@@ -1,0 +1,577 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Publishes the workspace crates of one release to crates.io, at the
+# workspace version (docs/adr/0029-crates-io-packaging.md). crates.io has no
+# candidate stage and never replaces a version. So this workflow runs last in
+# a release, after promote-image. packaging/README.md, "Releasing to
+# crates.io", lists the release steps, the repository settings that the
+# release depends on, and the steps for a new crate.
+#
+# This workflow publishes new versions of crates that crates.io has, through
+# trusted publishing. Trusted publishing cannot create a crate. So a
+# maintainer publishes each new crate with an API token and
+# `devtools/publish-crates --new-crates`. That mode never publishes a crate
+# that crates.io has.
+#
+# Shape, and why:
+#
+#   gate      Checks that need no build. The run must come from main. The
+#             input must be a strict `vX.Y.Z` tag that exists on origin.
+#             Its commit must be in origin/main. Its version must equal the
+#             workspace version at that commit. The promoted image of that
+#             version must carry the tagged commit in its revision label.
+#             The tagged commit must freeze the catalog migrations it ships.
+#             Then `devtools/publish-crates --dry-run` plans the run, and
+#             the plan goes to the job summary. The plan fails when a crate
+#             on crates.io accepts API tokens. A new crate does not fail the
+#             gate. The gate outputs the number of crates to publish before
+#             the first new crate, and the name of that new crate.
+#
+#   verify    Holds no credentials. `cargo package --workspace --locked`
+#             compiles every package from its tarball, and
+#             `devtools/check-crate-packages` checks the packages. The job
+#             uploads the SHA-256 of the package of each crate that
+#             crates.io receives, with the tagged commit and the toolchain.
+#             The build runs the build scripts and procedural macros of the
+#             dependency graph. That is why no token exists in this job. It
+#             also runs when the plan has a new crate. The maintainer's
+#             token run then checks out that commit, and it checks its bytes
+#             against this list.
+#
+#   publish   Runs when the plan has a crate to publish before the first
+#             new crate. A reviewer approves the `crates-io` environment
+#             first. The job packages the crates again without compiling
+#             them, and runs `devtools/check-crate-packages`. It stops
+#             unless each file has the SHA-256 that verify recorded. Then
+#             rust-lang/crates-io-auth-action exchanges the job's OIDC token
+#             for a crates.io token. That token expires after 30 minutes,
+#             and the action revokes it when the job ends.
+#             `devtools/publish-crates --no-verify` plans the run again, and
+#             publishes the crates in dependency order, up to the first new
+#             crate. After each upload, it compares the uploaded package
+#             with the list. The job outputs the first new crate of its own
+#             plan. A token run can publish the gate's new crate while the
+#             job waits for its approval. The job then does not stop.
+#
+#   index     Runs when no new crate stopped the run, so that the run
+#             published the whole release. The plan of the publish job
+#             decides that, and the gate's plan when the run skips publish.
+#             It reads each crate's file in the crates.io sparse index. It
+#             compares the checksum of the version with the SHA-256 that
+#             verify recorded. A difference fails the job.
+#
+#   smoke     Runs after index. It installs `extenddb` from crates.io with
+#             an empty cargo home, outside any checkout. It checks the
+#             version, the commit and the test-hooks lines that
+#             `extenddb version` prints.
+#
+#   new-crate Runs when the run stopped before a new crate. It writes the
+#             stop and a pointer to the steps for an API token to the job
+#             summary, and fails the run.
+#
+# Every job that runs cargo uses the toolchain in RUST_TOOLCHAIN. For one
+# commit and one toolchain, cargo writes the same bytes into each package.
+# The publish and index jobs compare those bytes.
+#
+# Trigger: manual workflow_dispatch only. A run that a pushed tag starts uses
+# the workflow file of the tagged commit. That file can be older than the
+# reviewed file on main. A dispatch from main runs the current file against
+# an existing tag.
+#
+# The release depends on two repository settings. packaging/README.md,
+# "Repository settings for crates.io", gives the commands that read them
+# back. A maintainer checks them before adding a trusted publisher.
+#   1. The environment crates-io. It has the four required reviewers of the
+#      other release environments, with prevent self-review, so that the
+#      dispatcher cannot approve the run. It allows deployments from main
+#      only, and it holds no secrets. Admin bypass is off. crates.io never
+#      replaces a version, so even an administrator needs the approval of a
+#      second maintainer to publish.
+#      gh api repos/ExtendDB/extenddb/environments/crates-io
+#   2. The tag ruleset protect-release-tags. It is active on refs/tags/v*,
+#      blocks the deletion and the update of those tags, and has no bypass
+#      actors. So a release tag cannot move to another commit.
+#      gh api repos/ExtendDB/extenddb/rulesets
+#
+# Each crate needs a GitHub trusted publisher on crates.io, on the Settings
+# tab of the crate, after its first publish. Its fields are repository owner
+# ExtendDB, repository name extenddb, workflow filename release-crates.yml
+# and environment crates-io. The form labels the last field "Environment
+# name (optional)". Fill it in, because a publisher without it gives a token
+# to a run of this workflow from any branch. Then select "Require trusted
+# publishing for all new versions". crates.io matches the workflow filename
+# exactly. A rename of this file stops publishing until every crate's entry
+# names the new file.
+
+name: release-crates
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to publish the crates of, e.g. v0.1.15'
+        required: true
+
+# No job commits anything, so no job needs to write to the repository. The
+# publish job adds id-token at job level.
+permissions:
+  contents: read
+
+# Two crates.io releases must never run at the same time.
+concurrency:
+  group: release-crates-extenddb
+  cancel-in-progress: false
+
+env:
+  # The publish job compares its packages with the ones verify built. So
+  # every job that runs cargo uses this toolchain. A maintainer who
+  # publishes a new crate with an API token uses it too
+  # (packaging/README.md). Change it in a reviewed pull request of its own.
+  RUST_TOOLCHAIN: "1.97.0"
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      sha: ${{ steps.meta.outputs.sha }}
+      publish_count: ${{ steps.plan.outputs.publish_count }}
+      first_new: ${{ steps.plan.outputs.first_new }}
+    steps:
+      - name: Gate - the run comes from main
+        # A dispatch from another branch runs that branch's copy of this
+        # file. The branch rule of the environment would stop it only at
+        # publish, after the verify build.
+        run: |
+          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+            echo "::error::dispatch release-crates from main, not from ${GITHUB_REF}"
+            exit 1
+          fi
+
+      - name: Check out main (the reviewed workflow's own ref)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          fetch-depth: 0         # tag resolution and the ancestry gate need history
+
+      - name: Gate - the tag must identify released code
+        id: meta
+        env:
+          # Dispatch inputs are untrusted. They reach the shell only through
+          # the environment, never as text in the script.
+          RAW_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # 1. The strict shape comes first, so no other input reaches git
+          #    as a ref expression.
+          if [[ ! "$RAW_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::input '$RAW_TAG' is not a strict release tag (vMAJOR.MINOR.PATCH)"
+            exit 1
+          fi
+          VERSION="${RAW_TAG#v}"
+
+          # 2. The tag must exist. This workflow never creates tags.
+          git fetch --no-tags origin "refs/tags/${RAW_TAG}:refs/tags/${RAW_TAG}" \
+            || { echo "::error::tag ${RAW_TAG} does not exist on origin"; exit 1; }
+          SHA=$(git rev-list -n 1 "refs/tags/${RAW_TAG}")
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::could not resolve ${RAW_TAG} to a full commit SHA"; exit 1; }
+
+          # 3. The tagged commit must be on main, so that a tag on an
+          #    unmerged branch cannot publish code that was not reviewed.
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$SHA" origin/main; then
+            echo "::error::${RAW_TAG} (${SHA}) is not contained in origin/main"
+            exit 1
+          fi
+
+          # 4. The tag must equal the workspace version at that commit.
+          CARGO_VERSION=$(git show "${SHA}:Cargo.toml" \
+            | sed -n 's/^version = "\(.*\)"$/\1/p' | head -1)
+          if [[ "$VERSION" != "$CARGO_VERSION" ]]; then
+            echo "::error::tag ${RAW_TAG} implies ${VERSION} but the workspace version at ${SHA} is ${CARGO_VERSION}"
+            exit 1
+          fi
+
+          {
+            echo "version=$VERSION"
+            echo "sha=$SHA"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Gate - the promoted image holds the tagged commit
+        # promote-image runs before this workflow. The version tag of the
+        # default image must carry the tagged commit in its revision label.
+        # The read is anonymous, as in promote-image.yml. A tag that moved
+        # to another commit fails here, because the image keeps its commit.
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          SHA: ${{ steps.meta.outputs.sha }}
+        run: |
+          set -euo pipefail
+          command -v skopeo >/dev/null || sudo apt-get install -y --no-install-recommends skopeo
+          IMAGE="docker://docker.io/extenddb/extenddb-postgres:${VERSION}"
+          if ! INSPECT=$(skopeo inspect --no-creds "$IMAGE"); then
+            echo "::error::cannot read ${IMAGE}. Run promote-image for ${VERSION} first."
+            exit 1
+          fi
+          REVISION=$(jq -r '.Labels["org.opencontainers.image.revision"] // ""' <<< "$INSPECT")
+          if [[ "$REVISION" != "$SHA" ]]; then
+            echo "::error::${IMAGE} has the revision label '${REVISION}', not the tagged commit ${SHA}"
+            exit 1
+          fi
+          echo "${IMAGE} has the revision ${REVISION}"
+
+      - name: Check out the tagged commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          ref: ${{ steps.meta.outputs.sha }}
+          persist-credentials: false
+
+      - name: Gate - the tagged commit has the crates.io release scripts
+        run: |
+          set -euo pipefail
+          for script in devtools/check-crate-packages devtools/publish-crates; do
+            if [[ ! -x "$script" ]]; then
+              echo "::error::the tagged commit has no ${script}. Use a tag created after release-crates.yml was merged."
+              exit 1
+            fi
+          done
+
+      - name: Gate - the release freezes the catalog migrations it ships
+        # The crates carry the catalog migrations of every backend, as the
+        # images and the npm packages do. So RELEASED_THROUGH must reach the
+        # last migration id.
+        run: python3 devtools/check-released-through
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Gate - plan the run
+        id: plan
+        # Reads the crates.io sparse index and the crates.io API. The plan
+        # shows the stop before a new crate. The script writes publish_count
+        # and first_new to the step outputs.
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          SHA: ${{ steps.meta.outputs.sha }}
+        run: |
+          set -euo pipefail
+          devtools/publish-crates --dry-run --version "$VERSION" --plan-output "$GITHUB_OUTPUT" \
+            | tee "$RUNNER_TEMP/plan.txt"
+          {
+            printf '### crates.io release v%s\n\n' "$VERSION"
+            printf '| field | value |\n|---|---|\n'
+            printf "| tag | \`v%s\` |\n" "$VERSION"
+            printf "| commit | \`%s\` |\n\n" "$SHA"
+            printf "\`\`\`\n"
+            cat "$RUNNER_TEMP/plan.txt"
+            printf "\`\`\`\n"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  verify:
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          # The build runs third-party build scripts, so the repository
+          # token stays out of .git/config.
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Build every package from its tarball
+        run: cargo package --workspace --locked
+
+      - name: Check the packages against the crates.io rules
+        run: devtools/check-crate-packages
+
+      - name: Record the SHA-256 of each crate's package, the commit and the toolchain
+        # SHA256SUMS has a line for the package of each crate that crates.io
+        # receives. cargo also packages a member that crates.io does not
+        # receive. The list leaves that file out, so that index compares only
+        # the crates of the release. COMMIT and TOOLCHAIN are for the
+        # maintainer's token run (packaging/README.md, "Publishing new crates
+        # with an API token"). That run checks out the tag only when the
+        # tag's commit is COMMIT, and it packages with TOOLCHAIN.
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+          SHA: ${{ needs.gate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/crate-sha256"
+          devtools/publish-crates --list-packages --version "$VERSION" > "$RUNNER_TEMP/packages.txt"
+          mapfile -t packages < "$RUNNER_TEMP/packages.txt"
+          if [[ ${#packages[@]} -eq 0 ]]; then
+            echo "::error::devtools/publish-crates lists no package"
+            exit 1
+          fi
+          printf '%s\n' "$SHA" > "$RUNNER_TEMP/crate-sha256/COMMIT"
+          printf '%s\n' "$RUST_TOOLCHAIN" > "$RUNNER_TEMP/crate-sha256/TOOLCHAIN"
+          cd target/package
+          sha256sum -- "${packages[@]}" | tee "$RUNNER_TEMP/crate-sha256/SHA256SUMS"
+
+      - name: Upload the checksums, the commit and the toolchain
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: crate-sha256
+          # The three files of the directory, at the root of the artifact.
+          path: ${{ runner.temp }}/crate-sha256/
+          if-no-files-found: error
+          retention-days: 7      # a failed publish job can be re-run for a week
+
+  publish:
+    needs: [gate, verify]
+    # A run with nothing to publish before the first new crate mints no
+    # token.
+    if: needs.gate.outputs.publish_count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Required reviewers with prevent self-review, no admin bypass, and the
+    # main-only branch rule. Each crate's trusted publisher names this
+    # environment. So a run outside it cannot get a crates.io token.
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write            # the OIDC token that crates.io exchanges for a publish token
+    outputs:
+      # The first new crate of this job's own plan, or empty. The script
+      # reads crates.io again before the first upload, so index and
+      # new-crate follow this plan and not the gate's.
+      first_new: ${{ steps.run.outputs.first_new }}
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Download the verified checksums
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: crate-sha256
+          path: ${{ runner.temp }}/crate-sha256
+
+      - name: Package without compiling, check, and compare with the verified packages
+        # `cargo package --no-verify` runs no build script, so the checker
+        # runs here on files that no dependency code touched. A package with
+        # other bytes than the one verify compiled stops the release before
+        # the first upload.
+        run: |
+          set -euo pipefail
+          cargo package --workspace --no-verify --locked
+          devtools/check-crate-packages
+          cd target/package
+          sha256sum --check --strict "$RUNNER_TEMP/crate-sha256/SHA256SUMS"
+
+      - name: Get a crates.io token through trusted publishing
+        id: auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9  # v1.0.6
+
+      - name: Publish the crates in dependency order
+        id: run
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          VERSION: ${{ needs.gate.outputs.version }}
+          FIRST_NEW: ${{ needs.gate.outputs.first_new }}
+        # crates.io does not rate-limit trusted publishing per user. Its one
+        # 429 here is the limit on the versions of one crate in 24 hours,
+        # and the script stops at it. The cap of 120 s bounds the waits for
+        # the index and after any other 429. The token expires 30 minutes
+        # after the step above.
+        run: |
+          set -euo pipefail
+          args=(--no-verify --max-wait 120 --version "$VERSION"
+                --sha256sums "$RUNNER_TEMP/crate-sha256/SHA256SUMS"
+                --plan-output "$GITHUB_OUTPUT")
+          # The gate found a new crate. The run publishes the crates before
+          # it and stops there, and the new-crate job reports the stop. When
+          # a token run published that crate in the meantime, the run does
+          # not stop, and index and smoke run instead.
+          if [[ -n "$FIRST_NEW" ]]; then
+            args+=(--expect-new "$FIRST_NEW")
+          fi
+          devtools/publish-crates "${args[@]}"
+
+  index:
+    needs: [gate, verify, publish]
+    # Only when no new crate stopped the run, so that the run published the
+    # whole release. The plan of the publish job decides when publish ran.
+    # The run skips publish when the gate's plan has nothing to publish
+    # before the first new crate, and the gate's plan decides then.
+    if: >-
+      ${{ !cancelled()
+          && needs.verify.result == 'success'
+          && ((needs.publish.result == 'success' && needs.publish.outputs.first_new == '')
+              || (needs.publish.result == 'skipped' && needs.gate.outputs.first_new == '')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions: {}
+    steps:
+      - name: Download the verified checksums
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: crate-sha256
+          path: ${{ runner.temp }}/crate-sha256
+
+      - name: Compare the checksums in the crates.io index with the verified packages
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The path of a crate's file in the sparse index (the Cargo book,
+          # "Registry Index"). devtools/publish-crates uses the same rule.
+          index_path() {
+            local name="${1,,}"
+            case "${#name}" in
+              1|2) echo "${#name}/${name}" ;;
+              3) echo "3/${name:0:1}/${name}" ;;
+              *) echo "${name:0:2}/${name:2:2}/${name}" ;;
+            esac
+          }
+          failed=0
+          while read -r sum file; do
+            name="${file%-"${VERSION}".crate}"
+            if [[ "$name" == "$file" ]]; then
+              echo "::error::${file} is not a package of version ${VERSION}"
+              failed=1
+              continue
+            fi
+            url="https://index.crates.io/$(index_path "$name")"
+            # cargo publish waits up to 60 s for each version. A cache in
+            # front of the index can serve an older file for a short time.
+            cksum=""
+            for attempt in $(seq 1 20); do
+              cksum=$(curl -fsS --max-time 30 "$url" | jq -r --arg v "$VERSION" 'select(.vers == $v) | .cksum' || true)
+              if [[ -n "$cksum" ]]; then
+                break
+              fi
+              echo "${name} ${VERSION} is not in the index yet (attempt ${attempt} of 20)"
+              sleep 15
+            done
+            if [[ -z "$cksum" ]]; then
+              echo "::error::${name} ${VERSION} is not in the crates.io index. See packaging/README.md, \"A failure after the upload\"."
+              failed=1
+            elif [[ "$cksum" != "$sum" ]]; then
+              echo "::error::${name} ${VERSION}: crates.io has cksum ${cksum}, and the verified package has SHA-256 ${sum}. The version is public and permanent. See packaging/README.md, \"A failure after the upload\"."
+              failed=1
+            else
+              echo "${name} ${VERSION}: ${cksum}"
+            fi
+          done < "$RUNNER_TEMP/crate-sha256/SHA256SUMS"
+          exit "$failed"
+
+  smoke:
+    needs: [gate, index]
+    if: ${{ !cancelled() && needs.index.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions: {}
+    steps:
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Install extenddb from crates.io with an empty cargo home
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+          SHA: ${{ needs.gate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # The job checks out nothing, and it works in a new directory under
+          # /tmp. So no cargo configuration of a repository or of the
+          # runner's home directory applies. The new CARGO_HOME holds no
+          # registry cache, configuration or token.
+          CARGO_HOME=$(mktemp -d)
+          export CARGO_HOME
+          cd "$(mktemp -d)"
+          # The index job saw every version. Try again only while cargo
+          # cannot resolve a version, never after a build error.
+          installed=false
+          for attempt in $(seq 1 10); do
+            if cargo install extenddb --version "$VERSION" --locked 2>&1 | tee install.log; then
+              installed=true
+              break
+            fi
+            if ! grep -qE 'could not find .extenddb. in registry|failed to select a version|no matching package named' install.log; then
+              break
+            fi
+            echo "crates.io does not resolve extenddb ${VERSION} yet (attempt ${attempt} of 10)"
+            sleep 30
+          done
+          if [[ "$installed" != true ]]; then
+            echo "::error::cargo install extenddb --version ${VERSION} --locked failed. Rerun this job first. See packaging/README.md, \"A failure after the upload\"."
+            exit 1
+          fi
+
+          "$CARGO_HOME/bin/extenddb" version | tee version.txt
+          # The binary reads the commit from the .cargo_vcs_info.json that
+          # cargo publish wrote. So this line shows the tag's commit only
+          # when cargo packaged the crate from a clean checkout of the tag.
+          after="See packaging/README.md, \"A failure after the upload\"."
+          grep -qxF "extenddb ${VERSION}" version.txt \
+            || { echo "::error::extenddb version does not report ${VERSION}. ${after}"; exit 1; }
+          grep -qxF "commit ${SHA}" version.txt \
+            || { echo "::error::extenddb version does not report commit ${SHA}. ${after}"; exit 1; }
+          # The test-hooks lines that `extenddb version` prints: the MongoDB
+          # test hooks are disabled, and no backup-test-hooks line appears.
+          # A test-hooks feature of a storage crate adds no line.
+          grep -qxF "test-hooks disabled" version.txt \
+            || { echo "::error::extenddb version does not report test-hooks disabled. ${after}"; exit 1; }
+          if grep -qF "backup-test-hooks enabled" version.txt; then
+            echo "::error::extenddb version reports backup-test-hooks enabled. ${after}"
+            exit 1
+          fi
+
+  new-crate:
+    needs: [gate, verify, publish]
+    # Only when the run stopped before a new crate. Either the plan of the
+    # publish job has a new crate, or the run skipped publish and the gate's
+    # plan has one. The publish job exits 0 at that stop only when the stop
+    # is at the gate's new crate, so the gate's outputs describe the stop.
+    if: >-
+      ${{ !cancelled()
+          && needs.verify.result == 'success'
+          && ((needs.publish.result == 'success' && needs.publish.outputs.first_new != '')
+              || (needs.publish.result == 'skipped' && needs.gate.outputs.first_new != '')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Report the stop before the new crate
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+          FIRST_NEW: ${{ needs.gate.outputs.first_new }}
+          PUBLISH_COUNT: ${{ needs.gate.outputs.publish_count }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          crates="crates"
+          if [[ "$PUBLISH_COUNT" == 1 ]]; then
+            crates="crate"
+          fi
+          {
+            printf '### Stopped before %s\n\n' "$FIRST_NEW"
+            printf "This run published %s %s of v%s, and then stopped before \`%s\`.\n" \
+              "$PUBLISH_COUNT" "$crates" "$VERSION" "$FIRST_NEW"
+            printf 'crates.io has no crate of this name, and trusted publishing cannot create a crate.\n'
+            printf "A maintainer publishes it with an API token and the \`crate-sha256\` artifact of this run,\n"
+            printf "run ID %s. packaging/README.md, \"Publishing new crates with an API token\", gives the steps.\n" \
+              "$RUN_ID"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::crates.io has no crate named ${FIRST_NEW}. The job summary points at the steps for an API token."
+          exit 1

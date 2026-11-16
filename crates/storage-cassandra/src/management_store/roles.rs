@@ -8,7 +8,7 @@ use extenddb_storage::management_store::{OpError, OpResult, RoleDetail};
 use time::OffsetDateTime;
 
 use crate::cassandra_util::{
-    apply_lwt, execute, get_column, get_timestamp, map_rows, query_optional, query_rows,
+    execute, get_column, get_timestamp, map_rows, query_optional, query_rows,
 };
 use crate::catalog_store::CassandraCatalogStore;
 
@@ -64,27 +64,22 @@ impl CassandraCatalogStore {
         if !applied {
             return Err(OpError::AlreadyExists("IAM role already exists".to_owned()));
         }
-
-        Ok(())
+        // A role deleted before deletes removed them could have left rows
+        // under this name.
+        self.clear_new_principal(account_id, "role", role_name)
+            .await
     }
 
     pub(crate) async fn delete_role_impl(&self, account_id: &str, role_name: &str) -> OpResult<()> {
         if !self.role_exists(account_id, role_name).await? {
             return Err(OpError::NotFound("IAM role not found".to_owned()));
         }
-
-        let query = format!(
-            "DELETE FROM {}.iam_roles WHERE account_id = ? AND role_name = ? IF EXISTS",
-            self.catalog_keyspace()
-        );
-        apply_lwt(
-            self.session(),
-            &query,
-            query_values!(account_id, role_name),
-            "delete_role",
-        )
-        .await?;
-        Ok(())
+        // What the role owns goes first, sessions among it, and its row last
+        // (see `dependents`).
+        self.delete_principal_dependents(account_id, "role", role_name)
+            .await?;
+        self.delete_principal_row(account_id, "role", role_name)
+            .await
     }
 
     pub(crate) async fn list_roles_impl(
@@ -232,6 +227,10 @@ impl CassandraCatalogStore {
         let Some(row) = row else {
             return Ok(None);
         };
+        // A role of a deleted account cannot be assumed.
+        if !self.account_exists(account_id).await? {
+            return Ok(None);
+        }
 
         let trust_policy_str: String = get_column(&row, "trust_policy", "get_role_trust_policy")?;
         let trust_policy: serde_json::Value =

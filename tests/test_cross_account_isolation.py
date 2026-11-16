@@ -356,27 +356,29 @@ class TestConsoleIsolation:
         return session
 
     def test_alice_console_does_not_show_bob_account(self):
-        """Alice's console session does not list bob's account."""
+        """Alice's console session does not list bob's account: the account
+        list is for admins and redirects her to the dashboard."""
         session = self._console_login(self.alice_acct, "alice", "AlicePass123!")
         resp = session.get(
             f"{self.endpoint}/console/accounts",
             allow_redirects=False,
             timeout=30,
         )
-        assert resp.status_code == 200
-        assert self.alice_acct in resp.text
+        assert resp.status_code == 303
+        assert resp.headers.get("location") == "/console"
         assert self.bob_acct not in resp.text
 
     def test_bob_console_does_not_show_alice_account(self):
-        """Bob's console session does not list alice's account."""
+        """Bob's console session does not list alice's account: the account
+        list is for admins and redirects him to the dashboard."""
         session = self._console_login(self.bob_acct, "bob", "BobPass456!")
         resp = session.get(
             f"{self.endpoint}/console/accounts",
             allow_redirects=False,
             timeout=30,
         )
-        assert resp.status_code == 200
-        assert self.bob_acct in resp.text
+        assert resp.status_code == 303
+        assert resp.headers.get("location") == "/console"
         assert self.alice_acct not in resp.text
 
 

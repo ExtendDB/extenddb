@@ -105,13 +105,36 @@ jobs:
         if: failure()
         run: cat moto.log || true
 
+  # crates.io accepts only what `cargo package` can write. Each dependency
+  # needs a version, and the dev-dependency cycle between extenddb-engine and
+  # extenddb-storage-sqlite must stay out of the published manifests.
+  # --no-verify writes the packages without compiling them, in seconds, and
+  # runs no build script. devtools/check-crate-packages then checks the pins,
+  # the LICENSE and NOTICE files, the metadata and crates.io's size limits.
+  # Compiling each package from its tarball takes minutes. That build runs in
+  # the verify job of release-crates.yml, before the upload, and not on each
+  # PR.
+  package:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - run: cargo package --workspace --no-verify --locked
+      - run: devtools/check-crate-packages
+
   test:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 15
-    needs: run-tests
+    needs: [run-tests, package]
     if: always()
     steps:
       - run: |
-          if [ "${{ needs.run-tests.result }}" != "success" ]; then
+          if [ "${{ needs.run-tests.result }}" != "success" ] \
+              || [ "${{ needs.package.result }}" != "success" ]; then
             exit 1
           fi

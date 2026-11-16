@@ -6,6 +6,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Operation dispatch, input validation and DynamoDB error mapping of the ExtendDB server. Internal crate of the extenddb binary, with no API stability promise."
+repository.workspace = true
+homepage.workspace = true
 
 [features]
 default = ["partiql"]
@@ -44,4 +47,10 @@ futures = { workspace = true }
 # `start_paused` for the tests of timers that must not depend on the wall clock.
 tokio = { workspace = true, features = ["test-util"] }
 # A storage engine for the tests that need an `OperationContext`.
-extenddb-storage-sqlite = { workspace = true }
+extenddb-storage-sqlite = { path = "../storage-sqlite" }
+# Scratch directories that are removed when a test panics.
+tempfile = "3"
+
+# `tests/private_modes.rs` sets umask 0.
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }

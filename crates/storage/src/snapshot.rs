@@ -65,11 +65,10 @@
 //! of each backend's `snapshot_engine.rs` are the record of what the
 //! snapshots do.
 
-use extenddb_core::backup_format::{KeyOrder, SourceTableSchema};
+use extenddb_core::backup_format::{BackupGsi, BackupLsi, KeyOrder, SourceTableSchema};
 use extenddb_core::types::{
-    BillingMode, GsiInput, IndexStatus, Item, LsiInput, ProvisionedThroughput,
-    ProvisionedThroughputDescription, TableDescription, TimeToLiveDescription,
-    VectorIndexSpecification,
+    BillingMode, IndexStatus, Item, ProvisionedThroughput, ProvisionedThroughputDescription,
+    TableDescription, TimeToLiveDescription, VectorIndexSpecification,
 };
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
@@ -393,7 +392,7 @@ pub fn source_table_schema(
         .global_secondary_indexes
         .iter()
         .flatten()
-        .map(|g| GsiInput {
+        .map(|g| BackupGsi {
             index_name: g.index_name.clone(),
             key_schema: g.key_schema.clone(),
             projection: g.projection.clone(),
@@ -404,7 +403,7 @@ pub fn source_table_schema(
         .local_secondary_indexes
         .iter()
         .flatten()
-        .map(|l| LsiInput {
+        .map(|l| BackupLsi {
             index_name: l.index_name.clone(),
             key_schema: l.key_schema.clone(),
             projection: l.projection.clone(),

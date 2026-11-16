@@ -47,7 +47,9 @@ pub struct BuildInfo {
     /// Package version of the deployed binary (e.g. `env!("CARGO_PKG_VERSION")`
     /// from the bin crate — not from a library crate, whose version may drift).
     pub version: &'static str,
-    /// Short git commit hash of the build (e.g. `env!("EXTENDDB_GIT_HASH")`).
+    /// Git commit hash of the build (e.g. `env!("EXTENDDB_GIT_HASH")`): the
+    /// full SHA in release images and in builds from crates.io, the short form
+    /// in local builds.
     pub git_hash: &'static str,
     /// Build timestamp (e.g. `env!("EXTENDDB_BUILD_TIME")`).
     pub build_time: &'static str,
@@ -230,6 +232,38 @@ impl std::fmt::Display for RegistrationLost {
 }
 
 impl std::error::Error for RegistrationLost {}
+
+/// The largest `request_timeout_secs` the server accepts.
+///
+/// hyper adds the HTTP/1 header read timeout to `Instant::now()` once per
+/// connection, and that addition panics on overflow, so a value near
+/// `u64::MAX` panics the task of every connection the server accepts. A day
+/// is longer than any pause a client takes between connecting and sending a
+/// request, and it leaves the addition far from the overflow point.
+const MAX_REQUEST_TIMEOUT_SECS: u64 = 86_400;
+
+/// Check the `request_timeout_secs` value from the `[server]` section.
+///
+/// Returns the startup error message when the value is outside the accepted
+/// range, so misconfiguration fails fast instead of reaching the listener.
+fn check_request_timeout_secs(secs: u64) -> Result<(), String> {
+    if secs == 0 {
+        return Err(
+            "Invalid [server] configuration: request_timeout_secs must be at least 1 \
+                    (0 would close every connection before it could send a request)."
+                .to_owned(),
+        );
+    }
+    if secs > MAX_REQUEST_TIMEOUT_SECS {
+        return Err(format!(
+            "Invalid [server] configuration: request_timeout_secs must be at most \
+             {MAX_REQUEST_TIMEOUT_SECS} (a day); the per-connection timers add it to the \
+             current instant, and a larger value overflows that addition and panics the \
+             connection task."
+        ));
+    }
+    Ok(())
+}
 
 /// Run the ExtendDB server on the pre-bound listener in `params` until shutdown.
 ///
@@ -434,11 +468,19 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
             crate::dev_credentials::describe(&dev_creds),
         );
         if let Some(ignored) = crate::dev_credentials::ignored_aws_env_key(&dev_creds) {
+            let alternative = if crate::dev_credentials::example_pair_active(&dev_creds) {
+                "or sign with the built-in example pair"
+            } else {
+                "or sign with the configured EXTENDDB_DEV_ACCESS_KEY_ID pair"
+            };
+            let switch_note = crate::dev_credentials::ignored_key_switch_note(&ignored, &dev_creds)
+                .map(|note| format!(" {note}"))
+                .unwrap_or_default();
             tracing::warn!(
                 "AWS_ACCESS_KEY_ID is set in the environment but dev mode does not adopt \
-                 it; requests signed with '{ignored}' will get UnrecognizedClientException. \
-                 Set EXTENDDB_DEV_ACCESS_KEY_ID and EXTENDDB_DEV_SECRET_ACCESS_KEY to seed \
-                 an additional credential, or sign with the built-in example pair."
+                 it; requests signed with '{ignored}' will get UnrecognizedClientException.\
+                 {switch_note} Set EXTENDDB_DEV_ACCESS_KEY_ID and EXTENDDB_DEV_SECRET_ACCESS_KEY \
+                 to seed an additional credential, {alternative}."
             );
         }
     }
@@ -465,6 +507,9 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
              soft_ttl_seconds, negative_ttl_seconds, max_entries."
         );
     }
+    if let Err(e) = check_request_timeout_secs(app_config.server.request_timeout_secs) {
+        anyhow::bail!("{e}");
+    }
     if !cache_enabled {
         tracing::warn!(
             "auth.cache.enabled = false — auth/authz caches are in pass-through mode \
@@ -483,9 +528,11 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
             make_cache_cfg("credential"),
         )
     });
-    let auth: Arc<dyn extenddb_auth::AuthProvider> = Arc::new(
-        extenddb_auth::BuiltinAuthProvider::new((*cached_cred_store).clone()),
-    );
+    let auth: Arc<dyn extenddb_auth::AuthProvider> =
+        Arc::new(extenddb_auth::BuiltinAuthProvider::new(
+            (*cached_cred_store).clone(),
+            app_config.server.region.as_str(),
+        ));
 
     // Phase 3: Build the authorization cache.
     let authz_cache: Arc<crate::CachedAuthzStore> = {
@@ -560,25 +607,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
 
     // P53: Resolve import and export path lists. Supports both the new
     // [import]/[export] sections and the deprecated import_export_root.
-    let resolve_paths = |raw_paths: &[String],
-                         label: &str|
-     -> anyhow::Result<Vec<Arc<std::path::PathBuf>>> {
-        let mut resolved = Vec::new();
-        for raw in raw_paths {
-            let expanded = config::expand_tilde(raw);
-            let path = std::path::PathBuf::from(&expanded);
-            if !path.exists() {
-                std::fs::create_dir_all(&path)
-                    .map_err(|e| anyhow::anyhow!("Cannot create {label} path {expanded}: {e}"))?;
-            }
-            let canonical = path
-                .canonicalize()
-                .map_err(|e| anyhow::anyhow!("Cannot canonicalize {label} path {expanded}: {e}"))?;
-            resolved.push(Arc::new(canonical));
-        }
-        Ok(resolved)
-    };
-
+    //
     // Build effective path lists: a populated section wins, and the deprecated
     // import_export_root fills only a list a section left empty. Which surface
     // won decides what the diagnostics should say, so it is recorded.
@@ -591,10 +620,12 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         tracing::warn!("{notice}");
     }
 
-    let import_paths: Arc<[Arc<std::path::PathBuf>]> =
-        Arc::from(resolve_paths(&effective.import, "import")?);
-    let export_paths: Arc<[Arc<std::path::PathBuf>]> =
-        Arc::from(resolve_paths(&effective.export, "export")?);
+    let import_paths: Arc<[Arc<std::path::PathBuf>]> = Arc::from(
+        crate::import_export_roots::resolve_roots(&effective.import, "import")?,
+    );
+    let export_paths: Arc<[Arc<std::path::PathBuf>]> = Arc::from(
+        crate::import_export_roots::resolve_roots(&effective.export, "export")?,
+    );
 
     for notice in crate::import_export_paths::overlap_notices(
         &import_paths,
@@ -684,8 +715,22 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
             .with_metrics(metrics.clone())
             .with_shutdown(shutdown.child_token())
             .with_source(&backend_name, build.version)
-            .with_limits(Arc::clone(&limits)),
+            .with_limits(Arc::clone(&limits))
+            .with_region(&app_config.server.region),
     );
+    // An in-memory catalog is new at every start: the server syncs it with
+    // the store before it serves, when the store's check passed here (a
+    // filesystem store), so the backups of the previous starts are served
+    // from the first request. The sync is bounded
+    // (`extenddb_engine::sync::STARTUP_SYNC_TIMEOUT`, 60 s); one that does
+    // not finish, or that met a store or catalog error on a prefix, is left
+    // to the reconciler's next cycle and logged (`backup_store` module doc).
+    if backup_runtime
+        .configured_store()
+        .is_some_and(extenddb_engine::ConfiguredStore::startup_sync_pending)
+    {
+        extenddb_engine::sync::startup_sync(&*storage, &backup_runtime).await;
+    }
     let backup_runtime_for_reconciler = Arc::clone(&backup_runtime);
     let state = AppState {
         storage: storage.clone(),
@@ -704,6 +749,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         ),
         metrics: metrics.clone(),
         tls_enabled,
+        request_timeout: Duration::from_secs(app_config.server.request_timeout_secs),
         dev_mode,
         import_paths,
         export_paths,
@@ -1150,6 +1196,9 @@ pub fn log_to_syslog_raw(msg: &str) {
 pub fn log_to_syslog_raw(msg: &str) {
     eprintln!("{msg}");
 }
+
+#[cfg(test)]
+mod request_timeout_tests;
 
 #[cfg(test)]
 mod tests {

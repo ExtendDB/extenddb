@@ -17,6 +17,10 @@
 //! | `CreateTable`, `DescribeTimeToLive`, `UpdateTimeToLive`, `DescribeContinuousBackups`, `UpdateContinuousBackups`, `CreateBackup`, `ListBackups`, `DescribeBackup`, `RestoreTableFromBackup`, `ExportTableToPointInTime` | ValidationException [`OWNER_ONLY`] | "Access is denied" |
 //! | `RestoreTableToPointInTime` | ValidationException [`OWNER_ONLY`] | the same |
 //!
+//! The server refuses every `RestoreTableToPointInTime`, and an
+//! `UpdateContinuousBackups` that enables point-in-time recovery, before this
+//! code runs.
+//!
 //! `DeleteTable`, `DeleteItem` and `DeleteBackup` were not sent to the
 //! service; they take the answers of `UpdateTable`, `UpdateItem` and
 //! `DescribeBackup`. `SearchVectors` has no service counterpart and takes the
@@ -41,6 +45,10 @@
 //! batch or transaction whose tables are in more than one account, the
 //! caller's included, is refused with [`MIXED_ACCOUNTS`] whichever accounts
 //! they are.
+//!
+//! An account segment that is not 12 ASCII digits gets the answers for an
+//! account that does not exist, without a catalog lookup (measured
+//! 2026-11-06; see [`account_in_catalog`]).
 //!
 //! An account exists here when this deployment's catalog holds it. Fields the
 //! service reads as a name rather than an ARN (`ListStreams` `TableName`,
@@ -110,6 +118,8 @@ pub(crate) fn find(operation: &str, input: &Value, account_id: &str) -> Option<O
             .map(extenddb_core::backup_format::trim_backup_arn)
             .and_then(|v| other(v, v.to_owned())),
         "ExportTableToPointInTime" => named("TableArn"),
+        // The server refuses every RestoreTableToPointInTime before this
+        // code runs.
         "RestoreTableToPointInTime" => named("SourceTableArn"),
         "BatchGetItem" | "BatchWriteItem" | "TransactGetItems" | "TransactWriteItems" => {
             batch_or_transaction(operation, input, account_id)
@@ -139,7 +149,15 @@ pub(crate) fn find(operation: &str, input: &Value, account_id: &str) -> Option<O
 /// each is authorized for: `Mixed` when they are in more than one account
 /// (a bare name is in the caller's), else the first in another account.
 fn batch_or_transaction(operation: &str, input: &Value, account_id: &str) -> Option<OtherAccount> {
-    let targets = crate::leading_keys::batch_transact_targets(operation, input, &HashMap::new())?;
+    // Only each target's table and action are read here. The limits govern
+    // how the expressions are read for Attributes, which this check ignores,
+    // so the defaults serve.
+    let targets = crate::leading_keys::batch_transact_targets(
+        operation,
+        input,
+        &HashMap::new(),
+        &extenddb_core::limits::LimitsConfig::default(),
+    )?;
     let mut accounts = BTreeSet::new();
     let mut first = None;
     for target in targets {
@@ -208,12 +226,16 @@ pub(crate) fn refusal(
 /// a catalog store knows no other account. A lookup failure fails the request
 /// (it is refused either way) with the authorization layer's internal error.
 ///
-/// An empty account field names no account the catalog can hold, so it is
-/// answered without a lookup. Cassandra refuses an empty partition key, and
-/// the lookup would fail the request with that internal error where every
-/// other backend answers that the account is not held.
+/// An account segment that is not 12 ASCII digits is not looked up: the
+/// management API creates no such account, on PostgreSQL one that carries
+/// U+0000 cannot be bound, and Cassandra refuses the empty one as a partition
+/// key, so the lookup would fail the request with an internal error. The
+/// service answers it as an account that does not exist (measured 2026-11-06
+/// with `1234` and U+0000, `12345678901x`, 11 and 13 digits, in `TableArn`,
+/// `SourceTableArn`, `ResourceArn`, `StreamArn`, `BackupArn` and the
+/// control-plane `TableName`).
 async fn account_in_catalog(state: &AppState, account: &str) -> Result<bool, DynamoDbError> {
-    if account.is_empty() {
+    if !extenddb_core::arn::is_account_id(account) {
         return Ok(false);
     }
     let Some(store) = state.catalog_store.as_ref() else {
@@ -231,7 +253,7 @@ async fn account_in_catalog(state: &AppState, account: &str) -> Result<bool, Dyn
 }
 
 /// The principal a denial names, in the form the service writes it.
-fn principal_arn(identity: &AuthIdentity) -> String {
+pub(crate) fn principal_arn(identity: &AuthIdentity) -> String {
     match identity {
         AuthIdentity::User {
             account_id,

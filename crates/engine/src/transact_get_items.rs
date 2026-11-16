@@ -46,9 +46,9 @@ pub async fn handle_transact_get_items(
     request_limits::check_transact_count(input.transact_items.len(), "TransactGetItem")?;
 
     // Validation runs in the order the service applies it, each phase over
-    // every item before the next phase starts: projection grammar and alias
-    // resolution (top-level ValidationException), then table lookup
-    // (ResourceNotFoundException), then key schema and key size
+    // every item before the next phase starts: projection grammar, alias
+    // resolution and the key's numbers (top-level ValidationException), then
+    // table lookup (ResourceNotFoundException), then key schema and key size
     // (TransactionCanceledException with a ValidationError reason on the
     // first offending item and None on every other), then duplicate keys
     // (top-level ValidationException).
@@ -83,6 +83,9 @@ pub async fn handle_transact_get_items(
             // No projection: transactions accept names with no expression.
             projections.push(None);
         }
+        // A number the service cannot read in the key comes after this item's
+        // projection checks and before the next item's (measured 2026-10-27).
+        validation::number::operations::transact_get_item(tgi)?;
     }
 
     let mut key_infos = Vec::with_capacity(input.transact_items.len());

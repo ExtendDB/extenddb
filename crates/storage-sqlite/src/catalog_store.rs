@@ -12,7 +12,7 @@ use std::sync::Arc;
 use extenddb_storage::CatalogStore;
 use extenddb_storage::diagnostics::{DiagError, DiagResult, DiagnosticsStore};
 use extenddb_storage::management_store::{
-    MetricsRow, MetricsStore, OpError, OpResult, RateLimitStore, SettingsStore,
+    MetricsFilter, MetricsRow, MetricsStore, OpError, OpResult, RateLimitStore, SettingsStore,
 };
 use futures::future::BoxFuture;
 use sqlx::SqlitePool;
@@ -138,6 +138,7 @@ impl SettingsStore for SqliteCatalogStore {
 #[derive(sqlx::FromRow)]
 struct DbMetricsRow {
     bucket: String,
+    account_id: String,
     metric: String,
     table_name: String,
     index_name: String,
@@ -148,6 +149,7 @@ struct DbMetricsRow {
     max: f64,
 }
 
+/// `account_metrics`: migration 10 replaced `metrics` with it.
 impl MetricsStore for SqliteCatalogStore {
     fn insert_metrics(&self, rows: &[MetricsRow]) -> BoxFuture<'_, OpResult<()>> {
         let rows = rows.to_vec();
@@ -158,16 +160,19 @@ impl MetricsStore for SqliteCatalogStore {
             for row in &rows {
                 let bucket = format_timestamp(row.bucket);
                 let result = sqlx::query(
-                    "INSERT INTO metrics \
-                     (bucket, metric, table_name, index_name, operation, sum, count, min, max) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
-                     ON CONFLICT(bucket, metric, table_name, index_name, operation) DO UPDATE SET \
-                       sum = metrics.sum + excluded.sum, \
-                       count = metrics.count + excluded.count, \
-                       min = MIN(metrics.min, excluded.min), \
-                       max = MAX(metrics.max, excluded.max)",
+                    "INSERT INTO account_metrics \
+                     (bucket, account_id, metric, table_name, index_name, operation, \
+                      sum, count, min, max) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                     ON CONFLICT(bucket, account_id, metric, table_name, index_name, operation) \
+                     DO UPDATE SET \
+                       sum = account_metrics.sum + excluded.sum, \
+                       count = account_metrics.count + excluded.count, \
+                       min = MIN(account_metrics.min, excluded.min), \
+                       max = MAX(account_metrics.max, excluded.max)",
                 )
                 .bind(&bucket)
+                .bind(row.account_id.as_deref().unwrap_or(""))
                 .bind(&row.metric)
                 .bind(row.table_name.as_deref().unwrap_or(""))
                 .bind(row.index_name.as_deref().unwrap_or(""))
@@ -190,20 +195,23 @@ impl MetricsStore for SqliteCatalogStore {
         &self,
         start: OffsetDateTime,
         end: OffsetDateTime,
-        table_name: Option<&str>,
-        metric: Option<&str>,
+        filter: &MetricsFilter,
     ) -> BoxFuture<'_, OpResult<Vec<MetricsRow>>> {
-        let table_name = table_name.map(str::to_owned);
-        let metric = metric.map(str::to_owned);
+        let account_id = filter.account_id().map(str::to_owned);
+        let table_name = filter.table_name().map(str::to_owned);
+        let metric = filter.metric().map(str::to_owned);
         let start_str = format_timestamp(start);
         let end_str = format_timestamp(end);
         Box::pin(async move {
             let mut sql = String::from(
-                "SELECT bucket, metric, table_name, index_name, operation, sum, count, min, max \
-                 FROM metrics WHERE bucket >= ? AND bucket <= ?",
+                "SELECT bucket, account_id, metric, table_name, index_name, operation, \
+                 sum, count, min, max \
+                 FROM account_metrics WHERE bucket >= ? AND bucket <= ?",
             );
-            let table_filter = table_name.as_deref().filter(|s| !s.is_empty());
-            if table_filter.is_some() {
+            if account_id.is_some() {
+                sql.push_str(" AND account_id = ?");
+            }
+            if table_name.is_some() {
                 sql.push_str(" AND table_name = ?");
             }
             if metric.is_some() {
@@ -214,11 +222,8 @@ impl MetricsStore for SqliteCatalogStore {
             let mut q = sqlx::query_as::<_, DbMetricsRow>(&sql)
                 .bind(&start_str)
                 .bind(&end_str);
-            if let Some(tn) = table_filter {
-                q = q.bind(tn.to_owned());
-            }
-            if let Some(m) = metric.as_deref() {
-                q = q.bind(m.to_owned());
+            for value in [&account_id, &table_name, &metric].into_iter().flatten() {
+                q = q.bind(value.clone());
             }
 
             let rows = q
@@ -231,6 +236,7 @@ impl MetricsStore for SqliteCatalogStore {
                 .filter_map(|r| {
                     Some(MetricsRow {
                         bucket: parse_timestamp(&r.bucket).ok()?,
+                        account_id: (!r.account_id.is_empty()).then_some(r.account_id),
                         metric: r.metric,
                         table_name: (!r.table_name.is_empty()).then_some(r.table_name),
                         index_name: (!r.index_name.is_empty()).then_some(r.index_name),
@@ -252,7 +258,7 @@ impl MetricsStore for SqliteCatalogStore {
             let cutoff_str = format_timestamp(cutoff);
             // D1: every writer holds the write lock.
             let _writer = self.lock_writes().await;
-            sqlx::query("DELETE FROM metrics WHERE bucket < ?")
+            sqlx::query("DELETE FROM account_metrics WHERE bucket < ?")
                 .bind(&cutoff_str)
                 .execute(&self.pool)
                 .await

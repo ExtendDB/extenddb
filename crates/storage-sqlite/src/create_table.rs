@@ -18,7 +18,10 @@ use extenddb_core::types::{
 };
 use extenddb_storage::backup_catalog::RestoreRegistrationRow;
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{index_arn, stream_arn, table_arn};
+use extenddb_storage::util::{
+    index_arn, stream_arn, table_arn, warm_throughput_record_for_create,
+    warm_throughput_record_json,
+};
 
 use crate::sqlite_util::{format_epoch_seconds, format_timestamp, is_unique_violation};
 use crate::store::SqliteEngine;
@@ -149,6 +152,7 @@ impl SqliteEngine {
         restore: Option<RestoreSource<'_>>,
     ) -> Result<TableDescription, StorageError> {
         Self::validate_account_id(account_id)?;
+        let input = extenddb_storage::stream_lineage::without_disabled_specification(input);
         // D1: every writer holds the engine write lock. This method runs two
         // write transactions (catalog rows, then data-table DDL); without the
         // lock they contend with data-plane writers at the SQLite level, and a
@@ -200,6 +204,16 @@ impl SqliteEngine {
         .map_err(|e| StorageError::Internal(e.to_string()))?
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(crate::DEFAULT_CONTROL_PLANE_DELAY_SECONDS);
+
+        // Stored as sent and reported back; nothing acts on it (see catalog
+        // migration 9, `m0009_warm_throughput`). UPDATING for the same delay
+        // the CREATING to ACTIVE flip takes.
+        let warm_record =
+            warm_throughput_record_for_create(input.warm_throughput.as_ref(), delay_secs);
+        let warm_json = warm_record
+            .as_ref()
+            .map(warm_throughput_record_json)
+            .transpose()?;
 
         let now = time::OffsetDateTime::now_utc();
         let creation_ts = format_timestamp(now);
@@ -309,8 +323,8 @@ impl SqliteEngine {
              (account_id, table_name, key_schema, attribute_definitions, billing_mode, \
               provisioned_throughput, stream_specification, table_status, creation_date_time, \
               table_arn, table_id, deletion_protection_enabled, status_transition_at, \
-              table_class, sse_specification, on_demand_throughput) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              table_class, sse_specification, on_demand_throughput, warm_throughput) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(account_id)
         .bind(&input.table_name)
@@ -328,6 +342,7 @@ impl SqliteEngine {
         .bind(&input.table_class)
         .bind(&sse_json)
         .bind(&on_demand_json)
+        .bind(&warm_json)
         .execute(&mut *tx)
         .await;
         if let Err(e) = inserted {
@@ -410,6 +425,7 @@ impl SqliteEngine {
 
         // GSI / LSI metadata.
         let mut gsi_ids: Vec<String> = Vec::new();
+        let mut gsi_warm_records = Vec::new();
         if let Some(gsis) = &input.global_secondary_indexes {
             for gsi in gsis {
                 let ks = serde_json::to_string(&gsi.key_schema)
@@ -430,12 +446,19 @@ impl SqliteEngine {
                     })
                     .transpose()
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
+                let gsi_warm =
+                    warm_throughput_record_for_create(gsi.warm_throughput.as_ref(), delay_secs);
+                let gsi_warm_json = gsi_warm
+                    .as_ref()
+                    .map(warm_throughput_record_json)
+                    .transpose()?;
+                gsi_warm_records.push(gsi_warm);
                 let index_id = uuid::Uuid::new_v4().to_string();
                 sqlx::query(
                     "INSERT INTO indexes \
                      (table_id, index_name, index_id, index_type, key_schema, projection, \
-                      index_status, provisioned_throughput) \
-                     VALUES (?, ?, ?, 'GSI', ?, ?, 'ACTIVE', ?)",
+                      index_status, provisioned_throughput, warm_throughput) \
+                     VALUES (?, ?, ?, 'GSI', ?, ?, 'ACTIVE', ?, ?)",
                 )
                 .bind(&table_id)
                 .bind(&gsi.index_name)
@@ -443,6 +466,7 @@ impl SqliteEngine {
                 .bind(&ks)
                 .bind(&proj)
                 .bind(&pt)
+                .bind(&gsi_warm_json)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -551,14 +575,23 @@ impl SqliteEngine {
         }
 
         // Stream shards (same transaction — single file).
-        let stream_label = if input
+        let stream_label = match input
             .stream_specification
             .as_ref()
-            .is_some_and(|s| s.stream_enabled)
+            .filter(|s| s.stream_enabled)
+            .and_then(|s| s.stream_view_type)
         {
-            Some(Self::init_stream_shards(&mut tx, account_id, &input.table_name, &table_id).await?)
-        } else {
-            None
+            Some(view_type) => Some(
+                Self::init_stream_shards(
+                    &mut tx,
+                    account_id,
+                    &input.table_name,
+                    &table_id,
+                    view_type,
+                )
+                .await?,
+            ),
+            None => None,
         };
 
         tx.commit()
@@ -647,7 +680,8 @@ impl SqliteEngine {
 
         let gsis = input.global_secondary_indexes.as_ref().map(|gs| {
             gs.iter()
-                .map(|g| GsiDescription {
+                .zip(gsi_warm_records)
+                .map(|(g, warm)| GsiDescription {
                     index_name: g.index_name.clone(),
                     key_schema: g.key_schema.clone(),
                     projection: g.projection.clone(),
@@ -673,6 +707,8 @@ impl SqliteEngine {
                         &input.table_name,
                         &g.index_name,
                     ),
+                    warm_throughput: None,
+                    warm_throughput_record: warm,
                 })
                 .collect()
         });
@@ -786,6 +822,9 @@ impl SqliteEngine {
                 .as_ref()
                 .map(|tc| serde_json::json!({ "TableClass": tc })),
             on_demand_throughput: input.on_demand_throughput,
+            // Derived by the engine from the record; see core.
+            warm_throughput: None,
+            warm_throughput_record: warm_record,
             // Every field is populated deliberately, with no `..Default::default()`
             // spread. This response is the complete description of what was just
             // created, so a new core field should break this site and force a

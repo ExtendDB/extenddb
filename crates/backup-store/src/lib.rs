@@ -69,6 +69,17 @@ pub struct ObjectMeta {
     pub etag: Option<String>,
 }
 
+/// What one [`BackupStore::delete_prefix_before`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefixDeletion {
+    /// The objects removed, counted as [`BackupStore::delete_prefix`]
+    /// counts them.
+    pub deleted: u64,
+    /// Whether the deletion ran to its end; `false` when it stopped at the
+    /// deadline, with the rest of the prefix left.
+    pub finished: bool,
+}
+
 /// A destination for backup objects.
 ///
 /// Implementations must be safe to share across tasks; the engine holds one
@@ -188,6 +199,87 @@ pub trait BackupStore: Send + Sync {
     /// entry removal (its walk runs on the blocking pool and checks a flag
     /// the dropped future sets).
     fn delete_prefix<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<u64, StoreError>>;
+
+    /// Delete the object under `written.key` only while it is the object a
+    /// put of this store answered with `written`, and leave any other.
+    /// Returns `true` when nothing `written` describes is left under the
+    /// key (this call removed it, or it was already gone), `false` when an
+    /// object the call does not match is there, untouched. Written for a
+    /// writer that deletes only what it wrote under a prefix another writer
+    /// may since have written to under the same keys.
+    ///
+    /// The S3 store sends `DeleteObject` with `If-Match` on `written.etag`
+    /// (a 412 is `false`, a missing key `true`); it tells objects apart by
+    /// their entity tags, so another object with the same bytes (the same
+    /// `ETag`) is deleted, and a server that ignores `If-Match` deletes
+    /// whatever is under the key. With no `etag` the delete is
+    /// unconditional. The filesystem store renames the file at the key to a
+    /// hidden temporary name in its directory (one step), removes it if its
+    /// size and modification time are `written`'s, and otherwise links it
+    /// back under the key; a process stopped between the rename and the
+    /// link leaves the other object under the hidden name, which listings do
+    /// not report. The filesystem store leaves the key's directories in
+    /// place.
+    ///
+    /// The default, for a store with no way to tell objects apart and no
+    /// single-key delete (a test double), is unconditional and uses
+    /// `delete_prefix` of the key only when a listing of the key finds that
+    /// object alone: an object under `key/`, which the prefix deletion would
+    /// also remove, makes it answer `false` with nothing deleted.
+    fn delete_written<'a>(
+        &'a self,
+        written: &'a ObjectMeta,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        Box::pin(async move {
+            use futures::StreamExt as _;
+            let mut listed = self.list(&written.key);
+            while let Some(meta) = listed.next().await {
+                if meta?.key != written.key {
+                    return Ok(false);
+                }
+            }
+            drop(listed);
+            self.delete_prefix(&written.key).await.map(|_| true)
+        })
+    }
+
+    /// [`BackupStore::delete_prefix`] that starts no removal at or after
+    /// `deadline`: the filesystem store's walk checks the deadline beside its
+    /// cancel flag before each removal, the S3 store before each
+    /// `ListObjectsV2`, `DeleteObjects`, `ListMultipartUploads` and
+    /// `AbortMultipartUpload`. A call that reaches the deadline returns what
+    /// it removed so far with [`PrefixDeletion::finished`] false; what
+    /// remains is the step in flight at the deadline (one removal on a
+    /// filesystem root, one request on S3, up to 1,000 keys for a
+    /// `DeleteObjects`). The check reads the clock in the process, so it
+    /// bounds a process that keeps running; one paused between a check and
+    /// the step it admits (a stopped process, a frozen VM) runs that step
+    /// when it resumes. The caller still bounds the call with a timeout for
+    /// a step that never answers.
+    ///
+    /// The default checks the deadline once and then runs `delete_prefix`
+    /// whole: for a store whose deletion is one step (an in-memory test
+    /// store), the same rule.
+    fn delete_prefix_before<'a>(
+        &'a self,
+        prefix: &'a str,
+        deadline: tokio::time::Instant,
+    ) -> BoxFuture<'a, Result<PrefixDeletion, StoreError>> {
+        Box::pin(async move {
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(PrefixDeletion {
+                    deleted: 0,
+                    finished: false,
+                });
+            }
+            self.delete_prefix(prefix)
+                .await
+                .map(|deleted| PrefixDeletion {
+                    deleted,
+                    finished: true,
+                })
+        })
+    }
 
     /// Startup validation. The filesystem store applies the owner-only rule
     /// to the root and the ancestor rule to the directories above it (the
