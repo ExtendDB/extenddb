@@ -1,13 +1,13 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pins `extenddb.sample.toml` to the configuration structs of this crate and
-//! to `LimitsConfig`. Each `[storage.<backend>]` section is pinned by its
-//! backend crate. `docs/configuration.md` is generated from the sample, so a
+//! Pins `extenddb.sample.toml` to the configuration structs of this crate, to
+//! `LimitsConfig` and to the backup store structs this crate re-exports. Each
+//! `[storage.<backend>]` section is pinned by its backend crate. `docs/configuration.md` is generated from the sample, so a
 //! field added to a struct without a sample line fails here before the page
 //! can go stale.
 
-use crate::backup::BackupConfig;
+use crate::backup::{BackupConfig, BackupStoreConfig, FilesystemStoreConfig, S3StoreConfig};
 use crate::sample_toml_support as support;
 use crate::{
     AuthCacheConfigToml, AuthConfig, ImportExportPathConfig, LoggingConfig, ServerConfig, TlsConfig,
@@ -41,7 +41,8 @@ fn root_sections_are_the_app_config_tables() {
 /// shows them as none with an example) are exactly the keys the pin tests
 /// exclude from value comparison plus the keys with no struct default at all:
 /// `backend` (read by the custom `StorageConfig` deserializer), the three
-/// optional top-level keys, and the two required backend keys.
+/// optional top-level keys, the two required backend keys and the two
+/// required backup store keys.
 #[test]
 fn no_default_marker_matches_the_example_keys() {
     let mut expected: Vec<&str> = vec![
@@ -53,6 +54,8 @@ fn no_default_marker_matches_the_example_keys() {
         "storage.cassandra.username",
         "storage.cassandra.password",
         "backup.spool_path",
+        "backup.store.s3.region",
+        "backup.store.s3.endpoint",
         // No struct default.
         "storage.backend",
         "docs_dir",
@@ -60,6 +63,8 @@ fn no_default_marker_matches_the_example_keys() {
         "max_import_bytes",
         "storage.mongodb.connection_string",
         "storage.cassandra.contact_points",
+        "backup.store.filesystem.path",
+        "backup.store.s3.bucket",
     ];
     expected.sort_unstable();
     assert_eq!(support::no_default_keys(), expected);
@@ -128,6 +133,28 @@ fn backup_section_matches_backup_config() {
     // `spool_path` is `Option<String>` with no default; the sample shows an
     // example path and its value is not compared.
     support::pin(&root, "backup", &["spool_path"], &BackupConfig::default());
+}
+
+/// The backup store structs have no `Default`: `path` and `bucket` are
+/// required, and `region` and `endpoint` are `Option<String>` with no
+/// default. The sample shows examples for those four, so their values are not
+/// compared.
+#[test]
+fn backup_store_sections_match_the_store_config() {
+    let root = support::sample();
+    let store: BackupStoreConfig = toml::from_str("").expect("empty [backup.store] deserializes");
+    support::pin(&root, "backup.store", &[], &store);
+    let filesystem: FilesystemStoreConfig =
+        toml::from_str(r#"path = "/example""#).expect("minimal filesystem store deserializes");
+    support::pin(&root, "backup.store.filesystem", &["path"], &filesystem);
+    let s3: S3StoreConfig =
+        toml::from_str(r#"bucket = "example""#).expect("minimal S3 store deserializes");
+    support::pin(
+        &root,
+        "backup.store.s3",
+        &["bucket", "region", "endpoint"],
+        &s3,
+    );
 }
 
 #[test]

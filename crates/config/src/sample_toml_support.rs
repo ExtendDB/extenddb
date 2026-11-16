@@ -173,19 +173,23 @@ pub fn assert_pinned(
 /// fields), its keys are exactly the struct's field names, and every value
 /// equals the struct default except for the `examples`, whose sample line is
 /// an example rather than a default and whose value is only type checked by
-/// the deserialization.
+/// the deserialization. A field the sample writes as a sub-table (an
+/// `Option` of a struct, `None` in the default) is left to the pin of that
+/// sub-table.
 pub fn pin<T>(root: &Table, path: &str, examples: &[&str], expected: &T)
 where
     T: serde::de::DeserializeOwned + serde::Serialize,
 {
     let full = table_at(root, path).clone();
+    let mut fields = field_names(expected);
+    fields.retain(|field| !full.get(field).is_some_and(Value::is_table));
     let _: T = Value::Table(full)
         .try_into()
         .unwrap_or_else(|e| panic!("[{path}] of extenddb.sample.toml does not deserialize: {e}"));
     assert_pinned(
         path,
         &section(root, path, &[]),
-        &field_names(expected),
+        &fields,
         &defaults(expected),
         examples,
     );
