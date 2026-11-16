@@ -38,12 +38,14 @@
 //!
 //! The walks here run over the parsed request body: parameters and list
 //! elements in request order, the members of a map in the order the parsed
-//! JSON object holds them. That is the request's order when the build
-//! includes the MongoDB storage crate, whose JSON dependency makes every JSON
-//! map keep it (any build of the whole workspace), and name order otherwise.
-//! In name order, when two members of one map both have a problem, the one
-//! reported can differ from the service's, which walks the request's order
-//! (measured 2026-11-02).
+//! JSON object holds them. That is the request's order in every build that
+//! includes the server, whose crate turns on serde_json's `preserve_order`
+//! feature, and name order in a build without it, such as this crate's own
+//! tests. The service reports the member of a map that a Java `HashMap` of
+//! it yields first, so the request's order decides only between members that
+//! share a bucket (measured 2026-11-12). When two members of one map in
+//! different buckets both have a problem, the one reported here can differ
+//! from the service's.
 
 use std::collections::HashSet;
 

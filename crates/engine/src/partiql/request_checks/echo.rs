@@ -191,11 +191,8 @@ fn write_map(echo: &mut Echo, value: Option<&Value>) {
 /// them.
 ///
 /// Here the keys of one bucket come in the order the parsed request holds
-/// them: the request's when the build includes the MongoDB storage crate,
-/// whose JSON dependency makes every JSON map keep it (any build of the whole
-/// workspace), and name order otherwise. In name order, two keys that share
-/// a bucket print sorted by name, which differs from the service when the
-/// request sends them in another order.
+/// them, which is the request's order in every build that includes the
+/// server: its crate turns on serde_json's `preserve_order` feature.
 fn print_order(members: &Map<String, Value>) -> Vec<(&String, &Value)> {
     // `size / 0.75` rounded up, in whole numbers.
     let buckets = (members.len() * 4).div_ceil(3).next_power_of_two();

@@ -39,7 +39,13 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# A parsed request keeps its members in the order the client wrote them, in
+# every build that includes the server. The typed input deserializers stop at
+# the first member that fails, and the service answers a body with two type
+# faults with the fault of the member written first. Without this feature a
+# parsed object is sorted by name, except in a build that also compiles
+# `bson`, which turns the feature on.
+serde_json = { workspace = true, features = ["preserve_order"] }
 tracing = { workspace = true }
 crc32fast = { workspace = true }
 uuid = { workspace = true }

@@ -67,9 +67,9 @@ const LEAVES: usize = 409_458;
 
 /// Peak heap growth allowed while decoding, per line byte. Measured at 76
 /// for this item with `serde_json`'s default `BTreeMap` (`cargo test -p
-/// extenddb-core`, the default binary) and 51 when `preserve_order` is on
-/// (CI's `cargo test --workspace`, where the MongoDB backend's `bson`
-/// enables it and `indexmap` replaces the map), and about 1,200 when either
+/// extenddb-core`) and 51 when `preserve_order` is on (every build that
+/// includes the server, whose crate enables it, and CI's `cargo test
+/// --workspace`; `indexmap` replaces the map), and about 1,200 when either
 /// the `L` or the `M` arm copies its subtree again. The bound leaves about
 /// 1.5x headroom over the larger figure for allocator-visible changes in
 /// `serde_json` or in std's `BTreeMap` node layout, which is the dominant
