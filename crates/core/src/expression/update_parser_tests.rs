@@ -163,9 +163,7 @@ fn parse_empty_expression_rejected() {
 #[test]
 fn parse_invalid_action_keyword_rejected() {
     let err = parse("price = :v").unwrap_err();
-    assert!(
-        matches!(err, DynamoDbError::ValidationException(msg) if msg.contains("expected SET"))
-    );
+    assert!(matches!(err, DynamoDbError::ValidationException(msg) if msg.contains("expected SET")));
 }
 
 #[test]
