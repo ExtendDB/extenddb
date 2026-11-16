@@ -5,8 +5,8 @@ This document provides AI agents with essential context for working on the Exten
 ## Project Overview
 
 **ExtendDB** is an open source DynamoDB-compatible runtime with pluggable storage, released under the Apache 2.0
-License. ExtendDB is a clean-room implementation of the DynamoDB wire protocol, written in Rust and initially developed
-by AWS engineers. It is not a fork of DynamoDB and contains no DynamoDB source code. ExtendDB speaks the DynamoDB wire
+License. ExtendDB is a clean-room implementation of the DynamoDB wire protocol, written in Rust and maintained
+by AWS. It is not a fork of DynamoDB and contains no DynamoDB source code. ExtendDB speaks the DynamoDB wire
 protocol: any AWS SDK, CLI, or tool that works with DynamoDB works with ExtendDB, unchanged.
 
 - **Language:** Rust (edition 2024, MSRV 1.88+)
@@ -215,6 +215,8 @@ export EXTENDDB_TEST_ENDPOINT=https://127.0.0.1:18443
 export EXTENDDB_ADMIN_USER=admin
 export EXTENDDB_ADMIN_PASSWORD=<password-from-init>
 eval $(python3 devtools/provision-test-credentials)
+# The access key import tests need import enabled. devtools/run-tests sets it.
+./target/release/extenddb settings --config extenddb.toml set allow_credential_import true
 pytest tests/ -v
 ```
 
@@ -399,6 +401,7 @@ Expression parsing lives in `crates/core/src/expression/`. This is pure sync Rus
 | Admin Guide | `docs/manuals/05-admin-guide.md`                  | Server lifecycle, configuration, IAM   |
 | Security Model | `docs/manuals/10-security-model.md`               | Threat model, auth, authz              |
 | Deployment Guide | `docs/manuals/11-deployment-guide.md`             | Self-hosted, multi-cloud, air-gapped   |
+| Backup and Restore | `docs/manuals/14-backup-and-restore.md`           | Backup strategy, drills, recovery      |
 | Differences from DynamoDB | `docs/differences-from-dynamodb.md`               | Behavioral differences                 |
 | Troubleshooting | `docs/troubleshooting.md`                         | Common errors and solutions            |
 | Storage Component Design | `docs/design/04-component-storage.md`             | Storage trait design                   |
@@ -406,7 +409,7 @@ Expression parsing lives in `crates/core/src/expression/`. This is pure sync Rus
 | Cassandra Design (experimental) | `docs/adr/0010`–`0021`            | Cassandra backend design decisions (ADRs) |
 | Cassandra Setup | `docs/cassandra-setup.md`                         | Cassandra install, config, and deployment (experimental) |
 | Testing Design | `docs/design/09-testing.md`                       | Test strategy and infrastructure       |
-| Extending Storage | `12-backend-plugin-architecture.md` | Guide to implementing storage backends |
+| Extending Storage | `docs/manuals/12-extending-extenddb-storage.md` | Guide to implementing storage backends |
 
 Build PDFs:
 

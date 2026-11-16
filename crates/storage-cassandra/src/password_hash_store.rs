@@ -56,7 +56,13 @@ impl PasswordHashStore for CassandraCatalogStore {
                 "get_user_password_hash",
             )
             .await?;
-            password_hash_of(rows, "get_user_password_hash")
+            let hash = password_hash_of(rows, "get_user_password_hash")?;
+            // A user of a deleted account has no password: its console
+            // sessions end and it cannot log in.
+            if hash.is_some() && !self.account_exists_quorum(&account_id).await? {
+                return Ok(None);
+            }
+            Ok(hash)
         })
     }
 }

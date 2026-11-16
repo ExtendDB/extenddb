@@ -211,12 +211,13 @@ Check the build:
 
 ```
 extenddb 0.1.14
-catalog migration 6 (postgres)
+catalog migration 12 (postgres)
 commit ceb6a63a
 built 2026-10-24T08:37:05Z
+test-hooks disabled
 ```
 
-`extenddb -V` prints the same. A source build carries the same release version as the published `0.1.14` images and a newer catalog: migration 6 here, 0.0.3 in the images (see the [upgrade manual](manuals/07-upgrade-manual.md#upgrading-a-container-deployment)). <!-- version-literal-ok: names the published tag's catalog, which is behind the tree -->
+`extenddb -V` prints the same. A source build carries the same release version as the published `0.1.14` images and a newer catalog: migration 12 here, 0.0.3 in the images (see the [upgrade manual](manuals/07-upgrade-manual.md#upgrading-a-container-deployment)). <!-- version-literal-ok: names the published tag's catalog, which is behind the tree -->
 
 ## 3. Initialize the deployment
 
@@ -344,13 +345,14 @@ What `init` prints, abridged (the full output also names the certificate files i
 
 Save the admin password and the account ID. The password is shown once and cannot be retrieved; the account ID is the one you create IAM users in.
 
-`init` refuses to run when the catalog or data database already exists. To start over, run `extenddb destroy --config extenddb.toml --yes` first (see [Tear down](#tear-down)). It also refuses to overwrite an existing `extenddb.toml` unless `--overwrite` is given.
+`init` refuses to run when the catalog or data database already exists. To start over, run `extenddb destroy --config extenddb.toml --yes` first (see [Tear down](#tear-down)). It also refuses to overwrite an existing `extenddb.toml` unless `--overwrite` is given (`Error: Config file "extenddb.toml" already exists. Use --overwrite to delete and regenerate it.`, exit 255); with `--overwrite` it loads the PostgreSQL connection defaults from the existing file and writes a new one.
 
 | Flag | What it does |
 |---|---|
-| `--data-db <name>` | Data database name (default `extenddb`); PostgreSQL |
-| `--catalog-db <name>` | Catalog database name (default `<data-db>_catalog`); PostgreSQL |
+| `--data-db <name>` | Data database name (default: the catalog's name without `_catalog`, `extenddb` for the default catalog); PostgreSQL |
+| `--catalog-db <name>` | Catalog database name (default `extenddb_catalog`, or the config file's); PostgreSQL |
 | `--extenddb-user <name>` | The application database user `init` creates (default `extenddb`); PostgreSQL and Cassandra |
+| `--extenddb-pass <password>` | That user's password (default `extenddb-local-dev`, or `EXTENDDB_APP_PASSWORD`); PostgreSQL and Cassandra |
 | `--pg-host <host>`, `--pg-port <port>` | PostgreSQL host (or absolute socket directory) and port |
 | `--bind-addr <addr>` | Address the server binds to; also added to the certificate's Subject Alternative Names |
 | `--tls-san <name>` | Another name or address for the certificate, repeatable (for example an in-cluster service name) |
@@ -381,7 +383,7 @@ Config:           extenddb.toml
 Catalog database: extenddb_catalog
 
 --- Checking catalog migrations...
-  OK: Current: the catalog is at migration 6
+  OK: Current: the catalog is at migration 12
 --- Checking catalog connection...
   OK: Connected to catalog.
 --- Checking data database...
@@ -400,7 +402,7 @@ Catalog database: extenddb_catalog
 ```
 
 ```
-extenddb 0.1.14 (catalog migration 6) starting on 127.0.0.1:18443
+extenddb 0.1.14 (catalog migration 12) starting on 127.0.0.1:18443
   storage: postgres (postgresql://extenddb:***@localhost:5432/extenddb_catalog)
 extenddb server started (pid 8644, 127.0.0.1:18443)
 ```
@@ -552,6 +554,6 @@ docker exec extenddb-cassandra cqlsh -u cassandra -p cassandra \
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

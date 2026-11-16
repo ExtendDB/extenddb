@@ -15,12 +15,12 @@ The storage layer provides a trait-based abstraction for all persistent data ope
 `storage` crate with no database-specific dependencies. Backend implementations live in separate crates (e.g.,
 `storage-postgres`) and are installed once from a thin `main` via `set_backend`, one backend per binary.
 
-The trait-based design allows new storage backends to be added by implementing the storage traits and registering a
-factory function, with no changes needed to the `engine` or `server` crates. The factory pattern enables runtime
-backend selection based on configuration.
+A new storage backend implements the storage traits in its own crate and needs no change to the `engine` crate. A
+backend that cannot pin a table snapshot also needs an entry in `in_catalog_create_only` in
+`crates/server/src/backup_store.rs`, so that its CreateBackup writes the in-catalog format.
 
-**Current status**: PostgreSQL is the only supported backend. The trait architecture and plugin infrastructure provide
-the foundation for future backend implementations.
+**Current status**: four backends implement the storage traits, in `storage-postgres`, `storage-sqlite`, `storage-mongodb`
+and `storage-cassandra`. Each binary is built with one of them.
 
 Backends accepted into the ExtendDB repository must satisfy the [Backend Acceptance Criteria](../rfcs/0003-backend-acceptance-criteria.md)
 (the DynamoDB-behavioral invariants for the storage layer) and the process defined in
@@ -1404,6 +1404,6 @@ backups).
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

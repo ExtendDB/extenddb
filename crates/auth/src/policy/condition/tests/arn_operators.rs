@@ -4,8 +4,10 @@
 //! Arn* operator tests. IAM, as measured with `iam simulate-custom-policy`
 //! on 2026-10-23 and 2026-10-28, evaluates ArnEquals the same as ArnLike and
 //! ArnNotEquals the same as ArnNotLike: `*` and `?` match in every ARN field,
-//! matching is case sensitive in every field, and both sides must have the
-//! same number of `:`-separated fields. The rows measured are in the
+//! matching is case sensitive in every field, and a six-field pattern is
+//! compared field by field. A shorter pattern compares only the fields it has
+//! when it starts with `arn`, and a one-field pattern matches nothing (live
+//! role session, 2026-10-30, issue #665). The rows measured are in the
 //! description of PR #471. Not every assertion here is a measured row: some
 //! apply a measured property to more patterns or values.
 
@@ -284,18 +286,44 @@ fn arn_equals_field_count_must_agree() {
 /// A bare `*` policy value. Over `notanarn` and over `arn:aws:dynamodb` all
 /// four operators were implicitDeny (simulate-custom-policy, 2026-10-28,
 /// `aws:SourceArn` as a string). Over an ARN the simulator refuses the value
-/// (InvalidInput), so the first two assertions are derived, not measured:
-/// Access Analyzer reports `ArnEquals: "*"` as an error (MISSING_ARN_FIELD)
-/// and as equivalent to `Null: false`, and `ArnNotEquals: "*"` as equivalent
-/// to `Null: true`; over a present value those are true and false.
+/// (InvalidInput), so it was measured on a live role session on 2026-10-30
+/// (issue #665), twice: `ArnEquals: "*"` on `aws:PrincipalArn` did not match
+/// and `ArnNotEquals: "*"` did. A one-field pattern matches no ARN.
 #[test]
 fn arn_operators_bare_star_value() {
-    assert!(single(ArnEquals, "*"));
-    assert!(!single(ArnNotEquals, "*"));
+    assert!(!single(ArnEquals, "*"));
+    assert!(single(ArnNotEquals, "*"));
+    assert!(!single(ArnLike, "*"));
+    assert!(single(ArnNotLike, "*"));
     for op in [ArnEquals, ArnNotEquals, ArnLike, ArnNotLike] {
         for v in ["notanarn", "arn:aws:dynamodb"] {
             assert!(!single_value(op.clone(), "*", v), "{op:?} * {v}");
         }
+    }
+}
+
+/// Issue #665: a pattern with fewer than six fields compares only the fields
+/// it has, so `ArnNotEquals` with `arn:aws:dynamodb:*` does not hold for a
+/// DynamoDB ARN; before the fix it held for every context value, and an
+/// Allow gated on it granted every caller. The rule was measured on a live
+/// role session on 2026-10-30 (`arn:aws:iam:*` and `arn:aws:iam` against an
+/// IAM role ARN, `*:*` and `a*` matching nothing).
+#[test]
+fn arn_operators_short_pattern_compares_the_fields_it_has() {
+    for p in [
+        "arn:aws:dynamodb:*",
+        "arn:aws:dynamodb",
+        "arn:*",
+        "arn:aws:dynamodb:us-east-1:123456789012",
+    ] {
+        assert!(single(ArnEquals, p), "{p}");
+        assert!(single(ArnLike, p), "{p}");
+        assert!(!single(ArnNotEquals, p), "{p}");
+        assert!(!single(ArnNotLike, p), "{p}");
+    }
+    for p in ["arn:aws:iam:*", "arn:aws:dynamodb:eu-west-1", "a*", "*:*"] {
+        assert!(!single(ArnEquals, p), "{p}");
+        assert!(single(ArnNotEquals, p), "{p}");
     }
 }
 

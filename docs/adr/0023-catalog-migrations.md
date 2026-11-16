@@ -365,8 +365,8 @@ that each backend implements, as follows.
   to run.
 - Rollback after additive migrations runs the previous 1.x binary. Rollback
   after a breaking migration restores the backup taken before the upgrade.
-  All five v1.0 migrations are breaking, so rolling back from 1.0 is a
-  restore.
+  Each v1.0 migration is breaking on every backend it applies to, so
+  rolling back from 1.0 is a restore.
 - Releases before 1.0 refuse a 1.0 catalog or leave a trace in it. PostgreSQL
   `serve` refuses the integer version row, and v0.1.14 `serve` on every
   backend refuses a catalog without the `resource_tag_migration` row, which
@@ -423,6 +423,6 @@ that each backend implements, as follows.
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is
-a trademark of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

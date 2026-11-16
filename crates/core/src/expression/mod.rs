@@ -18,6 +18,8 @@ mod projection;
 mod reserved_words;
 mod resolver;
 mod search_condition;
+#[cfg(test)]
+mod test_timeout;
 mod tokenizer;
 mod update_evaluator;
 mod update_parser;

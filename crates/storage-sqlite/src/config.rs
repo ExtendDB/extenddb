@@ -24,11 +24,17 @@ use serde::Deserialize;
 /// stream (file-backed or in-memory) holds one. A snapshot or a `CreateBackup`
 /// that finds no slot free is refused at once with `LimitExceededException`,
 /// so no backup runs while snapshots hold every slot. With one slot, one held
-/// snapshot refuses every `CreateBackup` for as long as it is open. Running
-/// backups hold one connection each for their read snapshot plus one shared
-/// writer (`n` backups hold `n + 1`), so from `pool_size` 4 up a flood of
-/// backups leaves at least half the pool to other requests; with 2 or 3 the
-/// one admitted backup holds two of them.
+/// snapshot refuses every `CreateBackup` for as long as it is open. A server
+/// with `backup.max_concurrent_jobs` over the slot count raises a file-backed
+/// `pool_size` to `2 * (max_concurrent_jobs + 1)` (10 at the default of 4,
+/// which is the default pool; 34 at most, where the 16-slot cap is reached),
+/// logging a warning that names both numbers, so the slot never refuses a job
+/// the engine's permit admitted (`backup::pool_size_for_jobs` computes it);
+/// an in-memory database has one connection and one slot whatever the jobs.
+/// Running backups hold one connection each for their read snapshot plus one
+/// shared writer (`n` backups hold `n + 1`), so from `pool_size` 4 up a flood
+/// of backups leaves at least half the pool to other requests; with 2 or 3
+/// the one admitted backup holds two of them.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SqliteConfig {
@@ -67,6 +73,14 @@ fn default_pool_size() -> u32 {
 impl StorageConfig for SqliteConfig {
     fn connection_config(&self) -> &str {
         &self.path
+    }
+
+    fn database_file(&self) -> Option<std::path::PathBuf> {
+        crate::serve_lock::database_file(&self.path).ok().flatten()
+    }
+
+    fn database_location(&self) -> Result<Option<std::path::PathBuf>, String> {
+        crate::serve_lock::database_file(&self.path)
     }
 
     fn max_connections(&self) -> u32 {
