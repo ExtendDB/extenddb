@@ -512,12 +512,13 @@ async fn the_check_before_the_lock_reads_no_policy() {
     deployment(&session, &prefix).await;
     let migrations = CassandraCatalogMigrations;
     let target = target_of(&prefix);
-    let lock = migrations.lock(&target, TIMEOUT).await.expect("lock");
-    migrations
-        .forget(&lock, 2)
-        .await
-        .expect("forget migration 2");
-    migrations.release(lock).await;
+    // Migration 2 pending: its ledger row deleted (the version row is left
+    // as it was; the next run rewrites it).
+    cql(
+        &session,
+        &format!("DELETE FROM {prefix}_catalog.extenddb_migrations WHERE id = 2"),
+    )
+    .await;
     // A user, whose policies migration 2's read looks up.
     cql(
         &session,

@@ -82,10 +82,12 @@ impl<'a, B: MigrationBackend> Runner<'a, B> {
         }
     }
 
-    /// Use another released bound than [`RELEASED_THROUGH`].
-    #[cfg(test)]
+    /// Use another released bound than [`RELEASED_THROUGH`], for tests of
+    /// [`Runner::forget`] that need an id the bound does not cover, whatever
+    /// this binary's bound is. A release binary never sets it.
+    #[cfg(any(test, feature = "test-util"))]
     #[must_use]
-    pub(crate) fn with_released_through(mut self, released_through: u32) -> Self {
+    pub fn with_released_through(mut self, released_through: u32) -> Self {
         self.released_through = released_through;
         self
     }

@@ -641,11 +641,13 @@ async fn changed_ahead_and_forgotten_ledgers() {
     )
     .await;
 
-    // An unreleased id, migration 4, can be forgotten and runs again.
+    // Migration 4 can be forgotten and runs again. The runner is given a
+    // released bound of 0, so 4 is unreleased whatever bound this binary
+    // carries.
     let migrations = SqliteMigrations::open(&db.to_string_lossy())
         .await
         .expect("open");
-    let runner = Runner::new(&migrations, RELEASE);
+    let runner = Runner::new(&migrations, RELEASE).with_released_through(0);
     let four = MigrationId::IndexTableBaseKey.number();
     runner.forget(four).await.expect("forget 4");
     assert!(matches!(

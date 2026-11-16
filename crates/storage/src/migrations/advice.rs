@@ -317,7 +317,7 @@ mod quoting_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::{Advice, error_message, status_message};
+    use super::{Advice, RELEASED_THROUGH, error_message, status_message};
     use crate::migrations::{
         AppliedStep, CatalogStatus, Kind, MigrationError, MigrationId, Outcome, Pending, RunReport,
         StoreKind,
@@ -544,42 +544,45 @@ mod tests {
 
     #[test]
     fn each_refusal_names_its_command() {
+        let changed = |id| CatalogStatus::Changed {
+            id,
+            store_name: "db".to_owned(),
+            recorded: "a".to_owned(),
+            expected: "b".to_owned(),
+        };
+        let unreleased = RELEASED_THROUGH + 1;
         let cases = [
             (
                 CatalogStatus::Uninitialized,
-                "create it with 'extenddb init'",
+                "create it with 'extenddb init'".to_owned(),
             ),
             (
                 CatalogStatus::WrittenByOlderRelease {
                     trace: "catalog_version is 0.0.4".to_owned(),
                 },
-                "--yes --reconverge",
+                "--yes --reconverge".to_owned(),
             ),
             (
                 CatalogStatus::NeedsAttention {
                     items: vec!["migration 2 resource_tag_condition_keys: a collision".to_owned()],
                 },
-                "  migration 2 resource_tag_condition_keys: a collision",
+                "  migration 2 resource_tag_condition_keys: a collision".to_owned(),
             ),
+            (changed(unreleased), format!("--forget {unreleased}")),
             (
-                CatalogStatus::Changed {
-                    id: 4,
-                    store_name: "db".to_owned(),
-                    recorded: "a".to_owned(),
-                    expected: "b".to_owned(),
-                },
-                "--forget 4",
+                changed(RELEASED_THROUGH),
+                "run the ExtendDB release that recorded it".to_owned(),
             ),
             (
                 CatalogStatus::AheadIncompatible {
                     unknown: vec![(9, "later".to_owned())],
                 },
-                "ExtendDB 1.0.1 cannot use it",
+                "ExtendDB 1.0.1 cannot use it".to_owned(),
             ),
         ];
         for (status, expected) in cases {
             let message = status_message(&status, &ADVICE);
-            assert!(message.contains(expected), "{status:?}: {message}");
+            assert!(message.contains(&expected), "{status:?}: {message}");
             assert!(
                 !message.contains("--pg-pass") && !message.contains("password"),
                 "{message}"
