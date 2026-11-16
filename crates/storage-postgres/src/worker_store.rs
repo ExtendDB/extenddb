@@ -176,24 +176,6 @@ impl PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        // CREATING with no owner → removed. A restore whose process died
-        // mid-copy leaves its target CREATING with no scheduled transition.
-        // The poller is notification-driven with a 60-second idle timeout, so
-        // the 60-second grace means an idle abandoned target is removed about
-        // 60–120 seconds after ownership is lost. Every pass opens a fresh
-        // out-of-pool connection for each old candidate to probe its advisory
-        // lock; a still-owned restore closes that probe and is checked again on
-        // the next pass. Failures are logged and skipped, so they cannot hold
-        // up the transitions above.
-        match self.sweep_abandoned_restores().await {
-            Ok(names) => {
-                for name in names {
-                    transitions.push((name, "abandoned restore → removed"));
-                }
-            }
-            Err(e) => tracing::warn!("abandoned restore sweep failed: {e}"),
-        }
-
         Ok(ControlPlanePass {
             transitions,
             deferred_drops,

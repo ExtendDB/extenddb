@@ -29,8 +29,8 @@ use extenddb_storage::error::StorageError;
 use crate::MongoEngine;
 
 /// Default control-plane delay (seconds) when the setting is absent or
-/// unparseable. Matches the Postgres backend default.
-const DEFAULT_CONTROL_PLANE_DELAY_SECS: f64 = 0.25;
+/// unparseable: the workers and the console's default read this one value.
+pub(crate) const DEFAULT_CONTROL_PLANE_DELAY_SECONDS: f64 = 0.25;
 
 impl MongoEngine {
     /// Read `control_plane_delay_seconds` from the settings collection,
@@ -45,7 +45,7 @@ impl MongoEngine {
             .and_then(|d| d.get_str("value").ok().map(str::to_owned))
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| *v >= 0.0)
-            .unwrap_or(DEFAULT_CONTROL_PLANE_DELAY_SECS)
+            .unwrap_or(DEFAULT_CONTROL_PLANE_DELAY_SECONDS)
     }
 }
 

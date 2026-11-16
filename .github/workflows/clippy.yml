@@ -23,12 +23,20 @@ jobs:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: 1.97.0
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           # Only pushes to main save, so other runs restore main's cache.
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo clippy --all-targets -- -D warnings
+      # With the Cassandra and MongoDB crates' `test-hooks` features, so the
+      # hook modules (`src/test_hooks.rs`) and their call sites, which only
+      # the integration test binaries build otherwise, are linted too.
+      - run: cargo clippy --all-targets --features extenddb-storage-cassandra/test-hooks,extenddb-storage-mongodb/test-hooks -- -D warnings
+      # The backup job's kill-point pauses (`EXTENDDB_BACKUP_PAUSE`), which
+      # `devtools/backup-kill-points.sh` runs by hand on a build with the
+      # feature; no other job builds it.
+      - run: cargo clippy --all-targets --features extenddb-engine/backup-test-hooks -- -D warnings

@@ -5,9 +5,10 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use extenddb_storage::management_store::SettingsStore;
 use serde::{Deserialize, Serialize};
 
 use super::ManagementState;
@@ -63,10 +64,11 @@ fn authorize_self_service(
 pub async fn create_access_key(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((account_id, user_name)): Path<(String, String)>,
 ) -> Response {
     let caller =
-        match authenticate(&headers, &*state.catalog_store, &*state.catalog_store, None).await {
+        match authenticate(&headers, &*state.catalog_store, &*state.catalog_store, addr).await {
             Ok(c) => c,
             Err(e) => return e,
         };
@@ -104,10 +106,11 @@ pub async fn create_access_key(
 pub async fn list_access_keys(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((account_id, user_name)): Path<(String, String)>,
 ) -> Response {
     let caller =
-        match authenticate(&headers, &*state.catalog_store, &*state.catalog_store, None).await {
+        match authenticate(&headers, &*state.catalog_store, &*state.catalog_store, addr).await {
             Ok(c) => c,
             Err(e) => return e,
         };
@@ -144,10 +147,11 @@ pub async fn list_access_keys(
 pub async fn delete_access_key(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((account_id, user_name, key_id)): Path<(String, String, String)>,
 ) -> Response {
     let caller =
-        match authenticate(&headers, &*state.catalog_store, &*state.catalog_store, None).await {
+        match authenticate(&headers, &*state.catalog_store, &*state.catalog_store, addr).await {
             Ok(c) => c,
             Err(e) => return e,
         };
@@ -174,11 +178,12 @@ pub async fn delete_access_key(
 pub async fn change_user_password(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((account_id, user_name)): Path<(String, String)>,
     axum::Json(body): axum::Json<ChangePasswordRequest>,
 ) -> Response {
     let caller =
-        match authenticate(&headers, &*state.catalog_store, &*state.catalog_store, None).await {
+        match authenticate(&headers, &*state.catalog_store, &*state.catalog_store, addr).await {
             Ok(c) => c,
             Err(e) => return e,
         };
@@ -219,15 +224,37 @@ pub async fn change_user_password(
     }
 }
 
+/// Checks the runtime setting `allow_credential_import` before
+/// [`import_access_key`] stores a key. Only the stored value `true` allows the
+/// import. No row, `false`, and any other value refuse it with 403, because an
+/// import stores an access key ID and secret that the caller chooses. A store
+/// error is answered with 500.
+#[allow(clippy::result_large_err)] // axum Response as rejection is this module's idiom
+async fn credential_import_gate(settings: &dyn SettingsStore) -> Result<(), Response> {
+    match settings.get_setting("allow_credential_import").await {
+        Ok(Some(value)) if value == "true" => Ok(()),
+        Ok(_) => Err((
+            StatusCode::FORBIDDEN,
+            "Credential import is disabled (allow_credential_import = false)",
+        )
+            .into_response()),
+        Err(e) => {
+            tracing::error!("Management API: check allow_credential_import failed: {e:?}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+    }
+}
+
 /// `POST /management/accounts/{id}/users/{name}/access-keys/import` — import an external access key.
 pub async fn import_access_key(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((account_id, user_name)): Path<(String, String)>,
     axum::Json(body): axum::Json<ImportAccessKeyRequest>,
 ) -> Response {
     let caller =
-        match authenticate(&headers, &*state.catalog_store, &*state.catalog_store, None).await {
+        match authenticate(&headers, &*state.catalog_store, &*state.catalog_store, addr).await {
             Ok(c) => c,
             Err(e) => return e,
         };
@@ -235,26 +262,8 @@ pub async fn import_access_key(
         return e;
     }
 
-    // Check runtime setting gate.
-    let allowed: bool = match state
-        .catalog_store
-        .get_setting("allow_credential_import")
-        .await
-    {
-        Ok(Some(v)) => v == "true",
-        Ok(None) => true, // Default: allowed.
-        Err(e) => {
-            tracing::error!("Management API: check allow_credential_import failed: {e:?}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-
-    if !allowed {
-        return (
-            StatusCode::FORBIDDEN,
-            "Credential import is disabled (allow_credential_import = false)",
-        )
-            .into_response();
+    if let Err(refused) = credential_import_gate(&*state.catalog_store).await {
+        return refused;
     }
 
     // Validate access key ID format.
@@ -295,5 +304,104 @@ pub async fn import_access_key(
             (StatusCode::CREATED, "Access key imported").into_response()
         }
         Err(e) => op_err_to_response(OpError::from_storage(e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use extenddb_storage::management_store::{OpError, OpResult};
+    use futures::future::BoxFuture;
+
+    use super::*;
+    use crate::rate_limit::tests::capture_logs;
+
+    /// What the settings store answers for `allow_credential_import`.
+    enum Setting {
+        /// The catalog has no row for the key.
+        NoRow,
+        /// The catalog holds this value.
+        Value(&'static str),
+        /// The read fails.
+        StoreError,
+    }
+
+    impl SettingsStore for Setting {
+        fn get_setting(&self, key: &str) -> BoxFuture<'_, OpResult<Option<String>>> {
+            assert_eq!(key, "allow_credential_import");
+            let answer = match self {
+                Self::NoRow => Ok(None),
+                Self::Value(value) => Ok(Some((*value).to_owned())),
+                Self::StoreError => Err(OpError::Internal("store is down".to_owned())),
+            };
+            Box::pin(async move { answer })
+        }
+
+        fn set_setting(&self, _: &str, _: &str) -> BoxFuture<'_, OpResult<()>> {
+            unreachable!("the import gate does not write settings")
+        }
+
+        fn list_settings(&self) -> BoxFuture<'_, OpResult<Vec<(String, String)>>> {
+            unreachable!("the import gate does not list settings")
+        }
+    }
+
+    /// The gate's answer as a status code, with the body of a refusal.
+    async fn gate(setting: Setting) -> Result<(), (StatusCode, String)> {
+        match credential_import_gate(&setting).await {
+            Ok(()) => Ok(()),
+            Err(response) => {
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("the refusal body is in memory");
+                Err((status, String::from_utf8_lossy(&body).into_owned()))
+            }
+        }
+    }
+
+    fn refused() -> Result<(), (StatusCode, String)> {
+        Err((
+            StatusCode::FORBIDDEN,
+            "Credential import is disabled (allow_credential_import = false)".to_owned(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn no_row_refuses_the_import() {
+        assert_eq!(gate(Setting::NoRow).await, refused());
+    }
+
+    #[tokio::test]
+    async fn false_refuses_the_import() {
+        assert_eq!(gate(Setting::Value("false")).await, refused());
+    }
+
+    #[tokio::test]
+    async fn true_allows_the_import() {
+        assert_eq!(gate(Setting::Value("true")).await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn a_value_other_than_true_refuses_the_import() {
+        // The settings API writes only `true` or `false`. A row edited in the
+        // catalog by hand can hold any other value.
+        for value in ["TRUE", "True", "1", "yes", "", " true"] {
+            assert_eq!(gate(Setting::Value(value)).await, refused(), "{value:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_store_error_answers_500_and_is_logged() {
+        let (logs, _guard) = capture_logs();
+        assert_eq!(
+            gate(Setting::StoreError).await,
+            Err((StatusCode::INTERNAL_SERVER_ERROR, String::new()))
+        );
+        let text = logs.text();
+        assert!(
+            text.contains("ERROR")
+                && text.contains("Management API: check allow_credential_import failed"),
+            "{text}"
+        );
     }
 }

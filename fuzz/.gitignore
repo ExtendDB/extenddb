@@ -1,0 +1,9 @@
+# Build output and fuzzing runtime state. The committed seeds are in seeds/.
+# cargo fuzz writes generated inputs to corpus/ when it is given no corpus
+# directory, so corpus/ is ignored. Cargo.lock is generated from the root
+# Cargo.lock before each build (see Cargo.toml).
+target
+artifacts
+corpus
+coverage
+Cargo.lock
