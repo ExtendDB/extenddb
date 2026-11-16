@@ -15,11 +15,50 @@
 //! value_expr → operand ( ('+' | '-') operand )?
 //! remove_action → path
 //! ```
+//!
+//! A parenthesized value and a function call each nest one level. Past
+//! `max_expression_depth` levels the expression is refused before the parser
+//! recurses further, so the stack a parse takes stays bounded whatever the
+//! size and token limits allow.
 
 use super::ast::{ArithOp, Expr, UpdateAction};
 use super::parser_common;
 use super::tokenizer::Token;
 use crate::error::DynamoDbError;
+
+/// The nesting depth `parse_update` allows, the default of
+/// `max_expression_depth`.
+const DEFAULT_MAX_DEPTH: usize = 150;
+
+/// The nesting levels a parse has entered, and the most it may enter.
+struct Nesting {
+    depth: usize,
+    max_depth: usize,
+}
+
+impl Nesting {
+    fn new(max_depth: usize) -> Self {
+        Self {
+            depth: 0,
+            max_depth,
+        }
+    }
+
+    /// Enter one level, refusing the expression past `max_depth`.
+    fn enter(&mut self) -> Result<(), DynamoDbError> {
+        self.depth += 1;
+        if self.depth > self.max_depth {
+            return Err(validation_err(
+                "Invalid UpdateExpression: expression nesting depth exceeded",
+            ));
+        }
+        Ok(())
+    }
+
+    fn leave(&mut self) {
+        self.depth -= 1;
+    }
+}
 
 /// One `SET`, `REMOVE`, `ADD`, or `DELETE` section of a parsed update
 /// expression: its keyword and the range of actions it holds, in expression
@@ -41,7 +80,8 @@ pub struct ParsedUpdate {
 }
 
 /// Parse an update expression token stream into a list of actions, with the
-/// grammar-only checks plus the repeated-section rule.
+/// grammar-only checks plus the repeated-section rule, and the default depth
+/// limit.
 ///
 /// Callers that go on to run [`validate_update_semantics`](super::semantics::validate_update_semantics) should use
 /// [`parse_update_sections`] instead; this entry point serves the storage
@@ -49,24 +89,26 @@ pub struct ParsedUpdate {
 ///
 /// # Errors
 ///
-/// Returns `ValidationException` for syntax errors.
+/// Returns `ValidationException` for syntax errors or depth exceeded.
 pub fn parse_update(tokens: &[Token]) -> Result<Vec<UpdateAction>, DynamoDbError> {
-    let parsed = parse_update_sections(tokens, None)?;
+    let parsed = parse_update_sections(tokens, None, DEFAULT_MAX_DEPTH)?;
     check_sections_unique(&parsed.sections)?;
     Ok(parsed.actions)
 }
 
-/// Parse an update expression with DynamoDB-compatible syntax error messages,
-/// including the repeated-section rule.
+/// Parse an update expression with DynamoDB-compatible syntax error
+/// messages, including the repeated-section rule, nesting at most
+/// `max_depth` levels of parentheses and function calls.
 ///
 /// # Errors
 ///
-/// Returns `ValidationException` for syntax errors.
+/// Returns `ValidationException` for syntax errors or depth exceeded.
 pub fn parse_update_from(
     tokens: &[Token],
     source: &str,
+    max_depth: usize,
 ) -> Result<Vec<UpdateAction>, DynamoDbError> {
-    let parsed = parse_update_sections(tokens, Some(source))?;
+    let parsed = parse_update_sections(tokens, Some(source), max_depth)?;
     check_sections_unique(&parsed.sections)?;
     Ok(parsed.actions)
 }
@@ -85,12 +127,16 @@ pub fn parse_update_from(
 /// `source`, when given, enables the service's `Syntax error; token: ...,
 /// near: ...` wording for an unexpected token at section level.
 ///
+/// The parse nests at most `max_depth` levels of parentheses and function
+/// calls.
+///
 /// # Errors
 ///
-/// Returns `ValidationException` for syntax errors.
+/// Returns `ValidationException` for syntax errors or depth exceeded.
 pub fn parse_update_sections(
     tokens: &[Token],
     source: Option<&str>,
+    max_depth: usize,
 ) -> Result<ParsedUpdate, DynamoDbError> {
     parser_common::check_redundant_parens(tokens).map_err(|msg| {
         DynamoDbError::ValidationException(format!("Invalid UpdateExpression: {msg}"))
@@ -99,13 +145,14 @@ pub fn parse_update_sections(
     let mut pos = 0;
     let mut actions = Vec::new();
     let mut sections: Vec<UpdateSection> = Vec::new();
+    let mut nesting = Nesting::new(max_depth);
 
     while pos < tokens.len() {
         let start = actions.len();
         let keyword = match &tokens[pos] {
             Token::Set => {
                 pos += 1;
-                parse_set_actions(tokens, &mut pos, &mut actions)?;
+                parse_set_actions(tokens, &mut pos, &mut actions, &mut nesting)?;
                 "SET"
             }
             Token::Remove => {
@@ -217,11 +264,12 @@ fn parse_set_actions(
     tokens: &[Token],
     pos: &mut usize,
     actions: &mut Vec<UpdateAction>,
+    nesting: &mut Nesting,
 ) -> Result<(), DynamoDbError> {
     loop {
         let path = parser_common::parse_path(tokens, pos)?;
         parser_common::expect_token(tokens, pos, &Token::Eq, "=", "UpdateExpression")?;
-        let value = parse_value_expr(tokens, pos)?;
+        let value = parse_value_expr(tokens, pos, nesting)?;
         actions.push(UpdateAction::Set { path, value });
 
         if *pos < tokens.len() && tokens[*pos] == Token::Comma {
@@ -252,8 +300,12 @@ fn parse_remove_actions(
 }
 
 /// Parse a SET value expression: `operand` or `operand +/- operand`.
-fn parse_value_expr(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbError> {
-    let left = parse_set_operand(tokens, pos)?;
+fn parse_value_expr(
+    tokens: &[Token],
+    pos: &mut usize,
+    nesting: &mut Nesting,
+) -> Result<Expr, DynamoDbError> {
+    let left = parse_set_operand(tokens, pos, nesting)?;
 
     if *pos < tokens.len() {
         let arith_op = match &tokens[*pos] {
@@ -263,7 +315,7 @@ fn parse_value_expr(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbE
         };
         if let Some(op) = arith_op {
             *pos += 1;
-            let right = parse_set_operand(tokens, pos)?;
+            let right = parse_set_operand(tokens, pos, nesting)?;
             return Ok(Expr::Arithmetic {
                 left: Box::new(left),
                 op,
@@ -285,7 +337,11 @@ fn parse_value_expr(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbE
 /// 2026-10-14: `SET x = foo(x), b = ` reports the syntax error at the end,
 /// not the unknown function name), and deferring the semantic checks gives
 /// the same precedence.
-fn parse_set_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbError> {
+fn parse_set_operand(
+    tokens: &[Token],
+    pos: &mut usize,
+    nesting: &mut Nesting,
+) -> Result<Expr, DynamoDbError> {
     if *pos >= tokens.len() {
         return Err(validation_err("Invalid UpdateExpression: expected operand"));
     }
@@ -298,7 +354,10 @@ fn parse_set_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDb
         }
         Token::Ident(_) => {
             if *pos + 1 < tokens.len() && tokens[*pos + 1] == Token::LParen {
-                parse_set_function_call(tokens, pos)
+                nesting.enter()?;
+                let call = parse_set_function_call(tokens, pos, nesting)?;
+                nesting.leave();
+                Ok(call)
             } else {
                 parser_common::parse_path(tokens, pos).map(Expr::Path)
             }
@@ -306,7 +365,9 @@ fn parse_set_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDb
         Token::NameRef(_) => parser_common::parse_path(tokens, pos).map(Expr::Path),
         Token::LParen => {
             *pos += 1; // consume '('
-            let expr = parse_value_expr(tokens, pos)?;
+            nesting.enter()?;
+            let expr = parse_value_expr(tokens, pos, nesting)?;
+            nesting.leave();
             if *pos >= tokens.len() || tokens[*pos] != Token::RParen {
                 return Err(validation_err(
                     "Invalid UpdateExpression: expected closing ')'",
@@ -321,7 +382,11 @@ fn parse_set_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDb
     }
 }
 
-fn parse_set_function_call(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbError> {
+fn parse_set_function_call(
+    tokens: &[Token],
+    pos: &mut usize,
+    nesting: &mut Nesting,
+) -> Result<Expr, DynamoDbError> {
     let name = match &tokens[*pos] {
         Token::Ident(n) => n.clone(),
         _ => {
@@ -342,10 +407,10 @@ fn parse_set_function_call(tokens: &[Token], pos: &mut usize) -> Result<Expr, Dy
             "Invalid UpdateExpression: Syntax error; token: \")\", near: \"()\"",
         ));
     }
-    let mut args = vec![parse_set_operand(tokens, pos)?];
+    let mut args = vec![parse_set_operand(tokens, pos, nesting)?];
     while *pos < tokens.len() && tokens[*pos] == Token::Comma {
         *pos += 1;
-        args.push(parse_set_operand(tokens, pos)?);
+        args.push(parse_set_operand(tokens, pos, nesting)?);
     }
 
     parser_common::expect_token(tokens, pos, &Token::RParen, ")", "UpdateExpression")?;
@@ -414,4 +479,5 @@ fn validation_err(msg: &str) -> DynamoDbError {
 }
 
 #[cfg(test)]
+#[path = "update_parser_tests.rs"]
 mod tests;

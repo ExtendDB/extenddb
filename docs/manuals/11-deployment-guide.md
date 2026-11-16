@@ -73,8 +73,8 @@ ExtendDB runs in Docker or Kubernetes. The binary has no runtime dependencies be
 Example Dockerfile:
 
 ```dockerfile
-# Match rust-version in Cargo.toml
-FROM rust:1.95 AS builder
+# Match rust-version in Cargo.toml, and the Debian release of the runtime stage
+FROM rust:1.91.1-bookworm AS builder
 WORKDIR /src
 COPY . .
 RUN cargo build --release
