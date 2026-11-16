@@ -3,9 +3,9 @@
 
 //! Pins `extenddb.sample.toml` to the configuration structs of this crate, to
 //! `LimitsConfig` and to the backup store structs this crate re-exports. Each
-//! `[storage.<backend>]` section is pinned by its backend crate. `docs/configuration.md` is generated from the sample, so a
-//! field added to a struct without a sample line fails here before the page
-//! can go stale.
+//! `[storage.<backend>]` section is pinned by its backend crate.
+//! `docs/configuration.md` is generated from the sample, so a field added to
+//! a struct without a sample line fails here before the page can go stale.
 
 use crate::backup::{BackupConfig, BackupStoreConfig, FilesystemStoreConfig, S3StoreConfig};
 use crate::sample_toml_support as support;
@@ -135,10 +135,8 @@ fn backup_section_matches_backup_config() {
     support::pin(&root, "backup", &["spool_path"], &BackupConfig::default());
 }
 
-/// The backup store structs have no `Default`: `path` and `bucket` are
-/// required, and `region` and `endpoint` are `Option<String>` with no
-/// default. The sample shows examples for those four, so their values are not
-/// compared.
+/// `path`, `bucket`, `region` and `endpoint` have no default, so the sample's
+/// values for them are examples and are not compared.
 #[test]
 fn backup_store_sections_match_the_store_config() {
     let root = support::sample();

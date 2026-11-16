@@ -79,8 +79,10 @@
 # `ValidationException` naming `server.region`, since no backup ARN can be
 # formed; a backup taken earlier under such a region keeps an ARN that
 # `DescribeBackup`, `DeleteBackup` and `RestoreTableFromBackup` refuse as not
-# valid. See the [upgrade manual](./manuals/07-upgrade-manual.md) before
-# changing it on a deployment that has backups.
+# valid. A backup ARN of the caller's account in another region is resolved
+# in the server's region first, then as written. See the
+# [upgrade manual](./manuals/07-upgrade-manual.md) before changing it on a
+# deployment that has backups.
 # region = "us-east-1"
 
 # Directory for runtime files (the process ID file). A leading ~ expands to
@@ -259,7 +261,8 @@
 # path = "extenddb.sqlite"
 
 # Connection pool size. Writes are serialized by the engine whatever the
-# size. A file database raises a value of 1 to 2 and logs it at info, because
+# size. A file database raises a value of 1 to 2 and logs it at info
+# (`SQLite pool_size 1 raised to 2 for a file-backed database: ...`), because
 # a backup holds one reader connection for its whole duration while its
 # batches write through another; use 3 or more so a running backup does not
 # contend with ordinary requests. Besides the `[backup] max_concurrent_jobs`
@@ -517,7 +520,7 @@
 # --failed` prints the FAILED ones with their reason. At least
 # `stale_job_after_secs`: the reconciler deletes a stopped job's late object
 # only under its row, so the row outlives the window in which that job can
-# still write.
+# still write; a smaller value is refused at startup.
 # failed_row_retention_secs = 604800
 
 # The reconciler's cycle, in seconds; it also runs once at startup. Each cycle
