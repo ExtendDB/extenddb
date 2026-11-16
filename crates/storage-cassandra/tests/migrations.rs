@@ -640,7 +640,7 @@ async fn migration_1_converges_a_legacy_catalog_and_stops_on_a_table_of_another_
     let catalog = format!("{prefix}_catalog");
     keyspace(&session, &catalog).await;
     // A catalog with the legacy files' tables and no ledger, as a release
-    // before 1.0 left it, with the traces in its settings: the version row,
+    // before 0.1.15 left it, with the traces in its settings: the version row,
     // the marker, and a setting an operator changed.
     run_baseline_unrecorded(&session, &catalog, StoreKind::Catalog)
         .await

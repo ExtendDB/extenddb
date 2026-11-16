@@ -129,7 +129,7 @@ async fn a_registration_the_database_ended_is_taken_again_on_a_new_session() {
 
 /// A migration that holds the catalog when the server tries again refuses
 /// the attempt, which leaves no key behind: one that holds both keys, and one
-/// of a release before 1.0 that holds the migration key alone. Once it has
+/// of a release before 0.1.15 that holds the migration key alone. Once it has
 /// finished without a change, the server registers again.
 #[tokio::test]
 async fn a_migration_that_holds_the_catalog_refuses_the_registration() {

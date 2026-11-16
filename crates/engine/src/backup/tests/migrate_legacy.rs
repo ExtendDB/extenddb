@@ -41,8 +41,8 @@ fn seed_legacy(fake: &Fake, arn: &str, items: Vec<Item>) {
     let mut source = source(Some(definition("PAY_PER_REQUEST")));
     source.backup_arn = arn.to_owned();
     source.item_count = i64::try_from(items.len()).unwrap();
-    // An id of the 13-digit shape (a 0.1.x backup's) keeps the fixture's
-    // time.
+    // An id of the 13-digit shape (a backup of 0.1.14 or earlier) keeps the
+    // fixture's time.
     source.backup_creation_date_time =
         extenddb_storage::util::backup_creation_date_time(arn).unwrap_or(CREATED);
     fake.sources.lock().unwrap().insert(arn.to_owned(), source);
@@ -282,8 +282,8 @@ async fn an_in_catalog_backup_is_copied_under_its_arn_and_replaced_by_its_row() 
 type Prepare = Box<dyn Fn(&Fake, &str)>;
 
 /// Every refusal that needs no copy keeps the in-catalog backup and writes
-/// nothing to the store: an id of the 13-digit shape a 0.1.x release
-/// issued (13 digits with a suffix, and bare), a table name the store-prefix rules refuse, a name the
+/// nothing to the store: an id of the 13-digit shape that 0.1.14 and
+/// earlier releases issued (13 digits with a suffix, and bare), a table name the store-prefix rules refuse, a name the
 /// manifest refuses, a definition whose vector state is unknown (a SQLite
 /// backup from before catalog 0.0.4), vector indexes (the legacy restore's
 /// own refusal), a backend that cannot read the backup (MongoDB's without
@@ -300,13 +300,13 @@ async fn each_refusal_before_the_copy_keeps_the_in_catalog_backup_and_writes_not
         (
             thirteen,
             Box::new(|_, _| {}),
-            "has the 13-digit shape a 0.1.x release issued",
+            "has the 13-digit shape that 0.1.14 and earlier releases issued",
             false,
         ),
         (
             bare,
             Box::new(|_, _| {}),
-            "has the 13-digit shape a 0.1.x release issued",
+            "has the 13-digit shape that 0.1.14 and earlier releases issued",
             false,
         ),
         (

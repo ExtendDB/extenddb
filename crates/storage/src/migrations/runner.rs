@@ -12,7 +12,8 @@ use super::registry::{MigrationId, RELEASED_THROUGH};
 use super::status::{AppliedStep, CatalogStatus, MigrationError, Pending, RunReport};
 use super::table::{Body, Kind, Migration, StoreKind};
 
-/// Every store's ledger, catalog first, and the catalog's pre-1.0 traces.
+/// Every store's ledger, catalog first, and the traces a release before 0.1.15
+/// left in the catalog's settings.
 #[derive(Debug, Clone)]
 struct Snapshot {
     ledgers: Vec<(StoreRef, Vec<LedgerRow>)>,
@@ -49,7 +50,7 @@ impl Snapshot {
     }
 
     /// Whether the store is a catalog: it has a ledger row, or a
-    /// `catalog_version` row a release before 1.0 wrote.
+    /// `catalog_version` row a release before 0.1.15 wrote.
     fn initialized(&self) -> bool {
         !self.catalog_rows().is_empty() || self.traces.catalog_version.is_some()
     }
@@ -139,7 +140,7 @@ impl<'a, B: MigrationBackend> Runner<'a, B> {
     }
 
     /// Run the convergent migrations again, repairing a catalog a release
-    /// before 1.0 wrote to (`WrittenByOlderRelease`): each convergent body
+    /// before 0.1.15 wrote to (`WrittenByOlderRelease`): each convergent body
     /// reruns, the `catalog_version` row is written again, and the ledger
     /// rows already there stay as they are, with their notes and
     /// `applied_at`. A recorded migration that is not convergent does not

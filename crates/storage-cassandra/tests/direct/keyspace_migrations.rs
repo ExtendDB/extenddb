@@ -43,9 +43,9 @@ struct Schema {
     added_columns: &'static [(&'static str, &'static str)],
 }
 
-/// Migration 1's catalog body: the tables, index and columns of the 0.1.x
-/// catalog migrations V001 to V005, apart from `continuous_backups` and
-/// `metrics`, which migrations 5 and 10 drop (see [`DROPPED`]), and with
+/// Migration 1's catalog body: the tables, index and columns of the
+/// catalog migrations V001 to V005 of 0.1.14 and earlier, apart from
+/// `continuous_backups` and `metrics`, which migrations 5 and 10 drop (see [`DROPPED`]), and with
 /// `account_metrics`, which migration 10 creates in place of `metrics`. The
 /// runner's ledger and the serving registrations are in neither list.
 const CATALOG: Schema = Schema {
@@ -87,8 +87,8 @@ const CATALOG: Schema = Schema {
     ],
 };
 
-/// Migration 1's account body: the tables and indexes of the 0.1.x data
-/// migrations V001 and V002.
+/// Migration 1's account body: the tables and indexes of the data
+/// migrations V001 and V002 of 0.1.14 and earlier.
 const ACCOUNT: Schema = Schema {
     tables: &[
         "backup_items",
@@ -250,7 +250,7 @@ async fn problems_in(
 }
 
 /// Before every migration run the session selects another keyspace with
-/// `USE`, as the 0.1.x runners on the same session did before #632:
+/// `USE`, as the runners of earlier releases on the same session did before #632:
 /// `extenddb init` and `extenddb migrate` migrate the catalog keyspace and
 /// then each account keyspace on one session, and CreateAccount migrates
 /// its keyspace on the engine's session, which every other caller shares.

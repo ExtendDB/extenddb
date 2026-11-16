@@ -168,9 +168,9 @@ pub fn status_message(status: &CatalogStatus, advice: &Advice<'_>) -> String {
                     "Stop the server.",
                 ),
                 (None, None) => (
-                    "the catalog has no migration ledger (a release before 1.0 created it)"
+                    "the catalog has no migration ledger (a release before 0.1.15 created it)"
                         .to_owned(),
-                    "Stop every server that uses this catalog: a server of a release before 1.0 \
+                    "Stop every server that uses this catalog: a server of a release before 0.1.15 \
                      is not detected while it runs.",
                 ),
             };
@@ -208,8 +208,8 @@ pub fn status_message(status: &CatalogStatus, advice: &Advice<'_>) -> String {
              recorded it, or restore the backup taken before it ran."
         ),
         CatalogStatus::WrittenByOlderRelease { trace } => format!(
-            "a release before 1.0 wrote to this catalog after it was migrated ({trace}).\nStop \
-             every server of a release before 1.0, then run:\n{}",
+            "a release before 0.1.15 wrote to this catalog after it was migrated ({trace}).\nStop \
+             every server of a release before 0.1.15, then run:\n{}",
             advice.command("--yes --reconverge")
         ),
         CatalogStatus::AheadIncompatible { .. } => format!(
