@@ -468,7 +468,11 @@ mod tests {
         }
         // The table name is checked as for any operation.
         assert_eq!(
-            message("SearchVectors", json!({ "TableName": NUL, "IndexName": "vidx" })).unwrap(),
+            message(
+                "SearchVectors",
+                json!({ "TableName": NUL, "IndexName": "vidx" })
+            )
+            .unwrap(),
             one(NUL, "tableName", PAT)
         );
     }
