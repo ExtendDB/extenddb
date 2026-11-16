@@ -201,7 +201,7 @@ pub fn parse_update_expr(
         if limits.enforce_reserved_keywords {
             validate_no_reserved_words(&update_tokens)?;
         }
-        parse_update_from(&update_tokens, update_expr)
+        parse_update_from(&update_tokens, update_expr, limits.max_expression_depth)
     })
     .map_err(|e| prefix_expression_error(e, ExpressionKind::Update))
 }
@@ -580,6 +580,106 @@ mod tests {
         assert!(
             matches!(&err, DynamoDbError::ValidationException(msg)
                 if msg.contains("Expression size has exceeded the maximum allowed size")),
+            "got {err:?}"
+        );
+    }
+
+    /// Size and token limits raised so only the depth limit refuses the
+    /// expressions below.
+    fn raised() -> LimitsConfig {
+        LimitsConfig {
+            max_expression_length_bytes: 4 << 20,
+            max_expression_tokens: 1 << 20,
+            ..LimitsConfig::default()
+        }
+    }
+
+    /// Run `parse` on a thread with half a server worker's 2 MiB stack,
+    /// failing the test after 10 seconds instead of hanging.
+    fn on_small_stack(
+        what: &'static str,
+        parse: impl FnOnce() -> Result<(), DynamoDbError> + Send + 'static,
+    ) -> Result<(), DynamoDbError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(move || {
+                let _ = tx.send(parse());
+            })
+            .expect("spawn the parse thread");
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(answer) => answer,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                std::panic::resume_unwind(worker.join().expect_err("no answer and no panic"))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("{what} ran for 10 s"),
+        }
+    }
+
+    #[test]
+    fn update_expression_past_the_depth_limit_is_refused() {
+        let limits = raised();
+        let nested = |levels: usize| {
+            format!(
+                "SET qty = {}:v{}",
+                "(qty + ".repeat(levels),
+                ")".repeat(levels)
+            )
+        };
+        let at_limit = nested(limits.max_expression_depth);
+        assert!(parse_update_expr(&at_limit, &limits).is_ok());
+        for levels in [limits.max_expression_depth + 1, 50_000] {
+            let expr = nested(levels);
+            let err = on_small_stack("deep update", move || {
+                parse_update_expr(&expr, &raised()).map(drop)
+            })
+            .unwrap_err();
+            assert!(
+                matches!(&err, DynamoDbError::ValidationException(msg)
+                    if msg == "Invalid UpdateExpression: expression nesting depth exceeded"),
+                "{levels} levels: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_expression_calls_past_the_depth_limit_are_refused() {
+        let expr = format!(
+            "SET qty = {}:v{}",
+            "list_append(qty, ".repeat(50_000),
+            ")".repeat(50_000)
+        );
+        let err = on_small_stack("deep update calls", move || {
+            parse_update_expr(&expr, &raised()).map(drop)
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+                if msg == "Invalid UpdateExpression: expression nesting depth exceeded"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn condition_and_filter_size_calls_past_the_depth_limit_are_refused() {
+        let expr = format!("{}qty{} > :v", "size(".repeat(50_000), ")".repeat(50_000));
+        let condition = expr.clone();
+        let err = on_small_stack("deep condition", move || {
+            parse_condition_expr(&condition, &raised()).map(drop)
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+                if msg == "Invalid ConditionExpression: expression nesting depth exceeded"),
+            "got {err:?}"
+        );
+        let err = on_small_stack("deep filter", move || {
+            parse_optional_filter(Some(&expr), &raised()).map(drop)
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+                if msg == "Invalid FilterExpression: expression nesting depth exceeded"),
             "got {err:?}"
         );
     }

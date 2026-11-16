@@ -18,6 +18,10 @@
 //! path          → (ident | name_ref) ( '.' (ident | name_ref) | '[' number ']' )*
 //! function_call → function_name '(' operand ( ',' operand )* ')'
 //! ```
+//!
+//! A parenthesized condition, a `NOT` and a function call read as an operand
+//! each nest one level, up to `max_depth`. A function call that is the
+//! condition itself nests none.
 
 use super::ast::{CompareOp, Expr};
 use super::parser_common;
@@ -142,12 +146,20 @@ fn parse_primary(
     // semantic error, so `foo(pk) AND` is reported as the syntax error at the
     // end, not as the unknown function name that comes first in the text.
     // Deferring the semantic checks here gives the same precedence.
-    let left = parse_operand(tokens, pos)?;
+    //
+    // `parse_operand` counts a function call as one nesting level. A call
+    // that is the condition itself is not an operand and nests no level, so
+    // it is parsed here directly.
+    let left = if is_condition_call(tokens, *pos) {
+        parse_function_call(tokens, pos, depth, max_depth)?
+    } else {
+        parse_operand(tokens, pos, depth, max_depth)?
+    };
 
     if *pos < tokens.len() {
         if let Some(op) = try_comparator(&tokens[*pos]) {
             *pos += 1;
-            let right = parse_operand(tokens, pos)?;
+            let right = parse_operand(tokens, pos, depth, max_depth)?;
             return Ok(Expr::Compare {
                 left: Box::new(left),
                 op,
@@ -158,9 +170,9 @@ fn parse_primary(
         // BETWEEN operand AND operand
         if tokens[*pos] == Token::Between {
             *pos += 1;
-            let low = parse_operand(tokens, pos)?;
+            let low = parse_operand(tokens, pos, depth, max_depth)?;
             parser_common::expect_token(tokens, pos, &Token::And, "AND", "ConditionExpression")?;
-            let high = parse_operand(tokens, pos)?;
+            let high = parse_operand(tokens, pos, depth, max_depth)?;
             return Ok(Expr::Between {
                 operand: Box::new(left),
                 low: Box::new(low),
@@ -172,10 +184,10 @@ fn parse_primary(
         if tokens[*pos] == Token::In {
             *pos += 1;
             parser_common::expect_token(tokens, pos, &Token::LParen, "(", "ConditionExpression")?;
-            let mut list = vec![parse_operand(tokens, pos)?];
+            let mut list = vec![parse_operand(tokens, pos, depth, max_depth)?];
             while *pos < tokens.len() && tokens[*pos] == Token::Comma {
                 *pos += 1;
-                list.push(parse_operand(tokens, pos)?);
+                list.push(parse_operand(tokens, pos, depth, max_depth)?);
             }
             parser_common::expect_token(tokens, pos, &Token::RParen, ")", "ConditionExpression")?;
             return Ok(Expr::In {
@@ -195,7 +207,12 @@ fn parse_primary(
     ))
 }
 
-fn parse_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbError> {
+fn parse_operand(
+    tokens: &[Token],
+    pos: &mut usize,
+    depth: &mut usize,
+    max_depth: usize,
+) -> Result<Expr, DynamoDbError> {
     if *pos >= tokens.len() {
         return Err(validation_err(
             "Invalid ConditionExpression: expected operand",
@@ -209,8 +226,18 @@ fn parse_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbErro
             Ok(expr)
         }
         Token::Ident(_) => {
+            // A function call, `size(path)` or any other name, nests one
+            // level. Its name is checked by `validate_condition_semantics`.
             if *pos + 1 < tokens.len() && tokens[*pos + 1] == Token::LParen {
-                return parse_function_call(tokens, pos);
+                *depth += 1;
+                if *depth > max_depth {
+                    return Err(validation_err(
+                        "Invalid ConditionExpression: expression nesting depth exceeded",
+                    ));
+                }
+                let call = parse_function_call(tokens, pos, depth, max_depth)?;
+                *depth -= 1;
+                return Ok(call);
             }
             let elements = parser_common::parse_path(tokens, pos)?;
             Ok(Expr::Path(elements))
@@ -225,7 +252,12 @@ fn parse_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbErro
     }
 }
 
-fn parse_function_call(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbError> {
+fn parse_function_call(
+    tokens: &[Token],
+    pos: &mut usize,
+    depth: &mut usize,
+    max_depth: usize,
+) -> Result<Expr, DynamoDbError> {
     let name = match &tokens[*pos] {
         Token::Ident(n) => n.clone(),
         _ => {
@@ -250,10 +282,10 @@ fn parse_function_call(tokens: &[Token], pos: &mut usize) -> Result<Expr, Dynamo
             "Invalid ConditionExpression: Syntax error; token: \")\", near: \"()\"",
         ));
     }
-    let mut args = vec![parse_operand(tokens, pos)?];
+    let mut args = vec![parse_operand(tokens, pos, depth, max_depth)?];
     while *pos < tokens.len() && tokens[*pos] == Token::Comma {
         *pos += 1;
-        args.push(parse_operand(tokens, pos)?);
+        args.push(parse_operand(tokens, pos, depth, max_depth)?);
     }
 
     parser_common::expect_token(tokens, pos, &Token::RParen, ")", "ConditionExpression")?;
@@ -271,6 +303,33 @@ fn try_comparator(token: &Token) -> Option<CompareOp> {
         Token::Ge => Some(CompareOp::Ge),
         _ => None,
     }
+}
+
+/// Whether the tokens at `pos` start a function call with no comparator,
+/// `BETWEEN` or `IN` after its closing parenthesis, that is, a call that is
+/// the condition itself and not an operand.
+fn is_condition_call(tokens: &[Token], pos: usize) -> bool {
+    if !matches!(tokens.get(pos), Some(Token::Ident(_)))
+        || tokens.get(pos + 1) != Some(&Token::LParen)
+    {
+        return false;
+    }
+    let mut open = 0_usize;
+    for (i, token) in tokens.iter().enumerate().skip(pos + 1) {
+        match token {
+            Token::LParen => open += 1,
+            Token::RParen => {
+                open -= 1;
+                if open == 0 {
+                    return !tokens.get(i + 1).is_some_and(|next| {
+                        try_comparator(next).is_some() || matches!(next, Token::Between | Token::In)
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn validation_err(msg: &str) -> DynamoDbError {
