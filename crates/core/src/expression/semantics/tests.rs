@@ -10,6 +10,7 @@ use crate::expression::parser::parse_condition;
 use crate::expression::resolver::ExpressionMaps;
 use crate::expression::tokenizer::tokenize;
 use crate::expression::update_parser::parse_update_sections;
+use crate::limits::LimitsConfig;
 use crate::types::AttributeValue;
 use std::collections::HashMap;
 
@@ -41,7 +42,12 @@ fn l() -> AttributeValue {
 
 fn update_err(expr: &str, m: &ExpressionMaps) -> String {
     let tokens = tokenize(expr).unwrap();
-    let parsed = parse_update_sections(&tokens, Some(expr)).unwrap();
+    let parsed = parse_update_sections(
+        &tokens,
+        Some(expr),
+        LimitsConfig::default().max_expression_depth,
+    )
+    .unwrap();
     match validate_update_semantics(&parsed, m) {
         Ok(()) => "OK".to_owned(),
         Err(DynamoDbError::ValidationException(msg)) => msg,
