@@ -126,9 +126,8 @@ fn walk_set_value(expr: &Expr, maps: &ExpressionMaps, nested: bool) -> Result<()
 }
 
 /// `ADD` takes a number or a set; `DELETE` takes a set. The service names
-/// the offending type in its own vocabulary and the same allowed set for
-/// both operators (measured: `DELETE s :n` reports `NUMBER`, `typeSet:
-/// ALLOWED_FOR_ADD_OPERAND`).
+/// the offending type in its own vocabulary and the allowed set of the
+/// operator (measured 2026-11-16).
 fn check_add_delete_value(
     operator: &str,
     value: &Expr,
@@ -156,7 +155,7 @@ fn check_add_delete_value(
     Err(validation(
         kind,
         &format!(
-            "Incorrect operand type for operator or function; operator: {operator}, operand type: {type_name}, typeSet: ALLOWED_FOR_ADD_OPERAND"
+            "Incorrect operand type for operator or function; operator: {operator}, operand type: {type_name}, typeSet: ALLOWED_FOR_{operator}_OPERAND"
         ),
     ))
 }

@@ -218,13 +218,13 @@ fn add_and_delete_operand_types() {
     assert_eq!(
         update_err("DELETE s :n", &m),
         format!(
-            "{U}Incorrect operand type for operator or function; operator: DELETE, operand type: NUMBER, typeSet: ALLOWED_FOR_ADD_OPERAND"
+            "{U}Incorrect operand type for operator or function; operator: DELETE, operand type: NUMBER, typeSet: ALLOWED_FOR_DELETE_OPERAND"
         )
     );
     assert_eq!(
         update_err("DELETE s :l", &m),
         format!(
-            "{U}Incorrect operand type for operator or function; operator: DELETE, operand type: LIST, typeSet: ALLOWED_FOR_ADD_OPERAND"
+            "{U}Incorrect operand type for operator or function; operator: DELETE, operand type: LIST, typeSet: ALLOWED_FOR_DELETE_OPERAND"
         )
     );
     assert_eq!(update_err("ADD n :n, s :ss DELETE t :ss", &m), "OK");

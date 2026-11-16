@@ -5,7 +5,8 @@
 After the grammar pass, the service walks the parsed expression once, in
 expression order, checking each node after its operands, and only then
 checks overlapping paths and unused names and values. Every expectation
-below was captured from the service on 2026-10-14 (issue #108).
+below was captured from the service on 2026-10-14 (issue #108), except
+the DELETE typeSet, captured on 2026-11-16.
 
 UpdateExpression:
   - `+` and `-` take numbers; `list_append` takes lists; `ADD` takes a number
@@ -66,7 +67,7 @@ PR = "Invalid ProjectionExpression: "
 UNDEF_VALUE = "An expression attribute value used in expression is not defined; attribute value: {}"
 UNDEF_NAME = "An expression attribute name used in the document path is not defined; attribute name: {}"
 OPERAND_TYPE = "Incorrect operand type for operator or function; operator or function: {}, operand type: {}"
-ADD_DELETE_TYPE = "Incorrect operand type for operator or function; operator: {}, operand type: {}, typeSet: ALLOWED_FOR_ADD_OPERAND"
+ADD_DELETE_TYPE = "Incorrect operand type for operator or function; operator: {0}, operand type: {1}, typeSet: ALLOWED_FOR_{0}_OPERAND"
 INVALID_FN = "Invalid function name; function: {}"
 NOT_THIS_WAY = "The function is not allowed to be used this way in an expression; function: {}"
 NOT_IN_UPDATE = "The function is not allowed in an update expression; function: {}"
