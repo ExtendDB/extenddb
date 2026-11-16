@@ -22,6 +22,12 @@ const MAX_CLOCK_SKEW_SECS: i64 = 15 * 60;
 const SCOPE_DATE_COMPLAINT: &str =
     "Date in Credential scope does not match YYYYMMDD from ISO-8601 version of date from HTTP. ";
 
+/// The refusal for a request whose `SignedHeaders` does not name
+/// `x-amz-target`. It follows the form of the `Host` refusal; the service's
+/// own wording for this case has not been measured.
+const TARGET_NOT_SIGNED: &str =
+    "\"X-Amz-Target\" must be a \"SignedHeader\" in the AWS Authorization.";
+
 /// Whether the scope `date` is the `YYYYMMDD` prefix of `timestamp`.
 ///
 /// The comparison is on bytes, so a date of another length, a date carrying
@@ -120,6 +126,16 @@ pub fn verify_signature(
     if !signed_lower.split(';').any(|h| h == "host") {
         return Err(DynamoDbError::InvalidSignatureException(
             "\"Host\" must be a \"SignedHeader\" in the AWS Authorization.".to_owned(),
+        ));
+    }
+
+    // X-Amz-Target names the operation, for the DynamoDB and the DynamoDB
+    // Streams prefixes alike, and the server dispatches on it. A signature
+    // that does not cover it would let anyone holding one signed request
+    // replay its body as another operation, so it must be signed.
+    if !signed_lower.split(';').any(|h| h == "x-amz-target") {
+        return Err(DynamoDbError::InvalidSignatureException(
+            TARGET_NOT_SIGNED.to_owned(),
         ));
     }
 
@@ -238,6 +254,10 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 #[cfg(test)]
+#[path = "verify_target_tests.rs"]
+mod target_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -292,7 +312,7 @@ mod tests {
         }
     }
 
-    fn make_headers(date: &str) -> HeaderMap {
+    pub(super) fn make_headers(date: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
         h.insert("x-amz-date", date.parse().unwrap());
         h.insert("host", "localhost:18443".parse().unwrap());
@@ -300,6 +320,7 @@ mod tests {
             "content-type",
             "application/x-amz-json-1.0".parse().unwrap(),
         );
+        h.insert("x-amz-target", "DynamoDB_20120810.GetItem".parse().unwrap());
         h
     }
 
@@ -402,7 +423,7 @@ mod tests {
     fn unsigned_payload_literal_is_a_plain_signature_mismatch() {
         let mut headers = make_headers("20260415T120000Z");
         headers.insert("x-amz-content-sha256", "UNSIGNED-PAYLOAD".parse().unwrap());
-        let signed = "content-type;host;x-amz-content-sha256;x-amz-date";
+        let signed = "content-type;host;x-amz-content-sha256;x-amz-date;x-amz-target";
         // Sign the way such a client does: the literal in place of the body hash.
         let creq = canonical::canonical_request("POST", "/", "", &headers, signed, SIGNED_BODY)
             .rsplit_once('\n')
@@ -431,7 +452,11 @@ mod tests {
     /// auth H-1: Signature mismatch returns InvalidSignatureException.
     #[test]
     fn signature_mismatch_returns_invalid_signature() {
-        let parsed = make_parsed("dynamodb", "20260415", "content-type;host;x-amz-date");
+        let parsed = make_parsed(
+            "dynamodb",
+            "20260415",
+            "content-type;host;x-amz-date;x-amz-target",
+        );
         let headers = make_headers("20260415T120000Z");
         // Wrong secret → wrong signature → InvalidSignatureException
         let err = verify_signature(&parsed, "wrong-secret", "POST", "/", "", &headers, b"{}");
@@ -446,13 +471,17 @@ mod tests {
         }
     }
 
-    const SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
-    const SIGNED_BODY: &[u8] = br#"{"TableName":"t","Item":{"pk":{"S":"signed"}}}"#;
+    pub(super) const SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+    pub(super) const SIGNED_BODY: &[u8] = br#"{"TableName":"t","Item":{"pk":{"S":"signed"}}}"#;
     const TAMPERED_BODY: &[u8] = br#"{"TableName":"t","Item":{"pk":{"S":"tampered"}}}"#;
 
     /// Sign `body` the way a client does: the same canonical request and
     /// string-to-sign the server reconstructs, over the body the client sent.
-    fn sign(headers: &HeaderMap, signed_headers: &str, body: &[u8]) -> ParsedAuthorization {
+    pub(super) fn sign(
+        headers: &HeaderMap,
+        signed_headers: &str,
+        body: &[u8],
+    ) -> ParsedAuthorization {
         let creq = canonical::canonical_request("POST", "/", "", headers, signed_headers, body);
         let sts = canonical::string_to_sign(
             "20260415T120000Z",
@@ -465,7 +494,7 @@ mod tests {
         parsed
     }
 
-    fn assert_signature_mismatch(result: Result<(), DynamoDbError>) {
+    pub(super) fn assert_signature_mismatch(result: Result<(), DynamoDbError>) {
         match result {
             Err(DynamoDbError::InvalidSignatureException(msg)) => {
                 assert!(
@@ -480,14 +509,22 @@ mod tests {
     #[test]
     fn correctly_signed_body_verifies() {
         let headers = make_headers("20260415T120000Z");
-        let parsed = sign(&headers, "content-type;host;x-amz-date", SIGNED_BODY);
+        let parsed = sign(
+            &headers,
+            "content-type;host;x-amz-date;x-amz-target",
+            SIGNED_BODY,
+        );
         verify_signature(&parsed, SECRET, "POST", "/", "", &headers, SIGNED_BODY).unwrap();
     }
 
     #[test]
     fn body_changed_after_signing_is_rejected() {
         let headers = make_headers("20260415T120000Z");
-        let parsed = sign(&headers, "content-type;host;x-amz-date", SIGNED_BODY);
+        let parsed = sign(
+            &headers,
+            "content-type;host;x-amz-date;x-amz-target",
+            SIGNED_BODY,
+        );
         assert_signature_mismatch(verify_signature(
             &parsed,
             SECRET,
@@ -510,7 +547,7 @@ mod tests {
             "x-amz-content-sha256",
             canonical::sha256_hex(SIGNED_BODY).parse().unwrap(),
         );
-        let signed = "content-type;host;x-amz-content-sha256;x-amz-date";
+        let signed = "content-type;host;x-amz-content-sha256;x-amz-date;x-amz-target";
         let parsed = sign(&headers, signed, SIGNED_BODY);
         // Sanity: the same request with the signed body verifies.
         verify_signature(&parsed, SECRET, "POST", "/", "", &headers, SIGNED_BODY).unwrap();
@@ -532,7 +569,11 @@ mod tests {
     fn unsigned_content_sha256_header_does_not_affect_verification() {
         let mut headers = make_headers("20260415T120000Z");
         headers.insert("x-amz-content-sha256", "0".repeat(64).parse().unwrap());
-        let parsed = sign(&headers, "content-type;host;x-amz-date", SIGNED_BODY);
+        let parsed = sign(
+            &headers,
+            "content-type;host;x-amz-date;x-amz-target",
+            SIGNED_BODY,
+        );
         verify_signature(&parsed, SECRET, "POST", "/", "", &headers, SIGNED_BODY).unwrap();
     }
 }
