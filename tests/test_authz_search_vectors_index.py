@@ -10,10 +10,8 @@ never matched and the search ran. Each case below gives a principal
 ``dynamodb:*`` on ``*`` plus one Deny, and checks the refusal and its error
 type against a running server.
 
-An IndexName that is not one index segment (``vidx/extra``) is authorized as
-written, so a Deny on ``table/<T>/index/*`` refuses it; a caller allowed to
-search gets ValidationException from the engine, because no vector index can
-carry such a name.
+An IndexName outside ``[a-zA-Z0-9_.-]+`` (``vidx/extra``) gets ValidationException
+for every caller, before the policy decision, as Query and Scan do.
 
 The principals are builtin-IAM users provisioned through the management API.
 The module skips when the backend does not support vector indexes, unless
@@ -40,6 +38,7 @@ from botocore.awsrequest import AWSRequest
 from botocore.credentials import Credentials
 
 from management_helpers import ManagementClient
+from test_search_vectors_condition_limit import _expect_vectors
 
 REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 VECTOR = [{"N": "0.1"}, {"N": "0.2"}, {"N": "0.3"}, {"N": "0.4"}]
@@ -71,16 +70,6 @@ def _require_auth_env() -> tuple[str, str, str]:
             "These must be set by devtools/run-tests before test execution."
         )
     return endpoint, admin_user, admin_pass
-
-
-def _expect_vectors() -> bool | None:
-    """``EXTENDDB_EXPECT_VECTORS``: 1 requires vector support, 0 forbids it."""
-    value = os.environ.get("EXTENDDB_EXPECT_VECTORS")
-    if value is None:
-        return None
-    if value not in ("0", "1"):
-        pytest.fail(f"EXTENDDB_EXPECT_VECTORS must be 0 or 1, got {value!r}")
-    return value == "1"
 
 
 class Principal:
@@ -202,9 +191,44 @@ def _search(p: Principal, table: str, index: str = "vidx") -> requests.Response:
     )
 
 
-def _assert_denied(resp: requests.Response) -> None:
-    assert resp.status_code == 400, resp.text
-    assert _error_type(resp) == "AccessDeniedException", resp.text
+def _policy(effect: str, resource: str) -> dict:
+    """Allow: SearchVectors on ``resource`` only. Deny: allow-all plus a Deny on it."""
+    if effect == "Allow":
+        return {
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Effect": "Allow", "Action": "dynamodb:SearchVectors", "Resource": resource}
+            ],
+        }
+    return _allow_all_deny(resource)
+
+
+# (effect, resource suffix on the table ARN, status, error type)
+POLICY_CASES = [
+    ("Deny", "/index/vidx", 400, "AccessDeniedException"),
+    ("Deny", "/index/*", 400, "AccessDeniedException"),
+    ("Deny", "/index/other", 200, None),
+    ("Deny", "", 200, None),  # a table-only Deny does not cover SearchVectors
+    ("Allow", "", 400, "AccessDeniedException"),  # a table-only Allow loses it
+    ("Allow", "/index/*", 200, None),
+]
+
+
+@pytest.mark.parametrize(
+    ("effect", "suffix", "status", "error"),
+    POLICY_CASES,
+    ids=[f"{e}-table{s or ''}" for e, s, _, _ in POLICY_CASES],
+)
+def test_search_is_authorized_against_the_index_arn(
+    principal, vector_table, effect, suffix, status, error
+):
+    p = principal(_policy(effect, vector_table["table_arn"] + suffix))
+    resp = _search(p, vector_table["name"])
+    assert resp.status_code == status, resp.text
+    if error:
+        assert _error_type(resp) == error, resp.text
+    else:
+        assert len(resp.json()["SearchResults"]) == 1, resp.text
 
 
 def test_allowed_principal_searches_the_index(principal, vector_table):
@@ -213,67 +237,30 @@ def test_allowed_principal_searches_the_index(principal, vector_table):
     assert len(resp.json()["SearchResults"]) == 1, resp.text
 
 
-def test_deny_on_the_vector_index_refuses_search(principal, vector_table):
+def test_deny_on_the_vector_index_also_applies_to_the_table_arn_name(
+    principal, vector_table
+):
     p = principal(_allow_all_deny(vector_table["table_arn"] + "/index/vidx"))
-    _assert_denied(_search(p, vector_table["name"]))
-    # The same table named by its ARN reaches the same Deny.
-    _assert_denied(_search(p, vector_table["table_arn"]))
+    resp = _search(p, vector_table["table_arn"])
+    assert resp.status_code == 400, resp.text
+    assert _error_type(resp) == "AccessDeniedException", resp.text
 
 
-def test_deny_on_the_index_wildcard_refuses_search(principal, vector_table):
-    p = principal(_allow_all_deny(vector_table["table_arn"] + "/index/*"))
-    _assert_denied(_search(p, vector_table["name"]))
-
-
-def test_deny_on_another_index_permits_search(principal, vector_table):
-    p = principal(_allow_all_deny(vector_table["table_arn"] + "/index/other"))
-    resp = _search(p, vector_table["name"])
-    assert resp.status_code == 200, resp.text
-
-
-def test_index_name_with_a_slash_is_authorized_as_written(principal, vector_table):
-    # A Deny on every index of the table matches an IndexName with an extra
-    # segment, so the request never reaches the engine.
-    denied = principal(_allow_all_deny(vector_table["table_arn"] + "/index/*"))
-    _assert_denied(_search(denied, vector_table["name"], "vidx/extra"))
-    # A caller allowed to search gets ValidationException: no vector index
-    # carries that name, so the engine searches nothing.
-    resp = _search(principal(ALLOW_ALL), vector_table["name"], "vidx/extra")
+@pytest.mark.parametrize(
+    "policy_resource",
+    [None, "/index/*"],
+    ids=["allow-all", "deny-index-wildcard"],
+)
+def test_index_name_outside_the_pattern_is_refused_before_authorization(
+    principal, vector_table, policy_resource
+):
+    # Query and Scan refuse such a name with ValidationException before the
+    # policy decision; SearchVectors does the same for every caller.
+    policy = (
+        ALLOW_ALL
+        if policy_resource is None
+        else _allow_all_deny(vector_table["table_arn"] + policy_resource)
+    )
+    resp = _search(principal(policy), vector_table["name"], "vidx/extra")
     assert resp.status_code == 400, resp.text
     assert _error_type(resp) == "ValidationException", resp.text
-
-
-def test_deny_on_the_bare_table_arn_does_not_block_search(principal, vector_table):
-    # SearchVectors is authorized against the index ARN, so a Deny written only
-    # on table/<T> no longer applies to it. Fencing a table needs table/<T>/*.
-    p = principal(_allow_all_deny(vector_table["table_arn"]))
-    resp = _search(p, vector_table["name"])
-    assert resp.status_code == 200, resp.text
-
-
-def test_allow_on_the_bare_table_arn_does_not_permit_search(principal, vector_table):
-    # An Allow written only on table/<T> no longer covers SearchVectors.
-    only_table = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Action": "dynamodb:SearchVectors",
-                "Resource": vector_table["table_arn"],
-            }
-        ],
-    }
-    _assert_denied(_search(principal(only_table), vector_table["name"]))
-    # An Allow on the table's indexes does cover it.
-    on_indexes = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Action": "dynamodb:SearchVectors",
-                "Resource": vector_table["table_arn"] + "/index/*",
-            }
-        ],
-    }
-    resp = _search(principal(on_indexes), vector_table["name"])
-    assert resp.status_code == 200, resp.text

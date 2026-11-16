@@ -762,9 +762,9 @@ pub(crate) fn authz_targets(
             v
         }
         // Query and Scan on an index, and SearchVectors, authorize the index
-        // ARN. SearchVectors always names a vector index, and the service
-        // documents `table/<T>/index/<I>` as the resource for
-        // dynamodb:SearchVectors. With a table ARN in TableName the denial
+        // ARN. The service documents `table/<T>/index/<I>` as the resource for
+        // dynamodb:SearchVectors. A request that names no index (IndexName
+        // missing or empty) authorizes the table, as Query and Scan do. With a table ARN in TableName the denial
         // names that ARN with the index appended; any other ARN in TableName
         // (an index ARN, a malformed resource) names the canonical index ARN,
         // so the denial never names a resource the caller did not write.

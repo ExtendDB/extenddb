@@ -737,18 +737,21 @@ upgrading:
   authorized against `table/<name>/index/<index>`. A policy that granted a
   principal only `table/<name>` no longer allows reads or searches of that
   table's indexes. Grant `table/<name>/index/<index>` or
-  `table/<name>/index/*` as needed. This follows the DynamoDB developer guide.
+  `table/<name>/index/*` as needed. This matches DynamoDB for Query and Scan.
+  For SearchVectors it follows the DynamoDB developer guide, which gives
+  `table/<name>/index/<index>` as the resource; it has not been measured
+  against the service.
 - **Fencing a whole table with a Deny.** Index reads, `SearchVectors`,
   `ListStreams` with a TableName, and `ListBackups` with a TableName are
   authorized against a sub-resource ARN (`table/<name>/index/*`,
   `table/<name>/stream/*`, `table/<name>/backup/*`), not the bare
   `table/<name>`. A `Deny` written only on `table/<name>` therefore does not
   cover them, and `SearchVectors` needs the index ARN
-  (`table/<name>/index/<index>`) in the `Allow` as well. An operator who means to
-  fence a whole table adds `table/<name>/*` to the `Deny` alongside
+  (`table/<name>/index/<index>`) in the `Allow` as well. An operator who means
+  to fence a whole table adds `table/<name>/*` to the `Deny` alongside
   `table/<name>`.
-- **Index reads and resource tags.** An index Query or Scan evaluates the base
-  table's resource tags (`aws:ResourceTag/*`; `dynamodb:ResourceTag/*` is
+- **Index reads and resource tags.** An index Query or Scan, and SearchVectors,
+  evaluate the base table's resource tags (`aws:ResourceTag/*`; `dynamodb:ResourceTag/*` is
   absent for every resource),
   because a secondary index inherits the tags of its table. An ABAC `Deny` or
   `Allow` conditioned on the table's tags applies to its indexes.
