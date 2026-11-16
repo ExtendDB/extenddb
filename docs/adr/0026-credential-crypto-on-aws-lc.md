@@ -92,6 +92,6 @@ HMAC-SHA256 and signature compare use aws-lc-rs (Option 2).
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is maintained by
-engineers at Amazon Web Services. It is not Amazon DynamoDB and contains no DynamoDB source
-code. "DynamoDB" is a trademark of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

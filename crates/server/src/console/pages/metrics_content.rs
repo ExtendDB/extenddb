@@ -106,7 +106,7 @@ Per-operation average latency by request phase. Segments sum to total.
 </div>
 <h2 style="margin-top:1.5rem">Raw Metrics</h2>
 <table id="metrics-table">
-<thead><tr><th>Metric</th><th>Table</th><th>Operation</th><th>Plane</th><th>Sum</th><th>Count</th><th>Min</th><th>Max</th></tr></thead>
+<thead><tr><th>Metric</th><th>Account</th><th>Table</th><th>Operation</th><th>Plane</th><th>Sum</th><th>Count</th><th>Min</th><th>Max</th></tr></thead>
 <tbody id="metrics-body"></tbody>
 </table>
 </div>"#;
@@ -177,7 +177,7 @@ async function refresh(){
     buildLatencyOps(m);
     renderSegments(segs);
     const body=document.getElementById('metrics-body');
-    body.innerHTML=m.map(x=>{const dims=x.dimensions||[],tbl=(dims.find(d=>d.TableName)||{}).TableName||'',op=(dims.find(d=>d.Operation)||{}).Operation||'',pl=isDataOp(op)?'Data':'Control';return'<tr><td>'+esc(x.metric)+'</td><td>'+esc(tbl)+'</td><td>'+esc(op)+'</td><td>'+pl+'</td><td>'+x.sum.toFixed(2)+'</td><td>'+x.count+'</td><td>'+x.min.toFixed(2)+'</td><td>'+x.max.toFixed(2)+'</td></tr>';}).join('');
+    body.innerHTML=m.map(x=>{const dims=x.dimensions||[],acct=(dims.find(d=>d.AccountId)||{}).AccountId||'',tbl=(dims.find(d=>d.TableName)||{}).TableName||'',op=(dims.find(d=>d.Operation)||{}).Operation||'',pl=isDataOp(op)?'Data':'Control';return'<tr><td>'+esc(x.metric)+'</td><td>'+esc(acct)+'</td><td>'+esc(tbl)+'</td><td>'+esc(op)+'</td><td>'+pl+'</td><td>'+x.sum.toFixed(2)+'</td><td>'+x.count+'</td><td>'+x.min.toFixed(2)+'</td><td>'+x.max.toFixed(2)+'</td></tr>';}).join('');
     if(bkts.length>0)renderBkt(bkts);else{['c-latency','c-availability','c-rcu','c-wcu','c-cp-latency','c-cp-errors'].forEach(id=>drawLine(id,[],[]));};
   }catch(e){console.error('metrics fetch failed',e);}
 }

@@ -55,7 +55,6 @@ Environment variables use double-underscore (`__`) as a nesting separator, prefi
 | `storage.postgres.read_replica_url` | `EXTENDDB__STORAGE__POSTGRES__READ_REPLICA_URL` |
 | `storage.sqlite.path` | `EXTENDDB__STORAGE__SQLITE__PATH` |
 | `auth.provider` | `EXTENDDB__AUTH__PROVIDER` |
-| `auth.encryption_key` | `EXTENDDB__AUTH__ENCRYPTION_KEY` |
 | `auth.aws_iam.region` | `EXTENDDB__AUTH__AWS_IAM__REGION` |
 | `auth.aws_iam.identity_cache_ttl_seconds` | `EXTENDDB__AUTH__AWS_IAM__IDENTITY_CACHE_TTL_SECONDS` |
 | `auth.aws_iam.policy_cache_ttl_seconds` | `EXTENDDB__AUTH__AWS_IAM__POLICY_CACHE_TTL_SECONDS` |
@@ -124,7 +123,8 @@ statement_timeout_secs = 30
 [auth]
 provider = "builtin"     # "none" | "builtin" | "aws_iam" | future: "azure_ad"
 region = "us-east-1"     # Region for SigV4 validation
-# encryption_key: Set via EXTENDDB__AUTH__ENCRYPTION_KEY env var (never in config files)
+# The credential encryption key is not read from this file: `extenddb init` generates it
+# and stores it in the catalog `settings` table (see docs/manuals/10-security-model.md).
 credential_cache_ttl_secs = 300
 policy_cache_ttl_secs = 300
 timestamp_skew_secs = 300
@@ -432,7 +432,6 @@ Type=simple
 ExecStart=/usr/local/bin/extenddb --config /etc/extenddb/config.toml
 Restart=always
 RestartSec=5
-Environment=EXTENDDB__AUTH__ENCRYPTION_KEY=<secret>
 
 [Install]
 WantedBy=multi-user.target
@@ -462,11 +461,6 @@ spec:
             secretKeyRef:
               name: db-credentials
               key: connection-string
-        - name: EXTENDDB__AUTH__ENCRYPTION_KEY
-          valueFrom:
-            secretKeyRef:
-              name: auth-secrets
-              key: encryption-key
         livenessProbe:
           httpGet:
             path: /health
@@ -609,6 +603,6 @@ For development environments, a default credential pair can be seeded automatica
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is maintained by
-engineers at Amazon Web Services. It is not Amazon DynamoDB and contains no DynamoDB source
-code. "DynamoDB" is a trademark of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

@@ -47,9 +47,27 @@ cargo build --workspace
 # Rust unit tests
 cargo test --workspace
 
-# Integration tests (requires a running extenddb server)
-devtools/run-tests --extenddb --pytest
+# Integration tests (requires a running extenddb server; the variable says
+# where that server writes its backups, see the developer test guide)
+EXTENDDB_TEST_BACKUP_STORE=filesystem devtools/run-tests --extenddb --pytest
+
+# The backup store and job suites start servers of their own from the
+# release build named by EXTENDDB_BINARY, so they run by name (the S3 cells
+# need a moto server at EXTENDDB_TEST_S3_ENDPOINT; see the developer test
+# guide for the PostgreSQL and moto variables)
+EXTENDDB_BINARY=target/release/extenddb python3 -m pytest tests/test_backup_store_config.py tests/test_backup_job.py -v
 ```
+
+The MongoDB backup cells that read the store's root and the server's log
+(`EXTENDDB_TEST_BACKUP_ROOT`, `EXTENDDB_TEST_SERVER_LOG`) run through
+`devtools/run-mongodb-tests`, which exports both; its legacy LSI fallback
+cell needs the runner's `--backup-store none`. The cross-backend restore
+matrix is `devtools/backup-restore-matrix` (one cell per invocation, from the
+four per-backend release binaries; `pip install -r requirements-matrix.txt`
+for its MongoDB and Cassandra cells) and runs nightly from
+`.github/workflows/matrix-nightly.yml`. The developer test guide
+(`docs/manuals/06-developer-test-guide.md`, "Test Runner Script") has a
+paragraph on each.
 
 ### Code Style
 
@@ -63,6 +81,22 @@ cargo clippy -- -W clippy::pedantic -W clippy::unwrap_used -W clippy::expect_use
 - Use `cargo fmt` before committing.
 - Address all clippy warnings or add `#[allow(...)]` with a justification comment.
 - Avoid `.unwrap()` and `.expect()` in library crates — use `?` or explicit error handling.
+
+### Dependencies between workspace crates
+
+A crate depends on another workspace crate with `{ workspace = true }`. The
+root `[workspace.dependencies]` pins each workspace crate to the workspace
+version exactly (`=X.Y.Z`), because the crates publish to crates.io together
+([ADR-0029](docs/adr/0029-crates-io-packaging.md)). Declare a dev-dependency
+on a workspace crate by path with no version, for example
+`extenddb-storage = { path = "../storage", features = ["test-util"] }`, so
+that cargo drops it from the published manifest. The `package` job of the
+Test workflow checks both rules. To run the same check locally, on a tree
+with uncommitted changes too (the script needs Python 3.11 or later):
+
+```bash
+cargo package --workspace --no-verify --locked --allow-dirty && devtools/check-crate-packages
+```
 
 ## When you need an ADR or an RFC
 
@@ -341,27 +375,29 @@ SQLite, PostgreSQL, Cassandra and MongoDB migrate through this framework.
 
 ### Example: a nullable column on `tables`
 
-Migration 7, `table_note` (7 being the next free id at the time of writing;
-migration 6 is `backup_catalog_index`), adds a nullable `note TEXT` column to
-the catalog's `tables` table on SQLite and PostgreSQL.
+Migration 13, `table_note` (13 being the next free id at the time of writing;
+migrations 6, 7, 8, 9, 10, 11 and 12 are `backup_catalog_index`,
+`stream_pending`, `restore_progress`, `warm_throughput`, `account_metrics`,
+`attribute_name_escape` and `unique_access_key_ids`), adds a nullable
+`note TEXT` column to the catalog's `tables` table on SQLite and PostgreSQL.
 
 In `crates/storage/src/migrations/registry.rs`, at the end of the
 `migration_ids!` list:
 
 ```rust
     /// Adds a nullable `note` column to the `tables` catalog table.
-    TableNote = 7, "table_note",
+    TableNote = 13, "table_note",
         "add a nullable note column to the tables catalog";
 ```
 
 PostgreSQL has `ADD COLUMN IF NOT EXISTS`, so its body is a file,
-`crates/storage-postgres/migrations/0007_table_note.sql`:
+`crates/storage-postgres/migrations/0013_table_note.sql`:
 
 ```sql
 -- Copyright 2026 ExtendDB contributors
 -- SPDX-License-Identifier: Apache-2.0
 --
--- Migration 7, table_note, PostgreSQL catalog database: a nullable note
+-- Migration 13, table_note, PostgreSQL catalog database: a nullable note
 -- column on tables. IF NOT EXISTS makes a second run change nothing.
 
 ALTER TABLE tables ADD COLUMN IF NOT EXISTS note TEXT;
@@ -376,7 +412,7 @@ In `crates/storage-postgres/src/migrations/mod.rs`, the arm in `migration()`:
             bodies: vec![file_body!(
                 StoreKind::Catalog,
                 "migrations",
-                "0007_table_note.sql"
+                "0013_table_note.sql"
             )],
         },
 ```
@@ -389,19 +425,25 @@ and the id in the transactional arm of `runs_in()`:
         | MigrationId::SortKeyDefinitions
         | MigrationId::DropContinuousBackups
         | MigrationId::BackupCatalogIndex
+        | MigrationId::StreamPending
+        | MigrationId::RestoreProgress
+        | MigrationId::WarmThroughput
+        | MigrationId::AccountMetrics
+        | MigrationId::AttributeNameEscape
+        | MigrationId::UniqueAccessKeyIds
         | MigrationId::TableNote => RunsIn::Transaction,
 ```
 
 SQLite has no `ADD COLUMN IF NOT EXISTS`, and a file with a plain
 `ADD COLUMN` fails when it runs a second time, so the SQLite body is code
 that checks for the column first.
-`crates/storage-sqlite/src/migrations/m0007_table_note.rs`:
+`crates/storage-sqlite/src/migrations/m0013_table_note.rs`:
 
 ```rust
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Migration 7, `table_note`, SQLite: a nullable `note` column on `tables`.
+//! Migration 13, `table_note`, SQLite: a nullable `note` column on `tables`.
 //!
 //! SQLite has no `ADD COLUMN IF NOT EXISTS`, so the body reads the table's
 //! columns first and adds the column only when it is missing. A second run
@@ -413,10 +455,10 @@ use extenddb_storage::migrations::{CodeBody, Done, MigrationError};
 use super::SqliteStores;
 
 /// This file, whose SHA-256 the checksum test pins.
-pub(crate) const SOURCE: &str = include_str!("m0007_table_note.rs");
+pub(crate) const SOURCE: &str = include_str!("m0013_table_note.rs");
 
 /// Recorded as this migration's checksum. Changes only with a new migration.
-const FINGERPRINT: &str = "0007_table_note/sqlite/1";
+const FINGERPRINT: &str = "0013_table_note/sqlite/1";
 
 pub(crate) struct TableNote;
 
@@ -455,7 +497,7 @@ beside the others:
 ```rust
 #[rustfmt::skip]
 #[allow(clippy::all, deprecated)]
-mod m0007_table_note;
+mod m0013_table_note;
 ```
 
 and the arm in `migration()`:
@@ -466,8 +508,8 @@ and the arm in `migration()`:
             convergent: true,
             bodies: vec![StoreBody::code(
                 StoreKind::Catalog,
-                &m0007_table_note::TableNote,
-                m0007_table_note::SOURCE,
+                &m0013_table_note::TableNote,
+                m0013_table_note::SOURCE,
             )],
         },
 ```
@@ -479,8 +521,8 @@ rows of `tables`:
 
 ```rust
 #[tokio::test]
-async fn migration_7_adds_the_note_column_to_tables() {
-    let db = temp_db("m7");
+async fn migration_13_adds_the_note_column_to_tables() {
+    let db = temp_db("m13");
     load_dump(&db, DEV_0_1_14).await;
     run(&db).await.expect("migrate");
     let mut text = dump(
@@ -490,12 +532,12 @@ async fn migration_7_adds_the_note_column_to_tables() {
     )
     .await;
     text.push_str(&dump(&db, "SELECT table_name, note FROM tables ORDER BY table_name").await);
-    golden("0007_table_note", &text);
+    golden("0013_table_note", &text);
 }
 ```
 
-`EXTENDDB_BLESS_EXPECTED=1 cargo test -p extenddb-storage-sqlite --lib migration_7`
-writes `crates/storage-sqlite/tests/fixtures/golden/0007_table_note.txt`, one
+`EXTENDDB_BLESS_EXPECTED=1 cargo test -p extenddb-storage-sqlite --lib migration_13`
+writes `crates/storage-sqlite/tests/fixtures/golden/0013_table_note.txt`, one
 tab-separated line per row under each query:
 
 ```
@@ -510,15 +552,15 @@ The PostgreSQL body is a file, so it has no golden test.
 The example declares `Kind::Breaking`. A nullable column can be additive by
 the rule in step 4, but declaring it additive needs the old-binary job, which
 this example does not add. As a breaking migration it makes a 1.x binary
-without migration 7 refuse a catalog that has it, and a rollback restores the
+without migration 13 refuse a catalog that has it, and a rollback restores the
 backup.
 
 The same PR changes the code that reads and writes `tables.note` in each
 backend's catalog store, and commits the `docs/schema/sqlite.txt` and
 `docs/schema/postgres.txt` that the integration jobs regenerate. It changes
 no per-table DDL, because `tables` is a catalog table, and adds no `RELEASED`
-entry. `extenddb migrate --list` then shows migration 7, and on a catalog at
-migration 6 `extenddb migrate` lists migration 7 as pending and exits 3.
+entry. `extenddb migrate --list` then shows migration 13, and on a catalog at
+migration 12 `extenddb migrate` lists migration 13 as pending and exits 3.
 
 ### Running the migration tests
 

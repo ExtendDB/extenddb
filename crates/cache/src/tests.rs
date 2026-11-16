@@ -662,7 +662,20 @@ async fn panicking_refresh_does_not_leak_inflight_flag() {
             }
         }
     });
-    let cache = SwrCache::new(loader, fast_config());
+    // A hard TTL far past the test's run, so the entry stays stale and is
+    // never hard-missed: a hard miss would reload through the miss path and
+    // hide a leaked flag.
+    let cache = SwrCache::new(
+        loader,
+        SwrCacheConfig {
+            ttl: Duration::from_secs(60),
+            ..fast_config()
+        },
+    );
+    // Bounds the waits below. A slow or busy runner may take far longer
+    // than the soft TTL to schedule the spawned refresh, so the test waits
+    // for each step instead of sleeping a fixed time.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
 
     // Prime cache.
     let v1 = cache.get("k".into()).await.unwrap().unwrap();
@@ -671,22 +684,29 @@ async fn panicking_refresh_does_not_leak_inflight_flag() {
     // Cross soft_ttl. Stale-hit spawns refresh #1, which panics.
     tokio::time::sleep(Duration::from_millis(80)).await;
     cache.get("k".into()).await.unwrap();
+    while calls.load(Ordering::SeqCst) < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first refresh never ran"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 
-    // Give the panicking refresh time to land. Tokio swallows the panic,
-    // but the RAII guard must have cleared `refresh_in_flight`.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Tokio swallows the panic and drops the task, and with it the RAII
+    // guard that clears `refresh_in_flight`. Until then a stale-hit counts
+    // as `refresh_skipped_inflight`; once the guard has run, a stale-hit
+    // spawns refresh #2, which succeeds. A leaked flag never lets one
+    // spawn, and the deadline fails the test.
+    while cache.metrics().snapshot().refresh_success == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no refresh succeeded after the first one panicked; got {:?}",
+            cache.metrics().snapshot()
+        );
+        cache.get("k".into()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 
-    // Without the guard, this stale-hit would increment
-    // `refresh_skipped_inflight` because the flag would still be `true`. With
-    // the guard, the next stale-hit successfully spawns refresh #2.
-    cache.get("k".into()).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let m = cache.metrics().snapshot();
-    assert!(
-        m.refresh_success >= 1,
-        "second refresh must succeed after first one panicked; got {m:?}"
-    );
     assert_eq!(
         calls.load(Ordering::SeqCst),
         3,

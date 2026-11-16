@@ -47,6 +47,16 @@ pub const FILES_MANIFEST_FILE: &str = "manifest-files.json";
 /// sees a manifest.
 pub const DATA_PREFIX: &str = "data/";
 
+/// The first component of a store key that is reserved for exports
+/// (`<root>/exports/...`). No account id is spelled this way (account ids
+/// are digits), and [`classify_store_key`] names it rather than relying on
+/// that.
+pub const EXPORTS_COMPONENT: &str = "exports";
+
+/// The third component of a store key that is reserved for the change-log
+/// archive (`<root>/<account>/<table>/changelog/...`). It is not a backup id.
+pub const CHANGELOG_COMPONENT: &str = "changelog";
+
 /// Longest table name `DynamoDB` accepts, kept here as a path-safety bound:
 /// a longer component would exceed common filesystem name limits. The
 /// engine's configurable minimum length is not enforced here; a shorter name
@@ -473,6 +483,33 @@ impl BackupArn {
     pub fn backup_id(&self) -> &str {
         &self.backup_id
     }
+
+    /// Whether `other` names this backup: the same partition, account,
+    /// table and backup id, in any region. A manifest a server of another
+    /// region wrote names the backup in that region, and the row of the
+    /// backup carries the region of the server that holds it; readers that
+    /// compare the two accept a difference in the region alone.
+    #[must_use]
+    pub fn names_same_backup(&self, other: &Self) -> bool {
+        self.partition == other.partition
+            && self.account_id == other.account_id
+            && self.table_name == other.table_name
+            && self.backup_id == other.backup_id
+    }
+
+    /// This backup's ARN spelled in `region`, or `None` when `region` is
+    /// not one an ARN can carry ([`check_backup_arn`]'s alphabet).
+    #[must_use]
+    pub fn in_region(&self, region: &str) -> Option<Self> {
+        Self::new(
+            &self.partition,
+            region,
+            &self.account_id,
+            &self.table_name,
+            &self.backup_id,
+        )
+        .ok()
+    }
 }
 
 impl std::fmt::Display for BackupArn {
@@ -487,6 +524,133 @@ impl std::str::FromStr for BackupArn {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::parse(s)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Store keys
+// ---------------------------------------------------------------------------
+
+/// What a key of a store listing is, relative to the backup prefixes
+/// [`BackupArn::store_prefix`] forms. See [`classify_store_key`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreKey<'a> {
+    /// Fewer than four components: a file at the root (the store's identity
+    /// file), or one directly in an account's or a table's directory. No
+    /// object of a backup has such a key.
+    Outside,
+    /// Under a reserved component, the one named: [`EXPORTS_COMPONENT`] first,
+    /// or [`CHANGELOG_COMPONENT`] third.
+    Reserved(&'static str),
+    /// Under `<a>/<b>/<c>/`, whose three components are not the prefix of a
+    /// backup a manifest can describe.
+    NotABackup {
+        /// `<a>/<b>/<c>/`, a slice of the key.
+        prefix: &'a str,
+        /// Why, with the untrusted components cut to a bounded length.
+        reason: String,
+    },
+    /// Under the prefix of a backup.
+    Backup {
+        /// `<account>/<table>/<backup_id>/`, a slice of the key, equal to
+        /// [`BackupArn::store_prefix`] of every ARN with these components.
+        prefix: &'a str,
+        /// The account id component.
+        account_id: &'a str,
+        /// The table name component.
+        table_name: &'a str,
+        /// The backup id component, in the 14-digit shape
+        /// [`format_backup_id`] produces.
+        backup_id: &'a str,
+    },
+}
+
+/// Classify a key of a store listing (relative to the store's root): under a
+/// backup prefix `<account>/<table>/<backup_id>/`, under a reserved component,
+/// under three components that are not a backup prefix, or outside every
+/// prefix.
+///
+/// A backup prefix is one whose components [`BackupArn::new`] accepts, in any
+/// partition and region (so a component carrying a separator, surrounding
+/// whitespace, a control or non-ASCII character, or a traversal component
+/// such as `..` is refused), and whose id has the 14-digit shape: only that
+/// shape carries the instant a manifest's `backup_creation_date_time` must
+/// equal, so a prefix under an earlier build's id (13 digits, with or without
+/// a suffix) holds no manifest this build can read.
+#[must_use]
+pub fn classify_store_key(key: &str) -> StoreKey<'_> {
+    let mut parts = key.splitn(4, '/');
+    let account_id = parts.next().unwrap_or_default();
+    let table_name = parts.next();
+    if account_id == EXPORTS_COMPONENT && table_name.is_some() {
+        return StoreKey::Reserved(EXPORTS_COMPONENT);
+    }
+    let (Some(table_name), Some(backup_id), Some(_)) = (table_name, parts.next(), parts.next())
+    else {
+        return StoreKey::Outside;
+    };
+    if backup_id == CHANGELOG_COMPONENT {
+        return StoreKey::Reserved(CHANGELOG_COMPONENT);
+    }
+    let prefix = &key[..account_id.len() + table_name.len() + backup_id.len() + 3];
+    match store_prefix_problem(account_id, table_name, backup_id) {
+        Some(reason) => StoreKey::NotABackup { prefix, reason },
+        None => StoreKey::Backup {
+            prefix,
+            account_id,
+            table_name,
+            backup_id,
+        },
+    }
+}
+
+/// The account id, table name and backup id of the backup prefix `key` is
+/// under, or `None` when [`classify_store_key`] finds it outside every backup
+/// prefix, under a reserved component, or under components that are not a
+/// backup prefix.
+#[must_use]
+pub fn parse_store_prefix(key: &str) -> Option<(&str, &str, &str)> {
+    match classify_store_key(key) {
+        StoreKey::Backup {
+            account_id,
+            table_name,
+            backup_id,
+            ..
+        } => Some((account_id, table_name, backup_id)),
+        StoreKey::Outside | StoreKey::Reserved(_) | StoreKey::NotABackup { .. } => None,
+    }
+}
+
+/// Why three path components are not a backup prefix, or `None` when they
+/// are. The rules are [`BackupArn::new`]'s; the partition and region given to
+/// it are placeholders that pass, since a prefix carries neither.
+fn store_prefix_problem(account_id: &str, table_name: &str, backup_id: &str) -> Option<String> {
+    const PARTITION: &str = "aws";
+    const REGION: &str = "us-east-1";
+    if BackupArn::new(PARTITION, REGION, account_id, table_name, backup_id).is_ok() {
+        return backup_id_epoch_millis(backup_id).is_none().then(|| {
+            format!(
+                "backup id {:?} has an earlier build's shape, which no manifest carries",
+                truncated(backup_id)
+            )
+        });
+    }
+    // Name the class of the refusal without the placeholder partition and
+    // region, which `BackupArn::new`'s own message would show.
+    let formatted = format_backup_arn(PARTITION, REGION, account_id, table_name, backup_id);
+    Some(match check_backup_arn(&formatted) {
+        Err(BackupArnError::Id) => format!("{:?} is not a backup id", truncated(backup_id)),
+        Err(BackupArnError::Invalid) => format!(
+            "account id {:?}, table name {:?} and backup id {:?} are not the components of a \
+             backup ARN",
+            truncated(account_id),
+            truncated(table_name),
+            truncated(backup_id)
+        ),
+        Ok(_) => match check_store_prefix_table_name(table_name) {
+            Err(e) => e.to_string(),
+            Ok(()) => "a component has surrounding whitespace".to_owned(),
+        },
+    })
 }
 
 #[cfg(test)]
@@ -523,6 +687,32 @@ mod tests {
         assert_eq!(arn.to_arn_string(), ARN);
         assert_eq!(arn.to_string(), ARN);
         assert_eq!(ARN.parse::<BackupArn>().unwrap(), arn);
+    }
+
+    /// Two spellings of one backup differ in the region alone; a change in
+    /// the partition, account, table or id names another backup.
+    #[test]
+    fn same_backup_in_another_region() {
+        let arn = BackupArn::parse(ARN).unwrap();
+        let west = arn.in_region("us-west-2").unwrap();
+        assert_eq!(
+            west.to_arn_string(),
+            "arn:aws:dynamodb:us-west-2:123456789012:table/Music/backup/01489602797149-73d8d5bc"
+        );
+        assert!(arn.names_same_backup(&west));
+        assert!(west.names_same_backup(&arn));
+        assert!(arn.names_same_backup(&arn));
+        for other in [
+            "arn:aws-cn:dynamodb:us-east-1:123456789012:table/Music/backup/01489602797149-73d8d5bc",
+            "arn:aws:dynamodb:us-east-1:123456789013:table/Music/backup/01489602797149-73d8d5bc",
+            "arn:aws:dynamodb:us-east-1:123456789012:table/Songs/backup/01489602797149-73d8d5bc",
+            "arn:aws:dynamodb:us-east-1:123456789012:table/Music/backup/01489602797149-73d8d5bd",
+        ] {
+            let other = BackupArn::parse(other).unwrap();
+            assert!(!arn.names_same_backup(&other), "{other}");
+        }
+        assert_eq!(arn.in_region("us east"), None, "outside the ARN alphabet");
+        assert_eq!(arn.in_region(""), None);
     }
 
     #[test]
@@ -797,5 +987,239 @@ mod tests {
         assert_eq!(SUMMARY_MANIFEST_FILE, "manifest-summary.json");
         assert_eq!(FILES_MANIFEST_FILE, "manifest-files.json");
         assert_eq!(DATA_PREFIX, "data/");
+        assert_eq!(EXPORTS_COMPONENT, "exports");
+        assert_eq!(CHANGELOG_COMPONENT, "changelog");
+    }
+
+    const ID: &str = "01489602797149-73d8d5bc";
+
+    fn not_a_backup(key: &str) -> String {
+        match classify_store_key(key) {
+            StoreKey::NotABackup { prefix, reason } => {
+                assert!(key.starts_with(prefix), "{key:?}: {prefix:?}");
+                assert_eq!(prefix.matches('/').count(), 3, "{key:?}: {prefix:?}");
+                assert!(prefix.ends_with('/'), "{key:?}: {prefix:?}");
+                assert_eq!(parse_store_prefix(key), None, "{key:?}");
+                reason
+            }
+            other => panic!("{key:?}: expected NotABackup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn store_keys_under_a_backup_prefix_parse_to_its_components() {
+        for name in [
+            EXTENDDB_MANIFEST_FILE,
+            MANIFEST_CHECKSUM_FILE,
+            "data/000001.json.gz",
+            "data/a/b/c",
+        ] {
+            let key = format!("123456789012/Music/{ID}/{name}");
+            assert_eq!(
+                classify_store_key(&key),
+                StoreKey::Backup {
+                    prefix: &format!("123456789012/Music/{ID}/"),
+                    account_id: "123456789012",
+                    table_name: "Music",
+                    backup_id: ID,
+                },
+                "{key}"
+            );
+            assert_eq!(
+                parse_store_prefix(&key),
+                Some(("123456789012", "Music", ID)),
+                "{key}"
+            );
+        }
+        // The prefix is the one `BackupArn::store_prefix` forms, whatever the
+        // ARN's partition and region.
+        for (partition, region, table) in [
+            ("aws", "us-east-1", "Music"),
+            ("aws-cn", "cn-north-1", "My.Table-2"),
+            ("aws-us-gov", "us-gov-west-1", "a_b"),
+        ] {
+            let arn = BackupArn::new(partition, region, "000000000001", table, ID).unwrap();
+            let key = format!("{}{EXTENDDB_MANIFEST_FILE}", arn.store_prefix());
+            let StoreKey::Backup { prefix, .. } = classify_store_key(&key) else {
+                panic!("{key}");
+            };
+            assert_eq!(prefix, arn.store_prefix());
+            assert_eq!(
+                parse_store_prefix(&key),
+                Some((arn.account_id(), arn.table_name(), arn.backup_id()))
+            );
+        }
+        // A table named like a reserved component is a table: `exports` is
+        // reserved only first and `changelog` only third.
+        for table in [EXPORTS_COMPONENT, CHANGELOG_COMPONENT] {
+            let key = format!("123/{table}/{ID}/{EXTENDDB_MANIFEST_FILE}");
+            assert_eq!(parse_store_prefix(&key), Some(("123", table, ID)), "{key}");
+        }
+    }
+
+    #[test]
+    fn store_keys_outside_every_prefix_and_under_reserved_components_are_skipped() {
+        for key in [
+            "",
+            "extenddb-store.json",
+            "123456789012",
+            "123456789012/Music",
+            "123456789012/Music/file",
+            &format!("123456789012/Music/{ID}"),
+            // A file named like a reserved component, not under it.
+            EXPORTS_COMPONENT,
+            "123456789012/Music/changelog",
+        ] {
+            assert_eq!(classify_store_key(key), StoreKey::Outside, "{key:?}");
+            assert_eq!(parse_store_prefix(key), None, "{key:?}");
+        }
+        for key in [
+            "exports/",
+            "exports/x",
+            "exports/123456789012/Music",
+            &format!("exports/123456789012/{ID}/{EXTENDDB_MANIFEST_FILE}"),
+            &format!("exports/Music/{ID}/{EXTENDDB_MANIFEST_FILE}"),
+        ] {
+            assert_eq!(
+                classify_store_key(key),
+                StoreKey::Reserved(EXPORTS_COMPONENT),
+                "{key:?}"
+            );
+            assert_eq!(parse_store_prefix(key), None, "{key:?}");
+        }
+        for key in [
+            "123456789012/Music/changelog/",
+            "123456789012/Music/changelog/000001.json.gz",
+            &format!("123456789012/Music/changelog/{ID}/{EXTENDDB_MANIFEST_FILE}"),
+        ] {
+            assert_eq!(
+                classify_store_key(key),
+                StoreKey::Reserved(CHANGELOG_COMPONENT),
+                "{key:?}"
+            );
+            assert_eq!(parse_store_prefix(key), None, "{key:?}");
+        }
+        // The reserved words are matched whole and by case: another
+        // component in their place is an account or an id like any other.
+        for key in [
+            "Exports/Music/x/y",
+            "exportsx/Music/x/y",
+            "123/Music/Changelog/x",
+            "123/Music/changelogs/x",
+        ] {
+            not_a_backup(key);
+        }
+    }
+
+    /// The id grid of `id_shape_grid_and_error_classes`, applied to the third
+    /// component: only the 14-digit shape is a backup prefix; the shapes an
+    /// earlier build issued are refused with their own reason, and every
+    /// other string is not a backup id.
+    #[test]
+    fn store_prefix_ids_are_the_fourteen_digit_shape_only() {
+        let mut ids: Vec<String> = Vec::new();
+        for millis_len in 0..=16usize {
+            for suffix_len in 0..=10usize {
+                ids.push(format!(
+                    "{}-{}",
+                    "1".repeat(millis_len),
+                    "a".repeat(suffix_len)
+                ));
+            }
+            ids.push("1".repeat(millis_len));
+        }
+        ids.extend(
+            [
+                "01489602797149-73D8D5BC",
+                "01489602797149-73d8d5bg",
+                "0148960279714x-73d8d5bc",
+                "01489602797149_73d8d5bc",
+                "01489602797149-73d8d5bc-0",
+                "-01489602797149-73d8d5bc",
+                "a4b1d6c2-0000-4000-8000-000000000000",
+            ]
+            .map(str::to_owned),
+        );
+        let (mut adopted, mut earlier, mut refused) = (0, 0, 0);
+        for id in &ids {
+            let key = format!("123456789012/Music/{id}/{EXTENDDB_MANIFEST_FILE}");
+            if backup_id_epoch_millis(id).is_some() {
+                assert_eq!(
+                    parse_store_prefix(&key),
+                    Some(("123456789012", "Music", id.as_str())),
+                    "{id}"
+                );
+                adopted += 1;
+            } else if is_backup_id(id) {
+                let reason = not_a_backup(&key);
+                assert!(reason.contains("earlier build's shape"), "{id}: {reason}");
+                earlier += 1;
+            } else {
+                let reason = not_a_backup(&key);
+                // An empty component is refused as a malformed path before
+                // the id rule is reached.
+                let expected = if id.is_empty() {
+                    "are not the components of a backup ARN"
+                } else {
+                    "not a backup id"
+                };
+                assert!(reason.contains(expected), "{id}: {reason}");
+                refused += 1;
+            }
+        }
+        // Every class was reached: the 14-digit form; 13 digits with a
+        // suffix and 13 bare digits; the rest.
+        assert_eq!((adopted, earlier), (1, 2), "{ids:?}");
+        assert!(refused > 100, "{refused}");
+    }
+
+    #[test]
+    fn store_prefix_components_with_traversal_or_separators_are_refused() {
+        let long = "a".repeat(MAX_TABLE_NAME_LEN + 1);
+        for key in [
+            // Traversal components.
+            format!("123/../{ID}/x"),
+            format!("123/./{ID}/x"),
+            format!("123/..../{ID}/x"),
+            format!("../Music/{ID}/x"),
+            format!("./Music/{ID}/x"),
+            "123/Music/../x".to_owned(),
+            "123/Music/./x".to_owned(),
+            // Empty components.
+            format!("/Music/{ID}/x"),
+            format!("123//{ID}/x"),
+            "123/Music//x".to_owned(),
+            // Separators and characters a component cannot carry.
+            format!("12:3/Music/{ID}/x"),
+            format!("123/Mu:sic/{ID}/x"),
+            format!("123/Music/{ID}:x/x"),
+            format!("12\\3/Music/{ID}/x"),
+            format!("123/Mu\\sic/{ID}/x"),
+            format!("123/Music/{ID}\\x/x"),
+            format!("123/Mu sic/{ID}/x"),
+            format!("123/Music\t/{ID}/x"),
+            format!("123/Music/{ID} /x"),
+            format!("123/Music/{ID}\n/x"),
+            format!(" 123/Music/{ID}/x"),
+            format!("123/Mu\u{0}sic/{ID}/x"),
+            format!("123/Mus\u{e9}c/{ID}/x"),
+            // An account is digits; a table name is at most 255 bytes.
+            format!("12345678901x/Music/{ID}/x"),
+            format!("arn:aws/Music/{ID}/x"),
+            format!("123/{long}/{ID}/x"),
+        ] {
+            let reason = not_a_backup(&key);
+            assert!(!reason.is_empty(), "{key:?}");
+            // The placeholder partition and region never reach the reason.
+            assert!(!reason.contains("us-east-1"), "{key:?}: {reason}");
+        }
+        // The reasons name the rule where one rule applies.
+        assert!(not_a_backup(&format!("123/../{ID}/x")).contains("is only dots"));
+        assert!(not_a_backup(&format!("123/Music/{ID}\n/x")).contains("surrounding whitespace"));
+        assert!(not_a_backup(&format!("123/{long}/{ID}/x")).contains("longer than 255"));
+        // The reason is bounded however long the components are.
+        let huge = "x".repeat(100_000);
+        let reason = not_a_backup(&format!("{huge}/{huge}/{huge}/x"));
+        assert!(reason.len() < 1_000, "{}", reason.len());
     }
 }

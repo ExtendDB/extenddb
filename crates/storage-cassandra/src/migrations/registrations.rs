@@ -14,6 +14,15 @@
 //! `migrate --yes`, which waits while a row exists, can see it gone. The server then stops admitting requests and stops its
 //! background workers, and registers again with a new row
 //! ([`super::registrar`]).
+//!
+//! A command that opens the catalog as a server does (`extenddb backup list`,
+//! `extenddb backup purge`) registers too, so a migration waits for it. The
+//! table has no column for the process's name, and a column would be a
+//! catalog migration, so a command's row carries its name in `release`,
+//! after the release and ` as ` (`1.0.0 as extenddb backup purge`;
+//! [`release_cell`] writes it and [`registered_servers`] reads it back), and
+//! the migration's wait prints the name. A row whose `release` has no
+//! ` as ` is a server's.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -58,9 +67,33 @@ impl RegistrationTimes {
     };
 }
 
-/// One running server, as `migrate --yes` names it.
+/// The name a server's registration carries; a command's carries its own
+/// (`extenddb backup list`).
+pub const SERVE_COMMAND: &str = "extenddb serve";
+
+/// What a registration writes in `release`: the release for a server, the
+/// release, ` as ` and the command's name for a command.
+pub(crate) fn release_cell(release: &str, command: &str) -> String {
+    if command == SERVE_COMMAND {
+        release.to_owned()
+    } else {
+        format!("{release} as {command}")
+    }
+}
+
+/// The release and the process name a `release` cell carries.
+fn split_release_cell(cell: &str) -> (String, String) {
+    match cell.split_once(" as ") {
+        Some((release, command)) => (release.to_owned(), command.to_owned()),
+        None => (cell.to_owned(), SERVE_COMMAND.to_owned()),
+    }
+}
+
+/// One running server, or a command registered as one, as `migrate --yes`
+/// names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Server {
+    pub(crate) command: String,
     pub(crate) host: String,
     pub(crate) pid: i32,
     pub(crate) release: String,
@@ -71,8 +104,8 @@ impl std::fmt::Display for Server {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "extenddb serve {} on {} (process {}, started {})",
-            self.release, self.host, self.pid, self.started_at
+            "{} {} on {} (process {}, started {})",
+            self.command, self.release, self.host, self.pid, self.started_at
         )
     }
 }
@@ -101,10 +134,14 @@ pub(crate) async fn registered_servers(
     found
         .iter()
         .map(|row| {
+            let (release, command) = split_release_cell(
+                &nullable::<String>(row, "release", "read a server")?.unwrap_or_default(),
+            );
             Ok(Server {
+                command,
                 host: nullable::<String>(row, "host", "read a server")?.unwrap_or_default(),
                 pid: nullable::<i32>(row, "pid", "read a server")?.unwrap_or_default(),
-                release: nullable::<String>(row, "release", "read a server")?.unwrap_or_default(),
+                release,
                 started_at: nullable::<String>(row, "started_at", "read a server")?
                     .unwrap_or_default(),
             })
@@ -511,6 +548,33 @@ mod tests {
                 retry_every: Duration::from_secs(1),
                 lost_after: Duration::from_secs(30),
             }
+        );
+    }
+
+    /// A server's `release` cell is the release; a command's carries its
+    /// name after ` as `, and the read gives both back, so the wait names
+    /// the command where it names a server `extenddb serve`.
+    #[test]
+    fn a_commands_release_cell_carries_its_name() {
+        use super::{SERVE_COMMAND, Server, release_cell, split_release_cell};
+        assert_eq!(release_cell("1.0.0", SERVE_COMMAND), "1.0.0");
+        let cell = release_cell("1.0.0", "extenddb backup purge");
+        assert_eq!(cell, "1.0.0 as extenddb backup purge");
+        let (release, command) = split_release_cell(&cell);
+        let server = Server {
+            command,
+            host: "host-a".to_owned(),
+            pid: 7,
+            release,
+            started_at: "2026-11-03T00:00:00Z".to_owned(),
+        };
+        assert_eq!(
+            server.to_string(),
+            "extenddb backup purge 1.0.0 on host-a (process 7, started 2026-11-03T00:00:00Z)"
+        );
+        assert_eq!(
+            split_release_cell("1.0.0"),
+            ("1.0.0".to_owned(), SERVE_COMMAND.to_owned())
         );
     }
 }

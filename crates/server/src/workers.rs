@@ -225,6 +225,11 @@ pub(crate) async fn metrics_flush_worker(
                         .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
                     MetricsRow {
                         bucket: bucket_ts,
+                        account_id: if b.account_id.is_empty() {
+                            None
+                        } else {
+                            Some(b.account_id.clone())
+                        },
                         metric: b.metric.to_string(),
                         table_name: if b.table_name.is_empty() {
                             None
@@ -288,7 +293,9 @@ mod tests {
     use super::{login_attempt_cleanup_worker, metrics_flush_worker};
     use extenddb_core::metrics::MetricsCollector;
     use extenddb_storage::CancellationToken;
-    use extenddb_storage::management_store::{MetricsRow, MetricsStore, OpResult, RateLimitStore};
+    use extenddb_storage::management_store::{
+        MetricsFilter, MetricsRow, MetricsStore, OpResult, RateLimitStore,
+    };
     use futures::future::BoxFuture;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -320,8 +327,7 @@ mod tests {
             &self,
             _start: time::OffsetDateTime,
             _end: time::OffsetDateTime,
-            _table_name: Option<&str>,
-            _metric: Option<&str>,
+            _filter: &MetricsFilter,
         ) -> BoxFuture<'_, OpResult<Vec<MetricsRow>>> {
             Box::pin(async { Ok(Vec::new()) })
         }
@@ -421,7 +427,7 @@ mod tests {
 
         // Buffer a data point younger than one flush interval — a steady-state
         // flush would deliberately leave this to accumulate.
-        metrics.record_latency(Some("test-table"), "PutItem", 1_234.0);
+        metrics.record_latency("111111111111", Some("test-table"), "PutItem", 1_234.0);
 
         let handle = tokio::spawn(metrics_flush_worker(metrics, store.clone(), token.clone()));
 
@@ -442,6 +448,15 @@ mod tests {
         assert!(
             store.inserted_count() > 0,
             "final flush lost the in-flight bucket: nothing was persisted on shutdown"
+        );
+        // The row keeps the account it was recorded for.
+        let inserted = store.inserted.lock().expect("lock poisoned");
+        assert!(
+            inserted
+                .iter()
+                .any(|r| r.account_id.as_deref() == Some("111111111111")
+                    && r.table_name.as_deref() == Some("test-table")),
+            "the flushed row lost its account"
         );
     }
 }

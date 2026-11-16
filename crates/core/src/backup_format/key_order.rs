@@ -151,6 +151,15 @@ pub fn hash_key_text(value: &AttributeValue) -> Option<Cow<'_, str>> {
     }
 }
 
+/// An untrusted string bounded for an error message, the format module's
+/// rule (`error::truncated`) reached from outside the module: the string
+/// when short, a prefix and the total length otherwise. Call sites format
+/// the result with `{:?}`.
+#[must_use]
+pub fn shown(s: &str) -> String {
+    truncated(s)
+}
+
 /// A table's key shape, resolved once from its key schema and attribute
 /// definitions, able to compare and validate items' keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -433,9 +442,17 @@ fn parse_number(name: &str, n: &str) -> Result<BigDecimal, FormatError> {
 }
 
 /// One key attribute's value checked as [`KeyOrder::validate_key_item`]
-/// checks it: the declared scalar type, not empty, and for `N` a valid
-/// number in normalized form. The error is the reason alone.
-fn check_key_value(
+/// checks it: not empty, the declared scalar type, and for `N` a valid
+/// number in normalized form, in that order, so a text under a key declared
+/// `S` is a value of the wrong type and not a malformed number. The error is
+/// the reason alone. Public for the restorable-item validator
+/// (`crate::validation::restorable_item`), which checks a multi-part key's
+/// attributes one by one with the same rule.
+///
+/// # Errors
+///
+/// [`FormatError::InvalidKey`] naming the attribute and what is wrong.
+pub fn check_key_value(
     name: &str,
     ty: ScalarAttributeType,
     value: &AttributeValue,
@@ -454,32 +471,7 @@ fn check_key_value(
     }
     let actual = match value {
         AttributeValue::S(_) => ScalarAttributeType::S,
-        AttributeValue::N(n) => {
-            let normalized = validate_and_normalize_number(n).map_err(|e| {
-                // The reason for a malformed number ends in the input, which
-                // is shown once, bounded, before it; the other reasons
-                // (overflow, underflow, too many digits) are fixed texts.
-                let reason = e.to_string();
-                let reason = match reason.strip_suffix(n.as_str()) {
-                    Some(rest) => rest.strip_suffix(": ").unwrap_or(rest).to_owned(),
-                    None => reason,
-                };
-                FormatError::InvalidKey(format!(
-                    "key attribute {:?} value {:?} is not a valid number: {reason}",
-                    shown(),
-                    truncated(n),
-                ))
-            })?;
-            if normalized != *n {
-                return Err(FormatError::InvalidKey(format!(
-                    "key attribute {:?} value {:?} is not in normalized form ({:?})",
-                    shown(),
-                    truncated(n),
-                    truncated(&normalized)
-                )));
-            }
-            ScalarAttributeType::N
-        }
+        AttributeValue::N(_) => ScalarAttributeType::N,
         AttributeValue::B(_) => ScalarAttributeType::B,
         _ => {
             return Err(FormatError::InvalidKey(format!(
@@ -493,6 +485,33 @@ fn check_key_value(
             "key attribute {:?} is {actual:?}, the schema declares {ty:?}",
             shown()
         )));
+    }
+    if let AttributeValue::N(n) = value {
+        let normalized = validate_and_normalize_number(n).map_err(|e| {
+            // The reason for a malformed number ends in the input, which is
+            // shown once, bounded, before it, so the input and the colon
+            // before it are taken off the end (the wire appends the input
+            // as it is, trailing whitespace included); the other reasons
+            // (overflow, underflow, too many digits) are fixed texts.
+            let reason = e.to_string();
+            let reason = match reason.strip_suffix(n.as_str()) {
+                Some(rest) => rest.strip_suffix(": ").unwrap_or(rest).to_owned(),
+                None => reason,
+            };
+            FormatError::InvalidKey(format!(
+                "key attribute {:?} value {:?} is not a valid number: {reason}",
+                shown(),
+                truncated(n),
+            ))
+        })?;
+        if normalized != *n {
+            return Err(FormatError::InvalidKey(format!(
+                "key attribute {:?} value {:?} is not in normalized form ({:?})",
+                shown(),
+                truncated(n),
+                truncated(&normalized)
+            )));
+        }
     }
     Ok(())
 }
@@ -971,6 +990,48 @@ mod tests {
         let long = item(&"p".repeat(5000), Some(AttributeValue::N("abc".into())));
         let err = order.endpoint_key(&long).unwrap_err();
         assert!(err.to_string().len() < 400, "{}", err.to_string().len());
+    }
+
+    /// `check_key_value`'s texts: the declared type is compared before an
+    /// `N` is parsed, so a text under an `S` key is a value of the wrong
+    /// type; a malformed `N` under an `N` key gives the wire's reason without
+    /// the input the wire appends (shown once, bounded, before it) and
+    /// without the colon that preceded it, whatever whitespace the input
+    /// ends in; the fixed reasons are carried whole.
+    #[test]
+    fn check_key_value_compares_the_type_before_parsing_and_strips_the_echoed_input() {
+        let reason = |ty, value: AttributeValue| match check_key_value("k", ty, &value) {
+            Err(FormatError::InvalidKey(reason)) => reason,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            reason(ScalarAttributeType::S, AttributeValue::N("abc".into())),
+            r#"key attribute "k" is N, the schema declares S"#
+        );
+        for bad in ["abc", "5 ", " 5", "5\t", "1e"] {
+            assert_eq!(
+                reason(ScalarAttributeType::N, AttributeValue::N(bad.into())),
+                format!(
+                    "key attribute \"k\" value {bad:?} is not a valid number: The parameter \
+                     cannot be converted to a numeric value"
+                ),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            reason(ScalarAttributeType::N, AttributeValue::N("1E126".into())),
+            "key attribute \"k\" value \"1E126\" is not a valid number: Number overflow. \
+             Attempting to store a number with magnitude larger than supported range"
+        );
+        assert_eq!(
+            reason(ScalarAttributeType::N, AttributeValue::N(String::new())),
+            "key attribute \"k\" value \"\" is not a valid number: The parameter cannot be \
+             converted to a numeric value"
+        );
+        assert_eq!(
+            reason(ScalarAttributeType::N, AttributeValue::N("5.0".into())),
+            r#"key attribute "k" value "5.0" is not in normalized form ("5")"#
+        );
     }
 
     #[test]

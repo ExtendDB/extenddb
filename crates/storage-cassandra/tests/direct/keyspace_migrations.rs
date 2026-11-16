@@ -44,12 +44,14 @@ struct Schema {
 }
 
 /// Migration 1's catalog body: the tables, index and columns of the 0.1.x
-/// catalog migrations V001 to V005, apart from `continuous_backups`, which
-/// migration 5 drops (see [`DROPPED`]). The runner's ledger and the serving
-/// registrations are in neither list.
+/// catalog migrations V001 to V005, apart from `continuous_backups` and
+/// `metrics`, which migrations 5 and 10 drop (see [`DROPPED`]), and with
+/// `account_metrics`, which migration 10 creates in place of `metrics`. The
+/// runner's ledger and the serving registrations are in neither list.
 const CATALOG: Schema = Schema {
     tables: &[
         "access_keys",
+        "account_metrics",
         "accounts",
         "admin_users",
         "backups_by_account",
@@ -67,7 +69,6 @@ const CATALOG: Schema = Schema {
         "idempotency_tokens_by_account",
         "indexes",
         "login_attempts",
-        "metrics",
         "schema_history",
         "settings",
         "tables",
@@ -195,8 +196,9 @@ async fn tables_in(session: &Arc<CassandraSession>, keyspace: &str) -> BTreeSet<
 }
 
 /// Tables that migration 1 creates and a later migration drops, which no
-/// keyspace holds after a run: migration 5 drops `continuous_backups`.
-const DROPPED: &[&str] = &["continuous_backups"];
+/// keyspace holds after a run: migration 5 drops `continuous_backups`, and
+/// migration 10 `metrics`.
+const DROPPED: &[&str] = &["continuous_backups", "metrics"];
 
 /// One line for each table, index or added column of `schema` that `keyspace`
 /// lacks, for each table of `other` (the other store kind's schema) it

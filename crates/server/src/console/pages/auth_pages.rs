@@ -14,7 +14,7 @@ use serde::Deserialize;
 
 use crate::console::ConsoleState;
 use crate::console::html;
-use crate::console::session::CredentialStamp;
+use crate::console::session::{CredentialStamp, SESSION_MAX_LIFETIME_SECS};
 use crate::management::CallerIdentity;
 use crate::management::auth::log_password_check_error;
 use crate::rate_limit::{self, LoginAttempt, LoginRefusal};
@@ -58,7 +58,7 @@ pub async fn login_submit(
         };
 
     let (token, _csrf) = state.sessions.create(identity, stamp).await;
-    let cookie = session_cookie(&token, 28800, state.secure_cookies);
+    let cookie = session_cookie(&token, SESSION_MAX_LIFETIME_SECS, state.secure_cookies);
 
     (
         StatusCode::SEE_OTHER,
@@ -220,7 +220,7 @@ async fn try_admin_login(
     let Some(hash) = hash else {
         return Ok(AdminLoginResult::NotFound);
     };
-    Ok(match verify_login(password, hash).await? {
+    Ok(match verify_login(password, Some(hash)).await? {
         Some(stamp) => {
             AdminLoginResult::Authenticated(CallerIdentity::Admin(username.to_owned()), stamp)
         }
@@ -228,34 +228,42 @@ async fn try_admin_login(
     })
 }
 
-/// `Ok(None)` is a wrong password or an unknown user; `Err(())` is a storage
-/// error, which the caller answers 500 and records as nothing.
+/// `Ok(None)` is a wrong password, an unknown user, a user without a console
+/// password or a name without `/`; `Err(())` is a storage error, which the
+/// caller answers 500 and records as nothing. A name without `/` names no IAM
+/// user. When no stored hash is found, the password is checked against a
+/// fixed hash, so that the login runs one bcrypt check, as a login for an
+/// existing admin or IAM user does.
 async fn try_iam_login(
     username: &str,
     password: &str,
     store: &dyn PasswordHashStore,
 ) -> Result<Option<(CallerIdentity, CredentialStamp)>, ()> {
-    let Some((acct_id, uname)) = username.split_once('/') else {
-        return Ok(None);
+    let user = username.split_once('/');
+    // `None` when the name has no `/`, or when the user does not exist or has
+    // no console password.
+    let hash = match user {
+        Some((acct_id, uname)) => {
+            store
+                .get_user_password_hash(acct_id, uname)
+                .await
+                .map_err(|e| {
+                    log_password_check_error("Console login: DB error during IAM user auth", &e)
+                })?
+        }
+        None => None,
     };
-    // `None` when the user does not exist or has no console password.
-    let hash = store
-        .get_user_password_hash(acct_id, uname)
-        .await
-        .map_err(|e| {
-            log_password_check_error("Console login: DB error during IAM user auth", &e)
-        })?;
-    let Some(hash) = hash else {
-        return Ok(None);
-    };
-    let Some(stamp) = verify_login(password, hash).await? else {
-        return Ok(None);
-    };
-    let identity = CallerIdentity::IamUser {
-        account_id: acct_id.to_owned(),
-        user_name: uname.to_owned(),
-    };
-    Ok(Some((identity, stamp)))
+    let stamp = verify_login(password, hash).await?;
+    Ok(match (user, stamp) {
+        (Some((acct_id, uname)), Some(stamp)) => {
+            let identity = CallerIdentity::IamUser {
+                account_id: acct_id.to_owned(),
+                user_name: uname.to_owned(),
+            };
+            Some((identity, stamp))
+        }
+        _ => None,
+    })
 }
 
 /// Verify a login password against the hash read from the catalog. On a
@@ -264,17 +272,23 @@ async fn try_iam_login(
 /// lands during the login either fails the login or ends the new session at
 /// its first request.
 ///
+/// `hash` is `None` when the login names no principal with a password. The
+/// password is then checked against a fixed hash and refused, so the login
+/// runs the same bcrypt work as a wrong password (see
+/// [`extenddb_storage::password::verify_stored_password`]).
+///
 /// All console login verification goes through this function, and through
 /// the bcrypt slots of [`extenddb_storage::password::verify_password`].
-/// `Ok(None)` is a wrong password. `Err(())` is a verification that did not
-/// run (no bcrypt slot within the wait, or a failed blocking task); the
-/// caller answers 500 and records nothing.
-async fn verify_login(password: &str, hash: String) -> Result<Option<CredentialStamp>, ()> {
-    let stamp = CredentialStamp::of(&hash);
-    let matched = extenddb_storage::password::verify_password(password.to_owned(), hash)
+/// `Ok(None)` is a wrong password or a login without a stored hash.
+/// `Err(())` is a verification that did not run (no bcrypt slot within the
+/// wait, or a failed blocking task); the caller answers 500 and records
+/// nothing.
+async fn verify_login(password: &str, hash: Option<String>) -> Result<Option<CredentialStamp>, ()> {
+    let stamp = hash.as_deref().map(CredentialStamp::of);
+    let matched = extenddb_storage::password::verify_stored_password(password.to_owned(), hash)
         .await
         .map_err(|e| log_password_check_error("Console login: password verification failed", &e))?;
-    Ok(matched.then_some(stamp))
+    Ok(stamp.filter(|_| matched))
 }
 
 #[cfg(test)]
@@ -395,6 +409,33 @@ mod tests {
         assert_eq!(page.status(), StatusCode::OK);
         assert!(body_text(page).await.contains("Invalid credentials"));
         assert_eq!(attempts.rows_for("admin", "198.51.100.91"), 1);
+    }
+
+    #[tokio::test]
+    async fn every_credential_check_runs_one_bcrypt_check() {
+        use extenddb_storage::password::count_verifications;
+
+        use crate::management::auth::tests::{LOGIN_CASES, Outcome, login_catalog};
+
+        let catalog = login_catalog().await;
+        for login in LOGIN_CASES {
+            let (checked, costs) =
+                count_verifications(check_credentials(login.username, login.password, &catalog))
+                    .await;
+            assert_eq!(
+                costs,
+                [login.cost],
+                "{}: bcrypt checks and their cost",
+                login.case
+            );
+            let login_result = checked.unwrap_or_else(|()| panic!("{}: storage error", login.case));
+            assert_eq!(
+                Outcome::of(login_result.as_ref().map(|(identity, _)| identity)),
+                login.outcome,
+                "{}",
+                login.case
+            );
+        }
     }
 }
 
