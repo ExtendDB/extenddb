@@ -48,7 +48,7 @@ The steps run in this order; every rejection is HTTP 400.
 8. Derive the signing key (HMAC-SHA256 chain over date, region, service, "aws4_request") and compare the computed signature with the provided one in constant time; mismatch: `InvalidSignatureException`
 9. Apply the deferred decisions from steps 3 and 6, after the signature check so that failure paths take the same time: an inactive key or a wrong or missing token is `UnrecognizedClientException`
 
-Request bodies are parsed before authentication (the service does the same), so a malformed body returns `SerializationException` whatever the signature. Headers not named in `SignedHeaders` do not take part in verification; the service behaves the same way, and clients sign every `x-amz-*` header they send.
+Request bodies are parsed before authentication (the service does the same), so a malformed body returns `SerializationException` whatever the signature. Headers not named in `SignedHeaders` do not take part in verification, as in the service, with one exception: `x-amz-target` must be signed (step 7). That requirement is ExtendDB hardening beyond the service, which accepts an unsigned `x-amz-target` (measured against DynamoDB in us-east-1, data and Streams endpoints). Clients sign every `x-amz-*` header they send, so SDK clients are not affected.
 
 #### Credential Types
 

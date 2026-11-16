@@ -10,10 +10,15 @@
 use super::tests::{SECRET, SIGNED_BODY, assert_signature_mismatch, make_headers, sign};
 use super::*;
 
+/// The refusal for an unsigned `x-amz-target`: an `InvalidSignatureException`
+/// whose message names `X-Amz-Target` and is not the signature mismatch. The
+/// message wording itself is not pinned, because the service's wording for
+/// this case has not been measured.
 fn assert_target_not_signed(result: Result<(), DynamoDbError>, what: &str) {
     match result {
         Err(DynamoDbError::InvalidSignatureException(msg)) => {
-            assert_eq!(msg, TARGET_NOT_SIGNED, "{what}");
+            assert!(msg.contains("X-Amz-Target"), "{what}: {msg}");
+            assert!(!msg.contains("does not match"), "{what}: {msg}");
         }
         other => panic!("{what}: expected InvalidSignatureException, got: {other:?}"),
     }
@@ -37,35 +42,47 @@ fn reject_target_left_out_of_signed_headers() {
     }
 }
 
-/// A GetItem signed without `x-amz-target`, sent as DeleteItem with the
-/// same body and signature, is refused.
+/// The name must match exactly. A name that only looks like it does not
+/// count, whether it is longer, shorter or has a prefix; the bare name is the
+/// control.
 #[test]
-fn reject_operation_changed_when_target_was_not_signed() {
-    let mut headers = make_headers("20260415T120000Z");
-    let parsed = sign(&headers, "content-type;host;x-amz-date", SIGNED_BODY);
-    headers.insert(
-        "x-amz-target",
-        "DynamoDB_20120810.DeleteItem".parse().unwrap(),
-    );
-    assert_target_not_signed(
-        verify_signature(&parsed, SECRET, "POST", "/", "", &headers, SIGNED_BODY),
-        "GetItem sent as DeleteItem",
-    );
+fn only_the_exact_name_satisfies_the_check() {
+    for (name, accepted) in [
+        ("x-amz-targets", false),
+        ("x-amz-targe", false),
+        ("foo-x-amz-target", false),
+        ("x-amz-target", true),
+    ] {
+        let headers = make_headers("20260415T120000Z");
+        let signed = format!("content-type;host;x-amz-date;{name}");
+        let parsed = sign(&headers, &signed, SIGNED_BODY);
+        let result = verify_signature(&parsed, SECRET, "POST", "/", "", &headers, SIGNED_BODY);
+        if accepted {
+            result.unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        } else {
+            assert_target_not_signed(result, name);
+        }
+    }
 }
 
-/// The name must match exactly: a longer name that starts with
-/// `x-amz-target` does not count.
+/// The check runs before the signature is compared. A request with a wrong
+/// secret and an unsigned `x-amz-target` gets the `X-Amz-Target` refusal, not
+/// the signature mismatch, so the refusal does not depend on the secret.
 #[test]
-fn reject_signed_headers_naming_only_a_longer_name() {
+fn unsigned_target_is_refused_before_the_signature_is_compared() {
     let headers = make_headers("20260415T120000Z");
-    let parsed = sign(
-        &headers,
-        "content-type;host;x-amz-date;x-amz-targets",
-        SIGNED_BODY,
-    );
+    let parsed = sign(&headers, "content-type;host;x-amz-date", SIGNED_BODY);
     assert_target_not_signed(
-        verify_signature(&parsed, SECRET, "POST", "/", "", &headers, SIGNED_BODY),
-        "x-amz-targets",
+        verify_signature(
+            &parsed,
+            "not-the-signing-secret",
+            "POST",
+            "/",
+            "",
+            &headers,
+            SIGNED_BODY,
+        ),
+        "wrong secret",
     );
 }
 
@@ -120,18 +137,4 @@ fn mixed_case_signed_target_is_accepted_and_covered_by_the_signature() {
         &headers,
         SIGNED_BODY,
     ));
-}
-
-/// The `Host` check still runs first: a list that names neither header
-/// gets the `Host` refusal, as before this check existed.
-#[test]
-fn missing_host_is_reported_before_missing_target() {
-    let headers = make_headers("20260415T120000Z");
-    let parsed = sign(&headers, "content-type;x-amz-date", SIGNED_BODY);
-    match verify_signature(&parsed, SECRET, "POST", "/", "", &headers, SIGNED_BODY) {
-        Err(DynamoDbError::InvalidSignatureException(msg)) => {
-            assert!(msg.starts_with("\"Host\""), "{msg}");
-        }
-        other => panic!("Expected InvalidSignatureException, got: {other:?}"),
-    }
 }

@@ -22,6 +22,9 @@ const MAX_CLOCK_SKEW_SECS: i64 = 15 * 60;
 const SCOPE_DATE_COMPLAINT: &str =
     "Date in Credential scope does not match YYYYMMDD from ISO-8601 version of date from HTTP. ";
 
+/// The refusal for a request whose `SignedHeaders` does not name `host`.
+const HOST_NOT_SIGNED: &str = "\"Host\" must be a \"SignedHeader\" in the AWS Authorization.";
+
 /// The refusal for a request whose `SignedHeaders` does not name
 /// `x-amz-target`. It follows the form of the `Host` refusal; the service's
 /// own wording for this case has not been measured.
@@ -121,22 +124,21 @@ pub fn verify_signature(
         ));
     }
 
-    // CB-6: Require "host" in SignedHeaders.
+    // CB-6: Require "host" in SignedHeaders. X-Amz-Target names the operation,
+    // for the DynamoDB and the DynamoDB Streams prefixes alike, and the server
+    // dispatches on it. A signature that does not cover it would let anyone
+    // holding one signed request replay its body as another operation, so it
+    // must be signed too. Both checks run before the signature is computed.
     let signed_lower = parsed.signed_headers.to_ascii_lowercase();
-    if !signed_lower.split(';').any(|h| h == "host") {
-        return Err(DynamoDbError::InvalidSignatureException(
-            "\"Host\" must be a \"SignedHeader\" in the AWS Authorization.".to_owned(),
-        ));
-    }
-
-    // X-Amz-Target names the operation, for the DynamoDB and the DynamoDB
-    // Streams prefixes alike, and the server dispatches on it. A signature
-    // that does not cover it would let anyone holding one signed request
-    // replay its body as another operation, so it must be signed.
-    if !signed_lower.split(';').any(|h| h == "x-amz-target") {
-        return Err(DynamoDbError::InvalidSignatureException(
-            TARGET_NOT_SIGNED.to_owned(),
-        ));
+    for (required, complaint) in [
+        ("host", HOST_NOT_SIGNED),
+        ("x-amz-target", TARGET_NOT_SIGNED),
+    ] {
+        if !signed_lower.split(';').any(|h| h == required) {
+            return Err(DynamoDbError::InvalidSignatureException(
+                complaint.to_owned(),
+            ));
+        }
     }
 
     // Build canonical request

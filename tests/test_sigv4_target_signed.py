@@ -10,9 +10,14 @@ These tests sign with botocore's signer, leave X-Amz-Target out of
 SignedHeaders, and require the refusal. They run against the service and
 against extenddb with builtin auth, using the conftest dual-target pattern.
 
-The error type asserted here is the one extenddb returns for the other
-SignedHeaders refusal (Host). The service's error type and message for this
-case have not been measured, so the message is not asserted.
+The refusal is ExtendDB hardening, not service parity. DynamoDB in us-east-1
+accepts a request whose SignedHeaders leaves out X-Amz-Target: an unchanged
+GetItem and the same GetItem body sent as DeleteItem both answered 200 on the
+data endpoint, and ListStreams answered 200 on the Streams endpoint (measured
+by the PR reviewer). So the three refusal cases run only against extenddb
+(EXTENDDB_TEST_ENDPOINT set) and are skipped against the service. The two
+signed controls run against both. The test asserts the status and the error
+type, not the message, which has not been measured.
 
 REQ-TEST-001, REQ-AUTH-001
 """
@@ -22,14 +27,20 @@ from __future__ import annotations
 import json
 import os
 
-import boto3
 import pytest
 import requests
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
 from botocore.credentials import Credentials
 
-from conftest import scoped_table
+from conftest import _is_real_dynamodb, scoped_table
+from test_auth_error_fidelity import _env_credentials
+
+# The service accepts an unsigned X-Amz-Target; the refusal is extenddb only.
+extenddb_only = pytest.mark.skipif(
+    _is_real_dynamodb(),
+    reason="extenddb_only: the service accepts an unsigned X-Amz-Target",
+)
 
 DYNAMODB_PREFIX = "DynamoDB_20120810"
 STREAMS_PREFIX = "DynamoDBStreams_20120810"
@@ -42,19 +53,6 @@ class _SignerWithoutTarget(SigV4Auth):
         headers = super().headers_to_sign(request)
         del headers["x-amz-target"]
         return headers
-
-
-def _credentials() -> Credentials:
-    """Credentials to sign with: the environment first, then the SDK's chain."""
-    access_key = os.environ.get("AWS_ACCESS_KEY_ID", "")
-    secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
-    if access_key and secret_key:
-        return Credentials(access_key, secret_key, os.environ.get("AWS_SESSION_TOKEN") or None)
-    resolved = boto3.Session().get_credentials()
-    if resolved is None:
-        pytest.skip("no credentials available to sign the request")
-    frozen = resolved.get_frozen_credentials()
-    return Credentials(frozen.access_key, frozen.secret_key, frozen.token)
 
 
 class TestTargetMustBeSigned:
@@ -106,7 +104,8 @@ class TestTargetMustBeSigned:
             },
         )
         signer = SigV4Auth if sign_target else _SignerWithoutTarget
-        signer(_credentials(), "dynamodb", self.region).add_auth(request)
+        access_key, secret_key, token = _env_credentials()
+        signer(Credentials(access_key, secret_key, token), "dynamodb", self.region).add_auth(request)
         signed_headers = request.headers["Authorization"].split("SignedHeaders=")[1]
         signed_headers = signed_headers.split(",")[0].split(";")
         assert ("x-amz-target" in signed_headers) == sign_target, signed_headers
@@ -127,6 +126,7 @@ class TestTargetMustBeSigned:
         assert resp.status_code == 400, f"expected 400, got {resp.status_code}: {resp.text}"
         assert resp.json()["__type"].endswith("InvalidSignatureException"), resp.text
 
+    @extenddb_only
     def test_get_item_resent_as_delete_item_is_refused(self, dynamodb_client, table):
         key = {"pk": {"S": "kept"}}
         dynamodb_client.put_item(TableName=table, Item=key)
@@ -142,6 +142,7 @@ class TestTargetMustBeSigned:
         got = dynamodb_client.get_item(TableName=table, Key=key, ConsistentRead=True)
         assert got.get("Item") == key, "the item was deleted under a GetItem signature"
 
+    @extenddb_only
     def test_unsigned_target_is_refused_when_unchanged(self, table):
         resp = self._send(
             f"{DYNAMODB_PREFIX}.GetItem",
@@ -150,6 +151,7 @@ class TestTargetMustBeSigned:
         )
         self._assert_refused(resp)
 
+    @extenddb_only
     def test_unsigned_streams_target_is_refused(self):
         resp = self._send(
             f"{STREAMS_PREFIX}.ListStreams",
