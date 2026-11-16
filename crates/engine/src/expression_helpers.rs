@@ -231,7 +231,11 @@ pub fn parse_update_expr_checked(
         if limits.enforce_reserved_keywords {
             validate_no_reserved_words(&update_tokens)?;
         }
-        parse_update_sections(&update_tokens, Some(update_expr))
+        parse_update_sections(
+            &update_tokens,
+            Some(update_expr),
+            limits.max_expression_depth,
+        )
     })
     .map_err(|e| prefix_expression_error(e, ExpressionKind::Update))?;
     validate_update_semantics(&parsed, maps)?;
@@ -665,7 +669,7 @@ mod tests {
         let expr = format!("{}qty{} > :v", "size(".repeat(50_000), ")".repeat(50_000));
         let condition = expr.clone();
         let err = on_small_stack("deep condition", move || {
-            parse_condition_expr(&condition, &raised()).map(drop)
+            parse_condition_expr_with(&condition, &raised(), true).map(drop)
         })
         .unwrap_err();
         assert!(
@@ -674,7 +678,7 @@ mod tests {
             "got {err:?}"
         );
         let err = on_small_stack("deep filter", move || {
-            parse_optional_filter(Some(&expr), &raised()).map(drop)
+            parse_optional_filter(Some(&expr), &raised(), true).map(drop)
         })
         .unwrap_err();
         assert!(
