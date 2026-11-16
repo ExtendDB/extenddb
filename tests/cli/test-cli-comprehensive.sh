@@ -549,7 +549,9 @@ $EXTENDDB manage --config "$CONFIG" --user "${ACCOUNT_ID1}/user1" --password 'Us
     list-access-keys --account-id "$ACCOUNT_ID1" --user-name user1 >/dev/null 2>&1; RC=$?
 assert_ok $RC "self-service list-access-keys"
 
-# import-access-key
+# import-access-key (refused unless allow_credential_import is true)
+$EXTENDDB settings --config "$CONFIG" set allow_credential_import true >/dev/null 2>&1; RC=$?
+assert_ok $RC "settings set allow_credential_import true"
 manage import-access-key --account-id "$ACCOUNT_ID1" --user-name user1 \
     --access-key-id AKIAIOSFODNN7EXAMPLE --secret-access-key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY --yes >/dev/null 2>&1; RC=$?
 assert_ok $RC "import-access-key"

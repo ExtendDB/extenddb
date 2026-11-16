@@ -21,11 +21,15 @@ use aws_sdk_dynamodb::types::{
 use aws_sdk_dynamodb::Client;
 use std::time::{Duration, Instant};
 
+/// The refusal of every restore and every enable: point-in-time recovery is
+/// not in this release.
+const PITR_REFUSED: &str = "Point-in-time recovery is not supported by this storage backend";
+
 /// Where the server under test writes its backups, from
 /// `EXTENDDB_TEST_BACKUP_STORE`: `filesystem` or `s3` (a configured
-/// `[backup.store]`, under which a backup is in the store and this release
-/// refuses to restore it, PR 9a adding the restore) or `none` (the
-/// in-catalog create, which restores). Against the service the variable is
+/// `[backup.store]`, under which a backup is in the store and the restore
+/// job restores it) or `none` (the in-catalog create, which the legacy
+/// reader restores). Against the service the variable is
 /// not read (the restore runs). Against ExtendDB a test whose outcome depends
 /// on it fails when it is unset, with the text the Python fixture prints,
 /// rather than accept either outcome.
@@ -306,49 +310,39 @@ async fn restore_table_from_backup() {
         .backup_arn(&arn)
         .send()
         .await;
-    match backup_store() {
-        // A backup in the configured store is listed, described and deleted
-        // but not restored this release (the restore job is PR 9a's).
-        BackupStore::Filesystem | BackupStore::S3 => {
-            let err = restore.expect_err("a store-backed backup restored");
-            assert_eq!(err_code(&err), Some("ValidationException"), "{err:?}");
-            let msg = err_msg(&err);
-            assert!(
-                msg.contains("is in a backup store"),
-                "the refusal does not name the store: {msg}"
-            );
-            println!("restore of a store-backed backup refused: {msg}");
-            assert!(
-                c.describe_table()
-                    .table_name(&restored)
-                    .send()
-                    .await
-                    .is_err(),
-                "the refused restore created {restored}"
-            );
-        }
-        BackupStore::None => {
-            let resp = restore.unwrap();
-            assert_eq!(
-                resp.table_description()
-                    .unwrap()
-                    .table_status()
-                    .unwrap()
-                    .as_str(),
-                "CREATING"
-            );
+    // The round trip on either path: a backup in the configured store is
+    // restored by the restore job, an in-catalog one by the legacy reader.
+    let resp = restore.unwrap();
+    let desc = resp.table_description().unwrap();
+    assert_eq!(desc.table_status().unwrap().as_str(), "CREATING");
+    let summary = desc
+        .restore_summary()
+        .expect("a CREATING restore target carries its RestoreSummary");
+    assert_eq!(summary.source_backup_arn(), Some(arn.as_str()));
+    assert!(summary.restore_in_progress());
 
-            wait_for_active(c, &restored).await;
-            let scan = c.scan().table_name(&restored).send().await.unwrap();
-            assert_eq!(scan.count(), 5);
-            println!(
-                "restore of an in-catalog backup completed with {} items",
-                scan.count()
-            );
-
-            c.delete_table().table_name(&restored).send().await.ok();
-        }
-    }
+    wait_for_active(c, &restored).await;
+    let scan = c.scan().table_name(&restored).send().await.unwrap();
+    assert_eq!(scan.count(), 5);
+    let after = c
+        .describe_table()
+        .table_name(&restored)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        after.table().unwrap().restore_summary().is_none(),
+        "RestoreSummary is reported only while CREATING"
+    );
+    println!(
+        "restore of a {} backup completed with {} items",
+        match backup_store() {
+            BackupStore::Filesystem | BackupStore::S3 => "store-backed",
+            BackupStore::None => "in-catalog",
+        },
+        scan.count()
+    );
+    c.delete_table().table_name(&restored).send().await.ok();
 
     delete_backup_quietly(c, &arn).await;
     c.delete_table().table_name(&table).send().await.ok();
@@ -391,9 +385,9 @@ async fn enable_point_in_time_recovery_is_refused() {
     let table = format!("PITREnable_{}", ts());
     make_table(&table).await;
 
-    // Point-in-time recovery is not supported by any storage backend, so
-    // enabling it must fail with the typed exception rather than report a
-    // recovery capability that can never restore.
+    // Point-in-time recovery is not in this release, so enabling it fails
+    // with the typed exception rather than report a recovery capability that
+    // can never restore.
     let err = c
         .update_continuous_backups()
         .table_name(&table)
@@ -407,9 +401,28 @@ async fn enable_point_in_time_recovery_is_refused() {
         .await
         .unwrap_err();
     assert_eq!(
-        err_code(&err),
-        Some("ContinuousBackupsUnavailableException"),
+        (err_code(&err), err_msg(&err).as_str()),
+        (Some("ContinuousBackupsUnavailableException"), PITR_REFUSED),
         "unexpected error: {err:?}"
+    );
+
+    // A missing table gets the same refusal: no table is read.
+    let err = c
+        .update_continuous_backups()
+        .table_name(format!("PITRMissing_{}", ts()))
+        .point_in_time_recovery_specification(
+            PointInTimeRecoverySpecification::builder()
+                .point_in_time_recovery_enabled(true)
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (err_code(&err), err_msg(&err).as_str()),
+        (Some("ContinuousBackupsUnavailableException"), PITR_REFUSED),
+        "missing table: {err:?}"
     );
 
     // The refusal must not have changed anything.
@@ -472,9 +485,9 @@ async fn restore_table_to_point_in_time_is_refused() {
     let table = format!("PITRRestore_{}", ts());
     make_table(&table).await;
 
-    // Point-in-time recovery is not supported, so the restore must fail with
-    // the typed exception the service models on this operation rather than
-    // fabricate a restore of current state.
+    // Point-in-time recovery is not in this release, so every restore fails
+    // with the typed exception the service models on this operation rather
+    // than fabricate a restore of current state.
     let restored = format!("PITRRestored_{}", ts());
     let err = c
         .restore_table_to_point_in_time()
@@ -485,14 +498,38 @@ async fn restore_table_to_point_in_time_is_refused() {
         .await
         .unwrap_err();
     assert_eq!(
-        err_code(&err),
-        Some("PointInTimeRecoveryUnavailableException"),
+        (err_code(&err), err_msg(&err).as_str()),
+        (
+            Some("PointInTimeRecoveryUnavailableException"),
+            PITR_REFUSED
+        ),
         "unexpected error: {err:?}"
+    );
+
+    // A missing source gets the same refusal: no table is read.
+    let missing = format!("PITRMissing_{}", ts());
+    let err = c
+        .restore_table_to_point_in_time()
+        .source_table_name(&missing)
+        .target_table_name(format!("{missing}_restored"))
+        .use_latest_restorable_time(true)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (err_code(&err), err_msg(&err).as_str()),
+        (
+            Some("PointInTimeRecoveryUnavailableException"),
+            PITR_REFUSED
+        ),
+        "missing source: {err:?}"
     );
 
     c.delete_table().table_name(&table).send().await.ok();
 }
 
+/// A describe and a disable look the table up. An enable and a restore are
+/// refused before any table is read (the two refusal tests above).
 #[tokio::test]
 async fn point_in_time_recovery_operations_report_a_missing_table_as_table_not_found() {
     let c = client();
@@ -514,29 +551,17 @@ async fn point_in_time_recovery_operations_report_a_missing_table_as_table_not_f
         .unwrap_err();
     check("describe", err_code(&err), err_msg(&err));
 
-    for enabled in [false, true] {
-        let err = c
-            .update_continuous_backups()
-            .table_name(&missing)
-            .point_in_time_recovery_specification(
-                PointInTimeRecoverySpecification::builder()
-                    .point_in_time_recovery_enabled(enabled)
-                    .build()
-                    .unwrap(),
-            )
-            .send()
-            .await
-            .unwrap_err();
-        check("update", err_code(&err), err_msg(&err));
-    }
-
     let err = c
-        .restore_table_to_point_in_time()
-        .source_table_name(&missing)
-        .target_table_name(format!("{missing}_restored"))
-        .use_latest_restorable_time(true)
+        .update_continuous_backups()
+        .table_name(&missing)
+        .point_in_time_recovery_specification(
+            PointInTimeRecoverySpecification::builder()
+                .point_in_time_recovery_enabled(false)
+                .build()
+                .unwrap(),
+        )
         .send()
         .await
         .unwrap_err();
-    check("restore", err_code(&err), err_msg(&err));
+    check("disable", err_code(&err), err_msg(&err));
 }

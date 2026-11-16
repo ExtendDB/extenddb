@@ -1557,6 +1557,8 @@ fn status_index_creation(table_name: &str) -> extenddb_core::types::UpdateTableI
     use extenddb_core::types::{CreateGsiAction, GlobalSecondaryIndexUpdate, UpdateTableInput};
 
     UpdateTableInput {
+        sse_specification: None,
+        warm_throughput: None,
         table_name: table_name.to_owned(),
         billing_mode: None,
         table_throughput_mode: None,
@@ -1574,6 +1576,7 @@ fn status_index_creation(table_name: &str) -> extenddb_core::types::UpdateTableI
                     non_key_attributes: None,
                 },
                 provisioned_throughput: None,
+                warm_throughput: None,
             }),
             update: None,
             delete: None,

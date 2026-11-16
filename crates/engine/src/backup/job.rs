@@ -7,17 +7,23 @@
 //! The task ([`start`]) opens the table snapshot, mints the backup id from
 //! the millisecond the open returned, reads the table's TTL, builds the
 //! manifest's `source_table` from the snapshot's description
-//! ([`source_table_schema`]), inserts the CREATING row under the job's
-//! claim (`claim_backup`), answers the request through a one-shot channel
+//! ([`source_table_schema`]), runs the deletion fence (a root another
+//! catalog adopted since the store's last check is refused before the row,
+//! `StoreFence`; a fence read that recorded a problem answers the
+//! unhealthy-store refusal, one that failed in transport an internal
+//! error), inserts the CREATING row under the job's claim
+//! (`claim_backup`), answers the request through a one-shot channel
 //! (`BackupDetails` CREATING, or the refusal) and then goes on as the job
 //! ([`run`]) with the same owned values: nothing crosses a thread or a
 //! channel between the request and the job but the response (the
 //! pipeline's item and chunk channels are the job's own), and a client that
 //! disconnects mid-request cannot leave a row whose owner was never
 //! spawned. The maintenance claim is checked by the request before the
-//! permit, as the in-catalog paths check it, so a held claim refuses the
-//! request and inserts no row (a FAILED row written for the refusal was
-//! counted by `backup purge`'s wait as a live job for the stale window).
+//! permit, as the in-catalog paths check it, and again immediately before
+//! `claim_backup`, so a held claim refuses the request and inserts no row
+//! (a FAILED row written for the refusal was counted by `backup purge`'s
+//! wait as a live job for the stale window), and a claim taken while the
+//! open waited (on a lock the table holds, say) refuses it too.
 //! The open and the insert are selected against the shutdown token, so a
 //! server that is stopping neither waits on an open the table's lock holds
 //! nor inserts a row it would fail at once. The `ServiceUnavailable` that
@@ -29,7 +35,11 @@
 //! `CreateBackup` waiting in the open: its connection closed 8.2 s after it
 //! was sent), so there the refusal's effect is the row not written.
 //!
-//! The job: the data files through the pipeline ([`writer`]), then the
+//! The job: the fence once more, right before the first put (a root
+//! adopted between the request's read and the job's first write gets no
+//! object of this job's; the refusal fails the row with the fence's reason
+//! and makes no store write), the data files through the pipeline
+//! ([`writer`]), then the
 //! three documents `BackupDocuments::build` returns in its order, a re-check
 //! of the claim, the manifest (the commit record), and the AVAILABLE write
 //! with the size, the count and the manifest's `source_table`
@@ -47,7 +57,7 @@
 //! period, ends the job with no further store or catalog access. Any other
 //! failure, and the shutdown token (reason `shutdown`), runs the failure
 //! path ([`failure::fail_row`]): FAILED, then the prefix's deletion only
-//! when that write matched.
+//! when that write matched and the fence passed.
 //!
 //! Each job records `BackupJobs` and `BackupJobDuration` (microseconds,
 //! from the snapshot's open to the end of its last catalog or store call:
@@ -62,6 +72,8 @@
 //!
 //! Kill points ([`kill_point`]) pause the job for the binary-level crash
 //! tests under the `backup-test-hooks` feature and are no-ops without it.
+//! The restore job ([`super::restore`]) shares this module's environment
+//! ([`JobEnv`]), its kill points, its heartbeat and its status writes.
 
 pub(crate) mod failure;
 pub(crate) mod heartbeat;
@@ -91,26 +103,38 @@ use extenddb_storage::{
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
-use super::runtime::{BackupRuntime, ConfiguredStore, JobSettings};
-use super::{create_backup_storage_err_to_dynamo, storage_err_to_dynamo};
+use super::runtime::{BackupRuntime, ConfiguredStore, JobSettings, Spool, StoreFence};
+use super::{create_backup_storage_err_to_dynamo, maintenance_held, storage_err_to_dynamo};
 use failure::{FailurePath, Written};
-use heartbeat::HeartbeatHandle;
+use heartbeat::{HeartbeatHandle, HeartbeatMetric};
 use writer::{DataFiles, Pipeline, Stop};
+
+/// The reason a restore record carries when the maintenance claim was held
+/// as the job started (the design's 5.3 step 4; the backup job checks the
+/// claim before its row exists and writes no such row).
+pub(crate) const MAINTENANCE: &str = "maintenance";
 
 /// The reason a row carries when the server's shutdown stopped the job.
 pub(crate) const SHUTDOWN: &str = "shutdown";
 
 /// What the runtime hands a job: the store as the runtime holds it (its
 /// health and identity, read before every put), its identity as the row
-/// records it and its manifest names, the settings, the collector, the
-/// shutdown token and the source names.
+/// records it and its manifest names, the restore spool, the settings, the
+/// collector, the shutdown token and the source names.
 #[derive(Clone)]
 pub(crate) struct JobEnv {
     pub configured: Arc<ConfiguredStore>,
     pub store: Arc<dyn BackupStore>,
+    /// The store's deletion fence, which CreateBackup runs before its row,
+    /// the job right before its first put and the failure path before its
+    /// deletion.
+    pub fence: StoreFence,
     pub identity: StoreIdentity,
     pub bucket: String,
     pub key_prefix: String,
+    /// The restore spool of an S3 store; `None` for a filesystem store,
+    /// whose files a restore reads in place.
+    pub spool: Option<Spool>,
     pub settings: JobSettings,
     pub metrics: Option<Arc<MetricsCollector>>,
     pub shutdown: CancellationToken,
@@ -134,9 +158,11 @@ impl JobEnv {
         Ok(Self {
             configured: Arc::clone(store),
             store: Arc::clone(&store.store),
+            fence: store.fence(),
             identity,
             bucket: store.bucket.clone(),
             key_prefix: store.key_prefix.clone(),
+            spool: store.spool.clone(),
             settings: runtime.job_settings(),
             metrics: runtime.metrics().cloned(),
             shutdown: runtime.shutdown(),
@@ -199,6 +225,9 @@ pub(crate) struct Job {
     key_order: Option<KeyOrder>,
     limits: RestorableLimits,
     env: JobEnv,
+    /// This instance's catalog id, which the fence before the first put and
+    /// the failure path's fence compare the identity file with.
+    catalog_id: String,
     /// The id's instant, the row's `created_at`.
     created_at: f64,
     started: Instant,
@@ -308,6 +337,41 @@ where
         owner_generation: UNOWNED_GENERATION,
         heartbeat_at: 0.0,
     };
+    // The fence before the row: a root another catalog adopted since the
+    // store's last check gets no row from this catalog, and the store is
+    // marked unhealthy. A read that recorded a problem (the file names
+    // another catalog, is missing, or cannot be served) answers as the
+    // unhealthy store the next request meets; only a read that failed in
+    // transport, which recorded nothing, answers as a failed store call.
+    // The job runs the fence again right before its first put.
+    let catalog_id = env
+        .fence
+        .catalog_id(storage)
+        .await
+        .map_err(|e| internal(&format!("the catalog id could not be read: {e}")))?;
+    if let Err(problem) = env.fence.check(&catalog_id).await {
+        return Err(env.fence.refusal().unwrap_or_else(|| {
+            internal(&format!(
+                "{table_name}: the store's identity file could not be read before the row: \
+                 {problem}"
+            ))
+        }));
+    }
+    // The maintenance claim once more, immediately before the insert: the
+    // request's check ran before the open, the TTL read and the fence, any
+    // of which can wait (an open behind the table's lock), and a command
+    // that took the claim since gets no row of this job. A claim taken
+    // between this read and the insert is not seen: the CREATING row lands
+    // under the claim, where the command's wait lists it, the move's re-list
+    // of the old root reports it, or (an insert after that re-list) the
+    // move's closing report of other stores or a later plain sync does.
+    if storage
+        .check_maintenance_claim(env.settings.stale_job_after)
+        .await
+        .map_err(storage_err_to_dynamo)?
+    {
+        return Err(maintenance_held());
+    }
     let claimed_at = Instant::now();
     // The insert too is selected against the token: a server that is
     // stopping inserts no row it would have to fail at once.
@@ -335,6 +399,7 @@ where
         key_order,
         limits: *limits,
         env: env.clone(),
+        catalog_id,
         created_at,
         started,
         claimed_at,
@@ -363,7 +428,7 @@ async fn fail_without_store_access(claim: &dyn JobClaim, arn: &BackupArn, reason
         completed: true,
         ..StatusFields::default()
     };
-    match failure::write_status(claim, JobStatus::Failed, &fields).await {
+    match failure::write_status(claim, JobStatus::Creating, JobStatus::Failed, &fields).await {
         Written::Matched => {}
         Written::NotMatched(why) | Written::Error(why) => tracing::error!(
             "backup {}: the row could not be marked FAILED ({reason}): {why}",
@@ -384,6 +449,7 @@ pub(crate) async fn run(job: Job) -> BackupJobOutcome {
         key_order,
         limits,
         env,
+        catalog_id,
         created_at,
         started,
         claimed_at,
@@ -394,8 +460,13 @@ pub(crate) async fn run(job: Job) -> BackupJobOutcome {
     let heartbeat = HeartbeatHandle::start(
         Arc::clone(&claim),
         env.settings.heartbeat_interval,
-        env.metrics.clone(),
-        created_at,
+        match env.metrics.clone() {
+            Some(metrics) => HeartbeatMetric::BackupSnapshotAge {
+                metrics,
+                created_at,
+            },
+            None => HeartbeatMetric::None,
+        },
         claimed_at,
     );
     tracing::info!(
@@ -420,34 +491,44 @@ pub(crate) async fn run(job: Job) -> BackupJobOutcome {
         target_bytes: env.settings.data_file_target_bytes,
         key_prefix: &env.key_prefix,
         bucket: &env.bucket,
+        written: None,
     };
     let tracker = key_order.as_ref().map(KeyRangeTracker::new);
     let mut item_count = 0;
-    let end = match writer::write_data_files(&pipeline, items, key_schema, limits, tracker).await {
-        Ok(files) => {
-            item_count = files.item_count;
-            // Both figures are the stream's: the items written and their
-            // DynamoDB sizes summed, not the statistics pass's (which can
-            // be stale, or 0 on a fresh table).
-            source_table.item_count = i64::try_from(files.item_count).unwrap_or(i64::MAX);
-            source_table.table_size_bytes = i64::try_from(files.item_bytes).unwrap_or(i64::MAX);
-            let header = ManifestHeader {
-                backup_arn: arn.clone(),
-                backup_name,
-                source_backend: env.source_backend.clone(),
-                source_extenddb_version: env.source_extenddb_version.clone(),
-                snapshot: info,
-                item_order: if key_order.is_some() {
-                    ItemOrder::KeyOrdered
-                } else {
-                    ItemOrder::Unordered
-                },
-                source_table,
-            };
-            write_documents(&pipeline, &claim, header, files).await
-        }
-        Err(stop) => Err(stop),
-    };
+    let end = async {
+        // The fence right before the first put (`StoreFence`'s doc): the
+        // request's read was before the row, and a root another catalog
+        // adopted since gets no object of this job's. The refusal, recorded
+        // or not, fails the row with no store write.
+        env.fence.check(&catalog_id).await.map_err(|problem| {
+            Stop::StoreUnhealthy(format!(
+                "the store's identity file was re-read before the first write and refused \
+                     it ({problem}); no object was written"
+            ))
+        })?;
+        let files = writer::write_data_files(&pipeline, items, key_schema, limits, tracker).await?;
+        item_count = files.item_count;
+        // Both figures are the stream's: the items written and their
+        // DynamoDB sizes summed, not the statistics pass's (which can
+        // be stale, or 0 on a fresh table).
+        source_table.item_count = i64::try_from(files.item_count).unwrap_or(i64::MAX);
+        source_table.table_size_bytes = i64::try_from(files.item_bytes).unwrap_or(i64::MAX);
+        let header = ManifestHeader {
+            backup_arn: arn.clone(),
+            backup_name,
+            source_backend: env.source_backend.clone(),
+            source_extenddb_version: env.source_extenddb_version.clone(),
+            snapshot: info,
+            item_order: if key_order.is_some() {
+                ItemOrder::KeyOrdered
+            } else {
+                ItemOrder::Unordered
+            },
+            source_table,
+        };
+        write_documents(&pipeline, &claim, header, files).await
+    }
+    .await;
     let (outcome, bytes) = match end {
         Ok(bytes) => {
             tracing::info!(
@@ -464,26 +545,42 @@ pub(crate) async fn run(job: Job) -> BackupJobOutcome {
             (BackupJobOutcome::Failed, 0)
         }
         Err(Stop::StoreUnhealthy(reason)) => {
-            // The store is not to be called: FAILED with the store's reason,
-            // the prefix left to the FAILED-prefix duty once the store is
-            // healthy again.
+            // The store is not to be written: FAILED with the store's
+            // reason, the prefix left to the FAILED-prefix duty once the
+            // store is healthy again.
             fail_without_store_access(&*claim, &arn, &reason).await;
             tracing::error!(
-                "backup {arn_text}: FAILED ({reason}); no store call was made and its objects \
-                 are deleted by the reconciler once the store's check passes and the row's \
-                 heartbeat is stale"
+                "backup {arn_text}: FAILED ({reason}); no store write was made and its objects, \
+                 if any, are deleted by the reconciler once the store's check passes and the \
+                 row's heartbeat is stale (never, while another catalog has adopted the root: \
+                 the objects then stay under it)"
             );
             (BackupJobOutcome::Failed, 0)
         }
         Err(stop) => {
             let (reason, outcome) = match stop {
                 Stop::Cancelled => (SHUTDOWN.to_owned(), BackupJobOutcome::Cancelled),
-                Stop::Fail(reason) => (reason, BackupJobOutcome::Failed),
+                Stop::Fail(reason) | Stop::Refused(reason) | Stop::Occupied(reason) => {
+                    (reason, BackupJobOutcome::Failed)
+                }
                 Stop::ClaimLost(_) | Stop::StoreUnhealthy(_) => unreachable!("matched above"),
             };
-            match failure::fail_row(&*claim, &*env.store, &prefix, &reason, metrics).await {
+            match failure::fail_row(
+                &*claim,
+                &*env.store,
+                &env.fence,
+                &catalog_id,
+                &prefix,
+                &reason,
+                metrics,
+            )
+            .await
+            {
                 FailurePath::Deleted => tracing::error!(
                     "backup {arn_text}: FAILED ({reason}); its objects were deleted"
+                ),
+                FailurePath::Fenced(why) => tracing::error!(
+                    "backup {arn_text}: FAILED ({reason}); its objects were not deleted: {why}"
                 ),
                 FailurePath::DeleteFailed(e) => tracing::error!(
                     "backup {arn_text}: FAILED ({reason}); its objects could not be deleted and \
@@ -560,7 +657,8 @@ async fn write_documents(
         source_table_details_json: serde_json::to_value(&manifest.source_table).ok(),
         completed: true,
     };
-    match failure::write_status(&**claim, JobStatus::Available, &fields).await {
+    match failure::write_status(&**claim, JobStatus::Creating, JobStatus::Available, &fields).await
+    {
         Written::Matched => Ok(bytes_uploaded),
         Written::NotMatched(why) | Written::Error(why) => Err(Stop::ClaimLost(format!(
             "the AVAILABLE write did not settle: {why}"
@@ -570,7 +668,11 @@ async fn write_documents(
 
 /// One document's put under the backup prefix, after the pre-put check;
 /// returns the bytes the store reported.
-pub(crate) async fn put_document(p: &Pipeline<'_>, name: &str, bytes: &[u8]) -> Result<u64, Stop> {
+pub(crate) async fn put_document<W: writer::ClaimWatch + ?Sized>(
+    p: &Pipeline<'_, W>,
+    name: &str,
+    bytes: &[u8],
+) -> Result<u64, Stop> {
     if p.shutdown.is_cancelled() {
         return Err(Stop::Cancelled);
     }
@@ -585,23 +687,23 @@ pub(crate) async fn put_document(p: &Pipeline<'_>, name: &str, bytes: &[u8]) -> 
         biased;
         () = p.shutdown.cancelled() => Err(Stop::Cancelled),
         () = p.heartbeat.lost().cancelled() => Err(Stop::ClaimLost(p.heartbeat.reason())),
-        result = p.store.put(&key, byte_stream_from(bytes.to_vec())) => match result {
-            Ok(meta) => Ok(meta.size),
-            Err(e) => {
-                if let Some(metrics) = p.metrics {
-                    metrics.record_backup_store_error("put");
-                }
-                Err(Stop::Fail(format!("writing {name}: {e}")))
-            }
-        },
+        result = p.put_object(&key, name, byte_stream_from(bytes.to_vec())) => {
+            result.map(|meta| meta.size)
+        }
     }
 }
 
-/// The points at which a job pauses under `backup-test-hooks` when
-/// `EXTENDDB_BACKUP_PAUSE` names one, until the file
-/// `EXTENDDB_BACKUP_PAUSE_RELEASE` names exists (or for good, for a test
-/// that kills the server there). Each is logged as `backup job reached kill
-/// point <name>`.
+/// The points at which a backup or restore job pauses under
+/// `backup-test-hooks` when `EXTENDDB_BACKUP_PAUSE` names one, until the
+/// file `EXTENDDB_BACKUP_PAUSE_RELEASE` names exists (or for good, for a
+/// test that kills the server there). Each is logged as `job reached kill
+/// point <name>` (the backend's own points log `restore job reached kill
+/// point <name>`; the harness matches `reached kill point <name>`). This
+/// enum is the engine's list: the points inside a backend's own writes are
+/// paused by the backend through
+/// `extenddb_storage::backup_catalog::restore_pause_point` under
+/// `extenddb-storage/test-hooks`, and each backend's own point is named
+/// beside `restore_pause_point`, once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KillPoint {
     /// After the put of the first data file returned, before the next file
@@ -611,6 +713,22 @@ pub enum KillPoint {
     BeforeManifest,
     /// After the manifest's put returned, before the AVAILABLE write.
     AfterManifest,
+    /// Restore: after every data file downloaded and verified, before the
+    /// first `bulk_load`.
+    RestoreAfterDownload,
+    /// Restore: after the first file's `bulk_load` returned, before the
+    /// next file.
+    RestoreAfterFileCommit,
+    /// Restore: after a `finish_restore` that left the ACTIVE flip to the
+    /// backend's index backfill returned, before the job ends (MongoDB).
+    RestoreMongodbBeforeWorkerFlip,
+    /// Restore: after the FAILED write matched, before
+    /// `remove_restore_target`.
+    RestoreBetweenFailedAndRemoval,
+    /// Restore: before the DONE write, with the job's heartbeat stopped
+    /// first, so a reconciler takes the record over while the job pauses
+    /// and the job's write then matches no record.
+    RestoreFencedOut,
 }
 
 impl KillPoint {
@@ -621,7 +739,27 @@ impl KillPoint {
             Self::AfterDataFile => "after_data_file",
             Self::BeforeManifest => "before_manifest",
             Self::AfterManifest => "after_manifest",
+            Self::RestoreAfterDownload => "restore_after_download",
+            Self::RestoreAfterFileCommit => "restore_after_file_commit",
+            Self::RestoreMongodbBeforeWorkerFlip => "restore_mongodb_before_worker_flip",
+            Self::RestoreBetweenFailedAndRemoval => "restore_between_failed_and_removal",
+            Self::RestoreFencedOut => "restore_fenced_out",
         }
+    }
+}
+
+/// Whether the environment names `point` as the pause point (so a caller
+/// can do what the pause needs first, as the fenced-out point stops the
+/// heartbeat); `false` without `backup-test-hooks`.
+pub(crate) fn kill_point_named(point: KillPoint) -> bool {
+    #[cfg(feature = "backup-test-hooks")]
+    {
+        std::env::var("EXTENDDB_BACKUP_PAUSE").ok().as_deref() == Some(point.name())
+    }
+    #[cfg(not(feature = "backup-test-hooks"))]
+    {
+        let _ = point;
+        false
     }
 }
 
@@ -636,7 +774,7 @@ pub(crate) async fn kill_point(point: KillPoint, shutdown: &CancellationToken) {
         }
         let release = std::env::var("EXTENDDB_BACKUP_PAUSE_RELEASE").ok();
         tracing::warn!(
-            "backup job reached kill point {}; paused until {} exists",
+            "job reached kill point {}; paused until {} exists",
             point.name(),
             release
                 .as_deref()
@@ -646,12 +784,12 @@ pub(crate) async fn kill_point(point: KillPoint, shutdown: &CancellationToken) {
             if let Some(release) = &release
                 && std::path::Path::new(release).exists()
             {
-                tracing::warn!("backup job released from kill point {}", point.name());
+                tracing::warn!("job released from kill point {}", point.name());
                 return;
             }
             if shutdown.is_cancelled() {
                 tracing::warn!(
-                    "backup job at kill point {} released by the shutdown",
+                    "job at kill point {} released by the shutdown",
                     point.name()
                 );
                 return;

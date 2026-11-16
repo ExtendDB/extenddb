@@ -6,11 +6,13 @@
 use super::*;
 use crate::metrics::types::{Dimension, MetricName, MetricsQuery, TimeWindow};
 
+const ACCOUNT: &str = "111111111111";
+
 #[test]
 fn record_and_query_basic() {
     let c = MetricsCollector::new();
-    c.record_user_error(Some("MyTable"), "PutItem");
-    c.record_user_error(Some("MyTable"), "PutItem");
+    c.record_user_error(ACCOUNT, Some("MyTable"), "PutItem");
+    c.record_user_error(ACCOUNT, Some("MyTable"), "PutItem");
 
     let results = c.query(&MetricsQuery {
         table_name: Some("MyTable".to_owned()),
@@ -27,7 +29,7 @@ fn record_and_query_basic() {
 fn latency_percentiles() {
     let c = MetricsCollector::new();
     for i in 1..=100 {
-        c.record_latency(Some("T"), "GetItem", i as f64);
+        c.record_latency(ACCOUNT, Some("T"), "GetItem", i as f64);
     }
     let results = c.query(&MetricsQuery {
         metric: Some(MetricName::SuccessfulRequestLatency),
@@ -43,8 +45,8 @@ fn latency_percentiles() {
 #[test]
 fn filter_by_table() {
     let c = MetricsCollector::new();
-    c.record_user_error(Some("A"), "PutItem");
-    c.record_user_error(Some("B"), "PutItem");
+    c.record_user_error(ACCOUNT, Some("A"), "PutItem");
+    c.record_user_error(ACCOUNT, Some("B"), "PutItem");
 
     let results = c.query(&MetricsQuery {
         table_name: Some("A".to_owned()),
@@ -58,10 +60,90 @@ fn filter_by_table() {
     );
 }
 
+/// Two accounts' tables of the same name keep their own points: neither
+/// adds into the other's, each carries its account as a dimension, and the
+/// account filter returns only that account's. A metric of the whole
+/// deployment has no account dimension and only an unfiltered query sees it.
+#[test]
+fn two_accounts_with_the_same_table_name_keep_separate_metrics() {
+    const OTHER: &str = "222222222222";
+    let c = MetricsCollector::new();
+    c.record_user_error(ACCOUNT, Some("Orders"), "PutItem");
+    c.record_user_error(OTHER, Some("Orders"), "PutItem");
+    c.record_user_error(OTHER, Some("Orders"), "PutItem");
+    c.record_pool_acquire_latency(5.0);
+
+    let all = c.query(&MetricsQuery {
+        metric: Some(MetricName::UserErrors),
+        window: Some(TimeWindow::AllTime),
+        ..Default::default()
+    });
+    let mut counts: Vec<(Vec<Dimension>, u64)> = all
+        .iter()
+        .map(|s| (s.dimensions.clone(), s.count))
+        .collect();
+    counts.sort_by(|a, b| format!("{:?}", a.0).cmp(&format!("{:?}", b.0)));
+    let dims = |account: &str| {
+        vec![
+            Dimension::AccountId(account.to_owned()),
+            Dimension::TableName("Orders".to_owned()),
+            Dimension::Operation("PutItem".to_owned()),
+        ]
+    };
+    assert_eq!(counts, [(dims(ACCOUNT), 1), (dims(OTHER), 2)]);
+
+    let other = c.query(&MetricsQuery {
+        account_id: Some(OTHER.to_owned()),
+        window: Some(TimeWindow::AllTime),
+        ..Default::default()
+    });
+    assert_eq!(other.len(), 1);
+    assert_eq!(other[0].dimensions, dims(OTHER));
+    assert_eq!(other[0].count, 2);
+
+    let pool = c.query(&MetricsQuery {
+        metric: Some(MetricName::PoolAcquireLatency),
+        window: Some(TimeWindow::AllTime),
+        ..Default::default()
+    });
+    assert_eq!(pool.len(), 1);
+    assert!(pool[0].dimensions.is_empty());
+}
+
+/// A drained bucket carries its account, and a metric of the whole
+/// deployment drains with an empty one.
+#[test]
+fn a_drained_bucket_carries_its_account() {
+    let c = MetricsCollector::new();
+    c.record_ttl_deletion(ACCOUNT, "Orders");
+    c.record_ttl_repair_markers(3.0);
+    let mut buckets: Vec<(String, String, String)> = c
+        .drain(Duration::ZERO)
+        .into_iter()
+        .map(|b| (b.metric.to_string(), b.account_id, b.table_name))
+        .collect();
+    buckets.sort();
+    assert_eq!(
+        buckets,
+        [
+            (
+                "TimeToLiveDeletedItemCount".to_owned(),
+                ACCOUNT.to_owned(),
+                "Orders".to_owned()
+            ),
+            (
+                "TtlRepairMarkerCount".to_owned(),
+                String::new(),
+                String::new()
+            ),
+        ]
+    );
+}
+
 #[test]
 fn prune_removes_old_data() {
     let c = MetricsCollector::new();
-    c.record_user_error(Some("T"), "PutItem");
+    c.record_user_error(ACCOUNT, Some("T"), "PutItem");
 
     // All data is recent, prune should keep it.
     c.prune();
@@ -78,6 +160,7 @@ fn record_and_query_segments() {
 
     let c = MetricsCollector::new();
     c.record_segments(
+        ACCOUNT,
         "GetItem",
         Some("T"),
         LatencySegments {
@@ -90,6 +173,7 @@ fn record_and_query_segments() {
         },
     );
     c.record_segments(
+        ACCOUNT,
         "GetItem",
         Some("T"),
         LatencySegments {
@@ -102,7 +186,7 @@ fn record_and_query_segments() {
         },
     );
 
-    let segs = c.query_segments(TimeWindow::AllTime);
+    let segs = c.query_segments(TimeWindow::AllTime, None);
     assert_eq!(segs.len(), 1);
     let s = &segs[0];
     assert_eq!(s.operation, "GetItem");
@@ -119,6 +203,7 @@ fn prune_removes_old_segments() {
 
     let c = MetricsCollector::new();
     c.record_segments(
+        ACCOUNT,
         "PutItem",
         None,
         LatencySegments {
@@ -133,7 +218,7 @@ fn prune_removes_old_segments() {
 
     // All data is recent, prune should keep it.
     c.prune();
-    let segs = c.query_segments(TimeWindow::AllTime);
+    let segs = c.query_segments(TimeWindow::AllTime, None);
     assert_eq!(segs.len(), 1);
     assert_eq!(segs[0].count, 1);
 }
@@ -144,6 +229,7 @@ fn segments_multiple_operations() {
 
     let c = MetricsCollector::new();
     c.record_segments(
+        ACCOUNT,
         "GetItem",
         Some("T"),
         LatencySegments {
@@ -156,6 +242,7 @@ fn segments_multiple_operations() {
         },
     );
     c.record_segments(
+        ACCOUNT,
         "PutItem",
         Some("T"),
         LatencySegments {
@@ -168,7 +255,7 @@ fn segments_multiple_operations() {
         },
     );
 
-    let segs = c.query_segments(TimeWindow::AllTime);
+    let segs = c.query_segments(TimeWindow::AllTime, None);
     assert_eq!(segs.len(), 2);
     // Both operations should have count=1.
     for s in &segs {
@@ -231,4 +318,207 @@ fn backup_job_recorders_land_under_the_outcome_and_the_store_call() {
     ] {
         assert_eq!(outcome.to_string(), text);
     }
+}
+
+/// The restore job's recorders land as the backup job's do: one
+/// `RestoreJobs` and one `RestoreJobDuration` per job under the outcome,
+/// the bytes undimensioned, a `get` failure under `BackupStoreErrors`; and
+/// the names render as the `/metrics` endpoint prints them.
+#[test]
+fn restore_job_recorders_land_under_the_outcome_and_render_their_names() {
+    use crate::metrics::types::{BackupJobOutcome, QuerySource};
+
+    let c = MetricsCollector::new();
+    c.record_restore_job(BackupJobOutcome::Succeeded, 2_000.0);
+    c.record_restore_job(BackupJobOutcome::Cancelled, 500.0);
+    c.record_restore_bytes_downloaded(8192);
+    c.record_backup_store_error("get");
+
+    let by = |metric: MetricName| {
+        let mut snaps = c.query(&MetricsQuery {
+            metric: Some(metric),
+            window: Some(TimeWindow::AllTime),
+            ..Default::default()
+        });
+        snaps.sort_by(|a, b| format!("{:?}", a.dimensions).cmp(&format!("{:?}", b.dimensions)));
+        snaps
+    };
+    let jobs = by(MetricName::RestoreJobs);
+    let outcomes: Vec<String> = jobs.iter().map(|s| format!("{:?}", s.dimensions)).collect();
+    assert_eq!(
+        outcomes,
+        [
+            "[Operation(\"cancelled\")]".to_owned(),
+            "[Operation(\"succeeded\")]".to_owned()
+        ]
+    );
+    assert!(jobs.iter().all(|s| s.count == 1 && s.sum == 1.0));
+    let durations = by(MetricName::RestoreJobDuration);
+    assert_eq!(durations.len(), 2);
+    assert_eq!(durations.iter().map(|s| s.sum).sum::<f64>(), 2_500.0);
+    let bytes = by(MetricName::RestoreBytesDownloaded);
+    assert_eq!(bytes.len(), 1);
+    assert!(bytes[0].dimensions.is_empty());
+    assert_eq!(bytes[0].sum, 8192.0);
+    let errors = by(MetricName::BackupStoreErrors);
+    assert_eq!(
+        format!("{:?}", errors[0].dimensions),
+        "[Operation(\"get\")]"
+    );
+    assert!(by(MetricName::BackupJobs).is_empty());
+    assert_eq!(MetricName::RestoreJobs.to_string(), "RestoreJobs");
+    assert_eq!(
+        MetricName::RestoreJobDuration.to_string(),
+        "RestoreJobDuration"
+    );
+    assert_eq!(
+        MetricName::RestoreBytesDownloaded.to_string(),
+        "RestoreBytesDownloaded"
+    );
+    assert_eq!(QuerySource::RestoreJob.to_string(), "RestoreJob");
+}
+
+/// Every recorder of a request's or a table's metric keys its point by the
+/// account it is given, so the account filter finds it and reports it as the
+/// `AccountId` dimension.
+#[test]
+fn every_scoped_recorder_keeps_its_account() {
+    type Recorder = fn(&MetricsCollector, &str);
+    let recorders: [(&str, MetricName, Recorder); 14] = [
+        ("latency", MetricName::SuccessfulRequestLatency, |c, a| {
+            c.record_latency(a, Some("T"), "GetItem", 1.0);
+        }),
+        (
+            "read capacity",
+            MetricName::ConsumedReadCapacityUnits,
+            |c, a| {
+                c.record_read_capacity(a, "T", "GetItem", 1.0);
+            },
+        ),
+        (
+            "write capacity",
+            MetricName::ConsumedWriteCapacityUnits,
+            |c, a| {
+                c.record_write_capacity(a, "T", "PutItem", 1.0);
+            },
+        ),
+        ("user error", MetricName::UserErrors, |c, a| {
+            c.record_user_error(a, None, "PutItem");
+        }),
+        ("system error", MetricName::SystemErrors, |c, a| {
+            c.record_system_error(a, Some("T"), "PutItem");
+        }),
+        (
+            "condition",
+            MetricName::ConditionalCheckFailedRequests,
+            |c, a| {
+                c.record_conditional_check_failure(a, Some("T"), "PutItem");
+            },
+        ),
+        ("conflict", MetricName::TransactionConflict, |c, a| {
+            c.record_transaction_conflict(a, "TransactWriteItems");
+        }),
+        ("returned items", MetricName::ReturnedItemCount, |c, a| {
+            c.record_returned_items(a, "T", "Query", 2);
+        }),
+        ("returned bytes", MetricName::ReturnedBytes, |c, a| {
+            c.record_returned_bytes(a, "T", "Query", 20);
+        }),
+        (
+            "ttl deletion",
+            MetricName::TimeToLiveDeletedItemCount,
+            |c, a| {
+                c.record_ttl_deletion(a, "T");
+            },
+        ),
+        (
+            "ttl audit",
+            MetricName::TtlAuditRepairedEntryCount,
+            |c, a| {
+                c.record_ttl_audit_repair(a, "T");
+            },
+        ),
+        (
+            "ttl row error",
+            MetricName::TtlSweepRowErrorCount,
+            |c, a| {
+                c.record_ttl_sweep_row_error(a, "T");
+            },
+        ),
+        ("ttl staleness", MetricName::TtlDeletionStaleness, |c, a| {
+            c.record_ttl_staleness(a, "T", 3.0);
+        }),
+        ("request count", MetricName::RequestCount, |c, a| {
+            c.record_request_count(a, "GetItem");
+        }),
+    ];
+    for (label, metric, record) in recorders {
+        let c = MetricsCollector::new();
+        record(&c, ACCOUNT);
+        record(&c, "222222222222");
+        let mine = c.query(&MetricsQuery {
+            account_id: Some(ACCOUNT.to_owned()),
+            metric: Some(metric),
+            window: Some(TimeWindow::AllTime),
+            ..Default::default()
+        });
+        assert_eq!(mine.len(), 1, "{label}: {mine:?}");
+        assert!(
+            mine[0]
+                .dimensions
+                .contains(&Dimension::AccountId(ACCOUNT.to_owned())),
+            "{label}: {:?}",
+            mine[0].dimensions
+        );
+        assert_eq!(mine[0].count, 1, "{label}");
+    }
+}
+
+/// The latency segments of one account leave out the other account's
+/// requests; without an account, or with an empty one, they hold both.
+#[test]
+fn segments_are_filtered_by_account() {
+    use crate::metrics::types::LatencySegments;
+
+    let c = MetricsCollector::new();
+    let point = LatencySegments {
+        dispatch_us: 10.0,
+        total_us: 10.0,
+        ..LatencySegments::default()
+    };
+    c.record_segments(ACCOUNT, "GetItem", Some("T"), point.clone());
+    c.record_segments("222222222222", "Scan", Some("T"), point.clone());
+    c.record_segments("222222222222", "GetItem", Some("T"), point);
+
+    let ops = |account: Option<&str>| {
+        let mut ops: Vec<(String, u64)> = c
+            .query_segments(TimeWindow::AllTime, account)
+            .into_iter()
+            .map(|s| (s.operation, s.count))
+            .collect();
+        ops.sort();
+        ops
+    };
+    assert_eq!(ops(Some(ACCOUNT)), [("GetItem".to_owned(), 1)]);
+    assert_eq!(
+        ops(Some("222222222222")),
+        [("GetItem".to_owned(), 1), ("Scan".to_owned(), 1)]
+    );
+    let all = [("GetItem".to_owned(), 2), ("Scan".to_owned(), 1)];
+    assert_eq!(ops(None), all);
+    assert_eq!(ops(Some("")), all);
+}
+
+/// An empty account filter is no filter, as in the stores.
+#[test]
+fn an_empty_account_filter_is_no_filter() {
+    let c = MetricsCollector::new();
+    c.record_user_error(ACCOUNT, None, "PutItem");
+    c.record_pool_acquire_latency(1.0);
+    let all = c.query(&MetricsQuery {
+        account_id: Some(String::new()),
+        window: Some(TimeWindow::AllTime),
+        ..Default::default()
+    });
+    assert_eq!(all.len(), 2, "{all:?}");
 }

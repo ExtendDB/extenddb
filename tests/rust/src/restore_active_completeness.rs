@@ -25,9 +25,8 @@
 //! window.
 //!
 //! On a server with a configured `[backup.store]` (`EXTENDDB_TEST_BACKUP_STORE`
-//! at `filesystem` or `s3`) the restore of a backup this server created is
-//! refused this release (the restore job is PR 9a's), so the race test pins
-//! that refusal in place of the race.
+//! at `filesystem` or `s3`) the restore is the restore job's, from the store,
+//! and the race runs against it as against the in-catalog copy.
 
 use crate::backup_restore::{
     backup_store, delete_backup_quietly, wait_for_backup_available, BackupStore,
@@ -169,33 +168,13 @@ async fn restored_table_has_all_items_when_first_active() {
     wait_for_backup_available(c, &arn).await;
 
     let dst = format!("RestoreRaceDst_{}", ts());
-    // A backup in the configured store is not restored this release (the
-    // restore job is PR 9a's): the race has nothing to observe, and the test
-    // pins the refusal instead.
-    if matches!(backup_store(), BackupStore::Filesystem | BackupStore::S3) {
-        let err = c
-            .restore_table_from_backup()
-            .target_table_name(&dst)
-            .backup_arn(&arn)
-            .send()
-            .await
-            .expect_err("a store-backed backup restored");
-        assert_eq!(err_code(&err), Some("ValidationException"), "{err:?}");
-        let msg = err_msg(&err);
-        assert!(
-            msg.contains("is in a backup store"),
-            "the refusal does not name the store: {msg}"
-        );
-        println!("restore of a store-backed backup refused: {msg}");
-        assert!(
-            c.describe_table().table_name(&dst).send().await.is_err(),
-            "the refused restore created {dst}"
-        );
-        delete_backup_quietly(c, &arn).await;
-        c.delete_table().table_name(&src).send().await.ok();
-        return;
-    }
-    println!("restore of an in-catalog backup: racing the observer");
+    println!(
+        "restore of {} backup: racing the observer",
+        match backup_store() {
+            BackupStore::Filesystem | BackupStore::S3 => "a store-backed",
+            BackupStore::None => "an in-catalog",
+        }
+    );
     // Race an observer against the in-flight restore: the moment it sees
     // ACTIVE, it counts. Returns None if ACTIVE never arrives within the
     // bound, which means the restore itself failed.

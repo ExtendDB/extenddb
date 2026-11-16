@@ -42,7 +42,6 @@ use sqlx::{Connection, PgConnection, PgPool};
 const ACCOUNT: &str = "123456789012";
 const REGION: &str = "us-east-1";
 const TABLE: &str = "t_stream_order";
-const LABEL: &str = "2026-01-01T00:00:00.000";
 
 /// The advisory lock key of the gate.
 const GATE: i64 = 0x5374_4f72;
@@ -77,8 +76,7 @@ impl Scratch {
     }
 
     /// The test table, keyed on `pk` and `sk`, with a NEW_AND_OLD_IMAGES
-    /// stream whose label is pinned to [`LABEL`]. Returns its key info, its
-    /// table id and its stream ARN.
+    /// stream. Returns its key info, its table id and its stream ARN.
     async fn stream_table(&self) -> (TableKeyInfo, String, String) {
         let key = |name: &str, key_type| {
             (
@@ -114,12 +112,12 @@ impl Scratch {
             )
             .await
             .expect("create the table");
-        sqlx::query("UPDATE tables SET stream_label = $1 WHERE table_id = $2")
-            .bind(LABEL)
-            .bind(&desc.table_id)
-            .execute(&self.db)
-            .await
-            .expect("pin the stream label");
+        // The stream's label is carried in its shard ids, so the ARN takes the
+        // label the table was created with rather than pinning one.
+        let label = desc
+            .latest_stream_label
+            .clone()
+            .expect("a stream-enabled table has a label");
         let key_info = self
             .engine
             .table_key_info(ACCOUNT, TABLE)
@@ -128,7 +126,7 @@ impl Scratch {
         (
             key_info,
             desc.table_id,
-            stream_arn(REGION, ACCOUNT, TABLE, LABEL),
+            stream_arn(REGION, ACCOUNT, TABLE, &label),
         )
     }
 

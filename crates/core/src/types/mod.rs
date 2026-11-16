@@ -12,6 +12,7 @@ mod query;
 mod stream;
 mod table;
 mod transaction;
+mod warm_throughput;
 
 pub use attribute_value::AttributeValue;
 pub use backup::{
@@ -85,4 +86,8 @@ pub use transaction::{
     CancellationReason, ItemResponse, TransactConditionCheck, TransactDelete, TransactGet,
     TransactGetItem, TransactGetItemsInput, TransactGetItemsOutput, TransactPut, TransactUpdate,
     TransactWriteItem, TransactWriteItemsInput, TransactWriteItemsOutput,
+};
+pub use warm_throughput::{
+    ON_DEMAND_WARM_READ_UNITS, ON_DEMAND_WARM_WRITE_UNITS, WarmThroughput, WarmThroughputDefaults,
+    WarmThroughputDescription, WarmThroughputRecord, WarmThroughputStatus, epoch_seconds_now,
 };

@@ -61,6 +61,10 @@ LISTED = re.compile(
 # The same lines, for a migration that is not convergent.
 NOT_CONVERGENT = re.compile(r"^\s*(\d+)\s+\S+\s+(?:breaking|additive)\s+not convergent\s")
 
+# The line of a migration that does not apply on PostgreSQL. The runner
+# records it in the catalog's ledger and has no body to run again.
+NOT_APPLICABLE = re.compile(r"^\s*(\d+)\s+\S+\s+not applicable: ")
+
 
 @functools.cache
 def _not_convergent():
@@ -75,12 +79,24 @@ def _not_convergent():
 
 
 @functools.cache
+def _not_applicable():
+    """The ids `migrate --list` marks as not applicable on PostgreSQL."""
+    listed = _run_extenddb("migrate", "--list")
+    return {
+        int(match.group(1))
+        for match in map(NOT_APPLICABLE.match, listed.stdout.splitlines())
+        if match
+    }
+
+
+@functools.cache
 def _listed():
     """The stores of every migration the binary carries, by id, from
     `migrate --list`, which opens no database. Adding a migration then needs
-    no edit here; a literal id in a test means that migration itself."""
+    no edit here; a literal id in a test means that migration itself. A
+    migration that does not apply records its row in the catalog only."""
     listed = _run_extenddb("migrate", "--list")
-    stores = {}
+    stores = {i: ["catalog"] for i in _not_applicable()}
     for line in listed.stdout.splitlines():
         match = LISTED.match(line)
         if match:
@@ -345,8 +361,8 @@ class TestVectorCatalogMigration:
     ):
         """`migrate --yes --reconverge` runs each convergent migration again on
         a catalog at the latest migration, names each one that is not
-        convergent as skipped, and leaves the catalog current, with its ledger
-        rows as they were.
+        convergent as skipped, names none that does not apply, and leaves the
+        catalog current, with its ledger rows as they were.
 
         This is the command an operator runs after a release before 1.0 wrote
         to a migrated catalog. Migration 1's check of its result does not run
@@ -367,7 +383,9 @@ class TestVectorCatalogMigration:
         assert rerun.returncode == 0, output
         assert 2 in _not_convergent(), _not_convergent()
         for i in _ids_in("catalog"):
-            if i in _not_convergent():
+            if i in _not_applicable():
+                assert not re.search(rf"^\s*(?:Skipped|Ran again) {i} ", output, re.M), output
+            elif i in _not_convergent():
                 assert re.search(rf"^\s*Skipped {i} \S+: ", output, re.M), output
                 assert f"Ran again {i} " not in output, output
             else:

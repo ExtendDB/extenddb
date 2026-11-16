@@ -6,6 +6,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "SigV4 authentication and IAM-compatible authorization of the ExtendDB server. Internal crate of the extenddb binary, with no API stability promise."
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 extenddb-core = { workspace = true }
@@ -23,5 +26,10 @@ tracing = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
-extenddb-cache = { workspace = true, features = ["test-util"] }
+extenddb-cache = { path = "../cache", features = ["test-util"] }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+# The SigV4 differential tests (tests/sigv4_differential) sign requests with
+# the SDK's signer and generate them from a fixed seed.
+aws-credential-types = { workspace = true }
+aws-sigv4 = { workspace = true, features = ["sign-http", "http1"] }
+proptest = { workspace = true, features = ["std"] }

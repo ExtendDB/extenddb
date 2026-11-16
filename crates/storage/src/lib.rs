@@ -21,12 +21,19 @@ pub mod diagnostics;
 pub mod diagnostics_store;
 pub mod error;
 pub mod hooks;
+#[doc(hidden)]
+#[cfg(feature = "test-util")]
+pub mod iam_leftovers_conformance;
 pub mod management_store;
 pub mod management_store_factory;
+#[doc(hidden)]
+#[cfg(feature = "test-util")]
+pub mod metrics_conformance;
 pub mod migrations;
 pub mod operations;
 pub mod password;
 pub mod policy_migration;
+pub mod restore_engine;
 pub mod secret_cipher;
 pub mod server_components;
 pub mod settings_store;
@@ -34,6 +41,7 @@ pub mod snapshot;
 #[doc(hidden)]
 #[cfg(feature = "test-hooks")]
 pub mod snapshot_conformance;
+pub mod stream_lineage;
 #[doc(hidden)]
 #[cfg(feature = "test-hooks")]
 pub mod test_pause;
@@ -45,7 +53,10 @@ pub use backend::{Backend, BackendAlreadySet, backend_name, set_backend, try_bac
 pub use backup_catalog::{
     BackupCatalog, JobClaim, JobPermit, LegacyBackupReader, MaintenanceClaim,
 };
-pub use backup_definition::{BackupRestoreSource, RestoreRequest, RestoreTableOverrides};
+pub use backup_definition::{
+    BackupRestoreSource, RestoreRequest, RestoreSource, RestoreTableOverrides,
+};
+pub use restore_engine::{BulkLoadFile, Finished, RestoreEngine};
 pub use snapshot::{SnapshotEngine, SnapshotInfo, TableSnapshot};
 
 pub use transact::{IdempotencyKey, TransactGetOp, TransactWriteOp};
@@ -841,8 +852,10 @@ pub trait StreamEngine: Send + Sync {
     /// Cassandra after reading the table), and return `StorageError::TableNotFound`
     /// with the message `Requested resource not found: Stream does not exist` when the
     /// stream does not exist for that account or the shard is not one of that stream's
-    /// shards. A shard of another table, another account, or an earlier stream label on
-    /// the same table therefore yields no records.
+    /// shards (`util::shard_in_stream`). A shard of another table, another account, or
+    /// another stream of the same table therefore yields no records; a closed stream's
+    /// shards keep reading under the closed stream's ARN after the table has a newer
+    /// stream.
     fn get_stream_records(
         &self,
         account_id: &str,
@@ -939,6 +952,7 @@ pub trait StorageEngine:
     + StreamEngine
     + BackupCatalog
     + LegacyBackupReader
+    + RestoreEngine
     + SnapshotEngine
     + WorkerStore
     + BulkOperationStore
@@ -955,6 +969,7 @@ impl<T> StorageEngine for T where
         + StreamEngine
         + BackupCatalog
         + LegacyBackupReader
+        + RestoreEngine
         + SnapshotEngine
         + WorkerStore
         + BulkOperationStore
