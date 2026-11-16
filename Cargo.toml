@@ -3,9 +3,12 @@
 [workspace]
 # Resolver 3 prefers dependency versions whose rust-version fits ours. The
 # published crates use it too. (With resolver 2, cargo writes
-# `resolver = "2"` into each of them.) Without `--locked`, `cargo install`
-# then resolves for Rust 1.88 and does not fail on a dependency that needs a
-# newer Rust.
+# `resolver = "2"` into each of them.) This preference is best-effort: it
+# only holds back a crate whose declared minimum rustc is above ours. A
+# build that uses the committed Cargo.lock gets the recorded versions. A
+# resolve with no committed lock can still pick a transitive crate that does
+# not build with the aws-sdk pins below. A bare `cargo install` or an
+# explicit `cargo update` does this, so install from source with `--locked`.
 resolver = "3"
 members = [
     "crates/core",
@@ -27,7 +30,7 @@ members = [
 [workspace.package]
 version = "0.1.14"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.91.1"
 license = "Apache-2.0"
 repository = "https://github.com/ExtendDB/extenddb"
 homepage = "https://extenddb.org/"
@@ -111,15 +114,17 @@ bson = "2.13"
 dashmap = "6"
 
 # Backup store
-# Exact pins: the aws-sdk crates release in lockstep, and these are the newest
-# versions whose declared minimum supported rustc fits the workspace
-# rust-version (1.88); later releases require a newer compiler. Their
-# transitive aws-* and aws-smithy-* crates are held in Cargo.lock at the
-# newest versions that build on 1.88 (set with
-# `cargo +1.88.0 update <crate>@<version> --precise <older>`). The resolver
-# fallback in .cargo/config.toml keeps a plain `cargo update` from moving
-# them past that, and the 1.88 leg of .github/workflows/test.yml fails if
-# they drift. The feature set is that of tests/rust/Cargo.toml plus `sso` on
+# Exact pins: the aws-sdk crates release in lockstep, and each of these
+# versions declares a minimum supported rustc at or below the workspace
+# rust-version (1.91.1). Their transitive aws-* and aws-smithy-* crates are
+# held in Cargo.lock at versions that build on 1.91.1 (set with
+# `cargo +1.91.1 update <crate>@<version> --precise <older>`). The resolver
+# fallback in .cargo/config.toml makes a plain `cargo update` less likely to
+# move them, but does not prevent it: a bare `cargo update` on 1.91.1 can
+# still raise the transitive aws-smithy crates to versions that do not build
+# with these pins. A build that uses the committed Cargo.lock gets the
+# recorded versions. The release images pass `--locked`, and `cargo install
+# extenddb` should pass it too. The feature set is that of tests/rust/Cargo.toml plus `sso` on
 # aws-config, so a server whose credentials come from an SSO profile
 # (`sso_session` in the shared config) can reach the backup bucket.
 # tests/rust does not enable `sso`: its client takes explicit credentials

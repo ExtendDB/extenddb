@@ -13,7 +13,7 @@ This section gets you from zero to a working ExtendDB instance as fast as possib
 ### Prerequisites
 
 - PostgreSQL 14+ running locally
-- Rust toolchain 1.88+
+- Rust toolchain 1.91.1+
 - AWS CLI v2
 
 ### Steps

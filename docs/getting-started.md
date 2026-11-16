@@ -46,7 +46,7 @@ and continue at [section 6](#6-try-it-out).
   - SQLite (embedded; nothing to install)
   - MongoDB 7.0+ with replica set (see [Local MongoDB setup](local-mongodb-setup.md))
   - Apache Cassandra 4.1+ running locally (CI runs the `cassandra:4.1` image; see [Cassandra setup](cassandra-setup.md) and [Storage backends](storage-backends.md))
-- Rust toolchain (1.88+)
+- Rust toolchain (1.91.1+)
 - AWS CLI v2 (for testing)
 - Python 3.10+ with virtual environment (see [Python Environment Setup](https://github.com/ExtendDB/extenddb/blob/main/README.md#python-environment-setup) in the README)
 
