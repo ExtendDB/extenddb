@@ -1,0 +1,840 @@
+// Copyright 2026 ExtendDB contributors
+// SPDX-License-Identifier: Apache-2.0
+
+use serde_json::{Value, json};
+
+use super::*;
+use crate::types::{BatchWriteItemInput, TransactGetItem, TransactWriteItem};
+use crate::validation::number::validate_and_normalize_number;
+
+// Every value below was sent to DynamoDB twice on 2026-10-27 (us-east-1) on
+// the operation path the test names, with the same answer both times, except
+// where a comment gives another date or says the test pins a choice of these
+// checks.
+const NUMERIC: &str = "The parameter cannot be converted to a numeric value";
+const OVERFLOW: &str =
+    "Number overflow. Attempting to store a number with magnitude larger than supported range";
+const UNDERFLOW: &str =
+    "Number underflow. Attempting to store a number with magnitude smaller than supported range";
+const DIGITS: &str = "Attempting to store more than 38 significant digits in a Number";
+
+fn refused(result: Result<(), DynamoDbError>) -> String {
+    match result {
+        Err(DynamoDbError::ValidationException(message)) => message,
+        other => panic!("expected ValidationException, got {other:?}"),
+    }
+}
+
+// The `ImportTable` reader. Its rows were measured on `BatchWriteItem` on
+// 2026-10-27, when that operation read numbers this way; the `ImportTable`
+// rows measured on 2026-11-03, in the `import_row` tests below, follow the
+// same rules.
+
+fn i32_scale(n: &str) -> Result<(), String> {
+    validate_number_i32_scale(n).map_err(|fault| fault.message(n))
+}
+
+#[test]
+fn i32_scale_accepts_what_the_service_accepts() {
+    for n in [
+        "6180".to_owned(),
+        format!("1{}", "0".repeat(38)),
+        format!("1{}", "0".repeat(100)),
+        format!("1.{}", "0".repeat(40)),
+        format!("{}0", "1".repeat(38)),
+        format!("{}.0", "1".repeat(38)),
+        "0".repeat(40),
+        format!("0.{}", "0".repeat(40)),
+        format!("{}1", "0".repeat(40)),
+        "+5".to_owned(),
+        "5.".to_owned(),
+        ".5".to_owned(),
+        "+.5".to_owned(),
+        "-.5".to_owned(),
+        "1E+5".to_owned(),
+        format!("1E{}5", "0".repeat(24)),
+        format!("1E-{}5", "0".repeat(24)),
+        "0.0E126".to_owned(),
+        "0E125".to_owned(),
+        "0E-130".to_owned(),
+    ] {
+        assert_eq!(i32_scale(&n), Ok(()), "{n:?}");
+    }
+    // A lowercase exponent marker: accepted on BatchWriteItem and PutItem and
+    // stored as the 64-bit reader writes it (measured 2026-10-27, twice each).
+    for (n, stored) in [
+        ("1e5", "100000"),
+        ("1e+5", "100000"),
+        ("1.5e-3", "0.0015"),
+        ("0e125", "0"),
+    ] {
+        assert_eq!(i32_scale(n), Ok(()), "{n:?}");
+        assert_eq!(validate_and_normalize_number(n).unwrap(), stored, "{n:?}");
+    }
+}
+
+#[test]
+fn i32_scale_refuses_an_exponent_or_scale_outside_32_bits_as_malformed() {
+    for n in [
+        "abc",
+        " 5",
+        "1E2147483648",
+        "1E4294967296",
+        "1E9223372036854775807",
+        "1E9223372036854775808",
+        "1E-2147483648",
+        "1.5E-2147483648",
+        "1E-2147483649",
+        "0E2147483648",
+        "0E9223372036854775807",
+        "1E",
+        "1E+",
+        ".",
+        "-",
+        "1E5.5",
+        "\u{b2}",
+        "1.5a",
+        "1.\u{b2}",
+        "1.5.5",
+        "1.e",
+    ] {
+        assert_eq!(i32_scale(n), Err(format!("{NUMERIC}: {n}")), "{n:?}");
+    }
+    // An empty value answers the message with no colon.
+    assert_eq!(i32_scale(""), Err(NUMERIC.to_owned()));
+}
+
+#[test]
+fn i32_scale_magnitude_wraps_and_comes_before_the_digit_count() {
+    let ones = "1".repeat(39);
+    for n in [
+        "1E126".to_owned(),
+        format!("1E{}126", "0".repeat(24)),
+        format!("{ones}E200"),
+    ] {
+        assert_eq!(i32_scale(&n), Err(OVERFLOW.to_owned()), "{n:?}");
+    }
+    for n in [
+        "1E-131".to_owned(),
+        "1E-2147483647".to_owned(),
+        // The magnitude passes the 32-bit maximum and wraps to a negative.
+        "10E2147483647".to_owned(),
+        "1E2147483647".to_owned(),
+        format!("{ones}E2147483647"),
+        format!("{ones}E-200"),
+    ] {
+        assert_eq!(i32_scale(&n), Err(UNDERFLOW.to_owned()), "{n:?}");
+    }
+    assert_eq!(i32_scale(&ones), Err(DIGITS.to_owned()));
+}
+
+/// One number on four paths: a `PutItem` item value, a `BatchWriteItem` put
+/// item value, a `TransactWriteItems` `Put` item value and a
+/// `TransactGetItems` key value, as the answer each path gives.
+fn four_paths(n: &str) -> [Result<(), String>; 4] {
+    let answer = |result: Result<(), DynamoDbError>| match result {
+        Ok(()) => Ok(()),
+        Err(DynamoDbError::ValidationException(message)) => Err(message),
+        Err(other) => panic!("expected ValidationException, got {other:?}"),
+    };
+    let item = json!({"pk": {"S": "a"}, "n": {"N": n}});
+    let put: PutItemInput =
+        serde_json::from_value(json!({"TableName": "t", "Item": item.clone()})).unwrap();
+    let batch: BatchWriteItemInput = serde_json::from_value(
+        json!({"RequestItems": {"t": [{"PutRequest": {"Item": item.clone()}}]}}),
+    )
+    .unwrap();
+    let transact_put: TransactWriteItem =
+        serde_json::from_value(json!({"Put": {"TableName": "t", "Item": item}})).unwrap();
+    let transact_get: TransactGetItem =
+        serde_json::from_value(json!({"Get": {"TableName": "t", "Key": {"pk": {"N": n}}}}))
+            .unwrap();
+    [
+        answer(put_item_item(&put)),
+        answer(batch_write_item(&batch)),
+        answer(transact_write_item(&transact_put)),
+        answer(transact_get_item(&transact_get)),
+    ]
+}
+
+#[test]
+fn put_batch_and_transact_paths_read_a_number_alike() {
+    // Measured in us-east-1 on 2026-11-11, each value twice on PutItem,
+    // BatchWriteItem, TransactWriteItems and TransactGetItems with the same
+    // answer on each path. The service puts `1 validation error detected: `
+    // ahead of the PutItem message, and ExtendDB's PutItem item errors carry
+    // no prefix. `1E125` is accepted on each path.
+    let convert = |n: &str| format!("{NUMERIC}: {n}");
+    let forty = "1234567890123456789012345678901234567890";
+    for (n, want) in [
+        ("10E2147483647".to_owned(), Err(OVERFLOW.to_owned())),
+        ("1E2147483648".to_owned(), Err(OVERFLOW.to_owned())),
+        ("1E2147483647".to_owned(), Err(OVERFLOW.to_owned())),
+        ("1E-2147483648".to_owned(), Err(UNDERFLOW.to_owned())),
+        ("1E-2147483649".to_owned(), Err(UNDERFLOW.to_owned())),
+        ("1E9223372036854775807".to_owned(), Err(OVERFLOW.to_owned())),
+        (
+            "1E9223372036854775808".to_owned(),
+            Err(convert("1E9223372036854775808")),
+        ),
+        (
+            "10E9223372036854775807".to_owned(),
+            Err(OVERFLOW.to_owned()),
+        ),
+        (
+            "1E-9223372036854775808".to_owned(),
+            Err(UNDERFLOW.to_owned()),
+        ),
+        (
+            "1E-9223372036854775809".to_owned(),
+            Err(convert("1E-9223372036854775809")),
+        ),
+        ("1E125".to_owned(), Ok(())),
+        // Zeros and forty digits, also sent to UpdateItem as an
+        // ExpressionAttributeValues value with the same answer. The forty
+        // digits without an exponent were sent to BatchWriteItem alone.
+        ("0E2147483648".to_owned(), Err(OVERFLOW.to_owned())),
+        ("0E-2147483649".to_owned(), Err(UNDERFLOW.to_owned())),
+        (
+            "0E9223372036854775807".to_owned(),
+            Err(UNDERFLOW.to_owned()),
+        ),
+        (format!("{forty}E200"), Err(DIGITS.to_owned())),
+        (format!("{forty}E-200"), Err(DIGITS.to_owned())),
+        (forty.to_owned(), Err(DIGITS.to_owned())),
+    ] {
+        for (path, got) in [
+            "PutItem",
+            "BatchWriteItem",
+            "TransactWriteItems",
+            "TransactGetItems",
+        ]
+        .into_iter()
+        .zip(four_paths(&n))
+        {
+            assert_eq!(got, want, "{n} on {path}");
+        }
+    }
+}
+
+fn get(key: Value) -> GetItemInput {
+    serde_json::from_value(json!({"TableName": "t", "Key": key})).unwrap()
+}
+
+#[test]
+fn get_item_key_answers_without_a_prefix() {
+    assert_eq!(
+        refused(get_item(&get(json!({"pk": {"N": "abc"}})))),
+        format!("{NUMERIC}: abc")
+    );
+    // A malformed number after a valid attribute is found too.
+    assert_eq!(
+        refused(get_item(&get(json!({"a": {"S": "x"}, "b": {"N": "abc"}})))),
+        format!("{NUMERIC}: abc")
+    );
+    // The 64-bit exponent rules, and the empty value with its colon.
+    assert_eq!(
+        refused(get_item(&get(json!({"pk": {"N": "10E2147483647"}})))),
+        OVERFLOW
+    );
+    assert_eq!(
+        refused(get_item(&get(json!({"pk": {"N": "0E2147483648"}})))),
+        OVERFLOW
+    );
+    assert_eq!(
+        refused(get_item(&get(json!({"pk": {"N": ""}})))),
+        format!("{NUMERIC}: ")
+    );
+    get_item(&get(json!({"pk": {"N": "5"}, "sk": {"S": "x"}}))).unwrap();
+}
+
+#[test]
+fn batch_get_keys_answer_without_a_prefix() {
+    let keys: Vec<Item> = serde_json::from_value(json!([
+        {"pk": {"N": "1"}},
+        {"pk": {"N": "1E126"}},
+    ]))
+    .unwrap();
+    assert_eq!(refused(batch_get_keys(&keys)), OVERFLOW);
+    batch_get_keys(&keys[..1]).unwrap();
+}
+
+fn delete(body: Value) -> DeleteItemInput {
+    serde_json::from_value(body).unwrap()
+}
+
+#[test]
+fn delete_item_key_and_values_carry_the_prefix() {
+    let input = delete(json!({
+        "TableName": "t",
+        "Key": {"pk": {"N": "abc"}},
+        "ConditionExpression": "n = :v",
+        "ExpressionAttributeValues": {":v": {"N": "1E126"}},
+    }));
+    assert_eq!(
+        refused(delete_item_key(&input)),
+        format!("1 validation error detected: {NUMERIC}: abc")
+    );
+    // No `ExpressionAttributeValues contains invalid value` wrapper.
+    assert_eq!(
+        refused(delete_item_values(&input)),
+        format!("1 validation error detected: {OVERFLOW}")
+    );
+    let input = delete(json!({"TableName": "t", "Key": {"pk": {"N": ""}}}));
+    assert_eq!(
+        refused(delete_item_key(&input)),
+        format!("1 validation error detected: {NUMERIC}: ")
+    );
+    delete_item_values(&input).unwrap();
+}
+
+#[test]
+fn update_item_key_carries_the_prefix() {
+    let input: UpdateItemInput = serde_json::from_value(json!({
+        "TableName": "t",
+        "Key": {"pk": {"N": "1E126"}},
+        "UpdateExpression": "SET a = :s",
+        "ExpressionAttributeValues": {":s": {"S": "x"}},
+    }))
+    .unwrap();
+    assert_eq!(
+        refused(update_item_key(&input)),
+        format!("1 validation error detected: {OVERFLOW}")
+    );
+}
+
+fn put(body: Value) -> PutItemInput {
+    serde_json::from_value(body).unwrap()
+}
+
+#[test]
+fn put_item_values_carry_the_prefix_and_follow_the_item() {
+    let input = put(json!({
+        "TableName": "t",
+        "Item": {"pk": {"S": "a"}},
+        "ConditionExpression": "attribute_not_exists(n)",
+        "ExpressionAttributeValues": {":v": {"NS": ["1", "abc"]}},
+    }));
+    assert_eq!(
+        refused(put_item_values(&input)),
+        format!("1 validation error detected: {NUMERIC}: abc")
+    );
+    // The item's number is reported first, by the item check, with its own
+    // text; the values check answers only its own placeholders.
+    let input = put(json!({
+        "TableName": "t",
+        "Item": {"pk": {"S": "a"}, "n": {"N": "xyz"}},
+        "ConditionExpression": "n = :v",
+        "ExpressionAttributeValues": {":v": {"N": "abc"}},
+    }));
+    assert_eq!(refused(put_item_item(&input)), format!("{NUMERIC}: xyz"));
+    assert_eq!(
+        refused(put_item_values(&input)),
+        format!("1 validation error detected: {NUMERIC}: abc")
+    );
+    // Without values, there is nothing for the values check to refuse.
+    let input = put(json!({"TableName": "t", "Item": {"pk": {"S": "a"}, "n": {"N": "xyz"}}}));
+    put_item_values(&input).unwrap();
+}
+
+#[test]
+fn transact_get_item_reads_a_64_bit_exponent() {
+    // Measured 2026-11-11: `10E2147483647` and `1E2147483648` are a `Number
+    // overflow`, and an empty `N` answers the message with the colon (it had
+    // no colon on 2026-10-27).
+    let item = |n: &str| -> TransactGetItem {
+        serde_json::from_value(json!({"Get": {"TableName": "t", "Key": {"pk": {"N": n}}}})).unwrap()
+    };
+    assert_eq!(refused(transact_get_item(&item("10E2147483647"))), OVERFLOW);
+    assert_eq!(refused(transact_get_item(&item("1E2147483648"))), OVERFLOW);
+    assert_eq!(
+        refused(transact_get_item(&item(""))),
+        format!("{NUMERIC}: ")
+    );
+    transact_get_item(&item("5")).unwrap();
+}
+
+#[test]
+fn batch_write_item_checks_put_items_and_delete_keys() {
+    let batch = |requests: Value| -> BatchWriteItemInput {
+        serde_json::from_value(json!({"RequestItems": {"t": requests}})).unwrap()
+    };
+    for (request, want) in [
+        (
+            json!({"PutRequest": {"Item": {"pk": {"S": "a"}, "ns": {"NS": ["1", "abc"]}}}}),
+            format!("{NUMERIC}: abc"),
+        ),
+        (
+            json!({"PutRequest": {"Item": {"a": {"S": "x"}, "b": {"N": "abc"}}}}),
+            format!("{NUMERIC}: abc"),
+        ),
+        (
+            json!({"PutRequest": {"Item": {"pk": {"S": "a"}, "m": {"M": {"x": {"N": "1E126"}}}}}}),
+            OVERFLOW.to_owned(),
+        ),
+        (
+            // Measured 2026-11-11.
+            json!({"PutRequest": {"Item": {"pk": {"S": "a"}, "n": {"N": "10E2147483647"}}}}),
+            OVERFLOW.to_owned(),
+        ),
+        (
+            json!({"DeleteRequest": {"Key": {"pk": {"N": "1E126"}}}}),
+            OVERFLOW.to_owned(),
+        ),
+        // An empty `N` answers the message without the colon in a delete key,
+        // a put item value and an `NS` member (measured 2026-11-11; the
+        // delete key also on 2026-10-27).
+        (
+            json!({"DeleteRequest": {"Key": {"pk": {"N": ""}}}}),
+            NUMERIC.to_owned(),
+        ),
+        (
+            json!({"PutRequest": {"Item": {"pk": {"S": "a"}, "n": {"N": ""}}}}),
+            NUMERIC.to_owned(),
+        ),
+        (
+            json!({"PutRequest": {"Item": {"pk": {"S": "a"}, "n": {"NS": ["1", ""]}}}}),
+            NUMERIC.to_owned(),
+        ),
+    ] {
+        let input = batch(json!([{"PutRequest": {"Item": {"pk": {"S": "ok"}}}}, request]));
+        assert_eq!(refused(batch_write_item(&input)), want, "{request}");
+    }
+    batch_write_item(&batch(
+        json!([{"PutRequest": {"Item": {"n": {"N": "1E2"}}}}]),
+    ))
+    .unwrap();
+}
+
+fn transact(action: Value) -> TransactWriteItem {
+    serde_json::from_value(action).unwrap()
+}
+
+#[test]
+fn transact_write_item_checks_values_then_key_or_item() {
+    // Values come before the key: the service names the value (measured
+    // 2026-10-27). A value answers the number message alone, with no prefix
+    // and no wrapper, a value inside an `L` included, and an empty `N` with
+    // the colon (measured 2026-11-11 on Update, Put, Delete and
+    // ConditionCheck values; the empty `N` and the `L` on an Update value).
+    let update = transact(json!({"Update": {
+        "TableName": "t",
+        "Key": {"pk": {"N": "abc"}},
+        "UpdateExpression": "SET a = :v",
+        "ExpressionAttributeValues": {":v": {"N": "xyz"}},
+    }}));
+    assert_eq!(
+        refused(transact_write_item(&update)),
+        format!("{NUMERIC}: xyz")
+    );
+    let check = transact(json!({"ConditionCheck": {
+        "TableName": "t",
+        "Key": {"pk": {"S": "a"}},
+        "ConditionExpression": "n = :v",
+        "ExpressionAttributeValues": {":v": {"N": ""}},
+    }}));
+    assert_eq!(refused(transact_write_item(&check)), format!("{NUMERIC}: "));
+    let put = transact(json!({"Put": {
+        "TableName": "t",
+        "Item": {"pk": {"S": "a"}, "n": {"N": "xyz"}},
+        "ConditionExpression": "n = :v",
+        "ExpressionAttributeValues": {":v": {"L": [{"N": "1E126"}]}},
+    }}));
+    assert_eq!(refused(transact_write_item(&put)), OVERFLOW);
+    // Measured 2026-11-11 on a TransactWriteItems Delete key: `1E2147483647`
+    // is a `Number overflow`, with no prefix.
+    let delete = transact(json!({"Delete": {
+        "TableName": "t",
+        "Key": {"pk": {"N": "1E2147483647"}},
+    }}));
+    assert_eq!(refused(transact_write_item(&delete)), OVERFLOW);
+}
+
+#[test]
+fn transact_write_item_keys_and_items_answer_an_empty_number_with_the_colon() {
+    // Measured 2026-11-11 on a Delete key and a Put item value, each twice;
+    // both had no colon on 2026-10-27.
+    let delete = transact(json!({"Delete": {"TableName": "t", "Key": {"pk": {"N": ""}}}}));
+    assert_eq!(
+        refused(transact_write_item(&delete)),
+        format!("{NUMERIC}: ")
+    );
+    let put = transact(json!({"Put": {
+        "TableName": "t",
+        "Item": {"pk": {"S": "a"}, "n": {"N": ""}},
+    }}));
+    assert_eq!(refused(transact_write_item(&put)), format!("{NUMERIC}: "));
+}
+
+#[test]
+fn transact_update_values_answer_the_inner_number_message() {
+    // Measured 2026-11-11 with `SET n = :v`, each value twice: no prefix, no
+    // wrapper, and the colon for an empty `N`.
+    for (value, want) in [
+        (json!({"N": "1E126"}), OVERFLOW.to_owned()),
+        (json!({"N": "abc"}), format!("{NUMERIC}: abc")),
+        (json!({"N": ""}), format!("{NUMERIC}: ")),
+        (json!({"M": {"x": {"N": "abc"}}}), format!("{NUMERIC}: abc")),
+        (json!({"L": [{"N": "1E126"}]}), OVERFLOW.to_owned()),
+        (json!({"NS": ["1", "abc"]}), format!("{NUMERIC}: abc")),
+    ] {
+        let update = transact(json!({"Update": {
+            "TableName": "t",
+            "Key": {"pk": {"S": "a"}},
+            "UpdateExpression": "SET n = :v",
+            "ExpressionAttributeValues": {":v": value.clone()},
+        }}));
+        assert_eq!(refused(transact_write_item(&update)), want, "{value}");
+    }
+}
+
+#[test]
+fn update_item_values_carry_the_prefix_and_no_wrapper() {
+    // Measured 2026-11-11 with `SET n = :v`, each value twice.
+    for (value, want) in [
+        (json!({"N": "abc"}), format!("{NUMERIC}: abc")),
+        (json!({"N": "12e"}), format!("{NUMERIC}: 12e")),
+        (json!({"N": ""}), format!("{NUMERIC}: ")),
+        (json!({"N": "1E2147483648"}), OVERFLOW.to_owned()),
+        (json!({"N": "1E126"}), OVERFLOW.to_owned()),
+        (json!({"M": {"x": {"N": "abc"}}}), format!("{NUMERIC}: abc")),
+        (json!({"L": [{"N": "1E126"}]}), OVERFLOW.to_owned()),
+        (json!({"NS": ["1", "abc"]}), format!("{NUMERIC}: abc")),
+    ] {
+        let input: UpdateItemInput = serde_json::from_value(json!({
+            "TableName": "t",
+            "Key": {"pk": {"S": "a"}},
+            "UpdateExpression": "SET n = :v",
+            "ExpressionAttributeValues": {":v": value.clone()},
+        }))
+        .unwrap();
+        assert_eq!(
+            refused(update_item_values(&input)),
+            format!("1 validation error detected: {want}"),
+            "{value}"
+        );
+    }
+    let input: UpdateItemInput = serde_json::from_value(json!({
+        "TableName": "t",
+        "Key": {"pk": {"S": "a"}},
+        "UpdateExpression": "SET n = :v",
+        "ExpressionAttributeValues": {":v": {"N": "1E125"}},
+    }))
+    .unwrap();
+    update_item_values(&input).unwrap();
+}
+
+#[test]
+fn transact_put_and_delete_values_are_checked_only_with_a_condition() {
+    for action in ["Put", "Delete"] {
+        let field = if action == "Put" { "Item" } else { "Key" };
+        let mut body = json!({
+            "TableName": "t",
+            field: {"pk": {"S": "a"}},
+            "ExpressionAttributeValues": {":v": {"N": "abc"}},
+        });
+        transact_write_item(&transact(json!({action: body.clone()}))).unwrap();
+        // An empty ConditionExpression counts as present.
+        body["ConditionExpression"] = json!("");
+        assert_eq!(
+            refused(transact_write_item(&transact(json!({action: body})))),
+            format!("{NUMERIC}: abc"),
+            "{action}"
+        );
+    }
+}
+
+#[test]
+fn several_malformed_values_are_reported_in_placeholder_order() {
+    // The service named either value on two sends of one PutItem request;
+    // these checks pin the first placeholder in name order.
+    let input = put(json!({
+        "TableName": "t",
+        "Item": {"pk": {"S": "a"}},
+        "ConditionExpression": "n = :b OR n = :a",
+        "ExpressionAttributeValues": {":b": {"N": "abc"}, ":a": {"N": "xyz"}},
+    }));
+    assert_eq!(
+        refused(put_item_values(&input)),
+        format!("1 validation error detected: {NUMERIC}: xyz")
+    );
+}
+
+fn expected(map: Value) -> HashMap<String, ExpectedAttributeValue> {
+    serde_json::from_value(map).unwrap()
+}
+
+#[test]
+fn expected_values_carry_the_prefix() {
+    // Measured 2026-11-11 on items that do not exist: a Value on PutItem,
+    // DeleteItem and UpdateItem, and an EQ AttributeValueList on PutItem,
+    // each with `abc`, `1E2147483648` and an empty N. The last two rows pin
+    // a choice of these checks: a later list member and a number nested in
+    // a map are read too.
+    for (entry, want) in [
+        (json!({"Value": {"N": "abc"}}), format!("{NUMERIC}: abc")),
+        (json!({"Value": {"N": "1E2147483648"}}), OVERFLOW.to_owned()),
+        (json!({"Value": {"N": ""}}), format!("{NUMERIC}: ")),
+        (
+            json!({"ComparisonOperator": "EQ", "AttributeValueList": [{"N": "abc"}]}),
+            format!("{NUMERIC}: abc"),
+        ),
+        (
+            json!({"ComparisonOperator": "EQ", "AttributeValueList": [{"N": "1E2147483648"}]}),
+            OVERFLOW.to_owned(),
+        ),
+        (
+            json!({"ComparisonOperator": "EQ", "AttributeValueList": [{"N": ""}]}),
+            format!("{NUMERIC}: "),
+        ),
+        (
+            json!({"ComparisonOperator": "BETWEEN", "AttributeValueList": [{"N": "1"}, {"N": "1E126"}]}),
+            OVERFLOW.to_owned(),
+        ),
+        (
+            json!({"Value": {"M": {"x": {"N": "abc"}}}}),
+            format!("{NUMERIC}: abc"),
+        ),
+    ] {
+        let map = expected(json!({"a": entry.clone()}));
+        assert_eq!(
+            refused(expected_values(Some(&map))),
+            format!("1 validation error detected: {want}"),
+            "{entry}"
+        );
+    }
+    // `1E125` answered ConditionalCheckFailedException: it passes this check.
+    expected_values(Some(&expected(json!({"a": {"Value": {"N": "1E125"}}})))).unwrap();
+    expected_values(Some(&expected(json!({"a": {"Exists": false}})))).unwrap();
+    expected_values(None).unwrap();
+}
+
+#[test]
+fn expected_values_are_read_in_attribute_name_order() {
+    // Pins a choice of these checks, as for the placeholders above.
+    let map = expected(json!({
+        "b": {"Value": {"N": "abc"}},
+        "a": {"Value": {"N": "xyz"}},
+    }));
+    assert_eq!(
+        refused(expected_values(Some(&map))),
+        format!("1 validation error detected: {NUMERIC}: xyz")
+    );
+}
+
+/// A value nested `levels` maps deep.
+fn deep(levels: usize) -> Value {
+    let mut value = json!({"S": "leaf"});
+    for _ in 0..levels {
+        value = json!({"M": {"a": value}});
+    }
+    value
+}
+
+const NESTING: &str = "Nesting Levels have exceeded supported limits: \
+                       Attributes in the item have nested levels beyond supported limit";
+
+#[test]
+fn a_value_nested_too_deep_is_reported_before_a_malformed_number() {
+    // A BatchWriteItem put item holding both a 33-level value and a number
+    // the service cannot read answers the nesting message, whichever comes
+    // first in the item (measured 2026-10-27, the same on both sends). The
+    // PutItem and DeleteItem condition values answer it too, the order they
+    // answered before this check; the service answered the nesting on one
+    // send and the number on the other there.
+    let batch = |requests: Value| -> BatchWriteItemInput {
+        serde_json::from_value(json!({"RequestItems": {"t": requests}})).unwrap()
+    };
+
+    let values = put(json!({
+        "TableName": "t",
+        "Item": {"pk": {"S": "a"}},
+        "ConditionExpression": "n = :d OR n = :v",
+        "ExpressionAttributeValues": {":d": deep(33), ":v": {"N": "abc"}},
+    }));
+    assert_eq!(
+        refused(put_item_values(&values)),
+        format!("1 validation error detected: {NESTING}")
+    );
+
+    let batch_input = batch(json!([
+        {"PutRequest": {"Item": {"pk": {"S": "a"}, "n": {"N": "abc"}, "d": deep(33)}}}
+    ]));
+    assert_eq!(refused(batch_write_item(&batch_input)), NESTING);
+
+    // The earlier request's malformed number still wins over a later
+    // request's nesting (also measured).
+    let across = batch(json!([
+        {"PutRequest": {"Item": {"pk": {"S": "a"}, "n": {"N": "abc"}}}},
+        {"PutRequest": {"Item": {"pk": {"S": "b"}, "d": deep(33)}}}
+    ]));
+    assert_eq!(
+        refused(batch_write_item(&across)),
+        format!("{NUMERIC}: abc")
+    );
+}
+
+#[test]
+fn the_put_item_item_reports_a_malformed_number_before_a_value_nested_too_deep() {
+    // The order `validate_put_item` checks them in, and so what PutItem
+    // answered before this check. The service follows the request body,
+    // which `Item` does not keep: a malformed `n` ahead of a 33-level `d`
+    // answered the number on both sends (measured 2026-10-27).
+    let item = put(json!({
+        "TableName": "t",
+        "Item": {"pk": {"S": "a"}, "n": {"N": "abc"}, "d": deep(33)},
+    }));
+    assert_eq!(refused(put_item_item(&item)), format!("{NUMERIC}: abc"));
+    let item = put(json!({
+        "TableName": "t",
+        "Item": {"pk": {"S": "a"}, "d": deep(33)},
+    }));
+    assert_eq!(refused(put_item_item(&item)), NESTING);
+}
+
+#[test]
+fn put_item_checks_its_item_without_expression_attribute_values() {
+    // The item is checked whether or not the request carries values: measured
+    // 2026-10-27, PutItem to a table that does not exist answers the item's
+    // malformed number, not ResourceNotFoundException.
+    let input = put(json!({
+        "TableName": "t",
+        "Item": {"pk": {"S": "a"}, "n": {"N": "abc"}},
+    }));
+    assert_eq!(refused(put_item_item(&input)), format!("{NUMERIC}: abc"));
+}
+
+#[test]
+fn batch_write_item_visits_tables_in_name_order() {
+    // Two tables each holding a malformed number: the answer names the
+    // first table in name order, so one request cannot answer differently
+    // from one run to the next.
+    let input: BatchWriteItemInput = serde_json::from_value(json!({"RequestItems": {
+        "t2": [{"PutRequest": {"Item": {"n": {"N": "xyz"}}}}],
+        "t1": [{"DeleteRequest": {"Key": {"pk": {"N": "abc"}}}}],
+    }}))
+    .unwrap();
+    assert_eq!(refused(batch_write_item(&input)), format!("{NUMERIC}: abc"));
+}
+
+// `ImportTable` rows: measured 2026-11-03 (us-east-1), one import from S3 per
+// row. A row is read through `Item`'s deserializer, as the import file
+// reader reads it, so a valid number arrives normalized and any other
+// keeps its text.
+
+fn import_item(row: &Value) -> Item {
+    serde_json::from_value(row.clone()).unwrap()
+}
+
+#[test]
+fn import_row_stops_at_a_value_that_is_not_a_number() {
+    for row in [
+        json!({"pk": {"S": "a"}, "n": {"N": "abc"}}),
+        json!({"pk": {"S": "a"}, "n": {"N": ""}}),
+        json!({"pk": {"S": "a"}, "n": {"N": " 5"}}),
+        json!({"pk": {"S": "a"}, "n": {"N": "12e"}}),
+        // These three were measured again on 2026-11-11, one file each.
+        json!({"pk": {"S": "a"}, "n": {"N": "1E2147483648"}}),
+        json!({"pk": {"S": "a"}, "n": {"N": "1E9223372036854775808"}}),
+        json!({"pk": {"S": "a"}, "n": {"N": "1E-2147483648"}}),
+        json!({"pk": {"S": "a"}, "n": {"N": "1.5E-2147483647"}}),
+        json!({"pk": {"S": "a"}, "s": {"NS": ["1", "abc"]}}),
+        json!({"pk": {"N": "abc"}}),
+        // A number out of range ahead of it in the row does not change the
+        // answer, nor does a missing key.
+        json!({"pk": {"S": "a"}, "a": {"N": "1E126"}, "b": {"N": "abc"}}),
+        json!({"other": {"S": "x"}, "n": {"N": "abc"}}),
+        // The service imports a row holding a Unicode decimal digit with the
+        // digit (`5` here); this check refuses it, as every number check does.
+        json!({"pk": {"S": "a"}, "n": {"N": "\u{ff15}"}}),
+    ] {
+        assert_eq!(
+            import_row(&import_item(&row)),
+            Err(ImportRowFault::Malformed),
+            "{row}"
+        );
+    }
+}
+
+#[test]
+fn import_row_refuses_a_number_out_of_range() {
+    let ones = "1".repeat(39);
+    for (row, fault) in [
+        (
+            json!({"pk": {"S": "a"}, "n": {"N": "1E126"}}),
+            NumberFault::Overflow,
+        ),
+        (
+            json!({"pk": {"S": "a"}, "n": {"N": "1E999999999"}}),
+            NumberFault::Overflow,
+        ),
+        (
+            json!({"pk": {"S": "a"}, "n": {"N": "1E-131"}}),
+            NumberFault::Underflow,
+        ),
+        (
+            json!({"pk": {"S": "a"}, "n": {"N": "-1E-131"}}),
+            NumberFault::Underflow,
+        ),
+        // The magnitude passes the 32-bit maximum and wraps to a negative.
+        // Measured again on 2026-11-11, with `10E2147483647` as well.
+        (
+            json!({"pk": {"S": "a"}, "n": {"N": "1E2147483647"}}),
+            NumberFault::Underflow,
+        ),
+        (
+            json!({"pk": {"S": "a"}, "n": {"N": "10E2147483647"}}),
+            NumberFault::Underflow,
+        ),
+        (
+            json!({"pk": {"S": "a"}, "n": {"N": ones}}),
+            NumberFault::TooManyDigits,
+        ),
+        (
+            json!({"pk": {"S": "a"}, "s": {"NS": ["1", "1E126"]}}),
+            NumberFault::Overflow,
+        ),
+        (
+            json!({"pk": {"S": "a"}, "m": {"M": {"x": {"N": "1E126"}}}}),
+            NumberFault::Overflow,
+        ),
+        (
+            json!({"pk": {"S": "a"}, "l": {"L": [{"N": "1E-131"}]}}),
+            NumberFault::Underflow,
+        ),
+        (json!({"pk": {"N": "1E126"}}), NumberFault::Overflow),
+        (
+            json!({"other": {"S": "x"}, "n": {"N": "1E126"}}),
+            NumberFault::Overflow,
+        ),
+    ] {
+        assert_eq!(
+            import_row(&import_item(&row)),
+            Err(ImportRowFault::OutOfRange(fault)),
+            "{row}"
+        );
+    }
+}
+
+#[test]
+fn import_row_accepts_what_the_service_imports() {
+    for row in [
+        json!({"pk": {"S": "a"}, "n": {"N": "5"}}),
+        json!({"pk": {"S": "a"}, "n": {"N": "1.50"}}),
+        json!({"pk": {"S": "a"}, "n": {"N": "-0.0"}}),
+        json!({"pk": {"S": "a"}, "n": {"N": "+5"}}),
+        json!({"pk": {"S": "a"}, "n": {"N": "1.5E2"}}),
+        json!({"pk": {"S": "a"}, "n": {"N": "0E125"}}),
+        json!({"pk": {"S": "a"}, "n": {"N": "9.9999999999999999999999999999999999999E125"}}),
+        json!({"pk": {"S": "a"}, "n": {"N": "1E-130"}}),
+        json!({"pk": {"S": "a"}, "s": {"NS": ["1.0", "2"]}}),
+        json!({"pk": {"N": "2.50"}}),
+        json!({"pk": {"S": "a"}, "b": {"BOOL": true}, "s": {"S": "abc"}}),
+    ] {
+        assert_eq!(import_row(&import_item(&row)), Ok(()), "{row}");
+    }
+    // The service refuses `0E126` as `Number overflow`; the row's value is
+    // `0` until the 64-bit reader range checks every zero (#618).
+    let zero = json!({"pk": {"S": "a"}, "n": {"N": "0E126"}});
+    assert_eq!(import_row(&import_item(&zero)), Ok(()));
+}

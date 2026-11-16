@@ -7,7 +7,6 @@ Regenerated: v0.1.6 (BR-7085)
 - `crates/core/src/types/item.rs:176` — Route ConsistentRead to read replica when replica support is added.
 - `crates/engine/src/batch_write_item.rs:181` — DynamoDB charges WCU based on old item size for deletes.
 - `crates/engine/src/transact_write_helpers.rs:121` — DynamoDB charges WCU based on old item size for deletes.
-- `crates/engine/src/backup.rs:233` — Implement real PITR using PostgreSQL temporal/history tables.
 - `crates/storage-postgres/src/table_helpers.rs:141` — Two queries not in a transaction under concurrent access.
 
 ## TODO(cleanup)
@@ -28,6 +27,6 @@ Regenerated: v0.1.6 (BR-7085)
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.
