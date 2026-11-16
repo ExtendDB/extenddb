@@ -269,9 +269,20 @@ pub(crate) fn validate_client_request_token(token: &str) -> Result<(), DynamoDbE
 /// while remaining collision-resistant for the idempotency use case.
 pub(crate) fn compute_fingerprint(body: &Value, token: &str) -> String {
     let items = body.get("TransactItems").unwrap_or(&Value::Null);
+    // The service replays a retry that writes the members of an object in
+    // another order (measured 2026-11-10 for an item's attributes and
+    // 2026-11-16 for a Put's members), so the hash covers a copy with the
+    // members of every object sorted by name. Those are the bytes that a
+    // build without serde_json's `preserve_order` feature hashed before every
+    // build kept the client's order, so its stored tokens still match. A
+    // build with the feature (MongoDB, or the whole workspace) hashed the
+    // client's order: its token for a request whose members were not in name
+    // order no longer matches.
+    let mut sorted = items.clone();
+    sorted.sort_all_objects();
     // serde_json::to_string on a Value is infallible — all Value variants
     // are representable as JSON. Using unwrap_or_default as a defensive fallback.
-    let json = serde_json::to_string(items).unwrap_or_default();
+    let json = serde_json::to_string(&sorted).unwrap_or_default();
     // HMAC-SHA256 accepts any key length — new_from_slice cannot fail.
     // `InvalidLength` is impossible for HMAC per RFC 2104 (oversized keys are hashed).
     #[allow(clippy::expect_used)]
@@ -318,6 +329,36 @@ pub(crate) fn validate_no_key_updates(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each row's fingerprint under token "tok-1" is the one a build without
+    /// serde_json's `preserve_order` feature stored before every build kept
+    /// the client's member order: it hashed the items with the members of
+    /// every object sorted by name. A retry that writes the members in another
+    /// order, at either level, gets the same fingerprint.
+    #[test]
+    fn fingerprint_hashes_the_members_sorted_by_name() {
+        for (body, stored) in [
+            (
+                r#"{"TransactItems":[{"Put":{"Item":{"pk":{"S":"a"}},"TableName":"t"}}]}"#,
+                "ef18f4e7c37d6b12",
+            ),
+            (
+                r#"{"TransactItems":[{"Put":{"TableName":"t","Item":{"pk":{"S":"a"}}}}]}"#,
+                "ef18f4e7c37d6b12",
+            ),
+            (
+                r#"{"TransactItems":[{"Put":{"Item":{"a":{"N":"1"},"pk":{"S":"k"}},"TableName":"t"}}]}"#,
+                "89c79e090f17b7af",
+            ),
+            (
+                r#"{"TransactItems":[{"Put":{"TableName":"t","Item":{"pk":{"S":"k"},"a":{"N":"1"}}}}]}"#,
+                "89c79e090f17b7af",
+            ),
+        ] {
+            let body: Value = serde_json::from_str(body).unwrap();
+            assert_eq!(compute_fingerprint(&body, "tok-1"), stored, "{body}");
+        }
+    }
 
     #[test]
     fn validate_token_valid() {
