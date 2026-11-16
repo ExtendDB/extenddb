@@ -380,6 +380,32 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
+### v0.1.15: Cassandra `serve` warns of keyspaces at another replication
+
+**What changed.** At start-up, `serve` compares the replication of each of the
+deployment's keyspaces with `replication_factor` and `datacenter` in
+`[storage.cassandra]`. It logs a warning for each keyspace that differs, and
+starts anyway. A `[storage.cassandra]` section with no `replication_factor`
+line still means 3, so `serve` warns about each keyspace that `init` created
+at another replication factor; add the line with the keyspaces' replication
+factor.
+
+**Deployments that v0.1.14 `init --overwrite` created.** v0.1.14 `init
+--overwrite` created the catalog keyspace and the default account's keyspace
+at the `replication_factor` in the file, and then wrote
+`replication_factor = 1` to the file. Each account created after that got a
+keyspace at 1. On such a deployment, `serve` warns about the catalog keyspace
+and the default account's keyspace. To fix it:
+
+1. Stop every ExtendDB server of the deployment.
+2. Set `replication_factor` in `extenddb.toml` to the catalog keyspace's
+   replication factor. `DESCRIBE KEYSPACE <keyspace_prefix>_catalog` in
+   `cqlsh` shows it.
+3. Run `ALTER KEYSPACE` on each account keyspace at 1, to the same
+   replication factor (see "Keyspace replication" in
+   [cassandra-setup.md](../cassandra-setup.md)).
+4. Run `nodetool repair -full` on each node, then start the servers.
+
 ### v0.1.15: a deleted principal or account leaves nothing behind
 
 **What changed.** Deleting a user, group, role or account now removes
