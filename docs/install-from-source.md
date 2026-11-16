@@ -8,7 +8,7 @@ A build from source gives you one binary for one storage backend. This page cove
 
 ## Prerequisites
 
-- Rust 1.88 or newer (`rustup update`)
+- Rust 1.91.1 or newer (`rustup update`)
 - A storage backend, one of: PostgreSQL 14 or newer, MongoDB 7.0 or newer running as a replica set, Apache Cassandra 4.1 or newer (see [Cassandra setup](cassandra-setup.md)), or SQLite, which needs nothing installed
 - AWS CLI version 2, for the smoke test and the first requests
 - Python 3.10 or newer, if you use the installer scripts (they create a virtual environment for the documentation build)
