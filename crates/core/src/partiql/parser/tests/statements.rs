@@ -325,6 +325,8 @@ fn an_insert_without_value_reads_the_items_to_insert() {
         "INSERT INTO \"t\" {'pk': 'x'}",
         "INSERT INTO \"t\" t",
         "INSERT INTO \"t\" 'x'",
+        "INSERT INTO \"t\" <<{'pk': 'a'}, {'pk': 'b'}>>",
+        "INSERT INTO \"t\" <<>>",
     ] {
         assert_eq!(err(sql), MANY, "{sql}");
     }

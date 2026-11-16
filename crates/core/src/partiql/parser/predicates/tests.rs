@@ -374,6 +374,28 @@ fn an_is_after_an_is_test_is_refused_for_its_left_side() {
 }
 
 #[test]
+fn a_two_word_type_with_no_filter_is_refused_by_its_name_at_the_left_side() {
+    // `SELECT * FROM "t" WHERE pk = 'p' AND ` puts the left side at column 38.
+    for (test, name) in [
+        ("x IS CHAR VARYING(5)", "CharacterVaryingType"),
+        ("x IS CHARACTER VARYING", "CharacterVaryingType"),
+        ("x IS TIME(3) WITH TIME ZONE", "TimeWithTimeZoneType"),
+        ("x IS TIME WITH TIME ZONE", "TimeWithTimeZoneType"),
+        ("x IS TIME(3)", "TimeType"),
+        ("x IS TIMESTAMP WITH TIME ZONE", "TimestampType"),
+    ] {
+        assert_eq!(
+            err(&format!("SELECT * FROM \"t\" WHERE pk = 'p' AND {test}")),
+            format!(
+                "Unsupported data type for IS operator: {name}. Supported data types are \
+                 [MISSING, NULL, BOOLEAN, BLOB, STRING, NUMERIC, STRUCT, TUPLE, LIST] at 1:38:1"
+            ),
+            "{test}"
+        );
+    }
+}
+
+#[test]
 fn a_name_in_a_bag_after_in_is_an_operand() {
     assert_eq!(
         where_of("SELECT * FROM \"t\" WHERE a IN <<pk, 1>>"),

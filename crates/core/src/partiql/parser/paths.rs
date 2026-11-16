@@ -357,27 +357,19 @@ impl Parser {
     /// been read (see [`Parser::condition_after_path`]). The expression
     /// nests as an operand does.
     fn expression_in_brackets(&mut self, after_path: bool) -> PResult<()> {
-        let found = std::mem::take(&mut self.found);
         let in_where = std::mem::replace(&mut self.in_where, true);
         let brackets = std::mem::replace(&mut self.brackets, Brackets::Inner);
         let groups = self.bracket_groups.replace(self.nesting.groups());
-        let (operators, refusals) = (self.operators, self.operator_refusals);
-        let (after_not, bare_left) = (self.after_not, self.bare_left);
-        let read = self.nested(Nest::Operand, |p| {
+        let read = self.read_and_drop(Nest::Operand, |p| {
             if after_path {
                 p.condition_after_path()
             } else {
                 p.or_expr().map(drop)
             }
         });
-        self.found = found;
         self.in_where = in_where;
         self.brackets = brackets;
         self.bracket_groups = groups;
-        self.operators = operators;
-        self.operator_refusals = refusals;
-        self.after_not = after_not;
-        self.bare_left = bare_left;
         read
     }
 }

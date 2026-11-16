@@ -286,29 +286,7 @@ impl Parser {
                 let callable = class == WordClass::Name
                     || (class == WordClass::Keyword && is_function_keyword(&name));
                 if call && callable {
-                    self.count_operator();
-                    let at = self.span();
-                    let refusal = if self.in_where {
-                        forms::where_function_refusal(&lname, &at)
-                    } else {
-                        None
-                    };
-                    self.bump();
-                    // In a condition an argument may hold a LIKE (see
-                    // [`Parser::argument_with_like`]).
-                    let argument: fn(&mut Self) -> PResult<Operand> = if self.in_where {
-                        Self::argument_with_like
-                    } else {
-                        Self::operand
-                    };
-                    let args = self.arguments(argument)?;
-                    // The walk meets a call's arguments before its name
-                    // (measured 2026-11-02: `foo(1e126)` is refused for the
-                    // number, `foo(1 + 1)` for the `+`).
-                    if let Some(refusal) = refusal {
-                        self.defer(&refusal);
-                    }
-                    Ok(Operand::Function(lname, args))
+                    self.call(lname)
                 } else if matches!(class, WordClass::Name | WordClass::Literal) {
                     // `missing` outside a condition is read as a name.
                     Ok(Operand::Path(self.path()?))
@@ -316,9 +294,43 @@ impl Parser {
                     self.reserved_word_term()
                 }
             }
+            // A quoted name with `(` after it is a call (measured 2026-11-13:
+            // `"foo"(1)` as a statement is refused as `foo(1)` is).
+            TokenKind::QuotedIdent(name) if matches!(self.nth_kind(1), Some(TokenKind::LParen)) => {
+                self.call(name.to_ascii_lowercase())
+            }
             TokenKind::QuotedIdent(_) => Ok(Operand::Path(self.path()?)),
             _ => Err(self.term_error()),
         }
+    }
+
+    /// A call, with the current token on its name, `lname` in lower case. In
+    /// a condition only the condition functions are recognized (see
+    /// [`forms::where_function_refusal`]).
+    fn call(&mut self, lname: String) -> PResult<Operand> {
+        self.count_operator();
+        let at = self.span();
+        let refusal = if self.in_where {
+            forms::where_function_refusal(&lname, &at)
+        } else {
+            None
+        };
+        self.bump();
+        // In a condition an argument may hold a LIKE (see
+        // [`Parser::argument_with_like`]).
+        let argument: fn(&mut Self) -> PResult<Operand> = if self.in_where {
+            Self::argument_with_like
+        } else {
+            Self::operand
+        };
+        let args = self.arguments(argument)?;
+        // The walk meets a call's arguments before its name (measured
+        // 2026-11-02: `foo(1e126)` is refused for the number, `foo(1 + 1)`
+        // for the `+`).
+        if let Some(refusal) = refusal {
+            self.defer(&refusal);
+        }
+        Ok(Operand::Function(lname, args))
     }
 
     /// Path steps after a literal: the statement parses, and the path is

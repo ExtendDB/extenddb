@@ -174,14 +174,17 @@ impl Parser {
         let mut members: Vec<String> = Vec::new();
         if !matches!(self.peek().kind, TokenKind::RDoubleAngle) {
             loop {
+                let at = self.span();
                 // A parameter as a member parses and is refused at its
                 // position (measured 2026-11-02 with `<<?>>`).
                 if matches!(self.peek().kind, TokenKind::Param) {
-                    let at = self.span();
                     self.bump();
                     self.take_param_index();
                     self.defer(&format!("{BAG_MEMBER_TYPES} at {at}"));
                 } else {
+                    // A member that is neither is refused at its position
+                    // (measured 2026-11-13: `<<true>>` in an INSERT value
+                    // names the `true`).
                     match self.literal_value(path)? {
                         AttributeValue::S(s) => {
                             saw_string = true;
@@ -193,7 +196,7 @@ impl Parser {
                             numbers.insert(n.clone());
                             members.push(n);
                         }
-                        _ => return Err(ParseError::new(BAG_MEMBER_TYPES)),
+                        _ => return Err(ParseError::new(format!("{BAG_MEMBER_TYPES} at {at}"))),
                     }
                 }
                 if !self.eat(&TokenKind::Comma) {

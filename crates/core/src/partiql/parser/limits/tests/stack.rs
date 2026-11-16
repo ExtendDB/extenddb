@@ -236,6 +236,44 @@ fn nesting_forms() -> Vec<(&'static str, String, Result<(), String>)> {
         ),
         ("CASE words", keyed("a = ", "CASE ", "b", "", ""), deep()),
         (
+            "queries in parentheses",
+            keyed(
+                "a = ",
+                "(SELECT * FROM \"t\" WHERE a = ",
+                "123456789012345",
+                ")",
+                "",
+            ),
+            deep(),
+        ),
+        (
+            "queries in IN lists",
+            keyed(
+                "a IN ",
+                "[SELECT a FROM \"t\" WHERE a IN ",
+                "[12345678901234567890]",
+                "]",
+                "",
+            ),
+            deep(),
+        ),
+        (
+            "DELETEs as values",
+            keyed("a = ", "DELETE FROM \"t\" WHERE a = ", "1234567890", "", ""),
+            deep(),
+        ),
+        (
+            "DELETEs in IN lists",
+            keyed(
+                "a IN ",
+                "[DELETE FROM \"t\" WHERE a IN ",
+                "[1234567890123456789012]",
+                "]",
+                "",
+            ),
+            deep(),
+        ),
+        (
             "lists in an INSERT value",
             fill(INSERT, "[", "1", "]", "}"),
             deep(),

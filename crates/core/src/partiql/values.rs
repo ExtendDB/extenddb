@@ -40,7 +40,9 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use super::ast::{Operand, SetAction, SetMembersAction, Statement, UpdateStatement, WhereExpr};
+use super::ast::{
+    Operand, SetAction, SetMembersAction, SetMembersOp, Statement, UpdateStatement, WhereExpr,
+};
 use super::lexer::{Token, TokenKind, lex};
 use super::number::literal_number_refusal;
 use crate::types::AttributeValue;
@@ -63,8 +65,9 @@ const CONDITION_FUNCTIONS: [&str; 6] = [
 ];
 
 /// The aggregate calls, refused in a SET value as a token the expression
-/// does not take, naming the call (measured 2026-11-06 for each).
-const AGGREGATES: [&str; 5] = ["avg", "count", "max", "min", "sum"];
+/// does not take, naming the call (measured 2026-11-06 for each), and as a
+/// statement by the kind of call they are (see `parser::terms`).
+pub(crate) const AGGREGATES: [&str; 5] = ["avg", "count", "max", "min", "sum"];
 
 /// The path a value's own refusals name for the value itself.
 const ROOT: &str = "root";
@@ -364,7 +367,7 @@ impl SetTokens {
                     in_set = word.eq_ignore_ascii_case("set");
                 }
                 TokenKind::Eq if depth == 0 && in_set => {
-                    let members = is_set_members_call(&tokens, i + 1);
+                    let members = whole_value_set_call(&tokens, i + 1).is_some();
                     read.members.push(members);
                     whole_value_call = members.then_some(i + 1);
                 }
@@ -394,14 +397,34 @@ impl SetTokens {
     }
 }
 
-/// Whether the token at `i` and the one after it are `set_add(` or
-/// `set_delete(`, in any case.
-fn is_set_members_call(tokens: &[Token], i: usize) -> bool {
-    matches!(
-        tokens.get(i).map(|t| &t.kind),
-        Some(TokenKind::Ident(word))
-            if word.eq_ignore_ascii_case("set_add") || word.eq_ignore_ascii_case("set_delete")
-    ) && matches!(tokens.get(i + 1).map(|t| &t.kind), Some(TokenKind::LParen))
+/// The `set_add(` or `set_delete(` call, in any case, at token `i` of
+/// `tokens` that is a SET value on its own, or `None`. A call with an
+/// arithmetic operator after its closing parenthesis is a call like any other
+/// in the value, which the value's walk refuses (measured 2026-11-13:
+/// `set_add(a) + 1`, `set_add(a, <<'b'>>) + 1` and
+/// `set_delete(a, <<'b'>>) - 1` are "Unrecognized function" at the name, and
+/// `set_add(<<>>) + 1` is refused for the empty bag). A call left open is on
+/// its own.
+pub(crate) fn whole_value_set_call(tokens: &[Token], i: usize) -> Option<SetMembersOp> {
+    let op = match tokens.get(i).map(|t| &t.kind) {
+        Some(TokenKind::Ident(w)) if w.eq_ignore_ascii_case("set_add") => SetMembersOp::Add,
+        Some(TokenKind::Ident(w)) if w.eq_ignore_ascii_case("set_delete") => SetMembersOp::Delete,
+        _ => return None,
+    };
+    if tokens.get(i + 1).map(|t| &t.kind) != Some(&TokenKind::LParen) {
+        return None;
+    }
+    let mut depth = 0usize;
+    let close = tokens[i + 1..].iter().position(|t| {
+        match t.kind {
+            TokenKind::LParen => depth += 1,
+            TokenKind::RParen => depth -= 1,
+            _ => {}
+        }
+        depth == 0
+    });
+    let after = close.and_then(|j| tokens.get(i + 2 + j)).map(|t| &t.kind);
+    (!matches!(after, Some(TokenKind::Plus | TokenKind::Minus))).then_some(op)
 }
 
 fn is_clause_keyword(word: &str) -> bool {

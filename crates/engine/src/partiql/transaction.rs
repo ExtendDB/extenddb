@@ -33,7 +33,7 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::Projection as ItemProjection;
 use extenddb_core::partiql::Statement;
 use extenddb_core::partiql::ast::{Projection, Returning, SelectStatement};
-use extenddb_core::partiql::parser::parse_for_request;
+use extenddb_core::partiql::parser::parse_for_transaction;
 use extenddb_core::types::{CancellationReason, Item};
 
 use super::common;
@@ -135,10 +135,12 @@ pub(super) async fn run(
 /// 2026-11-05), but after their JSON types, which the request checked first
 /// (measured 2026-11-06). A malformed statement fails the whole request, its
 /// message prefixed with the statement's position (measured 2026-11-02 on an
-/// empty WHERE). A parameter that cannot be converted is reported without the
-/// statement's position (measured 2026-11-02), and so is one the service
-/// refuses for its content, such as an empty set (measured 2026-11-06); the
-/// checks on a parsed statement name it.
+/// empty WHERE), and so does a statement that is a call, as an operation a
+/// transaction does not run (measured 2026-11-13; see
+/// `parse_for_transaction`). A parameter that cannot be converted is reported
+/// without the statement's position (measured 2026-11-02), and so is one the
+/// service refuses for its content, such as an empty set (measured
+/// 2026-11-06); the checks on a parsed statement name it.
 /// A projected call (`COUNT(*)`) is among those checks, so it is refused
 /// ahead of every table lookup (measured 2026-11-02), and so are a
 /// projection list that names an identifier twice or two paths that
@@ -157,7 +159,7 @@ fn parse_member(i: usize, obj: &Value) -> Result<(SingleRequest, Statement), Dyn
     }
     super::check_parameters(obj.get("Parameters")).map_err(DynamoDbError::ValidationException)?;
     let req = SingleRequest::from_body(obj)?;
-    let stmt = parse_for_request(&req.statement, req.parameters.len())
+    let stmt = parse_for_transaction(&req.statement, req.parameters.len())
         .map_err(|e| positional(&e.message))?;
     super::check_statement(&stmt, &req.parameters, &req.statement)
         .map_err(|message| positional(&message))?;
