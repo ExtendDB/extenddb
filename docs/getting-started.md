@@ -41,7 +41,7 @@ See [Local Development with Docker Compose](local-dev-docker-compose.md).
   - SQLite (embedded; nothing to install)
   - MongoDB 7.0+ with replica set (see `docs/local-mongodb-setup.md`)
   - Cassandra 4.1+ running locally (see `docs/cassandra-setup.md`)
-- Rust toolchain (1.88+)
+- Rust toolchain (1.91.1+)
 - AWS CLI v2 (for testing)
 - Python 3.10+ with virtual environment (see [Python Environment Setup](../README.md#python-environment-setup) in the README)
 
