@@ -115,7 +115,7 @@ impl AuthorizationStore for CountingAuthzStore {
         &self,
         _account_id: &str,
         _user_name: &str,
-    ) -> BoxFuture<'_, OpResult<Vec<String>>> {
+    ) -> BoxFuture<'_, OpResult<Vec<(String, String)>>> {
         self.count();
         Box::pin(async { Ok(Vec::new()) })
     }
@@ -242,6 +242,7 @@ pub(super) async fn state_with_policies(
         version_info: Arc::from("test"),
         metrics: Arc::new(MetricsCollector::new()),
         tls_enabled: false,
+        request_timeout: std::time::Duration::from_secs(30),
         dev_mode,
         import_paths: Vec::new().into(),
         export_paths: Vec::new().into(),

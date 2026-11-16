@@ -124,7 +124,11 @@ async fn jobs(s: &Scratch) -> Jobs {
         export_paths: Arc::from(Vec::new()),
         authorized_key_info: Default::default(),
         auth_cache: extenddb_auth::AuthCacheRegistry::empty(),
+        bulk: None,
+        bulk_authorizer: None,
+        bulk_principal: None,
         table_key_info_lookup: None,
+        metrics: Arc::new(extenddb_core::metrics::MetricsCollector::new()),
         item_authorizer: None,
     };
     Jobs {

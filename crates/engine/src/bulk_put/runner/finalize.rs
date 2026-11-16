@@ -358,7 +358,7 @@ pub(super) async fn finalize(
                 failed_item_count = st.failed,
                 "bulk operation reached a terminal state"
             );
-            record_finished_metrics(deps, &record.table_name, &stored, st.written);
+            record_finished_metrics(deps, account, &record.table_name, &stored, st.written);
             Ok(())
         }
     }
@@ -392,11 +392,19 @@ fn stop_for_unavailable_store(record: &BulkOperationRecord, st: &mut RunState) -
 /// dimension is the status `finish` stored, which for a CANCELLING row is
 /// CANCELLED whatever the runner computed. `written`
 /// counts the rows whose write committed in this process; rows an earlier
-/// claim applied and condition failures are not counted.
-fn record_finished_metrics(deps: &RunnerDeps, table_name: &str, stored: &str, written: u64) {
+/// claim applied and condition failures are not counted. Both metrics
+/// are the account's, keyed by `account` as the request metrics are.
+fn record_finished_metrics(
+    deps: &RunnerDeps,
+    account: &str,
+    table_name: &str,
+    stored: &str,
+    written: u64,
+) {
     deps.metrics.record(
         MetricName::BulkOperationsFinished,
         1.0,
+        Some(account),
         Some(table_name),
         None,
         Some(stored),
@@ -408,6 +416,7 @@ fn record_finished_metrics(deps: &RunnerDeps, table_name: &str, stored: &str, wr
         deps.metrics.record(
             MetricName::BulkPutItemsWritten,
             written as f64,
+            Some(account),
             Some(table_name),
             None,
             None,

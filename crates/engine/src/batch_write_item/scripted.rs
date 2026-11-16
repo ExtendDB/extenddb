@@ -13,8 +13,8 @@ use extenddb_core::types::{
     AttributeDefinition, AttributeValue, Item, KeySchemaElement, KeyType, ScalarAttributeType,
 };
 use extenddb_storage::{
-    BoxedFuture, IdempotencyKey, ItemPairResult, QueryResult, StreamCapture, TransactGetOp,
-    TransactWriteOp,
+    BatchRow, BatchRowResult, BoxedFuture, BulkRowMarker, IdempotencyKey, ItemPairResult,
+    QueryResult, RowOutcome, StreamCapture, TransactGetOp, TransactWriteOp,
 };
 use serde_json::{Value, json};
 
@@ -67,8 +67,36 @@ impl DataEngine for Scripted {
         _condition: Option<&Expr>,
         _maps: &ExpressionMaps,
         _stream: Option<&StreamCapture>,
+        _marker: Option<&BulkRowMarker>,
     ) -> BoxedFuture<'_, Result<Option<Item>, StorageError>> {
         Box::pin(std::future::ready(self.answer(key_info, &item)))
+    }
+
+    fn put_items_batch(
+        &self,
+        _key_info: &TableKeyInfo,
+        _rows: Vec<BatchRow>,
+        _stream: Option<&StreamCapture>,
+    ) -> BoxedFuture<'_, Result<Vec<BatchRowResult>, StorageError>> {
+        unused()
+    }
+
+    fn bulk_row_outcome(
+        &self,
+        _account_id: &str,
+        _operation_id: &str,
+        _file_index: i64,
+        _row_index: i64,
+    ) -> BoxedFuture<'_, Result<Option<RowOutcome>, StorageError>> {
+        unused()
+    }
+
+    fn delete_bulk_row_outcomes(
+        &self,
+        _account_id: &str,
+        _operation_id: &str,
+    ) -> BoxedFuture<'_, Result<u64, StorageError>> {
+        unused()
     }
 
     fn delete_item(

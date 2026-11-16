@@ -236,7 +236,11 @@ async fn a_dead_restore_is_resumed_by_one_cycle_from_its_recorded_progress() {
         export_paths: Arc::from(Vec::new()),
         authorized_key_info: Default::default(),
         auth_cache: extenddb_auth::AuthCacheRegistry::empty(),
+        bulk: None,
+        bulk_authorizer: None,
+        bulk_principal: None,
         table_key_info_lookup: None,
+        metrics: Arc::new(extenddb_core::metrics::MetricsCollector::new()),
         item_authorizer: None,
     };
 

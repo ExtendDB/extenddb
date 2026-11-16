@@ -44,7 +44,11 @@ impl AuthorizationStore for Store {
         ready(self.policies.clone())
     }
 
-    fn fetch_user_group_policies(&self, _: &str, _: &str) -> BoxFuture<'_, OpResult<Vec<String>>> {
+    fn fetch_user_group_policies(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> BoxFuture<'_, OpResult<Vec<(String, String)>>> {
         ready(Vec::new())
     }
 

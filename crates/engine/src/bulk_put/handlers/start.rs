@@ -463,6 +463,7 @@ pub async fn handle_start_bulk_put_items(
         ctx.metrics.record(
             extenddb_core::metrics::MetricName::BulkOperationsStarted,
             1.0,
+            Some(&record.account_id),
             Some(&record.table_name),
             None,
             None,
@@ -545,6 +546,7 @@ async fn start_terminal_born(
         ctx.metrics.record(
             extenddb_core::metrics::MetricName::BulkOperationsStarted,
             1.0,
+            Some(&record.account_id),
             Some(&record.table_name),
             None,
             None,
@@ -552,6 +554,7 @@ async fn start_terminal_born(
         ctx.metrics.record(
             extenddb_core::metrics::MetricName::BulkOperationsFinished,
             1.0,
+            Some(&record.account_id),
             Some(&record.table_name),
             None,
             Some("FAILED"),

@@ -138,6 +138,7 @@ async fn the_collector_shows_started_finished_and_items_written_for_one_operatio
         authorized_key_info: Default::default(),
         auth_cache: AuthCacheRegistry::empty(),
         table_key_info_lookup: None,
+        item_authorizer: None,
         metrics: Arc::clone(&metrics),
     };
     let body = json!({

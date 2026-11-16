@@ -120,7 +120,7 @@ pub async fn handle_put_item(
     // the request body, which `Item` does not keep. An attribute name over
     // the size limit comes before both: the service answered either fault for
     // one item holding both (measured 2026-11-11).
-    // The later `validate_put_item` repeats both and cannot fail after this.
+    // The later `validate_put_payload` repeats both and cannot fail after this.
     extenddb_core::validation::number::operations::put_item_item(&input)?;
 
     // Reject mixing legacy and expression parameters, then EAN/EAV supplied

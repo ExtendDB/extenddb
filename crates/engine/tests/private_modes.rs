@@ -203,7 +203,11 @@ async fn context(base: &Path, root: &Path) -> OperationContext {
         export_paths: Arc::from(vec![Arc::new(root.canonicalize().unwrap())]),
         authorized_key_info: AuthorizedKeyInfo::new(),
         auth_cache: extenddb_auth::AuthCacheRegistry::default(),
+        bulk: None,
+        bulk_authorizer: None,
+        bulk_principal: None,
         table_key_info_lookup: None,
+        metrics: Arc::new(extenddb_core::metrics::MetricsCollector::new()),
         item_authorizer: None,
     }
 }

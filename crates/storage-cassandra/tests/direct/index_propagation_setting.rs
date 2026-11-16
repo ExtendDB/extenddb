@@ -62,6 +62,7 @@ impl Fixture {
                 None,
                 &ExpressionMaps::default(),
                 None,
+                None,
             )
             .await
             .expect("put_item");

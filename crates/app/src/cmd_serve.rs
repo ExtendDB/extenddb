@@ -604,18 +604,16 @@ mod tests {
 
     #[test]
     fn loopback_dev_banner_has_no_exposure_warning() {
-        let text =
-            dev_mode_banner_lines(":memory:", "127.0.0.1", 18080, &[example()], None, None)
-                .join("\n");
+        let text = dev_mode_banner_lines(":memory:", "127.0.0.1", 18080, &[example()], None, None)
+            .join("\n");
         assert!(text.contains("plain HTTP on loopback"), "{text}");
         assert!(!text.contains("WARNING"), "{text}");
     }
 
     #[test]
     fn non_loopback_dev_banner_warns_with_the_publish_command() {
-        let text =
-            dev_mode_banner_lines(":memory:", "0.0.0.0", 18080, &[example()], None, None)
-                .join("\n");
+        let text = dev_mode_banner_lines(":memory:", "0.0.0.0", 18080, &[example()], None, None)
+            .join("\n");
         // The banner used to say "on loopback" whatever the bind was.
         assert!(!text.contains("plain HTTP on loopback"), "{text}");
         assert!(text.contains("plain HTTP on 0.0.0.0"), "{text}");
@@ -630,8 +628,8 @@ mod tests {
 
     #[test]
     fn non_loopback_dev_banner_without_the_example_pair_drops_the_public_wording() {
-        let text = dev_mode_banner_lines(":memory:", "0.0.0.0", 9000, &[team()], None, None)
-            .join("\n");
+        let text =
+            dev_mode_banner_lines(":memory:", "0.0.0.0", 9000, &[team()], None, None).join("\n");
         assert!(
             text.contains("WARNING: dev mode is listening on 0.0.0.0:9000"),
             "{text}"

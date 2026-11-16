@@ -102,6 +102,7 @@ fn ctx_with_limits(h: &Harness, limits: LimitsConfig) -> OperationContext {
         authorized_key_info: Default::default(),
         auth_cache: AuthCacheRegistry::empty(),
         table_key_info_lookup: None,
+        item_authorizer: None,
         metrics: Arc::new(MetricsCollector::new()),
     }
 }

@@ -108,6 +108,7 @@ async fn put(isolated: &IsolatedEngine, account: &IsolatedAccount, item: Item) {
             None,
             &ExpressionMaps::default(),
             None,
+            None,
         )
         .await
         .expect("put_item");
@@ -185,6 +186,7 @@ async fn retried_put_item_reads_the_setting_once() {
             false,
             None,
             &ExpressionMaps::default(),
+            None,
             None,
         )
         .await;
