@@ -18,6 +18,10 @@ test-hooks = ["extenddb-storage/test-hooks"]
 # and the registration with another keepalive interval, the serving
 # session's settings, and the post-check's definitions.
 test-util = ["extenddb-storage/test-util"]
+# The SearchVectors inequality filter tests, which evaluate the extended
+# grammar on this backend. Production builds do not need it: the backend
+# applies whatever filter the engine hands it.
+search-inequality-filters = ["extenddb-core/search-inequality-filters"]
 
 [dev-dependencies]
 # The storage-level vector control-plane tests drive the engine directly against

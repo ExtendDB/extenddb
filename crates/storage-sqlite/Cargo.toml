@@ -19,6 +19,10 @@ memory = []
 # Compiles the snapshot page-size setter the consistency test uses and the
 # shared conformance check. Production builds do not compile them.
 test-hooks = ["extenddb-storage/test-hooks"]
+# The SearchVectors inequality filter tests, which evaluate the extended
+# grammar on this backend. Production builds do not need it: the backend
+# applies whatever filter the engine hands it.
+search-inequality-filters = ["extenddb-core/search-inequality-filters"]
 
 [dependencies]
 extenddb-core = { workspace = true }
