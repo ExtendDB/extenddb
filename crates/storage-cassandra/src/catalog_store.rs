@@ -13,7 +13,6 @@ use std::sync::Arc;
 
 use cdrs_tokio::cluster::TcpConnectionManager;
 use cdrs_tokio::cluster::session::Session;
-use cdrs_tokio::consistency::Consistency;
 use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
 use cdrs_tokio::query_values;
 use cdrs_tokio::transport::TransportTcp;
@@ -109,7 +108,7 @@ impl CassandraCatalogStore {
     /// Read the key rows (the key ring, the catalog key and `catalog_id`)
     /// at `ALL`, as the encryption-key commands do: the stores of the
     /// migration lock and the stores opened from a connection string.
-    /// The server's store reads them at `ONE` at startup.
+    /// The server's store reads them at `LOCAL_QUORUM` at startup.
     #[must_use]
     pub(crate) fn reading_key_rows_at_all(mut self) -> Self {
         self.key_rows_at_all = true;
@@ -315,11 +314,11 @@ impl extenddb_storage::management_store::SettingsStore for CassandraCatalogStore
 
             let row = if at_all {
                 let rows: Vec<cdrs_tokio::types::rows::Row> =
-                    crate::cassandra_util::query_rows_at::<OpError>(
+                    crate::cassandra_util::rows_at::<OpError>(
                         &session,
                         &query,
+                        Stmt::ReadAll,
                         values,
-                        Consistency::All,
                         "get_setting",
                     )
                     .await
@@ -356,7 +355,7 @@ impl extenddb_storage::management_store::SettingsStore for CassandraCatalogStore
                     &session,
                     &query,
                     values,
-                    Consistency::All,
+                    Stmt::WriteAll,
                     "set_setting",
                 )
                 .await

@@ -23,9 +23,7 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use cdrs_tokio::consistency::Consistency;
 use cdrs_tokio::query::QueryValues;
-use cdrs_tokio::statement::StatementParamsBuilder;
 use cdrs_tokio::types::IntoRustByIndex;
 use cdrs_tokio::types::IntoRustByName;
 use cdrs_tokio::types::blob::Blob;
@@ -36,7 +34,9 @@ use extenddb_storage::management_store::{
 };
 use extenddb_storage::secret_keys::{CATALOG_ID_SETTING, CATALOG_KEY_SETTING, SecretTable};
 
-use crate::cassandra_util::{execute_at, get_column, timestamp_to_datetime};
+use crate::cassandra_util::{
+    PolicySession as _, Stmt, execute_at, get_column, timestamp_to_datetime,
+};
 use crate::catalog_store::CassandraCatalogStore;
 
 /// The settings rows that the encryption-key commands read before they
@@ -48,8 +48,8 @@ const KEY_ROWS: [&str; 3] = [KEY_RING_SETTING, CATALOG_KEY_SETTING, CATALOG_ID_S
 /// copy of the wrapped DEK. A read of a key row does from a store opened for
 /// the commands (`commands`), so a command run again after a ring write that
 /// reached only some replicas reads the newest ring. Every other settings
-/// statement, and the server's read of the key rows at startup, runs at the
-/// driver default, `ONE`.
+/// statement, and the server's read of the key rows at startup, runs at
+/// `LOCAL_QUORUM` ([`Stmt::Read`], [`Stmt::Write`]).
 pub(crate) fn key_row_at_all(key: &str, write: bool, commands: bool) -> bool {
     if write {
         key == KEY_RING_SETTING
@@ -90,22 +90,29 @@ impl CassandraCatalogStore {
             self.catalog_keyspace(),
             table.name()
         );
-        let mut params = StatementParamsBuilder::new()
-            .with_consistency(Consistency::All)
-            .with_page_size(i32::try_from(page_size).unwrap_or(i32::MAX));
-        if let Some(page) = page {
-            let state = BASE64.decode(page).map_err(|e| {
-                OpError::Internal(format!("{WHAT}: the page token does not decode: {e}"))
-            })?;
-            params = params.with_paging_state(cdrs_tokio::types::CBytes::new(state));
-        }
+        let paging_state = page
+            .map(|page| {
+                BASE64
+                    .decode(page)
+                    .map(cdrs_tokio::types::CBytes::new)
+                    .map_err(|e| {
+                        OpError::Internal(format!("{WHAT}: the page token does not decode: {e}"))
+                    })
+            })
+            .transpose()?;
         let failed = |e: &dyn std::fmt::Display| {
-            tracing::error!("{WHAT} query at {} failed: {e}", Consistency::All);
+            tracing::error!("{WHAT} query at ALL failed: {e}");
             OpError::Internal(format!("{WHAT}: {e}"))
         };
         let body = self
             .session()
-            .query_with_params(&query, params.build())
+            .run_paged(
+                Stmt::ReadAll,
+                &query,
+                QueryValues::SimpleValues(vec![]),
+                i32::try_from(page_size).unwrap_or(i32::MAX),
+                paging_state,
+            )
             .await
             .map_err(|e| failed(&e))?
             .response_body()
@@ -291,7 +298,7 @@ impl CassandraCatalogStore {
                 self.session(),
                 query,
                 cdrs_tokio::query_values!(Self::tombstone_at(written), key.as_str()),
-                Consistency::All,
+                Stmt::WriteAll,
                 context,
             )
             .await
@@ -309,11 +316,11 @@ impl CassandraCatalogStore {
         count: usize,
         context: &str,
     ) -> OpResult<Option<i64>> {
-        let rows: Vec<Row> = crate::cassandra_util::query_rows_at(
+        let rows: Vec<Row> = crate::cassandra_util::rows_at(
             self.session(),
             read,
+            Stmt::ReadAll,
             cdrs_tokio::query_values!(key),
-            Consistency::All,
             context,
         )
         .await?;
@@ -350,7 +357,7 @@ impl CassandraCatalogStore {
         context: &str,
     ) -> OpResult<()> {
         Self::each_at_all(values, |values| {
-            execute_at(self.session(), query, values, Consistency::All, context)
+            execute_at(self.session(), query, values, Stmt::WriteAll, context)
         })
         .await
     }
@@ -390,7 +397,8 @@ impl CassandraCatalogStore {
     }
 
     /// `UPDATE ... IF value = ?` with its commit at `ALL` and its serial
-    /// phase at `SERIAL`, then the row read back at `ALL`, as every write of
+    /// phase at `LOCAL_SERIAL` ([`Stmt::LwtAll`]), then the row read back at
+    /// `ALL`, as every write of
     /// the key ring runs ([`key_row_at_all`]). A conditional update takes no
     /// client timestamp, and a cell stamped above the update's timestamp
     /// keeps its value, so an applied update whose row does not hold `value`
@@ -411,7 +419,7 @@ impl CassandraCatalogStore {
             session,
             &update,
             values,
-            Consistency::All,
+            Stmt::LwtAll,
             WHAT,
         )
         .await
@@ -420,11 +428,11 @@ impl CassandraCatalogStore {
             return Ok(false);
         }
         let read = format!("SELECT value FROM {keyspace}.settings WHERE key = ?");
-        let rows: Vec<Row> = crate::cassandra_util::query_rows_at::<OpError>(
+        let rows: Vec<Row> = crate::cassandra_util::rows_at::<OpError>(
             session,
             &read,
+            Stmt::ReadAll,
             cdrs_tokio::query_values!(key),
-            Consistency::All,
             WHAT,
         )
         .await
