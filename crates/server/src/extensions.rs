@@ -29,10 +29,13 @@ pub struct Extensions {
     /// that is not `/`, is not at or under a built-in route, and is not at,
     /// under or above another extension's prefix. A violation is a startup
     /// error. The server applies its response security headers to these
-    /// routes and nothing else: no authentication, no request rate limit, and
-    /// axum's default 2 MB body limit for the limited extractors (none for a
-    /// raw `Body`). A route that changes state or reads data authenticates in
-    /// its own handler or layer.
+    /// routes, and the layers in front of every route: a `ServiceUnavailable`
+    /// answer while the serving registration is lost, the refusal of a
+    /// repeated `host` or `authorization` header, and the request body
+    /// timeout. Nothing else applies: no authentication, no request rate
+    /// limit, and axum's default 2 MB body limit for the limited extractors
+    /// (none for a raw `Body`). A route that changes state or reads data
+    /// authenticates in its own handler or layer.
     pub http: Vec<(String, Router)>,
     /// Receives one record per request that reached authentication.
     pub request_observer: Option<Arc<dyn RequestObserver>>,
