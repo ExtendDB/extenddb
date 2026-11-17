@@ -47,6 +47,43 @@ mod tests {
         );
     }
 
+    /// `run_paged` panics on a kind that is not a read, before it sends
+    /// anything.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn run_paged_panics_on_a_kind_that_is_not_a_read() {
+        if crate::helpers::skip_without_cassandra() {
+            return;
+        }
+        let engine = crate::helpers::setup_engine().await;
+        let session = engine.session_arc();
+        let task = tokio::spawn(async move {
+            session
+                .run_paged(
+                    Stmt::Write,
+                    "INSERT INTO ks.t (a) VALUES (1)",
+                    cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
+                    10,
+                    None,
+                )
+                .await
+        });
+        let error = task
+            .await
+            .expect_err("run_paged() panics on a kind that is not a read");
+        assert!(error.is_panic(), "{error:?}");
+        let payload = error.into_panic();
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .unwrap_or_default();
+        assert!(
+            message.contains("a paged statement must be a read"),
+            "{message}"
+        );
+    }
+
     /// `run_batch` panics on a batch that was not built by
     /// `cassandra_util::batch()`, before it sends anything.
     #[cfg(debug_assertions)]

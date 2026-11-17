@@ -351,6 +351,12 @@ These errors occur when `auth.provider = "builtin"` is enabled.
 
 To allowlist attributes (allow only when *every* requested attribute is in the set), use `ForAllValues:` on an `Allow` statement. The same rule applies to `dynamodb:LeadingKeys`.
 
+`dynamodb:Attributes` holds the top-level names of the attributes the request names: the attributes of a `PutItem` item and of the items and keys in a `BatchWriteItem` request, the target of each `UpdateExpression` action, `AttributesToGet`, the first name of each projected document path (`secret` for `secret.a`), the attributes a `ConditionExpression` or `FilterExpression` reads, the legacy `Expected`, `AttributeUpdates`, `QueryFilter` and `ScanFilter` names, the attributes in a `Query` key condition, and on every item operation other than `SearchVectors` the key attributes of the table (and of the index a `Query` names). The first page of a `Scan` of an index holds the table's key attributes and not the index's (measured on DynamoDB 2026-11-09), and a later page also holds the index's key attributes, which its `ExclusiveStartKey` carries (measured 2026-11-10). The attributes a `SET` value reads are not in it. Batch requests are evaluated per table and transactions per item. The [security model manual](manuals/10-security-model.md) lists what the key holds for each operation, and how a PartiQL statement is authorized. It follows that:
+
+- A `Deny` on `ForAnyValue:StringEquals` over `ssn` does not block a `DeleteItem` of an item that holds `ssn`, or a read with no projection, which returns `ssn` with the rest of the item: neither request names `ssn`. DynamoDB answers the same way (measured 2026-10-31).
+- The same `Deny` does not block an `UpdateItem` that reads `ssn` only in a `SET` value. `SET #n = ssn` copies the value of `ssn` into `name`, and a projection of `name` then returns it. DynamoDB answers the same way (measured 2026-11-01).
+- An `Allow` on `ForAllValues:StringEquals` that does not list the table's key attributes grants no `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query`, `Scan`, batch or transaction request, because each of them holds the key attributes (measured on DynamoDB 2026-11-01 for `GetItem`, `Query`, `Scan`, `UpdateItem`, `DeleteItem` and a `BatchWriteItem` `DeleteRequest`). List the key attributes of the table and, for a `Query` of an index or a later page of a `Scan` of an index, of every index the statement covers. A `Query` of an index holds the index's full key schema (measured on DynamoDB 2026-11-09 on a global secondary index). The first page of a `Scan` of an index holds the table's key attributes and not the index's (measured the same day). A later page holds the index's key attributes from its `ExclusiveStartKey`. On DynamoDB an `Allow` that lists only the table's keys refused a later page of a `Scan` of a global and of a local secondary index (measured 2026-11-10).
+
 > Note: prior to v0.1.6, extenddb incorrectly treated a bare operator on these keys as an implicit AND across the requested values, so a single-attribute request appeared to be denied while a multi-attribute request leaked. That behavior diverged from AWS and gave a false sense of security. See the upgrade manual for migration guidance.
 
 ## Connection Issues
@@ -920,11 +926,17 @@ Keys imported earlier keep working while import is disabled.
 
 **Fix:** Each line must be a valid JSON object. The format is one item per line: `{"Item": {"pk": {"S": "val"}, ...}}` or bare `{"pk": {"S": "val"}, ...}`.
 
-### `Cannot write export file: <error>`
+### `Cannot write export file`
 
 **Cause:** The export destination path is not writable (permission denied, disk full, etc.).
 
-**Fix:** Check that the extenddb process has write access to the destination directory. Parent directories are created automatically.
+**Fix:** Check that the extenddb process has write access to the destination directory. The server creates the account directory (`<export root>/<account id>`) at the account's first export; any other directory in `FilePath` must already exist, or the export fails with `Parent directory does not exist or is not accessible`.
+
+### `Permission denied` opening an export file or directory after upgrading to v0.1.15
+
+**Cause:** From v0.1.15 the server creates export files with mode 0600, and the roots and account directories it creates with mode 0700, so only the server's user and root can read them. A member of the server user's group, or a host user reading through a bind mount while the container runs as another uid, is refused.
+
+**Fix:** Read the file as the server's user or as root, copy it out of the container with `docker cp <container>:<path> .`, or run the container as the reader's uid (`--user`). The upgrade manual's [v0.1.15 entry](manuals/07-upgrade-manual.md#v0115-export-files-are-created-0600-and-the-import-and-export-directories-the-server-creates-0700) gives the details, and how to keep a group's access to import files.
 
 ### `Invalid table ARN: <arn>`
 
@@ -1003,6 +1015,6 @@ even after the extension exists.
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

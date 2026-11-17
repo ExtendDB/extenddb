@@ -154,12 +154,21 @@ pub fn evaluate_condition_with(
             // `dynamodb:LeadingKeys` and `dynamodb:Attributes`. For a
             // multivalued key the context decides whether that answer applies:
             // it is right only where ExtendDB leaves the key absent on the same
-            // requests the service does. ExtendDB leaves `dynamodb:Attributes`
-            // absent on writes, on `AttributesToGet` reads and on batch and
-            // transaction targets, and `dynamodb:LeadingKeys` absent on query
-            // shapes it cannot pin to a partition value, where the service
-            // populates them; matching there would grant an Allow the service
-            // refuses, so those keys keep the no-match rule. `aws:TagKeys` is
+            // requests the service does. ExtendDB leaves `dynamodb:LeadingKeys`
+            // absent on query shapes it cannot pin to a partition value, where
+            // the service populates it. It leaves `dynamodb:Attributes` absent
+            // only on a `SearchVectors` with no `ProjectionExpression` (#729)
+            // and, on a table that does not exist, on a `GetItem`,
+            // transaction `Get` or `BatchGetItem` that names no attribute
+            // outside its keys, a `Query` whose key condition the key
+            // condition parser refuses and that names none elsewhere, and a
+            // `Scan` that names none. On the service the key holds the
+            // table's key attributes on every item request measured, a `Scan`
+            // that names no attribute included, and an Allow gated on a bare
+            // `StringNotEquals` over it grants no `Scan` (measured
+            // 2026-11-01).
+            // Matching on those absent keys could grant an Allow the service
+            // refuses, so they keep the no-match rule. `aws:TagKeys` is
             // populated on exactly the three operations the service reference
             // lists it for, so its absent-key answer is IAM's.
             None => {

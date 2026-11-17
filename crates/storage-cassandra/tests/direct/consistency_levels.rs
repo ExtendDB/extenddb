@@ -295,6 +295,30 @@ mod tests {
             );
         }
 
+        // `ReadAll` needs every replica, so Cassandra names `ALL`.
+        assert_eq!(
+            unavailable_level(
+                session
+                    .run(Stmt::ReadAll, keyspace.select("a"), none())
+                    .await
+            ),
+            Consistency::All,
+            "ReadAll"
+        );
+
+        // A page of a read has the level of its kind. For `SerialRead`,
+        // Cassandra names `LOCAL_QUORUM`, as it does for `run`.
+        for (kind, level) in [
+            (Stmt::Read, Consistency::LocalQuorum),
+            (Stmt::SerialRead, Consistency::LocalQuorum),
+            (Stmt::ReadAll, Consistency::All),
+        ] {
+            let result = session
+                .run_paged(kind, keyspace.select("a"), none(), 10, None)
+                .await;
+            assert_eq!(unavailable_level(result), level, "run_paged {kind:?}");
+        }
+
         session
             .run(
                 Stmt::Ddl,

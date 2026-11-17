@@ -53,7 +53,15 @@ pub use backend::{CassandraMigrations, CassandraStores};
 pub use commands::CassandraCatalogMigrations;
 pub(crate) use commands::lease_of;
 pub use connect::Deployment;
-pub(crate) use connect::{LOCKED_DDL_TIMEOUT, REQUEST_TIMEOUT};
+pub(crate) use connect::{
+    LOCKED_DDL_TIMEOUT, REQUEST_TIMEOUT, alter_steps, cluster_datacenters, replication_differs,
+    tables_of,
+};
+// Public for the integration tests only.
+#[cfg(any(test, feature = "test-util"))]
+pub use connect::{ReplicationChange, replication_mismatches};
+#[cfg(not(any(test, feature = "test-util")))]
+pub(crate) use connect::{ReplicationChange, replication_mismatches};
 pub(crate) use locks::LeaseHandle;
 pub use locks::{LeaseTimes, MigrationLock};
 pub use registrar::ServerRegistration;
@@ -177,6 +185,15 @@ pub fn migration(id: MigrationId) -> Migration<CassandraStores> {
                 "0010_account_metrics.cql"
             )],
         },
+        MigrationId::AttributeNameEscape => Migration::NotApplicable(
+            "Cassandra stores the documents that carry attribute names as JSON text in text \
+             columns, where U+0000 is the six-character escape \\u0000, so every name reads back \
+             as it was written",
+        ),
+        MigrationId::UniqueAccessKeyIds => Migration::NotApplicable(
+            "access_key_id is the primary key of access_keys, and an import writes with IF NOT \
+             EXISTS, so an ID can be stored once",
+        ),
     }
 }
 

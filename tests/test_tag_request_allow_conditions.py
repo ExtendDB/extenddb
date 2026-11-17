@@ -7,11 +7,10 @@ IAM matches a bare negated operator (`StringNotEquals`, `StringNotLike`,
 `StringNotEqualsIgnoreCase`) on an absent multivalued key and never on a
 present one (measured with `iam simulate-custom-policy` on 2026-10-24). ExtendDB
 applies the absent-key answer to `aws:TagKeys` alone, which it populates on
-exactly the operations the AWS service authorization reference lists it for. It
-leaves `dynamodb:Attributes` absent on writes, on `AttributesToGet` reads and on
-batch and transaction targets, where the service populates the key and answers
-implicitDeny for a bare operator, so for that key an absent key does not match
-and such an Allow grants nothing on those operations.
+exactly the operations the AWS service authorization reference lists it for.
+`dynamodb:Attributes` is present on every operation below, as on the service, so
+a bare negated operator over it does not match and such an Allow grants nothing
+on those operations.
 
 The same statement is checked as a user policy, a role policy, a permissions
 boundary and a session policy, and as the only statement of a trust policy.

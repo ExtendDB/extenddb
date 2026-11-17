@@ -35,6 +35,15 @@ pub enum Stmt {
     Lwt,
     /// A read at `LOCAL_SERIAL`, which sees every committed Paxos round.
     SerialRead,
+    /// A read at `ALL`. Use it only to read rows that an earlier version of
+    /// ExtendDB wrote at `ONE`: the in-catalog backup payload that
+    /// `backup migrate-legacy` reads. A quorum read can miss a row that only
+    /// one replica holds. At `ALL`, every replica answers, so a replica that
+    /// is down fails the read instead of shortening it. The restore of an
+    /// in-catalog backup reads the same rows as [`Stmt::Read`]: a row that
+    /// read misses fails the restore with an item count mismatch. Remove
+    /// this kind when `backup migrate-legacy` is removed.
+    ReadAll,
     /// `CREATE`, `ALTER`, `DROP`, `GRANT` or `REVOKE`: `ONE`. Cassandra does
     /// not use the client's consistency level for these statements.
     Ddl,
@@ -43,21 +52,74 @@ pub enum Stmt {
     SystemRead,
 }
 
+impl Stmt {
+    /// Whether the kind is a `SELECT`: only these kinds may be paged.
+    #[must_use]
+    pub fn is_read(self) -> bool {
+        matches!(
+            self,
+            Stmt::Read | Stmt::SerialRead | Stmt::ReadAll | Stmt::SystemRead
+        )
+    }
+}
+
+/// The consistency level of a statement of `kind`, and its serial level
+/// when it has one. [`params`] and [`params_paged`] both read it, so it is
+/// the one place that maps a kind to its levels.
+fn levels(
+    kind: Stmt,
+) -> (
+    cdrs_tokio::consistency::Consistency,
+    Option<cdrs_tokio::consistency::Consistency>,
+) {
+    use cdrs_tokio::consistency::Consistency;
+
+    match kind {
+        Stmt::Read | Stmt::Write => (Consistency::LocalQuorum, None),
+        Stmt::Lwt => (Consistency::LocalQuorum, Some(Consistency::LocalSerial)),
+        Stmt::SerialRead => (Consistency::LocalSerial, None),
+        Stmt::ReadAll => (Consistency::All, None),
+        Stmt::Ddl | Stmt::SystemRead => (Consistency::One, None),
+    }
+}
+
 /// The statement parameters for a statement of `kind` with `values`.
 #[must_use]
 pub fn params(kind: Stmt, values: QueryValues) -> cdrs_tokio::statement::StatementParams {
-    use cdrs_tokio::consistency::Consistency;
     use cdrs_tokio::statement::StatementParamsBuilder;
 
-    let builder = StatementParamsBuilder::new().with_values(values);
-    let builder = match kind {
-        Stmt::Read | Stmt::Write => builder.with_consistency(Consistency::LocalQuorum),
-        Stmt::Lwt => builder
-            .with_consistency(Consistency::LocalQuorum)
-            .with_serial_consistency(Consistency::LocalSerial),
-        Stmt::SerialRead => builder.with_consistency(Consistency::LocalSerial),
-        Stmt::Ddl | Stmt::SystemRead => builder.with_consistency(Consistency::One),
-    };
+    let (level, serial) = levels(kind);
+    let builder = StatementParamsBuilder::new()
+        .with_values(values)
+        .with_consistency(level);
+    match serial {
+        Some(serial) => builder.with_serial_consistency(serial),
+        None => builder,
+    }
+    .build()
+}
+
+/// The statement parameters for one page of a read of `kind`. `page_size`
+/// is the number of rows in a page. `paging_state` is `None` for the first
+/// page, and for each next page it is the paging state that the page before
+/// returned. The level is the one [`params`] gives `kind`.
+#[must_use]
+pub fn params_paged(
+    kind: Stmt,
+    values: QueryValues,
+    page_size: i32,
+    paging_state: Option<cdrs_tokio::types::CBytes>,
+) -> cdrs_tokio::statement::StatementParams {
+    use cdrs_tokio::statement::StatementParamsBuilder;
+
+    let (level, _) = levels(kind);
+    let mut builder = StatementParamsBuilder::new()
+        .with_values(values)
+        .with_consistency(level)
+        .with_page_size(page_size);
+    if let Some(state) = paging_state {
+        builder = builder.with_paging_state(state);
+    }
     builder.build()
 }
 
@@ -76,6 +138,25 @@ pub trait PolicySession {
         kind: Stmt,
         query: Q,
         values: QueryValues,
+    ) -> impl std::future::Future<
+        Output = Result<cdrs_tokio::frame::Envelope, cdrs_tokio::error::Error>,
+    > + Send;
+
+    /// Run one page of a read: like [`PolicySession::run`], with `page_size`
+    /// rows in the page, starting at `paging_state` (`None` for the first
+    /// page). In a debug build, a `kind` that is not a read panics. The
+    /// next page starts at the paging state in the rows metadata of the
+    /// response.
+    ///
+    /// # Errors
+    /// Returns the driver's error if the statement fails.
+    fn run_paged<Q: AsRef<str>>(
+        &self,
+        kind: Stmt,
+        query: Q,
+        values: QueryValues,
+        page_size: i32,
+        paging_state: Option<cdrs_tokio::types::CBytes>,
     ) -> impl std::future::Future<
         Output = Result<cdrs_tokio::frame::Envelope, cdrs_tokio::error::Error>,
     > + Send;
@@ -126,12 +207,38 @@ impl PolicySession for CassandraSession {
         );
         async move { self.query_with_params(query, params(kind, values)).await }
     }
+
+    fn run_paged<Q: AsRef<str>>(
+        &self,
+        kind: Stmt,
+        query: Q,
+        values: QueryValues,
+        page_size: i32,
+        paging_state: Option<cdrs_tokio::types::CBytes>,
+    ) -> impl std::future::Future<
+        Output = Result<cdrs_tokio::frame::Envelope, cdrs_tokio::error::Error>,
+    > + Send {
+        let query = query.as_ref().to_owned();
+        debug_assert!(
+            kind.is_read() && shape_error(kind, &query).is_none(),
+            "{kind:?} paged statement: {}",
+            if kind.is_read() {
+                shape_error(kind, &query).unwrap_or_default()
+            } else {
+                "a paged statement must be a read"
+            }
+        );
+        async move {
+            self.query_with_params(query, params_paged(kind, values, page_size, paging_state))
+                .await
+        }
+    }
 }
 
 /// What is wrong with `query` as a statement of `kind`, or `None` when its
 /// CQL matches `kind`:
 ///
-/// - [`Stmt::Read`] and [`Stmt::SerialRead`]: a `SELECT` that does not read
+/// - [`Stmt::Read`], [`Stmt::SerialRead`] and [`Stmt::ReadAll`]: a `SELECT` that does not read
 ///   `system.*` or `system_schema.*`.
 /// - [`Stmt::SystemRead`]: a `SELECT` from `system.*` or `system_schema.*`.
 /// - [`Stmt::Write`]: an `INSERT`, `UPDATE`, `DELETE` or `BEGIN BATCH` with
@@ -153,7 +260,7 @@ pub fn shape_error(kind: Stmt, query: &str) -> Option<&'static str> {
         .nth(1)
         .is_some_and(|table| table.starts_with("SYSTEM.") || table.starts_with("SYSTEM_SCHEMA."));
     match kind {
-        Stmt::Read | Stmt::SerialRead => {
+        Stmt::Read | Stmt::SerialRead | Stmt::ReadAll => {
             if first != "SELECT" {
                 Some("a read must be a SELECT")
             } else if system {
@@ -595,7 +702,7 @@ fn lwt_applied_flag<E: FromDbError>(
 
 #[cfg(test)]
 mod tests {
-    use super::{Stmt, batch, batch_level_error, params, shape_error};
+    use super::{Stmt, batch, batch_level_error, params, params_paged, shape_error};
 
     fn one_insert(builder: cdrs_tokio::query::BatchQueryBuilder) -> cdrs_tokio::query::QueryBatch {
         builder
@@ -770,6 +877,72 @@ mod tests {
     #[test]
     fn a_serial_read_runs_at_local_serial() {
         assert_eq!(levels(Stmt::SerialRead), (Consistency::LocalSerial, None));
+    }
+
+    #[test]
+    fn a_read_all_runs_at_all() {
+        assert_eq!(levels(Stmt::ReadAll), (Consistency::All, None));
+    }
+
+    #[test]
+    fn a_read_all_must_be_a_select_of_a_replicated_table() {
+        assert_eq!(
+            shape_error(Stmt::ReadAll, "SELECT a FROM ks.t WHERE pk = ?"),
+            None
+        );
+        assert!(shape_error(Stmt::ReadAll, "SELECT a FROM system.local").is_some());
+        assert!(shape_error(Stmt::ReadAll, "DELETE FROM ks.t WHERE pk = ?").is_some());
+    }
+
+    fn paged_levels(kind: Stmt) -> (Consistency, Option<Consistency>) {
+        let built = params_paged(kind, QueryValues::SimpleValues(vec![]), 10, None);
+        (
+            built.query_params.consistency,
+            built.query_params.serial_consistency,
+        )
+    }
+
+    #[test]
+    fn a_page_of_a_read_has_the_level_of_its_kind() {
+        for kind in [
+            Stmt::Read,
+            Stmt::SerialRead,
+            Stmt::ReadAll,
+            Stmt::SystemRead,
+        ] {
+            assert_eq!(paged_levels(kind), levels(kind), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_page_has_its_size_and_its_paging_state() {
+        let first = params_paged(Stmt::Read, QueryValues::SimpleValues(vec![]), 25, None);
+        assert_eq!(first.query_params.page_size, Some(25));
+        assert_eq!(first.query_params.paging_state, None);
+        let state = cdrs_tokio::types::CBytes::new(vec![1, 2, 3]);
+        let next = params_paged(
+            Stmt::Read,
+            QueryValues::SimpleValues(vec![]),
+            25,
+            Some(state.clone()),
+        );
+        assert_eq!(next.query_params.page_size, Some(25));
+        assert_eq!(next.query_params.paging_state, Some(state));
+    }
+
+    #[test]
+    fn only_a_read_can_be_paged() {
+        for kind in [
+            Stmt::Read,
+            Stmt::SerialRead,
+            Stmt::ReadAll,
+            Stmt::SystemRead,
+        ] {
+            assert!(kind.is_read(), "{kind:?}");
+        }
+        for kind in [Stmt::Write, Stmt::Lwt, Stmt::Ddl] {
+            assert!(!kind.is_read(), "{kind:?}");
+        }
     }
 
     #[test]

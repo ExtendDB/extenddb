@@ -876,6 +876,7 @@ jobs:
           cargo test --release -p extenddb-storage-postgres
           --test migrations_fresh --test migrations_released --test migrations_crash
           --test migrations_golden --test migrations_guards --test migrations_runs
+          --test migrations_name_escape
 
       # The daemonized server logs to syslog; dump it so server-side failures
       # are diagnosable from the job log.

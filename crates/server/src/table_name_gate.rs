@@ -104,6 +104,8 @@ pub(crate) fn check_table_name_chars(
             with_str(input, "BackupArn", arn_gate::check_backup_arn)?;
             check_name_member(input.get("TargetTableName"), "targetTableName")
         }
+        // The server refuses every RestoreTableToPointInTime before this
+        // code runs.
         "RestoreTableToPointInTime" => {
             check_name_member(input.get("SourceTableName"), "sourceTableName")?;
             check_name_member(input.get("TargetTableName"), "targetTableName")?;

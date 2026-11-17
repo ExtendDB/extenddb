@@ -22,7 +22,7 @@ use extenddb_storage::migrations::{
     CatalogStatus, LedgerRow, MigrationError, MigrationId, RunReport, Runner,
 };
 use extenddb_storage_mongodb::migrations::{
-    Definitions, MigrationLock, MongoMigrations, MongoTarget, Timing, catalog_status, lock,
+    Definitions, Index, MigrationLock, MongoMigrations, MongoTarget, Timing, catalog_status, lock,
     migrate_holding,
 };
 use futures::TryStreamExt;
@@ -41,9 +41,13 @@ pub const CATALOG_MIGRATION_6: &str =
 pub const CATALOG_MIGRATION_10: &str =
     include_str!("../fixtures/0010_account_metrics.expected.json");
 
+/// The name of the index migration 12 creates on `access_keys`.
+pub const ACCESS_KEY_ID_INDEX: &str = "access_key_id_1";
+
 /// The catalog database's definitions after every migration: migration 1's,
 /// without `continuous_backups`, which migration 5 drops, and `metrics`,
-/// which migration 10 drops, with what migrations 6 and 10 add.
+/// which migration 10 drops, with what migrations 6 and 10 add, and with the
+/// index migration 12 creates on `access_keys`.
 ///
 /// # Panics
 ///
@@ -65,6 +69,17 @@ pub fn expected_catalog() -> Definitions {
             }
         }
     }
+    expected
+        .get_mut("access_keys")
+        .expect("access_keys")
+        .indexes
+        .insert(
+            ACCESS_KEY_ID_INDEX.to_owned(),
+            Index {
+                key: vec![("access_key_id".to_owned(), serde_json::json!(1))],
+                options: [("unique".to_owned(), serde_json::json!(true))].into(),
+            },
+        );
     expected
 }
 
