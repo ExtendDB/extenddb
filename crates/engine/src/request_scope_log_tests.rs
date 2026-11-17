@@ -61,7 +61,11 @@ impl<S: Subscriber> Layer<S> for Captured {
 }
 
 /// Runs `f` under a fresh subscriber and returns every error event it logged.
+/// A second registered subscriber makes `tracing` compute a newly hit
+/// callsite's interest from every registered subscriber, so a parallel test
+/// with none cannot leave an error callsite disabled for this one.
 fn error_events_during(f: impl FnOnce()) -> Vec<Seen> {
+    let _second = tracing::Dispatch::new(tracing_subscriber::registry());
     let captured = Captured::default();
     let events = Arc::clone(&captured.0);
     let subscriber = tracing_subscriber::registry().with(captured);
@@ -70,8 +74,10 @@ fn error_events_during(f: impl FnOnce()) -> Vec<Seen> {
     events.lock().unwrap().clone()
 }
 
-/// Runs `fut` under a fresh subscriber and returns every error event it logged.
+/// Runs `fut` under a fresh subscriber and returns every error event it
+/// logged, with the second subscriber of [`error_events_during`].
 async fn error_events_during_async<F: std::future::Future>(fut: F) -> Vec<Seen> {
+    let _second = tracing::Dispatch::new(tracing_subscriber::registry());
     let captured = Captured::default();
     let events = Arc::clone(&captured.0);
     let subscriber = tracing_subscriber::registry().with(captured);
