@@ -29,7 +29,7 @@ sudo apt-get update && sudo apt-get install -y mongodb-org
 
 ```bash
 docker run -d --name extenddb-mongo \
-    -p 27017:27017 \
+    -p 127.0.0.1:27017:27017 \
     mongo:7 --replSet rs0
 ```
 
@@ -192,6 +192,6 @@ brew services stop mongodb-community@7.0
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

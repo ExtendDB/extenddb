@@ -4,7 +4,8 @@
 //! Database-backed credential store for SigV4 authentication.
 //!
 //! Implements `extenddb_auth::CredentialStore` by looking up access keys and
-//! session credentials from Cassandra, decrypting secrets with AES-256-GCM.
+//! session credentials from Cassandra, decrypting secrets with AES-256-GCM
+//! through `extenddb_storage::secret_cipher`, with the access key id as the AAD.
 
 use std::sync::Arc;
 
@@ -16,6 +17,7 @@ use cdrs_tokio::transport::TransportTcp;
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_auth::{CredentialStore, StoredCredential};
 use extenddb_core::error::DynamoDbError;
+use extenddb_storage::secret_cipher::decrypt_secret;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 type CassandraSession = Session<
@@ -23,45 +25,6 @@ type CassandraSession = Session<
     TcpConnectionManager,
     RoundRobinLoadBalancingStrategy<TransportTcp, TcpConnectionManager>,
 >;
-
-/// Decrypt a secret key from `nonce || ciphertext` using the base64-encoded encryption key.
-fn decrypt_secret(encrypted: &[u8], key_b64: &str, aad: &str) -> Result<String, String> {
-    use aes_gcm::aead::{Aead, Payload};
-    use aes_gcm::{Aes256Gcm, KeyInit};
-    use base64::Engine;
-
-    if encrypted.len() < 28 {
-        return Err(format!(
-            "ciphertext too short: {} bytes (need at least 12-byte nonce + 16-byte auth tag)",
-            encrypted.len()
-        ));
-    }
-
-    let key_bytes = base64::engine::general_purpose::STANDARD
-        .decode(key_b64)
-        .map_err(|e| format!("decode encryption key: {e}"))?;
-
-    let key = aes_gcm::Key::<Aes256Gcm>::from_slice(&key_bytes);
-    let cipher = Aes256Gcm::new(key);
-    let nonce = aes_gcm::Nonce::from_slice(&encrypted[..12]);
-
-    let payload_with_aad = Payload {
-        msg: &encrypted[12..],
-        aad: aad.as_bytes(),
-    };
-    if let Ok(plaintext_bytes) = cipher.decrypt(nonce, payload_with_aad) {
-        return String::from_utf8(plaintext_bytes)
-            .map_err(|e| format!("decrypted secret is not valid UTF-8: {e}"));
-    }
-
-    tracing::debug!("Decrypting secret without AAD (pre-CB-11 format) for {aad}");
-    let plaintext_bytes = cipher
-        .decrypt(nonce, &encrypted[12..])
-        .map_err(|e| format!("decrypt failed both with AAD and without AAD: {e}"))?;
-
-    String::from_utf8(plaintext_bytes)
-        .map_err(|e| format!("decrypted secret is not valid UTF-8: {e}"))
-}
 
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct CassandraCredentialStore {
@@ -87,6 +50,25 @@ impl CassandraCredentialStore {
 
     fn catalog_keyspace(&self) -> String {
         format!("{}_catalog", self.keyspace_prefix)
+    }
+
+    /// Whether `account_id` has a row in `accounts`. Before account deletes
+    /// removed them, a deleted account's access keys and role sessions stayed
+    /// in the catalog; a credential of an account that no longer exists is
+    /// unknown.
+    async fn account_exists(&self, account_id: &str) -> Result<bool, DynamoDbError> {
+        let query = format!(
+            "SELECT account_id FROM {}.accounts WHERE account_id = ?",
+            self.catalog_keyspace()
+        );
+        crate::cassandra_util::query_rows::<DynamoDbError>(
+            &self.session,
+            &query,
+            cdrs_tokio::query_values!(account_id),
+            "credential account_exists",
+        )
+        .await
+        .map(|rows| !rows.is_empty())
     }
 }
 
@@ -162,6 +144,9 @@ impl CassandraCredentialStore {
             tracing::error!("Failed to parse is_active: {e}");
             DynamoDbError::InternalServerError("Internal error during authentication".to_owned())
         })?;
+        if !self.account_exists(&account_id).await? {
+            return Ok(None);
+        }
 
         let secret_key =
             decrypt_secret(&encrypted, &self.encryption_key, access_key_id).map_err(|e| {
@@ -243,6 +228,9 @@ impl CassandraCredentialStore {
             tracing::error!("Failed to parse session_token: {e}");
             DynamoDbError::InternalServerError("Internal error during authentication".to_owned())
         })?;
+        if !self.account_exists(&account_id).await? {
+            return Ok(None);
+        }
 
         let expires_at_ms: i64 = row.get_r_by_name("expires_at").map_err(|e| {
             tracing::error!("Failed to parse expires_at: {e}");

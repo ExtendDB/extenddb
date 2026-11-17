@@ -4,19 +4,24 @@
 //! `BatchWriteItem` operation handler.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::ExpressionMaps;
+use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{
     BatchWriteItemInput, BatchWriteItemOutput, Item, KeySchemaElement, ReturnItemCollectionMetrics,
-    WriteRequest, extract_key, item_size_bytes,
+    TableKeyInfo, WriteRequest, extract_key, item_size_bytes,
 };
 use extenddb_core::validation::{
-    validate_attribute_name_sizes, validate_batch_item_keys, validate_batch_key_only,
-    validate_item_nesting_depth, validate_item_size, validate_key_sizes,
+    AttributeNameRequestForm, IndexKeyRef, validate_attribute_name_sizes, validate_batch_item_keys,
+    validate_batch_key_only, validate_index_keys, validate_item_nesting_depth, validate_item_size,
+    validate_key_sizes,
 };
+
+use extenddb_storage::DataEngine;
 use extenddb_storage::error::StorageError;
 
 use crate::OperationContext;
@@ -52,8 +57,6 @@ pub async fn handle_batch_write_item(
         .map(|(table_name, reqs)| (table_name.as_str(), Some(reqs.len())))
         .collect();
     request_limits::check_batch_counts("BatchWriteItem", &counts)?;
-    // The partial-success boundary below compares against the whole request.
-    let total_ops: usize = counts.iter().map(|(_, n)| n.unwrap_or(0)).sum();
 
     // Validate: each WriteRequest has exactly one of PutRequest or DeleteRequest
     for reqs in input.request_items.values() {
@@ -68,6 +71,81 @@ pub async fn handle_batch_write_item(
             }
         }
     }
+    // Attribute names over the size limit are request-shape validation: every
+    // PutRequest item is checked before any table lookup and before the key
+    // checks, so a request naming a missing table, or an item missing its key,
+    // answers with the name refusal.
+    for reqs in input.request_items.values() {
+        for put in reqs.iter().filter_map(|wr| wr.put_request.as_ref()) {
+            validate_attribute_name_sizes(
+                &put.item,
+                &ctx.limits,
+                AttributeNameRequestForm::BatchRequest,
+            )?;
+        }
+    }
+
+    // Every number in every request is checked before any table is looked up
+    // or written: the service reports a malformed number ahead of a missing
+    // table, a key type mismatch, a missing key and a duplicate key, and
+    // writes none of a batch whose later put holds one (measured 2026-10-27).
+    // An attribute name over the size limit comes first: for one item holding
+    // both, the service answered either fault (measured 2026-11-11).
+    extenddb_core::validation::number::operations::batch_write_item(&input)?;
+
+    // Read every table's key info before anything is written. A lookup that
+    // failed is reported where `check_batch` reaches its table, so the first
+    // fault reported is the one the checks reach first.
+    let tables: Vec<(&str, &[WriteRequest])> = input
+        .request_items
+        .iter()
+        .map(|(table_name, reqs)| (table_name.as_str(), reqs.as_slice()))
+        .collect();
+    let mut lookups = Vec::with_capacity(tables.len());
+    for (table_name, _) in &tables {
+        lookups.push(ctx.table_key_info_uncached(table_name).await);
+    }
+
+    write_batch(
+        &*ctx.storage,
+        &ctx.limits,
+        &ctx.region,
+        &input,
+        &tables,
+        lookups,
+    )
+    .await
+}
+
+/// Check the whole batch, then write it.
+///
+/// The table lookups, the duplicate-key check and the validation of every
+/// request run before the first write. The requests of a table are checked in
+/// the order they are listed. The tables come from a `HashMap` and are
+/// checked in the order it yields them, so which of two table faults is
+/// reported is not defined. A request fault found by any of these checks
+/// rejects the batch with nothing applied,
+/// wherever the faulty request sits, which is what the `BatchWriteItem` API
+/// reference documents for these faults. The limits on the number of tables
+/// and requests are checked before this function runs, in
+/// `check_batch_counts`, the attribute-name sizes in `handle_batch_write_item`
+/// ahead of the table lookups, and the limit on the request size by the HTTP
+/// layer.
+/// The writes run only after the checks, so a write that cannot be applied now
+/// never leaves a later request unchecked. A request fault is found after a
+/// request has been applied only on a secondary index added after the lookup,
+/// whose keys the storage layer checks at write time. A storage error that a
+/// replay does not clear (see `is_deferrable`) can still fail the batch after
+/// earlier requests were applied.
+async fn write_batch(
+    data: &dyn DataEngine,
+    limits: &LimitsConfig,
+    region: &Arc<str>,
+    input: &BatchWriteItemInput,
+    tables: &[(&str, &[WriteRequest])],
+    lookups: Vec<Result<TableKeyInfo, StorageError>>,
+) -> Result<DispatchResult, DynamoDbError> {
+    let key_infos = check_batch(tables, lookups, limits)?;
 
     let empty_maps = ExpressionMaps::default();
     let mut all_icm: HashMap<String, Vec<extenddb_core::types::ItemCollectionMetrics>> =
@@ -81,184 +159,213 @@ pub async fn handle_batch_write_item(
         input.return_consumed_capacity == extenddb_core::types::ReturnConsumedCapacity::Indexes;
     let mut per_table_gsi: HashMap<String, HashMap<String, f64>> = HashMap::new();
     let mut per_table_lsi: HashMap<String, HashMap<String, f64>> = HashMap::new();
-    // Entries a backend throttled, echoed as sent under `UnprocessedItems`
-    // (measured for PutRequest on an on-demand table, 2026-10-20: 18 of 80
-    // batches returned 200 with 6 to 24 of 25 entries unprocessed;
-    // DeleteRequest documented, not measured). When every entry was throttled
-    // the call fails with the throttle error instead (API Reference;
-    // documented, not measured).
-    let mut unprocessed_items: HashMap<String, Vec<WriteRequest>> = HashMap::new();
+
+    // Requests the batch did not apply: each write that failed because the
+    // backend could not apply it now. Amazon DynamoDB tolerates the failure of
+    // individual requests in a batch and reports them in UnprocessedItems for
+    // the client to replay: "If any requested operations fail because the
+    // table's provisioned throughput is exceeded or an internal processing
+    // failure occurs, the failed operations are returned in the
+    // UnprocessedItems response parameter." A failed request does not stop the
+    // others. Measured on 2026-10-27 in us-east-1, with a TransactWriteItems
+    // holding the items: a batch of two requests in which one was on a held
+    // item answered 200 with that request in UnprocessedItems and the other
+    // request applied, whichever came first. So every request is tried, and
+    // the answer to one contended request does not depend on where it sat in
+    // the batch. A request the backend throttled is deferred the same way and
+    // echoed as sent (measured for PutRequest on an on-demand table,
+    // 2026-10-20: 18 of 80 batches returned 200 with 6 to 24 of 25 entries
+    // unprocessed; DeleteRequest documented, not measured). The service's
+    // lists came back in neither request nor sorted order; this server keeps
+    // request order.
+    //
+    // A batch of which no request applied is an error. The same measurement
+    // answered 500 InternalServerError for batches whose requests were all on
+    // held items (one request or two), and never 200 with every request
+    // unprocessed. This server answers 503 ServiceUnavailable, which the SDKs
+    // retry with backoff, so a client's UnprocessedItems loop cannot spin on a
+    // batch that makes no progress. Each failed request spends its own retry
+    // budget first, so a batch of 25 contended requests can spend 25 budgets
+    // before it answers. When every request of the batch was throttled, the
+    // batch answers the first throttle error instead, with its
+    // ThrottlingReasons: the API reference documents
+    // ProvisionedThroughputExceededException or ThrottlingException for a
+    // batch that cannot process any item because of throttling (documented,
+    // not measured). A batch with nothing applied in which a request failed
+    // for another reason answers 503.
+    //
+    // The request faults the same page lists reject the whole batch before
+    // anything is written. `check_batch` finds a missing table, a key that
+    // does not match the schema, duplicate keys and an item over the size
+    // limit, wherever the faulty request sits. It also finds a secondary
+    // index key of the wrong type and an empty one, which the page does not
+    // list: the service rejected such a batch with nothing applied (measured
+    // 2026-11-10 in us-east-1 on a global secondary index).
+    // `check_batch_counts` finds too many requests and the HTTP layer finds a
+    // request over the size limit, both before this function runs. So a
+    // deferral below never hides a request fault, and a batch rejected for a
+    // request fault has no applied request, except for a fault on an index
+    // added after the lookup. A storage error that a replay does not clear
+    // (see `is_deferrable`) still fails the batch after earlier requests were
+    // applied.
+    let mut unprocessed: HashMap<String, Vec<WriteRequest>> = HashMap::new();
+    let mut applied = 0usize;
+    // The error of the last request that was not applied, for the warning
+    // logged once per batch below.
+    let mut last_error = String::new();
+    // How many requests the backend throttled, and the first throttle error:
+    // a batch of which every request was throttled answers that error.
     let mut throttled_count: usize = 0;
     let mut first_throttle: Option<DynamoDbError> = None;
 
-    for (table_name, reqs) in &input.request_items {
-        let key_info = ctx
-            .table_key_info_uncached(table_name)
-            .await
-            .map_err(storage_err_to_dynamo)?;
+    'tables: for (table_index, ((table_name, reqs), key_info)) in
+        tables.iter().zip(&key_infos).enumerate()
+    {
+        let table_name = *table_name;
+        let view_type = stream_capture::stream_view_type(key_info);
 
-        // Validate: no duplicate keys within the same table (using key schema)
-        validate_no_duplicate_keys(reqs, &key_info.key_schema)?;
+        for (request_index, wr) in reqs.iter().enumerate() {
+            let stream = view_type.map(|vt| extenddb_storage::StreamCapture {
+                view_type: vt,
+                user_identity: None,
+                region: region.clone(),
+            });
+            let need_old_for_stream = stream.is_some();
 
-        let view_type = stream_capture::stream_view_type(&key_info);
-        let mut table_unprocessed: Vec<WriteRequest> = Vec::new();
-
-        for wr in reqs {
-            if let Some(put) = &wr.put_request {
-                validate_batch_item_keys(
-                    &put.item,
-                    &key_info.key_schema,
-                    &key_info.attribute_definitions,
-                )?;
-                validate_item_nesting_depth(&put.item)?;
-                validate_item_size(&put.item, ctx.limits.max_item_size_bytes)?;
-                validate_attribute_name_sizes(&put.item, &ctx.limits)?;
-                validate_key_sizes(&put.item, &key_info.key_schema, &ctx.limits)?;
-                extenddb_core::validation::validate_vector_write(
-                    &put.item,
-                    &key_info.vector_indexes,
-                    &key_info.attribute_definitions,
-                )?;
-
-                let stream = view_type.map(|vt| extenddb_storage::StreamCapture {
-                    view_type: vt,
-                    user_identity: None,
-                    region: ctx.region.clone(),
-                });
-                let need_old_for_stream = stream.is_some();
-                let old_item = match ctx
-                    .storage
-                    .put_item(
-                        &key_info,
-                        put.item.clone(),
-                        need_old_for_stream || want_index_cc,
-                        None,
-                        &empty_maps,
-                        stream.as_ref(),
+            let (item_or_key, item_wcu, written) = match (&wr.put_request, &wr.delete_request) {
+                (Some(put), None) => {
+                    let item_wcu =
+                        capacity_helpers::write_capacity_units(item_size_bytes(&put.item));
+                    let written = data
+                        .put_item(
+                            key_info,
+                            put.item.clone(),
+                            need_old_for_stream || want_index_cc,
+                            None,
+                            &empty_maps,
+                            stream.as_ref(),
+                        )
+                        .await;
+                    (
+                        &put.item,
+                        item_wcu,
+                        written.map(|old| (old, Some(&put.item))),
                     )
-                    .await
-                {
-                    Ok(old_item) => old_item,
-                    // A throttled entry is returned unprocessed and the loop
-                    // continues; nothing below is charged or reported for it.
-                    // Every other storage error still fails the request.
-                    Err(StorageError::Service(e)) if e.is_throttle() => {
-                        table_unprocessed.push(wr.clone());
-                        throttled_count += 1;
-                        if first_throttle.is_none() {
-                            first_throttle = Some(e);
-                        }
-                        continue;
-                    }
-                    Err(e) => return Err(storage_err_to_dynamo(e)),
-                };
-                // Applied: charge capacity and report metrics for this entry.
-                collect_icm_if_needed(
-                    input.return_item_collection_metrics,
-                    &key_info,
-                    &put.item,
-                    table_name,
-                    &mut all_icm,
-                );
-                let item_wcu = capacity_helpers::write_capacity_units(item_size_bytes(&put.item));
-                total_wcu += item_wcu;
-                *per_table_wcu.entry(table_name.clone()).or_default() += item_wcu;
-                if want_index_cc {
-                    let (gsi, lsi) = capacity_helpers::index_write_units(
-                        old_item.as_ref(),
-                        Some(&put.item),
-                        false,
-                        &key_info,
-                    );
-                    let g = per_table_gsi.entry(table_name.clone()).or_default();
-                    for (name, cu) in gsi {
-                        *g.entry(name).or_default() += cu;
-                    }
-                    let l = per_table_lsi.entry(table_name.clone()).or_default();
-                    for (name, cu) in lsi {
-                        *l.entry(name).or_default() += cu;
-                    }
                 }
-            } else if let Some(del) = &wr.delete_request {
-                validate_batch_key_only(
-                    &del.key,
-                    &key_info.key_schema,
-                    &key_info.attribute_definitions,
-                )?;
-
-                let stream = view_type.map(|vt| extenddb_storage::StreamCapture {
-                    view_type: vt,
-                    user_identity: None,
-                    region: ctx.region.clone(),
-                });
-                let need_old_for_stream = stream.is_some();
-                let old_item = match ctx
-                    .storage
-                    .delete_item(
-                        &key_info,
-                        &del.key,
-                        need_old_for_stream || want_index_cc,
-                        None,
-                        &empty_maps,
-                        stream.as_ref(),
+                (None, Some(del)) => {
+                    // TODO(fidelity): DynamoDB charges WCU based on old item size for deletes,
+                    // but old item size is not available here. Using key size as lower bound.
+                    let item_wcu =
+                        capacity_helpers::write_capacity_units(item_size_bytes(&del.key));
+                    let written = data
+                        .delete_item(
+                            key_info,
+                            &del.key,
+                            need_old_for_stream || want_index_cc,
+                            None,
+                            &empty_maps,
+                            stream.as_ref(),
+                        )
+                        .await;
+                    (&del.key, item_wcu, written.map(|old| (old, None)))
+                }
+                (None, None) | (Some(_), Some(_)) => {
+                    unreachable!(
+                        "the shape check in `handle_batch_write_item` rejects this request"
                     )
-                    .await
-                {
-                    Ok(old_item) => old_item,
-                    Err(StorageError::Service(e)) if e.is_throttle() => {
-                        table_unprocessed.push(wr.clone());
+                }
+            };
+
+            let (old_item, new_item) = match written {
+                Ok(outcome) => outcome,
+                Err(e) if is_deferrable(&e) => {
+                    tracing::debug!(
+                        table = %table_name,
+                        error = %e,
+                        "BatchWriteItem: write not applied after {applied} committed; it is reported in UnprocessedItems if another request of the batch applies"
+                    );
+                    last_error = e.to_string();
+                    if matches!(e, StorageError::Connection(_)) {
+                        // The backend is unreachable and the requests after
+                        // this one would wait on it as well: leave them, and
+                        // this one, for the client.
+                        for (name, rest) in remaining_requests(tables, table_index, request_index) {
+                            unprocessed.entry(name).or_default().extend(rest);
+                        }
+                        break 'tables;
+                    }
+                    // `is_deferrable` takes a `Service` error only when it is
+                    // a throttle.
+                    if let StorageError::Service(e) = e {
                         throttled_count += 1;
                         if first_throttle.is_none() {
                             first_throttle = Some(e);
                         }
-                        continue;
                     }
-                    Err(e) => return Err(storage_err_to_dynamo(e)),
-                };
-                // Applied: charge capacity and report metrics for this entry.
-                collect_icm_if_needed(
-                    input.return_item_collection_metrics,
-                    &key_info,
-                    &del.key,
-                    table_name,
-                    &mut all_icm,
+                    unprocessed
+                        .entry(table_name.to_owned())
+                        .or_default()
+                        .push(wr.clone());
+                    continue;
+                }
+                Err(e) => return Err(storage_err_to_dynamo(e)),
+            };
+            applied += 1;
+
+            collect_icm_if_needed(
+                input.return_item_collection_metrics,
+                key_info,
+                item_or_key,
+                table_name,
+                &mut all_icm,
+            );
+            total_wcu += item_wcu;
+            *per_table_wcu.entry(table_name.to_owned()).or_default() += item_wcu;
+            if want_index_cc {
+                let (gsi, lsi) = capacity_helpers::index_write_units(
+                    old_item.as_ref(),
+                    new_item,
+                    false,
+                    key_info,
                 );
-                // TODO(fidelity): DynamoDB charges WCU based on old item size for deletes,
-                // but old item size is not available here. Using key size as lower bound.
-                let item_wcu = capacity_helpers::write_capacity_units(item_size_bytes(&del.key));
-                total_wcu += item_wcu;
-                *per_table_wcu.entry(table_name.clone()).or_default() += item_wcu;
-                if want_index_cc {
-                    let (gsi, lsi) = capacity_helpers::index_write_units(
-                        old_item.as_ref(),
-                        None,
-                        false,
-                        &key_info,
-                    );
-                    let g = per_table_gsi.entry(table_name.clone()).or_default();
-                    for (name, cu) in gsi {
-                        *g.entry(name).or_default() += cu;
-                    }
-                    let l = per_table_lsi.entry(table_name.clone()).or_default();
-                    for (name, cu) in lsi {
-                        *l.entry(name).or_default() += cu;
-                    }
+                let g = per_table_gsi.entry(table_name.to_owned()).or_default();
+                for (name, cu) in gsi {
+                    *g.entry(name).or_default() += cu;
+                }
+                let l = per_table_lsi.entry(table_name.to_owned()).or_default();
+                for (name, cu) in lsi {
+                    *l.entry(name).or_default() += cu;
                 }
             }
         }
-        if !table_unprocessed.is_empty() {
-            // Request order; the service's lists came back in neither request
-            // nor sorted order.
-            unprocessed_items.insert(table_name.clone(), table_unprocessed);
-        }
     }
 
-    // No entry of any table could be written: the call fails with the first
-    // throttle error (API Reference; documented, not measured).
-    if let Some(e) = first_throttle
-        && throttled_count == total_ops
-    {
-        return Err(e);
+    if !unprocessed.is_empty() {
+        let not_applied: usize = unprocessed.values().map(Vec::len).sum();
+        let all_throttled = throttled_count == not_applied;
+        let outcome = if applied == 0 && all_throttled {
+            "every request was throttled and the batch answers the first throttle error"
+        } else if applied == 0 {
+            "no request applied and the batch answers 503"
+        } else {
+            "they are returned in UnprocessedItems"
+        };
+        tracing::warn!(
+            applied,
+            not_applied,
+            last_error = %last_error,
+            "BatchWriteItem: {not_applied} request(s) of the batch not applied; {outcome}"
+        );
+        if applied == 0 {
+            if let Some(e) = first_throttle
+                && all_throttled
+            {
+                return Err(e);
+            }
+            return Err(DynamoDbError::ServiceUnavailable(
+                "Service is temporarily unavailable".to_owned(),
+            ));
+        }
     }
 
     // With INDEXES, each per-table entry carries the arms the batch actually
@@ -292,7 +399,7 @@ pub async fn handle_batch_write_item(
     let wcu = total_wcu;
 
     let output = BatchWriteItemOutput {
-        unprocessed_items,
+        unprocessed_items: unprocessed,
         consumed_capacity,
         // The service answers a SIZE request with the field present even when
         // no written item belongs to an item collection: 13 of 13 fully
@@ -315,6 +422,153 @@ pub async fn handle_batch_write_item(
             ..Default::default()
         },
     })
+}
+
+/// Whether a failed write leaves that request for the client to replay
+/// instead of failing the batch.
+///
+/// These are the errors a replay may clear: the backend could not apply the
+/// request now. `Transient` is a failure expected to clear on retry (a
+/// MongoDB write that lost every attempt to concurrent writers is one
+/// example), `TransactionConflict` is a transaction that holds the item, and
+/// `Connection` is a failed connection. A fault in the request itself
+/// (validation, a missing table, a condition) fails the batch as before, and
+/// so does an internal error: the documentation lists an internal processing
+/// failure among the causes of UnprocessedItems, but a storage fault here is
+/// not cleared by replaying the request, and a client's UnprocessedItems loop
+/// would spin on it. An internal error keeps answering HTTP 500, which is
+/// what it answered before this handler deferred anything.
+///
+/// A `Service` error that carries a throttle error (`is_throttle`) is
+/// deferred as well: the backend throttled the request, which is the first
+/// cause of UnprocessedItems the documentation lists. Every other `Service`
+/// error fails the batch with that error.
+///
+/// The handler assumes that a deferred request was not applied. The client
+/// replays it, and the replay of a request that had committed would apply it
+/// a second time and write a second stream record. So a backend must return
+/// these errors only for a write that did not commit, and must report a
+/// commit of unknown outcome as `Internal`, which fails the batch with 500.
+/// MongoDB does so for an `UnknownTransactionCommitResult` that outlasts the
+/// commit retries. On SQLite, `map_sqlx_err` classes `sqlx::Error::Io` as
+/// `Transient`, but an I/O error at COMMIT, which can leave the write
+/// applied, is not deferred: `put_item` and `delete_item` map any error of
+/// the COMMIT to `Internal` without `map_sqlx_err`.
+///
+/// `TransactionConflict` is deferred because the service treats it that way.
+/// Measured on 2026-10-27 in us-east-1 with client retries off, while a
+/// TransactWriteItems held the items: a batch of two requests in which one
+/// was on a held item answered 200 with that request in UnprocessedItems and
+/// the other request applied, whichever of the two came first, and no
+/// BatchWriteItem call answered TransactionConflictException.
+fn is_deferrable(e: &StorageError) -> bool {
+    matches!(
+        e,
+        StorageError::TransactionConflict(_)
+            | StorageError::Transient(_)
+            | StorageError::Connection(_)
+    ) || matches!(e, StorageError::Service(e) if e.is_throttle())
+}
+
+/// The requests from `tables[table_index][request_index]` on, in batch order:
+/// the request that was not applied and every request after it, in its table
+/// and in the tables that follow. These are the requests left unattempted
+/// when a connection error ends the batch.
+fn remaining_requests(
+    tables: &[(&str, &[WriteRequest])],
+    table_index: usize,
+    request_index: usize,
+) -> HashMap<String, Vec<WriteRequest>> {
+    let mut out: HashMap<String, Vec<WriteRequest>> = HashMap::new();
+    for (i, (table_name, reqs)) in tables.iter().enumerate().skip(table_index) {
+        let from = if i == table_index { request_index } else { 0 };
+        let rest = &reqs[from..];
+        if !rest.is_empty() {
+            out.insert((*table_name).to_owned(), rest.to_vec());
+        }
+    }
+    out
+}
+
+/// Take every table's key info and validate every request, before the first
+/// write. Returns the key info per table, in the order of `tables`.
+///
+/// Faults are reported in the order the writes used to reach them: for each
+/// table in turn, its lookup, the duplicate-key check, then its requests in
+/// the order they are listed. `tables` comes from a `HashMap`, so the tables
+/// are visited in the order the map yields them, and which of two table
+/// faults is reported is not defined. The first fault rejects the whole
+/// batch.
+fn check_batch(
+    tables: &[(&str, &[WriteRequest])],
+    lookups: Vec<Result<TableKeyInfo, StorageError>>,
+    limits: &LimitsConfig,
+) -> Result<Vec<TableKeyInfo>, DynamoDbError> {
+    let mut key_infos = Vec::with_capacity(tables.len());
+    for ((_, reqs), lookup) in tables.iter().zip(lookups) {
+        let key_info = lookup.map_err(storage_err_to_dynamo)?;
+        validate_no_duplicate_keys(reqs, &key_info.key_schema)?;
+        for wr in reqs.iter() {
+            validate_request(wr, &key_info, limits)?;
+        }
+        key_infos.push(key_info);
+    }
+    Ok(key_infos)
+}
+
+/// Validate one write request against its table.
+///
+/// A put's secondary index keys are checked against the global and local
+/// secondary indexes in `key_info`: a key of the wrong type or an empty string
+/// or binary key rejects the batch here, before the first write. The storage
+/// layer runs the same check again in `put_item` against the indexes it reads
+/// at write time, which also covers an index added after the lookup.
+fn validate_request(
+    wr: &WriteRequest,
+    key_info: &TableKeyInfo,
+    limits: &LimitsConfig,
+) -> Result<(), DynamoDbError> {
+    if let Some(put) = &wr.put_request {
+        validate_batch_item_keys(
+            &put.item,
+            &key_info.key_schema,
+            &key_info.attribute_definitions,
+        )?;
+        validate_item_nesting_depth(&put.item)?;
+        validate_item_size(&put.item, limits.max_item_size_bytes)?;
+        validate_key_sizes(&put.item, &key_info.key_schema, limits)?;
+        extenddb_core::validation::validate_vector_write(
+            &put.item,
+            &key_info.vector_indexes,
+            &key_info.attribute_definitions,
+        )?;
+        validate_index_keys(
+            &put.item,
+            &secondary_index_keys(key_info),
+            &key_info.attribute_definitions,
+        )?;
+    } else if let Some(del) = &wr.delete_request {
+        validate_batch_key_only(
+            &del.key,
+            &key_info.key_schema,
+            &key_info.attribute_definitions,
+        )?;
+    }
+    Ok(())
+}
+
+/// The name and key schema of each global and local secondary index of the
+/// table.
+fn secondary_index_keys(key_info: &TableKeyInfo) -> Vec<IndexKeyRef<'_>> {
+    key_info
+        .global_secondary_indexes
+        .iter()
+        .chain(&key_info.local_secondary_indexes)
+        .map(|idx| IndexKeyRef {
+            index_name: &idx.index_name,
+            key_schema: &idx.key_schema,
+        })
+        .collect()
 }
 
 /// Validate that no two write requests in the same table target the same key.
@@ -364,5 +618,91 @@ fn collect_icm_if_needed(
         capacity_helpers::item_metrics(ricm, &key_info.key_schema, item_or_key, key_info.has_lsi)
     {
         all_icm.entry(table_name.to_owned()).or_default().push(m);
+    }
+}
+
+#[cfg(test)]
+mod scripted;
+#[cfg(test)]
+mod write_batch_deferral_tests;
+#[cfg(test)]
+mod write_batch_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use extenddb_core::types::{AttributeValue, DeleteRequest, PutRequest};
+
+    fn put(pk: &str) -> WriteRequest {
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::S(pk.to_owned()));
+        WriteRequest {
+            put_request: Some(PutRequest { item }),
+            delete_request: None,
+        }
+    }
+
+    fn delete(pk: &str) -> WriteRequest {
+        let mut key = Item::new();
+        key.insert("pk".to_owned(), AttributeValue::S(pk.to_owned()));
+        WriteRequest {
+            put_request: None,
+            delete_request: Some(DeleteRequest { key }),
+        }
+    }
+
+    fn pks(reqs: &[WriteRequest]) -> Vec<String> {
+        reqs.iter()
+            .map(|wr| {
+                let item = wr
+                    .put_request
+                    .as_ref()
+                    .map(|p| &p.item)
+                    .or(wr.delete_request.as_ref().map(|d| &d.key))
+                    .expect("one of put or delete");
+                match item.get("pk") {
+                    Some(AttributeValue::S(s)) => s.clone(),
+                    other => panic!("unexpected key {other:?}"),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn remaining_requests_start_at_the_failed_request_and_cover_later_tables() {
+        let r1 = vec![put("a"), delete("b"), put("c")];
+        let r2 = vec![put("d")];
+        let tables = vec![("t1", r1.as_slice()), ("t2", r2.as_slice())];
+
+        let rest = remaining_requests(&tables, 0, 1);
+        assert_eq!(pks(&rest["t1"]), ["b", "c"]);
+        assert_eq!(pks(&rest["t2"]), ["d"]);
+
+        // Failed on the last request of the last table: only that request.
+        let rest = remaining_requests(&tables, 1, 0);
+        assert!(!rest.contains_key("t1"));
+        assert_eq!(pks(&rest["t2"]), ["d"]);
+
+        // Failed on the last request of an earlier table: no entry for that
+        // table's later requests, which do not exist.
+        let rest = remaining_requests(&tables, 0, 2);
+        assert_eq!(pks(&rest["t1"]), ["c"]);
+        assert_eq!(pks(&rest["t2"]), ["d"]);
+    }
+
+    #[test]
+    fn only_errors_a_replay_may_clear_are_deferred() {
+        assert!(is_deferrable(&StorageError::TransactionConflict(
+            String::new()
+        )));
+        assert!(is_deferrable(&StorageError::Transient(String::new())));
+        assert!(is_deferrable(&StorageError::Connection(String::new())));
+        // A storage fault is not cleared by a replay: it keeps answering 500
+        // rather than being handed to the client's UnprocessedItems loop.
+        assert!(!is_deferrable(&StorageError::Internal(String::new())));
+        assert!(!is_deferrable(&StorageError::Validation(String::new())));
+        assert!(!is_deferrable(&StorageError::TableNotFound(String::new())));
+        assert!(!is_deferrable(&StorageError::ConditionFailed(None)));
+        assert!(!is_deferrable(&StorageError::LimitExceeded(String::new())));
     }
 }

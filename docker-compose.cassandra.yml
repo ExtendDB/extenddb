@@ -1,0 +1,261 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Local development only. This stack runs a single Cassandra node with
+# replication factor 1 and must not be used as a production deployment. The
+# Cassandra service is separate from ExtendDB so the same image can be used
+# with a Cassandra cluster you operate.
+#
+# Cassandra publishes no port on the host's interfaces; it is reachable from
+# this stack's containers (and, on Linux, from the host through the bridge
+# network). ExtendDB is published on 127.0.0.1 only. All passwords come from the
+# environment and the stack refuses to start without them:
+#
+#   CASSANDRA_SUPERUSER_PASSWORD   replaces the stock cassandra/cassandra
+#                                  superuser password on first start
+#   EXTENDDB_CASSANDRA_APP_PASSWORD  password of the application role init
+#                                  creates and serve logs in as
+#   EXTENDDB_ADMIN_PASSWORD        first ExtendDB administrator
+
+name: extenddb-cassandra-dev
+
+x-extenddb-image: &extenddb-image
+  image: ${EXTENDDB_CASSANDRA_IMAGE:-extenddb-cassandra:dev}
+
+x-cassandra-image: &cassandra-image
+  image: ${CASSANDRA_IMAGE:-public.ecr.aws/docker/library/cassandra:4.1@sha256:b877532a79865d0212c860352bb9c3b0be97db9628a662ea815fb90ea4033158}
+
+x-extenddb-hardening: &extenddb-hardening
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=16m
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+
+services:
+  cassandra:
+    <<: *cassandra-image
+    # The cassandra:4.1 image has no environment variable for the
+    # authenticator or the authorizer. `extenddb init` needs
+    # PasswordAuthenticator because it creates its application role WITH
+    # PASSWORD, and under CassandraAuthorizer it grants that role only the
+    # permissions ExtendDB needs. Enable both in cassandra.yaml, then hand over
+    # to the image's own entrypoint.
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        sed -i -e 's/^authenticator: .*/authenticator: PasswordAuthenticator/' \
+          -e 's/^authorizer: .*/authorizer: CassandraAuthorizer/' \
+          /etc/cassandra/cassandra.yaml
+        # sed exits 0 whether or not a line matched. A cassandra.yaml laid out
+        # differently (another CASSANDRA_IMAGE) would otherwise start with
+        # AllowAllAuthorizer and no error.
+        grep -qx 'authenticator: PasswordAuthenticator' /etc/cassandra/cassandra.yaml \
+          || { echo "cassandra: cassandra.yaml has no top-level authenticator line to replace" >&2; exit 1; }
+        grep -qx 'authorizer: CassandraAuthorizer' /etc/cassandra/cassandra.yaml \
+          || { echo "cassandra: cassandra.yaml has no top-level authorizer line to replace" >&2; exit 1; }
+        exec docker-entrypoint.sh cassandra -f
+    environment:
+      # No CASSANDRA_DC: the image then keeps SimpleSnitch, whose datacenter
+      # is datacenter1, the name init writes into the keyspace definitions.
+      CASSANDRA_CLUSTER_NAME: extenddb-dev
+      MAX_HEAP_SIZE: ${CASSANDRA_MAX_HEAP_SIZE:-1024M}
+      HEAP_NEWSIZE: ${CASSANDRA_HEAP_NEWSIZE:-128M}
+    healthcheck:
+      # Native transport up; needs no credentials. cassandra-auth-init waits
+      # for the authenticated login separately.
+      test: ["CMD-SHELL", "nodetool statusbinary | grep -qx running"]
+      interval: 5s
+      timeout: 10s
+      retries: 60
+      start_period: 30s
+    volumes:
+      - cassandra-data:/var/lib/cassandra
+    # ExtendDB restarts on its own after a reboot and cannot start without
+    # Cassandra.
+    restart: unless-stopped
+
+  cassandra-auth-init:
+    <<: *cassandra-image
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    environment:
+      CASSANDRA_SUPERUSER_PASSWORD: ${CASSANDRA_SUPERUSER_PASSWORD:?set CASSANDRA_SUPERUSER_PASSWORD}
+    # The credentials files below hold the password; keep them off the
+    # container's writable layer. The image declares VOLUME /var/lib/cassandra;
+    # a tmpfs there stops each run leaving an empty anonymous volume behind.
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=1m
+      - /var/lib/cassandra:rw,noexec,nosuid,size=1m
+    # Waits until the superuser can log in, and replaces the stock password
+    # the first time. On later starts the new password already works and
+    # nothing changes. cqlsh reads every password from a 0600 credentials
+    # file in this container, never from its command line, which any user on
+    # the host can read.
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        fail() { echo "cassandra-auth-init: $$*" >&2; exit 1; }
+        [ "$$CASSANDRA_SUPERUSER_PASSWORD" != cassandra ] \
+          || fail "CASSANDRA_SUPERUSER_PASSWORD must not be the stock password"
+        umask 077
+        creds() {
+          printf '[plain_text_auth]\nusername = cassandra\npassword = %s\n' "$$1" > "$$2"
+        }
+        creds "$$CASSANDRA_SUPERUSER_PASSWORD" /tmp/new.credentials
+        # cqlsh parses the file with configparser, which strips surrounding
+        # whitespace (including \r and non-breaking spaces) and splits on line
+        # breaks. Refuse a password that would not read back exactly, before
+        # the stock password is replaced with it.
+        python3 -c '
+        import configparser, os, sys
+        parser = configparser.RawConfigParser()
+        try:
+            parser.read(sys.argv[1], encoding="utf-8")
+            ok = parser.get("plain_text_auth", "password") == os.environ["CASSANDRA_SUPERUSER_PASSWORD"]
+        except (configparser.Error, UnicodeDecodeError):
+            ok = False
+        sys.exit(0 if ok else 1)
+        ' /tmp/new.credentials \
+          || fail "CASSANDRA_SUPERUSER_PASSWORD must not contain line breaks or start or end with whitespace"
+        creds cassandra /tmp/stock.credentials
+        creds "wrong-$$(cat /proc/sys/kernel/random/uuid)" /tmp/wrong.credentials
+        printf "ALTER ROLE cassandra WITH PASSWORD = '%s';\n" \
+          "$$(printf '%s' "$$CASSANDRA_SUPERUSER_PASSWORD" | sed "s/'/''/g")" > /tmp/alter-role.cql
+        login() {
+          cqlsh --credentials "$$1" cassandra 9042 \
+            -e 'SELECT release_version FROM system.local' 2>&1
+        }
+        # Bounded by the clock, not by passes: each pass can spend two cqlsh
+        # connect timeouts.
+        deadline=$$(( $$(date +%s) + 300 ))
+        rejected_since=
+        while [ "$$(date +%s)" -lt "$$deadline" ]; do
+          if out=$$(login /tmp/new.credentials); then
+            # Fail closed if the authenticator edit did not take: an
+            # AllowAllAuthenticator node accepts any password.
+            if wrong=$$(login /tmp/wrong.credentials); then
+              fail "Cassandra accepted a random password; password authentication is not enabled"
+            fi
+            case "$$wrong" in
+              *"Bad credentials"*) ;;
+              *) fail "unexpected answer to a wrong password: $$wrong" ;;
+            esac
+            echo "cassandra-auth-init: superuser login works"
+            exit 0
+          fi
+          if stock=$$(login /tmp/stock.credentials); then
+            # The node caches credentials for a few seconds, so the stock
+            # login can keep working briefly after the change and the new one
+            # can fail. A failed ALTER is retried on the next pass.
+            echo "cassandra-auth-init: replacing the stock superuser password"
+            cqlsh --credentials /tmp/stock.credentials cassandra 9042 \
+              -f /tmp/alter-role.cql || true
+            rejected_since=
+          else
+            case "$$out" in
+              *"Bad credentials"*)
+                case "$$stock" in
+                  *"Bad credentials"*) : "$${rejected_since:=$$(date +%s)}" ;;
+                  *) rejected_since= ;;
+                esac ;;
+              *) rejected_since= ;;
+            esac
+            # Both passwords refused for a minute, well past the node's
+            # 10-second superuser setup delay: the volume was set up with
+            # another password.
+            [ -z "$$rejected_since" ] \
+              || [ $$(( $$(date +%s) - rejected_since )) -lt 60 ] \
+              || fail "Cassandra refuses CASSANDRA_SUPERUSER_PASSWORD and the stock password. Use the password this stack was first started with, or run 'docker compose -f docker-compose.cassandra.yml down -v' to remove both volumes and start over."
+          fi
+          sleep 2
+        done
+        fail "Cassandra did not accept a superuser login within 5 minutes"
+    restart: "no"
+
+  extenddb-volume-init:
+    <<: *extenddb-image
+    build:
+      context: .
+      dockerfile: Dockerfile.cassandra
+      args:
+        VERSION: ${EXTENDDB_VERSION:-dev}
+        VCS_REF: ${VCS_REF:-unknown}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
+    user: "0:0"
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      disable: true
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["chown -R 10001:10001 /var/lib/extenddb"]
+    volumes:
+      - extenddb-state:/var/lib/extenddb
+    restart: "no"
+
+  extenddb-bootstrap:
+    <<: [*extenddb-image, *extenddb-hardening]
+    depends_on:
+      cassandra-auth-init:
+        condition: service_completed_successfully
+      extenddb-volume-init:
+        condition: service_completed_successfully
+    environment:
+      # init reads all four. migrate connects as the application role in the
+      # config and needs none of them. Passed through the environment so they
+      # stay out of process arguments.
+      EXTENDDB_CASSANDRA_PASSWORD: ${CASSANDRA_SUPERUSER_PASSWORD:?set CASSANDRA_SUPERUSER_PASSWORD}
+      EXTENDDB_APP_PASSWORD: ${EXTENDDB_CASSANDRA_APP_PASSWORD:?set EXTENDDB_CASSANDRA_APP_PASSWORD}
+      EXTENDDB_ADMIN_USER: ${EXTENDDB_ADMIN_USER:-admin}
+      EXTENDDB_ADMIN_PASSWORD: ${EXTENDDB_ADMIN_PASSWORD:?set EXTENDDB_ADMIN_PASSWORD}
+    healthcheck:
+      disable: true
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        CONFIG=/var/lib/extenddb/extenddb.toml
+        if [ -f "$$CONFIG" ]; then
+          echo "bootstrap: existing config detected; running migrations"
+          # The preview changes nothing and exits 0 when the catalog is up to
+          # date, 3 when migrations are pending. Only then run --yes, which
+          # waits for a running server, so an `up` on a running, current stack
+          # does not fail.
+          status=0
+          extenddb migrate --config "$$CONFIG" || status=$$?
+          case "$$status" in
+            0) exit 0 ;;
+            3) exec extenddb migrate --config "$$CONFIG" --yes ;;
+            *) exit "$$status" ;;
+          esac
+        fi
+        echo "bootstrap: no config detected; initializing"
+        exec extenddb init --backend cassandra --config "$$CONFIG" \
+          --cassandra-contact-points cassandra:9042 --cassandra-user cassandra \
+          --bind-addr 0.0.0.0 --tls-san localhost --tls-san extenddb
+    volumes:
+      - extenddb-state:/var/lib/extenddb
+    restart: "no"
+
+  extenddb:
+    <<: [*extenddb-image, *extenddb-hardening]
+    depends_on:
+      extenddb-bootstrap:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:${EXTENDDB_PORT:-18443}:18443"
+    volumes:
+      - extenddb-state:/var/lib/extenddb
+    stop_grace_period: 80s
+    restart: unless-stopped
+
+volumes:
+  cassandra-data:
+  extenddb-state:

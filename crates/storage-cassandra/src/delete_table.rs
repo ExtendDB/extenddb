@@ -15,8 +15,7 @@ pub(crate) enum DeleteTableCaller<'a> {
     /// DeleteTable: refuses a deletion-protected table and a restore target
     /// still being restored.
     Client,
-    /// The restore copy or the abandoned-restore sweep removing a restore
-    /// target. Deletes only the incarnation with this `table_id`, so a target
+    /// The restore copy or the reconciler removing a restore target. Deletes only the incarnation with this `table_id`, so a target
     /// that was already removed and whose name was reused is left alone.
     RestoreCleanup { table_id: &'a str },
 }
@@ -92,7 +91,7 @@ impl CassandraEngine {
                 }
 
                 // A restore target is owned by its copy until the copy
-                // activates it (or the sweep removes it). Deleting it mid-copy
+                // activates it (or the reconciler removes it). Deleting it mid-copy
                 // would race the copy's writes into dropped tables.
                 let status: Option<String> = table_row.get_by_name("table_status").ok().flatten();
                 let restoring_from: Option<String> = table_row
@@ -163,19 +162,6 @@ impl CassandraEngine {
             )
             .await
             .map_err(|e| StorageError::Internal(format!("Delete indexes: {e}")))?;
-
-        // Delete table-scoped continuous-backup configuration so recreating the
-        // same table name does not inherit stale PITR state.
-        let delete_continuous_backup_query = format!(
-            "DELETE FROM {catalog_keyspace}.continuous_backups WHERE account_id = ? AND table_name = ?"
-        );
-        self.session
-            .query_with_values(
-                &delete_continuous_backup_query,
-                cdrs_tokio::query_values!(account_id, input.table_name.as_str()),
-            )
-            .await
-            .map_err(|e| StorageError::Internal(format!("Delete continuous backup state: {e}")))?;
 
         // Delete tags for this table so they don't survive recreation under the same name.
         let delete_tags_query =

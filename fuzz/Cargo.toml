@@ -1,0 +1,84 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# cargo-fuzz harness for the request parsers that read untrusted input. This is
+# its own workspace (see the [workspace] section at the end) so the root
+# workspace, its Cargo.lock and its license notices are unaffected.
+#
+# fuzz/Cargo.lock is not committed. Before a local build, create it the way the
+# Fuzz workflow does, so every crate shared with the server is at the server's
+# version: copy Cargo.lock to fuzz/Cargo.lock, then run
+# `cargo metadata --format-version 1 --manifest-path fuzz/Cargo.toml`.
+[package]
+name = "extenddb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+# Pinned for reproducibility. libfuzzer-sys brings its own libFuzzer runtime,
+# built from source by its cc build script, so no system libFuzzer is needed.
+libfuzzer-sys = "=0.4.13"
+# Used only to turn fuzzer bytes into structured items, maps and headers.
+arbitrary = "=1.5.0"
+# The sigv4 verify and timestamp entry points take axum::http::HeaderMap, which
+# is a re-export of this crate's HeaderMap. The same major version resolves in
+# the dependency graph, so the type matches.
+http = "1"
+
+extenddb-core = { path = "../crates/core" }
+extenddb-auth = { path = "../crates/auth" }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "sigv4_authorization"
+path = "fuzz_targets/sigv4_authorization.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sigv4_timestamp"
+path = "fuzz_targets/sigv4_timestamp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sigv4_verify"
+path = "fuzz_targets/sigv4_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "expression_parse"
+path = "fuzz_targets/expression_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "expression_evaluate"
+path = "fuzz_targets/expression_evaluate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy_document"
+path = "fuzz_targets/policy_document.rs"
+test = false
+doc = false
+bench = false
+
+# Independent workspace so the root workspace does not pick up the fuzz crate or
+# its dependencies.
+[workspace]
+members = ["."]
+resolver = "2"
