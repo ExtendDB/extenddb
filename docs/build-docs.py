@@ -89,6 +89,8 @@ DOCUMENTS = [
      "docs/local-postgres-setup.md"),
     (18, "event-ticketing-demo", "Event Ticketing Platform Demo", "getting-started",
      "docs/manuals/13-event-ticketing-demo.md"),
+    (19, "backup-and-restore", "Backup and Restore", "usage",
+     "docs/manuals/14-backup-and-restore.md"),
 ]
 
 
@@ -131,12 +133,14 @@ def get_extenddb_version() -> str:
 
 
 def get_catalog_version() -> str:
-    """Extract CATALOG_VERSION from storage-postgres lib.rs."""
-    lib_rs = ROOT / "crates" / "storage-postgres" / "src" / "lib.rs"
-    text = lib_rs.read_text()
-    m = re.search(r"CatalogVersion::new\((\d+),\s*(\d+),\s*(\d+)\)", text)
-    if m:
-        return f"{m.group(1)}.{m.group(2)}.{m.group(3)}"
+    """The catalog the manuals describe: `migration <n>`, the last id of the
+    `migration_ids!` list in crates/storage/src/migrations/registry.rs, as
+    `extenddb version` prints it."""
+    registry = ROOT / "crates" / "storage" / "src" / "migrations" / "registry.rs"
+    text = registry.read_text()
+    ids = [int(n) for n in re.findall(r"^\s*[A-Z][A-Za-z0-9]* = (\d+), \"", text, re.MULTILINE)]
+    if ids:
+        return f"migration {max(ids)}"
     return "unknown"
 
 
@@ -251,9 +255,9 @@ LICENSE_HTML = """<div class="license-page">
 <h2>License &amp; Disclaimer</h2>
 <p>Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See the LICENSE file in the project root for the full text.</p>
-<p>This software is provided &ldquo;as is&rdquo; without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. &ldquo;DynamoDB&rdquo; is a trademark
-of Amazon.com, Inc.</p>
+<p>This software is provided &ldquo;as is&rdquo; without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+&ldquo;DynamoDB&rdquo; is a trademark of Amazon.com, Inc. or its affiliates.</p>
 </div>
 <div style="page-break-after: always"></div>
 """

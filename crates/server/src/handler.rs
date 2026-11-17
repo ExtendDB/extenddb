@@ -10,17 +10,19 @@ use std::sync::Arc;
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, State};
 use axum::http::HeaderMap;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use extenddb_core::error::DynamoDbError;
 use extenddb_engine::OperationContext;
 use serde_json::Value;
 
 use crate::AppState;
-use crate::request_helpers::{authorize_request, extract_operation, extract_table_name};
+use crate::request_helpers::{
+    authorize_request, extract_operation, extract_table_name, metric_table_name,
+};
 use crate::response::{error_response, record_error_metrics, success_response};
 use crate::throttle_helpers::{
-    classify_data_operation, extract_partition_value, table_description_to_throughput,
-    throttle_error, update_throttle_buckets,
+    classify_data_operation, extract_partition_value, record_partial_batch_throttle,
+    table_description_to_throughput, throttle_error, update_throttle_buckets,
 };
 
 /// Main Virtual `DynamoDB` request handler.
@@ -48,14 +50,31 @@ pub(crate) async fn handle_request(
     }
     let request_id = uuid::Uuid::new_v4().to_string();
 
-    // SP-WIRE-007: body limit exceeded → 413
-    let Ok(body) = body else {
-        return error_response(
-            &DynamoDbError::RequestEntityTooLargeException(
-                "Request size has exceeded the maximum allowed size".to_owned(),
-            ),
-            &request_id,
-        );
+    // A repeated `host` or `authorization` header was refused before routing
+    // (see `repeated_headers`), so each is read as one value from here on.
+
+    // SP-WIRE-007: body limit exceeded → 413. Any other failure to read the
+    // body is the body timeout (the client stopped sending) → 408.
+    let body = match body {
+        Ok(body) => body,
+        Err(axum::extract::rejection::BytesRejection::FailedToBufferBody(
+            axum::extract::rejection::FailedToBufferBody::LengthLimitError(_),
+        )) => {
+            return error_response(
+                &DynamoDbError::RequestEntityTooLargeException(
+                    "Request size has exceeded the maximum allowed size".to_owned(),
+                ),
+                &request_id,
+            );
+        }
+        Err(_) => {
+            return (
+                axum::http::StatusCode::REQUEST_TIMEOUT,
+                [(axum::http::header::CONNECTION, "close")],
+                "request body was not received within the server's request timeout",
+            )
+                .into_response();
+        }
     };
 
     // A thin binary's observer receives one record per request that reached
@@ -129,13 +148,22 @@ pub(crate) async fn handle_request(
         });
     let served = extenddb_storage::request_scope::with_scope(
         request_scope_for(&request_id, &operation, &headers),
-        serve_request(&state, &headers, &body, peer_addr, &operation, input),
+        serve_request(
+            &state,
+            &headers,
+            &body,
+            peer_addr,
+            &request_id,
+            &operation,
+            input,
+        ),
     )
     .await;
     let mut record = abandon_guard.as_mut().and_then(AbandonGuard::disarm);
     let Served {
         account_id,
         table_name,
+        metric_table,
         partition_value,
         dispatch_result,
         auth_us,
@@ -165,6 +193,7 @@ pub(crate) async fn handle_request(
 
     // --- Response segment ---
     let response_start = std::time::Instant::now();
+    let mut succeeded = false;
     let mut record_error_type = None;
     let response = match dispatch_result {
         Ok(result) => {
@@ -175,13 +204,22 @@ pub(crate) async fn handle_request(
                 table_name.as_deref(),
                 &result.body,
             );
+            // A batch a backend served partially is a throttle the server's own
+            // bucket never saw; count it so the metrics do not read as zero.
+            record_partial_batch_throttle(
+                &state.metrics,
+                &account_id,
+                &operation,
+                &result.metrics.throttled_tables,
+            );
 
             let m = &result.metrics;
-            if let Some(ref tn) = table_name {
+            if let Some(ref tn) = metric_table {
                 if m.read_capacity_units > 0.0 {
                     state.metrics.record(
                         extenddb_core::metrics::MetricName::ConsumedReadCapacityUnits,
                         m.read_capacity_units,
+                        Some(&account_id),
                         Some(tn),
                         m.index_name.as_deref(),
                         Some(&operation),
@@ -191,21 +229,32 @@ pub(crate) async fn handle_request(
                     state.metrics.record(
                         extenddb_core::metrics::MetricName::ConsumedWriteCapacityUnits,
                         m.write_capacity_units,
+                        Some(&account_id),
                         Some(tn),
                         m.index_name.as_deref(),
                         Some(&operation),
                     );
                 }
                 if m.returned_item_count > 0 {
-                    state
-                        .metrics
-                        .record_returned_items(tn, &operation, m.returned_item_count);
+                    state.metrics.record_returned_items(
+                        &account_id,
+                        tn,
+                        &operation,
+                        m.returned_item_count,
+                    );
                 }
                 if m.returned_bytes > 0 {
-                    state
-                        .metrics
-                        .record_returned_bytes(tn, &operation, m.returned_bytes);
+                    state.metrics.record_returned_bytes(
+                        &account_id,
+                        tn,
+                        &operation,
+                        m.returned_bytes,
+                    );
                 }
+            }
+            // Throttle buckets stay keyed by the name the request sent, which
+            // is the name they were registered under above.
+            if let Some(ref tn) = table_name {
                 state.throttle.consume_with_partition(
                     &account_id,
                     tn,
@@ -215,10 +264,17 @@ pub(crate) async fn handle_request(
                 );
             }
 
+            succeeded = true;
             success_response(&result.body, &request_id)
         }
         Err(e) => {
-            record_error_metrics(&state.metrics, &e, table_name.as_deref(), &operation);
+            record_error_metrics(
+                &state.metrics,
+                &e,
+                &account_id,
+                metric_table.as_deref(),
+                &operation,
+            );
             if observing {
                 record_error_type = Some(e.error_type().to_owned());
             }
@@ -231,13 +287,18 @@ pub(crate) async fn handle_request(
     // Record per-segment latency breakdown and total latency.
     #[allow(clippy::cast_precision_loss)]
     let total_us = handler_start.elapsed().as_micros() as f64;
-    state
-        .metrics
-        .record_latency(table_name.as_deref(), &operation, total_us);
-    state.metrics.record_request_count(&operation);
+    // `SuccessfulRequestLatency` counts successful requests only, as
+    // CloudWatch's does.
+    if succeeded {
+        state
+            .metrics
+            .record_latency(&account_id, metric_table.as_deref(), &operation, total_us);
+    }
+    state.metrics.record_request_count(&account_id, &operation);
     state.metrics.record_segments(
+        &account_id,
         &operation,
-        table_name.as_deref(),
+        metric_table.as_deref(),
         extenddb_core::metrics::LatencySegments {
             auth_us,
             authz_us,
@@ -325,6 +386,7 @@ struct Refused {
 struct Served {
     account_id: Arc<str>,
     table_name: Option<String>,
+    metric_table: Option<String>,
     partition_value: Option<String>,
     dispatch_result: Result<extenddb_engine::DispatchResult, DynamoDbError>,
     auth_us: f64,
@@ -345,6 +407,7 @@ async fn serve_request(
     headers: &HeaderMap,
     body: &Bytes,
     peer_addr: std::net::SocketAddr,
+    request_id: &str,
     operation: &str,
     input: Value,
 ) -> Result<Served, Refused> {
@@ -368,9 +431,28 @@ async fn serve_request(
         }
     };
 
+    // Point-in-time recovery is not in this release: a restore and an enable
+    // are refused here, for every caller and before any table is read, where
+    // the service would authorize them first.
+    if let Some(e) = extenddb_engine::refuse_point_in_time_recovery(operation, &input) {
+        tracing::warn!(
+            request_id = %request_id,
+            operation = %operation,
+            principal = crate::authz_resource::cross_account::principal_arn(&identity),
+            "Point-in-time recovery refused"
+        );
+        record_error_metrics(&state.metrics, &e, &account_id, None, operation);
+        state.metrics.record_request_count(&account_id, operation);
+        return Err(Refused {
+            error: e,
+            account_id: Some(account_id.to_string()),
+        });
+    }
+
     // --- Authz segment ---
     let authz_start = std::time::Instant::now();
     let authorized_key_info;
+    let item_authorizer;
     {
         if state.catalog_store.is_none() {
             tracing::error!("Authorization required but catalog_store is not configured");
@@ -403,6 +485,9 @@ async fn serve_request(
             error,
             account_id: Some(account_id.to_string()),
         })?;
+        // The engine authorizes each PartiQL statement through it.
+        item_authorizer =
+            crate::item_authz::for_request(state, identity, &account_id, source_ip, user_agent);
     }
     #[allow(clippy::cast_precision_loss)]
     let authz_us = authz_start.elapsed().as_micros() as f64;
@@ -410,6 +495,7 @@ async fn serve_request(
     // Dispatch
     let ctx = OperationContext {
         storage: state.storage.clone(),
+        backup: state.backup_runtime.clone(),
         limits: state.limits.clone(),
         region: state.region.clone(),
         account_id,
@@ -420,9 +506,15 @@ async fn serve_request(
         table_key_info_lookup: Some(
             state.table_key_info_cache.clone() as Arc<dyn extenddb_storage::TableKeyInfoLookup>
         ),
+        item_authorizer: Some(item_authorizer),
     };
 
     let table_name = extract_table_name(&input);
+    // The table the metrics are recorded under: the request's `TableName` only
+    // when the operation acts on the table it names and the name passes the
+    // table name rules, with a table ARN reduced to its name. See
+    // `metric_table_name`.
+    let metric_table = metric_table_name(operation, &input, &state.limits);
 
     // --- Throttle segment ---
     let throttle_start = std::time::Instant::now();
@@ -465,13 +557,19 @@ async fn serve_request(
             } else {
                 extenddb_core::metrics::MetricName::WriteThrottleEvents
             };
-            state
-                .metrics
-                .record(metric, 1.0, Some(tn), None, Some(operation));
+            state.metrics.record(
+                metric,
+                1.0,
+                Some(&ctx.account_id),
+                metric_table.as_deref(),
+                None,
+                Some(operation),
+            );
             state.metrics.record(
                 extenddb_core::metrics::MetricName::ThrottledRequests,
                 1.0,
-                Some(tn),
+                Some(&ctx.account_id),
+                metric_table.as_deref(),
                 None,
                 Some(operation),
             );
@@ -530,6 +628,7 @@ async fn serve_request(
     Ok(Served {
         account_id: ctx.account_id,
         table_name,
+        metric_table,
         partition_value,
         dispatch_result,
         auth_us,

@@ -510,11 +510,11 @@ event with `userIdentity.type: Service` — proving the deletion was automatic.
 Verify that extenddb is recording operational metrics:
 
 ```bash
-# Request counts and latencies
-curl -s --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:**18443**/metrics | python3 -m json.tool
+# Request counts and latencies (admin credentials required)
+curl -s --cacert ~/.extenddb/tls/cert.pem -u "admin:$EXTENDDB_ADMIN_PASSWORD" https://127.0.0.1:18443/metrics | python3 -m json.tool
 
-# Management console metrics (open in browser)
-echo "Open: https://127.0.0.1:**18443**/console/metrics"
+# Management console metrics (open in a browser and log in as the admin user)
+echo "Open: https://127.0.0.1:18443/console/metrics"
 ```
 
 You should see non-zero counts for:
@@ -741,7 +741,7 @@ aws dynamodb describe-table --table-name Tickets | jq '{
 ## 23. Final metrics check
 
 ```bash
-curl -s --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/metrics | python3 -c "
+curl -s --cacert ~/.extenddb/tls/cert.pem -u "admin:$EXTENDDB_ADMIN_PASSWORD" https://127.0.0.1:18443/metrics | python3 -c "
 import json, sys
 m = json.load(sys.stdin)
 print('=== extenddb Metrics Summary ===')
@@ -814,3 +814,14 @@ rm -rf /tmp/extenddb-exports
 | Reservation TTL | 120 seconds | 900 seconds (15 min) |
 | Streams polling interval | 1 second | 1–5 seconds |
 | Export path | `/tmp/extenddb-exports` | `/var/lib/extenddb/exports` |
+
+---
+
+## License
+
+Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
+See [LICENSE](../../LICENSE) for the full text.
+
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

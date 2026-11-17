@@ -20,9 +20,8 @@ pub const INDEX_PROPAGATION_DELAY_MS: &str = "index_propagation_delay_ms";
 /// The pre-rename name of [`INDEX_PROPAGATION_DELAY_MS`], still honoured.
 ///
 /// Two reasons this cannot simply be deleted. A catalog created before the rename
-/// holds the operator's value under the old name, and the server refuses to start on
-/// a catalog-version mismatch rather than migrating, so there is no upgrade step in
-/// which the row could be rewritten. Silently reading past that row would reset a
+/// holds the operator's value under the old name, and no catalog migration rewrites
+/// that row yet, though one could. Silently reading past that row would reset a
 /// deliberately configured delay to the default, and a delay of 0 means synchronous,
 /// so the silent change would be from strict to eventually consistent.
 ///
@@ -100,23 +99,6 @@ pub const VECTOR_INDEX_MIN_CREATING_MS: &str = "vector_index_min_creating_ms";
 ///
 /// Unset, nothing waits and no branch is taken.
 pub const VECTOR_ALLOCATION_PHASE_DELAY_MS: &str = "vector_allocation_phase_delay_ms";
-
-/// Marker recording that the resource-tag condition-key migration has run on
-/// this catalog, or that the catalog was created after the migration existed
-/// and so has nothing to rewrite.
-///
-/// `extenddb migrate --yes` writes it after rewriting every stored policy from
-/// `dynamodb:ResourceTag/*` to `aws:ResourceTag/*` with no storage errors;
-/// `init` and every fresh-catalog bootstrap write it on a new catalog. `serve`
-/// reads this one row at startup and refuses to start when it is absent, naming
-/// `extenddb migrate --yes`, so a pre-migration catalog is never served under
-/// the new evaluator (which leaves `dynamodb:ResourceTag/*` absent). The value
-/// is informational; presence of the key is the signal.
-pub const RESOURCE_TAG_MIGRATION: &str = "resource_tag_migration";
-
-/// The value written for [`RESOURCE_TAG_MIGRATION`] when the migration is
-/// complete.
-pub const RESOURCE_TAG_MIGRATION_DONE: &str = "applied";
 
 /// Resolve a caller-supplied settings key to its canonical name.
 ///

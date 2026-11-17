@@ -14,7 +14,8 @@ use serde::Deserialize;
 use crate::console::ConsoleState;
 use crate::console::html;
 
-use super::{CsrfOnly, identity_label, is_admin, op_error_message, require_csrf, require_session};
+use super::account_scope::require_account_session;
+use super::{CsrfOnly, identity_label, is_admin, op_error_message, require_csrf};
 
 // ── User policies ──────────────────────────────────────────────────────
 
@@ -190,7 +191,7 @@ async fn policy_form(
     principal_type: &str,
     principal_name: &str,
 ) -> Response {
-    let session = match require_session(headers, state).await {
+    let session = match require_account_session(headers, state, account_id).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -256,7 +257,7 @@ async fn put_policy(
     form: PolicyForm,
     redirect_url: &str,
 ) -> Response {
-    let session = match require_session(headers, state).await {
+    let session = match require_account_session(headers, state, account_id).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -265,6 +266,24 @@ async fn put_policy(
     }
     if let Err(r) = require_csrf(&form.csrf, &session) {
         return r;
+    }
+
+    // Same name rule as the management API (`management::iam_policy::put_policy`).
+    if !crate::management::is_valid_iam_name(&form.policy_name) {
+        let nav = html::nav_bar(&identity_label(&session.identity));
+        let content = format!(
+            "<h1>Add Policy</h1>{}",
+            html::alert_error(
+                "policy_name must be 1-128 characters: alphanumeric, hyphens, underscores, dots, plus, equals, at"
+            )
+        );
+        return Html(html::layout_csrf(
+            "New Policy",
+            &nav,
+            &content,
+            &session.csrf_token,
+        ))
+        .into_response();
     }
 
     // Validate JSON.
@@ -307,17 +326,29 @@ async fn put_policy(
         .into_response();
     }
 
-    match state
-        .catalog_store
-        .put_policy(
-            account_id,
-            principal_type,
-            principal_name,
-            &form.policy_name,
-            &doc,
-        )
-        .await
+    let stored = match crate::management::require_principal(
+        &*state.catalog_store,
+        account_id,
+        principal_type,
+        principal_name,
+    )
+    .await
     {
+        Ok(()) => {
+            state
+                .catalog_store
+                .put_policy(
+                    account_id,
+                    principal_type,
+                    principal_name,
+                    &form.policy_name,
+                    &doc,
+                )
+                .await
+        }
+        Err(e) => Err(e),
+    };
+    match stored {
         Ok(()) => {
             invalidate_policy_caches(state, account_id, principal_type, principal_name).await;
             Redirect::to(redirect_url).into_response()
@@ -351,7 +382,7 @@ async fn delete_policy(
     redirect_url: &str,
     csrf_token: &str,
 ) -> Response {
-    let session = match require_session(headers, state).await {
+    let session = match require_account_session(headers, state, account_id).await {
         Ok(s) => s,
         Err(r) => return r,
     };
