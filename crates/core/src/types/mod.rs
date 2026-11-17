@@ -6,6 +6,8 @@ mod batch;
 mod capacity;
 mod import_export;
 mod item;
+#[cfg(test)]
+mod json_null_tests;
 mod key_schema;
 mod query;
 mod stream;

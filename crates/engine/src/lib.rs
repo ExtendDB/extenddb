@@ -222,6 +222,7 @@ pub(crate) fn deserialize_error(e: serde_json::Error) -> DynamoDbError {
         || msg.contains("AttributeValue is empty")
         || msg.contains("AttributeValue has more than one datatypes set")
         || msg.contains("parameter values were invalid")
+        || msg == extenddb_core::serde_helpers::EMPTY_ATTRIBUTE_NAME
     {
         DynamoDbError::ValidationException(msg)
     } else {
