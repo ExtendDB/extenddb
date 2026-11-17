@@ -44,6 +44,8 @@ mod read_helpers;
 mod request_limits;
 mod scan;
 mod search_vectors;
+#[cfg(test)]
+mod service_error_log_tests;
 mod start_key;
 pub mod stream_capture;
 mod streams;
@@ -180,7 +182,12 @@ pub(crate) fn serialize_output(
 ///
 /// Use this for storage calls that don't go through `storage_err_to_dynamo`
 /// (e.g., tagging, metadata operations that return `StorageError` directly).
+/// A [`StorageError::Service`] error is the backend's own classification of
+/// the failure and reaches the client unchanged, without the fault log line.
 pub(crate) fn sanitize_storage_error(e: extenddb_storage::error::StorageError) -> DynamoDbError {
+    if let extenddb_storage::error::StorageError::Service(e) = e {
+        return e;
+    }
     tracing::error!(internal_error = %e, "storage internal error");
     DynamoDbError::InternalServerError("Internal server error".to_owned())
 }
@@ -354,6 +361,10 @@ pub struct DispatchMetrics {
     /// GSI/LSI name when the operation targets a secondary index.
     /// Used to attribute metrics to the specific index.
     pub index_name: Option<String>,
+    /// The tables of a batch that answered 200 with requests or keys a
+    /// backend throttled left unprocessed, by table name, once each. The
+    /// server records a throttle for each: its own bucket never saw them.
+    pub throttled_tables: Vec<String>,
 }
 
 /// Result of an engine dispatch: the JSON response body plus sideband metrics.
@@ -592,5 +603,42 @@ pub async fn dispatch(
         #[cfg(feature = "partiql")]
         "ExecuteTransaction" => ctx.execute_transaction(body).await,
         _ => Err(DynamoDbError::UnknownOperationException(String::new())),
+    }
+}
+
+#[cfg(test)]
+mod sanitize_storage_error_tests {
+    use super::sanitize_storage_error;
+    use extenddb_core::error::DynamoDbError;
+    use extenddb_storage::error::StorageError;
+
+    // The metadata and tagging paths map through this function; a
+    // backend-classified error keeps its variant and message there too.
+    #[test]
+    fn service_error_passes_through() {
+        let err = sanitize_storage_error(StorageError::Service(DynamoDbError::ServiceUnavailable(
+            "retry shortly".to_owned(),
+        )));
+        match err {
+            DynamoDbError::ServiceUnavailable(msg) => assert_eq!(msg, "retry shortly"),
+            other => panic!("expected ServiceUnavailable, got {other:?}"),
+        }
+    }
+
+    // Control: every other variant is still redacted behind the fixed string.
+    #[test]
+    fn other_variants_are_redacted() {
+        for e in [
+            StorageError::Internal("driver text".to_owned()),
+            StorageError::Connection("host unreachable".to_owned()),
+            StorageError::Transient("pool timeout".to_owned()),
+        ] {
+            match sanitize_storage_error(e) {
+                DynamoDbError::InternalServerError(msg) => {
+                    assert_eq!(msg, "Internal server error");
+                }
+                other => panic!("expected InternalServerError, got {other:?}"),
+            }
+        }
     }
 }

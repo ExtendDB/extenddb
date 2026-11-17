@@ -98,6 +98,7 @@ Key design decisions:
 - **Items** are `BTreeMap<String, AttributeValue>`. A new backend must handle the full `AttributeValue` type (S, N, B, SS, NS, BS, L, M, BOOL, NULL).
 - **Query** must support forward/reverse sort order, exclusive start key pagination, and routing to secondary index storage.
 - **Parallel scan** uses `segment` and `total_segments` to partition the keyspace.
+- **Errors**: return the named `StorageError` variant for every condition the engine maps (`TableNotFound`, `ConditionFailed`, `TransactionCanceled`, `Validation`, `Unsupported`, `Transient` and the rest); the engine chooses the client-facing message and redacts anything it does not recognise behind a fixed `InternalServerError`. When the backend can classify its own failure into a service error class with a message of its own (a hosted database reporting a documented unavailability or capacity condition), return `StorageError::Service(DynamoDbError)`: the engine passes it to the client with its variant and message unchanged and does not log it as a storage fault (a conditional check error carries its item only when the request asked for `ALL_OLD`, as with the engine's own). That message crosses the wire verbatim, so it must be service-shaped text with no driver output, host names, connection strings or credentials. A failure the backend cannot classify stays `Internal`.
 
 ### MetadataEngine
 

@@ -6,6 +6,51 @@
 use super::*;
 use extenddb_storage::error::StorageError;
 
+// A backend-classified error reaches the client unchanged through the
+// UpdateTable mapper, keeping both its variant and its message.
+
+#[test]
+fn service_service_unavailable_passes_through() {
+    let err = update_table_err_to_dynamo(
+        StorageError::Service(DynamoDbError::ServiceUnavailable(
+            "retry shortly".to_owned(),
+        )),
+        "t",
+    );
+    match err {
+        DynamoDbError::ServiceUnavailable(msg) => assert_eq!(msg, "retry shortly"),
+        other => panic!("expected ServiceUnavailable, got {other:?}"),
+    }
+}
+
+#[test]
+fn service_capacity_error_passes_through() {
+    let err = update_table_err_to_dynamo(
+        StorageError::Service(DynamoDbError::provisioned_throughput_exceeded(
+            "capacity",
+            vec![],
+        )),
+        "t",
+    );
+    match err {
+        DynamoDbError::ProvisionedThroughputExceededException { message, .. } => {
+            assert_eq!(message, "capacity");
+        }
+        other => panic!("expected ProvisionedThroughputExceededException, got {other:?}"),
+    }
+}
+
+// Control: an unclassified driver error is still redacted behind the fixed
+// string, with the driver text absent from the client message.
+#[test]
+fn internal_driver_text_is_redacted() {
+    let err = update_table_err_to_dynamo(StorageError::Internal("driver text".to_owned()), "t");
+    match err {
+        DynamoDbError::InternalServerError(msg) => assert_eq!(msg, "Internal server error"),
+        other => panic!("expected InternalServerError, got {other:?}"),
+    }
+}
+
 /// Measured 2026-10-24: a stream change beside a billing or throughput
 /// change, beside an index create or delete, or beside a deletion protection
 /// change is refused with its own sentence; alone it is not.

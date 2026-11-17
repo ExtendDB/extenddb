@@ -17,6 +17,13 @@ fn conflict() -> StorageError {
     StorageError::TransactionConflict("held".to_owned())
 }
 
+fn throttle() -> StorageError {
+    StorageError::Service(DynamoDbError::provisioned_throughput_exceeded(
+        extenddb_core::error::PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE,
+        vec![],
+    ))
+}
+
 /// A failed request does not stop the ones after it. The service answered 200
 /// with only the held item's request unprocessed and the other request applied
 /// whichever came first (the neighbouring test has the held item second).
@@ -29,6 +36,8 @@ async fn a_failed_first_request_does_not_stop_the_rest() {
 
     assert_eq!(out.body["UnprocessedItems"], json!({"t": [put("held")]}));
     assert_eq!(data.writes(), ["t/held", "t/side"]);
+    // A held item is no throttle: the server records none for the batch.
+    assert!(out.metrics.throttled_tables.is_empty());
 }
 
 /// UnprocessedItems holds exactly the requests that failed, per table, and the
@@ -67,21 +76,27 @@ async fn unprocessed_items_hold_only_the_failed_requests_and_capacity_the_applie
 /// A batch of which no request applied is an error, not a 200 whose client
 /// replays it at full speed. Every request is tried first. The service
 /// answered 500 InternalServerError for such a batch; this server answers 503,
-/// which the SDKs retry with backoff.
+/// which the SDKs retry with backoff. A throttle beside a failure of another
+/// kind answers 503 too: only a batch of which every request was throttled
+/// answers the throttle error.
 #[tokio::test]
 async fn a_batch_where_nothing_applied_answers_503_after_trying_every_request() {
-    for failure in [transient(), conflict()] {
-        let data = Scripted::new(vec![Err(failure.clone()), Err(failure.clone())]);
+    for (first, second) in [
+        (transient(), transient()),
+        (conflict(), conflict()),
+        (throttle(), conflict()),
+    ] {
+        let data = Scripted::new(vec![Err(first.clone()), Err(second.clone())]);
         let items = json!({"t": [put("a"), put("b")]});
 
         let err = rejected(run(&data, items, &["t"], found(&["t"])).await);
 
         assert!(
             matches!(err, DynamoDbError::ServiceUnavailable(_)),
-            "{failure:?} gave {err:?}"
+            "{first:?}, {second:?} gave {err:?}"
         );
         assert_eq!(err.status_code(), 503);
-        assert_eq!(data.writes(), ["t/a", "t/b"], "{failure:?}");
+        assert_eq!(data.writes(), ["t/a", "t/b"], "{first:?}, {second:?}");
     }
 }
 

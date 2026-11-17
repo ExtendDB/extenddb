@@ -361,7 +361,7 @@ fn projected_after_gsi_updates(
 /// yet returns `Unsupported` or `IndexesInUse` from `update_table`, and the
 /// vector capability gate refuses vector requests before the backend is called
 /// at all, so a wire test cannot provoke either one today.
-fn update_table_err_to_dynamo(
+pub(crate) fn update_table_err_to_dynamo(
     e: extenddb_storage::error::StorageError,
     table_name: &str,
 ) -> DynamoDbError {
@@ -391,6 +391,10 @@ fn update_table_err_to_dynamo(
         // request. The backend supplies the whole message because only it knows
         // the state.
         StorageError::IndexesInUse(msg) => DynamoDbError::ResourceInUseException(msg),
+        // The backend already classified this failure into the service error
+        // vocabulary and chose the client-facing message. Pass it through
+        // unchanged; it is not a storage fault, so it is not logged as one.
+        StorageError::Service(e) => e,
         other => {
             tracing::error!(internal_error = %other, "storage internal error");
             DynamoDbError::InternalServerError("Internal server error".to_owned())

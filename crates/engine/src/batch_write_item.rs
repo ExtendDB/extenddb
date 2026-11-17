@@ -172,7 +172,12 @@ async fn write_batch(
     // item answered 200 with that request in UnprocessedItems and the other
     // request applied, whichever came first. So every request is tried, and
     // the answer to one contended request does not depend on where it sat in
-    // the batch.
+    // the batch. A request the backend throttled is deferred the same way and
+    // echoed as sent (measured for PutRequest on an on-demand table,
+    // 2026-10-20: 18 of 80 batches returned 200 with 6 to 24 of 25 entries
+    // unprocessed; DeleteRequest documented, not measured). The service's
+    // lists came back in neither request nor sorted order; this server keeps
+    // request order.
     //
     // A batch of which no request applied is an error. The same measurement
     // answered 500 InternalServerError for batches whose requests were all on
@@ -181,7 +186,13 @@ async fn write_batch(
     // retry with backoff, so a client's UnprocessedItems loop cannot spin on a
     // batch that makes no progress. Each failed request spends its own retry
     // budget first, so a batch of 25 contended requests can spend 25 budgets
-    // before it answers.
+    // before it answers. When every request of the batch was throttled, the
+    // batch answers the first throttle error instead, with its
+    // ThrottlingReasons: the API reference documents
+    // ProvisionedThroughputExceededException or ThrottlingException for a
+    // batch that cannot process any item because of throttling (documented,
+    // not measured). A batch with nothing applied in which a request was
+    // deferred for another reason answers 503.
     //
     // The request faults the same page lists reject the whole batch before
     // anything is written. `check_batch` finds a missing table, a key that
@@ -202,6 +213,10 @@ async fn write_batch(
     // The error of the last request that was not applied, for the warning
     // logged once per batch below.
     let mut last_error = String::new();
+    // How many requests the backend throttled, and the first throttle error.
+    let mut throttled_count: usize = 0;
+    let mut first_throttle: Option<DynamoDbError> = None;
+    let mut throttled_tables: Vec<String> = Vec::new();
 
     'tables: for (table_index, ((table_name, reqs), key_info)) in
         tables.iter().zip(&key_infos).enumerate()
@@ -279,6 +294,17 @@ async fn write_batch(
                         }
                         break 'tables;
                     }
+                    // `is_deferrable` takes a `Service` error only when it is
+                    // a throttle.
+                    if let StorageError::Service(e) = e {
+                        throttled_count += 1;
+                        if first_throttle.is_none() {
+                            first_throttle = Some(e);
+                        }
+                        if !throttled_tables.contains(&key_info.table_name) {
+                            throttled_tables.push(key_info.table_name.clone());
+                        }
+                    }
                     unprocessed
                         .entry(table_name.to_owned())
                         .or_default()
@@ -319,7 +345,10 @@ async fn write_batch(
 
     if !unprocessed.is_empty() {
         let not_applied: usize = unprocessed.values().map(Vec::len).sum();
-        let outcome = if applied == 0 {
+        let all_throttled = throttled_count == not_applied;
+        let outcome = if applied == 0 && all_throttled {
+            "every request was throttled and the batch answers the first throttle error"
+        } else if applied == 0 {
             "no request applied and the batch answers 503"
         } else {
             "they are returned in UnprocessedItems"
@@ -331,6 +360,11 @@ async fn write_batch(
             "BatchWriteItem: {not_applied} request(s) of the batch not applied; {outcome}"
         );
         if applied == 0 {
+            if let Some(e) = first_throttle
+                && all_throttled
+            {
+                return Err(e);
+            }
             return Err(DynamoDbError::ServiceUnavailable(
                 "Service is temporarily unavailable".to_owned(),
             ));
@@ -370,10 +404,17 @@ async fn write_batch(
     let output = BatchWriteItemOutput {
         unprocessed_items: unprocessed,
         consumed_capacity,
-        item_collection_metrics: if all_icm.is_empty() {
-            None
-        } else {
+        // The service answers a SIZE request with the field present even when
+        // no written item belongs to an item collection: 13 of 13 fully
+        // processed batches on a table without a local secondary index carried
+        // "ItemCollectionMetrics": {} (measured 2026-10-21). Without SIZE the
+        // field is absent.
+        item_collection_metrics: if input.return_item_collection_metrics
+            == ReturnItemCollectionMetrics::Size
+        {
             Some(all_icm)
+        } else {
+            None
         },
     };
     let body = serialize_output(&output)?;
@@ -381,6 +422,7 @@ async fn write_batch(
         body,
         metrics: DispatchMetrics {
             write_capacity_units: wcu,
+            throttled_tables,
             ..Default::default()
         },
     })
@@ -400,6 +442,11 @@ async fn write_batch(
 /// not cleared by replaying the request, and a client's UnprocessedItems loop
 /// would spin on it. An internal error keeps answering HTTP 500, which is
 /// what it answered before this handler deferred anything.
+///
+/// A `Service` error that carries a throttle error (`is_throttle`) is
+/// deferred as well: the backend throttled the request, which is the first
+/// cause of UnprocessedItems the documentation lists. Every other `Service`
+/// error fails the batch with that error.
 ///
 /// The handler assumes that a deferred request was not applied. The client
 /// replays it, and the replay of a request that had committed would apply it
@@ -424,7 +471,7 @@ fn is_deferrable(e: &StorageError) -> bool {
         StorageError::TransactionConflict(_)
             | StorageError::Transient(_)
             | StorageError::Connection(_)
-    )
+    ) || matches!(e, StorageError::Service(e) if e.is_throttle())
 }
 
 /// The requests from `tables[table_index][request_index]` on, in batch order:
