@@ -206,10 +206,10 @@ pub fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> Dynamo
         }
         StorageError::Validation(msg) => DynamoDbError::ValidationException(msg),
         StorageError::NoOpUpdate(msg) => DynamoDbError::ValidationException(msg),
-        StorageError::IdempotentReplay | StorageError::IdempotentMismatch => {
+        e @ (StorageError::IdempotentReplay | StorageError::IdempotentMismatch) => {
             // These are handled directly by the transact_write_items caller.
             // If they reach here, it's a programming error.
-            tracing::error!("Unexpected idempotency error in generic error handler");
+            log_storage_fault!(e, "Unexpected idempotency error in generic error handler");
             DynamoDbError::InternalServerError("Internal server error".to_owned())
         }
         StorageError::TransactionConflict(msg) => {
@@ -226,7 +226,7 @@ pub fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> Dynamo
             // Log the raw message for debugging but do not expose storage
             // backend details (e.g. PostgreSQL error text) to the client.
             // REQ-ERR: tenet 4 — only DynamoDB-shaped errors cross the wire.
-            tracing::error!(internal_error = %msg, "storage internal error");
+            log_storage_fault!(msg, "storage internal error");
             DynamoDbError::InternalServerError("Internal server error".to_owned())
         }
         // The backend already classified this failure into the service error

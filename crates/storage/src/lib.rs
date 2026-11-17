@@ -29,6 +29,7 @@ pub mod migrations;
 pub mod operations;
 pub mod password;
 pub mod policy_migration;
+pub mod request_scope;
 pub mod restore_engine;
 pub mod secret_cipher;
 pub mod server_components;
@@ -52,6 +53,7 @@ pub use backup_catalog::{
 pub use backup_definition::{
     BackupRestoreSource, RestoreRequest, RestoreSource, RestoreTableOverrides,
 };
+pub use request_scope::RequestScope;
 pub use restore_engine::{BulkLoadFile, Finished, RestoreEngine};
 pub use snapshot::{SnapshotEngine, SnapshotInfo, TableSnapshot};
 
