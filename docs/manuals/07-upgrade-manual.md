@@ -380,6 +380,32 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
+### v0.1.15: Cassandra `serve` warns of keyspaces at another replication
+
+**What changed.** At start-up, `serve` compares the replication of each of the
+deployment's keyspaces with `replication_factor` and `datacenter` in
+`[storage.cassandra]`. It logs a warning for each keyspace that differs, and
+starts anyway. A `[storage.cassandra]` section with no `replication_factor`
+line still means 3, so `serve` warns about each keyspace that `init` created
+at another replication factor; add the line with the keyspaces' replication
+factor.
+
+**Deployments that v0.1.14 `init --overwrite` created.** v0.1.14 `init
+--overwrite` created the catalog keyspace and the default account's keyspace
+at the `replication_factor` in the file, and then wrote
+`replication_factor = 1` to the file. Each account created after that got a
+keyspace at 1. On such a deployment, `serve` warns about the catalog keyspace
+and the default account's keyspace. To fix it:
+
+1. Stop every ExtendDB server of the deployment.
+2. Set `replication_factor` in `extenddb.toml` to the catalog keyspace's
+   replication factor. `DESCRIBE KEYSPACE <keyspace_prefix>_catalog` in
+   `cqlsh` shows it.
+3. Run `ALTER KEYSPACE` on each account keyspace at 1, to the same
+   replication factor (see "Keyspace replication" in
+   [cassandra-setup.md](../cassandra-setup.md)).
+4. Run `nodetool repair -full` on each node, then start the servers.
+
 ### v0.1.15: a deleted principal or account leaves nothing behind
 
 **What changed.** Deleting a user, group, role or account now removes
@@ -791,18 +817,19 @@ effect where it was previously bypassed.
 
 **Who is affected and what to change** (no catalog migration is required):
 
-- **Index reads need an index grant.** Query and Scan with an `IndexName` are
-  authorized against `table/<name>/index/<index>`. A policy granting only
-  `table/<name>` no longer allows that table's index reads; grant
-  `table/<name>/index/<index>` or `table/<name>/index/*`.
-- **Fencing a whole table with a Deny.** Index reads, `ListStreams` with a
+- **Index reads need an index grant.** Query and Scan with an `IndexName`, and
+  SearchVectors, are authorized against `table/<name>/index/<index>`. A policy
+  granting only `table/<name>` no longer allows that table's index reads or
+  SearchVectors; grant `table/<name>/index/<index>` or `table/<name>/index/*`.
+- **Fencing a whole table with a Deny.** Index reads, SearchVectors,
+  `ListStreams` with a
   TableName, and `ListBackups` with a TableName are authorized against a
   sub-resource ARN (`table/<name>/index/*`, `table/<name>/stream/*`,
   `table/<name>/backup/*`), not the bare `table/<name>`. A `Deny` on
-  `table/<name>` does not cover them: add `table/<name>/*` to the `Deny`
+  `table/<name>` does not cover them, so it no longer blocks SearchVectors: add `table/<name>/*` to the `Deny`
   alongside `table/<name>` to fence the whole table.
-- **Index reads and resource tags.** An index Query or Scan evaluates the base
-  table's resource tags, because an index inherits its table's tags. An ABAC
+- **Index reads and resource tags.** An index Query or Scan, and SearchVectors,
+  evaluate the base table's resource tags, because an index inherits its table's tags. An ABAC
   `Deny` or `Allow` conditioned on the table's tags now applies to its indexes.
 - **ListStreams, ListBackups, and resource tags.** ListStreams and ListBackups
   with a TableName are authorized against the table's `stream/*` or `backup/*`

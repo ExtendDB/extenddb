@@ -365,7 +365,7 @@ async fn refresh_failure_does_not_evict_stale_entry() {
 async fn lru_eviction_caps_size_at_max_entries() {
     let (loader, _) = CountingLoader::new();
     let config = SwrCacheConfig {
-        ttl: Duration::from_secs(60),
+        ttl: Duration::from_mins(1),
         soft_ttl: Duration::from_secs(30),
         negative_ttl: Duration::from_secs(5),
         max_entries: 4,
@@ -402,7 +402,7 @@ async fn invalidate_all_clears_every_entry() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn config_default_has_expected_values() {
     let cfg = SwrCacheConfig::default();
-    assert_eq!(cfg.ttl, Duration::from_secs(60));
+    assert_eq!(cfg.ttl, Duration::from_mins(1));
     assert_eq!(cfg.soft_ttl, Duration::from_secs(30));
     assert_eq!(cfg.negative_ttl, Duration::from_secs(5));
     assert_eq!(cfg.max_entries, 10_000);
@@ -668,7 +668,7 @@ async fn panicking_refresh_does_not_leak_inflight_flag() {
     let cache = SwrCache::new(
         loader,
         SwrCacheConfig {
-            ttl: Duration::from_secs(60),
+            ttl: Duration::from_mins(1),
             ..fast_config()
         },
     );

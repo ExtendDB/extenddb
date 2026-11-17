@@ -708,6 +708,7 @@ DynamoDB. The `Resource` element of a policy is matched field by field, and a
 |-----------|-------------------------|
 | Item and table operations (GetItem, PutItem, Query and Scan on the base table, CreateTable, UpdateTable, DescribeTable, and so on) | `table/<name>` |
 | Query and Scan with an `IndexName` | `table/<name>/index/<index>` |
+| SearchVectors | `table/<name>/index/<index>` (the vector index searched) |
 | TagResource, UntagResource, ListTagsOfResource | the `ResourceArn` (a table or stream ARN) |
 | DescribeStream, GetShardIterator | the `StreamArn` |
 | GetRecords | the stream the shard iterator reads |
@@ -733,20 +734,25 @@ Earlier builds authorized several of these operations against
 `table/*` instead of the specific resource. Review existing policies before
 upgrading:
 
-- **Index reads.** Query and Scan with an `IndexName` are authorized against
-  `table/<name>/index/<index>`. A policy that granted a principal only
-  `table/<name>` no longer allows reads of that table's indexes. Grant
-  `table/<name>/index/<index>` or `table/<name>/index/*` as needed. This
-  matches DynamoDB.
-- **Fencing a whole table with a Deny.** Index reads, `ListStreams` with a
-  TableName, and `ListBackups` with a TableName are authorized against a
-  sub-resource ARN (`table/<name>/index/*`, `table/<name>/stream/*`,
-  `table/<name>/backup/*`), not the bare `table/<name>`. A `Deny` written only
-  on `table/<name>` therefore does not cover them. An operator who means to
-  fence a whole table adds `table/<name>/*` to the `Deny` alongside
+- **Index reads.** Query and Scan with an `IndexName`, and SearchVectors, are
+  authorized against `table/<name>/index/<index>`. A policy that granted a
+  principal only `table/<name>` no longer allows reads or searches of that
+  table's indexes. Grant `table/<name>/index/<index>` or
+  `table/<name>/index/*` as needed. This matches DynamoDB for Query and Scan.
+  For SearchVectors it follows the DynamoDB developer guide, which gives
+  `table/<name>/index/<index>` as the resource; it has not been measured
+  against the service.
+- **Fencing a whole table with a Deny.** Index reads, `SearchVectors`,
+  `ListStreams` with a TableName, and `ListBackups` with a TableName are
+  authorized against a sub-resource ARN (`table/<name>/index/*`,
+  `table/<name>/stream/*`, `table/<name>/backup/*`), not the bare
+  `table/<name>`. A `Deny` written only on `table/<name>` therefore does not
+  cover them, and `SearchVectors` needs the index ARN
+  (`table/<name>/index/<index>`) in the `Allow` as well. An operator who means
+  to fence a whole table adds `table/<name>/*` to the `Deny` alongside
   `table/<name>`.
-- **Index reads and resource tags.** An index Query or Scan evaluates the base
-  table's resource tags (`aws:ResourceTag/*`; `dynamodb:ResourceTag/*` is
+- **Index reads and resource tags.** An index Query or Scan, and SearchVectors,
+  evaluate the base table's resource tags (`aws:ResourceTag/*`; `dynamodb:ResourceTag/*` is
   absent for every resource),
   because a secondary index inherits the tags of its table. An ABAC `Deny` or
   `Allow` conditioned on the table's tags applies to its indexes.
