@@ -5,6 +5,7 @@
 
 use super::limits::Nest;
 use super::{LITERAL_ROOT, PResult, ParseError, Parser, forms, terms};
+use crate::expression::list_index_range_refusal;
 use crate::partiql::ast::{ArithOp, Operand, Path, PathStep};
 use crate::partiql::lexer::{TokenKind, WordClass, is_function_keyword, word_class};
 use crate::types::AttributeValue;
@@ -151,12 +152,14 @@ impl Parser {
     /// A reserved word there is a syntax error. Anything else parses and is
     /// refused once the statement parses, at its first token (measured
     /// 2026-11-05: `m[?]`, `m[1.5]`, `m[true]` and `m[-1.5]`, at the
-    /// number); a minus before a whole number is refused as an index out of
-    /// range, and empty brackets are a syntax error (measured 2026-11-06:
-    /// `m[]` in a condition, a SET target and ORDER BY). The step returned
-    /// for a refused content stands for it and is never used. In an inner
-    /// bracket and in an ORDER BY term the content is only read (see
-    /// [`Brackets`]).
+    /// number); a minus before a whole number, or a whole number above
+    /// 2147483647, is refused as an index out of range (measured 2026-11-17:
+    /// `l[2147483648]` in a condition, a SET target and the select list, and
+    /// `l[2147483647]` parses), and empty brackets are a syntax error
+    /// (measured 2026-11-06: `m[]` in a condition, a SET target and ORDER
+    /// BY). The step returned for a refused content stands for it and is
+    /// never used. In an inner bracket and in an ORDER BY term the content is
+    /// only read (see [`Brackets`]).
     fn bracket_step(&mut self) -> PResult<(PathStep, bool)> {
         let at = self.span();
         if self.path_starts_here() {
@@ -179,7 +182,11 @@ impl Parser {
             TokenKind::Number(n) => {
                 self.bump();
                 match n.parse::<usize>() {
-                    Ok(index) => Ok((PathStep::Index(index), true)),
+                    Ok(index) if i32::try_from(index).is_ok() => Ok((PathStep::Index(index), true)),
+                    Ok(_) => {
+                        self.defer_bracket(&format!("{} at {at}", list_index_range_refusal(&n)));
+                        Ok((PathStep::Index(0), true))
+                    }
                     Err(_) => Ok(self.refuse_bracket(&at)),
                 }
             }
@@ -212,7 +219,8 @@ impl Parser {
                 };
                 if n.bytes().all(|b| b.is_ascii_digit()) {
                     self.defer_bracket(&format!(
-                        "List index is not within the allowable range; index: [-{n}] at {at}"
+                        "{} at {at}",
+                        list_index_range_refusal(&format!("-{n}"))
                     ));
                     Ok((PathStep::Index(0), true))
                 } else {

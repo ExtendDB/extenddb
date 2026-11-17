@@ -624,6 +624,7 @@ fn parse_clauses(tokens: &[Token]) -> Result<Vec<RawClause>, DynamoDbError> {
             "Invalid KeyConditionExpression: unexpected token after key conditions",
         ));
     }
+    parser_common::check_list_indexes(tokens)?;
 
     // A key condition may only reference a top-level key attribute. Any document
     // path (`attr.sub` or `attr[i]`) on a key is rejected, matching Amazon

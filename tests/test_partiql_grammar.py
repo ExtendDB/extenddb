@@ -1102,6 +1102,7 @@ def test_a_member_in_brackets_and_after_a_dot_is_one_path(dynamodb_client, ctabl
         ("[MISSING]", "Unexpected path component", "MISSING"),
         ("[-1]", "List index is not within the allowable range; index: [-1]", "1"),
         ("[- 1]", "List index is not within the allowable range; index: [-1]", "1"),
+        ("[2147483648]", "List index is not within the allowable range; index: [2147483648]", "2147483648"),
         ("[-1.5]", "Unexpected path component", "1.5"),
         ("[k.j]", "Unexpected path component", "k"),
         ("[k[0]]", "Unexpected path component", "k"),

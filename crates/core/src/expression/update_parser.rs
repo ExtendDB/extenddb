@@ -107,6 +107,7 @@ pub fn parse_update(tokens: &[Token]) -> Result<Vec<UpdateAction>, DynamoDbError
         ));
     }
 
+    parser_common::check_list_indexes(tokens)?;
     Ok(actions)
 }
 
@@ -164,10 +165,11 @@ pub fn parse_update_from(
         ));
     }
 
+    parser_common::check_list_indexes(tokens)?;
     Ok(actions)
 }
 
-fn token_display_text(token: &Token) -> String {
+pub(super) fn token_display_text(token: &Token) -> String {
     match token {
         Token::Ident(s) => s.clone(),
         Token::NameRef(s) => format!("#{s}"),

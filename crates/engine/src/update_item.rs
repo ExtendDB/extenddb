@@ -20,7 +20,7 @@ use extenddb_core::types::{
 use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::{storage_err_to_dynamo, storage_err_to_dynamo_with_ccf};
-use crate::expression_helpers::resolve_condition;
+use crate::expression_helpers::{count_list_index_refusal, parse_update_expr, resolve_condition};
 use crate::serialize_output;
 use crate::stream_capture;
 use crate::{DispatchMetrics, DispatchResult};
@@ -184,7 +184,7 @@ pub(crate) async fn handle_update_item_with(
     // No UpdateExpression and no AttributeUpdates: no-op upsert.
     // Some("") still errors via parse_update_expr.
     let actions = if let Some(update_expr) = effective_update_expr.as_deref() {
-        crate::expression_helpers::parse_update_expr(update_expr, &ctx.limits)?
+        parse_update_expr(update_expr, &ctx.limits).map_err(count_list_index_refusal)?
     } else {
         Vec::new()
     };
