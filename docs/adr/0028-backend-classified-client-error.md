@@ -1,4 +1,4 @@
-# ADR-0023: A backend-classified client error passes through the engine unchanged
+# ADR-0028: A backend-classified client error passes through the engine unchanged
 
 - Status: Accepted
 - Date: 2026-10-24
