@@ -179,21 +179,11 @@ impl DataEngine for SqliteEngine {
         key: &Item,
         segment: i64,
         total_segments: i64,
-        index_name: Option<&str>,
+        _index_name: Option<&str>,
     ) -> BoxFuture<'_, Result<bool, StorageError>> {
-        let key_info = key_info.clone();
-        let key = key.clone();
-        let index_name = index_name.map(str::to_owned);
-        Box::pin(async move {
-            self.scan_key_in_segment_impl(
-                &key_info,
-                &key,
-                segment,
-                total_segments,
-                index_name.as_deref(),
-            )
-            .await
-        })
+        // The rule reads the key alone, so the answer needs no connection.
+        let answer = Self::scan_key_in_segment_impl(key_info, key, segment, total_segments);
+        Box::pin(std::future::ready(answer))
     }
 
     fn transact_get_items(

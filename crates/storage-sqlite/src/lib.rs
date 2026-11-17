@@ -41,6 +41,8 @@ mod password_hash_store;
 mod restore_engine;
 #[cfg(test)]
 mod restore_job_tests;
+#[cfg(test)]
+mod scan_segment_tests;
 mod schema;
 mod serve_lock;
 mod snapshot_engine;

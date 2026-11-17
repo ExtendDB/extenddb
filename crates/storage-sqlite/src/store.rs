@@ -186,9 +186,10 @@ impl SqliteEngine {
         let connect = connect_options(&url)?;
         let pool = opts
             .after_connect(|conn, _| {
-                Box::pin(
-                    async move { crate::sqlite_util::set_connection_pragmas(conn, true).await },
-                )
+                Box::pin(async move {
+                    crate::sqlite_util::set_connection_pragmas(conn, true).await?;
+                    crate::sqlite_util::register_scan_segment(conn).await
+                })
             })
             .connect_with(connect)
             .await
