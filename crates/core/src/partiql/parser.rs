@@ -16,6 +16,7 @@ mod forms;
 mod limits;
 mod literals;
 mod operands;
+mod paths;
 mod predicates;
 mod statements;
 mod terms;
@@ -23,7 +24,7 @@ mod walk;
 
 pub use limits::{MAX_STATEMENT_LENGTH, statement_length_refusal};
 use limits::{Nest, Nesting};
-use operands::Brackets;
+use paths::Brackets;
 use walk::Findings;
 
 /// A parse failure. `message` is the full `ValidationException` string the
