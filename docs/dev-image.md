@@ -152,7 +152,7 @@ condition: service_healthy` work with no extra wiring.
 
 ## Image properties
 
-- Runtime base is distroless (`gcr.io/distroless/cc-debian12:nonroot`): no
+- Runtime base is distroless (`gcr.io/distroless/cc-debian13:nonroot`): no
   shell, no package manager, runs as uid 65532. `docker exec` into it is not
   possible by design.
 - The binary is built with the `release-slim` profile (stripped, LTO).

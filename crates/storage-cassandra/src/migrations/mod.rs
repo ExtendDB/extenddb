@@ -391,7 +391,7 @@ pub async fn wait_for_schema_agreement(session: &CassandraSession) -> Result<(),
 }
 
 /// Run migration 1's body for stores of `kind` in `keyspace` and record
-/// nothing, as a release before 1.0 left a catalog with these tables and no
+/// nothing, as a release before 0.1.15 left a catalog with these tables and no
 /// ledger: for the tests of adoption.
 ///
 /// # Errors
@@ -630,7 +630,7 @@ pub async fn foreign_contents(
 }
 
 /// The (table, column) pairs migration 1 adds to the catalog keyspace with
-/// `ALTER TABLE ... ADD IF NOT EXISTS`: a table an `init` or a 0.1.x release
+/// `ALTER TABLE ... ADD IF NOT EXISTS`: a table an `init` or a release up to 0.1.14
 /// created before such a statement lacks them, and migration 1 adds them.
 fn baseline_added_columns() -> std::collections::BTreeSet<(&'static str, &'static str)> {
     CATALOG_BASELINE

@@ -158,9 +158,9 @@ all the schema work, so it needs no credential the serving container lacks.
 To have it create the pgvector extension as well, add
 `--pg-user <bootstrap-user>` and inject `EXTENDDB_PG_PASSWORD` from the
 orchestrator's secret store into the Job only; without them the Job reports
-whether pgvector is available and goes on. A backup taken by a 0.1.x release
-can restore without its secondary indexes, so take a new backup of each table
-after the upgrade.
+whether pgvector is available and goes on. A backup taken by 0.1.14 or an
+earlier release can restore without its secondary indexes, so take a new
+backup of each table after the upgrade.
 
 ### Steady state
 

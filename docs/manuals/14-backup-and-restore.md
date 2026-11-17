@@ -884,7 +884,7 @@ The command prints one line per backup and a summary:
 
 ```
 migrated arn:aws:dynamodb:us-east-1:123456789012:table/orders/backup/01793991641206-db64fc83 (account 123456789012): 303 items, 3158 bytes
-refused arn:aws:dynamodb:us-east-1:123456789012:table/orders/backup/1793254932797-4116998c (account 123456789012): its backup id 1793254932797-4116998c has the 13-digit shape a 0.1.x release issued, and a store prefix carries only the 14-digit shape; restore it (RestoreTableFromBackup) and take a new backup of the restored table, which has a new ARN. Its in-catalog backup is kept
+refused arn:aws:dynamodb:us-east-1:123456789012:table/orders/backup/1793254932797-4116998c (account 123456789012): its backup id 1793254932797-4116998c has the 13-digit shape that 0.1.14 and earlier releases issued, and a store prefix carries only the 14-digit shape; restore it (RestoreTableFromBackup) and take a new backup of the restored table, which has a new ARN. Its in-catalog backup is kept
 
 === extenddb backup migrate-legacy complete: 1 migrated, 0 finished, 0 already in the store, 0 deleted, 1 refused, 0 skipped, 0 failed ===
 ```
@@ -929,7 +929,7 @@ than `stale_job_after_secs`.
 What it refuses, keeping the legacy backup as it is. A refusal before the copy writes nothing, and one after
 it deletes the copy, except where the list says the prefix is left:
 
-- **Every backup a 0.1.x release took.** Their backup ids have the 13-digit shape a 0.1.x release issued
+- **Every backup that 0.1.14 or an earlier release took.** Their backup ids have the 13-digit shape those releases issued
   (13 digits with a hex suffix, or 13 bare digits), and a store prefix carries only the 14-digit shape. Only legacy backups taken by this release
   line migrate: those of a server without a store, with `kind = "disabled"`, and on Cassandra.
 - A backup holding an item the item check refuses: a value the wire stores without validating it (#618,
