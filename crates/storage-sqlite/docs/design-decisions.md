@@ -164,8 +164,7 @@ only) — identical to Postgres, no change needed.
   text modulo `total_segments`, through the SQL function
   `extenddb_scan_segment` that every pool connection registers. DynamoDB
   returns all items of a partition key from one segment, on a table and on a
-  GSI (measured 2026-11-13 and 2026-11-14). The earlier `rowid % total_segments`
-  rule spread one partition key over several segments.
+  GSI (measured 2026-11-13 and 2026-11-14).
 - **Encryption** (access-key secrets) reuses AES-256-GCM with AAD, identical to
   Postgres/memory.
 

@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from conftest import scoped_table, wait_for_gsi_items
+from conftest import _paginate, scoped_table, wait_for_gsi_items
 
 PAGE_LIMIT_BYTES = 1_048_576
 
@@ -66,24 +66,6 @@ def _batch_write(client, table: str, items: list[dict], threads: int = 8) -> Non
 
     with ThreadPoolExecutor(max_workers=threads) as pool:
         list(pool.map(_write, batches))
-
-
-def _paginate(client, operation: str, max_pages: int = 100, **kwargs) -> list[dict]:
-    """Run a Scan or Query to exhaustion, returning the list of raw pages.
-
-    Bounded so a LastEvaluatedKey that fails to advance surfaces as a short
-    result instead of spinning forever.
-    """
-    pages: list[dict] = []
-    call = getattr(client, operation)
-    request = dict(kwargs)
-    for _ in range(max_pages):
-        resp = call(**request)
-        pages.append(resp)
-        if "LastEvaluatedKey" not in resp:
-            break
-        request["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
-    return pages
 
 
 def _all_items(pages: list[dict]) -> list[dict]:

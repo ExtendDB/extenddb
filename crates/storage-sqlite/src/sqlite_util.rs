@@ -7,6 +7,7 @@
 
 use std::ffi::c_int;
 
+use extenddb_storage::util::scan_segment;
 use libsqlite3_sys as ffi;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -31,22 +32,6 @@ pub(crate) async fn set_connection_pragmas(
     conn.execute("PRAGMA busy_timeout = 5000").await?;
     conn.execute("PRAGMA cache_size = -32000").await?;
     Ok(())
-}
-
-/// The segment of a `total_segments`-way parallel Scan that holds every item
-/// of the partition key whose `pk` column text is `pk`: CRC32 of the text
-/// modulo the segment count, the rule the MongoDB backend applies. DynamoDB
-/// returns all items of a partition key from one segment, on a table and on
-/// a global secondary index (measured in us-east-1, 13 and 14 Nov 2026).
-///
-/// The scan predicate evaluates this rule per row through the SQL function
-/// `extenddb_scan_segment(pk, total_segments)`, and the engine's start-key
-/// check evaluates it in Rust, so the two cannot disagree.
-pub(crate) fn scan_segment(pk: &[u8], total_segments: i64) -> i64 {
-    // The engine admits 1 to 1,000,000 segments. The clamp keeps the SQL
-    // function total, so no literal can divide by zero inside SQLite.
-    let total = u32::try_from(total_segments.max(1)).unwrap_or(u32::MAX);
-    i64::from(crc32fast::hash(pk) % total)
 }
 
 /// Register the SQL function `extenddb_scan_segment` on `conn`, which
@@ -97,9 +82,14 @@ unsafe extern "C" fn scan_segment_sql(
     // before its byte count, the order SQLite documents for a text value.
     unsafe {
         let pk = *argv;
+        if ffi::sqlite3_value_type(pk) == ffi::SQLITE_NULL {
+            ffi::sqlite3_result_null(ctx);
+            return;
+        }
         let text = ffi::sqlite3_value_text(pk);
         if text.is_null() {
-            ffi::sqlite3_result_null(ctx);
+            // The conversion of a non-NULL value to text ran out of memory.
+            ffi::sqlite3_result_error_nomem(ctx);
             return;
         }
         let len = usize::try_from(ffi::sqlite3_value_bytes(pk)).unwrap_or(0);

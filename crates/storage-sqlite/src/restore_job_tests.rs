@@ -32,14 +32,14 @@ use crate::SqliteEngine;
 use crate::backup_catalog::{SqliteJobClaim, restore_slot_key};
 use crate::restore_engine::{RESTORE_BATCH_BYTES, RESTORE_BATCH_ITEMS};
 
-const ACCOUNT: &str = "123456789012";
+pub(crate) const ACCOUNT: &str = "123456789012";
 const REGION: &str = "us-east-1";
 /// A stale window no test's heartbeat crosses on its own.
 const STALE: Duration = Duration::from_secs(300);
 
 // --- the engine, rows, inputs and items -------------------------------------------
 
-async fn engine() -> SqliteEngine {
+pub(crate) async fn engine() -> SqliteEngine {
     let engine = SqliteEngine::new(":memory:", 2, REGION, 409_600)
         .await
         .expect("engine");

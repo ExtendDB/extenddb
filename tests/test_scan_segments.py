@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from conftest import scoped_table, wait_for_gsi_items
+from conftest import _paginate, scoped_table, wait_for_gsi_items
 
 # Items per partition key of the table: p0 holds 5, p1 3, p2 2 and p3 1.
 TABLE_PARTITIONS = {"p0": 5, "p1": 3, "p2": 2, "p3": 1}
@@ -92,30 +92,11 @@ def grouped_gsi_table(dynamodb_client):
             )
 
         def _index_items():
-            return _scan_segments(dynamodb_client, 1, TableName=name, IndexName=GSI_NAME)[0]
+            pages = _paginate(dynamodb_client, "scan", TableName=name, IndexName=GSI_NAME)
+            return [item for page in pages for item in page["Items"]]
 
         wait_for_gsi_items(_index_items, GSI_ITEM_COUNT, timeout=120.0)
         yield name
-
-
-def _scan_segments(client, total_segments: int, **kwargs) -> list[list[dict]]:
-    """Every item of every segment, each segment paged to its end.
-
-    Returns one list of items per segment. ``kwargs`` are the Scan parameters
-    shared by every request: TableName, IndexName, Limit and the filter.
-    """
-    segments: list[list[dict]] = []
-    for segment in range(total_segments):
-        items: list[dict] = []
-        request = dict(kwargs, Segment=segment, TotalSegments=total_segments)
-        while True:
-            resp = client.scan(**request)
-            items.extend(resp["Items"])
-            if "LastEvaluatedKey" not in resp:
-                break
-            request["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
-        segments.append(items)
-    return segments
 
 
 def _base_key(item: dict) -> tuple[str, str]:
@@ -152,7 +133,13 @@ def test_every_partition_key_comes_back_from_one_segment(
     if limit is not None:
         request["Limit"] = limit
 
-    segments = _scan_segments(dynamodb_client, total_segments, **request)
+    # Every segment paged to its end, with the Scan parameters every page shares.
+    segments: list[list[dict]] = []
+    for segment in range(total_segments):
+        pages = _paginate(
+            dynamodb_client, "scan", Segment=segment, TotalSegments=total_segments, **request
+        )
+        segments.append([item for page in pages for item in page["Items"]])
 
     # Every item once across the segments.
     keys = [_base_key(item) for items in segments for item in items]

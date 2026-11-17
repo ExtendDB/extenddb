@@ -181,7 +181,6 @@ impl DataEngine for SqliteEngine {
         total_segments: i64,
         _index_name: Option<&str>,
     ) -> BoxFuture<'_, Result<bool, StorageError>> {
-        // The rule reads the key alone, so the answer needs no connection.
         let answer = Self::scan_key_in_segment_impl(key_info, key, segment, total_segments);
         Box::pin(std::future::ready(answer))
     }

@@ -1873,6 +1873,7 @@ dependencies = [
  "base64 0.22.1",
  "bcrypt",
  "bigdecimal",
+ "crc32fast",
  "extenddb-auth",
  "extenddb-core",
  "futures",

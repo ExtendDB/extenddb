@@ -10,8 +10,8 @@
 //! tie-breakers. SQLite differences: positional `?` placeholders, no `COLLATE`
 //! (the default BINARY collation already matches DynamoDB byte order, and `N`
 //! keys are stored as the order-preserving TEXT encoding per D2), and the SQL
-//! function `extenddb_scan_segment` ([`crate::sqlite_util::scan_segment`]) for
-//! parallel scan.
+//! function `extenddb_scan_segment` ([`extenddb_storage::util::scan_segment`])
+//! for parallel scan.
 
 use std::fmt::Write;
 
@@ -19,14 +19,14 @@ use extenddb_core::expression::{ExpressionMaps, KeyCondition, PathElement};
 use extenddb_core::types::{Item, ScalarAttributeType, TableKeyInfo};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{
-    encode_netstring_composite, parse_sk, pk_to_text, sk_column, sk_column_n, sk_info,
+    composite_pk_to_text, encode_netstring_composite, parse_sk, pk_to_text, scan_segment,
+    sk_column, sk_column_n, sk_info,
 };
 
 use super::query::{build_key, build_sk_sql_and_binds, execute_dynamic_query, resolve_expr_to_av};
 use super::{
     BoundValue, all_sort_key_info, data_table_name, index_table_name, json_to_item, sk_bound,
 };
-use crate::sqlite_util::scan_segment;
 use crate::store::SqliteEngine;
 
 impl SqliteEngine {
@@ -188,10 +188,8 @@ impl SqliteEngine {
         let mut conditions: Vec<String> = Vec::new();
         let mut binds: Vec<BoundValue> = Vec::new();
 
-        // Parallel scan: every item of a partition key in one segment, as
-        // DynamoDB returns them, by the hash of the `pk` column text
-        // (`crate::sqlite_util::scan_segment`). seg/total are validated
-        // non-negative integers at the engine layer, safe to interpolate.
+        // Parallel scan: `scan_segment` of the `pk` column text. seg/total are
+        // validated non-negative integers at the engine layer, safe to interpolate.
         if let (Some(seg), Some(total)) = (segment, total_segments) {
             conditions.push(format!("extenddb_scan_segment(pk, {total}) = {seg}"));
         }
@@ -330,20 +328,16 @@ impl SqliteEngine {
     /// key alone, so a key whose row was deleted since the previous page
     /// still answers definitively, and no read is needed.
     ///
-    /// `key_info` is scan-shaped: `key_schema[0]` is the partition key of the
-    /// table or index the scan targets, which is what its `pk` column holds.
+    /// `key_info` is scan-shaped: `key_schema` is the key schema of the table
+    /// or index the scan targets, and the text of its HASH attributes
+    /// ([`composite_pk_to_text`]) is what the `pk` column holds.
     pub(crate) fn scan_key_in_segment_impl(
         key_info: &TableKeyInfo,
         key: &Item,
         segment: i64,
         total_segments: i64,
     ) -> Result<bool, StorageError> {
-        let pk_name = &key_info.key_schema[0].attribute_name;
-        let Some(pk_value) = key.get(pk_name) else {
-            // Schema validation upstream already rejects this shape.
-            return Ok(false);
-        };
-        let pk_text = pk_to_text(pk_value)?;
+        let pk_text = composite_pk_to_text(key, &key_info.key_schema)?;
         Ok(scan_segment(pk_text.as_bytes(), total_segments) == segment)
     }
 }
