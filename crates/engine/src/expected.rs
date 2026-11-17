@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{CompareOp, Expr, ExpressionMaps, PathElement};
 use extenddb_core::types::{AttributeValue, ConditionalOperator, ExpectedAttributeValue};
+use extenddb_core::validation::number::operations::single_write;
 
 /// Desugar a legacy `Expected` map into a condition expression AST and maps.
 ///
@@ -43,6 +44,7 @@ pub fn desugar_expected(
         let path = Expr::Path(vec![PathElement::Attribute(attr_name.clone())]);
 
         let condition = desugar_one(
+            attr_name,
             &path,
             expected_val,
             &mut value_map,
@@ -57,9 +59,17 @@ pub fn desugar_expected(
     Ok((combined, maps))
 }
 
+/// The text `DynamoDB` gives a `ComparisonOperator` with the wrong number of values.
+fn invalid_argument_count(op: &str) -> String {
+    format!(
+        "One or more parameter values were invalid: Invalid number of argument(s) for the {op} ComparisonOperator"
+    )
+}
+
 /// Desugar a single `ExpectedAttributeValue` into a condition expression.
 #[allow(clippy::too_many_lines)]
 fn desugar_one(
+    attr_name: &str,
     path: &Expr,
     expected: &ExpectedAttributeValue,
     values: &mut HashMap<String, AttributeValue>,
@@ -117,12 +127,10 @@ fn desugar_one(
         });
     }
 
-    // Case 3: ComparisonOperator with AttributeValueList (or Value fallback).
-    // comparison_operator is guaranteed Some here: Case 1 handles exists,
-    // Case 2 handles comparison_operator.is_none().
-    // Real DynamoDB accepts Value as a single-element AttributeValueList when
-    // ComparisonOperator is present. The Java SDK uses this pattern for
-    // Expected conditions on set attributes (REQ-DATA-013).
+    // Case 3: ComparisonOperator. `Value` counts as a list of one (the Java
+    // SDK sends `Value` for Expected conditions on set attributes,
+    // REQ-DATA-013), an empty list as zero values, and NULL and NOT_NULL take
+    // zero values (measured in us-east-1 on 2026-11-14 and 2026-11-17).
     let Some(op_str) = expected.comparison_operator.as_deref() else {
         return Err(DynamoDbError::ValidationException(
             "One or more parameter values were invalid: Value or ComparisonOperator must be specified"
@@ -130,24 +138,44 @@ fn desugar_one(
         ));
     };
     let value_as_list;
-    let vals: &[AttributeValue] = match expected.attribute_value_list.as_deref() {
-        Some(list) if !list.is_empty() => list,
-        _ => match &expected.value {
-            Some(v) => {
-                value_as_list = [v.clone()];
-                &value_as_list
-            }
-            None => &[],
-        },
+    let vals: &[AttributeValue] = match (expected.attribute_value_list.as_deref(), &expected.value)
+    {
+        (Some(_), Some(_)) => {
+            return Err(single_write(format!(
+                "One or more parameter values were invalid: Value and AttributeValueList cannot be used together for Attribute: {attr_name}"
+            )));
+        }
+        (None, None) if matches!(op_str, "NULL" | "NOT_NULL") => &[],
+        (None, None) => {
+            return Err(single_write(format!(
+                "One or more parameter values were invalid: Value or AttributeValueList must be used with ComparisonOperator: {op_str} for Attribute: {attr_name}"
+            )));
+        }
+        (Some(list), None) => list,
+        (None, Some(v)) => {
+            value_as_list = [v.clone()];
+            &value_as_list
+        }
     };
+    let count_ok = match op_str {
+        "EQ" | "NE" | "LE" | "LT" | "GE" | "GT" | "BEGINS_WITH" | "CONTAINS" | "NOT_CONTAINS" => {
+            vals.len() == 1
+        }
+        "BETWEEN" => vals.len() == 2,
+        "IN" => !vals.is_empty(),
+        "NULL" | "NOT_NULL" => vals.is_empty(),
+        other => {
+            return Err(DynamoDbError::ValidationException(format!(
+                "One or more parameter values were invalid: unknown ComparisonOperator: {other}"
+            )));
+        }
+    };
+    if !count_ok {
+        return Err(single_write(invalid_argument_count(op_str)));
+    }
 
     match op_str {
         "EQ" | "NE" | "LE" | "LT" | "GE" | "GT" => {
-            if vals.len() != 1 {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "One or more parameter values were invalid: {op_str} requires exactly one AttributeValueList member"
-                )));
-            }
             let op = match op_str {
                 "EQ" => CompareOp::Eq,
                 "NE" => CompareOp::Ne,
@@ -166,12 +194,6 @@ fn desugar_one(
             })
         }
         "BETWEEN" => {
-            if vals.len() != 2 {
-                return Err(DynamoDbError::ValidationException(
-                    "One or more parameter values were invalid: BETWEEN requires exactly two AttributeValueList members"
-                        .to_owned(),
-                ));
-            }
             let p_low = next_placeholder(counter);
             let p_high = next_placeholder(counter);
             values.insert(p_low.clone(), vals[0].clone());
@@ -183,12 +205,6 @@ fn desugar_one(
             })
         }
         "BEGINS_WITH" => {
-            if vals.len() != 1 {
-                return Err(DynamoDbError::ValidationException(
-                    "One or more parameter values were invalid: BEGINS_WITH requires exactly one AttributeValueList member"
-                        .to_owned(),
-                ));
-            }
             let placeholder = next_placeholder(counter);
             values.insert(placeholder.clone(), vals[0].clone());
             Ok(Expr::Function {
@@ -197,12 +213,6 @@ fn desugar_one(
             })
         }
         "CONTAINS" => {
-            if vals.len() != 1 {
-                return Err(DynamoDbError::ValidationException(
-                    "One or more parameter values were invalid: CONTAINS requires exactly one AttributeValueList member"
-                        .to_owned(),
-                ));
-            }
             let placeholder = next_placeholder(counter);
             values.insert(placeholder.clone(), vals[0].clone());
             Ok(Expr::Function {
@@ -211,12 +221,6 @@ fn desugar_one(
             })
         }
         "NOT_CONTAINS" => {
-            if vals.len() != 1 {
-                return Err(DynamoDbError::ValidationException(
-                    "One or more parameter values were invalid: NOT_CONTAINS requires exactly one AttributeValueList member"
-                        .to_owned(),
-                ));
-            }
             let placeholder = next_placeholder(counter);
             values.insert(placeholder.clone(), vals[0].clone());
             Ok(Expr::Not(Box::new(Expr::Function {
@@ -225,12 +229,6 @@ fn desugar_one(
             })))
         }
         "IN" => {
-            if vals.is_empty() {
-                return Err(DynamoDbError::ValidationException(
-                    "One or more parameter values were invalid: IN requires at least one AttributeValueList member"
-                        .to_owned(),
-                ));
-            }
             let list: Vec<Expr> = vals
                 .iter()
                 .map(|v| {
@@ -252,9 +250,7 @@ fn desugar_one(
             name: "attribute_not_exists".to_owned(),
             args: vec![path.clone()],
         }),
-        other => Err(DynamoDbError::ValidationException(format!(
-            "One or more parameter values were invalid: unknown ComparisonOperator: {other}"
-        ))),
+        _ => unreachable!(),
     }
 }
 
@@ -284,9 +280,9 @@ mod tests {
     use extenddb_core::types::ConditionalOperator;
 
     fn make_expected(
-        value: Option<AttributeValue>,
         comparison_operator: Option<&str>,
         attribute_value_list: Option<Vec<AttributeValue>>,
+        value: Option<AttributeValue>,
     ) -> ExpectedAttributeValue {
         ExpectedAttributeValue {
             value,
@@ -296,49 +292,165 @@ mod tests {
         }
     }
 
+    fn s(v: &str) -> AttributeValue {
+        AttributeValue::S(v.to_owned())
+    }
+
+    fn desugar_tested(
+        tested: ExpectedAttributeValue,
+    ) -> Result<(Expr, ExpressionMaps), DynamoDbError> {
+        let mut expected = HashMap::new();
+        expected.insert("tested".to_owned(), tested);
+        desugar_expected(&expected, ConditionalOperator::And)
+    }
+
+    fn message(result: Result<(Expr, ExpressionMaps), DynamoDbError>) -> String {
+        match result {
+            Err(DynamoDbError::ValidationException(text)) => text,
+            other => panic!("expected a ValidationException, got {other:?}"),
+        }
+    }
+
+    /// The texts measured in us-east-1 for an entry `tested` of a PutItem,
+    /// UpdateItem or DeleteItem: a wrong number of values (2026-11-13,
+    /// 2026-11-14 and 2026-11-17), both `Value` and `AttributeValueList`
+    /// (2026-11-17), and neither (2026-11-14).
     #[test]
-    fn eq_with_value_and_comparison_operator() {
-        // Java SDK pattern: ComparisonOperator=EQ + Value (no AttributeValueList).
-        // Real DynamoDB treats Value as a single-element AttributeValueList.
+    fn refused_entries_get_the_measured_text() {
+        const PREFIX: &str =
+            "1 validation error detected: One or more parameter values were invalid: ";
+        const BOTH: &str =
+            "Value and AttributeValueList cannot be used together for Attribute: tested";
+        const NEITHER: &str = "Value or AttributeValueList must be used with ComparisonOperator: EQ for Attribute: tested";
+        let count =
+            |op: &str| format!("Invalid number of argument(s) for the {op} ComparisonOperator");
+        let two = || Some(vec![s("READY"), s("OTHER")]);
+        let mut rows: Vec<(ExpectedAttributeValue, String)> = vec![
+            (make_expected(Some("EQ"), Some(vec![]), None), count("EQ")),
+            (make_expected(Some("EQ"), two(), None), count("EQ")),
+            (make_expected(Some("NE"), two(), None), count("NE")),
+            (make_expected(Some("IN"), Some(vec![]), None), count("IN")),
+            (
+                make_expected(Some("BETWEEN"), None, Some(s("READY"))),
+                count("BETWEEN"),
+            ),
+            (
+                make_expected(Some("BETWEEN"), Some(vec![s("x")]), None),
+                count("BETWEEN"),
+            ),
+            (
+                make_expected(Some("BETWEEN"), Some(vec![s("A"), s("M"), s("Z")]), None),
+                count("BETWEEN"),
+            ),
+            (
+                make_expected(Some("NULL"), None, Some(s("READY"))),
+                count("NULL"),
+            ),
+            (
+                make_expected(Some("NULL"), Some(vec![s("READY")]), None),
+                count("NULL"),
+            ),
+            (
+                make_expected(Some("NOT_NULL"), None, Some(s("READY"))),
+                count("NOT_NULL"),
+            ),
+            (
+                make_expected(Some("EQ"), Some(vec![s("READY")]), Some(s("READY"))),
+                BOTH.to_owned(),
+            ),
+            (
+                make_expected(Some("EQ"), Some(vec![]), Some(s("READY"))),
+                BOTH.to_owned(),
+            ),
+            (
+                make_expected(Some("NOT_NULL"), Some(vec![s("READY")]), Some(s("READY"))),
+                BOTH.to_owned(),
+            ),
+            (make_expected(Some("EQ"), None, None), NEITHER.to_owned()),
+            // An unknown operator gets the text of its value shape first
+            // (measured 2026-11-17).
+            (
+                make_expected(Some("FOO"), None, None),
+                "Value or AttributeValueList must be used with ComparisonOperator: FOO for Attribute: tested".to_owned(),
+            ),
+            (
+                make_expected(Some("FOO"), Some(vec![s("READY")]), Some(s("READY"))),
+                BOTH.to_owned(),
+            ),
+        ];
+        for op in [
+            "LE",
+            "LT",
+            "GE",
+            "GT",
+            "BEGINS_WITH",
+            "CONTAINS",
+            "NOT_CONTAINS",
+        ] {
+            rows.push((make_expected(Some(op), Some(vec![]), None), count(op)));
+            rows.push((make_expected(Some(op), two(), None), count(op)));
+        }
+        for (tested, want) in rows {
+            let label = format!("{tested:?}");
+            let got = message(desugar_tested(tested));
+            assert_eq!(got, format!("{PREFIX}{want}"), "{label}");
+        }
+    }
+
+    /// A wrong entry is refused beside a valid one, with no `ConditionalOperator`
+    /// (measured 2026-11-14): the two-entry PutItem of #1042.
+    #[test]
+    fn wrong_entry_beside_a_valid_one_is_refused() {
         let mut expected = HashMap::new();
         expected.insert(
-            "attr".to_owned(),
-            make_expected(
-                Some(AttributeValue::S("hello".to_owned())),
-                Some("EQ"),
-                None,
-            ),
+            "a".to_owned(),
+            make_expected(Some("BETWEEN"), Some(vec![s("x")]), None),
         );
-        let result = desugar_expected(&expected, ConditionalOperator::And);
-        assert!(
-            result.is_ok(),
-            "should accept Value + ComparisonOperator=EQ"
+        expected.insert(
+            "b".to_owned(),
+            make_expected(Some("EQ"), Some(vec![s("y")]), None),
+        );
+        assert_eq!(
+            message(desugar_expected(&expected, ConditionalOperator::And)),
+            format!(
+                "1 validation error detected: {}",
+                invalid_argument_count("BETWEEN")
+            )
         );
     }
 
+    /// The shapes that desugar. The service applied EQ, NE and IN with a
+    /// `Value` and BETWEEN with two values on 2026-11-14, and NOT_NULL with an
+    /// empty list or no field on 2026-11-17; NULL with no field was refused by
+    /// its condition on the seeded item (2026-11-17). One value with the other
+    /// operators, a list with IN and a one-value list with EQ are the operators'
+    /// documented shape.
     #[test]
-    fn eq_with_attribute_value_list() {
-        // Standard pattern: ComparisonOperator=EQ + AttributeValueList=[value].
-        let mut expected = HashMap::new();
-        expected.insert(
-            "attr".to_owned(),
-            make_expected(
-                None,
-                Some("EQ"),
-                Some(vec![AttributeValue::S("hello".to_owned())]),
-            ),
-        );
-        let result = desugar_expected(&expected, ConditionalOperator::And);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn eq_with_no_value_and_no_list_fails() {
-        // ComparisonOperator=EQ with neither Value nor AttributeValueList.
-        let mut expected = HashMap::new();
-        expected.insert("attr".to_owned(), make_expected(None, Some("EQ"), None));
-        let result = desugar_expected(&expected, ConditionalOperator::And);
-        assert!(result.is_err());
+    fn accepted_entries_desugar() {
+        let one = |v: &str| Some(vec![s(v)]);
+        let rows = vec![
+            make_expected(Some("EQ"), None, Some(s("READY"))),
+            make_expected(Some("EQ"), one("READY"), None),
+            make_expected(Some("NE"), None, Some(s("READY"))),
+            make_expected(Some("IN"), None, Some(s("READY"))),
+            make_expected(Some("IN"), Some(vec![s("a"), s("b"), s("c")]), None),
+            make_expected(Some("BETWEEN"), Some(vec![s("a"), s("z")]), None),
+            make_expected(Some("LE"), one("z"), None),
+            make_expected(Some("LT"), one("z"), None),
+            make_expected(Some("GE"), one("a"), None),
+            make_expected(Some("GT"), one("a"), None),
+            make_expected(Some("BEGINS_WITH"), one("R"), None),
+            make_expected(Some("CONTAINS"), one("R"), None),
+            make_expected(Some("NOT_CONTAINS"), one("x"), None),
+            make_expected(Some("NULL"), None, None),
+            make_expected(Some("NOT_NULL"), None, None),
+            make_expected(Some("NOT_NULL"), Some(vec![]), None),
+        ];
+        for tested in rows {
+            let label = format!("{tested:?}");
+            let result = desugar_tested(tested);
+            assert!(result.is_ok(), "{label}: {result:?}");
+        }
     }
 
     #[test]
@@ -347,7 +459,7 @@ mod tests {
         let mut expected = HashMap::new();
         expected.insert(
             "attr".to_owned(),
-            make_expected(Some(AttributeValue::N("42".to_owned())), None, None),
+            make_expected(None, None, Some(AttributeValue::N("42".to_owned()))),
         );
         let result = desugar_expected(&expected, ConditionalOperator::And);
         assert!(result.is_ok());
