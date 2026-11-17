@@ -191,8 +191,8 @@ async fn write_batch(
     // ThrottlingReasons: the API reference documents
     // ProvisionedThroughputExceededException or ThrottlingException for a
     // batch that cannot process any item because of throttling (documented,
-    // not measured). A batch with nothing applied in which a request failed
-    // for another reason answers 503.
+    // not measured). A batch with nothing applied in which a request was
+    // deferred for another reason answers 503.
     //
     // The request faults the same page lists reject the whole batch before
     // anything is written. `check_batch` finds a missing table, a key that
@@ -213,8 +213,7 @@ async fn write_batch(
     // The error of the last request that was not applied, for the warning
     // logged once per batch below.
     let mut last_error = String::new();
-    // How many requests the backend throttled, and the first throttle error:
-    // a batch of which every request was throttled answers that error.
+    // How many requests the backend throttled, and the first throttle error.
     let mut throttled_count: usize = 0;
     let mut first_throttle: Option<DynamoDbError> = None;
     let mut throttled_tables: Vec<String> = Vec::new();
