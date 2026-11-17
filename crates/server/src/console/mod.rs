@@ -23,7 +23,6 @@ pub mod session;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::response::IntoResponse;
 use axum::routing::{get, post};
 
 use session::SessionStore;
@@ -61,6 +60,9 @@ pub struct ConsoleState {
     /// `/console/metrics-data` response with latency segments (same data the
     /// top-level `/metrics` handler adds).
     pub metrics: Arc<extenddb_core::metrics::MetricsCollector>,
+    /// Whether the session cookie carries `Secure`: true when the server
+    /// serves TLS, false in dev mode, which serves plain HTTP.
+    pub secure_cookies: bool,
 }
 
 /// The console user behind a request to an extension tab, and what the page
@@ -123,26 +125,28 @@ impl ConsoleIdentity {
     }
 }
 
-/// Middleware for extension tabs: a request without a live console session is
-/// redirected to the login page; one with a session carries a
-/// [`ConsoleIdentity`] extension for the page to render the navigation bar.
+/// Middleware for extension tabs: the session check of the built-in pages. A
+/// request without a live console session is redirected to the login page,
+/// and one whose session the catalog cannot check gets 503; one with a
+/// session carries a [`ConsoleIdentity`] extension for the page to render the
+/// navigation bar.
 pub async fn require_console_session(
     axum::extract::State(state): axum::extract::State<Arc<ConsoleState>>,
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    match pages::session_for_headers(req.headers(), &state).await {
-        Some((identity, csrf_token)) => {
+    match pages::require_session(req.headers(), &state).await {
+        Ok(session) => {
             req.extensions_mut().insert(ConsoleIdentity {
-                label: pages::identity_label(&identity),
-                csrf_token,
-                is_admin: pages::is_admin(&identity),
+                label: pages::identity_label(&session.identity).label,
+                csrf_token: session.csrf_token,
+                is_admin: pages::is_admin(&session.identity),
                 tabs: Arc::clone(&state.tabs),
                 version_info: Arc::clone(&state.version_info),
             });
             next.run(req).await
         }
-        None => axum::response::Redirect::to("/console/login").into_response(),
+        Err(response) => response,
     }
 }
 
@@ -159,16 +163,18 @@ pub fn router() -> Router<Arc<ConsoleState>> {
         .route("/docs/{slug}/pdf", get(pages::docs_pdf))
         // Dashboard (handle both with and without trailing slash)
         .route("/", get(pages::dashboard))
-        // Metrics
+        // Metrics (admin-only; an IAM-user session is redirected to /console)
         .route("/metrics", get(pages::metrics_page))
-        // Metrics data (JSON) — session-authed backend for the dashboard's
-        // client-side charts. Replaces the browser fetch of the top-level
-        // `/metrics` (now Basic-auth only, for Prometheus).
+        // Metrics data (JSON) for the dashboard's client-side charts, for
+        // admin sessions only; an IAM-user session gets 403. Replaces the
+        // browser fetch of the top-level `/metrics` (now Basic-auth only, for
+        // Prometheus).
         .route("/metrics-data", get(pages::metrics_data))
-        // Settings (read-only, admin-only)
+        // Settings (read-only, admin-only; an IAM-user session is redirected
+        // to /console)
         .route("/settings", get(pages::settings_page))
-        // Cache (admin-only break-glass invalidation).
-        // See docs/design/12-auth-authz-cache.md §6.1.
+        // Cache (admin-only break-glass invalidation; an IAM-user session is
+        // redirected to /console). See docs/design/12-auth-authz-cache.md §6.1.
         .route("/cache", get(pages::cache_page))
         .route("/cache/invalidate", post(pages::invalidate_cache))
         // Accounts

@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+"""Check the workspace crates for crates.io before anything is published.
+
+    cargo package --workspace --no-verify --locked
+    devtools/check-crate-packages [--root DIR] [--packages DIR]
+
+The first command writes one `.crate` file per published member into the
+`package` directory of cargo's target directory. On a tree with uncommitted
+changes, it also needs `--allow-dirty`. This script needs Python 3.11 or
+later. It reads the members from `cargo metadata`, so cargo resolves globs,
+`exclude`, inherited fields and renamed dependencies. It then fails, with
+one line per problem, unless all of the following hold for each member that
+crates.io receives (one without a `publish` field, or one whose `publish`
+list names crates-io):
+
+- The member's version is the `version` of the root manifest's
+  `[workspace.package]` table. A release publishes every crate at the
+  workspace version, and `devtools/publish-crates --version` refuses a
+  crate of another version.
+- Each dependency on another workspace crate, normal or build, requires
+  that crate's version exactly (`=X.Y.Z`). A caret requirement would let a
+  fresh install combine crates of two releases. A pin left at the previous
+  version after a release bump also fails every cargo command that resolves
+  dependencies.
+- Each dev-dependency on a workspace crate has a path and no version, so
+  cargo drops it from the published manifest. With a version, the
+  dev-dependencies between extenddb-engine and extenddb-storage-sqlite form
+  a cycle, and crates.io can publish neither crate first.
+- The member has a package at its version.
+- The package holds LICENSE and NOTICE with the bytes of the root files.
+  Each crate links both from the root, and the Apache License 2.0 requires a
+  redistributor to pass both on.
+- The packaged manifest has a description, a license and a repository. It
+  requires each workspace crate it depends on at exactly that crate's
+  version, and it has no dev-dependency on a workspace crate.
+- The packaged manifest passes the field rules of crates.io's publish
+  handler: a description of at most 1000 bytes, at most 5 keywords of at
+  most 20 bytes in crates.io's keyword format, and at most 5 categories.
+  The category slugs are not checked against crates.io's list.
+- The package is inside the default limits in crates.io's
+  `src/config/publish_limits.rs`. The limits cover the upload size, the
+  unpacked size, the number of tarball entries, the manifest size, and the
+  number of dependencies and features.
+
+Exit 0 when every check passes, 1 otherwise.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tarfile
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 and older
+    sys.exit("error: devtools/check-crate-packages needs Python 3.11 or later (for tomllib)")
+
+# crates.io's PublishLimitsConfig defaults (src/config/publish_limits.rs).
+UPLOAD_SIZE = 10 * 1024 * 1024
+UNPACK_SIZE = 512 * 1024 * 1024
+TARBALL_ENTRIES = 30_000
+METADATA_FILE_SIZE = 1024 * 1024
+DEPENDENCIES = 500
+FEATURES = 300
+
+# crates.io's publish handler (src/controllers/krate/publish.rs, and
+# Keyword::valid_name in crates/crates_io_database/src/models/keyword.rs).
+DESCRIPTION_LENGTH = 1000
+KEYWORDS = 5
+KEYWORD_LENGTH = 20
+CATEGORIES = 5
+
+DEPENDENCY_TABLES = ("dependencies", "build-dependencies", "dev-dependencies")
+
+
+def cargo_metadata(root: Path) -> dict:
+    """The workspace as cargo resolves it, without the dependency graph."""
+    cargo = os.environ.get("CARGO", "cargo")
+    try:
+        result = subprocess.run(
+            [cargo, "metadata", "--no-deps", "--format-version", "1"],
+            cwd=root, capture_output=True, text=True, check=False,
+        )
+    except OSError as error:
+        sys.exit(f"error: cannot run `{cargo} metadata` in {root}: {error}")
+    if result.returncode != 0:
+        sys.exit(f"error: `cargo metadata` failed in {root}:\n{result.stderr}")
+    return json.loads(result.stdout)
+
+
+def is_published(package: dict) -> bool:
+    """A member that crates.io receives. `publish = false` reaches cargo
+    metadata as an empty registry list, and a member without the field as
+    null. devtools/publish-crates uses the same rule."""
+    registries = package.get("publish")
+    return registries is None or "crates-io" in registries
+
+
+def workspace_version(metadata: dict) -> str | None:
+    """The `version` of the root manifest's [workspace.package] table, or
+    None when the root manifest sets none."""
+    manifest = tomllib.loads((Path(metadata["workspace_root"]) / "Cargo.toml").read_text())
+    version = manifest.get("workspace", {}).get("package", {}).get("version")
+    return version if isinstance(version, str) else None
+
+
+def check(root: Path, packages: Path | None = None) -> list[str]:
+    """Return one message per problem; an empty list means every check passed."""
+    metadata = cargo_metadata(root)
+    members = {package["name"]: package for package in metadata["packages"]}
+    versions = {name: package["version"] for name, package in members.items()}
+    if packages is None:
+        packages = Path(metadata["target_directory"]) / "package"
+    problems: list[str] = []
+    release = workspace_version(metadata)
+    if release is None:
+        problems.append("the root Cargo.toml sets no [workspace.package] version, so the release version is unknown")
+
+    for name, package in sorted(members.items()):
+        if not is_published(package):
+            continue
+        manifest = os.path.relpath(package["manifest_path"], root)
+        if release is not None and package["version"] != release:
+            problems.append(
+                f"{manifest}: {name} is version {package['version']}, and the workspace version is {release}. "
+                f"A release publishes every crate at the workspace version (`version.workspace = true`)."
+            )
+        for dependency in package["dependencies"]:
+            target = dependency["name"]
+            if target not in members:
+                continue
+            key = dependency.get("rename") or target
+            kind = dependency.get("kind") or "normal"
+            if kind == "dev":
+                if dependency.get("path") is None or dependency["req"] != "*":
+                    problems.append(
+                        f"{manifest}: dev-dependency {key} requires {dependency['req']!r}; declare it "
+                        f"by path with no version or workspace key, so cargo drops it from the "
+                        f"published manifest"
+                    )
+            elif dependency["req"] != f"={versions[target]}":
+                problems.append(
+                    f"{manifest}: {kind} dependency {key} requires {dependency['req']!r}; it must be "
+                    f'"={versions[target]}" (in the root [workspace.dependencies] for a '
+                    f"`workspace = true` entry)"
+                )
+
+    try:
+        root_files = {f: (root / f).read_bytes() for f in ("LICENSE", "NOTICE")}
+    except OSError as error:
+        return problems + [f"cannot read the root LICENSE or NOTICE: {error}"]
+    for name, package in sorted(members.items()):
+        if not is_published(package):
+            continue
+        crate = packages / f"{name}-{package['version']}.crate"
+        if not crate.is_file():
+            problems.append(f"{crate}: missing; run `cargo package --workspace --no-verify --locked` first")
+            continue
+        problems.extend(check_package(crate, name, package["version"], versions, root_files))
+    return problems
+
+
+def dependency_tables(manifest: dict):
+    """Yield (table label, table) for each dependency table of a manifest,
+    including the target-specific ones."""
+    for kind in DEPENDENCY_TABLES:
+        if kind in manifest:
+            yield kind, manifest[kind]
+    for target, tables in manifest.get("target", {}).items():
+        for kind in DEPENDENCY_TABLES:
+            if kind in tables:
+                yield f"target.{target}.{kind}", tables[kind]
+
+
+def check_package(crate: Path, name: str, version: str, versions: dict[str, str], root_files: dict[str, bytes]) -> list[str]:
+    """Check one `.crate` file against the root files and crates.io's limits.
+
+    `versions` maps each workspace crate to its version."""
+    problems: list[str] = []
+    size = crate.stat().st_size
+    if size > UPLOAD_SIZE:
+        problems.append(f"{crate.name}: {size} bytes, over the crates.io upload limit of {UPLOAD_SIZE}")
+    prefix = f"{name}-{version}/"
+    with tarfile.open(crate, "r:gz") as tar:
+        entries = tar.getmembers()
+        if len(entries) > TARBALL_ENTRIES:
+            problems.append(f"{crate.name}: {len(entries)} entries, over the crates.io limit of {TARBALL_ENTRIES}")
+        unpacked = sum(entry.size for entry in entries)
+        if unpacked > UNPACK_SIZE:
+            problems.append(f"{crate.name}: {unpacked} bytes unpacked, over the crates.io limit of {UNPACK_SIZE}")
+        files = {entry.name: entry for entry in entries if entry.isfile()}
+        for filename, expected in root_files.items():
+            entry = files.get(prefix + filename)
+            if entry is None:
+                problems.append(f"{crate.name}: no {filename}; link crates/<crate>/{filename} to the root file")
+            elif tar.extractfile(entry).read() != expected:
+                problems.append(f"{crate.name}: {filename} differs from the root {filename}")
+        entry = files.get(prefix + "Cargo.toml")
+        if entry is None:
+            return problems + [f"{crate.name}: no Cargo.toml"]
+        if entry.size > METADATA_FILE_SIZE:
+            problems.append(f"{crate.name}: Cargo.toml is {entry.size} bytes, over the crates.io limit of {METADATA_FILE_SIZE}")
+        manifest = tomllib.loads(tar.extractfile(entry).read().decode())
+    package = manifest.get("package", {})
+    for field in ("description", "license", "repository"):
+        if not str(package.get(field, "")).strip():
+            problems.append(f"{crate.name}: the packaged manifest has no {field}")
+    problems.extend(check_metadata(crate.name, package))
+    count = 0
+    for label, table in dependency_tables(manifest):
+        count += len(table)
+        for key, spec in table.items():
+            target = spec.get("package", key) if isinstance(spec, dict) else key
+            if target not in versions:
+                continue
+            if label.endswith("dev-dependencies"):
+                problems.append(
+                    f"{crate.name}: [{label}] {key}: cargo kept this dev-dependency in the published "
+                    f"manifest; declare it by path with no version"
+                )
+                continue
+            found = spec.get("version") if isinstance(spec, dict) else spec
+            if found != f"={versions[target]}":
+                problems.append(f'{crate.name}: [{label}] {key} requires {found!r}, not "={versions[target]}"')
+    if count > DEPENDENCIES:
+        problems.append(f"{crate.name}: {count} dependencies, over the crates.io limit of {DEPENDENCIES}")
+    features = manifest.get("features", {})
+    if len(features) > FEATURES:
+        problems.append(f"{crate.name}: {len(features)} features, over the crates.io limit of {FEATURES}")
+    for feature, enables in features.items():
+        if len(enables) > FEATURES:
+            problems.append(f"{crate.name}: feature {feature} enables {len(enables)} entries, over the crates.io limit of {FEATURES}")
+    return problems
+
+
+def valid_keyword(keyword: str) -> bool:
+    """crates.io's Keyword::valid_name: an ASCII letter or digit, then ASCII
+    letters, digits, `_`, `-` or `+`."""
+    def allowed(c: str) -> bool:
+        return c.isascii() and (c.isalnum() or c in "_-+")
+    return bool(keyword) and keyword[0].isascii() and keyword[0].isalnum() and all(allowed(c) for c in keyword[1:])
+
+
+def check_metadata(crate: str, package: dict) -> list[str]:
+    """The [package] fields crates.io refuses at upload. Lengths are in bytes,
+    as crates.io counts them. Category slugs are not checked against
+    crates.io's list here."""
+    problems: list[str] = []
+    description = str(package.get("description", ""))
+    if len(description.encode()) > DESCRIPTION_LENGTH:
+        problems.append(f"{crate}: the description is {len(description.encode())} bytes, over the crates.io limit of {DESCRIPTION_LENGTH}")
+    keywords = package.get("keywords", [])
+    if len(keywords) > KEYWORDS:
+        problems.append(f"{crate}: {len(keywords)} keywords, over the crates.io limit of {KEYWORDS}")
+    for keyword in keywords:
+        if len(keyword.encode()) > KEYWORD_LENGTH:
+            problems.append(f"{crate}: keyword {keyword!r} is over the crates.io limit of {KEYWORD_LENGTH} bytes")
+        elif not valid_keyword(keyword):
+            problems.append(f"{crate}: keyword {keyword!r} is not a valid crates.io keyword")
+    categories = package.get("categories", [])
+    if len(categories) > CATEGORIES:
+        problems.append(f"{crate}: {len(categories)} categories, over the crates.io limit of {CATEGORIES}")
+    return problems
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent,
+                        help="workspace root (default: this repository)")
+    parser.add_argument("--packages", type=Path,
+                        help="directory of .crate files (default: the package directory of cargo's target directory)")
+    args = parser.parse_args()
+    problems = check(args.root.resolve(), args.packages)
+    for problem in problems:
+        print(f"error: {problem}")
+    if problems:
+        print(f"{len(problems)} problem(s) found")
+        return 1
+    print("ok: every published workspace crate is ready for crates.io")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

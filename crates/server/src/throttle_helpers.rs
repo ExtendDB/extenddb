@@ -130,6 +130,49 @@ fn extract_throughput_from_response(
     ))
 }
 
+/// Record throttle metrics for a batch response a backend served partially.
+///
+/// The server's own bucket records `ThrottledRequests` and the read or write
+/// throttle event when it refuses a request. A backend throttle that leaves
+/// requests or keys unprocessed returns a 200 and would otherwise count as no
+/// throttle at all, so this records `ThrottledRequests` and the read or write
+/// throttle event once per table the engine reports throttled
+/// (`DispatchMetrics::throttled_tables`), with the account and the table as
+/// the dimensions the bucket's own records carry. The response's
+/// `UnprocessedItems` is no throttle count: it also holds requests deferred
+/// for a transient, conflict or connection failure.
+pub(crate) fn record_partial_batch_throttle(
+    metrics: &extenddb_core::metrics::MetricsCollector,
+    account_id: &str,
+    operation: &str,
+    throttled_tables: &[String],
+) {
+    use extenddb_core::metrics::MetricName;
+    let event = match operation {
+        "BatchGetItem" => MetricName::ReadThrottleEvents,
+        "BatchWriteItem" => MetricName::WriteThrottleEvents,
+        _ => return,
+    };
+    for table in throttled_tables {
+        metrics.record(
+            MetricName::ThrottledRequests,
+            1.0,
+            Some(account_id),
+            Some(table),
+            None,
+            Some(operation),
+        );
+        metrics.record(
+            event,
+            1.0,
+            Some(account_id),
+            Some(table),
+            None,
+            Some(operation),
+        );
+    }
+}
+
 /// Extract the partition key value from a request body for per-partition throttling.
 ///
 /// For item-level operations (`GetItem`, `PutItem`, `DeleteItem`, `UpdateItem`),
@@ -492,5 +535,64 @@ mod throttle_error_tests {
             assert_eq!(err.throttling_reasons(), Some(&[][..]), "{cause:?}");
             assert!(!err.message().is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod partial_batch_throttle_tests {
+    use extenddb_core::metrics::{MetricName, MetricsCollector, MetricsQuery, TimeWindow};
+
+    use super::record_partial_batch_throttle;
+
+    const ACCOUNT: &str = "111111111111";
+
+    fn sum(c: &MetricsCollector, metric: MetricName, table: Option<&str>) -> f64 {
+        c.query(&MetricsQuery {
+            account_id: Some(ACCOUNT.to_owned()),
+            table_name: table.map(str::to_owned),
+            metric: Some(metric),
+            window: Some(TimeWindow::AllTime),
+            ..Default::default()
+        })
+        .iter()
+        .map(|s| s.sum)
+        .sum()
+    }
+
+    #[test]
+    fn a_partial_batch_get_records_a_request_and_a_read_event_per_table() {
+        let c = MetricsCollector::new();
+        record_partial_batch_throttle(
+            &c,
+            ACCOUNT,
+            "BatchGetItem",
+            &["T".to_owned(), "U".to_owned()],
+        );
+        assert_eq!(sum(&c, MetricName::ThrottledRequests, None), 2.0);
+        assert_eq!(sum(&c, MetricName::ThrottledRequests, Some("T")), 1.0);
+        assert_eq!(sum(&c, MetricName::ThrottledRequests, Some("U")), 1.0);
+        assert_eq!(sum(&c, MetricName::ReadThrottleEvents, Some("T")), 1.0);
+        assert_eq!(sum(&c, MetricName::ReadThrottleEvents, Some("U")), 1.0);
+        assert_eq!(sum(&c, MetricName::WriteThrottleEvents, None), 0.0);
+    }
+
+    #[test]
+    fn a_partial_batch_write_records_a_write_event() {
+        let c = MetricsCollector::new();
+        record_partial_batch_throttle(&c, ACCOUNT, "BatchWriteItem", &["T".to_owned()]);
+        assert_eq!(sum(&c, MetricName::ThrottledRequests, Some("T")), 1.0);
+        assert_eq!(sum(&c, MetricName::WriteThrottleEvents, Some("T")), 1.0);
+    }
+
+    /// A batch with no throttled table and a non-batch operation record
+    /// nothing.
+    #[test]
+    fn a_full_batch_or_another_operation_records_nothing() {
+        let c = MetricsCollector::new();
+        record_partial_batch_throttle(&c, ACCOUNT, "BatchGetItem", &[]);
+        record_partial_batch_throttle(&c, ACCOUNT, "BatchWriteItem", &[]);
+        record_partial_batch_throttle(&c, ACCOUNT, "GetItem", &["T".to_owned()]);
+        assert_eq!(sum(&c, MetricName::ThrottledRequests, None), 0.0);
+        assert_eq!(sum(&c, MetricName::ReadThrottleEvents, None), 0.0);
     }
 }

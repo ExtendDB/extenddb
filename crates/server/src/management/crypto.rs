@@ -3,11 +3,15 @@
 
 //! Shared cryptographic helpers for the management API.
 //!
-//! Provides secret key generation and AES-256-GCM encryption used by both
-//! permanent access keys (`iam_user_self`) and temporary session credentials
-//! (`assume_role`).
+//! Provides secret key generation for the temporary session credentials that
+//! `assume_role` issues, and re-exports the AES-256-GCM secret encryption that
+//! every storage backend uses, from `extenddb_storage::secret_cipher`.
 
 use rand::Rng;
+
+/// Encrypt a secret key under the base64 catalog encryption key, with the
+/// access key id as the AAD. Returns `nonce || ciphertext || tag`.
+pub use extenddb_storage::secret_cipher::encrypt_secret;
 
 /// Generate a 40-character secret access key branded with `extenddb` prefix.
 ///
@@ -19,46 +23,6 @@ pub fn generate_secret_key() -> String {
         .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
         .collect();
     format!("extenddb{suffix}")
-}
-
-/// Encrypt a secret key with AES-256-GCM using the base64-encoded encryption key.
-///
-/// `aad` is Associated Authenticated Data (e.g., the access key ID) that binds
-/// the ciphertext to its context, preventing ciphertext from being moved between
-/// records (CB-11).
-///
-/// Returns `nonce || ciphertext` as a single byte vector.
-pub fn encrypt_secret(plaintext: &str, key_b64: &str, aad: &str) -> Result<Vec<u8>, String> {
-    use aes_gcm::Aes256Gcm;
-    use aes_gcm::KeyInit;
-    use aes_gcm::aead::Aead;
-    use aes_gcm::aead::Payload;
-    use base64::Engine;
-
-    let key_bytes = base64::engine::general_purpose::STANDARD
-        .decode(key_b64)
-        .map_err(|e| format!("decode encryption key: {e}"))?;
-
-    let key = aes_gcm::Key::<Aes256Gcm>::from_slice(&key_bytes);
-    let cipher = Aes256Gcm::new(key);
-
-    // Generate random 12-byte nonce.
-    let nonce_bytes: [u8; 12] = rand::random();
-    let nonce = aes_gcm::Nonce::from_slice(&nonce_bytes);
-
-    let payload = Payload {
-        msg: plaintext.as_bytes(),
-        aad: aad.as_bytes(),
-    };
-    let ciphertext = cipher
-        .encrypt(nonce, payload)
-        .map_err(|e| format!("encrypt: {e}"))?;
-
-    // Prepend nonce to ciphertext for storage.
-    let mut result = Vec::with_capacity(12 + ciphertext.len());
-    result.extend_from_slice(&nonce_bytes);
-    result.extend_from_slice(&ciphertext);
-    Ok(result)
 }
 
 /// Generate a 20-character session access key ID branded with `ASIAEXTENDDB` prefix.

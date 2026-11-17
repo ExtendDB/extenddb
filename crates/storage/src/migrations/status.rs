@@ -1,0 +1,405 @@
+// Copyright 2026 ExtendDB contributors
+// SPDX-License-Identifier: Apache-2.0
+
+//! The catalog status, the runner's errors, what a run did, and the process
+//! exit codes.
+
+use super::ledger::Outcome;
+use super::registry::MigrationId;
+use super::table::{Kind, StoreKind};
+
+/// One step a run applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedStep {
+    pub id: u32,
+    pub name: &'static str,
+    pub store_name: String,
+    /// `NotApplicable` for a migration that does not apply on this backend,
+    /// whose step recorded its ledger row and ran nothing.
+    pub outcome: Outcome,
+    /// The body's notes from this run. A reconverge leaves the row's notes
+    /// from the first application as they are, so these are printed only.
+    pub notes: Vec<String>,
+}
+
+/// What a run did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunReport {
+    /// The catalog version before the run; `None` without a ledger.
+    pub from: Option<u32>,
+    /// The catalog version after it.
+    pub to: Option<u32>,
+    pub applied: Vec<AppliedStep>,
+    /// Lines printed before the steps: the backend's preparation (the
+    /// SQLite copy's path), then one for each recorded migration a
+    /// reconverge skipped because it is not convergent.
+    pub notes: Vec<String>,
+}
+
+/// Process exit codes shared by `serve`, `migrate`, `migrate --yes` and
+/// `verify`.
+pub mod exit {
+    /// Current, or applied. `AheadCompatible` also exits 0, with a warning.
+    pub const OK: u8 = 0;
+    /// An error, and `Uninitialized` in a production build.
+    pub const ERROR: u8 = 1;
+    /// Migrations are pending that `migrate --yes` will apply.
+    pub const PENDING: u8 = 3;
+    /// The catalog has a breaking migration this binary does not know.
+    pub const AHEAD_INCOMPATIBLE: u8 = 4;
+    /// A person must act: `NeedsAttention`, `Changed`, `WrittenByOlderRelease`.
+    pub const ATTENTION: u8 = 5;
+    /// The lock or a running server outlasted the timeout; retry.
+    pub const LOCKED: u8 = 6;
+}
+
+/// A migration this binary carries that a store has no ledger row for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pending {
+    pub id: u32,
+    pub name: &'static str,
+    pub store: StoreKind,
+    /// The store instance (the SQLite file, a keyspace name).
+    pub store_name: String,
+    pub kind: Kind,
+}
+
+/// The stores of a `Behind` status's `pending` list whose ledger lacks a
+/// migration the catalog store's ledger has, which a run stopped between
+/// the catalog store and the others leaves: each with its own migration,
+/// the one before its first pending id, in the order `pending` names them,
+/// after the catalog store's migration. A store whose first pending id the
+/// catalog store lacks too is not behind it, as on an upgrade, where every
+/// store waits for the same migration. `None` when no store is behind.
+#[must_use]
+pub fn stores_behind(pending: &[Pending]) -> Option<(u32, Vec<(&Pending, u32)>)> {
+    let catalog_at = pending
+        .iter()
+        .filter(|p| p.store == StoreKind::Catalog)
+        .map(|p| p.id)
+        .min()
+        .map_or(MigrationId::LATEST.number(), |id| id.saturating_sub(1));
+    let mut behind: Vec<(&Pending, u32)> = Vec::new();
+    for p in pending.iter().filter(|p| p.store != StoreKind::Catalog) {
+        let at = p.id.saturating_sub(1);
+        match behind
+            .iter_mut()
+            .find(|(b, _)| b.store == p.store && b.store_name == p.store_name)
+        {
+            Some((_, lowest)) => *lowest = (*lowest).min(at),
+            None => behind.push((p, at)),
+        }
+    }
+    behind.retain(|(_, at)| *at < catalog_at);
+    (!behind.is_empty()).then_some((catalog_at, behind))
+}
+
+/// How many stores [`behind_line`] names before it counts the others.
+pub const BEHIND_NAMED: usize = 5;
+
+/// What a `Behind` status says first when [`stores_behind`] names stores:
+/// `account store x is at migration 0, behind the catalog store at
+/// migration 4`, or for several, `account store x (at migration 0) and data
+/// store y (at migration 3) are behind the catalog store at migration 4`.
+/// Past [`BEHIND_NAMED`] stores, the others are counted: `account store a
+/// (at migration 0), ..., account store e (at migration 0) and 995 more
+/// stores are behind the catalog store at migration 4`.
+#[must_use]
+pub fn behind_line(catalog_at: u32, behind: &[(&Pending, u32)]) -> String {
+    let named = |p: &Pending| format!("{} store {}", p.store.as_str(), p.store_name);
+    if let [(p, at)] = behind {
+        return format!(
+            "{} is at migration {at}, behind the catalog store at migration {catalog_at}",
+            named(p)
+        );
+    }
+    let mut items: Vec<String> = behind
+        .iter()
+        .take(BEHIND_NAMED)
+        .map(|(p, at)| format!("{} (at migration {at})", named(p)))
+        .collect();
+    let more = behind.len().saturating_sub(BEHIND_NAMED);
+    let last = match more {
+        0 => items.pop().unwrap_or_default(),
+        1 => "1 more store".to_owned(),
+        n => format!("{n} more stores"),
+    };
+    format!(
+        "{} and {last} are behind the catalog store at migration {catalog_at}",
+        items.join(", ")
+    )
+}
+
+/// The status `serve`, `migrate` and `verify` act on. When several apply, it
+/// is the first in this order: `Changed`, `WrittenByOlderRelease`,
+/// `AheadIncompatible`, `NeedsAttention`, `Behind`, `AheadCompatible`,
+/// `Current`. `Uninitialized` is decided before all of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogStatus {
+    /// Every migration this binary carries is recorded in every store it
+    /// touches.
+    Current { version: u32 },
+    /// Migrations this binary carries are missing. `version` is `None` for a
+    /// catalog with no ledger (a release before 1.0, behind at migration 1).
+    Behind {
+        version: Option<u32>,
+        pending: Vec<Pending>,
+    },
+    /// The catalog ledger has ids above this binary's, all additive.
+    AheadCompatible {
+        version: u32,
+        unknown: Vec<(u32, String)>,
+    },
+    /// The catalog ledger has an id above this binary's that is breaking.
+    AheadIncompatible { unknown: Vec<(u32, String)> },
+    /// A pending code body's `detect` returned items.
+    NeedsAttention { items: Vec<String> },
+    /// A recorded checksum differs from this binary's body.
+    Changed {
+        id: u32,
+        store_name: String,
+        recorded: String,
+        expected: String,
+    },
+    /// The catalog ledger has a row for migration 1 and a release before 1.0
+    /// wrote to the catalog afterwards.
+    WrittenByOlderRelease { trace: String },
+    /// Not a catalog: no ledger row and no `catalog_version` row.
+    Uninitialized,
+}
+
+impl CatalogStatus {
+    /// The exit code for this status as read, for `serve`, `migrate` without
+    /// `--yes` and `verify` in a production build. `migrate --yes` exits 0
+    /// once it has applied a `Behind` catalog.
+    #[must_use]
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::Current { .. } | Self::AheadCompatible { .. } => exit::OK,
+            Self::Behind { .. } => exit::PENDING,
+            Self::AheadIncompatible { .. } => exit::AHEAD_INCOMPATIBLE,
+            Self::NeedsAttention { .. }
+            | Self::Changed { .. }
+            | Self::WrittenByOlderRelease { .. } => exit::ATTENTION,
+            Self::Uninitialized => exit::ERROR,
+        }
+    }
+
+    /// A short name for tests.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Current { .. } => "Current",
+            Self::Behind { .. } => "Behind",
+            Self::AheadCompatible { .. } => "AheadCompatible",
+            Self::AheadIncompatible { .. } => "AheadIncompatible",
+            Self::NeedsAttention { .. } => "NeedsAttention",
+            Self::Changed { .. } => "Changed",
+            Self::WrittenByOlderRelease { .. } => "WrittenByOlderRelease",
+            Self::Uninitialized => "Uninitialized",
+        }
+    }
+}
+
+impl std::fmt::Display for CatalogStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Current { version } => write!(f, "the catalog is at migration {version}"),
+            Self::Behind { version, pending } => {
+                let at = match (stores_behind(pending), version) {
+                    (Some((catalog_at, behind)), _) => behind_line(catalog_at, &behind),
+                    (None, Some(v)) => format!("the catalog is at migration {v}"),
+                    (None, None) => {
+                        "the catalog has no migration ledger (a release before 1.0)".to_owned()
+                    }
+                };
+                let list: Vec<String> = pending
+                    .iter()
+                    .map(|p| {
+                        format!(
+                            "{} {} ({}, {})",
+                            p.id,
+                            p.name,
+                            p.store.as_str(),
+                            p.kind.as_str()
+                        )
+                    })
+                    .collect();
+                write!(f, "{at}; pending: {}", list.join(", "))
+            }
+            Self::AheadCompatible { version, unknown } => write!(
+                f,
+                "the catalog is at migration {version}, ahead of this binary by additive \
+                 migrations only: {}",
+                unknown_list(unknown)
+            ),
+            Self::AheadIncompatible { unknown } => write!(
+                f,
+                "the catalog has migrations this binary does not know, at least one of them \
+                 breaking: {}",
+                unknown_list(unknown)
+            ),
+            Self::NeedsAttention { items } => write!(
+                f,
+                "a pending migration needs attention before it can run: {}",
+                items.join("; ")
+            ),
+            Self::Changed {
+                id,
+                store_name,
+                recorded,
+                expected,
+            } => write!(
+                f,
+                "migration {id} in {store_name} was recorded with checksum {recorded}, and this \
+                 binary's body has {expected}"
+            ),
+            Self::WrittenByOlderRelease { trace } => write!(
+                f,
+                "a release before 1.0 wrote to this catalog after it was migrated ({trace}); \
+                 run 'extenddb migrate --yes --reconverge'"
+            ),
+            Self::Uninitialized => write!(f, "the catalog is not initialized"),
+        }
+    }
+}
+
+fn unknown_list(unknown: &[(u32, String)]) -> String {
+    unknown
+        .iter()
+        .map(|(id, name)| format!("{id} {name}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Why the runner stopped.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MigrationError {
+    /// A connection or statement failed, or a body returned an error.
+    #[error("{0}")]
+    Store(String),
+    /// A statement failed with a database error code (PostgreSQL's
+    /// SQLSTATE). The runner reads the code, never the message, to run a
+    /// body again after a lock timeout or to name the owners of tables the
+    /// role may not alter.
+    #[error("{message}")]
+    Database { message: String, sqlstate: String },
+    /// The catalog's status forbids the requested run.
+    #[error("{0}")]
+    Status(CatalogStatus),
+    /// `forget`, `reconverge` or a backend precondition refused the request.
+    #[error("{0}")]
+    Refused(String),
+    /// The lock was not free within the timeout.
+    #[error("{0}")]
+    Locked(String),
+    /// Sessions an earlier run left behind still hold what this run needs,
+    /// past the timeout, and do not end by themselves: the message names
+    /// them and the statement that ends them. Exits as [`Self::Locked`].
+    #[error("{0}")]
+    Blocked(String),
+    /// A run stopped on `error` after its preparation: `report` holds what
+    /// it did first, the steps it committed and the backend's lines (the
+    /// SQLite copy's path).
+    #[error("{error}")]
+    Stopped {
+        error: Box<MigrationError>,
+        report: RunReport,
+    },
+}
+
+impl MigrationError {
+    /// The process exit code for this error.
+    #[must_use]
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::Store(_) | Self::Database { .. } | Self::Refused(_) => exit::ERROR,
+            Self::Status(status) => status.exit_code(),
+            Self::Locked(_) | Self::Blocked(_) => exit::LOCKED,
+            Self::Stopped { error, .. } => error.exit_code(),
+        }
+    }
+
+    /// Shorthand for a store error with context.
+    pub fn store(context: impl std::fmt::Display, err: impl std::fmt::Display) -> Self {
+        Self::Store(format!("{context}: {err}"))
+    }
+
+    /// A store error with context that keeps the database's error code when
+    /// the driver reported one. Each backend's helper that maps its driver's
+    /// error calls this.
+    pub fn coded(
+        context: impl std::fmt::Display,
+        err: impl std::fmt::Display,
+        sqlstate: Option<String>,
+    ) -> Self {
+        let message = format!("{context}: {err}");
+        match sqlstate {
+            Some(sqlstate) => Self::Database { message, sqlstate },
+            None => Self::Store(message),
+        }
+    }
+
+    /// The database error code of the statement that failed, when the error
+    /// carries one.
+    #[must_use]
+    pub fn sqlstate(&self) -> Option<&str> {
+        match self {
+            Self::Database { sqlstate, .. } => Some(sqlstate),
+            Self::Stopped { error, .. } => error.sqlstate(),
+            Self::Store(_)
+            | Self::Status(_)
+            | Self::Refused(_)
+            | Self::Locked(_)
+            | Self::Blocked(_) => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BEHIND_NAMED, Pending, behind_line};
+    use crate::migrations::table::{Kind, StoreKind};
+
+    fn account(n: usize) -> Pending {
+        Pending {
+            id: 1,
+            name: "baseline",
+            store: StoreKind::Account,
+            store_name: format!("ks_account_{n}"),
+            kind: Kind::Breaking,
+        }
+    }
+
+    /// Two stores are both named; past `BEHIND_NAMED` the others are
+    /// counted, as on a deployment with many account keyspaces behind.
+    #[test]
+    fn the_behind_line_names_a_few_stores_and_counts_the_others() {
+        let two: Vec<Pending> = (1..=2).map(account).collect();
+        let behind: Vec<(&Pending, u32)> = two.iter().map(|p| (p, 0)).collect();
+        assert_eq!(
+            behind_line(4, &behind),
+            "account store ks_account_1 (at migration 0) and account store ks_account_2 (at \
+             migration 0) are behind the catalog store at migration 4"
+        );
+
+        let many: Vec<Pending> = (1..=1000).map(account).collect();
+        let behind: Vec<(&Pending, u32)> = many.iter().map(|p| (p, 0)).collect();
+        let line = behind_line(4, &behind);
+        assert!(
+            line.starts_with("account store ks_account_1 (at migration 0), ")
+                && line.contains("ks_account_5 (at migration 0) and 995 more stores are behind")
+                && !line.contains("ks_account_6"),
+            "{line}"
+        );
+
+        let one_more: Vec<Pending> = (1..=BEHIND_NAMED + 1).map(account).collect();
+        let behind: Vec<(&Pending, u32)> = one_more.iter().map(|p| (p, 0)).collect();
+        assert!(
+            behind_line(4, &behind).contains(" and 1 more store are behind"),
+            "{}",
+            behind_line(4, &behind)
+        );
+    }
+}

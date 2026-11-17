@@ -197,22 +197,25 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for PostgresCatalogStore {
 
 // ── MetricsStore ───────────────────────────────────────────────────────
 
+/// `account_metrics`: migration 10 replaced `metrics` with it.
 impl extenddb_storage::management_store::MetricsStore for PostgresCatalogStore {
     fn insert_metrics(&self, rows: &[MetricsRow]) -> BoxFuture<'_, OpResult<()>> {
         let rows = rows.to_vec();
         Box::pin(async move {
             for row in &rows {
                 let result = sqlx::query(
-                    "INSERT INTO metrics \
-                     (bucket, metric, table_name, index_name, operation, sum, count, min, max) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
-                     ON CONFLICT (bucket, metric, table_name, index_name, operation) \
-                     DO UPDATE SET sum = metrics.sum + EXCLUDED.sum, \
-                                   count = metrics.count + EXCLUDED.count, \
-                                   min = LEAST(metrics.min, EXCLUDED.min), \
-                                   max = GREATEST(metrics.max, EXCLUDED.max)",
+                    "INSERT INTO account_metrics \
+                     (bucket, account_id, metric, table_name, index_name, operation, \
+                      sum, count, min, max) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+                     ON CONFLICT (bucket, account_id, metric, table_name, index_name, operation) \
+                     DO UPDATE SET sum = account_metrics.sum + EXCLUDED.sum, \
+                                   count = account_metrics.count + EXCLUDED.count, \
+                                   min = LEAST(account_metrics.min, EXCLUDED.min), \
+                                   max = GREATEST(account_metrics.max, EXCLUDED.max)",
                 )
                 .bind(row.bucket)
+                .bind(row.account_id.as_deref().unwrap_or(""))
                 .bind(&row.metric)
                 .bind(row.table_name.as_deref().unwrap_or(""))
                 .bind(row.index_name.as_deref().unwrap_or(""))
@@ -235,41 +238,35 @@ impl extenddb_storage::management_store::MetricsStore for PostgresCatalogStore {
         &self,
         start: time::OffsetDateTime,
         end: time::OffsetDateTime,
-        table_name: Option<&str>,
-        metric: Option<&str>,
+        filter: &extenddb_storage::management_store::MetricsFilter,
     ) -> BoxFuture<'_, OpResult<Vec<MetricsRow>>> {
-        let table_name = table_name.map(std::borrow::ToOwned::to_owned);
-        let metric = metric.map(std::borrow::ToOwned::to_owned);
+        let filters: Vec<(&'static str, String)> = [
+            ("account_id", filter.account_id()),
+            ("table_name", filter.table_name()),
+            ("metric", filter.metric()),
+        ]
+        .into_iter()
+        .filter_map(|(column, value)| value.map(|v| (column, v.to_owned())))
+        .collect();
         Box::pin(async move {
             use std::fmt::Write as _;
 
             let mut sql = String::from(
-                "SELECT bucket, metric, table_name, index_name, operation, \
+                "SELECT bucket, account_id, metric, table_name, index_name, operation, \
                  sum, count, min, max \
-                 FROM metrics WHERE bucket >= $1 AND bucket <= $2",
+                 FROM account_metrics WHERE bucket >= $1 AND bucket <= $2",
             );
-            let mut param_idx = 3u32;
-
-            let table_filter = table_name.as_deref().filter(|s| !s.is_empty());
-            if table_filter.is_some() {
-                let _ = write!(sql, " AND table_name = ${param_idx}");
-                param_idx += 1;
+            for (i, (column, _)) in filters.iter().enumerate() {
+                let _ = write!(sql, " AND {column} = ${}", i + 3);
             }
-            if metric.is_some() {
-                let _ = write!(sql, " AND metric = ${param_idx}");
-            }
-            let _ = param_idx;
             sql.push_str(" ORDER BY bucket");
 
             // Build the query with dynamic binds.
             let mut query = sqlx::query_as::<_, DbMetricsRow>(&sql)
                 .bind(start)
                 .bind(end);
-            if let Some(tn) = table_filter {
-                query = query.bind(tn);
-            }
-            if let Some(mn) = metric.as_deref() {
-                query = query.bind(mn);
+            for (_, value) in &filters {
+                query = query.bind(value);
             }
 
             let rows = query.fetch_all(&self.pool).await.map_err(|e| {
@@ -277,26 +274,16 @@ impl extenddb_storage::management_store::MetricsStore for PostgresCatalogStore {
                 OpError::Internal("Database error".to_owned())
             })?;
 
+            let present = |s: String| (!s.is_empty()).then_some(s);
             Ok(rows
                 .into_iter()
                 .map(|r| MetricsRow {
                     bucket: r.bucket,
+                    account_id: present(r.account_id),
                     metric: r.metric,
-                    table_name: if r.table_name.is_empty() {
-                        None
-                    } else {
-                        Some(r.table_name)
-                    },
-                    index_name: if r.index_name.is_empty() {
-                        None
-                    } else {
-                        Some(r.index_name)
-                    },
-                    operation: if r.operation.is_empty() {
-                        None
-                    } else {
-                        Some(r.operation)
-                    },
+                    table_name: present(r.table_name),
+                    index_name: present(r.index_name),
+                    operation: present(r.operation),
                     sum: r.sum,
                     count: r.count,
                     min: r.min,
@@ -311,7 +298,7 @@ impl extenddb_storage::management_store::MetricsStore for PostgresCatalogStore {
             #[allow(clippy::cast_possible_wrap)] // retention seconds fit in i64
             let cutoff = time::OffsetDateTime::now_utc()
                 - time::Duration::seconds(retention.as_secs() as i64);
-            sqlx::query("DELETE FROM metrics WHERE bucket < $1")
+            sqlx::query("DELETE FROM account_metrics WHERE bucket < $1")
                 .bind(cutoff)
                 .execute(&self.pool)
                 .await
@@ -328,6 +315,7 @@ impl extenddb_storage::management_store::MetricsStore for PostgresCatalogStore {
 #[derive(sqlx::FromRow)]
 struct DbMetricsRow {
     bucket: time::OffsetDateTime,
+    account_id: String,
     metric: String,
     table_name: String,
     index_name: String,
@@ -344,16 +332,19 @@ impl extenddb_storage::management_store::RateLimitStore for PostgresCatalogStore
     fn count_principal_failures(
         &self,
         principal: &str,
+        source_ip: &str,
         window_seconds: i64,
     ) -> BoxFuture<'_, OpResult<i64>> {
         let principal = principal.to_owned();
+        let source_ip = source_ip.to_owned();
         Box::pin(async move {
             let row: (i64,) = sqlx::query_as(
                 "SELECT COUNT(*) FROM login_attempts \
-                 WHERE principal = $1 AND success = false \
-                 AND attempted_at > NOW() - make_interval(secs => $2)",
+                 WHERE principal = $1 AND source_ip = $2 AND success = false \
+                 AND attempted_at > NOW() - make_interval(secs => $3)",
             )
             .bind(&principal)
+            .bind(&source_ip)
             .bind(window_seconds)
             .fetch_one(&self.pool)
             .await

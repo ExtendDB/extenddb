@@ -5,6 +5,8 @@
 
 use extenddb_storage::management_store::{GroupDetail, OpError, OpResult};
 
+use super::database_error;
+use super::policies::delete_principal_attachments;
 use crate::catalog_store::PostgresCatalogStore;
 use crate::pg_util::{is_fk_violation, is_unique_violation};
 
@@ -15,25 +17,40 @@ impl PostgresCatalogStore {
         group_name: &str,
     ) -> OpResult<()> {
         let group_arn = format!("arn:aws:iam::{account_id}:group/{group_name}");
+        let mut tx = self.pool().begin().await.map_err(|e| {
+            tracing::error!("create_group begin transaction: {e}");
+            OpError::Internal("Database error".to_owned())
+        })?;
         let result = sqlx::query(
             "INSERT INTO iam_groups (account_id, group_name, group_arn) VALUES ($1, $2, $3)",
         )
         .bind(account_id)
         .bind(group_name)
         .bind(&group_arn)
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await;
         match result {
-            Ok(_) => Ok(()),
-            Err(e) if is_unique_violation(&e) => Err(OpError::AlreadyExists(
-                "IAM group already exists".to_owned(),
-            )),
-            Err(e) if is_fk_violation(&e) => Err(OpError::NotFound("Account not found".to_owned())),
+            Ok(_) => {}
+            Err(e) if is_unique_violation(&e) => {
+                return Err(OpError::AlreadyExists(
+                    "IAM group already exists".to_owned(),
+                ));
+            }
+            Err(e) if is_fk_violation(&e) => {
+                return Err(OpError::NotFound("Account not found".to_owned()));
+            }
             Err(e) => {
                 tracing::error!("create_group failed: {e}");
-                Err(OpError::Internal("Database error".to_owned()))
+                return Err(OpError::Internal("Database error".to_owned()));
             }
         }
+        // A group deleted before deletes removed them could have left its
+        // inline policies under this name.
+        delete_principal_attachments(&mut tx, account_id, "group", group_name).await?;
+        tx.commit().await.map_err(|e| {
+            tracing::error!("create_group commit: {e}");
+            OpError::Internal("Database error".to_owned())
+        })
     }
 
     pub(crate) async fn delete_group_impl(
@@ -41,22 +58,33 @@ impl PostgresCatalogStore {
         account_id: &str,
         group_name: &str,
     ) -> OpResult<()> {
+        let mut tx = self.pool().begin().await.map_err(|e| {
+            tracing::error!("delete_group begin transaction: {e}");
+            OpError::Internal("Database error".to_owned())
+        })?;
+        // The foreign keys remove the group's memberships. Its inline
+        // policies have none.
         let result =
             sqlx::query("DELETE FROM iam_groups WHERE account_id = $1 AND group_name = $2")
                 .bind(account_id)
                 .bind(group_name)
-                .execute(self.pool())
+                .execute(&mut *tx)
                 .await;
         match result {
             Ok(r) if r.rows_affected() == 0 => {
-                Err(OpError::NotFound("IAM group not found".to_owned()))
+                return Err(OpError::NotFound("IAM group not found".to_owned()));
             }
-            Ok(_) => Ok(()),
+            Ok(_) => {}
             Err(e) => {
                 tracing::error!("delete_group failed: {e}");
-                Err(OpError::Internal("Database error".to_owned()))
+                return Err(OpError::Internal("Database error".to_owned()));
             }
         }
+        delete_principal_attachments(&mut tx, account_id, "group", group_name).await?;
+        tx.commit().await.map_err(|e| {
+            tracing::error!("delete_group commit: {e}");
+            OpError::Internal("Database error".to_owned())
+        })
     }
 
     pub(crate) async fn list_groups_impl(
@@ -70,10 +98,7 @@ impl PostgresCatalogStore {
         .bind(account_id)
         .fetch_all(self.pool())
         .await
-        .map_err(|e| {
-            tracing::error!("list_groups: {e}");
-            OpError::Internal("Database error".to_owned())
-        })
+        .map_err(|e| database_error("list_groups", &e))
     }
 
     pub(crate) async fn get_group_detail_impl(

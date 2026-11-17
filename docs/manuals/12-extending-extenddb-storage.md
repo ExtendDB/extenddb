@@ -40,7 +40,7 @@ A new backend must implement **13 storage traits** plus the `CredentialStore` tr
 7. `AdminStore` — admin user management
 8. `SettingsStore` — runtime settings
 9. `MetricsStore` — historical metrics persistence and query
-10. `RateLimitStore` — login rate limiting and account lockout
+10. `RateLimitStore`: login rate limiting per user and source address
 11. `AuthorizationStore` — policy lookups for authorization decisions
 12. `BackupEngine` — backup and restore operations
 13. `Bootstrapper` — database initialization, destruction, migration, verification
@@ -178,7 +178,7 @@ Defined in `crates/storage/src/management_store/mod.rs`. Covers all IAM CRUD ope
 | `get_account_summary` | Account summary (user/group/role/policy counts) |
 
 Key design decisions:
-- Account deletion must cascade to all users, groups, roles, policies, and access keys atomically.
+- Deleting an account, user, group or role must remove everything it owns, and creating one must remove what an older delete left under its name or id (see [CASCADE Semantics](#cascade-semantics)).
 - Access key secrets are encrypted (AES-256-GCM) before storage.
 - Sessions have expiration enforcement.
 
@@ -210,8 +210,11 @@ Defined in `crates/storage/src/management_store/mod.rs`. Historical metrics pers
 
 | Method | Purpose |
 |--------|---------|
-| `record_metrics` | Insert a metrics snapshot |
-| `query_metrics` | Query metrics by time range, operation, and table filters |
+| `insert_metrics` | Insert a batch of one-minute rows, each with the account it was recorded for (none for a metric of the whole deployment) |
+| `query_metrics` | Query rows by time range, filtered by `MetricsFilter`: account, table name and metric |
+| `prune_metrics` | Delete rows older than the retention period |
+
+Two accounts' rows for a table of the same name must never be read back as one: a store that adds rows of one key together keeps the account in the key. `extenddb_storage::metrics_conformance::run` (feature `test-util`) checks a store against a migrated catalog.
 
 ### RateLimitStore
 
@@ -219,9 +222,12 @@ Defined in `crates/storage/src/management_store/mod.rs`. Login rate limiting:
 
 | Method | Purpose |
 |--------|---------|
-| `record_login_attempt` | Record a login attempt (success or failure) |
-| `recent_failed_attempts` | Count recent failed attempts for lockout decisions |
+| `count_principal_failures` | Count recent failed attempts for one principal from one source address |
+| `count_ip_failures` | Count recent failed attempts from one source address, over all principals |
+| `record_failed_login` | Record a failed login attempt with its source address |
 | `cleanup_old_attempts` | Garbage-collect old login attempt records |
+
+Password verification in a backend's `AdminStore` and `ManagementStore` must go through `extenddb_storage::password`, which bounds concurrent bcrypt work per process. `verify_admin_password` checks an existing admin's hash with `verify_password` and returns `None` without a bcrypt check when no admin has the name. `verify_iam_user_password` passes the user's hash to `verify_stored_password`, or `None` when the account or the user does not exist or the user has no console password; with `None`, the helper checks the password against a fixed hash and refuses it. A login checks the admin first and the IAM user only when no admin has the name, so every login runs one bcrypt check whether or not the name exists. The management API checks through these two methods and runs the fixed-hash check itself for a name without `/`. The console reads the stored hashes through `PasswordHashStore` and passes them to `verify_stored_password` itself, with `None` for a name without `/` and when `get_user_password_hash` returns `None`.
 
 ### AuthorizationStore
 
@@ -286,8 +292,8 @@ The `storage-postgres` crate provides the default implementation:
 ### Database Architecture
 
 extenddb uses a dual-database architecture:
-- **Catalog database** (`extenddb`) — table metadata, IAM data, settings, metrics, stream records, tags, idempotency tokens, login attempts
-- **Data database** (`extenddb_data`) — DynamoDB items and index rows
+- **Catalog database** (`extenddb_catalog` by default) — table metadata, IAM data, settings, metrics, stream records, tags, idempotency tokens, login attempts
+- **Data database** (`extenddb` by default, the catalog's name without `_catalog`) — DynamoDB items and index rows
 
 ### Migrations
 
@@ -358,7 +364,7 @@ inventory::submit! {
 
 The `bin` crate will discover your backend at startup and select it by name from the configuration.
 
-A thin binary that needs HTTP routes of its own (a status page, a control endpoint) or a hook on every request passes an `extenddb_app::Extensions` to `extenddb_app::run_with` in place of `run`. `Extensions::http` is a `Vec<(String, axum::Router)>`, built against the `axum` that `extenddb_app` re-exports; `Extensions::request_observer` is an `Option<Arc<dyn RequestObserver>>`, and the trait has one method, `fn on_response(&self, record: RequestRecord)`, on a `Send + Sync` type. Routers mount under absolute prefixes of literal segments, outside `/health`, `/metrics`, `/management` and `/console`, and not at, under or above another extension's prefix; a refused prefix stops the server before it connects to the backend. Their responses carry the server's security headers. Nothing else of the server's applies to them: no authentication, no request rate limit, and axum's default 2 MB body limit for the limited extractors (none for a raw `Body`). A route that changes state or reads data authenticates in its own handler or layer. A `RequestObserver` receives one `RequestRecord` per request that reached authentication, after the response is built, on the request's task, with no lock held and no ordering across requests; keep `on_response` short or hand the record to a task of your own, since the response is written after it returns, and do not let it panic, since a panic there closes the connection. The record's `table_name` is the request's top-level `TableName`, so it is `None` for the batch, transaction, PartiQL and stream operations; its two SDK fields are client-supplied text. `with_console_tab(label, slug, router)` adds a page to the console at `/console/<slug>`, reachable only with a console session; the router's handlers take an `axum::Extension<ConsoleIdentity>` and render the console's layout with `extenddb_app::console_html::nav_bar(&identity.label, &identity.tabs)` and `console_html::layout_with_version_csrf(title, &nav, content, Some(&identity.version_info), &identity.csrf_token)`, the calls the built-in pages make, so the page looks like them. Every console user reaches the tab, an admin or an IAM user with a console password; `identity.is_admin` tells them apart, and a page meant for admins answers 403 when it is false, as `/console/settings` and `/console/cache` do. A POST handler on the tab reads the `_csrf` form field, which the layout adds to every form on the page, and refuses the request with 403 unless `identity.csrf_matches(&form.csrf)`; the built-in pages do the same on every mutation. Every path under the slug meets the session check: a fallback the tab's router sets is replaced by a plain 404 inside it. The slug is one segment of `[a-z0-9-]`, not `login`, `logout`, `docs`, `metrics`, `metrics-data`, `settings`, `cache`, `accounts`, `users`, `groups`, `roles`, `policies` or `access-keys`, and not another tab's.
+A thin binary that needs HTTP routes of its own (a status page, a control endpoint) or a hook on every request passes an `extenddb_app::Extensions` to `extenddb_app::run_with` in place of `run`. `Extensions::http` is a `Vec<(String, axum::Router)>`, built against the `axum` that `extenddb_app` re-exports; `Extensions::request_observer` is an `Option<Arc<dyn RequestObserver>>`, and the trait has one method, `fn on_response(&self, record: RequestRecord)`, on a `Send + Sync` type. Routers mount under absolute prefixes of literal segments, outside `/health`, `/metrics`, `/management` and `/console`, and not at, under or above another extension's prefix; a refused prefix stops the server before it connects to the backend. Their responses carry the server's security headers, and the layers in front of every route apply to them: a `ServiceUnavailable` answer while the serving registration is lost, the refusal of a repeated `host` or `authorization` header, and the request body timeout. Nothing else of the server's applies to them: no authentication, no request rate limit, and axum's default 2 MB body limit for the limited extractors (none for a raw `Body`). A route that changes state or reads data authenticates in its own handler or layer. A `RequestObserver` receives one `RequestRecord` per request that reached authentication, after the response is built, on the request's task, with no lock held and no ordering across requests; keep `on_response` short or hand the record to a task of your own, since the response is written after it returns, and do not let it panic, since a panic there closes the connection. The record's `table_name` is the request's top-level `TableName`, so it is `None` for the batch, transaction, PartiQL and stream operations; its two SDK fields are client-supplied text. `with_console_tab(label, slug, router)` adds a page to the console at `/console/<slug>`, reachable only with a console session; the router's handlers take an `axum::Extension<ConsoleIdentity>` and render the console's layout with `extenddb_app::console_html::nav_bar(&console_html::NavIdentity { label: identity.label.clone(), is_admin: identity.is_admin }, &identity.tabs)` and `console_html::layout_with_version_csrf(title, &nav, content, Some(&identity.version_info), &identity.csrf_token)`, the calls the built-in pages make, so the page looks like them. Every console user reaches the tab, an admin or an IAM user with a console password; `identity.is_admin` tells them apart, and a page meant for admins answers 403 when it is false, as `/console/settings` and `/console/cache` do. A POST handler on the tab reads the `_csrf` form field, which the layout adds to every form on the page, and refuses the request with 403 unless `identity.csrf_matches(&form.csrf)`; the built-in pages do the same on every mutation. Every path under the slug meets the session check: a fallback the tab's router sets is replaced by a plain 404 inside it. The slug is one segment of `[a-z0-9-]`, not `login`, `logout`, `docs`, `metrics`, `metrics-data`, `settings`, `cache`, `accounts`, `users`, `groups`, `roles`, `policies` or `access-keys`, and not another tab's.
 
 ### Step 7: Test
 
@@ -392,7 +398,36 @@ Stream sequence numbers must be monotonically increasing within a shard. Your ba
 
 ### CASCADE Semantics
 
-Account deletion must cascade to all child resources (users, groups, roles, policies, access keys, sessions) atomically. Your backend must provide equivalent cascade logic.
+IAM records name their principal and account by value, and a record left
+behind belongs to the next principal or account created with that name or id:
+an inline policy or boundary grants it permissions, an access key or role
+session signs in as it, and a membership puts it in a group. So:
+
+- Deleting a user, group or role must also delete everything it owns: a
+  user's access keys, group memberships, tags, inline policies, boundary and
+  failed logins; a group's inline policies and memberships; a role's inline
+  policies, boundary, tags and sessions. On PostgreSQL and SQLite the foreign
+  keys cover all of it except inline policies and boundaries, which name their
+  principal by `(principal_type, principal_name)`, and failed logins, which the
+  `RateLimitStore` records under the sign-in name `account_id/user_name`. Those
+  are deleted in the same transaction as the principal. A user left with the
+  failures of a deleted one is refused with 429 on its first correct password.
+- Account deletion must cascade to all child resources (users, groups, roles,
+  policies, boundaries, access keys, memberships, tags, sessions), and delete
+  the failed logins recorded under any sign-in name `account_id/...`.
+- Creating a user, group or role must delete what is stored under its name
+  before it exists (rows an older release's delete left behind), and only
+  after its own insert succeeded, so that a create refused as a duplicate
+  touches nothing. Creating an account does the same for its id.
+- A backend without foreign keys deletes what a principal or account owns
+  before the principal or account itself, so that a failure leaves less, never
+  a credential without its owner. The MongoDB and Cassandra backends also treat
+  a user, access key, session or role of an account that no longer exists as
+  unknown when signing in or assuming a role.
+
+`extenddb_storage::iam_leftovers_conformance::run` (feature `test-util`)
+checks these properties against a real database; each backend's test suite
+runs it.
 
 ### Request Correlation
 
@@ -410,13 +445,13 @@ The PostgreSQL implementation makes backend-specific choices. These are implemen
 
 2. **Transaction isolation**: the PostgreSQL backend runs `transact_write_items` at `READ COMMITTED` and makes it serializable with locks held until commit: `SELECT ... FOR UPDATE` on every item that exists, and a reserved unique key on every item that a ConditionCheck or Delete finds missing. Your backend needs equivalent isolation guarantees.
 
-3. **Sequence generation** — stream sequence numbers use PostgreSQL sequences (`nextval`). Your backend needs a monotonic counter mechanism.
+3. **Sequence generation**: stream sequence numbers come from a PostgreSQL sequence (`nextval`), drawn after the write commits. A write stores its record in `stream_pending`, and a numbering step moves a shard's committed records to `stream_records` in the order they were stored, one numbering of a shard at a time; GetRecords and a `LATEST` iterator run one batch of it on their shard before they read. A number drawn inside the write's transaction could commit after a higher number that a consumer had already read past. Your backend needs numbers that become visible on each shard in increasing order: once a consumer has read a number, no record with a lower number may appear on that shard later ([RFC-0003](../rfcs/0003-backend-acceptance-criteria.md), criterion 5.2).
 
 4. **CASCADE deletes** — account deletion cascades through foreign keys. Your backend needs equivalent cascade logic (can be application-level).
 
 5. **Dual-database architecture** — catalog and data are separate PostgreSQL databases. Your backend might use a single database with keyspace separation, or a different topology entirely.
 
-6. **SQL migrations** — migration files are raw SQL. Your backend needs its own schema initialization mechanism, exposed through `Bootstrapper`.
+6. **SQL migrations**: migration files are raw SQL. Your backend applies the numbered catalog migrations through the shared runner: it implements `CatalogMigrations` (`crates/storage/src/migrations/catalog.rs`), installs it in its `Backend`, and declares a body or a reason for every id. Its `Bootstrapper` keeps database creation and the rows `init` writes after the migrations. [ADR-0023](../adr/0023-catalog-migrations.md) records the design and the [catalog migration section](../../CONTRIBUTING.md#adding-a-catalog-migration) of `CONTRIBUTING.md` the procedure.
 
 ## Summary of Traits and Implementations
 
@@ -438,3 +473,14 @@ The PostgreSQL implementation makes backend-specific choices. These are implemen
 | `CredentialStore` | `auth/src/lib.rs`                     | `DbCredentialStore` | SigV4 credential lookup |
 
 All PostgreSQL-specific code lives in `crates/storage-postgres/`. The `server` crate has no direct database dependencies. Backends register at compile time via the `inventory` crate and are selected by name at startup.
+
+---
+
+## License
+
+Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
+See [LICENSE](../../LICENSE) for the full text.
+
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.
