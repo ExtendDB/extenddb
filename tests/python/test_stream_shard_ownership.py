@@ -143,12 +143,15 @@ class TestShardBelongsToIteratorStream:
             for name in (name_a, name_b):
                 wait_for_deleted(dynamodb_client, name)
 
-    def test_iterator_reads_only_while_its_arn_is_the_tables_stream(
+    def test_iterator_reads_only_the_stream_its_arn_names(
         self, dynamodb_client, streams_client
     ):
         """An iterator issued before the stream was disabled and enabled again
-        keeps reading while the table keeps its stream ARN: across the four
-        shards it reads the same records a fresh iterator on each shard reads."""
+        keeps reading the stream it was issued for. Re-enabling creates a
+        stream with a new ARN, as on the service, so the writes after it are
+        in the new stream's shards alone: across the four old shards the old
+        iterators read the same records a fresh iterator on each reads, and
+        none of the new keys."""
         name, old_arn = _create_stream_table(dynamodb_client)
         try:
             old_shards = _shards(streams_client, old_arn)
@@ -160,14 +163,14 @@ class TestShardBelongsToIteratorStream:
             dynamodb_client.update_table(TableName=name, StreamSpecification=STREAM_SPEC)
             wait_for_active(dynamodb_client, name)
             new_arn = dynamodb_client.describe_table(TableName=name)["Table"]["LatestStreamArn"]
-            # A re-enabled stream with a new ARN, as on the service, becomes reachable with #515.
-            assert new_arn == old_arn, f"re-enabling made a new stream ARN: {new_arn}"
+            assert new_arn != old_arn, f"re-enabling kept the stream ARN: {new_arn}"
             new_keys = {f"n{i}" for i in range(8)}
             for key in sorted(new_keys):
                 dynamodb_client.put_item(TableName=name, Item={"pk": {"S": key}})
             time.sleep(1)
 
             new_shards = _shards(streams_client, new_arn)
+            assert not set(new_shards) & set(old_shards), (old_shards, new_shards)
             new_records = [
                 r
                 for s in new_shards
@@ -183,7 +186,15 @@ class TestShardBelongsToIteratorStream:
             old_seqs = sorted(
                 r["dynamodb"]["SequenceNumber"] for p in old_pages.values() for r in p["Records"]
             )
-            assert old_seqs == sorted(r["dynamodb"]["SequenceNumber"] for r in new_records)
+            fresh_seqs = sorted(
+                r["dynamodb"]["SequenceNumber"]
+                for s in old_shards
+                for r in streams_client.get_records(
+                    ShardIterator=_trim_horizon(streams_client, old_arn, s)
+                )["Records"]
+            )
+            assert old_seqs == fresh_seqs
+            assert not set(old_seqs) & {r["dynamodb"]["SequenceNumber"] for r in new_records}
         finally:
             dynamodb_client.delete_table(TableName=name)
             wait_for_deleted(dynamodb_client, name)

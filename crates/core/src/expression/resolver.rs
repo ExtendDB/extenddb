@@ -30,9 +30,24 @@ pub struct ExpressionMaps {
     /// and was desugared into an update expression. The service sizes that
     /// form against the item limit differently from an expression.
     pub legacy_attribute_updates: bool,
-    /// Pre-parsed `BigDecimal` values for numeric placeholders.
+    /// Set by the engine for an update translated from a PartiQL `UPDATE`.
+    /// The service sizes that statement by its finished item alone, as it
+    /// sizes a transacted Update, and not by the statement as it sizes
+    /// `UpdateItem`.
+    pub finished_item_sizing: bool,
+    /// Pre-parsed `BigDecimal` values for numeric placeholders, `None` for a
+    /// placeholder whose `N` is not a number the service can store.
     /// Populated eagerly by `new()` and refreshed by `pre_parse_numerics()`.
-    parsed_numerics: HashMap<String, bigdecimal::BigDecimal>,
+    parsed_numerics: HashMap<String, Option<bigdecimal::BigDecimal>>,
+}
+
+/// A numeric placeholder as [`ExpressionMaps`] pre-parsed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParsedNumber<'a> {
+    /// The placeholder's `N` is a number the service can store.
+    Number(&'a bigdecimal::BigDecimal),
+    /// The placeholder's `N` is not a number the service can store.
+    Refused,
 }
 
 impl ExpressionMaps {
@@ -45,6 +60,7 @@ impl ExpressionMaps {
             names,
             values,
             legacy_attribute_updates: false,
+            finished_item_sizing: false,
             parsed_numerics: HashMap::new(),
         };
         maps.pre_parse_numerics();
@@ -93,26 +109,45 @@ impl ExpressionMaps {
     /// Pre-parse all numeric placeholder values into `BigDecimal`.
     ///
     /// Call once per request before evaluating filter expressions against
-    /// multiple items. Invalid numeric strings are silently skipped — they
-    /// will produce `false` comparisons at evaluation time, matching the
-    /// existing behavior.
+    /// multiple items. A value that is not a number the service can store is
+    /// recorded as refused (see [`number_value`]), so a filter does not read
+    /// it again for each item.
     pub fn pre_parse_numerics(&mut self) {
         for (key, value) in &self.values {
-            if let AttributeValue::N(n) = value
-                && let Ok(d) = n.parse::<bigdecimal::BigDecimal>()
-            {
-                self.parsed_numerics.insert(key.clone(), d);
+            if let AttributeValue::N(n) = value {
+                self.parsed_numerics.insert(key.clone(), number_value(n));
             }
         }
     }
 
-    /// Look up a pre-parsed `BigDecimal` for a numeric placeholder.
-    ///
-    /// Returns `None` if the placeholder was not numeric or failed to parse.
+    /// Look up a numeric placeholder as it was pre-parsed, or `None` when the
+    /// placeholder is not an `N` in these maps.
     #[must_use]
-    pub fn get_parsed_numeric(&self, placeholder: &str) -> Option<&bigdecimal::BigDecimal> {
-        self.parsed_numerics.get(placeholder)
+    pub(crate) fn get_parsed_numeric(&self, placeholder: &str) -> Option<ParsedNumber<'_>> {
+        self.parsed_numerics.get(placeholder).map(|parsed| {
+            parsed
+                .as_ref()
+                .map_or(ParsedNumber::Refused, ParsedNumber::Number)
+        })
     }
+}
+
+/// A number in an expression as a decimal, or `None` when `n` is not a number
+/// the service can store.
+///
+/// The decimal is parsed from the number check's normalized text, which is
+/// at most 170 characters for every number the service accepts. Parsing the
+/// text as written takes time quadratic in its length: a million digits took
+/// about a second (bigdecimal 0.4.10, release build), and a request body can
+/// carry 16 MiB. `UpdateItem` and `TransactWriteItems` build their
+/// `ExpressionMaps` before they check numbers, `Query` and `Scan` do not check
+/// them (#544, #562), and a stored item can hold a number an older release
+/// stored without the check (#618).
+pub(crate) fn number_value(n: &str) -> Option<bigdecimal::BigDecimal> {
+    crate::validation::number::validate_and_normalize_number(n)
+        .ok()?
+        .parse()
+        .ok()
 }
 
 /// Resolve a `#name` reference or return the bare name.

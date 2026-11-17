@@ -30,7 +30,8 @@
 //! [`spawn_key_repair`] runs the whole pass as a background task, so `serve`
 //! opens its listener without waiting for it (see `build_components` in
 //! `lib.rs`, which spawns it only once `migrations::register_and_check` has
-//! accepted the catalog). Until the repair reaches a given document,
+//! accepted the catalog, and only for a server, not for a command that opens
+//! the catalog beside one). Until the repair reaches a given document,
 //! requests on that document's key answer as they did before this repair
 //! existed. Progress is logged every [`PROGRESS_EVERY`] documents and once
 //! at the end. A failure on one document is logged and skipped; the summary
@@ -335,7 +336,7 @@ impl MongoEngine {
                 }
                 Ok(outcome) => match self.commit_write_transaction(&mut session, None).await? {
                     CommitOutcome::Committed => return Ok(outcome),
-                    CommitOutcome::RerunBody => backoff_sleep(attempt).await,
+                    CommitOutcome::RerunBody(_) => backoff_sleep(attempt).await,
                 },
                 Err(BatchError::Mongo(e)) if is_transient_write_conflict(&e) => {
                     let _ = session.abort_transaction().await;

@@ -23,16 +23,17 @@ use async_trait::async_trait;
 use extenddb_storage::hooks::{Reregistration, ServingRegistrar};
 use extenddb_storage::migrations::{CatalogStatus, MigrationError, Target};
 
-use super::locks::{KEEPALIVE_INTERVAL, ServingRegistration};
+use super::locks::{KEEPALIVE_INTERVAL, SERVE_APPLICATION, ServingRegistration};
 use super::{PostgresTarget, catalog_status, require_data_connection_row, resolve};
 
 /// The serving registration of a running server, with what it needs to
-/// take it again: the catalog's databases and the status the server started
-/// with.
+/// take it again: the catalog's databases, the status the server started
+/// with, and the name its session carries.
 pub struct ServerRegistration {
     target: PostgresTarget,
     started: CatalogStatus,
     keepalive: Duration,
+    application: &'static str,
     current: Mutex<ServingRegistration>,
 }
 
@@ -48,7 +49,24 @@ impl ServerRegistration {
     /// [`MigrationError::Locked`] (exit 6) while a migration runs, or the
     /// error of a database that cannot be reached or read.
     pub async fn register(connection_string: &str) -> Result<Self, MigrationError> {
-        Self::register_keepalive(connection_string, KEEPALIVE_INTERVAL).await
+        Self::register_as(connection_string, SERVE_APPLICATION).await
+    }
+
+    /// [`ServerRegistration::register`] for the process `application` names
+    /// (`extenddb serve`, or a command such as `extenddb backup list`): its
+    /// session carries the name as `application_name`, which a migration
+    /// waiting for the registrations prints, and a refusal while a
+    /// migration runs names the migration's sessions without the server's
+    /// advice to start the server.
+    ///
+    /// # Errors
+    ///
+    /// As [`ServerRegistration::register`].
+    pub async fn register_as(
+        connection_string: &str,
+        application: &'static str,
+    ) -> Result<Self, MigrationError> {
+        Self::register_keepalive(connection_string, KEEPALIVE_INTERVAL, application).await
     }
 
     /// [`ServerRegistration::register`] with another keepalive interval, for
@@ -62,18 +80,35 @@ impl ServerRegistration {
         connection_string: &str,
         keepalive: Duration,
     ) -> Result<Self, MigrationError> {
-        Self::register_keepalive(connection_string, keepalive).await
+        Self::register_keepalive(connection_string, keepalive, SERVE_APPLICATION).await
+    }
+
+    /// [`ServerRegistration::register_as`] with another keepalive interval,
+    /// for tests.
+    ///
+    /// # Errors
+    ///
+    /// As [`ServerRegistration::register`].
+    #[cfg(feature = "test-util")]
+    pub async fn register_as_with(
+        connection_string: &str,
+        application: &'static str,
+        keepalive: Duration,
+    ) -> Result<Self, MigrationError> {
+        Self::register_keepalive(connection_string, keepalive, application).await
     }
 
     async fn register_keepalive(
         connection_string: &str,
         keepalive: Duration,
+        application: &'static str,
     ) -> Result<Self, MigrationError> {
         let Some(target) = resolve(&Target::at(connection_string)).await? else {
             return Err(MigrationError::Status(CatalogStatus::Uninitialized));
         };
         let registration =
-            ServingRegistration::register_keepalive(&target.catalog, keepalive).await?;
+            ServingRegistration::register_keepalive(&target.catalog, keepalive, application)
+                .await?;
         let status = match catalog_status(&target).await {
             Ok(status) => status,
             Err(e) => {
@@ -97,6 +132,7 @@ impl ServerRegistration {
                     target,
                     started: status,
                     keepalive,
+                    application,
                     current: Mutex::new(registration),
                 })
             }
@@ -130,14 +166,17 @@ impl ServingRegistrar for ServerRegistration {
     }
 
     async fn register_again(&self) -> Reregistration {
-        let registration =
-            match ServingRegistration::register_keepalive(&self.target.catalog, self.keepalive)
-                .await
-            {
-                Ok(registration) => registration,
-                Err(MigrationError::Locked(why)) => return Reregistration::Refused(why),
-                Err(e) => return Reregistration::Unavailable(e.to_string()),
-            };
+        let registration = match ServingRegistration::register_keepalive(
+            &self.target.catalog,
+            self.keepalive,
+            self.application,
+        )
+        .await
+        {
+            Ok(registration) => registration,
+            Err(MigrationError::Locked(why)) => return Reregistration::Refused(why),
+            Err(e) => return Reregistration::Unavailable(e.to_string()),
+        };
         let status = match catalog_status(&self.target).await {
             Ok(status) => status,
             Err(e) => {

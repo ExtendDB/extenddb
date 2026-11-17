@@ -39,8 +39,11 @@
 //! what `DescribeTable` and `DescribeTimeToLive` reported for the source;
 //! `DescribeBackup` reports them as `SourceTableFeatureDetails` and a
 //! restore does not reproduce them (the restored table has no stream and no
-//! TTL, as on the service). Nested members reuse the `DynamoDB` wire types, as on the wire. Most
-//! of their optional members are omitted when absent; `OnDemandThroughput`
+//! TTL, as on the service). Nested members reuse the `DynamoDB` wire types, as on the wire,
+//! except the index entries: [`BackupGsi`] and [`BackupLsi`] are the manifest's own types,
+//! with the members, names, order and serialization the `CreateTable` request types had when
+//! format version 1 was frozen, so a member the request gains later (a GSI's `WarmThroughput`)
+//! does not change the format. Most of their optional members are omitted when absent; `OnDemandThroughput`
 //! is not, and writes `null` for an absent `MaxReadRequestUnits` or
 //! `MaxWriteRequestUnits` (`{"MaxReadRequestUnits":100,
 //! "MaxWriteRequestUnits":null}`), which is its wire serialization and part
@@ -93,9 +96,9 @@ use super::layout::{
 };
 use super::strict_item::item_without_duplicates_raw;
 use crate::types::{
-    AttributeDefinition, BillingMode, GsiInput, Item, KeySchemaElement, KeyType, LsiInput,
-    OnDemandThroughput, ProvisionedThroughput, SseDescription, StreamSpecification,
-    TimeToLiveDescription, VectorIndexSpecification,
+    AttributeDefinition, BillingMode, Item, KeySchemaElement, KeyType, OnDemandThroughput,
+    Projection, ProvisionedThroughput, SseDescription, StreamSpecification, TimeToLiveDescription,
+    VectorIndexSpecification,
 };
 
 /// The backup format version this build reads and writes.
@@ -130,6 +133,17 @@ impl SnapshotDescriptor {
     /// MongoDB: a session with snapshot read concern; the marker is the
     /// cluster time `<seconds>:<increment>`.
     pub const KIND_MONGODB_SNAPSHOT_READ_CONCERN: &'static str = "mongodb_snapshot_read_concern";
+    /// A copy of an in-catalog backup, written by `extenddb backup
+    /// migrate-legacy`; the marker is empty. The items are those the
+    /// in-catalog backup stored when it was taken, with the legacy create's
+    /// consistency: a point-in-time snapshot on PostgreSQL and SQLite; on
+    /// MongoDB an `$out` of the live collection and on Cassandra a paged
+    /// read of the live table, neither point-in-time. For this kind
+    /// `source_backend` and
+    /// `source_extenddb_version` name the backend and the release that
+    /// wrote the copy, not the release that took the in-catalog backup,
+    /// whose version was never recorded.
+    pub const KIND_LEGACY_IN_CATALOG: &'static str = "legacy_in_catalog";
 }
 
 /// Order of items within and across a backup's data files.
@@ -158,9 +172,56 @@ pub enum ItemOrder {
     Unordered,
 }
 
+/// A global secondary index of the source table, as the manifest records it.
+///
+/// The members, serde names, order and `skip_serializing_if` are those of
+/// [`crate::types::GsiInput`] when format version 1 was frozen. The manifest
+/// has its own type so that a member the `CreateTable` request gains does not
+/// change the persisted format: `WarmThroughput`, which a backup does not
+/// record (the service's `GlobalSecondaryIndexInfo` in `DescribeBackup` has
+/// no warm member, and a restored table starts with the defaults).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackupGsi {
+    /// Name of the index.
+    #[serde(rename = "IndexName")]
+    pub index_name: String,
+    /// Key schema of the index.
+    #[serde(rename = "KeySchema")]
+    pub key_schema: Vec<KeySchemaElement>,
+    /// Attributes projected into the index.
+    #[serde(rename = "Projection")]
+    pub projection: Projection,
+    /// Provisioned throughput of the index; omitted when absent (the index
+    /// of an on-demand table, or one of a provisioned table that reported
+    /// none). A restore gives an absent or 0/0 index throughput on a
+    /// provisioned table the table's.
+    #[serde(
+        rename = "ProvisionedThroughput",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub provisioned_throughput: Option<ProvisionedThroughput>,
+}
+
+/// A local secondary index of the source table, as the manifest records it,
+/// with the members, serde names and order of [`crate::types::LsiInput`] when
+/// format version 1 was frozen (see [`BackupGsi`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackupLsi {
+    /// Name of the index.
+    #[serde(rename = "IndexName")]
+    pub index_name: String,
+    /// Key schema of the index.
+    #[serde(rename = "KeySchema")]
+    pub key_schema: Vec<KeySchemaElement>,
+    /// Attributes projected into the index.
+    #[serde(rename = "Projection")]
+    pub projection: Projection,
+}
+
 /// The source table definition captured at backup time.
 ///
-/// Field types reuse the existing wire types, so the nested JSON matches what
+/// Field types reuse the existing wire types, apart from the index entries
+/// ([`BackupGsi`], [`BackupLsi`]), so the nested JSON matches what
 /// the `DynamoDB` API itself carries (`PascalCase` members inside each element).
 /// Timestamps are `f64` epoch seconds, the same representation
 /// [`crate::types::BackupDetails`] uses.
@@ -180,7 +241,10 @@ pub struct SourceTableSchema {
     pub attribute_definitions: Vec<AttributeDefinition>,
     /// Billing mode at backup time.
     pub billing_mode: BillingMode,
-    /// Provisioned throughput; `null` when the table is on demand.
+    /// Provisioned throughput; `null` when the table is on demand, and in a
+    /// copy of an in-catalog backup that recorded none
+    /// ([`SnapshotDescriptor::KIND_LEGACY_IN_CATALOG`]), which a restore
+    /// creates with 5 read and 5 write capacity units.
     #[serde(default)]
     pub provisioned_throughput: Option<ProvisionedThroughput>,
     /// On-demand throughput limits; `null` when none are configured.
@@ -195,10 +259,10 @@ pub struct SourceTableSchema {
     pub sse_description: Option<SseDescription>,
     /// Global secondary indexes defined on the source table; empty when none.
     /// Required (module docs).
-    pub global_secondary_indexes: Vec<GsiInput>,
+    pub global_secondary_indexes: Vec<BackupGsi>,
     /// Local secondary indexes defined on the source table; empty when none.
     /// Required (module docs).
-    pub local_secondary_indexes: Vec<LsiInput>,
+    pub local_secondary_indexes: Vec<BackupLsi>,
     /// Vector indexes, as creation specifications. Three states: `null`, the
     /// source backend has no vector support (a target with vector support
     /// restores the table without vector indexes); `[]`, the source supports
@@ -587,6 +651,13 @@ impl<R: std::io::Read> DataFileReader<R> {
             });
         }
         checked
+    }
+
+    /// The uncompressed bytes decoded so far
+    /// ([`DataFileDecoder::bytes_decoded`]).
+    #[must_use]
+    pub fn bytes_decoded(&self) -> u64 {
+        self.decoder.bytes_decoded()
     }
 }
 
@@ -1449,8 +1520,10 @@ pub fn check_format_version(found: u32) -> Result<(), FormatError> {
 /// only copy of the alphabet: the engine's `validate_name_member`
 /// (`BackupName` on `CreateBackup`) and `validate_index_name` spell it again,
 /// and the engine counts the bounds in characters where this counts bytes
-/// (the same for this ASCII alphabet).
-fn is_valid_backup_name(name: &str) -> bool {
+/// (the same for this ASCII alphabet). `extenddb backup migrate-legacy`
+/// checks an in-catalog backup's name with it before it writes the copy.
+#[must_use]
+pub fn is_valid_backup_name(name: &str) -> bool {
     (3..=255).contains(&name.len()) && crate::validation::validate_table_name_chars(name).is_ok()
 }
 
@@ -1534,7 +1607,7 @@ mod tests {
                         "arn:aws:kms:us-east-1:123456789012:key/abcd".to_owned(),
                     ),
                 }),
-                global_secondary_indexes: vec![GsiInput {
+                global_secondary_indexes: vec![BackupGsi {
                     index_name: "GenreIndex".to_owned(),
                     key_schema: vec![KeySchemaElement {
                         attribute_name: "Genre".to_owned(),
@@ -1549,7 +1622,7 @@ mod tests {
                         write_capacity_units: 1,
                     }),
                 }],
-                local_secondary_indexes: vec![LsiInput {
+                local_secondary_indexes: vec![BackupLsi {
                     index_name: "TitleIndex".to_owned(),
                     key_schema: vec![
                         KeySchemaElement {
@@ -1844,6 +1917,29 @@ mod tests {
         let bytes = manifest.to_json_bytes().unwrap();
         let parsed = ExtenddbManifest::from_json_bytes(&bytes).unwrap();
         assert_eq!(parsed, manifest);
+    }
+
+    #[test]
+    fn a_manifest_of_the_legacy_in_catalog_kind_parses_and_round_trips() {
+        assert_eq!(
+            SnapshotDescriptor::KIND_LEGACY_IN_CATALOG,
+            "legacy_in_catalog"
+        );
+        let mut manifest = sample_manifest();
+        manifest.snapshot = SnapshotDescriptor {
+            kind: SnapshotDescriptor::KIND_LEGACY_IN_CATALOG.to_owned(),
+            marker: String::new(),
+        };
+        let bytes = manifest.to_json_bytes().unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            text.contains(r#""snapshot":{"kind":"legacy_in_catalog","marker":""}"#),
+            "the kind is written as named: {text}"
+        );
+        let parsed = ExtenddbManifest::from_json_bytes(&bytes).unwrap();
+        assert_eq!(parsed, manifest);
+        assert_eq!(parsed.snapshot.kind, "legacy_in_catalog");
+        assert_eq!(parsed.snapshot.marker, "");
     }
 
     #[test]

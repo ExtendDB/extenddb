@@ -12,7 +12,7 @@ use extenddb_storage::migrations::{CatalogMigrations, CatalogStatus, MigrationEr
 use extenddb_storage_cassandra::cassandra_util::CassandraSession;
 use extenddb_storage_cassandra::migrations::{
     CassandraCatalogMigrations, LeaseTimes, MigrationLock, RegistrationTimes, ServerRegistration,
-    ServingRegistration, register_server, schema_statement_bounds,
+    ServingRegistration, register_server, register_server_as, schema_statement_bounds,
 };
 
 use super::{deployment, target_of};
@@ -195,6 +195,96 @@ async fn a_server_and_a_migration_refuse_each_other() {
         .into_rows()
         .unwrap_or_default();
     assert!(rows.is_empty(), "a released server leaves no row");
+}
+
+/// The `release` cells of the catalog's `extenddb_servers` rows.
+async fn server_releases(session: &CassandraSession, catalog: &str) -> Vec<String> {
+    use cdrs_tokio::types::IntoRustByName;
+    session
+        .query(format!("SELECT release FROM {catalog}.extenddb_servers"))
+        .await
+        .expect("read")
+        .response_body()
+        .expect("body")
+        .into_rows()
+        .unwrap_or_default()
+        .iter()
+        .map(|row| {
+            let release: Option<String> = row.get_by_name("release").expect("release");
+            release.unwrap_or_default()
+        })
+        .collect()
+}
+
+/// A command that opens the catalog as a server does (`extenddb backup
+/// list`) registers under its own name: the row's `release` carries it
+/// after the release, a migration's wait names the command where it names
+/// a server `extenddb serve`, the name is kept when the registration is taken
+/// again, and the command's refusal while a migration holds the lock names
+/// the holder without the server's advice to start the server.
+#[tokio::test]
+async fn a_command_registers_under_its_own_name() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
+    const COMMAND: &str = "extenddb backup list";
+    let session = session().await;
+    let (prefix, _drops) = new_prefix("command");
+    deployment(&session, &prefix).await;
+    let catalog = format!("{prefix}_catalog");
+    let registration = register_server_as(session.clone(), &prefix, "127.0.0.1:1", "test", COMMAND)
+        .await
+        .expect("register");
+    assert_eq!(
+        server_releases(&session, &catalog).await,
+        vec![format!("test as {COMMAND}")]
+    );
+    let migrations = CassandraCatalogMigrations;
+    match migrations
+        .lock(&target_of(&prefix), Duration::from_secs(2))
+        .await
+    {
+        Err(MigrationError::Locked(message)) => {
+            assert!(
+                message.contains(&format!("{COMMAND} test on 127.0.0.1:1")),
+                "{message}"
+            );
+            assert!(!message.contains("extenddb serve"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
+    let again = registration.register_again().await;
+    assert!(matches!(again, Reregistration::Registered), "{again:?}");
+    assert!(
+        server_releases(&session, &catalog)
+            .await
+            .contains(&format!("test as {COMMAND}")),
+        "taken again under the command's name"
+    );
+    registration.release().await;
+
+    let lock = migrations
+        .lock(&target_of(&prefix), Duration::from_secs(5))
+        .await
+        .expect("no server is registered");
+    let refused = register_server_as(session.clone(), &prefix, "127.0.0.1:2", "test", COMMAND)
+        .await
+        .err()
+        .expect("a migration holds the lock");
+    assert_eq!(refused.exit_code(), 6);
+    let why = refused.to_string();
+    assert!(why.contains("holds the catalog's migration lock"), "{why}");
+    assert!(!why.contains("start the server"), "{why}");
+    let served = register_server(session.clone(), &prefix, "127.0.0.1:3", "test")
+        .await
+        .err()
+        .expect("a server is refused too");
+    assert!(served.to_string().contains("start the server"), "{served}");
+    migrations.release(lock).await;
+    assert!(
+        server_releases(&session, &catalog).await.is_empty(),
+        "a refused command leaves no row"
+    );
 }
 
 /// A code body's request to a node that stops answering fails at the request
