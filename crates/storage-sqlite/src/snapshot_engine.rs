@@ -604,7 +604,7 @@ mod tests {
                     .expect("pump");
             },
             |table| async move {
-                sqlx::query("UPDATE tables SET table_status = 'UPDATING' WHERE table_name = ?")
+                sqlx::query("UPDATE tables SET table_status = 'CREATING' WHERE table_name = ?")
                     .bind(table)
                     .execute(&pool)
                     .await
