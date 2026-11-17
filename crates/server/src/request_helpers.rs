@@ -50,6 +50,71 @@ pub(crate) fn extract_table_name(input: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// Operations whose top-level `TableName` names the table the request acts
+/// on. These are the operations the engine dispatches whose input shape has a
+/// top-level `TableName` in botocore 1.43.125's `dynamodb` and
+/// `dynamodbstreams` models, less `ListBackups` and `ListStreams`.
+///
+/// Each of these succeeds only when the table exists (`CreateTable` once it
+/// does), so a successful request records metrics under a real table. In
+/// `ListBackups` and `ListStreams`, `TableName` is a filter over the account's
+/// backups or streams, and either answers 200 with an empty list for a table
+/// that does not exist. Under it, any valid name a caller makes up would become
+/// a dimension value, so they record no table.
+///
+/// Any other operation ignores or refuses a `TableName` it is sent, so its
+/// metrics must not take one from the request either: a `BatchWriteItem` with
+/// an extra `TableName` would otherwise record its metrics under a table it
+/// never touched.
+const TABLE_NAME_OPERATIONS: &[&str] = &[
+    "CreateBackup",
+    "CreateTable",
+    "DeleteItem",
+    "DeleteTable",
+    "DescribeContinuousBackups",
+    "DescribeTable",
+    "DescribeTimeToLive",
+    "GetItem",
+    "PutItem",
+    "Query",
+    "Scan",
+    "SearchVectors",
+    "UpdateContinuousBackups",
+    "UpdateItem",
+    "UpdateTable",
+    "UpdateTimeToLive",
+];
+
+/// The table name a request's metrics are recorded under, or `None` when the
+/// request names no valid table.
+///
+/// The name comes from the request's top-level `TableName`, and only for an
+/// operation that acts on the table it names ([`TABLE_NAME_OPERATIONS`]). A
+/// table ARN is reduced to its table name, so a table has one dimension value
+/// however the request named it. The result must pass the table name rules
+/// (`validate_table_name`); a request that fails validation can carry any
+/// string, control characters included, and every reader of the metrics would
+/// get it as a dimension value (issue #728). Otherwise the result is `None`,
+/// and the request's metrics carry no table.
+pub(crate) fn metric_table_name(
+    operation: &str,
+    input: &Value,
+    limits: &extenddb_core::limits::LimitsConfig,
+) -> Option<String> {
+    if !TABLE_NAME_OPERATIONS.contains(&operation) {
+        return None;
+    }
+    let sent = input.get("TableName")?.as_str()?;
+    let name = if sent.starts_with("arn:") {
+        extenddb_core::arn::parse(sent)?.table
+    } else {
+        sent.to_owned()
+    };
+    extenddb_core::validation::validate_table_name(&name, limits)
+        .is_ok()
+        .then_some(name)
+}
+
 /// Decide how a `TableKeyInfo` lookup result feeds request authorization.
 ///
 /// A present table yields its key info. A missing table yields `None`: the
@@ -108,6 +173,14 @@ pub(crate) async fn authorize_request(
     source_ip: Option<&str>,
     user_agent: Option<&str>,
 ) -> Result<extenddb_engine::AuthorizedKeyInfo, DynamoDbError> {
+    // A table name, index name or ARN that the service refuses, in TableName
+    // or in any other field that carries one (RequestItems, TransactItems, the
+    // restore and import names, the stream, backup and tag ARNs), is refused
+    // here, before the key info and resource tag lookups below and before the
+    // developer-mode return, the cross-account refusal and the ARN shape
+    // checks (see `table_name_gate`).
+    crate::table_name_gate::check_table_name_chars(operation, input, account_id)?;
+
     let table_name = extract_table_name(input);
     let mut authorized_key_info = extenddb_engine::AuthorizedKeyInfo::new();
 
@@ -137,6 +210,84 @@ pub(crate) async fn authorize_request(
         }
     }
 
+    // The checks from here to the dev-mode return answer a request before the
+    // IAM decision, and the service gives each answer to every principal. So
+    // they run in dev mode too, and a dev-mode server refuses the same
+    // malformed, out-of-scope and unissued resources, and the same resources in
+    // another account, as any other build (#450, #451).
+    //
+    // A StreamArn (DescribeStream, GetShardIterator) that is not a stream ARN,
+    // a table, index or backup ARN included, or that has an empty partition,
+    // service or account field, is refused with ValidationException "Invalid
+    // StreamArn" before the account is looked at, in every account (measured
+    // 2026-10-28 and 2026-11-05).
+    authz_resource::validate_stream_arn_kind(operation, input)?;
+
+    // A request that names a resource in another account by ARN is refused
+    // with the service's answer for the operation and for whether this
+    // deployment knows the account, for an admin and a no-policy caller alike
+    // (measured 2026-11-03 and 2026-11-05; see `authz_resource::cross_account`).
+    // For an account the catalog holds, the shape checks below run first.
+    authz_resource::cross_account::refuse(state, identity, operation, input, account_id).await?;
+
+    // The tag operations' ResourceArn shape is validated before the IAM
+    // decision: an index ARN in this account (tags are accepted only on a
+    // table or stream) is rejected with ValidationException for every
+    // principal. A table or stream ARN passes; its partition, service, region
+    // and existence are checked after authorization by the engine tag handler,
+    // and the IAM decision runs on the ARN as sent (#451).
+    if matches!(
+        operation,
+        "TagResource" | "UntagResource" | "ListTagsOfResource"
+    ) && let Some(arn) = input.get("ResourceArn").and_then(Value::as_str)
+        && !arn.is_empty()
+    {
+        authz_resource::validate_tag_resource_arn_shape(arn)?;
+    }
+
+    // A StreamArn (DescribeStream, GetShardIterator) or BackupArn
+    // (DescribeBackup, DeleteBackup) that is not a well-formed ARN of that kind,
+    // and an export TableArn that does not parse, are refused with
+    // ValidationException before the IAM decision. Without this, an ARN the
+    // engine resolves one way and authorization reads another lets a Deny on
+    // the real resource be bypassed. A StreamArn must also be in this
+    // deployment's partition, service and region, so the stream authorized is
+    // the stream the engine reads and a respelled ARN is never served (#450,
+    // #451). A restore's source ARN, and an export TableArn of another kind,
+    // are refused by the engine after the IAM decision.
+    authz_resource::validate_operation_arns(operation, input, &state.region)?;
+
+    // GetRecords carries its resource only inside the opaque shard iterator, not
+    // in a request body field, so the iterator is decoded here for the stream
+    // ARN the IAM decision below authorizes against.
+    //
+    // A token that does not decode, or decodes to neither a current token nor
+    // the pre-upgrade shape, is rejected with ValidationException "Invalid
+    // ShardIterator" before authorization. A pre-upgrade token (the four
+    // pre-stream-ARN fields with a parseable timestamp) is answered with
+    // ExpiredIteratorException before authorization, so a consumer reading
+    // across the upgrade renews its iterator instead of failing on the
+    // non-retryable "Invalid ShardIterator". The service answers an iterator it
+    // did not issue the same way whatever the caller's policy (measured
+    // 2026-10-20).
+    let getrecords_stream = if operation == "GetRecords" {
+        match authz_resource::getrecords_resource(input, &state.region, account_id) {
+            authz_resource::GetRecordsResource::Stream(arn) => Some(arn),
+            authz_resource::GetRecordsResource::Expired => {
+                return Err(DynamoDbError::ExpiredIteratorException(
+                    extenddb_engine::SHARD_ITERATOR_EXPIRED_MESSAGE.to_owned(),
+                ));
+            }
+            authz_resource::GetRecordsResource::Invalid => {
+                return Err(DynamoDbError::ValidationException(
+                    "Invalid ShardIterator".to_owned(),
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
     // Developer mode opens authorization for the authenticated caller. SigV4
     // verification already ran upstream, so the request is authenticated; only
     // the IAM policy decision is skipped. The key info is still returned so the
@@ -149,6 +300,20 @@ pub(crate) async fn authorize_request(
     // item operations passed. Any future operation-specific branch must be added
     // below this point, or it will reintroduce that defect.
     if state.dev_mode {
+        return Ok(authorized_key_info);
+    }
+
+    // A PartiQL request names its tables inside its statements. The service
+    // authorizes each statement with the action of its type
+    // (`dynamodb:PartiQLSelect` and the others) against the table or index it
+    // reads or writes, and needs no action for the operation itself (measured
+    // 2026-11-03). The engine authorizes each statement through the item
+    // authorizer the handler gives it, and refuses every statement without
+    // one (see `item_authz`).
+    if matches!(
+        operation,
+        "ExecuteStatement" | "BatchExecuteStatement" | "ExecuteTransaction"
+    ) {
         return Ok(authorized_key_info);
     }
 
@@ -186,65 +351,11 @@ pub(crate) async fn authorize_request(
         return Ok(authorized_key_info);
     }
 
-    // A request that names a resource in another account by ARN is refused
-    // before the IAM decision, for every principal, with the service's answer
-    // for the operation and for whether this deployment knows the account
-    // (measured 2026-11-03 for an admin and a no-policy caller; see
-    // `authz_resource::cross_account`).
-    authz_resource::cross_account::refuse(state, identity, operation, input, account_id).await?;
-
-    // The tag operations' ResourceArn shape is validated before the IAM
-    // decision: an index ARN in this account (tags are accepted only on a
-    // table or stream) is rejected with ValidationException for every
-    // principal. A table or stream ARN passes; its region and existence are
-    // checked after authorization by the engine tag handler.
-    if matches!(
-        operation,
-        "TagResource" | "UntagResource" | "ListTagsOfResource"
-    ) && let Some(arn) = input.get("ResourceArn").and_then(Value::as_str)
-        && !arn.is_empty()
-    {
-        authz_resource::validate_tag_resource_arn_shape(arn)?;
-    }
-
-    // Every other ARN-bearing field (StreamArn, BackupArn, the export TableArn,
-    // a restore SourceTableArn) must parse to the resource kind the operation
-    // takes, or the request is refused with ValidationException before the IAM
-    // decision. Without this, an ARN the engine resolves one way and
-    // authorization reads another lets a Deny on the real resource be bypassed.
-    authz_resource::validate_operation_arns(operation, input)?;
-
-    // GetRecords carries its resource only inside the opaque shard iterator, not
-    // in a request body field. Decode the iterator for the stream ARN and
-    // authorize against that specific stream, as the service does. The storage
-    // read resolves the shard against that stream as part of the read, so a
-    // token that names an allowed stream but a different stream's shard reads
-    // nothing.
-    //
-    // A token that does not decode, or decodes to neither a current token nor
-    // the pre-upgrade shape, is rejected with ValidationException "Invalid
-    // ShardIterator" before authorization. A pre-upgrade token (the four
-    // pre-stream-ARN fields with a parseable timestamp) is answered with
-    // ExpiredIteratorException before authorization, so a consumer reading
-    // across the upgrade renews its iterator instead of failing on the
-    // non-retryable "Invalid ShardIterator". The service answers an iterator it
-    // did not issue the same way whatever the caller's policy (measured
-    // 2026-10-20).
-    if operation == "GetRecords" {
-        let resource_arn =
-            match authz_resource::getrecords_resource(input, &state.region, account_id) {
-                authz_resource::GetRecordsResource::Stream(arn) => arn,
-                authz_resource::GetRecordsResource::Expired => {
-                    return Err(DynamoDbError::ExpiredIteratorException(
-                        extenddb_engine::SHARD_ITERATOR_EXPIRED_MESSAGE.to_owned(),
-                    ));
-                }
-                authz_resource::GetRecordsResource::Invalid => {
-                    return Err(DynamoDbError::ValidationException(
-                        "Invalid ShardIterator".to_owned(),
-                    ));
-                }
-            };
+    // GetRecords is authorized against the specific stream its iterator names,
+    // as the service does. The storage read resolves the shard against that
+    // stream as part of the read, so a token that names an allowed stream but a
+    // different stream's shard reads nothing.
+    if let Some(resource_arn) = getrecords_stream {
         authorization::check_authorization(
             state.authz_cache.as_ref(),
             identity,
@@ -271,10 +382,12 @@ pub(crate) async fn authorize_request(
     // the set of keys that table receives; transaction operations authorize
     // once per item with that item's key. Each target carries the
     // `dynamodb:LeadingKeys` value(s) the service evaluates, extracted per the
-    // table's key schema. The resource ARN per target is unchanged: each is
-    // still that table's ARN. (Measured against live DynamoDB 2026-10-20.)
-    // Targets with the same (action, table, LeadingKeys) are evaluated once,
-    // since the decision depends only on those three for a given identity.
+    // table's key schema, and the `dynamodb:Attributes` names of that table's
+    // part of the batch or of that item (see `request_attributes`). The
+    // resource ARN per target is unchanged: each is still that table's ARN.
+    // (Measured against live DynamoDB 2026-10-20 and 2026-10-31.) Targets with
+    // the same (action, table, LeadingKeys, Attributes) are evaluated once,
+    // since the decision depends only on those four for a given identity.
     if let Some(tables) = crate::leading_keys::batch_transact_tables(operation, input) {
         // A request outside the operation's count limits is refused before any
         // key info is read or any policy is evaluated, with the engine's own
@@ -301,9 +414,13 @@ pub(crate) async fn authorize_request(
             let ki = key_info_for_authz(state.storage.table_key_info(account_id, &table).await)?;
             authorized_key_info.insert(table, ki);
         }
-        let targets =
-            crate::leading_keys::batch_transact_targets(operation, input, &authorized_key_info)
-                .unwrap_or_default();
+        let targets = crate::leading_keys::batch_transact_targets(
+            operation,
+            input,
+            &authorized_key_info,
+            &state.limits,
+        )
+        .unwrap_or_default();
 
         if targets.is_empty() {
             // Malformed body (the count checks above have already refused an
@@ -333,6 +450,7 @@ pub(crate) async fn authorize_request(
                 );
                 let params = extenddb_auth::policy::context::RequestParams {
                     leading_keys: target.leading_keys,
+                    attributes: target.attributes,
                     ..base_params(request_tags.clone(), request_tag_keys.clone())
                 };
                 authorization::check_authorization(
@@ -367,7 +485,12 @@ pub(crate) async fn authorize_request(
                 key_info.as_ref(),
                 state.limits.max_expression_tokens,
             ),
-            attributes: extract_attributes(input),
+            attributes: crate::request_attributes::single_table_attributes(
+                operation,
+                input,
+                key_info.as_ref(),
+                &state.limits,
+            ),
             select: input
                 .get("Select")
                 .and_then(|v| v.as_str())
@@ -393,7 +516,8 @@ pub(crate) async fn authorize_request(
     } else {
         // Multi-permission operations (restore). Each pair is authorized with
         // the request-level params; a Deny on any required resource fails the
-        // request.
+        // request. The pairs are checked in the order `authz_targets` returns
+        // them, and the first denied pair is the one the denial names.
         for target in &targets {
             authorization::check_authorization(
                 state.authz_cache.as_ref(),
@@ -407,31 +531,6 @@ pub(crate) async fn authorize_request(
     }
 
     Ok(authorized_key_info)
-}
-
-/// Extract attribute names from the request for `dynamodb:Attributes`.
-///
-/// Collects attribute names from `ProjectionExpression` (comma-separated list
-/// of top-level names). Resolves `ExpressionAttributeNames` placeholders
-/// (e.g. `#n` → `name`) when present.
-/// Returns `None` when no projection is specified.
-pub(crate) fn extract_attributes(input: &Value) -> Option<Vec<String>> {
-    let proj = input.get("ProjectionExpression")?.as_str()?;
-    let ean = input
-        .get("ExpressionAttributeNames")
-        .and_then(|v| v.as_object());
-    let names: Vec<String> = proj
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            ean.and_then(|m| m.get(s))
-                .and_then(|v| v.as_str())
-                .unwrap_or(s)
-                .to_owned()
-        })
-        .collect();
-    if names.is_empty() { None } else { Some(names) }
 }
 
 #[cfg(test)]
@@ -510,46 +609,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_attributes_resolves_expression_attribute_names() {
-        let input = json!({
-            "ProjectionExpression": "#n, #v",
-            "ExpressionAttributeNames": {
-                "#n": "name",
-                "#v": "value"
-            }
-        });
-        let result = extract_attributes(&input);
-        assert_eq!(result, Some(vec!["name".to_owned(), "value".to_owned()]));
-    }
-
-    #[test]
-    fn extract_attributes_mixed_placeholders_and_literals() {
-        let input = json!({
-            "ProjectionExpression": "#n, age",
-            "ExpressionAttributeNames": {
-                "#n": "name"
-            }
-        });
-        let result = extract_attributes(&input);
-        assert_eq!(result, Some(vec!["name".to_owned(), "age".to_owned()]));
-    }
-
-    #[test]
-    fn extract_attributes_no_expression_attribute_names() {
-        let input = json!({
-            "ProjectionExpression": "name, age"
-        });
-        let result = extract_attributes(&input);
-        assert_eq!(result, Some(vec!["name".to_owned(), "age".to_owned()]));
-    }
-
-    #[test]
-    fn extract_attributes_no_projection() {
-        let input = json!({"TableName": "test"});
-        assert_eq!(extract_attributes(&input), None);
-    }
-
-    #[test]
     fn missing_target_no_auth_returns_missing_auth_token() {
         // S-7: No Authorization header + no X-Amz-Target → MissingAuthenticationToken
         let headers = HeaderMap::new();
@@ -571,5 +630,124 @@ mod tests {
             matches!(err, DynamoDbError::UnknownOperationException(_)),
             "Expected UnknownOperationException, got: {err:?}"
         );
+    }
+
+    fn metric_name_of(table_name: Value) -> Option<String> {
+        metric_table_name(
+            "PutItem",
+            &json!({ "TableName": table_name }),
+            &extenddb_core::limits::LimitsConfig::default(),
+        )
+    }
+
+    #[test]
+    fn metric_table_name_keeps_a_valid_name() {
+        assert_eq!(
+            metric_name_of(json!("Orders_v2.prod-1")).as_deref(),
+            Some("Orders_v2.prod-1")
+        );
+    }
+
+    #[test]
+    fn metric_table_name_reduces_a_table_arn_to_its_name() {
+        for arn in [
+            "arn:aws:dynamodb:us-east-1:123456789012:table/Orders",
+            "arn:aws:dynamodb:us-east-1:123456789012:table/Orders/index/ByDate",
+        ] {
+            assert_eq!(
+                metric_name_of(json!(arn)).as_deref(),
+                Some("Orders"),
+                "{arn}"
+            );
+        }
+    }
+
+    #[test]
+    fn metric_table_name_drops_a_name_that_breaks_the_rules() {
+        // The values issue #728 found in the metrics table after rejected
+        // CreateTable calls, a name too short, and ARNs that name no table.
+        for sent in [
+            "x\";DROP TABLE tables;--".to_owned(),
+            "a\u{0}b".to_owned(),
+            "ééé".to_owned(),
+            "a".repeat(256),
+            "ab".to_owned(),
+            String::new(),
+            "arn:aws:dynamodb:us-east-1:123456789012:table/".to_owned(),
+            "arn:aws:s3:::bucket".to_owned(),
+            "arn:aws:dynamodb:us-east-1:123456789012:table/a;b".to_owned(),
+        ] {
+            assert_eq!(metric_name_of(json!(sent)), None, "{sent:?}");
+        }
+    }
+
+    #[test]
+    fn metric_table_name_is_none_without_a_string_table_name() {
+        assert_eq!(metric_name_of(json!(42)), None);
+        let limits = extenddb_core::limits::LimitsConfig::default();
+        assert_eq!(metric_table_name("PutItem", &json!({}), &limits), None);
+    }
+
+    /// An operation that does not act on the table its `TableName` names
+    /// records no table, whatever valid name the request carries: those whose
+    /// input has no top-level `TableName` member, and `ListBackups` and
+    /// `ListStreams`, where it is a filter. One that acts on it keeps it.
+    #[test]
+    fn metric_table_name_reads_table_name_only_for_operations_on_that_table() {
+        let limits = extenddb_core::limits::LimitsConfig::default();
+        let input = json!({ "TableName": "Orders" });
+        for operation in [
+            "BatchWriteItem",
+            "BatchGetItem",
+            "TransactWriteItems",
+            "TransactGetItems",
+            "ExecuteStatement",
+            "BatchExecuteStatement",
+            "ExecuteTransaction",
+            "ListTables",
+            "ListBackups",
+            "ListStreams",
+            "TagResource",
+            "DescribeBackup",
+            "RestoreTableFromBackup",
+            "ImportTable",
+            "NotAnOperation",
+        ] {
+            assert_eq!(
+                metric_table_name(operation, &input, &limits),
+                None,
+                "{operation}"
+            );
+        }
+        let mut listed = super::TABLE_NAME_OPERATIONS.to_vec();
+        listed.sort_unstable();
+        // Spelled out, not read from the constant, so a dropped, misspelt or
+        // added entry fails here.
+        let expected = [
+            "CreateBackup",
+            "CreateTable",
+            "DeleteItem",
+            "DeleteTable",
+            "DescribeContinuousBackups",
+            "DescribeTable",
+            "DescribeTimeToLive",
+            "GetItem",
+            "PutItem",
+            "Query",
+            "Scan",
+            "SearchVectors",
+            "UpdateContinuousBackups",
+            "UpdateItem",
+            "UpdateTable",
+            "UpdateTimeToLive",
+        ];
+        assert_eq!(listed, expected);
+        for operation in expected {
+            assert_eq!(
+                metric_table_name(operation, &input, &limits).as_deref(),
+                Some("Orders"),
+                "{operation}"
+            );
+        }
     }
 }

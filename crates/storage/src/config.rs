@@ -59,6 +59,29 @@ pub trait StorageConfig: Send + Sync + std::fmt::Debug {
         Vec::new()
     }
 
+    /// The local file the database lives in, for a backend whose database is
+    /// one file on this host (SQLite with a file path); `None` for a server
+    /// database and for an in-memory database. The backup configuration
+    /// derives its per-backend defaults from it: a store root and a restore
+    /// spool beside the file, and the rule that neither may sit in the
+    /// file's directory. The default is `None`.
+    fn database_file(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    /// [`Self::database_file`] with the reason a configured location names
+    /// no usable file: `Ok(None)` for a server database and for an
+    /// in-memory one, `Err` for a location the backend cannot parse (which
+    /// [`Self::database_file`] also answers `None` for). The default is
+    /// `Ok` of [`Self::database_file`].
+    ///
+    /// # Errors
+    ///
+    /// The backend's reason the location is not usable.
+    fn database_location(&self) -> Result<Option<std::path::PathBuf>, String> {
+        Ok(self.database_file())
+    }
+
     /// Clone this config into a boxed trait object.
     fn clone_box(&self) -> Box<dyn StorageConfig>;
 

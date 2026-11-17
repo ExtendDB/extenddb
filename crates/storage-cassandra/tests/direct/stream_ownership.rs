@@ -5,36 +5,91 @@
 //!
 //! The catalog read is keyed on the caller's account and the table name the
 //! ARN carries, the shard read on that table's id, and the stream label is
-//! decided in Rust from the table's current label. Each test here removes one
-//! of those from the picture (same label on two tables, same name in two
-//! accounts, a new label on the same shards) so that one predicate alone
+//! decided in Rust from the label the shard id carries. Each test here removes
+//! one of those from the picture (same label on two tables, same name in two
+//! accounts, a new label on the same partitions) so that one predicate alone
 //! decides the answer.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use cdrs_tokio::types::IntoRustByName;
 use extenddb_core::types::{AttributeValue, StreamViewType, TableKeyInfo};
 use extenddb_storage::error::StorageError;
+use extenddb_storage::stream_lineage::{ShardStream, parse_shard_id, shard_id};
 use extenddb_storage::util::stream_arn;
 use extenddb_storage::{DataEngine, StreamCapture, StreamEngine, StreamRecordsResult};
 use extenddb_storage_cassandra::CassandraEngine;
 
 use crate::helpers::setup_engine;
-use crate::streams::{setup_stream_table, shard_for};
+use crate::streams::{setup_stream_table, stream_shard_for};
 
 const REGION: &str = "us-east-1";
 const LABEL: &str = "2026-01-01T00:00:00.000";
 const LATER_LABEL: &str = "2026-02-02T00:00:00.000";
 
-/// Pin a table's stream label so two tables can share one.
+/// Pin a table's stream label so two tables can share one. A shard id carries
+/// its stream's label, so each shard row of the table moves to the id the
+/// stream `label` gives its index, with the row's sequence range kept.
 async fn relabel(engine: &CassandraEngine, key_info: &TableKeyInfo, label: &str) {
+    let session = engine.session_arc();
+    let account_ks = engine.account_keyspace(&key_info.account_id);
+    let rows = session
+        .query_with_values(
+            &format!(
+                "SELECT shard_id, starting_sequence_number, ending_sequence_number \
+                 FROM {account_ks}.stream_shards WHERE table_id = ?"
+            ),
+            cdrs_tokio::query_values!(key_info.table_id.as_str()),
+        )
+        .await
+        .expect("shard rows")
+        .response_body()
+        .expect("body")
+        .into_rows()
+        .unwrap_or_default();
+    for row in rows {
+        let old: String = row.get_r_by_name("shard_id").expect("shard_id");
+        let start: String = row
+            .get_r_by_name("starting_sequence_number")
+            .expect("starting_sequence_number");
+        let end: Option<String> = row.get_by_name("ending_sequence_number").ok().flatten();
+        let Some((ShardStream::Labelled { view_type, .. }, index)) =
+            parse_shard_id(&key_info.table_id, &old)
+        else {
+            panic!("{old} is not a labelled shard of {}", key_info.table_id);
+        };
+        let new = shard_id(&key_info.table_id, label, view_type, index).expect("label shape");
+        session
+            .query_with_values(
+                &format!("DELETE FROM {account_ks}.stream_shards WHERE shard_id = ?"),
+                cdrs_tokio::query_values!(old.as_str()),
+            )
+            .await
+            .expect("delete the old shard row");
+        session
+            .query_with_values(
+                &format!(
+                    "INSERT INTO {account_ks}.stream_shards \
+                     (shard_id, table_id, starting_sequence_number, ending_sequence_number) \
+                     VALUES (?, ?, ?, ?)"
+                ),
+                cdrs_tokio::query_values!(
+                    new.as_str(),
+                    key_info.table_id.as_str(),
+                    start.as_str(),
+                    end
+                ),
+            )
+            .await
+            .expect("insert the relabelled shard row");
+    }
     let catalog_keyspace = engine.catalog_keyspace();
     let query = format!(
         "UPDATE {catalog_keyspace}.tables SET stream_label = ? \
          WHERE account_id = ? AND table_name = ?"
     );
-    engine
-        .session_arc()
+    session
         .query_with_values(
             &query,
             cdrs_tokio::query_values!(
@@ -97,7 +152,8 @@ async fn stream_table_in(
     }
 }
 
-/// One item written under `pk`, which lands in `shard_for(pk, table_id)`.
+/// One item written under `pk`, which lands in the partition `shard_for(pk,
+/// table_id)` names; the stream's shard for it is `shard_of(pk, table, label)`.
 async fn put(engine: &CassandraEngine, key_info: &TableKeyInfo, pk: &str, val: u32) {
     let mut item = BTreeMap::new();
     item.insert("id".to_string(), AttributeValue::S(pk.to_string()));
@@ -124,6 +180,17 @@ fn arn_of(key_info: &TableKeyInfo, label: &str) -> String {
     stream_arn(REGION, &key_info.account_id, &key_info.table_name, label)
 }
 
+/// The shard of the stream `label` of `key_info`'s table that a record written
+/// under `pk` lands in.
+fn shard_of(pk: &str, key_info: &TableKeyInfo, label: &str) -> String {
+    let view_type = key_info
+        .stream_specification
+        .as_ref()
+        .and_then(|s| s.stream_view_type)
+        .expect("a stream-enabled table");
+    stream_shard_for(pk, &key_info.table_id, label, view_type)
+}
+
 fn assert_stream_not_found(result: StreamRecordsResult) {
     match result {
         Err(StorageError::TableNotFound(msg)) => {
@@ -147,8 +214,8 @@ async fn test_another_tables_shard_with_the_same_label_is_not_found() {
     relabel(&engine, &b, LABEL).await;
     put(&engine, &a, "pk-a", 1).await;
     put(&engine, &b, "pk-b", 1).await;
-    let shard_a = shard_for("pk-a", &a.table_id);
-    let shard_b = shard_for("pk-b", &b.table_id);
+    let shard_a = shard_of("pk-a", &a, LABEL);
+    let shard_b = shard_of("pk-b", &b, LABEL);
     let arn_a = arn_of(&a, LABEL);
     let arn_b = arn_of(&b, LABEL);
 
@@ -169,7 +236,7 @@ async fn test_another_tables_shard_with_the_same_label_is_not_found() {
             .get_stream_records(
                 &a.account_id,
                 &arn_a,
-                "shardId-forged-000000000000",
+                "shardId-forged-0000000000000000",
                 None,
                 10,
             )
@@ -201,8 +268,8 @@ async fn test_another_accounts_same_named_stream_is_not_found() {
     relabel(&engine, &other, LABEL).await;
     put(&engine, &own, "pk-o", 1).await;
     put(&engine, &other, "pk-o", 1).await;
-    let own_shard = shard_for("pk-o", &own.table_id);
-    let other_shard = shard_for("pk-o", &other.table_id);
+    let own_shard = shard_of("pk-o", &own, LABEL);
+    let other_shard = shard_of("pk-o", &other, LABEL);
 
     // From both callers, so whichever table a lookup without the account
     // would pick, one caller reads the other account's shard.
@@ -228,8 +295,9 @@ async fn test_another_accounts_same_named_stream_is_not_found() {
     }
 }
 
-/// The table takes a new stream label while keeping its shard rows: the old
-/// ARN's iterator is refused and the new ARN reads every record.
+/// The table's stream takes a new label while keeping its partitions: the old
+/// ARN's iterator, and the old shard id under the new ARN, are refused, and
+/// the new stream's shard reads every record of its partition.
 #[tokio::test]
 async fn test_an_earlier_label_on_the_same_shards_is_not_found() {
     if crate::helpers::skip_without_cassandra() {
@@ -239,7 +307,7 @@ async fn test_an_earlier_label_on_the_same_shards_is_not_found() {
     let (t, _) = setup_stream_table(&engine, "Relabel").await;
     relabel(&engine, &t, LABEL).await;
     put(&engine, &t, "pk-r", 1).await;
-    let shard = shard_for("pk-r", &t.table_id);
+    let shard = shard_of("pk-r", &t, LABEL);
     let old_arn = arn_of(&t, LABEL);
     engine
         .get_stream_records(&t.account_id, &old_arn, &shard, None, 10)
@@ -248,13 +316,20 @@ async fn test_an_earlier_label_on_the_same_shards_is_not_found() {
 
     relabel(&engine, &t, LATER_LABEL).await;
     put(&engine, &t, "pk-r", 2).await;
+    let new_arn = arn_of(&t, LATER_LABEL);
+    let new_shard = shard_of("pk-r", &t, LATER_LABEL);
     assert_stream_not_found(
         engine
             .get_stream_records(&t.account_id, &old_arn, &shard, None, 10)
             .await,
     );
+    assert_stream_not_found(
+        engine
+            .get_stream_records(&t.account_id, &new_arn, &shard, None, 10)
+            .await,
+    );
     let (records, _) = engine
-        .get_stream_records(&t.account_id, &arn_of(&t, LATER_LABEL), &shard, None, 10)
+        .get_stream_records(&t.account_id, &new_arn, &new_shard, None, 10)
         .await
         .expect("new label reads");
     assert_eq!(records.len(), 2);

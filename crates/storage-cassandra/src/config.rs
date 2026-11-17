@@ -21,7 +21,8 @@ pub struct CassandraStorageConfig {
     #[serde(default = "default_keyspace_prefix")]
     pub keyspace_prefix: String,
 
-    /// Replication factor for keyspaces (default: 3)
+    /// Replication factor for keyspaces (default: 3, for a section with no
+    /// `replication_factor` line; `init` always writes the line)
     ///
     /// Writes, and reads with `ConsistentRead: true`, need a local quorum
     /// (`LOCAL_QUORUM`): `replication_factor / 2 + 1` replicas up in
