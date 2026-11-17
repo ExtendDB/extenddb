@@ -1,0 +1,9 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+# The drivers devtools/backup-restore-matrix uses to set up and tear down its
+# MongoDB and Cassandra deployments (.github/workflows/matrix-nightly.yml
+# installs this file beside requirements.txt). Separate from requirements.txt
+# because nothing else in the test suites talks to those services directly
+# and cassandra-driver builds a C extension on install.
+pymongo==4.18.3
+cassandra-driver==3.29.3

@@ -84,8 +84,10 @@ pub enum DynamoDbError {
     #[error("{0}")]
     TableInUseException(String),
     /// HTTP 400. `CreateBackup` on a table that does not exist or is not yet
-    /// `ACTIVE`. Measured on DynamoDB: `Table not found: <name>`. Distinct
-    /// from `ResourceNotFoundException`, which the data plane returns.
+    /// `ACTIVE`, and `DescribeContinuousBackups`, `UpdateContinuousBackups`
+    /// and `RestoreTableToPointInTime` on a table that does not exist.
+    /// Measured on DynamoDB: `Table not found: <name>`. Distinct from
+    /// `ResourceNotFoundException`, which the data plane returns.
     #[error("{0}")]
     TableNotFoundException(String),
     /// A per-table or per-account limit was exceeded.
@@ -99,6 +101,13 @@ pub enum DynamoDbError {
     LimitExceededException(String),
     #[error("{0}")]
     ConditionalCheckFailedException(String, Option<Item>),
+    /// A PartiQL `INSERT` targeted a primary key that already exists.
+    ///
+    /// `INSERT` is create-only, so a duplicate full key fails with this error
+    /// rather than `ConditionalCheckFailedException`. HTTP 400. The message is
+    /// always `Duplicate primary key exists in table`, measured on the service.
+    #[error("{0}")]
+    DuplicateItemException(String),
     #[error("{message}")]
     TransactionCanceledException {
         /// Human-readable message.
@@ -133,6 +142,21 @@ pub enum DynamoDbError {
     /// Returned when a shard iterator has expired (older than 15 minutes).
     #[error("{0}")]
     ExpiredIteratorException(String),
+    /// SP-ERR-002: HTTP 400. Returned when continuous backups (point-in-time
+    /// recovery) cannot be enabled. The service models this exception on
+    /// `UpdateContinuousBackups`; ExtendDB returns it there for
+    /// `PointInTimeRecoveryEnabled: true`, because no storage backend
+    /// implements point-in-time recovery.
+    #[error("{0}")]
+    ContinuousBackupsUnavailableException(String),
+    /// SP-ERR-002: HTTP 400. Returned by `RestoreTableToPointInTime` when
+    /// point-in-time recovery is not enabled for the source table, which in
+    /// ExtendDB is always: no storage backend implements point-in-time
+    /// recovery. The service models this exception on the restore operation,
+    /// distinct from `ContinuousBackupsUnavailableException`, which it models
+    /// on `UpdateContinuousBackups`.
+    #[error("{0}")]
+    PointInTimeRecoveryUnavailableException(String),
     #[error("{0}")]
     ServiceUnavailable(String),
     /// SP-ERR-002: Concurrent modification of the same item in a transaction.
@@ -211,12 +235,15 @@ impl DynamoDbError {
             | Self::TableNotFoundException(_)
             | Self::LimitExceededException(_)
             | Self::ConditionalCheckFailedException(..)
+            | Self::DuplicateItemException(_)
             | Self::TransactionCanceledException { .. }
             | Self::IdempotentParameterMismatchException(_)
             | Self::SerializationException(_)
             | Self::AccessDeniedException(_)
             | Self::ExpiredTokenException(_)
             | Self::ExpiredIteratorException(_)
+            | Self::ContinuousBackupsUnavailableException(_)
+            | Self::PointInTimeRecoveryUnavailableException(_)
             | Self::TransactionConflictException(_)
             | Self::ProvisionedThroughputExceededException { .. }
             | Self::ThrottlingException { .. }
@@ -256,6 +283,7 @@ impl DynamoDbError {
             Self::TableNotFoundException(_) => "TableNotFoundException",
             Self::LimitExceededException(_) => "LimitExceededException",
             Self::ConditionalCheckFailedException(..) => "ConditionalCheckFailedException",
+            Self::DuplicateItemException(_) => "DuplicateItemException",
             Self::TransactionCanceledException { .. } => "TransactionCanceledException",
             Self::IdempotentParameterMismatchException(_) => "IdempotentParameterMismatchException",
             Self::SerializationException(_) => "SerializationException",
@@ -263,10 +291,16 @@ impl DynamoDbError {
             Self::InternalServerError(_) => "InternalServerError",
             Self::AccessDeniedException(_) => "AccessDeniedException",
             Self::MissingAuthenticationToken(_) => "MissingAuthenticationToken",
-            Self::IncompleteSignature(_) => "IncompleteSignature",
+            Self::IncompleteSignature(_) => "IncompleteSignatureException",
             Self::UnrecognizedClientException(_) => "UnrecognizedClientException",
             Self::ExpiredTokenException(_) => "ExpiredTokenException",
             Self::ExpiredIteratorException(_) => "ExpiredIteratorException",
+            Self::ContinuousBackupsUnavailableException(_) => {
+                "ContinuousBackupsUnavailableException"
+            }
+            Self::PointInTimeRecoveryUnavailableException(_) => {
+                "PointInTimeRecoveryUnavailableException"
+            }
             Self::ServiceUnavailable(_) => "ServiceUnavailable",
             Self::TransactionConflictException(_) => "TransactionConflictException",
             Self::ProvisionedThroughputExceededException { .. } => {
@@ -330,6 +364,7 @@ impl DynamoDbError {
             | Self::TableNotFoundException(m)
             | Self::LimitExceededException(m)
             | Self::ConditionalCheckFailedException(m, _)
+            | Self::DuplicateItemException(m)
             | Self::IdempotentParameterMismatchException(m)
             | Self::SerializationException(m)
             | Self::UnknownOperationException(m)
@@ -340,6 +375,8 @@ impl DynamoDbError {
             | Self::UnrecognizedClientException(m)
             | Self::ExpiredTokenException(m)
             | Self::ExpiredIteratorException(m)
+            | Self::ContinuousBackupsUnavailableException(m)
+            | Self::PointInTimeRecoveryUnavailableException(m)
             | Self::ServiceUnavailable(m)
             | Self::TransactionConflictException(m)
             | Self::ProvisionedThroughputExceededException { message: m, .. }
@@ -509,6 +546,15 @@ mod tests {
             (DynamoDbError::ValidationException(String::new()), 400),
             (DynamoDbError::ExpiredTokenException(String::new()), 400),
             (DynamoDbError::ExpiredIteratorException(String::new()), 400),
+            (
+                DynamoDbError::ContinuousBackupsUnavailableException(String::new()),
+                400,
+            ),
+            (
+                DynamoDbError::PointInTimeRecoveryUnavailableException(String::new()),
+                400,
+            ),
+            (DynamoDbError::TableNotFoundException(String::new()), 400),
             (DynamoDbError::InvalidSignatureException(String::new()), 400),
         ];
         for (err, expected) in cases {

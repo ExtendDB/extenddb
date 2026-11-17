@@ -22,7 +22,7 @@ fn capture(view_type: StreamViewType) -> StreamCapture {
 }
 
 /// Create a table with streams enabled and return its key_info + stream_label.
-async fn setup_stream_table(
+pub(crate) async fn setup_stream_table(
     engine: &CassandraEngine,
     table_name: &str,
 ) -> (extenddb_core::types::TableKeyInfo, String) {
@@ -65,6 +65,7 @@ async fn setup_stream_table(
         tags: None,
         table_class: None,
         deletion_protection_enabled: None,
+        warm_throughput: None,
     };
 
     let desc = engine.create_table(&account_id, input).await.unwrap();
@@ -139,8 +140,24 @@ async fn fetch_stream_records(
         .collect()
 }
 
-fn shard_for(pk: &str, table_id: &str) -> String {
+pub(crate) fn shard_for(pk: &str, table_id: &str) -> String {
     extenddb_storage_cassandra::stream_util::assign_shard_id(pk, table_id)
+}
+
+/// The shard of the stream `label` (view type `view_type`) of `table_id` that
+/// records written under `pk` land in: the stream's shard for the partition
+/// `shard_for` names, which is the id `get_stream_records` reads it by.
+pub(crate) fn stream_shard_for(
+    pk: &str,
+    table_id: &str,
+    label: &str,
+    view_type: StreamViewType,
+) -> String {
+    let (_, index) =
+        extenddb_storage::stream_lineage::parse_shard_id(table_id, &shard_for(pk, table_id))
+            .expect("the partition id is the table's");
+    extenddb_storage::stream_lineage::shard_id(table_id, label, view_type, index)
+        .expect("label shape")
 }
 
 #[tokio::test]
@@ -406,7 +423,15 @@ async fn test_validate_shard_ok() {
         &key_info.table_name,
         &stream_label,
     );
-    let shard_id = shard_for("any-pk", &key_info.table_id);
+    // The stream's own shard id for the partition the record lands in.
+    let index = crc32fast::hash(b"any-pk") % 4;
+    let shard_id = extenddb_storage::stream_lineage::shard_id(
+        &key_info.table_id,
+        &stream_label,
+        StreamViewType::NewAndOldImages,
+        index,
+    )
+    .unwrap();
 
     engine
         .validate_shard(&key_info.account_id, &arn, &shard_id)
@@ -492,7 +517,13 @@ async fn test_get_stream_records_returns_written_records() {
     use extenddb_storage::StreamEngine;
 
     let engine = setup_engine().await;
-    let (key_info, _) = setup_stream_table(&engine, "GetStreamRecords").await;
+    let (key_info, stream_label) = setup_stream_table(&engine, "GetStreamRecords").await;
+    let arn = extenddb_storage::util::stream_arn(
+        "us-east-1",
+        &key_info.account_id,
+        &key_info.table_name,
+        &stream_label,
+    );
 
     for i in 0..3u32 {
         let mut item = BTreeMap::new();
@@ -511,9 +542,14 @@ async fn test_get_stream_records_returns_written_records() {
             .unwrap();
     }
 
-    let shard_id = shard_for("pk-read", &key_info.table_id);
+    let shard_id = stream_shard_for(
+        "pk-read",
+        &key_info.table_id,
+        &stream_label,
+        StreamViewType::NewAndOldImages,
+    );
     let (records, last_seq) = engine
-        .get_stream_records(&key_info.account_id, &shard_id, None, 10)
+        .get_stream_records(&key_info.account_id, &arn, &shard_id, None, 10)
         .await
         .unwrap();
 
@@ -533,7 +569,13 @@ async fn test_get_stream_records_after_sequence_paginates() {
     use extenddb_storage::StreamEngine;
 
     let engine = setup_engine().await;
-    let (key_info, _) = setup_stream_table(&engine, "GetStreamRecordsPaginate").await;
+    let (key_info, stream_label) = setup_stream_table(&engine, "GetStreamRecordsPaginate").await;
+    let arn = extenddb_storage::util::stream_arn(
+        "us-east-1",
+        &key_info.account_id,
+        &key_info.table_name,
+        &stream_label,
+    );
 
     for i in 0..4u32 {
         let mut item = BTreeMap::new();
@@ -552,15 +594,26 @@ async fn test_get_stream_records_after_sequence_paginates() {
             .unwrap();
     }
 
-    let shard_id = shard_for("pk-page", &key_info.table_id);
+    let shard_id = stream_shard_for(
+        "pk-page",
+        &key_info.table_id,
+        &stream_label,
+        StreamViewType::NewAndOldImages,
+    );
     let (first_page, last_seq) = engine
-        .get_stream_records(&key_info.account_id, &shard_id, None, 2)
+        .get_stream_records(&key_info.account_id, &arn, &shard_id, None, 2)
         .await
         .unwrap();
     assert_eq!(first_page.len(), 2);
 
     let (second_page, _) = engine
-        .get_stream_records(&key_info.account_id, &shard_id, last_seq.as_deref(), 10)
+        .get_stream_records(
+            &key_info.account_id,
+            &arn,
+            &shard_id,
+            last_seq.as_deref(),
+            10,
+        )
         .await
         .unwrap();
     assert_eq!(second_page.len(), 2);
@@ -634,4 +687,93 @@ async fn test_list_streams_includes_stream_enabled_table() {
         .unwrap();
 
     assert!(streams.iter().any(|s| s.stream_arn == expected_arn));
+}
+
+/// `created_at` and `ApproximateCreationDateTime` derive from one clock
+/// read, and the sequence prefix is that reading or a later clamped value.
+/// For every stored record `created_at_ms <= hlc_ms`, and
+/// `created_at_ms / 1000` equals the record's timestamp. Covers plain
+/// writes and a service-identity deletion through `delete_item`.
+#[tokio::test]
+async fn test_stream_record_created_at_matches_the_record_and_sequence() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let table = TestTable::new(&engine, "StreamClock", false).await;
+    let view = StreamViewType::NewAndOldImages;
+
+    for v in ["one", "two"] {
+        let mut item = BTreeMap::new();
+        item.insert("id".to_string(), AttributeValue::S("pk-clock".to_string()));
+        item.insert("val".to_string(), AttributeValue::S(v.to_string()));
+        engine
+            .put_item(
+                &table.key_info,
+                item,
+                false,
+                None,
+                &Default::default(),
+                Some(&capture(view)),
+            )
+            .await
+            .unwrap();
+    }
+    let mut key = BTreeMap::new();
+    key.insert("id".to_string(), AttributeValue::S("pk-clock".to_string()));
+    engine
+        .delete_item(
+            &table.key_info,
+            &key,
+            false,
+            None,
+            &Default::default(),
+            Some(&StreamCapture {
+                view_type: view,
+                user_identity: Some(extenddb_core::types::UserIdentity {
+                    identity_type: "Service".to_string(),
+                    principal_id: "dynamodb.amazonaws.com".to_string(),
+                }),
+                region: Arc::from("us-east-1"),
+            }),
+        )
+        .await
+        .unwrap();
+
+    let shard_id = shard_for("pk-clock", &table.key_info.table_id);
+    let keyspace = format!("extenddb_ttl_test_account_{}", table.key_info.account_id);
+    let query = format!(
+        "SELECT sequence_number, created_at, record_data FROM {keyspace}.stream_records \
+         WHERE shard_id = ?"
+    );
+    let result = engine
+        .session_arc()
+        .query_with_values(&query, cdrs_tokio::query_values!(shard_id.as_str()))
+        .await
+        .unwrap();
+    let rows = result
+        .response_body()
+        .unwrap()
+        .into_rows()
+        .unwrap_or_default();
+    assert_eq!(rows.len(), 3, "two puts and one delete");
+    for row in rows {
+        let seq: String = row.get_r_by_name("sequence_number").unwrap();
+        let created_at_ms: i64 = row.get_r_by_name("created_at").unwrap();
+        let data: String = row.get_r_by_name("record_data").unwrap();
+        let record: serde_json::Value = serde_json::from_str(&data).unwrap();
+        let hlc_ms: i64 = seq[..13].parse().unwrap();
+        let approx = record["dynamodb"]["ApproximateCreationDateTime"]
+            .as_i64()
+            .unwrap();
+        assert!(
+            created_at_ms <= hlc_ms,
+            "created_at {created_at_ms} exceeds the sequence prefix {hlc_ms} in {seq}"
+        );
+        assert_eq!(
+            created_at_ms.div_euclid(1_000),
+            approx,
+            "created_at {created_at_ms} and ApproximateCreationDateTime {approx} disagree"
+        );
+    }
 }

@@ -2,12 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Credential store implementation for `MongoDB`.
+//!
+//! Secrets are decrypted with AES-256-GCM through
+//! `extenddb_storage::secret_cipher`, with the access key id as the AAD.
 
 use mongodb::bson::{Document, doc};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use extenddb_auth::{CredentialStore, StoredCredential};
 use extenddb_core::error::DynamoDbError;
+use extenddb_storage::secret_cipher::decrypt_secret;
 
 /// `MongoDB` credential store for authentication.
 ///
@@ -30,6 +34,24 @@ impl MongoCredentialStore {
 
     fn catalog_db(&self) -> mongodb::Database {
         self.client.database("extenddb_catalog")
+    }
+
+    /// Whether `account_id` has a document in `accounts`. Before account
+    /// deletes removed them, a deleted account's access keys and role
+    /// sessions stayed in the catalog; a credential of an account that no
+    /// longer exists is unknown.
+    async fn account_exists(&self, account_id: &str) -> Result<bool, DynamoDbError> {
+        self.catalog_db()
+            .collection::<Document>("accounts")
+            .find_one(doc! { "account_id": account_id })
+            .await
+            .map(|d| d.is_some())
+            .map_err(|e| {
+                tracing::error!("Account lookup failed for account {account_id}: {e}");
+                DynamoDbError::InternalServerError(
+                    "Internal error during authentication".to_owned(),
+                )
+            })
     }
 
     async fn lookup_user_credential(
@@ -61,6 +83,9 @@ impl MongoCredentialStore {
         // a corrupted or partially written access-key record cannot silently
         // authenticate.
         let is_active = key_doc.get_bool("is_active").unwrap_or(false);
+        if !self.account_exists(&account_id).await? {
+            return Ok(None);
+        }
 
         let secret_key =
             decrypt_secret(&encrypted, &self.encryption_key, access_key_id).map_err(|e| {
@@ -123,6 +148,9 @@ impl MongoCredentialStore {
             .get_str("session_token")
             .unwrap_or_default()
             .to_owned();
+        if !self.account_exists(&account_id).await? {
+            return Ok(None);
+        }
 
         let expires_at = session_doc.get_datetime("expires_at").map_err(|_| {
             DynamoDbError::InternalServerError("Internal error during authentication".to_owned())
@@ -178,47 +206,4 @@ impl CredentialStore for MongoCredentialStore {
 
         Ok(None)
     }
-}
-
-// ── Crypto helpers ──────────────────────────────────────────────────────
-
-fn decrypt_secret(encrypted: &[u8], key_b64: &str, aad: &str) -> Result<String, String> {
-    use aes_gcm::Aes256Gcm;
-    use aes_gcm::KeyInit;
-    use aes_gcm::aead::Aead;
-    use aes_gcm::aead::Payload;
-    use base64::Engine;
-
-    if encrypted.len() < 28 {
-        return Err(
-            "ciphertext too short (need at least 12-byte nonce + 16-byte auth tag)".to_owned(),
-        );
-    }
-
-    let key_bytes = base64::engine::general_purpose::STANDARD
-        .decode(key_b64)
-        .map_err(|e| format!("decode encryption key: {e}"))?;
-
-    let key = aes_gcm::Key::<Aes256Gcm>::from_slice(&key_bytes);
-    let cipher = Aes256Gcm::new(key);
-    let nonce = aes_gcm::Nonce::from_slice(&encrypted[..12]);
-
-    // Try with AAD first (CB-11 format).
-    let payload_with_aad = Payload {
-        msg: &encrypted[12..],
-        aad: aad.as_bytes(),
-    };
-    if let Ok(plaintext_bytes) = cipher.decrypt(nonce, payload_with_aad) {
-        return String::from_utf8(plaintext_bytes)
-            .map_err(|e| format!("decrypted secret is not valid UTF-8: {e}"));
-    }
-
-    // Fall back to without AAD (pre-CB-11 format).
-    tracing::debug!("Decrypting secret without AAD (pre-CB-11 format) for {aad}");
-    let plaintext_bytes = cipher
-        .decrypt(nonce, &encrypted[12..])
-        .map_err(|e| format!("decrypt: {e}"))?;
-
-    String::from_utf8(plaintext_bytes)
-        .map_err(|e| format!("decrypted secret is not valid UTF-8: {e}"))
 }

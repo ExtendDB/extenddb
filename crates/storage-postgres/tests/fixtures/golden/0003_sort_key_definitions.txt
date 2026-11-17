@@ -1,0 +1,9 @@
+backup orphan: []
+backup seed_backup: [{"AttributeName": "gpk", "AttributeType": "S"}, {"AttributeName": "lsk", "AttributeType": "N"}, {"AttributeName": "sk", "AttributeType": "S"}]
+table seed_simple: [{"AttributeName": "id", "AttributeType": "N"}]
+table seed_tbl: [{"AttributeName": "gpk", "AttributeType": "S"}, {"AttributeName": "lsk", "AttributeType": "N"}, {"AttributeName": "sk", "AttributeType": "S"}]
+notes:
+restored seed_tbl: sk (S)
+seed_tbl: partition key definition(s) [pk] are absent; reads and writes are unaffected, but index key type validation cannot check them
+restored backup <seed_backup> of seed_tbl: sk (S)
+backup arn:orphan of gone_tbl: sort key(s) [sk] have no attribute definition, and neither its items nor its source table give the type; restoring it fails until the definition is added

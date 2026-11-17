@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
@@ -101,13 +101,14 @@ pub struct InvalidateResponse {
 pub async fn invalidate(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     body: Result<axum::Json<InvalidateRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let admin_name = match authenticate_admin(
         &headers,
         &*state.catalog_store,
         &*state.catalog_store,
-        None,
+        addr,
     )
     .await
     {
