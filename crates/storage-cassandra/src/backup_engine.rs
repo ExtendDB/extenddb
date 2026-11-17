@@ -1291,7 +1291,7 @@ impl CassandraEngine {
         // own batch, as LSIs always are: the target turns ACTIVE only after
         // its last item is written, and DynamoDB reports a restored table's
         // indexes as complete at ACTIVE.
-        let mut indexes = crate::data::index::fetch_indexes_for_table_quorum(
+        let mut indexes = crate::data::index::fetch_indexes_for_table(
             &job.table_id,
             &self.session,
             &self.catalog_keyspace(),
