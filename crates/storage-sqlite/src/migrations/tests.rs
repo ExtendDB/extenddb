@@ -457,7 +457,7 @@ async fn a_rebuild_of_tables_keeps_its_index_shard_and_stream_rows() {
 }
 
 /// The copy is owner-only whatever the database's mode: 0644 is the mode of
-/// a catalog that 0.1.x `init` created and no server opened.
+/// a catalog that the `init` of 0.1.14 or earlier created and no server opened.
 #[cfg(unix)]
 #[tokio::test]
 async fn the_copy_is_owner_only_and_has_a_name_no_run_reuses() {

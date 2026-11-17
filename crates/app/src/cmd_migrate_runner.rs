@@ -6,7 +6,7 @@
 //! writing nothing, so it runs beside a server. `--yes` reads the status
 //! again under the migration lock and applies; it refuses a store that is
 //! not a catalog, which `extenddb init` creates. `--reconverge` reruns every
-//! convergent migration on a catalog a release before 1.0 wrote to,
+//! convergent migration on a catalog a release before 0.1.15 wrote to,
 //! `--forget` clears an unreleased migration, and `--list` prints the
 //! migrations without opening the catalog.
 //!
@@ -225,7 +225,7 @@ async fn preview(
             if version.is_none() {
                 println!(
                     "Stop every server that uses this catalog before applying: a server of a \
-                     release before 1.0 is not detected while it runs."
+                     release before 0.1.15 is not detected while it runs."
                 );
             }
             println!("{}", behind_summary(*version, pending, latest));
@@ -272,7 +272,7 @@ fn behind_summary(version: Option<u32>, pending: &[Pending], latest: u32) -> Str
             format!("The catalog is at migration {v}; this binary carries {latest}.")
         }
         (None, None) => format!(
-            "The catalog has no migration ledger (a release before 1.0 created it); this binary \
+            "The catalog has no migration ledger (a release before 0.1.15 created it); this binary \
              carries migrations 1 to {latest}."
         ),
     }
