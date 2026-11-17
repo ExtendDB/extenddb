@@ -6,6 +6,7 @@
 use extenddb_storage::management_store::{OpError, OpResult, RoleDetail};
 
 use super::database_error;
+use super::policies::delete_principal_attachments;
 use crate::catalog_store::PostgresCatalogStore;
 use crate::pg_util::{is_fk_violation, is_unique_violation};
 
@@ -17,6 +18,10 @@ impl PostgresCatalogStore {
         trust_policy: &serde_json::Value,
     ) -> OpResult<()> {
         let role_arn = format!("arn:aws:iam::{account_id}:role/{role_name}");
+        let mut tx = self.pool().begin().await.map_err(|e| {
+            tracing::error!("create_role begin transaction: {e}");
+            OpError::Internal("Database error".to_owned())
+        })?;
         let result = sqlx::query(
             "INSERT INTO iam_roles (account_id, role_name, role_arn, trust_policy) \
              VALUES ($1, $2, $3, $4)",
@@ -25,37 +30,57 @@ impl PostgresCatalogStore {
         .bind(role_name)
         .bind(&role_arn)
         .bind(trust_policy)
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await;
         match result {
-            Ok(_) => Ok(()),
+            Ok(_) => {}
             Err(e) if is_unique_violation(&e) => {
-                Err(OpError::AlreadyExists("IAM role already exists".to_owned()))
+                return Err(OpError::AlreadyExists("IAM role already exists".to_owned()));
             }
-            Err(e) if is_fk_violation(&e) => Err(OpError::NotFound("Account not found".to_owned())),
+            Err(e) if is_fk_violation(&e) => {
+                return Err(OpError::NotFound("Account not found".to_owned()));
+            }
             Err(e) => {
                 tracing::error!("create_role failed: {e}");
-                Err(OpError::Internal("Database error".to_owned()))
+                return Err(OpError::Internal("Database error".to_owned()));
             }
         }
+        // A role deleted before deletes removed them could have left its
+        // inline policies and boundary under this name.
+        delete_principal_attachments(&mut tx, account_id, "role", role_name).await?;
+        tx.commit().await.map_err(|e| {
+            tracing::error!("create_role commit: {e}");
+            OpError::Internal("Database error".to_owned())
+        })
     }
 
     pub(crate) async fn delete_role_impl(&self, account_id: &str, role_name: &str) -> OpResult<()> {
+        let mut tx = self.pool().begin().await.map_err(|e| {
+            tracing::error!("delete_role begin transaction: {e}");
+            OpError::Internal("Database error".to_owned())
+        })?;
+        // The foreign keys remove the role's tags and sessions. Its inline
+        // policies and boundary have none.
         let result = sqlx::query("DELETE FROM iam_roles WHERE account_id = $1 AND role_name = $2")
             .bind(account_id)
             .bind(role_name)
-            .execute(self.pool())
+            .execute(&mut *tx)
             .await;
         match result {
             Ok(r) if r.rows_affected() == 0 => {
-                Err(OpError::NotFound("IAM role not found".to_owned()))
+                return Err(OpError::NotFound("IAM role not found".to_owned()));
             }
-            Ok(_) => Ok(()),
+            Ok(_) => {}
             Err(e) => {
                 tracing::error!("delete_role failed: {e}");
-                Err(OpError::Internal("Database error".to_owned()))
+                return Err(OpError::Internal("Database error".to_owned()));
             }
         }
+        delete_principal_attachments(&mut tx, account_id, "role", role_name).await?;
+        tx.commit().await.map_err(|e| {
+            tracing::error!("delete_role commit: {e}");
+            OpError::Internal("Database error".to_owned())
+        })
     }
 
     pub(crate) async fn list_roles_impl(

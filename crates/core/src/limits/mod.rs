@@ -2,6 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 use serde::Deserialize;
 
+/// The default `max_item_size_bytes` (400 KB as `DynamoDB` sizes items), the
+/// largest item the backup format's line cap is sized for: the backup job
+/// measures the data file line of an item over this size and of no item
+/// within it.
+pub const DEFAULT_MAX_ITEM_SIZE_BYTES: usize = 409_600;
+
 /// All configurable limits with DynamoDB-compatible defaults.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -47,7 +53,9 @@ pub struct LimitsConfig {
     /// raw text before `#name` / `:value` substitution (DynamoDB: 4096).
     #[serde(default = "default_max_expression_length_bytes")]
     pub max_expression_length_bytes: usize,
-    /// Maximum nesting depth in condition expressions (parentheses, NOT, AND/OR).
+    /// Maximum nesting depth in condition and update expressions: parentheses,
+    /// NOT and a nested `size` call in a condition, parentheses and function
+    /// calls in an update.
     #[serde(default = "default_max_expression_depth")]
     pub max_expression_depth: usize,
     /// Maximum policy document size in bytes (before JSON parsing).
@@ -98,7 +106,7 @@ impl Default for LimitsConfig {
 }
 
 fn default_max_item_size() -> usize {
-    409_600
+    DEFAULT_MAX_ITEM_SIZE_BYTES
 }
 fn default_max_pk_size() -> usize {
     2048

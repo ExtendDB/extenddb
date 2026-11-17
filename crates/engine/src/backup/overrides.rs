@@ -46,8 +46,12 @@
 //! on-demand restore is accepted and not recorded (ExtendDB keeps no
 //! per-index on-demand maximum); on a PROVISIONED restore it contradicts the
 //! billing mode and is refused. A member of an entry outside the service
-//! model's (`WarmThroughput`, for one) is refused, since ExtendDB cannot apply
-//! it. An `OnDemandThroughputOverride` replaces the backup's on-demand
+//! model's is refused, since ExtendDB cannot apply it. A GSI entry's
+//! `WarmThroughput` is refused with the service's own sentence (measured
+//! 2026-10-23, row S6d). A restored table and its indexes report the
+//! on-demand warm throughput defaults, as the service's restore does (row
+//! S6c); the backup records no warm throughput (row S6b). An
+//! `OnDemandThroughputOverride` replaces the backup's on-demand
 //! throughput as a whole: a member it leaves out means no maximum, as on
 //! `CreateTable`.
 
@@ -131,6 +135,12 @@ pub(super) fn gsi_throughput_required(index_name: &str) -> DynamoDbError {
          PROVISIONED for index {index_name}"
     ))
 }
+
+/// The service's refusal of a `WarmThroughput` member on a
+/// `GlobalSecondaryIndexOverride` entry (measured, row S6d), after the
+/// "One or more parameter values were invalid: " prefix.
+const WARM_THROUGHPUT_OVERRIDE: &str =
+    "WarmThroughput is not supported on Global Secondary Indexes via RestoreTableFromBackup";
 
 fn invalid(detail: String) -> DynamoDbError {
     DynamoDbError::ValidationException(format!(
@@ -357,6 +367,9 @@ fn apply_gsis(
         .map(|(entry, recorded)| {
             let given = &entry.index;
             let name = &given.index_name;
+            if entry.unknown.iter().any(|m| m == "WarmThroughput") {
+                return Err(invalid(WARM_THROUGHPUT_OVERRIDE.to_owned()));
+            }
             same_definition(
                 name,
                 &entry.unknown,
@@ -383,6 +396,7 @@ fn apply_gsis(
                 key_schema: recorded.key_schema.clone(),
                 projection: recorded.projection.clone(),
                 provisioned_throughput: given.provisioned_throughput.clone(),
+                warm_throughput: None,
             })
         })
         .collect()
