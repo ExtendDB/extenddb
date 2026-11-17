@@ -6,24 +6,35 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
+use std::time::Duration;
 
+use extenddb_core::backup_format::BackupArn;
 use extenddb_core::error::{
     DynamoDbError, PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE, ThrottlingReason,
 };
 use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition, UpdateAction};
 use extenddb_core::types::{
     AttributeDefinition, AttributeValue, BackupDescription, BackupDetails, BackupSummary,
-    ContinuousBackupsDescription, CreateTableInput, DeleteTableInput, DescribeStreamInput,
-    DescribeTableInput, IndexInfo, Item, KeySchemaElement, KeyType, ListTablesInput,
-    ListTablesOutput, ScalarAttributeType, StreamDescription, StreamRecord, TableDescription,
-    TableKeyInfo, Tag, TimeToLiveDescription, UpdateTableInput,
+    CreateTableInput, DeleteTableInput, DescribeStreamInput, DescribeTableInput, IndexInfo, Item,
+    KeySchemaElement, KeyType, ListTablesInput, ListTablesOutput, ScalarAttributeType,
+    StreamDescription, StreamRecord, TableDescription, TableKeyInfo, Tag, TimeToLiveDescription,
+    UpdateTableInput,
+};
+use extenddb_storage::backup_catalog::{
+    AbandonedLegacyBackup, BackupKey, BackupRow, BackupStatus, DeleteStart, ForgetRow, JobStatus,
+    LegacyBackupItems, LegacyBackupKey, Replaced, RestoreJobRow, RestoreRegistered,
+    RestoreRegistrationRow, RestoreTargetKey, StaleClock, StoreIdentity, StoreKind, StoreRootCount,
+    TimeBounds,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{
-    BackupEngine, BackupRestoreSource, BoxedFuture, DataEngine, IdempotencyKey, ItemPairResult,
-    MetadataEngine, QueryResult, RestoreRequest, StreamCapture, StreamEngine, StreamListResult,
-    StreamRecordsResult, TableEngine, TransactGetOp, TransactWriteOp, TtlTableInfo, WorkerStore,
+    BackupCatalog, BackupRestoreSource, BoxedFuture, BulkLoadFile, DataEngine, Finished,
+    IdempotencyKey, ItemPairResult, JobClaim, JobPermit, LegacyBackupReader, MaintenanceClaim,
+    MetadataEngine, QueryResult, RestoreEngine, RestoreRequest, SnapshotEngine, StreamCapture,
+    StreamEngine, StreamListResult, StreamRecordsResult, TableEngine, TableSnapshot, TransactGetOp,
+    TransactWriteOp, TtlTableInfo, WorkerStore,
 };
+use futures::stream::BoxStream;
 
 pub const ACCOUNT: &str = "123456789012";
 pub const REGION: &str = "us-east-1";
@@ -449,6 +460,7 @@ impl StreamEngine for FailingStore {
     fn get_stream_records(
         &self,
         _account_id: &str,
+        _stream_arn: &str,
         _shard_id: &str,
         _after_sequence: Option<&str>,
         _limit: i64,
@@ -507,63 +519,332 @@ impl StreamEngine for FailingStore {
     }
 }
 
-impl BackupEngine for FailingStore {
-    fn create_backup(
+impl BackupCatalog for FailingStore {
+    fn catalog_id(&self) -> BoxedFuture<'_, Result<String, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn claim_backup<'a>(
+        &'a self,
+        _row: &'a BackupRow,
+    ) -> BoxedFuture<'a, Result<Box<dyn JobClaim>, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn insert_backup_row<'a>(
+        &'a self,
+        _row: &'a BackupRow,
+    ) -> BoxedFuture<'a, Result<bool, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn list_backup_rows<'a>(
+        &'a self,
+        _status: Option<BackupStatus>,
+        _store: &'a StoreIdentity,
+    ) -> BoxStream<'a, Result<BackupRow, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn list_backup_rows_by_root<'a>(
+        &'a self,
+        _store_kind: StoreKind,
+        _store_root: &'a str,
+        _status: Option<BackupStatus>,
+    ) -> BoxStream<'a, Result<BackupRow, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn newest_available_backup_row<'a>(
+        &'a self,
+        _store: &'a StoreIdentity,
+    ) -> BoxedFuture<'a, Result<Option<BackupRow>, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn list_account_backup_rows<'a>(
+        &'a self,
+        _account_id: &'a str,
+        _table_name: Option<&'a str>,
+        _bounds: &'a TimeBounds,
+    ) -> BoxStream<'a, Result<BackupRow, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn read_backup_row<'a>(
+        &'a self,
+        _arn: &'a BackupArn,
+    ) -> BoxedFuture<'a, Result<Option<BackupRow>, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn row_holding_backup_id<'a>(
+        &'a self,
+        _backup_id: &'a str,
+    ) -> BoxedFuture<'a, Result<Option<BackupRow>, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn start_backup_delete<'a>(
+        &'a self,
+        _key: &'a BackupKey,
+    ) -> BoxedFuture<'a, Result<DeleteStart, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn set_backup_deleted<'a>(
+        &'a self,
+        _key: &'a BackupKey,
+    ) -> BoxedFuture<'a, Result<bool, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn remove_backup_row<'a>(
+        &'a self,
+        _key: &'a BackupKey,
+        _store_kind: StoreKind,
+        _store_root: &'a str,
+    ) -> BoxedFuture<'a, Result<bool, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn forget_available_backup_row<'a>(
+        &'a self,
+        _key: &'a BackupKey,
+    ) -> BoxedFuture<'a, Result<ForgetRow, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn rewrite_store<'a>(
+        &'a self,
+        _from_kind: StoreKind,
+        _from_root: &'a str,
+        _keys: &'a [BackupKey],
+        _to: &'a StoreIdentity,
+    ) -> BoxedFuture<'a, Result<u64, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn remove_dead_creating_backup_row<'a>(
+        &'a self,
+        _key: &'a BackupKey,
+        _stale_after: Duration,
+    ) -> BoxedFuture<'a, Result<bool, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn claim_dead_backup<'a>(
+        &'a self,
+        _key: &'a BackupKey,
+        _stale_after: Duration,
+    ) -> BoxedFuture<'a, Result<Option<Box<dyn JobClaim>>, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn list_backup_rows_older_than<'a>(
+        &'a self,
+        _status: BackupStatus,
+        _store: &'a StoreIdentity,
+        _clock: StaleClock,
+        _age: Duration,
+    ) -> BoxStream<'a, Result<BackupRow, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn backup_in_use<'a>(
+        &'a self,
+        _key: &'a BackupKey,
+    ) -> BoxedFuture<'a, Result<Option<String>, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn remove_restore_target<'a>(
+        &'a self,
+        _key: &'a RestoreTargetKey,
+    ) -> BoxedFuture<'a, Result<bool, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn list_dead_restore_jobs(
+        &self,
+        _stale_after: Duration,
+    ) -> BoxedFuture<'_, Result<Vec<RestoreJobRow>, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn list_running_restore_jobs(
+        &self,
+    ) -> BoxedFuture<'_, Result<Vec<RestoreJobRow>, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn fail_restore_job<'a>(
+        &'a self,
+        _key: &'a RestoreTargetKey,
+        _owner_generation: u64,
+        _heartbeat_at: f64,
+        _reason: &'a str,
+    ) -> BoxedFuture<'a, Result<bool, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn claim_restore<'a>(
+        &'a self,
+        _account_id: &'a str,
+        _input: CreateTableInput,
+        _registration: &'a RestoreRegistrationRow,
+    ) -> BoxedFuture<'a, Result<RestoreRegistered, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn claim_restore_dead<'a>(
+        &'a self,
+        _key: &'a RestoreTargetKey,
+        _stale_after: Duration,
+        _spool_host: Option<&'a str>,
+    ) -> BoxedFuture<'a, Result<Option<Box<dyn JobClaim>>, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn read_restore_job<'a>(
+        &'a self,
+        _key: &'a RestoreTargetKey,
+    ) -> BoxedFuture<'a, Result<Option<RestoreJobRow>, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn list_restore_jobs<'a>(
+        &'a self,
+        _status: Option<JobStatus>,
+    ) -> BoxedFuture<'a, Result<Vec<RestoreJobRow>, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn read_store_ids<'a>(
+        &'a self,
+        _store_kind: StoreKind,
+        _store_root: &'a str,
+    ) -> BoxedFuture<'a, Result<Vec<String>, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn summarize_store_roots(&self) -> BoxedFuture<'_, Result<Vec<StoreRootCount>, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn maintenance_claim<'a>(
+        &'a self,
+        _holder: &'a str,
+        _stale_after: Duration,
+    ) -> BoxedFuture<'a, Result<Box<dyn MaintenanceClaim>, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn check_maintenance_claim(
+        &self,
+        _stale_after: Duration,
+    ) -> BoxedFuture<'_, Result<bool, StorageError>> {
+        unimplemented!("not exercised")
+    }
+}
+
+impl LegacyBackupReader for FailingStore {
+    fn create(
         &self,
         _account_id: &str,
         _table_name: &str,
         _backup_name: &str,
+        _permit: JobPermit,
     ) -> BoxedFuture<'_, Result<BackupDetails, StorageError>> {
         unimplemented!("not exercised")
     }
-    fn describe_backup(
+    fn describe(
         &self,
         _account_id: &str,
         _backup_arn: &str,
     ) -> BoxedFuture<'_, Result<BackupDescription, StorageError>> {
         unimplemented!("not exercised")
     }
-    fn list_backups(
+    fn list(
         &self,
         _account_id: &str,
         _table_name: Option<&str>,
     ) -> BoxedFuture<'_, Result<Vec<BackupSummary>, StorageError>> {
         unimplemented!("not exercised")
     }
-    fn delete_backup(
+    fn delete(
         &self,
         _account_id: &str,
         _backup_arn: &str,
     ) -> BoxedFuture<'_, Result<BackupDescription, StorageError>> {
         unimplemented!("not exercised")
     }
-    fn backup_restore_source(
+    fn restore_source(
         &self,
         _account_id: &str,
         _backup_arn: &str,
     ) -> BoxedFuture<'_, Result<BackupRestoreSource, StorageError>> {
         unimplemented!("not exercised")
     }
-    fn restore_table_from_backup(
+    fn restore(
         &self,
         _account_id: &str,
         _request: RestoreRequest,
+        _permit: JobPermit,
     ) -> BoxedFuture<'_, Result<TableDescription, StorageError>> {
         unimplemented!("not exercised")
     }
-    fn describe_continuous_backups(
+    fn abandoned_creating_backups(
         &self,
-        _account_id: &str,
-        _table_name: &str,
-    ) -> BoxedFuture<'_, Result<ContinuousBackupsDescription, StorageError>> {
+        _stale_after: Duration,
+    ) -> BoxedFuture<'_, Result<Vec<AbandonedLegacyBackup>, StorageError>> {
         unimplemented!("not exercised")
     }
-    fn update_continuous_backups(
+    fn list_all(&self) -> BoxedFuture<'_, Result<Vec<LegacyBackupKey>, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn list_deleted(&self) -> BoxedFuture<'_, Result<Vec<LegacyBackupKey>, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn holder_status<'a>(
+        &'a self,
+        _account_id: &'a str,
+        _backup_arn: &'a str,
+    ) -> BoxedFuture<'a, Result<Option<BackupStatus>, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn remove_deleted<'a>(
+        &'a self,
+        _account_id: &'a str,
+        _backup_arn: &'a str,
+    ) -> BoxedFuture<'a, Result<bool, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn items(
+        &self,
+        _account_id: &str,
+        _backup_arn: &str,
+    ) -> BoxedFuture<'_, Result<LegacyBackupItems, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn replace_with_index_row<'a>(
+        &'a self,
+        _row: &'a BackupRow,
+    ) -> BoxedFuture<'a, Result<Replaced, StorageError>> {
+        unimplemented!("not exercised")
+    }
+}
+
+impl RestoreEngine for FailingStore {
+    fn bulk_load<'a>(
+        &'a self,
+        _target: &'a RestoreTargetKey,
+        _claim: &'a dyn JobClaim,
+        _file: BulkLoadFile,
+        _items: BoxStream<'a, Result<Item, StorageError>>,
+    ) -> BoxedFuture<'a, Result<u64, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn finish_restore<'a>(
+        &'a self,
+        _target: &'a RestoreTargetKey,
+        _claim: &'a dyn JobClaim,
+        _item_count: u64,
+        _size_bytes: u64,
+    ) -> BoxedFuture<'a, Result<Finished, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn count_restore_target<'a>(
+        &'a self,
+        _key: &'a RestoreTargetKey,
+    ) -> BoxedFuture<'a, Result<u64, StorageError>> {
+        unimplemented!("not exercised")
+    }
+    fn restore_target_ready<'a>(
+        &'a self,
+        _key: &'a RestoreTargetKey,
+    ) -> BoxedFuture<'a, Result<bool, StorageError>> {
+        unimplemented!("not exercised")
+    }
+}
+
+impl SnapshotEngine for FailingStore {
+    fn open_table_snapshot(
         &self,
         _account_id: &str,
         _table_name: &str,
-        _pitr_enabled: bool,
-    ) -> BoxedFuture<'_, Result<ContinuousBackupsDescription, StorageError>> {
+    ) -> BoxedFuture<'_, Result<TableSnapshot, StorageError>> {
         unimplemented!("not exercised")
     }
 }

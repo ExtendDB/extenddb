@@ -31,7 +31,7 @@ use extenddb_auth::AuthCacheRegistry;
 use extenddb_core::error::{DynamoDbError, PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE};
 use extenddb_core::limits::LimitsConfig;
 use extenddb_engine::{
-    DispatchResult, OperationContext, handle_batch_get_item, handle_batch_write_item,
+    BackupRuntime, DispatchResult, OperationContext, handle_batch_get_item, handle_batch_write_item,
 };
 
 use failing_store::*;
@@ -39,6 +39,7 @@ use failing_store::*;
 fn ctx(store: Arc<FailingStore>) -> OperationContext {
     OperationContext {
         storage: store,
+        backup: Arc::new(BackupRuntime::new(1)),
         limits: Arc::new(LimitsConfig::default()),
         region: Arc::from(REGION),
         account_id: Arc::from(ACCOUNT),
@@ -47,6 +48,7 @@ fn ctx(store: Arc<FailingStore>) -> OperationContext {
         authorized_key_info: extenddb_engine::AuthorizedKeyInfo::new(),
         auth_cache: AuthCacheRegistry::empty(),
         table_key_info_lookup: None,
+        item_authorizer: None,
     }
 }
 

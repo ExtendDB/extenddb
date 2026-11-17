@@ -329,7 +329,12 @@ pub(crate) async fn handle_request(
             );
             // A batch a backend served partially is a throttle the server's own
             // bucket never saw; count it so the metrics do not read as zero.
-            record_partial_batch_throttle(&state.metrics, &operation, &result.body);
+            record_partial_batch_throttle(
+                &state.metrics,
+                &ctx.account_id,
+                &operation,
+                &result.body,
+            );
 
             let m = &result.metrics;
             if let Some(ref tn) = metric_table {
