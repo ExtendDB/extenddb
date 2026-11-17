@@ -70,7 +70,9 @@ async fn a_reconverge_keeps_what_a_later_migration_added() {
 }
 
 /// `forget` deletes the rows of the id it is given in every store that
-/// records it, and the next run applies that id again.
+/// records it, and the next run applies that id again. The runner is given
+/// a released bound of 0, so the latest migration is one it may forget
+/// whatever bound this binary carries.
 #[tokio::test]
 async fn forget_removes_one_migration_and_the_next_run_applies_it() {
     let Some(base) = base_conn() else {
@@ -81,7 +83,10 @@ async fn forget_removes_one_migration_and_the_next_run_applies_it() {
         .await
         .unwrap();
     let m = PostgresMigrations::open(&s.target(), &lock).await.unwrap();
-    let forgot = Runner::new(&m, RELEASE).forget(LATEST).await;
+    let forgot = Runner::new(&m, RELEASE)
+        .with_released_through(0)
+        .forget(LATEST)
+        .await;
     m.close().await;
     lock.release().await;
     forgot.expect("forget the latest migration");

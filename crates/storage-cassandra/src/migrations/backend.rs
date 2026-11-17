@@ -212,7 +212,7 @@ pub(crate) fn stopped(left: Option<&std::sync::atomic::AtomicUsize>) -> bool {
         return false;
     };
     // A compare-exchange loop: `fetch_update` is deprecated on current
-    // stable and its replacement does not exist on 1.88.
+    // stable and its replacement is unstable on 1.91.1.
     let mut n = left.load(Ordering::SeqCst);
     loop {
         let Some(next) = n.checked_sub(1) else {
@@ -341,8 +341,9 @@ struct KeyspaceLedger<'a> {
     keyspace: &'a str,
     /// The `catalog_version` to write with this keyspace's row. Migration
     /// 1's row and the version go in one logged batch: a stop between two
-    /// writes would leave that row beside a 0.1.x version row, which the
-    /// next run reads as a catalog an older release wrote to. A later row
+    /// writes would leave that row beside the dotted version row of 0.1.14
+    /// or earlier, which the next run reads as a catalog an older release
+    /// wrote to. A later row
     /// goes on its own, after the version, since its notes can be long and a
     /// logged batch is refused past the node's `batch_size_fail_threshold`
     /// (50 KB by default). A stop between them leaves the version ahead of
@@ -530,7 +531,7 @@ impl MigrationBackend for CassandraMigrations<'_> {
             Step::Record => Done::default(),
         };
         // The first time migration 1 is applied to a store, the store must
-        // match the v1.0 schema; a later --reconverge leaves its row as it
+        // match migration 1's schema; a later --reconverge leaves its row as it
         // is and is not checked, since later migrations change the schema.
         if id == MigrationId::Baseline && row.is_some() {
             self.agree().await?;

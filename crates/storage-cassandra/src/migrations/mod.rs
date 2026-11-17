@@ -53,7 +53,15 @@ pub use backend::{CassandraMigrations, CassandraStores};
 pub use commands::CassandraCatalogMigrations;
 pub(crate) use commands::lease_of;
 pub use connect::Deployment;
-pub(crate) use connect::{LOCKED_DDL_TIMEOUT, REQUEST_TIMEOUT};
+pub(crate) use connect::{
+    LOCKED_DDL_TIMEOUT, REQUEST_TIMEOUT, alter_steps, cluster_datacenters, replication_differs,
+    tables_of,
+};
+// Public for the integration tests only.
+#[cfg(any(test, feature = "test-util"))]
+pub use connect::{ReplicationChange, replication_mismatches};
+#[cfg(not(any(test, feature = "test-util")))]
+pub(crate) use connect::{ReplicationChange, replication_mismatches};
 pub(crate) use locks::LeaseHandle;
 pub use locks::{LeaseTimes, MigrationLock};
 pub use registrar::ServerRegistration;
@@ -383,7 +391,7 @@ pub async fn wait_for_schema_agreement(session: &CassandraSession) -> Result<(),
 }
 
 /// Run migration 1's body for stores of `kind` in `keyspace` and record
-/// nothing, as a release before 1.0 left a catalog with these tables and no
+/// nothing, as a release before 0.1.15 left a catalog with these tables and no
 /// ledger: for the tests of adoption.
 ///
 /// # Errors
@@ -622,7 +630,7 @@ pub async fn foreign_contents(
 }
 
 /// The (table, column) pairs migration 1 adds to the catalog keyspace with
-/// `ALTER TABLE ... ADD IF NOT EXISTS`: a table an `init` or a 0.1.x release
+/// `ALTER TABLE ... ADD IF NOT EXISTS`: a table an `init` or a release up to 0.1.14
 /// created before such a statement lacks them, and migration 1 adds them.
 fn baseline_added_columns() -> std::collections::BTreeSet<(&'static str, &'static str)> {
     CATALOG_BASELINE
