@@ -20,6 +20,12 @@ backup-test-hooks = []
 # off, the three operations are not known and the server answers them with
 # UnknownOperationException exactly as before.
 partiql = ["extenddb-core/partiql"]
+# SearchVectors inequality filters: the extended SearchConditionExpression
+# grammar (comparators, BETWEEN, IN, OR, NOT, attribute_exists and
+# attribute_not_exists) for the accounts the `search_inequality_filters`
+# runtime setting names. Off by default. Removable: with this off, the
+# grammar module is not compiled and SearchVectors behaves as before.
+search-inequality-filters = ["extenddb-core/search-inequality-filters"]
 
 [dependencies]
 extenddb-auth = { workspace = true }

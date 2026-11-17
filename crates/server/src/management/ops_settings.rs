@@ -46,7 +46,17 @@ pub const KNOWN_KEYS: &[(&str, Validator)] = &[
         extenddb_core::settings_keys::VECTOR_ALLOCATION_PHASE_DELAY_MS,
         validate_backfill_batch_delay_ms,
     ),
+    #[cfg(feature = "search-inequality-filters")]
+    (
+        extenddb_core::settings_keys::SEARCH_INEQUALITY_FILTERS,
+        validate_search_inequality_filters,
+    ),
 ];
+
+#[cfg(feature = "search-inequality-filters")]
+fn validate_search_inequality_filters(value: &str) -> Result<(), &'static str> {
+    extenddb_core::expression::search_filter::EnabledAccounts::parse(value).map(|_| ())
+}
 
 /// Read-only keys that cannot be changed via the settings API.
 pub const READONLY_KEYS: &[&str] = &[

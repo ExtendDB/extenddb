@@ -124,7 +124,17 @@ pub async fn handle_search_vectors(
     }
 
     // Structural validation of the filter expression (schema-independent).
+    // An account the extended grammar is enabled for gets that parser instead.
+    let extended = crate::search_vectors_extended::parse_request(
+        vector_search,
+        &ctx.account_id,
+        input.search_condition_expression.as_deref(),
+        input.expression_attribute_names.as_ref(),
+        input.expression_attribute_values.as_ref(),
+    )
+    .await?;
     let conditions = match input.search_condition_expression.as_deref() {
+        Some(_) if extended.is_some() => Vec::new(),
         Some(expr) => validate_search_condition_expression(
             expr,
             input.expression_attribute_names.as_ref(),
@@ -185,11 +195,24 @@ pub async fn handle_search_vectors(
         )));
     }
 
-    let (hash_key, filters) = resolve_search_scope(
-        &conditions,
-        vector_index.search_schema.as_deref(),
-        &table.attribute_definitions,
-    )?;
+    let (hash_key, filters, item_filter) = match &extended {
+        Some(extended) => {
+            let (hash_key, item_filter) = crate::search_vectors_extended::resolve_scope(
+                extended,
+                vector_index.search_schema.as_deref(),
+                &table.attribute_definitions,
+            )?;
+            (hash_key, Vec::new(), Some(item_filter))
+        }
+        None => {
+            let (hash_key, filters) = resolve_search_scope(
+                &conditions,
+                vector_index.search_schema.as_deref(),
+                &table.attribute_definitions,
+            )?;
+            (hash_key, filters, None)
+        }
+    };
 
     let search_output = vector_search
         .search_vectors(extenddb_storage::VectorSearch {
@@ -199,7 +222,7 @@ pub async fn handle_search_vectors(
             top_k: input.top_k,
             hash_key,
             filters: &filters,
-            item_filter: None,
+            item_filter,
         })
         .await
         .map_err(storage_err_to_dynamo)?;

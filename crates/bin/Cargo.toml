@@ -38,6 +38,10 @@ mongodb-test-hooks = [
 # fails (`main.rs` checks this at compile time). A production `sqlite` build
 # leaves it off.
 dev-mode = ["extenddb-app/dev-mode"]
+# SearchVectors inequality filters: the extended SearchConditionExpression
+# grammar for the accounts the `search_inequality_filters` runtime setting
+# names. Off by default; with it off SearchVectors behaves as before.
+search-inequality-filters = ["extenddb-app/search-inequality-filters"]
 
 [dependencies]
 extenddb-app = { workspace = true }
