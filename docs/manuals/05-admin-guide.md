@@ -134,6 +134,7 @@ ExtendDB owns the collections, tables and indexes of its catalog and data databa
 | `connection_string` | `postgresql://extenddb:extenddb-local-dev@localhost:5432/extenddb_catalog` | Catalog database connection string |
 | `pool_size` | `20` | Maximum concurrent database connections (minimum: 10) |
 | `catalog_pool_size` | (= `pool_size`) | Maximum connections for management/authz pool (minimum: 10) |
+| `create_only_puts` | `true` | Write a `PutItem` whose condition only says that the item must not exist (`attribute_not_exists` on a key attribute) as one `INSERT ... ON CONFLICT DO NOTHING`, without a transaction, when the put has nothing else to do in one: no secondary or vector index, no stream, and no old item to return. `false` keeps such puts on the transaction path. The answers are the same either way |
 
 Backup and restore jobs are bounded per server process by `[backup] max_concurrent_jobs` (default 4, below), not per account; a request that finds every slot held waits up to 30 s for one and is then refused with `LimitExceededException`. The server raises `pool_size` and `catalog_pool_size` to at least `2 * max_concurrent_jobs + 10` and logs the raise with both numbers, so every job the bound admits has a connection. Each running restore holds one connection from this pool for its whole copy, plus one dedicated connection outside the pool for its claim.
 

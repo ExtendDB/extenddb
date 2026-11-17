@@ -5683,6 +5683,7 @@ mod catalog_index {
             connection_string: s.catalog_url.clone(),
             pool_size: 10,
             catalog_pool_size: Some(10),
+            ..Default::default()
         };
         let open = |beside_server: bool| {
             let mut options = ServerComponentsOptions::default();

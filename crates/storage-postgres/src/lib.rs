@@ -288,6 +288,11 @@ pub struct PostgresEngine {
     /// the search path exists, so this backend still refuses vector operations
     /// over the wire; the flag is what that decision will read.
     pub(crate) vector_capable: bool,
+    /// Whether a create-only put with nothing else to do in a transaction is
+    /// one autocommit `INSERT ... ON CONFLICT DO NOTHING`
+    /// (`storage.postgres.create_only_puts`, on by default). Off, such a put
+    /// takes the transaction path, as every conditional put did before.
+    pub(crate) create_only_puts: bool,
     /// The serving registration a server holds for its life, so `migrate
     /// --yes` refuses while it serves, and takes again after the database
     /// ended its session. `None` outside a server.
@@ -446,6 +451,7 @@ impl PostgresEngine {
                 initial_gsi_delay,
             )),
             vector_capable,
+            create_only_puts: true,
             serving: None,
             snapshot_open_slots: Arc::new(tokio::sync::Semaphore::new(snapshot_slot_count(
                 pool_size,
@@ -492,6 +498,14 @@ impl PostgresEngine {
                 self.index_propagation_delay_cache.load(Ordering::Relaxed)
             }
         }
+    }
+
+    /// Turn the create-only put path on or off
+    /// (`storage.postgres.create_only_puts`). It is on unless this turns it off.
+    #[must_use]
+    pub fn with_create_only_puts(mut self, enabled: bool) -> Self {
+        self.create_only_puts = enabled;
+        self
     }
 
     pub fn start_gsi_workers(mut self) -> Self {
@@ -841,6 +855,10 @@ fn server_components_factory(
     Box<dyn std::future::Future<Output = Result<ServerComponents, BackendError>> + Send>,
 > {
     let connection_string = config.connection_config().to_string();
+    let create_only_puts = config
+        .as_any()
+        .downcast_ref::<PostgresStorageConfig>()
+        .is_none_or(|c| c.create_only_puts);
     // Both pools admit the jobs the instance may run at once (the rule is
     // `pool_size_for_jobs`'s).
     let job_floor =
@@ -881,7 +899,8 @@ fn server_components_factory(
             .map_err(|e| BackendError::ConnectionFailed {
                 backend: "postgres".to_string(),
                 details: e.to_string(),
-            })?;
+            })?
+            .with_create_only_puts(create_only_puts);
         engine.serving = Some(Arc::new(registration));
 
         // The startup recovery is a server's; a command reading beside one,

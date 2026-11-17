@@ -434,7 +434,8 @@ impl Bootstrapper for PostgresBootstrapper {
             r#"[storage.postgres]
 connection_string = "{}"
 # pool_size = 20                 # Max connections for data operations (default 20, min 10)
-# catalog_pool_size =            # Max connections for management/catalog ops (defaults to pool_size, min 10)"#,
+# catalog_pool_size =            # Max connections for management/catalog ops (defaults to pool_size, min 10)
+# create_only_puts = true        # A PutItem with only attribute_not_exists on the key is one INSERT, no transaction"#,
             self.catalog_connection_url()
         )
     }
