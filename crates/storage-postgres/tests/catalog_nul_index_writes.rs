@@ -365,6 +365,7 @@ async fn a_vector_index_keeps_its_attribute_names() {
             top_k: 5,
             hash_key: Some((hash, &tenant)),
             filters: &[],
+            item_filter: None,
         })
         .await
         .expect("SearchVectors");

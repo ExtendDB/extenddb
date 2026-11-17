@@ -52,6 +52,7 @@ pub mod stream_lineage;
 pub mod test_pause;
 pub mod transact;
 pub mod vector_catalog;
+pub mod vector_filter;
 pub mod vector_lifecycle;
 
 pub use backend::{Backend, BackendAlreadySet, backend_name, set_backend, try_backend};
@@ -65,6 +66,7 @@ pub use restore_engine::{BulkLoadFile, Finished, RestoreEngine};
 pub use snapshot::{SnapshotEngine, SnapshotInfo, TableSnapshot};
 
 pub use transact::{IdempotencyKey, TransactGetOp, TransactWriteOp};
+pub use vector_filter::VectorItemFilter;
 
 pub use server_components::{
     BackendError, KeySource, ServerComponents, ServerComponentsFactory, create_server_components,
@@ -194,6 +196,10 @@ pub struct VectorSearch<'a> {
     /// range or function conditions are rejected before reaching a backend. If
     /// the service ever admits range conditions this type must widen.
     pub filters: &'a [(&'a str, &'a AttributeValue)],
+    /// A condition each candidate must satisfy before it is ranked, for a
+    /// search condition that `filters` cannot express. `None` means no
+    /// condition beyond `hash_key` and `filters`. See [`VectorItemFilter`].
+    pub item_filter: Option<std::sync::Arc<dyn VectorItemFilter>>,
 }
 /// TTL table info: `(account_id, table_name, ttl_attribute)`.
 pub type TtlTableInfo = (String, String, String);
@@ -983,6 +989,7 @@ mod vector_opt_out_tests {
                 top_k: 10,
                 hash_key: None,
                 filters: &[],
+                item_filter: None,
             })
             .await
             .expect("a participating backend answers a search");

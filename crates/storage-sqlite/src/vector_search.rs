@@ -198,6 +198,7 @@ impl VectorSearchEngine for SqliteEngine {
             .iter()
             .map(|(name, value)| ((*name).to_owned(), (*value).clone()))
             .collect();
+        let item_filter = req.item_filter.clone();
 
         Box::pin(async move {
             let partition = partition?;
@@ -279,6 +280,11 @@ impl VectorSearchEngine for SqliteEngine {
                     && !filters
                         .iter()
                         .all(|(name, expected)| item.get(name) == Some(expected))
+                {
+                    continue;
+                }
+                if let Some(condition) = &item_filter
+                    && !condition.matches(&item)?
                 {
                     continue;
                 }

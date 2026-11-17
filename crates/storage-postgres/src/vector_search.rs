@@ -177,6 +177,7 @@ impl VectorSearchEngine for PostgresEngine {
             .iter()
             .map(|(name, value)| ((*name).to_owned(), (*value).clone()))
             .collect();
+        let item_filter = req.item_filter.clone();
 
         Box::pin(async move {
             let partition = partition?;
@@ -275,7 +276,9 @@ impl VectorSearchEngine for PostgresEngine {
                 // Bytes, matching the BYTEA column: the unscoped sentinel contains
                 // a NUL, so a text comparison would not even be storable.
                 .bind(partition.into_bytes())
-                .bind(top_k)
+                // NULL is no limit: with a condition the stream below stops at
+                // the top_k-th matching row instead.
+                .bind(item_filter.is_none().then_some(top_k))
                 .bind(query_norm);
             for (name, value) in &filters {
                 let value_json = serde_json::to_string(value)
@@ -283,7 +286,7 @@ impl VectorSearchEngine for PostgresEngine {
                 query = query.bind(name).bind(value_json);
             }
 
-            let rows = query.fetch_all(&self.data_pool).await.map_err(|e| {
+            let map_sql = |e: sqlx::Error| {
                 let mapped = crate::vector::map_vector_sql_error(e);
                 // The data table is gone, which happens when the index is deleted
                 // between the catalog read above and this statement. That is a
@@ -294,7 +297,20 @@ impl VectorSearchEngine for PostgresEngine {
                 } else {
                     mapped
                 }
-            })?;
+            };
+            let rows = match &item_filter {
+                None => query.fetch_all(&self.data_pool).await.map_err(map_sql)?,
+                Some(condition) => {
+                    crate::vector_search_filtered::fetch_matching(
+                        query,
+                        &self.data_pool,
+                        condition.as_ref(),
+                        top_k,
+                        map_sql,
+                    )
+                    .await?
+                }
+            };
 
             let mut hits = Vec::with_capacity(rows.len());
             for (ordered, embedding, item_json) in rows {

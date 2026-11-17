@@ -199,6 +199,7 @@ pub async fn handle_search_vectors(
             top_k: input.top_k,
             hash_key,
             filters: &filters,
+            item_filter: None,
         })
         .await
         .map_err(storage_err_to_dynamo)?;
