@@ -173,10 +173,11 @@ pub(crate) async fn handle_request(
     } = match served {
         Ok(served) => served,
         Err(refused) => {
-            // A refusal before dispatch (authentication, authorization or
-            // the throttle) is observed too: the operation and table are
-            // known and the error names the cause, and a throttle report that
-            // could not see throttled requests would be wrong about retries.
+            // A refusal before dispatch (authentication, the point-in-time
+            // recovery refusal, authorization or the throttle) is observed
+            // too: the operation and table are known and the error names the
+            // cause, and a throttle report that could not see throttled
+            // requests would be wrong about retries.
             let response = error_response(&refused.error, &request_id);
             if let (Some(observer), Some(mut record)) =
                 (state.request_observer.as_ref(), record.take())
