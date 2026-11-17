@@ -34,6 +34,7 @@ use extenddb_core::validation::{
     validate_attribute_values_nesting_depth, validate_item_nesting_depth, validate_key_only,
     validate_key_sizes,
 };
+use extenddb_storage::ReadOptions;
 use extenddb_storage::error::StorageError;
 
 use super::SingleRequest;
@@ -179,9 +180,11 @@ async fn stored_item_if_condition_holds(
     maps: &ExpressionMaps,
     on_failure: ReturnValuesOnConditionCheckFailure,
 ) -> Result<Option<Item>, DynamoDbError> {
+    // A write condition is evaluated against the item every acknowledged write
+    // has reached, so the read is consistent.
     let stored = ctx
         .storage
-        .get_item(key_info, key)
+        .get_item(key_info, key, ReadOptions::new(true))
         .await
         .map_err(storage_err_to_dynamo)?;
     if evaluate_condition(condition, stored.as_ref().unwrap_or(&Item::new()), maps)? {

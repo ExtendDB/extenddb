@@ -16,6 +16,7 @@
 use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition, PathElement};
 use extenddb_core::types::{AttributeValue, Item, TableKeyInfo};
 use extenddb_storage::DataEngine as _;
+use extenddb_storage::ReadOptions;
 use extenddb_storage::management_store::SettingsStore;
 use extenddb_storage_cassandra::{CassandraCatalogStore, CassandraEngine};
 
@@ -88,6 +89,7 @@ impl Fixture {
                 None,
                 None,
                 Some(GSI),
+                ReadOptions::default(),
             )
             .await
             .map(|(items, _)| items.len())

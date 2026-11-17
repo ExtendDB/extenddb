@@ -31,8 +31,8 @@ use extenddb_storage::backup_definition::{BACKUP_DEFINITION_VERSION, BackupTable
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{
     BackupCatalog, BackupRestoreSource, BoxedFuture, BulkLoadFile, DataEngine, Finished, JobPermit,
-    LegacyBackupReader, MetadataEngine, RestoreEngine, RestoreRequest, SnapshotEngine, TableEngine,
-    TableSnapshot,
+    LegacyBackupReader, MetadataEngine, ReadOptions, RestoreEngine, RestoreRequest, SnapshotEngine,
+    TableEngine, TableSnapshot,
 };
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
@@ -3387,6 +3387,7 @@ impl DataEngine for Fake {
         &self,
         _: &TableKeyInfo,
         _: &Item,
+        _: ReadOptions,
     ) -> BoxedFuture<'_, Result<Option<Item>, StorageError>> {
         unused()
     }
@@ -3426,6 +3427,7 @@ impl DataEngine for Fake {
         _: Option<i64>,
         _: Option<&Item>,
         _: Option<&str>,
+        _: ReadOptions,
     ) -> BoxedFuture<'_, extenddb_storage::QueryResult> {
         unused()
     }
@@ -3438,6 +3440,7 @@ impl DataEngine for Fake {
         _: Option<i64>,
         _: Option<i64>,
         _: Option<&str>,
+        _: ReadOptions,
     ) -> BoxedFuture<'_, extenddb_storage::QueryResult> {
         unused()
     }

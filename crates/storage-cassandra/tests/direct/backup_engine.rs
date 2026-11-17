@@ -10470,7 +10470,11 @@ async fn test_a_batch_landed_after_a_takeover_loses_to_the_successors_writes_and
         k.insert("id".to_owned(), AttributeValue::S(format!("p{}", i % 5)));
         k.insert("sk".to_owned(), AttributeValue::N(i.to_string()));
         assert!(
-            engine.get_item(&key_info, &k).await.expect("get").is_none(),
+            engine
+                .get_item(&key_info, &k, ReadOptions::default())
+                .await
+                .expect("get")
+                .is_none(),
             "item {i} was not resurrected"
         );
     }

@@ -50,6 +50,7 @@ fn context_with_export_paths(
         authorized_key_info: HashMap::new(),
         auth_cache: extenddb_auth::AuthCacheRegistry::empty(),
         table_key_info_lookup: None,
+        item_authorizer: None,
     }
 }
 
