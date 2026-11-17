@@ -219,6 +219,10 @@ async fn start_server_mounts_extensions_behind_the_security_layer() {
     let small = raw(addr, &post_req("/_probe/echo", "", b"hello")).await;
     assert_eq!(small.status, 200);
     assert_eq!(small.body, "5");
+    // The layers in front of every route cover an extension route too:
+    // `post_req` sends one `Host` header, so this request carries two.
+    let dup = raw(addr, &post_req("/_probe/echo", "Host: other\r\n", b"x")).await;
+    assert_eq!(dup.status, 400, "{}", dup.body);
 
     task.abort();
 }
