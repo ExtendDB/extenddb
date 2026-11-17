@@ -1838,7 +1838,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "extenddb-app",
@@ -1855,7 +1855,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-app"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1885,7 +1885,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-auth"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "async-trait",
  "aws-credential-types",
@@ -1908,7 +1908,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-backup-store"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "aws-config",
  "aws-runtime",
@@ -1933,7 +1933,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-cache"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "futures",
  "moka",
@@ -1944,7 +1944,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-config"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "config",
@@ -1959,7 +1959,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-core"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "base64 0.22.1",
  "bigdecimal",
@@ -1975,7 +1975,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-engine"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "aws-config",
  "aws-sdk-s3",
@@ -2012,7 +2012,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-s3"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "aws-config",
  "aws-credential-types",
@@ -2027,7 +2027,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-server"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2070,7 +2070,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-storage"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -2096,7 +2096,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-storage-cassandra"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2127,7 +2127,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-storage-mongodb"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2157,7 +2157,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-storage-postgres"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2189,7 +2189,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-storage-sqlite"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
