@@ -351,7 +351,7 @@ The steps:
 
 A run that stops at any step runs again with the same arguments. Until a run finishes, the server refuses to start (section 7).
 
-The pass is one driver in `crates/storage`, as the pass of migration 2 is (`crates/storage/src/policy_migration.rs`, `crates/storage/src/migrations/m0002_resource_tag_condition_keys.rs:13-18`). Each backend adds three `ManagementStore` methods. These are a paged read of the `access_keys` and `iam_sessions` rows, the write of a batch of ciphertexts, and the delete of one settings row. No store has the delete today. The ring row and, on PostgreSQL, the connection string row use the existing `SettingsStore::get_setting` and `set_setting` (`crates/storage/src/management_store/mod.rs:56`, `:59`), except in `set-data-connection` (section 8.7). The conditional ring writes of `rewrap` and `rotate` use a new `SettingsStore::replace_setting`, which writes a row only while it holds a given value.
+The pass is one driver in `crates/storage`, as the pass of migration 2 is (`crates/storage/src/policy_migration.rs`, `crates/storage/src/migrations/m0002_resource_tag_condition_keys.rs:13-18`). Each backend adds three `ManagementStore` methods. These are a paged read of the `access_keys` and `iam_sessions` rows, the write of a batch of ciphertexts, and the delete of one settings row. No store has the delete today. The ring row and, on PostgreSQL, the connection string row use the existing `SettingsStore::get_setting` and `set_setting` (`crates/storage/src/management_store/mod.rs:56`, `:59`), except in `set-data-connection` (section 8.7). The conditional ring writes of `rewrap`, `rotate` and `reset` use a new `SettingsStore::replace_setting`, which writes a row only while it holds a given value.
 
 Per backend:
 
