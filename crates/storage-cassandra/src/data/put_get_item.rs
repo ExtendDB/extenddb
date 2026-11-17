@@ -150,8 +150,7 @@ impl CassandraEngine {
         };
         // The batch carries the timestamp, so the index statements pass none
         // of their own (Cassandra refuses a batch with both).
-        let mut batch = BatchQueryBuilder::new()
-            .with_consistency(Consistency::LocalQuorum)
+        let mut batch = crate::cassandra_util::batch_builder()
             .with_timestamp(stamp)
             .add_query(cql, cdrs_tokio::query::QueryValues::SimpleValues(values));
         if !indexes.is_empty() {

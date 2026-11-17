@@ -256,6 +256,7 @@ async fn test_get_item_reads_a_two_part_hash_key_row() {
         tags: None,
         table_class: None,
         deletion_protection_enabled: None,
+        warm_throughput: None,
     };
     let desc = engine
         .create_table(&account_id, input)
