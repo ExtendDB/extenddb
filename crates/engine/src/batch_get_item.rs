@@ -180,6 +180,7 @@ pub async fn handle_batch_get_item(
     let mut unprocessed_keys: HashMap<String, KeysAndAttributes> = HashMap::new();
     let mut throttled_count: usize = 0;
     let mut first_throttle: Option<DynamoDbError> = None;
+    let mut throttled_tables: Vec<String> = Vec::new();
     let mut total_rcu: f64 = 0.0;
     let mut total_pre_proj_bytes: usize = 0;
     let mut returned_count: u64 = 0;
@@ -231,6 +232,10 @@ pub async fn handle_batch_get_item(
             }
         }
         if !table_unprocessed.is_empty() {
+            // Only a throttle leaves a key unprocessed.
+            if !throttled_tables.contains(&key_info.table_name) {
+                throttled_tables.push(key_info.table_name.clone());
+            }
             // The request's KeysAndAttributes with Keys reduced to the
             // unprocessed ones, in request order (the service's order is not
             // measured: its served and unprocessed lists came back in neither
@@ -284,6 +289,7 @@ pub async fn handle_batch_get_item(
             read_capacity_units: rcu,
             returned_item_count: returned_count,
             returned_bytes: total_pre_proj_bytes as u64,
+            throttled_tables,
             ..Default::default()
         },
     })

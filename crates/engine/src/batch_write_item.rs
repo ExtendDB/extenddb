@@ -217,6 +217,7 @@ async fn write_batch(
     // a batch of which every request was throttled answers that error.
     let mut throttled_count: usize = 0;
     let mut first_throttle: Option<DynamoDbError> = None;
+    let mut throttled_tables: Vec<String> = Vec::new();
 
     'tables: for (table_index, ((table_name, reqs), key_info)) in
         tables.iter().zip(&key_infos).enumerate()
@@ -300,6 +301,9 @@ async fn write_batch(
                         throttled_count += 1;
                         if first_throttle.is_none() {
                             first_throttle = Some(e);
+                        }
+                        if !throttled_tables.contains(&key_info.table_name) {
+                            throttled_tables.push(key_info.table_name.clone());
                         }
                     }
                     unprocessed
@@ -419,6 +423,7 @@ async fn write_batch(
         body,
         metrics: DispatchMetrics {
             write_capacity_units: wcu,
+            throttled_tables,
             ..Default::default()
         },
     })

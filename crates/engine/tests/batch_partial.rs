@@ -197,6 +197,7 @@ async fn batch_get_one_table_throttled_beside_a_served_table() {
         json!([{"TableName": "U", "CapacityUnits": 1.0}])
     );
     assert_eq!(result.metrics.read_capacity_units, 1.0);
+    assert_eq!(result.metrics.throttled_tables, ["T"]);
 }
 
 /// Every key of every table throttled: the call fails with the throttle
@@ -459,6 +460,7 @@ async fn batch_write_one_applied_entry_is_a_partial_success() {
         result.body["ConsumedCapacity"],
         json!([{"TableName": "T", "CapacityUnits": 1.0}])
     );
+    assert_eq!(result.metrics.throttled_tables, ["T"]);
 }
 
 /// Nothing throttled: `UnprocessedItems` is present as `{}` (13 of 13 fully

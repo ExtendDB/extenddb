@@ -36,6 +36,8 @@ async fn a_failed_first_request_does_not_stop_the_rest() {
 
     assert_eq!(out.body["UnprocessedItems"], json!({"t": [put("held")]}));
     assert_eq!(data.writes(), ["t/held", "t/side"]);
+    // A held item is no throttle: the server records none for the batch.
+    assert!(out.metrics.throttled_tables.is_empty());
 }
 
 /// UnprocessedItems holds exactly the requests that failed, per table, and the

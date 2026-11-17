@@ -333,7 +333,7 @@ pub(crate) async fn handle_request(
                 &state.metrics,
                 &ctx.account_id,
                 &operation,
-                &result.body,
+                &result.metrics.throttled_tables,
             );
 
             let m = &result.metrics;

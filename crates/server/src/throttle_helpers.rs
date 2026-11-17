@@ -119,31 +119,26 @@ fn extract_throughput_from_response(
 ///
 /// The server's own bucket records `ThrottledRequests` and the read or write
 /// throttle event when it refuses a request. A backend throttle that leaves
-/// entries under `UnprocessedKeys` or `UnprocessedItems` returns a 200 and
-/// would otherwise count as no throttle at all, so this records
-/// `ThrottledRequests` and the read or write throttle event once per table
-/// named in the non-empty map, with the account and the table as the
-/// dimensions the bucket's own records carry. The map's keys are the table
-/// names, which the batch operations do not carry at the top level.
+/// requests or keys unprocessed returns a 200 and would otherwise count as no
+/// throttle at all, so this records `ThrottledRequests` and the read or write
+/// throttle event once per table the engine reports throttled
+/// (`DispatchMetrics::throttled_tables`), with the account and the table as
+/// the dimensions the bucket's own records carry. The response's
+/// `UnprocessedItems` is no throttle count: it also holds requests deferred
+/// for a transient, conflict or connection failure.
 pub(crate) fn record_partial_batch_throttle(
     metrics: &extenddb_core::metrics::MetricsCollector,
     account_id: &str,
     operation: &str,
-    body: &Value,
+    throttled_tables: &[String],
 ) {
     use extenddb_core::metrics::MetricName;
-    let (field, event) = match operation {
-        "BatchGetItem" => ("UnprocessedKeys", MetricName::ReadThrottleEvents),
-        "BatchWriteItem" => ("UnprocessedItems", MetricName::WriteThrottleEvents),
+    let event = match operation {
+        "BatchGetItem" => MetricName::ReadThrottleEvents,
+        "BatchWriteItem" => MetricName::WriteThrottleEvents,
         _ => return,
     };
-    let Some(tables) = body.get(field).and_then(Value::as_object) else {
-        return;
-    };
-    if tables.is_empty() {
-        return;
-    }
-    for table in tables.keys() {
+    for table in throttled_tables {
         metrics.record(
             MetricName::ThrottledRequests,
             1.0,
@@ -511,7 +506,6 @@ mod throttle_error_tests {
 #[cfg(test)]
 mod partial_batch_throttle_tests {
     use extenddb_core::metrics::{MetricName, MetricsCollector, MetricsQuery, TimeWindow};
-    use serde_json::json;
 
     use super::record_partial_batch_throttle;
 
@@ -537,7 +531,7 @@ mod partial_batch_throttle_tests {
             &c,
             ACCOUNT,
             "BatchGetItem",
-            &json!({"Responses": {"T": []}, "UnprocessedKeys": {"T": {"Keys": []}, "U": {"Keys": []}}}),
+            &["T".to_owned(), "U".to_owned()],
         );
         assert_eq!(sum(&c, MetricName::ThrottledRequests, None), 2.0);
         assert_eq!(sum(&c, MetricName::ThrottledRequests, Some("T")), 1.0);
@@ -550,34 +544,19 @@ mod partial_batch_throttle_tests {
     #[test]
     fn a_partial_batch_write_records_a_write_event() {
         let c = MetricsCollector::new();
-        record_partial_batch_throttle(
-            &c,
-            ACCOUNT,
-            "BatchWriteItem",
-            &json!({"UnprocessedItems": {"T": [{"PutRequest": {"Item": {}}}]}}),
-        );
+        record_partial_batch_throttle(&c, ACCOUNT, "BatchWriteItem", &["T".to_owned()]);
         assert_eq!(sum(&c, MetricName::ThrottledRequests, Some("T")), 1.0);
         assert_eq!(sum(&c, MetricName::WriteThrottleEvents, Some("T")), 1.0);
     }
 
-    /// A fully served batch (the map present and empty) and a non-batch
-    /// operation record nothing.
+    /// A batch with no throttled table and a non-batch operation record
+    /// nothing.
     #[test]
     fn a_full_batch_or_another_operation_records_nothing() {
         let c = MetricsCollector::new();
-        record_partial_batch_throttle(&c, ACCOUNT, "BatchGetItem", &json!({"UnprocessedKeys": {}}));
-        record_partial_batch_throttle(
-            &c,
-            ACCOUNT,
-            "BatchWriteItem",
-            &json!({"UnprocessedItems": {}}),
-        );
-        record_partial_batch_throttle(
-            &c,
-            ACCOUNT,
-            "GetItem",
-            &json!({"UnprocessedKeys": {"T": {}}}),
-        );
+        record_partial_batch_throttle(&c, ACCOUNT, "BatchGetItem", &[]);
+        record_partial_batch_throttle(&c, ACCOUNT, "BatchWriteItem", &[]);
+        record_partial_batch_throttle(&c, ACCOUNT, "GetItem", &["T".to_owned()]);
         assert_eq!(sum(&c, MetricName::ThrottledRequests, None), 0.0);
         assert_eq!(sum(&c, MetricName::ReadThrottleEvents, None), 0.0);
     }
