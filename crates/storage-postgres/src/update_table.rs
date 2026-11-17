@@ -8,7 +8,8 @@ use extenddb_core::types::{
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{
-    building_refuses, effective_attribute_definitions, warm_throughput_record_for_create,
+    building_refuses, effective_attribute_definitions, enters_updating,
+    warm_throughput_record_for_create,
 };
 
 use crate::PostgresEngine;
@@ -377,6 +378,22 @@ impl PostgresEngine {
             .execute(&mut *tx)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
+        }
+
+        if enters_updating(&input) {
+            let delay_secs = Self::control_plane_delay_secs(&mut tx).await?;
+            if delay_secs > 0.0 {
+                sqlx::query(
+                    "UPDATE tables SET status_transition_at = NOW() + make_interval(secs => $1) \
+                     WHERE account_id = $2 AND table_name = $3",
+                )
+                .bind(delay_secs)
+                .bind(account_id)
+                .bind(&input.table_name)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            }
         }
 
         // WarmThroughput on the table and on updated indexes: stored as sent,

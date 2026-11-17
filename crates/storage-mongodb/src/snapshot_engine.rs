@@ -229,7 +229,7 @@ impl MongoEngine {
             .await?;
         // One rule for "is this table ACTIVE": the description's, as
         // DescribeTable reports it.
-        if description.table_status != extenddb_core::types::TableStatus::Active {
+        if !description.table_status.serves() {
             return Err(StorageError::TableNotActive(table_name.to_owned()));
         }
         drop_deleting_indexes(&mut description);

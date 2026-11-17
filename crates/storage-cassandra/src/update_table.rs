@@ -13,7 +13,8 @@ use extenddb_core::types::{
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{
-    effective_attribute_definitions, warm_throughput_record_for_create, warm_throughput_record_json,
+    effective_attribute_definitions, enters_updating, warm_throughput_record_for_create,
+    warm_throughput_record_json,
 };
 
 use crate::CassandraEngine;
@@ -151,6 +152,16 @@ impl CassandraEngine {
             let odt_json =
                 serde_json::to_string(odt).map_err(|e| StorageError::Internal(e.to_string()))?;
             add_update!("on_demand_throughput", odt_json.as_str());
+        }
+
+        if enters_updating(&input) {
+            let delay_secs = self.control_plane_delay_secs().await;
+            if delay_secs > 0.0 {
+                #[allow(clippy::cast_possible_truncation)]
+                let delay_ms = (delay_secs * 1000.0) as i64;
+                let at = chrono::Utc::now() + chrono::Duration::milliseconds(delay_ms);
+                add_update!("status_transition_at", at.timestamp_millis());
+            }
         }
 
         // WarmThroughput on the table and on updated indexes: stored as sent,

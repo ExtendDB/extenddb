@@ -4,7 +4,7 @@
 //! `UpdateTable` operation handler.
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::types::{BillingMode, UpdateTableInput};
+use extenddb_core::types::{BillingMode, TableStatus, UpdateTableInput};
 use serde_json::Value;
 
 use crate::OperationContext;
@@ -21,7 +21,8 @@ use crate::serialize_output;
 /// Returns `ValidationException` if no fields are specified, or if switching to
 /// `PROVISIONED` without providing throughput values.
 /// Returns `ResourceNotFoundException` if the table does not exist.
-/// Returns `ResourceInUseException` if the table is not ACTIVE.
+/// Returns `ResourceInUseException` if the table is not ACTIVE, or if the
+/// request changes its capacity while it is `UPDATING`.
 /// Returns `InternalServerError` on storage failures.
 pub async fn handle_update_table(
     body: Value,
@@ -219,7 +220,8 @@ pub async fn handle_update_table(
     // A switch to PAY_PER_REQUEST stores the on-demand minimum as the warm
     // throughput of a provisioned table that is below it, so it needs the table.
     let switches_to_on_demand = matches!(input.billing_mode, Some(BillingMode::PayPerRequest));
-    if projects_attributes || touches_warm || bare_update || switches_to_on_demand {
+    let changes_capacity = changes_capacity(&input);
+    if projects_attributes || touches_warm || bare_update || changes_capacity {
         let existing = ctx
             .storage
             .describe_table(
@@ -247,6 +249,13 @@ pub async fn handle_update_table(
         if touches_warm {
             crate::warm_throughput::validate_warm_throughput_updates(&input, &existing)?;
         }
+        if changes_capacity && existing.table_status == TableStatus::Updating {
+            return Err(DynamoDbError::ResourceInUseException(format!(
+                "Attempt to change a resource which is still in use: Table IOPS are currently \
+                 being updated. Table: {}",
+                input.table_name
+            )));
+        }
         if switches_to_on_demand {
             // After every validation: the client cannot send WarmThroughput
             // beside BillingMode, so this is the only way both reach a backend.
@@ -259,6 +268,7 @@ pub async fn handle_update_table(
     // Kept for the post-condition check below, since `input` is moved into the
     // backend call.
     let vector_index_updates = input.vector_index_updates.clone();
+    let starts_window = extenddb_storage::util::enters_updating(&input);
     let mut desc = ctx
         .storage
         .update_table(&ctx.account_id, input)
@@ -268,6 +278,9 @@ pub async fn handle_update_table(
     // A declared-capable backend must not silently drop the vector index change.
     // Checked against the description it returned, so this cannot be opted out of.
     crate::vector_gate::ensure_vector_updates_applied(vector_index_updates.as_ref(), &desc)?;
+    if !starts_window {
+        desc.table_status = TableStatus::Active;
+    }
 
     // Drop the cached TableKeyInfo: index changes, stream-spec changes, and
     // throughput changes all alter what the cached value contains.
@@ -297,7 +310,7 @@ pub async fn handle_update_table(
 /// and comes last.
 fn stream_change_companion(input: &UpdateTableInput) -> Option<&'static str> {
     input.stream_specification.as_ref()?;
-    if input.billing_mode.is_some() || input.provisioned_throughput.is_some() {
+    if changes_capacity(input) {
         return Some(
             "One or more parameter values were invalid: You cannot modify stream status while updating table IOPS",
         );
@@ -317,6 +330,11 @@ fn stream_change_companion(input: &UpdateTableInput) -> Option<&'static str> {
         );
     }
     None
+}
+
+/// Whether the request changes the table's billing mode or throughput.
+fn changes_capacity(input: &UpdateTableInput) -> bool {
+    input.billing_mode.is_some() || input.provisioned_throughput.is_some()
 }
 
 /// The table's projected `NonKeyAttributes` once `updates` apply: its LSIs,
@@ -401,3 +419,7 @@ fn update_table_err_to_dynamo(
 #[cfg(test)]
 #[path = "update_table_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "update_table_status_tests.rs"]
+mod status_tests;

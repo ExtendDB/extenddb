@@ -328,8 +328,8 @@ class TestWarmThroughputAcrossBillingChanges:
     """The values a provisioned table reports around capacity and billing mode
     changes (rows S3, S7a to S7c, T7a to T7d). Statuses the service reports while
     the table is UPDATING for a capacity or billing change, and the previous
-    values it answers with, are asserted on the service only: ExtendDB changes
-    capacity and billing mode with the table ACTIVE, and answers a switch to
+    values it answers with, are asserted on the service only: ExtendDB reports
+    UPDATING for control_plane_delay_seconds only, and answers a switch to
     PAY_PER_REQUEST with the on-demand values."""
 
     def test_switch_to_on_demand_raises_a_low_warm_throughput(
