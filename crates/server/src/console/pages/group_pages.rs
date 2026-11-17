@@ -91,7 +91,7 @@ pub async fn create_group(
 
     // Same name rule as the management API (`management::iam_group::create_group`).
     if !crate::management::is_valid_iam_name(&form.group_name) {
-        let nav = html::nav_bar(&identity_label(&session.identity));
+        let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
         let content = format!(
             "<h1>Create Group</h1>{}",
             html::alert_error(

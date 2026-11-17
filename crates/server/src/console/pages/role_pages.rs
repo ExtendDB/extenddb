@@ -101,7 +101,7 @@ pub async fn create_role(
 
     // Same name rule as the management API (`management::iam_role::create_role`).
     if !crate::management::is_valid_iam_name(&form.role_name) {
-        let nav = html::nav_bar(&identity_label(&session.identity));
+        let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
         let content = format!(
             "<h1>Create Role</h1>{}",
             html::alert_error(

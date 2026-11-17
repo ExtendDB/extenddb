@@ -340,7 +340,13 @@ fn tab_router() -> Router {
             "/",
             get(
                 |identity: axum::Extension<crate::console::ConsoleIdentity>| async move {
-                    let nav = crate::console::html::nav_bar(&identity.label, &identity.tabs);
+                    let nav = crate::console::html::nav_bar(
+                        &crate::console::html::NavIdentity {
+                            label: identity.label.clone(),
+                            is_admin: identity.is_admin,
+                        },
+                        &identity.tabs,
+                    );
                     axum::response::Html(crate::console::html::layout_with_version_csrf(
                         "Chaos",
                         &nav,

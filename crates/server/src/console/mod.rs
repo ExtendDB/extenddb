@@ -23,7 +23,6 @@ pub mod session;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::response::IntoResponse;
 use axum::routing::{get, post};
 
 use session::SessionStore;
@@ -126,26 +125,28 @@ impl ConsoleIdentity {
     }
 }
 
-/// Middleware for extension tabs: a request without a live console session is
-/// redirected to the login page; one with a session carries a
-/// [`ConsoleIdentity`] extension for the page to render the navigation bar.
+/// Middleware for extension tabs: the session check of the built-in pages. A
+/// request without a live console session is redirected to the login page,
+/// and one whose session the catalog cannot check gets 503; one with a
+/// session carries a [`ConsoleIdentity`] extension for the page to render the
+/// navigation bar.
 pub async fn require_console_session(
     axum::extract::State(state): axum::extract::State<Arc<ConsoleState>>,
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    match pages::session_for_headers(req.headers(), &state).await {
-        Some((identity, csrf_token)) => {
+    match pages::require_session(req.headers(), &state).await {
+        Ok(session) => {
             req.extensions_mut().insert(ConsoleIdentity {
-                label: pages::identity_label(&identity),
-                csrf_token,
-                is_admin: pages::is_admin(&identity),
+                label: pages::identity_label(&session.identity).label,
+                csrf_token: session.csrf_token,
+                is_admin: pages::is_admin(&session.identity),
                 tabs: Arc::clone(&state.tabs),
                 version_info: Arc::clone(&state.version_info),
             });
             next.run(req).await
         }
-        None => axum::response::Redirect::to("/console/login").into_response(),
+        Err(response) => response,
     }
 }
 

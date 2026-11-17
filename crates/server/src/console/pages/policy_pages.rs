@@ -270,7 +270,7 @@ async fn put_policy(
 
     // Same name rule as the management API (`management::iam_policy::put_policy`).
     if !crate::management::is_valid_iam_name(&form.policy_name) {
-        let nav = html::nav_bar(&identity_label(&session.identity));
+        let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
         let content = format!(
             "<h1>Add Policy</h1>{}",
             html::alert_error(

@@ -66,7 +66,7 @@ fn links(page: &str) -> Vec<&str> {
 
 #[tokio::test]
 async fn iam_user_page_shows_its_access_keys_and_the_forms_that_change_them() {
-    let response = render_user_page(&session(iam_user()), ACCOUNT, USER, Some(&detail()));
+    let response = render_user_page(&session(iam_user()), ACCOUNT, USER, Some(&detail()), &[]);
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
@@ -87,7 +87,7 @@ async fn iam_user_page_shows_its_access_keys_and_the_forms_that_change_them() {
 
 #[tokio::test]
 async fn iam_user_page_leaves_out_policies_groups_and_tags() {
-    let response = render_user_page(&session(iam_user()), ACCOUNT, USER, Some(&detail()));
+    let response = render_user_page(&session(iam_user()), ACCOUNT, USER, Some(&detail()), &[]);
 
     let body = body_text(response).await;
     for absent in [
@@ -109,7 +109,7 @@ async fn iam_user_page_leaves_out_policies_groups_and_tags() {
 async fn iam_user_page_links_to_no_account_page() {
     // Every page under /console/accounts other than its own user page
     // redirects an IAM-user session, and the page is not linked to itself.
-    let response = render_user_page(&session(iam_user()), ACCOUNT, USER, Some(&detail()));
+    let response = render_user_page(&session(iam_user()), ACCOUNT, USER, Some(&detail()), &[]);
 
     let body = body_text(response).await;
     let to_accounts: Vec<&str> = links(&body)
@@ -125,7 +125,7 @@ async fn iam_user_page_links_to_no_account_page() {
 
 #[tokio::test]
 async fn admin_page_shows_the_whole_user() {
-    let response = render_user_page(&session(admin()), ACCOUNT, USER, Some(&detail()));
+    let response = render_user_page(&session(admin()), ACCOUNT, USER, Some(&detail()), &[]);
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
@@ -149,7 +149,7 @@ async fn admin_page_shows_the_whole_user() {
 
 #[tokio::test]
 async fn a_missing_user_gets_the_not_found_page() {
-    let response = render_user_page(&session(admin()), ACCOUNT, "nobody", None);
+    let response = render_user_page(&session(admin()), ACCOUNT, "nobody", None, &[]);
 
     assert_eq!(response.status(), StatusCode::OK);
     assert!(body_text(response).await.contains("User not found"));

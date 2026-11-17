@@ -62,7 +62,7 @@ pub struct SessionData {
 /// is no session, it expired, or its principal was deleted or had its
 /// password changed; or 503 when the catalog cannot be read.
 #[allow(clippy::result_large_err)]
-async fn require_session(
+pub(super) async fn require_session(
     headers: &HeaderMap,
     state: &Arc<ConsoleState>,
 ) -> Result<SessionData, Response> {
