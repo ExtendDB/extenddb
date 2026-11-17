@@ -128,7 +128,7 @@ pub async fn prepare_to_serve(
                      applying the pending migrations before the server starts"
                 ),
                 None => format!(
-                    "the catalog has no migration ledger (a release before 1.0 created it); \
+                    "the catalog has no migration ledger (a release before 0.1.15 created it); \
                      applying migrations 1 to {latest} before the server starts"
                 ),
             });

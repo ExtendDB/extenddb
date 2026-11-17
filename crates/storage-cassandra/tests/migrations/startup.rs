@@ -65,7 +65,7 @@ fn second_target_of(prefix: &str) -> Target {
     ))
 }
 
-/// A catalog as a release before 1.0 left it: migration 1's tables with no
+/// A catalog as a release before 0.1.15 left it: migration 1's tables with no
 /// ledger rows, and `catalog_version` 0.0.4.
 async fn legacy_catalog(session: &Arc<CassandraSession>, prefix: &str) {
     let catalog = format!("{prefix}_catalog");
