@@ -41,6 +41,7 @@ use serde_json::{Value, json};
 use super::*;
 
 mod migrate_legacy;
+mod override_refusals;
 
 const ACCOUNT: &str = "123456789012";
 const REGION: &str = "us-east-1";
@@ -4833,50 +4834,8 @@ fn provisioned_override_with_throughput_is_accepted() {
     }))
     .unwrap();
     validate_override_shape(&overrides).unwrap();
-    validate_override_for_source(&overrides, "PAY_PER_REQUEST").unwrap();
     assert_eq!(overrides.billing_mode, Some(BillingMode::Provisioned));
     assert_eq!(overrides.provisioned_throughput, Some(throughput(5, 5)));
-}
-
-#[test]
-fn provisioned_override_without_throughput_is_refused() {
-    let overrides =
-        parse_restore_table_overrides(&json!({ "BillingModeOverride": "PROVISIONED" })).unwrap();
-    assert!(matches!(
-        validate_override_shape(&overrides).unwrap_err(),
-        DynamoDbError::ValidationException(_)
-    ));
-}
-
-#[test]
-fn throughput_override_under_pay_per_request_is_refused() {
-    let overrides = parse_restore_table_overrides(&json!({
-        "BillingModeOverride": "PAY_PER_REQUEST",
-        "ProvisionedThroughputOverride": { "ReadCapacityUnits": 5, "WriteCapacityUnits": 5 },
-    }))
-    .unwrap();
-    let msg =
-        validation_message(validate_override_for_source(&overrides, "PROVISIONED").unwrap_err());
-    assert!(msg.contains(
-        "ProvisionedThroughputOverride can only be specified with BillingModeOverride PROVISIONED"
-    ));
-}
-
-#[test]
-fn invalid_provisioned_throughput_override_matches_create_table() {
-    let expected = "One or more parameter values were invalid: ReadCapacityUnits and \
-                    WriteCapacityUnits must both be greater than or equal to 1 for table";
-    for (read, write) in [(0, 5), (5, 0), (-1, 5), (5, -1)] {
-        let overrides = parse_restore_table_overrides(&json!({
-            "BillingModeOverride": "PROVISIONED",
-            "ProvisionedThroughputOverride": { "ReadCapacityUnits": read, "WriteCapacityUnits": write },
-        }))
-        .unwrap();
-        assert_eq!(
-            validation_message(validate_override_shape(&overrides).unwrap_err()),
-            expected
-        );
-    }
 }
 
 #[test]
@@ -5347,7 +5306,7 @@ async fn index_override_lists_are_applied() {
 /// The DescribeBackup echo (a console or SDK restore flow) restores exactly
 /// the table the restore creates without it, for both billing modes; sent
 /// with the `{0, 0}` DescribeBackup reports for an on-demand backup's GSI it
-/// is refused as CreateTable refuses `{0, 0}`.
+/// is refused as any GSI throughput on an on-demand restore is.
 #[tokio::test]
 async fn index_overrides_echoing_describe_backup_restore_the_same_table() {
     for def in [definition("PAY_PER_REQUEST"), definition("PROVISIONED")] {
@@ -5373,9 +5332,10 @@ async fn index_overrides_echoing_describe_backup_restore_the_same_table() {
             .await
             .unwrap_err();
             let msg = validation_message(zero_echo);
-            assert!(
-                msg.contains("gsi1") && msg.contains("should not be specified"),
-                "{msg}"
+            assert_eq!(
+                msg,
+                "Invalid Request: Cannot override ProvisionedThroughput unless BillingMode is \
+                 PROVISIONED for index gsi1"
             );
             for g in gsis.as_array_mut().unwrap() {
                 g.as_object_mut().unwrap().remove("ProvisionedThroughput");
@@ -5398,23 +5358,15 @@ async fn index_overrides_echoing_describe_backup_restore_the_same_table() {
 }
 
 /// Measured on DynamoDB: refused by the service and by ExtendDB: an unknown or
-/// changed index definition, a throughput member contradicting the billing
-/// mode, `{0, 0}`. ExtendDB's own: a member it cannot apply.
+/// changed index definition, `{0, 0}`. ExtendDB's own: a member it cannot
+/// apply.
 #[tokio::test]
 async fn index_overrides_the_service_refuses_are_refused() {
-    let entry_with = |key: &str, value: Value| {
-        let mut e = gsi_entry(Some((3, 4)));
-        e[key] = value;
-        e
-    };
-    let cases: [(&str, Value, &str); 13] = [
-        (
-            "an index the backup does not have",
-            json!({ "LocalSecondaryIndexOverride": [], "GlobalSecondaryIndexOverride": [
-                entry_with("IndexName", json!("other")),
-            ] }),
-            "global secondary index other is not in the backup",
-        ),
+    let entry_with =
+        |key: &str, value: Value| override_refusals::with(gsi_entry(Some((3, 4))), key, value);
+    let gsi1 = "Invalid Request: Index gsi1 does not match a secondary index that existed in the \
+                source table and cannot be created during the restore operation";
+    let cases: [(&str, Value, &str); 8] = [
         (
             "listed twice",
             json!({ "GlobalSecondaryIndexOverride": [
@@ -5442,39 +5394,16 @@ async fn index_overrides_the_service_refuses_are_refused() {
             "index lsi1: KeySchema differs from the backup's",
         ),
         (
-            "projection type",
-            json!({ "GlobalSecondaryIndexOverride": [entry_with(
-                "Projection", json!({ "ProjectionType": "KEYS_ONLY" }),
-            )] }),
-            "index gsi1: Projection differs from the backup's",
-        ),
-        (
             "projected attributes",
             json!({ "GlobalSecondaryIndexOverride": [entry_with(
                 "Projection", json!({ "ProjectionType": "ALL", "NonKeyAttributes": ["x"] }),
             )] }),
-            "index gsi1: Projection differs from the backup's",
-        ),
-        (
-            "throughput on an on-demand restore",
-            json!({
-                "BillingModeOverride": "PAY_PER_REQUEST",
-                "GlobalSecondaryIndexOverride": [gsi_entry(Some((3, 4)))],
-            }),
-            "ProvisionedThroughput should not be specified for index: gsi1",
+            gsi1,
         ),
         (
             "{0, 0}",
             json!({ "GlobalSecondaryIndexOverride": [gsi_entry(Some((0, 0)))] }),
             "ReadCapacityUnits and WriteCapacityUnits must both be greater than or equal to 1",
-        ),
-        (
-            "an index on-demand throughput on a PROVISIONED restore",
-            json!({ "GlobalSecondaryIndexOverride": [entry_with(
-                "OnDemandThroughput", json!({ "MaxReadRequestUnits": 10 }),
-            )] }),
-            "index gsi1: OnDemandThroughput can only be specified when the restored table's \
-             BillingMode is PAY_PER_REQUEST",
         ),
         (
             "a warm throughput on a GSI entry",
@@ -5497,18 +5426,6 @@ async fn index_overrides_the_service_refuses_are_refused() {
                 "ProvisionedThroughput": { "ReadCapacityUnits": 1, "WriteCapacityUnits": 1 },
             }] }),
             "index lsi1: member ProvisionedThroughput is not supported",
-        ),
-        (
-            "an LSI the backup does not have",
-            json!({ "LocalSecondaryIndexOverride": [{
-                "IndexName": "lsi2",
-                "KeySchema": [
-                    { "AttributeName": "pk", "KeyType": "HASH" },
-                    { "AttributeName": "lsk", "KeyType": "RANGE" },
-                ],
-                "Projection": { "ProjectionType": "KEYS_ONLY" },
-            }] }),
-            "local secondary index lsi2 is not in the backup",
         ),
         (
             "an LSI listed twice",
@@ -5536,10 +5453,7 @@ async fn index_overrides_the_service_refuses_are_refused() {
         .await
         .unwrap_err(),
     );
-    assert!(
-        msg.ends_with("global secondary index gsi1 is not in the backup"),
-        "{msg}"
-    );
+    assert_eq!(msg, gsi1);
     let plain = restored_input(source(None), json!({})).await.unwrap();
     let empty = restored_input(
         source(None),
@@ -5578,12 +5492,7 @@ async fn a_provisioned_restore_needs_each_gsis_throughput_overridden() {
     // billing switch (what UpdateTable to PAY_PER_REQUEST leaves behind).
     let mut stale = definition("PAY_PER_REQUEST");
     stale.global_secondary_indexes[0].provisioned_throughput = Some(throughput(3, 4));
-    let refused: [(&str, BackupTableDefinition, Value); 6] = [
-        (
-            "no GSI list, on-demand backup",
-            definition("PAY_PER_REQUEST"),
-            provisioned.clone(),
-        ),
+    let refused: [(&str, BackupTableDefinition, Value); 4] = [
         (
             "no GSI list, PROVISIONED backup (the override, not the recorded throughput, decides)",
             definition("PROVISIONED"),
@@ -5603,11 +5512,6 @@ async fn a_provisioned_restore_needs_each_gsis_throughput_overridden() {
             "a GSI entry without throughput, PROVISIONED backup with the override",
             definition("PROVISIONED"),
             with(json!({ "GlobalSecondaryIndexOverride": [gsi_entry(None)] })),
-        ),
-        (
-            "a GSI entry without throughput, PROVISIONED backup without the override",
-            definition("PROVISIONED"),
-            json!({ "GlobalSecondaryIndexOverride": [gsi_entry(None)] }),
         ),
     ];
     for (what, def, body) in refused {
@@ -5667,8 +5571,7 @@ fn on_demand(read: Option<i64>, write: Option<i64>) -> OnDemandThroughput {
 /// Measured on DynamoDB: the service applies `OnDemandThroughputOverride` on an
 /// on-demand restore, changed or with one member, including on a PROVISIONED
 /// backup restored as on-demand; a GSI entry's `OnDemandThroughput` is
-/// accepted (and, ExtendDB's choice, not recorded). On a PROVISIONED restore
-/// the member contradicts the billing mode and is refused.
+/// accepted (and, ExtendDB's choice, not recorded).
 #[tokio::test]
 async fn an_on_demand_throughput_override_is_applied_on_an_on_demand_restore() {
     let with = |recorded: Option<OnDemandThroughput>| {
@@ -5764,8 +5667,7 @@ async fn an_on_demand_throughput_override_is_applied_on_an_on_demand_restore() {
     .unwrap();
     assert_eq!(input, plain);
 
-    // Refused: an unknown member, and the member on a PROVISIONED restore
-    // (from a PROVISIONED backup or by override).
+    // Refused: an unknown member.
     let fake = Fake::with_source(with(None));
     let msg = validation_message(
         restore(
@@ -5782,33 +5684,6 @@ async fn an_on_demand_throughput_override_is_applied_on_an_on_demand_restore() {
         "{msg}"
     );
     assert!(fake.restores().is_empty());
-    for (def, body) in [
-        (
-            definition("PROVISIONED"),
-            json!({ "OnDemandThroughputOverride": { "MaxReadRequestUnits": 1 } }),
-        ),
-        (
-            definition("PAY_PER_REQUEST"),
-            json!({
-                "OnDemandThroughputOverride": {},
-                "BillingModeOverride": "PROVISIONED",
-                "ProvisionedThroughputOverride": { "ReadCapacityUnits": 1, "WriteCapacityUnits": 1 },
-            }),
-        ),
-    ] {
-        let mut def = def;
-        def.global_secondary_indexes.clear();
-        let fake = Fake::with_source(source(Some(def)));
-        let msg = validation_message(restore(&fake, restore_body(body)).await.unwrap_err());
-        assert!(
-            msg.ends_with(
-                "OnDemandThroughputOverride can only be specified when the restored table's \
-                 BillingMode is PAY_PER_REQUEST"
-            ),
-            "{msg}"
-        );
-        assert!(fake.restores().is_empty());
-    }
 }
 
 /// Measured on DynamoDB: the service restores `STANDARD` whatever the source's
@@ -5906,39 +5781,12 @@ async fn billing_overrides_shape_the_restore_input() {
         input.global_secondary_indexes.as_ref().unwrap()[0].provisioned_throughput,
         Some(throughput(3, 4))
     );
-
-    // A throughput override on an on-demand backup without a billing override.
-    let err = restored_input(
-        source(Some(definition("PAY_PER_REQUEST"))),
-        json!({
-            "ProvisionedThroughputOverride": { "ReadCapacityUnits": 1, "WriteCapacityUnits": 1 },
-        }),
-    )
-    .await
-    .unwrap_err();
-    assert!(validation_message(err).contains("can only be specified"));
-}
-
-#[tokio::test]
-async fn provisioned_override_on_an_on_demand_gsi_has_the_services_text() {
-    let err = restored_input(
-        source(Some(definition("PAY_PER_REQUEST"))),
-        json!({
-            "BillingModeOverride": "PROVISIONED",
-            "ProvisionedThroughputOverride": { "ReadCapacityUnits": 5, "WriteCapacityUnits": 5 },
-        }),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(
-        validation_message(err),
-        "Invalid Request: Must override ProvisionedThroughput if BillingMode is overridden to \
-         PROVISIONED for index gsi1"
-    );
 }
 
 #[tokio::test]
 async fn override_shape_is_refused_before_any_storage_read() {
+    let expected = "Invalid Request: Must override ProvisionedThroughput if BillingMode is \
+                    overridden to PROVISIONED";
     let fake = Arc::new(Fake::default());
     let err = restore(
         &fake,
@@ -5946,7 +5794,7 @@ async fn override_shape_is_refused_before_any_storage_read() {
     )
     .await
     .unwrap_err();
-    assert!(validation_message(err).contains("ProvisionedThroughputOverride must"));
+    assert_eq!(validation_message(err), expected);
     assert_eq!(fake.source_reads(), 0);
     // The manifest path refuses the shape the same way, before any store or
     // row read.
@@ -5956,7 +5804,7 @@ async fn override_shape_is_refused_before_any_storage_read() {
     )
     .await
     .unwrap_err();
-    assert!(validation_message(err).contains("ProvisionedThroughputOverride must"));
+    assert_eq!(validation_message(err), expected);
 }
 
 // --- refusals and validation --------------------------------------------------
@@ -11497,8 +11345,8 @@ mod review_round_2 {
     /// The maintenance refusal comes after every other check: with the claim
     /// held, a create under a `server.region` `check_backup_arn_fits`
     /// refuses and a restore whose throughput override does not fit the
-    /// backup's billing mode (`validate_override_for_source`) each answer
-    /// their own ValidationException, not LimitExceededException.
+    /// backup's billing mode (checked as the overrides are applied) each
+    /// answer their own ValidationException, not LimitExceededException.
     #[tokio::test]
     async fn the_maintenance_refusal_comes_after_the_requests_own_checks() {
         let fake = Fake::with_source(source(Some(definition("PAY_PER_REQUEST"))));
@@ -11531,7 +11379,7 @@ mod review_round_2 {
         let err = restore_on(&fake, &runtime, &body).await.unwrap_err();
         assert!(
             matches!(&err, DynamoDbError::ValidationException(m)
-                if m.contains("ProvisionedThroughputOverride can only be specified")),
+                if m.contains("Cannot override ProvisionedThroughput if BillingMode")),
             "the override rule answers before the claim: {err:?}"
         );
         assert!(

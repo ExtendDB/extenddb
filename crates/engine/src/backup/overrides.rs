@@ -3,8 +3,9 @@
 
 //! `RestoreTableFromBackup`'s `GlobalSecondaryIndexOverride`,
 //! `LocalSecondaryIndexOverride`, and `OnDemandThroughputOverride`, applied as
-//! the service applies them and refused where the service refuses them
-//! (every rule below measured on DynamoDB, unless
+//! the service applies them, and the table's and each GSI entry's throughput
+//! checked against the restored table's billing mode, refused where the
+//! service refuses them (every rule below measured on DynamoDB, unless
 //! marked as ExtendDB's).
 //!
 //! An index override list, when given, replaces the backup's list of that
@@ -17,38 +18,34 @@
 //! is the restored table's on-demand throughput, on any on-demand restore,
 //! including a PROVISIONED backup restored as on-demand.
 //!
-//! Refused with `ValidationException`: an index name the backup does not have
-//! or listed twice, a changed `KeySchema` or `Projection`, a throughput member
-//! that contradicts the restored table's billing mode (`ProvisionedThroughput`
-//! on a GSI entry or `OnDemandThroughputOverride` on the wrong side), and a
-//! PROVISIONED restore of a GSI without an overriding throughput, with the
-//! service's text `Invalid Request: Must override ProvisionedThroughput if
-//! BillingMode is overridden to PROVISIONED for index <name>`. That text
-//! conditions on the override, so the rule does too: whenever
-//! `BillingModeOverride` is `PROVISIONED` and the backup has a GSI, every GSI
-//! must be supplied with a `ProvisionedThroughput` by a
-//! `GlobalSecondaryIndexOverride` entry, whatever the backup's billing mode
-//! and whatever throughput the backup recorded for the index. With no GSI
-//! list, the first GSI is the one named (measured on an on-demand backup;
-//! applied by ExtendDB to a PROVISIONED backup too, which was not measured).
-//! With a list, an entry without `ProvisionedThroughput` on a PROVISIONED
-//! restore is refused with the same text, also when the restore is
-//! PROVISIONED because the backup is and no `BillingModeOverride` was given
-//! (the service's reply to that case was not measured; ExtendDB's
-//! `CreateTable` accepts a PROVISIONED table whose GSI has no throughput, so
-//! there is no `CreateTable` text to borrow). `{0, 0}` and the rest of
-//! CreateTable's rules are left to `validate_create_table` on the result.
-//! When an index list is given, the attribute definitions only the dropped
-//! indexes used go with them, as CreateTable refuses unused definitions.
+//! Refused with `ValidationException`, with the service's texts (measured on
+//! DynamoDB on 13, 14 and 17 Nov 2026). The table's throughput is checked
+//! first, then the GSI list, then the LSI list. A list checks the names of all
+//! its entries, then each entry in the list's order. For the table and for
+//! each GSI entry, the on-demand maximum is checked before the provisioned
+//! throughput beside it, as the service checks them. The exception is a GSI
+//! entry without a throughput when `BillingModeOverride` is `PROVISIONED`:
+//! the missing throughput is refused first. A GSI entry's text ends with
+//! ` for index <name>`. `check_throughput`, `throughput_required` and
+//! `index_mismatch` give the texts, and the overrides table of
+//! `docs/differences-from-dynamodb.md` lists them.
+//!
+//! `BillingModeOverride` `PROVISIONED` without a `ProvisionedThroughputOverride`,
+//! and a throughput member below 1, are refused with the request's shape,
+//! before any storage read (`validate_override_shape`). A GSI throughput
+//! below 1 on a PROVISIONED restore and the rest of CreateTable's rules are
+//! left to `validate_create_table` on the result. When an index list is
+//! given, the attribute definitions only the dropped indexes used go with
+//! them, as CreateTable refuses unused definitions.
 //!
 //! ExtendDB's own choices, where the service's reply was not measured or
-//! ExtendDB cannot carry the member: a GSI entry's `OnDemandThroughput` on an
-//! on-demand restore is accepted and not recorded (ExtendDB keeps no
-//! per-index on-demand maximum); on a PROVISIONED restore it contradicts the
-//! billing mode and is refused. A member of an entry outside the service
-//! model's is refused, since ExtendDB cannot apply it. A GSI entry's
-//! `WarmThroughput` is refused with the service's own sentence (measured
-//! 2026-10-23, row S6d). A restored table and its indexes report the
+//! ExtendDB cannot carry the member: an index listed twice and a changed
+//! `KeySchema` are refused with texts naming the index. A GSI entry's
+//! `OnDemandThroughput` on an on-demand restore is accepted and not recorded
+//! (ExtendDB keeps no per-index on-demand maximum). A member of an entry
+//! outside the service model's is refused, since ExtendDB cannot apply it. A
+//! GSI entry's `WarmThroughput` is refused with the service's own sentence
+//! (measured 2026-10-23, row S6d). A restored table and its indexes report the
 //! on-demand warm throughput defaults, as the service's restore does (row
 //! S6c); the backup records no warm throughput (row S6b). An
 //! `OnDemandThroughputOverride` replaces the backup's on-demand
@@ -62,6 +59,7 @@ use extenddb_core::types::{
     BillingMode, CreateTableInput, GsiInput, KeySchemaElement, LsiInput, OnDemandThroughput,
     Projection,
 };
+use extenddb_storage::RestoreTableOverrides;
 use serde_json::Value;
 
 const GSI_FIELD: &str = "GlobalSecondaryIndexOverride";
@@ -127,13 +125,87 @@ fn list<'a>(body: &'a Value, field: &str) -> Result<Option<&'a Vec<Value>>, Dyna
     }
 }
 
-/// The service's text for a PROVISIONED restore of a GSI without throughput
-/// (measured on DynamoDB).
-pub(super) fn gsi_throughput_required(index_name: &str) -> DynamoDbError {
-    DynamoDbError::ValidationException(format!(
-        "Invalid Request: Must override ProvisionedThroughput if BillingMode is overridden to \
-         PROVISIONED for index {index_name}"
-    ))
+/// The service's `Invalid Request: ` refusal, of the table or, with `index`,
+/// of one index entry (measured on DynamoDB on 13 and 14 Nov 2026).
+fn invalid_request(text: &str, index: Option<&str>) -> DynamoDbError {
+    let suffix = index.map_or_else(String::new, |name| format!(" for index {name}"));
+    DynamoDbError::ValidationException(format!("Invalid Request: {text}{suffix}"))
+}
+
+/// The service's refusal of a PROVISIONED restore whose request gives no
+/// provisioned throughput for the table (`index` `None`, with
+/// `BillingModeOverride` `PROVISIONED`) or for a GSI.
+pub(super) fn throughput_required(
+    index: Option<&str>,
+    billing_override: Option<BillingMode>,
+) -> DynamoDbError {
+    invalid_request(
+        if billing_override == Some(BillingMode::Provisioned) {
+            "Must override ProvisionedThroughput if BillingMode is overridden to PROVISIONED"
+        } else {
+            "Must specify provisioned throughput"
+        },
+        index,
+    )
+}
+
+/// The service's refusal of an index entry that names no index of the
+/// backup, or that changes the `Projection` of one.
+fn index_mismatch(name: &str) -> DynamoDbError {
+    invalid_request(
+        &format!(
+            "Index {name} does not match a secondary index that existed in the source table \
+             and cannot be created during the restore operation"
+        ),
+        None,
+    )
+}
+
+/// The throughput members of the table (`index` `None`) or of one GSI entry
+/// against the restore's billing mode, in the service's order: the on-demand
+/// maximum, then the provisioned throughput. `provisioned` is whether the
+/// restored table is PROVISIONED. The caller refuses a missing GSI
+/// throughput: before this when `BillingModeOverride` is `PROVISIONED`, else
+/// after it.
+fn check_throughput(
+    index: Option<&str>,
+    on_demand: Option<&OnDemandThroughput>,
+    throughput_given: bool,
+    billing_override: Option<BillingMode>,
+    provisioned: bool,
+) -> Result<(), DynamoDbError> {
+    if let Some(given) = on_demand {
+        let member = [
+            ("MaxReadRequestUnits", given.max_read_request_units),
+            ("MaxWriteRequestUnits", given.max_write_request_units),
+        ]
+        .into_iter()
+        .find_map(|(name, units)| units.map(|_| name));
+        let reason = match billing_override {
+            Some(BillingMode::Provisioned) => Some("when BillingMode is PROVISIONED"),
+            None if throughput_given => Some("when ProvisionedThroughputOverride is present"),
+            None if provisioned => Some("unless BillingModeOverride is PAY_PER_REQUEST"),
+            _ => None,
+        };
+        if let (Some(member), Some(reason)) = (member, reason) {
+            return Err(invalid_request(
+                &format!("Cannot override {member} for OnDemandThroughput {reason}"),
+                index,
+            ));
+        }
+    }
+    if throughput_given && !provisioned {
+        return Err(invalid_request(
+            if billing_override == Some(BillingMode::PayPerRequest) {
+                "Cannot override ProvisionedThroughput if BillingMode is overridden to \
+                 PAY_PER_REQUEST"
+            } else {
+                "Cannot override ProvisionedThroughput unless BillingMode is PROVISIONED"
+            },
+            index,
+        ));
+    }
+    Ok(())
 }
 
 /// The service's refusal of a `WarmThroughput` member on a
@@ -211,8 +283,8 @@ impl IndexOverrides {
 
     /// Apply the overrides to `input`, the table the restore creates without
     /// them (the backup's indexes, with the billing and throughput overrides
-    /// already applied). `billing_override` is the request's
-    /// `BillingModeOverride`, which decides the no-GSI-list refusal.
+    /// already applied). `overrides` are the request's billing and throughput
+    /// overrides, which decide the throughput refusals.
     ///
     /// # Errors
     ///
@@ -220,13 +292,28 @@ impl IndexOverrides {
     pub(super) fn apply(
         &self,
         input: &mut CreateTableInput,
-        billing_override: Option<BillingMode>,
+        overrides: &RestoreTableOverrides,
     ) -> Result<(), DynamoDbError> {
         let provisioned = input.billing_mode != Some(BillingMode::PayPerRequest);
+        let billing_override = overrides.billing_mode;
+        if let Some((_, unknown)) = &self.on_demand
+            && let Some(member) = unknown.first()
+        {
+            return Err(invalid(format!(
+                "{ON_DEMAND_FIELD}: member {member} is not supported"
+            )));
+        }
+        check_throughput(
+            None,
+            self.on_demand.as_ref().map(|(given, _)| given),
+            overrides.provisioned_throughput.is_some(),
+            billing_override,
+            provisioned,
+        )?;
         let backup_gsis = input.global_secondary_indexes.take().unwrap_or_default();
         input.global_secondary_indexes = match &self.gsi {
             Some(entries) => {
-                let gsis = apply_gsis(entries, &backup_gsis, provisioned)?;
+                let gsis = apply_gsis(entries, &backup_gsis, billing_override, provisioned)?;
                 (!gsis.is_empty()).then_some(gsis)
             }
             None => {
@@ -236,7 +323,10 @@ impl IndexOverrides {
                 if billing_override == Some(BillingMode::Provisioned)
                     && let Some(index) = backup_gsis.first()
                 {
-                    return Err(gsi_throughput_required(&index.index_name));
+                    return Err(throughput_required(
+                        Some(&index.index_name),
+                        billing_override,
+                    ));
                 }
                 (!backup_gsis.is_empty()).then_some(backup_gsis)
             }
@@ -271,18 +361,7 @@ impl IndexOverrides {
                 .attribute_definitions
                 .retain(|a| used.contains(&a.attribute_name));
         }
-        if let Some((given, unknown)) = &self.on_demand {
-            if let Some(member) = unknown.first() {
-                return Err(invalid(format!(
-                    "{ON_DEMAND_FIELD}: member {member} is not supported"
-                )));
-            }
-            if provisioned {
-                return Err(invalid(format!(
-                    "{ON_DEMAND_FIELD} can only be specified when the restored table's \
-                     BillingMode is PAY_PER_REQUEST"
-                )));
-            }
+        if let Some((given, _)) = &self.on_demand {
             input.on_demand_throughput = Some(given.clone()).filter(|o| {
                 o.max_read_request_units.is_some() || o.max_write_request_units.is_some()
             });
@@ -309,7 +388,7 @@ fn match_entries<'a, T>(
             backup
                 .iter()
                 .find(|i| name_of(i) == name)
-                .ok_or_else(|| invalid(format!("{kind} index {name} is not in the backup")))
+                .ok_or_else(|| index_mismatch(name))
         })
         .collect()
 }
@@ -334,9 +413,7 @@ fn same_definition(
         )));
     }
     if !same_projection(projection.0, projection.1) {
-        return Err(invalid(format!(
-            "index {name}: Projection differs from the backup's"
-        )));
+        return Err(index_mismatch(name));
     }
     Ok(())
 }
@@ -353,6 +430,7 @@ fn same_projection(a: &Projection, b: &Projection) -> bool {
 fn apply_gsis(
     entries: &[GsiEntry],
     backup: &[GsiInput],
+    billing_override: Option<BillingMode>,
     provisioned: bool,
 ) -> Result<Vec<GsiInput>, DynamoDbError> {
     let matched = match_entries(
@@ -376,21 +454,20 @@ fn apply_gsis(
                 (&given.key_schema, &recorded.key_schema),
                 (&given.projection, &recorded.projection),
             )?;
-            if provisioned {
-                if given.provisioned_throughput.is_none() {
-                    return Err(gsi_throughput_required(name));
-                }
-                if entry.on_demand.is_some() {
-                    return Err(invalid(format!(
-                        "index {name}: OnDemandThroughput can only be specified when the \
-                         restored table's BillingMode is PAY_PER_REQUEST"
-                    )));
-                }
+            let missing = provisioned && given.provisioned_throughput.is_none();
+            if missing && billing_override == Some(BillingMode::Provisioned) {
+                return Err(throughput_required(Some(name), billing_override));
             }
-            // An on-demand restore: a ProvisionedThroughput given here stays
-            // on the index and validate_create_table refuses it with
-            // CreateTable's text; an OnDemandThroughput is accepted and not
-            // recorded (see the module documentation).
+            check_throughput(
+                Some(name),
+                entry.on_demand.as_ref(),
+                given.provisioned_throughput.is_some(),
+                billing_override,
+                provisioned,
+            )?;
+            if missing {
+                return Err(throughput_required(Some(name), billing_override));
+            }
             Ok(GsiInput {
                 index_name: recorded.index_name.clone(),
                 key_schema: recorded.key_schema.clone(),
