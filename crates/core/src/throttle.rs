@@ -15,8 +15,11 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-/// Default burst window: 300 seconds of accumulated capacity.
-const BURST_SECONDS: f64 = 300.0;
+mod bucket;
+mod index;
+
+use bucket::TokenBucket;
+pub use index::IndexThroughput;
 
 /// Default on-demand read capacity ceiling per table.
 const ON_DEMAND_DEFAULT_RCU: f64 = 12_000.0;
@@ -29,79 +32,6 @@ const PARTITION_RCU_LIMIT: f64 = 3_000.0;
 
 /// Per-partition write capacity limit (1000 WCU/s).
 const PARTITION_WCU_LIMIT: f64 = 1_000.0;
-
-/// A single token bucket that refills at a constant rate.
-#[derive(Debug)]
-struct TokenBucket {
-    /// Current token count (can go negative after a large operation).
-    tokens: f64,
-    /// Maximum tokens (burst capacity).
-    max_tokens: f64,
-    /// Tokens added per second (= provisioned CU/s).
-    refill_rate: f64,
-    /// Last time tokens were refilled. `None` until the first operation,
-    /// preventing burst accumulation during idle time between bucket
-    /// creation and first use.
-    last_refill: Option<Instant>,
-}
-
-impl TokenBucket {
-    fn new(refill_rate: f64) -> Self {
-        let max_tokens = refill_rate * BURST_SECONDS;
-        // Start with 1 second of capacity rather than the full burst window.
-        // Burst accumulates over time as unused capacity builds up, matching
-        // real DynamoDB's "unused capacity" burst model. Starting full would
-        // make throttling untestable for newly created tables.
-        //
-        // `last_refill` starts as `None` — the refill clock only begins on
-        // the first `has_capacity` or `consume` call. This prevents idle
-        // time between table creation and first data operation from
-        // accumulating burst tokens.
-        Self {
-            tokens: refill_rate,
-            max_tokens,
-            refill_rate,
-            last_refill: None,
-        }
-    }
-
-    /// Refill tokens based on elapsed time since the last operation.
-    /// On the first call, starts the refill clock without adding tokens.
-    fn refill(&mut self, now: Instant) {
-        if let Some(last) = self.last_refill {
-            let elapsed = now.duration_since(last).as_secs_f64();
-            if elapsed > 0.0 {
-                self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.max_tokens);
-            }
-        }
-        self.last_refill = Some(now);
-    }
-
-    /// Check if the bucket has any tokens available (pre-dispatch check).
-    fn has_capacity(&mut self, now: Instant) -> bool {
-        self.refill(now);
-        self.tokens > 0.0
-    }
-
-    /// Consume tokens after a successful operation.
-    fn consume(&mut self, amount: f64, now: Instant) {
-        self.refill(now);
-        self.tokens -= amount;
-    }
-
-    /// Update the refill rate (e.g., after `UpdateTable` changes throughput).
-    fn update_rate(&mut self, new_rate: f64) {
-        let old_max = self.max_tokens;
-        self.max_tokens = new_rate * BURST_SECONDS;
-        self.refill_rate = new_rate;
-        // Scale current tokens proportionally.
-        if old_max > 0.0 {
-            self.tokens = (self.tokens / old_max * self.max_tokens).min(self.max_tokens);
-        } else {
-            self.tokens = self.max_tokens;
-        }
-    }
-}
 
 /// Throughput configuration for a table, used to create/update buckets.
 #[derive(Debug, Clone, Copy)]
@@ -207,7 +137,7 @@ struct AccountBuckets {
 }
 
 /// Result of a throttle check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThrottleResult {
     /// Request may proceed.
     Allowed,
@@ -220,10 +150,10 @@ pub enum ThrottleResult {
 impl ThrottleResult {
     /// The bucket that refused, or `None` when the request was allowed.
     #[must_use]
-    pub fn cause(&self) -> Option<ThrottleCause> {
+    pub fn cause(&self) -> Option<&ThrottleCause> {
         match self {
             Self::Allowed => None,
-            Self::ThrottledRead(c) | Self::ThrottledWrite(c) => Some(*c),
+            Self::ThrottledRead(c) | Self::ThrottledWrite(c) => Some(c),
         }
     }
 }
@@ -231,7 +161,7 @@ impl ThrottleResult {
 /// Which bucket refused a request. The service names the throttled resource
 /// and the limit on a throttle error (`ThrottlingReasons`); the server maps
 /// this cause and the table's billing mode onto that vocabulary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThrottleCause {
     /// The table's own bucket: its provisioned capacity, the default ceiling
     /// of an on-demand table, or an `OnDemandThroughput` cap set on one.
@@ -247,8 +177,27 @@ pub enum ThrottleCause {
         /// Whether the table is billed on demand.
         on_demand: bool,
     },
+    /// A provisioned global secondary index's bucket: its read bucket for a
+    /// `Query` or `Scan` that names the index, its write bucket for a write to
+    /// the base table. Only provisioned indexes have buckets, so the cause
+    /// carries no billing mode.
+    Index {
+        /// The index whose bucket refused.
+        index_name: String,
+    },
     /// The per-account aggregate bucket.
     Account,
+}
+
+impl ThrottleCause {
+    /// The index whose bucket refused, for an [`ThrottleCause::Index`] cause.
+    #[must_use]
+    pub fn index_name(&self) -> Option<&str> {
+        match self {
+            Self::Index { index_name } => Some(index_name),
+            _ => None,
+        }
+    }
 }
 
 /// Thread-safe throttle manager holding all token buckets.
@@ -259,6 +208,10 @@ pub enum ThrottleCause {
 /// for `TokenBucket`, we use the write lock for all operations).
 pub struct ThrottleManager {
     tables: RwLock<HashMap<TableKey, TableBuckets>>,
+    /// Each table's provisioned global secondary indexes, in the order the
+    /// table's description lists them. No lock is taken while another of
+    /// these maps' locks is held.
+    indexes: RwLock<HashMap<TableKey, Vec<index::IndexBuckets>>>,
     partitions: RwLock<HashMap<PartitionKey, TableBuckets>>,
     accounts: RwLock<HashMap<String, AccountBuckets>>,
     account_rcu_limit: f64,
@@ -277,6 +230,7 @@ impl ThrottleManager {
     pub fn new(account_rcu_limit: u64, account_wcu_limit: u64, enabled: bool) -> Self {
         Self {
             tables: RwLock::new(HashMap::new()),
+            indexes: RwLock::new(HashMap::new()),
             partitions: RwLock::new(HashMap::new()),
             accounts: RwLock::new(HashMap::new()),
             account_rcu_limit: account_rcu_limit as f64,
@@ -323,7 +277,36 @@ impl ThrottleManager {
         }
     }
 
-    /// Remove a table's buckets (called on `DeleteTable`).
+    /// Replace a table's set of provisioned global secondary indexes.
+    ///
+    /// Called with the table's registration, from its description. An index
+    /// already registered keeps its balance and takes the new rates, as a
+    /// table does on `UpdateTable`; a new one starts with one second of its
+    /// rates; one absent from `indexes` loses its buckets, so an `UpdateTable`
+    /// that deleted it stops holding back writes. The order of `indexes` is
+    /// kept, so a write refused by several indexes names the first in
+    /// `DescribeTable` order.
+    pub fn register_indexes(
+        &self,
+        account_id: &str,
+        table_name: &str,
+        indexes: Vec<IndexThroughput>,
+    ) {
+        let key = TableKey {
+            account_id: account_id.to_owned(),
+            table_name: table_name.to_owned(),
+        };
+        let Ok(mut map) = self.indexes.write() else {
+            return;
+        };
+        let previous = map.remove(&key).unwrap_or_default();
+        let set = index::replace(previous, indexes);
+        if !set.is_empty() {
+            map.insert(key, set);
+        }
+    }
+
+    /// Remove a table's buckets and its indexes' (called on `DeleteTable`).
     pub fn remove_table(&self, account_id: &str, table_name: &str) {
         let key = TableKey {
             account_id: account_id.to_owned(),
@@ -331,6 +314,9 @@ impl ThrottleManager {
         };
         if let Ok(mut tables) = self.tables.write() {
             tables.remove(&key);
+        }
+        if let Ok(mut indexes) = self.indexes.write() {
+            indexes.remove(&key);
         }
     }
 
@@ -350,7 +336,9 @@ impl ThrottleManager {
     ///
     /// Checks per-partition, per-table, and per-account buckets in order.
     /// Returns `Allowed` if all have capacity, or the appropriate throttle
-    /// result if any is exhausted.
+    /// result if any is exhausted. A write is also checked against the
+    /// table's provisioned global secondary indexes; see
+    /// [`Self::check_capacity_with_partition`].
     ///
     /// `partition_value` is the partition key value for item-level operations.
     /// When provided, per-partition limits (1000 WCU/s, 3000 RCU/s) are enforced.
@@ -361,10 +349,19 @@ impl ThrottleManager {
         is_read: bool,
         is_write: bool,
     ) -> ThrottleResult {
-        self.check_capacity_with_partition(account_id, table_name, is_read, is_write, None)
+        self.check_capacity_with_partition(account_id, table_name, is_read, is_write, None, None)
     }
 
     /// Check capacity with optional per-partition throttling.
+    ///
+    /// `index_name` is the index a `Query` or `Scan` names. When it names a
+    /// provisioned global secondary index registered for the table, the read
+    /// is checked against the index's read bucket in place of the table's; a
+    /// local secondary index shares the table's capacity, so it and a name no
+    /// registered index has read from the table's buckets. A write is checked
+    /// against the table's write bucket and then each registered index's write
+    /// bucket in order; the first that is empty refuses with
+    /// [`ThrottleCause::Index`].
     pub fn check_capacity_with_partition(
         &self,
         account_id: &str,
@@ -372,6 +369,7 @@ impl ThrottleManager {
         is_read: bool,
         is_write: bool,
         partition_value: Option<&str>,
+        index_name: Option<&str>,
     ) -> ThrottleResult {
         if !self.enabled.load(Ordering::Relaxed) {
             return ThrottleResult::Allowed;
@@ -379,28 +377,57 @@ impl ThrottleManager {
 
         let now = Instant::now();
         let mut on_demand = false;
+        let key = TableKey {
+            account_id: account_id.to_owned(),
+            table_name: table_name.to_owned(),
+        };
+
+        // A read naming a provisioned global secondary index is served from
+        // the index's read bucket and does not consult the table's.
+        let mut index_read = false;
+        if is_read
+            && let Some(name) = index_name
+            && let Ok(mut indexes) = self.indexes.write()
+            && let Some(set) = indexes.get_mut(&key)
+            && let Some(allowed) = index::read_allowed(set, name, now)
+        {
+            index_read = true;
+            if !allowed {
+                return ThrottleResult::ThrottledRead(ThrottleCause::Index {
+                    index_name: name.to_owned(),
+                });
+            }
+        }
 
         // Check per-table bucket.
-        if let Ok(mut tables) = self.tables.write() {
-            let key = TableKey {
-                account_id: account_id.to_owned(),
-                table_name: table_name.to_owned(),
-            };
-            if let Some(buckets) = tables.get_mut(&key) {
-                on_demand = buckets.on_demand;
-                if is_read && !buckets.read.has_capacity(now) {
-                    return ThrottleResult::ThrottledRead(ThrottleCause::Table {
-                        on_demand,
-                        capped: buckets.read_capped,
-                    });
-                }
-                if is_write && !buckets.write.has_capacity(now) {
-                    return ThrottleResult::ThrottledWrite(ThrottleCause::Table {
-                        on_demand,
-                        capped: buckets.write_capped,
-                    });
-                }
+        if let Ok(mut tables) = self.tables.write()
+            && let Some(buckets) = tables.get_mut(&key)
+        {
+            on_demand = buckets.on_demand;
+            if is_read && !index_read && !buckets.read.has_capacity(now) {
+                return ThrottleResult::ThrottledRead(ThrottleCause::Table {
+                    on_demand,
+                    capped: buckets.read_capped,
+                });
             }
+            if is_write && !buckets.write.has_capacity(now) {
+                return ThrottleResult::ThrottledWrite(ThrottleCause::Table {
+                    on_demand,
+                    capped: buckets.write_capped,
+                });
+            }
+        }
+
+        // A write the table's bucket allowed is held back by the first index,
+        // in the order registered, whose write bucket is empty.
+        if is_write
+            && let Ok(mut indexes) = self.indexes.write()
+            && let Some(set) = indexes.get_mut(&key)
+            && let Some(exhausted) = index::first_write_exhausted(set, now)
+        {
+            return ThrottleResult::ThrottledWrite(ThrottleCause::Index {
+                index_name: exhausted.to_owned(),
+            });
         }
 
         // Check per-partition bucket (1000 WCU/s, 3000 RCU/s per partition).
@@ -449,12 +476,21 @@ impl ThrottleManager {
 
     /// Consume capacity after a successful operation.
     ///
-    /// Deducts tokens from per-table and per-account buckets.
+    /// Deducts tokens from per-table and per-account buckets, and charges a
+    /// write to the table's provisioned global secondary indexes as
+    /// [`Self::consume_with_partition`] does.
     pub fn consume(&self, account_id: &str, table_name: &str, read_units: f64, write_units: f64) {
-        self.consume_with_partition(account_id, table_name, read_units, write_units, None);
+        self.consume_with_partition(account_id, table_name, read_units, write_units, None, None);
     }
 
     /// Consume capacity with optional per-partition tracking.
+    ///
+    /// A read whose `index_name` names a registered provisioned global
+    /// secondary index is charged to the index's read bucket, not the table's.
+    /// A write is charged to the table's write bucket and to every registered
+    /// index's write bucket, each by `write_units`. The service charges an
+    /// index only for an item that carries the index's key attributes; this
+    /// layer does not see the item, so every index is charged.
     pub fn consume_with_partition(
         &self,
         account_id: &str,
@@ -462,25 +498,34 @@ impl ThrottleManager {
         read_units: f64,
         write_units: f64,
         partition_value: Option<&str>,
+        index_name: Option<&str>,
     ) {
         if !self.enabled.load(Ordering::Relaxed) {
             return;
         }
 
         let now = Instant::now();
+        let key = TableKey {
+            account_id: account_id.to_owned(),
+            table_name: table_name.to_owned(),
+        };
 
-        if let Ok(mut tables) = self.tables.write() {
-            let key = TableKey {
-                account_id: account_id.to_owned(),
-                table_name: table_name.to_owned(),
-            };
-            if let Some(buckets) = tables.get_mut(&key) {
-                if read_units > 0.0 {
-                    buckets.read.consume(read_units, now);
-                }
-                if write_units > 0.0 {
-                    buckets.write.consume(write_units, now);
-                }
+        let mut index_read = false;
+        if ((read_units > 0.0 && index_name.is_some()) || write_units > 0.0)
+            && let Ok(mut indexes) = self.indexes.write()
+            && let Some(set) = indexes.get_mut(&key)
+        {
+            index_read = index::charge(set, index_name, read_units, write_units, now);
+        }
+
+        if let Ok(mut tables) = self.tables.write()
+            && let Some(buckets) = tables.get_mut(&key)
+        {
+            if read_units > 0.0 && !index_read {
+                buckets.read.consume(read_units, now);
+            }
+            if write_units > 0.0 {
+                buckets.write.consume(write_units, now);
             }
         }
 
@@ -534,136 +579,10 @@ impl Default for ThrottleManager {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn token_bucket_starts_with_one_second_capacity() {
-        let bucket = TokenBucket::new(100.0);
-        assert_eq!(bucket.max_tokens, 100.0 * BURST_SECONDS);
-        assert_eq!(bucket.tokens, 100.0); // 1 second of capacity
-        assert!(bucket.last_refill.is_none()); // lazy — clock not started
-    }
-
-    #[test]
-    fn token_bucket_consume_and_refill() {
-        let now = Instant::now();
-        let mut bucket = TokenBucket::new(100.0);
-        // First consume starts the refill clock, then deducts tokens.
-        bucket.consume(100.0, now);
-        assert!(bucket.tokens <= 0.0);
-        assert!(!bucket.has_capacity(now));
-    }
-
-    #[test]
-    fn token_bucket_no_burst_accumulation_before_first_use() {
-        let mut bucket = TokenBucket::new(5.0);
-        // Simulate idle time: create bucket, wait, then check capacity.
-        // With lazy refill, the bucket should still have only 5 tokens
-        // (1 second of capacity) regardless of wall-clock delay.
-        let later = Instant::now();
-        // First call starts the clock — no tokens added.
-        assert!(bucket.has_capacity(later));
-        assert_eq!(bucket.tokens, 5.0); // unchanged from initial
-    }
-
-    #[test]
-    fn throttle_manager_allows_when_disabled() {
-        let mgr = ThrottleManager::new(100, 100, false);
-        mgr.register_table("acct", "tbl", TableThroughput::provisioned(1, 1));
-        assert_eq!(
-            mgr.check_capacity("acct", "tbl", true, false),
-            ThrottleResult::Allowed
-        );
-    }
-
-    #[test]
-    fn throttle_manager_allows_unregistered_table() {
-        let mgr = ThrottleManager::new(100, 100, true);
-        assert_eq!(
-            mgr.check_capacity("acct", "unknown", true, false),
-            ThrottleResult::Allowed
-        );
-    }
-
-    #[test]
-    fn throttle_manager_throttles_exhausted_table() {
-        let mgr = ThrottleManager::new(100_000, 100_000, true);
-        mgr.register_table("acct", "tbl", TableThroughput::provisioned(1, 1));
-        // Drain the table bucket (starts with 1 token = 1 second of 1 CU/s).
-        mgr.consume("acct", "tbl", 2.0, 0.0);
-        assert_eq!(
-            mgr.check_capacity("acct", "tbl", true, false),
-            ThrottleResult::ThrottledRead(ThrottleCause::Table {
-                on_demand: false,
-                capped: false,
-            })
-        );
-    }
-
-    #[test]
-    fn throttle_manager_throttles_exhausted_writes() {
-        let mgr = ThrottleManager::new(100_000, 100_000, true);
-        mgr.register_table("acct", "tbl", TableThroughput::provisioned(1, 1));
-        mgr.consume("acct", "tbl", 0.0, 2.0);
-        assert_eq!(
-            mgr.check_capacity("acct", "tbl", false, true),
-            ThrottleResult::ThrottledWrite(ThrottleCause::Table {
-                on_demand: false,
-                capped: false,
-            })
-        );
-    }
-
-    #[test]
-    fn throttle_manager_remove_table() {
-        let mgr = ThrottleManager::new(100_000, 100_000, true);
-        mgr.register_table("acct", "tbl", TableThroughput::provisioned(1, 1));
-        mgr.remove_table("acct", "tbl");
-        // After removal, unregistered table is allowed.
-        assert_eq!(
-            mgr.check_capacity("acct", "tbl", true, true),
-            ThrottleResult::Allowed
-        );
-    }
-
-    #[test]
-    fn throttle_manager_account_level_throttle() {
-        let mgr = ThrottleManager::new(1, 1, true);
-        mgr.register_table(
-            "acct",
-            "tbl",
-            TableThroughput::provisioned(100_000, 100_000),
-        );
-        // Table has plenty of capacity, but account limit is 1 CU/s.
-        // Drain account bucket (starts with 1 token).
-        mgr.consume("acct", "tbl", 2.0, 0.0);
-        assert_eq!(
-            mgr.check_capacity("acct", "tbl", true, false),
-            ThrottleResult::ThrottledRead(ThrottleCause::Account)
-        );
-    }
-
-    #[test]
-    fn on_demand_table_uses_default_ceilings() {
-        let mgr = ThrottleManager::new(100_000, 100_000, true);
-        mgr.register_table("acct", "tbl", TableThroughput::on_demand());
-        // Should allow normal operations.
-        assert_eq!(
-            mgr.check_capacity("acct", "tbl", true, true),
-            ThrottleResult::Allowed
-        );
-    }
-
-    #[test]
-    fn update_rate_adjusts_bucket() {
-        let mut bucket = TokenBucket::new(100.0);
-        assert_eq!(bucket.max_tokens, 100.0 * BURST_SECONDS);
-        bucket.update_rate(200.0);
-        assert_eq!(bucket.max_tokens, 200.0 * BURST_SECONDS);
-        assert_eq!(bucket.refill_rate, 200.0);
-    }
-}
+mod manager_tests;
 
 #[cfg(test)]
 mod cause_tests;
+
+#[cfg(test)]
+mod index_tests;

@@ -16,9 +16,16 @@ fn partition_throttle_carries_the_billing_mode() {
         mgr.register_table("acct", "tbl", throughput);
         // Drain the partition bucket (PARTITION_WCU_LIMIT per second, one
         // second of burst), leaving the table bucket full.
-        mgr.consume_with_partition("acct", "tbl", 0.0, PARTITION_WCU_LIMIT * 2.0, Some("k"));
+        mgr.consume_with_partition(
+            "acct",
+            "tbl",
+            0.0,
+            PARTITION_WCU_LIMIT * 2.0,
+            Some("k"),
+            None,
+        );
         assert_eq!(
-            mgr.check_capacity_with_partition("acct", "tbl", false, true, Some("k")),
+            mgr.check_capacity_with_partition("acct", "tbl", false, true, Some("k"), None),
             ThrottleResult::ThrottledWrite(ThrottleCause::Partition { on_demand }),
             "on_demand={on_demand}"
         );
@@ -57,7 +64,7 @@ fn on_demand_caps_size_the_table_bucket() {
     );
     assert_eq!(
         mgr.check_capacity("acct", "tbl", false, true).cause(),
-        Some(ThrottleCause::Table {
+        Some(&ThrottleCause::Table {
             on_demand: true,
             capped: true,
         })
