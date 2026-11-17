@@ -28,7 +28,8 @@
 # With the `dry_run` input the run ends after the build jobs: the gates and
 # the five native builds, smoke tests and launcher suites run as for a
 # release, and nothing is published; dry runs have a concurrency group of
-# their own (release-image.yml).
+# their own (release-image.yml). A `promote` dry run ends after the verify
+# legs: the gate and the five legs run, and no tag moves.
 #
 # Shape, and why (mirrors .github/workflows/release-image.yml):
 #
@@ -141,7 +142,7 @@ on:
           - candidate
           - promote
       dry_run:
-        description: 'Rehearse only: run the gates and the five platform builds with their smoke tests and launcher suites; publish nothing'
+        description: 'Rehearse only: run the gates and the five platform builds with their smoke tests and launcher suites; publish nothing. With promote: run the gate and the verify legs; move no tag.'
         type: boolean
         default: false
 
@@ -380,9 +381,8 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   publish:
-    if: inputs.action == 'candidate'
+    if: ${{ inputs.action == 'candidate' && !inputs.dry_run }}
     needs: [gate, build]
-    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # The protected environment requires reviewer approval, and its name is
@@ -498,7 +498,7 @@ jobs:
       platforms: ${{ needs.gate.outputs.platforms }}
 
   promote:
-    if: inputs.action == 'promote'
+    if: ${{ inputs.action == 'promote' && !inputs.dry_run }}
     needs: [gate, verify]
     runs-on: ubuntu-latest
     timeout-minutes: 15
