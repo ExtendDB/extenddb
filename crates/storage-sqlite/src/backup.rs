@@ -5370,9 +5370,12 @@ mod restore_tests {
 
             // Back to the shape before migration 6: the job record's columns
             // and index gone, the registrations as the old release wrote
-            // them, the interrupted target CREATING, and the migration
-            // forgotten.
-            let mut undo = String::from("DROP INDEX IF EXISTS idx_table_restores_status;");
+            // them, the interrupted target CREATING, and migration 6's
+            // ledger row deleted, so the next run applies migration 6 alone.
+            let mut undo = String::from(
+                "DROP INDEX IF EXISTS idx_table_restores_status; \
+                 DELETE FROM extenddb_migrations WHERE id = 6;",
+            );
             for column in [
                 "status",
                 "kind",
@@ -5407,7 +5410,6 @@ mod restore_tests {
                 crate::migrations::SqliteMigrations::on_pool(engine.pool.clone(), ":memory:")
                     .expect("one connection");
             let runner = extenddb_storage::migrations::Runner::new(&on_pool, "test");
-            runner.forget(6).await.expect("forget migration 6");
             let report = runner.migrate().await.expect("migrate again");
             assert_eq!(report.applied.iter().map(|a| a.id).collect::<Vec<_>>(), [6]);
 

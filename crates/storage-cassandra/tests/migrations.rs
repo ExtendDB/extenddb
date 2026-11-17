@@ -512,12 +512,13 @@ async fn the_check_before_the_lock_reads_no_policy() {
     deployment(&session, &prefix).await;
     let migrations = CassandraCatalogMigrations;
     let target = target_of(&prefix);
-    let lock = migrations.lock(&target, TIMEOUT).await.expect("lock");
-    migrations
-        .forget(&lock, 2)
-        .await
-        .expect("forget migration 2");
-    migrations.release(lock).await;
+    // Migration 2 pending: its ledger row deleted (the version row is left
+    // as it was; the next run rewrites it).
+    cql(
+        &session,
+        &format!("DELETE FROM {prefix}_catalog.extenddb_migrations WHERE id = 2"),
+    )
+    .await;
     // A user, whose policies migration 2's read looks up.
     cql(
         &session,
@@ -639,7 +640,7 @@ async fn migration_1_converges_a_legacy_catalog_and_stops_on_a_table_of_another_
     let catalog = format!("{prefix}_catalog");
     keyspace(&session, &catalog).await;
     // A catalog with the legacy files' tables and no ledger, as a release
-    // before 1.0 left it, with the traces in its settings: the version row,
+    // before 0.1.15 left it, with the traces in its settings: the version row,
     // the marker, and a setting an operator changed.
     run_baseline_unrecorded(&session, &catalog, StoreKind::Catalog)
         .await

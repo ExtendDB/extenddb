@@ -304,7 +304,7 @@ SQLite, PostgreSQL, Cassandra and MongoDB migrate through this framework.
    rewrites stored policies, and running it again would rewrite a policy
    written after it and change that policy's decision.
    `extenddb migrate --yes --reconverge`, which repairs a catalog that a
-   release before 1.0 wrote to, runs the convergent migrations again and
+   release before 0.1.15 wrote to, runs the convergent migrations again and
    skips a recorded migration that is not convergent, with a line that names
    it.
 
@@ -356,6 +356,7 @@ SQLite, PostgreSQL, Cassandra and MongoDB migrate through this framework.
    cargo test -p extenddb-storage-sqlite --lib the_released_bodies -- --nocapture
    cargo test -p extenddb-storage-postgres --lib the_released_bodies -- --nocapture
    cargo test -p extenddb-storage-mongodb --lib the_released_bodies -- --nocapture
+   cargo test -p extenddb-storage-cassandra --lib the_released_bodies -- --nocapture
    ```
 
    A released body does not change. If one has to, for example because a
@@ -363,7 +364,7 @@ SQLite, PostgreSQL, Cassandra and MongoDB migrate through this framework.
    entry for it with the new checksum and `rebless: Some("<reason>")`. A
    code body keeps its fingerprint, and its golden test shows that its output
    did not change. A later migration leaves migration 1's file and
-   `0001_baseline.expected.json` as they are: they define the v1.0 schema,
+   `0001_baseline.expected.json` as they are: they define migration 1's schema,
    which the runner checks a store against the first time migration 1 runs on
    it.
 
@@ -615,7 +616,7 @@ devtools/check-sqlite-older-binary ./target/release/extenddb \
 each other, that the `migrate` preview and `verify` run beside a server,
 that `verify` exits 3 on a catalog behind the binary, and that
 `migrate --yes` refuses a missing database without creating it.
-`check-sqlite-older-binary` runs the last 0.1.x dev image against catalogs
+`check-sqlite-older-binary` runs the 0.1.14 dev image against catalogs
 this binary migrated, and checks that the binary then reports
 `WrittenByOlderRelease` and that `extenddb migrate --yes --reconverge`
 restores `Current`; with `DEV_BIN` set to a `sqlite,dev-mode` build it also

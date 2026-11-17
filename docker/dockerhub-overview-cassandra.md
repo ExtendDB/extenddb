@@ -100,18 +100,24 @@ Pin `X.Y.Z` or a digest for production; a version tag is never overwritten.
 `sha-<commit>` are unpromoted build candidates, not releases. Both
 `linux/amd64` and `linux/arm64` ship as one multi-architecture index.
 
-Every published image is signed with ExtendDB's release key, an elliptic-curve
-P-256 key held in the AWS Key Management Service. The public key is committed
-in the repository as
-[`extenddb-signing.pub.pem`](https://github.com/ExtendDB/extenddb/blob/main/extenddb-signing.pub.pem).
-Verify an image before deploying it:
+Every published image is signed keyless with Sigstore cosign, with a Rekor
+transparency-log entry: the certificate names the GitHub Actions workflow and
+ref that signed the image, and no public key is needed. Verify an image before
+deploying it:
 
 ```console
-cosign verify --key extenddb-signing.pub.pem \
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/ExtendDB/extenddb/\.github/workflows/(release-image|sign-image)\.yml@refs/heads/main$' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   docker.io/extenddb/extenddb-cassandra:X.Y.Z
 ```
 
-The same images and their signatures are mirrored by digest to
+The signer identity separates tiers: routine backend releases are signed by
+`release-image.yml` and routine dev releases by `release-dev-image.yml`, so
+this pattern rejects a routinely-signed dev image. The break-glass signer
+`sign-image.yml` can sign any tier, so it is the one identity both patterns
+share; drop it to pin verification to the routine per-tier path. The same
+images and their signatures are mirrored by digest to
 `ghcr.io/extenddb/extenddb-cassandra` and
 `public.ecr.aws/extenddb/extenddb-cassandra`.
 

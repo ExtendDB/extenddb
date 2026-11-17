@@ -2888,7 +2888,8 @@ async fn test_migration_6_backfills_the_registrations_and_the_reconciler_removes
 
     // Back to the shape before migration 6: the registrations as the
     // previous release wrote them (no job record), the interrupted target
-    // CREATING, and the migration forgotten.
+    // CREATING, and migration 6's ledger row deleted, so the next run applies
+    // migration 6 alone.
     let catalog = engine.catalog_keyspace();
     for (name, table_id) in [
         ("BfDone", finished.table_id.as_str()),
@@ -2916,7 +2917,7 @@ async fn test_migration_6_backfills_the_registrations_and_the_reconciler_removes
     )
     .await;
     let prefix = prefix_of(&engine);
-    forget_catalog_migration(&engine, &prefix, MigrationId::BackupCatalogIndex).await;
+    delete_catalog_ledger_row(&engine, MigrationId::BackupCatalogIndex).await;
     let report = extenddb_storage_cassandra::migrations::migrate_catalog_keyspace(
         engine.session_arc(),
         &prefix,
@@ -4503,27 +4504,22 @@ fn prefix_of(engine: &CassandraEngine) -> String {
         .to_owned()
 }
 
-/// Remove migration `id`'s ledger row from the catalog keyspace under the
-/// migration lock, as `migrate --forget` does, so the next run applies it
-/// again.
-async fn forget_catalog_migration(engine: &CassandraEngine, prefix: &str, id: MigrationId) {
-    use extenddb_storage_cassandra::migrations::{CassandraMigrations, LeaseTimes, MigrationLock};
-    let lock = MigrationLock::acquire(
-        engine.session_arc(),
-        &engine.catalog_keyspace(),
-        LeaseTimes::DEFAULT,
-        Duration::from_secs(120),
-    )
-    .await
-    .expect("take the lock");
-    let forgotten = {
-        let migrations = CassandraMigrations::locked_catalog_only(&lock, prefix);
-        extenddb_storage::migrations::Runner::new(&migrations, "test")
-            .forget(id.number())
-            .await
-    };
-    lock.release().await;
-    forgotten.expect("forget the migration");
+/// Delete migration `id`'s ledger row from the catalog keyspace, so the
+/// next run applies it. The version row is left as it was; the next run
+/// rewrites it.
+async fn delete_catalog_ledger_row(engine: &CassandraEngine, id: MigrationId) {
+    let id = i32::try_from(id.number()).expect("a migration id fits an int");
+    engine
+        .session()
+        .query_with_values(
+            format!(
+                "DELETE FROM {}.extenddb_migrations WHERE id = ?",
+                engine.catalog_keyspace()
+            ),
+            cdrs_tokio::query_values!(id),
+        )
+        .await
+        .expect("delete the migration's ledger row");
 }
 
 /// A catalog at migration 5 whose migration 6 fails in its backfill (a

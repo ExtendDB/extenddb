@@ -62,7 +62,7 @@ mod workers;
 
 /// Default secondary-index propagation delay (milliseconds) when the
 /// `index_propagation_delay_ms` setting is absent, as it is on a catalog the
-/// migrations created (releases before 1.0 seeded the same value). The single
+/// migrations created (releases before 0.1.15 seeded the same value). The single
 /// definition used by both the live read on the write path and the background
 /// refresh worker.
 pub(crate) const DEFAULT_INDEX_PROPAGATION_DELAY_MS: u64 = 10;

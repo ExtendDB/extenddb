@@ -574,7 +574,8 @@ The catalog migrations are the numbered list every backend shares
 binary at compile time via `include_str!`. The shared runner applies them in id order and records
 each body in the `extenddb_migrations` ledger of the database it changed, and every id in the
 catalog's ledger. The
-`schema_history` table of a 0.1.x catalog stays in place and is not read.
+`schema_history` table of a catalog that 0.1.14 or an earlier release
+created stays in place and is not read.
 
 Migration files are named by id:
 ```
