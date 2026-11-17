@@ -51,6 +51,25 @@ impl CassandraCredentialStore {
     fn catalog_keyspace(&self) -> String {
         format!("{}_catalog", self.keyspace_prefix)
     }
+
+    /// Whether `account_id` has a row in `accounts`. Before account deletes
+    /// removed them, a deleted account's access keys and role sessions stayed
+    /// in the catalog; a credential of an account that no longer exists is
+    /// unknown.
+    async fn account_exists(&self, account_id: &str) -> Result<bool, DynamoDbError> {
+        let query = format!(
+            "SELECT account_id FROM {}.accounts WHERE account_id = ?",
+            self.catalog_keyspace()
+        );
+        crate::cassandra_util::query_rows::<DynamoDbError>(
+            &self.session,
+            &query,
+            cdrs_tokio::query_values!(account_id),
+            "credential account_exists",
+        )
+        .await
+        .map(|rows| !rows.is_empty())
+    }
 }
 
 #[async_trait]
@@ -125,6 +144,9 @@ impl CassandraCredentialStore {
             tracing::error!("Failed to parse is_active: {e}");
             DynamoDbError::InternalServerError("Internal error during authentication".to_owned())
         })?;
+        if !self.account_exists(&account_id).await? {
+            return Ok(None);
+        }
 
         let secret_key =
             decrypt_secret(&encrypted, &self.encryption_key, access_key_id).map_err(|e| {
@@ -206,6 +228,9 @@ impl CassandraCredentialStore {
             tracing::error!("Failed to parse session_token: {e}");
             DynamoDbError::InternalServerError("Internal error during authentication".to_owned())
         })?;
+        if !self.account_exists(&account_id).await? {
+            return Ok(None);
+        }
 
         let expires_at_ms: i64 = row.get_r_by_name("expires_at").map_err(|e| {
             tracing::error!("Failed to parse expires_at: {e}");

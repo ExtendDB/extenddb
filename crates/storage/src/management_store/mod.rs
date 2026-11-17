@@ -25,8 +25,8 @@
 mod types;
 
 pub use types::{
-    AccessKeyCreated, AccountDetail, AdminEntry, GroupDetail, MetricsRow, OpError, OpResult,
-    RoleDetail, SessionPolicyEntry, UserDetail,
+    AccessKeyCreated, AccountDetail, AdminEntry, GroupDetail, MetricsFilter, MetricsRow, OpError,
+    OpResult, RoleDetail, SessionPolicyEntry, UserDetail,
 };
 
 use futures::future::BoxFuture;
@@ -76,12 +76,15 @@ pub trait MetricsStore: Send + Sync {
     fn insert_metrics(&self, rows: &[MetricsRow]) -> BoxFuture<'_, OpResult<()>>;
 
     /// Query metrics rows within a time range, with optional filters.
+    ///
+    /// A filter that is `None` matches every row; `filter.account_id` set
+    /// returns only the rows recorded for that account, never a row of the
+    /// whole deployment (which has no account).
     fn query_metrics(
         &self,
         start: time::OffsetDateTime,
         end: time::OffsetDateTime,
-        table_name: Option<&str>,
-        metric: Option<&str>,
+        filter: &MetricsFilter,
     ) -> BoxFuture<'_, OpResult<Vec<MetricsRow>>>;
 
     /// Delete metrics rows older than the retention period.
@@ -138,6 +141,9 @@ pub trait AdminStore: Send + Sync {
 
     /// Verify an admin password. Returns `None` if the admin does not exist,
     /// `Some(true)` if the password matches, `Some(false)` if it does not.
+    /// An unknown name returns `None` without a bcrypt check. Every login
+    /// path then runs the IAM user step, which runs one bcrypt check for any
+    /// name, so a login runs one check whether or not an admin has the name.
     fn verify_admin_password(
         &self,
         admin_name: &str,
@@ -229,7 +235,11 @@ pub trait ManagementStore: Send + Sync {
         user_name: &str,
     ) -> BoxFuture<'_, OpResult<Option<UserDetail>>>;
 
-    /// Verify an IAM user's console password.
+    /// Verify an IAM user's console password. Returns `false` for a wrong
+    /// password, an unknown user and a user without a console password.
+    /// Implementations check through
+    /// [`crate::password::verify_stored_password`] in all three cases, so
+    /// that they run the same bcrypt work.
     fn verify_iam_user_password(
         &self,
         account_id: &str,

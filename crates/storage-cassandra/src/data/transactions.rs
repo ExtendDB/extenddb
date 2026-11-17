@@ -1057,11 +1057,22 @@ impl CassandraEngine {
             pre_commit_images.push(image);
         }
 
+        // The system GSI delay, read live at most once for the whole
+        // transaction, and only if some item's table has a GSI that follows
+        // the system setting (see `commit_secondary_effects`).
+        let sys_delay = tokio::sync::OnceCell::new();
+
         // TODO: Execute COMMIT operations for each item in parallel
         // For now, sequential execution
         for (op, prepared_item) in ops.iter().zip(prepared_items) {
-            self.commit_single_operation(op, prepared_item.as_deref(), txn_id, txn_timestamp)
-                .await?;
+            self.commit_single_operation(
+                op,
+                prepared_item.as_deref(),
+                txn_id,
+                txn_timestamp,
+                &sys_delay,
+            )
+            .await?;
         }
 
         for (op, old_image) in ops.iter().zip(&pre_commit_images) {
@@ -1652,6 +1663,7 @@ impl CassandraEngine {
         prepared_item: Option<&str>,
         txn_id: Uuid,
         txn_timestamp: i64,
+        sys_delay: &tokio::sync::OnceCell<u64>,
     ) -> Result<(), StorageError> {
         let txn_id_bytes = Bytes::new(txn_id.as_bytes().to_vec());
 
@@ -1700,6 +1712,7 @@ impl CassandraEngine {
                     &indexes,
                     stream_stmt,
                     next_version,
+                    sys_delay,
                 )
                 .await
             }
@@ -1760,6 +1773,7 @@ impl CassandraEngine {
                     &indexes,
                     stream_stmt,
                     next_version,
+                    sys_delay,
                 )
                 .await
             }
@@ -1899,6 +1913,7 @@ impl CassandraEngine {
                     &indexes,
                     stream_stmt,
                     delete_stamp,
+                    sys_delay,
                 )
                 .await
             }
@@ -2127,6 +2142,7 @@ impl CassandraEngine {
     /// followed by the record as a batch of its own when the two are too large
     /// to share one. The queue row that `enqueue_async_indexes` adds for an
     /// asynchronous GSI goes into the index batch with the index rows.
+    #[allow(clippy::too_many_arguments)]
     async fn commit_secondary_effects(
         &self,
         key_info: &TableKeyInfo,
@@ -2135,6 +2151,7 @@ impl CassandraEngine {
         indexes: &[super::index::IndexMeta],
         stream_stmt: Option<String>,
         stamp: i64,
+        sys_delay: &tokio::sync::OnceCell<u64>,
     ) -> Result<(), StorageError> {
         let data_keyspace = self.account_keyspace(&key_info.account_id);
 
@@ -2146,9 +2163,10 @@ impl CassandraEngine {
         let mut async_enqueued = 0;
 
         if !indexes.is_empty() {
-            let sys_delay = self
-                .gsi_default_delay_ms
-                .load(std::sync::atomic::Ordering::Relaxed);
+            // Read live once for the transaction: the first item whose table
+            // has a GSI following the system setting fills `sys_delay`, and
+            // later items reuse it. An item with none reads nothing.
+            let sys_delay = self.system_index_delay_once(indexes, sys_delay).await;
             super::index::sync_indexes_at(
                 &mut batch,
                 &data_keyspace,
@@ -2519,10 +2537,24 @@ impl CassandraEngine {
         let old = parse(old_item_data)?;
         let new = parse(new_item_data)?;
         let indexes = self.indexes_for_commit(&key_info).await?;
+        // Background recovery: the cached delay, not a live read, as the TTL
+        // sweep does.
+        let sys_delay = tokio::sync::OnceCell::new_with(Some(
+            self.gsi_default_delay_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ));
         // Recovery writes no stream record (issue #579), so the batch carries
         // the index rows alone.
-        self.commit_secondary_effects(&key_info, old.as_ref(), new.as_ref(), &indexes, None, stamp)
-            .await
+        self.commit_secondary_effects(
+            &key_info,
+            old.as_ref(),
+            new.as_ref(),
+            &indexes,
+            None,
+            stamp,
+            &sys_delay,
+        )
+        .await
     }
 
     /// Commit a single operation during recovery.

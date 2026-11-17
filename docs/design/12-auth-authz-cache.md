@@ -576,3 +576,14 @@ These should be resolved before implementation:
 5. **Multi-tenant deployments.** Different accounts on the same instance share one channel. Is the per-channel filtering by `instance_id` sufficient, or do we need per-account channels for noise reduction?
 
 These are flagged for review by other engineers (deployment shape, durability requirements, network topology) before this lands.
+
+---
+
+## License
+
+Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
+See [LICENSE](../../LICENSE) for the full text.
+
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

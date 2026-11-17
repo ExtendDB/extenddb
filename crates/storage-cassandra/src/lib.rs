@@ -12,6 +12,13 @@
 /// and the console's default all read this one value.
 pub(crate) const DEFAULT_CONTROL_PLANE_DELAY_SECONDS: f64 = 0.25;
 
+/// Default secondary-index propagation delay (milliseconds) when the
+/// `index_propagation_delay_ms` setting is absent or unparseable, as it is on
+/// a catalog the migrations created. The same value as SQLite and PostgreSQL,
+/// and the single definition used by the live read on the write path, the
+/// background refresh worker, and the engine's starting value.
+pub(crate) const DEFAULT_INDEX_PROPAGATION_DELAY_MS: u64 = 10;
+
 mod admin_store;
 mod authorization_store;
 mod backup_catalog;
@@ -32,8 +39,10 @@ pub mod migrations;
 pub mod operations;
 mod password_hash_store;
 pub(crate) mod propagation_hold;
+mod restore_engine;
 mod snapshot_engine;
 mod stream_engine;
+mod stream_lifecycle;
 pub mod stream_util;
 pub mod table_engine;
 mod table_helpers;
@@ -41,6 +50,7 @@ mod table_helpers;
 pub mod test_hooks;
 pub mod ttl_worker;
 mod update_table;
+mod warm_throughput;
 mod worker_store;
 pub mod workers;
 
@@ -132,6 +142,7 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
                 gsi_backfill_notify,
                 std::time::Duration::from_secs(120), // stale threshold
                 std::time::Duration::from_secs(60),  // scan interval backstop
+                None,                                // every account keyspace
                 token,
             )
             .await;
@@ -280,6 +291,102 @@ async fn make_catalog_store_from_connection_string(
     ))
 }
 
+/// The warnings for the deployment's keyspaces whose replication differs
+/// from the config's `replication_factor` and `datacenter`. `mismatches`
+/// holds each such keyspace with its replication, and `datacenters` the
+/// datacenters of the cluster's nodes.
+///
+/// Either the keyspace or the config can be wrong. When the config's
+/// datacenter is not one of the cluster's, the config is wrong, and one
+/// warning names the keyspaces and says to fix `datacenter`. Otherwise each
+/// keyspace gets a warning that gives the fix for each case, with the steps
+/// in the order that keeps every write for that keyspace's change
+/// ([`migrations::alter_steps`]).
+pub(crate) fn replication_warnings(
+    mismatches: &[(String, String, migrations::ReplicationChange)],
+    datacenters: &std::collections::BTreeSet<String>,
+    datacenter: &str,
+    replication_factor: u32,
+) -> Vec<String> {
+    if mismatches.is_empty() {
+        return Vec::new();
+    }
+    let expected = catalog_store::network_topology(datacenter, replication_factor);
+    if !datacenters.contains(datacenter) {
+        let keyspaces: Vec<&str> = mismatches.iter().map(|(k, _, _)| k.as_str()).collect();
+        let known: Vec<&str> = datacenters.iter().map(String::as_str).collect();
+        return vec![format!(
+            "The config sets datacenter = \"{datacenter}\", but this cluster's datacenters \
+             are {}. Set datacenter in [storage.cassandra] to the datacenter of the \
+             keyspaces {}. Do not change the keyspaces to match the config \
+             (docs/cassandra-setup.md, Keyspace replication).",
+            known.join(", "),
+            keyspaces.join(", ")
+        )];
+    }
+    mismatches
+        .iter()
+        .map(|(keyspace, found, change)| {
+            format!(
+                "Keyspace {keyspace} has replication {found}, but the config asks for \
+                 {expected}. If the keyspace is right, set replication_factor and \
+                 datacenter in [storage.cassandra] to match it. If the config is right, \
+                 {} (docs/cassandra-setup.md, Keyspace replication).",
+                migrations::alter_steps(*change)
+            )
+        })
+        .collect()
+}
+
+/// Log a warning for each of the deployment's keyspaces whose replication
+/// differs from the config's `replication_factor` and `datacenter`
+/// ([`replication_warnings`]), and return the warnings. `serve` starts
+/// anyway: the keyspaces still work. A failed read is logged and skipped.
+async fn warn_of_replication_mismatches(
+    session: &CassandraSession,
+    cassandra_config: &CassandraStorageConfig,
+) -> Vec<String> {
+    let read = async {
+        let mismatches = migrations::replication_mismatches(
+            session,
+            &cassandra_config.keyspace_prefix,
+            &cassandra_config.datacenter,
+            cassandra_config.replication_factor,
+        )
+        .await?;
+        let datacenters = migrations::cluster_datacenters(session).await?;
+        Ok::<_, extenddb_storage::migrations::MigrationError>(replication_warnings(
+            &mismatches,
+            &datacenters,
+            &cassandra_config.datacenter,
+            cassandra_config.replication_factor,
+        ))
+    };
+    match read.await {
+        Ok(warnings) => {
+            for warning in &warnings {
+                tracing::warn!("{warning}");
+            }
+            warnings
+        }
+        Err(e) => {
+            let warning = format!("Could not check the keyspaces' replication: {e}");
+            tracing::warn!("{warning}");
+            vec![warning]
+        }
+    }
+}
+
+/// The warnings that `serve` logs at start-up for the deployment's keyspaces
+/// at another replication, for the integration tests.
+#[cfg(any(test, feature = "test-util"))]
+pub async fn startup_replication_warnings(
+    session: &CassandraSession,
+    cassandra_config: &CassandraStorageConfig,
+) -> Vec<String> {
+    warn_of_replication_mismatches(session, cassandra_config).await
+}
+
 fn server_components_factory(
     config: &dyn extenddb_storage::config::StorageConfig,
     region: &str,
@@ -316,11 +423,14 @@ fn server_components_factory(
             .instance_id
             .clone()
             .unwrap_or_else(|| "unknown".to_owned());
-        let registration = migrations::register_server(
+        // Every caller registers, a command too, so a migration does not run
+        // under one; a command's registration carries its own name.
+        let registration = migrations::register_server_as(
             status_session,
             &cassandra_config.keyspace_prefix,
             &host,
             options.release,
+            options.command.unwrap_or(migrations::SERVE_COMMAND),
         )
         .await
         .map_err(BackendError::Catalog)?;
@@ -337,17 +447,26 @@ fn server_components_factory(
             }
         };
 
+        if options.command.is_none() {
+            let _ = warn_of_replication_mismatches(engine.session(), cassandra_config).await;
+        }
+
         let control_plane_notify = engine.control_plane_notify.clone();
         let engine = Arc::new(engine);
 
-        match engine.process_control_plane_transitions().await {
-            Ok(ref t) if t.is_empty() => {}
-            Ok(transitions) => {
-                for (name, transition) in &transitions {
-                    tracing::info!("Recovered table '{name}': {transition}");
+        // The startup recovery is a server's; a command reading beside one,
+        // or one that writes beside the live servers (`backup purge`,
+        // `options.startup_recovery` off), leaves it to the server.
+        if !options.beside_server && options.startup_recovery {
+            match engine.process_control_plane_transitions().await {
+                Ok(ref t) if t.is_empty() => {}
+                Ok(transitions) => {
+                    for (name, transition) in &transitions {
+                        tracing::info!("Recovered table '{name}': {transition}");
+                    }
                 }
+                Err(e) => tracing::error!("Failed to recover control plane transitions: {e}"),
             }
-            Err(e) => tracing::error!("Failed to recover control plane transitions: {e}"),
         }
 
         // Load encryption key from catalog.
@@ -404,4 +523,144 @@ fn server_components_factory(
             runtime_hooks: Some(runtime_hooks),
         })
     })
+}
+
+#[cfg(test)]
+mod replication_warning_tests {
+    use super::replication_warnings;
+    use crate::migrations::ReplicationChange;
+    use std::collections::BTreeSet;
+
+    fn datacenters(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    fn mismatch(
+        keyspace: &str,
+        found: &str,
+        change: ReplicationChange,
+    ) -> (String, String, ReplicationChange) {
+        (keyspace.to_owned(), found.to_owned(), change)
+    }
+
+    /// Where `first` and `second` appear in `text`, in that order.
+    fn in_order(text: &str, first: &str, second: &str) -> bool {
+        matches!((text.find(first), text.find(second)), (Some(a), Some(b)) if a < b)
+    }
+
+    #[test]
+    fn no_mismatch_gives_no_warning() {
+        assert!(replication_warnings(&[], &datacenters(&["datacenter1"]), "dc2", 1).is_empty());
+    }
+
+    #[test]
+    fn a_datacenter_the_cluster_lacks_blames_the_config() {
+        let mismatches = [
+            mismatch(
+                "p_catalog",
+                "{'datacenter1': '1'}",
+                ReplicationChange::Other,
+            ),
+            mismatch(
+                "p_account_111111111111",
+                "{'datacenter1': '1'}",
+                ReplicationChange::Other,
+            ),
+        ];
+        let warnings = replication_warnings(
+            &mismatches,
+            &datacenters(&["datacenter1"]),
+            "datacenter2",
+            1,
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let warning = &warnings[0];
+        for part in [
+            "datacenter = \"datacenter2\"",
+            "datacenters are datacenter1",
+            "Set datacenter in [storage.cassandra]",
+            "p_catalog, p_account_111111111111",
+            "Do not change the keyspaces",
+        ] {
+            assert!(warning.contains(part), "{part}: {warning}");
+        }
+        assert!(!warning.contains("ALTER KEYSPACE"), "{warning}");
+    }
+
+    #[test]
+    fn each_keyspace_gets_both_fixes() {
+        let mismatches = [
+            mismatch(
+                "p_catalog",
+                "{'datacenter1': '1'}",
+                ReplicationChange::Raise,
+            ),
+            mismatch(
+                "p_account_111111111111",
+                "{'datacenter1': '1'}",
+                ReplicationChange::Raise,
+            ),
+        ];
+        let warnings = replication_warnings(
+            &mismatches,
+            &datacenters(&["datacenter1"]),
+            "datacenter1",
+            3,
+        );
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        for (warning, keyspace) in warnings.iter().zip(["p_catalog", "p_account_111111111111"]) {
+            for part in [
+                format!("Keyspace {keyspace} has replication {{'datacenter1': '1'}}"),
+                "If the keyspace is right, set replication_factor and datacenter".to_owned(),
+                "If the config is right,".to_owned(),
+            ] {
+                assert!(warning.contains(&part), "{part}: {warning}");
+            }
+        }
+    }
+
+    /// The steps for a raise repair after the ALTER, so the new replicas get
+    /// the data. The steps for a lower repair before it, so each remaining
+    /// replica holds every write. A move to another datacenter gets no ALTER
+    /// and repair steps: the new replicas have no copy to repair from.
+    #[test]
+    fn the_steps_keep_every_write_for_each_change() {
+        let warning = |found: &str, change, datacenter: &str, replication_factor| {
+            replication_warnings(
+                &[mismatch("p_catalog", found, change)],
+                &datacenters(&["dc1", "dc2"]),
+                datacenter,
+                replication_factor,
+            )
+            .remove(0)
+        };
+
+        let raise = warning("{'dc1': '1'}", ReplicationChange::Raise, "dc1", 3);
+        assert!(
+            in_order(&raise, "ALTER KEYSPACE", "nodetool repair -full"),
+            "{raise}"
+        );
+
+        let lower = warning("{'dc1': '3'}", ReplicationChange::Lower, "dc1", 1);
+        assert!(
+            in_order(&lower, "nodetool repair -full", "ALTER KEYSPACE")
+                && in_order(&lower, "ALTER KEYSPACE", "nodetool cleanup"),
+            "{lower}"
+        );
+
+        let other = warning("{'dc1': '3'}", ReplicationChange::Other, "dc2", 3);
+        assert!(!other.contains("nodetool repair"), "{other}");
+        assert!(
+            other.contains("as the Cassandra documentation describes"),
+            "{other}"
+        );
+
+        // Each change starts with stopping the servers.
+        for steps in [&raise, &lower, &other] {
+            assert!(
+                steps.contains("If the config is right, stop every ExtendDB server"),
+                "{steps}"
+            );
+        }
+    }
 }
