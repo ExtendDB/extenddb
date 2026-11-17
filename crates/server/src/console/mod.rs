@@ -87,8 +87,10 @@ pub struct ConsoleIdentity {
     pub csrf_token: String,
     /// Whether the session is an admin login (full management access) rather
     /// than an IAM user's self-service session. The session check admits
-    /// both; a page meant for admins answers 403 when this is false, as
-    /// `/console/settings` and `/console/cache` do.
+    /// both. A page meant for admins refuses an IAM-user session as the
+    /// built-in admin pages do: `/console/settings`, `/console/cache` and
+    /// `/console/metrics` redirect it to `/console`, and
+    /// `/console/metrics-data` answers 403.
     pub is_admin: bool,
     /// Every extension tab as `(label, href)`, for the navigation bar.
     pub tabs: Arc<[(String, String)]>,
@@ -137,10 +139,11 @@ pub async fn require_console_session(
 ) -> axum::response::Response {
     match pages::require_session(req.headers(), &state).await {
         Ok(session) => {
+            let nav = pages::identity_label(&session.identity);
             req.extensions_mut().insert(ConsoleIdentity {
-                label: pages::identity_label(&session.identity).label,
+                label: nav.label,
                 csrf_token: session.csrf_token,
-                is_admin: pages::is_admin(&session.identity),
+                is_admin: nav.is_admin,
                 tabs: Arc::clone(&state.tabs),
                 version_info: Arc::clone(&state.version_info),
             });
