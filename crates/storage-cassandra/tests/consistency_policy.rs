@@ -17,7 +17,8 @@ use std::path::{Path, PathBuf};
 
 /// Driver methods that send a statement or a batch, and what to use instead.
 /// [`forbidden`] matches each one as a method call (`.m(`), a method call
-/// with type arguments (`.m::<`), and a path call (`Session::m(&s, …)`).
+/// with type arguments (`.m::<`), a path call (`Session::m(&s, …)`), and a
+/// method taken as a value (`let send = Session::m;`).
 const SEND_METHODS: &[(&str, &str)] = &[
     ("query", "PolicySession::run"),
     ("query_with_values", "PolicySession::run"),
@@ -34,6 +35,12 @@ const SEND_METHODS: &[(&str, &str)] = &[
     ("exec_with_pager_state", "PolicySession::run"),
 ];
 
+/// The characters that can follow a method taken as a value, such as
+/// `Session::query_with_values;` or `.map(Session::query)`. The end of a line
+/// ends it too: rustfmt can put the method path last on a line. Text such as
+/// `cdrs_tokio::query::QueryBatch` continues with `::` and is not a method.
+const VALUE_END_CHARS: &str = ";,)]} \t";
+
 /// Other text that bypasses the policy, and what to use instead.
 const FORBIDDEN_TEXT: &[(&str, &str)] = &[
     ("StatementParamsBuilder::new(", "cassandra_util::params"),
@@ -48,13 +55,19 @@ const FORBIDDEN_TEXT: &[(&str, &str)] = &[
     ("Envelope::new_query(", "PolicySession::run"),
     ("BodyReqQuery::new(", "PolicySession::run"),
     ("BodyReqBatch::new(", "PolicySession::run_batch"),
-    // The driver function that sends a frame to the nodes of a query plan.
+    // The driver functions that send a frame to the nodes of a query plan,
+    // or to one connection.
     ("send_envelope(", "PolicySession::run"),
+    ("write_envelope(", "PolicySession::run"),
+    // The driver call that gives a raw connection to a node, and the
+    // constructor of a request frame that has no level checked.
+    ("persistent_connection(", "PolicySession::run"),
+    ("Envelope::new(", "PolicySession::run"),
 ];
 
 /// Text that contains a forbidden pattern but is the policy's own API. The
 /// scan blanks it out before it matches.
-const ALLOWED: &[&str] = &["cassandra_util::batch("];
+const ALLOWED: &[&str] = &["cassandra_util::batch(", "cassandra_util::batch;"];
 
 /// Each forbidden pattern, and what to use instead.
 fn forbidden() -> Vec<(String, &'static str)> {
@@ -63,6 +76,9 @@ fn forbidden() -> Vec<(String, &'static str)> {
         for form in [".{m}(", ".{m}::<", "::{m}(", "::{m}::<"] {
             patterns.push((form.replace("{m}", method), *instead));
         }
+        // A method taken as a value. The `$` ends the pattern: it matches
+        // only when [`VALUE_END_CHARS`] or the end of the line follows.
+        patterns.push((format!("::{method}$"), *instead));
     }
     for (text, instead) in FORBIDDEN_TEXT {
         patterns.push(((*text).to_owned(), *instead));
@@ -162,6 +178,29 @@ const KNOWN_BYPASSES: &[(&str, &str)] = &[
     (
         "send_envelope(plan.into_iter(), &envelope, true, retry).await",
         "send_envelope(",
+    ),
+    (
+        "connection.write_envelope(&envelope, false).await",
+        "write_envelope(",
+    ),
+    (
+        "let connection = node.persistent_connection().await?;",
+        "persistent_connection(",
+    ),
+    (
+        "let e = Envelope::new(version, flags, opcode, stream, body, tracing_id);",
+        "Envelope::new(",
+    ),
+    (
+        "let send = CassandraSession::query_with_values;",
+        "::query_with_values$",
+    ),
+    ("let send = Session::batch;", "::batch$"),
+    ("run_all(rows, Session::query)", "::query$"),
+    ("let f = (Session::exec, Session::paged);", "::exec$"),
+    (
+        "let f = [Session::query_with_params];",
+        "::query_with_params$",
     ),
 ];
 
@@ -287,45 +326,94 @@ fn raw_string_start(chars: &[char], i: usize) -> Option<usize> {
     (chars.get(i + 1 + hashes) == Some(&'"')).then_some(hashes)
 }
 
+/// The index after the string, raw string or char literal that starts at
+/// `chars[i]`, or `None` when no literal starts there. A `'` that starts a
+/// lifetime is not a literal.
+fn literal_end(chars: &[char], i: usize) -> Option<usize> {
+    if let Some(hashes) = raw_string_start(chars, i) {
+        let close: Vec<char> = std::iter::once('"')
+            .chain(std::iter::repeat_n('#', hashes))
+            .collect();
+        let mut j = i + 2 + hashes;
+        while j < chars.len() && !chars[j..].starts_with(&close) {
+            j += 1;
+        }
+        return Some((j + close.len()).min(chars.len()));
+    }
+    let is_char_literal =
+        chars[i] == '\'' && (chars.get(i + 2) == Some(&'\'') || chars.get(i + 1) == Some(&'\\'));
+    if chars[i] == '"' || is_char_literal {
+        let quote = chars[i];
+        let mut j = i + 1;
+        while j < chars.len() && chars[j] != quote {
+            j += if chars[j] == '\\' { 2 } else { 1 };
+        }
+        return Some((j + 1).min(chars.len()));
+    }
+    None
+}
+
 /// `code` with each `#[cfg(test)]` attribute followed by `mod NAME {` removed
-/// up to its closing brace, keeping the newlines.
+/// up to its closing brace, keeping the newlines. An attribute inside a
+/// string literal is not an attribute.
 fn without_test_modules(code: &str) -> String {
+    let attribute: Vec<char> = "#[cfg(test)]".chars().collect();
+    let chars: Vec<char> = code.chars().collect();
     let mut out = String::with_capacity(code.len());
-    let mut rest = code;
-    while let Some(at) = rest.find("#[cfg(test)]") {
-        let after = &rest[at + "#[cfg(test)]".len()..];
-        let is_module = after.trim_start().starts_with("mod ")
-            && after.find('{').is_some_and(|brace| {
-                after[..brace].trim_start().starts_with("mod ") && !after[..brace].contains(';')
-            });
-        if !is_module {
-            out.push_str(&rest[..at + "#[cfg(test)]".len()]);
-            rest = after;
+    let mut i = 0;
+    while i < chars.len() {
+        if let Some(end) = literal_end(&chars, i) {
+            out.extend(&chars[i..end]);
+            i = end;
             continue;
         }
-        out.push_str(&rest[..at]);
-        let open = after.find('{').expect("a module body");
-        let mut depth = 0_usize;
-        let mut end = after.len();
-        for (offset, c) in after[open..].char_indices() {
-            match c {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = open + offset + 1;
-                        break;
-                    }
-                }
-                _ => {}
+        if chars[i..].starts_with(&attribute) {
+            let after = i + attribute.len();
+            let rest: String = chars[after..].iter().collect();
+            let brace = rest.find('{');
+            let is_module = rest.trim_start().starts_with("mod ")
+                && brace.is_some_and(|brace| {
+                    rest[..brace].trim_start().starts_with("mod ") && !rest[..brace].contains(';')
+                });
+            if let (true, Some(brace)) = (is_module, brace) {
+                let open = after + rest[..brace].chars().count();
+                let end = open + block_len(&chars[open..]);
+                out.extend(chars[i..end].iter().filter(|c| **c == '\n'));
+                i = end;
+                continue;
             }
         }
-        let removed = &rest[at..at + "#[cfg(test)]".len() + end];
-        out.extend(removed.chars().filter(|c| *c == '\n'));
-        rest = &after[end..];
+        out.push(chars[i]);
+        i += 1;
     }
-    out.push_str(rest);
     out
+}
+
+/// The length in chars of the block that `chars` starts with: up to and
+/// including the `}` that closes its first `{`, or all of `chars` when no `}`
+/// does. A brace inside a string, a raw string or a char literal does not
+/// count. The text has no comments (see [`code_only`]).
+fn block_len(chars: &[char]) -> usize {
+    let mut depth = 0_usize;
+    let mut i = 0;
+    while i < chars.len() {
+        if let Some(end) = literal_end(chars, i) {
+            i = end;
+            continue;
+        }
+        match chars[i] {
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    chars.len()
 }
 
 /// Each forbidden call in `source`: its line number, the call, and what to
@@ -345,12 +433,26 @@ fn bypasses(source: &str) -> Vec<(usize, String, &'static str)> {
             line = line.replace(allowed, &" ".repeat(allowed.len()));
         }
         for (pattern, instead) in &patterns {
-            if line.contains(pattern.as_str()) {
+            if matches_pattern(&line, pattern) {
                 found.push((index + 1, pattern.clone(), *instead));
             }
         }
     }
     found
+}
+
+/// Whether `line` holds `pattern`. A pattern that ends in `$` must be
+/// followed by one of [`VALUE_END_CHARS`] or by the end of the line.
+fn matches_pattern(line: &str, pattern: &str) -> bool {
+    match pattern.strip_suffix('$') {
+        None => line.contains(pattern),
+        Some(prefix) => line.match_indices(prefix).any(|(at, _)| {
+            line[at + prefix.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| VALUE_END_CHARS.contains(c))
+        }),
+    }
 }
 
 fn exempt(relative: &str) -> bool {
@@ -413,7 +515,10 @@ fn each_exempt_path_exists() {
 #[test]
 fn the_scan_finds_each_forbidden_call() {
     for (call, _) in forbidden() {
-        let source = format!("fn f() {{\n    let x = y{call}a);\n}}\n");
+        let source = match call.strip_suffix('$') {
+            Some(prefix) => format!("fn f() {{\n    let x = y{prefix}\n}}\n"),
+            None => format!("fn f() {{\n    let x = y{call}a);\n}}\n"),
+        };
         let found = bypasses(&source);
         assert!(
             found.iter().any(|(line, c, _)| *line == 2 && *c == call),
@@ -436,7 +541,8 @@ fn the_scan_finds_each_known_bypass() {
 
 #[test]
 fn the_scan_allows_the_policy_batch_builder() {
-    let source = "fn f() {\n    let b = crate::cassandra_util::batch();\n    \
+    let source = "use crate::cassandra_util::batch;\nfn f() {\n    \
+                  let b = crate::cassandra_util::batch();\n    \
                   let c = cassandra_util::batch().add_query(q, v);\n}\n";
     assert_eq!(
         bypasses(source),
@@ -475,6 +581,80 @@ fn h() {
             .map(|(line, call, _)| (*line, call.as_str()))
             .collect::<Vec<_>>(),
         [(8, ".query("), (19, ".query_with_values(")],
+        "{found:?}"
+    );
+}
+
+#[test]
+fn a_brace_in_a_literal_does_not_hide_the_code_after_a_test_module() {
+    let source = r##"
+#[cfg(test)]
+mod tests {
+    fn g() { let a = "{"; let b = '{'; let c = r#"{ " {"#; let d = "\"{"; }
+}
+fn h() {
+    session.query("x");
+}
+"##;
+    let found = bypasses(source);
+    assert_eq!(
+        found
+            .iter()
+            .map(|(line, call, _)| (*line, call.as_str()))
+            .collect::<Vec<_>>(),
+        [(7, ".query(")],
+        "{found:?}"
+    );
+}
+
+#[test]
+fn a_brace_in_a_literal_does_not_end_a_test_module_early() {
+    let source = r##"
+#[cfg(test)]
+mod tests {
+    fn g() { let a = "}"; let b = '}'; let c = r#"} " }"#; session.query("x"); }
+}
+"##;
+    assert_eq!(bypasses(source), [], "the call is in the test module");
+}
+
+#[test]
+fn the_scan_finds_a_method_taken_as_a_value_at_the_end_of_a_line() {
+    // rustfmt writes a long `if` expression with the method on its own line.
+    let source = "fn f() {\n    let send = if paged {\n        \
+                  CassandraSession::query_with_values\n    } else {\n        \
+                  CassandraSession::query\n    };\n    \
+                  let all = [CassandraSession::batch];\n}\n";
+    let found = bypasses(source);
+    assert_eq!(
+        found
+            .iter()
+            .map(|(line, call, _)| (*line, call.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (3, "::query_with_values$"),
+            (5, "::query$"),
+            (7, "::batch$")
+        ],
+        "{found:?}"
+    );
+}
+
+#[test]
+fn a_test_module_attribute_inside_a_string_does_not_hide_the_code_after_it() {
+    let source = r##"
+const SAMPLE: &str = "#[cfg(test)] mod x {";
+fn h() {
+    session.query("x");
+}
+"##;
+    let found = bypasses(source);
+    assert_eq!(
+        found
+            .iter()
+            .map(|(line, call, _)| (*line, call.as_str()))
+            .collect::<Vec<_>>(),
+        [(4, ".query(")],
         "{found:?}"
     );
 }
