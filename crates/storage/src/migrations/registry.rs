@@ -45,10 +45,10 @@ macro_rules! migration_ids {
 }
 
 migration_ids! {
-    /// Creates the v1.0 schema on an empty store and brings every released
+    /// Creates the catalog schema on an empty store and brings every released
     /// catalog to it.
     Baseline = 1, "baseline",
-        "create the v1.0 catalog schema, or bring a released catalog to it";
+        "create the catalog schema, or bring a released catalog to it";
     /// Rewrites stored policies from `dynamodb:ResourceTag/<key>` to
     /// `aws:ResourceTag/<key>`.
     ResourceTagConditionKeys = 2, "resource_tag_condition_keys",

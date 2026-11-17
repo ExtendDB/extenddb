@@ -311,9 +311,23 @@ impl SqliteMigrations {
     ///
     /// As [`Runner::forget`]; the database is then as it was.
     pub(crate) async fn forget(&self, id: u32) -> Result<(), MigrationError> {
+        self.forget_with(&Runner::new(self, ""), id).await
+    }
+
+    /// [`SqliteMigrations::forget`] with `runner`, which a test gives
+    /// another released bound.
+    ///
+    /// # Errors
+    ///
+    /// As [`SqliteMigrations::forget`].
+    pub(crate) async fn forget_with(
+        &self,
+        runner: &Runner<'_, Self>,
+        id: u32,
+    ) -> Result<(), MigrationError> {
         in_transaction(
             self.exec("BEGIN IMMEDIATE"),
-            Runner::new(self, "").forget(id),
+            runner.forget(id),
             self.exec("COMMIT"),
             async {
                 let _ = self.exec("ROLLBACK").await;

@@ -98,7 +98,7 @@ side, build one binary per backend.
 
 ## Container Image
 
-Starting with ExtendDB 1.0, the `extenddb/extenddb-cassandra` image is
+From release 0.1.15 on, the `extenddb/extenddb-cassandra` image is
 published to Docker Hub, GHCR and ECR Public. It contains this build of
 ExtendDB and no Cassandra server, client or Java runtime; Cassandra stays a
 separate service. [`docker/README-cassandra.md`](../docker/README-cassandra.md) covers
