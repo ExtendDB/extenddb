@@ -146,10 +146,9 @@ fn signed_for_another_service_is_refused_by_the_service_check() {
     tally.report("signed_for_another_service_is_refused_by_the_service_check");
 }
 
-/// The HTTP layer routes only POST requests for `/` to `authenticate`, which
-/// passes POST, `/` and an empty query string to `verify_signature`. These
-/// calls pass other values to `verify_signature` to show the signature covers
-/// the method, the path and the query string.
+/// `authenticate` passes POST and the request's path and query string to
+/// `verify_signature`. These calls pass other values to `verify_signature`
+/// to show the signature covers the method, the path and the query string.
 #[test]
 fn method_path_and_query_string_are_covered_by_the_signature() {
     let mut tally = Tally::default();
@@ -175,7 +174,7 @@ fn method_path_and_query_string_are_covered_by_the_signature() {
                 ("method changed", "GET", "/", ""),
                 ("method changed", "PUT", "/", ""),
                 ("path changed", "POST", "/x", ""),
-                ("path changed", "POST", "//", ""),
+                ("path changed", "POST", "/ping", ""),
                 ("query string changed", "POST", "/", "a=b"),
                 ("query string changed", "POST", "/", "Action=ListTables"),
             ];

@@ -25,8 +25,35 @@ use crate::throttle_helpers::{
     update_throttle_buckets,
 };
 
+/// The answer to a request body that could not be read through the 16 MiB
+/// limit: over it, 413 `RequestEntityTooLargeException`; any other failure to
+/// read it, such as the body timeout or a body the client breaks off or
+/// frames wrongly, gets 408.
+pub(crate) fn body_refusal(
+    rejection: &axum::extract::rejection::BytesRejection,
+    request_id: &str,
+) -> Response {
+    if let axum::extract::rejection::BytesRejection::FailedToBufferBody(
+        axum::extract::rejection::FailedToBufferBody::LengthLimitError(_),
+    ) = rejection
+    {
+        return error_response(
+            &DynamoDbError::RequestEntityTooLargeException(
+                "Request size has exceeded the maximum allowed size".to_owned(),
+            ),
+            request_id,
+        );
+    }
+    (
+        axum::http::StatusCode::REQUEST_TIMEOUT,
+        [(axum::http::header::CONNECTION, "close")],
+        "request body was not received within the server's request timeout",
+    )
+        .into_response()
+}
+
 /// Main Virtual `DynamoDB` request handler.
-/// REQ-WIRE-001: Accept HTTP POST to `/`.
+/// REQ-WIRE-001: Accept HTTP POST at any path (`wire_routes` hands it here).
 /// REQ-WIRE-002: Parse X-Amz-Target header.
 /// SP-WIRE-007: Reject bodies exceeding 16 MB with `RequestEntityTooLargeException`.
 #[allow(clippy::too_many_lines)] // sequential request pipeline — splitting would obscure the flow
@@ -53,28 +80,10 @@ pub(crate) async fn handle_request(
     // A repeated `host` or `authorization` header was refused before routing
     // (see `repeated_headers`), so each is read as one value from here on.
 
-    // SP-WIRE-007: body limit exceeded → 413. Any other failure to read the
-    // body is the body timeout (the client stopped sending) → 408.
+    // SP-WIRE-007: `body_refusal` gives 413 over the limit and 408 otherwise.
     let body = match body {
         Ok(body) => body,
-        Err(axum::extract::rejection::BytesRejection::FailedToBufferBody(
-            axum::extract::rejection::FailedToBufferBody::LengthLimitError(_),
-        )) => {
-            return error_response(
-                &DynamoDbError::RequestEntityTooLargeException(
-                    "Request size has exceeded the maximum allowed size".to_owned(),
-                ),
-                &request_id,
-            );
-        }
-        Err(_) => {
-            return (
-                axum::http::StatusCode::REQUEST_TIMEOUT,
-                [(axum::http::header::CONNECTION, "close")],
-                "request body was not received within the server's request timeout",
-            )
-                .into_response();
-        }
+        Err(rejection) => return body_refusal(&rejection, &request_id),
     };
 
     // Extract operation from X-Amz-Target
@@ -110,7 +119,8 @@ pub(crate) async fn handle_request(
 
     // --- Auth segment ---
     let auth_start = std::time::Instant::now();
-    let identity = match state.auth.authenticate(&headers, &body).await {
+    let (path, query) = (uri.path(), uri.query().unwrap_or_default());
+    let identity = match state.auth.authenticate(path, query, &headers, &body).await {
         Ok(id) => id,
         Err(e) => return error_response(&e, &request_id),
     };

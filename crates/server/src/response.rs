@@ -3,14 +3,46 @@
 
 //! Wire-format response construction and error metrics recording.
 
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use extenddb_core::error::DynamoDbError;
 use serde_json::Value;
 
+/// REQ-WIRE-012: the media type of the API's answers.
+pub(crate) const AMZ_JSON_1_0: &str = "application/x-amz-json-1.0";
+
 /// Hardcoded fallback body for when response serialization itself fails.
 const SERIALIZATION_FAILURE_BODY: &[u8] =
     br#"{"__type":"com.amazonaws.dynamodb.v20120810#InternalServerError","message":"Internal error"}"#;
+
+/// An answer with the headers every answer of the service carries:
+/// REQ-WIRE-010 `x-amzn-RequestId` and REQ-WIRE-011 `x-amz-crc32` of `body`,
+/// and `content_type`, or no Content-Type when it is `None`.
+pub(crate) fn wire_response(
+    status: StatusCode,
+    content_type: Option<&'static str>,
+    body: Vec<u8>,
+    request_id: &str,
+) -> Response {
+    let crc = crc32fast::hash(&body);
+    let mut response = (
+        status,
+        [
+            ("x-amzn-RequestId", request_id),
+            ("x-amz-crc32", &crc.to_string()),
+        ],
+        body,
+    )
+        .into_response();
+    // A byte body comes with `application/octet-stream`; this replaces it.
+    let headers = response.headers_mut();
+    if let Some(content_type) = content_type {
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    } else {
+        headers.remove(header::CONTENT_TYPE);
+    }
+    response
+}
 
 /// REQ-WIRE-010: `x-amzn-RequestId` on every response.
 /// REQ-WIRE-011: `x-amz-crc32` checksum.
@@ -19,18 +51,7 @@ pub(crate) fn success_response(body: &Value, request_id: &str) -> Response {
     // Fix #8: Use fallback error body instead of empty bytes on serialization failure
     let body_bytes =
         serde_json::to_vec(body).unwrap_or_else(|_| SERIALIZATION_FAILURE_BODY.to_vec());
-    let crc = crc32fast::hash(&body_bytes);
-
-    (
-        StatusCode::OK,
-        [
-            ("content-type", "application/x-amz-json-1.0"),
-            ("x-amzn-RequestId", request_id),
-            ("x-amz-crc32", &crc.to_string()),
-        ],
-        body_bytes,
-    )
-        .into_response()
+    wire_response(StatusCode::OK, Some(AMZ_JSON_1_0), body_bytes, request_id)
 }
 
 /// REQ-ERR-001: `__type` with prefix. REQ-ERR-002: message field.
@@ -56,20 +77,10 @@ pub(crate) fn error_response(error: &DynamoDbError, request_id: &str) -> Respons
     }
     let body_bytes =
         serde_json::to_vec(&body).unwrap_or_else(|_| SERIALIZATION_FAILURE_BODY.to_vec());
-    let crc = crc32fast::hash(&body_bytes);
     let status =
         StatusCode::from_u16(error.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
-    (
-        status,
-        [
-            ("content-type", "application/x-amz-json-1.0"),
-            ("x-amzn-RequestId", request_id),
-            ("x-amz-crc32", &crc.to_string()),
-        ],
-        body_bytes,
-    )
-        .into_response()
+    wire_response(status, Some(AMZ_JSON_1_0), body_bytes, request_id)
 }
 
 /// Classify and record error metrics for a failed `DynamoDB` request.
