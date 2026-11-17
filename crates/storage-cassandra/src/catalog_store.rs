@@ -11,12 +11,16 @@ use std::sync::Arc;
 
 use cdrs_tokio::cluster::TcpConnectionManager;
 use cdrs_tokio::cluster::session::Session;
+use cdrs_tokio::consistency::Consistency;
 use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
 use cdrs_tokio::query_values;
 use cdrs_tokio::transport::TransportTcp;
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_storage::management_store::{OpError, OpResult};
+use extenddb_storage::secret_keys::SecretKeys;
 use futures::future::BoxFuture;
+
+use crate::management_store::secrets::{key_row_at_all, key_row_at_all_failed};
 
 type CassandraSession = Session<
     TransportTcp,
@@ -43,12 +47,16 @@ pub struct CassandraCatalogStore {
     replication: Option<String>,
     /// The release recorded in the ledger rows of a new account keyspace.
     release: String,
-    /// Cached encryption key (immutable after bootstrap). Avoids
-    /// per-request DB query on access key and assume-role operations.
-    encryption_key: Option<Arc<str>>,
+    /// The key holder that encrypts the stored secrets, shared with the
+    /// credential store; `None` for a store opened without a key, which
+    /// writes no credential.
+    keys: Option<Arc<SecretKeys>>,
     /// TTL in seconds applied to every metrics row on insert.
     /// Cassandra expires rows natively; `prune_metrics` is a no-op.
     metrics_ttl_seconds: i32,
+    /// Read the key rows at `ALL`, as a store opened for the encryption-key
+    /// commands does ([`Self::reading_key_rows_at_all`]).
+    key_rows_at_all: bool,
     /// The crash-and-rerun tests' request budget, shared with the migration
     /// backend, which fails a policy write once it is spent.
     #[cfg(any(test, feature = "test-util"))]
@@ -69,8 +77,9 @@ impl CassandraCatalogStore {
             keyspace_prefix,
             replication: Some(network_topology(&datacenter, replication_factor)),
             release: env!("CARGO_PKG_VERSION").to_owned(),
-            encryption_key: None,
+            keys: None,
             metrics_ttl_seconds: 86400,
+            key_rows_at_all: false,
             #[cfg(any(test, feature = "test-util"))]
             stop_after: None,
         }
@@ -87,11 +96,22 @@ impl CassandraCatalogStore {
             keyspace_prefix,
             replication: None,
             release: env!("CARGO_PKG_VERSION").to_owned(),
-            encryption_key: None,
+            keys: None,
             metrics_ttl_seconds: 86400,
+            key_rows_at_all: false,
             #[cfg(any(test, feature = "test-util"))]
             stop_after: None,
         }
+    }
+
+    /// Read the key rows (the key ring, the catalog key and `catalog_id`)
+    /// at `ALL`, as the encryption-key commands do: the stores of the
+    /// migration lock and the stores opened from a connection string.
+    /// The server's store reads them at `ONE` at startup.
+    #[must_use]
+    pub(crate) fn reading_key_rows_at_all(mut self) -> Self {
+        self.key_rows_at_all = true;
+        self
     }
 
     /// Share the crash-and-rerun tests' request budget: each policy write
@@ -134,37 +154,18 @@ impl CassandraCatalogStore {
         self
     }
 
-    /// Create a new catalog store with a pre-loaded encryption key.
+    /// Hold the key holder the factory loaded, shared with the credential
+    /// store. Without one the store writes no credential.
     #[must_use]
-    pub fn with_encryption_key(
-        session: Arc<CassandraSession>,
-        keyspace_prefix: String,
-        datacenter: String,
-        replication_factor: u32,
-        encryption_key: String,
-    ) -> Self {
-        Self {
-            session,
-            keyspace_prefix,
-            replication: Some(network_topology(&datacenter, replication_factor)),
-            release: env!("CARGO_PKG_VERSION").to_owned(),
-            encryption_key: Some(Arc::from(encryption_key.as_str())),
-            metrics_ttl_seconds: 86400,
-            #[cfg(any(test, feature = "test-util"))]
-            stop_after: None,
-        }
+    pub fn with_secret_keys(mut self, keys: Option<Arc<SecretKeys>>) -> Self {
+        self.keys = keys;
+        self
     }
 
     /// Borrow the underlying session (escape hatch for callers not yet migrated).
     #[must_use]
     pub fn session(&self) -> &Arc<CassandraSession> {
         &self.session
-    }
-
-    /// Get the cached encryption key. Returns `None` if not loaded at startup.
-    #[must_use]
-    pub fn encryption_key(&self) -> Option<&Arc<str>> {
-        self.encryption_key.as_ref()
     }
 
     /// Get the catalog keyspace name.
@@ -291,16 +292,27 @@ impl extenddb_storage::management_store::SettingsStore for CassandraCatalogStore
         let key = key.to_string();
         let session = self.session.clone();
         let catalog_keyspace = self.catalog_keyspace();
+        let at_all = key_row_at_all(&key, false, self.key_rows_at_all);
         Box::pin(async move {
             let query = format!("SELECT value FROM {catalog_keyspace}.settings WHERE key = ?");
+            let values = query_values!(key.as_str());
 
-            let row = crate::cassandra_util::query_optional(
-                &session,
-                &query,
-                query_values!(key.as_str()),
-                "get_setting",
-            )
-            .await?;
+            let row = if at_all {
+                let rows: Vec<cdrs_tokio::types::rows::Row> =
+                    crate::cassandra_util::query_rows_at::<OpError>(
+                        &session,
+                        &query,
+                        values,
+                        Consistency::All,
+                        "get_setting",
+                    )
+                    .await
+                    .map_err(|e| key_row_at_all_failed("get_setting", &key, e.message()))?;
+                rows.into_iter().next()
+            } else {
+                crate::cassandra_util::query_optional(&session, &query, values, "get_setting")
+                    .await?
+            };
 
             if let Some(row) = row {
                 let value: String =
@@ -317,18 +329,36 @@ impl extenddb_storage::management_store::SettingsStore for CassandraCatalogStore
         let value = value.to_string();
         let session = self.session.clone();
         let catalog_keyspace = self.catalog_keyspace();
+        let at_all = key_row_at_all(&key, true, self.key_rows_at_all);
         Box::pin(async move {
             let query =
                 format!("INSERT INTO {catalog_keyspace}.settings (key, value) VALUES (?, ?)");
+            let values = query_values!(key.as_str(), value.as_str());
 
-            crate::cassandra_util::execute(
-                &session,
-                &query,
-                query_values!(key.as_str(), value.as_str()),
-                "set_setting",
-            )
-            .await
+            if at_all {
+                crate::cassandra_util::execute_at::<OpError>(
+                    &session,
+                    &query,
+                    values,
+                    Consistency::All,
+                    "set_setting",
+                )
+                .await
+                .map_err(|e| key_row_at_all_failed("set_setting", &key, e.message()))
+            } else {
+                crate::cassandra_util::execute(&session, &query, values, "set_setting").await
+            }
         })
+    }
+
+    fn replace_setting(
+        &self,
+        key: &str,
+        expected: &str,
+        value: &str,
+    ) -> BoxFuture<'_, OpResult<bool>> {
+        let (key, expected, value) = (key.to_owned(), expected.to_owned(), value.to_owned());
+        Box::pin(async move { self.replace_setting_impl(&key, &expected, &value).await })
     }
 
     fn list_settings(&self) -> BoxFuture<'_, OpResult<Vec<(String, String)>>> {
@@ -361,12 +391,6 @@ impl extenddb_storage::management_store::SettingsStore for CassandraCatalogStore
             settings.sort_by(|a, b| a.0.cmp(&b.0));
             Ok(settings)
         })
-    }
-
-    fn cached_encryption_key(&self) -> Option<String> {
-        self.encryption_key
-            .as_ref()
-            .map(std::string::ToString::to_string)
     }
 }
 
@@ -427,6 +451,7 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for CassandraCatalogStore {
 
     fn test_data_database_connection(
         &self,
+        _key: &extenddb_storage::server_components::KeySource,
     ) -> BoxFuture<'_, extenddb_storage::diagnostics::DiagResult<String>> {
         let session = self.session.clone();
         let catalog_keyspace = self.catalog_keyspace();
@@ -754,9 +779,7 @@ impl MetricsStore for CassandraCatalogStore {
 }
 
 impl extenddb_storage::CatalogStore for CassandraCatalogStore {
-    fn cached_encryption_key(&self) -> Option<String> {
-        self.encryption_key
-            .as_ref()
-            .map(std::string::ToString::to_string)
+    fn secret_keys(&self) -> Option<&SecretKeys> {
+        self.keys.as_deref()
     }
 }

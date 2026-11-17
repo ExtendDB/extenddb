@@ -3,48 +3,38 @@
 
 //! Access-key management for `SqliteCatalogStore`, including key generation.
 //!
-//! Secrets are encrypted with the catalog encryption key before storage by
-//! `extenddb_storage::secret_cipher`. The ciphertext layout is
-//! `nonce(12) || ciphertext || tag(16)`, with the `access_key_id` bound as
-//! additional authenticated data (AAD) so a stored secret cannot be
-//! transplanted onto a different key id.
+//! Secrets are encrypted before storage with the store's key holder
+//! (`extenddb_storage::secret_keys`). The ciphertext layout is
+//! `nonce(12) || ciphertext || tag(16)`, with the row bound as additional
+//! authenticated data (AAD) so a stored secret cannot be transplanted onto
+//! another row.
 
+use extenddb_storage::CatalogStore as _;
 use extenddb_storage::management_store::{AccessKeyCreated, OpError, OpResult};
-use extenddb_storage::secret_cipher::encrypt_secret;
+use extenddb_storage::secret_keys::{SecretRow, require_keys};
 use time::OffsetDateTime;
 
 use crate::catalog_store::SqliteCatalogStore;
 use crate::sqlite_util::{is_fk_violation, is_unique_violation, parse_timestamp};
 
 impl SqliteCatalogStore {
-    /// Resolve the AES-256-GCM encryption key (base64), preferring the cached
-    /// value and falling back to the `settings` table.
-    async fn resolve_encryption_key(&self) -> OpResult<String> {
-        if let Some(k) = self.encryption_key() {
-            return Ok(k.to_string());
-        }
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT value FROM settings WHERE key = 'encryption_key'")
-                .fetch_optional(self.pool())
-                .await
-                .map_err(|e| OpError::Internal(format!("fetch encryption key: {e}")))?;
-        row.map(|(v,)| v)
-            .ok_or_else(|| OpError::Internal("Encryption key not configured".to_owned()))
-    }
-
     pub(crate) async fn create_access_key_impl(
         &self,
         account_id: &str,
         user_name: &str,
     ) -> OpResult<AccessKeyCreated> {
-        let enc_key = self.resolve_encryption_key().await?;
+        let keys = require_keys(self.secret_keys())?;
         let access_key_id = generate_access_key_id();
         let secret_access_key = generate_secret_key();
-        let encrypted = encrypt_secret(&secret_access_key, &enc_key, &access_key_id)
+        let encrypted = keys
+            .encrypt(
+                &SecretRow::access_key(&access_key_id, account_id, user_name),
+                &secret_access_key,
+            )
             .map_err(|e| OpError::Internal(format!("encrypt secret: {e}")))?;
 
-        // D1: every writer holds the write lock. Key generation, encryption,
-        // and the encryption-key read above all run before it.
+        // D1: every writer holds the write lock. Key generation and
+        // encryption above run before it.
         let _writer = self.lock_writes().await;
         sqlx::query(
             "INSERT INTO access_keys \
@@ -135,12 +125,16 @@ impl SqliteCatalogStore {
         access_key_id: &str,
         secret_access_key: &str,
     ) -> OpResult<()> {
-        let enc_key = self.resolve_encryption_key().await?;
-        let encrypted = encrypt_secret(secret_access_key, &enc_key, access_key_id)
+        let keys = require_keys(self.secret_keys())?;
+        let encrypted = keys
+            .encrypt(
+                &SecretRow::access_key(access_key_id, account_id, user_name),
+                secret_access_key,
+            )
             .map_err(|e| OpError::Internal(format!("encrypt secret: {e}")))?;
 
-        // D1: every writer holds the write lock. Encryption and the
-        // encryption-key read above run before it.
+        // D1: every writer holds the write lock. Encryption above runs
+        // before it.
         let _writer = self.lock_writes().await;
         sqlx::query(
             "INSERT INTO access_keys \

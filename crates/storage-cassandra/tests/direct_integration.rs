@@ -60,6 +60,8 @@ mod query;
 mod roles;
 #[path = "direct/scan.rs"]
 mod scan;
+#[path = "direct/secret_rows.rs"]
+mod secret_rows;
 #[path = "direct/settings_store.rs"]
 mod settings_store;
 #[path = "direct/snapshot_engine.rs"]

@@ -111,31 +111,34 @@ pub async fn query_rows<E: FromDbError>(
     Ok(body.into_rows().unwrap_or_default())
 }
 
-/// Execute a query at `LOCAL_QUORUM` and return all rows.
+/// Execute a query at `consistency` and return all rows.
 ///
-/// [`query_rows`] uses the driver's default consistency, which is `ONE`. Use
-/// this instead wherever an *empty* result is treated as authoritative and acted
-/// on destructively: at `ONE` a replica that has not yet received a write reads
-/// as empty, and a decision made on that read cannot be undone by a timestamp
-/// guard, because the write it missed is older than the guard.
-pub async fn query_rows_quorum<E: FromDbError>(
+/// [`query_rows`] uses the driver's default consistency, which is `ONE`. Name
+/// the consistency wherever an *empty* result is treated as authoritative and
+/// acted on destructively: at `ONE` a replica that has not yet received a
+/// write reads as empty, and a decision made on that read cannot be undone by
+/// a timestamp guard, because the write it missed is older than the guard.
+///
+/// # Errors
+/// Returns an error if the Cassandra query fails or the response cannot be parsed.
+pub async fn query_rows_at<E: FromDbError>(
     session: &Arc<CassandraSession>,
     query: &str,
     values: QueryValues,
+    consistency: cdrs_tokio::consistency::Consistency,
     context: &str,
 ) -> Result<Vec<Row>, E> {
-    use cdrs_tokio::consistency::Consistency;
     use cdrs_tokio::statement::StatementParamsBuilder;
 
     let params = StatementParamsBuilder::new()
-        .with_consistency(Consistency::LocalQuorum)
+        .with_consistency(consistency)
         .with_values(values)
         .build();
     let result = session
         .query_with_params(query, params)
         .await
         .map_err(|e| {
-            tracing::error!("{context} quorum query failed: {e}");
+            tracing::error!("{context} query at {consistency} failed: {e}");
             E::db_error(format!("{context}: {e}"))
         })?;
 
@@ -145,6 +148,23 @@ pub async fn query_rows_quorum<E: FromDbError>(
     })?;
 
     Ok(body.into_rows().unwrap_or_default())
+}
+
+/// [`query_rows_at`] at `LOCAL_QUORUM`.
+pub async fn query_rows_quorum<E: FromDbError>(
+    session: &Arc<CassandraSession>,
+    query: &str,
+    values: QueryValues,
+    context: &str,
+) -> Result<Vec<Row>, E> {
+    query_rows_at(
+        session,
+        query,
+        values,
+        cdrs_tokio::consistency::Consistency::LocalQuorum,
+        context,
+    )
+    .await
 }
 
 /// Execute a query at `LOCAL_SERIAL` and return all rows: the read sees
@@ -217,34 +237,51 @@ pub async fn execute<E: FromDbError>(
     Ok(())
 }
 
-/// Execute a non-query statement at `LOCAL_QUORUM`.
+/// Execute a non-query statement at `consistency`.
 ///
-/// Use this for writes that are prerequisites for a later quorum operation or
-/// whose loss would make an absence decision unsafe.
+/// Name the consistency for writes that are prerequisites for a later read
+/// at that consistency, or whose loss would make an absence decision unsafe.
 ///
 /// # Errors
-/// Returns an error if Cassandra does not acknowledge the statement at quorum.
-pub async fn execute_quorum<E: FromDbError>(
+/// Returns an error if Cassandra does not acknowledge the statement at `consistency`.
+pub async fn execute_at<E: FromDbError>(
     session: &Arc<CassandraSession>,
     query: &str,
     values: QueryValues,
+    consistency: cdrs_tokio::consistency::Consistency,
     context: &str,
 ) -> Result<(), E> {
-    use cdrs_tokio::consistency::Consistency;
     use cdrs_tokio::statement::StatementParamsBuilder;
 
     let params = StatementParamsBuilder::new()
-        .with_consistency(Consistency::LocalQuorum)
+        .with_consistency(consistency)
         .with_values(values)
         .build();
     session
         .query_with_params(query, params)
         .await
         .map_err(|error| {
-            tracing::error!("{context} quorum execute failed: {error}");
+            tracing::error!("{context} execute at {consistency} failed: {error}");
             E::db_error(format!("{context}: {error}"))
         })?;
     Ok(())
+}
+
+/// [`execute_at`] at `LOCAL_QUORUM`.
+pub async fn execute_quorum<E: FromDbError>(
+    session: &Arc<CassandraSession>,
+    query: &str,
+    values: QueryValues,
+    context: &str,
+) -> Result<(), E> {
+    execute_at(
+        session,
+        query,
+        values,
+        cdrs_tokio::consistency::Consistency::LocalQuorum,
+        context,
+    )
+    .await
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -414,18 +451,42 @@ pub async fn apply_lwt_quorum<E: FromDbError>(
     values: QueryValues,
     context: &str,
 ) -> Result<bool, E> {
+    apply_lwt_at(
+        session,
+        query,
+        values,
+        cdrs_tokio::consistency::Consistency::LocalQuorum,
+        context,
+    )
+    .await
+}
+
+/// [`apply_lwt`] with the commit phase at `consistency` and the serial phase
+/// at `SERIAL`.
+///
+/// # Errors
+/// Returns an error if Cassandra does not acknowledge the statement at
+/// `consistency` or the response cannot be parsed.
+pub async fn apply_lwt_at<E: FromDbError>(
+    session: &Arc<CassandraSession>,
+    query: &str,
+    values: QueryValues,
+    consistency: cdrs_tokio::consistency::Consistency,
+    context: &str,
+) -> Result<bool, E> {
     use cdrs_tokio::consistency::Consistency;
     use cdrs_tokio::statement::StatementParamsBuilder;
 
     let params = StatementParamsBuilder::new()
-        .with_consistency(Consistency::LocalQuorum)
+        .with_consistency(consistency)
+        .with_serial_consistency(Consistency::Serial)
         .with_values(values)
         .build();
     let result = session
         .query_with_params(query, params)
         .await
         .map_err(|e| {
-            tracing::error!("{context} quorum lwt failed: {e}");
+            tracing::error!("{context} lwt at {consistency} failed: {e}");
             E::db_error("Database error".to_owned())
         })?;
     lwt_applied_flag(&result, context)
