@@ -2195,7 +2195,7 @@ pub mod store_identity;
 pub mod store_maintenance;
 pub mod sync;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use pitr::refuse_before_authorization as refuse_point_in_time_recovery;
 pub(crate) use pitr::{

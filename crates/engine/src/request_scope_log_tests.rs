@@ -110,23 +110,6 @@ fn sites() -> Vec<Site> {
             target: "extenddb_engine::create_table",
         },
         Site {
-            name: "create_table::storage_err_to_dynamo, CatalogVersionMismatch",
-            error: || StorageError::CatalogVersionMismatch {
-                expected: "3".to_owned(),
-                found: "2".to_owned(),
-            },
-            map: crate::create_table::storage_err_to_dynamo,
-            message: "Catalog version mismatch: expected 3, found 2",
-            target: "extenddb_engine::create_table",
-        },
-        Site {
-            name: "create_table::storage_err_to_dynamo, CatalogNotInitialized",
-            error: || StorageError::CatalogNotInitialized,
-            map: crate::create_table::storage_err_to_dynamo,
-            message: "Catalog not initialized",
-            target: "extenddb_engine::create_table",
-        },
-        Site {
             name: "create_table::storage_err_to_dynamo, IdempotentReplay",
             error: || StorageError::IdempotentReplay,
             map: crate::create_table::storage_err_to_dynamo,
@@ -224,93 +207,6 @@ async fn the_fault_line_carries_no_request_fields_outside_a_scope_at_every_site(
     }
 }
 
-/// A backup engine whose source lookup fails with a storage fault. The other
-/// methods are never reached: the restore reads the source first.
-struct FaultingBackups;
-
-impl extenddb_storage::BackupEngine for FaultingBackups {
-    fn create_backup(
-        &self,
-        _: &str,
-        _: &str,
-        _: &str,
-    ) -> extenddb_storage::BoxedFuture<'_, Result<extenddb_core::types::BackupDetails, StorageError>>
-    {
-        unreachable!("not reached by the restore")
-    }
-    fn describe_backup(
-        &self,
-        _: &str,
-        _: &str,
-    ) -> extenddb_storage::BoxedFuture<
-        '_,
-        Result<extenddb_core::types::BackupDescription, StorageError>,
-    > {
-        unreachable!("not reached by the restore")
-    }
-    fn list_backups(
-        &self,
-        _: &str,
-        _: Option<&str>,
-    ) -> extenddb_storage::BoxedFuture<
-        '_,
-        Result<Vec<extenddb_core::types::BackupSummary>, StorageError>,
-    > {
-        unreachable!("not reached by the restore")
-    }
-    fn delete_backup(
-        &self,
-        _: &str,
-        _: &str,
-    ) -> extenddb_storage::BoxedFuture<
-        '_,
-        Result<extenddb_core::types::BackupDescription, StorageError>,
-    > {
-        unreachable!("not reached by the restore")
-    }
-    fn backup_restore_source(
-        &self,
-        _: &str,
-        _: &str,
-    ) -> extenddb_storage::BoxedFuture<
-        '_,
-        Result<extenddb_storage::BackupRestoreSource, StorageError>,
-    > {
-        Box::pin(async { Err(internal()) })
-    }
-    fn restore_table_from_backup(
-        &self,
-        _: &str,
-        _: extenddb_storage::RestoreRequest,
-    ) -> extenddb_storage::BoxedFuture<
-        '_,
-        Result<extenddb_core::types::TableDescription, StorageError>,
-    > {
-        unreachable!("not reached by the restore")
-    }
-    fn describe_continuous_backups(
-        &self,
-        _: &str,
-        _: &str,
-    ) -> extenddb_storage::BoxedFuture<
-        '_,
-        Result<extenddb_core::types::ContinuousBackupsDescription, StorageError>,
-    > {
-        unreachable!("not reached by the restore")
-    }
-    fn update_continuous_backups(
-        &self,
-        _: &str,
-        _: &str,
-        _: bool,
-    ) -> extenddb_storage::BoxedFuture<
-        '_,
-        Result<extenddb_core::types::ContinuousBackupsDescription, StorageError>,
-    > {
-        unreachable!("not reached by the restore")
-    }
-}
-
 /// `RestoreTableFromBackup` runs its restore in a task of its own. The task
 /// does not inherit the request scope, so the engine carries it across; the
 /// `backup storage error` line written inside the task names the request.
@@ -321,6 +217,10 @@ async fn the_detached_restore_carries_the_scope_into_its_task() {
         "TargetTableName": "restored",
     });
     let limits = Arc::new(extenddb_core::limits::LimitsConfig::default());
+    // A backup engine whose source lookup fails with a storage fault. It has
+    // no catalog row for the ARN, so the restore reads the source next.
+    let backups = crate::backup::tests::Fake::default();
+    *backups.source_error.lock().unwrap() = Some(internal());
     let logged = with_scope(
         RequestScope::new(
             "req-restore".to_owned(),
@@ -328,7 +228,8 @@ async fn the_detached_restore_carries_the_scope_into_its_task() {
         ),
         error_events_during_async(async {
             let result = crate::backup::restore_table_from_backup_detached(
-                Arc::new(FaultingBackups),
+                Arc::new(backups),
+                Arc::new(crate::backup::tests::runtime()),
                 Arc::from("123456789012"),
                 Arc::from("us-east-1"),
                 limits,

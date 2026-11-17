@@ -57,7 +57,7 @@ fn source_arn() -> String {
 // --- double -----------------------------------------------------------------
 
 #[derive(Default)]
-struct Fake {
+pub(crate) struct Fake {
     /// Cancelled by `list_dead_restore_jobs`: a token that fires in the
     /// middle of a cycle, after its store check.
     cancel_on_list_dead: Mutex<Option<extenddb_storage::CancellationToken>>,
@@ -66,7 +66,7 @@ struct Fake {
     summaries: Mutex<Vec<BackupSummary>>,
     restore_error: Mutex<Option<StorageError>>,
     /// Returned (once) by `restore_source` instead of the stored source.
-    source_error: Mutex<Option<StorageError>>,
+    pub(crate) source_error: Mutex<Option<StorageError>>,
     restores: Mutex<Vec<RestoreRequest>>,
     /// The permits the legacy restore and create were handed, held as the
     /// backend would hold them for the job's life.
@@ -1009,7 +1009,7 @@ fn unused<T: Send + 'static>() -> BoxedFuture<'static, Result<T, StorageError>> 
 }
 
 /// The runtime the tests run with: four slots, no configured store.
-fn runtime() -> BackupRuntime {
+pub(crate) fn runtime() -> BackupRuntime {
     BackupRuntime::new(4)
 }
 
