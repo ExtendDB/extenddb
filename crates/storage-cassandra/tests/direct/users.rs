@@ -176,7 +176,7 @@ mod tests {
 
         // Need encryption key for access keys
         use extenddb_storage::bootstrapper::helpers::generate_encryption_key;
-        let enc_key = generate_encryption_key();
+        let enc_key = generate_encryption_key().expect("generate key");
         let catalog_store = extenddb_storage_cassandra::CassandraCatalogStore::with_encryption_key(
             engine.session_arc(),
             config.keyspace_prefix.clone(),
@@ -421,6 +421,84 @@ mod tests {
                 println!("✓ Change password for non-existent user correctly rejected");
             }
             other => panic!("Expected NotFound, got: {:?}", other),
+        }
+    }
+
+    /// Every check runs one bcrypt verification: against the user's hash
+    /// when the user has a console password, and against the fixed hash at
+    /// the default cost for a user without one, an unknown user and an
+    /// unknown account.
+    #[tokio::test]
+    async fn an_unknown_user_or_one_without_a_password_runs_one_bcrypt_check() {
+        use extenddb_storage::password::count_verifications;
+
+        if crate::helpers::skip_without_cassandra() {
+            return;
+        }
+        let engine = setup_engine().await;
+        let config = test_config();
+        let catalog_store = crate::helpers::create_catalog_store(&engine, &config);
+
+        let account_id = unique_test_account();
+        let missing_account = unique_test_account();
+        catalog_store
+            .create_account(&account_id, &format!("TestAccount_{}", unique_test_id()))
+            .await
+            .expect("Failed to create account");
+        // bcrypt's lowest cost keeps the test fast and tells a check against
+        // this hash apart from one against the fixed hash.
+        let test_cost = 4;
+        let hash = bcrypt::hash("correct horse", test_cost).expect("Failed to hash password");
+        catalog_store
+            .create_user(&account_id, "alice", Some(&hash))
+            .await
+            .expect("Failed to create user with password");
+        catalog_store
+            .create_user(&account_id, "bob", None)
+            .await
+            .expect("Failed to create user without password");
+
+        let (right, right_costs) = count_verifications(catalog_store.verify_iam_user_password(
+            &account_id,
+            "alice",
+            "correct horse",
+        ))
+        .await;
+        assert!(right.expect("Failed to verify password"));
+        assert_eq!(right_costs, [test_cost]);
+
+        // The cost of the one check each refused login runs: alice's hash
+        // for her wrong password, the fixed hash for the others.
+        let cases = [
+            (account_id.as_str(), "alice", test_cost, "wrong password"),
+            (
+                account_id.as_str(),
+                "bob",
+                bcrypt::DEFAULT_COST,
+                "user without a console password",
+            ),
+            (
+                account_id.as_str(),
+                "nobody",
+                bcrypt::DEFAULT_COST,
+                "unknown user",
+            ),
+            (
+                missing_account.as_str(),
+                "alice",
+                bcrypt::DEFAULT_COST,
+                "unknown account",
+            ),
+        ];
+        for (account, user_name, cost, case) in cases {
+            let (verified, costs) = count_verifications(catalog_store.verify_iam_user_password(
+                account,
+                user_name,
+                "battery staple",
+            ))
+            .await;
+            assert!(!verified.expect("Failed to verify password"), "{case}");
+            assert_eq!(costs, [cost], "{case}: bcrypt checks and their cost");
         }
     }
 }

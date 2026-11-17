@@ -524,9 +524,14 @@ impl SqliteEngine {
         table_id: &str,
         index_name: &str,
     ) -> Result<IndexInfo, StorageError> {
+        // A GSI still being built is not readable: its table is partial, or not
+        // there yet (a Query hit it with a 500 on main). The service answers a
+        // Query or Scan naming one with "The table does not have the specified
+        // index", the same as for no index at all, which is what `IndexNotFound`
+        // becomes on the wire.
         let row: Option<(String, String, String, String)> = sqlx::query_as(
             "SELECT index_type, index_id, key_schema, projection \
-             FROM indexes WHERE table_id = ? AND index_name = ?",
+             FROM indexes WHERE table_id = ? AND index_name = ? AND index_status <> 'CREATING'",
         )
         .bind(table_id)
         .bind(index_name)

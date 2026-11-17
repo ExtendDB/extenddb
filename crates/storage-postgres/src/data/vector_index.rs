@@ -41,6 +41,7 @@ use extenddb_storage::vector_lifecycle::{
 use pgvector::Vector;
 
 use super::{all_sort_key_info, vector_table_name};
+use crate::catalog_json::from_catalog_json;
 
 /// Read the vector index metadata for a table from the catalog.
 ///
@@ -74,14 +75,14 @@ where
 
     let mut out = Vec::with_capacity(rows.len());
     for (index_id, dimensions, vector_attribute, search_schema, projection, index_status) in rows {
-        let attr: extenddb_core::types::VectorAttribute = serde_json::from_value(vector_attribute)
+        let attr: extenddb_core::types::VectorAttribute = from_catalog_json(vector_attribute)
             .map_err(|e| StorageError::Internal(format!("vector_attribute: {e}")))?;
         let search_schema: Vec<extenddb_core::types::SearchSchemaElement> = match search_schema {
-            Some(value) => serde_json::from_value(value)
+            Some(value) => from_catalog_json(value)
                 .map_err(|e| StorageError::Internal(format!("vector search_schema: {e}")))?,
             None => Vec::new(),
         };
-        let projection: extenddb_core::types::Projection = serde_json::from_value(projection)
+        let projection: extenddb_core::types::Projection = from_catalog_json(projection)
             .map_err(|e| StorageError::Internal(format!("vector projection: {e}")))?;
         let hash_attribute_name = search_schema
             .iter()
@@ -865,9 +866,18 @@ async fn sweep_orphan_holds(
     engine: &crate::PostgresEngine,
     live: &[String],
 ) -> Result<(), StorageError> {
+    // A hold whose index_id is its own table_id is the control plane stopping
+    // the queue while it drops a DELETING table (`drop_table_storage`). The
+    // drop runs within a one-second budget, so a hold that is still there
+    // after one was left by a process that died mid-drop; it gets the longer
+    // age all the same, since sweeping a live one only makes workers claim
+    // rows they then time out on.
     let swept = sqlx::query(
         "DELETE FROM vector_index_holds \
-         WHERE NOT (index_id = ANY($1)) AND created_at < NOW() - INTERVAL '1 minute'",
+         WHERE NOT (index_id = ANY($1)) \
+           AND created_at < NOW() - CASE WHEN index_id = table_id \
+                                         THEN INTERVAL '10 minutes' \
+                                         ELSE INTERVAL '1 minute' END",
     )
     .bind(live)
     .execute(&engine.data_pool)
@@ -982,7 +992,7 @@ pub async fn build_ownership(data: &sqlx::PgPool, index_id: &str) -> Option<Buil
     let mut conn = match <sqlx::PgConnection as sqlx::Connection>::connect_with(&options).await {
         Ok(conn) => conn,
         Err(e) => {
-            tracing::warn!("could not open a session for vector build ownership: {e}");
+            tracing::warn!("could not open a session for index build ownership: {e}");
             return None;
         }
     };
@@ -998,7 +1008,7 @@ pub async fn build_ownership(data: &sqlx::PgPool, index_id: &str) -> Option<Buil
         Ok(true) => Some(BuildOwner { _conn: conn }),
         Ok(false) => None,
         Err(e) => {
-            tracing::warn!("vector build ownership probe failed: {e}");
+            tracing::warn!("index build ownership probe failed: {e}");
             None
         }
     }
@@ -1086,10 +1096,8 @@ pub async fn rebuild_stuck_vector_indexes(
             );
             continue;
         };
-        let base_key_schema: Vec<KeySchemaElement> =
-            serde_json::from_value(ks_json).map_err(|e| StorageError::Internal(e.to_string()))?;
-        let attribute_definitions: Vec<AttributeDefinition> =
-            serde_json::from_value(ad_json).map_err(|e| StorageError::Internal(e.to_string()))?;
+        let base_key_schema: Vec<KeySchemaElement> = from_catalog_json(ks_json)?;
+        let attribute_definitions: Vec<AttributeDefinition> = from_catalog_json(ad_json)?;
         let dimensions = u32::try_from(dimensions)
             .map_err(|_| StorageError::Internal("vector dimensions out of range".to_owned()))?;
 
