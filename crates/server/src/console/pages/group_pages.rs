@@ -32,7 +32,7 @@ pub async fn new_group_form(
         return Redirect::to("/console").into_response();
     }
 
-    let nav = html::nav_bar(&identity_label(&session.identity));
+    let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
     let eid = html::escape(&account_id);
     let crumbs = html::breadcrumb(&[
         ("Dashboard", Some("/console")),
@@ -91,7 +91,7 @@ pub async fn create_group(
 
     // Same name rule as the management API (`management::iam_group::create_group`).
     if !crate::management::is_valid_iam_name(&form.group_name) {
-        let nav = html::nav_bar(&identity_label(&session.identity));
+        let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
         let content = format!(
             "<h1>Create Group</h1>{}",
             html::alert_error(
@@ -118,7 +118,7 @@ pub async fn create_group(
         ))
         .into_response(),
         Err(e) => {
-            let nav = html::nav_bar(&identity_label(&session.identity));
+            let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
             let content = format!(
                 "<h1>Create Group</h1>{}",
                 html::alert_error(&op_error_message(e))
@@ -150,7 +150,7 @@ pub async fn group_detail(
         return Redirect::to("/console").into_response();
     }
 
-    let nav = html::nav_bar(&identity_label(&session.identity));
+    let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
     let eid = html::escape(&account_id);
     let egn = html::escape(&group_name);
     let crumbs = html::breadcrumb(&[
@@ -311,7 +311,7 @@ pub async fn delete_group(
             Redirect::to(&format!("/console/accounts/{account_id}")).into_response()
         }
         Err(e) => {
-            let nav = html::nav_bar(&identity_label(&session.identity));
+            let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
             let content = format!(
                 "<h1>Delete Group</h1>{}",
                 html::alert_error(&op_error_message(e))
@@ -370,7 +370,7 @@ pub async fn add_group_member(
             Redirect::to(&redirect).into_response()
         }
         Err(e) => {
-            let nav = html::nav_bar(&identity_label(&session.identity));
+            let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
             let content = format!(
                 "<h1>Add Member</h1>{}",
                 html::alert_error(&op_error_message(e))
@@ -419,7 +419,7 @@ pub async fn remove_group_member(
             Redirect::to(&redirect).into_response()
         }
         Err(e) => {
-            let nav = html::nav_bar(&identity_label(&session.identity));
+            let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
             let content = format!(
                 "<h1>Remove Member</h1>{}",
                 html::alert_error(&op_error_message(e))

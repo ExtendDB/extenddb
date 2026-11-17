@@ -43,7 +43,7 @@ pub async fn dashboard(State(state): State<Arc<ConsoleState>>, headers: HeaderMa
         None
     };
 
-    render_dashboard(&session, counts, &state.version_info)
+    render_dashboard(&session, counts, &state.version_info, &state.tabs)
 }
 
 /// The dashboard page for `session`. An admin session sees `counts`, the
@@ -53,8 +53,9 @@ fn render_dashboard(
     session: &SessionData,
     counts: Option<(i64, i64)>,
     version_info: &str,
+    tabs: &[(String, String)],
 ) -> Response {
-    let nav = html::nav_bar(&identity_label(&session.identity));
+    let nav = html::nav_bar(&identity_label(&session.identity), tabs);
 
     let cards = match &session.identity {
         CallerIdentity::Admin(_) => {
@@ -116,7 +117,7 @@ pub async fn list_accounts(State(state): State<Arc<ConsoleState>>, headers: Head
         return Redirect::to("/console").into_response();
     }
 
-    let nav = html::nav_bar(&identity_label(&session.identity));
+    let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
     let crumbs = html::breadcrumb(&[("Dashboard", Some("/console")), ("Accounts", None)]);
 
     let rows: Vec<(String, String)> = state
@@ -167,7 +168,7 @@ pub async fn new_account_form(
         return Redirect::to("/console").into_response();
     }
 
-    let nav = html::nav_bar(&identity_label(&session.identity));
+    let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
     let crumbs = html::breadcrumb(&[
         ("Dashboard", Some("/console")),
         ("Accounts", Some("/console/accounts")),
@@ -235,7 +236,7 @@ pub async fn create_account(
 
     // Validate account ID format (must be 12-digit numeric string).
     if account_id.len() != 12 || !account_id.chars().all(|c| c.is_ascii_digit()) {
-        let nav = html::nav_bar(&identity_label(&session.identity));
+        let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
         let content = format!(
             "{}<h1>Create Account</h1>{}",
             html::breadcrumb(&[
@@ -262,7 +263,7 @@ pub async fn create_account(
     match result {
         Ok(()) => Redirect::to(&format!("/console/accounts/{account_id}")).into_response(),
         Err(e) => {
-            let nav = html::nav_bar(&identity_label(&session.identity));
+            let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
             let msg = op_error_message(e);
             let content = format!(
                 "{}<h1>Create Account</h1>{}",
@@ -300,7 +301,7 @@ pub async fn account_detail(
         return Redirect::to("/console").into_response();
     }
 
-    let nav = html::nav_bar(&identity_label(&session.identity));
+    let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
     let eid = html::escape(&account_id);
     let crumbs = html::breadcrumb(&[
         ("Dashboard", Some("/console")),
@@ -434,7 +435,7 @@ pub async fn delete_account(
             Redirect::to("/console/accounts").into_response()
         }
         Err(e) => {
-            let nav = html::nav_bar(&identity_label(&session.identity));
+            let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
             let msg = op_error_message(e);
             let content = format!("<h1>Delete Account</h1>{}", html::alert_error(&msg));
             Html(html::layout_csrf(

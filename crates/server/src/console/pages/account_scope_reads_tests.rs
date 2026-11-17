@@ -247,6 +247,7 @@ async fn console(identity: CallerIdentity) -> (Arc<ConsoleState>, Arc<CountingSt
     let store = Arc::new(CountingStore::default());
     let state = Arc::new(ConsoleState {
         sessions: SessionStore::new(),
+        tabs: Arc::from(Vec::new()),
         version_info: Arc::from("test-version"),
         listen_url: "https://127.0.0.1:8000".to_owned(),
         config_entries: Vec::new(),

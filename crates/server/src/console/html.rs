@@ -182,14 +182,19 @@ const ADMIN_LINKS: &str = concat!(
 /// Build the navigation bar for an authenticated session. The Accounts,
 /// Metrics, Settings and Cache links are left out for IAM users, because
 /// those pages are admin only. An IAM-user session reaches its own user page
-/// from the console dashboard.
-pub fn nav_bar(identity: &NavIdentity) -> String {
+/// from the console dashboard. `tabs` are the extension links shown after
+/// the built-in ones, as `(label, href)`.
+pub fn nav_bar(identity: &NavIdentity, tabs: &[(String, String)]) -> String {
     let admin_links = if identity.is_admin { ADMIN_LINKS } else { "" };
+    let mut extra = String::new();
+    for (label, href) in tabs {
+        let _ = writeln!(extra, r#"<a href="{}">{}</a>"#, escape(href), escape(label));
+    }
     format!(
         r#"<nav>
 <span class="brand">extenddb Console</span>
 <a href="/console">Dashboard</a>{admin_links}
-<span class="spacer"></span>
+{extra}<span class="spacer"></span>
 <span>{identity}</span>
 <form class="inline" method="post" action="/console/logout">
 <button class="btn btn-sm" type="submit">Logout</button>

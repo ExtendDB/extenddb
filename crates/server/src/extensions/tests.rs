@@ -12,7 +12,8 @@ use axum::routing::get;
 use tower::ServiceExt;
 
 use super::{
-    ExtensionMountError, Extensions, body_hash, mount_extensions, validate_extension_prefix,
+    ConsoleTab, ExtensionMountError, Extensions, body_hash, mount_extensions,
+    validate_console_slug, validate_console_slugs, validate_extension_prefix,
     validate_extension_prefixes,
 };
 
@@ -218,4 +219,74 @@ fn the_builders_fill_the_fields() {
     assert_eq!(ext.http[0].0, "/_a");
     assert_eq!(ext.http[1].0, "/_b");
     assert!(ext.request_observer.is_some());
+}
+
+#[test]
+fn a_console_tab_slug_is_one_lower_case_segment_not_reserved_and_not_taken() {
+    assert!(validate_console_slug("chaos", &[]).is_ok());
+    assert!(validate_console_slug("my-tab-2", &[]).is_ok());
+    for slug in ["", "Chaos", "my tab", "a/b", "a_b", "tab.", "/x", "ä"] {
+        assert!(
+            matches!(validate_console_slug(slug, &[]), Err(ExtensionMountError::BadSlug(s)) if s == slug),
+            "{slug:?} must be refused as a bad slug"
+        );
+    }
+    for reserved in [
+        "login",
+        "logout",
+        "docs",
+        "metrics",
+        "metrics-data",
+        "settings",
+        "cache",
+        "accounts",
+        "users",
+        "groups",
+        "roles",
+        "policies",
+        "access-keys",
+    ] {
+        match validate_console_slug(reserved, &[]) {
+            Err(ExtensionMountError::ReservedSlug(s)) => assert_eq!(s, reserved),
+            other => panic!("{reserved} must be reserved, got {other:?}"),
+        }
+    }
+    let taken = vec!["chaos".to_owned()];
+    assert!(matches!(
+        validate_console_slug("chaos", &taken),
+        Err(ExtensionMountError::RepeatedSlug(s)) if s == "chaos"
+    ));
+    assert!(validate_console_slug("chaos2", &taken).is_ok());
+    assert_eq!(
+        ExtensionMountError::ReservedSlug("login".to_owned()).to_string(),
+        "console tab slug 'login' is a built-in console route"
+    );
+    assert_eq!(
+        ExtensionMountError::RepeatedSlug("chaos".to_owned()).to_string(),
+        "console tab slug 'chaos' is used by an earlier tab"
+    );
+}
+
+#[test]
+fn validate_console_slugs_checks_the_list_in_order() {
+    let tabs = vec![
+        ConsoleTab {
+            label: "A".to_owned(),
+            slug: "a".to_owned(),
+            router: probe_router(),
+        },
+        ConsoleTab {
+            label: "A again".to_owned(),
+            slug: "a".to_owned(),
+            router: probe_router(),
+        },
+    ];
+    let err = validate_console_slugs(&tabs).expect_err("the second slug repeats the first");
+    assert!(matches!(err, ExtensionMountError::RepeatedSlug(ref s) if s == "a"));
+    assert!(validate_console_slugs(&[]).is_ok());
+    let ext = Extensions::default().with_console_tab("Chaos", "chaos", probe_router());
+    assert_eq!(ext.console_tabs.len(), 1);
+    assert_eq!(ext.console_tabs[0].label, "Chaos");
+    assert_eq!(ext.console_tabs[0].slug, "chaos");
+    assert!(validate_console_slugs(&ext.console_tabs).is_ok());
 }

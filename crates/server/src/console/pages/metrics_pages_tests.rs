@@ -199,7 +199,7 @@ async fn admin_gets_every_accounts_rows_from_the_data_feed() {
 
 #[test]
 fn iam_user_is_redirected_from_the_metrics_page() {
-    let response = render_metrics_page(&session(iam_user()), "test-version");
+    let response = render_metrics_page(&session(iam_user()), "test-version", &[]);
 
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
     let location = response
@@ -211,7 +211,7 @@ fn iam_user_is_redirected_from_the_metrics_page() {
 
 #[tokio::test]
 async fn admin_gets_the_metrics_page() {
-    let response = render_metrics_page(&session(admin()), "test-version");
+    let response = render_metrics_page(&session(admin()), "test-version", &[]);
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
@@ -235,14 +235,14 @@ fn nav_bar_links_the_admin_only_pages_for_admins_only() {
 
     // An admin's bar lists the three links after Accounts, in this order,
     // and before the spacer.
-    let admin_nav = html::nav_bar(&identity_label(&admin()));
+    let admin_nav = html::nav_bar(&identity_label(&admin()), &[]);
     let admin_row = format!("{accounts}\n{}\n{spacer}", admin_links.join("\n"));
     assert!(admin_nav.contains(&admin_row), "{admin_nav}");
 
     // An IAM user's bar has no Accounts link either: Dashboard comes right
     // before the spacer.
     let dashboard = r#"<a href="/console">Dashboard</a>"#;
-    let user_nav = html::nav_bar(&identity_label(&iam_user()));
+    let user_nav = html::nav_bar(&identity_label(&iam_user()), &[]);
     for link in admin_links {
         assert!(!user_nav.contains(link), "{user_nav}");
     }

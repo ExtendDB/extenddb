@@ -46,6 +46,7 @@ async fn iam_user_dashboard_has_no_deployment_count() {
         &session(iam_user()),
         Some((ACCOUNT_COUNT, ADMIN_COUNT)),
         "test-version",
+        &[],
     );
 
     assert_eq!(response.status(), StatusCode::OK);
@@ -59,7 +60,7 @@ async fn iam_user_dashboard_has_no_deployment_count() {
 
 #[tokio::test]
 async fn iam_user_dashboard_links_to_its_own_user_page_and_no_account_page() {
-    let response = render_dashboard(&session(iam_user()), None, "test-version");
+    let response = render_dashboard(&session(iam_user()), None, "test-version", &[]);
 
     let body = body_text(response).await;
     assert!(
@@ -82,6 +83,7 @@ async fn admin_dashboard_shows_the_deployment_counts() {
         &session(CallerIdentity::Admin("admin".to_owned())),
         Some((ACCOUNT_COUNT, ADMIN_COUNT)),
         "test-version",
+        &[],
     );
 
     assert_eq!(response.status(), StatusCode::OK);

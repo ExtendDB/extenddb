@@ -62,7 +62,7 @@ pub struct SessionData {
 /// is no session, it expired, or its principal was deleted or had its
 /// password changed; or 503 when the catalog cannot be read.
 #[allow(clippy::result_large_err)]
-async fn require_session(
+pub(super) async fn require_session(
     headers: &HeaderMap,
     state: &Arc<ConsoleState>,
 ) -> Result<SessionData, Response> {
@@ -95,7 +95,7 @@ fn session_response(check: SessionCheck) -> Result<SessionData, Response> {
 
 /// Validate a CSRF token from a form submission against the session's token.
 /// Uses constant-time comparison to prevent timing attacks.
-fn validate_csrf(submitted: &str, expected: &str) -> bool {
+pub(super) fn validate_csrf(submitted: &str, expected: &str) -> bool {
     if submitted.len() != expected.len() {
         return false;
     }
@@ -140,7 +140,7 @@ fn extract_session_token(headers: &HeaderMap) -> Option<String> {
 
 /// Describe a `CallerIdentity` for the nav bar: its display label, and
 /// whether it is an admin, which decides the admin-only links.
-fn identity_label(identity: &CallerIdentity) -> html::NavIdentity {
+pub(super) fn identity_label(identity: &CallerIdentity) -> html::NavIdentity {
     let label = match identity {
         CallerIdentity::Admin(name) => format!("Admin: {name}"),
         CallerIdentity::IamUser {
