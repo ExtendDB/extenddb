@@ -167,12 +167,14 @@ async fn index_read_throttle_names_the_index_arn_with_the_table_message() {
     // count carries the table and operation only.
     let t = |op: &str| {
         vec![
+            Dimension::AccountId(account_id.clone()),
             Dimension::TableName(table.to_owned()),
             Dimension::Operation(op.to_owned()),
         ]
     };
     let g = |op: &str| {
         vec![
+            Dimension::AccountId(account_id.clone()),
             Dimension::TableName(table.to_owned()),
             Dimension::GlobalSecondaryIndexName(GSI.to_owned()),
             Dimension::Operation(op.to_owned()),

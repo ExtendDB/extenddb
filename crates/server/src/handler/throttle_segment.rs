@@ -22,12 +22,15 @@ use crate::throttle_helpers::{
 /// is the index a `Query` or `Scan` names; a provisioned global secondary
 /// index is checked on its own read bucket, and a write is checked on every
 /// registered index's write bucket after the table's. A refusal carries the
-/// account the request authenticated as.
+/// account the request authenticated as. Its throttle metrics are recorded
+/// under that account and `metric_table`, the table the request's metrics
+/// use (see `metric_table_name`).
 pub(super) async fn check(
     state: &Arc<AppState>,
     ctx: &OperationContext,
     operation: &str,
     table_name: Option<&str>,
+    metric_table: Option<&str>,
     partition_value: Option<&str>,
     index_name: Option<&str>,
 ) -> Result<(), Refused> {
@@ -84,14 +87,16 @@ pub(super) async fn check(
             state.metrics.record(
                 metric,
                 1.0,
-                Some(tn),
+                Some(&ctx.account_id),
+                metric_table,
                 refused_index.as_deref(),
                 Some(operation),
             );
             state.metrics.record(
                 extenddb_core::metrics::MetricName::ThrottledRequests,
                 1.0,
-                Some(tn),
+                Some(&ctx.account_id),
+                metric_table,
                 None,
                 Some(operation),
             );
