@@ -95,7 +95,7 @@ This will:
 
 **Important:** Save the admin credentials printed during init. They are shown once and cannot be retrieved later. These credentials are used to authenticate to the management API.
 
-**Re-initialization:** `extenddb init` will abort if either the catalog or data database already exists. To re-initialize, first run `extenddb destroy --config extenddb.toml --yes` to drop the existing databases, then run `extenddb init` again.
+**Re-initialization:** `extenddb init` will abort if either the catalog or data database already exists. To re-initialize, first run `extenddb destroy --config extenddb.toml --yes` to drop the existing databases, then run `extenddb init` again. On Cassandra, `init` aborts if the catalog is already initialized. If an earlier `init` stopped partway, `init` finishes it, when its `--replication-factor` and `--datacenter` match the ones the earlier `init` used. If `init` stops because its `--replication-factor` is larger than the number of nodes, an `init` with the same `--replication-factor` stops the same way. To go on, see "Keyspace replication" in [cassandra-setup.md](cassandra-setup.md).
 
 To use a custom catalog database name:
 
@@ -204,8 +204,8 @@ contact_points = ["127.0.0.1:9042"]
 username = <extenddb-user>      # From extenddb init args
 password = <extenddb-pass>      # From extenddb init args
 keyspace_prefix = "extenddb"
-replication_factor = 1           # init always writes 1; edit for production
-datacenter = "datacenter1"       # must be datacenter1 (hardcoded by init)
+replication_factor = 1           # From --replication-factor (default 1)
+datacenter = "datacenter1"       # From --datacenter (default datacenter1)
 max_connections = 10
 ```
 
@@ -219,10 +219,12 @@ To override a default, pass the matching flag at init time:
   and password (default `extenddb` / `extenddb-local-dev`).
 - `--keyspace-prefix myapp` — a different keyspace prefix, so one cluster can
   host more than one deployment.
+- `--replication-factor 3` — the replication factor of the keyspaces (default
+  `1`, for a single node). Use 3 or more for a multi-node cluster.
+- `--datacenter dc1` — the datacenter the keyspaces replicate in (default
+  `datacenter1`); use the name `nodetool status` prints.
 
-For a higher replication factor, edit `replication_factor` in the config after
-`init` (there is no init flag for it today). The datacenter must be
-`datacenter1`. For replication strategy, datacenter topology, authentication,
+For replication strategy, datacenter topology, authentication,
 authorization, and the fact that connections are unencrypted, see
 `docs/cassandra-setup.md`.
 
