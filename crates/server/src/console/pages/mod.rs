@@ -157,7 +157,7 @@ pub(super) fn identity_label(identity: &CallerIdentity) -> html::NavIdentity {
 }
 
 /// Check if the caller is an admin. Returns true for admins, false for IAM users.
-pub(super) fn is_admin(identity: &CallerIdentity) -> bool {
+fn is_admin(identity: &CallerIdentity) -> bool {
     matches!(identity, CallerIdentity::Admin(_))
 }
 

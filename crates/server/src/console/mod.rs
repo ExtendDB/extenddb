@@ -139,10 +139,11 @@ pub async fn require_console_session(
 ) -> axum::response::Response {
     match pages::require_session(req.headers(), &state).await {
         Ok(session) => {
+            let nav = pages::identity_label(&session.identity);
             req.extensions_mut().insert(ConsoleIdentity {
-                label: pages::identity_label(&session.identity).label,
+                label: nav.label,
                 csrf_token: session.csrf_token,
-                is_admin: pages::is_admin(&session.identity),
+                is_admin: nav.is_admin,
                 tabs: Arc::clone(&state.tabs),
                 version_info: Arc::clone(&state.version_info),
             });
