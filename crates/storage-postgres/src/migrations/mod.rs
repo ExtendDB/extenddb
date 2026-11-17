@@ -75,8 +75,136 @@ pub(crate) const CATALOG_EXPECTED: &str =
 pub(crate) const DATA_EXPECTED: &str =
     include_str!("../../data_migrations/0001_baseline.expected.json");
 
-/// Checksums of the released bodies (none until v1.0).
-pub(crate) const RELEASED: &[Released] = &[];
+/// Checksums of the released bodies, every migration at or below
+/// `RELEASED_THROUGH`.
+pub(crate) const RELEASED: &[Released] = &[
+    Released {
+        id: MigrationId::Baseline,
+        store: StoreKind::Catalog,
+        checksum: "1353083a65512973a4e54c35242ce1e11e68f8773d9e59c2f9c60ef4e56d63d3",
+        fingerprint: None,
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::Baseline,
+        store: StoreKind::Data,
+        checksum: "aeb9f87144e5ca589669b8bd32e71d36bf54d1c7a926c5aae79ed2897a5bd98d",
+        fingerprint: None,
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::ResourceTagConditionKeys,
+        store: StoreKind::Catalog,
+        checksum: "80c502c54ef9240ab5f64b24b060261a295e41d29954d9b492b83c64c444170e",
+        fingerprint: Some("0002_resource_tag_condition_keys/1"),
+        kind: Kind::Breaking,
+        convergent: false,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::SortKeyDefinitions,
+        store: StoreKind::Catalog,
+        checksum: "76e4e40ede2d02020703cff333f71feba2839da573f83aa0be0e3ff5b50aafb3",
+        fingerprint: Some("0003_sort_key_definitions/postgres/1"),
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::IndexTableBaseKey,
+        store: StoreKind::Data,
+        checksum: "534ef4a81efc85815ce055bfb2410de8d099f0c3756883b5871b7da04e02b002",
+        fingerprint: Some("0004_index_table_base_key/postgres/1"),
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::DropContinuousBackups,
+        store: StoreKind::Catalog,
+        checksum: "b685348472df535fc4873e7439b9a81ab2b9dff60c703f95ec3de769048da596",
+        fingerprint: None,
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::BackupCatalogIndex,
+        store: StoreKind::Catalog,
+        checksum: "7d67534ae535c17d283c8cb1477fb8be0820d2bb96b6a91179f7e17e116ef8c4",
+        fingerprint: None,
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::StreamPending,
+        store: StoreKind::Data,
+        checksum: "57ecfc569703552867fba309ecb6b82e5f81b7b1f87d27558943bdff3ae82341",
+        fingerprint: None,
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::RestoreProgress,
+        store: StoreKind::Data,
+        checksum: "366157a591a030703fbf2d1c899b90e8b57e9c67c68d8e0a71b74b3eaee8d546",
+        fingerprint: None,
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::WarmThroughput,
+        store: StoreKind::Catalog,
+        checksum: "3fedea10abfba13ee3aecf0a61daafb8cce470d70a8e134b5dcd53b007759f28",
+        fingerprint: None,
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::AccountMetrics,
+        store: StoreKind::Catalog,
+        checksum: "abf2b0b69ce379b42ffbd9fbd7c22d61cbd9624b21d42b1856e02005771f315d",
+        fingerprint: None,
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::AttributeNameEscape,
+        store: StoreKind::Catalog,
+        checksum: "284c9e0acc37bc8fe0390188b1fc4b0a74467854b7919c616b525aafff8bba05",
+        fingerprint: Some("0011_attribute_name_escape/postgres/1"),
+        kind: Kind::Breaking,
+        convergent: false,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::AttributeNameEscape,
+        store: StoreKind::Data,
+        checksum: "284c9e0acc37bc8fe0390188b1fc4b0a74467854b7919c616b525aafff8bba05",
+        fingerprint: Some("0011_attribute_name_escape/postgres/1"),
+        kind: Kind::Breaking,
+        convergent: false,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::UniqueAccessKeyIds,
+        store: StoreKind::Catalog,
+        checksum: "5003dffcdb2e46d560d794360fdb7a6a9d5eb000968082450b8bee9a0bc23d02",
+        fingerprint: None,
+        kind: Kind::Additive,
+        convergent: true,
+        rebless: None,
+    },
+];
 
 /// This backend's entry for every id. Public so `migrate --list` can print
 /// each migration's kind without connecting.

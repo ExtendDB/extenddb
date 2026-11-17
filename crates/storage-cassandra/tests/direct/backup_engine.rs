@@ -1750,7 +1750,7 @@ async fn provision_account(engine: &CassandraEngine, account_id: &str) {
 /// The columns and tables catalog migration 6 adds are absent from
 /// `keyspace`, and migration 1's restore registration columns are present.
 async fn assert_catalog_lacks_migration_6(engine: &CassandraEngine, keyspace: &str) {
-    let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<StorageError>(
+    let rows = extenddb_storage_cassandra::cassandra_util::system_read::<StorageError>(
         &engine.session_arc(),
         "SELECT column_name FROM system_schema.columns WHERE keyspace_name = ?",
         cdrs_tokio::query_values!(keyspace),
@@ -1782,7 +1782,7 @@ async fn assert_catalog_lacks_migration_6(engine: &CassandraEngine, keyspace: &s
     ] {
         assert!(!columns.iter().any(|c| c == added), "{added} present");
     }
-    let tables = extenddb_storage_cassandra::cassandra_util::query_rows::<StorageError>(
+    let tables = extenddb_storage_cassandra::cassandra_util::system_read::<StorageError>(
         &engine.session_arc(),
         "SELECT table_name FROM system_schema.tables WHERE keyspace_name = ?",
         cdrs_tokio::query_values!(keyspace),
@@ -1937,7 +1937,7 @@ async fn orphan_restore_target(
 /// The names of the tables in `keyspace`, read from `system_schema`.
 async fn table_names_in(engine: &CassandraEngine, keyspace: &str) -> BTreeSet<String> {
     use cdrs_tokio::types::IntoRustByName;
-    let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<StorageError>(
+    let rows = extenddb_storage_cassandra::cassandra_util::system_read::<StorageError>(
         &engine.session_arc(),
         "SELECT table_name FROM system_schema.tables WHERE keyspace_name = ?",
         cdrs_tokio::query_values!(keyspace),
@@ -2869,7 +2869,7 @@ async fn job_record(
     Option<i64>,
 ) {
     use cdrs_tokio::types::IntoRustByName;
-    let rows = extenddb_storage_cassandra::cassandra_util::query_rows_quorum::<StorageError>(
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<StorageError>(
         &engine.session_arc(),
         &format!(
             "SELECT restore_status, restore_kind, restore_owner_generation, restore_heartbeat_at, \
@@ -2951,7 +2951,8 @@ async fn test_migration_6_backfills_the_registrations_and_the_reconciler_removes
 
     // Back to the shape before migration 6: the registrations as the
     // previous release wrote them (no job record), the interrupted target
-    // CREATING, and the migration forgotten.
+    // CREATING, and migration 6's ledger row deleted, so the next run applies
+    // migration 6 alone.
     let catalog = engine.catalog_keyspace();
     for (name, table_id) in [
         ("BfDone", finished.table_id.as_str()),
@@ -2979,7 +2980,7 @@ async fn test_migration_6_backfills_the_registrations_and_the_reconciler_removes
     )
     .await;
     let prefix = prefix_of(&engine);
-    forget_catalog_migration(&engine, &prefix, MigrationId::BackupCatalogIndex).await;
+    delete_catalog_ledger_row(&engine, MigrationId::BackupCatalogIndex).await;
     let report = extenddb_storage_cassandra::migrations::migrate_catalog_keyspace(
         engine.session_arc(),
         &prefix,
@@ -3285,7 +3286,7 @@ async fn test_an_abandoned_in_catalog_create_is_reported_once_stale_and_deleted(
         engine.account_keyspace(&account_id)
     );
     for bucket in 0..4_i32 {
-        let rows = extenddb_storage_cassandra::cassandra_util::query_rows_quorum::<StorageError>(
+        let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<StorageError>(
             &engine.session_arc(),
             &probe,
             cdrs_tokio::query_values!(backup_arn.as_str(), bucket),
@@ -3979,7 +3980,7 @@ async fn test_a_failed_record_whose_target_is_deleting_is_listed_once_stale_and_
 
 /// Whether `table` exists in `account_id`'s keyspace.
 async fn data_table_exists(engine: &CassandraEngine, account_id: &str, table: &str) -> bool {
-    !extenddb_storage_cassandra::cassandra_util::query_rows::<StorageError>(
+    !extenddb_storage_cassandra::cassandra_util::system_read::<StorageError>(
         &engine.session_arc(),
         "SELECT table_name FROM system_schema.tables WHERE keyspace_name = ? AND table_name = ?",
         cdrs_tokio::query_values!(engine.account_keyspace(account_id), table),
@@ -3999,7 +4000,7 @@ async fn create_row_write_times(
     account_id: &str,
 ) -> Option<(Option<i64>, Option<i64>, String)> {
     use cdrs_tokio::types::IntoRustByName;
-    let rows = extenddb_storage_cassandra::cassandra_util::query_rows_quorum::<StorageError>(
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<StorageError>(
         &engine.session_arc(),
         &format!(
             "SELECT WRITETIME(heartbeat_at) AS beat, WRITETIME(backup_name) AS inserted, \
@@ -4143,7 +4144,7 @@ async fn raw_index_entries(engine: &CassandraEngine, row: &BackupRow) -> usize {
             ),
         ),
     ] {
-        let rows = extenddb_storage_cassandra::cassandra_util::query_rows_quorum::<StorageError>(
+        let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<StorageError>(
             &engine.session_arc(),
             &cql,
             values,
@@ -4159,7 +4160,7 @@ async fn raw_index_entries(engine: &CassandraEngine, row: &BackupRow) -> usize {
 /// Items of `backup_arn`'s payload in `account_id`'s keyspace, all buckets.
 async fn payload_item_count(engine: &CassandraEngine, account_id: &str, backup_arn: &str) -> i64 {
     use cdrs_tokio::types::IntoRustByName;
-    let rows = extenddb_storage_cassandra::cassandra_util::query_rows_quorum::<StorageError>(
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<StorageError>(
         &engine.session_arc(),
         &format!(
             "SELECT COUNT(*) AS n FROM {}.backup_items WHERE backup_arn = ? ALLOW FILTERING",
@@ -4183,7 +4184,7 @@ async fn backup_status_of(
     backup_arn: &str,
 ) -> Option<String> {
     use cdrs_tokio::types::IntoRustByName;
-    extenddb_storage_cassandra::cassandra_util::query_rows_quorum::<StorageError>(
+    extenddb_storage_cassandra::cassandra_util::query_rows::<StorageError>(
         &engine.session_arc(),
         &format!(
             "SELECT backup_status FROM {}.backups_by_arn WHERE account_id = ? AND backup_arn = ?",
@@ -4566,27 +4567,22 @@ fn prefix_of(engine: &CassandraEngine) -> String {
         .to_owned()
 }
 
-/// Remove migration `id`'s ledger row from the catalog keyspace under the
-/// migration lock, as `migrate --forget` does, so the next run applies it
-/// again.
-async fn forget_catalog_migration(engine: &CassandraEngine, prefix: &str, id: MigrationId) {
-    use extenddb_storage_cassandra::migrations::{CassandraMigrations, LeaseTimes, MigrationLock};
-    let lock = MigrationLock::acquire(
-        engine.session_arc(),
-        &engine.catalog_keyspace(),
-        LeaseTimes::DEFAULT,
-        Duration::from_secs(120),
-    )
-    .await
-    .expect("take the lock");
-    let forgotten = {
-        let migrations = CassandraMigrations::locked_catalog_only(&lock, prefix);
-        extenddb_storage::migrations::Runner::new(&migrations, "test")
-            .forget(id.number())
-            .await
-    };
-    lock.release().await;
-    forgotten.expect("forget the migration");
+/// Delete migration `id`'s ledger row from the catalog keyspace, so the
+/// next run applies it. The version row is left as it was; the next run
+/// rewrites it.
+async fn delete_catalog_ledger_row(engine: &CassandraEngine, id: MigrationId) {
+    let id = i32::try_from(id.number()).expect("a migration id fits an int");
+    engine
+        .session()
+        .query_with_values(
+            format!(
+                "DELETE FROM {}.extenddb_migrations WHERE id = ?",
+                engine.catalog_keyspace()
+            ),
+            cdrs_tokio::query_values!(id),
+        )
+        .await
+        .expect("delete the migration's ledger row");
 }
 
 /// A catalog at migration 5 whose migration 6 fails in its backfill (a
@@ -4710,7 +4706,7 @@ async fn test_a_migration_6_that_fails_in_its_backfill_stays_pending_and_resumes
 #[cfg(feature = "test-hooks")]
 async fn target_item_count(engine: &CassandraEngine, account_id: &str, table_id: &str) -> i64 {
     use cdrs_tokio::types::IntoRustByName;
-    let rows = extenddb_storage_cassandra::cassandra_util::query_rows_quorum::<StorageError>(
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<StorageError>(
         &engine.session_arc(),
         &format!(
             "SELECT COUNT(*) AS n FROM {}.items_{}",
@@ -4935,7 +4931,7 @@ async fn test_a_target_claimed_to_deleting_stops_the_restore_copy_at_its_next_he
     assert_eq!(after, generation);
     let (table_status,): (Option<String>,) = {
         use cdrs_tokio::types::IntoRustByName;
-        let rows = extenddb_storage_cassandra::cassandra_util::query_rows_quorum::<StorageError>(
+        let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<StorageError>(
             &engine.session_arc(),
             &format!(
                 "SELECT table_status FROM {}.tables WHERE account_id = ? AND table_name = ?",
@@ -5384,7 +5380,7 @@ async fn status_entry(
     status: BackupStatus,
     arn: &str,
 ) -> Option<(String, String)> {
-    let rows = extenddb_storage_cassandra::cassandra_util::query_rows_quorum::<StorageError>(
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<StorageError>(
         &engine.session_arc(),
         &format!(
             "SELECT store_kind, store_id FROM {}.backup_index_by_status \
@@ -8127,7 +8123,7 @@ async fn registrations(
 ) -> std::collections::HashMap<String, String> {
     use cdrs_tokio::types::AsRust;
     use cdrs_tokio::types::IntoRustByName;
-    let rows = extenddb_storage_cassandra::cassandra_util::query_rows_quorum::<StorageError>(
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<StorageError>(
         &engine.session_arc(),
         &format!(
             "SELECT active_restores FROM {}.backups_by_arn \
@@ -9201,7 +9197,7 @@ async fn index_rows(
     index_name: &str,
 ) -> i64 {
     use cdrs_tokio::types::IntoRustByName;
-    let rows = extenddb_storage_cassandra::cassandra_util::query_rows_quorum::<StorageError>(
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<StorageError>(
         &engine.session_arc(),
         &format!(
             "SELECT index_id FROM {}.indexes WHERE table_id = ? AND index_name = ?",
@@ -9219,7 +9215,7 @@ async fn index_rows(
         .ok()
         .flatten()
         .expect("index_id");
-    let rows = extenddb_storage_cassandra::cassandra_util::query_rows_quorum::<StorageError>(
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<StorageError>(
         &engine.session_arc(),
         &format!(
             "SELECT COUNT(*) AS c FROM {}.{}",
@@ -9258,18 +9254,17 @@ async fn stamps_by_attr(
             table_id.replace('-', "_")
         ),
         Some(index_name) => {
-            let rows =
-                extenddb_storage_cassandra::cassandra_util::query_rows_quorum::<StorageError>(
-                    &engine.session_arc(),
-                    &format!(
-                        "SELECT index_id FROM {}.indexes WHERE table_id = ? AND index_name = ?",
-                        engine.catalog_keyspace()
-                    ),
-                    cdrs_tokio::query_values!(table_id, index_name),
-                    "index id",
-                )
-                .await
-                .expect("read the index");
+            let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<StorageError>(
+                &engine.session_arc(),
+                &format!(
+                    "SELECT index_id FROM {}.indexes WHERE table_id = ? AND index_name = ?",
+                    engine.catalog_keyspace()
+                ),
+                cdrs_tokio::query_values!(table_id, index_name),
+                "index id",
+            )
+            .await
+            .expect("read the index");
             let index_id: String = rows
                 .first()
                 .expect("the index exists")
@@ -9283,7 +9278,7 @@ async fn stamps_by_attr(
             )
         }
     };
-    let rows = extenddb_storage_cassandra::cassandra_util::query_rows_quorum::<StorageError>(
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<StorageError>(
         &engine.session_arc(),
         &cql,
         cdrs_tokio::query_values!(),
@@ -10344,7 +10339,7 @@ async fn test_a_beat_between_the_takeovers_read_and_its_write_refuses_the_takeov
 #[cfg(feature = "test-hooks")]
 async fn base_rows(engine: &CassandraEngine, account_id: &str, table_id: &str) -> i64 {
     use cdrs_tokio::types::IntoRustByName;
-    let rows = extenddb_storage_cassandra::cassandra_util::query_rows_quorum::<StorageError>(
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<StorageError>(
         &engine.session_arc(),
         &format!(
             "SELECT COUNT(item_data) AS c FROM {}.items_{}",
@@ -10561,7 +10556,7 @@ async fn live_versions_by_sk(
     table_id: &str,
 ) -> BTreeMap<String, i64> {
     use cdrs_tokio::types::IntoRustByName;
-    let rows = extenddb_storage_cassandra::cassandra_util::query_rows_quorum::<StorageError>(
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<StorageError>(
         &engine.session_arc(),
         &format!(
             "SELECT item_data, version FROM {}.items_{}",
@@ -10733,7 +10728,7 @@ async fn test_restore_target_ready_requires_every_index_table() {
     // The GSI's table is dropped, as a crash between the data table's DDL
     // and the index table's would leave it.
     use cdrs_tokio::types::IntoRustByName;
-    let rows = extenddb_storage_cassandra::cassandra_util::query_rows_quorum::<StorageError>(
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<StorageError>(
         &engine.session_arc(),
         &format!(
             "SELECT index_id FROM {}.indexes WHERE table_id = ? AND index_name = ?",
@@ -11305,7 +11300,7 @@ async fn payload_in_order(
     use cdrs_tokio::types::IntoRustByName;
     let mut items = Vec::new();
     for bucket in 0..buckets {
-        let rows = extenddb_storage_cassandra::cassandra_util::query_rows_quorum::<StorageError>(
+        let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<StorageError>(
             &engine.session_arc(),
             &format!(
                 "SELECT item_data FROM {}.backup_items WHERE backup_arn = ? AND bucket = ?",
@@ -11774,7 +11769,7 @@ async fn test_a_conversion_whose_answer_is_lost_or_that_stopped_is_settled() {
 #[cfg(feature = "test-hooks")]
 async fn has_registration(engine: &CassandraEngine, account_id: &str, backup_arn: &str) -> bool {
     use cdrs_tokio::types::IntoRustByName;
-    extenddb_storage_cassandra::cassandra_util::query_rows_quorum::<StorageError>(
+    extenddb_storage_cassandra::cassandra_util::query_rows::<StorageError>(
         &engine.session_arc(),
         &format!(
             "SELECT active_restores FROM {}.backups_by_arn WHERE account_id = ? AND backup_arn = ?",

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2026 ExtendDB contributors
 # SPDX-License-Identifier: Apache-2.0
-"""A catalog this binary migrated, against the last 0.1.x dev image:
+"""A catalog this binary migrated, against the 0.1.14 dev image:
 
     devtools/check-sqlite-older-binary <extenddb binary> <released fixture dump> \\
         [image] [port]
@@ -173,10 +173,10 @@ def check(label: str, kind: str, source: str, binary: str, image: Image, work: s
     for line in changes:
         print(f"     | {line}")
     output = expect_exit(
-        5, "migrate reports a catalog a release before 1.0 wrote to",
+        5, "migrate reports a catalog a release before 0.1.15 wrote to",
         [binary, "migrate", "--config", config],
     )
-    if "a release before 1.0 wrote to this catalog" not in output:
+    if "a release before 0.1.15 wrote to this catalog" not in output:
         report(False, "the preview does not name WrittenByOlderRelease", output)
     expect_exit(5, "verify reports it", [binary, "verify", "--config", config])
     dev_bin = os.environ.get("DEV_BIN", "")
