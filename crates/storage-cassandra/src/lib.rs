@@ -7,6 +7,12 @@
 //! as the underlying database. It provides a DynamoDB-compatible API backed
 //! by Cassandra's distributed architecture.
 
+// `clippy.toml` disallows the driver calls that run at the driver default
+// consistency. The catalog, metadata, backup and bootstrap code outside
+// `data/` runs at that default, so the lint is off here and `data/mod.rs`
+// turns it back on for the data path.
+#![allow(clippy::disallowed_methods)]
+
 /// Default control-plane delay (seconds) when the `control_plane_delay_seconds`
 /// setting is absent or unparseable: CreateTable, the control-plane worker
 /// and the console's default all read this one value.

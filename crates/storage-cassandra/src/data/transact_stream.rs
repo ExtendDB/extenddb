@@ -125,7 +125,6 @@ fn value_bytes(value: &Value) -> usize {
 mod tests {
     use super::*;
     use cdrs_tokio::consistency::Consistency;
-    use cdrs_tokio::query::BatchQueryBuilder;
     use extenddb_core::types::AttributeValue;
 
     fn built_statements(batch: &QueryBatch) -> Vec<String> {
@@ -145,7 +144,7 @@ mod tests {
     /// An index batch with every setting the record batch has to carry over set
     /// to a value other than its default.
     fn index_batch() -> QueryBatch {
-        BatchQueryBuilder::new()
+        crate::cassandra_util::batch_builder()
             .with_consistency(Consistency::LocalQuorum)
             .with_serial_consistency(Consistency::LocalSerial)
             .with_timestamp(1_700_000_000_000_000)
@@ -198,7 +197,7 @@ mod tests {
 
     #[test]
     fn a_table_with_no_index_runs_the_record_in_one_batch() {
-        let empty = BatchQueryBuilder::new().build().unwrap();
+        let empty = crate::cassandra_util::batch_builder().build().unwrap();
         let batches = secondary_effect_batches(empty, Some(RECORD.to_owned()));
         assert_eq!(batches.len(), 1);
         assert_eq!(built_statements(&batches[0]), vec![RECORD.to_owned()]);
@@ -209,7 +208,7 @@ mod tests {
     /// followed by the record.
     #[test]
     fn a_large_record_with_no_index_rows_is_one_batch() {
-        let empty = BatchQueryBuilder::new().build().unwrap();
+        let empty = crate::cassandra_util::batch_builder().build().unwrap();
         let record = record_of_len(300_000);
         let batches = secondary_effect_batches(empty, Some(record.clone()));
         assert_eq!(batches.len(), 1);
@@ -292,7 +291,7 @@ mod tests {
     /// record can still be the statement that tips a batch over.
     #[test]
     fn bound_values_count_toward_the_budget() {
-        let queue_row = BatchQueryBuilder::new()
+        let queue_row = crate::cassandra_util::batch_builder()
             .with_consistency(Consistency::LocalQuorum)
             .add_query(
                 "INSERT INTO ks.gsi_pending (new_item) VALUES (?)".to_owned(),

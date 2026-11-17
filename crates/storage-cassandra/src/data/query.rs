@@ -87,7 +87,8 @@ fn base_sk_info(
 }
 
 impl CassandraEngine {
-    /// Implementation of `DataEngine::query`.
+    /// Implementation of `DataEngine::query`. Every read runs at
+    /// [`read_consistency`](crate::cassandra_util::read_consistency)`(consistent_read)`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn query_impl(
         &self,
@@ -98,6 +99,7 @@ impl CassandraEngine {
         limit: Option<i64>,
         exclusive_start_key: Option<&Item>,
         index_name: Option<&str>,
+        consistent_read: bool,
     ) -> Result<(Vec<Item>, Option<Item>), StorageError> {
         // Determine table to query (base or index)
         let (table_name, query_key_schema, is_lsi) = if let Some(idx_name) = index_name {
@@ -402,6 +404,7 @@ impl CassandraEngine {
                         &pk_text,
                         start_sk,
                         base_sk,
+                        consistent_read,
                         "same_sk",
                     )
                     .await?;
@@ -438,6 +441,7 @@ impl CassandraEngine {
                         start_sk,
                         base_pk_text,
                         base_sk,
+                        consistent_read,
                         "same_sk_same_base_pk",
                     )
                     .await?;
@@ -457,6 +461,7 @@ impl CassandraEngine {
                             &pk_text,
                             start_sk,
                             base_pk_text,
+                            consistent_read,
                             "same_sk_next_base_pk",
                         )
                         .await?;
@@ -483,6 +488,7 @@ impl CassandraEngine {
                         &pk_text,
                         start_sk,
                         base_pk_text,
+                        consistent_read,
                         "same_sk",
                     )
                     .await?;
@@ -529,14 +535,16 @@ impl CassandraEngine {
                             &pk_text,
                             base_pk_text,
                             base_sk,
+                            consistent_read,
                             "same_sk",
                         )
                         .await?
                     } else {
-                        cassandra_util::query_rows(
+                        cassandra_util::query_rows_at(
                             &self.session_arc(),
                             &query1,
                             cdrs_tokio::query_values!(pk_text.as_str(), base_pk_text.as_str()),
+                            consistent_read,
                             "same_sk",
                         )
                         .await?
@@ -576,6 +584,7 @@ impl CassandraEngine {
                         &query2,
                         &pk_text,
                         &sk_binds,
+                        consistent_read,
                         "next_sk",
                     )
                     .await?;
@@ -601,10 +610,11 @@ impl CassandraEngine {
                             "{query} AND base_pk {base_pk_cmp} ? ORDER BY base_pk {dir} LIMIT {remaining}"
                         )
                     };
-                    let rows2 = cassandra_util::query_rows(
+                    let rows2 = cassandra_util::query_rows_at(
                         &self.session_arc(),
                         &query2,
                         cdrs_tokio::query_values!(pk_text.as_str(), base_pk_text.as_str()),
+                        consistent_read,
                         "next_base_pk",
                     )
                     .await?;
@@ -625,18 +635,26 @@ impl CassandraEngine {
             match base_pk_cursor {
                 Some(Some(base_pk_val)) => {
                     let base_pk_text = pk_to_text(base_pk_val)?.into_owned();
-                    cassandra_util::query_rows(
+                    cassandra_util::query_rows_at(
                         &self.session_arc(),
                         &query,
                         cdrs_tokio::query_values!(pk_text.as_str(), base_pk_text.as_str()),
+                        consistent_read,
                         "query",
                     )
                     .await?
                 }
                 Some(None) => Vec::new(),
                 None => {
-                    query_with_pk_sks(&self.session_arc(), &query, &pk_text, &sk_binds, "query")
-                        .await?
+                    query_with_pk_sks(
+                        &self.session_arc(),
+                        &query,
+                        &pk_text,
+                        &sk_binds,
+                        consistent_read,
+                        "query",
+                    )
+                    .await?
                 }
             }
         };

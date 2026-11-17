@@ -7,6 +7,10 @@
 //! `EXTENDDB_TEST_CASSANDRA_CONTACT_POINT` (default 127.0.0.1:9042). The
 //! integration-cassandra workflow runs these against a service container.
 
+// The suites set up and inspect Cassandra state with driver calls at the
+// driver default; the lint in `clippy.toml` guards `src/data/` only.
+#![allow(clippy::disallowed_methods)]
+
 #[path = "common/mod.rs"]
 mod helpers;
 

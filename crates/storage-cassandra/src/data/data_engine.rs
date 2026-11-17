@@ -45,23 +45,28 @@ impl DataEngine for CassandraEngine {
         })
     }
 
-    /// `_opts.consistent_read` is accepted and not acted on. Reads run at the
-    /// driver default consistency `ONE`, and the base-row writes (the OCC and
-    /// put-if-absent lightweight transactions, the plain delete, the
-    /// transaction commit) are acknowledged at `ONE` as well, so a `true` is
-    /// not honoured when the keyspace replication factor is above 1. Serving
-    /// `true` consistently needs those writes acknowledged at `LOCAL_QUORUM`
-    /// and `true` read at `LOCAL_QUORUM` (reads plus writes above the
-    /// replication factor); `false` can stay at `LOCAL_ONE`.
+    /// `opts.consistent_read: true` reads at `LOCAL_QUORUM` and `false` at
+    /// `LOCAL_ONE`. Base-row writes and the lightweight transactions (the OCC
+    /// and put-if-absent writes, the conditional and plain deletes, the
+    /// transaction prepare and commit) are acknowledged at `LOCAL_QUORUM`, with
+    /// serial consistency `LOCAL_SERIAL` for the lightweight transactions.
+    /// The backend creates each keyspace with `NetworkTopologyStrategy` in the
+    /// one datacenter named by `datacenter`, so a `LOCAL_QUORUM` read and a
+    /// `LOCAL_QUORUM` write each reach a majority of the same
+    /// `replication_factor` replicas, and a `true` read reflects every write
+    /// acknowledged before it started (ADR-0025).
     fn get_item(
         &self,
         key_info: &TableKeyInfo,
         key: &Item,
-        _opts: ReadOptions,
+        opts: ReadOptions,
     ) -> BoxFuture<'_, Result<Option<Item>, StorageError>> {
         let key_info = key_info.clone();
         let key = key.clone();
-        Box::pin(async move { self.get_item_impl(&key_info, &key).await })
+        Box::pin(async move {
+            self.get_item_impl(&key_info, &key, opts.consistent_read)
+                .await
+        })
     }
 
     fn delete_item(
@@ -123,7 +128,7 @@ impl DataEngine for CassandraEngine {
         })
     }
 
-    /// `_opts`: see `get_item`.
+    /// `opts`: see `get_item`.
     fn query(
         &self,
         key_info: &TableKeyInfo,
@@ -133,7 +138,7 @@ impl DataEngine for CassandraEngine {
         limit: Option<i64>,
         exclusive_start_key: Option<&Item>,
         index_name: Option<&str>,
-        _opts: ReadOptions,
+        opts: ReadOptions,
     ) -> BoxFuture<'_, Result<(Vec<Item>, Option<Item>), StorageError>> {
         let key_info = key_info.clone();
         let key_condition = key_condition.clone();
@@ -149,12 +154,13 @@ impl DataEngine for CassandraEngine {
                 limit,
                 exclusive_start_key.as_ref(),
                 index_name.as_deref(),
+                opts.consistent_read,
             )
             .await
         })
     }
 
-    /// `_opts`: see `get_item`.
+    /// `opts`: see `get_item`.
     fn scan(
         &self,
         key_info: &TableKeyInfo,
@@ -163,7 +169,7 @@ impl DataEngine for CassandraEngine {
         segment: Option<i64>,
         total_segments: Option<i64>,
         index_name: Option<&str>,
-        _opts: ReadOptions,
+        opts: ReadOptions,
     ) -> BoxFuture<'_, Result<(Vec<Item>, Option<Item>), StorageError>> {
         let key_info = key_info.clone();
         let exclusive_start_key = exclusive_start_key.cloned();
@@ -176,6 +182,7 @@ impl DataEngine for CassandraEngine {
                 segment,
                 total_segments,
                 index_name.as_deref(),
+                opts.consistent_read,
             )
             .await
         })

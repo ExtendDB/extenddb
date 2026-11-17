@@ -9,7 +9,9 @@ use extenddb_storage::error::StorageError;
 use uuid::Uuid;
 
 use crate::CassandraEngine;
-use crate::cassandra_util::{get_column, query_optional, query_rows};
+use crate::cassandra_util::{
+    get_column, lwt_params, query_optional_at, query_rows_at, write_params,
+};
 
 /// Transaction states (from DynamoDB paper).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,16 +122,16 @@ impl CassandraEngine {
 
         let result = self
             .session
-            .query_with_values(
+            .query_with_params(
                 &query,
-                cdrs_tokio::query_values!(
+                lwt_params(cdrs_tokio::query_values!(
                     Bytes::new(txn_id.as_bytes().to_vec()),
                     state.as_str(),
                     started_at,
                     client_token,
                     request_fingerprint,
                     items_blob
-                ),
+                )),
             )
             .await
             .map_err(|e| {
@@ -167,12 +169,12 @@ impl CassandraEngine {
         let query = format!("UPDATE {keyspace}.transaction_ledger SET state = ? WHERE txn_id = ?");
 
         self.session
-            .query_with_values(
+            .query_with_params(
                 &query,
-                cdrs_tokio::query_values!(
+                write_params(cdrs_tokio::query_values!(
                     new_state.as_str(),
                     Bytes::new(txn_id.as_bytes().to_vec())
-                ),
+                )),
             )
             .await
             .map_err(|e| {
@@ -198,9 +200,12 @@ impl CassandraEngine {
         let query =
             format!("UPDATE {keyspace}.transaction_ledger SET items_blob = ? WHERE txn_id = ?");
         self.session
-            .query_with_values(
+            .query_with_params(
                 &query,
-                cdrs_tokio::query_values!(blob, Bytes::new(txn_id.as_bytes().to_vec())),
+                write_params(cdrs_tokio::query_values!(
+                    blob,
+                    Bytes::new(txn_id.as_bytes().to_vec())
+                )),
             )
             .await
             .map_err(|e| {
@@ -221,10 +226,11 @@ impl CassandraEngine {
              FROM {keyspace}.transaction_ledger WHERE txn_id = ?"
         );
 
-        let row = query_optional::<StorageError>(
+        let row = query_optional_at::<StorageError>(
             &self.session,
             &query,
             cdrs_tokio::query_values!(Bytes::new(txn_id.as_bytes().to_vec())),
+            true,
             "read_ledger_entry",
         )
         .await?;
@@ -263,10 +269,11 @@ impl CassandraEngine {
              FROM {keyspace}.transaction_ledger WHERE started_at < ? ALLOW FILTERING"
         );
 
-        let rows = query_rows::<StorageError>(
+        let rows = query_rows_at::<StorageError>(
             &self.session,
             &query,
             cdrs_tokio::query_values!(cutoff_timestamp),
+            true,
             "scan_old_transactions",
         )
         .await?;
@@ -304,9 +311,11 @@ impl CassandraEngine {
         let query = format!("DELETE FROM {keyspace}.transaction_ledger WHERE txn_id = ?");
 
         self.session
-            .query_with_values(
+            .query_with_params(
                 &query,
-                cdrs_tokio::query_values!(Bytes::new(txn_id.as_bytes().to_vec())),
+                write_params(cdrs_tokio::query_values!(Bytes::new(
+                    txn_id.as_bytes().to_vec()
+                ))),
             )
             .await
             .map_err(|e| {

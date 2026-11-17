@@ -11,6 +11,10 @@
 //! One binary, one module per area, sharing tests/common/mod.rs, which is the
 //! in-tree descendant of the plug-in repo's helpers.rs.
 
+// The suites set up and inspect Cassandra state with driver calls at the
+// driver default; the lint in `clippy.toml` guards `src/data/` only.
+#![allow(clippy::disallowed_methods)]
+
 #[path = "common/mod.rs"]
 mod helpers;
 
@@ -28,6 +32,8 @@ mod backup_engine;
 mod cassandra_engine;
 #[path = "direct/concurrent_account_creation.rs"]
 mod concurrent_account_creation;
+#[path = "direct/consistent_read.rs"]
+mod consistent_read;
 #[path = "direct/delete_item.rs"]
 mod delete_item;
 #[path = "direct/groups.rs"]
