@@ -2181,11 +2181,11 @@ mod pitr;
 pub mod reconciler;
 mod restore;
 mod runtime;
+#[cfg(test)]
+mod service_error_tests;
 pub mod store_identity;
 pub mod store_maintenance;
 pub mod sync;
-#[cfg(test)]
-mod service_error_tests;
 #[cfg(test)]
 mod tests;
 
