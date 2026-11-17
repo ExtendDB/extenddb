@@ -87,8 +87,10 @@ pub struct ConsoleIdentity {
     pub csrf_token: String,
     /// Whether the session is an admin login (full management access) rather
     /// than an IAM user's self-service session. The session check admits
-    /// both; a page meant for admins answers 403 when this is false, as
-    /// `/console/settings` and `/console/cache` do.
+    /// both. A page meant for admins refuses an IAM-user session as the
+    /// built-in admin pages do: `/console/settings`, `/console/cache` and
+    /// `/console/metrics` redirect it to `/console`, and
+    /// `/console/metrics-data` answers 403.
     pub is_admin: bool,
     /// Every extension tab as `(label, href)`, for the navigation bar.
     pub tabs: Arc<[(String, String)]>,
