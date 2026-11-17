@@ -20,6 +20,8 @@ mod projection;
 mod reserved_words;
 mod resolver;
 mod search_condition;
+#[cfg(feature = "search-inequality-filters")]
+pub mod search_filter;
 #[cfg(test)]
 mod test_timeout;
 mod tokenizer;

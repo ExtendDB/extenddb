@@ -100,6 +100,13 @@ pub const VECTOR_INDEX_MIN_CREATING_MS: &str = "vector_index_min_creating_ms";
 /// Unset, nothing waits and no branch is taken.
 pub const VECTOR_ALLOCATION_PHASE_DELAY_MS: &str = "vector_allocation_phase_delay_ms";
 
+/// The accounts whose SearchVectors requests accept the extended
+/// `SearchConditionExpression` grammar: `off` (the default when the row is
+/// absent), `all`, or a comma-separated list of 12-digit account IDs. Read on
+/// every SearchVectors request, so a change applies without a restart.
+#[cfg(feature = "search-inequality-filters")]
+pub const SEARCH_INEQUALITY_FILTERS: &str = "search_inequality_filters";
+
 /// Resolve a caller-supplied settings key to its canonical name.
 ///
 /// Accepting the old name keeps `extenddb settings set gsi_propagation_delay_ms 0`
