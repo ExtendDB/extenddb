@@ -817,18 +817,19 @@ effect where it was previously bypassed.
 
 **Who is affected and what to change** (no catalog migration is required):
 
-- **Index reads need an index grant.** Query and Scan with an `IndexName` are
-  authorized against `table/<name>/index/<index>`. A policy granting only
-  `table/<name>` no longer allows that table's index reads; grant
-  `table/<name>/index/<index>` or `table/<name>/index/*`.
-- **Fencing a whole table with a Deny.** Index reads, `ListStreams` with a
+- **Index reads need an index grant.** Query and Scan with an `IndexName`, and
+  SearchVectors, are authorized against `table/<name>/index/<index>`. A policy
+  granting only `table/<name>` no longer allows that table's index reads or
+  SearchVectors; grant `table/<name>/index/<index>` or `table/<name>/index/*`.
+- **Fencing a whole table with a Deny.** Index reads, SearchVectors,
+  `ListStreams` with a
   TableName, and `ListBackups` with a TableName are authorized against a
   sub-resource ARN (`table/<name>/index/*`, `table/<name>/stream/*`,
   `table/<name>/backup/*`), not the bare `table/<name>`. A `Deny` on
-  `table/<name>` does not cover them: add `table/<name>/*` to the `Deny`
+  `table/<name>` does not cover them, so it no longer blocks SearchVectors: add `table/<name>/*` to the `Deny`
   alongside `table/<name>` to fence the whole table.
-- **Index reads and resource tags.** An index Query or Scan evaluates the base
-  table's resource tags, because an index inherits its table's tags. An ABAC
+- **Index reads and resource tags.** An index Query or Scan, and SearchVectors,
+  evaluate the base table's resource tags, because an index inherits its table's tags. An ABAC
   `Deny` or `Allow` conditioned on the table's tags now applies to its indexes.
 - **ListStreams, ListBackups, and resource tags.** ListStreams and ListBackups
   with a TableName are authorized against the table's `stream/*` or `backup/*`
