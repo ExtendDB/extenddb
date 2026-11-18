@@ -118,6 +118,15 @@ In-memory stale-while-revalidate caches sit between the request path and the cat
 | `negative_ttl_seconds` | `5` | Time to live in seconds for negative results ("not found"). Short so newly created entities become usable quickly. |
 | `max_entries` | `10000` | Maximum entries per cache; least recently used entries are evicted beyond it. |
 
+## `[auth.encryption]`
+
+Where the key that encrypts stored secrets comes from. Without this section the server uses the catalog key in the `encryption_key` settings row, as `extenddb init` created it. The release before this one refuses an `[auth.encryption]` table, even an empty one, so the header stays commented until `key_file` is set. The administration guide's [Encryption Key](./manuals/05-admin-guide.md#encryption-key) section gives the procedure, the file format, the ownership and mode the file must have, and the delivery routes.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `key_file` | none | Path of the key-encryption key (KEK) file. Set, the server unwraps the data encryption key (DEK) from the `encryption_key_ring` settings row with the KEK in this file. Set it only after `extenddb encryption-key switch --yes` has run. A leading `~` expands as in the TLS key path, and the path must then be absolute: `serve` changes its working directory to `/` when it detaches, so the configuration refuses a relative path. An in-memory SQLite catalog refuses it. Example: `key_file = "/etc/extenddb/kek"` |
+| `require_locked_memory` | `true` | With `key_file` set, refuse to start when the locked key store that holds the DEK and the cached signing keys cannot lock its memory; the refusal names the memlock limit it needs. false turns the refusal into a warning. Without `key_file` the server warns and starts in either case. |
+
 ## `[limits]`
 
 The defaults match the DynamoDB service quotas. Override them only to test edge cases.

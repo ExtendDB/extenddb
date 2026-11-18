@@ -18,6 +18,8 @@
 # separator between levels:
 #   EXTENDDB__SERVER__PORT=9000
 #   EXTENDDB__STORAGE__POSTGRES__CONNECTION_STRING="postgresql://..."
+#   EXTENDDB__AUTH__ENCRYPTION__KEY_FILE=/etc/extenddb/kek
+#   EXTENDDB__AUTH__ENCRYPTION__REQUIRE_LOCKED_MEMORY=true
 # Every key accepts this form. A list key (import.paths, export.paths,
 # storage.cassandra.contact_points) takes one comma-delimited string:
 #   EXTENDDB__IMPORT__PATHS="/data/in,/data/shared"
@@ -369,6 +371,31 @@
 # Maximum entries per cache; least recently used entries are evicted beyond
 # it.
 # max_entries = 10000
+
+# [auth.encryption]
+# Where the key that encrypts stored secrets comes from. Without this section
+# the server uses the catalog key in the `encryption_key` settings row, as
+# `extenddb init` created it. The release before this one refuses an
+# `[auth.encryption]` table, even an empty one, so the header stays commented
+# until `key_file` is set. The administration guide's
+# [Encryption Key](./manuals/05-admin-guide.md#encryption-key) section gives
+# the procedure, the file format, the ownership and mode the file must have,
+# and the delivery routes.
+
+# Path of the key-encryption key (KEK) file. Set, the server unwraps the data
+# encryption key (DEK) from the `encryption_key_ring` settings row with the
+# KEK in this file. Set it only after `extenddb encryption-key switch --yes`
+# has run. A leading `~` expands as in the TLS key path, and the path must
+# then be absolute: `serve` changes its working directory to `/` when it
+# detaches, so the configuration refuses a relative path. An in-memory SQLite
+# catalog refuses it. No default.
+# key_file = "/etc/extenddb/kek"
+
+# With `key_file` set, refuse to start when the locked key store that holds
+# the DEK and the cached signing keys cannot lock its memory; the refusal
+# names the memlock limit it needs. false turns the refusal into a warning.
+# Without `key_file` the server warns and starts in either case.
+# require_locked_memory = true
 
 [limits]
 # The defaults match the DynamoDB service quotas. Override them only to test

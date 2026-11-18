@@ -30,6 +30,51 @@ async fn forget_refuses_released_ids() {
     assert_eq!(fake.rows("cat"), all);
 }
 
+/// The runner every backend's `forget` builds, `Runner::new`, takes this
+/// binary's own bound: it refuses every id from 1 to `RELEASED_THROUGH`
+/// and forgets the first id above it. The tests above give their runner a
+/// bound; this one is what keeps a release binary from forgetting a
+/// released migration.
+#[tokio::test]
+async fn the_default_runner_refuses_every_id_this_binary_released() {
+    let fake = Fake::new();
+    current(&fake).await;
+    let all: Vec<u32> = (1..=LATEST).collect();
+    // Every id at or below the bound (none while the bound is 0).
+    let released = &all[..RELEASED_THROUGH as usize];
+    for &id in released {
+        let err = Runner::new(&fake, "1.0.0-test")
+            .forget(id)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MigrationError::Refused(_)), "{err:?}");
+        assert_eq!(err.exit_code(), exit::ERROR);
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "migration {id} has been released; only migrations above \
+                 {RELEASED_THROUGH} can be forgotten"
+            ),
+        );
+        assert_eq!(fake.rows("cat"), all);
+    }
+    // The bound itself: with no id released the loop above checks nothing,
+    // so the first id above the bound must be forgotten.
+    let above = RELEASED_THROUGH + 1;
+    if above <= LATEST {
+        Runner::new(&fake, "1.0.0-test")
+            .forget(above)
+            .await
+            .unwrap();
+        let without: Vec<u32> = all.iter().copied().filter(|id| *id != above).collect();
+        assert_eq!(fake.rows("cat"), without);
+        runner(&fake).migrate().await.unwrap();
+        assert_eq!(fake.rows("cat"), all);
+    } else {
+        assert_eq!(RELEASED_THROUGH, LATEST);
+    }
+}
+
 #[tokio::test]
 async fn forget_refuses_an_id_it_cannot_forget() {
     let fake = Fake::new();
@@ -43,7 +88,11 @@ async fn forget_refuses_an_id_it_cannot_forget() {
     assert_eq!(err.exit_code(), exit::ERROR);
     assert!(err.to_string().contains("carries no migration"), "{err}");
     // An id no store has a row for.
-    let err = runner(&fake).forget(LATEST).await.unwrap_err();
+    let err = runner(&fake)
+        .with_released_through(0)
+        .forget(LATEST)
+        .await
+        .unwrap_err();
     assert_eq!(err.exit_code(), exit::ERROR);
     assert!(err.to_string().contains("nothing to forget"), "{err}");
     // 0 is no migration id, whatever the released bound.

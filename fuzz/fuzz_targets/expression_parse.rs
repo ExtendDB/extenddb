@@ -57,7 +57,7 @@ fuzz_target!(|data: &[u8]| {
         }
         _ => {
             if let Ok(tokens) = tokenize_for(expr, max_tokens, ExpressionKind::Update) {
-                let _ = parse_update_from(&tokens, expr);
+                let _ = parse_update_from(&tokens, expr, limits.max_expression_depth);
             }
         }
     }
