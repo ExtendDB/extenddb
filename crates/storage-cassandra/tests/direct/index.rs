@@ -1554,6 +1554,7 @@ fn status_index_creation(table_name: &str) -> extenddb_core::types::UpdateTableI
 
     UpdateTableInput {
         sse_specification: None,
+        replica_updates: None,
         warm_throughput: None,
         table_name: table_name.to_owned(),
         billing_mode: None,

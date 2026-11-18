@@ -363,6 +363,7 @@ fn update_input(table: &str) -> UpdateTableInput {
         vector_index_updates: None,
         warm_throughput: None,
         sse_specification: None,
+        replica_updates: None,
     }
 }
 

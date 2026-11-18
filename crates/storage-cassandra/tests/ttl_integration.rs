@@ -3155,6 +3155,7 @@ async fn test_ttl_enabled_table_rejects_new_async_gsi() {
                 vector_index_updates: None,
                 warm_throughput: None,
                 sse_specification: None,
+                replica_updates: None,
             },
         )
         .await;
