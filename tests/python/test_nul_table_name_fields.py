@@ -189,6 +189,136 @@ class TestSeveralConstraintsAtOnce:
         )
 
 
+SHORT = "Member must have length greater than or equal to 3"
+LONG = "Member must have length less than or equal to 255"
+EMOJI = "\U0001F600"
+VECTOR_UNSUPPORTED = "Vector indexes are not supported by this storage backend"
+
+# Each member that carries an index name: its path in DynamoDB's answer, the
+# operation and the request measured with it. A CreateTable names a table
+# that it does not create. An UpdateTable names a table that does not exist,
+# and DynamoDB refuses the name before it looks the table up.
+INDEX_NAME_MEMBERS = {
+    "gsi": "globalSecondaryIndexes.1.member.indexName",
+    "second-gsi": "globalSecondaryIndexes.2.member.indexName",
+    "lsi": "localSecondaryIndexes.1.member.indexName",
+    "vector": "vectorIndexes.1.member.indexName",
+    "gsi-create": "globalSecondaryIndexUpdates.1.member.create.indexName",
+    "gsi-update": "globalSecondaryIndexUpdates.1.member.update.indexName",
+    "gsi-delete": "globalSecondaryIndexUpdates.1.member.delete.indexName",
+    "vector-create": "vectorIndexUpdates.1.member.create.indexName",
+    "vector-delete": "vectorIndexUpdates.1.member.delete.indexName",
+}
+
+# Measured in us-east-1: #904 on 2026-11-06, #1021 on 2026-11-14 (the emoji
+# names in a CreateTable GSI or LSI and an UpdateTable GSI Create), the other
+# rows on 2026-11-18. DynamoDB lists the two clauses in either order.
+INDEX_NAME_ROWS = [
+    pytest.param(member, name, clauses, id=f"{member}-{label}")
+    for member in INDEX_NAME_MEMBERS
+    if member != "second-gsi"
+    for label, name, clauses in [
+        ("ab", "ab", [SHORT]),
+        ("256-chars", "a" * 256, [LONG]),
+        ("2-emoji", EMOJI * 2, [SHORT, MEMBER_PATTERN]),
+        ("128-emoji", EMOJI * 128, [MEMBER_PATTERN]),
+    ]
+] + [
+    pytest.param("gsi", "g i", [MEMBER_PATTERN], id="gsi-space"),
+    pytest.param("second-gsi", f"g{NUL}i", [MEMBER_PATTERN], id="second-gsi-nul"),
+]
+
+
+def index_name_request(member: str, name: str) -> tuple[str, dict]:
+    keys_only = {"ProjectionType": "KEYS_ONLY"}
+
+    def defs(*names):
+        return [{"AttributeName": n, "AttributeType": "S"} for n in names]
+
+    def gsi(index_name):
+        return {
+            "IndexName": index_name,
+            "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+            "Projection": keys_only,
+        }
+
+    vector = {
+        "IndexName": name,
+        "Dimensions": 4,
+        "DistanceFunction": "COSINE",
+        "VectorAttribute": {"AttributeName": "emb"},
+        "Projection": {"ProjectionType": "ALL"},
+    }
+    table = {
+        "TableName": unique_name("idxn"),
+        "BillingMode": "PAY_PER_REQUEST",
+        "AttributeDefinitions": defs("pk", "g"),
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+    }
+    missing = {"TableName": unique_name("idxn-missing")}
+    if member == "gsi":
+        return "create_table", {**table, "GlobalSecondaryIndexes": [gsi(name)]}
+    if member == "second-gsi":
+        return "create_table", {**table, "GlobalSecondaryIndexes": [gsi("gok"), gsi(name)]}
+    if member == "lsi":
+        return "create_table", {
+            **table,
+            "AttributeDefinitions": defs("pk", "s", "l"),
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "s", "KeyType": "RANGE"},
+            ],
+            "LocalSecondaryIndexes": [
+                {
+                    "IndexName": name,
+                    "KeySchema": [
+                        {"AttributeName": "pk", "KeyType": "HASH"},
+                        {"AttributeName": "l", "KeyType": "RANGE"},
+                    ],
+                    "Projection": keys_only,
+                }
+            ],
+        }
+    if member == "vector":
+        return "create_table", {**table, "AttributeDefinitions": defs("pk"), "VectorIndexes": [vector]}
+    if member == "gsi-create":
+        return "update_table", {
+            **missing,
+            "AttributeDefinitions": defs("pk", "g"),
+            "GlobalSecondaryIndexUpdates": [{"Create": gsi(name)}],
+        }
+    if member == "gsi-update":
+        throughput = {"ReadCapacityUnits": 1, "WriteCapacityUnits": 1}
+        return "update_table", {
+            **missing,
+            "GlobalSecondaryIndexUpdates": [
+                {"Update": {"IndexName": name, "ProvisionedThroughput": throughput}}
+            ],
+        }
+    if member == "gsi-delete":
+        return "update_table", {
+            **missing,
+            "GlobalSecondaryIndexUpdates": [{"Delete": {"IndexName": name}}],
+        }
+    if member == "vector-create":
+        return "update_table", {**missing, "VectorIndexUpdates": [{"Create": vector}]}
+    assert member == "vector-delete", member
+    return "update_table", {**missing, "VectorIndexUpdates": [{"Delete": {"IndexName": name}}]}
+
+
+def refusal(client, operation: str, request: dict) -> ClientError:
+    """The error `operation` answers. A CreateTable that is accepted is
+    deleted before the test fails."""
+    try:
+        getattr(client, operation)(**request)
+    except ClientError as exc:
+        return exc
+    if operation == "create_table":
+        wait_for_active(client, request["TableName"])
+        client.delete_table(TableName=request["TableName"])
+    pytest.fail(f"{operation} was accepted")
+
+
 class TestIndexName:
     def test_query_and_scan_with_nul_index_name(self, raw_client, nul_table):
         name, _ = nul_table
@@ -232,6 +362,21 @@ class TestIndexName:
         assert_member_pattern(
             exc.value, "globalSecondaryIndexUpdates.1.member.delete.indexName", bad
         )
+
+    @pytest.mark.parametrize(("member", "name", "clauses"), INDEX_NAME_ROWS)
+    def test_index_name_is_refused_at_its_member_path(self, raw_client, member, name, clauses):
+        operation, request = index_name_request(member, name)
+        resp = refusal(raw_client, operation, request).response
+        message = resp["Error"]["Message"]
+        if member.startswith("vector") and message == VECTOR_UNSUPPORTED:
+            pytest.skip(VECTOR_UNSUPPORTED)
+        assert resp["ResponseMetadata"]["HTTPStatusCode"] == 400, resp
+        assert resp["Error"]["Code"] == "ValidationException", resp["Error"]
+        path = INDEX_NAME_MEMBERS[member]
+        parts = [f"Value '{name}' at '{path}' failed to satisfy constraint: {c}" for c in clauses]
+        n = len(parts)
+        head = f"{n} validation error{'s' if n > 1 else ''} detected: "
+        assert message in {head + "; ".join(parts), head + "; ".join(reversed(parts))}, message
 
 
 class TestStreamBackupAndTagArns:

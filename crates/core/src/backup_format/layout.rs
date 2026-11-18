@@ -314,8 +314,7 @@ pub fn check_backup_arn(arn: &str) -> Result<BackupArnParts<'_>, BackupArnError>
     };
     // The table-name alphabet is CreateTable's, from the function CreateTable
     // calls (`validate_table_name_chars`), so a name CreateTable accepts is a
-    // name this parser accepts. The engine's `validate_name_member` and
-    // `validate_index_name` spell the same alphabet again.
+    // name this parser accepts.
     if table_name.is_empty()
         || crate::validation::validate_table_name_chars(table_name).is_err()
         || backup_id.is_empty()
