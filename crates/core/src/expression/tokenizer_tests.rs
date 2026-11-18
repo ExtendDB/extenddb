@@ -175,9 +175,11 @@ fn tokenize_underscore_ident() {
 
 #[test]
 fn tokenize_multibyte_utf8_near_an_invalid_byte_does_not_panic() {
-    // Each input has an invalid byte whose five-byte context window ends
-    // inside a two-, three- or four-byte character. In the second and
-    // fourth the invalid byte starts a multi-byte character itself.
+    // Each input has a character outside the grammar near a two-, three- or
+    // four-byte character. The window runs from the start of the previous
+    // token to the end of the next one, so both ends fall on a character
+    // boundary. In the second and fourth inputs the character outside the
+    // grammar is multi-byte itself.
     for input in [
         "\0\0\u{7}#\u{41f}",
         "\u{41f}\u{41f}\u{41f}",
@@ -192,7 +194,8 @@ fn tokenize_multibyte_utf8_near_an_invalid_byte_does_not_panic() {
         );
     }
 
-    // The window ends at the end of the character it would have split.
+    // No token comes before `$`, so the window starts at the start of the
+    // expression. It ends after the next token, the three-byte U+65E5.
     let err = tokenize_with_limit("$  \u{65e5}", 4096).unwrap_err();
     assert!(
         matches!(err, DynamoDbError::ValidationException(ref msg)
@@ -205,12 +208,10 @@ fn tokenize_multibyte_utf8_near_an_invalid_byte_does_not_panic() {
 fn tokenize_reports_the_whole_invalid_character() {
     // The window starts at the previous token, `=`, as the service answers
     // for `#v = é` in `UNKNOWN_CHARACTER_ROWS`.
-    let err = tokenize("a = \u{e9}").unwrap_err();
-    assert!(
-        matches!(err, DynamoDbError::ValidationException(ref msg)
-            if msg.contains("token: \"\u{e9}\", near: \"= \u{e9}\"")),
-        "{err:?}"
-    );
+    let Err(DynamoDbError::ValidationException(msg)) = tokenize("a = \u{e9}") else {
+        panic!("expected a syntax error");
+    };
+    assert_eq!(msg, "Syntax error; token: \"\u{e9}\", near: \"= \u{e9}\"");
 }
 
 #[test]
@@ -284,6 +285,11 @@ const UNKNOWN_CHARACTER_ROWS: &[(&str, &str, &str)] = &[
     ("#v = é abc", "é", "= é abc"),
     ("#v[é12] = :v", "é", "[é12"),
     ("#v BETWEEN é AND :v", "é", "BETWEEN é AND"),
+    // A tab, a line feed or a carriage return before the next token
+    // (measured 2026-11-18).
+    ("#v = é\tabc", "é", "= é\tabc"),
+    ("#v = é\n:v", "é", "= é\n:v"),
+    ("#v = é\r:v", "é", "= é\r:v"),
 ];
 
 #[test]
@@ -295,13 +301,13 @@ fn unknown_character_reports_the_character_and_the_service_window() {
         };
         assert_eq!(msg, expected, "{expr}");
         let Err(DynamoDbError::ValidationException(msg)) =
-            tokenize_for(expr, 4096, super::super::ExpressionKind::Filter)
+            tokenize_for(expr, 4096, super::super::ExpressionKind::Update)
         else {
             panic!("{expr}: expected a syntax error");
         };
         assert_eq!(
             msg,
-            format!("Invalid FilterExpression: {expected}"),
+            format!("Invalid UpdateExpression: {expected}"),
             "{expr}"
         );
     }

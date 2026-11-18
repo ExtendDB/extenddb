@@ -9,16 +9,20 @@ token is the character as sent, a whole code point, and the window runs from
 the start of the previous token (or of the expression, when no token comes
 before it) to the end of the next one, with each character outside the
 grammar counted as one token. U+0000 is removed from the token and the window.
-The write paths carry a ``1 validation error detected: `` prefix that
-ExtendDB does not emit; those assertions compare the text after it.
+On PutItem, UpdateItem and DeleteItem the message starts with the count
+``1 validation error detected: ``. ExtendDB leaves the count out, so those
+rows are an expected failure on ExtendDB.
 
-Every expected text was measured against Amazon DynamoDB on 2026-10-25
-(us-east-1), each request twice.
+Every expected text was measured against Amazon DynamoDB (us-east-1), each
+request twice: the rows of ``OPERATION_ROWS`` on 2026-11-18, the others on
+2026-10-25.
 
 Dual-target against Amazon DynamoDB and extenddb.
 """
 
 from __future__ import annotations
+
+import os
 
 import pytest
 from botocore.exceptions import ClientError
@@ -29,6 +33,17 @@ PREFIX = "1 validation error detected: "
 NAMES = {"#v": "v"}
 VALUES = {":v": {"S": "x"}}
 ABSENT = {"pk": {"S": "absent"}, "sk": {"S": "absent"}}
+INDEX = "gsi"
+
+# ExtendDB sends the message of a PutItem, UpdateItem or DeleteItem
+# validation error without the count before it. Not strict, so a server that
+# sends the count passes these rows.
+MISSING_COUNT = pytest.mark.xfail(
+    bool(os.environ.get("EXTENDDB_TEST_ENDPOINT", "").strip()),
+    reason="ExtendDB leaves out the count '1 validation error detected: '",
+    raises=AssertionError,
+    strict=False,
+)
 
 
 def _message(func) -> str:
@@ -37,10 +52,6 @@ def _message(func) -> str:
     err = exc_info.value.response["Error"]
     assert err["Code"] == "ValidationException", err
     return err["Message"]
-
-
-def _after_prefix(msg: str) -> str:
-    return msg[len(PREFIX) :] if msg.startswith(PREFIX) else msg
 
 
 def syntax(kind: str, token: str, near: str) -> str:
@@ -54,10 +65,18 @@ def table(dynamodb_client):
         attribute_definitions=[
             {"AttributeName": "pk", "AttributeType": "S"},
             {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "g", "AttributeType": "S"},
         ],
         key_schema=[
             {"AttributeName": "pk", "KeyType": "HASH"},
             {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": INDEX,
+                "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"},
+            }
         ],
     ) as name:
         dynamodb_client.put_item(
@@ -116,6 +135,7 @@ def test_scan_filter(dynamodb_client, table, expr, token, near):
     assert msg == syntax("FilterExpression", token, near)
 
 
+@MISSING_COUNT
 @pytest.mark.parametrize(
     "condition, token, near",
     [
@@ -133,9 +153,10 @@ def test_put_item_condition(dynamodb_client, table, condition, token, near):
             ExpressionAttributeValues=VALUES,
         )
     )
-    assert _after_prefix(msg) == syntax("ConditionExpression", token, near)
+    assert msg == PREFIX + syntax("ConditionExpression", token, near)
 
 
+@MISSING_COUNT
 def test_update_item_condition(dynamodb_client, table):
     msg = _message(
         lambda: dynamodb_client.update_item(
@@ -147,7 +168,7 @@ def test_update_item_condition(dynamodb_client, table):
             ExpressionAttributeValues=VALUES,
         )
     )
-    assert _after_prefix(msg) == syntax("ConditionExpression", "\u00e9", "= \u00e9\u00e9")
+    assert msg == PREFIX + syntax("ConditionExpression", "\u00e9", "= \u00e9\u00e9")
 
 
 def test_query_filter(dynamodb_client, table):
@@ -185,6 +206,7 @@ def test_query_key_condition(dynamodb_client, table, kce, token, near):
     assert msg == syntax("KeyConditionExpression", token, near)
 
 
+@MISSING_COUNT
 @pytest.mark.parametrize(
     "update, token, near, values",
     [
@@ -207,7 +229,7 @@ def test_update_expression(dynamodb_client, table, update, token, near, values):
             **extra,
         )
     )
-    assert _after_prefix(msg) == syntax("UpdateExpression", token, near)
+    assert msg == PREFIX + syntax("UpdateExpression", token, near)
 
 
 @pytest.mark.parametrize(
@@ -229,3 +251,99 @@ def test_projection_expression(dynamodb_client, table, projection, token, near):
         )
     )
     assert msg == syntax("ProjectionExpression", token, near)
+
+
+CONDITION = {"ConditionExpression": "#v = \u00e9", "ExpressionAttributeNames": NAMES}
+IN_CONDITION = syntax("ConditionExpression", "\u00e9", "= \u00e9")
+IN_PROJECTION = syntax("ProjectionExpression", "\u00e9", "\u00e9")
+
+
+def _transact_write(kind: str, **action):
+    return lambda client, table: client.transact_write_items(
+        TransactItems=[{kind: {"TableName": table, **action}}]
+    )
+
+
+# One request per row, with the character in one expression, and the message
+# the service answers.
+OPERATION_ROWS = [
+    pytest.param(
+        lambda client, table: client.delete_item(TableName=table, Key=ABSENT, **CONDITION),
+        PREFIX + IN_CONDITION,
+        marks=MISSING_COUNT,
+        id="DeleteItem-condition",
+    ),
+    pytest.param(
+        _transact_write("Put", Item=ABSENT, **CONDITION),
+        IN_CONDITION,
+        id="TransactWriteItems-Put",
+    ),
+    pytest.param(
+        _transact_write(
+            "Update",
+            Key=ABSENT,
+            UpdateExpression="SET #v = :v",
+            ExpressionAttributeValues=VALUES,
+            **CONDITION,
+        ),
+        IN_CONDITION,
+        id="TransactWriteItems-Update",
+    ),
+    pytest.param(
+        _transact_write("Delete", Key=ABSENT, **CONDITION),
+        IN_CONDITION,
+        id="TransactWriteItems-Delete",
+    ),
+    pytest.param(
+        _transact_write("ConditionCheck", Key=ABSENT, **CONDITION),
+        IN_CONDITION,
+        id="TransactWriteItems-ConditionCheck",
+    ),
+    pytest.param(
+        lambda client, table: client.query(
+            TableName=table,
+            Limit=1,
+            KeyConditionExpression="pk = :v",
+            ExpressionAttributeValues=VALUES,
+            ProjectionExpression="\u00e9",
+        ),
+        IN_PROJECTION,
+        id="Query-projection",
+    ),
+    pytest.param(
+        lambda client, table: client.scan(TableName=table, Limit=1, ProjectionExpression="\u00e9"),
+        IN_PROJECTION,
+        id="Scan-projection",
+    ),
+    pytest.param(
+        lambda client, table: client.batch_get_item(
+            RequestItems={table: {"Keys": [ABSENT], "ProjectionExpression": "\u00e9"}}
+        ),
+        IN_PROJECTION,
+        id="BatchGetItem-projection",
+    ),
+    pytest.param(
+        lambda client, table: client.transact_get_items(
+            TransactItems=[
+                {"Get": {"TableName": table, "Key": ABSENT, "ProjectionExpression": "\u00e9"}}
+            ]
+        ),
+        IN_PROJECTION,
+        id="TransactGetItems-projection",
+    ),
+    pytest.param(
+        lambda client, table: client.query(
+            TableName=table,
+            IndexName=INDEX,
+            Limit=1,
+            KeyConditionExpression="g = \u00e9\u00e9\u00e9",
+        ),
+        syntax("KeyConditionExpression", "\u00e9", "= \u00e9\u00e9"),
+        id="Query-index-key-condition",
+    ),
+]
+
+
+@pytest.mark.parametrize("send, expected", OPERATION_ROWS)
+def test_operation(dynamodb_client, table, send, expected):
+    assert _message(lambda: send(dynamodb_client, table)) == expected

@@ -400,7 +400,8 @@ fn unknown_character(input: &str, at: usize, prev_start: Option<usize>) -> (Stri
 /// The byte offset where the next token after `from` ends, skipping the
 /// tokenizer's whitespace, or `None` at the end of input. Mirrors the token
 /// rules of [`tokenize_with_limit`], with a character outside the grammar
-/// counted as one token.
+/// counted as one token. A bare `#` or `:`, which the tokenizer refuses,
+/// counts as a one-byte token, as the service counts it.
 fn next_token_end(input: &str, from: usize) -> Option<usize> {
     let bytes = input.as_bytes();
     let mut i = from;
