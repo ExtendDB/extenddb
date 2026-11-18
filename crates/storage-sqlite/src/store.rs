@@ -252,9 +252,13 @@ impl SqliteEngine {
 
         let internal = |e: String| StorageError::Internal(e);
 
-        // Encryption key.
+        // Encryption key: only into a catalog that has neither a catalog key
+        // nor a key ring. A switched catalog has the ring and no catalog
+        // key, and a catalog key written into it at each start would stop
+        // the next start.
         let key_exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM settings WHERE key = 'encryption_key')",
+            "SELECT EXISTS(SELECT 1 FROM settings \
+             WHERE key IN ('encryption_key', 'encryption_key_ring'))",
         )
         .fetch_one(&self.pool)
         .await
@@ -638,13 +642,12 @@ mod d1_write_lock_tests {
 
     /// Build a catalog store over the engine's pool and, critically, the
     /// engine's OWN write lock, mirroring the server wiring in `lib.rs`. The
-    /// cached key lets access-key creation encrypt without a settings lookup.
+    /// key holder lets access-key creation encrypt.
     fn catalog_store(engine: &SqliteEngine) -> crate::SqliteCatalogStore {
-        use base64::Engine as _;
-        let key = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
-        crate::SqliteCatalogStore::with_encryption_key(
+        let keys = extenddb_storage::secret_keys::SecretKeys::dek_for_tests([0; 32], 1, "test");
+        crate::SqliteCatalogStore::with_secret_keys(
             engine.pool.clone(),
-            key,
+            Some(std::sync::Arc::new(keys)),
             std::sync::Arc::clone(&engine.write_lock),
         )
     }

@@ -26,11 +26,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
-use extenddb_storage::management_store::ManagementStore;
+use extenddb_storage::management_store::{ManagementStore, SettingsStore};
 use extenddb_storage::migrations::{
-    CatalogTraces, Done, HasManagementStore, LedgerColumns, LedgerRow, LedgerWrites, Migration,
-    MigrationBackend, MigrationError, MigrationId, Released, RunReport, Runner, Step, StoreKind,
-    StoreRef, in_transaction, record_rows, sql_ledger_ddl,
+    CatalogTraces, Done, HasManagementStore, LedgerColumns, LedgerRow, LedgerWrites, LockedStores,
+    Migration, MigrationBackend, MigrationError, MigrationId, Released, RunReport, Runner, Step,
+    StoreKind, StoreRef, in_transaction, record_rows, sql_ledger_ddl,
 };
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{ConnectOptions, Connection, SqlitePool};
@@ -48,6 +48,28 @@ pub struct SqliteStores {
 impl HasManagementStore for SqliteStores {
     fn management_store(&self) -> &dyn ManagementStore {
         &self.management
+    }
+}
+
+/// The catalog's stores under a held migration lock, for `encryption-key
+/// switch`, `rotate` and `reset` (RFC-0000 section 8, common rules): the
+/// management store over the runner's one connection, holding no key.
+/// Dropping it closes the connection.
+pub(crate) struct LockedCatalog(SqliteMigrations);
+
+impl LockedCatalog {
+    pub(crate) fn new(migrations: SqliteMigrations) -> Self {
+        Self(migrations)
+    }
+}
+
+impl LockedStores for LockedCatalog {
+    fn management(&self) -> &dyn ManagementStore {
+        &self.0.stores.management
+    }
+
+    fn settings(&self) -> &dyn SettingsStore {
+        &self.0.stores.management
     }
 }
 
@@ -319,9 +341,23 @@ impl SqliteMigrations {
     ///
     /// As [`Runner::forget`]; the database is then as it was.
     pub(crate) async fn forget(&self, id: u32) -> Result<(), MigrationError> {
+        self.forget_with(&Runner::new(self, ""), id).await
+    }
+
+    /// [`SqliteMigrations::forget`] with `runner`, which a test gives
+    /// another released bound.
+    ///
+    /// # Errors
+    ///
+    /// As [`SqliteMigrations::forget`].
+    pub(crate) async fn forget_with(
+        &self,
+        runner: &Runner<'_, Self>,
+        id: u32,
+    ) -> Result<(), MigrationError> {
         in_transaction(
             self.exec("BEGIN IMMEDIATE"),
-            Runner::new(self, "").forget(id),
+            runner.forget(id),
             self.exec("COMMIT"),
             async {
                 let _ = self.exec("ROLLBACK").await;

@@ -56,7 +56,7 @@ A backend moves up one tier in a minor release. Before that release, the maintai
 
 | Backend | Tier | Topology | Data across upgrades | API coverage | CI | Known limits |
 |---|---|---|---|---|---|---|
-| PostgreSQL | Stable | PostgreSQL 14 or later, on the same host, on another host or as a managed service. | `extenddb migrate --yes` migrates the catalog in place. CI upgrades catalogs that 0.1.x releases created. | The operations in [Supported Operations](#supported-operations). Vector search needs the pgvector extension. | `integration`, required, on PostgreSQL 16 | Time to Live (TTL) removes about 100 expired items per table per minute. |
+| PostgreSQL | Stable | PostgreSQL 14 or later, on the same host, on another host or as a managed service. | `extenddb migrate --yes` migrates the catalog in place. CI upgrades catalogs that 0.1.14 and earlier releases created. | The operations in [Supported Operations](#supported-operations). Vector search needs the pgvector extension. | `integration`, required, on PostgreSQL 16 | Time to Live (TTL) removes about 100 expired items per table per minute. |
 | SQLite | Stable (single node) | SQLite runs in the server process. A lock file allows one server for each database file. There is no production image, so build from source. | As PostgreSQL. `migrate --yes` copies the database file before its first change. | The operations in Supported Operations. | `integration`, required | One write transaction at a time. TTL as PostgreSQL. |
 | MongoDB | Beta | MongoDB 7.0 or later, as a replica set, also for one node. | As PostgreSQL. | No vector search. On a global secondary index (GSI) with more than one RANGE attribute, `Query` takes a key condition on the first one only. | `mongodb-integration`, required, on MongoDB 7 | A number in a key attribute has at most 34 significant digits. The database names are fixed, so one replica set holds one catalog. TTL as PostgreSQL. |
 | Cassandra | Experimental | Cassandra 4.1 or later, with `PasswordAuthenticator`. Each table takes its writes in one datacenter. | `migrate --yes` migrates the catalog. No rollback procedure is tested. | No vector search. CreateBackup keeps each backup in the catalog, with or without a backup store. The `Query` limit of MongoDB on a GSI with more than one RANGE attribute. | `cassandra-integration`, required, on Cassandra 4.1 | Some management operations are not atomic. A few known race conditions are open. TTL removes about 1,000 expired items per table per minute. See [Known Limitations](docs/cassandra-setup.md#known-limitations). |
@@ -113,7 +113,7 @@ scripts/install-macos.sh   # macOS
 
 ## Prerequisites
 
-- Rust 1.88+ (`rustup update`)
+- Rust 1.91.1+ (`rustup update`)
 - Python 3.10+ (for test suites and documentation)
 - A storage backend:
   - PostgreSQL 14+ (see `docs/local-postgres-setup.md`)
@@ -176,7 +176,7 @@ key_path = "/etc/extenddb/tls/key.pem"
 
 The production images contain ExtendDB only. The storage backend runs as a separate service. See
 [`docker/README.md`](docker/README.md) for the PostgreSQL image, [`docker/README-mongodb.md`](docker/README-mongodb.md) for the MongoDB image,
-and [`docker/README-cassandra.md`](docker/README-cassandra.md) for the Cassandra image (published from 1.0): external database requirements,
+and [`docker/README-cassandra.md`](docker/README-cassandra.md) for the Cassandra image (published from 0.1.15): external database requirements,
 hardened local Compose stacks, smoke tests, and explicit init/migrate/serve production lifecycle. The SQLite
 backend has no production container image; [`docs/dev-image.md`](docs/dev-image.md) covers the SQLite development image.
 

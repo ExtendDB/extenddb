@@ -41,6 +41,9 @@ tracing-subscriber = { workspace = true }
 base64 = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
+# The connection string that `encryption-key reset` and `set-data-connection`
+# read from standard input, wiped when it drops.
+zeroize = { workspace = true }
 
 # Daemon mode (double-fork, PID files, SIGTERM) is POSIX-only; on Windows the
 # server runs with `serve --foreground` under an external supervisor.
@@ -50,3 +53,6 @@ libc = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
+# The encryption-key commands' tests run on a SQLite file catalog.
+extenddb-storage-sqlite = { path = "../storage-sqlite" }
+tempfile = "3"

@@ -13,10 +13,8 @@ mod migrations_support;
 use std::time::Duration;
 
 use extenddb_storage::hooks::{Reregistration, ServingRegistrar};
-use extenddb_storage::migrations::{CatalogStatus, MigrationError, MigrationId, Runner};
-use extenddb_storage_postgres::migrations::{
-    MigrationLock, PostgresMigrations, ServerRegistration, migrate,
-};
+use extenddb_storage::migrations::{CatalogStatus, MigrationError, MigrationId};
+use extenddb_storage_postgres::migrations::{MigrationLock, ServerRegistration, migrate};
 use migrations_support::{LATEST, Scratch, base_conn, pool, skip};
 use sqlx::PgPool;
 
@@ -131,7 +129,7 @@ async fn a_registration_the_database_ended_is_taken_again_on_a_new_session() {
 
 /// A migration that holds the catalog when the server tries again refuses
 /// the attempt, which leaves no key behind: one that holds both keys, and one
-/// of a release before 1.0 that holds the migration key alone. Once it has
+/// of a release before 0.1.15 that holds the migration key alone. Once it has
 /// finished without a change, the server registers again.
 #[tokio::test]
 async fn a_migration_that_holds_the_catalog_refuses_the_registration() {
@@ -196,15 +194,15 @@ async fn a_status_that_changed_while_unregistered_refuses_the_registration() {
         .expect("register");
     end_the_serving_session(&admin, &s).await;
     lost(&registration).await;
-    // A migrator clears the latest migration in the meantime.
-    let lock = MigrationLock::acquire(&s.options(), Duration::from_secs(5))
+    // The catalog changes in the meantime: the latest migration's ledger
+    // row is deleted (the version row is left as it was).
+    let catalog = s.catalog().await;
+    sqlx::query("DELETE FROM extenddb_migrations WHERE id = $1")
+        .bind(i32::try_from(LATEST).unwrap())
+        .execute(&catalog)
         .await
-        .unwrap();
-    let m = PostgresMigrations::open(&s.target(), &lock).await.unwrap();
-    let forgot = Runner::new(&m, RELEASE).forget(LATEST).await;
-    m.close().await;
-    lock.release().await;
-    forgot.expect("forget the latest migration");
+        .expect("delete the latest migration's ledger row");
+    catalog.close().await;
     match registration.register_again().await {
         Reregistration::Refused(why) => assert!(
             why.contains("status changed")
