@@ -17,24 +17,426 @@ pub type CassandraSession = Session<
     RoundRobinLoadBalancingStrategy<TransportTcp, TcpConnectionManager>,
 >;
 
-/// Execute a lightweight transaction with explicit regional quorum and serial
-/// consistency. TTL claims and lifecycle metadata use this rather than the
-/// driver's default consistency.
+// ══════════════════════════════════════════════════════════════════════════════
+// Consistency policy (#770)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// The kind of a statement. [`params`] gives each kind its consistency level,
+/// so this enum and [`params`] are the only place that sets the level of a
+/// statement. [`batch`] does the same for batches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stmt {
+    /// A read: `LOCAL_QUORUM`.
+    Read,
+    /// A write without a condition: `LOCAL_QUORUM`.
+    Write,
+    /// A conditional write (LWT): Paxos at `LOCAL_SERIAL`, commit at
+    /// `LOCAL_QUORUM`.
+    Lwt,
+    /// A read at `LOCAL_SERIAL`, which sees every committed Paxos round.
+    SerialRead,
+    /// A read at `ALL`, for two kinds of read. The first reads rows that an
+    /// earlier version of ExtendDB wrote at `ONE`: the in-catalog backup
+    /// payload that `backup migrate-legacy` reads. A quorum read can miss a
+    /// row that only one replica holds. At `ALL`, every replica answers, so a
+    /// replica that is down fails the read instead of shortening it. The
+    /// restore of an in-catalog backup reads the same rows as [`Stmt::Read`]:
+    /// a row that read misses fails the restore with an item count mismatch.
+    /// The second is the encryption-key commands' reads of the key rows and
+    /// of the stored secrets ([`Stmt::WriteAll`]).
+    ReadAll,
+    /// A write without a condition at `ALL`. The encryption-key commands
+    /// (RFC-0000 section 8.4) write the key ring row, and rewrite and delete
+    /// the stored secrets, at `ALL`, so every replica holds the new
+    /// ciphertexts and the new ring before the old key goes. A replica that
+    /// is down fails the write.
+    WriteAll,
+    /// A conditional write (LWT) of the encryption-key commands: Paxos at
+    /// `LOCAL_SERIAL`, commit at `ALL` ([`Stmt::WriteAll`]).
+    LwtAll,
+    /// `CREATE`, `ALTER`, `DROP`, `GRANT` or `REVOKE`: `ONE`. Cassandra does
+    /// not use the client's consistency level for these statements.
+    Ddl,
+    /// A read of a node-local system table (`system.local`, `system.peers`,
+    /// `system_schema`): `ONE`.
+    SystemRead,
+}
+
+impl Stmt {
+    /// Whether the kind is a `SELECT`: only these kinds may be paged.
+    #[must_use]
+    pub fn is_read(self) -> bool {
+        matches!(
+            self,
+            Stmt::Read | Stmt::SerialRead | Stmt::ReadAll | Stmt::SystemRead
+        )
+    }
+}
+
+/// The consistency level of a statement of `kind`, and its serial level
+/// when it has one. [`params`] and [`params_paged`] both read it, so it is
+/// the one place that maps a kind to its levels.
+fn levels(
+    kind: Stmt,
+) -> (
+    cdrs_tokio::consistency::Consistency,
+    Option<cdrs_tokio::consistency::Consistency>,
+) {
+    use cdrs_tokio::consistency::Consistency;
+
+    match kind {
+        Stmt::Read | Stmt::Write => (Consistency::LocalQuorum, None),
+        Stmt::Lwt => (Consistency::LocalQuorum, Some(Consistency::LocalSerial)),
+        Stmt::LwtAll => (Consistency::All, Some(Consistency::LocalSerial)),
+        Stmt::SerialRead => (Consistency::LocalSerial, None),
+        Stmt::ReadAll | Stmt::WriteAll => (Consistency::All, None),
+        Stmt::Ddl | Stmt::SystemRead => (Consistency::One, None),
+    }
+}
+
+/// The statement parameters for a statement of `kind` with `values`.
+#[must_use]
+pub fn params(kind: Stmt, values: QueryValues) -> cdrs_tokio::statement::StatementParams {
+    use cdrs_tokio::statement::StatementParamsBuilder;
+
+    let (level, serial) = levels(kind);
+    let builder = StatementParamsBuilder::new()
+        .with_values(values)
+        .with_consistency(level);
+    match serial {
+        Some(serial) => builder.with_serial_consistency(serial),
+        None => builder,
+    }
+    .build()
+}
+
+/// The statement parameters for one page of a read of `kind`. `page_size`
+/// is the number of rows in a page. `paging_state` is `None` for the first
+/// page, and for each next page it is the paging state that the page before
+/// returned. The level is the one [`params`] gives `kind`.
+#[must_use]
+pub fn params_paged(
+    kind: Stmt,
+    values: QueryValues,
+    page_size: i32,
+    paging_state: Option<cdrs_tokio::types::CBytes>,
+) -> cdrs_tokio::statement::StatementParams {
+    use cdrs_tokio::statement::StatementParamsBuilder;
+
+    let (level, _) = levels(kind);
+    let mut builder = StatementParamsBuilder::new()
+        .with_values(values)
+        .with_consistency(level)
+        .with_page_size(page_size);
+    if let Some(state) = paging_state {
+        builder = builder.with_paging_state(state);
+    }
+    builder.build()
+}
+
+/// Run one statement at the consistency level of its kind. Every statement
+/// outside this module and `migrations/` goes through [`PolicySession::run`]
+/// or a helper that calls it.
+pub trait PolicySession {
+    /// Run `query` with `values` as a statement of `kind`, with the
+    /// parameters [`params`] gives that kind. In a debug build, a statement
+    /// whose CQL does not match `kind` ([`shape_error`]) panics.
+    ///
+    /// # Errors
+    /// Returns the driver's error if the statement fails.
+    fn run<Q: AsRef<str>>(
+        &self,
+        kind: Stmt,
+        query: Q,
+        values: QueryValues,
+    ) -> impl std::future::Future<
+        Output = Result<cdrs_tokio::frame::Envelope, cdrs_tokio::error::Error>,
+    > + Send;
+
+    /// Run one page of a read: like [`PolicySession::run`], with `page_size`
+    /// rows in the page, starting at `paging_state` (`None` for the first
+    /// page). In a debug build, a `kind` that is not a read panics. The
+    /// next page starts at the paging state in the rows metadata of the
+    /// response.
+    ///
+    /// # Errors
+    /// Returns the driver's error if the statement fails.
+    fn run_paged<Q: AsRef<str>>(
+        &self,
+        kind: Stmt,
+        query: Q,
+        values: QueryValues,
+        page_size: i32,
+        paging_state: Option<cdrs_tokio::types::CBytes>,
+    ) -> impl std::future::Future<
+        Output = Result<cdrs_tokio::frame::Envelope, cdrs_tokio::error::Error>,
+    > + Send;
+
+    /// Send `batch`. In a debug build, a batch whose levels are not the ones
+    /// [`batch`] sets ([`batch_level_error`]) panics.
+    ///
+    /// # Errors
+    /// Returns the driver's error if the batch fails.
+    fn run_batch(
+        &self,
+        batch: cdrs_tokio::query::QueryBatch,
+    ) -> impl std::future::Future<
+        Output = Result<cdrs_tokio::frame::Envelope, cdrs_tokio::error::Error>,
+    > + Send;
+}
+
+impl PolicySession for CassandraSession {
+    fn run_batch(
+        &self,
+        batch: cdrs_tokio::query::QueryBatch,
+    ) -> impl std::future::Future<
+        Output = Result<cdrs_tokio::frame::Envelope, cdrs_tokio::error::Error>,
+    > + Send {
+        debug_assert!(
+            batch_level_error(&batch).is_none(),
+            "batch: {}",
+            batch_level_error(&batch).unwrap_or_default()
+        );
+        self.batch(batch)
+    }
+
+    fn run<Q: AsRef<str>>(
+        &self,
+        kind: Stmt,
+        query: Q,
+        values: QueryValues,
+    ) -> impl std::future::Future<
+        Output = Result<cdrs_tokio::frame::Envelope, cdrs_tokio::error::Error>,
+    > + Send {
+        let query = query.as_ref().to_owned();
+        debug_assert!(
+            shape_error(kind, &query).is_none(),
+            // The CQL text is not in the message: it can hold a password
+            // (CREATE ROLE) or account names.
+            "{kind:?} statement: {}",
+            shape_error(kind, &query).unwrap_or_default()
+        );
+        async move { self.query_with_params(query, params(kind, values)).await }
+    }
+
+    fn run_paged<Q: AsRef<str>>(
+        &self,
+        kind: Stmt,
+        query: Q,
+        values: QueryValues,
+        page_size: i32,
+        paging_state: Option<cdrs_tokio::types::CBytes>,
+    ) -> impl std::future::Future<
+        Output = Result<cdrs_tokio::frame::Envelope, cdrs_tokio::error::Error>,
+    > + Send {
+        let query = query.as_ref().to_owned();
+        debug_assert!(
+            kind.is_read() && shape_error(kind, &query).is_none(),
+            "{kind:?} paged statement: {}",
+            if kind.is_read() {
+                shape_error(kind, &query).unwrap_or_default()
+            } else {
+                "a paged statement must be a read"
+            }
+        );
+        async move {
+            self.query_with_params(query, params_paged(kind, values, page_size, paging_state))
+                .await
+        }
+    }
+}
+
+/// What is wrong with `query` as a statement of `kind`, or `None` when its
+/// CQL matches `kind`:
+///
+/// - [`Stmt::Read`], [`Stmt::SerialRead`] and [`Stmt::ReadAll`]: a `SELECT` that does not read
+///   `system.*` or `system_schema.*`.
+/// - [`Stmt::SystemRead`]: a `SELECT` from `system.*` or `system_schema.*`.
+/// - [`Stmt::Write`] and [`Stmt::WriteAll`]: an `INSERT`, `UPDATE`, `DELETE`
+///   or `BEGIN BATCH` with no `IF` condition.
+/// - [`Stmt::Lwt`] and [`Stmt::LwtAll`]: an `INSERT`, `UPDATE` or `DELETE`
+///   with an `IF` condition.
+/// - [`Stmt::Ddl`]: a `CREATE`, `ALTER`, `DROP`, `GRANT` or `REVOKE`.
+///
+/// Quoted literals and identifiers are removed before the check, so an `IF`
+/// inside a string does not count.
+#[must_use]
+pub fn shape_error(kind: Stmt, query: &str) -> Option<&'static str> {
+    let words = cql_words(query);
+    let first = words.first().map_or("", String::as_str);
+    let conditional = words.iter().any(|word| word == "IF");
+    // Each node keeps its own copy of these keyspaces (LocalStrategy).
+    let system = words
+        .iter()
+        .skip_while(|word| *word != "FROM")
+        .nth(1)
+        .is_some_and(|table| table.starts_with("SYSTEM.") || table.starts_with("SYSTEM_SCHEMA."));
+    match kind {
+        Stmt::Read | Stmt::SerialRead | Stmt::ReadAll => {
+            if first != "SELECT" {
+                Some("a read must be a SELECT")
+            } else if system {
+                Some("a read of system.* or system_schema.* must use Stmt::SystemRead")
+            } else {
+                None
+            }
+        }
+        Stmt::SystemRead => {
+            if first != "SELECT" {
+                Some("a system read must be a SELECT")
+            } else if system {
+                None
+            } else {
+                Some("a system read must read system.* or system_schema.*")
+            }
+        }
+        Stmt::Write | Stmt::WriteAll => {
+            if !matches!(first, "INSERT" | "UPDATE" | "DELETE" | "BEGIN") {
+                Some("a write must be an INSERT, UPDATE, DELETE or BEGIN BATCH")
+            } else if conditional {
+                Some("a write with an IF condition must use Stmt::Lwt or Stmt::LwtAll")
+            } else {
+                None
+            }
+        }
+        Stmt::Lwt | Stmt::LwtAll => {
+            if !matches!(first, "INSERT" | "UPDATE" | "DELETE") {
+                Some("an LWT must be an INSERT, UPDATE or DELETE")
+            } else if conditional {
+                None
+            } else {
+                Some("an LWT must have an IF condition")
+            }
+        }
+        Stmt::Ddl => (!matches!(first, "CREATE" | "ALTER" | "DROP" | "GRANT" | "REVOKE"))
+            .then_some("DDL must be a CREATE, ALTER, DROP, GRANT or REVOKE"),
+    }
+}
+
+/// What is wrong with the levels of `batch`, or `None` when they are the
+/// ones [`batch`] sets: `LOCAL_QUORUM`, with `LOCAL_SERIAL` for a
+/// conditional batch.
+#[must_use]
+pub fn batch_level_error(batch: &cdrs_tokio::query::QueryBatch) -> Option<&'static str> {
+    use cdrs_tokio::consistency::Consistency;
+
+    if batch.request.consistency != Consistency::LocalQuorum {
+        Some("a batch must run at LOCAL_QUORUM; build it with cassandra_util::batch()")
+    } else if batch.request.serial_consistency != Some(Consistency::LocalSerial) {
+        Some("a batch must have LOCAL_SERIAL; build it with cassandra_util::batch()")
+    } else {
+        None
+    }
+}
+
+/// The words of `query` in upper case, with quoted literals and quoted
+/// identifiers removed. A word holds letters, digits, `_` and `.`.
+fn cql_words(query: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote: Option<char> = None;
+    for c in query.chars() {
+        if let Some(open) = quote {
+            if c == open {
+                quote = None;
+            }
+            continue;
+        }
+        if c == '\'' || c == '"' {
+            quote = Some(c);
+        } else if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
+            word.push(c.to_ascii_uppercase());
+            continue;
+        }
+        if !word.is_empty() {
+            words.push(std::mem::take(&mut word));
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+/// A batch builder at `LOCAL_QUORUM`, with `LOCAL_SERIAL` for a conditional
+/// batch. Use it in place of `BatchQueryBuilder::new()`.
+#[must_use]
+pub fn batch() -> cdrs_tokio::query::BatchQueryBuilder {
+    use cdrs_tokio::consistency::Consistency;
+
+    cdrs_tokio::query::BatchQueryBuilder::new()
+        .with_consistency(Consistency::LocalQuorum)
+        .with_serial_consistency(Consistency::LocalSerial)
+}
+
+/// Run a `CREATE`, `ALTER` or `DROP` statement.
+///
+/// # Errors
+/// Returns an error if the Cassandra statement fails.
+pub async fn ddl<E: FromDbError>(
+    session: &Arc<CassandraSession>,
+    query: &str,
+    context: &str,
+) -> Result<(), E> {
+    session
+        .run(Stmt::Ddl, query, QueryValues::SimpleValues(vec![]))
+        .await
+        .map_err(|e| {
+            tracing::error!("{context} DDL failed: {e}");
+            E::db_error(format!("{context}: {e}"))
+        })?;
+    Ok(())
+}
+
+/// Read rows from a node-local system table (`system.local`,
+/// `system.peers`, `system_schema`).
+///
+/// # Errors
+/// Returns an error if the Cassandra query fails or the response cannot be parsed.
+pub async fn system_read<E: FromDbError>(
+    session: &Arc<CassandraSession>,
+    query: &str,
+    values: QueryValues,
+    context: &str,
+) -> Result<Vec<Row>, E> {
+    rows_at(session, query, Stmt::SystemRead, values, context).await
+}
+
+/// Run `query` with `values` as a statement of `kind` and return its rows.
+/// The error keeps the driver's message.
+///
+/// # Errors
+/// Returns an error if the Cassandra query fails or the response cannot be parsed.
+pub(crate) async fn rows_at<E: FromDbError>(
+    session: &Arc<CassandraSession>,
+    query: &str,
+    kind: Stmt,
+    values: QueryValues,
+    context: &str,
+) -> Result<Vec<Row>, E> {
+    let result = session.run(kind, query, values).await.map_err(|e| {
+        tracing::error!("{context} query failed: {e}");
+        E::db_error(format!("{context}: {e}"))
+    })?;
+
+    let body = result.response_body().map_err(|e| {
+        tracing::error!("{context} response_body failed: {e}");
+        E::db_error(format!("{context} response_body: {e}"))
+    })?;
+
+    Ok(body.into_rows().unwrap_or_default())
+}
+
+/// Execute a lightweight transaction: Paxos at `LOCAL_SERIAL`, commit at
+/// `LOCAL_QUORUM`. Returns the response, for callers that read more than
+/// the `[applied]` flag.
 pub async fn query_lwt(
     session: &CassandraSession,
     query: &str,
     values: QueryValues,
 ) -> Result<cdrs_tokio::frame::Envelope, extenddb_storage::error::StorageError> {
-    use cdrs_tokio::consistency::Consistency;
-    use cdrs_tokio::statement::StatementParamsBuilder;
-
-    let params = StatementParamsBuilder::new()
-        .with_consistency(Consistency::LocalQuorum)
-        .with_serial_consistency(Consistency::LocalSerial)
-        .with_values(values)
-        .build();
     session
-        .query_with_params(query, params)
+        .run(Stmt::Lwt, query, values)
         .await
         .map_err(|error| {
             extenddb_storage::error::StorageError::Internal(format!("LWT query failed: {error}"))
@@ -85,7 +487,7 @@ pub fn is_fk_violation(_err: &cdrs_tokio::error::Error) -> bool {
 // Phase 1: Core Query Helpers
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// Execute a query and return all rows with standardized error handling.
+/// Execute a query at `LOCAL_QUORUM` and return all rows.
 ///
 /// # Errors
 /// Returns an error if the Cassandra query fails or the response cannot be parsed.
@@ -95,56 +497,7 @@ pub async fn query_rows<E: FromDbError>(
     values: QueryValues,
     context: &str,
 ) -> Result<Vec<Row>, E> {
-    let result = session
-        .query_with_values(query, values)
-        .await
-        .map_err(|e| {
-            tracing::error!("{context} query failed: {e}");
-            E::db_error(format!("{context}: {e}"))
-        })?;
-
-    let body = result.response_body().map_err(|e| {
-        tracing::error!("{context} response_body failed: {e}");
-        E::db_error(format!("{context} response_body: {e}"))
-    })?;
-
-    Ok(body.into_rows().unwrap_or_default())
-}
-
-/// Execute a query at `LOCAL_QUORUM` and return all rows.
-///
-/// [`query_rows`] uses the driver's default consistency, which is `ONE`. Use
-/// this instead wherever an *empty* result is treated as authoritative and acted
-/// on destructively: at `ONE` a replica that has not yet received a write reads
-/// as empty, and a decision made on that read cannot be undone by a timestamp
-/// guard, because the write it missed is older than the guard.
-pub async fn query_rows_quorum<E: FromDbError>(
-    session: &Arc<CassandraSession>,
-    query: &str,
-    values: QueryValues,
-    context: &str,
-) -> Result<Vec<Row>, E> {
-    use cdrs_tokio::consistency::Consistency;
-    use cdrs_tokio::statement::StatementParamsBuilder;
-
-    let params = StatementParamsBuilder::new()
-        .with_consistency(Consistency::LocalQuorum)
-        .with_values(values)
-        .build();
-    let result = session
-        .query_with_params(query, params)
-        .await
-        .map_err(|e| {
-            tracing::error!("{context} quorum query failed: {e}");
-            E::db_error(format!("{context}: {e}"))
-        })?;
-
-    let body = result.response_body().map_err(|e| {
-        tracing::error!("{context} response_body failed: {e}");
-        E::db_error(format!("{context} response_body: {e}"))
-    })?;
-
-    Ok(body.into_rows().unwrap_or_default())
+    rows_at(session, query, Stmt::Read, values, context).await
 }
 
 /// Execute a query at `LOCAL_SERIAL` and return all rows: the read sees
@@ -157,27 +510,7 @@ pub async fn query_rows_serial<E: FromDbError>(
     values: QueryValues,
     context: &str,
 ) -> Result<Vec<Row>, E> {
-    use cdrs_tokio::consistency::Consistency;
-    use cdrs_tokio::statement::StatementParamsBuilder;
-
-    let params = StatementParamsBuilder::new()
-        .with_consistency(Consistency::LocalSerial)
-        .with_values(values)
-        .build();
-    let result = session
-        .query_with_params(query, params)
-        .await
-        .map_err(|e| {
-            tracing::error!("{context} serial query failed: {e}");
-            E::db_error(format!("{context}: {e}"))
-        })?;
-
-    let body = result.response_body().map_err(|e| {
-        tracing::error!("{context} response_body failed: {e}");
-        E::db_error(format!("{context} response_body: {e}"))
-    })?;
-
-    Ok(body.into_rows().unwrap_or_default())
+    rows_at(session, query, Stmt::SerialRead, values, context).await
 }
 
 /// Execute a query and return the first row, if any.
@@ -196,7 +529,7 @@ pub async fn query_optional<E: FromDbError>(
     Ok(rows.drain(..).next())
 }
 
-/// Execute a non-query statement (INSERT/UPDATE/DELETE).
+/// Execute a non-query statement (INSERT/UPDATE/DELETE) at `LOCAL_QUORUM`.
 ///
 /// # Errors
 /// Returns an error if the Cassandra statement fails.
@@ -206,44 +539,34 @@ pub async fn execute<E: FromDbError>(
     values: QueryValues,
     context: &str,
 ) -> Result<(), E> {
-    session
-        .query_with_values(query, values)
-        .await
-        .map_err(|e| {
-            tracing::error!("{context} execute failed: {e}");
-            E::db_error("Database error".to_owned())
-        })?;
+    session.run(Stmt::Write, query, values).await.map_err(|e| {
+        tracing::error!("{context} execute failed: {e}");
+        E::db_error("Database error".to_owned())
+    })?;
 
     Ok(())
 }
 
-/// Execute a non-query statement at `LOCAL_QUORUM`.
+/// Execute a non-query statement of `kind`, at the level [`params`] gives
+/// that kind. Unlike [`execute`], the error keeps the driver's message.
 ///
-/// Use this for writes that are prerequisites for a later quorum operation or
-/// whose loss would make an absence decision unsafe.
+/// Name the kind for writes that are prerequisites for a later read at that
+/// level, or whose loss would make an absence decision unsafe.
 ///
 /// # Errors
-/// Returns an error if Cassandra does not acknowledge the statement at quorum.
-pub async fn execute_quorum<E: FromDbError>(
+/// Returns an error if Cassandra does not acknowledge the statement at the
+/// level of `kind`.
+pub(crate) async fn execute_at<E: FromDbError>(
     session: &Arc<CassandraSession>,
     query: &str,
     values: QueryValues,
+    kind: Stmt,
     context: &str,
 ) -> Result<(), E> {
-    use cdrs_tokio::consistency::Consistency;
-    use cdrs_tokio::statement::StatementParamsBuilder;
-
-    let params = StatementParamsBuilder::new()
-        .with_consistency(Consistency::LocalQuorum)
-        .with_values(values)
-        .build();
-    session
-        .query_with_params(query, params)
-        .await
-        .map_err(|error| {
-            tracing::error!("{context} quorum execute failed: {error}");
-            E::db_error(format!("{context}: {error}"))
-        })?;
+    session.run(kind, query, values).await.map_err(|error| {
+        tracing::error!("{context} {kind:?} execute failed: {error}");
+        E::db_error(format!("{context}: {error}"))
+    })?;
     Ok(())
 }
 
@@ -376,6 +699,8 @@ pub fn lwt_applied(
     })
 }
 
+/// Execute a lightweight transaction (Paxos at `LOCAL_SERIAL`, commit at
+/// `LOCAL_QUORUM`) and return whether it applied.
 ///
 /// Parses the `[applied]` column from the Cassandra LWT response.
 /// Use for `INSERT ... IF NOT EXISTS` and `UPDATE ... IF ...` statements.
@@ -388,46 +713,27 @@ pub async fn apply_lwt<E: FromDbError>(
     values: QueryValues,
     context: &str,
 ) -> Result<bool, E> {
-    let result = session
-        .query_with_values(query, values)
-        .await
-        .map_err(|e| {
-            tracing::error!("{context} lwt failed: {e}");
-            E::db_error("Database error".to_owned())
-        })?;
-    lwt_applied_flag(&result, context)
+    apply_lwt_at(session, query, values, Stmt::Lwt, context).await
 }
 
-/// [`apply_lwt`] with the commit phase at `LOCAL_QUORUM`.
-///
-/// [`apply_lwt`] commits at the driver's default consistency, `ONE`, so a
-/// `LOCAL_QUORUM` read issued after it returns can still miss the write. Use
-/// this where a later quorum read must see the change. The serial phase keeps
-/// the default, `SERIAL`, which every other LWT on these rows also uses.
+/// [`apply_lwt`] as a statement of `kind`: [`Stmt::Lwt`], or
+/// [`Stmt::LwtAll`] for the commit phase at `ALL`. The serial phase runs at
+/// `LOCAL_SERIAL` for both.
 ///
 /// # Errors
-/// Returns an error if Cassandra does not acknowledge the statement at quorum
-/// or the response cannot be parsed.
-pub async fn apply_lwt_quorum<E: FromDbError>(
+/// Returns an error if Cassandra does not acknowledge the statement at the
+/// level of `kind` or the response cannot be parsed.
+pub(crate) async fn apply_lwt_at<E: FromDbError>(
     session: &Arc<CassandraSession>,
     query: &str,
     values: QueryValues,
+    kind: Stmt,
     context: &str,
 ) -> Result<bool, E> {
-    use cdrs_tokio::consistency::Consistency;
-    use cdrs_tokio::statement::StatementParamsBuilder;
-
-    let params = StatementParamsBuilder::new()
-        .with_consistency(Consistency::LocalQuorum)
-        .with_values(values)
-        .build();
-    let result = session
-        .query_with_params(query, params)
-        .await
-        .map_err(|e| {
-            tracing::error!("{context} quorum lwt failed: {e}");
-            E::db_error("Database error".to_owned())
-        })?;
+    let result = session.run(kind, query, values).await.map_err(|e| {
+        tracing::error!("{context} lwt failed: {e}");
+        E::db_error("Database error".to_owned())
+    })?;
     lwt_applied_flag(&result, context)
 }
 
@@ -448,4 +754,300 @@ fn lwt_applied_flag<E: FromDbError>(
         .and_then(|rows| rows.into_iter().next())
         .and_then(|row| row.get_r_by_name("[applied]").ok())
         .unwrap_or(false))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Stmt, batch, batch_level_error, params, params_paged, shape_error};
+
+    fn one_insert(builder: cdrs_tokio::query::BatchQueryBuilder) -> cdrs_tokio::query::QueryBatch {
+        builder
+            .add_query(
+                "INSERT INTO ks.t (id) VALUES (1)",
+                QueryValues::SimpleValues(vec![]),
+            )
+            .build()
+            .expect("a batch")
+    }
+
+    #[test]
+    fn only_a_batch_from_batch_has_the_policy_levels() {
+        assert_eq!(batch_level_error(&one_insert(batch())), None);
+        assert!(
+            batch_level_error(&one_insert(cdrs_tokio::query::BatchQueryBuilder::new())).is_some()
+        );
+        assert!(batch_level_error(&one_insert(Default::default())).is_some());
+        assert!(
+            batch_level_error(&one_insert(
+                cdrs_tokio::query::BatchQueryBuilder::new()
+                    .with_consistency(Consistency::LocalQuorum)
+            ))
+            .is_some(),
+            "LOCAL_QUORUM without LOCAL_SERIAL"
+        );
+    }
+
+    #[test]
+    fn a_read_must_be_a_select() {
+        assert_eq!(
+            shape_error(Stmt::Read, "SELECT a FROM ks.t WHERE pk = ?"),
+            None
+        );
+        assert_eq!(shape_error(Stmt::SerialRead, "select a from ks.t"), None);
+        assert_eq!(
+            shape_error(
+                Stmt::Read,
+                "SELECT role FROM system_auth.roles WHERE role = ?"
+            ),
+            None,
+            "system_auth is replicated, so it is not a SystemRead"
+        );
+        assert!(shape_error(Stmt::Read, "SELECT token(?) AS t FROM system.local").is_some());
+        assert!(
+            shape_error(
+                Stmt::SerialRead,
+                "SELECT table_name FROM system_schema.tables"
+            )
+            .is_some()
+        );
+        assert!(shape_error(Stmt::Read, "UPDATE ks.t SET a = 1 WHERE pk = ?").is_some());
+        assert!(shape_error(Stmt::SerialRead, "DELETE FROM ks.t WHERE pk = ?").is_some());
+    }
+
+    #[test]
+    fn a_system_read_must_read_a_system_table() {
+        assert_eq!(
+            shape_error(
+                Stmt::SystemRead,
+                "SELECT keyspace_name FROM system_schema.keyspaces"
+            ),
+            None
+        );
+        assert_eq!(
+            shape_error(Stmt::SystemRead, "SELECT data_center FROM system.local"),
+            None
+        );
+        assert!(shape_error(Stmt::SystemRead, "SELECT role FROM system_auth.roles").is_some());
+        assert!(shape_error(Stmt::SystemRead, "SELECT a FROM ks.t").is_some());
+        assert!(shape_error(Stmt::SystemRead, "DELETE FROM system.local").is_some());
+    }
+
+    #[test]
+    fn a_write_has_no_condition() {
+        assert_eq!(
+            shape_error(Stmt::Write, "INSERT INTO ks.t (a) VALUES (?)"),
+            None
+        );
+        assert_eq!(
+            shape_error(Stmt::Write, "UPDATE ks.t SET a = ? WHERE pk = ?"),
+            None
+        );
+        assert_eq!(
+            shape_error(Stmt::Write, "DELETE FROM ks.t WHERE pk = ?"),
+            None
+        );
+        assert_eq!(
+            shape_error(
+                Stmt::Write,
+                "BEGIN BATCH\nINSERT INTO ks.t (a) VALUES (1)\nAPPLY BATCH"
+            ),
+            None
+        );
+        assert!(
+            shape_error(Stmt::Write, "INSERT INTO ks.t (a) VALUES (?) IF NOT EXISTS").is_some()
+        );
+        assert!(shape_error(Stmt::Write, "UPDATE ks.t SET a = ? WHERE pk = ? IF a = ?").is_some());
+        assert!(shape_error(Stmt::Write, "DELETE FROM ks.t WHERE pk = ? IF EXISTS").is_some());
+        assert!(shape_error(Stmt::Write, "SELECT a FROM ks.t").is_some());
+    }
+
+    #[test]
+    fn an_lwt_has_a_condition() {
+        assert_eq!(
+            shape_error(Stmt::Lwt, "INSERT INTO ks.t (a) VALUES (?) IF NOT EXISTS"),
+            None
+        );
+        assert_eq!(
+            shape_error(Stmt::Lwt, "UPDATE ks.t SET a = ? WHERE pk = ? IF a = null"),
+            None
+        );
+        assert!(shape_error(Stmt::Lwt, "UPDATE ks.t SET a = ? WHERE pk = ?").is_some());
+        assert!(shape_error(Stmt::Lwt, "SELECT a FROM ks.t").is_some());
+    }
+
+    #[test]
+    fn ddl_is_create_alter_drop_or_a_role_statement() {
+        for cql in [
+            "CREATE TABLE IF NOT EXISTS ks.t (a int PRIMARY KEY)",
+            "ALTER TABLE ks.t ADD b int",
+            "DROP KEYSPACE IF EXISTS ks",
+            "CREATE ROLE IF NOT EXISTS 'app' WITH PASSWORD = 'x' AND LOGIN = true",
+            "GRANT 'app' TO 'admin'",
+            "REVOKE 'app' FROM 'admin'",
+        ] {
+            assert_eq!(shape_error(Stmt::Ddl, cql), None, "{cql}");
+        }
+        assert!(shape_error(Stmt::Ddl, "INSERT INTO ks.t (a) VALUES (1)").is_some());
+    }
+
+    #[test]
+    fn a_quoted_if_is_not_a_condition() {
+        assert_eq!(
+            shape_error(Stmt::Write, "INSERT INTO ks.t (a) VALUES ('IF x = 1')"),
+            None
+        );
+        assert_eq!(
+            shape_error(
+                Stmt::Write,
+                "UPDATE ks.t SET \"IF\" = 'it''s IF' WHERE pk = ?"
+            ),
+            None
+        );
+        assert!(shape_error(Stmt::Lwt, "INSERT INTO ks.t (a) VALUES ('IF')").is_some());
+    }
+    use cdrs_tokio::consistency::Consistency;
+    use cdrs_tokio::query::QueryValues;
+
+    fn levels(kind: Stmt) -> (Consistency, Option<Consistency>) {
+        let built = params(kind, QueryValues::SimpleValues(vec![]));
+        (
+            built.query_params.consistency,
+            built.query_params.serial_consistency,
+        )
+    }
+
+    #[test]
+    fn reads_and_writes_run_at_local_quorum() {
+        assert_eq!(levels(Stmt::Read), (Consistency::LocalQuorum, None));
+        assert_eq!(levels(Stmt::Write), (Consistency::LocalQuorum, None));
+    }
+
+    #[test]
+    fn an_lwt_runs_paxos_at_local_serial_and_commits_at_local_quorum() {
+        assert_eq!(
+            levels(Stmt::Lwt),
+            (Consistency::LocalQuorum, Some(Consistency::LocalSerial))
+        );
+    }
+
+    #[test]
+    fn a_serial_read_runs_at_local_serial() {
+        assert_eq!(levels(Stmt::SerialRead), (Consistency::LocalSerial, None));
+    }
+
+    #[test]
+    fn the_all_kinds_run_at_all() {
+        assert_eq!(levels(Stmt::ReadAll), (Consistency::All, None));
+        assert_eq!(levels(Stmt::WriteAll), (Consistency::All, None));
+        assert_eq!(
+            levels(Stmt::LwtAll),
+            (Consistency::All, Some(Consistency::LocalSerial))
+        );
+    }
+
+    #[test]
+    fn a_write_all_has_no_condition_and_an_lwt_all_has_one() {
+        let plain = "UPDATE ks.t SET a = ? WHERE pk = ?";
+        let conditional = "UPDATE ks.t SET a = ? WHERE pk = ? IF a = ?";
+        assert_eq!(shape_error(Stmt::WriteAll, plain), None);
+        assert!(shape_error(Stmt::WriteAll, conditional).is_some());
+        assert_eq!(shape_error(Stmt::LwtAll, conditional), None);
+        assert!(shape_error(Stmt::LwtAll, plain).is_some());
+    }
+
+    #[test]
+    fn a_read_all_must_be_a_select_of_a_replicated_table() {
+        assert_eq!(
+            shape_error(Stmt::ReadAll, "SELECT a FROM ks.t WHERE pk = ?"),
+            None
+        );
+        assert!(shape_error(Stmt::ReadAll, "SELECT a FROM system.local").is_some());
+        assert!(shape_error(Stmt::ReadAll, "DELETE FROM ks.t WHERE pk = ?").is_some());
+    }
+
+    fn paged_levels(kind: Stmt) -> (Consistency, Option<Consistency>) {
+        let built = params_paged(kind, QueryValues::SimpleValues(vec![]), 10, None);
+        (
+            built.query_params.consistency,
+            built.query_params.serial_consistency,
+        )
+    }
+
+    #[test]
+    fn a_page_of_a_read_has_the_level_of_its_kind() {
+        for kind in [
+            Stmt::Read,
+            Stmt::SerialRead,
+            Stmt::ReadAll,
+            Stmt::SystemRead,
+        ] {
+            assert_eq!(paged_levels(kind), levels(kind), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_page_has_its_size_and_its_paging_state() {
+        let first = params_paged(Stmt::Read, QueryValues::SimpleValues(vec![]), 25, None);
+        assert_eq!(first.query_params.page_size, Some(25));
+        assert_eq!(first.query_params.paging_state, None);
+        let state = cdrs_tokio::types::CBytes::new(vec![1, 2, 3]);
+        let next = params_paged(
+            Stmt::Read,
+            QueryValues::SimpleValues(vec![]),
+            25,
+            Some(state.clone()),
+        );
+        assert_eq!(next.query_params.page_size, Some(25));
+        assert_eq!(next.query_params.paging_state, Some(state));
+    }
+
+    #[test]
+    fn only_a_read_can_be_paged() {
+        for kind in [
+            Stmt::Read,
+            Stmt::SerialRead,
+            Stmt::ReadAll,
+            Stmt::SystemRead,
+        ] {
+            assert!(kind.is_read(), "{kind:?}");
+        }
+        for kind in [
+            Stmt::Write,
+            Stmt::Lwt,
+            Stmt::WriteAll,
+            Stmt::LwtAll,
+            Stmt::Ddl,
+        ] {
+            assert!(!kind.is_read(), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn ddl_and_system_reads_run_at_one() {
+        assert_eq!(levels(Stmt::Ddl), (Consistency::One, None));
+        assert_eq!(levels(Stmt::SystemRead), (Consistency::One, None));
+    }
+
+    #[test]
+    fn params_keep_the_values() {
+        let values = QueryValues::SimpleValues(vec![1_i32.into()]);
+        let built = params(Stmt::Write, values.clone());
+        assert_eq!(built.query_params.values, Some(values));
+    }
+
+    #[test]
+    fn a_batch_runs_at_local_quorum_and_local_serial() {
+        let built = batch()
+            .add_query(
+                "INSERT INTO ks.t (id) VALUES (1)",
+                QueryValues::SimpleValues(vec![]),
+            )
+            .build()
+            .expect("a batch");
+        assert_eq!(built.request.consistency, Consistency::LocalQuorum);
+        assert_eq!(
+            built.request.serial_consistency,
+            Some(Consistency::LocalSerial)
+        );
+    }
 }

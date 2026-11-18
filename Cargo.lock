@@ -1660,7 +1660,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb"
-version = "0.1.15"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "extenddb-app",
@@ -1677,7 +1677,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-app"
-version = "0.1.15"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1691,6 +1691,7 @@ dependencies = [
  "extenddb-engine",
  "extenddb-server",
  "extenddb-storage",
+ "extenddb-storage-sqlite",
  "futures",
  "libc",
  "rcgen",
@@ -1698,16 +1699,18 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "tempfile",
  "time",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
 name = "extenddb-auth"
-version = "0.1.15"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "aws-credential-types",
@@ -1718,6 +1721,7 @@ dependencies = [
  "extenddb-core",
  "futures",
  "hex",
+ "libc",
  "proptest",
  "serde_json",
  "sha2 0.10.9",
@@ -1730,7 +1734,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-backup-store"
-version = "0.1.15"
+version = "1.0.0"
 dependencies = [
  "aws-config",
  "aws-runtime",
@@ -1755,7 +1759,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-cache"
-version = "0.1.15"
+version = "1.0.0"
 dependencies = [
  "futures",
  "moka",
@@ -1766,7 +1770,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-config"
-version = "0.1.15"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "config",
@@ -1781,7 +1785,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-core"
-version = "0.1.15"
+version = "1.0.0"
 dependencies = [
  "base64 0.22.1",
  "bigdecimal",
@@ -1797,7 +1801,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-engine"
-version = "0.1.15"
+version = "1.0.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1823,7 +1827,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-server"
-version = "0.1.15"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1862,11 +1866,12 @@ dependencies = [
  "tracing-subscriber",
  "unicode-properties",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
 name = "extenddb-storage"
-version = "0.1.15"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -1892,7 +1897,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-storage-cassandra"
-version = "0.1.15"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1923,7 +1928,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-storage-mongodb"
-version = "0.1.15"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1953,7 +1958,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-storage-postgres"
-version = "0.1.15"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1985,7 +1990,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-storage-sqlite"
-version = "0.1.15"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
