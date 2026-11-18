@@ -201,12 +201,31 @@ pub fn resolve_condition(
     }
 
     let maps = build_expression_maps(names, values);
-    let condition = parse_optional_condition(condition_expression, limits)?;
+    let condition = parse_optional_condition(condition_expression, limits)
+        .map_err(count_leading_underscore_refusal)?;
     if let Some(ref expr) = condition {
         validate_ordering_operand_types(expr, &maps)
             .map_err(|e| prefix_expression_error(e, ExpressionKind::Condition))?;
     }
     Ok((condition, maps))
+}
+
+/// `PutItem`, `UpdateItem` and `DeleteItem` put `1 validation error detected: `
+/// ahead of the syntax error for a name that starts with `_`. The other
+/// operations, `TransactWriteItems` included, send the syntax error alone
+/// (measured on Amazon `DynamoDB` 2026-11-18).
+#[must_use]
+pub fn count_leading_underscore_refusal(err: DynamoDbError) -> DynamoDbError {
+    match err {
+        DynamoDbError::ValidationException(msg)
+            if msg
+                .split_once(": ")
+                .is_some_and(|(_, body)| body.starts_with("Syntax error; token: \"_\"")) =>
+        {
+            DynamoDbError::ValidationException(format!("1 validation error detected: {msg}"))
+        }
+        other => other,
+    }
 }
 
 /// Tokenize, reserved-word check, and parse a `ProjectionExpression`.
@@ -346,6 +365,37 @@ mod tests {
                 if msg.starts_with("Invalid FilterExpression:")),
             "got {err:?}"
         );
+    }
+
+    /// A name that starts with `_` in a filter, a PutItem condition, an
+    /// UpdateItem update and a TransactWriteItems update, in the parse each
+    /// runs, with Amazon DynamoDB's answers (measured 2026-11-14 and
+    /// 2026-11-18). The single-item writes count the refusal.
+    #[test]
+    fn a_name_that_starts_with_an_underscore_is_refused_as_the_service_refuses_it() {
+        use ExpressionKind::{Condition, Filter, Update};
+        let limits = LimitsConfig::default();
+        let counted = "1 validation error detected: ";
+        let filter = parse_optional_filter(Some("attribute_exists(_x)"), &limits).map(drop);
+        let put = Some("attribute_not_exists(_x)");
+        let condition = resolve_condition(put, None, None, None, None, &limits).map(drop);
+        let update = parse_update_expr("SET _x = :v", &limits).map(drop);
+        let update_item = update.clone().map_err(count_leading_underscore_refusal);
+        let rows = [
+            (filter, "", Filter, "(_x"),
+            (condition, counted, Condition, "(_x"),
+            (update_item, counted, Update, "SET _x"),
+            // TransactWriteItems parses the same update and does not count it.
+            (update, "", Update, "SET _x"),
+        ];
+        for (answer, count_text, kind, near) in rows {
+            let expected =
+                format!("{count_text}Invalid {kind}: Syntax error; token: \"_\", near: \"{near}\"");
+            assert!(
+                matches!(&answer, Err(DynamoDbError::ValidationException(m)) if *m == expected),
+                "got {answer:?}, expected {expected}"
+            );
+        }
     }
 
     #[test]
