@@ -18,7 +18,8 @@ pub(super) enum Role<'a> {
     Sort(SortCondition<'a>),
     /// Any other predicate on a key attribute.
     OnKey,
-    /// A key attribute compared with something that is not a value.
+    /// A key attribute compared with something that is not a value, or a
+    /// NOT or an OR that stays in the filter and names one (see [`role`]).
     KeyAndPath(&'a str),
     /// A path into a key attribute.
     IntoKey(&'a str),
@@ -100,6 +101,15 @@ pub(super) fn role<'a>(expr: &'a WhereExpr, keys: KeyNames<'_>) -> Role<'a> {
                 role(inner, keys)
             }
         }
+        // An OR that `split` keeps whole (no side tests a key attribute outside a
+        // NOT) and that tests a key attribute stays in the disjunct's filter. The
+        // refusal names the key as for a NOT over an AND or an OR (measured
+        // 2026-11-14 and 2026-11-18: beside `pk = 'a'`, `(NOT sk = 's0' OR x = 0)`
+        // names sk and `(NOT pk = 'b' OR x = 0)` names pk).
+        WhereExpr::Or(..) => match named_key(expr, keys) {
+            Some(key) if mentions_key(expr, keys) => Role::KeyAndPath(key),
+            _ => other_role(expr, keys),
+        },
         other => other_role(other, keys),
     }
 }
@@ -296,7 +306,8 @@ fn operand_key<'a>(op: &'a Operand, keys: KeyNames<'_>) -> Option<&'a str> {
     }
 }
 
-/// The key attribute the filter refusal of a NOT over an AND or an OR names:
+/// The key attribute the filter refusal of a NOT over an AND or an OR, or
+/// of an OR kept whole (see [`role`]), names:
 /// the sort key when the condition names it, itself or as the root of a
 /// path, else the partition key (measured 2026-11-02: `pk = 'a' AND NOT
 /// (sk.q = 1 AND pk = b)` and `pk = 'a' AND NOT (pk = b AND sk.q = 1)` name
