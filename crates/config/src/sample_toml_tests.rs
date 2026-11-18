@@ -10,7 +10,8 @@
 use crate::backup::{BackupConfig, BackupStoreConfig, FilesystemStoreConfig, S3StoreConfig};
 use crate::sample_toml_support as support;
 use crate::{
-    AuthCacheConfigToml, AuthConfig, ImportExportPathConfig, LoggingConfig, ServerConfig, TlsConfig,
+    AuthCacheConfigToml, AuthConfig, EncryptionConfig, ImportExportPathConfig, LoggingConfig,
+    ServerConfig, TlsConfig,
 };
 use extenddb_core::limits::LimitsConfig;
 
@@ -53,6 +54,7 @@ fn no_default_marker_matches_the_example_keys() {
         "storage.mongodb.max_catalog_connections",
         "storage.cassandra.username",
         "storage.cassandra.password",
+        "auth.encryption.key_file",
         "backup.spool_path",
         "backup.store.s3.region",
         "backup.store.s3.endpoint",
@@ -113,6 +115,19 @@ fn auth_section_matches_auth_config() {
 fn auth_cache_section_matches_auth_cache_config() {
     let root = support::sample();
     support::pin(&root, "auth.cache", &[], &AuthCacheConfigToml::default());
+}
+
+#[test]
+fn auth_encryption_section_matches_encryption_config() {
+    let root = support::sample();
+    // `key_file` is `Option<String>` with no default; the sample shows an
+    // example path and its value is not compared.
+    support::pin(
+        &root,
+        "auth.encryption",
+        &["key_file"],
+        &EncryptionConfig::default(),
+    );
 }
 
 #[test]

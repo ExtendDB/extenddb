@@ -3,13 +3,13 @@
 
 //! The `[auth.encryption]` section.
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::expand_tilde;
 
 /// The `[auth.encryption]` section: the key-encryption key (KEK) file and the
 /// locked memory rule.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EncryptionConfig {
     /// Path of the KEK file. Not set: the server uses the catalog key in the
