@@ -206,12 +206,16 @@ function versionOutput(release) {
 }
 
 // Releases next to `release` that a looser comparison accepts. A major.minor
-// comparison accepts one patch release either side. A prefix match accepts
-// the release with a digit added or removed.
+// comparison accepts one patch release either side. An ordered comparison
+// accepts the release before, which for an X.Y.0 release is on the line
+// before: X.(Y-1).99, or (X-1).99.99 for X.0.0. A prefix match accepts the
+// release with a digit added or removed.
 function nearReleases(release) {
   const [major, minor, patch] = release.split(".").map(Number);
   const near = [`${major}.${minor}.${patch + 1}`, `${release}0`, release.slice(0, -1)];
   if (patch > 0) near.push(`${major}.${minor}.${patch - 1}`);
+  else if (minor > 0) near.push(`${major}.${minor - 1}.99`);
+  else if (major > 0) near.push(`${major - 1}.99.99`);
   return near;
 }
 
