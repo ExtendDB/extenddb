@@ -256,13 +256,14 @@ pub fn validate_warm_throughput_on_update(
 /// an index `Update` alone, reaches the table lookup and answers
 /// `ResourceNotFoundException` (S10, T5a, T5c).
 ///
-/// TableClass, DeletionProtection and SSE have the same "only operation" rule
+/// TableClass and DeletionProtection have the same "only operation" rule
 /// on their own, without WarmThroughput (measured), but ExtendDB does not apply
 /// it elsewhere yet; here the companion's own sentence is used only when
 /// WarmThroughput is present, so a request without WarmThroughput is never
 /// refused by this function. `VectorIndexUpdates` is an ExtendDB extension and
 /// is grouped with the WarmThroughput sentence, unmeasured. `AttributeDefinitions`
-/// is not an operation.
+/// is not an operation. `UpdateTable` checks the SSE rule beside the other
+/// measured companions before it calls this function (2026-11-18).
 ///
 /// # Errors
 ///

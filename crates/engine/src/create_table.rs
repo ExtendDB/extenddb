@@ -127,7 +127,7 @@ pub async fn handle_create_table(
 /// The service's refusals of an `SSESpecification` whose members do not go
 /// together. They come after the member faults. Only an `Enabled` of `true`
 /// or `false` is checked.
-fn check_sse_specification(spec: Option<&Value>) -> Result<(), DynamoDbError> {
+pub(crate) fn check_sse_specification(spec: Option<&Value>) -> Result<(), DynamoDbError> {
     let Some(spec) = spec else {
         return Ok(());
     };

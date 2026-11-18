@@ -286,6 +286,49 @@ fn rows() -> Vec<((&'static str, Value), Option<String>)> {
             refused(sse_type, SSE_TYPE, SSE_SET),
         ));
     }
+    for (spec, expected) in [
+        (
+            json!({"Enabled": true, "SSEType": "AES256"}),
+            invalid("SSEType AES256 is not supported"),
+        ),
+        (json!({"Enabled": true, "SSEType": "BOGUS"}), sse_bogus),
+        (
+            kms_key("alias/no-such-key"),
+            invalid("SSEType KMS is required if KMSMasterKeyId is specified"),
+        ),
+        // Without Enabled, an SSEType or a KMSMasterKeyId reads as Enabled
+        // true.
+        (
+            json!({"SSEType": "AES256"}),
+            invalid("SSEType AES256 is not supported"),
+        ),
+        (
+            json!({"KMSMasterKeyId": "alias/no-such-key"}),
+            invalid("SSEType KMS is required if KMSMasterKeyId is specified"),
+        ),
+    ] {
+        rows.push((update(json!({"SSESpecification": spec})), expected));
+    }
+    // The service refuses a specification beside another change.
+    let only =
+        invalid("Server-Side Encryption modification must be the only operation in the request");
+    let units = json!({"ReadCapacityUnits": 5, "WriteCapacityUnits": 5});
+    for companion in [
+        json!({"DeletionProtectionEnabled": false}),
+        json!({"TableClass": "STANDARD_INFREQUENT_ACCESS"}),
+        stream(true, "NEW_IMAGE"),
+        json!({
+            "AttributeDefinitions": defs(&["pk"]),
+            "GlobalSecondaryIndexUpdates": [{"Create": index("gsi1", "pk", "ALL")}],
+        }),
+        json!({"ProvisionedThroughput": units}),
+        json!({"OnDemandThroughput": {"MaxReadRequestUnits": 100}}),
+        json!({"BillingMode": "PROVISIONED", "ProvisionedThroughput": units}),
+        json!({"BillingMode": "PAY_PER_REQUEST"}),
+    ] {
+        let kms = json!({"SSESpecification": {"Enabled": true, "SSEType": "KMS"}});
+        rows.push((update(with(companion, kms)), only.clone()));
+    }
     rows
 }
 
