@@ -4,7 +4,8 @@
 //! `DynamoDB` reserved word list.
 //!
 //! Bare identifiers matching these words are rejected in expressions unless
-//! aliased via `ExpressionAttributeNames`.
+//! aliased via `ExpressionAttributeNames`. A bare `size` is rejected only in a
+//! `SearchConditionExpression`.
 
 use std::collections::HashSet;
 use std::sync::LazyLock;
@@ -35,6 +36,12 @@ pub fn validate_no_reserved_words(tokens: &[Token]) -> Result<(), DynamoDbError>
 }
 
 pub fn is_reserved(word: &str) -> bool {
+    // Amazon DynamoDB reads a bare `size` as an attribute name (measured
+    // 2026-11-14, 2026-11-16 and 2026-11-18).
+    !word.eq_ignore_ascii_case("size") && is_listed(word)
+}
+
+pub(crate) fn is_listed(word: &str) -> bool {
     RESERVED_SET.contains(word.to_ascii_uppercase().as_str())
 }
 
@@ -613,3 +620,7 @@ const RESERVED_WORDS: &[&str] = &[
     "YEAR",
     "ZONE",
 ];
+
+#[cfg(test)]
+#[path = "reserved_words_tests.rs"]
+mod tests;
