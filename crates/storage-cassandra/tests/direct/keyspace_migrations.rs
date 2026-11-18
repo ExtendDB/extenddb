@@ -23,7 +23,7 @@ use cdrs_tokio::cluster::session::{SessionBuilder, TcpSessionBuilder};
 use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
 use extenddb_storage::error::StorageError;
 use extenddb_storage_cassandra::CassandraSession;
-use extenddb_storage_cassandra::cassandra_util::{get_column, query_rows};
+use extenddb_storage_cassandra::cassandra_util::{get_column, system_read};
 use extenddb_storage_cassandra::migrations::{migrate_account, migrate_catalog_keyspace};
 
 /// Connections per node, the `max_connections` default.
@@ -170,7 +170,7 @@ async fn schema_names(
     keyspace: &str,
     columns: &[&str],
 ) -> BTreeSet<String> {
-    let rows = query_rows::<StorageError>(
+    let rows = system_read::<StorageError>(
         session,
         query,
         cdrs_tokio::query_values!(keyspace),

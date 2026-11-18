@@ -198,8 +198,18 @@ IAM-type entities.
 Runtime settings storage (key-value store):
 - `get_setting`, `set_setting`, `list_settings`, `cached_encryption_key`
 
-Settings include `control_plane_delay_seconds`, `log_level`, and the
-encryption key for access key secrets.
+Settings include `control_plane_delay_seconds`, `log_level`, and the key
+material for stored secrets: the catalog key (`encryption_key`) or, with
+`[auth.encryption] key_file` set, the key ring (`encryption_key_ring`) that
+holds the data encryption key wrapped under the key-encryption key in that
+file. One function in `crates/storage` loads the key from the two rows and the
+configured key source at startup and returns the one key the server uses, or a
+refusal that names the command that fixes the state (the admin guide's
+Encryption Key section). Each backend holds that key once, in the locked key
+store, and a store built without the key refuses to create, import or store a
+credential. The re-encryption pass of `extenddb encryption-key` is one driver in
+this crate; each backend adds a paged read of the credential rows, a batch write
+of ciphertexts by primary key, and the delete of one settings row.
 
 ### MetricsStore
 

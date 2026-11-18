@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use extenddb_storage::management_store::{MetricsRow, OpError, OpResult};
+use extenddb_storage::secret_keys::SecretKeys;
 use futures::future::BoxFuture;
 use sqlx::PgPool;
 
@@ -21,40 +22,32 @@ use sqlx::PgPool;
 /// and shared (via `Arc`) across management API handlers and background workers.
 pub struct PostgresCatalogStore {
     pool: PgPool,
-    /// P119: Cached encryption key (immutable after bootstrap). Avoids
-    /// per-request DB query on access key and assume-role operations.
-    encryption_key: Option<Arc<str>>,
+    /// The key holder the server's factory loaded at startup, shared with
+    /// the credential store: the catalog key, or the DEK of the key ring.
+    /// Access key creation and import encrypt with it, and AssumeRole
+    /// reads it through `CatalogStore::secret_keys`. `None` for a store
+    /// opened without a key, which writes no credential.
+    keys: Option<Arc<SecretKeys>>,
 }
 
 impl PostgresCatalogStore {
-    /// Create a new catalog store wrapping the given pool.
+    /// Create a new catalog store wrapping the given pool, with no key
+    /// holder.
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
-        Self {
-            pool,
-            encryption_key: None,
-        }
+        Self { pool, keys: None }
     }
 
-    /// Create a new catalog store with a pre-loaded encryption key (P119).
+    /// Create a new catalog store with the key holder the factory loaded.
     #[must_use]
-    pub fn with_encryption_key(pool: PgPool, encryption_key: String) -> Self {
-        Self {
-            pool,
-            encryption_key: Some(Arc::from(encryption_key.as_str())),
-        }
+    pub fn with_secret_keys(pool: PgPool, keys: Option<Arc<SecretKeys>>) -> Self {
+        Self { pool, keys }
     }
 
     /// Borrow the underlying pool (escape hatch for callers not yet migrated).
     #[must_use]
     pub fn pool(&self) -> &PgPool {
         &self.pool
-    }
-
-    /// Get the cached encryption key. Returns `None` if not loaded at startup.
-    #[must_use]
-    pub fn encryption_key(&self) -> Option<&Arc<str>> {
-        self.encryption_key.as_ref()
     }
 }
 
@@ -99,6 +92,29 @@ impl extenddb_storage::management_store::SettingsStore for PostgresCatalogStore 
         })
     }
 
+    fn replace_setting(
+        &self,
+        key: &str,
+        expected: &str,
+        value: &str,
+    ) -> futures::future::BoxFuture<'_, OpResult<bool>> {
+        let (key, expected, value) = (key.to_owned(), expected.to_owned(), value.to_owned());
+        let pool = self.pool.clone();
+        Box::pin(async move {
+            let done = sqlx::query("UPDATE settings SET value = $3 WHERE key = $1 AND value = $2")
+                .bind(&key)
+                .bind(&expected)
+                .bind(&value)
+                .execute(&pool)
+                .await
+                .map_err(|e| {
+                    tracing::error!("replace_setting: {e}");
+                    OpError::Internal("Database error".to_owned())
+                })?;
+            Ok(done.rows_affected() == 1)
+        })
+    }
+
     fn list_settings(&self) -> futures::future::BoxFuture<'_, OpResult<Vec<(String, String)>>> {
         let pool = self.pool.clone();
         Box::pin(async move {
@@ -112,10 +128,17 @@ impl extenddb_storage::management_store::SettingsStore for PostgresCatalogStore 
         })
     }
 
-    fn cached_encryption_key(&self) -> Option<String> {
-        self.encryption_key
-            .as_ref()
-            .map(std::string::ToString::to_string)
+    fn set_data_connection(
+        &self,
+        kek: &[u8; 32],
+        connection_string: &str,
+    ) -> BoxFuture<'_, OpResult<()>> {
+        let kek = zeroize::Zeroizing::new(*kek);
+        let connection_string = zeroize::Zeroizing::new(connection_string.to_owned());
+        Box::pin(async move {
+            self.set_data_connection_impl(&kek, &connection_string)
+                .await
+        })
     }
 }
 
@@ -154,43 +177,37 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for PostgresCatalogStore {
 
     fn test_data_database_connection(
         &self,
+        key: &extenddb_storage::server_components::KeySource,
     ) -> futures::future::BoxFuture<'_, extenddb_storage::diagnostics::DiagResult<String>> {
+        use extenddb_storage::diagnostics::DiagError;
         let pool = self.pool.clone();
+        let key = key.clone();
         Box::pin(async move {
-            // Get data database connection string and name from settings
-            let conn_row: Option<(String,)> = sqlx::query_as(
-                "SELECT value FROM settings WHERE key = 'data_database_connection_string'",
-            )
-            .fetch_optional(&pool)
-            .await
-            .map_err(|e| extenddb_storage::diagnostics::DiagError::QueryFailed(e.to_string()))?;
-
+            let not_configured =
+                || DiagError::QueryFailed("Data database not configured".to_string());
             let name_row: Option<(String,)> =
                 sqlx::query_as("SELECT value FROM settings WHERE key = 'data_database_name'")
                     .fetch_optional(&pool)
                     .await
-                    .map_err(|e| {
-                        extenddb_storage::diagnostics::DiagError::QueryFailed(e.to_string())
-                    })?;
+                    .map_err(|e| DiagError::QueryFailed(e.to_string()))?;
+            let (name,) = name_row.ok_or_else(not_configured)?;
 
-            match (conn_row, name_row) {
-                (Some((conn,)), Some((name,))) => {
-                    // Test connection
-                    sqlx::postgres::PgPoolOptions::new()
-                        .max_connections(1)
-                        .connect(&conn)
-                        .await
-                        .map_err(|e| {
-                            extenddb_storage::diagnostics::DiagError::ConnectionFailed(
-                                e.to_string(),
-                            )
-                        })?;
-                    Ok(name)
-                }
-                _ => Err(extenddb_storage::diagnostics::DiagError::QueryFailed(
-                    "Data database not configured".to_string(),
-                )),
-            }
+            // The connection string as the server reads it: in a catalog with
+            // a key ring the row is encrypted, and the KEK of key_file opens
+            // it (RFC-0000 section 12).
+            let target =
+                crate::migrations::PostgresTarget::new((*pool.connect_options()).clone(), &name)
+                    .with_key_source(key, false);
+            let conn = crate::migrations::data_connection_string(&target)
+                .await
+                .map_err(|e| DiagError::QueryFailed(e.to_string()))?
+                .ok_or_else(not_configured)?;
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&conn)
+                .await
+                .map_err(|e| DiagError::ConnectionFailed(e.to_string()))?;
+            Ok(name)
         })
     }
 }
@@ -422,9 +439,7 @@ impl extenddb_storage::management_store::RateLimitStore for PostgresCatalogStore
 
 // Implement CatalogStore supertrait
 impl extenddb_storage::CatalogStore for PostgresCatalogStore {
-    fn cached_encryption_key(&self) -> Option<String> {
-        self.encryption_key
-            .as_ref()
-            .map(std::string::ToString::to_string)
+    fn secret_keys(&self) -> Option<&SecretKeys> {
+        self.keys.as_deref()
     }
 }
