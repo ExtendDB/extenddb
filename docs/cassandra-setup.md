@@ -350,6 +350,11 @@ keyspace is up. It reads the backup data that older versions wrote at `ALL`, so
 it fails when any replica is down, even with a replication factor of 3. See
 [Migrating legacy backups into the store](manuals/14-backup-and-restore.md#migrating-legacy-backups-into-the-store).
 
+Run the `extenddb encryption-key` commands only when every replica of the
+catalog keyspace is up. They read the key rows at `ALL`, and they write the key
+ring and the stored secrets at `ALL`. So they fail when any replica is down,
+even with a replication factor of 3.
+
 ExtendDB creates its keyspaces with `NetworkTopologyStrategy`, with
 `replication_factor` replicas in `datacenter`. Use the name your cluster's
 nodes report (`nodetool status` prints it); in the `ALTER KEYSPACE` statements

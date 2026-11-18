@@ -36,8 +36,14 @@ pub trait DiagnosticsStore: Send + Sync {
     /// Count the number of secondary indexes in the catalog.
     fn count_indexes(&self) -> BoxFuture<'_, DiagResult<i64>>;
 
-    /// Test connection to the data database.
+    /// Test connection to the data database. On PostgreSQL, whose catalog
+    /// holds the data database's connection string, `key` opens that row in
+    /// a catalog with a key ring (RFC-0000 section 12); the other backends
+    /// read no such row and ignore it.
     ///
     /// Returns the database name on success, or an error if connection fails.
-    fn test_data_database_connection(&self) -> BoxFuture<'_, DiagResult<String>>;
+    fn test_data_database_connection(
+        &self,
+        key: &crate::server_components::KeySource,
+    ) -> BoxFuture<'_, DiagResult<String>>;
 }

@@ -954,6 +954,7 @@ impl Bootstrapper for CassandraBootstrapper {
                 password: self.config.admin_password.clone(),
             }),
             data_connection: None,
+            ..Target::default()
         }
     }
 

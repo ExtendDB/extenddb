@@ -883,6 +883,17 @@ pub fn create_catalog_store(
     )
 }
 
+/// [`create_catalog_store`] with a new catalog key, for the tests that
+/// create access keys or store sessions.
+pub fn create_keyed_catalog_store(
+    engine: &CassandraEngine,
+    config: &CassandraStorageConfig,
+) -> CassandraCatalogStore {
+    let key = extenddb_storage::bootstrapper::helpers::generate_encryption_key().expect("a key");
+    let keys = extenddb_storage::secret_keys::SecretKeys::catalog_key(&key).expect("a key holder");
+    create_catalog_store(engine, config).with_secret_keys(Some(Arc::new(keys)))
+}
+
 /// Whether the cluster has one node. `system.paxos` is local to each node,
 /// so a test that reads it needs a cluster of one node.
 pub async fn is_one_node_cluster(engine: &CassandraEngine) -> bool {

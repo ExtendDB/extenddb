@@ -33,7 +33,9 @@ mod s3;
 
 pub use config::{BackupStoreConfig, BackupStoreKind, FilesystemStoreConfig, S3StoreConfig};
 pub use error::StoreError;
-pub use fs::{FilesystemStore, check_private_directory};
+#[cfg(unix)]
+pub use fs::effective_uid;
+pub use fs::{FilesystemStore, check_private_ancestors, check_private_directory};
 pub use s3::{
     ATTEMPT_TIMEOUT as S3_ATTEMPT_TIMEOUT, MAX_PART_SIZE_BYTES, MAX_STORE_PREFIX_LEN,
     MIN_PART_SIZE_BYTES, S3Store,
