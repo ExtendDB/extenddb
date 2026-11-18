@@ -16,7 +16,9 @@ use extenddb_engine::OperationContext;
 use serde_json::Value;
 
 use crate::AppState;
-use crate::request_helpers::{authorize_request, extract_operation, extract_table_name};
+use crate::request_helpers::{
+    authorize_request, extract_operation, extract_table_name, metric_table_name,
+};
 use crate::response::{error_response, record_error_metrics, success_response};
 use crate::throttle_helpers::{
     classify_data_operation, extract_partition_value, table_description_to_throughput,
@@ -122,6 +124,21 @@ pub(crate) async fn handle_request(
         }
     };
 
+    // Point-in-time recovery is not in this release: a restore and an enable
+    // are refused here, for every caller and before any table is read, where
+    // the service would authorize them first.
+    if let Some(e) = extenddb_engine::refuse_point_in_time_recovery(&operation, &input) {
+        tracing::warn!(
+            request_id = %request_id,
+            operation = %operation,
+            principal = crate::authz_resource::cross_account::principal_arn(&identity),
+            "Point-in-time recovery refused"
+        );
+        record_error_metrics(&state.metrics, &e, &account_id, None, &operation);
+        state.metrics.record_request_count(&account_id, &operation);
+        return error_response(&e, &request_id);
+    }
+
     // --- Authz segment ---
     let authz_start = std::time::Instant::now();
     let authorized_key_info;
@@ -183,6 +200,11 @@ pub(crate) async fn handle_request(
     };
 
     let table_name = extract_table_name(&input);
+    // The table the metrics are recorded under: the request's `TableName` only
+    // when the operation acts on the table it names and the name passes the
+    // table name rules, with a table ARN reduced to its name. See
+    // `metric_table_name`.
+    let metric_table = metric_table_name(&operation, &input, &state.limits);
 
     // --- Throttle segment ---
     let throttle_start = std::time::Instant::now();
@@ -221,13 +243,19 @@ pub(crate) async fn handle_request(
             } else {
                 extenddb_core::metrics::MetricName::WriteThrottleEvents
             };
-            state
-                .metrics
-                .record(metric, 1.0, Some(tn), None, Some(&operation));
+            state.metrics.record(
+                metric,
+                1.0,
+                Some(&ctx.account_id),
+                metric_table.as_deref(),
+                None,
+                Some(&operation),
+            );
             state.metrics.record(
                 extenddb_core::metrics::MetricName::ThrottledRequests,
                 1.0,
-                Some(tn),
+                Some(&ctx.account_id),
+                metric_table.as_deref(),
                 None,
                 Some(&operation),
             );
@@ -278,6 +306,7 @@ pub(crate) async fn handle_request(
 
     // --- Response segment ---
     let response_start = std::time::Instant::now();
+    let mut succeeded = false;
     let response = match dispatch_result {
         Ok(result) => {
             update_throttle_buckets(
@@ -289,11 +318,12 @@ pub(crate) async fn handle_request(
             );
 
             let m = &result.metrics;
-            if let Some(ref tn) = table_name {
+            if let Some(ref tn) = metric_table {
                 if m.read_capacity_units > 0.0 {
                     state.metrics.record(
                         extenddb_core::metrics::MetricName::ConsumedReadCapacityUnits,
                         m.read_capacity_units,
+                        Some(&ctx.account_id),
                         Some(tn),
                         m.index_name.as_deref(),
                         Some(&operation),
@@ -303,21 +333,32 @@ pub(crate) async fn handle_request(
                     state.metrics.record(
                         extenddb_core::metrics::MetricName::ConsumedWriteCapacityUnits,
                         m.write_capacity_units,
+                        Some(&ctx.account_id),
                         Some(tn),
                         m.index_name.as_deref(),
                         Some(&operation),
                     );
                 }
                 if m.returned_item_count > 0 {
-                    state
-                        .metrics
-                        .record_returned_items(tn, &operation, m.returned_item_count);
+                    state.metrics.record_returned_items(
+                        &ctx.account_id,
+                        tn,
+                        &operation,
+                        m.returned_item_count,
+                    );
                 }
                 if m.returned_bytes > 0 {
-                    state
-                        .metrics
-                        .record_returned_bytes(tn, &operation, m.returned_bytes);
+                    state.metrics.record_returned_bytes(
+                        &ctx.account_id,
+                        tn,
+                        &operation,
+                        m.returned_bytes,
+                    );
                 }
+            }
+            // Throttle buckets stay keyed by the name the request sent, which
+            // is the name they were registered under above.
+            if let Some(ref tn) = table_name {
                 state.throttle.consume_with_partition(
                     &ctx.account_id,
                     tn,
@@ -327,10 +368,17 @@ pub(crate) async fn handle_request(
                 );
             }
 
+            succeeded = true;
             success_response(&result.body, &request_id)
         }
         Err(e) => {
-            record_error_metrics(&state.metrics, &e, table_name.as_deref(), &operation);
+            record_error_metrics(
+                &state.metrics,
+                &e,
+                &ctx.account_id,
+                metric_table.as_deref(),
+                &operation,
+            );
             error_response(&e, &request_id)
         }
     };
@@ -340,13 +388,23 @@ pub(crate) async fn handle_request(
     // Record per-segment latency breakdown and total latency.
     #[allow(clippy::cast_precision_loss)]
     let total_us = handler_start.elapsed().as_micros() as f64;
+    // `SuccessfulRequestLatency` counts successful requests only, as
+    // CloudWatch's does.
+    if succeeded {
+        state.metrics.record_latency(
+            &ctx.account_id,
+            metric_table.as_deref(),
+            &operation,
+            total_us,
+        );
+    }
     state
         .metrics
-        .record_latency(table_name.as_deref(), &operation, total_us);
-    state.metrics.record_request_count(&operation);
+        .record_request_count(&ctx.account_id, &operation);
     state.metrics.record_segments(
+        &ctx.account_id,
         &operation,
-        table_name.as_deref(),
+        metric_table.as_deref(),
         extenddb_core::metrics::LatencySegments {
             auth_us,
             authz_us,

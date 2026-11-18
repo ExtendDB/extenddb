@@ -5,7 +5,8 @@
 //! `BuiltinAuthProvider::authenticate`, and for the order of its checks.
 
 use super::tests::{
-    MockCredentialStore, SECRET, credential, make_headers_with_auth, provider, signed_headers,
+    MockCredentialStore, SECRET, credential, make_headers_with_auth, provider, provider_over,
+    signed_headers,
 };
 use super::*;
 use axum::http::{HeaderMap, HeaderValue};
@@ -40,14 +41,11 @@ async fn scope_wrong_in_region_and_service_reports_both() {
 }
 
 /// A provider whose store holds no credential at all.
-fn provider_without_credentials() -> BuiltinAuthProvider<MockCredentialStore> {
-    BuiltinAuthProvider::new(
-        MockCredentialStore {
-            credential: None,
-            error: None,
-        },
-        "us-east-1",
-    )
+fn provider_without_credentials() -> BuiltinAuthProvider {
+    provider_over(MockCredentialStore {
+        credential: None,
+        error: None,
+    })
 }
 
 /// Move the request date one hour into the past, re-signing the scope

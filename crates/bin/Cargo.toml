@@ -6,6 +6,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "A DynamoDB-compatible API server that stores data in PostgreSQL, MongoDB, Cassandra or SQLite."
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["dynamodb", "database", "nosql", "server", "postgresql"]
+categories = ["database-implementations", "command-line-utilities"]
 
 [[bin]]
 name = "extenddb"
@@ -47,4 +53,4 @@ extenddb-config = { workspace = true }
 sqlx = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
-extenddb-storage = { workspace = true, features = ["test-util"] }
+extenddb-storage = { path = "../storage", features = ["test-util"] }

@@ -47,7 +47,9 @@ pub struct BuildInfo {
     /// Package version of the deployed binary (e.g. `env!("CARGO_PKG_VERSION")`
     /// from the bin crate — not from a library crate, whose version may drift).
     pub version: &'static str,
-    /// Short git commit hash of the build (e.g. `env!("EXTENDDB_GIT_HASH")`).
+    /// Git commit hash of the build (e.g. `env!("EXTENDDB_GIT_HASH")`): the
+    /// full SHA in release images and in builds from crates.io, the short form
+    /// in local builds.
     pub git_hash: &'static str,
     /// Build timestamp (e.g. `env!("EXTENDDB_BUILD_TIME")`).
     pub build_time: &'static str,
@@ -402,6 +404,21 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         tracing::warn!("{}", warning.log_message());
     }
 
+    // The key the factory loads (RFC-0000 section 7). With `[auth.encryption]
+    // key_file` set it is the KEK, read through the file rule; the factory's
+    // loader unwraps the ring's DEK with it and drops it, which wipes it.
+    let key_file = app_config.auth.encryption.key_file_path();
+    let key_source =
+        crate::key_file::key_source(&app_config.auth.encryption).map_err(anyhow::Error::msg)?;
+    // Before the factory, which puts the key in the store.
+    let workers = tokio::runtime::Handle::current().metrics().num_workers();
+    let protection = crate::key_file::init_key_store(
+        key_file.is_some(),
+        app_config.auth.encryption.require_locked_memory,
+        crate::key_file::serve_slots(app_config.auth.cache.max_entries, workers),
+    )
+    .map_err(anyhow::Error::msg)?;
+
     // Create server components via factory pattern. Dev mode asks the backend
     // to bootstrap an uninitialized catalog at serve time (zero-config use).
     let mut component_options =
@@ -411,6 +428,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     component_options.max_item_size_bytes = app_config.limits.max_item_size_bytes;
     component_options.release = build.version;
     component_options.max_concurrent_jobs = app_config.backup.max_concurrent_jobs;
+    component_options.key_source = key_source;
 
     // Wire the node's own bind address as the instance ID so each ExtendDB node
     // has a distinct node ID (to support logical clocks for sequences, etc.).
@@ -438,6 +456,28 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         }
         Err(other) => return Err(other.into()),
     };
+    // The options and the KEK they carried are dropped: the KEK is wiped.
+    // The catalog key warning is serve's alone, so the commands that open the
+    // catalog through the same factory print nothing new.
+    match key_file.as_deref() {
+        None => tracing::warn!(
+            "The stored secrets are encrypted under the catalog key, which the catalog holds, \
+             so a copy of the catalog decrypts every stored secret. `extenddb encryption-key \
+             switch --key-file <path>` moves the key to a KEK file outside the catalog."
+        ),
+        Some(path) => {
+            if let Some(database) = app_config.storage.database_file()
+                && crate::key_file::same_file_system(std::path::Path::new(path), &database)
+            {
+                tracing::warn!(
+                    "The KEK file {path} and the database file {} are on the same file \
+                     system, so one snapshot of it holds the key ring and the KEK that opens \
+                     it. Keep the KEK file on another file system.",
+                    database.display()
+                );
+            }
+        }
+    }
 
     let storage = components.engine;
     let catalog_store = components.catalog_store;
@@ -466,11 +506,19 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
             crate::dev_credentials::describe(&dev_creds),
         );
         if let Some(ignored) = crate::dev_credentials::ignored_aws_env_key(&dev_creds) {
+            let alternative = if crate::dev_credentials::example_pair_active(&dev_creds) {
+                "or sign with the built-in example pair"
+            } else {
+                "or sign with the configured EXTENDDB_DEV_ACCESS_KEY_ID pair"
+            };
+            let switch_note = crate::dev_credentials::ignored_key_switch_note(&ignored, &dev_creds)
+                .map(|note| format!(" {note}"))
+                .unwrap_or_default();
             tracing::warn!(
                 "AWS_ACCESS_KEY_ID is set in the environment but dev mode does not adopt \
-                 it; requests signed with '{ignored}' will get UnrecognizedClientException. \
-                 Set EXTENDDB_DEV_ACCESS_KEY_ID and EXTENDDB_DEV_SECRET_ACCESS_KEY to seed \
-                 an additional credential, or sign with the built-in example pair."
+                 it; requests signed with '{ignored}' will get UnrecognizedClientException.\
+                 {switch_note} Set EXTENDDB_DEV_ACCESS_KEY_ID and EXTENDDB_DEV_SECRET_ACCESS_KEY \
+                 to seed an additional credential, {alternative}."
             );
         }
     }
@@ -509,20 +557,28 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
 
     // Phase 2: Wrap the raw credential store. In pass-through mode the
     // wrapper bypasses the cache and forwards every lookup to the inner
-    // store; otherwise it caches per the TOML config.
+    // store; otherwise it caches per the TOML config. The cache derives
+    // signing keys for the server's region and reserves one temporary
+    // buffer per runtime worker thread (RFC-0000 section 6.1).
+    let region = app_config.server.region.as_str();
     let cached_cred_store = Arc::new(if cache_enabled {
-        extenddb_auth::CachedCredentialStore::with_arc(cred_store, make_cache_cfg("credential"))
+        extenddb_auth::CachedCredentialStore::with_arc(
+            cred_store,
+            make_cache_cfg("credential"),
+            region,
+            workers,
+        )
     } else {
         extenddb_auth::CachedCredentialStore::pass_through_arc(
             cred_store,
             make_cache_cfg("credential"),
+            region,
+            workers,
         )
     });
-    let auth: Arc<dyn extenddb_auth::AuthProvider> =
-        Arc::new(extenddb_auth::BuiltinAuthProvider::new(
-            (*cached_cred_store).clone(),
-            app_config.server.region.as_str(),
-        ));
+    let auth: Arc<dyn extenddb_auth::AuthProvider> = Arc::new(
+        extenddb_auth::BuiltinAuthProvider::new((*cached_cred_store).clone()),
+    );
 
     // Phase 3: Build the authorization cache.
     let authz_cache: Arc<crate::CachedAuthzStore> = {
@@ -569,10 +625,11 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         .and_then(|h| h.backend_info())
         .unwrap_or_else(|| "(unknown)".to_owned());
 
-    // REQ-LOG-001: Startup banner with effective configuration.
+    // REQ-LOG-001: Startup banner with effective configuration, and the
+    // protection of the locked key store (RFC-0000 section 6.2).
     // REQ-LOG-002: Connection strings redact passwords.
     tracing::info!(
-        "extenddb {} (catalog {}) starting — bind={}:{}, region={}, auth={}, catalog_db={}, data_db={}, log_output={}, log_level={}",
+        "extenddb {} (catalog {}) starting — bind={}:{}, region={}, auth={}, catalog_db={}, data_db={}, log_output={}, log_level={}, key_store={}",
         build.version,
         catalog_version,
         app_config.server.bind_addr,
@@ -583,6 +640,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         data_db_info,
         log_target.label(),
         app_config.logging.level,
+        protection,
     );
 
     // Convert pre-bound std listener to tokio (D-4: bind before fork).
@@ -597,25 +655,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
 
     // P53: Resolve import and export path lists. Supports both the new
     // [import]/[export] sections and the deprecated import_export_root.
-    let resolve_paths = |raw_paths: &[String],
-                         label: &str|
-     -> anyhow::Result<Vec<Arc<std::path::PathBuf>>> {
-        let mut resolved = Vec::new();
-        for raw in raw_paths {
-            let expanded = config::expand_tilde(raw);
-            let path = std::path::PathBuf::from(&expanded);
-            if !path.exists() {
-                std::fs::create_dir_all(&path)
-                    .map_err(|e| anyhow::anyhow!("Cannot create {label} path {expanded}: {e}"))?;
-            }
-            let canonical = path
-                .canonicalize()
-                .map_err(|e| anyhow::anyhow!("Cannot canonicalize {label} path {expanded}: {e}"))?;
-            resolved.push(Arc::new(canonical));
-        }
-        Ok(resolved)
-    };
-
+    //
     // Build effective path lists: a populated section wins, and the deprecated
     // import_export_root fills only a list a section left empty. Which surface
     // won decides what the diagnostics should say, so it is recorded.
@@ -628,10 +668,12 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         tracing::warn!("{notice}");
     }
 
-    let import_paths: Arc<[Arc<std::path::PathBuf>]> =
-        Arc::from(resolve_paths(&effective.import, "import")?);
-    let export_paths: Arc<[Arc<std::path::PathBuf>]> =
-        Arc::from(resolve_paths(&effective.export, "export")?);
+    let import_paths: Arc<[Arc<std::path::PathBuf>]> = Arc::from(
+        crate::import_export_roots::resolve_roots(&effective.import, "import")?,
+    );
+    let export_paths: Arc<[Arc<std::path::PathBuf>]> = Arc::from(
+        crate::import_export_roots::resolve_roots(&effective.export, "export")?,
+    );
 
     for notice in crate::import_export_paths::overlap_notices(
         &import_paths,

@@ -3,7 +3,7 @@
 
 //! `update_table` implementation for the Cassandra backend.
 
-use cdrs_tokio::consistency::Consistency;
+use crate::cassandra_util::PolicySession as _;
 use cdrs_tokio::query::BatchQueryBuilder;
 use cdrs_tokio::query::QueryValues;
 use cdrs_tokio::types::IntoRustByName;
@@ -110,7 +110,7 @@ impl CassandraEngine {
         // created with IF NOT EXISTS. See ADR-0021.
         let mut table_cols: Vec<(&'static str, Value)> = Vec::new();
         // Separate plain batch for `indexes` (plain INSERT/DELETE, no LWT mixing issue).
-        let mut indexes_batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+        let mut indexes_batch = crate::cassandra_util::batch();
         let mut indexes_batch_has_statements = false;
 
         macro_rules! add_update {
@@ -382,11 +382,11 @@ impl CassandraEngine {
         //   index as ACTIVE and its data table actually existing. Without it a
         //   sweep can take a base-row claim and then fail applying index
         //   effects against a table that is not there yet.
-        let creating_async_gsi = !gsi_creates.is_empty()
-            && self
-                .gsi_default_delay_ms
-                .load(std::sync::atomic::Ordering::Relaxed)
-                != 0;
+        // A created GSI sets no delay of its own, so it follows the system
+        // setting: read it live (only when a GSI is being created), so a
+        // `settings set` made just before this request decides the fence.
+        let creating_async_gsi =
+            !gsi_creates.is_empty() && self.index_propagation_delay().await != 0;
         // Quorum and uncached: the control-lease decision below fences GSI
         // creation against TTL lifecycle changes, and a cached stale None
         // would skip that fence in exactly the window it exists for.
@@ -659,7 +659,7 @@ impl CassandraEngine {
         if indexes_batch_has_statements
             && let Err(e) = self
                 .session
-                .batch(
+                .run_batch(
                     indexes_batch
                         .build()
                         .map_err(|e| StorageError::Internal(e.to_string()))?,

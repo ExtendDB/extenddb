@@ -541,6 +541,73 @@ impl FilesystemStore {
         .await
     }
 
+    /// `delete_written` (the trait's doc): the file at the key renamed to a
+    /// hidden temporary in its directory, then removed if it is the file
+    /// `written` describes (its size, and its modification time where
+    /// `written` has one) or linked back under the key otherwise. The rename
+    /// is the one step another writer's file can be caught in: what it moved
+    /// is either removed as this caller's or put back.
+    async fn delete_written_impl(&self, written: &ObjectMeta) -> Result<bool, StoreError> {
+        let (path, meta) = match self.resolve_no_follow(&written.key).await {
+            Ok(found) => found,
+            Err(StoreError::NotFound) => return Ok(true),
+            Err(e) => return Err(e),
+        };
+        if !meta.is_file() {
+            return Ok(false);
+        }
+        let Some(parent) = path.parent().map(Path::to_path_buf) else {
+            return Ok(false);
+        };
+        let size = written.size;
+        let modified = written.last_modified;
+        tokio::task::spawn_blocking(move || {
+            let aside = parent.join(format!(
+                "{TEMP_PREFIX}{}{TEMP_SUFFIX}",
+                uuid::Uuid::new_v4()
+            ));
+            match std::fs::rename(&path, &aside) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+                Err(e) => {
+                    return Err(StoreError::io(
+                        format!("rename {} to {}", path.display(), aside.display()),
+                        e,
+                    ));
+                }
+            }
+            let moved = std::fs::symlink_metadata(&aside)
+                .map_err(|e| StoreError::io(format!("stat {}", aside.display()), e))?;
+            let same = moved.is_file()
+                && moved.len() == size
+                && modified.is_none_or(|at| moved.modified().ok() == Some(at));
+            if same {
+                std::fs::remove_file(&aside)
+                    .map_err(|e| StoreError::io(format!("remove {}", aside.display()), e))?;
+                return Ok(true);
+            }
+            // Another writer's file: back under the key. `link` refuses a
+            // key something took meanwhile, and the file then stays under
+            // the hidden name, which the error names.
+            std::fs::hard_link(&aside, &path).map_err(|e| {
+                StoreError::io(
+                    format!(
+                        "link {} back to {} (the file under the key is not the one this \
+                         caller wrote)",
+                        aside.display(),
+                        path.display()
+                    ),
+                    e,
+                )
+            })?;
+            std::fs::remove_file(&aside)
+                .map_err(|e| StoreError::io(format!("remove {}", aside.display()), e))?;
+            Ok(false)
+        })
+        .await
+        .map_err(|e| StoreError::Other(format!("deletion task failed: {e}")))?
+    }
+
     async fn get_impl(&self, key: &str) -> Result<ByteStream, StoreError> {
         validate_key(key)?;
         let (path, meta) = self.resolve_no_follow(key).await?;
@@ -772,6 +839,13 @@ impl BackupStore for FilesystemStore {
         self.delete_prefix_impl(prefix).boxed()
     }
 
+    fn delete_written<'a>(
+        &'a self,
+        written: &'a ObjectMeta,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        self.delete_written_impl(written).boxed()
+    }
+
     fn delete_prefix_before<'a>(
         &'a self,
         prefix: &'a str,
@@ -817,12 +891,27 @@ pub fn check_private_directory(dir: &Path, what: &str) -> Result<(), StoreError>
 }
 
 fn check_private_tree(root: &Path, meta: &std::fs::Metadata, what: &str) -> Result<(), StoreError> {
+    check_owner_only(root, meta)?;
+    check_private_ancestors(root, what)
+}
+
+/// The ancestor half of the owner-only rule, for the canonical path `path`:
+/// every ancestor is a directory, not a symlink, owned by the effective user
+/// or by root, and not writable by group or others unless its sticky bit is
+/// set. `what` names `path` in the messages. The backup root, the restore
+/// spool and the KEK file (RFC-0000 section 2, check 2) use it. No check is
+/// made on other platforms.
+///
+/// # Errors
+///
+/// `PermissionDenied` naming the ancestor and what it needs; `Io` when an
+/// ancestor cannot be read.
+pub fn check_private_ancestors(path: &Path, what: &str) -> Result<(), StoreError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        check_owner_only(root, meta)?;
         let euid = effective_uid();
-        let mut ancestor = root.parent();
+        let mut ancestor = path.parent();
         while let Some(dir) = ancestor {
             let m = std::fs::symlink_metadata(dir)
                 .map_err(|e| StoreError::io(format!("stat {}", dir.display()), e))?;
@@ -840,7 +929,8 @@ fn check_private_tree(root: &Path, meta: &std::fs::Metadata, what: &str) -> Resu
             if m.uid() != euid && m.uid() != 0 {
                 return Err(StoreError::PermissionDenied(format!(
                     "{} (an ancestor of the {what}) is owned by uid {}; the {what} must sit \
-                     under directories owned by root or by the extenddb user",
+                     under directories owned by root or by the user extenddb runs as (uid \
+                     {euid})",
                     dir.display(),
                     m.uid()
                 )));
@@ -858,7 +948,7 @@ fn check_private_tree(root: &Path, meta: &std::fs::Metadata, what: &str) -> Resu
     }
     #[cfg(not(unix))]
     {
-        let _ = (root, meta, what);
+        let _ = (path, what);
     }
     Ok(())
 }
@@ -918,8 +1008,9 @@ fn check_root_is_directory(root: &Path, meta: &std::fs::Metadata) -> Result<(), 
     Ok(())
 }
 
+/// The effective user ID of this process.
 #[cfg(unix)]
-fn effective_uid() -> u32 {
+pub fn effective_uid() -> u32 {
     // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { libc::geteuid() }
 }

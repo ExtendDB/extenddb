@@ -156,6 +156,13 @@ mod armed {
         pub(super) after_delete_claim: HashMap<String, Arc<Pause>>,
         pub(super) after_deleted_write: HashMap<String, Arc<Pause>>,
         pub(super) before_tombstone_removal: HashMap<String, Arc<Pause>>,
+        pub(super) gsi_worker_before_wait: HashMap<String, Arc<Pause>>,
+        pub(super) convert_write_faults: HashMap<String, VecDeque<ProgressWriteFault>>,
+        pub(super) convert_stops: std::collections::HashSet<String>,
+        pub(super) before_convert: HashMap<String, Arc<Pause>>,
+        pub(super) before_legacy_registration: HashMap<String, Arc<Pause>>,
+        pub(super) convert_refusals: HashMap<String, usize>,
+        pub(super) legacy_keys_page: Option<i32>,
     }
 
     pub(super) static HOOKS: LazyLock<Mutex<Hooks>> = LazyLock::new(Mutex::default);
@@ -464,6 +471,172 @@ pub fn stop_rewrite(backup_arn: &str, at: RewriteStop) {
     });
 }
 
+/// Make the next lightweight transactions that convert the in-catalog row
+/// of `backup_arn` into its index row (`replace_with_index_row`) answer
+/// `WriteOutcome::Unknown`, one fault per write in the order given, as
+/// [`fail_insert_writes`] does for the insert.
+#[cfg(feature = "test-hooks")]
+pub fn fail_convert_writes(backup_arn: &str, faults: &[ProgressWriteFault]) {
+    armed::with_hooks(|hooks| {
+        hooks
+            .convert_write_faults
+            .insert(backup_arn.to_owned(), faults.iter().copied().collect());
+    });
+}
+
+/// Stop the next `replace_with_index_row` of `backup_arn` with an error
+/// right after its row's conversion, before the list and status entries and
+/// the item buckets, as a process that dies there would. Taken once.
+#[cfg(feature = "test-hooks")]
+pub fn stop_convert_after_row(backup_arn: &str) {
+    armed::with_hooks(|hooks| {
+        hooks.convert_stops.insert(backup_arn.to_owned());
+    });
+}
+
+/// Arm a pause in the next `replace_with_index_row` of `backup_arn`, after
+/// its read of the row and its in-use check and before the conversion's
+/// lightweight transaction, so a test can land a restore's registration in
+/// the gap. Taken once, then disarmed.
+#[cfg(feature = "test-hooks")]
+pub fn pause_before_convert(backup_arn: &str) -> std::sync::Arc<Pause> {
+    let pause = std::sync::Arc::new(Pause::new());
+    armed::with_hooks(|hooks| {
+        hooks
+            .before_convert
+            .insert(backup_arn.to_owned(), std::sync::Arc::clone(&pause));
+    });
+    pause
+}
+
+/// Hold here if a test armed [`pause_before_convert`] for `backup_arn`.
+pub(crate) async fn before_convert(backup_arn: &str) {
+    #[cfg(feature = "test-hooks")]
+    if let Some(pause) = armed::with_hooks(|hooks| hooks.before_convert.remove(backup_arn)) {
+        pause.hold().await;
+    }
+    let _ = backup_arn;
+}
+
+/// Arm a pause in the next legacy restore of `backup_arn`, between its
+/// target's creation and its `active_restores` lightweight transaction on
+/// the in-catalog row, so a test can convert the row in the gap. Taken
+/// once, then disarmed.
+#[cfg(feature = "test-hooks")]
+pub fn pause_before_legacy_restore_registration(backup_arn: &str) -> std::sync::Arc<Pause> {
+    let pause = std::sync::Arc::new(Pause::new());
+    armed::with_hooks(|hooks| {
+        hooks
+            .before_legacy_registration
+            .insert(backup_arn.to_owned(), std::sync::Arc::clone(&pause));
+    });
+    pause
+}
+
+/// Hold here if a test armed [`pause_before_legacy_restore_registration`]
+/// for `backup_arn`.
+pub(crate) async fn before_legacy_restore_registration(backup_arn: &str) {
+    #[cfg(feature = "test-hooks")]
+    if let Some(pause) =
+        armed::with_hooks(|hooks| hooks.before_legacy_registration.remove(backup_arn))
+    {
+        pause.hold().await;
+    }
+    let _ = backup_arn;
+}
+
+/// The fault the next conversion lightweight transaction of `backup_arn`
+/// takes, if a test armed one.
+pub(crate) fn convert_write_fault(backup_arn: &str) -> Option<ProgressWriteFault> {
+    #[cfg(feature = "test-hooks")]
+    {
+        armed::with_hooks(|hooks| {
+            hooks
+                .convert_write_faults
+                .get_mut(backup_arn)
+                .and_then(std::collections::VecDeque::pop_front)
+        })
+    }
+    #[cfg(not(feature = "test-hooks"))]
+    {
+        let _ = backup_arn;
+        None
+    }
+}
+
+/// Make the next `count` conversion lightweight transactions of
+/// `backup_arn` answer `WriteOutcome::NotMatched` without being sent, as a
+/// DeleteBackup or a restore's registration changing the row before each
+/// would.
+#[cfg(feature = "test-hooks")]
+pub fn refuse_convert_writes(backup_arn: &str, count: usize) {
+    armed::with_hooks(|hooks| {
+        hooks.convert_refusals.insert(backup_arn.to_owned(), count);
+    });
+}
+
+/// Whether a test armed [`refuse_convert_writes`] for the next conversion
+/// lightweight transaction of `backup_arn`; each answer uses one.
+pub(crate) fn convert_refused(backup_arn: &str) -> bool {
+    #[cfg(feature = "test-hooks")]
+    {
+        armed::with_hooks(|hooks| match hooks.convert_refusals.get_mut(backup_arn) {
+            Some(left) if *left > 0 => {
+                *left -= 1;
+                true
+            }
+            _ => false,
+        })
+    }
+    #[cfg(not(feature = "test-hooks"))]
+    {
+        let _ = backup_arn;
+        false
+    }
+}
+
+/// Make the scans of `list_all` and `list_deleted` read `backups_by_arn` in
+/// pages of `size` rows instead of the production page, so a test can
+/// cross a page boundary with a few rows. Every scan of the process uses
+/// it until [`clear_legacy_keys_page_size`].
+#[cfg(feature = "test-hooks")]
+pub fn set_legacy_keys_page_size(size: i32) {
+    armed::with_hooks(|hooks| hooks.legacy_keys_page = Some(size));
+}
+
+/// Undo [`set_legacy_keys_page_size`].
+#[cfg(feature = "test-hooks")]
+pub fn clear_legacy_keys_page_size() {
+    armed::with_hooks(|hooks| hooks.legacy_keys_page = None);
+}
+
+/// The page size a test set for the `list_all` and `list_deleted` scans.
+pub(crate) fn legacy_keys_page_size() -> Option<i32> {
+    #[cfg(feature = "test-hooks")]
+    {
+        armed::with_hooks(|hooks| hooks.legacy_keys_page)
+    }
+    #[cfg(not(feature = "test-hooks"))]
+    {
+        None
+    }
+}
+
+/// The error a conversion of `backup_arn` stops with after its row, if a
+/// test armed [`stop_convert_after_row`].
+pub(crate) fn convert_stop(backup_arn: &str) -> Result<(), StorageError> {
+    #[cfg(feature = "test-hooks")]
+    {
+        if armed::with_hooks(|hooks| hooks.convert_stops.remove(backup_arn)) {
+            return Err(StorageError::Internal(format!(
+                "test hook: the conversion of {backup_arn} stopped after its row"
+            )));
+        }
+    }
+    let _ = backup_arn;
+    Ok(())
+}
+
 /// The fault the next rewrite lightweight transaction of `backup_arn` takes,
 /// if a test armed one.
 pub(crate) fn rewrite_write_fault(backup_arn: &str) -> Option<ProgressWriteFault> {
@@ -592,6 +765,45 @@ pub(crate) fn index_entry_batch_error(backup_arn: &str) -> Option<StorageError> 
     }
     let _ = backup_arn;
     None
+}
+
+/// The key of a GSI worker's pause: the engine's keyspace prefix and the
+/// worker id, so a pause holds only the worker of the test that armed it.
+#[cfg(feature = "test-hooks")]
+fn gsi_worker_key(keyspace_prefix: &str, worker_id: u64) -> String {
+    format!("{keyspace_prefix}/{worker_id}")
+}
+
+/// Arm a pause in GSI worker `worker_id` of the engine on `keyspace_prefix`,
+/// after its next pass that applies nothing and before it waits for a wake.
+/// The pause is taken once and then disarmed.
+#[cfg(feature = "test-hooks")]
+pub fn pause_gsi_worker_before_wait(
+    keyspace_prefix: &str,
+    worker_id: u64,
+) -> std::sync::Arc<Pause> {
+    let pause = std::sync::Arc::new(Pause::new());
+    armed::with_hooks(|hooks| {
+        hooks.gsi_worker_before_wait.insert(
+            gsi_worker_key(keyspace_prefix, worker_id),
+            std::sync::Arc::clone(&pause),
+        );
+    });
+    pause
+}
+
+/// Hold here if a test armed a pause for GSI worker `worker_id` of the
+/// engine on `keyspace_prefix`.
+pub(crate) async fn gsi_worker_before_wait(keyspace_prefix: &str, worker_id: u64) {
+    #[cfg(feature = "test-hooks")]
+    if let Some(pause) = armed::with_hooks(|hooks| {
+        hooks
+            .gsi_worker_before_wait
+            .remove(&gsi_worker_key(keyspace_prefix, worker_id))
+    }) {
+        pause.hold().await;
+    }
+    let _ = (keyspace_prefix, worker_id);
 }
 
 /// The period the jobs of `account_id` heartbeat at.

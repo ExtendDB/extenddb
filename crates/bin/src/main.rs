@@ -29,7 +29,7 @@
 compile_error!(
     "the `postgres`, `mongodb`, `sqlite`, and `cassandra` features are mutually exclusive: \
      a thin bin installs exactly one backend (e.g. build the MongoDB binary with \
-     `--no-default-features --features mongodb)"
+     `--no-default-features --features mongodb`)"
 );
 
 #[cfg(not(any(
