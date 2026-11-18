@@ -12,7 +12,7 @@ started:
   2. store an inline user policy, a group policy and a permissions boundary
      using every operator shape of dynamodb:ResourceTag, plus a conditional
      allow used for the decision check, through the management API.
-  3. stop, and make the catalog read as one a release before 1.0 left: an
+  3. stop, and make the catalog read as one a release before 0.1.15 left: an
      empty migration ledger, a dotted catalog_version and the old marker row.
   4. run `migrate` without --yes: it lists the pending migrations, the
      condition-key rewrite included, and exits 3, and nothing on disk changes
@@ -20,7 +20,7 @@ started:
   5. run `migrate --yes`: it names each rewritten policy with its key count;
      restart, and confirm a GetItem gated on the resource tag that was denied
      before the migration is allowed after it.
-  6. write the marker row again, as a release before 1.0 does, and confirm
+  6. write the marker row again, as a release before 0.1.15 does, and confirm
      serve refuses with exit 5 naming `--reconverge`, which repairs it. The
      reconverge skips the condition-key rewrite, which is not convergent: a
      policy written through the API after the upgrade keeps its
@@ -293,14 +293,39 @@ def deployment(tmp_path):
     server.stop()
 
 
+BACKUP_CATALOG_INDEX_COLUMNS = (
+    "status", "kind", "store_kind", "store_root", "store_id", "owner_generation",
+    "heartbeat_at", "spool_host", "file_index", "items_applied", "failure_reason",
+    "completed_at",
+)
+
+
 def _as_released_catalog(sqlite_path: str) -> None:
-    """Make a catalog this binary created read as one a release before 1.0
+    """Make a catalog this binary created read as one a release before 0.1.15
     left: no ledger rows (the runner reads an empty ledger as it reads a
-    missing one), a dotted catalog_version, and the marker row every released
-    baseline seeded. The runner then applies every migration, the
-    condition-key rewrite included, as it does on a released catalog."""
+    missing one), a dotted catalog_version, the marker row every released
+    baseline seeded, and the baseline's shape for every table migration 1
+    checks: the objects migration 6 (backup_catalog_index) and migration 9
+    (warm_throughput) add are removed, since no release before 0.1.15 had them
+    and the check after migration 1 refuses a `table_restores` carrying its
+    twelve job columns and a `tables` or `indexes` carrying warm_throughput.
+    The `account_metrics` table migration 10 creates is removed too; migration
+    1 creates the `metrics` table it replaced again.
+    The runner then applies every migration, the condition-key rewrite
+    included, as it does on a released catalog."""
     conn = sqlite3.connect(sqlite_path)
     try:
+        conn.execute("DROP INDEX IF EXISTS idx_table_restores_status")
+        for column in BACKUP_CATALOG_INDEX_COLUMNS:
+            conn.execute(f"ALTER TABLE table_restores DROP COLUMN {column}")
+        conn.execute("DROP TABLE IF EXISTS backup_index")
+        conn.execute("DROP TABLE IF EXISTS backup_maintenance")
+        conn.execute("DELETE FROM settings WHERE key = 'catalog_id'")
+        # Migration 9 adds warm_throughput to tables and indexes.
+        for table in ("tables", "indexes"):
+            conn.execute(f"ALTER TABLE {table} DROP COLUMN warm_throughput")
+        # Migration 10 replaces metrics with account_metrics.
+        conn.execute("DROP TABLE IF EXISTS account_metrics")
         conn.execute("DELETE FROM extenddb_migrations")
         conn.execute(
             "UPDATE settings SET value = '0.0.3' WHERE key = 'catalog_version'"
@@ -406,7 +431,7 @@ def test_resource_tag_migration_wire(deployment):
         scoped_client.get_item(TableName=table, Key={"pk": {"S": "k1"}})
     assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
 
-    # 2. Stop, and make the catalog read as one a release before 1.0 left.
+    # 2. Stop, and make the catalog read as one a release before 0.1.15 left.
     server.stop()
     _as_released_catalog(sqlite_path)
     before_docs = _sqlite_policy_docs(sqlite_path)
@@ -462,7 +487,7 @@ def test_resource_tag_migration_wire(deployment):
     assert again.returncode == 0, again.stdout + again.stderr
     assert "Up to date" in (again.stdout + again.stderr)
 
-    # 6. A release before 1.0 writes the marker row again; serve refuses the
+    # 6. A release before 0.1.15 writes the marker row again; serve refuses the
     #    catalog with exit 5 and names --reconverge, which repairs it.
     conn = sqlite3.connect(sqlite_path)
     try:
@@ -611,7 +636,7 @@ def test_resource_tag_migration_collisions(deployment):
     admin_client.put_item(TableName=table, Item={"pk": {"S": "k1"}})
     server.stop()
 
-    # A catalog a release before 1.0 left, with both policies stored on it.
+    # A catalog a release before 0.1.15 left, with both policies stored on it.
     _as_released_catalog(sqlite_path)
     same_before = _sqlite_policy(sqlite_path, "hedged-same")
 

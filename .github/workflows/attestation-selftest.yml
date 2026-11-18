@@ -1,0 +1,160 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Proves, on every change to the release workflows, that this repository can
+# make and verify the attestations their attest jobs make, before a release
+# depends on it. The sbom job, holding no OIDC token like the release build
+# jobs, checks that this file's scanner and actions/attest pins match the
+# release workflows, saves an image tarball and generates its CycloneDX SBOM.
+# The attest job then uses the release jobs' two input modes on file subjects:
+# provenance through subject-checksums with one name on two digests, and the
+# SBOM through subject-name, subject-digest and sbom-path. It verifies all
+# three with `gh attestation verify` pinned to this workflow's exact
+# certificate identity.
+#
+# Not covered here: the release jobs' registry reads and refusals, and `oci://`
+# verification. Each run writes public Rekor entries for its throwaway
+# subjects. No registry write and no credential.
+
+name: attestation selftest
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/release-image.yml'
+      - '.github/workflows/release-dev-image.yml'
+      - '.github/workflows/attestation-selftest.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: attestation-selftest-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Must equal the release workflows' scanner pin; the sbom job checks it.
+  TRIVY_IMAGE: public.ecr.aws/aquasecurity/trivy:0.76.0@sha256:2416d1f74045b57274df1a340eee6b510cacd73c66a6ccb8da092b117eb7d222
+  # The throwaway subject: the production image's runtime base, already
+  # digest-pinned in Dockerfile and served from ECR Public.
+  SUBJECT_IMAGE: public.ecr.aws/debian/debian:bookworm-slim@sha256:8eeeb3e089a27d34c398a5580fe479b71a457cba535f59d85e52a303610ec583
+
+jobs:
+  sbom:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the workflows
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          sparse-checkout: .github/workflows
+          persist-credentials: false
+
+      - name: The scanner and actions/attest pins must match the release workflows
+        run: |
+          set -euo pipefail
+          # Every scanner pin in the three files (the release gates, the SBOM
+          # steps and this file) must be the one image this selftest runs.
+          TRIVY_PINS=$(grep -ho 'aquasecurity/trivy:[0-9.]*@sha256:[0-9a-f]\{64\}' \
+                         .github/workflows/release-image.yml \
+                         .github/workflows/release-dev-image.yml \
+                         .github/workflows/attestation-selftest.yml | sort -u)
+          [[ $(wc -l <<< "$TRIVY_PINS") == 1 && "public.ecr.aws/${TRIVY_PINS}" == "$TRIVY_IMAGE" ]] \
+            || { echo "::error::scanner pins differ between the release workflows and this selftest: ${TRIVY_PINS}"; exit 1; }
+          PINS=$(grep -ho 'actions/attest@[0-9a-f]\{40\}' \
+                   .github/workflows/release-image.yml \
+                   .github/workflows/release-dev-image.yml \
+                   .github/workflows/attestation-selftest.yml | sort -u)
+          [[ $(wc -l <<< "$PINS") == 1 ]] \
+            || { echo "::error::actions/attest pins differ between the release workflows and this selftest: ${PINS}"; exit 1; }
+
+      - name: Save an image tarball and generate its SBOM, as the release build jobs do
+        run: |
+          set -euo pipefail
+          docker pull -q "$SUBJECT_IMAGE"
+          docker save "$SUBJECT_IMAGE" | gzip > subject.tar.gz
+          printf 'attestation selftest %s %s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > subject2.txt
+          mkdir -p sbom
+          docker run --rm \
+            -v "$PWD/subject.tar.gz:/image.tar.gz:ro" \
+            "$TRIVY_IMAGE" image --input /image.tar.gz \
+            --format cyclonedx --no-progress --skip-version-check \
+            > sbom/sbom.cdx.json
+          python3 - sbom/sbom.cdx.json <<'PY'
+          import json, sys
+          bom = json.load(open(sys.argv[1]))
+          if bom.get("bomFormat") != "CycloneDX" or not bom.get("components"):
+              print(f"::error::{sys.argv[1]} is not a CycloneDX SBOM with components")
+              sys.exit(1)
+          print(f"{len(bom['components'])} components")
+          PY
+
+      - name: Upload the subjects and the SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: attestation-selftest
+          path: |
+            subject.tar.gz
+            subject2.txt
+            sbom/
+          retention-days: 1
+          compression-level: 0   # the tarball is already gzipped
+
+  attest:
+    needs: sbom
+    # Fork pull requests get no OIDC token; skip rather than fail.
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write       # Sigstore certificate for the attestations
+      attestations: write   # store them; also lets gh read them back
+    steps:
+      - name: Download the subjects and the SBOM
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: attestation-selftest
+
+      - name: Write the subjects as the release attest jobs do
+        id: subjects
+        run: |
+          set -euo pipefail
+          D1=$(sha256sum subject.tar.gz | cut -d' ' -f1)
+          D2=$(sha256sum subject2.txt | cut -d' ' -f1)
+          printf '%s %s\n%s %s\n' "$D1" selftest/subject "$D2" selftest/subject > subjects.txt
+          echo "digest=sha256:${D1}" >> "$GITHUB_OUTPUT"
+
+      - name: Attest the build provenance (two subjects, one name)
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6  # v4.2.2
+        with:
+          subject-checksums: subjects.txt
+
+      - name: Attest the SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6  # v4.2.2
+        with:
+          subject-name: selftest/subject
+          subject-digest: ${{ steps.subjects.outputs.digest }}
+          sbom-path: sbom/sbom.cdx.json
+
+      - name: Verify all three, by exact signer identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # GITHUB_WORKFLOW_REF is owner/repo/.github/workflows/file.yml@ref,
+          # so the certificate identity is https://github.com/<it>.
+          IDENTITY="https://github.com/${GITHUB_WORKFLOW_REF}"
+          for f in subject.tar.gz subject2.txt; do
+            gh attestation verify "$f" \
+              --repo "$GITHUB_REPOSITORY" --cert-identity "$IDENTITY" >/dev/null
+            echo "Provenance verified for ${f}"
+          done
+          FORMAT=$(gh attestation verify subject.tar.gz \
+            --repo "$GITHUB_REPOSITORY" --cert-identity "$IDENTITY" \
+            --predicate-type https://cyclonedx.org/bom \
+            --format json --jq '.[0].verificationResult.statement.predicate.bomFormat')
+          [[ "$FORMAT" == "CycloneDX" ]] \
+            || { echo "::error::SBOM attestation verified but its predicate is not the CycloneDX SBOM (got '${FORMAT}')"; exit 1; }
+          echo "SBOM verified and extracted"

@@ -14,7 +14,7 @@ First, check whether a config file is already present at the repo root.
 test -f extenddb.toml && echo "extenddb.toml already exists" || echo "extenddb.toml absent"
 ```
 
-`extenddb.toml` on its own does not block `extenddb init`. If `extenddb.toml` exists, `init` loads defaults from it and continues. The real blocker is whether the `extenddb_catalog` and `extenddb` data databases exist in PostgreSQL.
+`extenddb.toml` on its own blocks `extenddb init`: if it exists, `init` refuses with `Error: Config file "extenddb.toml" already exists. Use --overwrite to delete and regenerate it.` and exits 255. With `--overwrite`, `init` loads the PostgreSQL connection defaults from the file and continues. The other blocker is whether the `extenddb_catalog` and `extenddb` data databases exist in PostgreSQL.
 
 Second, check whether a prior deployment is present in PostgreSQL.
 

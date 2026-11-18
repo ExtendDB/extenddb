@@ -276,3 +276,79 @@ async fn shards_of_a_deleted_table_go_once_its_records_are_gone() {
 
     s.cleanup().await;
 }
+
+/// A record that still waits for its sequence number in `stream_pending`
+/// keeps the shards of a deleted table too. Deleting the shards would take
+/// the record with them, through the foreign key's cascade, before the
+/// numbering worker numbered it (#808).
+#[tokio::test]
+async fn a_pending_record_keeps_the_shards_of_a_deleted_table() {
+    if base_conn().is_none() {
+        eprintln!("SKIP: EXTENDDB_TEST_PG_CONNECTION_STRING is not set");
+        return;
+    }
+    let s = scratch().await;
+    let gone = s
+        .engine
+        .create_table(ACCOUNT, stream_table("t_gone"))
+        .await
+        .expect("create the table to delete");
+    let gone_id = gone.table_id.clone();
+    s.engine
+        .delete_table(
+            ACCOUNT,
+            DeleteTableInput {
+                table_name: "t_gone".to_owned(),
+            },
+        )
+        .await
+        .expect("delete the table");
+    let shard: String = sqlx::query_scalar(
+        "SELECT shard_id FROM stream_shards WHERE table_id = $1 ORDER BY shard_id LIMIT 1",
+    )
+    .bind(&gone_id)
+    .fetch_one(&s.db)
+    .await
+    .expect("one shard id");
+    // A write's record, stored before the table was deleted and not yet
+    // numbered.
+    sqlx::query(
+        "INSERT INTO stream_pending (shard_id, table_id, event_name, record_data, created_at) \
+         VALUES ($1, $2, 'INSERT', '{\"dynamodb\": {\"SequenceNumber\": \"\"}}'::jsonb, NOW())",
+    )
+    .bind(&shard)
+    .bind(&gone_id)
+    .execute(&s.db)
+    .await
+    .expect("seed a pending record");
+
+    s.engine
+        .cleanup_expired_stream_records(0)
+        .await
+        .expect("sweep");
+    assert_eq!(
+        shard_count(&s.db, &gone_id).await,
+        4,
+        "shards stay while a record of theirs waits for its number"
+    );
+
+    let moved = s
+        .engine
+        .number_pending_stream_records_for_tests()
+        .await
+        .expect("number the pending record");
+    assert_eq!(moved, 1, "the record is numbered");
+    // The numbered record is past a retention of zero hours, so the sweep
+    // trims it, and then the shards.
+    s.engine
+        .cleanup_expired_stream_records(0)
+        .await
+        .expect("sweep");
+    assert_eq!(
+        shard_count(&s.db, &gone_id).await,
+        0,
+        "the shards go once the record has been numbered and trimmed"
+    );
+
+    s.cleanup().await;
+}

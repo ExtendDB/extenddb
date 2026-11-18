@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2026 ExtendDB contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Catalogs this binary created and migrated, against the last 0.1.x image:
+"""Catalogs this binary created and migrated, against the 0.1.14 image:
 
     devtools/check-mongodb-older-binary <extenddb binary> \\
         [image] [mongo port] [api port]
@@ -146,7 +146,7 @@ def check(label: str, binary: str, image: str, port: int, api: int, fixture: str
         for what, cmd in [("verify", [binary, "verify", "--config", config]),
                           ("migrate preview", [binary, "migrate", "--config", config])]:
             expect_exit(5, f"{label}: {what} after the image wrote to the catalog", cmd, env,
-                        contains="release before 1.0")
+                        contains="release before 0.1.15")
         expect_exit(5, f"{label}: serve after the image wrote to the catalog",
                     [binary, *serve], env, contains="--reconverge", timeout=60)
         expect_exit(0, f"{label}: migrate --yes --reconverge",

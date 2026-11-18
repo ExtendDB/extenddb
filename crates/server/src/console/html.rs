@@ -163,23 +163,39 @@ label{{display:block;margin:0.5rem 0 0.2rem;font-weight:500;font-size:0.9rem}}
     )
 }
 
-/// Build the navigation bar for an authenticated session.
-pub fn nav_bar(identity_label: &str) -> String {
+/// The caller a navigation bar is built for: the label shown at its right,
+/// and whether the caller is an admin.
+pub struct NavIdentity {
+    pub label: String,
+    pub is_admin: bool,
+}
+
+/// The navigation links to the admin-only pages. Each of these pages
+/// redirects an IAM-user session to the console dashboard.
+const ADMIN_LINKS: &str = concat!(
+    "\n<a href=\"/console/accounts\">Accounts</a>",
+    "\n<a href=\"/console/metrics\">Metrics</a>",
+    "\n<a href=\"/console/settings\">Settings</a>",
+    "\n<a href=\"/console/cache\">Cache</a>",
+);
+
+/// Build the navigation bar for an authenticated session. The Accounts,
+/// Metrics, Settings and Cache links are left out for IAM users, because
+/// those pages are admin only. An IAM-user session reaches its own user page
+/// from the console dashboard.
+pub fn nav_bar(identity: &NavIdentity) -> String {
+    let admin_links = if identity.is_admin { ADMIN_LINKS } else { "" };
     format!(
         r#"<nav>
 <span class="brand">extenddb Console</span>
-<a href="/console">Dashboard</a>
-<a href="/console/accounts">Accounts</a>
-<a href="/console/metrics">Metrics</a>
-<a href="/console/settings">Settings</a>
-<a href="/console/cache">Cache</a>
+<a href="/console">Dashboard</a>{admin_links}
 <span class="spacer"></span>
 <span>{identity}</span>
 <form class="inline" method="post" action="/console/logout">
 <button class="btn btn-sm" type="submit">Logout</button>
 </form>
 </nav>"#,
-        identity = escape(identity_label),
+        identity = escape(&identity.label),
     )
 }
 

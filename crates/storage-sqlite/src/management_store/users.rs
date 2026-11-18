@@ -9,6 +9,8 @@ use extenddb_storage::management_store::{OpError, OpResult, UserDetail, UserList
 use crate::catalog_store::SqliteCatalogStore;
 use crate::sqlite_util::{is_fk_violation, is_unique_violation, parse_timestamp};
 
+use super::policies::{begin_write, delete_login_history, delete_principal_attachments, finish};
+
 impl SqliteCatalogStore {
     pub(crate) async fn create_user_impl(
         &self,
@@ -17,39 +19,6 @@ impl SqliteCatalogStore {
         password_hash: Option<&str>,
     ) -> OpResult<()> {
         let user_arn = format!("arn:aws:iam::{account_id}:user/{user_name}");
-
-        // D1: every writer holds the write lock, acquired before the
-        // transaction begins so the lock never waits on a pool connection.
-        let _writer = self.lock_writes().await;
-        let mut tx = self
-            .pool()
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| {
-                tracing::error!("create_user begin: {e}");
-                OpError::Internal("Database error".to_owned())
-            })?;
-
-        sqlx::query(
-            "INSERT INTO iam_users (account_id, user_name, user_arn, password_hash) \
-             VALUES (?, ?, ?, ?)",
-        )
-        .bind(account_id)
-        .bind(user_name)
-        .bind(&user_arn)
-        .bind(password_hash)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            if is_unique_violation(&e) {
-                OpError::AlreadyExists("IAM user already exists".to_owned())
-            } else if is_fk_violation(&e) {
-                OpError::NotFound("Account not found".to_owned())
-            } else {
-                tracing::error!("create_user: {e}");
-                OpError::Internal("Database error".to_owned())
-            }
-        })?;
 
         // Seed a default self-service policy so the user can manage its own
         // access keys and password without an administrator attaching one
@@ -64,49 +33,87 @@ impl SqliteCatalogStore {
                     "iam:ListAccessKeys",
                     "iam:ChangePassword"
                 ],
-                "Resource": user_arn,
+                "Resource": &user_arn,
             }]
         })
         .to_string();
 
-        sqlx::query(
-            "INSERT INTO iam_policies \
-             (account_id, principal_type, principal_name, policy_name, policy_document) \
-             VALUES (?, 'user', ?, 'SelfServicePolicy', ?) ON CONFLICT DO NOTHING",
-        )
-        .bind(account_id)
-        .bind(user_name)
-        .bind(&self_service_policy)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            tracing::error!("seed self-service policy: {e}");
-            OpError::Internal("Database error".to_owned())
-        })?;
+        // D1: every writer holds the write lock, acquired before the
+        // transaction begins so the lock never waits on a pool connection.
+        let _writer = self.lock_writes().await;
+        let mut tx = begin_write(self.pool(), "create_user").await?;
+        let result: OpResult<()> = async {
+            sqlx::query(
+                "INSERT INTO iam_users (account_id, user_name, user_arn, password_hash) \
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(account_id)
+            .bind(user_name)
+            .bind(&user_arn)
+            .bind(password_hash)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                if is_unique_violation(&e) {
+                    OpError::AlreadyExists("IAM user already exists".to_owned())
+                } else if is_fk_violation(&e) {
+                    OpError::NotFound("Account not found".to_owned())
+                } else {
+                    tracing::error!("create_user: {e}");
+                    OpError::Internal("Database error".to_owned())
+                }
+            })?;
 
-        tx.commit().await.map_err(|e| {
-            tracing::error!("create_user commit: {e}");
-            OpError::Internal("Database error".to_owned())
-        })?;
-        Ok(())
+            // A user deleted before deletes removed these could have left its
+            // inline policies and boundary under this name.
+            delete_principal_attachments(&mut tx, account_id, "user", user_name).await?;
+            delete_login_history(&mut tx, account_id, user_name).await?;
+
+            sqlx::query(
+                "INSERT INTO iam_policies \
+                 (account_id, principal_type, principal_name, policy_name, policy_document) \
+                 VALUES (?, 'user', ?, 'SelfServicePolicy', ?) ON CONFLICT DO NOTHING",
+            )
+            .bind(account_id)
+            .bind(user_name)
+            .bind(&self_service_policy)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                tracing::error!("seed self-service policy: {e}");
+                OpError::Internal("Database error".to_owned())
+            })?;
+            Ok(())
+        }
+        .await;
+        finish(tx, result, "create_user").await
     }
 
     pub(crate) async fn delete_user_impl(&self, account_id: &str, user_name: &str) -> OpResult<()> {
         // D1: every writer holds the write lock.
         let _writer = self.lock_writes().await;
-        let result = sqlx::query("DELETE FROM iam_users WHERE account_id = ? AND user_name = ?")
-            .bind(account_id)
-            .bind(user_name)
-            .execute(self.pool())
-            .await
-            .map_err(|e| {
-                tracing::error!("delete_user: {e}");
-                OpError::Internal("Database error".to_owned())
-            })?;
-        if result.rows_affected() == 0 {
-            return Err(OpError::NotFound("IAM user not found".to_owned()));
+        let mut tx = begin_write(self.pool(), "delete_user").await?;
+        let result: OpResult<()> = async {
+            // The foreign keys remove the user's access keys, tags and group
+            // memberships. Its inline policies and boundary have none.
+            let deleted =
+                sqlx::query("DELETE FROM iam_users WHERE account_id = ? AND user_name = ?")
+                    .bind(account_id)
+                    .bind(user_name)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("delete_user: {e}");
+                        OpError::Internal("Database error".to_owned())
+                    })?;
+            if deleted.rows_affected() == 0 {
+                return Err(OpError::NotFound("IAM user not found".to_owned()));
+            }
+            delete_principal_attachments(&mut tx, account_id, "user", user_name).await?;
+            delete_login_history(&mut tx, account_id, user_name).await
         }
-        Ok(())
+        .await;
+        finish(tx, result, "delete_user").await
     }
 
     pub(crate) async fn list_users_impl(&self, account_id: &str) -> OpResult<Vec<UserListEntry>> {
@@ -219,11 +226,11 @@ impl SqliteCatalogStore {
             OpError::Internal("Database error".to_owned())
         })?;
 
-        let Some((Some(hash),)) = row else {
-            // User absent or has no console password.
-            return Ok(false);
-        };
-        extenddb_storage::password::verify_password(password.to_owned(), hash).await
+        // `None` when the user is absent or has no console password, which
+        // still runs one bcrypt check (see `verify_stored_password`), as a
+        // wrong password does.
+        let hash = row.and_then(|(hash,)| hash);
+        extenddb_storage::password::verify_stored_password(password.to_owned(), hash).await
     }
 
     pub(crate) async fn change_user_password_impl(
@@ -344,5 +351,80 @@ impl SqliteCatalogStore {
             tracing::error!("list_user_tags: {e}");
             OpError::Internal("Database error".to_owned())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use extenddb_storage::management_store::ManagementStore;
+    use extenddb_storage::password::count_verifications;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::*;
+
+    const ACCOUNT: &str = "123456789012";
+
+    /// bcrypt's lowest cost, for the test user's hash. It keeps the test fast
+    /// and tells a check against a stored hash apart from one against the
+    /// fixed hash, which is at the default cost.
+    const TEST_COST: u32 = 4;
+
+    async fn store() -> SqliteCatalogStore {
+        // One connection keeps the in-memory database alive for the test.
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory sqlite");
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+        crate::migrations::apply_for_tests(&pool).await;
+        SqliteCatalogStore::new(pool)
+    }
+
+    #[tokio::test]
+    async fn an_unknown_user_or_one_without_a_password_runs_one_bcrypt_check() {
+        let s = store().await;
+        s.create_account(ACCOUNT, "acct").await.unwrap();
+        let hash = bcrypt::hash("correct horse", TEST_COST).unwrap();
+        s.create_user(ACCOUNT, "alice", Some(&hash)).await.unwrap();
+        s.create_user(ACCOUNT, "bob", None).await.unwrap();
+
+        let (right, right_costs) =
+            count_verifications(s.verify_iam_user_password(ACCOUNT, "alice", "correct horse"))
+                .await;
+        assert!(right.unwrap());
+        assert_eq!(right_costs, [TEST_COST]);
+
+        // The cost of the one check each refused login runs: alice's hash for
+        // her wrong password, the fixed hash for the others.
+        let cases = [
+            (ACCOUNT, "alice", TEST_COST, "wrong password"),
+            (
+                ACCOUNT,
+                "bob",
+                bcrypt::DEFAULT_COST,
+                "user without a console password",
+            ),
+            (ACCOUNT, "nobody", bcrypt::DEFAULT_COST, "unknown user"),
+            (
+                "111122223333",
+                "alice",
+                bcrypt::DEFAULT_COST,
+                "unknown account",
+            ),
+        ];
+        for (account_id, user_name, cost, case) in cases {
+            let (verified, costs) = count_verifications(s.verify_iam_user_password(
+                account_id,
+                user_name,
+                "battery staple",
+            ))
+            .await;
+            assert!(!verified.unwrap(), "{case}: verified");
+            assert_eq!(costs, [cost], "{case}: bcrypt checks and their cost");
+        }
     }
 }

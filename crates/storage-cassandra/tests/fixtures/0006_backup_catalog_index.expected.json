@@ -1,0 +1,197 @@
+{
+  "columns": {
+    "backup_index_by_status.account_id": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backup_index_by_status.backup_arn": {
+      "kind": "clustering",
+      "position": 0,
+      "clustering_order": "asc",
+      "type": "text"
+    },
+    "backup_index_by_status.backup_status": {
+      "kind": "partition_key",
+      "position": 1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backup_index_by_status.store_id": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backup_index_by_status.store_kind": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backup_index_by_status.store_root": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backup_maintenance.claim": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backup_maintenance.claimed_at": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "backup_maintenance.heartbeat_at": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "backup_maintenance.holder": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backup_maintenance.owner_generation": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "bigint"
+    },
+    "backups_by_arn.backup_id": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backups_by_arn.completed_at": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "backups_by_arn.failure_reason": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backups_by_arn.heartbeat_at": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "backups_by_arn.owner_generation": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "bigint"
+    },
+    "backups_by_arn.source_table_details_json": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backups_by_arn.store_id": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backups_by_arn.store_kind": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backups_by_arn.store_root": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "tables.restore_completed_at": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "tables.restore_failure_reason": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "tables.restore_file_index": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "int"
+    },
+    "tables.restore_heartbeat_at": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "tables.restore_items_applied": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "bigint"
+    },
+    "tables.restore_kind": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "tables.restore_owner_generation": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "bigint"
+    },
+    "tables.restore_spool_host": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "tables.restore_status": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "tables.restore_store_id": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "tables.restore_store_kind": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "tables.restore_store_root": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    }
+  },
+  "indexes": {}
+}

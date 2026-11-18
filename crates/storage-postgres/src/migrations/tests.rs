@@ -53,7 +53,7 @@ fn the_baseline_files_keep_the_legacy_index_names_and_guards() {
     let Body::File { text, .. } = &baseline.bodies()[0].body else {
         panic!("migration 1's catalog body is a file");
     };
-    // A release before 1.0 that replays legacy 001 stops at its first index,
+    // A release before 0.1.15 that replays legacy 001 stops at its first index,
     // before it changes anything, only while the names stay the same.
     for name in [
         "idx_tables_pending_transition",
