@@ -169,7 +169,7 @@ fn provider_over(store: MockCredentialStore) -> BuiltinAuthProvider {
 }
 
 /// The requests here are signed for `/` with no query string.
-impl BuiltinAuthProvider<MockCredentialStore> {
+impl BuiltinAuthProvider {
     async fn authenticate(&self, h: &HeaderMap, b: &[u8]) -> Result<AuthIdentity, DynamoDbError> {
         AuthProvider::authenticate(self, "/", "", h, b).await
     }
