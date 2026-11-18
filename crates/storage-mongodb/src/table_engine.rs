@@ -930,6 +930,11 @@ impl MongoEngine {
             update_doc.insert("table_class", tc);
         }
 
+        if let Some(spec) = &input.sse_specification {
+            let spec = bson::to_bson(spec).map_err(|e| StorageError::Internal(e.to_string()))?;
+            update_doc.insert("sse_specification", spec);
+        }
+
         if let Some(odt) = &input.on_demand_throughput {
             let odt_bson = bson::to_bson(odt).map_err(|e| StorageError::Internal(e.to_string()))?;
             update_doc.insert("on_demand_throughput", odt_bson);

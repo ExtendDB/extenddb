@@ -147,6 +147,10 @@ impl CassandraEngine {
             add_update!("table_class", tc.as_str());
         }
 
+        if let Some(spec) = &input.sse_specification {
+            add_update!("sse_specification", spec.to_string().as_str());
+        }
+
         if let Some(odt) = &input.on_demand_throughput {
             let odt_json =
                 serde_json::to_string(odt).map_err(|e| StorageError::Internal(e.to_string()))?;

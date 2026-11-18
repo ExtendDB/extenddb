@@ -362,6 +362,18 @@ impl PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
         }
+        if let Some(spec) = &input.sse_specification {
+            sqlx::query(
+                "UPDATE tables SET sse_specification = $1 \
+                 WHERE account_id = $2 AND table_name = $3",
+            )
+            .bind(spec)
+            .bind(account_id)
+            .bind(&input.table_name)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        }
 
         // Apply on-demand throughput change.
         if let Some(odt) = &input.on_demand_throughput {

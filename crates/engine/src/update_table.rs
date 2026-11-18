@@ -98,7 +98,8 @@ pub async fn handle_update_table(
         .is_some_and(|u| !u.is_empty());
 
     // Validate: at least one field must be specified. An UpdateTable carrying
-    // only WarmThroughput is accepted (measured 2026-10-23).
+    // only WarmThroughput is accepted (measured 2026-10-23), and so is one
+    // carrying only SSESpecification (measured 2026-11-18).
     if input.billing_mode.is_none()
         && input.provisioned_throughput.is_none()
         && input.deletion_protection_enabled.is_none()
@@ -106,6 +107,7 @@ pub async fn handle_update_table(
         && input.table_class.is_none()
         && input.on_demand_throughput.is_none()
         && input.warm_throughput.is_none()
+        && input.sse_specification.is_none()
         && !has_gsi_updates
         && !has_vector_updates
     {
@@ -159,6 +161,42 @@ pub async fn handle_update_table(
         return Err(DynamoDbError::ValidationException(
                 "One or more parameter values were invalid: ReadCapacityUnits and WriteCapacityUnits must each be at least 1".to_owned(),
             ));
+    }
+
+    // The service reads a specification without Enabled that names SSEType
+    // or KMSMasterKeyId as one with Enabled true (measured 2026-11-18), and
+    // the backends report a specification by its Enabled.
+    if let Some(spec) = input
+        .sse_specification
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        && !spec.contains_key("Enabled")
+        && (spec.contains_key("SSEType") || spec.contains_key("KMSMasterKeyId"))
+    {
+        spec.insert("Enabled".to_owned(), Value::Bool(true));
+    }
+    // The service answers these after a BillingMode of PROVISIONED without
+    // ProvisionedThroughput, and before the table lookup (measured
+    // 2026-11-18).
+    crate::create_table::check_sse_specification(input.sse_specification.as_ref())?;
+    // A specification travels alone, refused before the table lookup
+    // (measured 2026-11-18 beside each of these). A stream change beside
+    // ProvisionedThroughput answers its own sentence first (measured
+    // 2026-11-18), and beside WarmThroughput the specification gets the same
+    // sentence from the WarmThroughput rule below.
+    if input.sse_specification.is_some()
+        && !(input.stream_specification.is_some() && input.provisioned_throughput.is_some())
+        && (input.billing_mode.is_some()
+            || input.provisioned_throughput.is_some()
+            || input.deletion_protection_enabled.is_some()
+            || input.stream_specification.is_some()
+            || input.table_class.is_some()
+            || input.on_demand_throughput.is_some()
+            || has_gsi_updates)
+    {
+        return Err(DynamoDbError::ValidationException(
+            extenddb_core::validation::SSE_MUST_BE_ONLY_OPERATION.to_owned(),
+        ));
     }
 
     // A table-level WarmThroughput stands alone in its request, with the
@@ -227,7 +265,13 @@ pub async fn handle_update_table(
     // A switch to PAY_PER_REQUEST stores the on-demand minimum as the warm
     // throughput of a provisioned table that is below it, so it needs the table.
     let switches_to_on_demand = matches!(input.billing_mode, Some(BillingMode::PayPerRequest));
-    if projects_attributes || touches_warm || bare_update || switches_to_on_demand {
+    // A specification that disables encryption is refused on a table with the
+    // default encryption, after the table lookup (measured 2026-11-18).
+    let disables_sse = input
+        .sse_specification
+        .as_ref()
+        .is_some_and(|spec| spec.get("Enabled") != Some(&Value::Bool(true)));
+    if projects_attributes || touches_warm || bare_update || switches_to_on_demand || disables_sse {
         let existing = ctx
             .storage
             .describe_table(
@@ -238,6 +282,12 @@ pub async fn handle_update_table(
             )
             .await
             .map_err(|e| update_table_err_to_dynamo(e, &input.table_name))?;
+        if disables_sse && existing.sse_description.is_none() {
+            return Err(DynamoDbError::ValidationException(
+                "One or more parameter values were invalid: Table is already encrypted by default"
+                    .to_owned(),
+            ));
+        }
         if let Some(updates) = &input.global_secondary_index_updates
             && projects_attributes
         {
