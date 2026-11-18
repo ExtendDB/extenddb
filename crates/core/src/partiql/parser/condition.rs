@@ -203,7 +203,15 @@ impl Parser {
                     let comparison = self.finish_comparison(Operand::Function(lname, args))?;
                     return self.after_predicate(comparison);
                 }
-                forms::check_presence_operands(&lname, &args)?;
+                if let Err(refusal) = forms::check_presence_operands(&lname, &args) {
+                    // A later syntax error comes first in a refused EXISTS
+                    // statement (measured 2026-11-18, see `walk`), so the
+                    // parse reads on.
+                    if !self.refuse_exists {
+                        return Err(refusal);
+                    }
+                    self.defer(&refusal.message);
+                }
                 return self.after_predicate(WhereExpr::Function(lname, args));
             }
         }

@@ -68,11 +68,12 @@ pub(super) async fn run(
         Statement::Insert(insert) => run_insert(ctx, insert, req, gate).await,
         Statement::Update(update) => run_update(ctx, update, req, gate).await,
         Statement::Delete(delete) => run_delete(ctx, delete, req, gate).await,
-        Statement::Exists(_) => Err(exists_outside_transaction()),
-        // SELECT is dispatched to the read executor by the caller; reaching
-        // here is a routing bug, not a client error.
-        Statement::Select(_) => Err(DynamoDbError::InternalServerError(
-            "SELECT routed to the write executor".to_owned(),
+        // SELECT is dispatched to the read executor by the caller, and the
+        // parse refuses EXISTS outside a transaction (see
+        // `parse_for_execute_statement`); reaching here is a routing bug,
+        // not a client error.
+        Statement::Select(_) | Statement::Exists(_) => Err(DynamoDbError::InternalServerError(
+            "SELECT or EXISTS routed to the write executor".to_owned(),
         )),
     }
 }
@@ -99,20 +100,10 @@ pub(super) async fn check_translation(
             }
             build_delete_parts(ctx, delete, params).await.map(drop)
         }
-        Statement::Exists(_) => Err(exists_outside_transaction()),
-        Statement::Select(_) => Err(DynamoDbError::InternalServerError(
-            "SELECT routed to the write executor".to_owned(),
+        Statement::Select(_) | Statement::Exists(_) => Err(DynamoDbError::InternalServerError(
+            "SELECT or EXISTS routed to the write executor".to_owned(),
         )),
     }
-}
-
-/// `EXISTS(SELECT ...)` is a condition check for an `ExecuteTransaction`
-/// member. `ExecuteStatement` refuses it, and a `BatchExecuteStatement`
-/// member reports it as its error (measured 2026-11-02).
-pub(super) fn exists_outside_transaction() -> DynamoDbError {
-    DynamoDbError::ValidationException(
-        "EXISTS can only be used in ExecuteTransaction write requests.".to_owned(),
-    )
 }
 
 // --- response shaping -----------------------------------------------------
