@@ -367,8 +367,8 @@ fn update_table_err_to_dynamo(
 ) -> DynamoDbError {
     use extenddb_storage::error::StorageError;
     match e {
-        StorageError::TableNotFound(_name) => {
-            DynamoDbError::ResourceNotFoundException("Requested resource not found".to_string())
+        e @ StorageError::TableNotFound(_) => {
+            crate::create_table::storage_err_to_dynamo_naming_table(e)
         }
         StorageError::TableNotActive(name) => {
             DynamoDbError::ResourceInUseException(format!("Table {name} is not in ACTIVE state"))
