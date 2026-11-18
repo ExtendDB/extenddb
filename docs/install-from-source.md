@@ -217,7 +217,7 @@ built 2026-10-24T08:37:05Z
 test-hooks disabled
 ```
 
-`extenddb -V` prints the same. A source build carries the same release version as the published `0.1.14` images and a newer catalog: migration 12 here, 0.0.3 in the images (see the [upgrade manual](manuals/07-upgrade-manual.md#upgrading-a-container-deployment)). <!-- version-literal-ok: names the published tag's catalog, which is behind the tree -->
+`extenddb -V` prints the same. A source build carries a newer release version and a newer catalog than the published `0.1.14` images. The catalog is at migration 12 here and at 0.0.3 in the images (see the [upgrade manual](manuals/07-upgrade-manual.md#upgrading-a-container-deployment)). <!-- version-literal-ok: names the published tag's catalog, which is behind the tree -->
 
 ## 3. Initialize the deployment
 
