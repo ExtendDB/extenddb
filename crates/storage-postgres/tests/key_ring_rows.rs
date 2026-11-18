@@ -356,6 +356,18 @@ async fn set_data_connection_writes_the_row_under_the_ring() {
                     .is_err(),
                 "{name}: verify's check opened the row without a key"
             );
+            // `catalog-check` opens the row as `verify` does.
+            store
+                .check_storage_relations(&KeySource::Kek(Zeroizing::new(KEK).into()))
+                .await
+                .unwrap_or_else(|e| panic!("{name}: catalog-check with the KEK: {e}"));
+            assert!(
+                store
+                    .check_storage_relations(&KeySource::CatalogKey)
+                    .await
+                    .is_err(),
+                "{name}: catalog-check opened the row without the KEK"
+            );
         } else {
             assert!(result.is_err(), "{name}: not refused");
             assert_eq!(row, "unchanged", "{name}: the row changed");
