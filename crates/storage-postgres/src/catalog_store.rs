@@ -212,9 +212,13 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for PostgresCatalogStore {
         })
     }
 
-    fn check_storage_relations(&self) -> BoxFuture<'_, DiagResult<StorageRelationCheck>> {
+    fn check_storage_relations(
+        &self,
+        key: &extenddb_storage::server_components::KeySource,
+    ) -> BoxFuture<'_, DiagResult<StorageRelationCheck>> {
+        let key = key.clone();
         Box::pin(async move {
-            let data = data_pool(&self.pool).await?;
+            let data = data_pool(&self.pool, key).await?;
             let budget = crate::data::catalog_check::INDEX_LOCK_BUDGET;
             crate::data::catalog_check::check(&self.pool, &data, budget)
                 .await
@@ -224,10 +228,12 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for PostgresCatalogStore {
 
     fn drop_orphaned_relations(
         &self,
+        key: &extenddb_storage::server_components::KeySource,
         orphaned: Vec<String>,
     ) -> BoxFuture<'_, DiagResult<Vec<(String, OrphanDrop)>>> {
+        let key = key.clone();
         Box::pin(async move {
-            let data = data_pool(&self.pool).await?;
+            let data = data_pool(&self.pool, key).await?;
             let budget = crate::data::catalog_check::INDEX_LOCK_BUDGET;
             crate::data::catalog_check::drop_orphaned(&self.pool, &data, orphaned, budget)
                 .await
@@ -251,7 +257,9 @@ fn catalog_check_error(e: &sqlx::Error, budget: std::time::Duration, outcome: &s
 }
 
 /// The pool that holds the data relations: the data database the catalog
-/// names, as `extenddb init` records it.
+/// names, as `extenddb init` records it. The connection string is read as
+/// `test_data_database_connection` reads it: in a catalog with a key ring
+/// the row is encrypted, and `key` opens it (RFC-0000 section 12).
 ///
 /// A catalog without the setting, or with an empty one, is refused: the data
 /// relations could then only be looked for in the catalog's own database, a
@@ -260,13 +268,18 @@ fn catalog_check_error(e: &sqlx::Error, budget: std::time::Duration, outcome: &s
 ///
 /// Statement logging is off, so a drop that waits out its lock timeout does
 /// not print a slow-statement line in the middle of the command's report.
-async fn data_pool(catalog: &PgPool) -> DiagResult<PgPool> {
-    let conn: Option<(String,)> =
-        sqlx::query_as("SELECT value FROM settings WHERE key = 'data_database_connection_string'")
-            .fetch_optional(catalog)
-            .await
-            .map_err(|e| DiagError::QueryFailed(e.to_string()))?;
-    let Some((conn,)) = conn.filter(|(conn,)| !conn.is_empty()) else {
+async fn data_pool(
+    catalog: &PgPool,
+    key: extenddb_storage::server_components::KeySource,
+) -> DiagResult<PgPool> {
+    // `data_connection_string` reads the catalog's rows only, so the
+    // target's data database name is not used.
+    let target = crate::migrations::PostgresTarget::new((*catalog.connect_options()).clone(), "")
+        .with_key_source(key, false);
+    let conn = crate::migrations::data_connection_string(&target)
+        .await
+        .map_err(|e| DiagError::QueryFailed(e.to_string()))?;
+    let Some(conn) = conn.filter(|conn| !conn.is_empty()) else {
         return Err(DiagError::NotConfigured(
             "No data database connection string in settings. Run `extenddb init`.".to_owned(),
         ));

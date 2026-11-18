@@ -6,6 +6,7 @@
 use std::time::{Duration, Instant};
 
 use extenddb_storage::diagnostics::{DiagnosticsStore, OrphanDrop};
+use extenddb_storage::server_components::KeySource;
 use extenddb_storage_postgres::PostgresCatalogStore;
 use sqlx::{Connection, PgPool};
 
@@ -88,7 +89,7 @@ async fn fix_drops_only_the_relation_no_catalog_row_names() {
 
     let check = d
         .diagnostics
-        .check_storage_relations()
+        .check_storage_relations(&KeySource::CatalogKey)
         .await
         .expect("check");
     assert_eq!(check.orphaned, vec![orphan.clone()]);
@@ -111,7 +112,7 @@ async fn fix_drops_only_the_relation_no_catalog_row_names() {
 
     let outcomes = d
         .diagnostics
-        .drop_orphaned_relations(candidates.clone())
+        .drop_orphaned_relations(&KeySource::CatalogKey, candidates.clone())
         .await
         .expect("drop");
     let names: Vec<&String> = outcomes.iter().map(|(n, _)| n).collect();
@@ -142,7 +143,7 @@ async fn fix_drops_only_the_relation_no_catalog_row_names() {
 
     let check = d
         .diagnostics
-        .check_storage_relations()
+        .check_storage_relations(&KeySource::CatalogKey)
         .await
         .expect("check again");
     assert!(check.orphaned.is_empty(), "orphaned: {:?}", check.orphaned);
@@ -166,7 +167,7 @@ async fn an_index_added_during_the_drop_keeps_its_relation(
     let relation = add.relation.clone();
     let five = Duration::from_secs(5);
     let (outcomes, (held_while_waiting, table_write, other_write)) = tokio::join!(
-        store.drop_orphaned_relations(vec![relation.clone()]),
+        store.drop_orphaned_relations(&KeySource::CatalogKey, vec![relation.clone()]),
         async move {
             let held = other_tables_locked_by_the_index_lock_waiter(&d.catalog).await;
             let table_write = tokio::time::timeout(five, add.write_table_row()).await;
@@ -255,13 +256,17 @@ async fn an_index_added_during_the_check_is_not_reported_orphaned() {
     d.create_table_with_indexes(TABLE).await;
     let mut add = d.begin_index_add("gsi9").await;
     let d = &d;
-    let (check, table_write) = tokio::join!(d.diagnostics.check_storage_relations(), async move {
-        Deployment::wait_for_lock_request(&d.catalog, "indexes", "ShareLock").await;
-        let table_write = add.write_table_row().await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        add.commit().await;
-        table_write
-    });
+    let (check, table_write) = tokio::join!(
+        d.diagnostics
+            .check_storage_relations(&KeySource::CatalogKey),
+        async move {
+            Deployment::wait_for_lock_request(&d.catalog, "indexes", "ShareLock").await;
+            let table_write = add.write_table_row().await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            add.commit().await;
+            table_write
+        }
+    );
     let table_write = table_write.expect("the add's table write succeeded");
     assert!(table_write < Duration::from_millis(900), "{table_write:?}");
     let check = check.expect("check");
@@ -291,7 +296,8 @@ async fn a_held_orphan_fails_within_its_lock_timeout_and_catalog_writes_go_on() 
             // without a lock timeout of its own would wait here for good.
             let outcomes = tokio::time::timeout(
                 Duration::from_secs(10),
-                d.diagnostics.drop_orphaned_relations(vec![orphan.clone()]),
+                d.diagnostics
+                    .drop_orphaned_relations(&KeySource::CatalogKey, vec![orphan.clone()]),
             )
             .await
             .expect("the drop gave up on the held orphan within 10 s");
@@ -327,7 +333,7 @@ async fn a_held_orphan_fails_within_its_lock_timeout_and_catalog_writes_go_on() 
     holder.close().await.expect("release the orphan");
     let outcomes = d
         .diagnostics
-        .drop_orphaned_relations(vec![orphan.clone()])
+        .drop_orphaned_relations(&KeySource::CatalogKey, vec![orphan.clone()])
         .await
         .expect("drop again");
     assert_eq!(outcomes, vec![(orphan, OrphanDrop::Dropped)]);
@@ -346,14 +352,14 @@ async fn a_relation_dropped_first_by_another_session_is_already_gone() {
     let orphan = d.plant_orphan().await;
     let check = d
         .diagnostics
-        .check_storage_relations()
+        .check_storage_relations(&KeySource::CatalogKey)
         .await
         .expect("check");
     assert_eq!(check.orphaned, vec![orphan.clone()]);
     d.remove_relation(&orphan).await;
     let outcomes = d
         .diagnostics
-        .drop_orphaned_relations(check.orphaned)
+        .drop_orphaned_relations(&KeySource::CatalogKey, check.orphaned)
         .await
         .expect("drop");
     assert_eq!(outcomes, vec![(orphan, OrphanDrop::AlreadyGone)]);

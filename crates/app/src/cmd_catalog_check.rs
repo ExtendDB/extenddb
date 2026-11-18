@@ -70,6 +70,13 @@ pub async fn run(args: CatalogCheckArgs) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Cannot connect to catalog: {e}"))?;
     println!("Connected to catalog.");
 
+    // The key that opens the data database connection string row of a
+    // catalog with a key ring: the KEK of `[auth.encryption] key_file`
+    // (RFC-0000 section 12). Without `key_file`, the catalog key, which opens
+    // no such row.
+    let key_source = extenddb_server::key_file::key_source(&app_config.auth.encryption)
+        .map_err(anyhow::Error::msg)?;
+
     // The backend's own view of its data relations. It connects to the data
     // database the catalog names, and refuses a catalog that names none, as
     // this command always has.
@@ -79,7 +86,7 @@ pub async fn run(args: CatalogCheckArgs) -> anyhow::Result<()> {
     .await
     .map_err(|e| anyhow::anyhow!("Cannot open the storage backend's diagnostics: {e}"))?;
     let relations = diag_store
-        .check_storage_relations()
+        .check_storage_relations(&key_source)
         .await
         .map_err(|e| match e {
             DiagError::NotConfigured(msg) => anyhow::anyhow!("{msg}"),
@@ -105,7 +112,7 @@ pub async fn run(args: CatalogCheckArgs) -> anyhow::Result<()> {
             // relation against the catalog again, and drops each one that no
             // row names with a short lock wait of its own.
             match diag_store
-                .drop_orphaned_relations(relations.orphaned.clone())
+                .drop_orphaned_relations(&key_source, relations.orphaned.clone())
                 .await
             {
                 Ok(outcomes) => {
@@ -193,49 +200,4 @@ pub async fn run(args: CatalogCheckArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-/// The data database connection string that the row `stored` holds: the
-/// row as it is in a catalog without a key ring; with a ring, the row
-/// decrypted under a DEK of the ring, which the KEK of `[auth.encryption]
-/// key_file` opens (RFC-0000 section 12). A row that no DEK opens is
-/// refused, plaintext included, as every reader but `switch` refuses it.
-async fn data_connection_text(
-    catalog: &sqlx::PgPool,
-    app_config: &config::AppConfig,
-    stored: String,
-) -> anyhow::Result<zeroize::Zeroizing<String>> {
-    use extenddb_storage::key_ring::{KEY_RING_SETTING, open_ring};
-    use extenddb_storage::secret_keys::CATALOG_ID_SETTING;
-    use extenddb_storage::server_components::KeySource;
-
-    let setting = async |key: &str| -> anyhow::Result<Option<String>> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT value FROM settings WHERE key = $1")
-            .bind(key)
-            .fetch_optional(catalog)
-            .await?;
-        Ok(row.map(|(value,)| value))
-    };
-    let Some(ring) = setting(KEY_RING_SETTING).await? else {
-        return Ok(zeroize::Zeroizing::new(stored));
-    };
-    let KeySource::Kek(kek) = extenddb_server::key_file::key_source(&app_config.auth.encryption)
-        .map_err(anyhow::Error::msg)?
-    else {
-        anyhow::bail!(
-            "The catalog has a key ring, so its data database connection string is encrypted. \
-             Set [auth.encryption] key_file to the KEK file that the ring names"
-        );
-    };
-    let catalog_id = setting(CATALOG_ID_SETTING).await?;
-    let open = open_ring(&ring, catalog_id.as_deref(), &kek).map_err(|e| anyhow::anyhow!("{e}"))?;
-    open.deks
-        .iter()
-        .find_map(|dek| dek.decrypt_setting(&stored).ok())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "No DEK of the key ring opens the data_database_connection_string row. Run \
-                 `extenddb encryption-key status`"
-            )
-        })
 }

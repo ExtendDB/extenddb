@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use extenddb_core::types::DeleteTableInput;
 use extenddb_storage::TableEngine;
 use extenddb_storage::diagnostics::{CatalogRelation, DiagError, DiagnosticsStore};
+use extenddb_storage::server_components::KeySource;
 use extenddb_storage_postgres::{CatalogCheckPoint, arm_catalog_check_pause};
 use sqlx::Connection;
 
@@ -29,7 +30,7 @@ async fn live_relations_are_neither_orphaned_nor_missing() {
 
     let check = d
         .diagnostics
-        .check_storage_relations()
+        .check_storage_relations(&KeySource::CatalogKey)
         .await
         .expect("check");
     assert!(check.orphaned.is_empty(), "orphaned: {:?}", check.orphaned);
@@ -57,7 +58,7 @@ async fn a_relation_the_catalog_names_is_reported_missing() {
 
     let check = d
         .diagnostics
-        .check_storage_relations()
+        .check_storage_relations(&KeySource::CatalogKey)
         .await
         .expect("check");
     assert_eq!(check.orphaned, vec![elsewhere.clone()]);
@@ -75,7 +76,7 @@ async fn a_relation_the_catalog_names_is_reported_missing() {
         .expect("rename it back");
     let check = d
         .diagnostics
-        .check_storage_relations()
+        .check_storage_relations(&KeySource::CatalogKey)
         .await
         .expect("check again");
     assert!(check.orphaned.is_empty(), "orphaned: {:?}", check.orphaned);
@@ -101,7 +102,7 @@ async fn rows_in_every_status_count_as_live() {
         d.set_status(table_status, status).await;
         let check = d
             .diagnostics
-            .check_storage_relations()
+            .check_storage_relations(&KeySource::CatalogKey)
             .await
             .expect("check");
         assert!(check.orphaned.is_empty(), "{status}: {:?}", check.orphaned);
@@ -114,7 +115,7 @@ async fn rows_in_every_status_count_as_live() {
         d.set_status(vector_status, status).await;
         let check = d
             .diagnostics
-            .check_storage_relations()
+            .check_storage_relations(&KeySource::CatalogKey)
             .await
             .expect("check");
         assert!(check.orphaned.is_empty(), "{status}: {:?}", check.orphaned);
@@ -159,7 +160,7 @@ async fn rows_being_created_or_deleted_are_not_reported_missing() {
         d.set_status(vector_status, status).await;
         let check = d
             .diagnostics
-            .check_storage_relations()
+            .check_storage_relations(&KeySource::CatalogKey)
             .await
             .expect("check");
         assert!(
@@ -187,7 +188,7 @@ async fn rows_being_created_or_deleted_are_not_reported_missing() {
         d.set_status(table_status, status).await;
         let check = d
             .diagnostics
-            .check_storage_relations()
+            .check_storage_relations(&KeySource::CatalogKey)
             .await
             .expect("check");
         assert!(
@@ -203,7 +204,7 @@ async fn rows_being_created_or_deleted_are_not_reported_missing() {
     d.set_status(vector_status, "ACTIVE").await;
     let check = d
         .diagnostics
-        .check_storage_relations()
+        .check_storage_relations(&KeySource::CatalogKey)
         .await
         .expect("check");
     let missing: BTreeSet<String> = check.missing.into_iter().map(|m| m.relation).collect();
@@ -235,7 +236,8 @@ async fn a_check_that_finds_every_relation_named_does_not_wait_for_index_writers
     let started = std::time::Instant::now();
     let check = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        d.diagnostics.check_storage_relations(),
+        d.diagnostics
+            .check_storage_relations(&KeySource::CatalogKey),
     )
     .await
     .expect("the check did not wait out 5 s")
@@ -273,13 +275,17 @@ async fn a_catalog_without_the_data_database_setting_is_refused() {
             .execute(&d.catalog)
             .await
             .expect("change the setting");
-        match d.diagnostics.check_storage_relations().await {
+        match d
+            .diagnostics
+            .check_storage_relations(&KeySource::CatalogKey)
+            .await
+        {
             Err(DiagError::NotConfigured(msg)) => assert_eq!(msg, refusal, "{change}"),
             other => panic!("{change}: check gave {other:?}"),
         }
         match d
             .diagnostics
-            .drop_orphaned_relations(vec![orphan.clone()])
+            .drop_orphaned_relations(&KeySource::CatalogKey, vec![orphan.clone()])
             .await
         {
             Err(DiagError::NotConfigured(msg)) => assert_eq!(msg, refusal, "{change}"),
@@ -317,7 +323,9 @@ async fn changes_during_the_check_are_not_reported() {
 
     let mut pause = arm_catalog_check_pause(CatalogCheckPoint::AfterCatalogRead);
     let reached = pause.take_reached();
-    let mut check = d.diagnostics.check_storage_relations();
+    let mut check = d
+        .diagnostics
+        .check_storage_relations(&KeySource::CatalogKey);
     tokio::select! {
         r = &mut check => panic!("the check finished while it should be paused: {r:?}"),
         r = reached => r.expect("the check reached the pause"),
@@ -344,7 +352,7 @@ async fn changes_during_the_check_are_not_reported() {
 
     let next = d
         .diagnostics
-        .check_storage_relations()
+        .check_storage_relations(&KeySource::CatalogKey)
         .await
         .expect("check again");
     assert_eq!(next.orphaned, vec![late]);

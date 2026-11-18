@@ -95,7 +95,9 @@ pub trait DiagnosticsStore: Send + Sync {
     ) -> BoxFuture<'_, DiagResult<String>>;
 
     /// Compare the data relations the backend created with the catalog, for
-    /// `extenddb catalog-check`.
+    /// `extenddb catalog-check`. On PostgreSQL, `key` opens the data
+    /// database's connection string row, as for
+    /// [`Self::test_data_database_connection`].
     ///
     /// A relation is orphaned when no catalog row names it, whatever the row's
     /// status. A relation is missing when a catalog row names it, neither the
@@ -103,12 +105,16 @@ pub trait DiagnosticsStore: Send + Sync {
     /// does not have the relation.
     ///
     /// The default reports that the backend does not implement the check.
-    fn check_storage_relations(&self) -> BoxFuture<'_, DiagResult<StorageRelationCheck>> {
+    fn check_storage_relations(
+        &self,
+        _key: &crate::server_components::KeySource,
+    ) -> BoxFuture<'_, DiagResult<StorageRelationCheck>> {
         Box::pin(async { Err(unsupported("checking data relations against the catalog")) })
     }
 
     /// Drop relations that [`Self::check_storage_relations`] reported as
-    /// orphaned, for `extenddb catalog-check --fix`.
+    /// orphaned, for `extenddb catalog-check --fix`. `key` is as for that
+    /// check.
     ///
     /// The backend waits for the catalog changes in flight that could name a
     /// relation, checks each relation against the catalog again, and keeps
@@ -119,6 +125,7 @@ pub trait DiagnosticsStore: Send + Sync {
     /// The default reports that the backend does not implement the drop.
     fn drop_orphaned_relations(
         &self,
+        _key: &crate::server_components::KeySource,
         _orphaned: Vec<String>,
     ) -> BoxFuture<'_, DiagResult<Vec<(String, OrphanDrop)>>> {
         Box::pin(async { Err(unsupported("dropping orphaned data relations")) })
