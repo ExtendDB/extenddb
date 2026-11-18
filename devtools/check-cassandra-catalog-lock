@@ -30,8 +30,10 @@ with `init` and removes them at the end.
   a second migrate --yes exit 6, and the preview exits 0;
 - once the lock is free, migrate --yes --reconverge runs migration 1 again
   and neither 2, which is not convergent, nor 3 and 4, which do not apply on
-  Cassandra; migrate --forget 2 and the migrate --yes that applies 2 again
-  run, and serve runs;
+  Cassandra; migrate --forget of an id the binary does not carry exits 1
+  and leaves the lock free; once the script has deleted migration 2's
+  ledger row, the preview lists 2 as pending and migrate --yes applies it
+  again; and serve runs;
 - with the node paused, a server that cannot renew its registration answers
   503 within 40 s of the pause, before its row can expire (45 s after its
   last renewal, which came up to 5 s before the pause), then tries to
@@ -49,7 +51,17 @@ import tempfile
 import time
 import tomllib
 
-from catalog_checks import expect_exit, finish, healthy, report, run, start, stop, watch_lost_registration
+from catalog_checks import (
+    expect_exit,
+    finish,
+    healthy,
+    report,
+    run,
+    start,
+    stop,
+    watch_lost_registration,
+    with_filesystem_store,
+)
 
 ADMIN_USER = os.environ.get("CASSANDRA_ADMIN_USER", "cassandra")
 ADMIN_PASSWORD = os.environ.get("CASSANDRA_ADMIN_PASSWORD", "cassandra")
@@ -230,6 +242,47 @@ def main(binary: str, container: str, contact_point: str, port: int) -> int:
         )
         report(time.monotonic() - started < 30, "the stopped server's registration was removed")
 
+        # The backup commands register as a server does and release the
+        # registration when they exit, whatever the outcome, so a migration
+        # right after them does not wait for the row's TTL. With no store
+        # configured the command releases on its no-store path before it
+        # prints; with a filesystem store (a root under the work directory)
+        # it opens the store, runs, and releases when it closes the catalog,
+        # the path a store-backed deployment takes.
+        backup = [binary, "backup", "--config", config]
+        expect_exit(0, "backup list with no server running", backup + ["list"], env, contains="none (")
+        expect_exit(
+            0,
+            "backup purge's dry run with no server running",
+            backup + ["purge"],
+            env,
+            contains="Dry run: nothing was deleted",
+        )
+        store_config, root = with_filesystem_store(config, work)
+        backup = [binary, "backup", "--config", store_config]
+        expect_exit(
+            0,
+            "backup list with a filesystem store configured",
+            backup + ["list"],
+            env,
+            contains=f"=== backups in the filesystem store {root}",
+        )
+        expect_exit(
+            0,
+            "backup purge's dry run with a filesystem store configured",
+            backup + ["purge"],
+            env,
+            contains="Dry run: nothing was deleted. Run again with --confirm",
+        )
+        started = time.monotonic()
+        expect_exit(
+            0,
+            "migrate --yes right after the backup commands, without waiting for a registration's TTL",
+            migrate + ["--yes", "--lock-timeout", "5"],
+            env,
+        )
+        report(time.monotonic() - started < 30, "the backup commands' registration was removed")
+
         keyspace = f"{stem}_catalog"
         code, output = cqlsh(
             container,
@@ -267,7 +320,23 @@ def main(binary: str, container: str, contact_point: str, port: int) -> int:
             "the reconverge skips migration 2 and does not name 3 or 4, which do not apply",
             output,
         )
-        expect_exit(0, "migrate --forget 2", migrate + ["--forget", "2"], env)
+        # --forget refuses an id the binary does not carry, whatever its
+        # released bound, and leaves the lock free: the migrate --yes below
+        # waits at most 5 s for it.
+        expect_exit(
+            1,
+            "migrate --forget of an id the binary does not carry",
+            migrate + ["--forget", "9999"],
+            env,
+            contains="carries no migration 9999",
+        )
+        # Migration 2 pending: its ledger row deleted (the version row is
+        # left as it was; the next run rewrites it).
+        code, output = cqlsh(
+            container,
+            f"CONSISTENCY QUORUM;\nDELETE FROM {keyspace}.extenddb_migrations WHERE id = 2;\n",
+        )
+        report(code == 0, "the script deletes migration 2's ledger row", output)
         expect_exit(
             3, "the preview lists migration 2 as pending", migrate, env, contains="2 resource_tag_condition_keys"
         )

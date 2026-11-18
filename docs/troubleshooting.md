@@ -40,10 +40,12 @@ connection_string = "postgresql://extenddb:***@/var/run/postgresql:5432/extenddb
 connection_string = "postgresql://extenddb:***@%2Fvar%2Frun%2Fpostgresql:5432/extenddb_catalog"
 ```
 
-Also update the catalog database:
+Also update the catalog database. For a catalog without a key ring (no `[auth.encryption] key_file`):
 ```bash
 psql extenddb_catalog -c "UPDATE settings SET value='postgresql://extenddb:***@%2Fvar%2Frun%2Fpostgresql:5432/extenddb' WHERE key='data_database_connection_string';"
 ```
+
+For a catalog with a key ring the row is encrypted under the data encryption key, so write it with `extenddb encryption-key set-data-connection --config extenddb.toml --yes < conn.txt`, where `conn.txt` holds the corrected string and was written under `umask 077` (the admin guide's [Encryption Key](manuals/05-admin-guide.md#set-data-connection) section). The command needs the KEK file and may run beside the server, which reads the row at its next start.
 
 **Prevention:** This issue is fixed in versions after 0.1, which automatically encode Unix socket paths correctly.
 
@@ -123,6 +125,26 @@ The error intentionally does not name the specific file to avoid leaking filesys
    chmod 644 ~/.extenddb/tls/cert.pem
    ```
 4. Verify PEM format — the cert file should start with `-----BEGIN CERTIFICATE-----` and the key file with `-----BEGIN PRIVATE KEY-----` (or `-----BEGIN EC PRIVATE KEY-----`).
+
+### TLS private key readable by other users
+
+`WARNING: TLS private key (server.tls.key_path) had permissions <mode>, which let other users read it. …`
+
+**Cause:** `extenddb serve`, or `extenddb init` when it keeps an existing certificate, found the TLS private key readable by group or other users. An older `init` that stopped before it set the key's mode left it that way, as does a key copied in with the default umask. The warning names the setting rather than the file, as the TLS load error above does, and goes to stderr: the terminal that ran the command, or the log stream under `--foreground`.
+
+What the server did depends on the rest of the message:
+
+- **`It is now 0600: group and other access were removed`**: the server could change the key's mode, because it owns the key or runs as root, and narrowed it. If another service read the key through its group, it can no longer read it. If `server.tls.key_path` is a symlink, the file it points to was changed.
+- **`Another user (uid <n>) owns it`**: the key is readable by every user, and the server cannot change it. What its owner should run depends on the key's group, which the message names:
+  - **`this server reads it through its group`**: remove other access with `chmod o-rwx <file>`. The group's access stays, and the server reads the key through it.
+  - **`this server is not in its group`**: the server reads the key through the access every user has, so `chmod o-rwx` alone would leave it unable to load the key. Give the key to the server's group first, then remove other access: `chgrp <server gid> <file>`, then `chmod 640 <file>`.
+
+  A key another user owns that only its owner and group can read is a supported layout and gets no warning.
+- **`it is on a read-only filesystem`**: set the mode where the file is provided. For a Kubernetes Secret volume, use `defaultMode: 0440` with the pod's `fsGroup` set to the server's group (gid 10001 in the official image). Secret volume files are owned by root, so `defaultMode: 0400` without a matching group would leave the key unreadable to a server that does not run as root.
+- **`was accepted but did not take effect`**: the filesystem keeps no file modes (vfat, some SMB and 9p mounts). Keep the key on a filesystem that does, or mount it with an owner-only mode.
+- **`setting it to 0600 failed: <error>`**: run `chmod 600` on the file as its owner.
+
+**Rotate the key if it may have been copied.** While its mode was wider, any local user could read the key. In the four cases where the server could not narrow it, the key stays readable until its mode is fixed, so fix the mode first: a key replaced before that lands at the same mode. Then, if a copy matters, replace the key and certificate by generating a new pair as in [Generating a self-signed certificate manually](getting-started.md#generating-a-self-signed-certificate-manually), with the key at the mode above, and restart the server. Do not rely on `extenddb init` for this: on a deployment that already has a config file, `init` stops at the config check before it reaches the certificate step. Clients that pinned the old certificate through `AWS_CA_BUNDLE` need the new `cert.pem`.
 
 ### `Config file <path> has permissions <mode>, which is too open.`
 
@@ -214,6 +236,108 @@ journalctl -t extenddb -f
 
 **Fix:** No action needed. This confirms the runtime log level change took effect.
 
+## Encryption Key Errors
+
+The server loads the key that opens stored secrets at startup from two catalog `settings` rows, `encryption_key` (the catalog key) and `encryption_key_ring` (the data encryption key, DEK, wrapped under the key-encryption key, KEK, in `[auth.encryption] key_file`), and refuses a catalog whose key state does not match its configuration. Each refusal below is one such state. The admin guide's [Encryption Key](manuals/05-admin-guide.md#encryption-key) section has the commands these fixes name; each previews by default and writes only with `--yes`. The message text of each refusal names the state and the command, and prints no key.
+
+### `Encryption key not found in settings table. Run 'extenddb init'`
+
+**Cause:** `key_file` is not set and the catalog has neither an `encryption_key` row nor an `encryption_key_ring` row. The catalog was created without `extenddb init`, or the row was deleted.
+
+**Fix:** For a new deployment, run `extenddb init`. For a catalog that had the row, restore a catalog copy that holds it: a new key opens none of the stored secrets.
+
+### `Encryption key in settings table is not valid: <reason>. Restore the original key: every stored access key and session secret is encrypted under it`
+
+**Cause:** The `encryption_key` row is not 32 bytes in standard base64. The server, and each `extenddb backup` command, refuse it, because a server started on it would fail every signed request with HTTP 500.
+
+**Fix:** Restore the original value of the row, from a catalog copy if needed.
+
+### `key_file` is not set and the catalog has a key ring marked as an unfinished switch
+
+**Cause:** `extenddb encryption-key switch --yes` started on this catalog and stopped before it finished. The ring records the switch as unfinished and the id of the catalog key it started from.
+
+**Fix:** If a switch of yours stopped, resume it with the same arguments, `extenddb encryption-key switch --config extenddb.toml --key-file <path> --yes`, with every server stopped; the run checks the ring, accepts only the catalog key whose id the ring recorded, finishes the pass, then set `key_file` and start the server. If no switch of yours stopped, do not resume: a writer to the catalog database put that ring row back from an older copy. Restore a catalog copy taken after your last `encryption-key` run finished and check it with `encryption-key status` (the Backup and Restore manual's [Restore a damaged or missing key ring](manuals/14-backup-and-restore.md#restore-a-damaged-or-missing-key-ring) section).
+
+### `key_file` is not set and the catalog has a finished key ring
+
+**Cause:** The deployment switched to a KEK file, and this configuration does not name it. The message prints the KEK id the ring names.
+
+**Fix:** Set `[auth.encryption] key_file` (or `EXTENDDB__AUTH__ENCRYPTION__KEY_FILE`) to the file whose id the message prints, and start the server.
+
+### `key_file` is set and the file is missing, or fails the ownership, mode or ACL check
+
+**Cause:** The message names the path and the check that failed. The server and every `encryption-key` command refuse a KEK file that is not a regular file owned by root or the server's user, that others can read, that gives its group access while root does not own it or while its group is not the server's effective group (or whose ACL grants another user or group), or whose parent directories a user other than root or the owner can write to without the sticky bit. A file that passes those checks and does not hold a key is refused as `KEK file <path> is not a KEK file: <reason>`; the reason names the length, or the offset of the character that does not decode, and leaves the character out.
+
+**Fix:** Check that the path is right for this host (a credential directory such as `/run/credentials/<unit>/` exists only while the unit runs, so run the commands through the same delivery route as the server) and that the owner, mode, ACL and parent directories meet the rule in the admin guide's [The KEK file](manuals/05-admin-guide.md#the-kek-file) paragraph. On Kubernetes, `fsGroup: 10001` and `runAsGroup: 10001` give the file the server's group; on swarm and Podman, pass `uid=10001,gid=10001,mode=0400` with the secret. For the format refusal, restore the file from the copy kept away from the host; the file holds exactly 44 base64 characters and at most one trailing newline.
+
+### `key_file` is set and the catalog has the catalog key and no key ring
+
+**Cause:** In the documented order, `key_file` is set only after `switch --yes` has finished, so this state means a deleted ring or a configuration set too early. The message names `encryption-key status` and the restore steps, and no write command.
+
+**Fix:** If the switch has not run yet, unset `key_file`, run the switch with every server stopped, then set it. If the switch had run, the ring is gone: restore a catalog copy taken after the switch and check it with `encryption-key status`.
+
+### `key_file` is set and the catalog has neither key row
+
+**Cause:** The catalog has no `encryption_key` row and no `encryption_key_ring` row. The ring was deleted, or the catalog was never initialized.
+
+**Fix:** Restore a catalog copy that holds the ring and check it with `encryption-key status`. For a catalog that `extenddb init` never created, see the entry on an uninitialized catalog above.
+
+### The key ring names another KEK than the configured file
+
+**Cause:** The message prints both KEK ids. After `encryption-key rewrap --yes`, the ring names the new file while `key_file` still names the old one; otherwise the configured file is not the KEK that this ring was written under, for example after a restore of a catalog copy wrapped under an older KEK. When `key_file` names the KEK that your last `encryption-key` run wrote the ring under and you restored no catalog copy since that run, a writer to the catalog database put this ring row back from an older copy.
+
+**Fix:** After a rewrap, set `key_file` to the new file. For a ring row that a writer put back, restore a catalog copy taken after your last `encryption-key` run finished and check it with `encryption-key status` (the Backup and Restore manual's [Restore a damaged or missing key ring](manuals/14-backup-and-restore.md#restore-a-damaged-or-missing-key-ring) section). Otherwise find the KEK whose id the ring names and point `key_file` at it; if that KEK is lost, `encryption-key reset --key-file <new> --discard-secrets` keeps every user, role, policy and table and deletes every access key and session (the Backup and Restore manual's [lost KEK](manuals/14-backup-and-restore.md#the-kek-of-a-catalog-copy-is-lost) section).
+
+### A DEK of the key ring fails to unwrap under the configured KEK
+
+**Cause:** The ring has damage or a changed field. The KEK authenticates every field of the ring, so a flipped flag, a changed id, an added or deleted DEK entry, or a wrapped DEK copied from another ring makes a DEK fail to unwrap. The message names `encryption-key status` and the restore steps, and no write command. `status` prints the ring's fields, marked as not authenticated, and which DEK ids fail.
+
+**Fix:** Restore a catalog copy taken before the change and check it with `encryption-key status`. `reset` refuses this ring, because its KEK is not lost.
+
+### `key_file` is set and the key ring is marked as an unfinished switch
+
+**Cause:** `key_file` was set while a stopped switch was unfinished, or a writer to the catalog database wrote the ring row of an unfinished switch back from a copy taken during the switch. The message names `encryption-key status` and the restore steps, and no write command.
+
+**Fix:** If a switch of yours stopped, unset `key_file` for the run, resume the switch with `encryption-key switch --key-file <path> --yes` with every server stopped, then set `key_file` again. If no switch of yours stopped, restore a catalog copy taken after your last run finished and check it with `encryption-key status`; do not resume a switch you did not start, because the resumed run would re-encrypt rows the writer chose.
+
+### `key_file` is set and the catalog has both a key ring and a catalog key
+
+**Cause:** A catalog key row appeared after the switch finished. Its writer is an older release started on this catalog, an older SQLite dev image (which writes a new `encryption_key` row into a switched catalog at startup), or a writer to the catalog database. The message names `encryption-key status`, which lists each stored secret under that key with its access key ID, owner and creation time, and no write command.
+
+**Fix:** Run `extenddb encryption-key status --config extenddb.toml` and read the list. If the rows are yours (the older dev image case), run `encryption-key switch --key-file <path> --accept-catalog-key --yes` with a configuration that does not set `key_file` and every server stopped; it re-encrypts the listed secrets under the DEK and deletes the row. If they are not yours, `--accept-catalog-key` would make a credential the writer chose valid: restore a catalog copy taken before the row appeared instead.
+
+### The key ring holds two DEKs
+
+**Cause:** `extenddb encryption-key rotate --yes` started on this catalog and stopped before it finished, so the ring holds the older DEK and the new one.
+
+**Fix:** Stop every server, then run `extenddb encryption-key rotate --config extenddb.toml` to preview, which takes the migration lock and lists the stored secrets still under the older DEK, then `rotate --yes`, which resumes the pass with the higher id as its target and writes the ring with that DEK alone.
+
+### The key ring changed while `rewrap` or `rotate` ran
+
+**Cause:** `rewrap` runs beside a server and outside the migration lock, so a `rotate` can write the ring between the read and the write of a `rewrap`, and a `rewrap` between the read and the first write of a `rotate`. Each of the two writes the ring only while the row still holds the ring it read. The message is "the key ring changed while `extenddb encryption-key <command>` ran, so nothing was written", and the run that printed it wrote nothing.
+
+**Fix:** Run the command again. A `rewrap` beside a `rotate` that is still running then refuses with the two-DEK refusal above until the `rotate` finishes. A `rotate` after a `rewrap` refuses with both KEK ids: set `key_file` to the file that the `rewrap` named, then run `rotate` again.
+
+The last ring write of `rotate` is conditional too, on the two-DEK ring of its first write. When another writer changed the ring after that write, `rotate` stops with "the key ring changed after `extenddb encryption-key rotate` wrote its two DEKs, so its last ring write did not happen" and names the DEK that the pass put the stored secrets under. Read the ring with `encryption-key status` before you run `rotate` again.
+
+### The rebuild of the database file failed after an encryption-key command
+
+**Cause:** On SQLite, `switch`, `rotate` and `reset` end with a rebuild of the catalog file (`VACUUM` under `secure_delete`), so no free page keeps a ciphertext the run replaced. The rebuild writes a new copy of the file, so it needs free disk space for that copy, and it ends with a checkpoint of the write-ahead log, which fails while another process has a transaction open on the database. The message is "`extenddb encryption-key <command>` wrote every row, and then the rebuild of the database file that erases the ciphertexts it replaced failed", followed by the database error. Every row of the run is written.
+
+**Fix:** Free disk space, or end every process that has the database file open (`fuser` or `lsof` on the file names them), then run the same command again with every server stopped. A `switch` or `reset` with nothing left to do rebuilds the file, and a `rotate` replaces the DEK again and then rebuilds the file.
+
+### The locked key store cannot be locked
+
+**Cause:** The server keeps the key that opens stored secrets and the cached signing keys in memory it locks out of swap and core dumps, sized by `[auth.cache] max_entries` (two 32-byte slots per entry, 640,000 bytes for the default, plus one buffer per runtime worker thread). The process's memlock limit is below that size: 64 KiB is the kernel default before Linux 5.16, and `mlock` of 1 MiB fails with `ENOMEM` under it. With `key_file` set the server refuses to start and names the memlock limit it needs; without `key_file` it logs a warning and starts with the keys in unlocked memory.
+
+**Fix:** Raise the limit: `LimitMEMLOCK=16M` in the systemd unit, `--ulimit memlock=` for a container, or a smaller `max_entries`. To start anyway with `key_file` set, `[auth.encryption] require_locked_memory = false` turns the refusal into a warning. The startup log line names the protection in force: `memfd_secret`, locked pages, or none. `serve` sets the key store up before it reads the catalog, so a refusal from the catalog (one of the entries above) can follow at the next start once the limit is raised.
+
+### A request fails with `InternalServerError` (HTTP 500) after a key change
+
+**Cause:** The stored secret of that access key opens under no key the server holds. `encryption-key status` lists such secrets by access key ID. A `switch --yes` or `rotate --yes` run with `--keep-unopenable` leaves them as they are; without the option the run stops before its first write and prints their access key IDs.
+
+**Fix:** Delete the access key and create a new one, or import the pair the client holds under its old ID with `import-access-key` (the Backup and Restore manual's [lost catalog](manuals/14-backup-and-restore.md#the-catalog-is-lost-and-re-created) section, step 2).
+
 ## Stop Errors
 
 ### `No PID file found at ... Is extenddb running on port ...?`
@@ -240,9 +364,9 @@ journalctl -t extenddb -f
 
 **Fix:** If permission denied, run `extenddb stop` as the same user that started extenddb. If the process already exited, the stale PID file will be cleaned up on the next `extenddb stop` invocation.
 
-### `extenddb (pid <pid>) did not exit within 10s after SIGTERM`
+### `extenddb (pid <pid>) did not exit within 76s after SIGTERM`
 
-**Cause:** The server received SIGTERM but did not shut down within the 10-second timeout. It may be stuck draining long-running requests or waiting on a database operation.
+**Cause:** The server received SIGTERM but did not shut down within the 76-second timeout, the sum of its shutdown bounds (5 s to drain connections, 30 s for running backup jobs to end, 36 s to stop its background workers and give up its serving registration, 5 s for its runtime). It may be stuck draining long-running requests or waiting on a database operation.
 
 **Fix:** Send SIGKILL to force termination: `kill -9 <pid>`. Check PostgreSQL for long-running queries that may be blocking shutdown.
 
@@ -331,6 +455,12 @@ These errors occur when `auth.provider = "builtin"` is enabled.
 
 To allowlist attributes (allow only when *every* requested attribute is in the set), use `ForAllValues:` on an `Allow` statement. The same rule applies to `dynamodb:LeadingKeys`.
 
+`dynamodb:Attributes` holds the top-level names of the attributes the request names: the attributes of a `PutItem` item and of the items and keys in a `BatchWriteItem` request, the target of each `UpdateExpression` action, `AttributesToGet`, the first name of each projected document path (`secret` for `secret.a`), the attributes a `ConditionExpression` or `FilterExpression` reads, the legacy `Expected`, `AttributeUpdates`, `QueryFilter` and `ScanFilter` names, the attributes in a `Query` key condition, and on every item operation other than `SearchVectors` the key attributes of the table (and of the index a `Query` names). The first page of a `Scan` of an index holds the table's key attributes and not the index's (measured on DynamoDB 2026-11-09), and a later page also holds the index's key attributes, which its `ExclusiveStartKey` carries (measured 2026-11-10). The attributes a `SET` value reads are not in it. Batch requests are evaluated per table and transactions per item. The [security model manual](manuals/10-security-model.md) lists what the key holds for each operation, and how a PartiQL statement is authorized. It follows that:
+
+- A `Deny` on `ForAnyValue:StringEquals` over `ssn` does not block a `DeleteItem` of an item that holds `ssn`, or a read with no projection, which returns `ssn` with the rest of the item: neither request names `ssn`. DynamoDB answers the same way (measured 2026-10-31).
+- The same `Deny` does not block an `UpdateItem` that reads `ssn` only in a `SET` value. `SET #n = ssn` copies the value of `ssn` into `name`, and a projection of `name` then returns it. DynamoDB answers the same way (measured 2026-11-01).
+- An `Allow` on `ForAllValues:StringEquals` that does not list the table's key attributes grants no `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query`, `Scan`, batch or transaction request, because each of them holds the key attributes (measured on DynamoDB 2026-11-01 for `GetItem`, `Query`, `Scan`, `UpdateItem`, `DeleteItem` and a `BatchWriteItem` `DeleteRequest`). List the key attributes of the table and, for a `Query` of an index or a later page of a `Scan` of an index, of every index the statement covers. A `Query` of an index holds the index's full key schema (measured on DynamoDB 2026-11-09 on a global secondary index). The first page of a `Scan` of an index holds the table's key attributes and not the index's (measured the same day). A later page holds the index's key attributes from its `ExclusiveStartKey`. On DynamoDB an `Allow` that lists only the table's keys refused a later page of a `Scan` of a global and of a local secondary index (measured 2026-11-10).
+
 > Note: prior to v0.1.6, extenddb incorrectly treated a bare operator on these keys as an implicit AND across the requested values, so a single-attribute request appeared to be denied while a multi-attribute request leaked. That behavior diverged from AWS and gave a false sense of security. See the upgrade manual for migration guidance.
 
 ## Connection Issues
@@ -389,7 +519,7 @@ SELECT l.pid, l.mode, a.query_start, l.relation::regclass AS relation, a.query
 
 ### Data tables without a catalog row (PostgreSQL, separate data database)
 
-**Cause:** With a separate data database, a synchronous DeleteTable commits the catalog row removal first, then commits the drop of the table's data tables on the data database. If that data commit fails (the connection is terminated, a failover, a network fault), the server redoes the drop on a fresh connection for up to 60 seconds. Only a process that dies, or a data database unreachable for that whole window, between the catalog commit and the last retry leaves the table's data tables on the data database with no catalog row naming them. Nothing reclaims them afterwards: DescribeTable reports the table gone, a same-name CreateTable gets a new table id, and the control plane only enumerates relations that still have a catalog row. When the retries are exhausted the server logs, at error, the table id, the relation names, and the exact `DROP TABLE` to run. (On one shared database the row and the drops commit together, so this cannot happen there.)
+**Cause:** A table's data relations (`_ddb_%`) are on the data database with no `tables` row naming them. Current releases do not create this state from an interrupted DeleteTable: with a separate data database a synchronous DeleteTable marks the catalog row `DELETING`, commits it, drops the table's data tables on the data database, and removes the row only after that drop has committed. If the data commit fails (the connection is terminated, a failover, a network fault), the server redoes the drop on a fresh connection for up to 60 seconds. A process that dies, or a data database unreachable for that whole window, between the catalog commit and the last retry leaves the row `DELETING` with its transition due; the control-plane poller (the next startup pass, or a later one) drops the data tables and removes the row once the data database is reachable again, so the relations are not left without a row. When the retries are exhausted the server logs, at error, the table id, the relation names, and the exact `DROP TABLE` to run, for an operator who would rather finish the drop by hand than wait for the poller. (On one shared database the row and the drops commit together, so none of this applies.) Relations a release from before this behaviour shipped left without a row are not swept automatically; find and drop them as below.
 
 To find such relations, compare the `_ddb_%` tables on the data database with the table ids the catalog still knows. On the catalog database:
 
@@ -614,6 +744,16 @@ The error log line names the exact relations for one leaked table and gives this
 
 **Fix:** Check PostgreSQL connectivity and logs.
 
+### `Credential import is disabled (allow_credential_import = false)`
+
+**Cause:** The server refused an access key import (`extenddb manage import-access-key`, or `POST /management/accounts/{id}/users/{name}/access-keys/import`) with HTTP 403 because the `allow_credential_import` runtime setting is not `true`. The message is the same when the catalog has no row for the setting. From v0.1.15 the server refuses the import when the row is missing. A deployment that imported keys before the upgrade without setting it gets this error after the upgrade.
+
+**Fix:** Enable import, then retry. The next import reads the new value, so you do not need to restart the server:
+```bash
+extenddb settings --config extenddb.toml set allow_credential_import true
+```
+Keys imported earlier keep working while import is disabled.
+
 ### `Management API: check allow_credential_import failed: <error>`
 
 **Cause:** The query to check the `allow_credential_import` runtime setting failed during an access key import. Likely a database connectivity issue.
@@ -764,9 +904,9 @@ The error log line names the exact relations for one leaked table and gives this
 
 ### `Management API: encrypt session secret failed: <error>`
 
-**Cause:** AES-256-GCM encryption of the temporary session secret key failed. This could indicate a corrupted or invalid encryption key in the settings table.
+**Cause:** AES-256-GCM encryption of the temporary session secret key failed. The server checks the encryption key at startup and encrypts with the copy it loaded then, so the key in the `settings` table is not the cause.
 
-**Fix:** Verify the `encryption_key` value in the `settings` table is a valid base64-encoded 32-byte key. If corrupted, re-run `extenddb init` to regenerate.
+**Fix:** Open an issue with the error that follows the message in the server log.
 
 ### `Management API: store assume-role session failed: <error>`
 
@@ -820,23 +960,29 @@ The error log line names the exact relations for one leaked table and gives this
 
 **Fix:** Check PostgreSQL connectivity. Verify the table's stream shards exist in the `stream_shards` table. If the table was created before streams were enabled, the shards may not have been initialized.
 
-### `Stream capture: failed to write record for <table>: <error>`
-
-**Cause:** A stream record was constructed but could not be persisted to the `stream_records` table. The data write succeeded — only the stream record is missing.
-
-**Fix:** Check PostgreSQL connectivity and disk space. If the error mentions a unique constraint violation, two writes to the same shard may have occurred in the same microsecond — retry the operation.
-
-### `Stream capture: failed to get sequence number: <error>`
-
-**Cause:** extenddb could not generate a sequence number for a stream record. The data write succeeded — only the stream record is missing.
-
-**Fix:** Check PostgreSQL connectivity.
-
 ### `Stream cleanup worker: <error>`
 
 **Cause:** The background worker that deletes stream records older than 24 hours encountered a database error. Expired records will accumulate until the worker succeeds.
 
 **Fix:** Check PostgreSQL connectivity. The worker retries every hour automatically.
+
+### `Stream record numbering failed: <error>`
+
+**Cause:** The background worker that gives PostgreSQL stream records their sequence numbers encountered a database error. GetRecords numbers one batch of the records of the shard it reads before it reads them, so a consumer that keeps reading a shard still receives its records, unless the same error stops that numbering too (see the next entry). The records of shards that nobody reads stay in the `stream_pending` table, and the retention sweep does not trim them, until the worker succeeds.
+
+**Fix:** Check PostgreSQL connectivity. After a failure the worker tries again a little over a second later.
+
+### `Stream record numbering before a read of shard <shard> failed: <error>`
+
+**Cause:** GetRecords, or GetShardIterator with `LATEST`, could not number the shard's committed stream records before it read the shard, because of a database error. The call went on and answered from the records numbered before. The records left in `stream_pending` get higher sequence numbers from a later read or the background worker, and a later GetRecords call returns them.
+
+**Fix:** Check PostgreSQL connectivity and the error in the message. While the error repeats on every read of the shard and in the worker, consumers of that shard receive no new records.
+
+### GetRecords is slow on PostgreSQL while a long transaction runs
+
+**Cause:** Every stream record passes through the `stream_pending` table, and the numbering step deletes it there. A transaction that stays open on the data database, such as the one a backup of a large table reads from, keeps autovacuum from removing those deleted rows. Until it ends, each GetRecords on a busy shard and each numbering read past them.
+
+**Fix:** Find the long transaction in `pg_stat_activity` (`xact_start`). Once it ends, autovacuum removes the rows; `VACUUM stream_pending` removes them at once.
 
 ## Management Console Errors
 
@@ -848,7 +994,7 @@ The error log line names the exact relations for one leaked table and gives this
 
 ### Console redirects to login page on every request
 
-**Cause:** The session cookie has expired (sessions last 8 hours of inactivity), the user's password was changed or the user was deleted after the session began, or cookies are blocked by the browser.
+**Cause:** The session cookie has expired (sessions end 8 hours after login, however active they are, and the browser drops the cookie at the same time), the user's password was changed or the user was deleted after the session began, or cookies are blocked by the browser.
 
 **Fix:** Log in again, with the new password if it was changed. Ensure cookies are enabled for the extenddb server address. If using a reverse proxy, ensure it forwards the `Cookie` and `Set-Cookie` headers.
 
@@ -884,11 +1030,17 @@ The error log line names the exact relations for one leaked table and gives this
 
 **Fix:** Each line must be a valid JSON object. The format is one item per line: `{"Item": {"pk": {"S": "val"}, ...}}` or bare `{"pk": {"S": "val"}, ...}`.
 
-### `Cannot write export file: <error>`
+### `Cannot write export file`
 
 **Cause:** The export destination path is not writable (permission denied, disk full, etc.).
 
-**Fix:** Check that the extenddb process has write access to the destination directory. Parent directories are created automatically.
+**Fix:** Check that the extenddb process has write access to the destination directory. The server creates the account directory (`<export root>/<account id>`) at the account's first export; any other directory in `FilePath` must already exist, or the export fails with `Parent directory does not exist or is not accessible`.
+
+### `Permission denied` opening an export file or directory after upgrading to v0.1.15
+
+**Cause:** From v0.1.15 the server creates export files with mode 0600, and the roots and account directories it creates with mode 0700, so only the server's user and root can read them. A member of the server user's group, or a host user reading through a bind mount while the container runs as another uid, is refused.
+
+**Fix:** Read the file as the server's user or as root, copy it out of the container with `docker cp <container>:<path> .`, or run the container as the reader's uid (`--user`). The upgrade manual's [v0.1.15 entry](manuals/07-upgrade-manual.md#v0115-export-files-are-created-0600-and-the-import-and-export-directories-the-server-creates-0700) gives the details, and how to keep a group's access to import files.
 
 ### `Invalid table ARN: <arn>`
 
@@ -916,7 +1068,7 @@ The error log line names the exact relations for one leaked table and gives this
 pool_size = 50  # default is 20
 ```
 
-If the problem persists, check for long-running queries or connection leaks with `SELECT * FROM pg_stat_activity WHERE datname = 'extenddb_data';`.
+If the problem persists, check for long-running queries or connection leaks with `SELECT * FROM pg_stat_activity WHERE datname = 'extenddb';` (the data database's default name).
 
 **Known limitation:** The HTTP status code should be 503 with a `Retry-After` header. This is tracked as technical debt.
 
@@ -967,6 +1119,6 @@ even after the extension exists.
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

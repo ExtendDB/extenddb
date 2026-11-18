@@ -32,6 +32,9 @@ mod m0004_index_table_base_key;
 #[rustfmt::skip]
 #[allow(clippy::all, deprecated)]
 mod m0006_backup_catalog_index;
+#[rustfmt::skip]
+#[allow(clippy::all, deprecated)]
+mod m0009_warm_throughput;
 mod postcheck;
 
 use std::time::Duration;
@@ -53,8 +56,118 @@ pub use commands::SqliteCatalogMigrations;
 /// applied to it.
 const BASELINE_EXPECTED: &str = include_str!("../../migrations/0001_baseline.expected.json");
 
-/// Checksums of the released bodies (none until v1.0).
-pub(crate) const RELEASED: &[Released] = &[];
+/// Checksums of the released bodies, every migration at or below
+/// `RELEASED_THROUGH`.
+pub(crate) const RELEASED: &[Released] = &[
+    Released {
+        id: MigrationId::Baseline,
+        store: StoreKind::Catalog,
+        checksum: "b72a83faad465556bceeb9c37554abbbc3aca316abd2823c3b117cd39e62349c",
+        fingerprint: Some("0001_baseline/sqlite/1"),
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::ResourceTagConditionKeys,
+        store: StoreKind::Catalog,
+        checksum: "80c502c54ef9240ab5f64b24b060261a295e41d29954d9b492b83c64c444170e",
+        fingerprint: Some("0002_resource_tag_condition_keys/1"),
+        kind: Kind::Breaking,
+        convergent: false,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::SortKeyDefinitions,
+        store: StoreKind::Catalog,
+        checksum: "a6f6841cb02734cc578f82b50ceb05fd7600d1647e6a0fed9e46fcd0c28c0e97",
+        fingerprint: Some("0003_sort_key_definitions/sqlite/1"),
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::IndexTableBaseKey,
+        store: StoreKind::Catalog,
+        checksum: "33863368aef25b7d9e678ddb4c9676de5a3c0408c818e4b3a91a88253d1b46c2",
+        fingerprint: Some("0004_index_table_base_key/sqlite/1"),
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::DropContinuousBackups,
+        store: StoreKind::Catalog,
+        checksum: "b7531559f55e4903371072c3e059ce3b82147f9b7fa7ba405dbb403b399e095c",
+        fingerprint: None,
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::BackupCatalogIndex,
+        store: StoreKind::Catalog,
+        checksum: "8528b29cd83afb95ac2e2bb637d90efe51dfaa704b5280e479edde4b7b2fa1cf",
+        fingerprint: Some("0006_backup_catalog_index/sqlite/1"),
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::StreamPending,
+        store: StoreKind::Catalog,
+        checksum: "99dc4a51692c3cc58d619420e2055130e33f93870dab2e02c087d4d44f1e5402",
+        fingerprint: None,
+        kind: Kind::Additive,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::RestoreProgress,
+        store: StoreKind::Catalog,
+        checksum: "6d2e68d8284d72072de839c13f121be4005e8950fda90c5d9f7742c6958175c9",
+        fingerprint: None,
+        kind: Kind::Additive,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::WarmThroughput,
+        store: StoreKind::Catalog,
+        checksum: "fd2dd35c3afbf3c8efcafe8dc6bddbfccbfb8c820c123bd5e74f87f60321953b",
+        fingerprint: Some("0009_warm_throughput/sqlite/1"),
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::AccountMetrics,
+        store: StoreKind::Catalog,
+        checksum: "6c75cabed24c7d7488b33148800fe492d3dc2f561dd286ae70f203098b5375df",
+        fingerprint: None,
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::AttributeNameEscape,
+        store: StoreKind::Catalog,
+        checksum: "d1d6e06c5e8e048d163b16f9b2d816a2d4f636bfc642be4d5e1d608cbac9994a",
+        fingerprint: None,
+        kind: Kind::Additive,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::UniqueAccessKeyIds,
+        store: StoreKind::Catalog,
+        checksum: "5003dffcdb2e46d560d794360fdb7a6a9d5eb000968082450b8bee9a0bc23d02",
+        fingerprint: None,
+        kind: Kind::Additive,
+        convergent: true,
+        rebless: None,
+    },
+];
 
 /// This backend's entry for every id. Public so `migrate --list` can print
 /// each migration's kind without opening the database.
@@ -118,6 +231,40 @@ pub fn migration(id: MigrationId) -> Migration<SqliteStores> {
                 m0006_backup_catalog_index::SOURCE,
             )],
         },
+        MigrationId::StreamPending => Migration::NotApplicable(
+            "SQLite runs one writer at a time, so its stream records commit in the order of \
+             their sequence numbers",
+        ),
+        MigrationId::RestoreProgress => Migration::NotApplicable(
+            "the restore progress of a store-backed restore is on table_restores (file_index, \
+             items_applied) on SQLite; the table is PostgreSQL's data database's",
+        ),
+        MigrationId::WarmThroughput => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![StoreBody::code(
+                StoreKind::Catalog,
+                &m0009_warm_throughput::WarmThroughput,
+                m0009_warm_throughput::SOURCE,
+            )],
+        },
+        MigrationId::AccountMetrics => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Catalog,
+                "migrations",
+                "0010_account_metrics.sql"
+            )],
+        },
+        MigrationId::AttributeNameEscape => Migration::NotApplicable(
+            "SQLite stores the documents that carry attribute names as JSON text in TEXT columns, \
+             where U+0000 is the six-character escape \\u0000, so every name reads back as it was \
+             written",
+        ),
+        MigrationId::UniqueAccessKeyIds => Migration::NotApplicable(
+            "access_key_id is the primary key of access_keys, so an ID can be stored once",
+        ),
     }
 }
 

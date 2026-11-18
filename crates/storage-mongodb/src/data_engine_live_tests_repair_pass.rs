@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use bson::{Bson, Document, doc};
 use extenddb_core::types::TableKeyInfo;
+use extenddb_storage::server_components::ServerComponentsOptions;
 use futures::TryStreamExt;
 
 use super::{
@@ -309,6 +310,69 @@ async fn live_a_refused_catalog_starts_no_key_repair() {
     );
     let _ = repair.await;
     ServingRegistrar::release(&registration).await;
+    let engine = Arc::try_unwrap(engine)
+        .ok()
+        .expect("the finished task dropped its engine");
+    finish(engine).await;
+}
+
+/// A command that opens the catalog beside a server (`backup list`, the
+/// purge's dry run: `beside_server`) starts no key repair. The factory's
+/// `build_components` decides through `start_key_repair`, which this test
+/// calls with the engine the factory would hand it (the factory opens the
+/// default databases). With a data document stored without its key, the
+/// call for a command starts no task and the document is still in the shape
+/// the pre-#436 upsert stored two seconds later, far past a one document
+/// repair (the refusal test measures one in milliseconds). The same call for
+/// a server then starts the repair, which rewrites the document.
+#[tokio::test]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_an_open_beside_a_server_starts_no_key_repair() {
+    use std::time::{Duration, Instant};
+
+    let engine = scratch_engine().await;
+    let key_info = table(&engine, "pass-beside", false);
+    let key = item_key(false);
+    engine
+        .catalog_db
+        .collection::<Document>("tables")
+        .insert_one(catalog_row("beside", &key_info.table_id, &key_info))
+        .await
+        .expect("catalog row");
+    store_without_key(&engine, &key_info, &key, Some("upd")).await;
+    let unrepaired = |document: &Document| document.get_object_id("_id").is_ok();
+    let engine = Arc::new(engine);
+
+    let mut beside = ServerComponentsOptions::default();
+    beside.beside_server = true;
+    assert!(
+        crate::start_key_repair(&engine, &beside).is_none(),
+        "an open beside a server started a key repair"
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        unrepaired(&stored(&engine, &key_info, &key).await),
+        "an open beside a server rewrote a data document"
+    );
+
+    let started = Instant::now();
+    let repair = crate::start_key_repair(&engine, &ServerComponentsOptions::default())
+        .expect("a server's open starts the repair");
+    let deadline = started + Duration::from_secs(30);
+    while unrepaired(&stored(&engine, &key_info, &key).await) {
+        assert!(
+            Instant::now() < deadline,
+            "the repair the server's open started did not rewrite the document"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let want = with(key.clone(), "w", s("upd"));
+    assert_eq!(
+        stored(&engine, &key_info, &key).await,
+        expected_document(&want, &key_info, 1),
+        "the server's repair rebuilt the document"
+    );
+    let _ = repair.await;
     let engine = Arc::try_unwrap(engine)
         .ok()
         .expect("the finished task dropped its engine");

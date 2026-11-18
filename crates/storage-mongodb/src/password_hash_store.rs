@@ -23,8 +23,16 @@ impl PasswordHashStore for MongoCatalogStore {
         user_name: &str,
     ) -> BoxFuture<'_, OpResult<Option<String>>> {
         let filter = doc! { "account_id": account_id, "user_name": user_name };
+        let account_id = account_id.to_owned();
         Box::pin(async move {
-            find_password_hash(self, "iam_users", filter, "get_user_password_hash").await
+            let hash =
+                find_password_hash(self, "iam_users", filter, "get_user_password_hash").await?;
+            // A user of a deleted account has no password: its console
+            // sessions end and it cannot log in.
+            if hash.is_some() && !self.account_exists(&account_id).await? {
+                return Ok(None);
+            }
+            Ok(hash)
         })
     }
 }

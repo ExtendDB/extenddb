@@ -112,8 +112,8 @@ async fn a_closed_wal_catalog_in_a_read_only_directory_names_the_shm_file() {
 
 #[tokio::test]
 async fn a_database_the_runner_cannot_write_fails_at_once_with_its_cause() {
-    // A rollback-journal database, as a 0.1.x release left it: the runner's
-    // connection switches it to WAL, which writes the file.
+    // A rollback-journal database, as 0.1.14 or an earlier release left it:
+    // the runner's connection switches it to WAL, which writes the file.
     let db = temp_db("ro-file");
     exec(
         &db,
