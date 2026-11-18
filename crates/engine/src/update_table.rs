@@ -28,7 +28,9 @@ pub async fn handle_update_table(
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
     // Per-member enum validation precedes everything else, including the table
-    // lookup, matching the measured service ordering.
+    // lookup, matching the measured service ordering. The service answers a
+    // TableClass outside its set ahead of the BillingMode fault.
+    let table_class = crate::nested_enums::table_class_fault(&body);
     crate::validate_enum_fields(
         &body,
         &[
@@ -43,12 +45,16 @@ pub async fn handle_update_table(
                 clause: crate::EnumClause::Named("tableThroughputMode"),
             },
         ],
-    )?;
+    )
+    .map_err(|e| table_class.clone().unwrap_or(e))?;
 
     crate::require_stream_enabled_member(&body)?;
     let enum_faults = crate::nested_enums::EnumFaults::update_table(&mut body);
     let mut input: UpdateTableInput =
         serde_json::from_value(body).map_err(crate::deserialize_error)?;
+    if let Some(fault) = table_class {
+        return Err(fault);
+    }
     enum_faults.check()?;
     input.resolve_table_throughput_mode();
 

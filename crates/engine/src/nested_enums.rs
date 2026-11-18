@@ -2,14 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The `ProjectionType` of each index and the `StreamViewType` of a
-//! `CreateTable` or `UpdateTable` body, which [`crate::validate_enum_fields`]
-//! does not reach.
+//! `CreateTable` or `UpdateTable` body, and the `SSEType` and
+//! `KMSMasterKeyId` of a `CreateTable` body, which
+//! [`crate::validate_enum_fields`] does not reach. Also the `TableClass` of
+//! both, which the service refuses with its own sentence.
 //!
 //! The typed read refuses a value outside its enum with a
 //! `SerializationException`. The service answers a `ValidationException`
 //! naming each such member, in its own order, once the body is read
-//! (measured 2026-11-13, 2026-11-14 and 2026-11-17, us-east-1). So
-//! [`EnumFaults`] takes the faults out of the body before the read.
+//! (measured 2026-11-13, 2026-11-14, 2026-11-17 and 2026-11-18, us-east-1).
+//! So [`EnumFaults`] takes the faults out of the body before the read.
 
 use serde_json::Value;
 
@@ -21,8 +23,29 @@ const PROJECTION_TYPES: &[&str] = &["ALL", "INCLUDE", "KEYS_ONLY"];
 /// The values of `StreamViewType`, in the service's order.
 const STREAM_VIEW_TYPES: &[&str] = &["OLD_IMAGE", "KEYS_ONLY", "NEW_AND_OLD_IMAGES", "NEW_IMAGE"];
 
-/// Each member outside its set: the value sent, the member's path and the
-/// constraint it fails.
+/// The values of `SSEType`, in the service's order.
+const SSE_TYPES: &[&str] = &["AES256", "KMS"];
+
+/// The values of `TableClass`, in the service's order.
+const TABLE_CLASSES: &[&str] = &["STANDARD", "STANDARD_INFREQUENT_ACCESS"];
+
+/// The most characters a `KMSMasterKeyId` may hold.
+const KMS_MASTER_KEY_ID_MAX: usize = 2048;
+
+/// The service's answer to a `TableClass` outside its set.
+pub(crate) fn table_class_fault(body: &Value) -> Option<DynamoDbError> {
+    let sent = body.get("TableClass")?.as_str()?;
+    (!TABLE_CLASSES.contains(&sent)).then(|| {
+        DynamoDbError::ValidationException(format!(
+            "Invalid table-class parameter provided. Please try again with a valid \
+             table-class value: [{}].",
+            TABLE_CLASSES.join(", ")
+        ))
+    })
+}
+
+/// Each member outside its set or over its length: the value sent, the
+/// member's path and the constraint it fails.
 #[derive(Default)]
 pub(crate) struct EnumFaults(Vec<(String, String, String)>);
 
@@ -30,6 +53,7 @@ impl EnumFaults {
     pub(crate) fn create_table(body: &mut Value) -> Self {
         let mut faults = Self::default();
         faults.projections(body, "GlobalSecondaryIndexes", false);
+        faults.sse_specification(body);
         faults.stream_view_type(body);
         faults.projections(body, "LocalSecondaryIndexes", false);
         faults
@@ -70,6 +94,27 @@ impl EnumFaults {
             let at = format!("{path}.{}.member{segment}.projection.projectionType", i + 1);
             self.one_of(element.pointer_mut(pointer), at, PROJECTION_TYPES);
         }
+    }
+
+    /// The length of the `KMSMasterKeyId`, which the service counts in
+    /// characters, then the `SSEType`.
+    fn sse_specification(&mut self, body: &mut Value) {
+        if let Some(key) = body
+            .pointer("/SSESpecification/KMSMasterKeyId")
+            .and_then(Value::as_str)
+            && key.chars().count() > KMS_MASTER_KEY_ID_MAX
+        {
+            self.0.push((
+                key.to_owned(),
+                "sSESpecification.kMSMasterKeyId".to_owned(),
+                format!("Member must have length less than or equal to {KMS_MASTER_KEY_ID_MAX}"),
+            ));
+        }
+        self.one_of(
+            body.pointer_mut("/SSESpecification/SSEType"),
+            "sSESpecification.sSEType".to_owned(),
+            SSE_TYPES,
+        );
     }
 
     fn stream_view_type(&mut self, body: &mut Value) {

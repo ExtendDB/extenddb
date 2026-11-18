@@ -13,6 +13,9 @@ pub async fn handle_create_table(
     mut body: Value,
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
+    // The service answers a TableClass outside its set ahead of the
+    // BillingMode fault, which is checked here before the read.
+    let table_class = crate::nested_enums::table_class_fault(&body);
     crate::validate_enum_fields(
         &body,
         &[
@@ -27,7 +30,8 @@ pub async fn handle_create_table(
                 clause: crate::EnumClause::Named("tableThroughputMode"),
             },
         ],
-    )?;
+    )
+    .map_err(|e| table_class.clone().unwrap_or(e))?;
 
     crate::require_stream_enabled_member(&body)?;
     let enum_faults = crate::nested_enums::EnumFaults::create_table(&mut body);
@@ -50,10 +54,17 @@ pub async fn handle_create_table(
             ))
         }
     })?;
+    // The service reads the body and checks the table name length before it
+    // answers the table class fault.
+    if let Some(fault) = table_class {
+        extenddb_core::validation::validate_table_name(&input.table_name, &ctx.limits)?;
+        return Err(fault);
+    }
     enum_faults.check()?;
     input.resolve_table_throughput_mode();
 
     validate_create_table(&input, &ctx.limits)?;
+    check_sse_specification(input.sse_specification.as_ref())?;
 
     // An empty SearchSchema means the same as an absent one, so it is collapsed
     // here, once, rather than in each backend. Storing the empty list would make
@@ -111,6 +122,29 @@ pub async fn handle_create_table(
         table_description: table_desc,
     };
     serialize_output(&output)
+}
+
+/// The service's refusals of an `SSESpecification` whose members do not go
+/// together. They come after the member faults. Only an `Enabled` of `true`
+/// or `false` is checked.
+fn check_sse_specification(spec: Option<&Value>) -> Result<(), DynamoDbError> {
+    let Some(spec) = spec else {
+        return Ok(());
+    };
+    let sse_type = spec.get("SSEType").and_then(Value::as_str);
+    let key = spec.get("KMSMasterKeyId").is_some_and(|k| !k.is_null());
+    let reason = match spec.get("Enabled").and_then(Value::as_bool) {
+        Some(false) if sse_type.is_some() => "SSEType can not be specified if Enabled is false",
+        Some(false) if key => "KMSMasterKeyId can not be specified if Enabled is false",
+        Some(true) if sse_type == Some("AES256") => "SSEType AES256 is not supported",
+        Some(true) if key && sse_type != Some("KMS") => {
+            "SSEType KMS is required if KMSMasterKeyId is specified"
+        }
+        _ => return Ok(()),
+    };
+    Err(DynamoDbError::ValidationException(format!(
+        "One or more parameter values were invalid: {reason}"
+    )))
 }
 
 /// Map a storage-layer error to its `DynamoDB` wire error.

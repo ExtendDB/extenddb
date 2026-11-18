@@ -1,17 +1,24 @@
 # Copyright 2026 ExtendDB contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""CreateTable and UpdateTable refuse a ProjectionType or StreamViewType outside its set.
+"""CreateTable and UpdateTable refuse members outside their sets.
 
 Measured against Amazon DynamoDB in us-east-1 on 13 and 14 Nov 2026, and
-beside a member of the wrong JSON type on 17 Nov 2026. Each request went out
-twice with the same answer.
+beside a member of the wrong JSON type on 17 Nov 2026. The TableClass and
+SSESpecification rows were measured on 13, 14 and 18 Nov 2026. Each request
+went out twice with the same answer.
 
 - The service answers ``ValidationException`` with the enum text, the member
   path and the set in its own order.
 - A member of the wrong JSON type answers ``SerializationException`` first.
   Its text there is "Unexpected field type", which ExtendDB does not send,
   so these rows check the exception only.
+- A TableClass outside its set gets the service's own sentence. A member of
+  the wrong JSON type and a table name of a bad length answer ahead of it.
+  It answers ahead of every member fault.
+- CreateTable refuses an SSEType outside its set and a KMSMasterKeyId of
+  more than 2048 characters with the other member faults. After them it
+  refuses an SSESpecification whose members do not go together.
 - UpdateTable refuses before it looks up the table. After a refused
   CreateTable no table exists. After a refused UpdateTable the table has no
   stream, and the same UpdateTable with ``NEW_IMAGE`` enables one.
@@ -34,13 +41,32 @@ REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 SERIALIZATION = "SerializationException"
 PROJECTION_SET = "[ALL, INCLUDE, KEYS_ONLY]"
 VIEW_SET = "[OLD_IMAGE, KEYS_ONLY, NEW_AND_OLD_IMAGES, NEW_IMAGE]"
+SSE_SET = "[AES256, KMS]"
+SSE_TYPE = "sSESpecification.sSEType"
+TABLE_CLASS = ("Invalid table-class parameter provided. Please try again with a valid "
+               "table-class value: [STANDARD, STANDARD_INFREQUENT_ACCESS].")
+ONE = "1 validation error detected: "
+
+
+def _clause(value: str, path: str, constraint: str) -> str:
+    return f"Value '{value}' at '{path}' failed to satisfy constraint: {constraint}"
 
 
 def _refused(value: str, path: str, values: str) -> str:
-    return (
-        f"1 validation error detected: Value '{value}' at '{path}' failed to "
-        f"satisfy constraint: Member must satisfy enum value set: {values}"
-    )
+    return ONE + _clause(value, path, f"Member must satisfy enum value set: {values}")
+
+
+def _too_long(value: str, path: str, most: int) -> str:
+    return ONE + _clause(value, path, f"Member must have length less than or equal to {most}")
+
+
+def _both(first: str, second: str) -> str:
+    """The faults of two texts with one fault each, in that order."""
+    return f"2 validation errors detected: {first.removeprefix(ONE)}; {second.removeprefix(ONE)}"
+
+
+def _invalid(reason: str) -> str:
+    return f"One or more parameter values were invalid: {reason}"
 
 
 def _projection(value: str, member: str) -> str:
@@ -119,6 +145,73 @@ ROWS = [
      {"AttributeDefinitions": _defs("g"), "GlobalSecondaryIndexUpdates": BAD_CREATE,
       "ReplicaUpdates": "x"},
      SERIALIZATION),
+]
+
+# A TableClass or an SSESpecification the service refuses. PLAIN is the
+# table keyed on pk alone. The ct-table-class-name row sends its own
+# TableName.
+PLAIN = {**TABLE, "AttributeDefinitions": _defs("pk")}
+GSI_FAULT = _projection("EVERY_ATTRIBUTE", "globalSecondaryIndexes.1.member")
+SSE_BOGUS = _refused("BOGUS", SSE_TYPE, SSE_SET)
+KEY_2049 = "k" * 2049
+KEY_FAULT = _too_long(KEY_2049, "sSESpecification.kMSMasterKeyId", 2048)
+NAME_256 = "t" * 256
+KMS_REQUIRED = _invalid("SSEType KMS is required if KMSMasterKeyId is specified")
+
+
+def _sse(**spec) -> dict:
+    return {**PLAIN, "SSESpecification": spec}
+
+
+ROWS += [
+    ("ct-sse-aes256", "CreateTable", _sse(Enabled=True, SSEType="AES256"),
+     _invalid("SSEType AES256 is not supported")),
+    ("ct-sse-bogus", "CreateTable", _sse(Enabled=True, SSEType="BOGUS"), SSE_BOGUS),
+    ("ct-sse-aes", "CreateTable", _sse(Enabled=True, SSEType="AES"),
+     _refused("AES", SSE_TYPE, SSE_SET)),
+    ("ct-sse-type-disabled", "CreateTable", _sse(Enabled=False, SSEType="KMS"),
+     _invalid("SSEType can not be specified if Enabled is false")),
+    ("ct-sse-key-without-type", "CreateTable",
+     _sse(Enabled=True, KMSMasterKeyId="alias/no-such-key"), KMS_REQUIRED),
+    ("ct-sse-key-disabled", "CreateTable",
+     _sse(Enabled=False, KMSMasterKeyId="alias/no-such-key"),
+     _invalid("KMSMasterKeyId can not be specified if Enabled is false")),
+    ("ct-sse-key-2049", "CreateTable",
+     _sse(Enabled=True, SSEType="KMS", KMSMasterKeyId=KEY_2049), KEY_FAULT),
+    # The service lists the key's length ahead of the SSEType.
+    ("ct-sse-bogus-key-2049", "CreateTable",
+     _sse(Enabled=True, SSEType="BOGUS", KMSMasterKeyId=KEY_2049), _both(KEY_FAULT, SSE_BOGUS)),
+    # The service counts the key's length in characters.
+    ("ct-sse-key-2048", "CreateTable", _sse(Enabled=True, KMSMasterKeyId="k" * 2048),
+     KMS_REQUIRED),
+    ("ct-sse-key-1025-emoji", "CreateTable",
+     _sse(Enabled=True, KMSMasterKeyId="\U0001F600" * 1025), KMS_REQUIRED),
+    ("ct-sse-bogus-gsi", "CreateTable",
+     {**TABLE, "GlobalSecondaryIndexes": BAD_GSI,
+      "SSESpecification": {"Enabled": True, "SSEType": "BOGUS"}},
+     _both(GSI_FAULT, SSE_BOGUS)),
+    ("ct-sse-bogus-stream", "CreateTable",
+     {**_sse(Enabled=True, SSEType="BOGUS"), "StreamSpecification": _stream(True, "NEW_IMAGES")},
+     _both(SSE_BOGUS, _view("NEW_IMAGES"))),
+    ("ct-sse-aes256-gsi", "CreateTable",
+     {**TABLE, "GlobalSecondaryIndexes": BAD_GSI,
+      "SSESpecification": {"Enabled": True, "SSEType": "AES256"}},
+     GSI_FAULT),
+    ("ct-table-class", "CreateTable", {**PLAIN, "TableClass": "STANDARD_IA"}, TABLE_CLASS),
+    ("ct-table-class-billing", "CreateTable",
+     {**PLAIN, "BillingMode": "ON_DEMAND", "TableClass": "PAY_PER_REQUEST"}, TABLE_CLASS),
+    ("ct-table-class-gsi", "CreateTable",
+     {**TABLE, "GlobalSecondaryIndexes": BAD_GSI, "TableClass": "BOGUS"}, TABLE_CLASS),
+    ("ct-table-class-name", "CreateTable",
+     {**PLAIN, "TableName": NAME_256, "TableClass": "BOGUS"},
+     _too_long(NAME_256, "tableName", 255)),
+    ("ct-table-class-tags", "CreateTable", {**PLAIN, "TableClass": "BOGUS", "Tags": "x"},
+     SERIALIZATION),
+    ("ut-table-class", "UpdateTable", {"TableClass": "STANDARD_IA"}, TABLE_CLASS),
+    ("ut-table-class-billing", "UpdateTable",
+     {"BillingMode": "ALSO_BOGUS", "TableClass": "BOGUS"}, TABLE_CLASS),
+    ("ut-table-class-defs", "UpdateTable",
+     {"TableClass": "BOGUS", "AttributeDefinitions": "x"}, SERIALIZATION),
 ]
 
 
