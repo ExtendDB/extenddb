@@ -18,6 +18,7 @@ futures = { workspace = true }
 thiserror = { workspace = true }
 axum = { workspace = true }
 aws-lc-rs = { workspace = true }
+libc = { workspace = true }
 sha2 = "0.10"
 hex = "0.4"
 serde_json = { workspace = true }

@@ -58,12 +58,12 @@ pub use backup_catalog::heartbeat_backup_row;
 pub use bootstrapper::CassandraBootstrapper;
 pub use catalog_store::CassandraCatalogStore;
 pub use config::CassandraStorageConfig;
+pub use credential_store::CassandraCredentialStore;
 pub use engine::{CassandraEngine, CassandraSession};
 pub use metadata_engine::TtlBackfillCursor;
 
-use cdrs_tokio::types::IntoRustByName;
 use extenddb_storage::hooks::{ServerRuntimeHooks, ServingRegistrar, WorkerContext};
-use extenddb_storage::server_components::{BackendError, ServerComponents};
+use extenddb_storage::server_components::{BackendError, ServerComponents, load_secret_keys};
 use std::sync::Arc;
 
 // ============================================================================
@@ -278,10 +278,10 @@ async fn make_catalog_store_from_connection_string(
     )
     .map_err(|e| e.to_string())?;
     let session = deployment.connect().await.map_err(|e| e.to_string())?;
-    Ok(CassandraCatalogStore::catalog_only(
-        session,
-        deployment.keyspace_prefix,
-    ))
+    Ok(
+        CassandraCatalogStore::catalog_only(session, deployment.keyspace_prefix)
+            .reading_key_rows_at_all(),
+    )
 }
 
 /// The warnings for the deployment's keyspaces whose replication differs
@@ -385,7 +385,7 @@ fn server_components_factory(
     region: &str,
     // `bootstrap_if_uninitialized` is not honored: an uninitialized catalog
     // fails with the explicit-`init` guidance, as on PostgreSQL.
-    options: extenddb_storage::server_components::ServerComponentsOptions,
+    mut options: extenddb_storage::server_components::ServerComponentsOptions,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<ServerComponents, BackendError>> + Send>,
 > {
@@ -462,37 +462,26 @@ fn server_components_factory(
             }
         }
 
-        // Load encryption key from catalog.
-        let catalog_keyspace = format!("{}_catalog", cassandra_config.keyspace_prefix);
-        let enc_key_query =
-            format!("SELECT value FROM {catalog_keyspace}.settings WHERE key = 'encryption_key'");
-        let enc_key_result = engine.session.query(&enc_key_query).await.map_err(|e| {
-            BackendError::InitializationFailed(format!("Failed to load encryption key: {e}"))
-        })?;
-        let enc_key_body = enc_key_result.response_body().map_err(|e| {
-            BackendError::InitializationFailed(format!(
-                "Failed to parse encryption key response: {e}"
-            ))
-        })?;
-        let enc_key_rows = enc_key_body
-            .into_rows()
-            .ok_or(BackendError::MissingEncryptionKey)?;
-        let enc_key_row = enc_key_rows
-            .into_iter()
-            .next()
-            .ok_or(BackendError::MissingEncryptionKey)?;
-        let enc_key: String = enc_key_row.get_r_by_name("value").map_err(|e| {
-            BackendError::InitializationFailed(format!("Failed to parse encryption key: {e}"))
-        })?;
+        // Load the key the stores share (RFC-0000 section 7): the catalog
+        // key, or the DEK of the key ring unwrapped with the KEK `serve`
+        // read. The refusals of section 7's table come from the loader.
+        let keys = load_secret_keys(
+            &CassandraCatalogStore::catalog_only(
+                engine.session.clone(),
+                cassandra_config.keyspace_prefix.clone(),
+            ),
+            std::mem::take(&mut options.key_source),
+        )
+        .await?;
 
         let catalog_store = Arc::new(
-            CassandraCatalogStore::with_encryption_key(
+            CassandraCatalogStore::new(
                 engine.session.clone(),
                 cassandra_config.keyspace_prefix.clone(),
                 cassandra_config.datacenter.clone(),
                 cassandra_config.replication_factor,
-                enc_key.clone(),
             )
+            .with_secret_keys(keys.clone())
             .recording_release(options.release),
         );
 
@@ -500,7 +489,7 @@ fn server_components_factory(
             Arc::new(credential_store::CassandraCredentialStore::new(
                 engine.session.clone(),
                 cassandra_config.keyspace_prefix.clone(),
-                enc_key,
+                keys,
             ));
 
         let runtime_hooks = Box::new(CassandraRuntimeHooks {

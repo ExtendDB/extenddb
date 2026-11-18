@@ -5,36 +5,53 @@
 //!
 //! Implements `extenddb_auth::CredentialStore` by looking up access keys and
 //! session credentials from the catalog database, decrypting secrets with
-//! AES-256-GCM through `extenddb_storage::secret_cipher`. The access key id is
-//! the AAD; a secret that does not authenticate under it is not returned.
+//! the key holder the catalog store shares (`extenddb_storage::secret_keys`).
+//! The row a secret was read from is its AAD; a secret that does not
+//! authenticate under it is not returned.
+
+use std::sync::Arc;
 
 use extenddb_auth::{CredentialStore, StoredCredential};
 use extenddb_core::error::DynamoDbError;
-use extenddb_storage::secret_cipher::decrypt_secret;
+use extenddb_storage::secret_keys::{SecretKeys, SecretRow};
 use sqlx::PgPool;
-use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Credential store backed by the catalog `PostgreSQL` database.
 ///
-/// The `encryption_key` is zeroed from memory on drop.
-#[derive(Zeroize, ZeroizeOnDrop)]
+/// With no key holder (a factory caller that passed `KeySource::None`) every
+/// lookup of a stored secret fails.
 pub struct DbCredentialStore {
-    #[zeroize(skip)]
     pool: PgPool,
-    /// Base64-encoded AES-256-GCM encryption key from the settings table.
-    encryption_key: String,
+    keys: Option<Arc<SecretKeys>>,
 }
 
 impl DbCredentialStore {
-    /// Create a new credential store.
-    ///
-    /// `encryption_key` is the base64-encoded 32-byte key from the `settings` table.
+    /// Create a new credential store over the key holder the catalog store
+    /// shares.
     #[must_use]
-    pub fn new(pool: PgPool, encryption_key: String) -> Self {
-        Self {
-            pool,
-            encryption_key,
-        }
+    pub fn new(pool: PgPool, keys: Option<Arc<SecretKeys>>) -> Self {
+        Self { pool, keys }
+    }
+
+    /// Decrypt the secret of `row`, logging a failure under `what`.
+    fn open(
+        &self,
+        row: &SecretRow<'_>,
+        encrypted: &[u8],
+        what: &str,
+    ) -> Result<String, DynamoDbError> {
+        let opened = match &self.keys {
+            Some(keys) => keys.decrypt(row, encrypted),
+            None => Err("the store was opened without an encryption key".to_owned()),
+        };
+        let mut secret = opened.map_err(|e| {
+            tracing::error!(
+                "{what} decryption failed for access key {}: {e}",
+                row.access_key_id
+            );
+            DynamoDbError::InternalServerError("Internal error during authentication".to_owned())
+        })?;
+        Ok(std::mem::take(&mut *secret))
     }
 }
 
@@ -80,13 +97,11 @@ impl DbCredentialStore {
             return Ok(None);
         };
 
-        let secret_key =
-            decrypt_secret(&encrypted, &self.encryption_key, access_key_id).map_err(|e| {
-                tracing::error!("Secret key decryption failed for access key {access_key_id}: {e}");
-                DynamoDbError::InternalServerError(
-                    "Internal error during authentication".to_owned(),
-                )
-            })?;
+        let secret_key = self.open(
+            &SecretRow::access_key(access_key_id, &account_id, &user_name),
+            &encrypted,
+            "Secret key",
+        )?;
 
         Ok(Some(StoredCredential {
             secret_key,
@@ -136,15 +151,19 @@ impl DbCredentialStore {
             ));
         }
 
-        let secret_key =
-            decrypt_secret(&encrypted, &self.encryption_key, access_key_id).map_err(|e| {
-                tracing::error!(
-                    "Session secret key decryption failed for access key {access_key_id}: {e}"
-                );
-                DynamoDbError::InternalServerError(
-                    "Internal error during authentication".to_owned(),
-                )
-            })?;
+        // `expires_at` is stored in microseconds; the AAD carries whole
+        // seconds, which `unix_timestamp` gives by flooring.
+        let secret_key = self.open(
+            &SecretRow::session(
+                access_key_id,
+                &account_id,
+                &role_name,
+                &session_name,
+                expires_at.unix_timestamp(),
+            ),
+            &encrypted,
+            "Session secret key",
+        )?;
 
         Ok(Some(StoredCredential {
             secret_key,

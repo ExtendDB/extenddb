@@ -207,7 +207,7 @@ async fn every_released_catalog_upgrades_to_the_definitions_of_a_fresh_install()
         if state == "dotted-ttl" {
             // The accepted difference of this state: the legacy index stays
             // until TTL is disabled on the table (inventory section 3.2,
-            // MongoDB item 4), and v1.0 creates none for a dotted name.
+            // MongoDB item 4), and this binary creates none for a dotted name.
             let dotted = &before["T_cu_dotted"];
             assert!(
                 dotted.iter().any(|(n, _)| n == "idx_ttl_exp.at"),
@@ -243,7 +243,7 @@ async fn stream_shards_indexes(d: &Deployment) -> BTreeMap<String, Document> {
 }
 
 /// The `{table_id, shard_id}` index on `stream_shards`, which no release
-/// before 1.0 created: every released data database has only the unique
+/// before 0.1.15 created: every released data database has only the unique
 /// `shard_id` index, and the `migrate --yes` that adopts it adds the index
 /// with migration 1's data step. A second run applies nothing.
 #[tokio::test(flavor = "multi_thread")]
@@ -466,7 +466,7 @@ async fn migration_1_upgrades_the_oldest_release_as_the_golden_file_records() {
     d.drop_databases().await;
 }
 
-/// From 1.0 on a `dynamodb:ResourceTag` key written through the API has no
+/// From 0.1.15 on a `dynamodb:ResourceTag` key written through the API has no
 /// effect, as on the service. Migration 2 is not convergent, so a reconverge
 /// leaves the policies written after it with the text they were written
 /// with, one that names both forms of a key, which the rewrite refuses,
@@ -532,7 +532,7 @@ async fn a_reconverge_leaves_policies_written_after_migration_2_as_they_are() {
         2,
         "{before:?}"
     );
-    // What a release before 1.0 leaves when it writes to a migrated catalog.
+    // What a release before 0.1.15 leaves when it writes to a migrated catalog.
     d.catalog()
         .collection::<Document>("settings")
         .insert_one(doc! { "_id": "resource_tag_migration", "value": "applied" })
@@ -580,7 +580,7 @@ async fn fixture_key(d: &Deployment) -> (Bson, String, String, i64) {
     )
 }
 
-/// An access key document as a release before 1.0 stored it, with an `_id`
+/// An access key document as a release before 0.1.15 stored it, with an `_id`
 /// and a creation time the test chooses, and a secret that tells the copies
 /// apart.
 fn stored_key(n: u8, access_key_id: &str, account: &str, user: &str, created_ms: i64) -> Document {
@@ -619,7 +619,7 @@ async fn access_key_indexes(d: &Deployment) -> Vec<String> {
 
 /// Migration 12's body on the oldest released catalog, after the fixture's
 /// user imported its access key ID twice more and the user `ci` imported
-/// the example pair three times: a release before 1.0 stored a document for
+/// the example pair three times: a release before 0.1.15 stored a document for
 /// each import. Each ID keeps the copy a credential lookup read before the
 /// upgrade: the first in natural order, which for the fixture's key is
 /// neither the oldest copy nor the one with the lowest `_id`. The unique
