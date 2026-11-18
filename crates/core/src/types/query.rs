@@ -168,6 +168,30 @@ pub struct ScanInput {
     pub conditional_operator: Option<ConditionalOperator>,
 }
 
+/// The value the service validates and uses for a `Scan` `Limit`, `Segment`
+/// or `TotalSegments` written as `number`: a fraction is truncated toward zero
+/// and a value outside the int32 range is saturated to the nearer bound.
+///
+/// Measured 2026-10-25 (us-east-1): `Limit: 1.5` and `Limit: 1.0` return one
+/// item, `Limit: 1e2`, `Limit: 2147483648` and `Limit: 9223372036854775808`
+/// are accepted, `Segment: 1.5` of `TotalSegments: 2` returns the items of
+/// segment 1, `Limit: 0.0` is reported as `0`, `Limit: -2147483649` as
+/// `-2147483648` and `TotalSegments: 2147483648` as `2147483647`. Measured
+/// 2026-10-30 12:40 UTC: `Limit: -1.5` is reported as `-1`, and `Limit: -0.5`
+/// and `Limit: -0` as `0`.
+#[must_use]
+pub fn saturated_int32(number: &serde_json::Number) -> i32 {
+    if let Some(value) = number.as_i64() {
+        return i32::try_from(value).unwrap_or(if value < 0 { i32::MIN } else { i32::MAX });
+    }
+    if number.is_u64() {
+        return i32::MAX;
+    }
+    // A float: `as` truncates toward zero and saturates at the int32 bounds.
+    #[allow(clippy::cast_possible_truncation)]
+    number.as_f64().map_or(0, |value| value as i32)
+}
+
 /// `Scan` response body.
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanOutput {

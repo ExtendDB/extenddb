@@ -235,7 +235,9 @@ impl SingleRequest {
                 .get("ConsistentRead")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
-            limit: body.get("Limit").and_then(Value::as_i64),
+            limit: crate::int32_member::read(body.get("Limit"))
+                .unwrap_or_default()
+                .map(i64::from),
             next_token: body
                 .get("NextToken")
                 .and_then(Value::as_str)

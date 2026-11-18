@@ -14,12 +14,15 @@ a finally so nothing is left in the live account.
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
 
 import boto3
 import pytest
 from botocore.exceptions import ClientError
+
+from test_partiql_write import _execute_raw, _raw_refusal
 
 
 # ---- local polling helpers (independent of conftest internals) -------------
@@ -305,6 +308,57 @@ def test_next_token_bound_to_parameter_values(dynamodb_client, table):
     second = dynamodb_client.execute_statement(
         Statement=stmt, Parameters=[{"S": "user1"}], Limit=1, NextToken=token)
     assert sks(_items(second)) == ["post#2"]
+
+
+# The SDK sends Limit as an integer, so these bodies are sent as written.
+BELOW_ONE = (
+    "1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: "
+    "Member must have value greater than or equal to 1"
+)
+ONE_PER_PAGE = [["post#1"], ["post#2"], ["post#3"], ["profile"]]
+ONE_PAGE = [["post#1", "post#2", "post#3", "profile"]]
+
+# Each Limit as the request writes it, and the answer: the pages of partition
+# user1 that hold items, or the refusal of a statement on a table that does
+# not exist, which comes ahead of the table lookup (measured 2026-11-14 and
+# 2026-11-18).
+LIMIT_FORMS = [
+    ("1.0", ONE_PER_PAGE),
+    ("1.5", ONE_PER_PAGE),
+    ('"2"', ("SerializationException", "STRING_VALUE cannot be converted to Integer")),
+    ("0.5", ("ValidationException", BELOW_ONE)),
+    ("true", ("SerializationException", "TRUE_VALUE cannot be converted to Integer")),
+    ("false", ("SerializationException", "FALSE_VALUE cannot be converted to Integer")),
+    ("[1]", ("SerializationException", "")),
+    ("{}", ("SerializationException", "Start of structure or map found where not expected")),
+    ("null", ("ResourceNotFoundException", "Requested resource not found")),
+    ("2147483648", ONE_PAGE),
+]
+
+
+@pytest.mark.parametrize("limit, expected", LIMIT_FORMS)
+def test_limit_written_as_any_json_value(dynamodb_client, table, limit, expected):
+    if isinstance(expected, tuple):
+        body = {
+            "Statement": 'SELECT * FROM "extenddb-measure-2a-does-not-exist-xyz" WHERE pk = \'k\'',
+            "Limit": json.loads(limit),
+        }
+        assert _raw_refusal(dynamodb_client, body)[:2] == expected
+        return
+    body = {
+        "Statement": f'SELECT * FROM "{table}" WHERE pk = \'user1\'',
+        "ConsistentRead": True,
+        "Limit": json.loads(limit),
+    }
+    pages = []
+    for _ in range(6):
+        resp = _execute_raw(dynamodb_client, body)
+        if resp.get("Items"):
+            pages.append(sks(resp["Items"]))
+        if "NextToken" not in resp:
+            break
+        body = {**body, "NextToken": resp["NextToken"]}
+    assert pages == expected
 
 
 # ---- index targeting -------------------------------------------------------
