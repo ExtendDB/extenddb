@@ -3,12 +3,14 @@
 
 //! Binary version literals in the documentation must match the compiled version.
 //!
-//! The documentation carries sample output containing the binary version. Those
-//! literals go stale silently: nothing fails, nothing warns, and the next reader
-//! trusts them, so the check stays behind rather than literals that expire at the
-//! next release. Sample lines show the catalog as `catalog migration <n>`, the
-//! highest migration id the binary carries; that number is not checked, so adding a
-//! migration needs no edit here.
+//! The documentation carries sample output containing the binary version, and
+//! the image READMEs and Docker Hub pages under `docker/` run image tags such
+//! as `extenddb/extenddb-mongodb:<version>`. Those literals go stale silently:
+//! nothing fails, nothing warns, and the next reader trusts them, so the check
+//! stays behind rather than literals that expire at the next release. Sample
+//! lines show the catalog as `catalog migration <n>`, the highest migration id
+//! the binary carries; that number is not checked, so adding a migration needs
+//! no edit here.
 //!
 //! Two escapes are deliberate. Files that document a past version, an upgrade
 //! between versions, or another backend's version are exempt by path, each with a
@@ -88,11 +90,19 @@ const LOOKAHEAD: usize = 24;
 ///
 /// So the match is case-insensitive and scans a short window after the keyword rather
 /// than requiring adjacency.
+///
+/// Three rules keep the window to our own version. An image reference such as
+/// `extenddb/extenddb-mongodb:0.1.5` holds the keyword twice and is one literal, so
+/// each number is reported once, by where it starts. A number after `:` (or `:v`) is
+/// an image tag, and it is ours only when no space separates it from the keyword:
+/// `(network extenddb, image cassandra:4.1.5)` names another project's image. A
+/// number after `/releases/` is a link to a release named on purpose.
 fn versions_near(line: &str, keyword: &str) -> Vec<String> {
     let haystack = line.to_ascii_lowercase();
     let chars: Vec<char> = haystack.chars().collect();
     let key: Vec<char> = keyword.chars().collect();
     let mut found = Vec::new();
+    let mut seen_at = Vec::new();
 
     for start in 0..chars.len() {
         if !chars[start..].starts_with(&key[..]) {
@@ -117,7 +127,16 @@ fn versions_near(line: &str, keyword: &str) -> Vec<String> {
                 j += 1;
             }
             let run: String = chars[digit_at..j].iter().collect();
+            let between: String = chars[after..digit_at].iter().collect();
+            let tag_colon = between.ends_with(':') || between.ends_with(":v");
+            if seen_at.contains(&digit_at)
+                || (tag_colon && between.contains(char::is_whitespace))
+                || between.contains("/releases/")
+            {
+                continue;
+            }
             if let Some(version) = exact_version(&run) {
+                seen_at.push(digit_at);
                 found.push(version);
             }
         }
@@ -212,11 +231,19 @@ fn the_matcher_sees_every_form_it_claims_to_cover() {
         "# extenddb 0.1.5 (catalog migration 4) starting on 127.0.0.1:18443",
         "# extenddb 0.1.5",
         "ExtendDB 0.1.5 needs migration 4.",
+        "  extenddb/extenddb-mongodb:0.1.5 \\",
+        "  docker.io/extenddb/extenddb-cassandra:0.1.5",
+        "EXTENDDB_CASSANDRA_IMAGE=extenddb/extenddb-cassandra:0.1.5",
+        "docker pull ghcr.io/extenddb/extenddb-postgres:0.1.5",
+        "docker pull public.ecr.aws/extenddb/extenddb-dev:0.1.5",
+        "  extenddb/extenddb-mongodb:v0.1.5",
     ];
     for line in seen {
-        assert!(
-            !stale_literals(line, "0.1.6").is_empty(),
-            "the matcher must see a stale literal in this form: {line}"
+        // Exactly one finding: an image reference names the keyword twice.
+        assert_eq!(
+            stale_literals(line, "0.1.6"),
+            vec![(1, "0.1.5".to_owned())],
+            "the matcher must see one stale literal in this form: {line}"
         );
     }
 
@@ -227,6 +254,8 @@ fn the_matcher_sees_every_form_it_claims_to_cover() {
         "connection_string = \"postgresql://extenddb:***@localhost:5432/extenddb_catalog\"",
         "  OK: Catalog version 0.0.2",
         "# catalog 0.0.2 (postgres)",
+        "(network extenddb, image cassandra:4.1.5)",
+        "See https://github.com/ExtendDB/extenddb/releases/tag/v0.1.14 for 0.1.14.",
     ];
     for line in ignored {
         assert_eq!(
@@ -291,6 +320,8 @@ fn documentation_version_literals_match_the_compiled_version() {
 
     let mut files = Vec::new();
     markdown_files(&root.join("docs"), &mut files);
+    // The image READMEs and Docker Hub pages run `extenddb/extenddb-<image>:<tag>`.
+    markdown_files(&root.join("docker"), &mut files);
     let readme = root.join("README.md");
     if readme.exists() {
         files.push(readme);
@@ -299,6 +330,13 @@ fn documentation_version_literals_match_the_compiled_version() {
         files.len() > 10,
         "expected to find the documentation set, found {} files under {}",
         files.len(),
+        root.display()
+    );
+    assert!(
+        files
+            .iter()
+            .any(|f| f.ends_with("docker/README-mongodb.md")),
+        "expected the image READMEs under {}/docker",
         root.display()
     );
 
