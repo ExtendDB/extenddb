@@ -27,8 +27,11 @@
 //!   `exclusiveStartTableName`, `indexName` for `Query`, `Scan` and `SearchVectors`, and
 //!   `transactItems.<n>.member.<op>.tableName` (1-based, `put`, `get`,
 //!   `delete`, `update`, `conditionCheck`). A name inside the pattern but of a
-//!   bad length is left to the engine handlers, whose answer the service's
-//!   matches already.
+//!   bad length is left to the engine handlers, for the reason given in
+//!   `extenddb_core::validation::table_name_length`. Beside a name outside the
+//!   pattern, `TransactWriteItems` lists the other actions' names of a bad
+//!   length here (measured 2026-11-13 and 2026-11-14). An empty
+//!   `DescribeTable` name fails both clauses (measured 2026-11-18).
 //! - `ListStreams` has its own validator: `TableName must be at least 3
 //!   characters long and at most 255 characters long`, measured for a U+0000
 //!   name, and on 2026-11-04 for a table ARN and for `abc:def`; applied to
@@ -63,23 +66,27 @@
 //! member's own sentence (derived), as a bare name outside the pattern does.
 //! `ListStreams` refuses every value outside the pattern, as measured.
 
-use extenddb_core::error::DynamoDbError;
+use extenddb_core::error::{DynamoDbError, validation_error, validation_errors};
+use extenddb_core::validation::table_name_length::{
+    MAP_KEYS_NAME, length_clause, transact_name_location,
+};
 use serde_json::Value;
 
 use crate::arn_gate::{self, PATTERN, in_pattern};
 
-const MAP_KEYS_NAME: &str = "Map keys must satisfy constraint: \
-    [Member must have length less than or equal to 255, \
-    Member must have length greater than or equal to 3, \
-    Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+]";
-
 const LIST_STREAMS_NAME: &str =
     "TableName must be at least 3 characters long and at most 255 characters long";
 
+/// The service's table name bounds. The gate lists a length clause only
+/// beside a pattern fault, and that request is refused whatever the
+/// deployment's bounds.
+const NAME_BOUNDS: (usize, usize) = (3, 255);
+
 /// Refuse a table name outside the service's character pattern, in any field
 /// the operation carries one, before the name is used in any lookup. A
-/// missing, non-string or empty name passes. `account_id` is the caller's
-/// account, which the control-plane ARN rules compare with the ARN's.
+/// missing, non-string or empty name passes, except an empty `DescribeTable`
+/// name. `account_id` is the caller's account, which the control-plane ARN
+/// rules compare with the ARN's.
 pub(crate) fn check_table_name_chars(
     operation: &str,
     input: &Value,
@@ -87,9 +94,9 @@ pub(crate) fn check_table_name_chars(
 ) -> Result<(), DynamoDbError> {
     match operation {
         "BatchGetItem" | "BatchWriteItem" => check_request_items_keys(operation, input),
-        "TransactGetItems" => check_transact_items(input, &["Get"]),
+        "TransactGetItems" => check_transact_items(input, &["Get"], false),
         "TransactWriteItems" => {
-            check_transact_items(input, &["Put", "Delete", "Update", "ConditionCheck"])
+            check_transact_items(input, &["Put", "Delete", "Update", "ConditionCheck"], true)
         }
         "TagResource" | "UntagResource" | "ListTagsOfResource" => {
             with_str(input, "ResourceArn", arn_gate::check_tag_resource_arn)
@@ -172,10 +179,7 @@ fn pattern_clause() -> String {
 }
 
 fn one_error(value: &str, location: &str, constraint: &str) -> DynamoDbError {
-    DynamoDbError::ValidationException(format!(
-        "1 validation error detected: Value '{value}' at '{location}' failed to satisfy \
-         constraint: {constraint}"
-    ))
+    DynamoDbError::ValidationException(validation_error(value, location, constraint))
 }
 
 /// A table name field: a bare name outside the pattern is refused with the
@@ -193,7 +197,9 @@ fn check_name(
     if name.starts_with("arn:") {
         return arn_gate::check_table_name_arn(operation, name, account_id);
     }
-    if name.is_empty() || in_pattern(name) {
+    // The service reads an empty DescribeTable name as one that fails the
+    // length and the pattern (measured 2026-11-18).
+    if in_pattern(name) && !(name.is_empty() && operation == "DescribeTable") {
         return Ok(());
     }
     Err(bare_name_error(name, location))
@@ -218,29 +224,30 @@ fn check_name_member(value: Option<&Value>, location: &str) -> Result<(), Dynamo
 /// The service lists every failed constraint of a member in one message, the
 /// length clause before the pattern clause.
 fn bare_name_error(name: &str, location: &str) -> DynamoDbError {
-    let length = name.chars().count();
-    let mut clauses: Vec<String> = Vec::with_capacity(2);
-    if length < 3 {
-        clauses.push("Member must have length greater than or equal to 3".to_owned());
-    } else if length > 255 {
-        clauses.push("Member must have length less than or equal to 255".to_owned());
+    bare_names_error(&[(name, location.to_owned())])
+}
+
+/// [`bare_name_error`] for several members, in the order given. A name inside
+/// the pattern contributes its length clause alone.
+fn bare_names_error(names: &[(&str, String)]) -> DynamoDbError {
+    let pattern = pattern_clause();
+    let mut faults: Vec<(&str, &str, &str)> = Vec::new();
+    for (name, location) in names {
+        if let Some(clause) = length_clause(name, NAME_BOUNDS) {
+            faults.push((name, location, clause));
+        }
+        if name.is_empty() || !in_pattern(name) {
+            faults.push((name, location, &pattern));
+        }
     }
-    clauses.push(pattern_clause());
-    let n = clauses.len();
-    DynamoDbError::ValidationException(format!(
-        "{n} validation error{} detected: {}",
-        if n == 1 { "" } else { "s" },
-        clauses
-            .iter()
-            .map(|c| format!("Value '{name}' at '{location}' failed to satisfy constraint: {c}"))
-            .collect::<Vec<_>>()
-            .join("; ")
-    ))
+    DynamoDbError::ValidationException(validation_errors(&faults))
 }
 
 /// A `RequestItems` key outside the pattern, or an ARN key that the ARN rules
 /// refuse. The sentence from `at 'requestItems'` onward is the service's; the
 /// offending key alone is rendered where the service renders the whole map.
+/// The engine handlers give a key of a bad length the same sentence, after
+/// the request is read.
 ///
 /// `BatchWriteItem` refuses a key for its account segment only when the
 /// segment carries U+0000; any other bad account segment is passed on to the
@@ -276,11 +283,21 @@ fn check_request_items_keys(operation: &str, input: &Value) -> Result<(), Dynamo
 }
 
 /// A `TransactItems` member whose sub-operation names a table outside the
-/// pattern, or by an ARN that the ARN rules refuse.
-fn check_transact_items(input: &Value, subs: &[&str]) -> Result<(), DynamoDbError> {
+/// pattern, or by an ARN that the ARN rules refuse. With `list_lengths`
+/// (`TransactWriteItems`) the message lists every action's name outside the
+/// pattern and every name of a bad length, as the service does (measured
+/// 2026-11-13 and 2026-11-14). Names of a bad length alone are left to the
+/// engine, which checks them after the request is read.
+fn check_transact_items(
+    input: &Value,
+    subs: &[&str],
+    list_lengths: bool,
+) -> Result<(), DynamoDbError> {
     let Some(items) = input.get("TransactItems").and_then(Value::as_array) else {
         return Ok(());
     };
+    let mut names: Vec<(&str, String)> = Vec::new();
+    let mut outside = false;
     for (i, item) in items.iter().enumerate() {
         for sub in subs {
             let Some(name) = item
@@ -293,27 +310,26 @@ fn check_transact_items(input: &Value, subs: &[&str]) -> Result<(), DynamoDbErro
             if name.is_empty() {
                 continue;
             }
-            let location = format!(
-                "transactItems.{}.member.{}.tableName",
-                i + 1,
-                lower_camel(sub)
-            );
+            let location = transact_name_location(i, sub);
             if name.starts_with("arn:") {
-                arn_gate::check_transact_member_arn(name, &location)?;
+                if let Err(e) = arn_gate::check_transact_member_arn(name, &location) {
+                    return Err(if outside { bare_names_error(&names) } else { e });
+                }
             } else if !in_pattern(name) {
-                return Err(bare_name_error(name, &location));
+                if !list_lengths {
+                    return Err(bare_name_error(name, &location));
+                }
+                outside = true;
+                names.push((name, location));
+            } else if list_lengths && length_clause(name, NAME_BOUNDS).is_some() {
+                names.push((name, location));
             }
         }
     }
-    Ok(())
-}
-
-fn lower_camel(s: &str) -> String {
-    let mut c = s.chars();
-    match c.next() {
-        Some(f) => f.to_ascii_lowercase().to_string() + c.as_str(),
-        None => String::new(),
+    if outside {
+        return Err(bare_names_error(&names));
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -700,7 +716,7 @@ mod tests {
         let m = message(
             "TransactWriteItems",
             json!({ "TransactItems": [
-                { "Put": { "TableName": "ok", "Item": {} } },
+                { "Put": { "TableName": "okay", "Item": {} } },
                 { "Delete": { "TableName": NUL, "Key": {} } },
             ] }),
         )
@@ -747,5 +763,75 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// Issue #1056 rows the gate answers (measured 2026-11-13, 2026-11-14 and
+    /// 2026-11-18). A name of a bad length alone passes on to the engine, and
+    /// every operation but `DescribeTable` passes an empty name on.
+    #[test]
+    fn bad_lengths_beside_a_pattern_fault_and_the_empty_describe_table_name() {
+        let len = "Member must have length greater than or equal to 3";
+        let at = |v: &str, l: &str, c: &str| {
+            format!("Value '{v}' at '{l}' failed to satisfy constraint: {c}")
+        };
+        let put = |t: &str| json!({ "Put": { "TableName": t, "Item": {} } });
+        let del = |t: &str| json!({ "Delete": { "TableName": t, "Key": {} } });
+        let n256 = "n".repeat(256);
+        let rows = [
+            (
+                "DescribeTable",
+                json!({ "TableName": "" }),
+                Some(format!(
+                    "2 validation errors detected: {}; {}",
+                    at("", "tableName", len),
+                    at("", "tableName", PAT)
+                )),
+            ),
+            (
+                "TransactWriteItems",
+                json!({ "TransactItems": [put("ab"), del("bad name")] }),
+                Some(format!(
+                    "2 validation errors detected: {}; {}",
+                    at("ab", "transactItems.1.member.put.tableName", len),
+                    at("bad name", "transactItems.2.member.delete.tableName", PAT)
+                )),
+            ),
+            (
+                "TransactWriteItems",
+                json!({ "TransactItems": [put("ab"), del(&n256)] }),
+                None,
+            ),
+            ("GetItem", json!({ "TableName": "ab" }), None),
+            (
+                "BatchGetItem",
+                json!({ "RequestItems": { "ab": {} } }),
+                None,
+            ),
+            (
+                "BatchWriteItem",
+                json!({ "RequestItems": { "ab": [] } }),
+                None,
+            ),
+            ("CreateTable", json!({ "TableName": "", "Tags": "x" }), None),
+            (
+                "CreateTable",
+                json!({ "TableName": n256, "Tags": "x" }),
+                None,
+            ),
+        ];
+        for (op, input, expected) in rows {
+            assert_eq!(message(op, input.clone()), expected, "{op} {input}");
+        }
+        for op in [
+            "CreateTable",
+            "UpdateTable",
+            "DeleteTable",
+            "PutItem",
+            "GetItem",
+            "Query",
+            "DescribeTimeToLive",
+        ] {
+            assert_eq!(message(op, json!({ "TableName": "" })), None, "{op}");
+        }
     }
 }

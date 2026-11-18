@@ -94,6 +94,11 @@ pub async fn handle_transact_write_items(
         validate_member_attribute_name_sizes(twi, &ctx.limits)?;
     }
 
+    extenddb_core::validation::table_name_length::validate_transact_write_names(
+        &input.transact_items,
+        &ctx.limits,
+    )?;
+
     // Resolve table key info, validate inputs, parse expressions, and check
     // for duplicate targets — all in a single pass to avoid redundant
     // `table_key_info` lookups.

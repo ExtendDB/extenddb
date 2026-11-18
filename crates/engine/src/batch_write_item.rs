@@ -93,6 +93,11 @@ pub async fn handle_batch_write_item(
     // both, the service answered either fault (measured 2026-11-11).
     extenddb_core::validation::number::operations::batch_write_item(&input)?;
 
+    extenddb_core::validation::table_name_length::validate_request_items_keys(
+        input.request_items.keys(),
+        &ctx.limits,
+    )?;
+
     // Read every table's key info before anything is written. A lookup that
     // failed is reported where `check_batch` reaches its table, so the first
     // fault reported is the one the checks reach first.
