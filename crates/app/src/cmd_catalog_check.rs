@@ -71,11 +71,11 @@ pub async fn run(args: CatalogCheckArgs) -> anyhow::Result<()> {
     println!("Connected to catalog.");
 
     // The key that opens the data database connection string row of a
-    // catalog with a key ring: the KEK of `[auth.encryption] key_file`
-    // (RFC-0000 section 12). Without `key_file`, the catalog key, which opens
-    // no such row.
-    let key_source = extenddb_server::key_file::key_source(&app_config.auth.encryption)
-        .map_err(anyhow::Error::msg)?;
+    // catalog with a key ring: the KEK of `[auth.encryption] key_file`, read
+    // after the locked key store is set up, as `verify` reads it (RFC-0000
+    // sections 7 and 12). Without `key_file`, the catalog key, which opens no
+    // such row.
+    let key_source = crate::util::status_key_source(&app_config)?;
 
     // The backend's own view of its data relations. It connects to the data
     // database the catalog names, and refuses a catalog that names none, as
