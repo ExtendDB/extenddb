@@ -297,6 +297,11 @@ pub struct AuthConfig {
     /// apply when absent.
     #[serde(default)]
     pub cache: AuthCacheConfigToml,
+    /// Where the key that encrypts stored secrets comes from
+    /// (`[auth.encryption]`). Optional; without it the server uses the
+    /// catalog key.
+    #[serde(default)]
+    pub encryption: EncryptionConfig,
 }
 
 impl Default for AuthConfig {
@@ -304,6 +309,7 @@ impl Default for AuthConfig {
         Self {
             provider: default_provider(),
             cache: AuthCacheConfigToml::default(),
+            encryption: EncryptionConfig::default(),
         }
     }
 }
@@ -466,9 +472,19 @@ pub fn serves_tls(tls: &TlsConfig) -> bool {
 pub fn load(config_path: &str) -> anyhow::Result<AppConfig> {
     let config = config::Config::builder()
         .add_source(config::File::with_name(config_path).required(false))
-        .add_source(config::Environment::with_prefix("EXTENDDB").separator("__"))
+        .add_source(environment(None))
         .build()?;
     validated(config.try_deserialize()?)
+}
+
+/// The `EXTENDDB__*` variables as a configuration source, `__` between
+/// section names (`EXTENDDB__AUTH__ENCRYPTION__KEY_FILE` sets
+/// `auth.encryption.key_file`). `vars` replaces the process environment in
+/// tests.
+fn environment(vars: Option<config::Map<String, String>>) -> config::Environment {
+    config::Environment::with_prefix("EXTENDDB")
+        .separator("__")
+        .source(vars)
 }
 
 /// The cross-field checks a deserialized config still has to pass, and the
@@ -507,7 +523,7 @@ pub fn load_builtin_defaults() -> anyhow::Result<AppConfig> {
             &storage_section,
             config::FileFormat::Toml,
         ))
-        .add_source(config::Environment::with_prefix("EXTENDDB").separator("__"))
+        .add_source(environment(None))
         .build()?;
     validated(config.try_deserialize()?)
 }
@@ -561,7 +577,9 @@ mod catalog_upgrade;
 pub use catalog_upgrade::{CatalogUpgrade, MAX_CATALOG_UPGRADE_LOCK_TIMEOUT};
 
 mod display;
+mod encryption;
 pub use display::{MASK, build_config_entries, should_redact};
+pub use encryption::EncryptionConfig;
 
 #[cfg(test)]
 mod tests {

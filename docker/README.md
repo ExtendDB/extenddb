@@ -188,6 +188,46 @@ Mount configuration/TLS state at `/var/lib/extenddb`, set the root filesystem
 read-only, drop all capabilities, use the runtime default seccomp profile, and
 apply CPU/memory limits in the orchestrator.
 
+### Encryption key file
+
+By default the catalog holds the key that encrypts stored secrets, so a copy of
+the catalog opens every access key secret. To keep that key outside the catalog,
+give the container a key-encryption key (KEK) file and set
+`EXTENDDB__AUTH__ENCRYPTION__KEY_FILE` to its path (the admin guide's
+[Encryption Key](../docs/manuals/05-admin-guide.md#encryption-key) section gives
+the file format, the ownership rule and the `extenddb encryption-key` commands).
+The server runs as uid 10001. It refuses a KEK file that neither root nor uid
+10001 owns, and one that another user can read, except through the server's
+group on a file that root owns; it cannot see who belongs to that group, so give
+the group no other members. Each runtime must deliver the file with `uid`, `gid`
+and `mode` set:
+
+* Docker swarm: `--secret source=extenddb-kek,target=kek,uid=10001,gid=10001,mode=0400`.
+  The default, root with mode 0444, is refused. Swarm keeps every secret in the
+  Raft log of its managers with the log's key unencrypted on each manager's disk;
+  `--autolock` keeps a copy of a manager's disk from giving the KEK, at the cost
+  of an operator typing the unlock key after each manager restart.
+* Podman: `--secret extenddb-kek,type=mount,uid=10001,gid=10001,mode=0400`.
+* Kubernetes: a Secret volume with `defaultMode: 0400` and
+  `securityContext: {runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001}` on the
+  pod, which gives the file to root with group 10001 at mode 0440.
+* Compose file secrets are bind mounts that ignore `uid`, `gid` and `mode`: uid
+  10001 must own the host file at mode 0400.
+
+The server keeps the key and the cached signing keys in locked memory. The
+default memlock limit is 64 KiB on kernels before 5.16, below the 640,000 bytes
+the default cache size needs, so pass `--ulimit memlock=16777216:16777216` to
+`docker run` (or the runtime's equivalent) on such hosts; with the key file set,
+a server that cannot lock its memory refuses to start and names the limit it
+needs. `--cap-add IPC_LOCK` alone does not raise the limit for uid 10001.
+
+The switch to the KEK file and a later key replacement run while no server
+runs, as one-off containers with the same secret: a one-off swarm service, a
+`podman run`, or a Kubernetes Job while the Deployment has 0 replicas. Each runs
+`extenddb encryption-key <command> --config /var/lib/extenddb/extenddb.toml`.
+Keep a copy of the KEK away from the runtime's secret store: the store is not a
+backup of it, and a catalog copy wrapped under a lost KEK keeps no stored secret.
+
 ## Known image limitations
 
 * The repository has no backend-aware readiness endpoint; health is liveness.

@@ -1665,3 +1665,65 @@ async fn init_finishes_a_catalog_stopped_before_its_admin_user() {
     drop(drops);
     helpers::flush_pending_drops(&session).await;
 }
+
+/// The stores that `CatalogMigrations::locked_stores` opens for the
+/// encryption-key commands work while the lock is held, and refuse once it
+/// is released.
+#[tokio::test]
+async fn the_stores_under_the_migration_lock_check_its_lease() {
+    use extenddb_storage::secret_keys::SecretTable;
+
+    if helpers::skip_without_cassandra() {
+        return;
+    }
+    let session = session().await;
+    let (prefix, _drops) = new_prefix("locked");
+    keyspace(&session, &format!("{prefix}_catalog")).await;
+    migrate_catalog_keyspace(session.clone(), &prefix, "test", TIMEOUT)
+        .await
+        .expect("migrate the catalog");
+    let migrations = CassandraCatalogMigrations;
+    let lock = migrations
+        .lock(&target_of(&prefix), TIMEOUT)
+        .await
+        .expect("lock");
+    let stores = migrations
+        .locked_stores(&lock, None)
+        .await
+        .expect("the stores under the lock");
+    stores
+        .settings()
+        .set_setting("row_under_lock", "value")
+        .await
+        .expect("write");
+    assert_eq!(
+        stores
+            .settings()
+            .get_setting("row_under_lock")
+            .await
+            .expect("read")
+            .as_deref(),
+        Some("value")
+    );
+    assert!(
+        stores
+            .settings()
+            .replace_setting("row_under_lock", "value", "replaced")
+            .await
+            .expect("replace")
+    );
+    let page = stores
+        .management()
+        .read_secret_page(SecretTable::AccessKeys, None, 1000)
+        .await
+        .expect("page");
+    assert!(page.rows.is_empty() && page.next.is_none());
+    stores
+        .management()
+        .delete_setting("row_under_lock")
+        .await
+        .expect("delete");
+
+    migrations.release(lock).await;
+    assert!(stores.settings().get_setting("catalog_id").await.is_err());
+}

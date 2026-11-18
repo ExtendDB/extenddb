@@ -176,6 +176,7 @@ mod tests {
         for key in [
             "encryption_key",
             "Encryption_KEY",
+            "encryption_key_ring",
             "connection_string",
             "storage.Connection_String",
             "password",

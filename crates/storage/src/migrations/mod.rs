@@ -42,8 +42,8 @@ pub mod m0002_resource_tag_condition_keys;
 
 pub use backend::{MigrationBackend, Step, StoreRef};
 pub use catalog::{
-    AdminRole, CatalogMigrations, HeldLock, Listed, RunKind, StatusNote, Target, WhenCurrent,
-    before_lock, binary_catalog_label, forget_locked, installed, policy_rewrite_lines,
+    AdminRole, CatalogMigrations, HeldLock, Listed, LockedStores, RunKind, StatusNote, Target,
+    WhenCurrent, before_lock, binary_catalog_label, forget_locked, installed, policy_rewrite_lines,
     policy_rewrite_pending, run_locked, run_with_lock, run_with_status,
 };
 #[cfg(any(test, feature = "test-util"))]

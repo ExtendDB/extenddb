@@ -659,6 +659,7 @@ async fn open_catalog(
     options.beside_server = mode == Mode::Read;
     options.startup_recovery = false;
     options.command = Some(command);
+    options.key_source = crate::util::command_key_source(app_config)?;
     let mut storage_config = app_config.storage.clone();
     storage_config.set_instance_id(&format!(
         "{}:backup-command",
