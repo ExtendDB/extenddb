@@ -114,7 +114,7 @@ from a request sent to that service or backend.
 
 ## Backup and Restore
 
-Measured against ExtendDB 0.1.14 with each backend (PostgreSQL, SQLite, MongoDB, Cassandra) on one host, database on loopback; timings compare the backends and do not predict a networked deployment. Two markers qualify entries: *(earlier build)* is a number measured on a pre-release build and not repeated on 0.1.14, and *(from the code)* is a statement from reading the code and storage-level tests rather than a running server.
+Measured against ExtendDB 0.1.14 with each backend (PostgreSQL, SQLite, MongoDB, Cassandra) on one host, database on loopback; timings compare the backends and do not predict a networked deployment. Two markers qualify entries: *(earlier build)* is a number measured on a pre-release build and not repeated on 0.1.14, and *(from the code)* is a statement from reading the code and storage-level tests rather than a running server. <!-- version-literal-ok: names the release the measurements were taken on -->
 
 | Area | DynamoDB | ExtendDB |
 |------|----------|------|
