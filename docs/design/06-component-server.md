@@ -474,7 +474,7 @@ All management routes use `POST /management/<action>` with JSON request/response
 }
 ```
 
-> **Note:** The `SecretAccessKey` is returned only in this response and is not retrievable afterward. The storage layer stores the raw secret (not a hash) because SigV4 authentication requires the original secret key for HMAC computation. Secrets are encrypted at rest with AES-256-GCM using a per-catalog encryption key generated during `extenddb init`.
+> **Note:** The `SecretAccessKey` is returned only in this response and is not retrievable afterward. The storage layer stores the raw secret (not a hash) because SigV4 authentication requires the original secret key for HMAC computation. Secrets are encrypted at rest with AES-256-GCM. By default the key is a per-catalog encryption key generated during `extenddb init`; with `[auth.encryption] key_file` set, it is a data encryption key that a key-encryption key file wraps (the Security Model's Credential Storage section). The response holds the secret for the life of the request, and afterwards the server's credential cache keeps only the SigV4 signing key derived from it.
 
 **Assume Role:**
 ```json

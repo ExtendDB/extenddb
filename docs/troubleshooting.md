@@ -40,10 +40,12 @@ connection_string = "postgresql://extenddb:***@/var/run/postgresql:5432/extenddb
 connection_string = "postgresql://extenddb:***@%2Fvar%2Frun%2Fpostgresql:5432/extenddb_catalog"
 ```
 
-Also update the catalog database:
+Also update the catalog database. For a catalog without a key ring (no `[auth.encryption] key_file`):
 ```bash
 psql extenddb_catalog -c "UPDATE settings SET value='postgresql://extenddb:***@%2Fvar%2Frun%2Fpostgresql:5432/extenddb' WHERE key='data_database_connection_string';"
 ```
+
+For a catalog with a key ring the row is encrypted under the data encryption key, so write it with `extenddb encryption-key set-data-connection --config extenddb.toml --yes < conn.txt`, where `conn.txt` holds the corrected string and was written under `umask 077` (the admin guide's [Encryption Key](manuals/05-admin-guide.md#set-data-connection) section). The command needs the KEK file and may run beside the server, which reads the row at its next start.
 
 **Prevention:** This issue is fixed in versions after 0.1, which automatically encode Unix socket paths correctly.
 
@@ -322,6 +324,108 @@ journalctl -t extenddb -f
 **Cause:** The background log-level poller detected a change in the `log_level` setting and is applying it. This is informational, logged at `warn` level to ensure visibility even when switching to a restrictive level.
 
 **Fix:** No action needed. This confirms the runtime log level change took effect.
+
+## Encryption Key Errors
+
+The server loads the key that opens stored secrets at startup from two catalog `settings` rows, `encryption_key` (the catalog key) and `encryption_key_ring` (the data encryption key, DEK, wrapped under the key-encryption key, KEK, in `[auth.encryption] key_file`), and refuses a catalog whose key state does not match its configuration. Each refusal below is one such state. The admin guide's [Encryption Key](manuals/05-admin-guide.md#encryption-key) section has the commands these fixes name; each previews by default and writes only with `--yes`. The message text of each refusal names the state and the command, and prints no key.
+
+### `Encryption key not found in settings table. Run 'extenddb init'`
+
+**Cause:** `key_file` is not set and the catalog has neither an `encryption_key` row nor an `encryption_key_ring` row. The catalog was created without `extenddb init`, or the row was deleted.
+
+**Fix:** For a new deployment, run `extenddb init`. For a catalog that had the row, restore a catalog copy that holds it: a new key opens none of the stored secrets.
+
+### `Encryption key in settings table is not valid: <reason>. Restore the original key: every stored access key and session secret is encrypted under it`
+
+**Cause:** The `encryption_key` row is not 32 bytes in standard base64. The server, and each `extenddb backup` command, refuse it, because a server started on it would fail every signed request with HTTP 500.
+
+**Fix:** Restore the original value of the row, from a catalog copy if needed.
+
+### `key_file` is not set and the catalog has a key ring marked as an unfinished switch
+
+**Cause:** `extenddb encryption-key switch --yes` started on this catalog and stopped before it finished. The ring records the switch as unfinished and the id of the catalog key it started from.
+
+**Fix:** If a switch of yours stopped, resume it with the same arguments, `extenddb encryption-key switch --config extenddb.toml --key-file <path> --yes`, with every server stopped; the run checks the ring, accepts only the catalog key whose id the ring recorded, finishes the pass, then set `key_file` and start the server. If no switch of yours stopped, do not resume: a writer to the catalog database put that ring row back from an older copy. Restore a catalog copy taken after your last `encryption-key` run finished and check it with `encryption-key status` (the Backup and Restore manual's [Restore a damaged or missing key ring](manuals/14-backup-and-restore.md#restore-a-damaged-or-missing-key-ring) section).
+
+### `key_file` is not set and the catalog has a finished key ring
+
+**Cause:** The deployment switched to a KEK file, and this configuration does not name it. The message prints the KEK id the ring names.
+
+**Fix:** Set `[auth.encryption] key_file` (or `EXTENDDB__AUTH__ENCRYPTION__KEY_FILE`) to the file whose id the message prints, and start the server.
+
+### `key_file` is set and the file is missing, or fails the ownership, mode or ACL check
+
+**Cause:** The message names the path and the check that failed. The server and every `encryption-key` command refuse a KEK file that is not a regular file owned by root or the server's user, that others can read, that gives its group access while root does not own it or while its group is not the server's effective group (or whose ACL grants another user or group), or whose parent directories a user other than root or the owner can write to without the sticky bit. A file that passes those checks and does not hold a key is refused as `KEK file <path> is not a KEK file: <reason>`; the reason names the length, or the offset of the character that does not decode, and leaves the character out.
+
+**Fix:** Check that the path is right for this host (a credential directory such as `/run/credentials/<unit>/` exists only while the unit runs, so run the commands through the same delivery route as the server) and that the owner, mode, ACL and parent directories meet the rule in the admin guide's [The KEK file](manuals/05-admin-guide.md#the-kek-file) paragraph. On Kubernetes, `fsGroup: 10001` and `runAsGroup: 10001` give the file the server's group; on swarm and Podman, pass `uid=10001,gid=10001,mode=0400` with the secret. For the format refusal, restore the file from the copy kept away from the host; the file holds exactly 44 base64 characters and at most one trailing newline.
+
+### `key_file` is set and the catalog has the catalog key and no key ring
+
+**Cause:** In the documented order, `key_file` is set only after `switch --yes` has finished, so this state means a deleted ring or a configuration set too early. The message names `encryption-key status` and the restore steps, and no write command.
+
+**Fix:** If the switch has not run yet, unset `key_file`, run the switch with every server stopped, then set it. If the switch had run, the ring is gone: restore a catalog copy taken after the switch and check it with `encryption-key status`.
+
+### `key_file` is set and the catalog has neither key row
+
+**Cause:** The catalog has no `encryption_key` row and no `encryption_key_ring` row. The ring was deleted, or the catalog was never initialized.
+
+**Fix:** Restore a catalog copy that holds the ring and check it with `encryption-key status`. For a catalog that `extenddb init` never created, see the entry on an uninitialized catalog above.
+
+### The key ring names another KEK than the configured file
+
+**Cause:** The message prints both KEK ids. After `encryption-key rewrap --yes`, the ring names the new file while `key_file` still names the old one; otherwise the configured file is not the KEK that this ring was written under, for example after a restore of a catalog copy wrapped under an older KEK. When `key_file` names the KEK that your last `encryption-key` run wrote the ring under and you restored no catalog copy since that run, a writer to the catalog database put this ring row back from an older copy.
+
+**Fix:** After a rewrap, set `key_file` to the new file. For a ring row that a writer put back, restore a catalog copy taken after your last `encryption-key` run finished and check it with `encryption-key status` (the Backup and Restore manual's [Restore a damaged or missing key ring](manuals/14-backup-and-restore.md#restore-a-damaged-or-missing-key-ring) section). Otherwise find the KEK whose id the ring names and point `key_file` at it; if that KEK is lost, `encryption-key reset --key-file <new> --discard-secrets` keeps every user, role, policy and table and deletes every access key and session (the Backup and Restore manual's [lost KEK](manuals/14-backup-and-restore.md#the-kek-of-a-catalog-copy-is-lost) section).
+
+### A DEK of the key ring fails to unwrap under the configured KEK
+
+**Cause:** The ring has damage or a changed field. The KEK authenticates every field of the ring, so a flipped flag, a changed id, an added or deleted DEK entry, or a wrapped DEK copied from another ring makes a DEK fail to unwrap. The message names `encryption-key status` and the restore steps, and no write command. `status` prints the ring's fields, marked as not authenticated, and which DEK ids fail.
+
+**Fix:** Restore a catalog copy taken before the change and check it with `encryption-key status`. `reset` refuses this ring, because its KEK is not lost.
+
+### `key_file` is set and the key ring is marked as an unfinished switch
+
+**Cause:** `key_file` was set while a stopped switch was unfinished, or a writer to the catalog database wrote the ring row of an unfinished switch back from a copy taken during the switch. The message names `encryption-key status` and the restore steps, and no write command.
+
+**Fix:** If a switch of yours stopped, unset `key_file` for the run, resume the switch with `encryption-key switch --key-file <path> --yes` with every server stopped, then set `key_file` again. If no switch of yours stopped, restore a catalog copy taken after your last run finished and check it with `encryption-key status`; do not resume a switch you did not start, because the resumed run would re-encrypt rows the writer chose.
+
+### `key_file` is set and the catalog has both a key ring and a catalog key
+
+**Cause:** A catalog key row appeared after the switch finished. Its writer is an older release started on this catalog, an older SQLite dev image (which writes a new `encryption_key` row into a switched catalog at startup), or a writer to the catalog database. The message names `encryption-key status`, which lists each stored secret under that key with its access key ID, owner and creation time, and no write command.
+
+**Fix:** Run `extenddb encryption-key status --config extenddb.toml` and read the list. If the rows are yours (the older dev image case), run `encryption-key switch --key-file <path> --accept-catalog-key --yes` with a configuration that does not set `key_file` and every server stopped; it re-encrypts the listed secrets under the DEK and deletes the row. If they are not yours, `--accept-catalog-key` would make a credential the writer chose valid: restore a catalog copy taken before the row appeared instead.
+
+### The key ring holds two DEKs
+
+**Cause:** `extenddb encryption-key rotate --yes` started on this catalog and stopped before it finished, so the ring holds the older DEK and the new one.
+
+**Fix:** Stop every server, then run `extenddb encryption-key rotate --config extenddb.toml` to preview, which takes the migration lock and lists the stored secrets still under the older DEK, then `rotate --yes`, which resumes the pass with the higher id as its target and writes the ring with that DEK alone.
+
+### The key ring changed while `rewrap` or `rotate` ran
+
+**Cause:** `rewrap` runs beside a server and outside the migration lock, so a `rotate` can write the ring between the read and the write of a `rewrap`, and a `rewrap` between the read and the first write of a `rotate`. Each of the two writes the ring only while the row still holds the ring it read. The message is "the key ring changed while `extenddb encryption-key <command>` ran, so nothing was written", and the run that printed it wrote nothing.
+
+**Fix:** Run the command again. A `rewrap` beside a `rotate` that is still running then refuses with the two-DEK refusal above until the `rotate` finishes. A `rotate` after a `rewrap` refuses with both KEK ids: set `key_file` to the file that the `rewrap` named, then run `rotate` again.
+
+The last ring write of `rotate` is conditional too, on the two-DEK ring of its first write. When another writer changed the ring after that write, `rotate` stops with "the key ring changed after `extenddb encryption-key rotate` wrote its two DEKs, so its last ring write did not happen" and names the DEK that the pass put the stored secrets under. Read the ring with `encryption-key status` before you run `rotate` again.
+
+### The rebuild of the database file failed after an encryption-key command
+
+**Cause:** On SQLite, `switch`, `rotate` and `reset` end with a rebuild of the catalog file (`VACUUM` under `secure_delete`), so no free page keeps a ciphertext the run replaced. The rebuild writes a new copy of the file, so it needs free disk space for that copy, and it ends with a checkpoint of the write-ahead log, which fails while another process has a transaction open on the database. The message is "`extenddb encryption-key <command>` wrote every row, and then the rebuild of the database file that erases the ciphertexts it replaced failed", followed by the database error. Every row of the run is written.
+
+**Fix:** Free disk space, or end every process that has the database file open (`fuser` or `lsof` on the file names them), then run the same command again with every server stopped. A `switch` or `reset` with nothing left to do rebuilds the file, and a `rotate` replaces the DEK again and then rebuilds the file.
+
+### The locked key store cannot be locked
+
+**Cause:** The server keeps the key that opens stored secrets and the cached signing keys in memory it locks out of swap and core dumps, sized by `[auth.cache] max_entries` (two 32-byte slots per entry, 640,000 bytes for the default, plus one buffer per runtime worker thread). The process's memlock limit is below that size: 64 KiB is the kernel default before Linux 5.16, and `mlock` of 1 MiB fails with `ENOMEM` under it. With `key_file` set the server refuses to start and names the memlock limit it needs; without `key_file` it logs a warning and starts with the keys in unlocked memory.
+
+**Fix:** Raise the limit: `LimitMEMLOCK=16M` in the systemd unit, `--ulimit memlock=` for a container, or a smaller `max_entries`. To start anyway with `key_file` set, `[auth.encryption] require_locked_memory = false` turns the refusal into a warning. The startup log line names the protection in force: `memfd_secret`, locked pages, or none. `serve` sets the key store up before it reads the catalog, so a refusal from the catalog (one of the entries above) can follow at the next start once the limit is raised.
+
+### A request fails with `InternalServerError` (HTTP 500) after a key change
+
+**Cause:** The stored secret of that access key opens under no key the server holds. `encryption-key status` lists such secrets by access key ID. A `switch --yes` or `rotate --yes` run with `--keep-unopenable` leaves them as they are; without the option the run stops before its first write and prints their access key IDs.
+
+**Fix:** Delete the access key and create a new one, or import the pair the client holds under its old ID with `import-access-key` (the Backup and Restore manual's [lost catalog](manuals/14-backup-and-restore.md#the-catalog-is-lost-and-re-created) section, step 2).
 
 ## Stop Errors
 
@@ -889,9 +993,9 @@ Keys imported earlier keep working while import is disabled.
 
 ### `Management API: encrypt session secret failed: <error>`
 
-**Cause:** AES-256-GCM encryption of the temporary session secret key failed. This could indicate a corrupted or invalid encryption key in the settings table.
+**Cause:** AES-256-GCM encryption of the temporary session secret key failed. The server checks the encryption key at startup and encrypts with the copy it loaded then, so the key in the `settings` table is not the cause.
 
-**Fix:** Verify the `encryption_key` value in the `settings` table is a valid base64-encoded 32-byte key. If corrupted, re-run `extenddb init` to regenerate.
+**Fix:** Open an issue with the error that follows the message in the server log.
 
 ### `Management API: store assume-role session failed: <error>`
 

@@ -16,6 +16,8 @@ use super::ledger::LedgerRow;
 use super::registry::MigrationId;
 use super::status::{CatalogStatus, MigrationError, RunReport};
 use super::table::{Kind, Migration, StoreKind};
+use crate::management_store::{ManagementStore, SettingsStore};
+use crate::server_components::KeySource;
 
 /// One migration of a backend's table, as `migrate --list` prints it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,8 +100,10 @@ impl std::fmt::Debug for HeldLock {
 
 /// The deployment a command works on, with the values the command's flags
 /// gave (parsed by the command, or resolved by `init`'s bootstrapper). A
-/// backend reads these fields and never the command line.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// backend reads these fields and never the command line. `Debug` prints
+/// neither connection string: `location` and `data_connection` can carry a
+/// password.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Target {
     /// The deployment's storage location as the config file gives it
     /// (`[storage.<backend>]`): on SQLite the database file, on PostgreSQL
@@ -115,6 +119,15 @@ pub struct Target {
     /// The data store's connection string, which `init` records with
     /// migration 1. Only `init` sets it.
     pub data_connection: Option<String>,
+    /// The key the command read (`[auth.encryption] key_file`, or the
+    /// catalog key). On PostgreSQL the backend opens the data connection
+    /// string row of a catalog with a key ring with it (RFC-0000 section 12).
+    /// Default [`KeySource::CatalogKey`]. Its `Debug` prints no key bytes.
+    pub key_source: KeySource,
+    /// `encryption-key switch` only: the backend accepts a plaintext
+    /// `data_database_connection_string` row while the ring's
+    /// `switch_from_catalog_key` is true. Every other caller leaves it false.
+    pub plaintext_data_connection: bool,
 }
 
 impl Target {
@@ -125,6 +138,22 @@ impl Target {
             location: location.into(),
             ..Self::default()
         }
+    }
+}
+
+impl std::fmt::Debug for Target {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Target")
+            .field("location", &"<connection string>")
+            .field("data_store", &self.data_store)
+            .field("admin", &self.admin)
+            .field(
+                "data_connection",
+                &self.data_connection.as_ref().map(|_| "<connection string>"),
+            )
+            .field("key_source", &self.key_source)
+            .field("plaintext_data_connection", &self.plaintext_data_connection)
+            .finish()
     }
 }
 
@@ -142,6 +171,16 @@ impl std::fmt::Debug for AdminRole {
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
             .finish()
     }
+}
+
+/// The catalog's stores under a held migration lock
+/// ([`CatalogMigrations::locked_stores`]), for `switch`, `rotate` and
+/// `reset` (RFC-0000 section 8, common rules).
+pub trait LockedStores: Send + Sync {
+    /// The rows of `access_keys` and `iam_sessions`.
+    fn management(&self) -> &dyn ManagementStore;
+    /// The settings rows.
+    fn settings(&self) -> &dyn SettingsStore;
 }
 
 /// A backend's catalog migrations, for the deployment a [`Target`] names.
@@ -202,6 +241,16 @@ pub trait CatalogMigrations: Send + Sync {
         self.status(target).await
     }
 
+    /// The catalog status for a command that runs beside a server and reads
+    /// and writes rows of the catalog store only (`encryption-key rewrap` and
+    /// `set-data-connection`). Takes no lock and writes nothing. The status
+    /// as [`CatalogMigrations::status`] reads it by default; PostgreSQL reads
+    /// the catalog database alone, so the data connection string row, which
+    /// a catalog with a key ring keeps encrypted, is not read.
+    async fn catalog_store_status(&self, target: &Target) -> Result<CatalogStatus, MigrationError> {
+        self.status(target).await
+    }
+
     /// The catalog store's ledger rows, in id order, for `verify` to print
     /// their notes. Read-only; empty for a store with no ledger.
     async fn catalog_ledger(&self, target: &Target) -> Result<Vec<LedgerRow>, MigrationError>;
@@ -229,6 +278,25 @@ pub trait CatalogMigrations: Send + Sync {
     /// need not wait for its TTL.
     async fn release(&self, lock: HeldLock) {
         drop(lock);
+    }
+
+    /// Open the catalog's stores under `lock`, holding no key, for the
+    /// encryption-key commands that run while every server is stopped
+    /// (RFC-0000 section 8, common rules). On Cassandra and MongoDB the
+    /// stores check the lease before each request, as the stores of a
+    /// migration do. `data_connection` is the PostgreSQL connection string
+    /// that `reset` read from standard input, which takes the place of the
+    /// row (section 8.6). The default refuses, so every backend compiles
+    /// until it overrides it.
+    async fn locked_stores(
+        &self,
+        lock: &HeldLock,
+        data_connection: Option<&str>,
+    ) -> Result<Box<dyn LockedStores>, MigrationError> {
+        let _ = (lock, data_connection);
+        Err(MigrationError::Refused(
+            "this storage backend does not open its stores under the migration lock".to_owned(),
+        ))
     }
 
     /// Notes about the deployment that its status does not show, for the
@@ -469,11 +537,15 @@ mod tests {
                 user: "admin".to_owned(),
                 password: Some("s3cret".to_owned()),
             }),
-            ..Target::at("db")
+            data_connection: Some("postgres://app:d4ta@db/data".to_owned()),
+            ..Target::at("postgres://admin:c4talog@db/catalog")
         };
         let shown = format!("{target:?}");
         assert!(shown.contains("admin"), "{shown}");
-        assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(shown.contains("data_connection: Some("), "{shown}");
+        for secret in ["s3cret", "c4talog", "d4ta", "postgres://"] {
+            assert!(!shown.contains(secret), "{shown}");
+        }
     }
 
     #[test]
