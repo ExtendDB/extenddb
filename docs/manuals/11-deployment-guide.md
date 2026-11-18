@@ -146,7 +146,7 @@ There is no readiness endpoint, so do not expect a Kubernetes `readinessProbe`
 on `/health` to remove a replica from service when its database becomes
 unreachable. Treat backend failures as something clients retry through.
 
-For Kubernetes, run `extenddb init` as an init container or a one-time Job, then deploy ExtendDB as a Deployment with the generated `extenddb.toml` mounted as a ConfigMap or Secret.
+For Kubernetes, run `extenddb init` as an init container or a one-time Job, then deploy ExtendDB as a Deployment with the generated `extenddb.toml` mounted as a ConfigMap or Secret. A deployment that keeps its stored secrets under a key-encryption key (KEK) file (the admin guide's [Encryption Key](05-admin-guide.md#encryption-key) section) mounts the KEK as a Secret volume with `defaultMode: 0400`, runs the pod with `securityContext: {runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001}`, and points `EXTENDDB__AUTH__ENCRYPTION__KEY_FILE` at the mounted file. kubelet gives the file to root with group 10001 at mode 0440, which the server accepts only when its effective group is 10001. The server cannot see who belongs to that group, and every member can read the file, so give group 10001 no other members. Without `fsGroup` the file belongs to group root and uid 10001 cannot open it. Secrets are unencrypted in etcd unless the cluster enables encryption at rest. The `extenddb encryption-key` commands that need every server stopped run as a Job that mounts the same Secret while the Deployment has 0 replicas.
 
 ### Air-Gapped
 
@@ -155,6 +155,7 @@ ExtendDB requires no internet connectivity. All functionality is self-contained 
 Requirements in the air-gapped environment:
 - A supported storage backend, reachable from the ExtendDB host
 - The `extenddb` binary (statically linked or with matching libc)
+- The KEK file, when the deployment encrypts its stored secrets under one (`[auth.encryption] key_file`), delivered by one of the routes in the admin guide's [Encryption Key](05-admin-guide.md#encryption-key) section, with a copy kept away from the host; no key source depends on a network key service
 
 ## Configuring PostgreSQL
 
@@ -214,6 +215,7 @@ extenddb init \
 - [ ] Change the admin password from the auto-generated one
 - [ ] Create named accounts and IAM users with least-privilege policies
 - [ ] Leave credential import off unless you need it. The server refuses imports unless `allow_credential_import` is `true`. If you enabled it to import keys, turn it off again: `extenddb settings set allow_credential_import false`
+- [ ] Encrypt stored secrets under a KEK file: `extenddb encryption-key switch --key-file <path> --yes` with every server stopped, then set `[auth.encryption] key_file`, and keep a copy of the KEK away from the host (the admin guide's [Encryption Key](05-admin-guide.md#encryption-key) section)
 
 ### Transport
 
@@ -271,6 +273,11 @@ User=extenddb
 Group=extenddb
 Restart=on-failure
 RestartSec=5
+# The locked key store that holds the encryption key and the cached signing
+# keys needs about 640 KiB for the default [auth.cache] max_entries. Kernels
+# before 5.16 default the memlock limit to 64 KiB (the admin guide's Memory
+# locking section).
+LimitMEMLOCK=16M
 # On a host that backs up tables of large items, one malloc arena keeps a
 # backup job's high-water mark at the pipeline's terms whatever the number of
 # large items it reads (the admin guide's [backup] max_concurrent_jobs row
@@ -290,6 +297,21 @@ WantedBy=multi-user.target
 sudo systemctl enable extenddb
 sudo systemctl start extenddb
 ```
+
+To keep the stored secrets under a key-encryption key (KEK) file instead of the catalog key (the admin guide's [Encryption Key](05-admin-guide.md#encryption-key) section), on a host with systemd 250 or later and a TPM 2.0 chip, seal the KEK to the TPM and let systemd decrypt it at each start of the unit. Keep a copy of the KEK away from the host first: the sealed file opens only with that TPM and is lost with the host.
+
+```bash
+systemd-creds encrypt --with-key=tpm2 --name=extenddb-kek kek /etc/credstore.encrypted/extenddb-kek
+```
+
+Then add two lines to the `[Service]` section above:
+
+```ini
+LoadCredentialEncrypted=extenddb-kek:/etc/credstore.encrypted/extenddb-kek
+Environment=EXTENDDB__AUTH__ENCRYPTION__KEY_FILE=%d/extenddb-kek
+```
+
+Run `extenddb encryption-key switch --key-file <path> --yes` with the unit stopped, through the admin guide's [`systemd-run` example](05-admin-guide.md#delivering-the-kek-file), which runs it as `extenddb` with the credential and gives the path under `/run/credentials/extenddb-keys.service/`, and then start the unit. The plaintext `kek` written under `umask 077` is root's at mode 0600, so the server's user cannot open it, and `/run/credentials/extenddb.service/` does not exist while the unit is stopped. systemd decrypts the credential into `/run/credentials/extenddb.service/` and unmounts that directory when the unit stops. On a ramfs the `extenddb` user owns the file at mode 0400; systemd 254 or later on Linux 6.4 or later uses a tmpfs, where root owns the file and an ACL entry lets the user read it. The server accepts both. With `LimitMEMLOCK=` in the unit the locked key store fits on every kernel; without `key_file` a server that cannot lock its memory warns and starts, with it the server refuses unless `require_locked_memory = false` is set.
 
 With this unit only the `extenddb` user and root can read export files: the server creates them with mode 0600, and the import and export roots and account directories it creates with mode 0700, which the daemon's umask (027) can only narrow; before v0.1.15 that umask gave the `extenddb` group read access (see [the v0.1.15 entry](07-upgrade-manual.md#v0115-export-files-are-created-0600-and-the-import-and-export-directories-the-server-creates-0700) of the upgrade manual). To give a group access to a root, for example to put import files into it, create the root before the first start with that group and the mode you want, since an existing directory keeps its mode; export files in it are still created 0600. Import files go under `<root>/<account id>`. When one directory is both an import and an export root (the deprecated `import_export_root`, or the same path under `[import]` and `[export]`), the first export of an account creates that directory 0700, so also create each `<root>/<account id>` beforehand with the group and mode you want, or use separate import and export roots. Keep each parent directory of a root writable by its owner only (root or `extenddb`): the server logs a warning at startup for a parent directory that group or others can write to without the sticky bit, since a user who can write to it could replace the root.
 

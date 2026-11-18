@@ -87,8 +87,127 @@ pub(crate) const CATALOG_EXPECTED: &str =
 pub(crate) const ACCOUNT_EXPECTED: &str =
     include_str!("../../migrations/account/0001_baseline.expected.json");
 
-/// Checksums of the released bodies (none until v1.0).
-pub(crate) const RELEASED: &[Released] = &[];
+/// Checksums of the released bodies, every migration at or below
+/// `RELEASED_THROUGH`.
+pub(crate) const RELEASED: &[Released] = &[
+    Released {
+        id: MigrationId::Baseline,
+        store: StoreKind::Catalog,
+        checksum: "69e43d5b7ca2ad3c9a357eda54d2c9cd7b7b27edc461dd37e4c6e1a7f6a3f483",
+        fingerprint: None,
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::Baseline,
+        store: StoreKind::Account,
+        checksum: "7120e35ef62f8d66cb0e35a00f606411a83cbe5f733271169ca9740814f7b991",
+        fingerprint: None,
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::ResourceTagConditionKeys,
+        store: StoreKind::Catalog,
+        checksum: "80c502c54ef9240ab5f64b24b060261a295e41d29954d9b492b83c64c444170e",
+        fingerprint: Some("0002_resource_tag_condition_keys/1"),
+        kind: Kind::Breaking,
+        convergent: false,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::SortKeyDefinitions,
+        store: StoreKind::Catalog,
+        checksum: "de1643152979168a2a4f806c19c99751f78b1cf21bf8e513396f8d44e1610c93",
+        fingerprint: None,
+        kind: Kind::Additive,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::IndexTableBaseKey,
+        store: StoreKind::Catalog,
+        checksum: "b746760f188138e35490c08ce40a9545dc889461419f55a8572502e7225bed66",
+        fingerprint: None,
+        kind: Kind::Additive,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::DropContinuousBackups,
+        store: StoreKind::Catalog,
+        checksum: "44a5e8e1978724b5f3a309d3a437688a0034ce95d5855b8e2d3deb69c603873b",
+        fingerprint: None,
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::BackupCatalogIndex,
+        store: StoreKind::Catalog,
+        checksum: "45352bad164748f9ddb072031cd35488c11f9f2d428f3e20b623ddda64a99330",
+        fingerprint: Some("0006_backup_catalog_index/cassandra/1"),
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::StreamPending,
+        store: StoreKind::Catalog,
+        checksum: "9d8b3fa7e8cb186bb92ef8e595f2a1d2847881dc6a21e3a4204ad0aac5ec667a",
+        fingerprint: None,
+        kind: Kind::Additive,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::RestoreProgress,
+        store: StoreKind::Catalog,
+        checksum: "ca346592755f9f3f172fc78aea2c5a8e901a31b16bca28eb375a36e3687e961a",
+        fingerprint: None,
+        kind: Kind::Additive,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::WarmThroughput,
+        store: StoreKind::Catalog,
+        checksum: "d5f50b607d377a316d07d8e962b67c08a821aa19f4bdf7eea7dd5e3e5630d6ac",
+        fingerprint: None,
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::AccountMetrics,
+        store: StoreKind::Catalog,
+        checksum: "5c868bb49143fcb9180e16a7584f09ba11ca1594ed8a45492b0a5866d7e3ee7b",
+        fingerprint: None,
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::AttributeNameEscape,
+        store: StoreKind::Catalog,
+        checksum: "764e80eb7f995c15d6a8fb1feb5611befaaa2fc5df9024ecc52cb64b39383871",
+        fingerprint: None,
+        kind: Kind::Additive,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::UniqueAccessKeyIds,
+        store: StoreKind::Catalog,
+        checksum: "17e0af138cf802384f025408af64bfc3349588bbdbc7b688e2c59f7aa2c5e0ff",
+        fingerprint: None,
+        kind: Kind::Additive,
+        convergent: true,
+        rebless: None,
+    },
+];
 
 /// This backend's entry for every id. Public so `migrate --list` can print
 /// each migration's kind without connecting.
@@ -391,7 +510,7 @@ pub async fn wait_for_schema_agreement(session: &CassandraSession) -> Result<(),
 }
 
 /// Run migration 1's body for stores of `kind` in `keyspace` and record
-/// nothing, as a release before 1.0 left a catalog with these tables and no
+/// nothing, as a release before 0.1.15 left a catalog with these tables and no
 /// ledger: for the tests of adoption.
 ///
 /// # Errors
@@ -630,7 +749,7 @@ pub async fn foreign_contents(
 }
 
 /// The (table, column) pairs migration 1 adds to the catalog keyspace with
-/// `ALTER TABLE ... ADD IF NOT EXISTS`: a table an `init` or a 0.1.x release
+/// `ALTER TABLE ... ADD IF NOT EXISTS`: a table an `init` or a release up to 0.1.14
 /// created before such a statement lacks them, and migration 1 adds them.
 fn baseline_added_columns() -> std::collections::BTreeSet<(&'static str, &'static str)> {
     CATALOG_BASELINE

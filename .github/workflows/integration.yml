@@ -221,11 +221,11 @@ jobs:
           devtools/check-postgres-catalog-lock ./target/release/extenddb
           postgresql://postgres:devpass@127.0.0.1:5432 18452
 
-      # The last 0.1.x image's verify, migrate --yes and serve against
+      # The 0.1.14 image's verify, migrate --yes and serve against
       # catalogs this binary created and migrated: what each writes, and that
       # this binary then reports WrittenByOlderRelease and --reconverge
       # restores Current.
-      - name: Check the last 0.1.x release against migrated catalogs
+      - name: Check the 0.1.14 release against migrated catalogs
         run: |
           docker pull extenddb/extenddb-postgres:0.1.14
           devtools/check-postgres-older-binary ./target/release/extenddb \
@@ -322,10 +322,10 @@ jobs:
       - name: Check serve and migrate on one catalog
         run: devtools/check-sqlite-catalog-lock ./target/release/extenddb 18450
 
-      # The last 0.1.x dev image's serve and migrate --yes against catalogs
+      # The 0.1.14 dev image's serve and migrate --yes against catalogs
       # this binary migrated: what each writes, and that this binary then
       # reports WrittenByOlderRelease and --reconverge restores Current.
-      - name: Check the last 0.1.x release against migrated catalogs
+      - name: Check the 0.1.14 release against migrated catalogs
         run: |
           docker pull extenddb/extenddb-dev:0.1.14
           devtools/check-sqlite-older-binary ./target/release/extenddb \

@@ -339,7 +339,7 @@ pub async fn run(args: InitArgs, release: &str) -> anyhow::Result<u8> {
 /// backend reads no flag itself. `say` prints this function's own lines:
 /// the one before the migrations, their notes, and the one that says a
 /// stopped `init` is being finished, before its rows.
-async fn init_on_runner(
+pub(crate) async fn init_on_runner(
     bootstrapper: &dyn extenddb_storage::bootstrapper::Bootstrapper,
     migrations: &dyn extenddb_storage::migrations::CatalogMigrations,
     release: &str,
