@@ -458,12 +458,6 @@ pub fn serves_tls(tls: &TlsConfig) -> bool {
     tls.enabled && !cfg!(feature = "dev-mode")
 }
 
-/// The environment-variable source every load path adds on top of the file:
-/// `EXTENDDB__<SECTION>__<KEY>`, one value per variable, arriving as a string.
-fn environment_source() -> config::Environment {
-    config::Environment::with_prefix("EXTENDDB").separator("__")
-}
-
 /// Load `AppConfig` from a config file (optional) and environment variables.
 ///
 /// # Errors

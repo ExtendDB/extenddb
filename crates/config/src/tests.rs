@@ -52,7 +52,7 @@ fn config_from(file: &str, vars: &[(&str, &str)]) -> config::Config {
     }
     config::Config::builder()
         .add_source(config::File::from_str(file, config::FileFormat::Toml))
-        .add_source(environment_source().source(Some(env)))
+        .add_source(environment(Some(env)))
         .build()
         .expect("sources build")
 }
