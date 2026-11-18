@@ -384,7 +384,8 @@ pub fn validate_update_paths_disjoint(
             | UpdateAction::Delete { path, .. } => path.clone(),
         })
         .collect();
-    super::projection::resolve_paths(&paths, maps, Some(super::ExpressionKind::Update)).map(|_| ())
+    super::projection::resolve_paths(&paths, maps, Some(super::ExpressionKind::Update), false)
+        .map(|_| ())
 }
 
 fn collect_expr_refs(

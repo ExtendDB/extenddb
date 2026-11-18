@@ -352,13 +352,14 @@ pub fn resolve_condition(
     Ok((condition, maps))
 }
 
-/// Tokenize, reserved-word check, and parse a `ProjectionExpression`.
+/// Tokenize and parse a `ProjectionExpression`. The reserved word check runs
+/// in `Projection::compile`.
 ///
 /// Errors carry the `ProjectionExpression` prefix, matching Amazon `DynamoDB`.
 ///
 /// # Errors
 ///
-/// Returns `DynamoDbError::ValidationException` for syntax or reserved-word errors.
+/// Returns `DynamoDbError::ValidationException` for over-size or syntax errors.
 pub fn parse_projection_expr(
     proj_str: &str,
     limits: &LimitsConfig,
@@ -369,12 +370,7 @@ pub fn parse_projection_expr(
         limits.max_expression_tokens,
         ExpressionKind::Projection,
     )
-    .and_then(|tokens| {
-        if limits.enforce_reserved_keywords {
-            validate_no_reserved_words(&tokens)?;
-        }
-        parse_projection(&tokens)
-    });
+    .and_then(|tokens| parse_projection(&tokens));
     result.map_err(|e| prefix_expression_error(e, ExpressionKind::Projection))
 }
 
@@ -438,6 +434,10 @@ pub fn prefix_expression_error(err: DynamoDbError, kind: ExpressionKind) -> Dyna
         other => other,
     }
 }
+
+#[cfg(test)]
+#[path = "expression_helpers_projection_tests.rs"]
+mod projection_tests;
 
 #[cfg(test)]
 mod tests {

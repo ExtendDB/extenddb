@@ -59,7 +59,12 @@ pub async fn handle_transact_get_items(
             let maps = build_expression_maps(tgi.get.expression_attribute_names.as_ref(), None);
             let projection =
                 crate::expression_helpers::parse_projection_expr(proj_str, &ctx.limits)?;
-            let compiled = Projection::compile(&projection, &maps, true)?;
+            let compiled = Projection::compile(
+                &projection,
+                &maps,
+                true,
+                ctx.limits.enforce_reserved_keywords,
+            )?;
             let mut extra_names = HashSet::new();
             for path in &projection {
                 for el in path {

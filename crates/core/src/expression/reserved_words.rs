@@ -24,12 +24,22 @@ pub fn validate_no_reserved_words(tokens: &[Token]) -> Result<(), DynamoDbError>
             if matches!(tokens.get(i + 1), Some(Token::LParen)) {
                 continue;
             }
-            if is_reserved(word) {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "Invalid expression: Attribute name is a reserved keyword; reserved keyword: {word}"
-                )));
-            }
+            validate_not_reserved(word, "expression")?;
         }
+    }
+    Ok(())
+}
+
+/// Refuse `word`, a name written bare in an expression labelled `kind`, when
+/// it is a reserved word.
+pub(crate) fn validate_not_reserved(
+    word: &str,
+    kind: impl std::fmt::Display,
+) -> Result<(), DynamoDbError> {
+    if is_reserved(word) {
+        return Err(DynamoDbError::ValidationException(format!(
+            "Invalid {kind}: Attribute name is a reserved keyword; reserved keyword: {word}"
+        )));
     }
     Ok(())
 }
