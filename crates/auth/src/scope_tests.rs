@@ -351,21 +351,13 @@ async fn scope_wrong_in_more_than_one_part_reports_each_complaint() {
 /// A provider whose store holds a temporary key whose session ends at
 /// `expires_at`, read through the credential cache. The cache refuses an
 /// expired session with the error the storage layer returns.
-fn provider_with_a_session_expiring_at(
-    expires_at: time::OffsetDateTime,
-) -> BuiltinAuthProvider<CachedCredentialStore> {
+fn provider_with_a_session_expiring_at(expires_at: time::OffsetDateTime) -> BuiltinAuthProvider {
     let mut session = credential(true);
     session.expires_at = Some(expires_at);
-    BuiltinAuthProvider::new(
-        CachedCredentialStore::new(
-            MockCredentialStore {
-                credential: Some(session),
-                error: None,
-            },
-            extenddb_cache::SwrCacheConfig::default(),
-        ),
-        "us-east-1",
-    )
+    provider_over(MockCredentialStore {
+        credential: Some(session),
+        error: None,
+    })
 }
 
 /// Measured 2026-11-10 on signed ListTables requests with temporary
