@@ -289,7 +289,7 @@ On PostgreSQL, Cassandra and MongoDB, and on SQLite with a server older than 0.1
 - Docker Compose: no change. The `extenddb-bootstrap` service runs `migrate --yes` before the server starts.
 - Kubernetes: one replica, the Deployment strategy `Recreate`, and a migration Job applied in the same release as the new Deployment, as below.
 
-On Kubernetes the migration Job uses the serving Secret. It runs the preview first, which takes no lock, and `migrate --yes` only when the preview exits 3. Its container runs this as its `command`, with `CONFIG` set to the path of the config file:
+On Kubernetes the migration Job uses the serving Secret. On PostgreSQL with `[auth.encryption] key_file` set, the Job also mounts the KEK Secret and sets `EXTENDDB__AUTH__ENCRYPTION__KEY_FILE` and the `securityContext` as the Deployment does ([Containerized](11-deployment-guide.md#containerized)). `migrate` opens the catalog's `data_database_connection_string` row with that KEK. It runs the preview first, which takes no lock, and `migrate --yes` only when the preview exits 3. Its container runs this as its `command`, with `CONFIG` set to the path of the config file:
 
 ```sh
 sh -c 'extenddb migrate --config "$CONFIG"; rc=$?; [ "$rc" -eq 3 ] || exit "$rc"; exec extenddb migrate --config "$CONFIG" --yes'
