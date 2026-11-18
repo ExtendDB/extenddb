@@ -28,7 +28,10 @@ the `sha2` and `hmac` crates and compared signatures with a hand-written loop.
 
 AWS-LC is already in every ExtendDB binary. ExtendDB installs the
 `rustls::crypto::aws_lc_rs` provider for its TLS server and clients, and sqlx
-connects to PostgreSQL with `tls-rustls-aws-lc-rs`.
+connects to PostgreSQL with `tls-rustls-aws-lc-rs`. The MongoDB driver does not
+use the installed provider. With its default `rustls-tls` feature it builds its
+TLS client configuration on `rustls::crypto::ring`, so the MongoDB backend
+connects to MongoDB through ring.
 
 ## Options Considered
 
@@ -39,9 +42,10 @@ connects to PostgreSQL with `tls-rustls-aws-lc-rs`.
    encryption, and the SigV4 SHA-256, HMAC-SHA256 and signature compare, all
    from AWS-LC, the library the TLS provider already uses.
 3. **Move the credential path onto ring.** ring has the same primitives and is
-   in `Cargo.lock`, but of the backend builds only the MongoDB one links it.
-   ExtendDB does not use ring as its TLS provider, and ring has no Federal
-   Information Processing Standards (FIPS) module.
+   in `Cargo.lock`, but of the backend builds only the MongoDB one links it,
+   for the MongoDB driver's TLS connections. The ExtendDB TLS server and its
+   other TLS clients do not use ring, and ring has no Federal Information
+   Processing Standards (FIPS) module.
 
 ## Decision
 
@@ -72,7 +76,10 @@ HMAC-SHA256 and signature compare use aws-lc-rs (Option 2).
 
 - The stored format does not change: `nonce(12) || ciphertext || tag(16)`, with
   the access key id as AAD. Unit tests decrypt a secret from the 0.1.14
-  release fixture and a secret written by the `aes-gcm` code.
+  release fixture and a secret written by the `aes-gcm` code. RFC-0000 (#707)
+  keeps the format and, for a secret under a data encryption key, makes the AAD
+  bind the row: catalog id, table, access key id, account, principal, session
+  name and expiry.
 - A secret written without AAD no longer decrypts, and an empty AAD is
   refused. No release wrote such a secret.
 - `sha2` stays for principal ids in `crates/auth/src/policy/principal_id.rs`,
@@ -82,8 +89,12 @@ HMAC-SHA256 and signature compare use aws-lc-rs (Option 2).
   so the toolchain requirement is unchanged. A build of `extenddb-storage`,
   `extenddb-auth`, or the Cassandra or MongoDB backend crate on its own now
   compiles `aws-lc-sys` as well.
-- The encryption key is still stored in the catalog. Moving it out of the
-  catalog and adding rotation needs an RFC.
+- The encryption key is stored in the catalog by default. RFC-0000 (#707) adds
+  `[auth.encryption] key_file`: a key-encryption key in a file on the server
+  host wraps the data encryption key, the catalog holds only the wrapped key,
+  and `extenddb encryption-key` switches a deployment to the file, rewraps the
+  key under a new file and replaces the data encryption key. Its wrap, unwrap
+  and key id (HMAC-SHA256) use aws-lc-rs as well.
 
 ---
 

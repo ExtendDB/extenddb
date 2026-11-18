@@ -522,14 +522,17 @@ async fn test_committing_recovery_repairs_the_index_rows_of_a_row_it_commits() {
     let fence = format!(
         "UPDATE {keyspace}.{data_table} SET prepared_txn_id = ?, prepared_txn_timestamp = ? WHERE pk = ? IF prepared_txn_id = null"
     );
-    extenddb_storage_cassandra::cassandra_util::execute::<StorageError>(
-        &engine.session_arc(),
-        &fence,
-        cdrs_tokio::query_values!(txn_id, 1_i64, "own"),
-        "prepare by hand",
-    )
-    .await
-    .unwrap();
+    assert!(
+        extenddb_storage_cassandra::cassandra_util::apply_lwt::<StorageError>(
+            &engine.session_arc(),
+            &fence,
+            cdrs_tokio::query_values!(txn_id, 1_i64, "own"),
+            "prepare by hand",
+        )
+        .await
+        .unwrap(),
+        "the fence applied"
+    );
     engine
         .write_ledger_entry(
             &keyspace,

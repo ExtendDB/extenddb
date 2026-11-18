@@ -15,9 +15,10 @@
 //! DELETED goes through these steps in this order, and every refusal
 //! before the first put reads nothing more and writes nothing:
 //!
-//! 1. The id: one with the 13-digit shape every 0.1.x release issued (with
-//!    or without a suffix) is refused, since a store prefix carries only
-//!    the 14-digit shape, whose id carries its creation instant. The way
+//! 1. The id: one with the 13-digit shape that 0.1.14 and earlier releases
+//!    issued (with or without a suffix) is refused, since a store prefix
+//!    carries only the 14-digit shape, whose id carries its creation
+//!    instant. The way
 //!    out is a restore of the backup and a new backup of the restored
 //!    table, which has a new ARN.
 //! 2. The table name: one the store-prefix rules refuse (`BackupArn`: over
@@ -821,8 +822,8 @@ async fn migrate_one<S: BackupCatalog + LegacyBackupReader + ?Sized>(
     };
     let Some(created_at) = backup_creation_date_time(parts.backup_id) else {
         return Step::Done(Outcome::Refused(format!(
-            "its backup id {} has the 13-digit shape a 0.1.x release issued, and a store prefix \
-             carries only the 14-digit shape; {CARRY_FORWARD}",
+            "its backup id {} has the 13-digit shape that 0.1.14 and earlier releases issued, and \
+             a store prefix carries only the 14-digit shape; {CARRY_FORWARD}",
             parts.backup_id
         )));
     };
@@ -1668,8 +1669,8 @@ async fn delete_leftover(
 /// prefix is known clean and the record is not listed again. Each deletion
 /// and the removal run after the claim's re-check. "deleted" either way,
 /// with a note for what was deleted or removed. A backup whose id has the
-/// 13-digit shape a 0.1.x release issued, or whose table name forms no
-/// prefix, never had a copy, and is left as it is.
+/// 13-digit shape that 0.1.14 and earlier releases issued, or whose table
+/// name forms no prefix, never had a copy, and is left as it is.
 async fn clean_deleted<S: BackupCatalog + LegacyBackupReader + ?Sized>(
     storage: &S,
     run: &Run<'_, '_>,
