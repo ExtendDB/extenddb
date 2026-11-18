@@ -17,6 +17,7 @@ use extenddb_storage::migrations::advice::{self, AdviceFor};
 use extenddb_storage::migrations::{
     CatalogMigrations, Startup, Target, exit, installed, prepare_to_serve,
 };
+use extenddb_storage::server_components::KeySource;
 
 /// The start of every line `serve` prints on stderr while it checks and
 /// migrates the catalog. The npm launcher's startup timeout restarts at
@@ -43,6 +44,11 @@ pub(crate) struct ServeStart<'a> {
     pub(crate) config_file: Option<&'a str>,
     /// Whether the server forks once the check has passed (daemon mode).
     pub(crate) daemonizes: bool,
+    /// The key the check puts on its target ([`Target::key_source`]): on
+    /// PostgreSQL with `[auth.encryption] key_file` set, the KEK, which
+    /// opens the data connection string row of a catalog with a key ring;
+    /// else the catalog key.
+    pub(crate) key_source: KeySource,
 }
 
 /// `[server] catalog_upgrade_lock_timeout`, refused above a day.
@@ -99,7 +105,10 @@ fn check(
     } else {
         start.server.catalog_upgrade
     };
-    let target = Target::at(start.location);
+    let target = Target {
+        key_source: start.key_source.clone(),
+        ..Target::at(start.location)
+    };
     let startup = Startup {
         apply: upgrade == CatalogUpgrade::Apply,
         // A dev build's server creates its catalog in a missing or empty

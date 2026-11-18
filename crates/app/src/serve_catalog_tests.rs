@@ -16,11 +16,21 @@ use extenddb_storage::migrations::{
     AppliedStep, CatalogMigrations, CatalogStatus, HeldLock, Kind, LedgerRow, Listed,
     MigrationError, MigrationId, Pending, RunKind, RunReport, StoreKind, Target, exit,
 };
+use extenddb_storage::server_components::KeySource;
 
 use super::{PROGRESS_PREFIX, ServeStart, check, lock_timeout};
 
 /// The cap the tests give the check's runtime to stop.
 const CAP: Duration = Duration::from_secs(10);
+
+/// `plain`, or `with_kek` when `target` carries a KEK.
+fn keyed(target: &Target, plain: &'static str, with_kek: &'static str) -> &'static str {
+    if matches!(target.key_source, KeySource::Kek(_)) {
+        with_kek
+    } else {
+        plain
+    }
+}
 
 struct Fake {
     /// What the next status reads return, the last one repeated.
@@ -61,8 +71,8 @@ impl CatalogMigrations for Fake {
     fn backup_advice(&self, target: &Target) -> String {
         format!("back up {}", target.location)
     }
-    async fn status(&self, _target: &Target) -> Result<CatalogStatus, MigrationError> {
-        self.call("status");
+    async fn status(&self, target: &Target) -> Result<CatalogStatus, MigrationError> {
+        self.call(keyed(target, "status", "status with the KEK"));
         let mut statuses = self.statuses.lock().unwrap();
         let status = statuses.front().cloned().expect("a status");
         if statuses.len() > 1 {
@@ -74,7 +84,7 @@ impl CatalogMigrations for Fake {
         Ok(Vec::new())
     }
     async fn lock(&self, target: &Target, _: Duration) -> Result<HeldLock, MigrationError> {
-        self.call("lock");
+        self.call(keyed(target, "lock", "lock with the KEK"));
         self.lock
             .clone()
             .map(|()| HeldLock::new(target.location.as_str(), ()))
@@ -155,6 +165,7 @@ fn start(server: &ServerConfig, migrate: bool, daemonizes: bool) -> ServeStart<'
         release: "1.0.0-test",
         config_file: Some("/etc/extenddb/extenddb.toml"),
         daemonizes,
+        key_source: KeySource::CatalogKey,
     }
 }
 
@@ -205,6 +216,29 @@ fn migrate_applies_a_catalog_behind_for_one_run() {
     let (code, lines) = run_check(&fake, &start(&apply, false, false), CAP);
     assert_eq!(code, exit::OK, "{lines:?}");
     assert!(fake.calls().contains(&"run"), "{:?}", fake.calls());
+}
+
+/// The status reads and the lock get the key `serve` gave the check: on
+/// PostgreSQL the KEK opens the data connection string row of a catalog
+/// with a key ring, which the status read and the run reach.
+#[test]
+fn the_check_reads_and_migrates_with_the_key_it_was_given() {
+    let apply = server(CatalogUpgrade::Apply);
+    let mut keyed_start = start(&apply, false, false);
+    keyed_start.key_source = KeySource::Kek(zeroize::Zeroizing::new([7; 32]).into());
+    let fake = Fake::new(vec![Ok(behind())]);
+    let (code, lines) = run_check(&fake, &keyed_start, CAP);
+    assert_eq!(code, exit::OK, "{lines:?}");
+    assert_eq!(
+        fake.calls(),
+        [
+            "status with the KEK",
+            "lock with the KEK",
+            "status with the KEK",
+            "run",
+            "release"
+        ]
+    );
 }
 
 /// Every line a run prints starts with the prefix, the lines of a note that
