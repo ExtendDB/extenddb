@@ -9,8 +9,9 @@ disjuncts, whatever its Limit: the first page in read order (key order, or
 the order an ORDER BY gives), later pages in the order that
 tests/test_partiql_visit_order.py describes. Within that cap the rules of a
 page hold: a disjunct
-that names one item takes one unit of Limit whether the item exists or not,
-any other disjunct is a Query with the units left. A page has a
+that names one item takes one unit of Limit when the item exists, also when
+the filter drops it, and none when it does not, so the page goes on to the
+next disjunct; any other disjunct is a Query with the units left. A page has a
 LastEvaluatedKey only when it returned Limit items, so a page the cap ends
 with fewer has none. There is no NextToken after the page that reads the
 last disjunct, and the capacity a page reports is that of its reads.
@@ -30,7 +31,7 @@ by where the partition sits in its storage, so the tests assert neither.
 Dual-target: EXTENDDB_TEST_ENDPOINT selects an extenddb server; unset, the
 tests run against the live service with the default credential chain. The
 assertions are identical on both. Every expected value was measured on the
-service (2026-11-03).
+service (2026-11-03; the keys with no item 2026-11-14 and 2026-11-18).
 """
 
 from __future__ import annotations
@@ -104,6 +105,21 @@ def c3table(dynamodb_client):
                 dynamodb_client.put_item(
                     TableName=name, Item={"pk": {"S": f"v{i:03}"}, "sk": {"S": f"s{j}"}}
                 )
+        yield name
+
+
+@pytest.fixture(scope="module")
+def rows(dynamodb_client):
+    """A table keyed on string pk and sk holding row-1 to row-4 in partition
+    or-page-missing, and row-1 and row-2, with v = 1 on row-2, in partition
+    or-page-filter."""
+    with _keyed_table(dynamodb_client) as name:
+        items = [("or-page-missing", f"row-{i}", {}) for i in range(1, 5)]
+        items += [("or-page-filter", "row-1", {}), ("or-page-filter", "row-2", {"v": {"N": "1"}})]
+        for pk, sk, more in items:
+            dynamodb_client.put_item(
+                TableName=name, Item={"pk": {"S": pk}, "sk": {"S": sk}, **more}
+            )
         yield name
 
 
@@ -349,6 +365,90 @@ def test_a_page_reads_10_partitions_of_several_items(dynamodb_client, c3table, l
 def test_sort_key_values_of_one_partition_take_a_place_each(dynamodb_client, c3table):
     statement = f"SELECT * FROM \"{c3table}\" WHERE pk = 'v000' AND sk IN [{_values(11, 's')}]"
     assert _sizes(dynamodb_client, statement) == [0, 0]
+
+
+# ---- a key with no item under Limit ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("partition", "condition", "limit", "pages"),
+    [
+        ("or-page-missing", "(sk = 'row-0' OR sk = 'row-2')", 1, [(["row-2"], False, 1.0)]),
+        (
+            "or-page-missing",
+            "(sk = 'row-1' OR sk = 'row-9') ORDER BY sk DESC",
+            1,
+            [(["row-1"], False, 1.0)],
+        ),
+        (
+            "or-page-missing",
+            "(sk = 'row-1' OR sk = 'row-15' OR sk = 'row-2')",
+            1,
+            [(["row-1"], True, 0.5), (["row-2"], False, 1.0)],
+        ),
+        (
+            "or-page-missing",
+            "(sk = 'row-1' OR sk = 'row-15' OR sk = 'row-2') ORDER BY sk DESC",
+            1,
+            [(["row-2"], True, 0.5), (["row-1"], False, 1.0)],
+        ),
+        (
+            "or-page-missing",
+            "(sk = 'row-1' OR sk = 'row-9')",
+            1,
+            [(["row-1"], True, 0.5), ([], False, 0.5)],
+        ),
+        (
+            "or-page-missing",
+            "(sk = 'row-0' OR sk = 'row-2') ORDER BY sk DESC",
+            1,
+            [(["row-2"], True, 0.5), ([], False, 0.5)],
+        ),
+        ("or-page-missing", "(sk = 'row-0' OR sk = 'row-9')", 1, [([], False, 1.0)]),
+        (
+            "or-page-missing",
+            "(sk = 'row-0' OR sk = 'row-05' OR sk = 'row-1')",
+            1,
+            [(["row-1"], False, 1.5)],
+        ),
+        (
+            "or-page-missing",
+            "(sk = 'row-1' OR sk = 'row-15' OR sk = 'row-2' OR sk = 'row-3')",
+            2,
+            [(["row-1", "row-2"], True, 1.5), (["row-3"], False, 0.5)],
+        ),
+        (
+            "or-page-filter",
+            "(sk = 'row-1' OR sk = 'row-2') AND v = 1",
+            1,
+            [([], True, 0.5), (["row-2"], False, 0.5)],
+        ),
+    ],
+    ids=[
+        "missing-first",
+        "missing-first-descending",
+        "missing-between",
+        "missing-between-descending",
+        "missing-last",
+        "missing-last-descending",
+        "none-found",
+        "two-missing-first",
+        "limit-2",
+        "filter-drops-first",
+    ],
+)
+def test_only_a_key_that_has_an_item_takes_a_unit_of_limit(
+    dynamodb_client, rows, partition, condition, limit, pages
+):
+    statement = f"SELECT * FROM \"{rows}\" WHERE pk = '{partition}' AND {condition}"
+    got = _read(
+        dynamodb_client,
+        statement,
+        key=lambda item: item["sk"]["S"],
+        Limit=limit,
+        ReturnConsumedCapacity="TOTAL",
+    )
+    assert [(keys, more, units) for keys, _, more, units in got] == pages
 
 
 # ---- a disjunct held back for a refusal --------------------------------------
