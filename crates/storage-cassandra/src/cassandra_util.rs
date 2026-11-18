@@ -294,7 +294,7 @@ pub fn shape_error(kind: Stmt, query: &str) -> Option<&'static str> {
             if !matches!(first, "INSERT" | "UPDATE" | "DELETE" | "BEGIN") {
                 Some("a write must be an INSERT, UPDATE, DELETE or BEGIN BATCH")
             } else if conditional {
-                Some("a write with an IF condition must use Stmt::Lwt")
+                Some("a write with an IF condition must use Stmt::Lwt or Stmt::LwtAll")
             } else {
                 None
             }
@@ -556,7 +556,7 @@ pub async fn execute<E: FromDbError>(
 /// # Errors
 /// Returns an error if Cassandra does not acknowledge the statement at the
 /// level of `kind`.
-pub async fn execute_at<E: FromDbError>(
+pub(crate) async fn execute_at<E: FromDbError>(
     session: &Arc<CassandraSession>,
     query: &str,
     values: QueryValues,
@@ -723,7 +723,7 @@ pub async fn apply_lwt<E: FromDbError>(
 /// # Errors
 /// Returns an error if Cassandra does not acknowledge the statement at the
 /// level of `kind` or the response cannot be parsed.
-pub async fn apply_lwt_at<E: FromDbError>(
+pub(crate) async fn apply_lwt_at<E: FromDbError>(
     session: &Arc<CassandraSession>,
     query: &str,
     values: QueryValues,
@@ -936,21 +936,13 @@ mod tests {
     }
 
     #[test]
-    fn a_read_all_runs_at_all() {
+    fn the_all_kinds_run_at_all() {
         assert_eq!(levels(Stmt::ReadAll), (Consistency::All, None));
-    }
-
-    #[test]
-    fn a_write_all_and_an_lwt_all_commit_at_all() {
-        for (kind, expected) in [
-            (Stmt::WriteAll, (Consistency::All, None)),
-            (
-                Stmt::LwtAll,
-                (Consistency::All, Some(Consistency::LocalSerial)),
-            ),
-        ] {
-            assert_eq!(levels(kind), expected, "{kind:?}");
-        }
+        assert_eq!(levels(Stmt::WriteAll), (Consistency::All, None));
+        assert_eq!(
+            levels(Stmt::LwtAll),
+            (Consistency::All, Some(Consistency::LocalSerial))
+        );
     }
 
     #[test]

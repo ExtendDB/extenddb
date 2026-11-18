@@ -286,6 +286,9 @@ mod tests {
             (Stmt::SerialRead, keyspace.select("a")),
             (Stmt::Write, insert.clone()),
             (Stmt::Lwt, format!("{insert} IF NOT EXISTS")),
+            // The Paxos round of `LwtAll` runs at `LOCAL_SERIAL` and fails
+            // before its commit at `ALL`.
+            (Stmt::LwtAll, format!("{insert} IF NOT EXISTS")),
         ] {
             let result = session.run(kind, &cql, none()).await;
             assert_eq!(
@@ -295,7 +298,8 @@ mod tests {
             );
         }
 
-        // `ReadAll` needs every replica, so Cassandra names `ALL`.
+        // `ReadAll` and `WriteAll` need every replica, so Cassandra names
+        // `ALL`.
         assert_eq!(
             unavailable_level(
                 session
@@ -304,6 +308,11 @@ mod tests {
             ),
             Consistency::All,
             "ReadAll"
+        );
+        assert_eq!(
+            unavailable_level(session.run(Stmt::WriteAll, &insert, none()).await),
+            Consistency::All,
+            "WriteAll"
         );
 
         // A page of a read has the level of its kind. For `SerialRead`,

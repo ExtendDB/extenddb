@@ -398,12 +398,11 @@ impl CassandraCatalogStore {
 
     /// `UPDATE ... IF value = ?` with its commit at `ALL` and its serial
     /// phase at `LOCAL_SERIAL` ([`Stmt::LwtAll`]), then the row read back at
-    /// `ALL`, as every write of
-    /// the key ring runs ([`key_row_at_all`]). A conditional update takes no
-    /// client timestamp, and a cell stamped above the update's timestamp
-    /// keeps its value, so an applied update whose row does not hold `value`
-    /// is an error, as a delete that leaves its row is for the
-    /// encryption-key commands.
+    /// `ALL`, as every write of the key ring runs ([`key_row_at_all`]). A
+    /// conditional update takes no client timestamp, and a cell stamped above
+    /// the update's timestamp keeps its value, so an applied update whose row
+    /// does not hold `value` is an error, as a delete that leaves its row is
+    /// for the encryption-key commands.
     pub(crate) async fn replace_setting_impl(
         &self,
         key: &str,
