@@ -121,6 +121,9 @@ pub fn validate_create_table(
     validate_provisioned_throughput(input)?;
     validate_gsi_provisioned_throughput(input)?;
     validate_gsi_throughput_minimum(input)?;
+    if let Some(pt) = &input.provisioned_throughput {
+        provisioned_limits::check_table_capacity_bounds(pt)?;
+    }
     validate_gsi_count(input, limits)?;
     validate_lsi_count(input, limits)?;
     validate_lsi_requires_range_key(input)?;

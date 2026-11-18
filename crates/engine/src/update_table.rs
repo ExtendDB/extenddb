@@ -152,6 +152,9 @@ pub async fn handle_update_table(
                 "One or more parameter values were invalid: ReadCapacityUnits and WriteCapacityUnits must each be at least 1".to_owned(),
             ));
     }
+    if let Some(tp) = &input.provisioned_throughput {
+        extenddb_core::validation::provisioned_limits::check_table_capacity_bounds(tp)?;
+    }
 
     // A table-level WarmThroughput stands alone in its request, with the
     // measured per-companion sentences (measured 2026-10-23). Checked before

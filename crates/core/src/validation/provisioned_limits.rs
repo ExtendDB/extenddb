@@ -7,9 +7,10 @@
 //! `per_account_max_wcu`).
 //!
 //! The checks are pure: the engine reads the account's tables and passes in
-//! what it found. Every refusal is `LimitExceededException`. The capacity
-//! sentences are the ones Amazon `DynamoDB` returns, measured on 2026-10-31;
-//! the table-quota sentence was not measured.
+//! what it found. Every refusal but [`check_table_capacity_bounds`] is
+//! `LimitExceededException`. The capacity sentences are the ones Amazon
+//! `DynamoDB` returns, measured on 2026-10-31 and 2026-11-16; the table-quota
+//! sentence was not measured.
 
 use crate::error::DynamoDbError;
 use crate::limits::LimitsConfig;
@@ -20,6 +21,11 @@ use crate::types::{
 /// The closing sentence of every provisioned-capacity refusal.
 const LIMITS_GUIDE: &str = "Refer to the Amazon DynamoDB Developer Guide for current limits \
                             and how to request higher limits.";
+
+/// The largest figure a table's `ReadCapacityUnits` or `WriteCapacityUnits`
+/// may carry. Measured 2026-11-14 and 2026-11-18 on `CreateTable` and
+/// `UpdateTable`: 1000000000001 and every larger figure are out of bounds.
+const MAX_TABLE_CAPACITY_UNITS: i64 = 1_000_000_000_000;
 
 /// Read and write capacity units held by a table and its global secondary
 /// indexes, or by every table in an account.
@@ -43,6 +49,13 @@ impl CapacityUnits {
         Self {
             read: throughput.read_capacity_units,
             write: throughput.write_capacity_units,
+        }
+    }
+
+    fn wrapping_add(self, other: Self) -> Self {
+        Self {
+            read: self.read.wrapping_add(other.read),
+            write: self.write.wrapping_add(other.write),
         }
     }
 }
@@ -90,6 +103,9 @@ impl Unit {
 
 /// What a `CreateTable` request provisions: the table's units plus those of
 /// every global secondary index. `None` for an on-demand table.
+///
+/// The sum wraps past `i64::MAX`. Measured 2026-11-18: the service answers
+/// the per-index sentence for an index that takes the sum past it.
 #[must_use]
 pub fn create_table_capacity(input: &CreateTableInput) -> Option<CapacityUnits> {
     if input.billing_mode.unwrap_or(BillingMode::Provisioned) == BillingMode::PayPerRequest {
@@ -103,7 +119,7 @@ pub fn create_table_capacity(input: &CreateTableInput) -> Option<CapacityUnits> 
             .flatten()
             .filter_map(|gsi| gsi.provisioned_throughput.as_ref())
             .map(CapacityUnits::of)
-            .fold(table, CapacityUnits::saturating_add),
+            .fold(table, CapacityUnits::wrapping_add),
     )
 }
 
@@ -234,10 +250,62 @@ pub fn check_create_table_capacity(
             ));
         }
     }
+    check_table_max(requested, None, limits, region)
+}
+
+/// Refuse a `CreateTable` whose global secondary index asks for more units
+/// than one table may hold, with the per-index sentence (measured 2026-11-16).
+///
+/// # Errors
+///
+/// `LimitExceededException` naming the index and its first unit over the
+/// per-table maximum.
+pub fn check_create_table_indexes(
+    input: &CreateTableInput,
+    limits: &LimitsConfig,
+    region: &str,
+) -> Result<(), DynamoDbError> {
+    for gsi in input.global_secondary_indexes.iter().flatten() {
+        if let Some(throughput) = &gsi.provisioned_throughput {
+            let requested = CapacityUnits::of(throughput);
+            check_table_max(requested, Some(&gsi.index_name), limits, region)?;
+        }
+    }
+    Ok(())
+}
+
+/// Refuse units above the per-table maximum, for the table or for `index`.
+fn check_table_max(
+    requested: CapacityUnits,
+    index: Option<&str>,
+    limits: &LimitsConfig,
+    region: &str,
+) -> Result<(), DynamoDbError> {
     for unit in Unit::BOTH {
         let max = unit.table_max(limits);
         if unit.of(requested) > max {
-            return Err(per_table_refusal(unit, unit.of(requested), max, region));
+            return Err(per_table_refusal(unit, index, requested, max, region));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a table's `ProvisionedThroughput` that carries a figure above
+/// [`MAX_TABLE_CAPACITY_UNITS`]. Checked after the minimum of 1, as measured
+/// on 2026-11-18. An index's figure is held to the per-index maximum instead.
+///
+/// # Errors
+///
+/// `ValidationException` naming the first figure out of bounds.
+pub fn check_table_capacity_bounds(pt: &ProvisionedThroughput) -> Result<(), DynamoDbError> {
+    let units = CapacityUnits::of(pt);
+    for unit in Unit::BOTH {
+        let value = unit.of(units);
+        if value > MAX_TABLE_CAPACITY_UNITS {
+            return Err(DynamoDbError::ValidationException(format!(
+                "Given value {value} for {} is out of bounds",
+                unit.name()
+            )));
         }
     }
     Ok(())
@@ -273,7 +341,7 @@ pub fn check_update_table_capacity(
         for unit in Unit::BOTH {
             let max = unit.table_max(limits);
             if unit.of(requested) > max && unit.of(requested) > unit.of(held) {
-                return Err(per_table_refusal(unit, unit.of(requested), max, region));
+                return Err(per_table_refusal(unit, None, requested, max, region));
             }
         }
     }
@@ -314,11 +382,24 @@ pub fn check_table_count(existing: usize, limits: &LimitsConfig) -> Result<(), D
     Ok(())
 }
 
-fn per_table_refusal(unit: Unit, requested: i64, max: i64, region: &str) -> DynamoDbError {
+/// The per-table sentence, or with `index` the per-index one, which names the
+/// same per-table maximum (measured 2026-11-16).
+fn per_table_refusal(
+    unit: Unit,
+    index: Option<&str>,
+    requested: CapacityUnits,
+    max: i64,
+    region: &str,
+) -> DynamoDbError {
+    let requested = unit.of(requested);
     let unit = unit.name();
+    let (subject, scope) = match index {
+        Some(name) => (format!("{unit} for index {name}"), "index"),
+        None => (unit.to_owned(), "table"),
+    };
     DynamoDbError::LimitExceededException(format!(
-        "The requested {unit}, {requested}, is above the per table maximum for the account in \
-         {region}. Per table maximum: {max}. {LIMITS_GUIDE}"
+        "The requested {subject}, {requested}, is above the per {scope} maximum for the account \
+         in {region}. Per table maximum: {max}. {LIMITS_GUIDE}"
     ))
 }
 

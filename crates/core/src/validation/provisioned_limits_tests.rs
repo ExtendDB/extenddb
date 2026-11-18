@@ -381,3 +381,112 @@ fn update_table_capacity_replaces_the_table_and_follows_index_changes() {
     }));
     assert_eq!(update_table_capacity(&existing, &to_on_demand), None);
 }
+
+/// What the service answered one row of [`CAPACITY_FIGURES`].
+enum Answer {
+    /// `Given value <n> for <unit> is out of bounds`.
+    Bounds(&'static str, &'static str),
+    /// The minimum of 1, which the service words as a member constraint and
+    /// ExtendDB its own way. Both texts carry [`MINIMUM`].
+    Minimum,
+    Limit(&'static str),
+    /// Passes these checks, with the table's write figure read as this.
+    Passes(i64),
+}
+
+const MINIMUM: &str = "greater than or equal to 1";
+const MAX: &str = "9223372036854775807";
+const PAST_MAX: &str = "9223372036854775808";
+const READ: &str = "ReadCapacityUnits";
+const WRITE: &str = "WriteCapacityUnits";
+const PER_INDEX: &str = "The requested WriteCapacityUnits for index by-label, \
+    9223372036854775807, is above the per index maximum for the account in us-east-1. Per \
+    table maximum: 200000. Refer to the Amazon DynamoDB Developer Guide for current limits and \
+    how to request higher limits.";
+const ACCOUNT: &str = "This request would have caused the WriteCapacityUnits limit to be \
+    exceeded for the account in us-east-1. Current WriteCapacityUnits reserved by the account: \
+    152. Limit: 200000. Requested: 1000000000006. Refer to the Amazon DynamoDB Developer Guide \
+    for current limits and how to request higher limits.";
+
+/// `UpdateTable` or `CreateTable`, the table's read and write figures as
+/// JSON text, the write figure of an index `by-label` created beside the
+/// table, and the service's answer. Measured in us-east-1 on 2026-11-14,
+/// 2026-11-16 and 2026-11-18, on the account of [`measured_limits`], which
+/// held 152 write units on 2026-11-18.
+#[rustfmt::skip]
+const CAPACITY_FIGURES: &[(bool, &str, &str, Option<&str>, Answer)] = {
+    use Answer::{Bounds, Limit, Minimum, Passes};
+    &[
+        (true, "5", PAST_MAX, None, Bounds(MAX, WRITE)),
+        (false, "5", PAST_MAX, None, Bounds(MAX, WRITE)),
+        (false, "5", "5", Some(PAST_MAX), Limit(PER_INDEX)),
+        (false, PAST_MAX, "5", None, Bounds(MAX, READ)),
+        (false, "1000000000001", "5", None, Bounds("1000000000001", READ)),
+        (false, PAST_MAX, "0", None, Minimum),
+        (false, "5", "-9223372036854775809", None, Minimum),
+        (false, "5", "5", Some("1000000000001"), Limit(ACCOUNT)),
+        (true, "5", "1000000000000", None, Passes(1_000_000_000_000)),
+        (true, "5", "1000000000001", None, Bounds("1000000000001", WRITE)),
+        (false, "5", "5.5", None, Passes(5)),
+    ]
+};
+
+/// The checks `CreateTable` runs on `body` in the engine's order, or the
+/// check of the table's figures `UpdateTable` runs, and the table's write
+/// figure as read.
+fn capacity_checks(update: bool, body: serde_json::Value) -> Result<i64, DynamoDbError> {
+    let unreadable = |e: serde_json::Error| DynamoDbError::SerializationException(e.to_string());
+    if update {
+        let input: UpdateTableInput = serde_json::from_value(body).map_err(unreadable)?;
+        let throughput = input.provisioned_throughput.unwrap();
+        check_table_capacity_bounds(&throughput)?;
+        return Ok(throughput.write_capacity_units);
+    }
+    let input: CreateTableInput = serde_json::from_value(body).map_err(unreadable)?;
+    let limits = measured_limits();
+    crate::validation::validate_create_table(&input, &limits)?;
+    let requested = create_table_capacity(&input).expect("a provisioned table");
+    check_create_table_capacity(requested, units(0, 152), &limits, REGION)?;
+    check_create_table_indexes(&input, &limits, REGION)?;
+    Ok(input.provisioned_throughput.unwrap().write_capacity_units)
+}
+
+#[test]
+fn a_capacity_figure_is_read_and_bounded_as_measured() {
+    // Parsed the way the server parses a body, so a figure past the 64-bit
+    // range reaches the reader in the same form.
+    let figure = |text: &str| serde_json::from_str::<serde_json::Value>(text).unwrap();
+    for (update, read, write, index_write, answer) in CAPACITY_FIGURES {
+        let throughput =
+            json!({ "ReadCapacityUnits": figure(read), "WriteCapacityUnits": figure(write) });
+        let mut body = json!({ "TableName": "capacity", "ProvisionedThroughput": throughput });
+        if !update {
+            body["BillingMode"] = json!("PROVISIONED");
+            body["KeySchema"] = json!([{ "AttributeName": "pk", "KeyType": "HASH" }]);
+            body["AttributeDefinitions"] = json!([{ "AttributeName": "pk", "AttributeType": "S" }]);
+        }
+        if let Some(index_write) = index_write {
+            let label = json!({ "AttributeName": "label", "AttributeType": "S" });
+            body["AttributeDefinitions"]
+                .as_array_mut()
+                .unwrap()
+                .push(label);
+            body["GlobalSecondaryIndexes"] = json!([{
+                "IndexName": "by-label",
+                "KeySchema": [{ "AttributeName": "label", "KeyType": "HASH" }],
+                "Projection": { "ProjectionType": "ALL" },
+                "ProvisionedThroughput": { "ReadCapacityUnits": 5, "WriteCapacityUnits": figure(index_write) },
+            }]);
+        }
+        let result = capacity_checks(*update, body.clone());
+        match (answer, &result) {
+            (Answer::Bounds(n, unit), Err(DynamoDbError::ValidationException(m)))
+                if *m == format!("Given value {n} for {unit} is out of bounds") => {}
+            (Answer::Minimum, Err(DynamoDbError::ValidationException(m)))
+                if m.contains(MINIMUM) && !m.contains("out of bounds") => {}
+            (Answer::Limit(text), Err(DynamoDbError::LimitExceededException(m))) if m == text => {}
+            (Answer::Passes(n), Ok(write)) if write == n => {}
+            _ => panic!("{body}: got {result:?}"),
+        }
+    }
+}
