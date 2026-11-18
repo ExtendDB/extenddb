@@ -340,8 +340,8 @@ async fn a_held_orphan_fails_within_its_lock_timeout_and_catalog_writes_go_on() 
 }
 
 /// A relation another session dropped after the check reported it, as a
-/// server's `DeleteTable` drops one, is reported as already gone, not as
-/// dropped by the command.
+/// server's `UpdateTable` drops the relation of a GSI it deleted, is
+/// reported as already gone, not as dropped by the command.
 #[tokio::test]
 async fn a_relation_dropped_first_by_another_session_is_already_gone() {
     let test = "a_relation_dropped_first_by_another_session_is_already_gone";

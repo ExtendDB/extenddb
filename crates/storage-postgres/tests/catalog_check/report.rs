@@ -299,10 +299,9 @@ async fn a_catalog_without_the_data_database_setting_is_refused() {
 }
 
 /// Changes that land between the check's first catalog read and its second
-/// listing are not reported: a table a `DeleteTable` removes (row first,
-/// then relations) is not missing, a relation another session drops is not
-/// orphaned, and a relation created after the first listing waits for the
-/// next check.
+/// listing are not reported: a table a `DeleteTable` removes is not missing,
+/// a relation another session drops is not orphaned, and a relation created
+/// after the first listing waits for the next check.
 #[tokio::test]
 async fn changes_during_the_check_are_not_reported() {
     let test = "changes_during_the_check_are_not_reported";

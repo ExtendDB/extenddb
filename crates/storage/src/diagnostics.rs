@@ -59,7 +59,8 @@ pub enum OrphanDrop {
     /// The relation was dropped here.
     Dropped,
     /// The relation no longer existed when the drop ran: another session, for
-    /// example a server's `DeleteTable`, had dropped it first.
+    /// example a server's `UpdateTable` that deleted a GSI, had dropped it
+    /// first.
     AlreadyGone,
     /// The relation was kept, for the reason given.
     Kept(String),

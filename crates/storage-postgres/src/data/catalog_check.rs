@@ -40,18 +40,14 @@
 //! - Orphaned: in the first listing, unnamed by the read after the wait, and
 //!   still in the second listing. A relation whose catalog row a server has
 //!   just deleted and whose drop has not yet committed when the second
-//!   listing runs is reported: a synchronous `DeleteTable` between its
-//!   catalog commit and its data commit, an `UpdateTable` that deletes a GSI
-//!   or vector index before its drop runs, and a GSI whose build failed, for
-//!   the second (`GRACE_PUBLISH`) between the removal of its row and its
-//!   drop.
+//!   listing runs is reported: an `UpdateTable` that deletes a GSI or vector
+//!   index before its drop runs, and a GSI whose build failed, for the
+//!   second (`GRACE_PUBLISH`) between the removal of its row and its drop.
 //! - Missing: named by a row that is expected in both catalog reads, and
 //!   absent from the second listing, which runs between them. A row is not
 //!   expected while it or its table is `CREATING` or `DELETING`, which
 //!   covers a catalog-first path between its row's commit and its relations,
-//!   and a drop that runs before the row goes. A synchronous `DeleteTable`
-//!   commits the row's removal before its drop, so the second read no longer
-//!   expects the relations a listing misses. What is still reported is a
+//!   and a drop that runs before the row goes. What is still reported is a
 //!   table row that is `ACTIVE` before its relations commit: a `CreateTable`
 //!   when `control_plane_delay_seconds` is 0, which inserts the row
 //!   `ACTIVE`, and one whose relations take longer to commit than that
