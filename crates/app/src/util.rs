@@ -49,18 +49,26 @@ pub(crate) fn is_postgres() -> bool {
     extenddb_storage::backend_name() == Some("postgres")
 }
 
-/// The key that `migrate` and `verify` put on their target: on PostgreSQL
-/// with `[auth.encryption] key_file` set, the KEK read through the file
-/// rule, with which the migration backend opens the data connection string
-/// row of a catalog with a key ring (RFC-0000 section 12); else the catalog
-/// key, which no other backend's migrations read.
+/// The key that `migrate`, `verify` and the catalog check of `serve` put on
+/// their target: on PostgreSQL with `[auth.encryption] key_file` set, the
+/// KEK read through the file rule, with which the migration backend opens the
+/// data connection string row of a catalog with a key ring (RFC-0000 section
+/// 12); else the catalog key, which no other backend's migrations read. With
+/// `locked_store` the locked key store is set up first, as the commands set
+/// it up ([`command_key_source`]). `serve` passes false: it sets the store up
+/// after the fork with the slots of the credential cache, and a second setup
+/// changes nothing.
 pub(crate) fn status_key_source(
     config: &extenddb_config::AppConfig,
+    locked_store: bool,
 ) -> anyhow::Result<extenddb_storage::server_components::KeySource> {
     if !is_postgres() {
         return Ok(extenddb_storage::server_components::KeySource::CatalogKey);
     }
-    command_key_source(config)
+    if locked_store {
+        return command_key_source(config);
+    }
+    extenddb_server::key_file::key_source(&config.auth.encryption).map_err(anyhow::Error::msg)
 }
 
 /// The key a command puts on its target or its factory options (RFC-0000

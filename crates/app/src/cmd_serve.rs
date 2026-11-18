@@ -181,16 +181,9 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     // catalog again when it registers.
     //
     // On PostgreSQL the check opens the data connection string row of a
-    // catalog with a key ring with the KEK, as `migrate` does, so the KEK is
-    // read here through the file rule. The locked key store is not set up
-    // here: `serve` sets it up after the fork, with the slots of the
-    // credential cache, and a second setup changes nothing.
-    let key_source = if crate::util::is_postgres() {
-        extenddb_server::key_file::key_source(&app_config.auth.encryption)
-            .map_err(anyhow::Error::msg)?
-    } else {
-        extenddb_storage::server_components::KeySource::CatalogKey
-    };
+    // catalog with a key ring with the KEK, as `migrate` does. The locked key
+    // store is not set up here, because `serve` sets it up after the fork.
+    let key_source = crate::util::status_key_source(&app_config, false)?;
     let code = crate::serve_catalog::check_catalog(&crate::serve_catalog::ServeStart {
         server: &app_config.server,
         location: app_config.storage.connection_config(),

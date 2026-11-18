@@ -57,7 +57,7 @@ pub(crate) async fn run(
             std::env::var_os("EXTENDDB_CASSANDRA_PASSWORD"),
         )?,
         data_connection: None,
-        key_source: crate::util::status_key_source(&app_config)?,
+        key_source: crate::util::status_key_source(&app_config, true)?,
         ..Target::default()
     };
     // The backup clause names the data store the catalog records when the
