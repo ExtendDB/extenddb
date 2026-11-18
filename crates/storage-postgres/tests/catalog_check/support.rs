@@ -296,6 +296,7 @@ impl Deployment {
                         key_schema: vec![key("gpk", KeyType::Hash)],
                         projection: all(),
                         provisioned_throughput: None,
+                        warm_throughput: None,
                     }]),
                     local_secondary_indexes: Some(vec![LsiInput {
                         index_name: "lsi1".to_owned(),
