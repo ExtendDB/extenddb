@@ -92,16 +92,36 @@ mod tests {
         keyspace: String,
     }
 
+    /// The replication factor whose quorum is one more than the cluster's
+    /// node count: 2N + 1 on N nodes.
+    async fn no_quorum_replicas(session: &Arc<CassandraSession>) -> usize {
+        let peers = cassandra_util::system_read::<StorageError>(
+            session,
+            "SELECT peer FROM system.peers",
+            none(),
+            "count the peers",
+        )
+        .await
+        .expect("read system.peers");
+        2 * (peers.len() + 1) + 1
+    }
+
+    /// The replication map of a keyspace with `replicas` replicas in the
+    /// test datacenter.
+    fn replication(replicas: usize) -> String {
+        let datacenter = crate::helpers::test_config().datacenter;
+        format!("{{'class': 'NetworkTopologyStrategy', '{datacenter}': {replicas}}}")
+    }
+
     impl TestKeyspace {
         /// A keyspace with `replicas` replicas in the test datacenter.
         async fn with_replicas(replicas: usize) -> Self {
             let session = session_without_retries().await;
             let keyspace = format!("consistency_{}", crate::helpers::unique_test_id());
-            let datacenter = crate::helpers::test_config().datacenter;
             for cql in [
                 format!(
-                    "CREATE KEYSPACE {keyspace} WITH replication = \
-                     {{'class': 'NetworkTopologyStrategy', '{datacenter}': {replicas}}}"
+                    "CREATE KEYSPACE {keyspace} WITH replication = {}",
+                    replication(replicas)
                 ),
                 format!("CREATE TABLE {keyspace}.t (pk text PRIMARY KEY, v int)"),
             ] {
@@ -115,15 +135,7 @@ mod tests {
         /// A keyspace whose quorum is one more than the cluster's node count.
         async fn under_replicated() -> Self {
             let session = session_without_retries().await;
-            let peers = cassandra_util::system_read::<StorageError>(
-                &session,
-                "SELECT peer FROM system.peers",
-                none(),
-                "count the peers",
-            )
-            .await
-            .expect("read system.peers");
-            Self::with_replicas(2 * (peers.len() + 1) + 1).await
+            Self::with_replicas(no_quorum_replicas(&session).await).await
         }
 
         fn session(&self) -> Arc<CassandraSession> {
@@ -262,6 +274,7 @@ mod tests {
         for (name, level) in [
             ("cl: LocalQuorum", Consistency::LocalQuorum),
             ("cl: Quorum", Consistency::Quorum),
+            ("cl: All", Consistency::All),
             ("cl: One", Consistency::One),
         ] {
             if error.contains("Unavailable") && error.contains(name) {
@@ -528,5 +541,75 @@ mod tests {
         );
 
         keyspace.drop().await;
+    }
+
+    /// Three statements of the secret store run at `ALL` (RFC-0000 section
+    /// 8.4): the page read, the rewrite and the write-time read of a delete.
+    /// The test gives a migrated catalog keyspace the replication of
+    /// [`TestKeyspace::under_replicated`] and calls four store methods. Each
+    /// call fails at its first statement. The Unavailable error names `ALL`.
+    /// Not checked here: `replace_setting`, the settings store's key row
+    /// statements, and the tombstone write of a delete, which runs only after
+    /// its read.
+    #[tokio::test]
+    async fn the_secret_store_sends_at_all() {
+        use extenddb_storage::management_store::{ManagementStore as _, SecretWrite};
+        use extenddb_storage::secret_keys::SecretTable;
+
+        if crate::helpers::skip_without_cassandra() {
+            return;
+        }
+        let isolated = crate::helpers::isolated_engine("levels").await;
+        let catalog = isolated.engine.catalog_keyspace();
+        let session = session_without_retries().await;
+        let replicas = no_quorum_replicas(&session).await;
+        cassandra_util::ddl::<StorageError>(
+            &session,
+            &format!(
+                "ALTER KEYSPACE {catalog} WITH replication = {}",
+                replication(replicas)
+            ),
+            "raise the replication",
+        )
+        .await
+        .expect("raise the catalog's replication");
+        let store = extenddb_storage_cassandra::CassandraCatalogStore::catalog_only(
+            Arc::clone(&session),
+            isolated.config.keyspace_prefix.clone(),
+        );
+        let key = "AKIAEXTENDDBLEVELS01".to_owned();
+        let write = SecretWrite {
+            key: key.clone(),
+            secret_key_encrypted: vec![1],
+            write_timestamp: None,
+        };
+
+        for (method, result) in [
+            (
+                "read_secret_page",
+                store
+                    .read_secret_page(SecretTable::IamSessions, None, 10)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "write_secrets",
+                store.write_secrets(SecretTable::AccessKeys, &[write]).await,
+            ),
+            (
+                "delete_secrets",
+                store.delete_secrets(SecretTable::AccessKeys, &[key]).await,
+            ),
+            (
+                "delete_setting",
+                store.delete_setting("encryption_key").await,
+            ),
+        ] {
+            let error = result.expect_err(method);
+            assert_eq!(level_in(error.message()), Consistency::All, "{method}");
+        }
+
+        drop(isolated);
+        crate::helpers::flush_pending_drops(&session).await;
     }
 }
