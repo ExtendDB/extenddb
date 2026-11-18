@@ -30,7 +30,7 @@ use extenddb_storage::util::sk_column;
 use std::sync::Arc;
 
 use super::json_to_item;
-use crate::cassandra_util::CassandraSession;
+use crate::cassandra_util::{CassandraSession, PolicySession, Stmt};
 
 /// The most rows one read takes while the scan reads on through rows that
 /// hold no item, unless the read's own LIMIT is larger.
@@ -83,7 +83,8 @@ pub(super) fn row_position(
     Ok((pk, value.map(|v| (format!("{col} > ?"), vec![v]))))
 }
 
-/// Runs one statement and returns its rows, keeping the driver's error.
+/// Runs one read at the consistency level of [`Stmt::Read`] and returns its
+/// rows, keeping the driver's error.
 async fn rows_of(
     session: &Arc<CassandraSession>,
     query: &str,
@@ -91,7 +92,7 @@ async fn rows_of(
     context: &'static str,
 ) -> Result<Vec<Row>, (&'static str, CdrsError)> {
     let result = session
-        .query_with_values(query, QueryValues::SimpleValues(values))
+        .run(Stmt::Read, query, QueryValues::SimpleValues(values))
         .await
         .map_err(|e| (context, e))?;
     let body = result.response_body().map_err(|e| (context, e))?;
