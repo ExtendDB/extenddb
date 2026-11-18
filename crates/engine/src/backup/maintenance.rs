@@ -57,7 +57,7 @@ use extenddb_storage::backup_catalog::{
     StaleClock, StoreIdentity, is_backup_not_found,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{BackupCatalog, MaintenanceClaim};
+use extenddb_storage::{BackupCatalog, CancellationToken, MaintenanceClaim};
 use futures::TryStreamExt;
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -66,61 +66,107 @@ use super::StoreFence;
 
 /// A maintenance claim with its heartbeat on a timer.
 ///
-/// The claim is confirmed by the job's rule (`job/heartbeat.rs`): each beat
-/// is bounded by one period ([`MaintenanceClaim::heartbeat_within`]), and a
-/// beat that answers `Lost`, fails or outlives its bound records the loss;
-/// between beats the claim counts as held while the last confirmed beat is
-/// at most two periods old (one for the timer to fire, one for the beat to
-/// return). A beat in flight confirms the claim only where the backend's
-/// beat parks before its bound
-/// ([`MaintenanceClaim::heartbeat_parks_before_its_bound`], SQLite, where
-/// it waits on this process's own write lock and the serve lock keeps every
-/// other process off the file), for as long as it waits; elsewhere a beat
-/// in flight says nothing about the record. Past that, [`Self::lost`]
-/// answers as for a lost claim: a process stopped and resumed (SIGSTOP, a
-/// paused VM), a timer that stopped running and a beat that hangs all read
-/// as lost once two periods pass with no confirmed beat. Every backend's
-/// take needs the record's heartbeat older than the stale window, which the
-/// config holds to at least three periods, so a holder that reads its claim
-/// held has not been taken over.
+/// The claim is confirmed by the job's rule (`job/heartbeat.rs`), with one
+/// restriction. Each beat is bounded by one period
+/// ([`MaintenanceClaim::heartbeat_within`]), and a beat that answers
+/// `Lost`, fails or outlives its bound records the loss. Between beats the
+/// claim counts as held while the last confirmed beat (dated when its
+/// answer arrived) is at most two periods old. A beat in flight confirms
+/// the claim only where the beat parks before its bound
+/// ([`MaintenanceClaim::heartbeat_parks_before_its_bound`]: SQLite, whose
+/// beat waits on this process's own write lock under the serve lock), as
+/// the job's third clause does; elsewhere `heartbeat_within` bounds the
+/// whole call, and a beat in flight says nothing about the record. The
+/// restriction: a parked beat confirms only while it is on schedule, having
+/// started within one period of the last confirmed beat (and a tenth of a
+/// period for the timer's lateness), so a process stopped and resumed,
+/// whose next beat starts late, is not confirmed by that beat. Past that,
+/// [`Self::lost`] answers as for a lost claim: a timer that stopped
+/// running, or a beat that hangs, does not keep the claim confirmed.
 ///
-/// The passive reading is checked before each prefix, row and wait poll;
-/// before each step that cannot be undone the command calls
-/// [`Self::recheck`], one beat it waits for. What remains is a stop between
-/// the re-check's confirmation and the step's own call reaching the catalog
-/// or the store, or with that call already sent: the call lands once the
-/// process resumes, though another holder may have taken the claim over
-/// during the stop.
+/// On PostgreSQL, MongoDB and Cassandra the holder therefore starts no
+/// store or catalog call more than two periods after the answer of its
+/// last confirmed beat. That beat wrote the record's heartbeat no earlier
+/// than its own start, at most one period before its answer, so the holder
+/// starts nothing more than three periods after the heartbeat it last
+/// wrote, and every backend's take needs the record's heartbeat older than
+/// the stale window, which the config holds to at least three periods: the
+/// margin is not negative, and it is the stale window less three periods
+/// (255 s at the 300 s default). On SQLite the serve lock keeps every other
+/// process out. The passive reading is not all: before each step that
+/// cannot be undone (migrate-legacy's manifest put, a deletion under a
+/// store prefix, the replacement and a tombstone's removal; sync's insert,
+/// `--adopt-store`'s rewrite, each removal of `--prune-missing` and the
+/// forget options, the move's resolutions, deletions and rewrite, purge's
+/// removal of a dead CREATING row and of its prefix) the command calls
+/// [`Self::recheck`], one beat it waits for, and a deletion walk stops at
+/// [`Self::acting_deadline`]. What no check bounds is a call already sent
+/// when the process stopped (SIGSTOP, a paused VM): it completes when the
+/// process resumes, however long the stop (`migrate_legacy`'s module doc
+/// says what such a call can still do).
 pub struct HeldClaim {
     claim: Arc<dyn MaintenanceClaim>,
     lost: Arc<Mutex<Option<String>>>,
-    /// The instant of the last confirmed beat; the take stands for the
-    /// first.
-    last_confirmed: Arc<Mutex<Instant>>,
-    /// Whether a beat (the timer's or a re-check's) is in flight.
-    in_flight: Arc<Mutex<bool>>,
-    /// Whether the claim's beat can wait outside its bound: a beat in
-    /// flight confirms the claim only where it can.
+    /// Cancelled when `lost` is set, for a writer that selects on the loss.
+    lost_signal: CancellationToken,
+    /// The last confirmed beat and the beat in flight, under one lock, so
+    /// [`Self::lost`] reads both as one snapshot and the timer's end of a
+    /// beat (the confirmation and the flight's end) is one write.
+    beats: Arc<Mutex<Beats>>,
+    /// Whether the claim's beat parks before its bound
+    /// ([`MaintenanceClaim::heartbeat_parks_before_its_bound`]): a beat in
+    /// flight confirms the claim only where it does.
     parks: bool,
     period: Duration,
     timer: tokio::task::JoinHandle<()>,
 }
 
-/// Marks a beat in flight for as long as it lives, and clears the mark when
-/// dropped: by the beat's return, or by the timer task's end mid-beat (a
-/// panic in the backend's beat, an abort).
-struct InFlight<'a>(&'a Mutex<bool>);
+/// What [`HeldClaim::lost`] reads, as one snapshot.
+#[derive(Debug, Clone, Copy)]
+struct Beats {
+    /// The instant the last confirmed beat's answer arrived; the take
+    /// stands for the first.
+    last_confirmed: Instant,
+    /// The instant the timer's beat in flight started, while one is.
+    in_flight: Option<Instant>,
+}
+
+/// Marks the timer's beat in flight, with its start, for as long as it
+/// lives, and clears the mark when dropped: by the beat's return, or by the
+/// timer task's end mid-beat (a panic in the backend's beat, an abort). A
+/// beat that confirmed the claim ends with [`Self::confirmed`], which
+/// records the confirmation and clears the mark in one write.
+struct InFlight<'a>(&'a Mutex<Beats>);
 
 impl<'a> InFlight<'a> {
-    fn mark(flag: &'a Mutex<bool>) -> Self {
-        *flag.lock().unwrap_or_else(PoisonError::into_inner) = true;
-        Self(flag)
+    fn mark(beats: &'a Mutex<Beats>) -> Self {
+        beats
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .in_flight = Some(Instant::now());
+        Self(beats)
+    }
+
+    /// The beat confirmed the claim now: its answer becomes the last
+    /// confirmed beat and the flight ends, under one lock, so no reader
+    /// sees the old confirmation with no beat in flight.
+    fn confirmed(self) {
+        {
+            let mut beats = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            beats.last_confirmed = Instant::now();
+            beats.in_flight = None;
+        }
+        // The drop clears the mark again, after the lock above is released.
+        drop(self);
     }
 }
 
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = false;
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .in_flight = None;
     }
 }
 
@@ -147,48 +193,45 @@ impl HeldClaim {
     /// [`HeldClaim::release`] or the drop (the caller passes the jobs'
     /// heartbeat period, `extenddb_storage::backup_catalog::JOB_HEARTBEAT_INTERVAL`,
     /// which every stale window the config accepts is at least three of).
-    /// Now stands for the first confirmed beat: the take just stamped the
-    /// record's heartbeat, so the instant is at or after it by the take's
-    /// own duration.
+    /// Now stands for the first confirmed beat: the claim was just taken.
+    /// The beats fall one period apart from it.
     #[must_use]
     pub fn start(claim: Box<dyn MaintenanceClaim>, interval: Duration) -> Self {
         let claim: Arc<dyn MaintenanceClaim> = Arc::from(claim);
         let lost = Arc::new(Mutex::new(None));
+        let lost_signal = CancellationToken::new();
         let taken = Instant::now();
-        let last_confirmed = Arc::new(Mutex::new(taken));
-        let in_flight = Arc::new(Mutex::new(false));
+        let beats = Arc::new(Mutex::new(Beats {
+            last_confirmed: taken,
+            in_flight: None,
+        }));
         let parks = claim.heartbeat_parks_before_its_bound();
         let timer = tokio::spawn({
             let claim = Arc::clone(&claim);
             let lost = Arc::clone(&lost);
-            let last_confirmed = Arc::clone(&last_confirmed);
-            let in_flight = Arc::clone(&in_flight);
+            let lost_signal = lost_signal.clone();
+            let beats = Arc::clone(&beats);
             async move {
-                // The beats fall one period apart from the take, whenever
-                // the task first runs.
                 let mut ticks = tokio::time::interval_at(taken + interval, interval);
                 ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     ticks.tick().await;
                     let failure = {
-                        let _beat = InFlight::mark(&in_flight);
+                        let beat = InFlight::mark(&beats);
                         let failure =
                             beat_failure(claim.heartbeat_within(interval).await, interval);
-                        // The confirmation is recorded before the flight
-                        // ends, so a reader never sees neither.
+                        // The confirmation and the flight's end are one
+                        // write, so a reader never sees neither.
                         if failure.is_none() {
-                            *last_confirmed
-                                .lock()
-                                .unwrap_or_else(PoisonError::into_inner) = Instant::now();
+                            beat.confirmed();
                         }
                         failure
                     };
                     let Some(reason) = failure else {
                         continue;
                     };
-                    lost.lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .get_or_insert(reason);
+                    *lost.lock().unwrap_or_else(PoisonError::into_inner) = Some(reason);
+                    lost_signal.cancel();
                     return;
                 }
             }
@@ -196,12 +239,18 @@ impl HeldClaim {
         Self {
             claim,
             lost,
-            last_confirmed,
-            in_flight,
+            lost_signal,
+            beats,
             parks,
             period: interval,
             timer,
         }
+    }
+
+    /// Cancelled once a heartbeat recorded the loss ([`Self::lost`]'s first
+    /// clause).
+    pub(crate) fn lost_signal(&self) -> &CancellationToken {
+        &self.lost_signal
     }
 
     /// The claim's fencing token.
@@ -212,8 +261,8 @@ impl HeldClaim {
 
     /// Why the claim is no longer held (the type's doc): a heartbeat that
     /// answered `Lost`, failed or outlived its bound, or no beat confirmed
-    /// within two periods and, where the beat parks, none in flight.
-    /// `None` while the claim is confirmed.
+    /// within two periods and, where the beat parks, none on schedule in
+    /// flight. `None` while the claim is confirmed.
     #[must_use]
     pub fn lost(&self) -> Option<String> {
         if let Some(reason) = self
@@ -224,25 +273,24 @@ impl HeldClaim {
         {
             return Some(reason);
         }
-        let since = self
-            .last_confirmed
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .elapsed();
+        // One snapshot of both: the timer's end of a beat cannot fall
+        // between the read of the confirmation and the read of the flight.
+        let Beats {
+            last_confirmed,
+            in_flight: beat,
+        } = *self.beats.lock().unwrap_or_else(PoisonError::into_inner);
+        let since = last_confirmed.elapsed();
         if since <= 2 * self.period {
             return None;
         }
-        if self.parks
-            && *self
-                .in_flight
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-        {
+        let on_schedule = |started: Instant| {
+            started.saturating_duration_since(last_confirmed) <= self.period + self.period / 10
+        };
+        if self.parks && beat.is_some_and(on_schedule) {
             return None;
         }
         Some(format!(
-            "no heartbeat confirmed the maintenance claim within two periods (the last {:.0} s \
-             ago)",
+            "no heartbeat confirmed the maintenance claim within two periods ({:.0} s ago)",
             since.as_secs_f64()
         ))
     }
@@ -250,8 +298,8 @@ impl HeldClaim {
     /// One beat outside the timer, under the period's bound, before a step
     /// that cannot be undone: `Ok` when it confirmed the claim (it counts
     /// as a confirmed beat), otherwise the reason the claim is lost, which
-    /// is recorded as the timer records a loss. A claim [`Self::lost`]
-    /// already reads lost answers at once, with no beat.
+    /// is recorded as the timer records a loss. A loss already recorded, or
+    /// a claim [`Self::lost`] reads lost, answers at once.
     ///
     /// # Errors
     ///
@@ -260,26 +308,41 @@ impl HeldClaim {
         if let Some(reason) = self.lost() {
             return Err(reason);
         }
-        let failure = {
-            let _beat = InFlight::mark(&self.in_flight);
-            let failure = beat_failure(self.claim.heartbeat_within(self.period).await, self.period);
-            if failure.is_none() {
-                *self
-                    .last_confirmed
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner) = Instant::now();
-            }
-            failure
-        };
+        let failure = beat_failure(self.claim.heartbeat_within(self.period).await, self.period);
         match failure {
-            None => Ok(()),
-            Some(reason) => Err(self
-                .lost
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get_or_insert(reason)
-                .clone()),
+            None => {
+                self.beats
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .last_confirmed = Instant::now();
+                Ok(())
+            }
+            Some(reason) => {
+                self.lost
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get_or_insert_with(|| reason.clone());
+                self.lost_signal.cancel();
+                Err(reason)
+            }
         }
+    }
+
+    /// The instant past which [`Self::lost`] reads the claim lost unless
+    /// another beat confirms it first: two periods after the last confirmed
+    /// beat. A deletion walk under a store prefix starts no removal at or
+    /// after it ([`BackupStore::delete_prefix_before`]), so a process
+    /// stopped mid-walk and resumed past it removes nothing more than the
+    /// entry whose removal was under way. Where a parked beat confirms the
+    /// claim (SQLite) the claim may still be held past it; the walk then
+    /// stops early and its caller re-checks and walks on.
+    #[must_use]
+    pub fn acting_deadline(&self) -> Instant {
+        self.beats
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .last_confirmed
+            + 2 * self.period
     }
 
     /// Stop the heartbeat, wait for one in flight to end, and release the
@@ -387,14 +450,24 @@ pub struct Wait {
     pub poll: Duration,
 }
 
-/// Wait until no CREATING or FAILED backup row of `identity` has a live
-/// owner and no restore job is RUNNING, re-reading every `wait.poll`, for
-/// at most `wait.limit`; the claim lost, a catalog read failing, or a
+/// Wait until no CREATING or FAILED backup row of any of `identities` has a
+/// live owner and no restore job is RUNNING, re-reading every `wait.poll`,
+/// for at most `wait.limit`; the claim lost, a catalog read failing, or a
 /// signal ends it early. The jobs found running are reported through
-/// `announce` the first time they are seen.
+/// `announce` the first time they are seen. Purge and `backup sync`'s
+/// `--adopt-store` and `--prune-missing` pass the configured store;
+/// `--move-store` and `--forget-store` add every store id the catalog
+/// records for the old root (`read_store_ids`), so a CreateBackup of a
+/// server still configured with that root is waited on too; `--forget-store`
+/// and `--forget-backup` pass, when the configured store's identity is not
+/// known (an unhealthy store, a root with no identity file), every store id
+/// the catalog records for the configured root instead of the configured
+/// store. An empty slice waits on the RUNNING restores alone: with no store
+/// configured, or when the catalog records no store id for the configured
+/// root (a failed read of those ids refuses the command before the wait).
 pub async fn wait_for_quiet<S: BackupCatalog + ?Sized>(
     storage: &S,
-    identity: &StoreIdentity,
+    identities: &[StoreIdentity],
     claim: &HeldClaim,
     wait: Wait,
     interrupt: &mut Interrupt,
@@ -409,7 +482,7 @@ pub async fn wait_for_quiet<S: BackupCatalog + ?Sized>(
         if let Some(signal) = interrupt.signalled() {
             return WaitOutcome::Interrupted(signal);
         }
-        let remaining = match busy_jobs(storage, identity, wait.owner_window).await {
+        let remaining = match busy_jobs(storage, identities, wait.owner_window).await {
             Ok(remaining) => remaining,
             Err(e) => return WaitOutcome::CatalogError(e),
         };
@@ -440,34 +513,36 @@ pub async fn wait_for_quiet<S: BackupCatalog + ?Sized>(
 /// (`list_running_restore_jobs`), with no age.
 async fn busy_jobs<S: BackupCatalog + ?Sized>(
     storage: &S,
-    identity: &StoreIdentity,
+    identities: &[StoreIdentity],
     owner_window: Duration,
 ) -> Result<Vec<String>, String> {
     let mut busy = Vec::new();
-    for status in [BackupStatus::Creating, BackupStatus::Failed] {
-        let rows: Vec<BackupRow> = storage
-            .list_backup_rows(Some(status), identity)
-            .try_collect()
-            .await
-            .map_err(|e| format!("cannot list the catalog's backup rows: {e}"))?;
-        let dead: Vec<BackupRow> = storage
-            .list_backup_rows_older_than(status, identity, StaleClock::Heartbeat, owner_window)
-            .try_collect()
-            .await
-            .map_err(|e| format!("cannot list the catalog's backup rows by age: {e}"))?;
-        for row in rows {
-            if dead.iter().any(|d| d.backup_arn == row.backup_arn) {
-                continue;
+    for identity in identities {
+        for status in [BackupStatus::Creating, BackupStatus::Failed] {
+            let rows: Vec<BackupRow> = storage
+                .list_backup_rows(Some(status), identity)
+                .try_collect()
+                .await
+                .map_err(|e| format!("cannot list the catalog's backup rows: {e}"))?;
+            let dead: Vec<BackupRow> = storage
+                .list_backup_rows_older_than(status, identity, StaleClock::Heartbeat, owner_window)
+                .try_collect()
+                .await
+                .map_err(|e| format!("cannot list the catalog's backup rows by age: {e}"))?;
+            for row in rows {
+                if dead.iter().any(|d| d.backup_arn == row.backup_arn) {
+                    continue;
+                }
+                busy.push(format!(
+                    "{} {} has a live owner (heartbeat within stale_job_after_secs)",
+                    if status == BackupStatus::Creating {
+                        "CreateBackup"
+                    } else {
+                        "the FAILED backup"
+                    },
+                    row.backup_arn
+                ));
             }
-            busy.push(format!(
-                "{} {} has a live owner (heartbeat within stale_job_after_secs)",
-                if status == BackupStatus::Creating {
-                    "CreateBackup"
-                } else {
-                    "the FAILED backup"
-                },
-                row.backup_arn
-            ));
         }
     }
     // Every RUNNING restore job, by status alone: a record stamped in the
@@ -642,7 +717,7 @@ pub async fn purge_row<S: BackupCatalog + ?Sized>(
             .map_err(|e| format!("cannot mark the row DELETED: {e}"))?;
     }
     if storage
-        .remove_backup_row(&key)
+        .remove_backup_row(&key, row.store.store_kind, &row.store.store_root)
         .await
         .map_err(|e| format!("cannot remove the row: {e}"))?
     {
@@ -1103,18 +1178,20 @@ mod tests {
 
     /// A heartbeat that hangs is bounded by one period: the claim stays
     /// confirmed through the first beat's bound and reads lost once it
-    /// passes (two periods after the take), naming the bound. A beat parked
-    /// before its bound (SQLite's) keeps the claim confirmed for as long as
-    /// it waits.
+    /// passes (two periods after the take), naming the bound, with the loss
+    /// token cancelled. A beat parked before its bound (SQLite's) keeps the
+    /// claim confirmed for as long as it waits.
     #[tokio::test(start_paused = true)]
     async fn a_heartbeat_that_hangs_loses_the_claim_after_two_periods() {
         let period = Duration::from_secs(1);
         let held = HeldClaim::start(Box::new(StalledBeat { parks: false }), period);
         tokio::time::sleep(Duration::from_millis(1_900)).await;
         assert_eq!(held.lost(), None, "within two periods");
+        assert!(!held.lost_signal().is_cancelled());
         tokio::time::sleep(Duration::from_millis(200)).await;
         let reason = held.lost().expect("lost after the beat's bound");
         assert!(reason.contains("did not return within 1 s"), "{reason}");
+        assert!(held.lost_signal().is_cancelled());
 
         let parked = HeldClaim::start(Box::new(StalledBeat { parks: true }), period);
         tokio::time::sleep(Duration::from_secs(60)).await;
@@ -1123,7 +1200,7 @@ mod tests {
 
     /// A timer that stops running without recording a loss (here, aborted)
     /// leaves no beat in flight: the claim reads lost once its last
-    /// confirmed beat is two periods old, though no beat said so.
+    /// confirmed beat is two periods old.
     #[tokio::test(start_paused = true)]
     async fn a_timer_that_stops_loses_the_claim_after_two_periods() {
         let fake = Arc::new(FakeClaim::default());
@@ -1141,12 +1218,12 @@ mod tests {
         assert!(reason.contains("within two periods"), "{reason}");
     }
 
-    /// A claim whose beat never returns and ignores its bound (a timer task
-    /// stopped mid-beat), recording that it started, and parking before its
-    /// bound (SQLite's) or not, as `parks` says.
+    /// A claim whose beat never returns, records that it started, and
+    /// either parks before its bound (SQLite's) or ignores it (a backend
+    /// whose bound does not fire: a timer task stopped mid-beat).
     struct HangingBeat {
         parks: bool,
-        started: Arc<std::sync::atomic::AtomicUsize>,
+        started: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl MaintenanceClaim for HangingBeat {
@@ -1161,7 +1238,7 @@ mod tests {
             _bound: Duration,
         ) -> BoxFuture<'_, Option<Result<Heartbeat, StorageError>>> {
             self.started
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                .store(true, std::sync::atomic::Ordering::Release);
             Box::pin(std::future::pending())
         }
         fn heartbeat_parks_before_its_bound(&self) -> bool {
@@ -1172,28 +1249,70 @@ mod tests {
         }
     }
 
+    fn hanging(parks: bool, period: Duration) -> (HeldClaim, Arc<std::sync::atomic::AtomicBool>) {
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let held = HeldClaim::start(
+            Box::new(HangingBeat {
+                parks,
+                started: Arc::clone(&started),
+            }),
+            period,
+        );
+        (held, started)
+    }
+
+    /// A process stopped for three periods and resumed (the clock advanced
+    /// with the timer unpolled): its next beat starts three periods after
+    /// the last confirmed one, and that beat in flight confirms nothing,
+    /// whether it would park (SQLite's) or stay within its bound.
+    #[tokio::test(start_paused = true)]
+    async fn a_beat_that_starts_after_a_gap_confirms_nothing() {
+        let period = Duration::from_secs(1);
+        for parks in [false, true] {
+            let (held, started) = hanging(parks, period);
+            tokio::time::advance(3 * period).await;
+            while !started.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+            let reason = held.lost().expect("a late beat confirms nothing");
+            assert!(
+                reason.contains("within two periods"),
+                "parks {parks}: {reason}"
+            );
+        }
+    }
+
+    /// A beat on schedule that outlives its bound without the timer
+    /// recording the loss (the bound did not fire) confirms nothing where it
+    /// does not park: the claim reads lost two periods after the take.
+    #[tokio::test(start_paused = true)]
+    async fn a_beat_on_schedule_confirms_only_within_its_bound() {
+        let period = Duration::from_secs(1);
+        let (held, started) = hanging(false, period);
+        tokio::time::sleep(Duration::from_millis(1_900)).await;
+        assert!(started.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(held.lost(), None, "within two periods of the take");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let reason = held.lost().expect("past the beat's bound");
+        assert!(reason.contains("within two periods"), "{reason}");
+    }
+
     /// A beat in flight confirms the claim only where the backend's beat
-    /// parks before its bound. On a paused clock: a beat on schedule that
-    /// never returns, and a process stopped for three periods and resumed
-    /// (the clock advanced with the timer unpolled, its missed tick's beat
-    /// started at once on resume), read lost two periods after the take on
-    /// a backend whose beat does not park (PostgreSQL, MongoDB, Cassandra),
-    /// with that beat in flight; where it parks (SQLite) the claim reads
-    /// held while it waits.
+    /// parks before its bound, and there only while it is on schedule. On a
+    /// paused clock: a beat on schedule that never returns reads lost two
+    /// periods after the take on a backend whose beat does not park
+    /// (PostgreSQL, MongoDB, Cassandra), with that beat in flight, and held
+    /// while it waits where it parks (SQLite); a process stopped for three
+    /// periods and resumed (the clock advanced with the timer unpolled, its
+    /// missed tick's beat started at once on resume) reads lost on both,
+    /// since that beat started late.
     #[tokio::test(start_paused = true)]
     async fn a_beat_in_flight_confirms_the_claim_only_where_the_beat_parks() {
         let period = Duration::from_secs(1);
         for parks in [false, true] {
-            let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let held = HeldClaim::start(
-                Box::new(HangingBeat {
-                    parks,
-                    started: Arc::clone(&started),
-                }),
-                period,
-            );
+            let (held, started) = hanging(parks, period);
             tokio::time::sleep(Duration::from_millis(1_900)).await;
-            assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(started.load(std::sync::atomic::Ordering::Acquire));
             assert_eq!(held.lost(), None, "parks {parks}: within two periods");
             tokio::time::sleep(Duration::from_millis(200)).await;
             if parks {
@@ -1204,21 +1323,14 @@ mod tests {
             }
 
             // Stopped between beats and resumed.
-            let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let held = HeldClaim::start(
-                Box::new(HangingBeat {
-                    parks,
-                    started: Arc::clone(&started),
-                }),
-                period,
-            );
+            let (held, started) = hanging(parks, period);
             tokio::time::advance(3 * period).await;
             // The missed tick's beat starts within a few polls of the
             // timer task; a timer that counts its ticks from its first run
             // rather than the take would never start it, and the cell
             // fails here by name rather than spinning.
             let mut yields = 0;
-            while started.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            while !started.load(std::sync::atomic::Ordering::Acquire) {
                 yields += 1;
                 assert!(
                     yields < 1_000,
@@ -1226,10 +1338,50 @@ mod tests {
                 );
                 tokio::task::yield_now().await;
             }
-            if parks {
-                assert_eq!(held.lost(), None, "SQLite: the resumed beat parks");
+            let reason = held.lost().expect("the resumed beat confirms nothing");
+            assert!(
+                reason.contains("within two periods"),
+                "parks {parks}: {reason}"
+            );
+        }
+    }
+
+    /// The on-schedule window of a parked beat is 1.1 periods after the last
+    /// confirmed beat. On a paused clock, with the process stopped and
+    /// resumed so that the first beat starts late: a parked beat that
+    /// started 1.05 periods after the take still confirms the claim at 2.1
+    /// periods, and one that started 1.5 periods after it confirms nothing
+    /// there. Both read held at 1.9 periods (a beat confirmed within two).
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_beat_counts_only_when_it_started_within_a_tenth_past_its_period() {
+        let period = Duration::from_secs(1);
+        for (late, counts) in [
+            (Duration::from_millis(1_050), true),
+            (Duration::from_millis(1_500), false),
+        ] {
+            let taken = Instant::now();
+            let (held, started) = hanging(true, period);
+            tokio::time::advance(late).await;
+            // The late beat starts within a few polls of the timer task;
+            // the cell fails here by name rather than spinning.
+            let mut yields = 0;
+            while !started.load(std::sync::atomic::Ordering::Acquire) {
+                yields += 1;
+                assert!(
+                    yields < 1_000,
+                    "started {late:?}: the late beat did not start within {yields} yields"
+                );
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep_until(taken + Duration::from_millis(1_900)).await;
+            assert_eq!(held.lost(), None, "started {late:?}: within two periods");
+            tokio::time::sleep_until(taken + Duration::from_millis(2_100)).await;
+            if counts {
+                assert_eq!(held.lost(), None, "started {late:?}: on schedule");
             } else {
-                let reason = held.lost().expect("the resumed beat confirms nothing");
+                let reason = held
+                    .lost()
+                    .expect("a beat that started 1.5 periods late confirms nothing");
                 assert!(reason.contains("within two periods"), "{reason}");
             }
         }
@@ -1287,7 +1439,171 @@ mod tests {
         assert!(reason.contains("did not return within 1 s"), "{reason}");
     }
 
-    /// A claim whose beat panics, on SQLite's terms (it parks).
+    /// A beat that parks for 2.5 periods (SQLite's beat behind the write
+    /// lock) and then confirms: the next beat starts at once (its tick is
+    /// overdue), so each confirmation lands 2.5 periods after the one before.
+    struct ParkedThenConfirmed {
+        park: Duration,
+        beats: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl MaintenanceClaim for ParkedThenConfirmed {
+        fn generation(&self) -> u64 {
+            1
+        }
+        fn heartbeat(&self) -> BoxFuture<'_, Result<Heartbeat, StorageError>> {
+            Box::pin(async { Ok(Heartbeat::Confirmed) })
+        }
+        fn heartbeat_within(
+            &self,
+            _bound: Duration,
+        ) -> BoxFuture<'_, Option<Result<Heartbeat, StorageError>>> {
+            self.beats.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let park = self.park;
+            Box::pin(async move {
+                tokio::time::sleep(park).await;
+                Some(Ok(Heartbeat::Confirmed))
+            })
+        }
+        fn heartbeat_parks_before_its_bound(&self) -> bool {
+            true
+        }
+        fn release(&self) -> BoxFuture<'_, Result<(), StorageError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// `lost()` reads the last confirmation and the beat in flight as one
+    /// snapshot. While parked beats confirm one after another, each over
+    /// two periods after the last, a thread reading `lost()` without pause
+    /// never sees the claim lost: before a beat ends it sees the old
+    /// confirmation with the beat in flight, after it the new confirmation.
+    /// Read under two locks, the beat's end can fall between the two reads
+    /// (the old confirmation, then no beat in flight), which reads lost.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_parked_beat_that_confirms_is_never_read_lost_as_it_ends() {
+        let period = Duration::from_millis(20);
+        let beats = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let held = Arc::new(HeldClaim::start(
+            Box::new(ParkedThenConfirmed {
+                park: period * 5 / 2,
+                beats: Arc::clone(&beats),
+            }),
+            period,
+        ));
+        // From the second beat on, each starts as the one before confirms.
+        while beats.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let first = beats.load(std::sync::atomic::Ordering::SeqCst);
+        let reader = Arc::clone(&held);
+        let reads = tokio::task::spawn_blocking(move || {
+            let until = std::time::Instant::now() + Duration::from_millis(1_500);
+            let mut reads = 0_u64;
+            while std::time::Instant::now() < until {
+                if let Some(reason) = reader.lost() {
+                    return Err(format!("read lost after {reads} reads: {reason}"));
+                }
+                reads += 1;
+            }
+            Ok(reads)
+        })
+        .await
+        .expect("the reader");
+        let ended = beats.load(std::sync::atomic::Ordering::SeqCst) - first;
+        let reads = reads.unwrap_or_else(|e| panic!("{e}"));
+        assert!(ended >= 10, "only {ended} beats ended during {reads} reads");
+    }
+
+    /// Beat 1 stamps the record at its start and answers 0.99 period later;
+    /// beat 2 never answers (the default `heartbeat_within` bounds it).
+    struct SlowThenHanging {
+        beats: Arc<std::sync::atomic::AtomicUsize>,
+        stamp: Arc<Mutex<Option<Instant>>>,
+    }
+
+    impl MaintenanceClaim for SlowThenHanging {
+        fn generation(&self) -> u64 {
+            1
+        }
+        fn heartbeat(&self) -> BoxFuture<'_, Result<Heartbeat, StorageError>> {
+            if self.beats.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                *self.stamp.lock().unwrap() = Some(Instant::now());
+                Box::pin(async {
+                    tokio::time::sleep(Duration::from_millis(990)).await;
+                    Ok(Heartbeat::Confirmed)
+                })
+            } else {
+                Box::pin(std::future::pending())
+            }
+        }
+        fn release(&self) -> BoxFuture<'_, Result<(), StorageError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Where the beat does not park (PostgreSQL, MongoDB, Cassandra), a
+    /// beat in flight confirms nothing, however close to schedule it
+    /// started. Beat 1 stamps the record at 1.0 s and answers at 1.99 s;
+    /// the process then does not run for 1.09 s (a stop, a starved thread),
+    /// so tick 2, due at 2.0 s, starts at 3.085 s, within 1.1 periods of
+    /// the confirmation, and hangs. Three periods after the stamp, the
+    /// earliest a take under a three-period stale window succeeds, the
+    /// claim reads lost: the last confirmed beat is over two periods old.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_beat_in_flight_confirms_nothing_where_it_does_not_park() {
+        let period = Duration::from_secs(1);
+        let beats = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stamp = Arc::new(Mutex::new(None));
+        let held = HeldClaim::start(
+            Box::new(SlowThenHanging {
+                beats: Arc::clone(&beats),
+                stamp: Arc::clone(&stamp),
+            }),
+            period,
+        );
+        tokio::time::sleep(Duration::from_millis(1_995)).await;
+        assert_eq!(beats.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(held.lost(), None, "beat 1 confirmed");
+        let stamp = stamp.lock().unwrap().expect("beat 1 stamped");
+        tokio::time::advance(Duration::from_millis(1_090)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            beats.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "beat 2 is in flight"
+        );
+        tokio::time::sleep_until(stamp + 3 * period + Duration::from_millis(50)).await;
+        let reason = held.lost().expect("a beat in flight confirms nothing here");
+        assert!(reason.contains("within two periods"), "{reason}");
+        assert!(
+            !held.lost_signal().is_cancelled(),
+            "beat 2's bound has not fired: the reading alone says lost"
+        );
+    }
+
+    /// The deadline a deletion walk stops at is two periods after the last
+    /// confirmed beat, and a re-check moves it.
+    #[tokio::test(start_paused = true)]
+    async fn the_acting_deadline_is_two_periods_after_the_last_confirmed_beat() {
+        let fake = Arc::new(FakeClaim::default());
+        let period = Duration::from_secs(1);
+        let taken = Instant::now();
+        let held = held_over(&fake, period);
+        held.timer.abort();
+        assert_eq!(held.acting_deadline(), taken + 2 * period);
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        held.recheck().await.expect("confirmed");
+        assert_eq!(held.acting_deadline(), Instant::now() + 2 * period);
+        tokio::time::sleep_until(held.acting_deadline()).await;
+        assert_eq!(held.lost(), None, "at the deadline");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(held.lost().is_some(), "past the deadline");
+    }
+
+    /// A claim whose beat panics (on SQLite's terms: it parks).
     struct PanickingBeat;
 
     impl MaintenanceClaim for PanickingBeat {
@@ -1320,8 +1636,8 @@ mod tests {
 
     /// The re-check before a step that cannot be undone: a beat that
     /// confirms counts as a confirmed beat; one that finds the claim lost
-    /// records the loss as the timer would, and a claim already read as
-    /// lost answers without a beat.
+    /// records the loss (the reason, the token) as the timer would, and a
+    /// loss already recorded answers without a beat.
     #[tokio::test(start_paused = true)]
     async fn a_recheck_confirms_the_claim_or_records_its_loss() {
         let fake = Arc::new(FakeClaim::default());
@@ -1345,6 +1661,7 @@ mod tests {
         let reason = held.recheck().await.expect_err("taken over");
         assert!(reason.contains("another holder took it over"), "{reason}");
         assert_eq!(held.lost().as_deref(), Some(reason.as_str()));
+        assert!(held.lost_signal().is_cancelled());
         *fake.lost.lock().unwrap() = false;
         assert_eq!(held.recheck().await, Err(reason), "a loss stays recorded");
     }

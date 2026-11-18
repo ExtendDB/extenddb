@@ -87,7 +87,7 @@
 //! the operations that touch the store refused, and the check run again
 //! each reconciler cycle until it passes.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use extenddb_backup_store::{BackupStore, BackupStoreKind, StoreError};
@@ -138,8 +138,10 @@ pub enum Caller {
     /// run): as `Command`, and no check of the store runs, so a root is left
     /// as it is found (neither the default directory nor an identity file is
     /// created; a default root that does not exist yet leaves the store
-    /// unconfigured, logged); the store is returned `checking` and the
-    /// command reads what it needs itself.
+    /// unconfigured, logged, as [`NotConfigured::DefaultRootMissing`] or,
+    /// when the catalog holds rows for it, as
+    /// [`NotConfigured::DefaultRootMissingWithRows`]); the store is
+    /// returned `checking` and the command reads what it needs itself.
     ReadOnlyCommand,
 }
 
@@ -151,9 +153,19 @@ pub enum NotConfigured {
     Absent,
     /// `kind = "disabled"`.
     Disabled,
-    /// A read-only command found that the default root does not exist yet:
-    /// no server has run with this database file.
+    /// A read-only command found that the default root does not exist yet,
+    /// and the catalog holds no rows for it: no server has run with this
+    /// database file.
     DefaultRootMissing(PathBuf),
+    /// A read-only command found the default root missing while the catalog
+    /// holds rows for it: moved away, or a symbolic link to a volume that
+    /// is gone. `label` is the root as the rows record it (the link's
+    /// target, for a link), `store_ids` the ids they carry.
+    DefaultRootMissingWithRows {
+        root: PathBuf,
+        label: String,
+        store_ids: Vec<String>,
+    },
     /// The defaulted root could not be created, opened, validated or checked
     /// while the catalog has no rows for it (module doc): the warning path.
     DefaultRootUnusable {
@@ -180,6 +192,18 @@ impl std::fmt::Display for NotConfigured {
                 "the default root {} does not exist yet: no server has run with this database \
                  file, so there are no store-backed backups to list, purge or sync",
                 root.display()
+            ),
+            Self::DefaultRootMissingWithRows {
+                root,
+                label,
+                store_ids,
+            } => write!(
+                f,
+                "the default root {} is missing while the catalog holds rows for {label} (store \
+                 id {}): a volume that is not mounted, a directory moved away, or a link to a \
+                 volume that is gone; put the root back before listing, purging or syncing it",
+                root.display(),
+                store_ids.join(", ")
             ),
             Self::DefaultRootUnusable { root, problem } => write!(
                 f,
@@ -335,6 +359,15 @@ pub async fn configure_described<C: BackupCatalog + ?Sized>(
         && let Some(fs) = &config.filesystem
         && !fs.path.exists()
     {
+        if let Some((label, store_ids)) = missing_root_with_rows(catalog, &fs.path).await? {
+            let why = NotConfigured::DefaultRootMissingWithRows {
+                root: fs.path.clone(),
+                label,
+                store_ids,
+            };
+            tracing::warn!("backup store: {why}");
+            return Ok(StoreSetup::without_store(runtime, why));
+        }
         tracing::info!(
             "backup store: the default root {} does not exist yet (no server has run with this \
              database file); there are no store-backed backups to list",
@@ -779,6 +812,117 @@ fn banner_target(config: &extenddb_backup_store::BackupStoreConfig) -> String {
     }
 }
 
+/// How many symbolic links [`link_chain`] replaces before it stops: the
+/// usual `SYMLOOP_MAX`, past which the kernel refuses the path (`ELOOP`).
+const LINK_HOPS: usize = 40;
+
+/// The label of a defaulted filesystem root that does not exist, and the
+/// store ids the catalog records for it, when it records any. The labels
+/// tried, in order: each path of [`link_chain`] (the path as configured,
+/// then the path after each symbolic link along it is replaced by its
+/// target), each also with its longest existing ancestor canonicalized
+/// ([`canonical_ancestor`]). Rows recorded through links carry the
+/// canonical directory the last target names, which the last of them is
+/// when the target's own directory is gone.
+async fn missing_root_with_rows<C: BackupCatalog + ?Sized>(
+    catalog: &C,
+    path: &Path,
+) -> anyhow::Result<Option<(String, Vec<String>)>> {
+    let mut labels: Vec<String> = Vec::new();
+    for path in &link_chain(path) {
+        for label in [Some(path.clone()), canonical_ancestor(path)]
+            .into_iter()
+            .flatten()
+        {
+            let label = label.display().to_string();
+            if !labels.contains(&label) {
+                labels.push(label);
+            }
+        }
+    }
+    for label in labels {
+        let ids = catalog
+            .read_store_ids(StoreKind::Filesystem, &label)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("the catalog's rows for the default root could not be read: {e}")
+            })?;
+        if !ids.is_empty() {
+            return Ok(Some((label, ids)));
+        }
+    }
+    Ok(None)
+}
+
+/// `path`, then the path each time the first symbolic link along it, read
+/// component by component from the start, is replaced by its target (a
+/// relative target joined to the link's directory), whether or not the
+/// target exists, the way the kernel resolves a path; at most
+/// [`LINK_HOPS`] links, so a loop of links ends.
+fn link_chain(path: &Path) -> Vec<PathBuf> {
+    let mut chain = vec![path.to_path_buf()];
+    let mut current = path.to_path_buf();
+    for _ in 0..LINK_HOPS {
+        let components: Vec<Component<'_>> = current.components().collect();
+        let mut prefix = PathBuf::new();
+        let mut replaced = None;
+        for (i, component) in components.iter().enumerate() {
+            prefix.push(component);
+            if !matches!(component, Component::Normal(_)) {
+                continue;
+            }
+            if let Ok(target) = std::fs::read_link(&prefix) {
+                let base = match prefix.parent() {
+                    Some(parent) if target.is_relative() => parent.join(target),
+                    _ => target,
+                };
+                replaced = Some(
+                    components[i + 1..]
+                        .iter()
+                        .fold(base, |path, rest| path.join(rest)),
+                );
+                break;
+            }
+        }
+        match replaced {
+            Some(next) => {
+                chain.push(next.clone());
+                current = next;
+            }
+            None => break,
+        }
+    }
+    chain
+}
+
+/// `path` with its longest existing ancestor canonicalized and the rest of
+/// its components joined back on (a `..` among them taking off the
+/// component before it, since none of them exists to be a link); `None`
+/// when no ancestor resolves.
+fn canonical_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut rest: Vec<Component<'_>> = Vec::new();
+    let mut current = path;
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(current) {
+            let mut resolved = canonical;
+            for component in rest.iter().rev() {
+                if *component == Component::ParentDir {
+                    resolved.pop();
+                } else {
+                    resolved.push(component);
+                }
+            }
+            return Some(resolved);
+        }
+        match current.components().next_back()? {
+            component @ (Component::Normal(_) | Component::ParentDir) => rest.push(component),
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+        current = current.parent()?;
+    }
+}
+
 /// A path for an operator's line: quoted when it is empty or begins or ends
 /// with whitespace, so the line shows where it ends.
 fn shown_path(path: &Path) -> String {
@@ -1027,17 +1171,19 @@ mod tests {
     use extenddb_storage::BoxedFuture;
     use extenddb_storage::backup_catalog::{
         BackupKey, BackupRow, BackupStatus, DeleteStart, JobClaim, MaintenanceClaim, RestoreJobRow,
-        RestoreTargetKey, StoreIdentity, TimeBounds,
+        RestoreTargetKey, StoreIdentity, StoreRootCount, TimeBounds,
     };
     use extenddb_storage::error::StorageError;
     use futures::stream::BoxStream;
 
-    /// A catalog whose rows for every root carry `ids`, or whose rows cannot
-    /// be read (`rows_unreadable`), with no backup row to list; every other
-    /// method is an error, since the startup checks never reach it.
+    /// A catalog whose rows for every root carry `ids` (only for the root
+    /// `ids_root` when it is set), or whose rows cannot be read
+    /// (`rows_unreadable`), with no backup row to list; every other method
+    /// is an error, since the startup checks never reach it.
     #[derive(Default)]
     struct StubCatalog {
         ids: Vec<String>,
+        ids_root: Option<String>,
         rows_unreadable: bool,
     }
 
@@ -1138,6 +1284,12 @@ mod tests {
         ) -> BoxedFuture<'a, Result<Option<BackupRow>, StorageError>> {
             unused()
         }
+        fn row_holding_backup_id<'a>(
+            &'a self,
+            _backup_id: &'a str,
+        ) -> BoxedFuture<'a, Result<Option<BackupRow>, StorageError>> {
+            unused()
+        }
         fn start_backup_delete<'a>(
             &'a self,
             _key: &'a BackupKey,
@@ -1153,6 +1305,8 @@ mod tests {
         fn remove_backup_row<'a>(
             &'a self,
             _key: &'a BackupKey,
+            _store_kind: StoreKind,
+            _store_root: &'a str,
         ) -> BoxedFuture<'a, Result<bool, StorageError>> {
             unused()
         }
@@ -1209,7 +1363,7 @@ mod tests {
         fn read_store_ids<'a>(
             &'a self,
             _store_kind: StoreKind,
-            _store_root: &'a str,
+            store_root: &'a str,
         ) -> BoxedFuture<'a, Result<Vec<String>, StorageError>> {
             if self.rows_unreadable {
                 return Box::pin(async {
@@ -1218,8 +1372,33 @@ mod tests {
                     ))
                 });
             }
-            let ids = self.ids.clone();
+            let ids = match &self.ids_root {
+                Some(root) if root != store_root => Vec::new(),
+                _ => self.ids.clone(),
+            };
             Box::pin(async move { Ok(ids) })
+        }
+        fn list_backup_rows_by_root<'a>(
+            &'a self,
+            _store_kind: StoreKind,
+            _store_root: &'a str,
+            _status: Option<BackupStatus>,
+        ) -> BoxStream<'a, Result<BackupRow, StorageError>> {
+            Box::pin(futures::stream::once(unused()))
+        }
+        fn rewrite_store<'a>(
+            &'a self,
+            _from_kind: StoreKind,
+            _from_root: &'a str,
+            _keys: &'a [BackupKey],
+            _to: &'a StoreIdentity,
+        ) -> BoxedFuture<'a, Result<u64, StorageError>> {
+            unused()
+        }
+        fn summarize_store_roots(
+            &self,
+        ) -> BoxedFuture<'_, Result<Vec<StoreRootCount>, StorageError>> {
+            unused()
         }
         fn maintenance_claim<'a>(
             &'a self,
@@ -1652,6 +1831,17 @@ mod tests {
                 .to_string()
                 .contains("/srv/db/backups does not exist yet")
         );
+        let with_rows = NotConfigured::DefaultRootMissingWithRows {
+            root: PathBuf::from("/srv/db/backups"),
+            label: "/mnt/vol/backups".to_owned(),
+            store_ids: vec!["store-1".to_owned()],
+        }
+        .to_string();
+        assert!(
+            with_rows.contains("/srv/db/backups is missing while the catalog holds rows for /mnt/vol/backups (store id store-1)")
+                && !with_rows.contains("no server has run"),
+            "{with_rows}"
+        );
         let unusable = NotConfigured::DefaultRootUnusable {
             root: "/srv/db/backups".to_owned(),
             problem: "extenddb-store.json names catalog other".to_owned(),
@@ -1750,5 +1940,103 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The labels a missing default root's rows are looked up under follow
+    /// every symbolic link along the path: a chain of two links, a
+    /// directory link in the middle of the path, a chain of relative
+    /// links, a path spelled through a linked directory, and one spelled
+    /// with `..` (its canonical form), each with the link's volume renamed
+    /// away; a loop of links ends with no label found.
+    #[tokio::test]
+    async fn a_missing_default_root_is_looked_up_through_every_link_of_its_path() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let found = |label: &Path| StubCatalog {
+            ids: vec!["store-1".to_owned()],
+            ids_root: Some(label.display().to_string()),
+            ..StubCatalog::default()
+        };
+        let lookup = |catalog: StubCatalog, path: PathBuf| async move {
+            missing_root_with_rows(&catalog, &path).await.unwrap()
+        };
+        let expect = |label: &Path| Some((label.display().to_string(), vec!["store-1".to_owned()]));
+
+        // backups -> l2 -> vol/backups, absolute targets, vol renamed away.
+        let a = base.join("a");
+        std::fs::create_dir_all(a.join("vol/backups")).unwrap();
+        symlink(a.join("vol/backups"), a.join("l2")).unwrap();
+        symlink(a.join("l2"), a.join("backups")).unwrap();
+        std::fs::rename(a.join("vol"), a.join("vol-away")).unwrap();
+        let label = a.join("vol/backups");
+        assert_eq!(
+            lookup(found(&label), a.join("backups")).await,
+            expect(&label)
+        );
+
+        // data -> mnt/disk1, the path data/backups, disk1 renamed away.
+        let b = base.join("b");
+        std::fs::create_dir_all(b.join("mnt/disk1/backups")).unwrap();
+        symlink(b.join("mnt/disk1"), b.join("data")).unwrap();
+        std::fs::rename(b.join("mnt/disk1"), b.join("mnt/disk1-away")).unwrap();
+        let label = b.join("mnt/disk1/backups");
+        assert_eq!(
+            lookup(found(&label), b.join("data/backups")).await,
+            expect(&label)
+        );
+
+        // backups -> l2 -> vol/backups, relative targets, vol renamed away.
+        let c = base.join("c");
+        std::fs::create_dir_all(c.join("vol/backups")).unwrap();
+        symlink("vol/backups", c.join("l2")).unwrap();
+        symlink("l2", c.join("backups")).unwrap();
+        std::fs::rename(c.join("vol"), c.join("vol-away")).unwrap();
+        let label = c.join("vol/backups");
+        assert_eq!(
+            lookup(found(&label), c.join("backups")).await,
+            expect(&label)
+        );
+
+        // The database's directory reached through a linked directory: the
+        // rows carry the real directory.
+        let e = base.join("e");
+        std::fs::create_dir_all(e.join("real/db")).unwrap();
+        symlink(e.join("real"), e.join("alias")).unwrap();
+        let label = e.join("real/db/backups");
+        assert_eq!(
+            lookup(found(&label), e.join("alias/db/backups")).await,
+            expect(&label)
+        );
+
+        // A path spelled with `..`: its canonical form.
+        let d = base.join("d");
+        std::fs::create_dir_all(d.join("db/sub")).unwrap();
+        let label = d.join("db/backups");
+        assert_eq!(
+            lookup(found(&label), d.join("db/sub/../backups")).await,
+            expect(&label)
+        );
+
+        // A loop of links: the walk stops at the hop limit, nothing found.
+        // The walk runs on its own thread, so a walk that does not stop
+        // fails this cell by name within seconds rather than hanging it.
+        let f = base.join("f");
+        std::fs::create_dir_all(&f).unwrap();
+        symlink(f.join("y"), f.join("x")).unwrap();
+        symlink(f.join("x"), f.join("y")).unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let looped = f.join("x/backups");
+        std::thread::spawn(move || {
+            let _ = sent.send(link_chain(&looped).len());
+        });
+        let hops = received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the walk of a loop of links ends at the hop limit");
+        assert!(hops <= LINK_HOPS + 1, "{hops} hops");
+        assert_eq!(
+            lookup(found(&base.join("elsewhere")), f.join("x/backups")).await,
+            None
+        );
     }
 }

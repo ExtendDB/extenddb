@@ -17,21 +17,81 @@ use super::signing_key;
 /// Maximum allowed clock skew between client and server (±15 minutes).
 const MAX_CLOCK_SKEW_SECS: i64 = 15 * 60;
 
+/// The scope complaint for a date that is not the `YYYYMMDD` prefix of
+/// `X-Amz-Date`, with the trailing period and space the service sends.
+pub(crate) const SCOPE_DATE_COMPLAINT: &str =
+    "Date in Credential scope does not match YYYYMMDD from ISO-8601 version of date from HTTP. ";
+
+/// Whether the scope `date` is the `YYYYMMDD` prefix of `timestamp`.
+///
+/// The comparison is on bytes, so a date of another length, a date carrying
+/// letters and a date naming a day that does not exist are all a mismatch.
+fn scope_date_matches(date: &str, timestamp: &str) -> bool {
+    timestamp.get(..8) == Some(date)
+}
+
+/// Check the credential scope's region, service and date against this server
+/// and the request timestamp.
+///
+/// `timestamp` is the `X-Amz-Date` value, which `validate_timestamp` returns.
+///
+/// The service reports every scope complaint in one message, region first,
+/// then service, then the date, each sentence ending with a space (measured
+/// 2026-09-16: a scope wrong in region and service gives "Credential should
+/// be scoped to a valid region. Credential should be scoped to correct
+/// service: 'dynamodb'. "). The region is not named in the message.
+///
+/// The date is compared here, before the access key is looked up, because the
+/// service answers the same message for a key that exists and one that does
+/// not (measured 2026-10-23 on signed ListTables requests: a scope date of the
+/// previous day answers InvalidSignatureException with the date complaint for
+/// an unknown key and for a known key). `verify_signature` compares it again,
+/// so a caller that verifies a signature without this check keeps the same
+/// refusal.
+///
+/// # Errors
+///
+/// Returns `InvalidSignatureException` carrying the accumulated complaints
+/// when the region is not `expected_region`, the service is not `dynamodb`, or
+/// the scope date is not the `YYYYMMDD` prefix of `timestamp`.
+pub fn check_scope(
+    parsed: &ParsedAuthorization,
+    expected_region: &str,
+    timestamp: &str,
+) -> Result<(), DynamoDbError> {
+    let mut complaints = String::new();
+    if parsed.region != expected_region {
+        complaints.push_str("Credential should be scoped to a valid region. ");
+    }
+    if parsed.service != "dynamodb" {
+        complaints.push_str("Credential should be scoped to correct service: 'dynamodb'. ");
+    }
+    if !scope_date_matches(&parsed.date, timestamp) {
+        complaints.push_str(SCOPE_DATE_COMPLAINT);
+    }
+    if complaints.is_empty() {
+        Ok(())
+    } else {
+        Err(DynamoDbError::InvalidSignatureException(complaints))
+    }
+}
+
 /// Verify a `SigV4` signature against the request.
 ///
 /// # Arguments
-/// * `parsed` — The parsed `Authorization` header.
-/// * `secret_key` — The plaintext secret access key.
-/// * `method` — HTTP method (e.g. `POST`).
-/// * `uri_path` — URI path (e.g. `/`).
-/// * `query_string` — Query string (empty for `DynamoDB`).
-/// * `headers` — The full request headers.
-/// * `body` — The request body bytes.
+/// * `parsed` - The parsed `Authorization` header.
+/// * `signing_key` - The `SigV4` signing key of the access key for the
+///   request's scope date, region and service, from the credential cache.
+/// * `method` - HTTP method (e.g. `POST`).
+/// * `uri_path` - URI path (e.g. `/`).
+/// * `query_string` - Query string (empty for `DynamoDB`).
+/// * `headers` - The full request headers.
+/// * `body` - The request body bytes.
 ///
 /// Returns `Ok(())` on success, or an appropriate auth error on failure.
 pub fn verify_signature(
     parsed: &ParsedAuthorization,
-    secret_key: &str,
+    signing_key: &[u8; 32],
     method: &str,
     uri_path: &str,
     query_string: &str,
@@ -46,11 +106,13 @@ pub fn verify_signature(
         ));
     }
 
-    // CB-5: Validate credential-scope date matches X-Amz-Date[..8].
+    // CB-5: Validate credential-scope date matches X-Amz-Date[..8]. The
+    // pre-lookup check_scope compares it too; this keeps the refusal for a
+    // caller that verifies a signature on its own.
     let timestamp = extract_timestamp(headers)?;
-    if timestamp.len() < 8 || parsed.date != timestamp[..8] {
+    if !scope_date_matches(&parsed.date, &timestamp) {
         return Err(DynamoDbError::InvalidSignatureException(
-            "Date in Credential scope does not match YYYYMMDD from ISO-8601 version of date from HTTP".to_owned(),
+            SCOPE_DATE_COMPLAINT.to_owned(),
         ));
     }
 
@@ -59,16 +121,6 @@ pub fn verify_signature(
     if !signed_lower.split(';').any(|h| h == "host") {
         return Err(DynamoDbError::InvalidSignatureException(
             "\"Host\" must be a \"SignedHeader\" in the AWS Authorization.".to_owned(),
-        ));
-    }
-
-    // Reject UNSIGNED-PAYLOAD: real DynamoDB requires a computed body hash
-    // for all API calls. UNSIGNED-PAYLOAD is only valid for S3.
-    if let Some(content_sha) = headers.get("x-amz-content-sha256")
-        && content_sha.as_bytes() == b"UNSIGNED-PAYLOAD"
-    {
-        return Err(DynamoDbError::InvalidSignatureException(
-            "UNSIGNED-PAYLOAD is not supported for DynamoDB operations.".to_owned(),
         ));
     }
 
@@ -90,10 +142,8 @@ pub fn verify_signature(
 
     let sts = canonical::string_to_sign(&timestamp, &scope, &creq);
 
-    // Derive signing key and compute expected signature
-    let signing_key =
-        signing_key::derive_signing_key(secret_key, &parsed.date, &parsed.region, &parsed.service);
-    let expected = signing_key::compute_signature(&signing_key, &sts);
+    // Compute the expected signature under the cached signing key.
+    let expected = signing_key::compute_signature(signing_key, &sts);
 
     // auth H-1: Use InvalidSignatureException for signature mismatches,
     // distinct from UnrecognizedClientException (unknown key).
@@ -108,9 +158,11 @@ pub fn verify_signature(
 
 /// Validate the request timestamp is within ±15 minutes of now.
 ///
+/// Returns the `X-Amz-Date` value, which the caller passes to `check_scope`.
+///
 /// Returns `UnrecognizedClientException` if the timestamp is missing or out of range.
 /// Returns `InternalServerError` if the system clock is misconfigured.
-pub fn validate_timestamp(headers: &HeaderMap) -> Result<(), DynamoDbError> {
+pub fn validate_timestamp(headers: &HeaderMap) -> Result<String, DynamoDbError> {
     let timestamp = extract_timestamp(headers)?;
 
     // Parse X-Amz-Date: YYYYMMDDTHHMMSSZ
@@ -133,7 +185,7 @@ pub fn validate_timestamp(headers: &HeaderMap) -> Result<(), DynamoDbError> {
         ));
     }
 
-    Ok(())
+    Ok(timestamp)
 }
 
 /// Extract the timestamp from `X-Amz-Date` header.
@@ -255,7 +307,7 @@ mod tests {
     fn reject_wrong_service_in_scope() {
         let parsed = make_parsed("s3", "20260415", "content-type;host;x-amz-date");
         let headers = make_headers("20260415T120000Z");
-        let err = verify_signature(&parsed, "secret", "POST", "/", "", &headers, b"{}");
+        let err = verify_signature(&parsed, &key(SECRET), "POST", "/", "", &headers, b"{}");
         match err {
             Err(DynamoDbError::InvalidSignatureException(msg)) => {
                 assert!(msg.contains("dynamodb"), "Expected 'dynamodb' in: {msg}");
@@ -269,16 +321,62 @@ mod tests {
     fn reject_scope_date_mismatch() {
         let parsed = make_parsed("dynamodb", "20260414", "content-type;host;x-amz-date");
         let headers = make_headers("20260415T120000Z");
-        let err = verify_signature(&parsed, "secret", "POST", "/", "", &headers, b"{}");
+        let err = verify_signature(&parsed, &key(SECRET), "POST", "/", "", &headers, b"{}");
         match err {
             Err(DynamoDbError::InvalidSignatureException(msg)) => {
-                assert!(
-                    msg.contains("Date in Credential scope"),
-                    "Expected date mismatch message: {msg}"
-                );
+                assert_eq!(msg, SCOPE_DATE_COMPLAINT);
             }
             other => panic!("Expected InvalidSignatureException, got: {other:?}"),
         }
+    }
+
+    /// `check_scope` accepts a scope whose date is the `YYYYMMDD` prefix of
+    /// the timestamp, and refuses one that is not.
+    #[test]
+    fn check_scope_compares_the_date_against_the_timestamp() {
+        let parsed = make_parsed("dynamodb", "20260415", "content-type;host;x-amz-date");
+        check_scope(&parsed, "us-east-1", "20260415T120000Z").unwrap();
+        match check_scope(&parsed, "us-east-1", "20260414T120000Z") {
+            Err(DynamoDbError::InvalidSignatureException(msg)) => {
+                assert_eq!(msg, SCOPE_DATE_COMPLAINT);
+            }
+            other => panic!("Expected InvalidSignatureException, got: {other:?}"),
+        }
+    }
+
+    /// A timestamp shorter than `YYYYMMDD` carries no date to compare, so
+    /// the scope date cannot match it. `validate_timestamp` rejects such a
+    /// value before `check_scope` sees it in `authenticate`; this holds the
+    /// behaviour for any other caller.
+    #[test]
+    fn check_scope_refuses_a_timestamp_too_short_to_carry_a_date() {
+        let parsed = make_parsed("dynamodb", "20260415", "content-type;host;x-amz-date");
+        for timestamp in ["", "2026", "2026041"] {
+            match check_scope(&parsed, "us-east-1", timestamp) {
+                Err(DynamoDbError::InvalidSignatureException(msg)) => {
+                    assert_eq!(msg, SCOPE_DATE_COMPLAINT, "{timestamp:?}");
+                }
+                other => panic!("{timestamp:?}: expected InvalidSignatureException, got {other:?}"),
+            }
+        }
+    }
+
+    /// `validate_timestamp` hands the `X-Amz-Date` value back so the caller
+    /// compares the scope date against the same string.
+    #[test]
+    fn validate_timestamp_returns_the_header_value() {
+        let now = time::OffsetDateTime::now_utc();
+        let value = format!(
+            "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+            now.year(),
+            now.month() as u8,
+            now.day(),
+            now.hour(),
+            now.minute(),
+            now.second(),
+        );
+        let headers = make_headers(&value);
+        assert_eq!(validate_timestamp(&headers).unwrap(), value);
     }
 
     /// CB-6: Reject SignedHeaders missing "host".
@@ -286,7 +384,7 @@ mod tests {
     fn reject_missing_host_in_signed_headers() {
         let parsed = make_parsed("dynamodb", "20260415", "content-type;x-amz-date");
         let headers = make_headers("20260415T120000Z");
-        let err = verify_signature(&parsed, "secret", "POST", "/", "", &headers, b"{}");
+        let err = verify_signature(&parsed, &key(SECRET), "POST", "/", "", &headers, b"{}");
         match err {
             Err(DynamoDbError::InvalidSignatureException(msg)) => {
                 assert!(msg.contains("Host"), "Expected 'Host' in message: {msg}");
@@ -295,23 +393,42 @@ mod tests {
         }
     }
 
-    /// Reject UNSIGNED-PAYLOAD for DynamoDB API calls.
+    /// A client that signs the payload line as the `UNSIGNED-PAYLOAD` literal
+    /// (an S3 convention) fails with the plain mismatch, which is what the
+    /// service returns (measured 2026-09-16): the payload line is always the
+    /// hash of the received body.
     #[test]
-    fn reject_unsigned_payload() {
-        let parsed = make_parsed(
-            "dynamodb",
-            "20260415",
-            "content-type;host;x-amz-content-sha256;x-amz-date",
-        );
+    fn unsigned_payload_literal_is_a_plain_signature_mismatch() {
         let mut headers = make_headers("20260415T120000Z");
         headers.insert("x-amz-content-sha256", "UNSIGNED-PAYLOAD".parse().unwrap());
-        let err = verify_signature(&parsed, "secret", "POST", "/", "", &headers, b"{}");
-        match err {
+        let signed = "content-type;host;x-amz-content-sha256;x-amz-date";
+        // Sign the way such a client does: the literal in place of the body hash.
+        let creq = canonical::canonical_request("POST", "/", "", &headers, signed, SIGNED_BODY)
+            .rsplit_once('\n')
+            .map(|(head, _)| format!("{head}\nUNSIGNED-PAYLOAD"))
+            .unwrap();
+        let sts = canonical::string_to_sign(
+            "20260415T120000Z",
+            "20260415/us-east-1/dynamodb/aws4_request",
+            &creq,
+        );
+        let mut parsed = make_parsed("dynamodb", "20260415", signed);
+        parsed.signature = signing_key::compute_signature(&key(SECRET), &sts);
+        match verify_signature(
+            &parsed,
+            &key(SECRET),
+            "POST",
+            "/",
+            "",
+            &headers,
+            SIGNED_BODY,
+        ) {
             Err(DynamoDbError::InvalidSignatureException(msg)) => {
                 assert!(
-                    msg.contains("UNSIGNED-PAYLOAD"),
-                    "Expected 'UNSIGNED-PAYLOAD' in: {msg}"
+                    msg.starts_with("The request signature we calculated does not match"),
+                    "{msg}"
                 );
+                assert!(!msg.contains("UNSIGNED-PAYLOAD"), "{msg}");
             }
             other => panic!("Expected InvalidSignatureException, got: {other:?}"),
         }
@@ -323,7 +440,15 @@ mod tests {
         let parsed = make_parsed("dynamodb", "20260415", "content-type;host;x-amz-date");
         let headers = make_headers("20260415T120000Z");
         // Wrong secret → wrong signature → InvalidSignatureException
-        let err = verify_signature(&parsed, "wrong-secret", "POST", "/", "", &headers, b"{}");
+        let err = verify_signature(
+            &parsed,
+            &key("wrong-secret"),
+            "POST",
+            "/",
+            "",
+            &headers,
+            b"{}",
+        );
         match err {
             Err(DynamoDbError::InvalidSignatureException(msg)) => {
                 assert!(
@@ -348,10 +473,14 @@ mod tests {
             "20260415/us-east-1/dynamodb/aws4_request",
             &creq,
         );
-        let key = signing_key::derive_signing_key(SECRET, "20260415", "us-east-1", "dynamodb");
         let mut parsed = make_parsed("dynamodb", "20260415", signed_headers);
-        parsed.signature = signing_key::compute_signature(&key, &sts);
+        parsed.signature = signing_key::compute_signature(&key(SECRET), &sts);
         parsed
+    }
+
+    /// The signing key of `secret` for the scope every test here signs with.
+    fn key(secret: &str) -> zeroize::Zeroizing<[u8; 32]> {
+        signing_key::derive_signing_key(secret, "20260415", "us-east-1", "dynamodb")
     }
 
     fn assert_signature_mismatch(result: Result<(), DynamoDbError>) {
@@ -370,7 +499,16 @@ mod tests {
     fn correctly_signed_body_verifies() {
         let headers = make_headers("20260415T120000Z");
         let parsed = sign(&headers, "content-type;host;x-amz-date", SIGNED_BODY);
-        verify_signature(&parsed, SECRET, "POST", "/", "", &headers, SIGNED_BODY).unwrap();
+        verify_signature(
+            &parsed,
+            &key(SECRET),
+            "POST",
+            "/",
+            "",
+            &headers,
+            SIGNED_BODY,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -379,7 +517,7 @@ mod tests {
         let parsed = sign(&headers, "content-type;host;x-amz-date", SIGNED_BODY);
         assert_signature_mismatch(verify_signature(
             &parsed,
-            SECRET,
+            &key(SECRET),
             "POST",
             "/",
             "",
@@ -402,10 +540,19 @@ mod tests {
         let signed = "content-type;host;x-amz-content-sha256;x-amz-date";
         let parsed = sign(&headers, signed, SIGNED_BODY);
         // Sanity: the same request with the signed body verifies.
-        verify_signature(&parsed, SECRET, "POST", "/", "", &headers, SIGNED_BODY).unwrap();
+        verify_signature(
+            &parsed,
+            &key(SECRET),
+            "POST",
+            "/",
+            "",
+            &headers,
+            SIGNED_BODY,
+        )
+        .unwrap();
         assert_signature_mismatch(verify_signature(
             &parsed,
-            SECRET,
+            &key(SECRET),
             "POST",
             "/",
             "",
@@ -422,6 +569,15 @@ mod tests {
         let mut headers = make_headers("20260415T120000Z");
         headers.insert("x-amz-content-sha256", "0".repeat(64).parse().unwrap());
         let parsed = sign(&headers, "content-type;host;x-amz-date", SIGNED_BODY);
-        verify_signature(&parsed, SECRET, "POST", "/", "", &headers, SIGNED_BODY).unwrap();
+        verify_signature(
+            &parsed,
+            &key(SECRET),
+            "POST",
+            "/",
+            "",
+            &headers,
+            SIGNED_BODY,
+        )
+        .unwrap();
     }
 }

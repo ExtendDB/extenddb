@@ -54,7 +54,16 @@
 //! another root, or one whose list entries are missing) is not seen by it;
 //! within one run, the row check keeps a second prefix of an id this run
 //! adopted out. A row under the spelling the insert writes is left to the
-//! insert. A
+//! insert. A complete prefix whose manifest's ARN, under either spelling,
+//! an in-catalog backup of the legacy reader holds in any status, DELETED
+//! included (`LegacyBackupReader::holder_status`), is skipped, naming
+//! `extenddb backup migrate-legacy <arn>` (a prefix that does not read back
+//! whole, such as one a run stopped before its manifest left, is reported
+//! incomplete before that read, as any other): a live backup's copy is the
+//! migration's to finish, and a row inserted here would leave the backup in
+//! the catalog twice; a DELETED one's is a copy a stopped migration left of
+//! a backup DeleteBackup answered DELETED, which the command deletes and a
+//! row inserted here would bring back. A
 //! verified prefix gets an AVAILABLE row through
 //! [`BackupCatalog::insert_backup_row`], unowned, in the configured store's
 //! identity, with the manifest's name, size, item total and
@@ -92,6 +101,16 @@
 //! no DELETING or DELETED tombstone is left for a deletion duty to act on
 //! them. A later sync where the bytes are adopts them again. Without
 //! `--prune-missing` such rows stay AVAILABLE.
+//!
+//! [`sync`] neither lists nor changes the rows of the other stores (another
+//! kind or root, or the configured root under another store id): a prefix
+//! whose backup id such a row holds meets it at the read under the ARN's
+//! spellings or at the insert, and is skipped naming that row's status,
+//! kind, root and store id. The command reports
+//! those rows as a whole once a listing has reached its end
+//! ([`super::store_maintenance::other_stores`]: the rows per status of
+//! each other store, and each CREATING and DELETING row by ARN), with the
+//! two options that act on them, `--move-store` and `--forget-store`.
 //!
 //! The command takes the maintenance claim for every sync on PostgreSQL,
 //! MongoDB and Cassandra, where it runs beside servers (design 4(f)), and
@@ -149,13 +168,13 @@ use extenddb_core::backup_format::{
     backup_creation_date_time, classify_store_key,
 };
 use extenddb_core::metrics::MetricsCollector;
-use extenddb_storage::BackupCatalog;
 use extenddb_storage::backup_catalog::{
-    BackupKey, BackupRow, BackupStatus, ForgetRow, StoreIdentity, StoreKind, UNOWNED_GENERATION,
+    BackupKey, BackupRow, BackupStatus, ForgetRow, StoreIdentity, UNOWNED_GENERATION,
     is_backup_not_found,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::ARN_PARTITION;
+use extenddb_storage::{BackupCatalog, LegacyBackupReader};
 use futures::TryStreamExt;
 
 use super::BackupRuntime;
@@ -286,6 +305,10 @@ pub enum SkipReason {
     /// The manifest's ARN is in another partition: no request to this
     /// server can address it.
     OtherPartition(String),
+    /// An in-catalog backup holds the ARN, in any status (DELETED: a copy
+    /// a stopped migration left of a deleted backup): its ARN as stored and
+    /// its status.
+    InCatalog { backup_arn: String, status: String },
     /// A read of the prefix's manifest or sidecar failed; the store's
     /// error.
     Store(String),
@@ -331,6 +354,16 @@ impl std::fmt::Display for SkipReason {
             Self::RowExists(what) => f.write_str(what),
             Self::Incomplete(why) => write!(f, "not a complete backup: {why}"),
             Self::ArnMismatch(why) | Self::OtherPartition(why) => f.write_str(why),
+            Self::InCatalog { backup_arn, status } if status == "DELETED" => write!(
+                f,
+                "an in-catalog backup with this ARN was deleted; this prefix is a copy a stopped \
+                 migration left, which extenddb backup migrate-legacy {backup_arn} deletes"
+            ),
+            Self::InCatalog { backup_arn, status } => write!(
+                f,
+                "an in-catalog backup ({status}) holds this ARN; run extenddb backup \
+                 migrate-legacy {backup_arn}"
+            ),
             Self::Store(e) => write!(f, "the store could not be read: {e}"),
             Self::Catalog(e) => write!(f, "the catalog could not be read or written: {e}"),
         }
@@ -481,7 +514,7 @@ type Known = HashMap<(String, String), (BackupStatus, String, String)>;
 ///
 /// [`SyncError`]: the catalog's read failed (nothing written), or the
 /// listing failed (the rows inserted before it stay).
-pub async fn sync<S: BackupCatalog + ?Sized>(
+pub async fn sync<S: BackupCatalog + LegacyBackupReader + ?Sized>(
     storage: &S,
     target: SyncTarget<'_>,
 ) -> Result<SyncReport, SyncError> {
@@ -556,7 +589,7 @@ pub async fn sync<S: BackupCatalog + ?Sized>(
 /// One prefix the listing has passed: the stop, then the row check, then
 /// the verification and the insert. Returns why the run stops, when the
 /// stop asked it to (the prefix is then left unread).
-async fn finish_group<S: BackupCatalog + ?Sized>(
+async fn finish_group<S: BackupCatalog + LegacyBackupReader + ?Sized>(
     storage: &S,
     calls: StoreCalls<'_>,
     target: SyncTarget<'_>,
@@ -646,7 +679,7 @@ impl From<SkipReason> for NotAdopted {
 }
 
 /// Verify one prefix with no row and insert its row.
-async fn adopt_prefix<S: BackupCatalog + ?Sized>(
+async fn adopt_prefix<S: BackupCatalog + LegacyBackupReader + ?Sized>(
     storage: &S,
     calls: StoreCalls<'_>,
     target: SyncTarget<'_>,
@@ -695,6 +728,13 @@ async fn adopt_prefix<S: BackupCatalog + ?Sized>(
         .and_then(|region| arn.in_region(region))
         .unwrap_or_else(|| arn.clone());
     let foreign = foreign_note(&arn, target.region);
+    match in_catalog_holder(storage, &arn, target.region).await {
+        Ok(Some((backup_arn, status))) => {
+            return Err(SkipReason::InCatalog { backup_arn, status }.into());
+        }
+        Ok(None) => {}
+        Err(e) => return Err(SkipReason::Catalog(e.to_string()).into()),
+    }
     // A row under a spelling other than the row's: on Cassandra the insert
     // decides per spelling only (the trait's doc). A row under the row's
     // own spelling is left to the insert, which answers `false` for it, or,
@@ -781,6 +821,33 @@ async fn row_under_a_spelling<S: BackupCatalog + ?Sized>(
         .read_backup_row(arn)
         .await?
         .map(|row| (arn.clone(), row)))
+}
+
+/// The in-catalog backup that holds `arn` under the spelling every request
+/// tries first (the ARN rebuilt in `region`) or as the manifest writes it,
+/// in DescribeBackup's order, in any status
+/// ([`LegacyBackupReader::holder_status`]): its ARN as stored and its
+/// status.
+async fn in_catalog_holder<S: LegacyBackupReader + ?Sized>(
+    storage: &S,
+    arn: &BackupArn,
+    region: Option<&str>,
+) -> Result<Option<(String, String)>, StorageError> {
+    let written = arn.to_arn_string();
+    let mut spellings = Vec::new();
+    if let (Some(region), Ok(parts)) = (region, extenddb_storage::util::check_backup_arn(&written))
+    {
+        spellings.push(super::canonical_backup_arn(&parts, region));
+    }
+    if !spellings.contains(&written) {
+        spellings.push(written);
+    }
+    for spelling in spellings {
+        if let Some(status) = storage.holder_status(arn.account_id(), &spelling).await? {
+            return Ok(Some((spelling, status.as_str().to_owned())));
+        }
+    }
+    Ok(None)
 }
 
 /// The sentence for a manifest whose ARN is in another region than the
@@ -1000,7 +1067,7 @@ impl Drop for Rearm<'_> {
 /// store, whose check ran then) and every reconciler cycle calls it after
 /// the store's check (the S3 store, whose first check runs there, and a sync
 /// left pending).
-pub async fn startup_sync<S: BackupCatalog + ?Sized>(
+pub async fn startup_sync<S: BackupCatalog + LegacyBackupReader + ?Sized>(
     storage: &S,
     runtime: &BackupRuntime,
 ) -> Option<Result<SyncReport, SyncError>> {
@@ -1032,22 +1099,33 @@ pub async fn startup_sync<S: BackupCatalog + ?Sized>(
             claim: None,
         },
     );
+    // A store call abandoned at its bound or dropped with the run (a
+    // filesystem call, whose thread still runs) is marked in flight under
+    // its caller's name: the run's own call, or another caller's (a
+    // deletion's, whose call held the slot the run waited for). Until it
+    // returns, each cycle's check is refused and the store is unreachable,
+    // so the sync runs again on the first cycle after it; the clause names
+    // the caller as the refusal does. A run cut in a catalog call, or after
+    // its last store call returned, marks nothing, and with no other
+    // caller's call in flight the next cycle's check runs as usual.
+    let in_flight = || {
+        store
+            .call_in_flight_caller()
+            .map_or_else(String::new, |caller| {
+                format!(
+                    " (once the abandoned {caller} has returned; until then the store is \
+                     unreachable)"
+                )
+            })
+    };
     let Ok(outcome) = tokio::time::timeout(STARTUP_SYNC_TIMEOUT, run).await else {
-        // On a filesystem store the abandoned listing's walk still runs:
-        // until it returns, each cycle's check is refused and the store is
-        // unreachable, so the sync runs again on the first cycle after it.
         tracing::warn!(
             "backup store ({}) startup sync of the in-memory catalog did not finish within {} \
              s; the backups it adopted keep their rows, and a later reconciler cycle runs it \
              again from the first key of the root{}",
             store.kind,
             STARTUP_SYNC_TIMEOUT.as_secs(),
-            if store.kind == StoreKind::Filesystem {
-                " (once the abandoned listing of the root has returned; until then the store is \
-                 unreachable)"
-            } else {
-                ""
-            }
+            in_flight()
         );
         return None;
     };
@@ -1102,8 +1180,9 @@ pub async fn startup_sync<S: BackupCatalog + ?Sized>(
         }
         Err(e) => tracing::warn!(
             "backup store ({}) startup sync of the in-memory catalog stopped: {e}; a later \
-             reconciler cycle runs it again",
-            store.kind
+             reconciler cycle runs it again{}",
+            store.kind,
+            in_flight()
         ),
     }
     Some(outcome)

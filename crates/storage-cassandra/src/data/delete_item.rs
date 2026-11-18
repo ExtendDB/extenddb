@@ -3,8 +3,7 @@
 
 //! `delete_item` implementation for the Cassandra backend.
 
-use cdrs_tokio::consistency::Consistency;
-use cdrs_tokio::query::BatchQueryBuilder;
+use crate::cassandra_util::PolicySession as _;
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_core::expression::{Expr, ExpressionMaps};
 use extenddb_core::types::{Item, TableKeyInfo};
@@ -16,6 +15,7 @@ use super::ddl::data_table_name;
 use super::index::fetch_indexes_for_table;
 use super::{json_to_item, query_with_pk_sk};
 use crate::CassandraEngine;
+use crate::cassandra_util::{Stmt, batch};
 use crate::stream_util::stream_record_statement;
 
 /// Lifetime of the base-row claim an ordinary request holds while it commits
@@ -90,10 +90,20 @@ impl CassandraEngine {
         maps: &ExpressionMaps,
         stream: Option<&StreamCapture>,
     ) -> Result<Option<Item>, StorageError> {
+        // The system delay, read at most once for all attempts.
+        let sys_delay_read = tokio::sync::OnceCell::new();
         for attempt in 0..=TTL_CLAIM_MAX_RETRIES {
             match self
                 .delete_item_impl_inner(
-                    key_info, key, return_old, condition, maps, stream, None, None,
+                    key_info,
+                    key,
+                    return_old,
+                    condition,
+                    maps,
+                    stream,
+                    None,
+                    None,
+                    &sys_delay_read,
                 )
                 .await
             {
@@ -185,6 +195,7 @@ impl CassandraEngine {
         stream: Option<&StreamCapture>,
         allowed_prepared_txn_id: Option<uuid::Uuid>,
         expected_claimed_item: Option<&Item>,
+        sys_delay_read: &tokio::sync::OnceCell<u64>,
     ) -> Result<Option<Item>, StorageError> {
         // Taken before the read: a write whose version is at or above it began
         // after this delete did (`item_present_serial`).
@@ -200,12 +211,9 @@ impl CassandraEngine {
             fetch_indexes_for_table(&key_info.table_id, &self.session, &catalog_keyspace),
             self.ttl_config_for_table(&key_info.account_id, &key_info.table_name),
         )?;
-        let sys_delay = if indexes.is_empty() {
-            0
-        } else {
-            self.gsi_default_delay_ms
-                .load(std::sync::atomic::Ordering::Relaxed)
-        };
+        // Read live, once per write call however often it retries, and only
+        // when some GSI follows the system setting.
+        let sys_delay = self.system_index_delay_once(&indexes, sys_delay_read).await;
 
         if let Some((sk_name, sk_type)) =
             sk_info(&key_info.key_schema, &key_info.attribute_definitions)
@@ -222,8 +230,14 @@ impl CassandraEngine {
                 "SELECT item_data, version, prepared_txn_id FROM {data_keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ?"
             );
 
-            let old_result =
-                query_with_pk_sk(&self.session, &select_query, pk_text.as_ref(), &sk).await?;
+            let old_result = query_with_pk_sk(
+                &self.session,
+                &select_query,
+                Stmt::Read,
+                pk_text.as_ref(),
+                &sk,
+            )
+            .await?;
 
             let body = old_result
                 .response_body()
@@ -291,9 +305,10 @@ impl CassandraEngine {
                 // index rows written afterwards carry that order (`data::version`).
                 // Deleting an absent item writes nothing.
                 let Some(old_item) = old_item_opt else {
-                    // The read above is at the driver's default consistency,
-                    // and a replica that missed the latest write reads as
-                    // absent. The fence catches a stale image but not a stale
+                    // The read above is at LOCAL_QUORUM. It sees every write that
+                    // was acknowledged before it, but not an LWT whose Paxos round
+                    // is still in progress, so it can read as absent. The fence
+                    // catches a stale image but not a stale
                     // absence, so the absence is confirmed at LOCAL_SERIAL
                     // before the delete answers without writing. An item found
                     // there that a write stored before this delete began is
@@ -398,7 +413,14 @@ impl CassandraEngine {
                 && ttl_config.is_none()
                 && ttl_claim.is_none()
             {
-                query_with_pk_sk(&self.session, &delete_cql, pk_text.as_ref(), &sk).await?;
+                query_with_pk_sk(
+                    &self.session,
+                    &delete_cql,
+                    Stmt::Write,
+                    pk_text.as_ref(),
+                    &sk,
+                )
+                .await?;
             } else {
                 use super::index::sk_to_value;
                 let delete_qv = cdrs_tokio::query::QueryValues::SimpleValues(vec![
@@ -418,9 +440,7 @@ impl CassandraEngine {
                             return Err(error);
                         }
                     };
-                let mut batch = BatchQueryBuilder::new()
-                    .with_consistency(Consistency::LocalQuorum)
-                    .with_timestamp(mutation_timestamp);
+                let mut batch = batch().with_timestamp(mutation_timestamp);
                 batch = batch.add_query(delete_cql, delete_qv);
 
                 if !indexes.is_empty()
@@ -494,7 +514,7 @@ impl CassandraEngine {
                         return Err(StorageError::Internal(error.to_string()));
                     }
                 };
-                if let Err(error) = self.session.batch(built).await {
+                if let Err(error) = self.session.run_batch(built).await {
                     self.release_ttl_mutation_claim(key_info, key, ttl_claim)
                         .await;
                     return Err(StorageError::Internal(format!("Batch execution: {error}")));
@@ -579,9 +599,10 @@ impl CassandraEngine {
             } else {
                 // Ordinary delete without TTL: see the sort-key variant above.
                 let Some(old_item) = old_item_opt else {
-                    // The read above is at the driver's default consistency,
-                    // and a replica that missed the latest write reads as
-                    // absent. The fence catches a stale image but not a stale
+                    // The read above is at LOCAL_QUORUM. It sees every write that
+                    // was acknowledged before it, but not an LWT whose Paxos round
+                    // is still in progress, so it can read as absent. The fence
+                    // catches a stale image but not a stale
                     // absence, so the absence is confirmed at LOCAL_SERIAL
                     // before the delete answers without writing. An item found
                     // there that a write stored before this delete began is
@@ -679,7 +700,11 @@ impl CassandraEngine {
                 && ttl_claim.is_none()
             {
                 self.session
-                    .query_with_values(&delete_cql, cdrs_tokio::query_values!(pk_text.as_str()))
+                    .run(
+                        Stmt::Write,
+                        &delete_cql,
+                        cdrs_tokio::query_values!(pk_text.as_str()),
+                    )
                     .await
                     .map_err(|e| StorageError::Internal(format!("Delete failed: {e}")))?;
             } else {
@@ -699,9 +724,7 @@ impl CassandraEngine {
                             return Err(error);
                         }
                     };
-                let mut batch = BatchQueryBuilder::new()
-                    .with_consistency(Consistency::LocalQuorum)
-                    .with_timestamp(mutation_timestamp);
+                let mut batch = batch().with_timestamp(mutation_timestamp);
                 batch = batch.add_query(delete_cql, delete_qv);
 
                 if !indexes.is_empty()
@@ -775,7 +798,7 @@ impl CassandraEngine {
                         return Err(StorageError::Internal(error.to_string()));
                     }
                 };
-                if let Err(error) = self.session.batch(built).await {
+                if let Err(error) = self.session.run_batch(built).await {
                     self.release_ttl_mutation_claim(key_info, key, ttl_claim)
                         .await;
                     return Err(StorageError::Internal(format!("Batch execution: {error}")));
@@ -829,7 +852,7 @@ impl CassandraEngine {
                  WHERE pk = ? AND {} = ?",
                 sk_column(sk_type)
             );
-            query_with_pk_sk(&self.session, &query, pk.as_str(), &sk)
+            query_with_pk_sk(&self.session, &query, Stmt::Read, pk.as_str(), &sk)
                 .await?
                 .response_body()
                 .ok()
@@ -963,13 +986,9 @@ impl CassandraEngine {
                 ]),
             )
         };
-        let rows = crate::cassandra_util::query_rows_quorum(
-            &self.session,
-            &query,
-            values,
-            "base_row_owned_by",
-        )
-        .await?;
+        let rows =
+            crate::cassandra_util::query_rows(&self.session, &query, values, "base_row_owned_by")
+                .await?;
         let owner: Option<uuid::Uuid> = rows
             .first()
             .and_then(|row| row.get_by_name("prepared_txn_id").ok().flatten());
@@ -991,10 +1010,10 @@ impl CassandraEngine {
         effects_timestamp_ms: i64,
     ) -> Result<(), StorageError> {
         let account_keyspace = self.account_keyspace(&key_info.account_id);
-        // Quorum: a stale replica omitting an index here would be read as
-        // "nothing to restore", and this is the last chance to restore it
-        // before the sealed owner is released.
-        let indexes = super::index::fetch_indexes_for_table_quorum(
+        // This is the last chance to restore an index before the sealed
+        // owner is released, so an index missing from this list is never
+        // restored.
+        let indexes = super::index::fetch_indexes_for_table(
             &key_info.table_id,
             &self.session,
             &self.catalog_keyspace(),
@@ -1003,6 +1022,10 @@ impl CassandraEngine {
         if indexes.is_empty() {
             return Ok(());
         }
+        // The cached value, refreshed every 5 s by `poll_gsi_delay`, not a
+        // live read: only the background TTL sweep calls this, once per
+        // expired item, so a live read would add a catalog read per item for
+        // no client-visible gain.
         let default_delay = self
             .gsi_default_delay_ms
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -1012,9 +1035,7 @@ impl CassandraEngine {
         // with now-derived micros keeps it also above any older write.
         let restore_timestamp =
             (effects_timestamp_ms * 1_000 + 1).max(chrono::Utc::now().timestamp_micros());
-        let mut batch = BatchQueryBuilder::new()
-            .with_consistency(Consistency::LocalQuorum)
-            .with_timestamp(restore_timestamp);
+        let mut batch = batch().with_timestamp(restore_timestamp);
         // old = None: this is a pure re-upsert of the current image's rows.
         super::index::sync_indexes(
             &mut batch,
@@ -1042,7 +1063,7 @@ impl CassandraEngine {
             .build()
             .map_err(|error| StorageError::Internal(error.to_string()))?;
         self.session
-            .batch(built)
+            .run_batch(built)
             .await
             .map_err(|error| StorageError::Internal(format!("Restore sync indexes: {error}")))?;
         self.gsi_queue.notify_workers();
@@ -1071,6 +1092,8 @@ impl CassandraEngine {
         let indexes =
             fetch_indexes_for_table(&key_info.table_id, &self.session, &self.catalog_keyspace())
                 .await?;
+        // The cached value, not a live read: only the background TTL sweep
+        // calls this (see `restore_sync_indexes_for_item`).
         let default_delay = self
             .gsi_default_delay_ms
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -1078,9 +1101,7 @@ impl CassandraEngine {
         // identical cells at an identical timestamp, and so restoration (which
         // stamps strictly above this) beats these tombstones by construction
         // rather than by cross-coordinator clock luck.
-        let mut batch = BatchQueryBuilder::new()
-            .with_consistency(Consistency::LocalQuorum)
-            .with_timestamp(delete_timestamp_ms * 1_000);
+        let mut batch = batch().with_timestamp(delete_timestamp_ms * 1_000);
         let mut has_effects = !indexes.is_empty();
         if !indexes.is_empty() {
             super::index::sync_indexes(
@@ -1144,7 +1165,7 @@ impl CassandraEngine {
                 .build()
                 .map_err(|error| StorageError::Internal(error.to_string()))?;
             self.session
-                .batch(built)
+                .run_batch(built)
                 .await
                 .map_err(|error| StorageError::Internal(format!("TTL side effects: {error}")))?;
             if !indexes.is_empty() {
@@ -1474,7 +1495,11 @@ impl CassandraEngine {
 
         let result = self
             .session
-            .query_with_values(&query_null, cdrs_tokio::query_values!(now_ms, pk))
+            .run(
+                Stmt::Lwt,
+                &query_null,
+                cdrs_tokio::query_values!(now_ms, pk),
+            )
             .await
             .map_err(|e| {
                 tracing::error!("update_partition_max_delete_timestamp (null): {e}");
@@ -1502,7 +1527,8 @@ impl CassandraEngine {
             );
 
             self.session
-                .query_with_values(
+                .run(
+                    Stmt::Lwt,
                     &query_compare,
                     cdrs_tokio::query_values!(now_ms, pk, now_ms),
                 )
@@ -1539,7 +1565,7 @@ impl CassandraEngine {
             pk,
             sk.map(|(value, _)| value),
             sk.map(|(_, col)| col),
-            Some(Consistency::LocalSerial),
+            crate::cassandra_util::Stmt::SerialRead,
         )
         .await?;
         Ok(row.is_some_and(|row| {
@@ -1603,10 +1629,7 @@ impl CassandraEngine {
         sys_delay: u64,
         stamp: i64,
     ) -> Result<(), StorageError> {
-        use cdrs_tokio::consistency::Consistency;
-        use cdrs_tokio::query::BatchQueryBuilder;
-
-        let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+        let mut batch = batch();
 
         if !indexes.is_empty() {
             super::index::sync_indexes_at(
@@ -1653,7 +1676,7 @@ impl CassandraEngine {
             .build()
             .map_err(|e| StorageError::Internal(e.to_string()))?;
         self.session
-            .batch(built)
+            .run_batch(built)
             .await
             .map_err(|e| StorageError::Internal(format!("delete secondary effects: {e}")))?;
 

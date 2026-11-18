@@ -78,6 +78,16 @@ pub struct ServerConfig {
     /// Enable provisioned throughput throttling via token buckets.
     /// When `None` or `false`, all requests are allowed regardless of capacity.
     pub throttling_enabled: Option<bool>,
+    /// Seconds a connection may take to deliver its request headers, and
+    /// seconds a request body may go without delivering data, before the
+    /// server closes the connection. Bounds how long a stalled or malicious
+    /// client can hold a connection open. Default 30.
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+}
+
+fn default_request_timeout_secs() -> u64 {
+    30
 }
 
 impl Default for ServerConfig {
@@ -89,6 +99,7 @@ impl Default for ServerConfig {
             run_dir: default_run_dir(),
             tls: TlsConfig::default(),
             throttling_enabled: None,
+            request_timeout_secs: default_request_timeout_secs(),
         }
     }
 }
@@ -273,6 +284,11 @@ pub struct AuthConfig {
     /// apply when absent.
     #[serde(default)]
     pub cache: AuthCacheConfigToml,
+    /// Where the key that encrypts stored secrets comes from
+    /// (`[auth.encryption]`). Optional; without it the server uses the
+    /// catalog key.
+    #[serde(default)]
+    pub encryption: EncryptionConfig,
 }
 
 impl Default for AuthConfig {
@@ -280,6 +296,7 @@ impl Default for AuthConfig {
         Self {
             provider: default_provider(),
             cache: AuthCacheConfigToml::default(),
+            encryption: EncryptionConfig::default(),
         }
     }
 }
@@ -423,7 +440,14 @@ fn default_log_format() -> String {
 /// in dev-mode builds.
 #[must_use]
 pub fn is_tls_enabled(config: &AppConfig) -> bool {
-    config.server.tls.enabled && !cfg!(feature = "dev-mode")
+    serves_tls(&config.server.tls)
+}
+
+/// [`is_tls_enabled`] for the TLS section alone: whether a server with this
+/// section loads its certificate and key.
+#[must_use]
+pub fn serves_tls(tls: &TlsConfig) -> bool {
+    tls.enabled && !cfg!(feature = "dev-mode")
 }
 
 /// Load `AppConfig` from a config file (optional) and environment variables.
@@ -435,9 +459,19 @@ pub fn is_tls_enabled(config: &AppConfig) -> bool {
 pub fn load(config_path: &str) -> anyhow::Result<AppConfig> {
     let config = config::Config::builder()
         .add_source(config::File::with_name(config_path).required(false))
-        .add_source(config::Environment::with_prefix("EXTENDDB").separator("__"))
+        .add_source(environment(None))
         .build()?;
     validated(config.try_deserialize()?)
+}
+
+/// The `EXTENDDB__*` variables as a configuration source, `__` between
+/// section names (`EXTENDDB__AUTH__ENCRYPTION__KEY_FILE` sets
+/// `auth.encryption.key_file`). `vars` replaces the process environment in
+/// tests.
+fn environment(vars: Option<config::Map<String, String>>) -> config::Environment {
+    config::Environment::with_prefix("EXTENDDB")
+        .separator("__")
+        .source(vars)
 }
 
 /// The cross-field checks a deserialized config still has to pass, and the
@@ -476,7 +510,7 @@ pub fn load_builtin_defaults() -> anyhow::Result<AppConfig> {
             &storage_section,
             config::FileFormat::Toml,
         ))
-        .add_source(config::Environment::with_prefix("EXTENDDB").separator("__"))
+        .add_source(environment(None))
         .build()?;
     validated(config.try_deserialize()?)
 }
@@ -527,7 +561,9 @@ pub fn pid_file_path_default(port: u16) -> PathBuf {
 
 pub mod backup;
 mod display;
+mod encryption;
 pub use display::{MASK, build_config_entries, should_redact};
+pub use encryption::EncryptionConfig;
 
 #[cfg(test)]
 mod tests {

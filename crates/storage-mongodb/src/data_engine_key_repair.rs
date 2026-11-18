@@ -336,7 +336,7 @@ impl MongoEngine {
                 }
                 Ok(outcome) => match self.commit_write_transaction(&mut session, None).await? {
                     CommitOutcome::Committed => return Ok(outcome),
-                    CommitOutcome::RerunBody => backoff_sleep(attempt).await,
+                    CommitOutcome::RerunBody(_) => backoff_sleep(attempt).await,
                 },
                 Err(BatchError::Mongo(e)) if is_transient_write_conflict(&e) => {
                     let _ = session.abort_transaction().await;

@@ -21,8 +21,11 @@
 //! The maintenance claim is the same mechanism on the `backup_maintenance`
 //! row: an advisory lock (`backup_maintenance` in the same key space) on a
 //! dedicated connection is the proof of a live holder, so a second command
-//! finds it taken and a holder whose session ended has released it; the row
-//! carries the holder, the generation and the heartbeat.
+//! finds it taken; a holder whose session ended has released it, and its
+//! claim is taken over once the row's heartbeat is older than the stale
+//! window (the holder's process may outlive its session until its next
+//! beat finds the loss); the row carries the holder, the generation and
+//! the heartbeat.
 //! `check_maintenance_claim` reports the claim held while a session holds
 //! the lock (a transaction-scoped shared try-lock in one autocommit
 //! statement fails while the exclusive lock is held, and holds nothing past
@@ -39,6 +42,13 @@
 //! [`extenddb_storage::backup_catalog::JOB_HEARTBEAT_INTERVAL`] (15 s), the
 //! constant every backend runs at until `[backup] heartbeat_interval_secs`
 //! reaches the jobs in a later release.
+//!
+//! `backup_index.source_table_details_json` is the manifest's source table,
+//! whose key schema, attribute definitions and indexes carry attribute
+//! names. It is stored through the escape of `catalog_json`, as the other
+//! catalog documents that carry names are: `claim_backup`, `set_status` and
+//! `insert_unowned_row` write it through `escape_json`, and every read
+//! reverses the escape in `row_from_tuple`.
 
 use std::time::Duration;
 
@@ -48,7 +58,7 @@ use extenddb_storage::backup_catalog::{
     BackupCatalog, BackupKey, BackupRow, BackupStatus, DeleteStart, ForgetRow, Heartbeat, JobClaim,
     JobRow, JobStatus, MaintenanceClaim, RestoreJobRow, RestoreKind, RestoreRegistered,
     RestoreRegistrationRow, RestoreTargetKey, StaleClock, StatusFields, StoreIdentity, StoreKind,
-    TimeBounds, UNOWNED_GENERATION, WriteOutcome, new_generation,
+    StoreRootCount, TimeBounds, UNOWNED_GENERATION, WriteOutcome, new_generation,
 };
 use extenddb_storage::error::StorageError;
 use futures::future::BoxFuture;
@@ -61,6 +71,7 @@ use crate::backup_engine::{
     ClaimSession, RESTORE_HEARTBEAT, backup_lock_key, generation_column, restore_lock_key,
     try_claim, try_claim_with,
 };
+use crate::catalog_json::{escape_json, unescape_json};
 use crate::create_table::RestoreSource;
 
 /// The name of a CREATING restore target registered from `backup_arn`, if
@@ -84,6 +95,82 @@ pub(crate) async fn creating_restore_target<'e, E: PgExecutor<'e>>(
 /// text, [`extenddb_storage::backup_catalog::backup_in_use`].
 pub(crate) fn backup_in_use(table: &str, backup_arn: &str) -> StorageError {
     extenddb_storage::backup_catalog::backup_in_use(table, backup_arn)
+}
+
+/// `insert_backup_row`'s statement, on `executor`: `row` unowned, if no row
+/// with its key or its backup id exists. `Ok(false)`, writing nothing,
+/// otherwise. The legacy reader's `replace_with_index_row` runs it inside
+/// its transaction.
+pub(crate) async fn insert_unowned_row<'e, E: PgExecutor<'e>>(
+    executor: E,
+    row: &BackupRow,
+) -> Result<bool, StorageError> {
+    // No conflict target: the primary key (`account_id`, `backup_id`) and
+    // the unique `backup_id` both make it a no-op. No advisory lock: a job
+    // that holds the id's lock and has not inserted its row yet finds this
+    // one and is refused, as it is by any row with the key.
+    let inserted = sqlx::query(
+        "INSERT INTO backup_index (backup_id, account_id, table_name, backup_arn, \
+         backup_name, status, store_kind, store_root, store_id, size_bytes, item_count, \
+         created_at, completed_at, failure_reason, source_table_details_json, \
+         owner_generation, heartbeat_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, to_timestamp($12), now(), \
+         $13, $14, $15, now()) ON CONFLICT DO NOTHING",
+    )
+    .bind(&row.backup_id)
+    .bind(&row.account_id)
+    .bind(&row.table_name)
+    .bind(&row.backup_arn)
+    .bind(&row.backup_name)
+    .bind(row.status.as_str())
+    .bind(row.store.store_kind.as_str())
+    .bind(&row.store.store_root)
+    .bind(&row.store.store_id)
+    .bind(row.size_bytes)
+    .bind(row.item_count)
+    .bind(row.created_at)
+    .bind(&row.failure_reason)
+    .bind(escape_json(row.source_table_details_json.clone()))
+    .bind(generation_column(UNOWNED_GENERATION))
+    .execute(executor)
+    .await
+    .map_err(db_err)?
+    .rows_affected();
+    Ok(inserted == 1)
+}
+
+/// The account, ARN and store of the `backup_index` row holding
+/// `backup_id`, if one does, on `executor`.
+pub(crate) async fn index_row_holding<'e, E: PgExecutor<'e>>(
+    executor: E,
+    backup_id: &str,
+) -> Result<Option<(String, String, StoreIdentity)>, StorageError> {
+    let found: Option<(String, String, String, String, String)> = sqlx::query_as(
+        "SELECT account_id, backup_arn, store_kind, store_root, store_id FROM backup_index \
+         WHERE backup_id = $1",
+    )
+    .bind(backup_id)
+    .fetch_optional(executor)
+    .await
+    .map_err(db_err)?;
+    found
+        .map(|(account_id, backup_arn, kind, store_root, store_id)| {
+            let store_kind = StoreKind::parse(&kind).ok_or_else(|| {
+                StorageError::Internal(format!(
+                    "backup {backup_arn} carries an unknown store kind {kind:?}"
+                ))
+            })?;
+            Ok((
+                account_id,
+                backup_arn,
+                StoreIdentity {
+                    store_kind,
+                    store_root,
+                    store_id,
+                },
+            ))
+        })
+        .transpose()
 }
 
 fn db_err(e: sqlx::Error) -> StorageError {
@@ -167,7 +254,7 @@ fn row_from_tuple(t: RowTuple) -> Result<BackupRow, StorageError> {
         created_at,
         completed_at,
         failure_reason,
-        source_table_details_json,
+        source_table_details_json: unescape_json(source_table_details_json),
         owner_generation: u64::try_from(owner_generation).unwrap_or_default(),
         heartbeat_at,
     })
@@ -270,7 +357,7 @@ impl JobClaim for PostgresBackupClaim {
             .bind(fields.failure_reason.as_deref())
             .bind(fields.completed)
             .bind(from.as_str())
-            .bind(fields.source_table_details_json.as_ref())
+            .bind(fields.source_table_details_json.clone().map(escape_json))
             .execute(session.connection())
             .await;
             match written {
@@ -520,7 +607,7 @@ impl BackupCatalog for PostgresEngine {
             .bind(row.size_bytes)
             .bind(row.item_count)
             .bind(row.created_at)
-            .bind(&row.source_table_details_json)
+            .bind(escape_json(row.source_table_details_json.clone()))
             .bind(generation_column(session.generation()))
             .execute(session.connection())
             .await
@@ -546,41 +633,7 @@ impl BackupCatalog for PostgresEngine {
         &'a self,
         row: &'a BackupRow,
     ) -> BoxFuture<'a, Result<bool, StorageError>> {
-        Box::pin(async move {
-            // No conflict target: the primary key (`account_id`,
-            // `backup_id`) and the unique `backup_id` both make it a no-op.
-            // No advisory lock: a job that holds the id's lock and has not
-            // inserted its row yet finds this one and is refused, as it is by
-            // any row with the key.
-            let inserted = sqlx::query(
-                "INSERT INTO backup_index (backup_id, account_id, table_name, backup_arn, \
-                 backup_name, status, store_kind, store_root, store_id, size_bytes, item_count, \
-                 created_at, completed_at, failure_reason, source_table_details_json, \
-                 owner_generation, heartbeat_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, to_timestamp($12), now(), \
-                 $13, $14, $15, now()) ON CONFLICT DO NOTHING",
-            )
-            .bind(&row.backup_id)
-            .bind(&row.account_id)
-            .bind(&row.table_name)
-            .bind(&row.backup_arn)
-            .bind(&row.backup_name)
-            .bind(row.status.as_str())
-            .bind(row.store.store_kind.as_str())
-            .bind(&row.store.store_root)
-            .bind(&row.store.store_id)
-            .bind(row.size_bytes)
-            .bind(row.item_count)
-            .bind(row.created_at)
-            .bind(&row.failure_reason)
-            .bind(&row.source_table_details_json)
-            .bind(generation_column(UNOWNED_GENERATION))
-            .execute(&self.pool)
-            .await
-            .map_err(db_err)?
-            .rows_affected();
-            Ok(inserted == 1)
-        })
+        Box::pin(insert_unowned_row(&self.pool, row))
     }
 
     fn list_backup_rows<'a>(
@@ -597,6 +650,29 @@ impl BackupCatalog for PostgresEngine {
             .bind(store.store_kind.as_str())
             .bind(&store.store_root)
             .bind(&store.store_id)
+            .bind(status.map(BackupStatus::as_str))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)
+        })
+    }
+
+    fn list_backup_rows_by_root<'a>(
+        &'a self,
+        store_kind: StoreKind,
+        store_root: &'a str,
+        status: Option<BackupStatus>,
+    ) -> BoxStream<'a, Result<BackupRow, StorageError>> {
+        // The `(store_kind, store_root)` prefix of
+        // `idx_backup_index_store_status`; the status is a filter on it.
+        rows_stream(async move {
+            sqlx::query_as(&format!(
+                "SELECT {ROW_COLUMNS} FROM backup_index \
+                 WHERE store_kind = $1 AND store_root = $2 \
+                 AND ($3::TEXT IS NULL OR status = $3) ORDER BY created_at, backup_arn"
+            ))
+            .bind(store_kind.as_str())
+            .bind(store_root)
             .bind(status.map(BackupStatus::as_str))
             .fetch_all(&self.pool)
             .await
@@ -668,6 +744,22 @@ impl BackupCatalog for PostgresEngine {
         })
     }
 
+    fn row_holding_backup_id<'a>(
+        &'a self,
+        backup_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<BackupRow>, StorageError>> {
+        Box::pin(async move {
+            let row: Option<RowTuple> = sqlx::query_as(&format!(
+                "SELECT {ROW_COLUMNS} FROM backup_index WHERE backup_id = $1"
+            ))
+            .bind(backup_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+            row.map(row_from_tuple).transpose()
+        })
+    }
+
     fn start_backup_delete<'a>(
         &'a self,
         key: &'a BackupKey,
@@ -685,6 +777,46 @@ impl BackupCatalog for PostgresEngine {
                 DeleteStart::InUse(table) => ForgetRow::InUse(table),
                 DeleteStart::Status(status) => ForgetRow::Status(status),
             })
+        })
+    }
+
+    fn rewrite_store<'a>(
+        &'a self,
+        from_kind: StoreKind,
+        from_root: &'a str,
+        keys: &'a [BackupKey],
+        to: &'a StoreIdentity,
+    ) -> BoxFuture<'a, Result<u64, StorageError>> {
+        Box::pin(async move {
+            // Batches of REWRITE_BATCH keys, each one statement in its own
+            // transaction under the two bounds, so no statement nears the
+            // statement timeout whatever the key count; a batch that fails
+            // leaves the batches before it committed and the rest left.
+            let mut rewritten = 0;
+            for batch in keys.chunks(REWRITE_BATCH) {
+                let mut attempt = 0;
+                rewritten += loop {
+                    attempt += 1;
+                    match self.rewrite_store_tx(from_kind, from_root, batch, to).await {
+                        Ok(count) => break count,
+                        Err(e)
+                            if attempt < REWRITE_ATTEMPTS
+                                && crate::data::lock_not_available(&e) =>
+                        {
+                            // A row lock held past the timeout (a
+                            // DeleteBackup's or a registration's
+                            // transaction, or the backend of a client that
+                            // died mid-statement): the transaction rolled
+                            // back, and the next attempt waits again after
+                            // a pause.
+                            tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt)))
+                                .await;
+                        }
+                        Err(e) => return Err(db_err(e)),
+                    }
+                };
+            }
+            Ok(rewritten)
         })
     }
 
@@ -710,14 +842,18 @@ impl BackupCatalog for PostgresEngine {
     fn remove_backup_row<'a>(
         &'a self,
         key: &'a BackupKey,
+        store_kind: StoreKind,
+        store_root: &'a str,
     ) -> BoxFuture<'a, Result<bool, StorageError>> {
         Box::pin(async move {
             let affected = sqlx::query(
                 "DELETE FROM backup_index WHERE account_id = $1 AND backup_id = $2 \
-                 AND status IN ('DELETED', 'FAILED')",
+                 AND status IN ('DELETED', 'FAILED') AND store_kind = $3 AND store_root = $4",
             )
             .bind(&key.account_id)
             .bind(&key.backup_id)
+            .bind(store_kind.as_str())
+            .bind(store_root)
             .execute(&self.pool)
             .await
             .map_err(db_err)?
@@ -1129,6 +1265,26 @@ impl BackupCatalog for PostgresEngine {
         })
     }
 
+    fn summarize_store_roots(&self) -> BoxFuture<'_, Result<Vec<StoreRootCount>, StorageError>> {
+        Box::pin(async move {
+            let grouped: Vec<(String, String, String, String, i64)> = sqlx::query_as(
+                "SELECT store_kind, store_root, store_id, status, count(*) FROM backup_index \
+                 GROUP BY store_kind, store_root, store_id, status",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+            let mut counts = grouped
+                .into_iter()
+                .map(|(kind, root, id, status, rows)| {
+                    StoreRootCount::from_columns(&kind, root, id, &status, rows)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            StoreRootCount::sort(&mut counts);
+            Ok(counts)
+        })
+    }
+
     fn maintenance_claim<'a>(
         &'a self,
         holder: &'a str,
@@ -1160,11 +1316,26 @@ impl BackupCatalog for PostgresEngine {
                 )));
             };
             // With the lock held, a row whose heartbeat is still young is a
-            // holder whose lock session ended within the stale window: dead
-            // by this backend's rule (4(e)), so the row is taken over
-            // whatever its age. `stale_after` is the other backends' rule and
-            // the one `check_maintenance_claim` applies on every backend.
-            let _ = stale_after;
+            // holder whose lock session ended within the stale window: its
+            // process may still be running (a connection reset, the session
+            // terminated) until its next beat finds the loss, so the take
+            // waits for the window, as the other backends' does. A released
+            // claim leaves no row.
+            let young: Option<String> = sqlx::query_scalar(
+                "SELECT holder FROM backup_maintenance \
+                 WHERE heartbeat_at >= now() - make_interval(secs => $1)",
+            )
+            .bind(stale_after.as_secs_f64())
+            .fetch_optional(session.connection())
+            .await
+            .map_err(db_err)?;
+            if let Some(current) = young {
+                session.close().await;
+                return Err(StorageError::AlreadyExists(format!(
+                    "the backup maintenance claim is held by {current} (its catalog session \
+                     ended, and its heartbeat is younger than the stale window)"
+                )));
+            }
             let generation = session.generation();
             sqlx::query(
                 "INSERT INTO backup_maintenance (singleton, holder, owner_generation) \
@@ -1234,7 +1405,157 @@ const MAINTENANCE_LOCK_KEY: &str = "backup_maintenance";
 const MAINTENANCE_TAKE_TRIES: u32 = 6;
 const MAINTENANCE_TAKE_PAUSE: Duration = Duration::from_millis(2);
 
+/// `rewrite_store`'s `lock_timeout`. The rewrite waits on the row locks a
+/// DeleteBackup's or a registration's `FOR UPDATE` transaction takes, each
+/// a few statements long, so a wait past this is a lock held by something
+/// else: the backend of a client that died with its transaction open, or a
+/// stalled session. The statement then fails with 55P03, its transaction
+/// rolls back, and the rewrite tries again ([`REWRITE_ATTEMPTS`]).
+#[doc(hidden)]
+pub const REWRITE_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// `rewrite_store`'s `statement_timeout`: how long one batch's statement may
+/// run in all, its lock waits included; past it the statement fails, rolls
+/// back, and is not tried again, with the batches before it committed.
+/// One statement over every key does not fit under a fixed bound: in plain
+/// SQL on PostgreSQL 16 with migration 0006's indexes, over a catalog of
+/// 400,000 rows with 1,449-byte descriptions, one statement over 200,000
+/// keys took 16.4 and 16.9 s, so the rewrite runs in batches of
+/// [`REWRITE_BATCH`] keys.
+#[doc(hidden)]
+pub const REWRITE_STATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How many keys one `rewrite_store` statement covers: one batch is one
+/// transaction the client commits, under [`REWRITE_LOCK_TIMEOUT`] and
+/// [`REWRITE_STATEMENT_TIMEOUT`]. On the catalog of
+/// [`REWRITE_STATEMENT_TIMEOUT`]'s measurement a batch of 5,000 keys took
+/// 0.23 to 0.29 s (six batches, each committed) and one of 20,000 keys 0.9
+/// to 1.1 s, so a batch stays about a hundred times inside the bound, and
+/// 200,000 keys take 40 batches.
+#[doc(hidden)]
+pub const REWRITE_BATCH: usize = 5_000;
+
+/// How many times `rewrite_store` runs one batch's transaction when the
+/// statement meets [`REWRITE_LOCK_TIMEOUT`]; the pauses between grow by
+/// half a second.
+#[doc(hidden)]
+pub const REWRITE_ATTEMPTS: u32 = 3;
+
 impl crate::PostgresEngine {
+    /// One attempt of one batch of `rewrite_store`: one statement over the
+    /// batch's keys inside a transaction this call commits, under
+    /// [`REWRITE_LOCK_TIMEOUT`] and [`REWRITE_STATEMENT_TIMEOUT`]. The row
+    /// lock the statement takes orders it against a registration's and a
+    /// delete's `FOR UPDATE`. CREATING rows are excluded; the statement
+    /// takes no advisory lock. Because the commit is the client's own, a
+    /// client that dies while the statement waits or runs rewrites nothing
+    /// of the batch: the server rolls the transaction back when it finds
+    /// the connection closed, at the latest when the statement ends.
+    async fn rewrite_store_tx(
+        &self,
+        from_kind: StoreKind,
+        from_root: &str,
+        keys: &[BackupKey],
+        to: &StoreIdentity,
+    ) -> Result<u64, sqlx::Error> {
+        let mut conn = self.pool.acquire().await?;
+        Self::rewrite_store_on(&mut conn, from_kind, from_root, keys, to, None).await
+    }
+
+    /// [`Self::rewrite_store_tx`] on `conn`: the transaction begins and
+    /// commits there, so a test can read the connection's settings after
+    /// it ([`Self::rewrite_store_settings_after`]). With `inside`, `SHOW
+    /// lock_timeout` and `SHOW statement_timeout` are read in the
+    /// transaction once the bounds are set, and pushed there in that order.
+    async fn rewrite_store_on(
+        conn: &mut sqlx::PgConnection,
+        from_kind: StoreKind,
+        from_root: &str,
+        keys: &[BackupKey],
+        to: &StoreIdentity,
+        inside: Option<&mut Vec<String>>,
+    ) -> Result<u64, sqlx::Error> {
+        use sqlx::Connection as _;
+        let accounts: Vec<&str> = keys.iter().map(|k| k.account_id.as_str()).collect();
+        let ids: Vec<&str> = keys.iter().map(|k| k.backup_id.as_str()).collect();
+        let mut tx = conn.begin().await?;
+        for (setting, bound) in [
+            ("lock_timeout", REWRITE_LOCK_TIMEOUT),
+            ("statement_timeout", REWRITE_STATEMENT_TIMEOUT),
+        ] {
+            sqlx::query("SELECT set_config($1, $2, true)")
+                .bind(setting)
+                .bind(format!("{}ms", bound.as_millis()))
+                .execute(&mut *tx)
+                .await?;
+        }
+        if let Some(inside) = inside {
+            for name in ["lock_timeout", "statement_timeout"] {
+                let value: String = sqlx::query_scalar(&format!("SHOW {name}"))
+                    .fetch_one(&mut *tx)
+                    .await?;
+                inside.push(value);
+            }
+        }
+        let rewritten = sqlx::query(
+            "UPDATE backup_index SET store_kind = $1, store_root = $2, store_id = $3 \
+             WHERE (account_id, backup_id) IN \
+             (SELECT * FROM unnest($4::TEXT[], $5::TEXT[])) \
+             AND store_kind = $6 AND store_root = $7 AND status <> 'CREATING'",
+        )
+        .bind(to.store_kind.as_str())
+        .bind(&to.store_root)
+        .bind(&to.store_id)
+        .bind(&accounts)
+        .bind(&ids)
+        .bind(from_kind.as_str())
+        .bind(from_root)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(rewritten)
+    }
+
+    /// One rewrite's transaction on one pooled connection, with `SHOW
+    /// lock_timeout` and `SHOW statement_timeout` read inside it once its
+    /// bounds are set, then the same two on that connection after the
+    /// commit: for the test that checks the rewrite runs under its bounds,
+    /// and that they end with its transaction and do not stay on the pooled
+    /// connection. The answer: the rows rewritten, the two settings inside,
+    /// the two after.
+    ///
+    /// # Errors
+    ///
+    /// The rewrite's or a `SHOW`'s error.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub async fn rewrite_store_settings_after(
+        &self,
+        from_kind: StoreKind,
+        from_root: &str,
+        keys: &[BackupKey],
+        to: &StoreIdentity,
+    ) -> Result<(u64, [String; 2], [String; 2]), StorageError> {
+        let mut conn = self.pool.acquire().await.map_err(db_err)?;
+        let mut inside = Vec::new();
+        let rewritten =
+            Self::rewrite_store_on(&mut conn, from_kind, from_root, keys, to, Some(&mut inside))
+                .await
+                .map_err(db_err)?;
+        let mut shown = Vec::new();
+        for name in ["lock_timeout", "statement_timeout"] {
+            let value: String = sqlx::query_scalar(&format!("SHOW {name}"))
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(db_err)?;
+            shown.push(value);
+        }
+        let after: [String; 2] = shown.try_into().expect("two settings");
+        let inside: [String; 2] = inside.try_into().expect("two settings");
+        Ok((rewritten, inside, after))
+    }
+
     /// DeleteBackup's first step, and with `remove` the outright removal of
     /// `forget_available_backup_row`, as one transaction: lock the row, read
     /// its status, run the in-use rule, then write DELETING or, with

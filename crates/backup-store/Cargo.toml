@@ -6,7 +6,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Backup object store abstraction with filesystem and S3 implementations."
+description = "Backup object store of the ExtendDB server, with filesystem and S3 implementations. Internal crate of the extenddb binary, with no API stability promise."
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 aws-config = { workspace = true }

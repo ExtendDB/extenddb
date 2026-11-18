@@ -28,16 +28,30 @@ mod backup_engine;
 mod cassandra_engine;
 #[path = "direct/concurrent_account_creation.rs"]
 mod concurrent_account_creation;
+#[path = "direct/consistency_levels.rs"]
+mod consistency_levels;
+#[path = "direct/consistency_shape.rs"]
+mod consistency_shape;
 #[path = "direct/delete_item.rs"]
 mod delete_item;
 #[path = "direct/groups.rs"]
 mod groups;
+#[path = "direct/gsi_worker_pass.rs"]
+mod gsi_worker_pass;
+#[path = "direct/iam_leftovers.rs"]
+mod iam_leftovers;
 #[path = "direct/index.rs"]
 mod index;
+#[path = "direct/index_delay_reads.rs"]
+mod index_delay_reads;
+#[path = "direct/index_propagation_setting.rs"]
+mod index_propagation_setting;
 #[path = "direct/keyspace_migrations.rs"]
 mod keyspace_migrations;
 #[path = "direct/metadata_engine.rs"]
 mod metadata_engine;
+#[path = "direct/metrics_store.rs"]
+mod metrics_store;
 #[path = "direct/policies.rs"]
 mod policies;
 #[path = "direct/pool_size.rs"]
@@ -50,10 +64,16 @@ mod query;
 mod roles;
 #[path = "direct/scan.rs"]
 mod scan;
+#[path = "direct/secret_rows.rs"]
+mod secret_rows;
 #[path = "direct/settings_store.rs"]
 mod settings_store;
 #[path = "direct/snapshot_engine.rs"]
 mod snapshot_engine;
+#[path = "direct/stream_disable.rs"]
+mod stream_disable;
+#[path = "direct/stream_endings.rs"]
+mod stream_endings;
 #[path = "direct/stream_ownership.rs"]
 mod stream_ownership;
 #[path = "direct/streams.rs"]

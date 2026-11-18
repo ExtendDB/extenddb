@@ -36,7 +36,7 @@ import pytest
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 
-from conftest import wait_for_active
+from conftest import ENABLE_REFUSED, RESTORE_REFUSED, wait_for_active
 from management_helpers import ManagementClient
 from test_backup_restore_fidelity import _delete_backup_when_available
 
@@ -54,14 +54,16 @@ def _require_auth_env() -> tuple[str, str, str]:
     return endpoint, admin_user, admin_pass
 
 
-def _client(endpoint: str, ak: str, sk: str, region: str, service: str = "dynamodb") -> Any:
+def _client(
+    endpoint: str, ak: str, sk: str, region: str, service: str = "dynamodb", validate: bool = True
+) -> Any:
     kwargs: dict = dict(
         service_name=service,
         endpoint_url=endpoint,
         aws_access_key_id=ak,
         aws_secret_access_key=sk,
         region_name=region,
-        config=BotoConfig(retries={"max_attempts": 0}),
+        config=BotoConfig(retries={"max_attempts": 0}, parameter_validation=validate),
     )
     if endpoint.startswith("https://"):
         kwargs["verify"] = False
@@ -615,40 +617,70 @@ class TestExplicitDenyOnResourceArn:
         self._assert_denied(lambda: d.restore_table_from_backup(
             TargetTableName=table["name"] + "-rfb", BackupArn=table["backup_arn"]))
 
-    def test_restore_to_point_in_time_deny_target_item_action_blocks(self, table):
-        target = table["table_arn"] + "-pitr"
-        d = self._ddb(_allow_all_deny("PutItem", target))
-        self._assert_denied(lambda: d.restore_table_to_point_in_time(
-            SourceTableName=table["name"], TargetTableName=table["name"] + "-pitr"))
+    def test_restore_to_point_in_time_is_refused_before_authorization(self, table):
+        # On DynamoDB (measured 2026-10-22 and 2026-11-10), a caller with no
+        # policy is denied on dynamodb:Scan on the target table, and a caller
+        # allowed dynamodb:* gets "Table ARN is invalid." for an index source.
+        # Point-in-time recovery is not in this release, so ExtendDB refuses
+        # every restore before it authorizes it: each caller, including one
+        # with an explicit Deny on the target, gets the same refusal.
+        policies = [
+            {"Version": "2012-10-17", "Statement": []},
+            ALLOW_ALL,
+            _allow_all_deny("PutItem", table["table_arn"] + "-pitr"),
+        ]
+        for policy in policies:
+            d = self._ddb(policy)
+            for source in ({"SourceTableArn": table["index_arn"]},
+                           {"SourceTableName": table["name"]}):
+                with pytest.raises(ClientError) as exc:
+                    d.restore_table_to_point_in_time(
+                        TargetTableName=table["name"] + "-pitr", UseLatestRestorableTime=True,
+                        **source)
+                err = exc.value.response["Error"]
+                assert (err["Code"], err["Message"]) == RESTORE_REFUSED, (policy, source, err)
 
-    def test_restore_to_point_in_time_noperm_denial_names_scan_on_target(self, table):
-        # Measured on DynamoDB 2026-10-22 (issue #446): a caller with no policy
-        # and an index SourceTableArn is denied on dynamodb:Scan on the target
-        # table, because the service checks the target's item actions before
-        # the restore action on the source.
-        target_arn = table["table_arn"] + "-pitr446"
-        d = self._ddb({"Version": "2012-10-17", "Statement": []})
-        msg = self._denial_message(lambda: d.restore_table_to_point_in_time(
-            SourceTableArn=table["index_arn"], TargetTableName=table["name"] + "-pitr446",
-            UseLatestRestorableTime=True))
-        assert msg.startswith(f"User: arn:aws:iam::{self.account_id}:user/"), msg
-        assert msg.endswith(
-            f" is not authorized to perform: dynamodb:Scan on resource: {target_arn} "
-            "because no identity-based policy allows the dynamodb:Scan action"
-        ), msg
+    def test_an_enable_is_refused_before_authorization(self, table):
+        # An UpdateContinuousBackups that enables point-in-time recovery gets
+        # the same refusal from every caller: no policy, dynamodb:*, and an
+        # explicit Deny on the action for the table.
+        policies = [
+            {"Version": "2012-10-17", "Statement": []},
+            ALLOW_ALL,
+            _allow_all_deny("UpdateContinuousBackups", table["table_arn"]),
+        ]
+        for policy in policies:
+            ak, sk = _user_with_policy(self.mgmt, self.account_id, policy)
+            d = _client(self.endpoint, ak, sk, self.region, validate=False)
+            for flag in (True, "true"):
+                with pytest.raises(ClientError) as exc:
+                    d.update_continuous_backups(
+                        TableName=table["name"],
+                        PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": flag})
+                err = exc.value.response["Error"]
+                assert (err["Code"], err["Message"]) == ENABLE_REFUSED, (policy, flag, err)
 
-    def test_restore_to_point_in_time_index_source_is_invalid_after_authorization(self, table):
-        # Measured on DynamoDB 2026-10-22 (issue #446): the same request from a
-        # caller allowed dynamodb:* passes authorization and is refused because
-        # the source ARN names an index, not a table.
-        d = self._ddb(ALLOW_ALL)
-        with pytest.raises(ClientError) as exc:
-            d.restore_table_to_point_in_time(
-                SourceTableArn=table["index_arn"], TargetTableName=table["name"] + "-pitr446",
-                UseLatestRestorableTime=True)
-        err = exc.value.response["Error"]
-        assert (err["Code"], err["Message"]) == (
-            "ValidationException", "Invalid Request: Table ARN is invalid."), err
+    def test_the_refusal_comes_after_authentication(self, table):
+        # A request that does not authenticate gets the authentication error,
+        # not the point-in-time recovery refusal.
+        ak, _ = _user_with_policy(self.mgmt, self.account_id, ALLOW_ALL)
+        clients = {
+            "UnrecognizedClientException": _client(
+                self.endpoint, "AKIA" + "X" * 16, "x" * 40, self.region),
+            "InvalidSignatureException": _client(self.endpoint, ak, "x" * 40, self.region),
+        }
+        for code, d in clients.items():
+            for call in (
+                lambda: d.restore_table_to_point_in_time(
+                    SourceTableName=table["name"], TargetTableName=table["name"] + "-pitr",
+                    UseLatestRestorableTime=True),
+                lambda: d.update_continuous_backups(
+                    TableName=table["name"],
+                    PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": True}),
+            ):
+                with pytest.raises(ClientError) as exc:
+                    call()
+                assert exc.value.response["Error"]["Code"] == code, exc.value.response["Error"]
 
     def test_export_deny_table_blocks(self, table):
         d = self._ddb(_allow_all_deny("ExportTableToPointInTime", table["table_arn"]))
