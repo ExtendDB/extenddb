@@ -382,17 +382,17 @@
 # the procedure, the file format, the ownership and mode the file must have,
 # and the delivery routes.
 
-# Path of the key-encryption key (KEK) file. Set, the server unwraps the data
-# encryption key (DEK) from the `encryption_key_ring` settings row with the
-# KEK in this file. Set it only after `extenddb encryption-key switch --yes`
-# has run. A leading `~` expands as in the TLS key path, and the path must
-# then be absolute: `serve` changes its working directory to `/` when it
-# detaches, so the configuration refuses a relative path. An in-memory SQLite
-# catalog refuses it. No default.
+# Path of the key-encryption key (KEK) file. When it is set, the server
+# unwraps the data encryption key (DEK) from the `encryption_key_ring`
+# settings row with the KEK in this file. Set it only after
+# `extenddb encryption-key switch --yes` completes. A leading `~` expands as
+# in the TLS key path. The configuration refuses a path that is relative
+# after that expansion, because `serve` changes its working directory to `/`
+# when it detaches. An in-memory SQLite catalog refuses this key. No default.
 # key_file = "/etc/extenddb/kek"
 
 # With `key_file` set, refuse to start when the locked key store that holds
-# the DEK and the cached signing keys cannot lock its memory; the refusal
+# the DEK and the cached signing keys cannot lock its memory. The refusal
 # names the memlock limit it needs. false turns the refusal into a warning.
 # Without `key_file` the server warns and starts in either case.
 # require_locked_memory = true
