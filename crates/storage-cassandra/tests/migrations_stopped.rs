@@ -3,12 +3,14 @@
 
 //! Runs stopped part way, as a migrator killed at that point stops, and the
 //! run after each, which finishes with the definitions of a fresh install;
-//! and migration 2's rewrite of a released catalog's policies, compared with
-//! a committed dump. Each test uses keyspaces of its own prefix and drops
+//! and migration 2's rewrite of a released catalog's policies and migration
+//! 6's backfill of its restore registrations, each compared with a committed
+//! dump. Each test uses keyspaces of its own prefix and drops
 //! them. Skipped without a node unless `EXTENDDB_TEST_CASSANDRA=required`.
 //!
-//! With `EXTENDDB_BLESS_EXPECTED=1`, the migration 2 test writes
-//! `tests/fixtures/golden/0002_resource_tag_condition_keys.txt` instead of
+//! With `EXTENDDB_BLESS_EXPECTED=1`, the migration 2 and migration 6 tests
+//! write `tests/fixtures/golden/0002_resource_tag_condition_keys.txt` and
+//! `tests/fixtures/golden/0006_backup_catalog_index.txt` instead of
 //! comparing.
 
 #[path = "common/mod.rs"]
@@ -43,7 +45,7 @@ async fn fresh_catalog(session: &Arc<CassandraSession>, prefix: &str) {
         .expect("the settings table");
 }
 
-/// A catalog as a release before 1.0 left it: the tables migration 1
+/// A catalog as a release before 0.1.15 left it: the tables migration 1
 /// converges and no ledger, `catalog_version` 0.0.4 and the resource-tag
 /// marker, one account with its keyspace, and a policy holding a
 /// `dynamodb:ResourceTag` key in each of the six places migration 2
@@ -242,16 +244,7 @@ async fn assert_finished(session: &Arc<CassandraSession>, prefix: &str, released
         let actual = postcheck::describe(session, &keyspace)
             .await
             .expect("describe");
-        let path = format!(
-            "{}/migrations/{dir}/0001_baseline.expected.json",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        let mut expected: postcheck::Definitions =
-            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
-        // Migration 5 drops continuous_backups, which migration 1 creates.
-        expected
-            .columns
-            .retain(|name, _| !name.starts_with("continuous_backups."));
+        let expected = migrations_support::expected_definitions(dir);
         assert_eq!(expected, actual, "{at}: {dir}");
     }
     let store = CassandraCatalogStore::catalog_only(session.clone(), prefix.to_owned());
@@ -394,8 +387,9 @@ async fn an_upgrade_stopped_inside_migrations_1_and_2_finishes_on_the_next_run()
         2,
         // Before migration 1's ledger row in the catalog keyspace, which is
         // written in one batch with the version row: as two writes, a stop
-        // between them left the row beside the 0.1.x version row, and the
-        // next run refused the catalog as one an older release wrote to.
+        // between them left the row beside the dotted version row of 0.1.14
+        // or earlier, and the next run refused the catalog as one an older
+        // release wrote to.
         catalog_1 - 1,
         // Between two statements of migration 1's account file.
         catalog_1 + 2,
@@ -456,6 +450,171 @@ async fn migration_2_rewrites_a_released_catalogs_policies_in_every_place() {
     assert_eq!(
         expected, text,
         "differs from {path}; regenerate with EXTENDDB_BLESS_EXPECTED=1"
+    );
+}
+
+/// Migration 6 on a released catalog holding two restore registrations: one
+/// whose table is ACTIVE (a finished restore) and one whose table is CREATING
+/// (a restore the stop interrupted). The job record is backfilled, the
+/// finished one DONE and completed at the table's creation, the interrupted
+/// one RUNNING with the epoch heartbeat and generation 0; the catalog id is
+/// written once; and a reconverge, which runs the body again, changes
+/// nothing.
+#[tokio::test]
+async fn migration_6_backfills_a_released_catalogs_restore_registrations() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
+    let session = session().await;
+    let (prefix, _drops) = new_prefix("m6");
+    released_catalog(&session, &prefix).await;
+    let catalog = format!("{prefix}_catalog");
+    for (name, id, status) in [
+        (
+            "cu_orders",
+            "0b7c2f5e-3d1a-4e8b-9c6f-1a2b3c4d5e6f",
+            "ACTIVE",
+        ),
+        (
+            "interrupted",
+            "4e1c0d2b-7a9f-4c3e-8b6d-2f5a1c9e7d30",
+            "CREATING",
+        ),
+    ] {
+        cql(
+            &session,
+            &format!(
+                "INSERT INTO {catalog}.tables (account_id, table_name, table_id, table_status, \
+                 created_at, restore_source_backup_arn, restore_source_table_arn, \
+                 restore_date_time) VALUES ('{ACCOUNT}', '{name}', '{id}', '{status}', \
+                 1700000000000, \
+                 'arn:aws:dynamodb:us-east-1:{ACCOUNT}:table/src/backup/01700000000000-0000000a', \
+                 'arn:aws:dynamodb:us-east-1:{ACCOUNT}:table/src', 1700000000000)"
+            ),
+        )
+        .await;
+    }
+    let (done, _) =
+        run_stopped_after(&session, &prefix, usize::MAX, false, MigrationId::LATEST).await;
+    done.expect("migrate");
+    assert_finished(&session, &prefix, true, "migrated").await;
+    let registrations = || async {
+        let mut text = String::from(
+            "-- table_name, table_status, restore_status, restore_kind, \
+             restore_owner_generation, restore_heartbeat_at, restore_store_kind, \
+             restore_completed_at = created_at\n",
+        );
+        let rows = session
+            .query(format!(
+                "SELECT table_name, table_status, created_at, restore_status, restore_kind, \
+                 restore_owner_generation, restore_heartbeat_at, restore_store_kind, \
+                 restore_completed_at FROM {catalog}.tables"
+            ))
+            .await
+            .expect("read")
+            .response_body()
+            .expect("body")
+            .into_rows()
+            .unwrap_or_default();
+        let mut lines: Vec<String> = rows
+            .iter()
+            .map(|row| {
+                let text = |name: &str| -> String {
+                    let value: Option<String> = row.get_by_name(name).expect(name);
+                    value.unwrap_or_else(|| "null".to_owned())
+                };
+                let number = |name: &str| -> String {
+                    let value: Option<i64> = row.get_by_name(name).expect(name);
+                    value.map_or_else(|| "null".to_owned(), |v| v.to_string())
+                };
+                let created: Option<i64> = row.get_by_name("created_at").expect("created_at");
+                let completed: Option<i64> =
+                    row.get_by_name("restore_completed_at").expect("completed");
+                let completed_at_creation = match completed {
+                    None => "null".to_owned(),
+                    Some(at) => (Some(at) == created).to_string(),
+                };
+                [
+                    text("table_name"),
+                    text("table_status"),
+                    text("restore_status"),
+                    text("restore_kind"),
+                    number("restore_owner_generation"),
+                    number("restore_heartbeat_at"),
+                    text("restore_store_kind"),
+                    completed_at_creation,
+                ]
+                .join("\t")
+            })
+            .collect();
+        lines.sort();
+        for line in lines {
+            text.push_str(&line);
+            text.push('\n');
+        }
+        text
+    };
+    let mut text = registrations().await;
+    let store = CassandraCatalogStore::catalog_only(session.clone(), prefix.clone());
+    let catalog_id = store
+        .get_setting("catalog_id")
+        .await
+        .expect("read")
+        .expect("a catalog id");
+    assert!(uuid::Uuid::parse_str(&catalog_id).is_ok(), "{catalog_id}");
+    let rows = session
+        .query(format!(
+            "SELECT notes FROM {catalog}.extenddb_migrations WHERE id = 6"
+        ))
+        .await
+        .expect("read")
+        .response_body()
+        .expect("body")
+        .into_rows()
+        .unwrap_or_default();
+    let notes: String = rows
+        .first()
+        .expect("migration 6's row")
+        .get_r_by_name("notes")
+        .expect("notes");
+    text.push_str("-- notes\n");
+    text.push_str(&notes);
+    text.push('\n');
+    let path = format!(
+        "{}/tests/fixtures/golden/0006_backup_catalog_index.txt",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    if std::env::var("EXTENDDB_BLESS_EXPECTED").as_deref() == Ok("1") {
+        std::fs::write(&path, &text).expect("write golden");
+    }
+    let expected = std::fs::read_to_string(&path).unwrap_or_default();
+    assert_eq!(
+        expected, text,
+        "differs from {path}; regenerate with EXTENDDB_BLESS_EXPECTED=1"
+    );
+
+    // A reconverge runs the body again and changes nothing.
+    let before = registrations().await;
+    let lock = MigrationLock::acquire(session.clone(), &catalog, LeaseTimes::DEFAULT, TIMEOUT)
+        .await
+        .expect("take the lock");
+    let reconverged = {
+        let migrations = CassandraMigrations::locked(&lock, &prefix);
+        Runner::new(&migrations, "test").reconverge().await
+    };
+    lock.release().await;
+    let reconverged = reconverged.expect("reconverge");
+    assert!(
+        reconverged.applied.iter().any(
+            |step| step.id == MigrationId::BackupCatalogIndex.number() && step.notes.is_empty()
+        ),
+        "{reconverged:?}"
+    );
+    assert_eq!(registrations().await, before);
+    assert_eq!(
+        store.get_setting("catalog_id").await.expect("read"),
+        Some(catalog_id),
+        "the catalog id is kept"
     );
 }
 
@@ -562,7 +721,7 @@ async fn the_status_read_under_the_lock_keeps_it_through_a_long_scan() {
 /// Both forms on one key with different values, which migration 2 refuses.
 const COLLIDING: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"dynamodb:*","Resource":"*","Condition":{"StringEquals":{"dynamodb:ResourceTag/env":"prod","aws:ResourceTag/env":"dev"}}}]}"#;
 
-/// From 1.0 on a `dynamodb:ResourceTag` key written through the API has no
+/// From 0.1.15 on a `dynamodb:ResourceTag` key written through the API has no
 /// effect, as on the service. Migration 2 is not convergent, so a reconverge
 /// leaves the policies written after it, in each place a policy is stored,
 /// with the text they were written with, one that names both forms of a key
@@ -609,7 +768,7 @@ async fn a_reconverge_leaves_policies_written_after_migration_2_as_they_are() {
         6,
         "{before}"
     );
-    // What a release before 1.0 leaves when it writes to a migrated catalog.
+    // What a release before 0.1.15 leaves when it writes to a migrated catalog.
     cql(
         &session,
         &format!(

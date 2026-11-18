@@ -141,12 +141,19 @@ class TestConsoleAuth:
         self.admin_user = auth_env[1]
         self.admin_pass = auth_env[2]
 
+    def _assert_secure_matches_scheme(self, set_cookie: str) -> None:
+        """The session cookie carries Secure exactly when the console is served
+        over HTTPS (dev mode serves plain HTTP)."""
+        attrs = [a.strip() for a in set_cookie.split(";")]
+        assert ("Secure" in attrs) == self.endpoint.startswith("https://"), set_cookie
+
     def test_login_redirects_to_dashboard(self):
         client = ConsoleClient(self.endpoint)
         resp = client.login(self.admin_user, self.admin_pass)
         assert resp.status_code == 303
         assert "/console" in resp.headers.get("location", "")
         assert "extenddb_session=" in resp.headers.get("set-cookie", "")
+        self._assert_secure_matches_scheme(resp.headers.get("set-cookie", ""))
 
     def test_login_invalid_credentials(self):
         client = ConsoleClient(self.endpoint)
@@ -161,6 +168,7 @@ class TestConsoleAuth:
         resp = client.logout()
         assert resp.status_code == 303
         assert "/console/login" in resp.headers.get("location", "")
+        self._assert_secure_matches_scheme(resp.headers.get("set-cookie", ""))
         # After logout, accessing dashboard should redirect to login.
         resp = client.get("")
         assert resp.status_code == 303
@@ -781,15 +789,17 @@ class TestConsoleIamUserScoping:
             resp = iam_console.login(f"{self.account_id}/{user}", password)
             assert resp.status_code == 303
 
-            # Dashboard should be accessible.
+            # Dashboard should be accessible, with a link to the user's own
+            # page.
             resp = iam_console.get("")
             assert resp.status_code == 200
+            assert f"/console/accounts/{self.account_id}/users/{user}" in resp.text
 
-            # Account listing: IAM user should see limited view.
+            # The account list is for admins: an IAM user is redirected to
+            # the dashboard.
             resp = iam_console.get("/accounts")
-            assert resp.status_code == 200
-            # The IAM user's own account should be visible.
-            assert self.account_id in resp.text
+            assert resp.status_code == 303
+            assert resp.headers.get("location") == "/console"
         finally:
             self.admin_console.post(
                 f"/accounts/{self.account_id}/users/{user}/delete"

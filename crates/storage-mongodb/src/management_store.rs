@@ -10,10 +10,10 @@ use mongodb::options::{FindOptions, UpdateOptions};
 
 use extenddb_storage::management_store::{
     AccessKeyCreated, AccountDetail, AdminEntry, GroupDetail, GroupListEntry, ManagementStore,
-    MetricsRow, OpError, OpResult, RoleDetail, RoleListEntry, SessionPolicyEntry, StoredDocument,
-    UserDetail, UserListEntry,
+    MetricsRow, OpError, OpResult, RoleDetail, RoleListEntry, SecretPage, SecretWrite,
+    SessionPolicyEntry, StoredDocument, UserDetail, UserListEntry,
 };
-use extenddb_storage::secret_cipher::encrypt_secret;
+use extenddb_storage::secret_keys::{SecretRow, SecretTable, require_keys};
 
 use crate::catalog_store::MongoCatalogStore;
 
@@ -26,13 +26,233 @@ fn is_duplicate_key(e: &mongodb::error::Error) -> bool {
     )
 }
 
-fn to_offset_dt(dt: BsonDateTime) -> time::OffsetDateTime {
+pub(crate) fn to_offset_dt(dt: BsonDateTime) -> time::OffsetDateTime {
     time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(dt.timestamp_millis()) * 1_000_000)
         .unwrap_or(time::OffsetDateTime::UNIX_EPOCH)
 }
 
 fn now_bson() -> BsonDateTime {
     BsonDateTime::now()
+}
+
+/// The records a principal owns besides its own document, as
+/// `(collection, filter)`: what deleting it must also delete.
+///
+/// The catalog has no references between collections, so nothing else
+/// removes them. A record left behind would belong to the next principal
+/// created with the same name: an inline policy or boundary would grant it
+/// permissions, an access key or a role session would sign in as it, and a
+/// membership would put it in a group. A user's failed logins are keyed by
+/// its sign-in name, `account_id/user_name`, and would count against the next
+/// user's first logins.
+fn principal_dependents(
+    account_id: &str,
+    principal_type: &str,
+    principal_name: &str,
+) -> Vec<(&'static str, Document)> {
+    let attached = doc! {
+        "account_id": account_id,
+        "principal_type": principal_type,
+        "principal_name": principal_name,
+    };
+    match principal_type {
+        "user" => vec![
+            (
+                "access_keys",
+                doc! { "account_id": account_id, "user_name": principal_name },
+            ),
+            ("iam_policies", attached.clone()),
+            ("iam_permissions_boundaries", attached),
+            (
+                "iam_group_members",
+                doc! { "account_id": account_id, "user_name": principal_name },
+            ),
+            (
+                "iam_user_tags",
+                doc! { "account_id": account_id, "user_name": principal_name },
+            ),
+            (
+                "failed_logins",
+                doc! { "principal": format!("{account_id}/{principal_name}") },
+            ),
+        ],
+        "group" => vec![
+            ("iam_policies", attached),
+            (
+                "iam_group_members",
+                doc! { "account_id": account_id, "group_name": principal_name },
+            ),
+        ],
+        "role" => vec![
+            ("iam_policies", attached.clone()),
+            ("iam_permissions_boundaries", attached),
+            (
+                "iam_role_tags",
+                doc! { "account_id": account_id, "role_name": principal_name },
+            ),
+            (
+                "iam_sessions",
+                doc! { "account_id": account_id, "role_name": principal_name },
+            ),
+        ],
+        other => unreachable!("principal type {other}"),
+    }
+}
+
+/// `text` with every regular-expression metacharacter escaped, for a pattern
+/// that must match it literally.
+fn escape_regex(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if r"\^$.|?*+()[]{}/-".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The filter of a principal's own document: `{account_id, <name_field>}`.
+fn principal_filter(account_id: &str, name_field: &str, principal_name: &str) -> Document {
+    let mut filter = doc! { "account_id": account_id };
+    filter.insert(name_field, principal_name);
+    filter
+}
+
+/// Every collection that holds an account's IAM records, each record with an
+/// `account_id` field. An account's delete removes all of them, as the
+/// foreign keys to `accounts` do on SQLite and PostgreSQL.
+const ACCOUNT_IAM_COLLECTIONS: &[&str] = &[
+    "access_keys",
+    "iam_sessions",
+    "iam_policies",
+    "iam_permissions_boundaries",
+    "iam_group_members",
+    "iam_user_tags",
+    "iam_role_tags",
+    "iam_users",
+    "iam_groups",
+    "iam_roles",
+];
+
+impl MongoCatalogStore {
+    /// Whether the account has a document in `accounts`.
+    ///
+    /// The catalog has no references between collections, and before account
+    /// deletes removed them, a deleted account's IAM records stayed. The
+    /// reads that sign a principal in, or let a role be assumed, check the
+    /// account through this, so those records grant nothing.
+    pub(crate) async fn account_exists(&self, account_id: &str) -> OpResult<bool> {
+        self.catalog_db()
+            .collection::<Document>("accounts")
+            .find_one(doc! { "account_id": account_id })
+            .await
+            .map(|d| d.is_some())
+            .map_err(|e| {
+                tracing::error!("account_exists: {e}");
+                OpError::Internal("Database error".to_owned())
+            })
+    }
+
+    /// Delete every IAM record of an account: its users, groups and roles and
+    /// all they own. Each principal's own document goes last.
+    async fn delete_account_iam(&self, what: &str, account_id: &str) -> OpResult<()> {
+        let mut records: Vec<(&str, Document)> = ACCOUNT_IAM_COLLECTIONS
+            .iter()
+            .map(|collection| (*collection, doc! { "account_id": account_id }))
+            .collect();
+        // Failed logins carry no `account_id`; they are keyed by sign-in name,
+        // `account_id/user_name`. An anchored prefix match on the escaped id,
+        // so no character of it is read as a pattern.
+        records.push((
+            "failed_logins",
+            doc! { "principal": { "$regex": format!("^{}/", escape_regex(account_id)) } },
+        ));
+        self.delete_records(what, &records).await
+    }
+
+    /// Delete each `(collection, filter)` in turn, stopping at the first
+    /// error. The management store writes without transactions, so callers
+    /// delete what a principal or an account owns before its own document:
+    /// a failure then leaves it with less than it had, never its records
+    /// without it.
+    async fn delete_records(&self, what: &str, records: &[(&str, Document)]) -> OpResult<()> {
+        for (collection, filter) in records {
+            self.catalog_db()
+                .collection::<Document>(collection)
+                .delete_many(filter.clone())
+                .await
+                .map_err(|e| {
+                    tracing::error!("{what}: delete from {collection}: {e}");
+                    OpError::Internal("Database error".to_owned())
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Delete a principal's records and then its document in `collection`.
+    async fn delete_principal(
+        &self,
+        collection: &str,
+        name_field: &str,
+        account_id: &str,
+        principal_type: &str,
+        principal_name: &str,
+    ) -> OpResult<()> {
+        let what = format!("delete_{principal_type}");
+        self.delete_records(
+            &what,
+            &principal_dependents(account_id, principal_type, principal_name),
+        )
+        .await?;
+        let result = self
+            .catalog_db()
+            .collection::<Document>(collection)
+            .delete_one(principal_filter(account_id, name_field, principal_name))
+            .await
+            .map_err(|e| {
+                tracing::error!("{what} failed: {e}");
+                OpError::Internal("Database error".to_owned())
+            })?;
+        if result.deleted_count == 0 {
+            return Err(OpError::NotFound(format!("IAM {principal_type} not found")));
+        }
+        Ok(())
+    }
+
+    /// After a principal's document was inserted, delete the records a delete
+    /// left behind under its name before deletes removed them. If that fails,
+    /// delete the new document again, so that a retry of the create is not
+    /// refused as a duplicate while the records stay.
+    async fn clear_new_principal(
+        &self,
+        collection: &str,
+        name_field: &str,
+        account_id: &str,
+        principal_type: &str,
+        principal_name: &str,
+    ) -> OpResult<()> {
+        let what = format!("create_{principal_type}");
+        let cleared = self
+            .delete_records(
+                &what,
+                &principal_dependents(account_id, principal_type, principal_name),
+            )
+            .await;
+        if cleared.is_err() {
+            let undo = self
+                .catalog_db()
+                .collection::<Document>(collection)
+                .delete_one(principal_filter(account_id, name_field, principal_name))
+                .await;
+            if let Err(e) = undo {
+                tracing::error!(
+                    "{what}: remove the new {principal_type} after a failed clear: {e}"
+                );
+            }
+        }
+        cleared
+    }
 }
 
 // ── ManagementStore ─────────────────────────────────────────────────────
@@ -57,6 +277,18 @@ impl ManagementStore for MongoCatalogStore {
         let account_name = account_name.to_owned();
         Box::pin(async move {
             let coll = self.catalog_db().collection::<Document>("accounts");
+            // `accounts` has a unique index on `account_name` only, so refuse a
+            // taken id here: the clear below must never reach a live account.
+            let taken = coll
+                .find_one(doc! { "account_id": &account_id })
+                .await
+                .map_err(|e| {
+                    tracing::error!("create_account check id: {e}");
+                    OpError::Internal("Database error".to_owned())
+                })?;
+            if taken.is_some() {
+                return Err(OpError::AlreadyExists("Account already exists".to_owned()));
+            }
             let result = coll
                 .insert_one(doc! {
                     "account_id": &account_id,
@@ -64,16 +296,27 @@ impl ManagementStore for MongoCatalogStore {
                     "created_at": now_bson(),
                 })
                 .await;
-            match result {
-                Ok(_) => Ok(()),
+            let inserted = match result {
+                Ok(inserted) => inserted.inserted_id,
                 Err(e) if is_duplicate_key(&e) => {
-                    Err(OpError::AlreadyExists("Account already exists".to_owned()))
+                    return Err(OpError::AlreadyExists("Account already exists".to_owned()));
                 }
                 Err(e) => {
                     tracing::error!("create_account failed: {e}");
-                    Err(OpError::Internal("Database error".to_owned()))
+                    return Err(OpError::Internal("Database error".to_owned()));
                 }
+            };
+            // An account deleted before deletes removed them could have left
+            // its IAM records under this id. If they cannot be removed, remove
+            // the new account again, so that a retry is not refused while they
+            // stay.
+            let cleared = self.delete_account_iam("create_account", &account_id).await;
+            if cleared.is_err()
+                && let Err(e) = coll.delete_one(doc! { "_id": inserted }).await
+            {
+                tracing::error!("create_account: remove the new account after a failed clear: {e}");
             }
+            cleared
         })
     }
 
@@ -96,9 +339,16 @@ impl ManagementStore for MongoCatalogStore {
                 ));
             }
 
+            // The account's users, groups, roles and everything they own go
+            // first, as the foreign keys to `accounts` remove them on SQLite
+            // and PostgreSQL. Left behind, a user could still sign in, and an
+            // account created later with the same id would get them all.
+            self.delete_account_iam("delete_account", &account_id)
+                .await?;
+
             let coll = self.catalog_db().collection::<Document>("accounts");
             let result = coll
-                .delete_one(doc! { "account_id": &account_id })
+                .delete_many(doc! { "account_id": &account_id })
                 .await
                 .map_err(|e| {
                     tracing::error!("delete_account: {e}");
@@ -358,6 +608,8 @@ impl ManagementStore for MongoCatalogStore {
                     return Err(OpError::Internal("Database error".to_owned()));
                 }
             }
+            self.clear_new_principal("iam_users", "user_name", &account_id, "user", &user_name)
+                .await?;
 
             // Seed default self-service policy.
             let self_service_policy = serde_json::json!({
@@ -408,33 +660,8 @@ impl ManagementStore for MongoCatalogStore {
         let account_id = account_id.to_owned();
         let user_name = user_name.to_owned();
         Box::pin(async move {
-            let coll = self.catalog_db().collection::<Document>("iam_users");
-            let result = coll
-                .delete_one(doc! { "account_id": &account_id, "user_name": &user_name })
+            self.delete_principal("iam_users", "user_name", &account_id, "user", &user_name)
                 .await
-                .map_err(|e| {
-                    tracing::error!("delete_user failed: {e}");
-                    OpError::Internal("Database error".to_owned())
-                })?;
-            if result.deleted_count == 0 {
-                return Err(OpError::NotFound("IAM user not found".to_owned()));
-            }
-            // Cascade: delete access keys, policies, group memberships
-            let keys_coll = self.catalog_db().collection::<Document>("access_keys");
-            let _ = keys_coll
-                .delete_many(doc! { "account_id": &account_id, "user_name": &user_name })
-                .await;
-            let policies_coll = self.catalog_db().collection::<Document>("iam_policies");
-            let _ = policies_coll
-                .delete_many(doc! { "account_id": &account_id, "principal_type": "user", "principal_name": &user_name })
-                .await;
-            let members_coll = self
-                .catalog_db()
-                .collection::<Document>("iam_group_members");
-            let _ = members_coll
-                .delete_many(doc! { "account_id": &account_id, "user_name": &user_name })
-                .await;
-            Ok(())
         })
     }
 
@@ -634,16 +861,16 @@ impl ManagementStore for MongoCatalogStore {
                     OpError::Internal("Database error".to_owned())
                 })?;
 
-            let Some(user_doc) = doc else {
-                return Ok(false);
+            // `None` when the user is absent or has no console password, which
+            // still runs one bcrypt check (see `verify_stored_password`), as a
+            // wrong password does. A user of a deleted account counts as absent.
+            let hash = doc.and_then(|d| d.get_str("password_hash").ok().map(str::to_owned));
+            let hash = if hash.is_some() && !self.account_exists(&account_id).await? {
+                None
+            } else {
+                hash
             };
-
-            let Some(hash) = user_doc.get_str("password_hash").ok() else {
-                return Ok(false);
-            };
-
-            let hash = hash.to_owned();
-            extenddb_storage::password::verify_password(password, hash).await
+            extenddb_storage::password::verify_stored_password(password, hash).await
         })
     }
 
@@ -789,7 +1016,16 @@ impl ManagementStore for MongoCatalogStore {
                 })
                 .await;
             match result {
-                Ok(_) => Ok(()),
+                Ok(_) => {
+                    self.clear_new_principal(
+                        "iam_groups",
+                        "group_name",
+                        &account_id,
+                        "group",
+                        &group_name,
+                    )
+                    .await
+                }
                 Err(e) if is_duplicate_key(&e) => Err(OpError::AlreadyExists(
                     "IAM group already exists".to_owned(),
                 )),
@@ -805,18 +1041,14 @@ impl ManagementStore for MongoCatalogStore {
         let account_id = account_id.to_owned();
         let group_name = group_name.to_owned();
         Box::pin(async move {
-            let coll = self.catalog_db().collection::<Document>("iam_groups");
-            let result = coll
-                .delete_one(doc! { "account_id": &account_id, "group_name": &group_name })
-                .await
-                .map_err(|e| {
-                    tracing::error!("delete_group failed: {e}");
-                    OpError::Internal("Database error".to_owned())
-                })?;
-            if result.deleted_count == 0 {
-                return Err(OpError::NotFound("IAM group not found".to_owned()));
-            }
-            Ok(())
+            self.delete_principal(
+                "iam_groups",
+                "group_name",
+                &account_id,
+                "group",
+                &group_name,
+            )
+            .await
         })
     }
 
@@ -1049,7 +1281,16 @@ impl ManagementStore for MongoCatalogStore {
                 })
                 .await;
             match result {
-                Ok(_) => Ok(()),
+                Ok(_) => {
+                    self.clear_new_principal(
+                        "iam_roles",
+                        "role_name",
+                        &account_id,
+                        "role",
+                        &role_name,
+                    )
+                    .await
+                }
                 Err(e) if is_duplicate_key(&e) => {
                     Err(OpError::AlreadyExists("IAM role already exists".to_owned()))
                 }
@@ -1065,18 +1306,8 @@ impl ManagementStore for MongoCatalogStore {
         let account_id = account_id.to_owned();
         let role_name = role_name.to_owned();
         Box::pin(async move {
-            let coll = self.catalog_db().collection::<Document>("iam_roles");
-            let result = coll
-                .delete_one(doc! { "account_id": &account_id, "role_name": &role_name })
+            self.delete_principal("iam_roles", "role_name", &account_id, "role", &role_name)
                 .await
-                .map_err(|e| {
-                    tracing::error!("delete_role failed: {e}");
-                    OpError::Internal("Database error".to_owned())
-                })?;
-            if result.deleted_count == 0 {
-                return Err(OpError::NotFound("IAM role not found".to_owned()));
-            }
-            Ok(())
         })
     }
 
@@ -1221,6 +1452,10 @@ impl ManagementStore for MongoCatalogStore {
                     tracing::error!("get_role_trust_policy: {e}");
                     OpError::Internal("Database error".to_owned())
                 })?;
+            // A role of a deleted account cannot be assumed.
+            if doc.is_some() && !self.account_exists(&account_id).await? {
+                return Ok(None);
+            }
             Ok(doc.and_then(|d| {
                 d.get("trust_policy")
                     .and_then(|b| bson::from_bson(b.clone()).ok())
@@ -1731,14 +1966,18 @@ impl ManagementStore for MongoCatalogStore {
                 return Err(OpError::NotFound("User not found".to_owned()));
             }
 
-            let enc_key = self.get_encryption_key().await?;
-
+            let keys = require_keys(self.keys.as_deref())?;
             let access_key_id = generate_access_key_id();
             let secret_key = generate_secret_key();
-            let encrypted = encrypt_secret(&secret_key, &enc_key, &access_key_id).map_err(|e| {
-                tracing::error!("create_access_key encryption: {e}");
-                OpError::Internal("Database error".to_owned())
-            })?;
+            let encrypted = keys
+                .encrypt(
+                    &SecretRow::access_key(&access_key_id, &account_id, &user_name),
+                    &secret_key,
+                )
+                .map_err(|e| {
+                    tracing::error!("create_access_key encryption: {e}");
+                    OpError::Internal("Database error".to_owned())
+                })?;
 
             let coll = self.catalog_db().collection::<Document>("access_keys");
             coll.insert_one(doc! {
@@ -1751,12 +1990,17 @@ impl ManagementStore for MongoCatalogStore {
             })
             .await
             .map_err(|e| {
+                // The unique index on access_key_id (migration 12) refuses a
+                // generated ID that another key holds. PostgreSQL and SQLite
+                // answer the same collision with an internal error.
                 if is_duplicate_key(&e) {
-                    OpError::NotFound("User not found".to_owned())
+                    tracing::error!(
+                        "create_access_key: the generated access key ID {access_key_id} is taken"
+                    );
                 } else {
                     tracing::error!("create_access_key failed: {e}");
-                    OpError::Internal("Database error".to_owned())
                 }
+                OpError::Internal("Database error".to_owned())
             })?;
 
             Ok(AccessKeyCreated {
@@ -1844,10 +2088,13 @@ impl ManagementStore for MongoCatalogStore {
         let access_key_id = access_key_id.to_owned();
         let secret_access_key = secret_access_key.to_owned();
         Box::pin(async move {
-            let enc_key = self.get_encryption_key().await?;
-
-            let encrypted =
-                encrypt_secret(&secret_access_key, &enc_key, &access_key_id).map_err(|e| {
+            let keys = require_keys(self.keys.as_deref())?;
+            let encrypted = keys
+                .encrypt(
+                    &SecretRow::access_key(&access_key_id, &account_id, &user_name),
+                    &secret_access_key,
+                )
+                .map_err(|e| {
                     tracing::error!("import_access_key encryption: {e}");
                     OpError::Internal("Database error".to_owned())
                 })?;
@@ -2081,6 +2328,40 @@ impl ManagementStore for MongoCatalogStore {
             }
         })
     }
+
+    // ── Encryption-key commands (RFC-0000 section 8.4) ─────────────
+
+    fn read_secret_page(
+        &self,
+        table: SecretTable,
+        page: Option<&str>,
+        page_size: usize,
+    ) -> BoxFuture<'_, OpResult<SecretPage>> {
+        let page = page.map(str::to_owned);
+        Box::pin(async move {
+            self.read_secret_page_impl(table, page.as_deref(), page_size)
+                .await
+        })
+    }
+
+    fn write_secrets(
+        &self,
+        table: SecretTable,
+        rows: &[SecretWrite],
+    ) -> BoxFuture<'_, OpResult<()>> {
+        let rows = rows.to_vec();
+        Box::pin(async move { self.write_secrets_impl(table, &rows).await })
+    }
+
+    fn delete_secrets(&self, table: SecretTable, keys: &[String]) -> BoxFuture<'_, OpResult<()>> {
+        let keys = keys.to_vec();
+        Box::pin(async move { self.delete_secrets_impl(table, &keys).await })
+    }
+
+    fn delete_setting(&self, key: &str) -> BoxFuture<'_, OpResult<()>> {
+        let key = key.to_owned();
+        Box::pin(async move { self.delete_setting_impl(&key).await })
+    }
 }
 
 // ── SettingsStore ───────────────────────────────────────────────────────
@@ -2117,6 +2398,16 @@ impl extenddb_storage::management_store::SettingsStore for MongoCatalogStore {
         })
     }
 
+    fn replace_setting(
+        &self,
+        key: &str,
+        expected: &str,
+        value: &str,
+    ) -> BoxFuture<'_, OpResult<bool>> {
+        let (key, expected, value) = (key.to_owned(), expected.to_owned(), value.to_owned());
+        Box::pin(async move { self.replace_setting_impl(&key, &expected, &value).await })
+    }
+
     fn list_settings(&self) -> BoxFuture<'_, OpResult<Vec<(String, String)>>> {
         Box::pin(async {
             let coll = self.catalog_db().collection::<Document>("settings");
@@ -2140,14 +2431,11 @@ impl extenddb_storage::management_store::SettingsStore for MongoCatalogStore {
                 .collect())
         })
     }
-
-    fn cached_encryption_key(&self) -> Option<String> {
-        self.encryption_key.clone()
-    }
 }
 
 // ── MetricsStore ────────────────────────────────────────────────────────
 
+/// `account_metrics`: migration 10 replaced `metrics` with it.
 impl extenddb_storage::management_store::MetricsStore for MongoCatalogStore {
     fn insert_metrics(&self, rows: &[MetricsRow]) -> BoxFuture<'_, OpResult<()>> {
         let rows = rows.to_vec();
@@ -2155,7 +2443,7 @@ impl extenddb_storage::management_store::MetricsStore for MongoCatalogStore {
             if rows.is_empty() {
                 return Ok(());
             }
-            let coll = self.catalog_db().collection::<Document>("metrics");
+            let coll = self.catalog_db().collection::<Document>(METRICS_COLLECTION);
             let docs: Vec<Document> = rows
                 .into_iter()
                 .map(|r| {
@@ -2167,6 +2455,9 @@ impl extenddb_storage::management_store::MetricsStore for MongoCatalogStore {
                         "min": r.min,
                         "max": r.max,
                     };
+                    if let Some(ref account) = r.account_id {
+                        d.insert("account_id", account.as_str());
+                    }
                     if let Some(ref tn) = r.table_name {
                         d.insert("table_name", tn.as_str());
                     }
@@ -2191,24 +2482,26 @@ impl extenddb_storage::management_store::MetricsStore for MongoCatalogStore {
         &self,
         start: time::OffsetDateTime,
         end: time::OffsetDateTime,
-        table_name: Option<&str>,
-        metric: Option<&str>,
+        filter: &extenddb_storage::management_store::MetricsFilter,
     ) -> BoxFuture<'_, OpResult<Vec<MetricsRow>>> {
-        let table_name = table_name.map(std::borrow::ToOwned::to_owned);
-        let metric = metric.map(std::borrow::ToOwned::to_owned);
+        let fields: Vec<(&'static str, String)> = [
+            ("account_id", filter.account_id()),
+            ("table_name", filter.table_name()),
+            ("metric", filter.metric()),
+        ]
+        .into_iter()
+        .filter_map(|(field, value)| value.map(|v| (field, v.to_owned())))
+        .collect();
         Box::pin(async move {
-            let coll = self.catalog_db().collection::<Document>("metrics");
+            let coll = self.catalog_db().collection::<Document>(METRICS_COLLECTION);
             let start_bson = BsonDateTime::from_millis(start.unix_timestamp() * 1000);
             let end_bson = BsonDateTime::from_millis(end.unix_timestamp() * 1000);
 
             let mut filter = doc! {
                 "bucket": { "$gte": start_bson, "$lte": end_bson }
             };
-            if let Some(ref tn) = table_name {
-                filter.insert("table_name", tn.as_str());
-            }
-            if let Some(ref m) = metric {
-                filter.insert("metric", m.as_str());
+            for (field, value) in fields {
+                filter.insert(field, value);
             }
 
             let cursor = coll.find(filter).await.map_err(|e| {
@@ -2219,24 +2512,17 @@ impl extenddb_storage::management_store::MetricsStore for MongoCatalogStore {
                 tracing::error!("query_metrics cursor: {e}");
                 OpError::Internal("Database error".to_owned())
             })?;
+            let text = |d: &Document, field: &str| d.get_str(field).ok().map(ToOwned::to_owned);
             Ok(docs
                 .into_iter()
                 .filter_map(|d| {
                     Some(MetricsRow {
                         bucket: to_offset_dt(d.get_datetime("bucket").ok()?.to_owned()),
+                        account_id: text(&d, "account_id"),
                         metric: d.get_str("metric").ok()?.to_owned(),
-                        table_name: d
-                            .get_str("table_name")
-                            .ok()
-                            .map(std::borrow::ToOwned::to_owned),
-                        index_name: d
-                            .get_str("index_name")
-                            .ok()
-                            .map(std::borrow::ToOwned::to_owned),
-                        operation: d
-                            .get_str("operation")
-                            .ok()
-                            .map(std::borrow::ToOwned::to_owned),
+                        table_name: text(&d, "table_name"),
+                        index_name: text(&d, "index_name"),
+                        operation: text(&d, "operation"),
                         sum: d.get_f64("sum").ok()?,
                         count: d
                             .get_i64("count")
@@ -2252,7 +2538,7 @@ impl extenddb_storage::management_store::MetricsStore for MongoCatalogStore {
 
     fn prune_metrics(&self, retention: std::time::Duration) -> BoxFuture<'_, OpResult<()>> {
         Box::pin(async move {
-            let coll = self.catalog_db().collection::<Document>("metrics");
+            let coll = self.catalog_db().collection::<Document>(METRICS_COLLECTION);
             let cutoff = time::OffsetDateTime::now_utc() - retention;
             let cutoff_bson = BsonDateTime::from_millis(cutoff.unix_timestamp() * 1000);
             coll.delete_many(doc! { "bucket": { "$lt": cutoff_bson } })
@@ -2265,6 +2551,10 @@ impl extenddb_storage::management_store::MetricsStore for MongoCatalogStore {
         })
     }
 }
+
+/// The catalog collection of the metrics rows, which migration 10 created
+/// in place of `metrics`.
+const METRICS_COLLECTION: &str = "account_metrics";
 
 // ── RateLimitStore ──────────────────────────────────────────────────────
 
@@ -2478,26 +2768,6 @@ impl extenddb_storage::management_store::AdminStore for MongoCatalogStore {
             let verified = extenddb_storage::password::verify_password(password, hash).await?;
             Ok(Some(verified))
         })
-    }
-}
-
-// ── Helper: encryption key retrieval ────────────────────────────────────
-
-impl MongoCatalogStore {
-    async fn get_encryption_key(&self) -> OpResult<String> {
-        if let Some(ref cached) = self.encryption_key {
-            return Ok(cached.clone());
-        }
-        let coll = self.catalog_db().collection::<Document>("settings");
-        let doc = coll
-            .find_one(doc! { "_id": "encryption_key" })
-            .await
-            .map_err(|e| {
-                tracing::error!("get_encryption_key: {e}");
-                OpError::Internal("Database error".to_owned())
-            })?;
-        doc.and_then(|d| d.get_str("value").ok().map(std::borrow::ToOwned::to_owned))
-            .ok_or_else(|| OpError::Internal("Encryption key not configured".to_owned()))
     }
 }
 

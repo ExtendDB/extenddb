@@ -23,7 +23,7 @@ use cdrs_tokio::cluster::session::{SessionBuilder, TcpSessionBuilder};
 use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
 use extenddb_storage::error::StorageError;
 use extenddb_storage_cassandra::CassandraSession;
-use extenddb_storage_cassandra::cassandra_util::{get_column, query_rows};
+use extenddb_storage_cassandra::cassandra_util::{get_column, system_read};
 use extenddb_storage_cassandra::migrations::{migrate_account, migrate_catalog_keyspace};
 
 /// Connections per node, the `max_connections` default.
@@ -43,13 +43,15 @@ struct Schema {
     added_columns: &'static [(&'static str, &'static str)],
 }
 
-/// Migration 1's catalog body: the tables, index and columns of the 0.1.x
-/// catalog migrations V001 to V005, apart from `continuous_backups`, which
-/// migration 5 drops (see [`DROPPED`]). The runner's ledger and the serving
-/// registrations are in neither list.
+/// Migration 1's catalog body: the tables, index and columns of the
+/// catalog migrations V001 to V005 of 0.1.14 and earlier, apart from
+/// `continuous_backups` and `metrics`, which migrations 5 and 10 drop (see [`DROPPED`]), and with
+/// `account_metrics`, which migration 10 creates in place of `metrics`. The
+/// runner's ledger and the serving registrations are in neither list.
 const CATALOG: Schema = Schema {
     tables: &[
         "access_keys",
+        "account_metrics",
         "accounts",
         "admin_users",
         "backups_by_account",
@@ -67,7 +69,6 @@ const CATALOG: Schema = Schema {
         "idempotency_tokens_by_account",
         "indexes",
         "login_attempts",
-        "metrics",
         "schema_history",
         "settings",
         "tables",
@@ -86,8 +87,8 @@ const CATALOG: Schema = Schema {
     ],
 };
 
-/// Migration 1's account body: the tables and indexes of the 0.1.x data
-/// migrations V001 and V002.
+/// Migration 1's account body: the tables and indexes of the data
+/// migrations V001 and V002 of 0.1.14 and earlier.
 const ACCOUNT: Schema = Schema {
     tables: &[
         "backup_items",
@@ -169,7 +170,7 @@ async fn schema_names(
     keyspace: &str,
     columns: &[&str],
 ) -> BTreeSet<String> {
-    let rows = query_rows::<StorageError>(
+    let rows = system_read::<StorageError>(
         session,
         query,
         cdrs_tokio::query_values!(keyspace),
@@ -195,8 +196,9 @@ async fn tables_in(session: &Arc<CassandraSession>, keyspace: &str) -> BTreeSet<
 }
 
 /// Tables that migration 1 creates and a later migration drops, which no
-/// keyspace holds after a run: migration 5 drops `continuous_backups`.
-const DROPPED: &[&str] = &["continuous_backups"];
+/// keyspace holds after a run: migration 5 drops `continuous_backups`, and
+/// migration 10 `metrics`.
+const DROPPED: &[&str] = &["continuous_backups", "metrics"];
 
 /// One line for each table, index or added column of `schema` that `keyspace`
 /// lacks, for each table of `other` (the other store kind's schema) it
@@ -248,7 +250,7 @@ async fn problems_in(
 }
 
 /// Before every migration run the session selects another keyspace with
-/// `USE`, as the 0.1.x runners on the same session did before #632:
+/// `USE`, as the runners of earlier releases on the same session did before #632:
 /// `extenddb init` and `extenddb migrate` migrate the catalog keyspace and
 /// then each account keyspace on one session, and CreateAccount migrates
 /// its keyspace on the engine's session, which every other caller shares.

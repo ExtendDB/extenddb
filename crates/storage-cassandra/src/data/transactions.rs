@@ -4,9 +4,8 @@
 //! DynamoDB transaction implementations for Cassandra backend.
 
 use super::transact_stream::{commit_old_image, secondary_effect_batches};
-use cdrs_tokio::consistency::Consistency;
+use crate::cassandra_util::PolicySession as _;
 use cdrs_tokio::frame::Envelope;
-use cdrs_tokio::query::BatchQueryBuilder;
 use cdrs_tokio::types::IntoRustByName;
 use cdrs_tokio::types::value::Bytes;
 use extenddb_core::expression::{self, ExpressionMaps};
@@ -23,7 +22,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::CassandraEngine;
-use crate::cassandra_util::{get_column, query_optional};
+use crate::cassandra_util::{Stmt, get_column, query_optional};
 use crate::data::ddl::data_table_name;
 use crate::data::transaction_ledger::{LedgerOp, TransactionState};
 use crate::data::{
@@ -477,8 +476,16 @@ impl CassandraEngine {
                 self.update_ledger_blob(&account_keyspace, txn_id, &ledger_ops)
                     .await?;
                 // T4.3: COMMIT phase
-                self.execute_commit_phase(&account_keyspace, ops, txn_id, started_at)
-                    .await
+                let prepared_items: Vec<Option<String>> =
+                    computed_items.iter().map(|(c, _)| c.clone()).collect();
+                self.execute_commit_phase(
+                    &account_keyspace,
+                    ops,
+                    &prepared_items,
+                    txn_id,
+                    started_at,
+                )
+                .await
             }
             Err(reasons) => {
                 // T4.4: ROLLBACK phase
@@ -580,7 +587,9 @@ impl CassandraEngine {
     /// Prepare a single transactional operation.
     ///
     /// Returns `Ok(Some(item_data_json))` for UPDATE (the post-mutation state),
-    /// `Ok(None)` for PUT/DELETE/CHECK, or `Err(reason)` on failure.
+    /// `Ok(None)` for PUT/DELETE/CHECK and for an UPDATE that writes nothing
+    /// because its actions only remove and the key holds no item, or
+    /// `Err(reason)` on failure.
     async fn prepare_single_operation(
         &self,
         op: &TransactWriteOp<'_>,
@@ -883,6 +892,18 @@ impl CassandraEngine {
                     }
                 }
 
+                // REMOVE and DELETE on a key that holds no item change nothing:
+                // the service writes no item and emits no stream record (issue
+                // #510). The actions ran above for their validation errors, and
+                // the PREPARE marker planted above stays, so a concurrent
+                // transaction that creates the key still collides, as it does
+                // for a ConditionCheck on an absent item. No `item_data` in the
+                // ledger tells COMMIT, and recovery, to remove the marker
+                // instead of writing an item.
+                if existing.is_none() && expression::removes_only(actions) {
+                    return Ok((None, Self::pre_commit_json(existing.as_ref())?));
+                }
+
                 // Return the computed final item so the caller can update the ledger blob
                 let item_json = serde_json::to_string(&item)
                     .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
@@ -981,6 +1002,9 @@ impl CassandraEngine {
 
     /// Execute COMMIT phase: apply changes and update ledger.
     ///
+    /// `prepared_items` holds, per op, the post-image PREPARE computed (the
+    /// first half of each `prepare_single_operation` result).
+    ///
     /// A stream record needs the image the item held before this transaction
     /// touched it, to tell an insert from a modify and to carry OldImage. Each
     /// arm reads it here, from the row together with its `created_to_prepare`
@@ -1003,6 +1027,7 @@ impl CassandraEngine {
         &self,
         account_keyspace: &str,
         ops: &[TransactWriteOp<'_>],
+        prepared_items: &[Option<String>],
         txn_id: Uuid,
         txn_timestamp: i64,
     ) -> Result<(), StorageError> {
@@ -1031,11 +1056,22 @@ impl CassandraEngine {
             pre_commit_images.push(image);
         }
 
+        // The system GSI delay, read live at most once for the whole
+        // transaction, and only if some item's table has a GSI that follows
+        // the system setting (see `commit_secondary_effects`).
+        let sys_delay = tokio::sync::OnceCell::new();
+
         // TODO: Execute COMMIT operations for each item in parallel
         // For now, sequential execution
-        for op in ops {
-            self.commit_single_operation(op, txn_id, txn_timestamp)
-                .await?;
+        for (op, prepared_item) in ops.iter().zip(prepared_items) {
+            self.commit_single_operation(
+                op,
+                prepared_item.as_deref(),
+                txn_id,
+                txn_timestamp,
+                &sys_delay,
+            )
+            .await?;
         }
 
         for (op, old_image) in ops.iter().zip(&pre_commit_images) {
@@ -1305,7 +1341,12 @@ impl CassandraEngine {
         skip_txn_id: Option<Uuid>,
     ) -> Result<Option<Item>, StorageError> {
         Ok(self
-            .fetch_row_for_transaction(key_info, key, skip_txn_id, None)
+            .fetch_row_for_transaction(
+                key_info,
+                key,
+                skip_txn_id,
+                crate::cassandra_util::Stmt::Read,
+            )
             .await?
             .item)
     }
@@ -1321,8 +1362,9 @@ impl CassandraEngine {
     /// item and therefore a real old image. The version is `None` in that last
     /// case too: the row belongs to the other transaction until it finishes.
     ///
-    /// `consistency` is the read's consistency. COMMIT reads its own fenced
-    /// row at `LOCAL_SERIAL`: the read supplies the old image whose index rows
+    /// `read` is the kind of the read. COMMIT reads its own fenced row as a
+    /// [`Stmt::SerialRead`](crate::cassandra_util::Stmt::SerialRead), at
+    /// `LOCAL_SERIAL`: the read supplies the old image whose index rows
     /// the commit removes and the version it advances, and the commit's
     /// `IF prepared_txn_id = ?` checks neither, so a replica that missed the
     /// latest write must not answer it.
@@ -1331,7 +1373,7 @@ impl CassandraEngine {
         key_info: &TableKeyInfo,
         key: &Item,
         skip_txn_id: Option<Uuid>,
-        consistency: Option<Consistency>,
+        read: crate::cassandra_util::Stmt,
     ) -> Result<TransactionRow, StorageError> {
         let keyspace = self.account_keyspace(&key_info.account_id);
         let table = data_table_name(&key_info.table_id);
@@ -1347,7 +1389,7 @@ impl CassandraEngine {
             pk_text.as_str(),
             sk.as_ref(),
             sk_col.as_deref(),
-            consistency,
+            read,
         )
         .await?
         else {
@@ -1505,7 +1547,11 @@ impl CassandraEngine {
 
         let result = self
             .session
-            .query_with_values(&query, cdrs_tokio::query_values!(pk_text.as_str()))
+            .run(
+                Stmt::Read,
+                &query,
+                cdrs_tokio::query_values!(pk_text.as_str()),
+            )
             .await
             .map_err(|e| {
                 tracing::error!("check_partition_max_delete_timestamp: {e}");
@@ -1587,7 +1633,7 @@ impl CassandraEngine {
                  VALUES (?, ?, ?, ?, true) IF NOT EXISTS"
             );
             self.session
-                .query_with_values(&query, cdrs_tokio::query_values!(pk_text.as_str(), item_text, txn_id_bytes, txn_timestamp))
+                .run(Stmt::Lwt, &query, cdrs_tokio::query_values!(pk_text.as_str(), item_text, txn_id_bytes, txn_timestamp))
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))
         } else {
@@ -1596,7 +1642,7 @@ impl CassandraEngine {
                  WHERE pk = ? IF prepared_txn_id = null"
             );
             self.session
-                .query_with_values(&query, cdrs_tokio::query_values!(txn_id_bytes, txn_timestamp, pk_text.as_str()))
+                .run(Stmt::Lwt, &query, cdrs_tokio::query_values!(txn_id_bytes, txn_timestamp, pk_text.as_str()))
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))
         }
@@ -1613,11 +1659,20 @@ impl CassandraEngine {
     ///
     /// For Put/Update: Write final `item_data`, clear `prepared_txn_id`, set `last_committed_txn_timestamp`
     /// For Delete: Update `partition_max_delete_timestamp`, then delete the item
+    ///
+    /// `prepared_item` is the post-image PREPARE computed for an Update, as it
+    /// went into the ledger. `None` there means the update writes nothing: its
+    /// actions only remove, and the key held no item when PREPARE read it.
+    /// PREPARE makes that decision and the ledger records it because recovery
+    /// replays from the ledger, which carries `item_data` and not the update's
+    /// actions. Ignored for the other three kinds.
     async fn commit_single_operation(
         &self,
         op: &TransactWriteOp<'_>,
+        prepared_item: Option<&str>,
         txn_id: Uuid,
         txn_timestamp: i64,
+        sys_delay: &tokio::sync::OnceCell<u64>,
     ) -> Result<(), StorageError> {
         let txn_id_bytes = Bytes::new(txn_id.as_bytes().to_vec());
 
@@ -1639,7 +1694,7 @@ impl CassandraEngine {
                         key_info,
                         item,
                         Some(txn_id),
-                        Some(Consistency::LocalSerial),
+                        crate::cassandra_util::Stmt::SerialRead,
                     )
                     .await?;
                 let old_image = commit_old_image(row.item, row.created_to_prepare);
@@ -1666,6 +1721,7 @@ impl CassandraEngine {
                     &indexes,
                     stream_stmt,
                     next_version,
+                    sys_delay,
                 )
                 .await
             }
@@ -1677,13 +1733,23 @@ impl CassandraEngine {
                 stream,
                 ..
             } => {
+                // PREPARE recorded no post-image for an update whose actions
+                // only remove on a key that held no item: it writes nothing
+                // (issue #510). PREPARE left a created_to_prepare marker row
+                // carrying the key, so remove that row rather than clear its
+                // prepared_txn_id, which would leave a phantom later readers
+                // see as an item. Same CQL as a ConditionCheck on an absent
+                // item, and no index work follows.
+                if prepared_item.is_none() {
+                    return self.commit_condition_check(key_info, key, txn_id).await;
+                }
                 // Re-fetch and re-apply update (idempotent)
                 let row = self
                     .fetch_row_for_transaction(
                         key_info,
                         key,
                         Some(txn_id),
-                        Some(Consistency::LocalSerial),
+                        crate::cassandra_util::Stmt::SerialRead,
                     )
                     .await?;
                 let mut final_item = row.item.clone().unwrap_or_else(|| (*key).clone());
@@ -1716,6 +1782,7 @@ impl CassandraEngine {
                     &indexes,
                     stream_stmt,
                     next_version,
+                    sys_delay,
                 )
                 .await
             }
@@ -1733,7 +1800,7 @@ impl CassandraEngine {
                         key_info,
                         key,
                         Some(txn_id),
-                        Some(Consistency::LocalSerial),
+                        crate::cassandra_util::Stmt::SerialRead,
                     )
                     .await?;
                 let old_image = commit_old_image(row.item, row.created_to_prepare);
@@ -1759,7 +1826,8 @@ impl CassandraEngine {
 
                 let result = self
                     .session
-                    .query_with_values(
+                    .run(
+                        Stmt::Lwt,
                         &update_max_ts_null_query,
                         cdrs_tokio::query_values!(txn_timestamp, pk_text.as_str()),
                     )
@@ -1780,7 +1848,8 @@ impl CassandraEngine {
 
                     let _result2 = self
                         .session
-                        .query_with_values(
+                        .run(
+                            Stmt::Lwt,
                             &update_max_ts_query,
                             cdrs_tokio::query_values!(
                                 txn_timestamp,
@@ -1823,10 +1892,7 @@ impl CassandraEngine {
                         "DELETE FROM {keyspace}.{ddb_table} WHERE pk = ? IF prepared_txn_id = ?"
                     );
                     self.session
-                        .query_with_values(
-                            &delete_query,
-                            cdrs_tokio::query_values!(pk_text.as_str(), txn_id_bytes),
-                        )
+                        .run(Stmt::Lwt, &delete_query, cdrs_tokio::query_values!(pk_text.as_str(), txn_id_bytes))
                         .await
                         .map_err(|e| StorageError::Internal(e.to_string()))
                 }
@@ -1855,6 +1921,7 @@ impl CassandraEngine {
                     &indexes,
                     stream_stmt,
                     delete_stamp,
+                    sys_delay,
                 )
                 .await
             }
@@ -1903,7 +1970,8 @@ impl CassandraEngine {
                  IF prepared_txn_id = ? AND created_to_prepare = true"
             );
             self.session
-                .query_with_values(
+                .run(
+                    Stmt::Lwt,
                     &query,
                     cdrs_tokio::query_values!(pk_text.as_str(), txn_id_bytes),
                 )
@@ -1970,17 +2038,14 @@ impl CassandraEngine {
                  WHERE pk = ? AND {sk_col} = ? IF prepared_txn_id = ?"
             );
             self.session
-                .query_with_values(
-                    &query,
-                    cdrs_tokio::query::QueryValues::SimpleValues(vec![
+                .run(Stmt::Lwt, &query, cdrs_tokio::query::QueryValues::SimpleValues(vec![
                         item_text.as_str().into(),
                         next_version.into(),
                         txn_timestamp.into(),
                         cdrs_tokio::types::value::Value::from(pk_text.as_str()),
                         super::index::sk_to_value(&sk),
                         txn_id_bytes.into(),
-                    ]),
-                )
+                    ]))
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))
         } else {
@@ -1989,7 +2054,7 @@ impl CassandraEngine {
                  WHERE pk = ? IF prepared_txn_id = ?"
             );
             self.session
-                .query_with_values(&query, cdrs_tokio::query_values!(item_text, next_version, txn_timestamp, pk_text.as_str(), txn_id_bytes))
+                .run(Stmt::Lwt, &query, cdrs_tokio::query_values!(item_text, next_version, txn_timestamp, pk_text.as_str(), txn_id_bytes))
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))
         }
@@ -2083,6 +2148,7 @@ impl CassandraEngine {
     /// followed by the record as a batch of its own when the two are too large
     /// to share one. The queue row that `enqueue_async_indexes` adds for an
     /// asynchronous GSI goes into the index batch with the index rows.
+    #[allow(clippy::too_many_arguments)]
     async fn commit_secondary_effects(
         &self,
         key_info: &TableKeyInfo,
@@ -2091,6 +2157,7 @@ impl CassandraEngine {
         indexes: &[super::index::IndexMeta],
         stream_stmt: Option<String>,
         stamp: i64,
+        sys_delay: &tokio::sync::OnceCell<u64>,
     ) -> Result<(), StorageError> {
         let data_keyspace = self.account_keyspace(&key_info.account_id);
 
@@ -2098,13 +2165,14 @@ impl CassandraEngine {
             return Ok(());
         }
 
-        let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+        let mut batch = crate::cassandra_util::batch();
         let mut async_enqueued = 0;
 
         if !indexes.is_empty() {
-            let sys_delay = self
-                .gsi_default_delay_ms
-                .load(std::sync::atomic::Ordering::Relaxed);
+            // Read live once for the transaction: the first item whose table
+            // has a GSI following the system setting fills `sys_delay`, and
+            // later items reuse it. An item with none reads nothing.
+            let sys_delay = self.system_index_delay_once(indexes, sys_delay).await;
             super::index::sync_indexes_at(
                 &mut batch,
                 &data_keyspace,
@@ -2135,7 +2203,7 @@ impl CassandraEngine {
             .build()
             .map_err(|e| StorageError::Internal(e.to_string()))?;
         for batch in secondary_effect_batches(index_batch, stream_stmt) {
-            self.session.batch(batch).await.map_err(|e| {
+            self.session.run_batch(batch).await.map_err(|e| {
                 StorageError::Internal(format!("commit_secondary_effects batch: {e}"))
             })?;
         }
@@ -2223,7 +2291,7 @@ impl CassandraEngine {
             );
 
             let dr = self.session
-                .query_with_values(&delete_query, cdrs_tokio::query_values!(pk_text.as_str(), txn_id_bytes.clone()))
+                .run(Stmt::Lwt, &delete_query, cdrs_tokio::query_values!(pk_text.as_str(), txn_id_bytes.clone()))
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))
                 .map_err(|e| { tracing::error!("rollback delete: {e}"); e })?;
@@ -2231,7 +2299,7 @@ impl CassandraEngine {
                 return Ok(());
             }
             self.session
-                .query_with_values(&update_query, cdrs_tokio::query_values!(pk_text.as_str(), txn_id_bytes))
+                .run(Stmt::Lwt, &update_query, cdrs_tokio::query_values!(pk_text.as_str(), txn_id_bytes))
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))
         }
@@ -2369,7 +2437,7 @@ impl CassandraEngine {
             pk,
             sk.map(|(value, _)| value),
             sk.map(|(_, col)| col.as_str()),
-            Some(Consistency::LocalSerial),
+            crate::cassandra_util::Stmt::SerialRead,
         )
         .await?;
         Ok(row.and_then(|row| row.get_by_name("version").ok().flatten()))
@@ -2396,7 +2464,7 @@ impl CassandraEngine {
             pk,
             sk.map(|(value, _)| value),
             sk.map(|(_, col)| col.as_str()),
-            Some(Consistency::LocalSerial),
+            crate::cassandra_util::Stmt::SerialRead,
         )
         .await?
         else {
@@ -2475,10 +2543,24 @@ impl CassandraEngine {
         let old = parse(old_item_data)?;
         let new = parse(new_item_data)?;
         let indexes = self.indexes_for_commit(&key_info).await?;
+        // Background recovery: the cached delay, not a live read, as the TTL
+        // sweep does.
+        let sys_delay = tokio::sync::OnceCell::new_with(Some(
+            self.gsi_default_delay_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ));
         // Recovery writes no stream record (issue #579), so the batch carries
         // the index rows alone.
-        self.commit_secondary_effects(&key_info, old.as_ref(), new.as_ref(), &indexes, None, stamp)
-            .await
+        self.commit_secondary_effects(
+            &key_info,
+            old.as_ref(),
+            new.as_ref(),
+            &indexes,
+            None,
+            stamp,
+            &sys_delay,
+        )
+        .await
     }
 
     /// Commit a single operation during recovery.
@@ -2487,12 +2569,15 @@ impl CassandraEngine {
     /// DELETE: update `partition_max_delete_timestamp`, then delete the row.
     /// CHECK: delete the `created_to_prepare` marker if PREPARE planted one for an
     /// absent item; no-op if the checked item already existed.
+    /// UPDATE with no `item_data`: a removal-only update on an absent key, which
+    /// writes nothing (issue #510), so its marker is deleted like a CHECK's.
     ///
     /// Returns the version stamp this call committed the row under; for a Put
     /// or Update whose fence did not apply, the row's version when the live
     /// commit landed and nothing has rewritten the row since; otherwise `None`
     /// (a later writer has taken the row, a Delete the live commit already
-    /// applied, and CHECK, which writes no item).
+    /// applied, and CHECK and an UPDATE with no `item_data`, which write no
+    /// item).
     async fn recover_commit_op(
         &self,
         keyspace: &str,
@@ -2500,13 +2585,16 @@ impl CassandraEngine {
         txn_id: Uuid,
         txn_timestamp: i64,
     ) -> Result<Option<i64>, StorageError> {
-        if op.op == "CHECK" {
+        if op.op == "CHECK" || (op.op == "UPDATE" && op.item_data.is_none()) {
             // A ConditionCheck never materializes an item. If PREPARE planted a
             // created_to_prepare marker (because the checked item was absent — see
             // prepare_single_operation's ConditionCheck arm), commit must delete
             // that phantom row rather than leave it behind. If the checked item
             // already existed, no marker was planted and this DELETE's `IF ... AND
             // created_to_prepare = true` guard simply does not apply — a no-op.
+            // An UPDATE whose actions only remove, on an absent key, writes
+            // nothing either (issue #510): PREPARE recorded no item_data for it
+            // and left the same marker, so it is cleaned up the same way.
             let table = data_table_name(&op.table_id);
             let txn_id_bytes = Bytes::new(txn_id.as_bytes().to_vec());
             let sk = ledger_sk(op)?;
@@ -2522,7 +2610,11 @@ impl CassandraEngine {
                      IF prepared_txn_id = ? AND created_to_prepare = true",
                 );
                 self.session
-                    .query_with_values(&dq, cdrs_tokio::query_values!(op.pk.as_str(), txn_id_bytes))
+                    .run(
+                        Stmt::Lwt,
+                        &dq,
+                        cdrs_tokio::query_values!(op.pk.as_str(), txn_id_bytes),
+                    )
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))
             }
@@ -2564,7 +2656,8 @@ impl CassandraEngine {
                          WHERE pk = ? AND {sk_col} = ? IF prepared_txn_id = ?",
                     );
                     self.session
-                        .query_with_values(
+                        .run(
+                            Stmt::Lwt,
                             &query,
                             cdrs_tokio::query::QueryValues::SimpleValues(vec![
                                 item_data.into(),
@@ -2585,7 +2678,8 @@ impl CassandraEngine {
                          WHERE pk = ? IF prepared_txn_id = ?",
                     );
                     self.session
-                        .query_with_values(
+                        .run(
+                            Stmt::Lwt,
                             &query,
                             cdrs_tokio::query_values!(
                                 item_data,
@@ -2637,7 +2731,8 @@ impl CassandraEngine {
                 );
                 let r1 = self
                     .session
-                    .query_with_values(
+                    .run(
+                        Stmt::Lwt,
                         &update_null,
                         cdrs_tokio::query_values!(txn_timestamp, op.pk.as_str()),
                     )
@@ -2655,7 +2750,8 @@ impl CassandraEngine {
                     );
                     let _ = self
                         .session
-                        .query_with_values(
+                        .run(
+                            Stmt::Lwt,
                             &update_cmp,
                             cdrs_tokio::query_values!(txn_timestamp, op.pk.as_str(), txn_timestamp),
                         )
@@ -2680,7 +2776,8 @@ impl CassandraEngine {
                         "DELETE FROM {keyspace}.{table} WHERE pk = ? IF prepared_txn_id = ?",
                     );
                     self.session
-                        .query_with_values(
+                        .run(
+                            Stmt::Lwt,
                             &query,
                             cdrs_tokio::query_values!(op.pk.as_str(), txn_id_bytes),
                         )
@@ -2752,7 +2849,8 @@ impl CassandraEngine {
             );
             let dr = self
                 .session
-                .query_with_values(
+                .run(
+                    Stmt::Lwt,
                     &dq,
                     cdrs_tokio::query_values!(op.pk.as_str(), txn_id_bytes.clone()),
                 )
@@ -2774,7 +2872,8 @@ impl CassandraEngine {
             query_with_pk_sk_txnid(&self.session, &update_query, &op.pk, sk_val, txn_id_bytes).await
         } else {
             self.session
-                .query_with_values(
+                .run(
+                    Stmt::Lwt,
                     &update_query,
                     cdrs_tokio::query_values!(op.pk.as_str(), txn_id_bytes),
                 )

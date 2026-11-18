@@ -55,6 +55,9 @@ pub struct ConsoleState {
     /// `/console/metrics-data` response with latency segments (same data the
     /// top-level `/metrics` handler adds).
     pub metrics: Arc<extenddb_core::metrics::MetricsCollector>,
+    /// Whether the session cookie carries `Secure`: true when the server
+    /// serves TLS, false in dev mode, which serves plain HTTP.
+    pub secure_cookies: bool,
 }
 
 /// Build the console router.
@@ -70,16 +73,18 @@ pub fn router() -> Router<Arc<ConsoleState>> {
         .route("/docs/{slug}/pdf", get(pages::docs_pdf))
         // Dashboard (handle both with and without trailing slash)
         .route("/", get(pages::dashboard))
-        // Metrics
+        // Metrics (admin-only; an IAM-user session is redirected to /console)
         .route("/metrics", get(pages::metrics_page))
-        // Metrics data (JSON) — session-authed backend for the dashboard's
-        // client-side charts. Replaces the browser fetch of the top-level
-        // `/metrics` (now Basic-auth only, for Prometheus).
+        // Metrics data (JSON) for the dashboard's client-side charts, for
+        // admin sessions only; an IAM-user session gets 403. Replaces the
+        // browser fetch of the top-level `/metrics` (now Basic-auth only, for
+        // Prometheus).
         .route("/metrics-data", get(pages::metrics_data))
-        // Settings (read-only, admin-only)
+        // Settings (read-only, admin-only; an IAM-user session is redirected
+        // to /console)
         .route("/settings", get(pages::settings_page))
-        // Cache (admin-only break-glass invalidation).
-        // See docs/design/12-auth-authz-cache.md §6.1.
+        // Cache (admin-only break-glass invalidation; an IAM-user session is
+        // redirected to /console). See docs/design/12-auth-authz-cache.md §6.1.
         .route("/cache", get(pages::cache_page))
         .route("/cache/invalidate", post(pages::invalidate_cache))
         // Accounts

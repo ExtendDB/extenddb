@@ -13,14 +13,15 @@ use extenddb_core::types::{
 use extenddb_core::validation;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::pk_to_text;
-use extenddb_storage::{IdempotencyKey, TransactGetOp, TransactWriteOp};
+use extenddb_storage::{IdempotencyKey, StreamCapture, TransactGetOp, TransactWriteOp};
 
 use super::index::{
     IndexMeta, db_error, enqueue_async_indexes, fetch_write_path_indexes, sync_indexes,
 };
 use super::tx_helpers::{
     check_idempotency_token_in_tx, delete_item_in_tx, fetch_item_for_update, fetch_item_in_tx,
-    insert_item_if_absent_in_tx, upsert_item_in_tx, write_stream_record_in_tx,
+    insert_item_if_absent_in_tx, stream_record_shard_in_tx, upsert_item_in_tx,
+    write_stream_record_to_shard_in_tx,
 };
 use crate::PostgresEngine;
 use crate::pg_util::is_conflict_abort;
@@ -230,26 +231,44 @@ impl PostgresEngine {
             });
         }
 
-        // Write stream records atomically within the transaction (BLOCKER #1 fix).
-        for (op, (old_item, new_item)) in ops.iter().zip(op_items.iter()) {
-            let capture = match op {
-                TransactWriteOp::Put { stream, .. }
-                | TransactWriteOp::Delete { stream, .. }
-                | TransactWriteOp::Update { stream, .. } => stream.as_ref(),
-                TransactWriteOp::ConditionCheck { .. } => None,
-            };
-            if let Some(capture) = capture {
-                write_stream_record_in_tx(
+        // Write stream records atomically within the transaction (BLOCKER #1 fix),
+        // in shard id order. Each record locks its shard's row FOR KEY SHARE,
+        // and a disable locks the stream's open rows FOR UPDATE in shard id
+        // order (`close_stream_shards`). In request order, a transaction with
+        // items on shard 2 and then shard 0 would hold shard 2 and wait for
+        // shard 0. A close that held shard 0 would wait for shard 2. This code
+        // chooses the shard of every record first. It then sorts the records
+        // by shard id, byte by byte, as the close sorts the rows. Two records
+        // on one shard keep their request order.
+        let mut records: Vec<(String, usize)> = Vec::new();
+        for (i, (op, (old_item, new_item))) in ops.iter().zip(op_items.iter()).enumerate() {
+            if transact_op_stream(op).is_none() {
+                continue;
+            }
+            let shard = stream_record_shard_in_tx(
+                &mut tx,
+                transact_op_key_info(op),
+                old_item.as_ref(),
+                new_item.as_ref(),
+            )
+            .await
+            .map_err(cancel_all)?;
+            if let Some(shard) = shard {
+                records.push((shard, i));
+            }
+        }
+        records.sort();
+        for (shard, i) in &records {
+            let op = &ops[*i];
+            let (old_item, new_item) = &op_items[*i];
+            if let Some(capture) = transact_op_stream(op) {
+                write_stream_record_to_shard_in_tx(
                     &mut tx,
-                    match op {
-                        TransactWriteOp::Put { key_info, .. }
-                        | TransactWriteOp::Delete { key_info, .. }
-                        | TransactWriteOp::Update { key_info, .. }
-                        | TransactWriteOp::ConditionCheck { key_info, .. } => key_info,
-                    },
+                    transact_op_key_info(op),
                     capture,
                     old_item.as_ref(),
                     new_item.as_ref(),
+                    shard,
                 )
                 .await
                 .map_err(cancel_all)?;
@@ -416,6 +435,27 @@ fn transact_op_table_id<'a>(op: &'a TransactWriteOp<'_>) -> &'a str {
         | TransactWriteOp::Delete { key_info, .. }
         | TransactWriteOp::Update { key_info, .. }
         | TransactWriteOp::ConditionCheck { key_info, .. } => &key_info.table_id,
+    }
+}
+
+/// The table metadata of a transactional write operation.
+fn transact_op_key_info<'a>(op: &'a TransactWriteOp<'_>) -> &'a TableKeyInfo {
+    match op {
+        TransactWriteOp::Put { key_info, .. }
+        | TransactWriteOp::Delete { key_info, .. }
+        | TransactWriteOp::Update { key_info, .. }
+        | TransactWriteOp::ConditionCheck { key_info, .. } => key_info,
+    }
+}
+
+/// The stream capture of a transactional write operation, if its table has an
+/// enabled stream. A `ConditionCheck` writes nothing and records nothing.
+fn transact_op_stream<'a>(op: &'a TransactWriteOp<'_>) -> Option<&'a StreamCapture> {
+    match op {
+        TransactWriteOp::Put { stream, .. }
+        | TransactWriteOp::Delete { stream, .. }
+        | TransactWriteOp::Update { stream, .. } => stream.as_ref(),
+        TransactWriteOp::ConditionCheck { .. } => None,
     }
 }
 
@@ -692,6 +732,15 @@ async fn execute_transact_write_op(
             let mut existing = fetch_item_for_update(tx, key_info, key)
                 .await
                 .map_err(TxnOpError::Storage)?;
+            // A removal-only update on a key that holds no row writes nothing
+            // (issue #510), which makes it the same shape as deleting a missing
+            // item: reserve the key so a concurrent create cannot commit
+            // between the condition check and the end of this transaction. The
+            // reservation returns the winner's item when a create raced in, and
+            // the normal write path below then runs against it.
+            if existing.is_none() && expression::removes_only(actions) {
+                existing = reserve_missing_item(tx, key_info, key).await?;
+            }
             // Compute and validate the post-update item from a given base.
             // Runs once on the fast path, and again when a create race is
             // lost and the loser's expression must re-apply on top of the
@@ -747,6 +796,12 @@ async fn execute_transact_write_op(
                 existing.as_ref(),
             )?;
             let mut item = compute_item(existing.as_ref())?;
+            if existing.is_none() && expression::removes_only(actions) {
+                // The key was reserved above and the actions ran for their
+                // validation errors only. Nothing is written, so no stream
+                // record and no index work follow from this op.
+                return Ok((None, None));
+            }
             if existing.is_some() {
                 // The locking read above holds the row: no concurrent writer can
                 // slip between the condition check and this write.
