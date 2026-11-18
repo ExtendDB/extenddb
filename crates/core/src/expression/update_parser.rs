@@ -15,17 +15,57 @@
 //! value_expr → operand ( ('+' | '-') operand )?
 //! remove_action → path
 //! ```
+//!
+//! A parenthesized value and a function call each nest one level. Past
+//! `max_expression_depth` levels the expression is refused before the parser
+//! recurses further, so the stack a parse takes stays bounded whatever the
+//! size and token limits allow.
 
 use super::ast::{ArithOp, Expr, UpdateAction};
 use super::parser_common;
 use super::tokenizer::Token;
 use crate::error::DynamoDbError;
 
-/// Parse an update expression token stream into a list of actions.
+/// The nesting depth `parse_update` allows, the default of
+/// `max_expression_depth`.
+const DEFAULT_MAX_DEPTH: usize = 150;
+
+/// The nesting levels a parse has entered, and the most it may enter.
+struct Nesting {
+    depth: usize,
+    max_depth: usize,
+}
+
+impl Nesting {
+    fn new(max_depth: usize) -> Self {
+        Self {
+            depth: 0,
+            max_depth,
+        }
+    }
+
+    /// Enter one level, refusing the expression past `max_depth`.
+    fn enter(&mut self) -> Result<(), DynamoDbError> {
+        self.depth += 1;
+        if self.depth > self.max_depth {
+            return Err(validation_err(
+                "Invalid UpdateExpression: expression nesting depth exceeded",
+            ));
+        }
+        Ok(())
+    }
+
+    fn leave(&mut self) {
+        self.depth -= 1;
+    }
+}
+
+/// Parse an update expression token stream into a list of actions, with the
+/// default depth limit.
 ///
 /// # Errors
 ///
-/// Returns `ValidationException` for syntax errors.
+/// Returns `ValidationException` for syntax errors or depth exceeded.
 pub fn parse_update(tokens: &[Token]) -> Result<Vec<UpdateAction>, DynamoDbError> {
     parser_common::check_redundant_parens(tokens).map_err(|msg| {
         DynamoDbError::ValidationException(format!("Invalid UpdateExpression: {msg}"))
@@ -33,12 +73,13 @@ pub fn parse_update(tokens: &[Token]) -> Result<Vec<UpdateAction>, DynamoDbError
 
     let mut pos = 0;
     let mut actions = Vec::new();
+    let mut nesting = Nesting::new(DEFAULT_MAX_DEPTH);
 
     while pos < tokens.len() {
         match &tokens[pos] {
             Token::Set => {
                 pos += 1;
-                parse_set_actions(tokens, &mut pos, &mut actions)?;
+                parse_set_actions(tokens, &mut pos, &mut actions, &mut nesting)?;
             }
             Token::Remove => {
                 pos += 1;
@@ -69,10 +110,17 @@ pub fn parse_update(tokens: &[Token]) -> Result<Vec<UpdateAction>, DynamoDbError
     Ok(actions)
 }
 
-/// Parse an update expression with DynamoDB-compatible syntax error messages.
+/// Parse an update expression with DynamoDB-compatible syntax error
+/// messages, nesting at most `max_depth` levels of parentheses and function
+/// calls.
+///
+/// # Errors
+///
+/// Returns `ValidationException` for syntax errors or depth exceeded.
 pub fn parse_update_from(
     tokens: &[Token],
     source: &str,
+    max_depth: usize,
 ) -> Result<Vec<UpdateAction>, DynamoDbError> {
     parser_common::check_redundant_parens(tokens).map_err(|msg| {
         DynamoDbError::ValidationException(format!("Invalid UpdateExpression: {msg}"))
@@ -80,12 +128,13 @@ pub fn parse_update_from(
 
     let mut pos = 0;
     let mut actions = Vec::new();
+    let mut nesting = Nesting::new(max_depth);
 
     while pos < tokens.len() {
         match &tokens[pos] {
             Token::Set => {
                 pos += 1;
-                parse_set_actions(tokens, &mut pos, &mut actions)?;
+                parse_set_actions(tokens, &mut pos, &mut actions, &mut nesting)?;
             }
             Token::Remove => {
                 pos += 1;
@@ -165,11 +214,12 @@ fn parse_set_actions(
     tokens: &[Token],
     pos: &mut usize,
     actions: &mut Vec<UpdateAction>,
+    nesting: &mut Nesting,
 ) -> Result<(), DynamoDbError> {
     loop {
         let path = parser_common::parse_path(tokens, pos)?;
         parser_common::expect_token(tokens, pos, &Token::Eq, "=", "UpdateExpression")?;
-        let value = parse_value_expr(tokens, pos)?;
+        let value = parse_value_expr(tokens, pos, nesting)?;
         actions.push(UpdateAction::Set { path, value });
 
         if *pos < tokens.len() && tokens[*pos] == Token::Comma {
@@ -200,8 +250,12 @@ fn parse_remove_actions(
 }
 
 /// Parse a SET value expression: `operand` or `operand +/- operand`.
-fn parse_value_expr(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbError> {
-    let left = parse_set_operand(tokens, pos)?;
+fn parse_value_expr(
+    tokens: &[Token],
+    pos: &mut usize,
+    nesting: &mut Nesting,
+) -> Result<Expr, DynamoDbError> {
+    let left = parse_set_operand(tokens, pos, nesting)?;
 
     if *pos < tokens.len() {
         let arith_op = match &tokens[*pos] {
@@ -211,7 +265,7 @@ fn parse_value_expr(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbE
         };
         if let Some(op) = arith_op {
             *pos += 1;
-            let right = parse_set_operand(tokens, pos)?;
+            let right = parse_set_operand(tokens, pos, nesting)?;
             return Ok(Expr::Arithmetic {
                 left: Box::new(left),
                 op,
@@ -224,7 +278,11 @@ fn parse_value_expr(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbE
 }
 
 /// Parse a SET operand: path, placeholder, or function call (`if_not_exists`, `list_append`).
-fn parse_set_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbError> {
+fn parse_set_operand(
+    tokens: &[Token],
+    pos: &mut usize,
+    nesting: &mut Nesting,
+) -> Result<Expr, DynamoDbError> {
     if *pos >= tokens.len() {
         return Err(validation_err("Invalid UpdateExpression: expected operand"));
     }
@@ -241,7 +299,10 @@ fn parse_set_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDb
                 && *pos + 1 < tokens.len()
                 && tokens[*pos + 1] == Token::LParen
             {
-                parse_set_function_call(tokens, pos)
+                nesting.enter()?;
+                let call = parse_set_function_call(tokens, pos, nesting)?;
+                nesting.leave();
+                Ok(call)
             } else {
                 parser_common::parse_path(tokens, pos).map(Expr::Path)
             }
@@ -249,7 +310,9 @@ fn parse_set_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDb
         Token::NameRef(_) => parser_common::parse_path(tokens, pos).map(Expr::Path),
         Token::LParen => {
             *pos += 1; // consume '('
-            let expr = parse_value_expr(tokens, pos)?;
+            nesting.enter()?;
+            let expr = parse_value_expr(tokens, pos, nesting)?;
+            nesting.leave();
             if *pos >= tokens.len() || tokens[*pos] != Token::RParen {
                 return Err(validation_err(
                     "Invalid UpdateExpression: expected closing ')'",
@@ -264,7 +327,11 @@ fn parse_set_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDb
     }
 }
 
-fn parse_set_function_call(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbError> {
+fn parse_set_function_call(
+    tokens: &[Token],
+    pos: &mut usize,
+    nesting: &mut Nesting,
+) -> Result<Expr, DynamoDbError> {
     let name = match &tokens[*pos] {
         Token::Ident(n) => n.to_ascii_lowercase(),
         _ => {
@@ -278,10 +345,10 @@ fn parse_set_function_call(tokens: &[Token], pos: &mut usize) -> Result<Expr, Dy
 
     let mut args = Vec::new();
     if *pos < tokens.len() && tokens[*pos] != Token::RParen {
-        args.push(parse_set_operand(tokens, pos)?);
+        args.push(parse_set_operand(tokens, pos, nesting)?);
         while *pos < tokens.len() && tokens[*pos] == Token::Comma {
             *pos += 1;
-            args.push(parse_set_operand(tokens, pos)?);
+            args.push(parse_set_operand(tokens, pos, nesting)?);
         }
     }
 
@@ -355,217 +422,5 @@ fn validation_err(msg: &str) -> DynamoDbError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::expression::ast::{ArithOp, Expr, PathElement, UpdateAction};
-    use crate::expression::tokenizer::tokenize;
-
-    fn parse(input: &str) -> Result<Vec<UpdateAction>, DynamoDbError> {
-        let tokens = tokenize(input)?;
-        parse_update(&tokens)
-    }
-
-    #[test]
-    fn parse_simple_set() {
-        let actions = parse("SET price = :p").unwrap();
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], UpdateAction::Set { path, .. } if path.len() == 1));
-    }
-
-    #[test]
-    fn parse_multiple_set_actions() {
-        let actions = parse("SET a = :v1, b = :v2, c = :v3").unwrap();
-        assert_eq!(actions.len(), 3);
-        assert!(
-            actions
-                .iter()
-                .all(|a| matches!(a, UpdateAction::Set { .. }))
-        );
-    }
-
-    #[test]
-    fn parse_set_with_arithmetic_add() {
-        let actions = parse("SET price = price + :inc").unwrap();
-        assert_eq!(actions.len(), 1);
-        if let UpdateAction::Set { value, .. } = &actions[0] {
-            assert!(matches!(
-                value,
-                Expr::Arithmetic {
-                    op: ArithOp::Add,
-                    ..
-                }
-            ));
-        } else {
-            panic!("Expected Set action");
-        }
-    }
-
-    #[test]
-    fn parse_set_with_arithmetic_sub() {
-        let actions = parse("SET stock = stock - :dec").unwrap();
-        if let UpdateAction::Set { value, .. } = &actions[0] {
-            assert!(matches!(
-                value,
-                Expr::Arithmetic {
-                    op: ArithOp::Sub,
-                    ..
-                }
-            ));
-        } else {
-            panic!("Expected Set action");
-        }
-    }
-
-    #[test]
-    fn parse_set_with_if_not_exists() {
-        let actions = parse("SET price = if_not_exists(price, :default)").unwrap();
-        if let UpdateAction::Set { value, .. } = &actions[0] {
-            if let Expr::Function { name, args } = value {
-                assert_eq!(name, "if_not_exists");
-                assert_eq!(args.len(), 2);
-            } else {
-                panic!("Expected Function expression");
-            }
-        } else {
-            panic!("Expected Set action");
-        }
-    }
-
-    #[test]
-    fn parse_set_with_list_append() {
-        let actions = parse("SET tags = list_append(tags, :newtags)").unwrap();
-        if let UpdateAction::Set { value, .. } = &actions[0] {
-            assert!(matches!(value, Expr::Function { name, .. } if name == "list_append"));
-        } else {
-            panic!("Expected Set action");
-        }
-    }
-
-    #[test]
-    fn parse_simple_remove() {
-        let actions = parse("REMOVE oldattr").unwrap();
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], UpdateAction::Remove { .. }));
-    }
-
-    #[test]
-    fn parse_multiple_remove() {
-        let actions = parse("REMOVE a, b, c").unwrap();
-        assert_eq!(actions.len(), 3);
-    }
-
-    #[test]
-    fn parse_set_and_remove_combined() {
-        let actions = parse("SET a = :v REMOVE b").unwrap();
-        assert_eq!(actions.len(), 2);
-        assert!(matches!(&actions[0], UpdateAction::Set { .. }));
-        assert!(matches!(&actions[1], UpdateAction::Remove { .. }));
-    }
-
-    #[test]
-    fn parse_add_action() {
-        let actions = parse("ADD counter :inc").unwrap();
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], UpdateAction::Add { .. }));
-    }
-
-    #[test]
-    fn parse_delete_action() {
-        let actions = parse("DELETE colors :remove_colors").unwrap();
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], UpdateAction::Delete { .. }));
-    }
-
-    #[test]
-    fn parse_all_four_action_types() {
-        let actions = parse("SET a = :v ADD b :inc DELETE c :rm REMOVE d").unwrap();
-        assert_eq!(actions.len(), 4);
-    }
-
-    #[test]
-    fn parse_nested_path_in_set() {
-        let actions = parse("SET address.city = :city").unwrap();
-        if let UpdateAction::Set { path, .. } = &actions[0] {
-            assert_eq!(path.len(), 2);
-            assert_eq!(path[0], PathElement::Attribute("address".into()));
-            assert_eq!(path[1], PathElement::Attribute("city".into()));
-        } else {
-            panic!("Expected Set action");
-        }
-    }
-
-    #[test]
-    fn parse_list_index_in_set() {
-        let actions = parse("SET items[0] = :v").unwrap();
-        if let UpdateAction::Set { path, .. } = &actions[0] {
-            assert_eq!(path.len(), 2);
-            assert_eq!(path[1], PathElement::Index(0));
-        } else {
-            panic!("Expected Set action");
-        }
-    }
-
-    #[test]
-    fn parse_empty_expression_rejected() {
-        let tokens = tokenize("").unwrap();
-        // Empty tokens — parse_update should fail
-        let err = parse_update(&tokens).unwrap_err();
-        assert!(
-            matches!(err, DynamoDbError::ValidationException(msg) if msg.contains("at least one action"))
-        );
-    }
-
-    #[test]
-    fn parse_invalid_action_keyword_rejected() {
-        let err = parse("price = :v").unwrap_err();
-        assert!(
-            matches!(err, DynamoDbError::ValidationException(msg) if msg.contains("expected SET"))
-        );
-    }
-
-    #[test]
-    fn parse_name_ref_in_path() {
-        let actions = parse("SET #n = :v").unwrap();
-        if let UpdateAction::Set { path, .. } = &actions[0] {
-            assert_eq!(path[0], PathElement::Attribute("#n".into()));
-        } else {
-            panic!("Expected Set action");
-        }
-    }
-
-    #[test]
-    fn redundant_parens_rejected() {
-        let err = parse("SET c = ((c - :v))").unwrap_err();
-        assert!(
-            matches!(&err, DynamoDbError::ValidationException(msg) if msg.contains("redundant parentheses")),
-            "Expected redundant parens error, got: {err:?}"
-        );
-    }
-
-    #[test]
-    fn single_parens_accepted() {
-        let actions = parse("SET c = (c - :v)").unwrap();
-        assert!(matches!(&actions[0], UpdateAction::Set { .. }));
-    }
-
-    #[test]
-    fn unmatched_paren_rejected() {
-        // Opening paren with no matching close must be a ValidationException,
-        // not a panic or a silently-accepted expression.
-        let err = parse("SET c = (c - :v").unwrap_err();
-        assert!(
-            matches!(&err, DynamoDbError::ValidationException(msg) if msg.contains("closing")),
-            "Expected unmatched-paren error, got: {err:?}"
-        );
-    }
-
-    #[test]
-    fn unmatched_close_paren_rejected() {
-        // A stray closing paren with no matching open must also be rejected.
-        let err = parse("SET c = c - :v)").unwrap_err();
-        assert!(
-            matches!(&err, DynamoDbError::ValidationException(_)),
-            "Expected validation error for stray ')', got: {err:?}"
-        );
-    }
-}
+#[path = "update_parser_tests.rs"]
+mod tests;

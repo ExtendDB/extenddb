@@ -985,7 +985,9 @@ async fn a_failed_ledger_insert_leaves_nothing_of_the_body() {
 
 /// `forget` deletes the ledger row and writes the version row in one
 /// transaction: when the version row cannot be written, the ledger row is
-/// still there.
+/// still there. The command's path is followed under the lock, with a
+/// runner given a released bound of 0, so the latest migration is one it may
+/// forget whatever bound this binary carries.
 #[tokio::test]
 async fn a_forget_whose_version_row_fails_keeps_the_ledger_row() {
     use extenddb_storage::migrations::{CatalogMigrations, Target};
@@ -1006,11 +1008,18 @@ async fn a_forget_whose_version_row_fails_keeps_the_ledger_row() {
         .lock(&target, std::time::Duration::ZERO)
         .await
         .expect("lock");
-    let err = SqliteCatalogMigrations
-        .forget(&lock, LATEST)
+    let migrations = SqliteMigrations::open(&db.to_string_lossy())
         .await
-        .expect_err("the version row fails");
+        .expect("open");
+    let result = migrations
+        .forget_with(
+            &Runner::new(&migrations, "").with_released_through(0),
+            LATEST,
+        )
+        .await;
+    migrations.close().await;
     drop(lock);
+    let err = result.expect_err("the version row fails");
     assert!(
         err.to_string()
             .contains("the version row cannot be written"),

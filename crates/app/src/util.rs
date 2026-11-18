@@ -43,6 +43,44 @@ pub(crate) fn command_config(
     )
 }
 
+/// Whether this binary serves PostgreSQL, the one backend whose catalog
+/// holds the data database connection string (RFC-0000 section 12).
+pub(crate) fn is_postgres() -> bool {
+    extenddb_storage::backend_name() == Some("postgres")
+}
+
+/// The key that `migrate` and `verify` put on their target: on PostgreSQL
+/// with `[auth.encryption] key_file` set, the KEK read through the file
+/// rule, with which the migration backend opens the data connection string
+/// row of a catalog with a key ring (RFC-0000 section 12); else the catalog
+/// key, which no other backend's migrations read.
+pub(crate) fn status_key_source(
+    config: &extenddb_config::AppConfig,
+) -> anyhow::Result<extenddb_storage::server_components::KeySource> {
+    if !is_postgres() {
+        return Ok(extenddb_storage::server_components::KeySource::CatalogKey);
+    }
+    command_key_source(config)
+}
+
+/// The key a command puts on its target or its factory options (RFC-0000
+/// section 7): with `[auth.encryption] key_file` set, the locked key store
+/// is set up first, as `serve` and the `encryption-key` commands set it up,
+/// so the DEK that the KEK unwraps lives in locked memory; then the KEK
+/// read through the file rule. Without `key_file`, the catalog key.
+pub(crate) fn command_key_source(
+    config: &extenddb_config::AppConfig,
+) -> anyhow::Result<extenddb_storage::server_components::KeySource> {
+    use extenddb_server::key_file::{COMMAND_SLOTS, init_key_store, key_source};
+    let encryption = &config.auth.encryption;
+    if encryption.key_file.is_some() {
+        let protection = init_key_store(true, encryption.require_locked_memory, COMMAND_SLOTS)
+            .map_err(anyhow::Error::msg)?;
+        tracing::info!("Locked key store: {protection}");
+    }
+    key_source(encryption).map_err(anyhow::Error::msg)
+}
+
 /// Print each step a run applied, as `<indent><verb> <noun> <id> <name>`
 /// (without `<noun> ` when `noun` is empty), naming the store only when the
 /// run touched more than one, and each step's notes below it. A step of a

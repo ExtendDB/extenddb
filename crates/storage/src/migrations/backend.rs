@@ -63,7 +63,7 @@ pub trait MigrationBackend: Send + Sync {
     /// rows; any other failure is an error, never "not applied".
     async fn read_ledger(&self, store: &StoreRef) -> Result<Vec<LedgerRow>, MigrationError>;
 
-    /// The pre-1.0 traces in the catalog's settings.
+    /// The traces a release before 0.1.15 left in the catalog's settings.
     async fn read_traces(&self) -> Result<CatalogTraces, MigrationError>;
 
     /// Whether the catalog store holds no tables (or collections) at all, so
