@@ -105,6 +105,14 @@ the current `EXTENDDB_DEV_*` pair, recreate the volume.
 This narrows who can sign requests; it does not add TLS or permissions. Keep
 the loopback publish.
 
+### Test suites that freeze time
+
+SigV4 rejects a request whose `X-Amz-Date` is more than 15 minutes from the
+server's clock, so tests that freeze or travel time (`freezegun`,
+`time_machine`) fail with `UnrecognizedClientException`. Pass
+`-e EXTENDDB_DEV_IGNORE_CLOCK_SKEW=1` (or `true`) to skip that check. The
+signature is still verified.
+
 ## Storage modes
 
 One image serves both modes; the mode is chosen at run time.

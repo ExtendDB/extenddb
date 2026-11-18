@@ -10,6 +10,11 @@ description = "SigV4 authentication and IAM-compatible authorization of the Exte
 repository.workspace = true
 homepage.workspace = true
 
+[features]
+# Developer mode: honors EXTENDDB_DEV_IGNORE_CLOCK_SKEW. Enabled only through
+# the app crate's `dev-mode` feature.
+dev-mode = []
+
 [dependencies]
 extenddb-core = { workspace = true }
 extenddb-cache = { workspace = true }

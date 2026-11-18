@@ -592,7 +592,8 @@ jobs:
           # No config file on purpose: dev mode falls back to built-in defaults,
           # which is the zero-config path a user gets, and the one the profile
           # documents as a DynamoDB Local replacement.
-          ./target/release/extenddb serve --foreground --port 18444 --config /nonexistent.toml &
+          # EXTENDDB_DEV_IGNORE_CLOCK_SKEW is exercised by test_dev_mode_clock_skew.py.
+          EXTENDDB_DEV_IGNORE_CLOCK_SKEW=1 ./target/release/extenddb serve --foreground --port 18444 --config /nonexistent.toml &
           for i in $(seq 1 30); do
             if curl -s http://127.0.0.1:18444/health | grep -q healthy; then
               echo "Server ready"
@@ -614,12 +615,13 @@ jobs:
         env:
           EXTENDDB_TEST_ENDPOINT: http://127.0.0.1:18444
           EXTENDDB_TEST_DEV_MODE: "1"
+          EXTENDDB_TEST_DEV_IGNORE_CLOCK_SKEW: "1"
           AWS_DEFAULT_REGION: us-east-1
           # The seeded zero-config dev credential. AWS's documented example key,
           # which grants nothing anywhere; it exists so SigV4 has a key to verify.
           AWS_ACCESS_KEY_ID: AKIAIOSFODNN7EXAMPLE
           AWS_SECRET_ACCESS_KEY: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
-        run: python3 -m pytest tests/test_dev_mode_authorization.py -v
+        run: python3 -m pytest tests/test_dev_mode_authorization.py tests/test_dev_mode_clock_skew.py -v
 
   run-rust-integration:
     runs-on: extenddb_ubuntu-2404_4-core
