@@ -335,7 +335,7 @@ fn member_projection(
     let rendered: Vec<String> = paths.iter().map(|path| bridge.path(path)).collect();
     let maps = build_expression_maps(Some(&bridge.names_map()), None);
     let paths = parse_projection_expr(&rendered.join(", "), &ctx.limits)?;
-    ItemProjection::compile(&paths, &maps, true).map(Some)
+    ItemProjection::compile(&paths, &maps, true, ctx.limits.enforce_reserved_keywords).map(Some)
 }
 
 /// Give each item of a `TransactGetItems` answer its member's projection.

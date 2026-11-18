@@ -64,14 +64,20 @@ pub struct Projection {
 impl Projection {
     /// Compile parsed paths into a trie, resolving `#name` references once.
     /// With `reject_overlap`, rejects paths where one is a prefix of another
-    /// (DynamoDB's rule); pass `false` for desugared `AttributesToGet`.
+    /// (DynamoDB's rule); pass `false` for desugared `AttributesToGet`. With
+    /// `reject_reserved`, rejects a reserved word written bare.
+    ///
+    /// Each path is checked in written order. A path reports its first faulty
+    /// element, and an overlap is a fault of the later path (measured 2026-11-18).
     pub fn compile(
         paths: &[Vec<PathElement>],
         maps: &ExpressionMaps,
         reject_overlap: bool,
+        reject_reserved: bool,
     ) -> Result<Self, DynamoDbError> {
         let overlap = reject_overlap.then_some(super::ExpressionKind::Projection);
-        let resolved = resolve_paths(paths, maps, overlap).map_err(prefix_projection_error)?;
+        let resolved = resolve_paths(paths, maps, overlap, reject_reserved)
+            .map_err(prefix_projection_error)?;
         Ok(Self {
             root: build_trie(resolved),
         })
@@ -106,7 +112,7 @@ fn apply_projection(
     paths: &[Vec<PathElement>],
     maps: &ExpressionMaps,
 ) -> Result<Item, DynamoDbError> {
-    Ok(Projection::compile(paths, maps, false)?.apply(item))
+    Ok(Projection::compile(paths, maps, false, false)?.apply(item))
 }
 
 /// Prefix a projection resolve error with `Invalid ProjectionExpression:`,
@@ -140,6 +146,7 @@ pub(crate) fn resolve_paths(
     paths: &[Vec<PathElement>],
     maps: &ExpressionMaps,
     overlap: Option<super::ExpressionKind>,
+    reject_reserved: bool,
 ) -> Result<Vec<Vec<ResolvedElement>>, DynamoDbError> {
     let mut resolved: Vec<Vec<ResolvedElement>> = Vec::with_capacity(paths.len());
     for path in paths {
@@ -150,6 +157,10 @@ pub(crate) fn resolve_paths(
         for (i, element) in path.iter().enumerate() {
             match element {
                 PathElement::Attribute(raw) => {
+                    if reject_reserved && !raw.starts_with('#') {
+                        let kind = super::ExpressionKind::Projection;
+                        super::reserved_words::validate_not_reserved(raw, kind)?;
+                    }
                     elems.push(ResolvedElement::Attr(
                         resolve_name_ref(raw, maps)?.into_owned(),
                     ));
@@ -550,7 +561,7 @@ mod tests {
         let tokens = tokenize(expr).unwrap();
         let paths = parse_projection(&tokens).unwrap();
         let maps = ExpressionMaps::new(names, HashMap::new());
-        Projection::compile(&paths, &maps, true).map(|_| ())
+        Projection::compile(&paths, &maps, true, true).map(|_| ())
     }
 
     #[test]
@@ -559,7 +570,7 @@ mod tests {
         let tokens = tokenize("a, a").unwrap();
         let paths = parse_projection(&tokens).unwrap();
         let maps = ExpressionMaps::new(HashMap::new(), HashMap::new());
-        assert!(Projection::compile(&paths, &maps, false).is_ok());
+        assert!(Projection::compile(&paths, &maps, false, false).is_ok());
     }
 
     #[test]
@@ -567,7 +578,7 @@ mod tests {
         let tokens = tokenize("name").unwrap();
         let paths = parse_projection(&tokens).unwrap();
         let maps = ExpressionMaps::new(HashMap::new(), HashMap::new());
-        let proj = Projection::compile(&paths, &maps, true).unwrap();
+        let proj = Projection::compile(&paths, &maps, true, false).unwrap();
         let item = sample_item();
         for _ in 0..2 {
             let out = proj.apply(&item);

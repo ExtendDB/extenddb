@@ -122,6 +122,7 @@ pub async fn handle_batch_get_item(
                 paths,
                 &maps,
                 ka.projection_expression.is_some(),
+                ctx.limits.enforce_reserved_keywords,
             )?),
             None => None,
         };

@@ -231,6 +231,7 @@ pub async fn handle_scan(
                 paths,
                 &proj_maps,
                 input.projection_expression.is_some(),
+                ctx.limits.enforce_reserved_keywords,
             )?)
         }
         None => None,

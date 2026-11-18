@@ -110,8 +110,12 @@ pub async fn handle_get_item(
             // runs first. Overlap rejection is scoped to a user-supplied
             // expression.
             let maps = build_expression_maps(effective_proj_names.as_ref(), None);
-            let compiled =
-                Projection::compile(&parsed, &maps, input.projection_expression.is_some())?;
+            let compiled = Projection::compile(
+                &parsed,
+                &maps,
+                input.projection_expression.is_some(),
+                ctx.limits.enforce_reserved_keywords,
+            )?;
             // Then reject ExpressionAttributeNames entries the projection never
             // references. Scoped to a user-supplied ProjectionExpression.
             if input.projection_expression.is_some() {

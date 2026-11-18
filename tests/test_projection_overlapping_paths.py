@@ -23,6 +23,47 @@ OVERLAP = (
     "Invalid ProjectionExpression: Two document paths overlap with each other; "
     "must remove or rewrite one of these paths; path one: {one}, path two: {two}"
 )
+UNDEFINED_U = (
+    "Invalid ProjectionExpression: An expression attribute name used in the "
+    "document path is not defined; attribute name: #u"
+)
+RESERVED_NAME = (
+    "Invalid ProjectionExpression: Attribute name is a reserved keyword; "
+    "reserved keyword: name"
+)
+KEY = {"pk": {"S": "k1"}}
+READS = {
+    "GetItem": lambda c, t, e: c.get_item(TableName=t, Key=KEY, ProjectionExpression=e),
+    "Query": lambda c, t, e: c.query(
+        TableName=t,
+        KeyConditionExpression="pk = :p",
+        ExpressionAttributeValues={":p": KEY["pk"]},
+        ProjectionExpression=e,
+    ),
+    "Scan": lambda c, t, e: c.scan(TableName=t, ProjectionExpression=e),
+    "BatchGetItem": lambda c, t, e: c.batch_get_item(
+        RequestItems={t: {"Keys": [KEY], "ProjectionExpression": e}}
+    ),
+    "TransactGetItems": lambda c, t, e: c.transact_get_items(
+        TransactItems=[{"Get": {"TableName": t, "Key": KEY, "ProjectionExpression": e}}]
+    ),
+}
+# The first fault in written order: a reserved word or an undefined #name is a
+# fault of its path, and an overlap is a fault of the later path. Measured on
+# GetItem 2026-11-14, and on the other reads 2026-11-18.
+FIRST_FAULT_ALL_READS = [
+    ("#u, name", UNDEFINED_U),
+    ("a, a.b, name", OVERLAP.format(one="[a]", two="[a, b]")),
+    ("a, a.b, #u", OVERLAP.format(one="[a]", two="[a, b]")),
+    ("a.b, c.d, c, a", OVERLAP.format(one="[c, d]", two="[c]")),
+]
+# Measured on GetItem, and name.#u on Query too.
+FIRST_FAULT_GET_ITEM = [
+    ("name, #u", RESERVED_NAME),
+    ("a, name, a.b", RESERVED_NAME),
+    ("#u.name", UNDEFINED_U),
+    ("name.#u", RESERVED_NAME),
+]
 
 
 def _validation_message(excinfo) -> str:
@@ -215,3 +256,16 @@ class TestProjectionOverlap:
             ProjectionExpression="a.b, a.c",
         )
         assert resp["Item"]["a"]["M"].keys() == {"b", "c"}
+
+    @pytest.mark.parametrize(
+        ("operation", "expression", "expected"),
+        [(op, expr, msg) for op in READS for expr, msg in FIRST_FAULT_ALL_READS]
+        + [("GetItem", expr, msg) for expr, msg in FIRST_FAULT_GET_ITEM]
+        + [("Query", "name.#u", RESERVED_NAME)],
+    )
+    def test_first_fault_in_written_order(
+        self, dynamodb_client, overlap_table, operation, expression, expected
+    ):
+        with pytest.raises(ClientError) as ei:
+            READS[operation](dynamodb_client, overlap_table, expression)
+        assert _validation_message(ei) == expected

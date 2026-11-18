@@ -239,7 +239,12 @@ pub async fn handle_search_vectors(
             .map(|(k, v)| (k.trim_start_matches('#').to_owned(), v))
             .collect();
         let proj_maps = ExpressionMaps::new(names, HashMap::new());
-        Some(Projection::compile(&paths, &proj_maps, true)?)
+        Some(Projection::compile(
+            &paths,
+            &proj_maps,
+            true,
+            ctx.limits.enforce_reserved_keywords,
+        )?)
     } else {
         None
     };

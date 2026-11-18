@@ -74,7 +74,7 @@ fn modified_paths(item: &Item, update: &UpdateStatement) -> Result<Item, DynamoD
     // A statement whose paths overlap was refused before it ran (see
     // `write::check_overlapping_paths`), so the projection does not check
     // them again.
-    Ok(Projection::compile(&paths, &maps, false)?.apply(item))
+    Ok(Projection::compile(&paths, &maps, false, false)?.apply(item))
 }
 
 /// A statement path in projection form, each attribute name carried through a
