@@ -4609,8 +4609,8 @@ def test_migrate_legacy_refuses_a_13_digit_id_or_an_item_618_let_in_and_keeps_bo
     """Three in-catalog backups: one of a table holding three items with an
     `N` value #618 let in (written into storage, `_seed_stored_items`), one
     of a table that restores, and (SQLite, PostgreSQL) a copy of the
-    second's rows under a 13-digit backup id, the shape every 0.1.x release
-    issued. `migrate-legacy --all`
+    second's rows under a 13-digit backup id, the shape that 0.1.14 and earlier
+    releases issued. `migrate-legacy --all`
     migrates the second and goes on past the other two, each refused with
     its reason and its way out (the item count, the first item and #618;
     the id of the 13-digit shape), and exits 1 naming the two. The refused
@@ -4665,8 +4665,8 @@ def test_migrate_legacy_refuses_a_13_digit_id_or_an_item_618_let_in_and_keeps_bo
         refusals = 2 if old else 1
         if old:
             assert (
-                f"refused {old} (account {ACCOUNT}): its backup id {_backup_id(old)} has the 13-digit shape a "
-                "0.1.x release issued, and a store prefix carries only the 14-digit shape; restore it "
+                f"refused {old} (account {ACCOUNT}): its backup id {_backup_id(old)} has the 13-digit shape that "
+                "0.1.14 and earlier releases issued, and a store prefix carries only the 14-digit shape; restore it "
                 "(RestoreTableFromBackup) and take a new backup of the restored table, which has a new ARN. "
                 "Its in-catalog backup is kept"
             ) in res.stdout, out

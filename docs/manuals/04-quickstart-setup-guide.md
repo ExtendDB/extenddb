@@ -9,7 +9,7 @@ This section gets you from zero to a working extenddb instance as fast as possib
 ### Prerequisites
 
 - PostgreSQL 14+ running locally
-- Rust toolchain 1.88+
+- Rust toolchain 1.91.1+
 - AWS CLI v2
 
 ### Steps
@@ -129,7 +129,7 @@ Check the version:
 
 ```bash
 ./target/release/extenddb version
-# extenddb 0.1.14
+# extenddb 0.1.15
 # catalog migration 12 (postgres)
 # commit abc1234
 # built 2026-04-17T12:00:00Z

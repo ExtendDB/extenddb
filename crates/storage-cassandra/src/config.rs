@@ -21,7 +21,8 @@ pub struct CassandraStorageConfig {
     #[serde(default = "default_keyspace_prefix")]
     pub keyspace_prefix: String,
 
-    /// Replication factor for keyspaces (default: 3)
+    /// Replication factor for keyspaces (default: 3, for a section with no
+    /// `replication_factor` line; `init` always writes the line)
     #[serde(default = "default_replication_factor")]
     pub replication_factor: u32,
 
