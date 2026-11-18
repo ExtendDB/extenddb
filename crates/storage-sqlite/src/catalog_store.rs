@@ -14,6 +14,7 @@ use extenddb_storage::diagnostics::{DiagError, DiagResult, DiagnosticsStore};
 use extenddb_storage::management_store::{
     MetricsFilter, MetricsRow, MetricsStore, OpError, OpResult, RateLimitStore, SettingsStore,
 };
+use extenddb_storage::secret_keys::SecretKeys;
 use futures::future::BoxFuture;
 use sqlx::SqlitePool;
 use time::OffsetDateTime;
@@ -22,11 +23,12 @@ use crate::sqlite_util::{format_timestamp, parse_timestamp};
 
 /// Catalog store over the shared SQLite pool.
 ///
-/// The encryption key is cached at construction (from the `settings` table) so
-/// access-key creation/import can encrypt secrets without an extra query.
+/// The key holder is the one the server's factory loaded, shared with the
+/// credential store, so access-key creation and import encrypt without an
+/// extra query.
 pub struct SqliteCatalogStore {
     pool: SqlitePool,
-    encryption_key: Option<Arc<str>>,
+    keys: Option<Arc<SecretKeys>>,
     /// Serializes this store's writers with the engine's (design decision D1,
     /// see `store.rs`). For a file-backed database the catalog pool opens the
     /// same file as the engine pool, so an uncoordinated catalog write can
@@ -38,7 +40,8 @@ pub struct SqliteCatalogStore {
 }
 
 impl SqliteCatalogStore {
-    /// Construct without a cached encryption key (settings/diagnostics-only use).
+    /// Construct without a key holder (settings/diagnostics-only use). The
+    /// store refuses to create or import an access key.
     ///
     /// Used by the out-of-process factories (the `settings`/`doctor` CLI
     /// paths), where no engine exists in the process; the fresh lock still
@@ -46,32 +49,28 @@ impl SqliteCatalogStore {
     pub fn new(pool: SqlitePool) -> Self {
         Self {
             pool,
-            encryption_key: None,
+            keys: None,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
-    /// Construct with the cached AES-256-GCM encryption key (base64) and the
-    /// engine's write lock, so catalog writers queue with engine writers
-    /// (design decision D1).
-    pub fn with_encryption_key(
+    /// Construct with the key holder the factory loaded (`None` for a caller
+    /// that passed `KeySource::None`) and the engine's write lock, so catalog
+    /// writers queue with engine writers (design decision D1).
+    pub fn with_secret_keys(
         pool: SqlitePool,
-        encryption_key: String,
+        keys: Option<Arc<SecretKeys>>,
         write_lock: Arc<tokio::sync::Mutex<()>>,
     ) -> Self {
         Self {
             pool,
-            encryption_key: Some(Arc::from(encryption_key.as_str())),
+            keys,
             write_lock,
         }
     }
 
     pub(crate) fn pool(&self) -> &SqlitePool {
         &self.pool
-    }
-
-    pub(crate) fn encryption_key(&self) -> Option<&Arc<str>> {
-        self.encryption_key.as_ref()
     }
 
     /// Acquire the write lock (design decision D1: every writer holds it for
@@ -119,6 +118,27 @@ impl SettingsStore for SqliteCatalogStore {
         })
     }
 
+    fn replace_setting(
+        &self,
+        key: &str,
+        expected: &str,
+        value: &str,
+    ) -> BoxFuture<'_, OpResult<bool>> {
+        let (key, expected, value) = (key.to_owned(), expected.to_owned(), value.to_owned());
+        Box::pin(async move {
+            // D1: every writer holds the write lock.
+            let _writer = self.lock_writes().await;
+            let done = sqlx::query("UPDATE settings SET value = ? WHERE key = ? AND value = ?")
+                .bind(&value)
+                .bind(&key)
+                .bind(&expected)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| OpError::Internal(format!("replace_setting: {e}")))?;
+            Ok(done.rows_affected() == 1)
+        })
+    }
+
     fn list_settings(&self) -> BoxFuture<'_, OpResult<Vec<(String, String)>>> {
         Box::pin(async move {
             sqlx::query_as("SELECT key, value FROM settings ORDER BY key")
@@ -126,10 +146,6 @@ impl SettingsStore for SqliteCatalogStore {
                 .await
                 .map_err(|e| OpError::Internal(format!("list_settings: {e}")))
         })
-    }
-
-    fn cached_encryption_key(&self) -> Option<String> {
-        self.encryption_key.as_ref().map(|k| k.to_string())
     }
 }
 
@@ -383,7 +399,10 @@ impl DiagnosticsStore for SqliteCatalogStore {
         })
     }
 
-    fn test_data_database_connection(&self) -> BoxFuture<'_, DiagResult<String>> {
+    fn test_data_database_connection(
+        &self,
+        _key: &extenddb_storage::server_components::KeySource,
+    ) -> BoxFuture<'_, DiagResult<String>> {
         Box::pin(async move {
             // Catalog and data share one SQLite file; report its recorded name.
             let row: Option<(String,)> =
@@ -399,7 +418,7 @@ impl DiagnosticsStore for SqliteCatalogStore {
 // ── CatalogStore supertrait ────────────────────────────────────────────
 
 impl CatalogStore for SqliteCatalogStore {
-    fn cached_encryption_key(&self) -> Option<String> {
-        self.encryption_key.as_ref().map(|k| k.to_string())
+    fn secret_keys(&self) -> Option<&SecretKeys> {
+        self.keys.as_deref()
     }
 }

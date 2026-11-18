@@ -351,7 +351,14 @@ if [[ $CRATES == 1 ]]; then
         printf '%s\n' "$RUST_TOOLCHAIN" > "$WORK/crate-sha256/TOOLCHAIN"
         local packages=()
         while IFS= read -r line; do packages+=("$line"); done < "$WORK/crate-sha256/packages.txt"
-        (cd target/package && sha256sum -- "${packages[@]}") | tee "$WORK/crate-sha256/SHA256SUMS"
+        # cargo package writes under the target directory, which
+        # CARGO_TARGET_DIR or a config file can move; read it from cargo, as
+        # devtools/check-crate-packages does.
+        local target_dir
+        target_dir=$(cargo metadata --no-deps --format-version 1 \
+            | "$PYTHON" -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
+        [[ -n "$target_dir" ]] || { echo "cargo metadata names no target directory"; return 1; }
+        (cd "$target_dir/package" && sha256sum -- "${packages[@]}") | tee "$WORK/crate-sha256/SHA256SUMS"
     }
     run "crates: SHA-256 record" crates-sha256.log -- crate_sha256
 fi

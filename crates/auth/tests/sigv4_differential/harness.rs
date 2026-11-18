@@ -15,7 +15,8 @@ use aws_sigv4::sign::v4;
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use extenddb_auth::sigv4::{canonical, parse};
 use extenddb_auth::{
-    AuthIdentity, AuthProvider, BuiltinAuthProvider, CredentialStore, StoredCredential,
+    AuthIdentity, AuthProvider, BuiltinAuthProvider, CachedCredentialStore, CredentialStore,
+    StoredCredential,
 };
 use extenddb_core::error::DynamoDbError;
 
@@ -437,7 +438,12 @@ pub fn authenticate_at(
     query: &str,
     wire: &Wire,
 ) -> Result<AuthIdentity, DynamoDbError> {
-    let provider = BuiltinAuthProvider::new(MemoryStore, SERVER_REGION);
+    let provider = BuiltinAuthProvider::new(CachedCredentialStore::pass_through(
+        MemoryStore,
+        extenddb_cache::SwrCacheConfig::default(),
+        SERVER_REGION,
+        1,
+    ));
     futures::executor::block_on(provider.authenticate(path, query, &wire.header_map(), &wire.body))
 }
 

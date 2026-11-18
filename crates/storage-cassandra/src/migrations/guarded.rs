@@ -20,9 +20,10 @@ use std::time::Duration;
 
 use extenddb_storage::management_store::{
     AccessKeyCreated, AccountDetail, GroupDetail, GroupListEntry, ManagementStore, OpError,
-    OpResult, RoleDetail, RoleListEntry, SessionPolicyEntry, StoredDocument, UserDetail,
-    UserListEntry,
+    OpResult, RoleDetail, RoleListEntry, SecretPage, SecretWrite, SessionPolicyEntry,
+    SettingsStore, StoredDocument, UserDetail, UserListEntry,
 };
+use extenddb_storage::secret_keys::SecretTable;
 use futures::future::BoxFuture;
 
 use super::connect::REQUEST_TIMEOUT;
@@ -152,5 +153,21 @@ impl ManagementStore for LeasedManagementStore {
         fn list_session_policies(&self) -> BoxFuture<'_, OpResult<Vec<SessionPolicyEntry>>>;
         fn update_session_policy(&self, session_token: &str, document: &serde_json::Value) -> BoxFuture<'_, OpResult<()>>;
         fn fetch_caller_tags(&self, account_id: &str, resource: &str) -> BoxFuture<'_, OpResult<Vec<(String, String)>>>;
+        fn read_secret_page(&self, table: SecretTable, page: Option<&str>, page_size: usize) -> BoxFuture<'_, OpResult<SecretPage>>;
+        fn write_secrets(&self, table: SecretTable, rows: &[SecretWrite]) -> BoxFuture<'_, OpResult<()>>;
+        fn delete_secrets(&self, table: SecretTable, keys: &[String]) -> BoxFuture<'_, OpResult<()>>;
+        fn delete_setting(&self, key: &str) -> BoxFuture<'_, OpResult<()>>;
+    }
+}
+
+/// The settings rows under the same lease check and bound: the encryption-key
+/// commands read and write the key rows through the stores of the lock they
+/// hold (RFC-0000 section 8, common rules).
+impl SettingsStore for LeasedManagementStore {
+    checked! {
+        fn get_setting(&self, key: &str) -> BoxFuture<'_, OpResult<Option<String>>>;
+        fn set_setting(&self, key: &str, value: &str) -> BoxFuture<'_, OpResult<()>>;
+        fn replace_setting(&self, key: &str, expected: &str, value: &str) -> BoxFuture<'_, OpResult<bool>>;
+        fn list_settings(&self) -> BoxFuture<'_, OpResult<Vec<(String, String)>>>;
     }
 }

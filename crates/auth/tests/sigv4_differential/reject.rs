@@ -4,7 +4,7 @@
 //! A request changed after `aws-sigv4` signed it, in a part the signature
 //! covers, or signed for another region or another service, is refused.
 
-use extenddb_auth::sigv4::{parse, verify};
+use extenddb_auth::sigv4::{parse, signing_key, verify};
 use extenddb_core::error::DynamoDbError;
 
 use crate::corpus::{self, REGIONS};
@@ -158,10 +158,16 @@ fn method_path_and_query_string_are_covered_by_the_signature() {
             let header = signed.wire.value("authorization").unwrap();
             let parsed = parse::parse_authorization(header).unwrap();
             let headers = signed.wire.header_map();
+            let signing_key = signing_key::derive_signing_key(
+                key.secret(),
+                &parsed.date,
+                &parsed.region,
+                &parsed.service,
+            );
             let verify = |method: &str, path: &str, query: &str| {
                 verify::verify_signature(
                     &parsed,
-                    key.secret(),
+                    &signing_key,
                     method,
                     path,
                     query,

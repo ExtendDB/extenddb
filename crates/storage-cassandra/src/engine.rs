@@ -3,6 +3,8 @@
 
 //! Cassandra storage engine implementation.
 
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use std::sync::Arc;
 
 use cdrs_tokio::authenticators::{NoneAuthenticatorProvider, StaticPasswordAuthenticatorProvider};
@@ -296,11 +298,8 @@ impl CassandraEngine {
         use std::sync::atomic::Ordering;
 
         self.index_delay_reads.fetch_add(1, Ordering::Relaxed);
-        // Read at the driver default, ONE, and `settings set` writes at ONE
-        // too. With replication factor above 1, each read can reach a
-        // different replica, so until every replica has a new value,
-        // successive writes can see the old and the new value in any order.
-        // One consistency policy for every statement is #770.
+        // Read at LOCAL_QUORUM, and `settings set` writes at LOCAL_QUORUM
+        // too (#770), so a read sees a new value once its write has returned.
         let query = format!(
             "SELECT key, value FROM {}.settings \
              WHERE key IN ('index_propagation_delay_ms', 'gsi_propagation_delay_ms')",
@@ -393,7 +392,11 @@ impl CassandraEngine {
         );
 
         self.session
-            .query(cql)
+            .run(
+                Stmt::Ddl,
+                cql,
+                cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
+            )
             .await
             .map_err(|e| StorageError::Internal(format!("Failed to create keyspace: {e}")))?;
 
@@ -405,7 +408,11 @@ impl CassandraEngine {
         let cql = format!("DROP KEYSPACE IF EXISTS {keyspace_name}");
 
         self.session
-            .query(cql)
+            .run(
+                Stmt::Ddl,
+                cql,
+                cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
+            )
             .await
             .map_err(|e| StorageError::Internal(format!("Failed to drop keyspace: {e}")))?;
 
@@ -418,7 +425,7 @@ impl CassandraEngine {
 
         let rows = self
             .session
-            .query_with_values(cql, query_values!(keyspace_name))
+            .run(Stmt::SystemRead, cql, query_values!(keyspace_name))
             .await
             .map_err(|e| StorageError::Internal(format!("Failed to query keyspaces: {e}")))?
             .response_body()
