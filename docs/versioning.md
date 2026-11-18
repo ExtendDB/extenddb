@@ -55,7 +55,7 @@ Fixes ship in patch releases. A fix for an earlier minor release gets a patch re
 - The newest minor release gets bug fixes and security fixes.
 - The minor release before it gets security fixes for 3 months after the newest one ships.
 - After 2.0 ships, the last 1.x minor release gets security fixes for 12 months.
-- The 0.1.x releases get no fixes after 1.0 ships.
+- The 0.1.x releases get no more fixes; the 3-month rule above starts with the 1.x releases.
 
 Support covers the stable and beta backends. An experimental backend gets fixes in the newest minor release only. To report a security issue, follow [SECURITY.md](../SECURITY.md).
 
