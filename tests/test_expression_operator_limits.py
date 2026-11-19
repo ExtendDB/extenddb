@@ -1,38 +1,39 @@
 # Copyright 2026 ExtendDB contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Expression operator cap, placeholder key length and syntax error wording.
+"""Expression operator cap and placeholder key length.
 
-Three request shapes Amazon DynamoDB refuses with texts ExtendDB did not match:
+Two request shapes Amazon DynamoDB refuses with texts ExtendDB did not match:
 
   - an expression with more than 300 operators:
     ``Invalid <Kind>: The expression contains too many operators; operator
     count: <n>``, on ConditionExpression (PutItem, UpdateItem, DeleteItem),
     FilterExpression (Scan, Query) and KeyConditionExpression (Query). Every
     comparison operator, AND, OR, NOT, BETWEEN, IN and function call counts
-    one; parentheses, paths, placeholders and list elements count zero.
+    one; parentheses, paths, placeholders and list elements count zero. An
+    undefined placeholder and an operand of the wrong type come before the
+    count, and so do the Scan Limit, Segment and TotalSegments ranges. PartiQL
+    counts the statement, not the text it writes for it.
   - an ExpressionAttributeNames or ExpressionAttributeValues key over 255
     bytes on PutItem: a ValidationException carrying ``size of key: <n>``,
     not a SerializationException.
-  - a repeated or misplaced operator or keyword: ``Syntax error; token: "<t>",
-    near: "<window>"`` where the window is the source text from the token
-    before the offending one to the token after it, and ``<EOF>`` with the
-    last token as the window when the input ends early.
 
-Every expected text was measured against Amazon DynamoDB on 2026-10-25
-(us-east-1); the probe case id is noted on each assertion. The write paths
-carry a ``1 validation error detected: `` prefix on the service that ExtendDB
-does not emit; those assertions compare the text after the prefix.
+The syntax error wording tests are in test_expression_syntax_wording.py.
+
+Every expected text was measured against Amazon DynamoDB on 2026-10-25 or
+2026-11-19 (us-east-1); the probe case id is noted on each assertion. The
+write paths carry a ``1 validation error detected: `` prefix on the service
+that ExtendDB does not emit; those assertions compare the text after the
+prefix.
 
 Dual-target against Amazon DynamoDB and extenddb.
 """
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
+from conftest import _is_real_dynamodb, configured_backend
 from expression_fault_helpers import (
     NAMES, VALUES, _after_prefix, _error, _validation, chain, put, query, scan, syntax, table,
 )
@@ -42,10 +43,11 @@ TOO_MANY = "The expression contains too many operators; operator count: "
 # On MongoDB an UpdateItem condition is compiled to a filter whose OR and AND
 # chains nest one level per operator, and a chain of 150 terms fails inside
 # MongoDB with InternalServerError. This change does not touch that compiler.
-# The MongoDB test runner sets EXTENDDB_TEST_MONGODB_CONTAINER.
+# The backend is read as the other tests read it: EXTENDDB_TEST_BACKEND, else
+# the server's config file.
 # TODO: remove this marker once the MongoDB filter compiler flattens chains.
 XFAIL_ON_MONGODB_DEEP_OR = pytest.mark.xfail(
-    bool(os.environ.get("EXTENDDB_TEST_MONGODB_CONTAINER", "").strip()),
+    not _is_real_dynamodb() and configured_backend() == "mongodb",
     reason="MongoDB answers InternalServerError for a condition chain of 150 terms",
     raises=AssertionError,
     strict=True,
