@@ -5,13 +5,16 @@
 
 Amazon DynamoDB rejects a request that provides ExpressionAttributeNames or
 ExpressionAttributeValues when there is no expression parameter that could
-reference them. The names message is always suffix-free. On Query and Scan
-the values message is suffix-free as well: it ends after "expressions".
+reference them. The names message is always suffix-free. On a Query or a Scan
+whose AttributeValues parse, the values message is suffix-free as well: it
+ends after "expressions".
 
 Dual-target against Amazon DynamoDB and extenddb.
 """
 
 from __future__ import annotations
+
+import uuid
 
 import pytest
 from botocore.exceptions import ClientError
@@ -76,11 +79,26 @@ class TestExpressionParamsWithoutExpression:
             NAMES_MSG,
         )
 
-    def test_scan_values_no_expression(self, dynamodb_client, hash_table):
+    @pytest.mark.parametrize(
+        "missing, extra",
+        [
+            pytest.param(True, {}, id="missing-table"),
+            pytest.param(False, {}, id="existing-table"),
+            pytest.param(False, {"ProjectionExpression": "a"}, id="projection-expression"),
+            pytest.param(
+                False, {"ScanFilter": {"a": {"ComparisonOperator": "NULL"}}}, id="scan-filter"
+            ),
+        ],
+    )
+    def test_scan_values_no_expression(self, dynamodb_client, hash_table, missing, extra):
+        # A missing table gets this message too, so the check runs before the
+        # table lookup.
+        table = f"extenddb-missing-{uuid.uuid4().hex[:12]}" if missing else hash_table
         _expect_validation(
             lambda: dynamodb_client.scan(
-                TableName=hash_table,
+                TableName=table,
                 ExpressionAttributeValues={":v": {"S": "x"}},
+                **extra,
             ),
             VALUES_PREFIX,
         )

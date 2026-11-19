@@ -214,7 +214,8 @@ pub fn resolve_element_name<'a>(
 /// present (condition, filter, key condition, update; not projection).
 /// `value_expr_params` lists the expression parameters the values message names
 /// as null. Query and Scan pass an empty list, because the service's message for
-/// them has no suffix.
+/// them has no suffix when the request's AttributeValues parse. GetItem and
+/// BatchGetItem, which take no values, also pass an empty list.
 ///
 /// # Errors
 ///
