@@ -1,6 +1,6 @@
 # ADR-0003: Adopt sqlx::migrate for PostgreSQL catalog and data schema migrations
 
-- Status: Accepted
+- Status: Superseded by [ADR-0023](0023-catalog-migrations.md)
 - Date: 2026-06-17
 - Deciders: ExtendDB CODEOWNERS
 
@@ -153,6 +153,6 @@ be recreated and reloaded after `init`.
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is
-a trademark of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

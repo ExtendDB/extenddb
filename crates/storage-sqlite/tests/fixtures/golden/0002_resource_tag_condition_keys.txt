@@ -1,0 +1,17 @@
+-- SELECT account_id, principal_type, principal_name, policy_name, policy_document FROM iam_policies ORDER BY principal_type, policy_name
+946175009945	group	devs	tagged-group	{"Statement":[{"Action":"dynamodb:*","Condition":{"StringEquals":{"aws:ResourceTag/env":"prod"}},"Effect":"Deny","Resource":"*"}],"Version":"2012-10-17"}
+946175009945	role	app	tagged-role	{"Statement":[{"Action":"dynamodb:*","Condition":{"StringEquals":{"aws:ResourceTag/env":"prod"}},"Effect":"Deny","Resource":"*"}],"Version":"2012-10-17"}
+946175009945	user	dev	SelfServicePolicy	{"Statement":[{"Action":["iam:CreateAccessKey","iam:DeleteAccessKey","iam:ListAccessKeys","iam:ChangePassword"],"Effect":"Allow","Resource":"arn:aws:iam::946175009945:user/dev"}],"Version":"2012-10-17"}
+946175009945	user	dev	tagged-user	{"Statement":[{"Action":"dynamodb:*","Condition":{"StringEquals":{"aws:ResourceTag/env":"prod"}},"Effect":"Deny","Resource":"*"}],"Version":"2012-10-17"}
+-- SELECT account_id, principal_type, principal_name, policy_document FROM iam_permissions_boundaries ORDER BY principal_type
+946175009945	role	app	{"Statement":[{"Action":"dynamodb:*","Condition":{"StringEquals":{"aws:ResourceTag/env":"prod"}},"Effect":"Deny","Resource":"*"}],"Version":"2012-10-17"}
+946175009945	user	dev	{"Statement":[{"Action":"dynamodb:*","Condition":{"StringEquals":{"aws:ResourceTag/env":"prod"}},"Effect":"Deny","Resource":"*"}],"Version":"2012-10-17"}
+-- SELECT session_token, role_name, session_policy FROM iam_sessions ORDER BY session_token
+token-1	app	{"Statement":[{"Action":"dynamodb:*","Condition":{"StringEquals":{"aws:ResourceTag/env":"prod"}},"Effect":"Deny","Resource":"*"}],"Version":"2012-10-17"}
+-- SELECT notes FROM extenddb_migrations WHERE id = 2
+rewrote account 946175009945 user/dev policy tagged-user (1 key(s))
+rewrote account 946175009945 user/dev policy <permissions-boundary> (1 key(s))
+rewrote account 946175009945 group/devs policy tagged-group (1 key(s))
+rewrote account 946175009945 role/app policy tagged-role (1 key(s))
+rewrote account 946175009945 role/app policy <permissions-boundary> (1 key(s))
+rewrote account 946175009945 assumed-role/app/session policy <session-policy> (1 key(s))

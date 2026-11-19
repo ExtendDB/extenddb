@@ -218,7 +218,7 @@ mod tests {
     }
 
     // Each case below is a figure MEASURED against the live service on
-    // 2026-08-13, us-east-1, account 964157134968. They are regression pins on
+    // 2026-08-13, us-east-1, account 444455556666. They are regression pins on
     // real service behaviour, not on our own arithmetic.
 
     #[test]

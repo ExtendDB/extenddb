@@ -3,19 +3,26 @@
 #
 # Publishes the `extenddb-dev` container image (SQLite + dev-mode) to ALL
 # THREE registries, for linux/amd64 and linux/arm64, in a SINGLE dispatch:
-# gate, build, smoke test, vulnerability scan, push, sign (dockerhub
+# gate, build, smoke test, vulnerability scan, SBOM, push, sign (dockerhub
 # environment approval), then
 # propagate to GHCR and ECR Public (ghcr environment approval) via the
 # promote-registry composite action — signature verified at each destination
-# before any tag is placed, forward-only latest per destination.
+# before any tag is placed, forward-only latest per destination. The attest
+# job runs beside propagate and attests the build provenance and the SBOMs
+# (see release-image.yml for the design). With the `dry_run` input the run
+# ends after the build jobs and publishes nothing, in a concurrency group of
+# its own (release-image.yml).
 #
 # Re-entrant on registry state: if the version tag already exists on Docker
 # Hub WITH a verifying signature, the publish job treats the published,
-# attested artifact as authoritative and skips pushing/signing (a rebuild is
+# signed artifact as authoritative and skips pushing/signing (a rebuild is
 # not bit-reproducible, so comparing a fresh build against the released
 # artifact would always refuse). This is what lets a re-dispatch finish an
 # interrupted release, or backfill the mirror registries for a version that
-# shipped before the propagate wave existed (v0.1.7).
+# shipped before the propagate wave existed (v0.1.7). In that case the attest
+# job attests nothing unless the published images are byte-identical to the
+# ones this run built (in practice, a re-run of the same run), because
+# provenance must name the run that built them.
 #
 # Why one dispatch where the Postgres image splits build and promotion:
 # extenddb-dev is explicitly a development image (plain HTTP, open
@@ -36,7 +43,7 @@
 #     refuses to overwrite an existing version tag; `latest` only moves
 #     forward, by highest-semver comparison).
 #   * Signing runs in the same job via the shared sign-image composite action
-#     (OIDC to the KMS signing role, Rekor transparency log on). Requires the
+#     (keyless via GitHub OIDC, Rekor transparency log on). Requires the
 #     composite action from PR #279 to be on main.
 #
 # Trigger: manual workflow_dispatch only, same rationale as release-image.yml
@@ -54,17 +61,20 @@ on:
       tag:
         description: 'Existing version tag to release, e.g. v0.1.6'
         required: true
+      dry_run:
+        description: 'Rehearse only: run the gates and both builds with their smoke tests, scans and SBOMs; publish, sign, mirror and attest nothing'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-image-extenddb-dev
+  group: release-image-extenddb-dev${{ inputs.dry_run && '-dry' || '' }}
   cancel-in-progress: false
 
 env:
   IMAGE_REPO: extenddb/extenddb-dev
-  KEY_ARN: arn:aws:kms:us-east-1:975306274793:key/654ab7f4-4a11-45e1-a313-3a6989f3721c
   # Pinned AWS CLI for runners that lack it (the smoke test needs `aws`).
   AWSCLI_VERSION: 2.31.6
   AWSCLI_SHA256_X86_64: 45fdcc3003056b3e85c23776636e74208dc2fc16f26278acdbe8eafe3d4e752b
@@ -137,10 +147,23 @@ jobs:
           cargo install --locked --version 0.9.0 --features cli cargo-about
           ./devtools/generate-dev-license-notices --check
 
+      - name: Gate - the release freezes the catalog migrations it ships
+        # As in release-image.yml: RELEASED_THROUGH must reach the last
+        # migration id. A tag before the migration framework passes.
+        run: |
+          set -euo pipefail
+          if [[ -e crates/storage/src/migrations/registry.rs ]]; then
+            python3 devtools/check-released-through
+          else
+            echo "the tagged commit has no catalog migration registry"
+          fi
+
   build:
     needs: gate
     strategy:
-      fail-fast: true
+      # A release stops at the first failing architecture; a rehearsal lets
+      # both report.
+      fail-fast: ${{ !inputs.dry_run }}
       matrix:
         include:
           - arch: amd64
@@ -222,7 +245,8 @@ jobs:
 
       - name: Fail on fixable high or critical vulnerabilities
         # Same gate as release-image.yml: scans the saved tarball with no
-        # Docker socket, and ignores findings that have no fixed version.
+        # Docker socket, ignores findings that have no fixed version, and
+        # keeps the extenddb binary's crate list out of the gate.
         env:
           TRIVY_IMAGE: public.ecr.aws/aquasecurity/trivy:0.76.0@sha256:2416d1f74045b57274df1a340eee6b510cacd73c66a6ccb8da092b117eb7d222
         run: |
@@ -230,9 +254,40 @@ jobs:
           docker run --rm \
             -v "$PWD/dev-image-${{ matrix.arch }}.tar.gz:/image.tar.gz:ro" \
             "$TRIVY_IMAGE" image --input /image.tar.gz \
-            --scanners vuln --ignore-unfixed --severity HIGH,CRITICAL \
+            --scanners vuln --skip-files usr/local/bin/extenddb \
+            --ignore-unfixed --severity HIGH,CRITICAL \
             --db-repository public.ecr.aws/aquasecurity/trivy-db:2 \
             --exit-code 1 --no-progress
+
+      - name: Generate the SBOM from the saved tarball
+        # Same scanner and tarball as the gate above, and the same reasons as
+        # in release-image.yml: no credential or OIDC token in this job, the
+        # image ID recorded in the SBOM lets the attest job check the registry
+        # copy, and crates are required only when the tagged commit's
+        # Dockerfile.dev builds with cargo-auditable.
+        env:
+          TRIVY_IMAGE: public.ecr.aws/aquasecurity/trivy:0.76.0@sha256:2416d1f74045b57274df1a340eee6b510cacd73c66a6ccb8da092b117eb7d222
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          mkdir -p sbom
+          docker run --rm \
+            -v "$PWD/dev-image-${ARCH}.tar.gz:/image.tar.gz:ro" \
+            "$TRIVY_IMAGE" image --input /image.tar.gz \
+            --format cyclonedx --no-progress --skip-version-check \
+            > "sbom/sbom-${ARCH}.cdx.json"
+          # The check is devtools/check-image-sbom at the tagged commit, shared
+          # with devtools/release-dry-run; a tag from before it has none.
+          [[ -x devtools/check-image-sbom ]] \
+            || { echo "::error::tagged commit has no devtools/check-image-sbom; use a tag created after it was merged"; exit 1; }
+          devtools/check-image-sbom "sbom/sbom-${ARCH}.cdx.json" Dockerfile.dev
+
+      - name: Upload the SBOM artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: sbom-${{ matrix.arch }}
+          path: sbom/
+          retention-days: 7      # a failed attest job can be re-run for a week
 
       - name: Upload the image artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
@@ -242,16 +297,41 @@ jobs:
           retention-days: 1
           compression-level: 0
 
+  # A rehearsal's end: the gates and the builds ran as the release runs them,
+  # and nothing was published. The publish-side jobs are skipped by their
+  # `if`, so their environments ask no approval.
+  dry-run-summary:
+    needs: [gate, build]
+    if: ${{ inputs.dry_run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Summarise the rehearsal
+        run: |
+          {
+            echo "### Dry run: gates and builds passed, nothing published"
+            echo ""
+            echo "Both architectures of \`${{ env.IMAGE_REPO }}\` built, passed the smoke test and the vulnerability scan, and produced SBOMs. Dispatch again without the dry run to publish."
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| tag | \`v${{ needs.gate.outputs.version }}\` |"
+            echo "| commit | \`${{ needs.gate.outputs.sha }}\` |"
+            echo "| version (from tag) | \`${{ needs.gate.outputs.version }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   publish:
     needs: [gate, build]
+    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: dockerhub       # approval 1: publish + sign (Docker Hub credential lives here)
     outputs:
       digest: ${{ steps.push.outputs.digest }}
+      already-published: ${{ steps.push.outputs.already-published }}
     permissions:
       contents: read
-      id-token: write            # OIDC for the signing role; no stored AWS secrets
+      id-token: write            # keyless signing (Sigstore/Fulcio) via OIDC
     steps:
       - name: Check out main (for the sign-image composite action)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
@@ -272,11 +352,23 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
 
+      - name: Fetch the Docker Hub credential via OIDC (Secrets Manager)
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::975306274793:role/ExtendDBDockerHubPublisher
+          role-session-name: extenddb-dockerhub-dev-${{ github.run_id }}
+          aws-region: us-east-1
+      - name: Read the Docker Hub credential from Secrets Manager
+        uses: aws-actions/aws-secretsmanager-get-secrets@2297f9a879480a9e3af9b293ed15c70caf8e1c88 # v3.0.2
+        with:
+          secret-ids: DOCKERHUB,extenddb/dockerhub-publish
+          parse-json-secrets: true
+
       - name: Log in to Docker Hub
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
 
       - name: Gate - skopeo and jq present (preinstalled on ubuntu-latest)
         # The forward-only `latest` guard depends on both. Verified before any
@@ -301,7 +393,7 @@ jobs:
           CANDIDATE="sha-${SHA}"
 
           # A released version tag is immutable. If it exists AND its
-          # signature VERIFIES against the committed release key, the
+          # signature VERIFIES as a keyless dev-image signature, the
           # published artifact is authoritative: skip pushing and signing
           # (re-dispatch recovery / mirror backfill). Exists but UNSIGNED:
           # fall through to signing only. Exists with a signature that fails
@@ -318,16 +410,20 @@ jobs:
             EXISTING="$OUT"
             SIG_TAG="sha256-${EXISTING#sha256:}.sig"
             if skopeo inspect --no-creds --format '{{.Digest}}' "docker://${REPO}:${SIG_TAG}" >/dev/null 2>&1; then
-              # The signature must VERIFY, not merely exist: a wrong-key or
-              # garbage manifest at the tag name must abort, not skip.
+              # The signature must VERIFY, not merely exist: a wrong-identity
+              # or garbage manifest at the tag name must abort, not skip.
               if ! command -v cosign >/dev/null || [[ "$(cosign version 2>/dev/null | awk '/GitVersion/{print $2}')" != "$COSIGN_VERSION" ]]; then
                 curl -sSfL -o /tmp/cosign \
                   "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
                 echo "${COSIGN_SHA256}  /tmp/cosign" | sha256sum --check --strict
                 sudo install -m 0755 /tmp/cosign /usr/local/bin/cosign
               fi
-              if ! cosign verify --key extenddb-signing.pub.pem "${REPO}@${EXISTING}" >/dev/null; then
-                echo "::error::${REPO}:${VERSION} carries a signature artifact that does NOT verify against the release key; refusing to skip. Investigate before re-dispatching."
+              if ! cosign verify \
+                   --certificate-identity-regexp '^https://github\.com/ExtendDB/extenddb/\.github/workflows/(release-dev-image|sign-image)\.yml@refs/heads/main$' \
+                   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+                   --certificate-github-workflow-trigger workflow_dispatch \
+                   "${REPO}@${EXISTING}" >/dev/null; then
+                echo "::error::${REPO}:${VERSION} carries a signature artifact that does NOT verify as a keyless ExtendDB dev-image signature; refusing to skip. A key-signed version from before the keyless cutover cannot be re-released through this path; handle it manually. Investigate before re-dispatching."
                 exit 1
               fi
               echo "::notice::${REPO}:${VERSION} already published and its signature verifies; treating published state as authoritative"
@@ -381,13 +477,6 @@ jobs:
           echo "$OUT" | grep -q 'linux/amd64' || { echo "::error::amd64 missing"; exit 1; }
           echo "$OUT" | grep -q 'linux/arm64' || { echo "::error::arm64 missing"; exit 1; }
 
-      - name: Assume the signing role via OIDC (no stored AWS secrets)
-        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
-        with:
-          role-to-assume: arn:aws:iam::975306274793:role/ExtendDBContainerSigningCI
-          role-session-name: extenddb-dev-sign-${{ github.run_id }}
-          aws-region: us-east-1
-
       - name: Does the signature already exist? (re-entry — never double-sign)
         id: sigstate
         env:
@@ -409,7 +498,6 @@ jobs:
           image-repo: docker.io/${{ env.IMAGE_REPO }}
           digest: ${{ steps.push.outputs.digest }}
           release-tag: v${{ needs.gate.outputs.version }}
-          key-arn: ${{ env.KEY_ARN }}
 
       - name: Summarise for the release checklist
         run: |
@@ -483,6 +571,7 @@ jobs:
           version: ${{ env.VERSION }}
           digest: ${{ env.DIGEST }}
           move-latest: ${{ steps.ml.outputs.move-latest }}
+          signer-workflows: release-dev-image|sign-image
 
       - name: Assume the ECR publisher role via OIDC
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
@@ -512,6 +601,7 @@ jobs:
           version: ${{ env.VERSION }}
           digest: ${{ env.DIGEST }}
           move-latest: ${{ steps.ml.outputs.move-latest }}
+          signer-workflows: release-dev-image|sign-image
 
       - name: Log out of the mirror registries
         if: always()
@@ -534,3 +624,98 @@ jobs:
             echo "First GHCR push auto-creates the package: verify repo linkage and"
             echo "visibility per runbook 10.6."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Build provenance and the SBOMs as GitHub artifact attestations, bound to the
+  # published digests. Same design and the same constraints as the attest job
+  # in release-image.yml: no registry credential, only first-party pinned
+  # actions plus the runner's skopeo and jq beside the OIDC token, and a failed
+  # attest job can be re-run for 7 days. When publish found the version already
+  # published, it attests only if the published images are the ones this run
+  # built (a re-run of the same run); otherwise it attests nothing.
+  attest:
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write       # Sigstore certificate for the attestations
+      attestations: write   # store them in this repository's attestation API
+    env:
+      DIGEST: ${{ needs.publish.outputs.digest }}
+      ALREADY_PUBLISHED: ${{ needs.publish.outputs.already-published }}
+    steps:
+      - name: Download the SBOMs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          path: sbom
+          pattern: sbom-*
+          merge-multiple: true
+
+      - name: Resolve the subjects; refuse images this run did not build
+        id: subjects
+        run: |
+          set -euo pipefail
+          SUBJECT="docker.io/${IMAGE_REPO}"
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
+            || { echo "::error::publish digest is malformed: ${DIGEST}"; exit 1; }
+          # The runner's skopeo does not hash-check `inspect --raw`; see the
+          # attest job in release-image.yml.
+          fetch() {
+            skopeo inspect --no-creds --retry-times 3 --raw "docker://${SUBJECT}@$1" > "$2"
+            echo "${1#sha256:}  $2" | sha256sum --check --quiet --strict - \
+              || { echo "::error::registry bytes for ${SUBJECT}@$1 do not match that digest"; exit 1; }
+          }
+          fetch "$DIGEST" index.json
+          jq -e '(.manifests | length) == 2' index.json > /dev/null \
+            || { echo "::error::${SUBJECT}@${DIGEST} lists images other than the two this run built"; exit 1; }
+          printf '%s %s\n' "${DIGEST#sha256:}" "$SUBJECT" > subjects.txt
+          SBOM_OK=true
+          for arch in amd64 arm64; do
+            MD=$(jq -r --arg a "$arch" '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == $a) | .digest] | if length == 1 then .[0] else "" end' index.json)
+            [[ "$MD" =~ ^sha256:[0-9a-f]{64}$ ]] \
+              || { echo "::error::expected exactly one linux/${arch} manifest in ${SUBJECT}@${DIGEST}"; exit 1; }
+            fetch "$MD" "manifest-${arch}.json"
+            REMOTE_ID=$(jq -r '.config.digest' "manifest-${arch}.json")
+            LOCAL_ID=$(jq -r '[.metadata.component.properties[] | select(.name == "aquasecurity:trivy:ImageID") | .value] | if length == 1 then .[0] else "" end' "sbom/sbom-${arch}.cdx.json")
+            if [[ ! "$LOCAL_ID" =~ ^sha256:[0-9a-f]{64}$ || "$REMOTE_ID" != "$LOCAL_ID" ]]; then
+              if [[ "$ALREADY_PUBLISHED" == "true" ]]; then
+                echo "::notice::the published ${SUBJECT}@${DIGEST} was not built by this run; attesting nothing"
+                echo "attest=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "::error::linux/${arch} ${MD} is image ${REMOTE_ID}, not ${LOCAL_ID} which this run built and described; refusing to attest"
+              exit 1
+            fi
+            jq -e '[.components[]? | select((.purl // "") | startswith("pkg:cargo/"))] | length > 0' \
+              "sbom/sbom-${arch}.cdx.json" > /dev/null || SBOM_OK=false
+            printf '%s %s\n' "${MD#sha256:}" "$SUBJECT" >> subjects.txt
+            echo "${arch}=${MD}" >> "$GITHUB_OUTPUT"
+          done
+          cat subjects.txt
+          echo "attest=true" >> "$GITHUB_OUTPUT"
+          # An SBOM without the binary's crates (a tag cut before
+          # cargo-auditable) would understate the image, so it is not attested.
+          echo "sbom=${SBOM_OK}" >> "$GITHUB_OUTPUT"
+          [[ "$SBOM_OK" == "true" ]] || echo "::warning::no crate list in the SBOMs; attesting provenance only"
+
+      - name: Attest the build provenance (the index and both architectures)
+        if: steps.subjects.outputs.attest == 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6  # v4.2.2
+        with:
+          subject-checksums: subjects.txt
+
+      - name: Attest the linux/amd64 SBOM
+        if: steps.subjects.outputs.attest == 'true' && steps.subjects.outputs.sbom == 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6  # v4.2.2
+        with:
+          subject-name: docker.io/${{ env.IMAGE_REPO }}
+          subject-digest: ${{ steps.subjects.outputs.amd64 }}
+          sbom-path: sbom/sbom-amd64.cdx.json
+
+      - name: Attest the linux/arm64 SBOM
+        if: steps.subjects.outputs.attest == 'true' && steps.subjects.outputs.sbom == 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6  # v4.2.2
+        with:
+          subject-name: docker.io/${{ env.IMAGE_REPO }}
+          subject-digest: ${{ steps.subjects.outputs.arm64 }}
+          sbom-path: sbom/sbom-arm64.cdx.json
