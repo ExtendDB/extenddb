@@ -99,12 +99,7 @@ pub(crate) async fn handle_request(
     let input: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
-            return error_response(
-                &DynamoDbError::SerializationException(format!(
-                    "Start of structure or map found where not expected: {e}"
-                )),
-                &request_id,
-            );
+            return error_response(&extenddb_core::error::malformed_body_error(&e), &request_id);
         }
     };
 
