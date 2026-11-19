@@ -295,12 +295,19 @@ async fn data_pool(
     key: extenddb_storage::server_components::KeySource,
 ) -> DiagResult<PgPool> {
     // `data_connection_string` reads the catalog's rows only, so the
-    // target's data database name is not used.
+    // target's data database name is not used. A row the key does not open
+    // is refused as the absent setting is, so the command prints the refusal
+    // on its own.
     let target = crate::migrations::PostgresTarget::new((*catalog.connect_options()).clone(), "")
         .with_key_source(key, false);
     let conn = crate::migrations::data_connection_string(&target)
         .await
-        .map_err(|e| DiagError::QueryFailed(e.to_string()))?;
+        .map_err(|e| match e {
+            extenddb_storage::migrations::MigrationError::Refused(refusal) => {
+                DiagError::NotConfigured(refusal)
+            }
+            e => DiagError::QueryFailed(e.to_string()),
+        })?;
     let Some(conn) = conn.filter(|conn| !conn.is_empty()) else {
         return Err(DiagError::NotConfigured(
             "No data database connection string in settings. Run `extenddb init`.".to_owned(),
