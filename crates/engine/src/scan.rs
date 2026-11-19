@@ -147,14 +147,17 @@ pub async fn handle_scan(
         )
     };
 
-    // The operator cap runs before the unused placeholder check and the table
-    // lookup (measured 2026-10-25: the count beats an unused value, a missing
-    // table and an unknown IndexName). It applies to a FilterExpression only:
-    // a legacy ScanFilter of 160 conditions is accepted (measured 2026-10-25).
+    // A FilterExpression's placeholders and operand types, then its operator
+    // count, are checked before the projection, the unused placeholder check
+    // and the table lookup (measured 2026-10-25 and 2026-11-19: the count
+    // beats an unused value, a missing table and an unknown IndexName, and an
+    // undefined placeholder or an operand of the wrong type beats the count).
+    // A legacy ScanFilter of 160 conditions is accepted (measured
+    // 2026-10-25), so it is not counted.
     if filter_maps.is_none()
         && let Some(ref f) = filter
     {
-        crate::expression_helpers::check_operator_count(f, ExpressionKind::Filter)?;
+        crate::expression_helpers::check_parsed_condition(f, &maps, ExpressionKind::Filter)?;
     }
 
     // Parse ProjectionExpression or desugar legacy AttributesToGet
@@ -434,8 +437,11 @@ pub async fn handle_scan(
         }
     }
 
-    // Validate begins_with operand types upfront (before any rows are scanned).
-    if let Some(ref f) = filter {
+    // The operand types of a legacy ScanFilter, before any rows are scanned.
+    // A FilterExpression's were checked with its placeholders above.
+    if filter_maps.is_some()
+        && let Some(ref f) = filter
+    {
         extenddb_core::expression::validate_begins_with_operands(f, &combined_maps).map_err(
             |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
         )?;

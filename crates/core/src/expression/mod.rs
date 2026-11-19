@@ -15,6 +15,7 @@ mod evaluator;
 mod key_condition;
 mod key_condition_resolve;
 mod kind;
+mod operand_check;
 mod operator_count;
 mod parser;
 mod parser_common;
@@ -36,6 +37,7 @@ pub use key_condition::{
     parse_key_condition, parse_key_condition_from,
 };
 pub use kind::ExpressionKind;
+pub use operand_check::validate_placeholders_and_operands;
 pub use operator_count::{MAX_EXPRESSION_OPERATORS, count_operators, validate_operator_count};
 pub use parser::{parse_condition, parse_condition_from, parse_condition_with_depth_limit};
 pub use projection::{Projection, parse_projection, parse_projection_from};

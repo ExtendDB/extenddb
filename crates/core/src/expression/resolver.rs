@@ -507,17 +507,7 @@ pub fn validate_begins_with_operands(
 ) -> Result<(), DynamoDbError> {
     match expr {
         Expr::Function { name, args } if name == "begins_with" => {
-            if args.len() == 2
-                && let Expr::Placeholder(ref placeholder) = args[1]
-                && let Some(val) = maps.values.get(placeholder)
-                && !matches!(val, AttributeValue::S(_) | AttributeValue::B(_))
-            {
-                let type_code = attribute_type_code(val);
-                return Err(DynamoDbError::ValidationException(format!(
-                    "Incorrect operand type for operator or function; operator or function: begins_with, operand type: {type_code}"
-                )));
-            }
-            Ok(())
+            super::operand_check::reject_begins_with_prefix(args, maps)
         }
         Expr::And(left, right) | Expr::Or(left, right) => {
             validate_begins_with_operands(left, maps)?;
@@ -587,7 +577,7 @@ pub fn validate_ordering_operand_types(
 
 /// The DynamoDB symbol for an ordering operator, or `None` for equality and
 /// inequality (which accept every operand type).
-fn ordering_op_symbol(op: CompareOp) -> Option<&'static str> {
+pub(super) fn ordering_op_symbol(op: CompareOp) -> Option<&'static str> {
     match op {
         CompareOp::Lt => Some("<"),
         CompareOp::Le => Some("<="),
@@ -599,7 +589,7 @@ fn ordering_op_symbol(op: CompareOp) -> Option<&'static str> {
 
 /// Reject a literal (`:value`) operand whose resolved type is not orderable.
 /// Non-literal operands (document paths, function results) are left to runtime.
-fn reject_non_orderable_literal(
+pub(super) fn reject_non_orderable_literal(
     operand: &Expr,
     maps: &ExpressionMaps,
     op_label: &str,

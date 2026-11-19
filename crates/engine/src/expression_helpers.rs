@@ -10,7 +10,7 @@ use extenddb_core::expression::{
     Expr, ExpressionKind, ExpressionMaps, KeyCondition, PathElement, Token, UpdateAction,
     parse_condition_from, parse_key_condition_from, parse_projection_from, parse_update_from,
     tokenize_for, tokenize_with_limit, validate_no_reserved_words, validate_operator_count,
-    validate_ordering_operand_types,
+    validate_placeholders_and_operands,
 };
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{AttributeValue, ConditionalOperator, ExpectedAttributeValue};
@@ -108,6 +108,28 @@ pub fn parse_condition_expr(expr: &str, limits: &LimitsConfig) -> Result<Expr, D
 /// Returns `DynamoDbError::ValidationException` when the count is over the cap.
 pub fn check_operator_count(expr: &Expr, kind: ExpressionKind) -> Result<(), DynamoDbError> {
     validate_operator_count(expr, kind)
+}
+
+/// Check a parsed condition or filter in the service's order: its placeholders
+/// and operand types (see [`validate_placeholders_and_operands`]), then its
+/// operator count. Measured 2026-11-19 (us-east-1) on Scan, Query, PutItem,
+/// UpdateItem and DeleteItem: with 151 `#v = :v` terms joined by OR, an added
+/// `OR #v = :zz` with `:zz` undefined answers the undefined value, `OR #x =
+/// :v` the undefined name, `OR #v < :b` with `:b` a BOOL and `OR
+/// begins_with(#v, :n)` with `:n` an N the operand type, and an unused `:u`
+/// the count.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` with the `Invalid <kind>:`
+/// prefix for the first fault.
+pub fn check_parsed_condition(
+    expr: &Expr,
+    maps: &ExpressionMaps,
+    kind: ExpressionKind,
+) -> Result<(), DynamoDbError> {
+    validate_placeholders_and_operands(expr, maps).map_err(|e| prefix_expression_error(e, kind))?;
+    check_operator_count(expr, kind)
 }
 
 /// Tokenize, reserved-word check, and parse an `UpdateExpression`.
@@ -220,11 +242,8 @@ pub fn resolve_condition(
     let maps = build_expression_maps(names, values);
     let condition = parse_optional_condition(condition_expression, limits)?;
     if let Some(ref expr) = condition {
-        validate_ordering_operand_types(expr, &maps)
-            .map_err(|e| prefix_expression_error(e, ExpressionKind::Condition))?;
-        // After the operand type check (an ordering operator on a BOOL beats
-        // the count), before the unused placeholder check and the table lookup.
-        check_operator_count(expr, ExpressionKind::Condition)?;
+        // Before the unused placeholder check and the table lookup.
+        check_parsed_condition(expr, &maps, ExpressionKind::Condition)?;
     }
     Ok((condition, maps))
 }
@@ -444,48 +463,93 @@ mod tests {
         vec!["#v = :v"; n].join(" OR ")
     }
 
-    #[test]
-    fn count_over_the_cap_is_refused_with_the_full_count() {
-        let limits = LimitsConfig::default();
-        // 151 comparisons and 150 ORs: 301 [a30].
-        let err =
-            resolve_condition(Some(&chain(151)), None, None, None, None, &limits).unwrap_err();
-        assert!(
-            matches!(&err, DynamoDbError::ValidationException(msg)
-            if msg == "Invalid ConditionExpression: The expression contains too many operators; operator count: 301"),
-            "got {err:?}"
-        );
-        // 150 comparisons and 149 ORs: 299, accepted [a30].
-        assert!(resolve_condition(Some(&chain(150)), None, None, None, None, &limits).is_ok());
+    /// Resolve `expr` with `#v` defined, `:v` an S, `:b` a BOOL and `:n` an N.
+    fn resolve(expr: &str) -> Result<(Option<Expr>, ExpressionMaps), DynamoDbError> {
+        let names = HashMap::from([("#v".to_owned(), "v".to_owned())]);
+        let values = HashMap::from([
+            (":v".to_owned(), AttributeValue::S("x".to_owned())),
+            (":b".to_owned(), AttributeValue::Bool(true)),
+            (":n".to_owned(), AttributeValue::N("1".to_owned())),
+        ]);
+        resolve_condition(
+            Some(expr),
+            Some(&names),
+            Some(&values),
+            None,
+            None,
+            &LimitsConfig::default(),
+        )
+    }
+
+    fn resolve_err(expr: &str) -> String {
+        match resolve(expr) {
+            Err(DynamoDbError::ValidationException(msg)) => msg,
+            other => panic!("expected ValidationException, got {other:?}"),
+        }
     }
 
     #[test]
-    fn ordering_operand_type_beats_the_count() {
-        // [p17] 299 operators plus `#v < :b` with a BOOL value.
-        let limits = LimitsConfig::default();
-        let expr = format!("{} OR #v < :b", chain(150));
-        let mut values = HashMap::new();
-        values.insert(":v".to_owned(), AttributeValue::S("x".to_owned()));
-        values.insert(":b".to_owned(), AttributeValue::Bool(true));
-        let err =
-            resolve_condition(Some(&expr), None, Some(&values), None, None, &limits).unwrap_err();
-        assert!(
-            matches!(&err, DynamoDbError::ValidationException(msg)
-            if msg.contains("Incorrect operand type for operator or function; operator or function: <, operand type: BOOL")),
-            "got {err:?}"
+    fn count_over_the_cap_is_refused_with_the_full_count() {
+        // 151 comparisons and 150 ORs: 301 [a30].
+        assert_eq!(
+            resolve_err(&chain(151)),
+            "Invalid ConditionExpression: The expression contains too many operators; operator count: 301"
+        );
+        // 150 comparisons and 149 ORs: 299, accepted [a30].
+        assert!(resolve(&chain(150)).is_ok());
+    }
+
+    #[test]
+    fn placeholder_and_operand_faults_beat_the_count() {
+        // The service's answers of 2026-11-19 (us-east-1) on PutItem; [p17] of
+        // 2026-10-25 for the BOOL operand.
+        let rows = [
+            (
+                "p01",
+                format!("{} OR #v = :zz", chain(151)),
+                "An expression attribute value used in expression is not defined; attribute value: :zz",
+            ),
+            (
+                "p02",
+                format!("{} OR #x = :v", chain(151)),
+                "An expression attribute name used in the document path is not defined; attribute name: #x",
+            ),
+            (
+                "p03",
+                format!("{} OR begins_with(#v, :n)", chain(151)),
+                "Incorrect operand type for operator or function; operator or function: begins_with, operand type: N",
+            ),
+            (
+                "p17",
+                format!("{} OR #v < :b", chain(150)),
+                "Incorrect operand type for operator or function; operator or function: <, operand type: BOOL",
+            ),
+        ];
+        for (case, expr, want) in rows {
+            assert_eq!(
+                resolve_err(&expr),
+                format!("Invalid ConditionExpression: {want}"),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_undefined_value_in_a_branch_evaluation_skips_is_refused() {
+        // [p04] measured 2026-11-19: `attribute_not_exists(pk)` holds for an
+        // absent item, and the service still refuses `:zz`.
+        assert_eq!(
+            resolve_err("attribute_not_exists(pk) OR #v = :zz"),
+            "Invalid ConditionExpression: An expression attribute value used in expression is not defined; attribute value: :zz"
         );
     }
 
     #[test]
     fn syntax_error_beats_the_count() {
         // [e04] a 300-term chain followed by ` = =`.
-        let limits = LimitsConfig::default();
-        let expr = format!("{} = =", chain(300));
-        let err = resolve_condition(Some(&expr), None, None, None, None, &limits).unwrap_err();
-        assert!(
-            matches!(&err, DynamoDbError::ValidationException(msg)
-            if msg == "Invalid ConditionExpression: Syntax error; token: \"=\", near: \":v = =\""),
-            "got {err:?}"
+        assert_eq!(
+            resolve_err(&format!("{} = =", chain(300))),
+            "Invalid ConditionExpression: Syntax error; token: \"=\", near: \":v = =\""
         );
     }
 
