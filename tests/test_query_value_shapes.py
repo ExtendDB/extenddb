@@ -5,7 +5,7 @@
 wrong JSON type, and an ExpressionAttributeValues value the service cannot
 read as one type. boto3 refuses or reshapes these bodies, so they go out as
 written. Every expected answer below was measured against the service on
-2026-10-25 (11:31 UTC) and 2026-11-11.
+2026-10-25 (11:31 UTC), 2026-11-11 and 2026-11-19.
 
 Dual-target: runs against the service and against extenddb with the same
 assertions.
@@ -140,6 +140,18 @@ UNREADABLE = [
     ("AttributesToGet", {":z": X1, ":u": NB}, {"AttributesToGet": ["a"]},
      "Can not use both expression and non-expression parameters in the same request: "
      "Non-expression parameters: {AttributesToGet} Expression parameters: {KeyConditionExpression}"),
+    # Beside a second type descriptor, a payload with a fault is named ahead of
+    # the more than one datatypes text, whatever order the members are in
+    # (measured 2026-11-19).
+    ("N bob then S", {":z": {"N": "bob", "S": "x"}}, {}, INVALID_VALUE + NUMERIC + "bob for key :z"),
+    ("S then N bob", {":z": {"S": "x", "N": "bob"}}, {}, INVALID_VALUE + NUMERIC + "bob for key :z"),
+    ("N 1 then S", {":z": {"N": "1", "S": "x"}}, {}, INVALID_VALUE + SEVERAL_AV + " for key :z"),
+    ("S then NS bob", {":z": {"S": "x", "NS": ["bob"]}}, {}, INVALID_VALUE + NUMERIC + "bob for key :z"),
+    ("S then L with null", {":z": {"S": "x", "L": [None]}}, {}, INVALID_VALUE + NULL_AV + " for key :z"),
+    ("L with N bbb then NS aaa", {":z": {"L": [{"N": "bbb"}], "NS": ["aaa"]}}, {},
+     INVALID_VALUE + NUMERIC + "aaa for key :z"),
+    ("N bob then S with Limit 0", {":z": {"N": "bob", "S": "x"}}, {"Limit": 0},
+     "1 validation error detected: " + LIMIT_0_AT),
 ]
 
 

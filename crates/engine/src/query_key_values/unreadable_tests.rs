@@ -58,6 +58,70 @@ fn a_value_the_service_cannot_read_as_one_type_is_named_with_its_placeholder() {
 }
 
 #[test]
+fn a_number_fault_in_a_value_with_several_types_is_named_ahead_of_the_several_types_text() {
+    // Measured 2026-11-19, each value beside `:p = {"S": "x"}`: the service
+    // reads every payload, N ahead of NS, NS and M ahead of L, whatever order
+    // the request wrote them in, and answers the more than one datatypes text
+    // only when no payload has a fault.
+    let numeric =
+        |text: &str| format!("The parameter cannot be converted to a numeric value: {text}");
+    let several = "Supplied AttributeValue has more than one datatypes set, must contain \
+                   exactly one of the supported datatypes";
+    for (value, reason) in [
+        (json!({"N": "bob", "S": "x"}), numeric("bob")),
+        (json!({"N": "1", "S": "x"}), several.to_owned()),
+        (
+            json!({"N": "", "S": "x"}),
+            "The parameter cannot be converted to a numeric value".to_owned(),
+        ),
+        (
+            json!({"N": "1e200", "S": "x"}),
+            "Number overflow. Attempting to store a number with magnitude larger than \
+             supported range"
+                .to_owned(),
+        ),
+        (json!({"NS": ["bob"], "S": "x"}), numeric("bob")),
+        (json!({"BOOL": true, "N": "bob"}), numeric("bob")),
+        (json!({"S": "x", "N": "bob", "X": "1"}), numeric("bob")),
+        (json!({"L": [{"N": "bob", "S": "x"}]}), numeric("bob")),
+        (json!({"S": "x", "L": [{"N": "bob"}]}), numeric("bob")),
+        (json!({"S": "x", "M": {"a": {"N": "bob"}}}), numeric("bob")),
+        (json!({"S": "x", "L": [{"X": "1"}]}), EMPTY.to_owned()),
+        (
+            json!({"S": "x", "L": [null]}),
+            "The supplied Item contains a null AttributeValue".to_owned(),
+        ),
+        (json!({"N": "aaa", "NS": ["bbb"]}), numeric("aaa")),
+        (json!({"N": "bbb", "L": [{"N": "aaa"}]}), numeric("bbb")),
+        (json!({"NS": ["aaa"], "L": [{"N": "bbb"}]}), numeric("aaa")),
+        (
+            json!({"M": {"k": {"N": "aaa"}}, "L": [{"N": "bbb"}]}),
+            numeric("aaa"),
+        ),
+    ] {
+        let body = body_with(json!({":p": {"S": "x"}, ":z": value}), json!({}));
+        assert_eq!(
+            message(validate_query_request_body(&body)),
+            Some(format!("{INVALID_VALUE}{reason} for key :z")),
+            "{value}"
+        );
+    }
+    // Such a value still takes the order of a value the service cannot read.
+    let body = body_with(
+        json!({":p": {"S": "x"}, ":z": {"N": "bob", "S": "x"}}),
+        json!({"Limit": 0}),
+    );
+    assert_eq!(
+        message(validate_query_request_body(&body)),
+        Some(
+            "1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: \
+             Member must have value greater than or equal to 1"
+                .to_owned()
+        )
+    );
+}
+
+#[test]
 fn numbers_beside_a_value_the_service_cannot_read_are_wrapped_and_echoed_as_sent() {
     // Measured 2026-11-11 beside `:a = {"S": "a", "X": "1"}`, which the service
     // reads as an S: the numeric texts are wrapped with the placeholder, the

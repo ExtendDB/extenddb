@@ -249,7 +249,7 @@ enum Fault<'a> {
     Null(Option<&'a str>),
     /// No type descriptor the service knows.
     Empty,
-    /// More than one type descriptor.
+    /// More than one type descriptor, with no fault in their payloads.
     SeveralTypes,
     /// An `N` text or `NS` member that is not a number, as the request wrote it.
     NotANumber(&'a str),
@@ -289,35 +289,46 @@ impl Fault<'_> {
 }
 
 /// The first fault in `value` (`member` is its name when it is the value of an
-/// `M` member): a null, no type descriptor or more than one, then the numbers
-/// in `N`, `NS` and every value an `L` or `M` holds. `L` items are visited in
-/// document order and `M` members in key order: this build of `serde_json`
-/// keeps an object's members sorted by key. A value of another JSON type, and
-/// an `N` or `NS` payload of the wrong JSON type, are shape faults the
-/// deserializer reports.
+/// `M` member): a null or no type descriptor, then the numbers in `N`, `NS`
+/// and every value an `L` or `M` holds, then more than one type descriptor.
+/// `L` items are visited in document order and `M` members in key order: this
+/// build of `serde_json` keeps an object's members sorted by key. A value of
+/// another JSON type, and an `N` or `NS` payload of the wrong JSON type, are
+/// shape faults the deserializer reports.
+///
+/// With several type descriptors, the service reads each payload in the order
+/// of [`TYPE_DESCRIPTORS`], whatever order the request wrote them in, and
+/// answers the more than one datatypes text only when no payload has a fault
+/// (measured 2026-11-19: `{"N": "bob", "S": "x"}` and `{"S": "x", "N": "bob"}`
+/// answer the numeric text for `bob`, `{"N": "1", "S": "x"}` the more than one
+/// datatypes text, `{"S": "x", "L": [null]}` the null text, and `N` is read
+/// ahead of `NS`, `NS` and `M` ahead of `L`).
 fn first_fault<'a>(value: &'a Value, member: Option<&'a str>) -> Option<Fault<'a>> {
     let Value::Object(map) = value else {
         return value.is_null().then_some(Fault::Null(member));
     };
-    let mut known = map
+    let payloads: Vec<(&str, &Value)> = TYPE_DESCRIPTORS
         .iter()
-        .filter(|(key, _)| TYPE_DESCRIPTORS.contains(&key.as_str()));
-    let (descriptor, payload) = match (known.next(), known.next()) {
-        (None, _) => return Some(Fault::Empty),
-        (Some(_), Some(_)) => return Some(Fault::SeveralTypes),
-        (Some(entry), None) => entry,
-    };
-    match (descriptor.as_str(), payload) {
-        ("N", Value::String(text)) => number_fault(text),
-        ("NS", Value::Array(members)) => members
-            .iter()
-            .filter_map(Value::as_str)
-            .find_map(number_fault),
-        ("L", Value::Array(items)) => items.iter().find_map(|item| first_fault(item, None)),
-        ("M", Value::Object(members)) => members
-            .iter()
-            .find_map(|(name, inner)| first_fault(inner, Some(name))),
-        _ => None,
+        .filter_map(|&descriptor| Some((descriptor, map.get(descriptor)?)))
+        .collect();
+    let fault = payloads
+        .iter()
+        .find_map(|&(descriptor, payload)| match (descriptor, payload) {
+            ("N", Value::String(text)) => number_fault(text),
+            ("NS", Value::Array(members)) => members
+                .iter()
+                .filter_map(Value::as_str)
+                .find_map(number_fault),
+            ("L", Value::Array(items)) => items.iter().find_map(|item| first_fault(item, None)),
+            ("M", Value::Object(members)) => members
+                .iter()
+                .find_map(|(name, inner)| first_fault(inner, Some(name))),
+            _ => None,
+        });
+    match payloads.len() {
+        0 => Some(Fault::Empty),
+        1 => fault,
+        _ => fault.or(Some(Fault::SeveralTypes)),
     }
 }
 
@@ -337,8 +348,8 @@ fn number_fault(text: &str) -> Option<Fault<'_>> {
 
 /// Refuse the first `N` value in `ExpressionAttributeValues` (including `NS`
 /// members and values nested in `L` and `M`) that is not a number, with the
-/// bare numeric message: no `ExpressionAttributeValues contains invalid value`
-/// wrapper, which the service uses on `UpdateItem`, and on `Query` for a value
+/// bare numeric message. On `Query` the service adds the
+/// `ExpressionAttributeValues contains invalid value` wrapper only for a value
 /// it cannot read as one type or beside a `Limit` above 2147483647 (measured
 /// 2026-11-12). The placeholders are visited in sorted
 /// order and each value on its own, so a value of the wrong JSON shape does
