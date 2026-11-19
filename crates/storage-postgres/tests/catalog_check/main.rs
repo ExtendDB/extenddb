@@ -19,8 +19,9 @@
 //!
 //! Requires `EXTENDDB_TEST_PG_CONNECTION_STRING` (a base URL
 //! `postgres://user:pass@host:port`, no database); without it every test
-//! reports a skip and passes. Each test creates its own databases and drops
-//! them when its deployment is dropped, on a panic too.
+//! reports a skip and passes, and `EXTENDDB_TEST_PG_REQUIRED` turns the skip
+//! into a failure. Each test creates its own databases and drops them when
+//! its deployment is dropped, on a panic too.
 
 mod fix;
 mod report;
