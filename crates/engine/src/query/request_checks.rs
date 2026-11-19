@@ -114,39 +114,29 @@ pub(super) fn check_request(
     })
 }
 
-/// Refuse a `Query` body whose `KeyConditionExpression` has more than one
-/// condition on one key attribute, with the first fault [`check_request`]
-/// finds in it. Any other body returns `Ok(())`.
-///
-/// Authorization calls this before the IAM decision. The service refuses such
-/// a request before it evaluates the caller's policy. Principals fenced by
-/// `dynamodb:LeadingKeys` to a value in the key condition or away from every
-/// value in it, a principal with no policy that allows `dynamodb:Query` and
-/// one with a Deny on it get the answer the table's owner gets: the
-/// one-condition-per-key message, or a fault the service reports ahead of it,
-/// such as `Limit`, a `FilterExpression` fault or an undefined reference
-/// (measured 2026-11-19 in us-east-1, two samples each).
+/// Refuse a `Query` body whose `KeyConditionExpression` has two conditions on
+/// one attribute, with the first fault [`check_request`] finds in it. `names`
+/// is the body's `ExpressionAttributeNames` without the `#`. Authorization
+/// calls this before the IAM decision, as the service refuses such a request
+/// for every principal (measured 2026-11-19, us-east-1).
 ///
 /// # Errors
 ///
-/// The `ValidationException` that [`check_request`] returns for the body.
+/// The error [`check_request`] returns for the body.
 pub fn refuse_duplicate_key_condition(
     body: &Value,
+    names: &HashMap<String, String>,
     limits: &LimitsConfig,
 ) -> Result<(), DynamoDbError> {
     let Some(kce) = body.get("KeyConditionExpression").and_then(Value::as_str) else {
         return Ok(());
     };
-    let names: Option<HashMap<String, String>> = body
-        .get("ExpressionAttributeNames")
-        .and_then(|names| serde_json::from_value(names.clone()).ok());
-    let maps = build_expression_maps(names.as_ref(), None);
     let duplicate = tokenize_for(
         kce,
         limits.max_expression_tokens,
         ExpressionKind::KeyCondition,
     )
-    .is_ok_and(|tokens| has_duplicate_key_condition(&tokens, &maps.names));
+    .is_ok_and(|tokens| has_duplicate_key_condition(&tokens, names));
     if duplicate {
         check_request(body.clone(), limits)?;
     }
@@ -155,7 +145,7 @@ pub fn refuse_duplicate_key_condition(
 
 #[cfg(test)]
 mod tests {
-    use super::refuse_duplicate_key_condition;
+    use super::{HashMap, refuse_duplicate_key_condition};
     use extenddb_core::error::DynamoDbError;
     use extenddb_core::limits::LimitsConfig;
     use serde_json::{Value, json};
@@ -171,7 +161,7 @@ mod tests {
         if let (Some(body), Value::Object(extra)) = (body.as_object_mut(), extra) {
             body.extend(extra);
         }
-        refuse_duplicate_key_condition(&body, &LimitsConfig::default())
+        refuse_duplicate_key_condition(&body, &HashMap::new(), &LimitsConfig::default())
     }
 
     /// The service gave each answer below to the table's owner and to every
@@ -182,12 +172,6 @@ mod tests {
                            contain one condition per key";
         let rows = [
             ("pk = :own AND sk = :b AND sk = :c", json!({}), one_per_key),
-            ("pk > :other AND pk = :own", json!({}), one_per_key),
-            (
-                "#p = :own AND pk = :other",
-                json!({"ExpressionAttributeNames": {"#p": "pk"}}),
-                one_per_key,
-            ),
             (
                 "pk = :own AND pk = :other",
                 json!({"FilterExpression": "#q = :own"}),

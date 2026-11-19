@@ -466,11 +466,12 @@ pub(crate) async fn authorize_request(
         return Ok(authorized_key_info);
     }
 
-    // The service refuses a Query whose key condition has more than one
-    // condition on one key attribute before the IAM decision, with the answer
-    // the table's owner gets, for every principal.
     if operation == "Query" {
-        extenddb_engine::refuse_duplicate_key_condition(input, &state.limits)?;
+        extenddb_engine::refuse_duplicate_key_condition(
+            input,
+            &crate::leading_keys::names_map(input),
+            &state.limits,
+        )?;
     }
 
     // Derive the targets the service authorizes this operation against. The

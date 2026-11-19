@@ -627,11 +627,8 @@ pub fn parse_key_condition(tokens: &[Token]) -> Result<KeyCondition, DynamoDbErr
     classify_clauses(parse_clauses(tokens)?)
 }
 
-/// Whether a `KeyConditionExpression` has more than one condition on one key
-/// attribute, the fault [`parse_key_condition_with_maps`] refuses with the
-/// one-condition-per-key message. `names` is the request's
-/// `ExpressionAttributeNames` with `#` stripped from each key. `false` when
-/// the clauses do not parse.
+/// Whether the key condition in `tokens` names one attribute twice, reading
+/// `#name` references through `names`. `false` when the clauses do not parse.
 #[must_use]
 pub fn has_duplicate_key_condition(
     tokens: &[Token],

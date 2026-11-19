@@ -369,7 +369,7 @@ fn index_name(input: &Value) -> Option<String> {
 
 /// `ExpressionAttributeNames` with the leading `#` stripped from each key,
 /// matching how the engine builds its name map.
-fn names_map(input: &Value) -> HashMap<String, String> {
+pub(crate) fn names_map(input: &Value) -> HashMap<String, String> {
     let mut out = HashMap::new();
     if let Some(m) = input
         .get("ExpressionAttributeNames")
