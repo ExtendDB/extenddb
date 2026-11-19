@@ -36,6 +36,7 @@ use crate::{DispatchMetrics, DispatchResult};
 mod request_checks;
 
 use request_checks::CheckedRequest;
+pub use request_checks::refuse_duplicate_key_condition;
 
 /// Handle a `Query` request.
 ///

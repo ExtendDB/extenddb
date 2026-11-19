@@ -616,15 +616,28 @@ impl SortKeyCondition {
 /// This does not refuse a second condition on one key attribute, which needs
 /// the request's `ExpressionAttributeNames` and `ExpressionAttributeValues`.
 /// The engine parses a request's key condition with
-/// [`parse_key_condition_with_maps`]. Authorization parses with this when it
-/// finds the partition key value for `dynamodb:LeadingKeys`, which keeps the
-/// value it bound for such a condition before the engine refused it.
+/// [`parse_key_condition_with_maps`]. Authorization refuses a second condition
+/// on one key attribute first ([`has_duplicate_key_condition`]), and parses
+/// with this when it finds the partition key value for `dynamodb:LeadingKeys`.
 ///
 /// # Errors
 ///
 /// Returns `ValidationException` for syntax errors or unsupported constructs.
 pub fn parse_key_condition(tokens: &[Token]) -> Result<KeyCondition, DynamoDbError> {
     classify_clauses(parse_clauses(tokens)?)
+}
+
+/// Whether a `KeyConditionExpression` has more than one condition on one key
+/// attribute, the fault [`parse_key_condition_with_maps`] refuses with the
+/// one-condition-per-key message. `names` is the request's
+/// `ExpressionAttributeNames` with `#` stripped from each key. `false` when
+/// the clauses do not parse.
+#[must_use]
+pub fn has_duplicate_key_condition(
+    tokens: &[Token],
+    names: &std::collections::HashMap<String, String>,
+) -> bool {
+    parse_clauses(tokens).is_ok_and(|clauses| reject_duplicate_key_attrs(&clauses, names).is_err())
 }
 
 /// [`parse_key_condition`] with the request's `ExpressionAttributeNames` and
@@ -688,9 +701,8 @@ fn refuse_unsupported_clauses(clauses: &[RawClause]) -> Result<(), DynamoDbError
 /// since it names no single value for the attribute.
 ///
 /// Like [`parse_key_condition`], this does not refuse a second condition on
-/// one key attribute, so authorization binds `dynamodb:LeadingKeys` for such a
-/// condition as it did before the engine refused it. Which value the service
-/// binds for it is not measured.
+/// one key attribute. Authorization refuses such a condition before it reads
+/// this ([`has_duplicate_key_condition`]).
 ///
 /// # Errors
 ///

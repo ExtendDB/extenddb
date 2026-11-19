@@ -380,12 +380,12 @@ class TestLeadingKeys:
     # -- A second clause on the partition key ------------------------------
 
     def test_unreadable_partition_equality_does_not_bind_another_clause(self, table):
-        # An equality on the partition key decides dynamodb:LeadingKeys, and
-        # the fenced value in the second clause (`:v`) is never bound in its
-        # place. A principal allowed everything gets the one-condition-per-key
-        # error. A policy fenced to `:v`'s value denies the request, whether
-        # the equality's value can be read (`:u = {"S": "bob"}`, bound) or not
-        # (`:u = {"N": "bob"}`, absent, and refused either way).
+        # Two clauses on the partition key are refused before
+        # dynamodb:LeadingKeys is evaluated, so no clause is bound. A principal
+        # allowed everything and principals fenced to `:v`'s value get the
+        # same ValidationException (measured 2026-11-12 and 2026-11-19). When
+        # `:u = {"N": "bob"}`, the service reports that `bob` is not a number,
+        # which this server does not check in a Query yet (#544).
         kces = ("pk = :u AND pk > :v", "pk > :v AND pk = :u")
         readable = {":u": {"S": OTHER}, ":v": {"S": OWN}}
         unreadable = {":u": {"N": OTHER}, ":v": {"S": OWN}}
@@ -412,30 +412,61 @@ class TestLeadingKeys:
                 with pytest.raises(ClientError) as e:
                     c.query(TableName=table, KeyConditionExpression=kce,
                             ExpressionAttributeValues=readable)
-                assert _denied(e), (form, kce)
+                err = e.value.response["Error"]
+                assert (err["Code"], err["Message"]) == (
+                    "ValidationException", ONE_PER_KEY), (form, kce)
                 with pytest.raises(ClientError) as e:
                     c.query(TableName=table, KeyConditionExpression=kce,
                             ExpressionAttributeValues=unreadable)
-                assert e.value.response["Error"]["Code"] in (
-                    "AccessDeniedException", "ValidationException"), (form, kce)
+                assert e.value.response["Error"]["Code"] == "ValidationException", (form, kce)
 
-    def test_duplicate_sort_key_condition_binds_the_partition_equality(self, table):
-        # A second condition on the sort key leaves dynamodb:LeadingKeys bound
-        # to the partition equality's value, so a principal fenced to that
-        # value reaches the engine and gets the one-condition-per-key error.
-        # With the key absent, the same principal would get
-        # AccessDeniedException. Which value the service binds for a key
-        # condition with two conditions on one key attribute is not measured.
-        c = self._user_client([("lk", self._leading_keys_policy(
-            "ForAnyValue", [OWN], table))])
-        with pytest.raises(ClientError) as e:
-            c.query(TableName=table,
-                    KeyConditionExpression="pk = :own AND sk = :b AND sk = :c",
-                    ExpressionAttributeValues={":own": {"S": OWN}, ":b": {"S": "x"},
-                                               ":c": {"S": "y"}})
-        err = e.value.response["Error"]
-        assert err["Code"] == "ValidationException"
-        assert err["Message"] == ONE_PER_KEY
+    def test_duplicate_key_condition_is_refused_before_leading_keys(self, table):
+        # A key condition with two conditions on one key attribute is refused
+        # before the IAM decision. Principals fenced to `own`, fenced away from
+        # every value in the request, allowed no Query or denied Query all get
+        # the one-condition-per-key error (measured 2026-11-12 and 2026-11-19,
+        # us-east-1).
+        values = {":own": {"S": OWN}, ":other": {"S": OTHER}, ":b": {"S": "x"},
+                  ":c": {"S": "y"}}
+        names = {"ExpressionAttributeNames": {"#p": "pk"}}
+        gsi = {"IndexName": "gsi1"}
+        shapes = [
+            ("pk = :own AND sk = :b AND sk = :c", {}),
+            ("pk = :own AND pk = :other", {}),
+            ("pk = :other AND pk = :own", {}),
+            ("pk = :own AND pk > :other", {}),
+            ("pk > :other AND pk = :own", {}),
+            ("#p = :own AND pk = :other", names),
+            ("pk = :other AND #p = :own", names),
+            ("gpk = :own AND gpk = :other", gsi),
+            ("gpk = :own AND pk = :b AND pk = :c", gsi),
+        ]
+        guarded = self._leading_keys_policy("ForAllValues", [OWN], table)
+        guarded["Statement"][0]["Condition"]["Null"] = {"dynamodb:LeadingKeys": "false"}
+        arn = f"arn:aws:dynamodb:{self.region}:{self.account_id}:table/{table}"
+        resources = [arn, arn + "/index/*"]
+        policies = {
+            "ForAnyValue own": self._leading_keys_policy("ForAnyValue", [OWN], table),
+            "ForAnyValue other": self._leading_keys_policy("ForAnyValue", [OTHER], table),
+            "ForAllValues away": self._leading_keys_policy("ForAllValues", ["away"], table),
+            "ForAllValues own, Null guard": guarded,
+            "no Query": {"Version": "2012-10-17", "Statement": [{
+                "Effect": "Allow", "Action": "dynamodb:DescribeTable",
+                "Resource": resources}]},
+            "Query denied": {"Version": "2012-10-17", "Statement": [
+                {"Effect": "Allow", "Action": "dynamodb:*", "Resource": resources},
+                {"Effect": "Deny", "Action": "dynamodb:Query", "Resource": resources}]},
+        }
+        for label, policy in policies.items():
+            c = self._user_client([("lk", policy)])
+            for kce, extra in shapes:
+                used = {k: values[k] for k in re.findall(r":\w+", kce)}
+                with pytest.raises(ClientError) as e:
+                    c.query(TableName=table, KeyConditionExpression=kce,
+                            ExpressionAttributeValues=used, **extra)
+                err = e.value.response["Error"]
+                assert (err["Code"], err["Message"]) == (
+                    "ValidationException", ONE_PER_KEY), (label, kce)
 
     def test_non_equality_partition_with_sort_clause_is_refused(self, table):
         # The fix binds the partition operand of these shapes; the engine still

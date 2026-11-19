@@ -1,12 +1,18 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! The checks `handle_query` makes on a request before it reads the table.
+//! The checks `handle_query` makes on a request before it reads the table,
+//! and the refusal authorization makes with them for a key condition with two
+//! conditions on one key attribute.
+
+use std::collections::HashMap;
 
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition};
+use extenddb_core::expression::{
+    Expr, ExpressionKind, ExpressionMaps, KeyCondition, has_duplicate_key_condition, tokenize_for,
+};
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::QueryInput;
 
@@ -106,4 +112,117 @@ pub(super) fn check_request(
         filter_expression,
         key_condition_expression,
     })
+}
+
+/// Refuse a `Query` body whose `KeyConditionExpression` has more than one
+/// condition on one key attribute, with the first fault [`check_request`]
+/// finds in it. Any other body returns `Ok(())`.
+///
+/// Authorization calls this before the IAM decision. The service refuses such
+/// a request before it evaluates the caller's policy. Principals fenced by
+/// `dynamodb:LeadingKeys` to a value in the key condition or away from every
+/// value in it, a principal with no policy that allows `dynamodb:Query` and
+/// one with a Deny on it get the answer the table's owner gets: the
+/// one-condition-per-key message, or a fault the service reports ahead of it,
+/// such as `Limit`, a `FilterExpression` fault or an undefined reference
+/// (measured 2026-11-19 in us-east-1, two samples each).
+///
+/// # Errors
+///
+/// The `ValidationException` that [`check_request`] returns for the body.
+pub fn refuse_duplicate_key_condition(
+    body: &Value,
+    limits: &LimitsConfig,
+) -> Result<(), DynamoDbError> {
+    let Some(kce) = body.get("KeyConditionExpression").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let names: Option<HashMap<String, String>> = body
+        .get("ExpressionAttributeNames")
+        .and_then(|names| serde_json::from_value(names.clone()).ok());
+    let maps = build_expression_maps(names.as_ref(), None);
+    let duplicate = tokenize_for(
+        kce,
+        limits.max_expression_tokens,
+        ExpressionKind::KeyCondition,
+    )
+    .is_ok_and(|tokens| has_duplicate_key_condition(&tokens, &maps.names));
+    if duplicate {
+        check_request(body.clone(), limits)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::refuse_duplicate_key_condition;
+    use extenddb_core::error::DynamoDbError;
+    use extenddb_core::limits::LimitsConfig;
+    use serde_json::{Value, json};
+
+    fn refuse(kce: &str, extra: Value) -> Result<(), DynamoDbError> {
+        let mut body = json!({
+            "TableName": "t",
+            "KeyConditionExpression": kce,
+            "ExpressionAttributeValues": {
+                ":own": {"S": "alice"}, ":other": {"S": "bob"}, ":b": {"S": "x"}, ":c": {"S": "y"},
+            },
+        });
+        if let (Some(body), Value::Object(extra)) = (body.as_object_mut(), extra) {
+            body.extend(extra);
+        }
+        refuse_duplicate_key_condition(&body, &LimitsConfig::default())
+    }
+
+    /// The service gave each answer below to the table's owner and to every
+    /// fenced, unallowed and denied principal (us-east-1, 2026-11-19).
+    #[test]
+    fn a_duplicate_gets_the_answer_of_the_table_owner() {
+        let one_per_key = "Invalid KeyConditionExpression: KeyConditionExpressions must only \
+                           contain one condition per key";
+        let rows = [
+            ("pk = :own AND sk = :b AND sk = :c", json!({}), one_per_key),
+            ("pk > :other AND pk = :own", json!({}), one_per_key),
+            (
+                "#p = :own AND pk = :other",
+                json!({"ExpressionAttributeNames": {"#p": "pk"}}),
+                one_per_key,
+            ),
+            (
+                "pk = :own AND pk = :other",
+                json!({"FilterExpression": "#q = :own"}),
+                "Invalid FilterExpression: An expression attribute name used in the document \
+                 path is not defined; attribute name: #q",
+            ),
+            (
+                "pk = :other AND pk = :own AND #u = :c",
+                json!({}),
+                "Invalid KeyConditionExpression: An expression attribute name used in the \
+                 document path is not defined; attribute name: #u",
+            ),
+            (
+                "pk = :other AND pk = :own",
+                json!({"Limit": 0}),
+                "1 validation error detected: Value at 'Limit' failed to satisfy constraint: \
+                 Member must have value greater than or equal to 1",
+            ),
+        ];
+        for (kce, extra, want) in rows {
+            let label = format!("{kce} {extra}");
+            let got = refuse(kce, extra);
+            assert!(
+                matches!(&got, Err(DynamoDbError::ValidationException(msg)) if msg == want),
+                "{label}: {got:?}"
+            );
+        }
+    }
+
+    /// The service authorizes these first: a principal fenced away from
+    /// `alice` gets AccessDeniedException for both (us-east-1, 2026-11-19).
+    #[test]
+    fn a_key_condition_without_a_duplicate_goes_on_to_authorization() {
+        for kce in ["pk = :own AND sk = :b", "pk > :own"] {
+            assert!(refuse(kce, json!({})).is_ok(), "{kce}");
+        }
+    }
 }
