@@ -22,7 +22,7 @@ use sqlx::Connection;
 #[allow(dead_code)]
 mod support;
 
-use support::{ACCOUNT, Deployment, TABLE, base_conn, skip};
+use support::{ACCOUNT, Deployment, TABLE, base_conn, hold, skip};
 
 fn catalog_check(config: &Path, fix: bool) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_extenddb"));
@@ -96,17 +96,11 @@ async fn catalog_check_prints_each_finding_and_exits_with_status_1() {
 
     // The report while a session holds a lock on a catalog table that the
     // check reads, for longer than a statement takes to count as slow.
-    let mut holder = sqlx::PgConnection::connect(&d.catalog_url())
-        .await
-        .expect("a catalog session for the lock");
-    sqlx::query("BEGIN")
-        .execute(&mut holder)
-        .await
-        .expect("begin");
-    sqlx::query("LOCK TABLE vector_indexes IN ACCESS EXCLUSIVE MODE")
-        .execute(&mut holder)
-        .await
-        .expect("lock vector_indexes");
+    let holder = hold(
+        &d.catalog_url(),
+        "LOCK TABLE vector_indexes IN ACCESS EXCLUSIVE MODE",
+    )
+    .await;
     let report = catalog_check(&config, false)
         .spawn()
         .expect("run catalog-check");

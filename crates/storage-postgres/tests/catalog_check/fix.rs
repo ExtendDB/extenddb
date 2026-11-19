@@ -10,7 +10,7 @@ use extenddb_storage::server_components::KeySource;
 use extenddb_storage_postgres::PostgresCatalogStore;
 use sqlx::{Connection, PgPool};
 
-use crate::support::{ACCOUNT, Deployment, TABLE, base_conn, hold_relation, skip};
+use crate::support::{ACCOUNT, Deployment, TABLE, base_conn, hold, hold_relation, skip};
 
 /// Wait until a session of the catalog database waits for `SHARE` on
 /// `indexes`, and return the catalog tables among `tables` and
@@ -378,17 +378,7 @@ async fn an_index_write_open_past_the_budget_stops_the_check_and_the_drop() {
     }
     let d = Deployment::new().await;
     let orphan = d.plant_orphan().await;
-    let mut writer = sqlx::PgConnection::connect(&d.catalog_url())
-        .await
-        .expect("a catalog session for the writer");
-    sqlx::query("BEGIN")
-        .execute(&mut writer)
-        .await
-        .expect("begin");
-    sqlx::query("LOCK TABLE indexes IN ROW EXCLUSIVE MODE")
-        .execute(&mut writer)
-        .await
-        .expect("the lock a write to indexes takes");
+    let writer = hold(&d.catalog_url(), "LOCK TABLE indexes IN ROW EXCLUSIVE MODE").await;
 
     let budget = Duration::from_secs(2);
     let store = PostgresCatalogStore::with_index_lock_budget(d.catalog.clone(), budget);

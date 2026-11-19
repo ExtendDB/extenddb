@@ -13,7 +13,7 @@ use extenddb_storage::server_components::KeySource;
 use extenddb_storage_postgres::{CatalogCheckPoint, PostgresCatalogStore, arm_catalog_check_pause};
 use sqlx::Connection;
 
-use crate::support::{ACCOUNT, Deployment, TABLE, base_conn, skip};
+use crate::support::{ACCOUNT, Deployment, TABLE, base_conn, hold, skip};
 
 /// A table with a GSI, an LSI and a vector index has every relation the
 /// engine created named by the catalog: nothing orphaned, nothing missing.
@@ -425,17 +425,7 @@ async fn other_catalog_failures_do_not_report_index_changes() {
             "canceling statement due to lock timeout",
         ),
     ] {
-        let mut holder = sqlx::PgConnection::connect(&d.catalog_url())
-            .await
-            .expect("a catalog session for the lock");
-        sqlx::query("BEGIN")
-            .execute(&mut holder)
-            .await
-            .expect("begin");
-        sqlx::query(held)
-            .execute(&mut holder)
-            .await
-            .expect("take the lock");
+        let holder = hold(&d.catalog_url(), held).await;
         let check = tokio::time::timeout(
             Duration::from_secs(10),
             store.check_storage_relations(&KeySource::CatalogKey),

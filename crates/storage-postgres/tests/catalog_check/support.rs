@@ -583,21 +583,29 @@ impl IndexAdd {
     }
 }
 
-/// A session of the data database holding `ACCESS SHARE` on `relation`, as
-/// a reader such as `pg_dump` holds it, until it is dropped.
-pub(crate) async fn hold_relation(d: &Deployment, relation: &str) -> PgConnection {
-    let mut conn = PgConnection::connect(&d.data_url())
+/// A session of the database at `url` that ran `statement` in a transaction
+/// it keeps open, so it holds the lock the statement took until it is
+/// closed or dropped.
+pub(crate) async fn hold(url: &str, statement: &str) -> PgConnection {
+    let mut conn = PgConnection::connect(url)
         .await
-        .expect("a data session for the holder");
+        .expect("a session for the holder");
     sqlx::query("BEGIN")
         .execute(&mut conn)
         .await
         .expect("begin");
-    sqlx::query(&format!("LOCK TABLE \"{relation}\" IN ACCESS SHARE MODE"))
+    sqlx::query(statement)
         .execute(&mut conn)
         .await
-        .expect("hold the relation");
+        .unwrap_or_else(|e| panic!("{statement}: {e}"));
     conn
+}
+
+/// A session of the data database holding `ACCESS SHARE` on `relation`, as
+/// a reader such as `pg_dump` holds it, until it is dropped.
+pub(crate) async fn hold_relation(d: &Deployment, relation: &str) -> PgConnection {
+    let lock = format!("LOCK TABLE \"{relation}\" IN ACCESS SHARE MODE");
+    hold(&d.data_url(), &lock).await
 }
 
 fn key(n: u32) -> Item {
