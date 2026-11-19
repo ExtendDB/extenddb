@@ -1935,7 +1935,6 @@ name = "extenddb-storage"
 version = "1.0.0"
 dependencies = [
  "async-trait",
- "aws-lc-rs",
  "base64 0.22.1",
  "bcrypt",
  "bigdecimal",
@@ -1953,6 +1952,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "web-time",
  "zeroize",
 ]
 
