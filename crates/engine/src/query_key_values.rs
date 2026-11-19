@@ -11,9 +11,9 @@
 //!    overflow, underflow and 38-digit messages). Every value in the map is
 //!    checked, whether the key condition, the filter or nothing reads it. The
 //!    check runs at request time, after the `Limit` check, the
-//!    `ReturnConsumedCapacity` enum check and the expression and
-//!    non-expression parameter mix check, and before the table is looked up;
-//!    see [`validate_query_request_body`];
+//!    `ReturnConsumedCapacity` enum check, the expression and non-expression
+//!    parameter mix check and the `ExpressionAttributeNames` check, and before
+//!    the table is looked up; see [`validate_query_request_body`];
 //! 2. a key condition value whose type is not the key attribute's
 //!    `AttributeDefinitions` type answers `One or more parameter values were
 //!    invalid: Condition parameter type does not match schema type`, on the
@@ -70,13 +70,17 @@ const SELECT: &[&str] = &[
 /// The `Query` checks that run on the request body alone, before the body is
 /// deserialized and before the table is looked up, in the service's order:
 /// `Limit`, the `ReturnConsumedCapacity` enum, the expression and
-/// non-expression parameter mix, every number in `ExpressionAttributeValues`,
-/// then the `Select` enum (measured 2026-10-24 and 2026-11-11: a `Limit` of 0
-/// is reported ahead of an invalid enum value of either field and of a
-/// parameter mix, an invalid `ReturnConsumedCapacity` ahead of a mix with
+/// non-expression parameter mix, the `ExpressionAttributeNames` map (see
+/// `validate_names`), every number in `ExpressionAttributeValues`, then the
+/// `Select` enum (measured 2026-10-24 and 2026-11-11: a `Limit` of 0 is
+/// reported ahead of an invalid enum value of either field and of a parameter
+/// mix, an invalid `ReturnConsumedCapacity` ahead of a mix with
 /// `AttributesToGet`, `QueryFilter`, `ConditionalOperator` or `KeyConditions`
 /// and ahead of an `N` value that is not a number, a mix ahead of that value,
-/// and that value ahead of an invalid `Select`).
+/// and that value ahead of an invalid `Select`. Measured 2026-11-19 in either
+/// member order: an invalid names map is reported after a `Limit` of 0, an
+/// invalid `ReturnConsumedCapacity` and a mix, and ahead of an `N` value that
+/// is not a number, a set with a duplicate member and an invalid `Select`).
 ///
 /// A request whose `ExpressionAttributeValues` holds a value the service
 /// cannot read as one type takes another order; see
@@ -178,6 +182,7 @@ fn query_request_checks(body: &Value) -> Result<(), DynamoDbError> {
     )?;
 
     validate_no_parameter_mix(body)?;
+    validate_names(body)?;
 
     if let Some(values) = values {
         validate_expression_attribute_value_numbers(values)?;
@@ -217,6 +222,26 @@ fn validate_no_parameter_mix(body: &Value) -> Result<(), DynamoDbError> {
             ("KeyConditionExpression", kce_present),
         ],
     )
+}
+
+/// The checks the `ExpressionAttributeNames` deserializer makes, on the raw
+/// body: an empty map, a key that is not `#` and a name, and an empty name,
+/// with the deserializer's text. A map or name of another JSON type is a shape
+/// fault, which this leaves to the shape fault check.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` with the deserializer's text.
+pub(crate) fn validate_names(body: &Value) -> Result<(), DynamoDbError> {
+    let Some(names) = body.get("ExpressionAttributeNames") else {
+        return Ok(());
+    };
+    match extenddb_core::serde_helpers::deserialize_expression_names(names)
+        .map_err(crate::deserialize_error)
+    {
+        Err(fault @ DynamoDbError::ValidationException(_)) => Err(fault),
+        _ => Ok(()),
+    }
 }
 
 /// Whether `field` is in the body with a value other than `null`, as a typed
@@ -444,3 +469,6 @@ mod request_order_tests;
 
 #[cfg(test)]
 mod unreadable_tests;
+
+#[cfg(test)]
+mod names_tests;

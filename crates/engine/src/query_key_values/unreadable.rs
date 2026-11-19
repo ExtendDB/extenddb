@@ -14,7 +14,7 @@ use serde_json::{Map, Value};
 
 use super::{
     RETURN_CONSUMED_CAPACITY, SELECT, TYPE_DESCRIPTORS, first_fault, sorted_entries,
-    validate_no_parameter_mix,
+    validate_names, validate_no_parameter_mix,
 };
 
 /// Whether the service cannot read `value` as exactly one AttributeValue type:
@@ -124,7 +124,12 @@ fn null_value() -> Value {
 ///    'limit' failed to satisfy constraint: Member must have value greater
 ///    than or equal to 1`;
 /// 2. the expression and non-expression parameter mix;
-/// 3. the first fault inside a value, in document order for `L` items and in
+/// 3. the `ExpressionAttributeNames` map (measured 2026-11-19: an invalid
+///    names key beside `{"X": "1"}`, `{}` or `{"N": "1", "S": "x"}` answers
+///    the names text, in either member order, and beside such a value a
+///    `Limit` of 0, an invalid `Select` or `ReturnConsumedCapacity` and a mix
+///    are reported ahead of it); see [`validate_names`];
+/// 4. the first fault inside a value, in document order for `L` items and in
 ///    key order for `M` members, as `ExpressionAttributeValues contains
 ///    invalid value: <reason> for key <placeholder>`: a null (`The supplied
 ///    Item contains a null AttributeValue`, with `: <member> is null` when it
@@ -178,6 +183,7 @@ pub(super) fn unreadable_value_checks(
     }
 
     validate_no_parameter_mix(body)?;
+    validate_names(body)?;
 
     // The values the service cannot read first; the sort is stable, so each
     // group keeps the placeholder order.

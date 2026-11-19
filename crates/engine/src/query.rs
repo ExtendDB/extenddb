@@ -49,10 +49,11 @@ pub async fn handle_query(
 ) -> Result<DispatchResult, DynamoDbError> {
     // Request-time checks on the raw body, in the service's order: Limit, the
     // ReturnConsumedCapacity enum, the expression and non-expression parameter
-    // mix, every number in ExpressionAttributeValues, the Select enum. They
-    // run before typed deserialization so a field that does not deserialize
-    // does not stop the ones before it. The server runs the same function
-    // ahead of the IAM decision; see `query_key_values`.
+    // mix, the ExpressionAttributeNames map, every number in
+    // ExpressionAttributeValues, the Select enum. They run before typed
+    // deserialization so a field that does not deserialize does not stop the
+    // ones before it. The server runs the same function ahead of the IAM
+    // decision; see `query_key_values`.
     crate::query_key_values::validate_query_request_body(&body)?;
     let input: QueryInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 

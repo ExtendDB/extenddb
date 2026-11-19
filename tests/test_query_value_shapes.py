@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Query request bodies the service does not read as written: a field of the
-wrong JSON type, and an ExpressionAttributeValues value the service cannot
-read as one type. boto3 refuses or reshapes these bodies, so they go out as
+wrong JSON type, an ExpressionAttributeValues value the service cannot read as
+one type, and an ExpressionAttributeNames map the service refuses, in both
+member orders. boto3 refuses or reshapes these bodies, so they go out as
 written. Every expected answer below was measured against the service on
 2026-10-25 (11:31 UTC), 2026-11-11 and 2026-11-19.
 
@@ -21,6 +22,7 @@ from __future__ import annotations
 import pytest
 
 from test_query_key_value_types import (  # noqa: F401  (ss_table is a fixture)
+    LEGACY_PK,
     LIMIT_MSG,
     NB,
     NUMERIC,
@@ -184,3 +186,88 @@ class TestValuesTheServiceCannotReadAsOneType:
         assert payload.get("__type", "").endswith("ValidationException"), payload
         assert payload.get("message", payload.get("Message")) == (
             INVALID_VALUE + EMPTY_AV + " for key :z")
+
+
+INVALID_KEY = 'ExpressionAttributeNames contains invalid key: Syntax error; key: "a"'
+BAD_NAMES = {"a": "b"}
+SELECT_MSG = ("1 validation error detected: Value 'bad' at 'select' failed to satisfy constraint: "
+              "Member must satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, "
+              "ALL_PROJECTED_ATTRIBUTES]")
+ATTRIBUTES_TO_GET_MIX = (
+    "Can not use both expression and non-expression parameters in the same request: "
+    "Non-expression parameters: {AttributesToGet} Expression parameters: {KeyConditionExpression}")
+
+# (row, ExpressionAttributeNames, values beside :p, other members, the
+# service's message).
+NAMES = [
+    ("invalid key beside N bob", BAD_NAMES, {":n": NB}, {}, INVALID_KEY),
+    ("empty map beside N bob", {}, {":n": NB}, {}, "ExpressionAttributeNames must not be empty"),
+    ("empty name beside N bob", {"#a": ""}, {":n": NB}, {},
+     "ExpressionAttributeNames contains invalid value: Empty attribute name for key #a"),
+    ("invalid key beside a duplicate NS", BAD_NAMES, {":d": {"NS": ["1", "1"]}}, {}, INVALID_KEY),
+    ("invalid key beside an invalid Select", BAD_NAMES, {}, {"Select": "bad"}, INVALID_KEY),
+    ("Limit 0 beside an invalid key", BAD_NAMES, {}, {"Limit": 0}, LIMIT_MSG),
+    ("ReturnConsumedCapacity beside an invalid key", BAD_NAMES, {},
+     {"ReturnConsumedCapacity": "bad"}, RCC_MSG),
+    ("AttributesToGet beside an invalid key", BAD_NAMES, {}, {"AttributesToGet": ["a"]},
+     ATTRIBUTES_TO_GET_MIX),
+    ("invalid key beside an unknown descriptor", BAD_NAMES, {":x": X1}, {}, INVALID_KEY),
+    ("invalid key beside no descriptor", BAD_NAMES, {":x": {}}, {}, INVALID_KEY),
+    ("invalid key beside two descriptors", BAD_NAMES, {":v": {"N": "1", "S": "x"}}, {}, INVALID_KEY),
+    ("Limit 0 beside an unknown descriptor and an invalid key", BAD_NAMES, {":x": X1},
+     {"Limit": 0}, "1 validation error detected: " + LIMIT_0_AT),
+    ("Select beside an unknown descriptor and an invalid key", BAD_NAMES, {":x": X1},
+     {"Select": "bad"}, SELECT_MSG),
+    ("ReturnConsumedCapacity beside an unknown descriptor and an invalid key", BAD_NAMES,
+     {":x": X1}, {"ReturnConsumedCapacity": "bad"}, RCC_MSG),
+    ("AttributesToGet beside an unknown descriptor and an invalid key", BAD_NAMES, {":x": X1},
+     {"AttributesToGet": ["a"]}, ATTRIBUTES_TO_GET_MIX),
+]
+
+# (row, ExpressionAttributeNames, ExpressionAttributeValues or None, the
+# service's message), with KeyConditions and no KeyConditionExpression.
+NAMES_WITHOUT_AN_EXPRESSION = [
+    ("invalid key alone", BAD_NAMES, None, INVALID_KEY),
+    ("invalid key beside S x", BAD_NAMES, {":v": SX}, INVALID_KEY),
+    ("invalid key beside N bob", BAD_NAMES, {":v": NB}, INVALID_KEY),
+    ("valid key beside N bob", {"#a": "a"}, {":v": NB}, NUMERIC + "bob"),
+]
+
+
+def _assert_validation(status, payload, expected):
+    assert status == 400, payload
+    assert payload.get("__type", "").endswith("ValidationException"), payload
+    assert payload.get("message", payload.get("Message")) == expected
+
+
+class TestExpressionAttributeNamesOrder:
+    """The ExpressionAttributeNames checks (an empty map, a key that is not
+    `#` and a name, an empty name) are reported after Limit,
+    ReturnConsumedCapacity and the parameter mix, and ahead of the number
+    check, a duplicate set member, Select and a value the service cannot read
+    as one type, whatever the member order (measured 2026-11-19). Each body is
+    sent with ExpressionAttributeNames ahead of the other members and after
+    them."""
+
+    @pytest.mark.parametrize("names_first", [True, False], ids=["names first", "names last"])
+    @pytest.mark.parametrize("row,names,values,extra,expected", NAMES, ids=[r[0] for r in NAMES])
+    def test_rows(self, dynamodb_client, ss_table, row, names, values, extra, expected,
+                  names_first):
+        rest = {"ExpressionAttributeValues": {":p": SX, **values}, **extra}
+        names_member = {"ExpressionAttributeNames": names}
+        body = {"TableName": ss_table, "KeyConditionExpression": "pk = :p",
+                **(names_member | rest if names_first else rest | names_member)}
+        _assert_validation(*_raw_query(dynamodb_client, body), expected)
+
+    @pytest.mark.parametrize("names_first", [True, False], ids=["names first", "names last"])
+    @pytest.mark.parametrize("row,names,values,expected", NAMES_WITHOUT_AN_EXPRESSION,
+                             ids=[r[0] for r in NAMES_WITHOUT_AN_EXPRESSION])
+    def test_rows_without_an_expression(self, dynamodb_client, ss_table, row, names, values,
+                                        expected, names_first):
+        rest = {"KeyConditions": LEGACY_PK}
+        if values is not None:
+            rest["ExpressionAttributeValues"] = values
+        names_member = {"ExpressionAttributeNames": names}
+        body = {"TableName": ss_table,
+                **(names_member | rest if names_first else rest | names_member)}
+        _assert_validation(*_raw_query(dynamodb_client, body), expected)
