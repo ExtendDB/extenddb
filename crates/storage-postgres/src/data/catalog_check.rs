@@ -152,7 +152,6 @@ fn bare(quoted: &str) -> String {
 }
 
 /// Why [`check`] or [`drop_orphaned`] stopped.
-#[derive(Debug)]
 pub(crate) enum CheckFailure {
     /// The `SHARE` lock on `indexes` was not granted before the deadline:
     /// the last attempt's error (SQLSTATE 55P03).
