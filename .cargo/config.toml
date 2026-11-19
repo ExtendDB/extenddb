@@ -10,3 +10,10 @@
 # everything else updates as usual. Build with `--locked` for the recorded
 # versions.
 incompatible-rust-versions = "fallback"
+
+[target.wasm32-unknown-unknown]
+# getrandom 0.3's browser backend is selected by both the `wasm_js` crate
+# feature and this cfg. Without it, getrandom has no backend on
+# wasm32-unknown-unknown and the build fails. Only affects wasm32 builds;
+# native targets never read this section.
+rustflags = ["--cfg", "getrandom_backend=\"wasm_js\""]
