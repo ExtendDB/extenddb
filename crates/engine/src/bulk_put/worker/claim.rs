@@ -271,11 +271,25 @@ pub(super) async fn cancel_only_loop(
 /// carries, and no report location is set because there is no sink to render
 /// one. On a held transition the operation's ledger rows are deleted, as the
 /// runner does after a terminal transition.
+///
+/// The claim first records itself as the operation's write owner, as a
+/// runner's claim does before its first write (`runner::resume`), so a
+/// write batch of an earlier claim still in flight writes nothing once the
+/// operation is `CANCELLED`. A takeover that fails leaves the operation
+/// `CANCELLING` for a later claim.
 async fn finish_cancelled(
     storage: &dyn StorageEngine,
     owner: &str,
     record: &BulkOperationRecord,
 ) -> Result<FinishState, StorageError> {
+    storage
+        .bulk_write_takeover(
+            &record.account_id,
+            &record.operation_id,
+            owner,
+            (record.cursor_file_index, record.cursor_row_index),
+        )
+        .await?;
     // The store supplies this pair itself when it turns a CANCELLING row
     // into CANCELLED; sending it too keeps the record readable on its own.
     let outcome = Terminal {

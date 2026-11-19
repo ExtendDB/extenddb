@@ -239,7 +239,11 @@ pub(crate) async fn run(deps: &RunnerDeps, record: BulkOperationRecord) -> Resul
 
     // A record started on another store than this server's (the operator
     // changed `[bulk] store` with operations in flight) is neither read
-    // nor rendered here: it ends with the internal failure.
+    // nor rendered here: it ends with the internal failure. The claim
+    // records itself as the write owner first, as on every other path to
+    // `finalize`, so a write batch of the claim before it that is still in
+    // flight writes nothing after the terminal transition. A spent resume
+    // bound ends the operation the same way.
     let recorded = match check_recorded_store(deps, &record) {
         Ok(recorded) => recorded,
         Err(detail) => {
@@ -250,6 +254,7 @@ pub(crate) async fn run(deps: &RunnerDeps, record: BulkOperationRecord) -> Resul
                 detail,
                 "bulk operation was not started on the configured store; it is failed unread"
             );
+            take_over(deps, &record, &mut st).await?;
             st.failure = Some(Failure::internal());
             return finalize(deps, &record, None, st).await;
         }

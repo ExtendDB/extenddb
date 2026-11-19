@@ -70,6 +70,12 @@ pub(crate) struct FaultingStorage {
     /// crash after the delete committed.
     pub(crate) pend_after_ledger_delete: Option<Arc<tokio::sync::Notify>>,
     pub(crate) ledger_delete_pend_fired: AtomicBool,
+    /// When set, the first `delete_bulk_row_outcomes` signals the first
+    /// `Notify` and waits for the second before it deletes anything, holding
+    /// its caller between a terminal `finish` and the ledger delete that
+    /// follows it.
+    pub(crate) hold_ledger_delete: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    pub(crate) ledger_delete_hold_fired: AtomicBool,
     /// Completed `purge_operations` calls, so a test can pin that a
     /// retention pass ran to its end.
     pub(crate) purge_calls: Arc<AtomicU64>,
@@ -107,6 +113,8 @@ impl FaultingStorage {
             ledger_delete_fail_fired: AtomicBool::new(false),
             pend_after_ledger_delete: None,
             ledger_delete_pend_fired: AtomicBool::new(false),
+            hold_ledger_delete: None,
+            ledger_delete_hold_fired: AtomicBool::new(false),
             purge_calls: Arc::new(AtomicU64::new(0)),
             batch_sizes: Arc::new(std::sync::Mutex::new(Vec::new())),
             recorded_reads: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -273,10 +281,19 @@ impl DataEngine for FaultingStorage {
             .as_ref()
             .filter(|_| !self.ledger_delete_pend_fired.swap(true, Ordering::SeqCst))
             .map(Arc::clone);
+        let hold = self
+            .hold_ledger_delete
+            .as_ref()
+            .filter(|_| !self.ledger_delete_hold_fired.swap(true, Ordering::SeqCst))
+            .cloned();
         let fut = self
             .inner
             .delete_bulk_row_outcomes(account_id, operation_id);
         Box::pin(async move {
+            if let Some((entered, release)) = hold {
+                entered.notify_one();
+                release.notified().await;
+            }
             let deleted = fut.await?;
             if let Some(notify) = pend {
                 notify.notify_one();

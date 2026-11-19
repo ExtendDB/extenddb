@@ -1,11 +1,15 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! A claim that lost the operation commits nothing, and a server shutdown
-//! stops a run at the next row with its rows written, a checkpoint and the
-//! lease released.
+//! A claim that lost the operation commits nothing, whichever claim ended
+//! it (a run, a store mismatch, the no-store cancel drain), and a server
+//! shutdown stops a run at the next row with its rows written, a checkpoint
+//! and the lease released.
 
 use super::*;
+
+use crate::bulk_put::run_context::STORE_S3;
+use crate::bulk_put::worker::bulk_operation_worker_with_interval;
 
 fn kv(pk: &str, v: &str) -> String {
     format!(
@@ -174,10 +178,186 @@ async fn a_shutdown_checkpoints_at_the_next_row_and_releases_the_lease_case(back
     h.cleanup().await;
 }
 
+/// Runner-1's storage: the first batch is held between the runner and
+/// storage until `release`, after it signals `entered`, the way a batch of
+/// a process that stalled past its lease is still in flight when another
+/// claim ends the operation.
+fn holding_first_batch(
+    h: &Harness,
+    entered: &Arc<tokio::sync::Notify>,
+    release: &Arc<tokio::sync::Notify>,
+) -> RunnerDeps {
+    let mut faulting = FaultingStorage::new(&h.storage);
+    faulting.hold_first_batch = Some((Arc::clone(entered), Arc::clone(release)));
+    faulting.checkpoint_lease = Some(Duration::from_millis(100));
+    h.deps_with_storage("runner-1", window(5, 5), Arc::new(faulting))
+}
+
+/// Storage for the claim that ends the operation: its ledger delete, the
+/// step after the terminal transition, signals `finished` and waits for
+/// `deleted`, so the earlier claim's batch can be released in between.
+fn holding_ledger_delete(
+    h: &Harness,
+    finished: &Arc<tokio::sync::Notify>,
+    deleted: &Arc<tokio::sync::Notify>,
+) -> Arc<dyn StorageEngine> {
+    let mut faulting = FaultingStorage::new(&h.storage);
+    faulting.hold_ledger_delete = Some((Arc::clone(finished), Arc::clone(deleted)));
+    Arc::new(faulting)
+}
+
+/// A claim on a server whose bulk store is not the one the operation started
+/// on ends it `FAILED` unread. It records itself as the write owner first,
+/// so a batch of the claim before it that is still in flight writes nothing
+/// after the terminal transition.
+async fn a_batch_in_flight_writes_nothing_after_a_store_mismatch_fails_the_operation_case(
+    backend: Backend,
+) {
+    let h = Harness::on(backend).await;
+    h.write_input("part-000.json", &file_of(&plain_rows(10)));
+    let files = h.enumerate().await;
+    let op = h.start(files, input_config(false), both_reports()).await;
+    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let deps = holding_first_batch(&h, &entered, &release);
+    let run = runner::run(&deps, record);
+    tokio::pin!(run);
+    tokio::select! {
+        _ = &mut run => panic!("runner-1 must reach its held batch"),
+        () = entered.notified() => {}
+    }
+
+    // The lease runs out. Runner-2 runs on a server configured with the S3
+    // store and ends the filesystem operation FAILED; it is held after its
+    // terminal transition, before its ledger delete.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let record = h.claim("runner-2", Duration::from_secs(60)).await;
+    let finished = Arc::new(tokio::sync::Notify::new());
+    let deleted = Arc::new(tokio::sync::Notify::new());
+    let mut deps2 = h.deps_with_storage(
+        "runner-2",
+        window(5, 5),
+        holding_ledger_delete(&h, &finished, &deleted),
+    );
+    deps2.store_kind = STORE_S3;
+    let run2 = runner::run(&deps2, record);
+    tokio::pin!(run2);
+    tokio::select! {
+        _ = &mut run2 => panic!("runner-2 must reach its ledger delete"),
+        () = finished.notified() => {}
+    }
+    assert_eq!(h.record(&op).await.status, "FAILED");
+
+    // Runner-1's batch of five rows now reaches storage.
+    release.notify_one();
+    let late = run.await;
+    assert!(
+        late.is_ok(),
+        "a claim that lost the operation stops cleanly, got {late:?}"
+    );
+    deleted.notify_one();
+    run2.await.expect("runner-2's run");
+
+    assert_eq!(
+        h.count_items().await,
+        0,
+        "the earlier claim's batch wrote nothing after the operation was FAILED"
+    );
+    let record = h.record(&op).await;
+    assert_eq!(record.status, "FAILED");
+    assert_eq!(record.failure_code.as_deref(), Some("InternalServerError"));
+    assert_eq!(record.processed_item_count, 0);
+    h.cleanup().await;
+}
+
+/// The worker of a server with no bulk store drains a cancel to `CANCELLED`.
+/// It records itself as the write owner first, so a batch of the claim
+/// before it that is still in flight writes nothing after the terminal
+/// transition.
+async fn a_batch_in_flight_writes_nothing_after_the_no_store_cancel_drain_case(backend: Backend) {
+    let h = Harness::on(backend).await;
+    h.write_input("part-000.json", &file_of(&plain_rows(10)));
+    let files = h.enumerate().await;
+    let op = h.start(files, input_config(false), both_reports()).await;
+    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let deps = holding_first_batch(&h, &entered, &release);
+    let run = runner::run(&deps, record);
+    tokio::pin!(run);
+    tokio::select! {
+        _ = &mut run => panic!("runner-1 must reach its held batch"),
+        () = entered.notified() => {}
+    }
+
+    // The caller cancels and runner-1's lease runs out. The no-store
+    // worker claims the operation, ends it CANCELLED, and is held after the
+    // terminal transition, before its ledger delete.
+    h.storage
+        .request_cancel(ACCOUNT, &op)
+        .await
+        .expect("request cancel");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let finished = Arc::new(tokio::sync::Notify::new());
+    let deleted = Arc::new(tokio::sync::Notify::new());
+    let token = CancellationToken::new();
+    let drain = tokio::spawn(bulk_operation_worker_with_interval(
+        holding_ledger_delete(&h, &finished, &deleted),
+        Arc::new(LimitsConfig::default()),
+        Arc::from(REGION),
+        None,
+        None,
+        Arc::new(MetricsCollector::new()),
+        token.clone(),
+        Duration::from_millis(50),
+    ));
+    tokio::time::timeout(Duration::from_secs(10), finished.notified())
+        .await
+        .expect("the cancel drain reaches its ledger delete");
+    assert_eq!(h.record(&op).await.status, "CANCELLED");
+
+    // Runner-1's batch of five rows now reaches storage.
+    release.notify_one();
+    let late = run.await;
+    assert!(
+        late.is_ok(),
+        "a claim that lost the operation stops cleanly, got {late:?}"
+    );
+    deleted.notify_one();
+    token.cancel();
+    tokio::time::timeout(Duration::from_secs(10), drain)
+        .await
+        .expect("the worker stops at its next tick")
+        .expect("the worker did not panic");
+
+    assert_eq!(
+        h.count_items().await,
+        0,
+        "the earlier claim's batch wrote nothing after the operation was CANCELLED"
+    );
+    let record = h.record(&op).await;
+    assert_eq!(record.status, "CANCELLED");
+    assert_eq!(record.processed_item_count, 0);
+    h.cleanup().await;
+}
+
 on_both_backends!(
     a_batch_still_in_flight_when_another_claim_takes_over_writes_nothing_case,
     a_batch_still_in_flight_when_another_claim_takes_over_writes_nothing,
     a_batch_still_in_flight_when_another_claim_takes_over_writes_nothing_on_postgres
+);
+
+on_both_backends!(
+    a_batch_in_flight_writes_nothing_after_a_store_mismatch_fails_the_operation_case,
+    a_batch_in_flight_writes_nothing_after_a_store_mismatch_fails_the_operation,
+    a_batch_in_flight_writes_nothing_after_a_store_mismatch_fails_the_operation_on_postgres
+);
+
+on_both_backends!(
+    a_batch_in_flight_writes_nothing_after_the_no_store_cancel_drain_case,
+    a_batch_in_flight_writes_nothing_after_the_no_store_cancel_drain,
+    a_batch_in_flight_writes_nothing_after_the_no_store_cancel_drain_on_postgres
 );
 
 on_both_backends!(
