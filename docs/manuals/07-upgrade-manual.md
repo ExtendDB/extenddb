@@ -1232,7 +1232,7 @@ DescribeStream and GetShardIterator now refuse a client-built `StreamArn` with t
 
 ---
 
-### v1.0.0: a `ClientRequestToken` retry compares `ReturnConsumedCapacity` and `ReturnItemCollectionMetrics`
+### v1.1.0: a `ClientRequestToken` retry compares `ReturnConsumedCapacity` and `ReturnItemCollectionMetrics`
 
 **What changed.** `TransactWriteItems` decides whether a request with a known
 `ClientRequestToken` is a replay. It compares a fingerprint of the request with
@@ -1250,10 +1250,10 @@ same way (measured 2026-11-10).
 **Who is affected.** Clients that retry a `TransactWriteItems` or
 `ExecuteTransaction` request with the same token across an upgrade or a
 downgrade. The change affects requests that set `ReturnConsumedCapacity` to
-`TOTAL` or `INDEXES`, or `ReturnItemCollectionMetrics` to `SIZE`. 0.1.15
-serves `ExecuteTransaction` with the earlier fingerprint, so a token that
-0.1.15 stored for an `ExecuteTransaction` write gets the same answers as one
-stored for a `TransactWriteItems` request.
+`TOTAL` or `INDEXES`, or `ReturnItemCollectionMetrics` to `SIZE`. 0.1.15 and
+1.0.0 serve `ExecuteTransaction` with the earlier fingerprint. A token that
+either release stored for an `ExecuteTransaction` write therefore gets the same
+answers as one stored for a `TransactWriteItems` request.
 
 **Impact.** After an upgrade, a token that the earlier release stored for such
 a request answers `IdempotentParameterMismatchException` to an identical retry.
