@@ -139,6 +139,13 @@ pub fn syntax_error(
     ))
 }
 
+/// Whether `err` is a syntax error in the service's wording, as
+/// [`syntax_error`] builds it.
+#[must_use]
+pub fn is_syntax_error(err: &DynamoDbError) -> bool {
+    matches!(err, DynamoDbError::ValidationException(msg) if msg.contains(": Syntax error; token: \""))
+}
+
 /// The window of source text around the token at `pos`: from the previous
 /// token to the next one, each dropped when absent. When the faulty token is
 /// the first one, the window starts at the start of the source, leading

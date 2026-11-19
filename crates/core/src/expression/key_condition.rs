@@ -191,10 +191,15 @@ fn parse_clauses(tokens: &[Token], source: &str) -> Result<Vec<RawClause>, Dynam
     clauses.push(parse_key_clause(tokens, &src, &mut pos)?);
 
     while pos < tokens.len() {
-        if tokens[pos] != Token::And {
-            return Err(validation_err(
-                "Invalid KeyConditionExpression: only AND is supported between key conditions",
-            ));
+        match tokens[pos] {
+            Token::And => {}
+            // Measured 2026-11-19: `pk = :p OR sk = :s` answers this text.
+            Token::Or => return Err(invalid_operator()),
+            _ => {
+                return Err(validation_err(
+                    "Invalid KeyConditionExpression: only AND is supported between key conditions",
+                ));
+            }
         }
         pos += 1;
         clauses.push(parse_key_clause(tokens, &src, &mut pos)?);
@@ -520,6 +525,9 @@ fn parse_key_operand(
             let value = parse_key_value(tokens, src, pos)?;
             Ok(KeyOperand::Value(value))
         }
+        // Measured 2026-11-19: `NOT pk = :p` and `pk = :p AND NOT sk = :s`
+        // answer this text.
+        Token::Not => Err(invalid_operator()),
         // An operator or keyword where an operand is required (`AND pk = :v`).
         token if is_operator_or_keyword(token) => Err(src.syntax_error(*pos)),
         _ => Err(validation_err(
@@ -614,6 +622,14 @@ fn outer_parens_match(tokens: &[Token]) -> bool {
 
 fn validation_err(msg: &str) -> DynamoDbError {
     DynamoDbError::ValidationException(msg.to_owned())
+}
+
+/// The refusal of an OR or a NOT in a key condition that the condition
+/// grammar accepts.
+fn invalid_operator() -> DynamoDbError {
+    validation_err(
+        "Invalid KeyConditionExpression: Invalid operator used in KeyConditionExpression",
+    )
 }
 
 #[cfg(test)]

@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
     Expr, ExpressionKind, ExpressionMaps, KeyCondition, PathElement, Token, UpdateAction,
-    parse_condition_from, parse_key_condition_from, parse_projection_from, parse_update_from,
-    tokenize_for, tokenize_with_limit, validate_no_reserved_words, validate_operator_count,
-    validate_placeholders_and_operands,
+    is_syntax_error, parse_condition_from, parse_key_condition_from, parse_projection_from,
+    parse_update_from, tokenize_for, tokenize_with_limit, validate_no_reserved_words,
+    validate_operator_count, validate_placeholders_and_operands,
 };
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{AttributeValue, ConditionalOperator, ExpectedAttributeValue};
@@ -305,15 +305,22 @@ pub fn parse_key_condition_expr(
         if limits.enforce_reserved_keywords {
             validate_no_reserved_words(&tokens)?;
         }
-        // The service counts operators on the whole expression before it
-        // applies the key condition grammar: `pk = :v OR` + 150 terms answers
-        // the count, not the operator refusal, and 151 AND-joined equalities
-        // answer the count ahead of the one-condition-per-key check (measured
-        // 2026-10-25). The general condition parser supplies the count; when
-        // it does not accept the text, the key condition parser reports the
-        // error in its own words.
-        if let Ok(expr) = parse_condition_from(&tokens, expr, limits.max_expression_depth) {
-            check_operator_count(&expr, ExpressionKind::KeyCondition, limits)?;
+        // The service reads a key condition with the condition grammar first.
+        // A syntax error in that grammar comes before the operator count and
+        // the key condition rules (measured 2026-11-19: `pk = :p OR` answers
+        // token "<EOF>", near "OR"; `pk = :p =` token "=", near ":p ="; `pk =
+        // :p sk = :s` token "sk", near ":p sk ="). The count comes next: `pk =
+        // :v OR` + 150 terms answers the count, not the operator refusal, and
+        // 151 AND-joined equalities answer the count ahead of the
+        // one-condition-per-key check (measured 2026-10-25). When the
+        // condition grammar refuses the text in another way, the key
+        // condition parser reports the error in its own words.
+        match parse_condition_from(&tokens, expr, limits.max_expression_depth) {
+            Ok(condition) => {
+                check_operator_count(&condition, ExpressionKind::KeyCondition, limits)?;
+            }
+            Err(err) if is_syntax_error(&err) => return Err(err),
+            Err(_) => {}
         }
         parse_key_condition_from(&tokens, expr)
     })
@@ -573,11 +580,12 @@ mod tests {
             if msg == "Invalid KeyConditionExpression: The expression contains too many operators; operator count: 301"),
             "got {err:?}"
         );
-        // [a63] two conditions joined by OR under the cap: the key grammar answers.
+        // [a63] two conditions joined by OR under the cap: the key grammar
+        // answers (measured 2026-11-19 as x25).
         let err = parse_key_condition_expr("pk = :v OR sk = :s", &limits).unwrap_err();
         assert!(
             matches!(&err, DynamoDbError::ValidationException(msg)
-            if msg == "Invalid KeyConditionExpression: only AND is supported between key conditions"),
+            if msg == "Invalid KeyConditionExpression: Invalid operator used in KeyConditionExpression"),
             "got {err:?}"
         );
         // [d23] a syntax error is reported by the key grammar in the service's words.
@@ -587,6 +595,39 @@ mod tests {
             if msg == "Invalid KeyConditionExpression: Syntax error; token: \"<EOF>\", near: \"AND\""),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn key_condition_syntax_errors_come_before_the_key_rules() {
+        // Measured 2026-11-19 (us-east-1) on Query, probe cases in the first
+        // column. A syntax error in the condition grammar is reported first;
+        // an OR or a NOT that the grammar accepts is the key rules' refusal.
+        let invalid = "Invalid operator used in KeyConditionExpression";
+        let syntax =
+            |token: &str, near: &str| format!("Syntax error; token: \"{token}\", near: \"{near}\"");
+        let rows = [
+            ("x20", "NOT pk = :p", invalid.to_owned()),
+            ("x21", "pk = :p AND NOT sk = :s", invalid.to_owned()),
+            ("k06", "NOT NOT pk = :p", invalid.to_owned()),
+            ("k08", "(pk = :p) OR (sk = :s)", invalid.to_owned()),
+            ("x22", "pk = :p AND NOT", syntax("<EOF>", "NOT")),
+            ("x23", "pk = :p OR", syntax("<EOF>", "OR")),
+            ("x24", "pk = :p =", syntax("=", ":p =")),
+            ("k01", "pk = :p sk = :s", syntax("sk", ":p sk =")),
+            ("k02", "pk = :p AND sk = :s sk", syntax("sk", ":s sk")),
+            ("k05", "pk = :p OR OR sk = :s", syntax("OR", "OR OR sk")),
+            ("k10", "NOT", syntax("<EOF>", "NOT")),
+            ("k11", "pk = :p AND NOT NOT", syntax("<EOF>", "NOT")),
+        ];
+        let limits = LimitsConfig::default();
+        for (case, expr, want) in rows {
+            let err = parse_key_condition_expr(expr, &limits).unwrap_err();
+            assert!(
+                matches!(&err, DynamoDbError::ValidationException(msg)
+                    if *msg == format!("Invalid KeyConditionExpression: {want}")),
+                "{case}: got {err:?}"
+            );
+        }
     }
 
     #[test]

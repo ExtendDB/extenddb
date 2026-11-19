@@ -981,11 +981,23 @@ fn a_fault_at_the_first_token_keeps_leading_whitespace() {
 }
 
 #[test]
+fn or_and_not_answer_the_invalid_operator_refusal() {
+    // Measured 2026-11-19 (us-east-1): [x25], [x20], [x21].
+    for src in [
+        "pk = :v OR sk = :s",
+        "NOT pk = :p",
+        "pk = :p AND NOT sk = :s",
+    ] {
+        assert_eq!(
+            kce_msg(src),
+            "Invalid KeyConditionExpression: Invalid operator used in KeyConditionExpression",
+            "{src}"
+        );
+    }
+}
+
+#[test]
 fn other_key_condition_texts_are_unchanged() {
-    assert_eq!(
-        kce_msg("pk = :v OR sk = :s"),
-        "Invalid KeyConditionExpression: only AND is supported between key conditions"
-    );
     assert_eq!(
         kce_msg("pk"),
         "Invalid KeyConditionExpression: expected operator after operand"

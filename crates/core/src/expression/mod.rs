@@ -52,7 +52,7 @@ pub use search_condition::{
     SearchCondition, validate_conditions_against_search_schema,
     validate_search_condition_expression,
 };
-pub use syntax_error::{is_operator_or_keyword, syntax_error, token_text};
+pub use syntax_error::{is_operator_or_keyword, is_syntax_error, syntax_error, token_text};
 pub use tokenizer::{Token, tokenize, tokenize_for, tokenize_with_limit};
 pub use update_evaluator::apply_update_validated;
 pub use update_parser::{parse_update, parse_update_from};
