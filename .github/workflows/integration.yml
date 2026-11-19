@@ -781,6 +781,9 @@ jobs:
           EXTENDDB_TEST_PG_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
           # table_snapshot fails rather than skips without the string above.
           EXTENDDB_TEST_PG_REQUIRED: "1"
+          # catalog_check fails when its data database has no pgvector, so
+          # its tests create and check a vector index relation on this image.
+          EXTENDDB_EXPECT_VECTORS: "1"
         run: cargo test --release -p extenddb-storage-postgres --tests
 
   # The runtime-detection proof: the same binary, against a PostgreSQL with no
