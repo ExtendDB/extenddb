@@ -210,14 +210,14 @@ Check the build:
 ```
 
 ```
-extenddb 0.1.15
+extenddb 1.0.0
 catalog migration 12 (postgres)
 commit ceb6a63a
 built 2026-10-24T08:37:05Z
 test-hooks disabled
 ```
 
-`extenddb -V` prints the same. A source build carries the same release version as the published `0.1.14` images and a newer catalog: migration 12 here, 0.0.3 in the images (see the [upgrade manual](manuals/07-upgrade-manual.md#upgrading-a-container-deployment)). <!-- version-literal-ok: names the published tag's catalog, which is behind the tree -->
+`extenddb -V` prints the same.
 
 ## 3. Initialize the deployment
 
@@ -404,7 +404,7 @@ Catalog database: extenddb_catalog
 ```
 
 ```
-extenddb 0.1.15 (catalog migration 12) starting on 127.0.0.1:18443
+extenddb 1.0.0 (catalog migration 12) starting on 127.0.0.1:18443
   storage: postgres (postgresql://extenddb:***@localhost:5432/extenddb_catalog)
 extenddb server started (pid 8644, 127.0.0.1:18443)
 ```
