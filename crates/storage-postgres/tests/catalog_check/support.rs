@@ -165,19 +165,12 @@ impl Deployment {
         .expect("catalog migrations");
         init.record_data_connection().await.expect("record");
         // `init` and `extenddb migrate` make this attempt beside the runner,
-        // which `migrations::migrate` runs alone. A job that sets
-        // EXTENDDB_EXPECT_VECTORS=1 runs on a server with pgvector, so the
-        // tests there check the vector relation too.
+        // which `migrations::migrate` runs alone.
         let vector = extenddb_storage_postgres::migrations::try_create_vector_extension(
             &format!("{base}/{data_db}").parse().expect("data URL"),
             None,
         )
         .await;
-        assert!(
-            vector.starts_with("pgvector available")
-                || std::env::var("EXTENDDB_EXPECT_VECTORS").as_deref() != Ok("1"),
-            "EXTENDDB_EXPECT_VECTORS=1, and the data database has no pgvector: {vector}"
-        );
 
         let catalog_url = format!("{base}/{catalog_db}");
         let catalog = PgPoolOptions::new()
@@ -225,7 +218,7 @@ impl Deployment {
                 .await
                 .expect("diagnostics pool"),
         );
-        Self {
+        let deployment = Self {
             base,
             catalog_db,
             data_db,
@@ -234,7 +227,17 @@ impl Deployment {
             engine,
             diagnostics,
             _permit: permit,
-        }
+        };
+        // A job that sets EXTENDDB_EXPECT_VECTORS=1 runs on a server with
+        // pgvector, so the tests there check the vector relation too. The
+        // check runs on the built deployment, so a failure drops its
+        // databases.
+        assert!(
+            deployment.pgvector().await
+                || std::env::var("EXTENDDB_EXPECT_VECTORS").as_deref() != Ok("1"),
+            "EXTENDDB_EXPECT_VECTORS=1, and the data database has no pgvector: {vector}"
+        );
+        deployment
     }
 
     pub(crate) fn catalog_url(&self) -> String {
