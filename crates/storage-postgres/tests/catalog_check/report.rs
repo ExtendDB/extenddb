@@ -408,7 +408,7 @@ async fn other_catalog_failures_do_not_report_index_changes() {
         return skip(test);
     }
     let d = Deployment::new().await;
-    d.plant_orphan().await;
+    let orphan = d.plant_orphan().await;
     let with_statement_timeout = d.diagnostics_with("statement_timeout", "50ms").await;
     let with_short_budget =
         PostgresCatalogStore::with_index_lock_budget(d.catalog.clone(), Duration::from_secs(2));
@@ -449,6 +449,20 @@ async fn other_catalog_failures_do_not_report_index_changes() {
                 "{held}"
             ),
             other => panic!("{held}: {other:?}"),
+        }
+        let drop = tokio::time::timeout(
+            Duration::from_secs(10),
+            store.drop_orphaned_relations(&KeySource::CatalogKey, vec![orphan.clone()]),
+        )
+        .await
+        .expect("the drop gave up within 10 s");
+        match drop {
+            Err(DiagError::QueryFailed(msg)) => assert_eq!(
+                msg,
+                format!("error returned from database: {error}"),
+                "drop: {held}"
+            ),
+            other => panic!("drop: {held}: {other:?}"),
         }
         holder.close().await.expect("release the lock");
     }
