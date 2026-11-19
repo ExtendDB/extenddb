@@ -279,8 +279,12 @@ function checkBinaryVersion(binary, env, cwd, deadline, timeoutMs) {
  *   shared by the binary's version check and the wait for the server to
  *   become healthy (default 15000). A health probe in flight at the deadline
  *   can add up to 1 s.
+ * @param {boolean} [options.detached]  Leave the server running after the
+ *   calling process exits. Its stderr then goes to the returned `log` file,
+ *   and the returned `pid` names the process to stop.
  * @returns {Promise<{endpoint: string, port: number, credentials: object,
- *                    region: string, storage: string, stop: () => Promise<void>}>}
+ *                    region: string, storage: string, stop: () => Promise<void>,
+ *                    pid?: number, log?: string}>}
  */
 async function start(options = {}) {
   // One deadline for the whole start. The version check and the health wait
@@ -304,13 +308,20 @@ async function start(options = {}) {
   // scratch cwd so a stray extenddb.toml in the project cannot leak in.
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "extenddb-"));
   await checkBinaryVersion(binary, env, cwd, deadline, timeoutMs);
+  // A detached server writes its stderr to a file: a pipe to this process
+  // would close when this process exits. Its stdout, which holds the admin
+  // password, is discarded in both modes.
+  const log = options.detached ? path.join(cwd, "extenddb.log") : undefined;
+  const logFd = log && fs.openSync(log, "a");
   const child = spawn(binary.path, ["serve", "--foreground"], {
     env,
     cwd,
-    stdio: ["ignore", "ignore", "pipe"],
+    stdio: ["ignore", "ignore", log ? logFd : "pipe"],
+    ...(log && { detached: true, windowsHide: true }),
   });
+  if (log) fs.closeSync(logFd);
   let stderrTail = "";
-  child.stderr.on("data", (d) => {
+  child.stderr?.on("data", (d) => {
     stderrTail = (stderrTail + d.toString()).slice(-4000);
   });
 
@@ -323,12 +334,17 @@ async function start(options = {}) {
       }
       reject(err);
     });
-    child.on("exit", (code) =>
-      reject(new Error(`extenddb exited during startup (code ${code}): ${stderrTail}`))
-    );
+    child.on("exit", (code) => {
+      const tail = log ? fs.readFileSync(log, "utf8").slice(-4000) : stderrTail;
+      reject(new Error(`extenddb exited during startup (code ${code}): ${tail}`));
+    });
   });
-  // The health wait gets the time the version check left.
-  await Promise.race([waitHealthy(endpoint, deadline, timeoutMs), spawned]);
+  // The health wait gets the time the version check left. A detached server
+  // that fails to start must not outlive the failed start.
+  await Promise.race([waitHealthy(endpoint, deadline, timeoutMs), spawned]).catch((err) => {
+    if (log) child.kill("SIGKILL");
+    throw err;
+  });
   child.removeAllListeners("exit");
 
   let stopped = false;
@@ -337,11 +353,14 @@ async function start(options = {}) {
       if (stopped || child.exitCode !== null) return resolve();
       stopped = true;
       child.once("exit", () => resolve());
+      // An unref'd child would let the event loop end before its exit event.
+      child.ref();
       child.kill("SIGTERM");
       setTimeout(() => child.kill("SIGKILL"), 5000).unref();
     });
-  // Best effort: do not outlive the caller.
-  process.once("exit", () => child.kill("SIGKILL"));
+  // Best effort: do not outlive the caller, unless the caller asked for that.
+  if (log) child.unref();
+  else process.once("exit", () => child.kill("SIGKILL"));
 
   return {
     endpoint,
@@ -350,6 +369,7 @@ async function start(options = {}) {
     region: "us-east-1",
     storage: description,
     stop,
+    ...(log && { pid: child.pid, log }),
   };
 }
 

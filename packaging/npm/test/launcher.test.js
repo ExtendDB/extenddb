@@ -30,6 +30,11 @@
 //      deadline bounds the version check and the
 //      health wait together. The error names a "binary" option or
 //      EXTENDDB_BINARY path that does not exist.
+//   5. A detached server outlives the process that started it, writes its
+//      stderr, and not its stdout with the admin password, to the log file
+//      that start() returns, and stops when its pid is killed. In the
+//      process that started it, stop() resolves. The GitHub Action in
+//      action.yml depends on each of these.
 
 "use strict";
 
@@ -319,12 +324,48 @@ async function main() {
     );
   }
 
+  // 5. A detached server outlives the process that started it. A child node
+  //    process starts one and exits, and the server still answers. Its stderr
+  //    is in the returned log file, its stdout is not, and killing the
+  //    returned pid stops it. In a second child, stop() resolves.
+  {
+    const index = JSON.stringify(path.join(__dirname, "..", "index.js"));
+    const node = (then) =>
+      spawnSync(
+        process.execPath,
+        ["-e", `require(${index}).start({ binary: process.env.EXTENDDB_BINARY, memory: true, detached: true })${then}`],
+        { encoding: "utf8", timeout: 30000 }
+      );
+    const starter = node(".then((eb) => console.log(JSON.stringify(eb)))");
+    assert.strictEqual(starter.status, 0, `the starting process must exit by itself: ${starter.stderr}`);
+    const eb = JSON.parse(starter.stdout);
+    try {
+      assert.strictEqual(await health(eb.endpoint), 200, "the server must outlive the process that started it");
+      const log = fs.readFileSync(eb.log, "utf8");
+      assert.ok(log.includes(`127.0.0.1:${eb.port}`), "the log file must hold the server's stderr");
+      assert.ok(!log.includes("Password:"), "the log file must not hold the server's stdout");
+    } finally {
+      try {
+        process.kill(eb.pid);
+      } catch {
+        // The server has exited already: keep the assertion's error.
+      }
+    }
+    const deadline = Date.now() + 10000;
+    while (await health(eb.endpoint).then(() => true, () => false)) {
+      assert.ok(Date.now() < deadline, "killing the pid must stop the server");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    const stopper = node(".then((eb) => eb.stop()).then(() => console.log('stopped'))");
+    assert.strictEqual(stopper.stdout.trim(), "stopped", `stop() of a detached server must resolve: ${stopper.stderr}`);
+  }
+
   if (process.platform === "win32") {
-    console.log("launcher tests: 4 scenarios passed (scenarios 5 to 11 run fake binaries through their #! line)");
+    console.log("launcher tests: 5 scenarios passed (scenarios 6 to 12 run fake binaries through their #! line)");
     return;
   }
 
-  // 5. A binary of the launcher's release starts. The check runs `version`
+  // 6. A binary of the launcher's release starts. The check runs `version`
   //    in the working directory `serve` then gets, so it checks the binary
   //    that serves.
   {
@@ -341,7 +382,7 @@ async function main() {
     assert.strictEqual(runs[0].cwd, runs[1].cwd, "version and serve share a working directory");
   }
 
-  // 6. Another release stops the start before serve runs. The error names
+  // 7. Another release stops the start before serve runs. The error names
   //    both releases, where the binary came from, and the fix for that
   //    source.
   {
@@ -384,7 +425,7 @@ async function main() {
     }
   }
 
-  // 7. A `version` that fails, and one that prints no release, stop the
+  // 8. A `version` that fails, and one that prints no release, stop the
   //    start too: a binary whose release cannot be read is not run. An
   //    extenddb before the `version` command exits 2 here, as clap exits on
   //    an unknown subcommand.
@@ -427,7 +468,7 @@ async function main() {
     clearTimeout(guard);
   }
 
-  // 8. From the command line, a binary that EXTENDDB_BINARY names or that
+  // 9. From the command line, a binary that EXTENDDB_BINARY names or that
   //    PATH finds is checked the same way, and the error names that source.
   {
     const fake = fakeBinary({ stdout: versionOutput("0.0.1") });
@@ -479,11 +520,11 @@ async function main() {
       );
       assert.deepStrictEqual(fake.invocations().map((r) => r.args), [["version"], ["version"]]);
     } else {
-      console.log("scenario 8: an installed platform package comes before PATH; PATH half skipped");
+      console.log("scenario 9: an installed platform package comes before PATH; PATH half skipped");
     }
   }
 
-  // 9. A fraction, a numeric string, Infinity and 2^32 each start a server.
+  // 10. A fraction, a numeric string, Infinity and 2^32 each start a server.
   //    For 2^32, the delay left at the version check is still above 2^31-1,
   //    the longest delay that setTimeout keeps. The launcher clamps the
   //    delay, so Node emits no Timeout warning.
@@ -511,7 +552,7 @@ async function main() {
     );
   }
 
-  // 10. One deadline bounds the whole start. Here `version` answers after
+  // 11. One deadline bounds the whole start. Here `version` answers after
   //     1 s and `serve` listens 1.5 s after it starts, so the server is
   //     healthy no earlier than 2.5 s into start(). With a 2 s budget, the
   //     health wait gets the time the version check left, and start() fails
@@ -536,7 +577,7 @@ async function main() {
     process.kill(serve.pid, "SIGKILL");
   }
 
-  // 11. The launcher skips a "binary" option or EXTENDDB_BINARY that names
+  // 12. The launcher skips a "binary" option or EXTENDDB_BINARY that names
   //     no file and falls back to the next source. The error that follows
   //     names the skipped path.
   {
@@ -599,11 +640,11 @@ async function main() {
         notFound.stderr
       );
     } else {
-      console.log("scenario 11: an installed platform package comes before PATH; PATH half skipped");
+      console.log("scenario 12: an installed platform package comes before PATH; PATH half skipped");
     }
   }
 
-  console.log("launcher tests: 11 scenarios passed");
+  console.log("launcher tests: 12 scenarios passed");
 }
 
 main().catch((err) => {
