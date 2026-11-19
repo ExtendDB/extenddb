@@ -14,7 +14,7 @@ use serde_json::{Map, Value};
 
 use super::{
     RETURN_CONSUMED_CAPACITY, SELECT, TYPE_DESCRIPTORS, first_fault, sorted_entries,
-    validate_names, validate_no_parameter_mix,
+    validate_name_keys, validate_names, validate_no_parameter_mix,
 };
 
 /// Whether the service cannot read `value` as exactly one AttributeValue type:
@@ -130,11 +130,12 @@ fn null_value() -> Value {
 ///    'limit' failed to satisfy constraint: Member must have value greater
 ///    than or equal to 1`;
 /// 2. the expression and non-expression parameter mix;
-/// 3. the `ExpressionAttributeNames` map (measured 2026-11-19: an invalid
-///    names key beside `{"X": "1"}`, `{}` or `{"N": "1", "S": "x"}` answers
-///    the names text, in either member order, and beside such a value a
-///    `Limit` of 0, an invalid `Select` or `ReturnConsumedCapacity` and a mix
-///    are reported ahead of it); see [`validate_names`];
+/// 3. the `ExpressionAttributeNames` key checks: an invalid key, a key over
+///    255 bytes and an empty map (measured 2026-11-19: an invalid names key
+///    beside `{"X": "1"}`, `{}` or `{"N": "1", "S": "x"}` answers the names
+///    text, in either member order, and beside such a value a `Limit` of 0,
+///    an invalid `Select` or `ReturnConsumedCapacity` and a mix are reported
+///    ahead of it); see [`validate_name_keys`];
 /// 4. the first fault inside a value, in document order for `L` items and in
 ///    key order for `M` members, as `ExpressionAttributeValues contains
 ///    invalid value: <reason> for key <placeholder>`: a null (`The supplied
@@ -142,7 +143,13 @@ fn null_value() -> Value {
 ///    is the value of an `M` member), no type descriptor, more than one, or an
 ///    `N` that is not a number. Such an `N` is echoed as written, and an empty
 ///    one has no colon after the message. No `M` with more than one member was
-///    measured.
+///    measured;
+/// 5. an empty name in `ExpressionAttributeNames` (measured 2026-11-19 in
+///    either member order: `{"#a": ""}` beside `{"X": "1"}`, `{}`, `{"N": "1",
+///    "S": "x"}`, a null or `{"S": null}` answers that value's text, beside
+///    `{"S": "a", "X": "1"}`, which has no fault of its own, it answers the
+///    empty name text, and `{"#a": "", "b": "c"}` beside `{"X": "1"}` answers
+///    the invalid key text for `b`).
 ///
 /// When several values have a fault, the service names a value it cannot read
 /// as one type ahead of a number fault in another value. `:u` with `{"N":
@@ -189,7 +196,7 @@ pub(super) fn unreadable_value_checks(
     }
 
     validate_no_parameter_mix(body)?;
-    validate_names(body)?;
+    validate_name_keys(body)?;
 
     // The values the service cannot read first; the sort is stable, so each
     // group keeps the placeholder order.
@@ -203,7 +210,7 @@ pub(super) fn unreadable_value_checks(
             )));
         }
     }
-    Ok(())
+    validate_names(body)
 }
 
 /// The enum violation clause for `field` when the body holds a string that is

@@ -115,6 +115,12 @@ X1 = {"X": "1"}
 S_PLUS_X = {"S": "a", "X": "1"}
 LIMIT_0_AT = ("Value '0' at 'limit' failed to satisfy constraint: "
               "Member must have value greater than or equal to 1")
+SELECT_MSG = ("1 validation error detected: Value 'bad' at 'select' failed to satisfy constraint: "
+              "Member must satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, "
+              "ALL_PROJECTED_ATTRIBUTES]")
+ATTRIBUTES_TO_GET_MIX = (
+    "Can not use both expression and non-expression parameters in the same request: "
+    "Non-expression parameters: {AttributesToGet} Expression parameters: {KeyConditionExpression}")
 
 # (row, values beside :p, other fields, the service's message).
 UNREADABLE = [
@@ -135,13 +141,8 @@ UNREADABLE = [
     ("Limit 0 and ReturnConsumedCapacity", {":z": X1}, {"Limit": 0, "ReturnConsumedCapacity": "bad"},
      "2 validation errors detected: " + RCC_MSG.removeprefix("1 validation error detected: ")
      + "; " + LIMIT_0_AT),
-    ("invalid Select", {":z": X1, ":u": NB}, {"Select": "bad"},
-     "1 validation error detected: Value 'bad' at 'select' failed to satisfy constraint: Member "
-     "must satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, "
-     "ALL_PROJECTED_ATTRIBUTES]"),
-    ("AttributesToGet", {":z": X1, ":u": NB}, {"AttributesToGet": ["a"]},
-     "Can not use both expression and non-expression parameters in the same request: "
-     "Non-expression parameters: {AttributesToGet} Expression parameters: {KeyConditionExpression}"),
+    ("invalid Select", {":z": X1, ":u": NB}, {"Select": "bad"}, SELECT_MSG),
+    ("AttributesToGet", {":z": X1, ":u": NB}, {"AttributesToGet": ["a"]}, ATTRIBUTES_TO_GET_MIX),
     # Beside a second type descriptor, a payload with a fault is named ahead of
     # the more than one datatypes text, whatever order the members are in
     # (measured 2026-11-19).
@@ -161,17 +162,13 @@ UNREADABLE = [
     ("S null in an L", {":z": {"L": [{"S": None}]}}, {}, INVALID_VALUE + EMPTY_AV + " for key :z"),
     ("S null beside N bob", {":z": {"S": None, "N": "bob"}}, {},
      INVALID_VALUE + NUMERIC + "bob for key :z"),
-    ("S null with an invalid Select", {":z": {"S": None}}, {"Select": "bad"},
-     "1 validation error detected: Value 'bad' at 'select' failed to satisfy constraint: Member "
-     "must satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, "
-     "ALL_PROJECTED_ATTRIBUTES]"),
+    ("S null with an invalid Select", {":z": {"S": None}}, {"Select": "bad"}, SELECT_MSG),
     ("S null with Limit 0", {":z": {"S": None}}, {"Limit": 0},
      "1 validation error detected: " + LIMIT_0_AT),
     ("S null with ReturnConsumedCapacity", {":z": {"S": None}}, {"ReturnConsumedCapacity": "bad"},
      RCC_MSG),
     ("S null with AttributesToGet", {":z": {"S": None}}, {"AttributesToGet": ["a"]},
-     "Can not use both expression and non-expression parameters in the same request: "
-     "Non-expression parameters: {AttributesToGet} Expression parameters: {KeyConditionExpression}"),
+     ATTRIBUTES_TO_GET_MIX),
 ]
 
 
@@ -209,12 +206,6 @@ class TestValuesTheServiceCannotReadAsOneType:
 
 INVALID_KEY = 'ExpressionAttributeNames contains invalid key: Syntax error; key: "a"'
 BAD_NAMES = {"a": "b"}
-SELECT_MSG = ("1 validation error detected: Value 'bad' at 'select' failed to satisfy constraint: "
-              "Member must satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, "
-              "ALL_PROJECTED_ATTRIBUTES]")
-ATTRIBUTES_TO_GET_MIX = (
-    "Can not use both expression and non-expression parameters in the same request: "
-    "Non-expression parameters: {AttributesToGet} Expression parameters: {KeyConditionExpression}")
 
 # (row, ExpressionAttributeNames, values beside :p, other members, the
 # service's message).
@@ -241,6 +232,10 @@ NAMES = [
      {":x": X1}, {"ReturnConsumedCapacity": "bad"}, RCC_MSG),
     ("AttributesToGet beside an unknown descriptor and an invalid key", BAD_NAMES, {":x": X1},
      {"AttributesToGet": ["a"]}, ATTRIBUTES_TO_GET_MIX),
+    ("empty name beside an unknown descriptor", {"#a": ""}, {":x": X1}, {},
+     INVALID_VALUE + EMPTY_AV + " for key :x"),
+    ("empty name and invalid key beside an unknown descriptor", {"#a": "", "b": "c"}, {":x": X1},
+     {}, 'ExpressionAttributeNames contains invalid key: Syntax error; key: "b"'),
 ]
 
 # (row, ExpressionAttributeNames, ExpressionAttributeValues or None, the
@@ -263,10 +258,11 @@ class TestExpressionAttributeNamesOrder:
     """The ExpressionAttributeNames checks (an empty map, a key that is not
     `#` and a name, an empty name) are reported after Limit,
     ReturnConsumedCapacity and the parameter mix, and ahead of the number
-    check, a duplicate set member, Select and a value the service cannot read
-    as one type, whatever the member order (measured 2026-11-19). Each body is
-    sent with ExpressionAttributeNames ahead of the other members and after
-    them."""
+    check, a duplicate set member and Select. Beside a value the service
+    cannot read as one type, the key checks and the empty map are reported
+    ahead of the value, and an empty name after it. The answers are the same
+    in either member order (measured 2026-11-19). Each body is sent with
+    ExpressionAttributeNames ahead of the other members and after them."""
 
     @pytest.mark.parametrize("names_first", [True, False], ids=["names first", "names last"])
     @pytest.mark.parametrize("row,names,values,extra,expected", NAMES, ids=[r[0] for r in NAMES])

@@ -10,10 +10,8 @@
 //!    `The parameter cannot be converted to a numeric value: <value>` (or the
 //!    overflow, underflow and 38-digit messages). Every value in the map is
 //!    checked, whether the key condition, the filter or nothing reads it. The
-//!    check runs at request time, after the `Limit` check, the
-//!    `ReturnConsumedCapacity` enum check, the expression and non-expression
-//!    parameter mix check and the `ExpressionAttributeNames` check, and before
-//!    the table is looked up; see [`validate_query_request_body`];
+//!    check runs at request time, before the table is looked up, in the order
+//!    [`validate_query_request_body`] gives;
 //! 2. a key condition value whose type is not the key attribute's
 //!    `AttributeDefinitions` type answers `One or more parameter values were
 //!    invalid: Condition parameter type does not match schema type`, on the
@@ -106,7 +104,11 @@ const SELECT: &[&str] = &[
 /// whose `dynamodb:LeadingKeys` fence cannot bind a number that does not parse
 /// gets the request's `ValidationException` rather than
 /// `AccessDeniedException`. That call goes through this function too, so it
-/// answers the shape fault first as well.
+/// answers the shape fault first as well. It comes after the server's
+/// cross-account refusal, so a `Query` that names a table ARN in another
+/// account answers `AccessDeniedException` without these checks, where the
+/// service makes them first (measured 2026-11-12: with such an ARN, `{"N":
+/// "bob"}` answers the numeric message and a `Limit` of 0 the `Limit` text).
 ///
 /// # Errors
 ///
@@ -241,6 +243,25 @@ pub(crate) fn validate_names(body: &Value) -> Result<(), DynamoDbError> {
     {
         Err(fault @ DynamoDbError::ValidationException(_)) => Err(fault),
         _ => Ok(()),
+    }
+}
+
+/// The key checks of [`validate_names`] alone: an empty map, a key that is not
+/// `#` and a name, and a key over 255 bytes. Each name is replaced with a
+/// name that is not empty, so an empty name passes here. Beside a value the
+/// service cannot read as one type, the service makes the key checks ahead of
+/// the values and reports an empty name after them; see
+/// `unreadable_value_checks`.
+fn validate_name_keys(body: &Value) -> Result<(), DynamoDbError> {
+    match body.get("ExpressionAttributeNames") {
+        Some(Value::Object(names)) => {
+            let keys: Map<String, Value> = names
+                .keys()
+                .map(|key| (key.clone(), Value::from("a")))
+                .collect();
+            validate_names(&serde_json::json!({ "ExpressionAttributeNames": keys }))
+        }
+        _ => validate_names(body),
     }
 }
 

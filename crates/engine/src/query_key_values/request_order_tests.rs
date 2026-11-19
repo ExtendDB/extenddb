@@ -6,7 +6,7 @@
 use extenddb_core::error::DynamoDbError;
 use serde_json::json;
 
-use super::tests::message;
+use super::tests::{LIMIT_ZERO, NUMERIC_BOB, RCC_BAD, message, one_error};
 use super::{LIMIT_BELOW_ONE, validate_query_request_body};
 
 #[test]
@@ -38,7 +38,7 @@ fn request_time_checks_run_limit_then_mix_then_numbers() {
 
     assert_eq!(
         message(validate_query_request_body(&bad_number)).as_deref(),
-        Some("The parameter cannot be converted to a numeric value: bob")
+        Some(NUMERIC_BOB)
     );
 
     // A number only a FilterExpression reads, and one nothing reads.
@@ -57,7 +57,7 @@ fn request_time_checks_run_limit_then_mix_then_numbers() {
     ] {
         assert_eq!(
             message(validate_query_request_body(&body)).as_deref(),
-            Some("The parameter cannot be converted to a numeric value: bob")
+            Some(NUMERIC_BOB)
         );
     }
 
@@ -89,16 +89,13 @@ fn enum_checks_sit_on_either_side_of_the_numbers() {
     rcc["ReturnConsumedCapacity"] = serde_json::json!("bad");
     assert_eq!(
         message(validate_query_request_body(&rcc)).as_deref(),
-        Some(
-            "1 validation error detected: Value 'bad' at 'returnConsumedCapacity' failed to \
-             satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"
-        )
+        Some(one_error(RCC_BAD).as_str())
     );
     let mut select = bad_number.clone();
     select["Select"] = serde_json::json!("bad");
     assert_eq!(
         message(validate_query_request_body(&select)).as_deref(),
-        Some("The parameter cannot be converted to a numeric value: bob")
+        Some(NUMERIC_BOB)
     );
     for field in ["ReturnConsumedCapacity", "Select"] {
         let mut limit = bad_number.clone();
@@ -122,10 +119,6 @@ fn enum_checks_sit_on_either_side_of_the_numbers() {
             .is_some_and(|m| m.contains("at 'select' failed to satisfy constraint"))
     );
 }
-
-const RCC_MSG: &str = "1 validation error detected: Value 'bad' at 'returnConsumedCapacity' \
-                       failed to satisfy constraint: Member must satisfy enum value set: \
-                       [INDEXES, TOTAL, NONE]";
 
 #[test]
 fn return_consumed_capacity_is_reported_ahead_of_the_parameter_mix() {
@@ -165,7 +158,7 @@ fn return_consumed_capacity_is_reported_ahead_of_the_parameter_mix() {
         body["ReturnConsumedCapacity"] = json!("bad");
         assert_eq!(
             message(validate_query_request_body(&body)).as_deref(),
-            Some(RCC_MSG),
+            Some(one_error(RCC_BAD).as_str()),
             "{name}"
         );
         body["Limit"] = json!(0);
@@ -264,10 +257,7 @@ fn a_shape_fault_in_another_field_is_reported_ahead_of_the_checks() {
     });
     assert_eq!(
         message(validate_query_request_body(&unknown_type)).as_deref(),
-        Some(
-            "1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: \
-             Member must have value greater than or equal to 1"
-        )
+        Some(one_error(LIMIT_ZERO).as_str())
     );
 
     // A body that passes every check is left to the handler's deserializer.

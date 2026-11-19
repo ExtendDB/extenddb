@@ -68,6 +68,33 @@ pub(super) fn message(result: Result<(), DynamoDbError>) -> Option<String> {
     }
 }
 
+/// The service's texts that the request-time check tests expect.
+pub(super) const INVALID_VALUE: &str = "ExpressionAttributeValues contains invalid value: ";
+pub(super) const EMPTY: &str =
+    "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes";
+pub(super) const SEVERAL: &str = "Supplied AttributeValue has more than one datatypes set, must \
+                                  contain exactly one of the supported datatypes";
+pub(super) const NULL: &str = "The supplied Item contains a null AttributeValue";
+pub(super) const NUMERIC_BOB: &str = "The parameter cannot be converted to a numeric value: bob";
+pub(super) const INVALID_KEY: &str =
+    r#"ExpressionAttributeNames contains invalid key: Syntax error; key: "a""#;
+pub(super) const MIX: &str = "Can not use both expression and non-expression parameters in the \
+                              same request: Non-expression parameters: {AttributesToGet} \
+                              Expression parameters: {KeyConditionExpression}";
+pub(super) const SELECT_BAD: &str = "Value 'bad' at 'select' failed to satisfy constraint: Member \
+                                     must satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, \
+                                     ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]";
+pub(super) const RCC_BAD: &str = "Value 'bad' at 'returnConsumedCapacity' failed to satisfy \
+                                  constraint: Member must satisfy enum value set: [INDEXES, \
+                                  TOTAL, NONE]";
+pub(super) const LIMIT_ZERO: &str = "Value '0' at 'limit' failed to satisfy constraint: Member \
+                                     must have value greater than or equal to 1";
+
+/// `clause` as the service's text for one validation error.
+pub(super) fn one_error(clause: &str) -> String {
+    format!("1 validation error detected: {clause}")
+}
+
 const SS: &[(&str, ScalarAttributeType)] = &[
     ("pk", ScalarAttributeType::S),
     ("sk", ScalarAttributeType::S),
@@ -240,10 +267,7 @@ fn undefined_placeholder_and_undefined_attribute_are_left_to_other_checks() {
 #[test]
 fn number_values_that_are_not_numbers_are_refused_with_the_bare_message() {
     let cases = [
-        (
-            "bob",
-            "The parameter cannot be converted to a numeric value: bob",
-        ),
+        ("bob", NUMERIC_BOB),
         (
             "1e",
             "The parameter cannot be converted to a numeric value: 1e",
@@ -295,7 +319,7 @@ fn every_value_in_the_map_is_checked_whatever_reads_it() {
     let values = HashMap::from([(":p".to_owned(), s("x")), (":n".to_owned(), n("bob"))]);
     assert_eq!(
         message(validate_expression_attribute_value_numbers(&values)).as_deref(),
-        Some("The parameter cannot be converted to a numeric value: bob")
+        Some(NUMERIC_BOB)
     );
 }
 
@@ -320,7 +344,7 @@ fn numbers_nested_in_sets_lists_and_maps_are_checked() {
         let values = HashMap::from([(":p".to_owned(), s("x")), (":n".to_owned(), value.clone())]);
         assert_eq!(
             message(validate_expression_attribute_value_numbers(&values)).as_deref(),
-            Some("The parameter cannot be converted to a numeric value: bob"),
+            Some(NUMERIC_BOB),
             "{value:?}"
         );
     }
@@ -460,7 +484,7 @@ fn a_value_that_does_not_deserialize_does_not_stop_the_number_check_of_another()
         );
         assert_eq!(
             message(validate_query_request_body(&body)).as_deref(),
-            Some("The parameter cannot be converted to a numeric value: bob"),
+            Some(NUMERIC_BOB),
             "{other}"
         );
     }
