@@ -93,7 +93,6 @@ class TestOperatorCount:
             ("a49", "NOT attribute_not_exists(pk) OR " + chain("#v = :v", 149)),  # 300
             ("a42", chain("#v IN (:v, :v, :v, :v, :v)", 130)),  # 259
             ("a54", chain("#v IN (:v)", 150)),  # 299
-            ("a46", chain("attribute_type(#v, :v)", 150)),  # 299
         ],
     )
     def test_put_item_condition_at_or_under_the_cap_is_evaluated(
@@ -102,6 +101,20 @@ class TestOperatorCount:
         # The condition is false for the absent key, so nothing is written.
         code, _ = _error(put(dynamodb_client, table, expr))
         assert code == "ConditionalCheckFailedException", case
+
+    def test_put_item_attribute_type_terms_are_evaluated(self, dynamodb_client, table):
+        # [a46] 150 calls: 299. The type name must be one the service knows:
+        # with "x" it answers "Invalid attribute type name found" (measured
+        # 2026-11-19), so the value is "S".
+        code, _ = _error(
+            put(
+                dynamodb_client,
+                table,
+                chain("attribute_type(#v, :t)", 150),
+                ExpressionAttributeValues={":t": {"S": "S"}},
+            )
+        )
+        assert code == "ConditionalCheckFailedException"
 
     def test_update_item_condition_count(self, dynamodb_client, table):
         # [u01] 599 refused; [u03] 300 accepted (condition evaluated).
@@ -410,3 +423,238 @@ class TestPlaceholderKeyLength:
             )
         )
         assert _after_prefix(msg) == self._names_msg("ExpressionAttributeNames", 256)
+
+
+UNDEFINED_VALUE = (
+    "An expression attribute value used in expression is not defined; attribute value: :zz"
+)
+UNDEFINED_NAME = (
+    "An expression attribute name used in the document path is not defined; attribute name: #x"
+)
+BOOL_OPERAND = (
+    "Incorrect operand type for operator or function; operator or function: <, operand type: BOOL"
+)
+N_PREFIX = (
+    "Incorrect operand type for operator or function; operator or function: begins_with, "
+    "operand type: N"
+)
+B = {":b": {"BOOL": True}}
+N = {":n": {"N": "1"}}
+U = {":u": {"S": "y"}}
+P = {":p": {"S": "p1"}}
+
+# Faults the service reports ahead of the count, measured 2026-11-19 on Scan
+# (s01-s04) and on Query (q01-q04) with the same answers.
+AHEAD_OF_THE_COUNT = [
+    ("s01", chain("#v = :v", 150) + " OR #v < :b", B, BOOL_OPERAND),
+    ("s02", chain("#v = :v", 151) + " OR #v = :zz", {}, UNDEFINED_VALUE),
+    ("s03", chain("#v = :v", 151) + " OR begins_with(#v, :n)", N, N_PREFIX),
+    ("s04", chain("#v = :v", 151) + " OR #x = :v", {}, UNDEFINED_NAME),
+]
+
+
+class TestChecksAheadOfTheCount:
+    """Undefined placeholders and operand types come before the count."""
+
+    @pytest.mark.parametrize("case, expr, values, want", AHEAD_OF_THE_COUNT)
+    def test_scan_filter(self, dynamodb_client, table, case, expr, values, want):
+        msg = _validation(
+            scan(dynamodb_client, table, expr, ExpressionAttributeValues={**VALUES, **values})
+        )
+        assert msg == f"Invalid FilterExpression: {want}", case
+
+    @pytest.mark.parametrize("case, expr, values, want", AHEAD_OF_THE_COUNT)
+    def test_query_filter(self, dynamodb_client, table, case, expr, values, want):
+        msg = _validation(
+            query(
+                dynamodb_client,
+                table,
+                "pk = :p",
+                FilterExpression=expr,
+                ExpressionAttributeValues={**VALUES, **P, **values},
+            )
+        )
+        assert msg == f"Invalid FilterExpression: {want}", case
+
+    def test_query_count_beats_an_unused_value(self, dynamodb_client, table):
+        # [q05]
+        msg = _validation(
+            query(
+                dynamodb_client,
+                table,
+                "pk = :p",
+                FilterExpression=chain("#v = :v", 151),
+                ExpressionAttributeValues={**VALUES, **P, **U},
+            )
+        )
+        assert msg == f"Invalid FilterExpression: {TOO_MANY}301"
+
+    def test_write_conditions(self, dynamodb_client, table):
+        # [p01], [p02], [p03] on PutItem; [u01] on UpdateItem; [d01] on DeleteItem.
+        key = {"pk": {"S": "absent"}, "sk": {"S": "absent"}}
+        undefined = chain("#v = :v", 151) + " OR #v = :zz"
+        rows = [
+            ("p01", put(dynamodb_client, table, undefined), UNDEFINED_VALUE),
+            (
+                "p02",
+                put(dynamodb_client, table, chain("#v = :v", 151) + " OR #x = :v"),
+                UNDEFINED_NAME,
+            ),
+            (
+                "p03",
+                put(
+                    dynamodb_client,
+                    table,
+                    chain("#v = :v", 151) + " OR begins_with(#v, :n)",
+                    ExpressionAttributeValues={**VALUES, **N},
+                ),
+                N_PREFIX,
+            ),
+            (
+                "u01",
+                lambda: dynamodb_client.update_item(
+                    TableName=table,
+                    Key=key,
+                    UpdateExpression="SET #w = :v",
+                    ConditionExpression=undefined,
+                    ExpressionAttributeNames={"#v": "v", "#w": "w"},
+                    ExpressionAttributeValues=VALUES,
+                ),
+                UNDEFINED_VALUE,
+            ),
+            (
+                "d01",
+                lambda: dynamodb_client.delete_item(
+                    TableName=table,
+                    Key=key,
+                    ConditionExpression=undefined,
+                    ExpressionAttributeNames=NAMES,
+                    ExpressionAttributeValues=VALUES,
+                ),
+                UNDEFINED_VALUE,
+            ),
+        ]
+        for case, request, want in rows:
+            assert _after_prefix(_validation(request)) == f"Invalid ConditionExpression: {want}", case
+
+    def test_the_checks_read_no_item(self, dynamodb_client, table):
+        # Measured 2026-11-19: the undefined value is found where evaluation
+        # would skip it or never run, and ahead of the other request faults.
+        rows = [
+            ("p04", put(dynamodb_client, table, "attribute_not_exists(pk) OR #v = :zz"), "Condition", UNDEFINED_VALUE),
+            (
+                "q06",
+                query(
+                    dynamodb_client,
+                    table,
+                    "pk = :p",
+                    FilterExpression="#v = :zz",
+                    ExpressionAttributeValues={**VALUES, ":p": {"S": "nothing"}},
+                ),
+                "Filter",
+                UNDEFINED_VALUE,
+            ),
+            (
+                "s07",
+                scan(dynamodb_client, table, "#v = :zz", ExpressionAttributeValues={**VALUES, **U}),
+                "Filter",
+                UNDEFINED_VALUE,
+            ),
+            ("s08", scan(dynamodb_client, "extenddb-missing-b501", "#v = :zz"), "Filter", UNDEFINED_VALUE),
+            (
+                "s10",
+                scan(
+                    dynamodb_client,
+                    table,
+                    "#v = :zz OR #v < :b",
+                    ExpressionAttributeValues={**VALUES, **B},
+                ),
+                "Filter",
+                UNDEFINED_VALUE,
+            ),
+            (
+                "s13",
+                scan(
+                    dynamodb_client,
+                    table,
+                    "#v < :b",
+                    ExpressionAttributeValues={**VALUES, **B},
+                    ProjectionExpression="#v, , #v",
+                ),
+                "Filter",
+                BOOL_OPERAND,
+            ),
+        ]
+        for case, request, kind, want in rows:
+            assert _after_prefix(_validation(request)) == f"Invalid {kind}Expression: {want}", case
+
+
+class TestScanRangesAheadOfTheCount:
+    """The Scan Limit, Segment and TotalSegments ranges come first."""
+
+    @pytest.mark.parametrize(
+        "case, expr, values, extra",
+        [
+            ("s05", chain("#v = :v", 151), {}, {"Limit": 0}),
+            ("s16", "#v < :b", B, {"Limit": 0}),
+            ("s17", "#v = :zz", {}, {"Limit": 0}),
+            ("s22", "#v = = :v", {}, {"Limit": 0}),
+            ("s06", chain("#v = :v", 151), {}, {"Segment": 0, "TotalSegments": 0}),
+        ],
+    )
+    def test_range_beats_the_filter_checks(
+        self, dynamodb_client_no_validation, table, case, expr, values, extra
+    ):
+        # Measured 2026-11-19. The service words the range as "Value at
+        # 'Limit' failed to satisfy constraint: ..."; ExtendDB keeps its own
+        # wording, so the assertion names the parameter and the bound.
+        msg = _validation(
+            scan(
+                dynamodb_client_no_validation,
+                table,
+                expr,
+                ExpressionAttributeValues={**VALUES, **values},
+                **extra,
+            )
+        )
+        name = "TotalSegments" if "TotalSegments" in extra else "limit"
+        assert name in msg or name.capitalize() in msg, (case, msg)
+        assert "greater than or equal to 1" in msg, (case, msg)
+
+    def test_segment_pairing_comes_after_the_count(self, dynamodb_client_no_validation, table):
+        # [s27] a Segment without TotalSegments beside 151 terms.
+        msg = _validation(
+            scan(dynamodb_client_no_validation, table, chain("#v = :v", 151), Segment=0)
+        )
+        assert msg == f"Invalid FilterExpression: {TOO_MANY}301"
+
+
+class TestPartiqlStatementCount:
+    """PartiQL counts a statement, not the text it writes for the statement."""
+
+    def test_not_over_and_joined_terms_runs(self, dynamodb_client, table):
+        # [e01]-[e04] measured 2026-11-19: the service runs each statement.
+        key = {"pk": {"S": "p2"}, "sk": {"S": "s2"}}
+        dynamodb_client.put_item(TableName=table, Item={**key, "v": {"S": "x"}})
+        try:
+            def not_and(n):
+                return "NOT (" + " AND ".join(["v = 'y'"] * n) + ")"
+
+            items = dynamodb_client.execute_statement(
+                Statement=f'SELECT * FROM "{table}" WHERE {not_and(150)}'
+            )["Items"]
+            assert {"S": "p2"} in [item["pk"] for item in items]
+            items = dynamodb_client.execute_statement(
+                Statement=f"SELECT * FROM \"{table}\" WHERE pk = 'p2' AND {not_and(101)}"
+            )["Items"]
+            assert [item["pk"] for item in items] == [{"S": "p2"}]
+            where = f"pk = 'p2' AND sk = 's2' AND {not_and(101)}"
+            dynamodb_client.execute_statement(Statement=f'UPDATE "{table}" SET w = 1 WHERE {where}')
+            item = dynamodb_client.get_item(TableName=table, Key=key, ConsistentRead=True)["Item"]
+            assert item["w"] == {"N": "1"}
+            dynamodb_client.execute_statement(Statement=f'DELETE FROM "{table}" WHERE {where}')
+            assert "Item" not in dynamodb_client.get_item(
+                TableName=table, Key=key, ConsistentRead=True
+            )
+        finally:
+            dynamodb_client.delete_item(TableName=table, Key=key)
