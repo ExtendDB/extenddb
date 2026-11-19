@@ -222,17 +222,11 @@ async fn a_check_that_finds_every_relation_named_does_not_wait_for_index_writers
     }
     let d = Deployment::new().await;
     d.create_table_with_indexes(TABLE).await;
-    let mut writer = sqlx::PgConnection::connect(&d.catalog_url())
-        .await
-        .expect("a catalog session for the writer");
-    sqlx::query("BEGIN")
-        .execute(&mut writer)
-        .await
-        .expect("begin");
-    sqlx::query("UPDATE indexes SET index_status = index_status WHERE index_name = 'gsi1'")
-        .execute(&mut writer)
-        .await
-        .expect("an open write to indexes");
+    let writer = hold(
+        &d.catalog_url(),
+        "UPDATE indexes SET index_status = index_status WHERE index_name = 'gsi1'",
+    )
+    .await;
 
     let started = std::time::Instant::now();
     let check = tokio::time::timeout(
