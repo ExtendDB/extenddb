@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
@@ -34,10 +34,11 @@ pub struct ChangePasswordRequest {
 pub async fn create_admin(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     axum::Json(body): axum::Json<CreateAdminRequest>,
 ) -> Response {
     if let Err(e) =
-        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, None).await
+        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, addr).await
     {
         return e;
     }
@@ -91,9 +92,10 @@ pub async fn create_admin(
 pub async fn list_admins(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
 ) -> Response {
     if let Err(e) =
-        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, None).await
+        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, addr).await
     {
         return e;
     }
@@ -123,13 +125,14 @@ pub async fn list_admins(
 pub async fn delete_admin(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(name): Path<String>,
 ) -> Response {
     let caller = match authenticate_admin(
         &headers,
         &*state.catalog_store,
         &*state.catalog_store,
-        None,
+        addr,
     )
     .await
     {
@@ -164,11 +167,12 @@ pub async fn delete_admin(
 pub async fn change_admin_password(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(name): Path<String>,
     axum::Json(body): axum::Json<ChangePasswordRequest>,
 ) -> Response {
     if let Err(e) =
-        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, None).await
+        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, addr).await
     {
         return e;
     }

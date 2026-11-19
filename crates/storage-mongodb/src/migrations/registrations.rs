@@ -5,6 +5,12 @@
 //! `extenddb_servers` while it serves, and the read of every live one that
 //! `migrate --yes` waits on. The lock it is paired with is in `locks.rs`,
 //! whose module doc describes both.
+//!
+//! A command that opens the catalog as a server does (`extenddb backup list`,
+//! `extenddb backup purge`) registers too, so a migration waits for it, and
+//! its document's `command` field carries its name, which the migration's
+//! wait prints. A document without the field (an earlier build's) is a
+//! server's.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -38,7 +44,8 @@ pub(crate) async fn live_registrations(
         .iter()
         .map(|d| {
             format!(
-                "pid {} on {} (release {}, registered {}, expires {})",
+                "{}, pid {} on {} (release {}, registered {}, expires {})",
+                d.get_str("command").unwrap_or(SERVE_COMMAND),
                 d.get("pid")
                     .map_or_else(|| "unknown".to_owned(), ToString::to_string),
                 d.get_str("host").unwrap_or("an unknown host"),
@@ -51,6 +58,10 @@ pub(crate) async fn live_registrations(
         })
         .collect())
 }
+
+/// The name a server's registration carries; a command's carries its own
+/// (`extenddb backup list`).
+pub const SERVE_COMMAND: &str = "extenddb serve";
 
 /// This host's name, for the registration.
 fn host_name() -> String {
@@ -86,6 +97,24 @@ impl ServingRegistration {
         release: &str,
         timing: Timing,
     ) -> Result<Self, MigrationError> {
+        Self::register_as(target, release, SERVE_COMMAND, timing).await
+    }
+
+    /// [`ServingRegistration::register`] for the process `command` names
+    /// ([`SERVE_COMMAND`], or a command such as `extenddb backup list`): the
+    /// document's `command` field carries the name, and a command's refusal
+    /// while a migration holds the lock names the holder without the
+    /// server's advice to start the server.
+    ///
+    /// # Errors
+    ///
+    /// As [`ServingRegistration::register`].
+    pub async fn register_as(
+        target: &MongoTarget,
+        release: &str,
+        command: &str,
+        timing: Timing,
+    ) -> Result<Self, MigrationError> {
         let client = connect(&target.connection_string).await?;
         let db = super::catalog_handle(&client, &target.catalog);
         let servers = db.collection::<Document>(SERVERS);
@@ -94,6 +123,7 @@ impl ServingRegistration {
             .update_one(
                 doc! { "_id": &token },
                 vec![doc! { "$set": {
+                    "command": command,
                     "host": host_name(),
                     "pid": i64::from(std::process::id()),
                     "release": release,
@@ -135,9 +165,15 @@ impl ServingRegistration {
         };
         if let Some(lock) = lock {
             registration.release().await;
+            // A command's refusal ends at the holder; the command's caller
+            // adds that it is retried once the migration has finished.
+            let then = if command == SERVE_COMMAND {
+                ", so the server does not start; start it again once the migration finishes"
+            } else {
+                ""
+            };
             return Err(MigrationError::Locked(format!(
-                "{} holds the migration lock on this catalog, so the server does not start; \
-                 start it again once the migration finishes",
+                "{} holds the migration lock on this catalog{then}",
                 holder(Some(&lock))
             )));
         }

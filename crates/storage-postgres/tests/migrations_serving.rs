@@ -13,10 +13,8 @@ mod migrations_support;
 use std::time::Duration;
 
 use extenddb_storage::hooks::{Reregistration, ServingRegistrar};
-use extenddb_storage::migrations::{CatalogStatus, MigrationId, Runner};
-use extenddb_storage_postgres::migrations::{
-    MigrationLock, PostgresMigrations, ServerRegistration, migrate,
-};
+use extenddb_storage::migrations::{CatalogStatus, MigrationError, MigrationId};
+use extenddb_storage_postgres::migrations::{MigrationLock, ServerRegistration, migrate};
 use migrations_support::{LATEST, Scratch, base_conn, pool, skip};
 use sqlx::PgPool;
 
@@ -131,7 +129,7 @@ async fn a_registration_the_database_ended_is_taken_again_on_a_new_session() {
 
 /// A migration that holds the catalog when the server tries again refuses
 /// the attempt, which leaves no key behind: one that holds both keys, and one
-/// of a release before 1.0 that holds the migration key alone. Once it has
+/// of a release before 0.1.15 that holds the migration key alone. Once it has
 /// finished without a change, the server registers again.
 #[tokio::test]
 async fn a_migration_that_holds_the_catalog_refuses_the_registration() {
@@ -196,15 +194,15 @@ async fn a_status_that_changed_while_unregistered_refuses_the_registration() {
         .expect("register");
     end_the_serving_session(&admin, &s).await;
     lost(&registration).await;
-    // A migrator clears the latest migration in the meantime.
-    let lock = MigrationLock::acquire(&s.options(), Duration::from_secs(5))
+    // The catalog changes in the meantime: the latest migration's ledger
+    // row is deleted (the version row is left as it was).
+    let catalog = s.catalog().await;
+    sqlx::query("DELETE FROM extenddb_migrations WHERE id = $1")
+        .bind(i32::try_from(LATEST).unwrap())
+        .execute(&catalog)
         .await
-        .unwrap();
-    let m = PostgresMigrations::open(&s.target(), &lock).await.unwrap();
-    let forgot = Runner::new(&m, RELEASE).forget(LATEST).await;
-    m.close().await;
-    lock.release().await;
-    forgot.expect("forget the latest migration");
+        .expect("delete the latest migration's ledger row");
+    catalog.close().await;
     match registration.register_again().await {
         Reregistration::Refused(why) => assert!(
             why.contains("status changed")
@@ -307,5 +305,66 @@ async fn an_attempt_dropped_while_its_status_read_waits_leaves_no_key() {
         "the attempt never took the key, so its drop shows nothing"
     );
     assert_eq!(held, [], "a dropped attempt left the serving key held");
+    admin.close().await;
+}
+
+/// A command that opens the catalog as a server does registers under its own
+/// name: the serving session's `application_name` is the command's, a
+/// migration that waits for the registrations names it, a registration
+/// taken again keeps it, and a registration refused while a migration holds
+/// the catalog names the migration without telling the operator to start a
+/// server.
+#[tokio::test]
+async fn a_command_registers_under_its_own_name() {
+    let Some(base) = base_conn() else {
+        return skip("a command's registration");
+    };
+    let s = installed(&base, "pgs_command").await;
+    let admin = pool(&format!("{base}/postgres"), 1).await;
+    let registration =
+        ServerRegistration::register_as_with(&s.catalog_url(), "extenddb backup list", KEEPALIVE)
+            .await
+            .expect("register");
+    let sessions = serving_sessions(&admin, &s).await;
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    assert_eq!(sessions[0].1, "extenddb backup list");
+    let err = migrate(&s.target(), RELEASE, Duration::from_secs(1))
+        .await
+        .expect_err("a migration while the command is registered");
+    assert_eq!(err.exit_code(), 6, "{err}");
+    assert!(
+        err.to_string().contains("\"extenddb backup list\""),
+        "the migration names the command: {err}"
+    );
+
+    end_the_serving_session(&admin, &s).await;
+    lost(&registration).await;
+    assert_eq!(
+        registration.register_again().await,
+        Reregistration::Registered
+    );
+    let sessions = serving_sessions(&admin, &s).await;
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    assert_eq!(sessions[0].1, "extenddb backup list", "taken again");
+    drop(registration);
+
+    let lock = MigrationLock::acquire(&s.options(), Duration::from_secs(5))
+        .await
+        .expect("the migration lock, once the command's key is gone");
+    match ServerRegistration::register_as(&s.catalog_url(), "extenddb backup purge").await {
+        Err(e @ MigrationError::Locked(_)) => {
+            assert_eq!(e.exit_code(), 6, "{e}");
+            assert!(
+                e.to_string()
+                    .contains("a migration is running on this catalog")
+                    && !e.to_string().contains("start the server"),
+                "{e}"
+            );
+        }
+        Err(other) => panic!("refused otherwise: {other}"),
+        Ok(_) => panic!("registered beside a migration"),
+    }
+    assert_eq!(serving_sessions(&admin, &s).await, []);
+    lock.release().await;
     admin.close().await;
 }

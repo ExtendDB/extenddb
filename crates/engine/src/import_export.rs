@@ -6,6 +6,7 @@
 //! extenddb imports from and exports to the local filesystem instead of S3.
 //! Both operations are synchronous — they complete before returning.
 
+use std::path::Path;
 use std::time::SystemTime;
 
 use serde_json::Value;
@@ -15,12 +16,14 @@ use crate::create_table::storage_err_to_dynamo;
 use crate::import_export_io::{
     ensure_account_dirs, read_items, validate_path, validate_path_parent,
 };
+use crate::private_fs::{create_private_dir_all, private_new_file_options};
 use crate::serialize_output;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::types::{
     CreateTableInput, ExportFormat, ImportStatus, ImportTableDescription, ImportTableInput,
     ImportTableOutput, Item, TableCreationParameters,
 };
+use extenddb_core::validation::number::operations::{ImportRowFault, import_row};
 use extenddb_core::validation::{
     validate_attribute_name_sizes, validate_item_keys, validate_item_nesting_depth,
     validate_item_size, validate_key_sizes,
@@ -119,33 +122,100 @@ pub async fn handle_import_table(
 
     let mut imported_count: i64 = 0;
     let mut error_count: i64 = 0;
-    let processed_count = i64::try_from(items.len()).unwrap_or(i64::MAX);
+    let mut processed_count: i64 = 0;
+    // Created before the rows are read so that each row's log line names the
+    // import it belongs to; `item_number` counts items, not file lines.
+    let import_arn = format!("{}:import/{}", table_arn, uuid::Uuid::new_v4());
+    let table_name = tcp.table_name.as_str();
 
     for item in items {
+        processed_count += 1;
+        // Numbers before the other checks: a row holding a value that is not
+        // a number ends the import of the file whatever else the row holds,
+        // and a row holding a number out of range is skipped (see
+        // `import_row`).
+        match import_row(&item) {
+            Ok(()) => {}
+            Err(ImportRowFault::OutOfRange(fault)) => {
+                tracing::warn!(
+                    import_arn = ?import_arn,
+                    table_name = ?table_name,
+                    item_number = processed_count,
+                    error = %fault.text(),
+                    "import: skipping item with a number out of range"
+                );
+                error_count += 1;
+                continue;
+            }
+            Err(ImportRowFault::Malformed) => {
+                tracing::warn!(
+                    import_arn = ?import_arn,
+                    table_name = ?table_name,
+                    item_number = processed_count,
+                    "import: item holds a value that is not a number; the rest of the file is not imported"
+                );
+                error_count += 1;
+                break;
+            }
+        }
         if let Err(e) =
             validate_item_keys(&item, &key_info.key_schema, &key_info.attribute_definitions)
         {
-            tracing::warn!(error = %e, "import: skipping item with invalid keys");
+            tracing::warn!(
+                import_arn = ?import_arn,
+                table_name = ?table_name,
+                item_number = processed_count,
+                error = ?e.to_string(),
+                "import: skipping item with invalid keys"
+            );
             error_count += 1;
             continue;
         }
         if let Err(e) = validate_item_nesting_depth(&item) {
-            tracing::warn!(error = %e, "import: skipping item with excessive nesting");
+            tracing::warn!(
+                import_arn = ?import_arn,
+                table_name = ?table_name,
+                item_number = processed_count,
+                error = ?e.to_string(),
+                "import: skipping item with excessive nesting"
+            );
             error_count += 1;
             continue;
         }
         if let Err(e) = validate_item_size(&item, ctx.limits.max_item_size_bytes) {
-            tracing::warn!(error = %e, "import: skipping oversized item");
+            tracing::warn!(
+                import_arn = ?import_arn,
+                table_name = ?table_name,
+                item_number = processed_count,
+                error = ?e.to_string(),
+                "import: skipping oversized item"
+            );
             error_count += 1;
             continue;
         }
-        if let Err(e) = validate_attribute_name_sizes(&item, &ctx.limits) {
-            tracing::warn!(error = %e, "import: skipping item with oversized attribute name");
+        if let Err(e) = validate_attribute_name_sizes(
+            &item,
+            &ctx.limits,
+            extenddb_core::validation::AttributeNameRequestForm::SingleItem,
+        ) {
+            tracing::warn!(
+                import_arn = ?import_arn,
+                table_name = ?table_name,
+                item_number = processed_count,
+                error = ?e.to_string(),
+                "import: skipping item with oversized attribute name"
+            );
             error_count += 1;
             continue;
         }
         if let Err(e) = validate_key_sizes(&item, &key_info.key_schema, &ctx.limits) {
-            tracing::warn!(error = %e, "import: skipping item with oversized key");
+            tracing::warn!(
+                import_arn = ?import_arn,
+                table_name = ?table_name,
+                item_number = processed_count,
+                error = ?e.to_string(),
+                "import: skipping item with oversized key"
+            );
             error_count += 1;
             continue;
         }
@@ -159,11 +229,29 @@ pub async fn handle_import_table(
     }
 
     let end_time = epoch_seconds();
-    let import_arn = format!("{}:import/{}", table_arn, uuid::Uuid::new_v4());
+
+    // An import that refused any row is FAILED with `ItemValidationError`,
+    // and the rows it accepted stay in the table (measured 2026-11-03 with
+    // number rows, and 2026-11-11 with a row whose key has the wrong type).
+    // The service's message sends the reader to its error log in CloudWatch;
+    // ExtendDB writes each refused row to the server log instead.
+    let (import_status, failure_code, failure_message) = if error_count > 0 {
+        (
+            ImportStatus::Failed,
+            Some("ItemValidationError".to_owned()),
+            Some(
+                "Some of the items failed validation checks and were not imported. \
+                 Please check the server log for more details."
+                    .to_owned(),
+            ),
+        )
+    } else {
+        (ImportStatus::Completed, None, None)
+    };
 
     let description = ImportTableDescription {
         import_arn,
-        import_status: ImportStatus::Completed,
+        import_status,
         table_arn,
         table_id: Some(table_id),
         file_source: input.file_source,
@@ -174,8 +262,8 @@ pub async fn handle_import_table(
         imported_item_count: imported_count,
         start_time: Some(start_time),
         end_time: Some(end_time),
-        failure_code: None,
-        failure_message: None,
+        failure_code,
+        failure_message,
     };
 
     serialize_output(&ImportTableOutput {
@@ -239,8 +327,10 @@ pub async fn handle_export_table(
         &ctx.export_paths,
         &ctx.account_id,
     )?;
+    // `validate_path_parent` has just required the parent to exist, so this
+    // creates a directory only when another process removes it in between.
     if let Some(parent) = output_path.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|_| {
+        create_private_dir_all(parent).map_err(|_| {
             DynamoDbError::ValidationException("Cannot create output directory".to_owned())
         })?;
     }
@@ -253,23 +343,7 @@ pub async fn handle_export_table(
         "import/export file access"
     );
 
-    // `create_new` refuses to write when anything already exists at the path,
-    // so an export cannot truncate a file it did not create. It also refuses an
-    // existing symlink, including a dangling one, rather than following it.
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&output_path)
-        .await
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                DynamoDbError::ValidationException(
-                    "Export file already exists; choose a different FilePath".to_owned(),
-                )
-            } else {
-                DynamoDbError::ValidationException("Cannot create export file".to_owned())
-            }
-        })?;
+    let mut file = create_export_file(&output_path).await?;
 
     let mut item_count: i64 = 0;
     let max_export_items = ctx.limits.max_export_item_count;
@@ -337,6 +411,24 @@ pub async fn handle_export_table(
     })
 }
 
+/// Create the export file, owner-only on Unix because it holds the table's
+/// items.
+///
+/// `create_new` refuses to write when anything already exists at the path, so
+/// an export cannot truncate a file it did not create. It also refuses an
+/// existing symlink, including a dangling one, rather than following it.
+pub(crate) async fn create_export_file(path: &Path) -> Result<tokio::fs::File, DynamoDbError> {
+    private_new_file_options().open(path).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            DynamoDbError::ValidationException(
+                "Export file already exists; choose a different FilePath".to_owned(),
+            )
+        } else {
+            DynamoDbError::ValidationException("Cannot create export file".to_owned())
+        }
+    })
+}
+
 fn create_table_input_from_params(tcp: &TableCreationParameters) -> CreateTableInput {
     CreateTableInput {
         table_name: tcp.table_name.clone(),
@@ -347,7 +439,18 @@ fn create_table_input_from_params(tcp: &TableCreationParameters) -> CreateTableI
         // member; nothing to resolve.
         table_throughput_mode: None,
         provisioned_throughput: tcp.provisioned_throughput.clone(),
-        global_secondary_indexes: tcp.global_secondary_indexes.clone(),
+        // TableCreationParameters has no table-level WarmThroughput, and an
+        // imported index's is cleared the same way: ImportTable does not run
+        // CreateTable's validation, so a value kept here would be stored
+        // unchecked. Imported tables and indexes report the defaults.
+        global_secondary_indexes: tcp.global_secondary_indexes.clone().map(|gsis| {
+            gsis.into_iter()
+                .map(|gsi| extenddb_core::types::GsiInput {
+                    warm_throughput: None,
+                    ..gsi
+                })
+                .collect()
+        }),
         local_secondary_indexes: None,
         vector_indexes: None,
         stream_specification: None,
@@ -356,6 +459,7 @@ fn create_table_input_from_params(tcp: &TableCreationParameters) -> CreateTableI
         deletion_protection_enabled: None,
         table_class: None,
         on_demand_throughput: None,
+        warm_throughput: None,
     }
 }
 
@@ -398,7 +502,8 @@ async fn wait_for_table_active(
 ///
 /// `RestoreTableToPointInTime` reads its `SourceTableArn` through this too,
 /// with no check before authorization: an index ARN there is refused here
-/// with the same message (measured on DynamoDB).
+/// with the same message (measured on DynamoDB). The server refuses every
+/// `RestoreTableToPointInTime` before its handler runs.
 pub(crate) fn extract_table_name_from_arn(arn: &str) -> Result<String, DynamoDbError> {
     match extenddb_core::arn::parse(arn) {
         Some(extenddb_core::arn::TableResource {
@@ -456,5 +561,41 @@ mod export_arn_tests {
                 other => panic!("expected ValidationException for {arn}, got {other:?}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod import_warm_throughput_tests {
+    use super::*;
+
+    /// An imported index's WarmThroughput is not stored, as the table's is
+    /// not: a value CreateTable refuses (-7) cannot reach the catalog.
+    #[test]
+    fn an_imported_gsi_warm_throughput_is_cleared() {
+        let tcp: TableCreationParameters = serde_json::from_value(serde_json::json!({
+            "TableName": "t",
+            "AttributeDefinitions": [
+                { "AttributeName": "pk", "AttributeType": "S" },
+                { "AttributeName": "g", "AttributeType": "S" }
+            ],
+            "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
+            "BillingMode": "PROVISIONED",
+            "ProvisionedThroughput": { "ReadCapacityUnits": 5, "WriteCapacityUnits": 5 },
+            "GlobalSecondaryIndexes": [{
+                "IndexName": "gsi",
+                "KeySchema": [{ "AttributeName": "g", "KeyType": "HASH" }],
+                "Projection": { "ProjectionType": "ALL" },
+                "ProvisionedThroughput": { "ReadCapacityUnits": 5, "WriteCapacityUnits": 5 },
+                "WarmThroughput": { "ReadUnitsPerSecond": -7, "WriteUnitsPerSecond": 0 }
+            }]
+        }))
+        .expect("parameters");
+        let input = create_table_input_from_params(&tcp);
+        assert_eq!(input.warm_throughput, None);
+        let gsis = input.global_secondary_indexes.expect("the index is kept");
+        assert_eq!(gsis.len(), 1);
+        assert_eq!(gsis[0].index_name, "gsi");
+        assert_eq!(gsis[0].warm_throughput, None);
+        assert!(gsis[0].provisioned_throughput.is_some());
     }
 }

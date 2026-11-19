@@ -3,7 +3,8 @@
 
 """Concurrent TransactWriteItems that read items that do not exist.
 
-A ConditionCheck or a Delete on a missing item reads that the item is absent.
+A ConditionCheck, a Delete, or an Update that only removes, on a missing item,
+reads that the item is absent.
 Amazon DynamoDB keeps that read valid until the transaction commits: a
 concurrent transaction that creates the item conflicts with it. So when each
 of two transactions reads an item the other one creates, they never both
@@ -129,6 +130,18 @@ def _update_absent(table: str, pk: str) -> dict:
             "UpdateExpression": "SET o = :o",
             "ConditionExpression": NOT_EXISTS,
             "ExpressionAttributeValues": {":o": {"S": pk}},
+        }
+    }
+
+
+def _remove_absent(table: str, pk: str) -> dict:
+    """An update whose actions only remove, so on a missing item it writes nothing."""
+    return {
+        "Update": {
+            "TableName": table,
+            "Key": _key(pk),
+            "UpdateExpression": "REMOVE a",
+            "ConditionExpression": NOT_EXISTS,
         }
     }
 
@@ -292,6 +305,27 @@ def test_conditional_updates_of_missing_items_serialize(
         lambda x, y: (
             [_update_absent(table, x), _put(table, y)],
             [_update_absent(table, y), _put(table, x)],
+        ),
+    )
+    skewed = _both_committed(rounds)
+    assert not skewed, f"{len(skewed)} of {ROUNDS} rounds committed both: {skewed[0]}"
+
+
+@XFAIL_UNTIL_MONGODB_FIX
+def test_removal_only_updates_of_missing_items_do_not_write_skew(
+    dynamodb_client, raw_client, table
+):
+    """[remove from y if absent, put x] vs [remove from x if absent, put y]: the
+    update writes nothing but reads that its item is absent, so one at most
+    commits. Measured on Amazon DynamoDB on 2026-10-24: no round of 40 committed
+    both."""
+    rounds = _run_rounds(
+        dynamodb_client,
+        raw_client,
+        table,
+        lambda x, y: (
+            [_remove_absent(table, y), _put(table, x)],
+            [_remove_absent(table, x), _put(table, y)],
         ),
     )
     skewed = _both_committed(rounds)

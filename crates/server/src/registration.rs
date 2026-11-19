@@ -9,7 +9,11 @@
 //! `ServiceUnavailable` (HTTP 503), which the AWS SDKs retry, and `/health`
 //! answers the same. It also stops its background workers and the tasks
 //! they started: their token fires, and the ones still running after 5 s are
-//! aborted. What requests started goes on until it ends or the process
+//! aborted; and it cancels the store-backed backup jobs running then, each
+//! of which fails its row with reason `shutdown` and deletes its objects,
+//! since a job's heartbeats and status writes would otherwise go on beside
+//! the migration (the jobs started under a new registration run on a fresh
+//! token). What requests started goes on until it ends or the process
 //! exits: the requests already running, and the work they left running in
 //! the background, which is a `RestoreTableFromBackup`'s item copy on every
 //! backend, an `UpdateTimeToLive` backfill on Cassandra and PostgreSQL, and
