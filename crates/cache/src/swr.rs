@@ -10,7 +10,7 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 use futures::future::BoxFuture;
 use moka::future::Cache as MokaCache;
