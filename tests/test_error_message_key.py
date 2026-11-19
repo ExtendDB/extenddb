@@ -5,9 +5,13 @@
 
 Amazon DynamoDB names it ``Message`` on TransactionCanceledException and
 IdempotentParameterMismatchException, whose modeled member is ``Message``,
-and ``message`` on the other errors (raw bodies measured in us-east-1 on
-2026-10-29 and 2026-11-03). botocore reads either key, so these tests read
-the raw body from botocore's ``before-parse`` event before it normalizes it.
+and ``message`` on ConditionalCheckFailedException and ValidationException
+(raw bodies measured in us-east-1 on 2026-10-29, 2026-11-03 and 2026-11-19).
+It also sends ``Message`` on TransactionInProgressException,
+AccessDeniedException and SerializationException. REQ-ERR-002 in
+docs/design/01-requirements.md lists the errors measured. botocore reads
+either key, so these tests read the raw body from botocore's ``before-parse``
+event before it normalizes it.
 
 Dual-target against Amazon DynamoDB and extenddb.
 """
