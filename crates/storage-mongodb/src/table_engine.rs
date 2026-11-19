@@ -18,8 +18,9 @@ use extenddb_core::types::{
 use extenddb_storage::TableEngine;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{
-    effective_attribute_definitions, enters_updating, index_arn, merge_attribute_definitions,
-    reported_status, sk_info, stream_arn, table_arn,
+    TableThroughputRecord, effective_attribute_definitions, enters_updating, index_arn,
+    merge_attribute_definitions, reported_status, sk_info, stream_arn, table_arn,
+    table_throughput_description,
 };
 
 use crate::MongoEngine;
@@ -865,7 +866,8 @@ impl MongoEngine {
         // write is refused there. The index inserts, the index collection
         // creation and the stream shard creation are not conditioned on the
         // table's status; only this first check guards them.
-        self.require_active_table(&tables_coll, &table_filter, &input.table_name)
+        let table_doc = self
+            .require_active_table(&tables_coll, &table_filter, &input.table_name)
             .await?;
 
         // Reject ProvisionedThroughput when the effective billing mode is
@@ -917,8 +919,30 @@ impl MongoEngine {
             }
         }
 
+        // The end of the UPDATING window this request opens, written to
+        // `status_transition_at` below.
+        let updating_until = if enters_updating(&input) {
+            let delay_secs = self.control_plane_delay_seconds().await;
+            (delay_secs > 0.0).then(|| {
+                bson::DateTime::from_millis(
+                    bson::DateTime::now().timestamp_millis() + (delay_secs * 1000.0) as i64,
+                )
+            })
+        } else {
+            None
+        };
+
         if let Some(pt) = &input.provisioned_throughput {
-            let pt_bson = bson::to_bson(pt).map_err(|e| StorageError::Internal(e.to_string()))?;
+            let record = TableThroughputRecord::for_update(
+                table_doc
+                    .get("provisioned_throughput")
+                    .and_then(|b| bson::from_bson(b.clone()).ok()),
+                table_doc.get_str("billing_mode").ok() != Some("PAY_PER_REQUEST"),
+                pt,
+                updating_until.map(crate::backup_catalog::datetime_epoch_secs),
+            );
+            let pt_bson =
+                bson::to_bson(&record).map_err(|e| StorageError::Internal(e.to_string()))?;
             update_doc.insert("provisioned_throughput", pt_bson);
         }
 
@@ -968,12 +992,8 @@ impl MongoEngine {
             }
         }
 
-        if enters_updating(&input) {
-            let delay_secs = self.control_plane_delay_seconds().await;
-            if delay_secs > 0.0 {
-                let at = bson::DateTime::now().timestamp_millis() + (delay_secs * 1000.0) as i64;
-                update_doc.insert("status_transition_at", bson::DateTime::from_millis(at));
-            }
+        if let Some(at) = updating_until {
+            update_doc.insert("status_transition_at", at);
         }
 
         if !update_doc.is_empty() {
@@ -1275,16 +1295,16 @@ impl MongoEngine {
         StorageError::TableAlreadyExists(table_name.to_owned())
     }
 
-    /// `TableNotFound` when no catalog document matches `filter`,
-    /// `TableNotActive` when one does but its `table_status` is not
-    /// `ACTIVE`. UpdateTable's guard; also used after a conditional write
-    /// matched nothing to report which of the two happened.
+    /// The table's catalog document. `TableNotFound` when no catalog document
+    /// matches `filter`, `TableNotActive` when one does but its
+    /// `table_status` is not `ACTIVE`. UpdateTable's guard; also used after a
+    /// conditional write matched nothing to report which of the two happened.
     async fn require_active_table(
         &self,
         tables_coll: &mongodb::Collection<Document>,
         filter: &Document,
         table_name: &str,
-    ) -> Result<(), StorageError> {
+    ) -> Result<Document, StorageError> {
         let table_doc = tables_coll
             .find_one(filter.clone())
             .await
@@ -1293,7 +1313,7 @@ impl MongoEngine {
         if table_doc.get_str("table_status").unwrap_or("ACTIVE") != "ACTIVE" {
             return Err(StorageError::TableNotActive(table_name.to_owned()));
         }
-        Ok(())
+        Ok(table_doc)
     }
 
     pub(crate) async fn table_key_info_impl(
@@ -1591,31 +1611,10 @@ impl MongoEngine {
             _ => BillingMode::Provisioned,
         };
 
-        let pt_desc = doc
-            .get("provisioned_throughput")
-            .and_then(|b| {
-                if b.as_null().is_some() {
-                    None
-                } else {
-                    bson::from_bson::<extenddb_core::types::ProvisionedThroughput>(b.clone()).ok()
-                }
-            })
-            .map_or(
-                ProvisionedThroughputDescription {
-                    read_capacity_units: 0,
-                    write_capacity_units: 0,
-                    number_of_decreases_today: 0,
-                    last_increase_date_time: None,
-                    last_decrease_date_time: None,
-                },
-                |pt| ProvisionedThroughputDescription {
-                    read_capacity_units: pt.read_capacity_units,
-                    write_capacity_units: pt.write_capacity_units,
-                    number_of_decreases_today: 0,
-                    last_increase_date_time: None,
-                    last_decrease_date_time: None,
-                },
-            );
+        let pt_desc = table_throughput_description(
+            doc.get("provisioned_throughput")
+                .and_then(|b| bson::from_bson(b.clone()).ok()),
+        );
 
         let billing_summary = if billing_mode == BillingMode::PayPerRequest {
             Some(BillingModeSummary {
