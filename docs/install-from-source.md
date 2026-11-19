@@ -210,7 +210,7 @@ Check the build:
 ```
 
 ```
-extenddb 0.1.15
+extenddb 1.0.0
 catalog migration 12 (postgres)
 commit ceb6a63a
 built 2026-10-24T08:37:05Z
@@ -404,7 +404,7 @@ Catalog database: extenddb_catalog
 ```
 
 ```
-extenddb 0.1.15 (catalog migration 12) starting on 127.0.0.1:18443
+extenddb 1.0.0 (catalog migration 12) starting on 127.0.0.1:18443
   storage: postgres (postgresql://extenddb:***@localhost:5432/extenddb_catalog)
 extenddb server started (pid 8644, 127.0.0.1:18443)
 ```
