@@ -145,11 +145,11 @@ fn null_value() -> Value {
 ///    one has no colon after the message. No `M` with more than one member was
 ///    measured;
 /// 5. an empty name in `ExpressionAttributeNames` (measured 2026-11-19 in
-///    either member order: `{"#a": ""}` beside `{"X": "1"}`, `{}`, `{"N": "1",
-///    "S": "x"}`, a null or `{"S": null}` answers that value's text, beside
-///    `{"S": "a", "X": "1"}`, which has no fault of its own, it answers the
-///    empty name text, and `{"#a": "", "b": "c"}` beside `{"X": "1"}` answers
-///    the invalid key text for `b`).
+///    either member order). `{"#a": ""}` beside `{"X": "1"}`, `{}`, `{"N":
+///    "1", "S": "x"}`, a null or `{"S": null}` answers that value's text.
+///    Beside `{"S": "a", "X": "1"}`, which has no fault of its own, it answers
+///    the empty name text. `{"#a": "", "b": "c"}` beside `{"X": "1"}` answers
+///    the invalid key text for `b`.
 ///
 /// When several values have a fault, the service names a value it cannot read
 /// as one type ahead of a number fault in another value. `:u` with `{"N":

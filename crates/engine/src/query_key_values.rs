@@ -107,8 +107,9 @@ const SELECT: &[&str] = &[
 /// answers the shape fault first as well. It comes after the server's
 /// cross-account refusal, so a `Query` that names a table ARN in another
 /// account answers `AccessDeniedException` without these checks, where the
-/// service makes them first (measured 2026-11-12: with such an ARN, `{"N":
-/// "bob"}` answers the numeric message and a `Limit` of 0 the `Limit` text).
+/// service makes them first for a body it can read (measured 2026-11-12: with
+/// such an ARN, `{"N": "bob"}` answers the numeric message and a `Limit` of 0
+/// the `Limit` text).
 ///
 /// # Errors
 ///
@@ -227,9 +228,9 @@ fn validate_no_parameter_mix(body: &Value) -> Result<(), DynamoDbError> {
 }
 
 /// The checks the `ExpressionAttributeNames` deserializer makes, on the raw
-/// body: an empty map, a key that is not `#` and a name, and an empty name,
-/// with the deserializer's text. A map or name of another JSON type is a shape
-/// fault, which this leaves to the shape fault check.
+/// body: an empty map, a key that is not `#` and a name, a key over 255 bytes,
+/// and an empty name, with the deserializer's text. A map or name of another
+/// JSON type is a shape fault, which this leaves to the shape fault check.
 ///
 /// # Errors
 ///

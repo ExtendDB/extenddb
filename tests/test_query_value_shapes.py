@@ -255,14 +255,16 @@ def _assert_validation(status, payload, expected):
 
 
 class TestExpressionAttributeNamesOrder:
-    """The ExpressionAttributeNames checks (an empty map, a key that is not
-    `#` and a name, an empty name) are reported after Limit,
-    ReturnConsumedCapacity and the parameter mix, and ahead of the number
-    check, a duplicate set member and Select. Beside a value the service
-    cannot read as one type, the key checks and the empty map are reported
-    ahead of the value, and an empty name after it. The answers are the same
-    in either member order (measured 2026-11-19). Each body is sent with
-    ExpressionAttributeNames ahead of the other members and after them."""
+    """With readable values, the ExpressionAttributeNames checks (an empty
+    map, a key that is not `#` and a name, a key over 255 bytes, an empty
+    name) are reported after Limit, ReturnConsumedCapacity and the parameter
+    mix, and ahead of the number check, a duplicate set member and Select.
+    Beside a value the service cannot read as one type, the key checks and
+    the empty map are reported after the Select, ReturnConsumedCapacity and
+    Limit step and the mix, and ahead of the value, and an empty name after
+    it. The answers are the same in either member order (measured
+    2026-11-19). Each body is sent with ExpressionAttributeNames ahead of the
+    other members and after them."""
 
     @pytest.mark.parametrize("names_first", [True, False], ids=["names first", "names last"])
     @pytest.mark.parametrize("row,names,values,extra,expected", NAMES, ids=[r[0] for r in NAMES])
