@@ -89,7 +89,10 @@ async fn catalog_check_prints_each_finding_and_exits_with_status_1() {
              ===\n"
         ),
     );
-    assert!(!d.relation_exists(&orphan).await, "--fix dropped the orphan");
+    assert!(
+        !d.relation_exists(&orphan).await,
+        "--fix dropped the orphan"
+    );
 
     // The report while a session holds a lock on a catalog table that the
     // check reads, for longer than a statement takes to count as slow.

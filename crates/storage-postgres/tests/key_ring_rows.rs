@@ -362,10 +362,7 @@ async fn set_data_connection_writes_the_row_under_the_ring() {
                 .check_storage_relations(&KeySource::Kek(Zeroizing::new(KEK).into()))
                 .await
                 .unwrap_or_else(|e| panic!("{name}: catalog-check with the KEK: {e}"));
-            match store
-                .check_storage_relations(&KeySource::CatalogKey)
-                .await
-            {
+            match store.check_storage_relations(&KeySource::CatalogKey).await {
                 Err(DiagError::NotConfigured(msg)) => assert!(
                     msg.starts_with(
                         "the catalog has a key ring, so its data_database_connection_string \

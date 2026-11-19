@@ -247,7 +247,11 @@ impl Deployment {
 
     /// A second diagnostics store whose catalog sessions start with
     /// `setting` set to `value`, as a database or role default would set it.
-    pub(crate) async fn diagnostics_with(&self, setting: &str, value: &str) -> PostgresCatalogStore {
+    pub(crate) async fn diagnostics_with(
+        &self,
+        setting: &str,
+        value: &str,
+    ) -> PostgresCatalogStore {
         // The server splits the startup options at spaces; a backslash keeps
         // one inside the value.
         let options = self

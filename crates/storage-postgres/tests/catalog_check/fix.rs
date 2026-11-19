@@ -422,7 +422,10 @@ async fn an_index_write_open_past_the_budget_stops_the_check_and_the_drop() {
             other => panic!("{call}: {other:?}"),
         }
     }
-    assert!(checked_in >= budget, "the check gave up after {checked_in:?}");
+    assert!(
+        checked_in >= budget,
+        "the check gave up after {checked_in:?}"
+    );
     assert!(d.relation_exists(&orphan).await, "the orphan was kept");
     writer.close().await.expect("end the writer");
 }
