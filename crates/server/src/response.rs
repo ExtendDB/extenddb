@@ -10,7 +10,7 @@ use serde_json::Value;
 
 #[cfg(test)]
 #[path = "response_tests.rs"]
-mod tests;
+mod message_key_tests;
 
 /// Hardcoded fallback body for when response serialization itself fails.
 const SERIALIZATION_FAILURE_BODY: &[u8] =
