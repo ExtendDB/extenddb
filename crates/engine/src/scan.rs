@@ -68,8 +68,16 @@ pub async fn handle_scan(
     )?;
     let input: ScanInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
+    // The Limit, Segment and TotalSegments ranges come before the expression
+    // checks and the table lookup (measured 2026-11-19: `Limit: 0` or
+    // `TotalSegments: 0` beside a filter syntax error, an undefined value, an
+    // operand of the wrong type, an operator count over the cap, an unused
+    // value or a missing table answers the range). The Segment pairing and
+    // order checks come after the operator count and stay below.
+    validate_scan_ranges(&input)?;
+
     // Validate Filter/Projection expressions before the existence
-    // check; index resolution, Segment/Limit/Select and key checks stay after.
+    // check; index resolution, Segment pairing, Select and key checks stay after.
 
     // --- Legacy vs expression mutual exclusivity checks ---
     let has_fe = input.filter_expression.is_some();
@@ -309,7 +317,9 @@ pub async fn handle_scan(
         )?;
     }
 
-    // Validate Segment/TotalSegments — DynamoDB returns different messages per direction
+    // The Segment and TotalSegments pairing and order, after the operator
+    // count (measured 2026-11-19). The service reports a missing partner with
+    // a message per direction. The ranges are checked in validate_scan_ranges.
     match (input.segment, input.total_segments) {
         (Some(_), None) => {
             return Err(DynamoDbError::ValidationException(
@@ -323,44 +333,13 @@ pub async fn handle_scan(
                     .to_owned(),
             ));
         }
-        (Some(seg), Some(total)) => {
-            if total < 1 {
-                return Err(DynamoDbError::ValidationException(
-                    "The parameter TotalSegments should be greater than or equal to 1".to_owned(),
-                ));
-            }
-            if total > 1_000_000 {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "1 validation error detected: Value '{total}' at 'totalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000"
-                )));
-            }
-            if seg < 0 {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value greater than or equal to 0"
-                )));
-            }
-            if seg > 999_999 {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value less than or equal to 999999"
-                )));
-            }
-            if seg >= total {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "The Segment parameter is zero-based and must be less than parameter TotalSegments: \
-                     Segment: {seg} is not less than TotalSegments: {total}"
-                )));
-            }
+        (Some(seg), Some(total)) if seg >= total => {
+            return Err(DynamoDbError::ValidationException(format!(
+                "The Segment parameter is zero-based and must be less than parameter TotalSegments: \
+                 Segment: {seg} is not less than TotalSegments: {total}"
+            )));
         }
-        (None, None) => {}
-    }
-
-    // Validate Limit >= 1
-    if let Some(limit) = input.limit
-        && limit < 1
-    {
-        return Err(DynamoDbError::ValidationException(format!(
-            "1 validation error detected: Value '{limit}' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
-        )));
+        _ => {}
     }
 
     // For index scans, build a key_info that reflects the index's key schema.
@@ -528,4 +507,40 @@ pub async fn handle_scan(
             ..Default::default()
         },
     })
+}
+
+/// Refuse a Limit, Segment or TotalSegments value outside its range. The
+/// Segment and TotalSegments ranges are checked when both are present; a
+/// missing partner is reported by the pairing check in `handle_scan`.
+fn validate_scan_ranges(input: &ScanInput) -> Result<(), DynamoDbError> {
+    if let (Some(seg), Some(total)) = (input.segment, input.total_segments) {
+        if total < 1 {
+            return Err(DynamoDbError::ValidationException(
+                "The parameter TotalSegments should be greater than or equal to 1".to_owned(),
+            ));
+        }
+        if total > 1_000_000 {
+            return Err(DynamoDbError::ValidationException(format!(
+                "1 validation error detected: Value '{total}' at 'totalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000"
+            )));
+        }
+        if seg < 0 {
+            return Err(DynamoDbError::ValidationException(format!(
+                "1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value greater than or equal to 0"
+            )));
+        }
+        if seg > 999_999 {
+            return Err(DynamoDbError::ValidationException(format!(
+                "1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value less than or equal to 999999"
+            )));
+        }
+    }
+    if let Some(limit) = input.limit
+        && limit < 1
+    {
+        return Err(DynamoDbError::ValidationException(format!(
+            "1 validation error detected: Value '{limit}' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
+        )));
+    }
+    Ok(())
 }
