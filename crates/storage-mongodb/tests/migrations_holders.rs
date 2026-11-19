@@ -133,12 +133,16 @@ async fn the_status_read_under_the_lock_keeps_it_through_a_long_scan() {
     let d = Deployment::new(&uri, "lockedstatus").await;
     fixture::load(&d, &fixture::read("0.1.14")).await;
     let account = first_account(&d).await;
-    add_users(&d, &account, "status", 1000, &allow_get_item()).await;
+    // Enough users that the status read outlasts two idle limits on a fast
+    // runner: at 1000 it took 2.7 to 4.3 s locally.
+    add_users(&d, &account, "status", 2500, &allow_get_item()).await;
     let timing = Timing {
         lease: Duration::from_secs(20),
         renew_every: Duration::from_millis(100),
         margin: Duration::from_secs(5),
-        idle_limit: Duration::from_millis(300),
+        // Room for a loaded runner between two completed requests: 300 ms
+        // without one lost the lock on CI (#989).
+        idle_limit: Duration::from_secs(2),
         ..Timing::PRODUCTION
     };
     let (held, target) = lock(&d.target, false, Duration::from_secs(10), timing)
