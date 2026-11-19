@@ -73,7 +73,7 @@ for cmd in $COMMANDS; do
     HELP_FLAGS=$(echo "$HELP" | grep -oP '\-\-[a-z][a-z0-9-]*' | sort -u)
     for flag in $HELP_FLAGS; do
         if [ "$flag" = "--help" ] || [ "$flag" = "--version" ]; then continue; fi
-        grep -rq "$flag" docs/manuals/ docs/getting-started.md 2>/dev/null; RC=$?
+        grep -rq "$flag" docs/manuals/ docs/install-from-source.md docs/first-requests.md 2>/dev/null; RC=$?
         assert_ok $RC "flag $flag for '$cmd' documented"
     done
 done
@@ -87,7 +87,7 @@ MANAGE_CMDS=$($EXTENDDB manage --help 2>&1 | awk '/Commands:/{found=1;next} /Opt
 
 for subcmd in $MANAGE_CMDS; do
     if [ "$subcmd" = "help" ]; then continue; fi
-    grep -rq "$subcmd" docs/manuals/ docs/getting-started.md 2>/dev/null; RC=$?
+    grep -rq "$subcmd" docs/manuals/ docs/install-from-source.md 2>/dev/null; RC=$?
     assert_ok $RC "manage subcommand '$subcmd' documented"
 done
 
@@ -100,7 +100,7 @@ if [ -f extenddb.sample.toml ]; then
     for key in $SAMPLE_KEYS; do
         # Skip very generic keys
         if [ ${#key} -lt 3 ]; then continue; fi
-        grep -rq "$key" docs/manuals/ docs/getting-started.md 2>/dev/null; RC=$?
+        grep -rq "$key" docs/manuals/ docs/install-from-source.md 2>/dev/null; RC=$?
         assert_ok $RC "config key '$key' documented"
     done
 else
@@ -123,8 +123,8 @@ SETTINGS=$(echo "$SETTINGS" | tr ' ' '\n' | sort -u | grep -v '^$')
 
 for setting in $SETTINGS; do
     if [ ${#setting} -lt 3 ]; then continue; fi
-    grep -q "$setting" docs/getting-started.md 2>/dev/null; RC=$?
-    assert_ok $RC "runtime setting '$setting' in getting-started.md"
+    grep -q "$setting" docs/manuals/05-admin-guide.md 2>/dev/null; RC=$?
+    assert_ok $RC "runtime setting '$setting' in the admin guide"
 done
 
 echo ""
@@ -150,7 +150,7 @@ echo "--- Check 5: Manage Subcommand Completeness ---"
 echo ""
 
 ACTUAL=$($EXTENDDB manage --help 2>&1 | awk '/Commands:/{found=1;next} /Options:/{found=0} found && NF{print $1}' | grep -v '^$' | sort)
-DOCUMENTED=$(grep -oP 'manage\s+[a-z][-a-z]+' docs/manuals/05-admin-guide.md docs/getting-started.md 2>/dev/null | awk '{print $2}' | sort -u)
+DOCUMENTED=$(grep -oP 'manage\s+[a-z][-a-z]+' docs/manuals/05-admin-guide.md 2>/dev/null | awk '{print $2}' | sort -u)
 
 # Subcommands in binary but not in docs
 while IFS= read -r cmd; do

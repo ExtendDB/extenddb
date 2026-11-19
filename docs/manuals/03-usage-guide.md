@@ -112,7 +112,7 @@ aws dynamodb create-table \
     }]'
 ```
 
-Tables transition through `CREATING` → `ACTIVE` status. The transition delay is configurable via the `control_plane_delay_seconds` runtime setting (default: 5 seconds). Poll with DescribeTable until `TableStatus` is `ACTIVE` before performing operations on the table.
+Tables transition through `CREATING` → `ACTIVE` status. The transition delay is configurable via the `control_plane_delay_seconds` runtime setting (default: 0.25 seconds). Poll with DescribeTable until `TableStatus` is `ACTIVE` before performing operations on the table.
 
 ### DeleteTable
 
@@ -375,7 +375,7 @@ aws dynamodb create-table \
 
 Stream view types: `KEYS_ONLY`, `NEW_IMAGE`, `OLD_IMAGE`, `NEW_AND_OLD_IMAGES`.
 
-**Important: SDK users need a separate `dynamodbstreams` client.** DynamoDB and DynamoDB Streams are separate services in every AWS SDK. Both clients must point at the same ExtendDB endpoint URL. See the [full walkthrough](../getting-started.md) for Python examples and the polling pattern.
+**Important: SDK users need a separate `dynamodbstreams` client.** DynamoDB and DynamoDB Streams are separate services in every AWS SDK. Both clients must point at the same ExtendDB endpoint URL. See [First requests](../first-requests.md#dynamodb-streams) for Python examples and the polling pattern.
 
 Read stream records:
 

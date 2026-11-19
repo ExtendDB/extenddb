@@ -330,8 +330,11 @@ Managed via `extenddb settings set`. Changes take effect within 30 seconds witho
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `log_level` | `info` | Log level: trace, debug, info, warn, error |
+| `sqlx_log_level` | `warn` | Log level for sqlx query traces, independent of `log_level`: trace, debug, info, warn, error |
 | `control_plane_delay_seconds` | `0.25` | Delay for table status transitions, in seconds (0 = instant). PostgreSQL and SQLite write 0.25 into the catalog when it is created; MongoDB and Cassandra use 0.25 when the setting is absent. On PostgreSQL and SQLite a value below 1 makes DeleteTable remove the table in the request; on PostgreSQL, if a session holds a lock on the table's data (a reader, an open write transaction, an index build), DeleteTable returns `DELETING` instead (after at most about a second), the drop finishes in the background within about a second of that session's release, and a CreateTable of the same name is refused until then. |
 | `allow_credential_import` | `false` | Whether `import-access-key` is allowed. Only `true` enables it |
+| `index_propagation_delay_ms` | `10` | Delay before an asynchronous GSI update is applied (0 = synchronous). The pre-rename key `gsi_propagation_delay_ms` is still accepted and writes to the same row |
+| `throttling_enabled` | `false` | Enforce provisioned throughput limits with a token bucket per table and partition |
 | `vector_backfill_batch_delay_ms` | `0` | **Test-oriented.** Milliseconds to pause between batches while a vector index backfills. Zero in production. A test sets it so a write is guaranteed to land while the index is still building. The pause is outside the batch transaction, so writes are still accepted throughout, but it does extend the per-table propagation hold: no index on that table advances while the build runs, GSIs included, and the accepted range goes up to 60 s per batch. |
 | `vector_allocation_phase_delay_ms` | `0` | **Test-oriented.** Milliseconds to hold a new vector index in the resource-allocation phase (`CREATING` with `Backfilling: false`) before the scan starts. Zero in production. Without it the phase lasts only from the `UpdateTable` transaction, which inserts the row as `CREATING` with `Backfilling: false`, until the detached build task flips the flag, which is a window no client can time reliably rather than one that cannot exist. |
 
@@ -360,7 +363,147 @@ history, CI logs and pasted transcripts. `set` refuses `encryption_key` and
 `encryption_key_ring`; the [Encryption Key](#encryption-key) commands are the
 one way to change them.
 
+#### sqlx log separation
+
+sqlx query traces are suppressed by default (level `warn`) so they don't flood the main log stream. The sqlx log level is independently configurable via the `sqlx_log_level` runtime setting:
+
+```bash
+# Enable sqlx debug logging for query troubleshooting
+./target/release/extenddb settings --config extenddb.toml set sqlx_log_level debug
+
+# Restore default (suppress most sqlx output)
+./target/release/extenddb settings --config extenddb.toml set sqlx_log_level warn
+```
+
+When sqlx logging is enabled, messages appear in the `extenddb` syslog with `sqlx::query` as the target. Filter them:
+
+```bash
+# Exclude sqlx messages
+journalctl -t extenddb | grep -v sqlx
+
+# Show only sqlx messages
+journalctl -t extenddb | grep sqlx
+```
+
+#### Control plane delay
+
+By default, control plane operations (CreateTable, DeleteTable) emulate the service's asynchronous behavior: tables transition through CREATING to ACTIVE and DELETING to removed states over a configurable delay (default: 0.25 seconds). Adjust with:
+
+```bash
+# Set to 0 for instant transitions (useful for fast test cycles)
+./target/release/extenddb settings --config extenddb.toml set \
+    control_plane_delay_seconds 0
+
+# Set to 10 seconds for more realistic behavior
+./target/release/extenddb settings --config extenddb.toml set \
+    control_plane_delay_seconds 10
+```
+
+#### Warm throughput
+
+`WarmThroughput` on `CreateTable`, `UpdateTable` and `GlobalSecondaryIndexUpdates` is stored and reported on `DescribeTable` with the shape, defaults (12000 read and 4000 write units on an on-demand table, the provisioned units on a provisioned one) and validation of Amazon DynamoDB, and `Status` reads `UPDATING` for the control plane delay after a change, then `ACTIVE`. Nothing acts on the values: there is no pre-warming and no scaling at the database level, and they have no effect on throughput, throttling or storage.
+
+#### GSI propagation delay
+
+GSI updates are applied asynchronously with a configurable delay, simulating the DynamoDB service's eventually consistent GSI behavior. The system-wide default is 10ms. Each GSI can override this with a per-index `propagation_delay_ms` stored in the catalog.
+
+```bash
+# Set system-wide default to 0 for synchronous GSI updates (fast tests)
+./target/release/extenddb settings --config extenddb.toml set \
+    index_propagation_delay_ms 0
+
+# Set to 50ms for more realistic eventual consistency
+./target/release/extenddb settings --config extenddb.toml set \
+    index_propagation_delay_ms 50
+```
+
+#### Throttling
+
+ExtendDB enforces provisioned throughput limits using a token bucket per table and partition, matching DynamoDB's burst and refill behavior. Throttling is disabled by default. The `throttling_enabled` key in the `[server]` section of `extenddb.toml` sets the value the server starts with; once the runtime setting has been written it takes precedence.
+
+```bash
+# Enable throttling (production-like behavior)
+./target/release/extenddb settings --config extenddb.toml set \
+    throttling_enabled true
+
+# Disable throttling (useful for bulk loading)
+./target/release/extenddb settings --config extenddb.toml set \
+    throttling_enabled false
+```
+
+#### TTL deletion
+
+Expired items are removed by a TTL sweeper that runs every 60 seconds. Each sweep finds expired items through the table's TTL index and deletes up to 100 per table on PostgreSQL, MongoDB and SQLite (1,000 on Cassandra), so a table with a small backlog is cleared within about a minute of expiry and a larger backlog drains at that rate per table per minute. The interval is fixed: there is no `ttl_deletion_target_seconds` runtime setting, and `extenddb settings set` rejects that key.
+
 ## IAM Management
+
+The management API is available at `/management/*` on the running ExtendDB server. The `extenddb manage` CLI subcommand is a thin client that calls these endpoints.
+
+Admin commands require admin credentials (the username and password printed during `extenddb init`). IAM user self-service commands accept `account_id/user_name` as the `--user` value.
+
+**Note:** The `--password` flag is visible in process listings (`ps aux`) and shell history. For sensitive environments, leave out `--password` and set the `EXTENDDB_PASSWORD` environment variable instead, with `read -rs EXTENDDB_PASSWORD && export EXTENDDB_PASSWORD`, which keeps the password out of shell history. `extenddb manage` reads the password from `EXTENDDB_PASSWORD`, and it prints a warning on stderr when it gets `--password`. `--admin-password`, `--new-password`, `--user-password` and `--secret-access-key` have no environment variable.
+
+### Using a custom endpoint
+
+By default, `extenddb manage` reads the server address from `extenddb.toml` (`--config` selects another file). To target a different server:
+
+```bash
+./target/release/extenddb manage --user admin --password <pw> \
+    --endpoint 127.0.0.1:9000 list-admins
+```
+
+### Command index
+
+Every `extenddb manage` subcommand, grouped as in the sections below.
+
+| Command | Purpose |
+|---------|---------|
+| `manage create-admin` | Create a new admin user |
+| `manage list-admins` | List admin users |
+| `manage delete-admin` | Delete an admin user |
+| `manage change-admin-password` | Change an admin user's password |
+| `manage create-account` | Create a new account |
+| `manage list-accounts` | List accounts |
+| `manage delete-account` | Delete an account |
+| `manage create-user` | Create an IAM user |
+| `manage list-users` | List IAM users in an account |
+| `manage delete-user` | Delete an IAM user |
+| `manage change-user-password` | Change an IAM user's password (self-service or admin) |
+| `manage create-access-key` | Create an access key (self-service or admin) |
+| `manage list-access-keys` | List access keys (self-service or admin) |
+| `manage delete-access-key` | Delete an access key (self-service or admin) |
+| `manage import-access-key` | Import an existing access key |
+| `manage create-group` | Create an IAM group |
+| `manage list-groups` | List IAM groups in an account |
+| `manage delete-group` | Delete an IAM group |
+| `manage add-group-member` | Add a user to a group |
+| `manage remove-group-member` | Remove a user from a group |
+| `manage create-role` | Create an IAM role |
+| `manage list-roles` | List IAM roles in an account |
+| `manage delete-role` | Delete an IAM role |
+| `manage assume-role` | Assume an IAM role and get temporary credentials |
+| `manage put-user-policy` | Put a user policy (creates or replaces) |
+| `manage list-user-policies` | List user policies |
+| `manage delete-user-policy` | Delete a user policy |
+| `manage put-group-policy` | Put a group policy (creates or replaces) |
+| `manage list-group-policies` | List group policies |
+| `manage delete-group-policy` | Delete a group policy |
+| `manage put-role-policy` | Put a role policy (creates or replaces) |
+| `manage list-role-policies` | List role policies |
+| `manage delete-role-policy` | Delete a role policy |
+| `manage set-user-boundary` | Set a user permissions boundary |
+| `manage get-user-boundary` | Get a user permissions boundary |
+| `manage delete-user-boundary` | Delete a user permissions boundary |
+| `manage set-role-boundary` | Set a role permissions boundary |
+| `manage get-role-boundary` | Get a role permissions boundary |
+| `manage delete-role-boundary` | Delete a role permissions boundary |
+| `manage tag-user` | Tag an IAM user |
+| `manage untag-user` | Untag an IAM user |
+| `manage list-user-tags` | List tags for an IAM user |
+| `manage tag-role` | Tag an IAM role |
+| `manage untag-role` | Untag an IAM role |
+| `manage list-role-tags` | List tags for an IAM role |
+| `manage cache` | Cache management (admin-only break-glass invalidation) |
 
 ### Admin Users
 
@@ -404,6 +547,8 @@ Account IDs must be 12-digit numeric strings (matching AWS format). If `--accoun
     delete-account --account-id 123456789012
 ```
 
+Deleting an account also deletes its users, groups and roles with everything they hold, so their access keys and sessions stop working and its users cannot log in. An account created later with the same ID starts empty.
+
 ### IAM Users
 
 ```bash
@@ -419,13 +564,28 @@ Account IDs must be 12-digit numeric strings (matching AWS format). If `--accoun
 # Delete (also removes its keys, memberships, tags, policies and boundary)
 ./target/release/extenddb manage --user admin --password <pw> \
     delete-user --account-id 123456789012 --user-name alice
+
+# Change password (self-service or admin)
+./target/release/extenddb manage --user 123456789012/alice --password secret \
+    change-user-password --account-id 123456789012 \
+    --user-name alice --new-password newsecret
 ```
+
+Deleting a user also removes its access keys, group memberships, tags, inline policies, permissions boundary and failed login attempts. A user created later with the same name starts with only the default `SelfServicePolicy`, and is not refused for the failed logins of the deleted one.
+
+If `--user-password` is provided, the user can authenticate to the management API for self-service operations. A default self-service policy is automatically attached, allowing the user to create and delete their own access keys and change their own password.
 
 ### Access Keys
 
+IAM users create their own access keys by authenticating with `account_id/user_name:password`. When authenticating as an IAM user, `--account-id` and `--user-name` are inferred automatically. The secret key is shown once and cannot be retrieved later.
+
 ```bash
-# Create (self-service or admin)
+# Create (self-service: account_id and user_name inferred from --user)
 ./target/release/extenddb manage --user 123456789012/alice --password secret \
+    create-access-key
+
+# Create (admin, on behalf of any user)
+./target/release/extenddb manage --user admin --password <pw> \
     create-access-key --account-id 123456789012 --user-name alice
 
 # List
@@ -446,7 +606,12 @@ Account IDs must be 12-digit numeric strings (matching AWS format). If `--accoun
     --secret-access-key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY --yes
 ```
 
-Access key prefixes: `AKIAEXTENDDB` (long-lived), `ASIAEXTENDDB` (temporary/AssumeRole).
+Generated access keys carry ExtendDB-specific prefixes that distinguish them from AWS credentials:
+- Long-lived keys: `AKIAEXTENDDB` + 8 random chars (20 total)
+- Temporary credentials (AssumeRole): `ASIAEXTENDDB` + 8 random chars (20 total)
+- Secret keys: `extenddb` + 32 random chars (40 total)
+
+`import-access-key` imports AWS credentials (or any AKIA* key) into ExtendDB. This enables the "change only the endpoint URL" workflow: the same credentials work against ExtendDB and the DynamoDB service. Both `--secret-access-key` and `--yes` are required. `--secret-access-key` and `--password` are visible in `ps` output and shell history; for sensitive environments, set the password with `read -rs EXTENDDB_PASSWORD && export EXTENDDB_PASSWORD` and leave out `--password`. `--secret-access-key` has no environment variable. Credential import is gated by the `allow_credential_import` runtime setting (default: `false`; see [Runtime Settings](#runtime-settings)): enable it before the first import, as above, and set it back to `false` to refuse further imports. Keys already imported keep working. Credential import is not audit-logged (see [Audit Logging](#audit-logging)).
 
 ### Groups
 
@@ -465,10 +630,16 @@ Access key prefixes: `AKIAEXTENDDB` (long-lived), `ASIAEXTENDDB` (temporary/Assu
     remove-group-member --account-id 123456789012 \
     --group-name developers --user-name alice
 
+# List
+./target/release/extenddb manage --user admin --password <pw> \
+    list-groups --account-id 123456789012
+
 # Delete (also removes its policies and memberships)
 ./target/release/extenddb manage --user admin --password <pw> \
     delete-group --account-id 123456789012 --group-name developers
 ```
+
+A group created later with the same name starts with no policies and no members.
 
 ### Roles
 
@@ -487,16 +658,41 @@ Access key prefixes: `AKIAEXTENDDB` (long-lived), `ASIAEXTENDDB` (temporary/Assu
       }]
     }'
 
+# List
+./target/release/extenddb manage --user admin --password <pw> \
+    list-roles --account-id 123456789012
+
 # Assume role (generates temporary ASIA* credentials)
 ./target/release/extenddb manage --user admin --password <pw> \
     assume-role --account-id 123456789012 --role-name data-reader \
     --caller-arn arn:aws:iam::123456789012:user/alice \
     --session-name test-session
 
+# Assume role with optional session tags, session policy and duration
+# (--duration-seconds defaults to 3600)
+./target/release/extenddb manage --user admin --password <pw> \
+    assume-role --account-id 123456789012 --role-name data-reader \
+    --caller-arn arn:aws:iam::123456789012:user/alice \
+    --session-name test-session \
+    --session-tags '{"Project":"Alpha"}' \
+    --session-policy '{
+      "Version": "2012-10-17",
+      "Statement": [{
+        "Effect": "Allow",
+        "Action": "dynamodb:GetItem",
+        "Resource": "*"
+      }]
+    }' \
+    --duration-seconds 1800
+
 # Delete (also removes its policies, boundary, tags and sessions)
 ./target/release/extenddb manage --user admin --password <pw> \
     delete-role --account-id 123456789012 --role-name data-reader
 ```
+
+The trust policy must allow the caller ARN for `assume-role` to succeed.
+
+Deleting a role also removes its inline policies, permissions boundary, tags and sessions: credentials issued by `assume-role` stop working. A role created later with the same name starts with none of them.
 
 #### What a trust-policy Deny matches
 
@@ -603,7 +799,28 @@ or `IAM role not found`), as IAM answers `NoSuchEntity`.
         "Resource": "*"
       }]
     }'
+
+# List policies
+./target/release/extenddb manage --user admin --password <pw> \
+    list-user-policies --account-id 123456789012 --user-name alice
+./target/release/extenddb manage --user admin --password <pw> \
+    list-group-policies --account-id 123456789012 --group-name developers
+./target/release/extenddb manage --user admin --password <pw> \
+    list-role-policies --account-id 123456789012 --role-name data-reader
+
+# Delete policies
+./target/release/extenddb manage --user admin --password <pw> \
+    delete-user-policy --account-id 123456789012 \
+    --user-name alice --policy-name ReadOnly
+./target/release/extenddb manage --user admin --password <pw> \
+    delete-group-policy --account-id 123456789012 \
+    --group-name developers --policy-name FullAccess
+./target/release/extenddb manage --user admin --password <pw> \
+    delete-role-policy --account-id 123456789012 \
+    --role-name data-reader --policy-name ReadOnly
 ```
+
+The policy document must be valid JSON with `Version` and `Statement` fields. `put-*-policy` creates or replaces the named policy.
 
 #### Condition keys in identity policies
 
@@ -935,6 +1152,27 @@ deny `dynamodb:PutItem` on it instead.
 # Delete boundary
 ./target/release/extenddb manage --user admin --password <pw> \
     delete-user-boundary --account-id 123456789012 --user-name alice
+
+# Set role boundary
+./target/release/extenddb manage --user admin --password <pw> \
+    set-role-boundary --account-id 123456789012 \
+    --role-name data-reader \
+    --policy-document '{
+      "Version": "2012-10-17",
+      "Statement": [{
+        "Effect": "Allow",
+        "Action": "dynamodb:GetItem",
+        "Resource": "*"
+      }]
+    }'
+
+# Get role boundary
+./target/release/extenddb manage --user admin --password <pw> \
+    get-role-boundary --account-id 123456789012 --role-name data-reader
+
+# Delete role boundary
+./target/release/extenddb manage --user admin --password <pw> \
+    delete-role-boundary --account-id 123456789012 --role-name data-reader
 ```
 
 ### Tags
@@ -952,6 +1190,37 @@ deny `dynamodb:PutItem` on it instead.
 # Untag
 ./target/release/extenddb manage --user admin --password <pw> \
     untag-user --account-id 123456789012 --user-name alice --tag-keys Department
+
+# Tag a role
+./target/release/extenddb manage --user admin --password <pw> \
+    tag-role --account-id 123456789012 --role-name data-reader \
+    --tags '[{"key":"Team","value":"Backend"}]'
+
+# List role tags
+./target/release/extenddb manage --user admin --password <pw> \
+    list-role-tags --account-id 123456789012 --role-name data-reader
+
+# Untag a role
+./target/release/extenddb manage --user admin --password <pw> \
+    untag-role --account-id 123456789012 --role-name data-reader --tag-keys Team
+```
+
+### Cache Invalidation
+
+`manage cache invalidate` is an admin-only break-glass path that evicts entries from the in-memory authorization caches described in the `[auth.cache]` configuration section above. Use it when a change made outside the management API (a direct catalog write, or a mutation on another instance) must take effect before `ttl_seconds` elapses. Scopes: `all` (requires `--yes`), `account`, `credential`, `user`, `role`, `group-members`, `table-key-info` and `resource-tags`; `cache invalidate --help` lists the flags each one takes.
+
+```bash
+# One credential
+./target/release/extenddb manage --user admin --password <pw> \
+    cache invalidate credential --access-key-id AKIAEXTENDDB...
+
+# Everything cached about a user
+./target/release/extenddb manage --user admin --password <pw> \
+    cache invalidate user --account-id 123456789012 --user-name alice
+
+# Every cache (global flush)
+./target/release/extenddb manage --user admin --password <pw> \
+    cache invalidate all --yes
 ```
 
 ## Encryption Key
@@ -1118,6 +1387,10 @@ Core dumps stay on: `MADV_DONTDUMP` keeps the core and excludes the key pages, s
 
 The management web console is served at `/console/` on the same port as the DynamoDB API. It requires `auth.provider = "builtin"`.
 
+### Accessing the console
+
+Navigate to `https://127.0.0.1:18443/console/` in your browser (adjust the host and port to match your `extenddb.toml` configuration). Accept the self-signed certificate warning on first visit.
+
 ### Features
 
 - **Dashboard**: Account and admin user counts (admin sessions only; an IAM-user session gets a link to its own user page), version info
@@ -1132,10 +1405,12 @@ The management web console is served at `/console/` on the same port as the Dyna
 
 ### Authentication
 
-- Admin users: enter username and password
+- Admin users: enter username and password (the credentials printed during `extenddb init`)
 - IAM users: enter `account_id/user_name` as username, console password as password
 
-Sessions end 8 hours after login. Click "Logout" to end immediately. Deleting an admin or IAM user, or changing its password, ends its console sessions on every server at their next request.
+Admin users have full access to all management operations. IAM users open their own user page, which lists their access keys, and create and delete their own access keys there. These are the access key reads and writes the management API gives an IAM user. The console has no form to change the password or import a key.
+
+Sessions end 8 hours after login. Click "Logout" to end a session immediately. Deleting an admin or IAM user, or changing its password, ends its console sessions on every server at their next request.
 
 ## Monitoring
 
@@ -1178,10 +1453,17 @@ The server logs some management operations, and the settings changes made throug
 
 ```bash
 # View audit entries
+# Linux
 journalctl -t extenddb | grep 'extenddb::audit'
+
+# macOS
+log show --predicate 'processImagePath ENDSWITH "extenddb"' --last 1d | grep 'extenddb::audit'
+
+# Docker Compose (--foreground)
+docker compose logs extenddb | grep 'extenddb::audit'
 ```
 
-Targets: `extenddb::audit::manage` (some management operations), `extenddb::audit::settings` (settings changes made through the management API).
+Targets: `extenddb::audit::manage` (some management operations), `extenddb::audit::settings` (settings changes made through the management API). Secrets (passwords, secret keys) are never included in audit log entries.
 
 ### Metrics
 
