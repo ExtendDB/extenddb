@@ -61,7 +61,7 @@ async function download() {
         `${platforms.join(", ")}. Set the binary input to an extenddb ${version} dev binary.`
     );
   }
-  const meta = await (await get(`https://registry.npmjs.org/${pkg.replace("/", "%2f")}/${version}`)).json();
+  const meta = await (await get(`https://registry.npmjs.org/${pkg.replaceAll("/", "%2f")}/${version}`)).json();
   const tarball = Buffer.from(await (await get(meta.dist.tarball)).arrayBuffer());
   const sha512 = `sha512-${crypto.createHash("sha512").update(tarball).digest("base64")}`;
   if (sha512 !== meta.dist.integrity) {
