@@ -40,7 +40,7 @@ pub const TXN_FAMILY: &str = "t";
 pub const INTENT_FAMILY: &str = "m";
 pub const INTENT_QUALIFIER_PREFIX: &str = "intent:";
 
-/// Coordinator ID prefix identifying single-item stream-fenced writes (`BUG-12`)
+/// Coordinator ID prefix identifying single-item stream-fenced writes
 /// so concurrent single-item writers serialize/retry rather than raising
 /// `TransactionConflictException`.
 pub const SINGLE_TXN_PREFIX: &str = "sgl-";
@@ -52,7 +52,7 @@ const STATE_ABORTED: &[u8] = b"ABORTED";
 
 /// Target row for a 2PC participant or GSI shadow mutation.
 /// Derives canonical `(data_table, row_key)` ordering to prevent 2PC lock-order
-/// deadlocks (`BUG-11`).
+/// deadlocks.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ParticipantRow {
     pub data_table: String,
@@ -83,18 +83,18 @@ pub struct TxnStreamRecord {
     #[serde(default)]
     pub shard_id: String,
     pub record: extenddb_core::types::StreamRecord,
-    /// Base-table participant that generated this stream event (`BUG-05`), so
+    /// Base-table participant that generated this stream event, so
     /// `roll_forward` suppresses phantom stream records when a stale coordinator
     /// was superseded by a newer write.
     #[serde(default)]
     pub participant: Option<ParticipantRow>,
     /// Optional explicit deduplication key (`<txn_id>:<op_idx>`) supplementing
-    /// `record.event_id` across crash recovery replays (`BUG-04`).
+    /// `record.event_id` across crash recovery replays.
     #[serde(default)]
     pub dedup_key: Option<String>,
 }
 
-/// Logged `__extenddb_ttl_index__` transition persisted at `COMMITTED` (`BUG-06`)
+/// Logged `__extenddb_ttl_index__` transition persisted at `COMMITTED`
 /// so crash recovery (`roll_forward`) maintains TTL index completeness.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct TxnTtlMutation {
@@ -109,7 +109,7 @@ pub struct TxnTtlMutation {
 }
 
 /// `ClientRequestToken` metadata persisted in `t:token_meta` from `open_with_token`
-/// onward (`BUG-07`) so concurrent callers and `sweeper` enforce fingerprint
+/// onward so concurrent callers and `sweeper` enforce fingerprint
 /// validation and persist `idem:<account_id>:<token>` before dropping `txn:<id>`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct TxnTokenMeta {
@@ -155,7 +155,7 @@ impl<'a> TxnCoordinator<'a> {
         format!("txn-{}", Uuid::new_v4().simple())
     }
 
-    /// New single-item stream-fenced txn id — `sgl-<uuid-no-dashes>` (`BUG-12`).
+    /// New single-item stream-fenced txn id — `sgl-<uuid-no-dashes>`.
     #[must_use]
     pub fn new_single_txn_id() -> String {
         format!("{SINGLE_TXN_PREFIX}{}", Uuid::new_v4().simple())
@@ -187,8 +187,7 @@ impl<'a> TxnCoordinator<'a> {
         self.open_with_token(txn_id, participants, None).await
     }
 
-    /// Atomically open a `PENDING` coordinator row with optional `TxnTokenMeta`
-    /// (`BUG-07a`, `BUG-07b`).
+    /// Atomically open a `PENDING` coordinator row with optional `TxnTokenMeta`.
     pub async fn open_with_token(
         &self,
         txn_id: &str,
@@ -254,7 +253,7 @@ impl<'a> TxnCoordinator<'a> {
 
     /// Read the latest coordinator state from `__extenddb_txn_log__`.
     ///
-    /// Never emits `DeleteFromColumn` on `t:state` during transitions (`BUG-02`),
+    /// Never emits `DeleteFromColumn` on `t:state` during transitions,
     /// retries transient gRPC glitches, and treats a row lacking `t:state` as
     /// `Ok(None)` so concurrent cleanup never triggers `StorageError::Internal` HTTP 500s.
     pub async fn get_state(&self, txn_id: &str) -> Result<Option<TxnState>, StorageError> {
@@ -357,7 +356,7 @@ impl<'a> TxnCoordinator<'a> {
     }
 
     /// Single-RPC attempt to place `m:intent:<txn_id>` if and only if NO
-    /// physical `m:intent:*` cell currently exists on `participant` (`BUG-03`).
+    /// physical `m:intent:*` cell currently exists on `participant`.
     pub async fn place_intent_once(
         &self,
         txn_id: &str,
@@ -391,6 +390,8 @@ impl<'a> TxnCoordinator<'a> {
     }
 
     /// Place an intent marker on a participant row with short jittered retries.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
     pub async fn place_intent(
         &self,
         txn_id: &str,
@@ -415,10 +416,10 @@ impl<'a> TxnCoordinator<'a> {
     }
 
     /// Atomically transition `(t:state == "PENDING" && t:started_at == started_at_micros)`
-    /// to `"COMMITTED"` (`BUG-01`, `BUG-02`, `BUG-06`).
+    /// to `"COMMITTED"`.
     ///
     /// Returns `Ok(Some(commit_ts_micros))` if committed, or `Ok(None)` if the
-    /// coordinator incarnation was already aborted/swept (`AllOrNothing2PCAtomicity`).
+    /// coordinator incarnation was already aborted or swept.
     pub async fn try_commit_full(
         &self,
         txn_id: &str,
@@ -484,7 +485,9 @@ impl<'a> TxnCoordinator<'a> {
     }
 
     /// CAS-guarded `commit` convenience wrapper returning `TransactionConflict`
-    /// if the `PENDING` incarnation was already aborted or dropped (`BUG-01`).
+    /// if the `PENDING` incarnation was already aborted or dropped.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
     pub async fn commit(
         &self,
         txn_id: &str,
@@ -502,7 +505,7 @@ impl<'a> TxnCoordinator<'a> {
     }
 
     /// Atomically CAS `(t:state == "PENDING" && t:started_at == started_at_micros)`
-    /// to `"ABORTED"` BEFORE clearing any participant intent (`BUG-01`).
+    /// to `"ABORTED"` BEFORE clearing any participant intent.
     pub async fn try_abort_pending(
         &self,
         txn_id: &str,
@@ -678,7 +681,7 @@ impl<'a> TxnCoordinator<'a> {
 
     /// Clear an orphaned/cleaned intent cell bounded to `[0, next_millis_exclusive(max_ts_micros))`
     /// so delayed cleanup of an earlier deterministic `ClientRequestToken` incarnation
-    /// can NEVER delete a newer incarnation's newly placed intent (`BUG-01`, `BUG-07`).
+    /// can NEVER delete a newer incarnation's newly placed intent.
     pub async fn clear_intent_up_to(
         &self,
         txn_id: &str,
@@ -709,7 +712,7 @@ impl<'a> TxnCoordinator<'a> {
 
     /// Delete the coordinator row only if `t:started_at` still matches
     /// `started_at_micros`, protecting reused deterministic `ClientRequestToken`
-    /// coordinator keys (`BUG-07`) against stale incarnation deletes.
+    /// coordinator keys against stale incarnation deletes.
     pub async fn drop_matching_start(
         &self,
         txn_id: &str,
@@ -798,7 +801,7 @@ fn build_latest_txn_qualifier_match(qualifier: &[u8], expected_val: &[u8]) -> Ro
 }
 
 /// Predicate matching iff BOTH `latest(t:state) == "PENDING"` AND
-/// `latest(t:started_at) == started_at_micros` (`BUG-01`, `BUG-07`).
+/// `latest(t:started_at) == started_at_micros`.
 fn build_pending_incarnation_predicate(started_at_micros: i64) -> RowFilter {
     let state_pending = build_latest_txn_qualifier_match(b"state", STATE_PENDING);
     let start_matches =
@@ -937,7 +940,7 @@ pub fn build_txn_log_latest_filter() -> RowFilter {
 }
 
 /// Filter matching ANY physical `m:intent:*` cell in family `m`, with no wall-clock
-/// `TimestampRangeFilter` (`BUG-03`).
+/// `TimestampRangeFilter`.
 fn build_intent_presence_filter() -> RowFilter {
     RowFilter {
         filter: Some(Filter::Chain(Chain {

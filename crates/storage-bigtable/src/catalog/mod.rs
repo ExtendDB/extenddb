@@ -327,18 +327,6 @@ impl<'c> Catalog<'c> {
         Ok(resp.predicate_matched)
     }
 
-    /// Atomically replace a catalog row only if its current raw payload matches
-    /// `expected_raw`.
-    pub async fn compare_and_swap_raw(
-        &self,
-        row_key: &str,
-        expected_raw: &[u8],
-        new_value: &serde_json::Value,
-    ) -> Result<bool, String> {
-        self.compare_and_swap_raw_after(row_key, expected_raw, 0, new_value)
-            .await
-    }
-
     /// Atomically delete a catalog row only if its current latest raw payload matches
     /// `expected_raw`.
     pub async fn compare_and_delete_raw(
@@ -386,7 +374,7 @@ impl<'c> Catalog<'c> {
     }
 
     /// Execute an atomic compare-and-swap read-modify-write loop over a catalog JSON row
-    /// (`BUG-13`, `RFC-0003` §7.4).
+    /// (`RFC-0003` §7.4).
     ///
     /// Retries on concurrent CAS contention with bounded exponential + random jitter
     /// backoff, advancing replacement timestamps strictly past the read cell's

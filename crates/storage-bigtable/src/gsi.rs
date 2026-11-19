@@ -48,6 +48,7 @@ pub fn escape_bytes_terminated(bytes: &[u8]) -> Vec<u8> {
 
 /// Decode an escape-encoded segment from a byte slice starting at `idx`.
 /// Returns the unescaped bytes and the new index immediately after `0x00 0x00`.
+#[cfg(any(test, feature = "test-hooks"))]
 pub fn unescape_bytes_terminated(
     bytes: &[u8],
     mut idx: usize,
@@ -181,6 +182,7 @@ pub fn shadow_row_key_for_item(
     Ok(Some(out))
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
 fn decode_attr_value(tag: u8, bytes: &[u8]) -> Result<AttributeValue, StorageError> {
     match tag {
         0x53 => Ok(AttributeValue::S(
@@ -199,6 +201,7 @@ fn decode_attr_value(tag: u8, bytes: &[u8]) -> Result<AttributeValue, StorageErr
 
 /// Decode a GSI shadow row key back into an Item containing both the GSI key
 /// attributes and the base table key attributes.
+#[cfg(any(test, feature = "test-hooks"))]
 pub fn decode_shadow_row_key(
     key: &[u8],
     gsi_key_schema: &[KeySchemaElement],
@@ -301,17 +304,6 @@ pub fn decode_shadow_row_key(
     Ok(item)
 }
 
-/// Build the prefix used to scan all shadow entries matching `gsi_pk` (and
-/// optionally a `gsi_sk` operator). Used by Query against an index.
-pub fn shadow_prefix_for_pk(pk: &AttributeValue) -> Result<Vec<u8>, StorageError> {
-    let (tag, bytes) = tag_bytes_for(pk)?;
-    let mut out = Vec::with_capacity(1 + 4 + bytes.len());
-    out.push(tag);
-    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-    out.extend_from_slice(&bytes);
-    Ok(out)
-}
-
 /// Project a base item down to exactly the attributes a shadow row needs,
 /// per the GSI's `Projection`:
 /// - `ALL`        → pass-through (every attribute).
@@ -346,27 +338,6 @@ pub fn project_for_shadow(
         }
     }
     out
-}
-
-/// Decode shadow-row cells back into an Item map. The base-key columns are
-/// already inside `item` (we projected ALL on write) so the caller gets the
-/// item directly.
-pub fn decode_shadow_cells(
-    cells: Vec<bigtable_rs::bigtable::RowCell>,
-) -> Result<Option<Item>, StorageError> {
-    let mut item: Item = BTreeMap::new();
-    for c in cells {
-        if c.family_name == crate::data::item_ops::FAMILY_DATA {
-            let attr = String::from_utf8(c.qualifier)
-                .map_err(|e| StorageError::Internal(format!("decode qualifier: {e}")))?;
-            item.insert(attr, crate::data::encoding::cell::decode(&c.value)?);
-        }
-    }
-    if item.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(item))
-    }
 }
 
 #[cfg(test)]

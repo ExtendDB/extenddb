@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! TTL cleanup worker (`BUG-10`).
+//! TTL cleanup worker.
 //!
 //! Sweeps the `__extenddb_ttl_index__` table in shards, verifies each candidate
 //! against the live base item's TTL attribute (including resolving `COMMITTED`
@@ -259,7 +259,7 @@ async fn sweep_shard(
             if live_secs > now_epoch_s {
                 // Live item's TTL was extended into the future: ensure the future
                 // TTL index entry exists at `live_ver` before retiring this stale
-                // expired index cell (`BUG-10`).
+                // expired index cell.
                 if let Some(lv) = live_ver {
                     let _ = engine
                         .ensure_ttl_index_entry(&key_info, base_row_key, live_secs, lv)
@@ -270,7 +270,7 @@ async fn sweep_shard(
             }
 
             // `0 < live_secs <= now_epoch_s`: evict regardless of whether `live_secs`
-            // equals the scanned `expiry` (`BUG-10` ABA fix), conditional on the
+            // equals the scanned `expiry` (ABA-safe), conditional on the
             // exact live TTL attribute value `#ttl = :ttl_exp` so a concurrent
             // extension between `get_item_with_version` and `delete_item` is safe.
             let cond = Expr::Compare {
@@ -347,7 +347,7 @@ async fn sweep_shard(
 /// Delete cells on `raw_key` in `__extenddb_ttl_index__` stamped at or before
 /// `max_inclusive_ts_micros` using a millisecond-aligned `[0, next_millis_exclusive)`
 /// `DeleteFromColumn` (never `DeleteFromRow`) so any newer concurrent TTL index
-/// stamp survives (`BUG-10`).
+/// stamp survives.
 async fn delete_ttl_index_entry_up_to(
     engine: &BigtableEngine,
     raw_key: &[u8],

@@ -50,6 +50,12 @@ bcrypt = { workspace = true }
 base64 = { workspace = true }
 axum = { workspace = true }
 
+[features]
+# Coordination and fault-injection hooks used only by this crate's integration
+# test binary (`tests/emulator_integration.rs`). Production builds do not
+# compile them.
+test-hooks = ["extenddb-storage/test-hooks"]
+
 [dev-dependencies]
 extenddb-storage = { path = "../storage", features = ["test-util"] }
 tokio = { workspace = true, features = ["full"] }

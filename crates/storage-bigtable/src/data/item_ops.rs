@@ -124,7 +124,7 @@ pub(crate) fn older_than_ts_range(ts_micros: i64) -> Option<TimestampRange> {
 pub enum CasOutcome {
     /// Mutation succeeded at the returned OCC version.
     Applied(u64),
-    /// One or more `m:intent:<txn_id>` cells are present on the row (`BUG-03`);
+    /// One or more `m:intent:<txn_id>` cells are present on the row;
     /// caller must cooperatively resolve `COMMITTED` / expired `PENDING`
     /// transactions via `__extenddb_txn_log__` before retrying or failing.
     IntentPresent,
@@ -134,7 +134,7 @@ pub enum CasOutcome {
 }
 
 /// Atomic single-row read snapshot capturing `d:*`, `m:v`, and all physical
-/// `(txn_id, intent_cell_ts_micros)` entries regardless of wall-clock age (`BUG-02`, `BUG-03`).
+/// `(txn_id, intent_cell_ts_micros)` entries regardless of wall-clock age.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RowSnapshot {
     pub item: Option<Item>,
@@ -153,7 +153,7 @@ pub fn decode_version(bytes: &[u8]) -> Option<u64> {
 }
 
 /// Filter matching ANY physical `m:intent:*` cell in family `m`, intentionally
-/// WITHOUT a wall-clock `TimestampRangeFilter` (`BUG-03`): an intent older than
+/// WITHOUT a wall-clock `TimestampRangeFilter`: an intent older than
 /// `intent_timeout_secs` may belong to a `COMMITTED` transaction in
 /// `__extenddb_txn_log__` awaiting roll-forward and must never be bypassed.
 pub(crate) fn build_active_intent_filter() -> RowFilter {
@@ -402,7 +402,7 @@ impl<'a> ItemOps<'a> {
         Ok(!resp.is_empty())
     }
 
-    /// Read `(item, occ_version, all_intents)` for a single row by raw key (`BUG-02`, `BUG-03`).
+    /// Read `(item, occ_version, all_intents)` for a single row by raw key.
     pub async fn get_row_snapshot_by_raw_key(
         &self,
         row_key: &[u8],
@@ -436,7 +436,7 @@ impl<'a> ItemOps<'a> {
     }
 
     /// Batch-read `(item, occ_version, all_intents)` across pre-encoded raw keys,
-    /// returning snapshots in the exact order of `row_keys` (`BUG-02`, `BUG-03`).
+    /// returning snapshots in the exact order of `row_keys`.
     pub async fn batch_get_row_snapshots_by_raw_keys(
         &self,
         row_keys: &[Vec<u8>],
@@ -755,7 +755,7 @@ impl<'a> ItemOps<'a> {
     }
 
     /// Read `(existing_d_qualifiers, max_d_timestamp_micros, current_shadow_version)`
-    /// for a GSI shadow row (`BUG-08`).
+    /// for a GSI shadow row.
     async fn read_shadow_row_meta(
         &self,
         shadow_row_key: &[u8],
@@ -817,7 +817,7 @@ impl<'a> ItemOps<'a> {
         }
     }
 
-    /// Version-fenced GSI shadow Put (`BUG-08`, `QuiescentGsiShadowConsistency`):
+    /// Version-fenced GSI shadow Put:
     ///
     /// Never uses unbounded `DeleteFromFamily("d")` or `DeleteFromRow`, and places
     /// `SetCell` before bounded `DeleteFromColumn` so concurrent GSI `Query`/`Scan`
@@ -938,7 +938,7 @@ impl<'a> ItemOps<'a> {
         ))
     }
 
-    /// Version-fenced GSI shadow Delete (`BUG-08`, `QuiescentGsiShadowConsistency`):
+    /// Version-fenced GSI shadow Delete:
     ///
     /// Never uses unbounded `DeleteFromFamily("d")` or `DeleteFromRow`. Advances
     /// shadow `m:v` to `new_version` while clearing `d:*` cells bounded by
@@ -1033,7 +1033,7 @@ impl<'a> ItemOps<'a> {
         ))
     }
 
-    /// Reconciler-safe cleanup of an orphaned GSI shadow row (`BUG-08`):
+    /// Reconciler-safe cleanup of an orphaned GSI shadow row:
     /// clears observed `d:*` qualifiers via millisecond-aligned bounded
     /// `DeleteFromColumn` only if the shadow row's `m:v` state has not changed
     /// since inspection, so a concurrent live write arriving on the same shadow

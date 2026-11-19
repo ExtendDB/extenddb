@@ -808,12 +808,12 @@ impl BigtableEngine {
     }
 
     /// Inspect all physical `m:intent:*` markers on `(data_table, row_key)`:
-    /// - `COMMITTED` -> cooperatively roll forward immediately (`BUG-03`).
+    /// - `COMMITTED` -> cooperatively roll forward immediately.
     /// - `CLEANED` / `ABORTED` / absent -> clear stale intent cell bounded by
     ///   observed timestamp (`clear_intent_up_to`) so newer reused-token
-    ///   incarnations are never stripped (`BUG-07`).
+    ///   incarnations are never stripped.
     /// - `PENDING` older than `intent_timeout_secs` -> CAS `PENDING -> ABORTED`
-    ///   (`try_abort_pending`) before clearing participant intents (`BUG-01`), or
+    ///   (`try_abort_pending`) before clearing participant intents, or
     ///   roll forward if it concurrently committed.
     /// - Unexpired `PENDING` -> classify as `SingleWriteInFlight` vs `MultiTxnInFlight`.
     async fn resolve_blocking_intents(
@@ -924,7 +924,7 @@ impl BigtableEngine {
     }
 
     /// Write/refresh shadow entries for every GSI using version-guarded
-    /// `put_shadow_versioned` / `delete_shadow_versioned` (`BUG-08`).
+    /// `put_shadow_versioned` / `delete_shadow_versioned`.
     async fn write_shadows_only(
         &self,
         key_info: &TableKeyInfo,
@@ -1037,7 +1037,7 @@ impl BigtableEngine {
     }
 
     /// Maintain `__extenddb_ttl_index__` using OCC-derived millisecond-aligned
-    /// cell timestamps (`BUG-10`). Always restamps `new_exp` even when
+    /// cell timestamps. Always restamps `new_exp` even when
     /// `old_exp == new_exp` (e.g. `"1000" -> "1000.5"`) so a racing `ttl_worker`
     /// `ConditionFailed` bounded cleanup cannot orphan the updated item.
     async fn maintain_ttl_index(
@@ -1229,12 +1229,12 @@ impl BigtableEngine {
             .await
     }
 
-    /// Execute a single-item write (`PutItem` / `UpdateItem` / `DeleteItem`)
-    /// through the `__extenddb_txn_log__` coordinator fence whenever streams
-    /// are enabled on the table (`BUG-01`, `BUG-03`, `BUG-04`, `BUG-05`,
-    /// `BUG-06`, `BUG-08`, `BUG-12`).
+    /// Execute Phase 1 (`open`, `place_intent_once`, `get_with_version`,
+    /// condition/update evaluation, and `try_commit_full`) of a single-item write
+    /// (`PutItem` / `UpdateItem` / `DeleteItem`) through the `__extenddb_txn_log__`
+    /// coordinator fence whenever streams are enabled on the table.
     #[allow(clippy::too_many_arguments)]
-    async fn execute_fenced_single_item_write(
+    async fn commit_fenced_single_item_write(
         &self,
         key_info: &TableKeyInfo,
         data_table: &str,
@@ -1244,8 +1244,15 @@ impl BigtableEngine {
         condition: Option<&Expr>,
         maps: &ExpressionMaps,
         stream: Option<&StreamCapture>,
-        stop_after_commit_for_test: bool,
-    ) -> Result<(Option<Item>, Option<Item>, String), StorageError> {
+    ) -> Result<
+        (
+            Option<Item>,
+            Option<Item>,
+            String,
+            Option<crate::transact::TxnState>,
+        ),
+        StorageError,
+    > {
         let gsis = desc.global_secondary_indexes.clone().unwrap_or_default();
         let row_key =
             crate::data::encoding::row_key::encode_key(op.lookup_key(), &key_info.key_schema)?;
@@ -1365,7 +1372,7 @@ impl BigtableEngine {
                 SingleWriteOp::Delete { .. } => {
                     if existing.is_none() {
                         abort_cleanly(txn_id.clone(), participant).await;
-                        return Ok((None, None, txn_id));
+                        return Ok((None, None, txn_id, None));
                     }
                     None
                 }
@@ -1390,7 +1397,7 @@ impl BigtableEngine {
                     };
                     if existing.is_none() && removes_only(actions) {
                         abort_cleanly(txn_id.clone(), participant).await;
-                        return Ok((None, None, txn_id));
+                        return Ok((None, None, txn_id, None));
                     }
                     Some(updated)
                 }
@@ -1497,10 +1504,6 @@ impl BigtableEngine {
                 }
             };
 
-            if stop_after_commit_for_test {
-                return Ok((existing, new_item, txn_id));
-            }
-
             let committed_state = crate::transact::TxnState {
                 state: "COMMITTED".to_owned(),
                 state_ts_micros: commit_ts_micros,
@@ -1511,9 +1514,8 @@ impl BigtableEngine {
                 ttl_mutations: Some(ttl_mutations),
                 token_meta: None,
             };
-            self.roll_forward(&txn_id, &committed_state).await?;
 
-            return Ok((existing, new_item, txn_id));
+            return Ok((existing, new_item, txn_id, Some(committed_state)));
         }
 
         Err(StorageError::TransactionConflict(
@@ -1521,9 +1523,36 @@ impl BigtableEngine {
         ))
     }
 
+    /// Execute a single-item write (`PutItem` / `UpdateItem` / `DeleteItem`)
+    /// through the `__extenddb_txn_log__` coordinator fence whenever streams
+    /// are enabled on the table.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_fenced_single_item_write(
+        &self,
+        key_info: &TableKeyInfo,
+        data_table: &str,
+        desc: &TableDescription,
+        ttl_attr: Option<&str>,
+        op: SingleWriteOp<'_>,
+        condition: Option<&Expr>,
+        maps: &ExpressionMaps,
+        stream: Option<&StreamCapture>,
+    ) -> Result<(Option<Item>, Option<Item>, String), StorageError> {
+        let (existing, new_item, txn_id, committed_state) = self
+            .commit_fenced_single_item_write(
+                key_info, data_table, desc, ttl_attr, op, condition, maps, stream,
+            )
+            .await?;
+        if let Some(state) = committed_state {
+            self.roll_forward(&txn_id, &state).await?;
+        }
+        Ok((existing, new_item, txn_id))
+    }
+
     /// Test-only entrypoint simulating a process crash immediately after the
     /// coordinator `COMMITTED` point of a stream-enabled `PutItem` (before base
     /// row or stream record apply). Returns the `txn_id` in `__extenddb_txn_log__`.
+    #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub async fn debug_fenced_put_commit_only(
         &self,
@@ -1533,8 +1562,8 @@ impl BigtableEngine {
     ) -> Result<String, StorageError> {
         let (data_table, desc, ttl_attr) = self.table_full_meta_for(key_info).await?;
         let empty_maps = ExpressionMaps::default();
-        let (_, _, txn_id) = self
-            .execute_fenced_single_item_write(
+        let (_, _, txn_id, _) = self
+            .commit_fenced_single_item_write(
                 key_info,
                 &data_table,
                 &desc,
@@ -1543,7 +1572,6 @@ impl BigtableEngine {
                 None,
                 &empty_maps,
                 stream,
-                true,
             )
             .await?;
         Ok(txn_id)
@@ -1552,6 +1580,7 @@ impl BigtableEngine {
     /// Test-only entrypoint simulating a process crash *before* the coordinator
     /// `COMMITTED` point of a stream-enabled `PutItem` (`PENDING` coordinator
     /// row + `m:intent:<txn_id>` placed, no commit). Returns `txn_id`.
+    #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub async fn debug_fenced_put_open_intent_only(
         &self,
@@ -1582,9 +1611,8 @@ impl BigtableEngine {
     }
 
     /// Idempotently roll forward a `COMMITTED` coordinator entry across base
-    /// participants, version-guarded GSI shadow rows (`BUG-08`), OCC-bounded TTL
-    /// index mutations (`BUG-06`), active-participant contiguous stream records
-    /// (`BUG-04`, `BUG-05`), and `ClientRequestToken` `idem:` persistence (`BUG-07`).
+    /// participants, version-guarded GSI shadow rows, OCC-bounded TTL
+    /// index mutations, active-participant contiguous stream records, and `ClientRequestToken` `idem:` persistence.
     pub async fn roll_forward(
         &self,
         txn_id: &str,
@@ -2188,7 +2216,7 @@ impl TableEngine for BigtableEngine {
 
             // Pre-create Bigtable physical shadow tables for any GSI Create
             // actions so live writers can project to the shadow table the
-            // instant `CREATING` commits in `table_meta` (`BUG-09`).
+            // instant `CREATING` commits in `table_meta`.
             let mut precreated_shadows: Vec<String> = Vec::new();
             if let Some(updates) = &input.global_secondary_index_updates
                 && updates.iter().any(|u| u.create.is_some())
@@ -2725,7 +2753,7 @@ impl TableEngine for BigtableEngine {
                     label_to_close,
                     label_to_close_prior,
                 } => {
-                    // `stream_enabled = false` is ALREADY durable in `table_meta` (`BUG-12`).
+                    // `stream_enabled = false` is ALREADY durable in `table_meta`.
                     let existing_shards = crate::streams::load_table_shards(&self.cat(), &table_id)
                         .await
                         .map_err(map_catalog_err)?;
@@ -2807,7 +2835,7 @@ impl TableEngine for BigtableEngine {
                         inserted_sids.push(sid);
                     }
 
-                    // Re-verify `enable_still_current` against `table_meta` (`BUG-12`).
+                    // Re-verify `enable_still_current` against `table_meta`.
                     let fresh_row = self.cat().get(&meta_key).await.map_err(map_catalog_err)?;
                     let fresh_stream_row = fresh_row
                         .as_ref()
@@ -3092,7 +3120,6 @@ impl DataEngine for BigtableEngine {
                         condition.as_ref(),
                         &maps,
                         stream.as_ref(),
-                        false,
                     )
                     .await?;
                 return Ok(if return_old { existing } else { None });
@@ -3205,7 +3232,6 @@ impl DataEngine for BigtableEngine {
                         condition.as_ref(),
                         &maps,
                         stream.as_ref(),
-                        false,
                     )
                     .await?;
                 return Ok(if return_old { existing } else { None });
@@ -3308,7 +3334,6 @@ impl DataEngine for BigtableEngine {
                         condition.as_ref(),
                         &maps,
                         stream.as_ref(),
-                        false,
                     )
                     .await?;
                 if new_item.is_none() {
@@ -3629,7 +3654,7 @@ impl DataEngine for BigtableEngine {
             }
 
             // Deduplicate unique `(data_table, enc_key)` pairs so duplicate keys in
-            // one TransactGetItems request share a single atomic snapshot slot (`BUG-02`).
+            // one TransactGetItems request share a single atomic snapshot slot.
             let mut table_raw_keys: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
             for (_, data_table, enc_key) in &resolved_ops {
                 let entry = table_raw_keys.entry(data_table.clone()).or_default();
@@ -3645,7 +3670,7 @@ impl DataEngine for BigtableEngine {
             );
 
             for attempt in 0..MAX_TRANSACT_GET_ATTEMPTS {
-                // Pass 1a: read `(d_item, m:v, all m:intent:*)` across all tables (`BUG-02`, `BUG-03`).
+                // Pass 1a: read `(d_item, m:v, all m:intent:*)` across all tables.
                 let mut futs_1 = Vec::with_capacity(table_raw_keys.len());
                 for (dt, raw_keys) in &table_raw_keys {
                     let client = self.client.clone();
@@ -3673,7 +3698,7 @@ impl DataEngine for BigtableEngine {
                     }
                 }
 
-                // Single-key read with zero intents is already linearizable at Pass 1a.
+                // Single-key read with zero intents needs no second snapshot pass.
                 if unique_key_count == 1 && all_tids.is_empty() {
                     let mut out = Vec::with_capacity(total_ops);
                     for (_, dt, rk) in &resolved_ops {
@@ -3782,8 +3807,8 @@ impl DataEngine for BigtableEngine {
                     continue;
                 }
 
-                // Snapshot verified linearizable at `t* = t2_end`. Resolve each
-                // requested item from `(map_1, txns_1)` (`NoTornTransactGetSnapshot`):
+                // Double-read snapshot validated across Pass 1 and Pass 2. Resolve each
+                // requested item from `(map_1, txns_1)`:
                 // - Intent present + txn COMMITTED (and not superseded by a
                 //   strictly newer `m:v`) -> serve logged post-image from `t:mutations`.
                 // - Otherwise -> serve current `d:*` value.
@@ -3914,7 +3939,7 @@ impl DataEngine for BigtableEngine {
             let participants: Vec<crate::transact::ParticipantRow> =
                 resolved.iter().map(|(_, _, _, _, p)| p.clone()).collect();
 
-            // Atomically open coordinator row (`BUG-07a`, `BUG-07b`).
+            // Atomically open coordinator row.
             let mut started_at_micros: i64 = 0;
             let mut leader_opened = false;
             for _open_round in 0..4usize {
@@ -4083,7 +4108,7 @@ impl DataEngine for BigtableEngine {
             }
 
             // Acquire participant intents in canonical sorted `(data_table, row_key)`
-            // order (`BUG-11`) so `[k1, k2]` vs `[k2, k1]` never deadlocks.
+            // order so `[k1, k2]` vs `[k2, k1]` never deadlocks.
             let mut lock_order: Vec<usize> = (0..resolved.len()).collect();
             lock_order.sort_by(|&a, &b| resolved[a].4.cmp(&resolved[b].4));
 
@@ -5189,7 +5214,7 @@ async fn insert_ttl_index_entry_at(
     let mut mutations = Vec::with_capacity(2);
     // Place SetCell FIRST and bounded DeleteFromColumn([0, ts_micros)) SECOND so
     // sequential per-row mutation application on `cbtemulator` never exposes an
-    // empty TTL index cell to a concurrent `ttl_worker` scan (`BUG-02`, `BUG-10`).
+    // empty TTL index cell to a concurrent `ttl_worker` scan.
     mutations.push(Mutation {
         mutation: Some(mutation::Mutation::SetCell(SetCell {
             family_name: "d".to_string(),

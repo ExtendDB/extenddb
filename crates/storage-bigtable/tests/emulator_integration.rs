@@ -13,7 +13,10 @@
 //! - GSI shadow table operations, FDB escape-encoded sort keys, range queries, update propagation, and deletion cleanup.
 //! - TTL index maintenance, background sweep with live-item expiry verification, and fenced TTL service stream emission (`dynamodb.amazonaws.com`).
 //!
-//! These tests run when `BIGTABLE_EMULATOR_HOST` is set, and skip gracefully otherwise.
+//! These tests run when `BIGTABLE_EMULATOR_HOST` is set, and skip gracefully
+//! otherwise unless `EXTENDDB_TEST_BIGTABLE_REQUIRED` is set to a non-empty,
+//! non-`"0"` value (in which case missing or unreachable emulator endpoints
+//! fail the test).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -80,45 +83,90 @@ fn parse_kc(expr_str: &str) -> KeyCondition {
     parse_key_condition(&tokens).expect("parse key condition")
 }
 
-async fn setup_emulator_context() -> Option<TestContext> {
+fn is_required_flag_enabled(raw: Option<&str>) -> bool {
+    raw.is_some_and(|v| {
+        let trimmed = v.trim();
+        !trimmed.is_empty() && trimmed != "0"
+    })
+}
+
+fn is_emulator_required() -> bool {
+    is_required_flag_enabled(
+        std::env::var("EXTENDDB_TEST_BIGTABLE_REQUIRED")
+            .ok()
+            .as_deref(),
+    )
+}
+
+async fn resolve_reachable_emulator_host(
+    config_for_probe: &BigtableStorageConfig,
+) -> Option<(String, Arc<BigtableClient>)> {
+    let required = is_emulator_required();
     let host = match std::env::var("BIGTABLE_EMULATOR_HOST") {
         Ok(h) if !h.trim().is_empty() => h,
-        _ => return None,
+        _ => {
+            assert!(
+                !required,
+                "BIGTABLE_EMULATOR_HOST is not set, and EXTENDDB_TEST_BIGTABLE_REQUIRED requires a live Bigtable emulator"
+            );
+            return None;
+        }
     };
 
+    let mut cfg = config_for_probe.clone();
+    cfg.emulator_host = Some(host.clone());
+    cfg.dev_mode = true;
+
+    let client = match BigtableClient::connect(&cfg).await {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            assert!(
+                !required,
+                "Bigtable emulator at {host} connect failed while EXTENDDB_TEST_BIGTABLE_REQUIRED is set: {e}"
+            );
+            eprintln!("Skipping Bigtable emulator integration test (connect failed): {e}");
+            return None;
+        }
+    };
+    let mut admin = match AdminClient::connect(&client).await {
+        Ok(a) => a,
+        Err(e) => {
+            assert!(
+                !required,
+                "Bigtable emulator at {host} admin connect failed while EXTENDDB_TEST_BIGTABLE_REQUIRED is set: {e}"
+            );
+            eprintln!("Skipping Bigtable emulator integration test (admin connect failed): {e}");
+            return None;
+        }
+    };
+    if let Err(e) = admin.list_tables().await {
+        assert!(
+            !required,
+            "Bigtable emulator at {host} list_tables probe failed while EXTENDDB_TEST_BIGTABLE_REQUIRED is set: {e}"
+        );
+        eprintln!("Skipping Bigtable emulator integration test (list_tables probe failed): {e}");
+        return None;
+    }
+
+    Some((host, client))
+}
+
+async fn setup_emulator_context() -> Option<TestContext> {
     let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
     let project_id =
         std::env::var("BIGTABLE_PROJECT_ID").unwrap_or_else(|_| format!("test-proj-{suffix}"));
     let instance_id =
         std::env::var("BIGTABLE_INSTANCE_ID").unwrap_or_else(|_| format!("test-inst-{suffix}"));
 
-    let config = BigtableStorageConfig {
+    let mut config = BigtableStorageConfig {
         project_id,
         instance_id,
-        emulator_host: Some(host),
         dev_mode: true,
         ..BigtableStorageConfig::default()
     };
 
-    let client = match BigtableClient::connect(&config).await {
-        Ok(c) => Arc::new(c),
-        Err(e) => {
-            eprintln!("Skipping Bigtable emulator integration test (connect failed): {e}");
-            return None;
-        }
-    };
-
-    let mut admin = match AdminClient::connect(&client).await {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("Skipping Bigtable emulator integration test (admin connect failed): {e}");
-            return None;
-        }
-    };
-    if let Err(e) = admin.list_tables().await {
-        eprintln!("Skipping Bigtable emulator integration test (list_tables probe failed): {e}");
-        return None;
-    }
+    let (host, client) = resolve_reachable_emulator_host(&config).await?;
+    config.emulator_host = Some(host);
 
     let bootstrapper = BigtableBootstrapper::new(config.clone());
     bootstrapper
@@ -184,14 +232,17 @@ async fn test_bootstrapping_and_table_lifecycle() {
     };
 
     let bootstrapper = BigtableBootstrapper::new(ctx.config.clone());
-    assert!(bootstrapper.is_catalog_initialized().await.unwrap());
     assert!(bootstrapper.has_admin_user().await.unwrap());
 
-    let latest_expected = MigrationId::LATEST.number().to_string();
-    assert_eq!(
-        bootstrapper.read_catalog_version().await.unwrap(),
-        Some(latest_expected)
-    );
+    #[cfg(feature = "test-hooks")]
+    {
+        assert!(bootstrapper.is_catalog_initialized().await.unwrap());
+        let latest_expected = MigrationId::LATEST.number().to_string();
+        assert_eq!(
+            bootstrapper.read_catalog_version().await.unwrap(),
+            Some(latest_expected)
+        );
+    }
 
     let mig_status = BigtableCatalogMigrations
         .status(&Target::at(ctx.config.connection_string()))
@@ -1349,6 +1400,7 @@ async fn test_gsi_shadow_table_operations_and_query() {
 // -----------------------------------------------------------------------------
 // Test 6: TransactGetItems Read-Through-Log Rule
 // -----------------------------------------------------------------------------
+#[cfg(feature = "test-hooks")]
 #[tokio::test]
 async fn test_transact_get_items_read_through_log_rule() {
     let Some(ctx) = setup_emulator_context().await else {
@@ -1912,6 +1964,7 @@ async fn read_all_stream_records(
 // -----------------------------------------------------------------------------
 // Test 9: Fenced Single-Item Streams & Mid-Flight Crash Recovery
 // -----------------------------------------------------------------------------
+#[cfg(feature = "test-hooks")]
 #[tokio::test]
 async fn test_fenced_single_item_streams_and_crash_recovery() {
     let Some(ctx) = setup_emulator_context().await else {
@@ -2997,23 +3050,19 @@ async fn test_stream_disable_reenable_lineage() {
 // -----------------------------------------------------------------------------
 #[tokio::test]
 async fn test_split_catalog_and_data_instance_isolation() {
-    let host = match std::env::var("BIGTABLE_EMULATOR_HOST") {
-        Ok(h) if !h.trim().is_empty() => h,
-        _ => {
-            eprintln!("Skipping Bigtable test: emulator unavailable");
-            return;
-        }
-    };
-
     let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
-    let config = BigtableStorageConfig {
+    let mut config = BigtableStorageConfig {
         project_id: format!("split-proj-{suffix}"),
         instance_id: format!("cat-inst-{suffix}"),
         data_instance_id: Some(format!("data-inst-{suffix}")),
-        emulator_host: Some(host),
         dev_mode: true,
         ..BigtableStorageConfig::default()
     };
+    let Some((host, _)) = resolve_reachable_emulator_host(&config).await else {
+        eprintln!("Skipping Bigtable test: emulator unavailable");
+        return;
+    };
+    config.emulator_host = Some(host);
 
     let bootstrapper = BigtableBootstrapper::new(config.clone());
     bootstrapper
@@ -3240,14 +3289,15 @@ async fn test_split_catalog_and_data_instance_isolation() {
 // -----------------------------------------------------------------------------
 // Test 14: Reused Token Tombstone Safety, Post-Lease ABA Fencing, GSI TOCTOU & GC Workers
 // -----------------------------------------------------------------------------
+#[cfg(feature = "test-hooks")]
 #[tokio::test]
-async fn test_layer2_aba_fencing_reused_token_gsi_toctou_and_cleanup_workers() {
+async fn test_aba_fencing_reused_token_gsi_toctou_and_cleanup_workers() {
     let Some(ctx) = setup_emulator_context().await else {
         eprintln!("Skipping Bigtable test: emulator unavailable");
         return;
     };
 
-    let table_name = unique_name("tbl_l2_hardening");
+    let table_name = unique_name("tbl_aba_hardening");
     let create_desc = ctx
         .engine
         .create_table(
@@ -3291,7 +3341,7 @@ async fn test_layer2_aba_fencing_reused_token_gsi_toctou_and_cleanup_workers() {
             },
         )
         .await
-        .expect("create table for Layer-2 hardening test");
+        .expect("create table for ABA fencing hardening test");
 
     let key_info = ctx
         .engine
@@ -3703,7 +3753,7 @@ async fn test_layer2_aba_fencing_reused_token_gsi_toctou_and_cleanup_workers() {
 }
 
 // =============================================================================
-// Specula Formal Verification Remediation Suite (BUG-01 .. BUG-13)
+// Concurrency, Recovery, Stream Ordering & Index Edge-Case Suite
 // =============================================================================
 
 fn s_item(pairs: &[(&str, &str)]) -> Item {
@@ -3715,17 +3765,17 @@ fn s_item(pairs: &[(&str, &str)]) -> Item {
 }
 
 // -----------------------------------------------------------------------------
-// Test 15: BUG-01 & BUG-03 — 2PC CAS Commit vs Sweeper Race & Post-COMMITTED
-//          Intent Lease Expiry Protection
+// Test 15: 2PC CAS Commit vs Sweeper Race & Post-COMMITTED Intent Lease Protection
 // -----------------------------------------------------------------------------
+#[cfg(feature = "test-hooks")]
 #[tokio::test]
-async fn test_specula_bug01_bug03_2pc_cas_sweeper_race_and_expired_committed_intent() {
+async fn test_2pc_cas_sweeper_race_and_expired_committed_intent() {
     let Some(ctx) = setup_emulator_context().await else {
         eprintln!("Skipping Bigtable test: emulator unavailable");
         return;
     };
 
-    let table_name = unique_name("tbl_bug01_03");
+    let table_name = unique_name("tbl_2pc_sweeper_race");
     ctx.engine
         .create_table(
             &ctx.account_id,
@@ -3758,9 +3808,9 @@ async fn test_specula_bug01_bug03_2pc_cas_sweeper_race_and_expired_committed_int
     let data_table = ctx.engine.data_table_for(&key_info).await.unwrap();
     let empty_maps = ExpressionMaps::default();
 
-    // --- BUG-01 Part A: Sweeper CAS-aborts PENDING -> ABORTED before clearing intents, and
-    //                    late `commit()` / `try_commit_full()` both before and after row drop
-    //                    MUST fail CAS without creating a zombie COMMITTED row!
+    // --- Part A: Sweeper CAS-aborts PENDING -> ABORTED before clearing intents, and
+    //             late `commit()` / `try_commit_full()` both before and after row drop
+    //             MUST fail CAS without creating a zombie COMMITTED row!
     let coord = extenddb_storage_bigtable::transact::TxnCoordinator::new(
         ctx.engine.client_ref(),
         Duration::from_secs(1),
@@ -3824,7 +3874,7 @@ async fn test_specula_bug01_bug03_2pc_cas_sweeper_race_and_expired_committed_int
             late_commit_on_aborted,
             Err(StorageError::TransactionConflict(_))
         ),
-        "BUG-01: commit() MUST fail CAS when coordinator was transitioned to ABORTED"
+        "commit() MUST fail CAS when coordinator was transitioned to ABORTED"
     );
 
     extenddb_storage_bigtable::sweeper::sweep_with_cutoff_override(&ctx.engine, Some(i64::MAX))
@@ -3837,14 +3887,14 @@ async fn test_specula_bug01_bug03_2pc_cas_sweeper_race_and_expired_committed_int
         .unwrap();
     assert!(
         late_commit_after_drop.is_none(),
-        "BUG-01: try_commit_full after sweeper drop must return None"
+        "try_commit_full after sweeper drop must return None"
     );
     assert!(
         coord.get_state(&slow_txn).await.unwrap().is_none(),
-        "BUG-01: failed commit must NOT resurrect a zombie COMMITTED coordinator row"
+        "failed commit must NOT resurrect a zombie COMMITTED coordinator row"
     );
 
-    // --- BUG-01 Part B: Incarnation fencing on deterministic IDs (`started_at_micros` mismatch) ---
+    // --- Part B: Incarnation fencing on deterministic IDs (`started_at_micros` mismatch) ---
     let det_tid = format!("det-incarnation-{}", Uuid::new_v4().simple());
     let (_, inc1_start) = coord
         .open(&det_tid, std::slice::from_ref(&part_a))
@@ -3872,7 +3922,7 @@ async fn test_specula_bug01_bug03_2pc_cas_sweeper_race_and_expired_committed_int
             .await
             .unwrap()
             .is_none(),
-        "BUG-01: stale incarnation started_at_micros must NOT commit a newer PENDING incarnation"
+        "stale incarnation started_at_micros must NOT commit a newer PENDING incarnation"
     );
     coord
         .drop_matching_start(&det_tid, inc1_start)
@@ -3885,7 +3935,7 @@ async fn test_specula_bug01_bug03_2pc_cas_sweeper_race_and_expired_committed_int
             .unwrap()
             .and_then(|s| s.started_at),
         Some(inc2_start),
-        "BUG-01: drop_matching_start with stale started_at must NOT delete newer incarnation"
+        "drop_matching_start with stale started_at must NOT delete newer incarnation"
     );
     let _ = coord
         .try_abort_pending(&det_tid, inc2_start, inc2_start)
@@ -3895,7 +3945,7 @@ async fn test_specula_bug01_bug03_2pc_cas_sweeper_race_and_expired_committed_int
         .await
         .unwrap();
 
-    // --- BUG-01 Part C: 16-round concurrent race between try_commit_full + roll_forward vs sweeper ---
+    // --- Part C: 16-round concurrent race between try_commit_full + roll_forward vs sweeper ---
     for round in 0..16u32 {
         let ka = s_item(&[("pk", &format!("race_a_{round}"))]);
         let kb = s_item(&[("pk", &format!("race_b_{round}"))]);
@@ -3988,16 +4038,16 @@ async fn test_specula_bug01_bug03_2pc_cas_sweeper_race_and_expired_committed_int
         assert_eq!(
             got_a.is_some(),
             committed,
-            "BUG-01 round {round}: row A state must match coordinator commit outcome"
+            "round {round}: row A state must match coordinator commit outcome"
         );
         assert_eq!(
             got_a.is_some(),
             got_b.is_some(),
-            "BUG-01 round {round}: all-or-nothing 2PC atomicity violated (A={got_a:?}, B={got_b:?})"
+            "round {round}: all-or-nothing 2PC atomicity violated (A={got_a:?}, B={got_b:?})"
         );
     }
 
-    // --- BUG-03: Post-COMMITTED intent older than `intent_timeout_secs = 1` MUST NOT
+    // --- Part D: Post-COMMITTED intent older than `intent_timeout_secs = 1` MUST NOT
     //             regress `TransactGetItems` or allow conditional `attribute_not_exists(pk)` bypass!
     let short_lease_engine = BigtableEngine::new(ctx.client.clone(), ctx.client.clone(), 1);
     let capture = StreamCapture {
@@ -4025,7 +4075,7 @@ async fn test_specula_bug01_bug03_2pc_cas_sweeper_race_and_expired_committed_int
     assert_eq!(
         tget[0].as_ref().and_then(|i| i.get("val")),
         Some(&AttributeValue::S("must_not_regress".into())),
-        "BUG-03: TransactGetItems must NOT ignore COMMITTED intent after wall-clock lease expiry"
+        "TransactGetItems must NOT ignore COMMITTED intent after wall-clock lease expiry"
     );
 
     let cond_not_exists = parse_cond("attribute_not_exists(pk)");
@@ -4048,7 +4098,7 @@ async fn test_specula_bug01_bug03_2pc_cas_sweeper_race_and_expired_committed_int
                 Some(&AttributeValue::S("must_not_regress".into()))
             );
         }
-        other => panic!("BUG-03: expected ConditionFailed(Some(committed)), got {other:?}"),
+        other => panic!("expected ConditionFailed(Some(committed)), got {other:?}"),
     }
     let after_roll = short_lease_engine
         .get_item(&key_info, &committed_key)
@@ -4062,17 +4112,17 @@ async fn test_specula_bug01_bug03_2pc_cas_sweeper_race_and_expired_committed_int
 }
 
 // -----------------------------------------------------------------------------
-// Test 16: BUG-02 — `TransactGetItems` Key Validation, Dedup, Linearizable
-//          Multi-Row Snapshot & Zero HTTP 500s
+// Test 16: `TransactGetItems` Key Validation, Dedup, Double-Read Multi-Row
+//          Snapshot Validation & Zero HTTP 500s
 // -----------------------------------------------------------------------------
 #[tokio::test]
-async fn test_specula_bug02_transact_get_items_linearizable_snapshot_validation_and_zero_500s() {
+async fn test_transact_get_items_double_read_snapshot_validation_and_zero_500s() {
     let Some(ctx) = setup_emulator_context().await else {
         eprintln!("Skipping Bigtable test: emulator unavailable");
         return;
     };
 
-    let table_name = unique_name("tbl_bug02_snap");
+    let table_name = unique_name("tbl_tget_snap");
     ctx.engine
         .create_table(
             &ctx.account_id,
@@ -4194,7 +4244,7 @@ async fn test_specula_bug02_transact_get_items_linearizable_snapshot_validation_
                 ];
                 match eng.transact_write_items(&ops, None).await {
                     Ok(()) | Err(StorageError::TransactionCanceled(_)) => {}
-                    Err(other) => panic!("BUG-02/11: unexpected writer error: {other:?}"),
+                    Err(other) => panic!("unexpected writer error: {other:?}"),
                 }
             }
             done_w.store(true, std::sync::atomic::Ordering::Release);
@@ -4235,13 +4285,13 @@ async fn test_specula_bug02_transact_get_items_linearizable_snapshot_validation_
                         assert_eq!(
                             ba + bb,
                             1000,
-                            "BUG-02: torn TransactGetItems snapshot observed (acct_a={ba}, acct_b={bb})"
+                            "torn TransactGetItems snapshot observed (acct_a={ba}, acct_b={bb})"
                         );
                         verified += 1;
                     }
                     Err(StorageError::TransactionCanceled(_)) => {}
                     Err(other) => {
-                        panic!("BUG-02: unexpected TransactGetItems error (HTTP 500): {other:?}")
+                        panic!("unexpected TransactGetItems error (HTTP 500): {other:?}")
                     }
                 }
                 reads += 1;
@@ -4262,18 +4312,18 @@ async fn test_specula_bug02_transact_get_items_linearizable_snapshot_validation_
 }
 
 // -----------------------------------------------------------------------------
-// Test 17: BUG-04, BUG-05 & BUG-12 — Contiguous Per-Shard Stream Slots,
-//          Concurrent Multi-Caller Dedup, Phantom Guard & Live Tailing Contention
+// Test 17: Contiguous Per-Shard Stream Slots, Concurrent Multi-Caller Dedup,
+//          Phantom Guard & Live Tailing Contention
 // -----------------------------------------------------------------------------
+#[cfg(feature = "test-hooks")]
 #[tokio::test]
-async fn test_specula_bug04_bug05_bug12_streams_contiguous_slots_concurrent_dedup_phantom_and_contention()
- {
+async fn test_streams_contiguous_slots_concurrent_dedup_phantom_and_contention() {
     let Some(ctx) = setup_emulator_context().await else {
         eprintln!("Skipping Bigtable test: emulator unavailable");
         return;
     };
 
-    let table_name = unique_name("tbl_bug04_05_12");
+    let table_name = unique_name("tbl_stream_slots");
     let desc = ctx
         .engine
         .create_table(
@@ -4334,7 +4384,7 @@ async fn test_specula_bug04_bug05_bug12_streams_contiguous_slots_concurrent_dedu
     }
     assert!(!second_pk.is_empty(), "must find second key on same shard");
 
-    // --- BUG-04 Part A: Out-of-order Phase 2 persistence on same shard must NEVER skip earlier commit ---
+    // --- Part A: Out-of-order Phase 2 persistence on same shard must NEVER skip earlier commit ---
     let txn1_id = ctx
         .engine
         .debug_fenced_put_commit_only(
@@ -4393,7 +4443,7 @@ async fn test_specula_bug04_bug05_bug12_streams_contiguous_slots_concurrent_dedu
     assert_eq!(
         batch2.len(),
         1,
-        "BUG-04: delayed Phase 2 stream record on same shard must NOT be skipped after consumer cursor advances"
+        "delayed Phase 2 stream record on same shard must NOT be skipped after consumer cursor advances"
     );
     assert_eq!(
         batch2[0].dynamodb.keys.get("pk"),
@@ -4402,7 +4452,7 @@ async fn test_specula_bug04_bug05_bug12_streams_contiguous_slots_concurrent_dedu
     assert!(batch2[0].dynamodb.sequence_number > cursor1);
     let cursor2 = cursor2.expect("cursor after recovered first_commit");
 
-    // --- BUG-04 Part B: 12 concurrent callers racing `streams::write_record_ordered`
+    // --- Part B: 12 concurrent callers racing `streams::write_record_ordered`
     //     on SEPARATE client connections with the SAME `event_id` MUST emit AT MOST ONCE!
     let shared_dedup_rec = extenddb_storage_bigtable::streams::build_record(
         desc.stream_specification.as_ref(),
@@ -4455,7 +4505,7 @@ async fn test_specula_bug04_bug05_bug12_streams_contiguous_slots_concurrent_dedu
     assert_eq!(dedup_batch[0].event_id, expected_event_id);
     let cursor3 = cursor3.expect("cursor after dedup_once");
 
-    // --- BUG-05: Superseded `roll_forward` must emit ZERO phantom stream records ---
+    // --- Part C: Superseded `roll_forward` must emit ZERO phantom stream records ---
     let data_table = ctx.engine.data_table_for(&key_info).await.unwrap();
     let sup_key = s_item(&[("pk", "shard_probe_0")]);
     let sup_part = extenddb_storage_bigtable::transact::ParticipantRow {
@@ -4519,10 +4569,10 @@ async fn test_specula_bug04_bug05_bug12_streams_contiguous_slots_concurrent_dedu
         .unwrap();
     assert!(
         phantom_check.is_empty(),
-        "BUG-05: superseded roll_forward must emit ZERO phantom stream records"
+        "superseded roll_forward must emit ZERO phantom stream records"
     );
 
-    // --- BUG-04 & BUG-12: 36-way concurrent single-item UpdateItem ADD on stream-enabled table
+    // --- Part D: 36-way concurrent single-item UpdateItem ADD on stream-enabled table
     //     WITH a live tailing consumer polling `get_stream_records` concurrently!
     let hot_key = s_item(&[("pk", "hot_stream_counter")]);
     let hot_shard = ctx
@@ -4577,7 +4627,7 @@ async fn test_specula_bug04_bug05_bug12_streams_contiguous_slots_concurrent_dedu
                 .insert("one".into(), AttributeValue::N("1".into()));
             eng.update_item(&ki, &hk, &acts, false, true, None, &maps, Some(&cap))
                 .await
-                .expect("BUG-12: unconditional single-item stream UpdateItem must not abort with TransactionConflict")
+                .expect("unconditional single-item stream UpdateItem must not abort with TransactionConflict")
         }));
     }
     for h in handles {
@@ -4595,12 +4645,12 @@ async fn test_specula_bug04_bug05_bug12_streams_contiguous_slots_concurrent_dedu
     assert_eq!(
         tailed_hot_recs.len(),
         36,
-        "BUG-04/12: live tailing consumer must observe all 36 stream events without skipping any sequence number"
+        "live tailing consumer must observe all 36 stream events without skipping any sequence number"
     );
     for pair in tailed_hot_recs.windows(2) {
         assert!(
             pair[0].dynamodb.sequence_number < pair[1].dynamodb.sequence_number,
-            "BUG-04: tailed sequence numbers must be strictly increasing"
+            "tailed sequence numbers must be strictly increasing"
         );
     }
 
@@ -4613,7 +4663,7 @@ async fn test_specula_bug04_bug05_bug12_streams_contiguous_slots_concurrent_dedu
     assert_eq!(
         final_hot.get("cnt"),
         Some(&AttributeValue::N("36".into())),
-        "BUG-12: all 36 concurrent stream-enabled UpdateItem increments must apply with zero lost updates"
+        "all 36 concurrent stream-enabled UpdateItem increments must apply with zero lost updates"
     );
 
     let disable_stream_in: extenddb_core::types::UpdateTableInput =
@@ -4639,17 +4689,18 @@ async fn test_specula_bug04_bug05_bug12_streams_contiguous_slots_concurrent_dedu
 }
 
 // -----------------------------------------------------------------------------
-// Test 18: BUG-06 & BUG-10 — `roll_forward` TTL Index Maintenance, `1000->future->1000`
-//          ABA, Same-Second Fractional Restamping & Millisecond-Aligned Bounds
+// Test 18: `roll_forward` TTL Index Maintenance, `1000->future->1000` ABA,
+//          Same-Second Fractional Restamping & Millisecond-Aligned Bounds
 // -----------------------------------------------------------------------------
+#[cfg(feature = "test-hooks")]
 #[tokio::test]
-async fn test_specula_bug06_bug10_ttl_roll_forward_aba_same_second_fractional_and_millis_bounds() {
+async fn test_ttl_roll_forward_aba_same_second_fractional_and_millis_bounds() {
     let Some(ctx) = setup_emulator_context().await else {
         eprintln!("Skipping Bigtable test: emulator unavailable");
         return;
     };
 
-    let table_name = unique_name("tbl_bug06_10_ttl");
+    let table_name = unique_name("tbl_ttl_roll_forward");
     ctx.engine
         .create_table(
             &ctx.account_id,
@@ -4690,7 +4741,7 @@ async fn test_specula_bug06_bug10_ttl_roll_forward_aba_same_second_fractional_an
     };
     let empty_maps = ExpressionMaps::default();
 
-    // --- BUG-06: Crash right after `COMMITTED` on a TTL item (`ttl = 1000`),
+    // --- Part A: Crash right after `COMMITTED` on a TTL item (`ttl = 1000`),
     //             recover via `sweeper`, then run `ttl_worker::sweep_once`:
     //             `roll_forward` MUST populate `__extenddb_ttl_index__` so `ttl_worker` evicts it!
     let mut crashed_ttl_item = s_item(&[("pk", "ttl_crash_rec")]);
@@ -4720,10 +4771,10 @@ async fn test_specula_bug06_bug10_ttl_roll_forward_aba_same_second_fractional_an
             .await
             .unwrap()
             .is_none(),
-        "BUG-06: roll_forward must populate __extenddb_ttl_index__ so expired item is swept"
+        "roll_forward must populate __extenddb_ttl_index__ so expired item is swept"
     );
 
-    // --- BUG-10: `1000 -> 9999999999 -> 1000 -> 1000.5` ABA + same-second fractional restamping +
+    // --- Part B: `1000 -> 9999999999 -> 1000 -> 1000.5` ABA + same-second fractional restamping +
     //     millisecond-aligned (`% 1_000 == 0`) TTL index timestamps!
     let aba_key = s_item(&[("pk", "ttl_aba_item")]);
     for exp in ["1000", "9999999999", "1000", "1000.5"] {
@@ -4796,7 +4847,7 @@ async fn test_specula_bug06_bug10_ttl_roll_forward_aba_same_second_fractional_an
             .await
             .unwrap()
             .is_none(),
-        "BUG-10: 1000 -> future -> 1000 -> 1000.5 ABA item must be evicted by ttl_worker"
+        "1000 -> future -> 1000 -> 1000.5 ABA item must be evicted by ttl_worker"
     );
 
     // Stale-900 index entry when live item has expired ttl = 1000 (!= 900):
@@ -4866,22 +4917,23 @@ async fn test_specula_bug06_bug10_ttl_roll_forward_aba_same_second_fractional_an
             .await
             .unwrap()
             .is_none(),
-        "BUG-10: ttl_worker scanning expiry=900 must still evict live item with expired ttl=1000"
+        "ttl_worker scanning expiry=900 must still evict live item with expired ttl=1000"
     );
 }
 
 // -----------------------------------------------------------------------------
-// Test 19: BUG-07 & BUG-11 — `ClientRequestToken` 4 Vectors, Empty-Ops Replay,
-//          Reused-Token `clear_intent_up_to`, Sorted Locking & CCF
+// Test 19: `ClientRequestToken` 4 Vectors, Empty-Ops Replay, Reused-Token
+//          `clear_intent_up_to`, Sorted Locking & CCF
 // -----------------------------------------------------------------------------
+#[cfg(feature = "test-hooks")]
 #[tokio::test]
-async fn test_specula_bug07_bug11_idempotency_four_vectors_sorted_locking_and_ccf() {
+async fn test_idempotency_four_vectors_sorted_locking_and_ccf() {
     let Some(ctx) = setup_emulator_context().await else {
         eprintln!("Skipping Bigtable test: emulator unavailable");
         return;
     };
 
-    let table_name = unique_name("tbl_bug07_11");
+    let table_name = unique_name("tbl_idem_locking");
     ctx.engine
         .create_table(
             &ctx.account_id,
@@ -4909,7 +4961,7 @@ async fn test_specula_bug07_bug11_idempotency_four_vectors_sorted_locking_and_cc
         .unwrap();
     let empty_maps = ExpressionMaps::default();
 
-    // --- BUG-07(a): 8 simultaneous concurrent calls with identical ClientRequestToken ---
+    // --- Part A: 8 simultaneous concurrent calls with identical ClientRequestToken ---
     let simul_key = s_item(&[("pk", "idem_simul_counter")]);
     let mut simul_handles = Vec::new();
     for _ in 0..8usize {
@@ -4947,16 +4999,13 @@ async fn test_specula_bug07_bug11_idempotency_four_vectors_sorted_locking_and_cc
         match h.await.unwrap() {
             Ok(()) => ok_count += 1,
             Err(StorageError::IdempotentReplay) => replay_count += 1,
-            other => panic!("BUG-07a: unexpected concurrent token result: {other:?}"),
+            other => panic!("unexpected concurrent token result: {other:?}"),
         }
     }
-    assert_eq!(
-        ok_count, 1,
-        "BUG-07a: exactly one leader must return Ok(())"
-    );
+    assert_eq!(ok_count, 1, "exactly one leader must return Ok(())");
     assert_eq!(
         replay_count, 7,
-        "BUG-07a: all 7 followers must return Err(IdempotentReplay)"
+        "all 7 followers must return Err(IdempotentReplay)"
     );
     let simul_item = ctx
         .engine
@@ -4967,10 +5016,10 @@ async fn test_specula_bug07_bug11_idempotency_four_vectors_sorted_locking_and_cc
     assert_eq!(
         simul_item.get("cnt"),
         Some(&AttributeValue::N("10".into())),
-        "BUG-07a: concurrent token transaction must execute AT MOST ONCE"
+        "concurrent token transaction must execute AT MOST ONCE"
     );
 
-    // --- BUG-07(b): Crashed COMMITTED token txn before `idem:` exists:
+    // --- Part B: Crashed COMMITTED token txn before `idem:` exists:
     //                mismatched payload (including empty `&[]` ops!) returns IdempotentMismatch;
     //                matching payload returns IdempotentReplay (never Ok)!
     use sha2::{Digest, Sha256};
@@ -5045,7 +5094,7 @@ async fn test_specula_bug07_bug11_idempotency_four_vectors_sorted_locking_and_cc
         .await;
     assert!(
         matches!(empty_mismatch_res, Err(StorageError::IdempotentMismatch)),
-        "BUG-07b: empty-ops mismatched payload against COMMITTED token txn must return IdempotentMismatch"
+        "empty-ops mismatched payload against COMMITTED token txn must return IdempotentMismatch"
     );
 
     let replay_res = ctx
@@ -5068,7 +5117,7 @@ async fn test_specula_bug07_bug11_idempotency_four_vectors_sorted_locking_and_cc
         .await;
     assert!(
         matches!(replay_res, Err(StorageError::IdempotentReplay)),
-        "BUG-07b: matching replay must return IdempotentReplay, got {replay_res:?}"
+        "matching replay must return IdempotentReplay, got {replay_res:?}"
     );
 
     // Verify `clear_intent_up_to` protects a newer reused-token intent timestamp from stale cleanup:
@@ -5112,7 +5161,7 @@ async fn test_specula_bug07_bug11_idempotency_four_vectors_sorted_locking_and_cc
     );
     coord.clear_intent(&derived_tid_b, &part_b).await.unwrap();
 
-    // --- BUG-07(c) & (d): Sweeper persists `idem:` before dropping recovered token txn,
+    // --- Part C & D: Sweeper persists `idem:` before dropping recovered token txn,
     //                      and expired (>600s) `applied_at` allows fresh execution!
     let tok_c = "tok-sweep-c";
     let derived_tid_c = {
@@ -5222,9 +5271,9 @@ async fn test_specula_bug07_bug11_idempotency_four_vectors_sorted_locking_and_cc
             }),
         )
         .await
-        .expect("BUG-07d: expired >10m idempotency record must allow token reuse");
+        .expect("expired >10m idempotency record must allow token reuse");
 
-    // --- BUG-11: Sorted [k1, k2] vs [k2, k1] locking & ReturnValuesOnConditionCheckFailure ---
+    // --- Part E: Sorted [k1, k2] vs [k2, k1] locking & ReturnValuesOnConditionCheckFailure ---
     let k1 = s_item(&[("pk", "lock_k1")]);
     let k2 = s_item(&[("pk", "lock_k2")]);
     let mut lock_handles = Vec::new();
@@ -5272,7 +5321,7 @@ async fn test_specula_bug07_bug11_idempotency_four_vectors_sorted_locking_and_cc
             Ok(()) => committed_pairs += 1,
             Err(StorageError::TransactionCanceled(_)) => {}
             Err(other) => {
-                panic!("BUG-11: 2PC conflict must return TransactionCanceled, got {other:?}")
+                panic!("2PC conflict must return TransactionCanceled, got {other:?}")
             }
         }
     }
@@ -5306,7 +5355,7 @@ async fn test_specula_bug07_bug11_idempotency_four_vectors_sorted_locking_and_cc
                 assert_eq!(
                     reasons[0].item.is_some(),
                     expect_some,
-                    "BUG-11: ReturnValuesOnConditionCheckFailure={rv_ccf:?} item presence mismatch"
+                    "ReturnValuesOnConditionCheckFailure={rv_ccf:?} item presence mismatch"
                 );
             }
             other => panic!("expected TransactionCanceled, got {other:?}"),
@@ -5315,12 +5364,11 @@ async fn test_specula_bug07_bug11_idempotency_four_vectors_sorted_locking_and_cc
 }
 
 // -----------------------------------------------------------------------------
-// Test 20: BUG-08, BUG-09 & BUG-13 — GSI Version Guard, CREATING Read Refusal,
-//          Full `UpdateTable` GSI Lifecycle, LSI `Scan` Sparse/Sort/Deleted-ESK/LEK & CAS RMW
+// Test 20: GSI Version Guard, CREATING Read Refusal, Full `UpdateTable` GSI
+//          Lifecycle, LSI `Scan` Sparse/Sort/Deleted-ESK/LEK & CAS RMW
 // -----------------------------------------------------------------------------
 #[tokio::test]
-async fn test_specula_bug08_bug09_bug13_gsi_version_guard_creating_refusal_update_table_lsi_scan_and_cas()
- {
+async fn test_gsi_version_guard_creating_refusal_update_table_lsi_scan_and_cas() {
     use extenddb_core::types::{
         CreateGsiAction, DeleteGsiAction, GlobalSecondaryIndexUpdate, LsiInput, Tag,
         UpdateGsiAction, UpdateTableInput, WarmThroughput,
@@ -5333,7 +5381,7 @@ async fn test_specula_bug08_bug09_bug13_gsi_version_guard_creating_refusal_updat
         return;
     };
 
-    let table_name = unique_name("tbl_bug08_09_13");
+    let table_name = unique_name("tbl_gsi_lsi_cas");
     let initial_desc = ctx
         .engine
         .create_table(
@@ -5422,8 +5470,8 @@ async fn test_specula_bug08_bug09_bug13_gsi_version_guard_creating_refusal_updat
             .unwrap();
     }
 
-    // --- BUG-13a: LSI `Scan` with `limit = 2` when `key_info.key_schema` is overwritten
-    //              by `extenddb-engine` to `lsi.key_schema`:
+    // --- Part A: LSI `Scan` with `limit = 2` when `key_info.key_schema` is overwritten
+    //             by `extenddb-engine` to `lsi.key_schema`:
     let mut engine_lsi_ki = base_ki.clone();
     engine_lsi_ki.key_schema = base_ki.local_secondary_indexes[0].key_schema.clone();
 
@@ -5435,14 +5483,14 @@ async fn test_specula_bug08_bug09_bug13_gsi_version_guard_creating_refusal_updat
     assert_eq!(
         page1.len(),
         2,
-        "BUG-13: LSI Scan with Limit=2 must skip sparse rows BEFORE applying Limit"
+        "LSI Scan with Limit=2 must skip sparse rows BEFORE applying Limit"
     );
     assert_eq!(page1[0].get("sk"), Some(&AttributeValue::S("z".into())));
     assert_eq!(page1[1].get("sk"), Some(&AttributeValue::S("m1".into())));
-    let lek1 = lek1.expect("BUG-13: LSI Scan page 1 must emit LastEvaluatedKey");
+    let lek1 = lek1.expect("LSI Scan page 1 must emit LastEvaluatedKey");
     assert!(
         lek1.contains_key("pk") && lek1.contains_key("sk") && lek1.contains_key("score"),
-        "BUG-13: LSI Scan LastEvaluatedKey must include (pk, base_sk, lsi_sk), got {lek1:?}"
+        "LSI Scan LastEvaluatedKey must include (pk, base_sk, lsi_sk), got {lek1:?}"
     );
 
     // Delete the `lek1` item ("m1") BEFORE calling page 2 to verify deleted-ESK resumption,
@@ -5470,7 +5518,7 @@ async fn test_specula_bug08_bug09_bug13_gsi_version_guard_creating_refusal_updat
     assert_eq!(page2[1].get("sk"), Some(&AttributeValue::S("a".into())));
     assert!(
         lek2.is_none(),
-        "BUG-13: exact exhaustion after remaining LSI items must emit lek=None"
+        "exact exhaustion after remaining LSI items must emit lek=None"
     );
 
     // Re-insert m1
@@ -5481,7 +5529,7 @@ async fn test_specula_bug08_bug09_bug13_gsi_version_guard_creating_refusal_updat
         .await
         .unwrap();
 
-    // --- BUG-09: `UpdateTable` GSI Create + backfill + TableClass + WarmThroughput ---
+    // --- Part B: `UpdateTable` GSI Create + backfill + TableClass + WarmThroughput ---
     let upd_desc = ctx
         .engine
         .update_table(
@@ -5528,7 +5576,7 @@ async fn test_specula_bug08_bug09_bug13_gsi_version_guard_creating_refusal_updat
             },
         )
         .await
-        .expect("BUG-09: UpdateTable GSI Create must succeed");
+        .expect("UpdateTable GSI Create must succeed");
 
     assert_eq!(
         upd_desc.table_class_summary,
@@ -5650,7 +5698,7 @@ async fn test_specula_bug08_bug09_bug13_gsi_version_guard_creating_refusal_updat
         .expect("GSI query succeeds once promoted ACTIVE");
     assert_eq!(after_prom.len(), 4);
 
-    // --- BUG-08: Delayed older version (`v1 < v2`) Put/Delete and orphan guard on GSI shadow ---
+    // --- Part C: Delayed older version (`v1 < v2`) Put/Delete and orphan guard on GSI shadow ---
     let data_table = fresh_eng.data_table_for(&promoted_ki).await.unwrap();
     let shadow_table = extenddb_storage_bigtable::gsi::shadow_table_id(&data_table, "by_dept");
     let shadow_ops = extenddb_storage_bigtable::data::item_ops::ItemOps::new(
@@ -5673,14 +5721,14 @@ async fn test_specula_bug08_bug09_bug13_gsi_version_guard_creating_refusal_updat
             .put_shadow_versioned(&shadow_rk, &stale_shadow_item, 1)
             .await
             .unwrap(),
-        "BUG-08: delayed older version Put on GSI shadow must be rejected"
+        "delayed older version Put on GSI shadow must be rejected"
     );
     assert!(
         !shadow_ops
             .delete_shadow_versioned(&shadow_rk, 1)
             .await
             .unwrap(),
-        "BUG-08: delayed older version Delete on GSI shadow must be rejected"
+        "delayed older version Delete on GSI shadow must be rejected"
     );
 
     // Seed an unversioned orphaned shadow row whose base row ("p_ghost", "sk_ghost") never existed,
@@ -5708,7 +5756,7 @@ async fn test_specula_bug08_bug09_bug13_gsi_version_guard_creating_refusal_updat
             .put_shadow_versioned(&ghost_shadow_rk, &ghost_item, 1)
             .await
             .unwrap(),
-        "BUG-08: orphan cleanup must retain monotonic m:v tombstone rejecting delayed v1 Put"
+        "orphan cleanup must retain monotonic m:v tombstone rejecting delayed v1 Put"
     );
     let (post_orphan_eng, _) = fresh_eng
         .query(&promoted_ki, &kc, &qmaps, true, None, None, Some("by_dept"))
@@ -5791,10 +5839,10 @@ async fn test_specula_bug08_bug09_bug13_gsi_version_guard_creating_refusal_updat
             .attribute_definitions
             .iter()
             .any(|a| a.attribute_name == "dept"),
-        "BUG-09: deleting GSI must prune orphaned dept AttributeDefinition"
+        "deleting GSI must prune orphaned dept AttributeDefinition"
     );
 
-    // --- BUG-13b: Concurrent CAS `MetricsStore::insert_metrics` (20-way) & `tag_resource` (16-way) ---
+    // --- Part D: Concurrent CAS `MetricsStore::insert_metrics` (20-way) & `tag_resource` (16-way) ---
     let cat_store = Arc::new(BigtableCatalogStore::new(ctx.client.clone(), None, true));
     let bucket_ts = time::OffsetDateTime::from_unix_timestamp(1_750_000_020).unwrap();
     let mut m_handles = Vec::new();
@@ -5837,7 +5885,7 @@ async fn test_specula_bug08_bug09_bug13_gsi_version_guard_creating_refusal_updat
     assert_eq!(queried_metrics.len(), 1);
     assert_eq!(
         queried_metrics[0].count, 20,
-        "BUG-13: concurrent MetricsStore::insert_metrics must accumulate all 20 increments via CAS"
+        "concurrent MetricsStore::insert_metrics must accumulate all 20 increments via CAS"
     );
     assert!((queried_metrics[0].sum - 30.0).abs() < 1e-6);
 
@@ -5864,6 +5912,18 @@ async fn test_specula_bug08_bug09_bug13_gsi_version_guard_creating_refusal_updat
     assert_eq!(
         tags.len(),
         16,
-        "BUG-13: concurrent tag_resource calls must preserve all 16 tags via CAS"
+        "concurrent tag_resource calls must preserve all 16 tags via CAS"
     );
+}
+
+#[test]
+fn test_required_flag_parsing() {
+    assert!(!is_required_flag_enabled(None));
+    assert!(!is_required_flag_enabled(Some("")));
+    assert!(!is_required_flag_enabled(Some("   ")));
+    assert!(!is_required_flag_enabled(Some("0")));
+    assert!(!is_required_flag_enabled(Some(" 0 ")));
+    assert!(is_required_flag_enabled(Some("1")));
+    assert!(is_required_flag_enabled(Some("true")));
+    assert!(is_required_flag_enabled(Some("required")));
 }

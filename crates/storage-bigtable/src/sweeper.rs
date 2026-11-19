@@ -5,12 +5,11 @@
 //!
 //! Sweeps the coordinator transaction log table `__extenddb_txn_log__` and:
 //! - CAS-transitions timed-out `PENDING` transactions to `ABORTED` (`try_abort_pending`)
-//!   *before* clearing participant intents (`BUG-01`, `AllOrNothing2PCAtomicity`),
-//!   preventing partial 2PC commits when racing a live coordinator.
+//!   *before* clearing participant intents, preventing partial 2PC commits when
+//!   racing a live coordinator.
 //! - Rolls forward `COMMITTED` transactions idempotently (`roll_forward`),
-//!   applying base mutations, versioned GSI shadow writes, `TxnTtlMutation`s
-//!   (`BUG-06`), ordered deduplicated stream records (`BUG-04`, `BUG-05`), and
-//!   `ClientRequestToken` `idem:` entries (`BUG-07c`).
+//!   applying base mutations, versioned GSI shadow writes, `TxnTtlMutation`s,
+//!   ordered deduplicated stream records, and `ClientRequestToken` `idem:` entries.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,12 +58,21 @@ pub async fn run(engine: Arc<BigtableEngine>, cadence: Duration, shutdown: Cance
 
 /// Run one sweep pass over `__extenddb_txn_log__`.
 pub async fn sweep_once(engine: &BigtableEngine) -> Result<(), String> {
-    sweep_with_cutoff_override(engine, None).await
+    sweep_inner(engine, None).await
 }
 
 /// Run one sweep pass with an optional cutoff timestamp override (for testing
 /// immediate recovery without sleeping `intent_timeout_secs`).
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
 pub async fn sweep_with_cutoff_override(
+    engine: &BigtableEngine,
+    cutoff_override_micros: Option<i64>,
+) -> Result<(), String> {
+    sweep_inner(engine, cutoff_override_micros).await
+}
+
+async fn sweep_inner(
     engine: &BigtableEngine,
     cutoff_override_micros: Option<i64>,
 ) -> Result<(), String> {

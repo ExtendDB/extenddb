@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! GSI Background Reconciler Worker & Backfill Engine (`BUG-08`, `BUG-09`).
+//! GSI Background Reconciler Worker & Backfill Engine.
 //!
 //! Scans GSI shadow tables, verifies them against base table rows, and repairs
 //! mismatches using freshly re-read `(base_item, occ_version)` pairs guarded by

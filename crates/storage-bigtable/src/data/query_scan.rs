@@ -213,7 +213,7 @@ fn check_defined_scalar_type(
 }
 
 /// Validate and decode an LSI `ExclusiveStartKey` into
-/// `(pk_prefix, lsi_sk_sort_bytes, base_sk_sort_bytes)` (`BUG-13`).
+/// `(pk_prefix, lsi_sk_sort_bytes, base_sk_sort_bytes)`.
 fn parse_lsi_exclusive_start_key(
     esk: &Item,
     base_key_info: &TableKeyInfo,
@@ -551,7 +551,7 @@ impl<'a> QueryScan<'a> {
         Ok((items, last_evaluated))
     }
 
-    /// Run a Query against a Local Secondary Index (`BUG-13`).
+    /// Run a Query against a Local Secondary Index.
     #[allow(clippy::too_many_arguments)]
     pub async fn query_lsi(
         &self,
@@ -669,7 +669,7 @@ impl<'a> QueryScan<'a> {
         Ok((items, last_evaluated))
     }
 
-    /// Run a Scan against a Local Secondary Index (`BUG-13`; `RFC-0003` §7.1, §7.2, §7.4).
+    /// Run a Scan against a Local Secondary Index (`RFC-0003` §7.1, §7.2, §7.4).
     ///
     /// Streams partitions forward, filtering out sparse base items missing
     /// `lsi_sk_name` *before* applying `limit`, sorting each partition by

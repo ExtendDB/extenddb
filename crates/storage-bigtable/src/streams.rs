@@ -10,10 +10,10 @@
 //! - `stream_record:<shard_id>:<seq_26>` — one `StreamRecord` row per contiguous
 //!   shard log slot (`slot_sequence_number(shard_id, slot)`), claimed via atomic
 //!   `Catalog::put_if_absent` so `seq_2 > seq_1` can never become visible on a
-//!   shard ahead of `seq_1` (`RFC-0003` §5.2, `BUG-04`).
+//!   shard ahead of `seq_1` (`RFC-0003` §5.2).
 //! - `stream_dedup:<shard_id>:<dedup_key>` — exact-once publication marker ensuring
 //!   concurrent or retried `roll_forward` / `sweeper` passes never emit duplicate
-//!   stream records (`BUG-04`, `BUG-05`).
+//!   stream records.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -35,7 +35,7 @@ use crate::catalog::{Catalog, CatalogJsonAction};
 pub const SEQUENCE_NUMBER_WIDTH: usize = 26;
 
 /// Placeholder sequence number stored during Phase 1 before Phase 2 assigns a
-/// contiguous per-shard log slot (`BUG-04`).
+/// contiguous per-shard log slot.
 pub const UNASSIGNED_SEQUENCE_NUMBER: &str = "00000000000000000000000000";
 
 const EVENT_SOURCE: &str = "aws:dynamodb";
@@ -108,7 +108,7 @@ pub fn shard_label_millis_and_index(shard_id: &str) -> (u64, u8) {
 }
 
 /// Deterministic 26-digit sequence number for `(shard_id, slot)` (`slot >= 1`):
-/// `{label_millis:013}{slot:011}{shard_idx:02}` (`BUG-04`).
+/// `{label_millis:013}{slot:011}{shard_idx:02}`.
 ///
 /// Because `label_millis` and `shard_idx` are fixed per `shard_id`, slot `k`
 /// maps bijectively to one exact `stream_record:<shard_id>:<seq_26>` key, so
@@ -166,7 +166,7 @@ pub fn next_sequence_number() -> String {
 }
 
 /// Weak-reference registry of per-shard async mutexes so concurrent in-process
-/// stream writers on the same shard serialize cleanly without CAS contention (`BUG-04`).
+/// stream writers on the same shard serialize cleanly without CAS contention.
 fn shard_local_mutex(shard_id: &str) -> Arc<tokio::sync::Mutex<()>> {
     static SHARD_LOCKS: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> =
         OnceLock::new();
@@ -283,7 +283,7 @@ pub async fn put_shard(cat: &Catalog<'_>, shard: &ShardMeta) -> Result<(), Strin
     cat.put(&keys::stream_shard(&shard.shard_id), &body).await
 }
 
-/// Insert a shard metadata row only if it does not already exist (`BUG-12`).
+/// Insert a shard metadata row only if it does not already exist.
 pub async fn put_shard_if_absent(cat: &Catalog<'_>, shard: &ShardMeta) -> Result<bool, String> {
     let body = serde_json::to_value(shard).map_err(|e| format!("encode shard meta: {e}"))?;
     cat.put_if_absent(&keys::stream_shard(&shard.shard_id), &body)
@@ -364,8 +364,8 @@ pub async fn ensure_shard_past_record(
     Ok(())
 }
 
-/// Close each open shard in `shard_ids` atomically via `Catalog::mutate_json_cas`
-/// (`BUG-12`, `BUG-13`), preserving concurrent `next_seq_num` / `last_sequence_number` advances.
+/// Close each open shard in `shard_ids` atomically via `Catalog::mutate_json_cas`,
+/// preserving concurrent `next_seq_num` / `last_sequence_number` advances.
 pub async fn close_shards_by_id(cat: &Catalog<'_>, shard_ids: &[String]) -> Result<(), String> {
     for sid in shard_ids {
         let fallback_latest = latest_sequence_for_shard(cat, sid).await?;
@@ -428,7 +428,7 @@ async fn persist_dedup_marker(cat: &Catalog<'_>, rk: &str, seq: &str, created_at
 }
 
 /// Append a stream record into the next contiguous per-shard log slot with
-/// exact-once cross-node deduplication (`BUG-04`, `BUG-05`, `RFC-0003` §5.2).
+/// exact-once cross-node deduplication (`RFC-0003` §5.2).
 ///
 /// Protocol invariant preventing cross-node duplicate slots:
 /// 1. In each loop iteration, read `ShardMeta` FIRST, and THEN check `stream_dedup`

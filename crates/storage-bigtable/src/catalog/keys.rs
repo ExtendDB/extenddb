@@ -205,7 +205,7 @@ pub fn stream_record_shard_prefix(shard_id: &str) -> String {
 
 /// Exact-once stream event deduplication marker (`stream_dedup:<shard_id>:<dedup_key>`)
 /// so concurrent or retried `roll_forward` passes never allocate a second sequence slot
-/// for an already-published event (`BUG-04`, `BUG-05`).
+/// for an already-published event.
 pub fn stream_dedup(shard_id: &str, dedup_key: &str) -> String {
     format!("stream_dedup:{shard_id}:{dedup_key}")
 }

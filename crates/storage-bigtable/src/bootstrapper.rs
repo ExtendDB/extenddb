@@ -158,6 +158,8 @@ impl BigtableBootstrapper {
     }
 
     /// Check whether `__extenddb_catalog__` holds a `version:catalog` record.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
     pub async fn is_catalog_initialized(&self) -> OpResult<bool> {
         let client = self.client().await?;
         let cat = Self::catalog(client);
@@ -168,6 +170,8 @@ impl BigtableBootstrapper {
     }
 
     /// Read the recorded catalog version string from `version:catalog`.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
     pub async fn read_catalog_version(&self) -> OpResult<Option<String>> {
         let client = self.client().await?;
         let cat = Self::catalog(client);
