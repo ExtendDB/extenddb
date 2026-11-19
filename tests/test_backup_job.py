@@ -373,6 +373,17 @@ def _wait_active(ddb, name: str, timeout: float = 60.0) -> None:
     raise AssertionError(f"{name} did not become ACTIVE")
 
 
+def _wait_log(server: _Server, needle: str, timeout: float = 60.0) -> str:
+    """The server's log once it holds `needle`, failing after `timeout`
+    seconds. A job can write its line after the state a test waits for: a
+    restore writes its `ACTIVE` line after it flips the target (#1157)."""
+    deadline = time.monotonic() + timeout
+    while needle not in server.log_text():
+        assert time.monotonic() < deadline, server.log_text()[-4000:]
+        time.sleep(0.2)
+    return server.log_text()
+
+
 def _create_composite_table(ddb, name: str, gsi: bool = False) -> None:
     """A key-ordered table: `pk` S hash key, `sk` N range key."""
     attrs = [
@@ -1085,9 +1096,8 @@ def test_sigterm_leaves_the_restore_running_and_it_finishes_after_restart(deploy
             Select="COUNT",
         )["Count"]
         assert by_g == RESTORE_ITEMS // 50, by_g
-        log = server.log_text()
+        log = _wait_log(server, ": ACTIVE, ")
         assert "taken over by this instance and resumed" in log, log[-4000:]
-        assert ": ACTIVE, " in log, log[-4000:]
     finally:
         server.stop()
 
@@ -1209,8 +1219,8 @@ def test_a_store_outage_mid_download_leaves_the_restore_running_and_it_completes
         assert _count(ddb, target) == RESTORE_ITEMS
         entries = [e for e in os.listdir(spool) if e.startswith("restore-")]
         assert entries == [], f"the spool entry stays: {entries}"
-        log = server.log_text()
-        assert ": ACTIVE, " in log and ": FAILED (" not in log, log[-4000:]
+        log = _wait_log(server, ": ACTIVE, ")
+        assert ": FAILED (" not in log, log[-4000:]
     finally:
         server.stop()
         forwarder.stop()
@@ -1294,11 +1304,7 @@ def test_remove_target_removes_a_target_not_empty_restore(deployment, tmp_path):
 
     server, ddb, creds = _started(d, str(tmp_path / "serve2.log"))
     try:
-        deadline = time.monotonic() + 60
-        while "target_not_empty" not in server.log_text():
-            assert time.monotonic() < deadline, server.log_text()[-4000:]
-            time.sleep(0.2)
-        log = server.log_text()
+        log = _wait_log(server, "target_not_empty")
         failed = [line for line in log.splitlines() if "target_not_empty" in line]
         assert any(target in line for line in failed), failed
         assert ddb.describe_table(TableName=target)["Table"]["TableStatus"] == "CREATING"
@@ -1592,13 +1598,9 @@ def _restore_fails(server: _Server, ddb, target: str, arn: str, *needles: str) -
     assert resp["TableStatus"] == "CREATING", resp
     assert resp["RestoreSummary"]["SourceBackupArn"] == arn, resp
     _wait_table_gone(ddb, target)
-    deadline = time.monotonic() + 15
-    while True:
-        failed = [line for line in server.log_text().splitlines() if ": FAILED (" in line and f" into {target} " in line]
-        if failed or time.monotonic() > deadline:
-            break
-        time.sleep(0.25)
-    assert len(failed) == 1, server.log_text()[-4000:]
+    log = _wait_log(server, f" into {target} (account {ACCOUNT}): FAILED (", timeout=15)
+    failed = [line for line in log.splitlines() if ": FAILED (" in line and f" into {target} " in line]
+    assert len(failed) == 1, log[-4000:]
     for needle in needles:
         assert needle in failed[0], failed[0]
     assert "the target was removed" in failed[0], failed[0]
@@ -1739,8 +1741,8 @@ def test_a_multi_part_key_table_restores_with_the_sources_item_set(deployment, t
         assert "RestoreSummary" not in table, table
         got = sorted(_canonical(i) for i in _scan_items(ddb, target))
         assert got == expected, f"{len(got)} restored items against {len(expected)} in the source"
-        log = server.log_text()
-        assert f" into {target} " in log and ": ACTIVE, " in log and ": FAILED (" not in log, log[-4000:]
+        log = _wait_log(server, ": ACTIVE, ")
+        assert f" into {target} " in log and ": FAILED (" not in log, log[-4000:]
     finally:
         server.stop()
 
