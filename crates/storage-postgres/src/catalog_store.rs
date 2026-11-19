@@ -29,6 +29,9 @@ pub struct PostgresCatalogStore {
     /// reads it through `CatalogStore::secret_keys`. `None` for a store
     /// opened without a key, which writes no credential.
     keys: Option<Arc<SecretKeys>>,
+    /// How long `catalog-check` waits for the index changes in flight
+    /// ([`crate::data::catalog_check::INDEX_LOCK_BUDGET`]).
+    index_lock_budget: std::time::Duration,
 }
 
 impl PostgresCatalogStore {
@@ -36,13 +39,30 @@ impl PostgresCatalogStore {
     /// holder.
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
-        Self { pool, keys: None }
+        Self::with_secret_keys(pool, None)
     }
 
     /// Create a new catalog store with the key holder the factory loaded.
     #[must_use]
     pub fn with_secret_keys(pool: PgPool, keys: Option<Arc<SecretKeys>>) -> Self {
-        Self { pool, keys }
+        Self {
+            pool,
+            keys,
+            index_lock_budget: crate::data::catalog_check::INDEX_LOCK_BUDGET,
+        }
+    }
+
+    /// A store whose `catalog-check` waits at most `budget` for the index
+    /// changes in flight, so a test can reach the end of the wait. Compiled
+    /// only with `test-hooks`.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_index_lock_budget(pool: PgPool, budget: std::time::Duration) -> Self {
+        Self {
+            index_lock_budget: budget,
+            ..Self::new(pool)
+        }
     }
 
     /// Borrow the underlying pool (escape hatch for callers not yet migrated).
@@ -219,7 +239,7 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for PostgresCatalogStore {
         let key = key.clone();
         Box::pin(async move {
             let data = data_pool(&self.pool, key).await?;
-            let budget = crate::data::catalog_check::INDEX_LOCK_BUDGET;
+            let budget = self.index_lock_budget;
             crate::data::catalog_check::check(&self.pool, &data, budget)
                 .await
                 .map_err(|e| catalog_check_error(&e, budget, "the check did not finish"))
@@ -234,7 +254,7 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for PostgresCatalogStore {
         let key = key.clone();
         Box::pin(async move {
             let data = data_pool(&self.pool, key).await?;
-            let budget = crate::data::catalog_check::INDEX_LOCK_BUDGET;
+            let budget = self.index_lock_budget;
             crate::data::catalog_check::drop_orphaned(&self.pool, &data, orphaned, budget)
                 .await
                 .map_err(|e| catalog_check_error(&e, budget, "nothing was dropped"))

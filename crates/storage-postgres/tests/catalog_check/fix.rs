@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use extenddb_storage::diagnostics::{DiagnosticsStore, OrphanDrop};
+use extenddb_storage::diagnostics::{DiagError, DiagnosticsStore, OrphanDrop};
 use extenddb_storage::server_components::KeySource;
 use extenddb_storage_postgres::PostgresCatalogStore;
 use sqlx::{Connection, PgPool};
@@ -363,4 +363,64 @@ async fn a_relation_dropped_first_by_another_session_is_already_gone() {
         .await
         .expect("drop");
     assert_eq!(outcomes, vec![(orphan, OrphanDrop::AlreadyGone)]);
+}
+
+/// A write to `indexes` that stays open for longer than the budget stops the
+/// check and the drop when the budget runs out, with the error that says so,
+/// and nothing is dropped.
+#[tokio::test]
+async fn an_index_write_open_past_the_budget_stops_the_check_and_the_drop() {
+    let test = "an_index_write_open_past_the_budget_stops_the_check_and_the_drop";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let d = Deployment::new().await;
+    let orphan = d.plant_orphan().await;
+    let mut writer = sqlx::PgConnection::connect(&d.catalog_url())
+        .await
+        .expect("a catalog session for the writer");
+    sqlx::query("BEGIN")
+        .execute(&mut writer)
+        .await
+        .expect("begin");
+    sqlx::query("LOCK TABLE indexes IN ROW EXCLUSIVE MODE")
+        .execute(&mut writer)
+        .await
+        .expect("the lock a write to indexes takes");
+
+    let budget = Duration::from_secs(2);
+    let store = PostgresCatalogStore::with_index_lock_budget(d.catalog.clone(), budget);
+    let started = Instant::now();
+    let check = tokio::time::timeout(
+        Duration::from_secs(10),
+        store.check_storage_relations(&KeySource::CatalogKey),
+    )
+    .await
+    .expect("the check gave up within 10 s");
+    let checked_in = started.elapsed();
+    let drop = tokio::time::timeout(
+        Duration::from_secs(10),
+        store.drop_orphaned_relations(&KeySource::CatalogKey, vec![orphan.clone()]),
+    )
+    .await
+    .expect("the drop gave up within 10 s");
+
+    for (call, result, outcome) in [
+        ("check", check.map(|_| ()), "the check did not finish"),
+        ("drop", drop.map(|_| ()), "nothing was dropped"),
+    ] {
+        match result {
+            Err(DiagError::QueryFailed(msg)) => assert!(
+                msg.starts_with(&format!(
+                    "index changes in progress kept the index catalog locked for more than 2 \
+                     seconds, so {outcome}; run the command again: "
+                )),
+                "{call}: {msg}"
+            ),
+            other => panic!("{call}: {other:?}"),
+        }
+    }
+    assert!(checked_in >= budget, "the check gave up after {checked_in:?}");
+    assert!(d.relation_exists(&orphan).await, "the orphan was kept");
+    writer.close().await.expect("end the writer");
 }
