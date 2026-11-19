@@ -54,9 +54,9 @@ impl Scratch {
         } = self;
         drop(engine);
         db.close().await;
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
-        ))
+        )))
         .execute(&admin)
         .await
         .expect("drop the scratch database");
@@ -114,10 +114,12 @@ async fn scratch() -> Scratch {
         .connect(&format!("{base}/postgres"))
         .await
         .expect("connect to the postgres maintenance database");
-    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
-        .execute(&admin)
-        .await
-        .expect("create the scratch database");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE \"{db_name}\""
+    )))
+    .execute(&admin)
+    .await
+    .expect("create the scratch database");
     let url = format!("{base}/{db_name}");
     let db = PgPoolOptions::new()
         .max_connections(2)
@@ -126,7 +128,7 @@ async fn scratch() -> Scratch {
         .expect("connect to the scratch database");
     // One scratch database stands in for both the catalog and the data database.
     for sql in shipped_migrations() {
-        sqlx::raw_sql(&sql)
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
             .execute(&db)
             .await
             .expect("apply a shipped migration");
@@ -262,9 +264,9 @@ async fn ids(db: &PgPool) -> (String, String, String) {
 /// columns and the projected item, so a row with the right key but a stale
 /// projection shows up as a difference.
 async fn index_rows(db: &PgPool, index_id: &str) -> BTreeSet<(String, String, String, String)> {
-    let rows: Vec<(String, String, String, String)> = sqlx::query_as(&format!(
+    let rows: Vec<(String, String, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT base_pk, base_sk_n::text, pk, item_data::text FROM \"_ddb_{index_id}\""
-    ))
+    )))
     .fetch_all(db)
     .await
     .expect("read the index table");
@@ -274,10 +276,10 @@ async fn index_rows(db: &PgPool, index_id: &str) -> BTreeSet<(String, String, St
 /// `(pk, sk, g, item_data)` for every base item carrying `g`; the GSIs in this
 /// file project ALL, so the index row's item is the base item.
 async fn expected_rows(db: &PgPool, table_id: &str) -> BTreeSet<(String, String, String, String)> {
-    let rows: Vec<(String, String, String, String)> = sqlx::query_as(&format!(
+    let rows: Vec<(String, String, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT pk, sk_n::text, item_data->'g'->>'S', item_data::text FROM \"_ddb_{table_id}\" \
          WHERE item_data ? 'g'"
-    ))
+    )))
     .fetch_all(db)
     .await
     .expect("read the base table");
@@ -420,10 +422,10 @@ async fn queue_row_for_a_row_the_backfill_wrote_is_applied() {
     // Queue an update, then write its row into the index directly, as a backfill
     // reading the item after the write would.
     put(&s, &key_info, item(2, Some("v"), None)).await;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO \"_ddb_{index_id}\" (pk, base_pk, base_sk_n, item_data) \
          SELECT item_data->'g'->>'S', pk, sk_n, item_data FROM \"_ddb_{table_id}\""
-    ))
+    )))
     .execute(&s.db)
     .await
     .expect("write the row the backfill would have");
@@ -462,10 +464,10 @@ async fn sync_write_over_an_existing_index_row_succeeds() {
     .expect("make index propagation synchronous");
     add_gsi(&s, false).await;
     let (table_id, index_id, _) = ids(&s.db).await;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO \"_ddb_{index_id}\" (pk, base_pk, base_sk_n, item_data) \
          VALUES ('v', 'p3', 3, '{{}}'::jsonb), ('gone', 'p4', 4, '{{}}'::jsonb)"
-    ))
+    )))
     .execute(&s.db)
     .await
     .expect("write the rows a backfill and a stale delete would have left");
@@ -608,9 +610,9 @@ async fn write_with_key_info_older_than_a_new_gsi_indexes_its_sort_key() {
     add_gsi(&s, true).await;
     let (_, index_id, _) = ids(&s.db).await;
     put(&s, &stale, item(9, Some("x"), Some(7))).await;
-    let (rows, missing): (i64, i64) = sqlx::query_as(&format!(
+    let (rows, missing): (i64, i64) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*), COUNT(*) FILTER (WHERE sk_n IS NULL) FROM \"_ddb_{index_id}\""
-    ))
+    )))
     .fetch_one(&s.db)
     .await
     .expect("count index rows");
@@ -662,10 +664,12 @@ async fn sync_write_survives_a_gsi_whose_table_is_gone() {
             .fetch_one(&s.db)
             .await
             .expect("second index id");
-    sqlx::query(&format!("DROP TABLE \"_ddb_{gone_id}\""))
-        .execute(&s.db)
-        .await
-        .expect("drop the second index's table behind the catalog's back");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP TABLE \"_ddb_{gone_id}\""
+    )))
+    .execute(&s.db)
+    .await
+    .expect("drop the second index's table behind the catalog's back");
 
     // The catalog returns the two GSIs in no fixed order. Whichever runs first,
     // the final rows must be right; when the kept one runs first its rows are
@@ -829,9 +833,9 @@ async fn delete_table_waits_for_a_claimed_queue_row_then_drops_everything() {
     .fetch_one(&mut *claim)
     .await
     .expect("claim the pending row");
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT 1 FROM \"_ddb_{table_id}\" WHERE pk = 'p1' FOR SHARE"
-    ))
+    )))
     .execute(&mut *claim)
     .await
     .expect("share-lock the base row");
@@ -955,9 +959,9 @@ async fn update_item_during_a_gsi_build_names_the_index_for_a_wrong_typed_litera
     put(&s, &cached, item(2, Some("a"), None)).await;
     let table_id = data_table_id(&s.db).await;
     let mut holder = s.db.begin().await.expect("begin the holder");
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT 1 FROM \"_ddb_{table_id}\" WHERE pk = 'p1' AND sk_n = 1 FOR UPDATE"
-    ))
+    )))
     .execute(&mut *holder)
     .await
     .expect("hold a base row");
@@ -1006,9 +1010,9 @@ async fn update_item_during_a_gsi_build_names_the_index_for_a_wrong_typed_litera
         .expect("UpdateTable finished once the row was released");
     drop(build);
     assert_eq!(ids(&s.db).await.2, "ACTIVE");
-    let g: Option<String> = sqlx::query_scalar(&format!(
+    let g: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT item_data->'g'->>'S' FROM \"_ddb_{table_id}\" WHERE pk = 'p2' AND sk_n = 2"
-    ))
+    )))
     .fetch_one(&s.db)
     .await
     .expect("read the refused item");
@@ -1064,9 +1068,9 @@ async fn a_held_base_row_does_not_hold_up_its_queue_partition() {
         .expect("count the held item's rows");
     assert_eq!(queued, 3, "three rows queued for the held item");
     let mut holder = s.db.begin().await.expect("begin the holder");
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT 1 FROM \"_ddb_{table_id}\" WHERE pk = 'p0' AND sk_n = 0 FOR UPDATE"
-    ))
+    )))
     .execute(&mut *holder)
     .await
     .expect("hold the base row");
@@ -1080,9 +1084,9 @@ async fn a_held_base_row_does_not_hold_up_its_queue_partition() {
     let start = std::time::Instant::now();
     let mut done = false;
     while start.elapsed() < Duration::from_secs(6) {
-        let n: i64 = sqlx::query_scalar(&format!(
+        let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT count(*) FROM \"_ddb_{index_id}\" WHERE pk = 'behind'"
-        ))
+        )))
         .fetch_one(&s.db)
         .await
         .expect("count indexed rows");
@@ -1097,9 +1101,9 @@ async fn a_held_base_row_does_not_hold_up_its_queue_partition() {
         done,
         "the rows behind the held one did not reach the index while it was held"
     );
-    let held_row: String = sqlx::query_scalar(&format!(
+    let held_row: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT pk FROM \"_ddb_{index_id}\" WHERE base_sk_n = 0"
-    ))
+    )))
     .fetch_one(&s.db)
     .await
     .expect("read the held item's index row");
@@ -1129,10 +1133,12 @@ async fn a_write_to_a_dropped_data_table_is_table_not_found() {
     let s = scratch().await;
     let key_info = create_table(&s).await;
     let table_id = data_table_id(&s.db).await;
-    sqlx::query(&format!("DROP TABLE \"_ddb_{table_id}\""))
-        .execute(&s.db)
-        .await
-        .expect("drop the data table behind the catalog's back");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP TABLE \"_ddb_{table_id}\""
+    )))
+    .execute(&s.db)
+    .await
+    .expect("drop the data table behind the catalog's back");
     let put = s
         .engine
         .put_item(
@@ -1221,20 +1227,24 @@ async fn recovery_finishes_a_gsi_left_creating() {
         .expect("mark CREATING");
     let idx = format!("\"_ddb_{index_id}\"");
     let base = format!("\"_ddb_{table_id}\"");
-    sqlx::query(&format!("DELETE FROM {idx} WHERE base_sk_n >= 20"))
-        .execute(&s.db)
-        .await
-        .expect("drop half the rows");
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DELETE FROM {idx} WHERE base_sk_n >= 20"
+    )))
+    .execute(&s.db)
+    .await
+    .expect("drop half the rows");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE {idx} SET pk = 'stale', item_data = '{{}}'::jsonb WHERE base_sk_n = 3"
-    ))
+    )))
     .execute(&s.db)
     .await
     .expect("make one row stale");
-    sqlx::query(&format!("DELETE FROM {base} WHERE sk_n = 5"))
-        .execute(&s.db)
-        .await
-        .expect("remove one base item behind the index's back");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DELETE FROM {base} WHERE sk_n = 5"
+    )))
+    .execute(&s.db)
+    .await
+    .expect("remove one base item behind the index's back");
 
     // The build that ran inside UpdateTable held the ownership lock on a
     // connection of its own, which the server releases when it notices that
@@ -1257,11 +1267,12 @@ async fn recovery_finishes_a_gsi_left_creating() {
         index_rows(&s.db, &index_id).await,
         expected_rows(&s.db, &table_id).await
     );
-    let range_ok: i64 =
-        sqlx::query_scalar(&format!("SELECT count(*) FROM {idx} WHERE sk_n IS NULL"))
-            .fetch_one(&s.db)
-            .await
-            .expect("check the sort key column");
+    let range_ok: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM {idx} WHERE sk_n IS NULL"
+    )))
+    .fetch_one(&s.db)
+    .await
+    .expect("check the sort key column");
     assert_eq!(range_ok, 0, "every row carries the index sort key");
     s.cleanup().await;
 }

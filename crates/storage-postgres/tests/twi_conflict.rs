@@ -55,9 +55,9 @@ impl Scratch {
         } = self;
         drop(engine);
         db.close().await;
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
-        ))
+        )))
         .execute(&admin)
         .await
         .expect("drop the scratch database");
@@ -118,10 +118,12 @@ async fn scratch() -> Scratch {
         .connect(&format!("{base}/postgres"))
         .await
         .expect("connect to the postgres maintenance database");
-    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
-        .execute(&admin)
-        .await
-        .expect("create the scratch database");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE \"{db_name}\""
+    )))
+    .execute(&admin)
+    .await
+    .expect("create the scratch database");
     let url = format!("{base}/{db_name}");
     let db = PgPoolOptions::new()
         .max_connections(2)
@@ -132,7 +134,7 @@ async fn scratch() -> Scratch {
     // database, so every shipped migration file from both directories is
     // applied to it, in filename order.
     for sql in shipped_migrations() {
-        sqlx::raw_sql(&sql)
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
             .execute(&db)
             .await
             .expect("apply a shipped migration");
@@ -256,10 +258,12 @@ async fn a_deadlock_cancels_with_transaction_conflict_on_the_waiting_item() {
         .fetch_one(&mut *holder)
         .await
         .expect("read the backend pid");
-    sqlx::query(&format!("SELECT 1 FROM {table} WHERE pk = 'b' FOR UPDATE"))
-        .execute(&mut *holder)
-        .await
-        .expect("lock b");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT 1 FROM {table} WHERE pk = 'b' FOR UPDATE"
+    )))
+    .execute(&mut *holder)
+    .await
+    .expect("lock b");
 
     let (new_a, new_b) = (item("a", "twi"), item("b", "twi"));
     // Request order is b, a: the reason must land on b's request position.
@@ -267,10 +271,12 @@ async fn a_deadlock_cancels_with_transaction_conflict_on_the_waiting_item() {
     let twi = s.engine.transact_write_items(&ops, None);
     let close_cycle = async {
         wait_for_lock_waiters(&s.db, holder_pid, 1).await;
-        sqlx::query(&format!("SELECT 1 FROM {table} WHERE pk = 'a' FOR UPDATE"))
-            .execute(&mut *holder)
-            .await
-            .expect("the outside transaction gets a once the write transaction aborts");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT 1 FROM {table} WHERE pk = 'a' FOR UPDATE"
+        )))
+        .execute(&mut *holder)
+        .await
+        .expect("the outside transaction gets a once the write transaction aborts");
     };
     // Bounded, so a transaction that never closes the cycle fails the test
     // instead of hanging it.
@@ -295,9 +301,9 @@ async fn a_deadlock_cancels_with_transaction_conflict_on_the_waiting_item() {
     }
     // The canceled transaction applied nothing.
     for pk in ["a", "b"] {
-        let v: String = sqlx::query_scalar(&format!(
+        let v: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT item_data->'v'->>'S' FROM {table} WHERE pk = $1"
-        ))
+        )))
         .bind(pk)
         .fetch_one(&s.db)
         .await
@@ -344,9 +350,9 @@ async fn opposite_request_orders_do_not_deadlock() {
     let table = data_table(&s.db).await;
     let mut tags = Vec::new();
     for pk in ["a", "b"] {
-        let v: String = sqlx::query_scalar(&format!(
+        let v: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT item_data->'v'->>'S' FROM {table} WHERE pk = $1"
-        ))
+        )))
         .bind(pk)
         .fetch_one(&s.db)
         .await
@@ -463,10 +469,12 @@ async fn an_invalid_first_op_answers_without_waiting_on_later_locks() {
         .expect("seed b");
     let table = data_table(&s.db).await;
     let mut holder = s.db.begin().await.expect("begin the outside transaction");
-    sqlx::query(&format!("SELECT 1 FROM {table} WHERE pk = 'b' FOR UPDATE"))
-        .execute(&mut *holder)
-        .await
-        .expect("lock b");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT 1 FROM {table} WHERE pk = 'b' FOR UPDATE"
+    )))
+    .execute(&mut *holder)
+    .await
+    .expect("lock b");
 
     let a = empty_key("a", "a1");
     let ops = [put(&key_info, &a, &maps), put(&key_info, &b, &maps)];
@@ -509,9 +517,9 @@ async fn create_in_flight(
         .fetch_one(&mut *creator)
         .await
         .expect("read the backend pid");
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {table} (pk, item_data) VALUES ($1, jsonb_build_object('pk', jsonb_build_object('S', $1::text)))"
-    ))
+    )))
     .bind(pk)
     .execute(&mut *creator)
     .await
@@ -616,10 +624,12 @@ async fn a_delete_of_a_missing_item_waits_for_its_concurrent_create() {
             .expect("the write transaction finished");
     result.expect("the delete commits");
 
-    let left: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table} WHERE pk = 'c'"))
-        .fetch_one(&s.db)
-        .await
-        .expect("count c");
+    let left: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM {table} WHERE pk = 'c'"
+    )))
+    .fetch_one(&s.db)
+    .await
+    .expect("count c");
     assert_eq!(left, 0, "the delete ran after the create, so c is gone");
 
     s.cleanup().await;
@@ -644,10 +654,12 @@ async fn a_plain_put_waits_for_a_check_of_the_missing_item() {
         .fetch_one(&mut *holder)
         .await
         .expect("read the backend pid");
-    sqlx::query(&format!("SELECT 1 FROM {table} WHERE pk = 'b' FOR UPDATE"))
-        .execute(&mut *holder)
-        .await
-        .expect("lock b");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT 1 FROM {table} WHERE pk = 'b' FOR UPDATE"
+    )))
+    .execute(&mut *holder)
+    .await
+    .expect("lock b");
 
     // `0c` sorts before `b`, so the check runs first and then the Put waits.
     let (cond, c, new_b) = (not_exists(), key("0c"), item("b", "twi"));
@@ -667,11 +679,12 @@ async fn a_plain_put_waits_for_a_check_of_the_missing_item() {
         // Readers neither see the reserved key nor wait for it.
         let read = tokio::time::timeout(Duration::from_secs(5), async {
             let got = s.engine.get_item(&key_info, &key("0c")).await;
-            let rows: i64 =
-                sqlx::query_scalar(&format!("SELECT count(*) FROM {table} WHERE pk = '0c'"))
-                    .fetch_one(&s.db)
-                    .await
-                    .expect("count 0c");
+            let rows: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT count(*) FROM {table} WHERE pk = '0c'"
+            )))
+            .fetch_one(&s.db)
+            .await
+            .expect("count 0c");
             (got, rows)
         })
         .await
@@ -695,9 +708,9 @@ async fn a_plain_put_waits_for_a_check_of_the_missing_item() {
     twi_result.expect("the check passes: 0c was missing when it ran");
     put_result.expect("the plain put commits after the transaction");
 
-    let v: String = sqlx::query_scalar(&format!(
+    let v: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT item_data->'v'->>'S' FROM {table} WHERE pk = '0c'"
-    ))
+    )))
     .fetch_one(&s.db)
     .await
     .expect("read 0c");
@@ -809,10 +822,12 @@ async fn a_delete_that_loses_its_reservation_removes_the_winner_everywhere() {
         .fetch_one(&mut *holder)
         .await
         .expect("read the backend pid");
-    sqlx::query(&format!("SELECT 1 FROM {table} WHERE pk = 'd' FOR UPDATE"))
-        .execute(&mut *holder)
-        .await
-        .expect("lock d");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT 1 FROM {table} WHERE pk = 'd' FOR UPDATE"
+    )))
+    .execute(&mut *holder)
+    .await
+    .expect("lock d");
 
     let capture = StreamCapture {
         view_type: StreamViewType::NewAndOldImages,
@@ -860,10 +875,12 @@ async fn a_delete_that_loses_its_reservation_removes_the_winner_everywhere() {
     deleted.expect("the delete commits after it");
 
     for t in [&table, &lsi] {
-        let left: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {t} WHERE pk = 'c'"))
-            .fetch_one(&s.db)
-            .await
-            .expect("count c");
+        let left: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT count(*) FROM {t} WHERE pk = 'c'"
+        )))
+        .fetch_one(&s.db)
+        .await
+        .expect("count c");
         assert_eq!(left, 0, "c is gone from {t}");
     }
     // A write leaves its stream record in stream_pending until a read or the

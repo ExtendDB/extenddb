@@ -260,7 +260,7 @@ fn rfc3339_millis(millis: u64) -> Result<String, FormatError> {
     let nanos = i128::from(millis) * 1_000_000;
     let instant = time::OffsetDateTime::from_unix_timestamp_nanos(nanos)
         .map_err(|e| FormatError::InvalidManifest(format!("backup instant {millis} ms: {e}")))?;
-    let format = time::format_description::parse(
+    let format = time::format_description::parse_borrowed::<1>(
         "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z",
     )
     .expect("a constant format description parses");

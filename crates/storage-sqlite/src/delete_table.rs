@@ -24,10 +24,10 @@ impl SqliteEngine {
 
         // A DELETING row is fetched too: DeleteTable of a table that is
         // already being deleted returns its description, as the service does.
-        let row: Option<TableRow> = sqlx::query_as(&format!(
+        let row: Option<TableRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {TABLE_COLUMNS} FROM tables WHERE account_id = ? AND table_name = ? \
              AND table_status IN ('ACTIVE', 'CREATING', 'DELETING')"
-        ))
+        )))
         .bind(account_id)
         .bind(&input.table_name)
         .fetch_optional(&self.pool)
@@ -38,9 +38,9 @@ impl SqliteEngine {
         if row.table_status == "DELETING" {
             // Already scheduled for removal by the control-plane worker:
             // nothing to change.
-            let index_rows: Vec<IndexRow> = sqlx::query_as(&format!(
+            let index_rows: Vec<IndexRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {INDEX_COLUMNS} FROM indexes WHERE table_id = ?"
-            ))
+            )))
             .bind(&row.table_id)
             .fetch_all(&self.pool)
             .await
@@ -78,9 +78,9 @@ impl SqliteEngine {
             }
         }
 
-        let index_rows: Vec<IndexRow> = sqlx::query_as(&format!(
+        let index_rows: Vec<IndexRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {INDEX_COLUMNS} FROM indexes WHERE table_id = ?"
-        ))
+        )))
         .bind(&row.table_id)
         .fetch_all(&self.pool)
         .await

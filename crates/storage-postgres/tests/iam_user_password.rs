@@ -52,10 +52,12 @@ async fn an_unknown_user_or_one_without_a_password_runs_one_bcrypt_check() {
         .connect(&format!("{base}/postgres"))
         .await
         .expect("connect to the postgres maintenance database");
-    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
-        .execute(&admin)
-        .await
-        .expect("create the scratch database");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE \"{db_name}\""
+    )))
+    .execute(&admin)
+    .await
+    .expect("create the scratch database");
     let db = PgPoolOptions::new()
         .max_connections(2)
         .connect(&format!("{base}/{db_name}"))
@@ -111,9 +113,9 @@ async fn an_unknown_user_or_one_without_a_password_runs_one_bcrypt_check() {
 
     drop(store);
     db.close().await;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
-    ))
+    )))
     .execute(&admin)
     .await
     .expect("remove the scratch database");

@@ -383,7 +383,7 @@ impl PostgresMigrations {
         let txid = current_txid(pool).await?;
         let mut done = match step {
             Step::File { name, text } => {
-                sqlx::raw_sql(text)
+                sqlx::raw_sql(*text)
                     .execute(pool)
                     .await
                     .map_err(|e| Failure::sqlx(&format!("migration {id} ({name})"), &e))?;

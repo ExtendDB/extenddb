@@ -298,10 +298,12 @@ async fn record_columns(engine: &SqliteEngine, table_id: &str) -> RecordColumns 
 }
 
 async fn rows_in(engine: &SqliteEngine, physical: &str) -> i64 {
-    sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {physical}"))
-        .fetch_one(&engine.pool)
-        .await
-        .expect("count rows")
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {physical}"
+    )))
+    .fetch_one(&engine.pool)
+    .await
+    .expect("count rows")
 }
 
 async fn base_rows(engine: &SqliteEngine, table_id: &str) -> i64 {
@@ -964,13 +966,13 @@ async fn a_dead_record_is_taken_over_with_the_claimants_spool_and_a_fresh_heartb
         .create_table_impl(ACCOUNT, target_input("Legacy", false), true)
         .await
         .expect("a CREATING table");
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO table_restores (table_id, source_backup_arn, source_table_arn, \
          restore_date_time, status, kind, owner_generation, heartbeat_at) \
          VALUES (?, 'arn:legacy', 'arn:aws:dynamodb:us-east-1:123456789012:table/Music', {NOW}, \
          'RUNNING', 'legacy', 7, '1970-01-01T00:00:00.000Z')",
         NOW = crate::backup_catalog::NOW
-    ))
+    )))
     .bind(&legacy.table_id)
     .execute(&engine.pool)
     .await

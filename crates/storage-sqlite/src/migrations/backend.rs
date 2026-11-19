@@ -91,7 +91,7 @@ impl LedgerWrites for Rows<'_> {
 
     async fn create_ledger(&self) -> Result<(), MigrationError> {
         let ddl = sql_ledger_ddl(APPLIED_AT);
-        sqlx::raw_sql(&ddl)
+        sqlx::raw_sql(sqlx::AssertSqlSafe(ddl.as_str()))
             .execute(self.pool)
             .await
             .map(|_| ())
@@ -448,7 +448,7 @@ impl SqliteMigrations {
     }
 
     async fn exec(&self, sql: &str) -> Result<(), MigrationError> {
-        sqlx::raw_sql(sql)
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
             .execute(&self.stores.pool)
             .await
             .map(|_| ())

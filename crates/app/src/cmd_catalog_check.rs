@@ -140,7 +140,10 @@ pub async fn run(args: CatalogCheckArgs) -> anyhow::Result<()> {
                 // Table names are from pg_tables (trusted), but quote anyway.
                 let quoted = format!("\"{}\"", name.replace('"', "\"\""));
                 let ddl = format!("DROP TABLE IF EXISTS {quoted}");
-                match sqlx::query(&ddl).execute(&data_pool).await {
+                match sqlx::query(sqlx::AssertSqlSafe(ddl))
+                    .execute(&data_pool)
+                    .await
+                {
                     Ok(_) => println!("    Dropped: {name}"),
                     Err(e) => println!("    FAILED to drop {name}: {e}"),
                 }

@@ -276,7 +276,8 @@ pub(crate) async fn apply_vector_index(
             .collect::<Vec<_>>()
             .join(" AND ");
         let sql = format!("DELETE FROM {vec_table} WHERE {where_clause}");
-        let mut query = sqlx::query(&sql).bind(composite_pk_to_text(source, base_key_schema)?);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(composite_pk_to_text(source, base_key_schema)?);
         for &(sk_name, sk_type) in &base_sks {
             if let Some(value) = source.get(sk_name) {
                 query = match parse_sk(value, sk_type)? {
@@ -422,7 +423,7 @@ impl<'a> VectorInsertPlan<'a> {
         //
         // As bytes: the column is BYTEA because the unscoped sentinel carries a NUL,
         // which PostgreSQL rejects in a text column.
-        let mut query = sqlx::query(&self.sql)
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(self.sql.as_str()))
             .bind(part.into_bytes())
             .bind(composite_pk_to_text(item, base_key_schema)?);
         for &(sk_name, sk_type) in &self.base_sks {
@@ -619,7 +620,7 @@ impl extenddb_storage::vector_lifecycle::VectorIndexBuild for PostgresVectorBuil
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
         if let Some(cursor) = &cursor {
             query = query.bind(cursor.pk.clone());
             for sk in &cursor.sort_keys {

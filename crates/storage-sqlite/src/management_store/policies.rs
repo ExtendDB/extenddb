@@ -65,10 +65,10 @@ pub(super) async fn delete_principal_attachments(
     principal_name: &str,
 ) -> OpResult<()> {
     for table in ["iam_policies", "iam_permissions_boundaries"] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} \
              WHERE account_id = ? AND principal_type = ? AND principal_name = ?"
-        ))
+        )))
         .bind(account_id)
         .bind(principal_type)
         .bind(principal_name)

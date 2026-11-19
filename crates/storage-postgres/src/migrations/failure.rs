@@ -52,7 +52,7 @@ impl From<MigrationError> for Failure {
 }
 
 pub(super) async fn exec(pool: &PgPool, sql: &str) -> Result<(), Failure> {
-    sqlx::raw_sql(sql)
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
         .execute(pool)
         .await
         .map(|_| ())

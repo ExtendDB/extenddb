@@ -210,7 +210,10 @@ pub(super) async fn connect(
 }
 
 pub(super) async fn statement(conn: &mut PgConnection, sql: &str) -> Result<(), sqlx::Error> {
-    sqlx::query(sql).execute(&mut *conn).await.map(|_| ())
+    sqlx::query(sqlx::AssertSqlSafe(sql))
+        .execute(&mut *conn)
+        .await
+        .map(|_| ())
 }
 
 #[cfg(test)]

@@ -107,11 +107,12 @@ async fn index_id(s: &Scratch, table: &str, index: &str) -> String {
 
 /// The attribute names of every row of an index, sorted, one row per entry.
 async fn index_rows(s: &Scratch, index_id: &str) -> Vec<Vec<String>> {
-    let rows: Vec<serde_json::Value> =
-        sqlx::query_scalar(&format!("SELECT item_data FROM \"_ddb_{index_id}\""))
-            .fetch_all(&s.data)
-            .await
-            .expect("read an index table");
+    let rows: Vec<serde_json::Value> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT item_data FROM \"_ddb_{index_id}\""
+    )))
+    .fetch_all(&s.data)
+    .await
+    .expect("read an index table");
     let mut out: Vec<Vec<String>> = rows
         .iter()
         .map(|row| {
@@ -244,7 +245,7 @@ async fn a_backfill_and_the_recovery_sweep_read_the_names_from_the_catalog() {
         .execute(&s.catalog)
         .await
         .expect("mark the index CREATING");
-    sqlx::query(&format!("DELETE FROM \"_ddb_{by_u1}\""))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM \"_ddb_{by_u1}\"")))
         .execute(&s.data)
         .await
         .expect("remove the index rows");

@@ -376,7 +376,7 @@ async fn delete_if_absent(
         "SELECT ctid::text FROM {idx_table} WHERE {} FOR UPDATE",
         idx_where.join(" AND ")
     );
-    let locked: Vec<String> = bind_key(sqlx::query(&lock), key)
+    let locked: Vec<String> = bind_key(sqlx::query(sqlx::AssertSqlSafe(lock)), key)
         .fetch_all(&mut **tx)
         .await
         .map_err(db_error)?
@@ -393,7 +393,7 @@ async fn delete_if_absent(
         base_cols.len() + 1,
         base_where.join(" AND ")
     );
-    bind_key(sqlx::query(&sql), key)
+    bind_key(sqlx::query(sqlx::AssertSqlSafe(sql)), key)
         .bind(locked)
         .execute(&mut **tx)
         .await
@@ -469,10 +469,12 @@ pub(crate) async fn write_barrier(data: &sqlx::PgPool, table_id: &str) -> Result
             .execute(&mut *tx)
             .await
             .map_err(db_error)?;
-            sqlx::query(&format!("LOCK TABLE {base_table} IN SHARE MODE"))
-                .execute(&mut *tx)
-                .await
-                .map_err(db_error)?;
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "LOCK TABLE {base_table} IN SHARE MODE"
+            )))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_error)?;
             tx.commit().await.map_err(db_error)
         }
         .await;
@@ -566,7 +568,7 @@ pub(crate) async fn backfill(
         "SELECT {selected} FROM {base_table} ORDER BY {} LIMIT 1",
         descending.join(", ")
     );
-    let last = sqlx::query(&last_sql)
+    let last = sqlx::query(sqlx::AssertSqlSafe(last_sql))
         .fetch_optional(data)
         .await
         .map_err(db_error)?
@@ -588,7 +590,7 @@ pub(crate) async fn backfill(
              LIMIT {BACKFILL_BATCH}",
             conds.join(" AND ")
         );
-        let mut q = sqlx::query(&keys_sql);
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(keys_sql));
         if let Some(c) = &cursor {
             q = bind_key(q, c);
         }
@@ -712,7 +714,7 @@ async fn write_page(
     );
 
     let mut tx = data.begin().await.map_err(db_error)?;
-    let mut q = sqlx::query(&lock_sql);
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(lock_sql));
     if let Some(c) = lower {
         q = bind_key(q, c);
     }
@@ -783,7 +785,7 @@ async fn resync_key(
         "SELECT item_data FROM {base_table} WHERE {} FOR SHARE",
         where_parts.join(" AND ")
     );
-    let current = bind_key(sqlx::query(&sql), key)
+    let current = bind_key(sqlx::query(sqlx::AssertSqlSafe(sql)), key)
         .fetch_optional(&mut **tx)
         .await
         .map_err(db_error)?;
@@ -830,7 +832,10 @@ async fn sweep_orphans(
         idx_cols.join(", "),
         join.join(" AND ")
     );
-    let rows = sqlx::query(&sql).fetch_all(data).await.map_err(db_error)?;
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .fetch_all(data)
+        .await
+        .map_err(db_error)?;
     for row in &rows {
         let key = read_key(row, base_sks)?;
         with_retries(|| async {
@@ -935,7 +940,7 @@ pub(crate) struct GsiBuild {
 pub(crate) async fn drop_gsi_tables(data: &sqlx::PgPool, builds: &[GsiBuild]) {
     for b in builds {
         let t = index_table_name(&b.def.index_id);
-        if let Err(e) = sqlx::query(&format!("DROP TABLE IF EXISTS {t}"))
+        if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE IF EXISTS {t}")))
             .execute(data)
             .await
         {

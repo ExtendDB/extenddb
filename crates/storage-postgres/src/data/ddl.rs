@@ -113,7 +113,7 @@ impl PostgresEngine {
             )
         };
 
-        sqlx::query(&ddl)
+        sqlx::query(sqlx::AssertSqlSafe(ddl))
             .execute(&mut **tx)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -200,7 +200,7 @@ impl PostgresEngine {
             pk_cols.join(", ")
         );
 
-        sqlx::query(&ddl)
+        sqlx::query(sqlx::AssertSqlSafe(ddl))
             .execute(&mut **tx)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -221,7 +221,7 @@ impl PostgresEngine {
                 order_cols.push(col);
             }
             let order_idx = format!("CREATE INDEX ON {idx_table} ({})", order_cols.join(", "));
-            sqlx::query(&order_idx)
+            sqlx::query(sqlx::AssertSqlSafe(order_idx))
                 .execute(&mut **tx)
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -243,7 +243,7 @@ impl PostgresEngine {
                 "CREATE INDEX \"{idx_name}\" ON {idx_table} ({})",
                 base_key_cols.join(", ")
             );
-            sqlx::query(&base_key_idx)
+            sqlx::query(sqlx::AssertSqlSafe(base_key_idx))
                 .execute(&mut **tx)
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -323,7 +323,7 @@ impl PostgresEngine {
             col_defs.join(",\n    "),
             pk_cols.join(", ")
         );
-        sqlx::query(&ddl)
+        sqlx::query(sqlx::AssertSqlSafe(ddl))
             .execute(&mut **tx)
             .await
             .map_err(crate::vector::map_vector_sql_error)?;
@@ -333,7 +333,7 @@ impl PostgresEngine {
         // Left unnamed, as the GSI tables' ordering index is: a name built from the
         // ids would be truncated at PostgreSQL's 63-byte identifier limit.
         let part_idx = format!("CREATE INDEX ON {vec_table} (part)");
-        sqlx::query(&part_idx)
+        sqlx::query(sqlx::AssertSqlSafe(part_idx))
             .execute(&mut **tx)
             .await
             .map_err(crate::vector::map_vector_sql_error)?;
@@ -350,10 +350,12 @@ impl PostgresEngine {
         index_id: &str,
     ) -> Result<(), StorageError> {
         let vec_table = vector_table_name(index_id);
-        sqlx::query(&format!("DROP TABLE IF EXISTS {vec_table}"))
-            .execute(&mut **tx)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP TABLE IF EXISTS {vec_table}"
+        )))
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
         Ok(())
     }
 
@@ -455,14 +457,15 @@ impl PostgresEngine {
         &self,
         table_id: &str,
     ) -> Result<Vec<extenddb_core::types::VectorIndexKeyInfo>, StorageError> {
-        let rows: Vec<crate::table_helpers::VectorIndexRow> = sqlx::query_as(&format!(
-            "SELECT {} FROM vector_indexes WHERE table_id = $1 ORDER BY index_name",
-            crate::table_helpers::VECTOR_INDEX_COLUMNS
-        ))
-        .bind(table_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let rows: Vec<crate::table_helpers::VectorIndexRow> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT {} FROM vector_indexes WHERE table_id = $1 ORDER BY index_name",
+                crate::table_helpers::VECTOR_INDEX_COLUMNS
+            )))
+            .bind(table_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         extenddb_storage::vector_catalog::vector_index_key_info(
             rows.into_iter().map(Into::into).collect(),
@@ -706,9 +709,11 @@ pub(crate) async fn drop_table_relations(
 ) -> Result<(), sqlx::Error> {
     for relation in table_storage_relations(table_id, index_ids, vector_index_ids) {
         set_lock_timeout_until(conn, deadline).await?;
-        sqlx::query(&format!("DROP TABLE IF EXISTS {relation}"))
-            .execute(&mut *conn)
-            .await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP TABLE IF EXISTS {relation}"
+        )))
+        .execute(&mut *conn)
+        .await?;
     }
     set_lock_timeout_until(conn, deadline).await?;
     sqlx::query("DELETE FROM vector_index_holds WHERE table_id = $1")

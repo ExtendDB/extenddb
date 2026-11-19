@@ -642,11 +642,11 @@ impl BackupCatalog for PostgresEngine {
         store: &'a StoreIdentity,
     ) -> BoxStream<'a, Result<BackupRow, StorageError>> {
         rows_stream(async move {
-            sqlx::query_as(&format!(
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {ROW_COLUMNS} FROM backup_index \
                  WHERE store_kind = $1 AND store_root = $2 AND store_id = $3 \
                  AND ($4::TEXT IS NULL OR status = $4) ORDER BY created_at, backup_arn"
-            ))
+            )))
             .bind(store.store_kind.as_str())
             .bind(&store.store_root)
             .bind(&store.store_id)
@@ -666,11 +666,11 @@ impl BackupCatalog for PostgresEngine {
         // The `(store_kind, store_root)` prefix of
         // `idx_backup_index_store_status`; the status is a filter on it.
         rows_stream(async move {
-            sqlx::query_as(&format!(
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {ROW_COLUMNS} FROM backup_index \
                  WHERE store_kind = $1 AND store_root = $2 \
                  AND ($3::TEXT IS NULL OR status = $3) ORDER BY created_at, backup_arn"
-            ))
+            )))
             .bind(store_kind.as_str())
             .bind(store_root)
             .bind(status.map(BackupStatus::as_str))
@@ -685,11 +685,11 @@ impl BackupCatalog for PostgresEngine {
         store: &'a StoreIdentity,
     ) -> BoxFuture<'a, Result<Option<BackupRow>, StorageError>> {
         Box::pin(async move {
-            let row: Option<RowTuple> = sqlx::query_as(&format!(
+            let row: Option<RowTuple> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {ROW_COLUMNS} FROM backup_index \
                  WHERE store_kind = $1 AND store_root = $2 AND store_id = $3 \
                  AND status = 'AVAILABLE' ORDER BY created_at DESC, backup_arn DESC LIMIT 1"
-            ))
+            )))
             .bind(store.store_kind.as_str())
             .bind(&store.store_root)
             .bind(&store.store_id)
@@ -707,13 +707,13 @@ impl BackupCatalog for PostgresEngine {
         bounds: &'a TimeBounds,
     ) -> BoxStream<'a, Result<BackupRow, StorageError>> {
         rows_stream(async move {
-            sqlx::query_as(&format!(
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {ROW_COLUMNS} FROM backup_index WHERE account_id = $1 \
                  AND ($2::TEXT IS NULL OR table_name = $2) \
                  AND ($3::FLOAT8 IS NULL OR created_at >= to_timestamp($3)) \
                  AND ($4::FLOAT8 IS NULL OR created_at < to_timestamp($4)) \
                  ORDER BY created_at, backup_arn"
-            ))
+            )))
             .bind(account_id)
             .bind(table_name)
             .bind(bounds.lower)
@@ -729,10 +729,10 @@ impl BackupCatalog for PostgresEngine {
         arn: &'a BackupArn,
     ) -> BoxFuture<'a, Result<Option<BackupRow>, StorageError>> {
         Box::pin(async move {
-            let row: Option<RowTuple> = sqlx::query_as(&format!(
+            let row: Option<RowTuple> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {ROW_COLUMNS} FROM backup_index WHERE account_id = $1 AND backup_id = $2 \
                  AND table_name = $3 AND backup_arn = $4"
-            ))
+            )))
             .bind(arn.account_id())
             .bind(arn.backup_id())
             .bind(arn.table_name())
@@ -749,9 +749,9 @@ impl BackupCatalog for PostgresEngine {
         backup_id: &'a str,
     ) -> BoxFuture<'a, Result<Option<BackupRow>, StorageError>> {
         Box::pin(async move {
-            let row: Option<RowTuple> = sqlx::query_as(&format!(
+            let row: Option<RowTuple> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {ROW_COLUMNS} FROM backup_index WHERE backup_id = $1"
-            ))
+            )))
             .bind(backup_id)
             .fetch_optional(&self.pool)
             .await
@@ -937,12 +937,12 @@ impl BackupCatalog for PostgresEngine {
             StaleClock::Completed => "completed_at",
         };
         rows_stream(async move {
-            sqlx::query_as(&format!(
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {ROW_COLUMNS} FROM backup_index \
                  WHERE store_kind = $1 AND store_root = $2 AND store_id = $3 AND status = $4 \
                  AND {column} < now() - make_interval(secs => $5) \
                  ORDER BY created_at, backup_arn"
-            ))
+            )))
             .bind(store.store_kind.as_str())
             .bind(&store.store_root)
             .bind(&store.store_id)
@@ -1012,7 +1012,7 @@ impl BackupCatalog for PostgresEngine {
             // this build cannot read (a kind or status no release writes) is
             // logged and skipped, as ListBackups skips a row it cannot read,
             // so one such row does not stop the cycle.
-            let rows: Vec<RestoreJobTuple> = sqlx::query_as(&format!(
+            let rows: Vec<RestoreJobTuple> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {RESTORE_ROW_COLUMNS} \
                  FROM table_restores r JOIN tables t ON t.table_id = r.table_id \
                  WHERE (r.status = 'RUNNING' \
@@ -1021,7 +1021,7 @@ impl BackupCatalog for PostgresEngine {
                         AND COALESCE(r.completed_at, r.heartbeat_at) \
                             < now() - make_interval(secs => $1)) \
                  ORDER BY t.account_id, t.table_name"
-            ))
+            )))
             .bind(stale_after.as_secs_f64())
             .fetch_all(&self.pool)
             .await
@@ -1049,11 +1049,11 @@ impl BackupCatalog for PostgresEngine {
         Box::pin(async move {
             // By status alone: a record stamped in this statement's instant,
             // or ahead of the server's clock, is RUNNING too.
-            let rows: Vec<RestoreJobTuple> = sqlx::query_as(&format!(
+            let rows: Vec<RestoreJobTuple> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {RESTORE_ROW_COLUMNS} \
                  FROM table_restores r JOIN tables t ON t.table_id = r.table_id \
                  WHERE r.status = 'RUNNING' ORDER BY t.account_id, t.table_name"
-            ))
+            )))
             .fetch_all(&self.pool)
             .await
             .map_err(db_err)?;
@@ -1213,11 +1213,11 @@ impl BackupCatalog for PostgresEngine {
         key: &'a RestoreTargetKey,
     ) -> BoxFuture<'a, Result<Option<RestoreJobRow>, StorageError>> {
         Box::pin(async move {
-            let row: Option<RestoreJobTuple> = sqlx::query_as(&format!(
+            let row: Option<RestoreJobTuple> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {RESTORE_ROW_COLUMNS} \
                  FROM table_restores r JOIN tables t ON t.table_id = r.table_id \
                  WHERE r.table_id = $1 AND t.account_id = $2 AND t.table_name = $3"
-            ))
+            )))
             .bind(&key.table_id)
             .bind(&key.account_id)
             .bind(&key.table_name)
@@ -1233,12 +1233,12 @@ impl BackupCatalog for PostgresEngine {
         status: Option<JobStatus>,
     ) -> BoxFuture<'a, Result<Vec<RestoreJobRow>, StorageError>> {
         Box::pin(async move {
-            let rows: Vec<RestoreJobTuple> = sqlx::query_as(&format!(
+            let rows: Vec<RestoreJobTuple> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {RESTORE_ROW_COLUMNS} \
                  FROM table_restores r JOIN tables t ON t.table_id = r.table_id \
                  WHERE ($1::TEXT IS NULL OR r.status = $1) \
                  ORDER BY t.account_id, t.table_name"
-            ))
+            )))
             .bind(status.map(JobStatus::as_str))
             .fetch_all(&self.pool)
             .await
@@ -1491,7 +1491,7 @@ impl crate::PostgresEngine {
         }
         if let Some(inside) = inside {
             for name in ["lock_timeout", "statement_timeout"] {
-                let value: String = sqlx::query_scalar(&format!("SHOW {name}"))
+                let value: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SHOW {name}")))
                     .fetch_one(&mut *tx)
                     .await?;
                 inside.push(value);
@@ -1545,7 +1545,7 @@ impl crate::PostgresEngine {
                 .map_err(db_err)?;
         let mut shown = Vec::new();
         for name in ["lock_timeout", "statement_timeout"] {
-            let value: String = sqlx::query_scalar(&format!("SHOW {name}"))
+            let value: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SHOW {name}")))
                 .fetch_one(&mut *conn)
                 .await
                 .map_err(db_err)?;

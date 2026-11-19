@@ -208,7 +208,7 @@ async fn next_batch(
         "SELECT {cursor}, length(CAST(item_data AS BLOB)) FROM {table} \
          WHERE {cond} AND {cursor} > ? ORDER BY {cursor} LIMIT ?"
     );
-    let mut q = sqlx::query_as::<_, (i64, i64)>(&sizes_sql);
+    let mut q = sqlx::query_as::<_, (i64, i64)>(sqlx::AssertSqlSafe(sizes_sql));
     if let Some(a) = arg {
         q = q.bind(a);
     }
@@ -235,7 +235,7 @@ async fn next_batch(
         "SELECT {cursor}, item_data FROM {table} \
          WHERE {cond} AND {cursor} > ? AND {cursor} <= ? ORDER BY {cursor}"
     );
-    let mut q = sqlx::query_as::<_, (i64, String)>(&rows_sql);
+    let mut q = sqlx::query_as::<_, (i64, String)>(sqlx::AssertSqlSafe(rows_sql));
     if let Some(a) = arg {
         q = q.bind(a);
     }
@@ -439,9 +439,9 @@ impl SqliteEngine {
             )
             .await?;
             let Some(&(tail, _)) = batch.last() else {
-                let (table_size,): (i64,) = sqlx::query_as(&format!(
+                let (table_size,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                     "SELECT COALESCE(SUM(length(item_data)), 0) FROM {ddb_table}"
-                ))
+                )))
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(db_err)?;
@@ -485,7 +485,7 @@ impl SqliteEngine {
                     values.push(sk_bound(&parse_sk(value, sk_type)?));
                 }
                 values.push(BoundValue::Text(item_json.clone()));
-                let mut q = sqlx::query(&insert_sql);
+                let mut q = sqlx::query(sqlx::AssertSqlSafe(insert_sql.as_str()));
                 for v in values {
                     q = crate::data::bind_bound!(q, v);
                 }
@@ -763,7 +763,7 @@ impl SqliteEngine {
         // the writer lock still excludes every engine write, so the definition,
         // source row and items describe one table state.
         let establish_snapshot = format!("SELECT 1 FROM {ddb_table} LIMIT 1");
-        let _: Option<i64> = sqlx::query_scalar(&establish_snapshot)
+        let _: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(establish_snapshot))
             .fetch_optional(&mut *read_tx)
             .await
             .map_err(db_err)?;
@@ -1537,11 +1537,13 @@ impl LegacyBackupReader for SqliteEngine {
                     continue;
                 }
                 for table in ["backup_items", "backup_definitions"] {
-                    sqlx::query(&format!("DELETE FROM {table} WHERE backup_arn = ?"))
-                        .bind(&backup_arn)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(db_err)?;
+                    sqlx::query(sqlx::AssertSqlSafe(format!(
+                        "DELETE FROM {table} WHERE backup_arn = ?"
+                    )))
+                    .bind(&backup_arn)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
                 }
                 removed.push(AbandonedLegacyBackup {
                     account_id,
@@ -1728,11 +1730,13 @@ impl LegacyBackupReader for SqliteEngine {
                 Replaced::AlreadyReplaced
             };
             for table in ["backup_items", "backup_definitions"] {
-                sqlx::query(&format!("DELETE FROM {table} WHERE backup_arn = ?"))
-                    .bind(&row.backup_arn)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(db_err)?;
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "DELETE FROM {table} WHERE backup_arn = ?"
+                )))
+                .bind(&row.backup_arn)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
             }
             // The row itself goes, not to DELETED: a DELETED `backups` row
             // is then always a DeleteBackup's, whose prefix `backup sync`
@@ -1753,10 +1757,10 @@ impl SqliteEngine {
     /// The `backups` rows `filter` keeps, of every account, by creation
     /// time and then ARN.
     async fn legacy_keys(&self, filter: &str) -> Result<Vec<LegacyBackupKey>, StorageError> {
-        let rows: Vec<(String, String, String)> = sqlx::query_as(&format!(
+        let rows: Vec<(String, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT account_id, backup_arn, backup_status FROM backups WHERE {filter} \
              ORDER BY created_at, backup_arn"
-        ))
+        )))
         .fetch_all(&self.pool)
         .await
         .map_err(db_err)?;
@@ -2035,7 +2039,7 @@ mod restore_tests {
     }
 
     async fn count(engine: &SqliteEngine, table: &str) -> i64 {
-        sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
             .fetch_one(&engine.pool)
             .await
             .expect("count")
@@ -2783,9 +2787,9 @@ mod restore_tests {
         let (engine, path) = file_engine().await;
         let source = plain_table(&engine, "source").await;
         let table = crate::data::data_table_name(&source.table_id);
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO {table} (pk, item_data) VALUES ('broken', 'not json')"
-        ))
+        )))
         .execute(&engine.pool)
         .await
         .expect("corrupt source row");
@@ -3094,9 +3098,9 @@ mod restore_tests {
         let rows = |t: String| {
             let pool = engine.pool.clone();
             async move {
-                sqlx::query_scalar::<_, String>(&format!(
+                sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
                     "SELECT pk || '|' || sk_n || '|' || item_data FROM {t} ORDER BY pk, sk_n"
-                ))
+                )))
                 .fetch_all(&pool)
                 .await
                 .expect("rows")
@@ -3107,11 +3111,11 @@ mod restore_tests {
         let gsi_rows = |id: String| {
             let pool = engine.pool.clone();
             async move {
-                sqlx::query_scalar::<_, String>(&format!(
+                sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
                     "SELECT pk || '|' || base_pk || '|' || base_sk_n || '|' || item_data \
                      FROM {} ORDER BY 1",
                     crate::data::index_table_name(&id)
-                ))
+                )))
                 .fetch_all(&pool)
                 .await
                 .expect("gsi rows")
@@ -3490,7 +3494,7 @@ mod restore_tests {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .expect("write transaction");
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(count)
             .bind(payload)
             .execute(&mut *tx)
@@ -3790,7 +3794,7 @@ mod restore_tests {
                  'payload', json_object('S', ?)) FROM n"
         );
         let _writer = engine.write_lock.lock().await;
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(count)
             .bind("x".repeat(1024))
             .execute(&engine.pool)
@@ -5038,13 +5042,13 @@ mod restore_tests {
             // A CREATING restore target registered from the backup: in use,
             // naming the target; an ACTIVE one is not.
             let target_id = indexed_table(&engine, "del_target").await;
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "INSERT INTO table_restores (table_id, source_backup_arn, source_table_arn, \
                  restore_date_time, status, kind, owner_generation, heartbeat_at) \
                  VALUES (?, ?, 'arn:aws:dynamodb:us-east-1:123456789012:table/Music', {NOW}, \
                  'RUNNING', 'manifest', 7, {NOW})",
                 NOW = crate::backup_catalog::NOW
-            ))
+            )))
             .bind(&target_id)
             .bind(&row.backup_arn)
             .execute(&engine.pool)
@@ -5390,7 +5394,7 @@ mod restore_tests {
                     " ALTER TABLE table_restores DROP COLUMN {column};"
                 ));
             }
-            sqlx::raw_sql(&undo)
+            sqlx::raw_sql(sqlx::AssertSqlSafe(undo.as_str()))
                 .execute(&engine.pool)
                 .await
                 .expect("drop the job record's columns");
@@ -5977,11 +5981,11 @@ mod restore_tests {
             for row in &rows {
                 assert!(engine.insert_backup_row(row).await.expect("insert"));
             }
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "CREATE TRIGGER refuse_the_last_key BEFORE UPDATE OF store_root ON backup_index \
                  WHEN OLD.backup_id = '{}' BEGIN SELECT RAISE(ABORT, 'refused'); END",
                 rows[2].backup_id
-            ))
+            )))
             .execute(&engine.pool)
             .await
             .expect("create the trigger");
@@ -6321,13 +6325,13 @@ mod restore_tests {
             // its heartbeat fresh. Dead at once.
             let left = row(ACCOUNT, "Music", "left");
             let source_table = serde_json::to_string(&left.source_table_details_json).unwrap();
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "INSERT INTO backup_index (backup_id, account_id, table_name, backup_arn, \
                  backup_name, status, store_kind, store_root, store_id, size_bytes, item_count, \
                  created_at, source_table_details_json, owner_generation, heartbeat_at) \
                  VALUES (?, ?, ?, ?, ?, 'CREATING', ?, ?, ?, 0, 0, ?, ?, 7, {NOW})",
                 NOW = crate::backup_catalog::NOW
-            ))
+            )))
             .bind(&left.backup_id)
             .bind(&left.account_id)
             .bind(&left.table_name)
@@ -6989,9 +6993,9 @@ mod restore_tests {
             let payload = "y".repeat(3 * 1024 * 1024);
             for i in 0..large {
                 let item = json!({"pk": {"S": format!("large{i}")}, "payload": {"S": payload}});
-                sqlx::query(&format!(
+                sqlx::query(sqlx::AssertSqlSafe(format!(
                     "INSERT INTO {table} (pk, item_data) VALUES (?, ?)"
-                ))
+                )))
                 .bind(format!("large{i}"))
                 .bind(item.to_string())
                 .execute(&engine.pool)
@@ -7802,11 +7806,11 @@ mod restore_tests {
                 Some("RUNNING")
             );
             let (generation, _) = claim_of(&engine, &desc.table_id).await;
-            let written = sqlx::query(&format!(
+            let written = sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE table_restores SET status = 'FAILED', failure_reason = 'owner dead', \
                  completed_at = {} WHERE table_id = ? AND status = 'RUNNING'",
                 crate::backup_catalog::NOW
-            ))
+            )))
             .bind(&desc.table_id)
             .execute(&engine.pool)
             .await

@@ -414,7 +414,7 @@ async fn fetch_page(
 ) -> Result<Page, StorageError> {
     use futures::TryStreamExt as _;
     let sql = page_sql(table, paging, cursor)?;
-    let query = sqlx::query(&sql);
+    let query = sqlx::query(sqlx::AssertSqlSafe(sql));
     let query = match cursor {
         Cursor::Start => query,
         Cursor::Pk(pk) => query.bind(pk),
@@ -1067,10 +1067,10 @@ mod tests {
             )
             .await
             .expect("describe");
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE {} SET item_data = '{{\"pk\": 5}}' WHERE pk = 'p006'",
             data_table_name(&desc.table_id)
-        ))
+        )))
         .execute(&engine.pool)
         .await
         .expect("make one row unparseable");
