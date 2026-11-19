@@ -1,6 +1,6 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// The default `max_item_size_bytes` (400 KB as `DynamoDB` sizes items), the
 /// largest item the backup format's line cap is sized for: the backup job
@@ -9,7 +9,7 @@ use serde::Deserialize;
 pub const DEFAULT_MAX_ITEM_SIZE_BYTES: usize = 409_600;
 
 /// All configurable limits with DynamoDB-compatible defaults.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LimitsConfig {
     #[serde(default = "default_max_item_size")]

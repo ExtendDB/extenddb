@@ -1778,6 +1778,7 @@ dependencies = [
  "extenddb-core",
  "extenddb-storage",
  "serde",
+ "serde_json",
  "tempfile",
  "toml",
  "tracing",

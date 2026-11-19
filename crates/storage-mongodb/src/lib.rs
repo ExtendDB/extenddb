@@ -25,6 +25,11 @@ mod operations;
 mod password_hash_store;
 pub mod pushdown;
 mod restore_engine;
+#[cfg(test)]
+#[path = "../../config/src/sample_toml_support.rs"]
+mod sample_toml_support;
+#[cfg(test)]
+mod sample_toml_tests;
 mod snapshot_engine;
 mod stream_engine;
 mod stream_lifecycle;

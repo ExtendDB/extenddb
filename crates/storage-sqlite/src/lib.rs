@@ -41,6 +41,11 @@ mod password_hash_store;
 mod restore_engine;
 #[cfg(test)]
 mod restore_job_tests;
+#[cfg(test)]
+#[path = "../../config/src/sample_toml_support.rs"]
+mod sample_toml_support;
+#[cfg(test)]
+mod sample_toml_tests;
 mod schema;
 mod serve_lock;
 mod snapshot_engine;

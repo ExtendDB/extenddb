@@ -7,6 +7,7 @@ use serde::Deserialize;
 
 /// Cassandra storage backend configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct CassandraStorageConfig {
     /// Cassandra contact points (host:port)
     pub contact_points: Vec<String>,
