@@ -234,6 +234,9 @@ struct Fake {
     /// When set, `claim_restore` takes this long before it registers (a
     /// registration held behind the catalog's lock or pool).
     claim_restore_delay: Mutex<Option<Duration>>,
+    /// When set, `claim_restore` waits for one permit before it registers,
+    /// so a test can hold a registration in flight for as long as it needs.
+    claim_restore_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     /// What `finish_restore` answers when its conditions hold: ACTIVE, or
     /// DONE with the backfill pending (MongoDB).
     finish_pending: std::sync::atomic::AtomicBool,
@@ -2121,9 +2124,16 @@ impl BackupCatalog for Fake {
             return Box::pin(async move { Err(e) });
         }
         let delay = *self.claim_restore_delay.lock().unwrap();
+        let gate = self.claim_restore_gate.lock().unwrap().clone();
         Box::pin(async move {
             if let Some(delay) = delay {
                 tokio::time::sleep(delay).await;
+            }
+            if let Some(gate) = gate {
+                gate.acquire()
+                    .await
+                    .expect("the gate is never closed")
+                    .forget();
             }
             self.register_restore(account_id, input, registration)
         })
@@ -19949,9 +19959,14 @@ async fn the_reconciler_fails_a_dead_restore_whose_target_has_no_tables() {
 /// target or being refused; a restore of another backup into the same name
 /// while that registration is in flight is `TableInUseException` (the 60 s
 /// registration bound equals botocore's default read timeout, so a client
-/// retries while the first registration still holds the lock).
+/// retries while the first registration still holds the lock). The
+/// registration is held by a gate the test opens only once both requests
+/// have met it: the in-flight entry ends with the retry's answer, so a
+/// request sent after the retry answered would meet the committed target
+/// instead (#951).
 #[tokio::test]
 async fn a_retry_waits_on_its_registration_and_another_backup_is_refused() {
+    let (lines, _guard) = LogLines::capture();
     let mem = Arc::new(MemStore::default());
     mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
     let fake = Arc::new(Fake::default());
@@ -19968,8 +19983,9 @@ async fn a_retry_waits_on_its_registration_and_another_backup_is_refused() {
     seed_manifest_backup(&fake, &mem, &arn_b, music_source_table(), &[songs(2)], true);
     let runtime = Arc::new(job_runtime(&mem));
     // Hold the first registration mid-flight so the target is not yet
-    // created when the retry's name check runs.
-    *fake.claim_restore_delay.lock().unwrap() = Some(Duration::from_millis(400));
+    // created while the other two requests run.
+    let gate = closed_gate();
+    *fake.claim_restore_gate.lock().unwrap() = Some(Arc::clone(&gate));
 
     let first = {
         let fake = Arc::clone(&fake);
@@ -19986,18 +20002,8 @@ async fn a_retry_waits_on_its_registration_and_another_backup_is_refused() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
-    // The retry of the same request waits and is answered CREATING.
-    let retry = restore_on(&fake, &runtime, &restore_body(json!({})))
-        .await
-        .unwrap();
-    assert_eq!(retry["TableDescription"]["TableStatus"], "CREATING");
-    assert_eq!(
-        retry["TableDescription"]["RestoreSummary"]["SourceBackupArn"],
-        arn(ACCOUNT)
-    );
-
     // A different backup into the same name is refused while the first is in
-    // flight.
+    // flight, without a registration of its own.
     let other = restore_on(
         &fake,
         &runtime,
@@ -20008,6 +20014,33 @@ async fn a_retry_waits_on_its_registration_and_another_backup_is_refused() {
     assert!(
         matches!(other, DynamoDbError::TableInUseException(_)),
         "{other:?}"
+    );
+    assert_eq!(fake.restore_claims.lock().unwrap().len(), 1);
+
+    // The retry of the same request waits and is answered CREATING once the
+    // registration returns.
+    let retry = {
+        let fake = Arc::clone(&fake);
+        let runtime = Arc::clone(&runtime);
+        tokio::spawn(async move { restore_on(&fake, &runtime, &restore_body(json!({}))).await })
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while lines
+        .containing("a registration of this request is in flight")
+        .is_empty()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the retry never met the registration in flight"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    gate.add_permits(1);
+    let retry = retry.await.unwrap().unwrap();
+    assert_eq!(retry["TableDescription"]["TableStatus"], "CREATING");
+    assert_eq!(
+        retry["TableDescription"]["RestoreSummary"]["SourceBackupArn"],
+        arn(ACCOUNT)
     );
 
     let first = first.await.unwrap().unwrap();
