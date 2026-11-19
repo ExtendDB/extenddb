@@ -786,6 +786,16 @@ jobs:
           EXTENDDB_EXPECT_VECTORS: "1"
         run: cargo test --release -p extenddb-storage-postgres --tests
 
+      # `extenddb catalog-check` run as the binary on the deployment the
+      # catalog_check tests above build: the lines it prints, its exit code,
+      # and its refusal of a catalog without the data database setting.
+      - name: Run the catalog-check command test
+        env:
+          EXTENDDB_TEST_PG_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
+          EXTENDDB_TEST_PG_REQUIRED: "1"
+          EXTENDDB_EXPECT_VECTORS: "1"
+        run: cargo test --release -p extenddb --test catalog_check
+
   # The runtime-detection proof: the same binary, against a PostgreSQL with no
   # pgvector, must refuse vector indexes over the wire. Today the job above runs
   # on a plain image too, so this looks like a duplicate of it; it is not, because
