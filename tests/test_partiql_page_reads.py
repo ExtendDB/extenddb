@@ -22,10 +22,13 @@ reads the last of the others does.
 
 An index read takes one Query for each disjunct, also when several name one
 partition of the index: each Query is one of the 10 of a page and reports
-its own capacity. Whether a page that ends in one of these Queries has a
-LastEvaluatedKey, and whether an empty page follows the last one, is the
-answer a Query gives at the end of a partition, which differs on the service
-by where the partition sits in its storage, so the tests assert neither.
+its own capacity. A Query that stops at Limit before an item of its
+partition that it does not match is read to its end, so the next page does
+not read its disjunct again. Whether a page that ends in one of these
+Queries has a LastEvaluatedKey, and whether an empty page follows the last
+one, is the answer a Query gives at the end of a partition, which differs on
+the service by where the partition sits in its storage, so the tests assert
+neither.
 
 Dual-target: EXTENDDB_TEST_ENDPOINT selects an extenddb server; unset, the
 tests run against the live service with the default credential chain. The
@@ -169,6 +172,50 @@ def xyz(dynamodb_client):
         for pk, gs in [("p1", "x"), ("p2", "y"), ("p3", "z")]:
             dynamodb_client.put_item(
                 TableName=name, Item={"pk": {"S": pk}, "g": {"S": "a"}, "gs": {"S": gs}}
+            )
+        _wait_for_index(dynamodb_client, name, 3)
+        yield name
+
+
+@pytest.fixture(scope="module")
+def ltable(dynamodb_client):
+    """A table keyed on string pk and sk with the local index lsi-all keyed on
+    pk and lsiSk and the GSI gix keyed on g and gs, both projecting every
+    attribute. Partition lk holds r1 at a, and r2 and r3 at b, on both
+    indexes."""
+    attributes = ("pk", "sk", "lsiSk", "g", "gs")
+    with scoped_table(
+        dynamodb_client,
+        attribute_definitions=[{"AttributeName": n, "AttributeType": "S"} for n in attributes],
+        key_schema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        LocalSecondaryIndexes=[
+            {
+                "IndexName": "lsi-all",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "lsiSk", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        ],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "gix",
+                "KeySchema": [
+                    {"AttributeName": "g", "KeyType": "HASH"},
+                    {"AttributeName": "gs", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        ],
+    ) as name:
+        for sk, at in [("r1", "a"), ("r2", "b"), ("r3", "b")]:
+            item = {"pk": "lk", "sk": sk, "lsiSk": at, "g": "lk", "gs": at}
+            dynamodb_client.put_item(
+                TableName=name, Item={k: {"S": v} for k, v in item.items()}
             )
         _wait_for_index(dynamodb_client, name, 3)
         yield name
@@ -477,3 +524,40 @@ def test_queries_of_one_index_partition_add_up_their_capacity(
     statement = f'SELECT * FROM "{xyz}"."gix" WHERE {condition}'
     pages = _read(dynamodb_client, statement, key=_gs, ReturnConsumedCapacity="TOTAL")
     assert [(found, more, units) for found, _, more, units in pages] == [(keys, False, 1.0)]
+
+
+# ---- a Query that stops before an item it does not match --------------------
+
+
+@pytest.mark.parametrize(
+    ("index", "condition", "consistent", "units"),
+    [
+        ("lsi-all", "pk = 'lk' AND (lsiSk = 'a' OR lsiSk = 'z')", False, [0.5, 0.5]),
+        ("lsi-all", "pk = 'lk' AND (lsiSk = 'z' OR lsiSk = 'a')", False, [0.5, 0.5]),
+        (
+            "lsi-all",
+            "pk = 'lk' AND (lsiSk = 'a' OR lsiSk = 'y' OR lsiSk = 'z')",
+            False,
+            [0.5, 1.0],
+        ),
+        ("lsi-all", "pk = 'lk' AND (lsiSk = 'a' OR lsiSk = 'z')", True, [1.0, 1.0]),
+        ("gix", "g = 'lk' AND (gs = 'a' OR gs = 'z')", False, [0.5, 0.5]),
+    ],
+    ids=["lsi", "lsi-reversed", "lsi-three-keys", "lsi-consistent", "gsi"],
+)
+def test_a_query_that_stops_before_an_item_it_does_not_match_is_read_to_its_end(
+    dynamodb_client, ltable, index, condition, consistent, units
+):
+    statement = f'SELECT * FROM "{ltable}"."{index}" WHERE {condition}'
+    got = _read(
+        dynamodb_client,
+        statement,
+        key=lambda item: item["sk"]["S"],
+        Limit=1,
+        ConsistentRead=consistent,
+        ReturnConsumedCapacity="TOTAL",
+    )
+    assert [(keys, more, capacity) for keys, _, more, capacity in got] == [
+        (["r1"], True, units[0]),
+        ([], False, units[1]),
+    ]
