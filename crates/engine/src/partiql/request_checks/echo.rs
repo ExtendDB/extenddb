@@ -6,7 +6,8 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use serde_json::{Map, Value};
+use extenddb_core::map_order::hash_map_order;
+use serde_json::Value;
 
 /// The longest echo of a statement list, in bytes. Every echo measured is
 /// shorter. A list can echo to about 13 times its size on the wire (a
@@ -158,7 +159,7 @@ fn write_list(echo: &mut Echo, value: Option<&Value>, write: impl Fn(&mut Echo, 
 }
 
 /// A map as `{name=value, ...}`, its members in the order the service prints
-/// them (see [`print_order`]). Writing stops at the first member past
+/// them (see [`hash_map_order`]). Writing stops at the first member past
 /// [`MAX_ECHO_BYTES`].
 fn write_map(echo: &mut Echo, value: Option<&Value>) {
     let Some(Value::Object(members)) = value else {
@@ -166,7 +167,7 @@ fn write_map(echo: &mut Echo, value: Option<&Value>) {
         return;
     };
     echo.push("{");
-    for (index, (name, member)) in print_order(members).into_iter().enumerate() {
+    for (index, (name, member)) in hash_map_order(members).into_iter().enumerate() {
         if echo.full() {
             return;
         }
@@ -178,41 +179,6 @@ fn write_map(echo: &mut Echo, value: Option<&Value>) {
         write_attribute_value(echo, member);
     }
     echo.push("}");
-}
-
-/// The members of a map in the order the service prints them (measured
-/// 2026-11-02 on maps of 2, 3, 4, 6, 12, 13, 24 and 48 members): the
-/// iteration order of a Java `HashMap` filled from the request's map. Its
-/// table has the smallest power of two of buckets at or above `size / 0.75`
-/// rounded up. A key
-/// sits in the bucket its Java `String.hashCode` picks once the hash's high
-/// 16 bits are folded into its low 16 by exclusive or. The buckets print in
-/// ascending order, and the keys of one bucket in the order the request sends
-/// them.
-///
-/// Here the keys of one bucket come in the order the parsed request holds
-/// them, which is the request's order in every build that includes the
-/// server: its crate turns on serde_json's `preserve_order` feature.
-fn print_order(members: &Map<String, Value>) -> Vec<(&String, &Value)> {
-    // `size / 0.75` rounded up, in whole numbers.
-    let buckets = (members.len() * 4).div_ceil(3).next_power_of_two();
-    let mut ordered: Vec<(usize, (&String, &Value))> = members
-        .iter()
-        .map(|member| (bucket(member.0, buckets), member))
-        .collect();
-    // The sort is stable, so the keys of one bucket keep their order.
-    ordered.sort_by_key(|(bucket, _)| *bucket);
-    ordered.into_iter().map(|(_, member)| member).collect()
-}
-
-/// The bucket of `key` in a Java `HashMap` table of `buckets` buckets.
-fn bucket(key: &str, buckets: usize) -> usize {
-    // Java's `String.hashCode`: 31 times the hash plus each UTF-16 unit,
-    // wrapping at 32 bits.
-    let hash = key.encode_utf16().fold(0_u32, |hash, unit| {
-        hash.wrapping_mul(31).wrapping_add(u32::from(unit))
-    });
-    (hash ^ (hash >> 16)) as usize & (buckets - 1)
 }
 
 #[cfg(test)]

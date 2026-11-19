@@ -321,14 +321,11 @@ pub(crate) fn member_parameters(list: Option<&Value>) -> impl Iterator<Item = Op
 /// statement-position prefix (measured 2026-11-02 and 2026-11-06), so it runs
 /// before the statement is parsed.
 ///
-/// The walk follows the parsed body: parameters and list elements in request
-/// order, the members of a map in the order the parsed request holds them,
-/// which is the request's in every build that includes the server (its crate
-/// turns on serde_json's `preserve_order` feature). The service reports the
-/// member of a map that a Java `HashMap` of it yields first, so the request's
-/// order decides only between members that share a bucket (measured
-/// 2026-11-12). When two members of one map in different buckets both have a
-/// problem, the one reported here can differ.
+/// The walk follows the parsed body, with parameters and list elements in
+/// request order. It visits the members of a map in the order the service
+/// checks them, the order a Java `HashMap` of the map yields them (see
+/// `extenddb_core::map_order::hash_map_order`; measured 2026-11-12 and
+/// 2026-11-19).
 ///
 /// # Errors
 ///
