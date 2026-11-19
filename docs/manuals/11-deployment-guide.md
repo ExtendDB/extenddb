@@ -74,7 +74,7 @@ Example Dockerfile:
 
 ```dockerfile
 # Match rust-version in Cargo.toml, and the Debian release of the runtime stage
-FROM rust:1.91.1-bookworm AS builder
+FROM rust:1.94.0-bookworm AS builder
 WORKDIR /src
 COPY . .
 RUN cargo build --release

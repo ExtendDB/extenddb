@@ -4,7 +4,7 @@
 # external service: use an Apache Cassandra 4.1+ cluster you operate, or the
 # optional docker-compose.cassandra.yml reference stack for local development.
 
-FROM public.ecr.aws/docker/library/rust:1.91.1-bookworm@sha256:c1e5f19e773b7878c3f7a805dd00a495e747acbdc76fb2337a4ebf0418896b33 AS build
+FROM public.ecr.aws/docker/library/rust:1.94.0-bookworm@sha256:365468470075493dc4583f47387001854321c5a8583ea9604b297e67f01c5a4f AS build
 ARG VCS_REF
 ARG BUILD_DATE
 WORKDIR /src
