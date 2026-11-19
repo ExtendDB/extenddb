@@ -54,9 +54,19 @@ pub(super) async fn flush_staged(
     }
     let mut rows = Vec::with_capacity(staged.len());
     let mut metas = Vec::with_capacity(staged.len());
+    // The process bucket takes each item's units. The operation bucket
+    // takes what `MaxWriteRequestUnits` bounds, the units the write consumes
+    // on the table and on its secondary indexes: here as an insert of the
+    // row would consume them, settled below from the item each write
+    // replaced (`pacer`).
     let mut units: u64 = 0;
+    let mut op_units: u64 = 0;
     for mut s in staged {
-        units = units.saturating_add(write_units(s.item_bytes));
+        let item_units = write_units(s.item_bytes);
+        units = units.saturating_add(item_units);
+        op_units = op_units
+            .saturating_add(item_units)
+            .saturating_add(index_write_units(None, s.image.as_ref(), &st.key_info));
         if let Some(marker) = s.row.marker.as_mut() {
             marker.settled = st.settled;
         }
@@ -72,7 +82,7 @@ pub(super) async fn flush_staged(
     let mut deadline = st.lease_deadline;
     let waited = keeping_lease_in_place(deps, record, &mut deadline, Watch::LeaseOnly, async {
         deps.pacer.acquire(units).await;
-        op_pacer.acquire(units).await;
+        op_pacer.acquire(op_units).await;
     })
     .await;
     st.lease_deadline = deadline;
@@ -153,6 +163,7 @@ pub(super) async fn flush_staged(
     let bucket = &config.input_bucket;
     let record_cap = deps.config.max_report_records;
     let byte_cap = deps.config.max_report_bytes;
+    let mut consumed: u64 = 0;
     for ((file_index, row_index, item_bytes, image), result) in metas.into_iter().zip(results) {
         let path = &record.input_files[file_index].path;
         match result {
@@ -170,6 +181,13 @@ pub(super) async fn flush_staged(
                 // new item.
                 let old_size = old.as_ref().map_or(0, item_size_bytes);
                 st.usage.add_base(item_bytes.max(old_size));
+                consumed = consumed
+                    .saturating_add(write_units(item_bytes.max(old_size)))
+                    .saturating_add(index_write_units(
+                        old.as_ref(),
+                        image.as_ref(),
+                        &st.key_info,
+                    ));
                 if has_indexes {
                     // The index charge from the old and new images: an
                     // unchanged projection under the same index key is
@@ -185,6 +203,7 @@ pub(super) async fn flush_staged(
             // at staging), and recorded with both images.
             BatchRowResult::ConditionFailed { old } => {
                 st.usage.add_condition_failed();
+                consumed = consumed.saturating_add(write_units(0));
                 let submitted = image.unwrap_or_default();
                 st.push_record(
                     &ReportSink {
@@ -206,6 +225,9 @@ pub(super) async fn flush_staged(
             }
         }
     }
+    // The operation bucket took the batch's units as inserts; it now holds
+    // what the writes consumed.
+    op_pacer.settle(op_units, consumed);
     // A condition record of this batch may be the first of its kind, whose
     // report object is checked now, after the rows before it were written.
     Ok(check_output_config_at_first_record(ctx, st).await)

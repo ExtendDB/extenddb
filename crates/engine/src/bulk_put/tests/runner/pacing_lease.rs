@@ -96,6 +96,97 @@ async fn max_write_request_units_paces_the_operation_on_its_own() {
     );
 }
 
+/// One input row keyed `k{i}` whose `g` value `g` puts it in the `gsi1`
+/// index of the `new_with_gsi` table.
+fn gsi_row(i: usize, g: &str) -> String {
+    format!(
+        "{{\"Item\": {{\"pk\": {{\"S\": \"k{i}\"}}, \"sk\": {{\"S\": \"s\"}}, \"g\": {{\"S\": \"{g}\"}}}}}}"
+    )
+}
+
+// `MaxWriteRequestUnits` bounds the write request units the operation
+// consumes on the table and on all of its indexes (service documentation,
+// "Running a bulk put items operation"). Each of these rows writes one unit
+// to the table and one to the index, so 60 rows at a ceiling of 40 units per
+// second pay 80 units of deficit after the full bucket, 2 s. Counting the
+// table alone, they would pay 20 units, 0.5 s.
+#[tokio::test]
+async fn max_write_request_units_counts_the_index_writes() {
+    let h = Harness::new_with_gsi().await;
+    let rows: Vec<String> = (0..60).map(|i| gsi_row(i, &format!("g{i}"))).collect();
+    h.write_input("part-000.json", &file_of(&rows));
+    let files = h.enumerate().await;
+    let op = h
+        .start_with_units(files, input_config(false), both_reports(), Some(40))
+        .await;
+    let record = h.claim("runner-1", Duration::from_secs(60)).await;
+    let mut cfg = config();
+    cfg.batch_size = 60;
+    cfg.write_batch_rows = 60;
+    let before = std::time::Instant::now();
+    runner::run(&h.deps("runner-1", cfg), record)
+        .await
+        .expect("runner run");
+
+    let record = h.record(&op).await;
+    assert_eq!(record.status, "COMPLETED");
+    assert_eq!(h.count_items().await, 60);
+    assert_eq!(
+        record.usage["GlobalSecondaryIndexes"]["gsi1"]["BulkPutBytes"],
+        json!(61_440),
+        "every row was written to the index"
+    );
+    assert!(
+        before.elapsed() >= Duration::from_millis(1600),
+        "120 units at MaxWriteRequestUnits 40 take about 2 s of pacing, took {:?}",
+        before.elapsed()
+    );
+}
+
+// A write that moves an item's index key also consumes the units of the old
+// projection, which the runner learns only from the item the write
+// replaced. The operation bucket is settled after each batch, so the next
+// batch waits for them. Each of these 60 rows moves its index key and
+// consumes 3 units, against the 2 an insert would. In two batches of 30 at
+// a ceiling of 30 units per second, the second batch waits for the 30 units
+// the first one settled: about 4 s in all, against 3 s without the settle.
+#[tokio::test]
+async fn a_moved_index_key_is_charged_to_the_next_batch() {
+    let h = Harness::new_with_gsi().await;
+    for i in 0..60 {
+        let mut seeded = item(&format!("k{i}"), "0");
+        seeded.insert("g".to_owned(), AttributeValue::S(format!("old{i}")));
+        h.put_direct(seeded).await;
+    }
+    let rows: Vec<String> = (0..60).map(|i| gsi_row(i, &format!("new{i}"))).collect();
+    h.write_input("part-000.json", &file_of(&rows));
+    let files = h.enumerate().await;
+    let op = h
+        .start_with_units(files, input_config(false), both_reports(), Some(30))
+        .await;
+    let record = h.claim("runner-1", Duration::from_secs(60)).await;
+    let mut cfg = config();
+    cfg.batch_size = 60;
+    cfg.write_batch_rows = 30;
+    let before = std::time::Instant::now();
+    runner::run(&h.deps("runner-1", cfg), record)
+        .await
+        .expect("runner run");
+
+    let record = h.record(&op).await;
+    assert_eq!(record.status, "COMPLETED");
+    assert_eq!(
+        record.usage["GlobalSecondaryIndexes"]["gsi1"]["BulkPutBytes"],
+        json!(122_880),
+        "each row is a delete and an insert on the index"
+    );
+    assert!(
+        before.elapsed() >= Duration::from_millis(3600),
+        "two batches of 90 consumed units at MaxWriteRequestUnits 30 take about 4 s, took {:?}",
+        before.elapsed()
+    );
+}
+
 // The pacers can hold a write batch longer than the lease: at 150 units per
 // second, 25 rows of 400 KB wait over a minute against a 60 s lease. The
 // lease is renewed during the wait, so no other claim takes the operation

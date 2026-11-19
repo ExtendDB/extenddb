@@ -47,7 +47,9 @@ pub(in crate::bulk_put::runner) use crate::bulk_put::authorize::{
     self, BulkAuthorizer, BulkPrincipal, Decision, S3Action,
 };
 pub(in crate::bulk_put::runner) use crate::bulk_put::epoch_millis;
-pub(in crate::bulk_put::runner) use crate::bulk_put::pacer::{WritePacer, write_units};
+pub(in crate::bulk_put::runner) use crate::bulk_put::pacer::{
+    WritePacer, index_write_units, write_units,
+};
 pub(in crate::bulk_put::runner) use crate::bulk_put::report;
 pub(in crate::bulk_put::runner) use crate::bulk_put::rows::{self, Row, RowCondition, RowError};
 pub(in crate::bulk_put::runner) use crate::bulk_put::source::{
