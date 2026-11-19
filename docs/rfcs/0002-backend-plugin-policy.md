@@ -318,7 +318,7 @@ Fork entire ExtendDB repo for each backend. Each fork contains frontend + one ba
 
 ## Unresolved questions
 
-1. **Security review process.** Backend implementations handle database credentials, execute queries, and manage connections—all surfaces with security implications (SQL injection, connection security, credential leakage). Should we formalize security review as part of the PR process? If so, what does that look like? Do we need security-focused reviewers, automated scanning tools, or documented security patterns? This wasn't part of the original discussion but seems important for production deployments.
+1. **Security review process.** Backend implementations handle database credentials, execute queries, and manage connections, all surfaces with security implications (SQL injection, connection security, credential leakage). Should we formalize security review as part of the PR process? If so, what does that look like? Do we need security-focused reviewers, automated scanning tools, or documented security patterns? This wasn't part of the original discussion but seems important for production deployments.
 
 2. **Conformance test ownership.** Should conformance tests live in the main `extenddb` repo, or in a separate `extenddb-conformance` repo used by all backends? Leaning toward main repo for simplicity, but open to feedback.
 

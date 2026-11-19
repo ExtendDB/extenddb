@@ -12,7 +12,7 @@ ExtendDB stores tables, items, indexes and its own catalog in a database you run
 | PostgreSQL (default) | `postgres` | `extenddb/extenddb-postgres` | PostgreSQL 14 or newer; the pgvector extension on the data database for vector indexes | [Docker Compose](/local-dev-docker-compose/), [from source](/install-from-source/#install-postgresql), [deployment](/manuals/deployment-guide/) |
 | MongoDB | `mongodb` | `extenddb/extenddb-mongodb` | MongoDB 7.0 or newer as a replica set, including for a single node | [from source](/install-from-source/#install-mongodb), [MongoDB container](https://github.com/ExtendDB/extenddb/blob/main/docker/README-mongodb.md) |
 | SQLite | `sqlite` | `extenddb/extenddb-dev` (built in developer mode, see below) | None; a file, or `:memory:` | [development image](/dev-image/), [from source](/install-from-source/#initialize-on-sqlite) |
-| Cassandra | `cassandra` | None | An Apache Cassandra cluster | [Cassandra setup](/cassandra-setup/), [from source](/install-from-source/#install-cassandra), [upgrade manual](/manuals/upgrade-manual/), [backend RFC (draft)](/rfcs/draft-cassandra-backend/) |
+| Cassandra (experimental) | `cassandra` | None | An Apache Cassandra 4.1 or newer cluster | [Cassandra setup](/cassandra-setup/), [from source](/install-from-source/#install-cassandra), [upgrade manual](/manuals/upgrade-manual/), [backend RFC (draft)](/rfcs/draft-cassandra-backend/) |
 
 ## Selecting a backend
 
@@ -42,9 +42,9 @@ The DynamoDB API surface is the same on every backend. Where a backend's behavio
 - PostgreSQL: vector indexes and `SearchVectors` need the pgvector extension on the data database; without it every vector operation is refused and nothing else is affected.
 - MongoDB: partition and sort key numbers carry 34 significant digits (BSON Decimal128) against the service's 38; larger precision is refused with a `ValidationException`.
 - SQLite: one server per database file, enforced with a lock file next to the database. The `extenddb/extenddb-dev` image compiles this backend in developer mode: plain HTTP, open authorization, a seeded credential, for local development and CI only ([development image](/dev-image/)).
-- Cassandra: backups copy the live table and are not point-in-time; see the backup rows on the differences page.
+- Cassandra: the backend is experimental. It does not implement vector indexes or `SearchVectors`, so every vector operation is refused. PutItem, UpdateItem and a conditional DeleteItem on a table without TTL, and the writes of a TransactWriteItems, commit the item before its stream record is written, so a failure between the two leaves the item changed with no stream record. Backups copy the live table and are not point-in-time. The vector, stream and backup rows on the differences page give the detail.
 
-Running more than one server against one PostgreSQL or MongoDB catalog is not supported in this release; the [deployment guide](/manuals/deployment-guide/#multi-instance-considerations) explains why.
+Running more than one server against one PostgreSQL, MongoDB or Cassandra catalog is not supported; the [deployment guide](/manuals/deployment-guide/#multi-instance-considerations) explains why.
 
 ## Developer notes
 

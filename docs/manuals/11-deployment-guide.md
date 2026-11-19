@@ -20,7 +20,7 @@ This guide covers deploying ExtendDB in various environments beyond local develo
 
 ExtendDB is a single Rust binary that connects to the storage backend it was built with (PostgreSQL by default; see [Storage backends](../storage-backends.md)). All durable state lives in the backend; ExtendDB keeps only short-lived credential, policy, and table-metadata caches in process. This means:
 
-- Running more than one ExtendDB instance against one catalog is not supported in this release (see [Multi-Instance Considerations](#multi-instance-considerations))
+- Running more than one ExtendDB instance against one catalog is not supported (see [Multi-Instance Considerations](#multi-instance-considerations))
 - The backend's own HA, backup, and replication tools provide durability; with `[backup.store]` configured (file-backed SQLite has one by default), table backups go to the store on PostgreSQL, SQLite and MongoDB; without one, and always on Cassandra, they are in-catalog backups inside the database; the [Backup and Restore manual](14-backup-and-restore.md) covers both
 - ExtendDB can run anywhere the storage backend is reachable
 
@@ -142,10 +142,9 @@ want: one that failed on a database outage would restart every replica at once.
 A backend that is unreachable at startup does stop the server from listening, so
 container start-up failures are still caught.
 
-There is no readiness endpoint yet, so do not expect a Kubernetes
-`readinessProbe` on `/health` to remove a replica from service when its database
-becomes unreachable. Until a readiness endpoint that probes the storage layer
-exists, treat backend failures as something clients retry through.
+There is no readiness endpoint, so do not expect a Kubernetes `readinessProbe`
+on `/health` to remove a replica from service when its database becomes
+unreachable. Treat backend failures as something clients retry through.
 
 For Kubernetes, run `extenddb init` as an init container or a one-time Job, then deploy ExtendDB as a Deployment with the generated `extenddb.toml` mounted as a ConfigMap or Secret. A deployment that keeps its stored secrets under a key-encryption key (KEK) file (the admin guide's [Encryption Key](05-admin-guide.md#encryption-key) section) mounts the KEK as a Secret volume with `defaultMode: 0400`, runs the pod with `securityContext: {runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001}`, and points `EXTENDDB__AUTH__ENCRYPTION__KEY_FILE` at the mounted file. kubelet gives the file to root with group 10001 at mode 0440, which the server accepts only when its effective group is 10001. The server cannot see who belongs to that group, and every member can read the file, so give group 10001 no other members. Without `fsGroup` the file belongs to group root and uid 10001 cannot open it. Secrets are unencrypted in etcd unless the cluster enables encryption at rest. The `extenddb encryption-key` commands that need every server stopped run as a Job that mounts the same Secret while the Deployment has 0 replicas.
 
@@ -318,7 +317,7 @@ With this unit only the `extenddb` user and root can read export files: the serv
 
 ## Multi-Instance Considerations
 
-Run one ExtendDB instance per catalog. Multiple instances behind a load balancer are not supported in this release:
+Run one ExtendDB instance per catalog. Multiple instances behind a load balancer are not supported:
 
 - Credentials, policies, and table metadata are cached in each process (see the cache TTLs in the admin guide). Nothing invalidates a cache on another instance, so a key revoked or a policy changed through one instance stays in force on the others until the TTL expires.
 - Every instance runs every background worker (TTL expiry, GSI backfill, stream retention, control-plane transitions). The workers are safe to run twice, but the work is duplicated.

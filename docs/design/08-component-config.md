@@ -1,12 +1,11 @@
 ---
 description: "The configuration system, configurable limits, logging, metrics, health checks and deployment settings."
+version: "1.0"
+date: "2026-04-03"
+status: "Draft"
 ---
 
 # Component design: Configuration and operations
-
-**Version:** 1.0
-**Date:** 2026-04-03
-**Status:** Draft
 
 ## 1. Purpose
 
@@ -15,10 +14,10 @@ This document covers the configuration system, configurable limits, logging, met
 ## 2. Configuration Layering
 
 Precedence (highest to lowest):
-1. **CLI flags** — `--config`, `--port`, `--version`, `--validate-config`
-2. **Environment variables** — `EXTENDDB__SERVER__PORT=18443`
-3. **Config file** — TOML format, path specified via `--config` or default `config.toml`
-4. **Defaults** — hardcoded in Rust structs via `Default` trait
+1. **CLI flags**: `--config`, `--port`, `--version`, `--validate-config`
+2. **Environment variables**: `EXTENDDB__SERVER__PORT=18443`
+3. **Config file**: TOML format, path specified via `--config` or default `config.toml`
+4. **Defaults**: hardcoded in Rust structs via `Default` trait
 
 ### 2.1 CLI (clap)
 
@@ -512,11 +511,11 @@ CMD ["--config", "/etc/extenddb/config.toml"]
 
 ## 10. SDK Client Configuration
 
-extenddb serves both DynamoDB and DynamoDB Streams on a single port. An unmodified application that works against AWS must work against extenddb by changing only endpoint configuration.
+ExtendDB serves both DynamoDB and DynamoDB Streams on a single port. An unmodified application that works against AWS must work against ExtendDB by changing only endpoint configuration.
 
 ### 10.1 Recommended Setup: Environment Variables
 
-The simplest approach — set two service-specific endpoint variables and credentials:
+The simplest approach is to set two service-specific endpoint variables and credentials:
 
 ```bash
 # Endpoint overrides (both point to the same extenddb instance)
@@ -529,19 +528,19 @@ export AWS_SECRET_ACCESS_KEY=local-dev-secret
 export AWS_DEFAULT_REGION=us-east-1
 ```
 
-This works with every AWS SDK (Python/boto3, Java v2, Rust, Go v2, .NET, Node.js) — all support the `AWS_ENDPOINT_URL_<SERVICE>` convention since late 2023.
+This works with every AWS SDK (Python/boto3, Java v2, Rust, Go v2, .NET, Node.js); all support the `AWS_ENDPOINT_URL_<SERVICE>` convention since late 2023.
 
-**Alternative — single global override** (when the application only uses DynamoDB):
+**Alternative: single global override** (when the application only uses DynamoDB):
 
 ```bash
 export AWS_ENDPOINT_URL=https://127.0.0.1:18443
 ```
 
-This sends all AWS SDK calls to extenddb. Simpler, but breaks if the application also calls non-DynamoDB services.
+This sends all AWS SDK calls to ExtendDB. Simpler, but breaks if the application also calls non-DynamoDB services.
 
 ### 10.2 Alternative Setup: AWS Config File
 
-For teams that prefer file-based configuration or need to switch between extenddb and real DynamoDB:
+For teams that prefer file-based configuration or need to switch between ExtendDB and real DynamoDB:
 
 ```ini
 # ~/.aws/config
@@ -577,7 +576,7 @@ AWS SDKs resolve endpoints in this order (highest priority first):
 
 When any override is set, the SDK disables endpoint discovery (`DescribeEndpoints` is never called automatically). All requests go directly to the configured URL.
 
-extenddb accepts both `DynamoDB_20120810.*` and `DynamoDBStreams_20120810.*` target prefixes on the same port. Both use `dynamodb` as the SigV4 signing name, so authentication is identical.
+ExtendDB accepts both `DynamoDB_20120810.*` and `DynamoDBStreams_20120810.*` target prefixes on the same port. Both use `dynamodb` as the SigV4 signing name, so authentication is identical.
 
 ### 10.4 DescribeEndpoints Response
 
@@ -598,9 +597,9 @@ The `Address` is derived from the server's configured `bind_addr` and `port`. If
 
 ### 10.5 Credential Pairing
 
-The credentials in `~/.aws/credentials` (or env vars) are what the SDK uses to sign requests. extenddb validates these signatures against its own credential store. The access key and secret key must match on both sides:
+The credentials in `~/.aws/credentials` (or env vars) are what the SDK uses to sign requests. ExtendDB validates these signatures against its own credential store. The access key and secret key must match on both sides:
 
-1. Register credentials in extenddb's credential store (via admin API or database seeding)
+1. Register credentials in ExtendDB's credential store (via admin API or database seeding)
 2. Configure the same `aws_access_key_id` / `aws_secret_access_key` in the SDK client's environment
 
 For development environments, a default credential pair can be seeded automatically on first startup (configurable via `auth.seed_credentials` in `config.toml`).
