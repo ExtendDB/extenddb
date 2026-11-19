@@ -101,8 +101,11 @@ pub fn parse_condition_expr(expr: &str, limits: &LimitsConfig) -> Result<Expr, D
 ///
 /// Measured 2026-10-25 (us-east-1): the check runs after the syntax, reserved
 /// word, undefined placeholder and operand type checks and before the unused
-/// placeholder check and the table lookup. `TransactWriteItems` counts a
-/// different total for the same text and does not call this.
+/// placeholder check and the table lookup. `TransactWriteItems` counts the
+/// same way, but it does not call this check (measured 2026-11-19: a Put of
+/// 151, 200 or 300 `#v = :v` terms joined by OR answers 301, 399 or 599, a
+/// ConditionCheck of 151 terms answers 301, and a Put of 150 terms is
+/// evaluated).
 ///
 /// # Errors
 ///
