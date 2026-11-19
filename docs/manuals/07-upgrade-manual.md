@@ -1261,9 +1261,14 @@ The server replays a retry without the field. After a downgrade, a token that
 this release stored for such a request answers
 `IdempotentParameterMismatchException` to every retry. This includes an
 identical retry and a retry without the field. A token for a request with
-neither field, or with both set to `NONE`, replays in both directions. Servers
-of both releases can share one database during a rolling upgrade. A retry that
-reaches a server of the other release then gets the same answers. PostgreSQL,
+neither field, or with both set to `NONE`, replays in both directions. On
+PostgreSQL, MongoDB and Cassandra nothing stops servers of both releases from
+sharing one database during a rolling upgrade (see the deployment guide's
+[Multi-Instance Considerations](11-deployment-guide.md#multi-instance-considerations)).
+A retry that reaches a server of the other release then gets the same answers.
+On SQLite, run the two releases one after the other. On Linux and macOS a
+second server refuses to start while another process holds the lock on
+`<database>.lock`. On Windows the server takes no lock (#642). PostgreSQL,
 SQLite and MongoDB keep a token for 10 minutes. On those backends every token
 that the release you upgrade or downgrade from stored expires at most 10
 minutes after its last server stops. The Cassandra backend does not expire
