@@ -19,7 +19,7 @@ use extenddb_storage::error::StorageError;
 use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
-use crate::expression_helpers::{build_expression_maps, parse_optional_filter};
+use crate::expression_helpers::parse_optional_filter;
 use crate::index_helpers::{
     VectorIndexReadRefusal, classify_unresolved_index_read, combined_lek_key_schema,
     validate_query_select_index_support,
@@ -33,6 +33,10 @@ use crate::start_key::{
 };
 use crate::{DispatchMetrics, DispatchResult};
 
+mod request_checks;
+
+use request_checks::CheckedRequest;
+
 /// Handle a `Query` request.
 ///
 /// Parses `KeyConditionExpression`, queries the storage layer, applies
@@ -44,82 +48,15 @@ use crate::{DispatchMetrics, DispatchResult};
 /// Returns `DynamoDbError` for validation failures, missing tables, or storage errors.
 #[allow(clippy::cast_possible_wrap)] // item counts won't exceed i64::MAX
 pub async fn handle_query(
-    mut body: Value,
+    body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
-    // Pre-scanned before typed deserialization, sequentially: Query stops at
-    // the FIRST invalid enum, checking ReturnConsumedCapacity ahead of Select.
-    // Measured 2026-08-24 (us-east-1): both invalid answers "1 validation
-    // error detected" naming returnConsumedCapacity alone. (Scan is the
-    // opposite on both counts: it aggregates, select-first; see handle_scan.)
-    crate::validate_enum_fields(
-        &body,
-        &[crate::EnumField {
-            json_name: "ReturnConsumedCapacity",
-            valid: &["INDEXES", "TOTAL", "NONE"],
-            clause: crate::EnumClause::Named("returnConsumedCapacity"),
-        }],
-    )?;
-    // The service checks Select after Limit, the request's parameters, the
-    // FilterExpression and the KeyConditionExpression (measured 2026-11-11),
-    // so an invalid Select is left out of the typed input and its error waits
-    // for those checks below.
-    let select_check = crate::validate_enum_fields(
-        &body,
-        &[crate::EnumField {
-            json_name: "Select",
-            valid: &[
-                "SPECIFIC_ATTRIBUTES",
-                "COUNT",
-                "ALL_ATTRIBUTES",
-                "ALL_PROJECTED_ATTRIBUTES",
-            ],
-            clause: crate::EnumClause::Named("select"),
-        }],
-    );
-    if select_check.is_err()
-        && let Some(fields) = body.as_object_mut()
-    {
-        fields.remove("Select");
-    }
-    // An invalid Select still comes ahead of a body that does not
-    // deserialize, as it did when it was checked before deserialization.
-    let input: QueryInput = match serde_json::from_value(body) {
-        Ok(input) => input,
-        Err(err) => {
-            select_check?;
-            return Err(crate::deserialize_error(err));
-        }
-    };
-
-    // Validate Limit >= 1 (REQ-QUERY-001). The service checks Limit ahead of
-    // every other fault measured (2026-11-11, us-east-1).
-    if let Some(limit) = input.limit
-        && limit < 1
-    {
-        return Err(DynamoDbError::ValidationException(
-                "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1".to_owned(),
-            ));
-    }
-
-    // Build expression maps from request (used for expression-based parameters)
-    let maps = build_expression_maps(
-        input.expression_attribute_names.as_ref(),
-        input.expression_attribute_values.as_ref(),
-    );
-
-    // The service checks a Query in this order (measured 2026-11-11 in
-    // us-east-1): Limit, then the request's parameters, then every
-    // FilterExpression fault, then every KeyConditionExpression fault, then
-    // Select, the table, the index and ConsistentRead.
-    check_request_parameters(&input)?;
-    let filter_expression = parse_filter_expression(&input, &maps, &ctx.limits)?;
-    let key_condition_expression = input
-        .key_condition_expression
-        .as_deref()
-        .map(|kce| crate::expression_helpers::parse_key_condition_expr(kce, &maps, &ctx.limits))
-        .transpose()?;
-    select_check?;
+    let CheckedRequest {
+        input,
+        maps,
+        filter_expression,
+        key_condition_expression,
+    } = request_checks::check_request(body, &ctx.limits)?;
 
     // P118: Fetch key_info first so we can use table_id for index lookup.
     let key_info = ctx
