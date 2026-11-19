@@ -212,7 +212,14 @@ fn parse_primary(
         // IN (operand, operand, ...)
         if tokens[*pos] == Token::In {
             *pos += 1;
-            parser_common::expect_token(tokens, pos, &Token::LParen, "(", "ConditionExpression")?;
+            // Any token but `(` after IN, and the end of input, answer the
+            // syntax error (measured 2026-11-19: `#v IN IN (:v)` answers token
+            // "IN", near "IN IN ("; `#v IN :v` token ":v"; `#v IN` token
+            // "<EOF>", near "IN").
+            if tokens.get(*pos) != Some(&Token::LParen) {
+                return Err(syntax_error(ExpressionKind::Condition, src, tokens, *pos));
+            }
+            *pos += 1;
             let mut list = vec![parse_operand(tokens, src, pos, depth, max_depth)?];
             while *pos < tokens.len() && tokens[*pos] == Token::Comma {
                 *pos += 1;
@@ -579,6 +586,25 @@ mod tests {
                 matches!(&err, DynamoDbError::ValidationException(msg)
                     if msg == "Invalid ConditionExpression: The expression has redundant parentheses;"),
                 "expr {expr}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_token_other_than_a_parenthesis_after_in_answers_the_syntax_error() {
+        // Measured 2026-11-19 (us-east-1), probe cases in the first column.
+        for (case, src, token, near) in [
+            ("x17", "#v IN IN (:v)", "IN", "IN IN ("),
+            ("i01", "#v IN :v", ":v", "IN :v"),
+            ("i02", "#v IN", "<EOF>", "IN"),
+        ] {
+            let err = parse_condition_from(&tokenize(src).unwrap(), src, 150).unwrap_err();
+            let want = format!(
+                "Invalid ConditionExpression: Syntax error; token: \"{token}\", near: \"{near}\""
+            );
+            assert!(
+                matches!(&err, DynamoDbError::ValidationException(msg) if *msg == want),
+                "{case}: got {err:?}"
             );
         }
     }
