@@ -9,12 +9,11 @@ use super::super::kind::ExpressionKind;
 use super::super::resolver::{
     ExpressionMaps, attribute_type_code, validate_ordering_operand_types,
 };
+use super::check_condition_call_name;
 use super::errors::{
-    invalid_function_name, not_allowed_this_way, operand_count_err, operand_type_err,
-    requires_document_path, validation, with_kind,
+    operand_count_err, operand_type_err, requires_document_path, validation, with_kind,
 };
 use super::refs::{check_path_refs, check_value_defined};
-use super::{CONDITION_FUNCTIONS, UPDATE_FUNCTIONS};
 use crate::error::DynamoDbError;
 use crate::types::AttributeValue;
 
@@ -104,18 +103,7 @@ fn walk_condition_function(
     for arg in args {
         walk_condition_operand(arg, maps, kind)?;
     }
-    if !CONDITION_FUNCTIONS.contains(&name) {
-        if UPDATE_FUNCTIONS.contains(&name) {
-            return Err(validation(
-                kind,
-                &format!("The function is not allowed in a condition expression; function: {name}"),
-            ));
-        }
-        return Err(invalid_function_name(kind, name));
-    }
-    if operand_position != (name == "size") {
-        return Err(not_allowed_this_way(kind, name));
-    }
+    check_condition_call_name(name, operand_position, kind)?;
     let expected = match name {
         "attribute_exists" | "attribute_not_exists" | "size" => 1,
         _ => 2,

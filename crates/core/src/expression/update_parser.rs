@@ -19,10 +19,12 @@
 //! A parenthesized value and a function call each nest one level. Past
 //! `max_expression_depth` levels the expression is refused before the parser
 //! recurses further, so the stack a parse takes stays bounded whatever the
-//! size and token limits allow.
+//! size and token limits allow. A call the semantic pass refuses by name is
+//! refused there with that message, not the depth error.
 
 use super::ast::{ArithOp, Expr, UpdateAction};
 use super::parser_common;
+use super::semantics::check_update_call_name;
 use super::tokenizer::Token;
 use crate::error::DynamoDbError;
 
@@ -332,7 +334,9 @@ fn parse_value_expr(
 /// Any identifier followed by `(` is a function call, with the name kept as
 /// written. This pass checks grammar only: whether the name exists, its case,
 /// and its operand count are checked afterwards by
-/// `validate_update_semantics`, over the whole parsed expression. Amazon
+/// `validate_update_semantics`, over the whole parsed expression. A call past
+/// the depth limit is the exception: that pass never runs, so its name is
+/// checked here (see `depth_tests.rs`). Amazon
 /// DynamoDB reports every syntax error before any semantic error (measured
 /// 2026-10-14: `SET x = foo(x), b = ` reports the syntax error at the end,
 /// not the unknown function name), and deferring the semantic checks gives
@@ -352,8 +356,11 @@ fn parse_set_operand(
             *pos += 1;
             Ok(expr)
         }
-        Token::Ident(_) => {
+        Token::Ident(name) => {
             if *pos + 1 < tokens.len() && tokens[*pos + 1] == Token::LParen {
+                if nesting.depth >= nesting.max_depth {
+                    check_update_call_name(name)?;
+                }
                 nesting.enter()?;
                 let call = parse_set_function_call(tokens, pos, nesting)?;
                 nesting.leave();

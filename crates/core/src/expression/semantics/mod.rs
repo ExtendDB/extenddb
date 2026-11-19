@@ -42,6 +42,9 @@
 //! - a comparison or `BETWEEN` with an ordering operator: a placeholder
 //!   operand is a string, number, or binary.
 
+use super::kind::ExpressionKind;
+use crate::error::DynamoDbError;
+
 const CONDITION_FUNCTIONS: [&str; 6] = [
     "attribute_exists",
     "attribute_not_exists",
@@ -66,6 +69,47 @@ pub(super) fn key_condition_function_refusal(name: &str) -> String {
     } else {
         format!("Invalid function name; function: {name}")
     }
+}
+
+/// The refusal of a call in a condition by its name and position alone, the
+/// first check on a call after its operands: a name that is not a condition
+/// function, `size` in condition position, and the other condition functions
+/// in operand position.
+pub(super) fn check_condition_call_name(
+    name: &str,
+    operand_position: bool,
+    kind: ExpressionKind,
+) -> Result<(), DynamoDbError> {
+    if !CONDITION_FUNCTIONS.contains(&name) {
+        if UPDATE_FUNCTIONS.contains(&name) {
+            return Err(errors::validation(
+                kind,
+                &format!("The function is not allowed in a condition expression; function: {name}"),
+            ));
+        }
+        return Err(errors::invalid_function_name(kind, name));
+    }
+    if operand_position != (name == "size") {
+        return Err(errors::not_allowed_this_way(kind, name));
+    }
+    Ok(())
+}
+
+/// The refusal of a call in a SET value by its name alone: a condition
+/// function (`SET x = size(x)`) and any name other than `if_not_exists` and
+/// `list_append`.
+pub(super) fn check_update_call_name(name: &str) -> Result<(), DynamoDbError> {
+    let kind = ExpressionKind::Update;
+    if UPDATE_FUNCTIONS.contains(&name) {
+        return Ok(());
+    }
+    if CONDITION_FUNCTIONS.contains(&name) {
+        return Err(errors::validation(
+            kind,
+            &format!("The function is not allowed in an update expression; function: {name}"),
+        ));
+    }
+    Err(errors::invalid_function_name(kind, name))
 }
 
 mod condition_rules;
