@@ -190,13 +190,18 @@ pub fn backend() -> extenddb_storage::Backend {
         diagnostics_store: |connection_string| {
             let connection_string = connection_string.to_string();
             Box::pin(async move {
-                let pool = sqlx::PgPool::connect(&connection_string)
-                    .await
-                    .map_err(|e| {
-                        extenddb_storage::diagnostics_store::DiagnosticsStoreError::ConnectionFailed(
-                            e.to_string(),
-                        )
-                    })?;
+                use extenddb_storage::diagnostics_store::DiagnosticsStoreError;
+                // Statement logging is off, as on the store's data pool, so a
+                // catalog read that waits on a lock does not print a
+                // slow-statement line in the middle of the command's report.
+                let options = connection_string
+                    .parse::<sqlx::postgres::PgConnectOptions>()
+                    .map_err(|e| DiagnosticsStoreError::ConnectionFailed(e.to_string()))?;
+                let pool = sqlx::PgPool::connect_with(
+                    sqlx::ConnectOptions::disable_statement_logging(options),
+                )
+                .await
+                .map_err(|e| DiagnosticsStoreError::ConnectionFailed(e.to_string()))?;
                 Ok(Box::new(PostgresCatalogStore::new(pool))
                     as Box<dyn extenddb_storage::diagnostics::DiagnosticsStore>)
             })

@@ -16,6 +16,8 @@
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
+use sqlx::Connection;
+
 #[path = "../../storage-postgres/tests/catalog_check/support.rs"]
 #[allow(dead_code)]
 mod support;
@@ -89,9 +91,26 @@ async fn catalog_check_prints_each_finding_and_exits_with_status_1() {
     );
     assert!(!d.relation_exists(&orphan).await, "--fix dropped the orphan");
 
+    // The report while a session holds a lock on a catalog table that the
+    // check reads, for longer than a statement takes to count as slow.
+    let mut holder = sqlx::PgConnection::connect(&d.catalog_url())
+        .await
+        .expect("a catalog session for the lock");
+    sqlx::query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("begin");
+    sqlx::query("LOCK TABLE vector_indexes IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut holder)
+        .await
+        .expect("lock vector_indexes");
     let report = catalog_check(&config, false)
-        .output()
+        .spawn()
         .expect("run catalog-check");
+    Deployment::wait_for_lock_request(&d.catalog, "vector_indexes", "AccessShareLock").await;
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    holder.close().await.expect("release the lock");
+    let report = report.wait_with_output().expect("catalog-check ended");
     assert_run(
         "report",
         &report,
