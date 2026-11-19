@@ -155,17 +155,23 @@ const TRANSLATED_EXPRESSION_LIMIT: usize = 16 * MAX_STATEMENT_LENGTH;
 
 /// The limits the requests a statement is translated into run with: `limits`
 /// with the size and token limits of an expression raised to
-/// [`TRANSLATED_EXPRESSION_LIMIT`]. The classic limits (4096 bytes and 4096
-/// tokens) apply to the expressions a caller writes. The text written for a
-/// statement is longer than the statement wherever a name or a value becomes
-/// a placeholder, and the service runs a statement within its own limits
-/// (8192 characters, 300 operators in its condition) whose text would be past
-/// the classic ones (measured 2026-11-02: a condition of 150 `begins_with`
-/// calls ANDed, 4275 bytes as classic text).
+/// [`TRANSLATED_EXPRESSION_LIMIT`], and no operator cap. The classic limits
+/// (4096 bytes, 4096 tokens and 300 operators) apply to the expressions a
+/// caller writes. The text written for a statement is longer than the
+/// statement wherever a name or a value becomes a placeholder, and the service
+/// runs a statement within its own limits (8192 characters, 300 operators in
+/// its condition) whose text would be past the classic ones (measured
+/// 2026-11-02: a condition of 150 `begins_with` calls ANDed, 4275 bytes as
+/// classic text). The PartiQL parser applies the operator cap to the
+/// statement. The written text holds more operators wherever a NOT is pushed
+/// onto the predicates under it or a key existence condition is added
+/// (measured 2026-11-19: a SELECT whose WHERE is NOT over 150 ANDed
+/// comparisons, 449 operators as classic text, returns the item).
 fn translation_limits(limits: &LimitsConfig) -> LimitsConfig {
     LimitsConfig {
         max_expression_length_bytes: TRANSLATED_EXPRESSION_LIMIT,
         max_expression_tokens: TRANSLATED_EXPRESSION_LIMIT,
+        max_expression_operators: usize::MAX,
         ..limits.clone()
     }
 }
@@ -456,6 +462,18 @@ mod tests {
         assert_eq!(
             translated.max_attribute_name_bytes,
             classic.max_attribute_name_bytes
+        );
+    }
+
+    #[test]
+    fn a_translated_expression_has_no_operator_cap() {
+        // The PartiQL parser counts the statement's operators; the text
+        // written for it is not counted again.
+        let classic = LimitsConfig::default();
+        assert_eq!(classic.max_expression_operators, 300);
+        assert_eq!(
+            translation_limits(&classic).max_expression_operators,
+            usize::MAX
         );
     }
 

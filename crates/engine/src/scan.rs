@@ -157,7 +157,12 @@ pub async fn handle_scan(
     if filter_maps.is_none()
         && let Some(ref f) = filter
     {
-        crate::expression_helpers::check_parsed_condition(f, &maps, ExpressionKind::Filter)?;
+        crate::expression_helpers::check_parsed_condition(
+            f,
+            &maps,
+            ExpressionKind::Filter,
+            &ctx.limits,
+        )?;
     }
 
     // Parse ProjectionExpression or desugar legacy AttributesToGet

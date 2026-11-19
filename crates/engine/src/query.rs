@@ -367,6 +367,7 @@ pub async fn handle_query(
             filter_expr,
             &maps,
             ExpressionKind::Filter,
+            &ctx.limits,
         )?;
     }
 

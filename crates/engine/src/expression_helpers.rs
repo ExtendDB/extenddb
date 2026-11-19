@@ -94,9 +94,10 @@ pub fn parse_condition_expr(expr: &str, limits: &LimitsConfig) -> Result<Expr, D
         .map_err(|e| prefix_expression_error(e, ExpressionKind::Condition))
 }
 
-/// Refuse a condition or filter whose operator count exceeds the service's cap
-/// of 300 (`Invalid <kind>: The expression contains too many operators;
-/// operator count: <n>`).
+/// Refuse a condition or filter whose operator count exceeds
+/// `limits.max_expression_operators`, the service's cap of 300 by default
+/// (`Invalid <kind>: The expression contains too many operators; operator
+/// count: <n>`).
 ///
 /// Measured 2026-10-25 (us-east-1): the check runs after the syntax, reserved
 /// word, undefined placeholder and operand type checks and before the unused
@@ -106,8 +107,12 @@ pub fn parse_condition_expr(expr: &str, limits: &LimitsConfig) -> Result<Expr, D
 /// # Errors
 ///
 /// Returns `DynamoDbError::ValidationException` when the count is over the cap.
-pub fn check_operator_count(expr: &Expr, kind: ExpressionKind) -> Result<(), DynamoDbError> {
-    validate_operator_count(expr, kind)
+pub fn check_operator_count(
+    expr: &Expr,
+    kind: ExpressionKind,
+    limits: &LimitsConfig,
+) -> Result<(), DynamoDbError> {
+    validate_operator_count(expr, kind, limits.max_expression_operators)
 }
 
 /// Check a parsed condition or filter in the service's order: its placeholders
@@ -127,9 +132,10 @@ pub fn check_parsed_condition(
     expr: &Expr,
     maps: &ExpressionMaps,
     kind: ExpressionKind,
+    limits: &LimitsConfig,
 ) -> Result<(), DynamoDbError> {
     validate_placeholders_and_operands(expr, maps).map_err(|e| prefix_expression_error(e, kind))?;
-    check_operator_count(expr, kind)
+    check_operator_count(expr, kind, limits)
 }
 
 /// Tokenize, reserved-word check, and parse an `UpdateExpression`.
@@ -243,7 +249,7 @@ pub fn resolve_condition(
     let condition = parse_optional_condition(condition_expression, limits)?;
     if let Some(ref expr) = condition {
         // Before the unused placeholder check and the table lookup.
-        check_parsed_condition(expr, &maps, ExpressionKind::Condition)?;
+        check_parsed_condition(expr, &maps, ExpressionKind::Condition, limits)?;
     }
     Ok((condition, maps))
 }
@@ -304,7 +310,7 @@ pub fn parse_key_condition_expr(
         // it does not accept the text, the key condition parser reports the
         // error in its own words.
         if let Ok(expr) = parse_condition_from(&tokens, expr, limits.max_expression_depth) {
-            check_operator_count(&expr, ExpressionKind::KeyCondition)?;
+            check_operator_count(&expr, ExpressionKind::KeyCondition, limits)?;
         }
         parse_key_condition_from(&tokens, expr)
     })
