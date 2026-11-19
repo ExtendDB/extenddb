@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `ExpressionAttributeValues` entries the service cannot read as one type: a
-//! null, no type descriptor it knows, more than one, or one it does not know
-//! beside one it does, in the value or in any value an `L` or `M` holds. A
-//! `Query` with such an entry takes its own order of checks (see
-//! [`unreadable_value_checks`]), and the shape fault check reads the entry with
-//! those parts replaced (see [`readable_for_shape_check`]).
+//! null, no type descriptor it knows, more than one, one it does not know
+//! beside one it does, or one with a null payload, in the value or in any
+//! value an `L` or `M` holds. A `Query` with such an entry takes its own order
+//! of checks (see [`unreadable_value_checks`]), and the shape fault check reads
+//! the entry with those parts replaced (see [`readable_for_shape_check`]).
 
 use std::borrow::Cow;
 
@@ -18,9 +18,11 @@ use super::{
 };
 
 /// Whether the service cannot read `value` as exactly one AttributeValue type:
-/// a null, no type descriptor it knows, more than one, or one it does not know
-/// beside one it does, in the value or in any value an `L` or `M` holds. A
-/// value of another JSON type is a shape fault instead.
+/// a null, no type descriptor it knows, more than one, one it does not know
+/// beside one it does, or one with a null payload, in the value or in any
+/// value an `L` or `M` holds (measured 2026-11-19: `{"S": null}` beside a
+/// `Limit` of 0 answers `Value '0' at 'limit'`, as `{"X": "1"}` does). A value
+/// of another JSON type is a shape fault instead.
 pub(super) fn unreadable(value: &Value) -> bool {
     match value {
         Value::Null => true,
@@ -31,6 +33,7 @@ pub(super) fn unreadable(value: &Value) -> bool {
             match (known.next(), known.next()) {
                 (Some((key, inner)), None) => {
                     map.len() > 1
+                        || inner.is_null()
                         || match (key.as_str(), inner) {
                             ("L", Value::Array(items)) => items.iter().any(unreadable),
                             ("M", Value::Object(members)) => members.values().any(unreadable),
@@ -70,16 +73,19 @@ pub(super) fn readable_for_shape_check(body: &Value) -> Cow<'_, Value> {
 /// Replace each part of `value` the service cannot read as one type, in the
 /// value and in the values an `L` or `M` holds. A null, or an object with no
 /// type descriptor the service knows, becomes `{"NULL": true}`. An unknown
-/// descriptor beside a known one is dropped. An object with several known
-/// descriptors becomes an `L` of one value per descriptor, so the deserializer
-/// still reads each payload (measured 2026-11-11: `{"L": [{"S": "a", "N":
-/// "1"}, "x"]}` and `{"S": "a", "N": 1}` answer `SerializationException`). A
+/// descriptor beside a known one, and a known one with a null payload, are
+/// dropped. An object with several known descriptors becomes an `L` of one
+/// value per descriptor, so the deserializer still reads each payload
+/// (measured 2026-11-11: `{"L": [{"S": "a", "N": "1"}, "x"]}` and `{"S": "a",
+/// "N": 1}` answer `SerializationException`). A
 /// value of another JSON type is left for the deserializer to report.
 fn make_readable(value: &mut Value) {
     let replacement = match value {
         Value::Null => Some(null_value()),
         Value::Object(map) => {
-            map.retain(|key, _| TYPE_DESCRIPTORS.contains(&key.as_str()));
+            map.retain(|key, payload| {
+                TYPE_DESCRIPTORS.contains(&key.as_str()) && !payload.is_null()
+            });
             if map.len() > 1 {
                 let mut parts: Vec<Value> = std::mem::take(map)
                     .into_iter()

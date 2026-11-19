@@ -363,3 +363,78 @@ fn a_json_type_fault_inside_a_value_the_service_cannot_read_is_a_shape_fault() {
         )
     );
 }
+
+#[test]
+fn a_type_descriptor_with_a_null_payload_counts_as_absent() {
+    // Measured 2026-11-19 on Query, each body twice: the service reads a null
+    // payload as no payload, so `{"S": null}` is a value it cannot read as one
+    // type, and the request takes that order of checks.
+    let select = "Value 'bad' at 'select' failed to satisfy constraint: Member must satisfy \
+                  enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, \
+                  ALL_PROJECTED_ATTRIBUTES]";
+    let limit = "Value '0' at 'limit' failed to satisfy constraint: Member must have value \
+                 greater than or equal to 1";
+    let empty = format!("{INVALID_VALUE}{EMPTY} for key :v");
+    for (value, extra, expected) in [
+        (json!({"S": null}), json!({}), empty.clone()),
+        (json!({"N": null}), json!({}), empty.clone()),
+        (json!({"L": [{"S": null}]}), json!({}), empty),
+        (
+            json!({"S": null, "N": "bob"}),
+            json!({}),
+            format!(
+                "{INVALID_VALUE}The parameter cannot be converted to a numeric value: bob for \
+                 key :v"
+            ),
+        ),
+        (
+            json!({"S": null}),
+            json!({"Select": "bad"}),
+            format!("1 validation error detected: {select}"),
+        ),
+        (
+            json!({"S": null}),
+            json!({"Limit": 0}),
+            format!("1 validation error detected: {limit}"),
+        ),
+        (
+            json!({"S": null}),
+            json!({"Select": "bad", "Limit": 0}),
+            format!("2 validation errors detected: {select}; {limit}"),
+        ),
+        (
+            json!({"S": null}),
+            json!({"ReturnConsumedCapacity": "bad"}),
+            "1 validation error detected: Value 'bad' at 'returnConsumedCapacity' failed to \
+             satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"
+                .to_owned(),
+        ),
+        (
+            json!({"S": null}),
+            json!({"AttributesToGet": ["a"]}),
+            "Can not use both expression and non-expression parameters in the same request: \
+             Non-expression parameters: {AttributesToGet} Expression parameters: \
+             {KeyConditionExpression}"
+                .to_owned(),
+        ),
+        (
+            json!({"S": null}),
+            json!({"ExpressionAttributeNames": {"a": "b"}}),
+            r#"ExpressionAttributeNames contains invalid key: Syntax error; key: "a""#.to_owned(),
+        ),
+    ] {
+        let body = body_with(json!({":p": {"S": "x"}, ":v": value}), extra);
+        assert_eq!(
+            message(validate_query_request_body(&body)),
+            Some(expected),
+            "{body}"
+        );
+    }
+    // `{"S": null, "N": "1"}` reads as `{"N": "1"}`: the service accepts it in
+    // a FilterExpression.
+    let body = body_with(
+        json!({":p": {"S": "x"}, ":v": {"S": null, "N": "1"}}),
+        json!({"FilterExpression": "a = :v"}),
+    );
+    assert!(validate_query_request_body(&body).is_ok());
+}

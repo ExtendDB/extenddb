@@ -154,16 +154,35 @@ UNREADABLE = [
      INVALID_VALUE + NUMERIC + "aaa for key :z"),
     ("N bob then S with Limit 0", {":z": {"N": "bob", "S": "x"}}, {"Limit": 0},
      "1 validation error detected: " + LIMIT_0_AT),
+    # A type descriptor with a null payload reads as no payload (measured
+    # 2026-11-19).
+    ("S null", {":z": {"S": None}}, {}, INVALID_VALUE + EMPTY_AV + " for key :z"),
+    ("N null", {":z": {"N": None}}, {}, INVALID_VALUE + EMPTY_AV + " for key :z"),
+    ("S null in an L", {":z": {"L": [{"S": None}]}}, {}, INVALID_VALUE + EMPTY_AV + " for key :z"),
+    ("S null beside N bob", {":z": {"S": None, "N": "bob"}}, {},
+     INVALID_VALUE + NUMERIC + "bob for key :z"),
+    ("S null with an invalid Select", {":z": {"S": None}}, {"Select": "bad"},
+     "1 validation error detected: Value 'bad' at 'select' failed to satisfy constraint: Member "
+     "must satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, "
+     "ALL_PROJECTED_ATTRIBUTES]"),
+    ("S null with Limit 0", {":z": {"S": None}}, {"Limit": 0},
+     "1 validation error detected: " + LIMIT_0_AT),
+    ("S null with ReturnConsumedCapacity", {":z": {"S": None}}, {"ReturnConsumedCapacity": "bad"},
+     RCC_MSG),
+    ("S null with AttributesToGet", {":z": {"S": None}}, {"AttributesToGet": ["a"]},
+     "Can not use both expression and non-expression parameters in the same request: "
+     "Non-expression parameters: {AttributesToGet} Expression parameters: {KeyConditionExpression}"),
 ]
 
 
 class TestValuesTheServiceCannotReadAsOneType:
     """A value in ExpressionAttributeValues that the service cannot read as one
-    type (a null, no type descriptor it knows, more than one, or an unknown one
-    beside a known one) is named with its placeholder, and beside such a value
-    Select, ReturnConsumedCapacity and Limit are reported together, ahead of
-    the parameter mix (measured 2026-11-11). boto3 cannot send an unknown
-    descriptor or a null, so the bodies go out as written."""
+    type (a null, no type descriptor it knows, more than one, an unknown one
+    beside a known one, or a known one with a null payload) is named with its
+    placeholder, and beside such a value Select, ReturnConsumedCapacity and
+    Limit are reported together, ahead of the parameter mix (measured
+    2026-11-11 and 2026-11-19). boto3 cannot send an unknown descriptor or a
+    null, so the bodies go out as written."""
 
     @pytest.mark.parametrize("row,values,extra,expected", UNREADABLE, ids=[r[0] for r in UNREADABLE])
     def test_rows(self, dynamodb_client, ss_table, row, values, extra, expected):
