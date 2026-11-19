@@ -25,11 +25,13 @@
 mod types;
 
 pub use types::{
-    AccessKeyCreated, AccountDetail, AdminEntry, GroupDetail, MetricsRow, OpError, OpResult,
-    RoleDetail, SessionPolicyEntry, UserDetail,
+    AccessKeyCreated, AccountDetail, AdminEntry, GroupDetail, MetricsFilter, MetricsRow, OpError,
+    OpResult, RoleDetail, SecretPage, SecretWrite, SessionPolicyEntry, StoredSecretRow, UserDetail,
 };
 
 use futures::future::BoxFuture;
+
+use crate::secret_keys::SecretTable;
 
 // Type aliases for complex return types in management traits.
 /// User info: `(account_id, user_name, user_arn, has_password, created_at)`.
@@ -58,13 +60,49 @@ pub trait SettingsStore: Send + Sync {
     /// Set a setting value (upsert).
     fn set_setting(&self, key: &str, value: &str) -> BoxFuture<'_, OpResult<()>>;
 
+    /// Set the row `key` to `value` only while it holds `expected`: `true`
+    /// when it held `expected` and now holds `value`, `false` when it held
+    /// anything else or no row. The encryption-key commands write the key
+    /// ring with it, because `rewrap` runs outside the migration lock.
+    ///
+    /// The default refuses: only the backends' catalog stores hold a ring.
+    fn replace_setting(
+        &self,
+        key: &str,
+        expected: &str,
+        value: &str,
+    ) -> BoxFuture<'_, OpResult<bool>> {
+        let _ = (key, expected, value);
+        Box::pin(async {
+            Err(OpError::Internal(
+                "replace_setting is not supported by this store".to_owned(),
+            ))
+        })
+    }
+
     /// List all settings as `(key, value)` pairs, ordered by key.
     fn list_settings(&self) -> BoxFuture<'_, OpResult<Vec<(String, String)>>>;
 
-    /// P119: Get the cached encryption key if available. Returns `None` by
-    /// default; backends that cache the key at startup override this.
-    fn cached_encryption_key(&self) -> Option<String> {
-        None
+    /// `encryption-key set-data-connection` (RFC-0000 section 8.7): in one
+    /// transaction, read the key ring `FOR SHARE`, open its DEK with `kek`
+    /// ([`crate::key_commands::data_connection_key`]), parse
+    /// `connection_string` as a PostgreSQL connection string, encrypt it with
+    /// section 12's AAD and write the `data_database_connection_string` row.
+    /// Refuses a catalog without a ring, a ring with `switch_from_catalog_key`
+    /// true, and a ring with two DEKs.
+    ///
+    /// The default refuses: only PostgreSQL stores this row.
+    fn set_data_connection(
+        &self,
+        kek: &[u8; 32],
+        connection_string: &str,
+    ) -> BoxFuture<'_, OpResult<()>> {
+        let _ = (kek, connection_string);
+        Box::pin(async {
+            Err(OpError::Validation(
+                "set-data-connection is for PostgreSQL catalogs".to_owned(),
+            ))
+        })
     }
 }
 
@@ -76,12 +114,15 @@ pub trait MetricsStore: Send + Sync {
     fn insert_metrics(&self, rows: &[MetricsRow]) -> BoxFuture<'_, OpResult<()>>;
 
     /// Query metrics rows within a time range, with optional filters.
+    ///
+    /// A filter that is `None` matches every row; `filter.account_id` set
+    /// returns only the rows recorded for that account, never a row of the
+    /// whole deployment (which has no account).
     fn query_metrics(
         &self,
         start: time::OffsetDateTime,
         end: time::OffsetDateTime,
-        table_name: Option<&str>,
-        metric: Option<&str>,
+        filter: &MetricsFilter,
     ) -> BoxFuture<'_, OpResult<Vec<MetricsRow>>>;
 
     /// Delete metrics rows older than the retention period.
@@ -576,4 +617,48 @@ pub trait ManagementStore: Send + Sync {
         account_id: &str,
         resource: &str,
     ) -> BoxFuture<'_, OpResult<Vec<(String, String)>>>;
+
+    // ── Encryption-key commands (RFC-0000 section 8.4) ─────────────
+
+    /// Read one page of the rows of `table` (`access_keys` or
+    /// `iam_sessions`), expired sessions included, in the backend's primary
+    /// key order. `page` is `None` for the first page, else the
+    /// [`SecretPage::next`] of the previous page. `page_size` is the most
+    /// rows a page holds. Cassandra reads at `ALL` and selects
+    /// `WRITETIME(secret_key_encrypted)`.
+    fn read_secret_page(
+        &self,
+        table: SecretTable,
+        page: Option<&str>,
+        page_size: usize,
+    ) -> BoxFuture<'_, OpResult<SecretPage>>;
+
+    /// Write each ciphertext of `rows` into the row of `table` with that
+    /// primary key, as one batch: one transaction of single-row updates on
+    /// SQLite, one `UPDATE ... FROM (VALUES ...)` on PostgreSQL, one
+    /// `update_one` per row with no upsert on MongoDB, and one `UPDATE` per
+    /// row at `ALL` with `USING TIMESTAMP` above the row's write time on
+    /// Cassandra. A row that is gone stays gone, and is not an error.
+    fn write_secrets(
+        &self,
+        table: SecretTable,
+        rows: &[SecretWrite],
+    ) -> BoxFuture<'_, OpResult<()>>;
+
+    /// Delete the rows of `table` with the primary keys `keys`, as one batch
+    /// (`encryption-key reset`, section 8.6). A row that is gone is not an
+    /// error.
+    fn delete_secrets(&self, table: SecretTable, keys: &[String]) -> BoxFuture<'_, OpResult<()>>;
+
+    /// Delete the settings row `key`. A row that is absent is not an error.
+    /// SQLite runs it under `PRAGMA secure_delete = ON`; Cassandra at `ALL`.
+    fn delete_setting(&self, key: &str) -> BoxFuture<'_, OpResult<()>>;
+
+    /// Rewrite the catalog's files so that their free space holds no old
+    /// copy of a row that a command replaced or deleted. `switch`, `rotate`
+    /// and `reset` call it after their last write. SQLite runs `VACUUM`
+    /// under `PRAGMA secure_delete = ON`; the default does nothing.
+    fn erase_free_space(&self) -> BoxFuture<'_, OpResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
 }

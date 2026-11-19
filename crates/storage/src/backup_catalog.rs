@@ -29,8 +29,8 @@ use std::time::Duration;
 use extenddb_core::backup_format::{BackupArn, SourceTableSchema};
 use extenddb_core::types::{
     BackupDescription, BackupDetails, BackupSummary, BillingMode, CreateTableInput,
-    GlobalSecondaryIndexInfo, LocalSecondaryIndexInfo, ProvisionedThroughput, SourceTableDetails,
-    SourceTableFeatureDetails, TableDescription,
+    GlobalSecondaryIndexInfo, Item, LocalSecondaryIndexInfo, ProvisionedThroughput,
+    SourceTableDetails, SourceTableFeatureDetails, TableDescription,
 };
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
@@ -153,6 +153,95 @@ pub struct StoreIdentity {
     pub store_id: String,
 }
 
+/// What [`BackupCatalog::remove_orphan_status_entries`] did with a root's
+/// status entries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatusEntrySweep {
+    /// Entries deleted: their row is gone or names another store.
+    pub removed: u64,
+    /// Entries whose row is of the root under another status, rewritten
+    /// under the row's status (the stale entry deleted).
+    pub repaired: u64,
+}
+
+/// One line of [`BackupCatalog::summarize_store_roots`]: the catalog holds
+/// `rows` rows of `status` under `store`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreRootCount {
+    pub store: StoreIdentity,
+    pub status: BackupStatus,
+    pub rows: u64,
+}
+
+impl StoreRootCount {
+    /// A count as a grouping query returns it: the `store_kind`,
+    /// `store_root`, `store_id` and `status` columns and the count.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` for a kind or status no release writes.
+    pub fn from_columns(
+        store_kind: &str,
+        store_root: String,
+        store_id: String,
+        status: &str,
+        rows: i64,
+    ) -> Result<Self, StorageError> {
+        let kind = StoreKind::parse(store_kind).ok_or_else(|| {
+            StorageError::Internal(format!(
+                "backup rows of root {store_root:?} carry an unknown store kind {store_kind:?}"
+            ))
+        })?;
+        Ok(Self {
+            store: StoreIdentity {
+                store_kind: kind,
+                store_root,
+                store_id,
+            },
+            status: BackupStatus::parse(status)?,
+            rows: u64::try_from(rows).unwrap_or_default(),
+        })
+    }
+
+    /// The order [`BackupCatalog::summarize_store_roots`] returns on every
+    /// backend: by kind, root and id, compared as bytes, then by status in
+    /// [`BackupStatus::ALL`]'s order, whatever the database's collation.
+    pub fn sort(counts: &mut [Self]) {
+        counts.sort_by(|a, b| {
+            fn key(c: &StoreRootCount) -> (&str, &[u8], &[u8], Option<usize>) {
+                (
+                    c.store.store_kind.as_str(),
+                    c.store.store_root.as_bytes(),
+                    c.store.store_id.as_bytes(),
+                    BackupStatus::ALL.iter().position(|s| *s == c.status),
+                )
+            }
+            key(a).cmp(&key(b))
+        });
+    }
+
+    /// One count per (store, status) of `rows`, sorted: the tally a backend
+    /// that cannot group in its query (Cassandra) makes of what it read.
+    #[must_use]
+    pub fn tally(rows: impl IntoIterator<Item = (StoreIdentity, BackupStatus)>) -> Vec<Self> {
+        let mut counts: std::collections::HashMap<(StoreIdentity, BackupStatus), u64> =
+            std::collections::HashMap::new();
+        for key in rows {
+            *counts.entry(key).or_default() += 1;
+        }
+        let mut counts: Vec<Self> = counts
+            .into_iter()
+            .map(|((store, status), rows)| Self {
+                store,
+                status,
+                rows,
+            })
+            .collect();
+        Self::sort(&mut counts);
+        counts
+    }
+}
+
 /// The status column of a backup row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BackupStatus {
@@ -164,6 +253,16 @@ pub enum BackupStatus {
 }
 
 impl BackupStatus {
+    /// Every status, in the order a row moves through them (CREATING first,
+    /// FAILED last): the order a per-status listing or report uses.
+    pub const ALL: [Self; 5] = [
+        Self::Creating,
+        Self::Available,
+        Self::Deleting,
+        Self::Deleted,
+        Self::Failed,
+    ];
+
     /// The value stored in the `status` column.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -473,6 +572,18 @@ pub enum DeleteStart {
     Status(BackupStatus),
 }
 
+/// What [`BackupCatalog::forget_available_backup_row`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForgetRow {
+    /// The row was AVAILABLE and is gone.
+    Removed,
+    /// A restore target registered from the backup is CREATING; its name.
+    /// The row is left.
+    InUse(String),
+    /// The row was not AVAILABLE; its status. The row is left.
+    Status(BackupStatus),
+}
+
 /// What a heartbeat found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Heartbeat {
@@ -774,8 +885,76 @@ pub struct AbandonedLegacyBackup {
     /// create that commits AVAILABLE and frees its slot between a read and
     /// the removal keeps its backup. The reconciler then only logs it. A
     /// backend that only reports (Cassandra) leaves `false`, and the
-    /// reconciler removes the row through [`LegacyBackupReader::delete`].
+    /// reconciler removes the row through
+    /// [`LegacyBackupReader::delete_fenced`].
     pub removed: bool,
+}
+
+/// One in-catalog backup, as [`LegacyBackupReader::list_all`] (CREATING,
+/// AVAILABLE or DELETING) and [`LegacyBackupReader::list_deleted`]
+/// (DELETED) list it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyBackupKey {
+    pub account_id: String,
+    pub backup_arn: String,
+    pub status: BackupStatus,
+}
+
+/// An AVAILABLE in-catalog backup opened for copying, as
+/// [`LegacyBackupReader::items`] answers it.
+pub struct LegacyBackupItems {
+    /// The backup's name, which its copy keeps.
+    pub backup_name: String,
+    /// The backup's recorded source, as
+    /// [`LegacyBackupReader::restore_source`] answers it.
+    pub source: BackupRestoreSource,
+    /// What the backend can state about the source table's vector indexes.
+    pub vector_state: crate::backup_definition::LegacyVectorState,
+    /// Every item the backup stored, in the order the backend stored them
+    /// (not key order), each as the legacy restore reads it: parsed from the
+    /// stored item JSON, with no validation. The first `Err` ends the stream.
+    /// Drop it inside a Tokio runtime (the sqlx backends hold a pooled
+    /// connection until it ends).
+    pub items: BoxStream<'static, Result<Item, StorageError>>,
+}
+
+impl std::fmt::Debug for LegacyBackupItems {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LegacyBackupItems")
+            .field("backup_name", &self.backup_name)
+            .field("source", &self.source)
+            .field("vector_state", &self.vector_state)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What [`LegacyBackupReader::replace_with_index_row`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Replaced {
+    /// The index row was written and the in-catalog backup removed, in one
+    /// step.
+    Replaced,
+    /// The index row was there already (an earlier run's, or a `backup sync`
+    /// that adopted the copy), so only what was left of the in-catalog
+    /// backup was removed: an AVAILABLE in-catalog backup (on MongoDB, a
+    /// DELETING one too; on Cassandra, the item buckets of a conversion
+    /// that stopped after its transaction). A DELETED or missing in-catalog
+    /// backup is left as it is.
+    AlreadyReplaced,
+    /// The in-catalog backup is not AVAILABLE (missing, another account's,
+    /// CREATING, DELETING or DELETED) and no index row of its id exists, or (on
+    /// Cassandra, finishing a stopped conversion) the index row is no longer
+    /// AVAILABLE; nothing was written but the item buckets' deletion. The
+    /// text names what was found.
+    NotAvailable(String),
+    /// A restore target of the backup is CREATING; nothing was written. The
+    /// text is the target's name.
+    InUse(String),
+    /// The write's condition failed at every attempt (Cassandra's
+    /// conversion: a DeleteBackup or a restore's registration raced each
+    /// one) and the in-catalog backup is still AVAILABLE; nothing was
+    /// written. The text says so; the caller tries again later.
+    NotApplied(String),
 }
 
 /// One of the `max_concurrent_jobs` slots of this instance, held by a backup
@@ -864,7 +1043,8 @@ pub trait BackupCatalog: Send + Sync {
 
     /// Insert `row` with status CREATING under a new claim, and return the
     /// claim. The claim precedes the insert or is the insert itself, so no
-    /// row ever exists unowned.
+    /// CREATING row ever exists unowned (the AVAILABLE rows
+    /// [`Self::insert_backup_row`] writes are unowned and have no job).
     ///
     /// # Errors
     ///
@@ -875,11 +1055,84 @@ pub trait BackupCatalog: Send + Sync {
         row: &'a BackupRow,
     ) -> BoxFuture<'a, Result<Box<dyn JobClaim>, StorageError>>;
 
+    /// Insert `row` unowned, if no row with its key exists: `backup sync`'s
+    /// insert for a prefix it verified. The row is written as given (its
+    /// status, sync's being AVAILABLE, its store, sizes, `created_at`,
+    /// `failure_reason` and source table) except for three columns:
+    /// `owner_generation` is [`UNOWNED_GENERATION`], and `completed_at` and
+    /// `heartbeat_at` are the database's clock; the row's own values for
+    /// those are ignored. No claim is taken: an unowned row has no job.
+    /// Sync passes AVAILABLE; an unowned row of another status has no job to
+    /// move it (on SQLite an unowned CREATING row has no slot, and the next
+    /// cycle resolves it as dead).
+    ///
+    /// Returns `false`, writing nothing, when a row with the key exists, of
+    /// whatever status or store, with one exception on Cassandra: a stored
+    /// row equal to this one in every column the insert writes (unowned, the
+    /// same store, sizes and source table) counts as inserted, and its list
+    /// and status entries are written, which completes an insert that
+    /// stopped between the row and its entries. On PostgreSQL, SQLite and
+    /// MongoDB, which
+    /// index `backup_id` alone as unique, a row with the backup id under
+    /// another account also exists for this rule. Cassandra keys its rows
+    /// by the account and the ARN and indexes no backup id, so there the
+    /// rule is per ARN spelling: a row for the same id under another region
+    /// or partition does not count. `backup sync` closes that gap itself:
+    /// it inserts the row under this deployment's region's spelling of the
+    /// manifest's ARN, and before the insert it reads the row under that
+    /// spelling and the manifest's own and skips a backup the manifest's
+    /// spelling, when it names another region, has a row for, so sync never
+    /// gives an account two rows of one backup id under this deployment's or
+    /// the manifest's spelling of the ARN on any backend (on Cassandra a row
+    /// of another root under a third region's spelling is not read, and is
+    /// not seen). A row under this deployment's spelling, the one sync
+    /// inserts, is left to this method, which answers `false` for it or, on
+    /// Cassandra, completes it under the exception above.
+    ///
+    /// # Errors
+    ///
+    /// The backend's error for a failed write. On Cassandra an answer lost
+    /// in transit, and a `NotMatched` answer, is settled by a serial read of
+    /// the row: this row counts as inserted and another as existing. No row
+    /// after a lost answer means not written, and the write is sent once
+    /// more; no row after `NotMatched` answers `false` (a legacy in-catalog
+    /// backup holds the ARN, which the read does not return). An outcome
+    /// still unknown after that is an error. A failed batch of the entries
+    /// is sent once more before the error, and the next insert of the same
+    /// row writes them.
+    fn insert_backup_row<'a>(
+        &'a self,
+        row: &'a BackupRow,
+    ) -> BoxFuture<'a, Result<bool, StorageError>>;
+
     /// Every row of `store` with `status`, or of every status for `None`.
     fn list_backup_rows<'a>(
         &'a self,
         status: Option<BackupStatus>,
         store: &'a StoreIdentity,
+    ) -> BoxStream<'a, Result<BackupRow, StorageError>>;
+
+    /// Every row whose `store_kind` and `store_root` equal these, whatever
+    /// its `store_id`, with `status` or of every status for `None`, in the
+    /// (`created_at`, `backup_arn`) order [`Self::list_backup_rows`] uses:
+    /// `backup sync --move-store` and `--forget-store`, which get a root and
+    /// no id, and the report of the rows of other roots. `store_root`
+    /// matches as stored, byte for byte: a root that differs by a trailing
+    /// `/`, or an S3 root that differs by its `?endpoint=` suffix, is
+    /// another root. The rows are read whole, as `list_backup_rows` reads
+    /// them. On Cassandra the root's five status partitions are read
+    /// whatever `status` is, each row behind an entry is re-read once, and
+    /// it is kept when its kind and root still match (and its status, with
+    /// `Some(status)`), whatever partition its entry is in: a row whose
+    /// entry is under an earlier status (a status change whose entry batch
+    /// failed, or whose writer died between the row and the batch) is
+    /// listed under its own status. A row with no status entry at all (an
+    /// insert that stopped before its entries) is not listed.
+    fn list_backup_rows_by_root<'a>(
+        &'a self,
+        store_kind: StoreKind,
+        store_root: &'a str,
+        status: Option<BackupStatus>,
     ) -> BoxStream<'a, Result<BackupRow, StorageError>>;
 
     /// The newest AVAILABLE row of `store` (the last in the
@@ -910,6 +1163,23 @@ pub trait BackupCatalog: Send + Sync {
         arn: &'a BackupArn,
     ) -> BoxFuture<'a, Result<Option<BackupRow>, StorageError>>;
 
+    /// The row holding `backup_id`, whatever its account, its ARN, its
+    /// table name and its store. The backup id is unique in the index on
+    /// its own (`idx_backup_index_backup_id` on PostgreSQL and SQLite, the
+    /// `backup_id` index on MongoDB), so [`Self::insert_backup_row`]
+    /// conflicts on it alone, another account's row included, and a store
+    /// prefix (`account/table/id/`, which carries no region) whose id this
+    /// answers for may hold that row's backup. `backup migrate-legacy`
+    /// reads it before it deletes anything under a prefix. PostgreSQL,
+    /// SQLite and MongoDB read it by the id. Cassandra can read only an
+    /// ARN's own partition (no table of it indexes the backup id) and
+    /// answers `None`; the caller reads the manifest under the prefix there
+    /// instead.
+    fn row_holding_backup_id<'a>(
+        &'a self,
+        backup_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<BackupRow>, StorageError>>;
+
     /// DeleteBackup's first step: under the row's lock, the in-use check and
     /// the AVAILABLE-to-DELETING write in one transaction.
     ///
@@ -922,24 +1192,145 @@ pub trait BackupCatalog: Send + Sync {
     ) -> BoxFuture<'a, Result<DeleteStart, StorageError>>;
 
     /// DELETING to DELETED, conditional on the row being DELETING; `false`
-    /// when it was not.
+    /// when it was not. Besides the deletion's last step, `backup sync
+    /// --forget-store` and `--forget-backup` remove a DELETING row with this
+    /// write and then [`Self::remove_backup_row`], under the maintenance
+    /// claim. No DELETED-prefix or tombstone duty acts on the row between
+    /// the two, by the order of the listings: a duty that listed its rows
+    /// before the claim was taken listed this one DELETING, not DELETED, and
+    /// a duty that lists it DELETED did so after the claim was taken, and
+    /// reads the claim held after its re-read of the row. A DELETING row of
+    /// the configured store has its deletion finished first, by the forget
+    /// itself or by a reconciler under the claim: its bytes were asked to be
+    /// deleted. A DELETING row of another store keeps its bytes unless a
+    /// server configured with that store finishes the deletion.
     fn set_backup_deleted<'a>(
         &'a self,
         key: &'a BackupKey,
     ) -> BoxFuture<'a, Result<bool, StorageError>>;
 
-    /// Remove a DELETED or FAILED tombstone; `false` when the row is not one.
+    /// Remove a DELETED or FAILED tombstone that is still of `store_kind`
+    /// and `store_root`, the store the caller read the row with; `false`
+    /// when the row is not one, or names another store. The tombstone
+    /// duty's write, and `backup sync --forget-store`'s and
+    /// `--forget-backup`'s for a DELETED or FAILED row (and for a DELETING
+    /// row after [`Self::set_backup_deleted`]). The store condition keeps a
+    /// duty of a server still configured with an old root from removing a
+    /// row `rewrite_store` moved after the duty read it: the configured
+    /// store's own duties then finish that row (on Cassandra the lightweight
+    /// transaction carries the condition, and a `NotMatched` answers
+    /// `false`).
     fn remove_backup_row<'a>(
         &'a self,
         key: &'a BackupKey,
+        store_kind: StoreKind,
+        store_root: &'a str,
     ) -> BoxFuture<'a, Result<bool, StorageError>>;
+
+    /// Remove an AVAILABLE row outright, leaving no DELETING or DELETED
+    /// tombstone, so no deletion duty ever acts on the backup's objects:
+    /// `backup sync --prune-missing`'s write for a row whose manifest the
+    /// configured root does not hold, whose bytes may be under another
+    /// host's root of the same path, and `--forget-backup`'s and
+    /// `--forget-store`'s for an AVAILABLE row, whose bytes the operator
+    /// keeps. Under the row's lock, as
+    /// [`Self::start_backup_delete`] takes it, the status check and the
+    /// in-use rule in one step with the removal: a row a CREATING restore
+    /// target reads is left ([`ForgetRow::InUse`]), and so is a row another
+    /// writer moved ([`ForgetRow::Status`]). The store is not touched.
+    ///
+    /// # Errors
+    ///
+    /// `Validation("Backup not found: <arn>")` when there is no such row.
+    fn forget_available_backup_row<'a>(
+        &'a self,
+        key: &'a BackupKey,
+    ) -> BoxFuture<'a, Result<ForgetRow, StorageError>>;
+
+    /// `backup sync --move-store`'s write: each row of `keys` that is still
+    /// of `from_kind` and `from_root` and is not CREATING gets `to`'s kind,
+    /// root and id; every other column is left. Returns how many rows were
+    /// rewritten. A key with no row, or whose row no longer matches (another
+    /// writer moved it to another root, or it is CREATING: a job may still
+    /// write its bytes under the old root), is left and not counted, so a
+    /// second call with the same keys counts 0 once `to` is another root.
+    /// A DELETING, DELETED or
+    /// FAILED row is rewritten like an AVAILABLE one. No claim and no fence
+    /// are taken: no object is touched.
+    ///
+    /// SQLite rewrites every key in one transaction, so a failed call
+    /// rewrites none. PostgreSQL rewrites in batches of keys, each batch one
+    /// statement in a transaction of its own (so no statement nears its
+    /// bound whatever the key count), MongoDB in chunks of keys, each chunk
+    /// one statement, and Cassandra key by key, so on those three a call
+    /// that stops leaves the rows split between the two roots: every step
+    /// is idempotent, and the caller re-lists the old root and runs again
+    /// for what is left. Cassandra keeps no `backup_id` uniqueness, so the
+    /// caller, not this method, refuses a move that would give an account
+    /// two rows of one backup id.
+    ///
+    /// What a client that dies in the call (a killed command) leaves:
+    /// - PostgreSQL: the batches before the one in flight, and of that one
+    ///   nothing, unless its commit was already sent. Each batch's
+    ///   statement runs in a transaction the client commits, under a
+    ///   `lock_timeout` (a lock timeout rolls back and runs the batch
+    ///   again, a bounded number of times) and a `statement_timeout`, so a
+    ///   statement still waiting or running when the client dies commits
+    ///   nothing: the server rolls it back once it finds the connection
+    ///   closed, at the latest when those bounds end it, and no rewrite
+    ///   lands after the maintenance claim's advisory lock went with the
+    ///   client.
+    /// - SQLite: nothing; the transaction is in the process and rolls back
+    ///   with it.
+    /// - MongoDB: the chunks before the one in flight are rewritten, and
+    ///   the one in flight in whole or in part (each document's update is
+    ///   atomic, and the server may finish the statement after the client
+    ///   is gone). The claim is a heartbeat, live until it is stale, which
+    ///   outlasts the statement.
+    /// - Cassandra: the keys before the one in flight are rewritten, and
+    ///   the one in flight is left at one of the points the module doc
+    ///   names (its new entry written, or its row moved with the old entry
+    ///   left); a lightweight transaction in flight may still commit. The
+    ///   claim is a heartbeat, as on MongoDB.
+    ///
+    /// In each case the re-run of the move re-lists the old root and moves
+    /// what is left.
+    ///
+    /// # Errors
+    ///
+    /// The backend's error for a failed read or write. On Cassandra an
+    /// answer lost in transit is settled by a serial read of the row: a row
+    /// that carries `to` whole (its kind, root and store id) counts as
+    /// rewritten, a row of the old root is sent again (up to three attempts
+    /// in all), a row of any other store (`to`'s root under another store
+    /// id included) is left and not counted, and an outcome still unknown
+    /// after the last attempt is an error.
+    fn rewrite_store<'a>(
+        &'a self,
+        from_kind: StoreKind,
+        from_root: &'a str,
+        keys: &'a [BackupKey],
+        to: &'a StoreIdentity,
+    ) -> BoxFuture<'a, Result<u64, StorageError>>;
+
+    /// Whether [`Self::rewrite_store`] writes key by key, several requests
+    /// per key with nothing checked between keys (Cassandra), so a caller
+    /// that must stop between keys (the move, once its maintenance claim
+    /// reads lost) passes one key per call. `false` by default: the other
+    /// backends rewrite a call's keys in one statement per batch or chunk.
+    fn rewrite_store_runs_key_by_key(&self) -> bool {
+        false
+    }
 
     /// Remove a CREATING row whose owner is dead: `heartbeat_at` older than
     /// `stale_after` on the catalog's clock. `false` when the row is not
     /// CREATING, is gone, or has a live owner. The maintenance command's
     /// write for a CREATING row its wait saw no live owner for, after it has
     /// deleted the row's prefix; the row's own job, were it alive, would
-    /// find its claim lost at its next heartbeat.
+    /// find its claim lost at its next heartbeat. Also `backup sync
+    /// --forget-store`'s and `--forget-backup`'s write for a CREATING row,
+    /// which delete no prefix: `false` with the row still CREATING is a live
+    /// owner, and they refuse the row.
     fn remove_dead_creating_backup_row<'a>(
         &'a self,
         key: &'a BackupKey,
@@ -1173,17 +1564,64 @@ pub trait BackupCatalog: Send + Sync {
         store_root: &'a str,
     ) -> BoxFuture<'a, Result<Vec<String>, StorageError>>;
 
+    /// How many rows the catalog holds per store (kind, root and id) and
+    /// status, every store and status with at least one row, in
+    /// [`StoreRootCount::sort`]'s order: plain `backup sync`'s report of the
+    /// rows of roots other than the configured one, and the roots
+    /// `--move-store` and `--forget-store` name when given one with no
+    /// rows. Counts only; no row is read whole. On Cassandra the counts are
+    /// of the status entries (`backup_index_by_status`, one partition per
+    /// root and status), not verified against their rows, so an entry a
+    /// stopped writer left behind counts as [`Self::read_store_ids`] counts
+    /// it ([`Self::summary_counts_status_entries`]).
+    fn summarize_store_roots(&self) -> BoxFuture<'_, Result<Vec<StoreRootCount>, StorageError>>;
+
+    /// Whether [`Self::summarize_store_roots`] counts status entries rather
+    /// than rows (Cassandra), so a caller that reports the counts verifies
+    /// them against the rows' listing. `false` by default: the other
+    /// backends count rows.
+    fn summary_counts_status_entries(&self) -> bool {
+        false
+    }
+
+    /// The sweep of the status entries under `store_root` whose entry
+    /// names `store_kind`, each verified against its row as it is read:
+    /// an entry whose row is gone or names another store is deleted, and
+    /// one whose row is of the root under another status is written again
+    /// under the row's status and then deleted (repaired). `backup sync
+    /// --forget-store`'s sweep of the root it forgets, under the
+    /// maintenance claim. Only Cassandra keeps status entries beside the
+    /// rows (`backup_index_by_status`): a deleter whose entry batch lands
+    /// after a `rewrite_store` of its row leaves an entry with no row of
+    /// the root behind it, and a status change whose entry batch failed, or
+    /// whose writer died between its row and its batch, leaves the row's
+    /// entry under the earlier status. Every other backend has none, which
+    /// is what the default body says.
+    fn remove_orphan_status_entries<'a>(
+        &'a self,
+        store_kind: StoreKind,
+        store_root: &'a str,
+    ) -> BoxFuture<'a, Result<StatusEntrySweep, StorageError>> {
+        let _ = (store_kind, store_root);
+        Box::pin(async { Ok(StatusEntrySweep::default()) })
+    }
+
     /// Take the catalog-level maintenance claim for `holder` (a label naming
     /// the command and the host it runs on, for the operator who finds it
     /// held). The claim is one record, `backup_maintenance`, born owned
     /// with a fresh generation and heartbeated through the handle; a holder
     /// whose heartbeat is older than `stale_after` on the catalog's clock is
-    /// dead and its claim is taken over. PostgreSQL is the exception to the
-    /// liveness rule on the holder's side: there the holder's session holds
-    /// an advisory lock, a holder whose session ended is dead whatever its
-    /// heartbeat says, and `stale_after` is read by [`check_maintenance_claim`]
-    /// alone; on SQLite a server's startup under the serve lock removes the
-    /// record outright, since no holder can be alive there.
+    /// dead and its claim is taken over. PostgreSQL adds a proof of life on
+    /// the holder's side: there the holder's session holds an advisory
+    /// lock, so a holder whose session is open is alive whatever its
+    /// heartbeat says, and the take also needs the record's heartbeat older
+    /// than `stale_after`, as everywhere: a holder whose session ended
+    /// (killed, or its connection reset) may still be running until its
+    /// next beat finds the loss, so its claim is not taken while its
+    /// heartbeat is young (the window [`check_maintenance_claim`] reads
+    /// too). On SQLite a command that holds the serve lock takes the record
+    /// whatever its age, and a server's startup under the serve lock removes
+    /// it outright, since no other holder can be alive there.
     ///
     /// [`check_maintenance_claim`]: BackupCatalog::check_maintenance_claim
     ///
@@ -1223,6 +1661,26 @@ pub trait MaintenanceClaim: Send + Sync {
     /// Refresh `heartbeat_at` on the catalog's clock and confirm the claim is
     /// still this holder's. The caller treats an `Err` as [`Heartbeat::Lost`].
     fn heartbeat(&self) -> BoxFuture<'_, Result<Heartbeat, StorageError>>;
+
+    /// [`Self::heartbeat`] under `bound`: `None` when the beat did not
+    /// return within it, which the holder treats as a lost claim. The
+    /// default bounds the whole call; SQLite, whose beat queues behind its
+    /// own process's engine write lock, measures the bound from the moment
+    /// the beat holds that lock, as [`JobClaim::heartbeat_within`] does.
+    fn heartbeat_within(
+        &self,
+        bound: Duration,
+    ) -> BoxFuture<'_, Option<Result<Heartbeat, StorageError>>> {
+        Box::pin(async move { tokio::time::timeout(bound, self.heartbeat()).await.ok() })
+    }
+
+    /// Whether [`Self::heartbeat_within`] can wait outside its bound before
+    /// the bound starts, as [`JobClaim::heartbeat_parks_before_its_bound`]
+    /// states it: `true` on SQLite only, where a beat parked on the write
+    /// lock confirms the claim for as long as it waits.
+    fn heartbeat_parks_before_its_bound(&self) -> bool {
+        false
+    }
 
     /// Remove the record, conditioned on the generation; a record another
     /// holder took over is left to it. Idempotent.
@@ -1288,11 +1746,17 @@ pub trait JobClaim: Send + Sync {
 /// in-catalog format, which each backend keeps as a copy of its own code for
 /// reading and decoding that shape. The engine consults the catalog index
 /// first and falls back to this reader; `create` is the CreateBackup path
-/// while no `[backup.store]` is configured.
+/// while no `[backup.store]` is configured. `extenddb backup migrate-legacy`
+/// reads a backup through [`Self::items`] (a frozen copy of each backend's
+/// restore read), finds every backup through [`Self::list_all`] (and the
+/// deleted ones through [`Self::list_deleted`]), and ends with
+/// [`Self::replace_with_index_row`].
 ///
-/// The one part that is not frozen is the restore's registration: a restore
-/// registers through the restore job fields (`kind = legacy`, the claim), so
-/// the reconciler finds a restore whose owner died as it finds any other.
+/// Two parts are not frozen. A restore registers through the restore job
+/// fields (`kind = legacy`, the claim), so the reconciler finds a restore
+/// whose owner died as it finds any other. And
+/// [`Self::replace_with_index_row`] writes a catalog index row in the step
+/// that removes the in-catalog backup.
 pub trait LegacyBackupReader: Send + Sync {
     /// Create an in-catalog backup of a table, snapshotting all items. The
     /// permit is the job's slot, released when the create ends.
@@ -1389,14 +1853,191 @@ pub trait LegacyBackupReader: Send + Sync {
     /// In-catalog CREATING backup rows whose create is dead: on a backend
     /// whose legacy create commits a CREATING row before the copy, those
     /// whose heartbeat is older than `stale_after`, or that no running create
-    /// holds. The reconciler removes each through [`Self::delete`], unless the
-    /// backend removed it in this call ([`AbandonedLegacyBackup::removed`]).
-    /// Empty on a backend whose legacy create commits its row AVAILABLE with
-    /// the copy.
+    /// holds. A backend whose legacy delete commits a DELETING row before its
+    /// cleanup also reports the DELETING rows a stopped DeleteBackup left.
+    /// The reconciler removes each through [`Self::delete_fenced`],
+    /// unless the backend removed it in this call
+    /// ([`AbandonedLegacyBackup::removed`]). Empty on a backend whose legacy
+    /// create commits its row AVAILABLE with the copy.
     fn abandoned_creating_backups(
         &self,
         stale_after: Duration,
     ) -> BoxFuture<'_, Result<Vec<AbandonedLegacyBackup>, StorageError>>;
+
+    /// Finish the deletion of a row [`Self::abandoned_creating_backups`]
+    /// reported with `removed` false, a DELETING row whose owner is dead:
+    /// either a CREATING row that call fenced to DELETING, or a stale
+    /// DELETING row that a stopped DeleteBackup left. Remove the backup's
+    /// items and definition and mark the row DELETED, as the second half of
+    /// [`Self::delete`] does. `Ok` for a row that is DELETING, or already
+    /// DELETED (a DeleteBackup that found it DELETING finished the cleanup);
+    /// a row in any other status is left and reported missing.
+    /// The reconciler counts the deletion and writes its audit line on `Ok`.
+    /// [`Self::delete`] answers a caller that finds the row DELETING "not
+    /// found", since that caller did not move the row there, and that answer
+    /// stays for a client's DeleteBackup. A backend that reports no row with
+    /// `removed` false is never asked and keeps the default, an error.
+    fn delete_fenced<'a>(
+        &'a self,
+        _account_id: &'a str,
+        backup_arn: &'a str,
+    ) -> BoxFuture<'a, Result<(), StorageError>> {
+        Box::pin(async move {
+            Err(StorageError::Internal(format!(
+                "{backup_arn}: this backend reports no fenced in-catalog backup"
+            )))
+        })
+    }
+
+    /// Every in-catalog backup that is not DELETED, of every account
+    /// (including an account since deleted), ordered by creation time and
+    /// then ARN. A frozen `delete` leaves a DELETED row, which is not a
+    /// backup and is not listed. A row that does not decode is an error.
+    fn list_all(&self) -> BoxFuture<'_, Result<Vec<LegacyBackupKey>, StorageError>>;
+
+    /// Every DELETED in-catalog backup of every account that
+    /// [`Self::replace_with_index_row`] did not replace: the rows a
+    /// DeleteBackup of the legacy ARN left, ordered as [`Self::list_all`].
+    /// `extenddb backup migrate-legacy --all` deletes what a stopped
+    /// migration left under each one's store prefix.
+    fn list_deleted(&self) -> BoxFuture<'_, Result<Vec<LegacyBackupKey>, StorageError>>;
+
+    /// The status of the in-catalog backup `backup_arn` of `account_id`
+    /// that [`Self::replace_with_index_row`] did not replace, DELETED
+    /// included; `None` when there is none (never one, another account's,
+    /// or one the replacement replaced). PostgreSQL and SQLite: the
+    /// `backups` row, which the replacement removes. MongoDB: the backup
+    /// document unless it carries the replacement's `migrated_to_store`
+    /// marker. Cassandra: the `backups_by_arn` row while `store_kind` is
+    /// null (the replacement converts the row into its index row).
+    ///
+    /// `backup sync` never adopts a prefix whose ARN this answers for, and
+    /// `backup migrate-legacy` deletes the copy a stopped migration left
+    /// under the prefix of one that is DELETED.
+    fn holder_status<'a>(
+        &'a self,
+        account_id: &'a str,
+        backup_arn: &'a str,
+    ) -> BoxFuture<'a, Result<Option<BackupStatus>, StorageError>>;
+
+    /// Finish a [`Self::replace_with_index_row`] that committed and stopped
+    /// before its end, whatever the catalog index row now holds: on
+    /// MongoDB a backup document DELETING with `migrated_to_store` has its
+    /// item collection dropped and DELETED written (the frozen delete's
+    /// second half), and the call answers `true`. Every other backend
+    /// finishes its replacement in one step or through
+    /// [`Self::replace_with_index_row`] itself, and answers `false`.
+    fn finish_replacement<'a>(
+        &'a self,
+        account_id: &'a str,
+        backup_arn: &'a str,
+    ) -> BoxFuture<'a, Result<bool, StorageError>> {
+        let _ = (account_id, backup_arn);
+        Box::pin(async { Ok(false) })
+    }
+
+    /// Remove the DELETED in-catalog backup `backup_arn` of `account_id`
+    /// (a DeleteBackup's tombstone, one [`Self::list_deleted`] lists), and
+    /// nothing else: the call is conditioned on the backup being DELETED
+    /// and in the catalog (not one [`Self::replace_with_index_row`]
+    /// replaced), and answers whether it removed it. `backup migrate-legacy`
+    /// calls it once the configured store lists nothing under the backup's
+    /// prefix and no catalog row holds its id, so a DELETED in-catalog
+    /// backup whose id carries an instant is one whose prefix is not yet
+    /// confirmed clean. PostgreSQL and SQLite delete the `backups` row
+    /// (its items and definition went with the DeleteBackup); MongoDB the
+    /// backup document without the `migrated_to_store` marker; Cassandra
+    /// the `backups_by_arn` row, with a lightweight transaction conditioned
+    /// on DELETED and `store_kind = null`.
+    fn remove_deleted<'a>(
+        &'a self,
+        account_id: &'a str,
+        backup_arn: &'a str,
+    ) -> BoxFuture<'a, Result<bool, StorageError>>;
+
+    /// Open the AVAILABLE in-catalog backup `backup_arn` owned by
+    /// `account_id` for copying: its name, its recorded source
+    /// ([`Self::restore_source`]'s answer), what the backend can state about
+    /// its vector indexes, and a stream of every item it stored.
+    ///
+    /// The stream is a copy of the backend's restore read, kept apart from
+    /// it so either can change alone: PostgreSQL reads the items in one
+    /// `REPEATABLE READ` catalog transaction, held until the stream ends or
+    /// is dropped, whose first statement re-checks AVAILABLE; SQLite reads
+    /// keyset batches, each in its own read transaction that re-checks
+    /// AVAILABLE; MongoDB reads the backup's collection with a cursor; and
+    /// Cassandra reads the item buckets in pages. On SQLite, MongoDB and
+    /// Cassandra a DeleteBackup that lands while the stream runs ends it
+    /// with an error or leaves it short; the caller compares the count with
+    /// `source.item_count`.
+    ///
+    /// # Errors
+    ///
+    /// `StorageError::Validation("Backup not found: <arn>")` if the backup is
+    /// missing, another account's, or not AVAILABLE.
+    /// `StorageError::Unsupported` for a definition this build cannot read
+    /// and, on MongoDB, for a backup taken before the `$out` copy, which has
+    /// no item collection to read.
+    fn items(
+        &self,
+        account_id: &str,
+        backup_arn: &str,
+    ) -> BoxFuture<'_, Result<LegacyBackupItems, StorageError>>;
+
+    /// Replace the in-catalog backup `row.backup_arn` of `row.account_id` by
+    /// `row`, the catalog index row of its copy in the store, in one step
+    /// that DeleteBackup and a restore's registration order wholly before or
+    /// after: the in-catalog backup is read AVAILABLE and locked, the in-use
+    /// rule runs (a CREATING restore target of the backup), `row` is
+    /// inserted as [`BackupCatalog::insert_backup_row`] inserts it (unowned,
+    /// `completed_at` and `heartbeat_at` on the database's clock), and the
+    /// in-catalog backup is removed so that no in-catalog row of the ARN is
+    /// left that [`Self::holder_status`] answers for. PostgreSQL and SQLite
+    /// do it in one transaction (SQLite under the engine write lock) that
+    /// deletes the `backups` row outright, its items and definition with
+    /// it; a DELETED `backups` row is then always a DeleteBackup's. MongoDB
+    /// writes the index document and DELETING marked `migrated_to_store` in
+    /// one session transaction and then drops the item collection and
+    /// writes DELETED, as the frozen `delete` does; a stop after the commit
+    /// leaves the marked DELETING document, which describe, list,
+    /// `holder_status` and DeleteBackup leave out and which a later call or
+    /// [`Self::finish_replacement`] finishes. Cassandra, whose in-catalog
+    /// and index rows share `backups_by_arn`, converts the row in place with
+    /// one lightweight transaction (`store_kind` set, so the in-catalog
+    /// reader no longer reads it; a legacy restore's registration is
+    /// conditioned on `store_kind = null` too), then writes its list and
+    /// status entries and deletes the item buckets; no DELETED row is left
+    /// there.
+    ///
+    /// [`Replaced::AlreadyReplaced`] when an index row with `row`'s account,
+    /// ARN and store is there already: what is left of the in-catalog
+    /// backup is removed as above when it is AVAILABLE (or, on MongoDB,
+    /// DELETING), the in-use rule first, and nothing else is written; a
+    /// DELETED or missing one is left as it is. On Cassandra that finishes a conversion that stopped
+    /// after its transaction; its list and status entries are written only
+    /// when a serial read finds the index row AVAILABLE, and otherwise (a
+    /// DeleteBackup of the migrated backup since) the item buckets are
+    /// deleted and the call answers [`Replaced::NotAvailable`]. An index row
+    /// with the backup's id under another ARN spelling or another store is
+    /// an `AlreadyExists` error, with nothing written, whatever the
+    /// in-catalog backup's status (a DELETED one included): the caller
+    /// keeps a copy that may be that row's prefix. Cassandra reads only
+    /// the ARN's own partition, so it finds another store's row there and
+    /// not a row of the id under another spelling (no table of it indexes
+    /// the backup id); the engine reads the id's row whatever its ARN
+    /// ([`BackupCatalog::row_holding_backup_id`]) and, on Cassandra, the
+    /// manifest under the prefix, before it writes anything there.
+    ///
+    /// # Errors
+    ///
+    /// `StorageError::AlreadyExists` as above; the backend's errors
+    /// otherwise, after which the in-catalog backup is as it was or (MongoDB
+    /// after the commit, Cassandra after the conversion) the call can be
+    /// repeated to finish it.
+    fn replace_with_index_row<'a>(
+        &'a self,
+        row: &'a BackupRow,
+    ) -> BoxFuture<'a, Result<Replaced, StorageError>>;
 }
 
 #[cfg(test)]
@@ -1743,5 +2384,47 @@ mod tests {
             "Too many backup and restore jobs are running on this server (the database server \
              has no connection slot left for the job); retry later"
         );
+    }
+
+    /// The tally counts each (kind, root, id, status) apart, and the order
+    /// is the bytes of kind, root and id, then the statuses in the order a
+    /// row moves through them, not their names' order.
+    #[test]
+    fn the_root_tally_counts_each_store_and_status_apart_in_one_order() {
+        let store = |kind: StoreKind, root: &str, id: &str| StoreIdentity {
+            store_kind: kind,
+            store_root: root.to_owned(),
+            store_id: id.to_owned(),
+        };
+        let a1 = store(StoreKind::Filesystem, "/a", "id-1");
+        let a2 = store(StoreKind::Filesystem, "/a", "id-2");
+        let lower = store(StoreKind::Filesystem, "/a/b", "id-1");
+        let s3 = store(StoreKind::S3, "s3://bucket/p", "id-1");
+        let counts = StoreRootCount::tally([
+            (s3.clone(), BackupStatus::Available),
+            (a1.clone(), BackupStatus::Failed),
+            (a1.clone(), BackupStatus::Available),
+            (a2.clone(), BackupStatus::Available),
+            (a1.clone(), BackupStatus::Available),
+            (lower.clone(), BackupStatus::Creating),
+            (a1.clone(), BackupStatus::Creating),
+        ]);
+        let line = |store: &StoreIdentity, status, rows| StoreRootCount {
+            store: store.clone(),
+            status,
+            rows,
+        };
+        assert_eq!(
+            counts,
+            [
+                line(&a1, BackupStatus::Creating, 1),
+                line(&a1, BackupStatus::Available, 2),
+                line(&a1, BackupStatus::Failed, 1),
+                line(&a2, BackupStatus::Available, 1),
+                line(&lower, BackupStatus::Creating, 1),
+                line(&s3, BackupStatus::Available, 1),
+            ]
+        );
+        assert!(StoreRootCount::tally([]).is_empty());
     }
 }

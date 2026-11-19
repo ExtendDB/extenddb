@@ -5,14 +5,17 @@ A cell proves that a backup taken on the source backend restores, through the
 store, into the target backend: the restored table has the source's items,
 key schema, secondary indexes, throughput, SSE and (where the target supports
 them) vector indexes, and its class is STANDARD. The target's catalog has no
-`backup_index` row for the source's backup until `backup sync --adopt-store`
-runs (PR 10); the cell stands in for that command by copying the prefix under
-a root the target owns and seeding the row at the storage level, so it proves
-the restore and not the adoption. `matrix-nightly.yml` runs the twelve plain
-cells and the duplicate-key and vector cells through this committed script.
+`backup_index` row for the source's backup until `extenddb backup sync` on
+the target adopts the prefix the cell copies under a root the target owns,
+so a cell proves the adoption and the restore. With --adopt-store the cell
+copies nothing: the target's store path is the source's root, and `backup
+sync --adopt-store` makes the target's catalog its owner, after which the
+source's server finds the store owned by another catalog.
+`matrix-nightly.yml` runs the twelve plain cells, the duplicate-key and
+vector cells and two --adopt-store cells through this committed script.
 
     backup-restore-matrix --source <sqlite|postgres|mongodb> --target <sqlite|postgres|mongodb|cassandra>
-              [--items N] [--vector] [--duplicate-key] [--work DIR]
+              [--items N] [--vector] [--duplicate-key] [--adopt-store] [--work DIR]
               [--bin-sqlite PATH] [--bin-postgres PATH] [--bin-mongodb PATH] [--bin-cassandra PATH]
 
 Starts a source server from the backend's binary with a filesystem store at
@@ -20,15 +23,17 @@ its own root, creates a composite-key table with a GSI and an LSI (and, with
 --vector, a vector index), writes --items items carrying every attribute
 type, takes a backup and waits for AVAILABLE. Starts the target server with
 its own empty root (it writes its own extenddb-store.json), copies the
-source's backup prefix under the target root, seeds the target's
-backup_index row at the storage level with the target's store id (what
-`backup sync --adopt-store` will do in PR 10; the cell proves the restore,
-not the adoption), restores, waits for ACTIVE, compares the item set and the
+source's backup prefix under the target root and runs `extenddb backup sync`
+on the target (beside its server, or on SQLite with the server stopped, since
+there the command takes the serve lock), which must adopt the backup, then
+restores, waits for ACTIVE, compares the item set and the
 description (key schema, indexes, throughput, SSE; the table class STANDARD),
 queries each GSI, and tears both servers down by PID and drops their
 databases. With --duplicate-key the copied prefix is replaced by a hand-built
 unordered backup whose two data files share one key, and the cell passes
-when the restore fails (the target gone, no table) instead.
+when the restore fails (the target gone, no table) instead. --adopt-store
+takes neither --duplicate-key nor a MongoDB source with a MongoDB target
+(the two catalogs would share the backend's fixed names).
 
 The two servers connect to PostgreSQL at 127.0.0.1:55432 (postgres/devpass),
 MongoDB at 127.0.0.1:27117 and Cassandra at 127.0.0.1:9042, the coordinates
@@ -102,16 +107,6 @@ class CellFailed(Exception):
 def check(cond: bool, msg: str) -> None:
     if not cond:
         raise CellFailed(msg)
-
-
-def sqlite_module():
-    """pysqlite3 when installed (an old sqlite3 library bundled with the
-    interpreter cannot read the catalog), else the standard module."""
-    try:
-        import pysqlite3 as sqlite3  # type: ignore
-    except ImportError:
-        import sqlite3  # type: ignore
-    return sqlite3
 
 
 def free_port() -> int:
@@ -589,135 +584,55 @@ def b64(value):
     raise TypeError(type(value))
 
 
-# --- the seed ------------------------------------------------------------------
+# --- the adoption --------------------------------------------------------------
 
 
-def seed_row(target: Deployment, arn: str, manifest: dict, size_bytes: int, item_count: int) -> None:
-    """Insert the target's `backup_index` row for the copied prefix, as
-    `backup sync` will (PR 10): AVAILABLE, the target's store identity, the
-    manifest's source table, `created_at` from the backup id."""
-    backup_id = arn.rsplit("/", 1)[1]
-    table = arn.split(":table/")[1].split("/")[0]
-    created_ms = int(backup_id.split("-")[0])
-    # `created_at` as the job writes it (the id's millisecond, six fraction
-    # digits on SQLite); `completed_at` and `heartbeat_at` are the seed's own
-    # instant, distinct from `created_at` as the job's AVAILABLE write and
-    # its last beat are.
-    created_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(created_ms / 1000)) + f".{created_ms % 1000:03d}000Z"
-    now_ms = int(time.time() * 1000)
-    now_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now_ms / 1000)) + f".{now_ms % 1000:03d}Z"
-    store_root = os.path.realpath(target.root)
-    source_table = json.dumps(manifest["source_table"], separators=(",", ":"))
-    if target.backend == "postgres":
-        catalog = f"{target.tag}_catalog"
-        psql(
-            "INSERT INTO backup_index (account_id, backup_id, table_name, backup_arn, backup_name, status, "
-            "store_kind, store_root, store_id, size_bytes, item_count, created_at, completed_at, "
-            "source_table_details_json, owner_generation, heartbeat_at) VALUES "
-            f"('{ACCOUNT}', '{backup_id}', '{table}', '{arn}', 'matrix', 'AVAILABLE', 'filesystem', "
-            f"'{store_root}', '{target.store_id()}', {size_bytes}, {item_count}, "
-            f"to_timestamp({created_ms} / 1000.0), now(), '{source_table.replace(chr(39), chr(39) * 2)}'::jsonb, 0, now())",
-            database=catalog,
-        )
-    elif target.backend == "sqlite":
-        conn = sqlite_module().connect(os.path.join(target.work, "db.sqlite"), timeout=10)
-        try:
-            conn.execute(
-                "INSERT INTO backup_index (account_id, backup_id, table_name, backup_arn, backup_name, status, "
-                "store_kind, store_root, store_id, size_bytes, item_count, created_at, completed_at, "
-                "source_table_details_json, owner_generation, heartbeat_at) VALUES (?, ?, ?, ?, 'matrix', 'AVAILABLE', "
-                "'filesystem', ?, ?, ?, ?, ?, ?, ?, 0, ?)",
-                (ACCOUNT, backup_id, table, arn, store_root, target.store_id(), size_bytes, item_count,
-                 created_iso, now_iso, source_table, now_iso),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-    elif target.backend == "mongodb":
-        import datetime
+def backup_sync(target: Deployment, *options: str) -> str:
+    """`extenddb backup sync [options]` on the target, its output logged to
+    `sync.log`: beside the server on PostgreSQL, MongoDB and Cassandra; on
+    SQLite, where the command takes the serve lock, with the server stopped
+    and started again after it."""
+    if target.backend == "sqlite":
+        target.stop()
+    r = subprocess.run(
+        [target.bin, "backup", "sync", *options, "--config", target.config],
+        cwd=target.work, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=600,
+    )
+    with open(os.path.join(target.work, "sync.log"), "a") as log:
+        log.write(f"$ extenddb backup sync {' '.join(options)}: exit {r.returncode}\n{r.stdout}{r.stderr}\n")
+    if target.backend == "sqlite":
+        target.start()
+    check(r.returncode == 0,
+          f"backup sync {' '.join(options)} on the target exited {r.returncode}: {(r.stdout + r.stderr)[-3000:]}")
+    return r.stdout
 
-        from bson import Int64
-        from pymongo import MongoClient
 
-        created = datetime.datetime.fromtimestamp(created_ms / 1000, tz=datetime.timezone.utc)
-        now = datetime.datetime.fromtimestamp(now_ms / 1000, tz=datetime.timezone.utc)
-        client = MongoClient(MONGODB_URI)
-        try:
-            client["extenddb_catalog"]["backup_index"].insert_one({
-                "account_id": ACCOUNT,
-                "backup_id": backup_id,
-                "table_name": table,
-                "backup_arn": arn,
-                "backup_name": "matrix",
-                "status": "AVAILABLE",
-                "store_kind": "filesystem",
-                "store_root": store_root,
-                "store_id": target.store_id(),
-                "size_bytes": Int64(size_bytes),
-                "item_count": Int64(item_count),
-                "created_at": created,
-                "completed_at": now,
-                "source_table_details_json": manifest["source_table"],
-                "owner_generation": Int64(0),
-                "heartbeat_at": now,
-                "lock_seq": Int64(0),
-            })
-        finally:
-            client.close()
-    elif target.backend == "cassandra":
-        # The catalog-index row (`store_kind` set) in `backups_by_arn`, plus
-        # its `backup_index_by_status` entry; DescribeTable and the restore
-        # re-read the authoritative row, so the two list rows are optional.
-        import datetime
+def store_health(d: Deployment) -> dict:
+    """The `backup_store` component of the server's /health."""
+    return requests.get(f"{d.endpoint}/health", verify=False, timeout=5).json().get("components", {}).get("backup_store", {})
 
-        from cassandra.auth import PlainTextAuthProvider
-        from cassandra.cluster import Cluster
 
-        st = manifest["source_table"]
-        created_dt = datetime.datetime.utcfromtimestamp(created_ms / 1000)
-        tct = st.get("table_creation_date_time")
-        table_created_dt = (
-            datetime.datetime.utcfromtimestamp(tct) if tct else created_dt
-        )
-        now_dt = datetime.datetime.utcnow()
-        cluster = Cluster(
-            ["127.0.0.1"], port=9042,
-            auth_provider=PlainTextAuthProvider("cassandra", "cassandra"),
-        )
-        session = cluster.connect()
-        try:
-            insert = session.prepare(
-                "INSERT INTO extenddb_catalog.backups_by_arn (account_id, backup_arn, backup_id, "
-                "backup_name, table_id, table_name, table_arn, backup_status, backup_type, "
-                "backup_size_bytes, item_count, key_schema, attribute_definitions, billing_mode, "
-                "table_created_at, created_at, store_kind, store_root, store_id, "
-                "source_table_details_json, owner_generation, heartbeat_at) "
-                "VALUES (?, ?, ?, 'matrix', ?, ?, ?, 'AVAILABLE', 'USER', ?, ?, ?, ?, ?, ?, ?, "
-                "'filesystem', ?, ?, ?, 0, ?)"
-            )
-            session.execute(
-                insert,
-                (
-                    ACCOUNT, arn, backup_id, st["table_id"], table, st["table_arn"],
-                    size_bytes, item_count,
-                    json.dumps(st["key_schema"], separators=(",", ":")),
-                    json.dumps(st["attribute_definitions"], separators=(",", ":")),
-                    str(st.get("billing_mode", "PAY_PER_REQUEST")),
-                    table_created_dt, created_dt, store_root, target.store_id(),
-                    source_table, now_dt,
-                ),
-            )
-            status_entry = session.prepare(
-                "INSERT INTO extenddb_catalog.backup_index_by_status (store_root, backup_status, "
-                "backup_arn, account_id, store_kind, store_id) "
-                "VALUES (?, 'AVAILABLE', ?, ?, 'filesystem', ?)"
-            )
-            session.execute(status_entry, (store_root, arn, ACCOUNT, target.store_id()))
-        finally:
-            cluster.shutdown()
-    else:
-        raise NotImplementedError(f"seed_row for {target.backend}")
-    say(f"target: backup_index row seeded for {arn} (store {target.store_id()})")
+def wait_store(d: Deployment, predicate, what: str, timeout: float = 60) -> dict:
+    deadline = time.monotonic() + timeout
+    while True:
+        component = store_health(d)
+        if predicate(component):
+            return component
+        check(time.monotonic() < deadline, f"the {d.role}'s store is not {what} after {timeout} s: {component}")
+        time.sleep(0.5)
+
+
+def adopt_backup(target: Deployment, arn: str, adopt_store: bool) -> None:
+    """Sync the target's catalog with its root and require the one backup
+    adopted: a plain `backup sync` for a prefix copied under a root the target
+    owns, `--adopt-store` for the source's root itself."""
+    out = backup_sync(target, *(["--adopt-store"] if adopt_store else []))
+    if adopt_store:
+        check("Adopted the root: extenddb-store.json named catalog" in out, f"--adopt-store did not adopt the root: {out[-3000:]}")
+    check(f"  {arn}" in out.splitlines() and "1 backup(s) adopted" in out,
+          f"backup sync did not adopt {arn}: {out[-3000:]}")
+    wait_store(target, lambda c: c.get("status") == "healthy", "healthy")
+    say(f"target: backup sync adopted {arn}" + (" with the root (--adopt-store)" if adopt_store else ""))
 
 
 # --- comparison ---------------------------------------------------------------
@@ -786,7 +701,12 @@ def compare_descriptions(source: dict, target: dict) -> None:
 
 
 def run(args) -> int:
-    cell_tag = f"{args.source}-{args.target}" + ("-vector" if args.vector else "") + ("-dup" if args.duplicate_key else "")
+    cell_tag = (
+        f"{args.source}-{args.target}"
+        + ("-vector" if args.vector else "")
+        + ("-dup" if args.duplicate_key else "")
+        + ("-adopt" if args.adopt_store else "")
+    )
     work = args.work or os.path.join(tempfile.gettempdir(), "backup-restore-matrix", cell_tag)
     work = os.path.abspath(work)
     shutil.rmtree(work, ignore_errors=True)
@@ -809,20 +729,41 @@ def run(args) -> int:
         manifest = json.load(open(os.path.join(source_prefix, "extenddb-manifest.json")))
         source.stop()
 
+        if args.adopt_store:
+            # No copy: the target's store is the source's root, which names
+            # the source's catalog until the target adopts it.
+            target.root = source.root
         target.init()
         target.start()
         target.provision()
-        check(os.path.isfile(os.path.join(target.root, "extenddb-store.json")), "the target wrote no identity file")
-        target_prefix = prefix_of(target.root, arn)
-        copy_prefix(source_prefix, target_prefix, target.root)
-        if args.duplicate_key:
-            manifest = write_duplicate_key_prefix(target_prefix, manifest, args.vector)
-            say("target: the prefix now holds an unordered backup with one key in two files")
-        seed_row(target, arn, manifest, manifest["backup_size_bytes"], manifest["source_table"]["item_count"])
+        if args.adopt_store:
+            with open(os.path.join(source.root, "extenddb-store.json")) as f:
+                owner = json.load(f)["catalog_id"]
+            wait_store(target, lambda c: c.get("reason") == "owned by another catalog", "owned by another catalog")
+            adopt_backup(target, arn, adopt_store=True)
+            with open(os.path.join(source.root, "extenddb-store.json")) as f:
+                check(json.load(f)["catalog_id"] != owner, "the root's file still names the source's catalog")
+            source.start("serve-after-adoption.log")
+            component = wait_store(source, lambda c: c.get("reason") == "owned by another catalog",
+                                   "owned by another catalog")
+            check(component.get("status") == "unhealthy", f"the source's store after the adoption: {component}")
+            say(f"source: after the adoption its store is {component}")
+            source.stop()
+        else:
+            check(os.path.isfile(os.path.join(target.root, "extenddb-store.json")), "the target wrote no identity file")
+            target_prefix = prefix_of(target.root, arn)
+            copy_prefix(source_prefix, target_prefix, target.root)
+            if args.duplicate_key:
+                manifest = write_duplicate_key_prefix(target_prefix, manifest, args.vector)
+                say("target: the prefix now holds an unordered backup with one key in two files")
+            adopt_backup(target, arn, adopt_store=False)
 
         c = target.client()
         described = c.describe_backup(BackupArn=arn)["BackupDescription"]
-        check(described["BackupDetails"]["BackupStatus"] == "AVAILABLE", "the seeded row does not describe AVAILABLE")
+        check(described["BackupDetails"]["BackupStatus"] == "AVAILABLE", "the adopted row does not describe AVAILABLE")
+        check(described["BackupDetails"]["BackupName"] == "matrix", f"the adopted row's name: {described['BackupDetails']}")
+        check(described["BackupDetails"]["BackupSizeBytes"] == manifest["backup_size_bytes"],
+              f"the adopted row's size: {described['BackupDetails']} against the manifest's {manifest['backup_size_bytes']}")
         started = time.monotonic()
 
         if args.vector and args.target == "mongodb":
@@ -964,10 +905,17 @@ def main() -> None:
     p.add_argument("--items", type=int, default=1200)
     p.add_argument("--vector", action="store_true")
     p.add_argument("--duplicate-key", action="store_true")
+    p.add_argument("--adopt-store", action="store_true",
+                   help="point the target's store at the source's root and adopt it with `backup sync --adopt-store`")
     p.add_argument("--work")
     for b in DEFAULT_BINS:
         p.add_argument(f"--bin-{b}")
-    sys.exit(run(p.parse_args()))
+    args = p.parse_args()
+    if args.adopt_store and args.duplicate_key:
+        p.error("--adopt-store copies no prefix, so it takes no --duplicate-key")
+    if args.adopt_store and args.source == "mongodb" and args.target == "mongodb":
+        p.error("--adopt-store keeps the source's catalog for its health check; two MongoDB catalogs share fixed names")
+    sys.exit(run(args))
 
 
 if __name__ == "__main__":

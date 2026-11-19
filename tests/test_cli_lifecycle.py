@@ -57,7 +57,7 @@ class TestCliLifecycle:
         """init writes the legacy data ledger rows in the data DB's schema_history.
 
         Migration 1 records every legacy data migration file and the legacy
-        code migration there, so a release before 1.0 started against this
+        code migration there, so a release before 0.1.15 started against this
         catalog finds nothing to replay.
         """
         import psycopg2

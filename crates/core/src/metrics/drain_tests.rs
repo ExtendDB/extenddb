@@ -42,6 +42,9 @@ fn keys(n: usize) -> Vec<MetricKey> {
     (0..n)
         .map(|i| MetricKey {
             metric: MetricName::SuccessfulRequestLatency,
+            // Two accounts, so a drain that dropped or swapped the account
+            // would not match the points recorded.
+            account_id: Some(format!("{:012}", i % 2)),
             table_name: Some(format!("table-{i}")),
             index_name: None,
             operation: Some("GetItem".to_owned()),
@@ -246,7 +249,7 @@ fn rows(buckets: Vec<FlushBucket>) -> Vec<BucketRow> {
         .map(|b| {
             (
                 b.metric.to_string(),
-                b.table_name,
+                format!("{}/{}", b.account_id, b.table_name),
                 b.index_name,
                 b.operation,
                 b.bucket,
@@ -291,6 +294,7 @@ fn drain_buckets_match_a_per_minute_reference() {
             want.push(FlushBucket {
                 bucket: SystemTime::UNIX_EPOCH + Duration::from_secs(minute as u64),
                 metric: key.metric,
+                account_id: key.account_id.clone().unwrap_or_default(),
                 table_name: key.table_name.clone().unwrap_or_default(),
                 index_name: String::new(),
                 operation: key.operation.clone().unwrap_or_default(),
@@ -309,8 +313,8 @@ fn drain_buckets_match_a_per_minute_reference() {
 fn drain_zero_takes_everything() {
     let c = MetricsCollector::new();
     for i in 0..(2 * CHUNK_CAP + 5) {
-        c.record_latency(Some("T"), "GetItem", i as f64);
-        c.record_request_count("GetItem");
+        c.record_latency("111111111111", Some("T"), "GetItem", i as f64);
+        c.record_request_count("111111111111", "GetItem");
     }
     let buckets = c.drain(Duration::ZERO);
     let count: u64 = buckets.iter().map(|b| b.count).sum();
@@ -324,7 +328,7 @@ fn drain_zero_takes_everything() {
 fn record_keeps_every_chunk_within_the_cap() {
     let c = MetricsCollector::new();
     for i in 0..(10 * CHUNK_CAP + 3) {
-        c.record_latency(Some("T"), "GetItem", i as f64);
+        c.record_latency("111111111111", Some("T"), "GetItem", i as f64);
     }
     let map = c.data.read().expect("lock");
     let acc = map.values().next().expect("one key");
