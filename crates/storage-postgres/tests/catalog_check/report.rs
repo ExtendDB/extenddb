@@ -359,6 +359,44 @@ async fn changes_during_the_check_are_not_reported() {
     assert!(next.missing.is_empty(), "missing: {:?}", next.missing);
 }
 
+/// The check lists the relations that unqualified names reach in the data
+/// database, as the server's statements and the drop resolve them. With a
+/// `search_path` of `alt, public` for the role there, the table the server
+/// serves from `public` is not missing, and a relation in a schema off the
+/// path is not orphaned.
+#[tokio::test]
+async fn the_check_lists_the_relations_the_search_path_reaches() {
+    let test = "the_check_lists_the_relations_the_search_path_reaches";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let d = Deployment::new().await;
+    d.create_table_with_indexes(TABLE).await;
+    let off_path = format!("_ddb_{}", uuid::Uuid::new_v4());
+    for statement in [
+        "CREATE SCHEMA alt".to_owned(),
+        "CREATE SCHEMA other".to_owned(),
+        format!("CREATE TABLE other.\"{off_path}\" (pk TEXT PRIMARY KEY)"),
+        format!(
+            "ALTER ROLE CURRENT_USER IN DATABASE \"{}\" SET search_path = alt, public",
+            d.data_db
+        ),
+    ] {
+        sqlx::query(&statement)
+            .execute(&d.data)
+            .await
+            .unwrap_or_else(|e| panic!("{statement}: {e}"));
+    }
+
+    let check = d
+        .diagnostics
+        .check_storage_relations(&KeySource::CatalogKey)
+        .await
+        .expect("check");
+    assert!(check.orphaned.is_empty(), "orphaned: {:?}", check.orphaned);
+    assert!(check.missing.is_empty(), "missing: {:?}", check.missing);
+}
+
 /// Only index writers that keep the `SHARE` lock on `indexes` from the check
 /// until its budget runs out give the error that says so. A statement
 /// timeout on the catalog sessions, and a lock on another catalog table,

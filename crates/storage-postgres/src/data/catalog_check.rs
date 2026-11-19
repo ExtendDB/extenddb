@@ -145,7 +145,7 @@ struct TableRows {
     owners: BTreeMap<String, Named>,
 }
 
-/// A relation name as `pg_tables` lists it, without the quotes the naming
+/// A relation name as the listing gives it, without the quotes the naming
 /// functions put around it.
 fn bare(quoted: &str) -> String {
     quoted.trim_matches('"').to_owned()
@@ -314,11 +314,14 @@ async fn read_catalog(
     named
 }
 
-/// The data relations this backend created that the data database holds now.
+/// The data relations this backend created that unqualified names reach in
+/// the data database now: `pg_table_is_visible` resolves each name through
+/// the session's `search_path`, as the server's statements and the drop do.
 async fn storage_relations(data: &PgPool) -> Result<BTreeSet<String>, sqlx::Error> {
     let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT tablename::text FROM pg_tables \
-         WHERE schemaname = current_schema() AND starts_with(tablename::text, $1)",
+        "SELECT c.relname::text FROM pg_class c \
+         WHERE c.relkind IN ('r', 'p') AND pg_table_is_visible(c.oid) \
+           AND starts_with(c.relname::text, $1)",
     )
     .bind(STORAGE_RELATION_PREFIX)
     .fetch_all(data)

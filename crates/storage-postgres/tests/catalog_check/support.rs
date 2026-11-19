@@ -90,7 +90,7 @@ async fn deployment_permit() -> tokio::sync::OwnedSemaphorePermit {
 pub(crate) struct Deployment {
     base: String,
     catalog_db: String,
-    data_db: String,
+    pub(crate) data_db: String,
     pub(crate) catalog: PgPool,
     pub(crate) data: PgPool,
     pub(crate) engine: PostgresEngine,
