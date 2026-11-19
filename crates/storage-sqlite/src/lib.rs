@@ -59,6 +59,15 @@ mod warm_throughput;
 mod worker;
 mod workers;
 
+// WebAssembly build only: a synchronous reimplementation of the slice of the
+// `sqlx` API the backend uses, over this crate's bundled SQLite (in-memory
+// VFS). Declared here so it builds and lints under wasm32; the crate root
+// aliases it to `sqlx` and the modules route through it in a following change,
+// so nothing references it yet.
+#[cfg(target_arch = "wasm32")]
+#[allow(dead_code)]
+mod wasm_sqlx;
+
 /// Default secondary-index propagation delay (milliseconds) when the
 /// `index_propagation_delay_ms` setting is absent, as it is on a catalog the
 /// migrations created (releases before 0.1.15 seeded the same value). The single

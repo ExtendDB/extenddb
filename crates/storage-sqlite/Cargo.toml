@@ -43,6 +43,19 @@ zeroize = { workspace = true }
 libc = { workspace = true }
 libsqlite3-sys = { workspace = true }
 
+# WebAssembly build only. On wasm32 the backend cannot use `sqlx` + the C
+# `libsqlite3-sys` (a dedicated OS thread per connection, a C sysroot), so it
+# resolves its `sqlx::` paths to the in-crate `wasm_sqlx` module instead, which
+# drives this crate's bundled SQLite (in-memory VFS, no threads, no C sysroot)
+# over its raw libsqlite3 C ABI. The `wasm-bindgen` feature supplies the host
+# hooks (clock, randomness, VFS glue) the module links against in a JavaScript
+# host. Pulled only into a wasm32 build; native builds are unaffected.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+sqlite-wasm-rs = { version = "0.6", features = ["wasm-bindgen"] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
 [dev-dependencies]
 extenddb-storage = { path = "../storage", features = ["test-util"] }
 # `tests/backup_job_panic.rs` drives the engine's CreateBackup job and
