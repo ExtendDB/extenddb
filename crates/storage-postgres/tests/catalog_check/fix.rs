@@ -239,7 +239,9 @@ async fn an_index_added_during_the_drop_keeps_its_relation_under_repeatable_read
         return skip(test);
     }
     let d = Deployment::new().await;
-    let store = d.diagnostics_at("repeatable read").await;
+    let store = d
+        .diagnostics_with("default_transaction_isolation", "repeatable read")
+        .await;
     an_index_added_during_the_drop_keeps_its_relation(&store, &d).await;
 }
 

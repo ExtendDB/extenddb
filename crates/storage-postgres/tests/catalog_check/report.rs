@@ -4,12 +4,13 @@
 //! What the check reports.
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use extenddb_core::types::DeleteTableInput;
 use extenddb_storage::TableEngine;
 use extenddb_storage::diagnostics::{CatalogRelation, DiagError, DiagnosticsStore};
 use extenddb_storage::server_components::KeySource;
-use extenddb_storage_postgres::{CatalogCheckPoint, arm_catalog_check_pause};
+use extenddb_storage_postgres::{CatalogCheckPoint, PostgresCatalogStore, arm_catalog_check_pause};
 use sqlx::Connection;
 
 use crate::support::{ACCOUNT, Deployment, TABLE, base_conn, skip};
@@ -356,4 +357,61 @@ async fn changes_during_the_check_are_not_reported() {
         .expect("check again");
     assert_eq!(next.orphaned, vec![late]);
     assert!(next.missing.is_empty(), "missing: {:?}", next.missing);
+}
+
+/// Only index writers that keep the `SHARE` lock on `indexes` from the check
+/// until its budget runs out give the error that says so. A statement
+/// timeout on the catalog sessions, and a lock on another catalog table,
+/// give the server's own error.
+#[tokio::test]
+async fn other_catalog_failures_do_not_report_index_changes() {
+    let test = "other_catalog_failures_do_not_report_index_changes";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let d = Deployment::new().await;
+    d.plant_orphan().await;
+    let with_statement_timeout = d.diagnostics_with("statement_timeout", "50ms").await;
+    let with_short_budget =
+        PostgresCatalogStore::with_index_lock_budget(d.catalog.clone(), Duration::from_secs(2));
+
+    for (held, store, error) in [
+        (
+            "LOCK TABLE indexes IN ROW EXCLUSIVE MODE",
+            &with_statement_timeout,
+            "canceling statement due to statement timeout",
+        ),
+        (
+            "LOCK TABLE vector_indexes IN ACCESS EXCLUSIVE MODE",
+            &with_short_budget,
+            "canceling statement due to lock timeout",
+        ),
+    ] {
+        let mut holder = sqlx::PgConnection::connect(&d.catalog_url())
+            .await
+            .expect("a catalog session for the lock");
+        sqlx::query("BEGIN")
+            .execute(&mut holder)
+            .await
+            .expect("begin");
+        sqlx::query(held)
+            .execute(&mut holder)
+            .await
+            .expect("take the lock");
+        let check = tokio::time::timeout(
+            Duration::from_secs(10),
+            store.check_storage_relations(&KeySource::CatalogKey),
+        )
+        .await
+        .expect("the check gave up within 10 s");
+        match check {
+            Err(DiagError::QueryFailed(msg)) => assert_eq!(
+                msg,
+                format!("error returned from database: {error}"),
+                "{held}"
+            ),
+            other => panic!("{held}: {other:?}"),
+        }
+        holder.close().await.expect("release the lock");
+    }
 }

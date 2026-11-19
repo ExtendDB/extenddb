@@ -151,6 +151,22 @@ fn bare(quoted: &str) -> String {
     quoted.trim_matches('"').to_owned()
 }
 
+/// Why [`check`] or [`drop_orphaned`] stopped.
+#[derive(Debug)]
+pub(crate) enum CheckFailure {
+    /// The `SHARE` lock on `indexes` was not granted before the deadline:
+    /// the last attempt's error (SQLSTATE 55P03).
+    IndexLock(sqlx::Error),
+    /// Any other failure, a lock wait of a catalog read among them.
+    Sql(sqlx::Error),
+}
+
+impl From<sqlx::Error> for CheckFailure {
+    fn from(e: sqlx::Error) -> Self {
+        Self::Sql(e)
+    }
+}
+
 /// Whether a row in `status` has its relations: it exists and is neither
 /// being created (a catalog-first path commits the row before the relations)
 /// nor deleted (a drop may already have run).
@@ -252,20 +268,22 @@ async fn begin_read_committed(
 /// relation this read does not name is named by no row later.
 ///
 /// The `SHARE` lock is requested in attempts of [`INDEX_LOCK_ATTEMPT`],
-/// [`INDEX_LOCK_PAUSE`] apart, until `deadline`; the last attempt's error
-/// (SQLSTATE 55P03) is returned once it has passed. The lock is released as
-/// soon as the read returns.
+/// [`INDEX_LOCK_PAUSE`] apart, until `deadline`; once it has passed, a last
+/// attempt that timed out on the lock gives [`CheckFailure::IndexLock`]. The
+/// lock is released as soon as the read returns.
 async fn read_after_index_writers(
     catalog: &PgPool,
     deadline: Instant,
-) -> Result<BTreeMap<String, Named>, sqlx::Error> {
+) -> Result<BTreeMap<String, Named>, CheckFailure> {
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         let mut hold = begin_read_committed(catalog, left.min(INDEX_LOCK_ATTEMPT)).await?;
+        let mut locked = false;
         let read = async {
             sqlx::query("LOCK TABLE indexes IN SHARE MODE")
                 .execute(&mut *hold)
                 .await?;
+            locked = true;
             named_relations(&mut hold).await
         }
         .await;
@@ -276,7 +294,10 @@ async fn read_after_index_writers(
                 let left = deadline.saturating_duration_since(Instant::now());
                 tokio::time::sleep(left.min(INDEX_LOCK_PAUSE)).await;
             }
-            read => return read,
+            Err(e) if lock_not_available(&e) && !locked => {
+                return Err(CheckFailure::IndexLock(e));
+            }
+            read => return read.map_err(CheckFailure::Sql),
         }
     }
 }
@@ -311,7 +332,7 @@ pub(crate) async fn check(
     catalog: &PgPool,
     data: &PgPool,
     budget: Duration,
-) -> Result<StorageRelationCheck, sqlx::Error> {
+) -> Result<StorageRelationCheck, CheckFailure> {
     let deadline = Instant::now() + budget;
     let listed = storage_relations(data).await?;
     let mut named = read_catalog(catalog, deadline).await?;
@@ -358,7 +379,7 @@ pub(crate) async fn drop_orphaned(
     data: &PgPool,
     orphaned: Vec<String>,
     budget: Duration,
-) -> Result<Vec<(String, OrphanDrop)>, sqlx::Error> {
+) -> Result<Vec<(String, OrphanDrop)>, CheckFailure> {
     if orphaned.is_empty() {
         return Ok(Vec::new());
     }

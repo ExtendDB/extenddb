@@ -245,28 +245,26 @@ impl Deployment {
         format!("{}/{}", self.base, self.data_db)
     }
 
-    /// A second diagnostics store whose catalog sessions start every
-    /// transaction at `isolation` unless it sets its own, as a database or
-    /// role default would make them.
-    pub(crate) async fn diagnostics_at(&self, isolation: &str) -> PostgresCatalogStore {
+    /// A second diagnostics store whose catalog sessions start with
+    /// `setting` set to `value`, as a database or role default would set it.
+    pub(crate) async fn diagnostics_with(&self, setting: &str, value: &str) -> PostgresCatalogStore {
         // The server splits the startup options at spaces; a backslash keeps
         // one inside the value.
-        let value = isolation.replace(' ', "\\ ");
         let options = self
             .catalog_url()
             .parse::<PgConnectOptions>()
             .expect("the catalog URL")
-            .options([("default_transaction_isolation", value)]);
+            .options([(setting, value.replace(' ', "\\ "))]);
         let pool = PgPoolOptions::new()
             .max_connections(2)
             .connect_with(options)
             .await
-            .expect("a pool at the isolation level");
-        let level: String = sqlx::query_scalar("SHOW default_transaction_isolation")
+            .expect("a pool with the setting");
+        let set: String = sqlx::query_scalar(&format!("SHOW {setting}"))
             .fetch_one(&pool)
             .await
-            .expect("read the default isolation");
-        assert_eq!(level, isolation, "the sessions start at {isolation}");
+            .expect("read the setting");
+        assert_eq!(set, value, "the sessions start with {setting} = {value}");
         PostgresCatalogStore::new(pool)
     }
 

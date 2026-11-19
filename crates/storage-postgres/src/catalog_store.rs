@@ -17,6 +17,8 @@ use extenddb_storage::secret_keys::SecretKeys;
 use futures::future::BoxFuture;
 use sqlx::PgPool;
 
+use crate::data::catalog_check::CheckFailure;
+
 /// PostgreSQL-backed catalog store for settings, metrics, and rate limiting.
 ///
 /// Holds a connection pool to the catalog database. Created once at startup
@@ -262,17 +264,17 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for PostgresCatalogStore {
     }
 }
 
-/// The error `catalog-check` reports when its catalog work fails. A lock wait
-/// that ran out its budget says so, with `outcome`, the effect on this run.
-fn catalog_check_error(e: &sqlx::Error, budget: std::time::Duration, outcome: &str) -> DiagError {
-    if crate::data::lock_wait_failed(e) {
-        DiagError::QueryFailed(format!(
+/// The error `catalog-check` reports when its catalog work fails. A wait for
+/// the `SHARE` lock on `indexes` that ran out its budget says so, with
+/// `outcome`, the effect on this run.
+fn catalog_check_error(e: &CheckFailure, budget: std::time::Duration, outcome: &str) -> DiagError {
+    match e {
+        CheckFailure::IndexLock(e) => DiagError::QueryFailed(format!(
             "index changes in progress kept the index catalog locked for more than {} \
              seconds, so {outcome}; run the command again: {e}",
             budget.as_secs()
-        ))
-    } else {
-        DiagError::QueryFailed(e.to_string())
+        )),
+        CheckFailure::Sql(e) => DiagError::QueryFailed(e.to_string()),
     }
 }
 
