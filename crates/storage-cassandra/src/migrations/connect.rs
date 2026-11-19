@@ -582,22 +582,26 @@ fn change_to(
     }
 }
 
+/// Whether `keyspace` is one of this deployment's account keyspaces:
+/// `<keyspace_prefix>_account_` and an account id. An account id is 12 ASCII
+/// digits (`generate_account_id`). Any other text after `account_` belongs to
+/// another deployment whose prefix starts with this one, such as
+/// `acme_account` for `acme`.
+pub(crate) fn is_account_keyspace(keyspace: &str, keyspace_prefix: &str) -> bool {
+    keyspace
+        .strip_prefix(keyspace_prefix)
+        .and_then(|r| r.strip_prefix("_account_"))
+        .is_some_and(extenddb_core::arn::is_account_id)
+}
+
 /// Whether `keyspace` is this deployment's catalog or one of its account
 /// keyspaces.
-fn is_deployment_keyspace(keyspace: &str, keyspace_prefix: &str) -> bool {
-    let Some(rest) = keyspace
-        .strip_prefix(keyspace_prefix)
-        .and_then(|r| r.strip_prefix('_'))
-    else {
-        return false;
-    };
-    // An account id is 12 ASCII digits (`generate_account_id`). Any other
-    // text after `account_` belongs to another deployment whose prefix
-    // starts with this one, such as `acme_account` for `acme`.
-    rest == "catalog"
-        || rest
-            .strip_prefix("account_")
-            .is_some_and(|id| id.len() == 12 && id.bytes().all(|b| b.is_ascii_digit()))
+pub(crate) fn is_deployment_keyspace(keyspace: &str, keyspace_prefix: &str) -> bool {
+    is_account_keyspace(keyspace, keyspace_prefix)
+        || keyspace
+            .strip_prefix(keyspace_prefix)
+            .and_then(|r| r.strip_prefix('_'))
+            == Some("catalog")
 }
 
 /// Whether a `system_schema` replication map is `NetworkTopologyStrategy`
@@ -797,6 +801,19 @@ mod tests {
         ] {
             assert!(!replicates_as(&other, "dc1", 3), "{other:?}");
         }
+    }
+
+    /// `migrate`, `verify` and `settings` reach the prefix through
+    /// `Deployment::from_target`: a prefix with an upper-case letter in the
+    /// connection string is the lower-case one Cassandra stores.
+    #[test]
+    fn a_deployment_takes_the_prefix_in_lower_case() {
+        let target = Target {
+            location: "user:pw@h1:9042/Acme_Prod".to_owned(),
+            ..Target::default()
+        };
+        let deployment = Deployment::from_target(&target).expect("a deployment");
+        assert_eq!(deployment.keyspace_prefix, "acme_prod");
     }
 
     #[test]

@@ -1723,3 +1723,250 @@ async fn the_stores_under_the_migration_lock_check_its_lease() {
     migrations.release(lock).await;
     assert!(stores.settings().get_setting("catalog_id").await.is_err());
 }
+
+/// The keyspaces of the cluster that start with `start`, sorted.
+async fn keyspaces_starting_with(session: &CassandraSession, start: &str) -> Vec<String> {
+    use cdrs_tokio::types::IntoRustByName;
+
+    let mut found: Vec<String> = session
+        .query("SELECT keyspace_name FROM system_schema.keyspaces")
+        .await
+        .expect("list keyspaces")
+        .response_body()
+        .expect("body")
+        .into_rows()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|row| {
+            let name: Result<String, _> = row.get_r_by_name("keyspace_name");
+            name.ok()
+        })
+        .filter(|name| name.starts_with(start))
+        .collect();
+    found.sort();
+    found
+}
+
+/// #645: `destroy` dropped every keyspace that starts with `<prefix>_`,
+/// including those of a second deployment whose prefix begins with the
+/// first one's and a keyspace an operator made by hand. It drops the
+/// deployment's catalog and its account keyspaces (a 12-digit account id)
+/// and leaves the rest.
+#[tokio::test]
+async fn destroy_drops_only_the_keyspaces_of_the_deployment() {
+    use extenddb_storage::bootstrapper::Bootstrapper;
+
+    if helpers::skip_without_cassandra() {
+        return;
+    }
+    let session = session().await;
+    let (prefix, _drops) = new_prefix("destroy");
+    let own = [
+        format!("{prefix}_catalog"),
+        format!("{prefix}_account_346032218963"),
+    ];
+    // Another deployment (prefix `<prefix>_test`), and keyspaces that the
+    // deployment's `init` never creates.
+    let others = [
+        format!("{prefix}_reports"),
+        format!("{prefix}_test_account_123456789012"),
+        format!("{prefix}_test_catalog"),
+        format!("{prefix}_account_12345"),
+    ];
+    let _cleanup =
+        helpers::DropKeyspacesOnDrop(own.iter().chain(others.iter()).cloned().collect::<Vec<_>>());
+    for name in own.iter().chain(others.iter()) {
+        keyspace(&session, name).await;
+    }
+
+    bootstrapper(&prefix)
+        .await
+        .drop_databases("")
+        .await
+        .expect("destroy");
+
+    let mut left: Vec<String> = others.to_vec();
+    left.sort();
+    assert_eq!(
+        keyspaces_starting_with(&session, &format!("{prefix}_")).await,
+        left,
+        "destroy dropped {own:?} and left the other keyspaces"
+    );
+}
+
+/// #645: `destroy` cut every trailing `_catalog` off the catalog keyspace
+/// name to get the prefix, so a deployment whose prefix itself ends in
+/// `_catalog` had its prefix shortened and dropped the keyspaces of every
+/// deployment that starts with the shorter one. It uses the configured
+/// prefix.
+#[tokio::test]
+async fn destroy_uses_the_configured_prefix_when_it_ends_in_catalog() {
+    use extenddb_storage::bootstrapper::Bootstrapper;
+
+    if helpers::skip_without_cassandra() {
+        return;
+    }
+    let session = session().await;
+    let (short, _drops) = new_prefix("destroy2");
+    let prefix = format!("{short}_catalog");
+    let own = format!("{prefix}_catalog");
+    // Starts with `<short>_`, the prefix the old code worked out, and not
+    // with `<prefix>_`.
+    let other = format!("{short}_widgets");
+    let _cleanup = helpers::DropKeyspacesOnDrop(vec![own.clone(), other.clone()]);
+    keyspace(&session, &own).await;
+    keyspace(&session, &other).await;
+
+    bootstrapper(&prefix)
+        .await
+        .drop_databases("")
+        .await
+        .expect("destroy");
+
+    assert_eq!(
+        keyspaces_starting_with(&session, &format!("{short}_")).await,
+        vec![other],
+        "destroy dropped {own} and left the other keyspace"
+    );
+}
+
+/// Cassandra stores a keyspace name written without quotes in lower case, so
+/// a prefix with an upper-case letter must name the lower-case keyspaces.
+/// Before, `destroy` compared `P2M_..._catalog` with the stored
+/// `p2m_..._catalog`, found nothing, and dropped nothing. The prefix comes
+/// from `--keyspace-prefix` or from the config file, and the two are the
+/// same prefix whatever their case.
+#[tokio::test]
+async fn an_upper_case_prefix_names_the_lower_case_keyspaces() {
+    use extenddb_storage::bootstrapper::Bootstrapper;
+    use extenddb_storage_cassandra::CassandraBootstrapper;
+
+    if helpers::skip_without_cassandra() {
+        return;
+    }
+    let session = session().await;
+    let config = helpers::test_config();
+    let contact_point = helpers::test_contact_point();
+    let user = config.username.clone().unwrap_or_default();
+    let password = config.password.clone().unwrap_or_default();
+    let dir = tempfile::tempdir().expect("a temporary directory");
+
+    let (prefix, _drops) = new_prefix("ucprefix");
+    let upper = prefix.to_ascii_uppercase();
+    assert_ne!(upper, prefix, "the test needs a prefix with letters");
+    let own = [
+        format!("{prefix}_catalog"),
+        format!("{prefix}_account_346032218963"),
+    ];
+    let other = format!("{prefix}_reports");
+    let _cleanup = helpers::DropKeyspacesOnDrop(
+        own.iter()
+            .cloned()
+            .chain(std::iter::once(other.clone()))
+            .collect(),
+    );
+    for name in own.iter().chain(std::iter::once(&other)) {
+        keyspace(&session, name).await;
+    }
+
+    // The flag: `init` and `destroy` with no config file.
+    let args: Vec<String> = [
+        "--cassandra-contact-points",
+        contact_point.as_str(),
+        "--cassandra-user",
+        user.as_str(),
+        "--cassandra-pass",
+        password.as_str(),
+        "--keyspace-prefix",
+        upper.as_str(),
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    let missing = dir.path().join("no-such-file.toml");
+    let from_flag = CassandraBootstrapper::from_config(missing.to_str().expect("utf-8"), &args)
+        .await
+        .unwrap_or_else(|e| panic!("from_config with an upper-case flag: {e:?}"));
+    assert_eq!(from_flag.catalog_database_name(), own[0]);
+
+    // A config file with the upper-case prefix, and the flag with the
+    // lower-case one: the same prefix, so no conflict.
+    let path = dir.path().join("extenddb.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "[storage.cassandra]\n\
+             contact_points = [\"{contact_point}\"]\n\
+             keyspace_prefix = \"{upper}\"\n\
+             replication_factor = 1\n\
+             datacenter = \"datacenter1\"\n"
+        ),
+    )
+    .expect("write the config file");
+    let args: Vec<String> = [
+        "--cassandra-user",
+        user.as_str(),
+        "--cassandra-pass",
+        password.as_str(),
+        "--keyspace-prefix",
+        prefix.as_str(),
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    let from_file = CassandraBootstrapper::from_config(path.to_str().expect("utf-8"), &args)
+        .await
+        .unwrap_or_else(|e| panic!("from_config with an upper-case config file: {e:?}"));
+    assert_eq!(from_file.catalog_database_name(), own[0]);
+
+    from_file.drop_databases("").await.expect("destroy");
+    assert_eq!(
+        keyspaces_starting_with(&session, &format!("{prefix}_")).await,
+        vec![other],
+        "destroy dropped {own:?} and left the other keyspace"
+    );
+}
+
+/// #645: the workers (transaction recovery, GSI, TTL) run statements in each
+/// keyspace of `list_account_keyspaces`. It lists the account keyspaces of
+/// the deployment of the engine's prefix and not those of another deployment
+/// whose prefix continues with `_account_`: `acme_account` beside `acme`.
+#[tokio::test]
+async fn the_workers_list_only_the_account_keyspaces_of_their_deployment() {
+    use extenddb_storage_cassandra::engine::CassandraEngine;
+
+    if helpers::skip_without_cassandra() {
+        return;
+    }
+    let session = session().await;
+    let (prefix, _drops) = new_prefix("w");
+    let own = format!("{prefix}_account_346032218963");
+    let not_own = [
+        // The catalog of this deployment.
+        format!("{prefix}_catalog"),
+        // The keyspaces of the deployment whose prefix is `<prefix>_account`.
+        format!("{prefix}_account_catalog"),
+        format!("{prefix}_account_account_123456789012"),
+        // An account id that is not 12 digits.
+        format!("{prefix}_account_12345"),
+    ];
+    let _cleanup = helpers::DropKeyspacesOnDrop(
+        std::iter::once(own.clone())
+            .chain(not_own.iter().cloned())
+            .collect(),
+    );
+    for name in std::iter::once(&own).chain(not_own.iter()) {
+        keyspace(&session, name).await;
+    }
+
+    let mut config = helpers::test_config();
+    config.keyspace_prefix = prefix.clone();
+    config.rebuild_cached_connection_string();
+    let engine = CassandraEngine::new(&config, "us-east-1")
+        .await
+        .expect("an engine for the prefix");
+    let listed = extenddb_storage_cassandra::workers::list_account_keyspaces_for_tests(&engine)
+        .await
+        .expect("list the account keyspaces");
+    assert_eq!(listed, vec![own]);
+}
