@@ -12,12 +12,16 @@ use extenddb_core::types::{
     AttributeDefinition, AttributeValue, IndexInfo, Item, KeySchemaElement, KeyType,
     ScalarAttributeType,
 };
+use extenddb_core::validation::{IndexKeyRef, validate_index_key_types};
 
 use crate::index_helpers::combined_lek_key_schema;
 
 /// Validate `ExclusiveStartKey` against the (table or index) key schema for
 /// `Scan`. Base-table scans use the long `DynamoDB` error message; index scans
 /// use the short one.
+///
+/// An index Scan names a key of another type, table keys included, ahead of a key
+/// left out or an extra attribute (measured 2026-11-14 to 2026-11-19, issue #1033).
 ///
 /// # Errors
 ///
@@ -29,6 +33,13 @@ pub fn validate_scan_exclusive_start_key(
     index_info: Option<&IndexInfo>,
 ) -> Result<(), extenddb_core::error::DynamoDbError> {
     let required = combined_lek_key_schema(&key_info.key_schema, index_info);
+    if let Some(index) = index_info {
+        let keys = IndexKeyRef {
+            index_name: &index.index_name,
+            key_schema: &required,
+        };
+        validate_index_key_types(start_key, &[keys], &key_info.attribute_definitions)?;
+    }
     let message = scan_invalid_start_key_message(index_info);
     check_exclusive_start_key(
         start_key,
