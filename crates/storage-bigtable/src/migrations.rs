@@ -383,15 +383,25 @@ impl MigrationBackend for BigtableMigrationRunnerBackend {
 
     async fn write_catalog_version(&self, version: u32) -> Result<(), MigrationError> {
         let cat = Catalog::new(&self.stores.client);
+        let ver_str = version.to_string();
         cat.put(
             keys::VERSION,
             &json!({
-                "catalog_version": version.to_string(),
+                "catalog_version": ver_str,
                 "applied_at": time::OffsetDateTime::now_utc().to_string(),
             }),
         )
         .await
-        .map_err(|e| MigrationError::store("write catalog_version", e))
+        .map_err(|e| MigrationError::store("write catalog_version", e))?;
+        cat.put(
+            &keys::setting("catalog_version"),
+            &json!({
+                "key": "catalog_version",
+                "value": ver_str,
+            }),
+        )
+        .await
+        .map_err(|e| MigrationError::store("write setting:catalog_version", e))
     }
 
     async fn delete_ledger_row(&self, store: &StoreRef, id: u32) -> Result<(), MigrationError> {

@@ -26,10 +26,64 @@ const TAG_B: u8 = 0x42;
 /// Maximum allowed row key size in Cloud Bigtable (4KB = 4096 bytes).
 pub const MAX_ROW_KEY_SIZE: usize = 4096;
 
-/// One past the largest possible SK encoding byte. Used to construct exclusive
-/// upper bounds for partition-scan ranges; 16 copies make for-all-practical-
-/// purposes "unreachable".
-const HI_FILL: [u8; 16] = [0xFF; 16];
+/// Exclusive upper bound for a raw byte prefix, or `None` when `prefix` is
+/// empty or every byte is `0xFF`.
+///
+/// Any byte sequence `k` starting with `prefix` satisfies `prefix <= k < upper`,
+/// and any byte sequence not starting with `prefix` lies outside `[prefix, upper)`.
+#[must_use]
+pub fn binary_prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let pos = prefix.iter().rposition(|&b| b < 0xFF)?;
+    let mut upper = prefix[..=pos].to_vec();
+    upper[pos] += 1;
+    Some(upper)
+}
+
+/// Smallest valid (`<= MAX_ROW_KEY_SIZE`-byte) Bigtable row key strictly greater
+/// than `key` in lexicographic byte order, or `None` if none exists.
+#[must_use]
+pub fn next_valid_row_key_after(key: &[u8]) -> Option<Vec<u8>> {
+    if key.len() < MAX_ROW_KEY_SIZE {
+        let mut next = Vec::with_capacity(key.len() + 1);
+        next.extend_from_slice(key);
+        next.push(0x00);
+        Some(next)
+    } else {
+        binary_prefix_upper_bound(&key[..MAX_ROW_KEY_SIZE])
+    }
+}
+
+/// Clamp a lexicographic range `(start_closed, end, end_open)` to the domain of
+/// valid Bigtable row keys (`len <= MAX_ROW_KEY_SIZE`), returning `None` if no
+/// valid row key can fall inside the range.
+///
+/// For any valid row key `x` (`|x| <= M`) and bound `B` with `|B| > M` and
+/// `H = B[..M]`: `x <= H <=> x < B <=> x <= B`, and `x > H <=> x >= B`.
+#[must_use]
+pub fn clamp_range_to_max_row_key(
+    start: Vec<u8>,
+    end: Vec<u8>,
+    end_open: bool,
+) -> Option<(Vec<u8>, Vec<u8>, bool)> {
+    if start > end || (end_open && start == end) {
+        return None;
+    }
+    let s = if start.len() <= MAX_ROW_KEY_SIZE {
+        start
+    } else {
+        binary_prefix_upper_bound(&start[..MAX_ROW_KEY_SIZE])?
+    };
+    let (e, open) = if end.len() <= MAX_ROW_KEY_SIZE {
+        (end, end_open)
+    } else {
+        (end[..MAX_ROW_KEY_SIZE].to_vec(), false)
+    };
+    if s > e || (open && s == e) {
+        None
+    } else {
+        Some((s, e, open))
+    }
+}
 
 fn tag_for(av: &AttributeValue) -> Result<u8, StorageError> {
     match av {
@@ -114,19 +168,15 @@ pub fn pk_range_start(pk: &AttributeValue) -> Result<Vec<u8>, StorageError> {
     Ok(out)
 }
 
-/// Exclusive upper bound for a Query against a single partition.
-pub fn pk_range_end_inclusive(pk: &AttributeValue) -> Result<Vec<u8>, StorageError> {
-    let mut out = pk_range_start(pk)?;
-    out.push(0xFF);
-    out.extend_from_slice(&HI_FILL);
-    Ok(out)
-}
-
-/// Append the "one past any possible SK" trailer to a row-key prefix. Useful
-/// for constructing exclusive upper bounds in Query SK conditions.
-pub fn append_sk_upper_trailer(buf: &mut Vec<u8>) {
-    buf.push(0xFF);
-    buf.extend_from_slice(&HI_FILL);
+/// Exclusive upper bound (`EndKeyOpen`) for a Query against a single partition.
+///
+/// Because byte `0` of `pk_range_start` is always a type tag (`0x42`/`0x4E`/`0x53`
+/// `< 0xFF`), `binary_prefix_upper_bound` always succeeds and never exceeds
+/// `pk_range_start(pk).len()`.
+pub fn pk_range_end_exclusive(pk: &AttributeValue) -> Result<Vec<u8>, StorageError> {
+    let start = pk_range_start(pk)?;
+    binary_prefix_upper_bound(&start)
+        .ok_or_else(|| StorageError::Internal("all-0xFF PK prefix".into()))
 }
 
 pub fn decode_key(
@@ -262,9 +312,51 @@ mod tests {
     fn n_pk_encoding_round_trips_via_helpers() {
         let pk = AttributeValue::N("42".into());
         let lo = pk_range_start(&pk).unwrap();
-        let hi = pk_range_end_inclusive(&pk).unwrap();
+        let hi = pk_range_end_exclusive(&pk).unwrap();
         assert!(lo < hi);
         assert_eq!(lo[0], TAG_N);
+
+        // Partition with all-0xFF binary PK still produces an exact short exclusive bound.
+        let ff_pk = AttributeValue::B(vec![0xFF; 32]);
+        let ff_lo = pk_range_start(&ff_pk).unwrap();
+        let ff_hi = pk_range_end_exclusive(&ff_pk).unwrap();
+        assert!(ff_lo < ff_hi);
+        assert!(ff_hi.len() < ff_lo.len());
+        let mut max_sk_row = ff_lo.clone();
+        max_sk_row.push(TAG_B);
+        max_sk_row.extend_from_slice(&[0xFF; 64]);
+        assert!(
+            max_sk_row.as_slice() >= ff_lo.as_slice() && max_sk_row.as_slice() < ff_hi.as_slice()
+        );
+    }
+
+    #[test]
+    fn row_key_successor_and_clamping_respect_4kb_limit() {
+        let short = vec![TAG_S, 0x41];
+        assert_eq!(
+            next_valid_row_key_after(&short),
+            Some(vec![TAG_S, 0x41, 0x00])
+        );
+
+        let mut at_max = vec![TAG_S; MAX_ROW_KEY_SIZE];
+        at_max[MAX_ROW_KEY_SIZE - 1] = 0xFF;
+        let succ = next_valid_row_key_after(&at_max).unwrap();
+        assert_eq!(succ.len(), MAX_ROW_KEY_SIZE - 1);
+        assert_eq!(*succ.last().unwrap(), TAG_S + 1);
+
+        // Overlong exact comparison [overlong, overlong] closed clamps to None.
+        let mut overlong = vec![TAG_S; MAX_ROW_KEY_SIZE + 5];
+        overlong[MAX_ROW_KEY_SIZE] = 0x00;
+        assert_eq!(
+            clamp_range_to_max_row_key(overlong.clone(), overlong.clone(), false),
+            None
+        );
+        // [short, overlong) clamps to [short, overlong[..4096]] closed.
+        let (cs, ce, copen) =
+            clamp_range_to_max_row_key(short.clone(), overlong.clone(), true).unwrap();
+        assert_eq!(cs, short);
+        assert_eq!(ce.len(), MAX_ROW_KEY_SIZE);
+        assert!(!copen);
     }
 
     #[test]

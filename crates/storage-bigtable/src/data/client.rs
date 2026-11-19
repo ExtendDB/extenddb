@@ -189,14 +189,20 @@ impl BigtableClient {
         });
 
         let connection = if let Some(ref host) = effective_emulator {
-            BigTableConnection::new_with_emulator(
-                host,
-                &config.project_id,
-                &config.instance_id,
-                /* is_read_only */ false,
-                channel_size,
-                timeout,
-            )
+            // `bigtable_rs` emits an unconditional `log::info!("Connecting to bigtable emulator ...")`
+            // inside `new_with_emulator`. Suppress that line on the thread-local
+            // tracing subscriber so machine-parsed CLI subcommands (`extenddb settings get`)
+            // keep stdout clean when logging is configured on stdout.
+            tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+                BigTableConnection::new_with_emulator(
+                    host,
+                    &config.project_id,
+                    &config.instance_id,
+                    /* is_read_only */ false,
+                    channel_size,
+                    timeout,
+                )
+            })
             .map_err(|e| format!("bigtable emulator connect ({host}): {e}"))?
         } else {
             // Real BigTable uses rustls (via tonic). Install aws-lc-rs

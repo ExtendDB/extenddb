@@ -1181,7 +1181,7 @@ pub fn apply_update_actions_validated(
         &key_info.vector_indexes,
         attr_defs,
     )
-    .map_err(|e| StorageError::Validation(format!("update expression evaluation: {e}")))?;
+    .map_err(|e| StorageError::Validation(e.to_string()))?;
     Ok(new_item)
 }
 
@@ -1200,9 +1200,7 @@ pub fn check_condition(
     match evaluate_condition(expr, item, maps) {
         Ok(true) => Ok(()),
         Ok(false) => Err(StorageError::ConditionFailed(existing.cloned())),
-        Err(e) => Err(StorageError::Validation(format!(
-            "condition evaluation: {e}"
-        ))),
+        Err(e) => Err(StorageError::Validation(e.to_string())),
     }
 }
 

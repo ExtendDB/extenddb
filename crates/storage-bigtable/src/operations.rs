@@ -71,7 +71,16 @@ impl OperationsEngine for BigtableOperationsEngine {
         lower.contains("credential") || lower.contains("key")
     }
 
-    fn setting_default(&self, _key: &str) -> Option<String> {
-        None
+    fn setting_default(&self, key: &str) -> Option<String> {
+        use extenddb_core::settings_keys::INDEX_PROPAGATION_DELAY_MS;
+        match key {
+            "control_plane_delay_seconds" => {
+                Some(crate::DEFAULT_CONTROL_PLANE_DELAY_SECONDS.to_string())
+            }
+            INDEX_PROPAGATION_DELAY_MS => {
+                Some(crate::DEFAULT_INDEX_PROPAGATION_DELAY_MS.to_string())
+            }
+            _ => None,
+        }
     }
 }

@@ -5916,6 +5916,628 @@ async fn test_gsi_version_guard_creating_refusal_update_table_lsi_scan_and_cas()
     );
 }
 
+// -----------------------------------------------------------------------------
+// Test 21: Multi-Attribute GSI Keys, Base SK Prefix Bounds, LSI Projections,
+//          TWI Key-Fault Precedence, Update Item-Size Limits & DDL Defaults
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_conformance_multipart_gsi_base_sk_bounds_lsi_projection_billing_size_and_txn_precedence()
+ {
+    use extenddb_core::types::{
+        CreateGsiAction, GlobalSecondaryIndexUpdate, LsiInput, ProvisionedThroughput,
+        UpdateTableInput, WarmThroughput,
+    };
+    use extenddb_storage::management_store::{ManagementStore, OpError, SettingsStore};
+    use extenddb_storage::secret_keys::{CATALOG_KEY_SETTING, SecretKeys};
+    use extenddb_storage_bigtable::BigtableCatalogStore;
+
+    let Some(ctx) = setup_emulator_context().await else {
+        eprintln!("Skipping Bigtable test: emulator unavailable");
+        return;
+    };
+
+    // 1. SettingsStore exposes `catalog_version`, IAM access keys use `AKIAEXTENDDB`
+    //    / `extenddb` prefixes, and deleting an account with tables returns the
+    //    reference HasDependents message.
+    let cat_store = BigtableCatalogStore::new(ctx.client.clone(), None, true);
+    let cat_ver = cat_store
+        .get_setting("catalog_version")
+        .await
+        .expect("get catalog_version");
+    assert_eq!(cat_ver, Some(MigrationId::LATEST.number().to_string()));
+    let all_settings = cat_store.list_settings().await.expect("list_settings");
+    assert!(all_settings.iter().any(|(k, v)| {
+        k == "catalog_version" && v == &MigrationId::LATEST.number().to_string()
+    }));
+
+    let enc_b64 = cat_store
+        .get_setting(CATALOG_KEY_SETTING)
+        .await
+        .unwrap()
+        .expect("encryption_key");
+    let secret_keys = Arc::new(SecretKeys::catalog_key(&enc_b64).unwrap());
+    let mgmt = BigtableCatalogStore::new(ctx.client.clone(), Some(secret_keys), true);
+    mgmt.create_account(&ctx.account_id, "conf-acct")
+        .await
+        .unwrap();
+    mgmt.create_user(&ctx.account_id, "ak_user", Some("hash"))
+        .await
+        .unwrap();
+    let ak = mgmt
+        .create_access_key(&ctx.account_id, "ak_user")
+        .await
+        .unwrap();
+    assert!(
+        ak.access_key_id.starts_with("AKIAEXTENDDB") && ak.access_key_id.len() == 20,
+        "expected 20-char AKIAEXTENDDB key, got {}",
+        ak.access_key_id
+    );
+    assert!(
+        ak.secret_access_key.starts_with("extenddb") && ak.secret_access_key.len() == 40,
+        "expected 40-char extenddb secret key, got len={}",
+        ak.secret_access_key.len()
+    );
+
+    // 2. CreateTable with billing_mode=None defaults to PROVISIONED (omits
+    //    BillingModeSummary) and honors `control_plane_delay_seconds`.
+    cat_store
+        .set_setting("control_plane_delay_seconds", "10.0")
+        .await
+        .unwrap();
+    let table_name = unique_name("tbl_multipart_conf");
+    let created_desc = ctx
+        .engine
+        .create_table(
+            &ctx.account_id,
+            CreateTableInput {
+                table_name: table_name.clone(),
+                key_schema: vec![
+                    KeySchemaElement {
+                        attribute_name: "pk".into(),
+                        key_type: KeyType::Hash,
+                    },
+                    KeySchemaElement {
+                        attribute_name: "sk".into(),
+                        key_type: KeyType::Range,
+                    },
+                ],
+                attribute_definitions: vec![
+                    AttributeDefinition {
+                        attribute_name: "pk".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "sk".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "lsi_sk".into(),
+                        attribute_type: ScalarAttributeType::N,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "h1".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "h2".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "r1".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "r2".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                ],
+                provisioned_throughput: Some(ProvisionedThroughput {
+                    read_capacity_units: 5,
+                    write_capacity_units: 5,
+                }),
+                warm_throughput: Some(WarmThroughput {
+                    read_units_per_second: Some(12_000),
+                    write_units_per_second: Some(4_000),
+                }),
+                local_secondary_indexes: Some(vec![LsiInput {
+                    index_name: "lsi_keys_only".into(),
+                    key_schema: vec![
+                        KeySchemaElement {
+                            attribute_name: "pk".into(),
+                            key_type: KeyType::Hash,
+                        },
+                        KeySchemaElement {
+                            attribute_name: "lsi_sk".into(),
+                            key_type: KeyType::Range,
+                        },
+                    ],
+                    projection: Projection {
+                        projection_type: ProjectionType::KeysOnly,
+                        non_key_attributes: None,
+                    },
+                }]),
+                global_secondary_indexes: Some(vec![GsiInput {
+                    index_name: "multi_gsi".into(),
+                    key_schema: vec![
+                        KeySchemaElement {
+                            attribute_name: "h1".into(),
+                            key_type: KeyType::Hash,
+                        },
+                        KeySchemaElement {
+                            attribute_name: "h2".into(),
+                            key_type: KeyType::Hash,
+                        },
+                        KeySchemaElement {
+                            attribute_name: "r1".into(),
+                            key_type: KeyType::Range,
+                        },
+                        KeySchemaElement {
+                            attribute_name: "r2".into(),
+                            key_type: KeyType::Range,
+                        },
+                    ],
+                    projection: Projection {
+                        projection_type: ProjectionType::All,
+                        non_key_attributes: None,
+                    },
+                    provisioned_throughput: Some(ProvisionedThroughput {
+                        read_capacity_units: 5,
+                        write_capacity_units: 5,
+                    }),
+                    warm_throughput: None,
+                }]),
+                billing_mode: None,
+                deletion_protection_enabled: Some(false),
+                ..CreateTableInput::default()
+            },
+        )
+        .await
+        .expect("create multi-attribute GSI + KEYS_ONLY LSI table");
+    assert!(
+        created_desc.billing_mode_summary.is_none(),
+        "default PROVISIONED table must omit BillingModeSummary"
+    );
+    assert!(
+        created_desc
+            .warm_throughput_record
+            .as_ref()
+            .expect("warm throughput record")
+            .updating_until
+            > extenddb_core::types::epoch_seconds_now(),
+        "WarmThroughput must remain UPDATING during control_plane_delay_seconds window"
+    );
+
+    let del_acct_err = mgmt
+        .delete_account(&ctx.account_id)
+        .await
+        .expect_err("delete_account with active table must fail");
+    assert!(matches!(
+        del_acct_err,
+        OpError::HasDependents(ref m)
+            if m == "Cannot delete account with existing tables. Delete all tables first."
+    ));
+
+    // 3. Conflicting AttributeDefinition redeclaration on UpdateTable keeps stored type.
+    let redecl_desc = ctx
+        .engine
+        .update_table(
+            &ctx.account_id,
+            UpdateTableInput {
+                table_name: table_name.clone(),
+                billing_mode: Some(BillingMode::PayPerRequest),
+                table_throughput_mode: None,
+                provisioned_throughput: None,
+                deletion_protection_enabled: None,
+                global_secondary_index_updates: Some(vec![GlobalSecondaryIndexUpdate {
+                    create: Some(CreateGsiAction {
+                        index_name: "extra_gsi".into(),
+                        key_schema: vec![KeySchemaElement {
+                            attribute_name: "extra_attr".into(),
+                            key_type: KeyType::Hash,
+                        }],
+                        projection: Projection {
+                            projection_type: ProjectionType::All,
+                            non_key_attributes: None,
+                        },
+                        provisioned_throughput: None,
+                        warm_throughput: None,
+                    }),
+                    update: None,
+                    delete: None,
+                }]),
+                attribute_definitions: Some(vec![
+                    AttributeDefinition {
+                        attribute_name: "pk".into(),
+                        attribute_type: ScalarAttributeType::N,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "extra_attr".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                ]),
+                stream_specification: None,
+                table_class: None,
+                on_demand_throughput: None,
+                vector_index_updates: None,
+                warm_throughput: None,
+                sse_specification: None,
+            },
+        )
+        .await
+        .expect("conflicting AttributeDefinition redeclaration must succeed");
+    assert_eq!(
+        redecl_desc
+            .attribute_definitions
+            .iter()
+            .find(|a| a.attribute_name == "pk")
+            .map(|a| a.attribute_type),
+        Some(ScalarAttributeType::S)
+    );
+    let gsis = redecl_desc
+        .global_secondary_indexes
+        .as_ref()
+        .expect("GSIs on PAY_PER_REQUEST table");
+    assert_eq!(gsis.len(), 2);
+    for g in gsis {
+        let pt = g
+            .provisioned_throughput
+            .as_ref()
+            .expect("PAY_PER_REQUEST GSI must still include zeroed ProvisionedThroughput");
+        assert_eq!(pt.read_capacity_units, 0);
+        assert_eq!(pt.write_capacity_units, 0);
+    }
+
+    let key_info = ctx
+        .engine
+        .table_key_info(&ctx.account_id, &table_name)
+        .await
+        .unwrap();
+    let empty_maps = ExpressionMaps::default();
+
+    // 4. Base-table SK prefix isolation ("@", "A", "A\0", "AB", "B") + multi-attribute GSI + LSI.
+    for (sk, r1, r2, lsi_n) in [
+        ("@", "F", "live", "40"),
+        ("A", "T", "live", "30"),
+        ("A\x00", "T", "draft", "10"),
+        ("AB", "F", "live", "20"),
+        ("B", "T", "zzz", "50"),
+    ] {
+        let mut it = s_item(&[
+            ("pk", "p1"),
+            ("sk", sk),
+            ("h1", "tenantA"),
+            ("h2", "us"),
+            ("r1", r1),
+            ("r2", r2),
+            ("secret_payload", "should_not_project_in_lsi"),
+        ]);
+        it.insert("lsi_sk".into(), AttributeValue::N(lsi_n.into()));
+        ctx.engine
+            .put_item(&key_info, it, false, None, &empty_maps, None)
+            .await
+            .unwrap();
+    }
+    ctx.engine
+        .put_item(
+            &key_info,
+            s_item(&[
+                ("pk", "p1"),
+                ("sk", "s_sparse"),
+                ("h1", "tenantA"),
+                ("h2", "us"),
+                ("r1", "T"),
+            ]),
+            false,
+            None,
+            &empty_maps,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let query_base_sks = |expr: &str, forward: bool| {
+        let engine = ctx.engine.clone();
+        let ki = key_info.clone();
+        let expr = expr.to_owned();
+        async move {
+            let kc = parse_kc(&expr);
+            let mut m = ExpressionMaps::default();
+            m.values.insert("p".into(), AttributeValue::S("p1".into()));
+            m.values.insert("v".into(), AttributeValue::S("A".into()));
+            m.values.insert("lo".into(), AttributeValue::S("@".into()));
+            let (items, _) = engine
+                .query(&ki, &kc, &m, forward, None, None, None)
+                .await
+                .unwrap();
+            items
+                .into_iter()
+                .map(|it| match it.get("sk") {
+                    Some(AttributeValue::S(s)) => s.clone(),
+                    other => panic!("unexpected sk {other:?}"),
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(query_base_sks("pk = :p AND sk = :v", true).await, vec!["A"]);
+    assert_eq!(
+        query_base_sks("pk = :p AND sk <= :v", true).await,
+        vec!["@", "A"]
+    );
+    assert_eq!(
+        query_base_sks("pk = :p AND sk BETWEEN :lo AND :v", true).await,
+        vec!["@", "A"]
+    );
+    assert_eq!(
+        query_base_sks("pk = :p AND sk > :v", true).await,
+        vec!["A\x00", "AB", "B", "s_sparse"]
+    );
+    assert_eq!(
+        query_base_sks("pk = :p AND begins_with(sk, :v)", false).await,
+        vec!["AB", "A\x00", "A"]
+    );
+
+    // Overlong (> 4096-byte) SK operand in KeyConditionExpression must clamp cleanly on cbtemulator.
+    let overlong_kc = parse_kc("pk = :p AND sk < :overlong");
+    let mut overlong_maps = ExpressionMaps::default();
+    overlong_maps
+        .values
+        .insert("p".into(), AttributeValue::S("p1".into()));
+    overlong_maps
+        .values
+        .insert("overlong".into(), AttributeValue::S("z".repeat(5000)));
+    let (overlong_items, _) = ctx
+        .engine
+        .query(
+            &key_info,
+            &overlong_kc,
+            &overlong_maps,
+            true,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("overlong SK bound must clamp cleanly without Bigtable 4KB error");
+    assert_eq!(overlong_items.len(), 6);
+
+    // Out-of-partition ExclusiveStartKey on direct DataEngine::query must fail Validation.
+    let wrong_pk_esk = s_item(&[("pk", "p0"), ("sk", "A")]);
+    let wrong_pk_err = ctx
+        .engine
+        .query(
+            &key_info,
+            &overlong_kc,
+            &overlong_maps,
+            true,
+            None,
+            Some(&wrong_pk_esk),
+            None,
+        )
+        .await;
+    assert!(matches!(wrong_pk_err, Err(StorageError::Validation(_))));
+
+    // Multi-HASH + multi-RANGE GSI query with aliased free-order clauses (without pre-resolving).
+    let kc = parse_kc("#h2 = :h2 AND r1 = :r1 AND #h1 = :h1 AND r2 < :r2");
+    let mut qmaps = ExpressionMaps::default();
+    qmaps.names.insert("h1".into(), "h1".into());
+    qmaps.names.insert("h2".into(), "h2".into());
+    qmaps
+        .values
+        .insert("h1".into(), AttributeValue::S("tenantA".into()));
+    qmaps
+        .values
+        .insert("h2".into(), AttributeValue::S("us".into()));
+    qmaps
+        .values
+        .insert("r1".into(), AttributeValue::S("T".into()));
+    qmaps
+        .values
+        .insert("r2".into(), AttributeValue::S("live".into()));
+    let (gsi_items, _) = ctx
+        .engine
+        .query(&key_info, &kc, &qmaps, true, None, None, Some("multi_gsi"))
+        .await
+        .unwrap();
+    assert_eq!(gsi_items.len(), 1);
+    assert_eq!(
+        gsi_items[0].get("sk"),
+        Some(&AttributeValue::S("A\x00".into()))
+    );
+
+    // Invalid ExclusiveStartKey missing GSI key attributes or carrying extraneous attrs on GSI Query & Scan must fail Validation.
+    let bad_gsi_esk = s_item(&[("pk", "p1"), ("sk", "A")]);
+    let bad_esk_err = ctx
+        .engine
+        .query(
+            &key_info,
+            &kc,
+            &qmaps,
+            true,
+            None,
+            Some(&bad_gsi_esk),
+            Some("multi_gsi"),
+        )
+        .await;
+    assert!(matches!(bad_esk_err, Err(StorageError::Validation(_))));
+    let mut extra_gsi_esk = s_item(&[
+        ("pk", "p1"),
+        ("sk", "A"),
+        ("h1", "tenantA"),
+        ("h2", "us"),
+        ("r1", "T"),
+        ("r2", "live"),
+        ("unexpected", "attr"),
+    ]);
+    let bad_scan_esk_err = ctx
+        .engine
+        .scan(
+            &key_info,
+            None,
+            Some(&extra_gsi_esk),
+            None,
+            None,
+            Some("multi_gsi"),
+        )
+        .await;
+    assert!(matches!(bad_scan_esk_err, Err(StorageError::Validation(_))));
+    extra_gsi_esk.remove("unexpected");
+    let (_, _) = ctx
+        .engine
+        .scan(
+            &key_info,
+            None,
+            Some(&extra_gsi_esk),
+            None,
+            None,
+            Some("multi_gsi"),
+        )
+        .await
+        .expect("valid GSI ExclusiveStartKey on Scan must succeed");
+
+    // 5. KEYS_ONLY LSI projection on paginated Query and Scan strips non-key attributes.
+    let lsi_kc = parse_kc("pk = :p");
+    let mut lsi_maps = ExpressionMaps::default();
+    lsi_maps
+        .values
+        .insert("p".into(), AttributeValue::S("p1".into()));
+    let (lsi_page1, lsi_lek1) = ctx
+        .engine
+        .query(
+            &key_info,
+            &lsi_kc,
+            &lsi_maps,
+            true,
+            Some(2),
+            None,
+            Some("lsi_keys_only"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(lsi_page1.len(), 2);
+    assert!(lsi_lek1.is_some());
+    let (lsi_page2, _) = ctx
+        .engine
+        .query(
+            &key_info,
+            &lsi_kc,
+            &lsi_maps,
+            true,
+            Some(10),
+            lsi_lek1.as_ref(),
+            Some("lsi_keys_only"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(lsi_page2.len(), 3);
+    for it in lsi_page1.iter().chain(lsi_page2.iter()) {
+        assert!(!it.contains_key("secret_payload"));
+    }
+    let (lsi_s_items, _) = ctx
+        .engine
+        .scan(&key_info, None, None, None, None, Some("lsi_keys_only"))
+        .await
+        .unwrap();
+    assert_eq!(lsi_s_items.len(), 5);
+    for it in &lsi_s_items {
+        assert!(!it.contains_key("secret_payload"));
+    }
+
+    // 6. TransactWriteItems key-fault precedence & empty index key handling.
+    let cond_never = parse_cond("attribute_not_exists(pk)");
+    let valid_k0 = s_item(&[("pk", "p1"), ("sk", "A")]);
+    let mut bad_k1 = Item::new();
+    bad_k1.insert("pk".into(), AttributeValue::N("999".into()));
+    bad_k1.insert("sk".into(), AttributeValue::S("AB".into()));
+    let prec_res = ctx
+        .engine
+        .transact_write_items(
+            &[
+                TransactWriteOp::ConditionCheck {
+                    key_info: &key_info,
+                    key: &valid_k0,
+                    condition: &cond_never,
+                    maps: &empty_maps,
+                    return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+                },
+                TransactWriteOp::Delete {
+                    key_info: &key_info,
+                    key: &bad_k1,
+                    condition: None,
+                    maps: &empty_maps,
+                    return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+                    stream: None,
+                },
+            ],
+            None,
+        )
+        .await;
+    match prec_res {
+        Err(StorageError::TransactionCanceled(reasons)) => {
+            assert_eq!(reasons.len(), 2);
+            assert_eq!(reasons[0].code, "None");
+            assert_eq!(reasons[1].code, "ValidationError");
+        }
+        other => panic!("expected TransactionCanceled with ValidationError, got {other:?}"),
+    }
+
+    let empty_idx_item = s_item(&[("pk", "p1"), ("sk", "s_empty"), ("h1", "")]);
+    let empty_only_err = ctx
+        .engine
+        .transact_write_items(
+            &[TransactWriteOp::Put {
+                key_info: &key_info,
+                item: &empty_idx_item,
+                condition: None,
+                maps: &empty_maps,
+                return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+                stream: None,
+            }],
+            None,
+        )
+        .await;
+    assert!(matches!(empty_only_err, Err(StorageError::Validation(_))));
+
+    // 7. max_item_size_bytes enforced on both UpdateItem and TransactWriteItems Update.
+    let capped_engine = BigtableEngine::with_options(
+        ctx.client.clone(),
+        ctx.client.clone(),
+        60,
+        "us-east-1".into(),
+        128,
+    );
+    let big_acts = parse_upd("SET big = :b");
+    let mut big_maps = ExpressionMaps::default();
+    big_maps
+        .values
+        .insert("b".into(), AttributeValue::S("x".repeat(256)));
+    let upd_size_err = capped_engine
+        .update_item(
+            &key_info, &valid_k0, &big_acts, false, false, None, &big_maps, None,
+        )
+        .await;
+    assert!(matches!(upd_size_err, Err(StorageError::Validation(_))));
+    let twi_size_err = capped_engine
+        .transact_write_items(
+            &[TransactWriteOp::Update {
+                key_info: &key_info,
+                key: &valid_k0,
+                actions: &big_acts,
+                condition: None,
+                maps: &big_maps,
+                return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+                stream: None,
+            }],
+            None,
+        )
+        .await;
+    match twi_size_err {
+        Err(StorageError::TransactionCanceled(reasons)) => {
+            assert_eq!(reasons[0].code, "ValidationError");
+        }
+        other => panic!("expected TransactionCanceled ValidationError, got {other:?}"),
+    }
+}
+
 #[test]
 fn test_required_flag_parsing() {
     assert!(!is_required_flag_enabled(None));

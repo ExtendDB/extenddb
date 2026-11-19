@@ -26,8 +26,6 @@ use extenddb_storage::management_store::{
 use extenddb_storage::secret_keys::{SecretKeys, SecretRow, SecretTable, require_keys};
 use futures::future::BoxFuture;
 use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::row_range::{EndKey, StartKey};
-use rand::TryRngCore as _;
-use rand::rngs::OsRng;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
@@ -58,31 +56,26 @@ fn parse_created_at(v: &serde_json::Value) -> OffsetDateTime {
         .unwrap_or(OffsetDateTime::UNIX_EPOCH)
 }
 
-fn generate_access_key_id(prefix: &str) -> OpResult<String> {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-    let mut bytes = [0u8; 16];
-    OsRng
-        .try_fill_bytes(&mut bytes)
-        .map_err(|e| OpError::Internal(format!("osrng access_key_id: {e}")))?;
-    let mut out = String::with_capacity(prefix.len() + 16);
-    out.push_str(prefix);
-    for b in bytes {
-        out.push(ALPHABET[usize::from(b) % ALPHABET.len()] as char);
-    }
-    Ok(out)
+/// Generate a 20-character access key ID (`AKIAEXTENDDB` + 8 uppercase
+/// alphanumerics), matching the branded prefix convention across ExtendDB
+/// backends so local keys are distinguishable from AWS IAM keys.
+fn generate_access_key_id() -> String {
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut rng = rand::rng();
+    let suffix: String = (0..8)
+        .map(|_| CHARSET[rand::Rng::random_range(&mut rng, 0..CHARSET.len())] as char)
+        .collect();
+    format!("AKIAEXTENDDB{suffix}")
 }
 
-fn generate_secret_access_key() -> OpResult<String> {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut bytes = [0u8; 40];
-    OsRng
-        .try_fill_bytes(&mut bytes)
-        .map_err(|e| OpError::Internal(format!("osrng secret_access_key: {e}")))?;
-    let mut out = String::with_capacity(40);
-    for b in bytes {
-        out.push(ALPHABET[usize::from(b) % ALPHABET.len()] as char);
-    }
-    Ok(out)
+/// Generate a 40-character secret access key (`extenddb` + 32 base64 characters).
+fn generate_secret_access_key() -> String {
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut rng = rand::rng();
+    let suffix: String = (0..32)
+        .map(|_| CHARSET[rand::Rng::random_range(&mut rng, 0..CHARSET.len())] as char)
+        .collect();
+    format!("extenddb{suffix}")
 }
 
 fn self_service_policy(user_arn: &str) -> serde_json::Value {
@@ -371,16 +364,27 @@ impl SettingsStore for BigtableCatalogStore {
     fn get_setting(&self, key: &str) -> BoxFuture<'_, OpResult<Option<String>>> {
         let key = key.to_owned();
         Box::pin(async move {
-            let row = self
-                .cat()
+            let cat = self.cat();
+            let row = cat
                 .get(&keys::setting(&key))
                 .await
                 .map_err(OpError::Internal)?;
-            Ok(row.and_then(|v| {
+            if let Some(val) = row.and_then(|v| {
                 v.get("value")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned)
-            }))
+            }) {
+                return Ok(Some(val));
+            }
+            if key == "catalog_version" {
+                let ver_row = cat.get(keys::VERSION).await.map_err(OpError::Internal)?;
+                return Ok(ver_row.and_then(|v| {
+                    v.get("catalog_version")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                }));
+            }
+            Ok(None)
         })
     }
 
@@ -434,8 +438,8 @@ impl SettingsStore for BigtableCatalogStore {
 
     fn list_settings(&self) -> BoxFuture<'_, OpResult<Vec<(String, String)>>> {
         Box::pin(async move {
-            let rows = self
-                .cat()
+            let cat = self.cat();
+            let rows = cat
                 .scan_prefix(keys::SETTING_SCAN_PREFIX)
                 .await
                 .map_err(OpError::Internal)?;
@@ -454,6 +458,14 @@ impl SettingsStore for BigtableCatalogStore {
                     Some((k, val))
                 })
                 .collect();
+            if !out.iter().any(|(k, _)| k == "catalog_version")
+                && let Some(ver_row) = cat.get(keys::VERSION).await.map_err(OpError::Internal)?
+                && let Some(ver) = ver_row
+                    .get("catalog_version")
+                    .and_then(serde_json::Value::as_str)
+            {
+                out.push(("catalog_version".to_owned(), ver.to_owned()));
+            }
             out.sort_by(|a, b| a.0.cmp(&b.0));
             Ok(out)
         })
@@ -958,7 +970,8 @@ impl ManagementStore for BigtableCatalogStore {
                 .map_err(OpError::Internal)?;
             if !tables.is_empty() {
                 return Err(OpError::HasDependents(
-                    "Account still owns DynamoDB tables".to_owned(),
+                    "Cannot delete account with existing tables. Delete all tables first."
+                        .to_owned(),
                 ));
             }
 
@@ -2155,10 +2168,10 @@ impl ManagementStore for BigtableCatalogStore {
             {
                 return Err(OpError::NotFound("IAM user not found".to_owned()));
             }
-            let secret_access_key = generate_secret_access_key()?;
+            let secret_access_key = generate_secret_access_key();
             let now = now_rfc3339();
             for _ in 0..8 {
-                let access_key_id = generate_access_key_id("AKIA")?;
+                let access_key_id = generate_access_key_id();
                 let aad = SecretRow::access_key(&access_key_id, &account_id, &user_name);
                 let sealed = keys_holder
                     .encrypt(&aad, &secret_access_key)

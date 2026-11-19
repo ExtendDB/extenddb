@@ -8,11 +8,19 @@
 //! 50-char table-id limit).
 //!
 //! GSI Index Row Key layout:
-//! `[gsi_pk_tag:1][gsi_pk_len:4][gsi_pk_bytes] [gsi_sk_tag:1][escape_encoded(gsi_sk_bytes)][0x00 0x00] [base_pk_tag:1][base_pk_len:4][base_pk_bytes] [base_sk_tag:1][base_sk_bytes]`
+//! - Single-HASH GSI partition prefix: `[gsi_pk_tag:1][gsi_pk_len:4][gsi_pk_bytes]`
+//! - Multi-HASH GSI partition prefix (`2..=4` HASH keys):
+//!   `[0x4D ('M'):1][inner_len:4][([tag_i:1][len_i:4][bytes_i])...]`
+//! - Followed by zero or more GSI sort-key segments (`0..=4` RANGE keys in schema order):
+//!   `([gsi_sk_tag_j:1][escape_encoded(gsi_sk_bytes_j)][0x00 0x00])...`
+//! - Followed by base table key suffix:
+//!   `[base_pk_tag:1][base_pk_len:4][base_pk_bytes] ([base_sk_tag:1][base_sk_bytes])?`
 //!
-//! The non-terminal `gsi_sk` segment is encoded using FoundationDB tuple
-//! order-preserving escape encoding (0x00 -> 0x00 0xFF, terminated with 0x00 0x00).
-//! The terminal `base_sk` segment remains raw bytes to the end of the row key.
+//! Non-terminal `gsi_sk` segments are encoded using FoundationDB tuple
+//! order-preserving escape encoding (`0x00 -> 0x00 0xFF`, terminated with `0x00 0x00`),
+//! so Bigtable's natural row-key byte order matches DynamoDB's lexicographic order
+//! across all `RANGE` attributes and base-key tie-breakers. The terminal `base_sk`
+//! segment remains raw bytes to the end of the row key.
 
 use std::collections::BTreeMap;
 
@@ -106,8 +114,47 @@ pub fn is_shadow_table_id(table_id_short: &str) -> bool {
     table_id_short.contains("_g")
 }
 
+/// Outer partition-prefix tag for multi-HASH (`2..=4` HASH keys) GSI shadow rows.
+/// Distinct from `S` (`0x53`), `N` (`0x4E`), and `B` (`0x42`).
+pub const TAG_MULTI_HASH: u8 = 0x4D;
+
 fn tag_bytes_for(av: &AttributeValue) -> Result<(u8, Vec<u8>), StorageError> {
     row_key::sk_tag_and_bytes(av)
+}
+
+/// Encode `1..=4` HASH attribute values (in key-schema order) into a self-delimiting
+/// `[tag:1][len:4][payload]` partition prefix.
+///
+/// For a single HASH key, this matches `row_key::pk_range_start` byte-for-byte.
+/// For multiple HASH keys, each part is length-framed inside a `TAG_MULTI_HASH`
+/// (`0x4D`) outer `[tag:1][len:4][inner]` envelope so `pk_prefix_slice` and
+/// parallel-scan CRC32 segment hashing work uniformly.
+pub fn encode_gsi_pk_prefix(hash_vals: &[&AttributeValue]) -> Result<Vec<u8>, StorageError> {
+    match hash_vals {
+        [] => Err(StorageError::Validation("GSI missing HASH key".into())),
+        [single] => {
+            let (tag, bytes) = tag_bytes_for(single)?;
+            let mut out = Vec::with_capacity(5 + bytes.len());
+            out.push(tag);
+            out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            out.extend_from_slice(&bytes);
+            Ok(out)
+        }
+        many => {
+            let mut inner = Vec::with_capacity(many.len() * 16);
+            for v in many {
+                let (tag, bytes) = tag_bytes_for(v)?;
+                inner.push(tag);
+                inner.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+                inner.extend_from_slice(&bytes);
+            }
+            let mut out = Vec::with_capacity(5 + inner.len());
+            out.push(TAG_MULTI_HASH);
+            out.extend_from_slice(&(inner.len() as u32).to_be_bytes());
+            out.extend_from_slice(&inner);
+            Ok(out)
+        }
+    }
 }
 
 /// Build the shadow row key for a given item, knowing both the GSI key schema
@@ -119,26 +166,36 @@ pub fn shadow_row_key_for_item(
     gsi_key_schema: &[KeySchemaElement],
     base_key_schema: &[KeySchemaElement],
 ) -> Result<Option<Vec<u8>>, StorageError> {
-    let mut out = Vec::with_capacity(64);
-
-    // GSI partition key (HASH) — required for the index entry to exist.
-    let gsi_pk = gsi_key_schema
+    let mut hash_vals: Vec<&AttributeValue> = Vec::with_capacity(4);
+    for ks in gsi_key_schema
         .iter()
-        .find(|k| k.key_type == KeyType::Hash)
-        .ok_or_else(|| StorageError::Validation("GSI missing HASH key".into()))?;
-    let Some(pk_val) = item.get(&gsi_pk.attribute_name) else {
-        return Ok(None);
-    };
-    let (tag, bytes) = tag_bytes_for(pk_val)?;
-    out.push(tag);
-    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-    out.extend_from_slice(&bytes);
-
-    // GSI sort key (optional) — non-terminal, escape-encoded with 0x00 0x00 terminator.
-    if let Some(gsi_sk) = gsi_key_schema.iter().find(|k| k.key_type == KeyType::Range) {
-        let Some(sk_val) = item.get(&gsi_sk.attribute_name) else {
+        .filter(|k| k.key_type == KeyType::Hash)
+    {
+        let Some(val) = item.get(&ks.attribute_name) else {
             return Ok(None);
         };
+        hash_vals.push(val);
+    }
+    if hash_vals.is_empty() {
+        return Err(StorageError::Validation("GSI missing HASH key".into()));
+    }
+
+    let mut range_vals: Vec<&AttributeValue> = Vec::with_capacity(4);
+    for ks in gsi_key_schema
+        .iter()
+        .filter(|k| k.key_type == KeyType::Range)
+    {
+        let Some(val) = item.get(&ks.attribute_name) else {
+            return Ok(None);
+        };
+        range_vals.push(val);
+    }
+
+    let mut out = encode_gsi_pk_prefix(&hash_vals)?;
+
+    // GSI sort keys (`0..=4` RANGE attributes in schema order) — each non-terminal,
+    // escape-encoded with `0x00 0x00` terminator.
+    for sk_val in range_vals {
         let (tag, bytes) = tag_bytes_for(sk_val)?;
         out.push(tag);
         let escaped = escape_bytes_terminated(&bytes);
@@ -213,11 +270,14 @@ pub fn decode_shadow_row_key(
     let mut idx = 0;
     let mut item = Item::new();
 
-    // 1. Decode GSI PK
-    let gsi_pk = gsi_key_schema
+    // 1. Decode GSI PK(s)
+    let hash_elems: Vec<&KeySchemaElement> = gsi_key_schema
         .iter()
-        .find(|k| k.key_type == KeyType::Hash)
-        .ok_or_else(|| StorageError::Validation("GSI missing HASH key".into()))?;
+        .filter(|k| k.key_type == KeyType::Hash)
+        .collect();
+    if hash_elems.is_empty() {
+        return Err(StorageError::Validation("GSI missing HASH key".into()));
+    }
     if key.len() < idx + 5 {
         return Err(StorageError::Internal(
             "malformed shadow row key (GSI PK header)".into(),
@@ -238,11 +298,52 @@ pub fn decode_shadow_row_key(
     }
     let gsi_pk_bytes = &key[idx..idx + gsi_pk_len];
     idx += gsi_pk_len;
-    let gsi_pk_val = decode_attr_value(gsi_pk_tag, gsi_pk_bytes)?;
-    item.insert(gsi_pk.attribute_name.clone(), gsi_pk_val);
 
-    // 2. Decode GSI SK (if present)
-    if let Some(gsi_sk) = gsi_key_schema.iter().find(|k| k.key_type == KeyType::Range) {
+    if hash_elems.len() == 1 {
+        let gsi_pk_val = decode_attr_value(gsi_pk_tag, gsi_pk_bytes)?;
+        item.insert(hash_elems[0].attribute_name.clone(), gsi_pk_val);
+    } else {
+        if gsi_pk_tag != TAG_MULTI_HASH {
+            return Err(StorageError::Internal(format!(
+                "expected multi-HASH tag 0x{TAG_MULTI_HASH:02X}, got 0x{gsi_pk_tag:02X}"
+            )));
+        }
+        let mut inner_idx = 0usize;
+        for he in &hash_elems {
+            if gsi_pk_bytes.len() < inner_idx + 5 {
+                return Err(StorageError::Internal(
+                    "malformed multi-HASH GSI PK part header".into(),
+                ));
+            }
+            let p_tag = gsi_pk_bytes[inner_idx];
+            inner_idx += 1;
+            let p_len = u32::from_be_bytes(
+                gsi_pk_bytes[inner_idx..inner_idx + 4]
+                    .try_into()
+                    .map_err(|_| StorageError::Internal("multi-HASH part len".into()))?,
+            ) as usize;
+            inner_idx += 4;
+            if gsi_pk_bytes.len() < inner_idx + p_len {
+                return Err(StorageError::Internal(
+                    "malformed multi-HASH GSI PK part bytes".into(),
+                ));
+            }
+            let p_val = decode_attr_value(p_tag, &gsi_pk_bytes[inner_idx..inner_idx + p_len])?;
+            inner_idx += p_len;
+            item.insert(he.attribute_name.clone(), p_val);
+        }
+        if inner_idx != gsi_pk_bytes.len() {
+            return Err(StorageError::Internal(
+                "trailing bytes in multi-HASH GSI PK envelope".into(),
+            ));
+        }
+    }
+
+    // 2. Decode GSI SK(s) (in schema order)
+    for gsi_sk in gsi_key_schema
+        .iter()
+        .filter(|k| k.key_type == KeyType::Range)
+    {
         if key.len() < idx + 1 {
             return Err(StorageError::Internal(
                 "missing GSI SK tag in shadow row key".into(),
@@ -525,6 +626,98 @@ mod tests {
                 assert!(msg.contains("exceeds Bigtable maximum limit of 4096 bytes"));
             }
             other => panic!("expected Validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_multi_hash_and_multi_range_shadow_keys_order_and_round_trip() {
+        let base_ks = vec![ks("pk", KeyType::Hash)];
+        let gsi_ks = vec![
+            ks("h1", KeyType::Hash),
+            ks("h2", KeyType::Hash),
+            ks("r1", KeyType::Range),
+            ks("r2", KeyType::Range),
+            ks("r3", KeyType::Range),
+        ];
+
+        // Delimiter safety across composite HASH keys: ("ab", "c") != ("a", "bc").
+        let mk_hash = |h1: &str, h2: &str| {
+            let mut it = BTreeMap::new();
+            it.insert("pk".into(), AttributeValue::S("p1".into()));
+            it.insert("h1".into(), AttributeValue::S(h1.into()));
+            it.insert("h2".into(), AttributeValue::S(h2.into()));
+            it.insert("r1".into(), AttributeValue::S("T".into()));
+            it.insert("r2".into(), AttributeValue::S("live".into()));
+            it.insert("r3".into(), AttributeValue::N("10".into()));
+            it
+        };
+        let k_ab_c = shadow_row_key_for_item(&mk_hash("ab", "c"), &gsi_ks, &base_ks)
+            .unwrap()
+            .unwrap();
+        let k_a_bc = shadow_row_key_for_item(&mk_hash("a", "bc"), &gsi_ks, &base_ks)
+            .unwrap()
+            .unwrap();
+        assert_ne!(k_ab_c, k_a_bc);
+
+        // Sparse-index rule: missing any HASH or RANGE attribute omits the entry.
+        let mut missing_h2 = mk_hash("a", "b");
+        missing_h2.remove("h2");
+        assert!(
+            shadow_row_key_for_item(&missing_h2, &gsi_ks, &base_ks)
+                .unwrap()
+                .is_none()
+        );
+        let mut missing_r3 = mk_hash("a", "b");
+        missing_r3.remove("r3");
+        assert!(
+            shadow_row_key_for_item(&missing_r3, &gsi_ks, &base_ks)
+                .unwrap()
+                .is_none()
+        );
+
+        // Round-trip decode of multi-HASH + multi-RANGE shadow key.
+        let orig = mk_hash("tenant:1", "region\x00us");
+        let enc = shadow_row_key_for_item(&orig, &gsi_ks, &base_ks)
+            .unwrap()
+            .unwrap();
+        let dec = decode_shadow_row_key(&enc, &gsi_ks, &base_ks).unwrap();
+        for attr in ["pk", "h1", "h2", "r1", "r2"] {
+            assert_eq!(orig.get(attr), dec.get(attr), "mismatch on {attr}");
+        }
+        match (orig.get("r3"), dec.get("r3")) {
+            (Some(AttributeValue::N(a)), Some(AttributeValue::N(b))) => {
+                use std::str::FromStr;
+                assert_eq!(
+                    bigdecimal::BigDecimal::from_str(a).unwrap(),
+                    bigdecimal::BigDecimal::from_str(b).unwrap(),
+                    "numeric mismatch on r3"
+                );
+            }
+            other => panic!("expected numeric r3 round-trip, got {other:?}"),
+        }
+
+        // Lexicographic order across (r1, r2, r3, pk).
+        let mk_row = |pk: &str, r1: &str, r2: &str, r3: &str| {
+            let mut it = BTreeMap::new();
+            it.insert("pk".into(), AttributeValue::S(pk.into()));
+            it.insert("h1".into(), AttributeValue::S("t1".into()));
+            it.insert("h2".into(), AttributeValue::S("us".into()));
+            it.insert("r1".into(), AttributeValue::S(r1.into()));
+            it.insert("r2".into(), AttributeValue::S(r2.into()));
+            it.insert("r3".into(), AttributeValue::N(r3.into()));
+            shadow_row_key_for_item(&it, &gsi_ks, &base_ks)
+                .unwrap()
+                .unwrap()
+        };
+        let ordered = [
+            mk_row("p5", "F", "live", "100"),
+            mk_row("p4", "T", "draft", "50"),
+            mk_row("p3", "T", "live", "-5"),
+            mk_row("p2", "T", "live", "2"),
+            mk_row("p1", "T", "live", "10"),
+        ];
+        for w in ordered.windows(2) {
+            assert!(w[0] < w[1]);
         }
     }
 }

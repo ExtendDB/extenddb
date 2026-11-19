@@ -35,6 +35,12 @@ pub use engine::BigtableEngine;
 /// Backend identifier registered with ExtendDB.
 pub const BACKEND_NAME: &str = "bigtable";
 
+/// Default control-plane transition delay (`control_plane_delay_seconds`) in seconds.
+pub(crate) const DEFAULT_CONTROL_PLANE_DELAY_SECONDS: f64 = 0.25;
+
+/// Default GSI propagation delay (`index_propagation_delay_ms`) in milliseconds.
+pub(crate) const DEFAULT_INDEX_PROPAGATION_DELAY_MS: u64 = 10;
+
 async fn catalog_store_from_connection_string(
     connection_string: &str,
 ) -> Result<BigtableCatalogStore, String> {
@@ -118,6 +124,7 @@ fn server_components_factory(
 > {
     let conn_str = config.connection_config().to_string();
     let region = region.to_owned();
+    let max_item_size_bytes = options.max_item_size_bytes;
     let key_source = std::mem::take(&mut options.key_source);
     Box::pin(async move {
         let cfg = crate::config::BigtableStorageConfig::from_connection_string(&conn_str)
@@ -155,11 +162,12 @@ fn server_components_factory(
             _ => client.clone(),
         };
 
-        let engine_concrete = std::sync::Arc::new(BigtableEngine::with_region(
+        let engine_concrete = std::sync::Arc::new(BigtableEngine::with_options(
             client.clone(),
             data_client,
             cfg.intent_timeout_secs,
             region,
+            max_item_size_bytes,
         ));
         let engine = engine_concrete.clone() as std::sync::Arc<dyn extenddb_storage::StorageEngine>;
         let catalog_store = std::sync::Arc::new(BigtableCatalogStore::new(

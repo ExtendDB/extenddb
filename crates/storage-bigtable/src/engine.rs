@@ -354,6 +354,7 @@ pub struct BigtableEngine {
     catalog_client: Arc<BigtableClient>,
     client: Arc<BigtableClient>,
     intent_timeout_secs: u64,
+    max_item_size_bytes: usize,
     metadata_cache: Cache<(String, String), (String, TableDescription, Option<String>)>,
     single_write_locks: std::sync::Mutex<SingleWriteLockMap>,
     building_gsis: std::sync::Mutex<HashSet<(String, String)>>,
@@ -381,6 +382,22 @@ impl BigtableEngine {
         intent_timeout_secs: u64,
         region: String,
     ) -> Self {
+        Self::with_options(
+            catalog_client,
+            data_client,
+            intent_timeout_secs,
+            region,
+            extenddb_core::limits::LimitsConfig::default().max_item_size_bytes,
+        )
+    }
+
+    pub fn with_options(
+        catalog_client: Arc<BigtableClient>,
+        data_client: Arc<BigtableClient>,
+        intent_timeout_secs: u64,
+        region: String,
+        max_item_size_bytes: usize,
+    ) -> Self {
         let metadata_cache = Cache::builder()
             .time_to_live(Duration::from_secs(5))
             .build();
@@ -389,12 +406,27 @@ impl BigtableEngine {
             catalog_client,
             client: data_client,
             intent_timeout_secs,
+            max_item_size_bytes,
             metadata_cache,
             single_write_locks: std::sync::Mutex::new(HashMap::new()),
             building_gsis: std::sync::Mutex::new(HashSet::new()),
             node_id,
             region,
         }
+    }
+
+    async fn control_plane_delay_secs(&self) -> f64 {
+        self.cat()
+            .get(&keys::setting("control_plane_delay_seconds"))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| {
+                v.get("value")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|s| s.parse::<f64>().ok())
+            })
+            .unwrap_or(crate::DEFAULT_CONTROL_PLANE_DELAY_SECONDS)
     }
 
     async fn acquire_single_write_lock(
@@ -632,6 +664,63 @@ impl BigtableEngine {
             .map_err(|e| StorageError::Validation(e.to_string()))?;
         }
         Ok(())
+    }
+
+    fn transact_op_key_checks(
+        op: &OwnedTxnOp,
+        desc: &TableDescription,
+    ) -> Result<(), extenddb_core::types::CancellationReason> {
+        use extenddb_core::types::CancellationReason;
+        use extenddb_core::validation;
+
+        let idx_refs = Self::index_key_refs(desc);
+        match &op.kind {
+            OwnedTxnKind::Put { item } => {
+                validation::validate_item_keys(item, &desc.key_schema, &desc.attribute_definitions)
+                    .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))?;
+                if !idx_refs.is_empty() {
+                    validation::validate_index_key_types(
+                        item,
+                        &idx_refs,
+                        &desc.attribute_definitions,
+                    )
+                    .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))?;
+                    validation::validate_index_key_not_empty(
+                        item,
+                        &idx_refs,
+                        validation::SecondaryIndexEmptyContext::Item,
+                    )
+                    .map_err(|e| CancellationReason::index_key_empty_abort(e.to_string()))?;
+                }
+                Ok(())
+            }
+            OwnedTxnKind::Update { key, actions } => {
+                validation::validate_batch_key_only(
+                    key,
+                    &desc.key_schema,
+                    &desc.attribute_definitions,
+                )
+                .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))?;
+                if !idx_refs.is_empty() {
+                    validation::validate_index_key_literal_operands(
+                        actions,
+                        &idx_refs,
+                        &desc.attribute_definitions,
+                        &op.maps,
+                    )
+                    .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))?;
+                }
+                Ok(())
+            }
+            OwnedTxnKind::Delete { key } | OwnedTxnKind::ConditionCheck { key } => {
+                validation::validate_batch_key_only(
+                    key,
+                    &desc.key_schema,
+                    &desc.attribute_definitions,
+                )
+                .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))
+            }
+        }
     }
 
     /// Look up the BigTable data-table short name for `(account, table_name)`.
@@ -1386,6 +1475,13 @@ impl BigtableEngine {
                         &desc.attribute_definitions,
                     )
                     .and_then(|u| {
+                        extenddb_core::validation::validate_update_item_size(
+                            &u,
+                            actions,
+                            maps,
+                            self.max_item_size_bytes,
+                        )
+                        .map_err(|e| StorageError::Validation(e.to_string()))?;
                         Self::validate_updated_item_index_keys(desc, &u)?;
                         Ok(u)
                     }) {
@@ -1894,7 +1990,8 @@ impl TableEngine for BigtableEngine {
                 }
             }
 
-            let billing = input.billing_mode.unwrap_or(BillingMode::PayPerRequest);
+            let delay_secs = self.control_plane_delay_secs().await;
+            let billing = input.billing_mode.unwrap_or(BillingMode::Provisioned);
             let throughput = match input.provisioned_throughput {
                 Some(p) => ProvisionedThroughputDescription {
                     read_capacity_units: p.read_capacity_units,
@@ -1915,14 +2012,18 @@ impl TableEngine for BigtableEngine {
                         key_schema: g.key_schema.clone(),
                         projection: g.projection.clone(),
                         index_status: "ACTIVE".to_string(),
-                        provisioned_throughput: g.provisioned_throughput.as_ref().map(|p| {
-                            ProvisionedThroughputDescription {
-                                read_capacity_units: p.read_capacity_units,
-                                write_capacity_units: p.write_capacity_units,
-                                number_of_decreases_today: 0,
-                                last_increase_date_time: None,
-                                last_decrease_date_time: None,
-                            }
+                        provisioned_throughput: Some(ProvisionedThroughputDescription {
+                            read_capacity_units: g
+                                .provisioned_throughput
+                                .as_ref()
+                                .map_or(0, |p| p.read_capacity_units),
+                            write_capacity_units: g
+                                .provisioned_throughput
+                                .as_ref()
+                                .map_or(0, |p| p.write_capacity_units),
+                            number_of_decreases_today: 0,
+                            last_increase_date_time: None,
+                            last_decrease_date_time: None,
                         }),
                         index_size_bytes: 0,
                         item_count: 0,
@@ -1930,7 +2031,7 @@ impl TableEngine for BigtableEngine {
                         warm_throughput: None,
                         warm_throughput_record: warm_throughput_record_for_create(
                             g.warm_throughput.as_ref(),
-                            0.0,
+                            delay_secs,
                         ),
                     })
                     .collect()
@@ -1990,23 +2091,26 @@ impl TableEngine for BigtableEngine {
                 .as_ref()
                 .map(|tc| json!({ "TableClass": tc }));
             let table_wt_record =
-                warm_throughput_record_for_create(input.warm_throughput.as_ref(), 0.0);
+                warm_throughput_record_for_create(input.warm_throughput.as_ref(), delay_secs);
+            let creation_date_time = now_unix_f64();
 
             let description = TableDescription {
                 table_name: input.table_name.clone(),
                 key_schema: input.key_schema,
                 attribute_definitions: input.attribute_definitions,
                 table_status: TableStatus::Active,
-                creation_date_time: now_unix_f64(),
+                creation_date_time,
                 table_size_bytes: 0,
                 item_count: 0,
                 table_arn,
                 table_id: table_id.clone(),
                 provisioned_throughput: throughput,
-                billing_mode_summary: Some(BillingModeSummary {
-                    billing_mode: billing,
-                    last_update_to_pay_per_request_date_time: None,
-                }),
+                billing_mode_summary: (billing == BillingMode::PayPerRequest).then_some(
+                    BillingModeSummary {
+                        billing_mode: BillingMode::PayPerRequest,
+                        last_update_to_pay_per_request_date_time: Some(creation_date_time),
+                    },
+                ),
                 global_secondary_indexes: gsis,
                 local_secondary_indexes: lsis,
                 stream_specification: input.stream_specification,
@@ -2294,6 +2398,7 @@ impl TableEngine for BigtableEngine {
                 }
             }
 
+            let delay_secs = self.control_plane_delay_secs().await;
             let region = self.region.clone();
             let acct_for_cas = account_id.clone();
             let input_for_cas = input.clone();
@@ -2361,19 +2466,13 @@ impl TableEngine for BigtableEngine {
                                     ProvisionedThroughputDescription::default();
                                 if let Some(gsis) = description.global_secondary_indexes.as_mut() {
                                     for g in gsis.iter_mut() {
-                                        g.provisioned_throughput = None;
+                                        g.provisioned_throughput =
+                                            Some(ProvisionedThroughputDescription::default());
                                     }
                                 }
                             }
                             BillingMode::Provisioned => {
-                                let prev_ts = description
-                                    .billing_mode_summary
-                                    .as_ref()
-                                    .and_then(|s| s.last_update_to_pay_per_request_date_time);
-                                description.billing_mode_summary = Some(BillingModeSummary {
-                                    billing_mode: BillingMode::Provisioned,
-                                    last_update_to_pay_per_request_date_time: prev_ts,
-                                });
+                                description.billing_mode_summary = None;
                             }
                         }
                     }
@@ -2398,8 +2497,9 @@ impl TableEngine for BigtableEngine {
                             .as_ref()
                             .map(warm_throughput_record_json)
                             .transpose()?;
-                        description.warm_throughput_record =
-                            Some(warm_throughput_record_for_update(prev_json.as_deref(), wt, 0.0));
+                        description.warm_throughput_record = Some(
+                            warm_throughput_record_for_update(prev_json.as_deref(), wt, delay_secs),
+                        );
                     }
 
                     let mut created_gsis: Vec<GsiDescription> = Vec::new();
@@ -2420,24 +2520,10 @@ impl TableEngine for BigtableEngine {
                             ));
                         }
 
-                        // Check attribute definition type consistency against existing defs.
                         let req_attrs = input_for_cas
                             .attribute_definitions
                             .as_deref()
                             .unwrap_or(&[]);
-                        for req_ad in req_attrs {
-                            if let Some(existing_ad) = description
-                                .attribute_definitions
-                                .iter()
-                                .find(|a| a.attribute_name == req_ad.attribute_name)
-                                && existing_ad.attribute_type != req_ad.attribute_type
-                            {
-                                return Err(StorageError::Validation(format!(
-                                    "AttributeDefinition type mismatch for '{}'",
-                                    req_ad.attribute_name
-                                )));
-                            }
-                        }
 
                         for upd_action in updates {
                             let action_count = usize::from(upd_action.create.is_some())
@@ -2477,7 +2563,7 @@ impl TableEngine for BigtableEngine {
                                         warm_throughput_record_for_update(
                                             prev_json.as_deref(),
                                             wt,
-                                            0.0,
+                                            delay_secs,
                                         ),
                                     );
                                 }
@@ -2559,16 +2645,21 @@ impl TableEngine for BigtableEngine {
                                     key_schema: create.key_schema.clone(),
                                     projection: create.projection.clone(),
                                     index_status: "CREATING".to_string(),
-                                    provisioned_throughput: create
-                                        .provisioned_throughput
-                                        .as_ref()
-                                        .map(|p| ProvisionedThroughputDescription {
-                                            read_capacity_units: p.read_capacity_units,
-                                            write_capacity_units: p.write_capacity_units,
+                                    provisioned_throughput: Some(
+                                        ProvisionedThroughputDescription {
+                                            read_capacity_units: create
+                                                .provisioned_throughput
+                                                .as_ref()
+                                                .map_or(0, |p| p.read_capacity_units),
+                                            write_capacity_units: create
+                                                .provisioned_throughput
+                                                .as_ref()
+                                                .map_or(0, |p| p.write_capacity_units),
                                             number_of_decreases_today: 0,
                                             last_increase_date_time: None,
                                             last_decrease_date_time: None,
-                                        }),
+                                        },
+                                    ),
                                     index_size_bytes: 0,
                                     item_count: 0,
                                     index_arn: format!(
@@ -2578,7 +2669,7 @@ impl TableEngine for BigtableEngine {
                                     warm_throughput: None,
                                     warm_throughput_record: warm_throughput_record_for_create(
                                         create.warm_throughput.as_ref(),
-                                        0.0,
+                                        delay_secs,
                                     ),
                                 };
                                 description
@@ -3371,6 +3462,13 @@ impl DataEngine for BigtableEngine {
                     &key_info,
                     &desc.attribute_definitions,
                 )?;
+                extenddb_core::validation::validate_update_item_size(
+                    &new_item,
+                    &actions,
+                    &maps,
+                    self.max_item_size_bytes,
+                )
+                .map_err(|e| StorageError::Validation(e.to_string()))?;
                 Self::validate_updated_item_index_keys(&desc, &new_item)?;
 
                 if existing.is_none() && removes_only(&actions) {
@@ -3477,6 +3575,7 @@ impl DataEngine for BigtableEngine {
                             .query_lsi(
                                 &base_ki,
                                 &lsi.key_schema,
+                                &lsi.projection,
                                 &kc,
                                 &maps,
                                 forward,
@@ -3541,14 +3640,7 @@ impl DataEngine for BigtableEngine {
                             .await
                     } else if let Some(lsi) = lsis.iter().find(|l| l.index_name == idx_name) {
                         QueryScan::new(&self.client, &data_table)
-                            .scan_lsi(
-                                &base_ki,
-                                &lsi.key_schema,
-                                limit,
-                                esk.as_ref(),
-                                segment,
-                                total_segments,
-                            )
+                            .scan_lsi(&base_ki, lsi, limit, esk.as_ref(), segment, total_segments)
                             .await
                     } else {
                         Err(StorageError::IndexNotFound(idx_name))
@@ -3883,28 +3975,44 @@ impl DataEngine for BigtableEngine {
                 self.check_idempotency_record(acct, tok, fp).await?;
             }
 
+            let mut pre_resolved = Vec::with_capacity(owned.len());
+            for op in owned {
+                let (data_table, desc, ttl_attr) = self.table_full_meta_for(&op.key_info).await?;
+                pre_resolved.push((op, data_table, desc, ttl_attr));
+            }
+
+            {
+                let mut key_reasons: Vec<extenddb_core::types::CancellationReason> =
+                    vec![extenddb_core::types::CancellationReason::none(); pre_resolved.len()];
+                let mut any_key_fault = false;
+                for (i, (op, _, desc, _)) in pre_resolved.iter().enumerate() {
+                    if let Err(r) = Self::transact_op_key_checks(op, desc) {
+                        any_key_fault = true;
+                        key_reasons[i] = r;
+                    }
+                }
+                if any_key_fault {
+                    return Err(
+                        match extenddb_core::types::CancellationReason::resolve_key_faults(
+                            key_reasons,
+                        ) {
+                            Ok(reasons) => StorageError::TransactionCanceled(reasons),
+                            Err(message) => StorageError::Validation(message),
+                        },
+                    );
+                }
+            }
+
             let mut resolved: Vec<(
                 OwnedTxnOp,
                 String,
                 TableDescription,
                 Option<String>,
                 crate::transact::ParticipantRow,
-            )> = Vec::with_capacity(owned.len());
-            for op in owned {
-                let (data_table, desc, ttl_attr) = self.table_full_meta_for(&op.key_info).await?;
-                match &op.kind {
-                    OwnedTxnKind::Put { item } => {
-                        Self::validate_put_index_keys(&desc, item)?;
-                    }
-                    OwnedTxnKind::Update { actions, .. } => {
-                        Self::validate_update_index_literals(&desc, actions, &op.maps)?;
-                    }
-                    OwnedTxnKind::Delete { .. } | OwnedTxnKind::ConditionCheck { .. } => {}
-                }
-                let row_key = crate::data::encoding::row_key::encode_key(
-                    op.lookup_key(),
-                    &op.key_info.key_schema,
-                )?;
+            )> = Vec::with_capacity(pre_resolved.len());
+            for (op, data_table, desc, ttl_attr) in pre_resolved {
+                let row_key =
+                    crate::data::encoding::row_key::encode_key(op.lookup_key(), &desc.key_schema)?;
                 let participant = crate::transact::ParticipantRow {
                     data_table: data_table.clone(),
                     row_key,
@@ -4216,38 +4324,125 @@ impl DataEngine for BigtableEngine {
 
             let mut reasons: Vec<extenddb_core::types::CancellationReason> =
                 Vec::with_capacity(resolved.len());
+            let mut staged_items: Vec<Option<Option<Item>>> = Vec::with_capacity(resolved.len());
             let mut any_failed = false;
-            for (idx, (op, _, _, _, _)) in resolved.iter().enumerate() {
+
+            for (idx, (op, _, desc, _, _)) in resolved.iter().enumerate() {
+                use extenddb_core::types::CancellationReason;
+                use extenddb_core::validation;
+
                 let existing = &items_read[idx];
-                match check_condition(existing.as_ref(), op.condition.as_ref(), &op.maps) {
-                    Ok(()) => {
-                        reasons.push(crate::transact::cancellation_reason("None", None, None))
+                let cond_reason =
+                    match check_condition(existing.as_ref(), op.condition.as_ref(), &op.maps) {
+                        Ok(()) => None,
+                        Err(StorageError::ConditionFailed(prior)) => {
+                            let item_for_reason = match op.return_values_on_ccf {
+                                ReturnValuesOnConditionCheckFailure::AllOld => prior,
+                                ReturnValuesOnConditionCheckFailure::None => None,
+                            };
+                            Some(CancellationReason::condition_check_failed_with_item(
+                                item_for_reason,
+                            ))
+                        }
+                        Err(StorageError::Validation(msg)) => {
+                            Some(CancellationReason::validation_error(msg))
+                        }
+                        Err(e) => {
+                            rollback_pending_txn(
+                                &coord,
+                                &txn_id,
+                                started_at_micros,
+                                &intents_placed,
+                                &participants,
+                            )
+                            .await;
+                            return Err(e);
+                        }
+                    };
+
+                if let Some(r) = cond_reason {
+                    any_failed = true;
+                    reasons.push(r);
+                    staged_items.push(None);
+                    continue;
+                }
+
+                match &op.kind {
+                    OwnedTxnKind::Put { item } => {
+                        reasons.push(CancellationReason::none());
+                        staged_items.push(Some(Some(item.clone())));
                     }
-                    Err(StorageError::ConditionFailed(prior)) => {
-                        any_failed = true;
-                        let item_for_reason = match op.return_values_on_ccf {
-                            ReturnValuesOnConditionCheckFailure::AllOld => prior,
-                            ReturnValuesOnConditionCheckFailure::None => None,
-                        };
-                        reasons.push(crate::transact::cancellation_reason(
-                            "ConditionalCheckFailed",
-                            Some("The conditional request failed"),
-                            item_for_reason,
-                        ));
+                    OwnedTxnKind::Delete { .. } => {
+                        reasons.push(CancellationReason::none());
+                        staged_items.push(Some(None));
                     }
-                    Err(e) => {
-                        rollback_pending_txn(
-                            &coord,
-                            &txn_id,
-                            started_at_micros,
-                            &intents_placed,
-                            &participants,
-                        )
-                        .await;
-                        return Err(e);
+                    OwnedTxnKind::ConditionCheck { .. } => {
+                        reasons.push(CancellationReason::none());
+                        staged_items.push(None);
+                    }
+                    OwnedTxnKind::Update { key, actions } => {
+                        let base = existing.clone().unwrap_or_else(|| key.clone());
+                        let eval_res: Result<Option<Option<Item>>, CancellationReason> = (|| {
+                            let updated = apply_update_actions_validated(
+                                &base,
+                                actions,
+                                &op.maps,
+                                &op.key_info,
+                                &desc.attribute_definitions,
+                            )
+                            .map_err(|e| match e {
+                                StorageError::Validation(m) => {
+                                    CancellationReason::validation_error(m)
+                                }
+                                other => CancellationReason::validation_error(other.to_string()),
+                            })?;
+                            validation::validate_transact_update_item_size(
+                                &updated,
+                                self.max_item_size_bytes,
+                            )
+                            .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+                            let idx_refs = Self::index_key_refs(desc);
+                            if !idx_refs.is_empty() {
+                                validation::validate_index_key_types_after_update(
+                                    &updated,
+                                    &idx_refs,
+                                    &desc.attribute_definitions,
+                                )
+                                .map_err(|e| {
+                                    CancellationReason::key_type_mismatch(e.to_string())
+                                })?;
+                                validation::validate_index_key_not_empty(
+                                    &updated,
+                                    &idx_refs,
+                                    validation::SecondaryIndexEmptyContext::UpdateExpression,
+                                )
+                                .map_err(|e| {
+                                    CancellationReason::index_key_empty_abort(e.to_string())
+                                })?;
+                            }
+                            if existing.is_none() && removes_only(actions) {
+                                Ok(None)
+                            } else {
+                                Ok(Some(Some(updated)))
+                            }
+                        })(
+                        );
+
+                        match eval_res {
+                            Ok(staged) => {
+                                reasons.push(CancellationReason::none());
+                                staged_items.push(staged);
+                            }
+                            Err(r) => {
+                                any_failed = true;
+                                reasons.push(r);
+                                staged_items.push(None);
+                            }
+                        }
                     }
                 }
             }
+
             if any_failed {
                 rollback_pending_txn(
                     &coord,
@@ -4257,7 +4452,12 @@ impl DataEngine for BigtableEngine {
                     &participants,
                 )
                 .await;
-                return Err(StorageError::TransactionCanceled(reasons));
+                return Err(
+                    match extenddb_core::types::CancellationReason::resolve_key_faults(reasons) {
+                        Ok(resolved_reasons) => StorageError::TransactionCanceled(resolved_reasons),
+                        Err(message) => StorageError::Validation(message),
+                    },
+                );
             }
 
             let mut log_records: Vec<crate::transact::TxnStreamRecord> = Vec::new();
@@ -4266,45 +4466,10 @@ impl DataEngine for BigtableEngine {
 
             for (idx, (op, data_table, desc, ttl_attr, participant)) in resolved.iter().enumerate()
             {
-                let existing = &items_read[idx];
-                let new_item: Option<Item> = match &op.kind {
-                    OwnedTxnKind::Put { item } => Some(item.clone()),
-                    OwnedTxnKind::Delete { .. } => None,
-                    OwnedTxnKind::Update { key, actions } => {
-                        let base = existing.clone().unwrap_or_else(|| key.clone());
-                        let updated = match apply_update_actions_validated(
-                            &base,
-                            actions,
-                            &op.maps,
-                            &op.key_info,
-                            &desc.attribute_definitions,
-                        )
-                        .and_then(|u| {
-                            Self::validate_updated_item_index_keys(desc, &u)?;
-                            Ok(u)
-                        }) {
-                            Ok(u) => u,
-                            Err(e) => {
-                                rollback_pending_txn(
-                                    &coord,
-                                    &txn_id,
-                                    started_at_micros,
-                                    &intents_placed,
-                                    &participants,
-                                )
-                                .await;
-                                return Err(e);
-                            }
-                        };
-                        if existing.is_none() && removes_only(actions) {
-                            continue;
-                        }
-                        Some(updated)
-                    }
-                    OwnedTxnKind::ConditionCheck { .. } => {
-                        continue;
-                    }
+                let Some(new_item) = staged_items[idx].clone() else {
+                    continue;
                 };
+                let existing = &items_read[idx];
 
                 let next_version = next_occ_version(read_versions[idx]);
                 let payload = match &new_item {
