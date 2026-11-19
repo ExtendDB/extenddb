@@ -138,8 +138,10 @@ pub enum SseType {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProvisionedThroughput {
     #[serde(rename = "ReadCapacityUnits")]
+    #[serde(deserialize_with = "crate::serde_helpers::deserialize_capacity_units")]
     pub read_capacity_units: i64,
     #[serde(rename = "WriteCapacityUnits")]
+    #[serde(deserialize_with = "crate::serde_helpers::deserialize_capacity_units")]
     pub write_capacity_units: i64,
 }
 
