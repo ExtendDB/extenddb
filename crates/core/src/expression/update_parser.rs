@@ -328,7 +328,7 @@ fn parse_add_actions(
 ) -> Result<(), DynamoDbError> {
     loop {
         let path = parse_action_path(tokens, src, pos)?;
-        let value = parse_add_delete_value(tokens, pos)?;
+        let value = parse_add_delete_value(tokens, src, pos)?;
         actions.push(UpdateAction::Add { path, value });
         if *pos < tokens.len() && tokens[*pos] == Token::Comma {
             *pos += 1;
@@ -348,7 +348,7 @@ fn parse_delete_actions(
 ) -> Result<(), DynamoDbError> {
     loop {
         let path = parse_action_path(tokens, src, pos)?;
-        let value = parse_add_delete_value(tokens, pos)?;
+        let value = parse_add_delete_value(tokens, src, pos)?;
         actions.push(UpdateAction::Delete { path, value });
         if *pos < tokens.len() && tokens[*pos] == Token::Comma {
             *pos += 1;
@@ -359,22 +359,23 @@ fn parse_delete_actions(
     Ok(())
 }
 
-/// Parse a value for ADD/DELETE — only placeholders are valid.
-fn parse_add_delete_value(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbError> {
-    if *pos >= tokens.len() {
-        return Err(validation_err(
-            "Invalid UpdateExpression: expected value for ADD/DELETE action",
-        ));
-    }
-    match &tokens[*pos] {
-        Token::Placeholder(name) => {
+/// Parse the value of an ADD or DELETE action, which must be a placeholder.
+/// Any other token, and the end of input, answer the service's syntax error
+/// (measured 2026-11-19: `ADD #v = :v` and `DELETE #v = :v` answer token
+/// "=", near "#v = :v"; `ADD #v` answers token "<EOF>", near "#v"; `ADD #v
+/// #w` answers token "#w", near "#v #w").
+fn parse_add_delete_value(
+    tokens: &[Token],
+    src: &str,
+    pos: &mut usize,
+) -> Result<Expr, DynamoDbError> {
+    match tokens.get(*pos) {
+        Some(Token::Placeholder(name)) => {
             let expr = Expr::Placeholder(name.clone());
             *pos += 1;
             Ok(expr)
         }
-        _ => Err(validation_err(
-            "Invalid UpdateExpression: ADD/DELETE value must be a placeholder",
-        )),
+        _ => Err(syntax_error(KIND, src, tokens, *pos)),
     }
 }
 

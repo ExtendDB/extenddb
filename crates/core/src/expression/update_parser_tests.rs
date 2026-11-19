@@ -241,6 +241,36 @@ fn measured_update_syntax_errors() {
 }
 
 #[test]
+fn the_window_is_found_by_token_position() {
+    // [x26] measured 2026-11-19: the second `+` of the second action is the
+    // offending token. A search for the token's text would find the first
+    // `+` and quote "+ :b, #w".
+    assert_eq!(
+        upd_msg("SET #v = :a + :b, #w = :c + :d + :e"),
+        syntax("+", ":d + :e")
+    );
+}
+
+#[test]
+fn add_and_delete_values_answer_the_syntax_error() {
+    // Measured 2026-11-19 (us-east-1), probe cases in brackets: any token
+    // where the value is required, and the end of input.
+    let rows = [
+        ("x07", "ADD #v = :v", "=", "#v = :v"),
+        ("x08", "DELETE #v = :v", "=", "#v = :v"),
+        ("x09", "ADD #v", "<EOF>", "#v"),
+        ("x10", "DELETE #v", "<EOF>", "#v"),
+        ("x11", "ADD #v #w", "#w", "#v #w"),
+        ("x27", "ADD #v, #w", ",", "#v, #w"),
+        ("x29", "ADD #v (:v)", "(", "#v (:v"),
+        ("x30", "DELETE #v AND :v", "AND", "#v AND :v"),
+    ];
+    for (case, src, token, near) in rows {
+        assert_eq!(upd_msg(src), syntax(token, near), "{case}");
+    }
+}
+
+#[test]
 fn other_update_texts_are_unchanged() {
     assert_eq!(
         upd_msg("SET #v #w = :v"),
