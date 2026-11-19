@@ -635,3 +635,11 @@ fn invalid_operator() -> DynamoDbError {
 #[cfg(test)]
 #[path = "key_condition_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "key_condition_classify_tests.rs"]
+mod classify_tests;
+
+#[cfg(test)]
+#[path = "key_condition_resolve_tests.rs"]
+mod resolve_tests;
