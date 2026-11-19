@@ -13,7 +13,8 @@ use super::*;
 /// rows an earlier claim wrote past its checkpoint) is accounted for from
 /// its ledger entry and not sent (`runner::resume`). The batch's write
 /// units are taken from the process bucket and the operation bucket before
-/// the call. `None` means the batch committed and the run continues;
+/// the call, with the lease renewed while the buckets hold the batch.
+/// `None` means the batch committed and the run continues;
 /// `Some(flow)` is the terminal flow after a batch error, with the run
 /// state reverted to the last checkpoint (nothing since it was committed).
 pub(super) async fn flush_staged(
@@ -48,17 +49,7 @@ pub(super) async fn flush_staged(
     // owner's later rows for the same keys, so the rows are dropped (they
     // are behind no checkpoint and the new owner reads them again) and the
     // runner stops without another catalog write.
-    if st
-        .lease_deadline
-        .is_some_and(|deadline| Instant::now() >= deadline)
-    {
-        let dropped = staged.len();
-        tracing::info!(
-            account_id = %record.account_id,
-            operation_id = %record.operation_id,
-            dropped_rows = dropped,
-            "lease deadline passed before a write batch; the runner stops"
-        );
+    if lease_ran_out(record, st, staged.len()) {
         return Ok(Some(Flow::Stop));
     }
     let mut rows = Vec::with_capacity(staged.len());
@@ -72,8 +63,38 @@ pub(super) async fn flush_staged(
         rows.push(s.row);
         metas.push((s.file_index, s.row_index, s.item_bytes, s.image));
     }
-    deps.pacer.acquire(units).await;
-    op_pacer.acquire(units).await;
+    // The pacers can hold the batch longer than the lease: 25 rows of 400 KB
+    // wait over a minute at 150 units per second. The rows are behind no
+    // checkpoint, so no boundary can run here. The lease is renewed in
+    // place instead, with the cursor left where the last checkpoint put it
+    // (`runner::in_place`), and the deadline is checked again after the
+    // wait, for a process that stalled through its renewals.
+    let mut deadline = st.lease_deadline;
+    let waited = keeping_lease_in_place(deps, record, &mut deadline, Watch::LeaseOnly, async {
+        deps.pacer.acquire(units).await;
+        op_pacer.acquire(units).await;
+    })
+    .await;
+    st.lease_deadline = deadline;
+    match waited {
+        InPlace::Answer(()) => {}
+        InPlace::Interrupted(error) => return Err(RunnerError::Storage(error)),
+        // A `Watch::LeaseOnly` renewal answers neither `Cancelled` nor
+        // `TableGone`; either would end the wait as a lost lease does, with
+        // the rows dropped for the next claim to read again.
+        InPlace::Lost | InPlace::Cancelled | InPlace::TableGone => {
+            tracing::info!(
+                account_id = %record.account_id,
+                operation_id = %record.operation_id,
+                dropped_rows = metas.len(),
+                "lease lost while a write batch waited on the write pacers; the runner stops"
+            );
+            return Ok(Some(Flow::Stop));
+        }
+    }
+    if lease_ran_out(record, st, metas.len()) {
+        return Ok(Some(Flow::Stop));
+    }
 
     let stream = stream_capture_for(&st.key_info, &deps.region);
     let results = match deps
@@ -188,6 +209,24 @@ pub(super) async fn flush_staged(
     // A condition record of this batch may be the first of its kind, whose
     // report object is checked now, after the rows before it were written.
     Ok(check_output_config_at_first_record(ctx, st).await)
+}
+
+/// Whether the lease has run out by this process's own clock, logging the
+/// `rows` staged rows the runner then drops instead of writing.
+fn lease_ran_out(record: &BulkOperationRecord, st: &RunState, rows: usize) -> bool {
+    if !st
+        .lease_deadline
+        .is_some_and(|deadline| Instant::now() >= deadline)
+    {
+        return false;
+    }
+    tracing::info!(
+        account_id = %record.account_id,
+        operation_id = %record.operation_id,
+        dropped_rows = rows,
+        "lease deadline passed before a write batch; the runner stops"
+    );
+    true
 }
 
 /// Whether the record names another lease owner, or is gone or terminal,

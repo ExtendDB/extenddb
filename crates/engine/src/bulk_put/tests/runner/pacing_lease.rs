@@ -96,6 +96,111 @@ async fn max_write_request_units_paces_the_operation_on_its_own() {
     );
 }
 
+// The pacers can hold a write batch longer than the lease: at 150 units per
+// second, 25 rows of 400 KB wait over a minute against a 60 s lease. The
+// lease is renewed during the wait, so no other claim takes the operation
+// over meanwhile. Here 40 one-unit rows wait 3 s on a 10-unit bucket against
+// a 1 s lease, and a second claim tried 1.5 s into the wait finds nothing.
+async fn a_pacer_wait_longer_than_the_lease_keeps_the_lease_case(backend: Backend) {
+    let h = Harness::on(backend).await;
+    h.write_input("part-000.json", &file_of(&plain_rows(40)));
+    let files = h.enumerate().await;
+    let op = h.start(files, input_config(false), both_reports()).await;
+    let lease = Duration::from_secs(1);
+    let record = h.claim("runner-1", lease).await;
+    let mut cfg = config();
+    cfg.batch_size = 40;
+    cfg.write_batch_rows = 40;
+    cfg.lease = lease;
+    let pacer = Arc::new(WritePacer::new(10));
+    let mut deps = h.deps("runner-1", cfg);
+    deps.pacer = Arc::clone(&pacer);
+    let second_claim = async {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        h.storage
+            .claim_runnable("runner-2", Duration::from_secs(60), 10, &[], &[])
+            .await
+            .expect("claim")
+    };
+    let (ran, claimed) = tokio::join!(runner::run(&deps, record), second_claim);
+    ran.expect("runner-1's run");
+
+    assert!(
+        claimed.is_empty(),
+        "the lease ran out while the batch waited on the pacer, and another claim took the operation"
+    );
+    assert!(
+        pacer.waited() >= Duration::from_millis(2500),
+        "40 units against a 10/s bucket wait about 3 s, waited {:?}",
+        pacer.waited()
+    );
+    let record = h.record(&op).await;
+    assert_eq!(record.status, "COMPLETED");
+    assert_eq!(record.processed_item_count, 40);
+    assert_eq!(h.count_items().await, 40);
+    h.cleanup().await;
+}
+
+// The deadline is checked again after the pacer wait. A runner that is not
+// polled through the wait, as a paused process is, runs no renewal, and its
+// lease has run out when the wait ends: it drops the batch and stops. Here
+// 20 one-unit rows wait 1 s on a 10-unit bucket, and the runner is not
+// polled for 1.5 s against a 1 s lease.
+async fn a_runner_stalled_through_a_pacer_wait_drops_its_batch_case(backend: Backend) {
+    let h = Harness::on(backend).await;
+    h.write_input("part-000.json", &file_of(&plain_rows(20)));
+    let files = h.enumerate().await;
+    let op = h.start(files, input_config(false), both_reports()).await;
+    let lease = Duration::from_secs(1);
+    let record = h.claim("runner-1", lease).await;
+    let mut cfg = config();
+    cfg.batch_size = 20;
+    cfg.write_batch_rows = 20;
+    cfg.lease = lease;
+    let pacer = Arc::new(WritePacer::new(10));
+    let mut deps = h.deps("runner-1", cfg);
+    deps.pacer = Arc::clone(&pacer);
+    let run = runner::run(&deps, record);
+    tokio::pin!(run);
+    // Poll the run until its batch has taken its units and waits on the
+    // bucket. No renewal is due yet: the first comes a third of the lease
+    // after the claim.
+    while pacer.settled_tokens() >= 0.0 {
+        tokio::select! {
+            _ = &mut run => panic!("runner-1 must reach the pacer wait"),
+            () = tokio::time::sleep(Duration::from_millis(5)) => {}
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    run.await
+        .expect("a lapsed lease is a clean stop, not an error");
+
+    assert_eq!(
+        h.count_items().await,
+        0,
+        "the batch that outwaited the lease was dropped, not written"
+    );
+    let record = h.record(&op).await;
+    assert_eq!(
+        record.status, "IN_PROGRESS",
+        "the runner stopped at the fence without a terminal transition"
+    );
+    assert_eq!(record.cursor_row_index, 0);
+    h.cleanup().await;
+}
+
+on_both_backends!(
+    a_pacer_wait_longer_than_the_lease_keeps_the_lease_case,
+    a_pacer_wait_longer_than_the_lease_keeps_the_lease,
+    a_pacer_wait_longer_than_the_lease_keeps_the_lease_on_postgres
+);
+
+on_both_backends!(
+    a_runner_stalled_through_a_pacer_wait_drops_its_batch_case,
+    a_runner_stalled_through_a_pacer_wait_drops_its_batch,
+    a_runner_stalled_through_a_pacer_wait_drops_its_batch_on_postgres
+);
+
 // A runner whose lease another owner has taken stops at its next boundary.
 //
 // The storage layer refuses a stale owner's checkpoint and finish (contract
