@@ -3,9 +3,10 @@
 
 //! Query of a table that does not exist. Only the tokenizer runs ahead of the
 //! table lookup: `_g` and an empty key condition get Amazon `DynamoDB`'s
-//! answers (measured 2026-11-18). The service takes `size` as a name and
-//! answers that the table is missing, which shows that the reserved word check
-//! does not run here.
+//! answers (measured 2026-11-18). The service reads `size` as a name, so
+//! `size = :v` gets the missing-table answer. The service also refuses a
+//! reserved word such as `status` ahead of the lookup (measured 2026-11-19),
+//! and the tokenizer does not check for it.
 
 use serde_json::json;
 
