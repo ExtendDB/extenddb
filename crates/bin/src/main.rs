@@ -22,12 +22,16 @@
     all(feature = "postgres", feature = "cassandra"),
     all(feature = "postgres", feature = "mongodb"),
     all(feature = "postgres", feature = "sqlite"),
+    all(feature = "postgres", feature = "bigtable"),
     all(feature = "sqlite", feature = "cassandra"),
     all(feature = "sqlite", feature = "mongodb"),
+    all(feature = "sqlite", feature = "bigtable"),
     all(feature = "cassandra", feature = "mongodb"),
+    all(feature = "cassandra", feature = "bigtable"),
+    all(feature = "mongodb", feature = "bigtable"),
 ))]
 compile_error!(
-    "the `postgres`, `mongodb`, `sqlite`, and `cassandra` features are mutually exclusive: \
+    "the `postgres`, `mongodb`, `sqlite`, `cassandra`, and `bigtable` features are mutually exclusive: \
      a thin bin installs exactly one backend (e.g. build the MongoDB binary with \
      `--no-default-features --features mongodb`)"
 );
@@ -36,10 +40,11 @@ compile_error!(
     feature = "postgres",
     feature = "mongodb",
     feature = "sqlite",
-    feature = "cassandra"
+    feature = "cassandra",
+    feature = "bigtable"
 )))]
 compile_error!(
-    "no backend selected: enable the `postgres` (default), `mongodb`, `sqlite` or `cassandra` feature"
+    "no backend selected: enable the `postgres` (default), `mongodb`, `sqlite`, `cassandra` or `bigtable` feature"
 );
 
 // Developer mode relaxes the security posture (plain HTTP on loopback, open
@@ -60,6 +65,8 @@ fn main() -> anyhow::Result<()> {
     // Install the compiled-in backend before dispatch. The compiler checks this
     // call; there is no link-time auto-registration and no name to resolve, so a
     // missing or mistyped backend cannot become a runtime error.
+    #[cfg(feature = "bigtable")]
+    extenddb_storage::set_backend(extenddb_storage_bigtable::backend())?;
     #[cfg(feature = "cassandra")]
     extenddb_storage::set_backend(extenddb_storage_cassandra::backend())?;
     #[cfg(feature = "mongodb")]
@@ -84,9 +91,11 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     /// Install this binary's backend once for the test process. Only the
-    /// postgres and sqlite builds have tests that need it.
-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    /// postgres, sqlite, and bigtable builds have tests that need it.
+    #[cfg(any(feature = "postgres", feature = "sqlite", feature = "bigtable"))]
     fn install_backend() {
+        #[cfg(feature = "bigtable")]
+        let _ = extenddb_storage::set_backend(extenddb_storage_bigtable::backend());
         #[cfg(feature = "cassandra")]
         let _ = extenddb_storage::set_backend(extenddb_storage_cassandra::backend());
         #[cfg(feature = "mongodb")]
@@ -95,6 +104,18 @@ mod tests {
         let _ = extenddb_storage::set_backend(extenddb_storage_postgres::backend());
         #[cfg(feature = "sqlite")]
         let _ = extenddb_storage::set_backend(extenddb_storage_sqlite::backend());
+    }
+
+    #[cfg(feature = "bigtable")]
+    #[test]
+    fn no_bigtable_migration_is_additive() {
+        install_backend();
+        assert_eq!(extenddb_storage::backend_name(), Some("bigtable"));
+        extenddb_storage::migrations::refuse_additive(
+            extenddb_storage_bigtable::BACKEND_NAME,
+            extenddb_storage_bigtable::migrations::migration,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
     }
 
     /// Zero-config serve contract: with the SQLite backend installed,

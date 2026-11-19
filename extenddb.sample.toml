@@ -31,7 +31,7 @@
 # run_dir = "~/.extenddb/run"  # Directory for PID file (~ is expanded to $HOME)
 
 [storage]
-# backend = "postgres"         # Storage backend: "postgres" (default), "mongodb", or "sqlite".
+# backend = "postgres"         # Storage backend: "postgres" (default), "mongodb", "sqlite", or "bigtable".
 
 # --- SQLite backend (developer mode) ---
 # Select with `extenddb init --backend sqlite`. The database path can be given
@@ -106,6 +106,25 @@
                                 # or "local" only when required. Both lose the
                                 # single point-in-time guarantee; "local" may read
                                 # data later rolled back after failover.
+
+# [storage.bigtable]
+# Google Cloud Bigtable backend (experimental; requires a binary built with
+# `--no-default-features --features bigtable`). Requires a single-cluster
+# routing app profile so `CheckAndMutateRow` executes with single-row
+# serializability.
+# project_id = "my-gcp-project"
+# instance_id = "my-bigtable-instance"
+# data_instance_id = ""         # Optional separate Bigtable instance for data tables.
+# app_profile_id = ""           # Optional single-cluster routing app profile ID.
+# credentials_path = ""         # Optional service-account JSON path (uses ADC if unset).
+# emulator_host = ""            # Optional host:port for local Bigtable emulator (e.g. "localhost:8086").
+# pool_size = 20                # Max concurrent data-plane gRPC channels (default: 20).
+# catalog_pool_size = 8         # Max concurrent catalog/auth gRPC channels (default: 8).
+# sweeper_cadence_secs = 30     # 2PC stale-intent sweeper cadence in seconds (default: 30).
+# intent_timeout_secs = 60      # Stale write-intent recovery threshold in seconds (default: 60).
+# ttl_scan_cadence_secs = 60    # Background TTL index sweep cadence in seconds (default: 60).
+# gsi_reconcile_cadence_secs = 300 # Background GSI reconciler cadence in seconds (default: 300).
+# dev_mode = false              # Local emulator test bypass ONLY; never enable in production.
 
 [auth]
 # provider = "builtin"          # Auth provider:
