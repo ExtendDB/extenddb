@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::PathElement;
-use extenddb_core::expression::{ExpressionKind, ExpressionMaps, Projection};
+use extenddb_core::expression::{ExpressionKind, ExpressionMaps, Projection, tokenize_for};
 use extenddb_core::types::{
     IndexType, KeyType, QueryInput, QueryOutput, Select, TableKeyInfo,
     VECTOR_INDEX_QUERY_NOT_SUPPORTED,
@@ -19,7 +19,9 @@ use extenddb_storage::error::StorageError;
 use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
-use crate::expression_helpers::{build_expression_maps, parse_optional_filter};
+use crate::expression_helpers::{
+    build_expression_maps, parse_optional_filter, prefix_expression_error,
+};
 use crate::index_helpers::{
     VectorIndexReadRefusal, classify_unresolved_index_read, combined_lek_key_schema,
     validate_query_select_index_support,
@@ -76,10 +78,25 @@ pub async fn handle_query(
     let input: QueryInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
     // P118: Fetch key_info first so we can use table_id for index lookup.
-    let key_info = ctx
-        .table_key_info(&input.table_name)
-        .await
-        .map_err(storage_err_to_dynamo)?;
+    // Amazon DynamoDB reads the key condition before it looks up the table:
+    // on a table that does not exist, `_g = :v` answers the syntax error and
+    // an empty key condition the empty-expression error (measured 2026-11-14
+    // and 2026-11-18). Only the tokenizer runs here, and only when the lookup
+    // fails, so every check below keeps its order on a table that exists.
+    let key_info = match ctx.table_key_info(&input.table_name).await {
+        Ok(key_info) => key_info,
+        Err(err) => {
+            if let Some(kce) = input.key_condition_expression.as_deref() {
+                tokenize_for(
+                    kce,
+                    ctx.limits.max_expression_tokens,
+                    ExpressionKind::KeyCondition,
+                )
+                .map_err(|e| prefix_expression_error(e, ExpressionKind::KeyCondition))?;
+            }
+            return Err(storage_err_to_dynamo(err));
+        }
+    };
 
     // GSI/LSI: resolve index metadata if querying a secondary index.
     // Uses table_id from pre-fetched key_info to skip redundant table lookup (P118 #4).
@@ -771,6 +788,10 @@ fn reject_empty_key_condition_expression(expr: Option<&str>) -> Result<(), Dynam
     }
     Ok(())
 }
+
+#[cfg(all(test, feature = "partiql"))]
+#[path = "query_missing_table_tests.rs"]
+mod missing_table_tests;
 
 #[cfg(test)]
 mod empty_key_condition_tests {
