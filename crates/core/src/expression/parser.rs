@@ -21,10 +21,13 @@
 //!
 //! A parenthesized condition, a `NOT` and a function call read as an operand
 //! each nest one level, up to `max_depth`. A function call that is the
-//! condition itself nests none.
+//! condition itself nests none. Past `max_depth`, a call the semantic pass
+//! refuses by name is refused with that message, not the depth error.
 
 use super::ast::{CompareOp, Expr};
+use super::kind::ExpressionKind;
 use super::parser_common;
+use super::semantics::check_condition_call_name;
 use super::tokenizer::Token;
 use crate::error::DynamoDbError;
 
@@ -225,12 +228,15 @@ fn parse_operand(
             *pos += 1;
             Ok(expr)
         }
-        Token::Ident(_) => {
+        Token::Ident(name) => {
             // A function call, `size(path)` or any other name, nests one
-            // level. Its name is checked by `validate_condition_semantics`.
+            // level. Its name is checked by `validate_condition_semantics`,
+            // except past the limit, where that pass never runs and the name
+            // is checked here (see `depth_tests.rs`).
             if *pos + 1 < tokens.len() && tokens[*pos + 1] == Token::LParen {
                 *depth += 1;
                 if *depth > max_depth {
+                    check_condition_call_name(name, true, ExpressionKind::Condition)?;
                     return Err(validation_err(
                         "Invalid ConditionExpression: expression nesting depth exceeded",
                     ));

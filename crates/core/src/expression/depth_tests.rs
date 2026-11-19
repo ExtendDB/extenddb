@@ -3,7 +3,8 @@
 
 //! The nesting depth limit of the update and condition parsers: an
 //! expression nested past `max_depth` is refused, and one nested far past it
-//! is refused on a thread with a small stack instead of overflowing it.
+//! is refused on a thread with a small stack instead of overflowing it. A
+//! call refused by name is refused with the name refusal past the limit too.
 
 use super::parser::parse_condition_with_depth_limit;
 use super::test_timeout::within_10_s;
@@ -22,6 +23,7 @@ const SMALL_STACK: usize = 1 << 20;
 
 const UPDATE_TOO_DEEP: &str = "Invalid UpdateExpression: expression nesting depth exceeded";
 const CONDITION_TOO_DEEP: &str = "Invalid ConditionExpression: expression nesting depth exceeded";
+const UPDATE_NO_FOO: &str = "Invalid UpdateExpression: Invalid function name; function: foo";
 
 /// `SET qty = (qty + (qty + ... :v))` with `levels` groups.
 fn nested_groups(levels: usize) -> String {
@@ -73,13 +75,12 @@ fn message(result: Result<(), DynamoDbError>) -> String {
     }
 }
 
+/// `update` or `condition`.
+type Parse = fn(&str) -> Result<(), DynamoDbError>;
+
 /// Run `parse` on `expr` on a thread with [`SMALL_STACK`], failing the test
 /// after 10 seconds.
-fn on_small_stack(
-    what: &'static str,
-    expr: String,
-    parse: fn(&str) -> Result<(), DynamoDbError>,
-) -> Result<(), DynamoDbError> {
+fn on_small_stack(what: &'static str, expr: String, parse: Parse) -> Result<(), DynamoDbError> {
     within_10_s(what, move || {
         std::thread::Builder::new()
             .stack_size(SMALL_STACK)
@@ -128,10 +129,6 @@ fn update_far_past_the_limit_is_refused_without_overflowing_the_stack() {
         ("deep update groups", nested_groups(FAR)),
         ("deep update calls", nested_calls(FAR)),
         ("deep update calls and groups", nested_mixed(FAR)),
-        (
-            "deep update calls of any name",
-            format!("SET qty = {}:v{}", "foo(".repeat(FAR), ")".repeat(FAR)),
-        ),
     ] {
         assert_eq!(message(on_small_stack(what, expr, update)), UPDATE_TOO_DEEP);
     }
@@ -161,16 +158,57 @@ fn condition_size_calls_inside_a_function_count_toward_the_limit() {
 
 #[test]
 fn condition_far_past_the_limit_is_refused_without_overflowing_the_stack() {
-    for (what, expr) in [
-        ("deep condition sizes", nested_sizes(FAR)),
+    let expr = nested_sizes(FAR);
+    assert_eq!(
+        message(on_small_stack("deep condition sizes", expr, condition)),
+        CONDITION_TOO_DEEP
+    );
+}
+
+/// Past the limit, a call the service refuses by name answers the name
+/// refusal, as the service does at 151, 200 and 300 calls (measured
+/// 2026-11-19, two sends each). `size` in a condition, and `if_not_exists`
+/// and `list_append` in a SET value, keep the depth error.
+#[test]
+fn calls_refused_by_name_past_the_limit_answer_the_name_refusal() {
+    let past = LIMIT + 1;
+    let rows: [(&'static str, Parse, String, &str); 5] = [
         (
-            "deep condition calls of any name",
-            format!("{}x{}", "f(".repeat(FAR), ")".repeat(FAR)),
+            "151 foo calls in a condition",
+            condition,
+            format!("{}a{} = :v", "foo(".repeat(past), ")".repeat(past)),
+            "Invalid ConditionExpression: Invalid function name; function: foo",
         ),
-    ] {
+        (
+            "50,000 f calls in a condition",
+            condition,
+            format!("{}x{}", "f(".repeat(FAR), ")".repeat(FAR)),
+            "Invalid ConditionExpression: Invalid function name; function: f",
+        ),
+        (
+            "151 foo calls in a SET",
+            update,
+            format!("SET a = {}:v{}", "foo(".repeat(past), ")".repeat(past)),
+            UPDATE_NO_FOO,
+        ),
+        (
+            "50,000 foo calls in a SET",
+            update,
+            format!("SET qty = {}:v{}", "foo(".repeat(FAR), ")".repeat(FAR)),
+            UPDATE_NO_FOO,
+        ),
+        (
+            "151 size calls in a SET",
+            update,
+            format!("SET a = {}:v{}", "size(".repeat(past), ")".repeat(past)),
+            "Invalid UpdateExpression: The function is not allowed in an update expression; function: size",
+        ),
+    ];
+    for (what, parse, expr, expected) in rows {
         assert_eq!(
-            message(on_small_stack(what, expr, condition)),
-            CONDITION_TOO_DEEP
+            message(on_small_stack(what, expr, parse)),
+            expected,
+            "{what}"
         );
     }
 }

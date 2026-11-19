@@ -8,11 +8,9 @@ use super::super::ast::{ArithOp, Expr, UpdateAction};
 use super::super::kind::ExpressionKind;
 use super::super::resolver::{ExpressionMaps, attribute_type_code};
 use super::super::update_parser::{ParsedUpdate, repeated_section_err};
-use super::errors::{
-    invalid_function_name, operand_count_err, operand_type_err, requires_document_path, validation,
-};
+use super::check_update_call_name;
+use super::errors::{operand_count_err, operand_type_err, requires_document_path, validation};
 use super::refs::{check_path_refs, check_value_defined};
-use super::{CONDITION_FUNCTIONS, UPDATE_FUNCTIONS};
 use crate::error::DynamoDbError;
 use crate::types::AttributeValue;
 
@@ -91,17 +89,7 @@ fn walk_set_value(expr: &Expr, maps: &ExpressionMaps, nested: bool) -> Result<()
                     "The function is not allowed to be used this way in an expression; function: list_append",
                 ));
             }
-            if !UPDATE_FUNCTIONS.contains(&name.as_str()) {
-                if CONDITION_FUNCTIONS.contains(&name.as_str()) {
-                    return Err(validation(
-                        kind,
-                        &format!(
-                            "The function is not allowed in an update expression; function: {name}"
-                        ),
-                    ));
-                }
-                return Err(invalid_function_name(kind, name));
-            }
+            check_update_call_name(name)?;
             if args.len() != 2 {
                 return Err(operand_count_err(kind, name, args.len()));
             }
