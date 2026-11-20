@@ -98,7 +98,8 @@ const IDEMPOTENT_MISMATCH_MESSAGE: &str = "Specified idempotent token was alread
 const TABLE_BUSY_MESSAGE: &str = "Table has ongoing bulk operations, please wait and try again";
 
 /// The service's minimum for `MaxWriteRequestUnits` (measured on the service:
-/// 1000 and 1023 refused with the `Invalid Request:` message, 1024 started).
+/// 1000 and 1023 refused with the model's range clause, which has no
+/// `Invalid Request: ` prefix, and 1024 started).
 const MIN_WRITE_REQUEST_UNITS: i64 = 1024;
 
 /// Measured message for a start on a table being deleted: answered

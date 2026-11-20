@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The S3 actions a bulk operation performs as its caller, evaluated against
-//! the caller's ExtendDB policies: `s3:ListBucket` on the input bucket at
-//! Start, `s3:GetObject` on each input object when it is opened and at every
-//! checkpoint boundary while it is read, and `s3:PutObject` on each report
-//! object and on the manifest. The service reports a denial of each as
+//! the caller's ExtendDB policies. The runner checks `s3:ListBucket` on the
+//! input bucket on the first claim, before the listing. It checks
+//! `s3:GetObject` on each input object when it opens the object and at every
+//! checkpoint boundary while it reads it. It checks `s3:PutObject` on each
+//! report object and on the manifest. The service reports a denial of each as
 //! `S3AccessDenied`; the evaluation runs on every store, so the filesystem
 //! store answers the same denials.
 //!

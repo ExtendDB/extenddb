@@ -77,9 +77,9 @@ pub(super) async fn drive(
         st.failure = Some(failure);
         return finalize(deps, record, Some(config), st).await;
     }
-    // `MaxWriteRequestUnits` was validated at Start to be at least 1 when
-    // present; a stored value outside that range (hand-edited catalog) is
-    // treated as absent rather than refusing the claim.
+    // Start refuses a `MaxWriteRequestUnits` below 1,024. A stored value
+    // below 1 (a hand-edited catalog) is treated as absent rather than
+    // refusing the claim.
     let op_pacer = WritePacer::new(
         record
             .max_write_request_units

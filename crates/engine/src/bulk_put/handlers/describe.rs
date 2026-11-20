@@ -114,9 +114,8 @@ pub(crate) fn describe(
             table_id: record.table_id.clone(),
         }],
         // The model types these two members, but the service never emits
-        // them: every description it answered during the runs
-        // (326 of them among them) carried the table only in
-        // `TableDetails`.
+        // them. Each of the 326 descriptions it answered during the runs
+        // carried the table only in `TableDetails`.
         table_arn: None,
         table_id: None,
         client_token: record.client_token.clone(),
