@@ -198,12 +198,13 @@ async fn test_idempotency_token_after_a_key_fault() {
 }
 
 /// The fingerprint of the token row of `token` and the seconds it has left
-/// (`TTL(fingerprint)`, `None` when the row never expires).
-async fn token_row(
+/// (`TTL(fingerprint)`, `None` when the row never expires), or `None` when
+/// the token has no row.
+async fn token_row_if_any(
     engine: &extenddb_storage_cassandra::CassandraEngine,
     account_id: &str,
     token: &str,
-) -> (String, Option<i32>) {
+) -> Option<(String, Option<i32>)> {
     use cdrs_tokio::types::IntoRustByName;
     let query = format!(
         "SELECT fingerprint, TTL(fingerprint) AS ttl FROM {}.idempotency_tokens_by_account \
@@ -220,10 +221,21 @@ async fn token_row(
     )
     .await
     .expect("read the token row");
-    let row = rows.first().expect("a token row");
+    let row = rows.first()?;
     let fingerprint: Option<String> = row.get_by_name("fingerprint").ok().flatten();
     let ttl: Option<i32> = row.get_by_name("ttl").ok().flatten();
-    (fingerprint.expect("a fingerprint"), ttl)
+    Some((fingerprint.expect("a fingerprint"), ttl))
+}
+
+/// [`token_row_if_any`] of a token that has a row.
+async fn token_row(
+    engine: &extenddb_storage_cassandra::CassandraEngine,
+    account_id: &str,
+    token: &str,
+) -> (String, Option<i32>) {
+    token_row_if_any(engine, account_id, token)
+        .await
+        .expect("a token row")
 }
 
 /// A table with the item `c1`, and a Put of `c1` with
@@ -548,32 +560,6 @@ async fn test_a_committed_token_row_expires_ten_minutes_after_its_commit() {
     assert!((590..=600).contains(&ttl), "TTL {ttl}");
 }
 
-/// The fingerprint of the token row of `token`, or `None` when it has no row.
-async fn token_fingerprint(
-    engine: &extenddb_storage_cassandra::CassandraEngine,
-    account_id: &str,
-    token: &str,
-) -> Option<String> {
-    use cdrs_tokio::types::IntoRustByName;
-    let query = format!(
-        "SELECT fingerprint FROM {}.idempotency_tokens_by_account \
-         WHERE account_id = ? AND \"token\" = ?",
-        engine.catalog_keyspace()
-    );
-    let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<
-        extenddb_storage::error::StorageError,
-    >(
-        &engine.session_arc(),
-        &query,
-        cdrs_tokio::query_values!(account_id, token),
-        "read the token row",
-    )
-    .await
-    .expect("read the token row");
-    rows.first()
-        .and_then(|row| row.get_by_name("fingerprint").ok().flatten())
-}
-
 /// The cancellation of a send writes the cancelled token only where the
 /// running row of that send was. Every write of a token row is an LWT, so a
 /// row that another request reserved while the send ran stays as it is, and
@@ -655,7 +641,7 @@ async fn test_a_cancellation_leaves_a_token_row_that_changed_while_the_send_ran(
         let sent = send(n, &token);
         // Wait for the reservation of the send, then change its row.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while token_fingerprint(&engine, account, &token).await.is_none() {
+        while token_row_if_any(&engine, account, &token).await.is_none() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "{case}: the send reserved no token"
@@ -681,7 +667,9 @@ async fn test_a_cancellation_leaves_a_token_row_that_changed_while_the_send_ran(
                 if r.len() == 40 && r[39].code == "ConditionalCheckFailed"),
             "{case}: {answer:?}"
         );
-        let fingerprint = token_fingerprint(&engine, account, &token).await;
+        let fingerprint = token_row_if_any(&engine, account, &token)
+            .await
+            .map(|row| row.0);
         assert_eq!(fingerprint.as_deref(), Some(expected), "{case}");
         let other = format!("d{n}");
         let result = put_with_token(&engine, key_info, &other, &token).await;
