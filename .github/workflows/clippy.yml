@@ -36,6 +36,9 @@ jobs:
       # so the hook helpers and their call sites, which only the integration
       # test binaries build otherwise, are linted too.
       - run: cargo clippy --all-targets --features extenddb-storage-cassandra/test-hooks,extenddb-storage-mongodb/test-hooks,extenddb-storage-bigtable/test-hooks -- -D warnings
+      # Lint the `bigtable` backend feature arm in `crates/bin` (whose default
+      # feature selects `postgres`).
+      - run: cargo clippy -p extenddb --no-default-features --features bigtable --all-targets -- -D warnings
       # The backup job's kill-point pauses (`EXTENDDB_BACKUP_PAUSE`), which
       # `devtools/backup-kill-points.sh` runs by hand on a build with the
       # feature; no other job builds it.
