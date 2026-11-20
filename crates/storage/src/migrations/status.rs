@@ -140,7 +140,7 @@ pub enum CatalogStatus {
     /// touches.
     Current { version: u32 },
     /// Migrations this binary carries are missing. `version` is `None` for a
-    /// catalog with no ledger (a release before 1.0, behind at migration 1).
+    /// catalog with no ledger (a release before 0.1.15, behind at migration 1).
     Behind {
         version: Option<u32>,
         pending: Vec<Pending>,
@@ -161,7 +161,7 @@ pub enum CatalogStatus {
         recorded: String,
         expected: String,
     },
-    /// The catalog ledger has a row for migration 1 and a release before 1.0
+    /// The catalog ledger has a row for migration 1 and a release before 0.1.15
     /// wrote to the catalog afterwards.
     WrittenByOlderRelease { trace: String },
     /// Not a catalog: no ledger row and no `catalog_version` row.
@@ -211,7 +211,7 @@ impl std::fmt::Display for CatalogStatus {
                     (Some((catalog_at, behind)), _) => behind_line(catalog_at, &behind),
                     (None, Some(v)) => format!("the catalog is at migration {v}"),
                     (None, None) => {
-                        "the catalog has no migration ledger (a release before 1.0)".to_owned()
+                        "the catalog has no migration ledger (a release before 0.1.15)".to_owned()
                     }
                 };
                 let list: Vec<String> = pending
@@ -257,7 +257,7 @@ impl std::fmt::Display for CatalogStatus {
             ),
             Self::WrittenByOlderRelease { trace } => write!(
                 f,
-                "a release before 1.0 wrote to this catalog after it was migrated ({trace}); \
+                "a release before 0.1.15 wrote to this catalog after it was migrated ({trace}); \
                  run 'extenddb migrate --yes --reconverge'"
             ),
             Self::Uninitialized => write!(f, "the catalog is not initialized"),

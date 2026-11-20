@@ -20,6 +20,14 @@ pub mod hooks;
 #[doc(hidden)]
 #[cfg(feature = "test-util")]
 pub mod iam_leftovers_conformance;
+pub mod key_commands;
+#[doc(hidden)]
+#[cfg(feature = "test-util")]
+pub mod key_conformance;
+pub mod key_pass;
+pub mod key_ring;
+#[cfg(test)]
+mod key_tests;
 pub mod management_store;
 pub mod management_store_factory;
 #[doc(hidden)]
@@ -31,6 +39,7 @@ pub mod password;
 pub mod policy_migration;
 pub mod restore_engine;
 pub mod secret_cipher;
+pub mod secret_keys;
 pub mod server_components;
 pub mod settings_store;
 pub mod snapshot;
@@ -58,7 +67,7 @@ pub use snapshot::{SnapshotEngine, SnapshotInfo, TableSnapshot};
 pub use transact::{IdempotencyKey, TransactGetOp, TransactWriteOp};
 
 pub use server_components::{
-    BackendError, ServerComponents, ServerComponentsFactory, create_server_components,
+    BackendError, KeySource, ServerComponents, ServerComponentsFactory, create_server_components,
 };
 
 pub use hooks::{CancellationToken, ServerRuntimeHooks, WorkerContext, sleep_or_shutdown};
@@ -792,12 +801,15 @@ pub trait CatalogStore:
     + Send
     + Sync
 {
-    /// Get the cached encryption key (if available).
+    /// The key holder that this store and its credential store share, or
+    /// `None` for a store built with no key. AssumeRole encrypts the session
+    /// secret with it before [`management_store::ManagementStore::store_session`].
     ///
-    /// Returns None if encryption key is not cached. This is used by
-    /// `cmd_serve` to construct the auth provider without re-querying
-    /// the settings table.
-    fn cached_encryption_key(&self) -> Option<String>;
+    /// The default is `None`; every backend that serves returns its key
+    /// holder.
+    fn secret_keys(&self) -> Option<&secret_keys::SecretKeys> {
+        None
+    }
 }
 
 #[cfg(test)]

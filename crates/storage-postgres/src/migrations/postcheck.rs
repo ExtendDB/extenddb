@@ -11,9 +11,9 @@
 //! ignored. Every object the expected file names is checked, and objects it
 //! does not name are ignored, because the same databases hold per-table
 //! objects no migration creates. A difference stops migration 1, and the
-//! refusal names each object with what it is, what v1.0 has and what to do;
-//! the check runs inside migration 1's transaction, so nothing is
-//! committed. One pre-release shape is accepted with a note:
+//! refusal names each object with what it is, what migration 1 has and
+//! what to do; the check runs inside migration 1's transaction, so nothing
+//! is committed. One pre-release shape is accepted with a note:
 //! `table_restores.source_table_arn` nullable, which a build from before the
 //! release of `table_restores` left.
 
@@ -183,7 +183,7 @@ fn column_sql(column: &Column) -> String {
 }
 
 /// How `found` differs from `expected`, one clause per attribute, such as
-/// `has type integer where v1.0 has bigint`.
+/// `has type integer where migration 1 has bigint`.
 fn column_differences(found: &Column, expected: &Column) -> Vec<String> {
     let collation = |c: &Option<String>| {
         c.as_ref()
@@ -192,28 +192,28 @@ fn column_differences(found: &Column, expected: &Column) -> Vec<String> {
     let mut clauses = Vec::new();
     if found.data_type != expected.data_type {
         clauses.push(format!(
-            "has type {} where v1.0 has {}",
+            "has type {} where migration 1 has {}",
             found.data_type, expected.data_type
         ));
     }
     if found.not_null != expected.not_null {
         clauses.push(if found.not_null {
-            "is NOT NULL where v1.0 allows NULL".to_owned()
+            "is NOT NULL where migration 1 allows NULL".to_owned()
         } else {
-            "allows NULL where v1.0 has NOT NULL".to_owned()
+            "allows NULL where migration 1 has NOT NULL".to_owned()
         });
     }
     match (&found.default, &expected.default) {
         (Some(f), Some(e)) if f != e => {
-            clauses.push(format!("has default {f} where v1.0 has {e}"));
+            clauses.push(format!("has default {f} where migration 1 has {e}"));
         }
-        (Some(f), None) => clauses.push(format!("has default {f} where v1.0 has none")),
-        (None, Some(e)) => clauses.push(format!("has no default where v1.0 has {e}")),
+        (Some(f), None) => clauses.push(format!("has default {f} where migration 1 has none")),
+        (None, Some(e)) => clauses.push(format!("has no default where migration 1 has {e}")),
         _ => {}
     }
     if found.collation != expected.collation {
         clauses.push(format!(
-            "has collation {} where v1.0 has {}",
+            "has collation {} where migration 1 has {}",
             collation(&found.collation),
             collation(&expected.collation)
         ));
@@ -236,8 +236,8 @@ fn split(key: &str) -> (&str, &str) {
 }
 
 /// The differences between `expected` and `actual`, each naming the object,
-/// what it is and what v1.0 has, and what to do about it; and the notes for
-/// the accepted shape.
+/// what it is and what migration 1 has, and what to do about it; and the
+/// notes for the accepted shape.
 #[must_use]
 pub fn compare(expected: &Definitions, actual: &Definitions) -> (Vec<String>, Vec<String>) {
     let mut differences = Vec::new();
@@ -264,8 +264,8 @@ pub fn compare(expected: &Definitions, actual: &Definitions) -> (Vec<String>, Ve
     for key in actual.columns.keys() {
         if named_tables.contains(split(key).0) && !expected.columns.contains_key(key) {
             differences.push(format!(
-                "column {key} is not part of the v1.0 schema; drop it, after saving any data in \
-                 it that you need"
+                "column {key} is not part of migration 1's schema; drop it, after saving any data \
+                 in it that you need"
             ));
         }
     }
@@ -278,8 +278,8 @@ pub fn compare(expected: &Definitions, actual: &Definitions) -> (Vec<String>, Ve
             )),
             Some(found) if found == index => {}
             Some(found) if found.definition != index.definition => differences.push(format!(
-                "{on} is defined as {} where v1.0 defines it as {}; drop it and create it with \
-                 the v1.0 definition",
+                "{on} is defined as {} where migration 1 defines it as {}; drop it and create it \
+                 with migration 1's definition",
                 found.definition, index.definition
             )),
             Some(_) => differences.push(format!(
@@ -295,7 +295,8 @@ pub fn compare(expected: &Definitions, actual: &Definitions) -> (Vec<String>, Ve
             None => differences.push(format!("{on} is missing; add it as {definition}")),
             Some(found) if found == definition => {}
             Some(found) => differences.push(format!(
-                "{on} is {found} where v1.0 has {definition}; drop it and add it as {definition}"
+                "{on} is {found} where migration 1 has {definition}; drop it and add it as \
+                 {definition}"
             )),
         }
     }
@@ -312,9 +313,10 @@ pub fn compare(expected: &Definitions, actual: &Definitions) -> (Vec<String>, Ve
 fn refusal(database: &str, differences: &[String]) -> String {
     let lines: Vec<String> = differences.iter().map(|d| format!("  {d}")).collect();
     format!(
-        "after migration 1 the database {database} differs from the v1.0 schema in {} place(s), \
-         so nothing was committed:\n{}\nMake each change in the database {database}, then run \
-         migrate --yes again; migration 1 checks the schema again before it commits.",
+        "after migration 1 the database {database} differs from migration 1's schema in {} \
+         place(s), so nothing was committed:\n{}\nMake each change in the database \
+         {database}, then run migrate --yes again; migration 1 checks the schema again before \
+         it commits.",
         differences.len(),
         lines.join("\n")
     )
@@ -389,8 +391,9 @@ mod tests {
             differences,
             [
                 "index t_pkey on table t is defined as CREATE UNIQUE INDEX t_pkey ON public.t \
-                 USING btree (id, other) where v1.0 defines it as CREATE UNIQUE INDEX t_pkey ON \
-                 public.t USING btree (id); drop it and create it with the v1.0 definition"
+                 USING btree (id, other) where migration 1 defines it as CREATE UNIQUE INDEX \
+                 t_pkey ON public.t USING btree (id); drop it and create it with migration 1's \
+                 definition"
             ]
         );
         let mut invalid = definitions();
@@ -414,8 +417,8 @@ mod tests {
         assert_eq!(
             differences,
             [
-                "constraint t_pkey on table t is PRIMARY KEY (id, other) where v1.0 has PRIMARY \
-                 KEY (id); drop it and add it as PRIMARY KEY (id)"
+                "constraint t_pkey on table t is PRIMARY KEY (id, other) where migration 1 has \
+                 PRIMARY KEY (id); drop it and add it as PRIMARY KEY (id)"
             ]
         );
     }
@@ -439,11 +442,11 @@ mod tests {
     }
 
     /// Each attribute of a column that differs is named in words with what
-    /// v1.0 has, followed by the definition to change it to; a missing
-    /// column gives the definition to add, and a column v1.0 does not have
-    /// is to be dropped.
+    /// migration 1 has, followed by the definition to change it to; a
+    /// missing column gives the definition to add, and a column migration 1
+    /// does not create is to be dropped.
     #[test]
-    fn a_column_difference_names_each_attribute_and_the_v1_definition() {
+    fn a_column_difference_names_each_attribute_and_migration_1s_definition() {
         let mut actual = definitions();
         actual.columns.insert(
             "t.id".to_owned(),
@@ -458,9 +461,10 @@ mod tests {
         assert_eq!(
             differences,
             [
-                "column t.id has type double precision where v1.0 has integer, allows NULL where \
-                 v1.0 has NOT NULL, has default 1 where v1.0 has none and has collation \"C\" \
-                 where v1.0 has the type's default; change it to integer NOT NULL"
+                "column t.id has type double precision where migration 1 has integer, allows \
+                 NULL where migration 1 has NOT NULL, has default 1 where migration 1 has none \
+                 and has collation \"C\" where migration 1 has the type's default; change it \
+                 to integer NOT NULL"
             ]
         );
         let mut actual = definitions();
@@ -470,7 +474,7 @@ mod tests {
         assert_eq!(
             compare(&expected, &actual).0,
             [
-                "column t.id has no default where v1.0 has 0; change it to integer NOT NULL \
+                "column t.id has no default where migration 1 has 0; change it to integer NOT NULL \
                  DEFAULT 0"
             ]
         );
@@ -489,8 +493,8 @@ mod tests {
             compare(&definitions(), &actual).0,
             [
                 "column t.id is missing; add it as integer NOT NULL",
-                "column t.extra is not part of the v1.0 schema; drop it, after saving any data \
-                 in it that you need"
+                "column t.extra is not part of migration 1's schema; drop it, after saving any \
+                 data in it that you need"
             ]
         );
     }
@@ -506,9 +510,9 @@ mod tests {
         let message = refusal("acme_catalog", &differences);
         assert_eq!(
             message,
-            "after migration 1 the database acme_catalog differs from the v1.0 schema in 2 \
-             place(s), so nothing was committed:\n  column t.id has type bigint where v1.0 has \
-             integer; change it to integer NOT NULL\n  sequence t_seq is missing; create it\n\
+            "after migration 1 the database acme_catalog differs from migration 1's schema in 2 \
+             place(s), so nothing was committed:\n  column t.id has type bigint where migration \
+             1 has integer; change it to integer NOT NULL\n  sequence t_seq is missing; create it\n\
              Make each change in the database acme_catalog, then run migrate --yes again; \
              migration 1 checks the schema again before it commits."
         );
