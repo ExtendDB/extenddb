@@ -188,6 +188,10 @@ impl StoreFixture for S3Fixture {
         &self.sink
     }
 
+    fn folds_case(&self) -> bool {
+        false
+    }
+
     async fn bucket(&self) -> String {
         let name = bucket_name("");
         self.clients

@@ -18,6 +18,7 @@ pub(super) struct FsFixture {
     source: FsSource,
     sink: FsSink,
     buckets: AtomicUsize,
+    folds_case: bool,
 }
 
 impl FsFixture {
@@ -26,6 +27,7 @@ impl FsFixture {
         Self {
             source: FsSource { root: root.root() },
             sink: FsSink { root: root.root() },
+            folds_case: folds_case(&root.root()),
             root,
             buckets: AtomicUsize::new(0),
         }
@@ -37,6 +39,18 @@ impl FsFixture {
         assert!(!key.starts_with('/'), "{key:?} is not a relative path");
         self.root.root().join(ACCOUNT).join(bucket).join(key)
     }
+}
+
+/// Whether the disk beneath `dir` folds letter case: a file created as
+/// `case-probe/a` is found as `case-probe/A`. The probe directory is
+/// outside every account directory, and is removed.
+fn folds_case(dir: &Path) -> bool {
+    let probe = dir.join("case-probe");
+    std::fs::create_dir_all(&probe).unwrap();
+    std::fs::write(probe.join("a"), b"").unwrap();
+    let folds = probe.join("A").exists();
+    std::fs::remove_dir_all(&probe).unwrap();
+    folds
 }
 
 /// The regular files beneath `dir`, as paths relative to `base` joined with
@@ -70,6 +84,10 @@ impl StoreFixture for FsFixture {
 
     fn sink(&self) -> &dyn BulkSink {
         &self.sink
+    }
+
+    fn folds_case(&self) -> bool {
+        self.folds_case
     }
 
     async fn bucket(&self) -> String {

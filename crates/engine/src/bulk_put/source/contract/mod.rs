@@ -61,6 +61,11 @@ trait StoreFixture: Sync {
 
     fn sink(&self) -> &dyn BulkSink;
 
+    /// Whether two keys that differ only in letter case name one object.
+    /// S3 keeps them apart. The filesystem store on a disk that folds case,
+    /// such as a default macOS volume, holds one file for both.
+    fn folds_case(&self) -> bool;
+
     /// A new, empty bucket of the caller's.
     async fn bucket(&self) -> String;
 

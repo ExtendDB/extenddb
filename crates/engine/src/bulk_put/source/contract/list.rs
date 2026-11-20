@@ -69,21 +69,27 @@ pub(super) async fn the_listing_matches_the_prefix_byte_wise<F: StoreFixture>(f:
 }
 
 /// The listing is in byte order of the whole key, whatever the nesting:
-/// `a-b.json`, `a.json` and `a/b.json` sort by their second byte.
+/// `a-b.json`, `a.json` and `a/b.json` sort by their second byte, and
+/// `B.json` before `a.json`. A disk that folds letter case holds `b.json`
+/// and `B.json` as one file, so there the case leaves `b.json` out.
 pub(super) async fn the_listing_is_in_byte_order_of_the_whole_key<F: StoreFixture>(f: &F) {
     let bucket = f.bucket().await;
-    for key in [
+    let mut keys = vec![
         "b.json", "a/z.json", "B.json", "a.json", "a/b.json", "a-b.json",
-    ] {
+    ];
+    let mut listed = vec![
+        "B.json", "a-b.json", "a.json", "a/b.json", "a/z.json", "b.json",
+    ];
+    if f.folds_case() {
+        eprintln!("SKIP b.json beside B.json: the disk folds letter case, so they are one file");
+        keys.retain(|key| *key != "b.json");
+        listed.retain(|key| *key != "b.json");
+    }
+    for key in keys {
         f.put(&bucket, key, &rows(0, 1)).await;
     }
     let files = f.source().list(&at(&bucket), "", 100).await.unwrap();
-    assert_eq!(
-        paths(&files),
-        [
-            "B.json", "a-b.json", "a.json", "a/b.json", "a/z.json", "b.json"
-        ]
-    );
+    assert_eq!(paths(&files), listed);
 }
 
 /// Collecting more than `max_files` ends the listing with `max_files + 1`

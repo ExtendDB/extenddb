@@ -519,6 +519,9 @@ On the filesystem store the layout beneath the root is
 `{path}/{account id}/{S3Bucket}/...`. The
 `S3Bucket` field of a request names a directory inside the caller's account
 subtree, and the `S3KeyPrefix` fields name paths beneath that directory.
+A key is a file path, so on a filesystem that folds letter case, such as a
+default macOS volume, two keys that differ only in case (`b.json` and
+`B.json`) are one file, where S3 keeps two objects.
 Every path is canonicalized and must resolve inside the account subtree, and
 symbolic links that escape it are rejected. At startup the server creates
 `path` if it is missing, logs its canonical form, and creates
