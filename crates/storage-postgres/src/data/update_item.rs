@@ -192,20 +192,20 @@ impl PostgresEngine {
             // Apply update actions and validate the resulting image against the
             // table's vector indexes: vector validity is a property of the stored
             // value, and expression-form checks cannot cover if_not_exists /
-            // list_append / copy-from-attribute forms.
-            expression::apply_update_validated(
+            // list_append / copy-from-attribute forms. Size the update the way
+            // the service does: what the statement writes plus a fixed cost per
+            // clause, against the item limit. A statement over the limit is
+            // refused ahead of the depth check, and an updated item over the
+            // limit after it.
+            expression::apply_update_item_validated(
                 actions,
                 &mut item,
                 maps,
                 &key_info.vector_indexes,
                 &key_info.attribute_definitions,
+                self.max_item_size_bytes,
             )
             .map_err(|e| StorageError::Validation(e.to_string()))?;
-
-            // Size the update the way the service does: what the statement
-            // writes plus a fixed cost per clause, against the item limit.
-            validation::validate_update_item_size(&item, actions, maps, self.max_item_size_bytes)
-                .map_err(|e| StorageError::Validation(e.to_string()))?;
 
             // Secondary-index keys on the written item, as the transacted Update
             // path and the SQLite backend already do. Literal operands were

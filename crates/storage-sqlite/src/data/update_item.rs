@@ -80,19 +80,20 @@ impl SqliteEngine {
         }
 
         // Start from the existing image, or from the key for a fresh upsert.
+        // Size the update the way the service does: what the statement writes
+        // plus a fixed cost per clause, against the item limit. A statement
+        // over the limit is refused ahead of the depth check, and an updated
+        // item over the limit after it.
         let mut item = old.clone().unwrap_or_else(|| key.clone());
-        expression::apply_update_validated(
+        expression::apply_update_item_validated(
             actions,
             &mut item,
             maps,
             &key_info.vector_indexes,
             &key_info.attribute_definitions,
+            self.max_item_size_bytes,
         )
         .map_err(|e| StorageError::Validation(e.to_string()))?;
-        // Size the update the way the service does: what the statement writes
-        // plus a fixed cost per clause, against the item limit.
-        validation::validate_update_item_size(&item, actions, maps, self.max_item_size_bytes)
-            .map_err(|e| StorageError::Validation(e.to_string()))?;
         // Secondary-index key validation on the post-update item, matching the
         // TransactWriteItems update path: a wrong-typed index key attribute or
         // an index key set to an empty value is a ValidationException up front,

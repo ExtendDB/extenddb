@@ -2298,6 +2298,33 @@ pub fn validate_update_item_size(
     Ok(())
 }
 
+/// The statement half of [`validate_update_item_size`], for a standalone
+/// `UpdateItem` written as an expression. It passes an update from a PartiQL
+/// `UPDATE` (`maps.finished_item_sizing`), which is sized by its updated item
+/// alone. It also passes the legacy `AttributeUpdates` form
+/// (`maps.legacy_attribute_updates`), whose figure is computed from the
+/// finished values of the attributes it names.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` with the update wording when
+/// the statement figure exceeds `max_bytes`.
+pub(crate) fn validate_update_statement_size(
+    actions: &[crate::expression::UpdateAction],
+    maps: &crate::expression::ExpressionMaps,
+    max_bytes: usize,
+) -> Result<(), DynamoDbError> {
+    if maps.finished_item_sizing || maps.legacy_attribute_updates {
+        return Ok(());
+    }
+    if update_statement_size(actions, maps)? > max_bytes {
+        return Err(DynamoDbError::ValidationException(
+            ITEM_SIZE_TO_UPDATE_EXCEEDED.to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// The bytes the service charges the operand expression of a `SET` clause:
 /// value placeholders at their size, function calls, arithmetic operators and
 /// document paths at their fixed costs.
@@ -2521,8 +2548,8 @@ pub(crate) const MAX_ITEM_NESTING_DEPTH: usize = 32;
 
 /// Validate that no attribute value in `item` nests beyond `MAX_ITEM_NESTING_DEPTH`.
 pub fn validate_item_nesting_depth(item: &Item) -> Result<(), DynamoDbError> {
-    for value in item.values() {
-        check_attribute_value_depth(value, 0)?;
+    if item.values().any(nests_beyond_item_limit) {
+        return Err(nesting_depth_error());
     }
     Ok(())
 }
@@ -2533,38 +2560,32 @@ pub fn validate_attribute_values_nesting_depth<'a, I>(values: I) -> Result<(), D
 where
     I: IntoIterator<Item = &'a AttributeValue>,
 {
-    for v in values {
-        check_attribute_value_depth(v, 0)?;
+    if values.into_iter().any(nests_beyond_item_limit) {
+        return Err(nesting_depth_error());
     }
     Ok(())
 }
 
-fn check_attribute_value_depth(
-    value: &AttributeValue,
-    current_depth: usize,
-) -> Result<(), DynamoDbError> {
+/// Whether `value` nests beyond `MAX_ITEM_NESTING_DEPTH` levels. A check that
+/// refuses such a value with its own text calls this, so the limit has one
+/// definition.
+pub(crate) fn nests_beyond_item_limit(value: &AttributeValue) -> bool {
+    wrappers_reach_limit(value, 0)
+}
+
+/// Whether `value`, under `current_depth` M or L wrappers, brings the number
+/// of wrappers on some path to `MAX_ITEM_NESTING_DEPTH`.
+fn wrappers_reach_limit(value: &AttributeValue, current_depth: usize) -> bool {
+    let next = current_depth + 1;
     match value {
         AttributeValue::M(map) => {
-            let next = current_depth + 1;
-            if next >= MAX_ITEM_NESTING_DEPTH {
-                return Err(nesting_depth_error());
-            }
-            for v in map.values() {
-                check_attribute_value_depth(v, next)?;
-            }
+            next >= MAX_ITEM_NESTING_DEPTH || map.values().any(|v| wrappers_reach_limit(v, next))
         }
         AttributeValue::L(list) => {
-            let next = current_depth + 1;
-            if next >= MAX_ITEM_NESTING_DEPTH {
-                return Err(nesting_depth_error());
-            }
-            for v in list {
-                check_attribute_value_depth(v, next)?;
-            }
+            next >= MAX_ITEM_NESTING_DEPTH || list.iter().any(|v| wrappers_reach_limit(v, next))
         }
-        _ => {}
+        _ => false,
     }
-    Ok(())
 }
 
 fn nesting_depth_error() -> DynamoDbError {

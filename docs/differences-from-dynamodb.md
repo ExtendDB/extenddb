@@ -186,14 +186,19 @@ remains. The key and untouched attributes are left out. Both the statement figur
 and the finished item are checked against the limit, and a breach refuses with
 `Item size to update has exceeded the maximum allowed size`.
 
-A transacted `Update` and a PartiQL `UPDATE` are sized by the finished item
-alone, with the same wording. For PartiQL this holds in `ExecuteStatement`,
+A transacted `Update` and a PartiQL `UPDATE` are sized by the finished item,
+with the same wording. For PartiQL this holds in `ExecuteStatement`,
 `BatchExecuteStatement` and `ExecuteTransaction` (measured in us-east-1 on
-2026-11-04).
+2026-11-04). The service also refused one transacted `Update` for its size
+before the transaction ran (measured in us-east-1 on 2026-11-10). That
+`Update` set a 409,500-byte value beside a `SET` that took a map past the
+nesting limit. The rule behind that check is not measured, and ExtendDB does
+not have it (the second row below).
 
 | Area | DynamoDB | ExtendDB |
 |------|----------|------|
-| `UpdateItem` item-size accounting | In 31 of 33 commercial regions a standalone `UpdateItem` is sized by the statement (the rule above). At a one-byte key the largest finished item it can produce is 409,581 bytes. Two regions (`eu-south-2`, `me-central-1`) size an `UpdateItem` on the finished item, like a `PutItem`. | PostgreSQL and SQLite follow the 31-region statement rule. A transacted `Update` and a PartiQL `UPDATE` are sized on the finished item on both, as on the service. Cassandra sizes every update on the finished item against a fixed 409,600 bytes; MongoDB applies no item-size limit on updates. |
+| `UpdateItem` item-size accounting | In 31 of 33 commercial regions a standalone `UpdateItem` is sized by the statement (the rule above). At a one-byte key the largest finished item it can produce is 409,581 bytes. Two regions (`eu-south-2`, `me-central-1`) size an `UpdateItem` on the finished item, like a `PutItem`. | PostgreSQL and SQLite follow the 31-region statement rule. On both, a transacted `Update` and a PartiQL `UPDATE` are sized on the finished item, as on the service. The next row gives a transacted `Update` that the service refuses before the transaction runs. Cassandra sizes every update on the finished item against a fixed 409,600 bytes. MongoDB applies no item-size limit on updates. |
+| Transacted `Update` refused before the transaction | A TransactWriteItems `Update` sets a 409,500-byte value, and a second `SET` action takes a map past the nesting limit. The service refuses it with `ValidationException` `Item size to update has exceeded the maximum allowed size` before the transaction runs. The item is unchanged (measured in us-east-1 on 2026-11-10). The rule behind this check is not measured. | The transaction runs and is cancelled with one `ValidationError` reason that carries `Nesting Levels have exceeded supported limits`. In builds before #590, PostgreSQL and SQLite cancelled it with a reason that carried the size message. Tracked in #937. |
 
 ## Capacity and Throttling
 
