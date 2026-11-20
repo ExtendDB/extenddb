@@ -26,6 +26,11 @@ mod connect;
 mod cql;
 mod guarded;
 mod locks;
+// Frozen once released: neither rustfmt nor a later clippy lint may require
+// an edit that changes its checksum.
+#[rustfmt::skip]
+#[allow(clippy::all, deprecated)]
+mod m0006_backup_catalog_index;
 pub mod postcheck;
 mod registrar;
 mod registrations;
@@ -48,11 +53,19 @@ pub use backend::{CassandraMigrations, CassandraStores};
 pub use commands::CassandraCatalogMigrations;
 pub(crate) use commands::lease_of;
 pub use connect::Deployment;
-pub(crate) use connect::{LOCKED_DDL_TIMEOUT, REQUEST_TIMEOUT};
+pub(crate) use connect::{
+    LOCKED_DDL_TIMEOUT, REQUEST_TIMEOUT, alter_steps, cluster_datacenters, replication_differs,
+    tables_of,
+};
+// Public for the integration tests only.
+#[cfg(any(test, feature = "test-util"))]
+pub use connect::{ReplicationChange, replication_mismatches};
+#[cfg(not(any(test, feature = "test-util")))]
+pub(crate) use connect::{ReplicationChange, replication_mismatches};
 pub(crate) use locks::LeaseHandle;
 pub use locks::{LeaseTimes, MigrationLock};
 pub use registrar::ServerRegistration;
-pub use registrations::{RegistrationTimes, ServingRegistration};
+pub use registrations::{RegistrationTimes, SERVE_COMMAND, ServingRegistration};
 
 use crate::cassandra_util::CassandraSession;
 
@@ -74,8 +87,127 @@ pub(crate) const CATALOG_EXPECTED: &str =
 pub(crate) const ACCOUNT_EXPECTED: &str =
     include_str!("../../migrations/account/0001_baseline.expected.json");
 
-/// Checksums of the released bodies (none until v1.0).
-pub(crate) const RELEASED: &[Released] = &[];
+/// Checksums of the released bodies, every migration at or below
+/// `RELEASED_THROUGH`.
+pub(crate) const RELEASED: &[Released] = &[
+    Released {
+        id: MigrationId::Baseline,
+        store: StoreKind::Catalog,
+        checksum: "69e43d5b7ca2ad3c9a357eda54d2c9cd7b7b27edc461dd37e4c6e1a7f6a3f483",
+        fingerprint: None,
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::Baseline,
+        store: StoreKind::Account,
+        checksum: "7120e35ef62f8d66cb0e35a00f606411a83cbe5f733271169ca9740814f7b991",
+        fingerprint: None,
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::ResourceTagConditionKeys,
+        store: StoreKind::Catalog,
+        checksum: "80c502c54ef9240ab5f64b24b060261a295e41d29954d9b492b83c64c444170e",
+        fingerprint: Some("0002_resource_tag_condition_keys/1"),
+        kind: Kind::Breaking,
+        convergent: false,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::SortKeyDefinitions,
+        store: StoreKind::Catalog,
+        checksum: "de1643152979168a2a4f806c19c99751f78b1cf21bf8e513396f8d44e1610c93",
+        fingerprint: None,
+        kind: Kind::Additive,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::IndexTableBaseKey,
+        store: StoreKind::Catalog,
+        checksum: "b746760f188138e35490c08ce40a9545dc889461419f55a8572502e7225bed66",
+        fingerprint: None,
+        kind: Kind::Additive,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::DropContinuousBackups,
+        store: StoreKind::Catalog,
+        checksum: "44a5e8e1978724b5f3a309d3a437688a0034ce95d5855b8e2d3deb69c603873b",
+        fingerprint: None,
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::BackupCatalogIndex,
+        store: StoreKind::Catalog,
+        checksum: "45352bad164748f9ddb072031cd35488c11f9f2d428f3e20b623ddda64a99330",
+        fingerprint: Some("0006_backup_catalog_index/cassandra/1"),
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::StreamPending,
+        store: StoreKind::Catalog,
+        checksum: "9d8b3fa7e8cb186bb92ef8e595f2a1d2847881dc6a21e3a4204ad0aac5ec667a",
+        fingerprint: None,
+        kind: Kind::Additive,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::RestoreProgress,
+        store: StoreKind::Catalog,
+        checksum: "ca346592755f9f3f172fc78aea2c5a8e901a31b16bca28eb375a36e3687e961a",
+        fingerprint: None,
+        kind: Kind::Additive,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::WarmThroughput,
+        store: StoreKind::Catalog,
+        checksum: "d5f50b607d377a316d07d8e962b67c08a821aa19f4bdf7eea7dd5e3e5630d6ac",
+        fingerprint: None,
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::AccountMetrics,
+        store: StoreKind::Catalog,
+        checksum: "5c868bb49143fcb9180e16a7584f09ba11ca1594ed8a45492b0a5866d7e3ee7b",
+        fingerprint: None,
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::AttributeNameEscape,
+        store: StoreKind::Catalog,
+        checksum: "764e80eb7f995c15d6a8fb1feb5611befaaa2fc5df9024ecc52cb64b39383871",
+        fingerprint: None,
+        kind: Kind::Additive,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::UniqueAccessKeyIds,
+        store: StoreKind::Catalog,
+        checksum: "17e0af138cf802384f025408af64bfc3349588bbdbc7b688e2c59f7aa2c5e0ff",
+        fingerprint: None,
+        kind: Kind::Additive,
+        convergent: true,
+        rebless: None,
+    },
+];
 
 /// This backend's entry for every id. Public so `migrate --list` can print
 /// each migration's kind without connecting.
@@ -127,6 +259,60 @@ pub fn migration(id: MigrationId) -> Migration<CassandraStores> {
                 "0005_drop_continuous_backups.cql"
             )],
         },
+        // Breaking: a binary without it neither reads the index nor writes
+        // the job record on the restore registrations it creates, so a
+        // restore it ran would be owned by nobody. Convergent: every
+        // statement is `IF NOT EXISTS`, the backfill writes only a
+        // registration whose job status is unset, which no registration
+        // this release writes is (each is inserted with its job record), and
+        // the catalog id is inserted only when absent; so a second run over
+        // data written since changes nothing but a registration a release
+        // before it wrote, which is the repair `--reconverge` is for.
+        MigrationId::BackupCatalogIndex => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![StoreBody::code(
+                StoreKind::Catalog,
+                &m0006_backup_catalog_index::BackupCatalogIndex,
+                m0006_backup_catalog_index::SOURCE,
+            )],
+        },
+        MigrationId::StreamPending => Migration::NotApplicable(
+            "the stream_pending table belongs to the PostgreSQL backend, and Cassandra numbers its \
+             stream records with the server's clock (#660)",
+        ),
+        MigrationId::RestoreProgress => Migration::NotApplicable(
+            "a store-backed restore records its progress on the target's catalog tables row \
+             (restore_file_index, restore_items_applied, which migration 6 adds); the \
+             restore_progress table is PostgreSQL's data database's",
+        ),
+        MigrationId::WarmThroughput => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Catalog,
+                "migrations/catalog",
+                "0009_warm_throughput.cql"
+            )],
+        },
+        MigrationId::AccountMetrics => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Catalog,
+                "migrations/catalog",
+                "0010_account_metrics.cql"
+            )],
+        },
+        MigrationId::AttributeNameEscape => Migration::NotApplicable(
+            "Cassandra stores the documents that carry attribute names as JSON text in text \
+             columns, where U+0000 is the six-character escape \\u0000, so every name reads back \
+             as it was written",
+        ),
+        MigrationId::UniqueAccessKeyIds => Migration::NotApplicable(
+            "access_key_id is the primary key of access_keys, and an import writes with IF NOT \
+             EXISTS, so an ID can be stored once",
+        ),
         MigrationId::EscapeControlChars => Migration::NotApplicable(
             "Cassandra stores U+0000 in strings as written, so its stored form of strings does \
              not change",
@@ -278,12 +464,38 @@ pub async fn migrate_catalog_keyspace(
     release: &str,
     timeout: std::time::Duration,
 ) -> Result<RunReport, MigrationError> {
+    migrate_catalog_keyspace_through(
+        session,
+        keyspace_prefix,
+        release,
+        timeout,
+        MigrationId::LATEST,
+    )
+    .await
+}
+
+/// [`migrate_catalog_keyspace`] stopping after migration `through`: for
+/// tests of a catalog a later migration has not reached.
+///
+/// # Errors
+///
+/// As [`migrate_catalog_keyspace`].
+#[cfg(any(test, feature = "test-util"))]
+pub async fn migrate_catalog_keyspace_through(
+    session: Arc<CassandraSession>,
+    keyspace_prefix: &str,
+    release: &str,
+    timeout: std::time::Duration,
+    through: MigrationId,
+) -> Result<RunReport, MigrationError> {
     let catalog = format!("{keyspace_prefix}_catalog");
     create_lock_table(&session, &catalog).await?;
     let lock = MigrationLock::acquire(session, &catalog, LeaseTimes::DEFAULT, timeout).await?;
     let result = {
         let migrations = CassandraMigrations::locked_catalog_only(&lock, keyspace_prefix);
-        Runner::new(&migrations, release).migrate().await
+        Runner::new(&migrations, release)
+            .migrate_through(through)
+            .await
     };
     lock.release().await;
     result
@@ -302,7 +514,7 @@ pub async fn wait_for_schema_agreement(session: &CassandraSession) -> Result<(),
 }
 
 /// Run migration 1's body for stores of `kind` in `keyspace` and record
-/// nothing, as a release before 1.0 left a catalog with these tables and no
+/// nothing, as a release before 0.1.15 left a catalog with these tables and no
 /// ledger: for the tests of adoption.
 ///
 /// # Errors
@@ -541,7 +753,7 @@ pub async fn foreign_contents(
 }
 
 /// The (table, column) pairs migration 1 adds to the catalog keyspace with
-/// `ALTER TABLE ... ADD IF NOT EXISTS`: a table an `init` or a 0.1.x release
+/// `ALTER TABLE ... ADD IF NOT EXISTS`: a table an `init` or a release up to 0.1.14
 /// created before such a statement lacks them, and migration 1 adds them.
 fn baseline_added_columns() -> std::collections::BTreeSet<(&'static str, &'static str)> {
     CATALOG_BASELINE
@@ -675,11 +887,31 @@ pub async fn register_server(
     host: &str,
     release: &str,
 ) -> Result<ServerRegistration, MigrationError> {
-    register_server_timed(
+    register_server_as(session, keyspace_prefix, host, release, SERVE_COMMAND).await
+}
+
+/// [`register_server`] for the process `command` names: `extenddb serve`
+/// ([`SERVE_COMMAND`]) or a command that opens the catalog as a server does
+/// (`extenddb backup list`), whose row carries its name (the registrations
+/// module doc says where) and whose refusal while a migration holds the
+/// lock names the holder without the server's advice to start the server.
+///
+/// # Errors
+///
+/// As [`register_server`].
+pub async fn register_server_as(
+    session: Arc<CassandraSession>,
+    keyspace_prefix: &str,
+    host: &str,
+    release: &str,
+    command: &str,
+) -> Result<ServerRegistration, MigrationError> {
+    register_server_with(
         session,
         keyspace_prefix,
         host,
         release,
+        command,
         RegistrationTimes::DEFAULT,
     )
     .await
@@ -697,6 +929,26 @@ pub async fn register_server_timed(
     release: &str,
     times: RegistrationTimes,
 ) -> Result<ServerRegistration, MigrationError> {
+    register_server_with(
+        session,
+        keyspace_prefix,
+        host,
+        release,
+        SERVE_COMMAND,
+        times,
+    )
+    .await
+}
+
+async fn register_server_with(
+    session: Arc<CassandraSession>,
+    keyspace_prefix: &str,
+    host: &str,
+    release: &str,
+    command: &str,
+    times: RegistrationTimes,
+) -> Result<ServerRegistration, MigrationError> {
+    let release = &registrations::release_cell(release, command);
     let catalog = format!("{keyspace_prefix}_catalog");
     agreement::wait_for_agreement(&session, AGREEMENT_TIMEOUT).await?;
     if !connect::table_exists(&session, &catalog, "extenddb_servers").await? {
@@ -715,9 +967,15 @@ pub async fn register_server_timed(
             .await?;
     let checked = async {
         if let Some(holder) = locks::lock_holder(&session, &catalog).await? {
+            // A command's refusal ends at the holder; the command's caller
+            // adds that it is retried once the migration has finished.
+            let then = if command == SERVE_COMMAND {
+                "; start the server again when it finishes"
+            } else {
+                ""
+            };
             return Err(MigrationError::Locked(format!(
-                "a migration holds the catalog's migration lock (holder {holder}); start the \
-                 server again when it finishes"
+                "a migration holds the catalog's migration lock (holder {holder}){then}"
             )));
         }
         match catalog_status(session.clone(), keyspace_prefix).await? {

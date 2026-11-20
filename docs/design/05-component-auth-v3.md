@@ -12,7 +12,7 @@ The `auth` crate provides pluggable authentication and authorization for extendd
 
 The crate depends on `extenddb-core` (for types and errors) and `async_trait` (for object-safe async trait dispatch). It has no HTTP framework or storage dependencies.
 
-> **No caching.** All credential lookups, policy fetches, and identity resolution read directly from Postgres on every request. The latency is sub-millisecond for indexed lookups, and this approach eliminates stale-cache bugs and cache invalidation complexity entirely. Multiple extenddb instances sharing the same catalog see consistent data without coordination. If profiling under production load shows database round-trips are a bottleneck, caching can be added as a transparent layer without changing any interfaces.
+> **Caching.** Credential lookups and policy fetches go through in-memory caches with write-through invalidation and a TTL: the credential cache in this crate (`credential_cache.rs`) and the authorization caches in the server crate (`authz_cache.rs`). `docs/design/12-auth-authz-cache.md` describes that design and replaces the "no caching" decision this document originally recorded. The credential cache holds no plaintext secret or session token: for each access key it keeps the principal fields, the SHA-256 of the session token and one SigV4 signing key per scope date in use, in the locked key store of this crate (`secmem.rs`), which keeps its pages out of swap and core dumps.
 
 ## 2. Key Design Decisions (from 2026-04-15 review session)
 
@@ -266,7 +266,7 @@ When `extenddb init` creates the first admin user, it seeds a default policy. Wh
 }
 ```
 
-Note: the `${account_id}` and `${user_name}` in the default policy are literal substitutions performed at user creation time, not IAM policy variables. Policy variable support (REQ-ABAC-006) remains deferred.
+Note: the `${account_id}` and `${user_name}` in the default policy are literal substitutions performed at user creation time, not IAM policy variables. IAM policy variables are expanded when a policy is evaluated (REQ-ABAC-006, `policy/variables.rs`).
 
 ## 6. Catalog Schema Changes for Multi-Account
 
@@ -321,11 +321,11 @@ The `OperationContext` carries `account_id` from auth resolution. Every engine d
 Unchanged from v2.0 §5.1. The server-side flow:
 
 1. Parse `Authorization: AWS4-HMAC-SHA256 Credential=<access_key>/<date>/<region>/dynamodb/aws4_request, SignedHeaders=<headers>, Signature=<hex>`
-2. Look up `access_key_id` → `StoredCredential` (encrypted secret, account_id, user_name)
-3. Decrypt secret key (AES-256-GCM)
+2. Look up `access_key_id` in the credential cache; on a miss, read `StoredCredential` (encrypted secret, account_id, user_name) from the catalog
+3. On a miss, decrypt the secret key (AES-256-GCM), derive the signing key of step 6 into a slot of the locked key store, and wipe the secret; a hit uses the cached signing key
 4. Validate timestamp (X-Amz-Date within ±15 minutes)
 5. Reconstruct canonical request from HTTP method, URI, signed headers, body hash
-6. Derive signing key: 4-step HMAC-SHA256 chain (date → region → service → aws4_request)
+6. Derive signing key: 4-step HMAC-SHA256 chain (date → region → service → aws4_request), once per access key and scope date
 7. Compute expected signature
 8. Constant-time compare
 9. On match: resolve full identity (user or role session)
@@ -403,11 +403,13 @@ Flow:
 
 ## 10. Encryption Key Management
 
-Secret keys are encrypted at rest with AES-256-GCM. The encryption key is generated at `extenddb init` time and stored in the `settings` table. The threat model is: the Postgres database is the trust boundary. If an attacker can read the settings table, they already have access to all data.
+Secret keys are encrypted at rest with AES-256-GCM. By default the encryption key is generated at `extenddb init` time and stored in the `settings` table, with the access key ID as the additional authenticated data (AAD), and the catalog database is the trust boundary: a reader of the settings table holds the key and every stored secret.
 
 ```sql
 INSERT INTO settings (key, value) VALUES ('encryption_key', '<base64-encoded-32-byte-key>');
 ```
+
+With `[auth.encryption] key_file` set, a key-encryption key (KEK) in a file on the server host wraps a data encryption key (DEK), and the catalog holds only the wrapped DEK, in the `settings` row `encryption_key_ring`, together with the KEK's id and the state of an unfinished switch or rotation. The KEK authenticates every field of the ring through the AAD of each wrapped DEK. Each stored secret written under the DEK carries an AAD that binds it to its row: `extenddb-secret-v1|<catalog_id>|<table>|<access_key_id>|<account_id>|<user or role name>|<session name or empty>|<expires_at in whole Unix seconds, or empty>`, each field as its length in decimal, a colon and the bytes, so a writer to the catalog without the key cannot reassign a secret to another principal or extend a session. The server reads the KEK once at startup, unwraps the DEK into the locked key store and wipes the KEK. The `extenddb encryption-key` commands switch a deployment to a KEK file, rewrap the DEK under a new KEK, replace the DEK, and recover a restored catalog whose KEK is lost. The Security Model's threat model table gives what each attacker gets in each mode, and the admin guide's Encryption Key section the commands and the delivery routes of the file.
 
 ## 11. Management API Endpoints
 
@@ -492,6 +494,6 @@ These must match real DynamoDB error format (HTTP status, error code, message st
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

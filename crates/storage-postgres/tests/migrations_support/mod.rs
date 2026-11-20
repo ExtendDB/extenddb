@@ -215,14 +215,14 @@ impl Scratch {
 
     /// The runner's target, which writes the data connection rows as `init`.
     /// The tests hold sessions of their own on the scratch databases (lock
-    /// holders, observers), so the target leaves out migration 6's check for
+    /// holders, observers), so the target leaves out migration 13's check for
     /// other sessions; [`Scratch::target_checking_sessions`] keeps it.
     pub fn target(&self) -> PostgresTarget {
         self.target_checking_sessions()
             .with_other_sessions_allowed()
     }
 
-    /// [`Scratch::target`] with migration 6's check for other sessions, as
+    /// [`Scratch::target`] with migration 13's check for other sessions, as
     /// `extenddb migrate --yes` runs it.
     pub fn target_checking_sessions(&self) -> PostgresTarget {
         PostgresTarget::new(self.options(), &self.data_name)
@@ -575,4 +575,29 @@ pub fn note_steps(note: &str) -> Vec<(String, String)> {
         n += 1;
     }
     steps
+}
+
+/// Compare `actual` with `tests/fixtures/golden/<name>`, or write the file
+/// when `EXTENDDB_BLESS_EXPECTED=1`.
+pub fn golden(name: &str, actual: &str) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/golden")
+        .join(name);
+    if bless() {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, actual).unwrap();
+        return;
+    }
+    let expected =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    assert_eq!(actual, expected, "{name} differs from its golden file");
+}
+
+/// The ledger notes of migration `id` in the store `catalog` connects to.
+pub async fn notes(catalog: &PgPool, id: i32) -> String {
+    sqlx::query_scalar("SELECT notes FROM extenddb_migrations WHERE id = $1")
+        .bind(id)
+        .fetch_one(catalog)
+        .await
+        .unwrap()
 }

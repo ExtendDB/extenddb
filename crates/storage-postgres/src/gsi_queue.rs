@@ -35,6 +35,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tokio::sync::Notify;
 
+use crate::catalog_json::{from_catalog_json, to_catalog_json};
+
 /// Number of worker tasks consuming from the persistent queue.
 ///
 /// Fixed invariant: a row's `worker_partition` is `hash(base_key) % NUM_WORKERS`
@@ -170,7 +172,7 @@ pub(crate) fn partition_for(base_pk_text: &str) -> i32 {
 /// which `new_item` carries for puts and updates and `old_item` for deletes
 /// (the base key is immutable over an item's lifetime). The key text is the
 /// stored (escaped) form, so a key holding U+0001 hashes differently from the
-/// raw text a build without the escape hashed; catalog migration 6,
+/// raw text a build without the escape hashed; catalog migration 13,
 /// `escape_control_chars`, recomputes the column of such rows through this
 /// function.
 pub(crate) fn worker_partition(
@@ -342,7 +344,10 @@ pub(crate) async fn enqueue_gsi_pending(
 ) -> Result<(), StorageError> {
     let old_json = old_item.map(crate::data::item_to_json).transpose()?;
     let new_json = new_item.map(crate::data::item_to_json).transpose()?;
-    let context_json = crate::data::to_stored_json(context)?;
+    // The context carries attribute names, so it is stored in the form of the
+    // catalog documents it was read from (`catalog_json`); the item images
+    // are stored in the form of `item_data` (`item_to_json`).
+    let context_json = to_catalog_json(context)?;
     let worker_partition = worker_partition(old_item, new_item, context)?;
 
     let delay_interval = jitter_delay_ms(delay_ms) as f64 / 1000.0;
@@ -590,7 +595,7 @@ fn decode_row(
 ) -> Result<(Option<Item>, Option<Item>, PendingApplyContext), StorageError> {
     let old_item: Option<Item> = old_json.map(crate::data::json_to_item).transpose()?;
     let new_item: Option<Item> = new_json.map(crate::data::json_to_item).transpose()?;
-    let context: PendingApplyContext = crate::data::stored_json_to(ctx_json)?;
+    let context: PendingApplyContext = from_catalog_json(ctx_json)?;
     Ok((old_item, new_item, context))
 }
 

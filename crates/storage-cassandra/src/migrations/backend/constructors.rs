@@ -110,13 +110,15 @@ impl<'l> CassandraMigrations<'l> {
     /// Stop this run before its `requests`-th write, as a migrator killed
     /// there stops: for the crash-and-rerun tests. Every write the backend
     /// sends counts (a file's statements, the ledger table and its rows, the
-    /// version row, an account keyspace, the start of a code body) and so does
-    /// each policy write of migration 2's body; reads do not.
+    /// version row, an account keyspace, the start of a code body), and so
+    /// do each policy write of migration 2's body and each write migration
+    /// 6's body sends; reads do not.
     #[cfg(any(test, feature = "test-util"))]
     #[must_use]
     pub fn stop_after(mut self, requests: usize) -> Self {
         let left = Arc::new(std::sync::atomic::AtomicUsize::new(requests));
         self.stores.management.stop_after(Arc::clone(&left));
+        self.stores.stop_after = Some(Arc::clone(&left));
         self.stop_after = Some(left);
         self
     }

@@ -20,10 +20,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use cdrs_tokio::consistency::Consistency;
-use extenddb_storage::management_store::ManagementStore;
+use extenddb_storage::management_store::{ManagementStore, SettingsStore};
 use extenddb_storage::migrations::{
-    CatalogTraces, Done, HasManagementStore, LedgerColumns, LedgerRow, Migration, MigrationBackend,
-    MigrationError, MigrationId, Released, Step, StoreKind, StoreRef, record_rows,
+    CatalogTraces, Done, HasManagementStore, LedgerColumns, LedgerRow, LockedStores, Migration,
+    MigrationBackend, MigrationError, MigrationId, Released, Step, StoreKind, StoreRef,
+    record_rows,
 };
 
 use super::agreement::{AGREEMENT_TIMEOUT, wait_for_agreement_with};
@@ -41,36 +42,135 @@ use crate::catalog_store::CassandraCatalogStore;
 /// The handle code bodies receive: the session, the keyspace names and the
 /// catalog's management store (migration 2 rewrites policies through it),
 /// every call of which is bounded by the request timeout and, under the
-/// lock, checked against the lease.
+/// lock, checked against the lease. A body that sends requests on
+/// [`Self::session`] itself checks [`Self::check`] before each write and
+/// executes CQL files through [`Self::run_file`], as the runner does.
 pub struct CassandraStores {
     pub(crate) session: Arc<CassandraSession>,
     pub(crate) keyspace_prefix: String,
     management: LeasedManagementStore,
+    /// The lease of the lock the run holds, or works under.
+    lease: Option<LeaseHandle>,
+    /// The test hook's request budget: `None` outside the tests.
+    stop_after: Option<Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+/// The error a write meets once the test hook's budget is spent.
+fn stopped_by_hook() -> MigrationError {
+    MigrationError::Store(
+        "stopped by the test hook before a write, as a killed migrator stops".to_owned(),
+    )
 }
 
 impl CassandraStores {
-    fn new(
+    pub(super) fn new(
         session: Arc<CassandraSession>,
         keyspace_prefix: &str,
         lease: Option<LeaseHandle>,
     ) -> Self {
         Self {
             management: LeasedManagementStore::new(
-                CassandraCatalogStore::catalog_only(session.clone(), keyspace_prefix.to_owned()),
-                lease,
+                CassandraCatalogStore::catalog_only(session.clone(), keyspace_prefix.to_owned())
+                    .reading_key_rows_at_all(),
+                lease.clone(),
             ),
             session,
             keyspace_prefix: keyspace_prefix.to_owned(),
+            lease,
+            stop_after: None,
         }
     }
 
     pub(crate) fn catalog_keyspace(&self) -> String {
         format!("{}_catalog", self.keyspace_prefix)
     }
+
+    /// Stop before a write when the lease's deadline has passed, or when
+    /// the test hook's budget is spent.
+    ///
+    /// # Errors
+    ///
+    /// The lease may have lapsed, or the hook stopped the run.
+    pub(crate) fn check(&self) -> Result<(), MigrationError> {
+        if stopped(self.stop_after.as_deref()) {
+            return Err(stopped_by_hook());
+        }
+        self.lease.as_ref().map_or(Ok(()), LeaseHandle::check)
+    }
+
+    /// Record that a request completed, which keeps the lease's renewal
+    /// going.
+    pub(crate) fn progress(&self) {
+        if let Some(lease) = &self.lease {
+            lease.progress();
+        }
+    }
+
+    /// The bound on a schema statement: shorter than the lease's margin when
+    /// the run holds or works under a lease (see [`ddl_bound`]).
+    pub(crate) fn ddl_timeout(&self) -> std::time::Duration {
+        ddl_bound(self.lease.is_some())
+    }
+
+    /// Wait for schema agreement, as progress of a leased run.
+    pub(crate) async fn agree(&self) -> Result<(), MigrationError> {
+        wait_for_agreement_with(&self.session, AGREEMENT_TIMEOUT, || self.progress()).await?;
+        self.progress();
+        Ok(())
+    }
+
+    /// Execute file `name`'s statements in `keyspace`, each with its table
+    /// qualified by the keyspace, checking the lease before each one,
+    /// recording progress when each completes, and waiting for schema
+    /// agreement after each DDL statement: a file body's run, and a code
+    /// body's that executes a file.
+    ///
+    /// # Errors
+    ///
+    /// A statement the runner cannot qualify (before any runs), the lease
+    /// lapsed, or a statement or the agreement wait failed.
+    pub(crate) async fn run_file(
+        &self,
+        keyspace: &str,
+        name: &str,
+        text: &str,
+    ) -> Result<(), MigrationError> {
+        for statement in statements(keyspace, name, text)? {
+            self.check()?;
+            send_within(
+                &self.session,
+                &statement.text,
+                cdrs_tokio::query_values!(),
+                Consistency::Quorum,
+                None,
+                &format!("migration file {name} in {keyspace}"),
+                self.ddl_timeout(),
+            )
+            .await?;
+            self.progress();
+            if statement.ddl {
+                self.agree().await?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl HasManagementStore for CassandraStores {
     fn management_store(&self) -> &dyn ManagementStore {
+        &self.management
+    }
+}
+
+/// The catalog's stores for the encryption-key commands, which open them
+/// under the lock they hold as a migration does: every call checks the
+/// lease first and is bounded by the request timeout.
+impl LockedStores for CassandraStores {
+    fn management(&self) -> &dyn ManagementStore {
+        &self.management
+    }
+
+    fn settings(&self) -> &dyn SettingsStore {
         &self.management
     }
 }
@@ -127,7 +227,7 @@ pub(crate) fn stopped(left: Option<&std::sync::atomic::AtomicUsize>) -> bool {
         return false;
     };
     // A compare-exchange loop: `fetch_update` is deprecated on current
-    // stable and its replacement does not exist on 1.88.
+    // stable and its replacement is unstable on 1.91.1.
     let mut n = left.load(Ordering::SeqCst);
     loop {
         let Some(next) = n.checked_sub(1) else {
@@ -149,9 +249,7 @@ impl CassandraMigrations<'_> {
     /// test hook's budget is spent.
     fn check(&self) -> Result<(), MigrationError> {
         if stopped(self.stop_after.as_deref()) {
-            return Err(MigrationError::Store(
-                "stopped by the test hook before a write, as a killed migrator stops".to_owned(),
-            ));
+            return Err(stopped_by_hook());
         }
         match (self.lock, &self.lease) {
             (Some(lock), _) => lock.check(),
@@ -199,30 +297,6 @@ impl CassandraMigrations<'_> {
             Some(lock) => lock.guard(work).await,
             None => work.await,
         }
-    }
-
-    /// Execute a file body's statements in `keyspace`, checking the lock
-    /// before each one, recording progress when each completes, and waiting
-    /// for schema agreement after each DDL statement.
-    async fn run_file(&self, keyspace: &str, name: &str, text: &str) -> Result<(), MigrationError> {
-        for statement in statements(keyspace, name, text)? {
-            self.check()?;
-            send_within(
-                self.session(),
-                &statement.text,
-                cdrs_tokio::query_values!(),
-                Consistency::Quorum,
-                None,
-                &format!("migration file {name} in {keyspace}"),
-                self.ddl_timeout(),
-            )
-            .await?;
-            self.progress();
-            if statement.ddl {
-                self.agree().await?;
-            }
-        }
-        Ok(())
     }
 
     /// Create a missing account keyspace with the catalog keyspace's
@@ -282,8 +356,9 @@ struct KeyspaceLedger<'a> {
     keyspace: &'a str,
     /// The `catalog_version` to write with this keyspace's row. Migration
     /// 1's row and the version go in one logged batch: a stop between two
-    /// writes would leave that row beside a 0.1.x version row, which the
-    /// next run reads as a catalog an older release wrote to. A later row
+    /// writes would leave that row beside the dotted version row of 0.1.14
+    /// or earlier, which the next run reads as a catalog an older release
+    /// wrote to. A later row
     /// goes on its own, after the version, since its notes can be long and a
     /// logged batch is refused past the node's `batch_size_fail_threshold`
     /// (50 KB by default). A stop between them leaves the version ahead of
@@ -461,7 +536,7 @@ impl MigrationBackend for CassandraMigrations<'_> {
         }
         let done = match step {
             Step::File { name, text } => {
-                self.run_file(&store.name, name, text).await?;
+                self.stores.run_file(&store.name, name, text).await?;
                 Done::default()
             }
             Step::Code(body) => {
@@ -471,7 +546,7 @@ impl MigrationBackend for CassandraMigrations<'_> {
             Step::Record => Done::default(),
         };
         // The first time migration 1 is applied to a store, the store must
-        // match the v1.0 schema; a later --reconverge leaves its row as it
+        // match migration 1's schema; a later --reconverge leaves its row as it
         // is and is not checked, since later migrations change the schema.
         if id == MigrationId::Baseline && row.is_some() {
             self.agree().await?;

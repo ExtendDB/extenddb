@@ -4,13 +4,13 @@
 """Catalog migration tests against a live PostgreSQL deployment.
 
 The vector index schema and the backup table definitions are part of
-migration 1, which creates the v1.0 catalog on an empty database and brings a
+migration 1, which creates the catalog schema on an empty database and brings a
 released catalog to the same schema, and migration 5 drops the
 `continuous_backups` table. These tests load a deployment of a release from
 before the vector index schema, from its committed fixture, and check that
 the binary refuses to serve it, that `extenddb migrate` upgrades it, and that
 the upgraded deployment then serves. They also check that `migrate --yes`
-applies migration 6 to a deployment holding a table and a backup and stops
+applies migration 13 to a deployment holding a table and a backup and stops
 while another session holds the catalog, that
 `--reconverge` runs every convergent migration again on a current catalog,
 and that a catalog ledger row for a migration this binary does not carry
@@ -63,6 +63,10 @@ LISTED = re.compile(
 # The same lines, for a migration that is not convergent.
 NOT_CONVERGENT = re.compile(r"^\s*(\d+)\s+\S+\s+(?:breaking|additive)\s+not convergent\s")
 
+# The line of a migration that does not apply on PostgreSQL. The runner
+# records it in the catalog's ledger and has no body to run again.
+NOT_APPLICABLE = re.compile(r"^\s*(\d+)\s+\S+\s+not applicable: ")
+
 
 @functools.cache
 def _not_convergent():
@@ -77,12 +81,24 @@ def _not_convergent():
 
 
 @functools.cache
+def _not_applicable():
+    """The ids `migrate --list` marks as not applicable on PostgreSQL."""
+    listed = _run_extenddb("migrate", "--list")
+    return {
+        int(match.group(1))
+        for match in map(NOT_APPLICABLE.match, listed.stdout.splitlines())
+        if match
+    }
+
+
+@functools.cache
 def _listed():
     """The stores of every migration the binary carries, by id, from
     `migrate --list`, which opens no database. Adding a migration then needs
-    no edit here; a literal id in a test means that migration itself."""
+    no edit here; a literal id in a test means that migration itself. A
+    migration that does not apply records its row in the catalog only."""
     listed = _run_extenddb("migrate", "--list")
-    stores = {}
+    stores = {i: ["catalog"] for i in _not_applicable()}
     for line in listed.stdout.splitlines():
         match = LISTED.match(line)
         if match:
@@ -180,7 +196,7 @@ def _init(cli_env):
 
 def _seed_table_and_backup(cli_env):
     """Create a table, an item and a backup through the running server, so
-    that both bodies of migration 6 check for other sessions: the data body
+    that both bodies of migration 13 check for other sessions: the data body
     while the catalog lists a table, the catalog body while `backup_items`
     holds a row."""
     import uuid
@@ -230,19 +246,19 @@ def _seed_table_and_backup(cli_env):
         time.sleep(0.5)
 
 
-def _forget_migration_6(cli_env):
-    """Take migration 6 out of both ledgers and set the catalog version back
-    to 5, as a deployment of the release before it holds them. The rows this
+def _forget_migration_13(cli_env):
+    """Take migration 13 out of both ledgers and set the catalog version back
+    to 12, as a deployment of the release before it holds them. The rows this
     build wrote hold no U+0001, so the migration rewrites none of them when it
     runs again."""
     for database in (cli_env["db_name"], _data_db(cli_env)):
         conn = _conn(database)
         try:
             with conn.cursor() as cur:
-                cur.execute("DELETE FROM extenddb_migrations WHERE id = 6")
+                cur.execute("DELETE FROM extenddb_migrations WHERE id = 13")
                 if database == cli_env["db_name"]:
                     cur.execute(
-                        "UPDATE settings SET value = '5' WHERE key = 'catalog_version'"
+                        "UPDATE settings SET value = '12' WHERE key = 'catalog_version'"
                     )
         finally:
             conn.close()
@@ -309,7 +325,7 @@ def _load_released_state(cli_env, state):
 
 
 class TestVectorCatalogMigration:
-    """Migrations from a catalog a release before 1.0 created, on the ledger."""
+    """Migrations from a catalog a release before 0.1.15 created, on the ledger."""
 
     def test_init_creates_the_catalog_at_the_current_migration(self, cli_env):
         """A fresh init records every migration in both ledgers and the version.
@@ -331,7 +347,7 @@ class TestVectorCatalogMigration:
         assert _ids_in("catalog") == list(range(1, _latest() + 1))
         data_ids = _ledger_ids(_data_db(cli_env))
         assert data_ids == _ids_in("data")
-        # Migrations 1 and 4 have bodies in the data database.
+        # Migrations 1, 4, 7 and 8 have bodies in the data database.
         assert data_ids[:2] == [1, 4], data_ids
 
         # Migration 1 also writes the legacy ledger rows, so a release before
@@ -354,7 +370,7 @@ class TestVectorCatalogMigration:
         ledger, catalog version 0.0.2, no vector tables. A fresh install with
         its ledger removed is not the same state: it also holds what later
         migrations added, which migration 1's check of its result refuses as
-        not part of the v1.0 schema.
+        not part of migration 1's schema.
         """
         _init(cli_env)
         _patch_config_port(cli_env["config_path"], cli_env["port"])
@@ -412,18 +428,18 @@ class TestVectorCatalogMigration:
         assert again.returncode == 0, again_output
         assert "up to date" in again_output.lower(), again_output
 
-    def test_migrate_applies_migration_6_beside_its_own_sessions(self, cli_env):
-        """`migrate --yes` applies migration 6 to a deployment holding a table
+    def test_migrate_applies_migration_13_beside_its_own_sessions(self, cli_env):
+        """`migrate --yes` applies migration 13 to a deployment holding a table
         and a backup, and stops while another session holds the catalog.
 
-        Migration 6 rewrites stored strings, so each body stops the run while a
+        Migration 13 rewrites stored strings, so each body stops the run while a
         session other than the migrate command's own holds the database it
         rewrites and that database has rows to rewrite. While the check runs,
         the command holds sessions of its own: the migration lock's session on
         the catalog database and the runner's sessions on both databases. The
         check leaves them out by their application_name; if it counted them,
         it would refuse every upgrade. The deployment comes from this binary's
-        init, with migration 6 then taken out of both ledgers, as an upgrade
+        init, with migration 13 then taken out of both ledgers, as an upgrade
         from the release before it finds them.
         """
         _init(cli_env)
@@ -436,7 +452,7 @@ class TestVectorCatalogMigration:
         finally:
             _run_extenddb("stop", config=cli_env["config_path"], check=False)
             time.sleep(1)
-        _forget_migration_6(cli_env)
+        _forget_migration_13(cli_env)
         catalog, data = cli_env["db_name"], _data_db(cli_env)
 
         pending = _run_extenddb(
@@ -444,8 +460,8 @@ class TestVectorCatalogMigration:
         )
         pending_output = pending.stdout + pending.stderr
         assert pending.returncode == 3, pending_output
-        assert "6 escape_control_chars (catalog, breaking)" in pending_output, pending_output
-        assert "6 escape_control_chars (data, breaking)" in pending_output, pending_output
+        assert "13 escape_control_chars (catalog, breaking)" in pending_output, pending_output
+        assert "13 escape_control_chars (data, breaking)" in pending_output, pending_output
 
         # Another client's session on the catalog database, which holds the
         # backup's items: the run stops before any write, in either store.
@@ -464,8 +480,8 @@ class TestVectorCatalogMigration:
         assert (
             f"other session(s) hold the catalog database {catalog}" in refused_output
         ), refused_output
-        assert 6 not in _ledger_ids(catalog)
-        assert 6 not in _ledger_ids(data)
+        assert 13 not in _ledger_ids(catalog)
+        assert 13 not in _ledger_ids(data)
 
         applied = _run_extenddb(
             "migrate", "--yes", *_pg_args(),
@@ -476,10 +492,10 @@ class TestVectorCatalogMigration:
         output = applied.stdout + applied.stderr
         assert applied.returncode == 0, output
         assert "other session(s) hold" not in output, output
-        assert f"Applied 6 escape_control_chars in {catalog}" in output, output
-        assert f"Applied 6 escape_control_chars in {data}" in output, output
-        assert 6 in _ledger_ids(catalog)
-        assert 6 in _ledger_ids(data)
+        assert f"Applied 13 escape_control_chars in {catalog}" in output, output
+        assert f"Applied 13 escape_control_chars in {data}" in output, output
+        assert 13 in _ledger_ids(catalog)
+        assert 13 in _ledger_ids(data)
         assert _catalog_version(cli_env) == str(_latest())
 
     def test_reconverge_runs_every_convergent_migration_again_on_a_current_catalog(
@@ -487,10 +503,10 @@ class TestVectorCatalogMigration:
     ):
         """`migrate --yes --reconverge` runs each convergent migration again on
         a catalog at the latest migration, names each one that is not
-        convergent as skipped, and leaves the catalog current, with its ledger
-        rows as they were.
+        convergent as skipped, names none that does not apply, and leaves the
+        catalog current, with its ledger rows as they were.
 
-        This is the command an operator runs after a release before 1.0 wrote
+        This is the command an operator runs after a release before 0.1.15 wrote
         to a migrated catalog. Migration 1's check of its result does not run
         again, because a later migration may have changed what it created.
         Migration 2 is not convergent: it would rewrite policies written
@@ -509,7 +525,9 @@ class TestVectorCatalogMigration:
         assert rerun.returncode == 0, output
         assert 2 in _not_convergent(), _not_convergent()
         for i in _ids_in("catalog"):
-            if i in _not_convergent():
+            if i in _not_applicable():
+                assert not re.search(rf"^\s*(?:Skipped|Ran again) {i} ", output, re.M), output
+            elif i in _not_convergent():
                 assert re.search(rf"^\s*Skipped {i} \S+: ", output, re.M), output
                 assert f"Ran again {i} " not in output, output
             else:

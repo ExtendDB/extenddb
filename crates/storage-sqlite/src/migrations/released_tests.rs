@@ -19,7 +19,7 @@ use super::tests::{
 };
 
 /// Settings rows a released baseline seeded with an equal default in code.
-/// v1.0 seeds none of them and keeps the ones it finds, because a seeded
+/// Migration 1 seeds none of them and keeps the ones it finds, because a seeded
 /// value cannot be told from one an operator set.
 const DEV_IMAGE_SETTINGS: &[(&str, &str)] = &[
     ("control_plane_delay_seconds", "0.25"),
@@ -133,8 +133,9 @@ async fn settings(db: &Path) -> BTreeMap<String, String> {
 }
 
 /// Tables that a released catalog has and a migration drops: migration 5
-/// drops `continuous_backups`.
-const DROPPED_TABLES: &[&str] = &["continuous_backups"];
+/// drops `continuous_backups`, and migration 10 `metrics`, which
+/// `account_metrics` replaces.
+const DROPPED_TABLES: &[&str] = &["continuous_backups", "metrics"];
 
 /// Row counts of every table but the ones a migration writes.
 async fn row_counts(db: &Path) -> BTreeMap<String, i64> {
@@ -182,8 +183,9 @@ const BACKUP_WITH_SORT_KEYS: &str = "\
         ('arn:with-sort-keys', 'p0', 's01', '{\"pk\":{\"S\":\"p0\"},\"sk\":{\"S\":\"s01\"}}'), \
         ('arn:with-sort-keys', 'p0', 's02', '{\"pk\":{\"S\":\"p0\"},\"sk\":{\"S\":\"s02\"}}');";
 
-/// A v1.0 catalog seeded as the fixtures were: the bootstrap rows, then
-/// CreateTable `cu_orders` with its GSI, LSI and stream, and its TTL index.
+/// A catalog this binary created, seeded as the fixtures were: the
+/// bootstrap rows, then CreateTable `cu_orders` with its GSI, LSI and
+/// stream, and its TTL index.
 async fn fresh_seeded() -> BTreeMap<String, Vec<String>> {
     let db = temp_db("fresh-seeded");
     run(&db).await.expect("fresh install");
@@ -316,7 +318,16 @@ async fn every_released_catalog_upgrades_to_the_fresh_schema() {
         for (key, value) in state.settings {
             expected_settings.insert((*key).to_owned(), (*value).to_owned());
         }
-        assert_eq!(settings(&db).await, expected_settings, "{name}: settings");
+        // Migration 6 writes a random catalog id on every catalog.
+        let mut actual_settings = settings(&db).await;
+        let catalog_id = actual_settings
+            .remove("catalog_id")
+            .unwrap_or_else(|| panic!("{name}: no catalog_id"));
+        assert!(
+            uuid::Uuid::parse_str(&catalog_id).is_ok(),
+            "{name}: {catalog_id}"
+        );
+        assert_eq!(actual_settings, expected_settings, "{name}: settings");
 
         // No post-check note: no released state has a pre-release shape.
         let notes = scalar(&db, "SELECT notes FROM extenddb_migrations WHERE id = 1").await;
@@ -352,9 +363,66 @@ async fn every_released_catalog_upgrades_to_the_fresh_schema() {
     }
 }
 
-/// A release before 1.0 that starts on a v1.0 catalog rewrites
+/// Migration 10 replaces `metrics`, whose rows carry no account, with an
+/// empty `account_metrics` keyed by account: the released rows are dropped,
+/// not copied. Two accounts' rows for a table of the same name are then two
+/// rows, and a second run of the body changes nothing.
+#[tokio::test]
+async fn migration_10_replaces_metrics_with_an_empty_account_metrics() {
+    let db = temp_db("m10");
+    load_dump(&db, DEV_0_1_14).await;
+    assert!(count(&db, "SELECT COUNT(*) FROM metrics").await > 0);
+    run(&db).await.expect("migrate");
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'metrics'"
+        )
+        .await,
+        0,
+        "metrics is dropped"
+    );
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM account_metrics").await, 0);
+
+    // Two rows that differ only in their account.
+    exec(
+        &db,
+        "INSERT INTO account_metrics (bucket, account_id, metric, table_name, operation, \
+         sum, count, min, max) VALUES \
+         ('2026-11-11T00:00:00Z', '111111111111', 'UserErrors', 'Orders', 'PutItem', 1, 1, 1, 1), \
+         ('2026-11-11T00:00:00Z', '222222222222', 'UserErrors', 'Orders', 'PutItem', 1, 1, 1, 1)",
+    )
+    .await;
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM account_metrics").await, 2);
+
+    // The body again, as --reconverge runs it: the rows stay.
+    let body = include_str!("../../migrations/0010_account_metrics.sql");
+    exec(&db, body).await;
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM account_metrics").await, 2);
+}
+
+/// The metrics store on a migrated catalog keeps two accounts' tables of
+/// the same name apart, and filters on the account.
+#[tokio::test]
+async fn the_metrics_store_keeps_two_accounts_apart() {
+    let db = temp_db("metrics-store");
+    run(&db).await.expect("migrate");
+    let pool = plain_pool(&db).await;
+    let store = crate::SqliteCatalogStore::new(pool.clone());
+    extenddb_storage::metrics_conformance::run(
+        &store,
+        extenddb_storage::metrics_conformance::Expectations {
+            accumulates: true,
+            prunes: true,
+        },
+    )
+    .await;
+    pool.close().await;
+}
+
+/// A release before 0.1.15 that starts on a migrated catalog rewrites
 /// `catalog_version` (SQLite dev builds) or the marker (`migrate --yes`).
-/// v1.0 then reports it, refuses to migrate, and `--reconverge` repairs it,
+/// This binary then reports it, refuses to migrate, and `--reconverge` repairs it,
 /// leaving the ledger rows as the first application wrote them.
 #[tokio::test]
 async fn a_catalog_an_older_release_wrote_to_is_reported_and_reconverged() {
@@ -574,11 +642,13 @@ async fn changed_ahead_and_forgotten_ledgers() {
     )
     .await;
 
-    // An unreleased id, migration 4, can be forgotten and runs again.
+    // Migration 4 can be forgotten and runs again. The runner is given a
+    // released bound of 0, so 4 is unreleased whatever bound this binary
+    // carries.
     let migrations = SqliteMigrations::open(&db.to_string_lossy())
         .await
         .expect("open");
-    let runner = Runner::new(&migrations, RELEASE);
+    let runner = Runner::new(&migrations, RELEASE).with_released_through(0);
     let four = MigrationId::IndexTableBaseKey.number();
     runner.forget(four).await.expect("forget 4");
     assert!(matches!(

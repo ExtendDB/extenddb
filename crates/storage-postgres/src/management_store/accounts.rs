@@ -6,6 +6,7 @@
 use extenddb_storage::management_store::{AccountDetail, OpError, OpResult};
 
 use super::database_error;
+use super::policies::delete_account_login_history;
 use crate::catalog_store::PostgresCatalogStore;
 use crate::pg_util::is_unique_violation;
 
@@ -81,6 +82,9 @@ impl PostgresCatalogStore {
         if r.rows_affected() == 0 {
             return Err(OpError::NotFound("Account not found".to_owned()));
         }
+        // The foreign keys remove the account's IAM rows; its users' failed
+        // logins are keyed by sign-in name and have none.
+        delete_account_login_history(&mut tx, account_id).await?;
 
         tx.commit().await.map_err(|e| {
             tracing::error!("delete_account commit: {e}");

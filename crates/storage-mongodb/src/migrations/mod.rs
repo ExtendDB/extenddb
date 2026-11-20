@@ -38,6 +38,15 @@ mod m0001_baseline;
 #[rustfmt::skip]
 #[allow(clippy::all, deprecated)]
 mod m0005_drop_continuous_backups;
+#[rustfmt::skip]
+#[allow(clippy::all, deprecated)]
+mod m0006_backup_catalog_index;
+#[rustfmt::skip]
+#[allow(clippy::all, deprecated)]
+mod m0010_account_metrics;
+#[rustfmt::skip]
+#[allow(clippy::all, deprecated)]
+mod m0012_unique_access_key_ids;
 mod postcheck;
 
 use std::time::Duration;
@@ -51,6 +60,8 @@ use extenddb_storage::migrations::{
 };
 
 pub use backend::{MongoMigrations, MongoStores};
+#[cfg(feature = "test-util")]
+pub use commands::held_lock_for_tests;
 pub(crate) use commands::lease_of;
 pub use commands::{MongoCatalogMigrations, lock};
 pub use foreign::foreign_contents;
@@ -59,7 +70,7 @@ pub use locks::{MigrationLock, Timing};
 #[cfg(feature = "test-util")]
 pub use postcheck::{Collection, Definitions, Index, describe_store};
 pub use registrar::ServerRegistration;
-pub use registrations::ServingRegistration;
+pub use registrations::{SERVE_COMMAND, ServingRegistration};
 
 /// The catalog database every MongoDB deployment uses.
 pub const CATALOG_DATABASE: &str = "extenddb_catalog";
@@ -85,8 +96,127 @@ pub(crate) const CATALOG_EXPECTED: &str =
 pub(crate) const DATA_EXPECTED: &str =
     include_str!("../../migrations/data/0001_baseline.expected.json");
 
-/// Checksums of the released bodies (none until v1.0).
-pub(crate) const RELEASED: &[Released] = &[];
+/// Checksums of the released bodies, every migration at or below
+/// `RELEASED_THROUGH`.
+pub(crate) const RELEASED: &[Released] = &[
+    Released {
+        id: MigrationId::Baseline,
+        store: StoreKind::Catalog,
+        checksum: "1ce04b3b2869e54a399f325d1e5c482b45d1cf5621e7ab13461a130108f85266",
+        fingerprint: Some("0001_baseline/mongodb/1"),
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::Baseline,
+        store: StoreKind::Data,
+        checksum: "1ce04b3b2869e54a399f325d1e5c482b45d1cf5621e7ab13461a130108f85266",
+        fingerprint: Some("0001_baseline/mongodb/1"),
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::ResourceTagConditionKeys,
+        store: StoreKind::Catalog,
+        checksum: "80c502c54ef9240ab5f64b24b060261a295e41d29954d9b492b83c64c444170e",
+        fingerprint: Some("0002_resource_tag_condition_keys/1"),
+        kind: Kind::Breaking,
+        convergent: false,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::SortKeyDefinitions,
+        store: StoreKind::Catalog,
+        checksum: "242923091cd3a8e6eb263c05ecd5cf96e5bb1d7d94c20772b06df1ec44a09937",
+        fingerprint: None,
+        kind: Kind::Additive,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::IndexTableBaseKey,
+        store: StoreKind::Catalog,
+        checksum: "786ea5e51bd39a29abea044bdf04cc7d3076f183b57847ccdaddd445b0c25604",
+        fingerprint: None,
+        kind: Kind::Additive,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::DropContinuousBackups,
+        store: StoreKind::Catalog,
+        checksum: "3ca80eefd6a2d3cef629e81666c90c34228b012626769712e3893c2dba6efba1",
+        fingerprint: Some("0005_drop_continuous_backups/mongodb/1"),
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::BackupCatalogIndex,
+        store: StoreKind::Catalog,
+        checksum: "68e0d07b8ca85db637aa70600b5834c76aeaada3d4deae4b2e67b9a313471fec",
+        fingerprint: Some("0006_backup_catalog_index/mongodb/1"),
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::StreamPending,
+        store: StoreKind::Catalog,
+        checksum: "261c42e26a802f1850859b051468a83472cffbf0506040e09e83e5410b721f61",
+        fingerprint: None,
+        kind: Kind::Additive,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::RestoreProgress,
+        store: StoreKind::Catalog,
+        checksum: "1743840a61b647fd1f7f53c3837a6d574d0a72e00620a1ab8ffddce625573034",
+        fingerprint: None,
+        kind: Kind::Additive,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::WarmThroughput,
+        store: StoreKind::Catalog,
+        checksum: "77444ad166c919980cdcf1a5f51ab65eca55724d186f0551fbe1b9a81c85cbe5",
+        fingerprint: None,
+        kind: Kind::Additive,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::AccountMetrics,
+        store: StoreKind::Catalog,
+        checksum: "3b9ff3ab729a20d26f99566d6f3c2ebdda6ca1bcf5c8e9442fa0c7328928e5b0",
+        fingerprint: Some("0010_account_metrics/mongodb/1"),
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::AttributeNameEscape,
+        store: StoreKind::Catalog,
+        checksum: "671888396581cd761f1dff0a78a417e09c9be96a898fd1495ea3422817ca5c46",
+        fingerprint: None,
+        kind: Kind::Additive,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::UniqueAccessKeyIds,
+        store: StoreKind::Catalog,
+        checksum: "8ebbabc18a490f6eed27571527b0666eda217e7dfac888c6943f08d133cd401e",
+        fingerprint: Some("0012_unique_access_key_ids/mongodb/1"),
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+];
 
 /// This backend's entry for every id. Public so `migrate --list` can print
 /// each migration's kind without connecting.
@@ -135,6 +265,65 @@ pub fn migration(id: MigrationId) -> Migration<MongoStores> {
                 StoreKind::Catalog,
                 &m0005_drop_continuous_backups::DropContinuousBackups,
                 m0005_drop_continuous_backups::SOURCE,
+            )],
+        },
+        // Breaking: a binary without it neither reads the index nor writes
+        // the job record on the restore registrations it creates, so a
+        // restore it ran would be owned by nobody; and the index's unique
+        // indexes are what refuse a second claim of one backup. Convergent:
+        // the collections and indexes are created only when absent, the
+        // backfill touches only a registration without a job record, which
+        // no registration this release writes is (each is inserted with its
+        // record), and the catalog id is written only when absent; so a
+        // second run over data written since changes nothing but a
+        // registration a release before it wrote, which is the repair
+        // `--reconverge` is for.
+        MigrationId::BackupCatalogIndex => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![StoreBody::code(
+                StoreKind::Catalog,
+                &m0006_backup_catalog_index::BackupCatalogIndex,
+                m0006_backup_catalog_index::SOURCE,
+            )],
+        },
+        MigrationId::StreamPending => Migration::NotApplicable(
+            "a MongoDB write draws its stream sequence number from its shard's counter inside its \
+             transaction, so the records of a shard commit in number order",
+        ),
+        MigrationId::RestoreProgress => Migration::NotApplicable(
+            "a store-backed restore records its progress on the target's restore job record \
+             (restore_job.file_index); the restore_progress table is PostgreSQL's data \
+             database's",
+        ),
+        MigrationId::WarmThroughput => Migration::NotApplicable(
+            "the catalog collections have no validator, so a table or index document carries \
+             a warm_throughput field without a schema change",
+        ),
+        MigrationId::AccountMetrics => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![StoreBody::code(
+                StoreKind::Catalog,
+                &m0010_account_metrics::AccountMetrics,
+                m0010_account_metrics::SOURCE,
+            )],
+        },
+        MigrationId::AttributeNameEscape => Migration::NotApplicable(
+            "MongoDB stores the catalog's attribute names as BSON string values, which carry their \
+             length and so can hold U+0000, and every name reads back as it was written",
+        ),
+        MigrationId::UniqueAccessKeyIds => Migration::Applies {
+            // A unique index is never additive (CONTRIBUTING.md): the
+            // previous release does not expect the index to refuse a write.
+            kind: Kind::Breaking,
+            // Once the index is built no ID has a second copy, so running
+            // the body again deletes nothing and keeps the index.
+            convergent: true,
+            bodies: vec![StoreBody::code(
+                StoreKind::Catalog,
+                &m0012_unique_access_key_ids::UniqueAccessKeyIds,
+                m0012_unique_access_key_ids::SOURCE,
             )],
         },
         MigrationId::EscapeControlChars => Migration::NotApplicable(
@@ -271,6 +460,50 @@ pub async fn migrate_holding(
     result
 }
 
+/// Take the migration lock on `target`, apply every pending migration
+/// through `id`, and release the lock: for the crate's live tests, which
+/// build catalogs in databases of their own.
+///
+/// # Errors
+///
+/// As [`Runner::migrate_through`], or the lock could not be taken.
+#[cfg(test)]
+pub(crate) async fn migrate_through_for_tests(
+    target: &MongoTarget,
+    id: MigrationId,
+) -> Result<RunReport, MigrationError> {
+    let (held, target) = lock(target, true, Duration::from_secs(10), Timing::PRODUCTION).await?;
+    let result = async {
+        let migrations = MongoMigrations::open(&target, Some(&held)).await?;
+        let result = Runner::new(&migrations, "test").migrate_through(id).await;
+        migrations.close().await;
+        result
+    }
+    .await;
+    held.release().await;
+    result
+}
+
+/// Run migration 6's catalog body on `target`'s catalog alone, with no lock
+/// and no ledger row, as a migrator stopped before it wrote the row leaves
+/// it: for the live tests of the body's backfill.
+///
+/// # Errors
+///
+/// As the body.
+#[cfg(test)]
+pub(crate) async fn run_backup_catalog_index(
+    target: &MongoTarget,
+) -> Result<extenddb_storage::migrations::Done, MigrationError> {
+    use extenddb_storage::migrations::{CodeBody, MigrationBackend};
+    let migrations = MongoMigrations::open(target, None).await?;
+    let done = m0006_backup_catalog_index::BackupCatalogIndex
+        .run(migrations.stores())
+        .await;
+    migrations.close().await;
+    done
+}
+
 /// Register as the catalog's server and read its status, before anything
 /// opens the engine: a server that refuses has written nothing but its
 /// registration, which it deletes. The registration is written before the
@@ -286,7 +519,24 @@ pub async fn register_and_check(
     release: &str,
     timing: Timing,
 ) -> Result<ServerRegistration, MigrationError> {
-    let registration = ServingRegistration::register(target, release, timing).await?;
+    register_and_check_as(target, release, SERVE_COMMAND, timing).await
+}
+
+/// [`register_and_check`] for the process `command` names: `extenddb serve`
+/// ([`SERVE_COMMAND`]) or a command that opens the catalog as a server does
+/// (`extenddb backup list`), whose registration carries its name
+/// ([`ServingRegistration::register_as`]).
+///
+/// # Errors
+///
+/// As [`register_and_check`].
+pub async fn register_and_check_as(
+    target: &MongoTarget,
+    release: &str,
+    command: &'static str,
+    timing: Timing,
+) -> Result<ServerRegistration, MigrationError> {
+    let registration = ServingRegistration::register_as(target, release, command, timing).await?;
     let status = match catalog_status(target).await {
         Ok(status) => status,
         Err(e) => {
@@ -310,6 +560,7 @@ pub async fn register_and_check(
     Ok(ServerRegistration::new(
         target,
         release,
+        command,
         timing,
         status,
         registration,

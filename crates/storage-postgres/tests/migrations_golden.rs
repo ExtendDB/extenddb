@@ -13,30 +13,8 @@ use std::time::Duration;
 
 use extenddb_storage::migrations::{CatalogStatus, MigrationError, MigrationId, Runner};
 use extenddb_storage_postgres::migrations::{PostgresMigrations, PostgresTarget, migrate};
-use migrations_support::{ACCOUNT, LATEST, Scratch, base_conn, id_names, skip};
+use migrations_support::{ACCOUNT, LATEST, Scratch, base_conn, golden, id_names, notes, skip};
 use sqlx::PgPool;
-
-fn golden(name: &str, actual: &str) {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/golden")
-        .join(name);
-    if migrations_support::bless() {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, actual).unwrap();
-        return;
-    }
-    let expected =
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    assert_eq!(actual, expected, "{name} differs from its golden file");
-}
-
-async fn notes(catalog: &PgPool, id: i32) -> String {
-    sqlx::query_scalar("SELECT notes FROM extenddb_migrations WHERE id = $1")
-        .bind(id)
-        .fetch_one(catalog)
-        .await
-        .unwrap()
-}
 
 const TAGGED: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"dynamodb:*","Resource":"*","Condition":{"StringEquals":{"dynamodb:ResourceTag/env":"prod"}}}]}"#;
 /// Both forms on one key with different values, which migration 2 refuses.
@@ -207,7 +185,7 @@ async fn every_policy_document(catalog: &PgPool) -> Vec<String> {
     .unwrap()
 }
 
-/// Record what a release before 1.0 leaves when it writes to a migrated
+/// Record what a release before 0.1.15 leaves when it writes to a migrated
 /// catalog, then reconverge: migration 2 is named as skipped, and the
 /// catalog is current again.
 async fn reconverge_after_an_older_release_wrote(s: &Scratch, catalog: &PgPool) {
@@ -233,7 +211,7 @@ async fn reconverge_after_an_older_release_wrote(s: &Scratch, catalog: &PgPool) 
     assert_eq!(s.status().await, CatalogStatus::Current { version: LATEST });
 }
 
-/// From 1.0 on a `dynamodb:ResourceTag` key written through the API has no
+/// From 0.1.15 on a `dynamodb:ResourceTag` key written through the API has no
 /// effect, as on the service. Migration 2 is not convergent, so a reconverge
 /// leaves a policy written after it, in each place a policy is stored, with
 /// the text it was written with, and so with the decision it had.
@@ -468,17 +446,18 @@ async fn rows_of(pool: &PgPool, table: &str, label: &str, key: [&str; 2]) -> Vec
         .collect()
 }
 
-/// Migration 6 on the 0.1.14 fixture whose strings an earlier release
-/// stored with a raw U+0001: in the key columns of `seed_tbl`'s table, GSI
-/// and LSI, in their documents, and in the backup's `backup_items`.
+/// Migration 13 on the 0.1.14 fixture, migrated through 12, whose strings an
+/// earlier release stored with a raw U+0001: in the key columns of
+/// `seed_tbl`'s table, GSI and LSI, in their documents, and in the backup's
+/// `backup_items`.
 #[tokio::test]
-async fn migration_6_escapes_the_strings_an_earlier_release_stored() {
+async fn migration_13_escapes_the_strings_an_earlier_release_stored() {
     let Some(base) = base_conn() else {
-        return skip("golden 6");
+        return skip("golden 13");
     };
-    let s = Scratch::new(&base, "pgm_g6").await;
+    let s = Scratch::new(&base, "pgm_g13").await;
     s.load("0.1.14").await;
-    s.migrate_through(MigrationId::DropContinuousBackups).await;
+    s.migrate_through(MigrationId::UniqueAccessKeyIds).await;
     let catalog = s.catalog().await;
     let data = s.data().await;
     let tables = seed_tbl_tables(&catalog).await;
@@ -538,21 +517,21 @@ async fn migration_6_escapes_the_strings_an_earlier_release_stored() {
     lines.sort();
     let mut out = lines.join("\n");
     for (pool, store) in [(&catalog, "catalog"), (&data, "data")] {
-        let mut note = notes(pool, 6).await;
+        let mut note = notes(pool, 13).await;
         for (id, name) in &names {
             note = note.replace(id.as_str(), name);
         }
         write!(out, "\n{store} notes:\n{note}").unwrap();
     }
     out.push('\n');
-    golden("0006_escape_control_chars.txt", &out);
+    golden("0013_escape_control_chars.txt", &out);
     catalog.close().await;
     data.close().await;
 }
 
-/// The id-6 rows of the ledger of the database `pool` reaches.
-async fn ledger_rows_of_6(pool: &PgPool) -> i64 {
-    sqlx::query_scalar("SELECT count(*) FROM extenddb_migrations WHERE id = 6")
+/// The id-13 rows of the ledger of the database `pool` reaches.
+async fn ledger_rows_of_13(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM extenddb_migrations WHERE id = 13")
         .fetch_one(pool)
         .await
         .unwrap()
@@ -562,13 +541,13 @@ async fn ledger_rows_of_6(pool: &PgPool) -> i64 {
 /// `migrate --yes` stops with exit 5 before its first write, naming the
 /// session, and migrates once the session is gone.
 #[tokio::test]
-async fn migration_6_stops_before_any_write_while_another_session_holds_the_data() {
+async fn migration_13_stops_before_any_write_while_another_session_holds_the_data() {
     let Some(base) = base_conn() else {
-        return skip("migration 6 sessions check");
+        return skip("migration 13 sessions check");
     };
-    let s = Scratch::new(&base, "pgm_g6s").await;
+    let s = Scratch::new(&base, "pgm_g13s").await;
     s.load("0.1.14").await;
-    s.migrate_through(MigrationId::DropContinuousBackups).await;
+    s.migrate_through(MigrationId::UniqueAccessKeyIds).await;
     // A server of an earlier release, still connected.
     let server = migrations_support::pool(&s.data_url(), 1).await;
     sqlx::query("SELECT 1").execute(&server).await.unwrap();
@@ -593,12 +572,12 @@ async fn migration_6_stops_before_any_write_while_another_session_holds_the_data
     let catalog = s.catalog().await;
     let data = s.data().await;
     assert_eq!(
-        ledger_rows_of_6(&catalog).await,
+        ledger_rows_of_13(&catalog).await,
         0,
         "the refused run wrote the catalog ledger"
     );
     assert_eq!(
-        ledger_rows_of_6(&data).await,
+        ledger_rows_of_13(&data).await,
         0,
         "the refused run wrote the data ledger"
     );

@@ -54,6 +54,12 @@ pub(crate) const SERVING_KEY: i32 = 2;
 /// How often a holder runs `SELECT 1` on its lock connection.
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
+/// The `application_name` of a server's serving session. A command that
+/// opens the catalog as a server does (`extenddb backup list`) names its
+/// own session after itself, so a migration waiting for the registrations
+/// names the command rather than a server.
+pub const SERVE_APPLICATION: &str = "extenddb serve";
+
 /// Server-side keepalives of the serving session: the first probe after 10 s
 /// of silence, then one every 5 s, and the session ends after 4 unanswered.
 const TCP_KEEPALIVES: [(&str, &str); 3] = [
@@ -413,16 +419,16 @@ pub struct ServingRegistration {
 }
 
 impl ServingRegistration {
-    /// Register, with the session named `extenddb serve`. The key is taken
-    /// with a try: a migration that holds or waits for it is never waited
-    /// for.
+    /// Register, with the session named `extenddb serve`
+    /// ([`SERVE_APPLICATION`]). The key is taken with a try: a migration
+    /// that holds or waits for it is never waited for.
     ///
     /// # Errors
     ///
     /// [`MigrationError::Locked`] (exit 6) when a migration is running, so a
     /// restart loop retries.
     pub async fn register(catalog: &PgConnectOptions) -> Result<Self, MigrationError> {
-        Self::register_keepalive(catalog, KEEPALIVE_INTERVAL).await
+        Self::register_keepalive(catalog, KEEPALIVE_INTERVAL, SERVE_APPLICATION).await
     }
 
     /// [`ServingRegistration::register`] with another keepalive interval, for
@@ -436,15 +442,18 @@ impl ServingRegistration {
         catalog: &PgConnectOptions,
         keepalive: Duration,
     ) -> Result<Self, MigrationError> {
-        Self::register_keepalive(catalog, keepalive).await
+        Self::register_keepalive(catalog, keepalive, SERVE_APPLICATION).await
     }
 
+    /// Register with the session named `application`: `extenddb serve` for
+    /// a server, the command's name for a command.
     pub(crate) async fn register_keepalive(
         catalog: &PgConnectOptions,
         keepalive: Duration,
+        application: &str,
     ) -> Result<Self, MigrationError> {
-        let mut conn = connect(catalog, "extenddb serve").await?;
-        match register_on(&mut conn).await {
+        let mut conn = connect(catalog, application).await?;
+        match register_on(&mut conn, application).await {
             Ok(()) => {}
             Err(e) => {
                 let _ = statement(&mut conn, "ROLLBACK").await;
@@ -514,7 +523,15 @@ impl Drop for ServingRegistration {
     }
 }
 
-async fn register_on(conn: &mut PgConnection) -> Result<(), MigrationError> {
+async fn register_on(conn: &mut PgConnection, application: &str) -> Result<(), MigrationError> {
+    // What the refusal tells a server's operator to do once the migration is
+    // done; a command's refusal ends at the holders, and the command's
+    // caller adds that it is retried once the migration has finished.
+    let then = if application == SERVE_APPLICATION {
+        "; start the server when it has finished"
+    } else {
+        ""
+    };
     let fail = |e: sqlx::Error| MigrationError::store("register the server", e);
     statement(conn, "BEGIN").await.map_err(fail)?;
     // Inside the transaction that holds the key, so a transaction-mode pooler
@@ -532,15 +549,14 @@ async fn register_on(conn: &mut PgConnection) -> Result<(), MigrationError> {
     {
         let names = holders(conn, SERVING_KEY).await.unwrap_or_default();
         return Err(MigrationError::Locked(format!(
-            "a migration is running on this catalog ({}); start the server when it has finished",
+            "a migration is running on this catalog ({}){then}",
             listed(&names)
         )));
     }
     let migrators = holders(conn, MIGRATION_KEY).await.map_err(fail)?;
     if !migrators.is_empty() {
         return Err(MigrationError::Locked(format!(
-            "a migration holds the migration lock on this catalog ({}); start the server when \
-             it has finished",
+            "a migration holds the migration lock on this catalog ({}){then}",
             listed(&migrators)
         )));
     }

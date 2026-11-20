@@ -69,8 +69,25 @@
 //!
 //! Memory: a batch is at most `batch_size` documents
 //! (`paging::DEFAULT_FETCH_BATCH`, 1000) and at most the server's 16 MiB
-//! reply limit, whichever is reached first, so unlike the SQL backends'
-//! row-bounded fetches one batch here is bounded in bytes too.
+//! reply limit, whichever is reached first, so one batch here is bounded in
+//! bytes by the server. The stream applies no cut of its own at
+//! `paging::SNAPSHOT_FETCH_BYTES` (64 MiB): the reply limit is already under
+//! that budget, and the byte cut the SQL backends make exists because their
+//! row-bounded fetches have no such limit.
+//!
+//! A snapshot read serves the majority-committed snapshot, which can trail
+//! what a `readConcern: local` read of the primary already returns (the
+//! catalog handle's level, so `DescribeTable`'s): a table flipped ACTIVE a
+//! few milliseconds earlier can be missing, or still CREATING, at the
+//! snapshot's time, and a CreateBackup sent as soon as DescribeTable said
+//! ACTIVE would be refused as a table that does not exist. So an open whose
+//! snapshot finds the table missing or not ACTIVE reads the `tables`
+//! document at `local`; when that read shows it ACTIVE, the open starts over
+//! with a fresh session after a short sleep (5 ms, doubling to 100 ms),
+//! for at most [`MAJORITY_CATCH_UP`], and answers the snapshot's refusal
+//! once a local read no longer shows the table ACTIVE or the bound has
+//! passed. The bound is far above the lag a w:majority write leaves (one
+//! journal commit, 100 ms at most by default).
 
 use extenddb_core::types::Item;
 use extenddb_storage::error::StorageError;
@@ -102,6 +119,10 @@ const STANDALONE_SERVER: &str = "MongoDB refused the first read at readConcern s
      standalone server cannot serve snapshot reads, and table snapshots need a replica set \
      member";
 
+/// How long an open waits for the majority-committed snapshot to show a
+/// table that a `local` read shows ACTIVE (module doc).
+const MAJORITY_CATCH_UP: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Why an open cannot proceed when the first read succeeded but the session
 /// reports no snapshot time.
 const NO_SNAPSHOT_TIME: &str = "MongoDB served the first read without a snapshot time: a read \
@@ -116,13 +137,51 @@ impl SnapshotEngine for MongoEngine {
         let account_id = account_id.to_owned();
         let table_name = table_name.to_owned();
         Box::pin(async move {
-            self.open_table_snapshot_impl(&account_id, &table_name)
-                .await
+            let deadline = tokio::time::Instant::now() + MAJORITY_CATCH_UP;
+            let mut delay = std::time::Duration::from_millis(5);
+            loop {
+                match self
+                    .open_table_snapshot_impl(&account_id, &table_name)
+                    .await
+                {
+                    Err(StorageError::TableNotFound(_) | StorageError::TableNotActive(_))
+                        if tokio::time::Instant::now() < deadline
+                            && self
+                                .table_is_active_locally(&account_id, &table_name)
+                                .await? =>
+                    {
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(std::time::Duration::from_millis(100));
+                    }
+                    outcome => return outcome,
+                }
+            }
         })
     }
 }
 
 impl MongoEngine {
+    /// Whether a `local` read of the `tables` document shows the table
+    /// ACTIVE: what `DescribeTable` reads, and the snapshot's time may trail.
+    async fn table_is_active_locally(
+        &self,
+        account_id: &str,
+        table_name: &str,
+    ) -> Result<bool, StorageError> {
+        Ok(self
+            .catalog_db
+            .collection::<Document>("tables")
+            .find_one(doc! {
+                "_id": { "account_id": account_id, "table_name": table_name },
+                "table_status": "ACTIVE",
+            })
+            .read_concern(ReadConcern::local())
+            .projection(doc! { "_id": 1 })
+            .await
+            .map_err(|e| map_mongo_error(&e))?
+            .is_some())
+    }
+
     async fn open_table_snapshot_impl(
         &self,
         account_id: &str,
@@ -470,7 +529,6 @@ mod tests {
             .insert_one(doc! { "_id": "control_plane_delay_seconds", "value": "0" })
             .await
             .expect("setting");
-        let slots = crate::backup_engine::restore_server_slot_count(10);
         let engine = MongoEngine {
             client: client.clone(),
             catalog_db,
@@ -479,9 +537,6 @@ mod tests {
             gsi_cache: Arc::default(),
             tx_read_concern: ReadConcern::majority(),
             backup_liveness: crate::backup_engine::BackupLiveness::default(),
-            restore_server_slot_count: slots,
-            restore_server_slots: Arc::new(tokio::sync::Semaphore::new(slots)),
-            restore_account_slots: crate::backup_engine::RestoreAccountSlots::default(),
         };
         let worker = tokio::spawn(crate::ttl_worker::gsi_backfill_worker(
             Arc::new(engine.clone()),
@@ -646,6 +701,78 @@ mod tests {
             &hooks, &*engine, ACCOUNT, "restored", true,
         )
         .await;
+    }
+
+    /// A table a `local` read shows ACTIVE opens although the majority-
+    /// committed snapshot does not show it yet. The flip to ACTIVE is
+    /// written at `w: 1` without the journal, so the majority snapshot
+    /// trails it by up to one journal commit; the test observes that
+    /// precondition with a snapshot read of its own before each open, and
+    /// asserts that it saw it at least once.
+    #[tokio::test]
+    async fn an_open_waits_for_the_snapshot_to_show_a_table_a_local_read_shows_active() {
+        let Some(uri) = uri() else {
+            eprintln!(
+                "SKIP an_open_waits_for_the_snapshot_to_show_a_table_a_local_read_shows_active: \
+                 no MongoDB"
+            );
+            return;
+        };
+        let _hooks = hooks().await;
+        let engine = fixture(&uri).await;
+        engine
+            .create_table(ACCOUNT, snapshot_conformance::table_input("lagging"))
+            .await
+            .expect("create");
+        snapshot_conformance::wait_active(&*engine, ACCOUNT, "lagging", || async {
+            let _ =
+                extenddb_storage::WorkerStore::process_control_plane_transitions(&*engine).await;
+        })
+        .await;
+        let tables = engine.catalog_db.collection::<Document>("tables");
+        let id = doc! { "_id": { "account_id": ACCOUNT, "table_name": "lagging" } };
+        let unjournaled = mongodb::options::WriteConcern::builder()
+            .w(mongodb::options::Acknowledgment::Nodes(1))
+            .journal(false)
+            .build();
+        let mut trailing = 0;
+        for _ in 0..20 {
+            set_updating(&engine, "lagging").await;
+            tables
+                .update_one(id.clone(), doc! { "$set": { "table_status": "ACTIVE" } })
+                .write_concern(unjournaled.clone())
+                .await
+                .expect("flip to ACTIVE");
+            let mut session = engine
+                .client
+                .start_session()
+                .snapshot(true)
+                .await
+                .expect("session");
+            let at_snapshot = tables
+                .find_one(id.clone())
+                .read_concern(ReadConcern::snapshot())
+                .session(&mut session)
+                .await
+                .expect("snapshot read")
+                .and_then(|d| d.get_str("table_status").ok().map(str::to_owned));
+            if at_snapshot.as_deref() != Some("ACTIVE") {
+                trailing += 1;
+            }
+            let snapshot = engine
+                .open_table_snapshot(ACCOUNT, "lagging")
+                .await
+                .expect("a table a local read shows ACTIVE opens");
+            assert_eq!(
+                snapshot.description.table_status,
+                extenddb_core::types::TableStatus::Active
+            );
+        }
+        eprintln!("the snapshot trailed the local read in {trailing} of 20 flips");
+        assert!(
+            trailing > 0,
+            "precondition: no flip left the majority snapshot behind the local read"
+        );
     }
 
     /// A document the decoder cannot read ends the stream at its error, as on

@@ -238,7 +238,7 @@ impl Bootstrapper for PostgresBootstrapper {
         }
 
         println!("--- Generating AES-256-GCM encryption key...");
-        let key_b64 = generate_encryption_key();
+        let key_b64 = generate_encryption_key().map_err(OpError::Internal)?;
 
         sqlx::query(
             "INSERT INTO settings (key, value) VALUES ('encryption_key', $1) \
@@ -426,6 +426,7 @@ impl Bootstrapper for PostgresBootstrapper {
                 password: self.config.admin_password.clone(),
             }),
             data_connection: Some(self.app_connection_url(&self.config.data_db)),
+            ..Target::default()
         }
     }
 

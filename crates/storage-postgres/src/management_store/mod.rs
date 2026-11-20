@@ -7,8 +7,10 @@
 //! file under the 500-line limit.
 
 use extenddb_storage::management_store::{
-    AccessKeyCreated, AccountDetail, GroupDetail, OpError, OpResult, RoleDetail, UserDetail,
+    AccessKeyCreated, AccountDetail, GroupDetail, OpError, OpResult, RoleDetail, SecretPage,
+    SecretWrite, UserDetail,
 };
+use extenddb_storage::secret_keys::SecretTable;
 use futures::future::BoxFuture;
 
 use super::catalog_store::PostgresCatalogStore;
@@ -18,6 +20,7 @@ mod accounts;
 mod groups;
 mod policies;
 mod roles;
+mod secret_rows;
 mod users;
 
 /// The error of a failed statement, logged with `what`. It keeps the
@@ -623,5 +626,39 @@ impl extenddb_storage::management_store::ManagementStore for PostgresCatalogStor
         let account_id = account_id.to_string();
         let resource = resource.to_string();
         Box::pin(async move { self.fetch_caller_tags_impl(&account_id, &resource).await })
+    }
+
+    // ── Encryption-key commands (in `secret_rows`) ─────────────────
+
+    fn read_secret_page(
+        &self,
+        table: SecretTable,
+        page: Option<&str>,
+        page_size: usize,
+    ) -> BoxFuture<'_, OpResult<SecretPage>> {
+        let page = page.map(ToOwned::to_owned);
+        Box::pin(async move {
+            self.read_secret_page_impl(table, page.as_deref(), page_size)
+                .await
+        })
+    }
+
+    fn write_secrets(
+        &self,
+        table: SecretTable,
+        rows: &[SecretWrite],
+    ) -> BoxFuture<'_, OpResult<()>> {
+        let rows = rows.to_vec();
+        Box::pin(async move { self.write_secrets_impl(table, &rows).await })
+    }
+
+    fn delete_secrets(&self, table: SecretTable, keys: &[String]) -> BoxFuture<'_, OpResult<()>> {
+        let keys = keys.to_vec();
+        Box::pin(async move { self.delete_secrets_impl(table, &keys).await })
+    }
+
+    fn delete_setting(&self, key: &str) -> BoxFuture<'_, OpResult<()>> {
+        let key = key.to_owned();
+        Box::pin(async move { self.delete_setting_impl(&key).await })
     }
 }

@@ -21,10 +21,10 @@
 //! checked.
 
 use async_trait::async_trait;
-use extenddb_storage::management_store::ManagementStore;
+use extenddb_storage::management_store::{ManagementStore, SettingsStore};
 use extenddb_storage::migrations::{
-    CatalogTraces, Done, HasManagementStore, LedgerColumns, LedgerRow, LedgerWrites, Migration,
-    MigrationBackend, MigrationError, MigrationId, Released, Step, StoreKind, StoreRef,
+    CatalogTraces, Done, HasManagementStore, LedgerColumns, LedgerRow, LedgerWrites, LockedStores,
+    Migration, MigrationBackend, MigrationError, MigrationId, Released, Step, StoreKind, StoreRef,
     in_transaction, record_rows,
 };
 use sqlx::PgPool;
@@ -57,7 +57,7 @@ pub struct PostgresStores {
     lock: Option<LockHandle>,
     /// The `application_name` of this runner's sessions.
     pub(crate) application: String,
-    /// Whether migration 6's `detect` looks for other sessions: in a run, not
+    /// Whether migration 13's `detect` looks for other sessions: in a run, not
     /// in a status read, and not for a target that allows them
     /// ([`PostgresTarget::with_other_sessions_allowed`]).
     pub(crate) checks_sessions: bool,
@@ -106,6 +106,28 @@ impl HasManagementStore for PostgresStores {
     }
 }
 
+/// The catalog's stores under a held migration lock, for `encryption-key
+/// switch`, `rotate` and `reset` (RFC-0000 section 8, common rules): the
+/// management store over the runner's catalog connection, holding no key.
+/// Dropping it closes the runner's connections.
+pub(crate) struct LockedCatalog(PostgresMigrations);
+
+impl LockedCatalog {
+    pub(crate) fn new(migrations: PostgresMigrations) -> Self {
+        Self(migrations)
+    }
+}
+
+impl LockedStores for LockedCatalog {
+    fn management(&self) -> &dyn ManagementStore {
+        &self.0.stores.management
+    }
+
+    fn settings(&self) -> &dyn SettingsStore {
+        &self.0.stores.management
+    }
+}
+
 /// How long each statement of a body waits for a table lock.
 const LOCK_TIMEOUT_SECS: u64 = 5;
 
@@ -128,6 +150,9 @@ pub struct PostgresMigrations {
     read_only: bool,
     /// Whether each database accepts [`CONNECTION_CHECK`]: catalog, data.
     connection_check: [bool; 2],
+    /// A status session of the catalog store alone: no data store is listed,
+    /// and `stores.data` is the catalog's connection, which no read reaches.
+    catalog_store_alone: bool,
 }
 
 impl PostgresMigrations {
@@ -207,6 +232,27 @@ impl PostgresMigrations {
                 ))
             }
         })?;
+        if read_only && target.catalog_store_alone {
+            // The status of the catalog store alone reaches no data database,
+            // so the data connection string row is not read.
+            return Ok(Self {
+                stores: PostgresStores {
+                    management: PostgresCatalogStore::new(catalog.clone()),
+                    data: catalog.clone(),
+                    catalog,
+                    data_watch: None,
+                    lock,
+                    application,
+                    checks_sessions: false,
+                },
+                catalog_name,
+                data_name: String::new(),
+                data_connection_row: None,
+                read_only,
+                connection_check: [false; 2],
+                catalog_store_alone: true,
+            });
+        }
         let data_options = match served_data(target, &catalog).await {
             Ok(options) => options,
             Err(e) => {
@@ -288,6 +334,7 @@ impl PostgresMigrations {
             data_connection_row: target.data_connection_row.clone(),
             read_only,
             connection_check,
+            catalog_store_alone: false,
         })
     }
 
@@ -297,7 +344,9 @@ impl PostgresMigrations {
     pub async fn close(self) {
         if self.read_only {
             let _ = exec(&self.stores.catalog, "ROLLBACK").await;
-            let _ = exec(&self.stores.data, "ROLLBACK").await;
+            if !self.catalog_store_alone {
+                let _ = exec(&self.stores.data, "ROLLBACK").await;
+            }
         }
         self.stores.catalog.close().await;
         self.stores.data.close().await;
@@ -462,6 +511,7 @@ impl MigrationBackend for PostgresMigrations {
     async fn store_names(&self, kind: StoreKind) -> Result<Vec<String>, MigrationError> {
         Ok(match kind {
             StoreKind::Catalog => vec![self.catalog_name.clone()],
+            StoreKind::Data if self.catalog_store_alone => Vec::new(),
             StoreKind::Data => vec![self.data_name.clone()],
             StoreKind::Account => Vec::new(),
         })
