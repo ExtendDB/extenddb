@@ -298,6 +298,67 @@ async fn a_renewal_started_during_a_held_check_runs_to_its_end() {
     assert_eq!(record.status, "COMPLETED_WITH_ERRORS", "{record:?}");
 }
 
+/// A renewal that answers after the check it kept the lease for still
+/// moves the local deadline. The renewal's checkpoint is held until a sixth
+/// of a lease past the deadline the run started with, and a sixth of a
+/// lease before the deadline the renewal grants (the renewal starts a third
+/// of the lease after the claim). The next write batch, rows 3 and 4, then
+/// finds the lease held by the runner's own clock and is written. With the
+/// deadline left where the claim put it, that batch would find the lease
+/// lapsed and stop the runner with the rows unwritten.
+#[tokio::test]
+async fn a_renewal_that_answers_after_the_check_moves_the_deadline() {
+    let h = Harness::new().await;
+    let (op, record, cfg) = five_rows_one_error(&h).await;
+    let sink = Arc::new(HoldingSink::new(&h, HoldAt::FirstCheck));
+    let reached = Arc::clone(&sink.reached);
+    let release = Arc::clone(&sink.release);
+    let entered = Arc::new(Notify::new());
+    let unhold = Arc::new(Notify::new());
+    let mut faulting = FaultingStorage::new(&h.storage);
+    faulting.hold_first_checkpoint = Some((Arc::clone(&entered), Arc::clone(&unhold)));
+    let faulting = Arc::new(faulting);
+    let mut deps = h.deps_with("runner-1", cfg, Arc::new(h.fs_source()), sink);
+    deps.storage = Arc::clone(&faulting) as Arc<dyn StorageEngine>;
+    let started = std::time::Instant::now();
+    let run = runner::run(&deps, record);
+    tokio::pin!(run);
+    for (step, signal) in [
+        ("the held check", &reached),
+        ("the renewal's checkpoint", &entered),
+    ] {
+        tokio::time::timeout(BOUND, async {
+            tokio::select! {
+                ended = &mut run => panic!("the runner must not finish before {step}: {ended:?}"),
+                () = signal.notified() => {}
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the runner reaches {step}"));
+    }
+    // The check answers while the renewal is inside its checkpoint; the
+    // checkpoint answers once the deadline the run started with has passed.
+    release.notify_one();
+    let past_first_deadline = tokio::time::Instant::from_std(started + LEASE + LEASE / 6);
+    tokio::select! {
+        ended = &mut run => panic!("the runner must not finish while the renewal is held: {ended:?}"),
+        () = tokio::time::sleep_until(past_first_deadline) => {}
+    }
+    unhold.notify_one();
+    tokio::time::timeout(BOUND, &mut run)
+        .await
+        .expect("the run ends once the renewal answers")
+        .expect("runner run");
+
+    let record = h.record(&op).await;
+    assert_eq!(record.status, "COMPLETED_WITH_ERRORS", "{record:?}");
+    assert_eq!(
+        h.count_items().await,
+        4,
+        "the write batch after the renewal found the lease held"
+    );
+}
+
 #[tokio::test]
 async fn a_cancel_during_a_held_report_write_still_writes_the_outputs() {
     let h = Harness::new().await;
