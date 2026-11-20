@@ -1,6 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use super::lease_in_place::{HoldAt, HoldingSink};
 use super::*;
 
 // Empty input.
@@ -330,4 +331,134 @@ async fn an_invalid_condition_expression_fails_the_row_with_the_put_item_message
     assert_eq!(report[0]["errorMessages"], json!([expected]));
     assert_eq!(report[0]["itemLocation"]["itemIndex"], json!(1));
     assert!(report[0].get("newImage").is_none());
+}
+
+// When the reports are written.
+
+/// One row of `REPORT_ORDER`: a name, the requested `OutputType`, the line
+/// cap of the run, and the record count of each report object the run
+/// writes, by kind.
+type OrderRow = (
+    &'static str,
+    &'static [&'static str],
+    u64,
+    &'static [(ReportKind, usize)],
+);
+
+/// The order table. Each row reads one file of a plain row, a row missing
+/// its sort key and a row whose condition fails, and ends another way:
+/// with both report kinds, with only `ERROR` requested (the condition
+/// record goes to no object), and `FAILED` at a line cap of two.
+const REPORT_ORDER: &[OrderRow] = &[
+    (
+        "both kinds",
+        &["ERROR", "CONDITION_CHECK_FAILURE"],
+        1_000_000,
+        &[
+            (ReportKind::Error, 1),
+            (ReportKind::ConditionCheckFailure, 1),
+        ],
+    ),
+    (
+        "errors only",
+        &["ERROR"],
+        1_000_000,
+        &[(ReportKind::Error, 1)],
+    ),
+    (
+        "a failed run",
+        &["ERROR", "CONDITION_CHECK_FAILURE"],
+        2,
+        &[(ReportKind::Error, 1)],
+    ),
+];
+
+/// Every report object of `op` a client listing the output prefix finds:
+/// its kind and its bytes, in kind and name order.
+fn listed_objects(h: &Harness, op: &str) -> Vec<(ReportKind, Vec<u8>)> {
+    let mut objects = Vec::new();
+    for kind in [ReportKind::Error, ReportKind::ConditionCheckFailure] {
+        let path = h.report_path(op, kind);
+        let dir = path.parent().expect("the report path has a directory");
+        for name in h.report_objects(op, kind) {
+            objects.push((kind, std::fs::read(dir.join(name)).expect("read object")));
+        }
+    }
+    objects
+}
+
+/// A client that lists the output prefix while the run ends finds each
+/// report object once and complete: every object holds all its records
+/// when the manifest is written, the manifest is in place before the
+/// terminal transition, and no object changes after the manifest. The
+/// service measured the same order: each report object appeared once with
+/// one entity tag, 2.6 to 48 s before `EndTime`, and the manifest at
+/// `EndTime`.
+#[tokio::test]
+async fn each_report_object_is_complete_before_the_manifest_and_the_terminal_transition() {
+    for &(name, types, max_item_count, expected) in REPORT_ORDER {
+        let h = Harness::new().await;
+        h.put_direct(item("c", "1")).await;
+        h.write_input(
+            "part-000.json",
+            &file_of(&[
+                row(0),
+                row_missing_sk(1),
+                condition_row("2", "attribute_not_exists(pk)"),
+            ]),
+        );
+        let files = h.enumerate().await;
+        let output = output_config(Some(OUT_BUCKET), types);
+        let op = h.start(files, input_config(false), output).await;
+        let record = h.claim("runner-1", Duration::from_secs(60)).await;
+        let sink = Arc::new(HoldingSink::new(&h, HoldAt::Manifest));
+        let at_manifest = Arc::clone(&sink.reached);
+        let release = Arc::clone(&sink.release);
+        let at_finish = Arc::new(tokio::sync::Notify::new());
+        let mut storage = FaultingStorage::new(&h.storage);
+        storage.pend_finish = Some(Arc::clone(&at_finish));
+        let mut cfg = config();
+        cfg.max_item_count = max_item_count;
+        let mut deps = h.deps_with("runner-1", cfg, Arc::new(h.fs_source()), sink);
+        deps.storage = Arc::new(storage);
+        let run = runner::run(&deps, record);
+        tokio::pin!(run);
+
+        tokio::select! {
+            _ = &mut run => panic!("{name}: the run must reach the manifest"),
+            () = at_finish.notified() => panic!("{name}: the terminal transition came before the manifest"),
+            () = at_manifest.notified() => {}
+        }
+        assert_eq!(h.record(&op).await.status, "IN_PROGRESS", "{name}");
+        assert!(
+            h.read_manifest(&op).is_none(),
+            "{name}: the manifest follows the reports"
+        );
+        let objects = listed_objects(&h, &op);
+        let records: Vec<(ReportKind, usize)> = objects
+            .iter()
+            .map(|(kind, bytes)| (*kind, gunzip_lines(bytes).len()))
+            .collect();
+        assert_eq!(
+            records, expected,
+            "{name}: each object holds all its records before the manifest"
+        );
+        release.notify_one();
+
+        tokio::select! {
+            _ = &mut run => panic!("{name}: the run must reach the terminal transition"),
+            () = at_finish.notified() => {}
+        }
+        assert_eq!(h.record(&op).await.status, "IN_PROGRESS", "{name}");
+        assert_eq!(
+            h.read_manifest(&op).map(|lines| lines.len()),
+            Some(1),
+            "{name}: the manifest precedes the terminal transition"
+        );
+        assert_eq!(
+            listed_objects(&h, &op),
+            objects,
+            "{name}: no object is written again"
+        );
+    }
 }

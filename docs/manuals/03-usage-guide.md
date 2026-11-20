@@ -940,13 +940,20 @@ log.
 
 ### Error report
 
-Reports are written once the operation ends, under these keys in the output
-bucket:
+Reports are written after the operation reads its last row, under these keys
+in the output bucket:
 
 ```
 {S3KeyPrefix}/AWSDynamoDB/BulkOperation/{account}:{operation id}-0/output/errors/output-00000.json.gz
 {S3KeyPrefix}/AWSDynamoDB/BulkOperation/{account}:{operation id}-0/output/condition-check-failures/output-00000.json.gz
 ```
+
+Each report object is written once, with all its records. Every report
+object is in place before the manifest is written, and the manifest is in
+place before the operation reaches its terminal status. ExtendDB reads the
+whole input as one partition, `-0`. The hosted service writes the objects of
+each of its partitions (`-0`, `-1`, and so on) when it finishes that
+partition.
 
 The keys are the same on both stores. One `/` separates the prefix from
 `AWSDynamoDB/` unless the prefix is empty or already ends with `/`; with no

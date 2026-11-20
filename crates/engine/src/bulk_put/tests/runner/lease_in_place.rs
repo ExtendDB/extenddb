@@ -21,7 +21,7 @@ const BOUND: Duration = Duration::from_secs(30);
 
 /// Which output call a `HoldingSink` holds, once.
 #[derive(Clone, Copy, PartialEq)]
-enum HoldAt {
+pub(super) enum HoldAt {
     /// The first location check, the one at the first report record.
     FirstCheck,
     /// The first report page write.
@@ -33,11 +33,11 @@ enum HoldAt {
 /// The filesystem sink with one call held: it signals `reached`, then
 /// answers only after `release`. A held location check also signals
 /// `answered` once it has answered.
-struct HoldingSink {
+pub(super) struct HoldingSink {
     inner: FsSink,
     at: HoldAt,
-    reached: Arc<Notify>,
-    release: Arc<Notify>,
+    pub(super) reached: Arc<Notify>,
+    pub(super) release: Arc<Notify>,
     answered: Arc<Notify>,
     fired: Arc<AtomicBool>,
 }
@@ -48,7 +48,7 @@ struct HoldingWriter {
 }
 
 impl HoldingSink {
-    fn new(h: &Harness, at: HoldAt) -> Self {
+    pub(super) fn new(h: &Harness, at: HoldAt) -> Self {
         Self {
             inner: h.fs_sink(),
             at,
