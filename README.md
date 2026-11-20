@@ -336,11 +336,17 @@ answers without a store return that same answer here: `ListBackups` is empty,
 `DescribeContinuousBackups` reports point-in-time recovery `DISABLED`, enabling
 it with `UpdateContinuousBackups` returns `ContinuousBackupsUnavailableException`,
 and `ImportTable` / `ExportTableToPointInTime` return the service's "disabled"
-`ValidationException`.
+`ValidationException`. These answers do not first check that the named table
+exists, so a `DescribeContinuousBackups` or disabling `UpdateContinuousBackups`
+request for a table that does not exist returns the point-in-time-disabled
+description rather than the `TableNotFoundException` a server returns. A malformed
+`UpdateContinuousBackups` specification is still rejected with the same
+`ValidationException` a server returns, because that check precedes the
+table lookup on a server too.
 
-A wasm trap is permanent: the build uses `panic = "abort"`, so a panic aborts
-the instance, leaves the pending `submit` promise unresolved, and requires
-reloading the page to recover.
+On `wasm32` a panic cannot unwind: it is an unrecoverable trap that aborts the
+instance permanently. A trap leaves the pending `submit` promise unresolved and
+every later call traps as well, so recovering requires reloading the page.
 
 ### Building it
 

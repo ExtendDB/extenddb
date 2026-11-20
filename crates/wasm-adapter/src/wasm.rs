@@ -57,12 +57,12 @@ impl ExtendDb {
     /// the promise with a DynamoDB-shaped error document carrying a `__type`
     /// member — the same JSON a real `DynamoDB` endpoint returns.
     ///
-    /// The promise rejects only if the module traps. The module is built with
-    /// `panic = "abort"`, so a panic in the engine is a wasm trap that aborts
-    /// the instance permanently: the `submit` promise is left **pending** (it
-    /// neither resolves nor rejects), and every later call traps as well. The
-    /// instance cannot recover; a new one requires reloading the page. The
-    /// panic hook writes the panic and its stack to `console.error` first.
+    /// The promise rejects only if the module traps. On `wasm32` a panic
+    /// cannot unwind: it is an unrecoverable trap that aborts the instance
+    /// permanently. The `submit` promise is left **pending** (it neither
+    /// resolves nor rejects), and every later call traps as well. The instance
+    /// cannot recover; a new one requires reloading the page. The panic hook
+    /// writes the panic and its stack to `console.error` first.
     pub fn submit(&self, operation: String, body: String) -> js_sys::Promise {
         // Clone the cheap, Arc-backed engine into the future so it owns its
         // state and does not borrow `self` across the JS boundary (a borrowed
