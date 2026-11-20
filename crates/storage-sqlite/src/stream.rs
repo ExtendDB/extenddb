@@ -55,6 +55,9 @@ impl SqliteEngine {
     /// lock, renders the cutoff from `now`, deletes the rows before it and
     /// returns the count. The trait method calls this with the wall clock;
     /// tests call it with a fixed `now` so the production path is what runs.
+    /// The trait method reads the clock before this takes the lock, so a
+    /// record written while the sweep waits for the lock is newer than the
+    /// cutoff and stays.
     pub(crate) async fn cleanup_expired_stream_records_at(
         &self,
         now: time::OffsetDateTime,

@@ -5,6 +5,8 @@
 
 use super::retention_cutoff;
 use crate::SqliteEngine;
+use crate::sqlite_util::format_epoch_millis;
+use extenddb_storage::StreamEngine;
 use time::OffsetDateTime;
 
 /// 2026-10-24T14:19:07Z: a `now` with a zero sub-second, so the cutoff 24
@@ -46,10 +48,9 @@ fn cutoff_with_a_fraction_keeps_the_column_shape() {
     assert!("2026-10-23T14:19:07.459Z" > cutoff.as_str());
 }
 
-/// Rows in the cutoff's own second survive the sweep; only the row in the
-/// previous second is deleted.
-#[tokio::test]
-async fn sweep_on_a_whole_second_keeps_same_second_rows() {
+/// An in-memory engine with one table and one shard, holding a stream record
+/// per `created_at` value.
+async fn engine_with_records(created_at: &[&str]) -> SqliteEngine {
     let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
         .await
         .expect("engine");
@@ -74,21 +75,38 @@ async fn sweep_on_a_whole_second_keeps_same_second_rows() {
     .execute(&engine.pool)
     .await
     .expect("shard");
-    for (seq, created_at) in [
-        ("1", "2026-10-23T14:19:06.999Z"),
-        ("2", "2026-10-23T14:19:07.000Z"),
-        ("3", "2026-10-23T14:19:07.123Z"),
-    ] {
+    for (seq, created_at) in created_at.iter().enumerate() {
         sqlx::query(
             "INSERT INTO stream_records (shard_id, sequence_number, table_id, event_name, \
              record_data, created_at) VALUES ('shard-1', ?, 'tid', 'INSERT', '{}', ?)",
         )
-        .bind(seq)
+        .bind((seq + 1).to_string())
         .bind(created_at)
         .execute(&engine.pool)
         .await
         .expect("record");
     }
+    engine
+}
+
+/// The `created_at` values left in `stream_records`, oldest first.
+async fn remaining(engine: &SqliteEngine) -> Vec<String> {
+    sqlx::query_scalar::<_, String>("SELECT created_at FROM stream_records ORDER BY created_at")
+        .fetch_all(&engine.pool)
+        .await
+        .expect("remaining")
+}
+
+/// Rows in the cutoff's own second survive the sweep; only the row in the
+/// previous second is deleted.
+#[tokio::test]
+async fn sweep_on_a_whole_second_keeps_same_second_rows() {
+    let engine = engine_with_records(&[
+        "2026-10-23T14:19:06.999Z",
+        "2026-10-23T14:19:07.000Z",
+        "2026-10-23T14:19:07.123Z",
+    ])
+    .await;
 
     let now = OffsetDateTime::from_unix_timestamp(WHOLE_SECOND_NOW).expect("now");
     let deleted = engine
@@ -96,15 +114,27 @@ async fn sweep_on_a_whole_second_keeps_same_second_rows() {
         .await
         .expect("sweep");
     assert_eq!(deleted, 1);
-
-    let remaining: Vec<(String,)> =
-        sqlx::query_as("SELECT created_at FROM stream_records ORDER BY created_at")
-            .fetch_all(&engine.pool)
-            .await
-            .expect("remaining");
-    let remaining: Vec<&str> = remaining.iter().map(|(s,)| s.as_str()).collect();
     assert_eq!(
-        remaining,
+        remaining(&engine).await,
         ["2026-10-23T14:19:07.000Z", "2026-10-23T14:19:07.123Z"]
     );
+}
+
+/// The retention worker's entry point sweeps with the wall clock and the
+/// retention it is given: a record stamped 24.5 hours ago is deleted and one
+/// stamped 23.5 hours ago stays.
+#[tokio::test]
+async fn the_worker_entry_point_deletes_only_records_past_the_retention() {
+    let now_ms = i64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)
+        .expect("now in milliseconds");
+    let half_hour_ms = 30 * 60 * 1_000;
+    let older = format_epoch_millis(now_ms - 49 * half_hour_ms);
+    let newer = format_epoch_millis(now_ms - 47 * half_hour_ms);
+    let engine = engine_with_records(&[older.as_str(), newer.as_str()]).await;
+
+    let deleted = StreamEngine::cleanup_expired_stream_records(&engine, 24)
+        .await
+        .expect("sweep");
+    assert_eq!(deleted, 1);
+    assert_eq!(remaining(&engine).await, [newer]);
 }
