@@ -324,7 +324,7 @@ async fn reencodes_legacy_rows() {
             "backup_items: 3 row update(s)",
             "_ddb_t1 (table \"t\" of account 111122223333): 3 row update(s)",
             "_ddb_i1 (index \"gsi1\" of table \"t\" of account 111122223333): 5 row update(s)",
-            "gsi_pending: 2 row update(s)",
+            "gsi_pending: 1 row update(s)",
             "stream_records: 1 row update(s)",
         ]
     );
@@ -385,8 +385,9 @@ async fn reencodes_legacy_rows() {
         ]
     );
 
-    // gsi_pending: NULL old_item stays NULL, the raw row is re-encoded in
-    // both jsonb columns, the plain row is untouched.
+    // gsi_pending: NULL old_item stays NULL, the raw row's item image is
+    // re-encoded, and its index context is left as it is: migration 11
+    // escapes `index_context`. The plain row is untouched.
     let rows: Vec<(
         Option<serde_json::Value>,
         serde_json::Value,
@@ -401,7 +402,7 @@ async fn reencodes_legacy_rows() {
             (
                 None,
                 json!({"pk": {"S": "a\u{1}\u{2}b"}}),
-                json!({"k\u{1}\u{2}": 1}),
+                json!({"k\u{1}": 1}),
             ),
             (None, json!({"pk": {"S": "p"}}), json!({"k": 1})),
         ]

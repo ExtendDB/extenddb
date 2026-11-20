@@ -21,7 +21,9 @@
 //! character is stored as it was before the escape existed. The escape
 //! applies to every string and object key of a document, so a string that is
 //! not an attribute name and holds one of the two characters is stored the
-//! same way and reads back as written.
+//! same way and reads back as written. It is the escape the item documents
+//! use, `extenddb_storage::util::escape_json_strings` and
+//! `unescape_json_strings`.
 //!
 //! The documents: in the catalog database `tables.key_schema`,
 //! `tables.attribute_definitions`, `indexes.key_schema`, `indexes.projection`,
@@ -43,13 +45,10 @@
 //! itself. The encoder never writes one.
 
 use extenddb_storage::error::StorageError;
+use extenddb_storage::util::{escape_json_strings, unescape_json_strings};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-
-const ESC: char = '\u{1}';
-const NUL_TAIL: char = '\u{1}';
-const ESC_TAIL: char = '\u{2}';
 
 /// Serialize `value` into its stored form.
 pub(crate) fn to_catalog_json<T: Serialize + ?Sized>(value: &T) -> Result<Value, StorageError> {
@@ -65,84 +64,13 @@ pub(crate) fn from_catalog_json<T: DeserializeOwned>(v: Value) -> Result<T, Stor
 
 /// The stored form of a document that is already a JSON tree.
 pub(crate) fn escape_json(v: Value) -> Value {
-    map_strings(v, &escape_str)
+    escape_json_strings(v)
 }
 
 /// A stored document with the escape reversed, for a caller that reads its
 /// fields without deserializing it.
 pub(crate) fn unescape_json(v: Value) -> Value {
-    map_strings(v, &unescape_str)
-}
-
-fn escape_str(s: &str) -> Option<String> {
-    if !s.bytes().any(|b| b == 0 || b == 1) {
-        return None;
-    }
-    let mut out = String::with_capacity(s.len() + 8);
-    for ch in s.chars() {
-        match ch {
-            '\u{0}' => {
-                out.push(ESC);
-                out.push(NUL_TAIL);
-            }
-            '\u{1}' => {
-                out.push(ESC);
-                out.push(ESC_TAIL);
-            }
-            other => out.push(other),
-        }
-    }
-    Some(out)
-}
-
-fn unescape_str(s: &str) -> Option<String> {
-    if !s.bytes().any(|b| b == 1) {
-        return None;
-    }
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != ESC {
-            out.push(ch);
-            continue;
-        }
-        match chars.peek() {
-            Some(&NUL_TAIL) => {
-                chars.next();
-                out.push('\u{0}');
-            }
-            Some(&ESC_TAIL) => {
-                chars.next();
-                out.push('\u{1}');
-            }
-            _ => out.push('\u{1}'),
-        }
-    }
-    Some(out)
-}
-
-/// Apply `f` to every object key and string value of the tree. `f` returns
-/// `None` for a string it leaves as it is, so a tree without either character
-/// is rebuilt without copying a string.
-fn map_strings(v: Value, f: &dyn Fn(&str) -> Option<String>) -> Value {
-    match v {
-        Value::String(s) => match f(&s) {
-            Some(t) => Value::String(t),
-            None => Value::String(s),
-        },
-        Value::Array(items) => {
-            Value::Array(items.into_iter().map(|item| map_strings(item, f)).collect())
-        }
-        Value::Object(map) => {
-            let mut out = serde_json::Map::with_capacity(map.len());
-            for (k, val) in map {
-                let key = f(&k).unwrap_or(k);
-                out.insert(key, map_strings(val, f));
-            }
-            Value::Object(out)
-        }
-        other => other,
-    }
+    unescape_json_strings(v)
 }
 
 #[cfg(test)]
@@ -211,28 +139,5 @@ mod tests {
             json!({"k\u{1}\u{1}": {"NonKeyAttributes": ["n\u{1}\u{1}", "plain"]}, "n": 1})
         );
         assert_eq!(unescape_json(stored), v);
-    }
-
-    #[test]
-    fn every_string_of_five_characters_over_the_affected_alphabet_round_trips() {
-        let alphabet = ['\u{0}', '\u{1}', '\u{2}', 'a'];
-        let mut frontier = vec![String::new()];
-        for _ in 0..5 {
-            let mut next = Vec::new();
-            for s in &frontier {
-                for ch in alphabet {
-                    let mut t = s.clone();
-                    t.push(ch);
-                    next.push(t);
-                }
-            }
-            for s in &next {
-                let stored = escape_str(s).unwrap_or_else(|| s.clone());
-                assert!(!stored.contains('\u{0}'), "{s:?}");
-                let back = unescape_str(&stored).unwrap_or_else(|| stored.clone());
-                assert_eq!(&back, s, "{s:?} stored as {stored:?}");
-            }
-            frontier = next;
-        }
     }
 }

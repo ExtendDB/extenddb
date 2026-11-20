@@ -17,10 +17,12 @@
 //! Two bodies, one per database. The catalog body rewrites `backup_items`,
 //! which lives in the catalog database; the data body rewrites every data
 //! table, index table and vector index table (the text key columns and
-//! `item_data`), `gsi_pending` and `stream_records`, and recomputes
-//! `gsi_pending.worker_partition` for the rows it changes. Tables are listed
-//! from the catalog rows; a row whose table is `DELETING`, or whose physical
-//! table is missing, is skipped and noted.
+//! `item_data`), the item images of `gsi_pending` (`old_item`, `new_item`)
+//! and `stream_records`, and recomputes `gsi_pending.worker_partition` for
+//! the rows it changes. `gsi_pending.index_context` is not rewritten: catalog
+//! migration 11, `attribute_name_escape`, applies the same escape to it once.
+//! Tables are listed from the catalog rows; a row whose table is `DELETING`,
+//! or whose physical table is missing, is skipped and noted.
 //!
 //! The escape is not idempotent: an escaped row also holds U+0001, and a
 //! legacy U+0001 U+0002 cannot be told from an escaped U+0001. Each body runs
@@ -73,8 +75,8 @@ const FINGERPRINT: &str = "0013_escape_control_chars/postgres/1";
 /// The catalog body: `backup_items`.
 pub(crate) struct EscapeBackupItems;
 
-/// The data body: the data, index and vector index tables, `gsi_pending` and
-/// `stream_records`.
+/// The data body: the data, index and vector index tables, the item images
+/// of `gsi_pending`, and `stream_records`.
 pub(crate) struct EscapeDataRows;
 
 #[async_trait]
@@ -561,10 +563,11 @@ pub(crate) async fn escape_data(
         }
     }
 
-    // Fixed tables holding item documents.
+    // Fixed tables holding item documents. `gsi_pending.index_context` is a
+    // catalog document, which migration 11 escaped once with the same
+    // mapping; escaping it again would read a U+0001 back as U+0001 U+0002.
     if let Some(mut w) =
-        fixed_table_work(conn, "gsi_pending", &[], &["old_item", "new_item", "index_context"])
-            .await?
+        fixed_table_work(conn, "gsi_pending", &[], &["old_item", "new_item"]).await?
     {
         w.recompute_worker_partition = true;
         work.push(w);

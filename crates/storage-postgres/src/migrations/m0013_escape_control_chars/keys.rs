@@ -81,7 +81,7 @@ fn current_partition(
 ) -> Option<i32> {
     let old_item = old_item.map(crate::data::json_to_item).transpose().ok()?;
     let new_item = new_item.map(crate::data::json_to_item).transpose().ok()?;
-    let context: PendingApplyContext = crate::data::stored_json_to(index_context).ok()?;
+    let context: PendingApplyContext = crate::catalog_json::from_catalog_json(index_context).ok()?;
     worker_partition(old_item.as_ref(), new_item.as_ref(), &context).ok()
 }
 
