@@ -258,6 +258,10 @@ async fn a_crash_during_a_pacer_wait_loses_no_row_case(backend: Backend) {
         stopped.await.is_err(),
         "runner-1 must still wait on the pacer"
     );
+    assert!(
+        deps.pacer.settled_tokens() < 0.0,
+        "runner-1 must reach the pacer wait"
+    );
     tokio::time::sleep(Duration::from_millis(1500)).await;
     let record = h.claim("runner-2", Duration::from_secs(60)).await;
     runner::run(&h.deps("runner-2", config()), record)
