@@ -545,21 +545,24 @@ mod tests {
         let emoji128 = "\u{1F600}".repeat(128);
         let a256 = "a".repeat(256);
         // (1-based position of the element, its action, the name, the clauses)
-        let rows: [(usize, &str, &str, &[&str]); 14] = [
+        let rows: [(usize, &str, &str, &[&str]); 17] = [
             (1, "create", "g\u{0}2", &[PATTERN]),
             (2, "delete", "g\u{0}2", &[PATTERN]),
             (1, "create", &emoji2, &[SHORT, PATTERN]),
             (1, "create", &emoji128, &[PATTERN]),
             (1, "create", "ab", &[SHORT]),
             (1, "create", &a256, &[LONG]),
+            (1, "create", "", &[SHORT, PATTERN]),
             (1, "update", "ab", &[SHORT]),
             (1, "update", &a256, &[LONG]),
             (1, "update", &emoji2, &[SHORT, PATTERN]),
             (1, "update", &emoji128, &[PATTERN]),
+            (1, "update", "", &[SHORT, PATTERN]),
             (1, "delete", "ab", &[SHORT]),
             (1, "delete", &a256, &[LONG]),
             (1, "delete", &emoji2, &[SHORT, PATTERN]),
             (1, "delete", &emoji128, &[PATTERN]),
+            (1, "delete", "", &[SHORT, PATTERN]),
         ];
         for (position, action, name, clauses) in rows {
             let mut updates = vec![delete("gix"); position - 1];
