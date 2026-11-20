@@ -284,27 +284,33 @@ def test_create_table_checks_the_tags_before_the_definition(
     assert_create_table_refused(dynamodb_client_no_validation, expected, Tags=tags, **definition)
 
 
-@pytest.mark.parametrize(
-    "request_name,expected",
-    [
-        (
-            "ab",
-            "1 validation error detected: Value 'ab' at 'tableName' failed to satisfy constraint: "
-            "Member must have length greater than or equal to 3",
-        ),
-        (None, "The parameter 'TableName' is required but was not present in the request"),
-    ],
-    ids=["too-short", "missing"],
+TOO_SHORT = (
+    "1 validation error detected: Value 'ab' at 'tableName' failed to satisfy constraint: "
+    "Member must have length greater than or equal to 3"
 )
-def test_create_table_checks_the_table_name_before_the_tags(
-    dynamodb_client_no_validation, request_name, expected
+
+
+@pytest.mark.parametrize(
+    "request_name,definition,tags,expected",
+    [
+        ("ab", {}, K_BAD, TOO_SHORT),
+        (None, {}, K_BAD, "The parameter 'TableName' is required but was not present in the request"),
+        # Without tags the TableName length still comes first.
+        ("ab", {"BillingMode": "FOO"}, None, TOO_SHORT),
+        ("ab", {"KeySchema": None}, None, TOO_SHORT),
+    ],
+    ids=["too-short", "missing", "too-short-billing-mode-enum", "too-short-missing-key-schema"],
+)
+def test_create_table_checks_the_table_name_first(
+    dynamodb_client_no_validation, request_name, definition, tags, expected
 ):
     params = {
         "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
         "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
         "BillingMode": "PAY_PER_REQUEST",
-        "Tags": K_BAD,
+        "TableName": request_name,
+        "Tags": tags,
     }
-    if request_name is not None:
-        params["TableName"] = request_name
+    params.update(definition)
+    params = {k: v for k, v in params.items() if v is not None}
     assert_validation(lambda: dynamodb_client_no_validation.create_table(**params), expected)
