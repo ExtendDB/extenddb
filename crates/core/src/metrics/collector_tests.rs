@@ -226,11 +226,11 @@ fn prune_keeps_recent_segments_and_drops_them_a_day_later() {
     // A day later the bucket has left the ring without any prune call.
     let later = epoch + Duration::from_secs(1441 * 60);
     assert!(
-        c.query_segments_at(TimeWindow::AllTime, None, later)
+        c.query_segments_with(TimeWindow::AllTime, None, || later)
             .is_empty()
     );
     assert!(
-        c.query_segments_at(TimeWindow::LastDay, None, later)
+        c.query_segments_with(TimeWindow::LastDay, None, || later)
             .is_empty()
     );
     // The buckets are still held until the collector's prune runs at that

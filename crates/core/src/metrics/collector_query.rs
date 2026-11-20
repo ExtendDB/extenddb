@@ -178,17 +178,6 @@ impl MetricsCollector {
         };
         store.query(window, account_id, clock())
     }
-
-    /// `query_segments` with an injected clock, for tests.
-    #[cfg(test)]
-    pub(super) fn query_segments_at(
-        &self,
-        window: TimeWindow,
-        account_id: Option<&str>,
-        now: Instant,
-    ) -> Vec<OperationSegments> {
-        self.query_segments_with(window, account_id, || now)
-    }
 }
 
 /// Compute percentiles from a pre-sorted slice of values.
