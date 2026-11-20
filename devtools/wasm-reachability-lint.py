@@ -4,7 +4,8 @@
 #
 # wasm-reachability-lint.py — a cheap backstop for the WebAssembly build of the
 # engine. Some APIs COMPILE to wasm32-unknown-unknown but TRAP at runtime when
-# called, and a trap is permanent for a wasm instance (`panic = "abort"`):
+# called, and a trap is permanent for a wasm instance (a panic cannot unwind on
+# wasm32):
 #
 #   * std::time::{SystemTime, Instant}::now() — "time not implemented on this
 #     platform"; the build reads the clock through web-time instead.
