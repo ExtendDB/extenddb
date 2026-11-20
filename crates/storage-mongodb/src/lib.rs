@@ -17,6 +17,7 @@ pub mod config;
 mod credential_store;
 mod data;
 mod data_engine;
+mod error_class;
 mod management_store;
 mod management_store_secrets;
 mod metadata_engine;
