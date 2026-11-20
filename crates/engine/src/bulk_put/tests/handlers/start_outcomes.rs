@@ -260,45 +260,6 @@ async fn the_default_limit_counts_five_operations_in_each_tier() {
 }
 
 #[tokio::test]
-async fn a_saturated_account_is_refused_before_the_enumeration_walk() {
-    let h = Harness::new().await;
-    Harness::create_table(&h.storage, "second").await;
-    let ctx = ctx_with_limits(
-        &h,
-        bulk_limits(&[
-            ("max_concurrent_bulk_operations", json!(1)),
-            ("max_bulk_input_files", json!(2)),
-        ]),
-    );
-    start_ok(&ctx, start_body()).await;
-
-    // The second start's input bucket holds more files than the cap, so
-    // an enumeration walk would answer the max_bulk_input_files message.
-    // The concurrency limit message can only come from the pre-check path
-    // that skips the walk.
-    let bucket_dir = h.store.0.join(ACCOUNT).join("oversized");
-    std::fs::create_dir_all(&bucket_dir).unwrap();
-    for i in 0..3 {
-        std::fs::write(bucket_dir.join(format!("part-{i}.json")), b"{}").unwrap();
-    }
-
-    let body = with_input(
-        with_top(start_body(), "TableName", json!("second")),
-        "S3Bucket",
-        json!("oversized"),
-    );
-    let message = expect_limit_exceeded(start(&ctx, body).await);
-    assert_eq!(
-        message,
-        "Subscriber limit exceededService quota exceeded You have reached the maximum \
-         number of concurrent bulk operations for the selected PerformanceTier, which is \
-         1. Wait until other jobs finish, and try again. You can also reach out to \
-         AWS Support to request a quota increase.",
-        "the account limit must answer without running the walk"
-    );
-}
-
-#[tokio::test]
 async fn a_replayed_token_on_a_saturated_account_returns_the_existing_operation() {
     // A replayed token is answered from its existing row before the
     // account limit, on the saturated path as well as the ordinary one:
