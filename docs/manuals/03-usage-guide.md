@@ -563,8 +563,8 @@ later row with the same key overwrites an earlier one.
 Keys are used as S3 lists them: a key holding `//`, a leading `/`, `.` or
 `..` segments, or `\` is read by that key. Every object under the prefix is
 an input, zero-byte objects whose keys end in `/` included; they hold no
-rows. The objects are listed at Start with ListObjectsV2, 1,000 keys per
-page.
+rows. The objects are listed on the operation's first claim with
+ListObjectsV2, 1,000 keys per page.
 
 The bucket check is a ListObjectsV2 call for at most one key under the
 prefix, so S3 decides whether the bucket exists, whether it has the expected
@@ -581,12 +581,12 @@ and they need not match any AWS account, so name the bucket's AWS account
 for S3 to check it.
 
 An object is read with ranged GETs of 8 MiB, up to the size the listing
-gave: bytes appended after Start are not read, and an object that shrank
+gave: bytes appended after the listing are not read, and an object that shrank
 ends early. An object listed at 0 bytes is read as one byte, `bytes=0-0`,
 and gives no rows whatever it holds by then. Every GET carries `If-Match`
-with the ETag the listing gave at Start, on the first range and on a read
-resumed after a restart, so a read takes bytes only from the object
-listed. An object overwritten after Start is recorded as the service
+with the ETag the listing gave, on the first range and on a read resumed
+after a restart, so a read takes bytes only from the object listed. An
+object overwritten after the listing is recorded as the service
 records it: the object counts one processed and failed item, its error
 record names the object with no `itemIndex` and carries `The S3 object could
 not be imported because it was overwritten`, the run goes on with the next
@@ -595,7 +595,7 @@ the items failed validation checks and were not ingested`. The service
 records this for an object overwritten after its listing and before its read
 (measured), counting none of the object's bytes as `ProcessedInputBytes` and
 marking it `PARTIALLY_PROCESSED` in the manifest with no range and the ETag
-listed at Start. ExtendDB records an object overwritten during its read, or
+the listing gave. ExtendDB records an object overwritten during its read, or
 between a stop and the resumed read, the same way, with the rows it had
 delivered kept and their range in the manifest. `ProcessedInputBytes` keeps
 the bytes of those rows for a replacement found during the read, and the
@@ -638,7 +638,8 @@ relative to the bucket directory:
 ```
 
 The server creates `{store root}/{account id}` at startup for every account,
-when an account is created, and at Start when it is missing, so the account
+when an account is created, and on an operation's first claim when it is
+missing, so the account
 directory is always there to stage buckets into. The bucket directory itself
 is the caller's to create. A directory whose name breaks the bucket name
 rules cannot be referenced.
@@ -775,7 +776,7 @@ ExtendDB policies, on both stores:
 
 | Action | Resource | Evaluated | Denied |
 |---|---|---|---|
-| `s3:ListBucket` | `arn:aws:s3:::{input bucket}`, with `s3:prefix` the request's `InputS3Configuration.S3KeyPrefix`, or the empty string when it has none, and, on the S3 store with an `endpoint_url`, again with the prefix as the service resolves it when that differs | At Start, before the input bucket check | The operation is created already `FAILED` with `S3AccessDenied`: no byte members, no manifest |
+| `s3:ListBucket` | `arn:aws:s3:::{input bucket}`, with `s3:prefix` the request's `InputS3Configuration.S3KeyPrefix`, or the empty string when it has none, and, on the S3 store with an `endpoint_url`, again with the prefix as the service resolves it when that differs | On the operation's first claim, before the input bucket check | The operation ends `FAILED` with `S3AccessDenied`: no byte members, no output object |
 | `s3:GetObject` | `arn:aws:s3:::{input bucket}/{key}` | Before each input object is opened, and at every checkpoint boundary (`bulk_put_batch_size` rows) while it is read | `FAILED` with `S3AccessDenied`. Rows already written stay written. The manifest marks the object `NOT_PROCESSED` when none of its rows was counted and `NOT_AVAILABLE` when some were |
 | `s3:PutObject` | `arn:aws:s3:::{output bucket}/{key}` | At the first record of each report kind, on report object 0 of that kind; when the reports are written, on each report object; and on the manifest's key | At a kind's first record, the fault is held to the end of the input (see Error report). When the reports are written, `FAILED` with `S3AccessDenied`: that report kind is not installed, and the manifest is still written. On the manifest's key, `FAILED` with `S3AccessDenied` and the message prefixed `Manifest is not available. ` |
 
@@ -885,15 +886,15 @@ table was deleted or left the `ACTIVE`/`UPDATING` states, the consumed line
 count passed `max_bulk_item_count`, the input or output location could not
 be used (`S3NoSuchBucket`, `S3AccessDenied`, `S3NoSuchKey`, and the other
 S3 and KMS codes below), or an internal error stopped it; `FailureCode` and
-`FailureMessage` say which. A failure decided at Start creates the operation
-already `FAILED` (see Input files). A cancel ends the operation
+`FailureMessage` say which. An input check that fails ends the operation
+`FAILED` on its first claim (see Input files). A cancel ends the operation
 `CANCELLED`, including a cancel that lands after every row was processed.
 
 ### Failure messages
 
 On the filesystem store the location failures carry fixed messages: `The
 specified bucket does not exist`, `Access Denied`, and `The specified key
-does not exist.` for an input file removed after Start.
+does not exist.` for an input file removed after the listing.
 
 On the S3 store a failure S3 answered carries S3's message, followed by the
 tail the hosted service renders for the call that failed. The input bucket
@@ -924,9 +925,9 @@ An S3 error code ExtendDB does not map, an S3 code about the server's own
 credentials, account, or clock (`InvalidAccessKeyId`,
 `SignatureDoesNotMatch`, `ExpiredToken`, `RequestTimeTooSkewed`, and the
 others the Admin Guide lists), or credentials the server cannot resolve
-end a running operation with `InternalServerError` at once. At Start each
-of these answers the request itself with `InternalServerError`, and no
-operation is created. S3's code and message are in the server log.
+end a running operation with `InternalServerError` at once, the first
+claim's input checks included. S3's code and message are in the server
+log.
 
 ### Counters
 

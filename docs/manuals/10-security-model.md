@@ -305,7 +305,7 @@ session policy, and an explicit Deny first.
 
 | Action | Resource evaluated | When |
 |--------|--------------------|------|
-| `s3:ListBucket` | the input bucket: `arn:aws:s3:::<bucket>` | Once, at Start, before the input bucket is checked |
+| `s3:ListBucket` | the input bucket: `arn:aws:s3:::<bucket>` | Once, on the operation's first claim, before the input bucket is checked |
 | `s3:GetObject` | each input object: `arn:aws:s3:::<bucket>/<key>` | Before the object is opened, on a resumed run too, and at every checkpoint boundary while it is read |
 | `s3:PutObject` | each report object and the manifest: `arn:aws:s3:::<bucket>/<key>` | At the first record of each report kind, on report object 0 of that kind; before each report object is written; and before the manifest is written |
 

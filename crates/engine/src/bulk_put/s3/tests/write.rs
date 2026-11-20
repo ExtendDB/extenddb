@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The output side: the write check at the first report record and at the
-//! manifest, the Start-time encryption check, the multipart report writer
+//! manifest, the first claim's encryption check, the multipart report writer
 //! with rotation, and the manifest.
 
 use std::io::Read;

@@ -18,9 +18,9 @@ use crate::bulk_put::source::StoreFault;
 /// The tail the service appends to S3's message, by the kind of call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Tail {
-    /// Input reads, the Start-time list, the manifest write and the
-    /// Start-time encryption check: `(Service: Amazon S3; Status Code: ...;
-    /// Proxy: null)`.
+    /// Input reads, the first claim's listing and encryption check, and the
+    /// manifest write: `(Service: Amazon S3; Status Code: ...; Proxy:
+    /// null)`.
     AmazonS3,
     /// Report writes, the first-record check included: `(Service: S3,
     /// Status Code: ...) (SDK Attempt Count: 1)`.

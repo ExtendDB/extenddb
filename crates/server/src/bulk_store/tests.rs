@@ -374,7 +374,7 @@ async fn create_table(storage: &Arc<dyn StorageEngine>, account: &str, table: &s
 }
 
 /// Start one operation of `account` on `table`, recording `run_context`,
-/// born terminal when `terminal`; returns its id.
+/// and end it at once when `terminal`; returns its id.
 async fn start(
     storage: &Arc<dyn StorageEngine>,
     account: &str,
@@ -434,7 +434,7 @@ async fn start(
 /// in progress recorded on S3, on the filesystem store, and with no run
 /// context (started before run contexts were recorded, so on the
 /// filesystem store); one recorded on S3 and cancelled, so `CANCELLING`; one
-/// recorded on S3 and born terminal; and one in progress whose run context
+/// recorded on S3 and ended at once; and one in progress whose run context
 /// does not parse. B holds one in progress on S3 and one terminal on the
 /// filesystem store; C holds one terminal on S3.
 async fn catalog_with_operations() -> (Arc<dyn CatalogStore>, Arc<dyn StorageEngine>) {

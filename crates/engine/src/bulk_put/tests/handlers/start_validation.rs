@@ -172,9 +172,8 @@ async fn a_token_over_the_byte_cap_is_rejected_before_a_missing_table() {
 
 #[tokio::test]
 async fn a_missing_table_answers_before_the_owner_mismatch() {
-    // The owner check moved from validation step 2 to the terminal-born
-    // insert, which needs the table row, so the table lookup answers
-    // first.
+    // The owner check runs on the operation's first claim, after Start
+    // found the table, so the table lookup answers first.
     let h = Harness::new().await;
     let body = with_top(
         with_input(start_body(), "S3BucketOwner", json!(OTHER_ACCOUNT)),

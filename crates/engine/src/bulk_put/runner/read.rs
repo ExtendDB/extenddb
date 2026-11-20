@@ -223,7 +223,7 @@ pub(super) async fn skip_covered_region(
 /// both directions: a missing output bucket, or a mismatched owner, with no
 /// failing rows completes, and the first record finds the fault, which
 /// fails the operation with `S3NoSuchBucket` or `S3AccessDenied`. Ownership
-/// is decided before existence, as at Start.
+/// is decided before existence, as in the first claim's input check.
 ///
 /// A denial, or a fault the store renders, is held (`hold_location_fault`):
 /// the run reads on to the end of the input, writing and checkpointing

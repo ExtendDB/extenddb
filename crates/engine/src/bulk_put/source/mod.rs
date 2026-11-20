@@ -80,8 +80,8 @@ pub(crate) struct SourceFile {
 /// A failure while enumerating or reading input files.
 ///
 /// `TooManyFiles` comes only from `list`, when the walk passes one of the
-/// bounds derived from the caller's file limit; the Start handler maps it
-/// to the `max_bulk_input_files` `ValidationException`. `LineTooLong`,
+/// bounds derived from the caller's file limit; the runner maps it to a
+/// `FAILED` operation with `S3ObjectsCountLimitExceeded`. `LineTooLong`,
 /// `InvalidUtf8` and `Corrupt` follow the parse-level abandon path; `Store`
 /// carries its own code and message; the runner maps the remaining three to
 /// a `FAILED` operation with `InternalServerError`, so none of those
@@ -190,7 +190,7 @@ pub(crate) enum SinkError {
 /// S3 store's source in `bulk_put::s3`. `at` names the input bucket on
 /// every call.
 pub(crate) trait BulkSource: Send + Sync {
-    /// The Start-time check of the input bucket: the expected owner first,
+    /// The first claim's check of the input bucket: the expected owner first,
     /// then existence; a failure of either is a [`SourceError::Store`]
     /// fault. `prefix` is the request's `S3KeyPrefix`. The filesystem store
     /// creates the caller's account directory first, then answers an
@@ -341,7 +341,7 @@ pub(crate) trait BulkSink: Send + Sync {
         sse: &OutputSse,
     ) -> BoxFuture<'_, Result<(), SinkError>>;
 
-    /// The Start-time check of the output encryption settings for `key`; a
+    /// The first claim's check of the output encryption settings for `key`; a
     /// failure is a [`SinkError::Store`] fault. The filesystem store records
     /// the encryption choice and checks nothing, which is the default.
     fn check_encryption(

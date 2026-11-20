@@ -92,7 +92,7 @@ trait StoreFixture: Sync {
 
 /// The tail S3 faults carry, by the call that met them (`s3::error`).
 enum Tail {
-    /// Input reads, the Start-time listing and the manifest write.
+    /// Input reads, the first claim's listing and the manifest write.
     AmazonS3 { status: u16, code: &'static str },
     /// Report writes and the write check of a report key.
     S3 { status: u16 },

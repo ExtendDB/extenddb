@@ -110,7 +110,7 @@ async fn a_store_fault_on_a_later_listing_page_fails_the_operation() {
     assert_eq!(replay["BulkOperationArn"], description["BulkOperationArn"]);
 }
 
-/// A sink whose Start-time encryption check fails with `fault`, or with an
+/// A sink whose encryption check fails with `fault`, or with an
 /// I/O error when `fault` is `None`; it records the key it was asked about.
 struct EncryptionFails {
     fault: Option<StoreFault>,

@@ -527,8 +527,8 @@ symbolic links that escape it are rejected. At startup the server creates
 `{path}/{account id}` for every account. If `path` names an existing regular
 file the server refuses to start with `Cannot resolve bulk store path
 {path}: File exists (os error 17)`. `POST
-/management/accounts` creates the new account's directory, and
-`StartBulkPutItems` creates it if it is missing. The caller creates the
+/management/accounts` creates the new account's directory, and the first
+claim of an operation creates it if it is missing. The caller creates the
 bucket directories: an operation naming a bucket directory that does not
 exist ends `FAILED` with `FailureCode` `S3NoSuchBucket`. Account deletion
 leaves the directory and its files in place.
@@ -682,18 +682,15 @@ off is requested again for the same range with the same `If-Match`, and
 those requests count toward the call's 120 seconds. Each retry logs a WARN
 line with its wait. A retry that starts before the 120 seconds have passed
 runs all three attempts, so a call that gets no answer at all ends after
-about three minutes. The S3 calls a Start makes (the bucket check, each page
-of the listing, and the encryption check of an SSE-KMS output) end within
-10 seconds each, retries included. A Start lists the whole input prefix
-before it answers, so its time grows with the number of listing pages, and
-a long listing on a slow endpoint can outlast a client's read timeout. When
-a Start's call has not ended after
-10 seconds, the Start answers `InternalServerError` and creates no
-operation. When a running operation's call still fails after 120 seconds,
-the operation stays `IN_PROGRESS` and the next claim resumes it from its
-last checkpoint, under the limit of ten resumes without progress described
-under `bulk_operation_lease_seconds`. In both cases the
-server logs an ERROR line naming the call and the bucket. Other 4xx
+about three minutes. The calls an operation's first claim makes before it
+reads a row (the input bucket check, each page of the listing, and the
+encryption check of an SSE-KMS output) run under the same 120 seconds. When
+a running operation's call still fails after 120 seconds, the operation
+stays `IN_PROGRESS` and the next claim resumes it from its last checkpoint,
+or lists the input again when no listing was recorded, under the limit of
+ten resumes without progress described under
+`bulk_operation_lease_seconds`. The server logs an ERROR line naming the
+call and the bucket. Other 4xx
 answers are not sent again.
 
 While an input object's open or read waits on S3, the runner checkpoints
