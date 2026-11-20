@@ -24,7 +24,7 @@
 //!   `; ` under `2 validation errors detected:` (measured at `tableName`;
 //!   derived for the other locations). Locations: `tableName` for `TableName`,
 //!   `targetTableName`, `sourceTableName`, `tableCreationParameters.tableName`,
-//!   `exclusiveStartTableName`, `indexName` for `Query` and `Scan`, and
+//!   `exclusiveStartTableName`, `indexName` for `Query`, `Scan` and `SearchVectors`, and
 //!   `transactItems.<n>.member.<op>.tableName` (1-based, `put`, `get`,
 //!   `delete`, `update`, `conditionCheck`). A name inside the pattern but of a
 //!   bad length is left to the engine handlers, whose answer the service's
@@ -146,7 +146,7 @@ pub(crate) fn check_table_name_chars(
             // service refuses U+0000 in either (measured 2026-11-06).
             with_str(input, "ExclusiveStartStreamArn", arn_gate::check_stream_arn)
         }
-        "Query" | "Scan" => {
+        "Query" | "Scan" | "SearchVectors" => {
             check_name(input.get("TableName"), "tableName", operation, account_id)?;
             match input.get("IndexName").and_then(Value::as_str) {
                 // Pattern only: the length clauses for an index name are unmeasured.
@@ -452,6 +452,32 @@ mod tests {
         assert_eq!(
             message("ListStreams", json!({ "TableName": NUL })).unwrap(),
             "TableName must be at least 3 characters long and at most 255 characters long"
+        );
+    }
+
+    #[test]
+    fn search_vectors_index_name_outside_the_pattern_is_refused_as_query_is() {
+        for bad in ["vidx/extra", "g\u{0}2", "a b", "v%2fx"] {
+            let input = json!({ "TableName": "ok", "IndexName": bad });
+            let expected = one(bad, "indexName", PAT);
+            assert_eq!(message("SearchVectors", input.clone()).unwrap(), expected);
+            assert_eq!(message("Query", input).unwrap(), expected);
+        }
+        for input in [
+            json!({ "TableName": "ok", "IndexName": "vidx" }),
+            json!({ "TableName": "ok", "IndexName": "" }),
+            json!({ "TableName": "ok" }),
+        ] {
+            assert!(message("SearchVectors", input.clone()).is_none(), "{input}");
+        }
+        // The table name is checked as for any operation.
+        assert_eq!(
+            message(
+                "SearchVectors",
+                json!({ "TableName": NUL, "IndexName": "vidx" })
+            )
+            .unwrap(),
+            one(NUL, "tableName", PAT)
         );
     }
 

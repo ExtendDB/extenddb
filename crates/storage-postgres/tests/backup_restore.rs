@@ -3892,9 +3892,11 @@ mod catalog_index {
 
         // Back to the shape before migration 6: the job record's columns and
         // index gone, the registrations as the old release wrote them, the
-        // interrupted target CREATING, and the migration forgotten.
+        // interrupted target CREATING, and migration 6's ledger row deleted,
+        // so the next run applies migration 6 alone.
         sqlx::raw_sql(
             "DROP INDEX IF EXISTS idx_table_restores_status; \
+             DELETE FROM extenddb_migrations WHERE id = 6; \
              ALTER TABLE table_restores DROP COLUMN status, DROP COLUMN kind, \
                  DROP COLUMN store_kind, DROP COLUMN store_root, DROP COLUMN store_id, \
                  DROP COLUMN owner_generation, DROP COLUMN heartbeat_at, DROP COLUMN spool_host, \
@@ -3917,7 +3919,6 @@ mod catalog_index {
             .await
             .expect("open the runner");
         let migrations = Runner::new(&runner, "test");
-        migrations.forget(6).await.expect("forget migration 6");
         let report = migrations.migrate().await.expect("migrate again");
         runner.close().await;
         assert_eq!(report.applied.iter().map(|a| a.id).collect::<Vec<_>>(), [6]);
@@ -5668,11 +5669,15 @@ mod catalog_index {
         put_indexed_items(&s, "gq_src", &desc, 1).await;
         assert_eq!(pending().await, 1, "the write queued its index update");
 
-        // The factory reads the encryption key `init` writes.
+        // The factory reads the encryption key `init` writes, and refuses
+        // one that is not 32 bytes in base64.
+        let key = extenddb_storage::bootstrapper::helpers::generate_encryption_key()
+            .expect("generate key");
         sqlx::query(
-            "INSERT INTO settings (key, value) VALUES ('encryption_key', 'test-key') \
+            "INSERT INTO settings (key, value) VALUES ('encryption_key', $1) \
              ON CONFLICT (key) DO NOTHING",
         )
+        .bind(&key)
         .execute(&s.catalog)
         .await
         .expect("encryption key");

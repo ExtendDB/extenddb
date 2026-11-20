@@ -3,6 +3,8 @@
 
 //! `WorkerStore` trait implementation and control plane transition processing.
 
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use cdrs_tokio::types::IntoRustByName;
 use futures::future::BoxFuture;
 
@@ -52,16 +54,13 @@ impl CassandraEngine {
              ALLOW FILTERING"
         );
 
-        let result =
-            self.session.query(&query).await.map_err(|e| {
-                StorageError::Internal(format!("Failed to query CREATING tables: {e}"))
-            })?;
-
-        let body = result.response_body().map_err(|e| {
-            StorageError::Internal(format!("Failed to parse CREATING tables response: {e}"))
-        })?;
-
-        let rows = body.into_rows().unwrap_or_default();
+        let rows: Vec<cdrs_tokio::types::rows::Row> = crate::cassandra_util::query_rows(
+            &self.session,
+            &query,
+            cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
+            "Failed to query CREATING tables",
+        )
+        .await?;
 
         for row in rows {
             let account_id: String = row
@@ -95,16 +94,13 @@ impl CassandraEngine {
              ALLOW FILTERING"
         );
 
-        let result =
-            self.session.query(&query).await.map_err(|e| {
-                StorageError::Internal(format!("Failed to query DELETING tables: {e}"))
-            })?;
-
-        let body = result.response_body().map_err(|e| {
-            StorageError::Internal(format!("Failed to parse DELETING tables response: {e}"))
-        })?;
-
-        let rows = body.into_rows().unwrap_or_default();
+        let rows: Vec<cdrs_tokio::types::rows::Row> = crate::cassandra_util::query_rows(
+            &self.session,
+            &query,
+            cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
+            "Failed to query DELETING tables",
+        )
+        .await?;
 
         for row in rows {
             let account_id: String = row
@@ -123,7 +119,11 @@ impl CassandraEngine {
             // Delete tags
             let tag_delete = format!("DELETE FROM {catalog_keyspace}.tags WHERE resource_arn = ?");
             self.session
-                .query_with_values(&tag_delete, cdrs_tokio::query_values!(table_arn.as_str()))
+                .run(
+                    Stmt::Write,
+                    &tag_delete,
+                    cdrs_tokio::query_values!(table_arn.as_str()),
+                )
                 .await
                 .map_err(|e| StorageError::Internal(format!("Failed to delete tags: {e}")))?;
 
