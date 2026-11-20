@@ -306,9 +306,11 @@ Statistics are exposed at `/management/auth-cache-metrics` (JSON, admin-authenti
 
 All defaults match real DynamoDB limits. Override only for testing edge cases.
 
-The bulk operation keys below are the exception: they are extenddb's own,
-DynamoDB exposes no equivalent, and they govern `StartBulkPutItems` and the
-workers that drive it.
+The bulk operation keys below govern `StartBulkPutItems` and the workers
+that drive it. The defaults of `max_concurrent_bulk_operations`,
+`max_bulk_input_bytes`, `max_bulk_input_files`, `max_bulk_input_object_bytes`
+and `max_bulk_client_token_chars` are DynamoDB's quotas. The other bulk keys
+are ExtendDB's own, and DynamoDB has no equivalent.
 
 | Key | Default | Description |
 |-----|---------|-------------|

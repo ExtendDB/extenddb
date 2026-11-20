@@ -4,11 +4,14 @@
 //! The commented bulk blocks of the config `extenddb init` writes.
 
 /// Commented bulk `[limits]` keys written into the generated config, with the
-/// defaults. They are extenddb's own; DynamoDB exposes no equivalent. Kept in
-/// sync with `extenddb.sample.toml` and covered by a test in this module.
+/// defaults. Five of the defaults are DynamoDB's quotas, and the other keys are
+/// extenddb's own. Kept in sync with `extenddb.sample.toml` and covered by a
+/// test in this module.
 pub(super) const BULK_LIMITS_TEMPLATE: &str = "\
 # Bulk operations (StartBulkPutItems and the workers that drive it).
-# These keys are extenddb's own; DynamoDB exposes no equivalent.
+# DynamoDB's quotas are the defaults of max_concurrent_bulk_operations,
+# the three max_bulk_input_* keys and max_bulk_client_token_chars. The
+# other keys are ExtendDB's own.
 # max_concurrent_bulk_operations = 5         # non-terminal operations per account in each PerformanceTier
 # bulk_operation_retention_days = 30         # floored at 1; a purge pass runs at startup and daily
 # bulk_operation_worker_concurrency = 4      # operations running at once per process; floored at 1
