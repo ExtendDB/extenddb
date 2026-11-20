@@ -388,6 +388,19 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
+### v1.1.0: TagResource, UntagResource and CreateTable check tags as DynamoDB does
+
+**What changed.** TagResource, UntagResource and CreateTable answer `ValidationException` for a tag key or value that DynamoDB refuses (#485). 1.0.0 and earlier releases stored any key and value. The rules:
+
+- A key holds 1 to 128 UTF-16 code units, and a value holds 0 to 256.
+- A key or a value holds only the letters, numbers and separators of Unicode 13.0, and the characters `_ . : / = + - @`.
+- The three operations refuse a key that starts with `aws:`, in any letter case.
+- TagResource and CreateTable also refuse a key with `ſ` (U+017F) in place of the `s` of `aws:`, such as `awſ:foo`. UntagResource accepts it, as DynamoDB does.
+
+**Who is affected.** A client that sends a tag outside these rules now gets `ValidationException`, where 1.0.0 stored the tag. A tag that an earlier release stored outside these rules stays on its table after the upgrade. ListTagsOfResource lists it, and `aws:ResourceTag` conditions in IAM policies match it as before. If only its value is outside the rules, UntagResource with its key removes the tag. If UntagResource refuses its key, only DeleteTable removes the tag.
+
+**Before upgrading**, list the tags of each table with ListTagsOfResource. With UntagResource, remove each tag whose key is outside these rules: 1.0.0 accepts any key in UntagResource. No catalog migration is required.
+
 ### v1.0.0: Cassandra reads and writes at `LOCAL_QUORUM`
 
 **What changed.** The Cassandra backend runs its reads and writes at `LOCAL_QUORUM`. 0.1.15 ran many of them at `ONE`, the driver's default, in each area: items (the reads of GetItem, Query and Scan among them), transactions, TTL, streams, the catalog, IAM and `init`. A read with `ConsistentRead` `false` also runs at `LOCAL_QUORUM`. A lightweight transaction runs Paxos at `LOCAL_SERIAL` and commits at `LOCAL_QUORUM`. 0.1.15 ran many of its lightweight transactions at those levels already, and others, among them the admin user creation and most IAM writes, at the driver's defaults, `SERIAL` and `ONE`. Batches ran at `LOCAL_QUORUM` before and still do. No setting changes these levels (#945).
