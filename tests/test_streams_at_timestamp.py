@@ -152,7 +152,7 @@ def _raw_error(endpoint_url: str | None, body: dict) -> tuple[str, str]:
         "Content-Type": "application/x-amz-json-1.0",
         "X-Amz-Target": "DynamoDBStreams_20120810.GetShardIterator",
     })
-    creds = boto3.Session().get_credentials().get_frozen_credentials()
+    creds = (boto3.DEFAULT_SESSION or boto3.Session()).get_credentials().get_frozen_credentials()
     SigV4Auth(creds, "dynamodb", REGION).add_auth(req)
     prepped = req.prepare()
     ctx = ssl.create_default_context()
