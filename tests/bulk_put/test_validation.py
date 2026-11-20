@@ -280,20 +280,28 @@ class TestValidation:
         # whole file and relabelled the outcome would fail here.
         assert terminal["ProcessedItemCount"] < 20000
 
-    def test_the_account_limit_counts_each_performance_tier(
-        self, dynamodb_client, bulk_bucket
-    ):
+    def test_the_account_limit_counts_each_performance_tier(self, mgmt):
         # Measured on the service (2026-11-19): five STANDARD operations and
         # one ACCELERATED operation run at once, and the sixth STANDARD Start
         # answers LimitExceededException with this text. MaxWriteRequestUnits
         # holds each run to about 20 s on this input, so all six are still
-        # running when the seventh Start arrives.
-        write_rows(bulk_bucket, "in/rows.json", [row("n", str(i)) for i in range(20000)])
+        # running when the seventh Start arrives. The limit counts every
+        # operation of the account, so the test runs in an account of its
+        # own: other bulk files start operations in the default account at
+        # the same time when pytest runs them in parallel.
+        account_id, creds = _provision_account(mgmt, "tiers")
+        client = _boto_client(creds)
+        bucket = f"bulk-tier-{uuid.uuid4().hex[:8]}"
+        create_bucket(bucket, account_id)
         tables = [f"extenddb-bulk-tier-{uuid.uuid4().hex[:8]}" for _ in range(7)]
         arns = []
         try:
+            write_rows(
+                bucket, "in/rows.json", [row("n", str(i)) for i in range(20000)],
+                account=account_id,
+            )
             for name in tables:
-                dynamodb_client.create_table(
+                client.create_table(
                     TableName=name,
                     AttributeDefinitions=[
                         {"AttributeName": "pk", "AttributeType": "S"},
@@ -306,18 +314,20 @@ class TestValidation:
                     BillingMode="PAY_PER_REQUEST",
                 )
             for name in tables:
-                wait_for_active(dynamodb_client, name)
+                wait_for_active(client, name)
             tiers = ["STANDARD"] * 5 + ["ACCELERATED"]
             for name, tier in zip(tables, tiers):
                 body = start_body(
-                    name, bulk_bucket, PerformanceTier=tier, MaxWriteRequestUnits=1024
+                    name, bucket, PerformanceTier=tier, MaxWriteRequestUnits=1024
                 )
-                desc = extenddb_request("StartBulkPutItems", body)["BulkOperationDescription"]
+                desc = extenddb_request("StartBulkPutItems", body, creds)[
+                    "BulkOperationDescription"
+                ]
                 arns.append(desc["BulkOperationArn"])
             expect_error(
                 "StartBulkPutItems",
                 start_body(
-                    tables[6], bulk_bucket, PerformanceTier="STANDARD",
+                    tables[6], bucket, PerformanceTier="STANDARD",
                     MaxWriteRequestUnits=1024,
                 ),
                 "LimitExceededException",
@@ -326,24 +336,29 @@ class TestValidation:
                 "PerformanceTier, which is 5. Wait until other jobs finish, and try "
                 "again. You can also reach out to AWS Support to request a quota "
                 "increase.",
+                creds,
             )
         finally:
             for arn in arns:
                 try:
-                    extenddb_request("CancelBulkOperation", {"BulkOperationArn": arn})
+                    extenddb_request(
+                        "CancelBulkOperation", {"BulkOperationArn": arn}, creds
+                    )
                 except Exception:
                     pass
             for arn in arns:
                 try:
-                    wait_until_terminal(arn, timeout=60)
+                    wait_until_terminal(arn, timeout=60, creds=creds)
                 except Exception:
                     pass
             for name in tables:
                 try:
-                    dynamodb_client.delete_table(TableName=name)
-                    wait_for_deleted(dynamodb_client, name)
+                    client.delete_table(TableName=name)
+                    wait_for_deleted(client, name)
                 except Exception:
                     pass
+            discard_bucket(bucket, account_id)
+            _release_account(mgmt, account_id, "tiers")
 
 
 # ---------------------------------------------------------------------------
