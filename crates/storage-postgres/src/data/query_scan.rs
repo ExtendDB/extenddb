@@ -191,7 +191,7 @@ impl PostgresEngine {
             && let Some((pos, sk_type)) = range_column(sk_cond.path())
                 .or_else(|| sk_info_val.map(|(_, sk_type)| (0, sk_type)))
         {
-            let info = build_sk_sql(sk_cond, &sk_column_n(pos, sk_type), &mut param_idx);
+            let info = build_sk_sql(sk_cond, &sk_column_n(pos, sk_type), maps, &mut param_idx)?;
             sql.push_str(&info.fragment);
             Some(sk_type)
         } else {
