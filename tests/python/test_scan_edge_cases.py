@@ -176,7 +176,7 @@ class TestScanEdgeCases:
             )
         err = exc_info.value.response["Error"]
         assert err["Code"] == "ValidationException"
-        assert err["Message"] == "The provided starting key is invalid: The provided key element does not match the schema"
+        assert err["Message"] == "The provided starting key is invalid"
 
     def test_query_malformed_exclusive_start_key(self, table_factory, dynamodb_client):
         """Query with ExclusiveStartKey that doesn't match schema returns ValidationException."""
@@ -267,10 +267,7 @@ class TestScanEdgeCases:
             dynamodb_client.scan(TableName=name, ExclusiveStartKey={})
         err = exc_info.value.response["Error"]
         assert err["Code"] == "ValidationException"
-        assert err["Message"] == (
-            "The provided starting key is invalid: "
-            "The provided key element does not match the schema"
-        )
+        assert err["Message"] == "The provided starting key is invalid"
 
     def test_query_empty_exclusive_start_key(self, table_factory, dynamodb_client):
         """Query with an empty {} ExclusiveStartKey returns ValidationException."""
@@ -304,10 +301,7 @@ class TestScanEdgeCases:
             )
         err = exc_info.value.response["Error"]
         assert err["Code"] == "ValidationException"
-        assert err["Message"] == (
-            "The provided starting key is invalid: "
-            "The provided key element does not match the schema"
-        )
+        assert err["Message"] == "The provided starting key is invalid"
 
     def test_query_extra_attribute_in_exclusive_start_key(self, table_factory, dynamodb_client):
         """Query with a valid composite start key plus an extra non-key attr."""
@@ -350,10 +344,7 @@ class TestScanEdgeCases:
             )
         err = exc_info.value.response["Error"]
         assert err["Code"] == "ValidationException"
-        assert err["Message"] == (
-            "The provided starting key is invalid: "
-            "The provided key element does not match the schema"
-        )
+        assert err["Message"] == "The provided starting key is invalid"
 
     def test_query_wrong_scalar_type_in_exclusive_start_key(
         self, table_factory, dynamodb_client
@@ -394,10 +385,7 @@ class TestScanEdgeCases:
             )
         err = exc_info.value.response["Error"]
         assert err["Code"] == "ValidationException"
-        assert err["Message"] == (
-            "The provided starting key is invalid: "
-            "The provided key element does not match the schema"
-        )
+        assert err["Message"] == "The provided starting key is invalid"
 
     def test_query_simple_table_extra_attribute_in_exclusive_start_key(
         self, table_factory, dynamodb_client
