@@ -22,10 +22,9 @@ The syntax error wording tests are in test_expression_syntax_wording.py.
 
 Every expected text was measured against Amazon DynamoDB on 2026-10-25,
 2026-11-19 or 2026-11-20 (us-east-1); the probe case id is noted on each
-assertion. The
-write paths carry a ``1 validation error detected: `` prefix on the service
-that ExtendDB does not emit; those assertions compare the text after the
-prefix.
+assertion. The write paths carry a ``1 validation error detected: `` prefix
+on the service that ExtendDB does not emit; those assertions compare the
+text after the prefix.
 
 Dual-target against Amazon DynamoDB and extenddb.
 """
