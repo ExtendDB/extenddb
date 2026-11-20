@@ -94,38 +94,15 @@ pub fn parse_condition_expr(expr: &str, limits: &LimitsConfig) -> Result<Expr, D
         .map_err(|e| prefix_expression_error(e, ExpressionKind::Condition))
 }
 
-/// Refuse a condition or filter whose operator count exceeds
-/// `limits.max_expression_operators`, the service's cap of 300 by default
-/// (`Invalid <kind>: The expression contains too many operators; operator
-/// count: <n>`).
+/// Check a parsed condition or filter in the service's order, after the parse
+/// and before the unused placeholder check and the table lookup:
+/// [`validate_placeholders_and_operands`], then [`validate_operator_count`]
+/// against `limits.max_expression_operators`.
 ///
-/// Measured 2026-10-25 (us-east-1): the check runs after the syntax, reserved
-/// word, undefined placeholder and operand type checks and before the unused
-/// placeholder check and the table lookup. `TransactWriteItems` counts the
-/// same way, but it does not call this check (measured 2026-11-19: a Put of
-/// 151, 200 or 300 `#v = :v` terms joined by OR answers 301, 399 or 599, a
-/// ConditionCheck of 151 terms answers 301, and a Put of 150 terms is
-/// evaluated).
-///
-/// # Errors
-///
-/// Returns `DynamoDbError::ValidationException` when the count is over the cap.
-pub fn check_operator_count(
-    expr: &Expr,
-    kind: ExpressionKind,
-    limits: &LimitsConfig,
-) -> Result<(), DynamoDbError> {
-    validate_operator_count(expr, kind, limits.max_expression_operators)
-}
-
-/// Check a parsed condition or filter in the service's order: its placeholders
-/// and operand types (see [`validate_placeholders_and_operands`]), then its
-/// operator count. Measured 2026-11-19 (us-east-1) on Scan, Query, PutItem,
-/// UpdateItem and DeleteItem: with 151 `#v = :v` terms joined by OR, an added
-/// `OR #v = :zz` with `:zz` undefined answers the undefined value, `OR #x =
-/// :v` the undefined name, `OR #v < :b` with `:b` a BOOL and `OR
-/// begins_with(#v, :n)` with `:n` an N the operand type, and an unused `:u`
-/// the count.
+/// `TransactWriteItems` counts the same way on the service, but it does not
+/// call this check (measured 2026-11-19: a Put of 151, 200 or 300 `#v = :v`
+/// terms joined by OR answers 301, 399 or 599, a ConditionCheck of 151 terms
+/// answers 301, and a Put of 150 terms is evaluated).
 ///
 /// # Errors
 ///
@@ -138,7 +115,7 @@ pub fn check_parsed_condition(
     limits: &LimitsConfig,
 ) -> Result<(), DynamoDbError> {
     validate_placeholders_and_operands(expr, maps).map_err(|e| prefix_expression_error(e, kind))?;
-    check_operator_count(expr, kind, limits)
+    validate_operator_count(expr, kind, limits.max_expression_operators)
 }
 
 /// Tokenize, reserved-word check, and parse an `UpdateExpression`.
@@ -317,7 +294,11 @@ pub fn parse_key_condition_expr(
         // condition parser reports the error in its own words.
         match parse_condition_from(&tokens, expr, limits.max_expression_depth) {
             Ok(condition) => {
-                check_operator_count(&condition, ExpressionKind::KeyCondition, limits)?;
+                validate_operator_count(
+                    &condition,
+                    ExpressionKind::KeyCondition,
+                    limits.max_expression_operators,
+                )?;
             }
             Err(err) if is_syntax_error(&err) => return Err(err),
             Err(_) => {}
