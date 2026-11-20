@@ -4975,16 +4975,14 @@ async fn a_malformed_index_override_is_refused_before_any_storage_read() {
 /// An index override's `IndexName` is checked at the entry's member path
 /// after the `BackupArn` account and the `TargetTableName`, and before the
 /// backup is read. The answers are DynamoDB's for a backup that does not
-/// exist (measured in us-east-1 on 18 and 20 Nov 2026), except the text for
-/// the target name, which is CreateTable's.
+/// exist (measured in us-east-1 on 18 and 20 Nov 2026).
 #[tokio::test]
 async fn an_index_override_name_is_checked_before_the_backup_is_read() {
     let short = "Member must have length greater than or equal to 3";
     let long = "Member must have length less than or equal to 255";
     let pattern = "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+";
-    let target_ab = validation_message(
-        extenddb_core::validation::validate_table_name("ab", &LimitsConfig::default()).unwrap_err(),
-    );
+    let target_ab =
+        "TableName must be at least 3 characters long and at most 255 characters long".to_owned();
     let (emoji, x256): (&str, &str) = ("\u{1F600}\u{1F600}", &"x".repeat(256));
     for (field, mut entry) in [
         ("GlobalSecondaryIndexOverride", gsi_entry(None)),

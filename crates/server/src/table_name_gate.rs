@@ -49,6 +49,11 @@
 //!   on), and key order otherwise. A key that is an ARN takes the ARN
 //!   constraint list (`arn_gate::MAP_KEYS_ARN`).
 //! - ARN-shaped values: see `arn_gate`.
+//! - A RestoreTableFromBackup `TargetTableName` outside the pattern gets the
+//!   answer of `extenddb_engine::check_restore_table_name`: `TableName must
+//!   be at least 3 characters long and at most 255 characters long` when its
+//!   length in UTF-16 code units is outside 3 to 255, and the clauses at
+//!   `targetTableName` otherwise (measured 2026-11-20).
 //!
 //! The service reads `SourceTableName`, `TargetTableName` (both restores),
 //! `TableCreationParameters.TableName` (`ImportTable`),
@@ -102,7 +107,14 @@ pub(crate) fn check_table_name_chars(
         }
         "RestoreTableFromBackup" => {
             with_str(input, "BackupArn", arn_gate::check_backup_arn)?;
-            check_name_member(input.get("TargetTableName"), "targetTableName")
+            // A target name refused here gets the restore's own answer, its
+            // length text before the member constraints, with the model's
+            // bounds (measured on DynamoDB on 20 Nov 2026).
+            let target = input.get("TargetTableName");
+            check_name_member(target, "targetTableName").or_else(|_| {
+                let name = target.and_then(Value::as_str).unwrap_or_default();
+                extenddb_engine::check_restore_table_name(name, "targetTableName", (3, 255))
+            })
         }
         // The server refuses every RestoreTableToPointInTime before this
         // code runs.
@@ -447,6 +459,11 @@ mod tests {
         assert!(message("Scan", json!({ "TableName": "ok", "IndexName": "gsi1" })).is_none());
         assert_eq!(
             message("ListStreams", json!({ "TableName": NUL })).unwrap(),
+            "TableName must be at least 3 characters long and at most 255 characters long"
+        );
+        // A restore's target name gets the restore's length text first.
+        assert_eq!(
+            message("RestoreTableFromBackup", json!({ "TargetTableName": "a*" })).unwrap(),
             "TableName must be at least 3 characters long and at most 255 characters long"
         );
     }

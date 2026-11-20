@@ -1746,11 +1746,16 @@ where
     // first (measured on DynamoDB with two invalid inputs).
     let backup_arn = backup_arn_field(body, account_id, region)?;
 
-    // 3. The names' syntax, before the backup is read: the target name, then
-    // each index override's name. DynamoDB answers a bad override name only
-    // after the ARN's account and the target name (measured on 20 Nov 2026).
-    let target_table_name = required_str(body, "TargetTableName", "targetTableName")?;
-    extenddb_core::validation::validate_table_name(target_table_name, limits)?;
+    // 3. The names' syntax, before the backup is read: the target name with
+    // the restore's checks, not CreateTable's, then each index override's
+    // name. DynamoDB answers a bad override name only after the ARN's
+    // account and the target name (measured on 20 Nov 2026).
+    let target_table_name = pitr::table_name_member(body, "TargetTableName")?;
+    pitr::check_restore_table_name(
+        target_table_name,
+        "targetTableName",
+        table_name_bounds(limits),
+    )?;
     index_overrides.check_index_names()?;
 
     // 4. The catalog index first: a row of the healthy configured store is
@@ -2142,6 +2147,7 @@ pub mod sync;
 #[cfg(test)]
 mod tests;
 
+pub use pitr::check_restore_table_name;
 pub use pitr::refuse_before_authorization as refuse_point_in_time_recovery;
 pub(crate) use pitr::{
     handle_describe_continuous_backups, handle_restore_table_to_point_in_time,

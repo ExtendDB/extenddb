@@ -7,7 +7,7 @@ use super::{
     pitr_restore_unavailable_error, pitr_unsupported_error, point_in_time_recovery_enabled,
     refuse_before_authorization, restore_source_table_name, table_name_member,
 };
-use super::{check_source_table_name, check_table_name};
+use super::{check_restore_table_name, check_table_name};
 use extenddb_core::error::DynamoDbError;
 use serde_json::json;
 
@@ -282,13 +282,15 @@ fn the_table_name_takes_the_models_constraints_before_the_lookup() {
 /// service's "TableName must be at least ..." text (M335 probe 58, an empty
 /// name), and a name that fails the pattern is the model's constraint text at
 /// `sourceTableName` (probe 46, a table ARN as the name). Both come after
-/// the member checks and before the lookup.
+/// the member checks and before the lookup. `TargetTableName` takes the same
+/// checks at its own path. The length counts UTF-16 code units, and the
+/// member constraints count characters (measured on DynamoDB on 20 Nov 2026).
 #[test]
 fn the_restore_source_name_is_checked_for_length_then_pattern() {
     let length = "TableName must be at least 3 characters long and at most 255 characters long";
     for name in [String::new(), "ab".to_owned(), "x".repeat(256)] {
         assert_eq!(
-            validation_message(check_source_table_name(&name, BOUNDS)),
+            validation_message(check_restore_table_name(&name, "sourceTableName", BOUNDS)),
             length,
             "{name:?}"
         );
@@ -301,8 +303,29 @@ fn the_restore_source_name_is_checked_for_length_then_pattern() {
             "{name:?}"
         );
     }
+    let e = "\u{1F600}";
+    let target = |name: &str| check_restore_table_name(name, "targetTableName", BOUNDS);
+    for name in ["a*".into(), e.into(), "\u{e9}\u{e9}".into(), e.repeat(128)] {
+        assert_eq!(validation_message(target(&name)), length, "{name:?}");
+    }
+    let at = |name: &str, c: &str| {
+        format!("Value '{name}' at 'targetTableName' failed to satisfy constraint: {c}")
+    };
+    let one = |name: &str, c: &str| format!("1 validation error detected: {}", at(name, c));
+    let short = "Member must have length greater than or equal to 3";
+    let pattern = "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+";
+    let (two, wide) = (e.repeat(2), e.repeat(64));
+    let both = format!(
+        "2 validation errors detected: {}; {}",
+        at(&two, short),
+        at(&two, pattern)
+    );
+    for (name, answer) in [(two.as_str(), both), (wide.as_str(), one(&wide, pattern))] {
+        assert_eq!(validation_message(target(name)), answer, "{name:?}");
+    }
+    assert!(target(&"x".repeat(255)).is_ok());
     assert_eq!(
-        validation_message(check_source_table_name("ab", (5, 10))),
+        validation_message(check_restore_table_name("ab", "sourceTableName", (5, 10))),
         "TableName must be at least 5 characters long and at most 10 characters long"
     );
     let arn = format!("{P}Music");
