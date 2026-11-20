@@ -1985,9 +1985,12 @@ impl LegacyBackupReader for MongoEngine {
     /// The AVAILABLE backup document (its source as `restore_source` reads
     /// it), then a cursor over its `_backup_<backup_id>` collection in
     /// batches of [`paging::DEFAULT_FETCH_BATCH`] documents. The collection
-    /// is a copy of the table's documents in their stored form, field names
-    /// escaped included, so each is decoded as the data path decodes a
-    /// stored document ([`document_to_item`]). The collection is immutable
+    /// is a copy of the table's documents in their stored form, with the
+    /// field names as the release that took it stored them, so each is
+    /// decoded as the data path decodes a stored document
+    /// ([`document_to_item`]). A backup taken before the escape holds raw
+    /// names, which read back as the data path reads that release's
+    /// documents (see `item_data_to_json`). The collection is immutable
     /// while the backup is AVAILABLE, so no snapshot is held; a
     /// DeleteBackup's drop ends the cursor with an error.
     fn items(

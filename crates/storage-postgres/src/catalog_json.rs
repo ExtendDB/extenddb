@@ -38,8 +38,8 @@
 //! name, so migration 11 rewrites every stored document through the escape
 //! once (`migrations/m0011_attribute_name_escape.rs`).
 //!
-//! The item documents (`item_data`, the stream record images, the images in
-//! `gsi_pending`) are stored through the same escape: `data::item_to_json`
+//! The item documents (`item_data`, `backup_items`, the stream record
+//! images, the images in `gsi_pending`) are stored through the same escape: `data::item_to_json`
 //! and `data::json_to_item` call these functions, and the records in
 //! `stream_pending` and `stream_records` are written and read through them.
 //! Migration 11 leaves those documents as they are; migration 13

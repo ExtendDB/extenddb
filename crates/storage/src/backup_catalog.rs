@@ -1752,11 +1752,15 @@ pub trait JobClaim: Send + Sync {
 /// deleted ones through [`Self::list_deleted`]), and ends with
 /// [`Self::replace_with_index_row`].
 ///
-/// Two parts are not frozen. A restore registers through the restore job
+/// Three parts are not frozen. A restore registers through the restore job
 /// fields (`kind = legacy`, the claim), so the reconciler finds a restore
-/// whose owner died as it finds any other. And
+/// whose owner died as it finds any other.
 /// [`Self::replace_with_index_row`] writes a catalog index row in the step
-/// that removes the in-catalog backup.
+/// that removes the in-catalog backup. And [`Self::items`] and the
+/// in-catalog restore decode each item through the backend's data path
+/// decode (`json_to_item` on PostgreSQL, `document_to_item` on MongoDB), so
+/// a stored name reads back through the escape of the release that reads
+/// it.
 pub trait LegacyBackupReader: Send + Sync {
     /// Create an in-catalog backup of a table, snapshotting all items. The
     /// permit is the job's slot, released when the create ends.
