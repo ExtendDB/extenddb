@@ -224,7 +224,7 @@ fn constraint_violations(body: &Value) -> Result<(), DynamoDbError> {
         return Ok(());
     }
     Err(DynamoDbError::ValidationException(
-        crate::validation_errors_detected(&clauses),
+        extenddb_core::error::validation_errors_detected(&clauses),
     ))
 }
 
@@ -283,7 +283,7 @@ const SHARD_ID_MAX_LEN: usize = 65;
 /// `exclusiveStartShardId`, `sequenceNumber`, `limit` and
 /// `exclusiveStartStreamArn`).
 fn constraint(member: &str, rule: &str) -> String {
-    crate::validation_errors_detected(&[clause(member, rule)])
+    extenddb_core::error::validation_errors_detected(&[clause(member, rule)])
 }
 
 /// One constraint clause of [`constraint`], as the service joins several of

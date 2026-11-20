@@ -15,17 +15,24 @@ pub fn validation_error(value: &str, field: &str, constraint: &str) -> String {
 /// Format multiple validation constraint errors in `DynamoDB`'s exact format.
 #[must_use]
 pub fn validation_errors(errors: &[(&str, &str, &str)]) -> String {
-    let count = errors.len();
     let details: Vec<String> = errors
         .iter()
         .map(|(value, field, constraint)| {
             format!("Value '{value}' at '{field}' failed to satisfy constraint: {constraint}")
         })
         .collect();
+    validation_errors_detected(&details)
+}
+
+/// The service's envelope for one or more constraint clauses: `N validation
+/// error(s) detected: ` and the clauses joined by `; `.
+#[must_use]
+pub fn validation_errors_detected(clauses: &[String]) -> String {
+    let count = clauses.len();
     format!(
         "{count} validation error{} detected: {}",
         if count == 1 { "" } else { "s" },
-        details.join("; ")
+        clauses.join("; ")
     )
 }
 

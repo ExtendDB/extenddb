@@ -299,19 +299,8 @@ pub(crate) fn validate_enum_fields(
         return Ok(());
     }
     Err(DynamoDbError::ValidationException(
-        validation_errors_detected(&errors),
+        extenddb_core::error::validation_errors_detected(&errors),
     ))
-}
-
-/// The service's envelope for one or more constraint clauses: `N validation
-/// error(s) detected: ` and the clauses joined by `; `.
-pub(crate) fn validation_errors_detected(clauses: &[String]) -> String {
-    let count = clauses.len();
-    format!(
-        "{count} validation error{} detected: {}",
-        if count == 1 { "" } else { "s" },
-        clauses.join("; ")
-    )
 }
 
 /// Validate the `ReturnValues` field for `PutItem` / `DeleteItem`, which accept
