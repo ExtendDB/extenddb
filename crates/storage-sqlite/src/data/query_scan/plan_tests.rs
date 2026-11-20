@@ -464,7 +464,12 @@ async fn lsi_query_pages_follow_the_index_order_in_both_directions() {
     for forward in [true, false] {
         let mut got = Vec::new();
         let mut start: Option<Item> = None;
-        loop {
+        // A cursor that repeats a page would walk for ever.
+        for page in 1.. {
+            assert!(
+                page <= want.len(),
+                "forward={forward}: no end after {page} pages"
+            );
             let (items, last) = engine
                 .query_impl(
                     &lsi,

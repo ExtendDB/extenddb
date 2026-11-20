@@ -269,13 +269,8 @@ impl PostgresEngine {
             {
                 // Index that has its own SK, with a base-table tie-breaker. The
                 // index SK is bound separately (see execute_query_sql); the binds
-                // here supply the full base primary key of the start key.
-                //
-                // On a GSI, rows sharing an index SK can come from different base
-                // partitions and can also share a base SK. On an LSI the start
-                // key's partition key is the queried one, which every row of the
-                // partition carries as its base_pk: request validation refuses a
-                // start key from another partition before storage reads anything.
+                // here supply the full base primary key of the start key
+                // (`PaginationBinds::BasePkAndSk`).
                 let base_sk = start_key
                     .get(base_sk_name.as_str())
                     .map(|v| parse_sk(v, base_sk_type))
