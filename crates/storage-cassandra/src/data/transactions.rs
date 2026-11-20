@@ -1544,8 +1544,9 @@ impl CassandraEngine {
     /// [`IDEMPOTENCY_TOKEN_TTL_SECONDS`], so the token stays used for
     /// 10 minutes from the last cancellation (measured 2026-11-05).
     ///
-    /// Both writes are LWTs, as every write of the row is, so neither
-    /// replaces a row that another send or request holds.
+    /// Both writes are LWTs, as every write of the row is: the UPDATE applies
+    /// only to a row that holds the request's running fingerprint, and the
+    /// INSERT only where the token has no row.
     async fn record_cancelled_token(&self, idempotency: Option<(&str, &str, &str)>) {
         let Some((account_id, token, fingerprint)) = idempotency else {
             return;
@@ -1583,12 +1584,12 @@ impl CassandraEngine {
             Ok(false) => tracing::warn!(
                 "record_cancelled_token: the token row no longer holds the running fingerprint"
             ),
-            // The token row stays as it was: the send's running row, which
-            // answers a different request with the mismatch and the same
-            // request with TransactionInProgress (#837) until it expires 10
-            // minutes after the reservation or the take, or no row. The
-            // request keeps its own answer.
-            Err(e) => tracing::warn!("record_cancelled_token failed (token row unchanged): {e}"),
+            // If the write did not apply, the token row stays as it was. A
+            // running row of the request answers a different request with the
+            // mismatch and the same request with TransactionInProgress (#837)
+            // until it expires 10 minutes after the reservation or the take.
+            // The request keeps its own answer.
+            Err(e) => tracing::warn!("record_cancelled_token failed: {e}"),
         }
     }
 
