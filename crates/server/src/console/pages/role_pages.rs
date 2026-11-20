@@ -29,7 +29,7 @@ pub async fn new_role_form(
         Err(r) => return r,
     };
     if !is_admin(&session.identity) {
-        return Redirect::to(&format!("/console/accounts/{account_id}")).into_response();
+        return Redirect::to("/console").into_response();
     }
 
     let nav = html::nav_bar(&identity_label(&session.identity));
@@ -93,7 +93,7 @@ pub async fn create_role(
         Err(r) => return r,
     };
     if !is_admin(&session.identity) {
-        return Redirect::to(&format!("/console/accounts/{account_id}")).into_response();
+        return Redirect::to("/console").into_response();
     }
     if let Err(r) = require_csrf(&form.csrf, &session) {
         return r;
@@ -193,6 +193,11 @@ pub async fn role_detail(
         Ok(s) => s,
         Err(r) => return r,
     };
+    // The page shows the role's trust policy, policies and tags, which the
+    // management API gives admins only.
+    if !is_admin(&session.identity) {
+        return Redirect::to("/console").into_response();
+    }
 
     let nav = html::nav_bar(&identity_label(&session.identity));
     let eid = html::escape(&account_id);
@@ -302,7 +307,7 @@ pub async fn delete_role(
         Err(r) => return r,
     };
     if !is_admin(&session.identity) {
-        return Redirect::to(&format!("/console/accounts/{account_id}")).into_response();
+        return Redirect::to("/console").into_response();
     }
     if let Err(r) = require_csrf(&form.csrf, &session) {
         return r;

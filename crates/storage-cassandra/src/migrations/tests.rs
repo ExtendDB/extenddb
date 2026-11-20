@@ -24,7 +24,7 @@ fn no_migration_is_additive_before_the_old_binary_job() {
 
 /// Every `ALTER TABLE ... ADD` of migration 1's catalog body is read as a
 /// column that may be missing from a table an `init` left, and each one is
-/// a column of the v1.0 schema.
+/// a column of migration 1's schema.
 #[test]
 fn the_columns_migration_1_adds_with_alter_are_read_from_its_body() {
     let added = super::baseline_added_columns();
@@ -46,7 +46,7 @@ fn the_columns_migration_1_adds_with_alter_are_read_from_its_body() {
     for (table, column) in &added {
         assert!(
             expected.columns.contains_key(&format!("{table}.{column}")),
-            "{table}.{column} is not in the v1.0 schema"
+            "{table}.{column} is not in migration 1's schema"
         );
     }
 }
@@ -69,6 +69,7 @@ fn every_migration_records_a_row_in_the_catalog_and_names_its_stores() {
     for id in [
         MigrationId::SortKeyDefinitions,
         MigrationId::IndexTableBaseKey,
+        MigrationId::RestoreProgress,
     ] {
         assert!(matches!(migration(id), Migration::NotApplicable(_)), "{id}");
     }
@@ -103,7 +104,7 @@ fn the_baselines_write_no_setting_except_deleting_the_marker() {
 
 #[test]
 fn the_baselines_record_every_legacy_file() {
-    // A release before 1.0 runs no legacy file once every version it knows is
+    // A release before 0.1.15 runs no legacy file once every version it knows is
     // recorded in its ledger.
     for version in 1..=5 {
         assert!(

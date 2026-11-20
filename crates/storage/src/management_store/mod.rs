@@ -25,11 +25,13 @@
 mod types;
 
 pub use types::{
-    AccessKeyCreated, AccountDetail, AdminEntry, GroupDetail, MetricsRow, OpError, OpResult,
-    RoleDetail, SessionPolicyEntry, UserDetail,
+    AccessKeyCreated, AccountDetail, AdminEntry, GroupDetail, MetricsFilter, MetricsRow, OpError,
+    OpResult, RoleDetail, SecretPage, SecretWrite, SessionPolicyEntry, StoredSecretRow, UserDetail,
 };
 
 use futures::future::BoxFuture;
+
+use crate::secret_keys::SecretTable;
 
 // Type aliases for complex return types in management traits.
 /// User info: `(account_id, user_name, user_arn, has_password, created_at)`.
@@ -58,13 +60,49 @@ pub trait SettingsStore: Send + Sync {
     /// Set a setting value (upsert).
     fn set_setting(&self, key: &str, value: &str) -> BoxFuture<'_, OpResult<()>>;
 
+    /// Set the row `key` to `value` only while it holds `expected`: `true`
+    /// when it held `expected` and now holds `value`, `false` when it held
+    /// anything else or no row. The encryption-key commands write the key
+    /// ring with it, because `rewrap` runs outside the migration lock.
+    ///
+    /// The default refuses: only the backends' catalog stores hold a ring.
+    fn replace_setting(
+        &self,
+        key: &str,
+        expected: &str,
+        value: &str,
+    ) -> BoxFuture<'_, OpResult<bool>> {
+        let _ = (key, expected, value);
+        Box::pin(async {
+            Err(OpError::Internal(
+                "replace_setting is not supported by this store".to_owned(),
+            ))
+        })
+    }
+
     /// List all settings as `(key, value)` pairs, ordered by key.
     fn list_settings(&self) -> BoxFuture<'_, OpResult<Vec<(String, String)>>>;
 
-    /// P119: Get the cached encryption key if available. Returns `None` by
-    /// default; backends that cache the key at startup override this.
-    fn cached_encryption_key(&self) -> Option<String> {
-        None
+    /// `encryption-key set-data-connection` (RFC-0000 section 8.7): in one
+    /// transaction, read the key ring `FOR SHARE`, open its DEK with `kek`
+    /// ([`crate::key_commands::data_connection_key`]), parse
+    /// `connection_string` as a PostgreSQL connection string, encrypt it with
+    /// section 12's AAD and write the `data_database_connection_string` row.
+    /// Refuses a catalog without a ring, a ring with `switch_from_catalog_key`
+    /// true, and a ring with two DEKs.
+    ///
+    /// The default refuses: only PostgreSQL stores this row.
+    fn set_data_connection(
+        &self,
+        kek: &[u8; 32],
+        connection_string: &str,
+    ) -> BoxFuture<'_, OpResult<()>> {
+        let _ = (kek, connection_string);
+        Box::pin(async {
+            Err(OpError::Validation(
+                "set-data-connection is for PostgreSQL catalogs".to_owned(),
+            ))
+        })
     }
 }
 
@@ -76,12 +114,15 @@ pub trait MetricsStore: Send + Sync {
     fn insert_metrics(&self, rows: &[MetricsRow]) -> BoxFuture<'_, OpResult<()>>;
 
     /// Query metrics rows within a time range, with optional filters.
+    ///
+    /// A filter that is `None` matches every row; `filter.account_id` set
+    /// returns only the rows recorded for that account, never a row of the
+    /// whole deployment (which has no account).
     fn query_metrics(
         &self,
         start: time::OffsetDateTime,
         end: time::OffsetDateTime,
-        table_name: Option<&str>,
-        metric: Option<&str>,
+        filter: &MetricsFilter,
     ) -> BoxFuture<'_, OpResult<Vec<MetricsRow>>>;
 
     /// Delete metrics rows older than the retention period.
@@ -138,11 +179,37 @@ pub trait AdminStore: Send + Sync {
 
     /// Verify an admin password. Returns `None` if the admin does not exist,
     /// `Some(true)` if the password matches, `Some(false)` if it does not.
+    /// An unknown name returns `None` without a bcrypt check. Every login
+    /// path then runs the IAM user step, which runs one bcrypt check for any
+    /// name, so a login runs one check whether or not an admin has the name.
     fn verify_admin_password(
         &self,
         admin_name: &str,
         password: &str,
     ) -> BoxFuture<'_, OpResult<Option<bool>>>;
+}
+
+// ── Password hashes ────────────────────────────────────────────────────
+
+/// Reads the stored password hash of a console principal.
+///
+/// The console reads the hash once at login, verifies the password against
+/// it, and binds the session to that hash. Every later console request reads
+/// the hash again and ends the session when the principal is gone or its hash
+/// differs. Implementations must return the latest acknowledged value: the
+/// read must see any password change or deletion that has already returned
+/// to its caller, on any server sharing the catalog.
+pub trait PasswordHashStore: Send + Sync {
+    /// The stored password hash of an admin, or `None` if the admin does not exist.
+    fn get_admin_password_hash(&self, admin_name: &str) -> BoxFuture<'_, OpResult<Option<String>>>;
+
+    /// The stored console password hash of an IAM user, or `None` if the user
+    /// does not exist or has no console password.
+    fn get_user_password_hash(
+        &self,
+        account_id: &str,
+        user_name: &str,
+    ) -> BoxFuture<'_, OpResult<Option<String>>>;
 }
 
 // ── Management store (IAM) ─────────────────────────────────────────────
@@ -206,7 +273,11 @@ pub trait ManagementStore: Send + Sync {
         user_name: &str,
     ) -> BoxFuture<'_, OpResult<Option<UserDetail>>>;
 
-    /// Verify an IAM user's console password.
+    /// Verify an IAM user's console password. Returns `false` for a wrong
+    /// password, an unknown user and a user without a console password.
+    /// Implementations check through
+    /// [`crate::password::verify_stored_password`] in all three cases, so
+    /// that they run the same bcrypt work.
     fn verify_iam_user_password(
         &self,
         account_id: &str,
@@ -546,4 +617,48 @@ pub trait ManagementStore: Send + Sync {
         account_id: &str,
         resource: &str,
     ) -> BoxFuture<'_, OpResult<Vec<(String, String)>>>;
+
+    // ── Encryption-key commands (RFC-0000 section 8.4) ─────────────
+
+    /// Read one page of the rows of `table` (`access_keys` or
+    /// `iam_sessions`), expired sessions included, in the backend's primary
+    /// key order. `page` is `None` for the first page, else the
+    /// [`SecretPage::next`] of the previous page. `page_size` is the most
+    /// rows a page holds. Cassandra reads at `ALL` and selects
+    /// `WRITETIME(secret_key_encrypted)`.
+    fn read_secret_page(
+        &self,
+        table: SecretTable,
+        page: Option<&str>,
+        page_size: usize,
+    ) -> BoxFuture<'_, OpResult<SecretPage>>;
+
+    /// Write each ciphertext of `rows` into the row of `table` with that
+    /// primary key, as one batch: one transaction of single-row updates on
+    /// SQLite, one `UPDATE ... FROM (VALUES ...)` on PostgreSQL, one
+    /// `update_one` per row with no upsert on MongoDB, and one `UPDATE` per
+    /// row at `ALL` with `USING TIMESTAMP` above the row's write time on
+    /// Cassandra. A row that is gone stays gone, and is not an error.
+    fn write_secrets(
+        &self,
+        table: SecretTable,
+        rows: &[SecretWrite],
+    ) -> BoxFuture<'_, OpResult<()>>;
+
+    /// Delete the rows of `table` with the primary keys `keys`, as one batch
+    /// (`encryption-key reset`, section 8.6). A row that is gone is not an
+    /// error.
+    fn delete_secrets(&self, table: SecretTable, keys: &[String]) -> BoxFuture<'_, OpResult<()>>;
+
+    /// Delete the settings row `key`. A row that is absent is not an error.
+    /// SQLite runs it under `PRAGMA secure_delete = ON`; Cassandra at `ALL`.
+    fn delete_setting(&self, key: &str) -> BoxFuture<'_, OpResult<()>>;
+
+    /// Rewrite the catalog's files so that their free space holds no old
+    /// copy of a row that a command replaced or deleted. `switch`, `rotate`
+    /// and `reset` call it after their last write. SQLite runs `VACUUM`
+    /// under `PRAGMA secure_delete = ON`; the default does nothing.
+    fn erase_free_space(&self) -> BoxFuture<'_, OpResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
 }

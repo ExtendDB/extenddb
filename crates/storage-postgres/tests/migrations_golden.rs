@@ -13,30 +13,8 @@ use std::time::Duration;
 
 use extenddb_storage::migrations::{CatalogStatus, MigrationError, MigrationId, Runner};
 use extenddb_storage_postgres::migrations::{PostgresMigrations, migrate};
-use migrations_support::{ACCOUNT, LATEST, Scratch, base_conn, id_names, skip};
+use migrations_support::{ACCOUNT, LATEST, Scratch, base_conn, golden, id_names, notes, skip};
 use sqlx::PgPool;
-
-fn golden(name: &str, actual: &str) {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/golden")
-        .join(name);
-    if migrations_support::bless() {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, actual).unwrap();
-        return;
-    }
-    let expected =
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    assert_eq!(actual, expected, "{name} differs from its golden file");
-}
-
-async fn notes(catalog: &PgPool, id: i32) -> String {
-    sqlx::query_scalar("SELECT notes FROM extenddb_migrations WHERE id = $1")
-        .bind(id)
-        .fetch_one(catalog)
-        .await
-        .unwrap()
-}
 
 const TAGGED: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"dynamodb:*","Resource":"*","Condition":{"StringEquals":{"dynamodb:ResourceTag/env":"prod"}}}]}"#;
 /// Both forms on one key with different values, which migration 2 refuses.
@@ -207,7 +185,7 @@ async fn every_policy_document(catalog: &PgPool) -> Vec<String> {
     .unwrap()
 }
 
-/// Record what a release before 1.0 leaves when it writes to a migrated
+/// Record what a release before 0.1.15 leaves when it writes to a migrated
 /// catalog, then reconverge: migration 2 is named as skipped, and the
 /// catalog is current again.
 async fn reconverge_after_an_older_release_wrote(s: &Scratch, catalog: &PgPool) {
@@ -233,7 +211,7 @@ async fn reconverge_after_an_older_release_wrote(s: &Scratch, catalog: &PgPool) 
     assert_eq!(s.status().await, CatalogStatus::Current { version: LATEST });
 }
 
-/// From 1.0 on a `dynamodb:ResourceTag` key written through the API has no
+/// From 0.1.15 on a `dynamodb:ResourceTag` key written through the API has no
 /// effect, as on the service. Migration 2 is not convergent, so a reconverge
 /// leaves a policy written after it, in each place a policy is stored, with
 /// the text it was written with, and so with the decision it had.
