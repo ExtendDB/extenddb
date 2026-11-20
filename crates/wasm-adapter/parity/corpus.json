@@ -1437,6 +1437,35 @@
       ]
     },
     {
+      "name": "UpdateContinuousBackups without a specification is a null member",
+      "op": "UpdateContinuousBackups",
+      "body": {
+        "TableName": "Products"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "contains": "Value null at 'pointInTimeRecoverySpecification' failed to satisfy constraint: Member must not be null"
+        }
+      ]
+    },
+    {
+      "name": "UpdateContinuousBackups without the enabled flag is a null member",
+      "op": "UpdateContinuousBackups",
+      "body": {
+        "TableName": "Products",
+        "PointInTimeRecoverySpecification": {}
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "contains": "Value null at 'pointInTimeRecoverySpecification.pointInTimeRecoveryEnabled' failed to satisfy constraint: Member must not be null"
+        }
+      ]
+    },
+    {
       "name": "ImportTable is disabled",
       "op": "ImportTable",
       "body": {
