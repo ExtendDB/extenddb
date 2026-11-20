@@ -45,7 +45,7 @@ use crate::{OperationContext, serialize_output};
 /// The service's text for a request without the table name member it routes
 /// on: `TableName` on the two continuous-backups operations, and
 /// `SourceTableName` (or `SourceTableArn`) or `TargetTableName` on the
-/// restore.
+/// restores.
 const TABLE_NAME_REQUIRED: &str =
     "The parameter 'TableName' is required but was not present in the request";
 
@@ -73,7 +73,10 @@ const NAME_PATTERN_CONSTRAINT: &str =
     "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+";
 
 /// The member's string value, or the service's missing-table-name refusal.
-fn table_name_member<'a>(body: &'a Value, member: &str) -> Result<&'a str, DynamoDbError> {
+pub(super) fn table_name_member<'a>(
+    body: &'a Value,
+    member: &str,
+) -> Result<&'a str, DynamoDbError> {
     body.get(member)
         .and_then(Value::as_str)
         .ok_or_else(|| DynamoDbError::ValidationException(TABLE_NAME_REQUIRED.to_owned()))
@@ -106,21 +109,26 @@ fn check_table_name(name: &str, (min, max): (usize, usize)) -> Result<(), Dynamo
     super::validate_name_member(name, "tableName", (min, max))
 }
 
-/// `SourceTableName` on the restore, checked before the source table is
-/// looked up. A length outside the bounds is the service's "TableName must
-/// be at least <min> characters long and at most <max> characters long"
-/// (measured with an empty name, where the bounds are the model's 3 and
-/// 255; here they are the deployment's), and a name that fails the pattern
-/// is the model's constraint text at `sourceTableName` (measured with a
-/// table ARN as the name).
-fn check_source_table_name(name: &str, (min, max): (usize, usize)) -> Result<(), DynamoDbError> {
-    let length = name.chars().count();
+/// A restore's `SourceTableName` or `TargetTableName`, at the member path
+/// `path`, checked before any table is looked up. A length outside the
+/// bounds is the service's "TableName must be at least <min> characters
+/// long and at most <max> characters long" (the model's 3 and 255 on the
+/// service, the deployment's bounds here). That length counts UTF-16 code
+/// units. A name within the bounds is then checked against the model's
+/// constraints at `path`, which count characters (measured on DynamoDB in
+/// us-east-1 on 20 Nov 2026 for both members).
+pub fn check_restore_table_name(
+    name: &str,
+    path: &str,
+    (min, max): (usize, usize),
+) -> Result<(), DynamoDbError> {
+    let length = name.encode_utf16().count();
     if length < min || length > max {
         return Err(DynamoDbError::ValidationException(format!(
             "TableName must be at least {min} characters long and at most {max} characters long"
         )));
     }
-    super::validate_name_member(name, "sourceTableName", (min, max))
+    super::validate_name_member(name, path, (min, max))
 }
 
 /// The service's refusal for a missing member, by its model path.
@@ -237,7 +245,7 @@ fn point_in_time_recovery_enabled(body: &Value) -> Result<bool, DynamoDbError> {
 }
 
 /// The restore's source table name, from `SourceTableName`, checked against
-/// `bounds` ([`check_source_table_name`]), or from `SourceTableArn`, which
+/// `bounds` ([`check_restore_table_name`]), or from `SourceTableArn`, which
 /// must name a table: an index, stream or backup ARN is refused with the
 /// service's text. Exactly one of the two members may be given.
 fn restore_source_table_name(
@@ -248,7 +256,7 @@ fn restore_source_table_name(
     let arn = body.get("SourceTableArn").and_then(Value::as_str);
     match (name, arn) {
         (Some(name), None) => {
-            check_source_table_name(name, bounds)?;
+            check_restore_table_name(name, "sourceTableName", bounds)?;
             Ok(name.to_owned())
         }
         (None, Some(arn)) => crate::import_export::extract_table_name_from_arn(arn),

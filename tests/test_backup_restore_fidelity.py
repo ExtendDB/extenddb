@@ -2239,7 +2239,9 @@ def test_backup_and_table_names_are_validated(dynamodb_client):
     the order of the two clauses when both fail was not captured, so it is
     asserted exactly on ExtendDB and as membership on the service). The
     restore names a backup that does not exist: the service checks the
-    IndexName before it reads the backup. Sent
+    IndexName before it reads the backup. Its TargetTableName gets the
+    restore's own length text, counted in UTF-16 code units, before the
+    member constraints (measured on 20 Nov 2026). Sent
     signed by hand: botocore refuses a too-short name
     before sending (its validator checks the minimum, not the pattern or
     the maximum). Before the check, a 200 KB name was a 500 on Cassandra and a
@@ -2253,6 +2255,7 @@ def test_backup_and_table_names_are_validated(dynamodb_client):
     short = "Member must have length greater than or equal to 3"
     long_ = "Member must have length less than or equal to 255"
     pattern = "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+    length = "TableName must be at least 3 characters long and at most 255 characters long"
     try:
         _simple_source(client, source)
         cases = [
@@ -2302,12 +2305,33 @@ def test_backup_and_table_names_are_validated(dynamodb_client):
                               {"TargetTableName": f"{source}-r", "BackupArn": missing,
                                field: [entry]},
                               expected))
+            # A bad TargetTableName is answered before the override's name.
+            cases.append(("RestoreTableFromBackup",
+                          {"TargetTableName": "ab", "BackupArn": missing,
+                           field: [dict(entry, IndexName="g i")]},
+                          length))
+        e = "\U0001F600"
+        for name, expected in (
+            ("ab", length), ("", length), ("a*", length), ("x" * 256, length),
+            (e, length), ("\u00e9\u00e9", length), (e * 128, length),
+            (emoji, "2 validation errors detected: "
+             + constraint.format(v=emoji, path="targetTableName", c=short) + "; "
+             + constraint.format(v=emoji, path="targetTableName", c=pattern)),
+            ("a b", "1 validation error detected: "
+             + constraint.format(v="a b", path="targetTableName", c=pattern)),
+            (e * 64, "1 validation error detected: "
+             + constraint.format(v=e * 64, path="targetTableName", c=pattern)),
+        ):
+            cases.append(("RestoreTableFromBackup",
+                          {"TargetTableName": name, "BackupArn": missing}, expected))
+        cases.append(("RestoreTableFromBackup", {"BackupArn": missing},
+                      "The parameter 'TableName' is required but was not present in the request"))
         for operation, body, expected in cases:
             resp = _signed(operation, body)
             assert resp.status_code == 400, (operation, body, resp.text)
             code, message = _error(resp)
             assert code == "ValidationException", (operation, body, resp.text)
-            if _is_real_dynamodb():
+            if _is_real_dynamodb() and " detected: " in expected:
                 # The clauses, their count, and the member path; the order of
                 # the two clauses on the service was not captured.
                 head, _, clauses = expected.partition(": ")
