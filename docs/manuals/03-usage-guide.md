@@ -1051,9 +1051,19 @@ are dropped and the drop is logged. The counters are unaffected.
 After the reports, every operation that read input writes a manifest to
 `{S3KeyPrefix}/AWSDynamoDB/BulkOperation/{account}:{operation id}/manifest-files.json`,
 with the reports' encryption: one line per input object, carrying its
-`inputSourceArn`, its `fileProcessingStatus` (`FULLY_PROCESSED`,
-`PARTIALLY_PROCESSED`, `NOT_PROCESSED`, or `NOT_AVAILABLE`), its
-`processedRanges`, and its `etag`. On the S3 store the `etag` is S3's ETag,
+`inputSourceArn`, its `fileProcessingStatus`, its `processedRanges`, and its
+`etag`. `processedRanges` is `[[0, N]]` when the operation counted rows 0 to
+`N` of the object, and `[]` when it counted none. The status says how far
+the operation read the object:
+
+| `fileProcessingStatus` | Meaning |
+|---|---|
+| `FULLY_PROCESSED` | The operation read the object to its end. A cancel that lands after that read leaves the status as it is. |
+| `PARTIALLY_PROCESSED` | The operation stopped inside the object: a cancel or a failure ended the operation while it read the object, or a parse-level error or an overwrite stopped the read. A cancel after the first rows were counted gives the range of those rows. |
+| `NOT_PROCESSED` | The operation did not read the object: it ended before it opened the object, as after a cancel that lands before the first row, or the open refused the object before any of its rows was counted. |
+| `NOT_AVAILABLE` | The object was gone or unreadable after the operation opened it or counted rows of it. |
+
+On the S3 store the `etag` is S3's ETag,
 without quotes: of the version read for an object read to its end, and the
 one the listing gave otherwise. On the filesystem store it is the MD5 of the
 enumerated bytes. A file that is refused or deleted before its open cannot

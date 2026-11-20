@@ -75,12 +75,9 @@ pub(super) async fn render_manifest(
                 count.checked_sub(1),
             )
         } else if index == st.cursor_file && (st.cursor_row > 0 || st.current_file_opened) {
-            // The file the run was inside when it ended. ExtendDB
-            // checkpoints at row boundaries and knows the range, so it is
-            // reported with the range it processed. The hosted service
-            // loses the range of a reader that was inside a read when a
-            // cancel landed and reports `NOT_AVAILABLE` with none;
-            // the range is kept here, a stated divergence.
+            // The file the run was inside when it ended, with the range it
+            // processed: a cancel after the first rows gives the range of
+            // those rows, as on the service (measured).
             (
                 report::FileProcessingStatus::PartiallyProcessed,
                 st.cursor_row.checked_sub(1),
