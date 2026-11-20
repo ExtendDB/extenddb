@@ -11,17 +11,17 @@
 //!
 //! # Layout
 //! - [`runtime`] — the portable engine wrapper: builds an `OperationContext`
-//!   over the in-memory SQLite backend and calls [`extenddb_engine::dispatch`].
+//!   over the in-memory `SQLite` backend and calls [`extenddb_engine::dispatch`].
 //!   Target-agnostic; the native unit tests exercise it against the native
-//!   `ExtendDB` SQLite build.
+//!   `ExtendDB` `SQLite` build.
 //! - `wasm` — the `wasm-bindgen` entry points (`wasm32` only).
 //!
 //! # Scope and limits
 //! The data-plane operations (`CreateTable`, `PutItem`, `GetItem`, Query, Scan,
 //! `UpdateItem`, `DeleteItem`, and the batch, transaction, stream, TTL and tagging
-//! operations) answer end-to-end against an in-memory SQLite database (the
+//! operations) answer end-to-end against an in-memory `SQLite` database (the
 //! synchronous `sqlx`-shaped shim over `sqlite-wasm-rs` on wasm, and `sqlx`
-//! with C SQLite natively). The build authenticates no request and authorizes
+//! with C `SQLite` natively). The build authenticates no request and authorizes
 //! none; every request runs under a single fixed account.
 //!
 //! The operations a browser cannot serve are answered by [`runtime`] itself,
