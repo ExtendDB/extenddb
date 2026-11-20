@@ -1,0 +1,59 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "extenddb-wasm-adapter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "WebAssembly binding layer that runs the ExtendDB engine over an in-memory SQLite database in the browser, replacing the network edge with a direct in-process call. Internal crate with no API stability promise."
+repository.workspace = true
+homepage.workspace = true
+# Not a published crate: it is the browser build's binding layer, not part of
+# the released library set. Keeping it out of the registry keeps the published
+# set at the count the release policy fixes.
+publish = false
+
+[lib]
+# `cdylib` is the wasm module `wasm-bindgen` emits for the browser;
+# `rlib` keeps the crate usable as a normal Rust library so native tests and
+# `cargo build -p extenddb-wasm-adapter` (the wasm build-check) work.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+extenddb-auth = { workspace = true }
+extenddb-core = { workspace = true }
+# The browser build answers the PartiQL and backup/PITR/import/export
+# operations in this crate, before dispatch, so the engine is built without its
+# PartiQL surface: that surface needs an item authorizer the browser build does
+# not install, and its snapshot path reads the backup runtime, which the wasm
+# engine build does not carry.
+extenddb-engine = { workspace = true, default-features = false }
+extenddb-storage = { workspace = true }
+# The in-browser backend: the SQLite storage engine opened on a `:memory:`
+# database. The `memory` cargo feature is deliberately not enabled — it only
+# changes `SqliteConfig::default().path`, and would unify across the whole
+# workspace; this crate opens `:memory:` explicitly through `new_in_memory`.
+extenddb-storage-sqlite = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
+
+# The JS <-> wasm boundary. Only the browser build needs it, so it is
+# target-scoped to wasm32; native builds (and the native unit tests) compile
+# the portable `runtime` module without any wasm-bindgen surface. `js-sys`
+# supplies the `Promise` the async `submit` resolves; `wasm-bindgen-futures`
+# drives the engine's async dispatch on the browser microtask queue;
+# `console_error_panic_hook` routes a wasm panic to `console.error` instead of
+# an opaque trap.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+
+# A current-thread runtime drives the adapter's async `submit` in the native
+# unit tests (the browser build uses `wasm-bindgen-futures` instead). Scoped to
+# non-wasm so `cargo clippy --target wasm32-unknown-unknown --all-targets` does
+# not pull tokio's net stack, which has no wasm32 target.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
