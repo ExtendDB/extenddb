@@ -323,23 +323,25 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Hub API v2 wants a session token, then a PATCH on the repository.
+          # Hub API v2 wants a short-lived access token (POST /v2/auth/token,
+          # valid for 10 minutes; /v2/users/login is deprecated), then a PATCH
+          # on the repository.
           TOKEN=$(jq -n --arg u "$DOCKERHUB_USERNAME" --arg p "$DOCKERHUB_TOKEN" \
-              '{username:$u, password:$p}' \
+              '{identifier:$u, secret:$p}' \
             | curl -sS --fail-with-body -X POST \
                 -H 'Content-Type: application/json' \
                 --data @- \
-                https://hub.docker.com/v2/users/login/ \
-            | jq -r '.token')
+                https://hub.docker.com/v2/auth/token \
+            | jq -r '.access_token')
           if [[ -z "$TOKEN" || "$TOKEN" == "null" ]]; then
-            echo "::error::could not obtain a Docker Hub session token"
+            echo "::error::could not obtain a Docker Hub access token"
             exit 1
           fi
 
           jq -n --rawfile full "$FILE" --arg short "$SHORT" \
               '{full_description:$full, description:$short}' \
             | curl -sS --fail-with-body -X PATCH \
-                -H "Authorization: JWT ${TOKEN}" \
+                -H "Authorization: Bearer ${TOKEN}" \
                 -H 'Content-Type: application/json' \
                 --data @- \
                 "https://hub.docker.com/v2/repositories/${HUB_NAMESPACE}/${IMAGE}/" \
