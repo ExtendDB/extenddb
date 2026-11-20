@@ -19,6 +19,7 @@
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_storage::error::StorageError;
 
+use crate::cassandra_util::query_rows;
 use crate::engine::CassandraEngine;
 
 /// The smallest sequence number whose millisecond prefix is `at_ms`.
@@ -72,16 +73,14 @@ impl CassandraEngine {
             }
             None => cdrs_tokio::query_values!(range.physical.as_str(), lower, at_ms),
         };
-        let result = self
-            .session
-            .query_with_values(&query, values)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-        let rows = result
-            .response_body()
-            .map_err(|e| StorageError::Internal(e.to_string()))?
-            .into_rows()
-            .unwrap_or_default();
+        // The same read as `last_sequence_in`: `Stmt::Read`, LOCAL_QUORUM.
+        let rows = query_rows::<StorageError>(
+            &self.session,
+            &query,
+            values,
+            "first_sequence_number_at_or_after",
+        )
+        .await?;
         Ok(rows
             .into_iter()
             .next()
