@@ -278,5 +278,17 @@ mod tests {
             !builds().contains_key(&table),
             "the last mark removes the entry"
         );
+
+        // A Start that holds a mark keeps the entry, so a later Start's
+        // marks still see the build that begins between them.
+        let hold = BuildMark::now(&table);
+        drop(BuildGuard::begin(&table));
+        let before = BuildMark::now(&table);
+        drop(BuildGuard::begin(&table));
+        assert!(
+            BuildMark::now(&table).began_since(&before),
+            "a build while another mark holds the entry"
+        );
+        drop((hold, before));
     }
 }
