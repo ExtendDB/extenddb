@@ -174,6 +174,9 @@ class TestClientToken:
         ("\u00e9" * 512 + "a", True),
         ("\U0001F600" + "a" * 1023, True),
         ("\U0001F600" + "a" * 1024, False),
+    ], ids=[
+        "1024-ascii", "1025-ascii", "513-chars-1025-bytes", "emoji-1024-chars",
+        "emoji-1025-chars",
     ])
     def test_the_token_length_is_counted_in_characters(
         self, bulk_table, bulk_bucket, token, accepted
