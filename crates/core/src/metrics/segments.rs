@@ -152,11 +152,6 @@ impl Ring {
         }
     }
 
-    /// Whether the newest bucket is at or after `first_slot`.
-    fn holds_from(&self, first_slot: u64) -> bool {
-        self.buckets.back().is_some_and(|b| b.slot >= first_slot)
-    }
-
     /// First slot included in a query made `elapsed_secs` after the epoch for
     /// a window of `window_secs`, or for the whole ring when `None`.
     fn first_slot(&self, elapsed_secs: u64, window_secs: Option<u64>) -> u64 {
@@ -319,7 +314,8 @@ impl SegmentStore {
         self.by_account.retain(|_, operations| {
             operations.retain(|_, rings| {
                 let ring = &rings.coarse;
-                ring.holds_from(ring.first_slot(elapsed, None))
+                let first = ring.first_slot(elapsed, None);
+                ring.buckets.back().is_some_and(|b| b.slot >= first)
             });
             !operations.is_empty()
         });
