@@ -313,6 +313,67 @@ async fn the_migration_runner_creates_the_target_of_a_dangling_symlink_owner_onl
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Over a database an earlier version left at 0644 with no sidecars, the
+/// migration runner's open never shows a `-wal` or `-shm` file wider than
+/// 0600: the database is narrowed before SQLite opens it, so the sidecars
+/// SQLite creates take 0600 from the start. A thread reads their modes for as
+/// long as the open runs. A narrowing after the connect would repair the end
+/// state, so only these reads can see the sidecars' first mode.
+#[tokio::test]
+async fn the_migration_runner_creates_its_sidecars_at_0600_over_a_0644_database() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let dir = deployment_dir();
+    let path = database_path(&dir);
+    init(&path).await;
+    for name in ["x.sqlite-wal", "x.sqlite-shm"] {
+        let _ = std::fs::remove_file(dir.join(name));
+    }
+    std::fs::set_permissions(dir.join("x.sqlite"), std::fs::Permissions::from_mode(0o644))
+        .expect("chmod");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let seen = Arc::new(Mutex::new(BTreeMap::<String, u32>::new()));
+    let watcher = {
+        let (stop, seen, dir) = (Arc::clone(&stop), Arc::clone(&seen), dir.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                for name in ["x.sqlite-wal", "x.sqlite-shm"] {
+                    if let Ok(meta) = std::fs::metadata(dir.join(name)) {
+                        let mode = meta.permissions().mode() & 0o777;
+                        let mut seen = seen.lock().expect("lock");
+                        let widest = seen.entry(name.to_owned()).or_insert(mode);
+                        *widest |= mode;
+                    }
+                }
+            }
+        })
+    };
+    let runner = SqliteMigrations::open(&path).await.expect("open");
+    // The sidecars stay while the runner's connection is open, so the watcher
+    // can read each of them at least once before it stops, however late it
+    // was scheduled.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while seen.lock().expect("lock").len() < 2 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    stop.store(true, Ordering::Relaxed);
+    watcher.join().expect("watcher");
+
+    let seen = seen.lock().expect("lock").clone();
+    assert_eq!(
+        seen.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["x.sqlite-shm", "x.sqlite-wal"],
+        "the watcher saw no sidecar"
+    );
+    for (name, mode) in &seen {
+        assert_eq!(*mode, 0o600, "{name} was {mode:o} during the open");
+    }
+    drop(runner);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // Each opener alone, on a database path that does not exist yet, read before
 // any other pool opens the file: a later opener's narrowing cannot hide one
 // that skipped its own.
