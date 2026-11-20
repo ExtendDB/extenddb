@@ -294,11 +294,11 @@ async fn serve_and_migrate_restrict_files_left_at_0644() {
 
 /// The migration runner's connection creates a missing database whatever the
 /// location asks. On a `sqlite:` URL without `mode=rwc` whose path is a
-/// dangling symlink, nothing creates the target before the connect, so SQLite
-/// creates it at 0644 with its sidecars, and the narrowing after the connect
-/// sets them to 0600.
+/// dangling symlink, the runner creates the link's target at 0600 before the
+/// connect, so SQLite never creates the database, and the sidecars take 0600
+/// from it. Nothing narrows the files after the connect.
 #[tokio::test]
-async fn the_migration_runner_narrows_a_database_sqlite_creates_through_a_dangling_symlink() {
+async fn the_migration_runner_creates_the_target_of_a_dangling_symlink_owner_only() {
     let dir = deployment_dir();
     let link = dir.join("x.sqlite");
     std::os::unix::fs::symlink(dir.join("target.sqlite"), &link).expect("symlink");

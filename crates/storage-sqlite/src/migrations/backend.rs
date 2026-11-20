@@ -198,7 +198,9 @@ impl SqliteMigrations {
                     MigrationError::store(format!("create the directory of {location}"), e)
                 })?;
             }
-            super::open::create_private(path)?;
+            // A dangling symlink names the file it will become, so the target
+            // is created here and the connection never creates the database.
+            super::open::create_private(&crate::serve_lock::resolve_dangling_symlinks(path))?;
             // Files an earlier version left wider than 0600 are narrowed
             // before SQLite opens them, so the sidecars this connection
             // creates take 0600 from the database file.
@@ -277,10 +279,6 @@ impl SqliteMigrations {
                 )));
             }
         };
-        if write && let Err(e) = crate::file_mode::restrict(location) {
-            pool.close().await;
-            return Err(MigrationError::Store(e));
-        }
         let migrations = Self::with_pool(pool, location, file, true);
         // Every run that writes holds the database's lock, so a partial copy
         // beside the database now is a stopped run's, whether or not this

@@ -184,13 +184,10 @@ impl SqliteEngine {
             opts = opts.idle_timeout(None).max_lifetime(None);
         }
         let connect = connect_options(&url)?;
-        // Owner-only modes for the file and its sidecars (`file_mode`). The pool
-        // connects with `connect_options` for its row buffer, so it calls
-        // `prepare` itself instead of `file_mode::connect`. This connect creates
-        // a missing database only when its URL carries `mode=rwc` (`sqlite_url`
-        // adds it to a plain path), and `prepare` then creates it at 0600, so
-        // the sidecars SQLite creates take 0600 too and nothing needs
-        // narrowing after the connect.
+        // The pool connects with `connect_options` for its row buffer, so it
+        // calls `file_mode::prepare` itself. Its connect creates a missing
+        // database only when the URL carries `mode=rwc`, which `sqlite_url`
+        // adds to a plain path, and `prepare` creates that file at 0600 first.
         crate::file_mode::prepare(path_or_url).map_err(StorageError::Connection)?;
         let pool = opts
             .after_connect(|conn, _| {

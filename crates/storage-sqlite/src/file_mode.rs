@@ -18,11 +18,11 @@
 //! The engine pool (`store.rs`) connects with its own connection options and
 //! calls `prepare` before that connect; its connect creates a missing file
 //! only when `prepare` creates it. The migration runner opens its own
-//! connection, and calls both around it when it opens the database for
-//! writing: that connection creates a missing database whatever the location
-//! asks, so on a `sqlite:` URL without `mode=rwc` through a dangling symlink,
-//! SQLite creates the file and `restrict` narrows it. Its read-only connection
-//! for the catalog status changes no mode.
+//! connection, which creates a missing database whatever the location asks.
+//! When it opens the database for writing, it first creates the file with
+//! mode 0600, through a dangling symlink too, and calls `prepare`, so that
+//! connection never creates the database. Its read-only connection for the
+//! catalog status changes no mode.
 //!
 //! Only a regular file with a permission bit outside 0600 is changed, and it is
 //! set to 0600. Anything else at one of those names is left alone: a symlink
@@ -117,7 +117,7 @@ pub(crate) fn prepare(_location: &str) -> Result<(), String> {
 ///
 /// A file's mode cannot be set.
 #[cfg(unix)]
-pub(crate) fn restrict(location: &str) -> Result<(), String> {
+fn restrict(location: &str) -> Result<(), String> {
     restrict_with(location, &SYSTEM)
 }
 
@@ -130,7 +130,7 @@ fn restrict_with(location: &str, calls: &ModeCalls<'_>) -> Result<(), String> {
 }
 
 #[cfg(not(unix))]
-pub(crate) fn restrict(_location: &str) -> Result<(), String> {
+fn restrict(_location: &str) -> Result<(), String> {
     Ok(())
 }
 
