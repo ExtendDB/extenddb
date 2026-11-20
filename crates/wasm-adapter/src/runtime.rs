@@ -190,7 +190,7 @@ impl Engine {
         // through to the real handler, which is the oracle the wasm answer is
         // checked against.
         #[cfg(target_arch = "wasm32")]
-        if let Some(answer) = no_store_answer(operation) {
+        if let Some(answer) = no_store_answer(operation, &body) {
             return answer;
         }
 
@@ -278,19 +278,29 @@ fn creates_vector_index(body: &Value) -> bool {
 /// compiled; natively the engine computes the identical answer, which is the
 /// oracle these values are checked against. The messages are the native
 /// no-store messages, reproduced so the two builds match.
+///
+/// `UpdateContinuousBackups` is the one body-sensitive case: natively, enabling
+/// point-in-time recovery is refused with `ContinuousBackupsUnavailableException`
+/// (no backend implements it), while disabling it succeeds and returns the
+/// description `DescribeContinuousBackups` reports. This reproduces both. It does
+/// not check that the table exists first (the describe handler is not compiled
+/// here), so a request naming a missing table is answered as enable/disable
+/// rather than with `TableNotFoundException`; that limitation is documented in
+/// the README.
 #[cfg(target_arch = "wasm32")]
-fn no_store_answer(operation: &str) -> Option<Result<Value, DynamoDbError>> {
+fn no_store_answer(operation: &str, body: &Value) -> Option<Result<Value, DynamoDbError>> {
     let answer = match operation {
         "ListBackups" => Ok(serde_json::json!({ "BackupSummaries": [] })),
-        "DescribeContinuousBackups" => Ok(serde_json::json!({
-            "ContinuousBackupsDescription": {
-                "ContinuousBackupsStatus": "ENABLED",
-                "PointInTimeRecoveryDescription": { "PointInTimeRecoveryStatus": "DISABLED" }
+        "DescribeContinuousBackups" => Ok(continuous_backups_disabled_document()),
+        "UpdateContinuousBackups" => {
+            if disables_point_in_time_recovery(body) {
+                Ok(continuous_backups_disabled_document())
+            } else {
+                Err(DynamoDbError::ContinuousBackupsUnavailableException(
+                    "Point-in-time recovery is not supported by this storage backend".to_owned(),
+                ))
             }
-        })),
-        "UpdateContinuousBackups" => Err(DynamoDbError::ContinuousBackupsUnavailableException(
-            "Point-in-time recovery is not supported by this storage backend".to_owned(),
-        )),
+        }
         "ImportTable" => Err(DynamoDbError::ValidationException(
             "Import is disabled. Configure [import] paths in extenddb.toml to enable.".to_owned(),
         )),
@@ -300,6 +310,37 @@ fn no_store_answer(operation: &str) -> Option<Result<Value, DynamoDbError>> {
         _ => return None,
     };
     Some(answer)
+}
+
+/// The `ContinuousBackupsDescription` document for a backend with point-in-time
+/// recovery off — continuous backups enabled, point-in-time recovery disabled.
+/// Both `DescribeContinuousBackups` and a disabling `UpdateContinuousBackups`
+/// return it, matching the native description.
+#[cfg(target_arch = "wasm32")]
+fn continuous_backups_disabled_document() -> Value {
+    serde_json::json!({
+        "ContinuousBackupsDescription": {
+            "ContinuousBackupsStatus": "ENABLED",
+            "PointInTimeRecoveryDescription": { "PointInTimeRecoveryStatus": "DISABLED" }
+        }
+    })
+}
+
+/// Whether an `UpdateContinuousBackups` body disables point-in-time recovery,
+/// i.e. `PointInTimeRecoverySpecification.PointInTimeRecoveryEnabled` is the
+/// boolean `false` or the string `"false"` (the two forms the service accepts).
+/// Anything else — enabling it, or a missing or malformed flag — is not a
+/// disable and is refused as unavailable.
+#[cfg(target_arch = "wasm32")]
+fn disables_point_in_time_recovery(body: &Value) -> bool {
+    match body
+        .get("PointInTimeRecoverySpecification")
+        .and_then(|spec| spec.get("PointInTimeRecoveryEnabled"))
+    {
+        Some(Value::Bool(enabled)) => !enabled,
+        Some(Value::String(s)) => s == "false",
+        _ => false,
+    }
 }
 
 // These tests drive the portable runtime on a current-thread tokio runtime,

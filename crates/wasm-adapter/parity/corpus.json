@@ -1416,6 +1416,27 @@
       "checks": []
     },
     {
+      "name": "Disabling point-in-time recovery succeeds",
+      "op": "UpdateContinuousBackups",
+      "body": {
+        "TableName": "Products",
+        "PointInTimeRecoverySpecification": {
+          "PointInTimeRecoveryEnabled": false
+        }
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/ContinuousBackupsDescription/ContinuousBackupsStatus",
+          "equals": "ENABLED"
+        },
+        {
+          "path": "/ContinuousBackupsDescription/PointInTimeRecoveryDescription/PointInTimeRecoveryStatus",
+          "equals": "DISABLED"
+        }
+      ]
+    },
+    {
       "name": "ImportTable is disabled",
       "op": "ImportTable",
       "body": {
