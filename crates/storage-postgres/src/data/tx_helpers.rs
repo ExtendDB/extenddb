@@ -473,35 +473,20 @@ pub(super) async fn write_stream_record_to_shard_in_tx(
     Ok(())
 }
 
-/// Check an idempotency token within an existing transaction.
+/// Check an idempotency token within an existing transaction. The token is
+/// scoped to `account_id`. Returns `Ok(())` for a new token (inserted, or a
+/// stored row taken for this run), `Err(IdempotentReplay)` for a replay and
+/// `Err(IdempotentMismatch)` for another request's token.
 ///
-/// The token is scoped to `account_id`: the same token value from different
-/// accounts is stored and matched independently. Returns `Ok(())` for new
-/// tokens (inserted, or a stored row taken for this run),
-/// `Err(IdempotentReplay)` for matching replays, `Err(IdempotentMismatch)`
-/// for fingerprint conflicts.
-///
-/// Two sends of one request with one token can reach this check at the same
-/// time (#851). The second send's insert waits on the first send's token row
-/// and, once the first send commits, locks the committed row. The select of
-/// the same statement reads with the snapshot taken when the statement
-/// started, before that commit, so it returns no row, or the `cancelled:` row
-/// that the committed row replaced. The locked row is neither: the insert's
-/// `WHERE` is false on it, so it is less than 10 minutes old and is not this
-/// request's cancelled row. In those two cases the statement runs once more.
-/// At READ COMMITTED the second statement takes a new snapshot, which sees
-/// the locked row. This transaction holds the lock until it ends, so the row
-/// cannot change between the two statements and the second one does not wait
-/// on it. A committed row of this request then answers as a replay, the
-/// answer the first send got.
-///
-/// The second statement reads the locked row when the transaction runs at
-/// READ COMMITTED and `NOW()` is the same in both statements.
-/// `transact_write_items_impl` opens the transaction with `begin()`, which
-/// takes the default isolation level of the role or the database, so the
-/// check also tests the second result. If it still returns no row, or this
-/// request's `cancelled:` row, the check answers `Err(TransactionInProgress)`
-/// and does not run the request.
+/// Two sends of one request can reach this check at once (#851). The insert
+/// of the second send waits for the first send to commit and then locks the
+/// committed row, but the select of the same statement reads the snapshot
+/// from before that commit: no row, or the `cancelled:` row that the commit
+/// replaced ([`stale_read`]). The statement then runs once more. It does not
+/// wait, because this transaction holds the lock, and at READ COMMITTED it
+/// takes a new snapshot, which holds the locked row. The transaction takes
+/// the isolation level of the role or the database, so a second stale result
+/// answers `Err(TransactionInProgress)` and the request does not run.
 pub(super) async fn check_idempotency_token_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: &str,
