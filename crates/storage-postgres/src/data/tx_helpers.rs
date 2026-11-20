@@ -484,9 +484,9 @@ pub(super) async fn write_stream_record_to_shard_in_tx(
 /// from before that commit: no row, or the `cancelled:` row that the commit
 /// replaced ([`stale_read`]). The statement then runs once more. It does not
 /// wait, because this transaction holds the lock, and at READ COMMITTED it
-/// takes a new snapshot, which holds the locked row. The transaction takes
-/// the isolation level of the role or the database, so a second stale result
-/// answers `Err(TransactionInProgress)` and the request does not run.
+/// takes a new snapshot, which holds the locked row. The level comes from the
+/// role or the database and may not be READ COMMITTED, so a second stale
+/// result answers `Err(TransactionInProgress)` and the request does not run.
 pub(super) async fn check_idempotency_token_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: &str,
