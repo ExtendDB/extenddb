@@ -1,3 +1,6 @@
+// Copyright 2026 ExtendDB contributors
+// SPDX-License-Identifier: Apache-2.0
+
 use super::*;
 use extenddb_core::expression::{parse_key_condition, tokenize};
 use extenddb_core::types::{AttributeValue, CreateTableInput, IndexType};
