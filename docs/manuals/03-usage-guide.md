@@ -1044,11 +1044,8 @@ item is within the item size limit, and on condition-failure records.
 item the condition was evaluated against.
 
 A record goes to its own kind's prefix when that kind was requested in
-`OutputType`, and otherwise to the one kind that was requested. With only
-`ERROR` requested, condition-failure records go to `errors/`; with only
-`CONDITION_CHECK_FAILURE` requested, parse-level and item-level error
-records go to `condition-check-failures/`; with both requested, each kind
-has its own prefix.
+`OutputType`. The runner writes a record of a kind that was not requested
+to no report object, as the service does. The counters still count its row.
 
 The records kept per operation are capped by `max_bulk_report_records`
 (default 1,000,000) and their serialized size by `max_bulk_report_bytes`
