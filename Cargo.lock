@@ -1717,6 +1717,7 @@ dependencies = [
  "aws-lc-rs",
  "aws-sigv4",
  "axum",
+ "base64 0.22.1",
  "extenddb-cache",
  "extenddb-core",
  "futures",

@@ -10,7 +10,10 @@
 //!   Signature=<hex>
 //! ```
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use extenddb_core::error::DynamoDbError;
+use sha2::{Digest, Sha256};
 
 /// Parsed components of a `SigV4` `Authorization` header.
 #[derive(Debug, PartialEq)]
@@ -60,6 +63,14 @@ pub fn parse_authorization(header: &str) -> Result<ParsedAuthorization, DynamoDb
             signed_headers = Some(val);
         } else if let Some(val) = part.strip_prefix("Signature=") {
             signature = Some(val);
+        } else if !part.is_empty() && !part.contains('=') {
+            // Measured 2026-11-20: DynamoDB refuses a part with no '=' wherever
+            // it sits, before it checks for missing parameters.
+            return Err(incomplete(&format!(
+                "Invalid key=value pair (missing equal-sign) in Authorization header \
+                 (hashed with SHA-256 and encoded with Base64): '{}'.",
+                BASE64.encode(Sha256::digest(header))
+            )));
         }
     }
 
@@ -130,6 +141,57 @@ mod tests {
     fn reject_missing_credential() {
         let header = "AWS4-HMAC-SHA256 SignedHeaders=host, Signature=abc";
         assert!(parse_authorization(header).is_err());
+    }
+
+    /// The hashes are DynamoDB's answers of 2026-11-20. In the last rows no
+    /// part lacks '=', and ExtendDB's base texts answer.
+    #[test]
+    fn part_without_equal_sign() {
+        let cred = "Credential=AKIAIOSFODNN7EXAMPLE/20261120/us-east-1/dynamodb/aws4_request";
+        let sh = "SignedHeaders=host;x-amz-target";
+        let sig = format!("Signature={}", "0".repeat(64));
+        let eq = |hash: &str| {
+            Some(format!(
+                "Invalid key=value pair (missing equal-sign) in Authorization header \
+                 (hashed with SHA-256 and encoded with Base64): '{hash}'."
+            ))
+        };
+        let no_credential = Some("Authorization header requires 'Credential' parameter".to_owned());
+        let rows = [
+            (
+                "garbage".to_owned(),
+                eq("zUZdJX3JKFekvINdpUsyc8qq7W43kESi0fduBwuIskY="),
+            ),
+            (
+                format!("garbage, {cred}, {sh}, {sig}"),
+                eq("qFJwfu14Kuj++dnpZ7SfZHb4qGEFK5qxVeYPABxnecw="),
+            ),
+            (
+                format!("{cred}, {sh}, {sig}, garbage"),
+                eq("vl/+vD+ZxerGScLuXRHUmQHfq+CnlTl4S/imWZQJJJY="),
+            ),
+            (
+                format!("{cred}, garbage, {sig}"),
+                eq("bQeyhzn0vhbh2yagmMjizvaUIkNJ6HgmBYLvWWGOzH0="),
+            ),
+            (
+                "garbage, other".to_owned(),
+                eq("ZA+NpPHMMD/WKwhx2PWZpccIYkMjg0H/pGF/oZm2TQ0="),
+            ),
+            (
+                "Credential".to_owned(),
+                eq("KfSoC26UaBDGXxo5AUFS45c1cmAbyLKDOxOTKcZYWt4="),
+            ),
+            ("Foo=bar".to_owned(), no_credential),
+            (format!("{cred}, {sh}, {sig}, "), None),
+        ];
+        for (pairs, want) in rows {
+            let header = format!("AWS4-HMAC-SHA256 {pairs}");
+            let got = parse_authorization(&header)
+                .err()
+                .map(|e| e.message().to_owned());
+            assert_eq!(got, want, "{header}");
+        }
     }
 
     #[test]
