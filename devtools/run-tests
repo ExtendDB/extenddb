@@ -31,7 +31,7 @@
 #
 # Options:
 #   --backend NAME    storage backend the running server uses:
-#                       postgres (default) or mongodb.
+#                       postgres (default), sqlite, mongodb, cassandra, or bigtable.
 #                       Gates postgres-only paths (pg connection-string
 #                       extraction, test_cli_lifecycle.py).
 #   --release         use release build for Rust tests
@@ -109,7 +109,7 @@ Suites (at least one required):
 
 Options:
   --backend NAME    storage backend the running server uses:
-                      postgres (default) or mongodb.
+                      postgres (default), sqlite, mongodb, cassandra, or bigtable.
   --release         release build for Rust tests
   --filter PATTERN  filter for cargo test / pytest -k
   --parallel[=N]    run pytest in parallel (default: 1/3 of CPU cores)
@@ -164,9 +164,9 @@ done
 
 # --- Validate: backend name ---
 case "$BACKEND" in
-    postgres|sqlite|mongodb|cassandra) ;;
+    postgres|sqlite|mongodb|cassandra|bigtable) ;;
     *)
-        echo "error: --backend must be 'postgres', 'sqlite', 'mongodb' or 'cassandra' (got: $BACKEND)"
+        echo "error: --backend must be 'postgres', 'sqlite', 'mongodb', 'cassandra' or 'bigtable' (got: $BACKEND)"
         exit 1
         ;;
 esac
@@ -229,7 +229,7 @@ validate_local_target() {
                 echo "  Set it to the server's [backup.store]: 'filesystem' or 's3' for a configured"
                 echo "  store (a file-backed SQLite server without the section has the defaulted"
                 echo "  filesystem root), 'none' for a server without one (kind = \"disabled\", or"
-                echo "  PostgreSQL, MongoDB and Cassandra without the section)."
+                echo "  PostgreSQL, MongoDB, Cassandra and Bigtable without the section)."
                 echo "  Got: '${EXTENDDB_TEST_BACKUP_STORE:-}'"
                 exit 1
                 ;;
