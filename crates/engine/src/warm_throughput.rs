@@ -226,6 +226,7 @@ mod tests {
                     projection_type: ProjectionType::All,
                     non_key_attributes: None,
                 },
+                backfilling: None,
                 index_status: "ACTIVE".to_owned(),
                 provisioned_throughput: Some(ProvisionedThroughputDescription::default()),
                 index_size_bytes: 0,
