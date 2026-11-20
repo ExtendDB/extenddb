@@ -184,8 +184,10 @@ async fn every_start_on_a_busy_table_answers_busy_whatever_its_input() {
     let h = Harness::new().await;
     let ctx = base_ctx(&h);
     h.write_input("data/part-0.json", b"0123456789");
-    let with_data = with_input(start_body(), "S3KeyPrefix", json!("data/"));
-    let running = start_ok(&ctx, with_data.clone()).await;
+    // Each call carries a fresh ClientToken, so no Start below replays
+    // the running one.
+    let with_data = || with_input(start_body(), "S3KeyPrefix", json!("data/"));
+    let running = start_ok(&ctx, with_data()).await;
     assert_eq!(running["BulkOperationStatus"], json!("IN_PROGRESS"));
     let running_id = description_arn(&running)
         .rsplit('/')
@@ -196,10 +198,10 @@ async fn every_start_on_a_busy_table_answers_busy_whatever_its_input() {
     let missing = with_input(start_body(), "S3Bucket", json!("absent"));
     let no_match = with_input(start_body(), "S3KeyPrefix", json!("nothing-here/"));
     for (label, body) in [
-        ("a valid start", with_data.clone()),
+        ("a valid start", with_data()),
         ("a missing input bucket", missing),
         ("a prefix that matches no object", no_match),
-        ("another valid start", with_data),
+        ("another valid start", with_data()),
     ] {
         match start(&ctx, body).await {
             Err(DynamoDbError::ResourceInUseException(message)) => {

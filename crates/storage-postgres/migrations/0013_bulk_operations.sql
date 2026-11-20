@@ -24,7 +24,9 @@ CREATE TABLE IF NOT EXISTS bulk_operations (
     table_name              TEXT NOT NULL,
     table_arn               TEXT NOT NULL,
     status                  TEXT NOT NULL,
-    client_token            TEXT,
+    -- The ClientToken's UTF-8 bytes. A token may hold U+0000, which the
+    -- service accepts and TEXT cannot store.
+    client_token            BYTEA,
     client_token_hash       TEXT,
     request_fingerprint     TEXT NOT NULL,
     input_config            JSONB NOT NULL,

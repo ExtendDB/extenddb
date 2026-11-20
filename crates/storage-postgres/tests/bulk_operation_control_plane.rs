@@ -160,7 +160,7 @@ where
              client_token, client_token_hash, request_fingerprint, \
              input_config, output_config, input_files, \
              start_time_ms, total_input_bytes, usage, end_time_ms) \
-         VALUES ($1, $2, $3, 'orders', $4, $5, $6, $6, $7, \
+         VALUES ($1, $2, $3, 'orders', $4, $5, convert_to($6, 'UTF8'), $6, $7, \
              '{}'::jsonb, '{}'::jsonb, '[]'::jsonb, 1, 0, '{}'::jsonb, \
              CASE WHEN $5 IN ('IN_PROGRESS', 'CANCELLING') THEN NULL ELSE 2 END)",
     )

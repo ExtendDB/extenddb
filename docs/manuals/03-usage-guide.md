@@ -1147,8 +1147,13 @@ DynamoDB message, missing separators included.
 
 ### Idempotency
 
-`ClientToken` makes a start retryable. The token is any non-empty string
-without `$`, at most `max_bulk_client_token_bytes` bytes. A repeated
+`ClientToken` makes a start retryable, and Start requires it: the SDKs fill
+one in for every call, and a request without one answers
+`ValidationException` with `Invalid Request: 1 validation error detected:
+Value null at 'clientToken' failed to satisfy constraint: Member must not
+be null`. The token is any non-empty string without `$`, at most
+`max_bulk_client_token_chars` characters (default 1,024, the DynamoDB
+limit, counted in Unicode code points). U+0000 is allowed. A repeated
 request with the same token and the same parameters returns the existing
 operation's current
 description with HTTP 200 and creates nothing. The same token with different
@@ -1175,7 +1180,7 @@ no `[bulk]` section the filesystem store is enabled at `./.extenddb/buckets`.
 The
 `[limits]` keys governing bulk operations
 (`max_concurrent_bulk_operations`, `max_bulk_input_bytes`,
-`max_bulk_input_files`, `max_bulk_input_object_bytes`, `max_bulk_client_token_bytes`,
+`max_bulk_input_files`, `max_bulk_input_object_bytes`, `max_bulk_client_token_chars`,
 `max_bulk_line_bytes`, `max_bulk_item_count`, `max_bulk_report_records`,
 `max_bulk_report_bytes`, `bulk_put_batch_size`, `bulk_put_write_batch_rows`,
 `bulk_operation_lease_seconds`, `bulk_operation_worker_concurrency`,

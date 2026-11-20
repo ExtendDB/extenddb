@@ -232,11 +232,13 @@ def read_manifest(bucket: str, prefix: str, operation_arn: str,
 def start_body(table: str, bucket: str, in_prefix: str = "in/",
                out_prefix: str = "reports",
                output_types: list[str] | None = None, **extra) -> dict:
-    """A StartBulkPutItems body reading one bucket and reporting to it."""
+    """A StartBulkPutItems body reading one bucket and reporting to it, with
+    a fresh ClientToken, as an SDK fills one in for every call."""
     if output_types is None:
         output_types = ["ERROR", "CONDITION_CHECK_FAILURE"]
     body = {
         "TableName": table,
+        "ClientToken": str(uuid.uuid4()),
         "InputS3Configuration": {
             "S3Bucket": bucket,
             "S3KeyPrefix": in_prefix,

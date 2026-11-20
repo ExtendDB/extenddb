@@ -118,7 +118,7 @@ column bulk_operations.table_id: text NOT NULL
 column bulk_operations.table_name: text NOT NULL
 column bulk_operations.table_arn: text NOT NULL
 column bulk_operations.status: text NOT NULL
-column bulk_operations.client_token: text
+column bulk_operations.client_token: bytea
 column bulk_operations.client_token_hash: text
 column bulk_operations.request_fingerprint: text NOT NULL
 column bulk_operations.input_config: jsonb NOT NULL

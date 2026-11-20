@@ -143,6 +143,7 @@ async fn the_collector_shows_started_finished_and_items_written_for_one_operatio
     };
     let body = json!({
         "TableName": TABLE,
+        "ClientToken": "retention-start",
         "InputS3Configuration": input_config(""),
         "OutputS3Configuration": both_reports(),
     });

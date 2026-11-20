@@ -100,14 +100,25 @@ pub async fn handle_start_bulk_put_items(
 
     // Second pass: the service's own `Invalid Request:` checks, after every
     // model constraint above. Their order among themselves is kept as it
-    // was, since it is unmeasured.
-    if let Some(token) = &input.client_token {
-        let cap = ctx.limits.max_bulk_client_token_bytes;
-        if token.len() > cap {
-            return Err(DynamoDbError::ValidationException(format!(
-                "ClientToken exceeds max_bulk_client_token_bytes ({cap} bytes)"
-            )));
-        }
+    // was, since it is unmeasured, except that the token checks come before
+    // the output encryption pair: a request with no ClientToken and a bad
+    // pair answers the missing token (measured on the service, six times).
+    // SDKs fill the token in from the model's idempotency trait, so only a
+    // raw request can arrive without one. The length is counted in
+    // characters, as the service counts it.
+    let Some(token) = &input.client_token else {
+        return Err(DynamoDbError::ValidationException(
+            "Invalid Request: 1 validation error detected: Value null at 'clientToken' failed \
+             to satisfy constraint: Member must not be null"
+                .to_owned(),
+        ));
+    };
+    let cap = ctx.limits.max_bulk_client_token_chars;
+    if token.chars().count() > cap {
+        return Err(DynamoDbError::ValidationException(format!(
+            "Invalid Request: 1 validation error detected: Value '{token}' at 'clientToken' \
+             failed to satisfy constraint: Member must have length less than or equal to {cap}"
+        )));
     }
     if input.output_s3_configuration.output_type.is_empty() {
         return Err(DynamoDbError::ValidationException(

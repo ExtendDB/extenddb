@@ -110,6 +110,7 @@ contract_case!(
     a_reused_token_replays_even_when_terminal_and_skips_the_table_guard,
     a_token_replays_inside_the_window_and_starts_anew_past_it,
     tokenless_starts_do_not_collide_on_the_token_index,
+    a_token_holding_nul_is_stored_and_replays,
     sixty_concurrent_starts_against_a_limit_of_fifty_admit_exactly_fifty,
     // A start and an index creation that cross.
     a_start_and_an_index_creation_that_cross_are_never_both_accepted,

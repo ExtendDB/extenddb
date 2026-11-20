@@ -99,11 +99,12 @@ pub struct LimitsConfig {
     /// as `5.0 GB` in its message).
     #[serde(default = "default_max_bulk_input_object_bytes")]
     pub max_bulk_input_object_bytes: u64,
-    /// Maximum `ClientToken` length in bytes on `StartBulkPutItems`. The API
-    /// model puts no length cap on the token; this bounds what one request
-    /// can ask the catalog to store.
-    #[serde(default = "default_max_bulk_client_token_bytes")]
-    pub max_bulk_client_token_bytes: usize,
+    /// Maximum `ClientToken` length on `StartBulkPutItems`, in characters
+    /// (Unicode code points), as the service counts it (measured: 1,024
+    /// characters accepted, 1,025 refused, and 513 characters of 1,025
+    /// UTF-8 bytes accepted). The default is the service's limit.
+    #[serde(default = "default_max_bulk_client_token_chars")]
+    pub max_bulk_client_token_chars: usize,
     /// Days a terminal bulk operation record is kept before the retention
     /// worker purges it, its report records, and its ledger rows.
     #[serde(default = "default_bulk_operation_retention_days")]
@@ -187,7 +188,7 @@ impl Default for LimitsConfig {
             max_bulk_input_bytes: default_max_bulk_input_bytes(),
             max_bulk_input_files: default_max_bulk_input_files(),
             max_bulk_input_object_bytes: default_max_bulk_input_object_bytes(),
-            max_bulk_client_token_bytes: default_max_bulk_client_token_bytes(),
+            max_bulk_client_token_chars: default_max_bulk_client_token_chars(),
             bulk_operation_retention_days: default_bulk_operation_retention_days(),
             bulk_operation_worker_concurrency: default_bulk_operation_worker_concurrency(),
             bulk_operation_worker_per_account: default_bulk_operation_worker_per_account(),
@@ -286,7 +287,7 @@ fn default_max_bulk_input_object_bytes() -> u64 {
     // 5 GiB, the hosted service's per-object cap.
     5_368_709_120
 }
-fn default_max_bulk_client_token_bytes() -> usize {
+fn default_max_bulk_client_token_chars() -> usize {
     1024
 }
 fn default_bulk_operation_retention_days() -> u32 {

@@ -107,3 +107,20 @@ async fn a_mismatched_replay_is_answered_while_every_store_call_fails() {
         other => panic!("expected the mismatch error, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn a_token_holding_nul_replays_its_operation_and_refuses_other_parameters() {
+    // Measured on the service: a token with U+0000 inside replays the
+    // operation it started, and the same token on another table answers
+    // the mismatch.
+    let h = Harness::new().await;
+    Harness::create_table(&h.storage, "other").await;
+    let body = with_top(start_body(), "ClientToken", json!("\u{0}nul\u{0}"));
+    let first = start_ok(&base_ctx(&h), body.clone()).await;
+    let replay = start_ok(&base_ctx(&h), body.clone()).await;
+    assert_eq!(replay, first);
+    match start(&base_ctx(&h), with_top(body, "TableName", json!("other"))).await {
+        Err(DynamoDbError::IdempotentParameterMismatchException(_)) => {}
+        other => panic!("expected the mismatch error, got {other:?}"),
+    }
+}

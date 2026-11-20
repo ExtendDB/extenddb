@@ -157,7 +157,14 @@ fn record_from_row(row: &PgRow) -> Result<BulkOperationRecord, StorageError> {
         table_name: col(row, "table_name")?,
         table_arn: col(row, "table_arn")?,
         status: col(row, "status")?,
-        client_token: col(row, "client_token")?,
+        // The token's UTF-8 bytes (see the migration); the start handler
+        // stored a string, so other bytes are corruption.
+        client_token: col::<Option<Vec<u8>>>(row, "client_token")?
+            .map(String::from_utf8)
+            .transpose()
+            .map_err(|_| {
+                StorageError::Internal("bulk_operations.client_token is not UTF-8".to_owned())
+            })?,
         request_fingerprint: col(row, "request_fingerprint")?,
         input_config: col(row, "input_config")?,
         output_config: col(row, "output_config")?,

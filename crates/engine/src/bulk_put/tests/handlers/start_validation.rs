@@ -152,20 +152,25 @@ async fn an_oversized_configuration_is_rejected_before_a_missing_table() {
 }
 
 #[tokio::test]
-async fn a_token_over_the_byte_cap_is_rejected_before_a_missing_table() {
+async fn a_token_over_the_length_cap_is_rejected_before_a_missing_table() {
     let h = Harness::new().await;
     let ctx = ctx_with_limits(
         &h,
-        bulk_limits(&[("max_bulk_client_token_bytes", json!(64))]),
+        bulk_limits(&[("max_bulk_client_token_chars", json!(64))]),
     );
+    let token = "t".repeat(65);
     let body = with_top(
-        with_top(start_body(), "ClientToken", json!("t".repeat(65))),
+        with_top(start_body(), "ClientToken", json!(token)),
         "TableName",
         json!("absent"),
     );
     let message = expect_validation(start(&ctx, body).await);
     assert_eq!(
-        message, "ClientToken exceeds max_bulk_client_token_bytes (64 bytes)",
+        message,
+        format!(
+            "Invalid Request: 1 validation error detected: Value '{token}' at 'clientToken' \
+             failed to satisfy constraint: Member must have length less than or equal to 64"
+        ),
         "step 2 must answer before step 5"
     );
 }
@@ -246,21 +251,38 @@ async fn an_empty_client_token_is_rejected_with_the_pattern_message() {
 }
 
 #[tokio::test]
-async fn a_client_token_containing_a_nul_byte_is_rejected_with_the_pattern_message() {
-    // The token is stored verbatim in a text column, and PostgreSQL
-    // refuses a raw NUL byte in text, so the handler rejects the byte
-    // with the pattern message.
+async fn a_missing_client_token_is_refused_before_the_encryption_pair() {
+    // Measured on the service: six Starts with no ClientToken, each with
+    // one inconsistent encryption pair, all answered the missing token.
     let h = Harness::new().await;
-    let body = with_top(start_body(), "ClientToken", json!("load\u{0}a"));
-    let message = expect_validation(start(&base_ctx(&h), body).await);
-    assert!(
-        message.contains("Member must satisfy regular expression pattern"),
-        "the token pattern must be reported: {message}"
-    );
-    assert!(
-        message.contains("clientToken"),
-        "the field must be named: {message}"
-    );
+    let missing = "Invalid Request: 1 validation error detected: Value null at 'clientToken' \
+                   failed to satisfy constraint: Member must not be null";
+    let tokenless = || {
+        let mut body = start_body();
+        body.as_object_mut()
+            .expect("an object")
+            .remove("ClientToken");
+        body
+    };
+    for body in [
+        tokenless(),
+        with_output(tokenless(), "S3SseAlgorithm", json!("KMS")),
+        with_top(tokenless(), "ClientToken", Value::Null),
+    ] {
+        let message = expect_validation(start(&base_ctx(&h), body.clone()).await);
+        assert_eq!(message, missing, "{body}");
+    }
+}
+
+#[tokio::test]
+async fn a_client_token_holding_nul_is_accepted() {
+    // Measured on the service: a token with U+0000 inside is accepted, and
+    // Describe returns it unchanged. The replay is pinned in start_replay.
+    let h = Harness::new().await;
+    let token = "nul\u{0}token";
+    let body = with_top(start_body(), "ClientToken", json!(token));
+    let description = start_ok(&base_ctx(&h), body).await;
+    assert_eq!(description["ClientToken"], json!(token));
 }
 
 #[tokio::test]
@@ -316,32 +338,38 @@ async fn an_inconsistent_output_encryption_pair_is_rejected() {
     }
 }
 
+/// The token length is counted in characters (Unicode code points), at most
+/// 1,024 by default (measured on the service, twice each). The service
+/// answers HTTP 500 for a token of 1,972 UTF-8 bytes or more within the
+/// limit; this server accepts it.
 #[tokio::test]
-async fn a_client_token_over_the_byte_cap_is_rejected() {
-    let h = Harness::new().await;
-    let ctx = ctx_with_limits(
-        &h,
-        bulk_limits(&[("max_bulk_client_token_bytes", json!(64))]),
-    );
-    let body = with_top(start_body(), "ClientToken", json!("t".repeat(65)));
-    let message = expect_validation(start(&ctx, body).await);
-    assert_eq!(
-        message,
-        "ClientToken exceeds max_bulk_client_token_bytes (64 bytes)"
-    );
-}
-
-#[tokio::test]
-async fn a_client_token_exactly_at_the_byte_cap_is_accepted() {
-    let h = Harness::new().await;
-    let ctx = ctx_with_limits(
-        &h,
-        bulk_limits(&[("max_bulk_client_token_bytes", json!(64))]),
-    );
-    let token = "t".repeat(64);
-    let body = with_top(start_body(), "ClientToken", json!(token));
-    let description = start_ok(&ctx, body).await;
-    assert_eq!(description["ClientToken"], json!(token));
+async fn the_client_token_length_is_counted_in_characters() {
+    let refused = |token: &str| {
+        format!(
+            "Invalid Request: 1 validation error detected: Value '{token}' at 'clientToken' \
+             failed to satisfy constraint: Member must have length less than or equal to 1024"
+        )
+    };
+    for (token, accepted) in [
+        ("a".repeat(1024), true),
+        ("a".repeat(1025), false),
+        (format!("{}a", "\u{e9}".repeat(512)), true),
+        (format!("\u{1F600}{}", "a".repeat(1023)), true),
+        (format!("\u{1F600}{}", "a".repeat(1024)), false),
+        (format!("{}{}", "\u{e9}".repeat(948), "a".repeat(76)), true),
+    ] {
+        let h = Harness::new().await;
+        let ctx = ctx_with_limits(&h, LimitsConfig::default());
+        let body = with_top(start_body(), "ClientToken", json!(token));
+        let shape = format!("{} chars, {} bytes", token.chars().count(), token.len());
+        if accepted {
+            let description = start_ok(&ctx, body).await;
+            assert_eq!(description["ClientToken"], json!(token), "{shape}");
+        } else {
+            let message = expect_validation(start(&ctx, body).await);
+            assert_eq!(message, refused(&token), "{shape}");
+        }
+    }
 }
 
 #[tokio::test]

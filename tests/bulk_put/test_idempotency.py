@@ -95,14 +95,19 @@ class TestPerTableGuard:
     ):
         rows = [row("k", str(i), f={"S": "x" * 40}) for i in range(self.LONG_RUN_ROWS)]
         write_rows(bulk_bucket, "in/rows.json", rows)
-        body = start_body(bulk_table, bulk_bucket)
 
         acceptances = 0
         for attempt in range(20):
-            first = extenddb_request("StartBulkPutItems", body)
+            # Each Start carries its own token, so the second one is not a
+            # replay of the first.
+            first = extenddb_request(
+                "StartBulkPutItems", start_body(bulk_table, bulk_bucket)
+            )
             arn = first["BulkOperationDescription"]["BulkOperationArn"]
 
-            status_code, result = _signed_post("StartBulkPutItems", body)
+            status_code, result = _signed_post(
+                "StartBulkPutItems", start_body(bulk_table, bulk_bucket)
+            )
             if status_code < 400:
                 acceptances += 1
             else:
@@ -123,11 +128,14 @@ class TestPerTableGuard:
         self, bulk_table, bulk_bucket
     ):
         write_rows(bulk_bucket, "in/rows.json", [row("m", "1")])
-        body = start_body(bulk_table, bulk_bucket)
-        first = extenddb_request("StartBulkPutItems", body)
+        first = extenddb_request(
+            "StartBulkPutItems", start_body(bulk_table, bulk_bucket)
+        )
         wait_until_terminal(first["BulkOperationDescription"]["BulkOperationArn"])
 
-        second = extenddb_request("StartBulkPutItems", body)
+        second = extenddb_request(
+            "StartBulkPutItems", start_body(bulk_table, bulk_bucket)
+        )
         desc = second["BulkOperationDescription"]
         assert desc["BulkOperationStatus"] == "IN_PROGRESS"
         wait_until_terminal(desc["BulkOperationArn"])
@@ -136,3 +144,63 @@ class TestPerTableGuard:
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
+
+
+def _length_refusal(token: str) -> str:
+    return (
+        f"Invalid Request: 1 validation error detected: Value '{token}' at "
+        "'clientToken' failed to satisfy constraint: Member must have length "
+        "less than or equal to 1024"
+    )
+
+
+class TestClientToken:
+    """The ClientToken bounds, measured on the service on 2026-11-19."""
+
+    def test_a_start_without_a_token_is_refused(self, bulk_table, bulk_bucket):
+        body = start_body(bulk_table, bulk_bucket)
+        del body["ClientToken"]
+        expect_error(
+            "StartBulkPutItems", body,
+            "ValidationException",
+            "Invalid Request: 1 validation error detected: Value null at "
+            "'clientToken' failed to satisfy constraint: Member must not be null",
+        )
+
+    # The length is counted in characters (Unicode code points), not bytes.
+    @pytest.mark.parametrize("token,accepted", [
+        ("a" * 1024, True),
+        ("a" * 1025, False),
+        ("\u00e9" * 512 + "a", True),
+        ("\U0001F600" + "a" * 1023, True),
+        ("\U0001F600" + "a" * 1024, False),
+    ])
+    def test_the_token_length_is_counted_in_characters(
+        self, bulk_table, bulk_bucket, token, accepted
+    ):
+        body = start_body(bulk_table, bulk_bucket, ClientToken=token)
+        if not accepted:
+            expect_error(
+                "StartBulkPutItems", body, "ValidationException",
+                _length_refusal(token),
+            )
+            return
+        desc = extenddb_request("StartBulkPutItems", body)["BulkOperationDescription"]
+        assert desc["ClientToken"] == token
+        wait_until_terminal(desc["BulkOperationArn"])
+
+    def test_a_token_holding_nul_replays_its_operation(self, bulk_table, bulk_bucket):
+        token = f"nul\u0000{uuid.uuid4()}"
+        body = start_body(bulk_table, bulk_bucket, ClientToken=token)
+        first = extenddb_request("StartBulkPutItems", body)["BulkOperationDescription"]
+        assert first["ClientToken"] == token
+        replay = extenddb_request("StartBulkPutItems", body)["BulkOperationDescription"]
+        assert replay["BulkOperationArn"] == first["BulkOperationArn"]
+        expect_error(
+            "StartBulkPutItems",
+            start_body(bulk_table, bulk_bucket, out_prefix="other", ClientToken=token),
+            "IdempotentParameterMismatchException",
+            IDEMPOTENT_MISMATCH_MESSAGE,
+        )
+        final = wait_until_terminal(first["BulkOperationArn"])
+        assert final["ClientToken"] == token

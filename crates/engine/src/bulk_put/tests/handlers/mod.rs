@@ -75,7 +75,7 @@ fn bulk_limits(overrides: &[(&str, Value)]) -> LimitsConfig {
         "max_bulk_input_bytes": 1_099_511_627_776_u64,
         "max_bulk_input_files": 10_000,
         "max_concurrent_bulk_operations": 50,
-        "max_bulk_client_token_bytes": 1024,
+        "max_bulk_client_token_chars": 1024,
     });
     for (key, value) in overrides {
         body[*key] = value.clone();
@@ -139,10 +139,14 @@ async fn call(
 }
 
 /// A valid start request: empty input prefix over the staged input bucket
-/// directory, and both report kinds into the staged report bucket.
+/// directory, both report kinds into the staged report bucket, and a
+/// `ClientToken` of its own, the way an SDK fills one in for every call.
 fn start_body() -> Value {
+    static NEXT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let token = NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     json!({
         "TableName": TABLE,
+        "ClientToken": format!("token-{token}"),
         "InputS3Configuration": {
             "S3Bucket": IN_BUCKET,
             "InputFormat": "DYNAMODB_JSON",

@@ -75,10 +75,10 @@ pub(super) fn check_model_constraints(body: &Value) -> Result<(), DynamoDbError>
         ));
     }
     if let Some(Value::String(token)) = obj.get("ClientToken")
-        // The pattern also refuses U+0000: the token is stored verbatim in
-        // a text column, and PostgreSQL refuses a NUL byte in text, so the
-        // byte is answered with the pattern clause.
-        && (token.is_empty() || token.contains('$') || token.contains('\0'))
+        // The pattern is `^[^\$]+$`: an empty token and a token holding `$`
+        // fail it (measured). U+0000 passes it, and the service accepts and
+        // replays a token holding it (measured).
+        && (token.is_empty() || token.contains('$'))
     {
         clauses.push((
             Member::ClientToken,

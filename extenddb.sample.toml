@@ -186,7 +186,7 @@
 # max_bulk_input_bytes = 1099511627776       # ceiling on the listed (compressed) total per operation, under the tier quota (100 GB STANDARD, 1 TB ACCELERATED); above it the operation fails
 # max_bulk_input_files = 50000               # enumerated object count per operation; above it the operation fails
 # max_bulk_input_object_bytes = 5368709120   # one enumerated input object; above it the operation fails
-# max_bulk_client_token_bytes = 1024         # longest accepted ClientToken on StartBulkPutItems, in bytes
+# max_bulk_client_token_chars = 1024         # longest accepted ClientToken on StartBulkPutItems, in characters
 # max_bulk_line_bytes = 4194304              # one input line; longer abandons the file
 # max_bulk_item_count = 100000000            # rows read per operation; more fails the operation
 # max_bulk_report_records = 1000000          # records kept per operation; more are dropped and logged

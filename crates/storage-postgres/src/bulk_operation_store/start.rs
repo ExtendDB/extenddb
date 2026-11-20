@@ -82,7 +82,8 @@ async fn insert_operation_row(
     .bind(&req.table_id)
     .bind(&req.table_name)
     .bind(&req.table_arn)
-    .bind(&req.client_token)
+    // The column holds the token's UTF-8 bytes (see the migration).
+    .bind(req.client_token.as_deref().map(str::as_bytes))
     .bind(&req.client_token_hash)
     .bind(&req.request_fingerprint)
     .bind(&req.input_config)

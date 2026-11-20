@@ -566,3 +566,48 @@ pub async fn a_token_hash_shared_across_accounts_creates_in_each_account<E: Stor
     .await;
     created(in_b);
 }
+
+/// A token holding U+0000 is stored as given, replays its operation, and
+/// reads back unchanged from every read (measured on the service: such a
+/// token is accepted, replayed, and returned by Describe).
+pub async fn a_token_holding_nul_is_stored_and_replays<E: StorageEngine>(fx: &Fixture<E>) {
+    let table = create_table(fx, &fx.account_a, "nul_token").await;
+    let token = "\u{0}nul\u{0}token\u{0}";
+    let first = created(
+        start(
+            fx,
+            &fx.account_a,
+            new_op(fx, &fx.account_a, &table, Some(token), "fp", 1000),
+            50,
+        )
+        .await,
+    );
+    assert_eq!(first.client_token.as_deref(), Some(token));
+    let replay = start(
+        fx,
+        &fx.account_a,
+        new_op(fx, &fx.account_a, &table, Some(token), "fp", 2000),
+        50,
+    )
+    .await;
+    match replay {
+        StartOutcome::IdempotentReplay(r) => {
+            assert_eq!(r.operation_id, first.operation_id);
+            assert_eq!(r.client_token.as_deref(), Some(token));
+        }
+        other => panic!("expected IdempotentReplay, got {}", start_kind(&other)),
+    }
+    let read = fx
+        .engine
+        .get_bulk_operation(&fx.account_a, &first.operation_id)
+        .await
+        .expect("get")
+        .expect("the operation exists");
+    assert_eq!(read.client_token.as_deref(), Some(token));
+    let (listed, _) = fx
+        .engine
+        .list_bulk_operations(&fx.account_a, 10, None)
+        .await
+        .expect("list");
+    assert_eq!(listed[0].client_token.as_deref(), Some(token));
+}
