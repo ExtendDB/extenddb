@@ -6,6 +6,7 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use extenddb_core::error::DynamoDbError;
+use serde::ser::{SerializeMap as _, Serializer as _};
 use serde_json::Value;
 
 #[cfg(test)]
@@ -41,26 +42,7 @@ pub(crate) fn success_response(body: &Value, request_id: &str) -> Response {
 /// key [`message_key`] picks. REQ-ERR-003: Omit the message field when empty
 /// (real `DynamoDB` behavior, verified 2026-05-04).
 pub(crate) fn error_response(error: &DynamoDbError, request_id: &str) -> Response {
-    // Fix #14: Use full_error_type() which includes the prefix
-    let mut body = serde_json::json!({
-        "__type": error.full_error_type(),
-    });
-    // Only include message field when non-empty (real DynamoDB omits it for
-    // UnknownOperationException and other errors with no message).
-    let msg = error.message();
-    if !msg.is_empty() {
-        body[message_key(error)] = serde_json::Value::String(msg.to_owned());
-    }
-    // TransactionCanceledException includes per-item CancellationReasons
-    if let Some(reasons) = error.cancellation_reasons() {
-        body["CancellationReasons"] = serde_json::to_value(reasons).unwrap_or_default();
-    }
-    // ConditionalCheckFailedException includes the old item when requested
-    if let Some(item) = error.condition_check_item() {
-        body["Item"] = serde_json::to_value(item).unwrap_or_default();
-    }
-    let body_bytes =
-        serde_json::to_vec(&body).unwrap_or_else(|_| SERIALIZATION_FAILURE_BODY.to_vec());
+    let body_bytes = error_body(error).unwrap_or_else(|_| SERIALIZATION_FAILURE_BODY.to_vec());
     let crc = crc32fast::hash(&body_bytes);
     let status =
         StatusCode::from_u16(error.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -75,6 +57,32 @@ pub(crate) fn error_response(error: &DynamoDbError, request_id: &str) -> Respons
         body_bytes,
     )
         .into_response()
+}
+
+/// The body of `error`, with its members in the order `DynamoDB` writes them
+/// (us-east-1, raw bodies, 2026-11-20): `__type` first, then the
+/// `CancellationReasons` of a `TransactionCanceledException` or the `Item` of
+/// a `ConditionalCheckFailedException`, then the message.
+fn error_body(error: &DynamoDbError) -> serde_json::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut serializer = serde_json::Serializer::new(&mut bytes);
+    let mut body = serializer.serialize_map(None)?;
+    body.serialize_entry("__type", &error.full_error_type())?;
+    // Through a `Value`, each reason writes its members in name order, as
+    // `DynamoDB` does: `Code`, `Item`, `Message`.
+    if let Some(reasons) = error.cancellation_reasons() {
+        let reasons = serde_json::to_value(reasons).unwrap_or_default();
+        body.serialize_entry("CancellationReasons", &reasons)?;
+    }
+    if let Some(item) = error.condition_check_item() {
+        body.serialize_entry("Item", item)?;
+    }
+    let msg = error.message();
+    if !msg.is_empty() {
+        body.serialize_entry(message_key(error), msg)?;
+    }
+    body.end()?;
+    Ok(bytes)
 }
 
 /// The key that carries the error message: `Message` on the errors matched
