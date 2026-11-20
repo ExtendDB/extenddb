@@ -108,6 +108,75 @@ fn the_shard_id_maximum_applies_once_the_shard_is_not_found() {
     }
 }
 
+/// Every constraint violation of a body joins one message, in the service's
+/// order (measured 2026-11-20): sequenceNumber, shardIteratorType, shardId.
+#[test]
+fn constraint_violations_join_one_message_in_the_service_order() {
+    use serde_json::json;
+    const SEQ: &str = "Value at 'sequenceNumber' failed to satisfy constraint: Member must have length greater than or equal to 21";
+    const NULL: &str =
+        "Value at 'shardIteratorType' failed to satisfy constraint: Member must not be null";
+    const SHARD: &str = "Value at 'shardId' failed to satisfy constraint: Member must have length greater than or equal to 28";
+    let long = "shardId-00000001792764241200-b719fef1";
+    let cases: &[(serde_json::Value, Option<String>)] = &[
+        (
+            json!({"ShardId": "shardId-short"}),
+            Some(format!("2 validation errors detected: {NULL}; {SHARD}")),
+        ),
+        (
+            json!({"ShardId": "shardId-short", "ShardIteratorType": null}),
+            Some(format!("2 validation errors detected: {NULL}; {SHARD}")),
+        ),
+        (
+            json!({"ShardId": "shardId-short", "ShardIteratorType": "BOGUS"}),
+            Some(format!(
+                "2 validation errors detected: {}; {SHARD}",
+                super::iterator_params::SHARD_ITERATOR_TYPE_ENUM_CLAUSE
+            )),
+        ),
+        (
+            json!({"ShardId": long, "SequenceNumber": "0"}),
+            Some(format!("2 validation errors detected: {SEQ}; {NULL}")),
+        ),
+        (
+            json!({"ShardId": "shardId-short", "SequenceNumber": "0"}),
+            Some(format!(
+                "3 validation errors detected: {SEQ}; {NULL}; {SHARD}"
+            )),
+        ),
+        (
+            json!({"ShardId": long, "Timestamp": 1792764248.0}),
+            Some(format!("1 validation error detected: {NULL}")),
+        ),
+        (
+            json!({"ShardId": long, "ShardIteratorType": "at_timestamp"}),
+            Some(format!(
+                "1 validation error detected: {}",
+                super::iterator_params::SHARD_ITERATOR_TYPE_ENUM_CLAUSE
+            )),
+        ),
+        (
+            json!({"ShardId": "shardId-short", "ShardIteratorType": "TRIM_HORIZON"}),
+            Some(super::SHARD_ID_TOO_SHORT.to_owned()),
+        ),
+        (
+            json!({"ShardId": long, "ShardIteratorType": "AT_TIMESTAMP", "SequenceNumber": "000000000000000000001"}),
+            None,
+        ),
+        // A ShardIteratorType of another JSON type is the deserializer's case.
+        (json!({"ShardId": long, "ShardIteratorType": 5}), None),
+    ];
+    for (body, expected) in cases {
+        match (super::constraint_violations(body), expected) {
+            (Ok(()), None) => {}
+            (Err(super::DynamoDbError::ValidationException(m)), Some(e)) => {
+                assert_eq!(&m, e, "body={body}");
+            }
+            (got, _) => panic!("body={body}: expected {expected:?}, got {got:?}"),
+        }
+    }
+}
+
 #[test]
 fn the_constraint_sentences_match_the_measured_ones() {
     assert_eq!(
