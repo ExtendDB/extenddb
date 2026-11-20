@@ -15,11 +15,14 @@ from botocore.exceptions import ClientError
 from helpers import unique_name
 
 # The clause of a count outside its bound: the requests or keys of a table, or
-# the tables of RequestItems. Each test gives the path and the bound. DynamoDB
-# gave these clauses, two of them in either order, in every answer measured on
-# 2026-11-20. On 2026-11-14 and 2026-11-16 it also quoted the request map in
-# a message that holds QUOTED_MAP, so the test accepts that from DynamoDB.
+# the tables of RequestItems. Each test gives the path and the bound. In every
+# answer measured on 2026-11-20, DynamoDB listed the table count clause first
+# when it was over the limit, then the table clauses in an order that changed
+# from one send to the next, at most MAX_CLAUSES in all. On 2026-11-14 and
+# 2026-11-16 it also quoted the request map in a message that holds
+# QUOTED_MAP, so the test accepts that from DynamoDB.
 CLAUSE = "Value at '{}' failed to satisfy constraint: Member must have length {}"
+MAX_CLAUSES = 10
 QUOTED_MAP = (
     "' at 'requestItems' failed to satisfy constraint: Map value must satisfy "
     "constraint: [Member must have length less than or equal to 25, "
@@ -27,14 +30,31 @@ QUOTED_MAP = (
 )
 
 
-def _assert_clauses(message: str, clauses: list[str]) -> None:
-    """The message lists these clauses, two of them in either order."""
-    detected = f"{len(clauses)} validation error{'s' if len(clauses) > 1 else ''} detected: "
-    assert message in {detected + "; ".join(c) for c in (clauses, clauses[::-1])}
+def _assert_clauses(message: str, clauses: list[str], count: str | None = None) -> None:
+    """The message lists `count` first when given, then clauses of `clauses` in
+    any order, each once, MAX_CLAUSES in all at most."""
+    n = min(len(clauses) + (count is not None), MAX_CLAUSES)
+    head, _, rest = message.partition(": ")
+    assert head == f"{n} validation error{'s' if n > 1 else ''} detected", message
+    listed = rest.split("; ")
+    assert len(listed) == n, message
+    if count is not None:
+        assert listed.pop(0) == count, message
+    assert len(set(listed)) == len(listed) and set(listed) <= set(clauses), message
 
 
 def _puts(n: int) -> list[dict]:
     return [{"PutRequest": {"Item": {"pk": {"S": f"k{i}"}}}} for i in range(n)]
+
+
+def _counts(n: int, empty: range | set[int], big: int | None = None, over: int = 101) -> list[int]:
+    """n counts of one, except none at the indexes of `empty` and `over` at `big`."""
+    return [0 if i in empty else over if i == big else 1 for i in range(n)]
+
+
+def _writes(n: int, empty: range | set[int], big: int | None = None) -> list[tuple]:
+    """n tables of one put, except none at `empty` and 26 at `big`."""
+    return [("tbl", _puts(c)) for c in _counts(n, empty, big, 26)]
 
 
 NESTED_PUT = {
@@ -137,17 +157,24 @@ class TestBatchWriteItem:
             pytest.param(
                 [("tbl", _puts(20)), ("tbl", _puts(10)), ("tbl", [])], [2], id="20_10_and_none"
             ),
-            pytest.param([("tbl", _puts(1))] * 26, None, id="26_tables"),
+            pytest.param([("tbl", _puts(1))] * 26, [], id="26_tables"),
+            pytest.param(_writes(26, {13}), [13], id="26_tables_1_none"),
+            pytest.param(_writes(30, {13}), [13], id="30_tables_1_none"),
+            pytest.param(_writes(26, range(1, 10)), range(1, 10), id="26_tables_9_none"),
+            pytest.param(_writes(26, range(1, 11)), range(1, 11), id="26_tables_10_none"),
+            pytest.param(_writes(26, {5}, 9), [5, 9], id="26_tables_1_none_1_of_26"),
         ],
     )
     def test_batch_write_too_many_items(
         self, table_factory, raw_client, is_extenddb, tables, named
     ):
         """A table with more than 25 requests or none, or more than 25 tables,
-        is rejected, with each such table named at its member path."""
-        # The row of 26 tables names tables that do not exist, as measured.
+        is rejected. The refusal names the table count when it is over 25, then
+        each such table at its member path."""
+        # A row of more than 25 tables names tables that do not exist, as measured.
+        over = len(tables) > 25
         names = [
-            unique_name(prefix) if named is None else table_factory(unique_name(prefix))
+            unique_name(prefix) if over else table_factory(unique_name(prefix))
             for prefix, _ in tables
         ]
         with pytest.raises(ClientError) as exc:
@@ -158,17 +185,18 @@ class TestBatchWriteItem:
         assert error["Code"] == "ValidationException"
         if not is_extenddb and QUOTED_MAP in error["Message"]:
             return
-        if named is None:
-            clauses = [CLAUSE.format("RequestItems", "less than or equal to 25")]
-        else:
-            clauses = [
-                CLAUSE.format(
-                    f"RequestItems.{names[i]}.member",
-                    "less than or equal to 25" if tables[i][1] else "greater than or equal to 1",
-                )
-                for i in named
-            ]
-        _assert_clauses(error["Message"], clauses)
+        clauses = [
+            CLAUSE.format(
+                f"RequestItems.{names[i]}.member",
+                "less than or equal to 25" if tables[i][1] else "greater than or equal to 1",
+            )
+            for i in named
+        ]
+        _assert_clauses(
+            error["Message"],
+            clauses,
+            CLAUSE.format("RequestItems", "less than or equal to 25") if over else None,
+        )
 
     def test_batch_write_unprocessed_empty(self, table_factory, dynamodb_client):
         """Small batch returns empty UnprocessedItems."""
@@ -306,12 +334,19 @@ class TestBatchGetItem:
             pytest.param([101, 101], [0, 1], id="101_and_101"),
             pytest.param([101, 0], [0, 1], id="101_and_none"),
             pytest.param([60, 41, 0], [2], id="60_41_and_none"),
+            pytest.param(_counts(101, {50}), [50], id="101_tables_1_none"),
+            pytest.param(_counts(101, range(1, 10)), range(1, 10), id="101_tables_9_none"),
+            pytest.param(_counts(101, range(1, 11)), range(1, 11), id="101_tables_10_none"),
+            pytest.param(_counts(101, {5}, 9), [5, 9], id="101_tables_1_none_1_of_101"),
         ],
     )
     def test_batch_get_too_many_keys(self, table_factory, raw_client, counts, named):
-        """A table with more than 100 keys or none is rejected, with each such
-        table named at its member path."""
-        names = [table_factory() for _ in counts]
+        """A table with more than 100 keys or none, or more than 100 tables, is
+        rejected. The refusal names the table count when it is over 100, then
+        each such table at its member path."""
+        # A row of more than 100 tables names tables that do not exist, as measured.
+        over = len(counts) > 100
+        names = [unique_name() if over else table_factory() for _ in counts]
         with pytest.raises(ClientError) as exc:
             raw_client.batch_get_item(
                 RequestItems={
@@ -328,7 +363,11 @@ class TestBatchGetItem:
             )
             for i in named
         ]
-        _assert_clauses(error["Message"], clauses)
+        _assert_clauses(
+            error["Message"],
+            clauses,
+            CLAUSE.format("RequestItems", "less than or equal to 100") if over else None,
+        )
 
     def test_batch_get_unprocessed_empty(self, table_factory, dynamodb_client):
         """Small batch returns empty UnprocessedKeys."""
