@@ -25,6 +25,7 @@ members = [
     "crates/server",
     "crates/app",
     "crates/bin",
+    "crates/wasm-adapter",
 ]
 
 [workspace.package]
