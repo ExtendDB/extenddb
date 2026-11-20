@@ -4,6 +4,8 @@ ExtendDB follows [Semantic Versioning](https://semver.org/). A release number ha
 
 ## What a release can change
 
+These rules apply from 1.0. A 0.x release, 0.1.15 among them, can add configuration keys, CLI flags and backup format versions, can carry breaking catalog migrations, and can raise the minimum Rust version, whatever part of its number changes. 0.1.15 adds configuration keys and breaking catalog migrations, so a rollback from it to 0.1.14 needs the backup taken before the upgrade, not only the 0.1.14 binary (see the [Rollback Procedure](manuals/07-upgrade-manual.md#rollback-procedure)).
+
 - A major release, such as 2.0, can change anything that this policy keeps compatible. Only a major release removes a deprecated item. Its release notes and the [upgrade manual](manuals/07-upgrade-manual.md) give the upgrade path. The 2.0 release upgrades the catalog of any 1.x release.
 - A minor release can add operations, configuration keys, CLI flags and catalog migrations. It can deprecate an item. It can carry a breaking catalog migration, and its release notes then say so. A minor release can also raise the minimum Rust version that a build from source needs.
 - A patch release fixes bugs other than the behavior changes under [The DynamoDB API](#what-stays-compatible-within-a-major-version), and it fixes security issues. It adds no configuration key, no breaking catalog migration and no new backup format version. A rollback to an earlier patch release of the same minor release needs only the earlier binary.
@@ -41,7 +43,7 @@ A backup in a backup store carries a format version. A release reads each format
 
 ## Not covered
 
-- The APIs of the Rust crates, the `Storage` trait among them: the crates are not published, and the trait still changes.
+- The APIs of the Rust crates, the `Storage` trait among them: from 0.1.15 the crates are published to crates.io, to build ExtendDB from them, not as a library interface, and the trait still changes.
 - Preview settings, such as `enable_multipart_keys`.
 - The fields of a `/metrics` response.
 - Backends in the experimental [tier](../README.md#storage-backends).
@@ -53,7 +55,7 @@ Fixes ship in patch releases. A fix for an earlier minor release gets a patch re
 - The newest minor release gets bug fixes and security fixes.
 - The minor release before it gets security fixes for 3 months after the newest one ships.
 - After 2.0 ships, the last 1.x minor release gets security fixes for 12 months.
-- The 0.1.x releases get no fixes after 1.0 ships.
+- The 0.1.x releases get no more fixes; the 3-month rule above starts with the 1.x releases.
 
 Support covers the stable and beta backends. An experimental backend gets fixes in the newest minor release only. To report a security issue, follow [SECURITY.md](../SECURITY.md).
 
@@ -64,3 +66,14 @@ Support covers the stable and beta backends. An experimental backend gets fixes 
 3. A major release removes the item, no earlier than 6 months after the release that announced it.
 
 The same steps apply when a release removes a stable or beta backend, or moves it to a lower tier. A security issue can need a faster change, and its release notes then give the reason.
+
+---
+
+## License
+
+Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
+See [LICENSE](../LICENSE) for the full text.
+
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

@@ -3,6 +3,8 @@
 
 //! Account management operations for `CassandraCatalogStore`.
 
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_storage::management_store::{AccountDetail, OpError, OpResult};
 
@@ -32,7 +34,11 @@ impl CassandraCatalogStore {
 
         let result = self
             .session()
-            .query_with_values(&query, cdrs_tokio::query_values!(account_id, account_name))
+            .run(
+                Stmt::Lwt,
+                &query,
+                cdrs_tokio::query_values!(account_id, account_name),
+            )
             .await
             .map_err(|e| {
                 tracing::error!("create_account query failed: {e}");
@@ -165,7 +171,7 @@ impl CassandraCatalogStore {
         .await?;
 
         // Quorum commit, so the console's quorum reads see the account gone.
-        crate::cassandra_util::apply_lwt_quorum(
+        crate::cassandra_util::apply_lwt(
             self.session(),
             &format!("DELETE FROM {catalog_keyspace}.accounts WHERE account_id = ? IF EXISTS"),
             cdrs_tokio::query_values!(account_id),

@@ -65,7 +65,7 @@ pub struct MigrateArgs {
     pub(crate) list: bool,
 
     /// With --yes: run every convergent migration again, to repair a catalog
-    /// a release before 1.0 wrote to after it was migrated
+    /// a release before 0.1.15 wrote to after it was migrated
     #[arg(long, requires = "yes", conflicts_with = "forget")]
     pub(crate) reconverge: bool,
 

@@ -111,7 +111,11 @@ field is unset when the index flips to `ACTIVE`.
 ```
 Keys include `catalog_version` (the catalog's migration id, which the
 migration runner writes with each catalog ledger row), `encryption_key`
-(base64-encoded 256-bit AES-GCM key), `data_database_name`, and
+(base64-encoded 256-bit AES-GCM key, the catalog key; absent after the switch
+to a key-encryption key file), `encryption_key_ring` (with `[auth.encryption]
+key_file` set: the data encryption key wrapped under the key-encryption key, the
+KEK's id and the state of an unfinished switch or rotation, as one JSON
+document), `data_database_name`, and
 `data_connection_string`.
 
 ### 3.6 `admin_users`
@@ -143,8 +147,14 @@ Unique index on `user_arn`.
 }
 ```
 Index on `(account_id, user_name)`. `secret_key_encrypted` is AES-256-GCM
-ciphertext of the secret access key using the `settings.encryption_key`;
-`access_key_id` is bound as additional authenticated data.
+ciphertext of the secret access key using the `settings.encryption_key`, with
+`access_key_id` bound as additional authenticated data; under the data
+encryption key of a key ring, the additional authenticated data binds the
+catalog id, the collection, the access key ID, the account, the user name and
+the expiry instead (the Security Model's Credential Storage section). The
+`extenddb encryption-key` pass rewrites each document with one `update_one` on
+its `_id` and no upsert, so a document that the TTL index deletes during the
+pass stays deleted.
 
 ### 3.9 `iam_groups`
 ```json
@@ -1069,7 +1079,8 @@ The backend implements every trait in `extenddb-storage`:
 - `AuthorizationStore` — user/group/role/permissions-boundary/session
   policy lookup for IAM evaluation.
 - `MongoCredentialStore` — SigV4 credential resolution with
-  AES-GCM-decrypted secret keys.
+  AES-GCM-decrypted secret keys on a cache miss; the credential cache keeps the
+  derived signing key and wipes the secret.
 
 **Background workers** — spawned from `MongoRuntimeHooks::spawn_workers`:
 - `ttl_cleanup_worker` — sweep expired items every 60 s, emit
@@ -1170,3 +1181,14 @@ uses the compound `(shard_id, sequence_number)` index.
 configured `transaction_read_concern` (default `"snapshot"`) and
 majority write concern; up to 100 operations
 per the DDB spec. Retried on transient conflicts with jittered backoff.
+
+---
+
+## License
+
+Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
+See [LICENSE](../../LICENSE) for the full text.
+
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

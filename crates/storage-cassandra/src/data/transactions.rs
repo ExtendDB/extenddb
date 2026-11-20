@@ -4,9 +4,8 @@
 //! DynamoDB transaction implementations for Cassandra backend.
 
 use super::transact_stream::{commit_old_image, secondary_effect_batches};
-use cdrs_tokio::consistency::Consistency;
+use crate::cassandra_util::PolicySession as _;
 use cdrs_tokio::frame::Envelope;
-use cdrs_tokio::query::BatchQueryBuilder;
 use cdrs_tokio::types::IntoRustByName;
 use cdrs_tokio::types::value::Bytes;
 use extenddb_core::expression::{self, ExpressionMaps};
@@ -23,7 +22,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::CassandraEngine;
-use crate::cassandra_util::{get_column, query_optional};
+use crate::cassandra_util::{Stmt, get_column, query_optional};
 use crate::data::ddl::data_table_name;
 use crate::data::transaction_ledger::{LedgerOp, TransactionState};
 use crate::data::{
@@ -1548,7 +1547,12 @@ impl CassandraEngine {
         skip_txn_id: Option<Uuid>,
     ) -> Result<Option<Item>, StorageError> {
         Ok(self
-            .fetch_row_for_transaction(key_info, key, skip_txn_id, None)
+            .fetch_row_for_transaction(
+                key_info,
+                key,
+                skip_txn_id,
+                crate::cassandra_util::Stmt::Read,
+            )
             .await?
             .item)
     }
@@ -1564,8 +1568,9 @@ impl CassandraEngine {
     /// item and therefore a real old image. The version is `None` in that last
     /// case too: the row belongs to the other transaction until it finishes.
     ///
-    /// `consistency` is the read's consistency. COMMIT reads its own fenced
-    /// row at `LOCAL_SERIAL`: the read supplies the old image whose index rows
+    /// `read` is the kind of the read. COMMIT reads its own fenced row as a
+    /// [`Stmt::SerialRead`](crate::cassandra_util::Stmt::SerialRead), at
+    /// `LOCAL_SERIAL`: the read supplies the old image whose index rows
     /// the commit removes and the version it advances, and the commit's
     /// `IF prepared_txn_id = ?` checks neither, so a replica that missed the
     /// latest write must not answer it.
@@ -1574,7 +1579,7 @@ impl CassandraEngine {
         key_info: &TableKeyInfo,
         key: &Item,
         skip_txn_id: Option<Uuid>,
-        consistency: Option<Consistency>,
+        read: crate::cassandra_util::Stmt,
     ) -> Result<TransactionRow, StorageError> {
         let keyspace = self.account_keyspace(&key_info.account_id);
         let table = data_table_name(&key_info.table_id);
@@ -1590,7 +1595,7 @@ impl CassandraEngine {
             pk_text.as_str(),
             sk.as_ref(),
             sk_col.as_deref(),
-            consistency,
+            read,
         )
         .await?
         else {
@@ -1748,7 +1753,11 @@ impl CassandraEngine {
 
         let result = self
             .session
-            .query_with_values(&query, cdrs_tokio::query_values!(pk_text.as_str()))
+            .run(
+                Stmt::Read,
+                &query,
+                cdrs_tokio::query_values!(pk_text.as_str()),
+            )
             .await
             .map_err(|e| {
                 tracing::error!("check_partition_max_delete_timestamp: {e}");
@@ -1830,7 +1839,7 @@ impl CassandraEngine {
                  VALUES (?, ?, ?, ?, true) IF NOT EXISTS"
             );
             self.session
-                .query_with_values(&query, cdrs_tokio::query_values!(pk_text.as_str(), item_text, txn_id_bytes, txn_timestamp))
+                .run(Stmt::Lwt, &query, cdrs_tokio::query_values!(pk_text.as_str(), item_text, txn_id_bytes, txn_timestamp))
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))
         } else {
@@ -1839,7 +1848,7 @@ impl CassandraEngine {
                  WHERE pk = ? IF prepared_txn_id = null"
             );
             self.session
-                .query_with_values(&query, cdrs_tokio::query_values!(txn_id_bytes, txn_timestamp, pk_text.as_str()))
+                .run(Stmt::Lwt, &query, cdrs_tokio::query_values!(txn_id_bytes, txn_timestamp, pk_text.as_str()))
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))
         }
@@ -1891,7 +1900,7 @@ impl CassandraEngine {
                         key_info,
                         item,
                         Some(txn_id),
-                        Some(Consistency::LocalSerial),
+                        crate::cassandra_util::Stmt::SerialRead,
                     )
                     .await?;
                 let old_image = commit_old_image(row.item, row.created_to_prepare);
@@ -1946,7 +1955,7 @@ impl CassandraEngine {
                         key_info,
                         key,
                         Some(txn_id),
-                        Some(Consistency::LocalSerial),
+                        crate::cassandra_util::Stmt::SerialRead,
                     )
                     .await?;
                 let mut final_item = row.item.clone().unwrap_or_else(|| (*key).clone());
@@ -1997,7 +2006,7 @@ impl CassandraEngine {
                         key_info,
                         key,
                         Some(txn_id),
-                        Some(Consistency::LocalSerial),
+                        crate::cassandra_util::Stmt::SerialRead,
                     )
                     .await?;
                 let old_image = commit_old_image(row.item, row.created_to_prepare);
@@ -2023,7 +2032,8 @@ impl CassandraEngine {
 
                 let result = self
                     .session
-                    .query_with_values(
+                    .run(
+                        Stmt::Lwt,
                         &update_max_ts_null_query,
                         cdrs_tokio::query_values!(txn_timestamp, pk_text.as_str()),
                     )
@@ -2044,7 +2054,8 @@ impl CassandraEngine {
 
                     let _result2 = self
                         .session
-                        .query_with_values(
+                        .run(
+                            Stmt::Lwt,
                             &update_max_ts_query,
                             cdrs_tokio::query_values!(
                                 txn_timestamp,
@@ -2087,10 +2098,7 @@ impl CassandraEngine {
                         "DELETE FROM {keyspace}.{ddb_table} WHERE pk = ? IF prepared_txn_id = ?"
                     );
                     self.session
-                        .query_with_values(
-                            &delete_query,
-                            cdrs_tokio::query_values!(pk_text.as_str(), txn_id_bytes),
-                        )
+                        .run(Stmt::Lwt, &delete_query, cdrs_tokio::query_values!(pk_text.as_str(), txn_id_bytes))
                         .await
                         .map_err(|e| StorageError::Internal(e.to_string()))
                 }
@@ -2168,7 +2176,8 @@ impl CassandraEngine {
                  IF prepared_txn_id = ? AND created_to_prepare = true"
             );
             self.session
-                .query_with_values(
+                .run(
+                    Stmt::Lwt,
                     &query,
                     cdrs_tokio::query_values!(pk_text.as_str(), txn_id_bytes),
                 )
@@ -2235,17 +2244,14 @@ impl CassandraEngine {
                  WHERE pk = ? AND {sk_col} = ? IF prepared_txn_id = ?"
             );
             self.session
-                .query_with_values(
-                    &query,
-                    cdrs_tokio::query::QueryValues::SimpleValues(vec![
+                .run(Stmt::Lwt, &query, cdrs_tokio::query::QueryValues::SimpleValues(vec![
                         item_text.as_str().into(),
                         next_version.into(),
                         txn_timestamp.into(),
                         cdrs_tokio::types::value::Value::from(pk_text.as_str()),
                         super::index::sk_to_value(&sk),
                         txn_id_bytes.into(),
-                    ]),
-                )
+                    ]))
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))
         } else {
@@ -2254,7 +2260,7 @@ impl CassandraEngine {
                  WHERE pk = ? IF prepared_txn_id = ?"
             );
             self.session
-                .query_with_values(&query, cdrs_tokio::query_values!(item_text, next_version, txn_timestamp, pk_text.as_str(), txn_id_bytes))
+                .run(Stmt::Lwt, &query, cdrs_tokio::query_values!(item_text, next_version, txn_timestamp, pk_text.as_str(), txn_id_bytes))
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))
         }
@@ -2365,7 +2371,7 @@ impl CassandraEngine {
             return Ok(());
         }
 
-        let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+        let mut batch = crate::cassandra_util::batch();
         let mut async_enqueued = 0;
 
         if !indexes.is_empty() {
@@ -2403,7 +2409,7 @@ impl CassandraEngine {
             .build()
             .map_err(|e| StorageError::Internal(e.to_string()))?;
         for batch in secondary_effect_batches(index_batch, stream_stmt) {
-            self.session.batch(batch).await.map_err(|e| {
+            self.session.run_batch(batch).await.map_err(|e| {
                 StorageError::Internal(format!("commit_secondary_effects batch: {e}"))
             })?;
         }
@@ -2491,7 +2497,7 @@ impl CassandraEngine {
             );
 
             let dr = self.session
-                .query_with_values(&delete_query, cdrs_tokio::query_values!(pk_text.as_str(), txn_id_bytes.clone()))
+                .run(Stmt::Lwt, &delete_query, cdrs_tokio::query_values!(pk_text.as_str(), txn_id_bytes.clone()))
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))
                 .map_err(|e| { tracing::error!("rollback delete: {e}"); e })?;
@@ -2499,7 +2505,7 @@ impl CassandraEngine {
                 return Ok(());
             }
             self.session
-                .query_with_values(&update_query, cdrs_tokio::query_values!(pk_text.as_str(), txn_id_bytes))
+                .run(Stmt::Lwt, &update_query, cdrs_tokio::query_values!(pk_text.as_str(), txn_id_bytes))
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))
         }
@@ -2637,7 +2643,7 @@ impl CassandraEngine {
             pk,
             sk.map(|(value, _)| value),
             sk.map(|(_, col)| col.as_str()),
-            Some(Consistency::LocalSerial),
+            crate::cassandra_util::Stmt::SerialRead,
         )
         .await?;
         Ok(row.and_then(|row| row.get_by_name("version").ok().flatten()))
@@ -2664,7 +2670,7 @@ impl CassandraEngine {
             pk,
             sk.map(|(value, _)| value),
             sk.map(|(_, col)| col.as_str()),
-            Some(Consistency::LocalSerial),
+            crate::cassandra_util::Stmt::SerialRead,
         )
         .await?
         else {
@@ -2810,7 +2816,11 @@ impl CassandraEngine {
                      IF prepared_txn_id = ? AND created_to_prepare = true",
                 );
                 self.session
-                    .query_with_values(&dq, cdrs_tokio::query_values!(op.pk.as_str(), txn_id_bytes))
+                    .run(
+                        Stmt::Lwt,
+                        &dq,
+                        cdrs_tokio::query_values!(op.pk.as_str(), txn_id_bytes),
+                    )
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))
             }
@@ -2852,7 +2862,8 @@ impl CassandraEngine {
                          WHERE pk = ? AND {sk_col} = ? IF prepared_txn_id = ?",
                     );
                     self.session
-                        .query_with_values(
+                        .run(
+                            Stmt::Lwt,
                             &query,
                             cdrs_tokio::query::QueryValues::SimpleValues(vec![
                                 item_data.into(),
@@ -2873,7 +2884,8 @@ impl CassandraEngine {
                          WHERE pk = ? IF prepared_txn_id = ?",
                     );
                     self.session
-                        .query_with_values(
+                        .run(
+                            Stmt::Lwt,
                             &query,
                             cdrs_tokio::query_values!(
                                 item_data,
@@ -2925,7 +2937,8 @@ impl CassandraEngine {
                 );
                 let r1 = self
                     .session
-                    .query_with_values(
+                    .run(
+                        Stmt::Lwt,
                         &update_null,
                         cdrs_tokio::query_values!(txn_timestamp, op.pk.as_str()),
                     )
@@ -2943,7 +2956,8 @@ impl CassandraEngine {
                     );
                     let _ = self
                         .session
-                        .query_with_values(
+                        .run(
+                            Stmt::Lwt,
                             &update_cmp,
                             cdrs_tokio::query_values!(txn_timestamp, op.pk.as_str(), txn_timestamp),
                         )
@@ -2968,7 +2982,8 @@ impl CassandraEngine {
                         "DELETE FROM {keyspace}.{table} WHERE pk = ? IF prepared_txn_id = ?",
                     );
                     self.session
-                        .query_with_values(
+                        .run(
+                            Stmt::Lwt,
                             &query,
                             cdrs_tokio::query_values!(op.pk.as_str(), txn_id_bytes),
                         )
@@ -3040,7 +3055,8 @@ impl CassandraEngine {
             );
             let dr = self
                 .session
-                .query_with_values(
+                .run(
+                    Stmt::Lwt,
                     &dq,
                     cdrs_tokio::query_values!(op.pk.as_str(), txn_id_bytes.clone()),
                 )
@@ -3062,7 +3078,8 @@ impl CassandraEngine {
             query_with_pk_sk_txnid(&self.session, &update_query, &op.pk, sk_val, txn_id_bytes).await
         } else {
             self.session
-                .query_with_values(
+                .run(
+                    Stmt::Lwt,
                     &update_query,
                     cdrs_tokio::query_values!(op.pk.as_str(), txn_id_bytes),
                 )

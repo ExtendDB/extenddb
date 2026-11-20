@@ -12,13 +12,13 @@ store's root:
   waits for the slot and is answered only once the first job has ended (the
   first backup AVAILABLE), and a third is accepted at once afterwards; a wait
   that outlives the 30 s bound is LimitExceededException naming the bound;
-- a table holding an `N` value the wire let in (#618: `1E126` or `abc` in a
-  non-key attribute, `1E126` in the range key of a key-ordered table) written
-  through each of the four paths that store it unvalidated (BatchWriteItem,
-  TransactWriteItems, UpdateItem on an absent item in the key it creates,
-  ImportTable) gives a FAILED row, no manifest under the root, three log
-  lines naming each item's key and attribute, and a FAILED reason giving the
-  count and the first item and naming #618;
+- a table holding items with an `N` value the service cannot store (#618:
+  `1E126` or `abc` in a non-key attribute, `1E126` or more in the range key
+  of a key-ordered table), in the shapes the write paths stored before they
+  checked numbers and written straight into the table's storage on each
+  backend, gives a FAILED row, no manifest under the root, three log lines
+  naming each item's key and attribute, and a FAILED reason giving the count
+  and the first item and naming #618;
 - an item over `max_item_size_bytes` (stored under the default limit, the
   server restarted with a lower one) gives a reason that does not name #618;
 - a refused item with a UUID hash key and a ten-digit epoch `N` range key is
@@ -183,12 +183,9 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
 
-import boto3
 import pytest
-import requests
-from botocore.auth import SigV4Auth
-from botocore.awsrequest import AWSRequest
 from botocore.exceptions import ClientError
 
 import lifecycle_helpers as lh
@@ -365,24 +362,6 @@ def _started(d: _Deployment, log_path: str) -> tuple[_Server, object, dict]:
         server.stop()
         raise
     return server, _client(d.port, creds), creds
-
-
-def _signed_post(d: _Deployment, creds: dict, operation: str, body: dict) -> requests.Response:
-    """A hand-signed request for an operation botocore's model would refuse
-    (ImportTable's `FileSource`)."""
-    body_bytes = json.dumps(body).encode("utf-8")
-    headers = {
-        "X-Amz-Target": f"DynamoDB_20120810.{operation}",
-        "Content-Type": "application/x-amz-json-1.0",
-    }
-    endpoint = f"https://127.0.0.1:{d.port}"
-    frozen = boto3.Session(
-        aws_access_key_id=creds["AWS_ACCESS_KEY_ID"],
-        aws_secret_access_key=creds["AWS_SECRET_ACCESS_KEY"],
-    ).get_credentials().get_frozen_credentials()
-    aws_req = AWSRequest(method="POST", url=endpoint, data=body_bytes, headers=headers)
-    SigV4Auth(frozen, "dynamodb", "us-east-1").add_auth(aws_req)
-    return requests.post(endpoint, data=body_bytes, headers=dict(aws_req.headers), verify=False)
 
 
 def _wait_active(ddb, name: str, timeout: float = 60.0) -> None:
@@ -617,111 +596,197 @@ def _load(d: _Deployment, creds: dict, name: str, n: int) -> None:
         list(pool.map(write, range(0, n, 25)))
 
 
-# The three items each path stores: `1E126` and `abc` in a non-key attribute
-# and `1E126` in the range key (an `abc` range key is refused by the number
-# column on PostgreSQL and SQLite, so no path stores one). UpdateItem
-# validates the values its expression sets, so its three items carry the bad
-# value in the key it creates.
+# Items holding an `N` value the service cannot store (#618), in the shapes
+# the write paths stored before they checked numbers. `values`: `1E126` and
+# `abc` in non-key attributes and `1E126` in the range key, as BatchWriteItem,
+# TransactWriteItems and ImportTable stored them. `keys`: three range keys out
+# of range, as UpdateItem stored them on an absent item, in the key it
+# created. Each path refuses them now, so the cells write them into the
+# table's storage (`_seed_stored_items`): the backup's check of stored items
+# guards the items a table still holds from before. An `abc` range key has no
+# stored form, since every backend's range key column holds a number or an
+# order-preserving text of one.
 BAD_ITEMS = [
     {"pk": {"S": "a"}, "sk": {"N": "1"}, "amount": {"N": "1E126"}},
     {"pk": {"S": "a"}, "sk": {"N": "2"}, "note": {"N": "abc"}},
     {"pk": {"S": "b"}, "sk": {"N": "1E126"}},
 ]
 BAD_KEYS = [
-    {"pk": {"S": "a"}, "sk": {"N": "1E126"}},
-    {"pk": {"S": "b"}, "sk": {"N": "1E127"}},
-    {"pk": {"S": "c"}, "sk": {"N": "1E128"}},
+    {"pk": {"S": "a"}, "sk": {"N": "1E126"}, "note": {"S": "created from the key"}},
+    {"pk": {"S": "b"}, "sk": {"N": "1E127"}, "note": {"S": "created from the key"}},
+    {"pk": {"S": "c"}, "sk": {"N": "1E128"}, "note": {"S": "created from the key"}},
 ]
+STORED_ITEMS = {"values": BAD_ITEMS, "keys": BAD_KEYS}
 GOOD_ITEMS = [{"pk": {"S": "z"}, "sk": {"N": str(i)}, "amount": {"N": str(i)}} for i in range(5)]
 
 
-def _write_batch(d, ddb, creds, name):
-    _create_composite_table(ddb, name)
-    ddb.batch_write_item(
-        RequestItems={name: [{"PutRequest": {"Item": i}} for i in BAD_ITEMS + GOOD_ITEMS]}
-    )
-    return BAD_ITEMS
+def _seed_cell(d: _Deployment) -> None:
+    """The cells that seed stored items write a MongoDB deployment's
+    documents with `mongosh` in the replica set's container (`_mongosh`),
+    which `EXTENDDB_TEST_MONGODB_CONTAINER` names."""
+    if d.backend == "mongodb" and not _mongodb_container():
+        pytest.skip("EXTENDDB_TEST_MONGODB_CONTAINER is unset: the MongoDB items are seeded with mongosh in it")
 
 
-def _write_transact(d, ddb, creds, name):
-    _create_composite_table(ddb, name)
-    ddb.transact_write_items(
-        TransactItems=[{"Put": {"TableName": name, "Item": i}} for i in BAD_ITEMS + GOOD_ITEMS]
-    )
-    return BAD_ITEMS
+def _key_text(value: dict) -> str:
+    """A key attribute's text in storage: the `S` or `N` as written."""
+    (text,) = value.values()
+    return text
 
 
-def _write_update(d, ddb, creds, name):
-    _create_composite_table(ddb, name)
-    for key in BAD_KEYS:
-        ddb.update_item(
-            TableName=name,
-            Key=key,
-            UpdateExpression="SET note = :v",
-            ExpressionAttributeValues={":v": {"S": "created from the key"}},
+def _sqlite_number_key(n: str) -> str:
+    """The SQLite backend's text for an `N` range key, as
+    `encode_orderable_number` (crates/storage-sqlite/src/number_key.rs)
+    writes it: `1` for zero; otherwise a class digit (`2` for a positive
+    value, `0` for a negative one), the exponent `E` of the form
+    `0.d1d2... x 10^E` in six digits (100000 + E, or 100000 - E for a
+    negative value), and the digits without trailing zeros (for a negative
+    value each digit complemented to 9 - d, then `:`)."""
+    value = Decimal(n)
+    if value == 0:
+        return "1"
+    sign, digits, exponent = value.as_tuple()
+    digits = list(digits)
+    while digits[-1] == 0:
+        digits.pop()
+        exponent += 1
+    e = len(digits) + exponent
+    if sign:
+        return f"0{100000 - e:06d}" + "".join(str(9 - x) for x in digits) + ":"
+    return f"2{100000 + e:06d}" + "".join(str(x) for x in digits)
+
+
+def _mongodb_id(item: dict) -> str:
+    """A MongoDB base-table document's `_id`: the hash and range key texts
+    as a netstring, `<bytes>:<text>,` each (`composite_id` in
+    crates/storage-mongodb/src/data/mod.rs)."""
+    parts = [_key_text(item["pk"]), _key_text(item["sk"])]
+    return "".join(f"{len(p.encode())}:{p}," for p in parts)
+
+
+def _pg_data_connection_string(catalog: str) -> str:
+    """The data database's connection string: `init` names the data
+    database after the catalog, less the `_catalog` suffix."""
+    base, _, database = catalog.rpartition("/")
+    assert database.endswith("_catalog"), catalog
+    return f"{base}/{database[: -len('_catalog')]}"
+
+
+def _seed_stored_items(d: _Deployment, name: str, items: list[dict]) -> None:
+    """Write `items` into the storage of the key-ordered table `name` (hash
+    key `pk` S, range key `sk` N) past the wire, which refuses them, in the
+    form the server writes an item:
+
+    - SQLite: a row of `"_ddb_<table id>"` in the database file, with `pk`
+      the hash key's text, `sk_n` the range key's text from
+      `_sqlite_number_key` and `item_data` the item as DynamoDB JSON;
+    - PostgreSQL: the same row in the data database, with `sk_n` a
+      `NUMERIC` and `item_data` a `JSONB`;
+    - MongoDB: a document of `extenddb_data._ddb_<table id>` holding `_id`
+      (`_mongodb_id`), `pk`, `sk_n` as a Decimal128 and `item_data`, written
+      with `mongosh` in the replica set's container.
+
+    The table id is read from the catalog. The caller writes `GOOD_ITEMS`
+    through the wire first, and the form is checked against the one the
+    server stored for `GOOD_ITEMS[0]`: a change to the stored form fails
+    here, before any row the server might not read is written."""
+    good = GOOD_ITEMS[0]
+    if d.backend == "mongodb":
+        table_id = _mongosh(
+            f"const t = db.tables.findOne({{'_id.account_id': {json.dumps(ACCOUNT)}, "
+            f"'_id.table_name': {json.dumps(name)}}});\nprint(JSON.stringify(t.table_id))"
         )
-    for item in GOOD_ITEMS:
-        ddb.put_item(TableName=name, Item=item)
-    return BAD_KEYS
+        coll = f'db.getSiblingDB("extenddb_data").getCollection({json.dumps("_ddb_" + table_id)})'
+        row = _mongosh(
+            f"const g = {coll}.findOne({{_id: {json.dumps(_mongodb_id(good))}}});\n"
+            "print(JSON.stringify(g && {pk: g.pk, sk_n: g.sk_n.toString(), item_data: g.item_data}))"
+        )
+        assert row and row["pk"] == _key_text(good["pk"]), row
+        assert Decimal(row["sk_n"]) == Decimal(good["sk"]["N"]) and row["item_data"] == good, row
+        docs = ", ".join(
+            f"{{_id: {json.dumps(_mongodb_id(i))}, pk: {json.dumps(_key_text(i['pk']))}, "
+            f"sk_n: NumberDecimal({json.dumps(i['sk']['N'])}), item_data: {json.dumps(i)}}}"
+            for i in items
+        )
+        n = _mongosh(f"print(Object.keys({coll}.insertMany([{docs}]).insertedIds).length)")
+        assert n == len(items), n
+        return
+    rows = [(_key_text(i["pk"]), i["sk"]["N"], json.dumps(i, separators=(",", ":"))) for i in items]
+    if d.backend == "sqlite":
+        try:
+            import pysqlite3 as sqlite3
+        except ImportError:
+            import sqlite3
+        conn = sqlite3.connect(d.catalog, timeout=10)
+        try:
+            found = conn.execute(
+                "SELECT table_id FROM tables WHERE account_id = ? AND table_name = ?", (ACCOUNT, name)
+            ).fetchone()
+            assert found, f"no catalog row for {name}"
+            data = f'"_ddb_{found[0]}"'
+            row = conn.execute(
+                f"SELECT item_data FROM {data} WHERE pk = ? AND sk_n = ?",
+                (_key_text(good["pk"]), _sqlite_number_key(good["sk"]["N"])),
+            ).fetchone()
+            assert row and json.loads(row[0]) == good, row
+            conn.executemany(
+                f"INSERT INTO {data} (pk, sk_n, item_data) VALUES (?, ?, ?)",
+                [(pk, _sqlite_number_key(sk), item) for pk, sk, item in rows],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return
+    import psycopg2
 
-
-def _write_import(d, ddb, creds, name):
-    path = os.path.join(d.cwd, ACCOUNT, f"{name}.json")
-    with open(path, "w") as f:
-        for item in BAD_ITEMS + GOOD_ITEMS:
-            f.write(json.dumps({"Item": item}) + "\n")
-    resp = _signed_post(
-        d,
-        creds,
-        "ImportTable",
-        {
-            "FileSource": {"Path": path},
-            "InputFormat": "DYNAMODB_JSON",
-            "TableCreationParameters": {
-                "TableName": name,
-                "AttributeDefinitions": [
-                    {"AttributeName": "pk", "AttributeType": "S"},
-                    {"AttributeName": "sk", "AttributeType": "N"},
-                ],
-                "KeySchema": [
-                    {"AttributeName": "pk", "KeyType": "HASH"},
-                    {"AttributeName": "sk", "KeyType": "RANGE"},
-                ],
-                "BillingMode": "PAY_PER_REQUEST",
-            },
-        },
-    )
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["ImportTableDescription"]["ImportStatus"] == "COMPLETED", resp.text
-    _wait_active(ddb, name)
-    return BAD_ITEMS
-
-
-WRITE_PATHS = {
-    "batch_write_item": _write_batch,
-    "transact_write_items": _write_transact,
-    "update_item": _write_update,
-    "import_table": _write_import,
-}
+    conn = psycopg2.connect(d.catalog)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT table_id FROM tables WHERE account_id = %s AND table_name = %s", (ACCOUNT, name))
+            found = cur.fetchone()
+    finally:
+        conn.close()
+    assert found, f"no catalog row for {name}"
+    data = f'"_ddb_{found[0]}"'
+    conn = psycopg2.connect(_pg_data_connection_string(d.catalog))
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT item_data FROM {data} WHERE pk = %s AND sk_n = %s::numeric",
+                (_key_text(good["pk"]), good["sk"]["N"]),
+            )
+            row = cur.fetchone()
+            assert row and row[0] == good, row
+            cur.executemany(f"INSERT INTO {data} (pk, sk_n, item_data) VALUES (%s, %s::numeric, %s::jsonb)", rows)
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _key_json(item: dict) -> str:
     return json.dumps({"pk": item["pk"], "sk": item["sk"]}, separators=(",", ":"))
 
 
-@pytest.mark.parametrize("path", sorted(WRITE_PATHS))
-def test_an_item_the_wire_let_in_fails_the_backup(deployment, tmp_path, path):
-    """Three items with an `N` value #618 let in, stored through one write
-    path, and five that restore: CreateBackup answers CREATING, the job
-    validates every item (three log lines, one per item, with its key and
-    attribute path), the row is FAILED with a reason giving the count and
-    the first item and naming #618, DescribeBackup is BackupNotFound,
-    ListBackups omits it, and no manifest is under the root."""
+@pytest.mark.parametrize("kind", sorted(STORED_ITEMS))
+def test_a_stored_item_holding_an_invalid_number_fails_the_backup(deployment, tmp_path, kind):
+    """Three stored items holding an `N` value the service cannot store
+    (#618), written into the table's storage in the shapes the write paths
+    stored before they checked numbers (`_seed_stored_items`; `kind` names
+    the set in `STORED_ITEMS`), and five that restore: CreateBackup answers
+    CREATING, the job validates every item (three log lines, one per item,
+    with its key and attribute path), the row is FAILED with a reason giving
+    the count and the first item and naming #618, DescribeBackup is
+    BackupNotFound, ListBackups omits it, and no manifest is under the
+    root."""
     d = deployment
-    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    _seed_cell(d)
+    server, ddb, _ = _started(d, str(tmp_path / "serve.log"))
     try:
-        name = f"n618-{path.replace('_', '')}-{uuid.uuid4().hex[:6]}"
-        bad = WRITE_PATHS[path](d, ddb, creds, name)
+        name = f"n618-{kind}-{uuid.uuid4().hex[:6]}"
+        _create_composite_table(ddb, name)
+        ddb.batch_write_item(RequestItems={name: [{"PutRequest": {"Item": i}} for i in GOOD_ITEMS]})
+        bad = STORED_ITEMS[kind]
+        _seed_stored_items(d, name, bad)
         stored = ddb.scan(TableName=name, ConsistentRead=True)["Items"]
         assert len(stored) == len(bad) + len(GOOD_ITEMS), stored
         details = ddb.create_backup(TableName=name, BackupName="nightly")["BackupDetails"]
@@ -751,18 +816,21 @@ def test_an_item_the_wire_let_in_fails_the_backup(deployment, tmp_path, path):
 
 
 def test_a_refused_item_with_a_uuid_and_epoch_key_is_named_whole(deployment, tmp_path):
-    """One refused item with a realistic key, a UUID hash key and a ten-digit
-    epoch range key, and `amount: abc`: the log line and the FAILED reason
-    carry the whole key as DynamoDB JSON (`{"pk":{"S":"<uuid>"},"sk":{"N":
-    "1761955200"}}`), not a shortened form, and the wire's reason for the
-    value, so an operator can find the item from either."""
+    """One stored item the backup refuses, written into storage as
+    `_seed_stored_items` does, with a realistic key, a UUID hash key and a
+    ten-digit epoch range key, and `amount: abc`: the log line and the FAILED
+    reason carry the whole key as DynamoDB JSON (`{"pk":{"S":"<uuid>"},"sk":
+    {"N":"1761955200"}}`), not a shortened form, and the wire's reason for
+    the value, so an operator can find the item from either."""
     d = deployment
+    _seed_cell(d)
     server, ddb, _ = _started(d, str(tmp_path / "serve.log"))
     try:
         name = f"n618-key-{uuid.uuid4().hex[:6]}"
         _create_composite_table(ddb, name)
+        ddb.batch_write_item(RequestItems={name: [{"PutRequest": {"Item": i}} for i in GOOD_ITEMS]})
         item = {"pk": {"S": str(uuid.uuid4())}, "sk": {"N": "1761955200"}, "amount": {"N": "abc"}}
-        ddb.batch_write_item(RequestItems={name: [{"PutRequest": {"Item": i}} for i in [item] + GOOD_ITEMS]})
+        _seed_stored_items(d, name, [item])
         arn = ddb.create_backup(TableName=name, BackupName="nightly")["BackupDetails"]["BackupArn"]
         _wait_backup_gone(ddb, arn)
         key = _key_json(item)
@@ -933,10 +1001,8 @@ def test_a_tampered_data_file_fails_the_restore_before_any_item(deployment, tmp_
     a file is loaded reads "data file <key>: data file sha256 checksum
     mismatch" or, when the flipped byte sits in the gzip trailer so the
     decoder's own CRC fires first, "data file <key>: data file decode error:
-    corrupt gzip stream does not have a matching checksum" instead. A
-    CREATING target answers no read whatever the job did, so the GetItem
-    probe below only confirms the target never became readable. The backup
-    itself stays AVAILABLE."""
+    corrupt gzip stream does not have a matching checksum" instead. The
+    backup itself stays AVAILABLE."""
     d = deployment
     _restore_cell(d)
     _add_backup_settings(d, RESTORE_BACKUP_SETTINGS)
@@ -949,33 +1015,10 @@ def test_a_tampered_data_file_fails_the_restore_before_any_item(deployment, tmp_
             last = f.read(1)
             f.seek(-1, os.SEEK_END)
             f.write(bytes([last[0] ^ 0xFF]))
-        target = f"{name}-r"
-        resp = ddb.restore_table_from_backup(TargetTableName=target, BackupArn=arn)["TableDescription"]
-        assert resp["TableStatus"] == "CREATING", resp
-        assert resp["RestoreSummary"]["SourceBackupArn"] == arn, resp
-        readable = []
-        deadline = time.monotonic() + 120
-        while time.monotonic() < deadline:
-            try:
-                got = ddb.get_item(TableName=target, Key={"pk": {"S": "p0000"}, "sk": {"N": "0"}}, ConsistentRead=True)
-                if "Item" in got:
-                    readable.append(got["Item"])
-            except ClientError:
-                pass
-            try:
-                ddb.describe_table(TableName=target)
-            except ClientError as e:
-                assert e.response["Error"]["Code"] == "ResourceNotFoundException", e.response["Error"]
-                break
-            time.sleep(0.2)
-        else:
-            raise AssertionError(f"{target} was not removed within 120 s")
-        assert readable == [], f"an item of the failed restore was readable: {readable[:1]}"
-        log = server.log_text()
-        failed = [line for line in log.splitlines() if "FAILED (data file data/000002.json.gz does not match the manifest" in line]
-        assert len(failed) == 1, log[-4000:]
-        assert "the target was removed" in failed[0], failed[0]
-        assert ddb.describe_backup(BackupArn=arn)["BackupDescription"]["BackupDetails"]["BackupStatus"] == "AVAILABLE"
+        _restore_fails(
+            server, ddb, f"{name}-r", arn,
+            "FAILED (data file data/000002.json.gz does not match the manifest",
+        )
     finally:
         server.stop()
 
@@ -1099,16 +1142,10 @@ def test_a_store_outage_mid_download_leaves_the_restore_running_and_it_completes
     moto_host, moto_port = _moto_or_skip()
     bucket = moto_bucket
     base = os.path.realpath(str(tmp_path))
-    port = _free_port()
-    store = (
-        '[backup.store]\nkind = "s3"\n[backup.store.s3]\n'
-        f'bucket = "{bucket}"\nendpoint = "http://127.0.0.1:{port}"\n'
-        'force_path_style = true\nregion = "us-east-1"\n'
-    )
     if _sqlite_build():
         sd = _SqliteDeployment(str(tmp_path))
         spool = os.path.join(base, "backup-spool")
-        _append(sd.config, "[backup]\nreconcile_interval_secs = 1\nmax_concurrent_jobs = 1\n" + RESTORE_BACKUP_SETTINGS + store)
+        _append(sd.config, "[backup]\nreconcile_interval_secs = 1\nmax_concurrent_jobs = 1\n" + RESTORE_BACKUP_SETTINGS)
         d = _Deployment("sqlite", sd.config, sd.port, "", sd.cert, base)
     elif _pg_build():
         cli_env = request.getfixturevalue("cli_env")
@@ -1123,12 +1160,20 @@ def test_a_store_outage_mid_download_leaves_the_restore_running_and_it_completes
             cli_env["config_path"],
             "[backup]\nreconcile_interval_secs = 1\nmax_concurrent_jobs = 1\n"
             + RESTORE_BACKUP_SETTINGS
-            + f'spool_path = "{spool}"\n'
-            + store,
+            + f'spool_path = "{spool}"\n',
         )
         d = _Deployment("postgres", cli_env["config_path"], cli_env["port"], "", os.path.join(cli_env["tls_dir"], "cert.pem"), base)
     else:
         pytest.skip("EXTENDDB_BINARY is neither a SQLite nor a PostgreSQL build")
+    # Picked after the server's port, and never equal to it: the forwarder
+    # binds this port before the server starts.
+    port = _free_port(d.port)
+    _append(
+        d.config,
+        '[backup.store]\nkind = "s3"\n[backup.store.s3]\n'
+        f'bucket = "{bucket}"\nendpoint = "http://127.0.0.1:{port}"\n'
+        'force_path_style = true\nregion = "us-east-1"\n',
+    )
     forwarder = _Forwarder(port, (moto_host, moto_port))
     server = _Server(d.config, str(tmp_path / "serve.log"), env=_s3_env())
     try:
@@ -2145,12 +2190,15 @@ def test_a_second_maintenance_command_fails_at_once_beside_a_live_holder(deploym
     d = deployment
     if d.backend == "sqlite":
         pytest.skip("on SQLite the serve lock refuses a second writing command before any claim is read")
+    _seed_cell(d)
     import subprocess
 
-    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    server, ddb, _ = _started(d, str(tmp_path / "serve.log"))
     try:
         name = f"n618-claim-{uuid.uuid4().hex[:6]}"
-        _write_batch(d, ddb, creds, name)
+        _create_composite_table(ddb, name)
+        ddb.batch_write_item(RequestItems={name: [{"PutRequest": {"Item": i}} for i in GOOD_ITEMS]})
+        _seed_stored_items(d, name, BAD_ITEMS)
         arn = ddb.create_backup(TableName=name, BackupName="refused")["BackupDetails"]["BackupArn"]
         deadline = time.monotonic() + 90
         while arn not in _failed_rows(d):
@@ -3619,14 +3667,16 @@ def test_a_create_backup_during_the_moves_wait_is_refused(deployment, tmp_path):
 
 def test_a_row_that_lands_during_the_moves_sync_exits_1(deployment, tmp_path):
     """Beside servers (PostgreSQL): server A stays on the old root, server B
-    runs on a new root holding a copy of the old tree and 2,000 junk
-    prefixes (so the move's sync lists for a while). A CreateBackup on A
-    passes its claim reads and is held in its CREATING insert by a trigger;
-    `--move-store <old root>` then moves the old row, and the trigger lets
-    the insert go once the move prints that it syncs the configured store.
-    The job's row lands under the old root during that sync: the closing
-    report names it under "Rows that landed under the old root during the
-    move" and the command exits 1, naming the remedy."""
+    runs on a new root holding a copy of the old tree, which includes one
+    complete backup whose row was dropped, so the move's sync adopts it. A
+    CreateBackup on A passes its claim reads and is held in its CREATING
+    insert by a trigger; `--move-store <old root>` then moves the old row,
+    and the trigger lets the insert go once the move prints that it syncs
+    the configured store. A second trigger holds the sync's adoption insert
+    until the late row has committed, so the late row lands during the sync
+    whatever the runner's speed: the closing report names it under "Rows
+    that landed under the old root during the move" and the command exits
+    1, naming the remedy."""
     d = deployment
     if d.backend == "sqlite":
         pytest.skip("on SQLite the serve lock keeps every server stopped during the move")
@@ -3650,6 +3700,14 @@ def test_a_row_that_lands_during_the_moves_sync_exits_1(deployment, tmp_path):
         creds = _provision(d.port, d.cert, ADMIN_PASSWORD)
         ddb_a = _client(d.port, creds)
         name, moved = _small_backed_up_table(ddb_a, "landed")
+        # A complete backup under the old root with no row: the move leaves
+        # it (it moves rows only), and the move's sync adopts it from the
+        # copy. Its adoption insert is the sync's one `backup_index` write,
+        # and it comes before the closing report's read of the other stores'
+        # rows.
+        adoptee = ddb_a.create_backup(TableName=name, BackupName="adoptee")["BackupDetails"]["BackupArn"]
+        _wait_backup_available(ddb_a, adoptee, timeout=60)
+        _drop_row(d, adoptee)
         new = os.path.join(d.cwd, "backups-new")
         os.mkdir(new, 0o700)
         new = os.path.realpath(new)
@@ -3663,11 +3721,6 @@ def test_a_row_that_lands_during_the_moves_sync_exits_1(deployment, tmp_path):
             server=b,
         )
         _copy_tree_into(old, new)
-        for i in range(2000):
-            _private_file(
-                os.path.join(new, ACCOUNT, "junk", f"0179{i:010d}-0000abcd", "data", "000001.json.gz"),
-                b"x",
-            )
         _catalog(d, "CREATE TABLE landed_release (x int)", ())
         _catalog(
             d,
@@ -3680,6 +3733,25 @@ def test_a_row_that_lands_during_the_moves_sync_exits_1(deployment, tmp_path):
             d,
             "CREATE TRIGGER landed_hold BEFORE INSERT ON backup_index FOR EACH ROW "
             "WHEN (NEW.status = 'CREATING') EXECUTE FUNCTION landed_hold()",
+            (),
+        )
+        # The sync's adoption insert waits for the late row, which orders the
+        # late row's commit before the report's read. After 30 s it fails
+        # the insert instead, so a cell that never released says so.
+        _catalog(
+            d,
+            "CREATE OR REPLACE FUNCTION landed_gate() RETURNS trigger AS $$ BEGIN "
+            "FOR i IN 1..600 LOOP "
+            "IF EXISTS (SELECT 1 FROM backup_index WHERE backup_name = 'late') THEN RETURN NEW; END IF; "
+            "PERFORM pg_sleep(0.05); END LOOP; "
+            "RAISE EXCEPTION 'landed_gate: the late row did not land within 30 s'; "
+            "END $$ LANGUAGE plpgsql",
+            (),
+        )
+        _catalog(
+            d,
+            "CREATE TRIGGER landed_gate BEFORE INSERT ON backup_index FOR EACH ROW "
+            "WHEN (NEW.status = 'AVAILABLE') EXECUTE FUNCTION landed_gate()",
             (),
         )
         held = True
@@ -3732,11 +3804,14 @@ def test_a_row_that_lands_during_the_moves_sync_exits_1(deployment, tmp_path):
         assert late is not None, result
         assert released, "the move's sync line was printed before it ended"
         assert f"Moved (each row now names the configured store):\n  {moved}" in text, text[-4000:]
+        assert _adopted_section(text).splitlines()[1:-1] == [f"  {adoptee}"], text[-4000:]
         assert "--- Rows that landed under the old root during the move:\n  " + late in text, text[-4000:]
         assert rc == 1, text[-4000:]
         assert "a row landed under the old root during the move (1 listed above)" in text, text[-4000:]
     finally:
         if held:
+            _catalog(d, "DROP TRIGGER IF EXISTS landed_gate ON backup_index", ())
+            _catalog(d, "DROP FUNCTION IF EXISTS landed_gate()", ())
             _catalog(d, "DROP TRIGGER IF EXISTS landed_hold ON backup_index", ())
             _catalog(d, "DROP FUNCTION IF EXISTS landed_hold()", ())
             _catalog(d, "DROP TABLE IF EXISTS landed_release", ())
@@ -4532,9 +4607,10 @@ def test_a_backup_deleted_after_a_stopped_migration_never_comes_back(deployment,
 
 def test_migrate_legacy_refuses_a_13_digit_id_or_an_item_618_let_in_and_keeps_both(deployment, tmp_path):
     """Three in-catalog backups: one of a table holding three items with an
-    `N` value #618 let in (BatchWriteItem), one of a table that restores,
-    and (SQLite, PostgreSQL) a copy of the second's rows under a 13-digit
-    backup id, the shape every 0.1.x release issued. `migrate-legacy --all`
+    `N` value #618 let in (written into storage, `_seed_stored_items`), one
+    of a table that restores, and (SQLite, PostgreSQL) a copy of the
+    second's rows under a 13-digit backup id, the shape that 0.1.14 and earlier
+    releases issued. `migrate-legacy --all`
     migrates the second and goes on past the other two, each refused with
     its reason and its way out (the item count, the first item and #618;
     the id of the 13-digit shape), and exits 1 naming the two. The refused
@@ -4543,6 +4619,7 @@ def test_migrate_legacy_refuses_a_13_digit_id_or_an_item_618_let_in_and_keeps_bo
     restores through the in-catalog reader and a new backup of the restored
     table is store-backed under a new ARN."""
     d = deployment
+    _seed_cell(d)
     _set_store_disabled(d)
     server = _Server(d.config, str(tmp_path / "serve-disabled.log"))
     try:
@@ -4550,7 +4627,10 @@ def test_migrate_legacy_refuses_a_13_digit_id_or_an_item_618_let_in_and_keeps_bo
         creds = _provision(d.port, d.cert, ADMIN_PASSWORD)
         ddb = _client(d.port, creds)
         bad_table = f"n618-legacy-{uuid.uuid4().hex[:6]}"
-        bad = _write_batch(d, ddb, creds, bad_table)
+        _create_composite_table(ddb, bad_table)
+        ddb.batch_write_item(RequestItems={bad_table: [{"PutRequest": {"Item": i}} for i in GOOD_ITEMS]})
+        bad = BAD_ITEMS
+        _seed_stored_items(d, bad_table, bad)
         bad_arn = ddb.create_backup(TableName=bad_table, BackupName="nightly")["BackupDetails"]["BackupArn"]
         _wait_backup_available(ddb, bad_arn, timeout=60)
         name, good = _small_backed_up_table(ddb, "legacy")
@@ -4585,8 +4665,8 @@ def test_migrate_legacy_refuses_a_13_digit_id_or_an_item_618_let_in_and_keeps_bo
         refusals = 2 if old else 1
         if old:
             assert (
-                f"refused {old} (account {ACCOUNT}): its backup id {_backup_id(old)} has the 13-digit shape a "
-                "0.1.x release issued, and a store prefix carries only the 14-digit shape; restore it "
+                f"refused {old} (account {ACCOUNT}): its backup id {_backup_id(old)} has the 13-digit shape that "
+                "0.1.14 and earlier releases issued, and a store prefix carries only the 14-digit shape; restore it "
                 "(RestoreTableFromBackup) and take a new backup of the restored table, which has a new ARN. "
                 "Its in-catalog backup is kept"
             ) in res.stdout, out

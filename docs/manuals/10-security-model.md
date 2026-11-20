@@ -19,14 +19,29 @@ This document describes the security architecture of extenddb, including the thr
 1. **Client ↔ extenddb**: Untrusted. All input is validated. SigV4 signatures are verified. IAM policies are evaluated.
 2. **extenddb ↔ PostgreSQL**: Trusted network. The PostgreSQL connection string contains credentials. Use TLS for the PostgreSQL connection in production (`sslmode=require` in the connection string).
 3. **Admin ↔ Management API/Console**: Authenticated via admin credentials or IAM user credentials. CSRF tokens protect the web console.
-4. **Catalog database contents**: Credential-equivalent. The AES-256-GCM key that encrypts access key secrets lives in the catalog `settings` table alongside the ciphertext it protects, so read access to the catalog database yields every stored access key secret. On PostgreSQL the same table holds `data_database_connection_string`, the login for the data database; the console, the management API and the `settings` CLI mask it, but a reader of the catalog database gets it in full. Treat catalog read access, and any catalog backup, as equivalent to holding those credentials. See [Credential Storage](#credential-storage).
-5. **Server host**: Credential-equivalent as well. `extenddb.toml` holds the catalog connection string, and a running server keeps the encryption key and recently used decrypted secrets in process memory, so read access to the config file, a core dump of the server, or a read of its memory yields the same credentials.
+4. **Catalog database contents**: Credential-equivalent in the default configuration. Without `[auth.encryption] key_file`, the AES-256-GCM key that encrypts access key secrets (the catalog key) lives in the catalog `settings` table alongside the ciphertext it protects, so read access to the catalog database yields every stored access key secret. With `key_file` set, the catalog holds only the data encryption key (DEK) wrapped under a key-encryption key (KEK) kept in a file on the server host, so a reader of the catalog or of a catalog copy gets no stored secret unless they also hold the KEK, or the copy predates the switch to the KEK file. On PostgreSQL the same table holds `data_database_connection_string`, the login for the data database; the console, the management API and the `settings` CLI mask it, and without `key_file` a reader of the catalog database gets it in full. After the switch that row is encrypted under the DEK as well. Treat catalog read access, and any catalog backup taken without a KEK file, as equivalent to holding those credentials. See [Credential Storage](#credential-storage) and [Attackers and what each gets](#attackers-and-what-each-gets).
+5. **Server host**: Credential-equivalent as well. `extenddb.toml` holds the catalog connection string. A running server keeps the key that opens stored secrets (the catalog key or the DEK) and one SigV4 signing key per access key and scope date in the locked key store, memory that stays out of swap and out of core dumps; it holds no plaintext secret outside the moment of a cache miss. Read access to the config file yields the catalog login. Root on the host can read the server's memory and therefore the DEK, under every delivery route of the KEK file.
 
 ### Out of Scope
 
 - **PostgreSQL security**: extenddb relies on PostgreSQL access controls and network security. Securing the PostgreSQL instance (firewall rules, TLS, authentication) is the operator's responsibility.
-- **Operating system security**: File permissions on `extenddb.toml`, TLS keys, and the PID file are the operator's responsibility.
-- **Key management**: extenddb generates the credential encryption key locally and stores it unwrapped in the catalog database. It does not wrap the key with an external KMS or HSM, derive it from an operator passphrase, or rotate it. Deployments that require any of those must add protection below extenddb, for example an encrypted volume, a managed database with a customer-managed KMS key, or a PostgreSQL distribution that adds transparent data encryption. That protects the key at rest but not from a principal that can query the catalog.
+- **Operating system security**: File permissions on `extenddb.toml`, TLS keys, and the PID file are the operator's responsibility. The server sets the modes of the export files and of the import and export directories it creates ([Import and Export Files](#import-and-export-files)).
+- **Key management**: extenddb generates the credential encryption key locally. By default it stores that key unwrapped in the catalog database. With `[auth.encryption] key_file` set, it keeps the key-encryption key in a file outside the catalog, which any tool that delivers a secret to a service as a file can hold: systemd credentials sealed to a Trusted Platform Module (TPM), a Kubernetes Secret volume, a Docker swarm or Podman secret (the admin guide's [Encryption Key](05-admin-guide.md#encryption-key) section). extenddb does not use a network key service, and it has no hardware key source of its own in this release: root on the running host can read the KEK file through every delivery route and the DEK from the server's memory. Deployments that must keep the key from root need protection below extenddb, for example an encrypted volume or a managed database with a customer-managed KMS key.
+
+### Attackers and what each gets
+
+The table gives, for each attacker, what a deployment on the catalog key (the default) exposes and what one on a KEK file exposes.
+
+| Attacker | Catalog key (the default) | KEK file (`key_file` set) |
+|---|---|---|
+| A reader of a catalog copy | Every stored secret, because the copy holds the catalog key | No secret, unless the copy predates the switch to the KEK file (it holds the catalog key) or the reader also holds the KEK. A physical copy of PostgreSQL, MongoDB or Cassandra taken after the switch can still hold the deleted `encryption_key` row: a write-ahead log archive, an SSTable before compaction, an oplog entry. [Backups](#backup-and-recovery) says what to do about that |
+| A reader of the server's memory (heap leak, core dump, swap) | The key that opens stored secrets, and the signing keys valid for one scope date, in locked pages that core dumps exclude. No plaintext secret outside the moment of a cache miss | The same, with the DEK as the key |
+| Root on the running host | The catalog key and every secret | The DEK, under every delivery route |
+| A catalog writer | Admin control, with no key (below) | The same |
+
+A catalog writer, anyone who can write rows into the catalog database without an ExtendDB server, is out of scope. With no key at all, a writer can replace an admin's or an IAM user's password hash and take that user's control, write any policy document or role trust policy, and deny service by deleting or replacing the key rows. Encryption cannot protect against any of these. Each stored secret written under a DEK is bound to its row through the additional authenticated data (AAD) of AES-GCM (the catalog id, the table, the access key ID, the account, the user or role name, the session name and the expiry), so a writer who holds no key cannot reassign a secret to another principal, extend a session, or carry a secret into another deployment. A catalog key row that a writer inserts after the switch stops the server and is never taken as an old key by the commands the server's messages name.
+
+Some plaintext stays in memory as today: the TLS private key inside rustls, the database passwords in the configuration and in the connection pools, and the console session tokens. The response of one CreateAccessKey or AssumeRole request holds a secret for the life of that request. The catalog keeps each session token in plaintext as the primary key of `iam_sessions`.
 
 ## Authentication
 
@@ -59,21 +74,24 @@ Request bodies are parsed before authentication (the service does the same), so 
 
 #### Credential Storage
 
-- Secret keys encrypted with AES-256-GCM using a per-catalog encryption key
-- Encryption key generated during `extenddb init` and stored unwrapped in the catalog `settings` table, under the key `encryption_key`
-- The encryption key and the ciphertext it protects therefore share one trust domain: anyone who can read the catalog database can decrypt every stored access key secret. Restrict catalog database access to the extenddb service account, and protect catalog backups to the same standard as the credentials themselves.
-- The management API and web console redact `encryption_key` from settings responses. The key is readable only with catalog database access: a database client, or `extenddb settings get encryption_key --show-secret` on a host that holds the catalog connection string.
-- extenddb has no command to rotate the encryption key, and `extenddb settings set` refuses `encryption_key`. Replacing the key by hand in the catalog `settings` table makes every stored access key secret and session credential unreadable. The server reads the key at startup and keeps it in memory, so a rotation takes these steps in order:
-    1. Replace the value of `encryption_key` in the catalog `settings` table with 32 random bytes in standard base64, for example the output of `openssl rand -base64 32`. On MongoDB the key is the `value` field of the `settings` document whose `_id` is `encryption_key`. The server checks only that the key is present. A value of any other form makes every signed request, CreateAccessKey call and AssumeRole call fail.
+- Secret keys encrypted with AES-256-GCM. The key that encrypts them depends on `[auth.encryption] key_file`:
+    - Not set (the default): the catalog key, generated during `extenddb init` and stored unwrapped in the catalog `settings` table, under the key `encryption_key`. The additional authenticated data (AAD) of each secret is its access key ID.
+    - Set: the data encryption key (DEK), a 32-byte key that the catalog holds wrapped under the key-encryption key (KEK) in that file, in the `settings` row `encryption_key_ring`. The ring also records the KEK's id (an HMAC of the KEK, which identifies it without revealing it) and the state of an unfinished switch or rotation. The AAD of each secret binds it to its row (catalog id, table, access key ID, account, principal name, session name and expiry). The server reads the KEK file once at startup, unwraps the DEK into the locked key store and wipes the KEK from memory.
+- Without a KEK file, the encryption key and the ciphertext it protects share one trust domain: anyone who can read the catalog database can decrypt every stored access key secret. Restrict catalog database access to the extenddb service account, and protect catalog backups to the same standard as the credentials themselves. With a KEK file, a catalog copy opens only with the KEK that its ring names.
+- The management API and web console redact `encryption_key` and `encryption_key_ring` from settings responses. The key is readable only with catalog database access: a database client, or `extenddb settings get encryption_key --show-secret` on a host that holds the catalog connection string. `extenddb settings set` refuses both rows.
+- The KEK file holds 32 random bytes in standard base64 with padding (44 characters), with at most one trailing newline. The server and every `extenddb encryption-key` command refuse a file that others can read, that is not owned by the server's user or root, or whose parent directories a user other than the owner can write to (the admin guide's [Encryption Key](05-admin-guide.md#encryption-key) section gives the rule in full and the delivery routes).
+- `extenddb encryption-key` switches a deployment from the catalog key to a KEK file (`switch`), changes the KEK with no outage (`rewrap`), replaces the DEK (`rotate`), recovers a restored catalog whose KEK is lost (`reset`) and, on PostgreSQL, writes the encrypted connection string row (`set-data-connection`). `switch` and `rotate` rewrite every stored secret and run while every server is stopped. None of them revokes a credential: a secret that leaked before the run works until its access key is re-created.
+- For a deployment that keeps the catalog key, the only key replacement is by hand, and it costs an outage. Replacing the key in the catalog `settings` table makes every stored access key secret and session credential unreadable. The server reads the key at startup and keeps it in memory, so a replacement takes these steps in order:
+    1. Replace the value of `encryption_key` in the catalog `settings` table with 32 random bytes in standard base64, for example the output of `openssl rand -base64 32`. On MongoDB the key is the `value` field of the `settings` document whose `_id` is `encryption_key`. The server refuses to start, and each `extenddb backup` command refuses to run, when the value is not 32 bytes in standard base64.
     2. Restart every server that serves the catalog. From the restart on, each request signed with an old access key or an unexpired session credential fails with `InternalServerError` (HTTP 500). Once step 3 deletes an old key, a request signed with it fails with `UnrecognizedClientException`.
     3. Delete every access key and create a new one. For each client that uses AssumeRole session credentials, call AssumeRole again with `extenddb manage assume-role`. The web console and `extenddb manage` sign in with a password, so they still work for this step.
     4. Give each client its new credentials: an access key ID and secret, or the new session's access key ID, secret and session token. Until then, each of its requests fails.
 - Console passwords hashed with bcrypt (cost factor 12)
-- Credentials and the inputs to authorization are cached in each server's memory; see Credential and Policy Caching below
+- Signing keys derived from the credentials are cached in each server's memory; see Credential and Policy Caching below
 
 #### Credential and Policy Caching
 
-Each server keeps in-memory caches between the request path and the catalog database, so that a request does not read the catalog for every credential and policy lookup. The caches hold decrypted credentials (long-term access keys and AssumeRole session credentials), parsed user, group and role inline policies, permissions boundaries, principal tags, resource tags, role-session data, user and role creation times, and each table's key and index definitions. Authorization decisions themselves are not cached: policies are evaluated on every request. Item data is not cached. This section covers the credentials that sign API requests; web console logins are described under Web Console Security.
+Each server keeps in-memory caches between the request path and the catalog database, so that a request does not read the catalog for every credential and policy lookup. The credential cache holds, for each access key, its principal fields, its session flag and expiry, the SHA-256 of its session token, and one SigV4 signing key per scope date in use (at most two, around midnight UTC), each in a slot of the locked key store. It holds no plaintext secret and no plaintext session token: a cache miss decrypts the stored secret, derives the signing key into its slot and wipes the secret, and the server compares a presented session token by its hash in constant time. The other caches hold parsed user, group and role inline policies, permissions boundaries, principal tags, resource tags, role-session data, user and role creation times, and each table's key and index definitions. Authorization decisions themselves are not cached: policies are evaluated on every request. Item data is not cached. This section covers the credentials that sign API requests; web console logins are described under Web Console Security.
 
 The caches are on by default and are configured under `[auth.cache]` in `extenddb.toml` (see the Admin Guide):
 
@@ -83,7 +101,7 @@ The caches are on by default and are configured under `[auth.cache]` in `extendd
 | `ttl_seconds` | `60` | The oldest a cached entry can be when it is used. Must be greater than 0 |
 | `soft_ttl_seconds` | `30` | After this age an entry is still used, and a background read replaces it. Must not exceed `ttl_seconds` |
 | `negative_ttl_seconds` | `5` | How long an empty answer is cached: an unknown access key ID, a missing table, or a principal with no policies, boundary or tags. Must not exceed `ttl_seconds` |
-| `max_entries` | `10000` | Entries per cache; beyond this, entries are evicted. Must be greater than 0 |
+| `max_entries` | `10000` | Entries per cache; beyond this, entries are evicted. Must be greater than 0. Also sets the size of the locked key store: two 32-byte signing-key slots per entry (640,000 bytes for the default), plus one buffer per runtime worker thread |
 
 These settings, whether set in the file or through `EXTENDDB__AUTH__CACHE__*` environment variables, are read at startup; changing them takes a restart. A server whose settings break one of the limits above refuses to start.
 
@@ -131,7 +149,15 @@ Flushing a cache does not revoke anything by itself: it only makes the server re
 
 ### Policy Evaluation — 5-Phase IAM Algorithm
 
-When `auth.provider = "builtin"`, every DynamoDB API request is authorized against IAM policies. The evaluation follows the same algorithm as real AWS IAM:
+When `auth.provider = "builtin"`, every authenticated DynamoDB API request is authorized against IAM policies, except these, which get an answer without an IAM decision:
+
+- `DescribeEndpoints`, which needs a signed request and no permission.
+- `RestoreTableToPointInTime`, and an `UpdateContinuousBackups` that enables point-in-time recovery, which are refused because point-in-time recovery is not supported.
+- A request that the service also answers before its IAM decision: a table name, index name or ARN outside the model's constraints, an ARN of the wrong kind or in another account, a stream ARN in another partition or region, a batch or transaction with no items or too many, and a shard iterator the server did not issue (see [Differences from DynamoDB](../differences-from-dynamodb.md)). A name or ARN that breaks only a length bound, an empty one included, is authorized first, except a `ListStreams` `TableName` of 1, 2 or more than 255 characters, which is refused first.
+- A PartiQL request that is refused before any of its statements is authorized: a member outside its constraints, or a statement that does not parse or breaks a rule of its form. The server authorizes a PartiQL request per statement.
+- A request the server cannot authorize because of a fault, such as a failed key lookup, which gets a server error.
+
+In dev mode no request gets an IAM decision. The evaluation follows the same algorithm as real AWS IAM:
 
 1. **Explicit Deny** — scan all policies (identity, permissions boundary, session). If any Deny statement matches the action, resource, and conditions → **DENY**.
 2. **Permissions Boundary** — if a permissions boundary is set on the user or role, it must contain an Allow statement matching the action, resource, and conditions. If not → **DENY**.
@@ -365,6 +391,10 @@ Import/export file paths are validated:
 - Auth provider defaults to `builtin` (SigV4 + IAM policies). The server refuses to start with `auth.provider = "none"`.
 - TLS is mandatory. `extenddb init` generates a self-signed certificate; production deployments should use CA-signed certificates.
 
+### Import and Export Files
+
+On Unix, an export file is created with mode 0600, and the directories the server creates to hold import and export files are created with mode 0700: a configured import or export root that does not exist at startup, and the account directory that the first export of an account creates under each export root. The modes are set when the file or directory is created, so the server's umask can only narrow them, and only the server's user and root can list the account directories it creates or read an export. Missing parent directories of a root are created 0755 (less the umask), so no directory the server creates is writable by group or others. A directory that already exists keeps its mode: a root the operator creates with group access keeps that access, and the export files in it are still 0600. Import files go under `<root>/<account id>`. When one directory is both an import root and an export root (the deprecated `import_export_root`, or one path under both `[import]` and `[export]`), the first export of an account creates `<root>/<account id>` 0700, so a group that puts import files there needs each `<root>/<account id>` created beforehand with the mode it wants. Import files keep the modes they were written with. A user who can write to a parent directory of a root can rename the root away and put a directory of their own in its place, and the server, which holds the root's path, would then read imports from it and write exports into it. At startup the server logs a warning for each root that has such a parent directory (writable by group or others without the sticky bit), naming the directory and its mode, and starts. Releases before v0.1.15 created these directories and files with the umask's modes (0755 and 0644 under umask 022, 0750 and 0640 for a daemon, whose umask is 027), and an upgrade does not change the modes of those that exist; the upgrade manual's [v0.1.15 entry](07-upgrade-manual.md#v0115-export-files-are-created-0600-and-the-import-and-export-directories-the-server-creates-0700) gives the command that tightens them.
+
 ### Backup and Recovery
 
 Back the databases up with the backend's own tools (the admin guide's [Data Recovery](05-admin-guide.md#data-recovery) entry names each backend's databases), and keep table backups in a backup store whose access you restrict (the [Backup and Restore manual](14-backup-and-restore.md#securing-the-store)). On PostgreSQL the catalog and data databases are one copy: dump both with the server stopped (the admin guide's Data Recovery entry restores the dumps), or, when both databases are on one PostgreSQL server, take a base backup of that server and restore it with PostgreSQL's own procedure (the design guide allows the two databases on different PostgreSQL instances, which one base backup does not cover). With the default database names, and `umask 077` so that only the owner can read the files:
@@ -375,7 +405,7 @@ pg_dump extenddb_catalog > catalog_backup.sql
 pg_dump extenddb > data_backup.sql
 ```
 
-The encryption key is stored in the catalog database, so a catalog dump contains both the key and the encrypted access key secrets. A catalog backup is credential-equivalent: store it encrypted, restrict who can read it, and do not copy it to less-protected environments (for example a developer machine or a shared bucket) to reproduce an issue.
+Without `[auth.encryption] key_file`, the encryption key is stored in the catalog database, so a catalog dump contains both the key and the encrypted access key secrets. A catalog backup is then credential-equivalent: store it encrypted, restrict who can read it, and do not copy it to less-protected environments (for example a developer machine or a shared bucket) to reproduce an issue. With a KEK file, a dump taken after the switch holds the wrapped DEK and opens only with the KEK that its ring names; keep each KEK for as long as a copy wrapped under it is kept, and keep a copy of the KEK away from the host. A dump taken before the switch still holds the catalog key, and a physical copy of a PostgreSQL, MongoDB or Cassandra catalog taken after it can hold the deleted `encryption_key` row until its pages are overwritten: re-create the access keys that existed before the switch to end that exposure. Sessions expire within 12 hours.
 
 ---
 
@@ -384,6 +414,6 @@ The encryption key is stored in the catalog database, so a catalog dump contains
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

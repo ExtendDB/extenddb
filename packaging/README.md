@@ -112,25 +112,39 @@ deliberate second step):
    `npm/package.json`. The launcher runs only a binary of its own release.
    On a tag whose `package.json` lags the workspace version, the launcher
    tests would fail on every build leg. The publish gate refuses such a tag
-   before any build. The container release uses the same tag. A maintainer
-   dispatches the container and npm publish workflows independently against
-   it. The crates.io workflow runs last, after `promote-image`. For a release
+   before any build. The container release uses the same tag. For a release
    that ships a catalog migration, the release commit also raises
    `RELEASED_THROUGH` to the last migration. That commit holds the checksum
    lines that the checksum test prints (CONTRIBUTING.md, "Adding a catalog
    migration"). The gate jobs of the release workflows run
    `devtools/check-released-through` on the tag and refuse it otherwise.
-2. Dispatch the `npm-publish` workflow from `main` with the tag as input.
+2. Rehearse first. Before the tag is pushed, run `devtools/release-dry-run`
+   on the release commit: it runs the image workflows' gate and build steps
+   on a developer's machine for the host's architecture (`--crates` adds
+   the crates.io verify steps on the release's pinned toolchain), and a
+   failure there costs a new commit, not a new version. Then push the tag
+   and dispatch `npm-publish`, `release-dev-image` and `release-image` (once
+   per backend image) against it with `dry_run` checked. Each runs its
+   gates and its builds as for the release (the image workflows: both
+   architectures, smoke tests, scans and SBOMs; the npm workflow: the five
+   platform binaries, their smoke tests and the launcher suite) and
+   publishes nothing. The `protect-release-tags` ruleset blocks any update
+   or deletion of a `v*` tag, so a rehearsal failure that needs a code
+   change after the tag is pushed takes the next patch version.
+3. A maintainer dispatches the container and npm publish workflows
+   independently against the tag; the crates.io workflow runs last, after
+   `promote-image`. Dispatch the `npm-publish` workflow from `main` with the
+   tag as input.
    The gate validates shape, existence, ancestry against `main`, and the
    version match. Five native runners build, smoke test, and run the full
    launcher suite against their own binary. Only after all five pass does the
    reviewer-gated `npm` environment release the token, and everything is
    published with `--provenance` under the `candidate` dist-tag. Nothing
    reaches `latest`.
-3. Verify the candidate from a clean machine:
+4. Verify the candidate from a clean machine:
    `npm install @extenddb/dev@candidate` and run a smoke script in both storage
    modes.
-4. Promote, one dist-tag move per package:
+5. Promote, one dist-tag move per package:
 
    ```
    npm dist-tag add @extenddb/dev@X.Y.Z latest

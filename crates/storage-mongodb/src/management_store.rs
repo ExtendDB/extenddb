@@ -10,10 +10,10 @@ use mongodb::options::{FindOptions, UpdateOptions};
 
 use extenddb_storage::management_store::{
     AccessKeyCreated, AccountDetail, AdminEntry, GroupDetail, GroupListEntry, ManagementStore,
-    MetricsRow, OpError, OpResult, RoleDetail, RoleListEntry, SessionPolicyEntry, StoredDocument,
-    UserDetail, UserListEntry,
+    MetricsRow, OpError, OpResult, RoleDetail, RoleListEntry, SecretPage, SecretWrite,
+    SessionPolicyEntry, StoredDocument, UserDetail, UserListEntry,
 };
-use extenddb_storage::secret_cipher::encrypt_secret;
+use extenddb_storage::secret_keys::{SecretRow, SecretTable, require_keys};
 
 use crate::catalog_store::MongoCatalogStore;
 
@@ -26,7 +26,7 @@ fn is_duplicate_key(e: &mongodb::error::Error) -> bool {
     )
 }
 
-fn to_offset_dt(dt: BsonDateTime) -> time::OffsetDateTime {
+pub(crate) fn to_offset_dt(dt: BsonDateTime) -> time::OffsetDateTime {
     time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(dt.timestamp_millis()) * 1_000_000)
         .unwrap_or(time::OffsetDateTime::UNIX_EPOCH)
 }
@@ -1966,14 +1966,18 @@ impl ManagementStore for MongoCatalogStore {
                 return Err(OpError::NotFound("User not found".to_owned()));
             }
 
-            let enc_key = self.get_encryption_key().await?;
-
+            let keys = require_keys(self.keys.as_deref())?;
             let access_key_id = generate_access_key_id();
             let secret_key = generate_secret_key();
-            let encrypted = encrypt_secret(&secret_key, &enc_key, &access_key_id).map_err(|e| {
-                tracing::error!("create_access_key encryption: {e}");
-                OpError::Internal("Database error".to_owned())
-            })?;
+            let encrypted = keys
+                .encrypt(
+                    &SecretRow::access_key(&access_key_id, &account_id, &user_name),
+                    &secret_key,
+                )
+                .map_err(|e| {
+                    tracing::error!("create_access_key encryption: {e}");
+                    OpError::Internal("Database error".to_owned())
+                })?;
 
             let coll = self.catalog_db().collection::<Document>("access_keys");
             coll.insert_one(doc! {
@@ -1986,12 +1990,17 @@ impl ManagementStore for MongoCatalogStore {
             })
             .await
             .map_err(|e| {
+                // The unique index on access_key_id (migration 12) refuses a
+                // generated ID that another key holds. PostgreSQL and SQLite
+                // answer the same collision with an internal error.
                 if is_duplicate_key(&e) {
-                    OpError::NotFound("User not found".to_owned())
+                    tracing::error!(
+                        "create_access_key: the generated access key ID {access_key_id} is taken"
+                    );
                 } else {
                     tracing::error!("create_access_key failed: {e}");
-                    OpError::Internal("Database error".to_owned())
                 }
+                OpError::Internal("Database error".to_owned())
             })?;
 
             Ok(AccessKeyCreated {
@@ -2079,10 +2088,13 @@ impl ManagementStore for MongoCatalogStore {
         let access_key_id = access_key_id.to_owned();
         let secret_access_key = secret_access_key.to_owned();
         Box::pin(async move {
-            let enc_key = self.get_encryption_key().await?;
-
-            let encrypted =
-                encrypt_secret(&secret_access_key, &enc_key, &access_key_id).map_err(|e| {
+            let keys = require_keys(self.keys.as_deref())?;
+            let encrypted = keys
+                .encrypt(
+                    &SecretRow::access_key(&access_key_id, &account_id, &user_name),
+                    &secret_access_key,
+                )
+                .map_err(|e| {
                     tracing::error!("import_access_key encryption: {e}");
                     OpError::Internal("Database error".to_owned())
                 })?;
@@ -2316,6 +2328,40 @@ impl ManagementStore for MongoCatalogStore {
             }
         })
     }
+
+    // ── Encryption-key commands (RFC-0000 section 8.4) ─────────────
+
+    fn read_secret_page(
+        &self,
+        table: SecretTable,
+        page: Option<&str>,
+        page_size: usize,
+    ) -> BoxFuture<'_, OpResult<SecretPage>> {
+        let page = page.map(str::to_owned);
+        Box::pin(async move {
+            self.read_secret_page_impl(table, page.as_deref(), page_size)
+                .await
+        })
+    }
+
+    fn write_secrets(
+        &self,
+        table: SecretTable,
+        rows: &[SecretWrite],
+    ) -> BoxFuture<'_, OpResult<()>> {
+        let rows = rows.to_vec();
+        Box::pin(async move { self.write_secrets_impl(table, &rows).await })
+    }
+
+    fn delete_secrets(&self, table: SecretTable, keys: &[String]) -> BoxFuture<'_, OpResult<()>> {
+        let keys = keys.to_vec();
+        Box::pin(async move { self.delete_secrets_impl(table, &keys).await })
+    }
+
+    fn delete_setting(&self, key: &str) -> BoxFuture<'_, OpResult<()>> {
+        let key = key.to_owned();
+        Box::pin(async move { self.delete_setting_impl(&key).await })
+    }
 }
 
 // ── SettingsStore ───────────────────────────────────────────────────────
@@ -2352,6 +2398,16 @@ impl extenddb_storage::management_store::SettingsStore for MongoCatalogStore {
         })
     }
 
+    fn replace_setting(
+        &self,
+        key: &str,
+        expected: &str,
+        value: &str,
+    ) -> BoxFuture<'_, OpResult<bool>> {
+        let (key, expected, value) = (key.to_owned(), expected.to_owned(), value.to_owned());
+        Box::pin(async move { self.replace_setting_impl(&key, &expected, &value).await })
+    }
+
     fn list_settings(&self) -> BoxFuture<'_, OpResult<Vec<(String, String)>>> {
         Box::pin(async {
             let coll = self.catalog_db().collection::<Document>("settings");
@@ -2374,10 +2430,6 @@ impl extenddb_storage::management_store::SettingsStore for MongoCatalogStore {
                 })
                 .collect())
         })
-    }
-
-    fn cached_encryption_key(&self) -> Option<String> {
-        self.encryption_key.clone()
     }
 }
 
@@ -2716,26 +2768,6 @@ impl extenddb_storage::management_store::AdminStore for MongoCatalogStore {
             let verified = extenddb_storage::password::verify_password(password, hash).await?;
             Ok(Some(verified))
         })
-    }
-}
-
-// ── Helper: encryption key retrieval ────────────────────────────────────
-
-impl MongoCatalogStore {
-    async fn get_encryption_key(&self) -> OpResult<String> {
-        if let Some(ref cached) = self.encryption_key {
-            return Ok(cached.clone());
-        }
-        let coll = self.catalog_db().collection::<Document>("settings");
-        let doc = coll
-            .find_one(doc! { "_id": "encryption_key" })
-            .await
-            .map_err(|e| {
-                tracing::error!("get_encryption_key: {e}");
-                OpError::Internal("Database error".to_owned())
-            })?;
-        doc.and_then(|d| d.get_str("value").ok().map(std::borrow::ToOwned::to_owned))
-            .ok_or_else(|| OpError::Internal("Encryption key not configured".to_owned()))
     }
 }
 
