@@ -16,6 +16,7 @@
 use serde_json::Value;
 
 use super::{is_known_iam_condition_operator, non_null, validate_trust_effect};
+use extenddb_auth::policy::document::by_name;
 use extenddb_auth::policy::variable_syntax::{trust_arn_value_error, trust_variable_error};
 
 /// Refuse a statement `Sid` outside IAM's charset. Measured on live IAM
@@ -65,7 +66,9 @@ fn validate_trust_condition_operators(cond: &Value) -> Result<(), String> {
     let obj = cond
         .as_object()
         .ok_or_else(|| "Condition must be an object".to_owned())?;
-    for (op_name, keys) in obj {
+    // In name order, as `validate_trust_condition` reads it, so a block with
+    // two faults reports the same one on every build.
+    for (op_name, keys) in by_name(obj) {
         if !is_known_iam_condition_operator(op_name) {
             return Err(format!("invalid Condition operator: {op_name}"));
         }
