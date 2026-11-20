@@ -113,7 +113,7 @@ async fn rows_found_in_the_ledger_on_resume_take_no_write_units() {
     let left = pacer.settled_tokens();
     assert!(
         (0.0..=1.0).contains(&left),
-        "rows 13 and 14 take their units: at most one of two remains, got {left}"
+        "the resume takes units for the rows it writes: at most one of two remains, got {left}"
     );
 }
 
