@@ -173,6 +173,7 @@ impl SqliteMigrations {
     /// # Errors
     ///
     /// The location does not parse, or the database cannot be opened.
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn open(location: &str) -> Result<Self, MigrationError> {
         Self::open_with(location, true).await
     }
@@ -184,10 +185,12 @@ impl SqliteMigrations {
     /// # Errors
     ///
     /// As [`Self::open`].
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn open_for_status(location: &str) -> Result<Self, MigrationError> {
         Self::open_with(location, false).await
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     async fn open_with(location: &str, write: bool) -> Result<Self, MigrationError> {
         let file = crate::serve_lock::database_file(location).map_err(MigrationError::Store)?;
         if write && let Some(path) = &file {
@@ -386,51 +389,60 @@ impl SqliteMigrations {
         &self,
         result: Result<RunReport, MigrationError>,
     ) -> Result<RunReport, MigrationError> {
-        let result = match (result, self.take_restore_failure()) {
-            (Ok(report), Some(error)) => Err(MigrationError::Stopped {
-                error: Box::new(error),
-                report,
-            }),
-            (result, _) => result,
-        };
-        let removed =
-            std::mem::take(&mut *self.removed.lock().unwrap_or_else(PoisonError::into_inner));
-        let replaced =
-            std::mem::take(&mut *self.replaced.lock().unwrap_or_else(PoisonError::into_inner));
-        match result {
-            Ok(mut report) => {
-                report.notes.splice(0..0, removed);
-                report.notes.extend(replaced);
-                Ok(report)
-            }
-            Err(MigrationError::Stopped { error, report }) if report.applied.is_empty() => {
-                // The run's own notes name the copy removed here, so only
-                // the lines naming the other files it removed are kept.
-                let copy = self
-                    .copy
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .take();
-                let mut notes = removed;
-                notes.extend(replaced);
-                if let Some(Err(note)) = copy.map(|copy| super::copy::remove_copy(&copy)) {
-                    notes.push(note);
+        #[cfg(target_arch = "wasm32")]
+        {
+            // The pre-migration copy is a file-backed, online-backup concern
+            // the browser build never takes; nothing to discard.
+            result
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let result = match (result, self.take_restore_failure()) {
+                (Ok(report), Some(error)) => Err(MigrationError::Stopped {
+                    error: Box::new(error),
+                    report,
+                }),
+                (result, _) => result,
+            };
+            let removed =
+                std::mem::take(&mut *self.removed.lock().unwrap_or_else(PoisonError::into_inner));
+            let replaced =
+                std::mem::take(&mut *self.replaced.lock().unwrap_or_else(PoisonError::into_inner));
+            match result {
+                Ok(mut report) => {
+                    report.notes.splice(0..0, removed);
+                    report.notes.extend(replaced);
+                    Ok(report)
                 }
-                if notes.is_empty() {
-                    Err(*error)
-                } else {
-                    Err(MigrationError::Stopped {
-                        error,
-                        report: RunReport { notes, ..report },
-                    })
+                Err(MigrationError::Stopped { error, report }) if report.applied.is_empty() => {
+                    // The run's own notes name the copy removed here, so only
+                    // the lines naming the other files it removed are kept.
+                    let copy = self
+                        .copy
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .take();
+                    let mut notes = removed;
+                    notes.extend(replaced);
+                    if let Some(Err(note)) = copy.map(|copy| super::copy::remove_copy(&copy)) {
+                        notes.push(note);
+                    }
+                    if notes.is_empty() {
+                        Err(*error)
+                    } else {
+                        Err(MigrationError::Stopped {
+                            error,
+                            report: RunReport { notes, ..report },
+                        })
+                    }
                 }
+                Err(MigrationError::Stopped { error, mut report }) => {
+                    report.notes.splice(0..0, removed);
+                    report.notes.extend(replaced);
+                    Err(MigrationError::Stopped { error, report })
+                }
+                other => other,
             }
-            Err(MigrationError::Stopped { error, mut report }) => {
-                report.notes.splice(0..0, removed);
-                report.notes.extend(replaced);
-                Err(MigrationError::Stopped { error, report })
-            }
-            other => other,
         }
     }
 
@@ -616,26 +628,37 @@ impl MigrationBackend for SqliteMigrations {
             // An empty database (init) holds nothing to keep.
             return Ok(Vec::new());
         }
-        let from = from.map_or_else(|| "legacy".to_owned(), |v| v.to_string());
-        let copy = super::copy::copy_path(file, &from, to, std::time::SystemTime::now());
-        let lines = super::copy::pre_migration_copy(
-            &self.stores.pool,
-            file,
-            &copy,
-            super::copy::Hooks::RUN,
-        )
-        .await?;
-        // An earlier copy with the same bytes holds nothing this copy does
-        // not, so it is removed now, before the run's first commit: a crash
-        // loop that kills each run before that commit then leaves one copy,
-        // not one per run.
-        let replaced = super::copy::remove_superseded(file, &copy).await;
-        self.replaced
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend(replaced);
-        *self.copy.lock().unwrap_or_else(PoisonError::into_inner) = Some(copy);
-        Ok(lines)
+        // A file-backed migration copies the database first through SQLite's
+        // online-backup C API; the browser build opens no file (`self.file` is
+        // always `None` above) and takes no copy.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let from = from.map_or_else(|| "legacy".to_owned(), |v| v.to_string());
+            let copy = super::copy::copy_path(file, &from, to, std::time::SystemTime::now());
+            let lines = super::copy::pre_migration_copy(
+                &self.stores.pool,
+                file,
+                &copy,
+                super::copy::Hooks::RUN,
+            )
+            .await?;
+            // An earlier copy with the same bytes holds nothing this copy does
+            // not, so it is removed now, before the run's first commit: a crash
+            // loop that kills each run before that commit then leaves one copy,
+            // not one per run.
+            let replaced = super::copy::remove_superseded(file, &copy).await;
+            self.replaced
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(replaced);
+            *self.copy.lock().unwrap_or_else(PoisonError::into_inner) = Some(copy);
+            Ok(lines)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (file, from, to);
+            Ok(Vec::new())
+        }
     }
 
     async fn apply(

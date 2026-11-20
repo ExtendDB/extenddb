@@ -20,10 +20,72 @@
 //! NOTE: this is the catalog-layer build slice. The data-plane engine modules
 //! and the `ServerComponents` registration are added in the engine slice.
 
+// On a browser `wasm32-unknown-unknown` target this crate compiles a subset of
+// itself — the data plane over the `wasm_sqlx` shim — and the server, CLI,
+// file-lock and file-migration surface is either gated off (where it uses a C
+// sysroot, `flock`, or the online-backup C API) or compiled but unreachable.
+// Items live on native (which compiles the whole crate) but look unused to the
+// wasm compiler; silence that here for wasm only. Native keeps full warning
+// discipline (the clippy gate runs on native).
+#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
+
+// On wasm the backend cannot use `sqlx` + the C `libsqlite3-sys` (a dedicated
+// OS thread per connection, a C sysroot), so every `sqlx::` path in this crate
+// resolves instead to the in-crate `wasm_sqlx` module: aliasing this crate to
+// `sqlx` and re-exporting the shim at the crate root makes bare `sqlx::` paths
+// (and the `#[derive(sqlx::FromRow)]`-equivalent) resolve to it from every
+// module, without a per-module import. Native keeps the real `sqlx` crate and
+// is the behaviour this backend is defined against.
+#[cfg(target_arch = "wasm32")]
+extern crate self as sqlx;
+#[cfg(target_arch = "wasm32")]
+pub use wasm_sqlx::*;
+
+/// Declare a catalog-row struct with a single field list that decodes the same
+/// way on both targets.
+///
+/// On native the struct derives `sqlx::FromRow` (decode by column name). On
+/// wasm, where `sqlx` is the in-crate shim and a derive macro is unavailable,
+/// the same field list generates a `FromRow` impl that reads each column by its
+/// field name through the shim's `try_get` — matching what the derive emits —
+/// so a new or renamed column changes one place and fails or compiles
+/// identically on both targets.
+mod row_macro {
+    macro_rules! sqlite_row_struct {
+        (
+            $(#[$meta:meta])*
+            $vis:vis struct $name:ident {
+                $( $(#[$fmeta:meta])* $fvis:vis $field:ident : $ty:ty ),* $(,)?
+            }
+        ) => {
+            $(#[$meta])*
+            #[cfg_attr(not(target_arch = "wasm32"), derive(sqlx::FromRow))]
+            $vis struct $name {
+                $( $(#[$fmeta])* $fvis $field : $ty ),*
+            }
+
+            #[cfg(target_arch = "wasm32")]
+            impl sqlx::FromRow for $name {
+                fn from_row(row: &sqlx::Row) -> ::core::result::Result<Self, sqlx::Error> {
+                    ::core::result::Result::Ok(Self {
+                        $( $field: sqlx::Row::try_get(row, stringify!($field))? ),*
+                    })
+                }
+            }
+        };
+    }
+    pub(crate) use sqlite_row_struct;
+}
+
 mod admin_store;
 mod authorization_store;
 mod backup;
 mod backup_catalog;
+// Stands up a file-backed server from config on disk, taking the serve lock
+// (`std::fs`, `std::os::unix`, the `flock`-based `ServeLock`): a server-only
+// path with no meaning in the browser, where the engine is built directly
+// against `:memory:`. Compiled off the wasm build.
+#[cfg(not(target_arch = "wasm32"))]
 mod bootstrapper;
 mod catalog_store;
 pub mod config;
@@ -42,7 +104,20 @@ mod restore_engine;
 #[cfg(test)]
 mod restore_job_tests;
 mod schema;
+#[cfg(not(target_arch = "wasm32"))]
 mod serve_lock;
+// The browser build owns a single in-memory database and takes no file lock;
+// `serve_lock`'s `flock(2)` guard has no meaning there. This floor provides the
+// in-memory location classifier and the lock-field type name the shared engine
+// code references.
+#[cfg(target_arch = "wasm32")]
+#[path = "serve_lock_wasm.rs"]
+mod serve_lock;
+// Table snapshots copy the database file on disk (`std::fs`, `std::os::unix`),
+// which the browser's in-memory build cannot do; the `SnapshotEngine` subtrait
+// the storage engine requires is answered with an out-of-scope error on wasm
+// (see `store.rs`).
+#[cfg(not(target_arch = "wasm32"))]
 mod snapshot_engine;
 mod sqlite_util;
 mod store;
@@ -60,13 +135,11 @@ mod warm_throughput;
 mod worker;
 mod workers;
 
-// WebAssembly build only: a synchronous reimplementation of the slice of the
-// `sqlx` API the backend uses, over this crate's bundled SQLite (in-memory
-// VFS). Declared here so it builds and lints under wasm32; the crate root
-// aliases it to `sqlx` and the modules route through it in a following change,
-// so nothing references it yet.
+// On wasm, the synchronous reimplementation of the slice of the `sqlx` API the
+// backend uses, over this crate's bundled SQLite (in-memory VFS). The crate
+// root aliases it to `sqlx` (above), so the modules' `sqlx::` paths resolve to
+// it.
 #[cfg(target_arch = "wasm32")]
-#[allow(dead_code)]
 mod wasm_sqlx;
 
 /// Default secondary-index propagation delay (milliseconds) when the
@@ -94,6 +167,7 @@ pub(crate) const INDEX_PROPAGATION_DELAY_QUERY: &str = "SELECT value FROM settin
      WHERE key IN ('index_propagation_delay_ms', 'gsi_propagation_delay_ms') \
      ORDER BY key = 'index_propagation_delay_ms' DESC LIMIT 1";
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use bootstrapper::SqliteBootstrapper;
 pub use catalog_store::SqliteCatalogStore;
 pub use config::SqliteConfig;
@@ -106,6 +180,7 @@ pub use store::SqliteEngine;
 /// Bundles the bootstrapper, operations engine, config deserializer, and the
 /// settings/diagnostics/server-components factories under the `sqlite` name,
 /// which also selects the `[storage.sqlite]` config section.
+#[cfg(not(target_arch = "wasm32"))]
 #[must_use]
 pub fn backend() -> extenddb_storage::Backend {
     extenddb_storage::Backend {
@@ -121,16 +196,23 @@ pub fn backend() -> extenddb_storage::Backend {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 use extenddb_storage::diagnostics::DiagnosticsStore;
+#[cfg(not(target_arch = "wasm32"))]
 use extenddb_storage::diagnostics_store::DiagnosticsStoreError;
+#[cfg(not(target_arch = "wasm32"))]
 use extenddb_storage::management_store::{ManagementStore, SettingsStore};
+#[cfg(not(target_arch = "wasm32"))]
 use extenddb_storage::management_store_factory::ManagementStoreError;
+#[cfg(not(target_arch = "wasm32"))]
 use extenddb_storage::settings_store::SettingsStoreError;
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::sqlite_util::sqlite_url;
 
 /// Open a small catalog-only pool for the settings/diagnostics factories,
 /// with the pragmas of every SQLite pool.
+#[cfg(not(target_arch = "wasm32"))]
 async fn catalog_pool(connection_string: &str) -> Result<sqlx::SqlitePool, sqlx::Error> {
     sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(4)
@@ -143,6 +225,7 @@ async fn catalog_pool(connection_string: &str) -> Result<sqlx::SqlitePool, sqlx:
 
 // ── Bootstrapper ───────────────────────────────────────────────────────
 
+#[cfg(not(target_arch = "wasm32"))]
 fn sqlite_bootstrapper_factory(
     config_path: String,
     cli_args: Vec<String>,
@@ -165,6 +248,7 @@ fn sqlite_bootstrapper_factory(
 
 // ── Settings store factory ─────────────────────────────────────────────
 
+#[cfg(not(target_arch = "wasm32"))]
 fn sqlite_settings_store_factory(
     connection_string: &str,
 ) -> futures::future::BoxFuture<'static, Result<Box<dyn SettingsStore>, SettingsStoreError>> {
@@ -179,6 +263,7 @@ fn sqlite_settings_store_factory(
 
 // ── Management store factory ───────────────────────────────────────────
 
+#[cfg(not(target_arch = "wasm32"))]
 fn sqlite_management_store_factory(
     connection_string: &str,
 ) -> futures::future::BoxFuture<'static, Result<Box<dyn ManagementStore>, ManagementStoreError>> {
@@ -193,6 +278,7 @@ fn sqlite_management_store_factory(
 
 // ── Diagnostics store factory ──────────────────────────────────────────
 
+#[cfg(not(target_arch = "wasm32"))]
 fn sqlite_diagnostics_store_factory(
     connection_string: &str,
 ) -> futures::future::BoxFuture<'static, Result<Box<dyn DiagnosticsStore>, DiagnosticsStoreError>> {
@@ -207,16 +293,22 @@ fn sqlite_diagnostics_store_factory(
 
 // ── Server components factory ──────────────────────────────────────────
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 
+#[cfg(not(target_arch = "wasm32"))]
 use extenddb_auth::CredentialStore;
+#[cfg(not(target_arch = "wasm32"))]
 use extenddb_storage::migrations::{MigrationError, Runner};
+#[cfg(not(target_arch = "wasm32"))]
 use extenddb_storage::server_components::{
     BackendError, KeySource, ServerComponents, load_secret_keys,
 };
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::hooks::SqliteRuntimeHooks;
 
+#[cfg(not(target_arch = "wasm32"))]
 fn sqlite_server_components_factory(
     config: &(dyn extenddb_storage::config::StorageConfig + 'static),
     region: &str,
@@ -426,6 +518,7 @@ fn sqlite_server_components_factory(
 /// credential stores over a second pool on the same file (the engine's own
 /// connection for an in-memory database, whose data lives only there),
 /// sharing the one key holder `key_source` loads, and the runtime hooks.
+#[cfg(not(target_arch = "wasm32"))]
 async fn components_of(
     engine: SqliteEngine,
     db_path: &str,

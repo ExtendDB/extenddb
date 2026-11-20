@@ -15,8 +15,16 @@
 //! runs on an in-memory database's single connection.
 
 mod backend;
+// CLI migration commands, the online-backup copy (`libsqlite3-sys`), and the
+// file-open helpers (`std::fs` create/`create_private`) are the server and CLI
+// migration surface. The browser build migrates an in-memory database on the
+// engine's single connection (`SqliteMigrations::on_pool`) and opens no file,
+// so these are compiled off it.
+#[cfg(not(target_arch = "wasm32"))]
 mod commands;
+#[cfg(not(target_arch = "wasm32"))]
 mod copy;
+#[cfg(not(target_arch = "wasm32"))]
 mod open;
 // The migration bodies are frozen once released: neither rustfmt nor a later
 // clippy lint may require an edit that changes their checksums.
@@ -49,6 +57,7 @@ use extenddb_storage::migrations::{
 };
 
 pub use backend::{SqliteMigrations, SqliteStores};
+#[cfg(not(target_arch = "wasm32"))]
 pub use commands::SqliteCatalogMigrations;
 
 /// The definitions migration 1 creates in an empty database, which the
@@ -269,6 +278,7 @@ pub fn migration(id: MigrationId) -> Migration<SqliteStores> {
 }
 
 /// The longest wait a lock timeout can ask for that `Instant` can add.
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_LOCK_WAIT: Duration = Duration::from_secs(86_400);
 
 /// The database file's lock, held for a migration. Dropping it releases it.
@@ -285,6 +295,7 @@ pub struct MigrationLock {
 ///
 /// [`MigrationError::Locked`] when the lock is still held at the timeout
 /// (exit 6), or a store error when the lock file cannot be opened.
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn lock_for_migration(
     location: &str,
     timeout: Duration,
@@ -321,6 +332,7 @@ pub async fn lock_for_migration(
 /// # Errors
 ///
 /// The database cannot be opened or its ledger read.
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn catalog_status(location: &str) -> Result<CatalogStatus, MigrationError> {
     let Some(file) = crate::serve_lock::database_file(location).map_err(MigrationError::Store)?
     else {
@@ -343,6 +355,7 @@ pub async fn catalog_status(location: &str) -> Result<CatalogStatus, MigrationEr
 /// # Errors
 ///
 /// As [`Runner::migrate`] and [`lock_for_migration`].
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn migrate(
     location: &str,
     release: &str,
@@ -367,6 +380,7 @@ pub async fn migrate(
 ///
 /// [`MigrationError::Refused`] when `held` is another file's lock or the
 /// location is in memory, or as [`Runner::migrate`].
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn migrate_holding(
     location: &str,
     release: &str,
@@ -398,6 +412,7 @@ pub(crate) async fn migrate_holding(
 /// # Errors
 ///
 /// The refusal, or as [`migrate_holding`].
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn prepare_for_serve(
     location: &str,
     release: &str,
@@ -427,6 +442,7 @@ pub(crate) async fn prepare_for_serve(
 
 /// Whether the file database at `location` exists and holds a table, read
 /// on a read-only connection.
+#[cfg(not(target_arch = "wasm32"))]
 async fn holds_tables(location: &str) -> Result<bool, MigrationError> {
     let exists = crate::serve_lock::database_file(location)
         .map_err(MigrationError::Store)?
@@ -455,6 +471,7 @@ pub(crate) fn log_report(report: &RunReport) {
 }
 
 /// Open the runner's connection to a file database, run, and close it.
+#[cfg(not(target_arch = "wasm32"))]
 async fn run_on_file(location: &str, release: &str) -> Result<RunReport, MigrationError> {
     let migrations = SqliteMigrations::open(location).await?;
     let result = Runner::new(&migrations, release).migrate().await;

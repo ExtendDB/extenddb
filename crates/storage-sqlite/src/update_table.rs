@@ -899,100 +899,117 @@ impl SqliteEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
         ops.meta = Some(metas);
 
-        let batch_delay =
-            std::time::Duration::from_millis(self.vector_backfill_batch_delay().await);
-        // The floor on how long the index stays CREATING. Captured with the
-        // creation instant here rather than inside the task, so the hold
-        // measures from when the caller could first observe the index, and a
-        // live settings change mid-build does not move an in-flight deadline.
-        // The wait itself lives in the shared driver, beside the flip it delays.
-        let min_creating =
-            std::time::Duration::from_millis(self.vector_index_min_creating_ms().await);
-        let created_at = tokio::time::Instant::now();
+        // UpdateTable vector-index creation spawns a detached backfill driven by
+        // the server's runtime. The browser build has no such runtime and the
+        // adapter refuses this operation before dispatch, so the spawn and its
+        // timer are compiled off wasm and the build returns an error here rather
+        // than spawn a task nothing would poll. This path is unreachable on wasm
+        // (the refusal comes first); the error is a non-panicking floor.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let batch_delay =
+                std::time::Duration::from_millis(self.vector_backfill_batch_delay().await);
+            // The floor on how long the index stays CREATING. Captured with the
+            // creation instant here rather than inside the task, so the hold
+            // measures from when the caller could first observe the index, and a
+            // live settings change mid-build does not move an in-flight deadline.
+            // The wait itself lives in the shared driver, beside the flip it delays.
+            let min_creating =
+                std::time::Duration::from_millis(self.vector_index_min_creating_ms().await);
+            let created_at = tokio::time::Instant::now();
 
-        let allocation_delay =
-            std::time::Duration::from_millis(self.vector_allocation_phase_delay().await);
-        let owned_index_id = index_id.to_owned();
-        let owned_index_name = create.index_name.clone();
+            let allocation_delay =
+                std::time::Duration::from_millis(self.vector_allocation_phase_delay().await);
+            let owned_index_id = index_id.to_owned();
+            let owned_index_name = create.index_name.clone();
 
-        // Registered BEFORE the spawn, so there is no instant where the catalog
-        // says CREATING and the registry disagrees while the task is viable. The
-        // guard deregisters on every exit path including a panic, which is the
-        // whole point: a CREATING index with no registry entry is provably
-        // orphaned, and the worker's recovery sweep may rebuild it.
-        //
-        // This registry is build OWNERSHIP, which the shared lifecycle leaves to
-        // the backend by design: a single process can prove a build's liveness
-        // in memory, where a multi-process backend needs a cross-process claim.
-        self.vector_builds_running
-            .lock()
-            .expect("registry poisoned")
-            .insert(index_id.to_owned());
-        let registry = std::sync::Arc::clone(&self.vector_builds_running);
+            // Registered BEFORE the spawn, so there is no instant where the catalog
+            // says CREATING and the registry disagrees while the task is viable. The
+            // guard deregisters on every exit path including a panic, which is the
+            // whole point: a CREATING index with no registry entry is provably
+            // orphaned, and the worker's recovery sweep may rebuild it.
+            //
+            // This registry is build OWNERSHIP, which the shared lifecycle leaves to
+            // the backend by design: a single process can prove a build's liveness
+            // in memory, where a multi-process backend needs a cross-process claim.
+            self.vector_builds_running
+                .lock()
+                .expect("registry poisoned")
+                .insert(index_id.to_owned());
+            let registry = std::sync::Arc::clone(&self.vector_builds_running);
 
-        // Detached, so UpdateTable returns while the index is still CREATING. The
-        // service behaves this way, and it is the whole point: a table stays ACTIVE
-        // and writable throughout, taking over eight minutes on an empty table when
-        // measured, and searches against the index are refused until it is ACTIVE.
-        //
-        // Not awaited, so failures cannot be returned to the caller. They are
-        // logged by `complete_build`, which deliberately leaves the index in
-        // CREATING: that is the state the worker's recovery sweep repairs at
-        // runtime (and `reconcile_incomplete_vector_indexes` at startup).
-        tokio::spawn(async move {
-            struct Deregister(
-                std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
-                String,
-            );
-            impl Drop for Deregister {
-                fn drop(&mut self) {
-                    if let Ok(mut set) = self.0.lock() {
-                        set.remove(&self.1);
+            // Detached, so UpdateTable returns while the index is still CREATING. The
+            // service behaves this way, and it is the whole point: a table stays ACTIVE
+            // and writable throughout, taking over eight minutes on an empty table when
+            // measured, and searches against the index are refused until it is ACTIVE.
+            //
+            // Not awaited, so failures cannot be returned to the caller. They are
+            // logged by `complete_build`, which deliberately leaves the index in
+            // CREATING: that is the state the worker's recovery sweep repairs at
+            // runtime (and `reconcile_incomplete_vector_indexes` at startup).
+            tokio::spawn(async move {
+                struct Deregister(
+                    std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+                    String,
+                );
+                impl Drop for Deregister {
+                    fn drop(&mut self) {
+                        if let Ok(mut set) = self.0.lock() {
+                            set.remove(&self.1);
+                        }
                     }
                 }
-            }
-            let _deregister = Deregister(registry, owned_index_id);
+                let _deregister = Deregister(registry, owned_index_id);
 
-            // Nothing waits and no branch is taken when the lever is unset, which is
-            // the same shape the shared driver uses for its own inter-batch pause.
-            if !allocation_delay.is_zero() {
-                tokio::time::sleep(allocation_delay).await;
-            }
-            // The scan is about to start, so the member becomes true. Set outside the
-            // backfill transaction, otherwise no observer could see it: the whole
-            // point of the flag is to be readable while the scan is in progress.
-            // Inside the task rather than before the spawn, so the caller returns
-            // while the index is still allocating, which is the state the service
-            // reports first.
-            //
-            // A failure here leaves the index CREATING and allocating, which reads as
-            // undeletable until it is repaired. Nothing has to be released on the way
-            // out on this backend: the registry guard above fires on every exit path,
-            // and the propagation worker's stuck-build sweep rebuilds a CREATING index
-            // with no registry entry within one worker loop, which re-asserts the
-            // phase and unblocks both the delete and the table's queued index writes.
-            let mut ops = ops;
-            if let Err(e) =
-                extenddb_storage::vector_lifecycle::VectorIndexBuild::set_backfilling(&mut ops)
-                    .await
-            {
-                tracing::error!(
-                    index_name = %owned_index_name,
-                    "could not mark the vector index as backfilling, leaving it CREATING \
-                     for recovery: {e}"
-                );
-                return;
-            }
-            extenddb_storage::vector_lifecycle::complete_build(
-                ops,
-                &owned_index_name,
-                extenddb_storage::vector_lifecycle::BACKFILL_BATCH,
-                batch_delay,
-                Some(created_at + min_creating),
-            )
-            .await;
-        });
-        Ok(())
+                // Nothing waits and no branch is taken when the lever is unset, which is
+                // the same shape the shared driver uses for its own inter-batch pause.
+                if !allocation_delay.is_zero() {
+                    tokio::time::sleep(allocation_delay).await;
+                }
+                // The scan is about to start, so the member becomes true. Set outside the
+                // backfill transaction, otherwise no observer could see it: the whole
+                // point of the flag is to be readable while the scan is in progress.
+                // Inside the task rather than before the spawn, so the caller returns
+                // while the index is still allocating, which is the state the service
+                // reports first.
+                //
+                // A failure here leaves the index CREATING and allocating, which reads as
+                // undeletable until it is repaired. Nothing has to be released on the way
+                // out on this backend: the registry guard above fires on every exit path,
+                // and the propagation worker's stuck-build sweep rebuilds a CREATING index
+                // with no registry entry within one worker loop, which re-asserts the
+                // phase and unblocks both the delete and the table's queued index writes.
+                let mut ops = ops;
+                if let Err(e) =
+                    extenddb_storage::vector_lifecycle::VectorIndexBuild::set_backfilling(&mut ops)
+                        .await
+                {
+                    tracing::error!(
+                        index_name = %owned_index_name,
+                        "could not mark the vector index as backfilling, leaving it CREATING \
+                         for recovery: {e}"
+                    );
+                    return;
+                }
+                extenddb_storage::vector_lifecycle::complete_build(
+                    ops,
+                    &owned_index_name,
+                    extenddb_storage::vector_lifecycle::BACKFILL_BATCH,
+                    batch_delay,
+                    Some(created_at + min_creating),
+                )
+                .await;
+            });
+            Ok(())
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = create;
+            Err(StorageError::Unsupported(
+                "creating a vector index is not available in the in-memory WebAssembly build"
+                    .to_owned(),
+            ))
+        }
     }
 
     /// Rebuild any GSI left in `CREATING` by a crash between the catalog commit
