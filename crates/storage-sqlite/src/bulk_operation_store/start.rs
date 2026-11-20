@@ -148,7 +148,7 @@ pub(super) fn start_bulk_operation<'a>(
             return Err(StorageError::Validation(TABLE_DELETING_MESSAGE.to_owned()));
         }
         let busy = super::index_guard::index_busy(&mut tx, &req.table_id).await?;
-        if busy || super::index_guard::BuildMark::now(&req.table_id).began_since(before) {
+        if busy || super::index_guard::BuildMark::now(&req.table_id).began_since(&before) {
             tx.commit().await.map_err(internal)?;
             return Ok(StartOutcome::IndexOperationInProgress);
         }

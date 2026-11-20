@@ -139,7 +139,7 @@ pub(super) fn start_bulk_operation<'a>(
         let mut pause = std::time::Duration::from_millis(10);
         loop {
             if let Some(outcome) =
-                start_attempt(engine, &account_id, &req, account_limit, before).await?
+                start_attempt(engine, &account_id, &req, account_limit, &before).await?
             {
                 return Ok(outcome);
             }
@@ -164,7 +164,7 @@ async fn start_attempt(
     account_id: &str,
     req: &NewBulkOperation,
     account_limit: u32,
-    before: super::index_guard::BuildMark,
+    before: &super::index_guard::BuildMark,
 ) -> Result<Option<StartOutcome>, StorageError> {
     let mut tx = begin(&engine.pool).await?;
 

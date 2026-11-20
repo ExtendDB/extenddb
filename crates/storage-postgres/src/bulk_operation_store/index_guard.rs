@@ -36,41 +36,78 @@
 //! not keep `UpdateTable` and `DeleteTable` on it waiting.
 
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex, PoisonError};
+use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 
 use extenddb_core::types::GlobalSecondaryIndexUpdate;
 use extenddb_storage::bulk_operation_store::index_creation_refused_message;
 
 use super::*;
 
-/// Per table id: how many builds have begun in this process, and how many
-/// are running. Entries are never removed, so a count never repeats for a
-/// table.
-static BUILDS: LazyLock<Mutex<HashMap<String, (u64, u32)>>> =
+/// Per table id, while a build runs on the table or a start holds a mark of
+/// it: the number of the last build that began on the table, the builds
+/// running, and the marks held. The entry is removed when the last of them
+/// ends, and a mark holds it, so the number cannot repeat between two
+/// marks of one start.
+static BUILDS: LazyLock<Mutex<HashMap<String, Builds>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// One table's builds in this process as one read saw them.
-#[derive(Clone, Copy)]
+#[derive(Default)]
+struct Builds {
+    last_begun: u64,
+    running: u32,
+    marks: u32,
+}
+
+fn builds() -> MutexGuard<'static, HashMap<String, Builds>> {
+    BUILDS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Applies `end` to the entry of `table_id`, and removes the entry when no
+/// build runs and no mark is held.
+fn release(table_id: &str, end: impl FnOnce(&mut Builds)) {
+    let mut builds = builds();
+    if let Some(entry) = builds.get_mut(table_id) {
+        end(entry);
+        if entry.running == 0 && entry.marks == 0 {
+            builds.remove(table_id);
+        }
+    }
+}
+
+/// One table's builds in this process as one read saw them. The mark keeps
+/// the table's entry until it drops, so a later mark compares with it.
 pub(super) struct BuildMark {
-    begun: u64,
+    table_id: String,
+    last_begun: u64,
     running: u32,
 }
 
 impl BuildMark {
     pub(super) fn now(table_id: &str) -> Self {
-        let builds = BUILDS.lock().unwrap_or_else(PoisonError::into_inner);
-        let (begun, running) = builds.get(table_id).copied().unwrap_or((0, 0));
-        Self { begun, running }
+        let mut builds = builds();
+        let entry = builds.entry(table_id.to_owned()).or_default();
+        entry.marks += 1;
+        Self {
+            table_id: table_id.to_owned(),
+            last_begun: entry.last_begun,
+            running: entry.running,
+        }
     }
 
     /// Whether a build was running when this mark was taken.
-    pub(super) fn building(self) -> bool {
+    pub(super) fn building(&self) -> bool {
         self.running > 0
     }
 
     /// Whether a build began between `earlier` and this mark.
-    pub(super) fn began_since(self, earlier: Self) -> bool {
-        self.begun != earlier.begun
+    pub(super) fn began_since(&self, earlier: &Self) -> bool {
+        self.last_begun != earlier.last_begun
+    }
+}
+
+impl Drop for BuildMark {
+    fn drop(&mut self) {
+        release(&self.table_id, |entry| entry.marks -= 1);
     }
 }
 
@@ -89,10 +126,10 @@ impl BuildGuard {
     /// a start compares. A commit that fails after the call stays counted:
     /// it can fail after it took effect.
     pub(crate) fn begin(table_id: &str) -> Self {
-        let mut builds = BUILDS.lock().unwrap_or_else(PoisonError::into_inner);
-        let entry = builds.entry(table_id.to_owned()).or_insert((0, 0));
-        entry.0 += 1;
-        entry.1 += 1;
+        let mut builds = builds();
+        let entry = builds.entry(table_id.to_owned()).or_default();
+        entry.last_begun += 1;
+        entry.running += 1;
         Self {
             table_id: table_id.to_owned(),
         }
@@ -101,10 +138,7 @@ impl BuildGuard {
 
 impl Drop for BuildGuard {
     fn drop(&mut self) {
-        let mut builds = BUILDS.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(entry) = builds.get_mut(&self.table_id) {
-            entry.1 = entry.1.saturating_sub(1);
-        }
+        release(&self.table_id, |entry| entry.running -= 1);
     }
 }
 
@@ -215,4 +249,34 @@ pub(crate) async fn refuse_index_creation_during_run(
         )));
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A build that begins and ends between two marks of its table is seen
+    /// by the later mark, and the table's entry goes when the last build and
+    /// the last mark on it end.
+    #[test]
+    fn a_table_entry_goes_with_its_last_build_and_mark() {
+        let table = format!("index-guard-{}", uuid::Uuid::new_v4());
+        drop(BuildGuard::begin(&table));
+        assert!(
+            !builds().contains_key(&table),
+            "an ended build keeps no entry"
+        );
+
+        let before = BuildMark::now(&table);
+        drop(BuildGuard::begin(&table));
+        let after = BuildMark::now(&table);
+        assert!(!before.building() && !after.building());
+        assert!(after.began_since(&before), "the build between the marks");
+        assert!(!BuildMark::now(&table).began_since(&after));
+        drop((before, after));
+        assert!(
+            !builds().contains_key(&table),
+            "the last mark removes the entry"
+        );
+    }
 }
