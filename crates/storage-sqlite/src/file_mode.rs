@@ -8,17 +8,21 @@
 //! (access-key secrets, password hashes), so neither the file nor its `-wal`,
 //! `-shm` and `-journal` files may be readable by other local users. SQLite's
 //! unix VFS creates a database file with mode 0644 less the umask, and creates
-//! each sidecar with the mode of the database file. So the bootstrapper and
-//! catalog pools on a file database are opened through [`connect`], which
-//! calls [`prepare`] before the pool's first connection and [`restrict`]
-//! after it. The engine pool
-//! (`store.rs`) connects with its own connection options, and calls both
-//! around that connect. The migration runner opens its own connection, and
-//! calls both around it when it opens the database for writing; its read-only
-//! connection for the catalog status changes no mode. `prepare` creates the
-//! database file with mode 0600 (or narrows an existing one to 0600) before
-//! the connection can create a sidecar from it; `restrict` narrows the file
-//! and every sidecar present to 0600 whoever created them.
+//! each sidecar with the mode of the database file. [`prepare`] creates the
+//! database file with mode 0600 when the connection would create it (or
+//! narrows an existing one, and any sidecar left beside it, to 0600) before
+//! the connection can create a sidecar from it; [`restrict`] narrows the file
+//! and every sidecar present to 0600 whoever created them. The bootstrapper
+//! and catalog pools on a file database are opened through [`connect`], which
+//! calls `prepare` before the pool's first connection and `restrict` after it.
+//! The engine pool (`store.rs`) connects with its own connection options and
+//! calls `prepare` before that connect; its connect creates a missing file
+//! only when `prepare` creates it. The migration runner opens its own
+//! connection, and calls both around it when it opens the database for
+//! writing: that connection creates a missing database whatever the location
+//! asks, so on a `sqlite:` URL without `mode=rwc` through a dangling symlink,
+//! SQLite creates the file and `restrict` narrows it. Its read-only connection
+//! for the catalog status changes no mode.
 //!
 //! Only a regular file with a permission bit outside 0600 is changed, and it is
 //! set to 0600. Anything else at one of those names is left alone: a symlink

@@ -25,7 +25,7 @@ use extenddb_storage::migrations::{
 };
 use extenddb_storage::server_components::{ServerComponents, ServerComponentsOptions};
 use extenddb_storage::{MetadataEngine, TableEngine};
-use extenddb_storage_sqlite::migrations::SqliteCatalogMigrations;
+use extenddb_storage_sqlite::migrations::{SqliteCatalogMigrations, SqliteMigrations};
 use extenddb_storage_sqlite::{SqliteBootstrapper, SqliteConfig, SqliteEngine};
 
 const ACCOUNT: &str = "000000000000";
@@ -289,6 +289,27 @@ async fn serve_and_migrate_restrict_files_left_at_0644() {
     set_every_mode(&dir, 0o644);
     migrate(&path).await;
     assert_owner_only(&dir, "migrate over 0644 files", &[]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The migration runner's connection creates a missing database whatever the
+/// location asks. On a `sqlite:` URL without `mode=rwc` whose path is a
+/// dangling symlink, nothing creates the target before the connect, so SQLite
+/// creates it at 0644 with its sidecars, and the narrowing after the connect
+/// sets them to 0600.
+#[tokio::test]
+async fn the_migration_runner_narrows_a_database_sqlite_creates_through_a_dangling_symlink() {
+    let dir = deployment_dir();
+    let link = dir.join("x.sqlite");
+    std::os::unix::fs::symlink(dir.join("target.sqlite"), &link).expect("symlink");
+    let location = format!("sqlite://{}", link.display());
+    let runner = SqliteMigrations::open(&location).await.expect("open");
+    assert_owner_only(
+        &dir,
+        "the migration runner's open",
+        &["target.sqlite", "target.sqlite-wal", "target.sqlite-shm"],
+    );
+    drop(runner);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
