@@ -43,11 +43,15 @@ use extenddb_core::error::DynamoDbError;
 /// send. At 1500 wrappers and deeper a few sends are a 500 `InternalFailure`
 /// instead (measured 2026-11-12 and 2026-11-13, us-east-1, 24 or more sends
 /// per depth across several windows).
-/// An unknown top-level member is ignored at any depth (20000 levels is a 200).
-/// The ceiling, 5200 structural levels or about 2598 wrappers, sits inside the
-/// band where the service itself varies: every depth the service answers
-/// consistently is parsed here, and a deeper body gets the message-less
-/// refusal the service gives in that band.
+/// The service ignores an unknown top-level member: one nested 5201, 6001 or
+/// 20000 levels is a 200 on PutItem, DescribeTable and ListTables (measured
+/// 2026-11-19, us-east-1). The ceiling, 5200 structural levels or about 2598
+/// wrappers, sits inside the band where the service itself varies. An
+/// attribute shallow enough for the service to validate it on every send is
+/// parsed here, and a body nested past the ceiling gets the message-less
+/// refusal the service gives for an attribute in that band. A body with an
+/// unknown top-level member nested past the ceiling is refused here, where
+/// the service ignores the member.
 ///
 /// A body this deep recurses the same number of levels three times over: the
 /// `serde_json` parse, the conversion to typed `AttributeValue`s (which has no
