@@ -3,16 +3,17 @@
 
 //! A `begin_with` future dropped after its `BEGIN IMMEDIATE` ran, while sqlx
 //! checks that the transaction is open, leaves the connection inside the
-//! transaction. The pool rolls it back when the connection comes back
-//! (`roll_back_on_release`), so the next `begin_with` works.
+//! transaction. The engine pool and the catalog pool roll it back when the
+//! connection comes back (`roll_back_on_release`), so the next `begin_with`
+//! works.
 
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Wake, Waker};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
-use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqlitePool};
 use sqlx::{ConnectOptions, Executor};
 
 use crate::migrations::tests::temp_db;
@@ -59,6 +60,45 @@ async fn write_lock_free(probe: &mut SqliteConnection) -> bool {
     }
 }
 
+/// Poll `begin_with` on `pool` by hand and drop it while sqlx checks that
+/// the transaction is open. Each poll is followed by the wake of the step it
+/// waits on. Once the write lock is taken, its BEGIN IMMEDIATE has run and
+/// the connection has answered. One more poll takes the answer and starts
+/// the check of the open transaction, which waits for the connection
+/// handle. The future is dropped there. A wake can also come before the
+/// answer, and the check can then be done at that poll: the attempt rolls
+/// its transaction back and runs again.
+async fn drop_a_begin_inside_its_check(
+    name: &str,
+    pool: &SqlitePool,
+    probe: &mut SqliteConnection,
+) {
+    for _ in 0..20 {
+        let woken = Arc::new(Woken::default());
+        let waker = Waker::from(Arc::clone(&woken));
+        let mut cx = Context::from_waker(&waker);
+        let mut begin = Box::pin(pool.begin_with("BEGIN IMMEDIATE"));
+        loop {
+            assert!(
+                begin.as_mut().poll(&mut cx).is_pending(),
+                "{name}: begin_with ended"
+            );
+            woken.wait().await;
+            if !write_lock_free(probe).await {
+                break;
+            }
+        }
+        match begin.as_mut().poll(&mut cx) {
+            Poll::Pending => {
+                drop(begin);
+                return;
+            }
+            Poll::Ready(tx) => tx.expect("begin_with").rollback().await.expect("rollback"),
+        }
+    }
+    panic!("{name}: no begin_with was dropped while it waited for the connection handle");
+}
+
 #[tokio::test]
 async fn a_begin_dropped_after_its_statement_ran_leaves_no_transaction_open() {
     let db = temp_db("release");
@@ -66,6 +106,7 @@ async fn a_begin_dropped_after_its_statement_ran_leaves_no_transaction_open() {
     let engine = SqliteEngine::new(path, 2, "us-east-1", 400 * 1024)
         .await
         .expect("engine");
+    let catalog = crate::catalog_pool(path).await.expect("catalog pool");
     let mut probe = SqliteConnectOptions::new()
         .filename(path)
         .busy_timeout(Duration::ZERO)
@@ -73,41 +114,16 @@ async fn a_begin_dropped_after_its_statement_ran_leaves_no_transaction_open() {
         .await
         .expect("probe connection");
 
-    // Poll `begin_with` by hand. Each poll is followed by the wake of the
-    // step it waits on. Once the write lock is taken, its BEGIN IMMEDIATE has
-    // run and the connection has answered. One more poll takes the answer
-    // and starts the check of the open transaction, which waits for the
-    // connection handle. The future is dropped there.
-    let woken = Arc::new(Woken::default());
-    let waker = Waker::from(Arc::clone(&woken));
-    let mut cx = Context::from_waker(&waker);
-    let mut begin = Box::pin(engine.pool.begin_with("BEGIN IMMEDIATE"));
-    loop {
+    for (name, pool) in [("engine", &engine.pool), ("catalog", &catalog)] {
+        drop_a_begin_inside_its_check(name, pool, &mut probe).await;
+        let tx = tokio::time::timeout(Duration::from_secs(30), pool.begin_with("BEGIN IMMEDIATE"))
+            .await
+            .unwrap_or_else(|_| panic!("{name}: the next begin_with answers"))
+            .unwrap_or_else(|e| panic!("{name}: the next begin_with opens a transaction: {e:?}"));
+        tx.rollback().await.expect("rollback");
         assert!(
-            begin.as_mut().poll(&mut cx).is_pending(),
-            "begin_with ended"
+            write_lock_free(&mut probe).await,
+            "{name}: no connection holds the write lock"
         );
-        woken.wait().await;
-        if !write_lock_free(&mut probe).await {
-            break;
-        }
     }
-    assert!(
-        begin.as_mut().poll(&mut cx).is_pending(),
-        "the check of the open transaction waits for the connection handle"
-    );
-    drop(begin);
-
-    let tx = tokio::time::timeout(
-        Duration::from_secs(30),
-        engine.pool.begin_with("BEGIN IMMEDIATE"),
-    )
-    .await
-    .expect("the next begin_with answers")
-    .expect("the next begin_with opens a transaction");
-    tx.rollback().await.expect("rollback");
-    assert!(
-        write_lock_free(&mut probe).await,
-        "no connection holds the write lock"
-    );
 }
