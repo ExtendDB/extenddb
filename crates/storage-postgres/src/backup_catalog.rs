@@ -1330,6 +1330,20 @@ impl BackupCatalog for PostgresEngine {
             .await
             .map_err(db_err)?;
             if let Some(current) = young {
+                // Unlock before closing: the server frees a closed session's
+                // lock only when its backend exits, which can be after
+                // `close` returns, and until then every CreateBackup's and
+                // RestoreTableFromBackup's check would read this refused
+                // take as a live claim. A failed unlock is not an error here;
+                // the close still releases the lock, only later.
+                if let Err(e) = sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, $2))")
+                    .bind(MAINTENANCE_LOCK_KEY)
+                    .bind(crate::backup_engine::RESTORE_LOCK_SEED)
+                    .execute(session.connection())
+                    .await
+                {
+                    tracing::warn!("unlocking a refused maintenance claim: {e}");
+                }
                 session.close().await;
                 return Err(StorageError::AlreadyExists(format!(
                     "the backup maintenance claim is held by {current} (its catalog session \
