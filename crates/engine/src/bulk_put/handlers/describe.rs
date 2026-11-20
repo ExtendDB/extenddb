@@ -49,10 +49,10 @@ pub(super) fn start_response(
             TABLE_BUSY_MESSAGE.to_owned(),
         )),
         // The text is the measured one, missing separators between the
-        // first three fragments included ("Other facts": a
-        // sixth concurrent Start on the service answered it verbatim); the
-        // configured limit is substituted where the hosted service names
-        // its quota.
+        // first three fragments included: a sixth concurrent STANDARD Start
+        // on the service answered it verbatim (2026-11-19). The configured
+        // limit is substituted where the hosted service names its quota of
+        // 5 per tier.
         StartOutcome::AccountLimitReached => Err(DynamoDbError::LimitExceededException(format!(
             "Subscriber limit exceededService quota exceeded You have reached the maximum \
              number of concurrent bulk operations for the selected PerformanceTier, which is \

@@ -280,6 +280,71 @@ class TestValidation:
         # whole file and relabelled the outcome would fail here.
         assert terminal["ProcessedItemCount"] < 20000
 
+    def test_the_account_limit_counts_each_performance_tier(
+        self, dynamodb_client, bulk_bucket
+    ):
+        # Measured on the service (2026-11-19): five STANDARD operations and
+        # one ACCELERATED operation run at once, and the sixth STANDARD Start
+        # answers LimitExceededException with this text. MaxWriteRequestUnits
+        # holds each run to about 20 s on this input, so all six are still
+        # running when the seventh Start arrives.
+        write_rows(bulk_bucket, "in/rows.json", [row("n", str(i)) for i in range(20000)])
+        tables = [f"extenddb-bulk-tier-{uuid.uuid4().hex[:8]}" for _ in range(7)]
+        arns = []
+        try:
+            for name in tables:
+                dynamodb_client.create_table(
+                    TableName=name,
+                    AttributeDefinitions=[
+                        {"AttributeName": "pk", "AttributeType": "S"},
+                        {"AttributeName": "sk", "AttributeType": "S"},
+                    ],
+                    KeySchema=[
+                        {"AttributeName": "pk", "KeyType": "HASH"},
+                        {"AttributeName": "sk", "KeyType": "RANGE"},
+                    ],
+                    BillingMode="PAY_PER_REQUEST",
+                )
+            for name in tables:
+                wait_for_active(dynamodb_client, name)
+            tiers = ["STANDARD"] * 5 + ["ACCELERATED"]
+            for name, tier in zip(tables, tiers):
+                body = start_body(
+                    name, bulk_bucket, PerformanceTier=tier, MaxWriteRequestUnits=1024
+                )
+                desc = extenddb_request("StartBulkPutItems", body)["BulkOperationDescription"]
+                arns.append(desc["BulkOperationArn"])
+            expect_error(
+                "StartBulkPutItems",
+                start_body(
+                    tables[6], bulk_bucket, PerformanceTier="STANDARD",
+                    MaxWriteRequestUnits=1024,
+                ),
+                "LimitExceededException",
+                "Subscriber limit exceededService quota exceeded You have reached the "
+                "maximum number of concurrent bulk operations for the selected "
+                "PerformanceTier, which is 5. Wait until other jobs finish, and try "
+                "again. You can also reach out to AWS Support to request a quota "
+                "increase.",
+            )
+        finally:
+            for arn in arns:
+                try:
+                    extenddb_request("CancelBulkOperation", {"BulkOperationArn": arn})
+                except Exception:
+                    pass
+            for arn in arns:
+                try:
+                    wait_until_terminal(arn, timeout=60)
+                except Exception:
+                    pass
+            for name in tables:
+                try:
+                    dynamodb_client.delete_table(TableName=name)
+                    wait_for_deleted(dynamodb_client, name)
+                except Exception:
+                    pass
+
 
 # ---------------------------------------------------------------------------
 # Second accounts, for listing and isolation

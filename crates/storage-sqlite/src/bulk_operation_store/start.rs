@@ -189,13 +189,19 @@ pub(super) fn start_bulk_operation<'a>(
             return Ok(StartOutcome::TableBusy);
         }
 
-        // Step 3b: account concurrency limit, exact because the write lock
-        // and BEGIN IMMEDIATE serialize every start.
+        // Step 3b: the account's limit in the requested PerformanceTier,
+        // exact because the write lock and BEGIN IMMEDIATE serialize every
+        // start. Each tier counts its own IN_PROGRESS and CANCELLING rows,
+        // and a row with no tier counts as STANDARD (measured on the
+        // service: five STANDARD operations refuse a sixth and admit an
+        // ACCELERATED one, and a CANCELLING operation still counts).
         let non_terminal: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM bulk_operations \
-             WHERE account_id = ? AND status IN ('IN_PROGRESS', 'CANCELLING')",
+             WHERE account_id = ? AND status IN ('IN_PROGRESS', 'CANCELLING') \
+             AND COALESCE(performance_tier, 'STANDARD') = ?",
         )
         .bind(&account_id)
+        .bind(req.performance_tier.as_deref().unwrap_or("STANDARD"))
         .fetch_one(&mut *tx)
         .await
         .map_err(internal)?;

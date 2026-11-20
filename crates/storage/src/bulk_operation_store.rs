@@ -309,7 +309,7 @@ pub type BulkOperationListResult =
 
 pub trait BulkOperationStore: Send + Sync {
     /// The start transaction. Besides the token, the per-table guard and
-    /// the account caps, it answers
+    /// the account's limit, it answers
     /// [`StartOutcome::IndexOperationInProgress`] when an index on the table
     /// is not `ACTIVE`, or was created between the call and the
     /// transaction, read under a lock that `UpdateTable`'s index creation
@@ -323,6 +323,11 @@ pub trait BulkOperationStore: Send + Sync {
     /// makes and before anything is inserted: the start handler gives that
     /// answer at its table lookup, and the table can be set `DELETING`
     /// after it. A table row that is absent is not refused here.
+    ///
+    /// `account_limit` applies to each `PerformanceTier` on its own: the
+    /// start answers [`StartOutcome::AccountLimitReached`] when the account
+    /// already has `account_limit` `IN_PROGRESS` or CANCELLING operations
+    /// in the request's tier, a row with no tier counting as `STANDARD`.
     fn start_bulk_operation(
         &self,
         account_id: &str,
@@ -346,8 +351,8 @@ pub trait BulkOperationStore: Send + Sync {
     }
 
     /// The account's non-terminal (`IN_PROGRESS` or CANCELLING) operation
-    /// count, read outside any transaction. The start transaction keeps
-    /// its own exact check under its locks.
+    /// count over both tiers, read outside any transaction. The start
+    /// transaction counts the request's tier under its own locks.
     fn count_non_terminal(&self, account_id: &str) -> BoxFuture<'_, Result<u64, StorageError>>;
 
     /// The non-terminal operations bound to one table of the account, by

@@ -309,6 +309,7 @@ contract_case!(
     report_totals_round_trip_through_checkpoint_and_start_at_zero,
     // The non-terminal count and the corrupt-counter refusal.
     count_non_terminal_counts_only_the_accounts_running_and_cancelling_rows,
+    the_account_limit_counts_each_tier_separately,
     a_negative_stored_counter_refuses_the_read,
     // The run context recorded at Start.
     the_run_context_round_trips_through_every_read,

@@ -1133,9 +1133,11 @@ the Start was being handled. A Start and an
 `UpdateTable` that creates an index on the same table are never both
 accepted: each side checks the other inside the transaction that acts, so
 when the two arrive together one of them answers `ResourceInUseException`
-with its usual message. An account may have at
-most `max_concurrent_bulk_operations` non-terminal operations (default 50);
-above that, `StartBulkPutItems` returns `LimitExceededException` with
+with its usual message. An account may have at most
+`max_concurrent_bulk_operations` non-terminal (`IN_PROGRESS` or
+`CANCELLING`) operations in each `PerformanceTier` (default 5, the hosted
+service's quota); `STANDARD` and `ACCELERATED` count separately. At the
+limit, a Start in that tier returns `LimitExceededException` with
 `Subscriber limit exceededService quota exceeded You have reached the
 maximum number of concurrent bulk operations for the selected
 PerformanceTier, which is {limit}. Wait until other jobs finish, and try

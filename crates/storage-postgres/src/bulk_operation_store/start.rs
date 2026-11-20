@@ -258,12 +258,18 @@ async fn start_attempt(
         return Ok(Some(StartOutcome::TableBusy));
     }
 
-    // Step 3b. Non-terminal operations count against the account limit.
+    // Step 3b. The account's limit in the requested PerformanceTier. Each
+    // tier counts its own IN_PROGRESS and CANCELLING rows, and a row with
+    // no tier counts as STANDARD (measured on the service: five STANDARD
+    // operations refuse a sixth and admit an ACCELERATED one, and a
+    // CANCELLING operation still counts).
     let (running,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM bulk_operations \
-         WHERE account_id = $1 AND status IN ('IN_PROGRESS', 'CANCELLING')",
+         WHERE account_id = $1 AND status IN ('IN_PROGRESS', 'CANCELLING') \
+         AND COALESCE(performance_tier, 'STANDARD') = $2",
     )
     .bind(account_id)
+    .bind(req.performance_tier.as_deref().unwrap_or("STANDARD"))
     .fetch_one(&mut *tx)
     .await
     .map_err(internal)?;

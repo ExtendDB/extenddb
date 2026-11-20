@@ -291,7 +291,8 @@ pub async fn handle_start_bulk_put_items(
     };
 
     // The start transaction answers a replayed token from its row before
-    // the per-table guard and the account limit.
+    // the per-table guard and the account's limit in the request's
+    // PerformanceTier.
     let account_limit = ctx.limits.max_concurrent_bulk_operations;
     let outcome = ctx
         .storage

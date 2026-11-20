@@ -219,7 +219,7 @@ fn ensure_cert_covers_sans(
 const BULK_LIMITS_TEMPLATE: &str = "\
 # Bulk operations (StartBulkPutItems and the workers that drive it).
 # These keys are extenddb's own; DynamoDB exposes no equivalent.
-# max_concurrent_bulk_operations = 50        # per account
+# max_concurrent_bulk_operations = 5         # non-terminal operations per account in each PerformanceTier
 # bulk_operation_retention_days = 30         # floored at 1; a purge pass runs at startup and daily
 # bulk_operation_worker_concurrency = 4      # operations running at once per process; floored at 1
 # bulk_operation_worker_per_account = 2      # of those, at most this many per account; floored at 1

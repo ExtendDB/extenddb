@@ -213,6 +213,53 @@ async fn the_account_limit_answers_across_tables() {
 }
 
 #[tokio::test]
+async fn the_default_limit_counts_five_operations_in_each_tier() {
+    // Measured on the service (2026-11-19): five STANDARD Starts and one
+    // ACCELERATED Start are accepted, and the sixth STANDARD Start answers
+    // this text, also while one of the five is CANCELLING. A Start with no
+    // PerformanceTier is STANDARD.
+    let h = Harness::new().await;
+    for name in ["tbl2", "tbl3", "tbl4", "tbl5", "tbl6", "tbl7"] {
+        Harness::create_table(&h.storage, name).await;
+    }
+    let ctx = ctx_with_limits(&h, LimitsConfig::default());
+    let refused = "Subscriber limit exceededService quota exceeded You have reached the maximum \
+                   number of concurrent bulk operations for the selected PerformanceTier, which \
+                   is 5. Wait until other jobs finish, and try again. You can also reach out to \
+                   AWS Support to request a quota increase.";
+    let body = |table: &str, tier: Option<&str>| {
+        let body = with_top(start_body(), "TableName", json!(table));
+        match tier {
+            Some(tier) => with_top(body, "PerformanceTier", json!(tier)),
+            None => body,
+        }
+    };
+    let mut first = None;
+    for (table, tier, accepted) in [
+        (TABLE, None, true),
+        ("tbl2", Some("STANDARD"), true),
+        ("tbl3", Some("STANDARD"), true),
+        ("tbl4", Some("STANDARD"), true),
+        ("tbl5", Some("STANDARD"), true),
+        ("tbl7", Some("ACCELERATED"), true),
+        ("tbl6", Some("STANDARD"), false),
+    ] {
+        if accepted {
+            let started = start_ok(&ctx, body(table, tier)).await;
+            first.get_or_insert_with(|| description_arn(&started));
+        } else {
+            let message = expect_limit_exceeded(start(&ctx, body(table, tier)).await);
+            assert_eq!(message, refused, "{table} {tier:?}");
+        }
+    }
+    cancel(&ctx, &first.expect("the first start is accepted"))
+        .await
+        .expect("cancel");
+    let message = expect_limit_exceeded(start(&ctx, body("tbl6", None)).await);
+    assert_eq!(message, refused, "a CANCELLING operation still counts");
+}
+
+#[tokio::test]
 async fn a_saturated_account_is_refused_before_the_enumeration_walk() {
     let h = Harness::new().await;
     Harness::create_table(&h.storage, "second").await;

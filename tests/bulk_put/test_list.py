@@ -51,7 +51,14 @@ class TestList:
                 tables.append(name)
             for name in tables:
                 wait_for_active(client, name)
+            # At most five operations of a tier run at once (the default
+            # max_concurrent_bulk_operations), so before each Start every
+            # operation but the newest four has ended.
+            ended = 0
             for name in tables:
+                while len(arns) - ended > 4:
+                    wait_until_terminal(arns[ended], creds=creds)
+                    ended += 1
                 resp = extenddb_request(
                     "StartBulkPutItems",
                     start_body(name, bucket, in_prefix="empty/"),

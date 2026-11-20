@@ -176,7 +176,7 @@
 #
 # Bulk operations (StartBulkPutItems and the workers that drive it).
 # These settings are ExtendDB's own; DynamoDB does not expose them.
-# max_concurrent_bulk_operations = 50        # per account
+# max_concurrent_bulk_operations = 5         # non-terminal operations per account in each PerformanceTier
 # bulk_operation_retention_days = 30
 # bulk_operation_worker_concurrency = 4      # operations running at once per process
 # bulk_operation_worker_per_account = 2      # of those, at most this many per account

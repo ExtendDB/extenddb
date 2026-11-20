@@ -73,8 +73,11 @@ pub struct LimitsConfig {
     /// Reject bare reserved keywords in expressions (DynamoDB-compatible default: true).
     #[serde(default = "default_enforce_reserved_keywords")]
     pub enforce_reserved_keywords: bool,
-    /// Maximum non-terminal bulk operations per account. `StartBulkPutItems`
-    /// rejects above it.
+    /// Maximum non-terminal (`IN_PROGRESS` or `CANCELLING`) bulk operations
+    /// per account in each `PerformanceTier`, counted separately for
+    /// `STANDARD` and `ACCELERATED`. `StartBulkPutItems` answers
+    /// `LimitExceededException` at the limit. The default is the hosted
+    /// service's quota of 5 per tier.
     #[serde(default = "default_max_concurrent_bulk_operations")]
     pub max_concurrent_bulk_operations: u32,
     /// Ceiling on the listed (compressed) input bytes of one bulk
@@ -269,7 +272,7 @@ fn default_enforce_reserved_keywords() -> bool {
     true
 }
 fn default_max_concurrent_bulk_operations() -> u32 {
-    50
+    5
 }
 fn default_max_bulk_input_bytes() -> u64 {
     // 1 TB in the service's binary units, the ACCELERATED quota.
