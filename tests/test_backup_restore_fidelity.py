@@ -2341,12 +2341,43 @@ def test_backup_and_table_names_are_validated(dynamodb_client):
             {"BackupArn": missing, "TargetTableName": 5, "BillingModeOverride": "X"},
         ):
             cases.append(("RestoreTableFromBackup", body, serialization))
+        # With a TargetTableName outside the pattern, an override member of another JSON
+        # kind and a BackupArn of another account are answered first, and any other
+        # override fault after the name (measured 20 Nov 2026). The SerializationException
+        # texts differ (#1012).
+        denied = "Access is denied"
+        for members, name, expected in (
+            ({"BackupArn": foreign}, "a*", denied),
+            ({"BackupArn": foreign}, "a b", denied),
+            ({"BackupArn": foreign}, "t\x00x", denied),
+            ({"BackupArn": foreign, "GlobalSecondaryIndexOverride": [{}]}, "a*", denied),
+            ({"GlobalSecondaryIndexOverride": {}}, "a*", serialization),
+            ({"GlobalSecondaryIndexOverride": {}}, "a b", serialization),
+            ({"LocalSecondaryIndexOverride": {}}, "a*", serialization),
+            ({"SSESpecificationOverride": 5}, "a*", serialization),
+            ({"ProvisionedThroughputOverride": "x"}, "a*", serialization),
+            ({"BillingModeOverride": 5}, "a*", serialization),
+            ({"BillingModeOverride": "PAY"}, "a*", length),
+            ({"BillingModeOverride": "PROVISIONED"}, "a*", length),
+            ({"GlobalSecondaryIndexOverride": [{}]}, "a*", length),
+            ({"GlobalSecondaryIndexOverride": [{
+                "IndexName": "gi", "KeySchema": [{"AttributeName": "k", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "FOO"}}]}, "a*", length),
+            ({"ProvisionedThroughputOverride": {}}, "a*", length),
+            ({"ProvisionedThroughputOverride": {"ReadCapacityUnits": 1.5, "WriteCapacityUnits": 1}},
+             "a*", length),
+        ):
+            cases.append(("RestoreTableFromBackup",
+                          {"BackupArn": missing, **members, "TargetTableName": name}, expected))
         for operation, body, expected in cases:
             resp = _signed(operation, body)
             assert resp.status_code == 400, (operation, body, resp.text)
             code, message = _error(resp)
             if expected == serialization:
                 assert code == serialization, (operation, body, resp.text)
+                continue
+            if expected == denied:
+                assert (code, message) == ("AccessDeniedException", denied), (body, resp.text)
                 continue
             assert code == "ValidationException", (operation, body, resp.text)
             if _is_real_dynamodb() and " detected: " in expected:
