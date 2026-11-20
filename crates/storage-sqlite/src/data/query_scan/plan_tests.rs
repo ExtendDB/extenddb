@@ -163,7 +163,6 @@ async fn assert_index_walk(
     label: &str,
     key_info: &TableKeyInfo,
     ddb_table: &str,
-    is_lsi: bool,
     cond: &KeyCondition,
     maps: &ExpressionMaps,
     forward: bool,
@@ -171,7 +170,6 @@ async fn assert_index_walk(
 ) {
     let (sql, binds) = query_statement(
         ddb_table,
-        is_lsi,
         key_info,
         cond,
         maps,
@@ -223,7 +221,7 @@ async fn lsi_query_walks_the_ordering_index_without_a_sort() {
             for start in [None, Some(&start)] {
                 let label = format!("LSI {shape} forward={forward} resumed={}", start.is_some());
                 assert_index_walk(
-                    &engine, &label, &lsi, &lsi_table, true, cond, maps, forward, start,
+                    &engine, &label, &lsi, &lsi_table, cond, maps, forward, start,
                 )
                 .await;
             }
@@ -243,7 +241,7 @@ async fn gsi_query_walks_the_ordering_index_without_a_sort() {
         for start in [None, Some(&start)] {
             let label = format!("GSI forward={forward} resumed={}", start.is_some());
             assert_index_walk(
-                &engine, &label, &gsi, &gsi_table, false, &cond, &maps, forward, start,
+                &engine, &label, &gsi, &gsi_table, &cond, &maps, forward, start,
             )
             .await;
         }
@@ -370,7 +368,7 @@ async fn multi_range_gsi_query_walks_the_ordering_index_without_a_sort() {
                     start.is_some()
                 );
                 assert_index_walk(
-                    &engine, &label, &gsi, &gsi_table, false, cond, maps, forward, start,
+                    &engine, &label, &gsi, &gsi_table, cond, maps, forward, start,
                 )
                 .await;
             }

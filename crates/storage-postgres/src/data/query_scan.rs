@@ -129,14 +129,13 @@ impl PostgresEngine {
     ) -> Result<(Vec<Item>, Option<Item>), StorageError> {
         use std::fmt::Write;
 
-        let (ddb_table, is_lsi) = if let Some(idx_name) = index_name {
+        let ddb_table = if let Some(idx_name) = index_name {
             let idx_info = self
                 .fetch_index_info_by_table_id(&key_info.table_id, idx_name)
                 .await?;
-            let lsi = idx_info.index_type == extenddb_core::types::IndexType::Lsi;
-            (index_table_name(&idx_info.index_id), lsi)
+            index_table_name(&idx_info.index_id)
         } else {
-            (data_table_name(&key_info.table_id), false)
+            data_table_name(&key_info.table_id)
         };
 
         // Resolve partition key value(s) — for multi-part keys, encode
@@ -270,40 +269,24 @@ impl PostgresEngine {
             {
                 // Index that has its own SK, with a base-table tie-breaker. The
                 // index SK is bound separately (see execute_query_sql); the binds
-                // here supply the full base primary key.
+                // here supply the full base primary key of the start key.
                 //
-                // A GSI takes the base partition key from the start key, because
-                // rows sharing an index SK can come from different base
-                // partitions and can also share a base SK. An LSI binds the
-                // queried partition key, which every row of the partition
-                // carries as its base_pk. base_pk then compares equal on every
-                // row, and only the base SK separates a row from the cursor.
-                // The statement does not read the start key's partition key:
-                // the bind keeps the page inside the queried partition.
-                // DynamoDB refuses a start key that names another partition
-                // with a ValidationException; that check belongs to request
-                // validation, not to this statement.
+                // On a GSI, rows sharing an index SK can come from different base
+                // partitions and can also share a base SK. On an LSI the start
+                // key's partition key is the queried one, which every row of the
+                // partition carries as its base_pk: request validation refuses a
+                // start key from another partition before storage reads anything.
                 let base_sk = start_key
                     .get(base_sk_name.as_str())
                     .map(|v| parse_sk(v, base_sk_type))
                     .transpose()?;
-                if is_lsi {
-                    match base_sk {
-                        Some(sk) => PaginationBinds::BasePkAndSk {
-                            pk_text: pk_text.clone(),
-                            sk,
-                        },
-                        None => PaginationBinds::None,
-                    }
-                } else {
-                    let base_pk_attr = &key_info.base_key_schema[0].attribute_name;
-                    match (start_key.get(base_pk_attr.as_str()), base_sk) {
-                        (Some(pk_val), Some(sk)) => PaginationBinds::BasePkAndSk {
-                            pk_text: pk_to_text(pk_val)?.into_owned(),
-                            sk,
-                        },
-                        _ => PaginationBinds::None,
-                    }
+                let base_pk_attr = &key_info.base_key_schema[0].attribute_name;
+                match (start_key.get(base_pk_attr.as_str()), base_sk) {
+                    (Some(pk_val), Some(sk)) => PaginationBinds::BasePkAndSk {
+                        pk_text: pk_to_text(pk_val)?.into_owned(),
+                        sk,
+                    },
+                    _ => PaginationBinds::None,
                 }
             } else if index_name.is_some() && sk_info_val.is_some() {
                 // Index with SK but no base SK — SQL has $N for base_pk

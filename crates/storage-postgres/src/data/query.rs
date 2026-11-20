@@ -24,12 +24,11 @@ pub(crate) enum PaginationBinds {
     None,
     /// Index query where base table has no SK — only `base_pk` as tie-breaker.
     BasePkOnly { pk_text: String },
-    /// Full base primary key as tie-breaker. A GSI query binds the start key's
-    /// base partition key: rows sharing an index SK can come from different
-    /// base partitions and can also share a base SK, so `base_sk` alone does
-    /// not identify a row. An LSI query binds the queried partition key, which
-    /// is every row's `base_pk`. Also used by a hash-only index on a table with
-    /// a SK.
+    /// Full base primary key of the start key as tie-breaker. On a GSI, rows
+    /// sharing an index SK can come from different base partitions and can
+    /// also share a base SK, so `base_sk` alone does not identify a row. On an
+    /// LSI the start key's partition key is the queried one, every row's
+    /// `base_pk`. Also used by a hash-only index on a table with a SK.
     BasePkAndSk { pk_text: String, sk: SortKeyValue },
 }
 

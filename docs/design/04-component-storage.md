@@ -774,8 +774,9 @@ the base sort key. These are the three columns of the GSI cursor above, and the
 `ORDER BY` lists them in the same order. The cursor is one row comparison. On
 every column, the cursor and the `ORDER BY` run in the direction of
 `ScanIndexForward`: `>` and `ASC` forward, `<` and `DESC` in reverse. Every row of an LSI partition
-stores the queried partition key as `base_pk`, and the cursor binds the queried
-partition key for it. So `base_pk` compares equal on every row, and the order
+stores the queried partition key as `base_pk`. The cursor binds the start key's
+partition key for it, and request validation refuses a start key from another
+partition. So `base_pk` compares equal on every row, and the order
 and page boundaries are those of the index sort key and the base sort key.
 Including `base_pk` makes the `ORDER BY` match the ordering index
 `(pk, sk_s, base_pk, base_sk_n)` after the fixed `pk`. The index can then return
@@ -786,7 +787,7 @@ several index sort key values. It adds a Sort when an equality on the index sort
 key leaves one. SQLite adds a temporary B-tree.
 ```sql
 WHERE pk = $lsi_pk
-  AND (sk_s COLLATE "C", base_pk COLLATE "C", base_sk_n) > ($lsi_sk, $lsi_pk, $base_sk)
+  AND (sk_s COLLATE "C", base_pk COLLATE "C", base_sk_n) > ($lsi_sk, $base_pk, $base_sk)
 ORDER BY sk_s COLLATE "C" ASC, base_pk COLLATE "C" ASC, base_sk_n ASC
 ```
 

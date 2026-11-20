@@ -544,20 +544,18 @@ async fn lsi_query_plans_as_an_index_walk_in_both_directions() {
     for forward in [true, false] {
         // The binds the engine sends for a resumed LSI page: the partition
         // key, the key condition's sort key values, the start key's index
-        // sort key, the partition key again as the base partition key, then
-        // the start key's base sort key.
-        let label = format!("resumed page, forward={forward}");
-        let expected = expected_page(&order, forward, Some(&cursor), PAGE);
+        // sort key, the start key's partition key as the base partition key,
+        // then the start key's base sort key.
         check_page(
             &s,
             &key_info,
             &sql_table,
-            &label,
+            &format!("resumed page, forward={forward}"),
             &whole,
             forward,
             Some(&start),
             PAGE,
-            &expected,
+            &expected_page(&order, forward, Some(&cursor), PAGE),
             &["p", start_lsk, "p", start_sk],
         )
         .await;
@@ -587,28 +585,6 @@ async fn lsi_query_plans_as_an_index_walk_in_both_directions() {
             &["p", low.as_str(), high.as_str(), start_lsk, "p", start_sk],
         )
         .await;
-
-        // The statement does not read the start key's partition key: the
-        // cursor binds the queried partition key as base_pk, which keeps the
-        // page inside partition p, so a start key naming partition q returns
-        // the same page. DynamoDB refuses such a start key with a
-        // ValidationException; that check belongs to request validation.
-        let mut elsewhere = start.clone();
-        elsewhere.insert("pk".to_owned(), sv("q"));
-        let (keys_elsewhere, _) = page(
-            &s,
-            &key_info,
-            &sql_table,
-            &whole,
-            forward,
-            Some(&elsewhere),
-            PAGE,
-        )
-        .await;
-        assert_eq!(
-            keys_elsewhere, expected,
-            "{label}: a start key naming partition q moved the page boundary"
-        );
     }
 
     s.cleanup().await;
