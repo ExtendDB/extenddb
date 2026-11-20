@@ -167,24 +167,6 @@ fn expected_rows(rows: &[Row], forward: bool, cursor: Option<&Row>, limit: usize
     page
 }
 
-fn assert_ordering_index_walk(label: &str, statement: &str, plan: &[String], index: &str) {
-    let shown = format!("{statement}\n{}", plan.join("\n"));
-    eprintln!("{label}:\n{shown}\n");
-    assert!(
-        sort_nodes(plan).is_empty(),
-        "{label}: the plan sorts the rows the index scan reads:\n{shown}"
-    );
-    assert!(
-        plan.iter()
-            .any(|l| l.contains("Index Scan") && l.contains(index)),
-        "{label}: the plan does not scan the ordering index {index}:\n{shown}"
-    );
-    assert!(
-        !plan.iter().any(|l| l.trim_start().starts_with("Filter:")),
-        "{label}: the plan filters rows after the index scan instead of seeking on them:\n{shown}"
-    );
-}
-
 /// One shape of key condition: its label, the condition, the rows it selects
 /// in forward index order, the page Limit, and the statement's binds for a
 /// first page in placeholder order.
@@ -198,23 +180,11 @@ struct Shape {
 
 #[tokio::test]
 async fn multi_range_gsi_query_plans_as_an_index_walk_in_both_directions() {
-    let test = "multi_range_gsi_query_plans_as_an_index_walk_in_both_directions";
-    if base_conn().is_none() {
-        return skip(test);
-    }
-    let mut s = scratch().await;
-    let version: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
-        .fetch_one(&s.db)
-        .await
-        .expect("read the server version");
-    if version < 160_000 {
-        eprintln!(
-            "SKIP {test}: EXPLAIN (GENERIC_PLAN) needs PostgreSQL 16 or later, the server \
-             reports server_version_num {version}."
-        );
-        s.cleanup().await;
+    let Some(mut s) =
+        scratch_or_skip("multi_range_gsi_query_plans_as_an_index_walk_in_both_directions").await
+    else {
         return;
-    }
+    };
     s.engine = s.engine.start_gsi_workers();
     let (key_info, sql_table, ordering_index) = multi_range_table(&s).await;
 
@@ -337,7 +307,7 @@ async fn multi_range_gsi_query_plans_as_an_index_walk_in_both_directions() {
                 assert_eq!(got, want, "{label}: rows");
                 let statement = last_statement(&s.db, &sql_table).await;
                 let generic = generic_plan(&s.db, &statement).await;
-                assert_ordering_index_walk(
+                assert_index_walk(
                     &format!("{label}, generic plan"),
                     &statement,
                     &generic,
@@ -348,7 +318,7 @@ async fn multi_range_gsi_query_plans_as_an_index_walk_in_both_directions() {
                     values.extend(cursor_binds);
                 }
                 let custom = custom_plan(&s.db, &statement, &values).await;
-                assert_ordering_index_walk(
+                assert_index_walk(
                     &format!("{label}, custom plan"),
                     &statement,
                     &custom,
@@ -357,6 +327,4 @@ async fn multi_range_gsi_query_plans_as_an_index_walk_in_both_directions() {
             }
         }
     }
-
-    s.cleanup().await;
 }

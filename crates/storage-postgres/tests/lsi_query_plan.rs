@@ -19,16 +19,17 @@
 //! them.
 //!
 //! Each test builds its own throwaway database, applies the shipped migrations
-//! to it, and drops it when it passes. A failing test leaves its database behind
-//! on purpose, named `eddb_lsip_*`, so the state that failed can be inspected.
+//! to it, and drops it when the test ends, a failed assertion included. The
+//! failure message prints the statement and the plan.
 //!
 //! Requires `EXTENDDB_TEST_PG_CONNECTION_STRING`, a base URL with no database
 //! component (for example `postgresql://postgres@127.0.0.1:5432`), pointing at a
 //! server whose role may create and drop databases and read other sessions'
 //! rows in `pg_stat_activity`. Without it every test here reports a skip and
-//! passes, the same convention the wire suites use. PostgreSQL added
-//! `EXPLAIN (GENERIC_PLAN)` in version 16; on an older server the test reports
-//! a skip as well.
+//! passes. PostgreSQL added `EXPLAIN (GENERIC_PLAN)` in version 16; on an older
+//! server the test reports a skip as well. With `EXTENDDB_TEST_PG_REQUIRED` set
+//! to any value but `0`, both skips fail instead, as in the crate's other
+//! PostgreSQL tests.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -53,6 +54,9 @@ const TABLE: &str = "t_lsi_plan";
 /// sort key value.
 const ITEMS: usize = 3_000;
 const GROUP: usize = 50;
+/// The end of the ordering index's name on the LSI table: PostgreSQL shortens
+/// the generated name to 63 bytes.
+const LSI_ORDERING_INDEX: &str = "_pk_sk_s_base_pk_base_sk_s_idx";
 /// The Query Limit of a page, larger than a group so a page crosses from one
 /// index sort key value to the next.
 const PAGE: usize = 100;
@@ -63,36 +67,68 @@ const PAGE: usize = 100;
 /// scan that reads the same rows.
 const GROUP_PAGE: usize = 10;
 
+/// A scratch database and an engine on it. The guard drops the database.
 struct Scratch {
     engine: PostgresEngine,
     db: PgPool,
-    admin: PgPool,
-    db_name: String,
+    _guard: DbGuard,
 }
 
-impl Scratch {
-    async fn cleanup(self) {
-        let Scratch {
-            engine,
-            db,
-            admin,
-            db_name,
-        } = self;
-        drop(engine);
-        db.close().await;
-        sqlx::query(&format!(
-            "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
-        ))
-        .execute(&admin)
-        .await
-        .expect("drop the scratch database");
-        admin.close().await;
+/// Drops the scratch database when the test ends, a failed assertion
+/// included. Runs on its own thread and runtime, because the test's runtime
+/// cannot be awaited from `Drop`; `WITH (FORCE)` ends the sessions the
+/// engine's pool still holds.
+struct DbGuard {
+    base: String,
+    name: String,
+}
+
+impl Drop for DbGuard {
+    fn drop(&mut self) {
+        let (base, name) = (self.base.clone(), self.name.clone());
+        let _ = std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            rt.block_on(async {
+                if let Ok(admin) = PgPoolOptions::new()
+                    .max_connections(1)
+                    .connect(&format!("{base}/postgres"))
+                    .await
+                {
+                    let _ =
+                        sqlx::query(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+                            .execute(&admin)
+                            .await;
+                    admin.close().await;
+                }
+            });
+        })
+        .join();
     }
 }
 
+/// The server's base URL, or `None` to skip. With `EXTENDDB_TEST_PG_REQUIRED`
+/// set, a job that must reach a server fails here instead.
 fn base_conn() -> Option<String> {
-    let conn = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING").ok()?;
-    (!conn.trim().is_empty()).then(|| conn.trim_end_matches('/').to_owned())
+    let conn = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING").unwrap_or_default();
+    if conn.trim().is_empty() {
+        assert!(
+            !required(),
+            "EXTENDDB_TEST_PG_CONNECTION_STRING is not set, and EXTENDDB_TEST_PG_REQUIRED says \
+             this job must reach a PostgreSQL server"
+        );
+        return None;
+    }
+    Some(conn.trim_end_matches('/').to_owned())
+}
+
+/// Whether `EXTENDDB_TEST_PG_REQUIRED` is set to any value but `0`.
+fn required() -> bool {
+    std::env::var("EXTENDDB_TEST_PG_REQUIRED").is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
 /// Every `.sql` file under `migrations/` and `data_migrations/`, each
@@ -115,15 +151,42 @@ fn shipped_migrations() -> Vec<String> {
     out
 }
 
-fn skip(test: &str) {
-    eprintln!(
-        "SKIP {test}: EXTENDDB_TEST_PG_CONNECTION_STRING is not set, so there is no PostgreSQL \
-         to build a scratch catalog in."
+/// Report a skip, or fail when [`required`].
+fn skip(test: &str, reason: &str) {
+    assert!(
+        !required(),
+        "{test}: {reason}, and EXTENDDB_TEST_PG_REQUIRED says this job must run the PostgreSQL \
+         tests"
     );
+    eprintln!("SKIP {test}: {reason}");
 }
 
-async fn scratch() -> Scratch {
-    let base = base_conn().expect("caller checks base_conn() first");
+/// A scratch database on a server with `EXPLAIN (GENERIC_PLAN)`, or `None`
+/// after [`skip`].
+async fn scratch_or_skip(test: &str) -> Option<Scratch> {
+    let Some(base) = base_conn() else {
+        skip(test, "EXTENDDB_TEST_PG_CONNECTION_STRING is not set");
+        return None;
+    };
+    let s = scratch(&base).await;
+    let version: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+        .fetch_one(&s.db)
+        .await
+        .expect("read the server version");
+    if version < 160_000 {
+        skip(
+            test,
+            &format!(
+                "EXPLAIN (GENERIC_PLAN) needs PostgreSQL 16 or later, the server reports \
+                 server_version_num {version}"
+            ),
+        );
+        return None;
+    }
+    Some(s)
+}
+
+async fn scratch(base: &str) -> Scratch {
     let db_name = format!("eddb_lsip_{}", uuid::Uuid::new_v4().simple())[..24].to_owned();
     let admin = PgPoolOptions::new()
         .max_connections(1)
@@ -134,6 +197,11 @@ async fn scratch() -> Scratch {
         .execute(&admin)
         .await
         .expect("create the scratch database");
+    admin.close().await;
+    let guard = DbGuard {
+        base: base.to_owned(),
+        name: db_name.clone(),
+    };
     let url = format!("{base}/{db_name}");
     let db = PgPoolOptions::new()
         .max_connections(2)
@@ -175,8 +243,7 @@ async fn scratch() -> Scratch {
     Scratch {
         engine,
         db,
-        admin,
-        db_name,
+        _guard: guard,
     }
 }
 
@@ -348,7 +415,9 @@ fn sort_nodes(plan: &[String]) -> Vec<&str> {
         .collect()
 }
 
-fn assert_index_walk(label: &str, statement: &str, plan: &[String]) {
+/// Assert that `plan` is a walk of the ordering index `index` (a name or a
+/// suffix of it) with no sort step and no filter under the scan.
+fn assert_index_walk(label: &str, statement: &str, plan: &[String], index: &str) {
     let shown = format!("{statement}\n{}", plan.join("\n"));
     eprintln!("{label}:\n{shown}\n");
     assert!(
@@ -357,8 +426,8 @@ fn assert_index_walk(label: &str, statement: &str, plan: &[String]) {
     );
     assert!(
         plan.iter()
-            .any(|l| l.contains("Index Scan") && l.contains("_pk_sk_s_base_pk_base_sk_s_idx")),
-        "{label}: the plan does not scan the ordering index:\n{shown}"
+            .any(|l| l.contains("Index Scan") && l.contains(index)),
+        "{label}: the plan does not scan the ordering index {index}:\n{shown}"
     );
     // Every predicate, the cursor included, is an index condition. A cursor
     // the index cannot seek on comes back as a Filter under the scan, and the
@@ -367,6 +436,28 @@ fn assert_index_walk(label: &str, statement: &str, plan: &[String]) {
         !plan.iter().any(|l| l.trim_start().starts_with("Filter:")),
         "{label}: the plan filters rows after the index scan instead of seeking on them:\n{shown}"
     );
+    // A resumed page's cursor compares every ORDER BY column, the ordering
+    // index's columns after `pk`, so the scan starts at the cursor. A cursor
+    // that leaves one out is still an index condition, but the scan reads
+    // every index entry between the start of the cursor's index sort key value
+    // and the cursor.
+    if statement.contains(") > ($") || statement.contains(") < ($") {
+        let order_by = statement
+            .split(" ORDER BY ")
+            .nth(1)
+            .and_then(|clause| clause.split(" LIMIT ").next())
+            .unwrap_or_default();
+        let columns: Vec<&str> = order_by
+            .split(", ")
+            .filter_map(|term| term.split_whitespace().next())
+            .collect();
+        let row = format!("ROW({})", columns.join(", "));
+        assert!(
+            plan.iter()
+                .any(|l| l.contains("Index Cond:") && l.contains(&row)),
+            "{label}: the cursor is not one index condition over {row}:\n{shown}"
+        );
+    }
 }
 
 /// One Query page through the engine; returns the page's (lsk, sk) keys and
@@ -450,30 +541,27 @@ async fn check_page(
     let (keys, statement) = page(s, key_info, sql_table, cond, forward, start, limit).await;
     assert_eq!(keys, expected, "{label}: rows");
     let generic = generic_plan(&s.db, &statement).await;
-    assert_index_walk(&format!("{label}, generic plan"), &statement, &generic);
+    assert_index_walk(
+        &format!("{label}, generic plan"),
+        &statement,
+        &generic,
+        LSI_ORDERING_INDEX,
+    );
     let custom = custom_plan(&s.db, &statement, values).await;
-    assert_index_walk(&format!("{label}, custom plan"), &statement, &custom);
+    assert_index_walk(
+        &format!("{label}, custom plan"),
+        &statement,
+        &custom,
+        LSI_ORDERING_INDEX,
+    );
 }
 
 #[tokio::test]
 async fn lsi_query_plans_as_an_index_walk_in_both_directions() {
-    let test = "lsi_query_plans_as_an_index_walk_in_both_directions";
-    if base_conn().is_none() {
-        return skip(test);
-    }
-    let s = scratch().await;
-    let version: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
-        .fetch_one(&s.db)
-        .await
-        .expect("read the server version");
-    if version < 160_000 {
-        eprintln!(
-            "SKIP {test}: EXPLAIN (GENERIC_PLAN) needs PostgreSQL 16 or later, the server \
-             reports server_version_num {version}."
-        );
-        s.cleanup().await;
+    let Some(s) = scratch_or_skip("lsi_query_plans_as_an_index_walk_in_both_directions").await
+    else {
         return;
-    }
+    };
     let (key_info, sql_table) = lsi_table(&s).await;
 
     // Every item of partition p in index order: index sort key, then base
@@ -586,6 +674,4 @@ async fn lsi_query_plans_as_an_index_walk_in_both_directions() {
         )
         .await;
     }
-
-    s.cleanup().await;
 }
