@@ -2129,12 +2129,7 @@ impl BackupCatalog for Fake {
             if let Some(delay) = delay {
                 tokio::time::sleep(delay).await;
             }
-            if let Some(gate) = gate {
-                gate.acquire()
-                    .await
-                    .expect("the gate is never closed")
-                    .forget();
-            }
+            pass(gate.as_deref()).await;
             self.register_restore(account_id, input, registration)
         })
     }
@@ -3088,12 +3083,7 @@ impl RestoreEngine for Fake {
             self.bulk_loads_started
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             let gate = self.bulk_load_gate.lock().unwrap().clone();
-            if let Some(gate) = gate {
-                gate.acquire()
-                    .await
-                    .expect("the gate is never closed")
-                    .forget();
-            }
+            pass(gate.as_deref()).await;
             let mut call = BulkLoadCall {
                 table_id: target.table_id.clone(),
                 file,
@@ -3104,12 +3094,7 @@ impl RestoreEngine for Fake {
             let mut failed = None;
             let item_gate = self.bulk_load_item_gate.lock().unwrap().clone();
             loop {
-                if let Some(gate) = &item_gate {
-                    gate.acquire()
-                        .await
-                        .expect("the gate is never closed")
-                        .forget();
-                }
+                pass(item_gate.as_deref()).await;
                 let Some(next) = items.next().await else {
                     break;
                 };
@@ -3267,12 +3252,7 @@ impl RestoreEngine for Fake {
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let gate = self.count_gate.lock().unwrap().clone();
         Box::pin(async move {
-            if let Some(gate) = gate {
-                gate.acquire()
-                    .await
-                    .expect("the gate is never closed")
-                    .forget();
-            }
+            pass(gate.as_deref()).await;
             // Take one error from the budget, if any is left: a
             // compare-exchange loop, since `fetch_update` is deprecated on
             // current stable and its replacement is unstable on 1.91.1.
@@ -3530,12 +3510,7 @@ impl SnapshotEngine for Fake {
                 (items.into_iter(), gate),
                 |(mut items, gate)| async move {
                     let next = items.next()?;
-                    if let Some(gate) = &gate {
-                        gate.acquire()
-                            .await
-                            .expect("the gate is never closed")
-                            .forget();
-                    }
+                    pass(gate.as_deref()).await;
                     Some((next, (items, gate)))
                 },
             )),
@@ -12121,6 +12096,16 @@ fn closed_gate() -> Arc<tokio::sync::Semaphore> {
     Arc::new(tokio::sync::Semaphore::new(0))
 }
 
+/// Wait for one permit of `gate`, when there is one, and keep it.
+async fn pass(gate: Option<&tokio::sync::Semaphore>) {
+    if let Some(gate) = gate {
+        gate.acquire()
+            .await
+            .expect("the gate is never closed")
+            .forget();
+    }
+}
+
 /// The settings the job tests run with: small files, a short heartbeat.
 fn job_settings() -> JobSettings {
     JobSettings {
@@ -19963,7 +19948,7 @@ async fn the_reconciler_fails_a_dead_restore_whose_target_has_no_tables() {
 /// registration is held by a gate the test opens only once both requests
 /// have met it: the in-flight entry ends with the retry's answer, so a
 /// request sent after the retry answered would meet the committed target
-/// instead (#951).
+/// at the name check (`check_restore_target_name`) instead (#951).
 #[tokio::test]
 async fn a_retry_waits_on_its_registration_and_another_backup_is_refused() {
     let (lines, _guard) = LogLines::capture();
