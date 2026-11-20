@@ -520,4 +520,4 @@ mod released_tests;
 #[cfg(test)]
 mod serve_tests;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
