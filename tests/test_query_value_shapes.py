@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import pytest
 
+from raw_signed_request import client_post
 from test_query_key_value_types import (  # noqa: F401  (ss_table is a fixture)
     LEGACY_PK,
     LIMIT_MSG,
@@ -30,22 +31,6 @@ from test_query_key_value_types import (  # noqa: F401  (ss_table is a fixture)
     SX,
     ss_table,
 )
-
-
-def _raw_query(client, body: dict):
-    """POST ``body`` as the Query JSON exactly as written, signed with the
-    client's credentials, so a field of the wrong JSON type reaches the server
-    (boto3 would refuse or reshape it)."""
-    import json
-
-    from botocore.awsrequest import AWSRequest
-
-    req = AWSRequest(method="POST", url=client.meta.endpoint_url, data=json.dumps(body),
-                     headers={"Content-Type": "application/x-amz-json-1.0",
-                              "X-Amz-Target": "DynamoDB_20120810.Query"})
-    client._request_signer.sign("Query", req)
-    resp = client._endpoint.http_session.send(req.prepare())
-    return resp.status_code, json.loads(resp.content.decode("utf-8", "replace") or "{}")
 
 
 SHAPE_FAULTS = [
@@ -92,12 +77,12 @@ class TestShapeFaultsAreReportedFirst:
 
     @pytest.mark.parametrize("row,body", SHAPE_FAULTS, ids=[r[0] for r in SHAPE_FAULTS])
     def test_rows(self, dynamodb_client, ss_table, row, body):
-        status, payload = _raw_query(dynamodb_client, {"TableName": ss_table, **body})
+        status, payload = client_post(dynamodb_client, "Query", {"TableName": ss_table, **body})
         assert status == 400
         assert payload.get("__type", "").endswith("SerializationException"), payload
 
     def test_control_without_a_shape_fault_answers_the_check(self, dynamodb_client, ss_table):
-        status, payload = _raw_query(dynamodb_client, {
+        status, payload = client_post(dynamodb_client, "Query", {
             "TableName": ss_table, "KeyConditionExpression": "pk = :p", "Limit": 0,
             "ExpressionAttributeValues": {":p": NB}})
         assert status == 400
@@ -183,7 +168,7 @@ class TestValuesTheServiceCannotReadAsOneType:
 
     @pytest.mark.parametrize("row,values,extra,expected", UNREADABLE, ids=[r[0] for r in UNREADABLE])
     def test_rows(self, dynamodb_client, ss_table, row, values, extra, expected):
-        status, payload = _raw_query(dynamodb_client, {
+        status, payload = client_post(dynamodb_client, "Query", {
             "TableName": ss_table, "KeyConditionExpression": "pk = :p",
             "ExpressionAttributeValues": {":p": SX, **values}, **extra})
         assert status == 400, payload
@@ -195,7 +180,7 @@ class TestValuesTheServiceCannotReadAsOneType:
         """A value the service cannot read as one type is named ahead of a
         number fault in another value: :z for this body on 28 of 28 requests
         (measured 2026-11-11)."""
-        status, payload = _raw_query(dynamodb_client, {
+        status, payload = client_post(dynamodb_client, "Query", {
             "TableName": ss_table, "KeyConditionExpression": "pk = :p",
             "ExpressionAttributeValues": {":p": SX, ":u": NB, ":z": X1}})
         assert status == 400, payload
@@ -274,7 +259,7 @@ class TestExpressionAttributeNamesOrder:
         names_member = {"ExpressionAttributeNames": names}
         body = {"TableName": ss_table, "KeyConditionExpression": "pk = :p",
                 **(names_member | rest if names_first else rest | names_member)}
-        _assert_validation(*_raw_query(dynamodb_client, body), expected)
+        _assert_validation(*client_post(dynamodb_client, "Query", body), expected)
 
     @pytest.mark.parametrize("names_first", [True, False], ids=["names first", "names last"])
     @pytest.mark.parametrize("row,names,values,expected", NAMES_WITHOUT_AN_EXPRESSION,
@@ -287,4 +272,4 @@ class TestExpressionAttributeNamesOrder:
         names_member = {"ExpressionAttributeNames": names}
         body = {"TableName": ss_table,
                 **(names_member | rest if names_first else rest | names_member)}
-        _assert_validation(*_raw_query(dynamodb_client, body), expected)
+        _assert_validation(*client_post(dynamodb_client, "Query", body), expected)

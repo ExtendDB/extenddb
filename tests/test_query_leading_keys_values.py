@@ -23,8 +23,9 @@ from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 
 from conftest import scoped_table
+from raw_signed_request import client_post
 from test_query_key_value_types import NB, NUMERIC
-from test_query_value_shapes import EMPTY_AV, INVALID_VALUE, X1, _raw_query
+from test_query_value_shapes import EMPTY_AV, INVALID_VALUE, X1
 
 
 class TestLeadingKeysWithAnInvalidKeyValue:
@@ -145,7 +146,7 @@ class TestLeadingKeysWithAnInvalidKeyValue:
                     "ExpressionAttributeValues": {":u": NB, ":z": X1}}
             expected = INVALID_VALUE + EMPTY_AV + " for key :z"
             for label, client in clients.items():
-                status, payload = _raw_query(client, body)
+                status, payload = client_post(client, "Query", body)
                 kind = payload.get("__type", "").rsplit("#", 1)[-1]
                 msg = payload.get("message", payload.get("Message"))
                 if (status, kind, msg) != (400, "ValidationException", expected):
