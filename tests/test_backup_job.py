@@ -964,7 +964,10 @@ def _wait_table_gone(ddb, name: str, timeout: float = 120.0) -> None:
         except ClientError as e:
             assert e.response["Error"]["Code"] == "ResourceNotFoundException", e.response["Error"]
             return
-        assert status == "CREATING", f"{name} is {status}, it was never writable"
+        # The removal of a failed restore's target can pass through DELETING
+        # (PostgreSQL's abort_restore sets it before the drop), so a poll can
+        # see either status. Neither is writable.
+        assert status in ("CREATING", "DELETING"), f"{name} is {status}, it was never writable"
         time.sleep(0.2)
     raise AssertionError(f"{name} still exists after {timeout} s")
 
