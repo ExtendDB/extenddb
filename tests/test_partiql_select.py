@@ -361,6 +361,28 @@ def test_limit_written_as_any_json_value(dynamodb_client, table, limit, expected
     assert pages == expected
 
 
+# A Limit on a write statement gets the same refusals, ahead of the table
+# lookup (measured 2026-11-20).
+WRITE_LIMITS = [
+    (statement, limit, expected)
+    for statement in [
+        "INSERT INTO \"extenddb-measure-2a-does-not-exist-xyz\" VALUE {'pk': 'k'}",
+        "UPDATE \"extenddb-measure-2a-does-not-exist-xyz\" SET a = 1 WHERE pk = 'k'",
+        "DELETE FROM \"extenddb-measure-2a-does-not-exist-xyz\" WHERE pk = 'k'",
+    ]
+    for limit, expected in [
+        ("2", ("SerializationException", "STRING_VALUE cannot be converted to Integer")),
+        (0.5, ("ValidationException", BELOW_ONE)),
+    ]
+]
+
+
+@pytest.mark.parametrize("statement, limit, expected", WRITE_LIMITS)
+def test_limit_on_a_write_statement(dynamodb_client, statement, limit, expected):
+    body = {"Statement": statement, "Limit": limit}
+    assert _raw_refusal(dynamodb_client, body)[:2] == expected
+
+
 # ---- index targeting -------------------------------------------------------
 
 def test_gsi_query(dynamodb_client, table):

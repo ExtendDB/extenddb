@@ -7,9 +7,11 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::types::saturated_int32;
 use serde_json::Value;
 
-/// Read a request member that the service reads as an int32, from any JSON
+/// Read a request member that the service reads as an int32, from a JSON
 /// number as [`saturated_int32`] reads it (measured on the `Limit` of
-/// `ExecuteStatement`, 2026-11-14 and 2026-11-18, us-east-1).
+/// `ExecuteStatement`, 2026-11-14, 2026-11-18 and 2026-11-20, us-east-1).
+/// A number beyond the range of a double fails the parse of the request
+/// body before this reader runs, where the service accepts `1e309`.
 /// A batch or transaction member's `Limit` is read but not used.
 ///
 /// # Errors

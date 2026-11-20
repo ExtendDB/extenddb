@@ -236,6 +236,8 @@ impl SingleRequest {
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             limit: crate::int32_member::read(body.get("Limit"))
+                // `check_execute_statement` has refused this `Limit` in ExecuteStatement, and the
+                // service ignores it in a batch or transaction member (measured 2026-11-20).
                 .unwrap_or_default()
                 .map(i64::from),
             next_token: body
