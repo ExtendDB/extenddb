@@ -720,10 +720,12 @@ its `S3Bucket`. An output configuration carrying `OutputType` with no
 `S3Bucket` is refused at Start with `Invalid Request:
 OutputS3Configuration.S3Bucket is invalid`. `S3KeyPrefix` stays optional;
 without it the report tree is written at the bucket root. `MaxWriteRequestUnits`
-is at least 1,024 and is a ceiling on the operation's write rate: when present, the runner paces
-the operation's writes at that many write request units per second (1 KB of
-item, rounded up, per unit). The server's own
-`bulk_put_write_units_per_second` ceiling applies on top of it.
+is at least 1,024 and caps the operation's write rate. When it is present, the
+runner paces the operation at that many write request units per second (1 KB,
+rounded up, per unit). As the service documents, the units count the table
+write and each global and local secondary index write. The server's own
+`bulk_put_write_units_per_second` ceiling applies on top of it and counts the
+table write only.
 `PerformanceTier` is validated, stored, and returned; it does not change how
 fast the operation runs. The description carries `TableDetails`, a one-entry
 list of the target table's bare name and its id, on the Start response and
