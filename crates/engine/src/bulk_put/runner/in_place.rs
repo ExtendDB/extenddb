@@ -1,8 +1,8 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Waiting on the output store while the lease is kept and the cursor
-//! stays where it is.
+//! Waiting on the output store or the write pacers while the lease is kept
+//! and the cursor stays where it is.
 //!
 //! The output check at the first report record, the report writes and the
 //! manifest write each wait on the store for up to its 120-second bound.
@@ -21,6 +21,11 @@
 //! cancelled or failed run still writes every report and its manifest, and
 //! a cancel that arrives during the writes is recorded by the terminal
 //! transition.
+//!
+//! The wait on the write pacers before a write batch renews the lease the
+//! same way, with [`Watch::LeaseOnly`]. The run's cursor already counts the
+//! batch's rows, so a boundary there would checkpoint past rows not yet
+//! written; a cancel is seen at the next boundary after the batch.
 
 use super::*;
 
@@ -134,7 +139,7 @@ async fn renew_in_place<T>(
     tracing::info!(
         account_id = %account,
         operation_id = %operation,
-        "lease renewed while the output store is waited on"
+        "lease renewed in place while the runner waits"
     );
     if watch == Watch::CancelAndTable && current.cancel_requested {
         return Err(InPlace::Cancelled);

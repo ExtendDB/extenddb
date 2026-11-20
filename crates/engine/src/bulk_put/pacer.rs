@@ -20,10 +20,12 @@
 //!   request units the operation consumes on the table and on all of its
 //!   indexes, so a row takes its item's units plus the units of its
 //!   projection into each global and local secondary index
-//!   ([`index_write_units`]). The runner takes them before the write as an
-//!   insert of the row would consume them, and settles the bucket after the
-//!   write from the item it replaced ([`WritePacer::settle`]). Absent, only
-//!   the process bucket applies.
+//!   ([`index_write_units`]). Vector index writes are charged in vector
+//!   bytes, a separate quantity that `BulkPutBytes` also leaves out, so they
+//!   do not count against `MaxWriteRequestUnits`. The runner takes the units
+//!   before the write as an insert of the row would consume them, and
+//!   settles the bucket after the write from the item it replaced
+//!   ([`WritePacer::settle`]). Absent, only the process bucket applies.
 //!
 //! The bucket holds one second of capacity and starts full, so a run opens
 //! at full rate and a short operation is not slowed. Tokens may go negative:
