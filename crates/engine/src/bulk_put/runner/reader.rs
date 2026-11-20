@@ -419,7 +419,11 @@ async fn process_row(
     let record_cap = deps.config.max_report_records;
     let byte_cap = deps.config.max_report_bytes;
 
-    let row = match rows::parse_row(line, deps.config.max_line_bytes) {
+    let row = match rows::parse_row(
+        line,
+        deps.config.max_line_bytes,
+        deps.storage.stores_nul_in_strings(),
+    ) {
         // A blank line consumes an index and touches no counter. The
         // caller already counted it toward the batch boundary and the
         // line cap, so the lease renews and a cancel is observed

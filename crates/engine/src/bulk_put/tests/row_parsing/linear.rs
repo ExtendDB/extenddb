@@ -26,7 +26,7 @@ fn parse_within_bound(line: String, label: &str) -> rows::Row {
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         // The receiver is gone once the bound has passed.
-        let _ = sender.send(rows::parse_row(&line, MAX_LINE));
+        let _ = sender.send(rows::parse_row(&line, MAX_LINE, true));
     });
     match receiver.recv_timeout(BOUND) {
         Ok(Ok(Some(row))) => row,

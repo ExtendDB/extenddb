@@ -12,7 +12,7 @@ use extenddb_core::types::attribute_value_size;
 use super::super::*;
 
 fn row(item: serde_json::Value) -> rows::Row {
-    rows::parse_row(&json!({ "Item": item }).to_string(), 4 * 1024 * 1024)
+    rows::parse_row(&json!({ "Item": item }).to_string(), 4 * 1024 * 1024, true)
         .unwrap()
         .expect("a row")
 }
@@ -31,6 +31,7 @@ fn a_number_set_member_that_is_not_a_string_fails_the_row_in_either_position() {
         rows::parse_row(
             &json!({ "Item": {"pk": {"S": "a"}, "ns": {"NS": set}} }).to_string(),
             4 * 1024 * 1024,
+            true,
         )
     };
     let first = parse(json!([1, "1"])).expect_err("a number member first fails the row");
@@ -107,7 +108,9 @@ fn a_conditional_row_records_its_repeated_members_too() {
         "ConditionExpression": "attribute_not_exists(pk)"
     })
     .to_string();
-    let parsed = rows::parse_row(&line, 1 << 20).unwrap().expect("a row");
+    let parsed = rows::parse_row(&line, 1 << 20, true)
+        .unwrap()
+        .expect("a row");
     assert!(parsed.condition.is_some());
     assert_eq!(parsed.repeated_member_bytes, 3);
 }

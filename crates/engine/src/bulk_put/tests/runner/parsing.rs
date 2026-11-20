@@ -358,16 +358,17 @@ async fn a_key_fault_over_the_limit_only_through_repeats_carries_no_image() {
     );
 }
 
-/// A string or attribute name containing U+0000 fails the row alone with
-/// a fixed message; the storage write never sees the row and the rows
-/// after it are written.
-#[tokio::test]
-async fn a_row_with_nul_in_a_string_fails_alone_and_the_file_continues() {
-    let h = Harness::new().await;
+/// U+0000 in a string value, an attribute name and a key value, the three
+/// shapes the service stored (measured 2026-11-19). `SQLite` stores each
+/// row and `GetItem` reads it back. PostgreSQL's `jsonb` cannot hold the
+/// character, so there each row fails alone with a fixed message, the
+/// storage write never sees it, and the row after them is written.
+async fn rows_holding_nul_case(backend: Backend) {
+    let h = Harness::on(backend).await;
     let rows = [
-        row(0),
-        r#"{"Item": {"pk": {"S": "k1"}, "sk": {"S": "s"}, "v": {"S": "a\u0000b"}}}"#.to_owned(),
-        r#"{"Item": {"pk": {"S": "k2"}, "sk": {"S": "s"}, "x\u0000y": {"N": "1"}}}"#.to_owned(),
+        r#"{"Item": {"pk": {"S": "k0"}, "sk": {"S": "s"}, "v": {"S": "a\u0000b"}}}"#.to_owned(),
+        r#"{"Item": {"pk": {"S": "k1"}, "sk": {"S": "s"}, "a\u0000b": {"S": "x"}}}"#.to_owned(),
+        r#"{"Item": {"pk": {"S": "k\u0000ey"}, "sk": {"S": "s"}, "v": {"S": "x"}}}"#.to_owned(),
         row(3),
     ];
     h.write_input("part-000.json", &file_of(&rows));
@@ -376,28 +377,47 @@ async fn a_row_with_nul_in_a_string_fails_alone_and_the_file_continues() {
         .run_to_end(files, input_config(false), both_reports(), config())
         .await;
 
-    assert_eq!(record.status, "COMPLETED_WITH_ERRORS");
     assert_eq!(record.processed_item_count, 4);
-    assert_eq!(record.failed_item_count, 2);
-    assert_eq!(h.count_items().await, 2);
-    assert!(h.get("k1").await.is_none());
-    assert!(h.get("k2").await.is_none());
-    assert!(
-        h.get("k3").await.is_some(),
-        "the row after the faults is written"
-    );
-    let report = h
-        .read_report(&record.operation_id, ReportKind::Error)
-        .expect("error report rendered");
-    assert_eq!(report.len(), 2);
-    for (i, record) in report.iter().enumerate() {
-        assert_eq!(
-            record["errorMessages"],
-            json!([crate::bulk_put::rows::NUL_IN_STRING_MESSAGE])
-        );
-        assert_eq!(record["itemLocation"]["itemIndex"], json!(i + 1));
+    assert!(h.get("k3").await.is_some(), "the row after them is written");
+    let report = h.read_report(&record.operation_id, ReportKind::Error);
+    match backend {
+        Backend::Sqlite => {
+            assert_eq!(record.status, "COMPLETED");
+            assert_eq!(record.failed_item_count, 0);
+            assert!(report.is_none(), "no row failed: {report:?}");
+            assert_eq!(h.count_items().await, 4);
+            for (pk, name, value) in [
+                ("k0", "v", "a\u{0}b"),
+                ("k1", "a\u{0}b", "x"),
+                ("k\u{0}ey", "v", "x"),
+            ] {
+                let item = h.get(pk).await.expect("the row is stored");
+                assert_eq!(item.get(name), Some(&AttributeValue::S(value.to_owned())));
+            }
+        }
+        Backend::Postgres => {
+            assert_eq!(record.status, "COMPLETED_WITH_ERRORS");
+            assert_eq!(record.failed_item_count, 3);
+            assert_eq!(h.count_items().await, 1);
+            let report = report.expect("error report rendered");
+            assert_eq!(report.len(), 3);
+            for (i, record) in report.iter().enumerate() {
+                assert_eq!(
+                    record["errorMessages"],
+                    json!([crate::bulk_put::rows::NUL_IN_STRING_MESSAGE])
+                );
+                assert_eq!(record["itemLocation"]["itemIndex"], json!(i));
+            }
+        }
     }
+    h.cleanup().await;
 }
+
+on_both_backends!(
+    rows_holding_nul_case,
+    rows_holding_nul_are_stored_on_sqlite,
+    rows_holding_nul_fail_alone_on_postgres
+);
 
 /// A line that is not valid UTF-8 is not well-formed JSON: the file is
 /// abandoned at that line with the parse-level message, and the bytes are

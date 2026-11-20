@@ -24,7 +24,7 @@ fn line_with_value(value: serde_json::Value) -> String {
 }
 
 fn parse(line: &str) -> Result<Option<rows::Row>, rows::RowError> {
-    rows::parse_row(line, 4 * 1024 * 1024)
+    rows::parse_row(line, 4 * 1024 * 1024, true)
 }
 
 fn expect_size_fault(line: &str, label: &str) {

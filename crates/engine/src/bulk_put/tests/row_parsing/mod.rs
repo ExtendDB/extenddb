@@ -12,9 +12,13 @@ mod repeats;
 
 #[test]
 fn plain_item_line_parses_with_no_condition() {
-    let row = rows::parse_row(r#"{"Item": {"pk": {"S": "a"}, "n": {"N": "1"}}}"#, 1 << 20)
-        .unwrap()
-        .expect("a plain item line is a row");
+    let row = rows::parse_row(
+        r#"{"Item": {"pk": {"S": "a"}, "n": {"N": "1"}}}"#,
+        1 << 20,
+        true,
+    )
+    .unwrap()
+    .expect("a plain item line is a row");
     assert_eq!(row.item["pk"], AttributeValue::S("a".to_owned()));
     assert_eq!(row.item["n"], AttributeValue::N("1".to_owned()));
     assert!(row.condition.is_none());
@@ -25,6 +29,7 @@ fn bare_condition_expression_is_carried() {
     let row = rows::parse_row(
         r#"{"Item": {"pk": {"S": "b"}}, "ConditionExpression": "attribute_not_exists(pk)"}"#,
         1 << 20,
+        true,
     )
     .unwrap()
     .expect("row");
@@ -42,7 +47,7 @@ fn expression_names_and_values_are_carried() {
         r##""ExpressionAttributeNames": {"#v": "v"}, "##,
         r##""ExpressionAttributeValues": {":max": {"N": "10"}}}"##
     );
-    let row = rows::parse_row(line, 1 << 20).unwrap().expect("row");
+    let row = rows::parse_row(line, 1 << 20, true).unwrap().expect("row");
     let condition = row.condition.expect("condition is carried");
     assert_eq!(condition.expression, "#v < :max");
     let names = condition.names.expect("names are carried");
@@ -63,6 +68,7 @@ fn an_unknown_top_level_key_abandons_the_file() {
     let error = rows::parse_row(
         r#"{"Item": {"pk": {"S": "a"}}, "SizeBytes": 42, "Comment": "x"}"#,
         1 << 20,
+        true,
     )
     .unwrap_err();
     assert_eq!(
@@ -73,7 +79,7 @@ fn an_unknown_top_level_key_abandons_the_file() {
 
 #[test]
 fn a_misspelled_item_key_answers_the_unknown_field_message_not_the_missing_item_one() {
-    let error = rows::parse_row(r#"{"Itme": {"pk": {"S": "a"}}}"#, 1 << 20).unwrap_err();
+    let error = rows::parse_row(r#"{"Itme": {"pk": {"S": "a"}}}"#, 1 << 20, true).unwrap_err();
     assert_eq!(
         error,
         rows::RowError::Parse(rows::UNKNOWN_FIELD_MESSAGE.to_owned())
@@ -82,6 +88,7 @@ fn a_misspelled_item_key_answers_the_unknown_field_message_not_the_missing_item_
     let error = rows::parse_row(
         r#"{"ConditionExpression": "attribute_not_exists(pk)"}"#,
         1 << 20,
+        true,
     )
     .unwrap_err();
     assert_eq!(
@@ -95,6 +102,7 @@ fn the_four_record_keys_together_are_accepted() {
     let row = rows::parse_row(
         r##"{"Item": {"pk": {"S": "a"}}, "ConditionExpression": "#v = :v", "ExpressionAttributeNames": {"#v": "v"}, "ExpressionAttributeValues": {":v": {"S": "x"}}}"##,
         1 << 20,
+        true,
     )
     .unwrap()
     .expect("a row with every allowed key parses");
@@ -108,12 +116,12 @@ fn the_four_record_keys_together_are_accepted() {
 #[test]
 fn nesting_at_sixty_three_levels_parses_and_sixty_four_abandons_the_file() {
     assert!(
-        rows::parse_row(&nested_item_line(63), 1 << 20)
+        rows::parse_row(&nested_item_line(63), 1 << 20, true)
             .unwrap()
             .is_some()
     );
     for depth in [64, 65, 200] {
-        let error = rows::parse_row(&nested_item_line(depth), 1 << 20).unwrap_err();
+        let error = rows::parse_row(&nested_item_line(depth), 1 << 20, true).unwrap_err();
         assert_eq!(
             error,
             rows::RowError::Parse(rows::NESTING_ABANDON_MESSAGE.to_owned()),
@@ -126,18 +134,20 @@ fn nesting_at_sixty_three_levels_parses_and_sixty_four_abandons_the_file() {
 fn brackets_inside_string_literals_do_not_count_toward_the_nesting_bound() {
     let brackets = "{[".repeat(200);
     let line = json!({"Item": {"pk": {"S": brackets}, "q": {"S": "a\"{[b"}}}).to_string();
-    let row = rows::parse_row(&line, 1 << 20).unwrap().expect("a row");
+    let row = rows::parse_row(&line, 1 << 20, true)
+        .unwrap()
+        .expect("a row");
     assert_eq!(row.item["pk"], AttributeValue::S(brackets));
 }
 
 #[test]
 fn blank_line_is_skipped() {
-    assert!(rows::parse_row("", 1 << 20).unwrap().is_none());
+    assert!(rows::parse_row("", 1 << 20, true).unwrap().is_none());
 }
 
 #[test]
 fn whitespace_only_line_is_skipped() {
-    assert!(rows::parse_row(" \t  ", 1 << 20).unwrap().is_none());
+    assert!(rows::parse_row(" \t  ", 1 << 20, true).unwrap().is_none());
 }
 
 // Row parsing: every parse-level fault carries the one abandon message.
@@ -242,6 +252,7 @@ fn a_duplicate_set_member_is_accepted_and_stored_deduplicated() {
     let row = rows::parse_row(
         r#"{"Item": {"pk": {"S": "a"}, "ss": {"SS": ["a", "a"]}, "ns": {"NS": ["1", "2", "1"]}, "m": {"M": {"bs": {"BS": ["AA==", "AA=="]}}}}}"#,
         1 << 20,
+        true,
     )
     .unwrap()
     .expect("a repeated member is not a fault");
@@ -270,6 +281,7 @@ fn a_set_under_an_attribute_named_like_a_type_tag_is_still_deduplicated() {
     let row = rows::parse_row(
         r#"{"Item": {"pk": {"S": "a"}, "SS": {"SS": ["x", "x"]}, "NS": {"NS": ["1", "1"]}, "BS": {"BS": ["AQ==", "AQ=="]}, "nested": {"M": {"SS": {"M": {"inner": {"SS": ["y", "y"]}}}}}, "list": {"L": [{"SS": ["z", "z"]}, {"M": {"BS": {"BS": ["AQ==", "AQ=="]}}}]}}}"#,
         1 << 20,
+        true,
     )
     .unwrap()
     .expect("a repeated member under a tag-named attribute is not a fault");
@@ -311,39 +323,43 @@ fn a_set_under_an_attribute_named_like_a_type_tag_is_still_deduplicated() {
     );
 }
 
+/// U+0000 in a key value, an attribute name, a string value, and a string set
+/// member in a map inside a list. The service stores the first three
+/// (measured). Where the backend stores the character the row parses with
+/// the character kept; where it cannot, the row fails alone.
 #[test]
-fn a_string_value_containing_nul_fails_the_row() {
-    assert_eq!(
-        item_message(r#"{"Item": {"pk": {"S": "a\u0000b"}}}"#),
-        rows::NUL_IN_STRING_MESSAGE
-    );
-}
-
-#[test]
-fn an_attribute_name_containing_nul_fails_the_row() {
-    assert_eq!(
-        item_message(r#"{"Item": {"pk": {"S": "a"}, "x\u0000y": {"N": "1"}}}"#),
-        rows::NUL_IN_STRING_MESSAGE
-    );
-}
-
-#[test]
-fn nul_nested_in_a_map_inside_a_list_fails_the_row() {
-    assert_eq!(
-        item_message(
-            r#"{"Item": {"pk": {"S": "a"}, "l": {"L": [{"M": {"k": {"SS": ["ok", "no\u0000"]}}}]}}}"#
-        ),
-        rows::NUL_IN_STRING_MESSAGE
-    );
+fn nul_fails_the_row_only_where_the_backend_cannot_store_it() {
+    for line in [
+        r#"{"Item": {"pk": {"S": "k\u0000ey"}}}"#,
+        r#"{"Item": {"pk": {"S": "a"}, "x\u0000y": {"N": "1"}}}"#,
+        r#"{"Item": {"pk": {"S": "a"}, "v": {"S": "a\u0000b"}}}"#,
+        r#"{"Item": {"pk": {"S": "a"}, "l": {"L": [{"M": {"k": {"SS": ["no\u0000", "ok"]}}}]}}}"#,
+    ] {
+        let submitted: serde_json::Value = serde_json::from_str(line).unwrap();
+        let row = rows::parse_row(line, 1 << 20, true)
+            .unwrap()
+            .expect("a row");
+        assert_eq!(
+            serde_json::to_value(&row.item).unwrap(),
+            submitted["Item"],
+            "{line}"
+        );
+        assert_eq!(
+            rows::parse_row(line, 1 << 20, false),
+            Err(rows::RowError::Item(rows::NUL_IN_STRING_MESSAGE.to_owned())),
+            "{line}"
+        );
+    }
 }
 
 #[test]
 fn a_binary_value_decoding_to_a_zero_byte_parses() {
-    // U+0000 is refused in text; a zero byte in a binary value is bytes
-    // and is stored as such.
+    // A backend that cannot store U+0000 in text still takes a zero byte in
+    // a binary value: it is bytes and is stored as such.
     let row = rows::parse_row(
         r#"{"Item": {"pk": {"S": "a"}, "b": {"B": "AAA="}}}"#,
         1 << 20,
+        false,
     )
     .unwrap()
     .expect("binary zero bytes parse");
@@ -353,7 +369,7 @@ fn a_binary_value_decoding_to_a_zero_byte_parses() {
 #[test]
 fn line_one_byte_over_the_cap_abandons_the_file() {
     let line = r#"{"Item": {"pk": {"S": "aaaaaaaa"}}}"#;
-    match rows::parse_row(line, line.len() - 1) {
+    match rows::parse_row(line, line.len() - 1, true) {
         Err(rows::RowError::Parse(message)) => assert_eq!(message, ABANDON),
         other => panic!("expected a parse-level error, got {other:?}"),
     }
@@ -362,7 +378,7 @@ fn line_one_byte_over_the_cap_abandons_the_file() {
 #[test]
 fn line_exactly_at_the_cap_parses() {
     let line = r#"{"Item": {"pk": {"S": "aaaaaaaa"}}}"#;
-    let row = rows::parse_row(line, line.len())
+    let row = rows::parse_row(line, line.len(), true)
         .unwrap()
         .expect("a line exactly at the cap is not over it");
     assert_eq!(row.item["pk"], AttributeValue::S("aaaaaaaa".to_owned()));
@@ -373,7 +389,7 @@ fn line_exactly_at_the_cap_parses() {
 #[test]
 fn row_missing_a_key_attribute_still_parses() {
     // The parser has no table schema; key checks belong to the runner.
-    let row = rows::parse_row(r#"{"Item": {"other": {"S": "a"}}}"#, 1 << 20)
+    let row = rows::parse_row(r#"{"Item": {"other": {"S": "a"}}}"#, 1 << 20, true)
         .unwrap()
         .expect("key validation is not the parser's");
     assert_eq!(row.item.len(), 1);
@@ -384,7 +400,7 @@ fn row_with_an_oversized_string_still_parses() {
     // 500 KB exceeds the 400 KB item cap; size checks belong to the runner.
     let big = "a".repeat(500 * 1024);
     let line = format!(r#"{{"Item": {{"pk": {{"S": "{big}"}}}}}}"#);
-    let row = rows::parse_row(&line, 1 << 20)
+    let row = rows::parse_row(&line, 1 << 20, true)
         .unwrap()
         .expect("item size validation is not the parser's");
     assert_eq!(row.item["pk"], AttributeValue::S(big));
@@ -397,7 +413,7 @@ fn row_with_an_oversized_string_still_parses() {
 #[test]
 fn names_without_an_expression_is_an_item_fault() {
     let line = r##"{"Item": {"pk": {"S": "a"}}, "ExpressionAttributeNames": {"#v": "v"}}"##;
-    match rows::parse_row(line, 1 << 20) {
+    match rows::parse_row(line, 1 << 20, true) {
         Err(rows::RowError::Item(message)) => assert_eq!(
             message,
             "ExpressionAttributeNames can only be specified when using expressions"
@@ -410,7 +426,7 @@ fn names_without_an_expression_is_an_item_fault() {
 fn values_without_an_expression_is_an_item_fault() {
     let line =
         r#"{"Item": {"pk": {"S": "a"}}, "ExpressionAttributeValues": {":max": {"N": "10"}}}"#;
-    match rows::parse_row(line, 1 << 20) {
+    match rows::parse_row(line, 1 << 20, true) {
         Err(rows::RowError::Item(message)) => assert_eq!(
             message,
             "ExpressionAttributeValues can only be specified when using expressions: \
@@ -426,7 +442,7 @@ fn both_maps_without_an_expression_answer_the_names_message() {
         r##"{"Item": {"pk": {"S": "a"}}, "ExpressionAttributeNames": {"#v": "v"}, "##,
         r##""ExpressionAttributeValues": {":max": {"N": "10"}}}"##
     );
-    match rows::parse_row(line, 1 << 20) {
+    match rows::parse_row(line, 1 << 20, true) {
         Err(rows::RowError::Item(message)) => assert_eq!(
             message,
             "ExpressionAttributeNames can only be specified when using expressions"
@@ -438,7 +454,7 @@ fn both_maps_without_an_expression_answer_the_names_message() {
 #[test]
 fn empty_names_map_without_an_expression_parses_unconditional() {
     let line = r#"{"Item": {"pk": {"S": "a"}}, "ExpressionAttributeNames": {}}"#;
-    let row = rows::parse_row(line, 1 << 20)
+    let row = rows::parse_row(line, 1 << 20, true)
         .unwrap()
         .expect("an empty map references nothing and does not trip the check");
     assert!(row.condition.is_none());
@@ -453,7 +469,7 @@ fn empty_condition_expression_with_a_names_map_fails_the_row() {
         r##"{"Item": {"pk": {"S": "a"}}, "ConditionExpression": "", "##,
         r##""ExpressionAttributeNames": {"#v": "v"}}"##
     );
-    match rows::parse_row(line, 1 << 20) {
+    match rows::parse_row(line, 1 << 20, true) {
         Err(rows::RowError::Item(message)) => assert_eq!(
             message,
             "ExpressionAttributeNames can only be specified when using expressions"
@@ -465,7 +481,7 @@ fn empty_condition_expression_with_a_names_map_fails_the_row() {
 #[test]
 fn empty_condition_expression_alone_parses_unconditional() {
     let line = r#"{"Item": {"pk": {"S": "a"}}, "ConditionExpression": ""}"#;
-    let row = rows::parse_row(line, 1 << 20)
+    let row = rows::parse_row(line, 1 << 20, true)
         .unwrap()
         .expect("an empty expression is no expression, matching PutItem");
     assert!(row.condition.is_none());
@@ -479,7 +495,7 @@ fn whitespace_padded_line_over_the_cap_abandons_the_file() {
     let line = format!("{json_part}{}", " ".repeat(30));
     let cap = json_part.len() + 10;
     assert!(line.len() > cap && json_part.len() < cap);
-    match rows::parse_row(&line, cap) {
+    match rows::parse_row(&line, cap, true) {
         Err(rows::RowError::Parse(message)) => assert_eq!(message, ABANDON),
         other => panic!("expected a parse-level error, got {other:?}"),
     }

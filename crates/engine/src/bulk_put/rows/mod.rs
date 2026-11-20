@@ -21,8 +21,9 @@
 //! - [`RowError::Item`] is an item-level fault the parser can see before
 //!   the runner does: a decoded attribute value that fails validation (an
 //!   empty set, a `NULL` that is not `true`), a string or attribute name
-//!   containing U+0000, an `ExpressionAttributeValues` entry that fails to
-//!   decode, or expression maps supplied without a `ConditionExpression`.
+//!   containing U+0000 on a backend that cannot store it, an
+//!   `ExpressionAttributeValues` entry that fails to decode, or expression
+//!   maps supplied without a `ConditionExpression`.
 //!   It fails the row alone and the file continues, carrying the `PutItem`
 //!   message for the same fault. A repeated set member is not a fault on
 //!   this path: the set is stored deduplicated, and the item size counts
@@ -165,8 +166,8 @@ struct RawRow {
 /// validation rule (an empty string, number or binary set; a duplicate set
 /// member), carrying the `PutItem` message for it; when an attribute name
 /// is repeated in the same attribute map (measured on the service); when
-/// an attribute name
-/// or string value contains U+0000 ([`NUL_IN_STRING_MESSAGE`]); when an
+/// an attribute name or string value contains U+0000 and `stores_nul` is
+/// false ([`NUL_IN_STRING_MESSAGE`]); when an
 /// `ExpressionAttributeValues` entry fails to decode or carries a number
 /// that does not convert, carrying that fault's single-item text wrapped in
 /// the map's own message (measured on the service); and when
@@ -187,7 +188,13 @@ struct RawRow {
 /// A row missing a key attribute or exceeding the item size limit parses
 /// here; those faults are item-level and are the runner's, through the
 /// `PutItem` validators.
-pub(crate) fn parse_row(line: &str, max_line_bytes: usize) -> Result<Option<Row>, RowError> {
+///
+/// `stores_nul` is the storage engine's `stores_nul_in_strings` answer.
+pub(crate) fn parse_row(
+    line: &str,
+    max_line_bytes: usize,
+    stores_nul: bool,
+) -> Result<Option<Row>, RowError> {
     if line.len() > max_line_bytes {
         return Err(parse_error());
     }
@@ -287,7 +294,7 @@ pub(crate) fn parse_row(line: &str, max_line_bytes: usize) -> Result<Option<Row>
             parse_error()
         }
     })?;
-    if item_contains_nul(&item) {
+    if !stores_nul && item_contains_nul(&item) {
         return Err(RowError::Item(NUL_IN_STRING_MESSAGE.to_owned()));
     }
     // An empty-string expression counts as absent, like in handle_put_item.

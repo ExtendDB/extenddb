@@ -39,7 +39,7 @@ fn parse_arn_message(input: &str) -> String {
 }
 
 fn abandon_message(line: &str) -> String {
-    match rows::parse_row(line, 1 << 20) {
+    match rows::parse_row(line, 1 << 20, true) {
         Err(rows::RowError::Parse(message)) => message,
         other => panic!("expected a parse-level error, got {other:?}"),
     }
@@ -55,7 +55,7 @@ fn nested_item_line(depth: usize) -> String {
 }
 
 fn item_message(line: &str) -> String {
-    match rows::parse_row(line, 1 << 20) {
+    match rows::parse_row(line, 1 << 20, true) {
         Err(rows::RowError::Item(message)) => message,
         other => panic!("expected an item-level error, got {other:?}"),
     }

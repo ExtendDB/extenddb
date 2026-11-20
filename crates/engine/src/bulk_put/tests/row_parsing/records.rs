@@ -107,6 +107,7 @@ fn a_number_outside_the_supported_range_is_still_the_rows_own_fault() {
     let row = rows::parse_row(
         r#"{"Item": {"pk": {"S": "a"}, "n": {"N": "1e1000"}}}"#,
         1 << 20,
+        true,
     )
     .expect("a magnitude fault is not a parse-level fault");
     assert!(row.is_some());
@@ -117,6 +118,7 @@ fn valid_numbers_in_the_item_still_parse() {
     let row = rows::parse_row(
         r#"{"Item": {"pk": {"S": "a"}, "n": {"N": "-0.5e3"}, "l": {"L": [{"N": "7"}]}}}"#,
         1 << 20,
+        true,
     )
     .unwrap()
     .expect("row");
@@ -247,7 +249,7 @@ fn an_empty_names_map_with_a_condition_fails_the_row() {
 #[test]
 fn an_empty_values_map_without_a_condition_still_parses_unconditional() {
     let line = r#"{"Item": {"pk": {"S": "a"}}, "ExpressionAttributeValues": {}}"#;
-    let row = rows::parse_row(line, 1 << 20)
+    let row = rows::parse_row(line, 1 << 20, true)
         .unwrap()
         .expect("an empty map references nothing and does not trip the check");
     assert!(row.condition.is_none());
@@ -282,7 +284,7 @@ fn line_with_maps(values_serialized: usize, names: Option<&str>) -> String {
 }
 
 fn parse(line: &str) -> Result<Option<rows::Row>, rows::RowError> {
-    rows::parse_row(line, 4 * 1024 * 1024)
+    rows::parse_row(line, 4 * 1024 * 1024, true)
 }
 
 fn expect_item_fault(line: &str, expected: &str, label: &str) {

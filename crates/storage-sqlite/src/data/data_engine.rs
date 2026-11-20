@@ -24,6 +24,12 @@ impl DataEngine for SqliteEngine {
         Some(self)
     }
 
+    /// An item is stored as JSON text, which writes U+0000 as the escape
+    /// `\u0000`, and a key value is bound as text with its length.
+    fn stores_nul_in_strings(&self) -> bool {
+        true
+    }
+
     fn put_item(
         &self,
         key_info: &TableKeyInfo,

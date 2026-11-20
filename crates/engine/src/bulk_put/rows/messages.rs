@@ -191,11 +191,12 @@ pub(crate) const EXPRESSION_SIZE_MESSAGE: &str =
 pub(crate) const MAX_EXPRESSION_SIZE_BYTES: usize = 1024 * 1024;
 
 /// The report message for an item whose attribute name or string value
-/// contains U+0000. The hosted service stores the character; ExtendDB's
-/// PostgreSQL backend cannot (`jsonb` refuses the byte, SQLSTATE 22021)
-/// and the single-item write path answers it with an internal error
-/// today. The bulk parser refuses the row ahead of the write so the fault
-/// names the row and the load continues; the message is ExtendDB's own.
+/// contains U+0000, on a backend that cannot store the character. The
+/// hosted service and ExtendDB's SQLite backend store it; the PostgreSQL
+/// backend cannot (`jsonb` refuses the byte, SQLSTATE 22021) and the
+/// single-item write path answers it with an internal error today. There
+/// the bulk parser refuses the row ahead of the write so the fault names
+/// the row and the load continues; the message is ExtendDB's own.
 pub(crate) const NUL_IN_STRING_MESSAGE: &str = "One or more parameter values were invalid: Attribute names and string values may not contain U+0000";
 
 /// The prefix of every `AttributeValue` deserializer message that names a

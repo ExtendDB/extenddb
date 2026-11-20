@@ -682,6 +682,16 @@ pub trait DataEngine: Send + Sync {
         None
     }
 
+    /// Whether item writes store U+0000 in attribute names and string values
+    /// and reads give it back unchanged. Where this is `false`, the bulk put
+    /// row parser fails a row that holds the character before it reaches
+    /// storage. The default is `false`, so a backend that has not checked
+    /// the character fails such a row there instead of in its write.
+    /// PostgreSQL keeps the default: `jsonb` refuses the character.
+    fn stores_nul_in_strings(&self) -> bool {
+        false
+    }
+
     /// Execute multiple get operations in a single consistent snapshot.
     ///
     /// Returns one `Option<Item>` per request, in the same order as `ops`.
