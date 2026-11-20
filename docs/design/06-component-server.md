@@ -356,15 +356,20 @@ ExtendDB's own `AccountId` dimension.
   every account's buckets are summed per operation. The table is not a
   dimension of this breakdown. Operations with no request in the window are
   omitted; results are sorted by operation name.
-  Each account's operation holds 301 one-second and 1,441 one-minute buckets
-  of 64 bytes, 111,488 bytes, so the breakdown holds at most
-  `accounts x operations x 111,488` bytes: with the 40 operations the server
-  dispatches, 4,459,520 bytes (4.25 MiB) per account. `accounts` counts the
-  accounts that sent a request in the last day (the 24-hour ring, 1,440 to
-  1,441 minutes): the metrics prune, every five minutes, drops the buckets of
-  an account's operation once that window holds none of its requests, and the
-  account once it holds no operation. The segments are recorded only for
-  authenticated requests.
+  Each account's operation holds a 64-byte bucket per second of the last five
+  minutes and per minute of the last day with a request. That is at most 301
+  one-second and 1,441 one-minute buckets, 111,488 bytes. So the breakdown
+  holds at most `accounts x operations x 111,488` bytes of buckets, plus about
+  340 bytes per pair for its keys and map entries. With the 40 operations the
+  server dispatches, an account that sends every operation every second holds
+  about 4.46 MB (4.25 MiB). An account that sends each operation once a day
+  holds about 14 KB. `accounts` counts the accounts that sent a request in the
+  last day. The metrics prune runs every five minutes. It drops the buckets of
+  an account's operation once its newest bucket left the 24-hour ring, 1,440 to
+  about 1,446 minutes after that request. It drops the account once it holds no
+  operation. The segments are recorded only for requests that reach dispatch. A
+  request refused by authentication, authorization, throttling or the
+  point-in-time recovery check adds none.
 - `source`: `"database"` when served from the persistent `MetricsStore`,
   `"memory"` when served from the in-process `MetricsCollector` fallback.
 

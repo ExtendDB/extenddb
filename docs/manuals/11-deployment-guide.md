@@ -361,25 +361,37 @@ ORDER BY mean_exec_time DESC LIMIT 10;
 
 ### Process Memory
 
-The server's resident memory does not grow with the number of requests
-served. Counter metrics are held for at most two minutes before they are
-flushed to the catalog, so the memory they occupy scales with the request
-rate (for example six 40-byte points per GetItem, held for 60 to 120 seconds)
-and not with uptime, and per-operation latency segments are summed into fixed
-time buckets per account and operation, at most 111,488 bytes (109 KiB)
-per operation an account has sent. With the 40 operations the server
-dispatches that is 4,459,520 bytes (4.25 MiB) per account that sent a
-request in the last day: the five-minute metrics prune drops the buckets of
-an account that has sent no request for a day. So the segments grow with the
-number of accounts that sent a request in the last day, and not with the
-request rate, the table count or uptime.
+The memory the metrics hold does not grow with the number of requests served.
+Counter metrics are held for at most two minutes before they are flushed to the
+catalog. So the memory they occupy scales with the request rate and not with
+uptime. A GetItem adds six 40-byte points, held for 60 to 120 seconds.
+Per-operation latency segments are summed into time buckets per account and
+operation. A bucket is 64 bytes and covers one second of the last five minutes
+or one minute of the last day. A bucket exists only for a second or minute in
+which the account sent that operation. An operation the account sends every
+second holds the most buckets, 1,742, which is 111,488 bytes (109 KiB). An
+operation the account sends once a day holds two buckets, about 340 bytes with
+its keys and map entries. With the 40 operations the server dispatches, an
+account that sends every operation every second holds about 4.46 MB (4.25 MiB)
+of buckets. An account that sends each operation once a day holds about 14 KB.
+The five-minute metrics prune drops the buckets of an account that sent no
+request for a day. That happens 1,440 to about 1,446 minutes after its last
+request. The buckets return to the allocator. The process's resident size can
+stay at the high-water mark the allocator reached. So the segments grow with
+the number of accounts that sent a request in the last day. They also grow with
+the seconds and minutes in which each of those accounts was active. They do not
+grow with the request rate, the table count or uptime. With
+`throttling_enabled = true` the throttle manager keeps a token bucket for every
+partition key it saw and never drops one. Resident memory then grows with the
+number of distinct partition keys written.
 
-Releases through 0.1.13 kept one latency segment record per data-plane
-request in memory for 24 hours, about 190 bytes per request. On those
-releases resident memory grows for the first 24 hours and then holds at the
-level set by the busiest 24-hour window the process has seen; it does not
-come down short of a restart. To run one of those releases until you upgrade,
-size the memory limit as
+Every release through 1.0.0 kept one latency segment record per data-plane
+request in memory for 24 hours, about 190 bytes per request. So does any later
+release before the one that carries this change. On those releases resident
+memory grows for the first 24 hours. It then holds at the level set by the
+busiest 24-hour window the process saw, and it does not come down short of a
+restart. To run one of those releases until you upgrade, size the memory limit
+as
 
 ```
 limit >= baseline + 190 bytes * requests_per_24h * 1.3
