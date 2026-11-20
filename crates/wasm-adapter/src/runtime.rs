@@ -290,7 +290,8 @@ fn creates_vector_index(body: &Value) -> bool {
 /// does — not treated as an enable. It does not check that the table exists
 /// first (the describe handler is not compiled here), so a request naming a
 /// missing table is answered from the specification rather than with
-/// `TableNotFoundException`; that limitation is documented in the README.
+/// `TableNotFoundException`. The README's refusal section documents this
+/// missing-table difference.
 #[cfg(target_arch = "wasm32")]
 fn no_store_answer(operation: &str, body: &Value) -> Option<Result<Value, DynamoDbError>> {
     let answer = match operation {
