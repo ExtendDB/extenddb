@@ -20,7 +20,7 @@ async fn body_keys(error: &DynamoDbError) -> Vec<String> {
     keys
 }
 
-/// The two errors measured with `Message` carry it under that key, as the
+/// The errors measured with `Message` carry it under that key, as the
 /// service sends them; the errors measured with `message` keep it.
 #[tokio::test]
 async fn the_message_key_follows_the_service_per_error() {
@@ -44,6 +44,12 @@ async fn the_message_key_follows_the_service_per_error() {
             .to_owned(),
     );
     assert_eq!(body_keys(&mismatch).await, ["Message", "__type"]);
+    let serialization = DynamoDbError::SerializationException(
+        "STRING_VALUE cannot be converted to Integer".to_owned(),
+    );
+    assert_eq!(body_keys(&serialization).await, ["Message", "__type"]);
+    let empty = DynamoDbError::SerializationException(String::new());
+    assert_eq!(body_keys(&empty).await, ["__type"]);
     for other in [
         DynamoDbError::ValidationException("One or more parameter values were invalid".into()),
         DynamoDbError::ConditionalCheckFailedException(
