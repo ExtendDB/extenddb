@@ -162,11 +162,21 @@ impl MetricsCollector {
         window: TimeWindow,
         account_id: Option<&str>,
     ) -> Vec<OperationSegments> {
-        // Clock read under the lock, paired with `record_segments`.
+        self.query_segments_with(window, account_id, Instant::now)
+    }
+
+    /// `query_segments` with the clock it reads, under the lock, paired with
+    /// `record_segments`.
+    pub(super) fn query_segments_with(
+        &self,
+        window: TimeWindow,
+        account_id: Option<&str>,
+        clock: impl FnOnce() -> Instant,
+    ) -> Vec<OperationSegments> {
         let Ok(store) = self.segments.read() else {
             return Vec::new();
         };
-        store.query(window, account_id, Instant::now())
+        store.query(window, account_id, clock())
     }
 
     /// `query_segments` with an injected clock, for tests.
@@ -177,10 +187,7 @@ impl MetricsCollector {
         account_id: Option<&str>,
         now: Instant,
     ) -> Vec<OperationSegments> {
-        let Ok(store) = self.segments.read() else {
-            return Vec::new();
-        };
-        store.query(window, account_id, now)
+        self.query_segments_with(window, account_id, || now)
     }
 }
 

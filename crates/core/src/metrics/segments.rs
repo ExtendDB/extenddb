@@ -6,19 +6,24 @@
 //! The console shows, per operation, the request count and the mean of each
 //! latency segment over a time window. Those are sums, so a request does not
 //! need to be stored: it is added into a time bucket at record time. Each
-//! operation of each account owns two fixed rings of buckets, one of 1-second
+//! operation of each account owns two rings of buckets, one of 1-second
 //! buckets covering the last 5 minutes and one of 1-minute buckets covering
-//! the last 24 hours. A bucket holds the count and six running sums, 64 bytes,
-//! and is overwritten in place when its ring position comes around again, so
-//! the memory per process is at most
-//! `accounts * operations * (FINE_SLOTS + COARSE_SLOTS) * 64` bytes. The
-//! server only records operations that pass `is_known_operation`, which caps
-//! `operations` at the size of the dispatch table, and only for a request
-//! that authenticated. `accounts` is the number of accounts that sent a
-//! request within the coarse ring's window, the last 1,440 to 1,441 minutes:
-//! the collector's prune, every five minutes, drops the rings of an account's
-//! operation once that window holds no bucket of theirs, and the account once
-//! it holds no operation.
+//! the last 24 hours. A bucket holds the count and six running sums, 64 bytes.
+//! A ring holds only the buckets of the slots that had a request, in slot
+//! order, and a record drops the buckets that have left the ring's window, so
+//! a ring never holds more than `FINE_SLOTS` or `COARSE_SLOTS` buckets and
+//! its allocation grows by doubling up to that length and no further. The
+//! memory per process is therefore at most
+//! `accounts * operations * (FINE_SLOTS + COARSE_SLOTS) * 64` bytes of
+//! buckets, reached only by a pair with a request in every second of the last
+//! five minutes and every minute of the last day; a pair with one request a
+//! day holds two buckets. The server only records operations that pass
+//! `is_known_operation`, which caps `operations` at the size of the dispatch
+//! table, and only for a request that reached dispatch. `accounts` is the
+//! number of accounts that sent a request within the coarse ring's window,
+//! the last 1,440 to 1,441 minutes: the collector's prune, every five minutes,
+//! drops the rings of an account's operation once its newest bucket has left
+//! that window, and the account once it holds no operation.
 //!
 //! The account is a key because `/metrics` filters the segments by account.
 //! A query without the filter sums every account's buckets per operation.
@@ -26,7 +31,7 @@
 //! Issue #397: one `SegmentPoint` per request grew to about 4.3 GiB in a day at
 //! 274 requests per second.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::Instant;
 
 use super::types::{LatencySegments, OperationSegments, TimeWindow};
@@ -83,53 +88,73 @@ impl Bucket {
     }
 }
 
-/// A fixed ring of buckets. Slot `k` covers elapsed seconds
-/// `[k * width, (k + 1) * width)` and lives at position `k % len`.
+/// A ring of buckets. Slot `k` covers elapsed seconds
+/// `[k * width, (k + 1) * width)`. Only the slots that had a request have a
+/// bucket, in slot order with the newest at the back, and never more than
+/// `len` of them: a record at slot `k` drops the buckets of slots before
+/// `k + 1 - len` first.
 #[derive(Debug)]
 struct Ring {
     width_secs: u64,
-    buckets: Box<[Bucket]>,
+    /// Most buckets held, and the capacity the deque grows to and no further.
+    len: usize,
+    buckets: VecDeque<Bucket>,
 }
 
 impl Ring {
-    fn new(width_secs: u64, slots: usize) -> Self {
+    fn new(width_secs: u64, len: usize) -> Self {
         Self {
             width_secs,
-            buckets: vec![Bucket::default(); slots].into_boxed_slice(),
+            len,
+            buckets: VecDeque::new(),
         }
     }
 
     fn slots(&self) -> u64 {
-        self.buckets.len() as u64
+        self.len as u64
     }
 
     /// Adds one request observed `elapsed_secs` after the epoch.
     fn record(&mut self, elapsed_secs: u64, segments: &LatencySegments) {
         let slot = elapsed_secs / self.width_secs;
-        #[allow(clippy::cast_possible_truncation)] // slot % len < len <= usize::MAX
-        let position = (slot % self.slots()) as usize;
-        let bucket = &mut self.buckets[position];
-        if bucket.slot < slot {
-            // The position comes around again: drop what the previous lap left.
-            *bucket = Bucket {
-                slot,
-                ..Bucket::default()
-            };
+        if let Some(newest) = self.buckets.back_mut()
+            && newest.slot >= slot
+        {
+            // The same slot, or a record behind the newest one, which the
+            // clock read under the lock rules out: counted in the newest.
+            newest.add(segments);
+            return;
         }
-        // `bucket.slot > slot` means this record lags the newest one by a full
-        // ring, which monotonic time rules out; it is counted where it lands.
+        let first_kept = (slot + 1).saturating_sub(self.slots());
+        while self.buckets.front().is_some_and(|b| b.slot < first_kept) {
+            self.buckets.pop_front();
+        }
+        if self.buckets.len() == self.buckets.capacity() {
+            // Double the capacity, up to the ring length: after the pops at
+            // most `len - 1` buckets are held, so `len - held` is at least 1.
+            let held = self.buckets.len();
+            self.buckets.reserve_exact(held.max(1).min(self.len - held));
+        }
+        let mut bucket = Bucket {
+            slot,
+            ..Bucket::default()
+        };
         bucket.add(segments);
+        self.buckets.push_back(bucket);
     }
 
     /// Sums every bucket whose slot is at or after `first_slot` into `acc`.
-    /// Slots left over from an earlier lap are older than `first_slot` for
-    /// every window this ring serves, so no separate staleness check is needed.
+    /// The buckets are in slot order, so this reads only the window's slots.
     fn sum_from(&self, first_slot: u64, acc: &mut Bucket) {
-        for b in &self.buckets {
-            if b.slot >= first_slot && b.count > 0 {
-                acc.add_bucket(b);
-            }
+        let start = self.buckets.partition_point(|b| b.slot < first_slot);
+        for b in self.buckets.range(start..) {
+            acc.add_bucket(b);
         }
+    }
+
+    /// Whether the newest bucket is at or after `first_slot`.
+    fn holds_from(&self, first_slot: u64) -> bool {
+        self.buckets.back().is_some_and(|b| b.slot >= first_slot)
     }
 
     /// First slot included in a query made `elapsed_secs` after the epoch for
@@ -183,7 +208,7 @@ pub(super) struct SegmentStore {
     epoch: Instant,
     /// The rings of each operation, under the account that sent the request.
     /// Two maps rather than one keyed by the pair, so a record probes with
-    /// the borrowed names and allocates nothing after the first request of an
+    /// the borrowed names and allocates no key after the first request of an
     /// account's operation.
     by_account: HashMap<String, HashMap<String, OperationRings>>,
 }
@@ -206,9 +231,9 @@ impl SegmentStore {
     }
 
     /// Adds one request of `account_id`. Steady state is two hash lookups and
-    /// two bucket updates; the only allocation is the rings of an account's
-    /// operation that has none, because it is the first request or because
-    /// `prune` dropped them.
+    /// two bucket updates. The allocations are the keys of a pair's first
+    /// request and the growth of its rings, which doubles up to the ring
+    /// length and stops there.
     pub(super) fn record(
         &mut self,
         account_id: &str,
@@ -251,10 +276,10 @@ impl SegmentStore {
         let elapsed = self.elapsed_secs(now);
         let (fine, window_secs) = ring_for(window);
         let mut by_operation: BTreeMap<&str, Bucket> = BTreeMap::new();
-        for (account, operations) in &self.by_account {
-            if account_id.is_some_and(|a| a != account) {
-                continue;
-            }
+        // One account's rings when filtered, every account's when not.
+        let one = account_id.and_then(|a| self.by_account.get(a));
+        let all = account_id.is_none().then(|| self.by_account.values());
+        for operations in one.into_iter().chain(all.into_iter().flatten()) {
             for (operation, rings) in operations {
                 let ring = if fine { &rings.fine } else { &rings.coarse };
                 let acc = by_operation.entry(operation).or_default();
@@ -283,31 +308,41 @@ impl SegmentStore {
             .collect()
     }
 
-    /// Drops the rings of each account's operation whose coarse ring holds no
-    /// bucket of the whole-ring window at `now`, then each account left with
+    /// Drops the rings of each account's operation whose newest coarse bucket
+    /// has left the whole-ring window at `now`, then each account left with
     /// no operation. The fine ring's windows lie inside the coarse ring's, so
     /// no query answer changes; an account that has sent no request for the
-    /// length of the coarse ring releases its memory.
+    /// length of the coarse ring releases its memory to the allocator. The
+    /// check is one comparison per pair.
     pub(super) fn prune(&mut self, now: Instant) {
         let elapsed = self.elapsed_secs(now);
         self.by_account.retain(|_, operations| {
             operations.retain(|_, rings| {
                 let ring = &rings.coarse;
-                let mut in_window = Bucket::default();
-                ring.sum_from(ring.first_slot(elapsed, None), &mut in_window);
-                in_window.count > 0
+                ring.holds_from(ring.first_slot(elapsed, None))
             });
             !operations.is_empty()
         });
     }
 
-    /// Number of buckets allocated, the quantity the memory bound is stated in.
+    /// Number of buckets held, the quantity the memory bound is stated in.
     #[cfg(test)]
     pub(super) fn bucket_count(&self) -> usize {
         self.by_account
             .values()
             .flat_map(HashMap::values)
             .map(|r| r.fine.buckets.len() + r.coarse.buckets.len())
+            .sum()
+    }
+
+    /// Number of buckets allocated, held or spare: the bucket memory is this
+    /// times [`Self::bucket_size`].
+    #[cfg(test)]
+    pub(super) fn bucket_capacity(&self) -> usize {
+        self.by_account
+            .values()
+            .flat_map(HashMap::values)
+            .map(|r| r.fine.buckets.capacity() + r.coarse.buckets.capacity())
             .sum()
     }
 

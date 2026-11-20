@@ -196,7 +196,7 @@ fn record_and_query_segments() {
 }
 
 #[test]
-fn prune_keeps_recent_segments_and_the_ring_ages_them_out() {
+fn prune_keeps_recent_segments_and_drops_them_a_day_later() {
     use crate::metrics::types::LatencySegments;
     use std::time::Duration;
 
@@ -233,6 +233,48 @@ fn prune_keeps_recent_segments_and_the_ring_ages_them_out() {
         c.query_segments_at(TimeWindow::LastDay, None, later)
             .is_empty()
     );
+    // The buckets are still held until the collector's prune runs at that
+    // time; then the account's rings and the account are gone.
+    let held = |c: &MetricsCollector| {
+        c.segments
+            .read()
+            .map(|s| s.bucket_count())
+            .unwrap_or(usize::MAX)
+    };
+    assert_eq!(held(&c), 2);
+    c.prune_at(later);
+    assert_eq!(held(&c), 0);
+}
+
+/// `record_segments` and `query_segments` read the clock under the lock: a
+/// clock that runs while the lock is free fails these checks.
+#[test]
+fn segment_record_and_query_read_the_clock_under_the_lock() {
+    use crate::metrics::types::LatencySegments;
+    use std::sync::TryLockError;
+    use std::time::Instant;
+
+    let c = MetricsCollector::new();
+    let point = LatencySegments {
+        total_us: 10.0,
+        ..LatencySegments::default()
+    };
+    c.record_segments_with(ACCOUNT, "GetItem", &point, || {
+        assert!(
+            matches!(c.segments.try_read(), Err(TryLockError::WouldBlock)),
+            "record read the clock before taking the write lock"
+        );
+        Instant::now()
+    });
+    let out = c.query_segments_with(TimeWindow::AllTime, None, || {
+        assert!(
+            matches!(c.segments.try_write(), Err(TryLockError::WouldBlock)),
+            "query read the clock before taking the read lock"
+        );
+        Instant::now()
+    });
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].count, 1);
 }
 
 #[test]

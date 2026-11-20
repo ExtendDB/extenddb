@@ -112,25 +112,41 @@ impl MetricsCollector {
     /// the bound by the table count, and the console reads per-operation
     /// averages.
     pub fn record_segments(&self, account_id: &str, operation: &str, segments: &LatencySegments) {
-        // The clock is read under the lock, as in `query_segments`, so a stored
-        // record is never ahead of a query that follows it; otherwise a writer
-        // that crosses a bucket boundary between its clock read and its lock
-        // could overwrite the oldest in-window bucket before a reader with an
-        // earlier clock reads it.
+        self.record_segments_with(account_id, operation, segments, Instant::now);
+    }
+
+    /// `record_segments` with the clock it reads. The clock is read under the
+    /// lock, as in `query_segments`, so a stored record is never ahead of a
+    /// query that follows it; otherwise a writer that crosses a bucket
+    /// boundary between its clock read and its lock could drop the oldest
+    /// in-window bucket before a reader with an earlier clock reads it.
+    pub(super) fn record_segments_with(
+        &self,
+        account_id: &str,
+        operation: &str,
+        segments: &LatencySegments,
+        clock: impl FnOnce() -> Instant,
+    ) {
         let Ok(mut store) = self.segments.write() else {
             return;
         };
-        store.record(account_id, operation, segments, Instant::now());
+        store.record(account_id, operation, segments, clock());
     }
 
     /// Prune data points older than 1 day.
     ///
-    /// Segment buckets inside the window are overwritten in place as time
-    /// advances; the prune drops the rings of an account's operation once no
-    /// bucket of the last day remains, so an account that stopped sending
-    /// requests, or was deleted, holds no segment memory after a day.
+    /// Segment buckets leave their ring as time advances; the prune drops the
+    /// rings of an account's operation once its newest bucket is older than a
+    /// day, so an account that stopped sending requests, or was deleted, frees
+    /// its segment buckets after a day.
     pub fn prune(&self) {
-        let now = Instant::now();
+        self.prune_at(Instant::now());
+    }
+
+    /// `prune` at the clock `now`, which may be read before the locks: a
+    /// point or a segment recorded in between is newer than `now`, so the
+    /// prune keeps it.
+    pub(super) fn prune_at(&self, now: Instant) {
         let cutoff = now.checked_sub(Duration::from_secs(86400)).unwrap_or(now);
         let Ok(mut map) = self.data.write() else {
             return;
@@ -140,9 +156,8 @@ impl MetricsCollector {
         }
         map.retain(|_, acc| !acc.is_empty());
         drop(map);
-        // Clock read under the lock, as in `record_segments`.
         if let Ok(mut store) = self.segments.write() {
-            store.prune(Instant::now());
+            store.prune(now);
         }
     }
 }
