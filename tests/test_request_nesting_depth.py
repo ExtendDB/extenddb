@@ -203,22 +203,36 @@ def test_a_body_far_past_the_ceiling_is_a_messageless_serialization_error(
     assert _is_messageless_serialization_error(resp.json()), resp.text
 
 
-def _unauthenticated_put(dynamodb_client, endpoint_url, body: bytes, signing: str):
-    """POST a raw PutItem body with no Authorization header ("unsigned"), or
+def _unauthenticated_post(
+    dynamodb_client, endpoint_url, body: bytes, signing: str, operation="PutItem"
+):
+    """POST a raw `operation` body with no Authorization header ("unsigned"),
     signed with the caller's access key and a wrong secret key
-    ("bad-signature")."""
+    ("bad-signature"), or signed for an access key that does not exist
+    ("unknown-key")."""
     endpoint = dynamodb_client.meta.endpoint_url
     if signing == "unsigned":
         return requests.post(
             endpoint,
             data=body,
             headers={
-                "X-Amz-Target": "DynamoDB_20120810.PutItem",
+                "X-Amz-Target": f"DynamoDB_20120810.{operation}",
                 "Content-Type": "application/x-amz-json-1.0",
             },
             # ExtendDB serves a self-signed certificate; the service does not.
             verify=endpoint_url is None,
             timeout=30,
+        )
+    if signing == "unknown-key":
+        # Not the documented example key: dev mode seeds that pair as a
+        # working credential.
+        return signed_post(
+            endpoint,
+            "AKIAEXAMPLEEXAMPLE01",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            dynamodb_client.meta.region_name,
+            operation,
+            body,
         )
     frozen = boto3.Session().get_credentials().get_frozen_credentials()
     secret = frozen.secret_key
@@ -228,7 +242,7 @@ def _unauthenticated_put(dynamodb_client, endpoint_url, body: bytes, signing: st
         frozen.access_key,
         wrong_secret,
         dynamodb_client.meta.region_name,
-        "PutItem",
+        operation,
         body,
         session_token=frozen.token,
     )
@@ -252,7 +266,7 @@ def test_a_malformed_deep_body_is_refused_before_authentication(
         if wrappers is None
         else _raw_put_body(table, "malformed", wrappers)[:-1]
     )
-    resp = _unauthenticated_put(dynamodb_client, endpoint_url, body, signing)
+    resp = _unauthenticated_post(dynamodb_client, endpoint_url, body, signing)
     assert resp.status_code == 400, resp.text
     assert _is_messageless_serialization_error(resp.json()), resp.text
 
@@ -272,7 +286,7 @@ def test_a_complete_deep_body_reaches_authentication(
     # InvalidSignatureException (2 of 2 sends each, us-east-1, 2026-11-19).
     # ExtendDB's type for the first is MissingAuthenticationToken (#1075).
     body = _raw_put_body(table, "unauthenticated", wrappers) + tail
-    resp = _unauthenticated_put(dynamodb_client, endpoint_url, body, signing)
+    resp = _unauthenticated_post(dynamodb_client, endpoint_url, body, signing)
     assert resp.status_code == 400, resp.text
     expected = (
         "MissingAuthenticationToken"

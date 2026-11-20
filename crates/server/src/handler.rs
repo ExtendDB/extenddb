@@ -98,13 +98,19 @@ pub(crate) async fn handle_request(
     // every depth but refuses an over deep body only after it (measured
     // 2026-11-19: unsigned, a 20000 wrapper PutItem is
     // MissingAuthenticationTokenException, and the same body without its last
-    // byte SerializationException). A body within serde_json's default depth
+    // byte SerializationException). Its check passes a body of zero bytes
+    // (measured 2026-11-20: unsigned, an empty DescribeTable body is
+    // MissingAuthenticationTokenException, and a body of one space is
+    // SerializationException). So an empty body is parsed, and refused, only
+    // after authentication. Any other body within serde_json's default depth
     // is parsed here, as it always was. A deeper one only has its syntax
     // checked, by a walk that does not recurse, until the caller is
     // authenticated, so no unauthenticated request makes this thread recurse
     // past that depth (see request_parse).
     let depth = crate::request_parse::nesting_depth(&body);
-    let pre_auth_input = if depth <= crate::request_parse::UNAUTHENTICATED_PARSE_DEPTH {
+    let pre_auth_input = if body.is_empty() {
+        None
+    } else if depth <= crate::request_parse::UNAUTHENTICATED_PARSE_DEPTH {
         match crate::request_parse::parse_request_value(&body, depth) {
             Ok(v) => Some(v),
             Err(e) => return error_response(&e, &request_id),
@@ -124,8 +130,8 @@ pub(crate) async fn handle_request(
     #[allow(clippy::cast_precision_loss)]
     let auth_us = auth_start.elapsed().as_micros() as f64;
 
-    // A body deeper than the pre-auth depth is parsed now, on a thread whose
-    // stack `REQUEST_WORKER_STACK_SIZE` sizes for the ceiling.
+    // An empty body, or one deeper than the pre-auth depth, is parsed now, on
+    // a thread whose stack `REQUEST_WORKER_STACK_SIZE` sizes for the ceiling.
     let input: Value = match pre_auth_input {
         Some(v) => v,
         None => match crate::request_parse::parse_request_value(&body, depth) {
