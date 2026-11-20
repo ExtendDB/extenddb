@@ -1054,13 +1054,15 @@ The records kept per operation are capped by `max_bulk_report_records`
 (default 1,000,000) and their serialized size by `max_bulk_report_bytes`
 (default 1 GiB). The caps cover both report kinds together. They are
 ExtendDB's own: the service documents no cap on a report. Records are kept
-in the order the rows are read until a cap is reached. Each record past a cap
-is dropped and counted, and the counters are unaffected. Once a record is
-dropped, `DescribeBulkOperation` returns the count in
-`DroppedReportRecordCount` (see Counters). When the operation ends, the
-server logs the count and records it in the `BulkReportRecordsDropped`
-metric (see the Admin Guide). The report and the manifest keep the service's
-shape, so tooling written for them reads them unchanged.
+in the order the rows are read. A record is dropped and counted when the
+kept records already reach `max_bulk_report_records`, or when its bytes
+would take the kept bytes past `max_bulk_report_bytes`. The counters are
+unaffected. Once a record is dropped, `DescribeBulkOperation` returns the
+count in `DroppedReportRecordCount` (see Counters). When the operation
+ends, the server logs the count and records it in the
+`BulkReportRecordsDropped` metric (see the Admin Guide). The report and the
+manifest keep the service's shape, so tooling written for them reads them
+unchanged.
 
 After the reports, every operation that read input writes a manifest to
 `{S3KeyPrefix}/AWSDynamoDB/BulkOperation/{account}:{operation id}/manifest-files.json`,

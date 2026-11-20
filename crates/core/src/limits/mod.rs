@@ -145,8 +145,9 @@ pub struct LimitsConfig {
     /// `DroppedReportRecordCount` and the `BulkReportRecordsDropped` metric.
     #[serde(default = "default_max_bulk_report_records")]
     pub max_bulk_report_records: u64,
-    /// Serialized bytes of report records kept per bulk operation; records
-    /// beyond it are dropped and counted as for `max_bulk_report_records`.
+    /// Serialized bytes of report records kept per bulk operation; a record
+    /// whose bytes would take the kept bytes past it is dropped and counted
+    /// as for `max_bulk_report_records`.
     #[serde(default = "default_max_bulk_report_bytes")]
     pub max_bulk_report_bytes: u64,
     /// Ceiling on bulk put writes in this process, in write request units
