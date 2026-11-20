@@ -478,8 +478,8 @@ The two configurations carry the members the service defines:
 | `OutputS3Configuration.S3KeyPrefix` | no | At most 1024 characters, and at least 3 when present. The report keys start with it. |
 | `OutputS3Configuration.S3BucketOwner` | no | Twelve digits: the account the report bucket must belong to. Absent, the description carries the caller's account id. |
 | `OutputS3Configuration.OutputType` | yes | The report kinds to write: `ERROR`, `CONDITION_CHECK_FAILURE`, or both. |
-| `OutputS3Configuration.S3SseAlgorithm` | no | `AES256` or `KMS`. |
-| `OutputS3Configuration.S3SseKmsKeyId` | no | 1 to 2048 characters: the KMS key for `KMS`. |
+| `OutputS3Configuration.S3SseAlgorithm` | no | `AES256` or `KMS`. `KMS` needs `S3SseKmsKeyId`. |
+| `OutputS3Configuration.S3SseKmsKeyId` | no | 1 to 2048 characters: the KMS key for `KMS`. Start refuses it with `AES256` and without an algorithm. |
 
 The operator chooses where those buckets resolve, with `[bulk] store` in the
 server configuration (see the [Admin Guide](05-admin-guide.md)): AWS S3, an

@@ -143,6 +143,7 @@ pub async fn handle_start_bulk_put_items(
         OUTPUT_BUCKET_MEMBER,
     )?;
     prefix::check_prefixes(ctx, &input)?;
+    validate_output_encryption(&input.output_s3_configuration)?;
     let input_config = serialize_output(&input.input_s3_configuration)?;
     let output_config = serialize_output(&input.output_s3_configuration)?;
     // The description echoes the caller's account as the owner of both

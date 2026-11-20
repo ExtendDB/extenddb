@@ -197,8 +197,9 @@ impl<'a> BucketRef<'a> {
 }
 
 impl OutputSse {
-    /// The encryption the output configuration asks for. A key id is kept
-    /// only with `KMS`, the algorithm that uses one.
+    /// The encryption the output configuration asks for. Start refuses a
+    /// key id without `KMS` and `KMS` without a key id, so a key id here
+    /// always comes with `KMS`.
     pub(crate) fn of(output: &OutputS3Configuration) -> Self {
         match output.s3_sse_algorithm {
             None => Self::None,

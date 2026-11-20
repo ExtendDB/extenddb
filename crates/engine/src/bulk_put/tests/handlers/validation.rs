@@ -117,7 +117,11 @@ async fn an_s3_sse_kms_key_id_outside_the_model_bounds_is_rejected() {
             )
         );
     }
-    let body = with_output(start_body(), "S3SseKmsKeyId", json!("k".repeat(2048)));
+    let body = with_output(
+        with_output(start_body(), "S3SseAlgorithm", json!("KMS")),
+        "S3SseKmsKeyId",
+        json!("k".repeat(2048)),
+    );
     start_ok(&base_ctx(&h), body).await;
 }
 

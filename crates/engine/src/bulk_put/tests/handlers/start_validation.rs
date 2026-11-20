@@ -270,9 +270,51 @@ async fn a_configuration_string_containing_a_nul_byte_is_rejected() {
     // refuses U+0000 in strings, so step 2 rejects the byte in any string
     // field of the two configurations.
     let h = Harness::new().await;
-    let body = with_output(start_body(), "S3SseKmsKeyId", json!("key\u{0}id"));
+    let body = with_output(
+        with_output(start_body(), "S3SseAlgorithm", json!("KMS")),
+        "S3SseKmsKeyId",
+        json!("key\u{0}id"),
+    );
     let message = expect_validation(start(&base_ctx(&h), body).await);
     assert_eq!(message, "S3 configuration contains an invalid character");
+}
+
+/// The output encryption pairs the service refuses at Start, each with its
+/// own message (measured 2026-11-19, twice each).
+#[tokio::test]
+async fn an_inconsistent_output_encryption_pair_is_rejected() {
+    let h = Harness::new().await;
+    let key = "arn:aws:kms:us-east-1:111111111111:key/00000000-0000-0000-0000-000000000000";
+    for (algorithm, key_id, expected) in [
+        (
+            Some("KMS"),
+            None,
+            "Invalid Request: OutputS3Configuration.S3SseKmsKeyId cannot be empty for when \
+             OutputS3Configuration.S3SseAlgorithm is 'KMS'",
+        ),
+        (
+            Some("AES256"),
+            Some(key),
+            "Invalid Request: Cannot provide OutputS3Configuration.S3SseKmsKeyId when \
+             OutputS3Configuration.S3SseAlgorithm is 'AES256'",
+        ),
+        (
+            None,
+            Some(key),
+            "Invalid Request: OutputS3Configuration.S3SseAlgorithm is required when \
+             OutputS3Configuration.S3SseKmsKeyId is provided",
+        ),
+    ] {
+        let mut body = start_body();
+        if let Some(algorithm) = algorithm {
+            body = with_output(body, "S3SseAlgorithm", json!(algorithm));
+        }
+        if let Some(key_id) = key_id {
+            body = with_output(body, "S3SseKmsKeyId", json!(key_id));
+        }
+        let message = expect_validation(start(&base_ctx(&h), body).await);
+        assert_eq!(message, expected, "{algorithm:?} with {key_id:?}");
+    }
 }
 
 #[tokio::test]

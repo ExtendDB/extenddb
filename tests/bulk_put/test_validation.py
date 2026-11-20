@@ -24,6 +24,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+# A KMS key ARN that names no key. Start refuses the pairs below before any
+# key is resolved.
+UNUSED_KMS_KEY_ARN = (
+    "arn:aws:kms:us-east-1:111111111111:key/00000000-0000-0000-0000-000000000000"
+)
+
+
 class TestValidation:
     """Field constraints, unsupported features, and the ARN layers."""
 
@@ -94,6 +101,29 @@ class TestValidation:
             "ValidationException",
             "Invalid Request: OutputS3Configuration.OutputType cannot be empty",
         )
+
+    # Measured on the service, twice each, with a key ARN of this shape: each
+    # pair is refused at Start with its own message.
+    @pytest.mark.parametrize("algorithm,key_id,message", [
+        ("KMS", None,
+         "Invalid Request: OutputS3Configuration.S3SseKmsKeyId cannot be empty "
+         "for when OutputS3Configuration.S3SseAlgorithm is 'KMS'"),
+        ("AES256", UNUSED_KMS_KEY_ARN,
+         "Invalid Request: Cannot provide OutputS3Configuration.S3SseKmsKeyId "
+         "when OutputS3Configuration.S3SseAlgorithm is 'AES256'"),
+        (None, UNUSED_KMS_KEY_ARN,
+         "Invalid Request: OutputS3Configuration.S3SseAlgorithm is required "
+         "when OutputS3Configuration.S3SseKmsKeyId is provided"),
+    ])
+    def test_an_inconsistent_output_encryption_pair_is_refused(
+        self, bulk_bucket, algorithm, key_id, message
+    ):
+        body = start_body("orders", bulk_bucket)
+        if algorithm is not None:
+            body["OutputS3Configuration"]["S3SseAlgorithm"] = algorithm
+        if key_id is not None:
+            body["OutputS3Configuration"]["S3SseKmsKeyId"] = key_id
+        expect_error("StartBulkPutItems", body, "ValidationException", message)
 
     def test_an_output_configuration_without_a_bucket_is_refused(self, bulk_bucket):
         # Measured on the service: the output bucket member is

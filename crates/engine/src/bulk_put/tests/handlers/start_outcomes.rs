@@ -18,7 +18,7 @@ async fn the_start_description_carries_every_submitted_field() {
         "S3Bucket": OUT_BUCKET,
         "S3KeyPrefix": "reports/",
         "OutputType": ["ERROR", "CONDITION_CHECK_FAILURE"],
-        "S3SseAlgorithm": "AES256",
+        "S3SseAlgorithm": "KMS",
         "S3SseKmsKeyId": "alias/example",
         "S3BucketOwner": ACCOUNT
     });

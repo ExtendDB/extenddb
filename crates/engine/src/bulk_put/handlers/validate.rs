@@ -7,6 +7,8 @@
 
 use super::*;
 
+use extenddb_core::types::S3SseAlgorithm;
+
 /// Whether any global secondary or vector index of the table is in a state
 /// other than `ACTIVE`. Local secondary indexes are created with the table
 /// and have no lifecycle of their own.
@@ -308,6 +310,31 @@ pub(super) fn validate_output_prefix(prefix: &str) -> Result<(), DynamoDbError> 
         ));
     }
     validate_prefix(prefix)
+}
+
+/// The output encryption pair (measured on the service, twice each): `KMS`
+/// needs `S3SseKmsKeyId`, `AES256` refuses one, and a key id needs an
+/// algorithm. An empty key id never reaches here: the model pass refuses
+/// it by its length.
+pub(super) fn validate_output_encryption(
+    output: &OutputS3Configuration,
+) -> Result<(), DynamoDbError> {
+    let message = match (output.s3_sse_algorithm, output.s3_sse_kms_key_id.is_some()) {
+        (Some(S3SseAlgorithm::Kms), false) => {
+            "Invalid Request: OutputS3Configuration.S3SseKmsKeyId cannot be empty for when \
+             OutputS3Configuration.S3SseAlgorithm is 'KMS'"
+        }
+        (Some(S3SseAlgorithm::Aes256), true) => {
+            "Invalid Request: Cannot provide OutputS3Configuration.S3SseKmsKeyId when \
+             OutputS3Configuration.S3SseAlgorithm is 'AES256'"
+        }
+        (None, true) => {
+            "Invalid Request: OutputS3Configuration.S3SseAlgorithm is required when \
+             OutputS3Configuration.S3SseKmsKeyId is provided"
+        }
+        _ => return Ok(()),
+    };
+    Err(DynamoDbError::ValidationException(message.to_owned()))
 }
 
 /// When present, `S3BucketOwner` must equal the caller's account id.
