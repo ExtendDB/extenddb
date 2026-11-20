@@ -2284,11 +2284,12 @@ def test_backup_and_table_names_are_validated(dynamodb_client):
             + "/backup/01700000000000-abcdef12"
         )
         emoji = "\U0001F600\U0001F600"
-        for field, key_schema in (
-            ("GlobalSecondaryIndexOverride", [{"AttributeName": "g", "KeyType": "HASH"}]),
-            ("LocalSecondaryIndexOverride", [{"AttributeName": "pk", "KeyType": "HASH"},
-                                             {"AttributeName": "l", "KeyType": "RANGE"}]),
-        ):
+        key_schemas = {
+            "GlobalSecondaryIndexOverride": [{"AttributeName": "g", "KeyType": "HASH"}],
+            "LocalSecondaryIndexOverride": [{"AttributeName": "pk", "KeyType": "HASH"},
+                                            {"AttributeName": "l", "KeyType": "RANGE"}],
+        }
+        for field, key_schema in key_schemas.items():
             path = field[0].lower() + field[1:] + ".1.member.indexName"
             for name, expected in (
                 ("ab", "1 validation error detected: "
@@ -2310,6 +2311,35 @@ def test_backup_and_table_names_are_validated(dynamodb_client):
                           {"TargetTableName": "ab", "BackupArn": missing,
                            field: [dict(entry, IndexName="g i")]},
                           length))
+        # Bad names in both lists, or two in one list, get one answer: the LSI
+        # list first, each list in entry order, whatever the order of the two
+        # members in the body (measured on 20 Nov 2026). The expected answer is
+        # (name, path, constraints) per name, in order. The service gives the
+        # two clauses of one name in either order, so they are compared as a set.
+        G, L = key_schemas
+        g1, g2, l1, l2 = (f"{k}SecondaryIndexOverride.{n}.member.indexName"
+                          for k, n in (("global", 1), ("global", 2), ("local", 1), ("local", 2)))
+        both = (short, pattern)
+        for lists, faults in (
+            ({G: ["ab"], L: ["g i"]}, [("g i", l1, [pattern]), ("ab", g1, [short])]),
+            ({L: ["g i"], G: ["ab"]}, [("g i", l1, [pattern]), ("ab", g1, [short])]),
+            ({G: ["g i"], L: ["ab"]}, [("ab", l1, [short]), ("g i", g1, [pattern])]),
+            ({G: ["ab"], L: ["ab"]}, [("ab", l1, [short]), ("ab", g1, [short])]),
+            ({G: ["ab", "g i"]}, [("ab", g1, [short]), ("g i", g2, [pattern])]),
+            ({L: ["ab", "g i"]}, [("ab", l1, [short]), ("g i", l2, [pattern])]),
+            ({G: ["ab", "cd"], L: ["g i"]},
+             [("g i", l1, [pattern]), ("ab", g1, [short]), ("cd", g2, [short])]),
+            ({G: ["gsi1", "ab"]}, [("ab", g2, [short])]),
+            ({G: ["a!"], L: ["g i"]}, [("g i", l1, [pattern]), ("a!", g1, both)]),
+            ({G: [emoji], L: ["g i"]}, [("g i", l1, [pattern]), (emoji, g1, both)]),
+            ({G: ["ab"], L: ["a!"]}, [("a!", l1, both), ("ab", g1, [short])]),
+            ({G: ["a!"], L: ["a!"]}, [("a!", l1, both), ("a!", g1, both)]),
+        ):
+            body = {"TargetTableName": f"{source}-r", "BackupArn": missing}
+            for field, names in lists.items():
+                body[field] = [{"IndexName": n, "KeySchema": key_schemas[field],
+                                "Projection": {"ProjectionType": "KEYS_ONLY"}} for n in names]
+            cases.append(("RestoreTableFromBackup", body, faults))
         e = "\U0001F600"
         for name, expected in (
             ("ab", length), ("", length), ("a*", length), ("x" * 256, length),
@@ -2349,7 +2379,18 @@ def test_backup_and_table_names_are_validated(dynamodb_client):
                 assert code == serialization, (operation, body, resp.text)
                 continue
             assert code == "ValidationException", (operation, body, resp.text)
-            if _is_real_dynamodb() and " detected: " in expected:
+            if isinstance(expected, list):
+                # The names in order, one name's clauses as a set.
+                count = sum(len(failed) for _, _, failed in expected)
+                head, _, rest = message.partition(": ")
+                clauses = iter(rest.split("; "))
+                got = [{next(clauses, None) for _ in failed} for _, _, failed in expected]
+                want = [{constraint.format(v=v, path=p, c=c) for c in failed}
+                        for v, p, failed in expected]
+                assert (head, got, next(clauses, None)) == (
+                    f"{count} validation error{'s' if count > 1 else ''} detected", want, None,
+                ), (body, message)
+            elif _is_real_dynamodb() and " detected: " in expected:
                 # The clauses, their count, and the member path; the order of
                 # the two clauses on the service was not captured.
                 head, _, clauses = expected.partition(": ")
