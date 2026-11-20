@@ -279,28 +279,30 @@ fn creates_vector_index(body: &Value) -> bool {
 /// oracle these values are checked against. The messages are the native
 /// no-store messages, reproduced so the two builds match.
 ///
-/// `UpdateContinuousBackups` is the one body-sensitive case: natively, enabling
-/// point-in-time recovery is refused with `ContinuousBackupsUnavailableException`
-/// (no backend implements it), while disabling it succeeds and returns the
-/// description `DescribeContinuousBackups` reports. This reproduces both. It does
-/// not check that the table exists first (the describe handler is not compiled
-/// here), so a request naming a missing table is answered as enable/disable
-/// rather than with `TableNotFoundException`; that limitation is documented in
-/// the README.
+/// `UpdateContinuousBackups` is the one body-sensitive case, and it reproduces
+/// native's three answers (`handle_update_continuous_backups`): disabling
+/// point-in-time recovery returns the description `DescribeContinuousBackups`
+/// reports; enabling it is refused with `ContinuousBackupsUnavailableException`
+/// (no backend implements it); and a request whose
+/// `PointInTimeRecoverySpecification` is missing or whose
+/// `PointInTimeRecoveryEnabled` flag is absent or malformed is refused with the
+/// service's "Member must not be null" `ValidationException`, exactly as native
+/// does — not treated as an enable. It does not check that the table exists
+/// first (the describe handler is not compiled here), so a request naming a
+/// missing table is answered from the specification rather than with
+/// `TableNotFoundException`; that limitation is documented in the README.
 #[cfg(target_arch = "wasm32")]
 fn no_store_answer(operation: &str, body: &Value) -> Option<Result<Value, DynamoDbError>> {
     let answer = match operation {
         "ListBackups" => Ok(serde_json::json!({ "BackupSummaries": [] })),
         "DescribeContinuousBackups" => Ok(continuous_backups_disabled_document()),
-        "UpdateContinuousBackups" => {
-            if disables_point_in_time_recovery(body) {
-                Ok(continuous_backups_disabled_document())
-            } else {
-                Err(DynamoDbError::ContinuousBackupsUnavailableException(
-                    "Point-in-time recovery is not supported by this storage backend".to_owned(),
-                ))
-            }
-        }
+        "UpdateContinuousBackups" => match point_in_time_recovery_enabled(body) {
+            Ok(false) => Ok(continuous_backups_disabled_document()),
+            Ok(true) => Err(DynamoDbError::ContinuousBackupsUnavailableException(
+                "Point-in-time recovery is not supported by this storage backend".to_owned(),
+            )),
+            Err(err) => Err(err),
+        },
         "ImportTable" => Err(DynamoDbError::ValidationException(
             "Import is disabled. Configure [import] paths in extenddb.toml to enable.".to_owned(),
         )),
@@ -326,21 +328,38 @@ fn continuous_backups_disabled_document() -> Value {
     })
 }
 
-/// Whether an `UpdateContinuousBackups` body disables point-in-time recovery,
-/// i.e. `PointInTimeRecoverySpecification.PointInTimeRecoveryEnabled` is the
-/// boolean `false` or the string `"false"` (the two forms the service accepts).
-/// Anything else — enabling it, or a missing or malformed flag — is not a
-/// disable and is refused as unavailable.
+/// `PointInTimeRecoverySpecification.PointInTimeRecoveryEnabled` from an
+/// `UpdateContinuousBackups` body, reproducing the native reader in
+/// `handle_update_continuous_backups`: the boolean flag, or the JSON strings
+/// `"true"`/`"false"` the service also accepts as the booleans. A request
+/// without the specification, or with one that does not hold the flag as one
+/// of those forms, is refused with the service's "Member must not be null"
+/// text at the member's model path — the same `ValidationException` native
+/// returns, so a malformed request is answered identically on both builds.
 #[cfg(target_arch = "wasm32")]
-fn disables_point_in_time_recovery(body: &Value) -> bool {
-    match body
+fn point_in_time_recovery_enabled(body: &Value) -> Result<bool, DynamoDbError> {
+    let spec = body
         .get("PointInTimeRecoverySpecification")
-        .and_then(|spec| spec.get("PointInTimeRecoveryEnabled"))
-    {
-        Some(Value::Bool(enabled)) => !enabled,
-        Some(Value::String(s)) => s == "false",
-        _ => false,
+        .filter(|v| !v.is_null())
+        .ok_or_else(|| member_null("pointInTimeRecoverySpecification"))?;
+    match spec.get("PointInTimeRecoveryEnabled") {
+        Some(Value::Bool(flag)) => Ok(*flag),
+        Some(Value::String(s)) if s == "true" => Ok(true),
+        Some(Value::String(s)) if s == "false" => Ok(false),
+        _ => Err(member_null(
+            "pointInTimeRecoverySpecification.pointInTimeRecoveryEnabled",
+        )),
     }
+}
+
+/// The service's refusal for a required member given as null, by its model
+/// path — the message native's `member_null` produces.
+#[cfg(target_arch = "wasm32")]
+fn member_null(path: &str) -> DynamoDbError {
+    DynamoDbError::ValidationException(format!(
+        "1 validation error detected: Value null at '{path}' \
+         failed to satisfy constraint: Member must not be null"
+    ))
 }
 
 // These tests drive the portable runtime on a current-thread tokio runtime,
