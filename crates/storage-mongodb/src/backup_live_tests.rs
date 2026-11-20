@@ -53,6 +53,9 @@ use crate::data::{data_collection_name, document_to_item, item_to_document};
 use crate::migrations::{MongoTarget, run_backup_catalog_index};
 use crate::restore_engine::INSERT_MANY_DOCUMENTS;
 
+#[path = "backup_live_tests_control_chars.rs"]
+mod control_chars;
+
 const ACCOUNT: &str = "123456789012";
 const OTHER_ACCOUNT: &str = "210987654321";
 const REGION: &str = "us-east-1";
