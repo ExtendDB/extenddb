@@ -21,6 +21,7 @@ members = [
     "crates/storage-cassandra",
     "crates/storage-mongodb",
     "crates/storage-sqlite",
+    "crates/storage-bigtable",
     "crates/auth",
     "crates/server",
     "crates/app",
@@ -51,6 +52,7 @@ extenddb-backup-store = { path = "crates/backup-store", version = "=1.0.0" }
 extenddb-engine = { path = "crates/engine", version = "=1.0.0" }
 extenddb-storage = { path = "crates/storage", version = "=1.0.0" }
 extenddb-config = { path = "crates/config", version = "=1.0.0" }
+extenddb-storage-bigtable = { path = "crates/storage-bigtable", version = "=1.0.0" }
 extenddb-storage-cassandra = { path = "crates/storage-cassandra", version = "=1.0.0" }
 extenddb-storage-mongodb = { path = "crates/storage-mongodb", version = "=1.0.0" }
 extenddb-storage-postgres = { path = "crates/storage-postgres", version = "=1.0.0" }
@@ -200,6 +202,14 @@ config = "0.14"
 
 # Security
 zeroize = { version = "1.8", features = ["derive"] }
+
+# Bigtable
+googleapis_tonic_google_bigtable_v2 = { package = "googleapis-tonic-google-bigtable-v2", version = "0.36" }
+googleapis_tonic_google_bigtable_admin_v2 = { package = "googleapis-tonic-google-bigtable-admin-v2", version = "0.44" }
+tonic = { version = "0.14", features = ["tls-native-roots"] }
+prost = "0.14"
+prost-types = "0.14"
+gcp_auth = "0.12"
 
 # Size-optimised profile for the `extenddb-dev` container image only.
 #

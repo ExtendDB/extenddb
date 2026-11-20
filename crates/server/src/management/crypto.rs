@@ -6,40 +6,6 @@
 //! encrypted through the catalog store's key holder
 //! (`extenddb_storage::secret_keys::SecretKeys`).
 
-use rand::Rng;
-
-/// Generate a 40-character secret access key branded with `extenddb` prefix.
-///
-/// Format: `extenddb` + 32 random chars = 40 total.
-pub fn generate_secret_key() -> String {
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut rng = rand::rng();
-    let suffix: String = (0..32)
-        .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
-        .collect();
-    format!("extenddb{suffix}")
-}
-
-/// Generate a 20-character session access key ID branded with `ASIAEXTENDDB` prefix.
-///
-/// Format: `ASIAEXTENDDB` + 8 random alphanumeric chars = 20 total.
-/// Used by `assume_role` for temporary credentials.
-pub fn generate_session_key_id() -> String {
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let mut rng = rand::rng();
-    let suffix: String = (0..8)
-        .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
-        .collect();
-    format!("ASIAEXTENDDB{suffix}")
-}
-
-/// Generate a session token (64-character random string).
-///
-/// Used by `assume_role` for temporary session credentials.
-pub fn generate_session_token() -> String {
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut rng = rand::rng();
-    (0..64)
-        .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
-        .collect()
-}
+pub use extenddb_storage::management_store::{
+    generate_secret_key, generate_session_key_id, generate_session_token,
+};

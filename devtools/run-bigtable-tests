@@ -1,0 +1,382 @@
+#!/usr/bin/env bash
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Orchestrated Cloud Bigtable integration-test runner.
+#
+# Starts a disposable local `cbtemulator` (using a host binary when installed or
+# `gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators` in Docker, unless
+# `--emulator-host` or `BIGTABLE_EMULATOR_HOST` points at an existing emulator),
+# initializes and serves `extenddb` built with the `bigtable` feature, and
+# delegates the test workload to `devtools/run-tests --backend bigtable`.
+# Tears everything down on exit.
+#
+# Usage:
+#   devtools/run-bigtable-tests [OPTIONS] [-- RUN_TESTS_ARGS ...]
+#
+# Options:
+#   --emulator-host HOST:PORT  Connect to an existing Bigtable emulator instead
+#                              of starting a local `cbtemulator` process
+#   --emulator-port PORT       Port for managed `cbtemulator` (default: 8086)
+#   --cbtemulator PATH         Explicit path to `cbtemulator` binary
+#   --emulator-only            Start `cbtemulator` on `--emulator-port`, print
+#                              its address, and exit without starting extenddb;
+#                              implies `--keep`
+#   --port PORT                HTTPS port extenddb should bind (default: 18443)
+#   --project-id ID            Bigtable project ID (default: extenddb-ci)
+#   --instance-id ID           Bigtable instance ID (default: extenddb-ci)
+#   --output DIR               Directory for logs and generated config
+#                              (default: /tmp/run-bigtable-tests-<port>-<ts>)
+#   --keep                     Do not tear down extenddb / cbtemulator on exit
+#   -h, --help                 Show this help
+#
+# Arguments after `--` are passed to `devtools/run-tests` verbatim.
+# Default suite is `--pytest --comprehensive --parallel`.
+#
+# Examples:
+#   devtools/run-bigtable-tests
+#   devtools/run-bigtable-tests -- --pytest --filter test_put_item
+#   devtools/run-bigtable-tests -- --rust-integration
+#   devtools/run-bigtable-tests --emulator-only --emulator-port 8086
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_DIR"
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+EMULATOR_HOST="${BIGTABLE_EMULATOR_HOST:-}"
+EMULATOR_PORT=8086
+CBTEMULATOR_BIN="${CBTEMULATOR_BIN:-${CBTEMULATOR:-}}"
+BIND_PORT=18443
+PROJECT_ID="extenddb-ci"
+INSTANCE_ID="extenddb-ci"
+OUTPUT_DIR=""
+EMULATOR_ONLY=false
+KEEP=false
+RUN_TESTS_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --emulator-host) EMULATOR_HOST="$2"; shift 2 ;;
+        --emulator-port) EMULATOR_PORT="$2"; shift 2 ;;
+        --cbtemulator)   CBTEMULATOR_BIN="$2"; shift 2 ;;
+        --emulator-only) EMULATOR_ONLY=true; KEEP=true; shift ;;
+        --port)          BIND_PORT="$2"; shift 2 ;;
+        --project-id)    PROJECT_ID="$2"; shift 2 ;;
+        --instance-id)   INSTANCE_ID="$2"; shift 2 ;;
+        --output)        OUTPUT_DIR="$2"; shift 2 ;;
+        --keep)          KEEP=true; shift ;;
+        --)              shift; RUN_TESTS_ARGS=("$@"); break ;;
+        -h|--help)       sed -n '5,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *)               echo "error: unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+
+if [[ ${#RUN_TESTS_ARGS[@]} -eq 0 ]]; then
+    RUN_TESTS_ARGS=(--pytest --comprehensive --parallel)
+fi
+
+if [[ -z "$OUTPUT_DIR" ]]; then
+    OUTPUT_DIR="/tmp/run-bigtable-tests-${BIND_PORT}-$(date +%Y%m%d-%H%M%S)-$$"
+fi
+umask 0077
+mkdir -p "$OUTPUT_DIR"
+chmod 0700 "$OUTPUT_DIR"
+
+CONFIG="$OUTPUT_DIR/extenddb.toml"
+SERVER_LOG="$OUTPUT_DIR/server.log"
+EMULATOR_LOG="$OUTPUT_DIR/cbtemulator.log"
+EMULATOR_PID_FILE="$OUTPUT_DIR/cbtemulator.pid"
+BINARY="${EXTENDDB_BINARY:-./target/release/extenddb}"
+
+if ! $EMULATOR_ONLY; then
+    if [[ ! -x "$BINARY" ]]; then
+        echo "error: $BINARY not found. Build first:" >&2
+        echo "  cargo build --release --no-default-features --features bigtable" >&2
+        exit 1
+    fi
+    VERSION_OUT=$("$BINARY" version 2>/dev/null || true)
+    if [[ "$VERSION_OUT" != *"(bigtable)"* ]]; then
+        echo "error: $BINARY is not a Bigtable build (${VERSION_OUT:-unknown}). Build with:" >&2
+        echo "  cargo build --release --no-default-features --features bigtable" >&2
+        exit 1
+    fi
+fi
+
+TMP_CANON=$(realpath "${TMPDIR:-/tmp}")
+EMULATOR_PID=""
+EMULATOR_CONTAINER=""
+
+find_cbtemulator() {
+    if [[ -n "$CBTEMULATOR_BIN" && -x "$CBTEMULATOR_BIN" ]]; then
+        printf '%s\n' "$CBTEMULATOR_BIN"
+        return 0
+    fi
+    if command -v cbtemulator >/dev/null 2>&1; then
+        command -v cbtemulator
+        return 0
+    fi
+    local candidate
+    for candidate in \
+        /usr/lib/google-cloud-sdk/platform/bigtable-emulator/cbtemulator \
+        /usr/local/Caskroom/google-cloud-sdk/latest/google-cloud-sdk/platform/bigtable-emulator/cbtemulator \
+        "$HOME/google-cloud-sdk/platform/bigtable-emulator/cbtemulator"
+    do
+        if [[ -x "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    if command -v gcloud >/dev/null 2>&1; then
+        local sdk_root
+        sdk_root=$(gcloud info --format='value(installation.sdk_root)' 2>/dev/null || true)
+        if [[ -n "$sdk_root" && -x "$sdk_root/platform/bigtable-emulator/cbtemulator" ]]; then
+            printf '%s\n' "$sdk_root/platform/bigtable-emulator/cbtemulator"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+wait_tcp() {
+    local host="$1" port="$2" timeout_s="${3:-60}" pid="${4:-}"
+    python3 - "$host" "$port" "$timeout_s" "$pid" <<'PY'
+import os, socket, sys, time
+host, port, timeout_s, pid_str = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
+pid = int(pid_str) if pid_str else None
+deadline = time.monotonic() + timeout_s
+while time.monotonic() < deadline:
+    if pid is not None:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            sys.exit(2)
+    try:
+        with socket.create_connection((host, port), timeout=1.0):
+            sys.exit(0)
+    except OSError:
+        time.sleep(0.2)
+sys.exit(1)
+PY
+}
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+
+cleanup() {
+    if $EMULATOR_ONLY; then
+        echo "  cbtemulator listening at ${EMULATOR_HOST} (pid ${EMULATOR_PID:-${EMULATOR_CONTAINER:-external}}, log $EMULATOR_LOG)"
+        return
+    fi
+    if $KEEP; then
+        echo ""
+        echo "=== --keep set; leaving extenddb running ==="
+        echo "  server log:   $SERVER_LOG"
+        if [[ -n "$EMULATOR_PID" ]]; then
+            echo "  emulator log: $EMULATOR_LOG (pid $EMULATOR_PID)"
+        fi
+        if [[ -n "$EMULATOR_CONTAINER" ]]; then
+            echo "  emulator container: $EMULATOR_CONTAINER"
+        fi
+        echo "  tear down:    $BINARY stop --config $CONFIG"
+        return
+    fi
+    echo ""
+    echo "=== Cleanup ==="
+    if [[ -f "$CONFIG" ]] && "$BINARY" stop --config "$CONFIG" >/dev/null 2>&1; then
+        echo "  stopped extenddb server"
+    fi
+    if [[ -n "$EMULATOR_PID" ]] && kill -0 "$EMULATOR_PID" 2>/dev/null; then
+        kill "$EMULATOR_PID" 2>/dev/null || true
+        wait "$EMULATOR_PID" 2>/dev/null || true
+        echo "  stopped cbtemulator (pid $EMULATOR_PID)"
+    fi
+    if [[ -n "$EMULATOR_CONTAINER" ]] && docker rm -f "$EMULATOR_CONTAINER" >/dev/null 2>&1; then
+        echo "  removed docker container $EMULATOR_CONTAINER"
+    fi
+}
+trap cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# Start or verify cbtemulator
+# ---------------------------------------------------------------------------
+
+if [[ -z "$EMULATOR_HOST" ]]; then
+    CBT_BIN=$(find_cbtemulator || true)
+    EMULATOR_HOST="127.0.0.1:$EMULATOR_PORT"
+    if [[ -n "$CBT_BIN" ]]; then
+        echo "=== Starting cbtemulator ($CBT_BIN) on $EMULATOR_HOST ==="
+        "$CBT_BIN" -host=127.0.0.1 -port="$EMULATOR_PORT" >"$EMULATOR_LOG" 2>&1 &
+        EMULATOR_PID=$!
+        printf '%s\n' "$EMULATOR_PID" >"$EMULATOR_PID_FILE"
+    elif command -v docker >/dev/null 2>&1; then
+        EMULATOR_CONTAINER="extenddb-runtests-cbt-${EMULATOR_PORT}"
+        echo "=== Starting cbtemulator in Docker ($EMULATOR_CONTAINER) on $EMULATOR_HOST ==="
+        docker rm -f "$EMULATOR_CONTAINER" >/dev/null 2>&1 || true
+        docker run -d --name "$EMULATOR_CONTAINER" \
+            -p "127.0.0.1:$EMULATOR_PORT:$EMULATOR_PORT" \
+            gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators \
+            gcloud beta emulators bigtable start --host-port="0.0.0.0:$EMULATOR_PORT" >/dev/null
+    else
+        echo "error: cbtemulator binary not found and docker unavailable (set CBTEMULATOR_BIN or --emulator-host)" >&2
+        exit 1
+    fi
+    if ! wait_tcp 127.0.0.1 "$EMULATOR_PORT" 60 "$EMULATOR_PID"; then
+        echo "error: cbtemulator did not become ready on $EMULATOR_HOST" >&2
+        if [[ -n "$EMULATOR_CONTAINER" ]]; then
+            docker logs "$EMULATOR_CONTAINER" >&2 || true
+        else
+            cat "$EMULATOR_LOG" >&2 || true
+        fi
+        exit 1
+    fi
+    echo "  cbtemulator ready on $EMULATOR_HOST"
+else
+    EMU_H="${EMULATOR_HOST%:*}"
+    EMU_P="${EMULATOR_HOST##*:}"
+    echo "=== Verifying external Bigtable emulator at $EMULATOR_HOST ==="
+    if ! wait_tcp "$EMU_H" "$EMU_P" 15 ""; then
+        echo "error: Bigtable emulator not reachable at $EMULATOR_HOST" >&2
+        exit 1
+    fi
+fi
+
+export BIGTABLE_EMULATOR_HOST="$EMULATOR_HOST"
+
+if $EMULATOR_ONLY; then
+    echo "BIGTABLE_EMULATOR_HOST=${EMULATOR_HOST}"
+    exit 0
+fi
+
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy \
+    REQUESTS_CA_BUNDLE CURL_CA_BUNDLE SSL_CERT_FILE AWS_CA_BUNDLE || true
+export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost"
+export no_proxy="${no_proxy:+${no_proxy},}127.0.0.1,localhost"
+
+# ---------------------------------------------------------------------------
+# Initialize extenddb
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== Initializing extenddb (Bigtable backend) ==="
+
+cat > "$CONFIG" <<TOML
+[storage]
+backend = "bigtable"
+
+[storage.bigtable]
+project_id = "$PROJECT_ID"
+instance_id = "$INSTANCE_ID"
+emulator_host = "$EMULATOR_HOST"
+TOML
+chmod 0600 "$CONFIG"
+
+ADMIN_PASSWORD=$(openssl rand -base64 16)
+if ! INIT_OUT=$(EXTENDDB_ADMIN_PASSWORD="$ADMIN_PASSWORD" "$BINARY" init \
+    --backend bigtable \
+    --config "$CONFIG" \
+    --overwrite 2>&1); then
+    printf '%s\n' "$INIT_OUT" >&2
+    exit 1
+fi
+printf '%s\n' "$INIT_OUT" | tail -n 5
+
+cat > "$CONFIG" <<TOML
+[server]
+bind_addr = "127.0.0.1"
+port = $BIND_PORT
+region = "us-east-1"
+run_dir = "$OUTPUT_DIR"
+throttling_enabled = true
+
+[server.tls]
+cert_path = "$HOME/.extenddb/tls/cert.pem"
+key_path  = "$HOME/.extenddb/tls/key.pem"
+
+[storage]
+backend = "bigtable"
+
+[storage.bigtable]
+project_id = "$PROJECT_ID"
+instance_id = "$INSTANCE_ID"
+emulator_host = "$EMULATOR_HOST"
+pool_size = 20
+catalog_pool_size = 8
+sweeper_cadence_secs = 5
+intent_timeout_secs = 15
+ttl_scan_cadence_secs = 2
+gsi_reconcile_cadence_secs = 10
+
+[auth]
+provider = "builtin"
+
+[import]
+paths = ["$TMP_CANON"]
+
+[export]
+paths = ["$TMP_CANON"]
+
+[logging]
+level  = "info"
+format = "pretty"
+TOML
+chmod 0600 "$CONFIG"
+
+# Pre-seed runtime settings before starting `serve` so early tests observe
+# `throttling_enabled = true` immediately at startup without waiting for the
+# 30-second settings poller tick.
+"$BINARY" settings --config "$CONFIG" set control_plane_delay_seconds 0.05 >/dev/null 2>&1 || true
+"$BINARY" settings --config "$CONFIG" set index_propagation_delay_ms 0 >/dev/null 2>&1 || true
+"$BINARY" settings --config "$CONFIG" set throttling_enabled true >/dev/null 2>&1 || true
+"$BINARY" settings --config "$CONFIG" set allow_credential_import true >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+# Start extenddb server
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== Starting extenddb server on 127.0.0.1:$BIND_PORT ==="
+"$BINARY" serve --foreground --write-pid-file --config "$CONFIG" >"$SERVER_LOG" 2>&1 &
+
+for i in $(seq 1 30); do
+    if curl -skf "https://127.0.0.1:$BIND_PORT/health" >/dev/null 2>&1; then
+        echo "  server healthy after ${i}s"
+        break
+    fi
+    sleep 1
+done
+
+if ! curl -skf "https://127.0.0.1:$BIND_PORT/health" >/dev/null 2>&1; then
+    echo "error: extenddb server did not become healthy" >&2
+    tail -n 40 "$SERVER_LOG" >&2 || true
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Delegate to run-tests
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== Running test suite via devtools/run-tests --backend bigtable ==="
+echo "  binary:           $("$BINARY" version)"
+echo "  emulator_host:    $EMULATOR_HOST"
+echo "  passthrough args: ${RUN_TESTS_ARGS[*]}"
+echo ""
+
+export EXTENDDB_TEST_ENDPOINT="https://127.0.0.1:$BIND_PORT"
+export EXTENDDB_ADMIN_USER=admin
+export EXTENDDB_ADMIN_PASSWORD="$ADMIN_PASSWORD"
+export EXTENDDB_CONFIG="$CONFIG"
+export EXTENDDB_TEST_BACKUP_STORE="${EXTENDDB_TEST_BACKUP_STORE:-none}"
+export TMPDIR="$TMP_CANON"
+
+RC=0
+devtools/run-tests --extenddb --backend bigtable --config "$CONFIG" "${RUN_TESTS_ARGS[@]}" || RC=$?
+
+exit $RC

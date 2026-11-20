@@ -6,7 +6,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "A DynamoDB-compatible API server that stores data in PostgreSQL, MongoDB, Cassandra or SQLite."
+description = "A DynamoDB-compatible API server that stores data in PostgreSQL, MongoDB, Cassandra, Google Cloud Bigtable or SQLite."
 repository.workspace = true
 homepage.workspace = true
 readme = "README.md"
@@ -25,6 +25,7 @@ sqlite = ["extenddb-storage-sqlite"]
 # Build the SQLite backend in its zero-config, ephemeral in-memory mode.
 sqlite-memory = ["sqlite", "extenddb-storage-sqlite/memory"]
 mongodb = ["extenddb-storage-mongodb"]
+bigtable = ["extenddb-storage-bigtable"]
 # MongoDB integration-test build with deterministic backfill coordination hooks.
 mongodb-test-hooks = [
     "mongodb",
@@ -42,6 +43,7 @@ dev-mode = ["extenddb-app/dev-mode"]
 [dependencies]
 extenddb-app = { workspace = true }
 extenddb-storage = { workspace = true }
+extenddb-storage-bigtable = { workspace = true, optional = true }
 extenddb-storage-cassandra = { workspace = true, optional = true }
 extenddb-storage-mongodb = { workspace = true, optional = true }
 extenddb-storage-postgres = { workspace = true, optional = true }

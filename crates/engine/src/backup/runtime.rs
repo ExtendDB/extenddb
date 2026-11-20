@@ -157,6 +157,9 @@ pub struct BackupRuntime {
     /// configuration (a backend that cannot pin a table snapshot); such a
     /// create is not refused by an unhealthy store.
     legacy_create_only: bool,
+    /// Whether the backend refuses CreateBackup altogether (for example
+    /// Cloud Bigtable, which exposes no cross-table point-in-time snapshot).
+    create_unsupported: bool,
     job_settings: JobSettings,
     /// The collector the jobs record into; `None` in commands and tests
     /// without one.
@@ -245,6 +248,7 @@ impl std::fmt::Debug for BackupRuntime {
                 &self.configured_store.as_ref().map(|store| store.identity()),
             )
             .field("legacy_create_only", &self.legacy_create_only)
+            .field("create_unsupported", &self.create_unsupported)
             .field("job_settings", &self.job_settings)
             .finish_non_exhaustive()
     }
@@ -1434,6 +1438,7 @@ impl BackupRuntime {
             permit_wait: PERMIT_WAIT,
             configured_store: None,
             legacy_create_only: false,
+            create_unsupported: false,
             job_settings: JobSettings::default(),
             metrics: None,
             shutdown: RwLock::new(CancellationToken::new()),
@@ -1681,6 +1686,14 @@ impl BackupRuntime {
         self
     }
 
+    /// The same runtime when the storage backend refuses `CreateBackup`
+    /// altogether.
+    #[must_use]
+    pub fn with_create_unsupported(mut self, create_unsupported: bool) -> Self {
+        self.create_unsupported = create_unsupported;
+        self
+    }
+
     /// The slots jobs take permits from.
     #[must_use]
     pub fn slots(&self) -> &Arc<Semaphore> {
@@ -1723,6 +1736,12 @@ impl BackupRuntime {
     #[must_use]
     pub fn legacy_create_only(&self) -> bool {
         self.legacy_create_only
+    }
+
+    /// Whether the storage backend refuses CreateBackup altogether.
+    #[must_use]
+    pub fn create_unsupported(&self) -> bool {
+        self.create_unsupported
     }
 
     /// What `/health` reports for the `backup_store` component; `None` when
