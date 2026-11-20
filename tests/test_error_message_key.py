@@ -22,9 +22,14 @@ import json
 import uuid
 
 import pytest
+from botocore import xform_name
 from botocore.exceptions import ClientError
 
 from conftest import scoped_table
+
+# A table that is never created: a member of the wrong JSON type is refused
+# before the table is read.
+MISSING_TABLE = f"extenddb-test-{uuid.uuid4().hex[:12]}"
 
 
 @pytest.fixture(scope="module")
@@ -89,6 +94,42 @@ def test_idempotent_parameter_mismatch_carries_message_under_capital_m(
     put("first")
     code, keys = _error_code_and_keys(dynamodb_client, "TransactWriteItems", lambda: put("second"))
     assert code == "IdempotentParameterMismatchException"
+    assert keys == ["Message", "__type"]
+
+
+# Raw bodies measured in us-east-1 on 2026-11-20, each request sent twice,
+# and for the ExecuteStatement parameter on 2026-11-18. With parameter
+# validation off, the client sends each member as it is written here.
+@pytest.mark.parametrize(
+    "operation, params",
+    [
+        (
+            "Query",
+            {
+                "TableName": MISSING_TABLE,
+                "KeyConditionExpression": "pk = :v",
+                "ExpressionAttributeValues": {":v": {"S": "k"}},
+                "Limit": "0",
+            },
+        ),
+        ("GetItem", {"TableName": MISSING_TABLE, "Key": {"pk": {"S": "k"}}, "ConsistentRead": "x"}),
+        ("PutItem", {"TableName": MISSING_TABLE, "Item": {"pk": {"S": "k"}}, "ReturnValues": 5}),
+        (
+            "ExecuteStatement",
+            {
+                "Statement": f"SELECT * FROM \"{MISSING_TABLE}\" WHERE pk = ?",
+                "Parameters": [{"S": 5}],
+            },
+        ),
+    ],
+)
+def test_serialization_error_carries_message_under_capital_m(
+    dynamodb_client_no_validation, operation, params
+):
+    client = dynamodb_client_no_validation
+    call = getattr(client, xform_name(operation))
+    code, keys = _error_code_and_keys(client, operation, lambda: call(**params))
+    assert code == "SerializationException"
     assert keys == ["Message", "__type"]
 
 
