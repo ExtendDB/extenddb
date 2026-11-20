@@ -16065,8 +16065,9 @@ async fn an_s3_restore_spools_every_file_and_removes_its_entry_at_the_end() {
 /// A resumed job skips the files and items the record and the progress rows
 /// account for: the first open file is loaded from its `start_at` with
 /// `reapplying`, the rest from 0 without it, and the count covers the whole
-/// manifest.
-#[tokio::test]
+/// manifest. The clock is paused so a loaded host cannot age the job's
+/// last beat past its two-period claim window before the DONE write.
+#[tokio::test(start_paused = true)]
 async fn a_resume_loads_from_the_recorded_progress() {
     let mem = Arc::new(MemStore::default());
     mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
