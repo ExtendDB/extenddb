@@ -20,9 +20,6 @@ pub(super) struct Failure {
 /// so the code is never written to a record.
 const CODE_STORE_UNAVAILABLE: &str = "StoreUnavailable";
 
-/// The failure code of the object-count quota class.
-const OBJECTS_COUNT_LIMIT_CODE: &str = "S3ObjectsCountLimitExceeded";
-
 impl Failure {
     /// The table with the bound `table_id` is gone or unusable.
     pub(super) fn table_not_found() -> Self {
@@ -111,7 +108,7 @@ impl Failure {
     /// interpolated as the request gave it and the cap as a bare number).
     pub(super) fn objects_count_limit_exceeded(prefix: &str, limit: u64) -> Self {
         Self {
-            code: Cow::Borrowed(OBJECTS_COUNT_LIMIT_CODE),
+            code: Cow::Borrowed("S3ObjectsCountLimitExceeded"),
             message: format!(
                 "You have reached the maximum number of objects allowed in a single bulk \
                  operation for the specified prefix {prefix}, which is {limit}. You can reach \
@@ -136,17 +133,18 @@ impl Failure {
         }
     }
 
-    /// The listed input total above the operation's quota for its
-    /// `PerformanceTier`. The code is the documented one: the service ends
-    /// such an operation `FAILED` with `SizeLimitExceeded`. The message is
-    /// ExtendDB's own, since the service's text needs an input over 100 GB
-    /// to measure; it renders the quota as `input_object_too_large` does.
+    /// The listed input total above the operation's quota: the quota of its
+    /// `PerformanceTier`, or the server's lower `max_bulk_input_bytes`. The
+    /// code is the documented one: the service ends such an operation
+    /// `FAILED` with `SizeLimitExceeded`. The message is ExtendDB's own,
+    /// since the service's text needs an input over 100 GB to measure; it
+    /// renders the quota as `input_object_too_large` does.
     pub(super) fn size_limit_exceeded(limit_bytes: u64) -> Self {
         Self {
             code: Cow::Borrowed("SizeLimitExceeded"),
             message: format!(
                 "The total size of the input objects of this bulk operation exceeds the \
-                 maximum allowed for the selected PerformanceTier, which is {}.",
+                 maximum allowed for this operation, which is {}.",
                 format_gibibytes(limit_bytes)
             ),
         }
