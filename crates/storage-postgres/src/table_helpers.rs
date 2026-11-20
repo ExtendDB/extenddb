@@ -10,6 +10,7 @@ use extenddb_core::types::{
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{
     index_arn, parse_warm_throughput_record, reported_status, stream_arn,
+    table_throughput_description,
 };
 use extenddb_storage::vector_catalog::{VectorIndexCatalogRow, vector_index_descriptions};
 
@@ -282,15 +283,13 @@ impl PostgresEngine {
             .transpose()
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let (rcu, wcu) = match &row.provisioned_throughput {
-            Some(v) => {
-                let pt: extenddb_core::types::ProvisionedThroughput =
-                    serde_json::from_value(v.clone())
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                (pt.read_capacity_units, pt.write_capacity_units)
-            }
-            None => (0, 0),
-        };
+        let provisioned_throughput = table_throughput_description(
+            row.provisioned_throughput
+                .clone()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|e| StorageError::Internal(e.to_string()))?,
+        );
 
         // Fix #12: Unknown table_status is an error, not a silent fallback
         let stored_status = match row.table_status.as_str() {
@@ -332,13 +331,7 @@ impl PostgresEngine {
             item_count: row.item_count,
             table_arn: row.table_arn,
             table_id: row.table_id,
-            provisioned_throughput: ProvisionedThroughputDescription {
-                read_capacity_units: rcu,
-                write_capacity_units: wcu,
-                number_of_decreases_today: 0,
-                last_increase_date_time: None,
-                last_decrease_date_time: None,
-            },
+            provisioned_throughput,
             billing_mode_summary,
             table_throughput_mode_summary: None,
             global_secondary_indexes: if gsis.is_empty() { None } else { Some(gsis) },

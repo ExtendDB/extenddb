@@ -40,6 +40,9 @@ pub async fn handle_delete_table(
     ctx.auth_cache.invalidate_resource_tags(&arn).await;
 
     table_desc.prepare_for_response();
+    // The service sends no LastIncreaseDateTime in this response, also after
+    // a raise that DescribeTable reports (measured in us-east-1 on 2026-11-19).
+    table_desc.provisioned_throughput.last_increase_date_time = None;
     let output = DeleteTableOutput {
         table_description: table_desc,
     };

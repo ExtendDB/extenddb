@@ -13,8 +13,8 @@ use extenddb_core::types::{
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{
-    effective_attribute_definitions, enters_updating, warm_throughput_record_for_create,
-    warm_throughput_record_json,
+    TableThroughputRecord, effective_attribute_definitions, enters_updating,
+    warm_throughput_record_for_create, warm_throughput_record_json,
 };
 
 use crate::CassandraEngine;
@@ -54,14 +54,13 @@ impl CassandraEngine {
             crate::cassandra_util::get_column(&row, "attribute_definitions", "update_table")?;
 
         // No-op rejection: PROVISIONED billing with identical throughput values.
+        let stored_bm: Option<String> = row.get_by_name("billing_mode").ok().flatten();
         if matches!(input.billing_mode, Some(BillingMode::Provisioned))
             && let Some(ref pt) = input.provisioned_throughput
         {
-            let current_bm: Option<String> = row.get_by_name("billing_mode").ok().flatten();
             let current_pt_str: Option<String> =
                 row.get_by_name("provisioned_throughput").ok().flatten();
-            let is_provisioned =
-                current_bm.as_deref() == Some("PROVISIONED") || current_bm.is_none();
+            let is_provisioned = stored_bm.as_deref() == Some("PROVISIONED") || stored_bm.is_none();
             if is_provisioned {
                 let (cur_rcu, cur_wcu) = current_pt_str
                     .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
@@ -93,7 +92,6 @@ impl CassandraEngine {
         // Reject ProvisionedThroughput when the effective billing mode is PAY_PER_REQUEST.
         // Covers the case where BillingMode is omitted but the table is already PAY_PER_REQUEST.
         if input.provisioned_throughput.is_some() {
-            let stored_bm: Option<String> = row.get_by_name("billing_mode").ok().flatten();
             let effective_ppr = match input.billing_mode {
                 Some(BillingMode::PayPerRequest) => true,
                 Some(BillingMode::Provisioned) => false,
@@ -134,9 +132,30 @@ impl CassandraEngine {
             add_update!("billing_mode", bm_str);
         }
 
+        // The end of the UPDATING window this request opens, in epoch
+        // milliseconds, written to `status_transition_at` below.
+        let updating_until = if enters_updating(&input) {
+            let delay_secs = self.control_plane_delay_secs().await;
+            (delay_secs > 0.0).then(|| {
+                #[allow(clippy::cast_possible_truncation)]
+                let delay_ms = (delay_secs * 1000.0) as i64;
+                (chrono::Utc::now() + chrono::Duration::milliseconds(delay_ms)).timestamp_millis()
+            })
+        } else {
+            None
+        };
+
         if let Some(pt) = &input.provisioned_throughput {
-            let pt_json =
-                serde_json::to_string(pt).map_err(|e| StorageError::Internal(e.to_string()))?;
+            let stored_pt: Option<String> =
+                row.get_by_name("provisioned_throughput").ok().flatten();
+            let record = TableThroughputRecord::for_update(
+                stored_pt.and_then(|s| serde_json::from_str(&s).ok()),
+                stored_bm.as_deref() != Some("PAY_PER_REQUEST"),
+                pt,
+                updating_until.map(crate::cassandra_util::millis_to_seconds_f64),
+            );
+            let pt_json = serde_json::to_string(&record)
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
             add_update!("provisioned_throughput", pt_json.as_str());
         }
 
@@ -154,14 +173,8 @@ impl CassandraEngine {
             add_update!("on_demand_throughput", odt_json.as_str());
         }
 
-        if enters_updating(&input) {
-            let delay_secs = self.control_plane_delay_secs().await;
-            if delay_secs > 0.0 {
-                #[allow(clippy::cast_possible_truncation)]
-                let delay_ms = (delay_secs * 1000.0) as i64;
-                let at = chrono::Utc::now() + chrono::Duration::milliseconds(delay_ms);
-                add_update!("status_transition_at", at.timestamp_millis());
-            }
+        if let Some(at) = updating_until {
+            add_update!("status_transition_at", at);
         }
 
         // WarmThroughput on the table and on updated indexes: stored as sent,

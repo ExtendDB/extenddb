@@ -1,16 +1,18 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `TableStatus` an `UpdateTable` answers, and what the table serves
-//! while that status lasts, against the SQLite backend in process. The
-//! expected answers are Amazon DynamoDB's, measured in us-east-1 on
-//! 2026-11-13, 2026-11-14 and 2026-11-17 on tables keyed on one S attribute.
+//! The `TableStatus` an `UpdateTable` answers, what the table serves while
+//! that status lasts, and the `LastIncreaseDateTime` a raise stamps, against
+//! the SQLite backend in process. The expected answers are Amazon DynamoDB's,
+//! measured in us-east-1 on 2026-11-13, 2026-11-14, 2026-11-16, 2026-11-17
+//! and 2026-11-19 on tables keyed on one S attribute.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::limits::LimitsConfig;
+use extenddb_core::types::epoch_seconds_now;
 use extenddb_storage::server_components::ServerComponentsOptions;
 use serde_json::{Value, json};
 
@@ -74,14 +76,15 @@ async fn call(
         .map(|result| result.body)
 }
 
-async fn describe_status(ctx: &OperationContext, table: &str) -> String {
-    let desc = call(ctx, "DescribeTable", json!({"TableName": table}))
+async fn describe(ctx: &OperationContext, table: &str) -> Value {
+    call(ctx, "DescribeTable", json!({"TableName": table}))
         .await
-        .expect("DescribeTable");
-    desc["Table"]["TableStatus"]
-        .as_str()
-        .expect("a status")
-        .to_owned()
+        .expect("DescribeTable")["Table"]
+        .clone()
+}
+
+async fn describe_status(ctx: &OperationContext, table: &str) -> Value {
+    describe(ctx, table).await["TableStatus"].clone()
 }
 
 /// `{"TableName": table}` with `members` added.
@@ -111,9 +114,14 @@ async fn update(
     call(ctx, "UpdateTable", request(table, members)).await
 }
 
-fn provisioned_5() -> Value {
-    json!({"BillingMode": "PROVISIONED",
-        "ProvisionedThroughput": {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5}})
+fn units(read: i64, write: i64) -> Value {
+    json!({"ProvisionedThroughput": {"ReadCapacityUnits": read, "WriteCapacityUnits": write}})
+}
+
+fn provisioned(read: i64, write: i64) -> Value {
+    let mut members = units(read, write);
+    members["BillingMode"] = json!("PROVISIONED");
+    members
 }
 
 fn on_demand() -> Value {
@@ -126,10 +134,10 @@ fn on_demand() -> Value {
 fn rows() -> [(Value, Value); 4] {
     [
         (
-            provisioned_5(),
+            provisioned(5, 5),
             json!({"ProvisionedThroughput": {"ReadCapacityUnits": 9, "WriteCapacityUnits": 11}}),
         ),
-        (provisioned_5(), json!({"BillingMode": "PAY_PER_REQUEST"})),
+        (provisioned(5, 5), json!({"BillingMode": "PAY_PER_REQUEST"})),
         (
             on_demand(),
             json!({"TableClass": "STANDARD_INFREQUENT_ACCESS"}),
@@ -179,7 +187,7 @@ async fn each_change_answers_updating_until_the_window_ends() {
 #[tokio::test]
 async fn inside_a_window_a_capacity_change_is_refused_and_the_table_is_served() {
     let (ctx, settings) = context().await;
-    create(&ctx, "tbl", &provisioned_5()).await;
+    create(&ctx, "tbl", &provisioned(5, 5)).await;
     set_delay(&settings, "3600").await;
     update(
         &ctx,
@@ -265,4 +273,91 @@ async fn a_zero_delay_answers_active_at_once() {
     .expect("UpdateTable");
     assert_eq!(response["TableDescription"]["TableStatus"], "ACTIVE");
     assert_eq!(describe_status(&ctx, "tbl").await, "ACTIVE");
+}
+
+/// An UpdateTable's members, and whether the service sent the member while
+/// the table was UPDATING and once it was ACTIVE again.
+type Change = (Value, [bool; 2]);
+
+/// `ProvisionedThroughput.LastIncreaseDateTime` around capacity changes: the
+/// table before, then each change in order. While UPDATING covers the
+/// UpdateTable response and a DescribeTable right after. Measured in
+/// us-east-1 on 2026-11-14, 2026-11-16 and 2026-11-19. The service sent none
+/// after CreateTable, and none in the DeleteTable response.
+fn last_increase_rows() -> [(Value, Vec<Change>); 5] {
+    [
+        (
+            provisioned(5, 7),
+            vec![(units(9, 11), [true, true]), (units(12, 13), [true, true])],
+        ),
+        (provisioned(5, 7), vec![(units(9, 7), [true, true])]),
+        (provisioned(5, 7), vec![(units(9, 6), [true, true])]),
+        (provisioned(5, 7), vec![(units(4, 6), [false, false])]),
+        (on_demand(), vec![(provisioned(5, 7), [true, false])]),
+    ]
+}
+
+/// The member of `desc`, which must be epoch seconds with at most 3
+/// decimals, as the service sends it, from `sent` to now to the millisecond.
+fn last_increase(desc: &Value, sent: f64) -> Option<f64> {
+    let member = &desc["ProvisionedThroughput"]["LastIncreaseDateTime"];
+    let at = member.as_f64().or_else(|| {
+        assert!(member.is_null(), "{member}");
+        None
+    })?;
+    let decimals = member
+        .to_string()
+        .split_once('.')
+        .map_or(0, |(_, d)| d.len());
+    assert!(decimals <= 3, "{member}");
+    assert!(
+        sent - 1e-3 <= at && at <= epoch_seconds_now() + 1e-3,
+        "{at} from {sent}"
+    );
+    Some(at)
+}
+
+#[tokio::test]
+async fn a_raise_stamps_last_increase_date_time_as_measured() {
+    let (ctx, settings) = context().await;
+    for (i, (before, changes)) in last_increase_rows().into_iter().enumerate() {
+        let table = format!("inc{i}");
+        set_delay(&settings, "0").await;
+        let created = epoch_seconds_now();
+        create(&ctx, &table, &before).await;
+        let after_create = describe(&ctx, &table).await;
+        assert_eq!(last_increase(&after_create, created), None, "row {i}");
+        set_delay(&settings, "1").await;
+        for (members, [updating, active]) in changes {
+            let sent = epoch_seconds_now();
+            let response = update(&ctx, &table, &members)
+                .await
+                .unwrap_or_else(|e| panic!("row {i} {members}: {e:?}"));
+            let right_after = describe(&ctx, &table).await;
+            for desc in [&response["TableDescription"], &right_after] {
+                assert_eq!(desc["TableStatus"], "UPDATING", "row {i} {members}");
+                assert_eq!(
+                    last_increase(desc, sent).is_some(),
+                    updating,
+                    "row {i} {members}: {desc}"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            let settled = describe(&ctx, &table).await;
+            assert_eq!(settled["TableStatus"], "ACTIVE", "row {i} {members}");
+            assert_eq!(
+                last_increase(&settled, sent).is_some(),
+                active,
+                "row {i} {members}: once ACTIVE"
+            );
+        }
+        let deleted = call(&ctx, "DeleteTable", json!({"TableName": table}))
+            .await
+            .expect("DeleteTable");
+        assert_eq!(
+            last_increase(&deleted["TableDescription"], created),
+            None,
+            "row {i}: DeleteTable"
+        );
+    }
 }

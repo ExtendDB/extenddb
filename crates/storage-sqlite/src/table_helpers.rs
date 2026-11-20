@@ -13,6 +13,7 @@ use extenddb_core::types::{
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{
     index_arn, parse_warm_throughput_record, reported_status, stream_arn,
+    table_throughput_description,
 };
 use extenddb_storage::vector_catalog::{VectorIndexCatalogRow, vector_index_descriptions};
 
@@ -266,13 +267,12 @@ impl SqliteEngine {
             .map(|s| parse_json(s, "stream_specification"))
             .transpose()?;
 
-        let (rcu, wcu) = match &row.provisioned_throughput {
-            Some(s) => {
-                let pt: ProvisionedThroughput = parse_json(s, "provisioned_throughput")?;
-                (pt.read_capacity_units, pt.write_capacity_units)
-            }
-            None => (0, 0),
-        };
+        let provisioned_throughput = table_throughput_description(
+            row.provisioned_throughput
+                .as_deref()
+                .map(|s| parse_json(s, "provisioned_throughput"))
+                .transpose()?,
+        );
 
         let stored_status = match row.table_status.as_str() {
             "ACTIVE" => TableStatus::Active,
@@ -336,13 +336,7 @@ impl SqliteEngine {
             item_count: row.item_count,
             table_arn: row.table_arn,
             table_id: row.table_id,
-            provisioned_throughput: ProvisionedThroughputDescription {
-                read_capacity_units: rcu,
-                write_capacity_units: wcu,
-                number_of_decreases_today: 0,
-                last_increase_date_time: None,
-                last_decrease_date_time: None,
-            },
+            provisioned_throughput,
             billing_mode_summary,
             table_throughput_mode_summary: None,
             global_secondary_indexes: (!gsis.is_empty()).then_some(gsis),
