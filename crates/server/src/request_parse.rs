@@ -241,26 +241,27 @@ mod tests {
     #[test]
     fn the_depth_scan_brackets_the_ceiling_exactly() {
         // Scan only (no parse), so this is safe at any depth on the test stack.
-        // Rows: body, the depth the scan must report. The scan saturates one
-        // past the ceiling for a deeper body.
-        let rows: [(Vec<u8>, usize); 5] = [
-            (deep_body(100), 203),
-            (deep_body(2000), 4003),
-            (b"[".repeat(MAX_REQUEST_JSON_DEPTH), MAX_REQUEST_JSON_DEPTH),
-            (
-                b"[".repeat(MAX_REQUEST_JSON_DEPTH + 1),
-                MAX_REQUEST_JSON_DEPTH + 1,
-            ),
-            (
-                deep_body(MAX_REQUEST_JSON_DEPTH),
-                MAX_REQUEST_JSON_DEPTH + 1,
-            ),
+        // Rows: body, the depth the scan must report, whether that depth is
+        // within the ceiling. The depths are literals, so a ceiling other than
+        // 5200 fails a row. The scan saturates one past the ceiling for a
+        // deeper body.
+        let rows: [(Vec<u8>, usize, bool); 5] = [
+            (deep_body(100), 203, true),
+            (deep_body(2000), 4003, true),
+            (b"[".repeat(5200), 5200, true),
+            (b"[".repeat(5201), 5201, false),
+            (deep_body(5200), 5201, false),
         ];
-        for (body, depth) in &rows {
-            assert_eq!(nesting_depth(body), *depth, "{} bytes", body.len());
+        for (body, depth, within) in &rows {
+            let scanned = nesting_depth(body);
+            assert_eq!(scanned, *depth, "{} bytes", body.len());
+            assert_eq!(
+                scanned <= MAX_REQUEST_JSON_DEPTH,
+                *within,
+                "{} bytes",
+                body.len()
+            );
         }
-        assert!(nesting_depth(&rows[2].0) <= MAX_REQUEST_JSON_DEPTH);
-        assert!(nesting_depth(&rows[3].0) > MAX_REQUEST_JSON_DEPTH);
     }
 
     #[test]
