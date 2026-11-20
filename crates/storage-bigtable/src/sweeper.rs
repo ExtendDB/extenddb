@@ -3,10 +3,14 @@
 
 //! 2PC Recovery Sweeper Worker.
 //!
-//! Sweeps the coordinator transaction log table `__extenddb_txn_log__` and
-//! rolls back aborted transaction intents that exceed `intent_timeout_secs`,
-//! or rolls forward committed ones (both multi-item `TransactWriteItems` and
-//! single-item stream-enabled writes).
+//! Sweeps the coordinator transaction log table `__extenddb_txn_log__` and:
+//! - CAS-transitions timed-out `PENDING` transactions to `ABORTED` (`try_abort_pending`)
+//!   *before* clearing participant intents (`BUG-01`, `AllOrNothing2PCAtomicity`),
+//!   preventing partial 2PC commits when racing a live coordinator.
+//! - Rolls forward `COMMITTED` transactions idempotently (`roll_forward`),
+//!   applying base mutations, versioned GSI shadow writes, `TxnTtlMutation`s
+//!   (`BUG-06`), ordered deduplicated stream records (`BUG-04`, `BUG-05`), and
+//!   `ClientRequestToken` `idem:` entries (`BUG-07c`).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,7 +25,7 @@ use crate::BigtableEngine;
 use crate::data::item_ops::now_millis_micros;
 use crate::transact::{
     ParticipantMutation, ParticipantRow, TXN_FAMILY, TXN_LOG_TABLE, TxnCoordinator, TxnState,
-    TxnStreamRecord, build_txn_log_latest_filter,
+    TxnStreamRecord, TxnTokenMeta, TxnTtlMutation, build_txn_log_latest_filter,
 };
 
 pub async fn run(engine: Arc<BigtableEngine>, cadence: Duration, shutdown: CancellationToken) {
@@ -80,7 +84,10 @@ pub async fn sweep_with_cutoff_override(
     let intent_timeout_micros = (engine.intent_timeout_secs().saturating_mul(1_000_000)) as i64;
     let cutoff = cutoff_override_micros.unwrap_or_else(|| now_micros - intent_timeout_micros);
 
-    let coord = TxnCoordinator::new(client, Duration::from_secs(engine.intent_timeout_secs()));
+    let coord = TxnCoordinator::new(
+        client,
+        Duration::from_secs(engine.intent_timeout_secs().max(1)),
+    );
 
     loop {
         let range = RowRange {
@@ -130,6 +137,8 @@ pub async fn sweep_with_cutoff_override(
             let mut participants: Option<Vec<ParticipantRow>> = None;
             let mut mutations: Option<Vec<ParticipantMutation>> = None;
             let mut stream_records: Option<Vec<TxnStreamRecord>> = None;
+            let mut ttl_mutations: Option<Vec<TxnTtlMutation>> = None;
+            let mut token_meta: Option<TxnTokenMeta> = None;
 
             for cell in cells {
                 if cell.family_name == TXN_FAMILY {
@@ -152,6 +161,12 @@ pub async fn sweep_with_cutoff_override(
                         b"stream_records" if stream_records.is_none() => {
                             stream_records = serde_json::from_slice(&cell.value).ok();
                         }
+                        b"ttl_mutations" if ttl_mutations.is_none() => {
+                            ttl_mutations = serde_json::from_slice(&cell.value).ok();
+                        }
+                        b"token_meta" if token_meta.is_none() => {
+                            token_meta = serde_json::from_slice(&cell.value).ok();
+                        }
                         _ => {}
                     }
                 }
@@ -165,40 +180,91 @@ pub async fn sweep_with_cutoff_override(
             };
 
             if st == "CLEANED" {
-                let _ = coord.drop(&txn_id).await;
+                if let Some(ref tm) = token_meta
+                    && let Err(e) = engine
+                        .persist_idempotency_if_unexpired(
+                            &tm.account_id,
+                            &tm.token,
+                            &tm.fingerprint,
+                            &txn_id,
+                            state_ts_micros.max(start),
+                        )
+                        .await
+                {
+                    tracing::warn!(
+                        "2PC Sweeper: failed to persist idempotency record for CLEANED txn {txn_id}: {e}"
+                    );
+                    continue;
+                }
+                let _ = coord.drop_matching_start(&txn_id, start).await;
                 continue;
             }
 
-            if start < cutoff {
+            if st == "ABORTED" {
+                clear_aborted_intents_and_drop(&coord, &txn_id, start, participants.as_deref())
+                    .await;
+                continue;
+            }
+
+            if start <= cutoff {
                 tracing::info!(
                     "2PC Sweeper: found stale transaction {txn_id} (state={st}, started {}s ago)",
                     (now_micros - start) / 1_000_000
                 );
 
                 match st.as_str() {
-                    "PENDING" | "ABORTED" => {
-                        let mut success = true;
-                        if let Some(parts) = participants {
-                            for p in parts {
-                                if let Err(e) = coord.clear_intent(&txn_id, &p).await {
-                                    tracing::warn!(
-                                        "2PC Sweeper: rollback failed to clear intent on {} for txn {txn_id}: {e}",
-                                        p.data_table
-                                    );
-                                    success = false;
+                    "PENDING" => {
+                        match coord
+                            .try_abort_pending(&txn_id, start, start.max(state_ts_micros))
+                            .await
+                        {
+                            Ok(true) => {
+                                clear_aborted_intents_and_drop(
+                                    &coord,
+                                    &txn_id,
+                                    start,
+                                    participants.as_deref(),
+                                )
+                                .await;
+                            }
+                            Ok(false) => {
+                                // Coordinator raced us: check if this incarnation committed!
+                                match coord.get_state(&txn_id).await {
+                                    Ok(Some(fresh))
+                                        if fresh.state == "COMMITTED"
+                                            && fresh.started_at == Some(start) =>
+                                    {
+                                        if let Err(e) = engine.roll_forward(&txn_id, &fresh).await {
+                                            tracing::error!(
+                                                "2PC Sweeper: rollforward after CAS race failed for {txn_id}: {e}"
+                                            );
+                                        }
+                                    }
+                                    Ok(Some(fresh))
+                                        if fresh.state == "ABORTED"
+                                            && fresh.started_at == Some(start) =>
+                                    {
+                                        clear_aborted_intents_and_drop(
+                                            &coord,
+                                            &txn_id,
+                                            start,
+                                            fresh.participants.as_deref(),
+                                        )
+                                        .await;
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "2PC Sweeper: get_state after CAS miss failed for {txn_id}: {e}"
+                                        );
+                                    }
                                 }
                             }
-                        }
-                        if success {
-                            if let Err(e) = coord.drop(&txn_id).await {
+                            Err(e) => {
                                 tracing::warn!(
-                                    "2PC Sweeper: failed to drop coordinator row for txn {txn_id}: {e}"
+                                    "2PC Sweeper: try_abort_pending failed for {txn_id}: {e}"
                                 );
-                            } else {
-                                tracing::info!("2PC Sweeper: rolled back stale txn {txn_id}");
                             }
-                        } else if st == "PENDING" {
-                            let _ = coord.aborted(&txn_id, start.max(state_ts_micros)).await;
                         }
                     }
                     "COMMITTED" => {
@@ -209,6 +275,8 @@ pub async fn sweep_with_cutoff_override(
                             participants,
                             mutations,
                             stream_records,
+                            ttl_mutations,
+                            token_meta,
                         };
                         if let Err(e) = engine.roll_forward(&txn_id, &txn_state).await {
                             tracing::error!(
@@ -234,4 +302,31 @@ pub async fn sweep_with_cutoff_override(
     }
 
     Ok(())
+}
+
+async fn clear_aborted_intents_and_drop(
+    coord: &TxnCoordinator<'_>,
+    txn_id: &str,
+    started_at_micros: i64,
+    participants: Option<&[ParticipantRow]>,
+) {
+    let mut success = true;
+    if let Some(parts) = participants {
+        for p in parts {
+            if let Err(e) = coord.clear_intent(txn_id, p).await {
+                tracing::warn!(
+                    "2PC Sweeper: rollback failed to clear intent on {} for txn {txn_id}: {e}",
+                    p.data_table
+                );
+                success = false;
+            }
+        }
+    }
+    if success {
+        if let Err(e) = coord.drop_matching_start(txn_id, started_at_micros).await {
+            tracing::warn!("2PC Sweeper: failed to drop coordinator row for txn {txn_id}: {e}");
+        } else {
+            tracing::info!("2PC Sweeper: rolled back stale txn {txn_id}");
+        }
+    }
 }

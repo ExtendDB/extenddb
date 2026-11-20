@@ -3701,3 +3701,2169 @@ async fn test_layer2_aba_fencing_reused_token_gsi_toctou_and_cleanup_workers() {
         "expired stream records must be pruned"
     );
 }
+
+// =============================================================================
+// Specula Formal Verification Remediation Suite (BUG-01 .. BUG-13)
+// =============================================================================
+
+fn s_item(pairs: &[(&str, &str)]) -> Item {
+    let mut it = BTreeMap::new();
+    for (k, v) in pairs {
+        it.insert((*k).to_string(), AttributeValue::S((*v).to_string()));
+    }
+    it
+}
+
+// -----------------------------------------------------------------------------
+// Test 15: BUG-01 & BUG-03 — 2PC CAS Commit vs Sweeper Race & Post-COMMITTED
+//          Intent Lease Expiry Protection
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_specula_bug01_bug03_2pc_cas_sweeper_race_and_expired_committed_intent() {
+    let Some(ctx) = setup_emulator_context().await else {
+        eprintln!("Skipping Bigtable test: emulator unavailable");
+        return;
+    };
+
+    let table_name = unique_name("tbl_bug01_03");
+    ctx.engine
+        .create_table(
+            &ctx.account_id,
+            CreateTableInput {
+                table_name: table_name.clone(),
+                key_schema: vec![KeySchemaElement {
+                    attribute_name: "pk".to_string(),
+                    key_type: KeyType::Hash,
+                }],
+                attribute_definitions: vec![AttributeDefinition {
+                    attribute_name: "pk".to_string(),
+                    attribute_type: ScalarAttributeType::S,
+                }],
+                billing_mode: Some(BillingMode::PayPerRequest),
+                stream_specification: Some(StreamSpecification {
+                    stream_enabled: true,
+                    stream_view_type: Some(StreamViewType::NewAndOldImages),
+                }),
+                deletion_protection_enabled: Some(false),
+                ..CreateTableInput::default()
+            },
+        )
+        .await
+        .expect("create table");
+    let key_info = ctx
+        .engine
+        .table_key_info(&ctx.account_id, &table_name)
+        .await
+        .unwrap();
+    let data_table = ctx.engine.data_table_for(&key_info).await.unwrap();
+    let empty_maps = ExpressionMaps::default();
+
+    // --- BUG-01 Part A: Sweeper CAS-aborts PENDING -> ABORTED before clearing intents, and
+    //                    late `commit()` / `try_commit_full()` both before and after row drop
+    //                    MUST fail CAS without creating a zombie COMMITTED row!
+    let coord = extenddb_storage_bigtable::transact::TxnCoordinator::new(
+        ctx.engine.client_ref(),
+        Duration::from_secs(1),
+    );
+    let item_a = s_item(&[("pk", "r_abort_a"), ("v", "partial_bad")]);
+    let item_b = s_item(&[("pk", "r_abort_b"), ("v", "partial_bad")]);
+    let part_a = extenddb_storage_bigtable::transact::ParticipantRow {
+        data_table: data_table.clone(),
+        row_key: extenddb_storage_bigtable::data::encoding::row_key::encode_key(
+            &item_a,
+            &key_info.key_schema,
+        )
+        .unwrap(),
+    };
+    let part_b = extenddb_storage_bigtable::transact::ParticipantRow {
+        data_table: data_table.clone(),
+        row_key: extenddb_storage_bigtable::data::encoding::row_key::encode_key(
+            &item_b,
+            &key_info.key_schema,
+        )
+        .unwrap(),
+    };
+    let slow_txn = extenddb_storage_bigtable::transact::TxnCoordinator::new_txn_id();
+    let (created, started_at) = coord
+        .open(&slow_txn, &[part_a.clone(), part_b.clone()])
+        .await
+        .unwrap();
+    assert!(created);
+    assert!(coord.place_intent(&slow_txn, &part_a).await.unwrap());
+    assert!(coord.place_intent(&slow_txn, &part_b).await.unwrap());
+
+    assert!(
+        coord
+            .try_abort_pending(&slow_txn, started_at, started_at)
+            .await
+            .expect("try_abort_pending")
+    );
+    let muts = vec![
+        extenddb_storage_bigtable::transact::ParticipantMutation {
+            participant: part_a.clone(),
+            payload: extenddb_storage_bigtable::transact::TxnOpPayload::Put {
+                item: item_a.clone(),
+            },
+            expected_version: None,
+            row_existed: false,
+            new_version: Some(100),
+        },
+        extenddb_storage_bigtable::transact::ParticipantMutation {
+            participant: part_b.clone(),
+            payload: extenddb_storage_bigtable::transact::TxnOpPayload::Put {
+                item: item_b.clone(),
+            },
+            expected_version: None,
+            row_existed: false,
+            new_version: Some(100),
+        },
+    ];
+    let late_commit_on_aborted = coord.commit(&slow_txn, started_at, &muts, None).await;
+    assert!(
+        matches!(
+            late_commit_on_aborted,
+            Err(StorageError::TransactionConflict(_))
+        ),
+        "BUG-01: commit() MUST fail CAS when coordinator was transitioned to ABORTED"
+    );
+
+    extenddb_storage_bigtable::sweeper::sweep_with_cutoff_override(&ctx.engine, Some(i64::MAX))
+        .await
+        .expect("sweeper cleans ABORTED");
+    assert!(coord.get_state(&slow_txn).await.unwrap().is_none());
+    let late_commit_after_drop = coord
+        .try_commit_full(&slow_txn, started_at, &muts, None, None)
+        .await
+        .unwrap();
+    assert!(
+        late_commit_after_drop.is_none(),
+        "BUG-01: try_commit_full after sweeper drop must return None"
+    );
+    assert!(
+        coord.get_state(&slow_txn).await.unwrap().is_none(),
+        "BUG-01: failed commit must NOT resurrect a zombie COMMITTED coordinator row"
+    );
+
+    // --- BUG-01 Part B: Incarnation fencing on deterministic IDs (`started_at_micros` mismatch) ---
+    let det_tid = format!("det-incarnation-{}", Uuid::new_v4().simple());
+    let (_, inc1_start) = coord
+        .open(&det_tid, std::slice::from_ref(&part_a))
+        .await
+        .unwrap();
+    assert!(
+        coord
+            .try_abort_pending(&det_tid, inc1_start, inc1_start)
+            .await
+            .unwrap()
+    );
+    coord
+        .drop_matching_start(&det_tid, inc1_start)
+        .await
+        .unwrap();
+    let (inc2_created, inc2_start) = coord
+        .open(&det_tid, std::slice::from_ref(&part_a))
+        .await
+        .unwrap();
+    assert!(inc2_created);
+    assert!(inc2_start > inc1_start);
+    assert!(
+        coord
+            .try_commit_full(&det_tid, inc1_start, &muts[..1], None, None)
+            .await
+            .unwrap()
+            .is_none(),
+        "BUG-01: stale incarnation started_at_micros must NOT commit a newer PENDING incarnation"
+    );
+    coord
+        .drop_matching_start(&det_tid, inc1_start)
+        .await
+        .unwrap();
+    assert_eq!(
+        coord
+            .get_state(&det_tid)
+            .await
+            .unwrap()
+            .and_then(|s| s.started_at),
+        Some(inc2_start),
+        "BUG-01: drop_matching_start with stale started_at must NOT delete newer incarnation"
+    );
+    let _ = coord
+        .try_abort_pending(&det_tid, inc2_start, inc2_start)
+        .await;
+    coord
+        .drop_matching_start(&det_tid, inc2_start)
+        .await
+        .unwrap();
+
+    // --- BUG-01 Part C: 16-round concurrent race between try_commit_full + roll_forward vs sweeper ---
+    for round in 0..16u32 {
+        let ka = s_item(&[("pk", &format!("race_a_{round}"))]);
+        let kb = s_item(&[("pk", &format!("race_b_{round}"))]);
+        let mut ia = ka.clone();
+        ia.insert("val".into(), AttributeValue::S("committed".into()));
+        let mut ib = kb.clone();
+        ib.insert("val".into(), AttributeValue::S("committed".into()));
+
+        let pa = extenddb_storage_bigtable::transact::ParticipantRow {
+            data_table: data_table.clone(),
+            row_key: extenddb_storage_bigtable::data::encoding::row_key::encode_key(
+                &ka,
+                &key_info.key_schema,
+            )
+            .unwrap(),
+        };
+        let pb = extenddb_storage_bigtable::transact::ParticipantRow {
+            data_table: data_table.clone(),
+            row_key: extenddb_storage_bigtable::data::encoding::row_key::encode_key(
+                &kb,
+                &key_info.key_schema,
+            )
+            .unwrap(),
+        };
+        let tid = extenddb_storage_bigtable::transact::TxnCoordinator::new_txn_id();
+        let (_, st_ts) = coord.open(&tid, &[pa.clone(), pb.clone()]).await.unwrap();
+        assert!(coord.place_intent(&tid, &pa).await.unwrap());
+        assert!(coord.place_intent(&tid, &pb).await.unwrap());
+
+        let race_ver = extenddb_storage_bigtable::data::item_ops::next_occ_version(None);
+        let rmuts = vec![
+            extenddb_storage_bigtable::transact::ParticipantMutation {
+                participant: pa.clone(),
+                payload: extenddb_storage_bigtable::transact::TxnOpPayload::Put { item: ia },
+                expected_version: None,
+                row_existed: false,
+                new_version: Some(race_ver),
+            },
+            extenddb_storage_bigtable::transact::ParticipantMutation {
+                participant: pb.clone(),
+                payload: extenddb_storage_bigtable::transact::TxnOpPayload::Put { item: ib },
+                expected_version: None,
+                row_existed: false,
+                new_version: Some(race_ver),
+            },
+        ];
+
+        let eng_w = ctx.engine.clone();
+        let eng_s = ctx.engine.clone();
+        let tid_w = tid.clone();
+        let parts_w = vec![pa, pb];
+        let writer_fut = async move {
+            let c = extenddb_storage_bigtable::transact::TxnCoordinator::new(
+                eng_w.client_ref(),
+                Duration::from_secs(1),
+            );
+            if let Some(cts) = c
+                .try_commit_full(&tid_w, st_ts, &rmuts, None, None)
+                .await
+                .unwrap()
+            {
+                let state = extenddb_storage_bigtable::transact::TxnState {
+                    state: "COMMITTED".into(),
+                    state_ts_micros: cts,
+                    started_at: Some(st_ts),
+                    participants: Some(parts_w),
+                    mutations: Some(rmuts),
+                    stream_records: None,
+                    ttl_mutations: None,
+                    token_meta: None,
+                };
+                eng_w.roll_forward(&tid_w, &state).await.unwrap();
+                true
+            } else {
+                false
+            }
+        };
+        let sweeper_fut = async move {
+            extenddb_storage_bigtable::sweeper::sweep_with_cutoff_override(&eng_s, Some(i64::MAX))
+                .await
+                .unwrap();
+        };
+        let (committed, _) = tokio::join!(writer_fut, sweeper_fut);
+        extenddb_storage_bigtable::sweeper::sweep_with_cutoff_override(&ctx.engine, Some(i64::MAX))
+            .await
+            .unwrap();
+
+        let got_a = ctx.engine.get_item(&key_info, &ka).await.unwrap();
+        let got_b = ctx.engine.get_item(&key_info, &kb).await.unwrap();
+        assert_eq!(
+            got_a.is_some(),
+            committed,
+            "BUG-01 round {round}: row A state must match coordinator commit outcome"
+        );
+        assert_eq!(
+            got_a.is_some(),
+            got_b.is_some(),
+            "BUG-01 round {round}: all-or-nothing 2PC atomicity violated (A={got_a:?}, B={got_b:?})"
+        );
+    }
+
+    // --- BUG-03: Post-COMMITTED intent older than `intent_timeout_secs = 1` MUST NOT
+    //             regress `TransactGetItems` or allow conditional `attribute_not_exists(pk)` bypass!
+    let short_lease_engine = BigtableEngine::new(ctx.client.clone(), ctx.client.clone(), 1);
+    let capture = StreamCapture {
+        view_type: StreamViewType::NewAndOldImages,
+        user_identity: None,
+        region: Arc::from(ctx.engine.region()),
+    };
+    let committed_key = s_item(&[("pk", "expired_committed_pk")]);
+    let mut committed_item = committed_key.clone();
+    committed_item.insert("val".into(), AttributeValue::S("must_not_regress".into()));
+    let _stale_committed_tid = short_lease_engine
+        .debug_fenced_put_commit_only(&key_info, committed_item, Some(&capture))
+        .await
+        .expect("commit-only put");
+
+    tokio::time::sleep(Duration::from_millis(1250)).await;
+
+    let tget = short_lease_engine
+        .transact_get_items(&[TransactGetOp {
+            key_info: &key_info,
+            key: &committed_key,
+        }])
+        .await
+        .expect("transact_get_items after intent timeout");
+    assert_eq!(
+        tget[0].as_ref().and_then(|i| i.get("val")),
+        Some(&AttributeValue::S("must_not_regress".into())),
+        "BUG-03: TransactGetItems must NOT ignore COMMITTED intent after wall-clock lease expiry"
+    );
+
+    let cond_not_exists = parse_cond("attribute_not_exists(pk)");
+    let mut intruder = committed_key.clone();
+    intruder.insert("val".into(), AttributeValue::S("intruder_clobber".into()));
+    let cond_res = short_lease_engine
+        .put_item(
+            &key_info,
+            intruder,
+            false,
+            Some(&cond_not_exists),
+            &empty_maps,
+            None,
+        )
+        .await;
+    match cond_res {
+        Err(StorageError::ConditionFailed(Some(prior))) => {
+            assert_eq!(
+                prior.get("val"),
+                Some(&AttributeValue::S("must_not_regress".into()))
+            );
+        }
+        other => panic!("BUG-03: expected ConditionFailed(Some(committed)), got {other:?}"),
+    }
+    let after_roll = short_lease_engine
+        .get_item(&key_info, &committed_key)
+        .await
+        .unwrap()
+        .expect("committed item rolled forward");
+    assert_eq!(
+        after_roll.get("val"),
+        Some(&AttributeValue::S("must_not_regress".into()))
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Test 16: BUG-02 — `TransactGetItems` Key Validation, Dedup, Linearizable
+//          Multi-Row Snapshot & Zero HTTP 500s
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_specula_bug02_transact_get_items_linearizable_snapshot_validation_and_zero_500s() {
+    let Some(ctx) = setup_emulator_context().await else {
+        eprintln!("Skipping Bigtable test: emulator unavailable");
+        return;
+    };
+
+    let table_name = unique_name("tbl_bug02_snap");
+    ctx.engine
+        .create_table(
+            &ctx.account_id,
+            CreateTableInput {
+                table_name: table_name.clone(),
+                key_schema: vec![KeySchemaElement {
+                    attribute_name: "pk".to_string(),
+                    key_type: KeyType::Hash,
+                }],
+                attribute_definitions: vec![AttributeDefinition {
+                    attribute_name: "pk".to_string(),
+                    attribute_type: ScalarAttributeType::S,
+                }],
+                billing_mode: Some(BillingMode::PayPerRequest),
+                deletion_protection_enabled: Some(false),
+                ..CreateTableInput::default()
+            },
+        )
+        .await
+        .unwrap();
+    let key_info = ctx
+        .engine
+        .table_key_info(&ctx.account_id, &table_name)
+        .await
+        .unwrap();
+    let empty_maps = ExpressionMaps::default();
+
+    // Upfront key validation: wrong scalar type must return TransactionCanceled(ValidationError)
+    let mut bad_key = Item::new();
+    bad_key.insert("pk".to_string(), AttributeValue::N("123".into()));
+    match ctx
+        .engine
+        .transact_get_items(&[TransactGetOp {
+            key_info: &key_info,
+            key: &bad_key,
+        }])
+        .await
+    {
+        Err(StorageError::TransactionCanceled(reasons)) => {
+            assert_eq!(reasons.len(), 1);
+            assert_eq!(reasons[0].code, "ValidationError");
+        }
+        other => panic!("expected TransactionCanceled(ValidationError), got {other:?}"),
+    }
+
+    // Conservation-of-mass accounts: bal(acct_a) + bal(acct_b) == 1000 across all commits
+    for (pk, bal) in [("acct_a", "500"), ("acct_b", "500")] {
+        let mut it = s_item(&[("pk", pk)]);
+        it.insert("bal".into(), AttributeValue::N(bal.into()));
+        ctx.engine
+            .put_item(&key_info, it, false, None, &empty_maps, None)
+            .await
+            .unwrap();
+    }
+
+    // Duplicate keys in a single TransactGetItems preserve positional output order
+    let ka_dup = s_item(&[("pk", "acct_a")]);
+    let kb_dup = s_item(&[("pk", "acct_b")]);
+    let dup_snap = ctx
+        .engine
+        .transact_get_items(&[
+            TransactGetOp {
+                key_info: &key_info,
+                key: &ka_dup,
+            },
+            TransactGetOp {
+                key_info: &key_info,
+                key: &kb_dup,
+            },
+            TransactGetOp {
+                key_info: &key_info,
+                key: &ka_dup,
+            },
+        ])
+        .await
+        .unwrap();
+    assert_eq!(dup_snap.len(), 3);
+    assert_eq!(dup_snap[0], dup_snap[2]);
+
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut writer_handles = Vec::new();
+    for w in 0..3u32 {
+        let eng = ctx.engine.clone();
+        let ki = key_info.clone();
+        let done_w = done.clone();
+        writer_handles.push(tokio::spawn(async move {
+            let ka = s_item(&[("pk", "acct_a")]);
+            let kb = s_item(&[("pk", "acct_b")]);
+            let act_inc = parse_upd("SET bal = bal + :d");
+            let act_dec = parse_upd("SET bal = bal - :d");
+            for step in 0..15u32 {
+                let delta = ((w + step) % 7 + 1).to_string();
+                let mut maps = ExpressionMaps::default();
+                maps.values.insert("d".into(), AttributeValue::N(delta));
+                let (a_acts, b_acts) = if step % 2 == 0 {
+                    (&act_inc, &act_dec)
+                } else {
+                    (&act_dec, &act_inc)
+                };
+                let ops = [
+                    TransactWriteOp::Update {
+                        key_info: &ki,
+                        key: &ka,
+                        actions: a_acts,
+                        condition: None,
+                        maps: &maps,
+                        return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+                        stream: None,
+                    },
+                    TransactWriteOp::Update {
+                        key_info: &ki,
+                        key: &kb,
+                        actions: b_acts,
+                        condition: None,
+                        maps: &maps,
+                        return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+                        stream: None,
+                    },
+                ];
+                match eng.transact_write_items(&ops, None).await {
+                    Ok(()) | Err(StorageError::TransactionCanceled(_)) => {}
+                    Err(other) => panic!("BUG-02/11: unexpected writer error: {other:?}"),
+                }
+            }
+            done_w.store(true, std::sync::atomic::Ordering::Release);
+        }));
+    }
+
+    let mut reader_handles = Vec::new();
+    for _ in 0..4u32 {
+        let eng = ctx.engine.clone();
+        let ki = key_info.clone();
+        let done_r = done.clone();
+        reader_handles.push(tokio::spawn(async move {
+            let ka = s_item(&[("pk", "acct_a")]);
+            let kb = s_item(&[("pk", "acct_b")]);
+            let mut verified = 0usize;
+            let mut reads = 0usize;
+            while !done_r.load(std::sync::atomic::Ordering::Acquire) || reads < 20 {
+                let ops = [
+                    TransactGetOp {
+                        key_info: &ki,
+                        key: &ka,
+                    },
+                    TransactGetOp {
+                        key_info: &ki,
+                        key: &kb,
+                    },
+                ];
+                match eng.transact_get_items(&ops).await {
+                    Ok(snap) => {
+                        let ba: i64 = match snap[0].as_ref().unwrap().get("bal").unwrap() {
+                            AttributeValue::N(n) => n.parse().unwrap(),
+                            other => panic!("unexpected bal: {other:?}"),
+                        };
+                        let bb: i64 = match snap[1].as_ref().unwrap().get("bal").unwrap() {
+                            AttributeValue::N(n) => n.parse().unwrap(),
+                            other => panic!("unexpected bal: {other:?}"),
+                        };
+                        assert_eq!(
+                            ba + bb,
+                            1000,
+                            "BUG-02: torn TransactGetItems snapshot observed (acct_a={ba}, acct_b={bb})"
+                        );
+                        verified += 1;
+                    }
+                    Err(StorageError::TransactionCanceled(_)) => {}
+                    Err(other) => {
+                        panic!("BUG-02: unexpected TransactGetItems error (HTTP 500): {other:?}")
+                    }
+                }
+                reads += 1;
+            }
+            verified
+        }));
+    }
+
+    for h in writer_handles {
+        h.await.unwrap();
+    }
+    done.store(true, std::sync::atomic::Ordering::Release);
+    let mut total_verified = 0usize;
+    for h in reader_handles {
+        total_verified += h.await.unwrap();
+    }
+    assert!(total_verified > 0);
+}
+
+// -----------------------------------------------------------------------------
+// Test 17: BUG-04, BUG-05 & BUG-12 — Contiguous Per-Shard Stream Slots,
+//          Concurrent Multi-Caller Dedup, Phantom Guard & Live Tailing Contention
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_specula_bug04_bug05_bug12_streams_contiguous_slots_concurrent_dedup_phantom_and_contention()
+ {
+    let Some(ctx) = setup_emulator_context().await else {
+        eprintln!("Skipping Bigtable test: emulator unavailable");
+        return;
+    };
+
+    let table_name = unique_name("tbl_bug04_05_12");
+    let desc = ctx
+        .engine
+        .create_table(
+            &ctx.account_id,
+            CreateTableInput {
+                table_name: table_name.clone(),
+                key_schema: vec![KeySchemaElement {
+                    attribute_name: "pk".to_string(),
+                    key_type: KeyType::Hash,
+                }],
+                attribute_definitions: vec![AttributeDefinition {
+                    attribute_name: "pk".to_string(),
+                    attribute_type: ScalarAttributeType::S,
+                }],
+                billing_mode: Some(BillingMode::PayPerRequest),
+                stream_specification: Some(StreamSpecification {
+                    stream_enabled: true,
+                    stream_view_type: Some(StreamViewType::NewAndOldImages),
+                }),
+                deletion_protection_enabled: Some(false),
+                ..CreateTableInput::default()
+            },
+        )
+        .await
+        .unwrap();
+    let stream_arn = desc.latest_stream_arn.clone().unwrap();
+    let key_info = ctx
+        .engine
+        .table_key_info(&ctx.account_id, &table_name)
+        .await
+        .unwrap();
+    let capture = StreamCapture {
+        view_type: StreamViewType::NewAndOldImages,
+        user_identity: None,
+        region: Arc::from(ctx.engine.region()),
+    };
+    let empty_maps = ExpressionMaps::default();
+
+    // Find two distinct keys mapping onto the EXACT same stream shard (`SHARDS_PER_STREAM = 4`)
+    let target_shard = ctx
+        .engine
+        .assign_shard(&ctx.account_id, &table_name, "shard_probe_0")
+        .await
+        .unwrap();
+    let mut second_pk = String::new();
+    for i in 1..200u32 {
+        let cand = format!("shard_probe_{i}");
+        if ctx
+            .engine
+            .assign_shard(&ctx.account_id, &table_name, &cand)
+            .await
+            .unwrap()
+            == target_shard
+        {
+            second_pk = cand;
+            break;
+        }
+    }
+    assert!(!second_pk.is_empty(), "must find second key on same shard");
+
+    // --- BUG-04 Part A: Out-of-order Phase 2 persistence on same shard must NEVER skip earlier commit ---
+    let txn1_id = ctx
+        .engine
+        .debug_fenced_put_commit_only(
+            &key_info,
+            s_item(&[("pk", "shard_probe_0"), ("v", "first_commit")]),
+            Some(&capture),
+        )
+        .await
+        .unwrap();
+
+    ctx.engine
+        .put_item(
+            &key_info,
+            s_item(&[("pk", &second_pk), ("v", "second_commit")]),
+            false,
+            None,
+            &empty_maps,
+            Some(&capture),
+        )
+        .await
+        .unwrap();
+
+    let (batch1, after_seq) = ctx
+        .engine
+        .get_stream_records(&ctx.account_id, &stream_arn, &target_shard, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(batch1.len(), 1);
+    assert_eq!(
+        batch1[0].dynamodb.keys.get("pk"),
+        Some(&AttributeValue::S(second_pk.clone()))
+    );
+    let cursor1 = after_seq.expect("cursor after second_commit");
+
+    let coord = extenddb_storage_bigtable::transact::TxnCoordinator::new(
+        ctx.engine.client_ref(),
+        Duration::from_secs(60),
+    );
+    let txn1_state = coord.get_state(&txn1_id).await.unwrap().unwrap();
+    ctx.engine
+        .roll_forward(&txn1_id, &txn1_state)
+        .await
+        .unwrap();
+
+    let (batch2, cursor2) = ctx
+        .engine
+        .get_stream_records(
+            &ctx.account_id,
+            &stream_arn,
+            &target_shard,
+            Some(&cursor1),
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        batch2.len(),
+        1,
+        "BUG-04: delayed Phase 2 stream record on same shard must NOT be skipped after consumer cursor advances"
+    );
+    assert_eq!(
+        batch2[0].dynamodb.keys.get("pk"),
+        Some(&AttributeValue::S("shard_probe_0".into()))
+    );
+    assert!(batch2[0].dynamodb.sequence_number > cursor1);
+    let cursor2 = cursor2.expect("cursor after recovered first_commit");
+
+    // --- BUG-04 Part B: 12 concurrent callers racing `streams::write_record_ordered`
+    //     on SEPARATE client connections with the SAME `event_id` MUST emit AT MOST ONCE!
+    let shared_dedup_rec = extenddb_storage_bigtable::streams::build_record(
+        desc.stream_specification.as_ref(),
+        Some(&capture),
+        &key_info.key_schema,
+        None,
+        Some(&s_item(&[("pk", "shard_probe_0"), ("v", "dedup_once")])),
+        extenddb_storage_bigtable::streams::UNASSIGNED_SEQUENCE_NUMBER,
+        ctx.engine.region(),
+    )
+    .unwrap();
+    let expected_event_id = shared_dedup_rec.event_id.clone();
+    let mut dedup_handles = Vec::new();
+    for _ in 0..12usize {
+        let cat_client = ctx.client.clone();
+        let sh = target_shard.clone();
+        let rec = shared_dedup_rec.clone();
+        dedup_handles.push(tokio::spawn(async move {
+            let cat = extenddb_storage_bigtable::catalog::Catalog::new(&cat_client);
+            extenddb_storage_bigtable::streams::write_record_ordered(
+                &cat,
+                &sh,
+                &rec,
+                Some("dedup-op-0"),
+            )
+            .await
+        }));
+    }
+    for h in dedup_handles {
+        h.await
+            .unwrap()
+            .expect("concurrent write_record_ordered dedup");
+    }
+    let (dedup_batch, cursor3) = ctx
+        .engine
+        .get_stream_records(
+            &ctx.account_id,
+            &stream_arn,
+            &target_shard,
+            Some(&cursor2),
+            20,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        dedup_batch.len(),
+        1,
+        "concurrent write_record_ordered with identical event_id/dedup_key must emit exactly 1 stream slot"
+    );
+    assert_eq!(dedup_batch[0].event_id, expected_event_id);
+    let cursor3 = cursor3.expect("cursor after dedup_once");
+
+    // --- BUG-05: Superseded `roll_forward` must emit ZERO phantom stream records ---
+    let data_table = ctx.engine.data_table_for(&key_info).await.unwrap();
+    let sup_key = s_item(&[("pk", "shard_probe_0")]);
+    let sup_part = extenddb_storage_bigtable::transact::ParticipantRow {
+        data_table,
+        row_key: extenddb_storage_bigtable::data::encoding::row_key::encode_key(
+            &sup_key,
+            &key_info.key_schema,
+        )
+        .unwrap(),
+    };
+    let phantom_rec = extenddb_storage_bigtable::streams::build_record(
+        desc.stream_specification.as_ref(),
+        Some(&capture),
+        &key_info.key_schema,
+        None,
+        Some(&s_item(&[("pk", "shard_probe_0"), ("v", "phantom")])),
+        extenddb_storage_bigtable::streams::UNASSIGNED_SEQUENCE_NUMBER,
+        ctx.engine.region(),
+    )
+    .unwrap();
+    let superseded_state = extenddb_storage_bigtable::transact::TxnState {
+        state: "COMMITTED".into(),
+        state_ts_micros: 1_000_000,
+        started_at: Some(900_000),
+        participants: Some(vec![sup_part.clone()]),
+        mutations: Some(vec![
+            extenddb_storage_bigtable::transact::ParticipantMutation {
+                participant: sup_part.clone(),
+                payload: extenddb_storage_bigtable::transact::TxnOpPayload::Put {
+                    item: s_item(&[("pk", "shard_probe_0"), ("v", "phantom")]),
+                },
+                expected_version: None,
+                row_existed: false,
+                new_version: Some(1), // strictly older than live OCC version!
+            },
+        ]),
+        stream_records: Some(vec![extenddb_storage_bigtable::transact::TxnStreamRecord {
+            stream_arn: stream_arn.clone(),
+            shard_id: target_shard.clone(),
+            record: phantom_rec,
+            participant: Some(sup_part),
+            dedup_key: Some("txn-superseded-phantom:0".into()),
+        }]),
+        ttl_mutations: None,
+        token_meta: None,
+    };
+    ctx.engine
+        .roll_forward("txn-superseded-phantom", &superseded_state)
+        .await
+        .unwrap();
+    let (phantom_check, _) = ctx
+        .engine
+        .get_stream_records(
+            &ctx.account_id,
+            &stream_arn,
+            &target_shard,
+            Some(&cursor3),
+            10,
+        )
+        .await
+        .unwrap();
+    assert!(
+        phantom_check.is_empty(),
+        "BUG-05: superseded roll_forward must emit ZERO phantom stream records"
+    );
+
+    // --- BUG-04 & BUG-12: 36-way concurrent single-item UpdateItem ADD on stream-enabled table
+    //     WITH a live tailing consumer polling `get_stream_records` concurrently!
+    let hot_key = s_item(&[("pk", "hot_stream_counter")]);
+    let hot_shard = ctx
+        .engine
+        .assign_shard(&ctx.account_id, &table_name, "hot_stream_counter")
+        .await
+        .unwrap();
+    let (_, pre_hot_cursor) = ctx
+        .engine
+        .get_stream_records(&ctx.account_id, &stream_arn, &hot_shard, None, 100)
+        .await
+        .unwrap();
+
+    let writers_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let tail_eng = ctx.engine.clone();
+    let tail_acct = ctx.account_id.clone();
+    let tail_arn = stream_arn.clone();
+    let tail_shard = hot_shard.clone();
+    let tail_done = writers_done.clone();
+    let tail_handle = tokio::spawn(async move {
+        let mut cursor = pre_hot_cursor;
+        let mut tailed = Vec::new();
+        loop {
+            let done_now = tail_done.load(std::sync::atomic::Ordering::Acquire);
+            let (recs, next_cur) = tail_eng
+                .get_stream_records(&tail_acct, &tail_arn, &tail_shard, cursor.as_deref(), 5)
+                .await
+                .unwrap();
+            if !recs.is_empty() {
+                cursor = next_cur;
+                tailed.extend(recs);
+            } else if done_now {
+                break;
+            } else {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        tailed
+    });
+
+    let mut handles = Vec::with_capacity(36);
+    for _ in 0..36usize {
+        let eng = ctx.engine.clone();
+        let ki = key_info.clone();
+        let hk = hot_key.clone();
+        let cap = capture.clone();
+        handles.push(tokio::spawn(async move {
+            let acts = parse_upd("SET cnt = if_not_exists(cnt, :z) + :one");
+            let mut maps = ExpressionMaps::default();
+            maps.values.insert("z".into(), AttributeValue::N("0".into()));
+            maps.values
+                .insert("one".into(), AttributeValue::N("1".into()));
+            eng.update_item(&ki, &hk, &acts, false, true, None, &maps, Some(&cap))
+                .await
+                .expect("BUG-12: unconditional single-item stream UpdateItem must not abort with TransactionConflict")
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+    writers_done.store(true, std::sync::atomic::Ordering::Release);
+    let tailed_hot_recs: Vec<_> = tail_handle
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| {
+            r.dynamodb.keys.get("pk") == Some(&AttributeValue::S("hot_stream_counter".into()))
+        })
+        .collect();
+    assert_eq!(
+        tailed_hot_recs.len(),
+        36,
+        "BUG-04/12: live tailing consumer must observe all 36 stream events without skipping any sequence number"
+    );
+    for pair in tailed_hot_recs.windows(2) {
+        assert!(
+            pair[0].dynamodb.sequence_number < pair[1].dynamodb.sequence_number,
+            "BUG-04: tailed sequence numbers must be strictly increasing"
+        );
+    }
+
+    let final_hot = ctx
+        .engine
+        .get_item(&key_info, &hot_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        final_hot.get("cnt"),
+        Some(&AttributeValue::N("36".into())),
+        "BUG-12: all 36 concurrent stream-enabled UpdateItem increments must apply with zero lost updates"
+    );
+
+    let disable_stream_in: extenddb_core::types::UpdateTableInput =
+        serde_json::from_value(serde_json::json!({
+            "TableName": table_name,
+            "StreamSpecification": {
+                "StreamEnabled": false
+            }
+        }))
+        .unwrap();
+    let disabled_desc = ctx
+        .engine
+        .update_table(&ctx.account_id, disable_stream_in)
+        .await
+        .expect("disable stream via UpdateTable");
+    assert_eq!(
+        disabled_desc
+            .stream_specification
+            .as_ref()
+            .map(|s| s.stream_enabled),
+        Some(false)
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Test 18: BUG-06 & BUG-10 — `roll_forward` TTL Index Maintenance, `1000->future->1000`
+//          ABA, Same-Second Fractional Restamping & Millisecond-Aligned Bounds
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_specula_bug06_bug10_ttl_roll_forward_aba_same_second_fractional_and_millis_bounds() {
+    let Some(ctx) = setup_emulator_context().await else {
+        eprintln!("Skipping Bigtable test: emulator unavailable");
+        return;
+    };
+
+    let table_name = unique_name("tbl_bug06_10_ttl");
+    ctx.engine
+        .create_table(
+            &ctx.account_id,
+            CreateTableInput {
+                table_name: table_name.clone(),
+                key_schema: vec![KeySchemaElement {
+                    attribute_name: "pk".to_string(),
+                    key_type: KeyType::Hash,
+                }],
+                attribute_definitions: vec![AttributeDefinition {
+                    attribute_name: "pk".to_string(),
+                    attribute_type: ScalarAttributeType::S,
+                }],
+                billing_mode: Some(BillingMode::PayPerRequest),
+                stream_specification: Some(StreamSpecification {
+                    stream_enabled: true,
+                    stream_view_type: Some(StreamViewType::NewAndOldImages),
+                }),
+                deletion_protection_enabled: Some(false),
+                ..CreateTableInput::default()
+            },
+        )
+        .await
+        .unwrap();
+    ctx.engine
+        .update_ttl(&ctx.account_id, &table_name, "ttl", true)
+        .await
+        .unwrap();
+    let key_info = ctx
+        .engine
+        .table_key_info(&ctx.account_id, &table_name)
+        .await
+        .unwrap();
+    let capture = StreamCapture {
+        view_type: StreamViewType::NewAndOldImages,
+        user_identity: None,
+        region: Arc::from(ctx.engine.region()),
+    };
+    let empty_maps = ExpressionMaps::default();
+
+    // --- BUG-06: Crash right after `COMMITTED` on a TTL item (`ttl = 1000`),
+    //             recover via `sweeper`, then run `ttl_worker::sweep_once`:
+    //             `roll_forward` MUST populate `__extenddb_ttl_index__` so `ttl_worker` evicts it!
+    let mut crashed_ttl_item = s_item(&[("pk", "ttl_crash_rec")]);
+    crashed_ttl_item.insert("ttl".into(), AttributeValue::N("1000".into()));
+    let _tid = ctx
+        .engine
+        .debug_fenced_put_commit_only(&key_info, crashed_ttl_item, Some(&capture))
+        .await
+        .unwrap();
+
+    extenddb_storage_bigtable::sweeper::sweep_with_cutoff_override(&ctx.engine, Some(i64::MAX))
+        .await
+        .expect("sweeper roll-forward TTL item");
+    let crash_key = s_item(&[("pk", "ttl_crash_rec")]);
+    assert!(
+        ctx.engine
+            .get_item(&key_info, &crash_key)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    sweep_once(&ctx.engine).await.unwrap();
+    assert!(
+        ctx.engine
+            .get_item(&key_info, &crash_key)
+            .await
+            .unwrap()
+            .is_none(),
+        "BUG-06: roll_forward must populate __extenddb_ttl_index__ so expired item is swept"
+    );
+
+    // --- BUG-10: `1000 -> 9999999999 -> 1000 -> 1000.5` ABA + same-second fractional restamping +
+    //     millisecond-aligned (`% 1_000 == 0`) TTL index timestamps!
+    let aba_key = s_item(&[("pk", "ttl_aba_item")]);
+    for exp in ["1000", "9999999999", "1000", "1000.5"] {
+        let mut it = aba_key.clone();
+        it.insert("ttl".into(), AttributeValue::N(exp.into()));
+        ctx.engine
+            .put_item(&key_info, it, false, None, &empty_maps, None)
+            .await
+            .unwrap();
+    }
+    let data_table = ctx.engine.data_table_for(&key_info).await.unwrap();
+    let base_ops = extenddb_storage_bigtable::data::item_ops::ItemOps::new(
+        ctx.engine.client_ref(),
+        &data_table,
+        60,
+    );
+    let (_, Some(latest_ver)) = base_ops
+        .get_with_version(&key_info, &aba_key)
+        .await
+        .unwrap()
+    else {
+        panic!("expected m:v on ttl_aba_item");
+    };
+    let enc_aba = extenddb_storage_bigtable::data::encoding::row_key::encode_key(
+        &aba_key,
+        &key_info.key_schema,
+    )
+    .unwrap();
+    let aba_ttl_rk = extenddb_storage_bigtable::data::encoding::ttl_key::encode_ttl_key(
+        &ctx.account_id,
+        &table_name,
+        &enc_aba,
+        1000,
+    );
+    let ttl_rows = ctx
+        .client
+        .data()
+        .read_rows(ReadRowsRequest {
+            table_name: ctx.client.full_table_name(
+                extenddb_storage_bigtable::data::encoding::ttl_key::TTL_INDEX_TABLE,
+            ),
+            rows_limit: 1,
+            rows: Some(RowSet {
+                row_keys: vec![aba_ttl_rk],
+                row_ranges: vec![],
+            }),
+            ..ReadRowsRequest::default()
+        })
+        .await
+        .unwrap();
+    let (_, ttl_cells) = ttl_rows.into_iter().next().expect("ttl index row for 1000");
+    assert!(!ttl_cells.is_empty());
+    for c in &ttl_cells {
+        assert_eq!(
+            c.timestamp_micros % 1_000,
+            0,
+            "TTL index cell timestamp must be millisecond-aligned"
+        );
+    }
+    assert_eq!(
+        ttl_cells[0].timestamp_micros,
+        (latest_ver * 1_000) as i64,
+        "same-second fractional update (1000 -> 1000.5) must restamp TTL index cell to latest OCC version"
+    );
+
+    sweep_once(&ctx.engine).await.unwrap();
+    assert!(
+        ctx.engine
+            .get_item(&key_info, &aba_key)
+            .await
+            .unwrap()
+            .is_none(),
+        "BUG-10: 1000 -> future -> 1000 -> 1000.5 ABA item must be evicted by ttl_worker"
+    );
+
+    // Stale-900 index entry when live item has expired ttl = 1000 (!= 900):
+    let mismatch_key = s_item(&[("pk", "ttl_mismatch_expired")]);
+    let mut mismatch_item = mismatch_key.clone();
+    mismatch_item.insert("ttl".into(), AttributeValue::N("1000".into()));
+    ctx.engine
+        .put_item(&key_info, mismatch_item, false, None, &empty_maps, None)
+        .await
+        .unwrap();
+    let enc_mk = extenddb_storage_bigtable::data::encoding::row_key::encode_key(
+        &mismatch_key,
+        &key_info.key_schema,
+    )
+    .unwrap();
+    let k1000 = extenddb_storage_bigtable::data::encoding::ttl_key::encode_ttl_key(
+        &ctx.account_id,
+        &table_name,
+        &enc_mk,
+        1000,
+    );
+    let k900 = extenddb_storage_bigtable::data::encoding::ttl_key::encode_ttl_key(
+        &ctx.account_id,
+        &table_name,
+        &enc_mk,
+        900,
+    );
+    ctx.client
+        .data()
+        .mutate_row(MutateRowRequest {
+            table_name: ctx.client.full_table_name(
+                extenddb_storage_bigtable::data::encoding::ttl_key::TTL_INDEX_TABLE,
+            ),
+            row_key: k1000,
+            mutations: vec![Mutation {
+                mutation: Some(mutation::Mutation::DeleteFromRow(
+                    mutation::DeleteFromRow {},
+                )),
+            }],
+            ..MutateRowRequest::default()
+        })
+        .await
+        .unwrap();
+    ctx.client
+        .data()
+        .mutate_row(MutateRowRequest {
+            table_name: ctx.client.full_table_name(
+                extenddb_storage_bigtable::data::encoding::ttl_key::TTL_INDEX_TABLE,
+            ),
+            row_key: k900,
+            mutations: vec![Mutation {
+                mutation: Some(mutation::Mutation::SetCell(mutation::SetCell {
+                    family_name: "d".into(),
+                    column_qualifier: Vec::new(),
+                    timestamp_micros: 1_000_000,
+                    value: Vec::new(),
+                })),
+            }],
+            ..MutateRowRequest::default()
+        })
+        .await
+        .unwrap();
+    sweep_once(&ctx.engine).await.unwrap();
+    assert!(
+        ctx.engine
+            .get_item(&key_info, &mismatch_key)
+            .await
+            .unwrap()
+            .is_none(),
+        "BUG-10: ttl_worker scanning expiry=900 must still evict live item with expired ttl=1000"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Test 19: BUG-07 & BUG-11 — `ClientRequestToken` 4 Vectors, Empty-Ops Replay,
+//          Reused-Token `clear_intent_up_to`, Sorted Locking & CCF
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_specula_bug07_bug11_idempotency_four_vectors_sorted_locking_and_ccf() {
+    let Some(ctx) = setup_emulator_context().await else {
+        eprintln!("Skipping Bigtable test: emulator unavailable");
+        return;
+    };
+
+    let table_name = unique_name("tbl_bug07_11");
+    ctx.engine
+        .create_table(
+            &ctx.account_id,
+            CreateTableInput {
+                table_name: table_name.clone(),
+                key_schema: vec![KeySchemaElement {
+                    attribute_name: "pk".to_string(),
+                    key_type: KeyType::Hash,
+                }],
+                attribute_definitions: vec![AttributeDefinition {
+                    attribute_name: "pk".to_string(),
+                    attribute_type: ScalarAttributeType::S,
+                }],
+                billing_mode: Some(BillingMode::PayPerRequest),
+                deletion_protection_enabled: Some(false),
+                ..CreateTableInput::default()
+            },
+        )
+        .await
+        .unwrap();
+    let key_info = ctx
+        .engine
+        .table_key_info(&ctx.account_id, &table_name)
+        .await
+        .unwrap();
+    let empty_maps = ExpressionMaps::default();
+
+    // --- BUG-07(a): 8 simultaneous concurrent calls with identical ClientRequestToken ---
+    let simul_key = s_item(&[("pk", "idem_simul_counter")]);
+    let mut simul_handles = Vec::new();
+    for _ in 0..8usize {
+        let eng = ctx.engine.clone();
+        let ki = key_info.clone();
+        let acct = ctx.account_id.clone();
+        let sk = simul_key.clone();
+        simul_handles.push(tokio::spawn(async move {
+            let acts = parse_upd("SET cnt = if_not_exists(cnt, :z) + :ten");
+            let mut maps = ExpressionMaps::default();
+            maps.values
+                .insert("z".into(), AttributeValue::N("0".into()));
+            maps.values
+                .insert("ten".into(), AttributeValue::N("10".into()));
+            let ops = [TransactWriteOp::Update {
+                key_info: &ki,
+                key: &sk,
+                actions: &acts,
+                condition: None,
+                maps: &maps,
+                return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+                stream: None,
+            }];
+            let ikey = IdempotencyKey {
+                account_id: &acct,
+                token: "tok-simul-8way",
+                fingerprint: "fp-simul-8way",
+            };
+            eng.transact_write_items(&ops, Some(ikey)).await
+        }));
+    }
+    let mut ok_count = 0usize;
+    let mut replay_count = 0usize;
+    for h in simul_handles {
+        match h.await.unwrap() {
+            Ok(()) => ok_count += 1,
+            Err(StorageError::IdempotentReplay) => replay_count += 1,
+            other => panic!("BUG-07a: unexpected concurrent token result: {other:?}"),
+        }
+    }
+    assert_eq!(
+        ok_count, 1,
+        "BUG-07a: exactly one leader must return Ok(())"
+    );
+    assert_eq!(
+        replay_count, 7,
+        "BUG-07a: all 7 followers must return Err(IdempotentReplay)"
+    );
+    let simul_item = ctx
+        .engine
+        .get_item(&key_info, &simul_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        simul_item.get("cnt"),
+        Some(&AttributeValue::N("10".into())),
+        "BUG-07a: concurrent token transaction must execute AT MOST ONCE"
+    );
+
+    // --- BUG-07(b): Crashed COMMITTED token txn before `idem:` exists:
+    //                mismatched payload (including empty `&[]` ops!) returns IdempotentMismatch;
+    //                matching payload returns IdempotentReplay (never Ok)!
+    use sha2::{Digest, Sha256};
+    let tok_b = "tok-crash-b";
+    let derived_tid_b = {
+        let mut hasher = Sha256::new();
+        hasher.update(ctx.account_id.as_bytes());
+        hasher.update(b":");
+        hasher.update(tok_b.as_bytes());
+        format!("{:x}", hasher.finalize())
+    };
+    let data_table = ctx.engine.data_table_for(&key_info).await.unwrap();
+    let coord = extenddb_storage_bigtable::transact::TxnCoordinator::new(
+        ctx.engine.client_ref(),
+        Duration::from_secs(60),
+    );
+    let item_b = s_item(&[("pk", "idem_b_pk"), ("v", "from_b")]);
+    let part_b = extenddb_storage_bigtable::transact::ParticipantRow {
+        data_table: data_table.clone(),
+        row_key: extenddb_storage_bigtable::data::encoding::row_key::encode_key(
+            &item_b,
+            &key_info.key_schema,
+        )
+        .unwrap(),
+    };
+    let tmeta_b = extenddb_storage_bigtable::transact::TxnTokenMeta {
+        account_id: ctx.account_id.clone(),
+        token: tok_b.to_string(),
+        fingerprint: "fp-b-good".to_string(),
+    };
+    let (_, st_b) = coord
+        .open_with_token(
+            &derived_tid_b,
+            std::slice::from_ref(&part_b),
+            Some(&tmeta_b),
+        )
+        .await
+        .unwrap();
+    assert!(coord.place_intent(&derived_tid_b, &part_b).await.unwrap());
+    let ver_b = extenddb_storage_bigtable::data::item_ops::next_occ_version(None);
+    coord
+        .try_commit_full(
+            &derived_tid_b,
+            st_b,
+            &[extenddb_storage_bigtable::transact::ParticipantMutation {
+                participant: part_b.clone(),
+                payload: extenddb_storage_bigtable::transact::TxnOpPayload::Put {
+                    item: item_b.clone(),
+                },
+                expected_version: None,
+                row_existed: false,
+                new_version: Some(ver_b),
+            }],
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Empty-ops call with wrong fingerprint MUST still hit the COMMITTED coordinator row!
+    let empty_mismatch_res = ctx
+        .engine
+        .transact_write_items(
+            &[],
+            Some(IdempotencyKey {
+                account_id: &ctx.account_id,
+                token: tok_b,
+                fingerprint: "fp-b-empty-wrong",
+            }),
+        )
+        .await;
+    assert!(
+        matches!(empty_mismatch_res, Err(StorageError::IdempotentMismatch)),
+        "BUG-07b: empty-ops mismatched payload against COMMITTED token txn must return IdempotentMismatch"
+    );
+
+    let replay_res = ctx
+        .engine
+        .transact_write_items(
+            &[TransactWriteOp::Put {
+                key_info: &key_info,
+                item: &item_b,
+                condition: None,
+                maps: &empty_maps,
+                return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+                stream: None,
+            }],
+            Some(IdempotencyKey {
+                account_id: &ctx.account_id,
+                token: tok_b,
+                fingerprint: "fp-b-good",
+            }),
+        )
+        .await;
+    assert!(
+        matches!(replay_res, Err(StorageError::IdempotentReplay)),
+        "BUG-07b: matching replay must return IdempotentReplay, got {replay_res:?}"
+    );
+
+    // Verify `clear_intent_up_to` protects a newer reused-token intent timestamp from stale cleanup:
+    assert!(coord.place_intent(&derived_tid_b, &part_b).await.unwrap());
+    let snap_b = extenddb_storage_bigtable::data::item_ops::ItemOps::new(
+        ctx.engine.client_ref(),
+        &data_table,
+        60,
+    )
+    .get_row_snapshot_by_raw_key(&part_b.row_key)
+    .await
+    .unwrap();
+    let (_, newer_intent_ts) = snap_b
+        .intents
+        .iter()
+        .find(|(t, _)| t == &derived_tid_b)
+        .cloned()
+        .expect("placed intent");
+    coord
+        .clear_intent_up_to(
+            &derived_tid_b,
+            &part_b,
+            newer_intent_ts.saturating_sub(1_000),
+        )
+        .await
+        .unwrap();
+    let snap_after_stale_clear = extenddb_storage_bigtable::data::item_ops::ItemOps::new(
+        ctx.engine.client_ref(),
+        &data_table,
+        60,
+    )
+    .get_row_snapshot_by_raw_key(&part_b.row_key)
+    .await
+    .unwrap();
+    assert!(
+        snap_after_stale_clear
+            .intents
+            .iter()
+            .any(|(t, _)| t == &derived_tid_b),
+        "clear_intent_up_to with older bound must NOT strip a newer reused-token intent"
+    );
+    coord.clear_intent(&derived_tid_b, &part_b).await.unwrap();
+
+    // --- BUG-07(c) & (d): Sweeper persists `idem:` before dropping recovered token txn,
+    //                      and expired (>600s) `applied_at` allows fresh execution!
+    let tok_c = "tok-sweep-c";
+    let derived_tid_c = {
+        let mut hasher = Sha256::new();
+        hasher.update(ctx.account_id.as_bytes());
+        hasher.update(b":");
+        hasher.update(tok_c.as_bytes());
+        format!("{:x}", hasher.finalize())
+    };
+    let item_c = s_item(&[("pk", "idem_c_pk"), ("v", "from_sweep")]);
+    let part_c = extenddb_storage_bigtable::transact::ParticipantRow {
+        data_table,
+        row_key: extenddb_storage_bigtable::data::encoding::row_key::encode_key(
+            &item_c,
+            &key_info.key_schema,
+        )
+        .unwrap(),
+    };
+    let tmeta_c = extenddb_storage_bigtable::transact::TxnTokenMeta {
+        account_id: ctx.account_id.clone(),
+        token: tok_c.to_string(),
+        fingerprint: "fp-c-good".to_string(),
+    };
+    let (_, st_c) = coord
+        .open_with_token(
+            &derived_tid_c,
+            std::slice::from_ref(&part_c),
+            Some(&tmeta_c),
+        )
+        .await
+        .unwrap();
+    assert!(coord.place_intent(&derived_tid_c, &part_c).await.unwrap());
+    let ver_c = extenddb_storage_bigtable::data::item_ops::next_occ_version(None);
+    coord
+        .try_commit_full(
+            &derived_tid_c,
+            st_c,
+            &[extenddb_storage_bigtable::transact::ParticipantMutation {
+                participant: part_c,
+                payload: extenddb_storage_bigtable::transact::TxnOpPayload::Put {
+                    item: item_c.clone(),
+                },
+                expected_version: None,
+                row_existed: false,
+                new_version: Some(ver_c),
+            }],
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    extenddb_storage_bigtable::sweeper::sweep_with_cutoff_override(&ctx.engine, Some(i64::MAX))
+        .await
+        .expect("sweeper recovers token txn c");
+
+    assert!(matches!(
+        ctx.engine
+            .transact_write_items(
+                &[TransactWriteOp::Put {
+                    key_info: &key_info,
+                    item: &item_c,
+                    condition: None,
+                    maps: &empty_maps,
+                    return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+                    stream: None,
+                }],
+                Some(IdempotencyKey {
+                    account_id: &ctx.account_id,
+                    token: tok_c,
+                    fingerprint: "fp-c-good",
+                }),
+            )
+            .await,
+        Err(StorageError::IdempotentReplay)
+    ));
+
+    let cat = extenddb_storage_bigtable::catalog::Catalog::new(ctx.engine.catalog_client_ref());
+    let expired_idem_key =
+        extenddb_storage_bigtable::catalog::keys::idempotency(&ctx.account_id, tok_c);
+    cat.put(
+        &expired_idem_key,
+        &serde_json::json!({
+            "fingerprint": "fp-c-good",
+            "txn_id": derived_tid_c,
+            "applied_at": time::OffsetDateTime::now_utc().unix_timestamp() - 605,
+        }),
+    )
+    .await
+    .unwrap();
+
+    ctx.engine
+        .transact_write_items(
+            &[TransactWriteOp::Put {
+                key_info: &key_info,
+                item: &s_item(&[("pk", "idem_c_pk"), ("v", "reused_after_10m")]),
+                condition: None,
+                maps: &empty_maps,
+                return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+                stream: None,
+            }],
+            Some(IdempotencyKey {
+                account_id: &ctx.account_id,
+                token: tok_c,
+                fingerprint: "fp-c-brand-new",
+            }),
+        )
+        .await
+        .expect("BUG-07d: expired >10m idempotency record must allow token reuse");
+
+    // --- BUG-11: Sorted [k1, k2] vs [k2, k1] locking & ReturnValuesOnConditionCheckFailure ---
+    let k1 = s_item(&[("pk", "lock_k1")]);
+    let k2 = s_item(&[("pk", "lock_k2")]);
+    let mut lock_handles = Vec::new();
+    for i in 0..10usize {
+        let eng = ctx.engine.clone();
+        let ki = key_info.clone();
+        let (first, second) = if i % 2 == 0 {
+            (k1.clone(), k2.clone())
+        } else {
+            (k2.clone(), k1.clone())
+        };
+        lock_handles.push(tokio::spawn(async move {
+            let acts = parse_upd("SET c = if_not_exists(c, :z) + :one");
+            let mut maps = ExpressionMaps::default();
+            maps.values
+                .insert("z".into(), AttributeValue::N("0".into()));
+            maps.values
+                .insert("one".into(), AttributeValue::N("1".into()));
+            let ops = [
+                TransactWriteOp::Update {
+                    key_info: &ki,
+                    key: &first,
+                    actions: &acts,
+                    condition: None,
+                    maps: &maps,
+                    return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+                    stream: None,
+                },
+                TransactWriteOp::Update {
+                    key_info: &ki,
+                    key: &second,
+                    actions: &acts,
+                    condition: None,
+                    maps: &maps,
+                    return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+                    stream: None,
+                },
+            ];
+            eng.transact_write_items(&ops, None).await
+        }));
+    }
+    let mut committed_pairs = 0i64;
+    for h in lock_handles {
+        match h.await.unwrap() {
+            Ok(()) => committed_pairs += 1,
+            Err(StorageError::TransactionCanceled(_)) => {}
+            Err(other) => {
+                panic!("BUG-11: 2PC conflict must return TransactionCanceled, got {other:?}")
+            }
+        }
+    }
+    assert!(committed_pairs >= 1);
+    let r1 = ctx.engine.get_item(&key_info, &k1).await.unwrap().unwrap();
+    let r2 = ctx.engine.get_item(&key_info, &k2).await.unwrap().unwrap();
+    assert_eq!(
+        r1.get("c"),
+        Some(&AttributeValue::N(committed_pairs.to_string()))
+    );
+    assert_eq!(
+        r2.get("c"),
+        Some(&AttributeValue::N(committed_pairs.to_string()))
+    );
+
+    let cond_fail = parse_cond("attribute_not_exists(pk)");
+    for (rv_ccf, expect_some) in [
+        (ReturnValuesOnConditionCheckFailure::None, false),
+        (ReturnValuesOnConditionCheckFailure::AllOld, true),
+    ] {
+        let ops = [TransactWriteOp::Put {
+            key_info: &key_info,
+            item: &s_item(&[("pk", "lock_k1"), ("x", "nope")]),
+            condition: Some(&cond_fail),
+            maps: &empty_maps,
+            return_values_on_ccf: rv_ccf,
+            stream: None,
+        }];
+        match ctx.engine.transact_write_items(&ops, None).await {
+            Err(StorageError::TransactionCanceled(reasons)) => {
+                assert_eq!(
+                    reasons[0].item.is_some(),
+                    expect_some,
+                    "BUG-11: ReturnValuesOnConditionCheckFailure={rv_ccf:?} item presence mismatch"
+                );
+            }
+            other => panic!("expected TransactionCanceled, got {other:?}"),
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Test 20: BUG-08, BUG-09 & BUG-13 — GSI Version Guard, CREATING Read Refusal,
+//          Full `UpdateTable` GSI Lifecycle, LSI `Scan` Sparse/Sort/Deleted-ESK/LEK & CAS RMW
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_specula_bug08_bug09_bug13_gsi_version_guard_creating_refusal_update_table_lsi_scan_and_cas()
+ {
+    use extenddb_core::types::{
+        CreateGsiAction, DeleteGsiAction, GlobalSecondaryIndexUpdate, LsiInput, Tag,
+        UpdateGsiAction, UpdateTableInput, WarmThroughput,
+    };
+    use extenddb_storage::management_store::{MetricsFilter, MetricsRow, MetricsStore};
+    use extenddb_storage_bigtable::catalog_store::BigtableCatalogStore;
+
+    let Some(ctx) = setup_emulator_context().await else {
+        eprintln!("Skipping Bigtable test: emulator unavailable");
+        return;
+    };
+
+    let table_name = unique_name("tbl_bug08_09_13");
+    let initial_desc = ctx
+        .engine
+        .create_table(
+            &ctx.account_id,
+            CreateTableInput {
+                table_name: table_name.clone(),
+                key_schema: vec![
+                    KeySchemaElement {
+                        attribute_name: "pk".to_string(),
+                        key_type: KeyType::Hash,
+                    },
+                    KeySchemaElement {
+                        attribute_name: "sk".to_string(),
+                        key_type: KeyType::Range,
+                    },
+                ],
+                attribute_definitions: vec![
+                    AttributeDefinition {
+                        attribute_name: "pk".to_string(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "sk".to_string(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "score".to_string(),
+                        attribute_type: ScalarAttributeType::N,
+                    },
+                ],
+                local_secondary_indexes: Some(vec![LsiInput {
+                    index_name: "by_score".to_string(),
+                    key_schema: vec![
+                        KeySchemaElement {
+                            attribute_name: "pk".to_string(),
+                            key_type: KeyType::Hash,
+                        },
+                        KeySchemaElement {
+                            attribute_name: "score".to_string(),
+                            key_type: KeyType::Range,
+                        },
+                    ],
+                    projection: Projection {
+                        projection_type: ProjectionType::All,
+                        non_key_attributes: None,
+                    },
+                }]),
+                billing_mode: Some(BillingMode::PayPerRequest),
+                deletion_protection_enabled: Some(false),
+                ..CreateTableInput::default()
+            },
+        )
+        .await
+        .expect("create composite + LSI table");
+
+    let base_ki = ctx
+        .engine
+        .table_key_info(&ctx.account_id, &table_name)
+        .await
+        .unwrap();
+    let empty_maps = ExpressionMaps::default();
+
+    // Insert 6 sparse rows WITHOUT `score` sorting BEFORE `"a"`..`"z"` in base `sk` order:
+    for i in 0..6u32 {
+        let mut it = s_item(&[("pk", "p1"), ("sk", &format!("00_sparse_{i}"))]);
+        if i < 2 {
+            it.insert("dept".into(), AttributeValue::S("eng".into()));
+        }
+        ctx.engine
+            .put_item(&base_ki, it, false, None, &empty_maps, None)
+            .await
+            .unwrap();
+    }
+    // Insert 4 LSI-indexed rows whose `score` order INVERTS base `sk` order + ties on score=20:
+    for (sk, score, dept) in [
+        ("z", "10", "eng"),
+        ("m2", "20", "eng"),
+        ("m1", "20", "sales"),
+        ("a", "30", "sales"),
+    ] {
+        let mut it = s_item(&[("pk", "p1"), ("sk", sk), ("dept", dept)]);
+        it.insert("score".into(), AttributeValue::N(score.into()));
+        ctx.engine
+            .put_item(&base_ki, it, false, None, &empty_maps, None)
+            .await
+            .unwrap();
+    }
+
+    // --- BUG-13a: LSI `Scan` with `limit = 2` when `key_info.key_schema` is overwritten
+    //              by `extenddb-engine` to `lsi.key_schema`:
+    let mut engine_lsi_ki = base_ki.clone();
+    engine_lsi_ki.key_schema = base_ki.local_secondary_indexes[0].key_schema.clone();
+
+    let (page1, lek1) = ctx
+        .engine
+        .scan(&engine_lsi_ki, Some(2), None, None, None, Some("by_score"))
+        .await
+        .unwrap();
+    assert_eq!(
+        page1.len(),
+        2,
+        "BUG-13: LSI Scan with Limit=2 must skip sparse rows BEFORE applying Limit"
+    );
+    assert_eq!(page1[0].get("sk"), Some(&AttributeValue::S("z".into())));
+    assert_eq!(page1[1].get("sk"), Some(&AttributeValue::S("m1".into())));
+    let lek1 = lek1.expect("BUG-13: LSI Scan page 1 must emit LastEvaluatedKey");
+    assert!(
+        lek1.contains_key("pk") && lek1.contains_key("sk") && lek1.contains_key("score"),
+        "BUG-13: LSI Scan LastEvaluatedKey must include (pk, base_sk, lsi_sk), got {lek1:?}"
+    );
+
+    // Delete the `lek1` item ("m1") BEFORE calling page 2 to verify deleted-ESK resumption,
+    // then re-insert it for subsequent GSI backfill assertions!
+    let m1_base_key = s_item(&[("pk", "p1"), ("sk", "m1")]);
+    ctx.engine
+        .delete_item(&base_ki, &m1_base_key, false, None, &empty_maps, None)
+        .await
+        .unwrap();
+
+    let (page2, lek2) = ctx
+        .engine
+        .scan(
+            &engine_lsi_ki,
+            Some(2),
+            Some(&lek1),
+            None,
+            None,
+            Some("by_score"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page2.len(), 2);
+    assert_eq!(page2[0].get("sk"), Some(&AttributeValue::S("m2".into())));
+    assert_eq!(page2[1].get("sk"), Some(&AttributeValue::S("a".into())));
+    assert!(
+        lek2.is_none(),
+        "BUG-13: exact exhaustion after remaining LSI items must emit lek=None"
+    );
+
+    // Re-insert m1
+    let mut m1_item = s_item(&[("pk", "p1"), ("sk", "m1"), ("dept", "sales")]);
+    m1_item.insert("score".into(), AttributeValue::N("20".into()));
+    ctx.engine
+        .put_item(&base_ki, m1_item, false, None, &empty_maps, None)
+        .await
+        .unwrap();
+
+    // --- BUG-09: `UpdateTable` GSI Create + backfill + TableClass + WarmThroughput ---
+    let upd_desc = ctx
+        .engine
+        .update_table(
+            &ctx.account_id,
+            UpdateTableInput {
+                table_name: table_name.clone(),
+                billing_mode: None,
+                table_throughput_mode: None,
+                provisioned_throughput: None,
+                deletion_protection_enabled: None,
+                global_secondary_index_updates: Some(vec![GlobalSecondaryIndexUpdate {
+                    create: Some(CreateGsiAction {
+                        index_name: "by_dept".to_string(),
+                        key_schema: vec![KeySchemaElement {
+                            attribute_name: "dept".to_string(),
+                            key_type: KeyType::Hash,
+                        }],
+                        projection: Projection {
+                            projection_type: ProjectionType::All,
+                            non_key_attributes: None,
+                        },
+                        provisioned_throughput: None,
+                        warm_throughput: Some(WarmThroughput {
+                            read_units_per_second: Some(15_000),
+                            write_units_per_second: Some(5_000),
+                        }),
+                    }),
+                    update: None,
+                    delete: None,
+                }]),
+                attribute_definitions: Some(vec![AttributeDefinition {
+                    attribute_name: "dept".to_string(),
+                    attribute_type: ScalarAttributeType::S,
+                }]),
+                stream_specification: None,
+                table_class: Some("STANDARD_INFREQUENT_ACCESS".to_string()),
+                on_demand_throughput: None,
+                vector_index_updates: None,
+                warm_throughput: Some(WarmThroughput {
+                    read_units_per_second: Some(20_000),
+                    write_units_per_second: Some(8_000),
+                }),
+                sse_specification: None,
+            },
+        )
+        .await
+        .expect("BUG-09: UpdateTable GSI Create must succeed");
+
+    assert_eq!(
+        upd_desc.table_class_summary,
+        Some(serde_json::json!({ "TableClass": "STANDARD_INFREQUENT_ACCESS" }))
+    );
+    assert_eq!(
+        upd_desc
+            .warm_throughput_record
+            .as_ref()
+            .and_then(|r| r.read_units_per_second),
+        Some(20_000)
+    );
+    let gsis = upd_desc
+        .global_secondary_indexes
+        .as_ref()
+        .expect("created GSI");
+    assert_eq!(gsis.len(), 1);
+    assert_eq!(gsis[0].index_name, "by_dept");
+    assert_eq!(gsis[0].index_status, "ACTIVE");
+
+    // Verify paginated GSI Query when `key_info.key_schema` is overwritten by `extenddb-engine`:
+    let key_info = ctx
+        .engine
+        .table_key_info(&ctx.account_id, &table_name)
+        .await
+        .unwrap();
+    let mut engine_gsi_ki = key_info.clone();
+    engine_gsi_ki.key_schema = gsis[0].key_schema.clone();
+    let mut qmaps = ExpressionMaps::default();
+    qmaps
+        .values
+        .insert("d".into(), AttributeValue::S("eng".into()));
+    let kc = parse_kc("dept = :d");
+    let (gsi_p1, gsi_lek1) = ctx
+        .engine
+        .query(
+            &engine_gsi_ki,
+            &kc,
+            &qmaps,
+            true,
+            Some(2),
+            None,
+            Some("by_dept"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(gsi_p1.len(), 2);
+    let gsi_lek1 = gsi_lek1.expect("GSI LEK");
+    assert!(
+        gsi_lek1.contains_key("pk") && gsi_lek1.contains_key("sk") && gsi_lek1.contains_key("dept"),
+        "GSI LastEvaluatedKey must include (pk, sk, dept): got {gsi_lek1:?}"
+    );
+    let (gsi_p2, gsi_lek2) = ctx
+        .engine
+        .query(
+            &engine_gsi_ki,
+            &kc,
+            &qmaps,
+            true,
+            Some(5),
+            Some(&gsi_lek1),
+            Some("by_dept"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(gsi_p2.len(), 2, "all 4 eng items must be backfilled");
+    assert!(gsi_lek2.is_none());
+
+    // While a GSI has `index_status == "CREATING"` in catalog,
+    // `index_info`, `query`, and `scan` MUST reject reads with `IndexNotFound` until
+    // reconciliation promotes it `"CREATING" -> "ACTIVE"`!
+    let cat = extenddb_storage_bigtable::catalog::Catalog::new(ctx.engine.catalog_client_ref());
+    let tbl_rk = extenddb_storage_bigtable::catalog::keys::table_meta(&ctx.account_id, &table_name);
+    let mut raw_tbl = cat.get(&tbl_rk).await.unwrap().unwrap();
+    let mut raw_desc: extenddb_core::types::TableDescription =
+        serde_json::from_value(raw_tbl["description"].clone()).unwrap();
+    raw_desc.global_secondary_indexes.as_mut().unwrap()[0].index_status = "CREATING".to_string();
+    raw_tbl["description"] = serde_json::to_value(&raw_desc).unwrap();
+    cat.put(&tbl_rk, &raw_tbl).await.unwrap();
+    let fresh_eng = Arc::new(BigtableEngine::new(
+        ctx.client.clone(),
+        ctx.client.clone(),
+        60,
+    ));
+    let fresh_ki = fresh_eng
+        .table_key_info(&ctx.account_id, &table_name)
+        .await
+        .unwrap();
+    assert!(matches!(
+        fresh_eng
+            .index_info(&ctx.account_id, &table_name, "by_dept")
+            .await,
+        Err(StorageError::IndexNotFound(_))
+    ));
+    assert!(matches!(
+        fresh_eng
+            .query(&fresh_ki, &kc, &qmaps, true, None, None, Some("by_dept"))
+            .await,
+        Err(StorageError::IndexNotFound(_))
+    ));
+    assert!(matches!(
+        fresh_eng
+            .scan(&fresh_ki, None, None, None, None, Some("by_dept"))
+            .await,
+        Err(StorageError::IndexNotFound(_))
+    ));
+
+    // Reconciler promotes `"CREATING" -> "ACTIVE"` via CAS once backfill completes cleanly!
+    extenddb_storage_bigtable::gsi_worker::sweep_once(&fresh_eng)
+        .await
+        .expect("gsi_worker::sweep_once promotes CREATING -> ACTIVE");
+    let promoted_ki = fresh_eng
+        .table_key_info(&ctx.account_id, &table_name)
+        .await
+        .unwrap();
+    let (after_prom, _) = fresh_eng
+        .query(&promoted_ki, &kc, &qmaps, true, None, None, Some("by_dept"))
+        .await
+        .expect("GSI query succeeds once promoted ACTIVE");
+    assert_eq!(after_prom.len(), 4);
+
+    // --- BUG-08: Delayed older version (`v1 < v2`) Put/Delete and orphan guard on GSI shadow ---
+    let data_table = fresh_eng.data_table_for(&promoted_ki).await.unwrap();
+    let shadow_table = extenddb_storage_bigtable::gsi::shadow_table_id(&data_table, "by_dept");
+    let shadow_ops = extenddb_storage_bigtable::data::item_ops::ItemOps::new(
+        fresh_eng.client_ref(),
+        &shadow_table,
+        60,
+    );
+    let target_shadow_item = &after_prom[0];
+    let shadow_rk = extenddb_storage_bigtable::gsi::shadow_row_key_for_item(
+        target_shadow_item,
+        &gsis[0].key_schema,
+        &promoted_ki.key_schema,
+    )
+    .unwrap()
+    .unwrap();
+    let mut stale_shadow_item = target_shadow_item.clone();
+    stale_shadow_item.insert("corrupted".into(), AttributeValue::S("stale_v1".into()));
+    assert!(
+        !shadow_ops
+            .put_shadow_versioned(&shadow_rk, &stale_shadow_item, 1)
+            .await
+            .unwrap(),
+        "BUG-08: delayed older version Put on GSI shadow must be rejected"
+    );
+    assert!(
+        !shadow_ops
+            .delete_shadow_versioned(&shadow_rk, 1)
+            .await
+            .unwrap(),
+        "BUG-08: delayed older version Delete on GSI shadow must be rejected"
+    );
+
+    // Seed an unversioned orphaned shadow row whose base row ("p_ghost", "sk_ghost") never existed,
+    // verify `gsi_worker::sweep_once` cleans it via `delete_shadow_orphan_if_unchanged` (leaving a
+    // monotonic `m:v` tombstone), and verify a delayed `put_shadow_versioned(..., 1)` is rejected!
+    let ghost_item = s_item(&[("pk", "p_ghost"), ("sk", "sk_ghost"), ("dept", "eng")]);
+    let ghost_shadow_rk = extenddb_storage_bigtable::gsi::shadow_row_key_for_item(
+        &ghost_item,
+        &gsis[0].key_schema,
+        &promoted_ki.key_schema,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        shadow_ops
+            .put_shadow_versioned(&ghost_shadow_rk, &ghost_item, 5)
+            .await
+            .unwrap()
+    );
+    extenddb_storage_bigtable::gsi_worker::sweep_once(&fresh_eng)
+        .await
+        .expect("gsi_worker::sweep_once cleans orphaned shadow row");
+    assert!(
+        !shadow_ops
+            .put_shadow_versioned(&ghost_shadow_rk, &ghost_item, 1)
+            .await
+            .unwrap(),
+        "BUG-08: orphan cleanup must retain monotonic m:v tombstone rejecting delayed v1 Put"
+    );
+    let (post_orphan_eng, _) = fresh_eng
+        .query(&promoted_ki, &kc, &qmaps, true, None, None, Some("by_dept"))
+        .await
+        .unwrap();
+    assert_eq!(post_orphan_eng.len(), 4);
+
+    // Update GSI WarmThroughput & Delete GSI via UpdateTable
+    let upd_wt_desc = fresh_eng
+        .update_table(
+            &ctx.account_id,
+            UpdateTableInput {
+                table_name: table_name.clone(),
+                billing_mode: None,
+                table_throughput_mode: None,
+                provisioned_throughput: None,
+                deletion_protection_enabled: None,
+                global_secondary_index_updates: Some(vec![GlobalSecondaryIndexUpdate {
+                    create: None,
+                    update: Some(UpdateGsiAction {
+                        index_name: "by_dept".to_string(),
+                        warm_throughput: Some(WarmThroughput {
+                            read_units_per_second: Some(25_000),
+                            write_units_per_second: None,
+                        }),
+                        provisioned_throughput: None,
+                        on_demand_throughput: None,
+                    }),
+                    delete: None,
+                }]),
+                attribute_definitions: None,
+                stream_specification: None,
+                table_class: None,
+                on_demand_throughput: None,
+                vector_index_updates: None,
+                warm_throughput: None,
+                sse_specification: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        upd_wt_desc.global_secondary_indexes.as_ref().unwrap()[0]
+            .warm_throughput_record
+            .as_ref()
+            .and_then(|r| r.read_units_per_second),
+        Some(25_000)
+    );
+
+    let del_desc = fresh_eng
+        .update_table(
+            &ctx.account_id,
+            UpdateTableInput {
+                table_name: table_name.clone(),
+                billing_mode: None,
+                table_throughput_mode: None,
+                provisioned_throughput: None,
+                deletion_protection_enabled: None,
+                global_secondary_index_updates: Some(vec![GlobalSecondaryIndexUpdate {
+                    create: None,
+                    update: None,
+                    delete: Some(DeleteGsiAction {
+                        index_name: "by_dept".to_string(),
+                    }),
+                }]),
+                attribute_definitions: None,
+                stream_specification: None,
+                table_class: None,
+                on_demand_throughput: None,
+                vector_index_updates: None,
+                warm_throughput: None,
+                sse_specification: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(del_desc.global_secondary_indexes.is_none());
+    assert!(
+        !del_desc
+            .attribute_definitions
+            .iter()
+            .any(|a| a.attribute_name == "dept"),
+        "BUG-09: deleting GSI must prune orphaned dept AttributeDefinition"
+    );
+
+    // --- BUG-13b: Concurrent CAS `MetricsStore::insert_metrics` (20-way) & `tag_resource` (16-way) ---
+    let cat_store = Arc::new(BigtableCatalogStore::new(ctx.client.clone(), None, true));
+    let bucket_ts = time::OffsetDateTime::from_unix_timestamp(1_750_000_020).unwrap();
+    let mut m_handles = Vec::new();
+    for _ in 0..20usize {
+        let cs = cat_store.clone();
+        let acct = ctx.account_id.clone();
+        let tbl = table_name.clone();
+        m_handles.push(tokio::spawn(async move {
+            cs.insert_metrics(&[MetricsRow {
+                bucket: bucket_ts,
+                account_id: Some(acct),
+                metric: "SuccessfulRequestLatency".into(),
+                table_name: Some(tbl),
+                index_name: None,
+                operation: Some("PutItem".into()),
+                sum: 1.5,
+                count: 1,
+                min: 1.5,
+                max: 1.5,
+            }])
+            .await
+            .unwrap();
+        }));
+    }
+    for h in m_handles {
+        h.await.unwrap();
+    }
+    let queried_metrics = cat_store
+        .query_metrics(
+            time::OffsetDateTime::from_unix_timestamp(1_750_000_019).unwrap(),
+            time::OffsetDateTime::from_unix_timestamp(1_750_000_021).unwrap(),
+            &MetricsFilter {
+                account_id: Some(ctx.account_id.clone()),
+                table_name: Some(table_name.clone()),
+                metric: Some("SuccessfulRequestLatency".into()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(queried_metrics.len(), 1);
+    assert_eq!(
+        queried_metrics[0].count, 20,
+        "BUG-13: concurrent MetricsStore::insert_metrics must accumulate all 20 increments via CAS"
+    );
+    assert!((queried_metrics[0].sum - 30.0).abs() < 1e-6);
+
+    let mut t_handles = Vec::new();
+    for i in 0..16usize {
+        let eng = fresh_eng.clone();
+        let arn = initial_desc.table_arn.clone();
+        t_handles.push(tokio::spawn(async move {
+            eng.tag_resource(
+                &arn,
+                &[Tag {
+                    key: format!("k_{i}"),
+                    value: format!("v_{i}"),
+                }],
+            )
+            .await
+            .unwrap();
+        }));
+    }
+    for h in t_handles {
+        h.await.unwrap();
+    }
+    let tags = fresh_eng.list_tags(&initial_desc.table_arn).await.unwrap();
+    assert_eq!(
+        tags.len(),
+        16,
+        "BUG-13: concurrent tag_resource calls must preserve all 16 tags via CAS"
+    );
+}

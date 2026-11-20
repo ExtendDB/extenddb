@@ -1,14 +1,16 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Query and Scan over a BigTable data table.
+//! Query and Scan over a BigTable data table (base, GSI shadow, and sparse LSI).
 
 use std::collections::BTreeMap;
 
 use extenddb_core::expression::{
-    Expr, ExpressionMaps, KeyCondition, PathElement, SortKeyCondition, evaluate_condition,
+    Expr, ExpressionMaps, KeyCondition, PathElement, SortKeyCondition,
 };
-use extenddb_core::types::{AttributeValue, Item, KeySchemaElement, KeyType, TableKeyInfo};
+use extenddb_core::types::{
+    AttributeValue, Item, KeySchemaElement, KeyType, ScalarAttributeType, TableKeyInfo,
+};
 use extenddb_storage::error::StorageError;
 use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::row_filter::{
     Chain, Condition, Filter,
@@ -24,16 +26,8 @@ use crate::data::client::{
 use crate::data::encoding::{cell, row_key};
 use crate::data::item_ops::FAMILY_DATA;
 
-/// Compute the parallel-scan segment `[0, total_segments)` for an encoded row key
-/// (base table or GSI shadow table) by hashing its partition-key prefix
-/// (`[pk_tag:1][pk_len:4][pk_bytes]`) with CRC32.
-pub fn pk_segment_from_encoded_key(
-    encoded_row_key: &[u8],
-    total_segments: u64,
-) -> Result<u64, StorageError> {
-    if total_segments <= 1 {
-        return Ok(0);
-    }
+/// Extract the `[pk_tag:1][pk_len:4][pk_bytes]` slice from an encoded row key.
+fn pk_prefix_slice(encoded_row_key: &[u8]) -> Result<&[u8], StorageError> {
     if encoded_row_key.len() < 5 {
         return Err(StorageError::Internal(
             "malformed row key (shorter than 5-byte PK header)".into(),
@@ -50,7 +44,21 @@ pub fn pk_segment_from_encoded_key(
             "malformed row key (truncated PK bytes)".into(),
         ));
     }
-    let hash = crc32fast::hash(&encoded_row_key[..end]) as u64;
+    Ok(&encoded_row_key[..end])
+}
+
+/// Compute the parallel-scan segment `[0, total_segments)` for an encoded row key
+/// (base table or GSI shadow table) by hashing its partition-key prefix
+/// (`[pk_tag:1][pk_len:4][pk_bytes]`) with CRC32.
+pub fn pk_segment_from_encoded_key(
+    encoded_row_key: &[u8],
+    total_segments: u64,
+) -> Result<u64, StorageError> {
+    if total_segments <= 1 {
+        return Ok(0);
+    }
+    let prefix = pk_prefix_slice(encoded_row_key)?;
+    let hash = crc32fast::hash(prefix) as u64;
     Ok(hash % total_segments)
 }
 
@@ -93,6 +101,60 @@ fn data_family_latest_filter() -> RowFilter {
     }
 }
 
+/// Server-side sparse filter returning latest `d:*` cells iff `d:<lsi_sk_name>` exists.
+fn build_lsi_sparse_filter(lsi_sk_name: &str) -> RowFilter {
+    let predicate = RowFilter {
+        filter: Some(Filter::Chain(Chain {
+            filters: vec![
+                RowFilter {
+                    filter: Some(Filter::FamilyNameRegexFilter(format!("^{FAMILY_DATA}$"))),
+                },
+                RowFilter {
+                    filter: Some(Filter::ColumnQualifierRegexFilter(exact_re2_bytes(
+                        lsi_sk_name.as_bytes(),
+                    ))),
+                },
+                RowFilter {
+                    filter: Some(Filter::CellsPerColumnLimitFilter(1)),
+                },
+            ],
+        })),
+    };
+    RowFilter {
+        filter: Some(Filter::Condition(Box::new(Condition {
+            predicate_filter: Some(Box::new(predicate)),
+            true_filter: Some(Box::new(data_family_latest_filter())),
+            false_filter: Some(Box::new(RowFilter {
+                filter: Some(Filter::BlockAllFilter(true)),
+            })),
+        }))),
+    }
+}
+
+/// Lexicographic sort encoding `[tag, bytes...]` for an optional sort-key attribute.
+fn encode_sk_sort_bytes(val: Option<&AttributeValue>) -> Vec<u8> {
+    let Some(av) = val else {
+        return Vec::new();
+    };
+    match row_key::sk_tag_and_bytes(av) {
+        Ok((tag, bytes)) => {
+            let mut out = Vec::with_capacity(1 + bytes.len());
+            out.push(tag);
+            out.extend_from_slice(&bytes);
+            out
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+fn effective_base_schema(key_info: &TableKeyInfo) -> &[KeySchemaElement] {
+    if key_info.base_key_schema.is_empty() {
+        &key_info.key_schema
+    } else {
+        &key_info.base_key_schema
+    }
+}
+
 fn extract_lek(item: &Item, key_info: &TableKeyInfo, is_gsi: bool) -> Item {
     let mut key_attrs: Item = BTreeMap::new();
     for ks in &key_info.key_schema {
@@ -108,6 +170,102 @@ fn extract_lek(item: &Item, key_info: &TableKeyInfo, is_gsi: bool) -> Item {
         }
     }
     key_attrs
+}
+
+fn extract_lsi_lek(item: &Item, base_key_info: &TableKeyInfo, lsi_sk_name: &str) -> Item {
+    let mut lek: Item = BTreeMap::new();
+    for ks in effective_base_schema(base_key_info) {
+        if let Some(v) = item.get(&ks.attribute_name) {
+            lek.insert(ks.attribute_name.clone(), v.clone());
+        }
+    }
+    if let Some(v) = item.get(lsi_sk_name) {
+        lek.insert(lsi_sk_name.to_owned(), v.clone());
+    }
+    lek
+}
+
+type LsiStartCursor = (Vec<u8>, Vec<u8>, Vec<u8>);
+
+fn check_defined_scalar_type(
+    base_key_info: &TableKeyInfo,
+    attr_name: &str,
+    val: &AttributeValue,
+) -> Result<(), StorageError> {
+    if let Some(ad) = base_key_info
+        .attribute_definitions
+        .iter()
+        .find(|a| a.attribute_name == attr_name)
+    {
+        let ok = matches!(
+            (&ad.attribute_type, val),
+            (ScalarAttributeType::S, AttributeValue::S(_))
+                | (ScalarAttributeType::N, AttributeValue::N(_))
+                | (ScalarAttributeType::B, AttributeValue::B(_))
+        );
+        if !ok {
+            return Err(StorageError::Validation(
+                "The provided starting key is invalid".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate and decode an LSI `ExclusiveStartKey` into
+/// `(pk_prefix, lsi_sk_sort_bytes, base_sk_sort_bytes)` (`BUG-13`).
+fn parse_lsi_exclusive_start_key(
+    esk: &Item,
+    base_key_info: &TableKeyInfo,
+    lsi_sk_name: &str,
+) -> Result<LsiStartCursor, StorageError> {
+    let base_schema = effective_base_schema(base_key_info);
+    for ks in base_schema {
+        let Some(v) = esk.get(&ks.attribute_name) else {
+            return Err(StorageError::Validation(
+                "The provided starting key is invalid".into(),
+            ));
+        };
+        check_defined_scalar_type(base_key_info, &ks.attribute_name, v)?;
+    }
+
+    let base_encoded = row_key::encode_key(esk, base_schema)
+        .map_err(|_| StorageError::Validation("The provided starting key is invalid".into()))?;
+    let pk_prefix = pk_prefix_slice(&base_encoded)?.to_vec();
+
+    let Some(lsi_val) = esk.get(lsi_sk_name) else {
+        return Err(StorageError::Validation(
+            "The provided starting key is invalid".into(),
+        ));
+    };
+    check_defined_scalar_type(base_key_info, lsi_sk_name, lsi_val)?;
+    let (lsi_tag, lsi_bytes) = row_key::sk_tag_and_bytes(lsi_val)
+        .map_err(|_| StorageError::Validation("The provided starting key is invalid".into()))?;
+    let mut lsi_sort = Vec::with_capacity(1 + lsi_bytes.len());
+    lsi_sort.push(lsi_tag);
+    lsi_sort.extend_from_slice(&lsi_bytes);
+
+    let base_sk_name = base_schema
+        .iter()
+        .find(|k| k.key_type == KeyType::Range)
+        .map(|k| k.attribute_name.as_str());
+    let base_sort = base_sk_name
+        .and_then(|n| esk.get(n))
+        .map(|v| encode_sk_sort_bytes(Some(v)))
+        .unwrap_or_default();
+
+    let expected_attr_count = if base_schema.iter().any(|k| k.attribute_name == lsi_sk_name) {
+        base_schema.len()
+    } else {
+        base_schema.len() + 1
+    };
+    if esk.len() != expected_attr_count {
+        return Err(StorageError::Validation(
+            "The provided starting key is invalid".into(),
+        ));
+    }
+
+    Ok((pk_prefix, lsi_sort, base_sort))
 }
 
 pub struct QueryScan<'a> {
@@ -393,7 +551,7 @@ impl<'a> QueryScan<'a> {
         Ok((items, last_evaluated))
     }
 
-    /// Run a Query against a Local Secondary Index.
+    /// Run a Query against a Local Secondary Index (`BUG-13`).
     #[allow(clippy::too_many_arguments)]
     pub async fn query_lsi(
         &self,
@@ -413,37 +571,29 @@ impl<'a> QueryScan<'a> {
             .find(|k| k.key_type == KeyType::Range)
             .map(|k| k.attribute_name.clone())
             .ok_or_else(|| StorageError::Validation("LSI missing RANGE key".into()))?;
+        let base_schema = effective_base_schema(base_key_info);
+        let base_sk_name = base_schema
+            .iter()
+            .find(|k| k.key_type == KeyType::Range)
+            .map(|k| k.attribute_name.clone());
 
         let pk_start = row_key::pk_range_start(&pk_value)?;
         let pk_end = row_key::pk_range_end_inclusive(&pk_value)?;
 
-        let predicate = RowFilter {
-            filter: Some(Filter::Chain(Chain {
-                filters: vec![
-                    RowFilter {
-                        filter: Some(Filter::FamilyNameRegexFilter(format!("^{FAMILY_DATA}$"))),
-                    },
-                    RowFilter {
-                        filter: Some(Filter::ColumnQualifierRegexFilter(exact_re2_bytes(
-                            lsi_sk_name.as_bytes(),
-                        ))),
-                    },
-                    RowFilter {
-                        filter: Some(Filter::CellsPerColumnLimitFilter(1)),
-                    },
-                ],
-            })),
-        };
-        let lsi_cond = RowFilter {
-            filter: Some(Filter::Condition(Box::new(Condition {
-                predicate_filter: Some(Box::new(predicate)),
-                true_filter: Some(Box::new(data_family_latest_filter())),
-                false_filter: Some(Box::new(RowFilter {
-                    filter: Some(Filter::BlockAllFilter(true)),
-                })),
-            }))),
+        let parsed_esk = if let Some(esk) = exclusive_start_key {
+            let (esk_pk_prefix, esk_lsi, esk_base) =
+                parse_lsi_exclusive_start_key(esk, base_key_info, &lsi_sk_name)?;
+            if esk_pk_prefix != pk_start {
+                return Err(StorageError::Validation(
+                    "The provided starting key is outside query boundaries".into(),
+                ));
+            }
+            Some((esk_lsi, esk_base))
+        } else {
+            None
         };
 
+        let lsi_cond = build_lsi_sparse_filter(&lsi_sk_name);
         let req = ReadRowsRequest {
             table_name: self.full_table_name.clone(),
             app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
@@ -475,17 +625,13 @@ impl<'a> QueryScan<'a> {
         }
 
         items.sort_by(|a, b| {
-            let av = a.get(&lsi_sk_name);
-            let bv = b.get(&lsi_sk_name);
-            let aenc = av
-                .and_then(|v| row_key::sk_tag_and_bytes(v).ok())
-                .map(|(_, b)| b)
-                .unwrap_or_default();
-            let benc = bv
-                .and_then(|v| row_key::sk_tag_and_bytes(v).ok())
-                .map(|(_, b)| b)
-                .unwrap_or_default();
-            aenc.cmp(&benc)
+            let a_lsi = encode_sk_sort_bytes(a.get(&lsi_sk_name));
+            let b_lsi = encode_sk_sort_bytes(b.get(&lsi_sk_name));
+            a_lsi.cmp(&b_lsi).then_with(|| {
+                let a_base = encode_sk_sort_bytes(base_sk_name.as_deref().and_then(|n| a.get(n)));
+                let b_base = encode_sk_sort_bytes(base_sk_name.as_deref().and_then(|n| b.get(n)));
+                a_base.cmp(&b_base)
+            })
         });
 
         if let Some(sk_cond) = &kc.sk_condition {
@@ -496,43 +642,215 @@ impl<'a> QueryScan<'a> {
             items.reverse();
         }
 
-        if let Some(esk) = exclusive_start_key {
-            let base_sk_name = base_key_info
-                .key_schema
-                .iter()
-                .find(|k| k.key_type == KeyType::Range)
-                .map(|k| k.attribute_name.clone());
-            let esk_lsi = esk.get(&lsi_sk_name);
-            let esk_base_sk = base_sk_name.as_ref().and_then(|n| esk.get(n));
-            let cut = items.iter().position(|it| {
-                let item_lsi = it.get(&lsi_sk_name);
-                let item_base_sk = base_sk_name.as_ref().and_then(|n| it.get(n));
-                item_lsi == esk_lsi && item_base_sk == esk_base_sk
+        if let Some((esk_lsi, esk_base)) = parsed_esk {
+            items.retain(|it| {
+                let item_lsi = encode_sk_sort_bytes(it.get(&lsi_sk_name));
+                let item_base =
+                    encode_sk_sort_bytes(base_sk_name.as_deref().and_then(|n| it.get(n)));
+                if forward {
+                    (item_lsi.as_slice(), item_base.as_slice())
+                        > (esk_lsi.as_slice(), esk_base.as_slice())
+                } else {
+                    (item_lsi.as_slice(), item_base.as_slice())
+                        < (esk_lsi.as_slice(), esk_base.as_slice())
+                }
             });
-            if let Some(p) = cut {
-                items.drain(..=p);
-            }
         }
 
         let last_evaluated = match limit {
             Some(l) if l > 0 && items.len() > l as usize => {
                 let last = items[l as usize - 1].clone();
                 items.truncate(l as usize);
-                let mut lek: Item = BTreeMap::new();
-                for ks in &base_key_info.key_schema {
-                    if let Some(v) = last.get(&ks.attribute_name) {
-                        lek.insert(ks.attribute_name.clone(), v.clone());
-                    }
-                }
-                if let Some(v) = last.get(&lsi_sk_name) {
-                    lek.insert(lsi_sk_name.clone(), v.clone());
-                }
-                Some(lek)
+                Some(extract_lsi_lek(&last, base_key_info, &lsi_sk_name))
             }
             _ => None,
         };
 
         Ok((items, last_evaluated))
+    }
+
+    /// Run a Scan against a Local Secondary Index (`BUG-13`; `RFC-0003` §7.1, §7.2, §7.4).
+    ///
+    /// Streams partitions forward, filtering out sparse base items missing
+    /// `lsi_sk_name` *before* applying `limit`, sorting each partition by
+    /// `(enc_lsi_sk, enc_base_sk)`, honoring parallel scan (`segment` /
+    /// `total_segments`), resuming cleanly from `ExclusiveStartKey`
+    /// `(pk, base_sk, lsi_sk)` across intra-partition and inter-partition
+    /// boundaries (even if the boundary item was deleted), and emitting
+    /// `LastEvaluatedKey` with `(pk, base_sk, lsi_sk)` only when strictly more
+    /// LSI items remain.
+    pub async fn scan_lsi(
+        &self,
+        base_key_info: &TableKeyInfo,
+        lsi_key_schema: &[KeySchemaElement],
+        limit: Option<i64>,
+        exclusive_start_key: Option<&Item>,
+        segment: Option<i64>,
+        total_segments: Option<i64>,
+    ) -> Result<(Vec<Item>, Option<Item>), StorageError> {
+        let base_schema = effective_base_schema(base_key_info);
+        if !base_schema.iter().any(|k| k.key_type == KeyType::Hash) {
+            return Err(StorageError::Validation(
+                "base table missing HASH key".into(),
+            ));
+        }
+        let base_sk_name = base_schema
+            .iter()
+            .find(|k| k.key_type == KeyType::Range)
+            .map(|k| k.attribute_name.clone());
+        let lsi_sk_name = lsi_key_schema
+            .iter()
+            .find(|k| k.key_type == KeyType::Range)
+            .map(|k| k.attribute_name.clone())
+            .ok_or_else(|| StorageError::Validation("LSI missing RANGE key".into()))?;
+
+        let (mut cursor_start, esk_resume): (Vec<u8>, Option<LsiStartCursor>) =
+            if let Some(esk) = exclusive_start_key {
+                let (pk_start, esk_lsi_enc, esk_base_enc) =
+                    parse_lsi_exclusive_start_key(esk, base_key_info, &lsi_sk_name)?;
+                (
+                    pk_start.clone(),
+                    Some((pk_start, esk_lsi_enc, esk_base_enc)),
+                )
+            } else {
+                (Vec::new(), None)
+            };
+
+        let total = total_segments.unwrap_or(1).max(1) as u64;
+        let seg = segment.unwrap_or(0).max(0) as u64 % total;
+        let target_plus_one = limit.filter(|&l| l > 0).map(|l| l as usize + 1);
+        let page_batch: i64 = match limit {
+            Some(l) if l > 0 => (l.saturating_mul(total as i64).saturating_mul(4)).clamp(64, 1024),
+            _ => 512,
+        };
+
+        let lsi_filter = build_lsi_sparse_filter(&lsi_sk_name);
+        let mut data = self.client.data();
+        let mut collected: Vec<Item> = Vec::new();
+        let mut current_pk_prefix: Option<Vec<u8>> = None;
+        let mut current_partition_items: Vec<Item> = Vec::new();
+
+        let flush_partition = |pk_prefix: &[u8],
+                               mut part_items: Vec<Item>,
+                               out: &mut Vec<Item>|
+         -> Result<(), StorageError> {
+            if pk_segment_from_encoded_key(pk_prefix, total)? != seg {
+                return Ok(());
+            }
+            part_items.sort_by(|a, b| {
+                let a_lsi = encode_sk_sort_bytes(a.get(&lsi_sk_name));
+                let b_lsi = encode_sk_sort_bytes(b.get(&lsi_sk_name));
+                a_lsi.cmp(&b_lsi).then_with(|| {
+                    let a_base =
+                        encode_sk_sort_bytes(base_sk_name.as_deref().and_then(|n| a.get(n)));
+                    let b_base =
+                        encode_sk_sort_bytes(base_sk_name.as_deref().and_then(|n| b.get(n)));
+                    a_base.cmp(&b_base)
+                })
+            });
+            for it in part_items {
+                if let Some((ref esk_pk_pfx, ref esk_lsi_enc, ref esk_base_enc)) = esk_resume {
+                    if pk_prefix < esk_pk_pfx.as_slice() {
+                        continue;
+                    }
+                    if pk_prefix == esk_pk_pfx.as_slice() {
+                        let item_lsi_enc = encode_sk_sort_bytes(it.get(&lsi_sk_name));
+                        let item_base_enc =
+                            encode_sk_sort_bytes(base_sk_name.as_deref().and_then(|n| it.get(n)));
+                        if (item_lsi_enc.as_slice(), item_base_enc.as_slice())
+                            <= (esk_lsi_enc.as_slice(), esk_base_enc.as_slice())
+                        {
+                            continue;
+                        }
+                    }
+                }
+                out.push(it);
+                if let Some(want) = target_plus_one
+                    && out.len() >= want
+                {
+                    break;
+                }
+            }
+            Ok(())
+        };
+
+        loop {
+            let req = ReadRowsRequest {
+                table_name: self.full_table_name.clone(),
+                app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+                rows: Some(RowSet {
+                    row_keys: vec![],
+                    row_ranges: vec![RowRange {
+                        start_key: Some(StartKey::StartKeyClosed(cursor_start.clone())),
+                        end_key: None,
+                    }],
+                }),
+                rows_limit: page_batch,
+                filter: Some(lsi_filter.clone()),
+                ..ReadRowsRequest::default()
+            };
+            let resp = data
+                .read_rows(req)
+                .await
+                .map_err(|e| map_bigtable_err("LSI Scan ReadRows", e))?;
+            let batch_count = resp.len();
+            if batch_count == 0 {
+                break;
+            }
+
+            let mut last_raw_key: Option<Vec<u8>> = None;
+            let mut enough_after_flush = false;
+            for (raw_key, cells) in resp {
+                last_raw_key = Some(raw_key.clone());
+                let row_pk_prefix = pk_prefix_slice(&raw_key)?.to_vec();
+                if let Some(ref cur_pfx) = current_pk_prefix
+                    && cur_pfx != &row_pk_prefix
+                {
+                    let finished = std::mem::take(&mut current_partition_items);
+                    flush_partition(cur_pfx, finished, &mut collected)?;
+                    if let Some(want) = target_plus_one
+                        && collected.len() >= want
+                    {
+                        current_pk_prefix = None;
+                        enough_after_flush = true;
+                        break;
+                    }
+                }
+                current_pk_prefix = Some(row_pk_prefix);
+                if let Some(item) = Self::cells_to_item(cells)?
+                    && item.contains_key(&lsi_sk_name)
+                {
+                    current_partition_items.push(item);
+                }
+            }
+            if enough_after_flush {
+                break;
+            }
+            if (batch_count as i64) < page_batch {
+                break;
+            }
+            if let Some(mut k) = last_raw_key {
+                k.push(0x00);
+                cursor_start = k;
+            } else {
+                break;
+            }
+        }
+
+        if let Some(cur_pfx) = current_pk_prefix.take() {
+            flush_partition(&cur_pfx, current_partition_items, &mut collected)?;
+        }
+
+        let last_evaluated = match limit {
+            Some(l) if l > 0 && collected.len() > l as usize => {
+                collected.truncate(l as usize);
+                collected
+                    .last()
+                    .map(|it| extract_lsi_lek(it, base_key_info, &lsi_sk_name))
+            }
+            _ => None,
+        };
+        Ok((collected, last_evaluated))
     }
 
     /// Run a Scan against the base table or a GSI shadow table.
@@ -765,33 +1083,10 @@ fn filter_items_by_sk_condition(
     }
 }
 
-/// Apply a `FilterExpression` to a list of items, returning only those that match.
-pub fn apply_filter(
-    items: Vec<Item>,
-    filter: Option<&Expr>,
-    maps: &ExpressionMaps,
-) -> Result<Vec<Item>, StorageError> {
-    let Some(f) = filter else {
-        return Ok(items);
-    };
-    let mut out = Vec::with_capacity(items.len());
-    for item in items {
-        match evaluate_condition(f, &item, maps) {
-            Ok(true) => out.push(item),
-            Ok(false) => {}
-            Err(e) => {
-                return Err(StorageError::Validation(format!(
-                    "filter expression evaluation: {e}"
-                )));
-            }
-        }
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use extenddb_core::types::AttributeDefinition;
 
     #[test]
     fn pk_segment_matches_key_belongs_to_segment() {
@@ -818,5 +1113,83 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn extract_lsi_lek_and_esk_validation() {
+        let base_schema = vec![
+            KeySchemaElement {
+                attribute_name: "pk".into(),
+                key_type: KeyType::Hash,
+            },
+            KeySchemaElement {
+                attribute_name: "sk".into(),
+                key_type: KeyType::Range,
+            },
+        ];
+        let mut engine_rewritten_info = TableKeyInfo {
+            key_schema: vec![
+                KeySchemaElement {
+                    attribute_name: "pk".into(),
+                    key_type: KeyType::Hash,
+                },
+                KeySchemaElement {
+                    attribute_name: "lsi_sk".into(),
+                    key_type: KeyType::Range,
+                },
+            ],
+            base_key_schema: base_schema,
+            attribute_definitions: vec![
+                AttributeDefinition {
+                    attribute_name: "pk".into(),
+                    attribute_type: ScalarAttributeType::S,
+                },
+                AttributeDefinition {
+                    attribute_name: "sk".into(),
+                    attribute_type: ScalarAttributeType::S,
+                },
+                AttributeDefinition {
+                    attribute_name: "lsi_sk".into(),
+                    attribute_type: ScalarAttributeType::N,
+                },
+            ],
+            ..TableKeyInfo::default()
+        };
+        let mut item = BTreeMap::new();
+        item.insert("pk".to_string(), AttributeValue::S("p1".into()));
+        item.insert("sk".to_string(), AttributeValue::S("s9".into()));
+        item.insert("lsi_sk".to_string(), AttributeValue::N("42".into()));
+        item.insert("extra".to_string(), AttributeValue::S("ignored".into()));
+
+        let lek = extract_lsi_lek(&item, &engine_rewritten_info, "lsi_sk");
+        assert_eq!(lek.len(), 3);
+        assert!(parse_lsi_exclusive_start_key(&lek, &engine_rewritten_info, "lsi_sk").is_ok());
+
+        // Missing base_sk must fail validation
+        let mut missing_bsk = lek.clone();
+        missing_bsk.remove("sk");
+        assert!(
+            parse_lsi_exclusive_start_key(&missing_bsk, &engine_rewritten_info, "lsi_sk").is_err()
+        );
+
+        // Wrong scalar type on lsi_sk must fail validation
+        let mut wrong_type = lek.clone();
+        wrong_type.insert("lsi_sk".into(), AttributeValue::S("not_num".into()));
+        assert!(
+            parse_lsi_exclusive_start_key(&wrong_type, &engine_rewritten_info, "lsi_sk").is_err()
+        );
+
+        // Extra extraneous attribute must fail validation
+        let mut extra_attr = lek;
+        extra_attr.insert("bogus".into(), AttributeValue::S("x".into()));
+        assert!(
+            parse_lsi_exclusive_start_key(&extra_attr, &engine_rewritten_info, "lsi_sk").is_err()
+        );
+
+        // Also works when base_key_schema is empty (direct storage caller)
+        engine_rewritten_info.key_schema = engine_rewritten_info.base_key_schema.clone();
+        engine_rewritten_info.base_key_schema.clear();
+        let lek2 = extract_lsi_lek(&item, &engine_rewritten_info, "lsi_sk");
+        assert!(parse_lsi_exclusive_start_key(&lek2, &engine_rewritten_info, "lsi_sk").is_ok());
     }
 }

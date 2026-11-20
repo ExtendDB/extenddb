@@ -22,7 +22,7 @@ use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::{
     TimestampRange, mutation,
 };
 
-use crate::data::client::{BigtableClient, map_bigtable_err, monotonic_timestamp_micros};
+use crate::data::client::{BigtableClient, map_bigtable_err};
 use crate::data::encoding::{cell, row_key};
 
 /// Family for DDB attribute cells.
@@ -74,6 +74,24 @@ pub const fn version_to_timestamp_micros(version: u64) -> i64 {
     (version.saturating_mul(1_000)) as i64
 }
 
+/// Smallest millisecond-aligned (`% 1_000 == 0`) timestamp in microseconds
+/// strictly greater than `ts_micros`.
+///
+/// Production Cloud Bigtable (`TimestampGranularity::MILLIS`) requires
+/// `TimestampRange` bounds on `TimestampRangeFilter` and `DeleteFromColumn` to
+/// be multiples of `1_000` microseconds. Since OCC versions map to
+/// `v * 1_000`, `next_millis_exclusive(v * 1_000) == (v + 1) * 1_000`, which
+/// includes `v * 1_000` in `[0, next)` while excluding every strictly newer
+/// OCC version `>= v + 1`.
+#[inline]
+pub const fn next_millis_exclusive(ts_micros: i64) -> i64 {
+    if ts_micros <= 0 {
+        1_000
+    } else {
+        ((ts_micros / 1_000).saturating_add(1)).saturating_mul(1_000)
+    }
+}
+
 /// Parse a DynamoDB `N` string into a positive Unix epoch second (`>= 1`) for
 /// TTL indexing and expiration checks (supporting integer, fractional, and
 /// scientific-notation decimal strings). Zero and negative values never expire
@@ -90,13 +108,14 @@ pub fn parse_ttl_epoch_secs(s: &str) -> Option<i64> {
     (secs > 0).then_some(secs)
 }
 
-/// Bounded `[0, ts_micros)` range used when pre-clearing older `m:v` or
-/// `t:state` cells so a delayed mutation never deletes a strictly newer version.
+/// Bounded `[0, ts_micros)` range used when pre-clearing older `m:v` or TTL
+/// index cells so a delayed mutation never deletes a strictly newer version.
 #[inline]
 pub(crate) fn older_than_ts_range(ts_micros: i64) -> Option<TimestampRange> {
-    (ts_micros > 0).then_some(TimestampRange {
+    let aligned = (ts_micros / 1_000) * 1_000;
+    (aligned > 0).then_some(TimestampRange {
         start_timestamp_micros: 0,
-        end_timestamp_micros: ts_micros,
+        end_timestamp_micros: aligned,
     })
 }
 
@@ -105,9 +124,22 @@ pub(crate) fn older_than_ts_range(ts_micros: i64) -> Option<TimestampRange> {
 pub enum CasOutcome {
     /// Mutation succeeded at the returned OCC version.
     Applied(u64),
+    /// One or more `m:intent:<txn_id>` cells are present on the row (`BUG-03`);
+    /// caller must cooperatively resolve `COMMITTED` / expired `PENDING`
+    /// transactions via `__extenddb_txn_log__` before retrying or failing.
+    IntentPresent,
     /// Row's `m:v` (or presence) changed concurrently without an active 2PC
     /// intent; caller should re-read, re-evaluate conditions/updates, and retry.
     OccMismatch,
+}
+
+/// Atomic single-row read snapshot capturing `d:*`, `m:v`, and all physical
+/// `(txn_id, intent_cell_ts_micros)` entries regardless of wall-clock age (`BUG-02`, `BUG-03`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowSnapshot {
+    pub item: Option<Item>,
+    pub version: Option<u64>,
+    pub intents: Vec<(String, i64)>,
 }
 
 /// Decodes an OCC row version from cell bytes.
@@ -120,8 +152,11 @@ pub fn decode_version(bytes: &[u8]) -> Option<u64> {
     }
 }
 
-/// Filter matching any active intent in family `m`.
-fn build_active_intent_filter(cutoff_micros: i64) -> RowFilter {
+/// Filter matching ANY physical `m:intent:*` cell in family `m`, intentionally
+/// WITHOUT a wall-clock `TimestampRangeFilter` (`BUG-03`): an intent older than
+/// `intent_timeout_secs` may belong to a `COMMITTED` transaction in
+/// `__extenddb_txn_log__` awaiting roll-forward and must never be bypassed.
+pub(crate) fn build_active_intent_filter() -> RowFilter {
     RowFilter {
         filter: Some(Filter::Chain(Chain {
             filters: vec![
@@ -134,18 +169,12 @@ fn build_active_intent_filter(cutoff_micros: i64) -> RowFilter {
                 RowFilter {
                     filter: Some(Filter::CellsPerColumnLimitFilter(1)),
                 },
-                RowFilter {
-                    filter: Some(Filter::TimestampRangeFilter(TimestampRange {
-                        start_timestamp_micros: cutoff_micros.max(0),
-                        end_timestamp_micros: 0,
-                    })),
-                },
             ],
         })),
     }
 }
 
-/// Filter matching row version `m:v == expected_version`.
+/// Filter matching row version `m:v == expected_version` on the LATEST cell.
 pub(crate) fn build_version_match_filter(expected_version: u64) -> RowFilter {
     let val_regex = format!("^{expected_version}$").into_bytes();
     RowFilter {
@@ -184,26 +213,24 @@ fn build_version_mismatch_filter(expected_version: u64) -> RowFilter {
 }
 
 /// De Morgan conflict filter for existing-row OCC update/delete:
-/// Matches if `(active intent exists in m) OR (m:v != expected_version)`.
-/// When this filter matches (conflict), mutations are skipped.
-/// When this filter does NOT match (no conflict), `false_mutations` are applied.
-fn build_occ_conflict_filter(cutoff_micros: i64, expected_version: u64) -> RowFilter {
+/// Matches if `(any intent exists in m) OR (m:v != expected_version)`.
+fn build_occ_conflict_filter(expected_version: u64) -> RowFilter {
     RowFilter {
         filter: Some(Filter::Interleave(Interleave {
             filters: vec![
-                build_active_intent_filter(cutoff_micros),
+                build_active_intent_filter(),
                 build_version_mismatch_filter(expected_version),
             ],
         })),
     }
 }
 
-/// Filter matching if active intent exists OR `m:v` exists OR data family `d` exists.
-fn build_row_presence_conflict_filter(cutoff_micros: i64) -> RowFilter {
+/// Filter matching if any intent exists OR `m:v` exists OR data family `d` exists.
+fn build_row_presence_conflict_filter() -> RowFilter {
     RowFilter {
         filter: Some(Filter::Interleave(Interleave {
             filters: vec![
-                build_active_intent_filter(cutoff_micros),
+                build_active_intent_filter(),
                 RowFilter {
                     filter: Some(Filter::Chain(Chain {
                         filters: vec![
@@ -241,9 +268,9 @@ fn build_row_presence_conflict_filter(cutoff_micros: i64) -> RowFilter {
 }
 
 /// Conflict filter for updating/deleting a legacy row that existed in family `d`
-/// without an `m:v` cell: conflicts if an active intent exists, OR `m:v` appeared
+/// without an `m:v` cell: conflicts if any intent exists, OR `m:v` appeared
 /// concurrently, OR family `d` was deleted concurrently.
-fn build_unversioned_existing_conflict_filter(cutoff_micros: i64) -> RowFilter {
+fn build_unversioned_existing_conflict_filter() -> RowFilter {
     let missing_data_filter = RowFilter {
         filter: Some(Filter::Condition(Box::new(Condition {
             predicate_filter: Some(Box::new(RowFilter {
@@ -269,7 +296,7 @@ fn build_unversioned_existing_conflict_filter(cutoff_micros: i64) -> RowFilter {
     RowFilter {
         filter: Some(Filter::Interleave(Interleave {
             filters: vec![
-                build_active_intent_filter(cutoff_micros),
+                build_active_intent_filter(),
                 RowFilter {
                     filter: Some(Filter::Chain(Chain {
                         filters: vec![
@@ -293,45 +320,69 @@ fn build_unversioned_existing_conflict_filter(cutoff_micros: i64) -> RowFilter {
     }
 }
 
-fn select_occ_predicate(
-    cutoff_micros: i64,
-    expected_version: Option<u64>,
-    row_existed: bool,
-) -> RowFilter {
+fn select_occ_predicate(expected_version: Option<u64>, row_existed: bool) -> RowFilter {
     match (expected_version, row_existed) {
-        (Some(v), _) => build_occ_conflict_filter(cutoff_micros, v),
-        (None, true) => build_unversioned_existing_conflict_filter(cutoff_micros),
-        (None, false) => build_row_presence_conflict_filter(cutoff_micros),
+        (Some(v), _) => build_occ_conflict_filter(v),
+        (None, true) => build_unversioned_existing_conflict_filter(),
+        (None, false) => build_row_presence_conflict_filter(),
     }
+}
+
+fn decode_snapshot_cells(
+    cells: Vec<bigtable_rs::bigtable::RowCell>,
+) -> Result<RowSnapshot, StorageError> {
+    let mut item: Item = BTreeMap::new();
+    let mut version: Option<u64> = None;
+    let mut intents: BTreeMap<String, i64> = BTreeMap::new();
+    for c in cells {
+        if c.family_name == FAMILY_DATA {
+            let attr_name = String::from_utf8(c.qualifier)
+                .map_err(|e| StorageError::Internal(format!("decode qualifier: {e}")))?;
+            if let std::collections::btree_map::Entry::Vacant(e) = item.entry(attr_name) {
+                let value = cell::decode(&c.value)?;
+                e.insert(value);
+            }
+        } else if c.family_name == FAMILY_META {
+            if c.qualifier.as_slice() == QUALIFIER_VERSION && version.is_none() {
+                version = decode_version(&c.value);
+            } else if c.qualifier.starts_with(QUALIFIER_INTENT_PREFIX)
+                && let Ok(qual_str) = std::str::from_utf8(&c.qualifier)
+                && let Some(tid) = qual_str.strip_prefix("intent:")
+            {
+                intents
+                    .entry(tid.to_string())
+                    .and_modify(|ts| *ts = (*ts).max(c.timestamp_micros))
+                    .or_insert(c.timestamp_micros);
+            }
+        }
+    }
+    Ok(RowSnapshot {
+        item: (!item.is_empty()).then_some(item),
+        version,
+        intents: intents.into_iter().collect(),
+    })
 }
 
 /// Holds the table-specific context for a sequence of data operations.
 pub struct ItemOps<'a> {
     client: &'a BigtableClient,
     full_table_name: String,
-    intent_timeout_secs: u64,
 }
 
 impl<'a> ItemOps<'a> {
     pub fn new(
         client: &'a BigtableClient,
         data_table_short: &str,
-        intent_timeout_secs: u64,
+        _intent_timeout_secs: u64,
     ) -> Self {
         Self {
             client,
             full_table_name: client.full_table_name(data_table_short),
-            intent_timeout_secs,
         }
     }
 
-    fn intent_cutoff_micros(&self) -> i64 {
-        let timeout_micros = (self.intent_timeout_secs.saturating_mul(1_000_000)) as i64;
-        now_millis_micros().saturating_sub(timeout_micros)
-    }
-
-    /// Check whether an unexpired 2PC intent cell currently holds `row_key`.
-    async fn has_active_intent(&self, row_key: &[u8]) -> Result<bool, StorageError> {
+    /// Check whether ANY physical 2PC intent cell currently holds `row_key`.
+    pub async fn has_any_intent(&self, row_key: &[u8]) -> Result<bool, StorageError> {
         let mut data = self.client.data();
         let req = ReadRowsRequest {
             table_name: self.full_table_name.clone(),
@@ -341,7 +392,7 @@ impl<'a> ItemOps<'a> {
                 row_keys: vec![row_key.to_vec()],
                 row_ranges: vec![],
             }),
-            filter: Some(build_active_intent_filter(self.intent_cutoff_micros())),
+            filter: Some(build_active_intent_filter()),
             ..ReadRowsRequest::default()
         };
         let resp = data
@@ -351,12 +402,11 @@ impl<'a> ItemOps<'a> {
         Ok(!resp.is_empty())
     }
 
-    /// Read the entire row by raw encoded key into an `Item` map along with its
-    /// captured OCC row version (`m:v`).
-    pub async fn get_by_raw_key_with_version(
+    /// Read `(item, occ_version, all_intents)` for a single row by raw key (`BUG-02`, `BUG-03`).
+    pub async fn get_row_snapshot_by_raw_key(
         &self,
         row_key: &[u8],
-    ) -> Result<(Option<Item>, Option<u64>), StorageError> {
+    ) -> Result<RowSnapshot, StorageError> {
         let mut data = self.client.data();
         let req = ReadRowsRequest {
             table_name: self.full_table_name.clone(),
@@ -374,37 +424,71 @@ impl<'a> ItemOps<'a> {
         let resp = data
             .read_rows(req)
             .await
-            .map_err(|e| map_bigtable_err("ReadRows get_with_version", e))?;
-        let mut iter = resp.into_iter();
-        let Some((_, cells)) = iter.next() else {
-            return Ok((None, None));
+            .map_err(|e| map_bigtable_err("ReadRows get_row_snapshot", e))?;
+        let Some((_, cells)) = resp.into_iter().next() else {
+            return Ok(RowSnapshot {
+                item: None,
+                version: None,
+                intents: Vec::new(),
+            });
         };
-        let mut item: Item = BTreeMap::new();
-        let mut version: Option<u64> = None;
-        for c in cells {
-            if c.family_name == FAMILY_DATA {
-                let attr_name = String::from_utf8(c.qualifier)
-                    .map_err(|e| StorageError::Internal(format!("decode qualifier: {e}")))?;
-                if let std::collections::btree_map::Entry::Vacant(e) = item.entry(attr_name) {
-                    let value = cell::decode(&c.value)?;
-                    e.insert(value);
-                }
-            } else if c.family_name == FAMILY_META
-                && c.qualifier.as_slice() == QUALIFIER_VERSION
-                && version.is_none()
-            {
-                version = decode_version(&c.value);
-            }
+        decode_snapshot_cells(cells)
+    }
+
+    /// Batch-read `(item, occ_version, all_intents)` across pre-encoded raw keys,
+    /// returning snapshots in the exact order of `row_keys` (`BUG-02`, `BUG-03`).
+    pub async fn batch_get_row_snapshots_by_raw_keys(
+        &self,
+        row_keys: &[Vec<u8>],
+    ) -> Result<Vec<RowSnapshot>, StorageError> {
+        if row_keys.is_empty() {
+            return Ok(Vec::new());
         }
-        if item.is_empty() {
-            return Ok((None, version));
+        let mut data = self.client.data();
+        let req = ReadRowsRequest {
+            table_name: self.full_table_name.clone(),
+            app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+            rows_limit: row_keys.len() as i64,
+            rows: Some(RowSet {
+                row_keys: row_keys.to_vec(),
+                row_ranges: vec![],
+            }),
+            filter: Some(RowFilter {
+                filter: Some(Filter::CellsPerColumnLimitFilter(1)),
+            }),
+            ..ReadRowsRequest::default()
+        };
+        let resp = data
+            .read_rows(req)
+            .await
+            .map_err(|e| map_bigtable_err("ReadRows batch_get_row_snapshots", e))?;
+        let mut map: BTreeMap<Vec<u8>, RowSnapshot> = BTreeMap::new();
+        for (rk, cells) in resp {
+            map.insert(rk, decode_snapshot_cells(cells)?);
         }
-        Ok((Some(item), version))
+        Ok(row_keys
+            .iter()
+            .map(|rk| {
+                map.get(rk).cloned().unwrap_or(RowSnapshot {
+                    item: None,
+                    version: None,
+                    intents: Vec::new(),
+                })
+            })
+            .collect())
+    }
+
+    /// Read the entire row by raw encoded key into an `Item` map along with its
+    /// captured OCC row version (`m:v`).
+    pub async fn get_by_raw_key_with_version(
+        &self,
+        row_key: &[u8],
+    ) -> Result<(Option<Item>, Option<u64>), StorageError> {
+        let snap = self.get_row_snapshot_by_raw_key(row_key).await?;
+        Ok((snap.item, snap.version))
     }
 
     /// Read the entire row into an `Item` map along with its captured OCC row version.
-    /// Returns `Ok((None, version))` if family `d` has no cells (including deleted
-    /// rows that retain a monotonic `m:v` version marker).
     pub async fn get_with_version(
         &self,
         key_info: &TableKeyInfo,
@@ -501,81 +585,10 @@ impl<'a> ItemOps<'a> {
         self.batch_get_by_raw_keys(&row_keys).await
     }
 
-    /// Read multiple rows into `Item` maps along with any active intent `txn_id` in column family `m`.
-    pub async fn batch_get_with_intent_check(
-        &self,
-        key_info: &TableKeyInfo,
-        keys: &[Item],
-    ) -> Result<Vec<(Option<Item>, Option<String>)>, StorageError> {
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut row_keys = Vec::with_capacity(keys.len());
-        for k in keys {
-            row_keys.push(row_key::encode_key(k, &key_info.key_schema)?);
-        }
-        let mut data = self.client.data();
-        let req = ReadRowsRequest {
-            table_name: self.full_table_name.clone(),
-            app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
-            rows_limit: keys.len() as i64,
-            rows: Some(RowSet {
-                row_keys,
-                row_ranges: vec![],
-            }),
-            filter: Some(RowFilter {
-                filter: Some(Filter::CellsPerColumnLimitFilter(1)),
-            }),
-            ..ReadRowsRequest::default()
-        };
-        let resp = data
-            .read_rows(req)
-            .await
-            .map_err(|e| map_bigtable_err("ReadRows batch_get_with_intent_check", e))?;
-
-        let cutoff_micros = self.intent_cutoff_micros();
-        let mut row_map: BTreeMap<Vec<u8>, (Option<Item>, Option<String>)> = BTreeMap::new();
-
-        for (rkey, cells) in resp {
-            let mut item: Item = BTreeMap::new();
-            let mut active_txn_id: Option<String> = None;
-            for c in cells {
-                if c.family_name == FAMILY_DATA {
-                    let attr_name = String::from_utf8(c.qualifier)
-                        .map_err(|e| StorageError::Internal(format!("decode qualifier: {e}")))?;
-                    if let std::collections::btree_map::Entry::Vacant(e) = item.entry(attr_name) {
-                        let value = cell::decode(&c.value)?;
-                        e.insert(value);
-                    }
-                } else if c.family_name == FAMILY_META
-                    && c.qualifier.starts_with(QUALIFIER_INTENT_PREFIX)
-                    && c.timestamp_micros >= cutoff_micros
-                    && active_txn_id.is_none()
-                    && let Ok(qual_str) = std::str::from_utf8(&c.qualifier)
-                    && let Some(tid) = qual_str.strip_prefix("intent:")
-                {
-                    active_txn_id = Some(tid.to_string());
-                }
-            }
-            let item_opt = if item.is_empty() { None } else { Some(item) };
-            row_map.insert(rkey, (item_opt, active_txn_id));
-        }
-
-        let mut out = Vec::with_capacity(keys.len());
-        for k in keys {
-            let rkey = row_key::encode_key(k, &key_info.key_schema)?;
-            out.push(row_map.get(&rkey).cloned().unwrap_or((None, None)));
-        }
-
-        Ok(out)
-    }
-
-    /// OCC-guarded Put: atomically verifies no active 2PC intent AND `m:v == expected_version`
-    /// (or row absence when `expected_version == None`), then replaces family `d` and updates
-    /// `m:v` with a single deterministic cell timestamp `version_to_timestamp_micros(next_version)`.
-    ///
-    /// Distinguishes active 2PC intent conflicts (`Err(StorageError::TransactionConflict)`)
-    /// from OCC version mismatches (`Ok(CasOutcome::OccMismatch)`).
+    /// OCC-guarded Put: atomically verifies no `m:intent:*` cell AND
+    /// `m:v == expected_version` (or row absence when `expected_version == None`),
+    /// then replaces family `d` and updates `m:v` at
+    /// `version_to_timestamp_micros(next_version)`.
     pub async fn put_cas(
         &self,
         key_info: &TableKeyInfo,
@@ -584,19 +597,10 @@ impl<'a> ItemOps<'a> {
         row_existed: bool,
     ) -> Result<CasOutcome, StorageError> {
         let row_key = row_key::encode_key(item, &key_info.key_schema)?;
-        let min_timestamp = self.intent_cutoff_micros();
-
         let next_version = next_occ_version(expected_version);
         let ts_micros = version_to_timestamp_micros(next_version);
 
         let mut mutations = self.item_to_mutations_at(item, true, ts_micros)?;
-        mutations.push(Mutation {
-            mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
-                family_name: FAMILY_META.to_string(),
-                column_qualifier: QUALIFIER_VERSION.to_vec(),
-                time_range: older_than_ts_range(ts_micros),
-            })),
-        });
         mutations.push(Mutation {
             mutation: Some(mutation::Mutation::SetCell(SetCell {
                 family_name: FAMILY_META.to_string(),
@@ -605,8 +609,15 @@ impl<'a> ItemOps<'a> {
                 value: next_version.to_string().into_bytes(),
             })),
         });
+        mutations.push(Mutation {
+            mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
+                family_name: FAMILY_META.to_string(),
+                column_qualifier: QUALIFIER_VERSION.to_vec(),
+                time_range: older_than_ts_range(ts_micros),
+            })),
+        });
 
-        let predicate = select_occ_predicate(min_timestamp, expected_version, row_existed);
+        let predicate = select_occ_predicate(expected_version, row_existed);
 
         let mut data = self.client.data();
         let req = CheckAndMutateRowRequest {
@@ -628,16 +639,13 @@ impl<'a> ItemOps<'a> {
             return Ok(CasOutcome::Applied(next_version));
         }
 
-        if self.has_active_intent(&row_key).await? {
-            return Err(StorageError::TransactionConflict(
-                "concurrent transaction holds an intent on this row".to_string(),
-            ));
+        if self.has_any_intent(&row_key).await? {
+            return Ok(CasOutcome::IntentPresent);
         }
         Ok(CasOutcome::OccMismatch)
     }
 
-    /// Backwards-compatible guarded `put` wrapper returning `TransactionConflict`
-    /// on any conflict.
+    /// Guarded `put` wrapper returning `TransactionConflict` on conflict.
     pub async fn put(
         &self,
         key_info: &TableKeyInfo,
@@ -650,17 +658,18 @@ impl<'a> ItemOps<'a> {
             .await?
         {
             CasOutcome::Applied(v) => Ok(v),
+            CasOutcome::IntentPresent => Err(StorageError::TransactionConflict(
+                "concurrent transaction holds an intent on this row".to_string(),
+            )),
             CasOutcome::OccMismatch => Err(StorageError::TransactionConflict(
                 "row version changed concurrently".to_string(),
             )),
         }
     }
 
-    /// OCC-guarded Delete: verifies no active 2PC intent AND `m:v == expected_version`
-    /// (or row state when `expected_version == None`). Clears family `d` while
-    /// advancing `m:v` to `next_occ_version(expected_version)` at
-    /// `version_to_timestamp_micros(next_version)` whenever a row or `m:v` existed,
-    /// so subsequent inserts never regress `m:v` or reuse an older cell timestamp.
+    /// OCC-guarded Delete: verifies no `m:intent:*` cell AND `m:v == expected_version`.
+    /// Clears family `d` while advancing `m:v` to `next_occ_version(expected_version)`
+    /// whenever a row or `m:v` existed.
     pub async fn delete_cas(
         &self,
         key_info: &TableKeyInfo,
@@ -669,25 +678,14 @@ impl<'a> ItemOps<'a> {
         row_existed: bool,
     ) -> Result<CasOutcome, StorageError> {
         let row_key = row_key::encode_key(key, &key_info.key_schema)?;
-        let min_timestamp = self.intent_cutoff_micros();
-
         let next_version = next_occ_version(expected_version);
         let ts_micros = version_to_timestamp_micros(next_version);
 
-        let mut mutations = vec![
-            Mutation {
-                mutation: Some(mutation::Mutation::DeleteFromFamily(DeleteFromFamily {
-                    family_name: FAMILY_DATA.to_string(),
-                })),
-            },
-            Mutation {
-                mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
-                    family_name: FAMILY_META.to_string(),
-                    column_qualifier: QUALIFIER_VERSION.to_vec(),
-                    time_range: older_than_ts_range(ts_micros),
-                })),
-            },
-        ];
+        let mut mutations = vec![Mutation {
+            mutation: Some(mutation::Mutation::DeleteFromFamily(DeleteFromFamily {
+                family_name: FAMILY_DATA.to_string(),
+            })),
+        }];
         if expected_version.is_some() || row_existed {
             mutations.push(Mutation {
                 mutation: Some(mutation::Mutation::SetCell(SetCell {
@@ -698,8 +696,15 @@ impl<'a> ItemOps<'a> {
                 })),
             });
         }
+        mutations.push(Mutation {
+            mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
+                family_name: FAMILY_META.to_string(),
+                column_qualifier: QUALIFIER_VERSION.to_vec(),
+                time_range: older_than_ts_range(ts_micros),
+            })),
+        });
 
-        let predicate = select_occ_predicate(min_timestamp, expected_version, row_existed);
+        let predicate = select_occ_predicate(expected_version, row_existed);
 
         let mut data = self.client.data();
         let req = CheckAndMutateRowRequest {
@@ -721,15 +726,13 @@ impl<'a> ItemOps<'a> {
             return Ok(CasOutcome::Applied(next_version));
         }
 
-        if self.has_active_intent(&row_key).await? {
-            return Err(StorageError::TransactionConflict(
-                "concurrent transaction holds an intent on this row".to_string(),
-            ));
+        if self.has_any_intent(&row_key).await? {
+            return Ok(CasOutcome::IntentPresent);
         }
         Ok(CasOutcome::OccMismatch)
     }
 
-    /// Backwards-compatible guarded `delete` wrapper.
+    /// Guarded `delete` wrapper returning `TransactionConflict` on conflict.
     pub async fn delete(
         &self,
         key_info: &TableKeyInfo,
@@ -742,23 +745,320 @@ impl<'a> ItemOps<'a> {
             .await?
         {
             CasOutcome::Applied(_) => Ok(()),
+            CasOutcome::IntentPresent => Err(StorageError::TransactionConflict(
+                "concurrent transaction holds an intent on this row".to_string(),
+            )),
             CasOutcome::OccMismatch => Err(StorageError::TransactionConflict(
                 "row version changed concurrently".to_string(),
             )),
         }
     }
 
-    /// Replace any existing row with the supplied item using a deterministic
-    /// OCC-derived cell timestamp. No condition check, no lock check.
-    pub async fn put_unconditional(
+    /// Read `(existing_d_qualifiers, max_d_timestamp_micros, current_shadow_version)`
+    /// for a GSI shadow row (`BUG-08`).
+    async fn read_shadow_row_meta(
         &self,
-        key_info: &TableKeyInfo,
-        item: &Item,
-    ) -> Result<u64, StorageError> {
-        let row_key = row_key::encode_key(item, &key_info.key_schema)?;
-        let version = next_occ_version(None);
-        let ts_micros = version_to_timestamp_micros(version);
-        let mut mutations = self.item_to_mutations_at(item, true, ts_micros)?;
+        shadow_row_key: &[u8],
+    ) -> Result<(Vec<Vec<u8>>, i64, Option<u64>), StorageError> {
+        let mut data = self.client.data();
+        let req = ReadRowsRequest {
+            table_name: self.full_table_name.clone(),
+            app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+            rows_limit: 1,
+            rows: Some(RowSet {
+                row_keys: vec![shadow_row_key.to_vec()],
+                row_ranges: vec![],
+            }),
+            filter: Some(RowFilter {
+                filter: Some(Filter::CellsPerColumnLimitFilter(1)),
+            }),
+            ..ReadRowsRequest::default()
+        };
+        let resp = data
+            .read_rows(req)
+            .await
+            .map_err(|e| map_bigtable_err("ReadRows shadow_meta", e))?;
+        let mut quals: Vec<Vec<u8>> = Vec::new();
+        let mut max_d_ts: i64 = 0;
+        let mut ver: Option<u64> = None;
+        if let Some((_, cells)) = resp.into_iter().next() {
+            for c in cells {
+                if c.family_name == FAMILY_DATA {
+                    max_d_ts = max_d_ts.max(c.timestamp_micros);
+                    if !quals.iter().any(|q| q.as_slice() == c.qualifier.as_slice()) {
+                        quals.push(c.qualifier);
+                    }
+                } else if c.family_name == FAMILY_META
+                    && c.qualifier.as_slice() == QUALIFIER_VERSION
+                    && ver.is_none()
+                {
+                    ver = decode_version(&c.value);
+                }
+            }
+        }
+        Ok((quals, max_d_ts, ver))
+    }
+
+    fn missing_version_filter() -> RowFilter {
+        RowFilter {
+            filter: Some(Filter::Chain(Chain {
+                filters: vec![
+                    RowFilter {
+                        filter: Some(Filter::FamilyNameRegexFilter(format!("^{FAMILY_META}$"))),
+                    },
+                    RowFilter {
+                        filter: Some(Filter::ColumnQualifierRegexFilter(b"^v$".to_vec())),
+                    },
+                    RowFilter {
+                        filter: Some(Filter::CellsPerColumnLimitFilter(1)),
+                    },
+                ],
+            })),
+        }
+    }
+
+    /// Version-fenced GSI shadow Put (`BUG-08`, `QuiescentGsiShadowConsistency`):
+    ///
+    /// Never uses unbounded `DeleteFromFamily("d")` or `DeleteFromRow`, and places
+    /// `SetCell` before bounded `DeleteFromColumn` so concurrent GSI `Query`/`Scan`
+    /// readers never observe a transiently empty shadow row on `cbtemulator`.
+    /// Rejects (`Ok(false)`) any delayed write whose `new_version < cur_ver`.
+    pub async fn put_shadow_versioned(
+        &self,
+        shadow_row_key: &[u8],
+        projected_item: &Item,
+        new_version: u64,
+    ) -> Result<bool, StorageError> {
+        let base_ts_micros = version_to_timestamp_micros(new_version);
+        for _ in 0..32 {
+            let (existing_quals, max_d_ts, cur_ver) =
+                self.read_shadow_row_meta(shadow_row_key).await?;
+            if let Some(cv) = cur_ver
+                && cv > new_version
+            {
+                return Ok(false);
+            }
+
+            let ts_micros = if cur_ver.is_none() && max_d_ts >= base_ts_micros {
+                next_millis_exclusive(max_d_ts)
+            } else {
+                base_ts_micros
+            };
+
+            let mut mutations =
+                Vec::with_capacity(projected_item.len() * 2 + existing_quals.len() + 2);
+            mutations.push(Mutation {
+                mutation: Some(mutation::Mutation::SetCell(SetCell {
+                    family_name: FAMILY_META.to_string(),
+                    column_qualifier: QUALIFIER_VERSION.to_vec(),
+                    timestamp_micros: ts_micros,
+                    value: new_version.to_string().into_bytes(),
+                })),
+            });
+            mutations.push(Mutation {
+                mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
+                    family_name: FAMILY_META.to_string(),
+                    column_qualifier: QUALIFIER_VERSION.to_vec(),
+                    time_range: older_than_ts_range(ts_micros),
+                })),
+            });
+
+            for (name, value) in projected_item {
+                let q = name.as_bytes().to_vec();
+                mutations.push(Mutation {
+                    mutation: Some(mutation::Mutation::SetCell(SetCell {
+                        family_name: FAMILY_DATA.to_string(),
+                        column_qualifier: q.clone(),
+                        timestamp_micros: ts_micros,
+                        value: cell::encode(value)?,
+                    })),
+                });
+                mutations.push(Mutation {
+                    mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
+                        family_name: FAMILY_DATA.to_string(),
+                        column_qualifier: q,
+                        time_range: older_than_ts_range(ts_micros),
+                    })),
+                });
+            }
+
+            let del_removed_end = next_millis_exclusive(ts_micros.max(max_d_ts));
+            for old_q in existing_quals {
+                let retained = std::str::from_utf8(&old_q)
+                    .ok()
+                    .is_some_and(|k| projected_item.contains_key(k));
+                if !retained {
+                    mutations.push(Mutation {
+                        mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
+                            family_name: FAMILY_DATA.to_string(),
+                            column_qualifier: old_q,
+                            time_range: older_than_ts_range(del_removed_end),
+                        })),
+                    });
+                }
+            }
+
+            let req = match cur_ver {
+                Some(cv) => CheckAndMutateRowRequest {
+                    table_name: self.full_table_name.clone(),
+                    app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+                    row_key: shadow_row_key.to_vec(),
+                    predicate_filter: Some(build_version_match_filter(cv)),
+                    true_mutations: mutations,
+                    false_mutations: vec![],
+                    ..CheckAndMutateRowRequest::default()
+                },
+                None => CheckAndMutateRowRequest {
+                    table_name: self.full_table_name.clone(),
+                    app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+                    row_key: shadow_row_key.to_vec(),
+                    predicate_filter: Some(Self::missing_version_filter()),
+                    true_mutations: vec![],
+                    false_mutations: mutations,
+                    ..CheckAndMutateRowRequest::default()
+                },
+            };
+
+            let mut data = self.client.data();
+            let resp = data
+                .check_and_mutate_row(req)
+                .await
+                .map_err(|e| map_bigtable_err("CheckAndMutateRow put_shadow_versioned", e))?;
+            let applied = if cur_ver.is_some() {
+                resp.predicate_matched
+            } else {
+                !resp.predicate_matched
+            };
+            if applied {
+                return Ok(true);
+            }
+        }
+        Err(StorageError::Transient(
+            "GSI shadow versioned put CAS contention exhausted".to_string(),
+        ))
+    }
+
+    /// Version-fenced GSI shadow Delete (`BUG-08`, `QuiescentGsiShadowConsistency`):
+    ///
+    /// Never uses unbounded `DeleteFromFamily("d")` or `DeleteFromRow`. Advances
+    /// shadow `m:v` to `new_version` while clearing `d:*` cells bounded by
+    /// `[0, next_millis_exclusive(...))` under a `CheckAndMutateRow` guard on `cur_ver`,
+    /// rejecting (`Ok(false)`) any delayed delete whose `new_version < cur_ver`.
+    pub async fn delete_shadow_versioned(
+        &self,
+        shadow_row_key: &[u8],
+        new_version: u64,
+    ) -> Result<bool, StorageError> {
+        let ts_micros = version_to_timestamp_micros(new_version);
+        for _ in 0..32 {
+            let (existing_quals, max_d_ts, cur_ver) =
+                self.read_shadow_row_meta(shadow_row_key).await?;
+            if let Some(cv) = cur_ver
+                && cv > new_version
+            {
+                return Ok(false);
+            }
+            if existing_quals.is_empty() && cur_ver == Some(new_version) {
+                return Ok(true);
+            }
+
+            let mut mutations = Vec::with_capacity(existing_quals.len() + 2);
+            mutations.push(Mutation {
+                mutation: Some(mutation::Mutation::SetCell(SetCell {
+                    family_name: FAMILY_META.to_string(),
+                    column_qualifier: QUALIFIER_VERSION.to_vec(),
+                    timestamp_micros: ts_micros,
+                    value: new_version.to_string().into_bytes(),
+                })),
+            });
+            mutations.push(Mutation {
+                mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
+                    family_name: FAMILY_META.to_string(),
+                    column_qualifier: QUALIFIER_VERSION.to_vec(),
+                    time_range: older_than_ts_range(ts_micros),
+                })),
+            });
+            let end_ts = if cur_ver.is_none() && max_d_ts > 0 {
+                next_millis_exclusive(ts_micros.max(max_d_ts))
+            } else {
+                next_millis_exclusive(ts_micros)
+            };
+            for q in existing_quals {
+                mutations.push(Mutation {
+                    mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
+                        family_name: FAMILY_DATA.to_string(),
+                        column_qualifier: q,
+                        time_range: older_than_ts_range(end_ts),
+                    })),
+                });
+            }
+
+            let req = match cur_ver {
+                Some(cv) => CheckAndMutateRowRequest {
+                    table_name: self.full_table_name.clone(),
+                    app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+                    row_key: shadow_row_key.to_vec(),
+                    predicate_filter: Some(build_version_match_filter(cv)),
+                    true_mutations: mutations,
+                    false_mutations: vec![],
+                    ..CheckAndMutateRowRequest::default()
+                },
+                None => CheckAndMutateRowRequest {
+                    table_name: self.full_table_name.clone(),
+                    app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+                    row_key: shadow_row_key.to_vec(),
+                    predicate_filter: Some(Self::missing_version_filter()),
+                    true_mutations: vec![],
+                    false_mutations: mutations,
+                    ..CheckAndMutateRowRequest::default()
+                },
+            };
+
+            let mut data = self.client.data();
+            let resp = data
+                .check_and_mutate_row(req)
+                .await
+                .map_err(|e| map_bigtable_err("CheckAndMutateRow delete_shadow_versioned", e))?;
+            let applied = if cur_ver.is_some() {
+                resp.predicate_matched
+            } else {
+                !resp.predicate_matched
+            };
+            if applied {
+                return Ok(true);
+            }
+        }
+        Err(StorageError::Transient(
+            "GSI shadow versioned delete CAS contention exhausted".to_string(),
+        ))
+    }
+
+    /// Reconciler-safe cleanup of an orphaned GSI shadow row (`BUG-08`):
+    /// clears observed `d:*` qualifiers via millisecond-aligned bounded
+    /// `DeleteFromColumn` only if the shadow row's `m:v` state has not changed
+    /// since inspection, so a concurrent live write arriving on the same shadow
+    /// row is never clobbered.
+    pub async fn delete_shadow_orphan_if_unchanged(
+        &self,
+        shadow_row_key: &[u8],
+    ) -> Result<bool, StorageError> {
+        let (existing_quals, max_d_ts, cur_ver) = self.read_shadow_row_meta(shadow_row_key).await?;
+        if existing_quals.is_empty() {
+            return Ok(false);
+        }
+        let next_ver = next_occ_version(cur_ver);
+        let ts_micros = version_to_timestamp_micros(next_ver);
+        let del_end = next_millis_exclusive(ts_micros.max(max_d_ts));
+
+        let mut mutations = Vec::with_capacity(existing_quals.len() + 2);
+        mutations.push(Mutation {
+            mutation: Some(mutation::Mutation::SetCell(SetCell {
+                family_name: FAMILY_META.to_string(),
+                column_qualifier: QUALIFIER_VERSION.to_vec(),
+                timestamp_micros: ts_micros,
+                value: next_ver.to_string().into_bytes(),
+            })),
+        });
         mutations.push(Mutation {
             mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
                 family_name: FAMILY_META.to_string(),
@@ -766,63 +1066,50 @@ impl<'a> ItemOps<'a> {
                 time_range: older_than_ts_range(ts_micros),
             })),
         });
-        mutations.push(Mutation {
-            mutation: Some(mutation::Mutation::SetCell(SetCell {
-                family_name: FAMILY_META.to_string(),
-                column_qualifier: QUALIFIER_VERSION.to_vec(),
-                timestamp_micros: ts_micros,
-                value: version.to_string().into_bytes(),
-            })),
-        });
-        let mut data = self.client.data();
-        let req = MutateRowRequest {
-            table_name: self.full_table_name.clone(),
-            app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
-            row_key,
-            mutations,
-            ..MutateRowRequest::default()
+        for q in existing_quals {
+            mutations.push(Mutation {
+                mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
+                    family_name: FAMILY_DATA.to_string(),
+                    column_qualifier: q,
+                    time_range: older_than_ts_range(del_end),
+                })),
+            });
+        }
+
+        let req = match cur_ver {
+            Some(cv) => CheckAndMutateRowRequest {
+                table_name: self.full_table_name.clone(),
+                app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+                row_key: shadow_row_key.to_vec(),
+                predicate_filter: Some(build_version_match_filter(cv)),
+                true_mutations: mutations,
+                false_mutations: vec![],
+                ..CheckAndMutateRowRequest::default()
+            },
+            None => CheckAndMutateRowRequest {
+                table_name: self.full_table_name.clone(),
+                app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+                row_key: shadow_row_key.to_vec(),
+                predicate_filter: Some(Self::missing_version_filter()),
+                true_mutations: vec![],
+                false_mutations: mutations,
+                ..CheckAndMutateRowRequest::default()
+            },
         };
-        data.mutate_row(req)
+
+        let mut data = self.client.data();
+        let resp = data
+            .check_and_mutate_row(req)
             .await
-            .map_err(|e| map_bigtable_err("MutateRow put_unconditional", e))?;
-        Ok(version)
+            .map_err(|e| map_bigtable_err("CheckAndMutateRow delete_shadow_orphan", e))?;
+        Ok(if cur_ver.is_some() {
+            resp.predicate_matched
+        } else {
+            !resp.predicate_matched
+        })
     }
 
-    /// Delete a row by key, removing data and `m:v`. No condition check, no lock check.
-    pub async fn delete_unconditional(
-        &self,
-        key_info: &TableKeyInfo,
-        key: &Item,
-    ) -> Result<(), StorageError> {
-        let row_key = row_key::encode_key(key, &key_info.key_schema)?;
-        let mut data = self.client.data();
-        let req = MutateRowRequest {
-            table_name: self.full_table_name.clone(),
-            app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
-            row_key,
-            mutations: vec![
-                Mutation {
-                    mutation: Some(mutation::Mutation::DeleteFromFamily(DeleteFromFamily {
-                        family_name: FAMILY_DATA.to_string(),
-                    })),
-                },
-                Mutation {
-                    mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
-                        family_name: FAMILY_META.to_string(),
-                        column_qualifier: QUALIFIER_VERSION.to_vec(),
-                        time_range: None,
-                    })),
-                },
-            ],
-            ..MutateRowRequest::default()
-        };
-        data.mutate_row(req)
-            .await
-            .map_err(|e| map_bigtable_err("MutateRow delete_unconditional", e))?;
-        Ok(())
-    }
-
-    /// Apply a list of mutations (`SetCell` / `DeleteFromColumn` / `DeleteFromRow`) to a row by key.
+    /// Apply a list of mutations to a row by raw encoded key.
     pub async fn mutate_cells(
         &self,
         row_key_bytes: Vec<u8>,
@@ -876,15 +1163,6 @@ impl<'a> ItemOps<'a> {
         }
         Ok(mutations)
     }
-
-    /// Turn an `Item` map into BigTable `Mutation`s stamped at `monotonic_timestamp_micros()`.
-    pub fn item_to_mutations(
-        &self,
-        item: &Item,
-        delete_row_first: bool,
-    ) -> Result<Vec<Mutation>, StorageError> {
-        self.item_to_mutations_at(item, delete_row_first, monotonic_timestamp_micros())
-    }
 }
 
 /// Apply `UpdateAction`s with full vector-index and attribute-definition validation.
@@ -904,19 +1182,6 @@ pub fn apply_update_actions_validated(
         attr_defs,
     )
     .map_err(|e| StorageError::Validation(format!("update expression evaluation: {e}")))?;
-    Ok(new_item)
-}
-
-/// Apply `UpdateAction`s to an existing item (or key seed if absent). Returns the
-/// new image. Used by `UpdateItem`.
-pub fn apply_update_actions(
-    existing: &Item,
-    actions: &[UpdateAction],
-    maps: &ExpressionMaps,
-) -> Result<Item, StorageError> {
-    let mut new_item = existing.clone();
-    apply_update_validated(actions, &mut new_item, maps, &[], &[])
-        .map_err(|e| StorageError::Validation(format!("update expression evaluation: {e}")))?;
     Ok(new_item)
 }
 
@@ -964,13 +1229,21 @@ mod tests {
         assert!(v1 > 0);
         let ts1 = version_to_timestamp_micros(v1);
         assert_eq!(ts1 % 1_000, 0, "timestamp must be millisecond-aligned");
+        assert_eq!(next_millis_exclusive(ts1), ts1 + 1_000);
+        assert_eq!(next_millis_exclusive(ts1) % 1_000, 0);
+        assert_eq!(next_millis_exclusive(1_500), 2_000);
+        assert_eq!(
+            older_than_ts_range(next_millis_exclusive(5_000))
+                .unwrap()
+                .end_timestamp_micros,
+            6_000
+        );
 
-        // Rapid sub-millisecond updates strictly advance both version and timestamp.
         let v2 = next_occ_version(Some(v1));
         let v3 = next_occ_version(Some(v2));
         assert!(v2 > v1);
         assert!(v3 > v2);
-        assert!(version_to_timestamp_micros(v2) > ts1);
+        assert!(version_to_timestamp_micros(v2) >= next_millis_exclusive(ts1));
         assert!(version_to_timestamp_micros(v3) > version_to_timestamp_micros(v2));
         assert_eq!(version_to_timestamp_micros(v2) % 1_000, 0);
         assert_eq!(version_to_timestamp_micros(v3) % 1_000, 0);
@@ -989,45 +1262,30 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_builders() {
-        let intent_filter = build_active_intent_filter(1000);
-        assert!(intent_filter.filter.is_some());
+    fn test_filter_builders_have_no_wall_clock_intent_cutoff() {
+        let intent_filter = build_active_intent_filter();
+        if let Some(Filter::Chain(chain)) = intent_filter.filter {
+            assert!(
+                !chain
+                    .filters
+                    .iter()
+                    .any(|f| matches!(f.filter, Some(Filter::TimestampRangeFilter(_)))),
+                "intent filter must NOT drop older intents via wall-clock TimestampRangeFilter"
+            );
+        } else {
+            panic!("expected Chain filter");
+        }
 
-        let version_filter = build_version_match_filter(42);
-        assert!(version_filter.filter.is_some());
-
-        let mismatch_filter = build_version_mismatch_filter(42);
-        assert!(mismatch_filter.filter.is_some());
-
-        let occ_conflict_filter = build_occ_conflict_filter(1000, 42);
+        let occ_conflict_filter = build_occ_conflict_filter(42);
         if let Some(Filter::Interleave(interleave)) = occ_conflict_filter.filter {
             assert_eq!(interleave.filters.len(), 2);
-            if let Some(Filter::Condition(cond)) = &interleave.filters[1].filter {
-                assert!(matches!(
-                    cond.true_filter.as_ref().and_then(|f| f.filter.as_ref()),
-                    Some(Filter::BlockAllFilter(true))
-                ));
-                assert!(matches!(
-                    cond.false_filter.as_ref().and_then(|f| f.filter.as_ref()),
-                    Some(Filter::PassAllFilter(true))
-                ));
-            } else {
-                panic!("expected Condition filter in second branch");
-            }
         } else {
             panic!("expected Interleave filter");
         }
 
-        let conflict_filter = build_row_presence_conflict_filter(1000);
-        assert!(conflict_filter.filter.is_some());
-
-        let unversioned_existing = select_occ_predicate(1000, None, true);
+        let unversioned_existing = select_occ_predicate(None, true);
         if let Some(Filter::Interleave(interleave)) = unversioned_existing.filter {
             assert_eq!(interleave.filters.len(), 3);
-            assert!(matches!(
-                interleave.filters[2].filter,
-                Some(Filter::Condition(_))
-            ));
         } else {
             panic!("expected 3-branch Interleave for unversioned existing row");
         }

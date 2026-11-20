@@ -98,6 +98,13 @@ pub fn shadow_table_id(base_data_table: &str, index_name: &str) -> String {
     format!("{base_data_table}_g{:08x}", (h & 0xFFFF_FFFF) as u32)
 }
 
+/// Returns `true` when `table_id_short` names a GSI shadow table (`<base>_g<8hex>`)
+/// rather than a base data table (`t<16hex>`).
+#[must_use]
+pub fn is_shadow_table_id(table_id_short: &str) -> bool {
+    table_id_short.contains("_g")
+}
+
 fn tag_bytes_for(av: &AttributeValue) -> Result<(u8, Vec<u8>), StorageError> {
     row_key::sk_tag_and_bytes(av)
 }
@@ -376,7 +383,6 @@ mod tests {
 
     #[test]
     fn test_gsi_sk_sort_order_no_inversion() {
-        // Test "A" vs "AB" sort ordering (maintainer B3 issue)
         let base_ks = vec![ks("pk", KeyType::Hash)];
         let gsi_ks = vec![ks("gsi_pk", KeyType::Hash), ks("gsi_sk", KeyType::Range)];
 
@@ -404,7 +410,6 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        // "A" MUST sort before "AB", and "AB" before "B"
         assert!(
             key_a < key_ab,
             "sort inversion: 'A' should sort before 'AB'"
@@ -505,7 +510,6 @@ mod tests {
 
     #[test]
     fn test_shadow_row_key_unambiguous_boundaries() {
-        // Distinct (gsi_sk, base_pk) pairs must NEVER produce the same shadow row key
         let base_ks = vec![ks("pk", KeyType::Hash)];
         let gsi_ks = vec![ks("gsi_pk", KeyType::Hash), ks("gsi_sk", KeyType::Range)];
 

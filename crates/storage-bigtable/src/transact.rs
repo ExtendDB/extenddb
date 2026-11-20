@@ -3,16 +3,11 @@
 
 //! Coordinator-row 2PC for `TransactWriteItems` and fenced single-item stream writes.
 //!
-//! State machine (per coordinator entry):
-//!   PENDING   — coordinator row exists; intents are being placed.
-//!   COMMITTED — every condition passed and every intent landed; commit point.
-//!   CLEANED   — every mutation and stream record has been applied and intents cleared.
-//!
-//! Per-row intent markers live in column family `m` under qualifier
-//! `intent:<txn_id>`. When a writer wants to fence a row, it places its intent
-//! via `CheckAndMutateRow` with a predicate that succeeds only when no other
-//! unexpired intent exists — guaranteeing at most one in-flight coordinator
-//! entry per row at a time.
+//! State machine (per coordinator entry in `__extenddb_txn_log__`):
+//!   PENDING   — coordinator row exists (`t:started_at`); intents are being placed.
+//!   ABORTED   — coordinator was CAS-aborted (`PENDING -> ABORTED`) before intent cleanup.
+//!   COMMITTED — every condition passed and `PENDING -> COMMITTED` CAS succeeded; commit point.
+//!   CLEANED   — every mutation, GSI shadow, TTL delta, stream record, and `idem:` entry applied.
 
 use std::time::Duration;
 
@@ -26,7 +21,7 @@ use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::row_filter::{
 };
 use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::{
     CheckAndMutateRowRequest, MutateRowRequest, Mutation, ReadRowsRequest, RowFilter, RowSet,
-    TimestampRange, mutation,
+    mutation,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -36,7 +31,7 @@ use crate::data::client::{
     monotonic_timestamp_micros,
 };
 use crate::data::item_ops::{
-    FAMILY_DATA, QUALIFIER_VERSION, build_version_match_filter, now_millis_micros,
+    FAMILY_DATA, QUALIFIER_VERSION, build_version_match_filter, next_millis_exclusive,
     older_than_ts_range, version_to_timestamp_micros,
 };
 
@@ -45,16 +40,23 @@ pub const TXN_FAMILY: &str = "t";
 pub const INTENT_FAMILY: &str = "m";
 pub const INTENT_QUALIFIER_PREFIX: &str = "intent:";
 
+/// Coordinator ID prefix identifying single-item stream-fenced writes (`BUG-12`)
+/// so concurrent single-item writers serialize/retry rather than raising
+/// `TransactionConflictException`.
+pub const SINGLE_TXN_PREFIX: &str = "sgl-";
+
 const STATE_PENDING: &[u8] = b"PENDING";
 const STATE_COMMITTED: &[u8] = b"COMMITTED";
 const STATE_CLEANED: &[u8] = b"CLEANED";
 const STATE_ABORTED: &[u8] = b"ABORTED";
 
 /// Target row for a 2PC participant or GSI shadow mutation.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Derives canonical `(data_table, row_key)` ordering to prevent 2PC lock-order
+/// deadlocks (`BUG-11`).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ParticipantRow {
-    pub data_table: String, // BigTable table id
-    pub row_key: Vec<u8>,   // encoded composite key
+    pub data_table: String,
+    pub row_key: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -81,9 +83,42 @@ pub struct TxnStreamRecord {
     #[serde(default)]
     pub shard_id: String,
     pub record: extenddb_core::types::StreamRecord,
+    /// Base-table participant that generated this stream event (`BUG-05`), so
+    /// `roll_forward` suppresses phantom stream records when a stale coordinator
+    /// was superseded by a newer write.
+    #[serde(default)]
+    pub participant: Option<ParticipantRow>,
+    /// Optional explicit deduplication key (`<txn_id>:<op_idx>`) supplementing
+    /// `record.event_id` across crash recovery replays (`BUG-04`).
+    #[serde(default)]
+    pub dedup_key: Option<String>,
 }
 
-#[derive(Debug)]
+/// Logged `__extenddb_ttl_index__` transition persisted at `COMMITTED` (`BUG-06`)
+/// so crash recovery (`roll_forward`) maintains TTL index completeness.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TxnTtlMutation {
+    pub participant: ParticipantRow,
+    pub account_id: String,
+    pub table_name: String,
+    #[serde(default)]
+    pub old_expiry: Option<i64>,
+    #[serde(default)]
+    pub new_expiry: Option<i64>,
+    pub new_version: u64,
+}
+
+/// `ClientRequestToken` metadata persisted in `t:token_meta` from `open_with_token`
+/// onward (`BUG-07`) so concurrent callers and `sweeper` enforce fingerprint
+/// validation and persist `idem:<account_id>:<token>` before dropping `txn:<id>`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TxnTokenMeta {
+    pub account_id: String,
+    pub token: String,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct TxnState {
     pub state: String,
     pub state_ts_micros: i64,
@@ -91,6 +126,8 @@ pub struct TxnState {
     pub participants: Option<Vec<ParticipantRow>>,
     pub mutations: Option<Vec<ParticipantMutation>>,
     pub stream_records: Option<Vec<TxnStreamRecord>>,
+    pub ttl_mutations: Option<Vec<TxnTtlMutation>>,
+    pub token_meta: Option<TxnTokenMeta>,
 }
 
 #[derive(Clone, Copy)]
@@ -107,11 +144,29 @@ impl<'a> TxnCoordinator<'a> {
         }
     }
 
-    /// New txn id — `txn-<uuid-no-dashes>`.
+    #[must_use]
+    pub fn intent_max_age(&self) -> Duration {
+        self.intent_max_age
+    }
+
+    /// New multi-item 2PC txn id — `txn-<uuid-no-dashes>`.
+    #[must_use]
     pub fn new_txn_id() -> String {
         format!("txn-{}", Uuid::new_v4().simple())
     }
 
+    /// New single-item stream-fenced txn id — `sgl-<uuid-no-dashes>` (`BUG-12`).
+    #[must_use]
+    pub fn new_single_txn_id() -> String {
+        format!("{SINGLE_TXN_PREFIX}{}", Uuid::new_v4().simple())
+    }
+
+    #[must_use]
+    pub fn is_single_item_txn(txn_id: &str) -> bool {
+        txn_id.starts_with(SINGLE_TXN_PREFIX)
+    }
+
+    #[must_use]
     pub fn coordinator_row_key(txn_id: &str) -> String {
         format!("txn:{txn_id}")
     }
@@ -129,14 +184,55 @@ impl<'a> TxnCoordinator<'a> {
         txn_id: &str,
         participants: &[ParticipantRow],
     ) -> Result<(bool, i64), StorageError> {
+        self.open_with_token(txn_id, participants, None).await
+    }
+
+    /// Atomically open a `PENDING` coordinator row with optional `TxnTokenMeta`
+    /// (`BUG-07a`, `BUG-07b`).
+    pub async fn open_with_token(
+        &self,
+        txn_id: &str,
+        participants: &[ParticipantRow],
+        token_meta: Option<&TxnTokenMeta>,
+    ) -> Result<(bool, i64), StorageError> {
         let mut data = self.client.data();
         let now_micros = monotonic_timestamp_micros();
         let serialized = serde_json::to_vec(participants)
             .map_err(|e| StorageError::Internal(format!("serialize participants: {e}")))?;
 
         let predicate = RowFilter {
-            filter: Some(Filter::FamilyNameRegexFilter(format!("^{TXN_FAMILY}$"))),
+            filter: Some(Filter::Chain(Chain {
+                filters: vec![
+                    RowFilter {
+                        filter: Some(Filter::FamilyNameRegexFilter(format!("^{TXN_FAMILY}$"))),
+                    },
+                    RowFilter {
+                        filter: Some(Filter::CellsPerColumnLimitFilter(1)),
+                    },
+                ],
+            })),
         };
+
+        let mut false_mutations = vec![
+            Self::set_cell_at(TXN_FAMILY, b"state", STATE_PENDING.to_vec(), now_micros),
+            Self::set_cell_at(
+                TXN_FAMILY,
+                b"started_at",
+                now_micros.to_string().into_bytes(),
+                now_micros,
+            ),
+            Self::set_cell_at(TXN_FAMILY, b"participants", serialized, now_micros),
+        ];
+        if let Some(meta) = token_meta {
+            let meta_bytes = serde_json::to_vec(meta)
+                .map_err(|e| StorageError::Internal(format!("serialize token_meta: {e}")))?;
+            false_mutations.push(Self::set_cell_at(
+                TXN_FAMILY,
+                b"token_meta",
+                meta_bytes,
+                now_micros,
+            ));
+        }
 
         let req = CheckAndMutateRowRequest {
             table_name: self.client.full_table_name(TXN_LOG_TABLE),
@@ -144,16 +240,7 @@ impl<'a> TxnCoordinator<'a> {
             row_key: Self::coordinator_row_key(txn_id).into_bytes(),
             predicate_filter: Some(predicate),
             true_mutations: vec![],
-            false_mutations: vec![
-                Self::set_cell_at(TXN_FAMILY, b"state", STATE_PENDING.to_vec(), now_micros),
-                Self::set_cell_at(
-                    TXN_FAMILY,
-                    b"started_at",
-                    now_micros.to_string().into_bytes(),
-                    now_micros,
-                ),
-                Self::set_cell_at(TXN_FAMILY, b"participants", serialized, now_micros),
-            ],
+            false_mutations,
             ..CheckAndMutateRowRequest::default()
         };
 
@@ -167,29 +254,48 @@ impl<'a> TxnCoordinator<'a> {
 
     /// Read the latest coordinator state from `__extenddb_txn_log__`.
     ///
-    /// Chains `FamilyNameRegexFilter("^t$")` with `CellsPerColumnLimitFilter(1)`
-    /// because Bigtable's `MaxNumVersions(1)` GC rule is applied lazily during
-    /// compaction; without `CellsPerColumnLimitFilter(1)` a `ReadRows` response
-    /// returns `[COMMITTED, PENDING]` in descending timestamp order.
+    /// Never emits `DeleteFromColumn` on `t:state` during transitions (`BUG-02`),
+    /// retries transient gRPC glitches, and treats a row lacking `t:state` as
+    /// `Ok(None)` so concurrent cleanup never triggers `StorageError::Internal` HTTP 500s.
     pub async fn get_state(&self, txn_id: &str) -> Result<Option<TxnState>, StorageError> {
-        let mut data = self.client.data();
-        let req = ReadRowsRequest {
-            table_name: self.client.full_table_name(TXN_LOG_TABLE),
-            app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
-            rows_limit: 1,
-            rows: Some(RowSet {
-                row_keys: vec![Self::coordinator_row_key(txn_id).into_bytes()],
-                row_ranges: vec![],
-            }),
-            filter: Some(build_txn_log_latest_filter()),
-            ..ReadRowsRequest::default()
+        let mut last_err: Option<StorageError> = None;
+        let mut resp_opt = None;
+        for attempt in 0..4u8 {
+            let mut data = self.client.data();
+            let req = ReadRowsRequest {
+                table_name: self.client.full_table_name(TXN_LOG_TABLE),
+                app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+                rows_limit: 1,
+                rows: Some(RowSet {
+                    row_keys: vec![Self::coordinator_row_key(txn_id).into_bytes()],
+                    row_ranges: vec![],
+                }),
+                filter: Some(build_txn_log_latest_filter()),
+                ..ReadRowsRequest::default()
+            };
+            match data
+                .read_rows(req)
+                .await
+                .map_err(|e| map_bigtable_err("ReadRows get_state", e))
+            {
+                Ok(r) => {
+                    resp_opt = Some(r);
+                    break;
+                }
+                Err(e @ (StorageError::Transient(_) | StorageError::Connection(_)))
+                    if attempt < 3 =>
+                {
+                    last_err = Some(e);
+                    tokio::time::sleep(Duration::from_millis(5 * u64::from(attempt + 1))).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let resp = match resp_opt {
+            Some(r) => r,
+            None => return Err(last_err.unwrap()),
         };
-        let resp = data
-            .read_rows(req)
-            .await
-            .map_err(|e| map_bigtable_err("ReadRows get_state", e))?;
-        let mut iter = resp.into_iter();
-        let Some((_, cells)) = iter.next() else {
+        let Some((_, cells)) = resp.into_iter().next() else {
             return Ok(None);
         };
 
@@ -199,6 +305,8 @@ impl<'a> TxnCoordinator<'a> {
         let mut participants: Option<Vec<ParticipantRow>> = None;
         let mut mutations: Option<Vec<ParticipantMutation>> = None;
         let mut stream_records: Option<Vec<TxnStreamRecord>> = None;
+        let mut ttl_mutations: Option<Vec<TxnTtlMutation>> = None;
+        let mut token_meta: Option<TxnTokenMeta> = None;
 
         for cell in cells {
             if cell.family_name == TXN_FAMILY {
@@ -221,13 +329,19 @@ impl<'a> TxnCoordinator<'a> {
                     b"stream_records" if stream_records.is_none() => {
                         stream_records = serde_json::from_slice(&cell.value).ok();
                     }
+                    b"ttl_mutations" if ttl_mutations.is_none() => {
+                        ttl_mutations = serde_json::from_slice(&cell.value).ok();
+                    }
+                    b"token_meta" if token_meta.is_none() => {
+                        token_meta = serde_json::from_slice(&cell.value).ok();
+                    }
                     _ => {}
                 }
             }
         }
 
         let Some(st) = state else {
-            return Err(StorageError::Internal("missing state in txn log".into()));
+            return Ok(None);
         };
 
         Ok(Some(TxnState {
@@ -237,11 +351,46 @@ impl<'a> TxnCoordinator<'a> {
             participants,
             mutations,
             stream_records,
+            ttl_mutations,
+            token_meta,
         }))
     }
 
-    /// Place an intent marker on a participant row. Returns `Ok(true)` if the
-    /// intent landed; `Ok(false)` if an unexpired conflicting intent holds the row.
+    /// Single-RPC attempt to place `m:intent:<txn_id>` if and only if NO
+    /// physical `m:intent:*` cell currently exists on `participant` (`BUG-03`).
+    pub async fn place_intent_once(
+        &self,
+        txn_id: &str,
+        participant: &ParticipantRow,
+    ) -> Result<bool, StorageError> {
+        let mut data = self.client.data();
+        let qualifier = Self::intent_qualifier(txn_id);
+        let write_ts = monotonic_timestamp_micros();
+        let predicate = build_intent_presence_filter();
+
+        let req = CheckAndMutateRowRequest {
+            table_name: self.client.full_table_name(&participant.data_table),
+            app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+            row_key: participant.row_key.clone(),
+            predicate_filter: Some(predicate),
+            true_mutations: vec![],
+            false_mutations: vec![Self::set_cell_at(
+                INTENT_FAMILY,
+                &qualifier,
+                txn_id.as_bytes().to_vec(),
+                write_ts,
+            )],
+            ..CheckAndMutateRowRequest::default()
+        };
+        let resp = data
+            .check_and_mutate_row(req)
+            .await
+            .map_err(|e| map_bigtable_err("place_intent", e))?;
+
+        Ok(!resp.predicate_matched)
+    }
+
+    /// Place an intent marker on a participant row with short jittered retries.
     pub async fn place_intent(
         &self,
         txn_id: &str,
@@ -252,50 +401,90 @@ impl<'a> TxnCoordinator<'a> {
         let mut delay = Duration::from_millis(10);
 
         loop {
-            let mut data = self.client.data();
-            let qualifier = Self::intent_qualifier(txn_id);
-            let write_ts = monotonic_timestamp_micros();
-            let cutoff = now_millis_micros().saturating_sub(self.intent_max_age.as_micros() as i64);
-            let predicate = build_intent_presence_filter(cutoff);
-
-            let req = CheckAndMutateRowRequest {
-                table_name: self.client.full_table_name(&participant.data_table),
-                app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
-                row_key: participant.row_key.clone(),
-                predicate_filter: Some(predicate),
-                true_mutations: vec![],
-                false_mutations: vec![Self::set_cell_at(
-                    INTENT_FAMILY,
-                    &qualifier,
-                    txn_id.as_bytes().to_vec(),
-                    write_ts,
-                )],
-                ..CheckAndMutateRowRequest::default()
-            };
-            let resp = data
-                .check_and_mutate_row(req)
-                .await
-                .map_err(|e| map_bigtable_err("place_intent", e))?;
-
-            if !resp.predicate_matched {
+            if self.place_intent_once(txn_id, participant).await? {
                 return Ok(true);
             }
-
             attempts += 1;
             if attempts >= max_attempts {
                 return Ok(false);
             }
-
             let jitter = rand::random_range(0..delay.as_millis() as u64);
-            let sleep_duration = delay + Duration::from_millis(jitter);
-            tokio::time::sleep(sleep_duration).await;
+            tokio::time::sleep(delay + Duration::from_millis(jitter)).await;
             delay *= 2;
         }
     }
 
-    /// Move the coordinator row to `COMMITTED` — the atomic commit point.
-    /// Guarantees `commit_ts > started_at_micros` across any node clock skew and
-    /// returns `commit_ts` so subsequent `CLEANED` transitions strictly dominate it.
+    /// Atomically transition `(t:state == "PENDING" && t:started_at == started_at_micros)`
+    /// to `"COMMITTED"` (`BUG-01`, `BUG-02`, `BUG-06`).
+    ///
+    /// Returns `Ok(Some(commit_ts_micros))` if committed, or `Ok(None)` if the
+    /// coordinator incarnation was already aborted/swept (`AllOrNothing2PCAtomicity`).
+    pub async fn try_commit_full(
+        &self,
+        txn_id: &str,
+        started_at_micros: i64,
+        mutations: &[ParticipantMutation],
+        stream_records: Option<&[TxnStreamRecord]>,
+        ttl_mutations: Option<&[TxnTtlMutation]>,
+    ) -> Result<Option<i64>, StorageError> {
+        let ts_micros = monotonic_timestamp_after_micros(started_at_micros);
+        let serialized_muts = serde_json::to_vec(mutations)
+            .map_err(|e| StorageError::Internal(format!("serialize mutations: {e}")))?;
+
+        let mut true_mutations = vec![
+            Self::set_cell_at(TXN_FAMILY, b"state", STATE_COMMITTED.to_vec(), ts_micros),
+            Self::set_cell_at(TXN_FAMILY, b"mutations", serialized_muts, ts_micros),
+        ];
+
+        if let Some(records) = stream_records
+            && !records.is_empty()
+        {
+            let serialized = serde_json::to_vec(records)
+                .map_err(|e| StorageError::Internal(format!("serialize stream records: {e}")))?;
+            true_mutations.push(Self::set_cell_at(
+                TXN_FAMILY,
+                b"stream_records",
+                serialized,
+                ts_micros,
+            ));
+        }
+
+        if let Some(ttls) = ttl_mutations
+            && !ttls.is_empty()
+        {
+            let serialized = serde_json::to_vec(ttls)
+                .map_err(|e| StorageError::Internal(format!("serialize ttl mutations: {e}")))?;
+            true_mutations.push(Self::set_cell_at(
+                TXN_FAMILY,
+                b"ttl_mutations",
+                serialized,
+                ts_micros,
+            ));
+        }
+
+        let mut data = self.client.data();
+        let req = CheckAndMutateRowRequest {
+            table_name: self.client.full_table_name(TXN_LOG_TABLE),
+            app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+            row_key: Self::coordinator_row_key(txn_id).into_bytes(),
+            predicate_filter: Some(build_pending_incarnation_predicate(started_at_micros)),
+            true_mutations,
+            false_mutations: vec![],
+            ..CheckAndMutateRowRequest::default()
+        };
+        let resp = data
+            .check_and_mutate_row(req)
+            .await
+            .map_err(|e| map_bigtable_err("txn try_commit_full", e))?;
+        if resp.predicate_matched {
+            Ok(Some(ts_micros))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// CAS-guarded `commit` convenience wrapper returning `TransactionConflict`
+    /// if the `PENDING` incarnation was already aborted or dropped (`BUG-01`).
     pub async fn commit(
         &self,
         txn_id: &str,
@@ -303,76 +492,74 @@ impl<'a> TxnCoordinator<'a> {
         mutations: &[ParticipantMutation],
         stream_records: Option<&[TxnStreamRecord]>,
     ) -> Result<i64, StorageError> {
-        let ts_micros = monotonic_timestamp_after_micros(started_at_micros);
-        let mut txn_mutations = vec![
-            Mutation {
-                mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
-                    family_name: TXN_FAMILY.to_string(),
-                    column_qualifier: b"state".to_vec(),
-                    time_range: older_than_ts_range(ts_micros),
-                })),
-            },
-            Self::set_cell_at(TXN_FAMILY, b"state", STATE_COMMITTED.to_vec(), ts_micros),
-        ];
+        self.try_commit_full(txn_id, started_at_micros, mutations, stream_records, None)
+            .await?
+            .ok_or_else(|| {
+                StorageError::TransactionConflict(
+                    "coordinator row is no longer PENDING (rolled back by sweeper)".into(),
+                )
+            })
+    }
 
-        let serialized_muts = serde_json::to_vec(mutations)
-            .map_err(|e| StorageError::Internal(format!("serialize mutations: {e}")))?;
-        txn_mutations.push(Self::set_cell_at(
-            TXN_FAMILY,
-            b"mutations",
-            serialized_muts,
-            ts_micros,
-        ));
-
-        if let Some(records) = stream_records {
-            let serialized = serde_json::to_vec(records)
-                .map_err(|e| StorageError::Internal(format!("serialize stream records: {e}")))?;
-            txn_mutations.push(Self::set_cell_at(
-                TXN_FAMILY,
-                b"stream_records",
-                serialized,
-                ts_micros,
-            ));
-        }
+    /// Atomically CAS `(t:state == "PENDING" && t:started_at == started_at_micros)`
+    /// to `"ABORTED"` BEFORE clearing any participant intent (`BUG-01`).
+    pub async fn try_abort_pending(
+        &self,
+        txn_id: &str,
+        started_at_micros: i64,
+        after_ts_micros: i64,
+    ) -> Result<bool, StorageError> {
         let mut data = self.client.data();
-        let req = MutateRowRequest {
+        let ts_micros = monotonic_timestamp_after_micros(after_ts_micros.max(started_at_micros));
+        let req = CheckAndMutateRowRequest {
             table_name: self.client.full_table_name(TXN_LOG_TABLE),
             app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
             row_key: Self::coordinator_row_key(txn_id).into_bytes(),
-            mutations: txn_mutations,
-            ..MutateRowRequest::default()
+            predicate_filter: Some(build_pending_incarnation_predicate(started_at_micros)),
+            true_mutations: vec![Self::set_cell_at(
+                TXN_FAMILY,
+                b"state",
+                STATE_ABORTED.to_vec(),
+                ts_micros,
+            )],
+            false_mutations: vec![],
+            ..CheckAndMutateRowRequest::default()
         };
-        data.mutate_row(req)
+        let resp = data
+            .check_and_mutate_row(req)
             .await
-            .map_err(|e| map_bigtable_err("txn commit", e))?;
-        Ok(ts_micros)
+            .map_err(|e| map_bigtable_err("txn try_abort_pending", e))?;
+        Ok(resp.predicate_matched)
     }
 
-    /// Mark the coordinator `CLEANED` at a timestamp strictly greater than
-    /// `after_ts_micros` after all participant mutations and stream records applied.
+    /// Mark a `COMMITTED` coordinator `CLEANED` at `ts > after_ts_micros`
+    /// without resurrecting a row that was already dropped.
     pub async fn cleaned(&self, txn_id: &str, after_ts_micros: i64) -> Result<(), StorageError> {
-        self.set_state_after(txn_id, STATE_CLEANED, after_ts_micros)
+        let mut data = self.client.data();
+        let ts_micros = monotonic_timestamp_after_micros(after_ts_micros);
+        let req = CheckAndMutateRowRequest {
+            table_name: self.client.full_table_name(TXN_LOG_TABLE),
+            app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+            row_key: Self::coordinator_row_key(txn_id).into_bytes(),
+            predicate_filter: Some(build_latest_txn_qualifier_match(b"state", STATE_COMMITTED)),
+            true_mutations: vec![Self::set_cell_at(
+                TXN_FAMILY,
+                b"state",
+                STATE_CLEANED.to_vec(),
+                ts_micros,
+            )],
+            false_mutations: vec![],
+            ..CheckAndMutateRowRequest::default()
+        };
+        data.check_and_mutate_row(req)
             .await
-    }
-
-    /// Mark the coordinator `ABORTED` at a timestamp strictly greater than
-    /// `after_ts_micros` after rollback failed to clear all intents.
-    pub async fn aborted(&self, txn_id: &str, after_ts_micros: i64) -> Result<(), StorageError> {
-        self.set_state_after(txn_id, STATE_ABORTED, after_ts_micros)
-            .await
+            .map_err(|e| map_bigtable_err("txn cleaned", e))?;
+        Ok(())
     }
 
     /// Apply participant mutation in Phase 2 fenced with predicate asserting BOTH:
     /// 1. Coordinator's own intent `m:intent:<txn_id>` is still present, AND
     /// 2. Row's OCC state still matches `(expected_version, row_existed)`.
-    ///
-    /// Stamps every `SetCell` (`d:*` and `m:v`) with the deterministic cell
-    /// timestamp `version_to_timestamp_micros(new_version)` and keeps
-    /// `m:intent:<txn_id>` in place until dependent GSI shadow, TTL index, and
-    /// stream writes complete before `clear_intent` releases the row.
-    /// Checking `(expected_version, row_existed)` also guarantees that a delayed
-    /// `roll_forward` after lease expiry is a clean no-op both when Phase 2
-    /// already applied `new_version` and when a newer writer advanced `m:v`.
     pub async fn apply_fenced_mutation(
         &self,
         txn_id: &str,
@@ -405,18 +592,18 @@ impl<'a> TxnCoordinator<'a> {
                     });
                 }
                 true_mutations.push(Mutation {
-                    mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
-                        family_name: INTENT_FAMILY.to_string(),
-                        column_qualifier: QUALIFIER_VERSION.to_vec(),
-                        time_range: older_than_ts_range(ts_micros),
-                    })),
-                });
-                true_mutations.push(Mutation {
                     mutation: Some(mutation::Mutation::SetCell(SetCell {
                         family_name: INTENT_FAMILY.to_string(),
                         column_qualifier: QUALIFIER_VERSION.to_vec(),
                         timestamp_micros: ts_micros,
                         value: new_version.to_string().into_bytes(),
+                    })),
+                });
+                true_mutations.push(Mutation {
+                    mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
+                        family_name: INTENT_FAMILY.to_string(),
+                        column_qualifier: QUALIFIER_VERSION.to_vec(),
+                        time_range: older_than_ts_range(ts_micros),
                     })),
                 });
             }
@@ -427,18 +614,18 @@ impl<'a> TxnCoordinator<'a> {
                     })),
                 });
                 true_mutations.push(Mutation {
-                    mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
-                        family_name: INTENT_FAMILY.to_string(),
-                        column_qualifier: QUALIFIER_VERSION.to_vec(),
-                        time_range: older_than_ts_range(ts_micros),
-                    })),
-                });
-                true_mutations.push(Mutation {
                     mutation: Some(mutation::Mutation::SetCell(SetCell {
                         family_name: INTENT_FAMILY.to_string(),
                         column_qualifier: QUALIFIER_VERSION.to_vec(),
                         timestamp_micros: ts_micros,
                         value: new_version.to_string().into_bytes(),
+                    })),
+                });
+                true_mutations.push(Mutation {
+                    mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
+                        family_name: INTENT_FAMILY.to_string(),
+                        column_qualifier: QUALIFIER_VERSION.to_vec(),
+                        time_range: older_than_ts_range(ts_micros),
                     })),
                 });
             }
@@ -462,7 +649,7 @@ impl<'a> TxnCoordinator<'a> {
         Ok(resp.predicate_matched)
     }
 
-    /// Clear an intent cell.
+    /// Clear an intent cell unconditionally (used while this incarnation still owns `txn:<id>`).
     pub async fn clear_intent(
         &self,
         txn_id: &str,
@@ -489,7 +676,65 @@ impl<'a> TxnCoordinator<'a> {
         Ok(())
     }
 
-    /// Delete the coordinator row entirely (post-clean GC).
+    /// Clear an orphaned/cleaned intent cell bounded to `[0, next_millis_exclusive(max_ts_micros))`
+    /// so delayed cleanup of an earlier deterministic `ClientRequestToken` incarnation
+    /// can NEVER delete a newer incarnation's newly placed intent (`BUG-01`, `BUG-07`).
+    pub async fn clear_intent_up_to(
+        &self,
+        txn_id: &str,
+        participant: &ParticipantRow,
+        max_ts_micros: i64,
+    ) -> Result<(), StorageError> {
+        let qualifier = Self::intent_qualifier(txn_id);
+        let end_ts = next_millis_exclusive(max_ts_micros);
+        let mut data = self.client.data();
+        let req = MutateRowRequest {
+            table_name: self.client.full_table_name(&participant.data_table),
+            app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+            row_key: participant.row_key.clone(),
+            mutations: vec![Mutation {
+                mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
+                    family_name: INTENT_FAMILY.to_string(),
+                    column_qualifier: qualifier,
+                    time_range: older_than_ts_range(end_ts),
+                })),
+            }],
+            ..MutateRowRequest::default()
+        };
+        data.mutate_row(req)
+            .await
+            .map_err(|e| map_bigtable_err("clear_intent_up_to", e))?;
+        Ok(())
+    }
+
+    /// Delete the coordinator row only if `t:started_at` still matches
+    /// `started_at_micros`, protecting reused deterministic `ClientRequestToken`
+    /// coordinator keys (`BUG-07`) against stale incarnation deletes.
+    pub async fn drop_matching_start(
+        &self,
+        txn_id: &str,
+        started_at_micros: i64,
+    ) -> Result<(), StorageError> {
+        let mut data = self.client.data();
+        let req = CheckAndMutateRowRequest {
+            table_name: self.client.full_table_name(TXN_LOG_TABLE),
+            app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+            row_key: Self::coordinator_row_key(txn_id).into_bytes(),
+            predicate_filter: Some(build_latest_txn_qualifier_match(
+                b"started_at",
+                started_at_micros.to_string().as_bytes(),
+            )),
+            true_mutations: vec![Mutation {
+                mutation: Some(mutation::Mutation::DeleteFromRow(DeleteFromRow {})),
+            }],
+            false_mutations: vec![],
+            ..CheckAndMutateRowRequest::default()
+        };
+        let _ = data.check_and_mutate_row(req).await;
+        Ok(())
+    }
+
+    /// Unconditional coordinator row delete (post-clean GC when `started_at` is unknown).
     pub async fn drop(&self, txn_id: &str) -> Result<(), StorageError> {
         let mut data = self.client.data();
         let req = MutateRowRequest {
@@ -502,36 +747,6 @@ impl<'a> TxnCoordinator<'a> {
             ..MutateRowRequest::default()
         };
         let _ = data.mutate_row(req).await;
-        Ok(())
-    }
-
-    async fn set_state_after(
-        &self,
-        txn_id: &str,
-        state: &[u8],
-        after_ts_micros: i64,
-    ) -> Result<(), StorageError> {
-        let mut data = self.client.data();
-        let ts_micros = monotonic_timestamp_after_micros(after_ts_micros);
-        let req = MutateRowRequest {
-            table_name: self.client.full_table_name(TXN_LOG_TABLE),
-            app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
-            row_key: Self::coordinator_row_key(txn_id).into_bytes(),
-            mutations: vec![
-                Mutation {
-                    mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
-                        family_name: TXN_FAMILY.to_string(),
-                        column_qualifier: b"state".to_vec(),
-                        time_range: older_than_ts_range(ts_micros),
-                    })),
-                },
-                Self::set_cell_at(TXN_FAMILY, b"state", state.to_vec(), ts_micros),
-            ],
-            ..MutateRowRequest::default()
-        };
-        data.mutate_row(req)
-            .await
-            .map_err(|e| map_bigtable_err("set_state", e))?;
         Ok(())
     }
 
@@ -556,11 +771,51 @@ impl<'a> TxnCoordinator<'a> {
     }
 }
 
+/// Predicate matching the LATEST cell (`CellsPerColumnLimitFilter(1)` *before*
+/// `ValueRegexFilter` so lazy `MaxNumVersions(1)` compaction can never match a
+/// historical `PENDING` cell after transition!) of `t:<qualifier> == expected_val`.
+fn build_latest_txn_qualifier_match(qualifier: &[u8], expected_val: &[u8]) -> RowFilter {
+    RowFilter {
+        filter: Some(Filter::Chain(Chain {
+            filters: vec![
+                RowFilter {
+                    filter: Some(Filter::FamilyNameRegexFilter(format!("^{TXN_FAMILY}$"))),
+                },
+                RowFilter {
+                    filter: Some(Filter::ColumnQualifierRegexFilter(exact_re2_bytes(
+                        qualifier,
+                    ))),
+                },
+                RowFilter {
+                    filter: Some(Filter::CellsPerColumnLimitFilter(1)),
+                },
+                RowFilter {
+                    filter: Some(Filter::ValueRegexFilter(exact_re2_bytes(expected_val))),
+                },
+            ],
+        })),
+    }
+}
+
+/// Predicate matching iff BOTH `latest(t:state) == "PENDING"` AND
+/// `latest(t:started_at) == started_at_micros` (`BUG-01`, `BUG-07`).
+fn build_pending_incarnation_predicate(started_at_micros: i64) -> RowFilter {
+    let state_pending = build_latest_txn_qualifier_match(b"state", STATE_PENDING);
+    let start_matches =
+        build_latest_txn_qualifier_match(b"started_at", started_at_micros.to_string().as_bytes());
+    RowFilter {
+        filter: Some(Filter::Condition(Box::new(Condition {
+            predicate_filter: Some(Box::new(state_pending)),
+            true_filter: Some(Box::new(start_matches)),
+            false_filter: Some(Box::new(RowFilter {
+                filter: Some(Filter::BlockAllFilter(true)),
+            })),
+        }))),
+    }
+}
+
 /// Predicate matching iff `m:intent:<txn_id>` is present AND the row's OCC
-/// state matches `(expected_version, row_existed)`:
-/// - `(Some(v), _)`  -> `m:v == v`
-/// - `(None, false)` -> neither `m:v` nor `d:*` exists
-/// - `(None, true)`  -> `d:*` exists and `m:v` does not exist (legacy unversioned row)
+/// state matches `(expected_version, row_existed)`.
 fn build_fenced_apply_predicate(
     txn_id: &str,
     expected_version: Option<u64>,
@@ -599,6 +854,7 @@ fn build_fenced_apply_predicate(
             ],
         })),
     };
+
     let has_d = RowFilter {
         filter: Some(Filter::Chain(Chain {
             filters: vec![
@@ -680,9 +936,9 @@ pub fn build_txn_log_latest_filter() -> RowFilter {
     }
 }
 
-/// Filter that matches any cell in family `m` with qualifier prefix `intent:`
-/// and timestamp >= cutoff micros.
-fn build_intent_presence_filter(cutoff_micros: i64) -> RowFilter {
+/// Filter matching ANY physical `m:intent:*` cell in family `m`, with no wall-clock
+/// `TimestampRangeFilter` (`BUG-03`).
+fn build_intent_presence_filter() -> RowFilter {
     RowFilter {
         filter: Some(Filter::Chain(Chain {
             filters: vec![
@@ -696,12 +952,6 @@ fn build_intent_presence_filter(cutoff_micros: i64) -> RowFilter {
                 },
                 RowFilter {
                     filter: Some(Filter::CellsPerColumnLimitFilter(1)),
-                },
-                RowFilter {
-                    filter: Some(Filter::TimestampRangeFilter(TimestampRange {
-                        start_timestamp_micros: cutoff_micros.max(0),
-                        end_timestamp_micros: 0, // 0 = unbounded
-                    })),
                 },
             ],
         })),
@@ -738,10 +988,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_txn_id_format() {
+    fn test_txn_id_and_single_id_formats() {
         let id = TxnCoordinator::new_txn_id();
         assert!(id.starts_with("txn-"));
-        assert_eq!(id.len(), 4 + 32); // txn- + 32 hex chars
+        assert_eq!(id.len(), 4 + 32);
+        assert!(!TxnCoordinator::is_single_item_txn(&id));
+
+        let sid = TxnCoordinator::new_single_txn_id();
+        assert!(sid.starts_with(SINGLE_TXN_PREFIX));
+        assert!(TxnCoordinator::is_single_item_txn(&sid));
+    }
+
+    #[test]
+    fn test_participant_row_canonical_ordering() {
+        let a = ParticipantRow {
+            data_table: "t0001".into(),
+            row_key: vec![0x02],
+        };
+        let b = ParticipantRow {
+            data_table: "t0001".into(),
+            row_key: vec![0x01],
+        };
+        let c = ParticipantRow {
+            data_table: "t0002".into(),
+            row_key: vec![0x00],
+        };
+        let mut v = vec![c.clone(), a.clone(), b.clone()];
+        v.sort();
+        assert_eq!(v, vec![b, a, c]);
     }
 
     #[test]
@@ -783,6 +1057,30 @@ mod tests {
     }
 
     #[test]
+    fn test_pending_incarnation_predicate_limits_cells_before_value_regex() {
+        let pred = build_pending_incarnation_predicate(1_700_000_000_000);
+        if let Some(Filter::Condition(cond)) = pred.filter {
+            let Some(Filter::Chain(state_chain)) = cond
+                .predicate_filter
+                .as_ref()
+                .and_then(|f| f.filter.as_ref())
+            else {
+                panic!("expected Chain on state predicate");
+            };
+            assert!(matches!(
+                state_chain.filters[2].filter,
+                Some(Filter::CellsPerColumnLimitFilter(1))
+            ));
+            assert!(matches!(
+                state_chain.filters[3].filter,
+                Some(Filter::ValueRegexFilter(_))
+            ));
+        } else {
+            panic!("expected outer Condition");
+        }
+    }
+
+    #[test]
     fn test_build_fenced_apply_predicate_uses_outer_condition() {
         for (expected, existed) in [(Some(7), true), (None, false), (None, true)] {
             let pred = build_fenced_apply_predicate("txn-abc.123", expected, existed);
@@ -796,47 +1094,6 @@ mod tests {
             } else {
                 panic!("expected outer Filter::Condition so true_filter inspects full row");
             }
-        }
-    }
-
-    #[test]
-    fn test_txn_log_latest_filter_has_cells_limit() {
-        let filter = build_txn_log_latest_filter();
-        if let Some(Filter::Chain(chain)) = filter.filter {
-            assert_eq!(chain.filters.len(), 2);
-            assert!(matches!(
-                chain.filters[1].filter,
-                Some(Filter::CellsPerColumnLimitFilter(1))
-            ));
-        } else {
-            panic!("expected Filter::Chain");
-        }
-    }
-
-    #[test]
-    fn test_build_intent_presence_filter_order() {
-        let filter = build_intent_presence_filter(1000);
-        if let Some(Filter::Chain(chain)) = filter.filter {
-            assert_eq!(chain.filters.len(), 4);
-            if let Some(Filter::FamilyNameRegexFilter(fam)) = &chain.filters[0].filter {
-                assert_eq!(fam, "^m$");
-            } else {
-                panic!("expected FamilyNameRegexFilter");
-            }
-            assert!(matches!(
-                chain.filters[1].filter,
-                Some(Filter::ColumnQualifierRegexFilter(_))
-            ));
-            assert!(matches!(
-                chain.filters[2].filter,
-                Some(Filter::CellsPerColumnLimitFilter(1))
-            ));
-            assert!(matches!(
-                chain.filters[3].filter,
-                Some(Filter::TimestampRangeFilter(_))
-            ));
-        } else {
-            panic!("expected Filter::Chain");
         }
     }
 }

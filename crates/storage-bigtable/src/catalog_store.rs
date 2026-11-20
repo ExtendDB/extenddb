@@ -34,7 +34,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
-use crate::catalog::{Catalog, keys};
+use crate::catalog::{Catalog, CatalogJsonAction, keys};
 use crate::data::admin::AdminClient;
 use crate::data::client::BigtableClient;
 
@@ -262,54 +262,55 @@ impl BigtableCatalogStore {
     }
 
     async fn upsert_tags_row(&self, row_key: &str, tags: &[(String, String)]) -> OpResult<()> {
-        let cur = self
-            .cat()
-            .get(row_key)
-            .await
-            .map_err(OpError::Internal)?
-            .unwrap_or_else(|| json!({}));
-        let mut map: BTreeMap<String, String> = cur
-            .as_object()
-            .map(|o| {
-                o.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
-                    .collect()
-            })
-            .unwrap_or_default();
-        for (k, v) in tags {
-            map.insert(k.clone(), v.clone());
-        }
-        let next = serde_json::to_value(map).map_err(|e| OpError::Internal(e.to_string()))?;
+        let tags = tags.to_vec();
         self.cat()
-            .put(row_key, &next)
+            .mutate_json_cas(row_key, OpError::Internal, move |existing| {
+                let cur = existing.unwrap_or_else(|| json!({}));
+                let mut map: BTreeMap<String, String> = cur
+                    .as_object()
+                    .map(|o| {
+                        o.iter()
+                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for (k, v) in &tags {
+                    map.insert(k.clone(), v.clone());
+                }
+                let next =
+                    serde_json::to_value(map).map_err(|e| OpError::Internal(e.to_string()))?;
+                Ok((CatalogJsonAction::Put(next), ()))
+            })
             .await
-            .map_err(OpError::Internal)
     }
 
     async fn remove_tags_from_row(&self, row_key: &str, tag_keys: &[String]) -> OpResult<()> {
-        let Some(cur) = self.cat().get(row_key).await.map_err(OpError::Internal)? else {
-            return Ok(());
-        };
-        let mut map: BTreeMap<String, String> = cur
-            .as_object()
-            .map(|o| {
-                o.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
-                    .collect()
+        let tag_keys = tag_keys.to_vec();
+        self.cat()
+            .mutate_json_cas(row_key, OpError::Internal, move |existing| {
+                let Some(cur) = existing else {
+                    return Ok((CatalogJsonAction::NoOp, ()));
+                };
+                let mut map: BTreeMap<String, String> = cur
+                    .as_object()
+                    .map(|o| {
+                        o.iter()
+                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for k in &tag_keys {
+                    map.remove(k);
+                }
+                if map.is_empty() {
+                    Ok((CatalogJsonAction::Delete, ()))
+                } else {
+                    let next =
+                        serde_json::to_value(map).map_err(|e| OpError::Internal(e.to_string()))?;
+                    Ok((CatalogJsonAction::Put(next), ()))
+                }
             })
-            .unwrap_or_default();
-        for k in tag_keys {
-            map.remove(k);
-        }
-        if map.is_empty() {
-            self.cat().delete(row_key).await.map_err(OpError::Internal)
-        } else {
-            let next = serde_json::to_value(map).map_err(|e| OpError::Internal(e.to_string()))?;
-            self.cat()
-                .put(row_key, &next)
-                .await
-                .map_err(OpError::Internal)
-        }
+            .await
     }
 }
 
@@ -411,36 +412,23 @@ impl SettingsStore for BigtableCatalogStore {
         let value = value.to_owned();
         Box::pin(async move {
             let row_key = keys::setting(&key);
-            let next_doc = json!({
-                "key": key,
-                "value": value,
-            });
-            for _ in 0..16 {
-                let Some((raw, parsed)) = self
-                    .cat()
-                    .get_raw(&row_key)
-                    .await
-                    .map_err(OpError::Internal)?
-                else {
-                    return Ok(false);
-                };
-                if parsed.get("value").and_then(serde_json::Value::as_str)
-                    != Some(expected.as_str())
-                {
-                    return Ok(false);
-                }
-                if self
-                    .cat()
-                    .compare_and_swap_raw(&row_key, &raw, &next_doc)
-                    .await
-                    .map_err(OpError::Internal)?
-                {
-                    return Ok(true);
-                }
-            }
-            Err(OpError::Internal(format!(
-                "replace_setting contended on '{key}'"
-            )))
+            self.cat()
+                .mutate_json_cas(&row_key, OpError::Internal, move |existing| {
+                    let Some(parsed) = existing else {
+                        return Ok((CatalogJsonAction::NoOp, false));
+                    };
+                    if parsed.get("value").and_then(serde_json::Value::as_str)
+                        != Some(expected.as_str())
+                    {
+                        return Ok((CatalogJsonAction::NoOp, false));
+                    }
+                    let next_doc = json!({
+                        "key": key,
+                        "value": value,
+                    });
+                    Ok((CatalogJsonAction::Put(next_doc), true))
+                })
+                .await
         })
     }
 
@@ -483,50 +471,50 @@ impl MetricsStore for BigtableCatalogStore {
                 let bucket_secs = r.bucket.unix_timestamp();
                 let dims = metric_dims_hash(r);
                 let rk = keys::metric_row(bucket_secs, &dims);
-                let (sum, count, min, max) = match cat.get(&rk).await.map_err(OpError::Internal)? {
-                    Some(prev) => {
-                        let p_sum = prev
-                            .get("sum")
-                            .and_then(serde_json::Value::as_f64)
-                            .unwrap_or(0.0);
-                        let p_cnt = prev
-                            .get("count")
-                            .and_then(serde_json::Value::as_i64)
-                            .unwrap_or(0);
-                        let p_min = prev
-                            .get("min")
-                            .and_then(serde_json::Value::as_f64)
-                            .unwrap_or(r.min);
-                        let p_max = prev
-                            .get("max")
-                            .and_then(serde_json::Value::as_f64)
-                            .unwrap_or(r.max);
-                        (
-                            p_sum + r.sum,
-                            p_cnt + r.count,
-                            p_min.min(r.min),
-                            p_max.max(r.max),
-                        )
-                    }
-                    None => (r.sum, r.count, r.min, r.max),
-                };
-                cat.put(
-                    &rk,
-                    &json!({
+                let r_clone = r.clone();
+                cat.mutate_json_cas(&rk, OpError::Internal, move |existing| {
+                    let (sum, count, min, max) = match existing {
+                        Some(prev) => {
+                            let p_sum = prev
+                                .get("sum")
+                                .and_then(serde_json::Value::as_f64)
+                                .unwrap_or(0.0);
+                            let p_cnt = prev
+                                .get("count")
+                                .and_then(serde_json::Value::as_i64)
+                                .unwrap_or(0);
+                            let p_min = prev
+                                .get("min")
+                                .and_then(serde_json::Value::as_f64)
+                                .unwrap_or(r_clone.min);
+                            let p_max = prev
+                                .get("max")
+                                .and_then(serde_json::Value::as_f64)
+                                .unwrap_or(r_clone.max);
+                            (
+                                p_sum + r_clone.sum,
+                                p_cnt + r_clone.count,
+                                p_min.min(r_clone.min),
+                                p_max.max(r_clone.max),
+                            )
+                        }
+                        None => (r_clone.sum, r_clone.count, r_clone.min, r_clone.max),
+                    };
+                    let doc = json!({
                         "bucket_secs": bucket_secs,
-                        "account_id": r.account_id,
-                        "metric": r.metric,
-                        "table_name": r.table_name,
-                        "index_name": r.index_name,
-                        "operation": r.operation,
+                        "account_id": r_clone.account_id,
+                        "metric": r_clone.metric,
+                        "table_name": r_clone.table_name,
+                        "index_name": r_clone.index_name,
+                        "operation": r_clone.operation,
                         "sum": sum,
                         "count": count,
                         "min": min,
                         "max": max,
-                    }),
-                )
-                .await
-                .map_err(OpError::Internal)?;
+                    });
+                    Ok((CatalogJsonAction::Put(doc), ()))
+                })
+                .await?;
             }
             Ok(())
         })
@@ -861,24 +849,19 @@ impl AdminStore for BigtableCatalogStore {
         let password_hash = password_hash.to_owned();
         Box::pin(async move {
             let rk = keys::admin(&admin_name);
-            let Some(mut doc) = self.cat().get(&rk).await.map_err(OpError::Internal)? else {
-                return Err(OpError::NotFound("Admin user not found".to_owned()));
-            };
-            if let Some(obj) = doc.as_object_mut() {
-                obj.insert(
-                    "password_hash".to_owned(),
-                    serde_json::Value::String(password_hash),
-                );
-            }
-            let updated = self
-                .cat()
-                .put_if_present(&rk, &doc)
+            self.cat()
+                .mutate_json_cas(&rk, OpError::Internal, move |existing| {
+                    let mut doc = existing
+                        .ok_or_else(|| OpError::NotFound("Admin user not found".to_owned()))?;
+                    if let Some(obj) = doc.as_object_mut() {
+                        obj.insert(
+                            "password_hash".to_owned(),
+                            serde_json::Value::String(password_hash.clone()),
+                        );
+                    }
+                    Ok((CatalogJsonAction::Put(doc), ()))
+                })
                 .await
-                .map_err(OpError::Internal)?;
-            if !updated {
-                return Err(OpError::NotFound("Admin user not found".to_owned()));
-            }
-            Ok(())
         })
     }
 
@@ -1414,24 +1397,19 @@ impl ManagementStore for BigtableCatalogStore {
         let password_hash = password_hash.to_owned();
         Box::pin(async move {
             let rk = keys::user(&account_id, &user_name);
-            let Some(mut doc) = self.cat().get(&rk).await.map_err(OpError::Internal)? else {
-                return Err(OpError::NotFound("IAM user not found".to_owned()));
-            };
-            if let Some(obj) = doc.as_object_mut() {
-                obj.insert(
-                    "password_hash".to_owned(),
-                    serde_json::Value::String(password_hash),
-                );
-            }
-            let updated = self
-                .cat()
-                .put_if_present(&rk, &doc)
+            self.cat()
+                .mutate_json_cas(&rk, OpError::Internal, move |existing| {
+                    let mut doc = existing
+                        .ok_or_else(|| OpError::NotFound("IAM user not found".to_owned()))?;
+                    if let Some(obj) = doc.as_object_mut() {
+                        obj.insert(
+                            "password_hash".to_owned(),
+                            serde_json::Value::String(password_hash.clone()),
+                        );
+                    }
+                    Ok((CatalogJsonAction::Put(doc), ()))
+                })
                 .await
-                .map_err(OpError::Internal)?;
-            if !updated {
-                return Err(OpError::NotFound("IAM user not found".to_owned()));
-            }
-            Ok(())
         })
     }
 
@@ -1962,31 +1940,26 @@ impl ManagementStore for BigtableCatalogStore {
         let document = document.clone();
         Box::pin(async move {
             let rk = policy_row_key(&account_id, &principal_type, &principal_name, &policy_name)?;
-            let created_at = self
-                .cat()
-                .get(&rk)
-                .await
-                .map_err(OpError::Internal)?
-                .and_then(|v| {
-                    v.get("created_at")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned)
-                })
-                .unwrap_or_else(now_rfc3339);
             self.cat()
-                .put(
-                    &rk,
-                    &json!({
+                .mutate_json_cas(&rk, OpError::Internal, move |existing| {
+                    let created_at = existing
+                        .and_then(|v| {
+                            v.get("created_at")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .unwrap_or_else(now_rfc3339);
+                    let doc = json!({
                         "account_id": account_id,
                         "principal_type": principal_type,
                         "principal_name": principal_name,
                         "policy_name": policy_name,
                         "document": document,
                         "created_at": created_at,
-                    }),
-                )
+                    });
+                    Ok((CatalogJsonAction::Put(doc), ()))
+                })
                 .await
-                .map_err(OpError::Internal)
         })
     }
 
@@ -2441,18 +2414,17 @@ impl ManagementStore for BigtableCatalogStore {
         let document = document.clone();
         Box::pin(async move {
             let rk = keys::iam_session(&session_token);
-            let Some(mut cur) = self.cat().get(&rk).await.map_err(OpError::Internal)? else {
-                return Ok(());
-            };
-            if let Some(obj) = cur.as_object_mut() {
-                obj.insert("session_policy".to_owned(), document);
-            }
-            let _ = self
-                .cat()
-                .put_if_present(&rk, &cur)
+            self.cat()
+                .mutate_json_cas(&rk, OpError::Internal, move |existing| {
+                    let Some(mut cur) = existing else {
+                        return Ok((CatalogJsonAction::NoOp, ()));
+                    };
+                    if let Some(obj) = cur.as_object_mut() {
+                        obj.insert("session_policy".to_owned(), document.clone());
+                    }
+                    Ok((CatalogJsonAction::Put(cur), ()))
+                })
                 .await
-                .map_err(OpError::Internal)?;
-            Ok(())
         })
     }
 
@@ -2603,20 +2575,21 @@ impl ManagementStore for BigtableCatalogStore {
                     SecretTable::AccessKeys => keys::access_key(&w.key),
                     SecretTable::IamSessions => keys::iam_session(&w.key),
                 };
-                let Some(mut cur) = cat.get(&rk).await.map_err(OpError::Internal)? else {
-                    continue;
-                };
-                if let Some(obj) = cur.as_object_mut() {
-                    obj.remove("secret_encrypted");
-                    obj.insert(
-                        "secret_key_encrypted_b64".to_owned(),
-                        serde_json::Value::String(BASE64.encode(&w.secret_key_encrypted)),
-                    );
-                }
-                let _ = cat
-                    .put_if_present(&rk, &cur)
-                    .await
-                    .map_err(OpError::Internal)?;
+                let b64 = BASE64.encode(&w.secret_key_encrypted);
+                cat.mutate_json_cas(&rk, OpError::Internal, move |existing| {
+                    let Some(mut cur) = existing else {
+                        return Ok((CatalogJsonAction::NoOp, ()));
+                    };
+                    if let Some(obj) = cur.as_object_mut() {
+                        obj.remove("secret_encrypted");
+                        obj.insert(
+                            "secret_key_encrypted_b64".to_owned(),
+                            serde_json::Value::String(b64.clone()),
+                        );
+                    }
+                    Ok((CatalogJsonAction::Put(cur), ()))
+                })
+                .await?;
             }
             Ok(())
         })

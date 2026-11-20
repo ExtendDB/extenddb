@@ -203,6 +203,21 @@ pub fn stream_record_shard_prefix(shard_id: &str) -> String {
     format!("stream_record:{shard_id}:")
 }
 
+/// Exact-once stream event deduplication marker (`stream_dedup:<shard_id>:<dedup_key>`)
+/// so concurrent or retried `roll_forward` passes never allocate a second sequence slot
+/// for an already-published event (`BUG-04`, `BUG-05`).
+pub fn stream_dedup(shard_id: &str, dedup_key: &str) -> String {
+    format!("stream_dedup:{shard_id}:{dedup_key}")
+}
+
+/// Prefix for deleting all stream deduplication markers belonging to `shard_id`.
+pub fn stream_dedup_shard_prefix(shard_id: &str) -> String {
+    format!("stream_dedup:{shard_id}:")
+}
+
+/// Prefix for scanning stream deduplication markers during retention cleanup.
+pub const STREAM_DEDUP_SCAN_PREFIX: &str = "stream_dedup:";
+
 /// Prefix passed to `Catalog::scan_prefix` to enumerate every user in an account.
 pub fn user_scan_prefix(account_id: &str) -> String {
     format!("user:{account_id}:")

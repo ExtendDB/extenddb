@@ -1,24 +1,28 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! GSI Background Reconciler Worker.
+//! GSI Background Reconciler Worker & Backfill Engine (`BUG-08`, `BUG-09`).
 //!
-//! Scans GSI shadow tables, verifies them against base table rows,
-//! and repairs mismatches (deletes stale shadow entries, updates incorrect ones)
-//! using freshly re-read `(base_item, occ_version)` pairs so concurrent writes
-//! are never overwritten with stale scan-time projections.
+//! Scans GSI shadow tables, verifies them against base table rows, and repairs
+//! mismatches using freshly re-read `(base_item, occ_version)` pairs guarded by
+//! monotonic shadow `m:v` checks (`put_shadow_versioned`,
+//! `delete_shadow_versioned`, `delete_shadow_orphan_if_unchanged`) without
+//! unbounded `DeleteFromFamily("d")` or `DeleteFromRow`, so delayed writers or
+//! reconcilers (`v1 < v2`) never overwrite newer shadow cells.
+//! Also completes interrupted `"CREATING" -> "ACTIVE"` GSI backfills via CAS on
+//! `table_meta` when no in-process `UpdateTable` build owns the index.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use extenddb_core::types::{
-    GsiDescription, IndexInfo, IndexType, Item, TableDescription, TableKeyInfo,
-};
+use extenddb_core::types::{GsiDescription, IndexInfo, IndexType, Item, TableKeyInfo};
 use extenddb_storage::{CancellationToken, sleep_or_shutdown};
-use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::{Mutation, mutation};
 
 use crate::BigtableEngine;
-use crate::data::item_ops::{ItemOps, now_millis_micros, version_to_timestamp_micros};
+use crate::catalog::CatalogJsonAction;
+use crate::data::admin::AdminClient;
+use crate::data::encoding::row_key;
+use crate::data::item_ops::{ItemOps, next_occ_version};
 use crate::data::query_scan::QueryScan;
 
 const SCAN_BATCH: i64 = 200;
@@ -71,11 +75,7 @@ pub async fn sweep_once(engine: &BigtableEngine) -> Result<(), String> {
             tracing::warn!("missing data_table in catalog row {k}");
             continue;
         };
-        let Some(desc_val) = val.get("description") else {
-            tracing::warn!("missing description in catalog row {k}");
-            continue;
-        };
-        let desc: TableDescription = match serde_json::from_value(desc_val.clone()) {
+        let desc = match engine.deserialize_table_description(&val) {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!("deserialize TableDescription for {k} failed: {e}");
@@ -88,74 +88,163 @@ pub async fn sweep_once(engine: &BigtableEngine) -> Result<(), String> {
             continue;
         }
 
-        let base_key_info = TableKeyInfo {
-            table_name: table_name.to_string(),
-            account_id: acct_id.to_string(),
-            table_id: desc.table_id.clone(),
-            key_schema: desc.key_schema.clone(),
-            base_key_schema: desc.key_schema.clone(),
-            attribute_definitions: desc.attribute_definitions.clone(),
-            has_lsi: desc.local_secondary_indexes.is_some(),
-            global_secondary_indexes: desc
-                .global_secondary_indexes
-                .clone()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|g| IndexInfo {
-                    index_name: g.index_name.clone(),
-                    index_id: g.index_name,
-                    index_type: IndexType::Gsi,
-                    key_schema: g.key_schema,
-                    projection: g.projection,
-                })
-                .collect(),
-            local_secondary_indexes: desc
-                .local_secondary_indexes
-                .clone()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|l| IndexInfo {
-                    index_name: l.index_name.clone(),
-                    index_id: l.index_name,
-                    index_type: IndexType::Lsi,
-                    key_schema: l.key_schema,
-                    projection: l.projection,
-                })
-                .collect(),
-            stream_specification: None,
-            vector_indexes: Vec::new(),
-        };
+        let base_key_info = build_reconciler_base_key_info(acct_id, table_name, &desc);
 
         for gsi in gsis {
-            if let Err(e) = reconcile_gsi(engine, &base_key_info, data_table, &gsi).await {
+            if gsi.index_status == "DELETING"
+                || engine.is_gsi_building(&desc.table_id, &gsi.index_name)
+            {
+                continue;
+            }
+            if gsi.index_status == "CREATING"
+                && let Err(e) = ensure_gsi_shadow_table(engine, data_table, &gsi.index_name).await
+            {
                 tracing::warn!(
-                    "reconcile GSI {} for table {table_name} failed: {e}",
+                    "ensure shadow table for CREATING GSI {} on {table_name} failed: {e}",
                     gsi.index_name
                 );
+                continue;
+            }
+            match reconcile_table_gsi(engine, &base_key_info, data_table, &gsi).await {
+                Ok(()) => {
+                    if gsi.index_status == "CREATING"
+                        && let Err(e) =
+                            promote_creating_gsi_to_active(engine, acct_id, table_name, &gsi).await
+                    {
+                        tracing::warn!(
+                            "promote CREATING GSI {} for table {table_name} failed: {e}",
+                            gsi.index_name
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "reconcile GSI {} for table {table_name} failed: {e}",
+                        gsi.index_name
+                    );
+                }
             }
         }
     }
     Ok(())
 }
 
-async fn reconcile_gsi(
+async fn ensure_gsi_shadow_table(
+    engine: &BigtableEngine,
+    data_table: &str,
+    index_name: &str,
+) -> Result<(), String> {
+    let shadow_table = crate::gsi::shadow_table_id(data_table, index_name);
+    let mut admin = AdminClient::connect(engine.client_ref()).await?;
+    let families = vec![
+        ("d", Some(crate::data::admin::gc_max_versions(1))),
+        ("m", Some(crate::data::admin::gc_max_versions(1))),
+        ("t", None),
+    ];
+    admin.create_table(&shadow_table, &families).await
+}
+
+pub(crate) fn build_reconciler_base_key_info(
+    acct_id: &str,
+    table_name: &str,
+    desc: &extenddb_core::types::TableDescription,
+) -> TableKeyInfo {
+    TableKeyInfo {
+        table_name: table_name.to_string(),
+        account_id: acct_id.to_string(),
+        table_id: desc.table_id.clone(),
+        key_schema: desc.key_schema.clone(),
+        base_key_schema: desc.key_schema.clone(),
+        attribute_definitions: desc.attribute_definitions.clone(),
+        has_lsi: desc.local_secondary_indexes.is_some(),
+        global_secondary_indexes: desc
+            .global_secondary_indexes
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|g| IndexInfo {
+                index_name: g.index_name.clone(),
+                index_id: g.index_name,
+                index_type: IndexType::Gsi,
+                key_schema: g.key_schema,
+                projection: g.projection,
+            })
+            .collect(),
+        local_secondary_indexes: desc
+            .local_secondary_indexes
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|l| IndexInfo {
+                index_name: l.index_name.clone(),
+                index_id: l.index_name,
+                index_type: IndexType::Lsi,
+                key_schema: l.key_schema,
+                projection: l.projection,
+            })
+            .collect(),
+        stream_specification: None,
+        vector_indexes: Vec::new(),
+    }
+}
+
+async fn promote_creating_gsi_to_active(
+    engine: &BigtableEngine,
+    acct_id: &str,
+    table_name: &str,
+    gsi: &GsiDescription,
+) -> Result<(), String> {
+    let meta_key = crate::catalog::keys::table_meta(acct_id, table_name);
+    let idx_name = gsi.index_name.clone();
+    let changed = engine
+        .cat()
+        .mutate_json_cas(&meta_key, std::convert::identity, |cur| {
+            let Some(mut row) = cur else {
+                return Ok((CatalogJsonAction::NoOp, false));
+            };
+            let mut desc = engine
+                .deserialize_table_description(&row)
+                .map_err(|e| e.to_string())?;
+            let mut promoted = false;
+            if let Some(ref mut gsis) = desc.global_secondary_indexes {
+                for g in gsis.iter_mut() {
+                    if g.index_name == idx_name && g.index_status == "CREATING" {
+                        g.index_status = "ACTIVE".to_string();
+                        promoted = true;
+                    }
+                }
+            }
+            if !promoted {
+                return Ok((CatalogJsonAction::NoOp, false));
+            }
+            engine
+                .write_table_description_into_row(&mut row, &desc)
+                .map_err(|e| e.to_string())?;
+            Ok((CatalogJsonAction::Put(row), true))
+        })
+        .await?;
+    if changed {
+        engine.invalidate_table_cache(acct_id, table_name).await;
+    }
+    Ok(())
+}
+
+/// Reconciles both shadow-to-base and base-to-shadow directions for a single GSI,
+/// propagating errors so `"CREATING"` GSIs are never marked `"ACTIVE"` while
+/// backfill is incomplete.
+pub(crate) async fn reconcile_table_gsi(
     engine: &BigtableEngine,
     base_key_info: &TableKeyInfo,
     data_table: &str,
     gsi: &GsiDescription,
 ) -> Result<(), String> {
-    if let Err(e) = reconcile_gsi_shadow_to_base(engine, base_key_info, data_table, gsi).await {
-        tracing::warn!(
-            "GSI shadow-to-base reconciliation failed for {}: {e}",
-            gsi.index_name
-        );
-    }
-    if let Err(e) = reconcile_gsi_base_to_shadow(engine, base_key_info, data_table, gsi).await {
-        tracing::warn!(
-            "GSI base-to-shadow reconciliation failed for {}: {e}",
-            gsi.index_name
-        );
-    }
+    // Materialize any already-COMMITTED coordinator mutations targeting `data_table`
+    // so newly committed rows are visible in `d:*` before base-to-shadow scan.
+    engine
+        .roll_forward_committed_txns_for_table(data_table)
+        .await?;
+    reconcile_gsi_shadow_to_base(engine, base_key_info, data_table, gsi).await?;
+    reconcile_gsi_base_to_shadow(engine, base_key_info, data_table, gsi).await?;
     Ok(())
 }
 
@@ -210,19 +299,17 @@ async fn reconcile_gsi_shadow_to_base(
             .map_err(|e| format!("batch get base rows: {e}"))?;
 
         for ((shadow_item, base_key), base_row) in items.into_iter().zip(base_keys).zip(base_rows) {
-            if let Err(e) = reconcile_shadow_item_with_base(
+            reconcile_shadow_item_with_base(
+                engine,
+                data_table,
                 &shadow_ops,
-                &base_ops,
                 base_key_info,
                 gsi,
                 &shadow_item,
                 &base_key,
                 base_row.as_ref(),
             )
-            .await
-            {
-                tracing::warn!("reconcile shadow item failed: {e}");
-            }
+            .await?;
         }
 
         match last {
@@ -241,7 +328,6 @@ async fn reconcile_gsi_base_to_shadow(
     gsi: &GsiDescription,
 ) -> Result<(), String> {
     let base_qs = QueryScan::new(engine.client_ref(), data_table);
-    let base_ops = ItemOps::new(engine.client_ref(), data_table, 0);
     let shadow_table = crate::gsi::shadow_table_id(data_table, &gsi.index_name);
     let shadow_ops = ItemOps::new(engine.client_ref(), &shadow_table, 0);
 
@@ -300,12 +386,12 @@ async fn reconcile_gsi_base_to_shadow(
                     Some(shadow_item) => shadow_item != expected_projected,
                 };
                 if needs_write {
-                    // Re-read the live base row + OCC version together to avoid
-                    // TOCTOU: never stamp scan-time attributes with a newer m:v.
                     let base_key =
                         extenddb_core::types::extract_key(&base_item, &base_key_info.key_schema);
-                    let (fresh_base_opt, fresh_ver) = base_ops
-                        .get_with_version(base_key_info, &base_key)
+                    let base_key_bytes = row_key::encode_key(&base_key, &base_key_info.key_schema)
+                        .map_err(|e| format!("encode base key: {e}"))?;
+                    let (fresh_base_opt, fresh_ver) = engine
+                        .read_base_row_for_worker(data_table, &base_key_bytes)
                         .await
                         .map_err(|e| format!("re-read base row version: {e}"))?;
                     let Some(fresh_base) = fresh_base_opt else {
@@ -326,13 +412,9 @@ async fn reconcile_gsi_base_to_shadow(
                         &base_key_info.key_schema,
                         &gsi.key_schema,
                     );
-                    let ts_micros =
-                        fresh_ver.map_or_else(now_millis_micros, version_to_timestamp_micros);
-                    let mutations = shadow_ops
-                        .item_to_mutations_at(&fresh_projected, true, ts_micros)
-                        .map_err(|e| format!("item_to_mutations_at: {e}"))?;
+                    let version = fresh_ver.unwrap_or_else(|| next_occ_version(None));
                     shadow_ops
-                        .mutate_cells(fresh_key, mutations)
+                        .put_shadow_versioned(&fresh_key, &fresh_projected, version)
                         .await
                         .map_err(|e| format!("repair GSI entry: {e}"))?;
                 }
@@ -348,9 +430,11 @@ async fn reconcile_gsi_base_to_shadow(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn reconcile_shadow_item_with_base(
+    engine: &BigtableEngine,
+    data_table: &str,
     shadow_ops: &ItemOps<'_>,
-    base_ops: &ItemOps<'_>,
     base_key_info: &TableKeyInfo,
     gsi: &GsiDescription,
     shadow_item: &Item,
@@ -385,28 +469,27 @@ async fn reconcile_shadow_item_with_base(
         }
     }
 
-    // Mismatch or absent base row: re-read `(fresh_base_row, fresh_ver)` atomically
-    // so repairs always project attributes matching the exact stamped OCC version.
-    let (fresh_base_row, fresh_ver) = base_ops
-        .get_with_version(base_key_info, base_key)
+    let base_key_bytes = row_key::encode_key(base_key, &base_key_info.key_schema)
+        .map_err(|e| format!("encode base key: {e}"))?;
+    let (fresh_base_row, fresh_ver) = engine
+        .read_base_row_for_worker(data_table, &base_key_bytes)
         .await
         .map_err(|e| format!("re-read base row with version: {e}"))?;
 
-    match fresh_base_row {
-        None => {
+    match (fresh_base_row, fresh_ver) {
+        (None, Some(tombstone_ver)) => {
             shadow_ops
-                .mutate_cells(
-                    shadow_key_bytes,
-                    vec![Mutation {
-                        mutation: Some(mutation::Mutation::DeleteFromRow(
-                            mutation::DeleteFromRow {},
-                        )),
-                    }],
-                )
+                .delete_shadow_versioned(&shadow_key_bytes, tombstone_ver)
                 .await
-                .map_err(|e| format!("delete stale shadow row: {e}"))?;
+                .map_err(|e| format!("delete stale shadow row at tombstone version: {e}"))?;
         }
-        Some(fresh_base) => {
+        (None, None) => {
+            shadow_ops
+                .delete_shadow_orphan_if_unchanged(&shadow_key_bytes)
+                .await
+                .map_err(|e| format!("delete orphaned shadow row if unchanged: {e}"))?;
+        }
+        (Some(fresh_base), ver_opt) => {
             let expected_projected = crate::gsi::project_for_shadow(
                 &fresh_base,
                 &gsi.projection,
@@ -419,37 +502,24 @@ async fn reconcile_shadow_item_with_base(
                 &base_key_info.key_schema,
             )
             .map_err(|e| format!("derive new shadow key: {e}"))?;
-            let ts_micros = fresh_ver.map_or_else(now_millis_micros, version_to_timestamp_micros);
+            let version = ver_opt.unwrap_or_else(|| next_occ_version(None));
 
             if Some(&shadow_key_bytes) == new_shadow_key.as_ref() {
                 if expected_projected != *shadow_item {
-                    let mutations = shadow_ops
-                        .item_to_mutations_at(&expected_projected, true, ts_micros)
-                        .map_err(|e| format!("item_to_mutations_at: {e}"))?;
                     shadow_ops
-                        .mutate_cells(shadow_key_bytes, mutations)
+                        .put_shadow_versioned(&shadow_key_bytes, &expected_projected, version)
                         .await
                         .map_err(|e| format!("repair GSI entry: {e}"))?;
                 }
             } else {
                 shadow_ops
-                    .mutate_cells(
-                        shadow_key_bytes,
-                        vec![Mutation {
-                            mutation: Some(mutation::Mutation::DeleteFromRow(
-                                mutation::DeleteFromRow {},
-                            )),
-                        }],
-                    )
+                    .delete_shadow_versioned(&shadow_key_bytes, version)
                     .await
                     .map_err(|e| format!("delete stale GSI entry: {e}"))?;
 
                 if let Some(key) = new_shadow_key {
-                    let mutations = shadow_ops
-                        .item_to_mutations_at(&expected_projected, true, ts_micros)
-                        .map_err(|e| format!("item_to_mutations_at: {e}"))?;
                     shadow_ops
-                        .mutate_cells(key, mutations)
+                        .put_shadow_versioned(&key, &expected_projected, version)
                         .await
                         .map_err(|e| format!("write new GSI entry: {e}"))?;
                 }
