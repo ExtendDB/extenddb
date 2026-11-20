@@ -216,15 +216,14 @@ mod tests {
 
     /// Epoch seconds round half up to whole milliseconds, as the service
     /// does. Rows measured 2026-11-20 (us-east-1) on a record at ms ...389:
-    /// `.3894900` returned it, `.3894999` (whose double times 1000 is exactly
-    /// ...389.5) and `.3895000` did not, `.3885100` did. `0.0004` and
+    /// `.3894900` returned it, `.3895000` did not (so did `.3894999`, whose
+    /// double is the same as `.3895`), `.3885100` did. `0.0004` and
     /// `0.00049` were refused, `0.0005` and `0.00051` accepted. A floor fails
-    /// the `.3894999` and `.3885100` rows.
+    /// the `.3895` and `.3885100` rows.
     #[test]
     fn timestamp_rounds_half_up_to_the_millisecond() {
         let cases: &[(f64, Option<i64>)] = &[
             (1_795_171_973.389_49, Some(1_795_171_973_389)),
-            (1_795_171_973.389_499_9, Some(1_795_171_973_390)),
             (1_795_171_973.389_5, Some(1_795_171_973_390)),
             (1_795_171_973.388_51, Some(1_795_171_973_389)),
             (1_792_764_248.0, Some(1_792_764_248_000)),
@@ -285,12 +284,13 @@ mod tests {
             .as_secs_f64();
         let past = 1_792_764_148.0;
         let future = now + 3_600.0;
-        let cases: &[(
+        type Row = (
             ShardIteratorType,
-            Option<&str>,
+            Option<&'static str>,
             Option<f64>,
-            Result<Option<i64>, &str>,
-        )] = &[
+            Result<Option<i64>, &'static str>,
+        );
+        let cases: &[Row] = &[
             // AT_TIMESTAMP: a valid Timestamp first; null, zero, 0.0004 and negative refuse.
             (AtTimestamp, None, None, Err(TS_REQUIRED)),
             (AtTimestamp, None, Some(0.0), Err(TS_REQUIRED)),
