@@ -31,12 +31,14 @@ enum HoldAt {
 }
 
 /// The filesystem sink with one call held: it signals `reached`, then
-/// answers only after `release`.
+/// answers only after `release`. A held location check also signals
+/// `answered` once it has answered.
 struct HoldingSink {
     inner: FsSink,
     at: HoldAt,
     reached: Arc<Notify>,
     release: Arc<Notify>,
+    answered: Arc<Notify>,
     fired: Arc<AtomicBool>,
 }
 
@@ -52,6 +54,7 @@ impl HoldingSink {
             at,
             reached: Arc::new(Notify::new()),
             release: Arc::new(Notify::new()),
+            answered: Arc::new(Notify::new()),
             fired: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -80,8 +83,13 @@ impl BulkSink for HoldingSink {
         let hold = self.hold(HoldAt::FirstCheck);
         let fut = self.inner.check_location(at, key, sse);
         Box::pin(async move {
+            let holding = hold.is_some();
             held(hold).await;
-            fut.await
+            let answer = fut.await;
+            if holding {
+                self.answered.notify_one();
+            }
+            answer
         })
     }
 
@@ -241,6 +249,53 @@ async fn an_output_check_held_past_two_leases_keeps_the_lease() {
     assert_eq!(record.status, "COMPLETED_WITH_ERRORS", "{record:?}");
     assert_eq!(record.processed_item_count, 5);
     assert_eq!(h.count_items().await, 4);
+}
+
+/// A renewal that started while the output check waits runs to its end
+/// when the check answers first: dropped inside its checkpoint, it could
+/// leave the pooled connection inside the checkpoint's transaction. The
+/// renewal's checkpoint is held until the check has answered.
+#[tokio::test]
+async fn a_renewal_started_during_a_held_check_runs_to_its_end() {
+    let h = Harness::new().await;
+    let (op, record, cfg) = five_rows_one_error(&h).await;
+    let sink = Arc::new(HoldingSink::new(&h, HoldAt::FirstCheck));
+    let reached = Arc::clone(&sink.reached);
+    let release = Arc::clone(&sink.release);
+    let entered = Arc::new(Notify::new());
+    let mut faulting = FaultingStorage::new(&h.storage);
+    faulting.hold_first_checkpoint = Some((Arc::clone(&entered), Arc::clone(&sink.answered)));
+    let faulting = Arc::new(faulting);
+    let mut deps = h.deps_with("runner-1", cfg, Arc::new(h.fs_source()), sink);
+    deps.storage = Arc::clone(&faulting) as Arc<dyn StorageEngine>;
+    let run = runner::run(&deps, record);
+    tokio::pin!(run);
+    for (step, signal) in [
+        ("the held check", &reached),
+        ("the renewal's checkpoint", &entered),
+    ] {
+        tokio::time::timeout(BOUND, async {
+            tokio::select! {
+                ended = &mut run => panic!("the runner must not finish before {step}: {ended:?}"),
+                () = signal.notified() => {}
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the runner reaches {step}"));
+    }
+    release.notify_one();
+    tokio::time::timeout(BOUND, &mut run)
+        .await
+        .expect("the run ends once the check answers")
+        .expect("runner run");
+
+    assert_eq!(
+        faulting.checkpoints_finished.load(Ordering::SeqCst),
+        faulting.checkpoints_started.load(Ordering::SeqCst),
+        "every checkpoint the run started ran to its end"
+    );
+    let record = h.record(&op).await;
+    assert_eq!(record.status, "COMPLETED_WITH_ERRORS", "{record:?}");
 }
 
 #[tokio::test]

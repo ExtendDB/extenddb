@@ -123,9 +123,25 @@ impl BulkOperationStore for FaultingStorage {
                 unreachable!("pending never resolves")
             });
         }
+        let hold = self
+            .hold_first_checkpoint
+            .as_ref()
+            .filter(|_| !self.checkpoint_hold_fired.swap(true, Ordering::SeqCst))
+            .cloned();
         let lease = self.checkpoint_lease.unwrap_or(lease);
-        self.inner
-            .checkpoint(account_id, operation_id, owner, lease, progress)
+        let fut = self
+            .inner
+            .checkpoint(account_id, operation_id, owner, lease, progress);
+        Box::pin(async move {
+            self.checkpoints_started.fetch_add(1, Ordering::SeqCst);
+            if let Some((entered, release)) = hold {
+                entered.notify_one();
+                release.notified().await;
+            }
+            let state = fut.await;
+            self.checkpoints_finished.fetch_add(1, Ordering::SeqCst);
+            state
+        })
     }
 
     fn report_records_page(

@@ -65,6 +65,14 @@ pub(super) enum InPlace<T> {
 /// connection (a report page read, the lease re-read before a rename), and
 /// a renewal that waited for the pool while the call was not polled could
 /// wait for that connection forever.
+///
+/// A renewal that has started runs to its end, also when the call answers
+/// first, and the call's answer wins. A renewal dropped inside its
+/// checkpoint can leave the pooled connection inside the checkpoint's
+/// transaction. On PostgreSQL, sqlx counts a transaction only after the
+/// server answers its `BEGIN`, so it does not roll back a `begin` dropped
+/// before that answer, and the pool hands the connection out again inside
+/// that transaction.
 pub(super) async fn keeping_lease_in_place<T>(
     deps: &RunnerDeps,
     record: &BulkOperationRecord,
@@ -80,17 +88,25 @@ pub(super) async fn keeping_lease_in_place<T>(
             return InPlace::Answer(call.await);
         };
         let renew_at = renewal_instant(due, lease, started);
-        let renewal = async {
-            tokio::time::sleep_until(tokio::time::Instant::from_std(renew_at)).await;
-            renew_in_place(deps, record, watch).await
-        };
         tokio::select! {
             biased;
             answer = &mut call => return InPlace::Answer(answer),
-            renewed = renewal => match renewed {
-                Ok(renewed_at) => *deadline = Some(renewed_at + lease),
-                Err(stop) => return stop,
-            },
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(renew_at)) => {}
+        }
+        let mut renewal = std::pin::pin!(renew_in_place(deps, record, watch));
+        let renewed = tokio::select! {
+            biased;
+            renewed = &mut renewal => renewed,
+            answer = &mut call => {
+                if let Ok(renewed_at) = renewal.await {
+                    *deadline = Some(renewed_at + lease);
+                }
+                return InPlace::Answer(answer);
+            }
+        };
+        match renewed {
+            Ok(renewed_at) => *deadline = Some(renewed_at + lease),
+            Err(stop) => return stop,
         }
     }
 }

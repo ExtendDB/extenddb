@@ -52,6 +52,16 @@ pub(crate) struct FaultingStorage {
     /// of the runner's, so the store's lease can run out while the runner's
     /// own deadline is still far off.
     pub(crate) checkpoint_lease: Option<Duration>,
+    /// When set, the first `checkpoint` signals the first `Notify` and
+    /// waits for the second before it reaches storage, the way a lease
+    /// renewal is still inside its checkpoint when the call it renews the
+    /// lease for answers.
+    pub(crate) hold_first_checkpoint: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    pub(crate) checkpoint_hold_fired: AtomicBool,
+    /// `checkpoint` calls started and finished, so a test can pin that no
+    /// checkpoint was dropped before it answered.
+    pub(crate) checkpoints_started: AtomicU64,
+    pub(crate) checkpoints_finished: AtomicU64,
     /// When set, `get_bulk_operation` rewrites the returned record's status
     /// to this string, modelling a stored status outside the known set.
     pub(crate) doctor_status: Option<String>,
@@ -105,6 +115,10 @@ impl FaultingStorage {
             fail_checkpoint_once: false,
             checkpoint_fail_fired: AtomicBool::new(false),
             checkpoint_lease: None,
+            hold_first_checkpoint: None,
+            checkpoint_hold_fired: AtomicBool::new(false),
+            checkpoints_started: AtomicU64::new(0),
+            checkpoints_finished: AtomicU64::new(0),
             doctor_status: None,
             fail_get_on_call: None,
             get_calls: std::sync::atomic::AtomicUsize::new(0),
