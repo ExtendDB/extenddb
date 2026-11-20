@@ -66,8 +66,9 @@ pub(crate) fn check_transact_count(count: usize, member: &str) -> Result<(), Dyn
 /// (`BatchGetItem`) or write-request count (`BatchWriteItem`), or `None` when
 /// the entry is not the expected shape; the handler's deserialization rejects
 /// such an entry, so it counts towards the number of tables only. The checks
-/// run in this order: an empty `RequestItems`, too many tables, tables with
-/// too many items or none, too many items in total.
+/// run in this order: an empty `RequestItems`, then too many tables and the
+/// tables with too many items or none, in one refusal, then too many items in
+/// total.
 ///
 /// # Errors
 ///
@@ -91,23 +92,23 @@ pub(crate) fn check_batch_counts(
         }));
     }
 
-    if tables.len() > limit {
-        return Err(DynamoDbError::ValidationException(format!(
-            "1 validation error detected: Value at 'RequestItems' failed to satisfy constraint: Member must have length less than or equal to {limit}"
-        )));
-    }
-
-    // The service names each table with too many items or none, at most
-    // `MAX_PARTS` of them, before it counts the total, and counts only the
-    // tables it names. It listed them in a different order from one send to
+    // The service names the table count first when it is over the limit,
+    // then each table with too many items or none, at most `MAX_PARTS`
+    // clauses in all, before it counts the total, and counts only the clauses
+    // it lists. It listed the tables in a different order from one send to
     // the next (measured 2026-11-20).
-    let failed: Vec<(&str, usize)> = tables
-        .iter()
-        .filter_map(|&(t, count)| count.filter(|&n| n == 0 || n > limit).map(|n| (t, n)))
+    let member = if get { "member.Keys" } else { "member" };
+    let failed: Vec<(String, usize)> = (tables.len() > limit)
+        .then(|| ("RequestItems".to_owned(), tables.len()))
+        .into_iter()
+        .chain(tables.iter().filter_map(|&(t, count)| {
+            let n = count.filter(|&n| n == 0 || n > limit)?;
+            Some((format!("RequestItems.{t}.{member}"), n))
+        }))
         .take(MAX_PARTS)
         .collect();
     if !failed.is_empty() {
-        return Err(per_table_count_error(get, limit, &failed));
+        return Err(count_error(limit, &failed));
     }
 
     let total: usize = tables.iter().filter_map(|(_, n)| *n).sum();
@@ -119,21 +120,20 @@ pub(crate) fn check_batch_counts(
     Ok(())
 }
 
-/// The refusal naming each table of `failed`, whose key or write-request
-/// count is 0 or over `limit`, at its member path (measured 2026-11-20).
-fn per_table_count_error(get: bool, limit: usize, failed: &[(&str, usize)]) -> DynamoDbError {
-    let member = if get { "member.Keys" } else { "member" };
+/// The refusal naming each path of `failed`, `RequestItems` or a table's
+/// member path, whose count is 0 or over `limit` (measured 2026-11-20).
+fn count_error(limit: usize, failed: &[(String, usize)]) -> DynamoDbError {
     let n = failed.len();
     let errors = failed
         .iter()
-        .map(|&(table_name, count)| {
-            let bound = if count == 0 {
+        .map(|(path, count)| {
+            let bound = if *count == 0 {
                 "greater than or equal to 1".to_owned()
             } else {
                 format!("less than or equal to {limit}")
             };
             format!(
-                "Value at 'RequestItems.{table_name}.{member}' failed to satisfy constraint: Member must have length {bound}"
+                "Value at '{path}' failed to satisfy constraint: Member must have length {bound}"
             )
         })
         .collect::<Vec<_>>()
@@ -269,12 +269,6 @@ mod tests {
             message(check_request_item_counts("BatchGetItem", &bgi(&tables))),
             "1 validation error detected: Value at 'RequestItems' failed to satisfy constraint: Member must have length less than or equal to 100"
         );
-        // 101 tables with no keys: still the table count.
-        let tables: Vec<(&str, usize)> = many.iter().map(|t| (t.as_str(), 0)).collect();
-        assert!(
-            message(check_request_item_counts("BatchGetItem", &bgi(&tables)))
-                .ends_with("Member must have length less than or equal to 100")
-        );
         assert_eq!(
             message(check_request_item_counts(
                 "BatchGetItem",
@@ -316,13 +310,39 @@ mod tests {
         let g = |t: &str, bound: &str| at(&format!("RequestItems.{t}.member.Keys"), bound);
         let one = |c: String| format!("1 validation error detected: {c}");
         let two = |a: String, b: String| format!("2 validation errors detected: {a}; {b}");
-        let many = names(26);
+        let many = names(101);
         let first = |n: usize, count: usize| -> Vec<(&str, usize)> {
             many[..n].iter().map(|t| (t.as_str(), count)).collect()
         };
         let ten = |clause: &dyn Fn(&str) -> String| {
             let clauses: Vec<String> = many[..10].iter().map(|t| clause(t)).collect();
             format!("10 validation errors detected: {}", clauses.join("; "))
+        };
+        // `n` tables of one item, except none in `empty` and `big.1` at `big.0`.
+        let mix = |n: usize, empty: std::ops::Range<usize>, big: Option<(usize, usize)>| {
+            let mut tables = first(n, 1);
+            tables[empty].iter_mut().for_each(|t| t.1 = 0);
+            if let Some((i, count)) = big {
+                tables[i].1 = count;
+            }
+            tables
+        };
+        let gap = |n: usize, empty: std::ops::Range<usize>| mix(n, empty, None);
+        // The table count clause, then `tables`.
+        let over = |bound: &str, tables: &[String]| {
+            let clauses = [&[at("RequestItems", bound)][..], tables].concat();
+            format!(
+                "{} validation errors detected: {}",
+                clauses.len(),
+                clauses.join("; ")
+            )
+        };
+        // The table count clause, then `clause` of each table from t001 to t009.
+        // Past 9 failed tables, the service named another 9 on each send, so
+        // the rows with 10 failed tables expect the first 9 in name order.
+        let nine = |bound: &str, clause: &dyn Fn(&str) -> String| {
+            let tables: Vec<String> = many[1..10].iter().map(|t| clause(t)).collect();
+            over(bound, &tables)
         };
         let (bw, bg) = ("BatchWriteItem", "BatchGetItem");
         let cases = [
@@ -343,6 +363,15 @@ mod tests {
             ),
             (bw, bwi(&[("a", 20), ("b", 10), ("c", 0)]), one(w("c", GE1))),
             (bw, bwi(&first(11, 0)), ten(&|t| w(t, GE1))),
+            (bw, bwi(&gap(26, 13..14)), over(LE25, &[w("t013", GE1)])),
+            (bw, bwi(&gap(30, 13..14)), over(LE25, &[w("t013", GE1)])),
+            (bw, bwi(&gap(26, 1..10)), nine(LE25, &|t| w(t, GE1))),
+            (bw, bwi(&gap(26, 1..11)), nine(LE25, &|t| w(t, GE1))),
+            (
+                bw,
+                bwi(&mix(26, 5..6, Some((9, 26)))),
+                over(LE25, &[w("t005", GE1), w("t009", LE25)]),
+            ),
             (
                 bg,
                 bgi(&[("a", 101), ("b", 101)]),
@@ -355,6 +384,14 @@ mod tests {
                 two(g("a", LE100), g("b", GE1)),
             ),
             (bg, bgi(&[("a", 60), ("b", 41), ("c", 0)]), one(g("c", GE1))),
+            (bg, bgi(&gap(101, 50..51)), over(LE100, &[g("t050", GE1)])),
+            (bg, bgi(&gap(101, 1..10)), nine(LE100, &|t| g(t, GE1))),
+            (bg, bgi(&gap(101, 1..11)), nine(LE100, &|t| g(t, GE1))),
+            (
+                bg,
+                bgi(&mix(101, 5..6, Some((9, 101)))),
+                over(LE100, &[g("t005", GE1), g("t009", LE100)]),
+            ),
             (bg, bgi(&[("a", 101)]), one(g("a", LE100))),
             (bg, bgi(&[("a", 1), ("b", 0)]), one(g("b", GE1))),
         ];
