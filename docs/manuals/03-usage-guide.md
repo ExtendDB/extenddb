@@ -934,6 +934,7 @@ log.
 |---|---|
 | `ProcessedItemCount` | Rows read and attempted, including failed rows and condition failures. Rows after a parse-level abandon are not included. |
 | `FailedItemCount` | Rows that failed a parse-level or item-level check. Condition failures are not counted. |
+| `DroppedReportRecordCount` | Report records dropped past the server's report caps (see Error report). Present once a record was dropped. While the operation runs, it counts the drops up to the last checkpoint. ExtendDB's own member: the service returns no such member, and AWS SDKs skip a response member that their service model does not name. |
 | `ProcessedInputBytes` | Input bytes consumed, advanced to the end of each object as it finishes or is abandoned. Compressed bytes for `GZIP` and `ZSTD`. A `CANCELLED` or `FAILED` operation reports what was read before it stopped, except one that failed on its output location, which reports 0 (see Error report). |
 | `TotalInputBytes` | Sum of the listed input object sizes (compressed sizes for `GZIP` and `ZSTD`), recorded when the first claim lists the input. Absent before then, and on an operation whose input check or listing quota failed. `ProcessedInputBytes` is present exactly when this member is. |
 | `BulkOperationUsage` | Present once terminal: one entry for the table. The entry's `TableName` is the bare table name. `Table.BulkPutBytes` is the sum, over rows that were written, of the item's logical size in bytes with a 1,024 byte floor and no rounding above it; a row that replaced an item is charged the larger of the replaced item's size and its own. A row whose condition evaluated false is charged the 1,024 byte floor alone; rows that failed a parse-level or item-level check are not charged. Each secondary index entry is the same sum over the bytes its projection stores, and an index no row reached has no entry. A row that replaced an item and left an index's projection unchanged under the same index key charges that index nothing; one that changed the projection under the same key charges the larger of the old and new projections; one that moved the index key charges the old and the new projection. The top-level `BulkPutBytes` is the table figure plus every secondary index figure. Vector index entries carry `BulkPutVectorBytes` and are not included in the top-level figure. |
@@ -1049,9 +1050,17 @@ A record goes to its own kind's prefix when that kind was requested in
 records go to `condition-check-failures/`; with both requested, each kind
 has its own prefix.
 
-The records kept per operation are capped by `max_bulk_report_records` and
-their serialized size by `max_bulk_report_bytes`; records beyond either cap
-are dropped and the drop is logged. The counters are unaffected.
+The records kept per operation are capped by `max_bulk_report_records`
+(default 1,000,000) and their serialized size by `max_bulk_report_bytes`
+(default 1 GiB). The caps cover both report kinds together. They are
+ExtendDB's own: the service documents no cap on a report. Records are kept
+in the order the rows are read until a cap is reached. Each record past a cap
+is dropped and counted, and the counters are unaffected. Once a record is
+dropped, `DescribeBulkOperation` returns the count in
+`DroppedReportRecordCount` (see Counters). When the operation ends, the
+server logs the count and records it in the `BulkReportRecordsDropped`
+metric (see the Admin Guide). The report and the manifest keep the service's
+shape, so tooling written for them reads them unchanged.
 
 After the reports, every operation that read input writes a manifest to
 `{S3KeyPrefix}/AWSDynamoDB/BulkOperation/{account}:{operation id}/manifest-files.json`,

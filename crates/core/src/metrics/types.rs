@@ -64,6 +64,10 @@ pub enum MetricName {
     /// whose write committed; replayed rows and condition failures are not
     /// counted (dimensions: table).
     BulkPutItemsWritten,
+    /// Report records a bulk operation dropped past `max_bulk_report_records`
+    /// or `max_bulk_report_bytes`, the operation's total, recorded once by
+    /// the terminal transition that held the lease (dimensions: table).
+    BulkReportRecordsDropped,
     /// Store-backed backup jobs ended, one per job; the operation dimension
     /// carries the outcome ([`BackupJobOutcome`]: `succeeded`, `failed` or
     /// `cancelled`). `/metrics` emits it under this name as JSON, as it does
@@ -168,6 +172,7 @@ impl std::fmt::Display for MetricName {
             Self::BulkOperationsStarted => f.write_str("BulkOperationsStarted"),
             Self::BulkOperationsFinished => f.write_str("BulkOperationsFinished"),
             Self::BulkPutItemsWritten => f.write_str("BulkPutItemsWritten"),
+            Self::BulkReportRecordsDropped => f.write_str("BulkReportRecordsDropped"),
             Self::BackupJobs => f.write_str("BackupJobs"),
             Self::BackupJobDuration => f.write_str("BackupJobDuration"),
             Self::BackupBytesUploaded => f.write_str("BackupBytesUploaded"),

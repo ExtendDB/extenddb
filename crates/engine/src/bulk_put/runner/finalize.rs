@@ -304,6 +304,7 @@ pub(super) async fn finalize(
         st.failure = Some(Failure::items_failed_validation());
     }
     let status = terminal_status(st.failure.as_ref(), st.cancelled, st.failed);
+    let usage = st.usage_value(&record.table_arn);
     let (failure_code, failure_message) = match st.failure {
         Some(failure) => (Some(failure.code.into_owned()), Some(failure.message)),
         None => (None, None),
@@ -313,7 +314,7 @@ pub(super) async fn finalize(
         end_time_ms: epoch_millis(),
         failure_code,
         failure_message,
-        usage: st.usage.to_value(&record.table_arn),
+        usage,
     };
     // finish is conditional on the lease and turns a CANCELLING row into
     // CANCELLED whatever status the runner computed; it answers with the
@@ -362,7 +363,14 @@ pub(super) async fn finalize(
                 failed_item_count = st.failed,
                 "bulk operation reached a terminal state"
             );
-            record_finished_metrics(deps, account, &record.table_name, &stored, st.written);
+            record_finished_metrics(
+                deps,
+                account,
+                &record.table_name,
+                &stored,
+                st.written,
+                st.dropped_records,
+            );
             Ok(())
         }
     }
@@ -394,16 +402,19 @@ fn stop_for_unavailable_store(record: &BulkOperationRecord, st: &mut RunState) -
 /// The terminal-transition metrics, recorded only on the transition that
 /// held the lease, so a resumed operation is counted once. The status
 /// dimension is the status `finish` stored, which for a CANCELLING row is
-/// CANCELLED whatever the runner computed. `written`
-/// counts the rows whose write committed in this process; rows an earlier
-/// claim applied and condition failures are not counted. Both metrics
-/// are the account's, keyed by `account` as the request metrics are.
+/// CANCELLED whatever the runner computed. `written` feeds
+/// `BulkPutItemsWritten`: the rows whose write committed in this process;
+/// rows an earlier claim applied and condition failures are not counted.
+/// `dropped` feeds `BulkReportRecordsDropped`: the operation's total, the
+/// drops of every claim. The metrics are the account's, keyed by `account`
+/// as the request metrics are.
 fn record_finished_metrics(
     deps: &RunnerDeps,
     account: &str,
     table_name: &str,
     stored: &str,
     written: u64,
+    dropped: u64,
 ) {
     deps.metrics.record(
         MetricName::BulkOperationsFinished,
@@ -413,17 +424,22 @@ fn record_finished_metrics(
         None,
         Some(stored),
     );
-    if written > 0 {
-        // Bounded by max_bulk_item_count, far below 2^53, so the value
-        // is exact.
-        #[allow(clippy::cast_precision_loss)]
-        deps.metrics.record(
-            MetricName::BulkPutItemsWritten,
-            written as f64,
-            Some(account),
-            Some(table_name),
-            None,
-            None,
-        );
+    for (metric, count) in [
+        (MetricName::BulkPutItemsWritten, written),
+        (MetricName::BulkReportRecordsDropped, dropped),
+    ] {
+        if count > 0 {
+            // Both counts are bounded by max_bulk_item_count, far below
+            // 2^53, so the value is exact.
+            #[allow(clippy::cast_precision_loss)]
+            deps.metrics.record(
+                metric,
+                count as f64,
+                Some(account),
+                Some(table_name),
+                None,
+                None,
+            );
+        }
     }
 }

@@ -70,10 +70,11 @@ pub(super) fn end_with_held_location_fault(st: &mut RunState) {
     st.failure = Some(fault);
 }
 
-/// The usage value a checkpoint stores: the accumulated usage, and the held
-/// fault under [`HELD_FAULT_MEMBER`] while one is held.
+/// The usage value a checkpoint stores: the accumulated usage, the dropped
+/// report record count once a record was dropped, and the held fault under
+/// [`HELD_FAULT_MEMBER`] while one is held.
 pub(super) fn persisted_usage(st: &RunState, table_arn: &str) -> Value {
-    let mut usage = st.usage.to_value(table_arn);
+    let mut usage = st.usage_value(table_arn);
     if let (Some(fault), Some(members)) = (&st.held_location, usage.as_object_mut()) {
         members.insert(
             HELD_FAULT_MEMBER.to_owned(),

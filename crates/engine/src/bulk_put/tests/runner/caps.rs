@@ -135,92 +135,144 @@ async fn the_item_count_cap_stops_the_run_at_exactly_the_cap() {
     );
 }
 
-#[tokio::test]
-async fn records_past_the_report_cap_are_dropped_from_the_rendered_file() {
-    let h = Harness::new().await;
-    let mut rows: Vec<String> = (0..4).map(row_missing_sk).collect();
-    rows.push(row(4));
-    h.write_input("part-000.json", &file_of(&rows));
-    let files = h.enumerate().await;
-    let mut cfg = config();
-    cfg.max_report_records = 2;
-    let record = h
-        .run_to_end(files, input_config(false), both_reports(), cfg)
-        .await;
+// Report caps.
 
-    assert_eq!(record.status, "COMPLETED_WITH_ERRORS");
-    assert_eq!(record.processed_item_count, 5);
-    assert_eq!(
-        record.failed_item_count, 4,
-        "the counters are unaffected by the report cap"
-    );
-    let report = h
-        .read_report(&record.operation_id, ReportKind::Error)
-        .expect("error report rendered");
-    assert_eq!(report.len(), 2, "records past the cap are dropped");
-    let mut indexes: Vec<i64> = report
-        .iter()
-        .map(|r| r["itemLocation"]["itemIndex"].as_i64().unwrap())
-        .collect();
-    indexes.sort_unstable();
-    assert_eq!(indexes, [0, 1], "the earliest records are the kept ones");
+/// Which report cap a row of `REPORT_CAPS` sets to two records' worth.
+#[derive(Clone, Copy, Debug)]
+enum ReportCap {
+    Records,
+    Bytes,
 }
 
+/// The report cap table. Each row runs six rows that fail item validation,
+/// one error record each and all of one size, with batches of two rows,
+/// under a cap of two records. A row with a crash point stops its first
+/// runner once that many lines were read, past two checkpoints, as a crash
+/// does, and a second runner finishes the operation.
+const REPORT_CAPS: &[(&str, ReportCap, Option<u64>)] = &[
+    ("record cap", ReportCap::Records, None),
+    ("byte cap", ReportCap::Bytes, None),
+    ("record cap across a crash", ReportCap::Records, Some(4)),
+    ("byte cap across a crash", ReportCap::Bytes, Some(4)),
+];
+
+/// The `BulkReportRecordsDropped` series a collector holds.
+fn dropped_series(metrics: &MetricsCollector) -> Vec<extenddb_core::metrics::MetricSnapshot> {
+    metrics.query(&MetricsQuery {
+        metric: Some(MetricName::BulkReportRecordsDropped),
+        window: Some(TimeWindow::AllTime),
+        ..MetricsQuery::default()
+    })
+}
+
+/// Records past either cap are dropped while the counters stand, and the
+/// earliest records are the kept ones. The operation keeps the count of the
+/// dropped records with its checkpoints, so a resumed claim continues it,
+/// and the terminal transition records the total once under
+/// `BulkReportRecordsDropped`.
 #[tokio::test]
-async fn a_crash_resume_continues_the_record_cap_from_the_persisted_count() {
-    let h = Harness::new().await;
-    h.write_input(
-        "part-000.json",
-        &file_of(&(0..4).map(row_missing_sk).collect::<Vec<_>>()),
-    );
-    let files = h.enumerate().await;
-    let op = h.start(files, input_config(false), both_reports()).await;
-    let record = h.claim("runner-1", STORE_LEASE).await;
+async fn records_past_a_report_cap_are_dropped_and_counted() {
+    let rows: Vec<String> = (0..6).map(row_missing_sk).collect();
+    // Calibration: the same input under the roomy caps of `config()` gives
+    // the size of one record.
+    let calibration = Harness::new().await;
+    calibration.write_input("part-000.json", &file_of(&rows));
+    let files = calibration.enumerate().await;
+    let record = calibration
+        .run_to_end(files, input_config(false), both_reports(), config())
+        .await;
+    let report = calibration
+        .read_report(&record.operation_id, ReportKind::Error)
+        .expect("calibration report rendered");
+    assert_eq!(report.len(), 6);
+    let size = calibrated_record_bytes(&report);
 
-    // Rows 0 and 1 checkpoint with two kept records, exhausting the cap;
-    // the runner dies with rows 2 and 3 unread.
-    let notify = Arc::new(tokio::sync::Notify::new());
-    let source = Arc::new(PendAfterSource {
-        inner: h.fs_source(),
-        after: 2,
-        handed: Arc::new(AtomicU64::new(0)),
-        notify: Arc::clone(&notify),
-    });
-    let mut cfg = config();
-    cfg.batch_size = 2;
-    cfg.max_report_records = 2;
-    let deps =
-        h.with_short_store_lease(h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink())));
-    tokio::select! {
-        _ = runner::run(&deps, record) => panic!("the runner must not finish while the reader pends"),
-        () = notify.notified() => {}
+    for &(name, cap, crash_after) in REPORT_CAPS {
+        let h = Harness::new().await;
+        h.write_input("part-000.json", &file_of(&rows));
+        let files = h.enumerate().await;
+        let op = h.start(files, input_config(false), both_reports()).await;
+        let capped = || {
+            let mut cfg = config();
+            cfg.batch_size = 2;
+            match cap {
+                ReportCap::Records => cfg.max_report_records = 2,
+                ReportCap::Bytes => cfg.max_report_bytes = 2 * size,
+            }
+            cfg
+        };
+        if let Some(after) = crash_after {
+            // Rows 0 to 3 checkpoint in two batches: two kept records and
+            // two dropped ones. The runner dies with rows 4 and 5 unread.
+            let record = h.claim("runner-1", STORE_LEASE).await;
+            let notify = Arc::new(tokio::sync::Notify::new());
+            let source = Arc::new(PendAfterSource {
+                inner: h.fs_source(),
+                after,
+                handed: Arc::new(AtomicU64::new(0)),
+                notify: Arc::clone(&notify),
+            });
+            let deps = h.with_short_store_lease(h.deps_with(
+                "runner-1",
+                capped(),
+                source,
+                Arc::new(h.fs_sink()),
+            ));
+            tokio::select! {
+                _ = runner::run(&deps, record) => panic!("{name}: the runner must not finish while the reader pends"),
+                () = notify.notified() => {}
+            }
+            let mid = h.record(&op).await;
+            assert_eq!(mid.cursor_row_index, 4, "{name}");
+            assert_eq!(mid.failed_item_count, 4, "{name}");
+            assert_eq!(
+                crate::bulk_put::usage::dropped_report_records(&mid.usage),
+                2,
+                "{name}: the checkpoint stores the dropped count"
+            );
+            assert!(
+                dropped_series(&deps.metrics).is_empty(),
+                "{name}: a claim that stops records no drop"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let record = h.claim("runner-2", Duration::from_secs(60)).await;
+        let deps = h.deps("runner-2", capped());
+        runner::run(&deps, record).await.expect("runner run");
+
+        let record = h.record(&op).await;
+        assert_eq!(record.status, "COMPLETED_WITH_ERRORS", "{name}");
+        assert_eq!(
+            record.failed_item_count, 6,
+            "{name}: the counters are unaffected by the cap"
+        );
+        let report = h
+            .read_report(&op, ReportKind::Error)
+            .expect("error report rendered");
+        let mut indexes: Vec<i64> = report
+            .iter()
+            .map(|r| r["itemLocation"]["itemIndex"].as_i64().unwrap())
+            .collect();
+        indexes.sort_unstable();
+        assert_eq!(
+            indexes,
+            [0, 1],
+            "{name}: the earliest records are the kept ones"
+        );
+        assert_eq!(
+            crate::bulk_put::usage::dropped_report_records(&record.usage),
+            4,
+            "{name}: the terminal record counts every dropped record"
+        );
+        let series = dropped_series(&deps.metrics);
+        assert_eq!(series.len(), 1, "{name}: one series: {series:?}");
+        assert_eq!(series[0].sum, 4.0, "{name}");
+        assert!(
+            series[0]
+                .dimensions
+                .contains(&Dimension::TableName(TABLE.to_owned())),
+            "{name}: {:?}",
+            series[0].dimensions
+        );
     }
-    let mid = h.record(&op).await;
-    assert_eq!(mid.cursor_row_index, 2);
-    assert_eq!(mid.failed_item_count, 2);
-
-    // The resumed runner restores the kept count from the record instead
-    // of starting from zero, so rows 2 and 3 are dropped from the report.
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    let record = h.claim("runner-2", Duration::from_secs(60)).await;
-    let mut cfg2 = config();
-    cfg2.batch_size = 2;
-    cfg2.max_report_records = 2;
-    runner::run(&h.deps("runner-2", cfg2), record)
-        .await
-        .expect("resumed run");
-
-    let record = h.record(&op).await;
-    assert_eq!(record.status, "COMPLETED_WITH_ERRORS");
-    assert_eq!(record.failed_item_count, 4, "counters are unaffected");
-    let report = h
-        .read_report(&op, ReportKind::Error)
-        .expect("error report rendered");
-    assert_eq!(report.len(), 2, "the cap holds across the resume");
-    let mut indexes: Vec<i64> = report
-        .iter()
-        .map(|r| r["itemLocation"]["itemIndex"].as_i64().unwrap())
-        .collect();
-    indexes.sort_unstable();
-    assert_eq!(indexes, [0, 1]);
 }

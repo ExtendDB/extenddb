@@ -161,6 +161,10 @@ pub(super) struct RunState {
     /// Serialized bytes of those records, against the byte cap. Restored
     /// from the operation record on claim, like the count.
     pub(super) kept_bytes: u64,
+    /// Records dropped past either cap. Restored from the operation
+    /// record's stored usage value on claim and stored there by every
+    /// checkpoint and by the terminal transition, so the count covers every
+    /// claim of the operation.
     pub(super) dropped_records: u64,
     pub(super) rows_since_checkpoint: usize,
     /// Physical lines consumed by this runner, blank and skipped lines
@@ -350,6 +354,7 @@ impl RunState {
             output_checked: record.report_record_count > 0,
             kept_records: record.report_record_count,
             kept_bytes: record.report_bytes,
+            dropped_records: crate::bulk_put::usage::dropped_report_records(&record.usage),
             cursor_file,
             cursor_row: non_negative("cursor_row_index", record.cursor_row_index)?,
             abandoned,
@@ -357,6 +362,15 @@ impl RunState {
             file_etags,
             ..Self::default()
         })
+    }
+
+    /// The accumulated usage with the dropped report record count, the value
+    /// a checkpoint and the terminal transition store.
+    pub(super) fn usage_value(&self, table_arn: &str) -> Value {
+        crate::bulk_put::usage::with_dropped_report_records(
+            self.usage.to_value(table_arn),
+            self.dropped_records,
+        )
     }
 
     /// One checkpoint's worth of progress; drains the pending records.

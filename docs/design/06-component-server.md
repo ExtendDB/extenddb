@@ -368,6 +368,7 @@ ExtendDB-internal:
 - `BulkOperationsStarted` (dimension: `TableName`)
 - `BulkOperationsFinished` (dimensions: `TableName`, and `Operation` carrying the terminal status)
 - `BulkPutItemsWritten` (dimension: `TableName`; rows the committing process wrote, excluding replayed rows and condition failures)
+- `BulkReportRecordsDropped` (dimension: `TableName`; report records the operation dropped past the report caps, its total over every claim, recorded at the terminal transition)
 
 **Dimensions** (from the `Dimension` enum):
 

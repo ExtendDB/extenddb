@@ -132,6 +132,8 @@ pub(crate) fn describe(
             .is_terminal()
             .then(|| vec![usage::usage_from_value(&record.usage, &record.table_name)]),
         failed_item_count: Some(non_negative(record.failed_item_count)),
+        dropped_report_record_count: Some(usage::dropped_report_records(&record.usage))
+            .filter(|dropped| *dropped > 0),
         failure_code: record.failure_code.clone(),
         failure_message: record.failure_message.clone(),
         max_write_request_units: record.max_write_request_units,

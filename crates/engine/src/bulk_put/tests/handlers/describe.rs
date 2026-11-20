@@ -214,6 +214,36 @@ async fn a_failed_operation_description_carries_the_failure_fields() {
     assert!(description["EndTime"].is_f64(), "EndTime must be present");
 }
 
+/// `DroppedReportRecordCount` is the count of report records dropped past
+/// `max_bulk_report_records`, and is absent while none was dropped. Three
+/// rows fail; each row of the table is a record cap and the member the
+/// description carries under it.
+#[tokio::test]
+async fn the_description_counts_the_report_records_dropped_past_the_cap() {
+    for (cap, dropped) in [(1, Some(2)), (3, None)] {
+        let h = Harness::new().await;
+        let rows: Vec<String> = (0..3).map(row_missing_sk).collect();
+        h.write_input("part-000.json", &file_of(&rows));
+        let files = h.enumerate().await;
+        let mut config = runner_config();
+        config.max_report_records = cap;
+        let record = h
+            .run_to_end(files, stored_input_config(), stored_output_config(), config)
+            .await;
+        let arn = arn_of(ACCOUNT, &record.operation_id);
+        let response = describe(&base_ctx(&h), &arn).await.expect("describe");
+        let description = &response["BulkOperationDescription"];
+        assert_eq!(
+            description
+                .get("DroppedReportRecordCount")
+                .and_then(Value::as_u64),
+            dropped,
+            "cap {cap}"
+        );
+        assert_eq!(description["FailedItemCount"], json!(3), "cap {cap}");
+    }
+}
+
 #[tokio::test]
 async fn an_unknown_stored_status_answers_internal_server_error() {
     let h = Harness::new().await;

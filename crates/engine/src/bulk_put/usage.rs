@@ -35,6 +35,32 @@ const LOCAL_SECONDARY_INDEXES: &str = "LocalSecondaryIndexes";
 const VECTOR_INDEXES: &str = "VectorIndexes";
 const BULK_PUT_VECTOR_BYTES: &str = "BulkPutVectorBytes";
 
+/// The member of the stored value that counts the report records the
+/// operation dropped past `max_bulk_report_records` or
+/// `max_bulk_report_bytes`. The checkpoints and the terminal transition
+/// store it once a record is dropped, a claim that resumes restores it, and
+/// Describe renders it as `DroppedReportRecordCount`. `usage_from_value`
+/// reads the named usage members only, so `BulkOperationUsage` never
+/// carries it.
+const DROPPED_REPORT_RECORDS: &str = "DroppedReportRecords";
+
+/// `value` with the dropped report record count stored, when it is above
+/// zero.
+pub(crate) fn with_dropped_report_records(mut value: Value, dropped: u64) -> Value {
+    if dropped > 0
+        && let Some(members) = value.as_object_mut()
+    {
+        members.insert(DROPPED_REPORT_RECORDS.to_owned(), Value::from(dropped));
+    }
+    value
+}
+
+/// The dropped report record count a stored value carries; zero when it
+/// carries none.
+pub(crate) fn dropped_report_records(value: &Value) -> u64 {
+    member_u64(value, DROPPED_REPORT_RECORDS)
+}
+
 /// Running usage figures, restored from the record and persisted with
 /// every checkpoint. All values are bytes.
 #[derive(Debug, Default, PartialEq, Eq)]

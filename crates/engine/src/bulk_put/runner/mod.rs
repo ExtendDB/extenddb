@@ -166,7 +166,8 @@ pub(crate) struct RunnerDeps {
     pub owner: String,
     pub config: RunnerConfig,
     /// Collector for the terminal-transition metrics: `finalize` records
-    /// `BulkOperationsFinished` and `BulkPutItemsWritten`.
+    /// `BulkOperationsFinished`, `BulkPutItemsWritten` and
+    /// `BulkReportRecordsDropped`.
     pub metrics: Arc<MetricsCollector>,
     /// The process-wide write pacer, shared by every runner in this server
     /// and sized by `bulk_put_write_units_per_second`. Every row write takes

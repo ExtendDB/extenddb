@@ -67,6 +67,8 @@ fn fully_populated_description_uses_the_model_wire_names() {
     }
     assert!(value["BulkOperationUsage"].is_array());
     assert_eq!(value["PerformanceTier"], json!("STANDARD"));
+    // ExtendDB's own member, outside the model.
+    assert_eq!(value["DroppedReportRecordCount"], json!(2));
 }
 
 #[test]

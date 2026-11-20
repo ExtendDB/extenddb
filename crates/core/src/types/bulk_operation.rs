@@ -435,6 +435,15 @@ pub struct BulkOperationDescription {
     /// Rows that failed a parse-level or item-level check.
     #[serde(rename = "FailedItemCount", skip_serializing_if = "Option::is_none")]
     pub failed_item_count: Option<u64>,
+    /// Report records the operation dropped past the server's
+    /// `max_bulk_report_records` or `max_bulk_report_bytes`, present only
+    /// once a record was dropped. ExtendDB's own member: the service model
+    /// does not name it, so an SDK built from that model skips it.
+    #[serde(
+        rename = "DroppedReportRecordCount",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub dropped_report_record_count: Option<u64>,
     /// Exception type name explaining a `FAILED` status.
     #[serde(rename = "FailureCode", skip_serializing_if = "Option::is_none")]
     pub failure_code: Option<String>,
