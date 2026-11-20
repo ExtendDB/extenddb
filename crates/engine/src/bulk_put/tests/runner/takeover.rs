@@ -193,16 +193,16 @@ fn holding_first_batch(
     h.deps_with_storage("runner-1", window(5, 5), Arc::new(faulting))
 }
 
-/// Storage for the claim that ends the operation: its ledger delete, the
-/// step after the terminal transition, signals `finished` and waits for
-/// `deleted`, so the earlier claim's batch can be released in between.
-fn holding_ledger_delete(
+/// Storage for the claim that ends the operation: its terminal `finish`
+/// commits, then signals `finished` and waits for `resume`, so the earlier
+/// claim's batch can be released right after the terminal transition.
+fn holding_after_finish(
     h: &Harness,
     finished: &Arc<tokio::sync::Notify>,
-    deleted: &Arc<tokio::sync::Notify>,
+    resume: &Arc<tokio::sync::Notify>,
 ) -> Arc<dyn StorageEngine> {
     let mut faulting = FaultingStorage::new(&h.storage);
-    faulting.hold_ledger_delete = Some((Arc::clone(finished), Arc::clone(deleted)));
+    faulting.hold_after_finish = Some((Arc::clone(finished), Arc::clone(resume)));
     Arc::new(faulting)
 }
 
@@ -229,22 +229,22 @@ async fn a_batch_in_flight_writes_nothing_after_a_store_mismatch_fails_the_opera
     }
 
     // The lease runs out. Runner-2 runs on a server configured with the S3
-    // store and ends the filesystem operation FAILED; it is held after its
-    // terminal transition, before its ledger delete.
+    // store and ends the filesystem operation FAILED; it is held right after
+    // its terminal transition commits.
     tokio::time::sleep(Duration::from_millis(250)).await;
     let record = h.claim("runner-2", Duration::from_secs(60)).await;
     let finished = Arc::new(tokio::sync::Notify::new());
-    let deleted = Arc::new(tokio::sync::Notify::new());
+    let resume = Arc::new(tokio::sync::Notify::new());
     let mut deps2 = h.deps_with_storage(
         "runner-2",
         window(5, 5),
-        holding_ledger_delete(&h, &finished, &deleted),
+        holding_after_finish(&h, &finished, &resume),
     );
     deps2.store_kind = STORE_S3;
     let run2 = runner::run(&deps2, record);
     tokio::pin!(run2);
     tokio::select! {
-        _ = &mut run2 => panic!("runner-2 must reach its ledger delete"),
+        _ = &mut run2 => panic!("runner-2 must reach its terminal transition"),
         () = finished.notified() => {}
     }
     assert_eq!(h.record(&op).await.status, "FAILED");
@@ -256,7 +256,7 @@ async fn a_batch_in_flight_writes_nothing_after_a_store_mismatch_fails_the_opera
         late.is_ok(),
         "a claim that lost the operation stops cleanly, got {late:?}"
     );
-    deleted.notify_one();
+    resume.notify_one();
     run2.await.expect("runner-2's run");
 
     assert_eq!(
@@ -292,18 +292,18 @@ async fn a_batch_in_flight_writes_nothing_after_the_no_store_cancel_drain_case(b
     }
 
     // The caller cancels and runner-1's lease runs out. The no-store
-    // worker claims the operation, ends it CANCELLED, and is held after the
-    // terminal transition, before its ledger delete.
+    // worker claims the operation, ends it CANCELLED, and is held right
+    // after its terminal transition commits.
     h.storage
         .request_cancel(ACCOUNT, &op)
         .await
         .expect("request cancel");
     tokio::time::sleep(Duration::from_millis(250)).await;
     let finished = Arc::new(tokio::sync::Notify::new());
-    let deleted = Arc::new(tokio::sync::Notify::new());
+    let resume = Arc::new(tokio::sync::Notify::new());
     let token = CancellationToken::new();
     let drain = tokio::spawn(bulk_operation_worker_with_interval(
-        holding_ledger_delete(&h, &finished, &deleted),
+        holding_after_finish(&h, &finished, &resume),
         Arc::new(LimitsConfig::default()),
         Arc::from(REGION),
         None,
@@ -314,7 +314,7 @@ async fn a_batch_in_flight_writes_nothing_after_the_no_store_cancel_drain_case(b
     ));
     tokio::time::timeout(Duration::from_secs(10), finished.notified())
         .await
-        .expect("the cancel drain reaches its ledger delete");
+        .expect("the cancel drain reaches its terminal transition");
     assert_eq!(h.record(&op).await.status, "CANCELLED");
 
     // Runner-1's batch of five rows now reaches storage.
@@ -324,7 +324,7 @@ async fn a_batch_in_flight_writes_nothing_after_the_no_store_cancel_drain_case(b
         late.is_ok(),
         "a claim that lost the operation stops cleanly, got {late:?}"
     );
-    deleted.notify_one();
+    resume.notify_one();
     token.cancel();
     tokio::time::timeout(Duration::from_secs(10), drain)
         .await

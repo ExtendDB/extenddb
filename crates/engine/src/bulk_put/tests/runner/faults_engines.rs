@@ -146,7 +146,20 @@ impl BulkOperationStore for FaultingStorage {
                 unreachable!("pending never resolves")
             });
         }
-        self.inner.finish(account_id, operation_id, owner, outcome)
+        let hold = self
+            .hold_after_finish
+            .as_ref()
+            .filter(|_| !self.finish_hold_fired.swap(true, Ordering::SeqCst))
+            .cloned();
+        let fut = self.inner.finish(account_id, operation_id, owner, outcome);
+        Box::pin(async move {
+            let state = fut.await;
+            if let Some((entered, release)) = hold {
+                entered.notify_one();
+                release.notified().await;
+            }
+            state
+        })
     }
 
     fn list_purgeable_before(
