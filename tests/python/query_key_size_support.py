@@ -31,7 +31,6 @@ RANGE_MESSAGE = (
     "One or more parameter values were invalid: "
     "Aggregated size of all range keys has exceeded the size limit of 1024 bytes"
 )
-MISSING_HASH_MESSAGE = "Query condition missed key schema element: h"
 
 
 def S(length: int, fill: str = "x") -> dict:
@@ -96,31 +95,6 @@ def refused_ending(client, suffix: str, **query) -> None:
     assert err["Error"]["Message"].endswith(suffix), err["Error"]["Message"]
 
 
-def require_multi_range(client, **query) -> None:
-    """Skip unless the server runs ``query``'s key condition on a multi-RANGE index.
-
-    Sends ``query`` with every value cut to its first byte. A server that does
-    not yet serve several RANGE clauses on one index refuses it as
-    ``Query condition missed key schema element: h``; a backend that cannot yet
-    read an index with several RANGE attributes at all answers
-    ``InternalServerError`` to any Query on it, whatever the clause count. The
-    test is then skipped and passes without an edit once the server serves
-    the shape.
-    """
-    probe = dict(query)
-    probe["ExpressionAttributeValues"] = {
-        name: {"S": value["S"][:1]} for name, value in query["ExpressionAttributeValues"].items()
-    }
-    try:
-        client.query(**probe)
-    except ClientError as exc:
-        err = exc.response["Error"]
-        if err["Message"] == MISSING_HASH_MESSAGE:
-            pytest.skip("multi-attribute range conditions need the #429 change")
-        if err["Code"] == "InternalServerError":
-            pytest.skip("multi-attribute range Query is not supported by this backend yet")
-
-
 FIRST_RANGE_ONLY_MARK = "applies a key condition to the first RANGE attribute"
 
 
@@ -131,8 +105,7 @@ def require_served(client, **query) -> None:
     attribute of a multi-attribute index only, and refuse a condition on a later
     one with a ValidationException that says so. The size checks run before that
     refusal, so only the rows that expect a Query to be served call this. Sends
-    ``query`` with every value cut to its first byte, as ``require_multi_range``
-    does.
+    ``query`` with every value cut to its first byte.
     """
     probe = dict(query)
     probe["ExpressionAttributeValues"] = {
@@ -227,11 +200,15 @@ def binary_table(dynamodb_client):
 
 @pytest.fixture(scope="module")
 def index_table(dynamodb_client):
-    """HASH ``pk`` and RANGE ``sk``; LSI ``lsi`` on RANGE ``l``; GSI ``gsi`` on ``g`` and ``gs``."""
+    """HASH ``pk`` and RANGE ``sk``; LSI ``lsi`` on RANGE ``l``; GSI ``gsi`` on ``g`` and ``gs``.
+
+    Two KEYS_ONLY GSIs as well: ``gko`` on HASH ``g`` and ``ngsi`` on HASH ``n`` (N).
+    """
+    keys_only = {"ProjectionType": "KEYS_ONLY"}
     with make_table(
         dynamodb_client,
         "qks-idx",
-        AttributeDefinitions=[attr(n) for n in ("pk", "sk", "l", "g", "gs")],
+        AttributeDefinitions=[attr(n) for n in ("pk", "sk", "l", "g", "gs")] + [attr("n", "N")],
         KeySchema=[key("pk", "HASH"), key("sk", "RANGE")],
         LocalSecondaryIndexes=[
             {
@@ -245,7 +222,9 @@ def index_table(dynamodb_client):
                 "IndexName": "gsi",
                 "KeySchema": [key("g", "HASH"), key("gs", "RANGE")],
                 "Projection": {"ProjectionType": "ALL"},
-            }
+            },
+            {"IndexName": "gko", "KeySchema": [key("g", "HASH")], "Projection": keys_only},
+            {"IndexName": "ngsi", "KeySchema": [key("n", "HASH")], "Projection": keys_only},
         ],
     ) as name:
         yield name

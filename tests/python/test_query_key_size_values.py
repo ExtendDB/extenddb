@@ -2,13 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Query key size rows for multi-byte values, ordered BETWEEN bounds, undefined
-references, a hash-only table and a GSI.
+references, a hash-only table, a GSI and number key values.
 
-Measured on the service on 2026-10-23 (``issues/query-parity/service-435-review.jsonl``,
-labels 1 to 4, 6, 10). The main key size rows are in ``test_query_key_size.py``.
+Measured on the service in us-east-1 on 2026-10-23, the number rows on
+2026-11-20. The main key size rows are in ``test_query_key_size.py``.
 """
 
 from __future__ import annotations
+
+import pytest
 
 from query_key_size_support import (  # noqa: F401  (fixtures are used by name)
     HASH_MESSAGE,
@@ -181,3 +183,48 @@ class TestIndexRangeClauses:
             KeyConditionExpression="pk = :p AND begins_with(l, :v)",
             ExpressionAttributeValues={":p": S(1, "p"), ":v": S(1025, "l")},
         )
+
+
+DIGITS_MESSAGE = "Attempting to store more than 38 significant digits in a Number"
+OVERFLOW_MESSAGE = (
+    "Number overflow. Attempting to store a number with magnitude larger than supported range"
+)
+
+
+class TestNumberKeyValues:
+    """GSI ``ngsi`` with HASH ``n`` (N), measured 2026-11-20 in us-east-1.
+
+    A number that breaks the number rules gets the number's sentence, not the
+    size sentence, and a valid number is sized after it is normalized, so 2100
+    zeros followed by ``1`` is served.
+    """
+
+    @pytest.mark.parametrize("syntax", ["expression", "legacy"])
+    @pytest.mark.parametrize(
+        ("number", "message"),
+        [
+            pytest.param("1" * 2049, DIGITS_MESSAGE, id="2049-digits"),
+            pytest.param("1" * 39, DIGITS_MESSAGE, id="39-digits"),
+            pytest.param("1" + "0" * 2100, OVERFLOW_MESSAGE, id="1-then-2100-zeros"),
+            pytest.param("0" * 2100 + "1", None, id="2100-zeros-then-1"),
+        ],
+    )
+    def test_a_number_is_checked_before_it_is_sized(
+        self, dynamodb_client, index_table, number, message, syntax
+    ):
+        if syntax == "expression":
+            condition = {
+                "KeyConditionExpression": "n = :v",
+                "ExpressionAttributeValues": {":v": {"N": number}},
+            }
+        else:
+            condition = {
+                "KeyConditions": {
+                    "n": {"ComparisonOperator": "EQ", "AttributeValueList": [{"N": number}]}
+                }
+            }
+        query = {"TableName": index_table, "IndexName": "ngsi", **condition}
+        if message is None:
+            assert dynamodb_client.query(**query)["Count"] == 0
+        else:
+            refused(dynamodb_client, message, **query)

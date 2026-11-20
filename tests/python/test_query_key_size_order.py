@@ -4,15 +4,16 @@
 """Where the Query key size refusal sits among the other Query refusals.
 
 Each test sends a 2049-byte partition key value together with one other
-fault and asserts which refusal comes back. Measured on the service
-2026-10-23 (``issues/query-parity/service-435-shapes.jsonl`` rows 8a to 8h and
-``service-435-review.jsonl`` rows 7a to 7h): a missing table, a wrong
+fault and asserts which refusal comes back. Measured on the service in
+us-east-1 on 2026-10-23: a missing table, a wrong
 IndexName, ConsistentRead on a GSI, Limit 0, a key condition that misses the
 key schema, a projection syntax error, Select against a projection, an
 undefined filter name, a filter operand type, Select ALL_PROJECTED_ATTRIBUTES
 on a base table, overlapping projection paths, an unused expression name, a
 FilterExpression syntax error and an unused expression value are all reported
-ahead of the size; an invalid ExclusiveStartKey is reported after it.
+ahead of the size; an invalid ExclusiveStartKey is reported after it. On a
+KEYS_ONLY GSI, Select ALL_ATTRIBUTES is reported after the size, with and
+without an ExclusiveStartKey (measured 2026-11-20).
 
 Where ExtendDB words a syntax error differently from the service, the test
 checks the label that precedes the wording and that the size refusal did not
@@ -21,10 +22,6 @@ come back.
 
 from __future__ import annotations
 
-import os
-
-import boto3
-import botocore.config
 import pytest
 from botocore.exceptions import ClientError
 
@@ -37,24 +34,6 @@ from query_key_size_support import (  # noqa: F401  (fixtures are used by name)
 )
 
 BIG = S(2049, "p")
-
-
-@pytest.fixture(scope="module")
-def unvalidated_client(endpoint_url):
-    """A client with botocore parameter validation off, so Limit 0 reaches the server."""
-    kwargs: dict = {
-        "service_name": "dynamodb",
-        "region_name": os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
-        "config": botocore.config.Config(
-            parameter_validation=False, retries={"max_attempts": 0}
-        ),
-    }
-    if endpoint_url:
-        kwargs["endpoint_url"] = endpoint_url
-        if endpoint_url.startswith("https://"):
-            ca_cert = os.environ.get("EXTENDDB_CA_CERT", "")
-            kwargs["verify"] = ca_cert if ca_cert else False
-    return boto3.client(**kwargs)
 
 
 def _error(client, **query) -> dict:
@@ -116,9 +95,9 @@ def test_consistent_read_on_a_gsi_is_reported_first(dynamodb_client, index_table
     assert err["Message"] == "Consistent reads are not supported on global secondary indexes"
 
 
-def test_limit_zero_is_reported_first(unvalidated_client, index_table):
+def test_limit_zero_is_reported_first(raw_client, index_table):
     err = _error(
-        unvalidated_client,
+        raw_client,
         TableName=index_table,
         Limit=0,
         KeyConditionExpression="pk = :p",
@@ -262,3 +241,37 @@ def test_exclusive_start_key_of_the_wrong_type_is_reported_after(
         HASH_MESSAGE,
         ExclusiveStartKey={"pk": {"N": "1"}, "sk": S(1, "s")},
     )
+
+
+SELECT_ON_KEYS_ONLY_MESSAGE = (
+    "One or more parameter values were invalid: Select type ALL_ATTRIBUTES is not "
+    "supported for global secondary index gko because its projection type is not ALL"
+)
+START_KEY = {"g": S(1, "x"), "pk": S(1, "a"), "sk": S(1, "b")}
+
+
+@pytest.mark.parametrize(
+    ("value", "start_key", "message"),
+    [
+        pytest.param(BIG, None, HASH_MESSAGE, id="2049-bytes"),
+        pytest.param(BIG, START_KEY, HASH_MESSAGE, id="2049-bytes-with-a-start-key"),
+        pytest.param(S(1, "x"), None, SELECT_ON_KEYS_ONLY_MESSAGE, id="1-byte"),
+        pytest.param(S(1, "x"), START_KEY, SELECT_ON_KEYS_ONLY_MESSAGE, id="1-byte-with-a-start-key"),
+    ],
+)
+def test_select_all_attributes_on_a_keys_only_gsi_is_reported_after(
+    dynamodb_client, index_table, value, start_key, message
+):
+    # Measured 2026-11-20 in us-east-1, each shape twice.
+    query = {
+        "TableName": index_table,
+        "IndexName": "gko",
+        "Select": "ALL_ATTRIBUTES",
+        "KeyConditionExpression": "g = :v",
+        "ExpressionAttributeValues": {":v": value},
+    }
+    if start_key is not None:
+        query["ExclusiveStartKey"] = start_key
+    err = _error(dynamodb_client, **query)
+    assert err["Code"] == "ValidationException"
+    assert err["Message"] == message

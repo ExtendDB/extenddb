@@ -12,19 +12,13 @@ sentence is its own. Every RANGE clause counts whatever its operator; a BETWEEN
 counts the larger of its two bounds, so two 600-byte bounds pass and bounds of
 1 and 1025 bytes are refused.
 
-Every row below was measured on the service: the GSI hash and range rows on
-2026-10-21 (index ``idx`` with HASH ``h`` and RANGE ``a``, ``b``, ``c``, ``d``,
-all S), the base table rows on 2026-10-22 (HASH ``pk``, RANGE ``sk``, both S),
-and the operator, BETWEEN, binary, LSI, legacy, multi-attribute and two-HASH
-rows on 2026-10-23 (``issues/query-parity/service-435-shapes.jsonl``,
-``service-435-review.jsonl`` and ``service-435-440-review-2.jsonl``). Rows that
-send several RANGE clauses on one index are skipped on a server that refuses
-that shape earlier as ``Query condition missed key schema element: h``, and the
-``idx`` accept rows are skipped on a backend that answers ``InternalServerError``
-to any Query on an index with several RANGE attributes (see
-``query_key_size_support.require_multi_range``). The ``idx`` accept rows with a
-condition on a later RANGE attribute are also skipped on a backend that applies
-a key condition to the first RANGE attribute only (MongoDB and Cassandra, see
+Every row below was measured on the service in us-east-1: the GSI hash and range
+rows on 2026-10-21 (index ``idx`` with HASH ``h`` and RANGE ``a``, ``b``, ``c``,
+``d``, all S), the base table rows on 2026-10-22 (HASH ``pk``, RANGE ``sk``,
+both S), and the operator, BETWEEN, binary, LSI, legacy, multi-attribute and
+two-HASH rows on 2026-10-23. The ``idx`` accept rows with a condition on a later
+RANGE attribute are skipped on a backend that applies a key condition to the
+first RANGE attribute only (MongoDB and Cassandra, see
 ``query_key_size_support.require_served``). Multi-byte
 values, ordered BETWEEN bounds, undefined references and a hash-only table are in
 ``test_query_key_size_values.py``; the order against other refusals is in
@@ -46,7 +40,6 @@ from query_key_size_support import (  # noqa: F401  (fixtures are used by name)
     gsi_table,
     index_table,
     refused,
-    require_multi_range,
     require_served,
     two_hash_table,
 )
@@ -80,7 +73,6 @@ class TestGsiQueryKeySize:
 
     def test_one_600_byte_range_value_is_accepted(self, dynamodb_client, gsi_table):
         query = self._query("h = :h AND a = :s600", {":h": S(1, "h"), ":s600": S(600)})
-        require_multi_range(dynamodb_client, TableName=gsi_table, **query)
         assert dynamodb_client.query(TableName=gsi_table, **query)["Count"] == 0
 
     def test_two_600_byte_range_values_are_refused_together(
@@ -90,7 +82,6 @@ class TestGsiQueryKeySize:
             "h = :h AND a = :s600 AND b = :b AND c = :s600",
             {":h": S(1, "h"), ":s600": S(600), ":b": S(1, "b")},
         )
-        require_multi_range(dynamodb_client, TableName=gsi_table, **query)
         refused(dynamodb_client, RANGE_MESSAGE, TableName=gsi_table, **query)
 
     def test_two_range_values_totalling_1024_bytes_are_accepted(
@@ -100,7 +91,6 @@ class TestGsiQueryKeySize:
             "h = :h AND a = :a AND b = :b",
             {":h": S(1, "h"), ":a": S(512, "a"), ":b": S(512, "b")},
         )
-        require_multi_range(dynamodb_client, TableName=gsi_table, **query)
         require_served(dynamodb_client, TableName=gsi_table, **query)
         assert dynamodb_client.query(TableName=gsi_table, **query)["Count"] == 0
 
@@ -111,7 +101,6 @@ class TestGsiQueryKeySize:
             "h = :h AND a = :a AND b = :b",
             {":h": S(1, "h"), ":a": S(512, "a"), ":b": S(513, "b")},
         )
-        require_multi_range(dynamodb_client, TableName=gsi_table, **query)
         refused(dynamodb_client, RANGE_MESSAGE, TableName=gsi_table, **query)
 
     def test_a_1025_byte_non_equality_on_a_later_range_attribute_is_refused(
@@ -121,24 +110,24 @@ class TestGsiQueryKeySize:
             "h = :h AND a = :a AND b > :big",
             {":h": S(1, "h"), ":a": S(1, "a"), ":big": S(1025, "b")},
         )
-        require_multi_range(dynamodb_client, TableName=gsi_table, **query)
         refused(dynamodb_client, RANGE_MESSAGE, TableName=gsi_table, **query)
+
+    def _between(self, upper: int) -> dict:
+        """``a`` of 600 bytes and ``b BETWEEN`` a 1-byte and an ``upper``-byte bound."""
+        return self._query(
+            "h = :h AND a = :a AND b BETWEEN :l AND :u",
+            {":h": S(1, "h"), ":a": S(600, "a"), ":l": S(1, "b"), ":u": S(upper, "b")},
+        )
 
     def test_between_adds_its_larger_bound_to_the_range_total(
         self, dynamodb_client, gsi_table
     ):
-        # a = 600 plus the larger BETWEEN bound: 1 and 600 (1200) is refused,
-        # 1 and 424 (1024) is accepted.
-        refusing = self._query(
-            "h = :h AND a = :a AND b BETWEEN :l AND :u",
-            {":h": S(1, "h"), ":a": S(600, "a"), ":l": S(1, "b"), ":u": S(600, "b")},
-        )
-        require_multi_range(dynamodb_client, TableName=gsi_table, **refusing)
-        refused(dynamodb_client, RANGE_MESSAGE, TableName=gsi_table, **refusing)
-        accepted = self._query(
-            "h = :h AND a = :a AND b BETWEEN :l AND :u",
-            {":h": S(1, "h"), ":a": S(600, "a"), ":l": S(1, "b"), ":u": S(424, "b")},
-        )
+        # a = 600 plus the larger BETWEEN bound, 600: 1200 is refused.
+        refused(dynamodb_client, RANGE_MESSAGE, TableName=gsi_table, **self._between(600))
+
+    def test_between_within_the_range_total_is_accepted(self, dynamodb_client, gsi_table):
+        # a = 600 plus the larger BETWEEN bound, 424: 1024 is accepted.
+        accepted = self._between(424)
         require_served(dynamodb_client, TableName=gsi_table, **accepted)
         assert dynamodb_client.query(TableName=gsi_table, **accepted)["Count"] == 0
 
