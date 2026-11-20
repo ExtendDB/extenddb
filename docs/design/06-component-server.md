@@ -360,7 +360,7 @@ ExtendDB's own `AccountId` dimension.
   minutes and per minute of the last day with a request. That is at most 301
   one-second and 1,441 one-minute buckets, 111,488 bytes. So the breakdown
   holds at most `accounts x operations x 111,488` bytes of buckets, plus about
-  340 bytes per pair for its keys and map entries. With the 40 operations the
+  210 bytes per pair for its keys and map entries. With the 40 operations the
   server dispatches, an account that sends every operation every second holds
   about 4.46 MB (4.25 MiB). An account that sends each operation once a day
   holds about 14 KB. `accounts` counts the accounts that sent a request in the

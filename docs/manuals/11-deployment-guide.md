@@ -379,27 +379,32 @@ request for a day. That happens 1,440 to about 1,446 minutes after its last
 request. The buckets return to the allocator. The process's resident size can
 stay at the high-water mark the allocator reached. So the segments grow with
 the number of accounts that sent a request in the last day. They also grow with
-the seconds and minutes in which each of those accounts was active. They do not
-grow with the request rate, the table count or uptime. With
-`throttling_enabled = true` the throttle manager keeps a token bucket for every
-partition key it saw and never drops one. Resident memory then grows with the
-number of distinct partition keys written.
+the seconds and minutes in which each of those accounts was active. Below one
+request a second per operation, they grow with the request rate. Above it, and
+with the table count or uptime, they do not grow. With
+`throttling_enabled = true` the throttle manager keeps a read and a write token
+bucket for each partition key that a GetItem, PutItem, UpdateItem or DeleteItem
+names. It never drops one. Resident memory then grows with the number of
+distinct partition keys those requests name.
 
 Every release through 1.0.0 kept one latency segment record per data-plane
-request in memory for 24 hours, about 190 bytes per request. So does any later
-release before the one that carries this change. On those releases resident
+request in memory for 24 hours. So does any later release before the one that
+carries this change. A record takes about 190 bytes through 0.1.14, and about
+250 from 0.1.15 on, which also stores the account id. On those releases resident
 memory grows for the first 24 hours. It then holds at the level set by the
 busiest 24-hour window the process saw, and it does not come down short of a
 restart. To run one of those releases until you upgrade, size the memory limit
 as
 
 ```
-limit >= baseline + 190 bytes * requests_per_24h * 1.3
+limit >= baseline + bytes_per_request * requests_per_24h * 1.3
 ```
 
-where 1.3 is a modelled allowance for allocator overhead, not a measured
-figure (274 requests per second is 23.7 million requests per day and about
-5.5 GiB plus baseline), or restart the process before the limit is reached.
+where `bytes_per_request` is 190 through 0.1.14 and 250 from 0.1.15 on. The
+factor 1.3 is a modelled allowance for allocator overhead, not a measured
+figure. At 274 requests per second, 23.7 million requests per day, the rule
+gives about 5.5 GiB plus baseline on 0.1.14. On 1.0.0 it gives about 7.2 GiB
+plus baseline. Or restart the process before the limit is reached.
 Stop with SIGTERM or `extenddb stop` so the last partial minute of counter
 metrics is flushed. Only the in-memory latency segments are lost on restart;
 counter metrics are in the catalog.
