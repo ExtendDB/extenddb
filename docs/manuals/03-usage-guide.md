@@ -639,9 +639,8 @@ relative to the bucket directory:
 
 The server creates `{store root}/{account id}` at startup for every account,
 when an account is created, and on an operation's first claim when it is
-missing, so the account
-directory is always there to stage buckets into. The bucket directory itself
-is the caller's to create. A directory whose name breaks the bucket name
+missing, so the account directory is always there to stage buckets into.
+The bucket directory itself is the caller's to create. A directory whose name breaks the bucket name
 rules cannot be referenced.
 
 Every regular file whose path relative to the bucket directory starts with
@@ -898,7 +897,7 @@ does not exist.` for an input file removed after the listing.
 
 On the S3 store a failure S3 answered carries S3's message, followed by the
 tail the hosted service renders for the call that failed. The input bucket
-check and listing, the input reads, the Start-time encryption check, and
+check and listing, the input reads, the first claim's encryption check, and
 the manifest carry this form:
 
 ```

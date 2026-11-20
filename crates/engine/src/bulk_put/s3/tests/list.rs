@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! The bucket check and the enumeration at Start: a missing bucket, an
+//! The first claim's bucket check and enumeration: a missing bucket, an
 //! `s3:ListBucket` denial, an owner mismatch, paging, key decoding, and
 //! the failures that are the server's.
 

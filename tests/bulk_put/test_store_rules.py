@@ -28,7 +28,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 # The tail the S3 store renders after the S3 service's message for the
-# Start-time listing, and the one it renders for a report write.
+# first claim's listing, and the one it renders for a report write.
 LISTING_TAIL = re.compile(
     r"(?P<message>.+) \(Service: Amazon S3; Status Code: 404; Error Code: "
     r"NoSuchBucket; Request ID: [^;]+; S3 Extended Request ID: [^;]+; "

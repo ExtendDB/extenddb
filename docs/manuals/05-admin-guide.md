@@ -690,8 +690,7 @@ stays `IN_PROGRESS` and the next claim resumes it from its last checkpoint,
 or lists the input again when no listing was recorded, under the limit of
 ten resumes without progress described under
 `bulk_operation_lease_seconds`. The server logs an ERROR line naming the
-call and the bucket. Other 4xx
-answers are not sent again.
+call and the bucket. Other 4xx answers are not sent again.
 
 While an input object's open or read waits on S3, the runner checkpoints
 every third of `bulk_operation_lease_seconds` (20 seconds by default), so

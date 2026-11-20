@@ -45,8 +45,8 @@ impl Drop for Root {
 
 /// A store root with the two bucket directories the tests name staged for
 /// the main account, matching what a caller does before its first request:
-/// Start refuses a missing input or report bucket with a terminal FAILED
-/// operation, and the sink opens the report bucket without creating it.
+/// the first claim fails an operation whose input bucket is missing, and
+/// the sink opens the report bucket without creating it.
 pub(crate) fn store_with_buckets() -> Root {
     let store = Root::new();
     store.bucket_dir(ACCOUNT, IN_BUCKET);
@@ -99,7 +99,7 @@ impl Harness {
         }
     }
 
-    /// Enumerate the input bucket the way the start handler will: through
+    /// Enumerate the input bucket the way the first claim does: through
     /// `BulkSource::list`, so the stored file list carries real sizes.
     pub(crate) async fn enumerate(&self) -> Vec<InputFile> {
         self.fs_source()

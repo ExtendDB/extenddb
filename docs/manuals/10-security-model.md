@@ -305,7 +305,7 @@ session policy, and an explicit Deny first.
 
 | Action | Resource evaluated | When |
 |--------|--------------------|------|
-| `s3:ListBucket` | the input bucket: `arn:aws:s3:::<bucket>` | Once, on the operation's first claim, before the input bucket is checked |
+| `s3:ListBucket` | the input bucket: `arn:aws:s3:::<bucket>` | On each claim that lists the input (normally the first), before the input bucket is checked |
 | `s3:GetObject` | each input object: `arn:aws:s3:::<bucket>/<key>` | Before the object is opened, on a resumed run too, and at every checkpoint boundary while it is read |
 | `s3:PutObject` | each report object and the manifest: `arn:aws:s3:::<bucket>/<key>` | At the first record of each report kind, on report object 0 of that kind; before each report object is written; and before the manifest is written |
 
@@ -389,16 +389,16 @@ gives `with an explicit deny in an identity-based policy`.
 `StartBulkPutItems` records its caller on the operation: the identity, a
 role session's session policy, session tags, and token issue time as they
 were at Start, and the request-level keys above. No response renders the
-record. The runner evaluates `s3:GetObject` and `s3:PutObject` for the
-recorded caller. Identity policies, group policies, the permissions
-boundary, and principal tags are read when each check runs, so a policy
-changed during a load takes effect at the next check. The recorded session
-data is evaluated in place of the session's current data, so a session that
-expires or is removed during a load neither fails it nor changes its access.
-An operation recorded with no caller, such as one started in developer mode
-and resumed by a server outside it, fails its first S3 check with
-`S3AccessDenied`, `Access Denied`. In developer mode no S3 action is
-evaluated, as no other action is.
+record. The runner evaluates `s3:ListBucket`, `s3:GetObject` and
+`s3:PutObject` for the recorded caller. Identity policies, group policies,
+the permissions boundary, and principal tags are read when each check runs,
+so a policy changed during a load takes effect at the next check. The
+recorded session data is evaluated in place of the session's current data,
+so a session that expires or is removed during a load neither fails it nor
+changes its access. An operation recorded with no caller, such as one
+started in developer mode and resumed by a server outside it, fails its
+first S3 check with `S3AccessDenied`, `Access Denied`. In developer mode no
+S3 action is evaluated, as no other action is.
 
 On the S3 store a check that passes is followed by the server's request to
 S3, which S3 evaluates for the server's credentials. A denial S3 returns

@@ -47,9 +47,9 @@ impl BulkSink for FsSink {
         let bucket = at.bucket.to_owned();
         let owner_mismatch = at.expected_owner.is_some();
         Box::pin(async move {
-            // Ownership is decided before existence, as at Start: on this
-            // store the caller's account is the only owner a bucket
-            // directory can have.
+            // Ownership is decided before existence, as in the first claim's
+            // input check: on this store the caller's account is the only
+            // owner a bucket directory can have.
             if owner_mismatch {
                 return Err(SinkError::Store(StoreFault::access_denied()));
             }

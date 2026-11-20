@@ -108,7 +108,8 @@ async fn a_missing_output_bucket_found_at_the_first_record_is_held_to_the_end_of
 #[tokio::test]
 async fn a_mismatched_output_owner_found_at_the_first_record_is_held_to_the_end_of_the_input() {
     // The output bucket exists; only the recorded owner differs from the
-    // account. Ownership is decided before existence, as at Start.
+    // account. Ownership is decided before existence, as in the first
+    // claim's input check.
     let h = Harness::new().await;
     h.write_input(
         "part-000.json",

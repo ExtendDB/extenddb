@@ -1,7 +1,8 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cases for the input side at Start: the bucket check and the listing.
+//! Cases for the first claim's input side: the bucket check and the
+//! listing.
 
 use super::super::InputCodec;
 use super::super::tests::read_all;

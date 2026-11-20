@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The input bucket on an operation's first claim: the bucket check and
-//! the enumeration, both ListObjectsV2. The check lists one key under the request's prefix, so
-//! S3 answers the owner, existence and `s3:ListBucket` faults with its own
-//! code and message; a HEAD request would carry neither, since its error
-//! has no body. The enumeration lists pages of 1,000 keys with
+//! the enumeration, both ListObjectsV2. The check lists one key under the
+//! request's prefix, so S3 answers the owner, existence and `s3:ListBucket`
+//! faults with its own code and message; a HEAD request would carry
+//! neither, since its error has no body. The enumeration lists pages of 1,000 keys with
 //! `encoding-type=url`, which keeps keys holding characters XML cannot
 //! carry intact, and decodes them.
 

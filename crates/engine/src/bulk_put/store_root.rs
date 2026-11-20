@@ -8,9 +8,9 @@
 //! the configured root once at startup with [`resolve_store_root`] and
 //! creates the per-account level with [`ensure_account_dir`]: at startup
 //! for every existing account, when an account is created, and on an
-//! operation's first claim when the directory is missing. The account level is the trust boundary
-//! between tenants, so its check reads `symlink_metadata` and refuses a
-//! symlink outright; a planted link at `{root}/{account id}` would
+//! operation's first claim when the directory is missing. The account
+//! level is the trust boundary between tenants, so its check reads
+//! `symlink_metadata` and refuses a symlink outright; a planted link at `{root}/{account id}` would
 //! otherwise redirect every path the enumeration and the report sink
 //! build beneath it.
 

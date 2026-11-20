@@ -4,7 +4,7 @@
 //! Reading one input object: sequential ranged GETs of 8 MiB, ending at
 //! the enumerated size, behind a blocking `Read` the shared decode chain
 //! consumes on the blocking pool. Every GET carries `If-Match` with the
-//! `ETag` the listing gave at Start, the first range of an open and of a
+//! `ETag` the first claim's listing gave, the first range of an open and of a
 //! resumed open included, so a read never takes bytes of an object other
 //! than the one listed and one read never mixes two versions. A 412 means
 //! the listed object is no longer at the key: the line reader reports the
@@ -511,7 +511,7 @@ pub(super) async fn open(
     Ok(S3LineReader { chain, etag, stop })
 }
 
-/// The entity tag for the manifest: the `ETag` listed at Start, or, for a
+/// The entity tag for the manifest: the `ETag` the listing gave, or, for a
 /// record without one, the `ETag` of a GET of the first byte. Only the
 /// header is used and the body is not read, so a service that ignores
 /// `Range` and answers the whole object gives the same tag.

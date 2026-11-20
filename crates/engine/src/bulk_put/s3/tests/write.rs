@@ -244,7 +244,7 @@ async fn manifest_check_faults_carry_the_amazon_s3_tail() {
 }
 
 #[tokio::test]
-async fn the_start_encryption_check_reports_kms_faults_only() {
+async fn the_first_claim_encryption_check_reports_kms_faults_only() {
     let kms = OutputSse::Kms {
         key_id: Some("arn:aws:kms:us-east-1:111122223333:key/k1".to_owned()),
     };

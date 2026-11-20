@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """The S3 actions a load performs as its caller, decided by the caller's
 ExtendDB policies on whichever store the server is configured with:
-s3:ListBucket on the input bucket at Start, s3:GetObject on each input
-object, and s3:PutObject on each report object and the manifest."""
+s3:ListBucket on the input bucket on the operation's first claim,
+s3:GetObject on each input object, and s3:PutObject on each report object
+and the manifest."""
 
 from __future__ import annotations
 

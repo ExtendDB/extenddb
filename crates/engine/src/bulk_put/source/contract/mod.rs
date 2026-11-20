@@ -153,7 +153,8 @@ fn md5_hex(bytes: &[u8]) -> String {
     format!("{:x}", <md5::Md5 as md5::Digest>::digest(bytes))
 }
 
-/// The record an enumerated file becomes at Start.
+/// The record an enumerated file becomes when the first claim records the
+/// listing.
 fn recorded(file: &SourceFile) -> InputFile {
     InputFile {
         path: file.path.clone(),
