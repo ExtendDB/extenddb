@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # Copyright 2026 ExtendDB contributors
 # SPDX-License-Identifier: Apache-2.0
-"""A Cassandra catalog the last 0.1.x release created, upgraded by this
-binary, and that release run against v1.0 catalogs:
+"""A Cassandra catalog the 0.1.14 release created, upgraded by this
+binary, and that release run against catalogs this binary created or
+migrated:
 
     devtools/check-cassandra-older-binary <extenddb binary> <0.1.14 binary> \\
         <container> <contact point> [port]
 
 <0.1.14 binary> is `extenddb` built from the v0.1.14 tag with
-`--no-default-features --features cassandra` (there is no released Cassandra
+`--no-default-features --features cassandra` (0.1.14 has no Cassandra
 image). <container> and <contact point> are as in
 devtools/check-cassandra-catalog-lock; the node uses PasswordAuthenticator
 with the admin role $CASSANDRA_ADMIN_USER and $CASSANDRA_ADMIN_PASSWORD
@@ -26,12 +27,12 @@ with the admin role $CASSANDRA_ADMIN_USER and $CASSANDRA_ADMIN_PASSWORD
 - Two migrators: on another 0.1.14 catalog, two `migrate --yes` started
   together both exit 0, one applies the migrations and the other waits for
   the lock and finds nothing to do.
-- Older binary: on the fresh and the upgraded v1.0 catalog the 0.1.14 binary
+- Older binary: on the fresh and the upgraded catalog the 0.1.14 binary
   runs `verify`, `migrate --yes` and `serve`. The script prints what each run
   changed and checks what this binary then reports: after a run that wrote
   the catalog, `migrate` and `verify` exit 5 naming WrittenByOlderRelease and
   `migrate --yes --reconverge` restores Current with the schema the catalog
-  had before; the 0.1.14 `serve` refuses a v1.0 catalog.
+  had before; the 0.1.14 `serve` refuses a migrated catalog.
 
 Everything the script creates (roles, keyspaces, the temporary directory) is
 removed at the end. The servers bind 127.0.0.1 only.
@@ -290,7 +291,7 @@ def seed(binary: str, deployment: Deployment, port: int, work: str) -> bool:
 
 
 def older_binary_runs(label: str, d: Deployment, binary: str, old: str, container: str, port: int) -> None:
-    """The 0.1.14 binary's verify, migrate --yes and serve on a v1.0 catalog,
+    """The 0.1.14 binary's verify, migrate --yes and serve on a migrated catalog,
     and what this binary then reports."""
     migrate = [binary, "migrate", "--config", d.config]
     for command in (["verify"], ["migrate", "--yes"], ["serve", "--foreground", "--port", str(port)]):
@@ -313,7 +314,7 @@ def older_binary_runs(label: str, d: Deployment, binary: str, old: str, containe
             # failure (a port in use, a config it cannot parse).
             report(
                 code not in (0, -1) and "resource-tag condition-key migration" in output,
-                f"exit {code}: {label}: the 0.1.14 serve refuses a v1.0 catalog for its marker",
+                f"exit {code}: {label}: the 0.1.14 serve refuses a migrated catalog for its marker",
                 output,
             )
         if not changes:
@@ -324,7 +325,7 @@ def older_binary_runs(label: str, d: Deployment, binary: str, old: str, containe
             f"{label}: after the 0.1.14 {what}, migrate reports WrittenByOlderRelease",
             migrate,
             d.env,
-            contains="a release before 1.0 wrote to this catalog",
+            contains="a release before 0.1.15 wrote to this catalog",
         )
         expect_exit(5, f"{label}: after the 0.1.14 {what}, verify exits 5", [binary, "verify", "--config", d.config], d.env)
         expect_exit(0, f"{label}: migrate --yes --reconverge", migrate + ["--yes", "--reconverge"], d.env)
@@ -355,7 +356,7 @@ def marker_written_by_older_migrate(label: str, d: Deployment, binary: str, cont
         f"{label}: with the 0.1.14 marker row, migrate reports WrittenByOlderRelease",
         migrate,
         d.env,
-        contains="a release before 1.0 wrote to this catalog",
+        contains="a release before 0.1.15 wrote to this catalog",
     )
     expect_exit(5, f"{label}: with the 0.1.14 marker row, migrate --yes refuses", migrate + ["--yes"], d.env)
     expect_exit(0, f"{label}: migrate --yes --reconverge removes the row", migrate + ["--yes", "--reconverge"], d.env)

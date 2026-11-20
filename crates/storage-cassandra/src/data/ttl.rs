@@ -8,6 +8,8 @@
 //! indexed into day-bucketed, 64-way sharded partitions and are deleted through
 //! the normal item mutation path.
 
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use cdrs_tokio::query::BatchQueryBuilder;
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_core::types::{AttributeValue, Item, TableKeyInfo};
@@ -143,7 +145,7 @@ fn same_queue_key(left: &TtlEntry, right: &TtlEntry) -> bool {
 /// `&mut` needs a swap. Doing that inline at each call site buried the statements
 /// being built.
 fn push_query(batch: &mut BatchQueryBuilder, cql: String, values: cdrs_tokio::query::QueryValues) {
-    let previous = std::mem::replace(batch, BatchQueryBuilder::new());
+    let previous = std::mem::take(batch);
     *batch = previous.add_query(cql, values);
 }
 
@@ -319,8 +321,7 @@ pub(crate) async fn record_ttl_repair(
     // account deletion + same-id recreation safe in a multi-host fleet — a
     // process-lifetime "already registered" cache on any one host would go
     // stale the moment another host dropped and recreated the keyspace.
-    let batch = cdrs_tokio::query::BatchQueryBuilder::new()
-        .with_consistency(cdrs_tokio::consistency::Consistency::LocalQuorum)
+    let batch = crate::cassandra_util::batch()
         .add_query(
             format!(
                 "INSERT INTO {account_keyspace}.ttl_repair_inflight_partitions \
@@ -349,7 +350,7 @@ pub(crate) async fn record_ttl_repair(
         .map_err(|error| StorageError::Internal(format!("Build TTL repair batch: {error}")))?;
     engine
         .session
-        .batch(built)
+        .run_batch(built)
         .await
         .map_err(|error| StorageError::Internal(format!("Record TTL repair inflight: {error}")))?;
 
@@ -386,7 +387,7 @@ impl TtlRepairGuard {
         engine: &CassandraEngine,
         account_keyspace: &str,
     ) -> Result<(), StorageError> {
-        crate::cassandra_util::execute_quorum(
+        crate::cassandra_util::execute(
             &engine.session,
             &format!(
                 "INSERT INTO {account_keyspace}.ttl_reconcile_pending \
@@ -404,7 +405,7 @@ impl TtlRepairGuard {
         )
         .await?;
 
-        crate::cassandra_util::execute_quorum(
+        crate::cassandra_util::execute(
             &engine.session,
             &format!(
                 "DELETE FROM {account_keyspace}.ttl_repair_inflight \
@@ -432,7 +433,7 @@ pub(crate) async fn ttl_entry_registered(
     generation: uuid::Uuid,
     entry: &TtlEntry,
 ) -> Result<bool, StorageError> {
-    let rows = crate::cassandra_util::query_rows_quorum(
+    let rows = crate::cassandra_util::query_rows(
         &engine.session,
         &format!(
             "SELECT key_hash FROM {account_keyspace}.{TTL_QUEUE_TABLE} \
@@ -462,7 +463,7 @@ async fn ensure_ttl_bucket_registration(
     entry: &TtlEntry,
 ) -> Result<(), StorageError> {
     let generation_bytes = cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec());
-    crate::cassandra_util::execute_quorum(
+    crate::cassandra_util::execute(
         &engine.session,
         &format!(
             "INSERT INTO {account_keyspace}.{TTL_BUCKET_TABLE} \
@@ -477,7 +478,7 @@ async fn ensure_ttl_bucket_registration(
         "restore TTL bucket registration",
     )
     .await?;
-    let visible = crate::cassandra_util::query_rows_quorum(
+    let visible = crate::cassandra_util::query_rows(
         &engine.session,
         &format!(
             "SELECT shard FROM {account_keyspace}.{TTL_BUCKET_TABLE} \
@@ -512,7 +513,7 @@ pub(crate) async fn insert_ttl_entry(
     // Common case after restoring discoverability: the entry is already there
     // because the write's own logged batch inserted it. A plain quorum read
     // avoids Paxos when that row is still PENDING.
-    let existing = crate::cassandra_util::query_rows_quorum(
+    let existing = crate::cassandra_util::query_rows(
         &engine.session,
         &format!(
             "SELECT state FROM {account_keyspace}.{TTL_QUEUE_TABLE} \
@@ -945,7 +946,7 @@ async fn retire_bucket_registration(
         "DELETE FROM {account_keyspace}.{TTL_BUCKET_TABLE}{using} \
          WHERE table_id = ? AND generation = ? AND bucket = ? AND shard = ?"
     );
-    crate::cassandra_util::execute_quorum(
+    crate::cassandra_util::execute(
         &engine.session,
         &cql,
         cdrs_tokio::query_values!(
@@ -1021,7 +1022,7 @@ pub(crate) async fn load_due_ttl_work(
              AND generation = ? AND bucket = ? AND shard = ? AND expires_at <= ? \
              LIMIT {partition_limit}"
         );
-        let rows = crate::cassandra_util::query_rows_quorum(
+        let rows = crate::cassandra_util::query_rows(
             &engine.session,
             &query,
             cdrs_tokio::query_values!(table_id, generation_bytes.clone(), *bucket, *shard, now),
@@ -1105,7 +1106,7 @@ pub(crate) async fn load_generation_work(
         }
         // Quorum: work this read misses would be abandoned holding a base-row
         // claim, and the generation would be reported drained when it is not.
-        let rows = crate::cassandra_util::query_rows_quorum(
+        let rows = crate::cassandra_util::query_rows(
             &engine.session,
             &format!(
                 "SELECT expires_at, key_hash, key_data, state, work_id, work_data \
@@ -1161,7 +1162,7 @@ async fn generation_partitions(
     table_id: &str,
     generation: uuid::Uuid,
 ) -> Result<Vec<(i64, i32)>, StorageError> {
-    let rows = crate::cassandra_util::query_rows_quorum(
+    let rows = crate::cassandra_util::query_rows(
         &engine.session,
         &format!(
             "SELECT bucket, shard FROM {account_keyspace}.{TTL_BUCKET_TABLE} \
@@ -1206,7 +1207,7 @@ pub(crate) async fn clear_ttl_generation(
     {
         // Quorum: `partition_drained` below decides whether to delete the bucket
         // registration and whether the generation can be reported fully drained.
-        let rows = crate::cassandra_util::query_rows_quorum(
+        let rows = crate::cassandra_util::query_rows(
             &engine.session,
             &format!(
                 "SELECT expires_at, key_hash, key_data, state \
@@ -1294,7 +1295,8 @@ pub(crate) async fn clear_ttl_entries(
         );
         engine
             .session
-            .query_with_values(
+            .run(
+                Stmt::Write,
                 &delete,
                 cdrs_tokio::query_values!(
                     table_id,
@@ -1310,7 +1312,11 @@ pub(crate) async fn clear_ttl_entries(
         format!("DELETE FROM {account_keyspace}.{TTL_BUCKET_TABLE} WHERE table_id = ?");
     engine
         .session
-        .query_with_values(&delete_buckets, cdrs_tokio::query_values!(table_id))
+        .run(
+            Stmt::Write,
+            &delete_buckets,
+            cdrs_tokio::query_values!(table_id),
+        )
         .await
         .map_err(|error| StorageError::Internal(format!("Clear TTL buckets: {error}")))?;
     Ok(())

@@ -523,7 +523,7 @@ async fn every_status_and_its_exit_code() {
     fake.with_state(|s| s.ledgers.get_mut("data-a").unwrap().retain(|r| r.id != 4));
     assert_eq!(runner(&fake).status().await.unwrap().label(), "Behind");
 
-    // A release before 1.0 wrote to it: a dotted version, or the marker.
+    // A release before 0.1.15 wrote to it: a dotted version, or the marker.
     let fake = Fake::new();
     current(&fake).await;
     fake.with_state(|s| s.traces.catalog_version = Some("0.0.3".into()));

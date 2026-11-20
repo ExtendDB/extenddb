@@ -14605,7 +14605,7 @@ fn songs_from(from: usize, n: usize) -> Vec<Item> {
 }
 
 /// A healthy runtime on `mem` with a spool at `spool` (an S3 store's shape),
-/// the job settings and a collector.
+/// the job settings at a 1 s heartbeat, and a collector.
 fn spooled_runtime(mem: &Arc<MemStore>, spool: &std::path::Path) -> BackupRuntime {
     runtime()
         .with_store(
@@ -14625,7 +14625,16 @@ fn spooled_runtime(mem: &Arc<MemStore>, spool: &std::path::Path) -> BackupRuntim
             )
             .with_manifest_names("bucket".to_owned(), "prefix/".to_owned()),
         )
-        .with_job_settings(job_settings())
+        // A 1 s heartbeat, not the 50 ms of `job_settings`: the claim window is
+        // two periods, and a spooled job's first claim check comes after its
+        // first beat (a resume's is the takeover's return inside the reconciler
+        // cycle), the spool entry's open, its fsynced document writes and the
+        // test's own steps, which a loaded host can stretch past 100 ms and end
+        // the job as a lost claim before its first download.
+        .with_job_settings(JobSettings {
+            heartbeat_interval: Duration::from_secs(1),
+            ..job_settings()
+        })
         .with_metrics(Arc::new(extenddb_core::metrics::MetricsCollector::new()))
 }
 

@@ -28,7 +28,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.14"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.91.1"
 license = "Apache-2.0"
@@ -45,19 +45,19 @@ homepage = "https://extenddb.org/"
 # pin that is not exact.
 # Internal dev-dependencies are declared by path in each crate instead, with
 # no version, so that cargo drops them from the published manifests.
-extenddb-core = { path = "crates/core", version = "=0.1.14" }
-extenddb-cache = { path = "crates/cache", version = "=0.1.14" }
-extenddb-backup-store = { path = "crates/backup-store", version = "=0.1.14" }
-extenddb-engine = { path = "crates/engine", version = "=0.1.14" }
-extenddb-storage = { path = "crates/storage", version = "=0.1.14" }
-extenddb-config = { path = "crates/config", version = "=0.1.14" }
-extenddb-storage-cassandra = { path = "crates/storage-cassandra", version = "=0.1.14" }
-extenddb-storage-mongodb = { path = "crates/storage-mongodb", version = "=0.1.14" }
-extenddb-storage-postgres = { path = "crates/storage-postgres", version = "=0.1.14" }
-extenddb-storage-sqlite = { path = "crates/storage-sqlite", version = "=0.1.14" }
-extenddb-auth = { path = "crates/auth", version = "=0.1.14" }
-extenddb-server = { path = "crates/server", version = "=0.1.14" }
-extenddb-app = { path = "crates/app", version = "=0.1.14" }
+extenddb-core = { path = "crates/core", version = "=1.0.0" }
+extenddb-cache = { path = "crates/cache", version = "=1.0.0" }
+extenddb-backup-store = { path = "crates/backup-store", version = "=1.0.0" }
+extenddb-engine = { path = "crates/engine", version = "=1.0.0" }
+extenddb-storage = { path = "crates/storage", version = "=1.0.0" }
+extenddb-config = { path = "crates/config", version = "=1.0.0" }
+extenddb-storage-cassandra = { path = "crates/storage-cassandra", version = "=1.0.0" }
+extenddb-storage-mongodb = { path = "crates/storage-mongodb", version = "=1.0.0" }
+extenddb-storage-postgres = { path = "crates/storage-postgres", version = "=1.0.0" }
+extenddb-storage-sqlite = { path = "crates/storage-sqlite", version = "=1.0.0" }
+extenddb-auth = { path = "crates/auth", version = "=1.0.0" }
+extenddb-server = { path = "crates/server", version = "=1.0.0" }
+extenddb-app = { path = "crates/app", version = "=1.0.0" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
