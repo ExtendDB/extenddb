@@ -79,9 +79,12 @@ RUN_TERRAFORM=false
 RUN_CATALOG_CHECK=false
 # Standalone WebAssembly suites. Unlike the others these need no running server,
 # target flag or credentials: --wasm is a wasm32 build check of the adapter
-# crate, and --headless builds the wasm module and runs it under Node.
+# crate, --headless builds the wasm module and runs it under Node, and
+# --wasm-test runs the on-target wasm-bindgen-test suites (crypto, SQLite shim)
+# under Node.
 RUN_WASM=false
 RUN_HEADLESS=false
+RUN_WASM_TEST=false
 
 # Options
 RELEASE=false
@@ -120,6 +123,11 @@ Suites (at least one required):
                     parity corpus through it under Node. Standalone like --wasm;
                     needs node and wasm-pack but no server/creds. Writes
                     discussions/test-headless-<hash>.txt
+  --wasm-test       run the on-target wasm-bindgen-test suites (core's crypto
+                    backend and the SQLite shim) on wasm32 under Node. Standalone
+                    like --wasm; needs a Node >= 20 and wasm-bindgen-test-runner
+                    (matching the wasm-bindgen crate in Cargo.lock) but no
+                    server/creds. Writes discussions/test-wasm-bindgen-<hash>.txt
 
 Options:
   --backend NAME    storage backend the running server uses:
@@ -163,6 +171,7 @@ while [[ $# -gt 0 ]]; do
         --catalog-check)  RUN_CATALOG_CHECK=true; shift ;;
         --wasm)           RUN_WASM=true; shift ;;
         --headless)       RUN_HEADLESS=true; shift ;;
+        --wasm-test)      RUN_WASM_TEST=true; shift ;;
         --config)         CONFIG_PATH="$2"; shift 2 ;;
         --backend)        BACKEND="$2"; BACKEND_GIVEN=1; shift 2 ;;
         --parallel)
@@ -195,8 +204,8 @@ if [[ -n "${BACKEND_GIVEN:-}" ]]; then
 fi
 
 # --- Validate: target flag required ---
-# The standalone wasm suites (--wasm, --headless) need no server, so they do not
-# require a target; every other suite does.
+# The standalone wasm suites (--wasm, --headless, --wasm-test) need no server, so
+# they do not require a target; every other suite does.
 if [[ -z "$TARGET" ]] \
     && ( $RUN_RUST || $RUN_RUST_INTEGRATION || $RUN_PYTEST || $RUN_EXTERNAL \
          || $RUN_COMPREHENSIVE || $RUN_TERRAFORM || $RUN_CATALOG_CHECK ); then
@@ -205,8 +214,8 @@ if [[ -z "$TARGET" ]] \
 fi
 
 # --- Validate: at least one suite ---
-if ! $RUN_RUST && ! $RUN_RUST_INTEGRATION && ! $RUN_PYTEST && ! $RUN_EXTERNAL && ! $RUN_COMPREHENSIVE && ! $RUN_TERRAFORM && ! $RUN_CATALOG_CHECK && ! $RUN_WASM && ! $RUN_HEADLESS; then
-    echo "error: at least one suite flag is required (--rust, --rust-integration, --pytest, --external, --comprehensive, --terraform, --all, --catalog-check, --wasm, --headless)"
+if ! $RUN_RUST && ! $RUN_RUST_INTEGRATION && ! $RUN_PYTEST && ! $RUN_EXTERNAL && ! $RUN_COMPREHENSIVE && ! $RUN_TERRAFORM && ! $RUN_CATALOG_CHECK && ! $RUN_WASM && ! $RUN_HEADLESS && ! $RUN_WASM_TEST; then
+    echo "error: at least one suite flag is required (--rust, --rust-integration, --pytest, --external, --comprehensive, --terraform, --all, --catalog-check, --wasm, --headless, --wasm-test)"
     exit 1
 fi
 
@@ -406,7 +415,7 @@ if $RUN_WASM; then
     # The only suite requested: its status is the whole run.
     if ! $RUN_RUST && ! $RUN_RUST_INTEGRATION && ! $RUN_PYTEST \
         && ! $RUN_EXTERNAL && ! $RUN_COMPREHENSIVE && ! $RUN_TERRAFORM \
-        && ! $RUN_CATALOG_CHECK && ! $RUN_HEADLESS; then
+        && ! $RUN_CATALOG_CHECK && ! $RUN_HEADLESS && ! $RUN_WASM_TEST; then
         exit "$WASM_RC"
     fi
     [ "$WASM_RC" -ne 0 ] && PASS=false
@@ -457,10 +466,108 @@ if $RUN_HEADLESS; then
     # The only remaining suite requested: its status is the whole run.
     if ! $RUN_RUST && ! $RUN_RUST_INTEGRATION && ! $RUN_PYTEST \
         && ! $RUN_EXTERNAL && ! $RUN_COMPREHENSIVE && ! $RUN_TERRAFORM \
-        && ! $RUN_CATALOG_CHECK; then
+        && ! $RUN_CATALOG_CHECK && ! $RUN_WASM_TEST; then
         exit "$HEADLESS_RC"
     fi
     [ "$HEADLESS_RC" -ne 0 ] && PASS=false
+fi
+
+# --- On-target wasm-bindgen-test suites (standalone) ------------------------
+# core's wasm crypto backend (sha2/hmac/subtle/aes-gcm/getrandom) and the
+# synchronous SQLite shim run in no native test — they exist only on wasm32.
+# Their behavior is pinned by wasm-bindgen-test cases that execute on wasm32
+# under Node, the same two suites the WebAssembly CI workflow runs. Standalone
+# like --wasm: no server, target flag or credentials. Placed after PASS=true so
+# a failure here is not later reset.
+#
+# wasm-bindgen-test drives the compiled test module through
+# wasm-bindgen-test-runner, which must match the wasm-bindgen crate in
+# Cargo.lock (a mismatch crashes at run time, not at build time), and runs it on
+# a Node whose V8 is newer than Node 18's. CARGO_TARGET_..._RUNNER and
+# WASM_BINDGEN_TEST_ONLY_NODE are read only when a wasm `cargo test` executes.
+if $RUN_WASM_TEST; then
+    WASM_TEST_OUTFILE="discussions/test-wasm-bindgen-${HASH}.txt"
+    echo "=== on-target wasm-bindgen-test suites → ${WASM_TEST_OUTFILE} ==="
+    {
+        echo "WebAssembly on-target wasm-bindgen-test suites"
+        echo "target:  wasm32-unknown-unknown (in-memory SQLite in the browser) via Node"
+        echo "suites:  extenddb-core crypto (--lib), extenddb-storage-sqlite shim (--test wasm_shim)"
+        echo "commit:  ${HASH}"
+        echo "date:    $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo
+    } > "$WASM_TEST_OUTFILE"
+    WASM_TEST_RC=0
+
+    # Pick a Node >= 20 for the harness. The host default `node` may be 18
+    # (whose V8 crashes the wasm-bindgen-test harness), with a newer build
+    # installed under a versioned name such as `node-22`. The runner spawns
+    # `node` from PATH, so a shim directory makes the chosen binary resolve as
+    # `node` without disturbing the rest of the environment.
+    WASM_TEST_NODE=""
+    for cand in node node-22 node-21 node-20; do
+        if command -v "$cand" >/dev/null 2>&1; then
+            node_major=$("$cand" -e 'process.stdout.write(process.versions.node.split(".")[0])' 2>/dev/null) || continue
+            if [[ "$node_major" =~ ^[0-9]+$ ]] && [ "$node_major" -ge 20 ]; then
+                WASM_TEST_NODE=$(command -v "$cand")
+                break
+            fi
+        fi
+    done
+
+    # wasm-bindgen-test-runner is a cargo-installed binary; it is on PATH in CI
+    # but cargo's bin directory is not always on an interactive PATH, so fall
+    # back to it. It must match the wasm-bindgen crate in Cargo.lock.
+    CARGO_BIN_DIR="${CARGO_HOME:-$HOME/.cargo}/bin"
+    if command -v wasm-bindgen-test-runner >/dev/null 2>&1; then
+        HAVE_RUNNER=1
+    elif [ -x "$CARGO_BIN_DIR/wasm-bindgen-test-runner" ]; then
+        HAVE_RUNNER=1
+    else
+        HAVE_RUNNER=0
+    fi
+
+    if [ -z "$WASM_TEST_NODE" ]; then
+        echo "error: no Node >= 20 found (node, node-22, node-21, node-20); the wasm-bindgen-test harness needs a V8 newer than Node 18's" | tee -a "$WASM_TEST_OUTFILE"
+        WASM_TEST_RC=1
+    elif [ "$HAVE_RUNNER" -ne 1 ]; then
+        echo "error: wasm-bindgen-test-runner not found on PATH or in $CARGO_BIN_DIR — install it with the Cargo.lock wasm-bindgen version, e.g. 'cargo install --locked --version 0.2.130 wasm-bindgen-cli'" | tee -a "$WASM_TEST_OUTFILE"
+        WASM_TEST_RC=1
+    else
+        echo "node:    ${WASM_TEST_NODE} ($("$WASM_TEST_NODE" --version 2>/dev/null))" | tee -a "$WASM_TEST_OUTFILE"
+        NODE_SHIM_DIR=$(mktemp -d)
+        ln -sf "$WASM_TEST_NODE" "$NODE_SHIM_DIR/node"
+        for suite in \
+            "crypto|-p extenddb-core --lib" \
+            "shim|-p extenddb-storage-sqlite --test wasm_shim"; do
+            suite_name="${suite%%|*}"
+            suite_args="${suite#*|}"
+            echo "--- ${suite_name} (cargo test ${suite_args} --target wasm32-unknown-unknown) ---" | tee -a "$WASM_TEST_OUTFILE"
+            # shellcheck disable=SC2086
+            if ! PATH="$NODE_SHIM_DIR:$CARGO_BIN_DIR:$PATH" \
+                CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+                WASM_BINDGEN_TEST_ONLY_NODE=1 \
+                RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$WASM_RUSTFLAGS" \
+                cargo test --locked $suite_args --target wasm32-unknown-unknown \
+                2>&1 | tee -a "$WASM_TEST_OUTFILE"; then
+                WASM_TEST_RC=1
+            fi
+        done
+        rm -rf "$NODE_SHIM_DIR"
+    fi
+
+    if [ "$WASM_TEST_RC" -eq 0 ]; then
+        echo "RESULT: PASS" | tee -a "$WASM_TEST_OUTFILE"
+    else
+        echo "RESULT: FAIL" | tee -a "$WASM_TEST_OUTFILE"
+    fi
+    echo "=== wrote ${WASM_TEST_OUTFILE} ==="
+    # The only remaining suite requested: its status is the whole run.
+    if ! $RUN_RUST && ! $RUN_RUST_INTEGRATION && ! $RUN_PYTEST \
+        && ! $RUN_EXTERNAL && ! $RUN_COMPREHENSIVE && ! $RUN_TERRAFORM \
+        && ! $RUN_CATALOG_CHECK; then
+        exit "$WASM_TEST_RC"
+    fi
+    [ "$WASM_TEST_RC" -ne 0 ] && PASS=false
 fi
 
 # --- Pre-flight for integration suites (local targets) ---
