@@ -282,8 +282,10 @@ class TestWarmThroughputCreateShapes:
         """Rows S8a and V5: a GSI created through GlobalSecondaryIndexUpdates with
         WarmThroughput reports the values as sent with Status UPDATING, then the
         same values ACTIVE. The service also reports the new index CREATING and the
-        table UPDATING; ExtendDB reports both ACTIVE at once (the index build is
-        immediate), so those two statuses are asserted on the service only."""
+        table UPDATING. ExtendDB reports the table ACTIVE. SQLite builds the index
+        before UpdateTable answers and reports it ACTIVE. PostgreSQL, MongoDB and
+        Cassandra build it in the background and report it CREATING until the build
+        ends. So those two statuses are asserted on the service only."""
         name = _on_demand_with_gsi(dynamodb_client, tables)
         sent = {"ReadUnitsPerSecond": 30000, "WriteUnitsPerSecond": 8000}
         t, took = _update_table(

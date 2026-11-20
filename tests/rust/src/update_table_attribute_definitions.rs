@@ -92,7 +92,7 @@ async fn add_gsi(table: &str, index: &str, attr: &str, extra_defs: Vec<Attribute
     .send()
     .await
     .unwrap_or_else(|e| panic!("adding GSI {index} must succeed: {}", err_msg(&e)));
-    wait_for_active(client(), table).await;
+    wait_for_index_active(client(), table, index).await;
 }
 
 /// Stored attribute definitions as a name -> type map.

@@ -358,6 +358,9 @@ async fn names_with_u0000_and_u0001_round_trip_through_the_catalog() {
         )
         .await
         .expect("UpdateTable creating a GSI on the U+0000 attribute");
+    // UpdateTable returns before its build task backfills gsi2, and
+    // DeleteTable below refuses a table whose index is still CREATING.
+    wait_active(&s.catalog, table).await;
     let gsi2 = &after_create
         .global_secondary_indexes
         .as_deref()
