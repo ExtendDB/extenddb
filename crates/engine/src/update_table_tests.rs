@@ -6,6 +6,33 @@
 use super::*;
 use extenddb_storage::error::StorageError;
 
+/// Enabling a stream without a view type is refused with the service's
+/// sentence; a view type, or a disable, passes this check.
+#[test]
+fn enabling_a_stream_without_a_view_type_is_refused() {
+    let input = |spec: Value| -> UpdateTableInput {
+        serde_json::from_value(serde_json::json!({
+            "TableName": "t",
+            "StreamSpecification": spec,
+        }))
+        .unwrap()
+    };
+    match validate_stream_specification(&input(serde_json::json!({ "StreamEnabled": true })))
+        .unwrap_err()
+    {
+        DynamoDbError::ValidationException(m) => assert_eq!(
+            m,
+            "One or more parameter values were invalid: If stream is being enabled then UpdateViewType is required"
+        ),
+        other => panic!("{other:?}"),
+    }
+    validate_stream_specification(&input(serde_json::json!({
+        "StreamEnabled": true, "StreamViewType": "NEW_IMAGE"
+    })))
+    .unwrap();
+    validate_stream_specification(&input(serde_json::json!({ "StreamEnabled": false }))).unwrap();
+}
+
 /// Measured 2026-10-24: a stream change beside a billing or throughput
 /// change, beside an index create or delete, or beside a deletion protection
 /// change is refused with its own sentence; alone it is not.

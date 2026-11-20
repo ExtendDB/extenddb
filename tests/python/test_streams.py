@@ -17,6 +17,7 @@ import base64
 import os
 import time
 import uuid
+from datetime import datetime, timezone
 
 import boto3
 import botocore.config
@@ -175,6 +176,47 @@ class TestDescribeStream:
             streams_client.describe_stream(StreamArn="arn:aws:dynamodb:us-east-1:000000000000:table/nonexistent/stream/2026-01-01T00:00:00.000")
         error = exc.value.response["Error"]
         assert (error["Code"], error["Message"]) == ("AccessDeniedException", "Access is denied")
+
+    def test_creation_request_date_time_is_the_label_instant(
+        self, dynamodb_client, streams_client
+    ):
+        """CreationRequestDateTime is present on an enabled and on a disabled
+        stream and equals the instant the StreamLabel names (UTC, to the
+        millisecond)."""
+        name, stream_arn = _create_stream_table(dynamodb_client)
+        try:
+            desc = streams_client.describe_stream(StreamArn=stream_arn)["StreamDescription"]
+            assert desc["StreamStatus"] == "ENABLED"
+            self._assert_creation_matches_label(desc)
+
+            dynamodb_client.update_table(
+                TableName=name, StreamSpecification={"StreamEnabled": False}
+            )
+            wait_for_active(dynamodb_client, name)
+            table = dynamodb_client.describe_table(TableName=name)["Table"]
+            # A disabled stream is dropped from DescribeTable's
+            # StreamSpecification, as on the service; LatestStreamArn keeps
+            # naming the closed stream.
+            assert "StreamSpecification" not in table
+            assert table["LatestStreamArn"] == stream_arn
+            desc = streams_client.describe_stream(StreamArn=stream_arn)["StreamDescription"]
+            assert desc["StreamStatus"] == "DISABLED"
+            self._assert_creation_matches_label(desc)
+        finally:
+            dynamodb_client.delete_table(TableName=name)
+            wait_for_deleted(dynamodb_client, name)
+
+    @staticmethod
+    def _assert_creation_matches_label(desc: dict) -> None:
+        label = desc["StreamLabel"]
+        expected = (
+            datetime.strptime(label, "%Y-%m-%dT%H:%M:%S.%f")
+            .replace(tzinfo=timezone.utc)
+            .timestamp()
+        )
+        created = desc["CreationRequestDateTime"]
+        assert isinstance(created, datetime), created
+        assert abs(created.timestamp() - expected) < 0.0005, (label, created)
 
 
 def _arn_with_another_label(stream_arn: str) -> str:

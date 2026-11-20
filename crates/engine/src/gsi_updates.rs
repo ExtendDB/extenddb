@@ -242,24 +242,47 @@ pub(crate) fn validate_gsi_updates(input: &UpdateTableInput) -> Result<(), Dynam
                         .to_owned(),
                 ));
             }
-            let attr_defs = input.attribute_definitions.as_deref().unwrap_or(&[]);
-            for ks in &create.key_schema {
-                if !attr_defs
-                    .iter()
-                    .any(|ad| ad.attribute_name == ks.attribute_name)
-                {
+            // Every key attribute must be in AttributeDefinitions. The
+            // service's sentence depends on the member's shape (measured
+            // 2026-10-25): absent names the index; present but lacking
+            // the key lists the keys and the definitions (the CreateTable
+            // sentence, whose CreateTable copy lives in core's validation
+            // and is not shared with this path); an empty list has its
+            // own sentence.
+            let missing: Vec<&str> = match &input.attribute_definitions {
+                None => {
                     return Err(DynamoDbError::ValidationException(format!(
-                        "One or more parameter values were invalid: Some index key attributes \
-                         are not defined in AttributeDefinitions. Keys: [{}], \
-                         AttributeDefinitions: [{}]",
-                        ks.attribute_name,
-                        attr_defs
-                            .iter()
-                            .map(|ad| ad.attribute_name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
+                        "One or more parameter values were invalid: AttributeDefinitions is not specified for index: {}",
+                        create.index_name
                     )));
                 }
+                Some(defs) if defs.is_empty() => {
+                    return Err(DynamoDbError::ValidationException(
+                        "Invalid KeySchema: Some index key attribute have no definition".to_owned(),
+                    ));
+                }
+                Some(defs) => create
+                    .key_schema
+                    .iter()
+                    .filter(|ks| !defs.iter().any(|ad| ad.attribute_name == ks.attribute_name))
+                    .map(|ks| ks.attribute_name.as_str())
+                    .collect(),
+            };
+            if let Some(first_missing) = missing.first() {
+                let defined: Vec<&str> = input
+                    .attribute_definitions
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|ad| ad.attribute_name.as_str())
+                    .collect();
+                return Err(DynamoDbError::ValidationException(format!(
+                    "One or more parameter values were invalid: Some index key attributes \
+                     are not defined in AttributeDefinitions. Keys: [{}], \
+                     AttributeDefinitions: [{}]",
+                    first_missing,
+                    defined.join(", ")
+                )));
             }
         }
         if let Some(delete) = &update.delete {
@@ -534,6 +557,60 @@ mod tests {
             message(validate_gsi_updates(&input(json!([c]))))
                 .contains("Some index key attributes are not defined")
         );
+    }
+
+    /// A created index whose key attribute is not in AttributeDefinitions is
+    /// refused with the sentence the service picks by the member's shape
+    /// (measured 2026-10-25): absent names the index, present but lacking the
+    /// key lists the key and the definitions, empty has its own sentence.
+    #[test]
+    fn a_created_gsi_on_an_undefined_key_attribute_is_refused_by_member_shape() {
+        let input = |defs: Option<Value>| -> UpdateTableInput {
+            let mut v = serde_json::json!({
+                "TableName": "t",
+                "GlobalSecondaryIndexUpdates": [{ "Create": {
+                    "IndexName": "gix",
+                    "KeySchema": [
+                        { "AttributeName": "g", "KeyType": "HASH" },
+                        { "AttributeName": "r", "KeyType": "RANGE" },
+                    ],
+                    "Projection": { "ProjectionType": "ALL" },
+                }}],
+            });
+            if let Some(d) = defs {
+                v["AttributeDefinitions"] = d;
+            }
+            serde_json::from_value(v).unwrap()
+        };
+        let message = |defs: Option<Value>| match validate_gsi_updates(&input(defs)).unwrap_err() {
+            DynamoDbError::ValidationException(m) => m,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            message(None),
+            "One or more parameter values were invalid: AttributeDefinitions is not specified for index: gix"
+        );
+        assert_eq!(
+            message(Some(serde_json::json!([]))),
+            "Invalid KeySchema: Some index key attribute have no definition"
+        );
+        assert_eq!(
+            message(Some(
+                serde_json::json!([{ "AttributeName": "g", "AttributeType": "S" }])
+            )),
+            "One or more parameter values were invalid: Some index key attributes are not defined in AttributeDefinitions. Keys: [r], AttributeDefinitions: [g]"
+        );
+        assert_eq!(
+            message(Some(
+                serde_json::json!([{ "AttributeName": "other", "AttributeType": "S" }])
+            )),
+            "One or more parameter values were invalid: Some index key attributes are not defined in AttributeDefinitions. Keys: [g], AttributeDefinitions: [other]"
+        );
+        validate_gsi_updates(&input(Some(serde_json::json!([
+            { "AttributeName": "g", "AttributeType": "S" },
+            { "AttributeName": "r", "AttributeType": "S" },
+        ]))))
+        .unwrap();
     }
 
     #[test]

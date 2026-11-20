@@ -7,9 +7,10 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::types::{
     DescribeStreamInput, DescribeStreamOutput, GetRecordsInput, GetRecordsOutput,
     GetShardIteratorInput, GetShardIteratorOutput, ListStreamsInput, ListStreamsOutput,
-    ShardIteratorType,
+    ShardIteratorType, StreamDescription,
 };
 use extenddb_storage::error::StorageError;
+use extenddb_storage::util::stream_label_creation_date_time;
 use serde_json::Value;
 
 use crate::OperationContext;
@@ -43,9 +44,17 @@ pub async fn handle_describe_stream(
         .map_err(storage_to_dynamo)?;
 
     let output = DescribeStreamOutput {
-        stream_description: desc,
+        stream_description: with_creation_request_date_time(desc),
     };
     serialize_output(&output)
+}
+
+/// The service returns `CreationRequestDateTime` on every stream, enabled or
+/// disabled. The label is the creation instant to the millisecond, so it is
+/// derived here for every backend rather than stored by each.
+fn with_creation_request_date_time(mut desc: StreamDescription) -> StreamDescription {
+    desc.creation_request_date_time = stream_label_creation_date_time(&desc.stream_label);
+    desc
 }
 
 /// Handle `ListStreams`.
