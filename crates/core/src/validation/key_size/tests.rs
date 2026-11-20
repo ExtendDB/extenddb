@@ -512,10 +512,10 @@ fn non_scalar_values_are_skipped() {
 
 #[test]
 fn number_values_get_the_number_rules_before_any_size() {
-    // Measured 2026-11-20 in us-east-1 on a GSI with HASH `n` (N): a number
+    // Measured 2026-11-20 in us-east-1 on a GSI with HASH `n` (N). A number
     // that breaks the number rules gets the number's sentence, never the size
-    // sentence, and a valid one is sized by its normalized digits. The RANGE
-    // rows apply the same rule to a sort key value.
+    // sentence. A valid one is sized by its normalized digits. The RANGE rows
+    // apply the same rule to a sort key value.
     const DIGITS: &str = "Attempting to store more than 38 significant digits in a Number";
     const OVERFLOW: &str =
         "Number overflow. Attempting to store a number with magnitude larger than supported range";

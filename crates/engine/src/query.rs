@@ -516,11 +516,11 @@ pub async fn handle_query(
     // Select=ALL_ATTRIBUTES requires an ALL-projection GSI (shared with Scan).
     // The service makes this check after the key size and start key checks.
     // Measured 2026-11-20 in us-east-1 on a KEYS_ONLY GSI with no
-    // ExclusiveStartKey: a 2049-byte key value answers the size, and Limit 0,
-    // a parameter mix, an empty or invalid KeyConditionExpression, a missed key
-    // schema element, a wrong-typed key value, a filter or projection fault,
-    // ProjectionExpression with ALL_ATTRIBUTES and an unused name or value
-    // each answer their own refusal.
+    // ExclusiveStartKey: a 2049-byte key value answers the size. Limit 0, a
+    // parameter mix and an empty or invalid KeyConditionExpression each answer
+    // their own refusal. So do a missed key schema element, a wrong-typed key
+    // value and a filter or projection fault. ProjectionExpression with
+    // ALL_ATTRIBUTES and an unused name or value come first as well.
     validate_query_select_index_support(input.select, index_info.as_ref())?;
 
     // Determine which key schema to use for LastEvaluatedKey extraction.

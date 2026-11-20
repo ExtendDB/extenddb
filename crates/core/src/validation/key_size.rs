@@ -112,10 +112,10 @@ enum ClauseSize {
 /// An `N` value is checked against the number rules first, and one that breaks
 /// them is refused with the number's own sentence, never sized; one that
 /// passes is sized by its normalized digit string. Measured 2026-11-20 in
-/// us-east-1 on a GSI with HASH `n` (N): 2049 or 39 digits answer `Attempting
-/// to store more than 38 significant digits in a Number` in
-/// `KeyConditionExpression` and in `KeyConditions`, `1` followed by 2100 zeros
-/// answers `Number overflow. ...`, and 2100 zeros followed by `1` is served.
+/// us-east-1 on a GSI with HASH `n` (N). In `KeyConditionExpression` and in
+/// `KeyConditions`, 2049 or 39 digits answer `Attempting to store more than 38
+/// significant digits in a Number`. `1` followed by 2100 zeros answers `Number
+/// overflow. ...`, and the service serves 2100 zeros followed by `1`.
 ///
 /// # Errors
 ///
@@ -176,10 +176,11 @@ fn sized_clause(
 ///   sentence and is not sized (see `sized_clause`).
 /// - If a `#name` or `:value` of any key clause is not defined, the check
 ///   returns `Ok`, because the service reports the undefined reference ahead
-///   of the size. ExtendDB refuses most such requests later on. On a key
-///   schema with one HASH and at most one RANGE attribute, an undefined
-///   `#name` in a second clause (`pk = :h AND #u > :r`) is not refused yet and
-///   the Query is served, where the service refuses it (#1214).
+///   of the size. ExtendDB refuses most such requests later on. One exception
+///   remains. ExtendDB does not refuse an undefined `#name` in a second clause
+///   when the key schema has one HASH and at most one RANGE attribute. It
+///   serves such a Query, for example `pk = :h AND #u > :r`, and the service
+///   refuses it (#1214).
 ///
 /// All limits are inclusive. `key_schema` is the key schema being queried: the
 /// index's for an index query, the table's otherwise.
