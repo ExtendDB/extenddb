@@ -7,9 +7,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use extenddb_storage::error::StorageError;
 use extenddb_storage::hooks::{Reregistration, ServingRegistrar};
 use extenddb_storage::migrations::{CatalogMigrations, CatalogStatus, MigrationError};
-use extenddb_storage_cassandra::cassandra_util::CassandraSession;
+use extenddb_storage_cassandra::cassandra_util::{self, CassandraSession};
 use extenddb_storage_cassandra::migrations::{
     CassandraCatalogMigrations, LeaseTimes, MigrationLock, RegistrationTimes, ServerRegistration,
     ServingRegistration, register_server, register_server_as, schema_statement_bounds,
@@ -55,17 +56,43 @@ async fn the_lock_holds_for_three_ttls_and_a_killed_holder_frees_it_within_one_t
         holder.check().expect("the holder keeps its lease");
         tokio::time::sleep(Duration::from_millis(700)).await;
     }
+    assert!(
+        lock_row_exists(&other, &catalog).await,
+        "the holder's lock row is readable"
+    );
     holder.abandon();
+    // The bound measures the lapse of the lease, not the steps of acquire.
+    // The 2 s over the TTL are for a renewal that was in flight at the
+    // abandon, which starts the TTL again.
     let killed = Instant::now();
-    let next = MigrationLock::acquire(other.clone(), &catalog, times, times.ttl * 3)
+    loop {
+        let read_at = killed.elapsed();
+        if !lock_row_exists(&other, &catalog).await {
+            break;
+        }
+        assert!(
+            read_at <= times.ttl + Duration::from_secs(2),
+            "the lock row is still there {read_at:?} after the abandon"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let next = MigrationLock::acquire(other.clone(), &catalog, times, TIMEOUT)
         .await
         .expect("the lock is free once the row expires");
-    let waited = killed.elapsed();
-    assert!(
-        waited <= times.ttl + times.renew_every + Duration::from_secs(1),
-        "waited {waited:?}"
-    );
     next.release().await;
+}
+
+/// Whether the lock row of `catalog` exists, read at `LOCAL_SERIAL`. A read
+/// that fails counts as the row still there.
+async fn lock_row_exists(session: &Arc<CassandraSession>, catalog: &str) -> bool {
+    !cassandra_util::query_rows_serial::<StorageError>(
+        session,
+        &format!("SELECT key FROM {catalog}.settings WHERE key = 'migration_lock'"),
+        cdrs_tokio::query_values!(),
+        "read the lock row",
+    )
+    .await
+    .is_ok_and(|rows| rows.is_empty())
 }
 
 #[tokio::test]
@@ -585,7 +612,7 @@ async fn one_lock_timeout_bounds_the_waits_for_the_lock_and_the_servers() {
         let target = target.clone();
         tokio::spawn(async move {
             CassandraCatalogMigrations
-                .lock(&target, Duration::from_secs(4))
+                .lock(&target, Duration::from_secs(8))
                 .await
                 .map(drop)
         })
@@ -593,7 +620,7 @@ async fn one_lock_timeout_bounds_the_waits_for_the_lock_and_the_servers() {
     tokio::time::sleep(Duration::from_secs(1)).await;
     let started = Instant::now();
     let second = CassandraCatalogMigrations
-        .lock(&target, Duration::from_secs(6))
+        .lock(&target, Duration::from_secs(12))
         .await
         .map(drop);
     let waited = started.elapsed();
@@ -601,9 +628,13 @@ async fn one_lock_timeout_bounds_the_waits_for_the_lock_and_the_servers() {
         matches!(&second, Err(MigrationError::Locked(m)) if m.contains("for the lock and the servers")),
         "{second:?}"
     );
+    // B gives up at about 12 s. The 4 s over that are for the steps outside
+    // its deadline: the connect and the status reads before it, and the last
+    // read at ALL and the release after it. A wait for the servers that
+    // starts when B takes the lock, 7 s in, would give up at about 19 s.
     assert!(
-        waited < Duration::from_secs(8),
-        "B waited {waited:?} with a 6 s lock timeout"
+        waited < Duration::from_secs(16),
+        "B waited {waited:?} with a 12 s lock timeout"
     );
     let first = first.await.expect("join");
     assert!(
