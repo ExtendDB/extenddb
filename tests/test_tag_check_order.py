@@ -19,12 +19,12 @@ from __future__ import annotations
 import uuid
 
 import pytest
-from botocore.exceptions import ClientError
 
 from conftest import scoped_table
 from test_tag_validation import (
     LONG_S_MESSAGE,
     assert_create_table_refused,
+    assert_error,
     assert_validation,
     key_message,
     prefix_message,
@@ -34,13 +34,6 @@ from test_tag_validation import (
 K_BAD = [{"Key": "k!", "Value": "v"}]
 K_OK = [{"Key": "valid-key", "Value": "v"}]
 STREAM = "stream/2026-01-01T00:00:00.000"
-
-
-def assert_error(call, code: str, message: str) -> None:
-    with pytest.raises(ClientError) as exc:
-        call()
-    err = exc.value.response["Error"]
-    assert (err["Code"], err["Message"]) == (code, message), err
 
 
 def with_field(arn: str, index: int, value: str) -> str:

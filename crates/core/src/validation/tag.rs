@@ -145,6 +145,21 @@ pub fn validate_folded_tag_prefix(tags: &[Tag]) -> Result<(), DynamoDbError> {
     Ok(())
 }
 
+/// Validate the `Tags` member of a raw `TagResource` or `CreateTable` request
+/// body. A member that does not parse as a tag list is left to the request's
+/// deserialization, which reports it.
+///
+/// # Errors
+///
+/// Returns `ValidationException` for the first key or value that is invalid.
+pub fn validate_tags_member(input: &serde_json::Value) -> Result<(), DynamoDbError> {
+    use serde::Deserialize;
+    match input.get("Tags").map(Vec::<Tag>::deserialize) {
+        Some(Ok(tags)) => validate_tags(&tags),
+        _ => Ok(()),
+    }
+}
+
 /// Validate the tag keys of an `UntagResource` request. The service applies the
 /// same key rules there as on `TagResource` (measured).
 ///
@@ -162,7 +177,7 @@ pub fn validate_tag_keys(keys: &[String]) -> Result<(), DynamoDbError> {
 mod tests {
     use super::{
         validate_folded_tag_prefix, validate_tag_key, validate_tag_keys, validate_tag_value,
-        validate_tags,
+        validate_tags, validate_tags_member,
     };
     use crate::error::DynamoDbError;
     use crate::types::Tag;
@@ -402,5 +417,19 @@ mod tests {
         // check is not part of this validator.
         assert!(validate_tags(&[]).is_ok());
         assert!(validate_tag_keys(&[]).is_ok());
+    }
+
+    #[test]
+    fn the_tags_member_is_checked_only_when_it_parses_as_a_tag_list() {
+        let bad = serde_json::json!({"Tags": [{"Key": "k!", "Value": "v"}]});
+        assert_eq!(
+            message(validate_tags_member(&bad).expect_err("k!")),
+            "The Tag Key provided is invalid, Key: k!"
+        );
+        let good = serde_json::json!({"Tags": [{"Key": "k", "Value": "v"}]});
+        assert!(validate_tags_member(&good).is_ok());
+        // A member that is not a tag list is left to the request's deserialization.
+        assert!(validate_tags_member(&serde_json::json!({"Tags": "x"})).is_ok());
+        assert!(validate_tags_member(&serde_json::json!({})).is_ok());
     }
 }

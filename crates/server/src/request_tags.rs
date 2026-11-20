@@ -19,8 +19,7 @@
 use std::collections::HashMap;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::types::Tag;
-use extenddb_core::validation::{validate_tag_keys, validate_tags};
+use extenddb_core::validation::{validate_tag_keys, validate_tags_member};
 use serde_json::Value;
 
 /// The tag condition keys `operation` populates from `input`.
@@ -96,10 +95,7 @@ pub(crate) fn tag_condition_keys(
 pub(crate) fn validate_request_tags(operation: &str, input: &Value) -> Result<(), DynamoDbError> {
     use serde::Deserialize;
     match operation {
-        "TagResource" => match input.get("Tags").map(Vec::<Tag>::deserialize) {
-            Some(Ok(tags)) => validate_tags(&tags),
-            _ => Ok(()),
-        },
+        "TagResource" => validate_tags_member(input),
         "UntagResource" => match input.get("TagKeys").map(Vec::<String>::deserialize) {
             Some(Ok(keys)) => validate_tag_keys(&keys),
             _ => Ok(()),

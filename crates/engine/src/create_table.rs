@@ -1,12 +1,11 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
-use serde::Deserialize;
 use serde_json::Value;
 
 use extenddb_core::error::{DynamoDbError, ErrorMessageKey, error_message};
-use extenddb_core::types::{CreateTableInput, CreateTableOutput, Tag};
+use extenddb_core::types::{CreateTableInput, CreateTableOutput};
 use extenddb_core::validation::{
-    validate_create_table, validate_folded_tag_prefix, validate_table_name, validate_tags,
+    validate_create_table, validate_folded_tag_prefix, validate_table_name, validate_tags_member,
 };
 
 use crate::OperationContext;
@@ -28,9 +27,7 @@ pub async fn handle_create_table(
     // this handler.
     if let Some(name) = body.get("TableName").and_then(Value::as_str) {
         validate_table_name(name, &ctx.limits)?;
-        if let Some(Ok(tags)) = body.get("Tags").map(Vec::<Tag>::deserialize) {
-            validate_tags(&tags)?;
-        }
+        validate_tags_member(&body)?;
     }
 
     crate::validate_enum_fields(

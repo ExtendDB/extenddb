@@ -128,13 +128,17 @@ def prefix_message(key: str) -> str:
     return f"Tag Key cannot be prefixed with aws:, Key: {key}"
 
 
-def assert_validation(call, expected_message: str) -> None:
-    """Assert the call fails with ValidationException and that exact message."""
+def assert_error(call, code: str, message: str) -> None:
+    """Assert the call fails with that error code and that exact message."""
     with pytest.raises(ClientError) as exc:
         call()
     err = exc.value.response["Error"]
-    assert err["Code"] == "ValidationException", err
-    assert err["Message"] == expected_message, err
+    assert (err["Code"], err["Message"]) == (code, message), err
+
+
+def assert_validation(call, expected_message: str) -> None:
+    """Assert the call fails with ValidationException and that exact message."""
+    assert_error(call, "ValidationException", expected_message)
 
 
 def assert_create_table_refused(client, expected_message: str, **params) -> None:
