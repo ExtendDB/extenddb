@@ -542,14 +542,14 @@ bucket is not a failure: the operation completes with every counter at zero.
 Of the output configuration, Start checks the `S3Bucket` member's presence
 and its name. On the S3 store the first claim also checks a `KMS` encryption
 key (see the error report section). A report bucket that does not exist, or
-a mismatched output `S3BucketOwner`, does not stop the operation: both are
-checked when the operation's first report record is produced.
+a mismatched output `S3BucketOwner`, does not stop the operation. The
+operation's first report record checks both.
 
 The object list and `TotalInputBytes` are fixed when the first claim lists
-the input: an object added under the prefix afterwards is not read, and
+the input. An object added under the prefix afterwards is not read, and
 neither are bytes appended to an object afterwards. More objects than
 `max_bulk_input_files` end the operation `FAILED` with
-`S3ObjectsCountLimitExceeded`, and a listed total above the quota of the
+`S3ObjectsCountLimitExceeded`. A listed total above the quota of the
 operation's `PerformanceTier` (100 GB for `STANDARD`, 1 TB for
 `ACCELERATED`, or `max_bulk_input_bytes` when that is lower) ends it `FAILED`
 with `SizeLimitExceeded`. Either failure leaves both byte members absent and
@@ -762,7 +762,7 @@ Response:
 ```
 
 The status is `IN_PROGRESS`, even for empty input and for an input bucket
-that does not exist; poll `DescribeBulkOperation` for the terminal status.
+that does not exist. Poll `DescribeBulkOperation` for the terminal status.
 The Start response carries no `TotalInputBytes`, `ProcessedInputBytes` or
 `BulkOperationUsage` (measured on the service).
 
@@ -990,12 +990,12 @@ between, fails with the same prefix on its message.
 On the S3 store an output configuration with `S3SseAlgorithm` `KMS` is also
 checked before the first claim lists the input: the same write check runs on
 error report object 0 with the key. A key S3 cannot use ends the operation
-`FAILED` with S3's KMS code, `KmsDisabledException` for a disabled key and
-`KmsInvalidKeyUsageException` for a key of the wrong usage, and no byte
-members. A bucket or owner fault that check meets is left to the first
-report record. So is an S3 `AccessDenied` for the key, which S3 returns
-when the server's credentials may not use it, with a message that names
-the `kms:` action. The operation then fails with `S3AccessDenied` at its
+`FAILED` with S3's KMS code and no byte members. The code is
+`KmsDisabledException` for a disabled key and `KmsInvalidKeyUsageException`
+for a key of the wrong usage. A bucket or owner fault that check meets is
+left to the first report record. So is an S3 `AccessDenied` for the key,
+which S3 returns when the server's credentials may not use it, with a
+message that names the `kms:` action. The operation then fails with `S3AccessDenied` at its
 first report record, held to the end of the input as other faults found
 there are, or at the manifest when it produces no report record.
 
