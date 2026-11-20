@@ -9,7 +9,9 @@ and ``message`` on ConditionalCheckFailedException and ValidationException
 (raw bodies measured in us-east-1 on 2026-10-29, 2026-11-03 and 2026-11-19).
 It also sends ``Message`` on TransactionInProgressException,
 AccessDeniedException and SerializationException. REQ-ERR-002 in
-docs/design/01-requirements.md lists the errors measured. botocore reads
+docs/design/01-requirements.md lists the errors measured. DynamoDB writes
+``__type`` first in each of these bodies (2026-11-20), so the tests read the
+keys in the order of the raw bytes. botocore reads
 either key, so these tests read the raw body from botocore's ``before-parse``
 event before it normalizes it.
 
@@ -40,8 +42,8 @@ def hash_table(dynamodb_client):
 
 
 def _error_code_and_keys(client, operation: str, call) -> tuple[str, list[str]]:
-    """Run ``call``, which must fail, and return the error code and the sorted
-    top-level keys of the raw response body."""
+    """Run ``call``, which must fail, and return the error code and the
+    top-level keys of the raw response body, in the order of the bytes."""
     raw: list[bytes] = []
 
     def capture(response_dict, **_kwargs):
@@ -54,7 +56,7 @@ def _error_code_and_keys(client, operation: str, call) -> tuple[str, list[str]]:
             call()
     finally:
         client.meta.events.unregister(event, capture)
-    return exc_info.value.response["Error"]["Code"], sorted(json.loads(raw[-1]))
+    return exc_info.value.response["Error"]["Code"], list(json.loads(raw[-1]))
 
 
 def test_transaction_canceled_carries_message_under_capital_m(dynamodb_client, hash_table):
@@ -74,7 +76,7 @@ def test_transaction_canceled_carries_message_under_capital_m(dynamodb_client, h
         ),
     )
     assert code == "TransactionCanceledException"
-    assert keys == ["CancellationReasons", "Message", "__type"]
+    assert keys == ["__type", "CancellationReasons", "Message"]
 
 
 def test_idempotent_parameter_mismatch_carries_message_under_capital_m(
@@ -94,7 +96,7 @@ def test_idempotent_parameter_mismatch_carries_message_under_capital_m(
     put("first")
     code, keys = _error_code_and_keys(dynamodb_client, "TransactWriteItems", lambda: put("second"))
     assert code == "IdempotentParameterMismatchException"
-    assert keys == ["Message", "__type"]
+    assert keys == ["__type", "Message"]
 
 
 # Raw bodies measured in us-east-1 on 2026-11-20, each request sent twice,
@@ -130,7 +132,7 @@ def test_serialization_error_carries_message_under_capital_m(
     call = getattr(client, xform_name(operation))
     code, keys = _error_code_and_keys(client, operation, lambda: call(**params))
     assert code == "SerializationException"
-    assert keys == ["Message", "__type"]
+    assert keys == ["__type", "Message"]
 
 
 def test_conditional_check_failed_carries_message_under_lower_case(dynamodb_client, hash_table):

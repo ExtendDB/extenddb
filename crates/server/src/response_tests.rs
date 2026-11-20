@@ -4,26 +4,42 @@
 //! Tests of the error bodies [`super::error_response`] sends.
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::types::CancellationReason;
+use extenddb_core::types::{AttributeValue, CancellationReason, Item};
+use serde::de::{Deserializer as _, IgnoredAny, MapAccess, Visitor};
 
 use super::error_response;
 
-/// The top-level keys of the body `error_response` sends for `error`.
-async fn body_keys(error: &DynamoDbError) -> Vec<String> {
+/// The top-level member names of the body `error_response` sends for
+/// `error`, in the order of the bytes.
+async fn body_members(error: &DynamoDbError) -> Vec<String> {
+    struct Names;
+    impl<'de> Visitor<'de> for Names {
+        type Value = Vec<String>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an object")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut names = Vec::new();
+            while let Some((name, IgnoredAny)) = map.next_entry::<String, IgnoredAny>()? {
+                names.push(name);
+            }
+            Ok(names)
+        }
+    }
     let response = error_response(error, "request-1");
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body");
-    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
-    let mut keys: Vec<String> = body.as_object().expect("object").keys().cloned().collect();
-    keys.sort_unstable();
-    keys
+    serde_json::Deserializer::from_slice(&bytes)
+        .deserialize_map(Names)
+        .expect("json object")
 }
 
-/// The errors measured with `Message` carry it under that key, as the
-/// service sends them; the errors measured with `message` keep it.
+/// Each body writes `__type` first and the other members in the order the
+/// service writes them, with the message under the key the service uses for
+/// that error (us-east-1, raw bodies, 2026-10-29 to 2026-11-20).
 #[tokio::test]
-async fn the_message_key_follows_the_service_per_error() {
+async fn the_members_follow_the_service_per_error() {
     let cancelled = DynamoDbError::TransactionCanceledException {
         message: "Transaction cancelled, please refer cancellation reasons for specific \
                   reasons [ConditionalCheckFailed]"
@@ -34,30 +50,49 @@ async fn the_message_key_follows_the_service_per_error() {
             item: None,
         }],
     };
-    assert_eq!(
-        body_keys(&cancelled).await,
-        ["CancellationReasons", "Message", "__type"]
-    );
-    let mismatch = DynamoDbError::IdempotentParameterMismatchException(
-        "Specified idempotent token was used with different request parameters within \
-         the idempotency window"
-            .to_owned(),
-    );
-    assert_eq!(body_keys(&mismatch).await, ["Message", "__type"]);
-    let serialization = DynamoDbError::SerializationException(
-        "STRING_VALUE cannot be converted to Integer".to_owned(),
-    );
-    assert_eq!(body_keys(&serialization).await, ["Message", "__type"]);
-    let empty = DynamoDbError::SerializationException(String::new());
-    assert_eq!(body_keys(&empty).await, ["__type"]);
-    for other in [
-        DynamoDbError::ValidationException("One or more parameter values were invalid".into()),
-        DynamoDbError::ConditionalCheckFailedException(
-            "The conditional request failed".into(),
-            None,
+    let old_item = Item::from([("pk".to_owned(), AttributeValue::S("e1222".to_owned()))]);
+    let failed = "The conditional request failed";
+    let rows: [(DynamoDbError, &[&str]); 7] = [
+        (cancelled, &["__type", "CancellationReasons", "Message"]),
+        (
+            DynamoDbError::ConditionalCheckFailedException(failed.into(), Some(old_item)),
+            &["__type", "Item", "message"],
         ),
-        DynamoDbError::TransactionConflictException("Transaction is ongoing".into()),
-    ] {
-        assert_eq!(body_keys(&other).await, ["__type", "message"], "{other:?}");
+        (
+            DynamoDbError::ConditionalCheckFailedException(failed.into(), None),
+            &["__type", "message"],
+        ),
+        (
+            DynamoDbError::IdempotentParameterMismatchException(
+                "Specified idempotent token was used with different request parameters \
+                 within the idempotency window"
+                    .to_owned(),
+            ),
+            &["__type", "Message"],
+        ),
+        (
+            DynamoDbError::SerializationException(
+                "STRING_VALUE cannot be converted to Integer".to_owned(),
+            ),
+            &["__type", "Message"],
+        ),
+        (
+            DynamoDbError::SerializationException(String::new()),
+            &["__type"],
+        ),
+        (
+            DynamoDbError::ValidationException("One or more parameter values were invalid".into()),
+            &["__type", "message"],
+        ),
+    ];
+    let mut got = Vec::new();
+    let mut want: Vec<(&str, Vec<String>)> = Vec::new();
+    for (error, members) in &rows {
+        got.push((error.error_type(), body_members(error).await));
+        want.push((
+            error.error_type(),
+            members.iter().map(ToString::to_string).collect(),
+        ));
     }
+    assert_eq!(got, want);
 }
