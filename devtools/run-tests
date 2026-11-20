@@ -440,7 +440,9 @@ if $NEEDS_INTEGRATION && [[ "$TARGET" != "real-dynamodb" ]]; then
             if ! "$BINARY" stop --config "$CONFIG_FOR_SETTINGS"; then
                 echo "  ✗ Could not stop the running server to apply the config change."
                 echo "    If it was started with 'serve --foreground', restart it with"
-                echo "    --write-pid-file so 'stop' can signal it."
+                echo "    --write-pid-file so 'stop' can signal it. A server that an earlier"
+                echo "    release started with --write-pid-file holds no lock on its PID file;"
+                echo "    stop it with the kill command 'stop' printed above."
                 exit 1
             fi
             sleep 1
