@@ -266,7 +266,14 @@ class TestValidation:
         # Measured on the hosted service.
         assert terminal["FailureCode"] == "RequestCancelled"
         assert terminal["FailureMessage"] == "The request was cancelled"
-        assert terminal["ProcessedInputBytes"] == 0
+        # A cancel that lands before the input is listed leaves both byte
+        # members absent; one that lands after carries ProcessedInputBytes 0
+        # (measured on the service: 3.2 s or less after Start, and 3.9 s or
+        # more).
+        if "TotalInputBytes" in terminal:
+            assert terminal["ProcessedInputBytes"] == 0
+        else:
+            assert "ProcessedInputBytes" not in terminal
         # The cancel lands within milliseconds of the start and the run
         # takes seconds, so a worker that stopped at the next boundary has
         # processed far fewer than all rows. A server that finished the

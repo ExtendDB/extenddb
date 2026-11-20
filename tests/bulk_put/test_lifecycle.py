@@ -181,17 +181,18 @@ class TestLifecycle:
             start_body(bulk_table, bulk_bucket, in_prefix="nothing-here/"),
         )
         desc = resp["BulkOperationDescription"]
-        assert desc["TotalInputBytes"] == 0
+        assert "TotalInputBytes" not in desc
 
         arn = desc["BulkOperationArn"]
         terminal = wait_until_terminal(arn)
         assert terminal["BulkOperationStatus"] == "COMPLETED"
+        assert terminal["TotalInputBytes"] == 0
         assert terminal["ProcessedItemCount"] == 0
         assert terminal["FailedItemCount"] == 0
         assert terminal["ProcessedInputBytes"] == 0
         assert read_report(bulk_bucket, "reports", arn, "errors") is None
 
-    def test_a_bucket_that_does_not_exist_fails_the_operation_at_start(
+    def test_a_bucket_that_does_not_exist_fails_the_operation_after_start(
         self, bulk_table
     ):
         absent = f"absent-{uuid.uuid4().hex[:12]}"
@@ -199,23 +200,18 @@ class TestLifecycle:
             "StartBulkPutItems", start_body(bulk_table, absent)
         )
         desc = resp["BulkOperationDescription"]
-        assert desc["BulkOperationStatus"] == "FAILED"
-        assert desc["FailureCode"] == "S3NoSuchBucket"
+        # Measured on the hosted service: HTTP 200 IN_PROGRESS, then FAILED
+        # with S3NoSuchBucket, the counters at zero and no byte member.
+        assert desc["BulkOperationStatus"] == "IN_PROGRESS"
+        terminal = wait_until_terminal(desc["BulkOperationArn"])
+        assert terminal["BulkOperationStatus"] == "FAILED"
+        assert terminal["FailureCode"] == "S3NoSuchBucket"
         # The message is the store's own: test_store_rules.py pins each.
-        assert desc["ProcessedItemCount"] == 0
-        # Born terminal before enumeration: the hosted service omits
-        # TotalInputBytes here while keeping the counters at zero.
-        assert "TotalInputBytes" not in desc
-        assert "EndTime" in desc
-
-        # Describe answers the same terminal row: the operation was
-        # inserted already finished, with no worker involvement.
-        arn = desc["BulkOperationArn"]
-        described = extenddb_request(
-            "DescribeBulkOperation", {"BulkOperationArn": arn}
-        )["BulkOperationDescription"]
-        assert described["BulkOperationStatus"] == "FAILED"
-        assert described["FailureCode"] == "S3NoSuchBucket"
+        assert terminal["ProcessedItemCount"] == 0
+        assert "TotalInputBytes" not in terminal
+        assert "ProcessedInputBytes" not in terminal
+        assert "EndTime" in terminal
+        assert terminal["BulkOperationUsage"][0]["BulkPutBytes"] == 0
 
 
 # ---------------------------------------------------------------------------
