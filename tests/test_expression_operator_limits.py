@@ -444,28 +444,29 @@ N = {":n": {"N": "1"}}
 U = {":u": {"S": "y"}}
 P = {":p": {"S": "p1"}}
 
-# Faults the service reports ahead of the count, measured 2026-11-19 on Scan
-# (s01-s04) and on Query (q01-q04) with the same answers.
+# Faults the service reports ahead of the count, measured 2026-11-19 with the
+# same answers on Scan and on Query. Each row names its Scan case, then its
+# Query case.
 AHEAD_OF_THE_COUNT = [
-    ("s01", chain("#v = :v", 150) + " OR #v < :b", B, BOOL_OPERAND),
-    ("s02", chain("#v = :v", 151) + " OR #v = :zz", {}, UNDEFINED_VALUE),
-    ("s03", chain("#v = :v", 151) + " OR begins_with(#v, :n)", N, N_PREFIX),
-    ("s04", chain("#v = :v", 151) + " OR #x = :v", {}, UNDEFINED_NAME),
+    ("s01", "q01", chain("#v = :v", 150) + " OR #v < :b", B, BOOL_OPERAND),
+    ("s02", "q03", chain("#v = :v", 151) + " OR #v = :zz", {}, UNDEFINED_VALUE),
+    ("s03", "q04", chain("#v = :v", 151) + " OR begins_with(#v, :n)", N, N_PREFIX),
+    ("s04", "q02", chain("#v = :v", 151) + " OR #x = :v", {}, UNDEFINED_NAME),
 ]
 
 
 class TestChecksAheadOfTheCount:
     """Undefined placeholders and operand types come before the count."""
 
-    @pytest.mark.parametrize("case, expr, values, want", AHEAD_OF_THE_COUNT)
-    def test_scan_filter(self, dynamodb_client, table, case, expr, values, want):
+    @pytest.mark.parametrize("case, query_case, expr, values, want", AHEAD_OF_THE_COUNT)
+    def test_scan_filter(self, dynamodb_client, table, case, query_case, expr, values, want):
         msg = _validation(
             scan(dynamodb_client, table, expr, ExpressionAttributeValues={**VALUES, **values})
         )
         assert msg == f"Invalid FilterExpression: {want}", case
 
-    @pytest.mark.parametrize("case, expr, values, want", AHEAD_OF_THE_COUNT)
-    def test_query_filter(self, dynamodb_client, table, case, expr, values, want):
+    @pytest.mark.parametrize("scan_case, case, expr, values, want", AHEAD_OF_THE_COUNT)
+    def test_query_filter(self, dynamodb_client, table, scan_case, case, expr, values, want):
         msg = _validation(
             query(
                 dynamodb_client,
