@@ -15,7 +15,7 @@ homepage.workspace = true
 # authentication still enforced), seeded dev credential. A build-time profile
 # for local development and CI. The thin bin enforces that it is paired with the
 # `sqlite` backend.
-dev-mode = ["extenddb-config/dev-mode"]
+dev-mode = ["extenddb-config/dev-mode", "extenddb-auth/dev-mode"]
 mongodb-test-hooks = ["extenddb-server/mongodb-test-hooks"]
 backup-test-hooks = ["extenddb-server/backup-test-hooks"]
 
