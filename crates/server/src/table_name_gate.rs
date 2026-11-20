@@ -54,6 +54,13 @@
 //!   be at least 3 characters long and at most 255 characters long` when its
 //!   length in UTF-16 code units is outside 3 to 255, and the clauses at
 //!   `targetTableName` otherwise (measured 2026-11-20).
+//! - A RestoreTableFromBackup `TargetTableName` that is neither a string nor
+//!   null: `SerializationException`, before the checks of the value of
+//!   `BackupArn` and of the overrides (measured 2026-11-20). A member of
+//!   another JSON type written before it is answered first by the service,
+//!   which this check does not follow. The text is the one the restore's
+//!   other members of another JSON type get. The service's texts and its
+//!   member order are #1012.
 //!
 //! The service reads `SourceTableName`, `TargetTableName` (both restores),
 //! `TableCreationParameters.TableName` (`ImportTable`),
@@ -83,8 +90,9 @@ const LIST_STREAMS_NAME: &str =
 
 /// Refuse a table name outside the service's character pattern, in any field
 /// the operation carries one, before the name is used in any lookup. A
-/// missing, non-string or empty name passes. `account_id` is the caller's
-/// account, which the control-plane ARN rules compare with the ARN's.
+/// missing, non-string or empty name passes, except a RestoreTableFromBackup
+/// `TargetTableName` that is neither a string nor null. `account_id` is the
+/// caller's account, which the control-plane ARN rules compare with the ARN's.
 pub(crate) fn check_table_name_chars(
     operation: &str,
     input: &Value,
@@ -106,11 +114,17 @@ pub(crate) fn check_table_name_chars(
             with_str(input, "BackupArn", arn_gate::check_backup_arn)
         }
         "RestoreTableFromBackup" => {
+            let target = input.get("TargetTableName");
+            if target.is_some_and(|v| !v.is_string() && !v.is_null()) {
+                return Err(DynamoDbError::SerializationException(
+                    "Start of structure or map found where not expected: TargetTableName"
+                        .to_owned(),
+                ));
+            }
             with_str(input, "BackupArn", arn_gate::check_backup_arn)?;
             // A target name refused here gets the restore's own answer, its
             // length text before the member constraints, with the model's
             // bounds (measured on DynamoDB on 20 Nov 2026).
-            let target = input.get("TargetTableName");
             check_name_member(target, "targetTableName").or_else(|_| {
                 let name = target.and_then(Value::as_str).unwrap_or_default();
                 extenddb_engine::check_restore_table_name(name, "targetTableName", (3, 255))
@@ -636,6 +650,28 @@ mod tests {
             assert!(message(op, json!({ "ResourceArn": format!("{ARN}/index/i") })).is_none());
             assert!(message(op, json!({})).is_none());
         }
+    }
+
+    /// Measured on DynamoDB on 20 Nov 2026: a restore's `TargetTableName`
+    /// that is neither a string nor null is answered before its `BackupArn`,
+    /// and a null is an absent member.
+    #[test]
+    fn a_restore_target_name_of_another_json_type_is_refused_before_the_backup_arn() {
+        let own =
+            "arn:aws:dynamodb:us-east-1:123456789012:table/t367name/backup/01700000000000-abcdef12";
+        let refused_arn = format!("{ARN}/backup/01700000000000-abcdef12");
+        for target in [json!(5), json!(true), json!({}), json!([])] {
+            let input = json!({ "BackupArn": refused_arn, "TargetTableName": target });
+            assert!(
+                matches!(
+                    check_table_name_chars("RestoreTableFromBackup", &input, "123456789012"),
+                    Err(DynamoDbError::SerializationException(_))
+                ),
+                "{input}"
+            );
+        }
+        let null = json!({ "BackupArn": own, "TargetTableName": null });
+        assert!(message("RestoreTableFromBackup", null).is_none());
     }
 
     #[test]

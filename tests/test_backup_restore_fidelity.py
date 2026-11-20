@@ -2324,12 +2324,30 @@ def test_backup_and_table_names_are_validated(dynamodb_client):
         ):
             cases.append(("RestoreTableFromBackup",
                           {"TargetTableName": name, "BackupArn": missing}, expected))
-        cases.append(("RestoreTableFromBackup", {"BackupArn": missing},
-                      "The parameter 'TableName' is required but was not present in the request"))
+        # An absent or null TargetTableName is a missing member. Another JSON type is a
+        # SerializationException (measured 20 Nov 2026), and only its type is checked (#1012).
+        for body in ({"BackupArn": missing}, {"BackupArn": missing, "TargetTableName": None}):
+            cases.append(("RestoreTableFromBackup", body,
+                          "The parameter 'TableName' is required but was not present in the request"))
+        serialization = "SerializationException"
+        foreign = missing.replace(missing.split(":")[4], "111122223333", 1)
+        for target in (5, 5.5, True, False, {}, {"S": "a"}, [], ["a"]):
+            cases.append(("RestoreTableFromBackup",
+                          {"BackupArn": missing, "TargetTableName": target}, serialization))
+        for body in (
+            {"TargetTableName": 5},
+            {"BackupArn": "x", "TargetTableName": 5},
+            {"BackupArn": foreign, "TargetTableName": 5},
+            {"BackupArn": missing, "TargetTableName": 5, "BillingModeOverride": "X"},
+        ):
+            cases.append(("RestoreTableFromBackup", body, serialization))
         for operation, body, expected in cases:
             resp = _signed(operation, body)
             assert resp.status_code == 400, (operation, body, resp.text)
             code, message = _error(resp)
+            if expected == serialization:
+                assert code == serialization, (operation, body, resp.text)
+                continue
             assert code == "ValidationException", (operation, body, resp.text)
             if _is_real_dynamodb() and " detected: " in expected:
                 # The clauses, their count, and the member path; the order of
