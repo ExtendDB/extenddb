@@ -119,7 +119,6 @@ use crate::cassandra_util::Stmt;
 use std::time::Duration;
 
 use cdrs_tokio::error::Error as DriverError;
-use cdrs_tokio::frame::message_error::ErrorType;
 use cdrs_tokio::query::QueryValues;
 use cdrs_tokio::types::IntoRustByName;
 use cdrs_tokio::types::rows::Row;
@@ -226,14 +225,7 @@ pub async fn heartbeat_backup_row(
 /// or failure on a lightweight transaction is the Paxos round not completing
 /// within the coordinator's view; the proposal may still commit.
 fn outcome_unknown(error: &DriverError) -> bool {
-    match error {
-        DriverError::Io(_) | DriverError::Timeout(_) => true,
-        DriverError::Server { body, .. } => matches!(
-            body.ty,
-            ErrorType::WriteTimeout(_) | ErrorType::WriteFailure(_)
-        ),
-        _ => false,
-    }
+    crate::cassandra_util::lwt_outcome_unknown(error)
 }
 
 /// Run a conditional write and report what it did.
@@ -3420,7 +3412,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use cdrs_tokio::consistency::Consistency;
-    use cdrs_tokio::frame::message_error::{ErrorBody, WriteTimeoutError, WriteType};
+    use cdrs_tokio::frame::message_error::{ErrorBody, ErrorType, WriteTimeoutError, WriteType};
 
     use super::*;
 
