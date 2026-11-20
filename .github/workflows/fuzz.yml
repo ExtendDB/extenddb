@@ -8,8 +8,9 @@
 # Pull requests that touch crates/core, crates/auth or the fuzz crate run each
 # target for a short time as a smoke test. A daily schedule runs each target
 # for longer. Each run starts from the committed seeds in fuzz/seeds and writes
-# the inputs it generates under $RUNNER_TEMP, outside the checkout. A crash or
-# a timeout uploads the reproducing input under fuzz/artifacts.
+# the inputs it generates under $RUNNER_TEMP, outside the checkout. An input
+# that crashes, times out, runs out of memory or runs slowly fails the job, and
+# the job does not publish that input (see the Fuzz step).
 name: Fuzz
 
 on:
@@ -20,6 +21,8 @@ on:
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'
+      # The resolver setting in .cargo/config.toml applies to the fuzz build.
+      - '.cargo/**'
       - 'crates/core/**'
       - 'crates/auth/**'
       - 'crates/cache/**'
@@ -38,6 +41,9 @@ concurrency:
 
 jobs:
   fuzz:
+    # A fork inherits the schedule but not the runner group below, so the job
+    # runs only in repositories that the ExtendDB organization owns.
+    if: github.repository_owner == 'ExtendDB'
     # Dedicated ExtendDB runner group (Ubuntu 24.04, 4 vCPU / 16 GB, capped at
     # 20 concurrent).
     runs-on: extenddb_ubuntu-2404_4-core
@@ -104,10 +110,28 @@ jobs:
           tar -xzf cargo-fuzz.crate -C cargo-fuzz-src
           cargo install --locked --path "cargo-fuzz-src/cargo-fuzz-${version}"
 
+      - name: Build ${{ matrix.target }}
+        # Its own step, so the build output stays in the log. The Fuzz step
+        # keeps the libFuzzer output out of it.
+        run: cargo fuzz build "${{ matrix.target }}"
+
       - name: Fuzz ${{ matrix.target }}
         # libFuzzer writes the inputs it generates to the first corpus
         # directory and only reads the second, so the committed seeds are not
         # modified. The first directory has to exist before libFuzzer starts.
+        # A target with a dictionary in fuzz/dicts gets it with -dict.
+        #
+        # The log of a run in a public repository is public. When an input
+        # crashes, times out, runs out of memory or runs for more than 10
+        # seconds, libFuzzer writes it under fuzz/artifacts and prints it in
+        # the log as bytes and as base64 (up to 256 bytes), and cargo-fuzz
+        # prints a failing input in full. The SigV4 targets parse a request
+        # before the caller is authenticated, so such an input can be a denial
+        # of service that SECURITY.md asks to be reported privately. This step
+        # writes the cargo-fuzz and libFuzzer output to a file, prints only the
+        # final statistics of a clean run, and uploads nothing. Any file under
+        # fuzz/artifacts fails the job, a slow input too, because no log shows
+        # it.
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "pull_request" ]; then
@@ -117,15 +141,20 @@ jobs:
           fi
           corpus="$RUNNER_TEMP/corpus/${{ matrix.target }}"
           mkdir -p "$corpus"
+          dict=""
+          if [ -f "fuzz/dicts/${{ matrix.target }}.dict" ]; then
+            dict="-dict=fuzz/dicts/${{ matrix.target }}.dict"
+          fi
+          log="$RUNNER_TEMP/fuzz-${{ matrix.target }}.log"
+          status=0
           cargo fuzz run "${{ matrix.target }}" "$corpus" "fuzz/seeds/${{ matrix.target }}" -- \
+            ${dict:+"$dict"} \
             -max_total_time="${seconds}" \
             -rss_limit_mb=4096 \
-            -timeout=25
-
-      - name: Upload the reproducing input on failure
-        if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: fuzz-artifacts-${{ matrix.target }}
-          path: fuzz/artifacts
-          if-no-files-found: ignore
+            -timeout=25 \
+            -print_final_stats=1 > "$log" 2>&1 || status=$?
+          if [ "$status" -ne 0 ] || [ -n "$(find fuzz/artifacts -type f -print -quit 2>/dev/null)" ]; then
+            echo "::error::The ${{ matrix.target }} fuzz run failed: an input crashed, timed out, ran out of memory or ran slowly, or libFuzzer stopped. This job does not publish the libFuzzer log or the input. Run cargo fuzz run ${{ matrix.target }} locally to reproduce it, and report a security defect privately, as SECURITY.md describes."
+            exit 1
+          fi
+          grep -E '^(Done |stat::)' "$log" || true
