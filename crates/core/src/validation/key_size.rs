@@ -18,7 +18,7 @@ use crate::expression::{
 };
 use crate::limits::LimitsConfig;
 use crate::types::{AttributeValue, KeySchemaElement, KeyType};
-use crate::validation::number::validate_and_normalize_number;
+use crate::validation::number::normalize_number;
 
 /// Byte size of a key attribute value.
 ///
@@ -119,8 +119,8 @@ enum ClauseSize {
 ///
 /// # Errors
 ///
-/// Returns the number rules' `ValidationException` for an `N` value that
-/// breaks them.
+/// Returns the number's `ValidationException` for an `N` value with more
+/// than 38 significant digits or a magnitude out of range.
 fn sized_clause(
     clause: &Clause<'_>,
     key_schema: &[KeySchemaElement],
@@ -144,7 +144,14 @@ fn sized_clause(
             return Ok(ClauseSize::Unresolved);
         };
         let bytes = match value {
-            AttributeValue::N(n) => validate_and_normalize_number(n)?.len(),
+            // The service reads Unicode decimal digits such as U+FF11 as
+            // digits, and `normalize_number` refuses them, so a value it does
+            // not read as a number is sized by its text (measured 2026-11-20).
+            AttributeValue::N(n) => match normalize_number(n) {
+                Ok(digits) => digits.len(),
+                Err(fault) if fault.is_not_a_number() => n.len(),
+                Err(fault) => return Err(fault.error(n)),
+            },
             other => key_value_byte_size(other),
         };
         size = size.max(bytes);
@@ -172,15 +179,16 @@ fn sized_clause(
 ///   the range sentence.
 /// - The HASH checks run before the RANGE check, so the hash sentence wins when
 ///   both limits are exceeded.
-/// - An `N` value that breaks the number rules is refused with the number's
-///   sentence and is not sized (see `sized_clause`).
+/// - An `N` value with more than 38 significant digits or a magnitude out of
+///   range is refused with the number's sentence and is not sized. A value
+///   the number validator does not read as a number is sized by its text
+///   (see `sized_clause`).
 /// - If a `#name` or `:value` of any key clause is not defined, the check
 ///   returns `Ok`, because the service reports the undefined reference ahead
-///   of the size. ExtendDB refuses most such requests later on. One exception
-///   remains. ExtendDB does not refuse an undefined `#name` in a second clause
-///   when the key schema has one HASH and at most one RANGE attribute. It
-///   serves such a Query, for example `pk = :h AND #u > :r`, and the service
-///   refuses it (#1214).
+///   of the size. ExtendDB refuses most such requests later on. On a key
+///   schema with one HASH and at most one RANGE attribute it serves
+///   `pk = :h AND #u > :r` with `#u` undefined, which the service refuses
+///   (#1214).
 ///
 /// All limits are inclusive. `key_schema` is the key schema being queried: the
 /// index's for an index query, the table's otherwise.

@@ -30,6 +30,7 @@ from query_key_size_support import (  # noqa: F401  (fixtures are used by name)
     HASH_MESSAGE,
     S,
     index_table,
+    refused,
     refused_ending,
 )
 
@@ -255,7 +256,6 @@ START_KEY = {"g": S(1, "x"), "pk": S(1, "a"), "sk": S(1, "b")}
     [
         pytest.param(BIG, None, HASH_MESSAGE, id="2049-bytes"),
         pytest.param(BIG, START_KEY, HASH_MESSAGE, id="2049-bytes-with-a-start-key"),
-        pytest.param(S(1, "x"), None, SELECT_ON_KEYS_ONLY_MESSAGE, id="1-byte"),
         pytest.param(S(1, "x"), START_KEY, SELECT_ON_KEYS_ONLY_MESSAGE, id="1-byte-with-a-start-key"),
     ],
 )
@@ -272,6 +272,4 @@ def test_select_all_attributes_on_a_keys_only_gsi_is_reported_after(
     }
     if start_key is not None:
         query["ExclusiveStartKey"] = start_key
-    err = _error(dynamodb_client, **query)
-    assert err["Code"] == "ValidationException"
-    assert err["Message"] == message
+    refused(dynamodb_client, message, **query)

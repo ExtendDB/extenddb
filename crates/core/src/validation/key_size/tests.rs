@@ -513,14 +513,15 @@ fn non_scalar_values_are_skipped() {
 #[test]
 fn number_values_get_the_number_rules_before_any_size() {
     // Measured 2026-11-20 in us-east-1 on a GSI with HASH `n` (N). A number
-    // that breaks the number rules gets the number's sentence, never the size
-    // sentence. A valid one is sized by its normalized digits. The RANGE rows
-    // apply the same rule to a sort key value.
+    // with more than 38 significant digits or out of range gets the number's
+    // sentence, never the size sentence. A valid one is sized by its
+    // normalized digits. A number in other Unicode decimal digits is served.
+    // The RANGE rows apply the same rule to a sort key value.
     const DIGITS: &str = "Attempting to store more than 38 significant digits in a Number";
     const OVERFLOW: &str =
         "Number overflow. Attempting to store a number with magnitude larger than supported range";
     let zeros = "0".repeat(2100);
-    let cases: [(&str, &str, String, Option<&str>); 6] = [
+    let cases: [(&str, &str, String, Option<&str>); 8] = [
         ("hash, 2049 digits", "pk", "1".repeat(2049), Some(DIGITS)),
         ("hash, 39 digits", "pk", "1".repeat(39), Some(DIGITS)),
         (
@@ -530,18 +531,24 @@ fn number_values_get_the_number_rules_before_any_size() {
             Some(OVERFLOW),
         ),
         ("hash, 2100 zeros and 1", "pk", format!("{zeros}1"), None),
+        ("hash, U+FF11", "pk", "\u{ff11}".to_owned(), None),
+        (
+            "hash, U+0967 U+0968",
+            "pk",
+            "\u{967}\u{968}".to_owned(),
+            None,
+        ),
         ("range, 1025 digits", "sk", "1".repeat(1025), Some(DIGITS)),
         ("range, 2100 zeros and 1", "sk", format!("{zeros}1"), None),
     ];
     for (label, attribute, n, expected) in cases {
-        let mut kc = hash_only("pk", "p");
-        let mut values = vec![("p", s_of("p", 1))];
-        if attribute == "sk" {
+        let (kc, values) = if attribute == "sk" {
+            let mut kc = hash_only("pk", "p");
             kc.sk_condition = Some(eq("sk", "v"));
-            values.push(("v", AttributeValue::N(n)));
+            (kc, vec![("p", s_of("p", 1)), ("v", AttributeValue::N(n))])
         } else {
-            values = vec![("p", AttributeValue::N(n))];
-        }
+            (hash_only("pk", "p"), vec![("p", AttributeValue::N(n))])
+        };
         let result = check(&kc, &base_schema(), &maps_with(values));
         match expected {
             Some(sentence) => assert_eq!(message(result), sentence, "{label}"),

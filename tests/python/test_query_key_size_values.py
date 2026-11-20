@@ -194,9 +194,10 @@ OVERFLOW_MESSAGE = (
 class TestNumberKeyValues:
     """GSI ``ngsi`` with HASH ``n`` (N), measured 2026-11-20 in us-east-1.
 
-    A number that breaks the number rules gets the number's sentence, not the
-    size sentence, and a valid number is sized after it is normalized, so 2100
-    zeros followed by ``1`` is served.
+    A number with more than 38 significant digits or out of range gets the
+    number's sentence, not the size sentence. A valid number is sized after it
+    is normalized, so 2100 zeros followed by ``1`` is served. A number in other
+    Unicode decimal digits (U+FF11, U+0967 U+0968) is served too.
     """
 
     @pytest.mark.parametrize("syntax", ["expression", "legacy"])
@@ -207,6 +208,8 @@ class TestNumberKeyValues:
             pytest.param("1" * 39, DIGITS_MESSAGE, id="39-digits"),
             pytest.param("1" + "0" * 2100, OVERFLOW_MESSAGE, id="1-then-2100-zeros"),
             pytest.param("0" * 2100 + "1", None, id="2100-zeros-then-1"),
+            pytest.param("\uff11", None, id="fullwidth-1"),
+            pytest.param("\u0967\u0968", None, id="devanagari-12"),
         ],
     )
     def test_a_number_is_checked_before_it_is_sized(
