@@ -274,63 +274,39 @@ fn configuration_size_cap_binds_on_the_serialized_bytes() {
     }
 }
 
-// Fidelity: a Start that names a missing input bucket inserts the
-// operation already terminal FAILED, before enumeration, so it carries
-// no input total. The hosted service returns that FAILED operation
-// with TotalInputBytes absent and the counters present at zero
-// (measured on the service); describe renders the same shape.
+// An operation whose input checks fail on its first claim ends FAILED
+// before the runner records the files, so the record holds no input total.
+// The hosted service answers a missing bucket and an object count over the
+// quota (50,500 objects under one prefix) with neither byte member and the
+// counters at zero (measured on the service); describe renders the same.
 #[test]
-fn describe_omits_total_input_bytes_on_a_missing_bucket_failure() {
-    let mut terminal = record("FAILED");
-    terminal.end_time_ms = Some(terminal.start_time_ms); // born terminal
-    terminal.total_input_bytes = None;
-    terminal.processed_item_count = 0;
-    terminal.failed_item_count = 0;
-    terminal.failure_code = Some("S3NoSuchBucket".to_owned());
-    terminal.failure_message = Some("The specified bucket does not exist".to_owned());
+fn describe_omits_both_byte_members_when_the_listing_failed() {
+    for (code, message, ran_ms) in [
+        ("S3NoSuchBucket", "The specified bucket does not exist", 0),
+        (
+            "S3ObjectsCountLimitExceeded",
+            "You have reached the maximum number of objects allowed in a single bulk operation \
+             for the specified prefix h1/, which is 50000. You can reach out to AWS Support to \
+             request a quota increase.",
+            15_386,
+        ),
+    ] {
+        let mut terminal = record("FAILED");
+        terminal.end_time_ms = Some(terminal.start_time_ms + ran_ms);
+        terminal.total_input_bytes = None;
+        terminal.processed_item_count = 0;
+        terminal.failed_item_count = 0;
+        terminal.failure_code = Some(code.to_owned());
+        terminal.failure_message = Some(message.to_owned());
 
-    let description = describe(&terminal, REGION).expect("the record renders");
-    let wire = serde_json::to_value(&description).expect("the description serializes");
+        let description = describe(&terminal, REGION).expect("the record renders");
+        let wire = serde_json::to_value(&description).expect("the description serializes");
 
-    assert_eq!(wire.get("ProcessedItemCount"), Some(&json!(0)));
-    assert_eq!(wire.get("FailedItemCount"), Some(&json!(0)));
-    assert!(
-        wire.get("TotalInputBytes").is_none(),
-        "the hosted service omits TotalInputBytes on a missing-bucket FAILED operation"
-    );
-    // The two byte members travel together: the missing-bucket description
-    // the hosted service answered carries neither.
-    assert!(
-        wire.get("ProcessedInputBytes").is_none(),
-        "ProcessedInputBytes is absent whenever TotalInputBytes is absent"
-    );
-}
-
-// A failure on the input object count (measured on the service: 50,500
-// objects under one prefix) runs for seconds on the hosted service and
-// ends FAILED with neither byte member, the same shape as the missing
-// bucket: the runner fails the count before it records the files, so the
-// record holds no total.
-#[test]
-fn describe_omits_both_byte_members_on_an_object_count_quota_failure() {
-    let mut terminal = record("FAILED");
-    terminal.end_time_ms = Some(terminal.start_time_ms + 15_386);
-    terminal.total_input_bytes = None;
-    terminal.failure_code = Some("S3ObjectsCountLimitExceeded".to_owned());
-    terminal.failure_message = Some(
-        "You have reached the maximum number of objects allowed in a single bulk operation \
-         for the specified prefix h1/, which is 50000. You can reach out to AWS Support to \
-         request a quota increase."
-            .to_owned(),
-    );
-
-    let description = describe(&terminal, REGION).expect("the record renders");
-    let wire = serde_json::to_value(&description).expect("the description serializes");
-
-    assert!(wire.get("TotalInputBytes").is_none());
-    assert!(wire.get("ProcessedInputBytes").is_none());
-    assert_eq!(wire.get("ProcessedItemCount"), Some(&json!(0)));
-    assert_eq!(wire.get("FailedItemCount"), Some(&json!(0)));
+        assert!(wire.get("TotalInputBytes").is_none(), "{code}");
+        assert!(wire.get("ProcessedInputBytes").is_none(), "{code}");
+        assert_eq!(wire.get("ProcessedItemCount"), Some(&json!(0)), "{code}");
+        assert_eq!(wire.get("FailedItemCount"), Some(&json!(0)), "{code}");
+    }
 }
 
 // The per-object size quota keeps both: TotalInputBytes from the

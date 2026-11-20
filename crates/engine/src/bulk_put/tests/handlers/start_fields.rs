@@ -360,6 +360,20 @@ async fn the_listing_quotas_end_the_run_before_the_files_are_recorded() {
     }
 }
 
+/// A listed total equal to the quota is within it, so the run records the
+/// files.
+#[tokio::test]
+async fn a_total_equal_to_the_quota_is_recorded() {
+    let h = Harness::new().await;
+    h.write_input("part-0.json", b"0123456789");
+    let limits = vec![("max_bulk_input_bytes", json!(10))];
+    let ctx = ctx_with_limits(&h, bulk_limits(&limits));
+    let started = start_ok(&ctx, start_body()).await;
+    let ended = run_started(&h, &ctx, &started).await;
+    assert_ne!(ended["FailureCode"], json!("SizeLimitExceeded"));
+    assert_eq!(ended["TotalInputBytes"], json!(10));
+}
+
 #[tokio::test]
 async fn the_byte_members_appear_once_the_run_records_the_files() {
     // Measured on the service: the Start answer carries neither byte
