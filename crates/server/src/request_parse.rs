@@ -21,7 +21,7 @@
 //! 20000 wrapper PutItem is a `MissingAuthenticationTokenException`, and the
 //! same body without its last byte a `SerializationException`). The handler
 //! follows that order. It parses a body within [`UNAUTHENTICATED_PARSE_DEPTH`]
-//! before authentication. For a deeper body it runs only
+//! before authentication unless it is empty. For a deeper body it runs only
 //! [`check_request_syntax`], which does not recurse, and parses the body after
 //! the caller is authenticated, so no request recurses past `serde_json`'s
 //! default depth on an unauthenticated connection.
