@@ -209,6 +209,22 @@ impl IndexOverrides {
         })
     }
 
+    /// Check each entry's `IndexName` with `validate_index_name` at the
+    /// entry's member path, numbered from 1, the GSI list first.
+    pub(super) fn check_index_names(&self) -> Result<(), DynamoDbError> {
+        let gsi = self.gsi.iter().flatten().map(|e| &e.index.index_name);
+        let lsi = self.lsi.iter().flatten().map(|e| &e.index.index_name);
+        let entries = gsi
+            .enumerate()
+            .map(|(n, name)| ("global", n, name))
+            .chain(lsi.enumerate().map(|(n, name)| ("local", n, name)));
+        for (kind, n, name) in entries {
+            let path = format!("{kind}SecondaryIndexOverride.{}.member.indexName", n + 1);
+            extenddb_core::validation::validate_index_name(name, &path)?;
+        }
+        Ok(())
+    }
+
     /// Apply the overrides to `input`, the table the restore creates without
     /// them (the backup's indexes, with the billing and throughput overrides
     /// already applied). `billing_override` is the request's
