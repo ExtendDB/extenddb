@@ -293,11 +293,7 @@ pub(crate) fn check_request_parameter_types<'a>(
 ) -> Result<(), DynamoDbError> {
     for list in lists {
         if let Some(Value::Array(parameters)) = list {
-            check_parameter_types(parameters).map_err(|detail| {
-                DynamoDbError::SerializationException(format!(
-                    "Start of structure or map found where not expected: {detail}"
-                ))
-            })?;
+            check_parameter_types(parameters).map_err(crate::serialization_exception)?;
         }
     }
     Ok(())
