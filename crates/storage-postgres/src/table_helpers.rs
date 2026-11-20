@@ -25,6 +25,8 @@ pub(crate) struct TableRow {
     pub provisioned_throughput: Option<serde_json::Value>,
     pub stream_specification: Option<serde_json::Value>,
     pub table_status: String,
+    /// The column keeps microseconds, and DynamoDB sends `CreationDateTime`
+    /// with at most three decimal places.
     pub creation_epoch: Option<f64>,
     pub table_size_bytes: i64,
     pub item_count: i64,
@@ -139,7 +141,8 @@ impl PostgresEngine {
         let row: Option<TableRow> = sqlx::query_as(
             r"SELECT table_name, key_schema, attribute_definitions, billing_mode,
                       provisioned_throughput, stream_specification, table_status,
-                      EXTRACT(EPOCH FROM creation_date_time)::FLOAT8 as creation_epoch,
+                      EXTRACT(EPOCH FROM date_trunc('milliseconds', creation_date_time))::FLOAT8
+                          as creation_epoch,
                       table_size_bytes, item_count, table_arn, table_id,
                       deletion_protection_enabled, stream_label,
                       table_class, sse_specification, on_demand_throughput,

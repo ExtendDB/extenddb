@@ -266,7 +266,8 @@ impl PostgresEngine {
                      ELSE NOW() + make_interval(secs => (SELECT secs FROM delay))
                 END,
                 $11, $12, $13, $16)
-               RETURNING EXTRACT(EPOCH FROM creation_date_time)::FLOAT8, table_status",
+               RETURNING EXTRACT(EPOCH FROM date_trunc('milliseconds', creation_date_time))::FLOAT8,
+                 table_status",
         )
         .bind(account_id)
         .bind(&input.table_name)

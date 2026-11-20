@@ -10,8 +10,11 @@ REQ-TEST-001, REQ-TEST-002, REQ-TEST-003, REQ-TEST-004
 from __future__ import annotations
 
 import contextlib
+import json
 import os
+import time
 import uuid
+from decimal import Decimal
 
 import pytest
 from botocore.exceptions import ClientError
@@ -102,6 +105,73 @@ class TestDescribeTable:
             dynamodb_client.describe_table(TableName="nonexistent-table-xyz-999")
         err = exc_info.value.response["Error"]
         assert err["Code"] == "ResourceNotFoundException"
+
+
+# Date members as (operation, path in its response). DynamoDB sends each as
+# epoch seconds with at most three decimal places (measured in us-east-1 on
+# 2026-11-14 and 2026-11-16, each response body read as text).
+DATE_MEMBERS = [
+    ("CreateTable", ("TableDescription", "CreationDateTime")),
+    ("DescribeTable", ("Table", "CreationDateTime")),
+    ("DescribeTable", ("Table", "BillingModeSummary", "LastUpdateToPayPerRequestDateTime")),
+    ("CreateBackup", ("BackupDetails", "BackupCreationDateTime")),
+    ("UpdateTable", ("TableDescription", "CreationDateTime")),
+]
+
+
+@pytest.fixture(scope="module")
+def date_member_answers(dynamodb_client):
+    """The answers DATE_MEMBERS reads, every number kept as sent: an on-demand
+    table and its backup, and a provisioned table raised from 5/7 to 9/11."""
+    from test_backup_restore_fidelity import _delete_backup_when_available
+    from test_vector_index_query_scan import _signed_post
+
+    def call(operation: str, **body) -> dict:
+        deadline = time.monotonic() + 300
+        resp = _signed_post(operation, body)
+        # The service refuses a backup until backups are enabled for the table.
+        while "ContinuousBackupsUnavailable" in resp.text and time.monotonic() < deadline:
+            time.sleep(5)
+            resp = _signed_post(operation, body)
+        assert resp.status_code == 200, f"{operation} failed: {resp.text}"
+        return json.loads(resp.text, parse_float=Decimal)
+
+    key = {
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+    }
+    on_demand, provisioned = (f"extenddb-test-{uuid.uuid4().hex[:12]}" for _ in range(2))
+    answers: dict = {}
+    try:
+        answers["CreateTable"] = call(
+            "CreateTable", TableName=on_demand, BillingMode="PAY_PER_REQUEST", **key
+        )
+        wait_for_active(dynamodb_client, on_demand)
+        answers["DescribeTable"] = call("DescribeTable", TableName=on_demand)
+        answers["CreateBackup"] = call("CreateBackup", TableName=on_demand, BackupName="dates")
+        pt = {"ReadCapacityUnits": 5, "WriteCapacityUnits": 7}
+        call("CreateTable", TableName=provisioned, ProvisionedThroughput=pt, **key)
+        wait_for_active(dynamodb_client, provisioned)
+        pt = {"ReadCapacityUnits": 9, "WriteCapacityUnits": 11}
+        answers["UpdateTable"] = call("UpdateTable", TableName=provisioned, ProvisionedThroughput=pt)
+        yield answers
+    finally:
+        if "CreateBackup" in answers:
+            arn = answers["CreateBackup"]["BackupDetails"]["BackupArn"]
+            _delete_backup_when_available(dynamodb_client, arn)
+        for name in (on_demand, provisioned):
+            with contextlib.suppress(ClientError, TimeoutError):
+                wait_for_active(dynamodb_client, name)
+                dynamodb_client.delete_table(TableName=name)
+
+
+@pytest.mark.parametrize(("operation", "path"), DATE_MEMBERS)
+def test_date_member_has_at_most_three_decimal_places(date_member_answers, operation, path):
+    value = date_member_answers[operation]
+    for name in path:
+        value = value[name]
+    places = -Decimal(value).normalize().as_tuple().exponent
+    assert places <= 3, f"{operation} {'.'.join(path)} is {value}"
 class TestListTables:
     """ListTables operation tests."""
 
