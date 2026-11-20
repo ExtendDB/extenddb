@@ -548,38 +548,82 @@ async fn test_a_committed_token_row_expires_ten_minutes_after_its_commit() {
     assert!((590..=600).contains(&ttl), "TTL {ttl}");
 }
 
-/// The cancellation of a send writes the cancelled token only over the
-/// running row of that send. Every write of a token row is an LWT, so a row
-/// that changed while the send ran stays as it is. The test changes the row
+/// The fingerprint of the token row of `token`, or `None` when it has no row.
+async fn token_fingerprint(
+    engine: &extenddb_storage_cassandra::CassandraEngine,
+    account_id: &str,
+    token: &str,
+) -> Option<String> {
+    use cdrs_tokio::types::IntoRustByName;
+    let query = format!(
+        "SELECT fingerprint FROM {}.idempotency_tokens_by_account \
+         WHERE account_id = ? AND \"token\" = ?",
+        engine.catalog_keyspace()
+    );
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<
+        extenddb_storage::error::StorageError,
+    >(
+        &engine.session_arc(),
+        &query,
+        cdrs_tokio::query_values!(account_id, token),
+        "read the token row",
+    )
+    .await
+    .expect("read the token row");
+    rows.first()
+        .and_then(|row| row.get_by_name("fingerprint").ok().flatten())
+}
+
+/// The cancellation of a send writes the cancelled token only where the
+/// running row of that send was. Every write of a token row is an LWT, so a
+/// row that another request reserved while the send ran stays as it is, and
+/// a row that is gone gets the cancelled token. Each case changes the row
 /// while the send prepares its 40 members, as a row looks when it expired
-/// during the send and another request then reserved the token.
+/// during the send. A different request with the token then answers the
+/// mismatch and writes nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_a_cancellation_leaves_a_token_row_that_changed_while_the_send_ran() {
     use extenddb_core::expression::{Expr, PathElement};
     use extenddb_storage::error::StorageError;
+
+    // (case, the LWT that changes the send's row in keyspace `{ks}`, the
+    // fingerprint of the row after the cancellation)
+    const CASES: [(&str, &str, &str); 2] = [
+        (
+            "another request reserved the token",
+            "UPDATE {ks}.idempotency_tokens_by_account USING TTL 600 \
+             SET fingerprint = 'running:fp-b' \
+             WHERE account_id = ? AND \"token\" = ? IF fingerprint = 'running:fp-a'",
+            "running:fp-b",
+        ),
+        (
+            "the row is gone",
+            "DELETE FROM {ks}.idempotency_tokens_by_account \
+             WHERE account_id = ? AND \"token\" = ? IF fingerprint = 'running:fp-a'",
+            "cancelled:fp-a",
+        ),
+    ];
 
     if crate::helpers::skip_without_cassandra() {
         return;
     }
     let engine = setup_engine().await;
     let table = table_with_a_failing_put(&engine, "TxnTokenChanged").await;
-    let key_info = table.key_info.clone();
-    let account = key_info.account_id.clone();
-    let token = format!("tok-changed-{}", uuid::Uuid::new_v4().simple());
-
-    let send = {
+    let key_info = &table.key_info;
+    let account = key_info.account_id.as_str();
+    // A send of 39 Puts that prepare, then the Put of c1 that fails.
+    let send = |n: usize, token: &str| {
         let engine = engine.clone();
         let key_info = key_info.clone();
-        let token = token.clone();
+        let token = token.to_owned();
         tokio::spawn(async move {
             let maps = ExpressionMaps::default();
             let not_exists = Expr::Function {
                 name: "attribute_not_exists".to_owned(),
                 args: vec![Expr::Path(vec![PathElement::Attribute("id".to_owned())])],
             };
-            // 39 Puts that prepare, then the Put of c1 that fails.
             let mut items: Vec<Item> = (0..39)
-                .map(|i| Item::from([("id".to_owned(), AttributeValue::S(format!("m{i:02}")))]))
+                .map(|i| Item::from([("id".to_owned(), AttributeValue::S(format!("m{n}-{i:02}")))]))
                 .collect();
             items.push(Item::from([
                 ("id".to_owned(), AttributeValue::S("c1".to_owned())),
@@ -606,55 +650,47 @@ async fn test_a_cancellation_leaves_a_token_row_that_changed_while_the_send_ran(
         })
     };
 
-    // Wait for the reservation of the send, then give the row to request b.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<StorageError>(
+    for (n, (case, change, expected)) in CASES.into_iter().enumerate() {
+        let token = format!("tok-changed-{n}-{}", uuid::Uuid::new_v4().simple());
+        let sent = send(n, &token);
+        // Wait for the reservation of the send, then change its row.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while token_fingerprint(&engine, account, &token).await.is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{case}: the send reserved no token"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        let changed = extenddb_storage_cassandra::cassandra_util::apply_lwt::<StorageError>(
             &engine.session_arc(),
-            &format!(
-                "SELECT fingerprint FROM {}.idempotency_tokens_by_account \
-                 WHERE account_id = ? AND \"token\" = ?",
-                engine.catalog_keyspace()
-            ),
-            cdrs_tokio::query_values!(account.as_str(), token.as_str()),
-            "read the token row",
+            &change.replace("{ks}", &engine.catalog_keyspace()),
+            cdrs_tokio::query_values!(account, token.as_str()),
+            "change the token row",
         )
         .await
-        .expect("read the token row");
-        if !rows.is_empty() {
-            break;
-        }
+        .expect("change the token row");
         assert!(
-            std::time::Instant::now() < deadline,
-            "the send reserved no token"
+            changed,
+            "{case}: the send was cancelled before the row changed"
         );
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-    }
-    let changed = extenddb_storage_cassandra::cassandra_util::apply_lwt::<StorageError>(
-        &engine.session_arc(),
-        &format!(
-            "UPDATE {}.idempotency_tokens_by_account USING TTL 600 SET fingerprint = ? \
-             WHERE account_id = ? AND \"token\" = ? IF fingerprint = ?",
-            engine.catalog_keyspace()
-        ),
-        cdrs_tokio::query_values!(
-            "running:fp-b",
-            account.as_str(),
-            token.as_str(),
-            "running:fp-a"
-        ),
-        "give the token row to request b",
-    )
-    .await
-    .expect("change the token row");
-    assert!(changed, "the send was cancelled before the row changed");
 
-    let answer = send.await.expect("the send");
-    assert!(
-        matches!(&answer, Err(StorageError::TransactionCanceled(r))
-            if r.len() == 40 && r[39].code == "ConditionalCheckFailed"),
-        "{answer:?}"
-    );
-    let (fingerprint, _) = token_row(&engine, &account, &token).await;
-    assert_eq!(fingerprint, "running:fp-b");
+        let answer = sent.await.expect("the send");
+        assert!(
+            matches!(&answer, Err(StorageError::TransactionCanceled(r))
+                if r.len() == 40 && r[39].code == "ConditionalCheckFailed"),
+            "{case}: {answer:?}"
+        );
+        let fingerprint = token_fingerprint(&engine, account, &token).await;
+        assert_eq!(fingerprint.as_deref(), Some(expected), "{case}");
+        let other = format!("d{n}");
+        let result = put_with_token(&engine, key_info, &other, &token).await;
+        assert!(
+            matches!(result, Err(StorageError::IdempotentMismatch)),
+            "{case}: {result:?}"
+        );
+        let key = Item::from([("id".to_owned(), AttributeValue::S(other))]);
+        let written = engine.get_item(key_info, &key).await.expect("get");
+        assert!(written.is_none(), "{case}: the different request wrote");
+    }
 }

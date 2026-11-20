@@ -1347,24 +1347,15 @@ impl CassandraEngine {
         // The row expires IDEMPOTENCY_TOKEN_TTL_SECONDS after this write, so
         // a send that fails before it commits or is cancelled leaves its
         // running row for 10 minutes (#837).
-        let insert_query = format!(
-            "INSERT INTO {keyspace}.idempotency_tokens_by_account \
-             (account_id, \"token\", fingerprint, created_at) VALUES (?, ?, ?, ?) \
-             IF NOT EXISTS USING TTL {IDEMPOTENCY_TOKEN_TTL_SECONDS}"
-        );
-        let now = crate::cassandra_util::now_millis();
-        let result = crate::cassandra_util::apply_lwt(
-            &self.session,
-            &insert_query,
-            cdrs_tokio::query_values!(
+        let result = self
+            .insert_token_row(
+                keyspace,
                 account_id,
                 token,
-                running_token_fingerprint(fingerprint),
-                now
-            ),
-            "check_idempotency_token insert",
-        )
-        .await?;
+                &running_token_fingerprint(fingerprint),
+                "check_idempotency_token insert",
+            )
+            .await?;
 
         if !result {
             // Lost the LWT race: another send reserved the token between the
@@ -1391,6 +1382,32 @@ impl CassandraEngine {
         }
 
         Ok(())
+    }
+
+    /// Write the token row with `fingerprint`, the time now and a TTL of
+    /// [`IDEMPOTENCY_TOKEN_TTL_SECONDS`], unless the token has a row. The
+    /// write is an LWT. Returns whether it applied.
+    async fn insert_token_row(
+        &self,
+        keyspace: &str,
+        account_id: &str,
+        token: &str,
+        fingerprint: &str,
+        context: &str,
+    ) -> Result<bool, StorageError> {
+        let query = format!(
+            "INSERT INTO {keyspace}.idempotency_tokens_by_account \
+             (account_id, \"token\", fingerprint, created_at) VALUES (?, ?, ?, ?) \
+             IF NOT EXISTS USING TTL {IDEMPOTENCY_TOKEN_TTL_SECONDS}"
+        );
+        let now = crate::cassandra_util::now_millis();
+        crate::cassandra_util::apply_lwt(
+            &self.session,
+            &query,
+            cdrs_tokio::query_values!(account_id, token, fingerprint, now),
+            context,
+        )
+        .await
     }
 
     /// Answer a request with `fingerprint` from the token row that holds
@@ -1519,48 +1536,59 @@ impl CassandraEngine {
     /// Keep a reserved token used after its request was cancelled past the
     /// request-level key checks, as the service keeps it: replace the running
     /// fingerprint of the request's token row with
-    /// [`extenddb_storage::cancelled_token_fingerprint`], so a different
-    /// request with the token answers `IdempotentParameterMismatchException`
-    /// and the same request runs again (B5: a retry is not answered as a
-    /// replay of a write that never happened). The write restarts the row's
-    /// TTL of [`IDEMPOTENCY_TOKEN_TTL_SECONDS`], so the token stays used for
+    /// [`extenddb_storage::cancelled_token_fingerprint`], or write a row with
+    /// it when the send's row expired, so a different request with the token
+    /// answers `IdempotentParameterMismatchException` and the same request
+    /// runs again (B5: a retry is not answered as a replay of a write that
+    /// never happened). Either write gives the row a TTL of
+    /// [`IDEMPOTENCY_TOKEN_TTL_SECONDS`], so the token stays used for
     /// 10 minutes from the last cancellation (measured 2026-11-05).
     ///
-    /// The write is an LWT on the running fingerprint. Cassandra orders an
-    /// LWT and a plain write of one row by their write timestamps, not in
-    /// Paxos order, so a plain write from a coordinator whose clock runs
-    /// ahead could hide a later take of the token. A plain write would also
-    /// replace a row that another request reserved after this send's row
-    /// expired.
+    /// Both writes are LWTs, as every write of the row is, so neither
+    /// replaces a row that another send or request holds.
     async fn record_cancelled_token(&self, idempotency: Option<(&str, &str, &str)>) {
         let Some((account_id, token, fingerprint)) = idempotency else {
             return;
         };
-        let cancelled = self
+        let keyspace = self.catalog_keyspace();
+        let cancelled_fp = extenddb_storage::cancelled_token_fingerprint(fingerprint);
+        let cancelled = match self
             .swap_token_fingerprint(
-                &self.catalog_keyspace(),
+                &keyspace,
                 account_id,
                 token,
                 &running_token_fingerprint(fingerprint),
-                &extenddb_storage::cancelled_token_fingerprint(fingerprint),
+                &cancelled_fp,
                 "record_cancelled_token",
             )
-            .await;
+            .await
+        {
+            // The send's row expired while it ran: store the cancelled token
+            // unless another send or request reserved the token since.
+            Ok(false) => {
+                self.insert_token_row(
+                    &keyspace,
+                    account_id,
+                    token,
+                    &cancelled_fp,
+                    "record_cancelled_token insert",
+                )
+                .await
+            }
+            other => other,
+        };
         match cancelled {
             Ok(true) => {}
-            // The send's row expired while it ran, and the row now belongs
-            // to another send or is gone: leave it.
+            // Another send or request holds the token row: leave it.
             Ok(false) => tracing::warn!(
                 "record_cancelled_token: the token row no longer holds the running fingerprint"
             ),
-            // The reserved row keeps the request's running fingerprint, so a
-            // different request still answers the mismatch and the same
-            // request answers TransactionInProgress (#837), until the row
-            // expires 10 minutes after the reservation or the take. The
+            // The token row stays as it was: the send's running row, which
+            // answers a different request with the mismatch and the same
+            // request with TransactionInProgress (#837) until it expires 10
+            // minutes after the reservation or the take, or no row. The
             // request keeps its own answer.
-            Err(e) => {
-                tracing::warn!("record_cancelled_token failed (the reserved token stays): {e}");
-            }
+            Err(e) => tracing::warn!("record_cancelled_token failed (token row unchanged): {e}"),
         }
     }
 
