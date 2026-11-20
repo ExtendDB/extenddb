@@ -22,6 +22,9 @@ not exist in every ARN field the cross-account check reads, and in
 `TableName` of the control-plane operations whatever the ARN's shape; the
 item operations, the transaction members and `BatchGetItem` refuse it as a
 validation error after the shape, vendor, region and table segment checks.
+
+The table segment length rows of `TestArnCheckOrder` were measured on
+2026-11-20 and 2026-11-21 (us-east-1).
 """
 
 import time
@@ -46,6 +49,8 @@ FRAME = (
     "Resource name must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
 )
 TABLE_OF_ARN = "Table name of ARN must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+MIN_LENGTH = "Table name of ARN must have length greater than or equal to 3"
+MAX_LENGTH = "Table name of ARN must have length less than or equal to 255"
 MAP_KEYS_ARN = (
     "Map keys must satisfy constraint: [Valid resource name or resource arn must be given. "
     "Valid resource arn format is "
@@ -420,6 +425,17 @@ SHAPES = {
     "s3t": ("t", "s3"),
     "s3table": ("table/t830name", "s3"),
 }
+# (table segment, DescribeTable). DescribeTable counts the segment in UTF-16
+# code units, the item operations in UTF-8 bytes: one U+1F600 is 2 code units
+# and 4 bytes.
+TABLE_SEGMENT_LENGTH = {
+    "empty": ("", MIN_LENGTH),
+    "two": ("ab", MIN_LENGTH),
+    "star": ("a*", MIN_LENGTH),
+    "long": ("x" * 256, MAX_LENGTH),
+    "emoji": ("\U0001F600", MIN_LENGTH),
+    "space": ("a b", TABLE_OF_ARN),
+}
 
 
 class TestArnCheckOrder:
@@ -427,6 +443,8 @@ class TestArnCheckOrder:
     2026-11-07. The control-plane operations answer an account that is not
     the caller's before anything else. The item operations check the shape,
     the vendor, the region, the table segment and the account, in that order.
+    A table segment outside 3 to 255 gets a length sentence before the
+    pattern sentence (measured 2026-11-20 and 2026-11-21).
     On PostgreSQL the control-plane rows with U+0000 in the account of a shape
     `arn::parse` rejects answered 500 `Internal server error` before the gate
     answered them itself."""
@@ -500,6 +518,12 @@ class TestArnCheckOrder:
             (_arn(caller, BAD_ACCOUNTS[0], "table/t830" + NUL + "name"), TABLE_OF_ARN),
             (_arn(caller, BAD_ACCOUNTS[2], "table/t830" + NUL + "name"), TABLE_OF_ARN),
             (_arn(caller, "", "table/t830name"), "Invalid subscriber ID"),
+            (_arn(caller, own, "table/"), MIN_LENGTH),
+            (_arn(caller, own, "table/ab"), MIN_LENGTH),
+            (_arn(caller, own, "table/a*"), MIN_LENGTH),
+            (_arn(caller, own, "table/" + "x" * 256), MAX_LENGTH),
+            (_arn(caller, own, "table/\U0001F600"), TABLE_OF_ARN),
+            (_arn(caller, own, "table/a b"), TABLE_OF_ARN),
         ]
         key = {"pk": {"S": "a"}}
         for arn, constraint in cases:
@@ -513,6 +537,12 @@ class TestArnCheckOrder:
                 f"1 validation error detected: Value '{arn}' at "
                 f"'transactItems.1.member.get.tableName' failed to satisfy constraint: {constraint}",
             )
+
+    @pytest.mark.parametrize("row", list(TABLE_SEGMENT_LENGTH))
+    def test_table_segment_length_comes_before_the_pattern(self, raw_client, caller, row):
+        segment, constraint = TABLE_SEGMENT_LENGTH[row]
+        arn = _arn(caller, caller["account"], "table/" + segment)
+        _at_table_name(_raises(lambda: raw_client.describe_table(TableName=arn)), arn, constraint)
 
     def test_empty_account_in_batch_keys(self, raw_client, caller):
         arn = _arn(caller, "", "table/t830name")
