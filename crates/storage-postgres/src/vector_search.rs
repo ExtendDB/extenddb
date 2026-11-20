@@ -281,10 +281,7 @@ impl VectorSearchEngine for PostgresEngine {
             // column, so the filter's attribute name and value must be compared
             // in stored form.
             for (name, value) in &filters {
-                let value_json = serde_json::to_value(value)
-                    .map(extenddb_storage::util::escape_json_strings)
-                    .map_err(|e| StorageError::Internal(format!("filter value: {e}")))?
-                    .to_string();
+                let value_json = crate::catalog_json::to_catalog_json(value)?.to_string();
                 query = query
                     .bind(extenddb_storage::util::escape_control(name).into_owned())
                     .bind(value_json);

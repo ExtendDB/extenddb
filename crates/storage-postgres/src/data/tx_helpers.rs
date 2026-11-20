@@ -16,7 +16,7 @@ use extenddb_storage::util::{SortKeyValue, sk_column, sk_info};
 
 use super::index::db_error;
 use super::key_text::{parse_sk, pk_to_text};
-use super::{data_table_name, item_to_json, json_to_item, to_stored_json};
+use super::{data_table_name, item_to_json, json_to_item};
 
 /// Fetch a single item within an existing transaction.
 pub(super) async fn fetch_item_in_tx(
@@ -442,9 +442,9 @@ pub(super) async fn write_stream_record_to_shard_in_tx(
     // It is the record's size before TOAST compresses it, which is what the
     // numbering copies and rewrites; `pg_column_size` would give the
     // compressed size. The text is that of the stored form
-    // ([`to_stored_json`]), since jsonb refuses the `\u0000` escape, so the
-    // length counts the escaped strings.
-    let record_text = to_stored_json(&record)?.to_string();
+    // (`catalog_json::to_catalog_json`), since jsonb refuses the `\u0000`
+    // escape, so the length counts the escaped strings.
+    let record_text = crate::catalog_json::to_catalog_json(&record)?.to_string();
     let record_bytes = i64::try_from(record_text.len()).unwrap_or(i64::MAX);
 
     // The record waits in stream_pending, with no sequence number, until this

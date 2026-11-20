@@ -39,7 +39,11 @@
 //! once (`migrations/m0011_attribute_name_escape.rs`).
 //!
 //! The item documents (`item_data`, the stream record images, the images in
-//! `gsi_pending`) are not written through this module.
+//! `gsi_pending`) are stored through the same escape: `data::item_to_json`
+//! and `data::json_to_item` call these functions, and the records in
+//! `stream_pending` and `stream_records` are written and read through them.
+//! Migration 11 leaves those documents as they are; migration 13
+//! (`escape_control_chars`) rewrites them.
 //!
 //! Decoding reads a U+0001 that is not followed by U+0001 or U+0002 as
 //! itself. The encoder never writes one.

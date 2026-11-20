@@ -9,7 +9,8 @@
 
 use extenddb_core::types::{AttributeDefinition, Item, KeySchemaElement, ScalarAttributeType};
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{escape_json_strings, unescape_json_strings};
+
+use crate::catalog_json::{from_catalog_json, to_catalog_json};
 
 /// SQL table name for a Virtual `DynamoDB` table.
 ///
@@ -69,8 +70,7 @@ pub(crate) fn all_sort_key_info<'a>(
 /// before deserialization, so an item written with U+0000 anywhere in it comes
 /// back byte-identical.
 pub(crate) fn json_to_item(v: serde_json::Value) -> Result<Item, StorageError> {
-    serde_json::from_value(unescape_json_strings(v))
-        .map_err(|e| StorageError::Internal(e.to_string()))
+    from_catalog_json(v)
 }
 
 /// Serialize an `Item` for an `item_data` JSONB column.
@@ -80,28 +80,7 @@ pub(crate) fn json_to_item(v: serde_json::Value) -> Result<Item, StorageError> {
 /// escape from `extenddb_storage::util` before it reaches the column. Items
 /// without U+0000 or U+0001 serialize to exactly what they did before.
 pub(crate) fn item_to_json(item: &Item) -> Result<serde_json::Value, StorageError> {
-    serde_json::to_value(item)
-        .map(escape_json_strings)
-        .map_err(|e| StorageError::Internal(e.to_string()))
-}
-
-/// Serialize any value for a JSONB column that may carry item strings (stream
-/// records, queued index updates, index contexts). Same escape as
-/// [`item_to_json`]; the inverse is [`stored_json_to`].
-pub(crate) fn to_stored_json<T: serde::Serialize>(
-    value: &T,
-) -> Result<serde_json::Value, StorageError> {
-    serde_json::to_value(value)
-        .map(escape_json_strings)
-        .map_err(|e| StorageError::Internal(e.to_string()))
-}
-
-/// Deserialize a JSONB value written by [`to_stored_json`].
-pub(crate) fn stored_json_to<T: serde::de::DeserializeOwned>(
-    v: serde_json::Value,
-) -> Result<T, StorageError> {
-    serde_json::from_value(unescape_json_strings(v))
-        .map_err(|e| StorageError::Internal(e.to_string()))
+    to_catalog_json(item)
 }
 
 /// Bind a `SortKeyValue` to a positional parameter in a sqlx query and execute it.
