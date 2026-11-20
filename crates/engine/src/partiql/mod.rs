@@ -463,18 +463,9 @@ mod tests {
             translated.max_attribute_name_bytes,
             classic.max_attribute_name_bytes
         );
-    }
-
-    #[test]
-    fn a_translated_expression_has_no_operator_cap() {
-        // The PartiQL parser counts the statement's operators; the text
-        // written for it is not counted again.
-        let classic = LimitsConfig::default();
+        // The PartiQL parser counts the statement's operators instead.
         assert_eq!(classic.max_expression_operators, 300);
-        assert_eq!(
-            translation_limits(&classic).max_expression_operators,
-            usize::MAX
-        );
+        assert_eq!(translated.max_expression_operators, usize::MAX);
     }
 
     #[test]
