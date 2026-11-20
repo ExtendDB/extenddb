@@ -179,7 +179,7 @@ fn sized_clause(
 ///   of the size. ExtendDB refuses most such requests later on. On a key
 ///   schema with one HASH and at most one RANGE attribute, an undefined
 ///   `#name` in a second clause (`pk = :h AND #u > :r`) is not refused yet and
-///   the Query is served, where the service refuses it.
+///   the Query is served, where the service refuses it (#1214).
 ///
 /// All limits are inclusive. `key_schema` is the key schema being queried: the
 /// index's for an index query, the table's otherwise.
