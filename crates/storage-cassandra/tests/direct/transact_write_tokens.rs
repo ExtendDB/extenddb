@@ -667,10 +667,12 @@ async fn test_a_cancellation_leaves_a_token_row_that_changed_while_the_send_ran(
                 if r.len() == 40 && r[39].code == "ConditionalCheckFailed"),
             "{case}: {answer:?}"
         );
-        let fingerprint = token_row_if_any(&engine, account, &token)
-            .await
-            .map(|row| row.0);
-        assert_eq!(fingerprint.as_deref(), Some(expected), "{case}");
+        let row = token_row_if_any(&engine, account, &token).await;
+        assert_eq!(row.as_ref().map(|r| r.0.as_str()), Some(expected), "{case}");
+        assert!(
+            matches!(row, Some((_, Some(590..=600)))),
+            "{case}: TTL of {row:?}"
+        );
         let other = format!("d{n}");
         let result = put_with_token(&engine, key_info, &other, &token).await;
         assert!(
