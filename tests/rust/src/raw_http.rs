@@ -44,11 +44,10 @@ async fn invalid_json_body() {
 
 #[tokio::test]
 async fn empty_body() {
-    // Real DynamoDB requires SigV4 auth; raw unauthenticated requests get
-    // MissingAuthenticationToken instead of SerializationException.
-    if is_real_dynamodb() {
-        return;
-    }
+    // An empty body goes to authentication before its syntax is read, so an
+    // unsigned one gets the missing token error, from DynamoDB as well
+    // (MissingAuthenticationTokenException for GetItem, measured
+    // 2026-11-20).
     let c = http_client();
     let resp = c
         .post(endpoint())
@@ -60,7 +59,7 @@ async fn empty_body() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 400);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("SerializationException"), "body: {body}");
+    assert!(body.contains("MissingAuthenticationToken"), "body: {body}");
 }
 
 #[tokio::test]
