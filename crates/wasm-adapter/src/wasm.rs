@@ -25,7 +25,7 @@ pub struct ExtendDb {
 
 #[wasm_bindgen]
 impl ExtendDb {
-    /// Create an engine instance backed by a fresh in-browser in-memory SQLite
+    /// Create an engine instance backed by a fresh in-browser in-memory `SQLite`
     /// database.
     ///
     /// Installs [`console_error_panic_hook`] once so a panic inside the wasm

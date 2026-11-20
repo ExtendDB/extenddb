@@ -5,7 +5,7 @@
 //! `DynamoDB` request by calling the `ExtendDB` engine in-process.
 //!
 //! This module is target-agnostic — it compiles and runs natively (where the
-//! unit tests exercise it against the native `ExtendDB` SQLite build) and on
+//! unit tests exercise it against the native `ExtendDB` `SQLite` build) and on
 //! `wasm32` (where [`crate::wasm`] wraps it in a `wasm-bindgen` surface). It
 //! contains no `wasm-bindgen` and no network code: the "transport" is a direct
 //! function call into [`extenddb_engine::dispatch`], which is what the tokio
@@ -93,14 +93,14 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Build an engine over a fresh in-browser in-memory SQLite database.
+    /// Build an engine over a fresh in-browser in-memory `SQLite` database.
     ///
-    /// Opens a `:memory:` SQLite database through the `ExtendDB` SQLite backend
+    /// Opens a `:memory:` `SQLite` database through the `ExtendDB` `SQLite` backend
     /// (the synchronous `sqlx`-shaped shim over `sqlite-wasm-rs` on wasm, and
-    /// `sqlx` with C SQLite natively, which is the fidelity oracle), runs the
+    /// `sqlx` with C `SQLite` natively, which is the fidelity oracle), runs the
     /// catalog migrations, and registers the account with a synchronous control
     /// plane.
-    /// The data-plane operations then answer as the native `ExtendDB` SQLite
+    /// The data-plane operations then answer as the native `ExtendDB` `SQLite`
     /// build answers them.
     ///
     /// # Errors
