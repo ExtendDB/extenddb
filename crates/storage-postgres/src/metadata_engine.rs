@@ -11,6 +11,32 @@ use futures::future::BoxFuture;
 use crate::PostgresEngine;
 use crate::data;
 
+/// A table's TTL description from its catalog columns, as DescribeTimeToLive
+/// reports it. Shared with CreateBackup, which records it for DescribeBackup.
+pub(crate) fn ttl_description(
+    ttl_attr: Option<String>,
+    index_ready: Option<bool>,
+) -> TimeToLiveDescription {
+    match ttl_attr {
+        Some(attr) => TimeToLiveDescription {
+            // Enabled only once the queue backfill has published
+            // readiness; until then pre-existing items are still
+            // being registered. Postgres disable tears the queue
+            // down synchronously, so it has no Disabling state.
+            time_to_live_status: if index_ready == Some(true) {
+                TimeToLiveStatus::Enabled
+            } else {
+                TimeToLiveStatus::Enabling
+            },
+            attribute_name: Some(attr),
+        },
+        None => TimeToLiveDescription {
+            time_to_live_status: TimeToLiveStatus::Disabled,
+            attribute_name: None,
+        },
+    }
+}
+
 impl MetadataEngine for PostgresEngine {
     fn describe_ttl(
         &self,
@@ -33,24 +59,7 @@ impl MetadataEngine for PostgresEngine {
             let (ttl_attr, index_ready) =
                 row.ok_or_else(|| StorageError::TableNotFound(table_name.clone()))?;
 
-            Ok(match ttl_attr {
-                Some(attr) => TimeToLiveDescription {
-                    // Enabled only once the queue backfill has published
-                    // readiness; until then pre-existing items are still
-                    // being registered. Postgres disable tears the queue
-                    // down synchronously, so it has no Disabling state.
-                    time_to_live_status: if index_ready == Some(true) {
-                        TimeToLiveStatus::Enabled
-                    } else {
-                        TimeToLiveStatus::Enabling
-                    },
-                    attribute_name: Some(attr),
-                },
-                None => TimeToLiveDescription {
-                    time_to_live_status: TimeToLiveStatus::Disabled,
-                    attribute_name: None,
-                },
-            })
+            Ok(ttl_description(ttl_attr, index_ready))
         })
     }
 

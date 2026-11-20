@@ -46,7 +46,8 @@ creation.
 
 ## 3. Catalog Database Collections
 
-Collections created by `run_catalog_migrations` in `bootstrapper.rs`. Two
+Collections created by migration 1's catalog body,
+`crates/storage-mongodb/src/migrations/m0001_baseline.rs`. Two
 additional collections (`iam_group_members`, `backup_items` — the latter is
 no longer used) are auto-created on first insert and not in the migration list.
 
@@ -108,8 +109,14 @@ field is unset when the index flips to `ACTIVE`.
 ```json
 { "_id": "<key>", "value": "..." }
 ```
-Bootstrapped keys include `catalog_version`, `encryption_key` (base64-encoded
-256-bit AES-GCM key), `data_database_name`, and `data_connection_string`.
+Keys include `catalog_version` (the catalog's migration id, which the
+migration runner writes with each catalog ledger row), `encryption_key`
+(base64-encoded 256-bit AES-GCM key, the catalog key; absent after the switch
+to a key-encryption key file), `encryption_key_ring` (with `[auth.encryption]
+key_file` set: the data encryption key wrapped under the key-encryption key, the
+KEK's id and the state of an unfinished switch or rotation, as one JSON
+document), `data_database_name`, and
+`data_connection_string`.
 
 ### 3.6 `admin_users`
 ```json
@@ -140,8 +147,14 @@ Unique index on `user_arn`.
 }
 ```
 Index on `(account_id, user_name)`. `secret_key_encrypted` is AES-256-GCM
-ciphertext of the secret access key using the `settings.encryption_key`;
-`access_key_id` is bound as additional authenticated data.
+ciphertext of the secret access key using the `settings.encryption_key`, with
+`access_key_id` bound as additional authenticated data; under the data
+encryption key of a key ring, the additional authenticated data binds the
+catalog id, the collection, the access key ID, the account, the user name and
+the expiry instead (the Security Model's Credential Storage section). The
+`extenddb encryption-key` pass rewrites each document with one `update_one` on
+its `_id` and no upsert, so a document that the TTL index deletes during the
+pass stays deleted.
 
 ### 3.9 `iam_groups`
 ```json
@@ -251,16 +264,9 @@ Compound index on `(principal, attempted_at)`.
 Index on `(account_id, table_name)`. The physical backup collection lives in
 `extenddb_data` as `_backup_{backup_id}` — see §4.5.
 
-### 3.17 `continuous_backups`
-```json
-{
-  "account_id": "...",
-  "table_name": "...",
-  "pitr_enabled": false,
-  "earliest_restorable": null,
-  "latest_restorable": null
-}
-```
+### 3.17 `continuous_backups` (removed)
+
+Earlier builds stored each table's point-in-time recovery flag here. The engine answers the point-in-time recovery operations without storage, so a fresh catalog does not create this collection and `extenddb migrate --yes` drops it from a catalog an earlier build created; `extenddb migrate` without `--yes` reports the pending drop as `catalog: drop the continuous_backups collection`. The catalog version does not change for this.
 
 ### 3.18 `schema_history`
 ```json
@@ -377,7 +383,9 @@ Simple collation is used whenever the tuple contains a string component.
 }
 ```
 
-Unique index on `shard_id`. Four shards per stream-enabled table.
+Unique index on `shard_id`, and an index on `(table_id, shard_id)`, by which
+every streamed write and every stream read finds a table's shards in shard id
+order. Four shards per stream-enabled table.
 
 `shard_id` embeds `table_id` (a UUID) rather than `table_name`. Table
 names are only unique per-account; a name-derived scheme would let one
@@ -533,11 +541,15 @@ Not pushable: any operand of type `N` (numbers stored as strings; `"10"
 count), `BETWEEN` / `IN` (pending proptest coverage; the compiler emits
 them, the analyzer refuses them), and `NOT` around anything else.
 
-Property tests (`tests/pushdown_parity.rs`) generate random items and
-expressions, compile the filter, and check that a pure-Rust BSON
-interpreter and `evaluate_condition` agree on match/no-match — the
-regression harness that lets the analyzer's certification be extended
-safely.
+Property tests (`tests/pushdown_parity.rs`) generate random items, whose
+attributes can hold maps and lists nested two deep with members named
+from `a`, `b`, `M`, `L`, `S` and `0`, and conditions on paths of up to
+three elements; when the item has an attribute, about three in four of
+the paths are replaced by paths the item has (about three in five of all
+generated paths, since one item in five is empty). They
+compile each condition and check that a pure-Rust BSON interpreter and
+`evaluate_condition` agree on match or no match. This is the regression
+harness that lets the analyzer's certification be extended safely.
 
 ### 5.3 Query and Scan
 
@@ -732,17 +744,29 @@ second-precision form.
 ### 5.6 Write conflict handling
 
 **Transient-conflict detection.** `is_transient_write_conflict` returns
-true for any of: the `TransientTransactionError` label, the
-`UnknownTransactionCommitResult` label, or a raw `WriteConflict` (code
-112). Under snapshot isolation these all mean "your write lost to a
-concurrent writer; retry the whole transaction."
+true for the `TransientTransactionError` label or a raw `WriteConflict`
+(code 112). Under snapshot isolation both mean nothing was applied and the
+transaction may be re-run; a conflict with a concurrent writer is the
+usual cause. It does not match the `UnknownTransactionCommitResult` label:
+under that label the commit may already have applied, so the body is never
+re-run, and `classify_commit_error` retries `commitTransaction` in place,
+which is idempotent.
 
 **Retry loop.** Session-scoped writes (Put / Delete / Update / TWI) wrap
 the transaction body in a `for attempt in 0..TRANSIENT_RETRY_ATTEMPTS`
 loop (50 attempts). Each attempt starts a fresh transaction, runs the
 body, and either commits, aborts and retries (transient), or aborts and
-returns (fatal). Retries sleep with jittered exponential backoff
-(`backoff_sleep`, base 50 µs).
+returns (fatal). Retries sleep with jittered exponential backoff:
+`backoff_sleep` waits a uniform 0 to 50 µs × 2^min(attempt, 8), which is at
+most 12.8 ms from the ninth attempt on and sums to at most about 550 ms
+over the 50 attempts (275 ms expected). Tokio's timer ticks every
+millisecond and rounds a sleep up to the next tick, so for the first five
+attempts (longest jitter under 1 ms) the wait is set by the tick, not by
+the jitter. The helpers that run inside the transaction (index entry
+writes, the stream shard lookup, the stream sequence counter draw and the
+stream record insert) map a transient conflict to `StorageError::Transient`
+through `write_conflict::transaction_error`, and the transaction body
+turns that into a re-run like a conflict on the data collection.
 
 **UpdateItem's OCC guard on top.** `UpdateItem` uses a `_v` version filter.
 In snapshot mode, the transaction supplies the point-in-time view used to
@@ -753,9 +777,15 @@ signal from `Transient`) and the loop restarts. The native fast path always
 emits `$inc: {_v: 1}` so a concurrent slow-path update racing against a stale
 read fails its filter and retries.
 
-**Exhaustion behavior.** Single-item retry exhaustion returns
-`StorageError::Internal` (rare in practice; the retry ceiling is high).
-`TransactWriteItems` exhaustion surfaces as
+**Exhaustion behavior.** Single-item retry exhaustion (PutItem,
+DeleteItem, UpdateItem) returns `StorageError::Transient`, built by
+`write_conflict::retry_budget_exhausted`. Its message reads
+`<operation>: could not commit in <N> attempts: <last error>` and carries
+the last error that ended an attempt: the driver's text, or a fixed
+sentence after an UpdateItem version miss. The engine logs it and answers
+HTTP 503 `ServiceUnavailable`, which the SDKs retry. The server counts
+that 503 as a system error, not under
+`TransactionConflict`. `TransactWriteItems` exhaustion surfaces as
 `StorageError::TransactionCanceled` with a synthetic per-op
 `TransactionConflict` reason so wire consumers see the DDB-canonical
 error string instead of a bare HTTP 500.
@@ -797,19 +827,24 @@ so the stream record matches DynamoDB's format.
 
 ### 5.8 Backups
 
-`CreateBackup` snapshots the source table by running a server-side
+`CreateBackup` copies the source table by running a server-side
 aggregation pipeline `[{ $out: "_backup_<backup_id>" }]` on the data
 collection. `$out` writes the target collection server-side without
-per-item traffic between the driver and the server. The destination
+per-item traffic between the driver and the server. It reads the live
+collection, so the copy is not a point-in-time snapshot: writes made while
+it runs can be in the backup without writes that preceded them (see
+`docs/differences-from-dynamodb.md`, Backup and Restore). The destination
 name is derived from a UUID because the caller-visible `backup_arn`
 contains characters (`:`, `/`) that MongoDB does not allow in
 collection names.
 
-`RestoreTableFromBackup` recreates the target table via
-`CreateTable` (preserving `TableClass` / `SSESpecification` /
-`OnDemandThroughput` from the backup metadata), then clones the backup
-collection into the new data collection with the same `$out` pipeline
-in reverse.
+`RestoreTableFromBackup` creates the target table `CREATING` from the
+table definition the engine resolves from the backup, returns, and then, in
+a background task, clones the backup collection into the new data
+collection with the same `$out` pipeline in reverse and hands the target to
+the index backfill worker, which makes it `ACTIVE`. A restore whose owner
+stops before the hand-over is removed by the heartbeat sweep (startup and
+every 15 s, once the heartbeat is 60 s old).
 
 `DeleteBackup` drops the physical collection using `backup_id` from
 the metadata document and marks the metadata row `DELETED`.
@@ -823,12 +858,21 @@ in `lib.rs`). Reject `$` (operator injection), `.` (field-path
 traversal), null bytes, and non-ASCII. Runs before any query
 construction.
 
-### 5.10 Catalog version check
+### 5.10 Catalog status check
 
-`read_catalog_version` returns the `settings.catalog_version` value;
-`expected_catalog_version` returns the compiled-in `0.0.2`. The bin
-layer compares them on `extenddb serve` startup — same pattern as the
-PostgreSQL backend.
+The catalog and the data database each hold a migration ledger, the
+`extenddb_migrations` collection. `extenddb serve` reads the catalog's
+status from both ledgers through the shared migration runner before it
+opens the engine, and refuses a catalog with pending migrations or with a
+breaking migration this binary does not know, as on every backend.
+[ADR-0023](../adr/0023-catalog-migrations.md) records the design.
+
+The factory registers and reads the status before it builds the engine
+or starts the startup key repair, so a server that refuses has written
+nothing but its registration, which it deletes. A command that opens
+the catalog beside a server (`ServerComponentsOptions::beside_server`:
+`extenddb backup list`, the purge's dry run) starts no repair; the
+server does.
 
 ## 6. Crate Structure
 
@@ -919,34 +963,29 @@ pub struct MongoStorageConfig {
 ```
 
 The connection string must use `readPreference=primary` (the driver
-default). Persisting the connection string in
+default). The engine opens the catalog database with read preference
+primary and read concern `local` whatever the connection string says, so
+the backup claim protocol sees every write the primary acknowledged. It
+also sets write concern `majority` on the catalog database and on the `$out`
+copies of CreateBackup and restore, so an acknowledged claim is not rolled
+back by a failover; a connection string that sets a weaker write concern
+(`w=0`, a numeric or tagged `w`, `journal=false`) is refused at startup. Persisting the connection string in
 `settings.data_connection_string` uses the raw string as-is; the bin
 layer redacts the password from it for display via the
 `OperationsEngine::redact_connection_string` hook.
 
 ## 9. Bootstrapper Flow
 
-**`extenddb init`:**
-
-1. Materialize both databases with sentinel collections (MongoDB creates
-   databases lazily on first write, so we explicitly create
-   `schema_history` in the catalog db and `idempotency_tokens` in the
-   data db).
-2. `run_catalog_migrations` — create the 17 catalog collections and
-   their indexes; seed `settings.catalog_version = 0.0.2`; record
-   the migration in `schema_history`.
-3. `create_data_db` — create `idempotency_tokens` (TTL + unique index),
-   `stream_shards` (unique on shard_id), `stream_records` (TTL + compound
-   query index).
-4. `bootstrap_encryption_key` — generate a random 256-bit key,
-   base64-encode, insert into `settings` (idempotent — E11000 races are
-   silently ignored).
-5. `bootstrap_default_account` — insert `default` account if none
-   exists.
-6. `bootstrap_admin_user` — bcrypt-hash the password, insert into
-   `admin_users`.
-7. `record_data_connection` — record `data_database_name` and
-   `data_connection_string` in `settings`.
+**`extenddb init`:** takes the migration lock, whose claim creates the
+catalog database, and checks under it that the catalog is not
+initialized. It applies every migration through the shared runner:
+migration 1 creates the catalog and data collections and their indexes,
+and the runner records each body in its database's ledger once the body
+completes. Still under the lock, it writes
+the encryption key, the default account, the admin user and the data
+connection rows, checking the lock's lease before each request as the
+runner does, and then releases the lock.
+[ADR-0023](../adr/0023-catalog-migrations.md) records the design.
 
 **`extenddb destroy`:** drop both databases.
 
@@ -992,7 +1031,6 @@ uuid.workspace = true
 base64.workspace = true
 rand.workspace = true
 bcrypt.workspace = true
-aes-gcm.workspace = true
 zeroize.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
@@ -1041,7 +1079,8 @@ The backend implements every trait in `extenddb-storage`:
 - `AuthorizationStore` — user/group/role/permissions-boundary/session
   policy lookup for IAM evaluation.
 - `MongoCredentialStore` — SigV4 credential resolution with
-  AES-GCM-decrypted secret keys.
+  AES-GCM-decrypted secret keys on a cache miss; the credential cache keeps the
+  derived signing key and wipes the secret.
 
 **Background workers** — spawned from `MongoRuntimeHooks::spawn_workers`:
 - `ttl_cleanup_worker` — sweep expired items every 60 s, emit
@@ -1142,3 +1181,14 @@ uses the compound `(shard_id, sequence_number)` index.
 configured `transaction_read_concern` (default `"snapshot"`) and
 majority write concern; up to 100 operations
 per the DDB spec. Retried on transient conflicts with jittered backoff.
+
+---
+
+## License
+
+Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
+See [LICENSE](../../LICENSE) for the full text.
+
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

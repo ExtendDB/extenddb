@@ -24,6 +24,14 @@ from botocore.config import Config
 
 # D4: Suppress InsecureRequestWarning for self-signed TLS certs from ``extenddb init``.
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# The message of every refused point-in-time recovery request: a restore and
+# an enable are refused before authorization, because point-in-time recovery
+# is not in this release.
+PITR_REFUSAL = "Point-in-time recovery is not supported by this storage backend"
+RESTORE_REFUSED = ("PointInTimeRecoveryUnavailableException", PITR_REFUSAL)
+ENABLE_REFUSED = ("ContinuousBackupsUnavailableException", PITR_REFUSAL)
+
+
 @pytest.fixture(scope="session")
 def endpoint_url() -> str | None:
     """Return the endpoint URL if targeting extenddb, None for real DynamoDB."""
@@ -70,6 +78,35 @@ def unique_table_name() -> str:
 def _is_real_dynamodb() -> bool:
     """Return True when tests target real DynamoDB (no EXTENDDB_TEST_ENDPOINT)."""
     return not os.environ.get("EXTENDDB_TEST_ENDPOINT", "").strip()
+
+
+def config_value(section: str, key: str) -> str | None:
+    """`key` of the `[section]` table in the server's config file
+    (`EXTENDDB_CONFIG`, else `extenddb.toml`), unquoted, or None when the file
+    or the key is missing. Reads plain `key = "value"` lines only, which is
+    what `extenddb init` writes."""
+    path = os.environ.get("EXTENDDB_CONFIG", "").strip() or "extenddb.toml"
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return None
+    current = None
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line.startswith("["):
+            current = line.strip("[]").strip()
+        elif current == section and "=" in line and line.split("=", 1)[0].strip() == key:
+            return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return None
+
+
+def configured_backend() -> str | None:
+    """The backend of the server under test: `EXTENDDB_TEST_BACKEND` (exported
+    by devtools/run-tests), else the `[storage] backend` of its config file,
+    else None (real DynamoDB, or a server started elsewhere)."""
+    explicit = os.environ.get("EXTENDDB_TEST_BACKEND", "").strip()
+    return explicit or config_value("storage", "backend")
 
 
 def _poll_interval() -> float:

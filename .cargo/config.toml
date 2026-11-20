@@ -1,0 +1,12 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+
+[resolver]
+# Prefer dependency versions whose declared rust-version fits the workspace
+# rust-version (1.91.1). This is best-effort: it only holds back a candidate
+# whose own minimum rustc is above the workspace rust-version, so it does not
+# guarantee that a bare `cargo update` resolves a graph that builds with the
+# aws-sdk pins. Only applies when a newer version would be incompatible;
+# everything else updates as usual. Build with `--locked` for the recorded
+# versions.
+incompatible-rust-versions = "fallback"

@@ -5,79 +5,53 @@
 //!
 //! Implements `extenddb_auth::CredentialStore` by looking up access keys and
 //! session credentials from the catalog database, decrypting secrets with
-//! AES-256-GCM.
+//! the key holder the catalog store shares (`extenddb_storage::secret_keys`).
+//! The row a secret was read from is its AAD; a secret that does not
+//! authenticate under it is not returned.
+
+use std::sync::Arc;
 
 use extenddb_auth::{CredentialStore, StoredCredential};
 use extenddb_core::error::DynamoDbError;
+use extenddb_storage::secret_keys::{SecretKeys, SecretRow};
 use sqlx::PgPool;
-use zeroize::{Zeroize, ZeroizeOnDrop};
-
-/// Decrypt a secret key from `nonce || ciphertext` using the base64-encoded encryption key.
-///
-/// `aad` must match the value used during encryption (CB-11). Falls back to
-/// decryption without AAD for secrets encrypted before the CB-11 fix.
-fn decrypt_secret(encrypted: &[u8], key_b64: &str, aad: &str) -> Result<String, String> {
-    use aes_gcm::Aes256Gcm;
-    use aes_gcm::KeyInit;
-    use aes_gcm::aead::Aead;
-    use aes_gcm::aead::Payload;
-    use base64::Engine;
-
-    if encrypted.len() < 28 {
-        return Err(
-            "ciphertext too short (need at least 12-byte nonce + 16-byte auth tag)".to_owned(),
-        );
-    }
-
-    let key_bytes = base64::engine::general_purpose::STANDARD
-        .decode(key_b64)
-        .map_err(|e| format!("decode encryption key: {e}"))?;
-
-    let key = aes_gcm::Key::<Aes256Gcm>::from_slice(&key_bytes);
-    let cipher = Aes256Gcm::new(key);
-    let nonce = aes_gcm::Nonce::from_slice(&encrypted[..12]);
-
-    // Try with AAD first (CB-11 format).
-    let payload_with_aad = Payload {
-        msg: &encrypted[12..],
-        aad: aad.as_bytes(),
-    };
-    if let Ok(plaintext_bytes) = cipher.decrypt(nonce, payload_with_aad) {
-        return String::from_utf8(plaintext_bytes)
-            .map_err(|e| format!("decrypted secret is not valid UTF-8: {e}"));
-    }
-
-    // Fall back to without AAD (pre-CB-11 format).
-    tracing::debug!("Decrypting secret without AAD (pre-CB-11 format) for {aad}");
-    let plaintext_bytes = cipher
-        .decrypt(nonce, &encrypted[12..])
-        .map_err(|e| format!("decrypt: {e}"))?;
-
-    String::from_utf8(plaintext_bytes)
-        .map_err(|e| format!("decrypted secret is not valid UTF-8: {e}"))
-}
 
 /// Credential store backed by the catalog `PostgreSQL` database.
 ///
-/// The `encryption_key` is zeroed from memory on drop.
-#[derive(Zeroize, ZeroizeOnDrop)]
+/// With no key holder (a factory caller that passed `KeySource::None`) every
+/// lookup of a stored secret fails.
 pub struct DbCredentialStore {
-    #[zeroize(skip)]
     pool: PgPool,
-    /// Base64-encoded AES-256-GCM encryption key from the settings table.
-    encryption_key: String,
+    keys: Option<Arc<SecretKeys>>,
 }
 
 impl DbCredentialStore {
-    /// Create a new credential store.
-    ///
-    /// `encryption_key` is the base64-encoded 32-byte key from the `settings` table.
+    /// Create a new credential store over the key holder the catalog store
+    /// shares.
     #[must_use]
-    pub fn new(pool: PgPool, encryption_key: String) -> Self {
-        Self {
-            pool,
-            encryption_key,
-        }
+    pub fn new(pool: PgPool, keys: Option<Arc<SecretKeys>>) -> Self {
+        Self { pool, keys }
+    }
+
+    /// Decrypt the secret of `row`, logging a failure under `what`.
+    fn open(
+        &self,
+        row: &SecretRow<'_>,
+        encrypted: &[u8],
+        what: &str,
+    ) -> Result<String, DynamoDbError> {
+        let opened = match &self.keys {
+            Some(keys) => keys.decrypt(row, encrypted),
+            None => Err("the store was opened without an encryption key".to_owned()),
+        };
+        let mut secret = opened.map_err(|e| {
+            tracing::error!(
+                "{what} decryption failed for access key {}: {e}",
+                row.access_key_id
+            );
+            DynamoDbError::InternalServerError("Internal error during authentication".to_owned())
+        })?;
+        Ok(std::mem::take(&mut *secret))
     }
 }
 
@@ -123,13 +97,11 @@ impl DbCredentialStore {
             return Ok(None);
         };
 
-        let secret_key =
-            decrypt_secret(&encrypted, &self.encryption_key, access_key_id).map_err(|e| {
-                tracing::error!("Secret key decryption failed for access key {access_key_id}: {e}");
-                DynamoDbError::InternalServerError(
-                    "Internal error during authentication".to_owned(),
-                )
-            })?;
+        let secret_key = self.open(
+            &SecretRow::access_key(access_key_id, &account_id, &user_name),
+            &encrypted,
+            "Secret key",
+        )?;
 
         Ok(Some(StoredCredential {
             secret_key,
@@ -179,15 +151,19 @@ impl DbCredentialStore {
             ));
         }
 
-        let secret_key =
-            decrypt_secret(&encrypted, &self.encryption_key, access_key_id).map_err(|e| {
-                tracing::error!(
-                    "Session secret key decryption failed for access key {access_key_id}: {e}"
-                );
-                DynamoDbError::InternalServerError(
-                    "Internal error during authentication".to_owned(),
-                )
-            })?;
+        // `expires_at` is stored in microseconds; the AAD carries whole
+        // seconds, which `unix_timestamp` gives by flooring.
+        let secret_key = self.open(
+            &SecretRow::session(
+                access_key_id,
+                &account_id,
+                &role_name,
+                &session_name,
+                expires_at.unix_timestamp(),
+            ),
+            &encrypted,
+            "Session secret key",
+        )?;
 
         Ok(Some(StoredCredential {
             secret_key,

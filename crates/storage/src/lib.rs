@@ -9,26 +9,65 @@
 
 pub mod authorization_store;
 pub mod backend;
+pub mod backup_catalog;
+pub mod backup_definition;
 pub mod bootstrapper;
 pub mod config;
 pub mod diagnostics;
 pub mod diagnostics_store;
 pub mod error;
 pub mod hooks;
+#[doc(hidden)]
+#[cfg(feature = "test-util")]
+pub mod iam_leftovers_conformance;
+pub mod key_commands;
+#[doc(hidden)]
+#[cfg(feature = "test-util")]
+pub mod key_conformance;
+pub mod key_pass;
+pub mod key_ring;
+#[cfg(test)]
+mod key_tests;
 pub mod management_store;
+pub mod management_store_factory;
+#[doc(hidden)]
+#[cfg(feature = "test-util")]
+pub mod metrics_conformance;
+pub mod migrations;
 pub mod operations;
+pub mod password;
+pub mod policy_migration;
+pub mod restore_engine;
+pub mod secret_cipher;
+pub mod secret_keys;
 pub mod server_components;
 pub mod settings_store;
+pub mod snapshot;
+#[doc(hidden)]
+#[cfg(feature = "test-hooks")]
+pub mod snapshot_conformance;
+pub mod stream_lineage;
+#[doc(hidden)]
+#[cfg(feature = "test-hooks")]
+pub mod test_pause;
 pub mod transact;
 pub mod vector_catalog;
 pub mod vector_lifecycle;
 
 pub use backend::{Backend, BackendAlreadySet, backend_name, set_backend, try_backend};
+pub use backup_catalog::{
+    BackupCatalog, JobClaim, JobPermit, LegacyBackupReader, MaintenanceClaim,
+};
+pub use backup_definition::{
+    BackupRestoreSource, RestoreRequest, RestoreSource, RestoreTableOverrides,
+};
+pub use restore_engine::{BulkLoadFile, Finished, RestoreEngine};
+pub use snapshot::{SnapshotEngine, SnapshotInfo, TableSnapshot};
 
 pub use transact::{IdempotencyKey, TransactGetOp, TransactWriteOp};
 
 pub use server_components::{
-    BackendError, ServerComponents, ServerComponentsFactory, create_server_components,
+    BackendError, KeySource, ServerComponents, ServerComponentsFactory, create_server_components,
 };
 
 pub use hooks::{CancellationToken, ServerRuntimeHooks, WorkerContext, sleep_or_shutdown};
@@ -312,7 +351,11 @@ pub trait DataEngine: Send + Sync {
     /// Update an item by primary key using update actions.
     ///
     /// `UpdateItem` is an upsert: if the item doesn't exist, a new item is created
-    /// containing the key attributes plus the SET values.
+    /// containing the key attributes plus the SET values. The exception is an
+    /// update whose actions all remove data (`REMOVE`, `DELETE`): on a missing
+    /// item it writes nothing, emits no stream record, and returns
+    /// `(None, None)` whatever `return_old` and `return_new` say
+    /// (`extenddb_core::expression::removes_only`).
     ///
     /// If `condition` is `Some`, evaluates the condition against the existing item
     /// (or empty item for new) inside a transaction.
@@ -599,13 +642,21 @@ pub trait StreamEngine: Send + Sync {
 
     /// Read stream records from a shard starting after a sequence number.
     ///
-    /// `account_id` is the authenticated caller's account. Implementations MUST
-    /// return records only for shards whose backing table belongs to that
-    /// account; a shard whose table belongs to a different account must yield no
-    /// records, so a shard iterator only reads its owning account's stream data.
+    /// `stream_arn` is the stream the shard iterator was issued for, and the resource
+    /// the request was authorized against. Implementations MUST resolve the shard
+    /// against the table and stream label that ARN names, scoped to `account_id`, as
+    /// part of the read (SQLite in the records statement, PostgreSQL, MongoDB and
+    /// Cassandra after reading the table), and return `StorageError::TableNotFound`
+    /// with the message `Requested resource not found: Stream does not exist` when the
+    /// stream does not exist for that account or the shard is not one of that stream's
+    /// shards (`util::shard_in_stream`). A shard of another table, another account, or
+    /// another stream of the same table therefore yields no records; a closed stream's
+    /// shards keep reading under the closed stream's ARN after the table has a newer
+    /// stream.
     fn get_stream_records(
         &self,
         account_id: &str,
+        stream_arn: &str,
         shard_id: &str,
         after_sequence: Option<&str>,
         limit: i64,
@@ -686,101 +737,36 @@ pub trait WorkerStore: Send + Sync {
     ) -> BoxFuture<'_, Result<Vec<(String, &'static str)>, StorageError>>;
 }
 
-/// Backup and point-in-time recovery operations.
-pub trait BackupEngine: Send + Sync {
-    /// Create a backup of a table, snapshotting all items.
-    fn create_backup(
-        &self,
-        account_id: &str,
-        table_name: &str,
-        backup_name: &str,
-    ) -> BoxFuture<'_, Result<extenddb_core::types::BackupDetails, StorageError>>;
-
-    /// Describe a backup by ARN, scoped to the owning account.
-    ///
-    /// Backups belong to an account, so implementations must match on both
-    /// `account_id` and `backup_arn` and report a missing backup when the ARN
-    /// belongs to another account — consistent with `list_backups`, which is
-    /// already account-scoped.
-    fn describe_backup(
-        &self,
-        account_id: &str,
-        backup_arn: &str,
-    ) -> BoxFuture<'_, Result<extenddb_core::types::BackupDescription, StorageError>>;
-
-    /// List backups for a table.
-    fn list_backups(
-        &self,
-        account_id: &str,
-        table_name: Option<&str>,
-    ) -> BoxFuture<'_, Result<Vec<extenddb_core::types::BackupSummary>, StorageError>>;
-
-    /// Delete a backup by ARN, scoped to the owning account.
-    ///
-    /// Same scoping requirement as `describe_backup`: an ARN owned by another
-    /// account must be reported as missing rather than deleted.
-    fn delete_backup(
-        &self,
-        account_id: &str,
-        backup_arn: &str,
-    ) -> BoxFuture<'_, Result<extenddb_core::types::BackupDescription, StorageError>>;
-
-    /// Restore a table from a backup.
-    ///
-    /// `account_id` is the caller's account: it owns the new table *and* scopes
-    /// the source backup lookup, since a backup can only be restored by the
-    /// account that owns it.
-    fn restore_table_from_backup(
-        &self,
-        account_id: &str,
-        target_table_name: &str,
-        backup_arn: &str,
-    ) -> BoxFuture<'_, Result<TableDescription, StorageError>>;
-
-    /// Describe continuous backups / PITR status for a table.
-    fn describe_continuous_backups(
-        &self,
-        account_id: &str,
-        table_name: &str,
-    ) -> BoxFuture<'_, Result<extenddb_core::types::ContinuousBackupsDescription, StorageError>>;
-
-    /// Update continuous backups (enable/disable PITR).
-    fn update_continuous_backups(
-        &self,
-        account_id: &str,
-        table_name: &str,
-        pitr_enabled: bool,
-    ) -> BoxFuture<'_, Result<extenddb_core::types::ContinuousBackupsDescription, StorageError>>;
-
-    /// Restore a table to a point in time.
-    // TODO(cleanup): This method is unreachable — the engine handler returns
-    // ValidationException("not yet supported") before calling storage. Remove
-    // when real PITR is implemented or during the next storage trait cleanup.
-    fn restore_table_to_point_in_time(
-        &self,
-        account_id: &str,
-        source_table_name: &str,
-        target_table_name: &str,
-    ) -> BoxFuture<'_, Result<TableDescription, StorageError>>;
-}
-
 /// Supertrait combining all `DynamoDB` operation traits.
 ///
 /// All storage backends must implement this to provide a complete
 /// DynamoDB-compatible API. This trait has NO additional methods beyond
 /// the trait bounds — backend-specific concerns belong in `ServerRuntimeHooks`.
 pub trait StorageEngine:
-    TableEngine + DataEngine + MetadataEngine + StreamEngine + BackupEngine + WorkerStore + Send + Sync
+    TableEngine
+    + DataEngine
+    + MetadataEngine
+    + StreamEngine
+    + BackupCatalog
+    + LegacyBackupReader
+    + RestoreEngine
+    + SnapshotEngine
+    + WorkerStore
+    + Send
+    + Sync
 {
 }
 
-// Blanket implementation: any type implementing all 6 traits is a StorageEngine
+// Blanket implementation: any type implementing all 9 traits is a StorageEngine
 impl<T> StorageEngine for T where
     T: TableEngine
         + DataEngine
         + MetadataEngine
         + StreamEngine
-        + BackupEngine
+        + BackupCatalog
+        + LegacyBackupReader
+        + RestoreEngine
+        + SnapshotEngine
         + WorkerStore
         + Send
         + Sync
@@ -794,6 +780,7 @@ impl<T> StorageEngine for T where
 pub trait CatalogStore:
     management_store::ManagementStore
     + management_store::AdminStore
+    + management_store::PasswordHashStore
     + management_store::SettingsStore
     + management_store::MetricsStore
     + management_store::RateLimitStore
@@ -801,12 +788,15 @@ pub trait CatalogStore:
     + Send
     + Sync
 {
-    /// Get the cached encryption key (if available).
+    /// The key holder that this store and its credential store share, or
+    /// `None` for a store built with no key. AssumeRole encrypts the session
+    /// secret with it before [`management_store::ManagementStore::store_session`].
     ///
-    /// Returns None if encryption key is not cached. This is used by
-    /// `cmd_serve` to construct the auth provider without re-querying
-    /// the settings table.
-    fn cached_encryption_key(&self) -> Option<String>;
+    /// The default is `None`; every backend that serves returns its key
+    /// holder.
+    fn secret_keys(&self) -> Option<&secret_keys::SecretKeys> {
+        None
+    }
 }
 
 #[cfg(test)]

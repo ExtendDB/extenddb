@@ -7,10 +7,11 @@
 //! session policy → identity allow → implicit deny. This is the same algorithm
 //! used by real AWS IAM, supporting IBAC, RBAC, and ABAC patterns.
 
-use super::condition::evaluate_condition;
+use super::condition::{ConditionMatch, evaluate_statement_conditions};
 use super::context::ConditionContext;
 use super::document::{ActionMatch, Effect, PolicyDocument, ResourceMatch, Statement};
-use super::matcher::{arn_match, wildcard_match_ignore_case};
+use super::matcher::wildcard_match_ignore_case;
+use super::variables::{resource_pattern_is_unresolvable, resource_pattern_matches};
 
 /// The result of policy evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +78,35 @@ pub fn evaluate_policies_arc(
     )
 }
 
+/// Returns true if an explicit Deny statement in any identity policy,
+/// permissions boundary, or session policy matches the action, resource and
+/// context. The server uses this only to choose the AccessDenied message form;
+/// it does not change the authorization decision, which `evaluate_policies_arc`
+/// already made.
+#[must_use]
+pub fn explicit_deny_matches_arc(
+    identity_policies: &[std::sync::Arc<PolicyDocument>],
+    permissions_boundary: Option<&PolicyDocument>,
+    session_policy: Option<&PolicyDocument>,
+    action: &str,
+    resource_arn: &str,
+    context: &impl ConditionContext,
+) -> bool {
+    identity_policies
+        .iter()
+        .map(std::sync::Arc::as_ref)
+        .chain(permissions_boundary)
+        .chain(session_policy)
+        .any(|policy| {
+            policy.statements.iter().any(|stmt| {
+                stmt.effect == Effect::Deny
+                    && action_matches(stmt, action)
+                    && resource_matches(policy, stmt, resource_arn, context)
+                    && deny_conditions_apply(policy, stmt, context)
+            })
+        })
+}
+
 fn evaluate_with<'a, I>(
     identity_policies: I,
     permissions_boundary: Option<&'a PolicyDocument>,
@@ -100,8 +130,8 @@ where
         for stmt in &policy.statements {
             if stmt.effect == Effect::Deny
                 && action_matches(stmt, action)
-                && resource_matches(stmt, resource_arn)
-                && conditions_match(stmt, context)
+                && resource_matches(policy, stmt, resource_arn, context)
+                && deny_conditions_apply(policy, stmt, context)
             {
                 return AuthzDecision::Deny;
             }
@@ -113,8 +143,8 @@ where
         let boundary_allows = boundary.statements.iter().any(|stmt| {
             stmt.effect == Effect::Allow
                 && action_matches(stmt, action)
-                && resource_matches(stmt, resource_arn)
-                && conditions_match(stmt, context)
+                && resource_matches(boundary, stmt, resource_arn, context)
+                && allow_conditions_grant(boundary, stmt, context)
         });
         if !boundary_allows {
             return AuthzDecision::Deny;
@@ -126,8 +156,8 @@ where
         let session_allows = session.statements.iter().any(|stmt| {
             stmt.effect == Effect::Allow
                 && action_matches(stmt, action)
-                && resource_matches(stmt, resource_arn)
-                && conditions_match(stmt, context)
+                && resource_matches(session, stmt, resource_arn, context)
+                && allow_conditions_grant(session, stmt, context)
         });
         if !session_allows {
             return AuthzDecision::Deny;
@@ -139,8 +169,8 @@ where
         for stmt in &policy.statements {
             if stmt.effect == Effect::Allow
                 && action_matches(stmt, action)
-                && resource_matches(stmt, resource_arn)
-                && conditions_match(stmt, context)
+                && resource_matches(policy, stmt, resource_arn, context)
+                && allow_conditions_grant(policy, stmt, context)
             {
                 return AuthzDecision::Allow;
             }
@@ -165,23 +195,86 @@ fn action_matches(statement: &Statement, request_action: &str) -> bool {
 }
 
 /// Check if the request resource matches the statement's resource constraint.
-fn resource_matches(statement: &Statement, request_resource: &str) -> bool {
+///
+/// In a `2012-10-17` document, `${key}` policy variables in each pattern are
+/// expanded from `context` before matching, and a pattern with an unresolved
+/// variable matches nothing. For `Resource` the statement then does not
+/// apply; for `NotResource` every resource is outside the pattern, so the
+/// statement applies to all of them.
+///
+/// When no pattern matches and one names a key the service populates but the
+/// context cannot resolve, the statement fails closed, as a condition on such
+/// a key does: a `Deny` applies and an `Allow` does not grant, for `Resource`
+/// and `NotResource` alike.
+fn resource_matches(
+    policy: &PolicyDocument,
+    statement: &Statement,
+    request_resource: &str,
+    context: &impl ConditionContext,
+) -> bool {
+    let expand = policy.expands_policy_variables();
+    let any_match = |patterns: &[String]| {
+        patterns
+            .iter()
+            .any(|p| resource_pattern_matches(p, request_resource, expand, context))
+    };
+    let unresolvable = |patterns: &[String]| {
+        patterns
+            .iter()
+            .any(|p| resource_pattern_is_unresolvable(p, expand, context))
+    };
+    let deny = statement.effect == Effect::Deny;
     match &statement.resource_match {
         ResourceMatch::Resources(patterns) => {
-            patterns.iter().any(|p| arn_match(p, request_resource))
+            any_match(patterns) || (deny && unresolvable(patterns))
         }
         ResourceMatch::NotResources(patterns) => {
-            !patterns.iter().any(|p| arn_match(p, request_resource))
+            !any_match(patterns) && (deny || !unresolvable(patterns))
         }
     }
 }
 
-/// Check if all conditions in the statement are satisfied.
-fn conditions_match(statement: &Statement, context: &impl ConditionContext) -> bool {
-    statement
-        .conditions
-        .iter()
-        .all(|c| evaluate_condition(c, context))
+/// Outcome of a statement's `Condition` block, three-valued. `policy` is the
+/// statement's document: its `Version` decides whether the condition values
+/// expand policy variables, which only a `2012-10-17` document does
+/// (`condition::evaluate_condition_with`).
+fn statement_conditions(
+    policy: &PolicyDocument,
+    statement: &Statement,
+    context: &impl ConditionContext,
+) -> ConditionMatch {
+    evaluate_statement_conditions(
+        &statement.conditions,
+        policy.expands_policy_variables(),
+        context,
+    )
+}
+
+/// Whether a `Deny` applies: its conditions match, or depend on a key the
+/// service populates but the context cannot resolve (fail closed, so the Deny
+/// blocks rather than being silently dropped).
+fn deny_conditions_apply(
+    policy: &PolicyDocument,
+    statement: &Statement,
+    context: &impl ConditionContext,
+) -> bool {
+    matches!(
+        statement_conditions(policy, statement, context),
+        ConditionMatch::Match | ConditionMatch::Unresolvable
+    )
+}
+
+/// Whether an `Allow` grants: its conditions definitely match. An unresolvable
+/// key does not grant (fail closed).
+fn allow_conditions_grant(
+    policy: &PolicyDocument,
+    statement: &Statement,
+    context: &impl ConditionContext,
+) -> bool {
+    matches!(
+        statement_conditions(policy, statement, context),
+        ConditionMatch::Match
+    )
 }
 
 #[cfg(test)]

@@ -22,9 +22,11 @@ impl SqliteEngine {
     ) -> Result<TableDescription, StorageError> {
         Self::validate_account_id(account_id)?;
 
+        // A DELETING row is fetched too: DeleteTable of a table that is
+        // already being deleted returns its description, as the service does.
         let row: Option<TableRow> = sqlx::query_as(&format!(
-            "SELECT {TABLE_COLUMNS} FROM tables \
-             WHERE account_id = ? AND table_name = ? AND table_status IN ('ACTIVE', 'CREATING')"
+            "SELECT {TABLE_COLUMNS} FROM tables WHERE account_id = ? AND table_name = ? \
+             AND table_status IN ('ACTIVE', 'CREATING', 'DELETING')"
         ))
         .bind(account_id)
         .bind(&input.table_name)
@@ -33,8 +35,47 @@ impl SqliteEngine {
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let row = row.ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
+        if row.table_status == "DELETING" {
+            // Already scheduled for removal by the control-plane worker:
+            // nothing to change.
+            let index_rows: Vec<IndexRow> = sqlx::query_as(&format!(
+                "SELECT {INDEX_COLUMNS} FROM indexes WHERE table_id = ?"
+            ))
+            .bind(&row.table_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let desc = self.build_table_description_from_row(account_id, row, index_rows)?;
+            return Ok(TableDescription {
+                table_status: TableStatus::Deleting,
+                ..desc
+            });
+        }
         if row.deletion_protection_enabled {
             return Err(StorageError::DeletionProtected(row.table_arn.clone()));
+        }
+
+        // A restore target (CREATING with no scheduled transition) is being
+        // filled by RestoreTableFromBackup. The service refuses to delete a
+        // table it is still creating, and deleting this one would make the
+        // restore fail part-way; refuse until the restore finishes. An
+        // abandoned target is removed by the restore sweep, not here.
+        if row.table_status == "CREATING" {
+            let restoring: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM tables WHERE table_id = ? \
+                 AND table_status = 'CREATING' AND status_transition_at IS NULL)",
+            )
+            .bind(&row.table_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if restoring {
+                return Err(StorageError::IndexesInUse(format!(
+                    "Attempt to change a resource which is still in use: Table is being \
+                     restored: {}",
+                    row.table_name
+                )));
+            }
         }
 
         let index_rows: Vec<IndexRow> = sqlx::query_as(&format!(
@@ -52,7 +93,7 @@ impl SqliteEngine {
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?
         .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(0.25);
+        .unwrap_or(crate::DEFAULT_CONTROL_PLANE_DELAY_SECONDS);
 
         let index_ids: Vec<String> = index_rows.iter().map(|r| r.index_id.clone()).collect();
         let table_id = row.table_id.clone();

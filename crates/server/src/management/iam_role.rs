@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
@@ -51,11 +51,12 @@ pub struct TagEntry {
 pub async fn create_role(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(account_id): Path<String>,
     axum::Json(body): axum::Json<CreateRoleRequest>,
 ) -> Response {
     if let Err(e) =
-        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, None).await
+        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, addr).await
     {
         return e;
     }
@@ -66,10 +67,17 @@ pub async fn create_role(
         ));
     }
 
-    if body.trust_policy.get("Version").is_none() || body.trust_policy.get("Statement").is_none() {
+    if body.trust_policy.get("Statement").is_none() {
         return op_err_to_response(OpError::Validation(
-            "Trust policy must contain Version and Statement".to_owned(),
+            "Trust policy must contain a Statement".to_owned(),
         ));
+    }
+    // Validate the trust document the way IAM validates an AssumeRole trust
+    // policy, so a document IAM would reject is not stored and then dropped at
+    // evaluation. The error text is ExtendDB's own; the accepted and rejected
+    // sets match IAM.
+    if let Err(msg) = super::assume_role::validate_trust_policy(&body.trust_policy) {
+        return op_err_to_response(OpError::Validation(format!("Invalid trust policy: {msg}")));
     }
 
     match state
@@ -86,10 +94,11 @@ pub async fn create_role(
 pub async fn list_roles(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(account_id): Path<String>,
 ) -> Response {
     if let Err(e) =
-        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, None).await
+        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, addr).await
     {
         return e;
     }
@@ -123,10 +132,11 @@ pub async fn list_roles(
 pub async fn delete_role(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((account_id, role_name)): Path<(String, String)>,
 ) -> Response {
     if let Err(e) =
-        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, None).await
+        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, addr).await
     {
         return e;
     }
@@ -162,6 +172,10 @@ pub async fn delete_role(
                 .auth_cache
                 .invalidate_role_sessions(&account_id, &role_name)
                 .await;
+            state
+                .auth_cache
+                .invalidate_role_created_at(&account_id, &role_name)
+                .await;
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => op_err_to_response(OpError::from_storage(e)),
@@ -172,25 +186,19 @@ pub async fn delete_role(
 pub async fn tag_role(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((account_id, role_name)): Path<(String, String)>,
     axum::Json(body): axum::Json<TagRequest>,
 ) -> Response {
     if let Err(e) =
-        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, None).await
+        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, addr).await
     {
         return e;
     }
 
     for tag in &body.tags {
-        if tag.key.is_empty() || tag.key.len() > 128 {
-            return (StatusCode::BAD_REQUEST, "tag key must be 1-128 characters").into_response();
-        }
-        if tag.value.len() > 256 {
-            return (
-                StatusCode::BAD_REQUEST,
-                "tag value must not exceed 256 characters",
-            )
-                .into_response();
+        if tag.key.is_empty() {
+            return (StatusCode::BAD_REQUEST, "tag key must not be empty").into_response();
         }
     }
 
@@ -199,6 +207,17 @@ pub async fn tag_role(
         .iter()
         .map(|t| (t.key.clone(), t.value.clone()))
         .collect();
+
+    if let Err(e) = super::validate_iam_tags(&tags) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
+    if let Some(dup) = super::duplicate_tag_key_ci(&tags) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("Duplicate tag keys found (tag keys are case insensitive): {dup}"),
+        )
+            .into_response();
+    }
 
     match state
         .catalog_store
@@ -226,11 +245,12 @@ pub async fn tag_role(
 pub async fn untag_role(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((account_id, role_name)): Path<(String, String)>,
     axum::Json(body): axum::Json<UntagRequest>,
 ) -> Response {
     if let Err(e) =
-        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, None).await
+        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, addr).await
     {
         return e;
     }
@@ -261,10 +281,11 @@ pub async fn untag_role(
 pub async fn list_role_tags(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((account_id, role_name)): Path<(String, String)>,
 ) -> Response {
     if let Err(e) =
-        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, None).await
+        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, addr).await
     {
         return e;
     }

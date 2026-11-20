@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
@@ -101,13 +101,14 @@ pub struct InvalidateResponse {
 pub async fn invalidate(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     body: Result<axum::Json<InvalidateRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let admin_name = match authenticate_admin(
         &headers,
         &*state.catalog_store,
         &*state.catalog_store,
-        None,
+        addr,
     )
     .await
     {
@@ -178,6 +179,9 @@ pub async fn apply(
                 .await;
             auth_cache.invalidate_user_tags(account_id, user_name).await;
             auth_cache
+                .invalidate_user_created_at(account_id, user_name)
+                .await;
+            auth_cache
                 .invalidate_principal_credentials(account_id, user_name)
                 .await;
             vec![
@@ -185,6 +189,7 @@ pub async fn apply(
                 "user_group_policies",
                 "user_boundary",
                 "user_tags",
+                "user_created_at",
                 "principal_credentials",
             ]
         }
@@ -202,6 +207,9 @@ pub async fn apply(
                 .invalidate_role_sessions(account_id, role_name)
                 .await;
             auth_cache
+                .invalidate_role_created_at(account_id, role_name)
+                .await;
+            auth_cache
                 .invalidate_principal_credentials(account_id, role_name)
                 .await;
             vec![
@@ -209,6 +217,7 @@ pub async fn apply(
                 "role_boundary",
                 "role_tags",
                 "role_sessions",
+                "role_created_at",
                 "principal_credentials",
             ]
         }

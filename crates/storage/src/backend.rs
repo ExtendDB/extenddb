@@ -51,10 +51,15 @@ pub struct Backend {
     pub operations: &'static dyn OperationsEngine,
     /// Creates the runtime settings store.
     pub settings_store: SettingsStoreFactory,
+    /// Creates a catalog-only management store (used by `migrate`).
+    pub management_store: crate::management_store_factory::ManagementStoreFactory,
     /// Creates the diagnostics store (`catalog-check`, `verify`).
     pub diagnostics_store: DiagnosticsStoreFactory,
     /// Creates the assembled server components for `serve`.
     pub server_components: ServerComponentsFactory,
+    /// The backend's catalog migrations on the shared runner, which `init`,
+    /// `migrate`, `verify` and `serve` use.
+    pub catalog_migrations: &'static dyn crate::migrations::CatalogMigrations,
 }
 
 static BACKEND: OnceLock<Backend> = OnceLock::new();

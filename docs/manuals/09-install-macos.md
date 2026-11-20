@@ -26,7 +26,7 @@ If you prefer to run each step yourself, follow the sections below.
 
 ## Prerequisites
 
-- Rust 1.88+ (`rustup update`)
+- Rust 1.91.1+ (`rustup update`)
 - PostgreSQL 14+ via Homebrew (`brew install postgresql@17`)
 - Python 3.10+ (for test suites)
 - AWS CLI v2 (for testing)
@@ -96,7 +96,7 @@ Expected:
 ```
 === extenddb verify ===
 ...
-  OK: Catalog version 0.0.3
+  OK: Current: the catalog is at migration 12
 ...
 === HEALTHY: All checks passed ===
 ```
@@ -197,6 +197,6 @@ See `docs/troubleshooting.md` for the full troubleshooting guide.
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

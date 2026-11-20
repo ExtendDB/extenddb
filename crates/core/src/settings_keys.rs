@@ -20,9 +20,8 @@ pub const INDEX_PROPAGATION_DELAY_MS: &str = "index_propagation_delay_ms";
 /// The pre-rename name of [`INDEX_PROPAGATION_DELAY_MS`], still honoured.
 ///
 /// Two reasons this cannot simply be deleted. A catalog created before the rename
-/// holds the operator's value under the old name, and the server refuses to start on
-/// a catalog-version mismatch rather than migrating, so there is no upgrade step in
-/// which the row could be rewritten. Silently reading past that row would reset a
+/// holds the operator's value under the old name, and no catalog migration rewrites
+/// that row yet, though one could. Silently reading past that row would reset a
 /// deliberately configured delay to the default, and a delay of 0 means synchronous,
 /// so the silent change would be from strict to eventually consistent.
 ///

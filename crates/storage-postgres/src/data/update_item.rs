@@ -10,6 +10,7 @@ use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{parse_sk, pk_to_text, sk_column, sk_info};
 
+use super::gsi_build::fix_up_stale_write;
 use super::index::{enqueue_async_indexes, fetch_write_path_indexes, sync_indexes};
 use super::query::check_condition;
 use super::tx_helpers::write_stream_record_in_tx;
@@ -58,13 +59,28 @@ impl PostgresEngine {
         // cached membership gate, and that is gone: an index takes effect the moment
         // its catalog row commits. What remains is a window between this read and
         // the data transaction's commit, in which an index created concurrently is
-        // missed. That window cannot be closed here, because the catalog and the
-        // data tables are different databases and no transaction spans them. It is
-        // also exactly the window the secondary indexes have, for the same reason
-        // and with the same read: parity with a GSI is the bar, and the backfill
-        // that publishes a new index is what covers writes older than it.
-        let (indexes, vector_metas) =
+        // missed. No transaction can close it, because the catalog and the data
+        // tables are different databases. For a GSI it is closed by time instead:
+        // the read's stamp lets a write that was slow to commit queue a repair
+        // for any GSI it did not see (`gsi_build::fix_up_stale_write`), and a fast
+        // write is one the backfill sees. Vector indexes still have the window.
+        let (indexes, vector_metas, stamp) =
             fetch_write_path_indexes(&key_info.table_id, &self.pool).await?;
+        // Literal operands assigned to a secondary-index key, checked on the
+        // statement ahead of the condition as the service checks them. The
+        // engine ran this check against its cached key info, which does not list
+        // a GSI until the UpdateTable that adds it returns; this read lists it
+        // from the moment its CREATING row commits, so a literal of the wrong
+        // type for an index still being built gets the same per-index wording.
+        if !indexes.is_empty() {
+            validation::validate_index_key_literal_operands(
+                actions,
+                &super::transactions::index_key_refs(&indexes),
+                super::index::fresh_attr_defs(&indexes, &key_info.attribute_definitions),
+                maps,
+            )
+            .map_err(|e| StorageError::Validation(e.to_string()))?;
+        }
         // Read whenever anything can propagate, secondary or vector. Gating this on
         // the secondary set alone made a vector-only table ignore the configured
         // delay and apply its vector index inline, while a TransactWriteItems on the
@@ -186,9 +202,40 @@ impl PostgresEngine {
             )
             .map_err(|e| StorageError::Validation(e.to_string()))?;
 
-            // Validate post-update item size (400 KB limit)
-            validation::validate_item_size(&item, self.max_item_size_bytes)
+            // Size the update the way the service does: what the statement
+            // writes plus a fixed cost per clause, against the item limit.
+            validation::validate_update_item_size(&item, actions, maps, self.max_item_size_bytes)
                 .map_err(|e| StorageError::Validation(e.to_string()))?;
+
+            // Secondary-index keys on the written item, as the transacted Update
+            // path and the SQLite backend already do. Literal operands were
+            // checked ahead of the condition, above; a value computed from the
+            // existing item is only known now and carries the service's
+            // computed-value wording. An index key left empty is a
+            // ValidationException, not a malformed index row.
+            if !indexes.is_empty() {
+                let idx_refs = super::transactions::index_key_refs(&indexes);
+                validation::validate_index_key_types_after_update(
+                    &item,
+                    &idx_refs,
+                    super::index::fresh_attr_defs(&indexes, &key_info.attribute_definitions),
+                )
+                .map_err(|e| StorageError::Validation(e.to_string()))?;
+                validation::validate_index_key_not_empty(
+                    &item,
+                    &idx_refs,
+                    validation::SecondaryIndexEmptyContext::UpdateExpression,
+                )
+                .map_err(|e| StorageError::Validation(e.to_string()))?;
+            }
+
+            // REMOVE and DELETE on a key that holds no row change nothing: the
+            // service writes no item and emits no stream record (issue #478).
+            // The actions were still applied above so that their validation
+            // errors surface the same way as on an existing row.
+            if old_json.is_none() && expression::removes_only(actions) {
+                return Ok((None, None));
+            }
 
             let new_item = if return_new { Some(item.clone()) } else { None };
 
@@ -263,7 +310,6 @@ impl PostgresEngine {
             sync_indexes(
                 &mut tx,
                 &key_info.key_schema,
-                &key_info.attribute_definitions,
                 &indexes,
                 pre_mutation_item.as_ref(),
                 Some(&item),
@@ -309,6 +355,9 @@ impl PostgresEngine {
             sys_delay,
         )
         .await?;
+
+        async_enqueued +=
+            fix_up_stale_write(&mut tx, &self.pool, stamp, key_info, &indexes, key).await?;
 
         tx.commit()
             .await

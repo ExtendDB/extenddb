@@ -16,11 +16,9 @@ use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::build_expression_maps;
+use crate::request_limits;
 use crate::serialize_output;
 use crate::{DispatchMetrics, DispatchResult};
-
-/// Maximum number of keys across all tables in a single `BatchGetItem` request.
-const MAX_BATCH_GET_KEYS: usize = 100;
 
 /// Handle a `BatchGetItem` request.
 ///
@@ -38,44 +36,15 @@ pub async fn handle_batch_get_item(
     let input: BatchGetItemInput =
         serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
-    // Validate: RequestItems must not be empty. The message is the request
-    // model's length constraint (measured; note "Value at", with no value
-    // echoed). BatchWriteItem keeps its distinct required-parameter sentence,
-    // which is likewise measured.
-    if input.request_items.is_empty() {
-        return Err(DynamoDbError::ValidationException(
-            "1 validation error detected: Value at 'RequestItems' failed to satisfy \
-             constraint: Member must have length greater than or equal to 1"
-                .to_owned(),
-        ));
-    }
-
-    // Validate: per-table keys <= 100
-    for (table_name, ka) in &input.request_items {
-        if ka.keys.len() > MAX_BATCH_GET_KEYS {
-            return Err(DynamoDbError::ValidationException(format!(
-                "1 validation error detected: Value at 'RequestItems.{table_name}.member.Keys' failed to satisfy constraint: \
-                 Member must have length less than or equal to 100"
-            )));
-        }
-    }
-
-    // Validate: total keys across all tables <= 100
-    let total_keys: usize = input.request_items.values().map(|ka| ka.keys.len()).sum();
-    if total_keys > MAX_BATCH_GET_KEYS {
-        return Err(DynamoDbError::ValidationException(
-            "Too many items requested for the BatchGetItem call".to_owned(),
-        ));
-    }
-
-    // Validate: each table must have at least one key
-    for (table_name, ka) in &input.request_items {
-        if ka.keys.is_empty() {
-            return Err(DynamoDbError::ValidationException(format!(
-                "1 validation error detected: Value '[]' at 'requestItems.{table_name}.member.keys' failed to satisfy constraint: Member must have length greater than or equal to 1"
-            )));
-        }
-    }
+    // Validate the table and key counts: RequestItems not empty, at most 100
+    // tables, at most 100 keys per table and in total, at least one key per
+    // table. The server runs the same checks before authorization.
+    let counts: Vec<(&str, Option<usize>)> = input
+        .request_items
+        .iter()
+        .map(|(table_name, ka)| (table_name.as_str(), Some(ka.keys.len())))
+        .collect();
+    request_limits::check_batch_counts("BatchGetItem", &counts)?;
 
     // Reject mixing expression and non-expression parameters anywhere in the
     // request. The check is request-wide: ProjectionExpression on one table and
@@ -181,6 +150,21 @@ pub async fn handle_batch_get_item(
         table_projections.insert(table_name.clone(), projection);
     }
 
+    // A number the service cannot read in a key is checked after every
+    // table's projection and duplicate checks, and before the table lookups,
+    // with tables in name order so that a request answers the same way each
+    // time. Measured 2026-10-27, the service answered a duplicate key in the
+    // first table of the request body ahead of a malformed number in the
+    // second, which this pass follows, and a malformed number in the first
+    // table ahead of a duplicate key in the second, where this pass reports
+    // the duplicate, as before this check.
+    let mut table_names: Vec<&String> = input.request_items.keys().collect();
+    table_names.sort();
+    for table_name in table_names {
+        let keys = &input.request_items[table_name].keys;
+        extenddb_core::validation::number::operations::batch_get_keys(keys)?;
+    }
+
     let mut responses: HashMap<String, Vec<Item>> = HashMap::new();
     let mut total_rcu: f64 = 0.0;
     let mut total_pre_proj_bytes: usize = 0;
@@ -189,8 +173,7 @@ pub async fn handle_batch_get_item(
 
     for (table_name, ka) in &input.request_items {
         let key_info = ctx
-            .storage
-            .table_key_info(&ctx.account_id, table_name)
+            .table_key_info_uncached(table_name)
             .await
             .map_err(storage_err_to_dynamo)?;
 

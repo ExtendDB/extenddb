@@ -8,6 +8,14 @@
 //! `DynamoDB`-format error responses.
 
 mod backup;
+pub use backup::{
+    BackupRuntime, ConfiguredStore, HeldClaim, JobSettings, KillPoint, LOCAL_CHECK_TIMEOUT,
+    OTHER_STORE, RESTORE_REGISTRATION_TIMEOUT, S3_CHECK_TIMEOUT, STORE_IDENTITY_KEY, Spool,
+    StoreFence, StoreHealth, StoreHealthReport, StoreIdentityFile, StoreProblem, TARGET_NOT_EMPTY,
+    check_configured_store, check_configured_store_read_only, maintenance, migrate_legacy,
+    read_identity_bounded, reconciler, refuse_point_in_time_recovery, store_identity,
+    store_maintenance, sync,
+};
 mod batch_get_item;
 mod batch_write_item;
 pub mod capacity_helpers;
@@ -20,16 +28,23 @@ mod describe_table;
 mod expected;
 mod expression_helpers;
 mod get_item;
+mod gsi_updates;
 mod import_export;
 mod import_export_io;
 mod index_helpers;
+mod item_authorizer;
 mod legacy_filter;
 mod list_tables;
+#[cfg(feature = "partiql")]
+mod partiql;
+pub mod private_fs;
 mod put_item;
 mod query;
 mod read_helpers;
+mod request_limits;
 mod scan;
 mod search_vectors;
+mod start_key;
 pub mod stream_capture;
 mod streams;
 mod tagging;
@@ -40,10 +55,14 @@ mod ttl;
 mod update_item;
 mod update_table;
 mod vector_gate;
+mod warm_throughput;
+#[cfg(feature = "partiql")]
+use partiql::PartiqlExecutor;
 
 pub use batch_get_item::handle_batch_get_item;
 pub use batch_write_item::handle_batch_write_item;
 pub use create_table::handle_create_table;
+pub use create_table::storage_err_to_dynamo;
 pub use delete_item::handle_delete_item;
 pub use delete_table::handle_delete_table;
 pub use describe_endpoints::handle_describe_endpoints;
@@ -51,11 +70,15 @@ pub use describe_limits::handle_describe_limits;
 pub use describe_table::handle_describe_table;
 pub use get_item::handle_get_item;
 pub use import_export::{handle_export_table, handle_import_table};
+pub use item_authorizer::{ItemAccess, ItemAuthorization, ItemAuthorizer};
 pub use list_tables::handle_list_tables;
 pub use put_item::handle_put_item;
 pub use query::handle_query;
+pub use request_limits::check_request_item_counts;
 pub use scan::handle_scan;
 pub use search_vectors::handle_search_vectors;
+pub use streams::{SHARD_ITERATOR_EXPIRED_MESSAGE, ShardIteratorClass, classify_shard_iterator};
+pub use streams::{ShardIterator, decode_shard_iterator, encode_shard_iterator};
 pub use streams::{
     handle_describe_stream, handle_get_records, handle_get_shard_iterator, handle_list_streams,
 };
@@ -71,6 +94,7 @@ use std::sync::Arc;
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::limits::LimitsConfig;
+use extenddb_core::types::TableKeyInfo;
 
 /// Check whether an operation name is recognized by the dispatch table.
 ///
@@ -118,7 +142,23 @@ pub fn is_known_operation(operation: &str) -> bool {
             | "DescribeContinuousBackups"
             | "UpdateContinuousBackups"
             | "RestoreTableToPointInTime"
+    ) || is_known_partiql_operation(operation)
+}
+
+/// PartiQL operations, known only when the `partiql` feature is on. With the
+/// feature off this is always false, so the server answers them with
+/// `UnknownOperationException`.
+#[cfg(feature = "partiql")]
+fn is_known_partiql_operation(operation: &str) -> bool {
+    matches!(
+        operation,
+        "ExecuteStatement" | "BatchExecuteStatement" | "ExecuteTransaction"
     )
+}
+
+#[cfg(not(feature = "partiql"))]
+fn is_known_partiql_operation(_operation: &str) -> bool {
+    false
 }
 use serde::Serialize;
 
@@ -143,6 +183,26 @@ pub(crate) fn serialize_output(
 pub(crate) fn sanitize_storage_error(e: extenddb_storage::error::StorageError) -> DynamoDbError {
     tracing::error!(internal_error = %e, "storage internal error");
     DynamoDbError::InternalServerError("Internal server error".to_owned())
+}
+
+/// The null-member sentence for a `StreamSpecification` object without
+/// `StreamEnabled`, on `CreateTable` and `UpdateTable` alike (measured
+/// 2026-10-24). Checked before the body is deserialised, where the missing
+/// field would otherwise surface as a serialization error; its order against
+/// the other request checks is not measured. A `StreamSpecification` that is
+/// not an object is left to deserialisation, which refuses it as a
+/// `SerializationException`.
+pub(crate) fn require_stream_enabled_member(body: &serde_json::Value) -> Result<(), DynamoDbError> {
+    if let Some(spec) = body.get("StreamSpecification").filter(|v| v.is_object())
+        && spec
+            .get("StreamEnabled")
+            .is_none_or(serde_json::Value::is_null)
+    {
+        return Err(DynamoDbError::ValidationException(
+            "1 validation error detected: Value null at 'streamSpecification.streamEnabled' failed to satisfy constraint: Member must not be null".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Map a serde deserialization error to the appropriate `DynamoDB` error type.
@@ -315,19 +375,29 @@ impl DispatchResult {
     }
 }
 
+/// The `TableKeyInfo` the authorization layer read for a request, by table
+/// name. A `None` value records a table that authorization found missing.
+pub type AuthorizedKeyInfo = std::collections::HashMap<String, Option<TableKeyInfo>>;
+
 /// Context passed to every operation handler.
 /// Fix #9: region and `account_id` use Arc<str> to avoid per-request cloning.
 ///
 /// # Catalog Query Discipline (P118)
 ///
-/// For single-table item operations (`GetItem`, `PutItem`, `DeleteItem`,
-/// `UpdateItem`, `Query`, `Scan`), the auth layer pre-fetches `TableKeyInfo`
-/// and stores it in `pre_fetched_key_info`. Engine handlers MUST use this
-/// pre-fetched value instead of calling `storage.table_key_info()` directly.
-/// New per-request catalog roundtrips require justification in the discussion
-/// file and principal reviewer approval.
+/// The auth layer reads `TableKeyInfo` for every table whose partition key it
+/// evaluates (`dynamodb:LeadingKeys`) and stores what it read in
+/// `authorized_key_info`. Engine handlers MUST resolve those tables from this
+/// snapshot instead of reading the catalog again, through
+/// [`OperationContext::table_key_info`] or
+/// [`OperationContext::table_key_info_uncached`]. Authorization and the engine
+/// then act on the same key schema, and on the same answer to whether the
+/// table exists. New per-request catalog roundtrips require justification in
+/// the discussion file and principal reviewer approval.
 pub struct OperationContext {
     pub storage: Arc<dyn extenddb_storage::StorageEngine>,
+    /// The process's job slots and configured backup store, which the backup
+    /// operations read.
+    pub backup: Arc<BackupRuntime>,
     pub limits: Arc<LimitsConfig>,
     pub region: Arc<str>,
     pub account_id: Arc<str>,
@@ -337,37 +407,80 @@ pub struct OperationContext {
     /// Allowed directories for export file operations. Empty means exports
     /// are disabled (secure default).
     pub export_paths: Arc<[Arc<PathBuf>]>,
-    /// Pre-fetched `TableKeyInfo` from the auth layer (P118 optimization #2).
-    /// Populated for single-table item-level operations; `None` for table-level
-    /// and batch/transact operations.
-    pub pre_fetched_key_info: Option<extenddb_core::types::TableKeyInfo>,
+    /// The `TableKeyInfo` the auth layer read for this request (P118
+    /// optimization #2). Populated for single-table item operations, `Query`,
+    /// `Scan`, and the batch and transaction operations; empty for table-level
+    /// operations. In developer mode authorization is skipped after the
+    /// single-table read, so only a single-table operation has an entry.
+    pub authorized_key_info: AuthorizedKeyInfo,
     /// Auth/authz cache handles. Used by control-plane and tagging operations
     /// to issue write-through cache invalidations after the underlying state
     /// changes (e.g. `TagResource` invalidates the resource-tags cache).
     pub auth_cache: extenddb_auth::AuthCacheRegistry,
-    /// Optional cached `TableKeyInfo` lookup. When set, batch / transact /
-    /// multi-table engine handlers route through this instead of calling
-    /// `storage.table_key_info` directly. When unset (e.g. unit tests), the
-    /// engine falls back to direct storage lookups.
+    /// Optional cached `TableKeyInfo` lookup, used by
+    /// [`OperationContext::table_key_info`] for a table the auth layer did not
+    /// read. When unset (e.g. unit tests), the engine falls back to direct
+    /// storage lookups.
     pub table_key_info_lookup: Option<Arc<dyn extenddb_storage::TableKeyInfoLookup>>,
+    /// Authorizes the item reads and writes a request names inside its body
+    /// (the statements of the PartiQL operations), which the server does not
+    /// authorize before dispatch. `None` refuses every such read and write.
+    pub item_authorizer: Option<Arc<dyn ItemAuthorizer>>,
 }
 
 impl OperationContext {
-    /// Return pre-fetched `TableKeyInfo` if available and matching the requested
-    /// table, otherwise fetch from storage. This is the single entry point for
-    /// obtaining `TableKeyInfo` in engine handlers (P118 Catalog Query Discipline).
+    /// The auth layer's answer for `table_name`, if it read that table: the key
+    /// info it used, or `TableNotFound` when it found the table missing. A
+    /// missing table stays missing for the rest of the request even if it has
+    /// since become ACTIVE, because authorization left `dynamodb:LeadingKeys`
+    /// absent for it and an absent key satisfies a `ForAllValues` condition.
+    /// The snapshot is authoritative for every table it names: an entry for
+    /// another account is an internal error, never a reason to read the table
+    /// again.
+    fn authorized_table_key_info(
+        &self,
+        table_name: &str,
+    ) -> Option<Result<TableKeyInfo, extenddb_storage::error::StorageError>> {
+        use extenddb_storage::error::StorageError;
+        Some(match self.authorized_key_info.get(table_name)? {
+            Some(ki) if *ki.account_id == *self.account_id => Ok(ki.clone()),
+            Some(_) => Err(StorageError::Internal(format!(
+                "authorized key info for table {table_name} belongs to another account"
+            ))),
+            None => Err(StorageError::TableNotFound(table_name.to_owned())),
+        })
+    }
+
+    /// `TableKeyInfo` for a single-table operation: the auth layer's snapshot
+    /// when it read the table, otherwise the cached lookup, otherwise storage.
+    /// This is the entry point for single-table handlers (P118 Catalog Query
+    /// Discipline).
     pub(crate) async fn table_key_info(
         &self,
         table_name: &str,
-    ) -> Result<extenddb_core::types::TableKeyInfo, extenddb_storage::error::StorageError> {
-        if let Some(ref ki) = self.pre_fetched_key_info
-            && ki.table_name == table_name
-            && *ki.account_id == *self.account_id
-        {
-            return Ok(ki.clone());
+    ) -> Result<TableKeyInfo, extenddb_storage::error::StorageError> {
+        if let Some(result) = self.authorized_table_key_info(table_name) {
+            return result;
         }
         if let Some(ref lookup) = self.table_key_info_lookup {
             return lookup.lookup(&self.account_id, table_name).await;
+        }
+        self.storage
+            .table_key_info(&self.account_id, table_name)
+            .await
+    }
+
+    /// `TableKeyInfo` for a batch or transaction handler: the auth layer's
+    /// snapshot when it read the table, otherwise a direct storage read. The
+    /// fallback skips the cache, as these handlers always have, so a request
+    /// that authorization did not evaluate (developer mode) sees the catalog as
+    /// it is now rather than a cached or negative entry.
+    pub(crate) async fn table_key_info_uncached(
+        &self,
+        table_name: &str,
+    ) -> Result<TableKeyInfo, extenddb_storage::error::StorageError> {
+        if let Some(result) = self.authorized_table_key_info(table_name) {
+            return result;
         }
         self.storage
             .table_key_info(&self.account_id, table_name)
@@ -472,6 +585,12 @@ pub async fn dispatch(
         "RestoreTableToPointInTime" => backup::handle_restore_table_to_point_in_time(body, ctx)
             .await
             .map(DispatchResult::body_only),
+        #[cfg(feature = "partiql")]
+        "ExecuteStatement" => ctx.execute_statement(body).await,
+        #[cfg(feature = "partiql")]
+        "BatchExecuteStatement" => ctx.batch_execute_statement(body).await,
+        #[cfg(feature = "partiql")]
+        "ExecuteTransaction" => ctx.execute_transaction(body).await,
         _ => Err(DynamoDbError::UnknownOperationException(String::new())),
     }
 }

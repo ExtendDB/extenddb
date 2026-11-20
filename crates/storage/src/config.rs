@@ -59,6 +59,29 @@ pub trait StorageConfig: Send + Sync + std::fmt::Debug {
         Vec::new()
     }
 
+    /// The local file the database lives in, for a backend whose database is
+    /// one file on this host (SQLite with a file path); `None` for a server
+    /// database and for an in-memory database. The backup configuration
+    /// derives its per-backend defaults from it: a store root and a restore
+    /// spool beside the file, and the rule that neither may sit in the
+    /// file's directory. The default is `None`.
+    fn database_file(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    /// [`Self::database_file`] with the reason a configured location names
+    /// no usable file: `Ok(None)` for a server database and for an
+    /// in-memory one, `Err` for a location the backend cannot parse (which
+    /// [`Self::database_file`] also answers `None` for). The default is
+    /// `Ok` of [`Self::database_file`].
+    ///
+    /// # Errors
+    ///
+    /// The backend's reason the location is not usable.
+    fn database_location(&self) -> Result<Option<std::path::PathBuf>, String> {
+        Ok(self.database_file())
+    }
+
     /// Clone this config into a boxed trait object.
     fn clone_box(&self) -> Box<dyn StorageConfig>;
 
@@ -84,6 +107,104 @@ pub trait StorageConfig: Send + Sync + std::fmt::Debug {
 impl Clone for Box<dyn StorageConfig> {
     fn clone(&self) -> Self {
         self.clone_box()
+    }
+}
+
+/// The warning for a `server.region` outside `[a-z0-9-]`, or `None` when the
+/// region is in that class (the `BackupArn` parser's predicate,
+/// [`extenddb_core::backup_format::is_region`], so the warning and the parser
+/// cannot disagree).
+///
+/// The region is baked into every backup ARN the server issues
+/// (`arn:aws:dynamodb:<region>:<account>:table/<name>/backup/<id>`), and the
+/// `BackupArn` parser accepts a region in `[a-z0-9-]` only, as the service
+/// does. The engine checks the region before forming a backup ARN, so on a
+/// deployment configured outside that class `CreateBackup` is refused with a
+/// `ValidationException` naming `server.region`; backups taken before the
+/// upgrade under such a region keep their stored ARN, which `DescribeBackup`,
+/// `DeleteBackup` and `RestoreTableFromBackup` refuse as "Invalid Request:
+/// BackupArn is not valid" as before. The server starts anyway (the setting
+/// is pre-existing and the data plane does not depend on it); the operator
+/// is told at startup.
+#[must_use]
+pub fn server_region_warning(region: &str) -> Option<StartupWarning> {
+    if extenddb_core::backup_format::is_region(region) {
+        return None;
+    }
+    Some(StartupWarning {
+        title: format!(
+            "server.region {region:?} is outside [a-z0-9-]; CreateBackup is refused on this \
+             server."
+        ),
+        details: vec![
+            "Every backup ARN carries the configured region, and BackupArn is accepted \
+             only with a region in [a-z0-9-], so CreateBackup answers ValidationException \
+             naming server.region (no backup ARN can be formed), and the backups created \
+             under this region before the upgrade keep an ARN that DescribeBackup, \
+             DeleteBackup, and RestoreTableFromBackup refuse with ValidationException \
+             \"Invalid Request: BackupArn is not valid\"; ListBackups refuses a cursor that is \
+             such an ARN (a listing of backups created under a valid region pages)."
+                .to_owned(),
+            "Set server.region to a value in [a-z0-9-] (for example us-east-1). Backups \
+             already created keep the old region in their stored ARN; see the upgrade \
+             manual on changing server.region."
+                .to_owned(),
+        ],
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::server_region_warning;
+
+    #[test]
+    fn a_region_the_backup_arn_parser_accepts_draws_no_warning() {
+        for region in ["us-east-1", "local", "eu-west-2", "a", "0-9"] {
+            assert!(server_region_warning(region).is_none(), "{region}");
+        }
+    }
+
+    #[test]
+    fn a_region_the_backup_arn_parser_refuses_is_warned_about_with_the_consequence() {
+        for region in [
+            "LOCAL",
+            "us_east_1",
+            "dev.local",
+            "",
+            "us east",
+            "Us-East-1",
+            "ü",
+        ] {
+            let warning = server_region_warning(region).unwrap_or_else(|| panic!("{region:?}"));
+            assert!(warning.title.contains("server.region"), "{region:?}");
+            assert!(warning.title.contains(&format!("{region:?}")), "{region:?}");
+            let text = warning.log_message();
+            assert!(
+                text.contains("Invalid Request: BackupArn is not valid"),
+                "{region:?}: {text}"
+            );
+            assert!(text.contains("DescribeBackup"), "{region:?}: {text}");
+            assert!(
+                text.contains("ListBackups refuses a cursor that is such an ARN"),
+                "{region:?}: {text}"
+            );
+            assert!(!text.contains("first page"), "{region:?}: {text}");
+            assert!(
+                text.contains("CreateBackup answers ValidationException naming server.region"),
+                "{region:?}: {text}"
+            );
+            // The warning agrees with the parser it speaks for.
+            let arn =
+                crate::util::backup_arn(region, "123456789012", "Music", "01489602797149-73d8d5bc");
+            assert!(crate::util::parse_backup_arn(&arn).is_none(), "{region:?}");
+        }
+        let arn = crate::util::backup_arn(
+            "us-east-1",
+            "123456789012",
+            "Music",
+            "01489602797149-73d8d5bc",
+        );
+        assert!(crate::util::parse_backup_arn(&arn).is_some());
     }
 }
 

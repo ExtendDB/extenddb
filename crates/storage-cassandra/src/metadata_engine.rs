@@ -3,6 +3,8 @@
 
 //! `MetadataEngine` trait implementation for `CassandraEngine`.
 
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_core::types::{Item, Tag, TimeToLiveDescription, TimeToLiveStatus};
 use extenddb_storage::MetadataEngine;
@@ -50,9 +52,7 @@ impl CassandraEngine {
         let epoch_before = self
             .ttl_config_cache_epoch
             .load(std::sync::atomic::Ordering::Acquire);
-        let config = self
-            .ttl_config_for_table_at(account_id, table_name, false)
-            .await?;
+        let config = self.read_ttl_config(account_id, table_name).await?;
         let mut cache = self
             .ttl_config_cache
             .lock()
@@ -83,27 +83,26 @@ impl CassandraEngine {
             .remove(&(account_id.to_owned(), table_name.to_owned()));
     }
 
-    /// Read TTL configuration at `LOCAL_QUORUM` for an authoritative absence
-    /// decision. Durable repair records must not be discharged from a stale
-    /// replica that still reports TTL disabled or an old generation.
+    /// Read TTL configuration from the catalog, not from the cache that
+    /// [`Self::ttl_config_for_table`] serves, for an authoritative absence
+    /// decision. Durable repair records must not be discharged from a cached
+    /// value that still reports TTL disabled or an old generation.
     pub(crate) async fn ttl_config_for_table_quorum(
         &self,
         account_id: &str,
         table_name: &str,
     ) -> Result<Option<crate::data::ttl::TtlConfig>, StorageError> {
-        self.ttl_config_for_table_at(account_id, table_name, true)
-            .await
+        self.read_ttl_config(account_id, table_name).await
     }
 
-    /// One implementation for both consistencies, so the legacy null-generation
-    /// adoption cannot drift between them. An applied adoption LWT is already
-    /// authoritative (Paxos), so no re-read is needed in that arm at either
-    /// consistency; a lost adoption race re-reads to pick up the winner.
-    async fn ttl_config_for_table_at(
+    /// The catalog read behind both TTL configuration reads, so the legacy
+    /// null-generation adoption cannot drift between them. An applied
+    /// adoption LWT is already authoritative (Paxos), so no re-read is needed
+    /// in that arm; a lost adoption race re-reads to pick up the winner.
+    async fn read_ttl_config(
         &self,
         account_id: &str,
         table_name: &str,
-        quorum: bool,
     ) -> Result<Option<crate::data::ttl::TtlConfig>, StorageError> {
         let query = format!(
             "SELECT ttl_attribute, ttl_generation FROM {}.tables \
@@ -113,23 +112,13 @@ impl CassandraEngine {
         let read = |context: &'static str| {
             let query = query.clone();
             async move {
-                let rows = if quorum {
-                    crate::cassandra_util::query_rows_quorum(
-                        &self.session,
-                        &query,
-                        cdrs_tokio::query_values!(account_id, table_name),
-                        context,
-                    )
-                    .await?
-                } else {
-                    crate::cassandra_util::query_rows(
-                        &self.session,
-                        &query,
-                        cdrs_tokio::query_values!(account_id, table_name),
-                        context,
-                    )
-                    .await?
-                };
+                let rows = crate::cassandra_util::query_rows(
+                    &self.session,
+                    &query,
+                    cdrs_tokio::query_values!(account_id, table_name),
+                    context,
+                )
+                .await?;
                 Ok::<_, StorageError>(rows.into_iter().next())
             }
         };
@@ -646,7 +635,7 @@ impl CassandraEngine {
                     {
                         Ok(true) => {
                             repaired += 1;
-                            metrics.record_ttl_audit_repair(table_name);
+                            metrics.record_ttl_audit_repair(account_id, table_name);
                         }
                         Ok(false) => {}
                         // Claimed work owns this key right now; skip rather
@@ -972,17 +961,21 @@ impl MetadataEngine for CassandraEngine {
                     &self.catalog_keyspace(),
                 )
                 .await?;
-                let default_delay = self
-                    .gsi_default_delay_ms
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                if indexes.iter().any(|index| {
-                    index.index_type == "GSI"
-                        && crate::data::index::effective_delay(index, default_delay) != 0
+                // Live, so a `settings set` made just before this request
+                // decides the refusal; no read when no GSI follows the
+                // system setting.
+                let default_delay = self.system_index_delay(&indexes).await;
+                if let Some((index_name, delay)) = indexes.iter().find_map(|index| {
+                    let delay = crate::data::index::effective_delay(index, default_delay);
+                    (index.index_type == "GSI" && delay != 0)
+                        .then_some((index.index_name.as_str(), delay))
                 }) {
-                    return Err(StorageError::Validation(
-                        "TTL is not supported while a table has asynchronously propagated GSIs"
-                            .to_owned(),
-                    ));
+                    // A refusal of the request, not a fault.
+                    return Err(StorageError::Validation(async_gsi_ttl_refusal(
+                        &table_name,
+                        index_name,
+                        delay,
+                    )));
                 }
             }
 
@@ -1103,7 +1096,8 @@ impl MetadataEngine for CassandraEngine {
                     "INSERT INTO {catalog}.tags (resource_arn, tag_key, tag_value) VALUES (?, ?, ?)"
                 );
                 self.session_arc()
-                    .query_with_values(
+                    .run(
+                        Stmt::Write,
                         &query,
                         cdrs_tokio::query_values!(
                             arn.as_str(),
@@ -1134,7 +1128,8 @@ impl MetadataEngine for CassandraEngine {
                 let query =
                     format!("DELETE FROM {catalog}.tags WHERE resource_arn = ? AND tag_key = ?");
                 self.session_arc()
-                    .query_with_values(
+                    .run(
+                        Stmt::Write,
                         &query,
                         cdrs_tokio::query_values!(arn.as_str(), key.as_str()),
                     )
@@ -1156,7 +1151,7 @@ impl MetadataEngine for CassandraEngine {
                 format!("SELECT tag_key, tag_value FROM {catalog}.tags WHERE resource_arn = ?");
             let result = self
                 .session_arc()
-                .query_with_values(&query, cdrs_tokio::query_values!(arn.as_str()))
+                .run(Stmt::Read, &query, cdrs_tokio::query_values!(arn.as_str()))
                 .await
                 .map_err(|e| {
                     tracing::error!("list_tags: {e}");
@@ -1519,4 +1514,33 @@ fn metadata_lwt_applied(result: &cdrs_tokio::frame::Envelope) -> Result<bool, St
     };
     row.get_r_by_name("[applied]")
         .map_err(|error| StorageError::Internal(format!("Parse TTL metadata result: {error}")))
+}
+
+/// The refusal of a TTL enable on a table with an asynchronously propagated
+/// GSI: the expiration queue cannot keep such an index consistent (ADR-0010).
+/// Names the first such index and its effective delay; with the default
+/// `index_propagation_delay_ms` (10 ms) every GSI that sets no delay of its
+/// own is asynchronous.
+fn async_gsi_ttl_refusal(table_name: &str, index_name: &str, delay_ms: u64) -> String {
+    format!(
+        "Time to Live cannot be enabled on table {table_name}: the Cassandra backend does not \
+         support TTL on a table with an asynchronously propagated global secondary index, and \
+         index {index_name} propagates after {delay_ms} ms (an index that sets no delay of its \
+         own uses the index_propagation_delay_ms setting)"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_async_gsi_ttl_refusal_names_the_table_index_and_delay() {
+        let msg = super::async_gsi_ttl_refusal("Music", "by_artist", 10);
+        assert_eq!(
+            msg,
+            "Time to Live cannot be enabled on table Music: the Cassandra backend does not \
+             support TTL on a table with an asynchronously propagated global secondary index, \
+             and index by_artist propagates after 10 ms (an index that sets no delay of its own \
+             uses the index_propagation_delay_ms setting)"
+        );
+    }
 }

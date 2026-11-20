@@ -1,0 +1,89 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Builds the Cassandra-backed image and runs ci/smoke-test-cassandra-container.sh
+# against it, on both release architectures, whenever a pull request touches
+# the image, its reference stack or the smoke test.
+#
+# release-image.yml runs the same script against the tagged commit, but only at
+# release. A script or stack that fails there, on ubuntu-24.04-arm in
+# particular, leaves that tag without a Cassandra image and needs a new tag to
+# fix. This runs the same thing on the pull request that changes it, in the
+# script's build mode (the image built by the script), so a release dispatch
+# meets a script that has already passed on both runners. Nothing here is
+# published or needs credentials.
+
+name: Cassandra image smoke
+
+on:
+  pull_request:
+    paths:
+      - 'Dockerfile.cassandra'
+      - 'docker-compose.cassandra.yml'
+      - 'ci/smoke-test-cassandra-container.sh'
+      - '.github/workflows/smoke-cassandra-image.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Pinned AWS CLI for runners that lack it (the smoke test needs `aws`), as
+  # in release-image.yml.
+  AWSCLI_VERSION: 2.31.6
+  AWSCLI_SHA256_X86_64: 45fdcc3003056b3e85c23776636e74208dc2fc16f26278acdbe8eafe3d4e752b
+  AWSCLI_SHA256_AARCH64: 517dec4ce83fabe7ace6164bb6189cdb686ef816332ccf83e81999e3fb57cad5
+
+jobs:
+  smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm      # native arm64, no qemu
+    name: smoke (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60          # a hung Rust build must not burn the 6h default
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Ensure smoke-test prerequisites
+        # The AWS CLI is not guaranteed on every runner image. Install is
+        # pinned to an exact version and verified against a recorded
+        # checksum: never execute a mutable unverified download.
+        run: |
+          set -euo pipefail
+          if ! command -v aws >/dev/null 2>&1; then
+            case "$(uname -m)" in
+              x86_64)  EXPECTED="$AWSCLI_SHA256_X86_64";  PKG="awscli-exe-linux-x86_64-${AWSCLI_VERSION}.zip" ;;
+              aarch64) EXPECTED="$AWSCLI_SHA256_AARCH64"; PKG="awscli-exe-linux-aarch64-${AWSCLI_VERSION}.zip" ;;
+              *) echo "::error::unsupported architecture $(uname -m)"; exit 1 ;;
+            esac
+            curl -fsSL "https://awscli.amazonaws.com/${PKG}" -o /tmp/awscli.zip
+            echo "${EXPECTED}  /tmp/awscli.zip" | sha256sum -c - \
+              || { echo "::error::AWS CLI download failed checksum verification"; exit 1; }
+            unzip -q /tmp/awscli.zip -d /tmp
+            sudo /tmp/aws/install
+          fi
+          for c in docker aws python3 timeout; do
+            command -v "$c" >/dev/null || { echo "::error::missing $c"; exit 1; }
+          done
+          docker compose version
+
+      - name: Build the image and run the smoke test
+        # Build mode: the script builds the image with `docker build` from
+        # this checkout, then starts the reference stack against it and
+        # removes the image afterwards.
+        env:
+          VCS_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: ci/smoke-test-cassandra-container.sh
