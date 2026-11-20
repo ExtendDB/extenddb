@@ -62,6 +62,9 @@ mod tests {
             deletion_protection_enabled: None,
             table_class: None,
             warm_throughput: None,
+            resource_policy: None,
+            global_table_settings_replication_mode: None,
+            global_table_source_arn: None,
         };
 
         engine

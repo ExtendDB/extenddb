@@ -515,6 +515,9 @@ async fn test_ttl_sweep_emits_service_remove_stream_record() {
                 table_class: None,
                 deletion_protection_enabled: None,
                 warm_throughput: None,
+                resource_policy: None,
+                global_table_settings_replication_mode: None,
+                global_table_source_arn: None,
             },
         )
         .await
@@ -3155,6 +3158,11 @@ async fn test_ttl_enabled_table_rejects_new_async_gsi() {
                 vector_index_updates: None,
                 warm_throughput: None,
                 sse_specification: None,
+                replica_updates: None,
+                multi_region_consistency: None,
+                global_table_witness_updates: None,
+                global_table_settings_replication_mode: None,
+                disassociation_protection_enabled: None,
             },
         )
         .await;

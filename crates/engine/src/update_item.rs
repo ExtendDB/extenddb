@@ -69,7 +69,8 @@ pub(crate) async fn handle_update_item_with(
             clause: crate::EnumClause::Named("returnConsumedCapacity"),
         }],
     )?;
-    let input: UpdateItemInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
+    let input: UpdateItemInput =
+        crate::read_input(body, &["TableName", "Key"], crate::deserialize_error)?;
 
     extenddb_core::validation::validate_table_name(&input.table_name, &ctx.limits)?;
     // A number the service cannot read in the key comes next, ahead of the

@@ -73,7 +73,7 @@ pub async fn handle_query(
             clause: crate::EnumClause::Named("select"),
         }],
     )?;
-    let input: QueryInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
+    let input: QueryInput = crate::read_input(body, &["TableName"], crate::deserialize_error)?;
 
     // P118: Fetch key_info first so we can use table_id for index lookup.
     let key_info = ctx

@@ -34,7 +34,8 @@ pub async fn handle_get_item(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
-    let input: GetItemInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
+    let input: GetItemInput =
+        crate::read_input(body, &["TableName", "Key"], crate::deserialize_error)?;
 
     // A number the service cannot read in the key is reported ahead of the
     // projection checks, the table lookup and the key schema checks

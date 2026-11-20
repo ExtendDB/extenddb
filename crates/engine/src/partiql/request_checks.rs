@@ -54,9 +54,6 @@ const MAX_PARTS: usize = 10;
 /// The constraint an empty statement or list fails.
 const AT_LEAST_ONE: &str = "Member must have length greater than or equal to 1";
 
-/// The constraint a member the request does not carry fails.
-const NOT_NULL: &str = "Member must not be null";
-
 /// The values of `ReturnValuesOnConditionCheckFailure`, as the service lists
 /// them.
 const ON_FAILURE_VALUES: &[&str] = &["ALL_OLD", "NONE"];
@@ -178,9 +175,7 @@ impl Found {
 
     /// A member the request does not carry.
     fn null(&mut self, path: &str) {
-        self.0.push(format!(
-            "Value null at '{path}' failed to satisfy constraint: {NOT_NULL}"
-        ));
+        self.0.push(crate::null_clause(path));
     }
 
     /// A token of 1 to `max` code points.
