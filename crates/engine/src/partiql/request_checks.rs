@@ -47,9 +47,7 @@ const MAX_CLIENT_REQUEST_TOKEN: usize = 36;
 /// The longest `NextToken`, in code points.
 const MAX_NEXT_TOKEN: usize = 32768;
 
-/// The most failed constraints one refusal lists; its count then says 10 too
-/// (measured 2026-11-02).
-const MAX_PARTS: usize = 10;
+use crate::request_limits::MAX_PARTS;
 
 /// The constraint an empty statement or list fails.
 const AT_LEAST_ONE: &str = "Member must have length greater than or equal to 1";
