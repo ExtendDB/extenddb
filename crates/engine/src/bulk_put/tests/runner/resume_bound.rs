@@ -40,13 +40,22 @@ async fn stall(h: &Harness, op: &str, claims: usize) {
 }
 
 /// The claim that spends the bound: the first claim and nine resumes ran,
-/// so this is the tenth resume without progress.
+/// so this is the tenth resume without progress. It ends the operation
+/// before it loads the rows the ledger holds past the checkpoint, which a
+/// claim within the bound loads first.
 async fn spend_the_bound(h: &Harness) {
     let record = h.claim("runner-last", Duration::from_millis(100)).await;
-    let deps = h.deps("runner-last", window());
+    let faulting = FaultingStorage::new(&h.storage);
+    let reads = Arc::clone(&faulting.recorded_reads);
+    let deps = h.deps_with_storage("runner-last", window(), Arc::new(faulting));
     runner::run(&deps, record)
         .await
         .expect("the run that ends the operation returns cleanly");
+    assert_eq!(
+        *reads.lock().unwrap(),
+        Vec::<usize>::new(),
+        "the bound ends the operation before the ledger is read"
+    );
 }
 
 async fn stalled_operation(h: &Harness) -> String {
