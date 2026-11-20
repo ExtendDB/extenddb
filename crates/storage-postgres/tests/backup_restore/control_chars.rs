@@ -1,6 +1,8 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use futures::StreamExt;
+
 use super::*;
 
 /// Every stored row of one physical table, each as the JSON text of the
@@ -18,10 +20,11 @@ async fn stored_rows(s: &Scratch, physical_id: &str) -> Vec<String> {
 
 /// Items holding U+0000 and U+0001 in key values, index key values, nested
 /// values, and attribute names are stored through the control-character
-/// escape. A restore copies `backup_items` text into the target as it is and
-/// derives the key columns and index rows from it, so those must come out in
-/// the same stored form as the source's (escaped once, not twice), and the
-/// restored items must read back equal to what was written.
+/// escape. The legacy reader decodes the backup's items, and a restore
+/// copies `backup_items` text into the target as it is and derives the key
+/// columns and index rows from it, so those must come out in the same stored
+/// form as the source's (escaped once, not twice), and the restored items
+/// must read back equal to what was written.
 #[tokio::test]
 async fn restore_keeps_control_characters_in_keys_indexes_and_items() {
     if base_conn().is_none() {
@@ -87,6 +90,25 @@ async fn restore_keeps_control_characters_in_keys_indexes_and_items() {
         .create(ACCOUNT, "nul_src", "b", JobPermit::detached())
         .await
         .expect("backup");
+
+    // The legacy reader, which carries an in-catalog backup into a store,
+    // reads the items back as written.
+    let text = |item: &Item| serde_json::to_string(item).expect("item text");
+    let mut written: Vec<String> = items.iter().map(text).collect();
+    written.sort();
+    let opened = s
+        .engine
+        .items(ACCOUNT, &backup.backup_arn)
+        .await
+        .expect("open the legacy reader");
+    let mut read: Vec<String> = opened
+        .items
+        .map(|item| text(&item.expect("an item")))
+        .collect()
+        .await;
+    read.sort();
+    assert_eq!(read, written);
+
     let desc = restore(&s, "nul_dst", &backup.backup_arn)
         .await
         .expect("restore");

@@ -46,8 +46,8 @@ use futures::stream::BoxStream;
 use crate::PostgresEngine;
 use crate::backup_engine::{RestoreTarget, RowInsertError, insert_restore_rows};
 use crate::catalog_json::from_catalog_json;
-use crate::data::{data_table_name, item_to_json};
 use crate::data::vector_index::{VectorInsertPlan, fetch_vector_indexes_for_table};
+use crate::data::{data_table_name, item_to_json};
 
 fn db_err(e: sqlx::Error) -> StorageError {
     StorageError::Internal(format!("Database error: {e}"))
