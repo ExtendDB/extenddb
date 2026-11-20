@@ -288,6 +288,77 @@ ListStreams, DescribeStream, GetShardIterator, GetRecords
 ### Other
 UpdateTimeToLive, DescribeTimeToLive, TagResource, UntagResource, ListTagsOfResource, ImportTable, ExportTableToPointInTime
 
+## Experimental: WebAssembly build
+
+The `extenddb-wasm-adapter` crate compiles the engine to `wasm32-unknown-unknown`
+so it runs in a web browser over an in-memory SQLite database, with no server
+and no network. JavaScript constructs an engine and submits a DynamoDB request
+through a direct in-process call (`ExtendDb.create()` / `submit(operation, body)`),
+and gets the DynamoDB-shaped response back.
+
+This build is **experimental** and **outside the [versioning and support
+policy](docs/versioning.md)**: its surface may change or be removed in any
+release, and it is not covered by the compatibility guarantees the server
+backends carry. It is an internal crate (`publish = false`) and is not released
+to crates.io.
+
+### What it does not do
+
+- **No authentication and no authorization.** It verifies no signature and runs
+  no IAM policy evaluation; every request runs under the placeholder account
+  `000000000000`. Do not put data in it you would not put in client-side
+  browser memory.
+- **Memory-only storage.** The database lives in wasm linear memory and is gone
+  when the page unloads. There is no persistence, no file, and no import/export.
+- **No background tasks.** The build runs no background workers, so: an item
+  past its time-to-live is still returned (TTL never deletes it); `ItemCount`
+  and `TableSizeBytes` stay `0`; and stream records are never trimmed.
+
+### What it refuses
+
+Operations that need a facility the in-browser build lacks return a
+`ValidationException` (HTTP 400, which an SDK does not retry), with a message
+that names the build:
+
+- The store-backed backup, restore and point-in-time operations — `CreateBackup`,
+  `DescribeBackup`, `DeleteBackup`, `RestoreTableFromBackup`,
+  `RestoreTableToPointInTime` — "… the browser build runs entirely in memory with
+  no backup store."
+- The PartiQL operations — `ExecuteStatement`, `BatchExecuteStatement`,
+  `ExecuteTransaction` — "… the PartiQL surface is not part of the browser build."
+- An `UpdateTable` that creates a vector index — "… it cannot build a vector
+  index; create the table with its vector indexes instead." The refusal lands
+  before any catalog write, so the table is unchanged and the instance keeps
+  serving.
+
+Operations that a server with no backup store and no import/export paths also
+answers without a store return that same answer here: `ListBackups` is empty,
+`DescribeContinuousBackups` reports point-in-time recovery `DISABLED`, enabling
+it with `UpdateContinuousBackups` returns `ContinuousBackupsUnavailableException`,
+and `ImportTable` / `ExportTableToPointInTime` return the service's "disabled"
+`ValidationException`.
+
+A wasm trap is permanent: the build uses `panic = "abort"`, so a panic aborts
+the instance, leaves the pending `submit` promise unresolved, and requires
+reloading the page to recover.
+
+### Building it
+
+The module is built with [`wasm-pack`](https://rustwasm.github.io/wasm-pack/):
+
+```bash
+wasm-pack build --target web --release crates/wasm-adapter
+```
+
+Building requires a C compiler that targets `wasm32`: the embedded SQLite is
+compiled from C by the `sqlite-wasm-rs` dependency, so a `clang` with a wasm32
+target must be on `PATH`, or the build stops in that crate's build script. The
+getrandom wasm backend is selected by a rustflag set in
+[`.cargo/config.toml`](.cargo/config.toml).
+
+The emitted module is about 6.6 MiB after `wasm-bindgen`; `wasm-pack --release`
+runs `wasm-opt`, which brings it to about 4.9 MiB.
+
 ## Project Structure
 
 ```
@@ -302,6 +373,7 @@ crates/
   storage-mongodb/    — MongoDB backend
   storage-postgres/   — PostgreSQL backend (default/reference)
   storage-sqlite/     — SQLite backend (embedded)
+  wasm-adapter/       — experimental WebAssembly build (see below; publish = false)
 
 
 docs/

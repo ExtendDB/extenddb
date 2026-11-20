@@ -40,7 +40,8 @@ extenddb/
 │   ├── storage-cassandra/ # Cassandra implementation (experimental; feature flag)
 │   ├── storage-mongodb/  # MongoDB implementation (feature flag)
 │   ├── storage-postgres/ # PostgreSQL implementation (default/reference)
-│   └── storage-sqlite/   # SQLite implementation (dev, CI, and embedded use)
+│   ├── storage-sqlite/   # SQLite implementation (dev, CI, and embedded use)
+│   └── wasm-adapter/     # Experimental WebAssembly build (publish = false)
 ├── tests/                # Python integration tests (pytest)
 ├── docs/
 │   ├── design/           # Architecture and component design docs
