@@ -8,10 +8,11 @@
 use super::source_faults::{ActAtSource, LineAction};
 use super::*;
 
-const LEASE: Duration = Duration::from_millis(300);
+const LEASE: Duration = Duration::from_secs(1);
 
-/// Longer than one lease, so every write spans at least one renewal.
-const SLOW: Duration = Duration::from_millis(800);
+/// Over two leases, so the renewals, a third of the lease apart, run
+/// during every write.
+const SLOW: Duration = Duration::from_millis(2500);
 
 /// The filesystem sink with every report page write and the manifest
 /// write answering after `SLOW`.
@@ -103,29 +104,38 @@ async fn run_with(during: During) -> (Harness, String) {
     let record = h.claim("runner-1", LEASE).await;
     let storage = Arc::clone(&h.storage);
     let acted_on = op.clone();
+    // The action's store call runs on its own task. While the read that
+    // awaits the action waits, the runner may run a boundary without
+    // polling the read (`wait::keeping_lease`). On SQLite a cancel and a
+    // table delete hold the write lock across their statements, and the
+    // boundary's writes wait for that lock.
     let action: LineAction = Arc::new(move || {
         let storage = Arc::clone(&storage);
         let op = acted_on.clone();
         Box::pin(async move {
-            match during {
-                During::Cancel => {
-                    storage
-                        .request_cancel(ACCOUNT, &op)
-                        .await
-                        .expect("request cancel");
+            tokio::spawn(async move {
+                match during {
+                    During::Cancel => {
+                        storage
+                            .request_cancel(ACCOUNT, &op)
+                            .await
+                            .expect("request cancel");
+                    }
+                    During::DeleteTable => {
+                        storage
+                            .delete_table(
+                                ACCOUNT,
+                                DeleteTableInput {
+                                    table_name: TABLE.to_owned(),
+                                },
+                            )
+                            .await
+                            .expect("delete table");
+                    }
                 }
-                During::DeleteTable => {
-                    storage
-                        .delete_table(
-                            ACCOUNT,
-                            DeleteTableInput {
-                                table_name: TABLE.to_owned(),
-                            },
-                        )
-                        .await
-                        .expect("delete table");
-                }
-            }
+            })
+            .await
+            .expect("the action task ends");
         })
     });
     let source = Arc::new(ActAtSource {
@@ -140,7 +150,7 @@ async fn run_with(during: During) -> (Harness, String) {
     cfg.batch_size = 5;
     let sink = Arc::new(SlowSink { inner: h.fs_sink() });
     let deps = h.deps_with("runner-1", cfg, source, sink);
-    tokio::time::timeout(Duration::from_secs(20), runner::run(&deps, record))
+    tokio::time::timeout(Duration::from_secs(60), runner::run(&deps, record))
         .await
         .expect("the run ends")
         .expect("runner run");

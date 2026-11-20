@@ -570,26 +570,26 @@ async fn a_gsi_key_change_on_overwrite_charges_delete_plus_insert() {
 // existing drop test stalls 250 ms against a 100 ms lease, which a deadline
 // of up to two leases (200 ms) also passes, so it does not pin the
 // arithmetic. This one sits the stall between one lease and two: lease
-// 200 ms, stall 300 ms. With the one-lease deadline the flush after the
-// stall finds it passed and drops the staged rows; a two-lease deadline
-// (400 ms) would not have passed and the rows would be written.
+// 1 s, stall 1.5 s. With the one-lease deadline the flush after the stall
+// finds it passed and drops the staged rows; a two-lease deadline (2 s)
+// would not have passed and the rows would be written.
 #[tokio::test]
 async fn the_lease_fence_deadline_is_one_lease_not_two() {
     let h = Harness::new().await;
     h.write_input("part-000.json", &file_of(&plain_rows(26)));
     let files = h.enumerate().await;
     let op = h.start(files, input_config(false), both_reports()).await;
-    let record = h.claim("runner-1", Duration::from_millis(200)).await;
+    let record = h.claim("runner-1", Duration::from_secs(1)).await;
 
     // Just before line 13 is handed (after the checkpoint at row 10 renewed
     // the lease and rows 10 onward are staging), freeze the whole runner for
-    // 300 ms: longer than one lease, shorter than two.
+    // 1.5 s: longer than one lease, shorter than two.
     let (wait, frozen, resume) = Wait::freeze();
     let source = Arc::new(WaitSource::at_line(h.fs_source(), 13, wait));
     let mut cfg = config();
     cfg.batch_size = 5;
     cfg.write_batch_rows = 5;
-    cfg.lease = Duration::from_millis(200);
+    cfg.lease = Duration::from_secs(1);
     let deps = h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink()));
     let run = runner::run(&deps, record);
     tokio::pin!(run);
@@ -597,7 +597,7 @@ async fn the_lease_fence_deadline_is_one_lease_not_two() {
         _ = &mut run => panic!("runner-1 must reach the freeze"),
         () = frozen.notified() => {}
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
     resume.notify_one();
     run.await
         .expect("a lapsed lease is a clean stop, not an error");

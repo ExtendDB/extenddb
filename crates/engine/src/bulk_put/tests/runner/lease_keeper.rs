@@ -9,7 +9,9 @@ use tokio::sync::Notify;
 // answer is retried for up to 120 seconds against a 60-second lease. While a
 // call waits, the runner runs a boundary every third of the lease, so the
 // lease is kept, the rows read before the call are written, and a cancel is
-// seen. These tests use a 300 ms lease and calls that wait over a second.
+// seen. These tests use a 1-second lease and calls that wait four seconds
+// or never answer. With a 300 ms lease a loaded host could stall the runner
+// past its own lease between two boundaries.
 
 /// What a `WaitSource` does at its chosen point.
 #[derive(Clone)]
@@ -197,9 +199,9 @@ impl LineReader for WaitReader {
     }
 }
 
-const LEASE: Duration = Duration::from_millis(300);
+const LEASE: Duration = Duration::from_secs(1);
 
-/// A run with one file of 12 rows, a 300 ms lease, and no write batch or
+/// A run with one file of 12 rows, a 1-second lease, and no write batch or
 /// checkpoint due inside the file, so the only boundary while a call waits
 /// is the one the wait itself runs.
 async fn twelve_rows(h: &Harness) -> (String, BulkOperationRecord, RunnerConfig) {
@@ -219,11 +221,11 @@ async fn a_read_that_waits_past_the_lease_keeps_it_and_writes_the_failure() {
     let h = Harness::new().await;
     let (op, record, cfg) = twelve_rows(&h).await;
     let wait = Wait::FailAfter {
-        hold: Duration::from_millis(1200),
+        hold: Duration::from_secs(4),
     };
     let source = Arc::new(WaitSource::at_line(h.fs_source(), 5, wait));
     let deps = h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink()));
-    tokio::time::timeout(Duration::from_secs(10), runner::run(&deps, record))
+    tokio::time::timeout(Duration::from_secs(30), runner::run(&deps, record))
         .await
         .expect("the run ends")
         .expect("runner run");
@@ -257,7 +259,7 @@ async fn a_cancel_is_seen_while_a_read_waits() {
         .request_cancel(ACCOUNT, &op)
         .await
         .expect("request cancel");
-    tokio::time::timeout(Duration::from_secs(5), &mut run)
+    tokio::time::timeout(Duration::from_secs(15), &mut run)
         .await
         .expect("the cancel is seen while the read waits")
         .expect("runner run");
@@ -291,7 +293,7 @@ async fn a_cancel_is_seen_while_an_open_waits() {
         .request_cancel(ACCOUNT, &op)
         .await
         .expect("request cancel");
-    tokio::time::timeout(Duration::from_secs(5), &mut run)
+    tokio::time::timeout(Duration::from_secs(15), &mut run)
         .await
         .expect("the cancel is seen while the open waits")
         .expect("runner run");
@@ -348,7 +350,7 @@ async fn a_cancel_is_seen_while_a_resumed_claim_reads_the_covered_rows_again() {
         .request_cancel(ACCOUNT, &op)
         .await
         .expect("request cancel");
-    tokio::time::timeout(Duration::from_secs(5), &mut run)
+    tokio::time::timeout(Duration::from_secs(15), &mut run)
         .await
         .expect("the cancel is seen while the covered rows are read again")
         .expect("runner run");
