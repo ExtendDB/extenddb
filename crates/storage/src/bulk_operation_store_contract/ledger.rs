@@ -1,8 +1,8 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! The row-outcome ledger: marked writes, condition failures, deletion scope, and
-//! a second write at a recorded position.
+//! The row-outcome ledger: marked batch rows, condition failures, deletion
+//! scope, and a second write at a recorded position.
 
 use super::*;
 
@@ -11,45 +11,42 @@ fn recorded_size(item: &Item) -> Option<i64> {
     Some(i64::try_from(extenddb_core::types::item_size_bytes(item)).expect("item size fits"))
 }
 
-/// A marked unconditional write commits the item and the Applied ledger row
-/// together, with the size of the item it replaced, and that item only when
-/// the marker asks to keep it.
+/// A marked plain row commits the item and the Applied ledger row together,
+/// with the size of the item it replaced, and that item only when the
+/// marker asks to keep it.
 pub async fn a_marked_write_records_applied_with_the_item<E: StorageEngine>(fx: &Fixture<E>) {
     let table = create_table(fx, &fx.account_a, "ledger_applied").await;
     let ki = key_info(fx, &table.table_name).await;
     let maps = ExpressionMaps::new(HashMap::new(), HashMap::new());
 
     fx.engine
-        .put_item(&ki, item("a", "before"), false, None, &maps, None, None)
+        .put_item(&ki, item("a", "before"), false, None, &maps, None)
         .await
         .expect("seed the replaced item");
+    take_over(fx, "op-1").await;
     fx.engine
-        .put_item(
+        .put_items_batch(
             &ki,
-            item("a", "1"),
-            false,
+            vec![marked("a", "1", marker(&fx.account_a, "op-1", 5))],
             None,
-            &maps,
-            None,
-            Some(&marker(&fx.account_a, "op-1", 5)),
         )
         .await
-        .expect("a marked put");
+        .expect("a marked batch");
     fx.engine
-        .put_item(
+        .put_items_batch(
             &ki,
-            item("a", "2"),
-            false,
+            vec![marked(
+                "a",
+                "2",
+                BulkRowMarker {
+                    keep_old: true,
+                    ..marker(&fx.account_a, "op-1", 6)
+                },
+            )],
             None,
-            &maps,
-            None,
-            Some(&BulkRowMarker {
-                keep_old: true,
-                ..marker(&fx.account_a, "op-1", 6)
-            }),
         )
         .await
-        .expect("a marked put that keeps the replaced item");
+        .expect("a marked batch that keeps the replaced item");
     let recorded: Vec<(i64, RowOutcome, Option<i64>, Option<Item>)> = fx
         .engine
         .bulk_rows_recorded(&fx.account_a, "op-1", 0, 0, i64::MAX)
@@ -95,9 +92,9 @@ pub async fn a_marked_write_records_applied_with_the_item<E: StorageEngine>(fx: 
     );
 }
 
-/// A marked conditional write whose condition fails records `ConditionFailed`,
-/// writes no item change, and records no Applied row: the marker's fate is
-/// tied to the write's.
+/// A marked conditional row whose condition fails records `ConditionFailed`
+/// with the item it was evaluated against, writes no item change, and
+/// records no Applied row.
 pub async fn a_marked_condition_failure_records_the_failure_and_writes_nothing<E: StorageEngine>(
     fx: &Fixture<E>,
 ) {
@@ -106,27 +103,28 @@ pub async fn a_marked_condition_failure_records_the_failure_and_writes_nothing<E
     let maps = ExpressionMaps::new(HashMap::new(), HashMap::new());
 
     fx.engine
-        .put_item(&ki, item("a", "before"), false, None, &maps, None, None)
+        .put_item(&ki, item("a", "before"), false, None, &maps, None)
         .await
         .expect("seed the target item");
 
-    let tokens = expression::tokenize("attribute_not_exists(pk)").expect("tokenize");
-    let condition = expression::parse_condition(&tokens).expect("parse the condition");
-    let result = fx
+    take_over(fx, "op-2").await;
+    let results = fx
         .engine
-        .put_item(
+        .put_items_batch(
             &ki,
-            item("a", "after"),
-            false,
-            Some(&condition),
-            &maps,
+            vec![marked_conditional(
+                "a",
+                "after",
+                "attribute_not_exists(pk)",
+                marker(&fx.account_a, "op-2", 9),
+            )],
             None,
-            Some(&marker(&fx.account_a, "op-2", 9)),
         )
-        .await;
+        .await
+        .expect("the batch applies");
     assert!(
-        matches!(result, Err(StorageError::ConditionFailed(_))),
-        "the condition must fail against the existing item"
+        matches!(results[..], [BatchRowResult::ConditionFailed { .. }]),
+        "the condition must fail against the existing item, got {results:?}"
     );
 
     let stored = fx
@@ -171,45 +169,25 @@ pub async fn a_marked_condition_failure_records_the_failure_and_writes_nothing<E
     );
 }
 
-/// A write with no marker leaves no ledger row.
-pub async fn unmarked_writes_leave_no_ledger_row<E: StorageEngine>(fx: &Fixture<E>) {
-    let table = create_table(fx, &fx.account_a, "ledger_unmarked").await;
-    let ki = key_info(fx, &table.table_name).await;
-    let maps = ExpressionMaps::new(HashMap::new(), HashMap::new());
-
-    fx.engine
-        .put_item(&ki, item("a", "1"), false, None, &maps, None, None)
-        .await
-        .expect("an unmarked put");
-    assert_eq!(
-        fx.engine
-            .bulk_row_outcome(&fx.account_a, "op-none", 0, 0)
-            .await
-            .expect("bulk_row_outcome"),
-        None
-    );
-}
-
 /// Deleting one operation's ledger rows leaves another operation's alone and
 /// reports how many went.
 pub async fn ledger_deletion_is_scoped_to_one_operation<E: StorageEngine>(fx: &Fixture<E>) {
     let table = create_table(fx, &fx.account_a, "ledger_scope").await;
     let ki = key_info(fx, &table.table_name).await;
-    let maps = ExpressionMaps::new(HashMap::new(), HashMap::new());
 
-    for (op, pk, row) in [("op-a", "a1", 1_i64), ("op-a", "a2", 2), ("op-b", "b1", 1)] {
+    for (op, rows) in [
+        ("op-a", vec![("a1", 1_i64), ("a2", 2)]),
+        ("op-b", vec![("b1", 1)]),
+    ] {
+        take_over(fx, op).await;
+        let batch = rows
+            .into_iter()
+            .map(|(pk, row)| marked(pk, "1", marker(&fx.account_a, op, row)))
+            .collect();
         fx.engine
-            .put_item(
-                &ki,
-                item(pk, "1"),
-                false,
-                None,
-                &maps,
-                None,
-                Some(&marker(&fx.account_a, op, row)),
-            )
+            .put_items_batch(&ki, batch, None)
             .await
-            .expect("a marked put");
+            .expect("a marked batch");
     }
 
     let deleted = fx
@@ -242,9 +220,10 @@ pub async fn ledger_deletion_is_scoped_to_one_operation<E: StorageEngine>(fx: &F
     );
 }
 
-/// A marked write at a position the ledger already records is refused and
-/// changes nothing: every applied row is recorded once, so a second outcome
-/// for one position means the row was sent after it was applied.
+/// A marked row at a position the ledger already records is refused and
+/// its batch changes nothing: every applied row is recorded once, so a
+/// second outcome for one position means the row was sent after it was
+/// applied.
 pub async fn a_marked_write_at_a_recorded_position_is_refused_and_changes_nothing<
     E: StorageEngine,
 >(
@@ -252,16 +231,16 @@ pub async fn a_marked_write_at_a_recorded_position_is_refused_and_changes_nothin
 ) {
     let table = create_table(fx, &fx.account_a, "ledger_recorded").await;
     let ki = key_info(fx, &table.table_name).await;
-    let maps = ExpressionMaps::new(HashMap::new(), HashMap::new());
     let m = marker(&fx.account_a, "op-recorded", 4);
+    take_over(fx, "op-recorded").await;
 
     fx.engine
-        .put_item(&ki, item("a", "first"), false, None, &maps, None, Some(&m))
+        .put_items_batch(&ki, vec![marked("a", "first", m.clone())], None)
         .await
-        .expect("the first marked put");
+        .expect("the first marked batch");
     let again = fx
         .engine
-        .put_item(&ki, item("a", "second"), false, None, &maps, None, Some(&m))
+        .put_items_batch(&ki, vec![marked("a", "second", m)], None)
         .await;
     assert!(
         again.is_err(),

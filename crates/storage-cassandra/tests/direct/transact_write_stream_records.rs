@@ -140,15 +140,7 @@ pub(crate) async fn one_stream_record_per_mutation(
     // only records in the table are the transaction's.
     for (id, val) in [("upd-1", "before"), ("del-1", "doomed")] {
         engine
-            .put_item(
-                &table.key_info,
-                item(id, val),
-                false,
-                None,
-                &maps,
-                None,
-                None,
-            )
+            .put_item(&table.key_info, item(id, val), false, None, &maps, None)
             .await
             .unwrap();
     }
@@ -394,7 +386,6 @@ async fn test_transact_write_condition_check_records_nothing() {
             None,
             &maps,
             None,
-            None,
         )
         .await
         .unwrap();
@@ -451,7 +442,6 @@ async fn test_cancelled_transaction_records_nothing() {
             false,
             None,
             &maps,
-            None,
             None,
         )
         .await

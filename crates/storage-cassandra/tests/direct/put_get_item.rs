@@ -33,7 +33,6 @@ async fn test_put_and_get_item_pk_only() {
             None,
             &Default::default(),
             None,
-            None,
         )
         .await
         .expect("Put failed");
@@ -79,7 +78,6 @@ async fn test_put_and_get_item_with_string_sk() {
             None,
             &Default::default(),
             None,
-            None,
         )
         .await
         .expect("Put failed");
@@ -124,7 +122,6 @@ async fn test_put_and_get_item_with_number_sk() {
             false,
             None,
             &Default::default(),
-            None,
             None,
         )
         .await
@@ -183,7 +180,6 @@ async fn test_put_and_get_item_with_decimal_sk() {
                 None,
                 &Default::default(),
                 None,
-                None,
             )
             .await
             .expect("put_item with decimal sort key should succeed");
@@ -241,7 +237,6 @@ async fn test_put_and_get_item_with_binary_sk() {
             None,
             &Default::default(),
             None,
-            None,
         )
         .await
         .expect("Put failed");
@@ -282,7 +277,6 @@ async fn test_put_item_update_existing() {
             None,
             &Default::default(),
             None,
-            None,
         )
         .await
         .expect("First put failed");
@@ -296,7 +290,6 @@ async fn test_put_item_update_existing() {
             false,
             None,
             &Default::default(),
-            None,
             None,
         )
         .await
@@ -365,7 +358,6 @@ async fn test_put_item_with_return_old() {
             None,
             &Default::default(),
             None,
-            None,
         )
         .await
         .expect("First put failed");
@@ -381,7 +373,6 @@ async fn test_put_item_with_return_old() {
             true,
             None,
             &Default::default(),
-            None,
             None,
         )
         .await
@@ -439,7 +430,6 @@ async fn test_put_item_with_sync_gsi() {
             false,
             None,
             &Default::default(),
-            None,
             None,
         )
         .await
@@ -514,7 +504,6 @@ async fn test_put_item_rejects_when_prepared_txn_id_set_pk_only() {
             None,
             &Default::default(),
             None,
-            None,
         )
         .await;
 
@@ -557,7 +546,6 @@ async fn test_put_item_rejects_when_prepared_txn_id_set_with_sk() {
             None,
             &Default::default(),
             None,
-            None,
         )
         .await;
 
@@ -589,7 +577,6 @@ async fn test_put_item_succeeds_when_prepared_txn_id_is_null() {
             None,
             &Default::default(),
             None,
-            None,
         )
         .await
         .expect("First put should succeed");
@@ -606,7 +593,6 @@ async fn test_put_item_succeeds_when_prepared_txn_id_is_null() {
             false,
             None,
             &Default::default(),
-            None,
             None,
         )
         .await

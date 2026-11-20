@@ -453,7 +453,7 @@ mod stream_clock_tests {
                 ("v".to_owned(), AttributeValue::S(v.to_owned())),
             ]);
             engine
-                .put_item(&key_info, item, false, None, &maps, Some(&capture), None)
+                .put_item(&key_info, item, false, None, &maps, Some(&capture))
                 .await
                 .expect("put");
         }

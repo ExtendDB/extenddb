@@ -259,7 +259,6 @@ contract_case!(
     // The row-outcome ledger.
     a_marked_write_records_applied_with_the_item,
     a_marked_condition_failure_records_the_failure_and_writes_nothing,
-    unmarked_writes_leave_no_ledger_row,
     ledger_deletion_is_scoped_to_one_operation,
     // Retention.
     purge_removes_only_terminal_operations_older_than_the_cutoff,

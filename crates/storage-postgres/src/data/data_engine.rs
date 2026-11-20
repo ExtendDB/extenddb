@@ -39,39 +39,22 @@ impl DataEngine for PostgresEngine {
         condition: Option<&Expr>,
         maps: &ExpressionMaps,
         stream: Option<&StreamCapture>,
-        marker: Option<&extenddb_storage::BulkRowMarker>,
     ) -> BoxFuture<'_, Result<Option<Item>, StorageError>> {
         let key_info = key_info.clone();
         let condition = condition.cloned();
         let maps = maps.clone();
         let stream = stream.cloned();
-        let marker = marker.cloned();
         Box::pin(async move {
-            let result = self
-                .put_item_impl(
-                    &key_info,
-                    item,
-                    return_old,
-                    condition.as_ref(),
-                    &maps,
-                    stream.as_ref(),
-                    marker.as_ref(),
-                )
-                .await
-                .map_err(|e| table_gone(e, &key_info.table_name));
-            // A failed condition writes nothing, so there is no write
-            // transaction for the marker to ride; it is recorded as its own
-            // transaction before the error returns, which is the order the
-            // spec's Durability and restart section fixes. The applied case
-            // is handled inside `put_item_impl`, in the write transaction.
-            match (result, marker) {
-                (Err(StorageError::ConditionFailed(old)), Some(m)) => {
-                    self.record_condition_failed_outcome(&m, old.as_ref())
-                        .await?;
-                    Err(StorageError::ConditionFailed(old))
-                }
-                (result, _) => result,
-            }
+            self.put_item_impl(
+                &key_info,
+                item,
+                return_old,
+                condition.as_ref(),
+                &maps,
+                stream.as_ref(),
+            )
+            .await
+            .map_err(|e| table_gone(e, &key_info.table_name))
         })
     }
 

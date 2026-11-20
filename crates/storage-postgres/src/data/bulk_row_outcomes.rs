@@ -119,17 +119,6 @@ pub(crate) async fn insert_outcomes_in_tx(
     Ok(())
 }
 
-/// Insert one ledger row inside an open transaction, for a single write
-/// that carries a marker outside a batch.
-pub(crate) async fn insert_outcome_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    marker: &BulkRowMarker,
-    outcome: RowOutcome,
-    old: Option<&Item>,
-) -> Result<(), StorageError> {
-    insert_outcomes_in_tx(tx, &[LedgerRow::new(marker, outcome, old)?]).await
-}
-
 /// The batch-level ledger work, before any row is written: bound the
 /// transaction's idle time, lock the operation's owner row and refuse the
 /// batch unless `marker.owner` is the owner it names, then delete the
@@ -187,24 +176,6 @@ fn parse_outcome(outcome: &str) -> Result<RowOutcome, StorageError> {
 }
 
 impl PostgresEngine {
-    /// Record a failed condition on the single-row path as its own
-    /// single-statement transaction: a failed condition writes nothing
-    /// else, so there is no write transaction for the outcome to ride.
-    pub(crate) async fn record_condition_failed_outcome(
-        &self,
-        marker: &BulkRowMarker,
-        old: Option<&Item>,
-    ) -> Result<(), StorageError> {
-        let mut tx = self
-            .data_pool
-            .begin()
-            .await
-            .map_err(crate::data::index::db_error)?;
-        insert_outcome_in_tx(&mut tx, marker, RowOutcome::ConditionFailed, old).await?;
-        tx.commit().await.map_err(crate::data::index::db_error)?;
-        Ok(())
-    }
-
     /// Implementation of `DataEngine::bulk_row_outcome`.
     pub(crate) async fn bulk_row_outcome_impl(
         &self,

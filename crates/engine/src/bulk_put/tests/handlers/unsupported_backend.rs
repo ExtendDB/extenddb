@@ -19,11 +19,11 @@ use extenddb_core::types::{
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{
     BoxedFuture as BoxFuture, BulkOperationListResult, BulkOperationRecord, BulkOperationStore,
-    BulkRowMarker, CancelOutcome, DataEngine, FinishState, IdempotencyKey, InputFile,
-    ItemPairResult, LeaseState, ListCursor, MetadataEngine, NewBulkOperation, Progress,
-    QueryResult, ReportKind, ReportRecord, RowOutcome, StartOutcome, StorageEngine, StreamCapture,
-    StreamEngine, StreamListResult, StreamRecordsResult, TableEngine, Terminal, TransactGetOp,
-    TransactWriteOp, TtlTableInfo, WorkerStore,
+    CancelOutcome, DataEngine, FinishState, IdempotencyKey, InputFile, ItemPairResult, LeaseState,
+    ListCursor, MetadataEngine, NewBulkOperation, Progress, QueryResult, ReportKind, ReportRecord,
+    RowOutcome, StartOutcome, StorageEngine, StreamCapture, StreamEngine, StreamListResult,
+    StreamRecordsResult, TableEngine, Terminal, TransactGetOp, TransactWriteOp, TtlTableInfo,
+    WorkerStore,
 };
 
 /// The refusal message both unsupported backends answer. A toggle lets
@@ -136,7 +136,6 @@ impl DataEngine for BulkUnsupportedStorage {
         _condition: Option<&Expr>,
         _maps: &ExpressionMaps,
         _stream: Option<&StreamCapture>,
-        _marker: Option<&BulkRowMarker>,
     ) -> BoxFuture<'_, Result<Option<Item>, StorageError>> {
         unimplemented!()
     }

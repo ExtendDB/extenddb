@@ -32,8 +32,8 @@ use extenddb_storage::error::StorageError;
 use extenddb_storage::server_components::ServerComponentsOptions;
 use extenddb_storage::{
     BoxedFuture as BoxFuture, BulkOperationListResult, BulkOperationRecord, BulkOperationStore,
-    BulkRowMarker, CancelOutcome, CancellationToken, DataEngine, FinishState, IdempotencyKey,
-    InputFile, ItemPairResult, LeaseState, ListCursor, MetadataEngine, NewBulkOperation, Progress,
+    CancelOutcome, CancellationToken, DataEngine, FinishState, IdempotencyKey, InputFile,
+    ItemPairResult, LeaseState, ListCursor, MetadataEngine, NewBulkOperation, Progress,
     QueryResult, ReportKind, ReportRecord, RowOutcome, StartOutcome, StorageEngine, StreamCapture,
     StreamEngine, StreamListResult, StreamRecordsResult, TableEngine, Terminal, TransactGetOp,
     TransactWriteOp, TtlTableInfo, WorkerStore,

@@ -15,7 +15,7 @@ use extenddb_core::types::{
     item_size_bytes,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{BulkRowMarker, StorageEngine, StreamCapture};
+use extenddb_storage::{StorageEngine, StreamCapture};
 
 use crate::expression_helpers::resolve_condition;
 use crate::stream_capture;
@@ -201,16 +201,13 @@ pub(crate) fn stream_capture_for(
 /// Apply one put to storage the way `handle_put_item` does: the stream
 /// capture is built from the table's stream specification and the region,
 /// with no user identity, and inserted in the same transaction as the data
-/// write; the bulk row marker is passed through to the row-outcome ledger.
-/// The replaced item is fetched when the caller asks for it or a stream
-/// record needs it.
+/// write. The replaced item is fetched when the caller asks for it or a
+/// stream record needs it.
 ///
 /// # Errors
 ///
-/// Returns the storage error unmapped; each caller owns its own mapping
-/// (`handle_put_item` maps to `DynamoDbError`, the bulk runner matches the
-/// variants directly).
-#[allow(clippy::too_many_arguments)] // the write's inputs, per the shared core contract
+/// Returns the storage error unmapped; `handle_put_item` maps it to
+/// `DynamoDbError`.
 pub(crate) async fn apply_put(
     storage: &dyn StorageEngine,
     region: &Arc<str>,
@@ -219,20 +216,11 @@ pub(crate) async fn apply_put(
     condition: Option<&Expr>,
     maps: &ExpressionMaps,
     return_old: bool,
-    marker: Option<&BulkRowMarker>,
 ) -> Result<Option<Item>, StorageError> {
     let stream = stream_capture_for(key_info, region);
     let fetch_old = return_old || stream.is_some();
     storage
-        .put_item(
-            key_info,
-            item,
-            fetch_old,
-            condition,
-            maps,
-            stream.as_ref(),
-            marker,
-        )
+        .put_item(key_info, item, fetch_old, condition, maps, stream.as_ref())
         .await
 }
 

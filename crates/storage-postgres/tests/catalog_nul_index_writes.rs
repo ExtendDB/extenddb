@@ -88,15 +88,7 @@ fn item(n: u32) -> Item {
 
 async fn put(s: &Scratch, key_info: &TableKeyInfo, it: Item) {
     s.engine
-        .put_item(
-            key_info,
-            it,
-            false,
-            None,
-            &ExpressionMaps::default(),
-            None,
-            None,
-        )
+        .put_item(key_info, it, false, None, &ExpressionMaps::default(), None)
         .await
         .expect("PutItem");
 }

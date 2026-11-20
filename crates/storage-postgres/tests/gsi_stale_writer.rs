@@ -242,15 +242,7 @@ fn item(n: u32, g: Option<&str>, r: Option<u32>) -> Item {
 
 async fn put(s: &Scratch, key_info: &TableKeyInfo, it: Item) {
     s.engine
-        .put_item(
-            key_info,
-            it,
-            false,
-            None,
-            &ExpressionMaps::default(),
-            None,
-            None,
-        )
+        .put_item(key_info, it, false, None, &ExpressionMaps::default(), None)
         .await
         .expect("put");
 }
@@ -309,22 +301,15 @@ async fn drive(at: PauseWrites, conditional: bool) {
     )
     .expect("parse");
     let writes = async {
-        let a = s.engine.put_item(
-            &ki,
-            item(100, Some("late"), None),
-            false,
-            None,
-            &maps,
-            None,
-            None,
-        );
+        let a = s
+            .engine
+            .put_item(&ki, item(100, Some("late"), None), false, None, &maps, None);
         let b = s.engine.put_item(
             &ki,
             item(1, Some("changed"), None),
             false,
             conditional.then_some(&cond),
             &maps,
-            None,
             None,
         );
         let mut key2 = item(2, None, None);

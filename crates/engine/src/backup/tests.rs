@@ -3379,7 +3379,6 @@ impl DataEngine for Fake {
         _: Option<&extenddb_core::expression::Expr>,
         _: &extenddb_core::expression::ExpressionMaps,
         _: Option<&extenddb_storage::StreamCapture>,
-        _: Option<&extenddb_storage::BulkRowMarker>,
     ) -> BoxedFuture<'_, Result<Option<Item>, StorageError>> {
         unused()
     }

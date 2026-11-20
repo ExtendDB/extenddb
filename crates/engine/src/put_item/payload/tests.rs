@@ -6,8 +6,8 @@ use extenddb_core::types::{
     AttributeDefinition, CreateTableInput, DescribeStreamInput, KeySchemaElement, KeyType,
     ScalarAttributeType, StreamEventName,
 };
+use extenddb_storage::StorageEngine;
 use extenddb_storage::server_components::ServerComponentsOptions;
-use extenddb_storage::{BulkRowMarker, RowOutcome, StorageEngine};
 use serde_json::json;
 
 const ACCOUNT: &str = "123456789012";
@@ -285,7 +285,6 @@ async fn apply_put_captures_a_stream_record_the_way_handle_put_item_does() {
         None,
         &ExpressionMaps::default(),
         false,
-        None,
     )
     .await
     .expect("the write applies");
@@ -330,54 +329,6 @@ async fn apply_put_captures_a_stream_record_the_way_handle_put_item_does() {
 }
 
 #[tokio::test]
-async fn apply_put_records_the_marker_in_the_row_outcome_ledger() {
-    let storage = engine().await;
-    create_table(&storage, "marked", false).await;
-    let key_info = storage
-        .table_key_info(ACCOUNT, "marked")
-        .await
-        .expect("key info");
-    let region: Arc<str> = Arc::from(REGION);
-    let (condition, maps) = resolve_put_condition(
-        Some("attribute_not_exists(pk)"),
-        None,
-        None,
-        None,
-        None,
-        &limits(),
-    )
-    .expect("the condition resolves");
-    let marker = BulkRowMarker {
-        account_id: ACCOUNT.to_owned(),
-        operation_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
-        file_index: 0,
-        row_index: 3,
-        owner: String::new(),
-        keep_old: false,
-        settled: (0, 0),
-    };
-
-    apply_put(
-        storage.as_ref(),
-        &region,
-        &key_info,
-        string_item(&[("pk", "a"), ("sk", "b")]),
-        condition.as_ref(),
-        &maps,
-        false,
-        Some(&marker),
-    )
-    .await
-    .expect("the write applies");
-
-    let outcome = storage
-        .bulk_row_outcome(ACCOUNT, &marker.operation_id, 0, 3)
-        .await
-        .expect("ledger read");
-    assert_eq!(outcome, Some(RowOutcome::Applied));
-}
-
-#[tokio::test]
 async fn apply_put_returns_the_old_item_only_when_asked() {
     let storage = engine().await;
     create_table(&storage, "plain", false).await;
@@ -396,7 +347,6 @@ async fn apply_put_returns_the_old_item_only_when_asked() {
         None,
         &maps,
         false,
-        None,
     )
     .await
     .expect("the first write applies");
@@ -410,7 +360,6 @@ async fn apply_put_returns_the_old_item_only_when_asked() {
         None,
         &maps,
         true,
-        None,
     )
     .await
     .expect("the second write applies");

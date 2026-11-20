@@ -229,7 +229,6 @@ async fn write_batch(
                             None,
                             &empty_maps,
                             stream.as_ref(),
-                            None,
                         )
                         .await;
                     (

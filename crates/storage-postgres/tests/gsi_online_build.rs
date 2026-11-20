@@ -241,15 +241,7 @@ fn item(n: u32, g: Option<&str>, r: Option<u32>) -> Item {
 
 async fn put(s: &Scratch, key_info: &TableKeyInfo, it: Item) {
     s.engine
-        .put_item(
-            key_info,
-            it,
-            false,
-            None,
-            &ExpressionMaps::default(),
-            None,
-            None,
-        )
+        .put_item(key_info, it, false, None, &ExpressionMaps::default(), None)
         .await
         .expect("put");
 }
@@ -530,15 +522,7 @@ async fn concurrent_build(delay_ms: u32) {
                         .map(|_| ()),
                     1 => s
                         .engine
-                        .put_item(
-                            key_info,
-                            item(n, None, Some(i)),
-                            false,
-                            None,
-                            maps,
-                            None,
-                            None,
-                        )
+                        .put_item(key_info, item(n, None, Some(i)), false, None, maps, None)
                         .await
                         .map(|_| ()),
                     2 => match s
@@ -549,7 +533,6 @@ async fn concurrent_build(delay_ms: u32) {
                             false,
                             Some(exists),
                             maps,
-                            None,
                             None,
                         )
                         .await
@@ -565,7 +548,6 @@ async fn concurrent_build(delay_ms: u32) {
                             false,
                             None,
                             maps,
-                            None,
                             None,
                         )
                         .await
@@ -1159,7 +1141,6 @@ async fn a_write_to_a_dropped_data_table_is_table_not_found() {
             false,
             None,
             &ExpressionMaps::default(),
-            None,
             None,
         )
         .await;

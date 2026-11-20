@@ -328,6 +328,26 @@ async fn take_over<E: StorageEngine>(fx: &Fixture<E>, operation_id: &str) {
         .expect("record the write owner");
 }
 
+fn marked(pk: &str, v: &str, m: BulkRowMarker) -> BatchRow {
+    BatchRow {
+        item: item(pk, v),
+        condition: None,
+        marker: Some(m),
+        return_old: true,
+    }
+}
+
+fn marked_conditional(pk: &str, v: &str, condition: &str, m: BulkRowMarker) -> BatchRow {
+    let tokens = expression::tokenize(condition).expect("tokenize");
+    let expr = expression::parse_condition(&tokens).expect("parse the condition");
+    BatchRow {
+        item: item(pk, v),
+        condition: Some((expr, ExpressionMaps::new(HashMap::new(), HashMap::new()))),
+        marker: Some(m),
+        return_old: true,
+    }
+}
+
 mod batch;
 mod checkpoint;
 mod counters;

@@ -13,8 +13,8 @@ use extenddb_core::types::{
     AttributeDefinition, AttributeValue, Item, KeySchemaElement, KeyType, ScalarAttributeType,
 };
 use extenddb_storage::{
-    BatchRow, BatchRowResult, BoxedFuture, BulkRowMarker, IdempotencyKey, ItemPairResult,
-    QueryResult, RowOutcome, StreamCapture, TransactGetOp, TransactWriteOp,
+    BatchRow, BatchRowResult, BoxedFuture, IdempotencyKey, ItemPairResult, QueryResult, RowOutcome,
+    StreamCapture, TransactGetOp, TransactWriteOp,
 };
 use serde_json::{Value, json};
 
@@ -67,7 +67,6 @@ impl DataEngine for Scripted {
         _condition: Option<&Expr>,
         _maps: &ExpressionMaps,
         _stream: Option<&StreamCapture>,
-        _marker: Option<&BulkRowMarker>,
     ) -> BoxedFuture<'_, Result<Option<Item>, StorageError>> {
         Box::pin(std::future::ready(self.answer(key_info, &item)))
     }

@@ -403,7 +403,7 @@ async fn single_writer(engine: &PostgresEngine, key_info: &TableKeyInfo, stop: &
             gs(format!("p{}", i % 7)),
         );
         engine
-            .put_item(key_info, it, false, None, &maps, None, None)
+            .put_item(key_info, it, false, None, &maps, None)
             .await
             .expect("put");
     }
@@ -543,7 +543,6 @@ async fn a_write_with_key_info_older_than_a_new_gsi_is_validated_against_its_def
             false,
             None,
             &ExpressionMaps::default(),
-            None,
             None,
         )
         .await;

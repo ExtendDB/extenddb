@@ -416,16 +416,7 @@ pub trait DataEngine: Send + Sync {
     /// When `stream` is `Some`, the stream record is inserted in the same
     /// transaction as the data write, guaranteeing atomicity.
     ///
-    /// When `marker` is `Some` and the write commits, the backend inserts an
-    /// `Applied` row into `bulk_row_outcomes` inside the write transaction.
-    /// When the condition fails and `marker` is `Some`, the backend records a
-    /// `ConditionFailed` row as its own transaction and then returns
-    /// `StorageError::ConditionFailed` as usual. A second outcome for one
-    /// marker's position fails the write. The bulk runner writes through
-    /// [`Self::put_items_batch`]; this path records the outcome alone.
-    ///
     /// Returns the previous item if `return_old` is true and an item existed.
-    #[allow(clippy::too_many_arguments)]
     fn put_item(
         &self,
         key_info: &TableKeyInfo,
@@ -434,7 +425,6 @@ pub trait DataEngine: Send + Sync {
         condition: Option<&Expr>,
         maps: &ExpressionMaps,
         stream: Option<&StreamCapture>,
-        marker: Option<&BulkRowMarker>,
     ) -> BoxFuture<'_, Result<Option<Item>, StorageError>>;
 
     /// Look up the recorded outcome of a marked bulk row, if any. Scoped by
@@ -1078,7 +1068,6 @@ mod vector_opt_out_tests {
             _condition: Option<&Expr>,
             _maps: &ExpressionMaps,
             _stream: Option<&StreamCapture>,
-            _marker: Option<&BulkRowMarker>,
         ) -> BoxFuture<'_, Result<Option<Item>, StorageError>> {
             Box::pin(async { Ok(None) })
         }

@@ -180,7 +180,6 @@ async fn test_put_item_insert_writes_stream_record() {
             None,
             &Default::default(),
             Some(&capture(StreamViewType::NewAndOldImages)),
-            None,
         )
         .await
         .unwrap();
@@ -217,7 +216,6 @@ async fn test_put_item_overwrite_writes_modify_stream_record() {
             None,
             &Default::default(),
             None,
-            None,
         )
         .await
         .unwrap();
@@ -232,7 +230,6 @@ async fn test_put_item_overwrite_writes_modify_stream_record() {
             None,
             &Default::default(),
             Some(&capture(StreamViewType::NewAndOldImages)),
-            None,
         )
         .await
         .unwrap();
@@ -270,7 +267,6 @@ async fn test_delete_item_writes_remove_stream_record() {
             false,
             None,
             &Default::default(),
-            None,
             None,
         )
         .await
@@ -349,7 +345,6 @@ async fn test_keys_only_view_type_omits_images() {
             None,
             &Default::default(),
             Some(&capture(StreamViewType::KeysOnly)),
-            None,
         )
         .await
         .unwrap();
@@ -384,7 +379,6 @@ async fn test_same_pk_records_land_in_same_shard_with_ordered_sequences() {
                 None,
                 &Default::default(),
                 Some(&capture(StreamViewType::NewImage)),
-                None,
             )
             .await
             .unwrap();
@@ -505,7 +499,6 @@ async fn test_latest_sequence_number_after_write() {
             None,
             &Default::default(),
             Some(&capture(StreamViewType::NewImage)),
-            None,
         )
         .await
         .unwrap();
@@ -544,7 +537,6 @@ async fn test_get_stream_records_returns_written_records() {
                 None,
                 &Default::default(),
                 Some(&capture(StreamViewType::NewImage)),
-                None,
             )
             .await
             .unwrap();
@@ -597,7 +589,6 @@ async fn test_get_stream_records_after_sequence_paginates() {
                 None,
                 &Default::default(),
                 Some(&capture(StreamViewType::NewImage)),
-                None,
             )
             .await
             .unwrap();
@@ -724,7 +715,6 @@ async fn test_stream_record_created_at_matches_the_record_and_sequence() {
                 None,
                 &Default::default(),
                 Some(&capture(view)),
-                None,
             )
             .await
             .unwrap();

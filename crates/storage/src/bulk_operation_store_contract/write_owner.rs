@@ -8,26 +8,6 @@
 
 use super::*;
 
-fn marked(pk: &str, v: &str, m: BulkRowMarker) -> BatchRow {
-    BatchRow {
-        item: item(pk, v),
-        condition: None,
-        marker: Some(m),
-        return_old: true,
-    }
-}
-
-fn marked_conditional(pk: &str, v: &str, condition: &str, m: BulkRowMarker) -> BatchRow {
-    let tokens = expression::tokenize(condition).expect("tokenize");
-    let expr = expression::parse_condition(&tokens).expect("parse the condition");
-    BatchRow {
-        item: item(pk, v),
-        condition: Some((expr, ExpressionMaps::new(HashMap::new(), HashMap::new()))),
-        marker: Some(m),
-        return_old: true,
-    }
-}
-
 fn at(operation_id: &str, file_index: i64, row_index: i64, fx_account: &str) -> BulkRowMarker {
     BulkRowMarker {
         file_index,
@@ -75,7 +55,7 @@ pub async fn every_marked_batch_row_is_recorded_with_what_it_replaced<E: Storage
     let ki = key_info(fx, &table.table_name).await;
     let maps = ExpressionMaps::new(HashMap::new(), HashMap::new());
     fx.engine
-        .put_item(&ki, item("a", "before"), false, None, &maps, None, None)
+        .put_item(&ki, item("a", "before"), false, None, &maps, None)
         .await
         .expect("seed");
     take_over(fx, "op-rec").await;

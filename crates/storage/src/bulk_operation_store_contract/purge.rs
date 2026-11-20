@@ -286,24 +286,21 @@ pub async fn purged_pairs_name_the_ledger_rows_to_delete<E: StorageEngine>(fx: &
     let owner = "owner-1";
     let table = create_table(fx, &fx.account_a, "purge_ledger").await;
     let ki = key_info(fx, &table.table_name).await;
-    let maps = ExpressionMaps::new(HashMap::new(), HashMap::new());
 
     let old_table = create_table(fx, &fx.account_a, "purge_ledger_old").await;
     let old_id = started_and_claimed(fx, &old_table, owner, 1000).await;
-    for (pk, row) in [("a1", 1_i64), ("a2", 2)] {
-        fx.engine
-            .put_item(
-                &ki,
-                item(pk, "1"),
-                false,
-                None,
-                &maps,
-                None,
-                Some(&marker(&fx.account_a, &old_id, row)),
-            )
-            .await
-            .expect("a marked put for the old operation");
-    }
+    take_over(fx, &old_id).await;
+    fx.engine
+        .put_items_batch(
+            &ki,
+            [("a1", 1_i64), ("a2", 2)]
+                .into_iter()
+                .map(|(pk, row)| marked(pk, "1", marker(&fx.account_a, &old_id, row)))
+                .collect(),
+            None,
+        )
+        .await
+        .expect("a marked batch for the old operation");
     fx.engine
         .finish(&fx.account_a, &old_id, owner, terminal("COMPLETED", 1000))
         .await
@@ -311,18 +308,15 @@ pub async fn purged_pairs_name_the_ledger_rows_to_delete<E: StorageEngine>(fx: &
 
     let live_table = create_table(fx, &fx.account_a, "purge_ledger_live").await;
     let live_id = started_and_claimed(fx, &live_table, owner, 2000).await;
+    take_over(fx, &live_id).await;
     fx.engine
-        .put_item(
+        .put_items_batch(
             &ki,
-            item("b1", "1"),
-            false,
+            vec![marked("b1", "1", marker(&fx.account_a, &live_id, 1))],
             None,
-            &maps,
-            None,
-            Some(&marker(&fx.account_a, &live_id, 1)),
         )
         .await
-        .expect("a marked put for the live operation");
+        .expect("a marked batch for the live operation");
 
     let purgeable = fx
         .engine

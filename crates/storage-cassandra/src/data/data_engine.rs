@@ -25,12 +25,7 @@ impl DataEngine for CassandraEngine {
         condition: Option<&Expr>,
         maps: &ExpressionMaps,
         stream: Option<&StreamCapture>,
-        marker: Option<&extenddb_storage::BulkRowMarker>,
     ) -> BoxFuture<'_, Result<Option<Item>, StorageError>> {
-        // Bulk operations are not implemented on this backend, so no caller
-        // can reach this method with a marker; the engine refuses the bulk
-        // request first.
-        let _ = marker;
         let key_info = key_info.clone();
         let condition = condition.cloned();
         let maps = maps.clone();

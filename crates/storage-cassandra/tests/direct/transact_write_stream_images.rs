@@ -82,7 +82,6 @@ async fn test_transact_write_put_over_existing_records_modify() {
             None,
             &maps,
             None,
-            None,
         )
         .await
         .unwrap();
@@ -217,7 +216,6 @@ async fn test_transacted_records_match_the_single_item_records() {
                     None,
                     &maps,
                     None,
-                    None,
                 )
                 .await
                 .unwrap();
@@ -235,7 +233,6 @@ async fn test_transacted_records_match_the_single_item_records() {
             None,
             &maps,
             Some(&view),
-            None,
         )
         .await
         .unwrap();

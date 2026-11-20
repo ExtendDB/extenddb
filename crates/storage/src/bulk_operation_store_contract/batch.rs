@@ -55,7 +55,7 @@ pub async fn a_batch_applies_every_row_and_reports_each_outcome_in_order<E: Stor
     let ki = key_info(fx, &table.table_name).await;
     let maps = ExpressionMaps::new(HashMap::new(), HashMap::new());
     fx.engine
-        .put_item(&ki, item("a", "before"), false, None, &maps, None, None)
+        .put_item(&ki, item("a", "before"), false, None, &maps, None)
         .await
         .expect("seed the target item");
     take_over(fx, "op-batch").await;
@@ -286,7 +286,7 @@ pub async fn a_batch_overwrite_reports_the_replaced_item_for_sizing<E: StorageEn
     let ki = key_info(fx, &table.table_name).await;
     let maps = ExpressionMaps::new(HashMap::new(), HashMap::new());
     fx.engine
-        .put_item(&ki, item("a", "old"), false, None, &maps, None, None)
+        .put_item(&ki, item("a", "old"), false, None, &maps, None)
         .await
         .expect("seed the target item");
 

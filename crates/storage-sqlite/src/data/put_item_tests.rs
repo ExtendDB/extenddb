@@ -85,7 +85,6 @@ async fn a_write_with_key_info_older_than_a_new_gsi_is_validated_against_its_def
             None,
             &ExpressionMaps::default(),
             None,
-            None,
         )
         .await;
     assert!(

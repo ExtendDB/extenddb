@@ -664,15 +664,7 @@ mod tests {
             .into_iter()
             .collect();
             engine
-                .put_item(
-                    &ki,
-                    item,
-                    false,
-                    None,
-                    &ExpressionMaps::default(),
-                    None,
-                    None,
-                )
+                .put_item(&ki, item, false, None, &ExpressionMaps::default(), None)
                 .await
                 .expect("put");
         }

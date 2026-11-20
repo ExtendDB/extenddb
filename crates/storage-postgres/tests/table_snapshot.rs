@@ -424,15 +424,7 @@ async fn put_collation_keys(s: &Scratch, table: &str, as_range: bool) {
         .into_iter()
         .collect();
         s.engine
-            .put_item(
-                &ki,
-                item,
-                false,
-                None,
-                &ExpressionMaps::default(),
-                None,
-                None,
-            )
+            .put_item(&ki, item, false, None, &ExpressionMaps::default(), None)
             .await
             .expect("put");
     }

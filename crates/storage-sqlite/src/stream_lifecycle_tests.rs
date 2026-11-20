@@ -113,7 +113,6 @@ async fn put(engine: &SqliteEngine, name: &str, pk: &str, view_type: StreamViewT
             None,
             &ExpressionMaps::default(),
             Some(&capture),
-            None,
         )
         .await
         .unwrap();

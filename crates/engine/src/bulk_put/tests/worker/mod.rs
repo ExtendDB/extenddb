@@ -17,15 +17,14 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use extenddb_auth::AuthCacheRegistry;
-use extenddb_core::expression::ExpressionMaps;
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::metrics::{
     Dimension, MetricName, MetricSnapshot, MetricsCollector, MetricsQuery, TimeWindow,
 };
 use extenddb_core::types::{AttributeValue, Item};
 use extenddb_storage::{
-    BulkRowMarker, CancellationToken, FinishState, InputFile, NewBulkOperation, ReportKind,
-    StartOutcome, StorageEngine, Terminal,
+    BatchRow, BulkRowMarker, CancellationToken, FinishState, InputFile, NewBulkOperation,
+    ReportKind, StartOutcome, StorageEngine, Terminal,
 };
 
 use super::runner::{FaultingStorage, Harness, file_of, plain_rows};
@@ -251,22 +250,27 @@ async fn start_claim_mark_finish(
         operation_id: op.clone(),
         file_index: 0,
         row_index: 0,
-        owner: String::new(),
+        owner: owner.to_owned(),
         keep_old: false,
         settled: (0, 0),
     };
     h.storage
-        .put_item(
+        .bulk_write_takeover(ACCOUNT, &op, owner, (0, 0))
+        .await
+        .expect("record the write owner");
+    h.storage
+        .put_items_batch(
             &ki,
-            item(pk, "1"),
-            false,
+            vec![BatchRow {
+                item: item(pk, "1"),
+                condition: None,
+                marker: Some(marker),
+                return_old: false,
+            }],
             None,
-            &ExpressionMaps::default(),
-            None,
-            Some(&marker),
         )
         .await
-        .expect("marked put");
+        .expect("marked batch");
     let state = h
         .storage
         .finish(

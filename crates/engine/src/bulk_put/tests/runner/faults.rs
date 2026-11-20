@@ -160,7 +160,6 @@ impl DataEngine for FaultingStorage {
         condition: Option<&Expr>,
         maps: &ExpressionMaps,
         stream: Option<&StreamCapture>,
-        marker: Option<&BulkRowMarker>,
     ) -> BoxFuture<'_, Result<Option<Item>, StorageError>> {
         if let Some(pk) = &self.fail_put_pk
             && item.get("pk") == Some(&AttributeValue::S(pk.clone()))
@@ -173,7 +172,7 @@ impl DataEngine for FaultingStorage {
             return Box::pin(async move { Err(error) });
         }
         self.inner
-            .put_item(key_info, item, return_old, condition, maps, stream, marker)
+            .put_item(key_info, item, return_old, condition, maps, stream)
     }
 
     fn bulk_row_outcome(

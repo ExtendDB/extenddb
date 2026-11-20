@@ -38,13 +38,11 @@ impl DataEngine for SqliteEngine {
         condition: Option<&Expr>,
         maps: &ExpressionMaps,
         stream: Option<&StreamCapture>,
-        marker: Option<&extenddb_storage::BulkRowMarker>,
     ) -> BoxFuture<'_, Result<Option<Item>, StorageError>> {
         let key_info = key_info.clone();
         let condition = condition.cloned();
         let maps = maps.clone();
         let stream = stream.cloned();
-        let marker = marker.cloned();
         Box::pin(async move {
             self.put_item_impl(
                 &key_info,
@@ -53,7 +51,6 @@ impl DataEngine for SqliteEngine {
                 condition.as_ref(),
                 &maps,
                 stream.as_ref(),
-                marker.as_ref(),
             )
             .await
         })

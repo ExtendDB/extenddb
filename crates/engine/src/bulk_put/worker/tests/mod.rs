@@ -10,7 +10,6 @@ mod claim;
 mod config;
 mod retention;
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,17 +17,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
-use extenddb_core::expression::ExpressionMaps;
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::metrics::MetricsCollector;
 use extenddb_core::types::{AttributeValue, CreateTableInput, Item, TableKeyInfo};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::server_components::ServerComponentsOptions;
 use extenddb_storage::{
-    BoxedFuture as BoxFuture, BulkOperationListResult, BulkOperationRecord, BulkOperationStore,
-    BulkRowMarker, CancelOutcome, CancellationToken, FinishState, InputFile, LeaseState,
-    ListCursor, NewBulkOperation, Progress, ReportKind, ReportRecord, StartOutcome, StorageEngine,
-    Terminal,
+    BatchRow, BoxedFuture as BoxFuture, BulkOperationListResult, BulkOperationRecord,
+    BulkOperationStore, BulkRowMarker, CancelOutcome, CancellationToken, FinishState, InputFile,
+    LeaseState, ListCursor, NewBulkOperation, Progress, ReportKind, ReportRecord, StartOutcome,
+    StorageEngine, Terminal,
 };
 
 use crate::bulk_put::arn;
@@ -185,30 +183,43 @@ async fn key_info(storage: &Arc<dyn StorageEngine>, account: &str, table: &str) 
         .expect("key info")
 }
 
-/// Write one item with an Applied ledger marker for `(operation, 0, 0)`,
-/// the way a runner's marked condition write populates the ledger.
+/// Write one item with an Applied ledger row for `(operation, 0, 0)`
+/// through a marked batch, the way a runner's batch populates the ledger.
 async fn write_ledger_row(
     storage: &Arc<dyn StorageEngine>,
     account: &str,
     table: &str,
     operation_id: &str,
 ) {
+    const WRITER: &str = "ledger-writer";
     let ki = key_info(storage, account, table).await;
-    let maps = ExpressionMaps::new(HashMap::new(), HashMap::new());
     let item = Item::from([("pk".to_owned(), AttributeValue::S("a".to_owned()))]);
     let marker = BulkRowMarker {
         account_id: account.to_owned(),
         operation_id: operation_id.to_owned(),
         file_index: 0,
         row_index: 0,
-        owner: String::new(),
+        owner: WRITER.to_owned(),
         keep_old: false,
         settled: (0, 0),
     };
     storage
-        .put_item(&ki, item, false, None, &maps, None, Some(&marker))
+        .bulk_write_takeover(account, operation_id, WRITER, (0, 0))
         .await
-        .expect("marked put");
+        .expect("record the write owner");
+    storage
+        .put_items_batch(
+            &ki,
+            vec![BatchRow {
+                item,
+                condition: None,
+                marker: Some(marker),
+                return_old: false,
+            }],
+            None,
+        )
+        .await
+        .expect("marked batch");
 }
 
 /// Poll `f` every 10 ms until it answers `true` or the deadline passes.

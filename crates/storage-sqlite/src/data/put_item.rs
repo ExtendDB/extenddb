@@ -65,10 +65,8 @@ const LEDGER_COLUMNS: usize = 7;
 const LEDGER_ROWS_PER_STATEMENT: usize = 32_766 / LEDGER_COLUMNS;
 
 /// Insert `bulk_row_outcomes` ledger rows, one multi-row `INSERT` per
-/// `LEDGER_ROWS_PER_STATEMENT` rows. The caller chooses the connection: the
-/// write transaction's for a batch and for an applied single row, a pool
-/// connection (a single-statement transaction) for a failed condition on
-/// the single-row path.
+/// `LEDGER_ROWS_PER_STATEMENT` rows, in the batch's write transaction
+/// before its commit.
 ///
 /// A plain insert: the ledger key is the row's position, and a second
 /// outcome for one position, in these rows or already recorded, means the
@@ -180,9 +178,8 @@ fn validate_index_keys(
 /// One row's write inside an open `BEGIN IMMEDIATE` transaction: the read
 /// of the current image when anything needs it (a marked row needs it for
 /// its ledger entry), the condition against it, the upsert, index and
-/// stream maintenance. The caller records a marked row's outcome from the
-/// returned image: a single write right after this returns, a batch with
-/// its other rows before its commit.
+/// stream maintenance. The batch records a marked row's outcome from the
+/// returned image, with its other rows, before its commit.
 ///
 /// A failed condition returns `Err(ConditionFailed(old))` after the read
 /// and before any statement that changes a row, so the transaction stays
@@ -281,7 +278,6 @@ async fn put_row_in_tx(
 }
 
 impl SqliteEngine {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn put_item_impl(
         &self,
         key_info: &TableKeyInfo,
@@ -290,7 +286,6 @@ impl SqliteEngine {
         condition: Option<&Expr>,
         maps: &ExpressionMaps,
         stream: Option<&StreamCapture>,
-        marker: Option<&extenddb_storage::BulkRowMarker>,
     ) -> Result<Option<Item>, StorageError> {
         // Read the index set only after acquiring the write lock, so a GSI added
         // by a concurrent UpdateTable (which holds the same lock) cannot be missed
@@ -310,7 +305,7 @@ impl SqliteEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let written = match put_row_in_tx(
+        let written = put_row_in_tx(
             &mut tx,
             key_info,
             &indexes,
@@ -320,40 +315,9 @@ impl SqliteEngine {
             condition,
             maps,
             stream,
-            marker,
+            None,
         )
-        .await
-        {
-            Ok(written) => written,
-            Err(StorageError::ConditionFailed(old)) => {
-                // Nothing else is written for a failed condition, so the
-                // write transaction is discarded and the outcome is recorded
-                // as a single-statement transaction of its own, still under
-                // the write lock (D1). The ledger row lets a resumed run tell
-                // this failure from a fresh one instead of re-evaluating the
-                // condition against the operation's own earlier writes.
-                drop(tx);
-                if let Some(m) = marker {
-                    let mut conn = self
-                        .pool
-                        .acquire()
-                        .await
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    let row = LedgerRow::new(m, RowOutcome::ConditionFailed, old.as_ref())?;
-                    insert_row_outcomes(&mut conn, &[row]).await?;
-                }
-                return Err(StorageError::ConditionFailed(old));
-            }
-            Err(other) => return Err(other),
-        };
-
-        // The applied outcome rides the write transaction: both commit or
-        // neither does, following the gsi_pending precedent for bookkeeping
-        // rows inside the write transaction.
-        if let Some(m) = marker {
-            let row = LedgerRow::new(m, RowOutcome::Applied, written.old.as_ref())?;
-            insert_row_outcomes(&mut tx, &[row]).await?;
-        }
+        .await?;
 
         tx.commit()
             .await

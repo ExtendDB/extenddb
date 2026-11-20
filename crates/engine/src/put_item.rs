@@ -218,7 +218,6 @@ pub async fn handle_put_item(
         condition.as_ref(),
         &maps,
         return_old || capacity_requested,
-        None,
     )
     .await
     .map_err(|e| {

@@ -334,7 +334,6 @@ impl Harness {
                 None,
                 &extenddb_core::expression::ExpressionMaps::default(),
                 None,
-                None,
             )
             .await
             .expect("direct put");

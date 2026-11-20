@@ -504,7 +504,6 @@ async fn a_runner_stalled_past_its_lease_drops_its_staged_rows_instead_of_writin
                 None,
                 &extenddb_core::expression::ExpressionMaps::default(),
                 None,
-                None,
             )
             .await
             .expect("marker put");

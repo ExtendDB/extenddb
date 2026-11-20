@@ -238,7 +238,6 @@ pub async fn put(s: &Scratch, name: &str, pk: &str, view_type: StreamViewType) {
             None,
             &ExpressionMaps::default(),
             Some(&capture),
-            None,
         )
         .await
         .expect("put");

@@ -29,7 +29,7 @@ async fn test_query_pk_only() {
 
         let maps = ExpressionMaps::default();
         engine
-            .put_item(&table.key_info, item, false, None, &maps, None, None)
+            .put_item(&table.key_info, item, false, None, &maps, None)
             .await
             .expect("put_item should succeed");
     }
@@ -108,7 +108,6 @@ async fn test_query_with_sk_equals() {
                 false,
                 None,
                 &Default::default(),
-                None,
                 None,
             )
             .await
@@ -190,7 +189,6 @@ async fn test_query_with_sk_comparison() {
                 false,
                 None,
                 &Default::default(),
-                None,
                 None,
             )
             .await
@@ -294,7 +292,6 @@ async fn test_query_with_numeric_sk() {
                 None,
                 &Default::default(),
                 None,
-                None,
             )
             .await
             .expect("put_item should succeed");
@@ -396,7 +393,6 @@ async fn test_query_with_decimal_sk_range_and_order() {
                 None,
                 &Default::default(),
                 None,
-                None,
             )
             .await
             .expect("put_item should succeed");
@@ -487,7 +483,6 @@ async fn test_query_ordering() {
                 false,
                 None,
                 &Default::default(),
-                None,
                 None,
             )
             .await
@@ -602,7 +597,6 @@ async fn test_query_limit() {
                 None,
                 &Default::default(),
                 None,
-                None,
             )
             .await
             .expect("put_item should succeed");
@@ -685,7 +679,6 @@ async fn test_query_pagination() {
                 false,
                 None,
                 &Default::default(),
-                None,
                 None,
             )
             .await
@@ -842,7 +835,6 @@ async fn test_query_between() {
                 None,
                 &Default::default(),
                 None,
-                None,
             )
             .await
             .expect("put_item should succeed");
@@ -942,7 +934,6 @@ async fn test_query_begins_with() {
                 false,
                 None,
                 &Default::default(),
-                None,
                 None,
             )
             .await
@@ -1053,7 +1044,7 @@ async fn test_query_gsi() {
         );
 
         engine
-            .put_item(&table.key_info, item, false, None, &maps, None, None)
+            .put_item(&table.key_info, item, false, None, &maps, None)
             .await
             .expect("put_item should succeed");
 
@@ -1148,7 +1139,7 @@ async fn test_query_gsi_pagination() {
         item.insert("data".to_string(), AttributeValue::N(i.to_string()));
 
         engine
-            .put_item(&table.key_info, item, false, None, &maps, None, None)
+            .put_item(&table.key_info, item, false, None, &maps, None)
             .await
             .expect("put_item should succeed");
     }
@@ -1297,7 +1288,7 @@ async fn test_query_lsi() {
         );
 
         engine
-            .put_item(&table.key_info, item, false, None, &maps, None, None)
+            .put_item(&table.key_info, item, false, None, &maps, None)
             .await
             .expect("put_item should succeed");
     }
@@ -1410,7 +1401,7 @@ async fn test_query_gsi_with_sort_key() {
         );
 
         engine
-            .put_item(&table.key_info, item, false, None, &maps, None, None)
+            .put_item(&table.key_info, item, false, None, &maps, None)
             .await
             .expect("put_item should succeed");
     }

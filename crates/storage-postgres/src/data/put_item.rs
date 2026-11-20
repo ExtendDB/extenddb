@@ -11,7 +11,7 @@ use extenddb_storage::util::{
     SortKeyValue, composite_pk_to_text, parse_sk, pk_to_text, sk_column, sk_info,
 };
 use extenddb_storage::vector_lifecycle::VectorIndexMeta;
-use extenddb_storage::{BatchRow, BatchRowResult, BulkRowMarker, RowOutcome, StreamCapture};
+use extenddb_storage::{BatchRow, BatchRowResult, RowOutcome, StreamCapture};
 
 use super::gsi_build::{GRACE_WRITE, WriteStamp, fix_up_stale_write};
 use super::index::{
@@ -46,8 +46,8 @@ struct WritePlan {
 
 impl WritePlan {
     /// Whether a write with these attributes needs the transactional path at
-    /// all. A plain row on a table with no indexes, no stream, and no marker
-    /// is one upsert statement. A write that is already slow takes the
+    /// all. A plain row on a table with no indexes and no stream is one
+    /// upsert statement. A write that is already slow takes the
     /// transaction path even with no index to maintain, so that a repair for
     /// a GSI created meanwhile commits with the write instead of after it.
     fn needs_tx(
@@ -55,14 +55,12 @@ impl WritePlan {
         condition: Option<&Expr>,
         return_old: bool,
         stream: Option<&StreamCapture>,
-        marker: Option<&BulkRowMarker>,
     ) -> bool {
         condition.is_some()
             || return_old
             || !self.indexes.is_empty()
             || !self.vector_metas.is_empty()
             || stream.is_some()
-            || marker.is_some()
             || self.stamp.elapsed() > GRACE_WRITE
     }
 }
@@ -243,9 +241,9 @@ impl PostgresEngine {
 
     /// One row's write inside an open transaction: the locking read, the
     /// condition against the current image, the write (with the create-race
-    /// loop), and index and stream maintenance. The caller records a marked
-    /// row's outcome from the returned image: a single write right after
-    /// this returns, a batch with its other rows before its commit.
+    /// loop), and index and stream maintenance. The batch records a marked
+    /// row's outcome from the returned image, with its other rows, before
+    /// its commit.
     ///
     /// A failed condition returns `Err(ConditionFailed(old))` after the
     /// locking read and before any statement that changes a row, so the
@@ -366,13 +364,6 @@ impl PostgresEngine {
     }
 
     /// Implementation of `DataEngine::put_item`.
-    ///
-    /// When `marker` is `Some` and the write commits, the row's applied
-    /// outcome is inserted into `bulk_row_outcomes` inside the same
-    /// transaction, so the marker and the write are durable together or not
-    /// at all. The condition-failed outcome is recorded by the caller, since
-    /// a failed condition leaves no transaction to ride.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn put_item_impl(
         &self,
         key_info: &TableKeyInfo,
@@ -381,12 +372,11 @@ impl PostgresEngine {
         condition: Option<&Expr>,
         maps: &ExpressionMaps,
         stream: Option<&StreamCapture>,
-        marker: Option<&BulkRowMarker>,
     ) -> Result<Option<Item>, StorageError> {
         let plan = self.write_plan(key_info).await?;
         Self::validate_index_keys(&plan, key_info, &item)?;
 
-        if !plan.needs_tx(condition, return_old, stream, marker) {
+        if !plan.needs_tx(condition, return_old, stream) {
             return self.upsert_plain(&plan, key_info, &item).await;
         }
 
@@ -397,18 +387,6 @@ impl PostgresEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
         let mut written =
             Self::put_row_in_tx(&mut tx, &plan, key_info, &item, condition, maps, stream).await?;
-        // The row's outcome, durable with the write: commit covers both or
-        // neither, which is what lets a resumed run find the row applied and
-        // account for it without writing it again.
-        if let Some(m) = marker {
-            super::bulk_row_outcomes::insert_outcome_in_tx(
-                &mut tx,
-                m,
-                RowOutcome::Applied,
-                written.old.as_ref(),
-            )
-            .await?;
-        }
         written.async_enqueued += fix_up_stale_write(
             &mut tx,
             &self.pool,

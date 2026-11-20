@@ -1659,7 +1659,7 @@ fn vector_item(pk: &str, tenant: Option<&str>, values: &[&str]) -> Item {
 async fn put(engine: &PostgresEngine, key_info: &TableKeyInfo, item: Item) {
     let maps = ExpressionMaps::new(HashMap::new(), HashMap::new());
     engine
-        .put_item(key_info, item, false, None, &maps, None, None)
+        .put_item(key_info, item, false, None, &maps, None)
         .await
         .expect("put an item");
 }
@@ -3062,7 +3062,6 @@ async fn an_inline_write_survives_the_index_data_table_disappearing() {
             false,
             None,
             &maps,
-            None,
             None,
         )
         .await
