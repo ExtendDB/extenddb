@@ -224,6 +224,7 @@ mod durability;
 mod exactly_once;
 mod fake_authorizer;
 mod faults;
+mod faults_backup;
 mod faults_engines;
 mod harness;
 mod held_location;
