@@ -1245,12 +1245,6 @@ This change needs no catalog migration of its own. Before upgrading a deployment
 
 A `DeleteItem` and a read with no projection hold only the names the request gives, not those of the stored item, so a `Deny` on an attribute blocks neither deleting an item that holds it nor reading the item with no projection, as on DynamoDB (measured 2026-10-31). Nor does it stop an `UpdateItem` from copying the attribute's value into another attribute through a `SET` value such as `SET #n = ssn`, as on DynamoDB (measured 2026-11-01). No catalog migration is required. Before upgrading, check the policies of each account for the statements above.
 
-### v1.1.0: a daemonized `serve` keeps the directory it started in
-
-**What changed.** `extenddb serve` without `--foreground` keeps the directory it was started in as the daemon's working directory. Before this release the daemon changed to `/`. A relative path in the configuration or the environment now resolves against the start directory, as it does in the foreground: the `[import]` and `[export]` roots, the bulk store's filesystem root, the run directory and PID file, and the files the AWS SDK reads from its environment. When the start directory cannot be read, the daemon changes to `/` as before.
-
-**Who is affected.** A daemonized deployment that gives one of those paths as a relative path. Before this release the path resolved against `/`; now it resolves against the directory `serve` started in. Absolute paths resolve as before. No catalog migration is required.
-
 ### v1.1.0: `PutItem` checks the nesting depth of `ExpressionAttributeValues` before the table lookup
 
 **What changed.** `PutItem` checks the nesting depth of every `ExpressionAttributeValues` value with its other condition checks, before it looks up the table and checks the item. Before this release that check ran after the table lookup and the item checks. The bulk put runner uses the same sequence for each row, so a row's condition fault carries the message `PutItem` returns.

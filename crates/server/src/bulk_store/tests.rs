@@ -22,6 +22,10 @@ use crate::test_logs::logged;
 /// apart from the SDK's and the configuration's.
 const SERVER_REGION: &str = "eu-west-3";
 
+/// The dev-mode root the cases pass; each gives a `[bulk]` section, so none
+/// uses it.
+const DEV_ROOT: &str = config::DEV_DEFAULT_BULK_PATH;
+
 /// A `[bulk]` section, written as the configuration file would hold it.
 fn bulk(section: Value) -> config::BulkConfig {
     serde_json::from_value(section).expect("a [bulk] section")
@@ -184,8 +188,8 @@ async fn refusals() {
         ),
     ] {
         let section = bulk(json!({"store": "s3", "s3": s3}));
-        for dev_mode in [false, true] {
-            let error = resolve(Some(&section), SERVER_REGION, dev_mode, &catalog, &storage)
+        for dev_root in [None, Some(DEV_ROOT)] {
+            let error = resolve(Some(&section), SERVER_REGION, dev_root, &catalog, &storage)
                 .await
                 .err()
                 .unwrap_or_else(|| panic!("{s3} must stop the server"));
@@ -218,7 +222,7 @@ async fn an_s3_section_beside_the_filesystem_store_is_checked() {
         ),
     ] {
         let section = bulk(json!({"store": "filesystem", "filesystem": {"path": path}, "s3": s3}));
-        let message = resolve(Some(&section), SERVER_REGION, false, &catalog, &storage)
+        let message = resolve(Some(&section), SERVER_REGION, None, &catalog, &storage)
             .await
             .err()
             .unwrap_or_else(|| panic!("{s3} must stop the server"))
@@ -230,7 +234,7 @@ async fn an_s3_section_beside_the_filesystem_store_is_checked() {
         "filesystem": {"path": path},
         "s3": {"endpoint_url": "http://127.0.0.1:9"}
     }));
-    let store = resolve(Some(&section), SERVER_REGION, false, &catalog, &storage)
+    let store = resolve(Some(&section), SERVER_REGION, None, &catalog, &storage)
         .await
         .unwrap()
         .expect("the filesystem store");
@@ -242,7 +246,7 @@ async fn an_s3_section_beside_the_filesystem_store_is_checked() {
 async fn an_s3_section_with_no_store_and_no_filesystem_section_names_both_ways_out() {
     let (catalog, storage) = components().await;
     let section = bulk(json!({"s3": {"endpoint_url": "http://127.0.0.1:9"}}));
-    let message = resolve(Some(&section), SERVER_REGION, false, &catalog, &storage)
+    let message = resolve(Some(&section), SERVER_REGION, None, &catalog, &storage)
         .await
         .err()
         .expect("no store can be built")
@@ -253,7 +257,7 @@ async fn an_s3_section_with_no_store_and_no_filesystem_section_names_both_ways_o
          the [bulk.s3] section, set store = \"s3\" in [bulk], or add [bulk.filesystem]"
     );
     let bare = bulk(json!({}));
-    let message = resolve(Some(&bare), SERVER_REGION, false, &catalog, &storage)
+    let message = resolve(Some(&bare), SERVER_REGION, None, &catalog, &storage)
         .await
         .err()
         .expect("no store can be built")
@@ -289,18 +293,18 @@ async fn s3_branch(dir: PathBuf) {
         "s3": {"endpoint_url": "http://127.0.0.1:9", "force_path_style": true},
         "filesystem": {"path": unused}
     }));
-    for dev_mode in [false, true] {
-        let store = resolve(Some(&section), SERVER_REGION, dev_mode, &catalog, &storage)
+    for dev_root in [None, Some(DEV_ROOT)] {
+        let store = resolve(Some(&section), SERVER_REGION, dev_root, &catalog, &storage)
             .await
             .unwrap()
             .expect("the S3 store");
-        assert!(store.filesystem_root().is_none(), "dev mode {dev_mode}");
+        assert!(store.filesystem_root().is_none(), "dev root {dev_root:?}");
         // The key the environment gives the store, for the startup check
         // against the keys the server accepts.
         assert_eq!(
             store.s3_access_key_id(),
             Some("AKIDRESOLUTIONTEST"),
-            "dev mode {dev_mode}"
+            "dev root {dev_root:?}"
         );
     }
     assert!(!unused.exists(), "the [bulk.filesystem] path is ignored");
@@ -333,12 +337,12 @@ async fn insecure_endpoint(_dir: PathBuf) {
             "force_path_style": true
         }
     }));
-    for dev_mode in [false, true] {
-        let store = resolve(Some(&section), SERVER_REGION, dev_mode, &catalog, &storage)
+    for dev_root in [None, Some(DEV_ROOT)] {
+        let store = resolve(Some(&section), SERVER_REGION, dev_root, &catalog, &storage)
             .await
             .unwrap()
             .expect("the S3 store");
-        assert!(store.filesystem_root().is_none(), "dev mode {dev_mode}");
+        assert!(store.filesystem_root().is_none(), "dev root {dev_root:?}");
     }
 }
 
@@ -460,7 +464,7 @@ fn startup_on_the_filesystem_store_warns_of_the_operations_recorded_on_s3() {
     let section = bulk(json!({"store": "filesystem", "filesystem": {"path": dir.join("buckets")}}));
     let (resolved, log) = logged(async {
         let (catalog, storage) = catalog_with_operations().await;
-        resolve(Some(&section), SERVER_REGION, false, &catalog, &storage).await
+        resolve(Some(&section), SERVER_REGION, None, &catalog, &storage).await
     });
     let _ = std::fs::remove_dir_all(&dir);
     let store = resolved.unwrap().expect("the filesystem store");
@@ -531,7 +535,7 @@ async fn signing_with_an_imported_key(_dir: PathBuf) {
     let store = resolve_checked(
         Some(&section),
         SERVER_REGION,
-        false,
+        None,
         &catalog,
         &components.engine,
         &components.credential_store,

@@ -2,14 +2,35 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Bulk operation store configuration (`[bulk]` section).
 
+use std::path::Path;
+
 use serde::Deserialize;
 
 use crate::BulkS3Config;
 
 /// Store root dev mode substitutes when the `[bulk]` section is absent,
-/// relative to the process working directory. Named in the dev-mode banner
-/// and resolved to its canonical form by the server at startup.
+/// relative to the directory `serve` was started in. The configuration
+/// loader makes it absolute ([`dev_default_bulk_path`]) before `serve`
+/// daemonizes, as it does `[bulk.filesystem] path`, and the server resolves
+/// it to its canonical form at startup.
 pub const DEV_DEFAULT_BULK_PATH: &str = "./.extenddb/buckets";
+
+/// [`DEV_DEFAULT_BULK_PATH`] made absolute against `cwd`.
+#[must_use]
+pub fn dev_default_bulk_path(cwd: &Path) -> String {
+    absolute(cwd, DEV_DEFAULT_BULK_PATH.trim_start_matches("./"))
+}
+
+/// `path` with a leading `~` expanded, then joined to `cwd` when it is
+/// still relative.
+fn absolute(cwd: &Path, path: &str) -> String {
+    let expanded = crate::expand_tilde(path);
+    if Path::new(&expanded).is_absolute() {
+        expanded
+    } else {
+        cwd.join(expanded).to_string_lossy().into_owned()
+    }
+}
 
 /// Configuration for the bulk operation store (`[bulk]` section).
 ///
@@ -31,6 +52,22 @@ pub struct BulkConfig {
     /// S3 store settings. Optional when `store = "s3"`: an absent section
     /// takes every default.
     pub s3: Option<BulkS3Config>,
+}
+
+impl BulkConfig {
+    /// Make `[bulk.filesystem] path` absolute against `cwd` (`~` expanded
+    /// first), so a relative value written in the config file names the
+    /// directory it does from the shell that started the server, in the
+    /// daemonized child too, whose working directory is `/`. An absolute
+    /// value is left as it is, and so is an empty one, which startup
+    /// refuses as before; made absolute, it would name `cwd` as the root.
+    pub fn make_paths_absolute(&mut self, cwd: &Path) {
+        if let Some(fs) = self.filesystem.as_mut()
+            && !fs.path.is_empty()
+        {
+            fs.path = absolute(cwd, &fs.path);
+        }
+    }
 }
 
 /// Store implementation selector for `[bulk] store`.
@@ -78,6 +115,39 @@ mod tests {
     fn bulk_section_absent_is_none() {
         let parsed = parse_bulk("").unwrap();
         assert!(parsed.bulk.is_none());
+    }
+
+    /// A relative store root is made absolute against the directory given
+    /// (the shell's at load), `~` expands to the home directory, and an
+    /// absolute or empty root stays as written. The dev-mode root lands
+    /// under the same directory.
+    #[test]
+    fn a_relative_store_root_is_made_absolute_at_load() {
+        let cwd = Path::new("/srv/extenddb");
+        let home = format!("{}/buckets", std::env::var("HOME").unwrap());
+        for (written, absolute) in [
+            ("buckets", "/srv/extenddb/buckets"),
+            ("./data/buckets", "/srv/extenddb/./data/buckets"),
+            ("/var/lib/extenddb/buckets", "/var/lib/extenddb/buckets"),
+            ("~/buckets", home.as_str()),
+            ("", ""),
+        ] {
+            let text = format!("[bulk]\n[bulk.filesystem]\npath = \"{written}\"\n");
+            let mut bulk = parse_bulk(&text).unwrap().bulk.unwrap();
+            bulk.make_paths_absolute(cwd);
+            assert_eq!(bulk.filesystem.unwrap().path, absolute, "{written:?}");
+        }
+        // The S3 store has no path to resolve.
+        let mut s3 = parse_bulk("[bulk]\nstore = \"s3\"\n")
+            .unwrap()
+            .bulk
+            .unwrap();
+        s3.make_paths_absolute(cwd);
+        assert!(s3.filesystem.is_none());
+        assert_eq!(
+            dev_default_bulk_path(cwd),
+            "/srv/extenddb/.extenddb/buckets"
+        );
     }
 
     #[test]

@@ -38,7 +38,7 @@ pub(crate) async fn resolve_bulk_store(
     resolve_checked(
         app_config.bulk.as_ref(),
         &app_config.server.region,
-        dev_mode,
+        dev_mode.then_some(app_config.dev_default_bulk_path.as_str()),
         catalog_store,
         storage,
         credential_store,
@@ -51,18 +51,18 @@ pub(crate) async fn resolve_bulk_store(
 async fn resolve_checked(
     bulk: Option<&config::BulkConfig>,
     server_region: &str,
-    dev_mode: bool,
+    dev_root: Option<&str>,
     catalog_store: &Arc<dyn CatalogStore>,
     storage: &Arc<dyn StorageEngine>,
     credential_store: &Arc<dyn CredentialStore>,
 ) -> anyhow::Result<Option<Arc<BulkStore>>> {
-    let store = resolve(bulk, server_region, dev_mode, catalog_store, storage).await?;
+    let store = resolve(bulk, server_region, dev_root, catalog_store, storage).await?;
     if let Some(access_key_id) = store.as_deref().and_then(BulkStore::s3_access_key_id) {
         crate::s3_client_key::warn_of_a_client_key(
             S3_STORE_LABEL,
             access_key_id,
             credential_store.as_ref(),
-            dev_mode,
+            dev_root.is_some(),
         )
         .await;
     }
@@ -70,10 +70,12 @@ async fn resolve_checked(
 }
 
 /// [`resolve_bulk_store`] over the `[bulk]` section and `[server] region`.
+/// `dev_root` is `Some` in dev mode: the root dev mode substitutes for an
+/// absent section, made absolute at config load.
 async fn resolve(
     bulk: Option<&config::BulkConfig>,
     server_region: &str,
-    dev_mode: bool,
+    dev_root: Option<&str>,
     catalog_store: &Arc<dyn CatalogStore>,
     storage: &Arc<dyn StorageEngine>,
 ) -> anyhow::Result<Option<Arc<BulkStore>>> {
@@ -84,19 +86,19 @@ async fn resolve(
     // means the feature is disabled, except in dev mode, which substitutes
     // a local directory so zero-config serve has a working store.
     let dev_default_bulk;
-    let effective_bulk = match (bulk, dev_mode) {
+    let effective_bulk = match (bulk, dev_root) {
         (Some(cfg), _) => Some((cfg, false)),
-        (None, true) => {
+        (None, Some(dev_root)) => {
             dev_default_bulk = config::BulkConfig {
                 store: config::BulkStoreKind::Filesystem,
                 filesystem: Some(config::BulkFilesystemConfig {
-                    path: config::DEV_DEFAULT_BULK_PATH.to_owned(),
+                    path: dev_root.to_owned(),
                 }),
                 s3: None,
             };
             Some((&dev_default_bulk, true))
         }
-        (None, false) => None,
+        (None, None) => None,
     };
     let bulk_store: Option<Arc<BulkStore>> = match effective_bulk {
         None => {
@@ -184,9 +186,9 @@ async fn resolve(
             )
             .map_err(|e| anyhow::anyhow!("Cannot resolve bulk store path {expanded}: {e}"))?;
             if is_dev_default {
-                // The dev-mode banner names the configured value; this line
-                // carries the canonical path, at warn so it sits with the
-                // banner's visibility.
+                // The dev-mode banner names the root as the configuration
+                // loader made it absolute; this line carries the canonical
+                // path, at warn so it sits with the banner's visibility.
                 tracing::warn!("Bulk store: {}", canonical.display());
             } else {
                 tracing::info!("Bulk store: filesystem at {}", canonical.display());

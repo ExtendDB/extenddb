@@ -45,6 +45,11 @@ pub struct AppConfig {
     /// filesystem store at `./.extenddb/buckets` when the section is absent.
     #[serde(rename = "bulk")]
     pub bulk: Option<BulkConfig>,
+    /// The store root dev mode substitutes for an absent `[bulk]` section:
+    /// [`DEV_DEFAULT_BULK_PATH`] made absolute at load against the working
+    /// directory, the shell's for `serve`. Not read from the file.
+    #[serde(skip)]
+    pub dev_default_bulk_path: String,
     /// Maximum import file size in bytes. Defaults to 10 GB.
     pub max_import_bytes: Option<u64>,
     /// Path to the rendered documentation directory (`/console/docs`).
@@ -490,8 +495,13 @@ fn environment(vars: Option<config::Map<String, String>>) -> config::Environment
 /// paths made absolute while the working directory is still the shell's.
 fn validated(mut config: AppConfig) -> anyhow::Result<AppConfig> {
     config.backup.validate().map_err(|e| anyhow::anyhow!(e))?;
+    config.dev_default_bulk_path = DEV_DEFAULT_BULK_PATH.to_owned();
     if let Ok(cwd) = std::env::current_dir() {
         config.backup.make_paths_absolute(&cwd);
+        if let Some(bulk) = config.bulk.as_mut() {
+            bulk.make_paths_absolute(&cwd);
+        }
+        config.dev_default_bulk_path = bulk::dev_default_bulk_path(&cwd);
     }
     Ok(config)
 }

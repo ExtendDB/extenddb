@@ -21,13 +21,6 @@ extenddb always runs as a daemon. On startup it:
 7. Starts the HTTP server
 8. Spawns background tasks (log level polling, stream cleanup, TTL expiry, bulk operation workers)
 
-The daemon keeps the directory `serve` was started in as its working
-directory, so a relative path in the configuration or in the environment
-resolves against that directory, as it does with `--foreground`.
-`extenddb stop` and `extenddb status` resolve a relative `run_dir` against
-the directory they run in, where they look for the PID file; give `run_dir`
-as an absolute path, or run them from the directory `serve` was started in.
-
 ### Checking Status
 
 ```bash
@@ -451,8 +444,9 @@ env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
 ```
 
 A relative path in `AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE`, or
-`AWS_WEB_IDENTITY_TOKEN_FILE` resolves against the directory `serve` was
-started in, with or without `--foreground`.
+`AWS_WEB_IDENTITY_TOKEN_FILE` resolves against the server's working
+directory: the directory `serve` was started in with `--foreground`, and `/`
+for the daemon. Give these paths as absolute paths.
 
 The SDK renews credentials before they expire, for as long as their source
 stays valid, when they come from web identity, from container or instance
@@ -485,7 +479,7 @@ root on the server.
 | Key | Default | Description | Environment variable |
 |-----|---------|-------------|----------------------|
 | `store` | `filesystem` | `filesystem` or `s3`, in any letter case. | `EXTENDDB__BULK__STORE` |
-| `filesystem.path` | (none) | The filesystem store's root. Required when `store = "filesystem"`. | `EXTENDDB__BULK__FILESYSTEM__PATH` |
+| `filesystem.path` | (none) | The filesystem store's root. Required when `store = "filesystem"`. A relative path is resolved against the working directory the server was started from (the daemon's own working directory is `/`). | `EXTENDDB__BULK__FILESYSTEM__PATH` |
 | `s3.region` | `[server] region` | The region the S3 store signs for, and the first region a bucket is tried in. One host label: lowercase letters, digits, and hyphens, beginning and ending with a letter or a digit. | `EXTENDDB__BULK__S3__REGION` |
 | `s3.endpoint_url` | AWS S3 for the region | An S3-compatible service: an absolute `http` or `https` URL with a host, an optional port, and an optional path. A URL with user information, a query, or a fragment refuses startup. So does an `http` URL whose host is not loopback, unless `s3.allow_insecure_endpoint` is `true`. | `EXTENDDB__BULK__S3__ENDPOINT_URL` |
 | `s3.allow_insecure_endpoint` | `false` | Accept an `http` `endpoint_url` whose host is not loopback; the server then logs a warning at startup. | `EXTENDDB__BULK__S3__ALLOW_INSECURE_ENDPOINT` (`true` or `false`) |

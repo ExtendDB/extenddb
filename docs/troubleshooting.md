@@ -1105,7 +1105,7 @@ Keys imported earlier keep working while import is disabled.
 
 **Cause:** The `FileSource.Path` in an `ImportTable` request points to a file or directory that does not exist on the server's filesystem.
 
-**Fix:** Verify the path is correct and accessible to the extenddb process. A relative path resolves against the directory `extenddb serve` was started in.
+**Fix:** Verify the path is correct and accessible to the extenddb process. Paths are relative to the server's working directory.
 
 ### `Cannot open source file: <error>`
 

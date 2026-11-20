@@ -243,18 +243,7 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
             // before daemonizing so startup verification reads the new daemon's
             // PID rather than a dead one from a previous run.
             let _ = std::fs::remove_file(pid_file);
-            // The daemon keeps the directory `serve` was started in as its
-            // working directory (the daemonize crate's default is `/`), so a
-            // relative path resolves as it does in the foreground: the bulk
-            // store path and its dev-mode default, the import and export
-            // paths, the run directory and PID file, and the files the AWS SDK
-            // reads from its environment. A start directory that cannot be
-            // read leaves the default.
-            let start_dir =
-                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
-            let daemon = Daemonize::new()
-                .pid_file(pid_file)
-                .working_directory(&start_dir);
+            let daemon = Daemonize::new().pid_file(pid_file);
             match daemon.execute() {
                 daemonize::Outcome::Parent(Ok(_)) => {
                     // Parent process: wait for the PID file to appear (written by
@@ -425,13 +414,13 @@ fn print_dev_mode_banner(
 
     let dev_creds = dev_credentials::resolve()?;
     let bulk_store = if app_config.bulk.is_none() {
-        // Dev mode substitutes the default store when [bulk] is absent. The
-        // banner prints before the server canonicalizes the root, so it
-        // names the configured value; the startup log carries the canonical
-        // path.
+        // Dev mode substitutes the default store when [bulk] is absent, at
+        // the root the configuration loader made absolute. The banner prints
+        // before the server canonicalizes the root; the startup log carries
+        // the canonical path.
         Some(format!(
             "  Bulk store: {} (dev-mode default; the startup log names the canonical path)",
-            config::DEV_DEFAULT_BULK_PATH
+            app_config.dev_default_bulk_path
         ))
     } else {
         dev_mode_s3_line(app_config.bulk.as_ref(), &app_config.server.region)?

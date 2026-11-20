@@ -9,6 +9,7 @@ PostgreSQL instance (EXTENDDB_TEST_PG_CONNECTION_STRING) and a built binary, and
 are excluded from the backend-agnostic pytest suite.
 """
 
+import json
 import os
 import time
 import uuid
@@ -279,32 +280,72 @@ class TestCliLifecycle:
         result = _run_extenddb("destroy", "--yes", *_pg_args(), config=cli_env["config_path"])
         assert result.returncode == 0
 
-    def test_daemon_resolves_relative_paths_against_its_start_directory(self, cli_env):
-        """A daemonized serve resolves relative bulk store, import and export
-        paths against the directory it was started in, as in the foreground."""
+    def test_daemon_resolves_a_relative_bulk_store_path_against_the_shell(
+        self, cli_env, tmp_path, monkeypatch
+    ):
+        """A relative `[bulk.filesystem] path` is made absolute at config
+        load, against the directory `serve` is started in, so the daemon,
+        whose working directory is `/`, creates the store root there and one
+        StartBulkPutItems loads a row from a file beneath it."""
+        import platform
+
+        from bulk_put import bulk_helpers as bh
+        from conftest import wait_for_active
+        from management_helpers import ManagementClient
+
         _run_extenddb(
             "init", *_init_args(cli_env),
             config=cli_env["config_path"],
             env_override={"EXTENDDB_ADMIN_PASSWORD": "TestPass1!"},
         )
         _patch_config_port(cli_env["config_path"], cli_env["port"])
-        start_dir = os.path.dirname(cli_env["config_path"])
-        names = ("relative-buckets", "relative-imports", "relative-exports")
         with open(cli_env["config_path"], "a") as f:
-            f.write(
-                f'\n[bulk]\n\n[bulk.filesystem]\npath = "{names[0]}"\n'
-                f'\n[import]\npaths = ["{names[1]}"]\n'
-                f'\n[export]\npaths = ["{names[2]}"]\n'
-            )
+            f.write('\n[bulk]\n\n[bulk.filesystem]\npath = "relative-buckets"\n')
+        # Another directory than the one that holds the config.
+        start_dir = tmp_path / "start"
+        start_dir.mkdir()
 
-        # Serve (daemonizes), started in the directory that holds the config.
         result = _run_extenddb(
-            "serve", config=cli_env["config_path"], cwd=start_dir, check=False,
+            "serve", config=cli_env["config_path"], cwd=str(start_dir), check=False,
         )
         assert result.returncode == 0, result.stdout + result.stderr
         assert _wait_for_server(cli_env["port"]), "Server did not become healthy"
-        for name in names:
-            assert os.path.isdir(os.path.join(start_dir, name)), name
+        if platform.system() == "Linux":
+            # The PID file is in the default run_dir, $HOME/.extenddb/run.
+            pid_file = os.path.join(
+                os.environ["HOME"], ".extenddb", "run", f"extenddb-{cli_env['port']}.pid"
+            )
+            with open(pid_file) as f:
+                daemon_pid = int(f.read().strip())
+            assert os.readlink(f"/proc/{daemon_pid}/cwd") == "/"
+        root = start_dir / "relative-buckets"
+        assert root.is_dir()
+        assert not os.path.exists("/relative-buckets")
+
+        endpoint = f"https://127.0.0.1:{cli_env['port']}"
+        monkeypatch.setattr(bh, "ENDPOINT", endpoint)
+        mgmt = ManagementClient(endpoint, "admin", "TestPass1!")
+        account, creds = bh._provision_account(mgmt, "bulk-root")
+        ddb = bh._boto_client(creds)
+        ddb.create_table(
+            TableName="relative-root",
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        wait_for_active(ddb, "relative-root")
+        # The account directory is the server's; the bucket is the caller's.
+        bucket = root / account / "loads"
+        (bucket / "in").mkdir(parents=True)
+        (bucket / "in" / "part-0.json").write_text(json.dumps(bh.row("k1")) + "\n")
+
+        started = bh.extenddb_request(
+            "StartBulkPutItems", bh.start_body("relative-root", "loads"), creds
+        )["BulkOperationDescription"]
+        done = bh.wait_until_terminal(started["BulkOperationArn"], creds=creds)
+        assert done["BulkOperationStatus"] == "COMPLETED", done
+        item = ddb.get_item(TableName="relative-root", Key={"pk": {"S": "k1"}})
+        assert item["Item"] == {"pk": {"S": "k1"}}
 
         result = _run_extenddb("stop", config=cli_env["config_path"])
         assert result.returncode == 0
