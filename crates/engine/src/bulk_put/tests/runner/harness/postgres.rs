@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The harness on a throwaway PostgreSQL database, for the runner cases
-//! that must hold on both backends. Each harness builds its own database
-//! from the shipped catalog and data migrations and drops it in
-//! [`Harness::cleanup`], which a case calls once it has passed, so a
-//! failing case leaves its database, named `eddb_run_*`, for inspection.
+//! that must hold on both backends. Each harness builds its own database,
+//! named `eddb_run_*`, from the shipped catalog and data migrations, and
+//! drops it in [`Harness::cleanup`], which a case calls once it has passed.
+//! A case that fails drops the harness without `cleanup`, and the database
+//! is dropped then, so a shared server keeps no database of a failed case.
 //!
 //! Requires `EXTENDDB_TEST_PG_CONNECTION_STRING`, a base URL with no
 //! database component, pointing at a server whose role may create and drop
@@ -14,14 +15,59 @@
 
 use super::*;
 
-use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use sqlx::{Connection, PgPool};
 
 /// The database a PostgreSQL harness runs on.
 pub(crate) struct PgScratch {
     admin: PgPool,
     catalog: PgPool,
-    db_name: String,
+    db_name: ScratchName,
+}
+
+/// The name of a scratch database. Dropped while it still holds the name,
+/// as when a case panics before `cleanup`, it drops the database through a
+/// connection of its own, on a thread with its own runtime, because `Drop`
+/// cannot wait on the case's runtime.
+struct ScratchName(Option<String>);
+
+impl Drop for ScratchName {
+    fn drop(&mut self) {
+        let (Some(db_name), Some(base)) = (self.0.take(), base_conn()) else {
+            return;
+        };
+        let dropped = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            runtime.block_on(async {
+                let remove = async {
+                    let mut conn = sqlx::PgConnection::connect(&format!("{base}/postgres")).await?;
+                    sqlx::query(&drop_statement(&db_name))
+                        .execute(&mut conn)
+                        .await?;
+                    conn.close().await
+                };
+                match tokio::time::timeout(Duration::from_secs(30), remove).await {
+                    Ok(result) => result.map_err(|e| format!("{db_name}: {e}")),
+                    Err(_) => Err(format!("{db_name}: no answer within 30 s")),
+                }
+            })
+        })
+        .join();
+        match dropped {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!("the scratch database was not dropped: {error}"),
+            Err(_) => eprintln!("the thread that drops the scratch database panicked"),
+        }
+    }
+}
+
+/// The statement that drops scratch database `db_name` and ends the
+/// connections that still hold it.
+fn drop_statement(db_name: &str) -> String {
+    format!("DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)")
 }
 
 /// Which backend a case that runs on both builds its harnesses on.
@@ -155,7 +201,7 @@ impl Harness {
             pg: Some(PgScratch {
                 admin,
                 catalog,
-                db_name,
+                db_name: ScratchName(Some(db_name)),
             }),
             _db_dir: None,
         }
@@ -166,19 +212,18 @@ impl Harness {
         let Some(PgScratch {
             admin,
             catalog,
-            db_name,
+            mut db_name,
         }) = self.pg
         else {
             return;
         };
+        let db_name = db_name.0.take().expect("only cleanup takes the name");
         drop(self.storage);
         catalog.close().await;
-        sqlx::query(&format!(
-            "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
-        ))
-        .execute(&admin)
-        .await
-        .expect("drop the scratch database");
+        sqlx::query(&drop_statement(&db_name))
+            .execute(&admin)
+            .await
+            .expect("drop the scratch database");
         admin.close().await;
     }
 }
