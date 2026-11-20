@@ -619,15 +619,9 @@ async fn refresh_dropped_when_hard_miss_races() {
     // discarded by the identity guard, NOT inserted on top of n=3.
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    // 6. Subsequent reads still see n=3. The post-hard-miss entry is ~150ms
-    // old now (well within the 200ms hard TTL). If the refresh had clobbered,
-    // we'd see n=2 here.
-    let v4 = cache.get("k".into()).await.unwrap().unwrap();
-    assert_eq!(
-        v4, "n=3",
-        "stale refresh must not overwrite the post-hard-miss value"
-    );
-
+    // 6. Check metrics immediately after the slow refresh finishes, before any
+    // subsequent read. The slow refresh (n=2) must have been dropped by the
+    // identity guard, not written back.
     let m = cache.metrics().snapshot();
     assert_eq!(
         m.refresh_success, 0,
@@ -636,6 +630,15 @@ async fn refresh_dropped_when_hard_miss_races() {
     assert!(
         m.refresh_dropped_epoch >= 1,
         "the slow refresh must be counted as dropped; got {m:?}"
+    );
+
+    // 7. Subsequent reads still see n=3. The post-hard-miss entry is ~150ms
+    // old now (well within the 200ms hard TTL). If the refresh had clobbered,
+    // we'd see n=2 here.
+    let v4 = cache.get("k".into()).await.unwrap().unwrap();
+    assert_eq!(
+        v4, "n=3",
+        "stale refresh must not overwrite the post-hard-miss value"
     );
 }
 
