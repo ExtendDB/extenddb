@@ -79,13 +79,12 @@ pub(super) async fn flush_staged(
     // place instead, with the cursor left where the last checkpoint put it
     // (`runner::in_place`), and the deadline is checked again after the
     // wait, for a process that stalled through its renewals.
-    let mut deadline = st.lease_deadline;
-    let waited = keeping_lease_in_place(deps, record, &mut deadline, Watch::LeaseOnly, async {
+    let wait = async {
         deps.pacer.acquire(units).await;
         op_pacer.acquire(op_units).await;
-    })
-    .await;
-    st.lease_deadline = deadline;
+    };
+    let waited =
+        keeping_lease_in_place(deps, record, &mut st.lease_deadline, Watch::LeaseOnly, wait).await;
     match waited {
         InPlace::Answer(()) => {}
         InPlace::Interrupted(error) => return Err(RunnerError::Storage(error)),

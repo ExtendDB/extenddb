@@ -41,6 +41,7 @@ use tokio::time::Instant;
 
 use extenddb_core::types::{Item, TableKeyInfo};
 
+use crate::bulk_put::usage::whole_f64_to_u64;
 use crate::capacity_helpers;
 
 /// Write request units for an item of `item_bytes` bytes: 1 KB each,
@@ -60,15 +61,8 @@ pub(crate) fn index_write_units(
     new: Option<&Item>,
     info: &TableKeyInfo,
 ) -> u64 {
-    if info.global_secondary_indexes.is_empty() && info.local_secondary_indexes.is_empty() {
-        return 0;
-    }
     let (gsi, lsi) = capacity_helpers::index_write_units(old, new, false, info);
-    let total: f64 = gsi.values().chain(lsi.values()).sum();
-    // Whole numbers of units, far below 2^53, so the conversion is exact.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let units = total.max(0.0) as u64;
-    units
+    whole_f64_to_u64(gsi.values().chain(lsi.values()).sum())
 }
 
 #[derive(Debug)]

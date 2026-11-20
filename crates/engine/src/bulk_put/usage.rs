@@ -333,7 +333,7 @@ fn index_write_bytes(
 
 /// Convert a `capacity_helpers` figure to an integer. The figures are
 /// non-negative whole numbers far below 2^53, so the conversion is exact.
-fn whole_f64_to_u64(value: f64) -> u64 {
+pub(super) fn whole_f64_to_u64(value: f64) -> u64 {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let converted = value.max(0.0) as u64;
     converted
