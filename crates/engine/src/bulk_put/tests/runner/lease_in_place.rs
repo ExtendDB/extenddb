@@ -155,8 +155,9 @@ async fn five_rows_one_error(h: &Harness) -> (String, BulkOperationRecord, Runne
 }
 
 /// Hold the call at `at` for over two lease periods while the runner is
-/// polled, check that no other process can claim the operation and that
-/// runner-1 still holds it, then release the call and let the run finish.
+/// polled, check that no other process can claim the operation, that
+/// runner-1 still holds it and that the renewals left the cursor where the
+/// hold found it, then release the call and let the run finish.
 async fn held_call_keeps_the_lease(at: HoldAt) -> (Harness, String) {
     let h = Harness::new().await;
     let (op, record, cfg) = five_rows_one_error(&h).await;
@@ -177,6 +178,7 @@ async fn held_call_keeps_the_lease(at: HoldAt) -> (Harness, String) {
     })
     .await
     .expect("the runner reaches the held call");
+    let at_hold = h.record(&op).await;
 
     // The runner is polled through the hold, so it renews its lease.
     let probe = async {
@@ -187,9 +189,9 @@ async fn held_call_keeps_the_lease(at: HoldAt) -> (Harness, String) {
             .await
             .expect("claim");
         let mid = h.record(&op).await;
-        (rivals.len(), mid.lease_owner, mid.status)
+        (rivals.len(), mid)
     };
-    let (rivals, owner, status) = tokio::select! {
+    let (rivals, mid) = tokio::select! {
         _ = &mut run => panic!("the runner must not finish while the call is held"),
         probed = probe => probed,
     };
@@ -197,8 +199,13 @@ async fn held_call_keeps_the_lease(at: HoldAt) -> (Harness, String) {
         rivals, 0,
         "no second owner claims the operation during the hold"
     );
-    assert_eq!(owner.as_deref(), Some("runner-1"));
-    assert_eq!(status, "IN_PROGRESS");
+    assert_eq!(mid.lease_owner.as_deref(), Some("runner-1"));
+    assert_eq!(mid.status, "IN_PROGRESS");
+    assert_eq!(
+        (mid.cursor_file_index, mid.cursor_row_index),
+        (at_hold.cursor_file_index, at_hold.cursor_row_index),
+        "the renewals during the hold leave the cursor where the hold found it"
+    );
 
     release.notify_one();
     tokio::time::timeout(BOUND, &mut run)
