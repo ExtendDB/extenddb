@@ -511,13 +511,41 @@ fn non_scalar_values_are_skipped() {
 }
 
 #[test]
-fn number_values_are_sized_by_their_digit_string() {
-    // The service refuses a number of more than 38 significant digits before
-    // any size check (measured 2026-10-23). ExtendDB does not validate a
-    // number in a key condition, so a long digit string reaches the size
-    // check and is sized by its length.
-    let kc = hash_only("pk", "v");
-    let values = HashMap::from([("v".to_owned(), AttributeValue::N("1".repeat(2049)))]);
-    let m = ExpressionMaps::new(HashMap::new(), values);
-    assert_eq!(message(check(&kc, &base_schema(), &m)), HASH_MSG_2048);
+fn number_values_get_the_number_rules_before_any_size() {
+    // Measured 2026-11-20 in us-east-1 on a GSI with HASH `n` (N): a number
+    // that breaks the number rules gets the number's sentence, never the size
+    // sentence, and a valid one is sized by its normalized digits. The RANGE
+    // rows apply the same rule to a sort key value.
+    const DIGITS: &str = "Attempting to store more than 38 significant digits in a Number";
+    const OVERFLOW: &str =
+        "Number overflow. Attempting to store a number with magnitude larger than supported range";
+    let zeros = "0".repeat(2100);
+    let cases: [(&str, &str, String, Option<&str>); 6] = [
+        ("hash, 2049 digits", "pk", "1".repeat(2049), Some(DIGITS)),
+        ("hash, 39 digits", "pk", "1".repeat(39), Some(DIGITS)),
+        (
+            "hash, 1 and 2100 zeros",
+            "pk",
+            format!("1{zeros}"),
+            Some(OVERFLOW),
+        ),
+        ("hash, 2100 zeros and 1", "pk", format!("{zeros}1"), None),
+        ("range, 1025 digits", "sk", "1".repeat(1025), Some(DIGITS)),
+        ("range, 2100 zeros and 1", "sk", format!("{zeros}1"), None),
+    ];
+    for (label, attribute, n, expected) in cases {
+        let mut kc = hash_only("pk", "p");
+        let mut values = vec![("p", s_of("p", 1))];
+        if attribute == "sk" {
+            kc.sk_condition = Some(eq("sk", "v"));
+            values.push(("v", AttributeValue::N(n)));
+        } else {
+            values = vec![("p", AttributeValue::N(n))];
+        }
+        let result = check(&kc, &base_schema(), &maps_with(values));
+        match expected {
+            Some(sentence) => assert_eq!(message(result), sentence, "{label}"),
+            None => assert!(result.is_ok(), "{label}: {result:?}"),
+        }
+    }
 }

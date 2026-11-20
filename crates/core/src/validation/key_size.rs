@@ -18,17 +18,14 @@ use crate::expression::{
 };
 use crate::limits::LimitsConfig;
 use crate::types::{AttributeValue, KeySchemaElement, KeyType};
+use crate::validation::number::validate_and_normalize_number;
 
 /// Byte size of a key attribute value.
 ///
 /// `S` is sized by its UTF-8 bytes, `B` by its decoded bytes and `N` by its
-/// digit string. The service caps a number at 38 significant digits and
-/// refuses a longer one on the Query path before any size check (measured
-/// 2026-10-23: 39 digits and 2049 digits are both refused with
-/// `Attempting to store more than 38 significant digits in a Number`). ExtendDB
-/// does not validate a number in a key condition yet, so a long `N` string
-/// reaches this function and is sized by its length; the Query path relies on
-/// number validation that ExtendDB does not have.
+/// digit string. A number that passes the number rules is normalized when the
+/// request is read; on the Query path a number that breaks them is refused
+/// before it is sized (see `sized_clause`).
 pub(super) fn key_value_byte_size(value: &AttributeValue) -> usize {
     match value {
         AttributeValue::S(s) => s.len(),
@@ -111,17 +108,30 @@ enum ClauseSize {
 /// Size one clause. A clause with two values (`BETWEEN`) contributes the
 /// larger of the two. Measured 2026-10-23: bounds of 600 and 600 bytes pass (a
 /// sum would be 1200), bounds of 1 and 1025 bytes are refused.
+///
+/// An `N` value is checked against the number rules first, and one that breaks
+/// them is refused with the number's own sentence, never sized; one that
+/// passes is sized by its normalized digit string. Measured 2026-11-20 in
+/// us-east-1 on a GSI with HASH `n` (N): 2049 or 39 digits answer `Attempting
+/// to store more than 38 significant digits in a Number` in
+/// `KeyConditionExpression` and in `KeyConditions`, `1` followed by 2100 zeros
+/// answers `Number overflow. ...`, and 2100 zeros followed by `1` is served.
+///
+/// # Errors
+///
+/// Returns the number rules' `ValidationException` for an `N` value that
+/// breaks them.
 fn sized_clause(
     clause: &Clause<'_>,
     key_schema: &[KeySchemaElement],
     maps: &ExpressionMaps,
-) -> ClauseSize {
+) -> Result<ClauseSize, DynamoDbError> {
     let (path, values) = clause;
     let Some(first) = path.first() else {
-        return ClauseSize::Skipped;
+        return Ok(ClauseSize::Skipped);
     };
     let Ok(name) = resolve_element_name(first, maps) else {
-        return ClauseSize::Unresolved;
+        return Ok(ClauseSize::Unresolved);
     };
     let mut size = 0;
     let mut placeholders = true;
@@ -131,17 +141,21 @@ fn sized_clause(
             continue;
         };
         let Ok(value) = maps.resolve_value(placeholder) else {
-            return ClauseSize::Unresolved;
+            return Ok(ClauseSize::Unresolved);
         };
-        size = size.max(key_value_byte_size(value));
+        let bytes = match value {
+            AttributeValue::N(n) => validate_and_normalize_number(n)?.len(),
+            other => key_value_byte_size(other),
+        };
+        size = size.max(bytes);
     }
     let Some(key) = key_schema.iter().find(|ks| ks.attribute_name == name) else {
-        return ClauseSize::Skipped;
+        return Ok(ClauseSize::Skipped);
     };
     if !placeholders {
-        return ClauseSize::Skipped;
+        return Ok(ClauseSize::Skipped);
     }
-    ClauseSize::Bytes(key.key_type, size)
+    Ok(ClauseSize::Bytes(key.key_type, size))
 }
 
 /// Refuse a `Query` whose key condition carries a key value over the key size
@@ -158,26 +172,30 @@ fn sized_clause(
 ///   the range sentence.
 /// - The HASH checks run before the RANGE check, so the hash sentence wins when
 ///   both limits are exceeded.
+/// - An `N` value that breaks the number rules is refused with the number's
+///   sentence and is not sized (see `sized_clause`).
 /// - If a `#name` or `:value` of any key clause is not defined, the check
-///   returns `Ok` and the request gets the undefined-reference refusal it
-///   already has, which the service reports ahead of the size.
+///   returns `Ok`, because the service reports the undefined reference ahead
+///   of the size. ExtendDB refuses most such requests later on. On a key
+///   schema with one HASH and at most one RANGE attribute, an undefined
+///   `#name` in a second clause (`pk = :h AND #u > :r`) is not refused yet and
+///   the Query is served, where the service refuses it.
 ///
 /// All limits are inclusive. `key_schema` is the key schema being queried: the
 /// index's for an index query, the table's otherwise.
 ///
-/// Measured on the service 2026-10-21 to 2026-10-23: the limits and the
-/// sentences on a base table, an LSI and a GSI; string and binary values sized
-/// by byte length; every operator above at 1025 bytes refused; `BETWEEN` as
-/// described; the hash sentence when both limits are exceeded; on an index
-/// with HASH `h1`, `h2`: `h1` of 2049 bytes and `h2` of 1 byte gives the
-/// single sentence, 1025 and 1024 bytes (sum 2049) and 2048 and 2048 bytes give
-/// the aggregated sentence; on an index with HASH `h` and RANGE `a`, `b`, `c`,
-/// `d`: `a` of 600 and `c` of 600 bytes (with `b` of 1) refused, 512 and 512
-/// passes, 512 and 513 refused, `b > 1025` refused, `a` of 600 with `b BETWEEN`
-/// 1 and 600 refused and with 1 and 424 passes. Not measured: a HASH sum of
-/// exactly 2048 bytes (treated as within the limit, as the single-value limit
-/// is) and which sentence wins when the HASH sum and the RANGE sum are both
-/// over (the hash sentence, as for a single HASH value).
+/// Measured on the service in us-east-1 2026-10-21 to 2026-10-23: the limits
+/// and the sentences on a base table, an LSI and a GSI; string and binary
+/// values sized by byte length; every operator above at 1025 bytes refused;
+/// `BETWEEN` as described; the hash sentence when both limits are exceeded; on
+/// an index with HASH `h1`, `h2`: `h1` of 2049 bytes and `h2` of 1 byte gives
+/// the single sentence, 1025 and 1024 bytes (sum 2049) and 2048 and 2048 bytes
+/// give the aggregated sentence; on an index with HASH `h` and RANGE `a`, `b`,
+/// `c`, `d`: `a` of 600 and `c` of 600 bytes (with `b` of 1) refused, 512 and
+/// 512 passes, 512 and 513 refused, `b > 1025` refused, `a` of 600 with `b
+/// BETWEEN` 1 and 600 refused and with 1 and 424 passes. Measured 2026-11-20 on
+/// the `h1`, `h2` index: 1024 and 1024 bytes (sum 2048) pass, and 1025 and 1024
+/// bytes with a 1025-byte RANGE value give the aggregated hash sentence.
 ///
 /// A clause that names an attribute outside the key schema, or that is not a
 /// placeholder, adds nothing, so the refusal it already gets stays unchanged.
@@ -185,7 +203,7 @@ fn sized_clause(
 /// # Errors
 ///
 /// Returns `ValidationException` with the service's sentence when a limit is
-/// exceeded.
+/// exceeded or an `N` value breaks the number rules.
 pub fn validate_query_key_sizes(
     key_condition: &KeyCondition,
     key_schema: &[KeySchemaElement],
@@ -196,7 +214,7 @@ pub fn validate_query_key_sizes(
     let mut hash_total: usize = 0;
     let mut range_total: usize = 0;
     for clause in clauses(key_condition) {
-        match sized_clause(&clause, key_schema, maps) {
+        match sized_clause(&clause, key_schema, maps)? {
             ClauseSize::Unresolved => return Ok(()),
             ClauseSize::Skipped => {}
             ClauseSize::Bytes(KeyType::Hash, size) => {
