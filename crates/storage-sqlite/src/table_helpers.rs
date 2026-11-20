@@ -15,11 +15,12 @@ use extenddb_storage::util::{index_arn, parse_warm_throughput_record, stream_arn
 use extenddb_storage::vector_catalog::{VectorIndexCatalogRow, vector_index_descriptions};
 
 use crate::data;
+use crate::row_macro::sqlite_row_struct;
 use crate::sqlite_util::parse_timestamp;
 use crate::store::SqliteEngine;
 
+sqlite_row_struct! {
 /// Catalog `tables` row (JSON columns as TEXT, timestamp as RFC 3339 TEXT).
-#[derive(sqlx::FromRow)]
 pub(crate) struct TableRow {
     pub table_name: String,
     pub key_schema: String,
@@ -40,9 +41,10 @@ pub(crate) struct TableRow {
     pub on_demand_throughput: Option<String>,
     pub warm_throughput: Option<String>,
 }
+}
 
+sqlite_row_struct! {
 /// Catalog `indexes` row.
-#[derive(sqlx::FromRow)]
 pub(crate) struct IndexRow {
     pub index_name: String,
     #[allow(dead_code)]
@@ -54,13 +56,14 @@ pub(crate) struct IndexRow {
     pub provisioned_throughput: Option<String>,
     pub warm_throughput: Option<String>,
 }
+}
 
+sqlite_row_struct! {
 /// A `vector_indexes` catalog row, in `FromRow` field order.
 ///
 /// Decoding stops at this struct: the rules that turn it into a wire shape are
 /// shared with the other backends in `extenddb_storage::vector_catalog`. The JSON
 /// columns are text here, so the conversion parses them into values.
-#[derive(sqlx::FromRow)]
 pub(crate) struct VectorIndexRow {
     pub index_name: String,
     #[allow(dead_code)]
@@ -72,6 +75,7 @@ pub(crate) struct VectorIndexRow {
     pub projection: String,
     pub index_status: String,
     pub backfilling: Option<i64>,
+}
 }
 
 impl VectorIndexRow {

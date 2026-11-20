@@ -47,6 +47,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::row_macro::sqlite_row_struct;
 use extenddb_core::backup_format::BackupArn;
 use extenddb_core::types::{CreateTableInput, RestoreSummary};
 use extenddb_storage::JobPermit;
@@ -535,8 +536,8 @@ const ROW_COLUMNS: &str = "backup_id, account_id, table_name, backup_arn, backup
      store_kind, store_root, store_id, size_bytes, item_count, created_at, completed_at, \
      failure_reason, source_table_details_json, owner_generation, heartbeat_at";
 
+sqlite_row_struct! {
 /// One `backup_index` row as the driver reads it.
-#[derive(sqlx::FromRow)]
 struct RowTuple {
     backup_id: String,
     account_id: String,
@@ -555,6 +556,7 @@ struct RowTuple {
     source_table_details_json: String,
     owner_generation: i64,
     heartbeat_at: String,
+}
 }
 
 fn row_from_tuple(t: RowTuple) -> Result<BackupRow, StorageError> {

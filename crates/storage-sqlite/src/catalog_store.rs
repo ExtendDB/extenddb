@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use crate::row_macro::sqlite_row_struct;
 use extenddb_storage::CatalogStore;
 use extenddb_storage::diagnostics::{DiagError, DiagResult, DiagnosticsStore};
 use extenddb_storage::management_store::{
@@ -151,7 +152,7 @@ impl SettingsStore for SqliteCatalogStore {
 
 // ── MetricsStore ───────────────────────────────────────────────────────
 
-#[derive(sqlx::FromRow)]
+sqlite_row_struct! {
 struct DbMetricsRow {
     bucket: String,
     account_id: String,
@@ -163,6 +164,7 @@ struct DbMetricsRow {
     count: i64,
     min: f64,
     max: f64,
+}
 }
 
 /// `account_metrics`: migration 10 replaced `metrics` with it.

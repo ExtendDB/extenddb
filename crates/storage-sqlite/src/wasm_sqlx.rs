@@ -1526,6 +1526,16 @@ pub mod sqlite {
     };
 }
 
+/// Mirrors the `sqlx::pool` module path (`sqlx::pool::PoolConnection`).
+pub mod pool {
+    pub use super::PoolConnection;
+}
+
+/// Mirrors the `sqlx::error` module path (`sqlx::error::DatabaseError`).
+pub mod error {
+    pub use super::DatabaseError;
+}
+
 // ──────────────────────────────── tests ────────────────────────────────
 
 #[cfg(test)]
