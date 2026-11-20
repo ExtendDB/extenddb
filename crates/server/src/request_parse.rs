@@ -376,21 +376,15 @@ mod tests {
         body
     }
 
-    /// `deep_body(wrappers)` with its last `}` written as `]`.
-    fn wrong_closer_body(wrappers: usize) -> Vec<u8> {
-        let mut body = deep_body(wrappers);
-        *body.last_mut().unwrap() = b']';
-        body
-    }
-
     #[test]
     fn the_syntax_check_refuses_a_malformed_deep_body_as_the_parse_does() {
         // Rows: a body nested past the pre-auth depth with a syntax fault. The
         // service refuses each before authentication with a
         // SerializationException (measured 2026-11-19, us-east-1, unsigned
-        // and badly signed). The check must give the refusal that the parse
-        // after authentication gives the same body. The parse recurses, so the
-        // rows run on a worker-sized stack.
+        // and badly signed). For the structural faults in these rows the check
+        // gives the message the parse after authentication gives. For a raw
+        // control character in a string, the skip reports one column earlier.
+        // The parse recurses, so the rows run on a worker-sized stack.
         let rows = [
             [&b"x"[..], &b"[".repeat(6000)].concat(),
             [&b"x"[..], &b"[".repeat(200)].concat(),
@@ -398,7 +392,7 @@ mod tests {
             truncated_body(200),
             truncated_body(2000),
             truncated_body(20000),
-            wrong_closer_body(200),
+            [&truncated_body(200)[..], b"]"].concat(),
         ];
         std::thread::Builder::new()
             .stack_size(REQUEST_WORKER_STACK_SIZE)
@@ -415,26 +409,6 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
-        // Past the ceiling the refusal carries no message, which the service
-        // also gives these bodies; within it, the server's usual wording.
-        let past = [&b"x"[..], &b"[".repeat(6000)].concat();
-        assert!(
-            check_request_syntax(&past, nesting_depth(&past))
-                .unwrap_err()
-                .message()
-                .is_empty()
-        );
-        let within = truncated_body(200);
-        assert_eq!(
-            check_request_syntax(&within, nesting_depth(&within))
-                .unwrap_err()
-                .message(),
-            format!(
-                "Start of structure or map found where not expected: \
-                 EOF while parsing an object at line 1 column {}",
-                within.len()
-            )
-        );
     }
 
     #[test]

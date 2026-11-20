@@ -234,40 +234,29 @@ def _unauthenticated_put(dynamodb_client, endpoint_url, body: bytes, signing: st
     )
 
 
-def _malformed_body(table_name: str, shape: str) -> bytes:
-    """`x-then-6000-openers` is the byte `x` followed by 6000 `[`;
-    `truncated-<w>` is the raw PutItem body of `w` wrappers without its last
-    byte."""
-    if shape == "x-then-6000-openers":
-        return b"x" + b"[" * 6000
-    wrappers = int(shape.removeprefix("truncated-"))
-    return _raw_put_body(table_name, "malformed", wrappers)[:-1]
-
-
 @pytest.mark.parametrize("signing", ["unsigned", "bad-signature"])
 @pytest.mark.parametrize(
-    "shape",
-    [
-        "x-then-6000-openers",
-        "truncated-63",
-        "truncated-200",
-        "truncated-2000",
-        "truncated-20000",
-    ],
+    "wrappers",
+    [None, 63, 200, 2000, 20000],
+    ids=lambda w: "x-then-6000-openers" if w is None else f"truncated-{w}",
 )
 def test_a_malformed_deep_body_is_refused_before_authentication(
-    dynamodb_client, endpoint_url, table, shape, signing
+    dynamodb_client, endpoint_url, table, wrappers, signing
 ):
     # Each body nests past the 127 levels ExtendDB parses before
     # authentication and has a syntax fault. The service answers each with a
     # 400 SerializationException, unsigned and badly signed (2 of 2 sends per
     # body and signing, us-east-1, 2026-11-19).
-    body = _malformed_body(table, shape)
+    body = (
+        b"x" + b"[" * 6000
+        if wrappers is None
+        else _raw_put_body(table, "malformed", wrappers)[:-1]
+    )
     resp = _unauthenticated_put(dynamodb_client, endpoint_url, body, signing)
     assert resp.status_code == 400, resp.text
     err = resp.json()
     assert err["__type"] == SERIALIZATION_TYPE, resp.text
-    if shape in ("x-then-6000-openers", "truncated-20000"):
+    if wrappers in (None, 20000):
         # Nested past ExtendDB's 5200 level ceiling, both answers have no
         # message field. Within the ceiling ExtendDB's refusal carries its usual
         # wording, as for a shallow malformed body, where the service's has no
