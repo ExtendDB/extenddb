@@ -2,12 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Key size limits on a `Query` key condition, driven from the expression
-//! text. Each case is a row measured on the service on 2026-10-21 (index with
-//! HASH `h` and RANGE `a`, `b`, `c`, `d`), 2026-10-22 (base table with HASH
-//! `pk` and RANGE `sk`) or 2026-10-23 (the operator, `BETWEEN`, binary and
-//! ordering rows, recorded in the issue's fold file) or 2026-10-23 (the
-//! multi-attribute, multi-byte and undefined-reference rows, recorded in
-//! `service-435-review.jsonl` and `service-435-440-review-2.jsonl`). The check
+//! text. Each case is a row measured on the service in us-east-1 on
+//! 2026-10-21 (index with HASH `h` and RANGE `a`, `b`, `c`, `d`), 2026-10-22
+//! (base table with HASH `pk` and RANGE `sk`) or 2026-10-23 (the operator,
+//! `BETWEEN`, binary, ordering, multi-attribute, multi-byte and
+//! undefined-reference rows). The check
 //! does not depend on how the key condition is arranged, so it runs on the
 //! parser's output without the schema classification step.
 
@@ -237,10 +236,9 @@ fn clause_order_does_not_change_the_result() {
 
 #[test]
 fn legacy_key_conditions_are_checked_like_the_expression() {
-    // Measured 2026-10-23 (rows `6 legacy hash 2049` and `6 legacy range 1025`
-    // of `service-435-shapes.jsonl`): the service sizes legacy `KeyConditions`
-    // with the same sentences. Both syntaxes reach the check as one key
-    // condition.
+    // Measured 2026-10-23 in us-east-1, with a 2049-byte hash value and with a
+    // 1025-byte range value: the service sizes legacy `KeyConditions` with the
+    // same sentences. Both syntaxes reach the check as one key condition.
     let eq = |value: AttributeValue| Condition {
         comparison_operator: "EQ".to_owned(),
         attribute_value_list: vec![value],

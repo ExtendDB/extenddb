@@ -131,12 +131,6 @@ pub async fn handle_query(
         ));
     }
 
-    // Select=ALL_ATTRIBUTES requires an ALL-projection GSI (shared with Scan).
-    // With an ExclusiveStartKey this runs after the start key checks below.
-    if input.exclusive_start_key.is_none() {
-        validate_query_select_index_support(input.select, index_info.as_ref())?;
-    }
-
     // Validate Limit >= 1 (REQ-QUERY-001)
     if let Some(limit) = input.limit
         && limit < 1
@@ -492,11 +486,11 @@ pub async fn handle_query(
     // values together 1024 bytes) before any storage read. Order measured
     // 2026-10-23 with a 2049-byte hash value plus one other fault: a missing
     // table, a wrong IndexName, ConsistentRead on a GSI, Limit 0, a key
-    // condition that misses the key schema, a wrong-typed key value (the type
-    // check arrives with the multi-attribute range change and belongs above
-    // this call), a FilterExpression syntax error and an unused expression
-    // value are all reported ahead of the size; an invalid ExclusiveStartKey
-    // is reported after it. KeyConditions is checked like the expression.
+    // condition that misses the key schema, a wrong-typed key value (checked
+    // above, in `resolve_key_schema_with`), a FilterExpression syntax error
+    // and an unused expression value are all reported ahead of the size; an
+    // invalid ExclusiveStartKey is reported after it. KeyConditions is checked
+    // like the expression.
     extenddb_core::validation::validate_query_key_sizes(
         &key_condition,
         &query_key_info.key_schema,
@@ -517,8 +511,17 @@ pub async fn handle_query(
                 forward: input.scan_index_forward,
             },
         )?;
-        validate_query_select_index_support(input.select, index_info.as_ref())?;
     }
+
+    // Select=ALL_ATTRIBUTES requires an ALL-projection GSI (shared with Scan).
+    // The service makes this check after the key size and start key checks.
+    // Measured 2026-11-20 in us-east-1 on a KEYS_ONLY GSI with no
+    // ExclusiveStartKey: a 2049-byte key value answers the size, and Limit 0,
+    // a parameter mix, an empty or invalid KeyConditionExpression, a missed key
+    // schema element, a wrong-typed key value, a filter or projection fault,
+    // ProjectionExpression with ALL_ATTRIBUTES and an unused name or value
+    // each answer their own refusal.
+    validate_query_select_index_support(input.select, index_info.as_ref())?;
 
     // Determine which key schema to use for LastEvaluatedKey extraction.
     // For index queries, the LEK includes both the index key and the base table key,
