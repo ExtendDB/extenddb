@@ -40,24 +40,26 @@ async fn a_describe_storage_fault_is_logged_under_the_bulk_handlers_target() {
 }
 
 /// An input enumeration that fails for a reason other than a store fault
-/// is logged under the Start handler's target.
+/// is logged under the runner's enumeration target, and the operation the
+/// Start accepted ends with the internal failure.
 #[tokio::test]
-async fn a_start_enumeration_failure_is_logged_under_the_start_target() {
+async fn an_enumeration_failure_is_logged_under_the_runner_target() {
     let h = Harness::new().await;
     let ctx = super::start_store_faults::ctx_with_listing(&h, None);
+    let started = start_ok(&ctx, start_body()).await;
+    assert_eq!(started["BulkOperationStatus"], json!("IN_PROGRESS"));
 
     let (capture, guard) = Capture::install();
-    let result = start(&ctx, start_body()).await;
+    let ended = run_started(&h, &ctx, &started).await;
     drop(guard);
 
-    assert!(
-        matches!(&result, Err(DynamoDbError::InternalServerError(m)) if m == "Internal server error"),
-        "{result:?}"
-    );
+    assert_eq!(ended["BulkOperationStatus"], json!("FAILED"));
+    assert_eq!(ended["FailureCode"], json!("InternalServerError"));
+    assert_eq!(ended["FailureMessage"], json!("Internal server error"));
     let lines = capture.errors_containing("bulk operation input enumeration failed");
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert_eq!(
-        lines[0].target, "extenddb_engine::bulk_put::handlers::start",
+        lines[0].target, "extenddb_engine::bulk_put::runner::enumerate",
         "{lines:?}"
     );
 }

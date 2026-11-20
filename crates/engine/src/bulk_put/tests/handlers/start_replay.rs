@@ -88,14 +88,7 @@ async fn a_replay_is_answered_while_every_store_call_fails() {
     let h = Harness::new().await;
     h.write_input("part-0.json", &file_of(&plain_rows(2)));
     let first = start_ok(&base_ctx(&h), tokened()).await;
-    let unreachable = ctx_unreachable(&h);
-    // The store is consulted for a request with no replay to answer.
-    let error = start(&unreachable, start_body()).await.unwrap_err();
-    assert!(
-        matches!(error, DynamoDbError::InternalServerError(_)),
-        "{error:?}"
-    );
-    let replay = start_ok(&unreachable, tokened()).await;
+    let replay = start_ok(&ctx_unreachable(&h), tokened()).await;
     assert_eq!(replay, first);
 }
 
@@ -113,58 +106,4 @@ async fn a_mismatched_replay_is_answered_while_every_store_call_fails() {
         ),
         other => panic!("expected the mismatch error, got {other:?}"),
     }
-}
-
-#[tokio::test]
-async fn a_replay_is_answered_after_the_prefix_grew_past_the_byte_bound() {
-    let h = Harness::new().await;
-    h.write_input("part-0.json", &file_of(&plain_rows(2)));
-    let size = std::fs::metadata(h.store.0.join(ACCOUNT).join(IN_BUCKET).join("part-0.json"))
-        .unwrap()
-        .len();
-    let ctx = ctx_with_limits(
-        &h,
-        bulk_limits(&[("max_bulk_input_bytes", json!(size + 10))]),
-    );
-    let first = start_ok(&ctx, tokened()).await;
-    h.write_input("part-1.json", &file_of(&plain_rows(2)));
-    let fresh = expect_validation(start(&ctx, start_body()).await);
-    assert!(
-        fresh.starts_with("Input exceeds max_bulk_input_bytes"),
-        "{fresh}"
-    );
-    let replay = start_ok(&ctx, tokened()).await;
-    assert_eq!(replay["BulkOperationArn"], first["BulkOperationArn"]);
-    assert_eq!(replay["TotalInputBytes"], json!(size));
-}
-
-#[tokio::test]
-async fn a_replay_is_answered_at_the_failed_start_cap() {
-    let h = Harness::new().await;
-    h.write_input("part-0.json", &file_of(&plain_rows(2)));
-    Harness::create_table(&h.storage, "second").await;
-    let ctx = ctx_with_limits(
-        &h,
-        bulk_limits(&[("max_bulk_failed_starts_per_hour", json!(1))]),
-    );
-    let first = start_ok(&ctx, tokened()).await;
-    // One terminal-born start reaches the cap. It names another table: the
-    // operation just started keeps this one busy, and a busy table answers
-    // busy rather than inserting the failed row.
-    let missing = with_input(
-        with_top(start_body(), "TableName", json!("second")),
-        "S3Bucket",
-        json!("absent-loads"),
-    );
-    let born = start_ok(&ctx, missing.clone()).await;
-    assert_eq!(born["BulkOperationStatus"], json!("FAILED"));
-    expect_throttling(start(&ctx, missing).await);
-    // The input bucket is gone, so the bucket check of a new Start would
-    // fail: on this table, which the first operation keeps busy, it would
-    // answer busy, and on an idle one it would be refused at the cap. The
-    // replay is answered from its row before the check.
-    std::fs::remove_dir_all(h.store.0.join(ACCOUNT).join(IN_BUCKET)).unwrap();
-    let replay = start_ok(&ctx, tokened()).await;
-    assert_eq!(replay["BulkOperationArn"], first["BulkOperationArn"]);
-    assert_eq!(replay["BulkOperationStatus"], first["BulkOperationStatus"]);
 }

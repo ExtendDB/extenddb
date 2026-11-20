@@ -50,12 +50,12 @@ async fn start_records_the_store_and_no_response_renders_it() {
 }
 
 #[tokio::test]
-async fn a_terminal_born_start_records_the_store_too() {
+async fn a_start_on_a_missing_bucket_records_the_store_too() {
     let h = Harness::new().await;
     let ctx = base_ctx(&h);
     let body = with_input(start_body(), "S3Bucket", json!("absent-loads"));
     let description = start_ok(&ctx, body).await;
-    assert_eq!(description["BulkOperationStatus"], json!("FAILED"));
+    assert_eq!(description["BulkOperationStatus"], json!("IN_PROGRESS"));
     assert_eq!(
         stored_run_context(&h, &description).await,
         Some(json!({"store": "filesystem"}))

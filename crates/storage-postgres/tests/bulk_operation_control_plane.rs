@@ -206,7 +206,6 @@ fn new_operation(
         performance_tier: None,
         start_time_ms: 1,
         total_input_bytes: Some(10),
-        initial_failure: None,
         run_context: None,
     }
 }
@@ -419,7 +418,6 @@ async fn a_same_token_conflict_at_insert_recovers_to_idempotent_replay() {
             panic!("a same-token start must never be answered as a table conflict")
         }
         StartOutcome::AccountLimitReached => panic!("the limit of 10 cannot be reached here"),
-        StartOutcome::FailedStartLimit => panic!("this start carries no initial failure"),
         StartOutcome::IndexOperationInProgress => panic!("the table has no index"),
     }
 

@@ -1,125 +1,124 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Starts that create an already-terminal operation: a missing or
-//! symlinked input bucket, an owner mismatch, the replay of a token that
-//! named one, and the per-hour cap on terminal-born rows. The output
-//! bucket checks that stay with the first report record are here too, and
-//! the busy table that refuses such a start before anything is created.
+//! Starts naming a bad input location: the Start answers `IN_PROGRESS`
+//! (measured on the service: HTTP 200 for a missing input bucket, three of
+//! three) and the first claim ends the operation `FAILED` before a row is
+//! read, with no byte member. The output bucket checks that stay with the
+//! first report record are here too, and the busy table that refuses any
+//! start before anything is created.
 
 use super::*;
 
+/// Each bad input location, as a request change and the setup it needs:
+/// the Start answers `IN_PROGRESS`, then the run ends `FAILED` with
+/// `S3NoSuchBucket` and both byte members absent.
 #[tokio::test]
-async fn a_missing_input_bucket_starts_the_operation_terminal_failed() {
+async fn a_bad_input_bucket_is_accepted_and_the_run_fails_it() {
+    struct Case {
+        label: &'static str,
+        bucket: &'static str,
+        setup: fn(&Harness),
+    }
+    fn none(_: &Harness) {}
+    #[cfg(unix)]
+    fn link_to_staged(h: &Harness) {
+        // The link's target is the account's own staged input bucket, so a
+        // FAILED verdict can only come from the link refusal.
+        let target = h.store.0.join(ACCOUNT).join(IN_BUCKET);
+        std::os::unix::fs::symlink(&target, h.store.0.join(ACCOUNT).join("linked")).unwrap();
+    }
+    fn remove_account(h: &Harness) {
+        std::fs::remove_dir_all(h.store.0.join(ACCOUNT)).unwrap();
+    }
+    let mut cases = vec![
+        Case {
+            label: "a missing bucket",
+            bucket: "absent",
+            setup: none,
+        },
+        Case {
+            label: "a missing account directory",
+            bucket: IN_BUCKET,
+            setup: remove_account,
+        },
+    ];
+    #[cfg(unix)]
+    cases.push(Case {
+        label: "a symlinked bucket",
+        bucket: "linked",
+        setup: link_to_staged,
+    });
+    for case in cases {
+        let h = Harness::new().await;
+        h.write_input("part-0.json", &file_of(&plain_rows(2)));
+        (case.setup)(&h);
+        let ctx = base_ctx(&h);
+        let body = with_input(start_body(), "S3Bucket", json!(case.bucket));
+        let started = start_ok(&ctx, body).await;
+        let label = case.label;
+        assert_eq!(
+            started["BulkOperationStatus"],
+            json!("IN_PROGRESS"),
+            "{label}"
+        );
+        for member in [
+            "TotalInputBytes",
+            "ProcessedInputBytes",
+            "BulkOperationUsage",
+        ] {
+            assert!(started.get(member).is_none(), "{label}: {member} at Start");
+        }
+
+        let ended = run_started(&h, &ctx, &started).await;
+        assert_eq!(ended["BulkOperationStatus"], json!("FAILED"), "{label}");
+        assert_eq!(ended["FailureCode"], json!("S3NoSuchBucket"), "{label}");
+        assert_eq!(ended["FailureMessage"], json!(NO_SUCH_BUCKET), "{label}");
+        assert_eq!(ended["ProcessedItemCount"], json!(0), "{label}");
+        for member in ["TotalInputBytes", "ProcessedInputBytes"] {
+            assert!(ended.get(member).is_none(), "{label}: {member} when FAILED");
+        }
+        assert!(ended.get("BulkOperationUsage").is_some(), "{label}");
+        if case.bucket == IN_BUCKET {
+            let meta = std::fs::symlink_metadata(h.store.0.join(ACCOUNT))
+                .expect("the account directory exists again");
+            assert!(meta.is_dir(), "the check creates the account directory");
+        }
+        // No output object: the run listed nothing, so nothing is rendered
+        // (measured on the service: no output object for a missing bucket).
+        let reports = h.store.0.join(ACCOUNT).join(OUT_BUCKET);
+        let written = std::fs::read_dir(&reports)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(written, 0, "{label}: no output object");
+    }
+}
+
+#[tokio::test]
+async fn a_replayed_token_returns_the_operation_its_run_failed() {
     let h = Harness::new().await;
     let ctx = base_ctx(&h);
-    let body = with_input(start_body(), "S3Bucket", json!("absent"));
-    let description = start_ok(&ctx, body).await;
-    assert_eq!(description["BulkOperationStatus"], json!("FAILED"));
-    assert_eq!(description["FailureCode"], json!("S3NoSuchBucket"));
-    assert_eq!(description["FailureMessage"], json!(NO_SUCH_BUCKET));
-    assert_eq!(description["ProcessedItemCount"], json!(0));
-    assert_eq!(description["FailedItemCount"], json!(0));
-    // Born terminal before enumeration: the hosted service omits
-    // TotalInputBytes here (measured on the service) while keeping the counters.
-    assert!(
-        description.get("TotalInputBytes").is_none(),
-        "TotalInputBytes must be absent on a failure born before enumeration"
-    );
-    assert_eq!(
-        description["EndTime"], description["StartTime"],
-        "the operation ends the instant it starts"
-    );
-    // Started and finished both count the operation, the finish under the
-    // FAILED status; no worker ever sees the row.
-    let started = ctx.metrics.query(&extenddb_core::metrics::MetricsQuery {
-        metric: Some(extenddb_core::metrics::MetricName::BulkOperationsStarted),
-        window: Some(extenddb_core::metrics::TimeWindow::AllTime),
-        ..extenddb_core::metrics::MetricsQuery::default()
-    });
-    assert_eq!(started.len(), 1, "one Started series: {started:?}");
-    assert_eq!(started[0].count, 1, "started once");
-    let finished = ctx.metrics.query(&extenddb_core::metrics::MetricsQuery {
-        metric: Some(extenddb_core::metrics::MetricName::BulkOperationsFinished),
-        window: Some(extenddb_core::metrics::TimeWindow::AllTime),
-        ..extenddb_core::metrics::MetricsQuery::default()
-    });
-    assert_eq!(finished.len(), 1, "one Finished series: {finished:?}");
-    assert_eq!(finished[0].count, 1, "finished once");
-    assert!(
-        finished[0]
-            .dimensions
-            .contains(&extenddb_core::metrics::Dimension::Operation(
-                "FAILED".to_owned()
-            )),
-        "the Finished dimension carries FAILED: {:?}",
-        finished[0].dimensions
-    );
-}
-
-#[tokio::test]
-async fn a_missing_report_bucket_is_not_checked_at_start() {
-    // Measured: only the input bucket is checked at Start; a missing
-    // output bucket with clean rows completes. A report bucket missing at
-    // render time fails the render instead.
-    let h = Harness::new().await;
-    // The input bucket exists (the harness staged it); only the named
-    // report bucket directory is absent.
-    let body = with_output(start_body(), "S3Bucket", json!("absent-reports"));
-    let description = start_ok(&base_ctx(&h), body).await;
-    assert_eq!(description["BulkOperationStatus"], json!("IN_PROGRESS"));
-    assert!(
-        description.get("FailureCode").is_none(),
-        "no failure is recorded for a missing report bucket"
-    );
-}
-
-/// A symlink a tenant plants at a bucket name is a missing bucket on the
-/// wire, wherever it points: the operation starts terminal `FAILED` with
-/// `S3NoSuchBucket` and no row is read through the link. An existence
-/// check that resolved the link would instead answer `IN_PROGRESS` and
-/// enumerate the link's target.
-#[cfg(unix)]
-#[tokio::test]
-async fn a_symlinked_input_bucket_starts_the_operation_terminal_failed() {
-    let h = Harness::new().await;
-    // The link's target is the account's own staged input bucket, so the
-    // target genuinely exists, holds files, and would enumerate cleanly:
-    // a FAILED verdict can only come from the link refusal.
-    let target = h.store.0.join(ACCOUNT).join(IN_BUCKET);
-    std::os::unix::fs::symlink(&target, h.store.0.join(ACCOUNT).join("linked")).unwrap();
-    let body = with_input(start_body(), "S3Bucket", json!("linked"));
-    let description = start_ok(&base_ctx(&h), body).await;
-    assert_eq!(description["BulkOperationStatus"], json!("FAILED"));
-    assert_eq!(description["FailureCode"], json!("S3NoSuchBucket"));
-    assert_eq!(description["FailureMessage"], json!(NO_SUCH_BUCKET));
-    assert!(
-        description.get("TotalInputBytes").is_none(),
-        "TotalInputBytes must be absent on a failure born before enumeration"
-    );
-}
-
-#[tokio::test]
-async fn a_replayed_token_returns_the_terminal_failed_operation() {
-    let h = Harness::new().await;
     let body = with_input(
         with_top(start_body(), "ClientToken", json!("tok-failed-replay")),
         "S3Bucket",
         json!("absent"),
     );
-    let first = start_ok(&base_ctx(&h), body.clone()).await;
-    let second = start_ok(&base_ctx(&h), body).await;
+    let first = start_ok(&ctx, body.clone()).await;
+    run_started(&h, &ctx, &first).await;
+    let second = start_ok(&ctx, body).await;
     assert_eq!(second["BulkOperationArn"], first["BulkOperationArn"]);
     assert_eq!(second["BulkOperationStatus"], json!("FAILED"));
+    assert!(
+        second.get("BulkOperationUsage").is_none(),
+        "a replayed Start answers no BulkOperationUsage (measured on the service)"
+    );
 }
 
 #[tokio::test]
 async fn a_replayed_token_wins_over_a_bucket_removed_after_the_first_start() {
-    // The idempotency path is unchanged by the bucket check: the replay is
-    // decided inside the start transaction, so a retry with the token of an
-    // operation that started IN_PROGRESS returns that operation even when
-    // the input bucket directory has been removed since. The retry must not
-    // manufacture a new FAILED row.
+    // A retry with the token of an operation that started IN_PROGRESS
+    // returns that operation even when the input bucket directory has been
+    // removed since; the retry creates nothing.
     let h = Harness::new().await;
     let body = with_top(start_body(), "ClientToken", json!("tok-replay-wins"));
     let first = start_ok(&base_ctx(&h), body.clone()).await;
@@ -127,176 +126,26 @@ async fn a_replayed_token_wins_over_a_bucket_removed_after_the_first_start() {
     std::fs::remove_dir_all(h.store.0.join(ACCOUNT).join(IN_BUCKET)).unwrap();
     let second = start_ok(&base_ctx(&h), body).await;
     assert_eq!(second["BulkOperationArn"], first["BulkOperationArn"]);
-    assert_eq!(
-        second["BulkOperationStatus"],
-        json!("IN_PROGRESS"),
-        "the replay answers the original operation, not a new terminal row"
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn a_bucket_that_is_a_symlink_starts_the_operation_terminal_failed() {
-    // The bucket existence check reads symlink_metadata, so a symlink at
-    // the bucket name is never followed: even one pointing at a real
-    // directory full of files answers the same terminal FAILED as a
-    // missing bucket, matching the enumeration, which would not follow it.
-    let h = Harness::new().await;
-    let account_dir = h.store.0.join(ACCOUNT);
-    let real = account_dir.join("real-bucket");
-    std::fs::create_dir_all(&real).unwrap();
-    std::fs::write(real.join("part-0.json"), b"{\"Item\": {}}\n").unwrap();
-    std::os::unix::fs::symlink(&real, account_dir.join("linked")).unwrap();
-    let body = with_input(start_body(), "S3Bucket", json!("linked"));
-    let description = start_ok(&base_ctx(&h), body).await;
-    assert_eq!(description["BulkOperationStatus"], json!("FAILED"));
-    assert_eq!(description["FailureCode"], json!("S3NoSuchBucket"));
-    assert_eq!(description["FailureMessage"], json!(NO_SUCH_BUCKET));
+    assert_eq!(second["BulkOperationStatus"], json!("IN_PROGRESS"));
 }
 
 #[tokio::test]
-async fn the_account_directory_is_created_at_start_when_missing() {
-    let h = Harness::new().await;
-    let account_dir = h.store.0.join(ACCOUNT);
-    std::fs::remove_dir_all(&account_dir).unwrap();
-    // With the account directory gone the staged buckets are gone too, so
-    // the start lands terminal FAILED; the directory itself must exist
-    // again, created before the bucket check ran.
-    let description = start_ok(&base_ctx(&h), start_body()).await;
-    assert_eq!(description["BulkOperationStatus"], json!("FAILED"));
-    assert_eq!(description["FailureCode"], json!("S3NoSuchBucket"));
-    let meta = std::fs::symlink_metadata(&account_dir).expect("the account directory exists");
-    assert!(meta.is_dir());
-}
-
-#[tokio::test]
-async fn a_missing_bucket_on_a_saturated_account_still_starts_terminal_failed() {
-    // A row born terminal occupies no concurrency slot, so the account
-    // limit is not consulted for it: the caller gets the failed operation,
-    // not LimitExceededException.
+async fn a_missing_input_bucket_takes_a_concurrency_slot_until_its_run_ends() {
+    // The operation is IN_PROGRESS until its first claim, so it counts
+    // against the account limit as every other running operation does.
     let h = Harness::new().await;
     Harness::create_table(&h.storage, "second").await;
     let ctx = ctx_with_limits(
         &h,
         bulk_limits(&[("max_concurrent_bulk_operations", json!(1))]),
     );
-    start_ok(&ctx, start_body()).await;
-    let body = with_input(
-        with_top(start_body(), "TableName", json!("second")),
-        "S3Bucket",
-        json!("absent"),
-    );
-    let description = start_ok(&ctx, body).await;
-    assert_eq!(description["BulkOperationStatus"], json!("FAILED"));
-    assert_eq!(description["FailureCode"], json!("S3NoSuchBucket"));
-}
-
-/// Insert one terminal-born row directly through the store with an
-/// explicit start time, the way the cap's window test needs rows older
-/// than the handler's real clock can produce.
-async fn insert_terminal_born(h: &Harness, start_time_ms: i64) {
-    let new = NewBulkOperation {
-        operation_id: arn::generate_operation_id(),
-        table_id: h.table_id.clone(),
-        table_name: TABLE.to_owned(),
-        table_arn: h.table_arn.clone(),
-        client_token: None,
-        client_token_hash: None,
-        request_fingerprint: "fp-terminal-born".to_owned(),
-        input_config: json!({"S3Bucket": "absent"}),
-        output_config: json!({}),
-        input_files: Vec::new(),
-        max_write_request_units: None,
-        performance_tier: Some("STANDARD".to_owned()),
-        start_time_ms,
-        total_input_bytes: None,
-        initial_failure: Some(extenddb_storage::InitialFailure {
-            code: "S3NoSuchBucket".to_owned(),
-            message: "The specified bucket does not exist".to_owned(),
-            cap: u64::MAX,
-            window_start_ms: 0,
-        }),
-        run_context: None,
-    };
-    match h
-        .storage
-        .start_bulk_operation(ACCOUNT, new, 50)
-        .await
-        .expect("insert a terminal-born row")
-    {
-        StartOutcome::Created(_) => {}
-        _ => panic!("the direct insert must create the row"),
-    }
-}
-
-#[tokio::test]
-async fn the_101st_missing_bucket_start_in_an_hour_is_refused() {
-    let h = Harness::new().await;
-    let ctx = base_ctx(&h);
-    let body = with_input(start_body(), "S3Bucket", json!("absent"));
-    // The default cap admits one hundred terminal-born starts. Terminal
-    // rows trip neither the per-table guard nor the account limit, so one
-    // table serves them all.
-    for _ in 0..100 {
-        let description = start_ok(&ctx, body.clone()).await;
-        assert_eq!(description["BulkOperationStatus"], json!("FAILED"));
-    }
-    assert_eq!(expect_throttling(start(&ctx, body).await), THROTTLED);
-    // The refusal inserted nothing: the account still holds exactly the
-    // hundred terminal-born rows.
-    let born = h
-        .storage
-        .count_terminal_born_since(ACCOUNT, 0)
-        .await
-        .expect("count");
-    assert_eq!(born, 100, "the refused request must not insert a row");
-}
-
-#[tokio::test]
-async fn a_start_on_an_existing_bucket_is_neither_counted_nor_refused_by_the_cap() {
-    let h = Harness::new().await;
-    Harness::create_table(&h.storage, "second").await;
-    Harness::create_table(&h.storage, "third").await;
-    let ctx = ctx_with_limits(
-        &h,
-        bulk_limits(&[("max_bulk_failed_starts_per_hour", json!(1))]),
-    );
-    // A start on an existing bucket succeeds and does not consume the cap
-    // of one: the missing-bucket start after it still lands terminal.
-    let ok = start_ok(&ctx, start_body()).await;
-    assert_eq!(ok["BulkOperationStatus"], json!("IN_PROGRESS"));
-    let missing = with_input(
-        with_top(start_body(), "TableName", json!("second")),
-        "S3Bucket",
-        json!("absent"),
-    );
-    let failed = start_ok(&ctx, missing.clone()).await;
-    assert_eq!(failed["BulkOperationStatus"], json!("FAILED"));
-    // The cap is now consumed, so the next missing-bucket start is
-    // refused; a start on an existing bucket is still admitted.
-    assert_eq!(expect_throttling(start(&ctx, missing).await), THROTTLED);
-    let still_ok = start_ok(&ctx, with_top(start_body(), "TableName", json!("third"))).await;
-    assert_eq!(still_ok["BulkOperationStatus"], json!("IN_PROGRESS"));
-}
-
-#[tokio::test]
-async fn the_failed_start_cap_ignores_rows_outside_the_hour_window() {
-    let h = Harness::new().await;
-    let ctx = ctx_with_limits(
-        &h,
-        bulk_limits(&[("max_bulk_failed_starts_per_hour", json!(1))]),
-    );
-    // Two terminal-born rows older than the window, inserted through the
-    // store with explicit start times.
-    insert_terminal_born(&h, now_ms() - 3_700_000).await;
-    insert_terminal_born(&h, now_ms() - 7_200_000).await;
-    // They are invisible to the cap: a fresh missing-bucket start still
-    // answers the terminal FAILED operation under a cap of one.
-    let body = with_input(start_body(), "S3Bucket", json!("absent"));
-    let description = start_ok(&ctx, body.clone()).await;
-    assert_eq!(description["BulkOperationStatus"], json!("FAILED"));
-    // The fresh row is inside the window, so the cap of one now refuses.
-    assert_eq!(expect_throttling(start(&ctx, body).await), THROTTLED);
+    let missing = with_input(start_body(), "S3Bucket", json!("absent"));
+    let started = start_ok(&ctx, missing).await;
+    let other = with_top(start_body(), "TableName", json!("second"));
+    expect_limit_exceeded(start(&ctx, other.clone()).await);
+    run_started(&h, &ctx, &started).await;
+    let admitted = start_ok(&ctx, other).await;
+    assert_eq!(admitted["BulkOperationStatus"], json!("IN_PROGRESS"));
 }
 
 #[tokio::test]
@@ -329,8 +178,7 @@ async fn stored_operation_ids(h: &Harness) -> Vec<String> {
 /// With an operation running on the table, a valid Start, one naming an
 /// input bucket that does not exist, one whose prefix matches no object
 /// and another valid one each answer the busy message and create nothing
-/// (measured on the hosted service with these four Starts). Once the
-/// operation has finished, the missing-bucket Start is born `FAILED`.
+/// (measured on the hosted service with these four Starts).
 #[tokio::test]
 async fn every_start_on_a_busy_table_answers_busy_whatever_its_input() {
     let h = Harness::new().await;
@@ -349,7 +197,7 @@ async fn every_start_on_a_busy_table_answers_busy_whatever_its_input() {
     let no_match = with_input(start_body(), "S3KeyPrefix", json!("nothing-here/"));
     for (label, body) in [
         ("a valid start", with_data.clone()),
-        ("a missing input bucket", missing.clone()),
+        ("a missing input bucket", missing),
         ("a prefix that matches no object", no_match),
         ("another valid start", with_data),
     ] {
@@ -362,56 +210,7 @@ async fn every_start_on_a_busy_table_answers_busy_whatever_its_input() {
     }
     assert_eq!(
         stored_operation_ids(&h).await,
-        vec![running_id.clone()],
+        vec![running_id],
         "the refused starts created nothing"
     );
-
-    let claimed = h
-        .storage
-        .claim_runnable("owner-1", Duration::from_secs(60), 10, &[], &[])
-        .await
-        .expect("claim");
-    assert!(claimed.iter().any(|r| r.operation_id == running_id));
-    finish_op(&h, ACCOUNT, "owner-1", &running_id, "COMPLETED").await;
-    let born = start_ok(&ctx, missing).await;
-    assert_eq!(born["BulkOperationStatus"], json!("FAILED"));
-    assert_eq!(born["FailureCode"], json!("S3NoSuchBucket"));
-    assert_eq!(born["FailureMessage"], json!(NO_SUCH_BUCKET));
-}
-
-/// At the failed-start cap a missing-bucket Start on a table with an
-/// operation running still answers busy, as the start transaction orders
-/// the two; on an idle table it is throttled. Neither inserts a row.
-#[tokio::test]
-async fn a_missing_bucket_start_at_the_cap_answers_busy_on_a_busy_table() {
-    let h = Harness::new().await;
-    Harness::create_table(&h.storage, "second").await;
-    let ctx = ctx_with_limits(
-        &h,
-        bulk_limits(&[("max_bulk_failed_starts_per_hour", json!(1))]),
-    );
-    let missing_on_second = with_input(
-        with_top(start_body(), "TableName", json!("second")),
-        "S3Bucket",
-        json!("absent"),
-    );
-    let failed = start_ok(&ctx, missing_on_second.clone()).await;
-    assert_eq!(failed["BulkOperationStatus"], json!("FAILED"));
-    start_ok(&ctx, start_body()).await;
-
-    let missing_on_busy = with_input(start_body(), "S3Bucket", json!("absent"));
-    assert_eq!(
-        expect_in_use(start(&ctx, missing_on_busy).await),
-        TABLE_BUSY
-    );
-    assert_eq!(
-        expect_throttling(start(&ctx, missing_on_second).await),
-        THROTTLED
-    );
-    let born = h
-        .storage
-        .count_terminal_born_since(ACCOUNT, 0)
-        .await
-        .expect("count");
-    assert_eq!(born, 1, "neither refused start inserted a row");
 }

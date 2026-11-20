@@ -36,7 +36,6 @@ use crate::OperationContext;
 use crate::bulk_put::arn;
 use crate::bulk_put::epoch_millis;
 use crate::bulk_put::fingerprint;
-use crate::bulk_put::source::{BucketRef, SourceError};
 use crate::bulk_put::usage;
 use crate::create_table::storage_err_to_dynamo;
 use crate::serialize_output;

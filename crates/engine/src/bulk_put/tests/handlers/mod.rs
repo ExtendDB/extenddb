@@ -54,7 +54,6 @@ const TABLE_BUSY: &str = "Table has ongoing bulk operations, please wait and try
 const IDEMPOTENT_MISMATCH: &str = "Specified idempotent token was already used with different \
                                    request parameters within the idempotency window";
 const TABLE_NOT_FOUND: &str = "Requested resource not found";
-const THROTTLED: &str = "Rate of requests exceeds the allowed throughput.";
 
 // Context and request plumbing.
 
@@ -73,7 +72,7 @@ fn now_ms() -> i64 {
 /// the fields the parse fails at run time and names what is missing.
 fn bulk_limits(overrides: &[(&str, Value)]) -> LimitsConfig {
     let mut body = json!({
-        "max_bulk_input_bytes": 10_737_418_240_u64,
+        "max_bulk_input_bytes": 1_099_511_627_776_u64,
         "max_bulk_input_files": 10_000,
         "max_concurrent_bulk_operations": 50,
         "max_bulk_client_token_bytes": 1024,
@@ -254,15 +253,6 @@ fn expect_validation(result: Result<Value, DynamoDbError>) -> String {
 }
 
 #[track_caller]
-fn expect_throttling(result: Result<Value, DynamoDbError>) -> String {
-    match result {
-        Err(DynamoDbError::ThrottlingException(message)) => message,
-        Err(other) => panic!("expected ThrottlingException, got {other:?}"),
-        Ok(body) => panic!("expected ThrottlingException, got success: {body}"),
-    }
-}
-
-#[track_caller]
 fn expect_not_found(result: Result<Value, DynamoDbError>) -> String {
     match result {
         Err(DynamoDbError::ResourceNotFoundException(message)) => message,
@@ -343,7 +333,6 @@ async fn raw_op(h: &Harness, account: &str, index: u32, start_time_ms: i64) -> S
                 performance_tier: None,
                 start_time_ms,
                 total_input_bytes: Some(0),
-                initial_failure: None,
                 run_context: None,
             },
             10_000,
@@ -389,6 +378,30 @@ fn runner_config() -> RunnerConfig {
         max_report_bytes: 64 << 20,
         lease: Duration::from_secs(60),
     }
+}
+
+/// Run the one runnable operation the way a worker would, with the store,
+/// the limits and the authorizer of `ctx`, and answer the Describe of
+/// `started` after the run.
+async fn run_started(h: &Harness, ctx: &OperationContext, started: &Value) -> Value {
+    let record = h.claim("runner-1", Duration::from_secs(60)).await;
+    let store = ctx.bulk.as_ref().expect("a bulk store");
+    let mut deps = h.deps_with(
+        "runner-1",
+        runner_config(),
+        Arc::clone(&store.source),
+        Arc::clone(&store.sink),
+    );
+    deps.limits = Arc::clone(&ctx.limits);
+    deps.authorizer = ctx.bulk_authorizer.clone();
+    deps.store_kind = crate::bulk_put::run_context::store_kind(store);
+    run_operation(&deps, record)
+        .await
+        .expect("the run finishes");
+    let described = describe(ctx, &description_arn(started))
+        .await
+        .expect("describe");
+    described["BulkOperationDescription"].clone()
 }
 
 fn stored_input_config() -> Value {

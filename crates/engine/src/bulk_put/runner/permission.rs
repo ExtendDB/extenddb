@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The runner's checks of the S3 actions the run performs as the
-//! operation's caller: `s3:GetObject` on an input object before it is opened
+//! operation's caller: `s3:ListBucket` on the input bucket before the first
+//! claim lists it, `s3:GetObject` on an input object before it is opened
 //! and at every checkpoint boundary while it is read, and `s3:PutObject` on a
 //! report object before the first record or page that writes it and on the
 //! manifest. In developer mode no check runs (`RunnerDeps::authorizer`).
@@ -40,6 +41,41 @@ pub(super) fn decision_failure(decision: Decision) -> Option<Failure> {
         }),
         Decision::Unavailable => Some(Failure::internal()),
     }
+}
+
+/// `s3:ListBucket` on the input bucket, decided on the first claim before
+/// the bucket check. The service accepts such a Start and fails the
+/// operation `S3AccessDenied` with S3's text naming `s3:ListBucket` on the
+/// bucket ARN, with no byte members and no manifest (measured on the
+/// service). `s3:prefix` is the request's `S3KeyPrefix`, or the empty string
+/// when absent, and then, when the store lists another prefix for it
+/// (`BulkSource::listed_prefix`), that prefix: the listing is allowed only
+/// when both are.
+pub(super) async fn list_bucket_decision(
+    deps: &RunnerDeps,
+    record: &BulkOperationRecord,
+    config: &OperationConfig,
+) -> Decision {
+    let prefix = config.input_prefix.as_str();
+    let listed = deps.source.listed_prefix(prefix);
+    let prefixes = std::iter::once(prefix).chain((listed != prefix).then_some(listed.as_str()));
+    let bucket = authorize::bucket_arn(&config.input_bucket);
+    for prefix in prefixes {
+        let decision = authorize::decide(
+            deps.authorizer.as_deref(),
+            config.caller.as_ref(),
+            S3Action::ListBucket,
+            &bucket,
+            Some(prefix),
+            &record.account_id,
+            &record.operation_id,
+        )
+        .await;
+        if decision != Decision::Allowed {
+            return decision;
+        }
+    }
+    Decision::Allowed
 }
 
 /// The decision for `s3:PutObject` on the object `key` of the output

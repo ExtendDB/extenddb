@@ -57,8 +57,11 @@ async fn the_start_description_carries_every_submitted_field() {
     assert_eq!(description["OutputS3Configuration"], output_config);
     assert_eq!(description["ProcessedItemCount"], json!(0));
     assert_eq!(description["FailedItemCount"], json!(0));
-    assert_eq!(description["ProcessedInputBytes"], json!(0));
-    assert_eq!(description["TotalInputBytes"], json!(10));
+    // Measured on the service: the Start answer carries neither byte
+    // member; the input is listed on the first claim.
+    assert!(description.get("ProcessedInputBytes").is_none());
+    assert!(description.get("TotalInputBytes").is_none());
+    assert!(description.get("BulkOperationUsage").is_none());
     assert_eq!(description["MaxWriteRequestUnits"], json!(2048));
     assert_eq!(description["PerformanceTier"], json!("ACCELERATED"));
 

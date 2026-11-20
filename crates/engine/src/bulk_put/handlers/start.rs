@@ -1,10 +1,11 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `StartBulkPutItems` handler: the seven observable validation steps,
-//! the terminal-born input configuration path, and the start transaction.
-//! The other three handlers, the renderers, and the field checks live
-//! beside it in the parent module.
+//! The `StartBulkPutItems` handler: the observable validation steps and
+//! the start transaction. The input location is checked and listed by the
+//! runner on the operation's first claim (`runner::enumerate`). The other
+//! three handlers, the renderers, and the field checks live beside it in
+//! the parent module.
 
 use super::*;
 
@@ -12,18 +13,7 @@ use crate::bulk_put::run_context::RecordedRunContext;
 
 mod config;
 use config::{resolved_input_configuration, resolved_output_configuration};
-mod permission;
 mod prefix;
-mod replay;
-
-/// An enumeration failure is server-side: the bucket name and prefix
-/// passed their lexical checks, so a jail refusal or a read failure here
-/// is not client input. Details go to the log, never to the client. Defined
-/// here so the line is filed under the Start handler's target.
-fn enumeration_error(error: &SourceError) -> DynamoDbError {
-    tracing::error!(error = ?error, "bulk operation input enumeration failed");
-    DynamoDbError::InternalServerError("Internal server error".to_owned())
-}
 
 /// Handle a `StartBulkPutItems` request.
 ///
@@ -249,14 +239,13 @@ pub async fn handle_start_bulk_put_items(
         ));
     }
 
-    // The request identity for steps 6 and 7. The fingerprint hashes the
+    // The request identity. The fingerprint hashes the
     // request as submitted, except for the service defaults a retry may add
     // or omit without changing the operation (measured): an absent
     // PerformanceTier and a STANDARD one hash alike, and
     // `strip_replayed_defaults` drops an InputCompressionType of NONE and an
     // own-account S3BucketOwner on either configuration. The stored record
-    // still carries the resolved default. The file list is filled in after
-    // enumeration.
+    // still carries the resolved default.
     let requested_tier = input.performance_tier.map(tier_str);
     let fingerprint_tier = requested_tier.filter(|tier| *tier != "STANDARD");
     let fingerprint_input = fingerprint::strip_replayed_defaults(&input_config, &ctx.account_id);
@@ -274,7 +263,14 @@ pub async fn handle_start_bulk_put_items(
         .client_token
         .as_ref()
         .map(|token| hex::encode(Sha256::digest(token.as_bytes())));
-    let mut new = NewBulkOperation {
+    // The input location is not read here. The service answers a Start
+    // naming a missing input bucket with HTTP 200 `IN_PROGRESS`, and the
+    // operation then ends `FAILED` `S3NoSuchBucket`; its Start answer
+    // carries no byte member (measured on the service). The runner checks
+    // the caller's listing permission, the bucket, its owner and the output
+    // key, then lists the input and records the files and their total, on
+    // the operation's first claim (`runner::enumerate`).
+    let new = NewBulkOperation {
         operation_id: arn::generate_operation_id(),
         table_id: table.table_id.clone(),
         table_name,
@@ -288,170 +284,15 @@ pub async fn handle_start_bulk_put_items(
         max_write_request_units: input.max_write_request_units,
         performance_tier: Some(requested_tier.unwrap_or("STANDARD").to_owned()),
         start_time_ms: epoch_millis(),
-        // Set by enumeration below; a failure born before the walk leaves
-        // it absent, as the hosted service does.
         total_input_bytes: None,
-        initial_failure: None,
         run_context: Some(
             RecordedRunContext::at_start(store, ctx.bulk_principal.clone()).to_value(),
         ),
     };
 
-    // A replayed token is answered from its row before any store call, the
-    // listing, the byte bound and the failed-start cap (`replay`).
-    if let Some(response) = replay::replayed(ctx, &new).await? {
-        return Ok(response);
-    }
-
-    // The input bucket as the store sees it, for the bucket check and the
-    // enumeration.
-    let input_at = BucketRef::new(
-        &ctx.account_id,
-        &input.input_s3_configuration.s3_bucket,
-        input.input_s3_configuration.s3_bucket_owner.as_deref(),
-    );
-    let prefix = input
-        .input_s3_configuration
-        .s3_key_prefix
-        .clone()
-        .unwrap_or_default();
-
-    // A bad input configuration fails the operation rather than the
-    // request: the row is inserted already terminal, the token consumed,
-    // before any row is read. The store decides the
-    // input bucket's owner, then its existence, and renders the fault (see
-    // `BulkSource::check_bucket`); any other failure of the check is the
-    // server's. Of the output configuration only the bucket member's
-    // presence and name are checked at Start (measured on the service); its
-    // existence and its owner are checked at the first report record. The
-    // insert skips the account limit, which binds on non-terminal rows
-    // only, so this path runs before the saturated-account check below. The
-    // per-table guard still binds: on a table with an operation running the
-    // start transaction answers busy and inserts nothing.
-    // The caller's s3:ListBucket is decided first (`permission`).
-    let denied =
-        permission::list_bucket_denial(ctx, &new.operation_id, input_at.bucket, &prefix).await?;
-    let initial_failure = match denied {
-        Some(fault) => Some(fault),
-        None => match store.source.check_bucket(&input_at, &prefix).await {
-            Ok(()) => None,
-            Err(SourceError::Store(fault)) => Some(fault),
-            Err(error) => return Err(enumeration_error(&error)),
-        },
-    };
-    // An SSE-KMS output key the store cannot use fails the operation the
-    // same way, before the input walk and with both byte members absent
-    // (measured on the service); a bucket or owner fault of the output is
-    // left to the first report record. The key checked is report object 0
-    // of the error report.
-    let initial_failure = match initial_failure {
-        Some(fault) => Some(fault),
-        None => {
-            let output_at = BucketRef::new(
-                &ctx.account_id,
-                output_bucket,
-                input.output_s3_configuration.s3_bucket_owner.as_deref(),
-            );
-            let key = crate::bulk_put::report::report_key(
-                input
-                    .output_s3_configuration
-                    .s3_key_prefix
-                    .as_deref()
-                    .unwrap_or_default(),
-                &ctx.account_id,
-                &new.operation_id,
-                extenddb_storage::ReportKind::Error,
-                0,
-            );
-            let sse = crate::bulk_put::source::OutputSse::of(&input.output_s3_configuration);
-            match store.sink.check_encryption(&output_at, &key, &sse).await {
-                Ok(()) => None,
-                Err(crate::bulk_put::source::SinkError::Store(fault)) => Some(fault),
-                Err(error) => {
-                    tracing::error!(error = ?error, "bulk operation output encryption check failed");
-                    return Err(DynamoDbError::InternalServerError(
-                        "Internal server error".to_owned(),
-                    ));
-                }
-            }
-        }
-    };
-    if let Some(fault) = initial_failure {
-        return start_terminal_born(ctx, new, fault).await;
-    }
-
-    // A saturated account is answered before the enumeration walk runs.
-    // The start transaction keeps its own exact check under its locks;
-    // this read only decides whether the walk runs. A count at or above
-    // the limit goes straight to the transaction with a zero limit, which
-    // can answer everything the limit does not outrank: a replayed token
-    // is still answered from its existing row and a busy table still
-    // answers busy, in the transaction's own order. A zero limit admits
-    // nothing, so `Created` cannot arrive from this call.
+    // The start transaction answers a replayed token from its row before
+    // the per-table guard and the account limit.
     let account_limit = ctx.limits.max_concurrent_bulk_operations;
-    let non_terminal = ctx
-        .storage
-        .count_non_terminal(&ctx.account_id)
-        .await
-        .map_err(bulk_storage_err)?;
-    if non_terminal >= u64::from(account_limit) {
-        let outcome = ctx
-            .storage
-            .start_bulk_operation(&ctx.account_id, new, 0)
-            .await
-            .map_err(bulk_storage_err)?;
-        return start_response(outcome, &ctx.region, account_limit);
-    }
-
-    // Step 6: enumeration fixes the file list and the total. The count cap
-    // binds during the walk as well as after it, then the two caps apply,
-    // count before bytes.
-    //
-    // The object count quota is not a Start refusal: the walk stops one
-    // object past the cap and returns what it collected, the record is
-    // inserted with that list, and the runner ends the operation FAILED
-    // with S3ObjectsCountLimitExceeded before reading a file (measured
-    // ). The per-object size cap is the runner's as
-    // well. Only the enumerated total stays a Start refusal; it
-    // is ExtendDB's own bound.
-    let max_files = ctx.limits.max_bulk_input_files;
-    let files = match store.source.list(&input_at, &prefix, max_files).await {
-        Ok(files) => files,
-        // A fault the store rendered on a later page (the bucket removed or
-        // access lost after the check) fails the operation as the check
-        // would have.
-        Err(SourceError::Store(fault)) => return start_terminal_born(ctx, new, fault).await,
-        // Only the walk's visit ceiling (four times the cap in entries that
-        // can hold a key under the prefix) still ends the enumeration here.
-        Err(SourceError::TooManyFiles) => {
-            return Err(DynamoDbError::ValidationException(format!(
-                "Input exceeds max_bulk_input_files ({max_files} files)"
-            )));
-        }
-        Err(other) => return Err(enumeration_error(&other)),
-    };
-    let total_input_bytes = files
-        .iter()
-        .fold(0_u64, |sum, file| sum.saturating_add(file.size));
-    let max_bytes = ctx.limits.max_bulk_input_bytes;
-    if total_input_bytes > max_bytes {
-        return Err(DynamoDbError::ValidationException(format!(
-            "Input exceeds max_bulk_input_bytes ({max_bytes} bytes)"
-        )));
-    }
-
-    // Step 7: the start transaction, on the enumerated input.
-    new.input_files = files
-        .into_iter()
-        .map(|file| InputFile {
-            path: file.path,
-            size: i64::try_from(file.size).unwrap_or(i64::MAX),
-            rows: None,
-            etag: file.etag,
-            abandon: None,
-        })
-        .collect();
-    new.total_input_bytes = Some(i64::try_from(total_input_bytes).unwrap_or(i64::MAX));
     let outcome = ctx
         .storage
         .start_bulk_operation(&ctx.account_id, new, account_limit)
@@ -480,98 +321,4 @@ pub async fn handle_start_bulk_put_items(
         );
     }
     start_response(outcome, &ctx.region, account_limit)
-}
-
-/// Insert the operation already terminal with a fault the store rendered:
-/// a bad input bucket found by the check, or by a later page of the
-/// enumeration (the bucket removed or access lost after the check). The
-/// row is born `FAILED`, the token consumed, before any row is read. On a
-/// table with an operation running nothing is inserted and the answer is
-/// the busy one, as for any other start.
-async fn start_terminal_born(
-    ctx: &OperationContext,
-    mut new: NewBulkOperation,
-    fault: crate::bulk_put::source::StoreFault,
-) -> Result<Value, DynamoDbError> {
-    // Terminal-born rows are bounded: at or
-    // above the cap of them born in the last hour, the request is
-    // refused. This read is a cheap fast path that rejects an
-    // obviously-over-cap caller before the start transaction; the
-    // authoritative, exact check runs inside that transaction under
-    // the per-account lock, so a concurrent burst that races past this
-    // read is still refused. The cap and window travel with the failure
-    // they govern. The floor keeps a zero configuration from refusing
-    // every missing-bucket start.
-    let cap = ctx.limits.max_bulk_failed_starts_per_hour.max(1);
-    let since_ms = new.start_time_ms.saturating_sub(3_600_000);
-    let born = ctx
-        .storage
-        .count_terminal_born_since(&ctx.account_id, since_ms)
-        .await
-        .map_err(bulk_storage_err)?;
-    if born >= cap {
-        // The transaction answers a busy table before the cap, so at the
-        // cap the fast path refuses only a table with no operation
-        // running and leaves a busy one to the transaction.
-        let running = ctx
-            .storage
-            .count_non_terminal_for_table(&ctx.account_id, &new.table_id)
-            .await
-            .map_err(bulk_storage_err)?;
-        if running == 0 {
-            return Err(DynamoDbError::ThrottlingException(
-                "Rate of requests exceeds the allowed throughput.".to_owned(),
-            ));
-        }
-    }
-    new.initial_failure = Some(extenddb_storage::InitialFailure {
-        code: fault.code.to_owned(),
-        message: fault.message,
-        cap,
-        window_start_ms: since_ms,
-    });
-    let outcome = ctx
-        .storage
-        .start_bulk_operation(
-            &ctx.account_id,
-            new,
-            ctx.limits.max_concurrent_bulk_operations,
-        )
-        .await
-        .map_err(bulk_storage_err)?;
-    if let StartOutcome::Created(record) = &outcome {
-        // Started and finished in the same instant: both metrics
-        // count the operation, the finish carrying the FAILED status.
-        // No worker sees the row, so only the handler can record the
-        // finish.
-        ctx.metrics.record(
-            extenddb_core::metrics::MetricName::BulkOperationsStarted,
-            1.0,
-            Some(&record.account_id),
-            Some(&record.table_name),
-            None,
-            None,
-        );
-        ctx.metrics.record(
-            extenddb_core::metrics::MetricName::BulkOperationsFinished,
-            1.0,
-            Some(&record.account_id),
-            Some(&record.table_name),
-            None,
-            Some("FAILED"),
-        );
-        tracing::info!(
-            account_id = %record.account_id,
-            operation_id = %record.operation_id,
-            table_name = %record.table_name,
-            status = %record.status,
-            failure_code = record.failure_code.as_deref().unwrap_or(""),
-            "bulk operation created terminal: the input configuration failed"
-        );
-    }
-    start_response(
-        outcome,
-        &ctx.region,
-        ctx.limits.max_concurrent_bulk_operations,
-    )
 }

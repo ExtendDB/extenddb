@@ -59,12 +59,23 @@ impl BulkOperationStore for FaultingStorage {
             .count_non_terminal_for_table(account_id, table_id)
     }
 
-    fn count_terminal_born_since(
+    fn record_input_files(
         &self,
         account_id: &str,
-        since_ms: i64,
-    ) -> BoxFuture<'_, Result<u64, StorageError>> {
-        self.inner.count_terminal_born_since(account_id, since_ms)
+        operation_id: &str,
+        owner: &str,
+        lease: Duration,
+        files: Vec<InputFile>,
+        total_input_bytes: i64,
+    ) -> BoxFuture<'_, Result<LeaseState, StorageError>> {
+        self.inner.record_input_files(
+            account_id,
+            operation_id,
+            owner,
+            lease,
+            files,
+            total_input_bytes,
+        )
     }
 
     fn request_cancel(

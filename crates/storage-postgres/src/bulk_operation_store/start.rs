@@ -3,8 +3,8 @@
 
 //! The start transaction for the `PostgreSQL` `BulkOperationStore`: the
 //! advisory-locked five-step start, the token replay window, the per-table
-//! guard and the account and terminal-born caps, plus the two helpers the
-//! insert and token lookup use.
+//! guard and the account cap, plus the two helpers the insert and token
+//! lookup use.
 
 use super::*;
 
@@ -51,24 +51,13 @@ async fn fetch_by_token(
 /// Step 4 of the start transaction: the insert that can conflict, written
 /// not to raise. A constraint violation would abort the transaction and
 /// turn a replayed token into an error, so recovery in step 5 depends on
-/// ON CONFLICT DO NOTHING rather than on catching a violation. An initial
-/// failure lands as a row that is terminal from its first instant: FAILED,
-/// end time equal to start time, no lease. Returns the inserted row, or
-/// `None` on a conflict.
+/// ON CONFLICT DO NOTHING rather than on catching a violation. Returns the
+/// inserted row, or `None` on a conflict.
 async fn insert_operation_row(
     conn: &mut sqlx::PgConnection,
     account_id: &str,
     req: &NewBulkOperation,
 ) -> Result<Option<PgRow>, StorageError> {
-    let (status, end_time_ms, failure_code, failure_message) = match &req.initial_failure {
-        Some(failure) => (
-            "FAILED",
-            Some(req.start_time_ms),
-            Some(failure.code.as_str()),
-            Some(failure.message.as_str()),
-        ),
-        None => ("IN_PROGRESS", None, None, None),
-    };
     sqlx::query(
         "INSERT INTO bulk_operations (\
              account_id, operation_id, table_id, table_name, table_arn, status, \
@@ -82,9 +71,9 @@ async fn insert_operation_row(
              usage, failure_code, failure_message, cancel_requested, \
              cursor_file_index, cursor_row_index, lease_owner, lease_until_ms, \
              run_context) \
-         VALUES ($1, $2, $3, $4, $5, $6, \
-             $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
-             0, 0, 0, $17, 0, 0, $18, $19, $20, FALSE, 0, 0, NULL, NULL, $21) \
+         VALUES ($1, $2, $3, $4, $5, 'IN_PROGRESS', \
+             $6, $7, $8, $9, $10, $11, $12, $13, $14, NULL, \
+             0, 0, 0, $15, 0, 0, $16, NULL, NULL, FALSE, 0, 0, NULL, NULL, $17) \
          ON CONFLICT DO NOTHING \
          RETURNING *",
     )
@@ -93,7 +82,6 @@ async fn insert_operation_row(
     .bind(&req.table_id)
     .bind(&req.table_name)
     .bind(&req.table_arn)
-    .bind(status)
     .bind(&req.client_token)
     .bind(&req.client_token_hash)
     .bind(&req.request_fingerprint)
@@ -104,13 +92,10 @@ async fn insert_operation_row(
     .bind(req.max_write_request_units)
     .bind(&req.performance_tier)
     .bind(req.start_time_ms)
-    .bind(end_time_ms)
     .bind(req.total_input_bytes)
     // The first checkpoint overwrites this; until then the operation
     // has consumed nothing.
     .bind(serde_json::json!({}))
-    .bind(failure_code)
-    .bind(failure_message)
     .bind(&req.run_context)
     .fetch_optional(conn)
     .await
@@ -251,21 +236,13 @@ async fn start_attempt(
         .map_err(internal)?;
     }
 
-    // Step 3a. The per-table guard binds on every start, including one
-    // whose input configuration already failed: while the table has an
-    // operation IN_PROGRESS or CANCELLING the start answers busy and
-    // nothing is inserted (measured on the service: with an operation
-    // running on the table, a Start naming an input bucket that does
-    // not exist answered the busy message and created nothing). The
-    // guard answers before the account limit and before the
-    // terminal-born cap when either would also reject, so a caller
-    // blocked by its own running operation learns which table is busy.
-    // For a start that is not born terminal, the partial unique index
-    // on the insert below remains the authoritative guard and this read
-    // only fixes the order of the answers. A row born terminal is
-    // outside that index, so for it this read is the guard, exact
-    // because the advisory lock held since step 1 serialises the
-    // account's starts.
+    // Step 3a. The per-table guard. While the table has an operation
+    // IN_PROGRESS or CANCELLING the start answers busy and nothing is
+    // inserted. The guard answers before the account limit when both
+    // would reject, so a caller blocked by its own running operation
+    // learns which table is busy. The partial unique index on the insert
+    // below remains the authoritative guard; this read only fixes the
+    // order of the answers.
     let (table_busy,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM bulk_operations \
          WHERE account_id = $1 AND table_id = $2 \
@@ -281,46 +258,18 @@ async fn start_attempt(
         return Ok(Some(StartOutcome::TableBusy));
     }
 
-    if let Some(failure) = &req.initial_failure {
-        // A row born terminal takes no account concurrency slot, so
-        // step 3b does not apply to it; its own cap does.
-        //
-        // Terminal-born cap, counted under the advisory lock held
-        // since step 1, so a concurrent burst of absent-bucket
-        // starts cannot overshoot it: each start sees the others'
-        // committed rows because the lock serialises them. A row
-        // is terminal-born when its end_time equals its start_time
-        // and it is FAILED, which is exactly the shape the insert
-        // below writes.
-        let (born,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM bulk_operations \
-             WHERE account_id = $1 AND status = 'FAILED' \
-               AND end_time_ms = start_time_ms AND start_time_ms >= $2",
-        )
-        .bind(account_id)
-        .bind(failure.window_start_ms)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(internal)?;
-        if u64::try_from(born).unwrap_or(0) >= failure.cap {
-            tx.commit().await.map_err(internal)?;
-            return Ok(Some(StartOutcome::FailedStartLimit));
-        }
-    } else {
-        // Step 3b. Non-terminal operations count against the
-        // account limit.
-        let (running,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM bulk_operations \
-             WHERE account_id = $1 AND status IN ('IN_PROGRESS', 'CANCELLING')",
-        )
-        .bind(account_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(internal)?;
-        if running >= i64::from(account_limit) {
-            tx.commit().await.map_err(internal)?;
-            return Ok(Some(StartOutcome::AccountLimitReached));
-        }
+    // Step 3b. Non-terminal operations count against the account limit.
+    let (running,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM bulk_operations \
+         WHERE account_id = $1 AND status IN ('IN_PROGRESS', 'CANCELLING')",
+    )
+    .bind(account_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(internal)?;
+    if running >= i64::from(account_limit) {
+        tx.commit().await.map_err(internal)?;
+        return Ok(Some(StartOutcome::AccountLimitReached));
     }
 
     // Step 4, in [`insert_operation_row`]: the insert that can
@@ -389,28 +338,6 @@ pub(super) fn count_non_terminal<'a>(
              WHERE account_id = $1 AND status IN ('IN_PROGRESS', 'CANCELLING')",
         )
         .bind(&account_id)
-        .fetch_one(&engine.pool)
-        .await
-        .map_err(internal)?;
-        // COUNT(*) is non-negative by construction.
-        Ok(u64::try_from(count).unwrap_or(0))
-    })
-}
-
-pub(super) fn count_terminal_born_since<'a>(
-    engine: &'a PostgresEngine,
-    account_id: &str,
-    since_ms: i64,
-) -> BoxFuture<'a, Result<u64, StorageError>> {
-    let account_id = account_id.to_owned();
-    Box::pin(async move {
-        let (count,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM bulk_operations \
-             WHERE account_id = $1 AND status = 'FAILED' \
-             AND end_time_ms = start_time_ms AND start_time_ms >= $2",
-        )
-        .bind(&account_id)
-        .bind(since_ms)
         .fetch_one(&engine.pool)
         .await
         .map_err(internal)?;

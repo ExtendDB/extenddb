@@ -3,7 +3,9 @@
 
 //! The bulk put runner: drives one claimed operation to a terminal state.
 //!
-//! The runner reads the enumerated input files in order, applies each row
+//! The first claim checks and lists the input and records the files
+//! (`runner::enumerate`). The runner reads the recorded input files in
+//! order, applies each row
 //! with `PutItem` semantics through the same validation and expression
 //! functions `handle_put_item` uses, and checkpoints cursor, counters,
 //! usage, and report records after every batch and at the end of every
@@ -63,6 +65,7 @@ pub(in crate::bulk_put::runner) use crate::put_item::{
 
 mod admit;
 mod cut;
+mod enumerate;
 mod failure;
 mod finalize;
 mod held;
@@ -75,12 +78,12 @@ mod reader;
 mod recorded;
 mod resume;
 mod state;
-pub(crate) use failure::OBJECTS_COUNT_LIMIT_CODE;
 mod wait;
 mod write;
 
 pub(in crate::bulk_put::runner) use admit::*;
 pub(in crate::bulk_put::runner) use cut::*;
+pub(in crate::bulk_put::runner) use enumerate::*;
 pub(in crate::bulk_put::runner) use failure::*;
 pub(in crate::bulk_put::runner) use finalize::*;
 pub(in crate::bulk_put::runner) use held::*;
@@ -336,6 +339,18 @@ pub(crate) async fn run(deps: &RunnerDeps, record: BulkOperationRecord) -> Resul
     };
     st.key_info = key_info;
 
+    // Step 3: the first claim checks and lists the input and records the
+    // files before any row is read (`runner::enumerate`); a later claim
+    // reads the files an earlier one recorded.
+    let record = if record.total_input_bytes.is_some() {
+        record
+    } else {
+        match list_input(deps, &record, &config, &mut st).await? {
+            Listed::Recorded(listed) => listed,
+            Listed::Finish => return finalize(deps, &record, Some(&config), st).await,
+            Listed::Stop => return Ok(()),
+        }
+    };
     drive(deps, &record, &config, st).await
 }
 

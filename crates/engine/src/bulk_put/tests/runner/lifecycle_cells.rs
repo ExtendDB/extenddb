@@ -470,14 +470,13 @@ async fn more_input_objects_than_the_count_quota_fails_the_operation() {
     let h = Harness::new().await;
     h.write_input("h1/o-000000.json", &file_of(&plain_rows(2)));
     h.write_input("h1/o-000001.json", &file_of(&plain_rows(2)));
-    let files = h.enumerate().await;
     let input = json!({
         "S3Bucket": IN_BUCKET,
         "S3KeyPrefix": "h1/",
         "InputFormat": "DYNAMODB_JSON",
         "InputCompressionType": "NONE",
     });
-    let op = h.start(files, input, both_reports()).await;
+    let op = h.start_unlisted(input, both_reports()).await;
     let record = h.claim("runner-1", Duration::from_secs(60)).await;
     let limits = LimitsConfig {
         max_bulk_input_files: 1,

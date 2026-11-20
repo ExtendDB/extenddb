@@ -4,42 +4,52 @@
 use super::*;
 
 #[tokio::test]
-async fn an_input_bucket_owner_of_another_account_starts_the_operation_terminal_failed() {
-    // Measured: the mismatch fails the operation, not the request. The
-    // token is consumed like any other terminal-born start.
-    let h = Harness::new().await;
-    let body = with_input(
-        with_top(start_body(), "ClientToken", json!("tok-owner-mismatch")),
-        "S3BucketOwner",
-        json!(OTHER_ACCOUNT),
-    );
-    let description = start_ok(&base_ctx(&h), body.clone()).await;
-    assert_eq!(description["BulkOperationStatus"], json!("FAILED"));
-    assert_eq!(description["FailureCode"], json!("S3AccessDenied"));
-    assert_eq!(description["FailureMessage"], json!("Access Denied"));
-    assert_eq!(description["ProcessedItemCount"], json!(0));
-    assert_eq!(description["EndTime"], description["StartTime"]);
-    let replay = start_ok(&base_ctx(&h), body).await;
-    assert_eq!(
-        replay["BulkOperationArn"], description["BulkOperationArn"],
-        "the token is consumed and replays to the failed operation"
-    );
-}
-
-#[tokio::test]
-async fn an_input_owner_mismatch_answers_before_the_bucket_existence_check() {
+async fn an_input_bucket_owner_of_another_account_fails_the_run_before_the_existence_check() {
+    // Measured: the mismatch fails the operation, not the request.
     // Ownership is decided before existence, so a caller naming another
     // owner cannot learn whether the bucket exists: a missing bucket with
-    // a mismatched owner answers S3AccessDenied, not S3NoSuchBucket.
-    let h = Harness::new().await;
-    let body = with_input(
-        with_input(start_body(), "S3BucketOwner", json!(OTHER_ACCOUNT)),
-        "S3Bucket",
-        json!("absent"),
-    );
-    let description = start_ok(&base_ctx(&h), body).await;
-    assert_eq!(description["BulkOperationStatus"], json!("FAILED"));
-    assert_eq!(description["FailureCode"], json!("S3AccessDenied"));
+    // a mismatched owner fails S3AccessDenied, not S3NoSuchBucket.
+    for bucket in [IN_BUCKET, "absent"] {
+        let h = Harness::new().await;
+        let ctx = base_ctx(&h);
+        let body = with_input(
+            with_input(
+                with_top(start_body(), "ClientToken", json!("tok-owner-mismatch")),
+                "S3BucketOwner",
+                json!(OTHER_ACCOUNT),
+            ),
+            "S3Bucket",
+            json!(bucket),
+        );
+        let started = start_ok(&ctx, body.clone()).await;
+        assert_eq!(
+            started["BulkOperationStatus"],
+            json!("IN_PROGRESS"),
+            "{bucket}"
+        );
+        let description = run_started(&h, &ctx, &started).await;
+        assert_eq!(
+            description["BulkOperationStatus"],
+            json!("FAILED"),
+            "{bucket}"
+        );
+        assert_eq!(
+            description["FailureCode"],
+            json!("S3AccessDenied"),
+            "{bucket}"
+        );
+        assert_eq!(
+            description["FailureMessage"],
+            json!("Access Denied"),
+            "{bucket}"
+        );
+        assert_eq!(description["ProcessedItemCount"], json!(0), "{bucket}");
+        let replay = start_ok(&ctx, body).await;
+        assert_eq!(
+            replay["BulkOperationArn"], description["BulkOperationArn"],
+            "{bucket}: the token replays to the failed operation"
+        );
+    }
 }
 
 #[tokio::test]
@@ -295,72 +305,84 @@ async fn a_table_being_deleted_answers_the_table_not_found_validation() {
     );
 }
 
+/// The two quotas on the listing end the run before the files are
+/// recorded, so the description has no byte member, and nothing is written
+/// to the output bucket. The object count is checked first: the listing
+/// stops one object past it, so the total is not known then. The count
+/// class is measured on the service (the Start is accepted and the
+/// operation ends FAILED with neither byte member); the size class has the
+/// documented code.
 #[tokio::test]
-async fn an_input_over_the_object_count_cap_is_accepted_at_start() {
-    // Measured on the service: the Start is accepted and the
-    // operation ends FAILED with S3ObjectsCountLimitExceeded (the runner's
-    // check); the walk stops one object past the cap, so the record
-    // carries max plus one files for the runner to count.
-    let h = Harness::new().await;
-    for i in 0..5 {
-        h.write_input(&format!("part-{i}.json"), b"0123456789");
+async fn the_listing_quotas_end_the_run_before_the_files_are_recorded() {
+    for (label, files, limits, code) in [
+        (
+            "the object count",
+            5,
+            vec![("max_bulk_input_files", json!(2))],
+            "S3ObjectsCountLimitExceeded",
+        ),
+        (
+            "the total",
+            2,
+            vec![("max_bulk_input_bytes", json!(10))],
+            "SizeLimitExceeded",
+        ),
+        (
+            "both, the count first",
+            3,
+            vec![
+                ("max_bulk_input_files", json!(2)),
+                ("max_bulk_input_bytes", json!(10)),
+            ],
+            "S3ObjectsCountLimitExceeded",
+        ),
+    ] {
+        let h = Harness::new().await;
+        for i in 0..files {
+            h.write_input(&format!("part-{i}.json"), b"01234567");
+        }
+        let ctx = ctx_with_limits(&h, bulk_limits(&limits));
+        let started = start_ok(&ctx, start_body()).await;
+        assert_eq!(
+            started["BulkOperationStatus"],
+            json!("IN_PROGRESS"),
+            "{label}"
+        );
+        let ended = run_started(&h, &ctx, &started).await;
+        assert_eq!(ended["BulkOperationStatus"], json!("FAILED"), "{label}");
+        assert_eq!(ended["FailureCode"], json!(code), "{label}");
+        assert!(ended.get("TotalInputBytes").is_none(), "{label}");
+        assert!(ended.get("ProcessedInputBytes").is_none(), "{label}");
+        let reports = std::fs::read_dir(h.store.0.join(ACCOUNT).join(OUT_BUCKET))
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(reports, 0, "{label}: no output object");
     }
-    let ctx = ctx_with_limits(&h, bulk_limits(&[("max_bulk_input_files", json!(2))]));
-    let description = start_ok(&ctx, start_body()).await;
-    assert_eq!(description["BulkOperationStatus"], json!("IN_PROGRESS"));
-    let operation_id = description["BulkOperationArn"]
-        .as_str()
-        .and_then(|arn| arn.rsplit('/').next())
-        .expect("operation id");
-    let record = h
-        .storage
-        .get_bulk_operation(ACCOUNT, operation_id)
-        .await
-        .expect("get")
-        .expect("record");
-    assert_eq!(record.input_files.len(), 3, "the cap plus one");
 }
 
 #[tokio::test]
-async fn the_input_byte_cap_answers_the_byte_message() {
-    let h = Harness::new().await;
-    h.write_input("part-0.json", b"01234567");
-    h.write_input("part-1.json", b"01234567");
-    let ctx = ctx_with_limits(&h, bulk_limits(&[("max_bulk_input_bytes", json!(10))]));
-    assert_eq!(
-        expect_validation(start(&ctx, start_body()).await),
-        "Input exceeds max_bulk_input_bytes (10 bytes)"
-    );
-}
-
-#[tokio::test]
-async fn the_byte_cap_still_refuses_when_the_count_cap_is_also_passed() {
-    // The count cap is no longer a Start refusal, so with both passed the
-    // enumerated total is what answers.
-    let h = Harness::new().await;
-    for i in 0..3 {
-        h.write_input(&format!("part-{i}.json"), b"01234567");
+async fn the_byte_members_appear_once_the_run_records_the_files() {
+    // Measured on the service: the Start answer carries neither byte
+    // member, and the description carries both once the input is listed.
+    for (label, files, total) in [("two files", 2, 30), ("an empty input", 0, 0)] {
+        let h = Harness::new().await;
+        if files > 0 {
+            h.write_input("part-0.json", b"0123456789");
+            h.write_input("part-1.json", b"01234567890123456789");
+        }
+        let ctx = base_ctx(&h);
+        let started = start_ok(&ctx, start_body()).await;
+        assert_eq!(
+            started["BulkOperationStatus"],
+            json!("IN_PROGRESS"),
+            "{label}"
+        );
+        assert!(started.get("TotalInputBytes").is_none(), "{label}");
+        assert!(started.get("ProcessedInputBytes").is_none(), "{label}");
+        let ended = run_started(&h, &ctx, &started).await;
+        assert_eq!(ended["TotalInputBytes"], json!(total), "{label}");
+        assert_eq!(ended["ProcessedInputBytes"], json!(total), "{label}");
     }
-    let ctx = ctx_with_limits(
-        &h,
-        bulk_limits(&[
-            ("max_bulk_input_files", json!(2)),
-            ("max_bulk_input_bytes", json!(10)),
-        ]),
-    );
-    assert_eq!(
-        expect_validation(start(&ctx, start_body()).await),
-        "Input exceeds max_bulk_input_bytes (10 bytes)"
-    );
-}
-
-#[tokio::test]
-async fn total_input_bytes_is_the_enumerated_sum() {
-    let h = Harness::new().await;
-    h.write_input("part-0.json", b"0123456789");
-    h.write_input("part-1.json", b"01234567890123456789");
-    let description = start_ok(&base_ctx(&h), start_body()).await;
-    assert_eq!(description["TotalInputBytes"], json!(30));
 }
 
 #[tokio::test]
@@ -368,14 +390,4 @@ async fn an_absent_performance_tier_echoes_standard() {
     let h = Harness::new().await;
     let description = start_ok(&base_ctx(&h), start_body()).await;
     assert_eq!(description["PerformanceTier"], json!("STANDARD"));
-}
-
-#[tokio::test]
-async fn an_empty_input_answers_in_progress_with_zero_total_bytes() {
-    let h = Harness::new().await;
-    // The bucket exists (the harness staged it) and is empty; enumeration
-    // matches no files.
-    let description = start_ok(&base_ctx(&h), start_body()).await;
-    assert_eq!(description["BulkOperationStatus"], json!("IN_PROGRESS"));
-    assert_eq!(description["TotalInputBytes"], json!(0));
 }

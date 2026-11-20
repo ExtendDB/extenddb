@@ -155,7 +155,6 @@ async fn start_op(
                 performance_tier: None,
                 start_time_ms,
                 total_input_bytes: Some(total),
-                initial_failure: None,
                 run_context: None,
             },
             50,
@@ -367,11 +366,15 @@ impl BulkOperationStore for UnsupportedStore {
         unsupported()
     }
 
-    fn count_terminal_born_since(
+    fn record_input_files(
         &self,
         _account_id: &str,
-        _since_ms: i64,
-    ) -> BoxFuture<'_, Result<u64, StorageError>> {
+        _operation_id: &str,
+        _owner: &str,
+        _lease: Duration,
+        _files: Vec<InputFile>,
+        _total_input_bytes: i64,
+    ) -> BoxFuture<'_, Result<LeaseState, StorageError>> {
         unsupported()
     }
 

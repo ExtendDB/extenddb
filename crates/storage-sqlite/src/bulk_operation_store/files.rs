@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The input files of a bulk operation, one row per file in
-//! `bulk_operation_input_files`. Start inserts them, a checkpoint updates
+//! `bulk_operation_input_files`. The runner records them on the
+//! operation's first claim, a checkpoint updates
 //! the rows of the files its cursor passes, and every full read of the
 //! record attaches them. The operation row's own `input_files` column
 //! keeps an empty array; the per-file figures lived there once, and every
@@ -11,7 +12,7 @@
 
 use super::*;
 
-/// Files per insert statement at Start: eight values each, well inside
+/// Files per insert statement: eight values each, well inside
 /// SQLite's limit on bound values per statement.
 const INSERT_CHUNK_FILES: usize = 500;
 
@@ -152,6 +153,52 @@ pub(super) async fn with_files_or_log(
             Ok(None)
         }
     }
+}
+
+/// Record the files the runner enumerated and their total, once, under the
+/// lease (`BulkOperationStore::record_input_files`).
+pub(super) fn record_input_files<'a>(
+    engine: &'a SqliteEngine,
+    account_id: &str,
+    operation_id: &str,
+    owner: &str,
+    lease: Duration,
+    files: Vec<InputFile>,
+    total_input_bytes: i64,
+) -> BoxFuture<'a, Result<LeaseState, StorageError>> {
+    let account_id = account_id.to_owned();
+    let operation_id = operation_id.to_owned();
+    let owner = owner.to_owned();
+    Box::pin(async move {
+        let lease_until = now_epoch_ms().saturating_add(lease_ms(lease));
+        let _writer = engine.write_lock.lock().await;
+        let mut tx = engine
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(internal)?;
+        let updated = sqlx::query(
+            "UPDATE bulk_operations SET total_input_bytes = ?, lease_until_ms = ? \
+             WHERE account_id = ? AND operation_id = ? AND lease_owner = ? \
+             AND total_input_bytes IS NULL",
+        )
+        .bind(total_input_bytes)
+        .bind(lease_until)
+        .bind(&account_id)
+        .bind(&operation_id)
+        .bind(&owner)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?
+        .rows_affected();
+        if updated == 0 {
+            // Dropping the transaction rolls it back.
+            return Ok(LeaseState::Lost);
+        }
+        insert_files(&mut tx, &account_id, &operation_id, &files).await?;
+        tx.commit().await.map_err(internal)?;
+        Ok(LeaseState::Held)
+    })
 }
 
 /// Delete the file rows of one operation, in the caller's transaction.

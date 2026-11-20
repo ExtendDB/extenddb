@@ -89,11 +89,13 @@ async fn an_s3_bucket_owner_that_is_not_twelve_digits_is_rejected_with_the_patte
         message.contains("at 'outputS3Configuration.s3BucketOwner'"),
         "{message}"
     );
-    // A well-formed foreign owner still reaches the ownership check, which
-    // is a terminal-born failure rather than a validation error.
+    // A well-formed foreign owner passes validation; the run's ownership
+    // check fails the operation.
+    let ctx = base_ctx(&h);
     let body = with_input(start_body(), "S3BucketOwner", json!("999999999999"));
-    let description = start_ok(&base_ctx(&h), body).await;
-    assert_eq!(description["BulkOperationStatus"], json!("FAILED"));
+    let started = start_ok(&ctx, body).await;
+    assert_eq!(started["BulkOperationStatus"], json!("IN_PROGRESS"));
+    let description = run_started(&h, &ctx, &started).await;
     assert_eq!(description["FailureCode"], json!("S3AccessDenied"));
 }
 

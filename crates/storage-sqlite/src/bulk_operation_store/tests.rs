@@ -65,7 +65,6 @@ pub(super) fn new_op(
         performance_tier: None,
         start_time_ms: 1_000,
         total_input_bytes: Some(10),
-        initial_failure: None,
         run_context: None,
     }
 }

@@ -7,7 +7,6 @@
 //! helpers the handlers share.
 
 use super::*;
-use crate::bulk_put::runner::OBJECTS_COUNT_LIMIT_CODE;
 
 /// Layer 3 of the operation ARN validation: a well-formed ARN that names no
 /// operation in the caller's account, a foreign account, or another region.
@@ -24,9 +23,10 @@ fn corrupt_record(operation_id: &str, what: &str) -> DynamoDbError {
     DynamoDbError::InternalServerError("Internal server error".to_owned())
 }
 
-/// The wire answer for one start transaction outcome, shared by the
-/// saturated-account path and the enumerated path so the messages cannot
-/// diverge.
+/// The wire answer for one start transaction outcome. A replayed Start of
+/// a terminal operation answers its description without
+/// `BulkOperationUsage`, which only Describe carries (measured on the
+/// service).
 pub(super) fn start_response(
     outcome: StartOutcome,
     region: &str,
@@ -34,8 +34,10 @@ pub(super) fn start_response(
 ) -> Result<Value, DynamoDbError> {
     match outcome {
         StartOutcome::Created(record) | StartOutcome::IdempotentReplay(record) => {
+            let mut description = describe(&record, region)?;
+            description.bulk_operation_usage = None;
             serialize_output(&StartBulkPutItemsOutput {
-                bulk_operation_description: describe(&record, region)?,
+                bulk_operation_description: description,
             })
         }
         StartOutcome::IdempotentMismatch => {
@@ -57,15 +59,6 @@ pub(super) fn start_response(
              {account_limit}. Wait until other jobs finish, and try again. You can also reach \
              out to AWS Support to request a quota increase."
         ))),
-        // The terminal-born cap, enforced exactly under the per-account
-        // lock inside the start transaction. Same throttle the pre-check
-        // fast path returns, so a burst that races past the pre-check is
-        // still refused here.
-        StartOutcome::FailedStartLimit => Err(DynamoDbError::ThrottlingException(
-            "Rate of requests exceeds the allowed throughput.".to_owned(),
-        )),
-        // The index check the handler makes before enumeration, made again
-        // inside the start transaction, so the same answer.
         StartOutcome::IndexOperationInProgress => Err(DynamoDbError::ResourceInUseException(
             INDEX_OPERATION_MESSAGE.to_owned(),
         )),
@@ -104,18 +97,12 @@ pub(crate) fn describe(
     let output_s3_configuration: OutputS3Configuration =
         serde_json::from_value(record.output_config.clone())
             .map_err(|_| corrupt_record(&record.operation_id, "stored output configuration"))?;
-    // The two byte members travel together and are absent when the hosted
-    // service never kept an enumerated total: a failure born before the
-    // walk (missing input bucket) and the object-count
-    // quota failure (50,500 objects: neither member in
-    // the description). The per-object size quota and every
-    // other terminal shape carry both. ExtendDB stores the enumerated
-    // total for the count class too, so the class is recognised by its
-    // failure code here rather than by a storage change.
-    let total_input_bytes = match record.failure_code.as_deref() {
-        Some(OBJECTS_COUNT_LIMIT_CODE) => None,
-        _ => record.total_input_bytes.map(non_negative),
-    };
+    // The two byte members travel together and are present once the runner
+    // has recorded the input files. A Start answer, and every description
+    // before the first claim lists the input, has neither (measured on the
+    // service), and neither has an operation whose input check failed: a
+    // missing input bucket, a denied listing, the object-count quota.
+    let total_input_bytes = record.total_input_bytes.map(non_negative);
     Ok(BulkOperationDescription {
         bulk_operation_arn: arn::format_arn(region, &record.account_id, &record.operation_id),
         bulk_operation_status: status,

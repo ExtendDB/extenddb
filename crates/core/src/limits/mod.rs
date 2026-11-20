@@ -77,8 +77,11 @@ pub struct LimitsConfig {
     /// rejects above it.
     #[serde(default = "default_max_concurrent_bulk_operations")]
     pub max_concurrent_bulk_operations: u32,
-    /// Maximum enumerated (compressed) input bytes per bulk operation.
-    /// `StartBulkPutItems` rejects above it.
+    /// Ceiling on the listed (compressed) input bytes of one bulk
+    /// operation, on top of the documented quota of its `PerformanceTier`
+    /// (100 GB for `STANDARD`, 1 TB for `ACCELERATED`). Above the lower of
+    /// the two the operation ends `FAILED` with `SizeLimitExceeded`. The
+    /// default is the larger quota, so each tier's own quota binds.
     #[serde(default = "default_max_bulk_input_bytes")]
     pub max_bulk_input_bytes: u64,
     /// Maximum enumerated input object count per bulk operation. Above it
@@ -141,12 +144,6 @@ pub struct LimitsConfig {
     /// beyond it are dropped and the drop is logged.
     #[serde(default = "default_max_bulk_report_bytes")]
     pub max_bulk_report_bytes: u64,
-    /// Terminal-born bulk operation starts per account per hour (rows
-    /// inserted already `FAILED`, from requests naming an absent bucket). At
-    /// or above it `StartBulkPutItems` answers `ThrottlingException` and
-    /// inserts nothing; the handler treats values below 1 as 1.
-    #[serde(default = "default_max_bulk_failed_starts_per_hour")]
-    pub max_bulk_failed_starts_per_hour: u64,
     /// Ceiling on bulk put writes in this process, in write request units
     /// per second (1 KB of item, rounded up, per unit; the unit
     /// `BulkPutBytes` charges). Shared by every operation the process runs,
@@ -198,7 +195,6 @@ impl Default for LimitsConfig {
             max_bulk_item_count: default_max_bulk_item_count(),
             max_bulk_report_records: default_max_bulk_report_records(),
             max_bulk_report_bytes: default_max_bulk_report_bytes(),
-            max_bulk_failed_starts_per_hour: default_max_bulk_failed_starts_per_hour(),
             bulk_put_write_units_per_second: default_bulk_put_write_units_per_second(),
         }
     }
@@ -276,8 +272,8 @@ fn default_max_concurrent_bulk_operations() -> u32 {
     50
 }
 fn default_max_bulk_input_bytes() -> u64 {
-    // 10 GB, matching the import file cap.
-    10_737_418_240
+    // 1 TB in the service's binary units, the ACCELERATED quota.
+    1_099_511_627_776
 }
 fn default_max_bulk_input_files() -> u64 {
     // The hosted service's per-operation object quota.
@@ -321,9 +317,6 @@ fn default_max_bulk_report_records() -> u64 {
 fn default_max_bulk_report_bytes() -> u64 {
     // 1 GiB.
     1_073_741_824
-}
-fn default_max_bulk_failed_starts_per_hour() -> u64 {
-    100
 }
 fn default_bulk_put_write_units_per_second() -> u64 {
     // The per-account write ceiling the request path enforces

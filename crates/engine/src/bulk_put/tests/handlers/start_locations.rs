@@ -118,7 +118,8 @@ async fn a_name_that_only_resembles_an_ip_literal_is_accepted() {
     let ctx = base_ctx(&h);
     for name in ["10.20.30.4a", "10.20.30.40.50", "10.20.30"] {
         let body = with_input(start_body(), "S3Bucket", json!(name));
-        let description = start_ok(&ctx, body).await;
+        let started = start_ok(&ctx, body).await;
+        let description = run_started(&h, &ctx, &started).await;
         assert_eq!(
             description["FailureCode"],
             json!("S3NoSuchBucket"),
@@ -257,6 +258,7 @@ async fn doubled_and_leading_slashes_in_the_input_prefix_are_accepted() {
             json!("IN_PROGRESS"),
             "the start with prefix {prefix} must be accepted"
         );
+        let description = run_started(&h, &ctx, &description).await;
         assert_eq!(
             description["TotalInputBytes"],
             json!(0),

@@ -308,12 +308,13 @@ fn describe_omits_total_input_bytes_on_a_missing_bucket_failure() {
 // A failure on the input object count (measured on the service: 50,500
 // objects under one prefix) runs for seconds on the hosted service and
 // ends FAILED with neither byte member, the same shape as the missing
-// bucket: the listing that would have fixed the total was never kept.
+// bucket: the runner fails the count before it records the files, so the
+// record holds no total.
 #[test]
 fn describe_omits_both_byte_members_on_an_object_count_quota_failure() {
     let mut terminal = record("FAILED");
     terminal.end_time_ms = Some(terminal.start_time_ms + 15_386);
-    terminal.total_input_bytes = Some(6_060_000);
+    terminal.total_input_bytes = None;
     terminal.failure_code = Some("S3ObjectsCountLimitExceeded".to_owned());
     terminal.failure_message = Some(
         "You have reached the maximum number of objects allowed in a single bulk operation \

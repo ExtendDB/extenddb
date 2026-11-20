@@ -18,8 +18,8 @@ mod abandon;
 pub use abandon::{AbandonKind, AbandonedFile, FileAbandon};
 
 /// Everything a backend needs to insert a new bulk operation row. The engine
-/// resolves the table, enumerates the input files, and computes the token
-/// hash and fingerprint before calling storage.
+/// resolves the table and computes the token hash and fingerprint before
+/// calling storage. The row is inserted `IN_PROGRESS`.
 pub struct NewBulkOperation {
     pub operation_id: String,
     pub table_id: String,
@@ -34,49 +34,17 @@ pub struct NewBulkOperation {
     pub max_write_request_units: Option<i64>,
     pub performance_tier: Option<String>,
     pub start_time_ms: i64,
-    /// The enumerated input total, or `None` when the operation never
-    /// reached enumeration (every initial failure is decided before the
-    /// walk). Stored as NULL and rendered as an absent `TotalInputBytes`,
-    /// the shape the hosted service answers for a failure born before the
-    /// input was read (measured on the service: a missing input bucket and an
-    /// input owner mismatch both omit the field, counters at zero).
+    /// The input total, `None` while the files are not recorded. Stored as
+    /// NULL and rendered as an absent `TotalInputBytes`. The Start handler
+    /// passes no files and `None`: the runner enumerates the input on the
+    /// operation's first claim and records both with
+    /// [`BulkOperationStore::record_input_files`].
     pub total_input_bytes: Option<i64>,
-    /// A failure the engine decided before any row was read, such as a
-    /// named bucket directory that does not exist. When set, the start
-    /// transaction inserts the row already terminal: status `FAILED`, the
-    /// code and message, `end_time_ms` equal to `start_time_ms`, zero
-    /// counters, no lease. The token hash and fingerprint are recorded as
-    /// usual so the idempotency lookup finds the row. The per-table guard
-    /// is consulted as for every start: while the table has an operation
-    /// `IN_PROGRESS` or `CANCELLING`, the start answers
-    /// `StartOutcome::TableBusy` and nothing is inserted (measured on the
-    /// hosted service: a Start naming an input bucket that does not exist,
-    /// on a table with an operation running, answered the busy message and
-    /// created nothing). The account limit is not consulted: it binds on
-    /// non-terminal rows only, and this row is terminal from its first
-    /// instant, so it never makes the table busy for a later start either.
-    pub initial_failure: Option<InitialFailure>,
     /// What the engine records at Start for the operation's runner: the
     /// store the operation started on and the caller it acts for. Opaque to
     /// storage, which stores it as given (NULL when `None`) and hands it
     /// back on every read; no wire response renders it.
     pub run_context: Option<Value>,
-}
-
-/// The failure code and message of an operation inserted already terminal.
-pub struct InitialFailure {
-    pub code: String,
-    pub message: String,
-    /// The ceiling on terminal-born rows for this account in the trailing
-    /// window, and the window start in epoch milliseconds. The start
-    /// transaction counts terminal-born rows at or after `window_start_ms`
-    /// under the per-account lock it already holds and refuses the insert
-    /// with `StartOutcome::FailedStartLimit` at or above `cap`, so the
-    /// bound is exact under a concurrent burst rather than a pre-check that
-    /// several requests can race past. The count is read after the
-    /// per-table guard, so a busy table answers `TableBusy` first.
-    pub cap: u64,
-    pub window_start_ms: i64,
 }
 
 /// One input file, as a bucket-relative path plus its size in bytes, and
@@ -91,8 +59,8 @@ pub struct InputFile {
     /// the runner abandoned. The manifest reads it instead of counting the
     /// file again, so a resume never re-reads a finished file.
     pub rows: Option<i64>,
-    /// The file's entity tag. Start records the tag the listing gave, when
-    /// it gave one; the checkpoint that moves the cursor past a finished
+    /// The file's entity tag. The runner records the tag the listing gave,
+    /// when it gave one; the checkpoint that moves the cursor past a finished
     /// file records the lowercase hex MD5 of the file's first `size` bytes,
     /// computed while the runner read them. The manifest asks the store
     /// for a tag when it is absent.
@@ -136,8 +104,8 @@ pub struct BulkOperationRecord {
     pub processed_item_count: i64,
     pub failed_item_count: i64,
     pub processed_input_bytes: i64,
-    /// `None` when the input was never enumerated (a failure born before the
-    /// walk); see [`NewBulkOperation::total_input_bytes`].
+    /// `None` until the runner records the input files; see
+    /// [`NewBulkOperation::total_input_bytes`].
     pub total_input_bytes: Option<i64>,
     /// Report records kept so far, against `max_bulk_report_records`. Set
     /// absolutely by each checkpoint, so a resumed runner continues from the
@@ -168,10 +136,6 @@ pub enum StartOutcome {
     IdempotentMismatch,
     TableBusy,
     AccountLimitReached,
-    /// A terminal-born start refused because the account is at or above
-    /// its cap of terminal-born rows in the trailing window, counted under
-    /// the per-account lock inside the start transaction.
-    FailedStartLimit,
     /// The table has a secondary or vector index that is not `ACTIVE`, or
     /// an index created while the start waited for its transaction. Read
     /// inside the start transaction, under a lock an index creation also
@@ -383,9 +347,7 @@ pub trait BulkOperationStore: Send + Sync {
 
     /// The account's non-terminal (`IN_PROGRESS` or CANCELLING) operation
     /// count, read outside any transaction. The start transaction keeps
-    /// its own exact check under its locks; this read lets the start
-    /// handler refuse a saturated account before input enumeration
-    /// runs.
+    /// its own exact check under its locks.
     fn count_non_terminal(&self, account_id: &str) -> BoxFuture<'_, Result<u64, StorageError>>;
 
     /// The non-terminal operations bound to one table of the account, by
@@ -404,18 +366,6 @@ pub trait BulkOperationStore: Send + Sync {
         let _ = (account_id, table_id);
         Box::pin(async { Ok(0) })
     }
-
-    /// The account's terminal-born rows younger than `since_ms`: rows with
-    /// status `FAILED`, `end_time_ms` equal to `start_time_ms`, and
-    /// `start_time_ms` at or after `since_ms`. Read outside any
-    /// transaction; the start handler uses it to cap how many terminal
-    /// rows an account can insert per window, so concurrent requests can
-    /// overshoot the cap by the number in flight.
-    fn count_terminal_born_since(
-        &self,
-        account_id: &str,
-        since_ms: i64,
-    ) -> BoxFuture<'_, Result<u64, StorageError>>;
 
     /// Newest first by (`start_time_ms` DESC, `operation_id` DESC); `after` is
     /// exclusive. `limit` must be at least 1; 0 is refused with
@@ -477,6 +427,22 @@ pub trait BulkOperationStore: Send + Sync {
         owner: &str,
         lease: Duration,
         progress: Progress,
+    ) -> BoxFuture<'_, Result<LeaseState, StorageError>>;
+
+    /// The input files the runner enumerated on the operation's first claim,
+    /// in list order (`file_index` from 0), and their total, which the row
+    /// then stores as `total_input_bytes`; one transaction that also renews
+    /// the lease, as `checkpoint` does. Conditional on `lease_owner` = owner
+    /// and on `total_input_bytes` still being NULL, so the files are
+    /// recorded once: zero rows updated is Lost and writes nothing.
+    fn record_input_files(
+        &self,
+        account_id: &str,
+        operation_id: &str,
+        owner: &str,
+        lease: Duration,
+        files: Vec<InputFile>,
+        total_input_bytes: i64,
     ) -> BoxFuture<'_, Result<LeaseState, StorageError>>;
 
     /// One page of report records of one kind, ordered `(file_index,

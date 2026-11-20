@@ -526,32 +526,34 @@ input prefix may carry doubled separators and a leading `/` (`orders//2026/`,
 `/orders/2026/`), as on the hosted service: it is compared with the keys as
 given.
 
-The input bucket is checked when the operation starts. A bucket that does
-not exist fails the operation with `FailureCode` `S3NoSuchBucket`. A caller
-whose policies do not allow `s3:ListBucket` on the bucket (see Permissions),
-or an `InputS3Configuration.S3BucketOwner` the bucket does not match, fails
-it with `S3AccessDenied`. The `s3:ListBucket` check comes first. Such an
-operation is created already `FAILED`, before any row is read: the Start
-response and every later description carry `FAILED`, an `EndTime` equal to
-`StartTime`, zero item counters, and no `TotalInputBytes` or
-`ProcessedInputBytes`. Its `ClientToken`
-is consumed like any other, and a retry with the same token returns the same
-failed operation. These failed-at-Start operations are capped at
-`max_bulk_failed_starts_per_hour` per account per hour (default 100); at or
-above the cap, Start answers `ThrottlingException` with `Rate of requests
-exceeds the allowed throughput.` and records nothing. A prefix that matches
-nothing in an existing bucket is not a failure: the operation completes with
-every counter at zero.
+The input bucket is checked when a worker first claims the operation, before
+any row is read. Start answers `IN_PROGRESS` without reading it, as the
+hosted service does. A bucket that does not exist fails the operation with
+`FailureCode` `S3NoSuchBucket`. A caller whose policies do not allow
+`s3:ListBucket` on the bucket (see Permissions), or an
+`InputS3Configuration.S3BucketOwner` the bucket does not match, fails it with
+`S3AccessDenied`. The `s3:ListBucket` check comes first. Such an operation
+ends `FAILED` with zero item counters, no `TotalInputBytes` or
+`ProcessedInputBytes`, and nothing written to the output bucket. Its
+`ClientToken` is consumed like any other, and a retry with the same token
+returns the same operation. A prefix that matches nothing in an existing
+bucket is not a failure: the operation completes with every counter at zero.
 
 Of the output configuration, Start checks the `S3Bucket` member's presence
-and its name, and on the S3 store a `KMS` encryption key (see the error
-report section). A report bucket that does not exist, or a mismatched output
-`S3BucketOwner`, does not stop the operation from starting: both are checked
-when the operation's first report record is produced.
+and its name. On the S3 store the first claim also checks a `KMS` encryption
+key (see the error report section). A report bucket that does not exist, or
+a mismatched output `S3BucketOwner`, does not stop the operation: both are
+checked when the operation's first report record is produced.
 
-The object list and `TotalInputBytes` are fixed when the operation starts:
-an object added under the prefix afterwards is not read, and neither are
-bytes appended to an object afterwards. Objects are processed one at a time
+The object list and `TotalInputBytes` are fixed when the first claim lists
+the input: an object added under the prefix afterwards is not read, and
+neither are bytes appended to an object afterwards. More objects than
+`max_bulk_input_files` end the operation `FAILED` with
+`S3ObjectsCountLimitExceeded`, and a listed total above the quota of the
+operation's `PerformanceTier` (100 GB for `STANDARD`, 1 TB for
+`ACCELERATED`, or `max_bulk_input_bytes` when that is lower) ends it `FAILED`
+with `SizeLimitExceeded`. Either failure leaves both byte members absent and
+writes nothing to the output bucket. Objects are processed one at a time
 in the byte order of their keys, and lines in order within an object, so a
 later row with the same key overwrites an earlier one.
 
@@ -753,20 +755,16 @@ Response:
     "StartTime": 1789060589.767,
     "ProcessedItemCount": 0,
     "FailedItemCount": 0,
-    "ProcessedInputBytes": 0,
-    "TotalInputBytes": 4096,
     "MaxWriteRequestUnits": 2000,
     "PerformanceTier": "STANDARD"
   }
 }
 ```
 
-The status is `IN_PROGRESS`, even for empty input; poll
-`DescribeBulkOperation` for the terminal status. The one exception is an
-operation created already `FAILED` by a check at Start (see Input files and
-Permissions), whose Start response carries `FAILED`. `TotalInputBytes` is
-the sum of the enumerated object sizes (compressed sizes for `GZIP` and
-`ZSTD`) and is present in this first response.
+The status is `IN_PROGRESS`, even for empty input and for an input bucket
+that does not exist; poll `DescribeBulkOperation` for the terminal status.
+The Start response carries no `TotalInputBytes`, `ProcessedInputBytes` or
+`BulkOperationUsage` (measured on the service).
 
 ### Permissions
 
@@ -937,7 +935,7 @@ operation is created. S3's code and message are in the server log.
 | `ProcessedItemCount` | Rows read and attempted, including failed rows and condition failures. Rows after a parse-level abandon are not included. |
 | `FailedItemCount` | Rows that failed a parse-level or item-level check. Condition failures are not counted. |
 | `ProcessedInputBytes` | Input bytes consumed, advanced to the end of each object as it finishes or is abandoned. Compressed bytes for `GZIP` and `ZSTD`. A `CANCELLED` or `FAILED` operation reports what was read before it stopped, except one that failed on its output location, which reports 0 (see Error report). |
-| `TotalInputBytes` | Sum of the enumerated input object sizes, fixed at start. |
+| `TotalInputBytes` | Sum of the listed input object sizes (compressed sizes for `GZIP` and `ZSTD`), recorded when the first claim lists the input. Absent before then, and on an operation whose input check or listing quota failed. `ProcessedInputBytes` is present exactly when this member is. |
 | `BulkOperationUsage` | Present once terminal: one entry for the table. The entry's `TableName` is the bare table name. `Table.BulkPutBytes` is the sum, over rows that were written, of the item's logical size in bytes with a 1,024 byte floor and no rounding above it; a row that replaced an item is charged the larger of the replaced item's size and its own. A row whose condition evaluated false is charged the 1,024 byte floor alone; rows that failed a parse-level or item-level check are not charged. Each secondary index entry is the same sum over the bytes its projection stores, and an index no row reached has no entry. A row that replaced an item and left an index's projection unchanged under the same index key charges that index nothing; one that changed the projection under the same key charges the larger of the old and new projections; one that moved the index key charges the old and the new projection. The top-level `BulkPutBytes` is the table figure plus every secondary index figure. Vector index entries carry `BulkPutVectorBytes` and are not included in the top-level figure. |
 
 ### Error report
@@ -990,9 +988,9 @@ that check passed, because the bucket was removed or its policy changed in
 between, fails with the same prefix on its message.
 
 On the S3 store an output configuration with `S3SseAlgorithm` `KMS` is also
-checked at Start: the same write check runs on error report object 0 with
-the key. A key S3 cannot use creates the operation already `FAILED` with
-S3's KMS code, `KmsDisabledException` for a disabled key and
+checked before the first claim lists the input: the same write check runs on
+error report object 0 with the key. A key S3 cannot use ends the operation
+`FAILED` with S3's KMS code, `KmsDisabledException` for a disabled key and
 `KmsInvalidKeyUsageException` for a key of the wrong usage, and no byte
 members. A bucket or owner fault that check meets is left to the first
 report record. So is an S3 `AccessDenied` for the key, which S3 returns
@@ -1156,10 +1154,10 @@ parameters returns `IdempotentParameterMismatchException` with `Specified
 idempotent token was already used with different request parameters within
 the idempotency window`. A token replays its operation for eight hours from
 the operation's start. After that, the same request starts a new operation.
-The token is looked up before any call to the store, so a replay or a
-mismatch gets the same answer while the store is unreachable, after the
-input prefix has grown past `max_bulk_input_bytes`, and while the account is
-at `max_bulk_failed_starts_per_hour`.
+Start makes no call to the store, so a replay or a mismatch gets the same
+answer while the store is unreachable. A replay of an operation that has
+ended answers its description without `BulkOperationUsage`, which only
+Describe carries (measured on the service).
 
 ### Configuration
 

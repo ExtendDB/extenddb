@@ -270,10 +270,14 @@ pub(super) async fn finalize(
     // Render each report kind that has records, when a report bucket is
     // configured. A rendering failure fails the operation; nothing about
     // the path reaches a client. A lease observed lost during rendering
-    // stops the runner here: no finish, no further writes.
+    // stops the runner here: no finish, no further writes. An operation
+    // whose input files were never recorded writes no output object
+    // (measured on the service: a missing input bucket, and a cancel before
+    // the listing).
     if let Some(config) = config
         && let Some(output_bucket) = config.output_bucket.as_deref()
         && !st.skip_render
+        && record.total_input_bytes.is_some()
     {
         match render_outputs(deps, record, config, output_bucket, &mut st, &mut deadline).await {
             Outputs::Finish => {}

@@ -19,11 +19,11 @@ use extenddb_core::types::{
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{
     BoxedFuture as BoxFuture, BulkOperationListResult, BulkOperationRecord, BulkOperationStore,
-    BulkRowMarker, CancelOutcome, DataEngine, FinishState, IdempotencyKey, ItemPairResult,
-    LeaseState, ListCursor, MetadataEngine, NewBulkOperation, Progress, QueryResult, ReportKind,
-    ReportRecord, RowOutcome, StartOutcome, StorageEngine, StreamCapture, StreamEngine,
-    StreamListResult, StreamRecordsResult, TableEngine, Terminal, TransactGetOp, TransactWriteOp,
-    TtlTableInfo, WorkerStore,
+    BulkRowMarker, CancelOutcome, DataEngine, FinishState, IdempotencyKey, InputFile,
+    ItemPairResult, LeaseState, ListCursor, MetadataEngine, NewBulkOperation, Progress,
+    QueryResult, ReportKind, ReportRecord, RowOutcome, StartOutcome, StorageEngine, StreamCapture,
+    StreamEngine, StreamListResult, StreamRecordsResult, TableEngine, Terminal, TransactGetOp,
+    TransactWriteOp, TtlTableInfo, WorkerStore,
 };
 
 /// The refusal message both unsupported backends answer. A toggle lets
@@ -905,11 +905,15 @@ impl BulkOperationStore for BulkUnsupportedStorage {
     fn count_non_terminal(&self, _account_id: &str) -> BoxFuture<'_, Result<u64, StorageError>> {
         refuse()
     }
-    fn count_terminal_born_since(
+    fn record_input_files(
         &self,
         _account_id: &str,
-        _since_ms: i64,
-    ) -> BoxFuture<'_, Result<u64, StorageError>> {
+        _operation_id: &str,
+        _owner: &str,
+        _lease: Duration,
+        _files: Vec<InputFile>,
+        _total_input_bytes: i64,
+    ) -> BoxFuture<'_, Result<LeaseState, StorageError>> {
         refuse()
     }
     fn list_bulk_operations(

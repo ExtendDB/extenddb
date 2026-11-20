@@ -1,12 +1,12 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Start against a store whose enumeration fails after the bucket check
-//! passed: a fault the store rendered on a later listing page (the bucket
-//! removed or access lost in between) starts the operation terminal, as
-//! the check would have; any other enumeration failure stays a request
-//! error. The same holds for the Start-time check of an output SSE-KMS
-//! key.
+//! Start against a store whose listing or output key check fails after
+//! the Start answered `IN_PROGRESS`: a fault the store rendered on a later
+//! listing page (the bucket removed or access lost in between) fails the
+//! operation as the bucket check would have, and so does the store's
+//! refusal of an output SSE-KMS key; any other failure of either ends the
+//! operation with the internal failure.
 
 use extenddb_storage::{BoxedFuture, InputFile};
 
@@ -87,7 +87,7 @@ pub(super) fn ctx_with_listing(h: &Harness, fault: Option<StoreFault>) -> Operat
 }
 
 #[tokio::test]
-async fn a_store_fault_on_a_later_listing_page_starts_the_operation_terminal_failed() {
+async fn a_store_fault_on_a_later_listing_page_fails_the_operation() {
     let h = Harness::new().await;
     let ctx = ctx_with_listing(
         &h,
@@ -98,26 +98,16 @@ async fn a_store_fault_on_a_later_listing_page_starts_the_operation_terminal_fai
         }),
     );
     let body = with_top(start_body(), "ClientToken", json!("tok-later-page"));
-    let description = start_ok(&ctx, body.clone()).await;
+    let started = start_ok(&ctx, body.clone()).await;
+    assert_eq!(started["BulkOperationStatus"], json!("IN_PROGRESS"));
+    let description = run_started(&h, &ctx, &started).await;
     assert_eq!(description["BulkOperationStatus"], json!("FAILED"));
     assert_eq!(description["FailureCode"], json!("S3NoSuchBucket"));
     assert_eq!(description["FailureMessage"], json!(LATER_PAGE_MESSAGE));
     assert_eq!(description["ProcessedItemCount"], json!(0));
     assert!(description.get("TotalInputBytes").is_none());
-    assert_eq!(description["EndTime"], description["StartTime"]);
     let replay = start_ok(&ctx, body).await;
     assert_eq!(replay["BulkOperationArn"], description["BulkOperationArn"]);
-}
-
-#[tokio::test]
-async fn another_enumeration_failure_stays_an_internal_request_error() {
-    let h = Harness::new().await;
-    let ctx = ctx_with_listing(&h, None);
-    let error = start(&ctx, start_body()).await.unwrap_err();
-    assert!(
-        matches!(&error, DynamoDbError::InternalServerError(message) if message == "Internal server error"),
-        "{error:?}"
-    );
 }
 
 /// A sink whose Start-time encryption check fails with `fault`, or with an
@@ -180,7 +170,7 @@ impl BulkSink for EncryptionFails {
 }
 
 #[tokio::test]
-async fn an_output_kms_key_the_store_refuses_starts_the_operation_terminal_failed() {
+async fn an_output_kms_key_the_store_refuses_fails_the_operation() {
     let h = Harness::new().await;
     let root = h.store.root();
     let message = "arn:aws:kms:us-east-1:111122223333:key/k1 is disabled. (Service: Amazon S3; \
@@ -194,20 +184,30 @@ async fn an_output_kms_key_the_store_refuses_starts_the_operation_terminal_faile
         }),
         asked: std::sync::Mutex::new(Vec::new()),
     });
-    let mut ctx = base_ctx(&h);
-    ctx.bulk = Some(Arc::new(BulkStore::with_parts(
-        Arc::clone(&root),
-        Arc::new(FsSource {
-            root: Arc::clone(&root),
-        }),
-        Arc::clone(&sink) as Arc<dyn BulkSink>,
-    )));
+    let with_sink = |sink: Arc<dyn BulkSink>| {
+        let mut ctx = base_ctx(&h);
+        ctx.bulk = Some(Arc::new(BulkStore::with_parts(
+            Arc::clone(&root),
+            Arc::new(FsSource {
+                root: Arc::clone(&root),
+            }),
+            sink,
+        )));
+        ctx
+    };
+    let ctx = with_sink(Arc::clone(&sink) as Arc<dyn BulkSink>);
     let body = with_output(
         with_output(start_body(), "S3SseAlgorithm", json!("KMS")),
         "S3SseKmsKeyId",
         json!("arn:aws:kms:us-east-1:111122223333:key/k1"),
     );
-    let description = start_ok(&ctx, body).await;
+    let started = start_ok(&ctx, body).await;
+    assert_eq!(started["BulkOperationStatus"], json!("IN_PROGRESS"));
+    assert!(
+        sink.asked.lock().unwrap().is_empty(),
+        "Start checks nothing"
+    );
+    let description = run_started(&h, &ctx, &started).await;
     assert_eq!(description["BulkOperationStatus"], json!("FAILED"));
     assert_eq!(description["FailureCode"], json!("KmsDisabledException"));
     assert_eq!(description["FailureMessage"], json!(message));
@@ -234,22 +234,12 @@ async fn an_output_kms_key_the_store_refuses_starts_the_operation_terminal_faile
     );
 
     // A failure of the check that the store did not render is the
-    // server's: the request answers InternalServerError and no operation
-    // is created.
-    let mut ctx = base_ctx(&h);
-    ctx.bulk = Some(Arc::new(BulkStore::with_parts(
-        Arc::clone(&root),
-        Arc::new(FsSource {
-            root: Arc::clone(&root),
-        }),
-        Arc::new(EncryptionFails {
-            fault: None,
-            asked: std::sync::Mutex::new(Vec::new()),
-        }),
-    )));
-    let error = start(&ctx, start_body()).await.unwrap_err();
-    assert!(
-        matches!(&error, DynamoDbError::InternalServerError(_)),
-        "{error:?}"
-    );
+    // server's: the operation ends with the internal failure.
+    let ctx = with_sink(Arc::new(EncryptionFails {
+        fault: None,
+        asked: std::sync::Mutex::new(Vec::new()),
+    }));
+    let started = start_ok(&ctx, start_body()).await;
+    let description = run_started(&h, &ctx, &started).await;
+    assert_eq!(description["FailureCode"], json!("InternalServerError"));
 }

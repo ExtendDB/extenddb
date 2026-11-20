@@ -257,10 +257,6 @@ fn limits_entries(lim: &LimitsConfig) -> Vec<(String, String)> {
             lim.max_bulk_report_bytes.to_string(),
         ),
         (
-            "limits.max_bulk_failed_starts_per_hour".into(),
-            lim.max_bulk_failed_starts_per_hour.to_string(),
-        ),
-        (
             "limits.bulk_put_write_units_per_second".into(),
             lim.bulk_put_write_units_per_second.to_string(),
         ),

@@ -74,8 +74,8 @@ pub use bulk_operation_flags::OperationFlags;
 pub use bulk_operation_store::{
     AbandonKind, AbandonedFile, BulkOperationListResult, BulkOperationRecord, BulkOperationStore,
     CANCELLED_FAILURE_CODE, CANCELLED_FAILURE_MESSAGE, CLIENT_TOKEN_WINDOW_MS, CancelOutcome,
-    FileAbandon, FinishState, FinishedFile, InitialFailure, InputFile, LeaseState, ListCursor,
-    NewBulkOperation, Progress, ReportKind, ReportRecord, StartOutcome, Terminal,
+    FileAbandon, FinishState, FinishedFile, InputFile, LeaseState, ListCursor, NewBulkOperation,
+    Progress, ReportKind, ReportRecord, StartOutcome, Terminal,
 };
 
 pub use server_components::{

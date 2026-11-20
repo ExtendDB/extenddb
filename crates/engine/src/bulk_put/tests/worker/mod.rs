@@ -115,7 +115,6 @@ async fn start_on(
                 performance_tier: None,
                 start_time_ms: now_ms(),
                 total_input_bytes: Some(total),
-                initial_failure: None,
                 run_context: None,
             },
             50,

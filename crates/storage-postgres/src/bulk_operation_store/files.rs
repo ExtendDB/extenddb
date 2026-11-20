@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The input files of a bulk operation, one row per file in
-//! `bulk_operation_input_files` (catalog migration 13). Start inserts
-//! them, a checkpoint updates the rows of the files its cursor passes, and
+//! `bulk_operation_input_files` (catalog migration 13). The runner
+//! records them on the operation's first claim, a checkpoint updates the
+//! rows of the files its cursor passes, and
 //! every full read of the record attaches them. The operation row's own
 //! `input_files` column keeps an empty array; the per-file figures lived
 //! there once, and every checkpoint that passed a file rewrote the whole
@@ -143,6 +144,47 @@ pub(super) async fn with_files_or_log(
             Ok(None)
         }
     }
+}
+
+/// Record the files the runner enumerated and their total, once, under the
+/// lease (`BulkOperationStore::record_input_files`). The renewed deadline is
+/// taken from the database's clock, as the checkpoint's is.
+pub(super) fn record_input_files<'a>(
+    engine: &'a PostgresEngine,
+    account_id: &str,
+    operation_id: &str,
+    owner: &str,
+    lease: Duration,
+    files: Vec<InputFile>,
+    total_input_bytes: i64,
+) -> BoxFuture<'a, Result<LeaseState, StorageError>> {
+    let account_id = account_id.to_owned();
+    let operation_id = operation_id.to_owned();
+    let owner = owner.to_owned();
+    Box::pin(async move {
+        let mut tx = begin(&engine.pool).await?;
+        let updated = sqlx::query(
+            "UPDATE bulk_operations SET total_input_bytes = $1, \
+                 lease_until_ms = (extract(epoch FROM clock_timestamp()) * 1000)::bigint + $2 \
+             WHERE account_id = $3 AND operation_id = $4 AND lease_owner = $5 \
+             AND total_input_bytes IS NULL",
+        )
+        .bind(total_input_bytes)
+        .bind(lease_millis(lease))
+        .bind(&account_id)
+        .bind(&operation_id)
+        .bind(&owner)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+        if updated.rows_affected() == 0 {
+            tx.rollback().await.map_err(internal)?;
+            return Ok(LeaseState::Lost);
+        }
+        insert_files(&mut tx, &account_id, &operation_id, &files).await?;
+        tx.commit().await.map_err(internal)?;
+        Ok(LeaseState::Held)
+    })
 }
 
 /// Delete the file rows of one operation, in the caller's transaction.

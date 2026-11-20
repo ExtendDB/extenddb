@@ -221,6 +221,7 @@ mod caps;
 mod compressed_cut;
 mod disk_full;
 mod durability;
+mod enumerate;
 mod exactly_once;
 mod fake_authorizer;
 mod faults;

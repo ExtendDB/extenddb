@@ -122,6 +122,13 @@ impl Harness {
         self.start_with_units(files, input, output, None).await
     }
 
+    /// Create the operation as the Start handler does, with no file list
+    /// and no total, so its first claim lists the input
+    /// (`runner::enumerate`).
+    pub(crate) async fn start_unlisted(&self, input: Value, output: Value) -> String {
+        self.start_with(None, input, output, None, None).await
+    }
+
     /// `start` with the request's `MaxWriteRequestUnits` recorded, so a
     /// test can drive the operation's own write ceiling.
     pub(crate) async fn start_with_units(
@@ -131,7 +138,7 @@ impl Harness {
         output: Value,
         max_write_request_units: Option<i64>,
     ) -> String {
-        self.start_with(files, input, output, max_write_request_units, None)
+        self.start_with(Some(files), input, output, max_write_request_units, None)
             .await
     }
 
@@ -143,20 +150,24 @@ impl Harness {
         output: Value,
         run_context: Option<Value>,
     ) -> String {
-        self.start_with(files, input, output, None, run_context)
+        self.start_with(Some(files), input, output, None, run_context)
             .await
     }
 
+    /// `files` is the recorded file list, or `None` for an operation whose
+    /// first claim lists the input.
     async fn start_with(
         &self,
-        files: Vec<InputFile>,
+        files: Option<Vec<InputFile>>,
         input: Value,
         output: Value,
         max_write_request_units: Option<i64>,
         run_context: Option<Value>,
     ) -> String {
         let operation_id = arn::generate_operation_id();
-        let total: i64 = files.iter().map(|f| f.size).sum();
+        let total = files
+            .as_ref()
+            .map(|files| files.iter().map(|f| f.size).sum());
         let outcome = self
             .storage
             .start_bulk_operation(
@@ -171,12 +182,11 @@ impl Harness {
                     request_fingerprint: "runner-test".to_owned(),
                     input_config: input,
                     output_config: output,
-                    input_files: files,
+                    input_files: files.unwrap_or_default(),
                     max_write_request_units,
                     performance_tier: None,
                     start_time_ms: now_ms(),
-                    total_input_bytes: Some(total),
-                    initial_failure: None,
+                    total_input_bytes: total,
                     run_context,
                 },
                 50,

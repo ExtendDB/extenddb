@@ -231,14 +231,9 @@ contract_case!(
     a_stream_of_starts_does_not_hold_off_delete_table,
     // A start whose table was removed after the handler's lookup.
     a_start_on_a_table_removed_after_the_lookup_is_refused,
-    // Rows born terminal (initial failure).
-    an_initial_failure_starts_terminal_and_is_never_claimed,
-    an_initial_failure_does_not_count_as_non_terminal,
-    a_table_with_an_initial_failure_row_accepts_a_new_start,
-    a_reused_token_replays_to_an_initial_failure_row,
-    count_terminal_born_since_counts_only_terminal_born_rows_in_the_window,
-    an_initial_failure_is_inserted_despite_a_saturated_account,
-    an_initial_failure_on_a_busy_table_answers_busy_and_inserts_nothing,
+    // The input files the runner records on the first claim.
+    the_lease_holder_records_the_input_files_once,
+    recording_the_input_files_needs_the_lease,
     // Reads and isolation.
     an_operation_is_invisible_and_inert_to_another_account,
     get_returns_the_record_as_stored,
@@ -268,7 +263,6 @@ contract_case!(
     // Retention.
     purge_removes_only_terminal_operations_older_than_the_cutoff,
     list_purgeable_before_honors_the_limit,
-    the_terminal_born_cap_is_enforced_in_the_start_transaction,
     purge_deletes_only_the_given_pairs,
     a_purged_operations_token_is_free_for_a_new_start,
     // A second write at a recorded position.
@@ -318,7 +312,6 @@ contract_case!(
     a_negative_stored_counter_refuses_the_read,
     // The run context recorded at Start.
     the_run_context_round_trips_through_every_read,
-    a_terminal_born_row_keeps_its_run_context,
 );
 
 /// Edits a stored operation row through the scratch catalog pool, for the

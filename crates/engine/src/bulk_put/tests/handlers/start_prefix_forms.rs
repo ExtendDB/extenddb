@@ -127,8 +127,10 @@ async fn the_filesystem_store_checks_the_listing_once_on_the_prefix_as_given() {
     let h = Harness::new().await;
     h.write_input("orders/part-0.json", &file_of(&plain_rows(1)));
     let fake = Arc::new(FakeAuthorizer::default());
+    let ctx = ctx_with(&h, Arc::clone(&fake) as _);
     let body = with_input(start_body(), "S3KeyPrefix", json!(".//orders/"));
-    let description = start_ok(&ctx_with(&h, Arc::clone(&fake) as _), body).await;
+    let started = start_ok(&ctx, body).await;
+    let description = run_started(&h, &ctx, &started).await;
     assert_eq!(list_prefixes(&fake), vec![Some(".//orders/".to_owned())]);
     assert_eq!(
         description["TotalInputBytes"],
@@ -142,8 +144,10 @@ async fn a_prefix_the_store_lists_as_given_is_checked_once() {
     let h = Harness::new().await;
     h.write_input("orders/part-0.json", &file_of(&plain_rows(1)));
     let fake = Arc::new(FakeAuthorizer::default());
+    let ctx = ctx_with(&h, Arc::clone(&fake) as _);
     let body = with_input(start_body(), "S3KeyPrefix", json!("orders/"));
-    start_ok(&ctx_with(&h, Arc::clone(&fake) as _), body).await;
+    let started = start_ok(&ctx, body).await;
+    run_started(&h, &ctx, &started).await;
     assert_eq!(fake.count(S3Action::ListBucket), 1);
 }
 
@@ -152,8 +156,10 @@ async fn an_s3_compatible_endpoint_checks_the_listing_as_given_and_as_it_resolve
     let h = Harness::new().await;
     h.write_input("orders/part-0.json", &file_of(&plain_rows(1)));
     let fake = Arc::new(FakeAuthorizer::default());
+    let ctx = endpoint_ctx_with(&h, Arc::clone(&fake) as _);
     let body = with_input(start_body(), "S3KeyPrefix", json!("x/..//./orders/"));
-    start_ok(&endpoint_ctx_with(&h, Arc::clone(&fake) as _), body).await;
+    let started = start_ok(&ctx, body).await;
+    run_started(&h, &ctx, &started).await;
     assert_eq!(
         list_prefixes(&fake),
         vec![
@@ -164,13 +170,14 @@ async fn an_s3_compatible_endpoint_checks_the_listing_as_given_and_as_it_resolve
 }
 
 #[tokio::test]
-async fn a_listing_denied_on_the_resolved_prefix_is_born_failed() {
+async fn a_listing_denied_on_the_resolved_prefix_fails_the_run() {
     for given in ["./orders/", ".//orders/", "orders//", "x/../orders/"] {
         let h = Harness::new().await;
         h.write_input("orders/part-0.json", &file_of(&plain_rows(1)));
         let body = with_input(start_body(), "S3KeyPrefix", json!(given));
         let ctx = endpoint_ctx_with(&h, Arc::new(DenyPrefix("orders/")));
-        let description = start_ok(&ctx, body).await;
+        let started = start_ok(&ctx, body).await;
+        let description = run_started(&h, &ctx, &started).await;
         assert_eq!(
             description["BulkOperationStatus"],
             json!("FAILED"),

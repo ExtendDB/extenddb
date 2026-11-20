@@ -40,40 +40,20 @@ pub(super) enum Flow {
     Finish,
 }
 
-/// The per-operation input quotas, checked against the enumerated file
-/// list before any file is opened. The hosted service accepts the Start
-/// and ends the operation `FAILED` with its own code for each class
-/// (measured on the service), so the runner answers the same
-/// way for a record whose enumeration no longer fits the configured caps.
-///
-/// The returned flag says whether the output prefix is left untouched:
-/// the count class writes neither reports nor manifest, while
-/// the size class writes a manifest with the file `NOT_PROCESSED`.
-/// `None` means both quotas hold and the files are read.
-fn input_quota_failure(
-    deps: &RunnerDeps,
-    record: &BulkOperationRecord,
-    config: &OperationConfig,
-) -> Option<(Failure, bool)> {
+/// The per-object input quota, checked against the recorded file list
+/// before any file is opened. The hosted service accepts the Start and ends
+/// the operation `FAILED` with `InputObjectTooLarge` (measured on the
+/// service), and writes a manifest with the file `NOT_PROCESSED`. The object
+/// count and the total are checked before the files are recorded
+/// (`runner::enumerate`). `None` means the quota holds and the files are
+/// read.
+fn input_quota_failure(deps: &RunnerDeps, record: &BulkOperationRecord) -> Option<Failure> {
     let limits = &deps.limits;
-    let count = u64::try_from(record.input_files.len()).unwrap_or(u64::MAX);
-    if count > limits.max_bulk_input_files {
-        let failure = Failure::objects_count_limit_exceeded(
-            &config.input_prefix,
-            limits.max_bulk_input_files,
-        );
-        return Some((failure, true));
-    }
     let over_size = record
         .input_files
         .iter()
         .any(|file| u64::try_from(file.size).unwrap_or(0) > limits.max_bulk_input_object_bytes);
-    over_size.then(|| {
-        (
-            Failure::input_object_too_large(limits.max_bulk_input_object_bytes),
-            false,
-        )
-    })
+    over_size.then(|| Failure::input_object_too_large(limits.max_bulk_input_object_bytes))
 }
 
 /// Steps 4 to 8: read every file from the restored cursor, then run the
@@ -85,18 +65,16 @@ pub(super) async fn drive(
     config: &OperationConfig,
     mut st: RunState,
 ) -> Result<(), RunnerError> {
-    if let Some((failure, skip_render)) = input_quota_failure(deps, record, config) {
+    if let Some(failure) = input_quota_failure(deps, record) {
         tracing::warn!(
             account_id = %record.account_id,
             operation_id = %record.operation_id,
             input_files = record.input_files.len(),
-            max_bulk_input_files = deps.limits.max_bulk_input_files,
             max_bulk_input_object_bytes = deps.limits.max_bulk_input_object_bytes,
             failure_code = %failure.code,
             "bulk operation input passes a configured quota; no file is read"
         );
         st.failure = Some(failure);
-        st.skip_render = skip_render;
         return finalize(deps, record, Some(config), st).await;
     }
     // `MaxWriteRequestUnits` was validated at Start to be at least 1 when

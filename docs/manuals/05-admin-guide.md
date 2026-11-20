@@ -313,11 +313,10 @@ workers that drive it.
 | Key | Default | Description |
 |-----|---------|-------------|
 | `max_concurrent_bulk_operations` | `50` | Non-terminal bulk operations one account may have. `StartBulkPutItems` rejects above it. |
-| `max_bulk_input_bytes` | `10737418240` | Enumerated (compressed) input bytes per operation. `StartBulkPutItems` rejects above it. |
-| `max_bulk_input_files` | `50000` | Enumerated input object count per operation. Above it the Start is accepted and the operation ends `FAILED` with `S3ObjectsCountLimitExceeded`, as the hosted service does at its 50,000 quota. The enumeration stores up to one object past the cap, one catalog row per object, and a checkpoint updates only the rows of the files it passes, so a lower value bounds the rows one operation holds. On the filesystem store the walk examines only the entries whose path can hold a key under the prefix, and when it examines more than four times this value of them, `StartBulkPutItems` answers `ValidationException` `Input exceeds max_bulk_input_files ({value} files)` and creates no operation. |
+| `max_bulk_input_bytes` | `1099511627776` | Ceiling on the listed (compressed) input bytes of one operation, on top of the documented quota of its `PerformanceTier` (100 GB for `STANDARD`, 1 TB for `ACCELERATED`, 1 GB being 2^30 bytes). Above the lower of the two the operation ends `FAILED` with `SizeLimitExceeded`. The default is the `ACCELERATED` quota, so each tier's own quota binds. |
+| `max_bulk_input_files` | `50000` | Listed input object count per operation. Above it the operation ends `FAILED` with `S3ObjectsCountLimitExceeded`, as the hosted service does at its 50,000 quota. The listing stops one object past the cap and the operation records no file, so a lower value bounds the catalog rows one operation holds. On the filesystem store the walk examines only the entries whose path can hold a key under the prefix, and when it examines more than four times this value of them, the operation ends the same way. |
 | `max_bulk_input_object_bytes` | `5368709120` | Size of one enumerated input object. Above it the Start is accepted and the operation ends `FAILED` with `InputObjectTooLarge`, as the hosted service does at 5 GiB. |
 | `max_bulk_client_token_bytes` | `1024` | Longest accepted `ClientToken` in bytes. The API model puts no length cap on the token; this bounds what one request can store in the catalog. |
-| `max_bulk_failed_starts_per_hour` | `100` | Terminal-born starts per account per hour. At or above it `StartBulkPutItems` answers `ThrottlingException`, except on a table with an operation running, which answers `ResourceInUseException`. Bounds catalog growth from requests naming absent buckets. |
 | `max_bulk_line_bytes` | `4194304` | Longest accepted input line in bytes. A longer line abandons the rest of its file. |
 | `max_bulk_item_count` | `100000000` | Physical lines one operation may consume, blank lines included. Exceeding it fails the operation. |
 | `max_bulk_report_records` | `1000000` | Report records kept per operation. Records beyond it are dropped and the drop is logged. On SQLite the records of an operation that has ended are deleted after its terminal transition, 2,000 per statement, so other writes wait for one statement at a time. |
@@ -530,8 +529,8 @@ file the server refuses to start with `Cannot resolve bulk store path
 {path}: File exists (os error 17)`. `POST
 /management/accounts` creates the new account's directory, and
 `StartBulkPutItems` creates it if it is missing. The caller creates the
-bucket directories: a request naming a bucket directory that does not exist
-fails the operation with `FailureCode` `S3NoSuchBucket`. Account deletion
+bucket directories: an operation naming a bucket directory that does not
+exist ends `FAILED` with `FailureCode` `S3NoSuchBucket`. Account deletion
 leaves the directory and its files in place.
 
 Whoever can write beneath `{path}/{account id}` can feed data into any

@@ -7,11 +7,12 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
 use extenddb_storage::bulk_operation_store::{
-    CancelOutcome, InitialFailure, NewBulkOperation, StartOutcome,
+    CancelOutcome, FinishState, NewBulkOperation, StartOutcome, Terminal,
 };
 use extenddb_storage::server_components::ServerComponentsOptions;
 
@@ -385,12 +386,6 @@ async fn start(
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
     let start_time_ms = 1_789_060_589_767 + i64::try_from(n).unwrap();
     let operation_id = format!("{start_time_ms:014}-{n:08x}");
-    let initial_failure = terminal.then(|| InitialFailure {
-        code: "S3NoSuchBucket".to_owned(),
-        message: "The specified bucket does not exist".to_owned(),
-        cap: 1_000,
-        window_start_ms: 0,
-    });
     let operation = NewBulkOperation {
         operation_id: operation_id.clone(),
         table_id: create_table(storage, account, table).await,
@@ -406,7 +401,6 @@ async fn start(
         performance_tier: None,
         start_time_ms,
         total_input_bytes: None,
-        initial_failure,
         run_context,
     };
     let outcome = storage
@@ -414,6 +408,25 @@ async fn start(
         .await
         .unwrap();
     assert!(matches!(outcome, StartOutcome::Created(_)), "{table}");
+    if terminal {
+        // A claim ends it the way a runner ends a missing input bucket.
+        storage
+            .claim_runnable("terminal", Duration::from_secs(60), 100, &[], &[])
+            .await
+            .unwrap();
+        let terminal = Terminal {
+            status: "FAILED".to_owned(),
+            end_time_ms: start_time_ms,
+            failure_code: Some("S3NoSuchBucket".to_owned()),
+            failure_message: Some("The specified bucket does not exist".to_owned()),
+            usage: json!({}),
+        };
+        let finished = storage
+            .finish(account, &operation_id, "terminal", terminal)
+            .await
+            .unwrap();
+        assert!(matches!(finished, FinishState::Held(_)), "{table}");
+    }
     operation_id
 }
 

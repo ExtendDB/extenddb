@@ -226,7 +226,7 @@ const BULK_LIMITS_TEMPLATE: &str = "\
 # bulk_operation_lease_seconds = 60          # floored at 1
 # bulk_put_batch_size = 25                   # rows per checkpoint; floored at 1, capped at 10000
 # bulk_put_write_batch_rows = 25             # rows per storage transaction; capped at 100 and by bulk_put_batch_size
-# max_bulk_input_bytes = 10737418240         # enumerated (compressed) total per operation; Start rejects above it
+# max_bulk_input_bytes = 1099511627776       # ceiling on the listed (compressed) total per operation, under the tier quota (100 GB STANDARD, 1 TB ACCELERATED); above it the operation fails
 # max_bulk_input_files = 50000               # enumerated object count per operation; above it the operation fails
 # max_bulk_input_object_bytes = 5368709120   # one enumerated input object; above it the operation fails
 # max_bulk_client_token_bytes = 1024         # longest accepted ClientToken on StartBulkPutItems, in bytes
@@ -234,7 +234,6 @@ const BULK_LIMITS_TEMPLATE: &str = "\
 # max_bulk_item_count = 100000000            # rows read per operation; more fails the operation
 # max_bulk_report_records = 1000000          # records kept per operation; more are dropped and logged
 # max_bulk_report_bytes = 1073741824         # serialized bytes of records kept per operation; more are dropped and logged
-# max_bulk_failed_starts_per_hour = 100      # terminal-born starts per account per hour; above it Start answers ThrottlingException
 # bulk_put_write_units_per_second = 80000    # ceiling on bulk writes per process, in 1 KB write units per second; 0 disables";
 
 /// Commented `[bulk]` store block written into the generated config, the
@@ -553,7 +552,6 @@ mod tests {
             "max_bulk_item_count",
             "max_bulk_report_records",
             "max_bulk_report_bytes",
-            "max_bulk_failed_starts_per_hour",
             "bulk_put_write_units_per_second",
         ];
         for key in expected {

@@ -72,22 +72,3 @@ async fn put_item_reports_the_condition_message_when_the_key_is_also_missing() {
         "the condition message must win over the missing key"
     );
 }
-
-#[cfg(unix)]
-#[tokio::test]
-async fn a_symlink_at_the_bucket_name_starts_the_operation_terminal_failed() {
-    let h = Harness::new().await;
-    // A real directory with an input file, reachable only through a
-    // symlink planted at the bucket name. The existence check reads the
-    // link itself and answers as if the bucket were missing; a check that
-    // followed the link would find a directory inside the caller's own
-    // subtree and let the operation proceed.
-    let elsewhere = h.store.0.join(ACCOUNT).join("elsewhere");
-    std::fs::create_dir_all(&elsewhere).unwrap();
-    std::fs::write(elsewhere.join("part-000.json"), b"{}\n").unwrap();
-    std::os::unix::fs::symlink(&elsewhere, h.store.0.join(ACCOUNT).join("linked")).unwrap();
-    let body = with_input(start_body(), "S3Bucket", json!("linked"));
-    let description = start_ok(&base_ctx(&h), body).await;
-    assert_eq!(description["BulkOperationStatus"], json!("FAILED"));
-    assert_eq!(description["FailureCode"], json!("S3NoSuchBucket"));
-}

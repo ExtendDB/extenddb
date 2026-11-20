@@ -141,7 +141,6 @@ fn new_op<E: StorageEngine>(
         performance_tier: Some("STANDARD".to_owned()),
         start_time_ms,
         total_input_bytes: Some(100),
-        initial_failure: None,
         run_context: None,
     }
 }
@@ -153,7 +152,6 @@ fn start_kind(outcome: &StartOutcome) -> &'static str {
         StartOutcome::IdempotentMismatch => "IdempotentMismatch",
         StartOutcome::TableBusy => "TableBusy",
         StartOutcome::AccountLimitReached => "AccountLimitReached",
-        StartOutcome::FailedStartLimit => "FailedStartLimit",
         StartOutcome::IndexOperationInProgress => "IndexOperationInProgress",
     }
 }
@@ -335,7 +333,7 @@ mod checkpoint;
 mod counters;
 mod finish;
 mod index_crossing;
-mod initial_failure;
+mod input_files;
 mod lease;
 mod ledger;
 mod list;
@@ -355,7 +353,7 @@ pub use self::checkpoint::*;
 pub use self::counters::*;
 pub use self::finish::*;
 pub use self::index_crossing::*;
-pub use self::initial_failure::*;
+pub use self::input_files::*;
 pub use self::lease::*;
 pub use self::ledger::*;
 pub use self::list::*;

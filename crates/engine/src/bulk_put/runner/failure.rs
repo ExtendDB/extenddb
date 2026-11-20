@@ -20,10 +20,8 @@ pub(super) struct Failure {
 /// so the code is never written to a record.
 const CODE_STORE_UNAVAILABLE: &str = "StoreUnavailable";
 
-/// The failure code of the object-count quota class. The Describe handler
-/// recognises the class by this code to omit the two byte members the
-/// hosted service leaves out of that description.
-pub(crate) const OBJECTS_COUNT_LIMIT_CODE: &str = "S3ObjectsCountLimitExceeded";
+/// The failure code of the object-count quota class.
+const OBJECTS_COUNT_LIMIT_CODE: &str = "S3ObjectsCountLimitExceeded";
 
 impl Failure {
     /// The table with the bound `table_id` is gone or unusable.
@@ -133,6 +131,22 @@ impl Failure {
                 "This bulk operation contains one or more input objects larger than the \
                  allowed per-object size of {}. Split those objects into smaller parts and \
                  retry.",
+                format_gibibytes(limit_bytes)
+            ),
+        }
+    }
+
+    /// The listed input total above the operation's quota for its
+    /// `PerformanceTier`. The code is the documented one: the service ends
+    /// such an operation `FAILED` with `SizeLimitExceeded`. The message is
+    /// ExtendDB's own, since the service's text needs an input over 100 GB
+    /// to measure; it renders the quota as `input_object_too_large` does.
+    pub(super) fn size_limit_exceeded(limit_bytes: u64) -> Self {
+        Self {
+            code: Cow::Borrowed("SizeLimitExceeded"),
+            message: format!(
+                "The total size of the input objects of this bulk operation exceeds the \
+                 maximum allowed for the selected PerformanceTier, which is {}.",
                 format_gibibytes(limit_bytes)
             ),
         }

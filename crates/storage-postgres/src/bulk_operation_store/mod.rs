@@ -231,14 +231,6 @@ impl BulkOperationStore for PostgresEngine {
         start::count_non_terminal_for_table(self, account_id, table_id)
     }
 
-    fn count_terminal_born_since(
-        &self,
-        account_id: &str,
-        since_ms: i64,
-    ) -> BoxFuture<'_, Result<u64, StorageError>> {
-        start::count_terminal_born_since(self, account_id, since_ms)
-    }
-
     fn list_bulk_operations(
         &self,
         account_id: &str,
@@ -283,6 +275,26 @@ impl BulkOperationStore for PostgresEngine {
         progress: Progress,
     ) -> BoxFuture<'_, Result<LeaseState, StorageError>> {
         claim::checkpoint(self, account_id, operation_id, owner, lease, progress)
+    }
+
+    fn record_input_files(
+        &self,
+        account_id: &str,
+        operation_id: &str,
+        owner: &str,
+        lease: Duration,
+        files: Vec<InputFile>,
+        total_input_bytes: i64,
+    ) -> BoxFuture<'_, Result<LeaseState, StorageError>> {
+        files::record_input_files(
+            self,
+            account_id,
+            operation_id,
+            owner,
+            lease,
+            files,
+            total_input_bytes,
+        )
     }
 
     fn report_records_page(
