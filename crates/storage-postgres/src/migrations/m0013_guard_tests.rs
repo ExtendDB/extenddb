@@ -190,9 +190,11 @@ async fn only_a_store_with_rows_is_checked() {
     assert!(!catalog_has_rows(&s.db).await.unwrap());
     assert!(!data_has_rows(&s.db, &s.db).await.unwrap());
     // A store whose only counted row is a stream record waiting for its
-    // number. Its shard row is not one that the check counts.
+    // number. This scratch holds the catalog's stream_shards, whose table_id
+    // references tables; the data database's has no such key.
     sqlx::raw_sql(
-        "INSERT INTO stream_shards (shard_id, table_id, starting_sequence_number) \
+        "ALTER TABLE stream_shards DROP CONSTRAINT stream_shards_table_id_fkey; \
+         INSERT INTO stream_shards (shard_id, table_id, starting_sequence_number) \
          VALUES ('shard-0', 't0', '1'); \
          INSERT INTO stream_pending (shard_id, table_id, event_name, record_data, \
          record_bytes, created_at) VALUES ('shard-0', 't0', 'INSERT', '{}', 2, now())",
