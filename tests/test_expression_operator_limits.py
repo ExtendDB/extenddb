@@ -20,8 +20,9 @@ Two request shapes Amazon DynamoDB refuses with texts ExtendDB did not match:
 
 The syntax error wording tests are in test_expression_syntax_wording.py.
 
-Every expected text was measured against Amazon DynamoDB on 2026-10-25 or
-2026-11-19 (us-east-1); the probe case id is noted on each assertion. The
+Every expected text was measured against Amazon DynamoDB on 2026-10-25,
+2026-11-19 or 2026-11-20 (us-east-1); the probe case id is noted on each
+assertion. The
 write paths carry a ``1 validation error detected: `` prefix on the service
 that ExtendDB does not emit; those assertions compare the text after the
 prefix.
@@ -488,6 +489,39 @@ class TestChecksAheadOfTheCount:
             )
         )
         assert msg == f"Invalid FilterExpression: {TOO_MANY}301"
+
+    @pytest.mark.parametrize(
+        "case, kce, values, want",
+        [
+            ("k20", "pk = :zz AND " + chain("#v = :v", 150, " AND "), {}, UNDEFINED_VALUE),
+            ("k21", "#x = :p AND " + chain("#v = :v", 150, " AND "), P, UNDEFINED_NAME),
+            (
+                "k22",
+                "pk = :p AND begins_with(sk, :n) AND " + chain("#v = :v", 149, " AND "),
+                {**P, **N},
+                N_PREFIX,
+            ),
+            (
+                "k26",
+                "pk = :p AND " + chain("#v = :v", 150, " AND ") + " AND #y = :v",
+                P,
+                UNDEFINED_NAME.replace("#x", "#y"),
+            ),
+            (
+                "k27",
+                "pk = :p AND sk < :b AND " + chain("#v = :v", 149, " AND "),
+                {**P, **B},
+                BOOL_OPERAND,
+            ),
+        ],
+    )
+    def test_key_condition(self, dynamodb_client, table, case, kce, values, want):
+        # Measured 2026-11-20: a key condition over the cap answers its
+        # undefined placeholder or operand type fault, not the count.
+        msg = _validation(
+            query(dynamodb_client, table, kce, ExpressionAttributeValues={**VALUES, **values})
+        )
+        assert msg == f"Invalid KeyConditionExpression: {want}", case
 
     def test_write_conditions(self, dynamodb_client, table):
         # [p01], [p02], [p03] on PutItem; [u01] on UpdateItem; [d01] on DeleteItem.

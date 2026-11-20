@@ -267,9 +267,11 @@ pub fn parse_projection_expr(
 /// # Errors
 ///
 /// Returns `DynamoDbError::ValidationException` for over-size, syntax, or
-/// reserved-word errors.
+/// reserved-word errors, and for an undefined placeholder or an operand type
+/// fault in a key condition over the operator cap.
 pub fn parse_key_condition_expr(
     expr: &str,
+    maps: &ExpressionMaps,
     limits: &LimitsConfig,
 ) -> Result<KeyCondition, DynamoDbError> {
     check_expression_size(expr, ExpressionKind::KeyCondition, limits)?;
@@ -289,16 +291,22 @@ pub fn parse_key_condition_expr(
         // :p sk = :s` token "sk", near ":p sk ="). The count comes next: `pk =
         // :v OR` + 150 terms answers the count, not the operator refusal, and
         // 151 AND-joined equalities answer the count ahead of the
-        // one-condition-per-key check (measured 2026-10-25). When the
+        // one-condition-per-key check (measured 2026-10-25). A key condition
+        // over the cap that also holds an undefined placeholder or an operand
+        // of the wrong type answers that fault instead (measured 2026-11-20:
+        // `#x = :p AND` 150 terms answers the undefined `#x`). When the
         // condition grammar refuses the text in another way, the key
         // condition parser reports the error in its own words.
         match parse_condition_from(&tokens, expr, limits.max_expression_depth) {
             Ok(condition) => {
-                validate_operator_count(
+                if let Err(count) = validate_operator_count(
                     &condition,
                     ExpressionKind::KeyCondition,
                     limits.max_expression_operators,
-                )?;
+                ) {
+                    validate_placeholders_and_operands(&condition, maps)?;
+                    return Err(count);
+                }
             }
             Err(err) if is_syntax_error(&err) => return Err(err),
             Err(_) => {}

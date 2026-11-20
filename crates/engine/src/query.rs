@@ -237,7 +237,8 @@ pub async fn handle_query(
     let (mut key_condition, legacy_kc_maps) = if let Some(kce_str) =
         input.key_condition_expression.as_deref()
     {
-        let parsed = crate::expression_helpers::parse_key_condition_expr(kce_str, &ctx.limits)?;
+        let parsed =
+            crate::expression_helpers::parse_key_condition_expr(kce_str, &maps, &ctx.limits)?;
         (parsed, None)
     } else if let Some(ref kc) = input.key_conditions {
         let key_schema_pairs: Vec<(String, bool)> = query_key_info

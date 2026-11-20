@@ -103,12 +103,24 @@ fn syntax_error_beats_the_count() {
     );
 }
 
+/// `#v` is defined; `:v`, `:p` and `:s` are S values.
+fn key_maps() -> ExpressionMaps {
+    let names = HashMap::from([("#v".to_owned(), "v".to_owned())]);
+    let values = HashMap::from([
+        (":v".to_owned(), AttributeValue::S("x".to_owned())),
+        (":p".to_owned(), AttributeValue::S("p1".to_owned())),
+        (":s".to_owned(), AttributeValue::S("s1".to_owned())),
+    ]);
+    build_expression_maps(Some(&names), Some(&values))
+}
+
 #[test]
 fn key_condition_count_runs_before_the_key_grammar() {
     let limits = LimitsConfig::default();
+    let maps = key_maps();
     // [a62] `pk = :v OR` + 150 terms: 301, the count, not the OR refusal.
     let expr = format!("pk = :v OR {}", vec!["#v = :v"; 150].join(" AND "));
-    let err = parse_key_condition_expr(&expr, &limits).unwrap_err();
+    let err = parse_key_condition_expr(&expr, &maps, &limits).unwrap_err();
     assert!(
         matches!(&err, DynamoDbError::ValidationException(msg)
         if msg == "Invalid KeyConditionExpression: The expression contains too many operators; operator count: 301"),
@@ -116,17 +128,30 @@ fn key_condition_count_runs_before_the_key_grammar() {
     );
     // [a63] two conditions joined by OR under the cap: the key grammar
     // answers (measured 2026-11-19 as x25).
-    let err = parse_key_condition_expr("pk = :v OR sk = :s", &limits).unwrap_err();
+    let err = parse_key_condition_expr("pk = :v OR sk = :s", &maps, &limits).unwrap_err();
     assert!(
         matches!(&err, DynamoDbError::ValidationException(msg)
         if msg == "Invalid KeyConditionExpression: Invalid operator used in KeyConditionExpression"),
         "got {err:?}"
     );
     // [d23] a syntax error is reported by the key grammar in the service's words.
-    let err = parse_key_condition_expr("pk = :v AND", &limits).unwrap_err();
+    let err = parse_key_condition_expr("pk = :v AND", &maps, &limits).unwrap_err();
     assert!(
         matches!(&err, DynamoDbError::ValidationException(msg)
         if msg == "Invalid KeyConditionExpression: Syntax error; token: \"<EOF>\", near: \"AND\""),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn key_condition_placeholder_fault_beats_the_count() {
+    // [k21] measured 2026-11-20: `#x = :p AND` 150 terms, with `#x`
+    // undefined, answers the undefined name, not the count of 301.
+    let expr = format!("#x = :p AND {}", vec!["#v = :v"; 150].join(" AND "));
+    let err = parse_key_condition_expr(&expr, &key_maps(), &LimitsConfig::default()).unwrap_err();
+    assert!(
+        matches!(&err, DynamoDbError::ValidationException(msg)
+        if msg == "Invalid KeyConditionExpression: An expression attribute name used in the document path is not defined; attribute name: #x"),
         "got {err:?}"
     );
 }
@@ -154,8 +179,9 @@ fn key_condition_syntax_errors_come_before_the_key_rules() {
         ("k11", "pk = :p AND NOT NOT", syntax("<EOF>", "NOT")),
     ];
     let limits = LimitsConfig::default();
+    let maps = key_maps();
     for (case, expr, want) in rows {
-        let err = parse_key_condition_expr(expr, &limits).unwrap_err();
+        let err = parse_key_condition_expr(expr, &maps, &limits).unwrap_err();
         assert!(
             matches!(&err, DynamoDbError::ValidationException(msg)
                 if *msg == format!("Invalid KeyConditionExpression: {want}")),
