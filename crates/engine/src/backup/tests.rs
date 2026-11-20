@@ -6313,7 +6313,8 @@ fn an_unsupported_feature_is_a_validation_exception() {
 
 /// Measured on DynamoDB: `BackupName` and `TableName` are
 /// constrained as the service model says, with the service's texts; both
-/// constraints failing join under `2 validation errors detected:`.
+/// constraints failing join under `2 validation errors detected:`. An empty
+/// name fails both (measured in us-east-1 on 2026-11-20).
 #[test]
 fn backup_and_table_names_are_validated_as_the_model_says() {
     let ok = ["abc", "a.b-c_D", &"x".repeat(255)];
@@ -6334,8 +6335,9 @@ fn backup_and_table_names_are_validated_as_the_model_says() {
             "",
             "backupName",
             format!(
-                "1 validation error detected: {}",
-                constraint("", "backupName", short)
+                "2 validation errors detected: {}; {}",
+                constraint("", "backupName", short),
+                constraint("", "backupName", pattern)
             ),
         ),
         (
