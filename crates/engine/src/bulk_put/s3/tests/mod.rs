@@ -18,7 +18,6 @@ mod read;
 mod redirect;
 mod replaced;
 pub(crate) mod smoke;
-mod start_deadline;
 mod startup;
 mod stub;
 mod transient;
@@ -91,8 +90,8 @@ pub(super) fn s3_error(status: u16, code: &str, message: &str) -> HttpResponse {
     )
 }
 
-/// The tail the service renders on input reads, the Start-time list and
-/// the manifest write.
+/// The tail the service renders on input reads, the first claim's listing
+/// and the manifest write.
 pub(super) fn amazon_s3_tail(status: u16, code: &str) -> String {
     format!(
         " (Service: Amazon S3; Status Code: {status}; Error Code: {code}; Request ID: \

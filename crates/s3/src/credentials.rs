@@ -32,7 +32,7 @@ pub struct Startup<'a> {
     /// The store's name, as its log lines give it, such as `S3 bulk store`.
     pub label: &'a str,
     /// What the store's callers meet while its credentials do not resolve,
-    /// as one clause, such as `Start answers InternalServerError until
+    /// as one clause, such as `operations fail at their first claim until
     /// they resolve`.
     pub until_resolved: &'a str,
 }

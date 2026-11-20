@@ -1,8 +1,8 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! The input bucket at Start: the bucket check and the enumeration, both
-//! ListObjectsV2. The check lists one key under the request's prefix, so
+//! The input bucket on an operation's first claim: the bucket check and
+//! the enumeration, both ListObjectsV2. The check lists one key under the request's prefix, so
 //! S3 answers the owner, existence and `s3:ListBucket` faults with its own
 //! code and message; a HEAD request would carry neither, since its error
 //! has no body. The enumeration lists pages of 1,000 keys with
@@ -11,22 +11,21 @@
 
 use aws_sdk_s3::types::EncodingType;
 
-use super::client::Phase;
 use super::{Location, S3Clients, source_error, unquoted};
 use crate::bulk_put::source::{SourceError, SourceFile};
 
 /// Keys asked for per ListObjectsV2 page.
 const LIST_PAGE_KEYS: i32 = 1_000;
 
-/// The Start-time check of the input bucket: one ListObjectsV2 of at most
-/// one key under `prefix`, with the expected owner when one is set.
+/// The first claim's check of the input bucket: one ListObjectsV2 of at
+/// most one key under `prefix`, with the expected owner when one is set.
 pub(super) async fn check_bucket(
     clients: &S3Clients,
     location: &Location,
     prefix: &str,
 ) -> Result<(), SourceError> {
     clients
-        .call_in(Phase::Start, &location.bucket, |client| {
+        .call(&location.bucket, |client| {
             client
                 .list_objects_v2()
                 .bucket(&location.bucket)
@@ -46,8 +45,9 @@ pub(super) async fn check_bucket(
 /// order whatever order the service listed them in. Collecting more than
 /// `max_files` stops the listing with `max_files + 1` entries, so the
 /// caller can tell the bound was passed. A fault on any page is the
-/// service's answer for that page. Each page is one call under the Start
-/// deadline, so a long listing is not cut short while its pages answer.
+/// service's answer for that page. Each page is one call under the
+/// store's retry bound, so a long listing is not cut short while its pages
+/// answer.
 pub(super) async fn list(
     clients: &S3Clients,
     location: &Location,
@@ -59,7 +59,7 @@ pub(super) async fn list(
     let mut token: Option<String> = None;
     loop {
         let page = clients
-            .call_in(Phase::Start, &location.bucket, |client| {
+            .call(&location.bucket, |client| {
                 client
                     .list_objects_v2()
                     .bucket(&location.bucket)

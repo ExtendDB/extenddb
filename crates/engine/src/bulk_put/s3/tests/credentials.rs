@@ -9,7 +9,6 @@ use tracing::Level;
 use super::logs::Capture;
 use super::read::{LINES, open_with};
 use super::*;
-use crate::bulk_put::s3::client::Phase;
 use crate::bulk_put::s3::error::Tail;
 use crate::bulk_put::s3::list::check_bucket;
 use crate::bulk_put::s3::probe::probe;
@@ -64,7 +63,6 @@ async fn the_servers_own_credential_faults_are_the_servers_failure_on_every_call
             "run/AWSDynamoDB/BulkOperation/report-0.json.gz",
             &OutputSse::None,
             Tail::S3,
-            Phase::Run,
         )
         .await
         .unwrap_err();

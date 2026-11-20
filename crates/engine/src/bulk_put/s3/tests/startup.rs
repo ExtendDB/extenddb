@@ -47,8 +47,8 @@ async fn warning() {
     assert_eq!(
         warnings[0].message(),
         format!(
-            "S3 bulk store credentials cannot be resolved; Start answers InternalServerError \
-             until they resolve. {CREDENTIALS_LATER}"
+            "S3 bulk store credentials cannot be resolved; operations fail at their first \
+             claim until they resolve. {CREDENTIALS_LATER}"
         )
     );
     assert!(

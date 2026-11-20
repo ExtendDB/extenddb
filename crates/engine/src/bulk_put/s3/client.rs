@@ -3,11 +3,9 @@
 
 //! The bulk put store's view of its S3 clients: the shared clients of
 //! `extenddb-s3` (the region redirects, the retry bound, the startup
-//! credential check), with the bytes of each ranged GET and uploaded part
-//! and the deadline of the calls a Start makes.
+//! credential check), with the bytes of each ranged GET and uploaded part.
 
 use std::future::Future;
-use std::time::Duration;
 
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::http::HttpResponse;
@@ -22,26 +20,8 @@ use crate::bulk_put::store::{S3_STORE_LABEL, S3StoreSettings};
 /// How the bulk store names itself in its startup lines.
 const STARTUP: Startup<'static> = Startup {
     label: S3_STORE_LABEL,
-    until_resolved: "Start answers InternalServerError until they resolve",
+    until_resolved: "operations fail at their first claim until they resolve",
 };
-
-/// How long one S3 call a Start makes may run, its retries included: the
-/// bucket check, each page of the listing, and the encryption check with
-/// its abort. A Start then answers within the time an SDK client waits
-/// for a response. A call still running at the deadline is dropped, which
-/// closes its connection, and fails as the server's, so the Start answers
-/// `InternalServerError` and creates no operation. The runner's calls are
-/// bound by the retry total alone.
-pub(crate) const START_DEADLINE: Duration = Duration::from_secs(10);
-
-/// Who makes an S3 call, which sets the bound it runs under.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Phase {
-    /// A Start: the retry bound and [`START_DEADLINE`].
-    Start,
-    /// The runner: the retry bound alone.
-    Run,
-}
 
 /// Build the store's clients from its settings and the standard AWS
 /// credential chain (`extenddb_s3::connect`), the startup lines naming the
@@ -76,8 +56,6 @@ pub(crate) struct S3Clients {
     shared: extenddb_s3::S3Clients,
     /// Bytes asked for per ranged GET and sent per uploaded part.
     part_bytes: u64,
-    /// How long one call a Start makes may run ([`START_DEADLINE`]).
-    start_deadline: Duration,
 }
 
 impl S3Clients {
@@ -100,7 +78,6 @@ impl S3Clients {
         Self {
             shared,
             part_bytes: super::read::GET_PART_BYTES,
-            start_deadline: START_DEADLINE,
         }
     }
 
@@ -114,14 +91,6 @@ impl S3Clients {
     #[cfg(test)]
     pub(crate) fn with_retry(mut self, retry: extenddb_s3::retry::RetryPolicy) -> Self {
         self.shared = self.shared.with_retry(retry);
-        self
-    }
-
-    /// Test hook: another deadline for the calls a Start makes, so a test
-    /// sees it end a call without waiting ten seconds.
-    #[cfg(test)]
-    pub(crate) fn with_start_deadline(mut self, deadline: Duration) -> Self {
-        self.start_deadline = deadline;
         self
     }
 
@@ -164,30 +133,6 @@ impl S3Clients {
         E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
     {
         self.shared.call(bucket, call).await
-    }
-
-    /// [`Self::call`] under the bound of `phase`. A Start's call still
-    /// running at the Start deadline is dropped and answered as an SDK
-    /// timeout, which the store maps to the server's failure.
-    pub(crate) async fn call_in<T, E, F, Fut>(
-        &self,
-        phase: Phase,
-        bucket: &str,
-        call: F,
-    ) -> Result<T, SdkError<E, HttpResponse>>
-    where
-        F: Fn(Client) -> Fut,
-        Fut: Future<Output = Result<T, SdkError<E, HttpResponse>>>,
-        E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
-    {
-        let bounded = self.call(bucket, call);
-        match phase {
-            Phase::Run => bounded.await,
-            Phase::Start => match tokio::time::timeout(self.start_deadline, bounded).await {
-                Ok(result) => result,
-                Err(elapsed) => Err(SdkError::timeout_error(elapsed)),
-            },
-        }
     }
 
     /// [`Self::call`] with the retries of a backoff the caller holds, so a

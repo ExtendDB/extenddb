@@ -26,7 +26,6 @@ use serde_json::Value;
 use extenddb_storage::BoxedFuture as BoxFuture;
 use extenddb_storage::ReportKind;
 
-use super::client::Phase;
 use super::error::Tail;
 use super::probe::{abort, sink_error, sse_fields};
 use super::retry::is_transient;
@@ -505,7 +504,7 @@ impl Drop for S3ReportWriter {
         let location = self.location.clone();
         runtime.spawn(async move {
             for (key, id) in started {
-                abort(&clients, &location, &key, &id, Phase::Run).await;
+                abort(&clients, &location, &key, &id).await;
             }
         });
     }

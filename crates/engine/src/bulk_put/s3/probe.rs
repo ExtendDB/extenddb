@@ -11,7 +11,6 @@
 
 use aws_sdk_s3::types::ServerSideEncryption;
 
-use super::client::Phase;
 use super::error::{Outcome, Tail, classify};
 use super::{Location, S3Clients};
 use crate::bulk_put::source::{OutputSse, SinkError, StoreUnavailable};
@@ -66,19 +65,17 @@ where
 }
 
 /// The write check for `key`: CreateMultipartUpload with the owner and
-/// encryption fields, then AbortMultipartUpload, both under the bound of
-/// `phase`.
+/// encryption fields, then AbortMultipartUpload.
 pub(super) async fn probe(
     clients: &S3Clients,
     location: &Location,
     key: &str,
     sse: &OutputSse,
     tail: Tail,
-    phase: Phase,
 ) -> Result<(), SinkError> {
     let (encryption, kms_key) = sse_fields(sse);
     let created = clients
-        .call_in(phase, &location.bucket, |client| {
+        .call(&location.bucket, |client| {
             client
                 .create_multipart_upload()
                 .bucket(&location.bucket)
@@ -91,23 +88,16 @@ pub(super) async fn probe(
         .await
         .map_err(|error| sink_error(&error, location, key, tail, "write check"))?;
     if let Some(upload_id) = created.upload_id() {
-        abort(clients, location, key, upload_id, phase).await;
+        abort(clients, location, key, upload_id).await;
     }
     Ok(())
 }
 
-/// Abort one multipart upload under the bound of `phase`. A failure
-/// leaves the upload to the bucket's lifecycle rule; it is logged, never
-/// the operation's fault.
-pub(super) async fn abort(
-    clients: &S3Clients,
-    location: &Location,
-    key: &str,
-    upload_id: &str,
-    phase: Phase,
-) {
+/// Abort one multipart upload. A failure leaves the upload to the
+/// bucket's lifecycle rule; it is logged, never the operation's fault.
+pub(super) async fn abort(clients: &S3Clients, location: &Location, key: &str, upload_id: &str) {
     let aborted = clients
-        .call_in(phase, &location.bucket, |client| {
+        .call(&location.bucket, |client| {
             client
                 .abort_multipart_upload()
                 .bucket(&location.bucket)

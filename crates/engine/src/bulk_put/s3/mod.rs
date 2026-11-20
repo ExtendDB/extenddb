@@ -34,7 +34,6 @@ use crate::bulk_put::source::{
     SourceError, SourceFile, StoreUnavailable,
 };
 
-use client::Phase;
 #[cfg(test)]
 pub(crate) use client::connect_with;
 pub(crate) use client::{S3Clients, connect};
@@ -256,9 +255,7 @@ impl BulkSink for S3Sink {
         } else {
             Tail::S3
         };
-        Box::pin(async move {
-            probe::probe(&self.clients, &location, &key, &sse, tail, Phase::Run).await
-        })
+        Box::pin(async move { probe::probe(&self.clients, &location, &key, &sse, tail).await })
     }
 
     fn check_encryption(
@@ -271,22 +268,15 @@ impl BulkSink for S3Sink {
         let key = key.to_owned();
         let sse = sse.clone();
         Box::pin(async move {
-            // Only an SSE-KMS key is checked at Start (measured on the
-            // service: a disabled key and a key of the wrong usage fail
-            // the operation before the input walk). A bucket or owner fault
-            // the same check meets is left to the first report record, as
-            // the service leaves it.
+            // Only an SSE-KMS key is checked on the first claim (measured
+            // on the service: a disabled key and a key of the wrong usage
+            // fail the operation before the input walk). A bucket or owner
+            // fault the same check meets is left to the first report
+            // record, as the service leaves it.
             if !matches!(sse, OutputSse::Kms { .. }) {
                 return Ok(());
             }
-            let checked = probe::probe(
-                &self.clients,
-                &location,
-                &key,
-                &sse,
-                Tail::AmazonS3,
-                Phase::Start,
-            );
+            let checked = probe::probe(&self.clients, &location, &key, &sse, Tail::AmazonS3);
             match checked.await {
                 Err(SinkError::Store(fault)) if !fault.code.starts_with("Kms") => Ok(()),
                 other => other,

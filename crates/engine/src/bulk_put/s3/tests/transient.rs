@@ -13,7 +13,6 @@ use aws_sdk_s3::primitives::SdkBody;
 use super::read::{LINES, drain, part, parts};
 use super::stub::{self, Answer, Stub, stub_clients};
 use super::*;
-use crate::bulk_put::s3::client::Phase;
 use crate::bulk_put::s3::error::Tail;
 use crate::bulk_put::s3::list::check_bucket;
 use crate::bulk_put::s3::probe::probe;
@@ -210,7 +209,6 @@ async fn transient_failures_past_the_bound_are_answered_as_the_store_unavailable
             "run/AWSDynamoDB/BulkOperation/report-0.json.gz",
             &OutputSse::None,
             Tail::S3,
-            Phase::Run,
         ),
     )
     .await
