@@ -38,6 +38,12 @@ rand = { workspace = true }
 bigdecimal = { workspace = true }
 crc32fast = { workspace = true }
 zeroize = { workspace = true }
+# The clock, so the browser build reads time through a backend that works on
+# wasm. `web-time` re-exports `std::time` verbatim on every non-wasm target, so
+# native builds are unchanged; on wasm it reads the host clock. Without it the
+# `std::time` clock reads on the write path (stream-record and TTL timestamps)
+# compile on wasm but trap when called.
+web-time = { workspace = true }
 
 # Storage transport, split per target. Native keeps `sqlx` (SQLite feature) and
 # the C `libsqlite3-sys` verbatim: the native build is unchanged and native
