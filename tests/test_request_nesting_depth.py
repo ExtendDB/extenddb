@@ -245,8 +245,8 @@ def test_a_malformed_deep_body_is_refused_before_authentication(
 ):
     # Each body nests past the 127 levels ExtendDB parses before
     # authentication and has a syntax fault. The service answers each with a
-    # 400 SerializationException, unsigned and badly signed (2 of 2 sends per
-    # body and signing, us-east-1, 2026-11-19).
+    # 400 SerializationException and no message field, unsigned and badly
+    # signed (2 of 2 sends per body and signing, us-east-1, 2026-11-19).
     body = (
         b"x" + b"[" * 6000
         if wrappers is None
@@ -254,14 +254,7 @@ def test_a_malformed_deep_body_is_refused_before_authentication(
     )
     resp = _unauthenticated_put(dynamodb_client, endpoint_url, body, signing)
     assert resp.status_code == 400, resp.text
-    err = resp.json()
-    assert err["__type"] == SERIALIZATION_TYPE, resp.text
-    if wrappers in (None, 20000):
-        # Nested past ExtendDB's 5200 level ceiling, both answers have no
-        # message field. Within the ceiling ExtendDB's refusal carries its usual
-        # wording, as for a shallow malformed body, where the service's has no
-        # message field.
-        assert "message" not in err, resp.text
+    assert _is_messageless_serialization_error(resp.json()), resp.text
 
 
 @pytest.mark.parametrize("signing", ["unsigned", "bad-signature"])

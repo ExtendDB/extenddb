@@ -124,25 +124,22 @@ pub(crate) fn nesting_depth(body: &[u8]) -> usize {
 /// Parse a request body whose [`nesting_depth`] is `depth` into a JSON
 /// [`Value`], matching `serde_json::from_slice` for everything within the depth
 /// ceiling and refusing a body nested past it.
-///
-/// A malformed or over deep body is a `SerializationException`, the error the
-/// server has always returned for a body it cannot read.
 pub(crate) fn parse_request_value(body: &[u8], depth: usize) -> Result<Value, DynamoDbError> {
     if depth > MAX_REQUEST_JSON_DEPTH {
-        return Err(over_ceiling_refusal());
+        return Err(serialization_refusal());
     }
     // The depth ceiling above keeps the disabled recursion limit from letting a
     // deep body overflow the stack.
     let mut de = serde_json::Deserializer::from_slice(body);
     de.disable_recursion_limit();
-    let value = Value::deserialize(&mut de).map_err(|e| serialization_error(&e.to_string()))?;
-    de.end().map_err(|e| serialization_error(&e.to_string()))?;
+    let value = Value::deserialize(&mut de).map_err(|_| serialization_refusal())?;
+    de.end().map_err(|_| serialization_refusal())?;
     Ok(value)
 }
 
-/// Check the JSON syntax of a request body whose [`nesting_depth`] is `depth`
-/// without building it, so the handler can refuse a malformed body nested past
-/// [`UNAUTHENTICATED_PARSE_DEPTH`] before authentication, as the service does.
+/// Check the JSON syntax of a request body without building it, so the handler
+/// can refuse a malformed body nested past [`UNAUTHENTICATED_PARSE_DEPTH`]
+/// before authentication, as the service does.
 /// `serde_json` skips an ignored value in one loop that keeps the kinds of the
 /// open containers on a heap stack, so the check does not recurse at any
 /// depth.
@@ -150,34 +147,25 @@ pub(crate) fn parse_request_value(body: &[u8], depth: usize) -> Result<Value, Dy
 /// The check reads one JSON value, as the service's check before
 /// authentication does: bytes after a complete body, an invalid UTF-8 byte in
 /// a string and a lone surrogate escape all pass it (measured 2026-11-19,
-/// us-east-1: unsigned, each is a `MissingAuthenticationTokenException`). A
-/// body that fails it gets a `SerializationException`, with no message past
-/// the ceiling, as from [`parse_request_value`], and with the server's usual
-/// wording within it.
-pub(crate) fn check_request_syntax(body: &[u8], depth: usize) -> Result<(), DynamoDbError> {
+/// us-east-1: unsigned, each is a `MissingAuthenticationTokenException`).
+pub(crate) fn check_request_syntax(body: &[u8]) -> Result<(), DynamoDbError> {
     let mut de = serde_json::Deserializer::from_slice(body);
-    match IgnoredAny::deserialize(&mut de) {
-        Ok(IgnoredAny) => Ok(()),
-        Err(_) if depth > MAX_REQUEST_JSON_DEPTH => Err(over_ceiling_refusal()),
-        Err(e) => Err(serialization_error(&e.to_string())),
-    }
+    IgnoredAny::deserialize(&mut de)
+        .map(|IgnoredAny| ())
+        .map_err(|_| serialization_refusal())
 }
 
-/// The refusal for a body nested past [`MAX_REQUEST_JSON_DEPTH`]. A signed body
-/// nested past what the service parses gets HTTP 400 with
+/// The refusal for a body with a JSON syntax fault or nested past
+/// [`MAX_REQUEST_JSON_DEPTH`]. The service answers a signed body with a syntax
+/// fault, and a signed body nested past what it parses, with HTTP 400 and
 /// `{"__type":"com.amazon.coral.service#SerializationException"}` and no
-/// message field at all (measured 2026-11-12, us-east-1: 24 of 24 sends at 5000
-/// and at 20000 wrappers). An empty message makes `error_response` omit the
-/// field.
-fn over_ceiling_refusal() -> DynamoDbError {
+/// message field at all (measured in us-east-1: 24 of 24 sends at 5000 and at
+/// 20000 wrappers on 2026-11-12, and every signed send of an empty body, a body
+/// cut short, a trailing comma, a bad literal or escape, or a raw control byte
+/// in a string on 2026-11-19 and 2026-11-20). An empty message makes
+/// `error_response` omit the field.
+fn serialization_refusal() -> DynamoDbError {
     DynamoDbError::SerializationException(String::new())
-}
-
-/// The server's long standing wording for a request body it cannot read.
-fn serialization_error(detail: &str) -> DynamoDbError {
-    DynamoDbError::SerializationException(format!(
-        "Start of structure or map found where not expected: {detail}"
-    ))
 }
 
 #[cfg(test)]
@@ -202,15 +190,6 @@ mod tests {
 
     fn parse(body: &[u8]) -> Result<Value, DynamoDbError> {
         parse_request_value(body, nesting_depth(body))
-    }
-
-    /// The message a malformed body carries: the server's wording around the
-    /// deserializer's own description of the fault.
-    fn expected_message(body: &[u8]) -> String {
-        let detail = serde_json::from_slice::<Value>(body)
-            .unwrap_err()
-            .to_string();
-        format!("Start of structure or map found where not expected: {detail}")
     }
 
     #[test]
@@ -321,18 +300,6 @@ mod tests {
     }
 
     #[test]
-    fn a_malformed_body_is_a_serialization_error_with_the_usual_message() {
-        // Rows: the malformed body. Each gets the server's long standing
-        // wording around the deserializer's own description, so a change to
-        // `serialization_error`'s format fails here.
-        for body in [&b"{not json"[..], br#"{"a":1"#] {
-            let err = parse(body).unwrap_err();
-            assert!(matches!(err, DynamoDbError::SerializationException(_)));
-            assert_eq!(err.message(), expected_message(body), "{body:?}");
-        }
-    }
-
-    #[test]
     fn the_unauthenticated_depth_is_serde_json_default() {
         // The handler parses a body within this depth before authentication, as
         // the server did with the deserializer's default limit on a default
@@ -377,33 +344,34 @@ mod tests {
     }
 
     #[test]
-    fn the_syntax_check_refuses_a_malformed_deep_body_as_the_parse_does() {
-        // Rows: a body nested past the pre-auth depth with a syntax fault. The
-        // service refuses each before authentication with a
-        // SerializationException (measured 2026-11-19, us-east-1, unsigned
-        // and badly signed). For the structural faults in these rows the check
-        // gives the message the parse after authentication gives. For a raw
-        // control character in a string, the skip reports one column earlier.
-        // The parse recurses, so the rows run on a worker-sized stack.
+    fn a_body_with_a_syntax_fault_is_refused_with_no_message() {
+        // Rows: a body that parses, a fault the parse meets, a fault within
+        // the ceiling that only the check meets before authentication, and a
+        // fault past the ceiling, each with whether the server reads it. The
+        // service sends no message field for a signed body with a syntax
+        // fault (measured 2026-11-19 and 2026-11-20, us-east-1). The parse and
+        // the check give each row the same answer. The parse recurses, so the
+        // rows run on a worker-sized stack.
         let rows = [
-            [&b"x"[..], &b"[".repeat(6000)].concat(),
-            [&b"x"[..], &b"[".repeat(200)].concat(),
-            truncated_body(63),
-            truncated_body(200),
-            truncated_body(2000),
-            truncated_body(20000),
-            [&truncated_body(200)[..], b"]"].concat(),
+            (br#"{"TableName": "t"}"#.to_vec(), true),
+            (b"".to_vec(), false),
+            (truncated_body(200), false),
+            (truncated_body(20000), false),
         ];
         std::thread::Builder::new()
             .stack_size(REQUEST_WORKER_STACK_SIZE)
             .spawn(move || {
-                for body in &rows {
-                    let depth = nesting_depth(body);
-                    assert!(depth > UNAUTHENTICATED_PARSE_DEPTH, "{} bytes", body.len());
-                    let checked = check_request_syntax(body, depth).unwrap_err();
-                    let parsed = parse_request_value(body, depth).unwrap_err();
-                    assert!(matches!(checked, DynamoDbError::SerializationException(_)));
-                    assert_eq!(checked.message(), parsed.message(), "{} bytes", body.len());
+                for (row, (body, read)) in rows.iter().enumerate() {
+                    let parsed = parse(body).map(drop);
+                    for answer in [parsed, check_request_syntax(body)] {
+                        match answer {
+                            Ok(()) => assert!(*read, "row {row} must be refused"),
+                            Err(DynamoDbError::SerializationException(m)) => {
+                                assert!(!*read && m.is_empty(), "row {row}: {m:?}");
+                            }
+                            Err(e) => panic!("row {row}: {e:?}"),
+                        }
+                    }
                 }
             })
             .unwrap()
@@ -435,11 +403,7 @@ mod tests {
         for body in &rows {
             let depth = nesting_depth(body);
             assert!(depth > UNAUTHENTICATED_PARSE_DEPTH, "{} bytes", body.len());
-            assert!(
-                check_request_syntax(body, depth).is_ok(),
-                "{} bytes",
-                body.len()
-            );
+            assert!(check_request_syntax(body).is_ok(), "{} bytes", body.len());
         }
     }
 }
