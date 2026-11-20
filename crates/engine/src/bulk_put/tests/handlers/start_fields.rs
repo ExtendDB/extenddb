@@ -351,6 +351,13 @@ async fn the_listing_quotas_end_the_run_before_the_files_are_recorded() {
         let ended = run_started(&h, &ctx, &started).await;
         assert_eq!(ended["BulkOperationStatus"], json!("FAILED"), "{label}");
         assert_eq!(ended["FailureCode"], json!(code), "{label}");
+        if code == "SizeLimitExceeded" {
+            let message = ended["FailureMessage"].as_str().unwrap_or_default();
+            assert!(
+                message.contains("exceeds the maximum allowed for this operation"),
+                "{label}: {message}"
+            );
+        }
         assert!(ended.get("TotalInputBytes").is_none(), "{label}");
         assert!(ended.get("ProcessedInputBytes").is_none(), "{label}");
         let reports = std::fs::read_dir(h.store.0.join(ACCOUNT).join(OUT_BUCKET))
