@@ -91,23 +91,39 @@ pub fn validate_table_name_chars(name: &str) -> Result<(), DynamoDbError> {
 pub fn validate_name_member(
     value: &str,
     path: &str,
+    bounds: (usize, usize),
+) -> Result<(), DynamoDbError> {
+    validate_name_members(&[(value, path)], bounds)
+}
+
+/// [`validate_name_member`] on several `(value, path)` members, answered in
+/// one message that lists each member's clauses in the order of `members`.
+///
+/// # Errors
+///
+/// `ValidationException` with one clause per failed constraint.
+pub fn validate_name_members<P: AsRef<str>>(
+    members: &[(&str, P)],
     (min, max): (usize, usize),
 ) -> Result<(), DynamoDbError> {
-    let length = value.chars().count();
     let too_short = format!("Member must have length greater than or equal to {min}");
     let too_long = format!("Member must have length less than or equal to {max}");
     let mut failed = Vec::new();
-    if length < min {
-        failed.push((value, path, too_short.as_str()));
-    } else if length > max {
-        failed.push((value, path, too_long.as_str()));
-    }
-    if validate_table_name_chars(value).is_err() {
-        failed.push((
-            value,
-            path,
-            "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+",
-        ));
+    for (value, path) in members {
+        let (value, path) = (*value, path.as_ref());
+        let length = value.chars().count();
+        if length < min {
+            failed.push((value, path, too_short.as_str()));
+        } else if length > max {
+            failed.push((value, path, too_long.as_str()));
+        }
+        if validate_table_name_chars(value).is_err() {
+            failed.push((
+                value,
+                path,
+                "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+",
+            ));
+        }
     }
     if failed.is_empty() {
         return Ok(());
@@ -132,8 +148,11 @@ pub fn validate_name_member(
 ///
 /// `ValidationException` from [`validate_name_member`].
 pub fn validate_index_name(name: &str, location: &str) -> Result<(), DynamoDbError> {
-    validate_name_member(name, location, (3, 255))
+    validate_name_member(name, location, INDEX_NAME_BOUNDS)
 }
+
+/// The length bounds of an index name, in characters.
+pub const INDEX_NAME_BOUNDS: (usize, usize) = (3, 255);
 
 #[cfg(test)]
 mod index_name_tests;

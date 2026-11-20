@@ -209,20 +209,25 @@ impl IndexOverrides {
         })
     }
 
-    /// Check each entry's `IndexName` with `validate_index_name` at the
-    /// entry's member path, numbered from 1, the GSI list first.
+    /// Check each entry's `IndexName` as `validate_index_name` does, at the
+    /// entry's member path, numbered from 1 in each list. The faults of both
+    /// lists are answered in one message, the LSI list first and each list
+    /// in entry order, as DynamoDB answers them whatever the order of the two
+    /// members in the body (measured in us-east-1 on 20 Nov 2026).
     pub(super) fn check_index_names(&self) -> Result<(), DynamoDbError> {
+        use extenddb_core::validation::{INDEX_NAME_BOUNDS, validate_name_members};
         let gsi = self.gsi.iter().flatten().map(|e| &e.index.index_name);
         let lsi = self.lsi.iter().flatten().map(|e| &e.index.index_name);
-        let entries = gsi
+        let members: Vec<(&str, String)> = lsi
             .enumerate()
-            .map(|(n, name)| ("global", n, name))
-            .chain(lsi.enumerate().map(|(n, name)| ("local", n, name)));
-        for (kind, n, name) in entries {
-            let path = format!("{kind}SecondaryIndexOverride.{}.member.indexName", n + 1);
-            extenddb_core::validation::validate_index_name(name, &path)?;
-        }
-        Ok(())
+            .map(|(n, name)| ("local", n, name))
+            .chain(gsi.enumerate().map(|(n, name)| ("global", n, name)))
+            .map(|(kind, n, name)| {
+                let path = format!("{kind}SecondaryIndexOverride.{}.member.indexName", n + 1);
+                (name.as_str(), path)
+            })
+            .collect();
+        validate_name_members(&members, INDEX_NAME_BOUNDS)
     }
 
     /// Apply the overrides to `input`, the table the restore creates without

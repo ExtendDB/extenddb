@@ -5027,6 +5027,73 @@ async fn an_index_override_name_is_checked_before_the_backup_is_read() {
     }
 }
 
+/// Bad `IndexName` values in both override lists, or two in one list, get
+/// one answer: the LSI list first, each list in entry order (DynamoDB's
+/// answers in us-east-1 on 20 Nov 2026). DynamoDB gives the two clauses of
+/// one name in either order, so they are compared as a set.
+#[tokio::test]
+async fn the_index_name_faults_of_both_override_lists_are_answered_together() {
+    use std::collections::BTreeSet;
+    let short: &[&str] = &["Member must have length greater than or equal to 3"];
+    let pat: &[&str] = &["Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"];
+    let both = &[short[0], pat[0]];
+    let (g1, g2) = (
+        "globalSecondaryIndexOverride.1",
+        "globalSecondaryIndexOverride.2",
+    );
+    let l1 = "localSecondaryIndexOverride.1";
+    // (entry, name, the constraints it fails)
+    type Fault<'a> = (&'a str, &'a str, &'a [&'a str]);
+    // (GSI names, LSI names, DynamoDB's faults in order)
+    let rows: [(&[&str], &[&str], &[Fault]); 4] = [
+        (&["ab"], &["g i"], &[(l1, "g i", pat), (g1, "ab", short)]),
+        (&["g i"], &["ab"], &[(l1, "ab", short), (g1, "g i", pat)]),
+        (&["ab", "g i"], &[], &[(g1, "ab", short), (g2, "g i", pat)]),
+        (&["a!"], &["a!"], &[(l1, "a!", both), (g1, "a!", both)]),
+    ];
+    for (gsis, lsis, faults) in rows {
+        let entries = |template: Value, names: &[&str]| -> Value {
+            let with_name = |name: &&str| {
+                let mut entry = template.clone();
+                entry["IndexName"] = json!(name);
+                entry
+            };
+            names.iter().map(with_name).collect()
+        };
+        let mut overrides = json!({});
+        if !gsis.is_empty() {
+            overrides["GlobalSecondaryIndexOverride"] = entries(gsi_entry(None), gsis);
+        }
+        if !lsis.is_empty() {
+            overrides["LocalSecondaryIndexOverride"] = entries(lsi_entry(), lsis);
+        }
+        let fake = Arc::new(Fake::default());
+        let message =
+            validation_message(restore(&fake, restore_body(overrides)).await.unwrap_err());
+        assert_eq!(fake.source_reads(), 0, "{gsis:?} {lsis:?}");
+        let (head, clauses) = message.split_once(": ").unwrap();
+        let mut clauses = clauses.split("; ");
+        let mut count = 0;
+        for (entry, name, failed) in faults {
+            let at = format!("Value '{name}' at '{entry}.member.indexName' failed to satisfy");
+            let want: BTreeSet<String> = failed
+                .iter()
+                .map(|c| format!("{at} constraint: {c}"))
+                .collect();
+            let got: BTreeSet<String> = clauses
+                .by_ref()
+                .take(failed.len())
+                .map(str::to_owned)
+                .collect();
+            assert_eq!(got, want, "{gsis:?} {lsis:?}: {message}");
+            count += failed.len();
+        }
+        assert_eq!(clauses.next(), None, "{message}");
+        let plural = if count == 1 { "" } else { "s" };
+        assert_eq!(head, format!("{count} validation error{plural} detected"));
+    }
+}
+
 /// The backup's GSI and LSI as a client would send them back: the shape
 /// `definition` records, in the wire's own form.
 fn gsi_entry(pt: Option<(i64, i64)>) -> Value {
