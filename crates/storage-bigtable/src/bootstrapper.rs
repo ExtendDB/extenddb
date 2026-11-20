@@ -3,6 +3,9 @@
 
 //! BigTable implementation of `Bootstrapper`.
 
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex, PoisonError};
+
 use async_trait::async_trait;
 use extenddb_storage::bootstrapper::{
     AdminBootstrapResult, Bootstrapper,
@@ -11,29 +14,61 @@ use extenddb_storage::bootstrapper::{
     },
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::management_store::{OpError, OpResult};
+use extenddb_storage::management_store::{DEFAULT_ACCOUNT_SETTING, OpError, OpResult};
+use extenddb_storage::migrations::{HeldLock, Target};
 use extenddb_storage::secret_keys::CATALOG_KEY_SETTING;
 use serde_json::json;
 use tokio::sync::OnceCell;
 
-use crate::catalog::{CATALOG_TABLE, CF, Catalog, keys};
+use crate::catalog::{CATALOG_TABLE, CF, Catalog, DATA_LEDGER_TABLE, keys};
 use crate::config::BigtableStorageConfig;
-use crate::data::admin::AdminClient;
+use crate::data::admin::{AdminClient, gc_max_versions};
 use crate::data::client::BigtableClient;
+use crate::migrations::{MigrationLease, lease_of};
 
 const DEFAULT_ADMIN_USER: &str = "admin";
-const DEFAULT_ACCOUNT_SETTING: &str = "default_account_id";
+
+/// Strict validator for ExtendDB-managed Bigtable data and secondary-index
+/// shadow table short names: `^t[0-9a-f]{16}(_[gl][0-9a-f]{8})?$`.
+#[must_use]
+pub fn is_extenddb_managed_data_table(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    match bytes.len() {
+        17 => bytes[0] == b't' && bytes[1..17].iter().all(u8::is_ascii_hexdigit_lower),
+        27 => {
+            bytes[0] == b't'
+                && bytes[1..17].iter().all(u8::is_ascii_hexdigit_lower)
+                && bytes[17] == b'_'
+                && (bytes[18] == b'g' || bytes[18] == b'l')
+                && bytes[19..27].iter().all(u8::is_ascii_hexdigit_lower)
+        }
+        _ => false,
+    }
+}
+
+trait AsciiLowerHex {
+    fn is_ascii_hexdigit_lower(&self) -> bool;
+}
+
+impl AsciiLowerHex for u8 {
+    fn is_ascii_hexdigit_lower(&self) -> bool {
+        matches!(self, b'0'..=b'9' | b'a'..=b'f')
+    }
+}
 
 pub struct BigtableBootstrapper {
     config: BigtableStorageConfig,
     client: OnceCell<BigtableClient>,
+    held_lease: Mutex<Option<Arc<MigrationLease>>>,
 }
 
 impl BigtableBootstrapper {
+    #[must_use]
     pub fn new(config: BigtableStorageConfig) -> Self {
         Self {
             config,
             client: OnceCell::new(),
+            held_lease: Mutex::new(None),
         }
     }
 
@@ -65,29 +100,21 @@ impl BigtableBootstrapper {
                         StorageError::Internal(format!("invalid [storage.bigtable]: {e}"))
                     })?
                 } else {
-                    BigtableStorageConfig {
-                        project_id: String::new(),
-                        instance_id: String::new(),
-                        emulator_host: None,
-                        ..BigtableStorageConfig::default()
-                    }
+                    BigtableStorageConfig::default()
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BigtableStorageConfig {
-                project_id: String::new(),
-                instance_id: String::new(),
-                emulator_host: None,
-                ..BigtableStorageConfig::default()
-            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BigtableStorageConfig::default(),
             Err(e) => return Err(StorageError::Internal(format!("read {config_path}: {e}"))),
         };
 
-        if let Some(emu) = env_non_empty(&[
-            "EXTENDDB__STORAGE__BIGTABLE__EMULATOR_HOST",
-            "BIGTABLE_EMULATOR_HOST",
-        ]) {
+        if let Some(emu) = env_non_empty(&["EXTENDDB__STORAGE__BIGTABLE__EMULATOR_HOST"]) {
+            config.emulator_host = Some(emu);
+        } else if config.emulator_host.is_none()
+            && let Some(emu) = config.resolve_emulator_host()
+        {
             config.emulator_host = Some(emu);
         }
+
         if let Some(proj) = env_non_empty(&[
             "EXTENDDB__STORAGE__BIGTABLE__PROJECT_ID",
             "BIGTABLE_PROJECT_ID",
@@ -130,13 +157,12 @@ impl BigtableBootstrapper {
         {
             config.catalog_pool_size = Some(parsed);
         }
-        if let Some(dev) = env_non_empty(&["EXTENDDB__STORAGE__BIGTABLE__DEV_MODE"]) {
-            config.dev_mode = dev.eq_ignore_ascii_case("true") || dev == "1";
-        }
 
         if config.project_id.trim().is_empty() || config.instance_id.trim().is_empty() {
             return Err(StorageError::Validation(format!(
-                "Bigtable bootstrap requires project_id and instance_id in {config_path} [storage.bigtable] (or via EXTENDDB__STORAGE__BIGTABLE__PROJECT_ID and EXTENDDB__STORAGE__BIGTABLE__INSTANCE_ID)"
+                "Bigtable bootstrap requires project_id and instance_id in {config_path} \
+                 [storage.bigtable] (or via EXTENDDB__STORAGE__BIGTABLE__PROJECT_ID and \
+                 EXTENDDB__STORAGE__BIGTABLE__INSTANCE_ID)"
             )));
         }
 
@@ -157,6 +183,93 @@ impl BigtableBootstrapper {
         Catalog::new(client)
     }
 
+    fn check_held_lease(&self) -> OpResult<()> {
+        let lease = self
+            .held_lease
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(lease) = lease {
+            lease
+                .check()
+                .map_err(|e| OpError::Internal(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn mark_lease_progress(&self) {
+        let lease = self
+            .held_lease
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(lease) = lease {
+            lease.progressed();
+        }
+    }
+
+    /// Collect the exact Bigtable data and shadow table IDs recorded in
+    /// `__extenddb_catalog__` `table_meta:` rows when the catalog exists.
+    async fn catalog_named_data_tables(&self, client: &BigtableClient) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        let cat = Self::catalog(client);
+        let Ok(rows) = cat.scan_prefix(keys::TABLE_META_SCAN_PREFIX).await else {
+            return names;
+        };
+        for (_, meta) in rows {
+            let Some(data_table) = meta.get("data_table").and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            names.insert(data_table.to_owned());
+            if let Some(desc_val) = meta.get("description")
+                && let Ok(desc) = serde_json::from_value::<extenddb_core::types::TableDescription>(
+                    desc_val.clone(),
+                )
+            {
+                if let Some(gsis) = &desc.global_secondary_indexes {
+                    for gsi in gsis {
+                        names.insert(crate::gsi::shadow_table_id(data_table, &gsi.index_name));
+                    }
+                }
+                if let Some(lsis) = &desc.local_secondary_indexes {
+                    for lsi in lsis {
+                        names.insert(crate::gsi::lsi_shadow_table_id(data_table, &lsi.index_name));
+                    }
+                }
+            }
+            if let Some(gsis) = meta.get("gsis").and_then(serde_json::Value::as_array) {
+                for gsi in gsis {
+                    if let Some(shadow) =
+                        gsi.get("shadow_table").and_then(serde_json::Value::as_str)
+                        && !shadow.is_empty()
+                    {
+                        names.insert(shadow.to_owned());
+                    } else if let Some(idx_name) =
+                        gsi.get("index_name").and_then(serde_json::Value::as_str)
+                    {
+                        names.insert(crate::gsi::shadow_table_id(data_table, idx_name));
+                    }
+                }
+            }
+            if let Some(lsis) = meta.get("lsis").and_then(serde_json::Value::as_array) {
+                for lsi in lsis {
+                    if let Some(shadow) =
+                        lsi.get("shadow_table").and_then(serde_json::Value::as_str)
+                        && !shadow.is_empty()
+                    {
+                        names.insert(shadow.to_owned());
+                    } else if let Some(idx_name) =
+                        lsi.get("index_name").and_then(serde_json::Value::as_str)
+                    {
+                        names.insert(crate::gsi::lsi_shadow_table_id(data_table, idx_name));
+                    }
+                }
+            }
+        }
+        names
+    }
+
     /// Check whether `__extenddb_catalog__` holds a `version:catalog` record.
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
@@ -175,7 +288,10 @@ impl BigtableBootstrapper {
     pub async fn read_catalog_version(&self) -> OpResult<Option<String>> {
         let client = self.client().await?;
         let cat = Self::catalog(client);
-        let row = cat.get(keys::VERSION).await.map_err(OpError::Internal)?;
+        let row = cat
+            .get(keys::VERSION)
+            .await
+            .map_err(|e| OpError::Internal(e.to_string()))?;
         Ok(row.and_then(|v| {
             v.get("catalog_version")
                 .and_then(|s| s.as_str())
@@ -196,42 +312,34 @@ impl Bootstrapper for BigtableBootstrapper {
 
     async fn create_catalog_db(&self) -> OpResult<()> {
         let client = self.client().await?;
+        AdminClient::validate_app_profile(client)
+            .await
+            .map_err(OpError::Internal)?;
         let mut admin = AdminClient::connect(client)
             .await
             .map_err(OpError::Internal)?;
         admin
-            .create_table(
-                CATALOG_TABLE,
-                &[(CF, Some(crate::data::admin::gc_max_versions(1)))],
-            )
+            .create_table(CATALOG_TABLE, &[(CF, Some(gc_max_versions(1)))])
             .await
             .map_err(OpError::Internal)?;
         Ok(())
     }
 
     async fn create_data_db(&self) -> OpResult<()> {
-        let data_client_owned = match self.config.data_instance_id.as_deref() {
-            Some(data_inst) if !data_inst.is_empty() && data_inst != self.config.instance_id => {
-                let mut data_cfg = self.config.clone();
-                data_cfg.instance_id = data_inst.to_owned();
-                Some(
-                    BigtableClient::connect(&data_cfg)
-                        .await
-                        .map_err(OpError::Internal)?,
-                )
-            }
-            _ => None,
-        };
-        let target = match data_client_owned.as_ref() {
-            Some(c) => c,
-            None => self.client().await?,
-        };
-        crate::transact::ensure_txn_log_table(target)
-            .await
-            .map_err(OpError::Internal)?;
-        crate::ttl_worker::ensure_ttl_index_table(target)
-            .await
-            .map_err(OpError::Internal)?;
+        let data_inst = self.config.effective_data_instance_id();
+        if data_inst != self.config.instance_id {
+            let mut data_cfg = self.config.clone();
+            data_cfg.instance_id = data_inst.to_owned();
+            let data_client = BigtableClient::connect(&data_cfg)
+                .await
+                .map_err(OpError::Internal)?;
+            AdminClient::validate_app_profile(&data_client)
+                .await
+                .map_err(OpError::Internal)?;
+        }
+        // Data-instance system tables (`__extenddb_data_ledger__`,
+        // `__extenddb_txn_log__`, and `__extenddb_ttl_index__`) are provisioned
+        // under the migration lock by Migration 1 (`M0001DataBaseline`).
         Ok(())
     }
 
@@ -240,18 +348,21 @@ impl Bootstrapper for BigtableBootstrapper {
     }
 
     async fn bootstrap_encryption_key(&self) -> OpResult<()> {
+        self.check_held_lease()?;
         let client = self.client().await?;
         let cat = Self::catalog(client);
         let setting_key = keys::setting(CATALOG_KEY_SETTING);
         if cat
             .get(&setting_key)
             .await
-            .map_err(OpError::Internal)?
+            .map_err(|e| OpError::Internal(e.to_string()))?
             .is_some()
         {
+            self.mark_lease_progress();
             return Ok(());
         }
         let b64 = generate_encryption_key().map_err(OpError::Internal)?;
+        self.check_held_lease()?;
         let _ = cat
             .put_if_absent(
                 &setting_key,
@@ -261,17 +372,19 @@ impl Bootstrapper for BigtableBootstrapper {
                 }),
             )
             .await
-            .map_err(OpError::Internal)?;
+            .map_err(|e| OpError::Internal(e.to_string()))?;
+        self.mark_lease_progress();
         Ok(())
     }
 
     async fn bootstrap_default_account(&self) -> OpResult<()> {
+        self.check_held_lease()?;
         let client = self.client().await?;
         let cat = Self::catalog(client);
         let existing = cat
             .scan_prefix(keys::ACCOUNT_SCAN_PREFIX)
             .await
-            .map_err(OpError::Internal)?;
+            .map_err(|e| OpError::Internal(e.to_string()))?;
         let account_id = if let Some((row_key, val)) = existing.first() {
             val.get("account_id")
                 .and_then(|s| s.as_str())
@@ -283,6 +396,7 @@ impl Bootstrapper for BigtableBootstrapper {
             let now = time::OffsetDateTime::now_utc()
                 .format(&time::format_description::well_known::Rfc3339)
                 .unwrap_or_else(|_| time::OffsetDateTime::now_utc().to_string());
+            self.check_held_lease()?;
             cat.put(
                 &keys::account(&id),
                 &json!({
@@ -292,11 +406,13 @@ impl Bootstrapper for BigtableBootstrapper {
                 }),
             )
             .await
-            .map_err(OpError::Internal)?;
+            .map_err(|e| OpError::Internal(e.to_string()))?;
             id
         };
+        self.mark_lease_progress();
 
         if !account_id.is_empty() {
+            self.check_held_lease()?;
             let _ = cat
                 .put_if_absent(
                     &keys::setting(DEFAULT_ACCOUNT_SETTING),
@@ -306,7 +422,8 @@ impl Bootstrapper for BigtableBootstrapper {
                     }),
                 )
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(|e| OpError::Internal(e.to_string()))?;
+            self.mark_lease_progress();
         }
         Ok(())
     }
@@ -316,6 +433,7 @@ impl Bootstrapper for BigtableBootstrapper {
         env_user: Option<&str>,
         env_password: Option<&str>,
     ) -> OpResult<AdminBootstrapResult> {
+        self.check_held_lease()?;
         let client = self.client().await?;
         let cat = Self::catalog(client);
         let username = env_user.unwrap_or(DEFAULT_ADMIN_USER).to_owned();
@@ -323,8 +441,9 @@ impl Bootstrapper for BigtableBootstrapper {
         if let Some(existing) = cat
             .get(&keys::admin(&username))
             .await
-            .map_err(OpError::Internal)?
+            .map_err(|e| OpError::Internal(e.to_string()))?
         {
+            self.mark_lease_progress();
             return Ok(AdminBootstrapResult {
                 username,
                 generated_password: None,
@@ -347,6 +466,7 @@ impl Bootstrapper for BigtableBootstrapper {
         let now = time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_else(|_| time::OffsetDateTime::now_utc().to_string());
+        self.check_held_lease()?;
         cat.put(
             &keys::admin(&username),
             &json!({
@@ -357,7 +477,8 @@ impl Bootstrapper for BigtableBootstrapper {
             }),
         )
         .await
-        .map_err(OpError::Internal)?;
+        .map_err(|e| OpError::Internal(e.to_string()))?;
+        self.mark_lease_progress();
         Ok(AdminBootstrapResult {
             username,
             generated_password: generated,
@@ -369,7 +490,10 @@ impl Bootstrapper for BigtableBootstrapper {
     async fn has_admin_user(&self) -> OpResult<bool> {
         let client = self.client().await?;
         let cat = Self::catalog(client);
-        let admins = cat.scan_prefix("admin:").await.map_err(OpError::Internal)?;
+        let admins = cat
+            .scan_prefix("admin:")
+            .await
+            .map_err(|e| OpError::Internal(e.to_string()))?;
         Ok(!admins.is_empty())
     }
 
@@ -379,7 +503,7 @@ impl Bootstrapper for BigtableBootstrapper {
         let rows = cat
             .scan_prefix(keys::TABLE_META_SCAN_PREFIX)
             .await
-            .map_err(OpError::Internal)?;
+            .map_err(|e| OpError::Internal(e.to_string()))?;
         let mut names = Vec::new();
         for (key, _) in rows {
             let mut parts = key.splitn(3, ':');
@@ -392,28 +516,38 @@ impl Bootstrapper for BigtableBootstrapper {
     }
 
     async fn get_data_db_name(&self) -> OpResult<Option<String>> {
-        Ok(None)
+        Ok(self.config.data_instance_id.clone())
     }
 
     async fn drop_databases(&self, _data_db: &str) -> OpResult<()> {
+        const SYSTEM_TABLES: [&str; 4] = [
+            CATALOG_TABLE,
+            DATA_LEDGER_TABLE,
+            crate::transact::TXN_LOG_TABLE,
+            crate::ttl_worker::TTL_INDEX_TABLE,
+        ];
+
         let client = self.client().await?;
         let mut admin = AdminClient::connect(client)
             .await
             .map_err(OpError::Internal)?;
         let tables = admin.list_tables().await.map_err(OpError::Internal)?;
-        for t in tables {
-            if t == CATALOG_TABLE
-                || t.starts_with("__extenddb_")
-                || (t.starts_with('t') && t.len() >= 17)
-            {
-                admin.delete_table(&t).await.map_err(OpError::Internal)?;
-            }
-        }
-        if let Some(ref data_inst) = self.config.data_instance_id
-            && data_inst != &self.config.instance_id
-        {
+        let catalog_listed = if tables.iter().any(|t| t == CATALOG_TABLE) {
+            self.catalog_named_data_tables(client).await
+        } else {
+            BTreeSet::new()
+        };
+
+        let separate_data_instance = self
+            .config
+            .data_instance_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != self.config.instance_id);
+
+        if let Some(data_inst) = separate_data_instance {
             let mut data_cfg = self.config.clone();
-            data_cfg.instance_id = data_inst.clone();
+            data_cfg.instance_id = data_inst.to_owned();
             let data_client = BigtableClient::connect(&data_cfg)
                 .await
                 .map_err(OpError::Internal)?;
@@ -422,13 +556,34 @@ impl Bootstrapper for BigtableBootstrapper {
                 .map_err(OpError::Internal)?;
             let data_tables = data_admin.list_tables().await.map_err(OpError::Internal)?;
             for t in data_tables {
-                if t.starts_with("__extenddb_") || (t.starts_with('t') && t.len() >= 17) {
+                if SYSTEM_TABLES.contains(&t.as_str())
+                    || catalog_listed.contains(&t)
+                    || is_extenddb_managed_data_table(&t)
+                {
                     data_admin
                         .delete_table(&t)
                         .await
                         .map_err(OpError::Internal)?;
                 }
             }
+        }
+
+        // Delete data/shadow tables before dropping `__extenddb_catalog__` so
+        // a partially interrupted `destroy` still knows the catalog-listed tables.
+        for t in &tables {
+            if *t != CATALOG_TABLE
+                && (SYSTEM_TABLES.contains(&t.as_str())
+                    || catalog_listed.contains(t)
+                    || is_extenddb_managed_data_table(t))
+            {
+                admin.delete_table(t).await.map_err(OpError::Internal)?;
+            }
+        }
+        if tables.iter().any(|t| t == CATALOG_TABLE) {
+            admin
+                .delete_table(CATALOG_TABLE)
+                .await
+                .map_err(OpError::Internal)?;
         }
         Ok(())
     }
@@ -441,7 +596,7 @@ impl Bootstrapper for BigtableBootstrapper {
     }
 
     fn endpoint_info(&self) -> String {
-        match &self.config.emulator_host {
+        match self.config.resolve_emulator_host() {
             Some(host) => format!("bigtable emulator @ {host}"),
             None => format!(
                 "bigtable @ projects/{}/instances/{}",
@@ -454,6 +609,22 @@ impl Bootstrapper for BigtableBootstrapper {
         self.config.connection_string()
     }
 
+    fn init_target(&self) -> Target {
+        Target {
+            location: self.catalog_connection_url(),
+            data_store: Some(self.config.effective_data_instance_id().to_owned()),
+            data_connection: Some(self.config.effective_data_instance_id().to_owned()),
+            ..Target::default()
+        }
+    }
+
+    fn hold(&self, lock: &HeldLock) {
+        *self
+            .held_lease
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = lease_of(lock);
+    }
+
     fn generate_backend_config_section(&self) -> String {
         let data_inst_line = match &self.config.data_instance_id {
             Some(v) if !v.is_empty() => format!("data_instance_id = {v:?}"),
@@ -462,7 +633,7 @@ impl Bootstrapper for BigtableBootstrapper {
         };
         let app_profile_line = match &self.config.app_profile_id {
             Some(v) if !v.is_empty() => format!("app_profile_id = {v:?}"),
-            _ => "# app_profile_id = \"\"            # Optional app profile ID (single-cluster routing required)"
+            _ => "# app_profile_id = \"\"            # Single-cluster routing app profile with single-row transactions enabled"
                 .to_owned(),
         };
         let creds_line = match &self.config.credentials_path {
@@ -482,12 +653,6 @@ impl Bootstrapper for BigtableBootstrapper {
             None => "# catalog_pool_size = 8          # Max concurrent catalog/auth gRPC channels"
                 .to_owned(),
         };
-        let dev_mode_line = if self.config.dev_mode {
-            "dev_mode = true".to_owned()
-        } else {
-            "# dev_mode = false               # Bypass authentication for local testing (default false)"
-                .to_owned()
-        };
 
         format!(
             "[storage.bigtable]\n\
@@ -502,8 +667,7 @@ impl Bootstrapper for BigtableBootstrapper {
              sweeper_cadence_secs = {}\n\
              intent_timeout_secs = {}\n\
              ttl_scan_cadence_secs = {}\n\
-             gsi_reconcile_cadence_secs = {}\n\
-             {dev_mode_line}",
+             gsi_reconcile_cadence_secs = {}",
             self.config.project_id,
             self.config.instance_id,
             self.config.pool_size,
@@ -520,6 +684,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn managed_table_name_filter_never_matches_foreign_tables() {
+        assert!(is_extenddb_managed_data_table("t0123456789abcdef"));
+        assert!(is_extenddb_managed_data_table(
+            "t0123456789abcdef_gdeadbeef"
+        ));
+        assert!(is_extenddb_managed_data_table(
+            "t0123456789abcdef_l0123abcd"
+        ));
+
+        assert!(!is_extenddb_managed_data_table("transactions_2024"));
+        assert!(!is_extenddb_managed_data_table("telemetry_archive_prod"));
+        assert!(!is_extenddb_managed_data_table("t0123456789ABCDEF"));
+        assert!(!is_extenddb_managed_data_table(
+            "t0123456789abcdef_xdeadbeef"
+        ));
+        assert!(!is_extenddb_managed_data_table("t0123456789abcdef_extra"));
+        assert!(!is_extenddb_managed_data_table("__extenddb_foreign__"));
+    }
+
+    #[test]
     fn generate_backend_config_section_preserves_production_vs_emulator_settings() {
         let prod_cfg = BigtableStorageConfig {
             project_id: "prod-proj".to_owned(),
@@ -533,6 +717,7 @@ mod tests {
         let section = prod_bs.generate_backend_config_section();
         assert!(section.contains("# emulator_host ="));
         assert!(!section.contains("\nemulator_host ="));
+        assert!(!section.contains("dev_mode"));
         assert!(section.contains("app_profile_id = \"single-cluster\""));
         assert!(section.contains("credentials_path = \"/etc/extenddb/sa.json\""));
 

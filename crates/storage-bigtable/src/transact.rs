@@ -11,7 +11,7 @@
 
 use std::time::Duration;
 
-use extenddb_core::types::{CancellationReason, Item};
+use extenddb_core::types::Item;
 use extenddb_storage::error::StorageError;
 use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::mutation::{
     DeleteFromColumn, DeleteFromFamily, DeleteFromRow, SetCell,
@@ -27,12 +27,13 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::data::client::{
-    BigtableClient, exact_re2_bytes, map_bigtable_err, monotonic_timestamp_after_micros,
-    monotonic_timestamp_micros,
+    BigtableClient, exact_re2_bytes, is_table_not_found_err, map_bigtable_err,
+    monotonic_timestamp_after_micros, monotonic_timestamp_micros,
 };
 use crate::data::item_ops::{
-    FAMILY_DATA, QUALIFIER_VERSION, build_version_match_filter, next_millis_exclusive,
-    older_than_ts_range, version_to_timestamp_micros,
+    FAMILY_DATA, QUALIFIER_VERSION, build_version_match_filter, max_mutations_per_rpc,
+    next_millis_exclusive, older_than_ts_range, split_mutation_batches,
+    version_to_timestamp_micros,
 };
 
 pub const TXN_LOG_TABLE: &str = "__extenddb_txn_log__";
@@ -244,7 +245,7 @@ impl<'a> TxnCoordinator<'a> {
         };
 
         let resp = data
-            .check_and_mutate_row(req)
+            .check_and_mutate_row_idempotent(req)
             .await
             .map_err(|e| map_bigtable_err("txn open", e))?;
 
@@ -290,9 +291,10 @@ impl<'a> TxnCoordinator<'a> {
                 Err(e) => return Err(e),
             }
         }
-        let resp = match resp_opt {
-            Some(r) => r,
-            None => return Err(last_err.unwrap()),
+        let Some(resp) = resp_opt else {
+            return Err(last_err.unwrap_or_else(|| {
+                StorageError::Transient("ReadRows get_state retry exhausted".to_owned())
+            }));
         };
         let Some((_, cells)) = resp.into_iter().next() else {
             return Ok(None);
@@ -382,11 +384,59 @@ impl<'a> TxnCoordinator<'a> {
             ..CheckAndMutateRowRequest::default()
         };
         let resp = data
-            .check_and_mutate_row(req)
+            .check_and_mutate_row_idempotent(req)
             .await
             .map_err(|e| map_bigtable_err("place_intent", e))?;
 
-        Ok(!resp.predicate_matched)
+        if !resp.predicate_matched {
+            return Ok(true);
+        }
+        // If an idempotent transport retry ran after our own intent was placed,
+        // `predicate_matched` is true because `m:intent:<txn_id>` already exists.
+        self.has_own_intent(txn_id, participant).await
+    }
+
+    async fn has_own_intent(
+        &self,
+        txn_id: &str,
+        participant: &ParticipantRow,
+    ) -> Result<bool, StorageError> {
+        let qualifier = Self::intent_qualifier(txn_id);
+        let mut data = self.client.data();
+        let req = ReadRowsRequest {
+            table_name: self.client.full_table_name(&participant.data_table),
+            app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+            rows_limit: 1,
+            rows: Some(RowSet {
+                row_keys: vec![participant.row_key.clone()],
+                row_ranges: vec![],
+            }),
+            filter: Some(RowFilter {
+                filter: Some(Filter::Chain(Chain {
+                    filters: vec![
+                        RowFilter {
+                            filter: Some(Filter::FamilyNameRegexFilter(format!(
+                                "^{INTENT_FAMILY}$"
+                            ))),
+                        },
+                        RowFilter {
+                            filter: Some(Filter::ColumnQualifierRegexFilter(exact_re2_bytes(
+                                &qualifier,
+                            ))),
+                        },
+                        RowFilter {
+                            filter: Some(Filter::CellsPerColumnLimitFilter(1)),
+                        },
+                    ],
+                })),
+            }),
+            ..ReadRowsRequest::default()
+        };
+        let resp = data
+            .read_rows(req)
+            .await
+            .map_err(|e| map_bigtable_err("ReadRows has_own_intent", e))?;
+        Ok(!resp.is_empty())
     }
 
     /// Place an intent marker on a participant row with short jittered retries.
@@ -474,14 +524,74 @@ impl<'a> TxnCoordinator<'a> {
             ..CheckAndMutateRowRequest::default()
         };
         let resp = data
-            .check_and_mutate_row(req)
+            .check_and_mutate_row_idempotent(req)
             .await
             .map_err(|e| map_bigtable_err("txn try_commit_full", e))?;
         if resp.predicate_matched {
             Ok(Some(ts_micros))
+        } else if let Some(st) = self.get_state(txn_id).await?
+            && st.state == "COMMITTED"
+            && st.started_at == Some(started_at_micros)
+        {
+            Ok(Some(st.state_ts_micros))
         } else {
             Ok(None)
         }
+    }
+
+    /// Persist a directly `COMMITTED` recovery record for post-`put_cas` /
+    /// `delete_cas` shadow-index or TTL side effects that encountered a
+    /// transient failure after base commit, so `sweeper` finishes them cleanly
+    /// without returning a misleading error on an already-durable write.
+    pub async fn write_committed_side_effects(
+        &self,
+        txn_id: &str,
+        mutations: &[ParticipantMutation],
+        ttl_mutations: &[TxnTtlMutation],
+    ) -> Result<(), StorageError> {
+        if mutations.is_empty() && ttl_mutations.is_empty() {
+            return Ok(());
+        }
+        let ts_micros = monotonic_timestamp_micros();
+        let empty_parts = serde_json::to_vec(&Vec::<ParticipantRow>::new())
+            .map_err(|e| StorageError::Internal(format!("serialize empty participants: {e}")))?;
+        let serialized_muts = serde_json::to_vec(mutations)
+            .map_err(|e| StorageError::Internal(format!("serialize side-effect mutations: {e}")))?;
+
+        let mut muts = vec![
+            Self::set_cell_at(TXN_FAMILY, b"state", STATE_COMMITTED.to_vec(), ts_micros),
+            Self::set_cell_at(
+                TXN_FAMILY,
+                b"started_at",
+                ts_micros.to_string().into_bytes(),
+                ts_micros,
+            ),
+            Self::set_cell_at(TXN_FAMILY, b"participants", empty_parts, ts_micros),
+            Self::set_cell_at(TXN_FAMILY, b"mutations", serialized_muts, ts_micros),
+        ];
+        if !ttl_mutations.is_empty() {
+            let serialized_ttls = serde_json::to_vec(ttl_mutations)
+                .map_err(|e| StorageError::Internal(format!("serialize side-effect ttls: {e}")))?;
+            muts.push(Self::set_cell_at(
+                TXN_FAMILY,
+                b"ttl_mutations",
+                serialized_ttls,
+                ts_micros,
+            ));
+        }
+
+        let mut data = self.client.data();
+        let req = MutateRowRequest {
+            table_name: self.client.full_table_name(TXN_LOG_TABLE),
+            app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+            row_key: Self::coordinator_row_key(txn_id).into_bytes(),
+            mutations: muts,
+            ..MutateRowRequest::default()
+        };
+        data.mutate_row(req)
+            .await
+            .map_err(|e| map_bigtable_err("txn write_committed_side_effects", e))?;
+        Ok(())
     }
 
     /// CAS-guarded `commit` convenience wrapper returning `TransactionConflict`
@@ -529,7 +639,7 @@ impl<'a> TxnCoordinator<'a> {
             ..CheckAndMutateRowRequest::default()
         };
         let resp = data
-            .check_and_mutate_row(req)
+            .check_and_mutate_row_idempotent(req)
             .await
             .map_err(|e| map_bigtable_err("txn try_abort_pending", e))?;
         Ok(resp.predicate_matched)
@@ -554,7 +664,7 @@ impl<'a> TxnCoordinator<'a> {
             false_mutations: vec![],
             ..CheckAndMutateRowRequest::default()
         };
-        data.check_and_mutate_row(req)
+        data.check_and_mutate_row_idempotent(req)
             .await
             .map_err(|e| map_bigtable_err("txn cleaned", e))?;
         Ok(())
@@ -580,21 +690,6 @@ impl<'a> TxnCoordinator<'a> {
         match payload {
             TxnOpPayload::Put { item } => {
                 true_mutations.push(Mutation {
-                    mutation: Some(mutation::Mutation::DeleteFromFamily(DeleteFromFamily {
-                        family_name: FAMILY_DATA.to_string(),
-                    })),
-                });
-                for (name, value) in item {
-                    true_mutations.push(Mutation {
-                        mutation: Some(mutation::Mutation::SetCell(SetCell {
-                            family_name: FAMILY_DATA.to_string(),
-                            column_qualifier: name.as_bytes().to_vec(),
-                            timestamp_micros: ts_micros,
-                            value: crate::data::encoding::cell::encode(value)?,
-                        })),
-                    });
-                }
-                true_mutations.push(Mutation {
                     mutation: Some(mutation::Mutation::SetCell(SetCell {
                         family_name: INTENT_FAMILY.to_string(),
                         column_qualifier: QUALIFIER_VERSION.to_vec(),
@@ -609,6 +704,21 @@ impl<'a> TxnCoordinator<'a> {
                         time_range: older_than_ts_range(ts_micros),
                     })),
                 });
+                true_mutations.push(Mutation {
+                    mutation: Some(mutation::Mutation::DeleteFromFamily(DeleteFromFamily {
+                        family_name: FAMILY_DATA.to_string(),
+                    })),
+                });
+                for (name, value) in item {
+                    true_mutations.push(Mutation {
+                        mutation: Some(mutation::Mutation::SetCell(SetCell {
+                            family_name: FAMILY_DATA.to_string(),
+                            column_qualifier: name.as_bytes().to_vec(),
+                            timestamp_micros: ts_micros,
+                            value: crate::data::encoding::cell::encode(value)?,
+                        })),
+                    });
+                }
             }
             TxnOpPayload::Delete => {
                 true_mutations.push(Mutation {
@@ -634,6 +744,9 @@ impl<'a> TxnCoordinator<'a> {
             }
         }
 
+        let rpc_limit = max_mutations_per_rpc();
+        let (true_mutations, overflow_chunks) = split_mutation_batches(true_mutations, rpc_limit);
+
         let req = CheckAndMutateRowRequest {
             table_name: self.client.full_table_name(&participant.data_table),
             app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
@@ -644,15 +757,36 @@ impl<'a> TxnCoordinator<'a> {
             ..CheckAndMutateRowRequest::default()
         };
 
-        let resp = data
-            .check_and_mutate_row(req)
-            .await
-            .map_err(|e| map_bigtable_err("apply_fenced_mutation", e))?;
+        let resp = match data.check_and_mutate_row_idempotent(req).await {
+            Ok(r) => r,
+            Err(e) if is_table_not_found_err(&e) => return Ok(false),
+            Err(e) => return Err(map_bigtable_err("apply_fenced_mutation", e)),
+        };
+
+        if resp.predicate_matched {
+            for chunk in overflow_chunks {
+                let mut chunk_data = self.client.data();
+                let mreq = MutateRowRequest {
+                    table_name: self.client.full_table_name(&participant.data_table),
+                    app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+                    row_key: participant.row_key.clone(),
+                    mutations: chunk,
+                    ..MutateRowRequest::default()
+                };
+                match chunk_data.mutate_row(mreq).await {
+                    Ok(_) => {}
+                    Err(e) if is_table_not_found_err(&e) => return Ok(false),
+                    Err(e) => return Err(map_bigtable_err("apply_fenced_mutation overflow", e)),
+                }
+            }
+        }
 
         Ok(resp.predicate_matched)
     }
 
     /// Clear an intent cell unconditionally (used while this incarnation still owns `txn:<id>`).
+    /// Treats `NotFound` on a deleted table as completed so surviving participants'
+    /// intents are never stranded.
     pub async fn clear_intent(
         &self,
         txn_id: &str,
@@ -673,10 +807,11 @@ impl<'a> TxnCoordinator<'a> {
             }],
             ..MutateRowRequest::default()
         };
-        data.mutate_row(req)
-            .await
-            .map_err(|e| map_bigtable_err("clear_intent", e))?;
-        Ok(())
+        match data.mutate_row(req).await {
+            Ok(_) => Ok(()),
+            Err(e) if is_table_not_found_err(&e) => Ok(()),
+            Err(e) => Err(map_bigtable_err("clear_intent", e)),
+        }
     }
 
     /// Clear an orphaned/cleaned intent cell bounded to `[0, next_millis_exclusive(max_ts_micros))`
@@ -704,15 +839,15 @@ impl<'a> TxnCoordinator<'a> {
             }],
             ..MutateRowRequest::default()
         };
-        data.mutate_row(req)
-            .await
-            .map_err(|e| map_bigtable_err("clear_intent_up_to", e))?;
-        Ok(())
+        match data.mutate_row(req).await {
+            Ok(_) => Ok(()),
+            Err(e) if is_table_not_found_err(&e) => Ok(()),
+            Err(e) => Err(map_bigtable_err("clear_intent_up_to", e)),
+        }
     }
 
     /// Delete the coordinator row only if `t:started_at` still matches
-    /// `started_at_micros`, protecting reused deterministic `ClientRequestToken`
-    /// coordinator keys against stale incarnation deletes.
+    /// `started_at_micros`.
     pub async fn drop_matching_start(
         &self,
         txn_id: &str,
@@ -733,7 +868,7 @@ impl<'a> TxnCoordinator<'a> {
             false_mutations: vec![],
             ..CheckAndMutateRowRequest::default()
         };
-        let _ = data.check_and_mutate_row(req).await;
+        let _ = data.check_and_mutate_row_idempotent(req).await;
         Ok(())
     }
 
@@ -961,21 +1096,8 @@ fn build_intent_presence_filter() -> RowFilter {
     }
 }
 
-/// Cancellation reason convenience builder.
-pub fn cancellation_reason(
-    code: &str,
-    message: Option<&str>,
-    item: Option<Item>,
-) -> CancellationReason {
-    CancellationReason {
-        code: code.to_string(),
-        message: message.map(str::to_owned),
-        item,
-    }
-}
-
-/// Make sure the `__extenddb_txn_log__` admin table exists on the BigTable
-/// instance. Called once at startup from `runtime_hooks` (idempotent).
+/// Ensure the `__extenddb_txn_log__` system table exists on the Bigtable
+/// data instance (called from Migration 1 `M0001DataBaseline`).
 pub async fn ensure_txn_log_table(client: &BigtableClient) -> Result<(), String> {
     let mut admin = crate::data::admin::AdminClient::connect(client).await?;
     admin

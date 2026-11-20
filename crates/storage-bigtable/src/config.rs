@@ -5,55 +5,57 @@
 
 use std::sync::OnceLock;
 
-use extenddb_storage::config::StorageConfig;
+use extenddb_storage::config::{StartupWarning, StorageConfig};
 use serde::Deserialize;
 
 /// Connection settings for a BigTable backend deployment.
 ///
 /// Loaded from the `[storage.bigtable]` block in `extenddb.toml`. If
-/// `emulator_host` is set, the backend uses the local BigTable emulator and
-/// skips ADC-based credential discovery; otherwise it connects to real GCP
-/// using Application Default Credentials.
+/// `emulator_host` (or `BIGTABLE_EMULATOR_HOST`) is set, the backend connects
+/// to the local Bigtable emulator over plaintext HTTP/2 without credentials;
+/// otherwise it connects to Google Cloud Bigtable over TLS using Application
+/// Default Credentials (or `credentials_path`).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BigtableStorageConfig {
-    /// GCP project id (or anything when using the emulator).
+    /// GCP project ID (or an arbitrary project identifier when using the emulator).
     pub project_id: String,
 
-    /// BigTable instance id within the project.
+    /// Cloud Bigtable instance ID within `project_id` holding `__extenddb_catalog__`.
     pub instance_id: String,
 
-    /// Optional instance ID specifically for data tables (separating catalog/data).
+    /// Optional separate Cloud Bigtable instance ID for data tables,
+    /// `__extenddb_txn_log__`, `__extenddb_ttl_index__`, and `__extenddb_data_ledger__`.
     #[serde(default)]
     pub data_instance_id: Option<String>,
 
-    /// Optional BigTable application profile ID.
+    /// Optional Cloud Bigtable application profile ID (defaults to `"default"`).
     ///
     /// # Routing Requirements
-    /// Cloud Bigtable requires single-cluster routing (or multi-cluster routing
-    /// with single-row transactions enabled) for conditional mutations
-    /// (`CheckAndMutateRow`). Multi-cluster routing with eventual consistency
-    /// does not support `CheckAndMutateRow` operations.
+    /// Cloud Bigtable supports single-row transactions (`CheckAndMutateRow`)
+    /// **only** on application profiles configured with **single-cluster routing**
+    /// and `allow_transactional_writes = true`. Multi-cluster routing profiles do
+    /// not support single-row transactions and are refused at server startup.
     #[serde(default, alias = "app_profile")]
     pub app_profile_id: Option<String>,
 
-    /// Path to a GCP service account JSON key file.
+    /// Optional path to a GCP service account JSON key file.
     #[serde(default)]
     pub credentials_path: Option<String>,
 
-    /// If set, point clients at this `host:port` instead of real GCP.
-    /// Equivalent to exporting `BIGTABLE_EMULATOR_HOST=host:port`.
+    /// If set, point clients at this `host:port` instead of Google Cloud Bigtable.
+    /// Equivalent to setting `BIGTABLE_EMULATOR_HOST=host:port`.
     #[serde(default)]
     pub emulator_host: Option<String>,
 
-    /// Max concurrent connections on the data path.
+    /// Max concurrent gRPC channels on the data path.
     #[serde(
         default = "default_pool_size",
         deserialize_with = "extenddb_storage::config::string_coerce::u32"
     )]
     pub pool_size: u32,
 
-    /// Max concurrent connections on the catalog path. Defaults to `pool_size`.
+    /// Max concurrent gRPC channels on the catalog/auth path. Defaults to `pool_size`.
     #[serde(
         default,
         deserialize_with = "extenddb_storage::config::string_coerce::opt_u32"
@@ -61,31 +63,33 @@ pub struct BigtableStorageConfig {
     pub catalog_pool_size: Option<u32>,
 
     /// How often the 2PC recovery sweeper scans for stale intents. Default 30s.
-    #[serde(default = "default_sweeper_cadence", deserialize_with = "coerce_u64")]
+    #[serde(
+        default = "default_sweeper_cadence",
+        deserialize_with = "extenddb_storage::config::string_coerce::u64"
+    )]
     pub sweeper_cadence_secs: u64,
 
     /// How long an unresolved 2PC intent stays in PENDING before the sweeper
     /// rolls it back. Default 60s.
-    #[serde(default = "default_intent_timeout", deserialize_with = "coerce_u64")]
+    #[serde(
+        default = "default_intent_timeout",
+        deserialize_with = "extenddb_storage::config::string_coerce::u64"
+    )]
     pub intent_timeout_secs: u64,
 
     /// How often the TTL scanner runs. Default 60s.
-    #[serde(default = "default_ttl_scan_cadence", deserialize_with = "coerce_u64")]
+    #[serde(
+        default = "default_ttl_scan_cadence",
+        deserialize_with = "extenddb_storage::config::string_coerce::u64"
+    )]
     pub ttl_scan_cadence_secs: u64,
 
-    /// How often the GSI reconciler worker runs. Default 300s (5 minutes).
+    /// How often the GSI reconciler worker checks `CREATING` indexes. Default 300s.
     #[serde(
         default = "default_gsi_reconcile_cadence",
-        deserialize_with = "coerce_u64"
+        deserialize_with = "extenddb_storage::config::string_coerce::u64"
     )]
     pub gsi_reconcile_cadence_secs: u64,
-
-    /// Dev-mode auth bypass for local testing. DO NOT enable in production.
-    #[serde(
-        default,
-        deserialize_with = "extenddb_storage::config::string_coerce::bool"
-    )]
-    pub dev_mode: bool,
 
     /// Lazily materialized connection string so `StorageConfig::connection_config`
     /// returns a borrowed `&str` without leaking memory on repeated calls.
@@ -109,7 +113,6 @@ impl Clone for BigtableStorageConfig {
             intent_timeout_secs: self.intent_timeout_secs,
             ttl_scan_cadence_secs: self.ttl_scan_cadence_secs,
             gsi_reconcile_cadence_secs: self.gsi_reconcile_cadence_secs,
-            dev_mode: self.dev_mode,
             cached_url: OnceLock::new(),
         }
     }
@@ -118,19 +121,18 @@ impl Clone for BigtableStorageConfig {
 impl Default for BigtableStorageConfig {
     fn default() -> Self {
         Self {
-            project_id: "extenddb-dev".to_string(),
-            instance_id: "extenddb-dev".to_string(),
+            project_id: String::new(),
+            instance_id: String::new(),
             data_instance_id: None,
             app_profile_id: None,
             credentials_path: None,
-            emulator_host: Some("localhost:8086".to_string()),
+            emulator_host: None,
             pool_size: default_pool_size(),
             catalog_pool_size: None,
             sweeper_cadence_secs: default_sweeper_cadence(),
             intent_timeout_secs: default_intent_timeout(),
             ttl_scan_cadence_secs: default_ttl_scan_cadence(),
             gsi_reconcile_cadence_secs: default_gsi_reconcile_cadence(),
-            dev_mode: false,
             cached_url: OnceLock::new(),
         }
     }
@@ -156,31 +158,81 @@ fn default_gsi_reconcile_cadence() -> u64 {
     300
 }
 
+/// Read `BIGTABLE_EMULATOR_HOST` from the process environment in one place,
+/// returning `None` when unset or blank.
+#[must_use]
+pub fn ambient_emulator_host() -> Option<String> {
+    std::env::var("BIGTABLE_EMULATOR_HOST")
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
 impl BigtableStorageConfig {
+    /// Resolve the effective emulator endpoint (`emulator_host` in config,
+    /// falling back to `BIGTABLE_EMULATOR_HOST` in the environment).
+    #[must_use]
+    pub fn resolve_emulator_host(&self) -> Option<String> {
+        self.emulator_host
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(ambient_emulator_host)
+    }
+
+    /// Resolve the effective Bigtable instance ID for data tables (`data_instance_id`
+    /// when non-empty, otherwise `instance_id`).
+    #[must_use]
+    pub fn effective_data_instance_id(&self) -> &str {
+        self.data_instance_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&self.instance_id)
+    }
+
     /// Returns a synthesised connection string of the form
     /// `bigtable://<project>/<instance>[?emulator=host:port&...]`. Used by the
     /// `StorageConfig::connection_config()` trait method.
     pub fn connection_string(&self) -> String {
         let mut params: Vec<String> = Vec::new();
-        if let Some(host) = &self.emulator_host {
+        if let Some(host) = self
+            .emulator_host
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             params.push(format!("emulator={}", urlencoding::encode(host)));
         }
-        if self.dev_mode {
-            params.push("dev_mode=true".to_string());
-        }
-        if let Some(data_inst) = &self.data_instance_id {
+        if let Some(data_inst) = self
+            .data_instance_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             params.push(format!(
                 "data_instance_id={}",
                 urlencoding::encode(data_inst)
             ));
         }
-        if let Some(app_profile) = &self.app_profile_id {
+        if let Some(app_profile) = self
+            .app_profile_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             params.push(format!(
                 "app_profile_id={}",
                 urlencoding::encode(app_profile)
             ));
         }
-        if let Some(cred_path) = &self.credentials_path {
+        if let Some(cred_path) = self
+            .credentials_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             params.push(format!(
                 "credentials_path={}",
                 urlencoding::encode(cred_path)
@@ -230,7 +282,6 @@ impl BigtableStorageConfig {
         }
 
         let mut emulator_host = None;
-        let mut dev_mode = false;
         let mut data_instance_id = None;
         let mut app_profile_id = None;
         let mut credentials_path = None;
@@ -251,11 +302,30 @@ impl BigtableStorageConfig {
                         .map(|c| c.into_owned())
                         .unwrap_or_else(|_| raw_v.to_owned());
                     match k {
-                        "emulator" | "emulator_host" => emulator_host = Some(v),
-                        "dev_mode" => dev_mode = v == "true" || v == "1",
-                        "data_instance_id" => data_instance_id = Some(v),
-                        "app_profile_id" | "app_profile" => app_profile_id = Some(v),
-                        "credentials_path" => credentials_path = Some(v),
+                        "emulator" | "emulator_host" => {
+                            let trimmed = v.trim();
+                            if !trimmed.is_empty() {
+                                emulator_host = Some(trimmed.to_owned());
+                            }
+                        }
+                        "data_instance_id" => {
+                            let trimmed = v.trim();
+                            if !trimmed.is_empty() {
+                                data_instance_id = Some(trimmed.to_owned());
+                            }
+                        }
+                        "app_profile_id" | "app_profile" => {
+                            let trimmed = v.trim();
+                            if !trimmed.is_empty() {
+                                app_profile_id = Some(trimmed.to_owned());
+                            }
+                        }
+                        "credentials_path" => {
+                            let trimmed = v.trim();
+                            if !trimmed.is_empty() {
+                                credentials_path = Some(trimmed.to_owned());
+                            }
+                        }
                         "pool_size" => pool_size = v.parse().unwrap_or(pool_size),
                         "catalog_pool_size" => catalog_pool_size = v.parse().ok(),
                         "ttl_scan" => ttl_scan = v.parse().unwrap_or(ttl_scan),
@@ -280,7 +350,6 @@ impl BigtableStorageConfig {
             intent_timeout_secs: intent_timeout,
             ttl_scan_cadence_secs: ttl_scan,
             gsi_reconcile_cadence_secs: gsi_reconcile,
-            dev_mode,
             cached_url: OnceLock::new(),
         })
     }
@@ -299,6 +368,35 @@ impl StorageConfig for BigtableStorageConfig {
         self.catalog_pool_size.unwrap_or(self.pool_size)
     }
 
+    fn startup_warnings(&self) -> Vec<StartupWarning> {
+        let mut out = Vec::new();
+        let configured_emu = self
+            .emulator_host
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(host) = self.resolve_emulator_host() {
+            let source = if configured_emu.is_some() {
+                "storage.bigtable.emulator_host"
+            } else {
+                "BIGTABLE_EMULATOR_HOST"
+            };
+            out.push(StartupWarning {
+                title: format!(
+                    "Bigtable emulator mode active ({source} = {host})"
+                ),
+                details: vec![
+                    format!(
+                        "Connecting to {host} over plaintext HTTP/2 without GCP credentials (project '{}', instance '{}').",
+                        self.project_id, self.instance_id
+                    ),
+                    "Unset BIGTABLE_EMULATOR_HOST and remove emulator_host before connecting to Google Cloud Bigtable.".to_owned(),
+                ],
+            });
+        }
+        out
+    }
+
     fn clone_box(&self) -> Box<dyn StorageConfig> {
         Box::new(self.clone())
     }
@@ -308,25 +406,17 @@ impl StorageConfig for BigtableStorageConfig {
     }
 }
 
-fn coerce_u64<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum MaybeStringU64 {
-        Native(u64),
-        Text(String),
-    }
-    match MaybeStringU64::deserialize(deserializer)? {
-        MaybeStringU64::Native(v) => Ok(v),
-        MaybeStringU64::Text(s) => s
-            .trim()
-            .parse()
-            .map_err(|e| serde::de::Error::custom(format!("invalid u64 value \"{s}\": {e}"))),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_config_does_not_point_at_emulator() {
+        let cfg = BigtableStorageConfig::default();
+        assert!(cfg.project_id.is_empty());
+        assert!(cfg.instance_id.is_empty());
+        assert_eq!(cfg.emulator_host, None);
+    }
 
     #[test]
     fn config_url_roundtrip_preserves_app_profile_and_pool_sizes() {
@@ -360,7 +450,6 @@ mod tests {
         assert_eq!(parsed.pool_size, 48);
         assert_eq!(parsed.catalog_pool_size, Some(12));
 
-        // Verify cached_url returns a stable borrowed pointer without leaking.
         let p1 = cfg.connection_config().as_ptr();
         let p2 = cfg.connection_config().as_ptr();
         assert_eq!(p1, p2);
@@ -377,12 +466,11 @@ mod tests {
         assert_eq!(cfg.app_profile_id.as_deref(), Some("single-cluster"));
 
         let p2 = BigtableStorageConfig::from_connection_string(
-            "bigtable://proj/inst?emulator_host=127.0.0.1:9090&app_profile=prof1&dev_mode=true",
+            "bigtable://proj/inst?emulator_host=127.0.0.1:9090&app_profile=prof1",
         )
         .unwrap();
         assert_eq!(p2.emulator_host.as_deref(), Some("127.0.0.1:9090"));
         assert_eq!(p2.app_profile_id.as_deref(), Some("prof1"));
-        assert!(p2.dev_mode);
     }
 
     #[test]
@@ -397,10 +485,13 @@ mod tests {
             r#"
             project_id = "p"
             instance_id = "i"
-            bogus_field = 123
+            dev_mode = true
             "#,
         );
-        assert!(unknown.is_err(), "unknown fields must be rejected");
+        assert!(
+            unknown.is_err(),
+            "unknown fields such as dev_mode must be rejected"
+        );
 
         let valid: toml::Table = toml::from_str(
             r#"
@@ -413,7 +504,6 @@ mod tests {
         assert_eq!(cfg.project_id, "my-gcp-project");
         assert_eq!(cfg.instance_id, "my-bt-instance");
         assert_eq!(cfg.emulator_host, None);
-        assert!(!cfg.dev_mode);
     }
 
     #[test]
@@ -427,7 +517,6 @@ mod tests {
             intent_timeout_secs = "45"
             ttl_scan_cadence_secs = "90"
             gsi_reconcile_cadence_secs = "120"
-            dev_mode = "true"
         "#;
         let cfg: BigtableStorageConfig = toml::from_str(raw).expect("string-coerced config");
         assert_eq!(cfg.pool_size, 32);
@@ -436,6 +525,5 @@ mod tests {
         assert_eq!(cfg.intent_timeout_secs, 45);
         assert_eq!(cfg.ttl_scan_cadence_secs, 90);
         assert_eq!(cfg.gsi_reconcile_cadence_secs, 120);
-        assert!(cfg.dev_mode);
     }
 }

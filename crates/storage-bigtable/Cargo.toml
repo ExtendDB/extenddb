@@ -8,6 +8,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Google Cloud Bigtable storage backend of the ExtendDB server (experimental). Internal crate of the extenddb binary, with no API stability promise."
+readme = "README.md"
 repository.workspace = true
 homepage.workspace = true
 
@@ -33,7 +34,6 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 
 # BigTable client + admin stubs
-bigtable_rs = { workspace = true }
 googleapis_tonic_google_bigtable_v2 = { workspace = true }
 googleapis_tonic_google_bigtable_admin_v2 = { workspace = true }
 tonic = { workspace = true }
@@ -48,7 +48,6 @@ rustls = { workspace = true }
 rand = { workspace = true }
 bcrypt = { workspace = true }
 base64 = { workspace = true }
-axum = { workspace = true }
 
 [features]
 # Coordination and fault-injection hooks used only by this crate's integration

@@ -9,7 +9,6 @@ pub mod catalog;
 pub mod catalog_store;
 pub mod config;
 pub mod data;
-pub mod dev_auth;
 pub mod engine;
 pub mod gsi;
 pub mod gsi_worker;
@@ -49,7 +48,7 @@ async fn catalog_store_from_connection_string(
         cfg.pool_size = cp;
     }
     let client = std::sync::Arc::new(crate::data::client::BigtableClient::connect(&cfg).await?);
-    Ok(BigtableCatalogStore::new(client, None, cfg.dev_mode))
+    Ok(BigtableCatalogStore::new(client, None))
 }
 
 #[must_use]
@@ -126,9 +125,15 @@ fn server_components_factory(
     let region = region.to_owned();
     let max_item_size_bytes = options.max_item_size_bytes;
     let key_source = std::mem::take(&mut options.key_source);
+    let release = options.release;
+    let command_opt = options.command;
+    let command = command_opt.unwrap_or(migrations::SERVE_COMMAND);
     Box::pin(async move {
+        use extenddb_storage::hooks::ServingRegistrar as _;
+
         let cfg = crate::config::BigtableStorageConfig::from_connection_string(&conn_str)
             .map_err(extenddb_storage::BackendError::InitializationFailed)?;
+
         let mut cat_cfg = cfg.clone();
         if let Some(cp) = cfg.catalog_pool_size {
             cat_cfg.pool_size = cp;
@@ -142,54 +147,101 @@ fn server_components_factory(
                 })?,
         );
 
-        let temp_store = BigtableCatalogStore::new(client.clone(), None, cfg.dev_mode);
-        let secret_keys =
-            extenddb_storage::server_components::load_secret_keys(&temp_store, key_source).await?;
+        if command_opt.is_none() {
+            client.log_startup_endpoint("catalog");
+        }
+
+        // Validate single-cluster transactional routing BEFORE `register_and_check_as`
+        // issues any `CheckAndMutateRow` against `__extenddb_catalog__`.
+        crate::data::admin::AdminClient::validate_app_profile(&client)
+            .await
+            .map_err(extenddb_storage::BackendError::InitializationFailed)?;
 
         let data_client = match cfg.data_instance_id.as_deref() {
             Some(data_inst) if !data_inst.is_empty() && data_inst != cfg.instance_id => {
                 let mut data_cfg = cfg.clone();
                 data_cfg.instance_id = data_inst.to_owned();
-                std::sync::Arc::new(
+                let dc = std::sync::Arc::new(
                     crate::data::client::BigtableClient::connect(&data_cfg)
                         .await
                         .map_err(|e| extenddb_storage::BackendError::ConnectionFailed {
                             backend: BACKEND_NAME.to_string(),
                             details: e,
                         })?,
-                )
+                );
+                if command_opt.is_none() {
+                    dc.log_startup_endpoint("data");
+                }
+                crate::data::admin::AdminClient::validate_app_profile(&dc)
+                    .await
+                    .map_err(extenddb_storage::BackendError::InitializationFailed)?;
+                dc
             }
             _ => client.clone(),
         };
 
-        let engine_concrete = std::sync::Arc::new(BigtableEngine::with_options(
-            client.clone(),
-            data_client,
-            cfg.intent_timeout_secs,
-            region,
-            max_item_size_bytes,
-        ));
-        let engine = engine_concrete.clone() as std::sync::Arc<dyn extenddb_storage::StorageEngine>;
-        let catalog_store = std::sync::Arc::new(BigtableCatalogStore::new(
-            client.clone(),
-            secret_keys.clone(),
-            cfg.dev_mode,
-        )) as std::sync::Arc<dyn extenddb_storage::CatalogStore>;
+        // Register in `server_registration:<token>`, verify no migration lock
+        // is held, and confirm `Runner::status` is `Current` (or
+        // `AheadCompatible`) before opening stores or spawning workers (`ADR-0023`).
+        let registration = std::sync::Arc::new(
+            migrations::register_and_check_as(
+                &conn_str,
+                release,
+                command,
+                migrations::Timing::PRODUCTION,
+            )
+            .await
+            .map_err(extenddb_storage::BackendError::Catalog)?,
+        );
 
-        let cred_store = std::sync::Arc::new(BigtableCredentialStore::new(client, secret_keys))
-            as std::sync::Arc<dyn extenddb_auth::CredentialStore>;
+        let build_result: Result<
+            extenddb_storage::ServerComponents,
+            extenddb_storage::BackendError,
+        > = async {
+            let temp_store = BigtableCatalogStore::new(client.clone(), None);
+            let secret_keys =
+                extenddb_storage::server_components::load_secret_keys(&temp_store, key_source)
+                    .await?;
 
-        let runtime_hooks: Option<Box<dyn extenddb_storage::ServerRuntimeHooks>> =
-            Some(Box::new(crate::runtime_hooks::BigtableRuntimeHooks {
-                engine: engine_concrete,
-                config: cfg,
-            }));
+            let engine_concrete = std::sync::Arc::new(BigtableEngine::with_options(
+                client.clone(),
+                data_client,
+                cfg.intent_timeout_secs,
+                region,
+                max_item_size_bytes,
+            ));
+            let engine =
+                engine_concrete.clone() as std::sync::Arc<dyn extenddb_storage::StorageEngine>;
+            let catalog_store = std::sync::Arc::new(BigtableCatalogStore::new(
+                client.clone(),
+                secret_keys.clone(),
+            ))
+                as std::sync::Arc<dyn extenddb_storage::CatalogStore>;
 
-        Ok(extenddb_storage::ServerComponents {
-            engine,
-            catalog_store,
-            credential_store: cred_store,
-            runtime_hooks,
-        })
+            let cred_store = std::sync::Arc::new(BigtableCredentialStore::new(client, secret_keys))
+                as std::sync::Arc<dyn extenddb_auth::CredentialStore>;
+
+            let registrar: Option<std::sync::Arc<dyn extenddb_storage::hooks::ServingRegistrar>> =
+                Some(registration.clone());
+            let runtime_hooks: Option<Box<dyn extenddb_storage::ServerRuntimeHooks>> =
+                Some(Box::new(crate::runtime_hooks::BigtableRuntimeHooks {
+                    engine: engine_concrete,
+                    config: cfg,
+                    registrar,
+                }));
+
+            Ok(extenddb_storage::ServerComponents {
+                engine,
+                catalog_store,
+                credential_store: cred_store,
+                runtime_hooks,
+            })
+        }
+        .await;
+
+        if build_result.is_err() {
+            registration.release().await;
+        }
+        build_result
     })
 }

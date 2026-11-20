@@ -1,16 +1,16 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! TTL cleanup worker.
+//! TTL backfill recovery and expiration worker.
 //!
-//! Sweeps the `__extenddb_ttl_index__` table in shards, verifies each candidate
-//! against the live base item's TTL attribute (including resolving `COMMITTED`
-//! 2PC intents), evicts any item whose current TTL epoch is in `(0, now_epoch_s]`
-//! via a conditional `DataEngine::delete_item`, re-asserts future TTL index
-//! entries when an item's TTL was extended (`> now_epoch_s`), and cleans up
-//! scanned TTL index cells using millisecond-aligned timestamp-bounded
-//! `DeleteFromColumn` (`[0, next_millis_exclusive(ts))`) rather than unbounded
-//! `DeleteFromRow` so concurrent same-second TTL updates are never wiped.
+//! - Completes any interrupted `ENABLING` table backfills whose per-table
+//!   `lock:ttl_backfill:<table_id>` lease is free.
+//! - Sweeps `__extenddb_ttl_index__` shards `0..16`, verifying each candidate
+//!   against the live base item's TTL attribute (resolving `COMMITTED` 2PC
+//!   intents), evicting items whose current TTL epoch is in `(0, now_epoch_s]`
+//!   when the table's TTL status is `ENABLED`, and leaving index entries intact
+//!   whenever TTL is `ENABLING` or `DISABLED` so no item is missed across status
+//!   transitions.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,9 +20,7 @@ use extenddb_core::expression::{CompareOp, Expr, ExpressionMaps, PathElement};
 use extenddb_core::metrics::MetricsCollector;
 use extenddb_core::types::{AttributeValue, StreamViewType, TimeToLiveStatus, UserIdentity};
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{
-    CancellationToken, DataEngine, MetadataEngine, StreamCapture, TableEngine, sleep_or_shutdown,
-};
+use extenddb_storage::{CancellationToken, DataEngine, MetadataEngine, StreamCapture, TableEngine};
 use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::{
     MutateRowRequest, Mutation, ReadRowsRequest, RowFilter, RowRange, RowSet, TimestampRange,
     mutation,
@@ -33,9 +31,11 @@ use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::{
 
 use crate::BigtableEngine;
 use crate::data::client::BigtableClient;
+pub use crate::data::encoding::ttl_key::TTL_INDEX_TABLE;
 use crate::data::item_ops::{
     next_millis_exclusive, parse_ttl_epoch_secs, version_to_timestamp_micros,
 };
+use crate::runtime_hooks::run_leased_worker;
 
 const TTL_PRINCIPAL_ID: &str = "dynamodb.amazonaws.com";
 const TTL_PRINCIPAL_TYPE: &str = "Service";
@@ -51,35 +51,30 @@ pub async fn run_with_metrics(
     shutdown: CancellationToken,
 ) {
     tracing::info!("bigtable TTL worker started; cadence={cadence:?}");
+    let catalog_client = engine.catalog_client_arc();
+    let owner = engine.node_id().to_owned();
+    let lease_duration = (cadence * 3).max(Duration::from_secs(30));
 
-    if let Err(e) = ensure_ttl_index_table(engine.client_ref()).await {
-        tracing::warn!("could not ensure TTL index table: {e}");
-    }
-
-    let lock_name = "ttl_worker";
-    let owner = engine.node_id();
-    let lease_duration = cadence * 2;
-
-    while sleep_or_shutdown(&shutdown, cadence).await {
-        let cat = engine.cat();
-        match cat.try_lock(lock_name, owner, lease_duration).await {
-            Ok(true) => {
-                tracing::debug!("acquired lock '{lock_name}' for node '{owner}'");
-                if let Err(e) = sweep_once_with_metrics(&engine, metrics.as_deref()).await {
+    run_leased_worker(
+        catalog_client,
+        "ttl_worker",
+        owner,
+        cadence,
+        lease_duration,
+        shutdown,
+        |pass_token| {
+            let engine = engine.clone();
+            let metrics = metrics.clone();
+            async move {
+                if let Err(e) =
+                    sweep_once_with_token(&engine, metrics.as_deref(), &pass_token).await
+                {
                     tracing::warn!("TTL worker sweep error: {e}");
                 }
-                if let Err(e) = cat.release_lock(lock_name, owner).await {
-                    tracing::warn!("failed to release lock '{lock_name}': {e}");
-                }
             }
-            Ok(false) => {
-                tracing::debug!("lock '{lock_name}' is busy, skipping TTL sweep");
-            }
-            Err(e) => {
-                tracing::warn!("error trying to acquire lock '{lock_name}': {e}");
-            }
-        }
-    }
+        },
+    )
+    .await;
     tracing::info!("bigtable TTL worker stopped");
 }
 
@@ -91,13 +86,35 @@ pub async fn sweep_once_with_metrics(
     engine: &BigtableEngine,
     metrics: Option<&MetricsCollector>,
 ) -> Result<(), String> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| e.to_string())?
-        .as_secs() as i64;
+    let token = CancellationToken::new();
+    sweep_once_with_token(engine, metrics, &token).await
+}
+
+async fn sweep_once_with_token(
+    engine: &BigtableEngine,
+    metrics: Option<&MetricsCollector>,
+    shutdown: &CancellationToken,
+) -> Result<(), String> {
+    if let Err(e) = engine.resume_enabling_ttl_tables(shutdown).await {
+        tracing::warn!("TTL worker backfill recovery error: {e}");
+    }
+    if shutdown.is_cancelled() {
+        return Ok(());
+    }
+
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_secs(),
+    )
+    .unwrap_or(i64::MAX);
 
     for shard in 0..crate::data::encoding::ttl_key::NUM_SHARDS {
-        if let Err(e) = sweep_shard(engine, shard, now, metrics).await {
+        if shutdown.is_cancelled() {
+            return Ok(());
+        }
+        if let Err(e) = sweep_shard(engine, shard, now, metrics, shutdown).await {
             tracing::warn!("TTL worker sweep failed for shard {shard}: {e}");
         }
     }
@@ -109,15 +126,16 @@ async fn sweep_shard(
     shard_id: u8,
     now_epoch_s: i64,
     metrics: Option<&MetricsCollector>,
+    shutdown: &CancellationToken,
 ) -> Result<(), String> {
     let client = engine.client_ref();
     let mut data = client.data();
-    let full_index_table = client.full_table_name(crate::data::encoding::ttl_key::TTL_INDEX_TABLE);
+    let full_index_table = client.full_table_name(TTL_INDEX_TABLE);
 
     let end_key = {
         let mut k = Vec::with_capacity(9);
         k.push(shard_id);
-        k.extend_from_slice(&(now_epoch_s + 1).to_be_bytes());
+        k.extend_from_slice(&now_epoch_s.saturating_add(1).to_be_bytes());
         k
     };
 
@@ -131,6 +149,9 @@ async fn sweep_shard(
     let mut exclude_start = false;
 
     loop {
+        if shutdown.is_cancelled() {
+            return Ok(());
+        }
         let range = RowRange {
             start_key: Some(if exclude_start {
                 StartKey::StartKeyOpen(start_key.clone())
@@ -204,11 +225,14 @@ async fn sweep_shard(
                     continue;
                 }
             };
+
+            // Never delete TTL index entries while TTL is `ENABLING`, `DISABLED`,
+            // or `DISABLING`: `ENABLING` is actively populating due entries, and
+            // preserving off-state entries ensures re-enabling never misses items.
             let Some(ttl_attr) = ttl_desc
                 .attribute_name
                 .filter(|_| ttl_desc.time_to_live_status == TimeToLiveStatus::Enabled)
             else {
-                let _ = delete_ttl_index_entry_up_to(engine, &raw_key, idx_ts_micros).await;
                 continue;
             };
 
@@ -226,8 +250,6 @@ async fn sweep_shard(
                 }
             };
 
-            // Read live item + OCC version (cooperatively rolling forward any
-            // COMMITTED 2PC intent on the row).
             let (live_item, live_ver) =
                 match engine.get_item_with_version(&key_info, &base_key).await {
                     Ok((Some(it), ver)) => (it, ver),
@@ -251,15 +273,11 @@ async fn sweep_shard(
             });
 
             let Some((live_secs, live_exp_str)) = live_ttl_parsed else {
-                // Live item no longer carries a positive numeric TTL attribute.
                 let _ = delete_ttl_index_entry_up_to(engine, &raw_key, bound_ts).await;
                 continue;
             };
 
             if live_secs > now_epoch_s {
-                // Live item's TTL was extended into the future: ensure the future
-                // TTL index entry exists at `live_ver` before retiring this stale
-                // expired index cell.
                 if let Some(lv) = live_ver {
                     let _ = engine
                         .ensure_ttl_index_entry(&key_info, base_row_key, live_secs, lv)
@@ -269,10 +287,6 @@ async fn sweep_shard(
                 continue;
             }
 
-            // `0 < live_secs <= now_epoch_s`: evict regardless of whether `live_secs`
-            // equals the scanned `expiry` (ABA-safe), conditional on the
-            // exact live TTL attribute value `#ttl = :ttl_exp` so a concurrent
-            // extension between `get_item_with_version` and `delete_item` is safe.
             let cond = Expr::Compare {
                 left: Box::new(Expr::Path(vec![PathElement::Attribute("#ttl".to_string())])),
                 op: CompareOp::Eq,
@@ -320,10 +334,6 @@ async fn sweep_shard(
                     let _ = delete_ttl_index_entry_up_to(engine, &raw_key, bound_ts).await;
                 }
                 Err(StorageError::ConditionFailed(_)) => {
-                    // Only retire cells up to `bound_ts`: if a concurrent same-second
-                    // update ("1000" -> "1000.5") caused ConditionFailed, its newer
-                    // cell on `raw_key` at `ts(v2) >= next_millis_exclusive(bound_ts)`
-                    // remains intact!
                     let _ = delete_ttl_index_entry_up_to(engine, &raw_key, bound_ts).await;
                 }
                 Err(e) => {
@@ -346,16 +356,15 @@ async fn sweep_shard(
 
 /// Delete cells on `raw_key` in `__extenddb_ttl_index__` stamped at or before
 /// `max_inclusive_ts_micros` using a millisecond-aligned `[0, next_millis_exclusive)`
-/// `DeleteFromColumn` (never `DeleteFromRow`) so any newer concurrent TTL index
-/// stamp survives.
-async fn delete_ttl_index_entry_up_to(
+/// `DeleteFromColumn` (never `DeleteFromRow`).
+pub(crate) async fn delete_ttl_index_entry_up_to(
     engine: &BigtableEngine,
     raw_key: &[u8],
     max_inclusive_ts_micros: i64,
 ) -> Result<(), String> {
     let client = engine.client_ref();
     let mut data = client.data();
-    let full_index_table = client.full_table_name(crate::data::encoding::ttl_key::TTL_INDEX_TABLE);
+    let full_index_table = client.full_table_name(TTL_INDEX_TABLE);
 
     let mutation = Mutation {
         mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
@@ -381,11 +390,13 @@ async fn delete_ttl_index_entry_up_to(
     Ok(())
 }
 
+/// Ensure the `__extenddb_ttl_index__` system table exists on the Bigtable
+/// data instance (called from Migration 1 `M0001DataBaseline`).
 pub async fn ensure_ttl_index_table(client: &BigtableClient) -> Result<(), String> {
     let mut admin = crate::data::admin::AdminClient::connect(client).await?;
     admin
         .create_table(
-            crate::data::encoding::ttl_key::TTL_INDEX_TABLE,
+            TTL_INDEX_TABLE,
             &[("d", Some(crate::data::admin::gc_max_versions(1)))],
         )
         .await

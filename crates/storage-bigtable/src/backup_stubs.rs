@@ -4,12 +4,12 @@
 //! Backup, snapshot, and restore trait implementations for `BigtableEngine`.
 //!
 //! Cloud Bigtable does not provide cross-row point-in-time snapshot reads on
-//! the data plane (and native Bigtable table backups live on the GCP Admin API
-//! rather than inside ExtendDB's logical backup format). All user-facing
-//! backup, snapshot, and restore operations therefore return
-//! [`StorageError::Unsupported`], which the engine maps to `ValidationException`
-//! (HTTP 400). Passive background reconciler queries return empty `Ok` results
-//! so `extenddb serve` runs cleanly without spurious background errors.
+//! the data plane, so `CreateBackup` (and `open_table_snapshot`) are refused
+//! with [`StorageError::Unsupported`]. All read/query/delete/restore lookups
+//! (`ListBackups`, `DescribeBackup`, `DeleteBackup`, `RestoreTableFromBackup`)
+//! answer as for a catalog with no backups: `ListBackups` returns an empty
+//! list, and `DescribeBackup`, `DeleteBackup`, and `RestoreTableFromBackup`
+//! return `BackupNotFoundException`.
 
 use std::time::Duration;
 
@@ -22,7 +22,7 @@ use extenddb_storage::backup_catalog::{
     ForgetRow, JobClaim, JobPermit, JobStatus, LegacyBackupItems, LegacyBackupKey,
     LegacyBackupReader, MaintenanceClaim, Replaced, RestoreJobRow, RestoreRegistered,
     RestoreRegistrationRow, RestoreTargetKey, StaleClock, StoreIdentity, StoreKind, StoreRootCount,
-    TimeBounds,
+    TimeBounds, backup_not_found,
 };
 use extenddb_storage::backup_definition::{BackupRestoreSource, RestoreRequest};
 use extenddb_storage::error::StorageError;
@@ -33,19 +33,22 @@ use futures::stream::{self, BoxStream};
 
 use crate::BigtableEngine;
 use crate::catalog::keys;
-use crate::data::client::map_catalog_err;
 
-/// Canonical message returned for unsupported backup/snapshot/restore calls on Bigtable.
-pub const BACKUP_UNSUPPORTED_REASON: &str = "backups, snapshots, and table restores are not \
-    supported on the Bigtable storage backend: Cloud Bigtable has no cross-table point-in-time \
-    data-plane read; use GCP-native Cloud Bigtable Backups via the Bigtable Admin API";
+/// Canonical message returned when `CreateBackup` is invoked on Bigtable.
+pub const CREATE_BACKUP_UNSUPPORTED_REASON: &str =
+    "CreateBackup is not supported by this storage backend";
 
-fn unsupported<T>() -> BoxFuture<'static, Result<T, StorageError>> {
+fn create_unsupported<T>() -> BoxFuture<'static, Result<T, StorageError>> {
     Box::pin(async {
         Err(StorageError::Unsupported(
-            BACKUP_UNSUPPORTED_REASON.to_owned(),
+            CREATE_BACKUP_UNSUPPORTED_REASON.to_owned(),
         ))
     })
+}
+
+fn missing_backup<T>(arn: &str) -> BoxFuture<'static, Result<T, StorageError>> {
+    let err = backup_not_found(arn);
+    Box::pin(async move { Err(err) })
 }
 
 impl SnapshotEngine for BigtableEngine {
@@ -54,7 +57,7 @@ impl SnapshotEngine for BigtableEngine {
         _account_id: &str,
         _table_name: &str,
     ) -> BoxFuture<'_, Result<TableSnapshot, StorageError>> {
-        unsupported()
+        create_unsupported()
     }
 }
 
@@ -66,15 +69,15 @@ impl LegacyBackupReader for BigtableEngine {
         _backup_name: &str,
         _permit: JobPermit,
     ) -> BoxFuture<'_, Result<BackupDetails, StorageError>> {
-        unsupported()
+        create_unsupported()
     }
 
     fn describe(
         &self,
         _account_id: &str,
-        _backup_arn: &str,
+        backup_arn: &str,
     ) -> BoxFuture<'_, Result<BackupDescription, StorageError>> {
-        unsupported()
+        missing_backup(backup_arn)
     }
 
     fn list(
@@ -82,32 +85,32 @@ impl LegacyBackupReader for BigtableEngine {
         _account_id: &str,
         _table_name: Option<&str>,
     ) -> BoxFuture<'_, Result<Vec<BackupSummary>, StorageError>> {
-        unsupported()
+        Box::pin(async { Ok(Vec::new()) })
     }
 
     fn delete(
         &self,
         _account_id: &str,
-        _backup_arn: &str,
+        backup_arn: &str,
     ) -> BoxFuture<'_, Result<BackupDescription, StorageError>> {
-        unsupported()
+        missing_backup(backup_arn)
     }
 
     fn restore_source(
         &self,
         _account_id: &str,
-        _backup_arn: &str,
+        backup_arn: &str,
     ) -> BoxFuture<'_, Result<BackupRestoreSource, StorageError>> {
-        unsupported()
+        missing_backup(backup_arn)
     }
 
     fn restore(
         &self,
         _account_id: &str,
-        _request: RestoreRequest,
+        request: RestoreRequest,
         _permit: JobPermit,
     ) -> BoxFuture<'_, Result<TableDescription, StorageError>> {
-        unsupported()
+        missing_backup(&request.backup_arn)
     }
 
     fn abandoned_creating_backups(
@@ -144,16 +147,16 @@ impl LegacyBackupReader for BigtableEngine {
     fn items(
         &self,
         _account_id: &str,
-        _backup_arn: &str,
+        backup_arn: &str,
     ) -> BoxFuture<'_, Result<LegacyBackupItems, StorageError>> {
-        unsupported()
+        missing_backup(backup_arn)
     }
 
     fn replace_with_index_row<'a>(
         &'a self,
-        _row: &'a BackupRow,
+        row: &'a BackupRow,
     ) -> BoxFuture<'a, Result<Replaced, StorageError>> {
-        unsupported()
+        missing_backup(&row.backup_arn)
     }
 }
 
@@ -162,7 +165,7 @@ impl BackupCatalog for BigtableEngine {
         Box::pin(async move {
             let cat = self.cat();
             let setting_key = keys::setting("catalog_id");
-            if let Some(val) = cat.get(&setting_key).await.map_err(map_catalog_err)?
+            if let Some(val) = cat.get(&setting_key).await?
                 && let Some(id) = val.get("value").and_then(serde_json::Value::as_str)
             {
                 return Ok(id.to_owned());
@@ -173,12 +176,10 @@ impl BackupCatalog for BigtableEngine {
                     &setting_key,
                     &serde_json::json!({ "key": "catalog_id", "value": fresh }),
                 )
-                .await
-                .map_err(map_catalog_err)?;
+                .await?;
             let stored = cat
                 .get(&setting_key)
-                .await
-                .map_err(map_catalog_err)?
+                .await?
                 .and_then(|v| {
                     v.get("value")
                         .and_then(serde_json::Value::as_str)
@@ -193,14 +194,14 @@ impl BackupCatalog for BigtableEngine {
         &'a self,
         _row: &'a BackupRow,
     ) -> BoxFuture<'a, Result<Box<dyn JobClaim>, StorageError>> {
-        unsupported()
+        create_unsupported()
     }
 
     fn insert_backup_row<'a>(
         &'a self,
         _row: &'a BackupRow,
     ) -> BoxFuture<'a, Result<bool, StorageError>> {
-        unsupported()
+        create_unsupported()
     }
 
     fn list_backup_rows<'a>(
@@ -233,18 +234,14 @@ impl BackupCatalog for BigtableEngine {
         _table_name: Option<&'a str>,
         _bounds: &'a TimeBounds,
     ) -> BoxStream<'a, Result<BackupRow, StorageError>> {
-        Box::pin(stream::once(async {
-            Err(StorageError::Unsupported(
-                BACKUP_UNSUPPORTED_REASON.to_owned(),
-            ))
-        }))
+        Box::pin(stream::empty())
     }
 
     fn read_backup_row<'a>(
         &'a self,
         _arn: &'a BackupArn,
     ) -> BoxFuture<'a, Result<Option<BackupRow>, StorageError>> {
-        unsupported()
+        Box::pin(async { Ok(None) })
     }
 
     fn row_holding_backup_id<'a>(
@@ -256,16 +253,16 @@ impl BackupCatalog for BigtableEngine {
 
     fn start_backup_delete<'a>(
         &'a self,
-        _key: &'a BackupKey,
+        key: &'a BackupKey,
     ) -> BoxFuture<'a, Result<DeleteStart, StorageError>> {
-        unsupported()
+        missing_backup(&key.backup_arn)
     }
 
     fn set_backup_deleted<'a>(
         &'a self,
         _key: &'a BackupKey,
     ) -> BoxFuture<'a, Result<bool, StorageError>> {
-        unsupported()
+        Box::pin(async { Ok(false) })
     }
 
     fn remove_backup_row<'a>(
@@ -274,14 +271,14 @@ impl BackupCatalog for BigtableEngine {
         _store_kind: StoreKind,
         _store_root: &'a str,
     ) -> BoxFuture<'a, Result<bool, StorageError>> {
-        unsupported()
+        Box::pin(async { Ok(false) })
     }
 
     fn forget_available_backup_row<'a>(
         &'a self,
-        _key: &'a BackupKey,
+        key: &'a BackupKey,
     ) -> BoxFuture<'a, Result<ForgetRow, StorageError>> {
-        unsupported()
+        missing_backup(&key.backup_arn)
     }
 
     fn rewrite_store<'a>(
@@ -291,7 +288,7 @@ impl BackupCatalog for BigtableEngine {
         _keys: &'a [BackupKey],
         _to: &'a StoreIdentity,
     ) -> BoxFuture<'a, Result<u64, StorageError>> {
-        unsupported()
+        Box::pin(async { Ok(0) })
     }
 
     fn remove_dead_creating_backup_row<'a>(
@@ -299,7 +296,7 @@ impl BackupCatalog for BigtableEngine {
         _key: &'a BackupKey,
         _stale_after: Duration,
     ) -> BoxFuture<'a, Result<bool, StorageError>> {
-        unsupported()
+        Box::pin(async { Ok(false) })
     }
 
     fn claim_dead_backup<'a>(
@@ -307,7 +304,7 @@ impl BackupCatalog for BigtableEngine {
         _key: &'a BackupKey,
         _stale_after: Duration,
     ) -> BoxFuture<'a, Result<Option<Box<dyn JobClaim>>, StorageError>> {
-        unsupported()
+        Box::pin(async { Ok(None) })
     }
 
     fn list_backup_rows_older_than<'a>(
@@ -324,14 +321,14 @@ impl BackupCatalog for BigtableEngine {
         &'a self,
         _key: &'a BackupKey,
     ) -> BoxFuture<'a, Result<Option<String>, StorageError>> {
-        unsupported()
+        Box::pin(async { Ok(None) })
     }
 
     fn remove_restore_target<'a>(
         &'a self,
         _key: &'a RestoreTargetKey,
     ) -> BoxFuture<'a, Result<bool, StorageError>> {
-        unsupported()
+        Box::pin(async { Ok(false) })
     }
 
     fn list_dead_restore_jobs(
@@ -352,16 +349,16 @@ impl BackupCatalog for BigtableEngine {
         _heartbeat_at: f64,
         _reason: &'a str,
     ) -> BoxFuture<'a, Result<bool, StorageError>> {
-        unsupported()
+        Box::pin(async { Ok(false) })
     }
 
     fn claim_restore<'a>(
         &'a self,
         _account_id: &'a str,
         _input: CreateTableInput,
-        _registration: &'a RestoreRegistrationRow,
+        registration: &'a RestoreRegistrationRow,
     ) -> BoxFuture<'a, Result<RestoreRegistered, StorageError>> {
-        unsupported()
+        missing_backup(&registration.backup.backup_arn)
     }
 
     fn claim_restore_dead<'a>(
@@ -370,14 +367,14 @@ impl BackupCatalog for BigtableEngine {
         _stale_after: Duration,
         _spool_host: Option<&'a str>,
     ) -> BoxFuture<'a, Result<Option<Box<dyn JobClaim>>, StorageError>> {
-        unsupported()
+        Box::pin(async { Ok(None) })
     }
 
     fn read_restore_job<'a>(
         &'a self,
         _key: &'a RestoreTargetKey,
     ) -> BoxFuture<'a, Result<Option<RestoreJobRow>, StorageError>> {
-        unsupported()
+        Box::pin(async { Ok(None) })
     }
 
     fn list_restore_jobs<'a>(
@@ -404,7 +401,7 @@ impl BackupCatalog for BigtableEngine {
         _holder: &'a str,
         _stale_after: Duration,
     ) -> BoxFuture<'a, Result<Box<dyn MaintenanceClaim>, StorageError>> {
-        unsupported()
+        create_unsupported()
     }
 
     fn check_maintenance_claim(
@@ -423,7 +420,7 @@ impl RestoreEngine for BigtableEngine {
         _file: BulkLoadFile,
         _items: BoxStream<'a, Result<Item, StorageError>>,
     ) -> BoxFuture<'a, Result<u64, StorageError>> {
-        unsupported()
+        create_unsupported()
     }
 
     fn finish_restore<'a>(
@@ -433,33 +430,39 @@ impl RestoreEngine for BigtableEngine {
         _item_count: u64,
         _size_bytes: u64,
     ) -> BoxFuture<'a, Result<Finished, StorageError>> {
-        unsupported()
+        create_unsupported()
     }
 
     fn count_restore_target<'a>(
         &'a self,
         _key: &'a RestoreTargetKey,
     ) -> BoxFuture<'a, Result<u64, StorageError>> {
-        unsupported()
+        Box::pin(async { Ok(0) })
     }
 
     fn restore_target_ready<'a>(
         &'a self,
         _key: &'a RestoreTargetKey,
     ) -> BoxFuture<'a, Result<bool, StorageError>> {
-        unsupported()
+        Box::pin(async { Ok(false) })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use extenddb_storage::backup_catalog::is_backup_not_found;
     use futures::StreamExt;
     use std::sync::Arc;
 
     #[tokio::test]
-    async fn backup_and_snapshot_stubs_return_unsupported() {
-        let config = crate::config::BigtableStorageConfig::default();
+    async fn create_backup_is_unsupported_and_lookup_ops_act_as_empty_catalog() {
+        let config = crate::config::BigtableStorageConfig {
+            project_id: "test-proj".to_owned(),
+            instance_id: "test-inst".to_owned(),
+            emulator_host: Some("127.0.0.1:8086".to_owned()),
+            ..crate::config::BigtableStorageConfig::default()
+        };
         let client = Arc::new(
             crate::data::client::BigtableClient::connect(&config)
                 .await
@@ -471,69 +474,47 @@ mod tests {
             engine.open_table_snapshot("123456789012", "tbl").await,
             Err(StorageError::Unsupported(_))
         ));
-
         assert!(matches!(
             LegacyBackupReader::create(&engine, "123456789012", "tbl", "bk", JobPermit::detached())
                 .await,
             Err(StorageError::Unsupported(_))
         ));
-        assert!(matches!(
-            LegacyBackupReader::describe(&engine, "123456789012", "arn").await,
-            Err(StorageError::Unsupported(_))
-        ));
-        assert!(matches!(
-            LegacyBackupReader::list(&engine, "123456789012", None).await,
-            Err(StorageError::Unsupported(_))
-        ));
-        assert!(matches!(
-            LegacyBackupReader::delete(&engine, "123456789012", "arn").await,
-            Err(StorageError::Unsupported(_))
-        ));
-        assert!(matches!(
-            LegacyBackupReader::restore_source(&engine, "123456789012", "arn").await,
-            Err(StorageError::Unsupported(_))
-        ));
+
+        let summaries = LegacyBackupReader::list(&engine, "123456789012", None)
+            .await
+            .expect("ListBackups succeeds with empty list");
+        assert!(summaries.is_empty());
 
         let bounds = TimeBounds::default();
         let mut rows_stream =
             BackupCatalog::list_account_backup_rows(&engine, "123456789012", None, &bounds);
-        assert!(matches!(
-            rows_stream.next().await,
-            Some(Err(StorageError::Unsupported(_)))
-        ));
+        assert!(rows_stream.next().await.is_none());
 
-        // Passive reconciler probes succeed with empty results.
+        let arn = BackupArn::parse(
+            "arn:aws:dynamodb:us-east-1:123456789012:table/tbl/backup/01700000000000-01234567",
+        )
+        .unwrap();
         assert!(
-            !engine
-                .check_maintenance_claim(Duration::from_secs(60))
+            BackupCatalog::read_backup_row(&engine, &arn)
                 .await
                 .unwrap()
+                .is_none()
         );
-        assert!(
-            engine
-                .list_dead_restore_jobs(Duration::from_secs(60))
+
+        let desc_err = LegacyBackupReader::describe(&engine, "123456789012", &arn.to_arn_string())
+            .await
+            .unwrap_err();
+        assert!(is_backup_not_found(&desc_err), "{desc_err:?}");
+
+        let del_err = LegacyBackupReader::delete(&engine, "123456789012", &arn.to_arn_string())
+            .await
+            .unwrap_err();
+        assert!(is_backup_not_found(&del_err), "{del_err:?}");
+
+        let restore_err =
+            LegacyBackupReader::restore_source(&engine, "123456789012", &arn.to_arn_string())
                 .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            engine
-                .abandoned_creating_backups(Duration::from_secs(60))
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            LegacyBackupReader::list_all(&engine)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            LegacyBackupReader::list_deleted(&engine)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+                .unwrap_err();
+        assert!(is_backup_not_found(&restore_err), "{restore_err:?}");
     }
 }

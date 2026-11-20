@@ -204,7 +204,6 @@ config = "0.14"
 zeroize = { version = "1.8", features = ["derive"] }
 
 # Bigtable
-bigtable_rs = "0.3"
 googleapis_tonic_google_bigtable_v2 = { package = "googleapis-tonic-google-bigtable-v2", version = "0.36" }
 googleapis_tonic_google_bigtable_admin_v2 = { package = "googleapis-tonic-google-bigtable-admin-v2", version = "0.44" }
 tonic = { version = "0.14", features = ["tls-native-roots"] }

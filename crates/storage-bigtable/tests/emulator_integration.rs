@@ -43,8 +43,7 @@ use extenddb_storage::{
 };
 use extenddb_storage_bigtable::data::admin::AdminClient;
 use extenddb_storage_bigtable::migrations::BigtableCatalogMigrations;
-use extenddb_storage_bigtable::transact::ensure_txn_log_table;
-use extenddb_storage_bigtable::ttl_worker::{ensure_ttl_index_table, sweep_once};
+use extenddb_storage_bigtable::ttl_worker::sweep_once;
 use extenddb_storage_bigtable::{
     BigtableBootstrapper, BigtableClient, BigtableEngine, BigtableStorageConfig,
 };
@@ -115,7 +114,6 @@ async fn resolve_reachable_emulator_host(
 
     let mut cfg = config_for_probe.clone();
     cfg.emulator_host = Some(host.clone());
-    cfg.dev_mode = true;
 
     let client = match BigtableClient::connect(&cfg).await {
         Ok(c) => Arc::new(c),
@@ -161,7 +159,6 @@ async fn setup_emulator_context() -> Option<TestContext> {
     let mut config = BigtableStorageConfig {
         project_id,
         instance_id,
-        dev_mode: true,
         ..BigtableStorageConfig::default()
     };
 
@@ -175,7 +172,7 @@ async fn setup_emulator_context() -> Option<TestContext> {
         .expect("create_catalog_db");
     bootstrapper.create_data_db().await.expect("create_data_db");
 
-    let target = Target::at(config.connection_string());
+    let target = bootstrapper.init_target();
     let lock = BigtableCatalogMigrations
         .lock(&target, Duration::from_secs(10))
         .await
@@ -198,13 +195,6 @@ async fn setup_emulator_context() -> Option<TestContext> {
         .bootstrap_admin_user(None, None)
         .await
         .expect("bootstrap_admin_user");
-
-    ensure_txn_log_table(&client)
-        .await
-        .expect("ensure_txn_log_table");
-    ensure_ttl_index_table(&client)
-        .await
-        .expect("ensure_ttl_index_table");
 
     let engine = Arc::new(BigtableEngine::new(
         client.clone(),
@@ -1584,6 +1574,22 @@ async fn test_ttl_index_operations() {
         .await
         .expect("update_ttl failed");
 
+    let enabling_desc = ctx
+        .engine
+        .describe_ttl(&ctx.account_id, &table_name)
+        .await
+        .expect("describe_ttl enabling failed");
+    assert_eq!(
+        enabling_desc.time_to_live_status,
+        TimeToLiveStatus::Enabling
+    );
+    assert_eq!(enabling_desc.attribute_name, Some("expires_at".to_string()));
+
+    ctx.engine
+        .create_ttl_index(&ctx.account_id, &table_name, "expires_at")
+        .await
+        .expect("create_ttl_index failed");
+
     let ttl_desc = ctx
         .engine
         .describe_ttl(&ctx.account_id, &table_name)
@@ -1598,10 +1604,6 @@ async fn test_ttl_index_operations() {
         .await
         .unwrap();
     let empty_maps = ExpressionMaps::default();
-
-    ensure_ttl_index_table(&ctx.client)
-        .await
-        .expect("ensure TTL table");
 
     let mut expired_item: Item = BTreeMap::new();
     expired_item.insert(
@@ -2162,15 +2164,26 @@ async fn test_fenced_single_item_streams_and_crash_recovery() {
     let mut crash_key: Item = BTreeMap::new();
     crash_key.insert("pk".to_string(), AttributeValue::S("s_crash".to_string()));
 
-    // Before sweeper runs, base table `d` does NOT yet have the item, BUT
-    // `TransactGetItems` MUST already serve it via read-through-log!
+    // Before sweeper runs, raw Bigtable family `d` does NOT yet have the item,
+    // while BOTH `GetItem` (#40) and `TransactGetItems` serve the committed
+    // post-image via read-through-log!
+    let data_table = ctx.engine.data_table_for(&key_info).await.unwrap();
+    let crash_rk = extenddb_storage_bigtable::data::encoding::row_key::encode_key(
+        &crash_key,
+        &key_info.key_schema,
+    )
+    .unwrap();
+    let raw_before_sweep = extenddb_storage_bigtable::data::item_ops::ItemOps::new(
+        ctx.engine.client_ref(),
+        &data_table,
+        60,
+    )
+    .get_row_snapshot_by_raw_key(&crash_rk)
+    .await
+    .unwrap();
     assert!(
-        ctx.engine
-            .get_item(&key_info, &crash_key)
-            .await
-            .unwrap()
-            .is_none(),
-        "raw GetItem before roll-forward sees unapplied base row"
+        raw_before_sweep.item.is_none(),
+        "raw Bigtable family d before roll-forward is still unapplied"
     );
     let tget = ctx
         .engine
@@ -2326,6 +2339,28 @@ async fn test_fenced_single_item_streams_and_crash_recovery() {
         )
         .await
         .expect("subsequent PutItem after intent rollback must succeed");
+
+    // 4. Verify `GetItem` (#40) immediately resolves a `COMMITTED` intent via
+    //    `read_row_resolving_committed_intents` without waiting for the sweeper!
+    let mut get_resolve_item: Item = BTreeMap::new();
+    get_resolve_item.insert("pk".to_string(), AttributeValue::S("s_get_resolve".into()));
+    get_resolve_item.insert("val".to_string(), AttributeValue::S("via_get_item".into()));
+    ctx.engine
+        .debug_fenced_put_commit_only(&key_info, get_resolve_item, Some(&capture))
+        .await
+        .expect("debug_fenced_put_commit_only for get_item");
+    let mut get_resolve_key: Item = BTreeMap::new();
+    get_resolve_key.insert("pk".to_string(), AttributeValue::S("s_get_resolve".into()));
+    assert_eq!(
+        ctx.engine
+            .get_item(&key_info, &get_resolve_key)
+            .await
+            .unwrap()
+            .as_ref()
+            .and_then(|i| i.get("val")),
+        Some(&AttributeValue::S("via_get_item".into())),
+        "GetItem must resolve COMMITTED coordinator intent via read_row_resolving_committed_intents (#40)"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -2368,7 +2403,10 @@ async fn test_ttl_sweeper_fenced_stream_emission_and_stale_index_guard() {
         .update_ttl(&ctx.account_id, &table_name, "expires_at", true)
         .await
         .unwrap();
-    ensure_ttl_index_table(&ctx.client).await.unwrap();
+    ctx.engine
+        .create_ttl_index(&ctx.account_id, &table_name, "expires_at")
+        .await
+        .unwrap();
 
     let key_info = ctx
         .engine
@@ -2573,7 +2611,7 @@ async fn test_catalog_iam_secrets_metrics_conformance() {
     };
 
     let unkeyed_store =
-        extenddb_storage_bigtable::BigtableCatalogStore::new(ctx.client.clone(), None, false);
+        extenddb_storage_bigtable::BigtableCatalogStore::new(ctx.client.clone(), None);
     let loaded_keys = extenddb_storage::server_components::load_secret_keys(
         &unkeyed_store,
         extenddb_storage::server_components::KeySource::CatalogKey,
@@ -2586,7 +2624,6 @@ async fn test_catalog_iam_secrets_metrics_conformance() {
     let store = extenddb_storage_bigtable::BigtableCatalogStore::new(
         ctx.client.clone(),
         loaded_keys.clone(),
-        false,
     );
 
     // 1. IAM leftovers conformance (#693, #694) across users, groups, roles, policies,
@@ -3055,7 +3092,6 @@ async fn test_split_catalog_and_data_instance_isolation() {
         project_id: format!("split-proj-{suffix}"),
         instance_id: format!("cat-inst-{suffix}"),
         data_instance_id: Some(format!("data-inst-{suffix}")),
-        dev_mode: true,
         ..BigtableStorageConfig::default()
     };
     let Some((host, _)) = resolve_reachable_emulator_host(&config).await else {
@@ -3074,7 +3110,7 @@ async fn test_split_catalog_and_data_instance_isolation() {
         .await
         .expect("split create_data_db");
 
-    let target = Target::at(config.connection_string());
+    let target = bootstrapper.init_target();
     let lock = BigtableCatalogMigrations
         .lock(&target, Duration::from_secs(10))
         .await
@@ -3107,14 +3143,20 @@ async fn test_split_catalog_and_data_instance_isolation() {
     assert!(
         data_tables_initial
             .iter()
+            .any(|t| t.ends_with("__extenddb_data_ledger__")),
+        "M0001DataBaseline must provision __extenddb_data_ledger__ on data_instance_id"
+    );
+    assert!(
+        data_tables_initial
+            .iter()
             .any(|t| t.ends_with("__extenddb_txn_log__")),
-        "create_data_db must provision __extenddb_txn_log__ on data_instance_id"
+        "M0001DataBaseline must provision __extenddb_txn_log__ on data_instance_id"
     );
     assert!(
         data_tables_initial
             .iter()
             .any(|t| t.ends_with("__extenddb_ttl_index__")),
-        "create_data_db must provision __extenddb_ttl_index__ on data_instance_id"
+        "M0001DataBaseline must provision __extenddb_ttl_index__ on data_instance_id"
     );
 
     let engine = Arc::new(BigtableEngine::new(
@@ -3653,9 +3695,11 @@ async fn test_aba_fencing_reused_token_gsi_toctou_and_cleanup_workers() {
         Some(&AttributeValue::S("v2_winner".into()))
     );
 
-    // 3. GSI Reconciler TOCTOU Repair & OCC Version Stamping:
-    //    Delete the GSI shadow row directly on `shadow_table`, run `gsi_worker::sweep_once`,
-    //    and verify the repaired shadow row carries `v2_winner` stamped at `(v2 * 1_000) as i64`.
+    // 3. GSI Build Worker (`CREATING`-only) Repair & OCC Version Stamping:
+    //    Delete the GSI shadow row directly on `shadow_table`. While `by_gpk` is
+    //    `ACTIVE`, `gsi_worker::sweep_once` skips it (#25); once marked `CREATING`,
+    //    `gsi_worker::sweep_once` repairs the shadow row stamped at `(v2 * 1_000) as i64`
+    //    and promotes `by_gpk` back to `ACTIVE`.
     ctx.client
         .data()
         .mutate_row(MutateRowRequest {
@@ -3670,6 +3714,9 @@ async fn test_aba_fencing_reused_token_gsi_toctou_and_cleanup_workers() {
         })
         .await
         .unwrap();
+    extenddb_storage_bigtable::gsi_worker::sweep_once(&ctx.engine)
+        .await
+        .expect("gsi_worker skips ACTIVE index");
     let (missing_gsi, _) = ctx
         .engine
         .query(
@@ -3683,11 +3730,26 @@ async fn test_aba_fencing_reused_token_gsi_toctou_and_cleanup_workers() {
         )
         .await
         .unwrap();
-    assert!(missing_gsi.is_empty());
+    assert!(
+        missing_gsi.is_empty(),
+        "gsi_worker must not scan ACTIVE indexes (#25)"
+    );
+
+    let cat_for_gsi =
+        extenddb_storage_bigtable::catalog::Catalog::new(ctx.engine.catalog_client_ref());
+    let tbl_rk_aba =
+        extenddb_storage_bigtable::catalog::keys::table_meta(&ctx.account_id, &table_name);
+    let mut raw_aba_tbl = cat_for_gsi.get(&tbl_rk_aba).await.unwrap().unwrap();
+    let mut raw_aba_desc: extenddb_core::types::TableDescription =
+        serde_json::from_value(raw_aba_tbl["description"].clone()).unwrap();
+    raw_aba_desc.global_secondary_indexes.as_mut().unwrap()[0].index_status =
+        "CREATING".to_string();
+    raw_aba_tbl["description"] = serde_json::to_value(&raw_aba_desc).unwrap();
+    cat_for_gsi.put(&tbl_rk_aba, &raw_aba_tbl).await.unwrap();
 
     extenddb_storage_bigtable::gsi_worker::sweep_once(&ctx.engine)
         .await
-        .expect("gsi_worker repair sweep");
+        .expect("gsi_worker repair sweep on CREATING index");
 
     let (repaired_gsi, _) = ctx
         .engine
@@ -4729,6 +4791,10 @@ async fn test_ttl_roll_forward_aba_same_second_fractional_and_millis_bounds() {
         .update_ttl(&ctx.account_id, &table_name, "ttl", true)
         .await
         .unwrap();
+    ctx.engine
+        .create_ttl_index(&ctx.account_id, &table_name, "ttl")
+        .await
+        .unwrap();
     let key_info = ctx
         .engine
         .table_key_info(&ctx.account_id, &table_name)
@@ -5748,9 +5814,16 @@ async fn test_gsi_version_guard_creating_refusal_update_table_lsi_scan_and_cas()
             .await
             .unwrap()
     );
+    let mut raw_tbl_orphan = cat.get(&tbl_rk).await.unwrap().unwrap();
+    let mut raw_desc_orphan: extenddb_core::types::TableDescription =
+        serde_json::from_value(raw_tbl_orphan["description"].clone()).unwrap();
+    raw_desc_orphan.global_secondary_indexes.as_mut().unwrap()[0].index_status =
+        "CREATING".to_string();
+    raw_tbl_orphan["description"] = serde_json::to_value(&raw_desc_orphan).unwrap();
+    cat.put(&tbl_rk, &raw_tbl_orphan).await.unwrap();
     extenddb_storage_bigtable::gsi_worker::sweep_once(&fresh_eng)
         .await
-        .expect("gsi_worker::sweep_once cleans orphaned shadow row");
+        .expect("gsi_worker::sweep_once cleans orphaned shadow row during CREATING build");
     assert!(
         !shadow_ops
             .put_shadow_versioned(&ghost_shadow_rk, &ghost_item, 1)
@@ -5843,7 +5916,7 @@ async fn test_gsi_version_guard_creating_refusal_update_table_lsi_scan_and_cas()
     );
 
     // --- Part D: Concurrent CAS `MetricsStore::insert_metrics` (20-way) & `tag_resource` (16-way) ---
-    let cat_store = Arc::new(BigtableCatalogStore::new(ctx.client.clone(), None, true));
+    let cat_store = Arc::new(BigtableCatalogStore::new(ctx.client.clone(), None));
     let bucket_ts = time::OffsetDateTime::from_unix_timestamp(1_750_000_020).unwrap();
     let mut m_handles = Vec::new();
     for _ in 0..20usize {
@@ -5939,7 +6012,7 @@ async fn test_conformance_multipart_gsi_base_sk_bounds_lsi_projection_billing_si
     // 1. SettingsStore exposes `catalog_version`, IAM access keys use `AKIAEXTENDDB`
     //    / `extenddb` prefixes, and deleting an account with tables returns the
     //    reference HasDependents message.
-    let cat_store = BigtableCatalogStore::new(ctx.client.clone(), None, true);
+    let cat_store = BigtableCatalogStore::new(ctx.client.clone(), None);
     let cat_ver = cat_store
         .get_setting("catalog_version")
         .await
@@ -5956,7 +6029,7 @@ async fn test_conformance_multipart_gsi_base_sk_bounds_lsi_projection_billing_si
         .unwrap()
         .expect("encryption_key");
     let secret_keys = Arc::new(SecretKeys::catalog_key(&enc_b64).unwrap());
-    let mgmt = BigtableCatalogStore::new(ctx.client.clone(), Some(secret_keys), true);
+    let mgmt = BigtableCatalogStore::new(ctx.client.clone(), Some(secret_keys));
     mgmt.create_account(&ctx.account_id, "conf-acct")
         .await
         .unwrap();
@@ -6548,4 +6621,1810 @@ fn test_required_flag_parsing() {
     assert!(is_required_flag_enabled(Some("1")));
     assert!(is_required_flag_enabled(Some("true")));
     assert!(is_required_flag_enabled(Some("required")));
+}
+
+// -----------------------------------------------------------------------------
+// Test 22: Exact Five-Item Base Sort-Key Range Bounds (`[a, ab, b, ba, c]`, #4)
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_exact_five_item_sort_key_bounds() {
+    let Some(ctx) = setup_emulator_context().await else {
+        eprintln!("Skipping Bigtable test: emulator unavailable");
+        return;
+    };
+
+    let table_name = unique_name("tbl_five_sk");
+    ctx.engine
+        .create_table(
+            &ctx.account_id,
+            CreateTableInput {
+                table_name: table_name.clone(),
+                key_schema: vec![
+                    KeySchemaElement {
+                        attribute_name: "pk".into(),
+                        key_type: KeyType::Hash,
+                    },
+                    KeySchemaElement {
+                        attribute_name: "sk".into(),
+                        key_type: KeyType::Range,
+                    },
+                ],
+                attribute_definitions: vec![
+                    AttributeDefinition {
+                        attribute_name: "pk".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "sk".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                ],
+                billing_mode: Some(BillingMode::PayPerRequest),
+                deletion_protection_enabled: Some(false),
+                ..CreateTableInput::default()
+            },
+        )
+        .await
+        .unwrap();
+    let key_info = ctx
+        .engine
+        .table_key_info(&ctx.account_id, &table_name)
+        .await
+        .unwrap();
+    let empty_maps = ExpressionMaps::default();
+
+    for sk in ["a", "ab", "b", "ba", "c"] {
+        ctx.engine
+            .put_item(
+                &key_info,
+                s_item(&[("pk", "p"), ("sk", sk)]),
+                false,
+                None,
+                &empty_maps,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    ctx.engine
+        .put_item(
+            &key_info,
+            s_item(&[("pk", "other_p"), ("sk", "ab")]),
+            false,
+            None,
+            &empty_maps,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let run_q = |expr: &str, forward: bool| {
+        let eng = ctx.engine.clone();
+        let ki = key_info.clone();
+        let expr = expr.to_owned();
+        async move {
+            let kc = parse_kc(&expr);
+            let mut m = ExpressionMaps::default();
+            m.values.insert("p".into(), AttributeValue::S("p".into()));
+            m.values.insert("a".into(), AttributeValue::S("a".into()));
+            m.values.insert("b".into(), AttributeValue::S("b".into()));
+            let (items, lek) = eng
+                .query(&ki, &kc, &m, forward, None, None, None)
+                .await
+                .unwrap();
+            assert!(lek.is_none());
+            items
+                .into_iter()
+                .map(|it| match it.get("sk") {
+                    Some(AttributeValue::S(s)) => s.clone(),
+                    other => panic!("expected S sk, got {other:?}"),
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+
+    assert_eq!(run_q("pk = :p AND sk = :a", true).await, vec!["a"]);
+    assert_eq!(run_q("pk = :p AND sk = :a", false).await, vec!["a"]);
+    assert_eq!(
+        run_q("pk = :p AND sk <= :b", true).await,
+        vec!["a", "ab", "b"]
+    );
+    assert_eq!(
+        run_q("pk = :p AND sk <= :b", false).await,
+        vec!["b", "ab", "a"]
+    );
+    assert_eq!(run_q("pk = :p AND sk < :b", true).await, vec!["a", "ab"]);
+    assert_eq!(run_q("pk = :p AND sk > :b", true).await, vec!["ba", "c"]);
+    assert_eq!(run_q("pk = :p AND sk > :b", false).await, vec!["c", "ba"]);
+    assert_eq!(
+        run_q("pk = :p AND sk >= :b", true).await,
+        vec!["b", "ba", "c"]
+    );
+    assert_eq!(
+        run_q("pk = :p AND sk BETWEEN :a AND :b", true).await,
+        vec!["a", "ab", "b"]
+    );
+    assert_eq!(
+        run_q("pk = :p AND sk BETWEEN :a AND :b", false).await,
+        vec!["b", "ab", "a"]
+    );
+    assert_eq!(
+        run_q("pk = :p AND begins_with(sk, :a)", true).await,
+        vec!["a", "ab"]
+    );
+    assert_eq!(
+        run_q("pk = :p AND begins_with(sk, :b)", true).await,
+        vec!["b", "ba"]
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Test 23: Digest-Bounded Large GSI Keys, Pre-Commit Validation & Same-Schema GSI (#5, #6)
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_gsi_large_keys_digest_and_same_key_schema_index_query() {
+    let Some(ctx) = setup_emulator_context().await else {
+        eprintln!("Skipping Bigtable test: emulator unavailable");
+        return;
+    };
+
+    // Part A (#5): 2,048-byte pk + 1,024-byte sk + 2,048-byte gsi_pk + 1,024-byte gsi_sk
+    let big_tbl = unique_name("tbl_big_gsi");
+    ctx.engine
+        .create_table(
+            &ctx.account_id,
+            CreateTableInput {
+                table_name: big_tbl.clone(),
+                key_schema: vec![
+                    KeySchemaElement {
+                        attribute_name: "pk".into(),
+                        key_type: KeyType::Hash,
+                    },
+                    KeySchemaElement {
+                        attribute_name: "sk".into(),
+                        key_type: KeyType::Range,
+                    },
+                ],
+                attribute_definitions: vec![
+                    AttributeDefinition {
+                        attribute_name: "pk".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "sk".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "gpk".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "gsk".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                ],
+                global_secondary_indexes: Some(vec![GsiInput {
+                    index_name: "BigKeyGsi".into(),
+                    key_schema: vec![
+                        KeySchemaElement {
+                            attribute_name: "gpk".into(),
+                            key_type: KeyType::Hash,
+                        },
+                        KeySchemaElement {
+                            attribute_name: "gsk".into(),
+                            key_type: KeyType::Range,
+                        },
+                    ],
+                    projection: Projection {
+                        projection_type: ProjectionType::All,
+                        non_key_attributes: None,
+                    },
+                    provisioned_throughput: None,
+                    warm_throughput: None,
+                }]),
+                billing_mode: Some(BillingMode::PayPerRequest),
+                deletion_protection_enabled: Some(false),
+                ..CreateTableInput::default()
+            },
+        )
+        .await
+        .unwrap();
+    let big_ki = ctx
+        .engine
+        .table_key_info(&ctx.account_id, &big_tbl)
+        .await
+        .unwrap();
+    let empty_maps = ExpressionMaps::default();
+
+    let pk_2048 = "p".repeat(2048);
+    let sk_1024 = "s".repeat(1024);
+    let gpk_2048 = "g".repeat(2048);
+    let gsk_1024 = "r".repeat(1024);
+    let big_item = s_item(&[
+        ("pk", &pk_2048),
+        ("sk", &sk_1024),
+        ("gpk", &gpk_2048),
+        ("gsk", &gsk_1024),
+        ("payload", "ok"),
+    ]);
+    ctx.engine
+        .put_item(&big_ki, big_item, false, None, &empty_maps, None)
+        .await
+        .expect("max-length 6,144-byte combined keys must fit in digest-bounded GSI shadow key");
+
+    let gsi_kc = parse_kc("gpk = :g AND gsk = :r");
+    let mut gsi_maps = ExpressionMaps::default();
+    gsi_maps
+        .values
+        .insert("g".into(), AttributeValue::S(gpk_2048.clone()));
+    gsi_maps
+        .values
+        .insert("r".into(), AttributeValue::S(gsk_1024.clone()));
+    let (found, _) = ctx
+        .engine
+        .query(
+            &big_ki,
+            &gsi_kc,
+            &gsi_maps,
+            true,
+            None,
+            None,
+            Some("BigKeyGsi"),
+        )
+        .await
+        .expect("query BigKeyGsi");
+    assert_eq!(found.len(), 1);
+    assert_eq!(
+        found[0].get("pk"),
+        Some(&AttributeValue::S(pk_2048.clone()))
+    );
+
+    let base_key = s_item(&[("pk", &pk_2048), ("sk", &sk_1024)]);
+    ctx.engine
+        .delete_item(&big_ki, &base_key, false, None, &empty_maps, None)
+        .await
+        .expect("delete max-length GSI item");
+    let (after_del, _) = ctx
+        .engine
+        .query(
+            &big_ki,
+            &gsi_kc,
+            &gsi_maps,
+            true,
+            None,
+            None,
+            Some("BigKeyGsi"),
+        )
+        .await
+        .unwrap();
+    assert!(after_del.is_empty());
+
+    // Pre-commit shadow key validation (#5): 4x 1,024-byte NUL-escaped RANGE keys exceed 4,096 bytes
+    // and must fail BEFORE base-table `put_cas` commits anything!
+    let multi_r_tbl = unique_name("tbl_4range_precheck");
+    ctx.engine
+        .create_table(
+            &ctx.account_id,
+            CreateTableInput {
+                table_name: multi_r_tbl.clone(),
+                key_schema: vec![KeySchemaElement {
+                    attribute_name: "pk".into(),
+                    key_type: KeyType::Hash,
+                }],
+                attribute_definitions: vec![
+                    AttributeDefinition {
+                        attribute_name: "pk".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "gh".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "r1".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "r2".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "r3".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "r4".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                ],
+                global_secondary_indexes: Some(vec![GsiInput {
+                    index_name: "FourRangeGsi".into(),
+                    key_schema: vec![
+                        KeySchemaElement {
+                            attribute_name: "gh".into(),
+                            key_type: KeyType::Hash,
+                        },
+                        KeySchemaElement {
+                            attribute_name: "r1".into(),
+                            key_type: KeyType::Range,
+                        },
+                        KeySchemaElement {
+                            attribute_name: "r2".into(),
+                            key_type: KeyType::Range,
+                        },
+                        KeySchemaElement {
+                            attribute_name: "r3".into(),
+                            key_type: KeyType::Range,
+                        },
+                        KeySchemaElement {
+                            attribute_name: "r4".into(),
+                            key_type: KeyType::Range,
+                        },
+                    ],
+                    projection: Projection {
+                        projection_type: ProjectionType::All,
+                        non_key_attributes: None,
+                    },
+                    provisioned_throughput: None,
+                    warm_throughput: None,
+                }]),
+                billing_mode: Some(BillingMode::PayPerRequest),
+                deletion_protection_enabled: Some(false),
+                ..CreateTableInput::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mr_ki = ctx
+        .engine
+        .table_key_info(&ctx.account_id, &multi_r_tbl)
+        .await
+        .unwrap();
+    let nul_1024 = "\0".repeat(1024);
+    let overlong_shadow_item = s_item(&[
+        ("pk", "must_not_store"),
+        ("gh", "h"),
+        ("r1", &nul_1024),
+        ("r2", &nul_1024),
+        ("r3", &nul_1024),
+        ("r4", &nul_1024),
+    ]);
+    let pre_err = ctx
+        .engine
+        .put_item(&mr_ki, overlong_shadow_item, false, None, &empty_maps, None)
+        .await;
+    assert!(matches!(pre_err, Err(StorageError::Validation(_))));
+    assert!(
+        ctx.engine
+            .get_item(&mr_ki, &s_item(&[("pk", "must_not_store")]))
+            .await
+            .unwrap()
+            .is_none(),
+        "shadow key validation failure must happen BEFORE base-table put_cas (#5)"
+    );
+
+    // Part B (#6): GSI whose key schema (pk S, sk N) equals the base table's key schema!
+    let mirror_tbl = unique_name("tbl_mirror_gsi");
+    ctx.engine
+        .create_table(
+            &ctx.account_id,
+            CreateTableInput {
+                table_name: mirror_tbl.clone(),
+                key_schema: vec![
+                    KeySchemaElement {
+                        attribute_name: "pk".into(),
+                        key_type: KeyType::Hash,
+                    },
+                    KeySchemaElement {
+                        attribute_name: "sk".into(),
+                        key_type: KeyType::Range,
+                    },
+                ],
+                attribute_definitions: vec![
+                    AttributeDefinition {
+                        attribute_name: "pk".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "sk".into(),
+                        attribute_type: ScalarAttributeType::N,
+                    },
+                ],
+                global_secondary_indexes: Some(vec![GsiInput {
+                    index_name: "MirrorIdx".into(),
+                    key_schema: vec![
+                        KeySchemaElement {
+                            attribute_name: "pk".into(),
+                            key_type: KeyType::Hash,
+                        },
+                        KeySchemaElement {
+                            attribute_name: "sk".into(),
+                            key_type: KeyType::Range,
+                        },
+                    ],
+                    projection: Projection {
+                        projection_type: ProjectionType::All,
+                        non_key_attributes: None,
+                    },
+                    provisioned_throughput: None,
+                    warm_throughput: None,
+                }]),
+                billing_mode: Some(BillingMode::PayPerRequest),
+                deletion_protection_enabled: Some(false),
+                ..CreateTableInput::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mirror_ki = ctx
+        .engine
+        .table_key_info(&ctx.account_id, &mirror_tbl)
+        .await
+        .unwrap();
+    for sk_n in ["5", "10"] {
+        let mut it = s_item(&[("pk", "a")]);
+        it.insert("sk".into(), AttributeValue::N(sk_n.into()));
+        ctx.engine
+            .put_item(&mirror_ki, it, false, None, &empty_maps, None)
+            .await
+            .unwrap();
+    }
+    let mirror_kc = parse_kc("pk = :p AND sk = :s");
+    let mut mirror_maps = ExpressionMaps::default();
+    mirror_maps
+        .values
+        .insert("p".into(), AttributeValue::S("a".into()));
+    mirror_maps
+        .values
+        .insert("s".into(), AttributeValue::N("5".into()));
+    let (mirror_res, _) = ctx
+        .engine
+        .query(
+            &mirror_ki,
+            &mirror_kc,
+            &mirror_maps,
+            true,
+            None,
+            None,
+            Some("MirrorIdx"),
+        )
+        .await
+        .expect("query GSI with identical key schema as base table (#6)");
+    assert_eq!(mirror_res.len(), 1);
+    assert_eq!(
+        mirror_res[0].get("sk"),
+        Some(&AttributeValue::N("5".into()))
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Test 24: TTL Pre-Enable Backfill (`ENABLING -> ENABLED`) & Preservation While Off (#8)
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_ttl_backfill_preexisting_items_and_disabled_preservation() {
+    let Some(ctx) = setup_emulator_context().await else {
+        eprintln!("Skipping Bigtable test: emulator unavailable");
+        return;
+    };
+
+    let table_name = unique_name("tbl_ttl_backfill");
+    ctx.engine
+        .create_table(
+            &ctx.account_id,
+            CreateTableInput {
+                table_name: table_name.clone(),
+                key_schema: vec![KeySchemaElement {
+                    attribute_name: "pk".into(),
+                    key_type: KeyType::Hash,
+                }],
+                attribute_definitions: vec![AttributeDefinition {
+                    attribute_name: "pk".into(),
+                    attribute_type: ScalarAttributeType::S,
+                }],
+                billing_mode: Some(BillingMode::PayPerRequest),
+                deletion_protection_enabled: Some(false),
+                ..CreateTableInput::default()
+            },
+        )
+        .await
+        .unwrap();
+    let key_info = ctx
+        .engine
+        .table_key_info(&ctx.account_id, &table_name)
+        .await
+        .unwrap();
+    let empty_maps = ExpressionMaps::default();
+
+    // 1. Write expired & future items BEFORE UpdateTimeToLive(Enabled=true)!
+    let mut pre_exp = s_item(&[("pk", "written_before_ttl_enable")]);
+    pre_exp.insert("exp".into(), AttributeValue::N("1000".into()));
+    ctx.engine
+        .put_item(&key_info, pre_exp, false, None, &empty_maps, None)
+        .await
+        .unwrap();
+    let mut pre_live = s_item(&[("pk", "future_before_ttl_enable")]);
+    pre_live.insert("exp".into(), AttributeValue::N("9999999999".into()));
+    ctx.engine
+        .put_item(&key_info, pre_live, false, None, &empty_maps, None)
+        .await
+        .unwrap();
+
+    ctx.engine
+        .update_ttl(&ctx.account_id, &table_name, "exp", true)
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.engine
+            .describe_ttl(&ctx.account_id, &table_name)
+            .await
+            .unwrap()
+            .time_to_live_status,
+        TimeToLiveStatus::Enabling,
+        "describe_ttl must report ENABLING until backfill finishes"
+    );
+
+    ctx.engine
+        .create_ttl_index(&ctx.account_id, &table_name, "exp")
+        .await
+        .expect("backfill pre-existing TTL items");
+    assert_eq!(
+        ctx.engine
+            .describe_ttl(&ctx.account_id, &table_name)
+            .await
+            .unwrap()
+            .time_to_live_status,
+        TimeToLiveStatus::Enabled
+    );
+
+    sweep_once(&ctx.engine).await.unwrap();
+    assert!(
+        ctx.engine
+            .get_item(&key_info, &s_item(&[("pk", "written_before_ttl_enable")]))
+            .await
+            .unwrap()
+            .is_none(),
+        "item written before TTL was enabled must be indexed by create_ttl_index and deleted (#8)"
+    );
+    assert!(
+        ctx.engine
+            .get_item(&key_info, &s_item(&[("pk", "future_before_ttl_enable")]))
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // 2. Disable TTL, seed an item + due index entry while TTL is DISABLED, verify
+    //    `ttl_worker::sweep_once` does NOT delete the index entry while off, and
+    //    verify re-enabling TTL deletes the item!
+    ctx.engine
+        .update_ttl(&ctx.account_id, &table_name, "exp", false)
+        .await
+        .unwrap();
+    ctx.engine
+        .drop_ttl_index(&ctx.account_id, &table_name, "exp")
+        .await
+        .unwrap();
+
+    let mut off_exp = s_item(&[("pk", "due_while_ttl_off")]);
+    off_exp.insert("exp".into(), AttributeValue::N("1000".into()));
+    ctx.engine
+        .put_item(&key_info, off_exp, false, None, &empty_maps, None)
+        .await
+        .unwrap();
+    let enc_off = extenddb_storage_bigtable::data::encoding::row_key::encode_key(
+        &s_item(&[("pk", "due_while_ttl_off")]),
+        &key_info.key_schema,
+    )
+    .unwrap();
+    let off_ttl_rk = extenddb_storage_bigtable::data::encoding::ttl_key::encode_ttl_key(
+        &ctx.account_id,
+        &table_name,
+        &enc_off,
+        1000,
+    );
+    ctx.client
+        .data()
+        .mutate_row(MutateRowRequest {
+            table_name: ctx.client.full_table_name(
+                extenddb_storage_bigtable::data::encoding::ttl_key::TTL_INDEX_TABLE,
+            ),
+            row_key: off_ttl_rk.clone(),
+            mutations: vec![Mutation {
+                mutation: Some(mutation::Mutation::SetCell(mutation::SetCell {
+                    family_name: "d".into(),
+                    column_qualifier: Vec::new(),
+                    timestamp_micros: extenddb_storage_bigtable::data::item_ops::now_millis_micros(
+                    ),
+                    value: Vec::new(),
+                })),
+            }],
+            ..MutateRowRequest::default()
+        })
+        .await
+        .unwrap();
+
+    sweep_once(&ctx.engine).await.unwrap();
+    let preserved_rows = ctx
+        .client
+        .data()
+        .read_rows(ReadRowsRequest {
+            table_name: ctx.client.full_table_name(
+                extenddb_storage_bigtable::data::encoding::ttl_key::TTL_INDEX_TABLE,
+            ),
+            rows_limit: 1,
+            rows: Some(RowSet {
+                row_keys: vec![off_ttl_rk],
+                row_ranges: vec![],
+            }),
+            ..ReadRowsRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        preserved_rows.len(),
+        1,
+        "ttl_worker must NOT delete due index entries while TTL is DISABLED (#8)"
+    );
+
+    ctx.engine
+        .update_ttl(&ctx.account_id, &table_name, "exp", true)
+        .await
+        .unwrap();
+    // Even without calling create_ttl_index manually, ttl_worker::sweep_once resumes
+    // ENABLING backfills, promotes to ENABLED, and evicts due items!
+    sweep_once(&ctx.engine).await.unwrap();
+    assert!(
+        ctx.engine
+            .get_item(&key_info, &s_item(&[("pk", "due_while_ttl_off")]))
+            .await
+            .unwrap()
+            .is_none(),
+        "re-enabled TTL must evict item that came due while TTL was off (#8)"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Test 25: Deleted-Table Roll-Forward (#10), Post-Commit Side-Effect Replay (#7/#9),
+//          Closed-Shard Stream Guard (#12) & Version-Only Tombstone GC (#24)
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_deleted_table_roll_forward_side_effects_closed_shard_and_tombstone_gc() {
+    use extenddb_core::types::{DeleteTableInput, UpdateTableInput};
+
+    let Some(ctx) = setup_emulator_context().await else {
+        eprintln!("Skipping Bigtable test: emulator unavailable");
+        return;
+    };
+
+    let tbl_a = unique_name("tbl_rf_keep");
+    let tbl_b = unique_name("tbl_rf_drop");
+    for (name, with_gsi_stream) in [(&tbl_a, true), (&tbl_b, false)] {
+        ctx.engine
+            .create_table(
+                &ctx.account_id,
+                CreateTableInput {
+                    table_name: name.clone(),
+                    key_schema: vec![KeySchemaElement {
+                        attribute_name: "pk".into(),
+                        key_type: KeyType::Hash,
+                    }],
+                    attribute_definitions: if with_gsi_stream {
+                        vec![
+                            AttributeDefinition {
+                                attribute_name: "pk".into(),
+                                attribute_type: ScalarAttributeType::S,
+                            },
+                            AttributeDefinition {
+                                attribute_name: "gpk".into(),
+                                attribute_type: ScalarAttributeType::S,
+                            },
+                        ]
+                    } else {
+                        vec![AttributeDefinition {
+                            attribute_name: "pk".into(),
+                            attribute_type: ScalarAttributeType::S,
+                        }]
+                    },
+                    global_secondary_indexes: with_gsi_stream.then(|| {
+                        vec![GsiInput {
+                            index_name: "ByGpk".into(),
+                            key_schema: vec![KeySchemaElement {
+                                attribute_name: "gpk".into(),
+                                key_type: KeyType::Hash,
+                            }],
+                            projection: Projection {
+                                projection_type: ProjectionType::All,
+                                non_key_attributes: None,
+                            },
+                            provisioned_throughput: None,
+                            warm_throughput: None,
+                        }]
+                    }),
+                    stream_specification: with_gsi_stream.then_some(StreamSpecification {
+                        stream_enabled: true,
+                        stream_view_type: Some(StreamViewType::NewAndOldImages),
+                    }),
+                    billing_mode: Some(BillingMode::PayPerRequest),
+                    deletion_protection_enabled: Some(false),
+                    ..CreateTableInput::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let ki_a = ctx
+        .engine
+        .table_key_info(&ctx.account_id, &tbl_a)
+        .await
+        .unwrap();
+    let ki_b = ctx
+        .engine
+        .table_key_info(&ctx.account_id, &tbl_b)
+        .await
+        .unwrap();
+    let dt_a = ctx.engine.data_table_for(&ki_a).await.unwrap();
+    let dt_b = ctx.engine.data_table_for(&ki_b).await.unwrap();
+    let empty_maps = ExpressionMaps::default();
+
+    // 1. (#10): Open & commit a 2-table transaction across tbl_a and tbl_b, then
+    //    drop tbl_b BEFORE roll_forward: sweeper must succeed, materialize tbl_a,
+    //    clear tbl_a's intent, and drop the coordinator row!
+    let coord = extenddb_storage_bigtable::transact::TxnCoordinator::new(
+        ctx.engine.client_ref(),
+        Duration::from_secs(60),
+    );
+    let item_a = s_item(&[("pk", "survives_a"), ("v", "from_2pc")]);
+    let item_b = s_item(&[("pk", "dropped_b"), ("v", "gone")]);
+    let part_a = extenddb_storage_bigtable::transact::ParticipantRow {
+        data_table: dt_a.clone(),
+        row_key: extenddb_storage_bigtable::data::encoding::row_key::encode_key(
+            &item_a,
+            &ki_a.key_schema,
+        )
+        .unwrap(),
+    };
+    let part_b = extenddb_storage_bigtable::transact::ParticipantRow {
+        data_table: dt_b.clone(),
+        row_key: extenddb_storage_bigtable::data::encoding::row_key::encode_key(
+            &item_b,
+            &ki_b.key_schema,
+        )
+        .unwrap(),
+    };
+    let tid_drop = extenddb_storage_bigtable::transact::TxnCoordinator::new_txn_id();
+    let (_, st_drop) = coord
+        .open(&tid_drop, &[part_a.clone(), part_b.clone()])
+        .await
+        .unwrap();
+    assert!(coord.place_intent_once(&tid_drop, &part_a).await.unwrap());
+    assert!(coord.place_intent_once(&tid_drop, &part_b).await.unwrap());
+    let ver_drop = extenddb_storage_bigtable::data::item_ops::next_occ_version(None);
+    coord
+        .try_commit_full(
+            &tid_drop,
+            st_drop,
+            &[
+                extenddb_storage_bigtable::transact::ParticipantMutation {
+                    participant: part_a.clone(),
+                    payload: extenddb_storage_bigtable::transact::TxnOpPayload::Put {
+                        item: item_a.clone(),
+                    },
+                    expected_version: None,
+                    row_existed: false,
+                    new_version: Some(ver_drop),
+                },
+                extenddb_storage_bigtable::transact::ParticipantMutation {
+                    participant: part_b.clone(),
+                    payload: extenddb_storage_bigtable::transact::TxnOpPayload::Put {
+                        item: item_b.clone(),
+                    },
+                    expected_version: None,
+                    row_existed: false,
+                    new_version: Some(ver_drop),
+                },
+            ],
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    ctx.engine
+        .delete_table(
+            &ctx.account_id,
+            DeleteTableInput {
+                table_name: tbl_b.clone(),
+            },
+        )
+        .await
+        .expect("delete tbl_b before roll_forward");
+
+    let state_drop = coord.get_state(&tid_drop).await.unwrap().unwrap();
+    ctx.engine
+        .roll_forward(&tid_drop, &state_drop)
+        .await
+        .expect("roll_forward must treat NOT_FOUND on deleted tbl_b as completed (#10)");
+    assert!(
+        coord.get_state(&tid_drop).await.unwrap().is_none(),
+        "coordinator row must be dropped after deleted-table roll_forward"
+    );
+    assert_eq!(
+        ctx.engine
+            .get_item(&ki_a, &s_item(&[("pk", "survives_a")]))
+            .await
+            .unwrap()
+            .as_ref()
+            .and_then(|i| i.get("v")),
+        Some(&AttributeValue::S("from_2pc".into()))
+    );
+
+    // 2. (#7 & #9): Durable post-commit side-effect recovery (`write_committed_side_effects`)
+    let gsi_shadow_tbl = extenddb_storage_bigtable::gsi::shadow_table_id(&dt_a, "ByGpk");
+    let se_item = s_item(&[("pk", "se_row"), ("gpk", "se_grp")]);
+    ctx.engine
+        .put_item(&ki_a, se_item.clone(), false, None, &empty_maps, None)
+        .await
+        .unwrap();
+    let gsi_schema = vec![KeySchemaElement {
+        attribute_name: "gpk".into(),
+        key_type: KeyType::Hash,
+    }];
+    let se_shadow_rk = extenddb_storage_bigtable::gsi::shadow_row_key_for_item(
+        &se_item,
+        &gsi_schema,
+        &ki_a.key_schema,
+    )
+    .unwrap()
+    .unwrap();
+    // Simulate a failed shadow write wiped from shadow table, then enqueued via `post-*`:
+    ctx.client
+        .data()
+        .mutate_row(MutateRowRequest {
+            table_name: ctx.client.full_table_name(&gsi_shadow_tbl),
+            row_key: se_shadow_rk.clone(),
+            mutations: vec![Mutation {
+                mutation: Some(mutation::Mutation::DeleteFromRow(
+                    mutation::DeleteFromRow {},
+                )),
+            }],
+            ..MutateRowRequest::default()
+        })
+        .await
+        .unwrap();
+    let post_id = format!("post-{}", Uuid::new_v4().simple());
+    let recover_ver = extenddb_storage_bigtable::data::item_ops::next_occ_version(None) + 10;
+    coord
+        .write_committed_side_effects(
+            &post_id,
+            &[extenddb_storage_bigtable::transact::ParticipantMutation {
+                participant: extenddb_storage_bigtable::transact::ParticipantRow {
+                    data_table: gsi_shadow_tbl.clone(),
+                    row_key: se_shadow_rk,
+                },
+                payload: extenddb_storage_bigtable::transact::TxnOpPayload::Put {
+                    item: se_item.clone(),
+                },
+                expected_version: None,
+                row_existed: false,
+                new_version: Some(recover_ver),
+            }],
+            &[],
+        )
+        .await
+        .expect("write_committed_side_effects");
+    let post_state = coord.get_state(&post_id).await.unwrap().unwrap();
+    ctx.engine
+        .roll_forward(&post_id, &post_state)
+        .await
+        .expect("replay committed side-effect record");
+    assert!(coord.get_state(&post_id).await.unwrap().is_none());
+    let gsi_kc = parse_kc("gpk = :g");
+    let mut gsi_maps = ExpressionMaps::default();
+    gsi_maps
+        .values
+        .insert("g".into(), AttributeValue::S("se_grp".into()));
+    let (se_found, _) = ctx
+        .engine
+        .query(&ki_a, &gsi_kc, &gsi_maps, true, None, None, Some("ByGpk"))
+        .await
+        .unwrap();
+    assert_eq!(se_found.len(), 1);
+
+    // 3. (#12): Disabling stream closes shards and `streams::write_record` refuses
+    //    to append past `EndingSequenceNumber`!
+    let desc_a = ctx
+        .engine
+        .describe_table(
+            &ctx.account_id,
+            DescribeTableInput {
+                table_name: tbl_a.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let stream_arn_a = desc_a.latest_stream_arn.clone().unwrap();
+    let disable_in: UpdateTableInput = serde_json::from_value(serde_json::json!({
+        "TableName": tbl_a,
+        "StreamSpecification": { "StreamEnabled": false }
+    }))
+    .unwrap();
+    ctx.engine
+        .update_table(&ctx.account_id, disable_in)
+        .await
+        .unwrap();
+    let closed_sdesc = ctx
+        .engine
+        .describe_stream(
+            &ctx.account_id,
+            &DescribeStreamInput {
+                stream_arn: stream_arn_a.clone(),
+                limit: None,
+                exclusive_start_shard_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    let closed_shard_id = closed_sdesc.shards[0].shard_id.clone();
+    assert!(
+        closed_sdesc.shards[0]
+            .sequence_number_range
+            .ending_sequence_number
+            .is_some()
+    );
+    let before_closed_recs =
+        read_all_stream_records(&ctx.engine, &ctx.account_id, &stream_arn_a, &closed_sdesc).await;
+    let dummy_cap = StreamCapture {
+        view_type: StreamViewType::NewImage,
+        user_identity: None,
+        region: Arc::from("us-east-1"),
+    };
+    let late_rec = extenddb_storage_bigtable::streams::build_record(
+        Some(&StreamSpecification {
+            stream_enabled: true,
+            stream_view_type: Some(StreamViewType::NewImage),
+        }),
+        Some(&dummy_cap),
+        &ki_a.key_schema,
+        None,
+        Some(&s_item(&[("pk", "late_after_close")])),
+        extenddb_storage_bigtable::streams::UNASSIGNED_SEQUENCE_NUMBER,
+        "us-east-1",
+    )
+    .unwrap();
+    let cat = extenddb_storage_bigtable::catalog::Catalog::new(ctx.engine.catalog_client_ref());
+    let written_seq = extenddb_storage_bigtable::streams::write_record_ordered(
+        &cat,
+        &closed_shard_id,
+        &late_rec,
+        Some("late-closed-op"),
+    )
+    .await
+    .expect("closed shard write must not error");
+    assert!(
+        written_seq.is_none(),
+        "write_record_ordered must skip closed shards without writing past EndingSequenceNumber (#12)"
+    );
+    let after_closed_recs =
+        read_all_stream_records(&ctx.engine, &ctx.account_id, &stream_arn_a, &closed_sdesc).await;
+    assert_eq!(before_closed_recs.len(), after_closed_recs.len());
+
+    // 4. (#24): Version-only `m:v` tombstone row reclamation after grace window!
+    let tomb_key = s_item(&[("pk", "tomb_gc_target")]);
+    ctx.engine
+        .put_item(&ki_a, tomb_key.clone(), false, None, &empty_maps, None)
+        .await
+        .unwrap();
+    ctx.engine
+        .delete_item(&ki_a, &tomb_key, false, None, &empty_maps, None)
+        .await
+        .unwrap();
+    let enc_tomb_rk =
+        extenddb_storage_bigtable::data::encoding::row_key::encode_key(&tomb_key, &ki_a.key_schema)
+            .unwrap();
+
+    // Before grace window expires, `m:v` tombstone row remains:
+    let before_gc = ctx
+        .client
+        .data()
+        .read_rows(ReadRowsRequest {
+            table_name: ctx.client.full_table_name(&dt_a),
+            rows_limit: 1,
+            rows: Some(RowSet {
+                row_keys: vec![enc_tomb_rk.clone()],
+                row_ranges: vec![],
+            }),
+            ..ReadRowsRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        before_gc.len(),
+        1,
+        "version-only m:v tombstone must exist during grace window"
+    );
+
+    // Advance sweeper cutoff past the 5-minute grace window: physical row is reclaimed!
+    #[cfg(feature = "test-hooks")]
+    {
+        extenddb_storage_bigtable::sweeper::sweep_with_cutoff_override(
+            &ctx.engine,
+            Some(i64::MAX / 2),
+        )
+        .await
+        .expect("sweeper reclaims due version-only tombstones");
+        let after_gc = ctx
+            .client
+            .data()
+            .read_rows(ReadRowsRequest {
+                table_name: ctx.client.full_table_name(&dt_a),
+                rows_limit: 1,
+                rows: Some(RowSet {
+                    row_keys: vec![enc_tomb_rk],
+                    row_ranges: vec![],
+                }),
+                ..ReadRowsRequest::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            after_gc.is_empty(),
+            "sweeper must reclaim version-only m:v row after grace window (#24)"
+        );
+        // Live row (`survives_a`) must remain completely intact!
+        assert!(
+            ctx.engine
+                .get_item(&ki_a, &s_item(&[("pk", "survives_a")]))
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Test 26: Foreign-Table Safe `drop_databases` (#14, #22), Migration Lock +
+//          `ServingRegistration` Fencing (#17, #18), Backup Refusal (#31) &
+//          Redacted Fail-Closed Auth (#32)
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_drop_databases_foreign_safety_migrations_fencing_backup_and_auth_redaction() {
+    use extenddb_auth::CredentialStore;
+    use extenddb_core::backup_format::BackupArn;
+    use extenddb_core::types::LsiInput;
+    use extenddb_storage::SnapshotEngine;
+    use extenddb_storage::backup_catalog::{BackupCatalog, BackupKey};
+    use extenddb_storage::hooks::ServingRegistrar;
+    use extenddb_storage::management_store::{ManagementStore, SettingsStore};
+    use extenddb_storage::migrations::MigrationError;
+    use extenddb_storage::secret_keys::{CATALOG_KEY_SETTING, SecretKeys};
+    use extenddb_storage_bigtable::migrations::Timing;
+
+    let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
+    let mut cfg = BigtableStorageConfig {
+        project_id: format!("iso-proj-{suffix}"),
+        instance_id: format!("iso-inst-{suffix}"),
+        ..BigtableStorageConfig::default()
+    };
+    let Some((host, client)) = resolve_reachable_emulator_host(&cfg).await else {
+        eprintln!("Skipping Bigtable test: emulator unavailable");
+        return;
+    };
+    cfg.emulator_host = Some(host);
+
+    // 1. (#17 & #18): Uninitialized catalog refused at `register_and_check` and
+    //    `Target::at`; `init_target` + `lock` writes `lock:catalog_migrations` on fresh
+    //    catalog; `ServingRegistration` fences concurrent `lock` until released!
+    let conn_str = cfg.connection_string();
+    let uninit_check = extenddb_storage_bigtable::migrations::register_and_check(
+        &conn_str,
+        "1.0.0",
+        Timing::PRODUCTION,
+    )
+    .await;
+    assert!(
+        uninit_check.is_err(),
+        "serve startup must refuse an uninitialized catalog (#17)"
+    );
+    let migrate_target = Target::at(conn_str.clone());
+    assert!(matches!(
+        BigtableCatalogMigrations
+            .lock(&migrate_target, Duration::from_secs(2))
+            .await,
+        Err(MigrationError::Status(CatalogStatus::Uninitialized))
+    ));
+
+    let bootstrapper = BigtableBootstrapper::new(cfg.clone());
+    let init_target = bootstrapper.init_target();
+    let lock = BigtableCatalogMigrations
+        .lock(&init_target, Duration::from_secs(5))
+        .await
+        .expect("lock fresh uninitialized catalog (#18)");
+    let second_lock = BigtableCatalogMigrations
+        .lock(&init_target, Duration::from_millis(150))
+        .await;
+    assert!(
+        matches!(second_lock, Err(MigrationError::Locked(_))),
+        "fresh catalog must hold lock:catalog_migrations row (#18)"
+    );
+    BigtableCatalogMigrations
+        .run(&lock, env!("CARGO_PKG_VERSION"), RunKind::Create)
+        .await
+        .expect("run baseline migrations");
+    BigtableCatalogMigrations.release(lock).await;
+
+    bootstrapper.bootstrap_encryption_key().await.unwrap();
+    bootstrapper.bootstrap_default_account().await.unwrap();
+    bootstrapper.bootstrap_admin_user(None, None).await.unwrap();
+
+    let serving_reg = extenddb_storage_bigtable::migrations::register_and_check(
+        &conn_str,
+        env!("CARGO_PKG_VERSION"),
+        Timing::PRODUCTION,
+    )
+    .await
+    .expect("register_and_check on current catalog (#17)");
+    let fenced_lock = BigtableCatalogMigrations
+        .lock(&migrate_target, Duration::from_millis(250))
+        .await;
+    assert!(
+        matches!(fenced_lock, Err(MigrationError::Locked(_))),
+        "migration lock must wait/fail while ServingRegistration is live (#18)"
+    );
+    ServingRegistrar::release(&serving_reg).await;
+
+    let lock_after_dereg = BigtableCatalogMigrations
+        .lock(&migrate_target, Duration::from_secs(5))
+        .await
+        .expect("migration lock succeeds once server deregisters");
+    BigtableCatalogMigrations.release(lock_after_dereg).await;
+
+    // 2. (#31 & #32): Backup refusal vs empty-catalog answers & redacted auth failure!
+    let unkeyed = extenddb_storage_bigtable::BigtableCatalogStore::new(client.clone(), None);
+    let default_acct = unkeyed
+        .get_setting("default_account_id")
+        .await
+        .unwrap()
+        .unwrap();
+    let engine = BigtableEngine::new(client.clone(), client.clone(), 60);
+    let tbl_name = unique_name("tbl_iso");
+    engine
+        .create_table(
+            &default_acct,
+            CreateTableInput {
+                table_name: tbl_name.clone(),
+                key_schema: vec![
+                    KeySchemaElement {
+                        attribute_name: "pk".into(),
+                        key_type: KeyType::Hash,
+                    },
+                    KeySchemaElement {
+                        attribute_name: "sk".into(),
+                        key_type: KeyType::Range,
+                    },
+                ],
+                attribute_definitions: vec![
+                    AttributeDefinition {
+                        attribute_name: "pk".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "sk".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "gpk".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "lsk".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                ],
+                global_secondary_indexes: Some(vec![GsiInput {
+                    index_name: "IsoGsi".into(),
+                    key_schema: vec![KeySchemaElement {
+                        attribute_name: "gpk".into(),
+                        key_type: KeyType::Hash,
+                    }],
+                    projection: Projection {
+                        projection_type: ProjectionType::All,
+                        non_key_attributes: None,
+                    },
+                    provisioned_throughput: None,
+                    warm_throughput: None,
+                }]),
+                local_secondary_indexes: Some(vec![LsiInput {
+                    index_name: "IsoLsi".into(),
+                    key_schema: vec![
+                        KeySchemaElement {
+                            attribute_name: "pk".into(),
+                            key_type: KeyType::Hash,
+                        },
+                        KeySchemaElement {
+                            attribute_name: "lsk".into(),
+                            key_type: KeyType::Range,
+                        },
+                    ],
+                    projection: Projection {
+                        projection_type: ProjectionType::All,
+                        non_key_attributes: None,
+                    },
+                }]),
+                billing_mode: Some(BillingMode::PayPerRequest),
+                deletion_protection_enabled: Some(false),
+                ..CreateTableInput::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    match engine.open_table_snapshot(&default_acct, &tbl_name).await {
+        Err(StorageError::Unsupported(msg)) => {
+            assert_eq!(msg, "CreateBackup is not supported by this storage backend");
+        }
+        other => panic!("expected CreateBackup Unsupported (#31), got {other:?}"),
+    }
+    let missing_arn = BackupArn::parse(&format!(
+        "arn:aws:dynamodb:us-east-1:{default_acct}:table/{tbl_name}/backup/01700000000000-11223344"
+    ))
+    .unwrap();
+    let del_missing = engine
+        .start_backup_delete(&BackupKey::from_arn(&missing_arn))
+        .await;
+    assert!(
+        matches!(del_missing, Err(StorageError::Validation(ref m)) if m.starts_with("Backup not found:")),
+        "DeleteBackup on Bigtable must return Backup not found (#31), got {del_missing:?}"
+    );
+
+    let key_b64 = unkeyed
+        .get_setting(CATALOG_KEY_SETTING)
+        .await
+        .unwrap()
+        .unwrap();
+    let secret_keys = Arc::new(SecretKeys::catalog_key(&key_b64).unwrap());
+    let mgmt = extenddb_storage_bigtable::BigtableCatalogStore::new(
+        client.clone(),
+        Some(secret_keys.clone()),
+    );
+    mgmt.create_user(&default_acct, "tampered_user", None)
+        .await
+        .unwrap();
+    let issued = mgmt
+        .create_access_key(&default_acct, "tampered_user")
+        .await
+        .unwrap();
+    let cat = extenddb_storage_bigtable::catalog::Catalog::new(&client);
+    let ak_row_key = extenddb_storage_bigtable::catalog::keys::access_key(&issued.access_key_id);
+    let mut ak_doc = cat.get(&ak_row_key).await.unwrap().unwrap();
+    ak_doc["secret_key_encrypted_b64"] =
+        serde_json::Value::String("dGhpcyBpcyBub3QgdmFsaWQgY2lwaGVydGV4dA==".into());
+    cat.put(&ak_row_key, &ak_doc).await.unwrap();
+
+    let cred_store =
+        extenddb_storage_bigtable::BigtableCredentialStore::new(client.clone(), Some(secret_keys));
+    let Err(auth_err) = cred_store.lookup_credential(&issued.access_key_id).await else {
+        panic!("corrupted ciphertext must fail closed (#32)");
+    };
+    assert_eq!(auth_err.to_string(), "Internal error during authentication");
+    assert!(
+        !auth_err.to_string().contains(&issued.access_key_id),
+        "auth error must not leak access_key_id (#32)"
+    );
+
+    // 3. (#14 & #22): Create a non-ExtendDB table `transactions_2024` (matching old `starts_with('t')`!)
+    //    and verify `drop_databases` leaves `transactions_2024` and its row intact while deleting
+    //    all ExtendDB system, base, GSI (`_g`), and LSI (`_l`) tables!
+    let mut admin = AdminClient::connect(&client).await.unwrap();
+    admin
+        .create_table("transactions_2024", &[("cf", None)])
+        .await
+        .expect("create foreign table transactions_2024");
+    client
+        .data()
+        .mutate_row(MutateRowRequest {
+            table_name: client.full_table_name("transactions_2024"),
+            row_key: b"foreign-row-1".to_vec(),
+            mutations: vec![Mutation {
+                mutation: Some(mutation::Mutation::SetCell(mutation::SetCell {
+                    family_name: "cf".into(),
+                    column_qualifier: b"q".to_vec(),
+                    timestamp_micros: extenddb_storage_bigtable::data::item_ops::now_millis_micros(
+                    ),
+                    value: b"precious-user-data".to_vec(),
+                })),
+            }],
+            ..MutateRowRequest::default()
+        })
+        .await
+        .unwrap();
+
+    bootstrapper
+        .drop_databases(&cfg.instance_id)
+        .await
+        .expect("drop_databases");
+
+    let remaining = admin.list_tables().await.unwrap();
+    assert_eq!(
+        remaining,
+        vec!["transactions_2024".to_string()],
+        "only foreign table transactions_2024 must remain (#14)"
+    );
+    let foreign_rows = client
+        .data()
+        .read_rows(ReadRowsRequest {
+            table_name: client.full_table_name("transactions_2024"),
+            rows_limit: 10,
+            ..ReadRowsRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        foreign_rows.len(),
+        1,
+        "foreign table data must be untouched"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Test 27: Multi-Frame >2 MiB Cell `ReadRowsAssembler` (#37) & >100k-Mutation
+//          Chunked Base + `ALL` GSI Round-Trip (#19)
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_multi_frame_large_cell_assembler_and_chunked_100k_mutation_gsi_roundtrip() {
+    let Some(ctx) = setup_emulator_context().await else {
+        eprintln!("Skipping Bigtable test: emulator unavailable");
+        return;
+    };
+
+    // 1. (#37): Write a 2.5 MiB cell + sibling cells directly on cbtemulator so
+    //    `ReadRows` splits the cell across multiple ~1 MiB `ReadRowsResponse` frames,
+    //    and verify `ReadRowsAssembler` reassembles the row byte-for-byte.
+    let tbl_name = unique_name("tbl_chunked_100k");
+    ctx.engine
+        .create_table(
+            &ctx.account_id,
+            CreateTableInput {
+                table_name: tbl_name.clone(),
+                key_schema: vec![KeySchemaElement {
+                    attribute_name: "pk".into(),
+                    key_type: KeyType::Hash,
+                }],
+                attribute_definitions: vec![
+                    AttributeDefinition {
+                        attribute_name: "pk".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "gpk".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                ],
+                global_secondary_indexes: Some(vec![GsiInput {
+                    index_name: "AllProjGsi".into(),
+                    key_schema: vec![KeySchemaElement {
+                        attribute_name: "gpk".into(),
+                        key_type: KeyType::Hash,
+                    }],
+                    projection: Projection {
+                        projection_type: ProjectionType::All,
+                        non_key_attributes: None,
+                    },
+                    provisioned_throughput: None,
+                    warm_throughput: None,
+                }]),
+                billing_mode: Some(BillingMode::PayPerRequest),
+                deletion_protection_enabled: Some(false),
+                ..CreateTableInput::default()
+            },
+        )
+        .await
+        .unwrap();
+    let ki = ctx
+        .engine
+        .table_key_info(&ctx.account_id, &tbl_name)
+        .await
+        .unwrap();
+    let data_table = ctx.engine.data_table_for(&ki).await.unwrap();
+
+    let large_payload: Vec<u8> = (0..5_500_000usize)
+        .map(|i| ((i * 31 + 7) % 251) as u8)
+        .collect();
+    let raw_rk = b"__raw_multiframe_probe__".to_vec();
+    let probe_ts = extenddb_storage_bigtable::data::item_ops::now_millis_micros();
+    ctx.client
+        .data()
+        .mutate_row(MutateRowRequest {
+            table_name: ctx.client.full_table_name(&data_table),
+            row_key: raw_rk.clone(),
+            mutations: vec![
+                Mutation {
+                    mutation: Some(mutation::Mutation::SetCell(mutation::SetCell {
+                        family_name: "d".into(),
+                        column_qualifier: b"big".to_vec(),
+                        timestamp_micros: probe_ts,
+                        value: large_payload.clone(),
+                    })),
+                },
+                Mutation {
+                    mutation: Some(mutation::Mutation::SetCell(mutation::SetCell {
+                        family_name: "m".into(),
+                        column_qualifier: b"v".to_vec(),
+                        timestamp_micros: probe_ts,
+                        value: 1u64.to_be_bytes().to_vec(),
+                    })),
+                },
+            ],
+            ..MutateRowRequest::default()
+        })
+        .await
+        .expect("write 2.5 MiB cell");
+    let assembled = ctx
+        .client
+        .data()
+        .read_rows(ReadRowsRequest {
+            table_name: ctx.client.full_table_name(&data_table),
+            rows_limit: 1,
+            rows: Some(RowSet {
+                row_keys: vec![raw_rk.clone()],
+                row_ranges: vec![],
+            }),
+            ..ReadRowsRequest::default()
+        })
+        .await
+        .expect("read multi-frame 2.5 MiB cell");
+    assert_eq!(assembled.len(), 1);
+    let big_cell = assembled[0]
+        .1
+        .iter()
+        .find(|c| c.family_name == "d" && c.qualifier == b"big")
+        .expect("assembled d:big cell");
+    assert_eq!(big_cell.value.len(), large_payload.len());
+    assert_eq!(big_cell.value, large_payload);
+    ctx.client
+        .data()
+        .mutate_row(MutateRowRequest {
+            table_name: ctx.client.full_table_name(&data_table),
+            row_key: raw_rk,
+            mutations: vec![Mutation {
+                mutation: Some(mutation::Mutation::DeleteFromRow(
+                    mutation::DeleteFromRow {},
+                )),
+            }],
+            ..MutateRowRequest::default()
+        })
+        .await
+        .unwrap();
+
+    // 2. (#19): Multi-chunk CAS + overflow `MutateRow` execution across `put_cas`,
+    //    `put_shadow_versioned`, `delete_shadow_versioned`, and 2PC `apply_fenced_mutation`
+    //    using task-local `with_max_mutations_per_rpc(200, ...)` (avoiding `cbtemulator`'s
+    //    quadratic in-memory 100k-column slice shift while exercising 4-6 RPC chunks per write;
+    //    `MAX_MUTATIONS_PER_RPC = 90_000` sizing on 165k mutations is verified in unit tests).
+    #[cfg(feature = "test-hooks")]
+    extenddb_storage_bigtable::data::item_ops::with_max_mutations_per_rpc(200, async {
+        let empty_maps = ExpressionMaps::default();
+        let mut wide_item = s_item(&[("pk", "wide_chunked"), ("gpk", "g_wide")]);
+        for i in 0..650u32 {
+            wide_item.insert(format!("a{i:04}"), AttributeValue::Bool(true));
+        }
+        ctx.engine
+            .put_item(&ki, wide_item, false, None, &empty_maps, None)
+            .await
+            .expect("multi-chunk PutItem + ALL GSI must succeed (#19)");
+
+        let fetched = ctx
+            .engine
+            .get_item(&ki, &s_item(&[("pk", "wide_chunked")]))
+            .await
+            .unwrap()
+            .expect("chunked base item");
+        assert_eq!(fetched.len(), 652);
+
+        let gsi_kc = parse_kc("gpk = :g");
+        let mut gsi_maps = ExpressionMaps::default();
+        gsi_maps
+            .values
+            .insert("g".into(), AttributeValue::S("g_wide".into()));
+        let (gsi_rows, _) = ctx
+            .engine
+            .query(
+                &ki,
+                &gsi_kc,
+                &gsi_maps,
+                true,
+                None,
+                None,
+                Some("AllProjGsi"),
+            )
+            .await
+            .expect("query multi-chunk ALL GSI shadow row");
+        assert_eq!(gsi_rows.len(), 1);
+        assert_eq!(gsi_rows[0].len(), 652);
+
+        // Overwrite replacing `a0000..a0399` with `b0000..b0399` (>1,050 shadow mutations -> 6 RPC chunks!)
+        let mut wide_item_v2 = s_item(&[("pk", "wide_chunked"), ("gpk", "g_wide")]);
+        for i in 400..650u32 {
+            wide_item_v2.insert(format!("a{i:04}"), AttributeValue::Bool(true));
+        }
+        for i in 0..400u32 {
+            wide_item_v2.insert(format!("b{i:04}"), AttributeValue::Bool(false));
+        }
+        ctx.engine
+            .transact_write_items(
+                &[TransactWriteOp::Put {
+                    key_info: &ki,
+                    item: &wide_item_v2,
+                    condition: None,
+                    maps: &empty_maps,
+                    return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+                    stream: None,
+                }],
+                None,
+            )
+            .await
+            .expect(
+                "2PC TransactWriteItems multi-chunk apply_fenced_mutation + shadow update (#19)",
+            );
+
+        let (gsi_rows_v2, _) = ctx
+            .engine
+            .query(
+                &ki,
+                &gsi_kc,
+                &gsi_maps,
+                true,
+                None,
+                None,
+                Some("AllProjGsi"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(gsi_rows_v2.len(), 1);
+        assert_eq!(gsi_rows_v2[0].len(), 652);
+        assert!(!gsi_rows_v2[0].contains_key("a0000"));
+        assert_eq!(
+            gsi_rows_v2[0].get("b0399"),
+            Some(&AttributeValue::Bool(false))
+        );
+
+        ctx.engine
+            .delete_item(
+                &ki,
+                &s_item(&[("pk", "wide_chunked")]),
+                false,
+                None,
+                &empty_maps,
+                None,
+            )
+            .await
+            .expect("multi-chunk delete_shadow_versioned (#19)");
+        assert!(
+            ctx.engine
+                .get_item(&ki, &s_item(&[("pk", "wide_chunked")]))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    })
+    .await;
+
+    ctx.engine
+        .delete_table(
+            &ctx.account_id,
+            extenddb_core::types::DeleteTableInput {
+                table_name: tbl_name,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+// -----------------------------------------------------------------------------
+// Test 28: Ordered LSI Shadow Tables (`<data_table>_l<8hex>`, #22 Option A)
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_lsi_ordered_shadow_table_lifecycle_and_queries() {
+    use extenddb_core::types::{DeleteTableInput, LsiInput};
+
+    let Some(ctx) = setup_emulator_context().await else {
+        eprintln!("Skipping Bigtable test: emulator unavailable");
+        return;
+    };
+    let empty_maps = ExpressionMaps::default();
+
+    let tbl = unique_name("tbl_lsi_shadow");
+    ctx.engine
+        .create_table(
+            &ctx.account_id,
+            CreateTableInput {
+                table_name: tbl.clone(),
+                key_schema: vec![
+                    KeySchemaElement {
+                        attribute_name: "pk".into(),
+                        key_type: KeyType::Hash,
+                    },
+                    KeySchemaElement {
+                        attribute_name: "sk".into(),
+                        key_type: KeyType::Range,
+                    },
+                ],
+                attribute_definitions: vec![
+                    AttributeDefinition {
+                        attribute_name: "pk".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "sk".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "rank".into(),
+                        attribute_type: ScalarAttributeType::N,
+                    },
+                ],
+                local_secondary_indexes: Some(vec![LsiInput {
+                    index_name: "by_rank_inc".into(),
+                    key_schema: vec![
+                        KeySchemaElement {
+                            attribute_name: "pk".into(),
+                            key_type: KeyType::Hash,
+                        },
+                        KeySchemaElement {
+                            attribute_name: "rank".into(),
+                            key_type: KeyType::Range,
+                        },
+                    ],
+                    projection: Projection {
+                        projection_type: ProjectionType::Include,
+                        non_key_attributes: Some(vec!["label".into()]),
+                    },
+                }]),
+                billing_mode: Some(BillingMode::PayPerRequest),
+                deletion_protection_enabled: Some(false),
+                ..CreateTableInput::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let ki = ctx
+        .engine
+        .table_key_info(&ctx.account_id, &tbl)
+        .await
+        .unwrap();
+    let data_table = ctx.engine.data_table_for(&ki).await.unwrap();
+    let lsi_shadow =
+        extenddb_storage_bigtable::gsi::lsi_shadow_table_id(&data_table, "by_rank_inc");
+
+    let mut admin = AdminClient::connect(&ctx.client).await.unwrap();
+    assert!(
+        admin.list_tables().await.unwrap().contains(&lsi_shadow),
+        "CreateTable must provision physical LSI shadow table {lsi_shadow}"
+    );
+
+    let mut t1 = s_item(&[
+        ("pk", "u1"),
+        ("sk", "c"),
+        ("label", "third"),
+        ("extra", "hidden"),
+    ]);
+    t1.insert("rank".into(), AttributeValue::N("30".into()));
+    let mut t2 = s_item(&[
+        ("pk", "u1"),
+        ("sk", "a"),
+        ("label", "first"),
+        ("extra", "hidden"),
+    ]);
+    t2.insert("rank".into(), AttributeValue::N("10".into()));
+    let mut t3 = s_item(&[
+        ("pk", "u1"),
+        ("sk", "b"),
+        ("label", "second"),
+        ("extra", "hidden"),
+    ]);
+    t3.insert("rank".into(), AttributeValue::N("20".into()));
+
+    ctx.engine
+        .transact_write_items(
+            &[
+                TransactWriteOp::Put {
+                    key_info: &ki,
+                    item: &t1,
+                    condition: None,
+                    maps: &empty_maps,
+                    return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+                    stream: None,
+                },
+                TransactWriteOp::Put {
+                    key_info: &ki,
+                    item: &t2,
+                    condition: None,
+                    maps: &empty_maps,
+                    return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+                    stream: None,
+                },
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+    ctx.engine
+        .put_item(&ki, t3, false, None, &empty_maps, None)
+        .await
+        .unwrap();
+
+    let mut upd_m = ExpressionMaps::default();
+    upd_m
+        .values
+        .insert("r".into(), AttributeValue::N("5".into()));
+    ctx.engine
+        .update_item(
+            &ki,
+            &s_item(&[("pk", "u1"), ("sk", "c")]),
+            &parse_upd("SET rank = :r"),
+            false,
+            false,
+            None,
+            &upd_m,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mut qm = ExpressionMaps::default();
+    qm.values.insert("p".into(), AttributeValue::S("u1".into()));
+    let kc = parse_kc("pk = :p");
+    let (fwd, _) = ctx
+        .engine
+        .query(&ki, &kc, &qm, true, None, None, Some("by_rank_inc"))
+        .await
+        .unwrap();
+    let fwd_sks: Vec<&str> = fwd
+        .iter()
+        .map(|i| match i.get("sk").unwrap() {
+            AttributeValue::S(s) => s.as_str(),
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_eq!(fwd_sks, vec!["c", "a", "b"]);
+    for item in &fwd {
+        assert!(item.contains_key("label"));
+        assert!(!item.contains_key("extra"));
+    }
+
+    let (rev, _) = ctx
+        .engine
+        .query(&ki, &kc, &qm, false, None, None, Some("by_rank_inc"))
+        .await
+        .unwrap();
+    let rev_sks: Vec<&str> = rev
+        .iter()
+        .map(|i| match i.get("sk").unwrap() {
+            AttributeValue::S(s) => s.as_str(),
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_eq!(rev_sks, vec!["b", "a", "c"]);
+
+    let mut par_seen = Vec::new();
+    for seg in 0..2i64 {
+        let (seg_items, _) = ctx
+            .engine
+            .scan(&ki, None, None, Some(seg), Some(2), Some("by_rank_inc"))
+            .await
+            .unwrap();
+        par_seen.extend(seg_items);
+    }
+    assert_eq!(par_seen.len(), 3);
+
+    ctx.engine
+        .delete_table(&ctx.account_id, DeleteTableInput { table_name: tbl })
+        .await
+        .unwrap();
+    assert!(
+        !admin.list_tables().await.unwrap().contains(&lsi_shadow),
+        "DeleteTable must drop physical LSI shadow table {lsi_shadow}"
+    );
 }

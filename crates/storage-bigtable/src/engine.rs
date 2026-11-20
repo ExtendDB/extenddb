@@ -6,19 +6,21 @@
 //! refusal stubs in `crate::backup_stubs`).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::sync::{Arc, PoisonError, Weak};
+use std::time::{Duration, Instant};
 
 use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition, UpdateAction, removes_only};
 use extenddb_core::types::{
-    AttributeValue, BillingMode, BillingModeSummary, CreateTableInput, DeleteTableInput,
-    DescribeStreamInput, DescribeTableInput, GsiDescription, IndexInfo, IndexType, Item,
-    ListTablesInput, ListTablesOutput, LsiDescription, ONLINE_INDEX_LIMIT,
-    ProvisionedThroughputDescription, ReturnValuesOnConditionCheckFailure, SseDescription,
-    StreamDescription, StreamRecord, TableDescription, TableKeyInfo, TableStatus, Tag,
-    TimeToLiveDescription, TimeToLiveStatus, UpdateTableInput,
+    AttributeValue, BillingMode, BillingModeSummary, CancellationReason, CreateTableInput,
+    DeleteTableInput, DescribeStreamInput, DescribeTableInput, GsiDescription, IndexInfo,
+    IndexType, Item, KeySchemaElement, ListTablesInput, ListTablesOutput, LsiDescription,
+    ONLINE_INDEX_LIMIT, Projection, ProvisionedThroughputDescription,
+    ReturnValuesOnConditionCheckFailure, SseDescription, StreamDescription, StreamRecord,
+    StreamViewType, TableDescription, TableKeyInfo, TableStatus, Tag, TimeToLiveDescription,
+    TimeToLiveStatus, UpdateTableInput,
 };
 use extenddb_storage::error::StorageError;
+use extenddb_storage::hooks::{CancellationToken, sleep_or_shutdown};
 use extenddb_storage::util::{
     building_refuses, effective_attribute_definitions, parse_warm_throughput_record,
     warm_throughput_record_for_create, warm_throughput_record_for_update,
@@ -30,9 +32,10 @@ use extenddb_storage::{
     TtlTableInfo, WorkerStore,
 };
 use futures::future::BoxFuture;
+use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::row_filter::Filter;
 use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::row_range::{EndKey, StartKey};
 use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::{
-    MutateRowRequest, Mutation, ReadRowsRequest, RowRange, RowSet, mutation,
+    MutateRowRequest, Mutation, ReadRowsRequest, RowFilter, RowRange, RowSet, mutation,
     mutation::{DeleteFromColumn, SetCell},
 };
 use moka::future::Cache;
@@ -42,18 +45,40 @@ use uuid::Uuid;
 
 use crate::catalog::{Catalog, CatalogJsonAction, keys};
 use crate::data::admin::AdminClient;
-use crate::data::client::{BigtableClient, map_bigtable_err, map_catalog_err};
+use crate::data::client::{BigtableClient, map_bigtable_err};
+use crate::data::encoding::ttl_key::{
+    NUM_SHARDS, TOMBSTONE_GC_QUALIFIER, TTL_INDEX_TABLE, decode_ttl_key, encode_tombstone_gc_key,
+    encode_tombstone_gc_value, encode_ttl_key,
+};
 use crate::data::item_ops::{
     CasOutcome, ItemOps, RowSnapshot, apply_update_actions_validated, check_condition,
-    next_occ_version, now_millis_micros, older_than_ts_range, parse_ttl_epoch_secs,
+    next_occ_version, now_millis, now_millis_micros, older_than_ts_range, parse_ttl_epoch_secs,
     version_to_timestamp_micros,
 };
 use crate::data::query_scan::{QueryScan, key_belongs_to_segment};
+use crate::gsi_worker::gsi_build_lock_name;
 
 const DEFAULT_REGION: &str = "us-east-1";
 const MAX_OCC_ATTEMPTS: usize = 128;
 const IDEMPOTENCY_WINDOW_SECS: i64 = 600;
 const MAX_TRANSACT_GET_ATTEMPTS: usize = 32;
+const CATALOG_GC_PAGE_SIZE: i64 = 500;
+const TTL_BACKFILL_SCAN_BATCH: i64 = 200;
+const TTL_BACKFILL_LEASE: Duration = Duration::from_secs(60);
+const GSI_BUILD_LEASE: Duration = Duration::from_secs(60);
+
+/// Metadata cache TTL kept tight (`1 s`) so online GSI builds and TTL `ENABLING`
+/// backfills only need a `1.35 s` visibility fence across nodes.
+const METADATA_CACHE_TTL: Duration = Duration::from_secs(1);
+
+/// Writers whose elapsed duration since reading `table_meta` exceeds
+/// `FAST_WRITE_BUDGET` re-check uncached `table_meta` after committing and
+/// self-repair any newly `CREATING`/`ACTIVE` GSI or `ENABLING`/`ENABLED` TTL.
+const FAST_WRITE_BUDGET: Duration = Duration::from_millis(250);
+
+/// Fence duration (`METADATA_CACHE_TTL + FAST_WRITE_BUDGET + 100 ms`) waited
+/// after publishing `CREATING` (GSI) or `ENABLING` (TTL) before scanning base rows.
+const SCHEMA_VISIBILITY_FENCE: Duration = Duration::from_millis(1_350);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IntentBlockState {
@@ -77,8 +102,9 @@ enum PendingStreamOp {
     Enable {
         table_id: String,
         label: String,
-        view: extenddb_core::types::StreamViewType,
+        view: StreamViewType,
         label_to_close_prior: Option<String>,
+        used_precreated_shards: bool,
     },
 }
 
@@ -89,22 +115,67 @@ struct BuildingGsiGuard<'a> {
 
 impl Drop for BuildingGsiGuard<'_> {
     fn drop(&mut self) {
-        let mut guard = self.set.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.set.lock().unwrap_or_else(PoisonError::into_inner);
         guard.remove(&self.key);
     }
+}
+
+/// Pre-validated shadow index mutation computed BEFORE base-row commit so a
+/// shadow key validation error can never occur after the commit point.
+#[derive(Clone)]
+struct ShadowTargetPlan {
+    shadow_table: String,
+    old_key: Option<Vec<u8>>,
+    new_entry: Option<(Vec<u8>, Item)>,
 }
 
 type SingleWriteLockKey = (String, Vec<u8>);
 type SingleWriteLockMap = HashMap<SingleWriteLockKey, Weak<tokio::sync::Mutex<()>>>;
 
-/// Maps a logical `(account_id, table_name)` pair's `table_id` UUID to its
-/// BigTable short table name (`t` + 16 hex chars).
 fn data_table_id(table_id: &str) -> String {
     format!("t{}", &table_id.replace('-', "")[..16])
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn now_unix_f64() -> f64 {
     time::OffsetDateTime::now_utc().unix_timestamp() as f64
+}
+
+fn ttl_backfill_lock_name(table_id: &str) -> String {
+    format!("ttl_backfill:{table_id}")
+}
+
+fn parse_ttl_status_and_attr(
+    row: &serde_json::Value,
+) -> (TimeToLiveStatus, Option<String>, String) {
+    let ttl = row.get("ttl").cloned().unwrap_or(serde_json::Value::Null);
+    let attr = ttl
+        .get("attribute")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let generation = ttl
+        .get("generation")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let status = match ttl.get("status").and_then(serde_json::Value::as_str) {
+        Some("ENABLING") => TimeToLiveStatus::Enabling,
+        Some("ENABLED") => TimeToLiveStatus::Enabled,
+        Some("DISABLING") => TimeToLiveStatus::Disabling,
+        Some("DISABLED") => TimeToLiveStatus::Disabled,
+        _ => {
+            if ttl
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                TimeToLiveStatus::Enabled
+            } else {
+                TimeToLiveStatus::Disabled
+            }
+        }
+    };
+    (status, attr, generation)
 }
 
 fn deserialize_table_description_row(
@@ -117,17 +188,21 @@ fn deserialize_table_description_row(
     )
     .map_err(|e| StorageError::Internal(format!("catalog deserialize: {e}")))?;
 
-    desc.warm_throughput_record =
-        parse_warm_throughput_record(row.get("warm_throughput_record").and_then(|v| v.as_str()));
+    desc.warm_throughput_record = parse_warm_throughput_record(
+        row.get("warm_throughput_record")
+            .and_then(serde_json::Value::as_str),
+    );
 
     if let (Some(gsis), Some(gsi_wt_map)) = (
         desc.global_secondary_indexes.as_mut(),
         row.get("gsi_warm_throughput_records")
-            .and_then(|v| v.as_object()),
+            .and_then(serde_json::Value::as_object),
     ) {
         for gsi in gsis.iter_mut() {
             gsi.warm_throughput_record = parse_warm_throughput_record(
-                gsi_wt_map.get(&gsi.index_name).and_then(|v| v.as_str()),
+                gsi_wt_map
+                    .get(&gsi.index_name)
+                    .and_then(serde_json::Value::as_str),
             );
         }
     }
@@ -197,11 +272,19 @@ enum SingleWriteOp<'a> {
     },
 }
 
-impl<'a> SingleWriteOp<'a> {
+impl SingleWriteOp<'_> {
     fn lookup_key(&self) -> &Item {
         match self {
             SingleWriteOp::Put { item } => item,
             SingleWriteOp::Delete { key } | SingleWriteOp::Update { key, .. } => key,
+        }
+    }
+
+    fn op_label(&self) -> &'static str {
+        match self {
+            SingleWriteOp::Put { .. } => "PutItem",
+            SingleWriteOp::Delete { .. } => "DeleteItem",
+            SingleWriteOp::Update { .. } => "UpdateItem",
         }
     }
 }
@@ -363,6 +446,7 @@ pub struct BigtableEngine {
 }
 
 impl BigtableEngine {
+    #[must_use]
     pub fn new(
         catalog_client: Arc<BigtableClient>,
         data_client: Arc<BigtableClient>,
@@ -376,6 +460,7 @@ impl BigtableEngine {
         )
     }
 
+    #[must_use]
     pub fn with_region(
         catalog_client: Arc<BigtableClient>,
         data_client: Arc<BigtableClient>,
@@ -391,6 +476,7 @@ impl BigtableEngine {
         )
     }
 
+    #[must_use]
     pub fn with_options(
         catalog_client: Arc<BigtableClient>,
         data_client: Arc<BigtableClient>,
@@ -398,9 +484,7 @@ impl BigtableEngine {
         region: String,
         max_item_size_bytes: usize,
     ) -> Self {
-        let metadata_cache = Cache::builder()
-            .time_to_live(Duration::from_secs(5))
-            .build();
+        let metadata_cache = Cache::builder().time_to_live(METADATA_CACHE_TTL).build();
         let node_id = Uuid::new_v4().to_string();
         Self {
             catalog_client,
@@ -438,7 +522,7 @@ impl BigtableEngine {
             let mut map = self
                 .single_write_locks
                 .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .unwrap_or_else(PoisonError::into_inner);
             let key = (data_table.to_owned(), row_key.to_vec());
             if let Some(existing) = map.get(&key).and_then(Weak::upgrade) {
                 existing
@@ -457,7 +541,10 @@ impl BigtableEngine {
     fn register_building_gsi(&self, table_id: &str, index_name: &str) -> BuildingGsiGuard<'_> {
         let key = (table_id.to_owned(), index_name.to_owned());
         {
-            let mut set = self.building_gsis.lock().unwrap_or_else(|e| e.into_inner());
+            let mut set = self
+                .building_gsis
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             set.insert(key.clone());
         }
         BuildingGsiGuard {
@@ -467,7 +554,10 @@ impl BigtableEngine {
     }
 
     pub(crate) fn is_gsi_building(&self, table_id: &str, index_name: &str) -> bool {
-        let set = self.building_gsis.lock().unwrap_or_else(|e| e.into_inner());
+        let set = self
+            .building_gsis
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         set.contains(&(table_id.to_owned(), index_name.to_owned()))
     }
 
@@ -492,22 +582,32 @@ impl BigtableEngine {
             .await;
     }
 
+    #[must_use]
     pub fn region(&self) -> &str {
         &self.region
     }
 
+    #[must_use]
     pub fn node_id(&self) -> &str {
         &self.node_id
     }
 
+    #[must_use]
     pub fn client_ref(&self) -> &BigtableClient {
         &self.client
     }
 
+    #[must_use]
     pub fn catalog_client_ref(&self) -> &BigtableClient {
         &self.catalog_client
     }
 
+    #[must_use]
+    pub fn catalog_client_arc(&self) -> Arc<BigtableClient> {
+        self.catalog_client.clone()
+    }
+
+    #[must_use]
     pub fn intent_timeout_secs(&self) -> u64 {
         self.intent_timeout_secs
     }
@@ -549,7 +649,7 @@ impl BigtableEngine {
 
     fn active_stream_target_from_desc(
         desc: &TableDescription,
-        view_override: Option<extenddb_core::types::StreamViewType>,
+        view_override: Option<StreamViewType>,
         key_or_item: &Item,
     ) -> Result<Option<(String, String)>, StorageError> {
         let enabled = desc
@@ -570,17 +670,13 @@ impl BigtableEngine {
             .as_ref()
             .and_then(|s| s.stream_view_type)
             .or(view_override)
-            .unwrap_or(extenddb_core::types::StreamViewType::NewAndOldImages);
+            .unwrap_or(StreamViewType::NewAndOldImages);
         let shard_idx = Self::shard_index_for_item(desc, key_or_item);
         let sid =
             extenddb_storage::stream_lineage::shard_id(&desc.table_id, label, view, shard_idx)?;
         Ok(Some((arn, sid)))
     }
 
-    /// Resolve the active stream `(arn, shard_id)` for a `DataEngine` write
-    /// carrying `capture`. When `capture` is `None` (for example during
-    /// `ImportTable` bulk imports or when streams are disabled at the caller),
-    /// returns `Ok(None)` so no stream event is emitted.
     fn active_stream_target_for_capture(
         desc: &TableDescription,
         capture: Option<&StreamCapture>,
@@ -669,8 +765,7 @@ impl BigtableEngine {
     fn transact_op_key_checks(
         op: &OwnedTxnOp,
         desc: &TableDescription,
-    ) -> Result<(), extenddb_core::types::CancellationReason> {
-        use extenddb_core::types::CancellationReason;
+    ) -> Result<(), CancellationReason> {
         use extenddb_core::validation;
 
         let idx_refs = Self::index_key_refs(desc);
@@ -723,10 +818,40 @@ impl BigtableEngine {
         }
     }
 
-    /// Look up the BigTable data-table short name for `(account, table_name)`.
+    /// Look up the Bigtable data-table short name for `(account, table_name)`.
     pub async fn data_table_for(&self, key_info: &TableKeyInfo) -> Result<String, StorageError> {
         let (dt, _, _) = self.table_full_meta_for(key_info).await?;
         Ok(dt)
+    }
+
+    async fn table_full_meta_uncached(
+        &self,
+        account_id: &str,
+        table_name: &str,
+    ) -> Result<(String, TableDescription, Option<String>), StorageError> {
+        let row = self
+            .cat()
+            .get(&keys::table_meta(account_id, table_name))
+            .await?
+            .ok_or_else(|| StorageError::TableNotFound(table_name.to_string()))?;
+        let data_table = row
+            .get("data_table")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| StorageError::Internal("missing data_table in catalog".into()))?;
+        let desc = deserialize_table_description_row(&row)?;
+
+        // Index TTL entries on writes during BOTH `ENABLING` and `ENABLED` so no
+        // item written while backfill runs can be missed.
+        let (ttl_status, ttl_attr_raw, _) = parse_ttl_status_and_attr(&row);
+        let ttl_attr = matches!(
+            ttl_status,
+            TimeToLiveStatus::Enabling | TimeToLiveStatus::Enabled
+        )
+        .then_some(ttl_attr_raw)
+        .flatten();
+
+        Ok((data_table, desc, ttl_attr))
     }
 
     async fn table_full_meta_for_raw(
@@ -739,33 +864,9 @@ impl BigtableEngine {
             return Ok(cached);
         }
 
-        let row = self
-            .cat()
-            .get(&keys::table_meta(account_id, table_name))
-            .await
-            .map_err(map_catalog_err)?
-            .ok_or_else(|| StorageError::TableNotFound(table_name.to_string()))?;
-        let data_table = row
-            .get("data_table")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-            .ok_or_else(|| StorageError::Internal("missing data_table in catalog".into()))?;
-        let desc = deserialize_table_description_row(&row)?;
-
-        let ttl = row.get("ttl").cloned().unwrap_or(serde_json::Value::Null);
-        let ttl_enabled = ttl
-            .get("enabled")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let ttl_attr = if ttl_enabled {
-            ttl.get("attribute")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned)
-        } else {
-            None
-        };
-
-        let result = (data_table, desc, ttl_attr);
+        let result = self
+            .table_full_meta_uncached(account_id, table_name)
+            .await?;
         self.metadata_cache.insert(cache_key, result.clone()).await;
         Ok(result)
     }
@@ -818,18 +919,185 @@ impl BigtableEngine {
         .await
     }
 
-    /// Roll forward any already-`COMMITTED` coordinator entries in `__extenddb_txn_log__`
-    /// that touch `data_table` (without touching `PENDING` transactions) so GSI
-    /// backfill scans see committed rows in `d:*`.
-    pub(crate) async fn roll_forward_committed_txns_for_table(
+    /// Enqueue a best-effort delayed reclamation entry (`b"tomb:"`) in
+    /// `__extenddb_ttl_index__` so `sweeper` deletes pure version-only tombstone
+    /// rows once `intent_timeout_secs` has elapsed.
+    pub(crate) async fn enqueue_tombstone_gc_best_effort(
+        &self,
+        table_short: &str,
+        raw_row_key: &[u8],
+        expected_version: u64,
+    ) {
+        let grace_ms = self.intent_timeout_secs.max(2).saturating_mul(1_000);
+        let ready_ms = now_millis().saturating_add(grace_ms);
+        let queue_key = encode_tombstone_gc_key(ready_ms, table_short, raw_row_key);
+        let queue_val = encode_tombstone_gc_value(expected_version, table_short, raw_row_key);
+        let ts_micros = version_to_timestamp_micros(expected_version.max(1));
+
+        let mut data = self.client.data();
+        let req = MutateRowRequest {
+            table_name: self.client.full_table_name(TTL_INDEX_TABLE),
+            app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+            row_key: queue_key,
+            mutations: vec![
+                Mutation {
+                    mutation: Some(mutation::Mutation::SetCell(SetCell {
+                        family_name: "d".to_string(),
+                        column_qualifier: TOMBSTONE_GC_QUALIFIER.to_vec(),
+                        timestamp_micros: ts_micros,
+                        value: queue_val,
+                    })),
+                },
+                Mutation {
+                    mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
+                        family_name: "d".to_string(),
+                        column_qualifier: TOMBSTONE_GC_QUALIFIER.to_vec(),
+                        time_range: older_than_ts_range(ts_micros),
+                    })),
+                },
+            ],
+            ..MutateRowRequest::default()
+        };
+        let _ = data.mutate_row(req).await;
+    }
+
+    /// Wait out peer metadata-cache + fast-write grace, roll forward any
+    /// `COMMITTED` transactions targeting `data_table`, and wait briefly for
+    /// pre-fence `PENDING` transactions on `data_table` to drain before scanning
+    /// base rows for online GSI build or TTL `ENABLING` backfill.
+    pub(crate) async fn await_schema_visibility_fence(
         &self,
         data_table: &str,
-    ) -> Result<(), String> {
+        token: &CancellationToken,
+    ) -> Result<(), StorageError> {
+        if !sleep_or_shutdown(token, SCHEMA_VISIBILITY_FENCE).await {
+            return Ok(());
+        }
+        let fence_micros = now_millis_micros();
+        self.roll_forward_committed_txns_for_table(data_table)
+            .await?;
+
+        let drain_deadline =
+            Instant::now() + Duration::from_secs(self.intent_timeout_secs.max(2) + 2);
+        while Instant::now() < drain_deadline && !token.is_cancelled() {
+            if !self
+                .has_pending_txns_before(data_table, fence_micros)
+                .await?
+            {
+                break;
+            }
+            if !sleep_or_shutdown(token, Duration::from_millis(50)).await {
+                break;
+            }
+            self.roll_forward_committed_txns_for_table(data_table)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn has_pending_txns_before(
+        &self,
+        data_table: &str,
+        fence_micros: i64,
+    ) -> Result<bool, StorageError> {
         let mut data = self.client.data();
         let txn_log_table = self.client.full_table_name(crate::transact::TXN_LOG_TABLE);
         let start_prefix = b"txn:".to_vec();
         let mut end_key = start_prefix.clone();
         end_key.push(0xFF);
+        let mut start_key = start_prefix;
+        let mut exclude_start = false;
+        let coord = crate::transact::TxnCoordinator::new(
+            &self.client,
+            Duration::from_secs(self.intent_timeout_secs.max(1)),
+        );
+        #[allow(clippy::cast_possible_wrap)]
+        let timeout_micros = (self.intent_timeout_secs.saturating_mul(1_000_000)) as i64;
+        let cutoff = now_millis_micros().saturating_sub(timeout_micros);
+
+        loop {
+            let range = RowRange {
+                start_key: Some(if exclude_start {
+                    StartKey::StartKeyOpen(start_key.clone())
+                } else {
+                    StartKey::StartKeyClosed(start_key.clone())
+                }),
+                end_key: Some(EndKey::EndKeyClosed(end_key.clone())),
+            };
+            let req = ReadRowsRequest {
+                table_name: txn_log_table.clone(),
+                app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+                rows_limit: 100,
+                rows: Some(RowSet {
+                    row_keys: vec![],
+                    row_ranges: vec![range],
+                }),
+                filter: Some(crate::transact::build_txn_log_latest_filter()),
+                ..ReadRowsRequest::default()
+            };
+            let resp = data
+                .read_rows(req)
+                .await
+                .map_err(|e| map_bigtable_err("ReadRows pending txns fence", e))?;
+            if resp.is_empty() {
+                break;
+            }
+            let mut last_key = None;
+            for (rk, _) in resp {
+                last_key = Some(rk.clone());
+                let Ok(s) = String::from_utf8(rk) else {
+                    continue;
+                };
+                let Some(tid) = s.strip_prefix("txn:") else {
+                    continue;
+                };
+                if let Some(st) = coord.get_state(tid).await?
+                    && st.state == "PENDING"
+                    && st.started_at.is_some_and(|sa| sa <= fence_micros)
+                    && st
+                        .participants
+                        .as_ref()
+                        .is_some_and(|ps| ps.iter().any(|p| p.data_table == data_table))
+                {
+                    if let Some(sa) = st.started_at
+                        && sa < cutoff
+                        && coord
+                            .try_abort_pending(tid, sa, sa.max(st.state_ts_micros))
+                            .await?
+                    {
+                        if let Some(parts) = &st.participants {
+                            for p in parts {
+                                let _ = coord.clear_intent(tid, p).await;
+                            }
+                        }
+                        let _ = coord.drop_matching_start(tid, sa).await;
+                        continue;
+                    }
+                    return Ok(true);
+                }
+            }
+            if let Some(k) = last_key {
+                start_key = k;
+                exclude_start = true;
+            } else {
+                break;
+            }
+        }
+        Ok(false)
+    }
+
+    /// Roll forward any already-`COMMITTED` coordinator entries in `__extenddb_txn_log__`
+    /// touching `data_table` (or its secondary-index shadow tables).
+    pub(crate) async fn roll_forward_committed_txns_for_table(
+        &self,
+        data_table: &str,
+    ) -> Result<(), StorageError> {
+        let mut data = self.client.data();
+        let txn_log_table = self.client.full_table_name(crate::transact::TXN_LOG_TABLE);
+        let start_prefix = b"txn:".to_vec();
+        let mut end_key = start_prefix.clone();
+        end_key.push(0xFF);
+        let shadow_prefix = format!("{data_table}_");
 
         let mut start_key = start_prefix;
         let mut exclude_start = false;
@@ -861,7 +1129,7 @@ impl BigtableEngine {
             let resp = data
                 .read_rows(req)
                 .await
-                .map_err(|e| format!("ReadRows committed txns for backfill: {e}"))?;
+                .map_err(|e| map_bigtable_err("ReadRows committed txns for table", e))?;
             if resp.is_empty() {
                 break;
             }
@@ -874,16 +1142,22 @@ impl BigtableEngine {
                 let Some(tid) = s.strip_prefix("txn:") else {
                     continue;
                 };
-                if let Ok(Some(st)) = coord.get_state(tid).await
+                if let Some(st) = coord.get_state(tid).await?
                     && st.state == "COMMITTED"
-                    && st
+                {
+                    let touches_part = st
                         .participants
                         .as_ref()
-                        .is_some_and(|ps| ps.iter().any(|p| p.data_table == data_table))
-                {
-                    self.roll_forward(tid, &st)
-                        .await
-                        .map_err(|e| format!("roll_forward {tid}: {e}"))?;
+                        .is_some_and(|ps| ps.iter().any(|p| p.data_table == data_table));
+                    let touches_mut = st.mutations.as_ref().is_some_and(|ms| {
+                        ms.iter().any(|m| {
+                            m.participant.data_table == data_table
+                                || m.participant.data_table.starts_with(&shadow_prefix)
+                        })
+                    });
+                    if touches_part || touches_mut {
+                        self.roll_forward(tid, &st).await?;
+                    }
                 }
             }
             if let Some(k) = last_key {
@@ -896,15 +1170,6 @@ impl BigtableEngine {
         Ok(())
     }
 
-    /// Inspect all physical `m:intent:*` markers on `(data_table, row_key)`:
-    /// - `COMMITTED` -> cooperatively roll forward immediately.
-    /// - `CLEANED` / `ABORTED` / absent -> clear stale intent cell bounded by
-    ///   observed timestamp (`clear_intent_up_to`) so newer reused-token
-    ///   incarnations are never stripped.
-    /// - `PENDING` older than `intent_timeout_secs` -> CAS `PENDING -> ABORTED`
-    ///   (`try_abort_pending`) before clearing participant intents, or
-    ///   roll forward if it concurrently committed.
-    /// - Unexpired `PENDING` -> classify as `SingleWriteInFlight` vs `MultiTxnInFlight`.
     async fn resolve_blocking_intents(
         &self,
         data_table: &str,
@@ -921,6 +1186,7 @@ impl BigtableEngine {
             &self.client,
             Duration::from_secs(self.intent_timeout_secs.max(1)),
         );
+        #[allow(clippy::cast_possible_wrap)]
         let timeout_micros = (self.intent_timeout_secs.saturating_mul(1_000_000)) as i64;
         let cutoff = now_millis_micros().saturating_sub(timeout_micros);
         let this_part = crate::transact::ParticipantRow {
@@ -1012,123 +1278,169 @@ impl BigtableEngine {
         }
     }
 
-    /// Write/refresh shadow entries for every GSI using version-guarded
-    /// `put_shadow_versioned` / `delete_shadow_versioned`.
-    async fn write_shadows_only(
-        &self,
-        key_info: &TableKeyInfo,
+    fn secondary_index_specs<'a>(
         data_table: &str,
-        gsis: &[GsiDescription],
-        new_item: &Item,
-        old_item: Option<&Item>,
-        new_version: u64,
-    ) -> Result<(), StorageError> {
-        if gsis.is_empty() {
-            return Ok(());
-        }
-        let mut futures = Vec::with_capacity(gsis.len());
-
-        for g in gsis {
-            let new_key =
-                crate::gsi::shadow_row_key_for_item(new_item, &g.key_schema, &key_info.key_schema)?;
-            let old_key = match old_item {
-                Some(o) => {
-                    crate::gsi::shadow_row_key_for_item(o, &g.key_schema, &key_info.key_schema)?
+        desc: &'a TableDescription,
+    ) -> Vec<(String, &'a [KeySchemaElement], &'a Projection)> {
+        let mut specs = Vec::new();
+        if let Some(gsis) = &desc.global_secondary_indexes {
+            for g in gsis {
+                if g.index_status != "DELETING" {
+                    specs.push((
+                        crate::gsi::shadow_table_id(data_table, &g.index_name),
+                        g.key_schema.as_slice(),
+                        &g.projection,
+                    ));
                 }
+            }
+        }
+        if let Some(lsis) = &desc.local_secondary_indexes {
+            for l in lsis {
+                specs.push((
+                    crate::gsi::lsi_shadow_table_id(data_table, &l.index_name),
+                    l.key_schema.as_slice(),
+                    &l.projection,
+                ));
+            }
+        }
+        specs
+    }
+
+    /// Pre-compute and validate all GSI and LSI shadow row keys BEFORE `put_cas`
+    /// / `delete_cas` / `try_commit_full` so a key validation error can never
+    /// follow a durable base commit.
+    fn prepare_shadow_plan(
+        base_key_schema: &[KeySchemaElement],
+        data_table: &str,
+        desc: &TableDescription,
+        old_item: Option<&Item>,
+        new_item: Option<&Item>,
+    ) -> Result<Vec<ShadowTargetPlan>, StorageError> {
+        let specs = Self::secondary_index_specs(data_table, desc);
+        if specs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut plans = Vec::with_capacity(specs.len());
+        for (shadow_table, idx_key_schema, projection) in specs {
+            let old_key = match old_item {
+                Some(o) => crate::gsi::shadow_row_key_for_item(o, idx_key_schema, base_key_schema)?,
                 None => None,
             };
-            let shadow = crate::gsi::shadow_table_id(data_table, &g.index_name);
+            let new_entry = match new_item {
+                Some(n) => crate::gsi::shadow_row_key_for_item(n, idx_key_schema, base_key_schema)?
+                    .map(|rk| {
+                        let projected = crate::gsi::project_for_shadow(
+                            n,
+                            projection,
+                            base_key_schema,
+                            idx_key_schema,
+                        );
+                        (rk, projected)
+                    }),
+                None => None,
+            };
+            if old_key.is_some() || new_entry.is_some() {
+                plans.push(ShadowTargetPlan {
+                    shadow_table,
+                    old_key,
+                    new_entry,
+                });
+            }
+        }
+        Ok(plans)
+    }
+
+    fn shadow_plans_to_participant_mutations(
+        plans: &[ShadowTargetPlan],
+        new_version: u64,
+        out: &mut Vec<crate::transact::ParticipantMutation>,
+    ) {
+        for plan in plans {
+            let new_key_ref = plan.new_entry.as_ref().map(|(rk, _)| rk);
+            if let Some(old_rk) = &plan.old_key
+                && new_key_ref != Some(old_rk)
+            {
+                out.push(crate::transact::ParticipantMutation {
+                    participant: crate::transact::ParticipantRow {
+                        data_table: plan.shadow_table.clone(),
+                        row_key: old_rk.clone(),
+                    },
+                    payload: crate::transact::TxnOpPayload::Delete,
+                    expected_version: None,
+                    row_existed: false,
+                    new_version: Some(new_version),
+                });
+            }
+            if let Some((new_rk, projected)) = &plan.new_entry {
+                out.push(crate::transact::ParticipantMutation {
+                    participant: crate::transact::ParticipantRow {
+                        data_table: plan.shadow_table.clone(),
+                        row_key: new_rk.clone(),
+                    },
+                    payload: crate::transact::TxnOpPayload::Put {
+                        item: projected.clone(),
+                    },
+                    expected_version: None,
+                    row_existed: false,
+                    new_version: Some(new_version),
+                });
+            }
+        }
+    }
+
+    /// Apply pre-computed GSI + LSI shadow updates, propagating transient/RPC
+    /// errors (while treating `TableNotFound` on a concurrently dropped GSI
+    /// shadow table as completed).
+    async fn apply_shadow_plans(
+        &self,
+        plans: &[ShadowTargetPlan],
+        new_version: u64,
+    ) -> Result<(), StorageError> {
+        if plans.is_empty() {
+            return Ok(());
+        }
+        let mut futures = Vec::with_capacity(plans.len());
+        for plan in plans {
             let client = self.client.clone();
-            let intent_timeout_secs = self.intent_timeout_secs;
-            let index_name = g.index_name.clone();
-            let table_name = key_info.table_name.clone();
-            let g_key_schema = g.key_schema.clone();
-            let g_projection = g.projection.clone();
-            let base_key_schema = key_info.key_schema.clone();
-
+            let timeout = self.intent_timeout_secs;
+            let plan = plan.clone();
             futures.push(async move {
-                let ops = ItemOps::new(&client, &shadow, intent_timeout_secs);
-
-                if let Some(old) = old_key
-                    && new_key.as_ref() != Some(&old)
-                    && let Err(e) = ops.delete_shadow_versioned(&old, new_version).await
+                let ops = ItemOps::new(&client, &plan.shadow_table, timeout);
+                let new_key_ref = plan.new_entry.as_ref().map(|(rk, _)| rk);
+                if let Some(old_rk) = &plan.old_key
+                    && new_key_ref != Some(old_rk)
                 {
-                    tracing::warn!(
-                        "shadow stale-delete to gsi {index_name} for table {table_name} failed: {e}"
-                    );
+                    match ops.delete_shadow_versioned(old_rk, new_version).await {
+                        Ok(_) => {
+                            self.enqueue_tombstone_gc_best_effort(
+                                &plan.shadow_table,
+                                old_rk,
+                                new_version,
+                            )
+                            .await;
+                        }
+                        Err(StorageError::TableNotFound(_)) => return Ok(()),
+                        Err(e) => return Err(e),
+                    }
                 }
-
-                if let Some(row_key) = new_key {
-                    let projected = crate::gsi::project_for_shadow(
-                        new_item,
-                        &g_projection,
-                        &base_key_schema,
-                        &g_key_schema,
-                    );
-                    if let Err(e) = ops
-                        .put_shadow_versioned(&row_key, &projected, new_version)
+                if let Some((new_rk, projected)) = &plan.new_entry {
+                    match ops
+                        .put_shadow_versioned(new_rk, projected, new_version)
                         .await
                     {
-                        tracing::warn!(
-                            "shadow write to gsi {index_name} for table {table_name} failed: {e}"
-                        );
+                        Ok(_) | Err(StorageError::TableNotFound(_)) => {}
+                        Err(e) => return Err(e),
                     }
                 }
                 Ok::<(), StorageError>(())
             });
         }
-
         for res in futures::future::join_all(futures).await {
             res?;
         }
         Ok(())
     }
 
-    async fn delete_shadows(
-        &self,
-        key_info: &TableKeyInfo,
-        data_table: &str,
-        gsis: &[GsiDescription],
-        item: &Item,
-        new_version: u64,
-    ) -> Result<(), StorageError> {
-        if gsis.is_empty() {
-            return Ok(());
-        }
-        let mut futures = Vec::new();
-        for g in gsis {
-            let Some(row_key) =
-                crate::gsi::shadow_row_key_for_item(item, &g.key_schema, &key_info.key_schema)?
-            else {
-                continue;
-            };
-            let shadow = crate::gsi::shadow_table_id(data_table, &g.index_name);
-            let client = self.client.clone();
-            let intent_timeout_secs = self.intent_timeout_secs;
-            let index_name = g.index_name.clone();
-            let table_name = key_info.table_name.clone();
-
-            futures.push(async move {
-                let ops = ItemOps::new(&client, &shadow, intent_timeout_secs);
-                if let Err(e) = ops.delete_shadow_versioned(&row_key, new_version).await {
-                    tracing::warn!(
-                        "shadow delete on gsi {index_name} for table {table_name} failed: {e}"
-                    );
-                }
-                Ok::<(), StorageError>(())
-            });
-        }
-
-        for res in futures::future::join_all(futures).await {
-            res?;
-        }
-        Ok(())
-    }
-
-    /// Maintain `__extenddb_ttl_index__` using OCC-derived millisecond-aligned
-    /// cell timestamps. Always restamps `new_exp` even when
-    /// `old_exp == new_exp` (e.g. `"1000" -> "1000.5"`) so a racing `ttl_worker`
-    /// `ConditionFailed` bounded cleanup cannot orphan the updated item.
     async fn maintain_ttl_index(
         &self,
         key_info: &TableKeyInfo,
@@ -1162,81 +1474,160 @@ impl BigtableEngine {
         .await
     }
 
-    fn build_gsi_participant_mutations(
+    /// Persist a `COMMITTED` side-effect recovery record into `__extenddb_txn_log__`
+    /// if post-`put_cas`/`delete_cas` shadow or TTL mutations hit an unrecovered
+    /// transient failure, so `sweeper` finishes them without returning an error
+    /// to the client after the commit point.
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_side_effect_recovery_on_failure(
+        &self,
         key_info: &TableKeyInfo,
         data_table: &str,
-        gsis: &[GsiDescription],
+        base_row_key: &[u8],
+        shadow_plans: &[ShadowTargetPlan],
+        ttl_attr: Option<&str>,
         existing: Option<&Item>,
         new_item: Option<&Item>,
         new_version: u64,
-        out: &mut Vec<crate::transact::ParticipantMutation>,
-    ) -> Result<(), StorageError> {
-        if let Some(item) = new_item {
-            for g in gsis {
-                let new_key =
-                    crate::gsi::shadow_row_key_for_item(item, &g.key_schema, &key_info.key_schema)?;
-                let old_key = match existing {
-                    Some(o) => {
-                        crate::gsi::shadow_row_key_for_item(o, &g.key_schema, &key_info.key_schema)?
-                    }
-                    None => None,
-                };
-                let shadow_table = crate::gsi::shadow_table_id(data_table, &g.index_name);
-                if let Some(old) = old_key
-                    && new_key.as_ref() != Some(&old)
-                {
-                    out.push(crate::transact::ParticipantMutation {
-                        participant: crate::transact::ParticipantRow {
-                            data_table: shadow_table.clone(),
-                            row_key: old,
-                        },
-                        payload: crate::transact::TxnOpPayload::Delete,
-                        expected_version: None,
-                        row_existed: false,
-                        new_version: Some(new_version),
-                    });
-                }
-                if let Some(row_key) = new_key {
-                    let projected = crate::gsi::project_for_shadow(
-                        item,
-                        &g.projection,
-                        &key_info.key_schema,
-                        &g.key_schema,
-                    );
-                    out.push(crate::transact::ParticipantMutation {
-                        participant: crate::transact::ParticipantRow {
-                            data_table: shadow_table,
-                            row_key,
-                        },
-                        payload: crate::transact::TxnOpPayload::Put { item: projected },
-                        expected_version: None,
-                        row_existed: false,
-                        new_version: Some(new_version),
-                    });
-                }
-            }
-        } else if let Some(prior_item) = existing {
-            for g in gsis {
-                if let Some(row_key) = crate::gsi::shadow_row_key_for_item(
-                    prior_item,
-                    &g.key_schema,
-                    &key_info.key_schema,
-                )? {
-                    let shadow_table = crate::gsi::shadow_table_id(data_table, &g.index_name);
-                    out.push(crate::transact::ParticipantMutation {
-                        participant: crate::transact::ParticipantRow {
-                            data_table: shadow_table,
-                            row_key,
-                        },
-                        payload: crate::transact::TxnOpPayload::Delete,
-                        expected_version: None,
-                        row_existed: false,
-                        new_version: Some(new_version),
-                    });
-                }
+    ) {
+        let mut side_muts = Vec::new();
+        Self::shadow_plans_to_participant_mutations(shadow_plans, new_version, &mut side_muts);
+        let mut side_ttls = Vec::new();
+        if let Some(attr) = ttl_attr {
+            let old_exp = existing.and_then(|p| get_ttl_expiry(p, attr));
+            let new_exp = new_item.and_then(|n| get_ttl_expiry(n, attr));
+            if old_exp.is_some() || new_exp.is_some() {
+                side_ttls.push(crate::transact::TxnTtlMutation {
+                    participant: crate::transact::ParticipantRow {
+                        data_table: data_table.to_owned(),
+                        row_key: base_row_key.to_vec(),
+                    },
+                    account_id: key_info.account_id.clone(),
+                    table_name: key_info.table_name.clone(),
+                    old_expiry: old_exp,
+                    new_expiry: new_exp,
+                    new_version,
+                });
             }
         }
-        Ok(())
+        if side_muts.is_empty() && side_ttls.is_empty() {
+            return;
+        }
+        let coord = crate::transact::TxnCoordinator::new(
+            &self.client,
+            Duration::from_secs(self.intent_timeout_secs.max(1)),
+        );
+        let recovery_id = format!("post-{}", Uuid::new_v4().simple());
+        if let Err(e) = coord
+            .write_committed_side_effects(&recovery_id, &side_muts, &side_ttls)
+            .await
+        {
+            tracing::error!(
+                table = %key_info.table_name,
+                error = %e,
+                "failed to enqueue post-commit side-effect recovery record"
+            );
+        }
+    }
+
+    /// Post-commit slow-write check: when a write took `>= FAST_WRITE_BUDGET`
+    /// since reading `table_meta`, refresh uncached `table_meta` and repair any
+    /// GSI (`CREATING`/`ACTIVE`) or TTL (`ENABLING`/`ENABLED`) added concurrently.
+    async fn repair_slow_write_schema_drift(
+        &self,
+        key_info: &TableKeyInfo,
+        data_table: &str,
+        base_row_key: &[u8],
+        initial_desc: &TableDescription,
+        initial_ttl_attr: Option<&str>,
+        old_item: Option<&Item>,
+    ) {
+        let account_id = key_info.account_id.as_str();
+        let table_name = key_info.table_name.as_str();
+        self.invalidate_table_cache(account_id, table_name).await;
+        let Ok((_, fresh_desc, fresh_ttl_attr)) =
+            self.table_full_meta_uncached(account_id, table_name).await
+        else {
+            return;
+        };
+        self.metadata_cache
+            .insert(
+                (account_id.to_owned(), table_name.to_owned()),
+                (
+                    data_table.to_owned(),
+                    fresh_desc.clone(),
+                    fresh_ttl_attr.clone(),
+                ),
+            )
+            .await;
+
+        let initial_gsi_names: HashSet<&str> = initial_desc
+            .global_secondary_indexes
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|g| g.index_name.as_str())
+            .collect();
+        let added_gsis: Vec<&GsiDescription> = fresh_desc
+            .global_secondary_indexes
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|g| {
+                g.index_status != "DELETING" && !initial_gsi_names.contains(g.index_name.as_str())
+            })
+            .collect();
+        let ttl_changed = fresh_ttl_attr.is_some() && fresh_ttl_attr.as_deref() != initial_ttl_attr;
+
+        if added_gsis.is_empty() && !ttl_changed {
+            return;
+        }
+
+        let Ok((live_item, live_ver)) = self
+            .read_base_row_for_worker(data_table, base_row_key)
+            .await
+        else {
+            return;
+        };
+        let ver = live_ver.unwrap_or_else(|| next_occ_version(None));
+
+        for g in added_gsis {
+            let shadow = crate::gsi::shadow_table_id(data_table, &g.index_name);
+            let ops = ItemOps::new(&self.client, &shadow, self.intent_timeout_secs);
+            if let Some(old) = old_item
+                && let Ok(Some(old_rk)) =
+                    crate::gsi::shadow_row_key_for_item(old, &g.key_schema, &fresh_desc.key_schema)
+            {
+                let _ = ops.delete_shadow_versioned(&old_rk, ver).await;
+            }
+            if let Some(ref item) = live_item
+                && let Ok(Some(new_rk)) =
+                    crate::gsi::shadow_row_key_for_item(item, &g.key_schema, &fresh_desc.key_schema)
+            {
+                let projected = crate::gsi::project_for_shadow(
+                    item,
+                    &g.projection,
+                    &fresh_desc.key_schema,
+                    &g.key_schema,
+                );
+                let _ = ops.put_shadow_versioned(&new_rk, &projected, ver).await;
+            }
+        }
+
+        if ttl_changed
+            && let (Some(attr), Some(item)) = (fresh_ttl_attr.as_deref(), live_item.as_ref())
+            && let Some(exp) = get_ttl_expiry(item, attr)
+        {
+            let _ = insert_ttl_index_entry_at(
+                &self.client,
+                account_id,
+                table_name,
+                base_row_key,
+                exp,
+                version_to_timestamp_micros(ver),
+            )
+            .await;
+        }
     }
 
     async fn check_idempotency_record(
@@ -1246,20 +1637,23 @@ impl BigtableEngine {
         fingerprint: &str,
     ) -> Result<(), StorageError> {
         let key = keys::idempotency(account_id, token);
-        let Some(prior) = self.cat().get(&key).await.map_err(map_catalog_err)? else {
+        let Some(prior) = self.cat().get(&key).await? else {
             return Ok(());
         };
         let now_secs = time::OffsetDateTime::now_utc().unix_timestamp();
         let applied_at = prior
             .get("applied_at")
-            .and_then(|v| v.as_i64())
+            .and_then(serde_json::Value::as_i64)
             .unwrap_or(0);
         if now_secs.saturating_sub(applied_at) >= IDEMPOTENCY_WINDOW_SECS {
             let _ = self
                 .cat()
-                .mutate_json_cas(&key, map_catalog_err, move |cur| {
+                .mutate_json_cas(&key, std::convert::identity, move |cur| {
                     if let Some(c) = cur {
-                        let ts = c.get("applied_at").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let ts = c
+                            .get("applied_at")
+                            .and_then(serde_json::Value::as_i64)
+                            .unwrap_or(0);
                         if now_secs.saturating_sub(ts) >= IDEMPOTENCY_WINDOW_SECS {
                             return Ok((CatalogJsonAction::Delete, ()));
                         }
@@ -1271,7 +1665,7 @@ impl BigtableEngine {
         }
         let prior_fp = prior
             .get("fingerprint")
-            .and_then(|v| v.as_str())
+            .and_then(serde_json::Value::as_str)
             .unwrap_or("");
         if prior_fp == fingerprint {
             Err(StorageError::IdempotentReplay)
@@ -1301,9 +1695,12 @@ impl BigtableEngine {
             return Ok(());
         }
         self.cat()
-            .mutate_json_cas(&key, map_catalog_err, move |existing| {
+            .mutate_json_cas(&key, std::convert::identity, move |existing| {
                 if let Some(cur) = existing {
-                    let cur_ts = cur.get("applied_at").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let cur_ts = cur
+                        .get("applied_at")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0);
                     if now_secs.saturating_sub(cur_ts) < IDEMPOTENCY_WINDOW_SECS {
                         return Ok((CatalogJsonAction::NoOp, ()));
                     }
@@ -1318,10 +1715,49 @@ impl BigtableEngine {
             .await
     }
 
-    /// Execute Phase 1 (`open`, `place_intent_once`, `get_with_version`,
-    /// condition/update evaluation, and `try_commit_full`) of a single-item write
-    /// (`PutItem` / `UpdateItem` / `DeleteItem`) through the `__extenddb_txn_log__`
-    /// coordinator fence whenever streams are enabled on the table.
+    fn compute_single_write_post_image(
+        &self,
+        key_info: &TableKeyInfo,
+        desc: &TableDescription,
+        op: &SingleWriteOp<'_>,
+        existing: Option<&Item>,
+        maps: &ExpressionMaps,
+    ) -> Result<Option<Option<Item>>, StorageError> {
+        match op {
+            SingleWriteOp::Put { item } => Ok(Some(Some(item.clone()))),
+            SingleWriteOp::Delete { .. } => {
+                if existing.is_none() {
+                    Ok(None)
+                } else {
+                    Ok(Some(None))
+                }
+            }
+            SingleWriteOp::Update { key, actions } => {
+                let base = existing.cloned().unwrap_or_else(|| (*key).clone());
+                let updated = apply_update_actions_validated(
+                    &base,
+                    actions,
+                    maps,
+                    key_info,
+                    &desc.attribute_definitions,
+                )?;
+                extenddb_core::validation::validate_update_item_size(
+                    &updated,
+                    actions,
+                    maps,
+                    self.max_item_size_bytes,
+                )
+                .map_err(|e| StorageError::Validation(e.to_string()))?;
+                Self::validate_updated_item_index_keys(desc, &updated)?;
+                if existing.is_none() && removes_only(actions) {
+                    Ok(None)
+                } else {
+                    Ok(Some(Some(updated)))
+                }
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn commit_fenced_single_item_write(
         &self,
@@ -1342,7 +1778,6 @@ impl BigtableEngine {
         ),
         StorageError,
     > {
-        let gsis = desc.global_secondary_indexes.clone().unwrap_or_default();
         let row_key =
             crate::data::encoding::row_key::encode_key(op.lookup_key(), &key_info.key_schema)?;
         let _row_guard = self.acquire_single_write_lock(data_table, &row_key).await;
@@ -1362,8 +1797,8 @@ impl BigtableEngine {
                 .open(&txn_id, std::slice::from_ref(&participant))
                 .await?;
 
-            let single_wait_deadline = std::time::Instant::now()
-                + Duration::from_secs(self.intent_timeout_secs.max(2) + 2);
+            let single_wait_deadline =
+                Instant::now() + Duration::from_secs(self.intent_timeout_secs.max(2) + 2);
             let mut multi_txn_conflicts = 0usize;
             let mut backoff = Duration::from_millis(8);
 
@@ -1381,7 +1816,7 @@ impl BigtableEngine {
                         {
                             IntentBlockState::Cleared => continue,
                             IntentBlockState::SingleWriteInFlight => {
-                                if std::time::Instant::now() >= single_wait_deadline {
+                                if Instant::now() >= single_wait_deadline {
                                     let _ = coord
                                         .try_abort_pending(
                                             &txn_id,
@@ -1415,7 +1850,9 @@ impl BigtableEngine {
                                             .to_string(),
                                     ));
                                 }
-                                let jitter = rand::random_range(0..backoff.as_millis() as u64 + 1);
+                                let jitter = rand::random_range(
+                                    0..u64::try_from(backoff.as_millis()).unwrap_or(8) + 1,
+                                );
                                 tokio::time::sleep(backoff + Duration::from_millis(jitter)).await;
                                 backoff = (backoff * 2).min(Duration::from_millis(64));
                             }
@@ -1456,52 +1893,41 @@ impl BigtableEngine {
                 return Err(e);
             }
 
-            let new_item: Option<Item> = match &op {
-                SingleWriteOp::Put { item } => Some(item.clone()),
-                SingleWriteOp::Delete { .. } => {
-                    if existing.is_none() {
-                        abort_cleanly(txn_id.clone(), participant).await;
-                        return Ok((None, None, txn_id, None));
-                    }
-                    None
+            let post_stage = match self.compute_single_write_post_image(
+                key_info,
+                desc,
+                &op,
+                existing.as_ref(),
+                maps,
+            ) {
+                Ok(Some(new_item)) => new_item,
+                Ok(None) => {
+                    abort_cleanly(txn_id.clone(), participant).await;
+                    return Ok((None, None, txn_id, None));
                 }
-                SingleWriteOp::Update { key, actions } => {
-                    let base = existing.clone().unwrap_or_else(|| (*key).clone());
-                    let updated = match apply_update_actions_validated(
-                        &base,
-                        actions,
-                        maps,
-                        key_info,
-                        &desc.attribute_definitions,
-                    )
-                    .and_then(|u| {
-                        extenddb_core::validation::validate_update_item_size(
-                            &u,
-                            actions,
-                            maps,
-                            self.max_item_size_bytes,
-                        )
-                        .map_err(|e| StorageError::Validation(e.to_string()))?;
-                        Self::validate_updated_item_index_keys(desc, &u)?;
-                        Ok(u)
-                    }) {
-                        Ok(u) => u,
-                        Err(e) => {
-                            abort_cleanly(txn_id, participant).await;
-                            return Err(e);
-                        }
-                    };
-                    if existing.is_none() && removes_only(actions) {
-                        abort_cleanly(txn_id.clone(), participant).await;
-                        return Ok((None, None, txn_id, None));
-                    }
-                    Some(updated)
+                Err(e) => {
+                    abort_cleanly(txn_id, participant).await;
+                    return Err(e);
+                }
+            };
+
+            let shadow_plans = match Self::prepare_shadow_plan(
+                &key_info.key_schema,
+                data_table,
+                desc,
+                existing.as_ref(),
+                post_stage.as_ref(),
+            ) {
+                Ok(plans) => plans,
+                Err(e) => {
+                    abort_cleanly(txn_id, participant).await;
+                    return Err(e);
                 }
             };
 
             let row_existed = existing.is_some();
             let next_version = next_occ_version(read_version);
-            let base_payload = match &new_item {
+            let base_payload = match &post_stage {
                 Some(item) => crate::transact::TxnOpPayload::Put { item: item.clone() },
                 None => crate::transact::TxnOpPayload::Delete,
             };
@@ -1513,23 +1939,18 @@ impl BigtableEngine {
                 row_existed,
                 new_version: Some(next_version),
             }];
-            if let Err(e) = Self::build_gsi_participant_mutations(
-                key_info,
-                data_table,
-                &gsis,
-                existing.as_ref(),
-                new_item.as_ref(),
+            Self::shadow_plans_to_participant_mutations(
+                &shadow_plans,
                 next_version,
                 &mut txn_mutations,
-            ) {
-                abort_cleanly(txn_id, participant).await;
-                return Err(e);
-            }
+            );
 
             let mut ttl_mutations = Vec::new();
             if let Some(attr_name) = ttl_attr {
                 let old_exp = existing.as_ref().and_then(|p| get_ttl_expiry(p, attr_name));
-                let new_exp = new_item.as_ref().and_then(|n| get_ttl_expiry(n, attr_name));
+                let new_exp = post_stage
+                    .as_ref()
+                    .and_then(|n| get_ttl_expiry(n, attr_name));
                 if old_exp.is_some() || new_exp.is_some() {
                     ttl_mutations.push(crate::transact::TxnTtlMutation {
                         participant: participant.clone(),
@@ -1543,7 +1964,7 @@ impl BigtableEngine {
             }
 
             let mut log_records: Vec<crate::transact::TxnStreamRecord> = Vec::new();
-            let representative = new_item
+            let representative = post_stage
                 .as_ref()
                 .or(existing.as_ref())
                 .unwrap_or_else(|| op.lookup_key());
@@ -1554,7 +1975,7 @@ impl BigtableEngine {
                         stream,
                         &key_info.key_schema,
                         existing.as_ref(),
-                        new_item.as_ref(),
+                        post_stage.as_ref(),
                         crate::streams::UNASSIGNED_SEQUENCE_NUMBER,
                         &self.region,
                     ) {
@@ -1611,7 +2032,7 @@ impl BigtableEngine {
                 token_meta: None,
             };
 
-            return Ok((existing, new_item, txn_id, Some(committed_state)));
+            return Ok((existing, post_stage, txn_id, Some(committed_state)));
         }
 
         Err(StorageError::TransactionConflict(
@@ -1619,35 +2040,207 @@ impl BigtableEngine {
         ))
     }
 
-    /// Execute a single-item write (`PutItem` / `UpdateItem` / `DeleteItem`)
-    /// through the `__extenddb_txn_log__` coordinator fence whenever streams
-    /// are enabled on the table.
-    #[allow(clippy::too_many_arguments)]
-    async fn execute_fenced_single_item_write(
+    /// Unified single-item write path (`PutItem`, `DeleteItem`, `UpdateItem`):
+    /// - Validates index keys & shadow keys BEFORE committing.
+    /// - Uses coordinator-fenced write when stream capture is active, or direct
+    ///   single-row OCC (`put_cas`/`delete_cas`) otherwise.
+    /// - Never surfaces post-commit side-effect errors to the client (`#9`),
+    ///   delegating any unrecovered post-`put_cas` shadow/TTL retry to
+    ///   `__extenddb_txn_log__` (`#7`).
+    /// - Performs slow-write schema-drift repair (`#13`) and enqueues row
+    ///   tombstone reclamation (`#24`).
+    async fn execute_single_item_write(
         &self,
         key_info: &TableKeyInfo,
-        data_table: &str,
-        desc: &TableDescription,
-        ttl_attr: Option<&str>,
         op: SingleWriteOp<'_>,
         condition: Option<&Expr>,
         maps: &ExpressionMaps,
         stream: Option<&StreamCapture>,
-    ) -> Result<(Option<Item>, Option<Item>, String), StorageError> {
-        let (existing, new_item, txn_id, committed_state) = self
-            .commit_fenced_single_item_write(
-                key_info, data_table, desc, ttl_attr, op, condition, maps, stream,
-            )
-            .await?;
-        if let Some(state) = committed_state {
-            self.roll_forward(&txn_id, &state).await?;
+    ) -> Result<(Option<Item>, Option<Item>), StorageError> {
+        let meta_read_at = Instant::now();
+        let (data_table, desc, ttl_attr) = self.table_full_meta_for(key_info).await?;
+
+        match &op {
+            SingleWriteOp::Put { item } => Self::validate_put_index_keys(&desc, item)?,
+            SingleWriteOp::Update { actions, .. } => {
+                Self::validate_update_index_literals(&desc, actions, maps)?;
+            }
+            SingleWriteOp::Delete { .. } => {}
         }
-        Ok((existing, new_item, txn_id))
+
+        let row_key =
+            crate::data::encoding::row_key::encode_key(op.lookup_key(), &key_info.key_schema)?;
+        let should_capture_stream =
+            Self::active_stream_target_for_capture(&desc, stream, op.lookup_key())?.is_some();
+
+        if should_capture_stream {
+            let (existing, new_item, txn_id, committed_state) = self
+                .commit_fenced_single_item_write(
+                    key_info,
+                    &data_table,
+                    &desc,
+                    ttl_attr.as_deref(),
+                    op,
+                    condition,
+                    maps,
+                    stream,
+                )
+                .await?;
+            if let Some(state) = committed_state
+                && let Err(e) = self.roll_forward(&txn_id, &state).await
+            {
+                tracing::warn!(
+                    txn_id = %txn_id,
+                    table = %key_info.table_name,
+                    error = %e,
+                    "post-commit roll_forward deferred to sweeper"
+                );
+            }
+            if meta_read_at.elapsed() >= FAST_WRITE_BUDGET {
+                self.repair_slow_write_schema_drift(
+                    key_info,
+                    &data_table,
+                    &row_key,
+                    &desc,
+                    ttl_attr.as_deref(),
+                    existing.as_ref(),
+                )
+                .await;
+            }
+            return Ok((existing, new_item));
+        }
+
+        let op_label = op.op_label();
+        let _row_guard = self.acquire_single_write_lock(&data_table, &row_key).await;
+        let ops = ItemOps::new(&self.client, &data_table, self.intent_timeout_secs);
+        let single_deadline =
+            Instant::now() + Duration::from_secs(self.intent_timeout_secs.max(2) + 2);
+        let mut multi_conflicts = 0usize;
+
+        for attempt in 0..MAX_OCC_ATTEMPTS {
+            let (has_live_intent, existing, read_version) = self
+                .read_row_resolving_committed_intents(&ops, &data_table, &row_key)
+                .await?;
+            check_condition(existing.as_ref(), condition, maps)?;
+
+            let post_stage = match self.compute_single_write_post_image(
+                key_info,
+                &desc,
+                &op,
+                existing.as_ref(),
+                maps,
+            )? {
+                Some(stage) => stage,
+                None => {
+                    if matches!(op, SingleWriteOp::Delete { .. }) && has_live_intent {
+                        // A live intent still exists on this missing row; resolve/wait
+                        // through `delete_cas` so conflicting 2PC transactions serialize.
+                        None
+                    } else {
+                        return Ok((None, None));
+                    }
+                }
+            };
+
+            // Pre-compute and validate all GSI + LSI shadow keys BEFORE `put_cas` / `delete_cas`.
+            let shadow_plans = Self::prepare_shadow_plan(
+                &key_info.key_schema,
+                &data_table,
+                &desc,
+                existing.as_ref(),
+                post_stage.as_ref(),
+            )?;
+
+            let cas_res = match &post_stage {
+                Some(new_item) => {
+                    ops.put_cas(key_info, new_item, read_version, existing.is_some())
+                        .await?
+                }
+                None => {
+                    ops.delete_cas(key_info, op.lookup_key(), read_version, existing.is_some())
+                        .await?
+                }
+            };
+
+            match cas_res {
+                CasOutcome::Applied(new_version) => {
+                    // Commit point has passed: never return `Err` to the client (`#9`).
+                    let shadow_res = self.apply_shadow_plans(&shadow_plans, new_version).await;
+                    let ttl_res = self
+                        .maintain_ttl_index(
+                            key_info,
+                            ttl_attr.as_deref(),
+                            existing.as_ref(),
+                            post_stage.as_ref(),
+                            new_version,
+                        )
+                        .await;
+                    if let Err(ref e) = shadow_res {
+                        tracing::warn!(
+                            table = %key_info.table_name,
+                            error = %e,
+                            "post-commit shadow update failed; scheduling sweeper recovery"
+                        );
+                    }
+                    if let Err(ref e) = ttl_res {
+                        tracing::warn!(
+                            table = %key_info.table_name,
+                            error = %e,
+                            "post-commit TTL index update failed; scheduling sweeper recovery"
+                        );
+                    }
+                    if shadow_res.is_err() || ttl_res.is_err() {
+                        self.persist_side_effect_recovery_on_failure(
+                            key_info,
+                            &data_table,
+                            &row_key,
+                            &shadow_plans,
+                            ttl_attr.as_deref(),
+                            existing.as_ref(),
+                            post_stage.as_ref(),
+                            new_version,
+                        )
+                        .await;
+                    }
+                    if post_stage.is_none() && (existing.is_some() || read_version.is_some()) {
+                        self.enqueue_tombstone_gc_best_effort(&data_table, &row_key, new_version)
+                            .await;
+                    }
+                    if meta_read_at.elapsed() >= FAST_WRITE_BUDGET {
+                        self.repair_slow_write_schema_drift(
+                            key_info,
+                            &data_table,
+                            &row_key,
+                            &desc,
+                            ttl_attr.as_deref(),
+                            existing.as_ref(),
+                        )
+                        .await;
+                    }
+                    return Ok((existing, post_stage));
+                }
+                CasOutcome::IntentPresent => {
+                    self.wait_or_fail_occ_intent(
+                        &data_table,
+                        &row_key,
+                        single_deadline,
+                        &mut multi_conflicts,
+                        attempt,
+                    )
+                    .await?;
+                }
+                CasOutcome::OccMismatch => {
+                    let backoff_ms = (1u64 << attempt.min(4)) + rand::random_range(0..4);
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                }
+            }
+        }
+
+        Err(StorageError::TransactionConflict(format!(
+            "OCC contention limit exceeded on {op_label}"
+        )))
     }
 
-    /// Test-only entrypoint simulating a process crash immediately after the
-    /// coordinator `COMMITTED` point of a stream-enabled `PutItem` (before base
-    /// row or stream record apply). Returns the `txn_id` in `__extenddb_txn_log__`.
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub async fn debug_fenced_put_commit_only(
@@ -1673,9 +2266,6 @@ impl BigtableEngine {
         Ok(txn_id)
     }
 
-    /// Test-only entrypoint simulating a process crash *before* the coordinator
-    /// `COMMITTED` point of a stream-enabled `PutItem` (`PENDING` coordinator
-    /// row + `m:intent:<txn_id>` placed, no commit). Returns `txn_id`.
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub async fn debug_fenced_put_open_intent_only(
@@ -1707,8 +2297,9 @@ impl BigtableEngine {
     }
 
     /// Idempotently roll forward a `COMMITTED` coordinator entry across base
-    /// participants, version-guarded GSI shadow rows, OCC-bounded TTL
-    /// index mutations, active-participant contiguous stream records, and `ClientRequestToken` `idem:` persistence.
+    /// participants, version-guarded GSI + LSI shadow rows, OCC-bounded TTL
+    /// index mutations, contiguous stream records, and `ClientRequestToken`
+    /// `idem:` persistence. Treats `TableNotFound` on deleted tables as done (`#10`).
     pub async fn roll_forward(
         &self,
         txn_id: &str,
@@ -1720,6 +2311,7 @@ impl BigtableEngine {
             Duration::from_secs(self.intent_timeout_secs.max(1)),
         );
 
+        let is_side_effect_only = state.participants.as_ref().is_some_and(Vec::is_empty);
         let mut materialized_participants: HashSet<crate::transact::ParticipantRow> =
             HashSet::new();
 
@@ -1747,41 +2339,77 @@ impl BigtableEngine {
                     if applied {
                         last_base_still_current = true;
                         materialized_participants.insert(m.participant.clone());
+                        if matches!(m.payload, crate::transact::TxnOpPayload::Delete) {
+                            self.enqueue_tombstone_gc_best_effort(
+                                &m.participant.data_table,
+                                &m.participant.row_key,
+                                new_version,
+                            )
+                            .await;
+                        }
                     } else {
                         let ops = ItemOps::new(
                             client,
                             &m.participant.data_table,
                             self.intent_timeout_secs,
                         );
-                        let (cur_item, cur_ver) = ops
+                        match ops
                             .get_by_raw_key_with_version(&m.participant.row_key)
-                            .await?;
-                        let matches_our_write = cur_ver == Some(new_version)
-                            && match &m.payload {
-                                crate::transact::TxnOpPayload::Put { item } => {
-                                    cur_item.as_ref() == Some(item)
+                            .await
+                        {
+                            Ok((cur_item, cur_ver)) => {
+                                let matches_our_write = cur_ver == Some(new_version)
+                                    && match &m.payload {
+                                        crate::transact::TxnOpPayload::Put { item } => {
+                                            cur_item.as_ref() == Some(item)
+                                        }
+                                        crate::transact::TxnOpPayload::Delete => cur_item.is_none(),
+                                    };
+                                last_base_still_current = matches_our_write;
+                                if matches_our_write {
+                                    materialized_participants.insert(m.participant.clone());
                                 }
-                                crate::transact::TxnOpPayload::Delete => cur_item.is_none(),
-                            };
-                        last_base_still_current = matches_our_write;
-                        if matches_our_write {
-                            materialized_participants.insert(m.participant.clone());
+                            }
+                            Err(StorageError::TableNotFound(_)) => {
+                                // Table was deleted concurrently; skip its shadow/stream side effects
+                                // and continue clearing surviving participants' intents (`#10`).
+                                last_base_still_current = false;
+                            }
+                            Err(e) => return Err(e),
                         }
                     }
                 } else {
-                    if !last_base_still_current {
+                    if !is_side_effect_only && !last_base_still_current {
                         continue;
                     }
                     let ops =
                         ItemOps::new(client, &m.participant.data_table, self.intent_timeout_secs);
                     match &m.payload {
                         crate::transact::TxnOpPayload::Put { item } => {
-                            ops.put_shadow_versioned(&m.participant.row_key, item, new_version)
-                                .await?;
+                            match ops
+                                .put_shadow_versioned(&m.participant.row_key, item, new_version)
+                                .await
+                            {
+                                Ok(_) | Err(StorageError::TableNotFound(_)) => {}
+                                Err(e) => return Err(e),
+                            }
                         }
                         crate::transact::TxnOpPayload::Delete => {
-                            ops.delete_shadow_versioned(&m.participant.row_key, new_version)
-                                .await?;
+                            match ops
+                                .delete_shadow_versioned(&m.participant.row_key, new_version)
+                                .await
+                            {
+                                Ok(_) => {
+                                    self.enqueue_tombstone_gc_best_effort(
+                                        &m.participant.data_table,
+                                        &m.participant.row_key,
+                                        new_version,
+                                    )
+                                    .await;
+                                }
+                                Err(StorageError::TableNotFound(_)) => {}
+                                Err(e) => return Err(e),
+                            }
                         }
                     }
                 }
@@ -1790,7 +2418,9 @@ impl BigtableEngine {
 
         if let Some(ttl_muts) = &state.ttl_mutations {
             for tm in ttl_muts {
-                if state.mutations.is_none() || materialized_participants.contains(&tm.participant)
+                if is_side_effect_only
+                    || state.mutations.is_none()
+                    || materialized_participants.contains(&tm.participant)
                 {
                     apply_ttl_mutation_versioned(
                         client,
@@ -1817,14 +2447,38 @@ impl BigtableEngine {
                     None => state.mutations.is_none() || !materialized_participants.is_empty(),
                 };
                 if should_emit {
-                    crate::streams::write_record_ordered(
+                    let written = crate::streams::write_record_ordered(
                         &cat,
                         &r.shard_id,
                         &r.record,
                         r.dedup_key.as_deref(),
                     )
-                    .await
-                    .map_err(map_catalog_err)?;
+                    .await?;
+                    // If `r.shard_id` was closed after prepare (`written == None`) and the
+                    // table was re-enabled with a newer open stream, route to the open shard;
+                    // if streams are now disabled, drop cleanly (`#12`).
+                    if written.is_none()
+                        && let Some(parsed_arn) = extenddb_core::arn::parse(&r.stream_arn)
+                        && let Ok((tbl_name, _)) =
+                            extenddb_storage::util::parse_stream_arn(&r.stream_arn)
+                        && let Ok((_, fresh_desc, _)) = self
+                            .table_full_meta_uncached(&parsed_arn.account, &tbl_name)
+                            .await
+                        && let Ok(Some((_, new_sid))) = Self::active_stream_target_from_desc(
+                            &fresh_desc,
+                            Some(r.record.dynamodb.stream_view_type),
+                            &r.record.dynamodb.keys,
+                        )
+                        && new_sid != r.shard_id
+                    {
+                        let _ = crate::streams::write_record_ordered(
+                            &cat,
+                            &new_sid,
+                            &r.record,
+                            r.dedup_key.as_deref(),
+                        )
+                        .await?;
+                    }
                 }
             }
         }
@@ -1865,14 +2519,13 @@ impl BigtableEngine {
     fn transaction_conflict_canceled(
         total_ops: usize,
         conflict_idx: usize,
-        msg: &str,
+        detail: &str,
     ) -> StorageError {
-        let mut reasons: Vec<extenddb_core::types::CancellationReason> = (0..total_ops)
-            .map(|_| crate::transact::cancellation_reason("None", None, None))
-            .collect();
+        tracing::debug!(conflict_idx, detail, "TransactWriteItems conflict");
+        let mut reasons: Vec<CancellationReason> =
+            (0..total_ops).map(|_| CancellationReason::none()).collect();
         if conflict_idx < reasons.len() {
-            reasons[conflict_idx] =
-                crate::transact::cancellation_reason("TransactionConflict", Some(msg), None);
+            reasons[conflict_idx] = CancellationReason::transaction_conflict();
         }
         StorageError::TransactionCanceled(reasons)
     }
@@ -1906,7 +2559,7 @@ impl BigtableEngine {
         &self,
         data_table: &str,
         row_key: &[u8],
-        single_deadline: std::time::Instant,
+        single_deadline: Instant,
         multi_conflicts: &mut usize,
         attempt: usize,
     ) -> Result<(), StorageError> {
@@ -1916,7 +2569,7 @@ impl BigtableEngine {
         {
             IntentBlockState::Cleared => Ok(()),
             IntentBlockState::SingleWriteInFlight => {
-                if std::time::Instant::now() >= single_deadline {
+                if Instant::now() >= single_deadline {
                     return Err(StorageError::TransactionConflict(
                         "single-item write contention timeout".to_string(),
                     ));
@@ -1938,6 +2591,280 @@ impl BigtableEngine {
             }
         }
     }
+
+    /// Resume any tables left in `ttl.status == "ENABLING"` whose per-table
+    /// backfill lock (`lock:ttl_backfill:<table_id>`) is free.
+    pub(crate) async fn resume_enabling_ttl_tables(
+        &self,
+        shutdown: &CancellationToken,
+    ) -> Result<(), StorageError> {
+        let rows = self.cat().scan_prefix(keys::TABLE_META_SCAN_PREFIX).await?;
+        for (key, val) in rows {
+            if shutdown.is_cancelled() {
+                return Ok(());
+            }
+            let (status, Some(attr), _) = parse_ttl_status_and_attr(&val) else {
+                continue;
+            };
+            if status != TimeToLiveStatus::Enabling {
+                continue;
+            }
+            let mut parts = key.splitn(3, ':');
+            let _ = parts.next();
+            let (Some(acct_id), Some(table_name)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            if let Err(e) = self
+                .run_ttl_backfill_locked(acct_id, table_name, &attr, shutdown)
+                .await
+            {
+                tracing::debug!(
+                    account_id = %acct_id,
+                    table = %table_name,
+                    error = %e,
+                    "TTL ENABLING backfill pass skipped or deferred"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn run_ttl_backfill_locked(
+        &self,
+        account_id: &str,
+        table_name: &str,
+        ttl_attribute: &str,
+        shutdown: &CancellationToken,
+    ) -> Result<(), StorageError> {
+        let meta_key = keys::table_meta(account_id, table_name);
+        let Some(row) = self.cat().get(&meta_key).await? else {
+            return Ok(());
+        };
+        let (status, stored_attr, generation) = parse_ttl_status_and_attr(&row);
+        if status != TimeToLiveStatus::Enabling {
+            return Ok(());
+        }
+        let target_attr = stored_attr.as_deref().unwrap_or(ttl_attribute);
+        let Some(data_table) = row.get("data_table").and_then(serde_json::Value::as_str) else {
+            return Ok(());
+        };
+        let desc = deserialize_table_description_row(&row)?;
+
+        let lock_name = ttl_backfill_lock_name(&desc.table_id);
+        let owner = format!("ttl-backfill-{}-{}", self.node_id, Uuid::new_v4());
+        if !self
+            .cat()
+            .try_lock(&lock_name, &owner, TTL_BACKFILL_LEASE)
+            .await?
+        {
+            return Ok(());
+        }
+
+        let renew_token = shutdown.child_token();
+        let renew_bg = renew_token.clone();
+        let renew_client = self.catalog_client.clone();
+        let renew_lock = lock_name.clone();
+        let renew_owner = owner.clone();
+        let renewal = tokio::spawn(async move {
+            let every = TTL_BACKFILL_LEASE / 3;
+            while sleep_or_shutdown(&renew_bg, every).await {
+                let c = Catalog::new(&renew_client);
+                if let Ok(false) = c
+                    .renew_lock(&renew_lock, &renew_owner, TTL_BACKFILL_LEASE)
+                    .await
+                {
+                    renew_bg.cancel();
+                    return;
+                }
+            }
+        });
+
+        let res = async {
+            self.await_schema_visibility_fence(data_table, &renew_token)
+                .await?;
+            if renew_token.is_cancelled() {
+                return Ok(());
+            }
+
+            let base_key_info =
+                crate::gsi_worker::build_reconciler_base_key_info(account_id, table_name, &desc);
+            let base_qs = QueryScan::new(&self.client, data_table);
+            let mut start_key = None;
+            loop {
+                if renew_token.is_cancelled() {
+                    return Err(StorageError::Transient(
+                        "TTL backfill lease cancelled".into(),
+                    ));
+                }
+                let (items, last) = base_qs
+                    .scan(
+                        &base_key_info,
+                        false,
+                        Some(TTL_BACKFILL_SCAN_BATCH),
+                        start_key.as_ref(),
+                        None,
+                        None,
+                    )
+                    .await?;
+                if items.is_empty() {
+                    break;
+                }
+                for item in &items {
+                    if let Some(exp) = get_ttl_expiry(item, target_attr) {
+                        let base_rk =
+                            crate::data::encoding::row_key::encode_key(item, &desc.key_schema)?;
+                        let (live_opt, live_ver) =
+                            self.read_base_row_for_worker(data_table, &base_rk).await?;
+                        if let Some(live_item) = live_opt
+                            && let Some(live_exp) = get_ttl_expiry(&live_item, target_attr)
+                        {
+                            let ver = live_ver.unwrap_or_else(|| next_occ_version(None));
+                            insert_ttl_index_entry_at(
+                                &self.client,
+                                account_id,
+                                table_name,
+                                &base_rk,
+                                live_exp.min(exp).max(live_exp),
+                                version_to_timestamp_micros(ver),
+                            )
+                            .await?;
+                        }
+                    }
+                }
+                match last {
+                    Some(k) => start_key = Some(k),
+                    None => break,
+                }
+            }
+
+            if renew_token.is_cancelled() {
+                return Err(StorageError::Transient(
+                    "TTL backfill lease lost before promotion".into(),
+                ));
+            }
+
+            let expected_gen = generation.clone();
+            let promoted = self
+                .cat()
+                .mutate_json_cas(&meta_key, std::convert::identity, move |existing| {
+                    let Some(mut cur) = existing else {
+                        return Ok((CatalogJsonAction::NoOp, false));
+                    };
+                    let (cur_status, cur_attr, cur_gen) = parse_ttl_status_and_attr(&cur);
+                    if cur_status != TimeToLiveStatus::Enabling || cur_gen != expected_gen {
+                        return Ok((CatalogJsonAction::NoOp, false));
+                    }
+                    if let Some(obj) = cur.as_object_mut() {
+                        obj.insert(
+                            "ttl".to_string(),
+                            json!({
+                                "status": "ENABLED",
+                                "enabled": true,
+                                "attribute": cur_attr,
+                                "generation": cur_gen,
+                            }),
+                        );
+                    }
+                    Ok((CatalogJsonAction::Put(cur), true))
+                })
+                .await?;
+            if promoted {
+                self.invalidate_table_cache(account_id, table_name).await;
+            }
+            Ok(())
+        }
+        .await;
+
+        renew_token.cancel();
+        renewal.abort();
+        let _ = renewal.await;
+        let _ = self.cat().release_lock(&lock_name, &owner).await;
+        res
+    }
+
+    async fn purge_ttl_entries_for_table(
+        &self,
+        account_id: &str,
+        table_name: &str,
+    ) -> Result<(), StorageError> {
+        let full_index_table = self.client.full_table_name(TTL_INDEX_TABLE);
+        for shard_id in 0..NUM_SHARDS {
+            let mut start_key = Vec::with_capacity(9);
+            start_key.push(shard_id);
+            start_key.extend_from_slice(&0i64.to_be_bytes());
+            let end_key = vec![shard_id + 1];
+            let mut exclude_start = false;
+
+            loop {
+                let mut data = self.client.data();
+                let req = ReadRowsRequest {
+                    table_name: full_index_table.clone(),
+                    app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+                    rows_limit: CATALOG_GC_PAGE_SIZE,
+                    rows: Some(RowSet {
+                        row_keys: vec![],
+                        row_ranges: vec![RowRange {
+                            start_key: Some(if exclude_start {
+                                StartKey::StartKeyOpen(start_key.clone())
+                            } else {
+                                StartKey::StartKeyClosed(start_key.clone())
+                            }),
+                            end_key: Some(EndKey::EndKeyOpen(end_key.clone())),
+                        }],
+                    }),
+                    filter: Some(RowFilter {
+                        filter: Some(Filter::CellsPerColumnLimitFilter(1)),
+                    }),
+                    ..ReadRowsRequest::default()
+                };
+                let resp = data
+                    .read_rows(req)
+                    .await
+                    .map_err(|e| map_bigtable_err("ReadRows purge_ttl_entries", e))?;
+                if resp.is_empty() {
+                    break;
+                }
+                let batch_len = resp.len();
+                let mut last_key = None;
+                for (raw_key, cells) in resp {
+                    last_key = Some(raw_key.clone());
+                    if let Ok((_, _, acct, tbl, _)) = decode_ttl_key(&raw_key)
+                        && acct == account_id
+                        && tbl == table_name
+                    {
+                        let max_ts = cells.iter().map(|c| c.timestamp_micros).max().unwrap_or(0);
+                        let _ =
+                            crate::ttl_worker::delete_ttl_index_entry_up_to(self, &raw_key, max_ts)
+                                .await;
+                    }
+                }
+                if i64::try_from(batch_len).unwrap_or(i64::MAX) < CATALOG_GC_PAGE_SIZE {
+                    break;
+                }
+                if let Some(k) = last_key {
+                    start_key = k;
+                    exclude_start = true;
+                } else {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn map_admin_err(msg: String) -> StorageError {
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("unavailable")
+        || lower.contains("deadline")
+        || lower.contains("resourceexhausted")
+        || lower.contains("aborted")
+        || lower.contains("goaway")
+    {
+        StorageError::Transient(msg)
+    } else {
+        StorageError::Internal(msg)
+    }
 }
 
 // =========== TableEngine ===========
@@ -1952,13 +2879,7 @@ impl TableEngine for BigtableEngine {
         let input = extenddb_storage::stream_lineage::without_disabled_specification(input);
         Box::pin(async move {
             let meta_key = keys::table_meta(&account_id, &input.table_name);
-            if self
-                .cat()
-                .get(&meta_key)
-                .await
-                .map_err(map_catalog_err)?
-                .is_some()
-            {
+            if self.cat().get(&meta_key).await?.is_some() {
                 return Err(StorageError::TableAlreadyExists(input.table_name));
             }
 
@@ -1967,7 +2888,7 @@ impl TableEngine for BigtableEngine {
 
             let mut admin = AdminClient::connect(&self.client)
                 .await
-                .map_err(map_catalog_err)?;
+                .map_err(map_admin_err)?;
             let families = vec![
                 ("d", Some(crate::data::admin::gc_max_versions(1))),
                 ("m", Some(crate::data::admin::gc_max_versions(1))),
@@ -1976,7 +2897,7 @@ impl TableEngine for BigtableEngine {
             admin
                 .create_table(&data_table, &families)
                 .await
-                .map_err(map_catalog_err)?;
+                .map_err(map_admin_err)?;
 
             let mut created_shadows = Vec::new();
             if let Some(gsis) = &input.global_secondary_indexes {
@@ -1985,7 +2906,17 @@ impl TableEngine for BigtableEngine {
                     admin
                         .create_table(&shadow, &families)
                         .await
-                        .map_err(map_catalog_err)?;
+                        .map_err(map_admin_err)?;
+                    created_shadows.push(shadow);
+                }
+            }
+            if let Some(lsis) = &input.local_secondary_indexes {
+                for l in lsis {
+                    let shadow = crate::gsi::lsi_shadow_table_id(&data_table, &l.index_name);
+                    admin
+                        .create_table(&shadow, &families)
+                        .await
+                        .map_err(map_admin_err)?;
                     created_shadows.push(shadow);
                 }
             }
@@ -2056,7 +2987,7 @@ impl TableEngine for BigtableEngine {
             {
                 let view = spec
                     .stream_view_type
-                    .unwrap_or(extenddb_core::types::StreamViewType::NewAndOldImages);
+                    .unwrap_or(StreamViewType::NewAndOldImages);
                 let label = extenddb_storage::stream_lineage::next_stream_label(None);
                 let arn = crate::streams::build_stream_arn(
                     &self.region,
@@ -2125,22 +3056,16 @@ impl TableEngine for BigtableEngine {
             };
 
             for shard_meta in &initial_shards {
-                crate::streams::put_shard(&self.cat(), shard_meta)
-                    .await
-                    .map_err(map_catalog_err)?;
+                crate::streams::put_shard(&self.cat(), shard_meta).await?;
             }
 
             let mut record = json!({
                 "data_table": data_table,
-                "ttl": {"enabled": false, "attribute": null},
+                "ttl": {"status": "DISABLED", "enabled": false, "attribute": null, "generation": ""},
             });
             insert_table_description_into_row(&mut record, &description)?;
 
-            let inserted = self
-                .cat()
-                .put_if_absent(&meta_key, &record)
-                .await
-                .map_err(map_catalog_err)?;
+            let inserted = self.cat().put_if_absent(&meta_key, &record).await?;
             if !inserted {
                 for shadow in &created_shadows {
                     let _ = admin.delete_table(shadow).await;
@@ -2178,8 +3103,7 @@ impl TableEngine for BigtableEngine {
             let row = self
                 .cat()
                 .get(&keys::table_meta(&account_id, &input.table_name))
-                .await
-                .map_err(map_catalog_err)?
+                .await?
                 .ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
 
             let description = deserialize_table_description_row(&row)?;
@@ -2190,51 +3114,55 @@ impl TableEngine for BigtableEngine {
 
             let data_table = row
                 .get("data_table")
-                .and_then(|v| v.as_str())
+                .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| {
                     StorageError::Internal("missing data_table in catalog row".into())
                 })?;
 
             let mut admin = AdminClient::connect(&self.client)
                 .await
-                .map_err(map_catalog_err)?;
+                .map_err(map_admin_err)?;
             if let Some(gsis) = &description.global_secondary_indexes {
                 for g in gsis {
                     let shadow = crate::gsi::shadow_table_id(data_table, &g.index_name);
                     let _ = admin.delete_table(&shadow).await;
                 }
             }
+            if let Some(lsis) = &description.local_secondary_indexes {
+                for l in lsis {
+                    let shadow = crate::gsi::lsi_shadow_table_id(data_table, &l.index_name);
+                    let _ = admin.delete_table(&shadow).await;
+                }
+            }
             admin
                 .delete_table(data_table)
                 .await
-                .map_err(map_catalog_err)?;
+                .map_err(map_admin_err)?;
 
-            let shards = crate::streams::load_table_shards(&self.cat(), &description.table_id)
-                .await
-                .map_err(map_catalog_err)?;
+            let _ = self
+                .purge_ttl_entries_for_table(&account_id, &input.table_name)
+                .await;
+
+            let shards =
+                crate::streams::load_table_shards(&self.cat(), &description.table_id).await?;
             for shard in &shards {
                 self.cat()
                     .delete_prefix(&keys::stream_record_shard_prefix(&shard.shard_id))
-                    .await
-                    .map_err(map_catalog_err)?;
+                    .await?;
                 self.cat()
                     .delete_prefix(&keys::stream_dedup_shard_prefix(&shard.shard_id))
-                    .await
-                    .map_err(map_catalog_err)?;
+                    .await?;
                 self.cat()
                     .delete(&keys::stream_shard(&shard.shard_id))
-                    .await
-                    .map_err(map_catalog_err)?;
+                    .await?;
             }
             self.cat()
                 .delete(&keys::tags(&description.table_arn))
-                .await
-                .map_err(map_catalog_err)?;
+                .await?;
 
             self.cat()
                 .delete(&keys::table_meta(&account_id, &input.table_name))
-                .await
-                .map_err(map_catalog_err)?;
+                .await?;
 
             let mut returned = description;
             returned.table_status = TableStatus::Deleting;
@@ -2255,8 +3183,7 @@ impl TableEngine for BigtableEngine {
             let row = self
                 .cat()
                 .get(&keys::table_meta(&account_id, &input.table_name))
-                .await
-                .map_err(map_catalog_err)?
+                .await?
                 .ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
             deserialize_table_description_row(&row)
         })
@@ -2272,8 +3199,7 @@ impl TableEngine for BigtableEngine {
             let rows = self
                 .cat()
                 .scan_prefix(&keys::table_meta_scan_prefix(&account_id))
-                .await
-                .map_err(map_catalog_err)?;
+                .await?;
             let mut names: Vec<String> = rows
                 .into_iter()
                 .filter_map(|(key, _)| key.rsplit_once(':').map(|(_, last)| last.to_owned()))
@@ -2284,8 +3210,8 @@ impl TableEngine for BigtableEngine {
                 names.retain(|n| n.as_str() > start.as_str());
             }
             let last_evaluated_table_name = match input.limit {
-                Some(l) if l > 0 && (l as usize) < names.len() => {
-                    names.truncate(l as usize);
+                Some(l) if l > 0 && usize::try_from(l).unwrap_or(usize::MAX) < names.len() => {
+                    names.truncate(usize::try_from(l).unwrap_or(usize::MAX));
                     names.last().cloned()
                 }
                 _ => None,
@@ -2318,83 +3244,131 @@ impl TableEngine for BigtableEngine {
             input.resolve_table_throughput_mode();
             let meta_key = keys::table_meta(&account_id, &input.table_name);
 
-            // Pre-create Bigtable physical shadow tables for any GSI Create
-            // actions so live writers can project to the shadow table the
-            // instant `CREATING` commits in `table_meta`.
             let mut precreated_shadows: Vec<String> = Vec::new();
-            if let Some(updates) = &input.global_secondary_index_updates
-                && updates.iter().any(|u| u.create.is_some())
-            {
+            let mut precreated_stream: Option<(String, String, StreamViewType, Vec<String>)> = None;
+
+            let needs_pre_read = input
+                .global_secondary_index_updates
+                .as_ref()
+                .is_some_and(|u| u.iter().any(|x| x.create.is_some()))
+                || input
+                    .stream_specification
+                    .as_ref()
+                    .is_some_and(|s| s.stream_enabled);
+
+            if needs_pre_read {
                 let initial_row = self
                     .cat()
                     .get(&meta_key)
-                    .await
-                    .map_err(map_catalog_err)?
+                    .await?
                     .ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
                 let initial_dt = initial_row
                     .get("data_table")
-                    .and_then(|v| v.as_str())
+                    .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| StorageError::Internal("missing data_table in catalog".into()))?
                     .to_owned();
                 let initial_desc = deserialize_table_description_row(&initial_row)?;
                 if initial_desc.table_status != TableStatus::Active {
                     return Err(StorageError::TableNotActive(input.table_name.clone()));
                 }
-                let building: Vec<String> = initial_desc
-                    .global_secondary_indexes
-                    .as_deref()
-                    .unwrap_or_default()
-                    .iter()
-                    .filter(|g| g.index_status == "CREATING")
-                    .map(|g| g.index_name.clone())
-                    .collect();
-                if building_refuses(&building, updates) {
-                    return Err(StorageError::LimitExceeded(ONLINE_INDEX_LIMIT.to_owned()));
-                }
-                let mut admin = AdminClient::connect(&self.client)
-                    .await
-                    .map_err(map_catalog_err)?;
-                let families = vec![
-                    ("d", Some(crate::data::admin::gc_max_versions(1))),
-                    ("m", Some(crate::data::admin::gc_max_versions(1))),
-                    ("t", None),
-                ];
-                for u in updates {
-                    if let Some(create) = &u.create {
-                        let name_taken = initial_desc
-                            .global_secondary_indexes
-                            .as_deref()
-                            .unwrap_or_default()
-                            .iter()
-                            .any(|g| {
-                                g.index_name == create.index_name
-                                    && !updates.iter().any(|du| {
-                                        du.delete
-                                            .as_ref()
-                                            .is_some_and(|d| d.index_name == create.index_name)
-                                    })
-                            })
-                            || initial_desc
-                                .local_secondary_indexes
+
+                if let Some(updates) = &input.global_secondary_index_updates
+                    && updates.iter().any(|u| u.create.is_some())
+                {
+                    let building: Vec<String> = initial_desc
+                        .global_secondary_indexes
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .filter(|g| g.index_status == "CREATING")
+                        .map(|g| g.index_name.clone())
+                        .collect();
+                    if building_refuses(&building, updates) {
+                        return Err(StorageError::LimitExceeded(ONLINE_INDEX_LIMIT.to_owned()));
+                    }
+                    let mut admin = AdminClient::connect(&self.client)
+                        .await
+                        .map_err(map_admin_err)?;
+                    let families = vec![
+                        ("d", Some(crate::data::admin::gc_max_versions(1))),
+                        ("m", Some(crate::data::admin::gc_max_versions(1))),
+                        ("t", None),
+                    ];
+                    for u in updates {
+                        if let Some(create) = &u.create {
+                            let name_taken = initial_desc
+                                .global_secondary_indexes
                                 .as_deref()
                                 .unwrap_or_default()
                                 .iter()
-                                .any(|l| l.index_name == create.index_name);
-                        if name_taken {
-                            for s in &precreated_shadows {
-                                let _ = admin.delete_table(s).await;
+                                .any(|g| {
+                                    g.index_name == create.index_name
+                                        && !updates.iter().any(|du| {
+                                            du.delete
+                                                .as_ref()
+                                                .is_some_and(|d| d.index_name == create.index_name)
+                                        })
+                                })
+                                || initial_desc
+                                    .local_secondary_indexes
+                                    .as_deref()
+                                    .unwrap_or_default()
+                                    .iter()
+                                    .any(|l| l.index_name == create.index_name);
+                            if name_taken {
+                                for s in &precreated_shadows {
+                                    let _ = admin.delete_table(s).await;
+                                }
+                                return Err(StorageError::IndexAlreadyExists(
+                                    create.index_name.clone(),
+                                ));
                             }
-                            return Err(StorageError::IndexAlreadyExists(
-                                create.index_name.clone(),
-                            ));
+                            let shadow =
+                                crate::gsi::shadow_table_id(&initial_dt, &create.index_name);
+                            admin
+                                .create_table(&shadow, &families)
+                                .await
+                                .map_err(map_admin_err)?;
+                            precreated_shadows.push(shadow);
                         }
-                        let shadow = crate::gsi::shadow_table_id(&initial_dt, &create.index_name);
-                        admin
-                            .create_table(&shadow, &families)
-                            .await
-                            .map_err(map_catalog_err)?;
-                        precreated_shadows.push(shadow);
                     }
+                }
+
+                // Pre-create the 4 `ShardMeta` rows BEFORE publishing `latest_stream_label`
+                // in `table_meta` so a writer can never observe an enabled stream whose
+                // shard rows do not exist yet (`#11`).
+                if let Some(spec) = &input.stream_specification
+                    && spec.stream_enabled
+                    && let Ok(extenddb_storage::stream_lineage::StreamChange::Enable(view)) =
+                        extenddb_storage::stream_lineage::stream_change(
+                            &input.table_name,
+                            initial_desc.stream_specification.as_ref(),
+                            spec,
+                        )
+                {
+                    let pre_label = extenddb_storage::stream_lineage::next_stream_label(
+                        initial_desc.latest_stream_label.as_deref(),
+                    );
+                    let mut pre_sids = Vec::with_capacity(
+                        extenddb_storage::stream_lineage::SHARDS_PER_STREAM as usize,
+                    );
+                    for idx in 0..extenddb_storage::stream_lineage::SHARDS_PER_STREAM {
+                        let sid = extenddb_storage::stream_lineage::shard_id(
+                            &initial_desc.table_id,
+                            &pre_label,
+                            view,
+                            idx,
+                        )?;
+                        let shard_meta = crate::streams::ShardMeta::new_open(
+                            initial_desc.table_id.clone(),
+                            sid.clone(),
+                            None,
+                        );
+                        crate::streams::put_shard_if_absent(&self.cat(), &shard_meta).await?;
+                        pre_sids.push(sid);
+                    }
+                    precreated_stream =
+                        Some((initial_desc.table_id.clone(), pre_label, view, pre_sids));
                 }
             }
 
@@ -2402,16 +3376,19 @@ impl TableEngine for BigtableEngine {
             let region = self.region.clone();
             let acct_for_cas = account_id.clone();
             let input_for_cas = input.clone();
+            let pre_stream_for_cas = precreated_stream
+                .as_ref()
+                .map(|(tid, lbl, vw, _)| (tid.clone(), lbl.clone(), *vw));
 
             let cas_result = self
                 .cat()
-                .mutate_json_cas(&meta_key, map_catalog_err, move |existing| {
+                .mutate_json_cas(&meta_key, std::convert::identity, move |existing| {
                     let mut row = existing.ok_or_else(|| {
                         StorageError::TableNotFound(input_for_cas.table_name.clone())
                     })?;
                     let data_table = row
                         .get("data_table")
-                        .and_then(|v| v.as_str())
+                        .and_then(serde_json::Value::as_str)
                         .ok_or_else(|| {
                             StorageError::Internal("missing data_table in catalog".into())
                         })?
@@ -2680,8 +3657,7 @@ impl TableEngine for BigtableEngine {
                             }
                         }
 
-                        let mut surviving_schemas: Vec<Vec<extenddb_core::types::KeySchemaElement>> =
-                            Vec::new();
+                        let mut surviving_schemas: Vec<Vec<KeySchemaElement>> = Vec::new();
                         if let Some(gsis) = &description.global_secondary_indexes {
                             for g in gsis {
                                 surviving_schemas.push(g.key_schema.clone());
@@ -2747,10 +3723,26 @@ impl TableEngine for BigtableEngine {
                                     extenddb_storage::stream_lineage::StreamChange::Enable(
                                         view,
                                     ) => {
-                                        let label =
-                                            extenddb_storage::stream_lineage::next_stream_label(
-                                                description.latest_stream_label.as_deref(),
-                                            );
+                                        let (label, used_precreated) = match &pre_stream_for_cas {
+                                            Some((pre_tid, pre_lbl, pre_view))
+                                                if *pre_tid == description.table_id
+                                                    && *pre_view == view
+                                                    && description
+                                                        .latest_stream_label
+                                                        .as_deref()
+                                                        .is_none_or(|cur| {
+                                                            cur < pre_lbl.as_str()
+                                                        }) =>
+                                            {
+                                                (pre_lbl.clone(), true)
+                                            }
+                                            _ => (
+                                                extenddb_storage::stream_lineage::next_stream_label(
+                                                    description.latest_stream_label.as_deref(),
+                                                ),
+                                                false,
+                                            ),
+                                        };
                                         let arn = crate::streams::build_stream_arn(
                                             &region,
                                             &acct_for_cas,
@@ -2765,6 +3757,7 @@ impl TableEngine for BigtableEngine {
                                             label,
                                             view,
                                             label_to_close_prior,
+                                            used_precreated_shards: used_precreated,
                                         };
                                     }
                                     extenddb_storage::stream_lineage::StreamChange::Disable => {
@@ -2807,9 +3800,27 @@ impl TableEngine for BigtableEngine {
                                 let _ = admin.delete_table(s).await;
                             }
                         }
+                        if let Some((_, _, _, pre_sids)) = precreated_stream {
+                            for sid in pre_sids {
+                                let _ = self.cat().delete(&keys::stream_shard(&sid)).await;
+                            }
+                        }
                         return Err(e);
                     }
                 };
+
+            let used_precreated_shards = matches!(
+                stream_op,
+                PendingStreamOp::Enable {
+                    used_precreated_shards: true,
+                    ..
+                }
+            );
+            if !used_precreated_shards && let Some((_, _, _, pre_sids)) = precreated_stream {
+                for sid in pre_sids {
+                    let _ = self.cat().delete(&keys::stream_shard(&sid)).await;
+                }
+            }
 
             self.metadata_cache
                 .invalidate(&(account_id.clone(), input.table_name.clone()))
@@ -2822,9 +3833,11 @@ impl TableEngine for BigtableEngine {
                     label_to_close,
                     refusal_message,
                 } => {
-                    let existing_shards = crate::streams::load_table_shards(&self.cat(), &table_id)
-                        .await
-                        .map_err(map_catalog_err)?;
+                    let _ = self
+                        .roll_forward_committed_txns_for_table(&data_table)
+                        .await;
+                    let existing_shards =
+                        crate::streams::load_table_shards(&self.cat(), &table_id).await?;
                     let lineage_rows: Vec<_> = existing_shards
                         .iter()
                         .map(crate::streams::ShardMeta::to_lineage_row)
@@ -2834,9 +3847,7 @@ impl TableEngine for BigtableEngine {
                         &label_to_close,
                         &lineage_rows,
                     );
-                    crate::streams::close_shards_by_id(&self.cat(), &to_close)
-                        .await
-                        .map_err(map_catalog_err)?;
+                    crate::streams::close_shards_by_id(&self.cat(), &to_close).await?;
                     return Err(StorageError::Validation(refusal_message));
                 }
                 PendingStreamOp::Disable {
@@ -2844,10 +3855,13 @@ impl TableEngine for BigtableEngine {
                     label_to_close,
                     label_to_close_prior,
                 } => {
-                    // `stream_enabled = false` is ALREADY durable in `table_meta`.
-                    let existing_shards = crate::streams::load_table_shards(&self.cat(), &table_id)
-                        .await
-                        .map_err(map_catalog_err)?;
+                    // Drain any already-committed 2PC writes targeting `data_table`
+                    // BEFORE sealing `ending_sequence_number` (`#12`).
+                    let _ = self
+                        .roll_forward_committed_txns_for_table(&data_table)
+                        .await;
+                    let existing_shards =
+                        crate::streams::load_table_shards(&self.cat(), &table_id).await?;
                     let lineage_rows: Vec<_> = existing_shards
                         .iter()
                         .map(crate::streams::ShardMeta::to_lineage_row)
@@ -2871,19 +3885,20 @@ impl TableEngine for BigtableEngine {
                             }
                         }
                     }
-                    crate::streams::close_shards_by_id(&self.cat(), &to_close)
-                        .await
-                        .map_err(map_catalog_err)?;
+                    crate::streams::close_shards_by_id(&self.cat(), &to_close).await?;
                 }
                 PendingStreamOp::Enable {
                     table_id,
                     label,
                     view,
                     label_to_close_prior,
+                    used_precreated_shards,
                 } => {
-                    let existing_shards = crate::streams::load_table_shards(&self.cat(), &table_id)
-                        .await
-                        .map_err(map_catalog_err)?;
+                    let _ = self
+                        .roll_forward_committed_txns_for_table(&data_table)
+                        .await;
+                    let existing_shards =
+                        crate::streams::load_table_shards(&self.cat(), &table_id).await?;
                     let lineage_rows: Vec<_> = existing_shards
                         .iter()
                         .map(crate::streams::ShardMeta::to_lineage_row)
@@ -2904,9 +3919,7 @@ impl TableEngine for BigtableEngine {
                             }
                         }
                     }
-                    crate::streams::close_shards_by_id(&self.cat(), &older)
-                        .await
-                        .map_err(map_catalog_err)?;
+                    crate::streams::close_shards_by_id(&self.cat(), &older).await?;
 
                     let mut inserted_sids = Vec::with_capacity(
                         extenddb_storage::stream_lineage::SHARDS_PER_STREAM as usize,
@@ -2915,19 +3928,18 @@ impl TableEngine for BigtableEngine {
                         let sid = extenddb_storage::stream_lineage::shard_id(
                             &table_id, &label, view, idx,
                         )?;
-                        let shard_meta = crate::streams::ShardMeta::new_open(
-                            table_id.clone(),
-                            sid.clone(),
-                            None,
-                        );
-                        crate::streams::put_shard_if_absent(&self.cat(), &shard_meta)
-                            .await
-                            .map_err(map_catalog_err)?;
+                        if !used_precreated_shards {
+                            let shard_meta = crate::streams::ShardMeta::new_open(
+                                table_id.clone(),
+                                sid.clone(),
+                                None,
+                            );
+                            crate::streams::put_shard_if_absent(&self.cat(), &shard_meta).await?;
+                        }
                         inserted_sids.push(sid);
                     }
 
-                    // Re-verify `enable_still_current` against `table_meta`.
-                    let fresh_row = self.cat().get(&meta_key).await.map_err(map_catalog_err)?;
+                    let fresh_row = self.cat().get(&meta_key).await?;
                     let fresh_stream_row = fresh_row
                         .as_ref()
                         .and_then(|r| deserialize_table_description_row(r).ok())
@@ -2936,9 +3948,7 @@ impl TableEngine for BigtableEngine {
                         fresh_stream_row.as_ref(),
                         &label,
                     ) {
-                        crate::streams::close_shards_by_id(&self.cat(), &inserted_sids)
-                            .await
-                            .map_err(map_catalog_err)?;
+                        crate::streams::close_shards_by_id(&self.cat(), &inserted_sids).await?;
                     }
                 }
             }
@@ -2952,38 +3962,90 @@ impl TableEngine for BigtableEngine {
                 for created_gsi in &created_gsis {
                     let _building_guard =
                         self.register_building_gsi(&staged_desc.table_id, &created_gsi.index_name);
-                    let backfill_res = crate::gsi_worker::reconcile_table_gsi(
-                        self,
-                        &base_key_info,
-                        &data_table,
-                        created_gsi,
-                    )
-                    .await
-                    .map_err(map_catalog_err);
+                    let build_lock =
+                        gsi_build_lock_name(&staged_desc.table_id, &created_gsi.index_name);
+                    let build_owner = format!("update-table-{}-{}", self.node_id, Uuid::new_v4());
+                    let _ = self
+                        .cat()
+                        .try_lock(&build_lock, &build_owner, GSI_BUILD_LEASE)
+                        .await;
+
+                    let fence_token = CancellationToken::new();
+                    let renew_bg = fence_token.clone();
+                    let renew_client = self.catalog_client.clone();
+                    let renew_lock = build_lock.clone();
+                    let renew_owner = build_owner.clone();
+                    let renewal = tokio::spawn(async move {
+                        let every = GSI_BUILD_LEASE / 3;
+                        while sleep_or_shutdown(&renew_bg, every).await {
+                            let c = Catalog::new(&renew_client);
+                            if let Ok(false) = c
+                                .renew_lock(&renew_lock, &renew_owner, GSI_BUILD_LEASE)
+                                .await
+                            {
+                                renew_bg.cancel();
+                                return;
+                            }
+                        }
+                    });
+
+                    let backfill_res = async {
+                        self.await_schema_visibility_fence(&data_table, &fence_token)
+                            .await?;
+                        crate::gsi_worker::reconcile_table_gsi(
+                            self,
+                            &base_key_info,
+                            &data_table,
+                            created_gsi,
+                        )
+                        .await
+                    }
+                    .await;
+
+                    fence_token.cancel();
+                    renewal.abort();
+                    let _ = renewal.await;
+
                     if let Err(e) = backfill_res {
                         let failed_name = created_gsi.index_name.clone();
-                        let _ = self
+                        // Roll back ONLY if the index is still `CREATING`; never
+                        // drop an index that `gsi_worker` already promoted to `ACTIVE` (`#41`).
+                        let removed_creating = self
                             .cat()
-                            .mutate_json_cas(&meta_key, map_catalog_err, move |existing| {
+                            .mutate_json_cas(&meta_key, std::convert::identity, move |existing| {
                                 let Some(mut row) = existing else {
-                                    return Ok((CatalogJsonAction::NoOp, ()));
+                                    return Ok((CatalogJsonAction::NoOp, false));
                                 };
                                 let mut desc = deserialize_table_description_row(&row)?;
+                                let mut removed = false;
                                 if let Some(gsis) = desc.global_secondary_indexes.as_mut() {
-                                    gsis.retain(|g| g.index_name != failed_name);
+                                    let before = gsis.len();
+                                    gsis.retain(|g| {
+                                        !(g.index_name == failed_name
+                                            && g.index_status == "CREATING")
+                                    });
+                                    removed = gsis.len() < before;
                                     if gsis.is_empty() {
                                         desc.global_secondary_indexes = None;
                                     }
                                 }
+                                if !removed {
+                                    return Ok((CatalogJsonAction::NoOp, false));
+                                }
                                 insert_table_description_into_row(&mut row, &desc)?;
-                                Ok((CatalogJsonAction::Put(row), ()))
+                                Ok((CatalogJsonAction::Put(row), true))
                             })
-                            .await;
-                        if let Ok(mut admin) = AdminClient::connect(&self.client).await {
+                            .await
+                            .unwrap_or(false);
+
+                        if removed_creating
+                            && let Ok(mut admin) = AdminClient::connect(&self.client).await
+                        {
                             let shadow =
                                 crate::gsi::shadow_table_id(&data_table, &created_gsi.index_name);
                             let _ = admin.delete_table(&shadow).await;
                         }
+                        let _ = self.cat().release_lock(&build_lock, &build_owner).await;
                         self.metadata_cache
                             .invalidate(&(account_id, input.table_name))
                             .await;
@@ -2991,8 +4053,9 @@ impl TableEngine for BigtableEngine {
                     }
 
                     let promoted_name = created_gsi.index_name.clone();
-                    self.cat()
-                        .mutate_json_cas(&meta_key, map_catalog_err, move |existing| {
+                    let promote_res = self
+                        .cat()
+                        .mutate_json_cas(&meta_key, std::convert::identity, move |existing| {
                             let mut row = existing.ok_or_else(|| {
                                 StorageError::TableNotFound(promoted_name.clone())
                             })?;
@@ -3008,7 +4071,9 @@ impl TableEngine for BigtableEngine {
                             insert_table_description_into_row(&mut row, &desc)?;
                             Ok((CatalogJsonAction::Put(row), ()))
                         })
-                        .await?;
+                        .await;
+                    let _ = self.cat().release_lock(&build_lock, &build_owner).await;
+                    promote_res?;
                 }
             }
 
@@ -3018,8 +4083,7 @@ impl TableEngine for BigtableEngine {
                 let current_desc = self
                     .cat()
                     .get(&meta_key)
-                    .await
-                    .map_err(map_catalog_err)?
+                    .await?
                     .and_then(|r| deserialize_table_description_row(&r).ok());
                 for del_name in &deleted_gsi_names {
                     let recreated = current_desc
@@ -3155,11 +4219,7 @@ impl TableEngine for BigtableEngine {
         let table_id = table_id.to_owned();
         let index_name = index_name.to_owned();
         Box::pin(async move {
-            let metas = self
-                .cat()
-                .scan_prefix(keys::TABLE_META_SCAN_PREFIX)
-                .await
-                .map_err(map_catalog_err)?;
+            let metas = self.cat().scan_prefix(keys::TABLE_META_SCAN_PREFIX).await?;
             for (meta_key, value) in metas {
                 let Ok(desc) = deserialize_table_description_row(&value) else {
                     continue;
@@ -3195,86 +4255,16 @@ impl DataEngine for BigtableEngine {
         let maps = maps.clone();
         let stream = stream.cloned();
         Box::pin(async move {
-            let (data_table, desc, ttl_attr) = self.table_full_meta_for(&key_info).await?;
-            Self::validate_put_index_keys(&desc, &item)?;
-            let should_capture_stream =
-                Self::active_stream_target_for_capture(&desc, stream.as_ref(), &item)?.is_some();
-
-            if should_capture_stream {
-                let (existing, _, _) = self
-                    .execute_fenced_single_item_write(
-                        &key_info,
-                        &data_table,
-                        &desc,
-                        ttl_attr.as_deref(),
-                        SingleWriteOp::Put { item },
-                        condition.as_ref(),
-                        &maps,
-                        stream.as_ref(),
-                    )
-                    .await?;
-                return Ok(if return_old { existing } else { None });
-            }
-
-            let row_key = crate::data::encoding::row_key::encode_key(&item, &key_info.key_schema)?;
-            let _row_guard = self.acquire_single_write_lock(&data_table, &row_key).await;
-
-            let gsis = desc.global_secondary_indexes.clone().unwrap_or_default();
-            let ops = ItemOps::new(&self.client, &data_table, self.intent_timeout_secs);
-            let single_deadline = std::time::Instant::now()
-                + Duration::from_secs(self.intent_timeout_secs.max(2) + 2);
-            let mut multi_conflicts = 0usize;
-
-            for attempt in 0..MAX_OCC_ATTEMPTS {
-                let (_, existing, read_version) = self
-                    .read_row_resolving_committed_intents(&ops, &data_table, &row_key)
-                    .await?;
-                check_condition(existing.as_ref(), condition.as_ref(), &maps)?;
-
-                match ops
-                    .put_cas(&key_info, &item, read_version, existing.is_some())
-                    .await?
-                {
-                    CasOutcome::Applied(new_version) => {
-                        self.write_shadows_only(
-                            &key_info,
-                            &data_table,
-                            &gsis,
-                            &item,
-                            existing.as_ref(),
-                            new_version,
-                        )
-                        .await?;
-                        self.maintain_ttl_index(
-                            &key_info,
-                            ttl_attr.as_deref(),
-                            existing.as_ref(),
-                            Some(&item),
-                            new_version,
-                        )
-                        .await?;
-                        return Ok(if return_old { existing } else { None });
-                    }
-                    CasOutcome::IntentPresent => {
-                        self.wait_or_fail_occ_intent(
-                            &data_table,
-                            &row_key,
-                            single_deadline,
-                            &mut multi_conflicts,
-                            attempt,
-                        )
-                        .await?;
-                    }
-                    CasOutcome::OccMismatch => {
-                        let backoff_ms = (1u64 << attempt.min(4)) + rand::random_range(0..4);
-                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                    }
-                }
-            }
-
-            Err(StorageError::TransactionConflict(
-                "OCC contention limit exceeded on PutItem".to_string(),
-            ))
+            let (existing, _) = self
+                .execute_single_item_write(
+                    &key_info,
+                    SingleWriteOp::Put { item },
+                    condition.as_ref(),
+                    &maps,
+                    stream.as_ref(),
+                )
+                .await?;
+            Ok(if return_old { existing } else { None })
         })
     }
 
@@ -3286,10 +4276,9 @@ impl DataEngine for BigtableEngine {
         let key_info = key_info.clone();
         let key = key.clone();
         Box::pin(async move {
-            let data_table = self.data_table_for(&key_info).await?;
-            ItemOps::new(&self.client, &data_table, self.intent_timeout_secs)
-                .get(&key_info, &key)
-                .await
+            // Cooperatively resolve any `COMMITTED` 2PC intents on the row (`#40`).
+            let (item, _) = self.get_item_with_version(&key_info, &key).await?;
+            Ok(item)
         })
     }
 
@@ -3308,83 +4297,16 @@ impl DataEngine for BigtableEngine {
         let maps = maps.clone();
         let stream = stream.cloned();
         Box::pin(async move {
-            let (data_table, desc, ttl_attr) = self.table_full_meta_for(&key_info).await?;
-            let should_capture_stream =
-                Self::active_stream_target_for_capture(&desc, stream.as_ref(), &key)?.is_some();
-
-            if should_capture_stream {
-                let (existing, _, _) = self
-                    .execute_fenced_single_item_write(
-                        &key_info,
-                        &data_table,
-                        &desc,
-                        ttl_attr.as_deref(),
-                        SingleWriteOp::Delete { key: &key },
-                        condition.as_ref(),
-                        &maps,
-                        stream.as_ref(),
-                    )
-                    .await?;
-                return Ok(if return_old { existing } else { None });
-            }
-
-            let row_key = crate::data::encoding::row_key::encode_key(&key, &key_info.key_schema)?;
-            let _row_guard = self.acquire_single_write_lock(&data_table, &row_key).await;
-
-            let gsis = desc.global_secondary_indexes.clone().unwrap_or_default();
-            let ops = ItemOps::new(&self.client, &data_table, self.intent_timeout_secs);
-            let single_deadline = std::time::Instant::now()
-                + Duration::from_secs(self.intent_timeout_secs.max(2) + 2);
-            let mut multi_conflicts = 0usize;
-
-            for attempt in 0..MAX_OCC_ATTEMPTS {
-                let (has_live_intent, existing, read_version) = self
-                    .read_row_resolving_committed_intents(&ops, &data_table, &row_key)
-                    .await?;
-                check_condition(existing.as_ref(), condition.as_ref(), &maps)?;
-                if existing.is_none() && condition.is_none() && !has_live_intent {
-                    return Ok(None);
-                }
-
-                match ops
-                    .delete_cas(&key_info, &key, read_version, existing.is_some())
-                    .await?
-                {
-                    CasOutcome::Applied(new_version) => {
-                        if let Some(prior) = existing.as_ref() {
-                            self.delete_shadows(&key_info, &data_table, &gsis, prior, new_version)
-                                .await?;
-                            self.maintain_ttl_index(
-                                &key_info,
-                                ttl_attr.as_deref(),
-                                Some(prior),
-                                None,
-                                new_version,
-                            )
-                            .await?;
-                        }
-                        return Ok(if return_old { existing } else { None });
-                    }
-                    CasOutcome::IntentPresent => {
-                        self.wait_or_fail_occ_intent(
-                            &data_table,
-                            &row_key,
-                            single_deadline,
-                            &mut multi_conflicts,
-                            attempt,
-                        )
-                        .await?;
-                    }
-                    CasOutcome::OccMismatch => {
-                        let backoff_ms = (1u64 << attempt.min(4)) + rand::random_range(0..4);
-                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                    }
-                }
-            }
-
-            Err(StorageError::TransactionConflict(
-                "OCC contention limit exceeded on DeleteItem".to_string(),
-            ))
+            let (existing, _) = self
+                .execute_single_item_write(
+                    &key_info,
+                    SingleWriteOp::Delete { key: &key },
+                    condition.as_ref(),
+                    &maps,
+                    stream.as_ref(),
+                )
+                .await?;
+            Ok(if return_old { existing } else { None })
         })
     }
 
@@ -3406,121 +4328,24 @@ impl DataEngine for BigtableEngine {
         let maps = maps.clone();
         let stream = stream.cloned();
         Box::pin(async move {
-            let (data_table, desc, ttl_attr) = self.table_full_meta_for(&key_info).await?;
-            Self::validate_update_index_literals(&desc, &actions, &maps)?;
-            let should_capture_stream =
-                Self::active_stream_target_for_capture(&desc, stream.as_ref(), &key)?.is_some();
-
-            if should_capture_stream {
-                let (existing, new_item, _) = self
-                    .execute_fenced_single_item_write(
-                        &key_info,
-                        &data_table,
-                        &desc,
-                        ttl_attr.as_deref(),
-                        SingleWriteOp::Update {
-                            key: &key,
-                            actions: &actions,
-                        },
-                        condition.as_ref(),
-                        &maps,
-                        stream.as_ref(),
-                    )
-                    .await?;
-                if new_item.is_none() {
-                    return Ok((None, None));
-                }
-                return Ok((
-                    if return_old { existing } else { None },
-                    if return_new { new_item } else { None },
-                ));
-            }
-
-            let row_key = crate::data::encoding::row_key::encode_key(&key, &key_info.key_schema)?;
-            let _row_guard = self.acquire_single_write_lock(&data_table, &row_key).await;
-
-            let gsis = desc.global_secondary_indexes.clone().unwrap_or_default();
-            let ops = ItemOps::new(&self.client, &data_table, self.intent_timeout_secs);
-            let single_deadline = std::time::Instant::now()
-                + Duration::from_secs(self.intent_timeout_secs.max(2) + 2);
-            let mut multi_conflicts = 0usize;
-
-            for attempt in 0..MAX_OCC_ATTEMPTS {
-                let (_, existing, read_version) = self
-                    .read_row_resolving_committed_intents(&ops, &data_table, &row_key)
-                    .await?;
-                check_condition(existing.as_ref(), condition.as_ref(), &maps)?;
-
-                let base = match existing.as_ref() {
-                    Some(e) => e.clone(),
-                    None => key.clone(),
-                };
-                let new_item = apply_update_actions_validated(
-                    &base,
-                    &actions,
-                    &maps,
+            let (existing, new_item) = self
+                .execute_single_item_write(
                     &key_info,
-                    &desc.attribute_definitions,
-                )?;
-                extenddb_core::validation::validate_update_item_size(
-                    &new_item,
-                    &actions,
+                    SingleWriteOp::Update {
+                        key: &key,
+                        actions: &actions,
+                    },
+                    condition.as_ref(),
                     &maps,
-                    self.max_item_size_bytes,
+                    stream.as_ref(),
                 )
-                .map_err(|e| StorageError::Validation(e.to_string()))?;
-                Self::validate_updated_item_index_keys(&desc, &new_item)?;
-
-                if existing.is_none() && removes_only(&actions) {
-                    return Ok((None, None));
-                }
-
-                match ops
-                    .put_cas(&key_info, &new_item, read_version, existing.is_some())
-                    .await?
-                {
-                    CasOutcome::Applied(new_version) => {
-                        self.write_shadows_only(
-                            &key_info,
-                            &data_table,
-                            &gsis,
-                            &new_item,
-                            existing.as_ref(),
-                            new_version,
-                        )
-                        .await?;
-                        self.maintain_ttl_index(
-                            &key_info,
-                            ttl_attr.as_deref(),
-                            existing.as_ref(),
-                            Some(&new_item),
-                            new_version,
-                        )
-                        .await?;
-                        return Ok((
-                            if return_old { existing } else { None },
-                            if return_new { Some(new_item) } else { None },
-                        ));
-                    }
-                    CasOutcome::IntentPresent => {
-                        self.wait_or_fail_occ_intent(
-                            &data_table,
-                            &row_key,
-                            single_deadline,
-                            &mut multi_conflicts,
-                            attempt,
-                        )
-                        .await?;
-                    }
-                    CasOutcome::OccMismatch => {
-                        let backoff_ms = (1u64 << attempt.min(4)) + rand::random_range(0..4);
-                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                    }
-                }
+                .await?;
+            if new_item.is_none() {
+                return Ok((None, None));
             }
-
-            Err(StorageError::TransactionConflict(
-                "OCC contention limit exceeded on UpdateItem".to_string(),
+            Ok((
+                if return_old { existing } else { None },
+                if return_new { new_item } else { None },
             ))
         })
     }
@@ -3568,14 +4393,32 @@ impl DataEngine for BigtableEngine {
                             ..TableKeyInfo::default()
                         };
                         QueryScan::new(&self.client, &shadow_table)
-                            .query(&gsi_key_info, &kc, &maps, forward, limit, esk.as_ref())
+                            .query(
+                                &gsi_key_info,
+                                true,
+                                &kc,
+                                &maps,
+                                forward,
+                                limit,
+                                esk.as_ref(),
+                            )
                             .await
                     } else if let Some(lsi) = lsis.iter().find(|l| l.index_name == idx_name) {
-                        QueryScan::new(&self.client, &data_table)
-                            .query_lsi(
-                                &base_ki,
-                                &lsi.key_schema,
-                                &lsi.projection,
+                        let shadow_table =
+                            crate::gsi::lsi_shadow_table_id(&data_table, &lsi.index_name);
+                        let lsi_key_info = TableKeyInfo {
+                            table_name: format!("{}__lsi_{}", key_info.table_name, lsi.index_name),
+                            account_id: key_info.account_id.clone(),
+                            table_id: format!("{}::{}", key_info.table_id, lsi.index_name),
+                            key_schema: lsi.key_schema.clone(),
+                            base_key_schema: desc.key_schema.clone(),
+                            attribute_definitions: desc.attribute_definitions.clone(),
+                            ..TableKeyInfo::default()
+                        };
+                        QueryScan::new(&self.client, &shadow_table)
+                            .query(
+                                &lsi_key_info,
+                                true,
                                 &kc,
                                 &maps,
                                 forward,
@@ -3589,7 +4432,7 @@ impl DataEngine for BigtableEngine {
                 }
                 None => {
                     QueryScan::new(&self.client, &data_table)
-                        .query(&base_ki, &kc, &maps, forward, limit, esk.as_ref())
+                        .query(&base_ki, false, &kc, &maps, forward, limit, esk.as_ref())
                         .await
                 }
             }
@@ -3636,11 +4479,36 @@ impl DataEngine for BigtableEngine {
                             ..TableKeyInfo::default()
                         };
                         QueryScan::new(&self.client, &shadow_table)
-                            .scan(&gsi_key_info, limit, esk.as_ref(), segment, total_segments)
+                            .scan(
+                                &gsi_key_info,
+                                true,
+                                limit,
+                                esk.as_ref(),
+                                segment,
+                                total_segments,
+                            )
                             .await
                     } else if let Some(lsi) = lsis.iter().find(|l| l.index_name == idx_name) {
-                        QueryScan::new(&self.client, &data_table)
-                            .scan_lsi(&base_ki, lsi, limit, esk.as_ref(), segment, total_segments)
+                        let shadow_table =
+                            crate::gsi::lsi_shadow_table_id(&data_table, &lsi.index_name);
+                        let lsi_key_info = TableKeyInfo {
+                            table_name: format!("{}__lsi_{}", key_info.table_name, lsi.index_name),
+                            account_id: key_info.account_id.clone(),
+                            table_id: format!("{}::{}", key_info.table_id, lsi.index_name),
+                            key_schema: lsi.key_schema.clone(),
+                            base_key_schema: desc.key_schema.clone(),
+                            attribute_definitions: desc.attribute_definitions.clone(),
+                            ..TableKeyInfo::default()
+                        };
+                        QueryScan::new(&self.client, &shadow_table)
+                            .scan(
+                                &lsi_key_info,
+                                true,
+                                limit,
+                                esk.as_ref(),
+                                segment,
+                                total_segments,
+                            )
                             .await
                     } else {
                         Err(StorageError::IndexNotFound(idx_name))
@@ -3648,7 +4516,14 @@ impl DataEngine for BigtableEngine {
                 }
                 None => {
                     QueryScan::new(&self.client, &data_table)
-                        .scan(&base_ki, limit, esk.as_ref(), segment, total_segments)
+                        .scan(
+                            &base_ki,
+                            false,
+                            limit,
+                            esk.as_ref(),
+                            segment,
+                            total_segments,
+                        )
                         .await
                 }
             }
@@ -3667,6 +4542,7 @@ impl DataEngine for BigtableEngine {
         let key = key.clone();
         let index_name = index_name.map(str::to_owned);
         Box::pin(async move {
+            let is_index = index_name.is_some();
             let schema = match index_name {
                 None => {
                     if key_info.base_key_schema.is_empty() {
@@ -3696,7 +4572,7 @@ impl DataEngine for BigtableEngine {
                     }
                 }
             };
-            key_belongs_to_segment(&key, &schema, segment, total_segments)
+            key_belongs_to_segment(&key, &schema, is_index, segment, total_segments)
         })
     }
 
@@ -3727,17 +4603,13 @@ impl DataEngine for BigtableEngine {
                     Ok(()) => {
                         let enc_key =
                             crate::data::encoding::row_key::encode_key(key, &desc.key_schema)?;
-                        validation_reasons
-                            .push(crate::transact::cancellation_reason("None", None, None));
+                        validation_reasons.push(CancellationReason::none());
                         resolved_ops.push((idx, data_table, enc_key));
                     }
                     Err(e) => {
                         any_validation_failed = true;
-                        validation_reasons.push(crate::transact::cancellation_reason(
-                            "ValidationError",
-                            Some(&e.to_string()),
-                            None,
-                        ));
+                        validation_reasons
+                            .push(CancellationReason::validation_error(e.to_string()));
                     }
                 }
             }
@@ -3745,8 +4617,6 @@ impl DataEngine for BigtableEngine {
                 return Err(StorageError::TransactionCanceled(validation_reasons));
             }
 
-            // Deduplicate unique `(data_table, enc_key)` pairs so duplicate keys in
-            // one TransactGetItems request share a single atomic snapshot slot.
             let mut table_raw_keys: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
             for (_, data_table, enc_key) in &resolved_ops {
                 let entry = table_raw_keys.entry(data_table.clone()).or_default();
@@ -3762,7 +4632,6 @@ impl DataEngine for BigtableEngine {
             );
 
             for attempt in 0..MAX_TRANSACT_GET_ATTEMPTS {
-                // Pass 1a: read `(d_item, m:v, all m:intent:*)` across all tables.
                 let mut futs_1 = Vec::with_capacity(table_raw_keys.len());
                 for (dt, raw_keys) in &table_raw_keys {
                     let client = self.client.clone();
@@ -3790,7 +4659,6 @@ impl DataEngine for BigtableEngine {
                     }
                 }
 
-                // Single-key read with zero intents needs no second snapshot pass.
                 if unique_key_count == 1 && all_tids.is_empty() {
                     let mut out = Vec::with_capacity(total_ops);
                     for (_, dt, rk) in &resolved_ops {
@@ -3802,7 +4670,6 @@ impl DataEngine for BigtableEngine {
                     return Ok(out);
                 }
 
-                // Pass 1b: read coordinator state for every observed intent.
                 let mut txns_1: HashMap<String, Option<crate::transact::TxnState>> =
                     HashMap::with_capacity(all_tids.len());
                 for tid in all_tids.keys() {
@@ -3810,9 +4677,6 @@ impl DataEngine for BigtableEngine {
                     txns_1.insert(tid.clone(), st);
                 }
 
-                // Fast skew check: if a COMMITTED transaction observed on one key
-                // also mutates another requested key whose Pass 1a read had
-                // `occ_ver < new_version` without that intent, retry immediately.
                 let mut cross_skew = false;
                 for (tid, st_opt) in &txns_1 {
                     if let Some(st) = st_opt
@@ -3839,12 +4703,13 @@ impl DataEngine for BigtableEngine {
                     }
                 }
                 if cross_skew {
-                    let jitter_ms = 1 + rand::random_range(0..4u64) + (attempt as u64).min(8);
+                    let jitter_ms = 1
+                        + rand::random_range(0..4u64)
+                        + u64::try_from(attempt.min(8)).unwrap_or(0);
                     tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
                     continue;
                 }
 
-                // Pass 2a: re-read rows to verify `[t1_end..t3_start]` quiescence.
                 let mut futs_2 = Vec::with_capacity(table_raw_keys.len());
                 for (dt, raw_keys) in &table_raw_keys {
                     let client = self.client.clone();
@@ -3873,13 +4738,13 @@ impl DataEngine for BigtableEngine {
                     }
                 }
                 if !rows_match {
-                    let jitter_ms = 1 + rand::random_range(0..4u64) + (attempt as u64).min(8);
+                    let jitter_ms = 1
+                        + rand::random_range(0..4u64)
+                        + u64::try_from(attempt.min(8)).unwrap_or(0);
                     tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
                     continue;
                 }
 
-                // Pass 2b: re-read coordinator states to verify none transitioned
-                // across `[t2_end..t3_start]`.
                 let mut txns_match = true;
                 for tid in all_tids.keys() {
                     let st_2 = coord.get_state(tid).await?;
@@ -3894,16 +4759,13 @@ impl DataEngine for BigtableEngine {
                     }
                 }
                 if !txns_match {
-                    let jitter_ms = 1 + rand::random_range(0..4u64) + (attempt as u64).min(8);
+                    let jitter_ms = 1
+                        + rand::random_range(0..4u64)
+                        + u64::try_from(attempt.min(8)).unwrap_or(0);
                     tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
                     continue;
                 }
 
-                // Double-read snapshot validated across Pass 1 and Pass 2. Resolve each
-                // requested item from `(map_1, txns_1)`:
-                // - Intent present + txn COMMITTED (and not superseded by a
-                //   strictly newer `m:v`) -> serve logged post-image from `t:mutations`.
-                // - Otherwise -> serve current `d:*` value.
                 let mut out: Vec<Option<Item>> = vec![None; total_ops];
                 for (idx, data_table, enc_key) in &resolved_ops {
                     let Some(row_snap) = map_1.get(&(data_table.clone(), enc_key.clone())) else {
@@ -3945,13 +4807,7 @@ impl DataEngine for BigtableEngine {
             }
 
             let reasons = (0..total_ops)
-                .map(|_| {
-                    crate::transact::cancellation_reason(
-                        "TransactionConflict",
-                        Some("Transaction is ongoing for the item"),
-                        None,
-                    )
-                })
+                .map(|_| CancellationReason::transaction_conflict())
                 .collect();
             Err(StorageError::TransactionCanceled(reasons))
         })
@@ -3975,6 +4831,7 @@ impl DataEngine for BigtableEngine {
                 self.check_idempotency_record(acct, tok, fp).await?;
             }
 
+            let meta_read_at = Instant::now();
             let mut pre_resolved = Vec::with_capacity(owned.len());
             for op in owned {
                 let (data_table, desc, ttl_attr) = self.table_full_meta_for(&op.key_info).await?;
@@ -3982,8 +4839,8 @@ impl DataEngine for BigtableEngine {
             }
 
             {
-                let mut key_reasons: Vec<extenddb_core::types::CancellationReason> =
-                    vec![extenddb_core::types::CancellationReason::none(); pre_resolved.len()];
+                let mut key_reasons: Vec<CancellationReason> =
+                    vec![CancellationReason::none(); pre_resolved.len()];
                 let mut any_key_fault = false;
                 for (i, (op, _, desc, _)) in pre_resolved.iter().enumerate() {
                     if let Err(r) = Self::transact_op_key_checks(op, desc) {
@@ -3992,14 +4849,10 @@ impl DataEngine for BigtableEngine {
                     }
                 }
                 if any_key_fault {
-                    return Err(
-                        match extenddb_core::types::CancellationReason::resolve_key_faults(
-                            key_reasons,
-                        ) {
-                            Ok(reasons) => StorageError::TransactionCanceled(reasons),
-                            Err(message) => StorageError::Validation(message),
-                        },
-                    );
+                    return Err(match CancellationReason::resolve_key_faults(key_reasons) {
+                        Ok(reasons) => StorageError::TransactionCanceled(reasons),
+                        Err(message) => StorageError::Validation(message),
+                    });
                 }
             }
 
@@ -4020,16 +4873,6 @@ impl DataEngine for BigtableEngine {
                 resolved.push((op, data_table, desc, ttl_attr, participant));
             }
 
-            let mut seen_items = HashSet::new();
-            for (_, _, _, _, p) in &resolved {
-                if !seen_items.insert((p.data_table.clone(), p.row_key.clone())) {
-                    return Err(StorageError::Validation(
-                        "Transaction request cannot include multiple operations on one item"
-                            .to_string(),
-                    ));
-                }
-            }
-
             let intent_max_age = Duration::from_secs(self.intent_timeout_secs.max(1));
             let txn_id = if let Some((acct, tok, _)) = &token {
                 derive_txn_id(acct, tok)
@@ -4047,7 +4890,6 @@ impl DataEngine for BigtableEngine {
             let participants: Vec<crate::transact::ParticipantRow> =
                 resolved.iter().map(|(_, _, _, _, p)| p.clone()).collect();
 
-            // Atomically open coordinator row.
             let mut started_at_micros: i64 = 0;
             let mut leader_opened = false;
             for _open_round in 0..4usize {
@@ -4058,10 +4900,6 @@ impl DataEngine for BigtableEngine {
                     .open_with_token(&txn_id, &participants, token_meta.as_ref())
                     .await?;
                 if created {
-                    // Re-check `idem:` AFTER opening `txn:<id>`: if a predecessor
-                    // finished `persist_idempotency_if_unexpired` + `drop_matching_start`
-                    // right between our pre-open check and `open_with_token`, roll back
-                    // this empty coordinator row and return `IdempotentReplay`/`IdempotentMismatch`.
                     if let Some((acct, tok, fp)) = &token
                         && let Err(idem_err) = self.check_idempotency_record(acct, tok, fp).await
                     {
@@ -4082,8 +4920,8 @@ impl DataEngine for BigtableEngine {
                     ));
                 };
 
-                let wait_deadline = std::time::Instant::now()
-                    + Duration::from_secs(self.intent_timeout_secs.max(2) + 2);
+                let wait_deadline =
+                    Instant::now() + Duration::from_secs(self.intent_timeout_secs.max(2) + 2);
                 let mut delay = Duration::from_millis(15);
 
                 loop {
@@ -4102,32 +4940,41 @@ impl DataEngine for BigtableEngine {
 
                     match ts.state.as_str() {
                         "COMMITTED" => {
-                            self.roll_forward(&txn_id, &ts).await?;
+                            if let Err(e) = self.roll_forward(&txn_id, &ts).await {
+                                tracing::warn!(
+                                    txn_id = %txn_id,
+                                    error = %e,
+                                    "post-commit replay roll_forward deferred to sweeper"
+                                );
+                            }
                             if ts.token_meta.is_none() {
                                 let after_ts = ts.state_ts_micros.max(ts.started_at.unwrap_or(0));
-                                self.persist_idempotency_if_unexpired(
-                                    acct, tok, fp, &txn_id, after_ts,
-                                )
-                                .await?;
+                                let _ = self
+                                    .persist_idempotency_if_unexpired(
+                                        acct, tok, fp, &txn_id, after_ts,
+                                    )
+                                    .await;
                             }
                             return Err(StorageError::IdempotentReplay);
                         }
                         "CLEANED" => {
                             let after_ts = ts.state_ts_micros.max(ts.started_at.unwrap_or(0));
                             if let Some(tm) = &ts.token_meta {
-                                self.persist_idempotency_if_unexpired(
-                                    &tm.account_id,
-                                    &tm.token,
-                                    &tm.fingerprint,
-                                    &txn_id,
-                                    after_ts,
-                                )
-                                .await?;
+                                let _ = self
+                                    .persist_idempotency_if_unexpired(
+                                        &tm.account_id,
+                                        &tm.token,
+                                        &tm.fingerprint,
+                                        &txn_id,
+                                        after_ts,
+                                    )
+                                    .await;
                             } else {
-                                self.persist_idempotency_if_unexpired(
-                                    acct, tok, fp, &txn_id, after_ts,
-                                )
-                                .await?;
+                                let _ = self
+                                    .persist_idempotency_if_unexpired(
+                                        acct, tok, fp, &txn_id, after_ts,
+                                    )
+                                    .await;
                             }
                             if let Some(s) = ts.started_at {
                                 let _ = coord.drop_matching_start(&txn_id, s).await;
@@ -4155,6 +5002,7 @@ impl DataEngine for BigtableEngine {
                             break;
                         }
                         "PENDING" => {
+                            #[allow(clippy::cast_possible_wrap)]
                             let timeout_micros =
                                 (self.intent_timeout_secs.saturating_mul(1_000_000)) as i64;
                             let cutoff = now_millis_micros().saturating_sub(timeout_micros);
@@ -4185,14 +5033,16 @@ impl DataEngine for BigtableEngine {
                                 continue;
                             }
 
-                            if std::time::Instant::now() >= wait_deadline {
+                            if Instant::now() >= wait_deadline {
                                 return Err(Self::transaction_conflict_canceled(
                                     resolved.len(),
                                     0,
                                     "concurrent transaction with same token is pending",
                                 ));
                             }
-                            let jitter = rand::random_range(0..delay.as_millis() as u64 + 1);
+                            let jitter = rand::random_range(
+                                0..u64::try_from(delay.as_millis()).unwrap_or(15) + 1,
+                            );
                             tokio::time::sleep(delay + Duration::from_millis(jitter)).await;
                             delay = (delay * 2).min(Duration::from_millis(80));
                         }
@@ -4215,8 +5065,6 @@ impl DataEngine for BigtableEngine {
                 ));
             }
 
-            // Acquire participant intents in canonical sorted `(data_table, row_key)`
-            // order so `[k1, k2]` vs `[k2, k1]` never deadlocks.
             let mut lock_order: Vec<usize> = (0..resolved.len()).collect();
             lock_order.sort_by(|&a, &b| resolved[a].4.cmp(&resolved[b].4));
 
@@ -4292,7 +5140,8 @@ impl DataEngine for BigtableEngine {
                     ));
                 }
 
-                let jitter = rand::random_range(0..txn_delay.as_millis() as u64 + 1);
+                let jitter =
+                    rand::random_range(0..u64::try_from(txn_delay.as_millis()).unwrap_or(15) + 1);
                 tokio::time::sleep(txn_delay + Duration::from_millis(jitter)).await;
                 txn_delay = (txn_delay * 2).min(Duration::from_millis(80));
             }
@@ -4322,13 +5171,11 @@ impl DataEngine for BigtableEngine {
                 read_versions.push(version);
             }
 
-            let mut reasons: Vec<extenddb_core::types::CancellationReason> =
-                Vec::with_capacity(resolved.len());
+            let mut reasons: Vec<CancellationReason> = Vec::with_capacity(resolved.len());
             let mut staged_items: Vec<Option<Option<Item>>> = Vec::with_capacity(resolved.len());
             let mut any_failed = false;
 
             for (idx, (op, _, desc, _, _)) in resolved.iter().enumerate() {
-                use extenddb_core::types::CancellationReason;
                 use extenddb_core::validation;
 
                 let existing = &items_read[idx];
@@ -4452,12 +5299,10 @@ impl DataEngine for BigtableEngine {
                     &participants,
                 )
                 .await;
-                return Err(
-                    match extenddb_core::types::CancellationReason::resolve_key_faults(reasons) {
-                        Ok(resolved_reasons) => StorageError::TransactionCanceled(resolved_reasons),
-                        Err(message) => StorageError::Validation(message),
-                    },
-                );
+                return Err(match CancellationReason::resolve_key_faults(reasons) {
+                    Ok(resolved_reasons) => StorageError::TransactionCanceled(resolved_reasons),
+                    Err(message) => StorageError::Validation(message),
+                });
             }
 
             let mut log_records: Vec<crate::transact::TxnStreamRecord> = Vec::new();
@@ -4471,6 +5316,27 @@ impl DataEngine for BigtableEngine {
                 };
                 let existing = &items_read[idx];
 
+                let shadow_plans = match Self::prepare_shadow_plan(
+                    &op.key_info.key_schema,
+                    data_table,
+                    desc,
+                    existing.as_ref(),
+                    new_item.as_ref(),
+                ) {
+                    Ok(plans) => plans,
+                    Err(e) => {
+                        rollback_pending_txn(
+                            &coord,
+                            &txn_id,
+                            started_at_micros,
+                            &intents_placed,
+                            &participants,
+                        )
+                        .await;
+                        return Err(e);
+                    }
+                };
+
                 let next_version = next_occ_version(read_versions[idx]);
                 let payload = match &new_item {
                     Some(item) => crate::transact::TxnOpPayload::Put { item: item.clone() },
@@ -4483,27 +5349,11 @@ impl DataEngine for BigtableEngine {
                     row_existed: existing.is_some(),
                     new_version: Some(next_version),
                 });
-
-                let gsis = desc.global_secondary_indexes.clone().unwrap_or_default();
-                if let Err(e) = Self::build_gsi_participant_mutations(
-                    &op.key_info,
-                    data_table,
-                    &gsis,
-                    existing.as_ref(),
-                    new_item.as_ref(),
+                Self::shadow_plans_to_participant_mutations(
+                    &shadow_plans,
                     next_version,
                     &mut txn_mutations,
-                ) {
-                    rollback_pending_txn(
-                        &coord,
-                        &txn_id,
-                        started_at_micros,
-                        &intents_placed,
-                        &participants,
-                    )
-                    .await;
-                    return Err(e);
-                }
+                );
 
                 if let Some(attr_name) = ttl_attr.as_deref() {
                     let old_exp = existing.as_ref().and_then(|p| get_ttl_expiry(p, attr_name));
@@ -4612,7 +5462,34 @@ impl DataEngine for BigtableEngine {
                 ttl_mutations: Some(ttl_mutations),
                 token_meta,
             };
-            self.roll_forward(&txn_id, &committed_state).await?;
+
+            // Commit point has passed: log any post-commit roll_forward failure
+            // so `sweeper` finishes it rather than triggering SDK double-retries (`#9`).
+            if let Err(e) = self.roll_forward(&txn_id, &committed_state).await {
+                tracing::warn!(
+                    txn_id = %txn_id,
+                    error = %e,
+                    "post-commit TransactWriteItems roll_forward deferred to sweeper"
+                );
+            }
+
+            if meta_read_at.elapsed() >= FAST_WRITE_BUDGET {
+                for (idx, (op, data_table, desc, ttl_attr, participant)) in
+                    resolved.iter().enumerate()
+                {
+                    if staged_items[idx].is_some() {
+                        self.repair_slow_write_schema_drift(
+                            &op.key_info,
+                            data_table,
+                            &participant.row_key,
+                            desc,
+                            ttl_attr.as_deref(),
+                            items_read[idx].as_ref(),
+                        )
+                        .await;
+                    }
+                }
+            }
 
             Ok(())
         })
@@ -4624,37 +5501,58 @@ impl DataEngine for BigtableEngine {
     ) -> BoxFuture<'_, Result<u64, StorageError>> {
         Box::pin(async move {
             let cutoff = time::OffsetDateTime::now_utc().unix_timestamp() - max_age_seconds;
-            let rows = self
-                .cat()
-                .scan_prefix(keys::IDEMPOTENCY_SCAN_PREFIX)
-                .await
-                .map_err(map_catalog_err)?;
+            let prefix = keys::IDEMPOTENCY_SCAN_PREFIX;
+            let end_open = "idem;";
+            let mut start_key = prefix.to_owned();
+            let mut inclusive = true;
             let mut deleted = 0u64;
-            for (k, val) in rows {
-                if val
-                    .get("applied_at")
-                    .and_then(|v| v.as_i64())
-                    .is_some_and(|ts| ts < cutoff)
-                {
-                    let removed = self
-                        .cat()
-                        .mutate_json_cas(&k, map_catalog_err, move |cur| {
-                            if cur
-                                .as_ref()
-                                .and_then(|c| c.get("applied_at"))
-                                .and_then(|v| v.as_i64())
-                                .is_some_and(|ts| ts < cutoff)
-                            {
-                                Ok((CatalogJsonAction::Delete, true))
-                            } else {
-                                Ok((CatalogJsonAction::NoOp, false))
-                            }
-                        })
-                        .await
-                        .unwrap_or(false);
-                    if removed {
-                        deleted += 1;
+
+            loop {
+                let rows = self
+                    .cat()
+                    .scan_str_range(&start_key, inclusive, end_open, CATALOG_GC_PAGE_SIZE)
+                    .await?;
+                if rows.is_empty() {
+                    break;
+                }
+                let batch_len = rows.len();
+                let mut last_key = None;
+                for (k, val) in rows {
+                    last_key = Some(k.clone());
+                    if val
+                        .get("applied_at")
+                        .and_then(serde_json::Value::as_i64)
+                        .is_some_and(|ts| ts < cutoff)
+                    {
+                        let removed = self
+                            .cat()
+                            .mutate_json_cas(&k, std::convert::identity, move |cur| {
+                                if cur
+                                    .as_ref()
+                                    .and_then(|c| c.get("applied_at"))
+                                    .and_then(serde_json::Value::as_i64)
+                                    .is_some_and(|ts| ts < cutoff)
+                                {
+                                    Ok((CatalogJsonAction::Delete, true))
+                                } else {
+                                    Ok((CatalogJsonAction::NoOp, false))
+                                }
+                            })
+                            .await
+                            .unwrap_or(false);
+                        if removed {
+                            deleted += 1;
+                        }
                     }
+                }
+                if i64::try_from(batch_len).unwrap_or(i64::MAX) < CATALOG_GC_PAGE_SIZE {
+                    break;
+                }
+                if let Some(last) = last_key {
+                    start_key = last;
+                    inclusive = false;
+                } else {
+                    break;
                 }
             }
             Ok(deleted)
@@ -4676,25 +5574,15 @@ impl MetadataEngine for BigtableEngine {
             let row = self
                 .cat()
                 .get(&keys::table_meta(&account_id, &table_name))
-                .await
-                .map_err(map_catalog_err)?
+                .await?
                 .ok_or_else(|| StorageError::TableNotFound(table_name.clone()))?;
-            let ttl = row.get("ttl").cloned().unwrap_or(serde_json::Value::Null);
-            let enabled = ttl
-                .get("enabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let attribute = ttl
-                .get("attribute")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned);
+            let (status, attr, _) = parse_ttl_status_and_attr(&row);
             Ok(TimeToLiveDescription {
-                time_to_live_status: if enabled {
-                    TimeToLiveStatus::Enabled
-                } else {
-                    TimeToLiveStatus::Disabled
+                time_to_live_status: status,
+                attribute_name: match status {
+                    TimeToLiveStatus::Enabling | TimeToLiveStatus::Enabled => attr,
+                    TimeToLiveStatus::Disabling | TimeToLiveStatus::Disabled => None,
                 },
-                attribute_name: attribute,
             })
         })
     }
@@ -4713,15 +5601,35 @@ impl MetadataEngine for BigtableEngine {
             let meta_key = keys::table_meta(&account_id, &table_name);
             let tbl_for_err = table_name.clone();
             let attr_for_cas = attribute_name.clone();
+            let generation = Uuid::new_v4().to_string();
             self.cat()
-                .mutate_json_cas(&meta_key, map_catalog_err, move |existing| {
+                .mutate_json_cas(&meta_key, std::convert::identity, move |existing| {
                     let mut row =
                         existing.ok_or_else(|| StorageError::TableNotFound(tbl_for_err.clone()))?;
                     if let Some(obj) = row.as_object_mut() {
-                        obj.insert(
-                            "ttl".to_string(),
-                            json!({"enabled": enabled, "attribute": attr_for_cas}),
-                        );
+                        if enabled {
+                            // Report `ENABLING` until `create_ttl_index` completes
+                            // indexing pre-existing items (`#8`).
+                            obj.insert(
+                                "ttl".to_string(),
+                                json!({
+                                    "status": "ENABLING",
+                                    "enabled": true,
+                                    "attribute": attr_for_cas,
+                                    "generation": generation,
+                                }),
+                            );
+                        } else {
+                            obj.insert(
+                                "ttl".to_string(),
+                                json!({
+                                    "status": "DISABLED",
+                                    "enabled": false,
+                                    "attribute": serde_json::Value::Null,
+                                    "generation": generation,
+                                }),
+                            );
+                        }
                     }
                     Ok((CatalogJsonAction::Put(row), ()))
                 })
@@ -4739,7 +5647,7 @@ impl MetadataEngine for BigtableEngine {
         Box::pin(async move {
             let key = keys::tags(&arn);
             self.cat()
-                .mutate_json_cas(&key, map_catalog_err, move |existing| {
+                .mutate_json_cas(&key, std::convert::identity, move |existing| {
                     let cur = existing.unwrap_or_else(|| json!({}));
                     let mut map: serde_json::Map<String, serde_json::Value> =
                         serde_json::from_value(cur).unwrap_or_default();
@@ -4762,7 +5670,7 @@ impl MetadataEngine for BigtableEngine {
         Box::pin(async move {
             let key = keys::tags(&arn);
             self.cat()
-                .mutate_json_cas(&key, map_catalog_err, move |existing| {
+                .mutate_json_cas(&key, std::convert::identity, move |existing| {
                     let Some(cur) = existing else {
                         return Ok((CatalogJsonAction::NoOp, ()));
                     };
@@ -4785,7 +5693,7 @@ impl MetadataEngine for BigtableEngine {
         let arn = arn.to_owned();
         Box::pin(async move {
             let key = keys::tags(&arn);
-            let Some(cur) = self.cat().get(&key).await.map_err(map_catalog_err)? else {
+            let Some(cur) = self.cat().get(&key).await? else {
                 return Ok(Vec::new());
             };
             let map: serde_json::Map<String, serde_json::Value> =
@@ -4809,24 +5717,22 @@ impl MetadataEngine for BigtableEngine {
             let rows = self
                 .cat()
                 .scan_prefix(&keys::table_meta_scan_prefix(&account_id))
-                .await
-                .map_err(map_catalog_err)?;
+                .await?;
             let mut out = Vec::new();
             for (key, value) in rows {
-                let ttl = value.get("ttl").cloned().unwrap_or(serde_json::Value::Null);
-                let enabled = ttl
-                    .get("enabled")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let attr = ttl.get("attribute").and_then(|v| v.as_str());
-                if !enabled {
+                let (status, Some(attr), _) = parse_ttl_status_and_attr(&value) else {
+                    continue;
+                };
+                if !matches!(
+                    status,
+                    TimeToLiveStatus::Enabling | TimeToLiveStatus::Enabled
+                ) {
                     continue;
                 }
-                let Some(attr) = attr else { continue };
                 let Some(table_name) = key.rsplit_once(':').map(|(_, n)| n.to_owned()) else {
                     continue;
                 };
-                out.push((table_name, attr.to_string()));
+                out.push((table_name, attr));
             }
             Ok(out)
         })
@@ -4834,11 +5740,7 @@ impl MetadataEngine for BigtableEngine {
 
     fn all_tables_with_ttl(&self) -> BoxFuture<'_, Result<Vec<TtlTableInfo>, StorageError>> {
         Box::pin(async move {
-            let rows = self
-                .cat()
-                .scan_prefix(keys::TABLE_META_SCAN_PREFIX)
-                .await
-                .map_err(map_catalog_err)?;
+            let rows = self.cat().scan_prefix(keys::TABLE_META_SCAN_PREFIX).await?;
             let mut out = Vec::new();
             for (key, value) in rows {
                 let mut parts = key.splitn(3, ':');
@@ -4846,20 +5748,14 @@ impl MetadataEngine for BigtableEngine {
                 let (Some(acct_id), Some(table_name)) = (parts.next(), parts.next()) else {
                     continue;
                 };
-                let ttl = value.get("ttl").cloned().unwrap_or(serde_json::Value::Null);
-                let enabled = ttl
-                    .get("enabled")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let Some(attr) = ttl.get("attribute").and_then(|v| v.as_str()) else {
+                let (status, Some(attr), _) = parse_ttl_status_and_attr(&value) else {
                     continue;
                 };
-                if enabled {
-                    out.push((
-                        acct_id.to_string(),
-                        table_name.to_string(),
-                        attr.to_string(),
-                    ));
+                if matches!(
+                    status,
+                    TimeToLiveStatus::Enabling | TimeToLiveStatus::Enabled
+                ) {
+                    out.push((acct_id.to_string(), table_name.to_string(), attr));
                 }
             }
             Ok(out)
@@ -4869,25 +5765,54 @@ impl MetadataEngine for BigtableEngine {
     fn all_tables_with_ttl_index_ready(
         &self,
     ) -> BoxFuture<'_, Result<Vec<TtlTableInfo>, StorageError>> {
-        self.all_tables_with_ttl()
+        Box::pin(async move {
+            let rows = self.cat().scan_prefix(keys::TABLE_META_SCAN_PREFIX).await?;
+            let mut out = Vec::new();
+            for (key, value) in rows {
+                let mut parts = key.splitn(3, ':');
+                let _ = parts.next();
+                let (Some(acct_id), Some(table_name)) = (parts.next(), parts.next()) else {
+                    continue;
+                };
+                let (status, Some(attr), _) = parse_ttl_status_and_attr(&value) else {
+                    continue;
+                };
+                if status == TimeToLiveStatus::Enabled {
+                    out.push((acct_id.to_string(), table_name.to_string(), attr));
+                }
+            }
+            Ok(out)
+        })
     }
 
     fn create_ttl_index(
         &self,
-        _account_id: &str,
-        _table_name: &str,
-        _ttl_attribute: &str,
+        account_id: &str,
+        table_name: &str,
+        ttl_attribute: &str,
     ) -> BoxFuture<'_, Result<(), StorageError>> {
-        Box::pin(async { Ok(()) })
+        let account_id = account_id.to_owned();
+        let table_name = table_name.to_owned();
+        let ttl_attribute = ttl_attribute.to_owned();
+        Box::pin(async move {
+            let token = CancellationToken::new();
+            self.run_ttl_backfill_locked(&account_id, &table_name, &ttl_attribute, &token)
+                .await
+        })
     }
 
     fn drop_ttl_index(
         &self,
-        _account_id: &str,
-        _table_name: &str,
+        account_id: &str,
+        table_name: &str,
         _ttl_attribute: &str,
     ) -> BoxFuture<'_, Result<(), StorageError>> {
-        Box::pin(async { Ok(()) })
+        let account_id = account_id.to_owned();
+        let table_name = table_name.to_owned();
+        Box::pin(async move {
+            self.purge_ttl_entries_for_table(&account_id, &table_name)
+                .await
+        })
     }
 
     fn find_expired_items_indexed(
@@ -4917,8 +5842,7 @@ impl MetadataEngine for BigtableEngine {
             let rows = self
                 .cat()
                 .scan_prefix(&keys::table_meta_scan_prefix(&account_id))
-                .await
-                .map_err(map_catalog_err)?;
+                .await?;
             Ok(rows
                 .into_iter()
                 .filter_map(|(k, _)| k.rsplit_once(':').map(|(_, n)| n.to_owned()))
@@ -4928,11 +5852,7 @@ impl MetadataEngine for BigtableEngine {
 
     fn all_active_tables(&self) -> BoxFuture<'_, Result<Vec<(String, String)>, StorageError>> {
         Box::pin(async move {
-            let rows = self
-                .cat()
-                .scan_prefix(keys::TABLE_META_SCAN_PREFIX)
-                .await
-                .map_err(map_catalog_err)?;
+            let rows = self.cat().scan_prefix(keys::TABLE_META_SCAN_PREFIX).await?;
             let mut out = Vec::new();
             for (key, _) in rows {
                 let mut parts = key.splitn(3, ':');
@@ -4974,9 +5894,7 @@ impl StreamEngine for BigtableEngine {
                 };
                 sid
             };
-            crate::streams::write_record(&self.cat(), &target_shard, &record)
-                .await
-                .map_err(map_catalog_err)
+            crate::streams::write_record(&self.cat(), &target_shard, &record).await
         })
     }
 
@@ -5000,19 +5918,13 @@ impl StreamEngine for BigtableEngine {
             let Some(table_row) = self
                 .cat()
                 .get(&keys::table_meta(&account_id, &table_name))
-                .await
-                .map_err(map_catalog_err)?
+                .await?
             else {
                 return Err(extenddb_storage::util::stream_does_not_exist());
             };
             let desc = deserialize_table_description_row(&table_row)?;
 
-            let Some(shard_val) = self
-                .cat()
-                .get(&keys::stream_shard(&shard_id))
-                .await
-                .map_err(map_catalog_err)?
-            else {
+            let Some(shard_val) = self.cat().get(&keys::stream_shard(&shard_id)).await? else {
                 return Err(extenddb_storage::util::stream_does_not_exist());
             };
             let shard_meta: crate::streams::ShardMeta = serde_json::from_value(shard_val)
@@ -5027,9 +5939,8 @@ impl StreamEngine for BigtableEngine {
                 desc.latest_stream_label.as_deref(),
                 &arn_label,
                 || async {
-                    let all = crate::streams::load_table_shards(&self.cat(), &desc.table_id)
-                        .await
-                        .map_err(map_catalog_err)?;
+                    let all =
+                        crate::streams::load_table_shards(&self.cat(), &desc.table_id).await?;
                     let lineage: Vec<_> = all
                         .iter()
                         .map(crate::streams::ShardMeta::to_lineage_row)
@@ -5045,26 +5956,28 @@ impl StreamEngine for BigtableEngine {
                 return Err(extenddb_storage::util::stream_does_not_exist());
             }
 
+            // Bounded server-side range read starting strictly after `after_sequence` (`#23`).
+            let prefix = keys::stream_record_shard_prefix(&shard_id);
+            let end_open = format!("stream_record:{shard_id};");
+            let (start_key, start_inclusive) = match &after {
+                Some(seq) => (format!("{prefix}{seq}"), false),
+                None => (prefix, true),
+            };
+            let fetch_limit = if limit > 0 { limit } else { 1_000 };
             let rows = self
                 .cat()
-                .scan_prefix(&keys::stream_record_shard_prefix(&shard_id))
-                .await
-                .map_err(map_catalog_err)?;
+                .scan_str_range(&start_key, start_inclusive, &end_open, fetch_limit)
+                .await?;
+
             let mut records: Vec<StreamRecord> = Vec::with_capacity(rows.len());
-            for (key, value) in rows {
-                let seq = key.rsplit_once(':').map(|(_, s)| s).unwrap_or("");
-                if let Some(after) = &after
-                    && seq <= after.as_str()
-                {
-                    continue;
-                }
+            for (_key, value) in rows {
                 if let Ok(record) = serde_json::from_value::<StreamRecord>(value) {
                     records.push(record);
                 }
             }
             records.sort_by(|a, b| a.dynamodb.sequence_number.cmp(&b.dynamodb.sequence_number));
-            if limit > 0 && records.len() > limit as usize {
-                records.truncate(limit as usize);
+            if limit > 0 && records.len() > usize::try_from(limit).unwrap_or(usize::MAX) {
+                records.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
             }
             let next_after = records.last().map(|r| r.dynamodb.sequence_number.clone());
             Ok((records, next_after))
@@ -5088,13 +6001,10 @@ impl StreamEngine for BigtableEngine {
             let row = self
                 .cat()
                 .get(&keys::table_meta(&account_id, &table_name))
-                .await
-                .map_err(map_catalog_err)?
+                .await?
                 .ok_or_else(|| extenddb_storage::util::stream_not_found(&arn))?;
             let desc = deserialize_table_description_row(&row)?;
-            let shards = crate::streams::load_table_shards(&self.cat(), &desc.table_id)
-                .await
-                .map_err(map_catalog_err)?;
+            let shards = crate::streams::load_table_shards(&self.cat(), &desc.table_id).await?;
             let shard_rows: Vec<_> = shards
                 .iter()
                 .map(crate::streams::ShardMeta::to_lineage_row)
@@ -5129,8 +6039,7 @@ impl StreamEngine for BigtableEngine {
             let rows = self
                 .cat()
                 .scan_prefix(&keys::table_meta_scan_prefix(&account_id))
-                .await
-                .map_err(map_catalog_err)?;
+                .await?;
             let mut tables = Vec::with_capacity(rows.len());
             let mut all_shards = Vec::new();
             for (_key, value) in rows {
@@ -5142,9 +6051,7 @@ impl StreamEngine for BigtableEngine {
                 {
                     continue;
                 }
-                let shards = crate::streams::load_table_shards(&self.cat(), &desc.table_id)
-                    .await
-                    .map_err(map_catalog_err)?;
+                let shards = crate::streams::load_table_shards(&self.cat(), &desc.table_id).await?;
                 all_shards.extend(shards.iter().map(crate::streams::ShardMeta::to_lineage_row));
                 tables.push(Self::table_stream_row(&desc));
             }
@@ -5165,36 +6072,81 @@ impl StreamEngine for BigtableEngine {
     ) -> BoxFuture<'_, Result<u64, StorageError>> {
         Box::pin(async move {
             let cutoff = time::OffsetDateTime::now_utc().unix_timestamp() - retention_hours * 3_600;
-            let rows = self
-                .cat()
-                .scan_prefix("stream_record:")
-                .await
-                .map_err(map_catalog_err)?;
             let mut deleted = 0u64;
-            for (k, value) in rows {
-                if let Ok(rec) = serde_json::from_value::<StreamRecord>(value)
-                    && rec.dynamodb.approximate_creation_date_time < cutoff
-                {
-                    let _ = crate::streams::ensure_shard_past_record(&self.cat(), &k).await;
-                    if self.cat().delete(&k).await.is_ok() {
-                        deleted += 1;
+
+            let mut start_key = "stream_record:".to_owned();
+            let mut inclusive = true;
+            loop {
+                let rows = self
+                    .cat()
+                    .scan_str_range(
+                        &start_key,
+                        inclusive,
+                        "stream_record;",
+                        CATALOG_GC_PAGE_SIZE,
+                    )
+                    .await?;
+                if rows.is_empty() {
+                    break;
+                }
+                let batch_len = rows.len();
+                let mut last_key = None;
+                for (k, value) in rows {
+                    last_key = Some(k.clone());
+                    if let Ok(rec) = serde_json::from_value::<StreamRecord>(value)
+                        && rec.dynamodb.approximate_creation_date_time < cutoff
+                    {
+                        let _ = crate::streams::ensure_shard_past_record(&self.cat(), &k).await;
+                        if self.cat().delete(&k).await.is_ok() {
+                            deleted += 1;
+                        }
                     }
                 }
+                if i64::try_from(batch_len).unwrap_or(i64::MAX) < CATALOG_GC_PAGE_SIZE {
+                    break;
+                }
+                if let Some(last) = last_key {
+                    start_key = last;
+                    inclusive = false;
+                } else {
+                    break;
+                }
             }
-            if let Ok(dedups) = self.cat().scan_prefix(keys::STREAM_DEDUP_SCAN_PREFIX).await {
+
+            let mut dedup_start = keys::STREAM_DEDUP_SCAN_PREFIX.to_owned();
+            let mut dedup_inclusive = true;
+            loop {
+                let Ok(dedups) = self
+                    .cat()
+                    .scan_str_range(
+                        &dedup_start,
+                        dedup_inclusive,
+                        "stream_dedup;",
+                        CATALOG_GC_PAGE_SIZE,
+                    )
+                    .await
+                else {
+                    break;
+                };
+                if dedups.is_empty() {
+                    break;
+                }
+                let batch_len = dedups.len();
+                let mut last_key = None;
                 for (dk, dval) in dedups {
+                    last_key = Some(dk.clone());
                     if dval
                         .get("created_at")
-                        .and_then(|v| v.as_i64())
+                        .and_then(serde_json::Value::as_i64)
                         .is_some_and(|ts| ts < cutoff)
                     {
                         let _ = self
                             .cat()
-                            .mutate_json_cas(&dk, map_catalog_err, move |cur| {
+                            .mutate_json_cas(&dk, std::convert::identity, move |cur| {
                                 if cur
                                     .as_ref()
                                     .and_then(|c| c.get("created_at"))
-                                    .and_then(|v| v.as_i64())
+                                    .and_then(serde_json::Value::as_i64)
                                     .is_some_and(|ts| ts < cutoff)
                                 {
                                     Ok((CatalogJsonAction::Delete, ()))
@@ -5205,7 +6157,17 @@ impl StreamEngine for BigtableEngine {
                             .await;
                     }
                 }
+                if i64::try_from(batch_len).unwrap_or(i64::MAX) < CATALOG_GC_PAGE_SIZE {
+                    break;
+                }
+                if let Some(last) = last_key {
+                    dedup_start = last;
+                    dedup_inclusive = false;
+                } else {
+                    break;
+                }
             }
+
             Ok(deleted)
         })
     }
@@ -5229,9 +6191,7 @@ impl StreamEngine for BigtableEngine {
                     }
                     other => other,
                 })?;
-            let shards = crate::streams::load_table_shards(&self.cat(), &desc.table_id)
-                .await
-                .map_err(map_catalog_err)?;
+            let shards = crate::streams::load_table_shards(&self.cat(), &desc.table_id).await?;
             let shard_rows: Vec<_> = shards
                 .iter()
                 .map(crate::streams::ShardMeta::to_lineage_row)
@@ -5270,14 +6230,12 @@ impl StreamEngine for BigtableEngine {
             let (table_row, shard_rows) = match self
                 .cat()
                 .get(&keys::table_meta(&account_id, &table_name))
-                .await
-                .map_err(map_catalog_err)?
+                .await?
             {
                 Some(row) => {
                     let desc = deserialize_table_description_row(&row)?;
-                    let shards = crate::streams::load_table_shards(&self.cat(), &desc.table_id)
-                        .await
-                        .map_err(map_catalog_err)?;
+                    let shards =
+                        crate::streams::load_table_shards(&self.cat(), &desc.table_id).await?;
                     let rows: Vec<_> = shards
                         .iter()
                         .map(crate::streams::ShardMeta::to_lineage_row)
@@ -5300,11 +6258,9 @@ impl StreamEngine for BigtableEngine {
         shard_id: &str,
     ) -> BoxFuture<'_, Result<Option<String>, StorageError>> {
         let shard = shard_id.to_owned();
-        Box::pin(async move {
-            crate::streams::latest_sequence_for_shard(&self.cat(), &shard)
-                .await
-                .map_err(map_catalog_err)
-        })
+        Box::pin(
+            async move { crate::streams::latest_sequence_for_shard(&self.cat(), &shard).await },
+        )
     }
 }
 
@@ -5370,16 +6326,8 @@ async fn insert_ttl_index_entry_at(
         "TTL index timestamp must be positive and millisecond-aligned, got {ts_micros}"
     );
     let mut data = client.data();
-    let ttl_key = crate::data::encoding::ttl_key::encode_ttl_key(
-        account_id,
-        table_name,
-        base_row_key,
-        expiry,
-    );
+    let ttl_key = encode_ttl_key(account_id, table_name, base_row_key, expiry);
     let mut mutations = Vec::with_capacity(2);
-    // Place SetCell FIRST and bounded DeleteFromColumn([0, ts_micros)) SECOND so
-    // sequential per-row mutation application on `cbtemulator` never exposes an
-    // empty TTL index cell to a concurrent `ttl_worker` scan.
     mutations.push(Mutation {
         mutation: Some(mutation::Mutation::SetCell(SetCell {
             family_name: "d".to_string(),
@@ -5399,7 +6347,7 @@ async fn insert_ttl_index_entry_at(
     }
 
     let req = MutateRowRequest {
-        table_name: client.full_table_name(crate::data::encoding::ttl_key::TTL_INDEX_TABLE),
+        table_name: client.full_table_name(TTL_INDEX_TABLE),
         app_profile_id: client.app_profile_id.clone().unwrap_or_default(),
         row_key: ttl_key,
         mutations,
@@ -5424,14 +6372,9 @@ async fn delete_ttl_index_entry_before(
         "TTL index delete bound must be positive and millisecond-aligned, got {exclusive_end_ts_micros}"
     );
     let mut data = client.data();
-    let ttl_key = crate::data::encoding::ttl_key::encode_ttl_key(
-        account_id,
-        table_name,
-        base_row_key,
-        expiry,
-    );
+    let ttl_key = encode_ttl_key(account_id, table_name, base_row_key, expiry);
     let req = MutateRowRequest {
-        table_name: client.full_table_name(crate::data::encoding::ttl_key::TTL_INDEX_TABLE),
+        table_name: client.full_table_name(TTL_INDEX_TABLE),
         app_profile_id: client.app_profile_id.clone().unwrap_or_default(),
         row_key: ttl_key,
         mutations: vec![Mutation {

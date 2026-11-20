@@ -17,11 +17,13 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_storage::CatalogStore;
 use extenddb_storage::authorization_store::{AuthorizationStore, SessionData};
 use extenddb_storage::diagnostics::{DiagError, DiagResult, DiagnosticsStore};
+use extenddb_storage::error::StorageError;
 use extenddb_storage::management_store::{
-    AccessKeyCreated, AccountDetail, AdminEntry, AdminStore, GroupDetail, GroupListEntry,
-    ManagementStore, MetricsFilter, MetricsRow, MetricsStore, OpError, OpResult, PasswordHashStore,
-    RateLimitStore, RoleDetail, RoleListEntry, SecretPage, SecretWrite, SessionPolicyEntry,
-    SettingsStore, StoredSecretRow, UserDetail, UserListEntry,
+    AccessKeyCreated, AccountDetail, AdminEntry, AdminStore, DEFAULT_ACCOUNT_SETTING, GroupDetail,
+    GroupListEntry, ManagementStore, MetricsFilter, MetricsRow, MetricsStore, OpError, OpResult,
+    PasswordHashStore, RateLimitStore, RoleDetail, RoleListEntry, SecretPage, SecretWrite,
+    SessionPolicyEntry, SettingsStore, StoredSecretRow, UserDetail, UserListEntry,
+    generate_access_key_id, generate_secret_key, self_service_policy,
 };
 use extenddb_storage::secret_keys::{SecretKeys, SecretRow, SecretTable, require_keys};
 use futures::future::BoxFuture;
@@ -36,9 +38,18 @@ use crate::catalog::{Catalog, CatalogJsonAction, keys};
 use crate::data::admin::AdminClient;
 use crate::data::client::BigtableClient;
 
-const DEV_ADMIN_POLICY: &str =
-    r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#;
-const DEFAULT_ACCOUNT_SETTING: &str = "default_account_id";
+fn internal_op_err(err: impl std::fmt::Display) -> OpError {
+    OpError::Internal(err.to_string())
+}
+
+fn storage_diag_err(err: StorageError) -> DiagError {
+    match err {
+        StorageError::Connection(msg) | StorageError::Transient(msg) => {
+            DiagError::ConnectionFailed(msg)
+        }
+        other => DiagError::QueryFailed(other.to_string()),
+    }
+}
 
 fn now_rfc3339() -> String {
     let now = OffsetDateTime::now_utc();
@@ -54,44 +65,6 @@ fn parse_created_at(v: &serde_json::Value) -> OffsetDateTime {
         .and_then(serde_json::Value::as_str)
         .and_then(parse_rfc3339)
         .unwrap_or(OffsetDateTime::UNIX_EPOCH)
-}
-
-/// Generate a 20-character access key ID (`AKIAEXTENDDB` + 8 uppercase
-/// alphanumerics), matching the branded prefix convention across ExtendDB
-/// backends so local keys are distinguishable from AWS IAM keys.
-fn generate_access_key_id() -> String {
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let mut rng = rand::rng();
-    let suffix: String = (0..8)
-        .map(|_| CHARSET[rand::Rng::random_range(&mut rng, 0..CHARSET.len())] as char)
-        .collect();
-    format!("AKIAEXTENDDB{suffix}")
-}
-
-/// Generate a 40-character secret access key (`extenddb` + 32 base64 characters).
-fn generate_secret_access_key() -> String {
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut rng = rand::rng();
-    let suffix: String = (0..32)
-        .map(|_| CHARSET[rand::Rng::random_range(&mut rng, 0..CHARSET.len())] as char)
-        .collect();
-    format!("extenddb{suffix}")
-}
-
-fn self_service_policy(user_arn: &str) -> serde_json::Value {
-    json!({
-        "Version": "2012-10-17",
-        "Statement": [{
-            "Effect": "Allow",
-            "Action": [
-                "iam:CreateAccessKey",
-                "iam:DeleteAccessKey",
-                "iam:ListAccessKeys",
-                "iam:ChangePassword"
-            ],
-            "Resource": user_arn,
-        }]
-    })
 }
 
 fn policy_row_key(
@@ -213,16 +186,12 @@ fn decode_stored_secret(v: &serde_json::Value) -> Option<Vec<u8>> {
 pub struct BigtableCatalogStore {
     client: Arc<BigtableClient>,
     keys: Option<Arc<SecretKeys>>,
-    dev_mode: bool,
 }
 
 impl BigtableCatalogStore {
-    pub fn new(client: Arc<BigtableClient>, keys: Option<Arc<SecretKeys>>, dev_mode: bool) -> Self {
-        Self {
-            client,
-            keys,
-            dev_mode,
-        }
+    #[must_use]
+    pub fn new(client: Arc<BigtableClient>, keys: Option<Arc<SecretKeys>>) -> Self {
+        Self { client, keys }
     }
 
     fn cat(&self) -> Catalog<'_> {
@@ -246,7 +215,7 @@ impl BigtableCatalogStore {
             .cat()
             .get(&keys::account(account_id))
             .await
-            .map_err(OpError::Internal)?
+            .map_err(internal_op_err)?
             .is_none()
         {
             return Err(OpError::NotFound("Account not found".to_owned()));
@@ -257,7 +226,7 @@ impl BigtableCatalogStore {
     async fn upsert_tags_row(&self, row_key: &str, tags: &[(String, String)]) -> OpResult<()> {
         let tags = tags.to_vec();
         self.cat()
-            .mutate_json_cas(row_key, OpError::Internal, move |existing| {
+            .mutate_json_cas(row_key, internal_op_err, move |existing| {
                 let cur = existing.unwrap_or_else(|| json!({}));
                 let mut map: BTreeMap<String, String> = cur
                     .as_object()
@@ -280,7 +249,7 @@ impl BigtableCatalogStore {
     async fn remove_tags_from_row(&self, row_key: &str, tag_keys: &[String]) -> OpResult<()> {
         let tag_keys = tag_keys.to_vec();
         self.cat()
-            .mutate_json_cas(row_key, OpError::Internal, move |existing| {
+            .mutate_json_cas(row_key, internal_op_err, move |existing| {
                 let Some(cur) = existing else {
                     return Ok((CatalogJsonAction::NoOp, ()));
                 };
@@ -316,7 +285,7 @@ impl DiagnosticsStore for BigtableCatalogStore {
                 .cat()
                 .scan_prefix(keys::TABLE_META_SCAN_PREFIX)
                 .await
-                .map_err(DiagError::QueryFailed)?;
+                .map_err(storage_diag_err)?;
             Ok(tables.len() as i64)
         })
     }
@@ -327,7 +296,7 @@ impl DiagnosticsStore for BigtableCatalogStore {
                 .cat()
                 .scan_prefix(keys::TABLE_META_SCAN_PREFIX)
                 .await
-                .map_err(DiagError::QueryFailed)?;
+                .map_err(storage_diag_err)?;
             let mut total = 0i64;
             for (_, v) in tables {
                 let desc = v.get("description").unwrap_or(&serde_json::Value::Null);
@@ -349,11 +318,25 @@ impl DiagnosticsStore for BigtableCatalogStore {
         _key: &extenddb_storage::KeySource,
     ) -> BoxFuture<'_, DiagResult<String>> {
         Box::pin(async move {
-            let mut admin = AdminClient::connect(&self.client)
-                .await
-                .map_err(DiagError::ConnectionFailed)?;
-            admin.list_tables().await.map_err(DiagError::QueryFailed)?;
-            Ok(self.client.instance_id.clone())
+            let data_inst = self.client.config().effective_data_instance_id().to_owned();
+            if data_inst != self.client.instance_id {
+                let mut data_cfg = self.client.config().clone();
+                data_cfg.instance_id.clone_from(&data_inst);
+                let data_client = BigtableClient::connect(&data_cfg)
+                    .await
+                    .map_err(DiagError::ConnectionFailed)?;
+                let mut admin = AdminClient::connect(&data_client)
+                    .await
+                    .map_err(DiagError::ConnectionFailed)?;
+                admin.list_tables().await.map_err(DiagError::QueryFailed)?;
+                Ok(data_inst)
+            } else {
+                let mut admin = AdminClient::connect(&self.client)
+                    .await
+                    .map_err(DiagError::ConnectionFailed)?;
+                admin.list_tables().await.map_err(DiagError::QueryFailed)?;
+                Ok(self.client.instance_id.clone())
+            }
         })
     }
 }
@@ -368,7 +351,7 @@ impl SettingsStore for BigtableCatalogStore {
             let row = cat
                 .get(&keys::setting(&key))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             if let Some(val) = row.and_then(|v| {
                 v.get("value")
                     .and_then(serde_json::Value::as_str)
@@ -377,7 +360,7 @@ impl SettingsStore for BigtableCatalogStore {
                 return Ok(Some(val));
             }
             if key == "catalog_version" {
-                let ver_row = cat.get(keys::VERSION).await.map_err(OpError::Internal)?;
+                let ver_row = cat.get(keys::VERSION).await.map_err(internal_op_err)?;
                 return Ok(ver_row.and_then(|v| {
                     v.get("catalog_version")
                         .and_then(serde_json::Value::as_str)
@@ -401,7 +384,7 @@ impl SettingsStore for BigtableCatalogStore {
                     }),
                 )
                 .await
-                .map_err(OpError::Internal)
+                .map_err(internal_op_err)
         })
     }
 
@@ -417,7 +400,7 @@ impl SettingsStore for BigtableCatalogStore {
         Box::pin(async move {
             let row_key = keys::setting(&key);
             self.cat()
-                .mutate_json_cas(&row_key, OpError::Internal, move |existing| {
+                .mutate_json_cas(&row_key, internal_op_err, move |existing| {
                     let Some(parsed) = existing else {
                         return Ok((CatalogJsonAction::NoOp, false));
                     };
@@ -442,7 +425,7 @@ impl SettingsStore for BigtableCatalogStore {
             let rows = cat
                 .scan_prefix(keys::SETTING_SCAN_PREFIX)
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             let mut out: Vec<(String, String)> = rows
                 .into_iter()
                 .filter_map(|(rk, v)| {
@@ -459,7 +442,7 @@ impl SettingsStore for BigtableCatalogStore {
                 })
                 .collect();
             if !out.iter().any(|(k, _)| k == "catalog_version")
-                && let Some(ver_row) = cat.get(keys::VERSION).await.map_err(OpError::Internal)?
+                && let Some(ver_row) = cat.get(keys::VERSION).await.map_err(internal_op_err)?
                 && let Some(ver) = ver_row
                     .get("catalog_version")
                     .and_then(serde_json::Value::as_str)
@@ -484,7 +467,7 @@ impl MetricsStore for BigtableCatalogStore {
                 let dims = metric_dims_hash(r);
                 let rk = keys::metric_row(bucket_secs, &dims);
                 let r_clone = r.clone();
-                cat.mutate_json_cas(&rk, OpError::Internal, move |existing| {
+                cat.mutate_json_cas(&rk, internal_op_err, move |existing| {
                     let (sum, count, min, max) = match existing {
                         Some(prev) => {
                             let p_sum = prev
@@ -555,7 +538,7 @@ impl MetricsStore for BigtableCatalogStore {
                 .cat()
                 .scan_range(start_key, end_key, 0)
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
 
             let mut out = Vec::with_capacity(raw.len());
             for (_, v) in raw {
@@ -656,7 +639,7 @@ impl MetricsStore for BigtableCatalogStore {
                     0,
                 )
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             let to_delete: Vec<String> = stale
                 .into_iter()
                 .filter(|(_, v)| {
@@ -669,7 +652,7 @@ impl MetricsStore for BigtableCatalogStore {
             self.cat()
                 .delete_keys(to_delete.iter().map(String::as_str))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             Ok(())
         })
     }
@@ -694,7 +677,7 @@ impl RateLimitStore for BigtableCatalogStore {
                 .cat()
                 .scan_prefix(&keys::failed_login_principal_prefix(&principal))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             let count = rows
                 .into_iter()
                 .filter(|(_, v)| {
@@ -722,7 +705,7 @@ impl RateLimitStore for BigtableCatalogStore {
                 .cat()
                 .scan_prefix(keys::FAILED_LOGIN_SCAN_PREFIX)
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             let count = rows
                 .into_iter()
                 .filter(|(_, v)| {
@@ -801,7 +784,7 @@ impl AdminStore for BigtableCatalogStore {
                     }),
                 )
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             if !inserted {
                 return Err(OpError::AlreadyExists(
                     "Admin user already exists".to_owned(),
@@ -817,7 +800,7 @@ impl AdminStore for BigtableCatalogStore {
                 .cat()
                 .scan_prefix("admin:")
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             let mut entries: Vec<AdminEntry> = rows
                 .into_iter()
                 .filter_map(|(rk, v)| {
@@ -844,7 +827,7 @@ impl AdminStore for BigtableCatalogStore {
                 .cat()
                 .delete_if_present(&keys::admin(&admin_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             if !deleted {
                 return Err(OpError::NotFound("Admin user not found".to_owned()));
             }
@@ -862,7 +845,7 @@ impl AdminStore for BigtableCatalogStore {
         Box::pin(async move {
             let rk = keys::admin(&admin_name);
             self.cat()
-                .mutate_json_cas(&rk, OpError::Internal, move |existing| {
+                .mutate_json_cas(&rk, internal_op_err, move |existing| {
                     let mut doc = existing
                         .ok_or_else(|| OpError::NotFound("Admin user not found".to_owned()))?;
                     if let Some(obj) = doc.as_object_mut() {
@@ -902,7 +885,7 @@ impl PasswordHashStore for BigtableCatalogStore {
                 .cat()
                 .get(&keys::admin(&admin_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             Ok(row.and_then(|v| {
                 v.get("password_hash")
                     .and_then(serde_json::Value::as_str)
@@ -923,7 +906,7 @@ impl PasswordHashStore for BigtableCatalogStore {
                 .cat()
                 .get(&keys::user(&account_id, &user_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             Ok(row.and_then(|v| {
                 v.get("password_hash")
                     .and_then(serde_json::Value::as_str)
@@ -951,7 +934,7 @@ impl ManagementStore for BigtableCatalogStore {
                     }),
                 )
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             if !inserted {
                 return Err(OpError::AlreadyExists("Account already exists".to_owned()));
             }
@@ -967,7 +950,7 @@ impl ManagementStore for BigtableCatalogStore {
             let tables = cat
                 .scan_prefix(&keys::table_meta_scan_prefix(&account_id))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             if !tables.is_empty() {
                 return Err(OpError::HasDependents(
                     "Cannot delete account with existing tables. Delete all tables first."
@@ -988,15 +971,13 @@ impl ManagementStore for BigtableCatalogStore {
                 keys::role_tags_account_prefix(&account_id),
                 keys::failed_login_account_prefix(&account_id),
             ] {
-                cat.delete_prefix(&prefix)
-                    .await
-                    .map_err(OpError::Internal)?;
+                cat.delete_prefix(&prefix).await.map_err(internal_op_err)?;
             }
 
             let all_aks = cat
                 .scan_prefix(keys::ACCESS_KEY_SCAN_PREFIX)
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             let acct_ak_keys: Vec<String> = all_aks
                 .into_iter()
                 .filter(|(_, v)| {
@@ -1006,12 +987,12 @@ impl ManagementStore for BigtableCatalogStore {
                 .collect();
             cat.delete_keys(acct_ak_keys.iter().map(String::as_str))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
 
             let all_sessions = cat
                 .scan_prefix(keys::IAM_SESSION_SCAN_PREFIX)
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             let mut session_keys_to_delete: Vec<String> = Vec::new();
             for (rk, v) in all_sessions {
                 if v.get("account_id").and_then(serde_json::Value::as_str) == Some(&account_id) {
@@ -1023,11 +1004,11 @@ impl ManagementStore for BigtableCatalogStore {
             }
             cat.delete_keys(session_keys_to_delete.iter().map(String::as_str))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
 
             cat.delete(&keys::account(&account_id))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             Ok(())
         })
     }
@@ -1051,7 +1032,7 @@ impl ManagementStore for BigtableCatalogStore {
                 .cat()
                 .scan_prefix(keys::ACCOUNT_SCAN_PREFIX)
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             let mut out: Vec<(String, String, OffsetDateTime)> = rows
                 .into_iter()
                 .filter_map(|(rk, v)| {
@@ -1083,7 +1064,7 @@ impl ManagementStore for BigtableCatalogStore {
                 .cat()
                 .get(&keys::account(&account_id))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             let Some(v) = row else {
                 return Ok(Vec::new());
             };
@@ -1106,7 +1087,7 @@ impl ManagementStore for BigtableCatalogStore {
                 .cat()
                 .get(&keys::account(&account_id))
                 .await
-                .map_err(OpError::Internal)?
+                .map_err(internal_op_err)?
             else {
                 return Ok(None);
             };
@@ -1148,12 +1129,12 @@ impl ManagementStore for BigtableCatalogStore {
                 .cat()
                 .scan_prefix(keys::ACCOUNT_SCAN_PREFIX)
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             let admins = self
                 .cat()
                 .scan_prefix("admin:")
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             Ok((accts.len() as i64, admins.len() as i64))
         })
     }
@@ -1186,7 +1167,7 @@ impl ManagementStore for BigtableCatalogStore {
                     }),
                 )
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             if !inserted {
                 return Err(OpError::AlreadyExists("IAM user already exists".to_owned()));
             }
@@ -1194,18 +1175,18 @@ impl ManagementStore for BigtableCatalogStore {
             // Clear any leftover attachments or failed-login history under this name.
             cat.delete_prefix(&keys::user_policy_scan_prefix(&account_id, &user_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             cat.delete(&keys::boundary(&account_id, "user", &user_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             cat.delete(&keys::user_tags(&account_id, &user_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             cat.delete_prefix(&keys::failed_login_principal_prefix(&format!(
                 "{account_id}/{user_name}"
             )))
             .await
-            .map_err(OpError::Internal)?;
+            .map_err(internal_op_err)?;
 
             let self_policy = self_service_policy(&user_arn);
             cat.put(
@@ -1220,7 +1201,7 @@ impl ManagementStore for BigtableCatalogStore {
                 }),
             )
             .await
-            .map_err(OpError::Internal)?;
+            .map_err(internal_op_err)?;
             Ok(())
         })
     }
@@ -1233,30 +1214,30 @@ impl ManagementStore for BigtableCatalogStore {
             let deleted = cat
                 .delete_if_present(&keys::user(&account_id, &user_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             if !deleted {
                 return Err(OpError::NotFound("IAM user not found".to_owned()));
             }
 
             cat.delete_prefix(&keys::user_policy_scan_prefix(&account_id, &user_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             cat.delete(&keys::boundary(&account_id, "user", &user_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             cat.delete(&keys::user_tags(&account_id, &user_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             cat.delete_prefix(&keys::failed_login_principal_prefix(&format!(
                 "{account_id}/{user_name}"
             )))
             .await
-            .map_err(OpError::Internal)?;
+            .map_err(internal_op_err)?;
 
             let memberships = cat
                 .scan_prefix(&keys::group_member_account_prefix(&account_id))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             let member_keys: Vec<String> = memberships
                 .into_iter()
                 .filter(|(_, v)| {
@@ -1266,12 +1247,12 @@ impl ManagementStore for BigtableCatalogStore {
                 .collect();
             cat.delete_keys(member_keys.iter().map(String::as_str))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
 
             let aks = cat
                 .scan_prefix(keys::ACCESS_KEY_SCAN_PREFIX)
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             let ak_keys: Vec<String> = aks
                 .into_iter()
                 .filter(|(_, v)| {
@@ -1283,7 +1264,7 @@ impl ManagementStore for BigtableCatalogStore {
                 .collect();
             cat.delete_keys(ak_keys.iter().map(String::as_str))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
 
             Ok(())
         })
@@ -1296,7 +1277,7 @@ impl ManagementStore for BigtableCatalogStore {
                 .cat()
                 .scan_prefix(&keys::user_scan_prefix(&account_id))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             let mut out: Vec<UserListEntry> = rows
                 .into_iter()
                 .filter_map(|(rk, v)| {
@@ -1339,7 +1320,7 @@ impl ManagementStore for BigtableCatalogStore {
                 .cat()
                 .get(&keys::user(&account_id, &user_name))
                 .await
-                .map_err(OpError::Internal)?
+                .map_err(internal_op_err)?
                 .is_none()
             {
                 return Ok(None);
@@ -1361,7 +1342,7 @@ impl ManagementStore for BigtableCatalogStore {
                 .cat()
                 .scan_prefix(&keys::group_member_account_prefix(&account_id))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             let mut groups: Vec<String> = memberships
                 .into_iter()
                 .filter_map(|(_, v)| {
@@ -1411,7 +1392,7 @@ impl ManagementStore for BigtableCatalogStore {
         Box::pin(async move {
             let rk = keys::user(&account_id, &user_name);
             self.cat()
-                .mutate_json_cas(&rk, OpError::Internal, move |existing| {
+                .mutate_json_cas(&rk, internal_op_err, move |existing| {
                     let mut doc = existing
                         .ok_or_else(|| OpError::NotFound("IAM user not found".to_owned()))?;
                     if let Some(obj) = doc.as_object_mut() {
@@ -1440,7 +1421,7 @@ impl ManagementStore for BigtableCatalogStore {
                 .cat()
                 .get(&keys::user(&account_id, &user_name))
                 .await
-                .map_err(OpError::Internal)?
+                .map_err(internal_op_err)?
                 .is_none()
             {
                 return Err(OpError::NotFound("IAM user not found".to_owned()));
@@ -1464,7 +1445,7 @@ impl ManagementStore for BigtableCatalogStore {
                 .cat()
                 .get(&keys::user(&account_id, &user_name))
                 .await
-                .map_err(OpError::Internal)?
+                .map_err(internal_op_err)?
                 .is_none()
             {
                 return Err(OpError::NotFound("IAM user not found".to_owned()));
@@ -1486,7 +1467,7 @@ impl ManagementStore for BigtableCatalogStore {
                 .cat()
                 .get(&keys::user_tags(&account_id, &user_name))
                 .await
-                .map_err(OpError::Internal)?
+                .map_err(internal_op_err)?
             else {
                 return Ok(Vec::new());
             };
@@ -1514,7 +1495,7 @@ impl ManagementStore for BigtableCatalogStore {
                     }),
                 )
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             if !inserted {
                 return Err(OpError::AlreadyExists(
                     "IAM group already exists".to_owned(),
@@ -1522,10 +1503,10 @@ impl ManagementStore for BigtableCatalogStore {
             }
             cat.delete_prefix(&keys::group_policy_scan_prefix(&account_id, &group_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             cat.delete_prefix(&keys::group_member_scan_prefix(&account_id, &group_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             Ok(())
         })
     }
@@ -1538,16 +1519,16 @@ impl ManagementStore for BigtableCatalogStore {
             let deleted = cat
                 .delete_if_present(&keys::group(&account_id, &group_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             if !deleted {
                 return Err(OpError::NotFound("IAM group not found".to_owned()));
             }
             cat.delete_prefix(&keys::group_policy_scan_prefix(&account_id, &group_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             cat.delete_prefix(&keys::group_member_scan_prefix(&account_id, &group_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             Ok(())
         })
     }
@@ -1559,7 +1540,7 @@ impl ManagementStore for BigtableCatalogStore {
                 .cat()
                 .scan_prefix(&keys::group_scan_prefix(&account_id))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             let mut out: Vec<GroupListEntry> = rows
                 .into_iter()
                 .filter_map(|(rk, v)| {
@@ -1592,7 +1573,7 @@ impl ManagementStore for BigtableCatalogStore {
                 .cat()
                 .get(&keys::group(&account_id, &group_name))
                 .await
-                .map_err(OpError::Internal)?
+                .map_err(internal_op_err)?
                 .is_none()
             {
                 return Ok(None);
@@ -1601,7 +1582,7 @@ impl ManagementStore for BigtableCatalogStore {
                 .cat()
                 .scan_prefix(&keys::group_member_scan_prefix(&account_id, &group_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             let mut members: Vec<String> = member_rows
                 .into_iter()
                 .filter_map(|(rk, v)| {
@@ -1647,12 +1628,12 @@ impl ManagementStore for BigtableCatalogStore {
             if cat
                 .get(&keys::group(&account_id, &group_name))
                 .await
-                .map_err(OpError::Internal)?
+                .map_err(internal_op_err)?
                 .is_none()
                 || cat
                     .get(&keys::user(&account_id, &user_name))
                     .await
-                    .map_err(OpError::Internal)?
+                    .map_err(internal_op_err)?
                     .is_none()
             {
                 return Err(OpError::NotFound("Group or user not found".to_owned()));
@@ -1667,7 +1648,7 @@ impl ManagementStore for BigtableCatalogStore {
                     }),
                 )
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             if !inserted {
                 return Err(OpError::AlreadyExists(
                     "User is already a member of this group".to_owned(),
@@ -1691,7 +1672,7 @@ impl ManagementStore for BigtableCatalogStore {
                 .cat()
                 .delete_if_present(&keys::group_member(&account_id, &group_name, &user_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             if !deleted {
                 return Err(OpError::NotFound("Membership not found".to_owned()));
             }
@@ -1726,19 +1707,19 @@ impl ManagementStore for BigtableCatalogStore {
                     }),
                 )
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             if !inserted {
                 return Err(OpError::AlreadyExists("IAM role already exists".to_owned()));
             }
             cat.delete_prefix(&keys::role_policy_scan_prefix(&account_id, &role_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             cat.delete(&keys::boundary(&account_id, "role", &role_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             cat.delete(&keys::role_tags(&account_id, &role_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             Ok(())
         })
     }
@@ -1751,24 +1732,24 @@ impl ManagementStore for BigtableCatalogStore {
             let deleted = cat
                 .delete_if_present(&keys::role(&account_id, &role_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             if !deleted {
                 return Err(OpError::NotFound("IAM role not found".to_owned()));
             }
             cat.delete_prefix(&keys::role_policy_scan_prefix(&account_id, &role_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             cat.delete(&keys::boundary(&account_id, "role", &role_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             cat.delete(&keys::role_tags(&account_id, &role_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
 
             let sessions = cat
                 .scan_prefix(keys::IAM_SESSION_SCAN_PREFIX)
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             let mut to_del = Vec::new();
             for (rk, v) in sessions {
                 if v.get("account_id").and_then(serde_json::Value::as_str) == Some(&account_id)
@@ -1782,7 +1763,7 @@ impl ManagementStore for BigtableCatalogStore {
             }
             cat.delete_keys(to_del.iter().map(String::as_str))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             Ok(())
         })
     }
@@ -1794,7 +1775,7 @@ impl ManagementStore for BigtableCatalogStore {
                 .cat()
                 .scan_prefix(&keys::role_scan_prefix(&account_id))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             let mut out: Vec<RoleListEntry> = rows
                 .into_iter()
                 .filter_map(|(rk, v)| {
@@ -1828,7 +1809,7 @@ impl ManagementStore for BigtableCatalogStore {
                 .cat()
                 .get(&keys::role(&account_id, &role_name))
                 .await
-                .map_err(OpError::Internal)?
+                .map_err(internal_op_err)?
             else {
                 return Ok(None);
             };
@@ -1860,7 +1841,7 @@ impl ManagementStore for BigtableCatalogStore {
                 .cat()
                 .get(&keys::role(&account_id, &role_name))
                 .await
-                .map_err(OpError::Internal)?
+                .map_err(internal_op_err)?
             else {
                 return Ok(None);
             };
@@ -1882,7 +1863,7 @@ impl ManagementStore for BigtableCatalogStore {
                 .cat()
                 .get(&keys::role(&account_id, &role_name))
                 .await
-                .map_err(OpError::Internal)?
+                .map_err(internal_op_err)?
                 .is_none()
             {
                 return Err(OpError::NotFound("IAM role not found".to_owned()));
@@ -1906,7 +1887,7 @@ impl ManagementStore for BigtableCatalogStore {
                 .cat()
                 .get(&keys::role(&account_id, &role_name))
                 .await
-                .map_err(OpError::Internal)?
+                .map_err(internal_op_err)?
                 .is_none()
             {
                 return Err(OpError::NotFound("IAM role not found".to_owned()));
@@ -1928,7 +1909,7 @@ impl ManagementStore for BigtableCatalogStore {
                 .cat()
                 .get(&keys::role_tags(&account_id, &role_name))
                 .await
-                .map_err(OpError::Internal)?
+                .map_err(internal_op_err)?
             else {
                 return Ok(Vec::new());
             };
@@ -1954,7 +1935,7 @@ impl ManagementStore for BigtableCatalogStore {
         Box::pin(async move {
             let rk = policy_row_key(&account_id, &principal_type, &principal_name, &policy_name)?;
             self.cat()
-                .mutate_json_cas(&rk, OpError::Internal, move |existing| {
+                .mutate_json_cas(&rk, internal_op_err, move |existing| {
                     let created_at = existing
                         .and_then(|v| {
                             v.get("created_at")
@@ -1993,7 +1974,7 @@ impl ManagementStore for BigtableCatalogStore {
                 .cat()
                 .delete_if_present(&rk)
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             if !deleted {
                 return Err(OpError::NotFound("Policy not found".to_owned()));
             }
@@ -2016,7 +1997,7 @@ impl ManagementStore for BigtableCatalogStore {
                 .cat()
                 .scan_prefix(&prefix)
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             let mut out: Vec<(String, serde_json::Value, OffsetDateTime)> = rows
                 .into_iter()
                 .filter_map(|(rk, v)| {
@@ -2055,7 +2036,7 @@ impl ManagementStore for BigtableCatalogStore {
                     }),
                 )
                 .await
-                .map_err(OpError::Internal)
+                .map_err(internal_op_err)
         })
     }
 
@@ -2071,7 +2052,7 @@ impl ManagementStore for BigtableCatalogStore {
                 .cat()
                 .get(&keys::boundary(&account_id, "user", &user_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             Ok(row.and_then(|v| v.get("document").cloned()))
         })
     }
@@ -2087,7 +2068,7 @@ impl ManagementStore for BigtableCatalogStore {
             self.cat()
                 .delete(&keys::boundary(&account_id, "user", &user_name))
                 .await
-                .map_err(OpError::Internal)
+                .map_err(internal_op_err)
         })
     }
 
@@ -2112,7 +2093,7 @@ impl ManagementStore for BigtableCatalogStore {
                     }),
                 )
                 .await
-                .map_err(OpError::Internal)
+                .map_err(internal_op_err)
         })
     }
 
@@ -2128,7 +2109,7 @@ impl ManagementStore for BigtableCatalogStore {
                 .cat()
                 .get(&keys::boundary(&account_id, "role", &role_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             Ok(row.and_then(|v| v.get("document").cloned()))
         })
     }
@@ -2144,7 +2125,7 @@ impl ManagementStore for BigtableCatalogStore {
             self.cat()
                 .delete(&keys::boundary(&account_id, "role", &role_name))
                 .await
-                .map_err(OpError::Internal)
+                .map_err(internal_op_err)
         })
     }
 
@@ -2163,19 +2144,19 @@ impl ManagementStore for BigtableCatalogStore {
                 .cat()
                 .get(&keys::user(&account_id, &user_name))
                 .await
-                .map_err(OpError::Internal)?
+                .map_err(internal_op_err)?
                 .is_none()
             {
                 return Err(OpError::NotFound("IAM user not found".to_owned()));
             }
-            let secret_access_key = generate_secret_access_key();
+            let secret_access_key = generate_secret_key();
             let now = now_rfc3339();
             for _ in 0..8 {
                 let access_key_id = generate_access_key_id();
                 let aad = SecretRow::access_key(&access_key_id, &account_id, &user_name);
                 let sealed = keys_holder
                     .encrypt(&aad, &secret_access_key)
-                    .map_err(OpError::Internal)?;
+                    .map_err(internal_op_err)?;
                 let inserted = self
                     .cat()
                     .put_if_absent(
@@ -2190,7 +2171,7 @@ impl ManagementStore for BigtableCatalogStore {
                         }),
                     )
                     .await
-                    .map_err(OpError::Internal)?;
+                    .map_err(internal_op_err)?;
                 if inserted {
                     return Ok(AccessKeyCreated {
                         access_key_id,
@@ -2215,7 +2196,7 @@ impl ManagementStore for BigtableCatalogStore {
         let key_id = key_id.to_owned();
         Box::pin(async move {
             let rk = keys::access_key(&key_id);
-            let Some(v) = self.cat().get(&rk).await.map_err(OpError::Internal)? else {
+            let Some(v) = self.cat().get(&rk).await.map_err(internal_op_err)? else {
                 return Err(OpError::NotFound("Access key not found".to_owned()));
             };
             if v.get("account_id").and_then(serde_json::Value::as_str) != Some(&account_id)
@@ -2223,7 +2204,7 @@ impl ManagementStore for BigtableCatalogStore {
             {
                 return Err(OpError::NotFound("Access key not found".to_owned()));
             }
-            self.cat().delete(&rk).await.map_err(OpError::Internal)
+            self.cat().delete(&rk).await.map_err(internal_op_err)
         })
     }
 
@@ -2239,7 +2220,7 @@ impl ManagementStore for BigtableCatalogStore {
                 .cat()
                 .scan_prefix(keys::ACCESS_KEY_SCAN_PREFIX)
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             let mut out: Vec<(String, bool, OffsetDateTime)> = rows
                 .into_iter()
                 .filter_map(|(rk, v)| {
@@ -2283,7 +2264,7 @@ impl ManagementStore for BigtableCatalogStore {
                 .cat()
                 .get(&keys::user(&account_id, &user_name))
                 .await
-                .map_err(OpError::Internal)?
+                .map_err(internal_op_err)?
                 .is_none()
             {
                 return Err(OpError::NotFound("IAM user not found".to_owned()));
@@ -2291,7 +2272,7 @@ impl ManagementStore for BigtableCatalogStore {
             let aad = SecretRow::access_key(&access_key_id, &account_id, &user_name);
             let sealed = keys_holder
                 .encrypt(&aad, &secret_access_key)
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             let inserted = self
                 .cat()
                 .put_if_absent(
@@ -2306,7 +2287,7 @@ impl ManagementStore for BigtableCatalogStore {
                     }),
                 )
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             if !inserted {
                 return Err(OpError::AlreadyExists(
                     "Access key ID already exists".to_owned(),
@@ -2361,7 +2342,7 @@ impl ManagementStore for BigtableCatalogStore {
                 }),
             )
             .await
-            .map_err(OpError::Internal)?;
+            .map_err(internal_op_err)?;
             cat.put(
                 &keys::iam_session_access_key(&access_key_id),
                 &json!({
@@ -2369,7 +2350,7 @@ impl ManagementStore for BigtableCatalogStore {
                 }),
             )
             .await
-            .map_err(OpError::Internal)
+            .map_err(internal_op_err)
         })
     }
 
@@ -2379,7 +2360,7 @@ impl ManagementStore for BigtableCatalogStore {
                 .cat()
                 .scan_prefix(keys::IAM_SESSION_SCAN_PREFIX)
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             let mut out = Vec::new();
             for (rk, v) in rows {
                 let Some(policy) = v.get("session_policy").filter(|p| !p.is_null()).cloned() else {
@@ -2428,7 +2409,7 @@ impl ManagementStore for BigtableCatalogStore {
         Box::pin(async move {
             let rk = keys::iam_session(&session_token);
             self.cat()
-                .mutate_json_cas(&rk, OpError::Internal, move |existing| {
+                .mutate_json_cas(&rk, internal_op_err, move |existing| {
                     let Some(mut cur) = existing else {
                         return Ok((CatalogJsonAction::NoOp, ()));
                     };
@@ -2485,7 +2466,7 @@ impl ManagementStore for BigtableCatalogStore {
                 .cat()
                 .scan_prefix(prefix)
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             let mut matched: Vec<StoredSecretRow> = Vec::new();
             for (rk, v) in raw {
                 let Some(pk) = rk.strip_prefix(prefix).map(str::to_owned) else {
@@ -2589,7 +2570,7 @@ impl ManagementStore for BigtableCatalogStore {
                     SecretTable::IamSessions => keys::iam_session(&w.key),
                 };
                 let b64 = BASE64.encode(&w.secret_key_encrypted);
-                cat.mutate_json_cas(&rk, OpError::Internal, move |existing| {
+                cat.mutate_json_cas(&rk, internal_op_err, move |existing| {
                     let Some(mut cur) = existing else {
                         return Ok((CatalogJsonAction::NoOp, ()));
                     };
@@ -2618,13 +2599,13 @@ impl ManagementStore for BigtableCatalogStore {
                         keys_to_del.iter().map(|k| keys::access_key(k)).collect();
                     cat.delete_keys(rks.iter().map(String::as_str))
                         .await
-                        .map_err(OpError::Internal)?;
+                        .map_err(internal_op_err)?;
                 }
                 SecretTable::IamSessions => {
                     let mut rks: Vec<String> = Vec::with_capacity(keys_to_del.len() * 2);
                     for token in &keys_to_del {
                         let sess_rk = keys::iam_session(token);
-                        if let Some(v) = cat.get(&sess_rk).await.map_err(OpError::Internal)?
+                        if let Some(v) = cat.get(&sess_rk).await.map_err(internal_op_err)?
                             && let Some(akid) =
                                 v.get("access_key_id").and_then(serde_json::Value::as_str)
                         {
@@ -2634,7 +2615,7 @@ impl ManagementStore for BigtableCatalogStore {
                     }
                     cat.delete_keys(rks.iter().map(String::as_str))
                         .await
-                        .map_err(OpError::Internal)?;
+                        .map_err(internal_op_err)?;
                 }
             }
             Ok(())
@@ -2647,7 +2628,7 @@ impl ManagementStore for BigtableCatalogStore {
             self.cat()
                 .delete(&keys::setting(&key))
                 .await
-                .map_err(OpError::Internal)
+                .map_err(internal_op_err)
         })
     }
 }
@@ -2660,18 +2641,14 @@ impl AuthorizationStore for BigtableCatalogStore {
         account_id: &str,
         user_name: &str,
     ) -> BoxFuture<'_, OpResult<Vec<String>>> {
-        let dev = self.dev_mode && user_name == crate::dev_auth::DEV_USER_NAME;
         let account_id = account_id.to_owned();
         let user_name = user_name.to_owned();
         Box::pin(async move {
-            if dev {
-                return Ok(vec![DEV_ADMIN_POLICY.to_owned()]);
-            }
             let rows = self
                 .cat()
                 .scan_prefix(&keys::user_policy_scan_prefix(&account_id, &user_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             Ok(rows
                 .into_iter()
                 .filter_map(|(_, v)| v.get("document").map(serde_json::Value::to_string))
@@ -2691,7 +2668,7 @@ impl AuthorizationStore for BigtableCatalogStore {
             let memberships = cat
                 .scan_prefix(&keys::group_member_account_prefix(&account_id))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             let mut out = Vec::new();
             for (_, v) in memberships {
                 if v.get("user_name").and_then(serde_json::Value::as_str) != Some(&user_name) {
@@ -2704,7 +2681,7 @@ impl AuthorizationStore for BigtableCatalogStore {
                 let policies = cat
                     .scan_prefix(&keys::group_policy_scan_prefix(&account_id, group_name))
                     .await
-                    .map_err(OpError::Internal)?;
+                    .map_err(internal_op_err)?;
                 for (_, pv) in policies {
                     if let Some(doc) = pv.get("document") {
                         out.push((group_name.to_owned(), doc.to_string()));
@@ -2742,7 +2719,7 @@ impl AuthorizationStore for BigtableCatalogStore {
                 .cat()
                 .scan_prefix(&keys::role_policy_scan_prefix(&account_id, &role_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             Ok(rows
                 .into_iter()
                 .filter_map(|(_, v)| v.get("document").map(serde_json::Value::to_string))
@@ -2779,7 +2756,7 @@ impl AuthorizationStore for BigtableCatalogStore {
                 .cat()
                 .scan_prefix(keys::IAM_SESSION_SCAN_PREFIX)
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             let now = OffsetDateTime::now_utc();
             let mut latest: Option<(OffsetDateTime, serde_json::Value)> = None;
             for (_, v) in rows {
@@ -2850,7 +2827,7 @@ impl AuthorizationStore for BigtableCatalogStore {
                 .cat()
                 .get(&keys::tags(&arn))
                 .await
-                .map_err(OpError::Internal)?
+                .map_err(internal_op_err)?
             else {
                 return Ok(Vec::new());
             };
@@ -2863,18 +2840,14 @@ impl AuthorizationStore for BigtableCatalogStore {
         account_id: &str,
         user_name: &str,
     ) -> BoxFuture<'_, OpResult<Option<String>>> {
-        let dev = self.dev_mode && user_name == crate::dev_auth::DEV_USER_NAME;
         let account_id = account_id.to_owned();
         let user_name = user_name.to_owned();
         Box::pin(async move {
-            if dev {
-                return Ok(Some("1970-01-01T00:00:00Z".to_owned()));
-            }
             let row = self
                 .cat()
                 .get(&keys::user(&account_id, &user_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             Ok(row.and_then(|v| {
                 v.get("created_at")
                     .and_then(serde_json::Value::as_str)
@@ -2895,7 +2868,7 @@ impl AuthorizationStore for BigtableCatalogStore {
                 .cat()
                 .get(&keys::role(&account_id, &role_name))
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(internal_op_err)?;
             Ok(row.and_then(|v| {
                 v.get("created_at")
                     .and_then(serde_json::Value::as_str)
@@ -2918,9 +2891,40 @@ pub struct BigtableCredentialStore {
     keys: Option<Arc<SecretKeys>>,
 }
 
+const AUTH_INTERNAL_ERROR: &str = "Internal error during authentication";
+
+fn redacted_auth_error(
+    access_key_id: &str,
+    context: &str,
+    detail: impl std::fmt::Display,
+) -> DynamoDbError {
+    tracing::error!(
+        access_key_id = %access_key_id,
+        context = %context,
+        error = %detail,
+        "credential lookup failed"
+    );
+    DynamoDbError::InternalServerError(AUTH_INTERNAL_ERROR.to_owned())
+}
+
 impl BigtableCredentialStore {
+    #[must_use]
     pub fn new(client: Arc<BigtableClient>, keys: Option<Arc<SecretKeys>>) -> Self {
         Self { client, keys }
+    }
+
+    async fn account_exists(
+        &self,
+        cat: &Catalog<'_>,
+        account_id: &str,
+    ) -> Result<bool, DynamoDbError> {
+        if account_id.is_empty() {
+            return Ok(false);
+        }
+        cat.get(&keys::account(account_id))
+            .await
+            .map(|row| row.is_some())
+            .map_err(|e| redacted_auth_error(account_id, "account lookup", e))
     }
 }
 
@@ -2930,10 +2934,16 @@ impl extenddb_auth::CredentialStore for BigtableCredentialStore {
         &self,
         access_key_id: &str,
     ) -> Result<Option<extenddb_auth::StoredCredential>, DynamoDbError> {
+        if !access_key_id.starts_with("AKIA") && !access_key_id.starts_with("ASIA") {
+            return Ok(None);
+        }
+
         let cat = Catalog::new(&self.client);
         let keys_holder = self.keys.as_deref().ok_or_else(|| {
-            DynamoDbError::InternalServerError(
-                "credential store opened without secret keys".to_owned(),
+            redacted_auth_error(
+                access_key_id,
+                "secret keys",
+                "credential store opened without secret keys",
             )
         })?;
 
@@ -2941,7 +2951,7 @@ impl extenddb_auth::CredentialStore for BigtableCredentialStore {
             let idx = cat
                 .get(&keys::iam_session_access_key(access_key_id))
                 .await
-                .map_err(|e| DynamoDbError::InternalServerError(format!("catalog read: {e}")))?;
+                .map_err(|e| redacted_auth_error(access_key_id, "session index read", e))?;
             let Some(idx_val) = idx else {
                 return Ok(None);
             };
@@ -2954,13 +2964,17 @@ impl extenddb_auth::CredentialStore for BigtableCredentialStore {
             let Some(sess) = cat
                 .get(&keys::iam_session(session_token))
                 .await
-                .map_err(|e| DynamoDbError::InternalServerError(format!("catalog read: {e}")))?
+                .map_err(|e| redacted_auth_error(access_key_id, "session read", e))?
             else {
                 return Ok(None);
             };
 
             let (expires_unix, expires_dt) = session_expires_at(&sess).ok_or_else(|| {
-                DynamoDbError::InternalServerError("session missing expires_at".to_owned())
+                redacted_auth_error(
+                    access_key_id,
+                    "session expiry",
+                    "session missing expires_at",
+                )
             })?;
             if expires_dt < OffsetDateTime::now_utc() {
                 return Err(DynamoDbError::ExpiredTokenException(
@@ -2969,8 +2983,10 @@ impl extenddb_auth::CredentialStore for BigtableCredentialStore {
             }
 
             let ciphertext = decode_stored_secret(&sess).ok_or_else(|| {
-                DynamoDbError::InternalServerError(
-                    "session missing secret_key_encrypted_b64".to_owned(),
+                redacted_auth_error(
+                    access_key_id,
+                    "session secret",
+                    "session missing secret_key_encrypted_b64",
                 )
             })?;
             let account_id = sess
@@ -2978,6 +2994,9 @@ impl extenddb_auth::CredentialStore for BigtableCredentialStore {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("")
                 .to_owned();
+            if !self.account_exists(&cat, &account_id).await? {
+                return Ok(None);
+            }
             let role_name = sess
                 .get("role_name")
                 .and_then(serde_json::Value::as_str)
@@ -2998,7 +3017,7 @@ impl extenddb_auth::CredentialStore for BigtableCredentialStore {
             );
             let plaintext = keys_holder
                 .decrypt(&aad, &ciphertext)
-                .map_err(|e| DynamoDbError::InternalServerError(format!("decrypt session: {e}")))?;
+                .map_err(|e| redacted_auth_error(access_key_id, "decrypt session", e))?;
 
             return Ok(Some(extenddb_auth::StoredCredential {
                 secret_key: (*plaintext).clone(),
@@ -3015,14 +3034,16 @@ impl extenddb_auth::CredentialStore for BigtableCredentialStore {
         let Some(row) = cat
             .get(&keys::access_key(access_key_id))
             .await
-            .map_err(|e| DynamoDbError::InternalServerError(format!("catalog read: {e}")))?
+            .map_err(|e| redacted_auth_error(access_key_id, "access key read", e))?
         else {
             return Ok(None);
         };
 
         let ciphertext = decode_stored_secret(&row).ok_or_else(|| {
-            DynamoDbError::InternalServerError(
-                "access key missing secret_key_encrypted_b64".to_owned(),
+            redacted_auth_error(
+                access_key_id,
+                "access key secret",
+                "access key missing secret_key_encrypted_b64",
             )
         })?;
         let account_id = row
@@ -3030,20 +3051,24 @@ impl extenddb_auth::CredentialStore for BigtableCredentialStore {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
             .to_owned();
+        if !self.account_exists(&cat, &account_id).await? {
+            return Ok(None);
+        }
         let user_name = row
             .get("user_name")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
             .to_owned();
+        // Fail closed when `is_active` is missing or malformed.
         let is_active = row
             .get("is_active")
             .and_then(serde_json::Value::as_bool)
-            .unwrap_or(true);
+            .unwrap_or(false);
 
         let aad = SecretRow::access_key(access_key_id, &account_id, &user_name);
         let plaintext = keys_holder
             .decrypt(&aad, &ciphertext)
-            .map_err(|e| DynamoDbError::InternalServerError(format!("decrypt access key: {e}")))?;
+            .map_err(|e| redacted_auth_error(access_key_id, "decrypt access key", e))?;
 
         Ok(Some(extenddb_auth::StoredCredential {
             secret_key: (*plaintext).clone(),
@@ -3055,5 +3080,27 @@ impl extenddb_auth::CredentialStore for BigtableCredentialStore {
             is_active,
             expires_at: None,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacted_auth_error_never_leaks_internal_details_to_client() {
+        let err = redacted_auth_error(
+            "AKIAEXTENDDB12345678",
+            "decrypt access key",
+            "AES-GCM tag mismatch on projects/secret-proj/instances/secret-inst",
+        );
+        match err {
+            DynamoDbError::InternalServerError(msg) => {
+                assert_eq!(msg, "Internal error during authentication");
+                assert!(!msg.contains("secret-proj"));
+                assert!(!msg.contains("AES-GCM"));
+            }
+            other => panic!("expected InternalServerError, got {other:?}"),
+        }
     }
 }

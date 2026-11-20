@@ -12,7 +12,7 @@ use extenddb_core::expression::{
 use extenddb_core::types::{AttributeDefinition, Item, TableKeyInfo};
 use extenddb_storage::error::StorageError;
 use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::mutation::{
-    DeleteFromColumn, DeleteFromFamily, SetCell,
+    DeleteFromColumn, DeleteFromFamily, DeleteFromRow, SetCell,
 };
 use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::row_filter::{
     Chain, Condition, Filter, Interleave,
@@ -33,6 +33,56 @@ pub const FAMILY_META: &str = "m";
 pub const QUALIFIER_VERSION: &[u8] = b"v";
 /// Qualifier prefix for 2PC intent cells in family `m`.
 pub const QUALIFIER_INTENT_PREFIX: &[u8] = b"intent:";
+/// Safe per-RPC mutation batch ceiling below Bigtable's 100,000-mutation hard limit.
+pub const MAX_MUTATIONS_PER_RPC: usize = 90_000;
+
+#[cfg(feature = "test-hooks")]
+tokio::task_local! {
+    static TEST_MAX_MUTATIONS_PER_RPC: usize;
+}
+
+/// Active per-RPC mutation ceiling (`MAX_MUTATIONS_PER_RPC` in production;
+/// task-locally overridable under `test-hooks` so emulator integration tests
+/// exercise multi-chunk CAS + overflow `MutateRow` execution without hitting
+/// `cbtemulator`'s quadratic in-memory column-slice insertion).
+#[inline]
+pub fn max_mutations_per_rpc() -> usize {
+    #[cfg(feature = "test-hooks")]
+    {
+        TEST_MAX_MUTATIONS_PER_RPC
+            .try_with(|&limit| limit.max(4))
+            .unwrap_or(MAX_MUTATIONS_PER_RPC)
+    }
+    #[cfg(not(feature = "test-hooks"))]
+    {
+        MAX_MUTATIONS_PER_RPC
+    }
+}
+
+/// Execute `fut` with a task-local per-RPC mutation chunk ceiling (`test-hooks` only).
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub async fn with_max_mutations_per_rpc<F, R>(limit: usize, fut: F) -> R
+where
+    F: std::future::Future<Output = R>,
+{
+    TEST_MAX_MUTATIONS_PER_RPC.scope(limit.max(4), fut).await
+}
+
+/// Split a mutation vector into `(initial_cas_batch, overflow_chunks)` where
+/// every returned batch has length `<= limit`.
+pub fn split_mutation_batches(
+    mut mutations: Vec<Mutation>,
+    limit: usize,
+) -> (Vec<Mutation>, Vec<Vec<Mutation>>) {
+    let cap = limit.max(1);
+    if mutations.len() <= cap {
+        return (mutations, Vec::new());
+    }
+    let rest = mutations.split_off(cap);
+    let chunks = rest.chunks(cap).map(<[Mutation]>::to_vec).collect();
+    (mutations, chunks)
+}
 
 /// Current wall-clock time in whole milliseconds since Unix epoch (at least 1).
 #[inline]
@@ -328,8 +378,37 @@ fn select_occ_predicate(expected_version: Option<u64>, row_existed: bool) -> Row
     }
 }
 
+/// De Morgan conflict filter for reclaiming a version-only tombstone row at
+/// `expected_version`: matches (preventing `DeleteFromRow` in `false_mutations`)
+/// whenever ANY `m:intent:*` cell exists, OR `m:v != expected_version`, OR ANY
+/// `d:*` data cell exists.
+pub(crate) fn build_tombstone_reclaim_conflict_filter(expected_version: u64) -> RowFilter {
+    RowFilter {
+        filter: Some(Filter::Interleave(Interleave {
+            filters: vec![
+                build_active_intent_filter(),
+                build_version_mismatch_filter(expected_version),
+                RowFilter {
+                    filter: Some(Filter::Chain(Chain {
+                        filters: vec![
+                            RowFilter {
+                                filter: Some(Filter::FamilyNameRegexFilter(format!(
+                                    "^{FAMILY_DATA}$"
+                                ))),
+                            },
+                            RowFilter {
+                                filter: Some(Filter::CellsPerColumnLimitFilter(1)),
+                            },
+                        ],
+                    })),
+                },
+            ],
+        })),
+    }
+}
+
 fn decode_snapshot_cells(
-    cells: Vec<bigtable_rs::bigtable::RowCell>,
+    cells: Vec<crate::data::client::RowCell>,
 ) -> Result<RowSnapshot, StorageError> {
     let mut item: Item = BTreeMap::new();
     let mut version: Option<u64> = None;
@@ -600,7 +679,10 @@ impl<'a> ItemOps<'a> {
         let next_version = next_occ_version(expected_version);
         let ts_micros = version_to_timestamp_micros(next_version);
 
-        let mut mutations = self.item_to_mutations_at(item, true, ts_micros)?;
+        let mut mutations = Vec::with_capacity(item.len() + 3);
+        // Place `m:v` and `DeleteFromFamily("d")` at the front so the first
+        // `MAX_MUTATIONS_PER_RPC` chunk atomically advances the OCC fence even
+        // when an item carries > 90,000 small attributes.
         mutations.push(Mutation {
             mutation: Some(mutation::Mutation::SetCell(SetCell {
                 family_name: FAMILY_META.to_string(),
@@ -616,6 +698,10 @@ impl<'a> ItemOps<'a> {
                 time_range: older_than_ts_range(ts_micros),
             })),
         });
+        mutations.extend(self.item_to_mutations_at(item, true, ts_micros)?);
+
+        let rpc_limit = max_mutations_per_rpc();
+        let (mutations, overflow_chunks) = split_mutation_batches(mutations, rpc_limit);
 
         let predicate = select_occ_predicate(expected_version, row_existed);
 
@@ -631,11 +717,14 @@ impl<'a> ItemOps<'a> {
         };
 
         let resp = data
-            .check_and_mutate_row(req)
+            .check_and_mutate_row_idempotent(req)
             .await
             .map_err(|e| map_bigtable_err("CheckAndMutateRow put", e))?;
 
         if !resp.predicate_matched {
+            for chunk in overflow_chunks {
+                self.mutate_cells(row_key.clone(), chunk).await?;
+            }
             return Ok(CasOutcome::Applied(next_version));
         }
 
@@ -718,7 +807,7 @@ impl<'a> ItemOps<'a> {
         };
 
         let resp = data
-            .check_and_mutate_row(req)
+            .check_and_mutate_row_idempotent(req)
             .await
             .map_err(|e| map_bigtable_err("CheckAndMutateRow delete", e))?;
 
@@ -817,10 +906,130 @@ impl<'a> ItemOps<'a> {
         }
     }
 
-    /// Version-fenced GSI shadow Put:
+    /// Execute a version-guarded `CheckAndMutateRow` against a shadow index row
+    /// (`cur_ver == Some(cv)` or `cur_ver == None`), transparently flushing any
+    /// overflow mutations (`> MAX_MUTATIONS_PER_RPC`) once the atomic version
+    /// fence succeeds.
+    async fn apply_shadow_version_cas(
+        &self,
+        op_name: &str,
+        shadow_row_key: &[u8],
+        cur_ver: Option<u64>,
+        mutations: Vec<Mutation>,
+    ) -> Result<bool, StorageError> {
+        let rpc_limit = max_mutations_per_rpc();
+        let (mutations, overflow_chunks) = split_mutation_batches(mutations, rpc_limit);
+
+        let req = match cur_ver {
+            Some(cv) => CheckAndMutateRowRequest {
+                table_name: self.full_table_name.clone(),
+                app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+                row_key: shadow_row_key.to_vec(),
+                predicate_filter: Some(build_version_match_filter(cv)),
+                true_mutations: mutations,
+                false_mutations: vec![],
+                ..CheckAndMutateRowRequest::default()
+            },
+            None => CheckAndMutateRowRequest {
+                table_name: self.full_table_name.clone(),
+                app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+                row_key: shadow_row_key.to_vec(),
+                predicate_filter: Some(Self::missing_version_filter()),
+                true_mutations: vec![],
+                false_mutations: mutations,
+                ..CheckAndMutateRowRequest::default()
+            },
+        };
+
+        let mut data = self.client.data();
+        let resp = data
+            .check_and_mutate_row_idempotent(req)
+            .await
+            .map_err(|e| map_bigtable_err(op_name, e))?;
+        let applied = if cur_ver.is_some() {
+            resp.predicate_matched
+        } else {
+            !resp.predicate_matched
+        };
+        if applied {
+            for chunk in overflow_chunks {
+                self.mutate_cells(shadow_row_key.to_vec(), chunk).await?;
+            }
+        }
+        Ok(applied)
+    }
+
+    pub(crate) fn build_shadow_put_mutations(
+        projected_item: &Item,
+        existing_quals: Vec<Vec<u8>>,
+        max_d_ts: i64,
+        cur_ver: Option<u64>,
+        new_version: u64,
+    ) -> Result<Vec<Mutation>, StorageError> {
+        let base_ts_micros = version_to_timestamp_micros(new_version);
+        let ts_micros =
+            if (cur_ver.is_none() && max_d_ts >= base_ts_micros) || max_d_ts > base_ts_micros {
+                next_millis_exclusive(max_d_ts)
+            } else {
+                base_ts_micros
+            };
+
+        let mut mutations = Vec::with_capacity(projected_item.len() + existing_quals.len() + 2);
+        mutations.push(Mutation {
+            mutation: Some(mutation::Mutation::SetCell(SetCell {
+                family_name: FAMILY_META.to_string(),
+                column_qualifier: QUALIFIER_VERSION.to_vec(),
+                timestamp_micros: ts_micros,
+                value: new_version.to_string().into_bytes(),
+            })),
+        });
+        mutations.push(Mutation {
+            mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
+                family_name: FAMILY_META.to_string(),
+                column_qualifier: QUALIFIER_VERSION.to_vec(),
+                time_range: older_than_ts_range(ts_micros),
+            })),
+        });
+
+        // One `SetCell` per retained projected attribute at `ts_micros >= max_d_ts`:
+        // with `MaxNumVersions(1)` on family `d` and `CellsPerColumnLimitFilter(1)`
+        // on every reader, retained attributes never need a duplicate
+        // `DeleteFromColumn`, keeping 50,000-attribute `ALL`-projected items at
+        // `50,002` mutations inside a single atomic `CheckAndMutateRow` RPC (#37).
+        for (name, value) in projected_item {
+            mutations.push(Mutation {
+                mutation: Some(mutation::Mutation::SetCell(SetCell {
+                    family_name: FAMILY_DATA.to_string(),
+                    column_qualifier: name.as_bytes().to_vec(),
+                    timestamp_micros: ts_micros,
+                    value: cell::encode(value)?,
+                })),
+            });
+        }
+
+        let del_removed_end = next_millis_exclusive(ts_micros.max(max_d_ts));
+        for old_q in existing_quals {
+            let retained = std::str::from_utf8(&old_q)
+                .ok()
+                .is_some_and(|k| projected_item.contains_key(k));
+            if !retained {
+                mutations.push(Mutation {
+                    mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
+                        family_name: FAMILY_DATA.to_string(),
+                        column_qualifier: old_q,
+                        time_range: older_than_ts_range(del_removed_end),
+                    })),
+                });
+            }
+        }
+
+        Ok(mutations)
+    }
+
+    /// Version-fenced secondary-index shadow Put:
     ///
     /// Never uses unbounded `DeleteFromFamily("d")` or `DeleteFromRow`, and places
-    /// `SetCell` before bounded `DeleteFromColumn` so concurrent GSI `Query`/`Scan`
+    /// `SetCell` before bounded `DeleteFromColumn` so concurrent index `Query`/`Scan`
     /// readers never observe a transiently empty shadow row on `cbtemulator`.
     /// Rejects (`Ok(false)`) any delayed write whose `new_version < cur_ver`.
     pub async fn put_shadow_versioned(
@@ -829,7 +1038,6 @@ impl<'a> ItemOps<'a> {
         projected_item: &Item,
         new_version: u64,
     ) -> Result<bool, StorageError> {
-        let base_ts_micros = version_to_timestamp_micros(new_version);
         for _ in 0..32 {
             let (existing_quals, max_d_ts, cur_ver) =
                 self.read_shadow_row_meta(shadow_row_key).await?;
@@ -839,106 +1047,32 @@ impl<'a> ItemOps<'a> {
                 return Ok(false);
             }
 
-            let ts_micros = if cur_ver.is_none() && max_d_ts >= base_ts_micros {
-                next_millis_exclusive(max_d_ts)
-            } else {
-                base_ts_micros
-            };
+            let mutations = Self::build_shadow_put_mutations(
+                projected_item,
+                existing_quals,
+                max_d_ts,
+                cur_ver,
+                new_version,
+            )?;
 
-            let mut mutations =
-                Vec::with_capacity(projected_item.len() * 2 + existing_quals.len() + 2);
-            mutations.push(Mutation {
-                mutation: Some(mutation::Mutation::SetCell(SetCell {
-                    family_name: FAMILY_META.to_string(),
-                    column_qualifier: QUALIFIER_VERSION.to_vec(),
-                    timestamp_micros: ts_micros,
-                    value: new_version.to_string().into_bytes(),
-                })),
-            });
-            mutations.push(Mutation {
-                mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
-                    family_name: FAMILY_META.to_string(),
-                    column_qualifier: QUALIFIER_VERSION.to_vec(),
-                    time_range: older_than_ts_range(ts_micros),
-                })),
-            });
-
-            for (name, value) in projected_item {
-                let q = name.as_bytes().to_vec();
-                mutations.push(Mutation {
-                    mutation: Some(mutation::Mutation::SetCell(SetCell {
-                        family_name: FAMILY_DATA.to_string(),
-                        column_qualifier: q.clone(),
-                        timestamp_micros: ts_micros,
-                        value: cell::encode(value)?,
-                    })),
-                });
-                mutations.push(Mutation {
-                    mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
-                        family_name: FAMILY_DATA.to_string(),
-                        column_qualifier: q,
-                        time_range: older_than_ts_range(ts_micros),
-                    })),
-                });
-            }
-
-            let del_removed_end = next_millis_exclusive(ts_micros.max(max_d_ts));
-            for old_q in existing_quals {
-                let retained = std::str::from_utf8(&old_q)
-                    .ok()
-                    .is_some_and(|k| projected_item.contains_key(k));
-                if !retained {
-                    mutations.push(Mutation {
-                        mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
-                            family_name: FAMILY_DATA.to_string(),
-                            column_qualifier: old_q,
-                            time_range: older_than_ts_range(del_removed_end),
-                        })),
-                    });
-                }
-            }
-
-            let req = match cur_ver {
-                Some(cv) => CheckAndMutateRowRequest {
-                    table_name: self.full_table_name.clone(),
-                    app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
-                    row_key: shadow_row_key.to_vec(),
-                    predicate_filter: Some(build_version_match_filter(cv)),
-                    true_mutations: mutations,
-                    false_mutations: vec![],
-                    ..CheckAndMutateRowRequest::default()
-                },
-                None => CheckAndMutateRowRequest {
-                    table_name: self.full_table_name.clone(),
-                    app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
-                    row_key: shadow_row_key.to_vec(),
-                    predicate_filter: Some(Self::missing_version_filter()),
-                    true_mutations: vec![],
-                    false_mutations: mutations,
-                    ..CheckAndMutateRowRequest::default()
-                },
-            };
-
-            let mut data = self.client.data();
-            let resp = data
-                .check_and_mutate_row(req)
-                .await
-                .map_err(|e| map_bigtable_err("CheckAndMutateRow put_shadow_versioned", e))?;
-            let applied = if cur_ver.is_some() {
-                resp.predicate_matched
-            } else {
-                !resp.predicate_matched
-            };
-            if applied {
+            if self
+                .apply_shadow_version_cas(
+                    "CheckAndMutateRow put_shadow_versioned",
+                    shadow_row_key,
+                    cur_ver,
+                    mutations,
+                )
+                .await?
+            {
                 return Ok(true);
             }
         }
         Err(StorageError::Transient(
-            "GSI shadow versioned put CAS contention exhausted".to_string(),
+            "shadow index versioned put CAS contention exhausted".to_string(),
         ))
     }
 
-    /// Version-fenced GSI shadow Delete:
+    /// Version-fenced secondary-index shadow Delete:
     ///
     /// Never uses unbounded `DeleteFromFamily("d")` or `DeleteFromRow`. Advances
     /// shadow `m:v` to `new_version` while clearing `d:*` cells bounded by
@@ -993,51 +1127,26 @@ impl<'a> ItemOps<'a> {
                 });
             }
 
-            let req = match cur_ver {
-                Some(cv) => CheckAndMutateRowRequest {
-                    table_name: self.full_table_name.clone(),
-                    app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
-                    row_key: shadow_row_key.to_vec(),
-                    predicate_filter: Some(build_version_match_filter(cv)),
-                    true_mutations: mutations,
-                    false_mutations: vec![],
-                    ..CheckAndMutateRowRequest::default()
-                },
-                None => CheckAndMutateRowRequest {
-                    table_name: self.full_table_name.clone(),
-                    app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
-                    row_key: shadow_row_key.to_vec(),
-                    predicate_filter: Some(Self::missing_version_filter()),
-                    true_mutations: vec![],
-                    false_mutations: mutations,
-                    ..CheckAndMutateRowRequest::default()
-                },
-            };
-
-            let mut data = self.client.data();
-            let resp = data
-                .check_and_mutate_row(req)
-                .await
-                .map_err(|e| map_bigtable_err("CheckAndMutateRow delete_shadow_versioned", e))?;
-            let applied = if cur_ver.is_some() {
-                resp.predicate_matched
-            } else {
-                !resp.predicate_matched
-            };
-            if applied {
+            if self
+                .apply_shadow_version_cas(
+                    "CheckAndMutateRow delete_shadow_versioned",
+                    shadow_row_key,
+                    cur_ver,
+                    mutations,
+                )
+                .await?
+            {
                 return Ok(true);
             }
         }
         Err(StorageError::Transient(
-            "GSI shadow versioned delete CAS contention exhausted".to_string(),
+            "shadow index versioned delete CAS contention exhausted".to_string(),
         ))
     }
 
-    /// Reconciler-safe cleanup of an orphaned GSI shadow row:
-    /// clears observed `d:*` qualifiers via millisecond-aligned bounded
-    /// `DeleteFromColumn` only if the shadow row's `m:v` state has not changed
-    /// since inspection, so a concurrent live write arriving on the same shadow
-    /// row is never clobbered.
+    /// Reconciler-safe cleanup of an orphaned shadow row: clears observed `d:*`
+    /// qualifiers via millisecond-aligned bounded `DeleteFromColumn` only if the
+    /// shadow row's `m:v` state has not changed since inspection.
     pub async fn delete_shadow_orphan_if_unchanged(
         &self,
         shadow_row_key: &[u8],
@@ -1076,56 +1185,70 @@ impl<'a> ItemOps<'a> {
             });
         }
 
-        let req = match cur_ver {
-            Some(cv) => CheckAndMutateRowRequest {
-                table_name: self.full_table_name.clone(),
-                app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
-                row_key: shadow_row_key.to_vec(),
-                predicate_filter: Some(build_version_match_filter(cv)),
-                true_mutations: mutations,
-                false_mutations: vec![],
-                ..CheckAndMutateRowRequest::default()
-            },
-            None => CheckAndMutateRowRequest {
-                table_name: self.full_table_name.clone(),
-                app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
-                row_key: shadow_row_key.to_vec(),
-                predicate_filter: Some(Self::missing_version_filter()),
-                true_mutations: vec![],
-                false_mutations: mutations,
-                ..CheckAndMutateRowRequest::default()
-            },
-        };
-
-        let mut data = self.client.data();
-        let resp = data
-            .check_and_mutate_row(req)
-            .await
-            .map_err(|e| map_bigtable_err("CheckAndMutateRow delete_shadow_orphan", e))?;
-        Ok(if cur_ver.is_some() {
-            resp.predicate_matched
-        } else {
-            !resp.predicate_matched
-        })
+        self.apply_shadow_version_cas(
+            "CheckAndMutateRow delete_shadow_orphan",
+            shadow_row_key,
+            cur_ver,
+            mutations,
+        )
+        .await
     }
 
-    /// Apply a list of mutations to a row by raw encoded key.
+    /// Atomically reclaim a version-only tombstone row (base table or shadow
+    /// index table) once the intent-timeout grace window has elapsed.
+    ///
+    /// Executes `DeleteFromRow` in `false_mutations` iff the row simultaneously
+    /// has NO `m:intent:*` cells, NO `d:*` data cells, AND `m:v == expected_version`.
+    /// If any live cell, active intent, or newer OCC version arrived in the
+    /// meantime, `predicate_matched` is `true` and the row is left untouched.
+    pub async fn reclaim_version_only_row(
+        &self,
+        row_key_bytes: &[u8],
+        expected_version: u64,
+    ) -> Result<bool, StorageError> {
+        let req = CheckAndMutateRowRequest {
+            table_name: self.full_table_name.clone(),
+            app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+            row_key: row_key_bytes.to_vec(),
+            predicate_filter: Some(build_tombstone_reclaim_conflict_filter(expected_version)),
+            true_mutations: vec![],
+            false_mutations: vec![Mutation {
+                mutation: Some(mutation::Mutation::DeleteFromRow(DeleteFromRow {})),
+            }],
+            ..CheckAndMutateRowRequest::default()
+        };
+        let mut data = self.client.data();
+        let resp = data
+            .check_and_mutate_row_idempotent(req)
+            .await
+            .map_err(|e| map_bigtable_err("CheckAndMutateRow reclaim_version_only_row", e))?;
+        Ok(!resp.predicate_matched)
+    }
+
+    /// Apply a list of mutations to a row by raw encoded key, splitting batches
+    /// larger than `MAX_MUTATIONS_PER_RPC` across multiple `MutateRow` calls.
     pub async fn mutate_cells(
         &self,
         row_key_bytes: Vec<u8>,
         mutations: Vec<Mutation>,
     ) -> Result<(), StorageError> {
+        if mutations.is_empty() {
+            return Ok(());
+        }
+        let rpc_limit = max_mutations_per_rpc();
         let mut data = self.client.data();
-        let req = MutateRowRequest {
-            table_name: self.full_table_name.clone(),
-            app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
-            row_key: row_key_bytes,
-            mutations,
-            ..MutateRowRequest::default()
-        };
-        data.mutate_row(req)
-            .await
-            .map_err(|e| map_bigtable_err("MutateRow mutate_cells", e))?;
+        for chunk in mutations.chunks(rpc_limit) {
+            let req = MutateRowRequest {
+                table_name: self.full_table_name.clone(),
+                app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+                row_key: row_key_bytes.clone(),
+                mutations: chunk.to_vec(),
+                ..MutateRowRequest::default()
+            };
+            data.mutate_row(req)
+                .await
+                .map_err(|e| map_bigtable_err("MutateRow mutate_cells", e))?;
+        }
         Ok(())
     }
 
@@ -1287,5 +1410,43 @@ mod tests {
         } else {
             panic!("expected 3-branch Interleave for unversioned existing row");
         }
+    }
+
+    #[test]
+    fn shadow_put_50k_attributes_fits_within_single_check_and_mutate_row() {
+        let mut item = Item::new();
+        for i in 0..50_000usize {
+            item.insert(
+                format!("a{i}"),
+                extenddb_core::types::AttributeValue::S("x".to_owned()),
+            );
+        }
+        let existing_quals = vec![b"a0".to_vec(), b"removed_attr".to_vec()];
+        let mutations =
+            ItemOps::build_shadow_put_mutations(&item, existing_quals, 1_000, Some(1), 2)
+                .expect("build_shadow_put_mutations");
+        // 2 (`m:v` SetCell + DeleteFromColumn) + 50,000 retained `SetCell` + 1 removed `DeleteFromColumn`.
+        assert_eq!(mutations.len(), 50_003);
+        assert!(mutations.len() < MAX_MUTATIONS_PER_RPC);
+
+        // Overwrite with 105,000 retained/new attributes + 60,000 removed attributes (165,002 mutations):
+        // `split_mutation_batches(..., MAX_MUTATIONS_PER_RPC)` keeps every RPC batch <= 90,000 (< 100,000).
+        let mut wide = Item::new();
+        for i in 0..105_000usize {
+            wide.insert(
+                format!("a{i:06}"),
+                extenddb_core::types::AttributeValue::Bool(true),
+            );
+        }
+        let removed: Vec<Vec<u8>> = (0..60_000usize)
+            .map(|i| format!("old{i:06}").into_bytes())
+            .collect();
+        let wide_muts =
+            ItemOps::build_shadow_put_mutations(&wide, removed, 1_000, Some(1), 2).unwrap();
+        assert_eq!(wide_muts.len(), 165_002);
+        let (cas_batch, overflow_chunks) = split_mutation_batches(wide_muts, MAX_MUTATIONS_PER_RPC);
+        assert_eq!(cas_batch.len(), MAX_MUTATIONS_PER_RPC);
+        assert_eq!(overflow_chunks.len(), 1);
+        assert_eq!(overflow_chunks[0].len(), 75_002);
     }
 }

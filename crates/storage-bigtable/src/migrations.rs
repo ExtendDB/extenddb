@@ -1,16 +1,27 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Catalog migrations for the Cloud Bigtable storage backend.
+//! Catalog and data-store migrations, distributed migration lease, and
+//! `ADR-0023` serving registrations for the Cloud Bigtable storage backend.
 //!
-//! Stores migration ledger rows inside `__extenddb_catalog__` under
-//! `migration_ledger:<store>:<id:04>` and maintains `version:catalog` for the
-//! shared [`extenddb_storage::migrations::Runner`].
+//! - Catalog ledger rows live in `__extenddb_catalog__` on `instance_id` under
+//!   `migration_ledger:catalog:<id:04>`.
+//! - Data-store ledger rows live in `__extenddb_data_ledger__` on
+//!   `effective_data_instance_id()` under `migration_ledger:data:<id:04>`.
+//! - Migrators acquire `lock:catalog_migrations` in `__extenddb_catalog__`,
+//!   renew it in the background while making progress, and wait for all live
+//!   `server_registration:<token>` rows to drain before applying migrations.
+//! - Servers write `server_registration:<token>`, verify that
+//!   `lock:catalog_migrations` is free, and verify that `Runner::status` is
+//!   `Current` (or `AheadCompatible`) before opening stores or spawning workers.
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use extenddb_storage::error::StorageError;
+use extenddb_storage::hooks::{Reregistration, ServingRegistrar};
 use extenddb_storage::management_store::{ManagementStore, SettingsStore};
 use extenddb_storage::migrations::{
     CatalogMigrations, CatalogStatus, CatalogTraces, Done, HeldLock, Kind, LedgerRow, Listed,
@@ -18,22 +29,756 @@ use extenddb_storage::migrations::{
     RunReport, Runner, Step, StoreBody, StoreKind, StoreRef, Target,
 };
 use serde_json::json;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::BigtableCatalogStore;
-use crate::catalog::{CATALOG_TABLE, Catalog, keys};
+use crate::catalog::{CATALOG_TABLE, CF, Catalog, DATA_LEDGER_TABLE, keys};
 use crate::config::BigtableStorageConfig;
-use crate::data::admin::AdminClient;
+use crate::data::admin::{AdminClient, gc_max_versions};
 use crate::data::client::BigtableClient;
-use crate::m0001_baseline::M0001Baseline;
+use crate::m0001_baseline::{M0001CatalogBaseline, M0001DataBaseline};
 
-const MIGRATION_LOCK_NAME: &str = "catalog_migrations";
-const MIGRATION_LOCK_LEASE: Duration = Duration::from_secs(120);
+/// Catalog lock name under `lock:catalog_migrations`.
+pub const MIGRATION_LOCK_NAME: &str = "catalog_migrations";
+
+/// Default command label recorded in `server_registration:<token>`.
+pub const SERVE_COMMAND: &str = "extenddb serve";
+
+/// Per-RPC timeout for migration lock and serving registration requests.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn now_epoch_ms() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX)
+}
+
+fn rfc3339_now() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| time::OffsetDateTime::now_utc().to_string())
+}
+
+fn host_name() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .unwrap_or_else(|| "unknown-host".to_owned())
+}
+
+/// Timings governing the migration lease and server registrations (`ADR-0023`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timing {
+    pub lease: Duration,
+    pub renew_every: Duration,
+    pub margin: Duration,
+    pub idle_limit: Duration,
+    pub registration: Duration,
+    pub registration_deadline: Duration,
+    pub registration_renew_every: Duration,
+    pub registration_retry_every: Duration,
+    pub retry_every: Duration,
+}
+
+impl Timing {
+    /// Production timings matching `ADR-0023`: 60 s migration lease renewed
+    /// every 15 s with a 25 s safety margin, and 45 s server registrations
+    /// renewed every 5 s with a 30 s loss deadline.
+    pub const PRODUCTION: Self = Self {
+        lease: Duration::from_secs(60),
+        renew_every: Duration::from_secs(15),
+        margin: Duration::from_secs(25),
+        idle_limit: Duration::from_secs(30),
+        registration: Duration::from_secs(45),
+        registration_deadline: Duration::from_secs(30),
+        registration_renew_every: Duration::from_secs(5),
+        registration_retry_every: Duration::from_secs(1),
+        retry_every: Duration::from_millis(250),
+    };
+
+    #[must_use]
+    pub fn valid_for(self) -> Duration {
+        self.lease.saturating_sub(self.margin)
+    }
+}
+
+/// Monotonic lease tracker shared between the migration renewal task,
+/// migration runner steps, and `BigtableBootstrapper`.
+pub struct MigrationLease {
+    renewed: Mutex<Instant>,
+    progress: Mutex<Instant>,
+    lost: Mutex<Option<String>>,
+    timing: Timing,
+}
+
+impl MigrationLease {
+    #[must_use]
+    pub fn new(renewed: Instant, timing: Timing) -> Arc<Self> {
+        Arc::new(Self {
+            renewed: Mutex::new(renewed),
+            progress: Mutex::new(Instant::now()),
+            lost: Mutex::new(None),
+            timing,
+        })
+    }
+
+    /// Verify that the holder still owns a valid, un-expired lease within the
+    /// safety margin.
+    pub fn check(&self) -> Result<(), MigrationError> {
+        if let Some(reason) = self
+            .lost
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        {
+            return Err(MigrationError::Store(reason));
+        }
+        let since = self
+            .renewed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .elapsed();
+        if since >= self.timing.valid_for() {
+            return Err(self.mark_lost(format!(
+                "the migration lock was last renewed {} s ago, exceeding the {} s safety window; \
+                 stopping before another process can claim the lock",
+                since.as_secs(),
+                self.timing.valid_for().as_secs()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Record forward progress so the renewal task knows the holder is not hung.
+    pub fn progressed(&self) {
+        *self.progress.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
+    }
+
+    fn idle_for(&self) -> Duration {
+        self.progress
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .elapsed()
+    }
+
+    fn renewed_at(&self, sent: Instant) {
+        *self.renewed.lock().unwrap_or_else(PoisonError::into_inner) = sent;
+    }
+
+    fn mark_lost(&self, reason: String) -> MigrationError {
+        let mut lost = self.lost.lock().unwrap_or_else(PoisonError::into_inner);
+        MigrationError::Store(lost.get_or_insert(reason).clone())
+    }
+}
+
+/// Active migration lock in `__extenddb_catalog__` (`lock:catalog_migrations`)
+/// paired with its background renewal task.
+pub struct MigrationLock {
+    catalog_client: Arc<BigtableClient>,
+    owner: String,
+    lease: Arc<MigrationLease>,
+    renewal: JoinHandle<()>,
+    released: AtomicBool,
+}
+
+impl MigrationLock {
+    /// Acquire `lock:catalog_migrations`, polling until `timeout` elapses, and
+    /// start background renewal.
+    pub async fn acquire(
+        catalog_client: Arc<BigtableClient>,
+        timeout: Duration,
+        timing: Timing,
+    ) -> Result<Self, MigrationError> {
+        let owner = format!(
+            "migrate-{}-pid{}-{}",
+            host_name(),
+            std::process::id(),
+            Uuid::new_v4()
+        );
+        let deadline = Instant::now() + timeout;
+        let cat = Catalog::new(&catalog_client);
+
+        let claimed_at = loop {
+            let sent = Instant::now();
+            match tokio::time::timeout(
+                REQUEST_TIMEOUT,
+                cat.try_lock(MIGRATION_LOCK_NAME, &owner, timing.lease),
+            )
+            .await
+            {
+                Ok(Ok(true)) => break sent,
+                Ok(Ok(false)) => {
+                    if Instant::now() >= deadline {
+                        let holder = cat
+                            .read_live_lock_owner(MIGRATION_LOCK_NAME)
+                            .await
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| "another migrator".to_owned());
+                        return Err(MigrationError::Locked(format!(
+                            "{holder} holds lock:{MIGRATION_LOCK_NAME} in {CATALOG_TABLE}"
+                        )));
+                    }
+                    tokio::time::sleep(timing.retry_every).await;
+                }
+                Ok(Err(e)) => return Err(MigrationError::store("acquire migration lock", e)),
+                Err(_) => {
+                    return Err(MigrationError::Store(format!(
+                        "acquire migration lock: timed out after {} s",
+                        REQUEST_TIMEOUT.as_secs()
+                    )));
+                }
+            }
+        };
+
+        let lease = MigrationLease::new(claimed_at, timing);
+        let renewal =
+            spawn_lock_renewal(catalog_client.clone(), owner.clone(), lease.clone(), timing);
+        Ok(Self {
+            catalog_client,
+            owner,
+            lease,
+            renewal,
+            released: AtomicBool::new(false),
+        })
+    }
+
+    #[must_use]
+    pub fn lease(&self) -> Arc<MigrationLease> {
+        self.lease.clone()
+    }
+
+    /// Wait up to `timeout` for all live `server_registration:<token>` rows to
+    /// disappear or expire.
+    pub async fn wait_for_servers(&self, timeout: Duration) -> Result<(), MigrationError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.lease.check()?;
+            let live = live_server_registrations(&self.catalog_client).await?;
+            self.lease.progressed();
+            if live.is_empty() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(MigrationError::Locked(format!(
+                    "cannot migrate while {} server(s) are still serving this catalog: {}",
+                    live.len(),
+                    live.join("; ")
+                )));
+            }
+            tokio::time::sleep(self.lease.timing.retry_every).await;
+        }
+    }
+
+    /// Stop background renewal and release `lock:catalog_migrations` if still
+    /// owned by this holder.
+    pub async fn release(&self) {
+        self.released.store(true, Ordering::Release);
+        self.renewal.abort();
+        let cat = Catalog::new(&self.catalog_client);
+        let _ = tokio::time::timeout(
+            REQUEST_TIMEOUT,
+            cat.release_lock(MIGRATION_LOCK_NAME, &self.owner),
+        )
+        .await;
+    }
+}
+
+impl Drop for MigrationLock {
+    fn drop(&mut self) {
+        self.renewal.abort();
+        if self.released.load(Ordering::Acquire) {
+            return;
+        }
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let client = self.catalog_client.clone();
+            let owner = self.owner.clone();
+            rt.spawn(async move {
+                let cat = Catalog::new(&client);
+                let _ = tokio::time::timeout(
+                    REQUEST_TIMEOUT,
+                    cat.release_lock(MIGRATION_LOCK_NAME, &owner),
+                )
+                .await;
+            });
+        }
+    }
+}
+
+fn spawn_lock_renewal(
+    catalog_client: Arc<BigtableClient>,
+    owner: String,
+    lease: Arc<MigrationLease>,
+    timing: Timing,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut wait = timing.renew_every;
+        loop {
+            tokio::time::sleep(wait).await;
+            if lease.idle_for() >= timing.idle_limit {
+                let _ = lease.mark_lost(format!(
+                    "migration holder made no progress for {} s; stopping lock renewal",
+                    timing.idle_limit.as_secs()
+                ));
+                return;
+            }
+            let sent = Instant::now();
+            let cat = Catalog::new(&catalog_client);
+            match tokio::time::timeout(
+                REQUEST_TIMEOUT.min(timing.renew_every),
+                cat.renew_lock(MIGRATION_LOCK_NAME, &owner, timing.lease),
+            )
+            .await
+            {
+                Ok(Ok(true)) => {
+                    lease.renewed_at(sent);
+                    wait = timing.renew_every;
+                }
+                Ok(Ok(false)) => {
+                    let _ = lease.mark_lost(format!(
+                        "lock:{MIGRATION_LOCK_NAME} in {CATALOG_TABLE} was lost or stolen"
+                    ));
+                    return;
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "migration lock renewal failed; retrying");
+                    wait = Duration::from_secs(1).min(timing.renew_every);
+                }
+                Err(_) => {
+                    tracing::warn!("migration lock renewal timed out; retrying");
+                    wait = Duration::from_secs(1).min(timing.renew_every);
+                }
+            }
+        }
+    })
+}
+
+async fn live_server_registrations(
+    catalog_client: &BigtableClient,
+) -> Result<Vec<String>, MigrationError> {
+    let cat = Catalog::new(catalog_client);
+    let rows = match tokio::time::timeout(
+        REQUEST_TIMEOUT,
+        cat.scan_prefix(keys::SERVER_REGISTRATION_SCAN_PREFIX),
+    )
+    .await
+    {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(StorageError::TableNotFound(_))) => return Ok(Vec::new()),
+        Ok(Err(e)) => return Err(MigrationError::store("read serving registrations", e)),
+        Err(_) => {
+            return Err(MigrationError::Store(format!(
+                "read serving registrations: timed out after {} s",
+                REQUEST_TIMEOUT.as_secs()
+            )));
+        }
+    };
+    let now_ms = now_epoch_ms();
+    let mut active = Vec::new();
+    for (_, val) in rows {
+        let expires_at = val
+            .get("expires_at_ms")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        if expires_at > now_ms {
+            let cmd = val
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(SERVE_COMMAND);
+            let pid = val
+                .get("pid")
+                .and_then(serde_json::Value::as_u64)
+                .map_or_else(|| "unknown".to_owned(), |n| n.to_string());
+            let host = val
+                .get("host")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown-host");
+            let release = val
+                .get("release")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            active.push(format!("{cmd} (pid {pid} on {host}, release {release})"));
+        }
+    }
+    Ok(active)
+}
+
+/// Active serving registration row (`server_registration:<token>`) held in
+/// `__extenddb_catalog__` while a server serves.
+pub struct ServingRegistration {
+    catalog_client: Arc<BigtableClient>,
+    token: String,
+    renewal: JoinHandle<()>,
+    lost: watch::Receiver<Option<String>>,
+    released: AtomicBool,
+}
+
+impl ServingRegistration {
+    pub async fn register(
+        connection_string: &str,
+        release: &str,
+        timing: Timing,
+    ) -> Result<Self, MigrationError> {
+        Self::register_as(connection_string, release, SERVE_COMMAND, timing).await
+    }
+
+    pub async fn register_as(
+        connection_string: &str,
+        release: &str,
+        command: &str,
+        timing: Timing,
+    ) -> Result<Self, MigrationError> {
+        let mut cfg = BigtableStorageConfig::from_connection_string(connection_string)
+            .map_err(|e| MigrationError::store("parse bigtable connection string", e))?;
+        if let Some(cp) = cfg.catalog_pool_size {
+            cfg.pool_size = cp;
+        }
+        let catalog_client = Arc::new(
+            BigtableClient::connect(&cfg)
+                .await
+                .map_err(|e| MigrationError::store("connect to Bigtable catalog", e))?,
+        );
+
+        let token = Uuid::new_v4().to_string();
+        let host = host_name();
+        let pid = std::process::id();
+        let now_ms = now_epoch_ms();
+        let lease_ms = i64::try_from(timing.registration.as_millis()).unwrap_or(45_000);
+        let doc = json!({
+            "token": token,
+            "command": command,
+            "host": host,
+            "pid": pid,
+            "release": release,
+            "registered_at": rfc3339_now(),
+            "registered_at_ms": now_ms,
+            "expires_at_ms": now_ms.saturating_add(lease_ms),
+        });
+
+        let cat = Catalog::new(&catalog_client);
+        let reg_key = keys::server_registration(&token);
+        let sent = Instant::now();
+        match tokio::time::timeout(REQUEST_TIMEOUT, cat.put(&reg_key, &doc)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(StorageError::TableNotFound(_))) => {
+                return Err(MigrationError::Status(CatalogStatus::Uninitialized));
+            }
+            Ok(Err(e)) => return Err(MigrationError::store("register server in catalog", e)),
+            Err(_) => {
+                return Err(MigrationError::Store(format!(
+                    "register server in catalog: timed out after {} s",
+                    REQUEST_TIMEOUT.as_secs()
+                )));
+            }
+        }
+
+        let (tx, lost) = watch::channel(None);
+        let renewal = spawn_registration_renewal(
+            catalog_client.clone(),
+            token.clone(),
+            doc,
+            timing,
+            sent,
+            tx,
+        );
+        let registration = Self {
+            catalog_client: catalog_client.clone(),
+            token,
+            renewal,
+            lost,
+            released: AtomicBool::new(false),
+        };
+
+        let live_holder = match tokio::time::timeout(
+            REQUEST_TIMEOUT,
+            cat.read_live_lock_owner(MIGRATION_LOCK_NAME),
+        )
+        .await
+        {
+            Ok(Ok(holder)) => holder,
+            Ok(Err(e)) => {
+                registration.release().await;
+                return Err(MigrationError::store("read migration lock", e));
+            }
+            Err(_) => {
+                registration.release().await;
+                return Err(MigrationError::Store(format!(
+                    "read migration lock: timed out after {} s",
+                    REQUEST_TIMEOUT.as_secs()
+                )));
+            }
+        };
+
+        if let Some(holder) = live_holder {
+            registration.release().await;
+            let suffix = if command == SERVE_COMMAND {
+                ", so the server does not start; start it again once the migration finishes"
+            } else {
+                ""
+            };
+            return Err(MigrationError::Locked(format!(
+                "{holder} holds the migration lock on this catalog{suffix}"
+            )));
+        }
+
+        Ok(registration)
+    }
+
+    #[must_use]
+    pub fn lost(&self) -> watch::Receiver<Option<String>> {
+        self.lost.clone()
+    }
+
+    pub async fn release(&self) {
+        self.released.store(true, Ordering::Release);
+        self.renewal.abort();
+        let cat = Catalog::new(&self.catalog_client);
+        let key = keys::server_registration(&self.token);
+        let _ = tokio::time::timeout(REQUEST_TIMEOUT, cat.delete(&key)).await;
+    }
+}
+
+impl Drop for ServingRegistration {
+    fn drop(&mut self) {
+        self.renewal.abort();
+        if self.released.load(Ordering::Acquire) {
+            return;
+        }
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let client = self.catalog_client.clone();
+            let token = self.token.clone();
+            rt.spawn(async move {
+                let cat = Catalog::new(&client);
+                let key = keys::server_registration(&token);
+                let _ = tokio::time::timeout(REQUEST_TIMEOUT, cat.delete(&key)).await;
+            });
+        }
+    }
+}
+
+fn spawn_registration_renewal(
+    catalog_client: Arc<BigtableClient>,
+    token: String,
+    mut doc: serde_json::Value,
+    timing: Timing,
+    registered: Instant,
+    lost: watch::Sender<Option<String>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let key = keys::server_registration(&token);
+        let lease_ms = i64::try_from(timing.registration.as_millis()).unwrap_or(45_000);
+        let mut renewed = registered;
+        let mut wait = timing.registration_renew_every;
+        let left = |renewed: Instant| {
+            timing
+                .registration_deadline
+                .saturating_sub(renewed.elapsed())
+        };
+        loop {
+            tokio::time::sleep(wait.min(left(renewed))).await;
+            let sent = Instant::now();
+            doc["expires_at_ms"] = json!(now_epoch_ms().saturating_add(lease_ms));
+            let bound = REQUEST_TIMEOUT
+                .min(timing.registration_renew_every)
+                .min(left(renewed));
+            let cat = Catalog::new(&catalog_client);
+            let answer = tokio::time::timeout(bound, cat.put_if_present(&key, &doc)).await;
+            let reason = match answer {
+                Ok(Ok(true)) => {
+                    renewed = sent;
+                    wait = timing.registration_renew_every;
+                    continue;
+                }
+                Ok(Ok(false)) => {
+                    format!("this server's registration ({key}) in {CATALOG_TABLE} was deleted")
+                }
+                Ok(Err(_)) | Err(_) if renewed.elapsed() < timing.registration_deadline => {
+                    wait = timing.registration_retry_every;
+                    continue;
+                }
+                Ok(Err(e)) => format!(
+                    "this server could not renew its registration for {} s ({e})",
+                    renewed.elapsed().as_secs()
+                ),
+                Err(_) => format!(
+                    "this server could not renew its registration for {} s (timed out)",
+                    renewed.elapsed().as_secs()
+                ),
+            };
+            let _ = lost.send(Some(reason));
+            return;
+        }
+    })
+}
+
+/// Server-lifetime [`ServingRegistrar`] handle capable of detecting lost
+/// registrations and re-registering if no migration intervened.
+pub struct ServerRegistration {
+    connection_string: String,
+    release: String,
+    command: &'static str,
+    timing: Timing,
+    started: CatalogStatus,
+    current: Mutex<Arc<ServingRegistration>>,
+}
+
+impl ServerRegistration {
+    #[must_use]
+    pub fn started(&self) -> &CatalogStatus {
+        &self.started
+    }
+
+    #[must_use]
+    pub fn current(&self) -> Arc<ServingRegistration> {
+        self.current
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[async_trait]
+impl ServingRegistrar for ServerRegistration {
+    async fn lost(&self) -> String {
+        let mut lost = self.current().lost();
+        loop {
+            let reason = lost.borrow_and_update().clone();
+            if let Some(reason) = reason {
+                return reason;
+            }
+            if lost.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    async fn register_again(&self) -> Reregistration {
+        let registration = match ServingRegistration::register_as(
+            &self.connection_string,
+            &self.release,
+            self.command,
+            self.timing,
+        )
+        .await
+        {
+            Ok(reg) => reg,
+            Err(MigrationError::Locked(why)) => return Reregistration::Refused(why),
+            Err(e) => return Reregistration::Unavailable(e.to_string()),
+        };
+
+        let status = match catalog_status(&self.connection_string).await {
+            Ok(s) => s,
+            Err(e) => {
+                registration.release().await;
+                return Reregistration::Unavailable(format!(
+                    "the catalog's status could not be read: {e}"
+                ));
+            }
+        };
+
+        if status != self.started {
+            registration.release().await;
+            return Reregistration::Refused(format!(
+                "the catalog's status changed while the server held no registration (started \
+                 with: {}; now: {status}); restart the server to serve the updated catalog",
+                self.started
+            ));
+        }
+
+        *self.current.lock().unwrap_or_else(PoisonError::into_inner) = Arc::new(registration);
+        Reregistration::Registered
+    }
+
+    async fn release(&self) {
+        self.current().release().await;
+    }
+}
+
+/// Read-only catalog status check across both `StoreKind::Catalog` and
+/// `StoreKind::Data`.
+pub async fn catalog_status(connection_string: &str) -> Result<CatalogStatus, MigrationError> {
+    let target = Target::at(connection_string);
+    let backend = BigtableMigrationRunnerBackend::connect(&target, None).await?;
+    Runner::new(&backend, "").status().await
+}
+
+/// Register as a serving process, verify that no migration lock is held, and
+/// verify that `Runner::status` is `Current` or `AheadCompatible`.
+pub async fn register_and_check(
+    connection_string: &str,
+    release: &str,
+    timing: Timing,
+) -> Result<ServerRegistration, MigrationError> {
+    register_and_check_as(connection_string, release, SERVE_COMMAND, timing).await
+}
+
+/// [`register_and_check`] for the process named by `command`.
+pub async fn register_and_check_as(
+    connection_string: &str,
+    release: &str,
+    command: &'static str,
+    timing: Timing,
+) -> Result<ServerRegistration, MigrationError> {
+    let registration =
+        ServingRegistration::register_as(connection_string, release, command, timing).await?;
+    let status = match catalog_status(connection_string).await {
+        Ok(s) => s,
+        Err(e) => {
+            registration.release().await;
+            return Err(e);
+        }
+    };
+    match status {
+        CatalogStatus::Current { .. } => {}
+        CatalogStatus::AheadCompatible { .. } => {
+            tracing::warn!("{status}; serving it because all unknown migrations are additive");
+        }
+        other => {
+            registration.release().await;
+            return Err(MigrationError::Status(other));
+        }
+    }
+    Ok(ServerRegistration {
+        connection_string: connection_string.to_owned(),
+        release: release.to_owned(),
+        command,
+        timing,
+        started: status,
+        current: Mutex::new(Arc::new(registration)),
+    })
+}
 
 pub struct BigtableCatalogMigrations;
 
+/// Store handles passed to Bigtable code migrations.
 pub struct BigtableMigrationStores {
-    pub client: Arc<BigtableClient>,
+    pub catalog_client: Arc<BigtableClient>,
+    pub data_client: Arc<BigtableClient>,
+    lease: Option<Arc<MigrationLease>>,
+}
+
+impl BigtableMigrationStores {
+    pub fn check_lease(&self) -> Result<(), MigrationError> {
+        if let Some(ref lease) = self.lease {
+            lease.check()?;
+        }
+        Ok(())
+    }
+
+    pub fn progressed(&self) {
+        if let Some(ref lease) = self.lease {
+            lease.progressed();
+        }
+    }
 }
 
 /// Bigtable's entry for every [`MigrationId`] in the workspace registry.
@@ -43,11 +788,18 @@ pub fn migration(id: MigrationId) -> Migration<BigtableMigrationStores> {
         MigrationId::Baseline => Migration::Applies {
             kind: Kind::Breaking,
             convergent: true,
-            bodies: vec![StoreBody::code(
-                StoreKind::Catalog,
-                &M0001Baseline,
-                include_str!("m0001_baseline.rs"),
-            )],
+            bodies: vec![
+                StoreBody::code(
+                    StoreKind::Catalog,
+                    &M0001CatalogBaseline,
+                    include_str!("m0001_baseline.rs"),
+                ),
+                StoreBody::code(
+                    StoreKind::Data,
+                    &M0001DataBaseline,
+                    include_str!("m0001_baseline.rs"),
+                ),
+            ],
         },
         MigrationId::ResourceTagConditionKeys => Migration::NotApplicable(
             "the Bigtable backend did not exist when dynamodb:ResourceTag was accepted",
@@ -89,8 +841,17 @@ pub(crate) const RELEASED: &[Released] = &[
     Released {
         id: MigrationId::Baseline,
         store: StoreKind::Catalog,
-        checksum: "15fe6100543e944512ba143148baa1ad8546d77b7c5311a64a1e4c1fdae995b8",
-        fingerprint: Some("0001_baseline/bigtable-v1"),
+        checksum: "2ba54650d2b66866667b135bc279c265c0bef7f450d538bc3c71ff06a79f83dc",
+        fingerprint: Some("0001_baseline/bigtable-catalog-v1"),
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::Baseline,
+        store: StoreKind::Data,
+        checksum: "2ba54650d2b66866667b135bc279c265c0bef7f450d538bc3c71ff06a79f83dc",
+        fingerprint: Some("0001_baseline/bigtable-data-v1"),
         kind: Kind::Breaking,
         convergent: true,
         rebless: None,
@@ -196,33 +957,64 @@ pub(crate) const RELEASED: &[Released] = &[
     },
 ];
 
+async fn connect_catalog_and_data(
+    cfg: &BigtableStorageConfig,
+) -> Result<(Arc<BigtableClient>, Arc<BigtableClient>, String), MigrationError> {
+    let mut cat_cfg = cfg.clone();
+    if let Some(cp) = cfg.catalog_pool_size {
+        cat_cfg.pool_size = cp;
+    }
+    let catalog_client = Arc::new(
+        BigtableClient::connect(&cat_cfg)
+            .await
+            .map_err(|e| MigrationError::store("connect to Bigtable catalog instance", e))?,
+    );
+    let data_instance_id = cfg.effective_data_instance_id().to_owned();
+    let data_client = if data_instance_id != cfg.instance_id {
+        let mut data_cfg = cfg.clone();
+        data_cfg.instance_id.clone_from(&data_instance_id);
+        Arc::new(
+            BigtableClient::connect(&data_cfg)
+                .await
+                .map_err(|e| MigrationError::store("connect to Bigtable data instance", e))?,
+        )
+    } else {
+        catalog_client.clone()
+    };
+    Ok((catalog_client, data_client, data_instance_id))
+}
+
 struct BigtableMigrationRunnerBackend {
     stores: BigtableMigrationStores,
+    data_instance_id: String,
 }
 
 impl BigtableMigrationRunnerBackend {
-    async fn connect(target: &Target) -> Result<Self, MigrationError> {
+    async fn connect(
+        target: &Target,
+        lease: Option<Arc<MigrationLease>>,
+    ) -> Result<Self, MigrationError> {
         let cfg = BigtableStorageConfig::from_connection_string(&target.location)
             .map_err(|e| MigrationError::store("parse bigtable connection string", e))?;
-        let client = BigtableClient::connect(&cfg)
-            .await
-            .map_err(|e| MigrationError::store("connect to Bigtable", e))?;
+        let (catalog_client, data_client, data_instance_id) =
+            connect_catalog_and_data(&cfg).await?;
         Ok(Self {
             stores: BigtableMigrationStores {
-                client: Arc::new(client),
+                catalog_client,
+                data_client,
+                lease,
             },
+            data_instance_id,
         })
     }
 
-    async fn catalog_table_exists(&self) -> Result<bool, MigrationError> {
-        let mut admin = AdminClient::connect(&self.stores.client)
-            .await
-            .map_err(|e| MigrationError::store("connect Bigtable admin client", e))?;
-        let tables = admin
-            .list_tables()
-            .await
-            .map_err(|e| MigrationError::store("list Bigtable tables", e))?;
-        Ok(tables.iter().any(|t| t == CATALOG_TABLE))
+    fn ledger_catalog(&self, kind: StoreKind) -> Catalog<'_> {
+        match kind {
+            StoreKind::Catalog => Catalog::new(&self.stores.catalog_client),
+            StoreKind::Data | StoreKind::Account => {
+                Catalog::with_table(&self.stores.data_client, DATA_LEDGER_TABLE)
+            }
+        }
     }
 }
 
@@ -275,20 +1067,27 @@ impl MigrationBackend for BigtableMigrationRunnerBackend {
     async fn store_names(&self, kind: StoreKind) -> Result<Vec<String>, MigrationError> {
         match kind {
             StoreKind::Catalog => Ok(vec![CATALOG_TABLE.to_owned()]),
-            StoreKind::Data | StoreKind::Account => Ok(Vec::new()),
+            StoreKind::Data => Ok(vec![format!(
+                "{}:{DATA_LEDGER_TABLE}",
+                self.data_instance_id
+            )]),
+            StoreKind::Account => Ok(Vec::new()),
         }
     }
 
     async fn read_ledger(&self, store: &StoreRef) -> Result<Vec<LedgerRow>, MigrationError> {
-        if !self.catalog_table_exists().await? {
-            return Ok(Vec::new());
-        }
-        let cat = Catalog::new(&self.stores.client);
+        self.stores.check_lease()?;
+        let cat = self.ledger_catalog(store.kind);
         let prefix = keys::migration_ledger_prefix_for_store(store.kind.as_str());
-        let rows = cat
-            .scan_prefix(&prefix)
-            .await
-            .map_err(|e| MigrationError::store("read migration ledger", e))?;
+        let rows = match cat.scan_prefix(&prefix).await {
+            Ok(rows) => rows,
+            Err(StorageError::TableNotFound(_)) => {
+                self.stores.progressed();
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(MigrationError::store("read migration ledger", e)),
+        };
+        self.stores.progressed();
         let mut parsed = Vec::with_capacity(rows.len());
         for (_, v) in rows {
             parsed.push(value_to_ledger_row(&store.name, &v)?);
@@ -298,14 +1097,17 @@ impl MigrationBackend for BigtableMigrationRunnerBackend {
     }
 
     async fn read_traces(&self) -> Result<CatalogTraces, MigrationError> {
-        if !self.catalog_table_exists().await? {
-            return Ok(CatalogTraces::default());
-        }
-        let cat = Catalog::new(&self.stores.client);
-        let row = cat
-            .get(keys::VERSION)
-            .await
-            .map_err(|e| MigrationError::store("read catalog version", e))?;
+        self.stores.check_lease()?;
+        let cat = Catalog::new(&self.stores.catalog_client);
+        let row = match cat.get(keys::VERSION).await {
+            Ok(row) => row,
+            Err(StorageError::TableNotFound(_)) => {
+                self.stores.progressed();
+                return Ok(CatalogTraces::default());
+            }
+            Err(e) => return Err(MigrationError::store("read catalog version", e)),
+        };
+        self.stores.progressed();
         let catalog_version = row.and_then(|v| {
             v.get("catalog_version")
                 .and_then(serde_json::Value::as_str)
@@ -318,7 +1120,28 @@ impl MigrationBackend for BigtableMigrationRunnerBackend {
     }
 
     async fn catalog_is_empty(&self) -> Result<bool, MigrationError> {
-        Ok(!self.catalog_table_exists().await?)
+        self.stores.check_lease()?;
+        let cat = Catalog::new(&self.stores.catalog_client);
+        let ver = match cat.get(keys::VERSION).await {
+            Ok(v) => v,
+            Err(StorageError::TableNotFound(_)) => {
+                self.stores.progressed();
+                return Ok(true);
+            }
+            Err(e) => return Err(MigrationError::store("check catalog version", e)),
+        };
+        if ver.is_some() {
+            self.stores.progressed();
+            return Ok(false);
+        }
+        let ledger = cat
+            .scan_prefix(&keys::migration_ledger_prefix_for_store(
+                StoreKind::Catalog.as_str(),
+            ))
+            .await
+            .map_err(|e| MigrationError::store("check catalog ledger", e))?;
+        self.stores.progressed();
+        Ok(ledger.is_empty())
     }
 
     async fn before_first_write(
@@ -326,6 +1149,7 @@ impl MigrationBackend for BigtableMigrationRunnerBackend {
         _from: Option<u32>,
         _to: u32,
     ) -> Result<Vec<String>, MigrationError> {
+        self.stores.check_lease()?;
         Ok(Vec::new())
     }
 
@@ -337,25 +1161,27 @@ impl MigrationBackend for BigtableMigrationRunnerBackend {
         row: Option<LedgerRow>,
         catalog_version: Option<u32>,
     ) -> Result<Done, MigrationError> {
+        self.stores.check_lease()?;
         let done = match step {
             Step::File { name, .. } => {
                 return Err(MigrationError::Store(format!(
                     "Bigtable backend does not execute SQL/CQL file body {name}"
                 )));
             }
-            Step::Code(code) => code.run(&self.stores).await?,
+            Step::Code(code) => code
+                .run(&self.stores)
+                .await
+                .map_err(|e| self.stores.check_lease().err().unwrap_or(e))?,
             Step::Record => Done::default(),
         };
 
-        let cat = Catalog::new(&self.stores.client);
-        let now_str = time::OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_else(|_| time::OffsetDateTime::now_utc().to_string());
-
+        let now_str = rfc3339_now();
         if let Some(mut ledger_row) = row {
+            self.stores.check_lease()?;
             if !done.notes.is_empty() {
                 ledger_row.notes = done.notes.join("\n");
             }
+            let cat = self.ledger_catalog(store.kind);
             let key = keys::migration_ledger_row(store.kind.as_str(), ledger_row.id);
             cat.put(
                 &key,
@@ -372,6 +1198,7 @@ impl MigrationBackend for BigtableMigrationRunnerBackend {
             )
             .await
             .map_err(|e| MigrationError::store("write migration ledger row", e))?;
+            self.stores.progressed();
         }
 
         if let Some(ver) = catalog_version {
@@ -382,17 +1209,22 @@ impl MigrationBackend for BigtableMigrationRunnerBackend {
     }
 
     async fn write_catalog_version(&self, version: u32) -> Result<(), MigrationError> {
-        let cat = Catalog::new(&self.stores.client);
+        self.stores.check_lease()?;
+        let cat = Catalog::new(&self.stores.catalog_client);
         let ver_str = version.to_string();
+        let applied_at = rfc3339_now();
         cat.put(
             keys::VERSION,
             &json!({
                 "catalog_version": ver_str,
-                "applied_at": time::OffsetDateTime::now_utc().to_string(),
+                "applied_at": applied_at,
             }),
         )
         .await
         .map_err(|e| MigrationError::store("write catalog_version", e))?;
+        self.stores.progressed();
+
+        self.stores.check_lease()?;
         cat.put(
             &keys::setting("catalog_version"),
             &json!({
@@ -401,36 +1233,124 @@ impl MigrationBackend for BigtableMigrationRunnerBackend {
             }),
         )
         .await
-        .map_err(|e| MigrationError::store("write setting:catalog_version", e))
+        .map_err(|e| MigrationError::store("write setting:catalog_version", e))?;
+        self.stores.progressed();
+        Ok(())
     }
 
     async fn delete_ledger_row(&self, store: &StoreRef, id: u32) -> Result<(), MigrationError> {
-        let cat = Catalog::new(&self.stores.client);
+        self.stores.check_lease()?;
+        let cat = self.ledger_catalog(store.kind);
         let key = keys::migration_ledger_row(store.kind.as_str(), id);
         cat.delete(&key)
             .await
-            .map_err(|e| MigrationError::store("delete migration ledger row", e))
+            .map_err(|e| MigrationError::store("delete migration ledger row", e))?;
+        self.stores.progressed();
+        Ok(())
     }
 }
 
-struct HeldMigrationLease {
-    client: Arc<BigtableClient>,
-    owner: String,
-    has_lock_row: bool,
-    dev_mode: bool,
+struct HeldMigrationLock {
+    lock: MigrationLock,
+    catalog_client: Arc<BigtableClient>,
+    data_client: Arc<BigtableClient>,
+    data_instance_id: String,
 }
 
-struct BigtableLockedStores {
-    store: BigtableCatalogStore,
+fn held(lock: &HeldLock) -> Result<&HeldMigrationLock, MigrationError> {
+    lock.get::<HeldMigrationLock>()
+        .ok_or_else(|| MigrationError::Refused("the migration lock is not a Bigtable lock".into()))
 }
 
-impl LockedStores for BigtableLockedStores {
+/// Extract the [`MigrationLease`] held inside a [`HeldLock`], if taken by the
+/// Bigtable backend.
+#[must_use]
+pub(crate) fn lease_of(lock: &HeldLock) -> Option<Arc<MigrationLease>> {
+    held(lock).ok().map(|h| h.lock.lease())
+}
+
+struct LeasedBigtableStores {
+    inner: BigtableCatalogStore,
+    lease: Arc<MigrationLease>,
+}
+
+impl LeasedBigtableStores {
+    fn check(&self) -> extenddb_storage::management_store::OpResult<()> {
+        self.lease
+            .check()
+            .map_err(|e| extenddb_storage::management_store::OpError::Internal(e.to_string()))
+    }
+}
+
+impl SettingsStore for LeasedBigtableStores {
+    fn get_setting(
+        &self,
+        key: &str,
+    ) -> futures::future::BoxFuture<'_, extenddb_storage::management_store::OpResult<Option<String>>>
+    {
+        let key = key.to_owned();
+        Box::pin(async move {
+            self.check()?;
+            let res = SettingsStore::get_setting(&self.inner, &key).await;
+            self.lease.progressed();
+            res
+        })
+    }
+
+    fn set_setting(
+        &self,
+        key: &str,
+        value: &str,
+    ) -> futures::future::BoxFuture<'_, extenddb_storage::management_store::OpResult<()>> {
+        let key = key.to_owned();
+        let value = value.to_owned();
+        Box::pin(async move {
+            self.check()?;
+            let res = SettingsStore::set_setting(&self.inner, &key, &value).await;
+            self.lease.progressed();
+            res
+        })
+    }
+
+    fn replace_setting(
+        &self,
+        key: &str,
+        expected: &str,
+        value: &str,
+    ) -> futures::future::BoxFuture<'_, extenddb_storage::management_store::OpResult<bool>> {
+        let key = key.to_owned();
+        let expected = expected.to_owned();
+        let value = value.to_owned();
+        Box::pin(async move {
+            self.check()?;
+            let res = SettingsStore::replace_setting(&self.inner, &key, &expected, &value).await;
+            self.lease.progressed();
+            res
+        })
+    }
+
+    fn list_settings(
+        &self,
+    ) -> futures::future::BoxFuture<
+        '_,
+        extenddb_storage::management_store::OpResult<Vec<(String, String)>>,
+    > {
+        Box::pin(async move {
+            self.check()?;
+            let res = SettingsStore::list_settings(&self.inner).await;
+            self.lease.progressed();
+            res
+        })
+    }
+}
+
+impl LockedStores for LeasedBigtableStores {
     fn management(&self) -> &dyn ManagementStore {
-        &self.store
+        &self.inner
     }
 
     fn settings(&self) -> &dyn SettingsStore {
-        &self.store
+        self
     }
 }
 
@@ -442,80 +1362,63 @@ impl CatalogMigrations for BigtableCatalogMigrations {
 
     fn backup_advice(&self, target: &Target) -> String {
         match BigtableStorageConfig::from_connection_string(&target.location) {
-            Ok(cfg) => format!(
-                "back up Cloud Bigtable table '{CATALOG_TABLE}' in projects/{}/instances/{}",
-                cfg.project_id, cfg.instance_id
-            ),
-            Err(_) => format!("back up Cloud Bigtable table '{CATALOG_TABLE}'"),
+            Ok(cfg) => {
+                let data_inst = cfg.effective_data_instance_id();
+                if data_inst == cfg.instance_id {
+                    format!(
+                        "back up Cloud Bigtable tables '{CATALOG_TABLE}' and '{DATA_LEDGER_TABLE}' \
+                         in projects/{}/instances/{}",
+                        cfg.project_id, cfg.instance_id
+                    )
+                } else {
+                    format!(
+                        "back up Cloud Bigtable catalog table '{CATALOG_TABLE}' in \
+                         projects/{}/instances/{} and data ledger table '{DATA_LEDGER_TABLE}' in \
+                         projects/{}/instances/{data_inst}",
+                        cfg.project_id, cfg.instance_id, cfg.project_id
+                    )
+                }
+            }
+            Err(_) => {
+                format!("back up Cloud Bigtable tables '{CATALOG_TABLE}' and '{DATA_LEDGER_TABLE}'")
+            }
         }
     }
 
     async fn status(&self, target: &Target) -> Result<CatalogStatus, MigrationError> {
-        let backend = BigtableMigrationRunnerBackend::connect(target).await?;
+        let backend = BigtableMigrationRunnerBackend::connect(target, None).await?;
+        Runner::new(&backend, env!("CARGO_PKG_VERSION"))
+            .status()
+            .await
+    }
+
+    async fn status_under_lock(
+        &self,
+        lock: &HeldLock,
+        _target: &Target,
+    ) -> Result<CatalogStatus, MigrationError> {
+        let h = held(lock)?;
+        let backend = BigtableMigrationRunnerBackend {
+            stores: BigtableMigrationStores {
+                catalog_client: h.catalog_client.clone(),
+                data_client: h.data_client.clone(),
+                lease: Some(h.lock.lease()),
+            },
+            data_instance_id: h.data_instance_id.clone(),
+        };
         Runner::new(&backend, env!("CARGO_PKG_VERSION"))
             .status()
             .await
     }
 
     async fn catalog_ledger(&self, target: &Target) -> Result<Vec<LedgerRow>, MigrationError> {
-        let backend = BigtableMigrationRunnerBackend::connect(target).await?;
-        let store = StoreRef {
-            kind: StoreKind::Catalog,
-            name: CATALOG_TABLE.to_owned(),
-        };
-        backend.read_ledger(&store).await
+        let backend = BigtableMigrationRunnerBackend::connect(target, None).await?;
+        Runner::new(&backend, "").catalog_ledger().await
     }
 
     async fn lock(&self, target: &Target, timeout: Duration) -> Result<HeldLock, MigrationError> {
-        let cfg = BigtableStorageConfig::from_connection_string(&target.location)
-            .map_err(|e| MigrationError::store("parse bigtable connection string", e))?;
-        let dev_mode = cfg.dev_mode;
-        let backend = BigtableMigrationRunnerBackend::connect(target).await?;
-        let owner = format!("migrate-{}", Uuid::new_v4());
-
-        if !backend.catalog_table_exists().await? {
-            return Ok(HeldLock::new(
-                target.location.clone(),
-                HeldMigrationLease {
-                    client: backend.stores.client,
-                    owner,
-                    has_lock_row: false,
-                    dev_mode,
-                },
-            ));
-        }
-
-        let deadline = Instant::now() + timeout;
-        let cat = Catalog::new(&backend.stores.client);
-        loop {
-            match cat
-                .try_lock(MIGRATION_LOCK_NAME, &owner, MIGRATION_LOCK_LEASE)
-                .await
-            {
-                Ok(true) => {
-                    return Ok(HeldLock::new(
-                        target.location.clone(),
-                        HeldMigrationLease {
-                            client: backend.stores.client,
-                            owner,
-                            has_lock_row: true,
-                            dev_mode,
-                        },
-                    ));
-                }
-                Ok(false) => {
-                    if Instant::now() >= deadline {
-                        return Err(MigrationError::Locked(format!(
-                            "another migration holds lock:{MIGRATION_LOCK_NAME} in {CATALOG_TABLE}"
-                        )));
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                Err(e) => {
-                    return Err(MigrationError::store("acquire migration lock", e));
-                }
-            }
-        }
+        self.lock_with_timing(target, timeout, Timing::PRODUCTION)
+            .await
     }
 
     async fn run(
@@ -524,13 +1427,14 @@ impl CatalogMigrations for BigtableCatalogMigrations {
         release: &str,
         kind: RunKind,
     ) -> Result<RunReport, MigrationError> {
-        let lease = lock
-            .get::<HeldMigrationLease>()
-            .ok_or_else(|| MigrationError::Store("invalid HeldLock for Bigtable".into()))?;
+        let h = held(lock)?;
         let backend = BigtableMigrationRunnerBackend {
             stores: BigtableMigrationStores {
-                client: lease.client.clone(),
+                catalog_client: h.catalog_client.clone(),
+                data_client: h.data_client.clone(),
+                lease: Some(h.lock.lease()),
             },
+            data_instance_id: h.data_instance_id.clone(),
         };
         let runner = Runner::new(&backend, release);
         match kind {
@@ -540,13 +1444,14 @@ impl CatalogMigrations for BigtableCatalogMigrations {
     }
 
     async fn forget(&self, lock: &HeldLock, id: u32) -> Result<(), MigrationError> {
-        let lease = lock
-            .get::<HeldMigrationLease>()
-            .ok_or_else(|| MigrationError::Store("invalid HeldLock for Bigtable".into()))?;
+        let h = held(lock)?;
         let backend = BigtableMigrationRunnerBackend {
             stores: BigtableMigrationStores {
-                client: lease.client.clone(),
+                catalog_client: h.catalog_client.clone(),
+                data_client: h.data_client.clone(),
+                lease: Some(h.lock.lease()),
             },
+            data_instance_id: h.data_instance_id.clone(),
         };
         Runner::new(&backend, env!("CARGO_PKG_VERSION"))
             .forget(id)
@@ -554,11 +1459,8 @@ impl CatalogMigrations for BigtableCatalogMigrations {
     }
 
     async fn release(&self, lock: HeldLock) {
-        if let Some(lease) = lock.get::<HeldMigrationLease>()
-            && lease.has_lock_row
-        {
-            let cat = Catalog::new(&lease.client);
-            let _ = cat.release_lock(MIGRATION_LOCK_NAME, &lease.owner).await;
+        if let Ok(h) = held(&lock) {
+            h.lock.release().await;
         }
     }
 
@@ -567,12 +1469,71 @@ impl CatalogMigrations for BigtableCatalogMigrations {
         lock: &HeldLock,
         _data_connection: Option<&str>,
     ) -> Result<Box<dyn LockedStores>, MigrationError> {
-        let lease = lock
-            .get::<HeldMigrationLease>()
-            .ok_or_else(|| MigrationError::Store("invalid HeldLock for Bigtable".into()))?;
-        Ok(Box::new(BigtableLockedStores {
-            store: BigtableCatalogStore::new(lease.client.clone(), None, lease.dev_mode),
+        let h = held(lock)?;
+        Ok(Box::new(LeasedBigtableStores {
+            inner: BigtableCatalogStore::new(h.catalog_client.clone(), None),
+            lease: h.lock.lease(),
         }))
+    }
+}
+
+impl BigtableCatalogMigrations {
+    /// Acquire the catalog migration lock with explicit [`Timing`] (exposed for
+    /// fast lease-renewal and server-fence tests).
+    pub async fn lock_with_timing(
+        &self,
+        target: &Target,
+        timeout: Duration,
+        timing: Timing,
+    ) -> Result<HeldLock, MigrationError> {
+        let cfg = BigtableStorageConfig::from_connection_string(&target.location)
+            .map_err(|e| MigrationError::store("parse bigtable connection string", e))?;
+        let (catalog_client, data_client, data_instance_id) =
+            connect_catalog_and_data(&cfg).await?;
+        let creating = target.data_connection.is_some();
+
+        if creating {
+            // `init`: ensure `__extenddb_catalog__` exists before taking the
+            // lock so a fresh catalog always writes and renews
+            // `lock:catalog_migrations` prior to running Migration 1.
+            let mut admin = AdminClient::connect(&catalog_client)
+                .await
+                .map_err(|e| MigrationError::store("connect Bigtable catalog admin client", e))?;
+            admin
+                .create_table(CATALOG_TABLE, &[(CF, Some(gc_max_versions(1)))])
+                .await
+                .map_err(|e| MigrationError::store("ensure __extenddb_catalog__ for lock", e))?;
+        } else {
+            let probe = BigtableMigrationRunnerBackend {
+                stores: BigtableMigrationStores {
+                    catalog_client: catalog_client.clone(),
+                    data_client: data_client.clone(),
+                    lease: None,
+                },
+                data_instance_id: data_instance_id.clone(),
+            };
+            if !Runner::new(&probe, "").initialized().await? {
+                return Err(MigrationError::Status(CatalogStatus::Uninitialized));
+            }
+        }
+
+        let started = Instant::now();
+        let lock = MigrationLock::acquire(catalog_client.clone(), timeout, timing).await?;
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if let Err(e) = lock.wait_for_servers(remaining).await {
+            lock.release().await;
+            return Err(e);
+        }
+
+        Ok(HeldLock::new(
+            target.location.clone(),
+            HeldMigrationLock {
+                lock,
+                catalog_client,
+                data_client,
+                data_instance_id,
+            },
+        ))
     }
 }
 
@@ -596,5 +1557,18 @@ mod tests {
         for id in MigrationId::ALL {
             let _ = BigtableCatalogMigrations.listed(id);
         }
+    }
+
+    #[test]
+    fn backup_advice_mentions_separate_data_instance_when_configured() {
+        let single = Target::at("bigtable://proj/inst");
+        let single_advice = BigtableCatalogMigrations.backup_advice(&single);
+        assert!(single_advice.contains(CATALOG_TABLE));
+        assert!(single_advice.contains(DATA_LEDGER_TABLE));
+
+        let split = Target::at("bigtable://proj/cat-inst?data_instance_id=data-inst");
+        let split_advice = BigtableCatalogMigrations.backup_advice(&split);
+        assert!(split_advice.contains("instances/cat-inst"));
+        assert!(split_advice.contains("instances/data-inst"));
     }
 }

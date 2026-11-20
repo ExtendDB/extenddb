@@ -236,3 +236,11 @@ pub fn table_meta_scan_prefix(account_id: &str) -> String {
 
 /// Prefix to enumerate all accounts.
 pub const ACCOUNT_SCAN_PREFIX: &str = "acct:";
+
+/// Prefix to enumerate active server registrations (`server_registration:<token>`).
+pub const SERVER_REGISTRATION_SCAN_PREFIX: &str = "server_registration:";
+
+/// Row key for a live server or CLI process registration (`ADR-0023`).
+pub fn server_registration(token: &str) -> String {
+    format!("{SERVER_REGISTRATION_SCAN_PREFIX}{token}")
+}

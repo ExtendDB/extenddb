@@ -13,11 +13,11 @@ impl OperationsEngine for BigtableOperationsEngine {
         let cfg = crate::config::BigtableStorageConfig::from_connection_string(s)
             .map_err(StorageError::Internal)?;
 
-        let (host, port) = if let Some(emu) = &cfg.emulator_host {
+        let (host, port) = if let Some(emu) = cfg.resolve_emulator_host() {
             if let Some((h, p)) = emu.split_once(':') {
                 (h.to_owned(), p.parse().unwrap_or(8086))
             } else {
-                (emu.clone(), 8086)
+                (emu, 8086)
             }
         } else {
             ("bigtable.googleapis.com".to_owned(), 443)

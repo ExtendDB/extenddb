@@ -10,20 +10,21 @@
 //! - `stream_record:<shard_id>:<seq_26>` — one `StreamRecord` row per contiguous
 //!   shard log slot (`slot_sequence_number(shard_id, slot)`), claimed via atomic
 //!   `Catalog::put_if_absent` so `seq_2 > seq_1` can never become visible on a
-//!   shard ahead of `seq_1` (`RFC-0003` §5.2).
+//!   shard ahead of `seq_1`.
 //! - `stream_dedup:<shard_id>:<dedup_key>` — exact-once publication marker ensuring
 //!   concurrent or retried `roll_forward` / `sweeper` passes never emit duplicate
 //!   stream records.
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
 use extenddb_core::types::{
-    AttributeValue, Item, KeySchemaElement, StreamEventName, StreamRecord, StreamRecordData,
-    StreamSpecification, StreamViewType,
+    Item, KeySchemaElement, StreamEventName, StreamRecord, StreamRecordData, StreamSpecification,
+    StreamViewType, extract_key, item_size_bytes,
 };
 use extenddb_storage::StreamCapture;
+use extenddb_storage::error::StorageError;
 use extenddb_storage::stream_lineage::ShardRow;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -103,16 +104,13 @@ pub fn shard_label_millis_and_index(shard_id: &str) -> (u64, u8) {
         let idx = suffix[14..16].parse::<u8>().unwrap_or(0);
         return (label_ms.max(1), idx);
     }
+    #[allow(clippy::cast_possible_truncation)]
     let fallback_idx = (crc32fast::hash(shard_id.as_bytes()) % 100) as u8;
     (1_000_000_000_000, fallback_idx)
 }
 
 /// Deterministic 26-digit sequence number for `(shard_id, slot)` (`slot >= 1`):
 /// `{label_millis:013}{slot:011}{shard_idx:02}`.
-///
-/// Because `label_millis` and `shard_idx` are fixed per `shard_id`, slot `k`
-/// maps bijectively to one exact `stream_record:<shard_id>:<seq_26>` key, so
-/// `Catalog::put_if_absent` fills slots `1, 2, 3, ...` contiguously without gaps.
 #[must_use]
 pub fn slot_sequence_number(shard_id: &str, slot: u64) -> String {
     let (label_ms, shard_idx) = shard_label_millis_and_index(shard_id);
@@ -142,14 +140,16 @@ fn node_decimal_suffix() -> u8 {
 }
 
 /// Generate a fresh, strictly monotonic 26-digit decimal sequence number
-/// (`{ms:013}{counter:011}{node:02}`).
+/// (`{ms:013}{counter:011}{node:02}`) for `StreamEngine::next_sequence_number`.
 #[must_use]
 pub fn next_sequence_number() -> String {
     static SEQ_STATE: Mutex<(u64, u64)> = Mutex::new((0, 0));
 
-    let now_ms = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000).max(1) as u64;
+    let now_ms =
+        u64::try_from((time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000).max(1))
+            .unwrap_or(1);
     let (ms, counter) = {
-        let mut guard = SEQ_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = SEQ_STATE.lock().unwrap_or_else(PoisonError::into_inner);
         if now_ms > guard.0 {
             guard.0 = now_ms;
             guard.1 = 1;
@@ -171,7 +171,7 @@ fn shard_local_mutex(shard_id: &str) -> Arc<tokio::sync::Mutex<()>> {
     static SHARD_LOCKS: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> =
         OnceLock::new();
     let map = SHARD_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = map.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(existing) = guard.get(shard_id).and_then(Weak::upgrade) {
         return existing;
     }
@@ -197,18 +197,9 @@ fn view_includes_old(v: StreamViewType) -> bool {
     )
 }
 
-fn extract_keys(item: &Item, key_schema: &[KeySchemaElement]) -> BTreeMap<String, AttributeValue> {
-    let mut keys = BTreeMap::new();
-    for ks in key_schema {
-        if let Some(v) = item.get(&ks.attribute_name) {
-            keys.insert(ks.attribute_name.clone(), v.clone());
-        }
-    }
-    keys
-}
-
 /// Build a `StreamRecord` describing one item mutation, honoring optional
-/// `StreamCapture` metadata (`view_type`, `region`, and TTL `user_identity`).
+/// `StreamCapture` metadata (`view_type`, `region`, and TTL `user_identity`)
+/// and computing `SizeBytes` via `extenddb_core::types::item_size_bytes`.
 #[must_use]
 pub fn build_record(
     spec: Option<&StreamSpecification>,
@@ -236,7 +227,7 @@ pub fn build_record(
         (None, None) => return None,
     };
     let representative = new.or(old)?;
-    let keys = extract_keys(representative, key_schema);
+    let keys = extract_key(representative, key_schema);
     let new_image = if view_includes_new(view) {
         new.cloned()
     } else {
@@ -247,11 +238,7 @@ pub fn build_record(
     } else {
         None
     };
-    let size_bytes = serde_json::to_string(&keys).map(|s| s.len()).unwrap_or(0)
-        + new_image
-            .as_ref()
-            .and_then(|n| serde_json::to_string(n).ok().map(|s| s.len()))
-            .unwrap_or(0);
+    let size_bytes = i64::try_from(item_size_bytes(representative)).unwrap_or(i64::MAX);
     let creation_ts = time::OffsetDateTime::now_utc().unix_timestamp();
     let region = capture
         .map(|c| c.region.as_ref().to_owned())
@@ -270,7 +257,7 @@ pub fn build_record(
             new_image,
             old_image,
             sequence_number: seq.to_owned(),
-            size_bytes: size_bytes as i64,
+            size_bytes,
             stream_view_type: view,
         },
         user_identity,
@@ -278,14 +265,19 @@ pub fn build_record(
 }
 
 /// Persist a shard metadata row into `__extenddb_catalog__`.
-pub async fn put_shard(cat: &Catalog<'_>, shard: &ShardMeta) -> Result<(), String> {
-    let body = serde_json::to_value(shard).map_err(|e| format!("encode shard meta: {e}"))?;
+pub async fn put_shard(cat: &Catalog<'_>, shard: &ShardMeta) -> Result<(), StorageError> {
+    let body = serde_json::to_value(shard)
+        .map_err(|e| StorageError::Internal(format!("encode shard meta: {e}")))?;
     cat.put(&keys::stream_shard(&shard.shard_id), &body).await
 }
 
 /// Insert a shard metadata row only if it does not already exist.
-pub async fn put_shard_if_absent(cat: &Catalog<'_>, shard: &ShardMeta) -> Result<bool, String> {
-    let body = serde_json::to_value(shard).map_err(|e| format!("encode shard meta: {e}"))?;
+pub async fn put_shard_if_absent(
+    cat: &Catalog<'_>,
+    shard: &ShardMeta,
+) -> Result<bool, StorageError> {
+    let body = serde_json::to_value(shard)
+        .map_err(|e| StorageError::Internal(format!("encode shard meta: {e}")))?;
     cat.put_if_absent(&keys::stream_shard(&shard.shard_id), &body)
         .await
 }
@@ -294,7 +286,7 @@ pub async fn put_shard_if_absent(cat: &Catalog<'_>, shard: &ShardMeta) -> Result
 pub async fn load_table_shards(
     cat: &Catalog<'_>,
     table_id: &str,
-) -> Result<Vec<ShardMeta>, String> {
+) -> Result<Vec<ShardMeta>, StorageError> {
     let rows = cat
         .scan_prefix(&keys::stream_shard_table_prefix(table_id))
         .await?;
@@ -315,14 +307,14 @@ async fn advance_shard_cursor_at_least(
     shard_id: &str,
     min_next_slot: u64,
     committed_seq: &str,
-) -> Result<(), String> {
+) -> Result<(), StorageError> {
     let rk = keys::stream_shard(shard_id);
     cat.mutate_json_cas(&rk, std::convert::identity, |existing| {
         let Some(val) = existing else {
             return Ok((CatalogJsonAction::NoOp, ()));
         };
         let mut meta: ShardMeta = serde_json::from_value(val)
-            .map_err(|e| format!("decode shard meta {shard_id}: {e}"))?;
+            .map_err(|e| StorageError::Internal(format!("decode shard meta {shard_id}: {e}")))?;
         let mut changed = false;
         if meta.next_seq_num < min_next_slot {
             meta.next_seq_num = min_next_slot;
@@ -339,19 +331,19 @@ async fn advance_shard_cursor_at_least(
         if !changed {
             return Ok((CatalogJsonAction::NoOp, ()));
         }
-        let encoded = serde_json::to_value(&meta).map_err(|e| format!("encode shard meta: {e}"))?;
+        let encoded = serde_json::to_value(&meta)
+            .map_err(|e| StorageError::Internal(format!("encode shard meta: {e}")))?;
         Ok((CatalogJsonAction::Put(encoded), ()))
     })
     .await
 }
 
 /// Ensure `ShardMeta.next_seq_num` is strictly past a `stream_record:<shard_id>:<seq>`
-/// row BEFORE 24-hour retention pruning deletes the record, guaranteeing pruned
-/// sequence slots can never be reused even after an un-healed crash.
+/// row BEFORE 24-hour retention pruning deletes the record.
 pub async fn ensure_shard_past_record(
     cat: &Catalog<'_>,
     record_row_key: &str,
-) -> Result<(), String> {
+) -> Result<(), StorageError> {
     let Some(rest) = record_row_key.strip_prefix("stream_record:") else {
         return Ok(());
     };
@@ -366,7 +358,10 @@ pub async fn ensure_shard_past_record(
 
 /// Close each open shard in `shard_ids` atomically via `Catalog::mutate_json_cas`,
 /// preserving concurrent `next_seq_num` / `last_sequence_number` advances.
-pub async fn close_shards_by_id(cat: &Catalog<'_>, shard_ids: &[String]) -> Result<(), String> {
+pub async fn close_shards_by_id(
+    cat: &Catalog<'_>,
+    shard_ids: &[String],
+) -> Result<(), StorageError> {
     for sid in shard_ids {
         let fallback_latest = latest_sequence_for_shard(cat, sid).await?;
         let rk = keys::stream_shard(sid);
@@ -374,8 +369,8 @@ pub async fn close_shards_by_id(cat: &Catalog<'_>, shard_ids: &[String]) -> Resu
             let Some(val) = existing else {
                 return Ok((CatalogJsonAction::NoOp, ()));
             };
-            let mut meta: ShardMeta =
-                serde_json::from_value(val).map_err(|e| format!("decode shard meta {sid}: {e}"))?;
+            let mut meta: ShardMeta = serde_json::from_value(val)
+                .map_err(|e| StorageError::Internal(format!("decode shard meta {sid}: {e}")))?;
             if meta.ending_sequence_number.is_some() {
                 return Ok((CatalogJsonAction::NoOp, ()));
             }
@@ -395,8 +390,8 @@ pub async fn close_shards_by_id(cat: &Catalog<'_>, shard_ids: &[String]) -> Resu
             .map(str::to_owned)
             .unwrap_or_else(|| meta.starting_sequence_number.clone());
             meta.ending_sequence_number = Some(end_seq);
-            let encoded =
-                serde_json::to_value(&meta).map_err(|e| format!("encode shard meta: {e}"))?;
+            let encoded = serde_json::to_value(&meta)
+                .map_err(|e| StorageError::Internal(format!("encode shard meta: {e}")))?;
             Ok((CatalogJsonAction::Put(encoded), ()))
         })
         .await?;
@@ -404,7 +399,7 @@ pub async fn close_shards_by_id(cat: &Catalog<'_>, shard_ids: &[String]) -> Resu
     Ok(())
 }
 
-async fn read_dedup_seq(cat: &Catalog<'_>, rk: &str) -> Result<Option<String>, String> {
+async fn read_dedup_seq(cat: &Catalog<'_>, rk: &str) -> Result<Option<String>, StorageError> {
     let Some(val) = cat.get(rk).await? else {
         return Ok(None);
     };
@@ -428,24 +423,19 @@ async fn persist_dedup_marker(cat: &Catalog<'_>, rk: &str, seq: &str, created_at
 }
 
 /// Append a stream record into the next contiguous per-shard log slot with
-/// exact-once cross-node deduplication (`RFC-0003` §5.2).
+/// exact-once cross-node deduplication.
 ///
-/// Protocol invariant preventing cross-node duplicate slots:
-/// 1. In each loop iteration, read `ShardMeta` FIRST, and THEN check `stream_dedup`
-///    SECOND before attempting `put_if_absent` on `cand_slot`.
-/// 2. Whenever any writer (either the slot winner or a colliding helper) advances
-///    `ShardMeta.next_seq_num` past `cand_slot`, it MUST persist the slot winner's
-///    `stream_dedup:<shard_id>:<winner_event_id>` marker BEFORE advancing `ShardMeta`.
-///    Consequently, any concurrent caller racing for the same event that reads
-///    `ShardMeta.next_seq_num >= cand_slot + 1` is guaranteed to observe the
-///    durable `stream_dedup` marker in step (1) and return idempotently without
-///    allocating a duplicate slot!
+/// - Never falls back to a clock-derived sequence number: `ShardMeta` is always
+///   persisted BEFORE `latest_stream_label` becomes visible on `table_meta`.
+/// - Returns `Ok(None)` without writing when `ShardMeta.ending_sequence_number`
+///   is already set, so a closed shard never receives records past its ending
+///   sequence number.
 pub async fn write_record_ordered(
     cat: &Catalog<'_>,
     shard_id: &str,
     record: &StreamRecord,
     dedup_key: Option<&str>,
-) -> Result<String, String> {
+) -> Result<Option<String>, StorageError> {
     let local_lock = shard_local_mutex(shard_id);
     let _guard = local_lock.lock().await;
 
@@ -457,8 +447,14 @@ pub async fn write_record_ordered(
     let shard_rk = keys::stream_shard(shard_id);
 
     for attempt in 0..256u32 {
-        // 1. Read `ShardMeta.next_seq_num` FIRST.
-        let shard_opt = cat.get(&shard_rk).await?;
+        // 1. Read `ShardMeta` FIRST.
+        let Some(shard_val) = cat.get(&shard_rk).await? else {
+            return Err(StorageError::Internal(format!(
+                "stream shard '{shard_id}' metadata row is missing"
+            )));
+        };
+        let meta: ShardMeta = serde_json::from_value(shard_val)
+            .map_err(|e| StorageError::Internal(format!("decode shard meta {shard_id}: {e}")))?;
 
         // 2. Check deduplication markers SECOND (after reading `ShardMeta`).
         for drk in [event_dedup_rk.as_deref(), extra_dedup_rk.as_deref()]
@@ -475,48 +471,22 @@ pub async fn write_record_ordered(
                     )
                     .await;
                 }
-                return Ok(existing_seq);
+                return Ok(Some(existing_seq));
             }
         }
 
-        let cand_slot = match shard_opt {
-            Some(val) => serde_json::from_value::<ShardMeta>(val)
-                .map(|m| m.next_seq_num.max(1))
-                .unwrap_or(1),
-            None => {
-                let fallback_seq = if record.dynamodb.sequence_number.is_empty()
-                    || record.dynamodb.sequence_number == UNASSIGNED_SEQUENCE_NUMBER
-                {
-                    next_sequence_number()
-                } else {
-                    record.dynamodb.sequence_number.clone()
-                };
-                let mut rec = record.clone();
-                rec.dynamodb.sequence_number = fallback_seq.clone();
-                let rk = keys::stream_record(shard_id, &fallback_seq);
-                let body = serde_json::to_value(&rec).map_err(|e| format!("encode record: {e}"))?;
-                cat.put(&rk, &body).await?;
-                for drk in [event_dedup_rk.as_deref(), extra_dedup_rk.as_deref()]
-                    .into_iter()
-                    .flatten()
-                {
-                    persist_dedup_marker(
-                        cat,
-                        drk,
-                        &fallback_seq,
-                        rec.dynamodb.approximate_creation_date_time,
-                    )
-                    .await;
-                }
-                return Ok(fallback_seq);
-            }
-        };
+        // 3. Refuse appending to a closed shard (`ending_sequence_number` set).
+        if meta.ending_sequence_number.is_some() {
+            return Ok(None);
+        }
 
+        let cand_slot = meta.next_seq_num.max(1);
         let cand_seq = slot_sequence_number(shard_id, cand_slot);
         let rec_rk = keys::stream_record(shard_id, &cand_seq);
         let mut candidate = record.clone();
-        candidate.dynamodb.sequence_number = cand_seq.clone();
-        let body = serde_json::to_value(&candidate).map_err(|e| format!("encode record: {e}"))?;
+        candidate.dynamodb.sequence_number.clone_from(&cand_seq);
+        let body = serde_json::to_value(&candidate)
+            .map_err(|e| StorageError::Internal(format!("encode stream record: {e}")))?;
 
         if cat.put_if_absent(&rec_rk, &body).await? {
             for drk in [event_dedup_rk.as_deref(), extra_dedup_rk.as_deref()]
@@ -538,7 +508,7 @@ pub async fn write_record_ordered(
                 &cand_seq,
             )
             .await;
-            return Ok(cand_seq);
+            return Ok(Some(cand_seq));
         }
 
         // Another writer claimed `cand_slot`. Help persist that winner's `event_id`
@@ -572,7 +542,7 @@ pub async fn write_record_ordered(
                     &cand_seq,
                 )
                 .await;
-                return Ok(cand_seq);
+                return Ok(Some(cand_seq));
             }
         }
 
@@ -586,9 +556,9 @@ pub async fn write_record_ordered(
         }
     }
 
-    Err(format!(
+    Err(StorageError::Transient(format!(
         "stream shard '{shard_id}' append contention limit exceeded"
-    ))
+    )))
 }
 
 /// Append a stream record idempotently via contiguous shard slot assignment.
@@ -596,44 +566,58 @@ pub async fn write_record(
     cat: &Catalog<'_>,
     shard_id: &str,
     record: &StreamRecord,
-) -> Result<(), String> {
+) -> Result<(), StorageError> {
     write_record_ordered(cat, shard_id, record, None)
         .await
         .map(|_| ())
 }
 
-/// Return the highest 26-digit sequence number recorded in `shard_id`, or `None`.
+/// Return the highest 26-digit sequence number recorded in `shard_id`, or `None`,
+/// using `ShardMeta` plus bounded tail-slot point reads rather than scanning
+/// the shard's 24-hour record history.
 pub async fn latest_sequence_for_shard(
     cat: &Catalog<'_>,
     shard_id: &str,
-) -> Result<Option<String>, String> {
-    let mut best: Option<String> = None;
-    if let Some(val) = cat.get(&keys::stream_shard(shard_id)).await?
-        && let Ok(meta) = serde_json::from_value::<ShardMeta>(val)
-    {
-        if let Some(last) = meta.last_sequence_number {
-            best = Some(last);
-        } else if meta.next_seq_num > 1 {
-            best = Some(slot_sequence_number(shard_id, meta.next_seq_num - 1));
+) -> Result<Option<String>, StorageError> {
+    let Some(val) = cat.get(&keys::stream_shard(shard_id)).await? else {
+        return Ok(None);
+    };
+    let meta: ShardMeta = serde_json::from_value(val)
+        .map_err(|e| StorageError::Internal(format!("decode shard meta {shard_id}: {e}")))?;
+
+    let mut best: Option<String> = meta.last_sequence_number;
+    if best.is_none() && meta.next_seq_num > 1 {
+        best = Some(slot_sequence_number(shard_id, meta.next_seq_num - 1));
+    }
+
+    // Probe at `next_seq_num` in case a writer persisted `stream_record` right
+    // before crashing prior to advancing `ShardMeta.next_seq_num`.
+    let mut probe_slot = meta.next_seq_num.max(1);
+    for _ in 0..64 {
+        let probe_seq = slot_sequence_number(shard_id, probe_slot);
+        let rk = keys::stream_record(shard_id, &probe_seq);
+        if cat.get(&rk).await?.is_some() {
+            best = Some(probe_seq.clone());
+            let _ = advance_shard_cursor_at_least(
+                cat,
+                shard_id,
+                probe_slot.saturating_add(1),
+                &probe_seq,
+            )
+            .await;
+            probe_slot = probe_slot.saturating_add(1);
+        } else {
+            break;
         }
     }
-    let rows = cat
-        .scan_prefix(&keys::stream_record_shard_prefix(shard_id))
-        .await?;
-    for (rk, _) in rows {
-        if let Some((_, seq)) = rk.rsplit_once(':')
-            && best.as_deref().is_none_or(|prev| seq > prev)
-        {
-            best = Some(seq.to_owned());
-        }
-    }
+
     Ok(best)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use extenddb_core::types::{KeyType, UserIdentity};
+    use extenddb_core::types::{AttributeValue, KeyType, UserIdentity};
 
     #[test]
     fn sequence_numbers_are_fixed_width_monotonic_decimal_u128() {
@@ -671,7 +655,7 @@ mod tests {
     }
 
     #[test]
-    fn build_record_propagates_ttl_service_user_identity_and_view_type() {
+    fn build_record_uses_dynamodb_item_size_bytes_and_propagates_ttl_identity() {
         let ks = vec![KeySchemaElement {
             attribute_name: "pk".into(),
             key_type: KeyType::Hash,
@@ -703,6 +687,10 @@ mod tests {
         assert_eq!(rec.aws_region, "us-west-2");
         assert!(rec.dynamodb.old_image.is_some());
         assert!(rec.dynamodb.new_image.is_none());
+        assert_eq!(
+            rec.dynamodb.size_bytes,
+            i64::try_from(item_size_bytes(&old)).unwrap()
+        );
         let uid = rec.user_identity.expect("user_identity");
         assert_eq!(uid.principal_id, "dynamodb.amazonaws.com");
         assert_eq!(uid.identity_type, "Service");
