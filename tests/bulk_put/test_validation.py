@@ -63,10 +63,10 @@ class TestValidation:
         resp = extenddb_request("StartBulkPutItems", body)
         desc = resp["BulkOperationDescription"]
         assert desc["InputS3Configuration"]["InputCompressionType"] == "ZSTD"
-        assert desc["TotalInputBytes"] == len(frame)
 
         terminal = wait_until_terminal(desc["BulkOperationArn"])
         assert terminal["BulkOperationStatus"] == "COMPLETED"
+        assert terminal["TotalInputBytes"] == len(frame)
         assert terminal["ProcessedItemCount"] == 5
         assert terminal["FailedItemCount"] == 0
         assert terminal["ProcessedInputBytes"] == len(frame)

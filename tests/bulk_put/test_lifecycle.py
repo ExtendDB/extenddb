@@ -70,7 +70,10 @@ class TestLifecycle:
         )
         desc = resp["BulkOperationDescription"]
         assert desc["BulkOperationStatus"] == "IN_PROGRESS"
-        assert desc["TotalInputBytes"] == input_size
+        # Measured on the service: the Start answer carries no byte member
+        # and no usage; the terminal description carries all three.
+        for member in ("TotalInputBytes", "ProcessedInputBytes", "BulkOperationUsage"):
+            assert member not in desc, member
         arn = desc["BulkOperationArn"]
         match = OPERATION_ARN_PATTERN.match(arn)
         assert match, f"unexpected operation ARN shape: {arn}"
@@ -78,6 +81,7 @@ class TestLifecycle:
 
         terminal = wait_until_terminal(arn)
         assert terminal["BulkOperationStatus"] == "COMPLETED_WITH_ERRORS"
+        assert terminal["TotalInputBytes"] == input_size
         assert terminal["ProcessedItemCount"] == 5
         assert terminal["FailedItemCount"] == 1
         assert terminal["ProcessedInputBytes"] == terminal["TotalInputBytes"]
@@ -113,10 +117,11 @@ class TestLifecycle:
         body["InputS3Configuration"]["InputCompressionType"] = "GZIP"
         resp = extenddb_request("StartBulkPutItems", body)
         desc = resp["BulkOperationDescription"]
-        assert desc["TotalInputBytes"] == input_size
+        assert "TotalInputBytes" not in desc
 
         terminal = wait_until_terminal(desc["BulkOperationArn"])
         assert terminal["BulkOperationStatus"] == "COMPLETED"
+        assert terminal["TotalInputBytes"] == input_size
         assert terminal["ProcessedItemCount"] == 5
         assert terminal["FailedItemCount"] == 0
         for i in range(5):

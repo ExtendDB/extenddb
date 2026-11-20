@@ -127,7 +127,9 @@ class TestS3Permissions:
         write_input(caller, "in/rows.json", [row("a", "1")])
         write_input(caller, "other/rows.json", [row("b", "1")])
 
-        desc = start(caller)
+        started = start(caller)
+        assert started["BulkOperationStatus"] == "IN_PROGRESS"
+        desc = wait_until_terminal(started["BulkOperationArn"], creds=caller.creds)
         assert desc["BulkOperationStatus"] == "FAILED"
         assert desc["FailureCode"] == "S3AccessDenied"
         assert desc["FailureMessage"] == (
@@ -135,7 +137,7 @@ class TestS3Permissions:
             f'on resource: "arn:aws:s3:::{caller.bucket}" because no '
             "identity-based policy allows the s3:ListBucket action"
         )
-        # Born terminal before enumeration: neither byte member is present.
+        # Failed before the listing: neither byte member is present.
         assert desc["ProcessedItemCount"] == 0
         assert "TotalInputBytes" not in desc
         assert "ProcessedInputBytes" not in desc
@@ -165,7 +167,7 @@ class TestS3Permissions:
 
         desc = start(caller)
         assert desc["BulkOperationStatus"] == "IN_PROGRESS"
-        assert desc["TotalInputBytes"] == len(payload)
+        assert "TotalInputBytes" not in desc
         arn = desc["BulkOperationArn"]
         terminal = wait_until_terminal(arn, creds=caller.creds)
         assert terminal["BulkOperationStatus"] == "FAILED"

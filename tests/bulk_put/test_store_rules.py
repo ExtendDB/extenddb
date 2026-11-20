@@ -41,13 +41,24 @@ REPORT_WRITE_TAIL = re.compile(
 
 
 def start_with_a_missing_input_bucket(bulk_table) -> tuple[dict, str]:
+    """Start a load whose input bucket does not exist.
+
+    The Start answers IN_PROGRESS with no byte member, and the run then
+    ends FAILED with S3NoSuchBucket, still with no byte member (measured on
+    the service). Returns the terminal description and the bucket's name.
+    """
     absent = f"absent-{uuid.uuid4().hex[:12]}"
     desc = extenddb_request(
         "StartBulkPutItems", start_body(bulk_table, absent)
     )["BulkOperationDescription"]
-    assert desc["BulkOperationStatus"] == "FAILED"
-    assert desc["FailureCode"] == "S3NoSuchBucket"
-    return desc, absent
+    assert desc["BulkOperationStatus"] == "IN_PROGRESS"
+    assert "TotalInputBytes" not in desc
+    terminal = wait_until_terminal(desc["BulkOperationArn"])
+    assert terminal["BulkOperationStatus"] == "FAILED"
+    assert terminal["FailureCode"] == "S3NoSuchBucket"
+    assert "TotalInputBytes" not in terminal
+    assert "ProcessedInputBytes" not in terminal
+    return terminal, absent
 
 
 def run_into_a_missing_output_bucket(dynamodb_client, bulk_table, bulk_bucket):
@@ -112,9 +123,9 @@ class TestFilesystemStore:
             desc = extenddb_request(
                 "StartBulkPutItems", start_body(bulk_table, bulk_bucket)
             )["BulkOperationDescription"]
-            assert desc["TotalInputBytes"] == size
             terminal = wait_until_terminal(desc["BulkOperationArn"])
             assert terminal["BulkOperationStatus"] == "COMPLETED"
+            assert terminal["TotalInputBytes"] == size
             assert terminal["ProcessedItemCount"] == 1
             linked = dynamodb_client.get_item(
                 TableName=bulk_table, Key={"pk": {"S": "linked"}, "sk": {"S": "1"}}
@@ -141,9 +152,11 @@ class TestFilesystemStore:
             desc = extenddb_request(
                 "StartBulkPutItems", start_body(table, bulk_bucket), creds
             )["BulkOperationDescription"]
-            assert desc["BulkOperationStatus"] == "FAILED"
-            assert desc["FailureCode"] == "S3NoSuchBucket"
-            assert desc["FailureMessage"] == "The specified bucket does not exist"
+            assert desc["BulkOperationStatus"] == "IN_PROGRESS"
+            terminal = wait_until_terminal(desc["BulkOperationArn"], creds=creds)
+            assert terminal["BulkOperationStatus"] == "FAILED"
+            assert terminal["FailureCode"] == "S3NoSuchBucket"
+            assert terminal["FailureMessage"] == "The specified bucket does not exist"
         finally:
             try:
                 client.delete_table(TableName=table)
@@ -152,17 +165,19 @@ class TestFilesystemStore:
                 pass
             _release_account(mgmt, account_id, "neighbour")
 
-    def test_an_input_owner_other_than_the_caller_is_refused_at_start(
+    def test_an_input_owner_other_than_the_caller_fails_the_operation(
         self, bulk_table, bulk_bucket
     ):
         write_rows(bulk_bucket, "in/rows.json", [row("o", "1")])
         body = start_body(bulk_table, bulk_bucket)
         body["InputS3Configuration"]["S3BucketOwner"] = "999999999999"
         desc = extenddb_request("StartBulkPutItems", body)["BulkOperationDescription"]
-        assert desc["BulkOperationStatus"] == "FAILED"
-        assert desc["FailureCode"] == "S3AccessDenied"
-        assert desc["FailureMessage"] == "Access Denied"
-        assert "TotalInputBytes" not in desc
+        assert desc["BulkOperationStatus"] == "IN_PROGRESS"
+        terminal = wait_until_terminal(desc["BulkOperationArn"])
+        assert terminal["BulkOperationStatus"] == "FAILED"
+        assert terminal["FailureCode"] == "S3AccessDenied"
+        assert terminal["FailureMessage"] == "Access Denied"
+        assert "TotalInputBytes" not in terminal
 
 
 class TestS3Store:
