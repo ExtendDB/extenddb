@@ -94,19 +94,23 @@ pub(crate) async fn handle_request(
     }
 
     // --- Pre-auth body validation ---
-    // The service checks the request's JSON syntax before authentication but
-    // refuses an over deep body only after it (measured 2026-11-12: unsigned,
-    // a 20000 wrapper PutItem is MissingAuthenticationTokenException; signed,
-    // SerializationException). A body within serde_json's default depth is
-    // parsed here, as it always was; a deeper one is only scanned until the
-    // caller is authenticated, so no unauthenticated request makes this
-    // thread recurse past that depth (see request_parse).
+    // The service checks the request's JSON syntax before authentication at
+    // every depth but refuses an over deep body only after it (measured
+    // 2026-11-19: unsigned, a 20000 wrapper PutItem is
+    // MissingAuthenticationTokenException, and the same body without its last
+    // byte SerializationException). A body within serde_json's default depth
+    // is parsed here, as it always was. A deeper one only has its syntax
+    // checked, by a walk that does not recurse, until the caller is
+    // authenticated, so no unauthenticated request makes this thread recurse
+    // past that depth (see request_parse).
     let depth = crate::request_parse::nesting_depth(&body);
     let pre_auth_input = if depth <= crate::request_parse::UNAUTHENTICATED_PARSE_DEPTH {
         match crate::request_parse::parse_request_value(&body, depth) {
             Ok(v) => Some(v),
             Err(e) => return error_response(&e, &request_id),
         }
+    } else if let Err(e) = crate::request_parse::check_request_syntax(&body, depth) {
+        return error_response(&e, &request_id);
     } else {
         None
     };

@@ -22,6 +22,11 @@ Dual-target: runs against the service and against ExtendDB on every backend.
 Bodies shallow enough for the client library to serialize without hitting its
 own recursion limit use boto3 directly; deeper bodies are built as raw JSON and
 signed, so no client library recurses to produce them.
+
+Before authentication the service checks only a body's syntax, at every depth:
+a deep body with a syntax fault is a SerializationException unsigned or badly
+signed, and a complete deep body gets the authentication error (us-east-1,
+2026-11-19).
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ import time
 
 import boto3
 import pytest
+import requests
 from botocore.exceptions import ClientError
 
 from conftest import scoped_table
@@ -195,3 +201,102 @@ def test_a_body_far_past_the_ceiling_is_a_messageless_serialization_error(
     resp = _raw_put(dynamodb_client, table, "huge", 20_000)
     assert resp.status_code == 400, resp.text
     assert _is_messageless_serialization_error(resp.json()), resp.text
+
+
+def _unauthenticated_put(dynamodb_client, endpoint_url, body: bytes, signing: str):
+    """POST a raw PutItem body with no Authorization header ("unsigned"), or
+    signed with the caller's access key and a wrong secret key
+    ("bad-signature")."""
+    endpoint = dynamodb_client.meta.endpoint_url
+    if signing == "unsigned":
+        return requests.post(
+            endpoint,
+            data=body,
+            headers={
+                "X-Amz-Target": "DynamoDB_20120810.PutItem",
+                "Content-Type": "application/x-amz-json-1.0",
+            },
+            # ExtendDB serves a self-signed certificate; the service does not.
+            verify=endpoint_url is None,
+            timeout=30,
+        )
+    frozen = boto3.Session().get_credentials().get_frozen_credentials()
+    secret = frozen.secret_key
+    wrong_secret = secret[:-1] + ("A" if secret[-1] != "A" else "B")
+    return signed_post(
+        endpoint,
+        frozen.access_key,
+        wrong_secret,
+        dynamodb_client.meta.region_name,
+        "PutItem",
+        body,
+        session_token=frozen.token,
+    )
+
+
+def _malformed_body(table_name: str, shape: str) -> bytes:
+    """`x-then-6000-openers` is the byte `x` followed by 6000 `[`;
+    `truncated-<w>` is the raw PutItem body of `w` wrappers without its last
+    byte."""
+    if shape == "x-then-6000-openers":
+        return b"x" + b"[" * 6000
+    wrappers = int(shape.removeprefix("truncated-"))
+    return _raw_put_body(table_name, "malformed", wrappers)[:-1]
+
+
+@pytest.mark.parametrize("signing", ["unsigned", "bad-signature"])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "x-then-6000-openers",
+        "truncated-63",
+        "truncated-200",
+        "truncated-2000",
+        "truncated-20000",
+    ],
+)
+def test_a_malformed_deep_body_is_refused_before_authentication(
+    dynamodb_client, endpoint_url, table, shape, signing
+):
+    # Each body nests past the 127 levels ExtendDB parses before
+    # authentication and has a syntax fault. The service answers each with a
+    # 400 SerializationException, unsigned and badly signed (2 of 2 sends per
+    # body and signing, us-east-1, 2026-11-19).
+    body = _malformed_body(table, shape)
+    resp = _unauthenticated_put(dynamodb_client, endpoint_url, body, signing)
+    assert resp.status_code == 400, resp.text
+    err = resp.json()
+    assert err["__type"] == SERIALIZATION_TYPE, resp.text
+    if shape in ("x-then-6000-openers", "truncated-20000"):
+        # Nested past ExtendDB's 5200 level ceiling, both answers have no
+        # message field. Within the ceiling ExtendDB's refusal carries its usual
+        # wording, as for a shallow malformed body, where the service's has no
+        # message field.
+        assert "message" not in err, resp.text
+
+
+@pytest.mark.parametrize("signing", ["unsigned", "bad-signature"])
+@pytest.mark.parametrize(
+    "wrappers, tail",
+    [(63, b""), (2000, b""), (20000, b""), (2000, b"x")],
+    ids=["complete-63", "complete-2000", "complete-20000", "complete-2000-then-x"],
+)
+def test_a_complete_deep_body_reaches_authentication(
+    dynamodb_client, endpoint_url, table, wrappers, tail, signing
+):
+    # The check before authentication reads one complete JSON value at any
+    # depth and ignores bytes after it, as the service's does: unsigned, each
+    # body is MissingAuthenticationTokenException, and badly signed
+    # InvalidSignatureException (2 of 2 sends each, us-east-1, 2026-11-19).
+    # ExtendDB's type for the first is MissingAuthenticationToken (#1075).
+    body = _raw_put_body(table, "unauthenticated", wrappers) + tail
+    resp = _unauthenticated_put(dynamodb_client, endpoint_url, body, signing)
+    assert resp.status_code == 400, resp.text
+    expected = (
+        "MissingAuthenticationToken"
+        if signing == "unsigned"
+        else "InvalidSignatureException"
+    )
+    assert resp.json()["__type"].startswith(
+        f"com.amazon.coral.service#{expected}"
+    ), resp.text

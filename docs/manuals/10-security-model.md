@@ -48,7 +48,7 @@ The steps run in this order; every rejection is HTTP 400.
 8. Derive the signing key (HMAC-SHA256 chain over date, region, service, "aws4_request") and compare the computed signature with the provided one in constant time; mismatch: `InvalidSignatureException`
 9. Apply the deferred decisions from steps 3 and 6, after the signature check so that failure paths take the same time: an inactive key or a wrong or missing token is `UnrecognizedClientException`
 
-Request bodies are parsed before authentication (the service does the same), so a malformed body returns `SerializationException` whatever the signature. Headers not named in `SignedHeaders` do not take part in verification; the service behaves the same way, and clients sign every `x-amz-*` header they send.
+A request body's JSON syntax is checked before authentication at every nesting depth (the service does the same), so a malformed body returns `SerializationException` whatever the signature. A body nested deeper than 127 levels is parsed only after the caller is authenticated, so an unauthenticated request never makes a worker thread recurse past that depth. Headers not named in `SignedHeaders` do not take part in verification; the service behaves the same way, and clients sign every `x-amz-*` header they send.
 
 #### Credential Types
 

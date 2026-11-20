@@ -16,15 +16,18 @@
 //! The recursion limit is therefore disabled, and a byte scan ([`nesting_depth`])
 //! bounds the structural nesting first so a hostile body (a 16 MiB request can
 //! nest to millions of levels) cannot overflow the worker stack. The service
-//! checks a body's JSON syntax before authentication but refuses an over deep
-//! body only after it (measured 2026-11-12, us-east-1: unsigned, a 20000
-//! wrapper PutItem is a `MissingAuthenticationTokenException`; signed, a
-//! `SerializationException`). The handler follows that order: it parses a body
-//! within [`UNAUTHENTICATED_PARSE_DEPTH`] before authentication and a deeper
-//! one only after the caller is authenticated, so no request recurses past
-//! `serde_json`'s default depth on an unauthenticated connection.
+//! checks a body's JSON syntax before authentication at every depth but refuses
+//! an over deep body only after it (measured 2026-11-19, us-east-1: unsigned, a
+//! 20000 wrapper PutItem is a `MissingAuthenticationTokenException`, and the
+//! same body without its last byte a `SerializationException`). The handler
+//! follows that order. It parses a body within [`UNAUTHENTICATED_PARSE_DEPTH`]
+//! before authentication. For a deeper body it runs only
+//! [`check_request_syntax`], which does not recurse, and parses the body after
+//! the caller is authenticated, so no request recurses past `serde_json`'s
+//! default depth on an unauthenticated connection.
 
 use serde::Deserialize;
+use serde::de::IgnoredAny;
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
@@ -60,9 +63,9 @@ const MAX_REQUEST_JSON_DEPTH: usize = 5200;
 /// Deepest structural nesting the handler parses before the caller is
 /// authenticated: the 127 levels `serde_json`'s default recursion limit of 128
 /// accepts (it refuses the 128th), which the server parsed on a default 2 MiB
-/// worker stack before the limit was lifted. A body nested deeper is only
-/// scanned until authentication succeeds, so an unauthenticated request can
-/// never make the handler recurse past this depth.
+/// worker stack before the limit was lifted. A deeper body only goes through
+/// [`check_request_syntax`] until authentication succeeds, so an
+/// unauthenticated request can never make the handler recurse past this depth.
 pub(crate) const UNAUTHENTICATED_PARSE_DEPTH: usize = 127;
 
 /// Stack each thread that handles requests needs, in bytes.
@@ -122,12 +125,7 @@ pub(crate) fn nesting_depth(body: &[u8]) -> usize {
 /// server has always returned for a body it cannot read.
 pub(crate) fn parse_request_value(body: &[u8], depth: usize) -> Result<Value, DynamoDbError> {
     if depth > MAX_REQUEST_JSON_DEPTH {
-        // A signed body nested past what the service parses gets HTTP 400 with
-        // `{"__type":"com.amazon.coral.service#SerializationException"}` and no
-        // message field at all (measured 2026-11-12, us-east-1: 24 of 24 sends
-        // at 5000 and at 20000 wrappers). An empty message makes
-        // `error_response` omit the field.
-        return Err(DynamoDbError::SerializationException(String::new()));
+        return Err(over_ceiling_refusal());
     }
     // The depth ceiling above keeps the disabled recursion limit from letting a
     // deep body overflow the stack.
@@ -136,6 +134,39 @@ pub(crate) fn parse_request_value(body: &[u8], depth: usize) -> Result<Value, Dy
     let value = Value::deserialize(&mut de).map_err(|e| serialization_error(&e.to_string()))?;
     de.end().map_err(|e| serialization_error(&e.to_string()))?;
     Ok(value)
+}
+
+/// Check the JSON syntax of a request body whose [`nesting_depth`] is `depth`
+/// without building it, so the handler can refuse a malformed body nested past
+/// [`UNAUTHENTICATED_PARSE_DEPTH`] before authentication, as the service does.
+/// `serde_json` skips an ignored value in one loop that keeps the kinds of the
+/// open containers on a heap stack, so the check does not recurse at any
+/// depth.
+///
+/// The check reads one JSON value, as the service's check before
+/// authentication does: bytes after a complete body, an invalid UTF-8 byte in
+/// a string and a lone surrogate escape all pass it (measured 2026-11-19,
+/// us-east-1: unsigned, each is a `MissingAuthenticationTokenException`). A
+/// body that fails it gets a `SerializationException`, with no message past
+/// the ceiling, as from [`parse_request_value`], and with the server's usual
+/// wording within it.
+pub(crate) fn check_request_syntax(body: &[u8], depth: usize) -> Result<(), DynamoDbError> {
+    let mut de = serde_json::Deserializer::from_slice(body);
+    match IgnoredAny::deserialize(&mut de) {
+        Ok(IgnoredAny) => Ok(()),
+        Err(_) if depth > MAX_REQUEST_JSON_DEPTH => Err(over_ceiling_refusal()),
+        Err(e) => Err(serialization_error(&e.to_string())),
+    }
+}
+
+/// The refusal for a body nested past [`MAX_REQUEST_JSON_DEPTH`]. A signed body
+/// nested past what the service parses gets HTTP 400 with
+/// `{"__type":"com.amazon.coral.service#SerializationException"}` and no
+/// message field at all (measured 2026-11-12, us-east-1: 24 of 24 sends at 5000
+/// and at 20000 wrappers). An empty message makes `error_response` omit the
+/// field.
+fn over_ceiling_refusal() -> DynamoDbError {
+    DynamoDbError::SerializationException(String::new())
 }
 
 /// The server's long standing wording for a request body it cannot read.
@@ -300,9 +331,9 @@ mod tests {
     fn the_unauthenticated_depth_is_serde_json_default() {
         // The handler parses a body within this depth before authentication, as
         // the server did with the deserializer's default limit on a default
-        // stack; a deeper one waits for authentication. Checked against
-        // serde_json itself: with its default limit, a body at this depth
-        // parses and a body one level deeper is the recursion error.
+        // stack; a deeper one only has its syntax checked until authentication.
+        // Checked against serde_json itself: with its default limit, a body at
+        // this depth parses and a body one level deeper is the recursion error.
         let nested = |levels: usize| [b"[".repeat(levels), b"]".repeat(levels)].concat();
         serde_json::from_slice::<Value>(&nested(UNAUTHENTICATED_PARSE_DEPTH))
             .expect("serde_json's default limit must parse a body at the depth");
@@ -331,5 +362,105 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    /// `deep_body(wrappers)` without its last byte.
+    fn truncated_body(wrappers: usize) -> Vec<u8> {
+        let mut body = deep_body(wrappers);
+        body.pop();
+        body
+    }
+
+    /// `deep_body(wrappers)` with its last `}` written as `]`.
+    fn wrong_closer_body(wrappers: usize) -> Vec<u8> {
+        let mut body = deep_body(wrappers);
+        *body.last_mut().unwrap() = b']';
+        body
+    }
+
+    #[test]
+    fn the_syntax_check_refuses_a_malformed_deep_body_as_the_parse_does() {
+        // Rows: a body nested past the pre-auth depth with a syntax fault. The
+        // service refuses each before authentication with a
+        // SerializationException (measured 2026-11-19, us-east-1, unsigned
+        // and badly signed). The check must give the refusal that the parse
+        // after authentication gives the same body. The parse recurses, so the
+        // rows run on a worker-sized stack.
+        let rows = [
+            [&b"x"[..], &b"[".repeat(6000)].concat(),
+            [&b"x"[..], &b"[".repeat(200)].concat(),
+            truncated_body(63),
+            truncated_body(200),
+            truncated_body(2000),
+            truncated_body(20000),
+            wrong_closer_body(200),
+        ];
+        std::thread::Builder::new()
+            .stack_size(REQUEST_WORKER_STACK_SIZE)
+            .spawn(move || {
+                for body in &rows {
+                    let depth = nesting_depth(body);
+                    assert!(depth > UNAUTHENTICATED_PARSE_DEPTH, "{} bytes", body.len());
+                    let checked = check_request_syntax(body, depth).unwrap_err();
+                    let parsed = parse_request_value(body, depth).unwrap_err();
+                    assert!(matches!(checked, DynamoDbError::SerializationException(_)));
+                    assert_eq!(checked.message(), parsed.message(), "{} bytes", body.len());
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        // Past the ceiling the refusal carries no message, which the service
+        // also gives these bodies; within it, the server's usual wording.
+        let past = [&b"x"[..], &b"[".repeat(6000)].concat();
+        assert!(
+            check_request_syntax(&past, nesting_depth(&past))
+                .unwrap_err()
+                .message()
+                .is_empty()
+        );
+        let within = truncated_body(200);
+        assert_eq!(
+            check_request_syntax(&within, nesting_depth(&within))
+                .unwrap_err()
+                .message(),
+            format!(
+                "Start of structure or map found where not expected: \
+                 EOF while parsing an object at line 1 column {}",
+                within.len()
+            )
+        );
+    }
+
+    #[test]
+    fn the_syntax_check_passes_what_the_service_authenticates_first() {
+        // Rows: bodies the service's check before authentication passes
+        // (measured 2026-11-19, us-east-1: unsigned, each is a
+        // MissingAuthenticationTokenException). Complete bodies far past the
+        // ceiling, bytes after a complete body, an invalid UTF-8 byte in a
+        // string and a lone surrogate escape. This runs on the default
+        // test-thread stack, where a parse that recursed a million levels
+        // would overflow, so it also shows that the check does not recurse.
+        let leaf = |with: &[u8]| {
+            let body = deep_body(200);
+            let at = body.windows(6).position(|w| w == b"\"leaf\"").unwrap();
+            [&body[..at], with, &body[at + 6..]].concat()
+        };
+        let rows = [
+            [b"[".repeat(1_000_000), b"]".repeat(1_000_000)].concat(),
+            deep_body(20000),
+            [deep_body(2000), b"x".to_vec()].concat(),
+            leaf(b"\"le\xffaf\""),
+            leaf(br#""le\ud800af""#),
+        ];
+        for body in &rows {
+            let depth = nesting_depth(body);
+            assert!(depth > UNAUTHENTICATED_PARSE_DEPTH, "{} bytes", body.len());
+            assert!(
+                check_request_syntax(body, depth).is_ok(),
+                "{} bytes",
+                body.len()
+            );
+        }
     }
 }
