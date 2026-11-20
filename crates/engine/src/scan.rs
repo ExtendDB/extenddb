@@ -21,11 +21,11 @@ use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::{build_expression_maps, parse_optional_filter};
 use crate::index_helpers::{
     VectorIndexReadRefusal, classify_unresolved_index_read, combined_lek_key_schema,
-    validate_scan_exclusive_start_key,
 };
 use crate::legacy_filter::desugar_filter;
 use crate::read_helpers::{PostRead, read_page};
 use crate::serialize_output;
+use crate::start_key::validate_scan_exclusive_start_key;
 use crate::{DispatchMetrics, DispatchResult};
 
 /// Handle a `Scan` request.
@@ -68,8 +68,16 @@ pub async fn handle_scan(
     )?;
     let input: ScanInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
+    // The Limit, Segment and TotalSegments ranges come before the expression
+    // checks and the table lookup (measured 2026-11-19: `Limit: 0` or
+    // `TotalSegments: 0` beside a filter syntax error, an undefined value, an
+    // operand of the wrong type, an operator count over the cap, an unused
+    // value or a missing table answers the range). The Segment pairing and
+    // order checks come after the operator count and stay below.
+    validate_scan_ranges(&input)?;
+
     // Validate Filter/Projection expressions before the existence
-    // check; index resolution, Segment/Limit/Select and key checks stay after.
+    // check; index resolution, Segment pairing, Select and key checks stay after.
 
     // --- Legacy vs expression mutual exclusivity checks ---
     let has_fe = input.filter_expression.is_some();
@@ -139,14 +147,22 @@ pub async fn handle_scan(
         )
     };
 
-    // The operator cap runs before the unused placeholder check and the table
-    // lookup (measured 2026-10-25: the count beats an unused value, a missing
-    // table and an unknown IndexName). It applies to a FilterExpression only:
-    // a legacy ScanFilter of 160 conditions is accepted (measured 2026-10-25).
+    // A FilterExpression's placeholders and operand types, then its operator
+    // count, are checked before the projection, the unused placeholder check
+    // and the table lookup (measured 2026-10-25 and 2026-11-19: the count
+    // beats an unused value, a missing table and an unknown IndexName, and an
+    // undefined placeholder or an operand of the wrong type beats the count).
+    // A legacy ScanFilter of 160 conditions is accepted (measured
+    // 2026-10-25), so it is not counted.
     if filter_maps.is_none()
         && let Some(ref f) = filter
     {
-        crate::expression_helpers::check_operator_count(f, ExpressionKind::Filter)?;
+        crate::expression_helpers::check_parsed_condition(
+            f,
+            &maps,
+            ExpressionKind::Filter,
+            &ctx.limits,
+        )?;
     }
 
     // Parse ProjectionExpression or desugar legacy AttributesToGet
@@ -309,7 +325,9 @@ pub async fn handle_scan(
         )?;
     }
 
-    // Validate Segment/TotalSegments — DynamoDB returns different messages per direction
+    // The Segment and TotalSegments pairing and order, after the operator
+    // count (measured 2026-11-19). The service reports a missing partner with
+    // a message per direction. The ranges are checked in validate_scan_ranges.
     match (input.segment, input.total_segments) {
         (Some(_), None) => {
             return Err(DynamoDbError::ValidationException(
@@ -323,44 +341,13 @@ pub async fn handle_scan(
                     .to_owned(),
             ));
         }
-        (Some(seg), Some(total)) => {
-            if total < 1 {
-                return Err(DynamoDbError::ValidationException(
-                    "The parameter TotalSegments should be greater than or equal to 1".to_owned(),
-                ));
-            }
-            if total > 1_000_000 {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "1 validation error detected: Value '{total}' at 'totalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000"
-                )));
-            }
-            if seg < 0 {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value greater than or equal to 0"
-                )));
-            }
-            if seg > 999_999 {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value less than or equal to 999999"
-                )));
-            }
-            if seg >= total {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "The Segment parameter is zero-based and must be less than parameter TotalSegments: \
-                     Segment: {seg} is not less than TotalSegments: {total}"
-                )));
-            }
+        (Some(seg), Some(total)) if seg >= total => {
+            return Err(DynamoDbError::ValidationException(format!(
+                "The Segment parameter is zero-based and must be less than parameter TotalSegments: \
+                 Segment: {seg} is not less than TotalSegments: {total}"
+            )));
         }
-        (None, None) => {}
-    }
-
-    // Validate Limit >= 1
-    if let Some(limit) = input.limit
-        && limit < 1
-    {
-        return Err(DynamoDbError::ValidationException(format!(
-            "1 validation error detected: Value '{limit}' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
-        )));
+        _ => {}
     }
 
     // For index scans, build a key_info that reflects the index's key schema.
@@ -387,7 +374,8 @@ pub async fn handle_scan(
         && index_info.is_none()
     {
         return Err(DynamoDbError::ValidationException(
-            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName".to_owned(),
+            "1 validation error detected: ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName"
+                .to_owned(),
         ));
     }
     if let Some(Select::Count) = input.select
@@ -454,8 +442,11 @@ pub async fn handle_scan(
         }
     }
 
-    // Validate begins_with operand types upfront (before any rows are scanned).
-    if let Some(ref f) = filter {
+    // The operand types of a legacy ScanFilter, before any rows are scanned.
+    // A FilterExpression's were checked with its placeholders above.
+    if filter_maps.is_some()
+        && let Some(ref f) = filter
+    {
         extenddb_core::expression::validate_begins_with_operands(f, &combined_maps).map_err(
             |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
         )?;
@@ -527,4 +518,40 @@ pub async fn handle_scan(
             ..Default::default()
         },
     })
+}
+
+/// Refuse a Limit, Segment or TotalSegments value outside its range. The
+/// Segment and TotalSegments ranges are checked when both are present; a
+/// missing partner is reported by the pairing check in `handle_scan`.
+fn validate_scan_ranges(input: &ScanInput) -> Result<(), DynamoDbError> {
+    if let (Some(seg), Some(total)) = (input.segment, input.total_segments) {
+        if total < 1 {
+            return Err(DynamoDbError::ValidationException(
+                "The parameter TotalSegments should be greater than or equal to 1".to_owned(),
+            ));
+        }
+        if total > 1_000_000 {
+            return Err(DynamoDbError::ValidationException(format!(
+                "1 validation error detected: Value '{total}' at 'totalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000"
+            )));
+        }
+        if seg < 0 {
+            return Err(DynamoDbError::ValidationException(format!(
+                "1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value greater than or equal to 0"
+            )));
+        }
+        if seg > 999_999 {
+            return Err(DynamoDbError::ValidationException(format!(
+                "1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value less than or equal to 999999"
+            )));
+        }
+    }
+    if let Some(limit) = input.limit
+        && limit < 1
+    {
+        return Err(DynamoDbError::ValidationException(format!(
+            "1 validation error detected: Value '{limit}' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
+        )));
+    }
+    Ok(())
 }

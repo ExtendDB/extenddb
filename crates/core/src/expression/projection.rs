@@ -44,10 +44,16 @@ pub fn parse_projection_from(
     let mut pos = 0;
     let mut paths = vec![parse_projection_path(tokens, source, &mut pos)?];
     while pos < tokens.len() {
+        // Any token but a comma after a path answers the syntax error
+        // (measured 2026-11-19: `#v = #v` answers token "=", near "#v = #v";
+        // `#v AND #v` token "AND"; `#v #w` token "#w").
         if tokens[pos] != Token::Comma {
-            return Err(DynamoDbError::ValidationException(format!(
-                "Invalid ProjectionExpression: unexpected token at position {pos}"
-            )));
+            return Err(syntax_error(
+                ExpressionKind::Projection,
+                source,
+                tokens,
+                pos,
+            ));
         }
         pos += 1;
         paths.push(parse_projection_path(tokens, source, &mut pos)?);
@@ -58,7 +64,10 @@ pub fn parse_projection_from(
 /// Parse one projected path. Input that ends where a path is required (`#v,`)
 /// and a comma, operator or keyword there (`#v, , #v`) answer the service's
 /// syntax error (measured 2026-10-25: token ",", near ", , #v"; token "<EOF>",
-/// near ","). Any other token keeps the previous text.
+/// near ","). Input that ends inside a path (`#v.`, `#v[`, `#v[1`) and an
+/// operator or keyword after a dot (`#v.=`) answer it too (measured
+/// 2026-11-19: `#v.` answers token "<EOF>", near "."; `#v.=` answers token
+/// "=", near ".="). Any other token keeps the previous text.
 fn parse_projection_path(
     tokens: &[Token],
     source: &str,
@@ -77,7 +86,16 @@ fn parse_projection_path(
             tokens,
             *pos,
         )),
-        Some(_) => super::parser_common::parse_path(tokens, pos),
+        Some(_) => super::parser_common::parse_path(tokens, pos).map_err(|err| {
+            let after_dot = *pos > 0 && tokens[*pos - 1] == Token::Dot;
+            match tokens.get(*pos) {
+                None => syntax_error(ExpressionKind::Projection, source, tokens, *pos),
+                Some(token) if after_dot && is_operator_or_keyword(token) => {
+                    syntax_error(ExpressionKind::Projection, source, tokens, *pos)
+                }
+                Some(_) => err,
+            }
+        }),
     }
 }
 

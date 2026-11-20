@@ -41,15 +41,21 @@ pub fn count_operators(expr: &Expr) -> usize {
     }
 }
 
-/// Refuse an expression with more than [`MAX_EXPRESSION_OPERATORS`] operators.
+/// Refuse an expression with more than `max` operators. The service's cap,
+/// and the default of `LimitsConfig::max_expression_operators`, is
+/// [`MAX_EXPRESSION_OPERATORS`].
 ///
 /// # Errors
 ///
 /// Returns `ValidationException` carrying the `Invalid <kind>:` prefix and the
 /// full operator count.
-pub fn validate_operator_count(expr: &Expr, kind: ExpressionKind) -> Result<(), DynamoDbError> {
+pub fn validate_operator_count(
+    expr: &Expr,
+    kind: ExpressionKind,
+    max: usize,
+) -> Result<(), DynamoDbError> {
     let count = count_operators(expr);
-    if count > MAX_EXPRESSION_OPERATORS {
+    if count > max {
         return Err(DynamoDbError::ValidationException(format!(
             "Invalid {kind}: The expression contains too many operators; operator count: {count}"
         )));
@@ -127,35 +133,39 @@ mod tests {
     #[test]
     fn cap_is_exclusive_at_300() {
         let kind = ExpressionKind::Condition;
+        let check = |src: &str| {
+            let expr = parse_condition(&tokenize(src).unwrap()).unwrap();
+            validate_operator_count(&expr, kind, MAX_EXPRESSION_OPERATORS)
+        };
         let at_cap = format!(
             "NOT attribute_not_exists(pk) OR {}",
             chain("#v = :v", 149, " OR ")
         ); // [a49]
         assert_eq!(count(&at_cap), 300);
-        assert!(
-            validate_operator_count(&parse_condition(&tokenize(&at_cap).unwrap()).unwrap(), kind)
-                .is_ok()
-        );
+        assert!(check(&at_cap).is_ok());
 
         let over = chain("#v = :v", 151, " OR "); // [a30]
-        let err =
-            validate_operator_count(&parse_condition(&tokenize(&over).unwrap()).unwrap(), kind)
-                .unwrap_err();
+        let err = check(&over).unwrap_err();
         assert!(matches!(err, DynamoDbError::ValidationException(m)
             if m == "Invalid ConditionExpression: The expression contains too many operators; operator count: 301"));
 
         let under = chain("#v = :v", 150, " OR "); // [a30]
-        assert!(
-            validate_operator_count(&parse_condition(&tokenize(&under).unwrap()).unwrap(), kind)
-                .is_ok()
-        );
+        assert!(check(&under).is_ok());
     }
 
     #[test]
     fn message_carries_the_kind() {
         let expr = parse_condition(&tokenize(&chain("#v = :v", 300, " OR ")).unwrap()).unwrap();
-        let err = validate_operator_count(&expr, ExpressionKind::Filter).unwrap_err();
+        let err = validate_operator_count(&expr, ExpressionKind::Filter, MAX_EXPRESSION_OPERATORS)
+            .unwrap_err();
         assert!(matches!(err, DynamoDbError::ValidationException(m)
             if m == "Invalid FilterExpression: The expression contains too many operators; operator count: 599")); // [b01]
+    }
+
+    #[test]
+    fn a_raised_cap_accepts_more_operators() {
+        let expr = parse_condition(&tokenize(&chain("#v = :v", 300, " OR ")).unwrap()).unwrap();
+        assert!(validate_operator_count(&expr, ExpressionKind::Filter, 599).is_ok());
+        assert!(validate_operator_count(&expr, ExpressionKind::Filter, 598).is_err());
     }
 }

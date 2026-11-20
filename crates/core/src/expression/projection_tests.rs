@@ -451,11 +451,36 @@ fn trailing_comma_is_eof_with_the_comma_as_window() {
 }
 
 #[test]
+fn a_fault_after_or_inside_a_path_answers_the_syntax_error() {
+    // Measured 2026-11-19 (us-east-1), probe cases in the first column.
+    let rows = [
+        ("x13", "#v = #v", "=", "#v = #v"),
+        ("x14", "#v AND #v", "AND", "#v AND #v"),
+        ("j01", "#v #w", "#w", "#v #w"),
+        ("j02", "#v :v", ":v", "#v :v"),
+        ("j03", "#v (", "(", "#v ("),
+        ("j04", "#v )", ")", "#v )"),
+        ("j10", "#v[1] = #v", "=", "] = #v"),
+        ("x15", "#v.", "<EOF>", "."),
+        ("j05", "#v[", "<EOF>", "["),
+        ("j06", "#v[1", "<EOF>", "1"),
+        ("j07", "#v.#w.", "<EOF>", "."),
+        ("j08", "#v. ", "<EOF>", ". "),
+        ("j09", "#v.=", "=", ".="),
+    ];
+    for (case, src, token, near) in rows {
+        assert_eq!(
+            proj_msg(src),
+            format!(
+                "Invalid ProjectionExpression: Syntax error; token: \"{token}\", near: \"{near}\""
+            ),
+            "{case}"
+        );
+    }
+}
+
+#[test]
 fn other_projection_texts_are_unchanged() {
-    assert_eq!(
-        proj_msg("#v #w"),
-        "Invalid ProjectionExpression: unexpected token at position 1"
-    );
     assert_eq!(
         proj_msg("#v, )"),
         "Invalid expression: expected attribute name"

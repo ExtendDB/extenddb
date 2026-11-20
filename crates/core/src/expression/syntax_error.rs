@@ -12,7 +12,8 @@
 //! the source's own whitespace kept (`#v==:v` answers `near: "==:v"`) and a
 //! missing neighbour dropped (`= #v = :v` answers `near: "= #v"`, `#v = :v =`
 //! answers `near: ":v ="`). For `<EOF>` the window is the last token's text
-//! (`#v = :v AND` answers `token: "<EOF>", near: "AND"`).
+//! and the whitespace after it (`#v = :v AND` answers `token: "<EOF>", near:
+//! "AND"`; `#v = :v AND   ` answers `near: "AND   "`, measured 2026-11-19).
 
 use std::ops::Range;
 
@@ -138,11 +139,20 @@ pub fn syntax_error(
     ))
 }
 
+/// Whether `err` is a syntax error in the service's wording, as
+/// [`syntax_error`] builds it.
+#[must_use]
+pub fn is_syntax_error(err: &DynamoDbError) -> bool {
+    matches!(err, DynamoDbError::ValidationException(msg) if msg.contains(": Syntax error; token: \""))
+}
+
 /// The window of source text around the token at `pos`: from the previous
 /// token to the next one, each dropped when absent. When the faulty token is
 /// the first one, the window starts at the start of the source, leading
 /// whitespace kept (measured 2026-10-25: `  = #v = :v` answers
-/// `near: "  = #v"`). At end of input the window is the last token alone.
+/// `near: "  = #v"`). At end of input the window is the last token and the
+/// rest of the source, trailing whitespace kept (measured 2026-11-19:
+/// `SET #v = :v,   ` answers `near: ",   "`).
 fn near_window(source: &str, tokens: &[Token], pos: usize) -> String {
     if tokens.is_empty() {
         return String::new();
@@ -157,7 +167,12 @@ fn near_window(source: &str, tokens: &[Token], pos: usize) -> String {
         .flatten()
     {
         let start = if pos == 0 { 0 } else { spans[first].start };
-        return source[start..spans[last].end].to_owned();
+        let end = if pos >= tokens.len() {
+            source.len()
+        } else {
+            spans[last].end
+        };
+        return source[start..end].to_owned();
     }
     tokens[first..=last]
         .iter()
@@ -233,6 +248,29 @@ mod tests {
             msg(ExpressionKind::Update, "SET #v = :v,", 5),
             "Invalid UpdateExpression: Syntax error; token: \"<EOF>\", near: \",\""
         );
+    }
+
+    #[test]
+    fn end_of_input_keeps_the_trailing_whitespace() {
+        // Measured 2026-11-19 (us-east-1), probe cases in brackets. A single
+        // token keeps no leading whitespace at end of input [e10].
+        let rows = [
+            ("x01", ExpressionKind::Filter, "#v = :v AND   ", 4, "AND   "),
+            ("x02", ExpressionKind::Update, "SET #v = :v,   ", 5, ",   "),
+            ("x04", ExpressionKind::Filter, "#v = :v AND\t", 4, "AND\t"),
+            ("x06", ExpressionKind::Projection, "#v,   ", 2, ",   "),
+            ("e10", ExpressionKind::Filter, "  NOT", 1, "NOT"),
+            ("e11", ExpressionKind::Filter, "  NOT  ", 1, "NOT  "),
+        ];
+        for (case, kind, source, pos, near) in rows {
+            assert!(
+                msg(kind, source, pos).ends_with(&format!("token: \"<EOF>\", near: \"{near}\"")),
+                "{case}: {}",
+                msg(kind, source, pos)
+            );
+        }
+        // [x03] Before the end of input the window still ends at the next token.
+        assert!(msg(ExpressionKind::Filter, "#v = = :v   ", 2).ends_with("near: \"= = :v\""));
     }
 
     #[test]

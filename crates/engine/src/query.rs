@@ -11,7 +11,7 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::PathElement;
 use extenddb_core::expression::{ExpressionKind, ExpressionMaps, Projection};
 use extenddb_core::types::{
-    IndexType, KeyType, ProjectionType, QueryInput, QueryOutput, Select, TableKeyInfo,
+    IndexType, KeyType, QueryInput, QueryOutput, Select, TableKeyInfo,
     VECTOR_INDEX_QUERY_NOT_SUPPORTED,
 };
 use extenddb_storage::error::StorageError;
@@ -22,11 +22,15 @@ use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::{build_expression_maps, parse_optional_filter};
 use crate::index_helpers::{
     VectorIndexReadRefusal, classify_unresolved_index_read, combined_lek_key_schema,
-    validate_query_exclusive_start_key,
+    validate_query_select_index_support,
 };
 use crate::legacy_filter::{desugar_filter, desugar_key_conditions};
 use crate::read_helpers::{PostRead, read_page};
 use crate::serialize_output;
+use crate::start_key::{
+    QueryReadShape, page_ends_at_far_end, validate_query_exclusive_start_key,
+    validate_query_start_key_bounds,
+};
 use crate::{DispatchMetrics, DispatchResult};
 
 /// Handle a `Query` request.
@@ -128,13 +132,9 @@ pub async fn handle_query(
     }
 
     // Select=ALL_ATTRIBUTES requires an ALL-projection GSI (shared with Scan).
-    if let Some(ref idx) = index_info {
-        extenddb_core::validation::validate_all_attributes_index_support(
-            input.select,
-            idx.index_type == IndexType::Gsi,
-            idx.projection.projection_type == ProjectionType::All,
-            &idx.index_name,
-        )?;
+    // With an ExclusiveStartKey this runs after the start key checks below.
+    if input.exclusive_start_key.is_none() {
+        validate_query_select_index_support(input.select, index_info.as_ref())?;
     }
 
     // Validate Limit >= 1 (REQ-QUERY-001)
@@ -237,7 +237,8 @@ pub async fn handle_query(
     let (mut key_condition, legacy_kc_maps) = if let Some(kce_str) =
         input.key_condition_expression.as_deref()
     {
-        let parsed = crate::expression_helpers::parse_key_condition_expr(kce_str, &ctx.limits)?;
+        let parsed =
+            crate::expression_helpers::parse_key_condition_expr(kce_str, &maps, &ctx.limits)?;
         (parsed, None)
     } else if let Some(ref kc) = input.key_conditions {
         let key_schema_pairs: Vec<(String, bool)> = query_key_info
@@ -354,17 +355,21 @@ pub async fn handle_query(
         )
     };
 
-    // Validate #name references in filter are defined in ExpressionAttributeNames
-    if let Some(ref filter_expr) = filter {
-        let names = input.expression_attribute_names.as_ref();
-        validate_name_refs_in_expr(filter_expr, names, ExpressionKind::Filter)?;
-        // The operator cap follows the undefined name check and precedes the
-        // unused placeholder check (measured 2026-10-25). It applies to a
-        // FilterExpression only: a legacy QueryFilter of 160 conditions is
-        // accepted (measured 2026-10-25).
-        if filter_maps.is_none() {
-            crate::expression_helpers::check_operator_count(filter_expr, ExpressionKind::Filter)?;
-        }
+    // A FilterExpression's placeholders and operand types, then its operator
+    // count, come before the projection and the unused placeholder check
+    // (measured 2026-10-25 and 2026-11-19: an undefined name or value or an
+    // operand of the wrong type beats the count, and the count beats an
+    // unused value). A legacy QueryFilter of 160 conditions is accepted
+    // (measured 2026-10-25), so it is not counted.
+    if filter_maps.is_none()
+        && let Some(ref filter_expr) = filter
+    {
+        crate::expression_helpers::check_parsed_condition(
+            filter_expr,
+            &maps,
+            ExpressionKind::Filter,
+            &ctx.limits,
+        )?;
     }
 
     // Parse ProjectionExpression or desugar legacy AttributesToGet
@@ -485,8 +490,11 @@ pub async fn handle_query(
         ExpressionMaps::new(names, values)
     };
 
-    // Validate begins_with operand types upfront (before any rows are read).
-    if let Some(ref f) = filter {
+    // The operand types of a legacy QueryFilter, before any rows are read. A
+    // FilterExpression's were checked with its placeholders above.
+    if filter_maps.is_some()
+        && let Some(ref f) = filter
+    {
         extenddb_core::expression::validate_begins_with_operands(f, &combined_maps).map_err(
             |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
         )?;
@@ -498,6 +506,17 @@ pub async fn handle_query(
     // Validate ExclusiveStartKey matches the key schema
     if let Some(ref start_key) = input.exclusive_start_key {
         validate_query_exclusive_start_key(start_key, &key_info, index_info.as_ref())?;
+        validate_query_start_key_bounds(
+            start_key,
+            &key_condition,
+            effective_maps,
+            QueryReadShape {
+                key_schema: &query_key_info.key_schema,
+                on_index: index_info.is_some(),
+                forward: input.scan_index_forward,
+            },
+        )?;
+        validate_query_select_index_support(input.select, index_info.as_ref())?;
     }
 
     // Determine which key schema to use for LastEvaluatedKey extraction.
@@ -533,7 +552,23 @@ pub async fn handle_query(
         },
     )
     .await?;
-    let result = page.post;
+    let mut result = page.post;
+    // A page that ends at the far end of the sort key range carries no key;
+    // the start key check would refuse it.
+    if let Some(ref last_key) = result.last_evaluated_key
+        && page_ends_at_far_end(
+            last_key,
+            &key_condition,
+            effective_maps,
+            QueryReadShape {
+                key_schema: &query_key_info.key_schema,
+                on_index: index_info.is_some(),
+                forward: input.scan_index_forward,
+            },
+        )
+    {
+        result.last_evaluated_key = None;
+    }
 
     // Capacity metering: RCU based on the pre-projection size of the evaluated items.
     let pre_projection_bytes = page.evaluated_bytes;
@@ -675,67 +710,6 @@ fn refuse_begins_with_on_number(
         ));
     }
     Ok(())
-}
-
-/// Validate that all `#name` references in an expression AST are defined.
-fn validate_name_refs_in_expr(
-    expr: &extenddb_core::expression::Expr,
-    names: Option<&HashMap<String, String>>,
-    expr_type: ExpressionKind,
-) -> Result<(), DynamoDbError> {
-    use extenddb_core::expression::Expr;
-    match expr {
-        Expr::Path(elements) => {
-            for el in elements {
-                if let PathElement::Attribute(name) = el
-                    && let Some(ref_name) = name.strip_prefix('#')
-                {
-                    let key_with_hash = format!("#{ref_name}");
-                    let defined = names.as_ref().is_some_and(|m| {
-                        m.contains_key(ref_name) || m.contains_key(key_with_hash.as_str())
-                    });
-                    if !defined {
-                        return Err(DynamoDbError::ValidationException(format!(
-                            "Invalid {expr_type}: An expression attribute name used in the document path is not defined; attribute name: #{ref_name}"
-                        )));
-                    }
-                }
-            }
-            Ok(())
-        }
-        Expr::Compare { left, right, .. } => {
-            validate_name_refs_in_expr(left, names, expr_type)?;
-            validate_name_refs_in_expr(right, names, expr_type)
-        }
-        Expr::And(l, r) | Expr::Or(l, r) => {
-            validate_name_refs_in_expr(l, names, expr_type)?;
-            validate_name_refs_in_expr(r, names, expr_type)
-        }
-        Expr::Not(inner) => validate_name_refs_in_expr(inner, names, expr_type),
-        Expr::Between { operand, low, high } => {
-            validate_name_refs_in_expr(operand, names, expr_type)?;
-            validate_name_refs_in_expr(low, names, expr_type)?;
-            validate_name_refs_in_expr(high, names, expr_type)
-        }
-        Expr::In { operand, list } => {
-            validate_name_refs_in_expr(operand, names, expr_type)?;
-            for item in list {
-                validate_name_refs_in_expr(item, names, expr_type)?;
-            }
-            Ok(())
-        }
-        Expr::Function { args, .. } => {
-            for arg in args {
-                validate_name_refs_in_expr(arg, names, expr_type)?;
-            }
-            Ok(())
-        }
-        Expr::Arithmetic { left, right, .. } => {
-            validate_name_refs_in_expr(left, names, expr_type)?;
-            validate_name_refs_in_expr(right, names, expr_type)
-        }
-        Expr::Placeholder(_) => Ok(()),
-    }
 }
 
 /// Reject an explicitly empty `KeyConditionExpression` with DynamoDB's exact

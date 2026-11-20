@@ -18,6 +18,9 @@
 //! path          → (ident | name_ref) ( '.' (ident | name_ref) | '[' number ']' )*
 //! function_call → function_name '(' operand ( ',' operand )* ')'
 //! ```
+//!
+//! A parenthesized condition, a `NOT` and a `size` call read as an operand
+//! each nest one level, up to `max_depth`.
 
 use super::ast::{CompareOp, Expr};
 use super::kind::ExpressionKind;
@@ -175,17 +178,17 @@ fn parse_primary(
             && *pos + 1 < tokens.len()
             && tokens[*pos + 1] == Token::LParen
         {
-            return parse_function_call(tokens, src, pos);
+            return parse_function_call(tokens, src, pos, depth, max_depth);
         }
     }
 
     // Operand — then check for comparator, BETWEEN, or IN
-    let left = parse_operand(tokens, src, pos)?;
+    let left = parse_operand(tokens, src, pos, depth, max_depth)?;
 
     if *pos < tokens.len() {
         if let Some(op) = try_comparator(&tokens[*pos]) {
             *pos += 1;
-            let right = parse_operand(tokens, src, pos)?;
+            let right = parse_operand(tokens, src, pos, depth, max_depth)?;
             return Ok(Expr::Compare {
                 left: Box::new(left),
                 op,
@@ -196,9 +199,9 @@ fn parse_primary(
         // BETWEEN operand AND operand
         if tokens[*pos] == Token::Between {
             *pos += 1;
-            let low = parse_operand(tokens, src, pos)?;
+            let low = parse_operand(tokens, src, pos, depth, max_depth)?;
             parser_common::expect_token(tokens, pos, &Token::And, "AND", "ConditionExpression")?;
-            let high = parse_operand(tokens, src, pos)?;
+            let high = parse_operand(tokens, src, pos, depth, max_depth)?;
             return Ok(Expr::Between {
                 operand: Box::new(left),
                 low: Box::new(low),
@@ -209,11 +212,18 @@ fn parse_primary(
         // IN (operand, operand, ...)
         if tokens[*pos] == Token::In {
             *pos += 1;
-            parser_common::expect_token(tokens, pos, &Token::LParen, "(", "ConditionExpression")?;
-            let mut list = vec![parse_operand(tokens, src, pos)?];
+            // Any token but `(` after IN, and the end of input, answer the
+            // syntax error (measured 2026-11-19: `#v IN IN (:v)` answers token
+            // "IN", near "IN IN ("; `#v IN :v` token ":v"; `#v IN` token
+            // "<EOF>", near "IN").
+            if tokens.get(*pos) != Some(&Token::LParen) {
+                return Err(syntax_error(ExpressionKind::Condition, src, tokens, *pos));
+            }
+            *pos += 1;
+            let mut list = vec![parse_operand(tokens, src, pos, depth, max_depth)?];
             while *pos < tokens.len() && tokens[*pos] == Token::Comma {
                 *pos += 1;
-                list.push(parse_operand(tokens, src, pos)?);
+                list.push(parse_operand(tokens, src, pos, depth, max_depth)?);
             }
             parser_common::expect_token(tokens, pos, &Token::RParen, ")", "ConditionExpression")?;
             return Ok(Expr::In {
@@ -229,7 +239,13 @@ fn parse_primary(
     ))
 }
 
-fn parse_operand(tokens: &[Token], src: &str, pos: &mut usize) -> Result<Expr, DynamoDbError> {
+fn parse_operand(
+    tokens: &[Token],
+    src: &str,
+    pos: &mut usize,
+    depth: &mut usize,
+    max_depth: usize,
+) -> Result<Expr, DynamoDbError> {
     if *pos >= tokens.len() {
         // Input ends where an operand is required (`#v = :v AND NOT`).
         return Err(syntax_error(ExpressionKind::Condition, src, tokens, *pos));
@@ -247,7 +263,15 @@ fn parse_operand(tokens: &[Token], src: &str, pos: &mut usize) -> Result<Expr, D
                 && *pos + 1 < tokens.len()
                 && tokens[*pos + 1] == Token::LParen
             {
-                return parse_function_call(tokens, src, pos);
+                *depth += 1;
+                if *depth > max_depth {
+                    return Err(validation_err(
+                        "Invalid ConditionExpression: expression nesting depth exceeded",
+                    ));
+                }
+                let call = parse_function_call(tokens, src, pos, depth, max_depth)?;
+                *depth -= 1;
+                return Ok(call);
             }
             let elements = parser_common::parse_path(tokens, pos)?;
             Ok(Expr::Path(elements))
@@ -271,6 +295,8 @@ fn parse_function_call(
     tokens: &[Token],
     src: &str,
     pos: &mut usize,
+    depth: &mut usize,
+    max_depth: usize,
 ) -> Result<Expr, DynamoDbError> {
     let name = match &tokens[*pos] {
         Token::Ident(n) => n.to_ascii_lowercase(),
@@ -286,10 +312,10 @@ fn parse_function_call(
 
     let mut args = Vec::new();
     if *pos < tokens.len() && tokens[*pos] != Token::RParen {
-        args.push(parse_operand(tokens, src, pos)?);
+        args.push(parse_operand(tokens, src, pos, depth, max_depth)?);
         while *pos < tokens.len() && tokens[*pos] == Token::Comma {
             *pos += 1;
-            args.push(parse_operand(tokens, src, pos)?);
+            args.push(parse_operand(tokens, src, pos, depth, max_depth)?);
         }
     }
 
@@ -560,6 +586,25 @@ mod tests {
                 matches!(&err, DynamoDbError::ValidationException(msg)
                     if msg == "Invalid ConditionExpression: The expression has redundant parentheses;"),
                 "expr {expr}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_token_other_than_a_parenthesis_after_in_answers_the_syntax_error() {
+        // Measured 2026-11-19 (us-east-1), probe cases in the first column.
+        for (case, src, token, near) in [
+            ("x17", "#v IN IN (:v)", "IN", "IN IN ("),
+            ("i01", "#v IN :v", ":v", "IN :v"),
+            ("i02", "#v IN", "<EOF>", "IN"),
+        ] {
+            let err = parse_condition_from(&tokenize(src).unwrap(), src, 150).unwrap_err();
+            let want = format!(
+                "Invalid ConditionExpression: Syntax error; token: \"{token}\", near: \"{near}\""
+            );
+            assert!(
+                matches!(&err, DynamoDbError::ValidationException(msg) if *msg == want),
+                "{case}: got {err:?}"
             );
         }
     }

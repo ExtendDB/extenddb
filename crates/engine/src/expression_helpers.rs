@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
     Expr, ExpressionKind, ExpressionMaps, KeyCondition, PathElement, Token, UpdateAction,
-    parse_condition_from, parse_key_condition_from, parse_projection_from, parse_update_from,
-    tokenize_for, tokenize_with_limit, validate_no_reserved_words, validate_operator_count,
-    validate_ordering_operand_types,
+    is_syntax_error, parse_condition_from, parse_key_condition_from, parse_projection_from,
+    parse_update_from, tokenize_for, tokenize_with_limit, validate_no_reserved_words,
+    validate_operator_count, validate_placeholders_and_operands,
 };
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{AttributeValue, ConditionalOperator, ExpectedAttributeValue};
@@ -94,20 +94,28 @@ pub fn parse_condition_expr(expr: &str, limits: &LimitsConfig) -> Result<Expr, D
         .map_err(|e| prefix_expression_error(e, ExpressionKind::Condition))
 }
 
-/// Refuse a condition or filter whose operator count exceeds the service's cap
-/// of 300 (`Invalid <kind>: The expression contains too many operators;
-/// operator count: <n>`).
+/// Check a parsed condition or filter in the service's order, after the parse
+/// and before the unused placeholder check and the table lookup:
+/// [`validate_placeholders_and_operands`], then [`validate_operator_count`]
+/// against `limits.max_expression_operators`.
 ///
-/// Measured 2026-10-25 (us-east-1): the check runs after the syntax, reserved
-/// word, undefined placeholder and operand type checks and before the unused
-/// placeholder check and the table lookup. `TransactWriteItems` counts a
-/// different total for the same text and does not call this.
+/// `TransactWriteItems` counts the same way on the service, but it does not
+/// call this check (measured 2026-11-19: a Put of 151, 200 or 300 `#v = :v`
+/// terms joined by OR answers 301, 399 or 599, a ConditionCheck of 151 terms
+/// answers 301, and a Put of 150 terms is evaluated).
 ///
 /// # Errors
 ///
-/// Returns `DynamoDbError::ValidationException` when the count is over the cap.
-pub fn check_operator_count(expr: &Expr, kind: ExpressionKind) -> Result<(), DynamoDbError> {
-    validate_operator_count(expr, kind)
+/// Returns `DynamoDbError::ValidationException` with the `Invalid <kind>:`
+/// prefix for the first fault.
+pub fn check_parsed_condition(
+    expr: &Expr,
+    maps: &ExpressionMaps,
+    kind: ExpressionKind,
+    limits: &LimitsConfig,
+) -> Result<(), DynamoDbError> {
+    validate_placeholders_and_operands(expr, maps).map_err(|e| prefix_expression_error(e, kind))?;
+    validate_operator_count(expr, kind, limits.max_expression_operators)
 }
 
 /// Tokenize, reserved-word check, and parse an `UpdateExpression`.
@@ -131,7 +139,7 @@ pub fn parse_update_expr(
         if limits.enforce_reserved_keywords {
             validate_no_reserved_words(&update_tokens)?;
         }
-        parse_update_from(&update_tokens, update_expr)
+        parse_update_from(&update_tokens, update_expr, limits.max_expression_depth)
     })
     .map_err(|e| prefix_expression_error(e, ExpressionKind::Update))
 }
@@ -220,11 +228,8 @@ pub fn resolve_condition(
     let maps = build_expression_maps(names, values);
     let condition = parse_optional_condition(condition_expression, limits)?;
     if let Some(ref expr) = condition {
-        validate_ordering_operand_types(expr, &maps)
-            .map_err(|e| prefix_expression_error(e, ExpressionKind::Condition))?;
-        // After the operand type check (an ordering operator on a BOOL beats
-        // the count), before the unused placeholder check and the table lookup.
-        check_operator_count(expr, ExpressionKind::Condition)?;
+        // Before the unused placeholder check and the table lookup.
+        check_parsed_condition(expr, &maps, ExpressionKind::Condition, limits)?;
     }
     Ok((condition, maps))
 }
@@ -262,9 +267,11 @@ pub fn parse_projection_expr(
 /// # Errors
 ///
 /// Returns `DynamoDbError::ValidationException` for over-size, syntax, or
-/// reserved-word errors.
+/// reserved-word errors, and for an undefined placeholder or an operand type
+/// fault in a key condition over the operator cap.
 pub fn parse_key_condition_expr(
     expr: &str,
+    maps: &ExpressionMaps,
     limits: &LimitsConfig,
 ) -> Result<KeyCondition, DynamoDbError> {
     check_expression_size(expr, ExpressionKind::KeyCondition, limits)?;
@@ -277,15 +284,32 @@ pub fn parse_key_condition_expr(
         if limits.enforce_reserved_keywords {
             validate_no_reserved_words(&tokens)?;
         }
-        // The service counts operators on the whole expression before it
-        // applies the key condition grammar: `pk = :v OR` + 150 terms answers
-        // the count, not the operator refusal, and 151 AND-joined equalities
-        // answer the count ahead of the one-condition-per-key check (measured
-        // 2026-10-25). The general condition parser supplies the count; when
-        // it does not accept the text, the key condition parser reports the
-        // error in its own words.
-        if let Ok(expr) = parse_condition_from(&tokens, expr, limits.max_expression_depth) {
-            check_operator_count(&expr, ExpressionKind::KeyCondition)?;
+        // The service reads a key condition with the condition grammar first.
+        // A syntax error in that grammar comes before the operator count and
+        // the key condition rules (measured 2026-11-19: `pk = :p OR` answers
+        // token "<EOF>", near "OR"; `pk = :p =` token "=", near ":p ="; `pk =
+        // :p sk = :s` token "sk", near ":p sk ="). The count comes next: `pk =
+        // :v OR` + 150 terms answers the count, not the operator refusal, and
+        // 151 AND-joined equalities answer the count ahead of the
+        // one-condition-per-key check (measured 2026-10-25). A key condition
+        // over the cap that also holds an undefined placeholder or an operand
+        // of the wrong type answers that fault instead (measured 2026-11-20:
+        // `#x = :p AND` 150 terms answers the undefined `#x`). When the
+        // condition grammar refuses the text in another way, the key
+        // condition parser reports the error in its own words.
+        match parse_condition_from(&tokens, expr, limits.max_expression_depth) {
+            Ok(condition) => {
+                if let Err(count) = validate_operator_count(
+                    &condition,
+                    ExpressionKind::KeyCondition,
+                    limits.max_expression_operators,
+                ) {
+                    validate_placeholders_and_operands(&condition, maps)?;
+                    return Err(count);
+                }
+            }
+            Err(err) if is_syntax_error(&err) => return Err(err),
+            Err(_) => {}
         }
         parse_key_condition_from(&tokens, expr)
     })
@@ -438,93 +462,107 @@ mod tests {
         );
     }
 
-    // Operator cap placement, measured 2026-10-25 (us-east-1).
+    /// Size and token limits raised so only the depth limit refuses the
+    /// expressions below.
+    fn raised() -> LimitsConfig {
+        LimitsConfig {
+            max_expression_length_bytes: 4 << 20,
+            max_expression_tokens: 1 << 20,
+            ..LimitsConfig::default()
+        }
+    }
 
-    fn chain(n: usize) -> String {
-        vec!["#v = :v"; n].join(" OR ")
+    /// Run `parse` on a thread with half a server worker's 2 MiB stack,
+    /// failing the test after 10 seconds instead of hanging.
+    fn on_small_stack(
+        what: &'static str,
+        parse: impl FnOnce() -> Result<(), DynamoDbError> + Send + 'static,
+    ) -> Result<(), DynamoDbError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(move || {
+                let _ = tx.send(parse());
+            })
+            .expect("spawn the parse thread");
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(answer) => answer,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                std::panic::resume_unwind(worker.join().expect_err("no answer and no panic"))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("{what} ran for 10 s"),
+        }
     }
 
     #[test]
-    fn count_over_the_cap_is_refused_with_the_full_count() {
-        let limits = LimitsConfig::default();
-        // 151 comparisons and 150 ORs: 301 [a30].
-        let err =
-            resolve_condition(Some(&chain(151)), None, None, None, None, &limits).unwrap_err();
-        assert!(
-            matches!(&err, DynamoDbError::ValidationException(msg)
-            if msg == "Invalid ConditionExpression: The expression contains too many operators; operator count: 301"),
-            "got {err:?}"
-        );
-        // 150 comparisons and 149 ORs: 299, accepted [a30].
-        assert!(resolve_condition(Some(&chain(150)), None, None, None, None, &limits).is_ok());
+    fn update_expression_past_the_depth_limit_is_refused() {
+        let limits = raised();
+        let nested = |levels: usize| {
+            format!(
+                "SET qty = {}:v{}",
+                "(qty + ".repeat(levels),
+                ")".repeat(levels)
+            )
+        };
+        let at_limit = nested(limits.max_expression_depth);
+        assert!(parse_update_expr(&at_limit, &limits).is_ok());
+        for levels in [limits.max_expression_depth + 1, 50_000] {
+            let expr = nested(levels);
+            let err = on_small_stack("deep update", move || {
+                parse_update_expr(&expr, &raised()).map(drop)
+            })
+            .unwrap_err();
+            assert!(
+                matches!(&err, DynamoDbError::ValidationException(msg)
+                    if msg == "Invalid UpdateExpression: expression nesting depth exceeded"),
+                "{levels} levels: got {err:?}"
+            );
+        }
     }
 
     #[test]
-    fn ordering_operand_type_beats_the_count() {
-        // [p17] 299 operators plus `#v < :b` with a BOOL value.
-        let limits = LimitsConfig::default();
-        let expr = format!("{} OR #v < :b", chain(150));
-        let mut values = HashMap::new();
-        values.insert(":v".to_owned(), AttributeValue::S("x".to_owned()));
-        values.insert(":b".to_owned(), AttributeValue::Bool(true));
-        let err =
-            resolve_condition(Some(&expr), None, Some(&values), None, None, &limits).unwrap_err();
-        assert!(
-            matches!(&err, DynamoDbError::ValidationException(msg)
-            if msg.contains("Incorrect operand type for operator or function; operator or function: <, operand type: BOOL")),
-            "got {err:?}"
+    fn update_expression_calls_past_the_depth_limit_are_refused() {
+        let expr = format!(
+            "SET qty = {}:v{}",
+            "list_append(qty, ".repeat(50_000),
+            ")".repeat(50_000)
         );
-    }
-
-    #[test]
-    fn syntax_error_beats_the_count() {
-        // [e04] a 300-term chain followed by ` = =`.
-        let limits = LimitsConfig::default();
-        let expr = format!("{} = =", chain(300));
-        let err = resolve_condition(Some(&expr), None, None, None, None, &limits).unwrap_err();
+        let err = on_small_stack("deep update calls", move || {
+            parse_update_expr(&expr, &raised()).map(drop)
+        })
+        .unwrap_err();
         assert!(
             matches!(&err, DynamoDbError::ValidationException(msg)
-            if msg == "Invalid ConditionExpression: Syntax error; token: \"=\", near: \":v = =\""),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn key_condition_count_runs_before_the_key_grammar() {
-        let limits = LimitsConfig::default();
-        // [a62] `pk = :v OR` + 150 terms: 301, the count, not the OR refusal.
-        let expr = format!("pk = :v OR {}", vec!["#v = :v"; 150].join(" AND "));
-        let err = parse_key_condition_expr(&expr, &limits).unwrap_err();
-        assert!(
-            matches!(&err, DynamoDbError::ValidationException(msg)
-            if msg == "Invalid KeyConditionExpression: The expression contains too many operators; operator count: 301"),
-            "got {err:?}"
-        );
-        // [a63] two conditions joined by OR under the cap: the key grammar answers.
-        let err = parse_key_condition_expr("pk = :v OR sk = :s", &limits).unwrap_err();
-        assert!(
-            matches!(&err, DynamoDbError::ValidationException(msg)
-            if msg == "Invalid KeyConditionExpression: only AND is supported between key conditions"),
-            "got {err:?}"
-        );
-        // [d23] a syntax error is reported by the key grammar in the service's words.
-        let err = parse_key_condition_expr("pk = :v AND", &limits).unwrap_err();
-        assert!(
-            matches!(&err, DynamoDbError::ValidationException(msg)
-            if msg == "Invalid KeyConditionExpression: Syntax error; token: \"<EOF>\", near: \"AND\""),
+                if msg == "Invalid UpdateExpression: expression nesting depth exceeded"),
             "got {err:?}"
         );
     }
 
     #[test]
-    fn projection_syntax_error_quotes_the_source() {
-        // [d27]
-        let limits = LimitsConfig::default();
-        let err = parse_projection_expr("#v, , #v", &limits).unwrap_err();
+    fn condition_and_filter_size_calls_past_the_depth_limit_are_refused() {
+        let expr = format!("{}qty{} > :v", "size(".repeat(50_000), ")".repeat(50_000));
+        let condition = expr.clone();
+        let err = on_small_stack("deep condition", move || {
+            parse_condition_expr(&condition, &raised()).map(drop)
+        })
+        .unwrap_err();
         assert!(
             matches!(&err, DynamoDbError::ValidationException(msg)
-            if msg == "Invalid ProjectionExpression: Syntax error; token: \",\", near: \", , #v\""),
+                if msg == "Invalid ConditionExpression: expression nesting depth exceeded"),
+            "got {err:?}"
+        );
+        let err = on_small_stack("deep filter", move || {
+            parse_optional_filter(Some(&expr), &raised()).map(drop)
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+                if msg == "Invalid FilterExpression: expression nesting depth exceeded"),
             "got {err:?}"
         );
     }
 }
+
+#[cfg(test)]
+#[path = "expression_helpers_order_tests.rs"]
+mod order_tests;

@@ -9,10 +9,13 @@
 //! Architecture: `input string → tokenizer → tokens → parser → AST → evaluator → result`
 
 mod ast;
+#[cfg(test)]
+mod depth_tests;
 mod evaluator;
 mod key_condition;
 mod key_condition_resolve;
 mod kind;
+mod operand_check;
 mod operator_count;
 mod parser;
 mod parser_common;
@@ -21,17 +24,20 @@ mod reserved_words;
 mod resolver;
 mod search_condition;
 mod syntax_error;
+#[cfg(test)]
+mod test_timeout;
 mod tokenizer;
 mod update_evaluator;
 mod update_parser;
 
-pub use ast::{ArithOp, CompareOp, Expr, PathElement, UpdateAction};
+pub use ast::{ArithOp, CompareOp, Expr, PathElement, UpdateAction, removes_only};
 pub use evaluator::evaluate_condition;
 pub use key_condition::{
     KeyClauseOperand, KeyCondition, SortKeyCondition, key_condition_clause_operands,
     parse_key_condition, parse_key_condition_from,
 };
 pub use kind::ExpressionKind;
+pub use operand_check::validate_placeholders_and_operands;
 pub use operator_count::{MAX_EXPRESSION_OPERATORS, count_operators, validate_operator_count};
 pub use parser::{parse_condition, parse_condition_from, parse_condition_with_depth_limit};
 pub use projection::{Projection, parse_projection, parse_projection_from};
@@ -46,7 +52,7 @@ pub use search_condition::{
     SearchCondition, validate_conditions_against_search_schema,
     validate_search_condition_expression,
 };
-pub use syntax_error::{is_operator_or_keyword, syntax_error, token_text};
+pub use syntax_error::{is_operator_or_keyword, is_syntax_error, syntax_error, token_text};
 pub use tokenizer::{Token, tokenize, tokenize_for, tokenize_with_limit};
 pub use update_evaluator::apply_update_validated;
 pub use update_parser::{parse_update, parse_update_from};

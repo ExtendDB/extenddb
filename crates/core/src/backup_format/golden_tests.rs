@@ -472,15 +472,15 @@ mod generate_golden_manifest {
     //! writes new ones beside them.
     use super::super::manifest::manifest_checksum;
     use super::super::{
-        CURRENT_FORMAT_VERSION, DataFileEntry, ExtenddbManifest, ItemOrder, KeyRange,
-        SnapshotDescriptor, SourceTableSchema,
+        BackupGsi, BackupLsi, CURRENT_FORMAT_VERSION, DataFileEntry, ExtenddbManifest, ItemOrder,
+        KeyRange, SnapshotDescriptor, SourceTableSchema,
     };
     use crate::types::{
-        AttributeDefinition, AttributeValue, BillingMode, DistanceFunction, GsiInput, Item,
-        KeySchemaElement, KeyType, LsiInput, OnDemandThroughput, Projection, ProjectionType,
-        ProvisionedThroughput, ScalarAttributeType, SearchSchemaElement, SearchSchemaElementType,
-        SseDescription, SseType, StreamSpecification, StreamViewType, TimeToLiveDescription,
-        TimeToLiveStatus, VectorAttribute, VectorIndexSpecification,
+        AttributeDefinition, AttributeValue, BillingMode, DistanceFunction, Item, KeySchemaElement,
+        KeyType, OnDemandThroughput, Projection, ProjectionType, ProvisionedThroughput,
+        ScalarAttributeType, SearchSchemaElement, SearchSchemaElementType, SseDescription, SseType,
+        StreamSpecification, StreamViewType, TimeToLiveDescription, TimeToLiveStatus,
+        VectorAttribute, VectorIndexSpecification,
     };
 
     fn key(a: &str, t: &str) -> Item {
@@ -554,7 +554,7 @@ mod generate_golden_manifest {
                         "arn:aws:kms:us-east-1:123456789012:key/abcd".to_owned(),
                     ),
                 }),
-                global_secondary_indexes: vec![GsiInput {
+                global_secondary_indexes: vec![BackupGsi {
                     index_name: "GenreIndex".to_owned(),
                     key_schema: vec![KeySchemaElement {
                         attribute_name: "Genre".to_owned(),
@@ -569,7 +569,7 @@ mod generate_golden_manifest {
                         write_capacity_units: 1,
                     }),
                 }],
-                local_secondary_indexes: vec![LsiInput {
+                local_secondary_indexes: vec![BackupLsi {
                     index_name: "TitleIndex".to_owned(),
                     key_schema: vec![
                         KeySchemaElement {
@@ -760,7 +760,7 @@ mod generate_golden_manifest {
                     kms_master_key_arn: None,
                 }),
                 // The GSI of an on-demand table has no `ProvisionedThroughput`.
-                global_secondary_indexes: vec![GsiInput {
+                global_secondary_indexes: vec![BackupGsi {
                     index_name: "ByKindGlobal".to_owned(),
                     key_schema: vec![element("kind", KeyType::Hash)],
                     projection: Projection {
@@ -769,7 +769,7 @@ mod generate_golden_manifest {
                     },
                     provisioned_throughput: None,
                 }],
-                local_secondary_indexes: vec![LsiInput {
+                local_secondary_indexes: vec![BackupLsi {
                     index_name: "ByKind".to_owned(),
                     key_schema: vec![
                         element("tenant", KeyType::Hash),
@@ -925,15 +925,16 @@ mod member_names {
     use serde::{Serialize, forward_to_deserialize_any};
 
     use super::super::{
-        DataFileEntry, ExtenddbManifest, ItemOrder, KeyRange, SnapshotDescriptor, SourceTableSchema,
+        BackupGsi, BackupLsi, DataFileEntry, ExtenddbManifest, ItemOrder, KeyRange,
+        SnapshotDescriptor, SourceTableSchema,
     };
     use super::generate_golden_manifest::{golden, unordered};
     use crate::types::{
-        AttributeDefinition, AttributeValue, BillingMode, DistanceFunction, GsiInput,
-        KeySchemaElement, KeyType, LsiInput, OnDemandThroughput, Projection, ProjectionType,
-        ProvisionedThroughput, ScalarAttributeType, SearchSchemaElement, SearchSchemaElementType,
-        SseDescription, SseType, StreamSpecification, StreamViewType, TimeToLiveDescription,
-        TimeToLiveStatus, VectorAttribute, VectorIndexSpecification,
+        AttributeDefinition, AttributeValue, BillingMode, DistanceFunction, KeySchemaElement,
+        KeyType, OnDemandThroughput, Projection, ProjectionType, ProvisionedThroughput,
+        ScalarAttributeType, SearchSchemaElement, SearchSchemaElementType, SseDescription, SseType,
+        StreamSpecification, StreamViewType, TimeToLiveDescription, TimeToLiveStatus,
+        VectorAttribute, VectorIndexSpecification,
     };
 
     /// A deserializer that records what a derived `Deserialize` passes to
@@ -1355,8 +1356,8 @@ mod member_names {
             &["Status", "SSEType", "KMSMasterKeyArn"],
         );
         let gsi = &t.global_secondary_indexes[0];
-        check::<GsiInput>(
-            "GsiInput",
+        check::<BackupGsi>(
+            "BackupGsi",
             gsi,
             &[
                 "IndexName",
@@ -1370,8 +1371,8 @@ mod member_names {
             &gsi.projection,
             &["ProjectionType", "NonKeyAttributes"],
         );
-        check::<LsiInput>(
-            "LsiInput",
+        check::<BackupLsi>(
+            "BackupLsi",
             &other.source_table.local_secondary_indexes[0],
             &["IndexName", "KeySchema", "Projection"],
         );
