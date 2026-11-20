@@ -346,7 +346,7 @@ pub(crate) async fn run(deps: &RunnerDeps, record: BulkOperationRecord) -> Resul
         record
     } else {
         match list_input(deps, &record, &config, &mut st).await? {
-            Listed::Recorded(listed) => listed,
+            Listed::Recorded(listed) => *listed,
             Listed::Finish => return finalize(deps, &record, Some(&config), st).await,
             Listed::Stop => return Ok(()),
         }

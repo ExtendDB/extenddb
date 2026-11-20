@@ -5,6 +5,7 @@
 //! codec, moved from the inline test module of the old handlers.rs file.
 
 use super::*;
+use extenddb_storage::InputFile;
 use serde_json::json;
 
 const REGION: &str = "us-east-1";

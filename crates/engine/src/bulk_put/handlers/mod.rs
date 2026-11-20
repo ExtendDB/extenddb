@@ -29,7 +29,7 @@ use extenddb_core::types::{
     StartBulkPutItemsOutput, TableDescription, TableStatus,
 };
 use extenddb_storage::{
-    BulkOperationRecord, CancelOutcome, InputFile, ListCursor, NewBulkOperation, StartOutcome,
+    BulkOperationRecord, CancelOutcome, ListCursor, NewBulkOperation, StartOutcome,
 };
 
 use crate::OperationContext;

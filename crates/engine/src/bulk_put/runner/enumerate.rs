@@ -37,7 +37,7 @@ pub(super) fn input_bytes_quota(tier: Option<&str>, ceiling: u64) -> u64 {
 /// What the input steps ended with.
 pub(super) enum Listed {
     /// The files are recorded; the record carries them and their total.
-    Recorded(BulkOperationRecord),
+    Recorded(Box<BulkOperationRecord>),
     /// The run ends with the failure or the cancel set on the state.
     Finish,
     /// The lease is lost; the runner stops without another write.
@@ -111,11 +111,11 @@ pub(super) async fn list_input(
         LeaseState::Lost => Ok(Listed::Stop),
         LeaseState::Held => {
             st.lease_deadline = Some(renewed_at + deps.config.lease);
-            Ok(Listed::Recorded(BulkOperationRecord {
+            Ok(Listed::Recorded(Box::new(BulkOperationRecord {
                 input_files: files,
                 total_input_bytes: Some(total),
                 ..record.clone()
-            }))
+            })))
         }
     }
 }
