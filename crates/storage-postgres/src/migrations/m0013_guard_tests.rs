@@ -179,6 +179,7 @@ async fn another_roles_session_counts_from_a_non_superuser_pool() {
 
 /// A store with nothing to rewrite needs no check: a fresh store, such as the
 /// one `init` creates, has no table, no backup and no queued or stream row.
+/// One row in `stream_pending` is enough to need it.
 #[tokio::test]
 async fn only_a_store_with_rows_is_checked() {
     if base_conn().is_none() {
@@ -188,6 +189,15 @@ async fn only_a_store_with_rows_is_checked() {
     let s = scratch().await;
     assert!(!catalog_has_rows(&s.db).await.unwrap());
     assert!(!data_has_rows(&s.db, &s.db).await.unwrap());
+    // A store whose only row is a stream record waiting for its number.
+    sqlx::query(
+        "INSERT INTO stream_pending (shard_id, table_id, event_name, record_data, \
+         record_bytes, created_at) VALUES ('shard-1', 't1', 'INSERT', '{}', 2, now())",
+    )
+    .execute(&s.db)
+    .await
+    .expect("seed a pending stream record");
+    assert!(data_has_rows(&s.db, &s.db).await.unwrap());
     seed(&s.db).await;
     assert!(catalog_has_rows(&s.db).await.unwrap());
     assert!(data_has_rows(&s.db, &s.db).await.unwrap());

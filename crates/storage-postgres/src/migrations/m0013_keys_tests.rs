@@ -196,11 +196,15 @@ async fn rebuilds_composite_partition_keys_part_by_part() {
     s.cleanup().await;
 }
 
+/// The base key attribute of [`context`]. Its name holds U+0001, so a decode
+/// that read the stored context raw would not find the key on the item.
+const PK: &str = "pk\u{1}";
+
 fn context() -> PendingApplyContext {
     PendingApplyContext::Gsi(GsiApplyContext {
-        base_key_schema: vec![element("pk", KeyType::Hash)],
+        base_key_schema: vec![element(PK, KeyType::Hash)],
         attribute_definitions: vec![AttributeDefinition {
-            attribute_name: "pk".to_owned(),
+            attribute_name: PK.to_owned(),
             attribute_type: ScalarAttributeType::S,
         }],
         index: GsiIndexDef {
@@ -217,7 +221,7 @@ fn context() -> PendingApplyContext {
 /// The partition a build without the escape gave a row for `item`: the
 /// hash of the raw key text.
 fn legacy_partition(item: &Item) -> i32 {
-    let raw = extenddb_storage::util::composite_pk_to_text(item, &[element("pk", KeyType::Hash)])
+    let raw = extenddb_storage::util::composite_pk_to_text(item, &[element(PK, KeyType::Hash)])
         .expect("raw key text");
     partition_for(&raw)
 }
@@ -242,7 +246,7 @@ async fn recomputes_the_worker_partition_of_rows_queued_before_the_upgrade() {
     .into_iter()
     .map(|k| {
         let mut item = Item::new();
-        item.insert("pk".to_owned(), text(k));
+        item.insert(PK.to_owned(), text(k));
         item.insert("g".to_owned(), text("v"));
         item
     })
@@ -253,14 +257,18 @@ async fn recomputes_the_worker_partition_of_rows_queued_before_the_upgrade() {
     let current = worker_partition(None, Some(&item), &ctx).expect("partition");
     let legacy = legacy_partition(&item);
 
-    // A key without U+0001 and a non-key string with it: same text both ways.
+    // A key value without U+0001 and a non-key string with it: same text
+    // both ways.
     let mut plain = Item::new();
-    plain.insert("pk".to_owned(), text("plain"));
+    plain.insert(PK.to_owned(), text("plain"));
     plain.insert("note".to_owned(), text("n\u{1}"));
     let plain_partition = legacy_partition(&plain);
 
     let s = scratch().await;
-    let raw_ctx = serde_json::to_value(&ctx).expect("context json");
+    // The images as a release without the escape stored them, and the
+    // context through the catalog escape, as a release with migration 11
+    // stores it.
+    let stored_ctx = crate::catalog_json::to_catalog_json(&ctx).expect("context json");
     let raw = |i: &Item| serde_json::to_value(i).expect("item json");
     for (old_item, new_item, partition) in [
         (None, Some(raw(&item)), legacy),
@@ -274,7 +282,7 @@ async fn recomputes_the_worker_partition_of_rows_queued_before_the_upgrade() {
         .bind(partition)
         .bind(old_item)
         .bind(new_item)
-        .bind(&raw_ctx)
+        .bind(&stored_ctx)
         .execute(&s.db)
         .await
         .expect("seed a queued row");
