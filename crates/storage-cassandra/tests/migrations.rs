@@ -1970,3 +1970,53 @@ async fn the_workers_list_only_the_account_keyspaces_of_their_deployment() {
         .expect("list the account keyspaces");
     assert_eq!(listed, vec![own]);
 }
+
+/// `destroy` returns only when every node has applied its drops. `DROP
+/// KEYSPACE` returns once the node that took it has applied it, so without
+/// the wait a read of `system_schema` on another node can still list a keyspace
+/// that was dropped (the `cassandra-two-nodes` job saw this). The test reads
+/// `system_schema` through a session on each node, right after `destroy`.
+/// With one node both sessions reach the same node, and the test checks that
+/// `destroy` dropped the deployment's keyspaces and left the other.
+#[tokio::test]
+async fn destroy_is_applied_on_every_node_when_it_returns() {
+    use extenddb_storage::bootstrapper::Bootstrapper;
+
+    if helpers::skip_without_cassandra() {
+        return;
+    }
+    let session = session().await;
+    let (first_node, second_node) = migrator_sessions().await;
+    let (prefix, _drops) = new_prefix("onall");
+    let own = [
+        format!("{prefix}_catalog"),
+        format!("{prefix}_account_346032218963"),
+    ];
+    let other = format!("{prefix}_reports");
+    let _cleanup = helpers::DropKeyspacesOnDrop(
+        own.iter()
+            .cloned()
+            .chain(std::iter::once(other.clone()))
+            .collect(),
+    );
+    for name in own.iter().chain(std::iter::once(&other)) {
+        keyspace(&session, name).await;
+    }
+
+    bootstrapper(&prefix)
+        .await
+        .drop_databases("")
+        .await
+        .expect("destroy");
+
+    for (which, node) in [
+        ("the first node", &first_node),
+        ("the second node", &second_node),
+    ] {
+        assert_eq!(
+            keyspaces_starting_with(node, &format!("{prefix}_")).await,
+            vec![other.clone()],
+            "{which} still lists a keyspace that destroy dropped"
+        );
+    }
+}

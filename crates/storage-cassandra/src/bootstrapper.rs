@@ -942,8 +942,24 @@ impl Bootstrapper for CassandraBootstrapper {
                 .map_err(|e| OpError::Internal(e.to_string()))?;
         }
 
-        println!("{}", drop_summary(dropped, left_alone.len()));
-        Ok(())
+        // `DROP KEYSPACE` returns once the node that took it has applied it;
+        // the other nodes follow later. A read of `system_schema` on another
+        // node, or an `init` that follows at once, would find the keyspace
+        // still there. The wait runs when nothing was dropped too: a run that
+        // dropped keyspaces and then timed out in the wait leaves a second run
+        // that finds nothing to drop, and the nodes may still disagree.
+        finish_destroy(dropped, left_alone.len(), || async {
+            let agreed = crate::migrations::wait_for_agreement(
+                self.engine.session(),
+                crate::migrations::AGREEMENT_TIMEOUT,
+            )
+            .await;
+            if agreed.is_ok() {
+                crate::test_hooks::destroy_waited(&self.keyspace_prefix);
+            }
+            agreed
+        })
+        .await
     }
 
     /// The deployment `init` creates, reached as the admin role `init`
@@ -1068,6 +1084,31 @@ fn fold_prefix_flag(
     Ok((Some(folded), note))
 }
 
+/// The end of `destroy`: wait with `wait` until the nodes agree on the
+/// schema, then print the summary.
+///
+/// When the wait fails after keyspaces were dropped, the error says so and
+/// says to run `destroy` again, which waits again. When nothing was dropped,
+/// the error says that and names the disagreement.
+async fn finish_destroy<W, Fut>(dropped: usize, left_alone: usize, wait: W) -> OpResult<()>
+where
+    W: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), extenddb_storage::migrations::MigrationError>>,
+{
+    wait().await.map_err(|e| {
+        OpError::Internal(if dropped > 0 {
+            format!(
+                "{dropped} keyspace(s) were dropped, but {e}; check the nodes \
+                 (`nodetool status`) and run `extenddb destroy` again to wait again"
+            )
+        } else {
+            format!("no keyspace was dropped, and {e}")
+        })
+    })?;
+    println!("{}", drop_summary(dropped, left_alone));
+    Ok(())
+}
+
 /// The line `destroy` prints for a keyspace that starts with `<prefix>_` and
 /// that it leaves in place.
 fn left_alone_line(keyspace: &str, prefix: &str) -> String {
@@ -1096,7 +1137,8 @@ fn drop_summary(dropped: usize, left_alone: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CassandraBootstrapper, drop_summary, fold_prefix_flag, left_alone_line, split_keyspaces,
+        CassandraBootstrapper, drop_summary, finish_destroy, fold_prefix_flag, left_alone_line,
+        split_keyspaces,
     };
 
     fn names(list: &[&str]) -> Vec<String> {
@@ -1159,6 +1201,60 @@ mod tests {
             fold_prefix_flag(Some("Acme-1")).expect_err("a dash")
         );
         assert!(err.contains("Acme-1") && !err.contains("acme-1"), "{err}");
+    }
+
+    /// `destroy` waits for the nodes to agree on the schema, once, whether it
+    /// dropped keyspaces or found none: a second run after a wait that timed
+    /// out finds nothing to drop, and the nodes may still disagree.
+    #[tokio::test]
+    async fn destroy_waits_for_the_nodes_to_agree_on_every_run() {
+        for (dropped, left_alone) in [(3, 0), (2, 1), (0, 0), (0, 2)] {
+            let waits = std::cell::Cell::new(0);
+            let result = finish_destroy(dropped, left_alone, || {
+                waits.set(waits.get() + 1);
+                async { Ok(()) }
+            })
+            .await;
+            assert!(result.is_ok(), "{result:?}");
+            assert_eq!(waits.get(), 1, "dropped {dropped}, left {left_alone}");
+        }
+    }
+
+    /// A wait that fails is an error that says the keyspaces were dropped and
+    /// says what to do.
+    #[tokio::test]
+    async fn destroy_whose_wait_fails_says_the_keyspaces_were_dropped() {
+        let result = finish_destroy(2, 0, || async {
+            Err(extenddb_storage::migrations::MigrationError::Store(
+                "the live Cassandra nodes did not agree on the schema within 30 s: n1".to_owned(),
+            ))
+        })
+        .await;
+        let message = format!("{:?}", result.expect_err("an error"));
+        assert!(
+            message
+                .contains("2 keyspace(s) were dropped, but the live Cassandra nodes did not agree")
+                && message.contains("run `extenddb destroy` again"),
+            "{message}"
+        );
+    }
+
+    /// A wait that fails when nothing was dropped does not say that
+    /// keyspaces were dropped.
+    #[tokio::test]
+    async fn destroy_that_dropped_nothing_does_not_say_it_dropped_keyspaces() {
+        let result = finish_destroy(0, 1, || async {
+            Err(extenddb_storage::migrations::MigrationError::Store(
+                "the live Cassandra nodes did not agree on the schema within 30 s: n1".to_owned(),
+            ))
+        })
+        .await;
+        let message = format!("{:?}", result.expect_err("an error"));
+        assert!(
+            message.contains("no keyspace was dropped, and the live Cassandra nodes did not agree")
+                && !message.contains("were dropped"),
+            "{message}"
+        );
     }
 
     /// The keyspaces of issue #645: the deployment `cui` beside a second

@@ -34,6 +34,9 @@ mod consistency_levels;
 mod consistency_shape;
 #[path = "direct/delete_item.rs"]
 mod delete_item;
+#[cfg(feature = "test-hooks")]
+#[path = "direct/destroy_wait.rs"]
+mod destroy_wait;
 #[path = "direct/groups.rs"]
 mod groups;
 #[path = "direct/gsi_worker_pass.rs"]

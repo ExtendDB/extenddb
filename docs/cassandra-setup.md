@@ -91,6 +91,12 @@ begins with this one (`extenddb_test` beside `extenddb`), stays in place.
 `destroy` prints its name. `destroy` decides by name only: a keyspace that
 another program made with the name `<keyspace_prefix>_catalog`, or with
 `<keyspace_prefix>_account_` and 12 digits, is dropped.
+`destroy` returns only after the nodes agree on the schema. It waits 30 seconds,
+or longer when a node is slow to answer. The wait compares the schema version of
+the whole cluster, so schema changes by another deployment on the same cluster
+can delay it. If the nodes do not agree, `destroy` returns an error. When it had
+dropped keyspaces, the error says so, and `destroy` can be run again to wait
+again.
 
 ## Building with Cassandra Support
 
@@ -197,9 +203,11 @@ Fields:
 - `username` / `password` — the application credentials ExtendDB uses at serve
   time. Required against any authenticated node (which `init` requires anyway).
 - `keyspace_prefix` — prefix for this deployment's keyspaces (default
-  `extenddb`). It may hold ASCII letters, digits and `_`, and at most 27
-  characters, so that `<keyspace_prefix>_account_` and a 12-digit id stay within
-  Cassandra's 48-character keyspace name limit. Cassandra stores a
+  `extenddb`). It may hold ASCII letters, digits and `_`, and must start with a
+  letter (ExtendDB does not check this). Keep it to 27
+  characters or fewer, so that `<keyspace_prefix>_account_` and a 12-digit id stay
+  within Cassandra's 48-character keyspace name limit. ExtendDB does not check
+  the length. Cassandra stores a
   keyspace name written without quotes in lower case, so ExtendDB lower-cases
   the prefix wherever it reads one: in this file, in a connection string and in
   `init --keyspace-prefix`. `Acme` and `acme` are the same prefix.

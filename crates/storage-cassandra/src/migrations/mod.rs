@@ -47,6 +47,7 @@ use extenddb_storage::migrations::{
 };
 
 pub use agreement::AGREEMENT_TIMEOUT;
+pub(crate) use agreement::wait_for_agreement;
 #[cfg(any(test, feature = "test-util"))]
 pub(crate) use backend::stopped;
 pub use backend::{CassandraMigrations, CassandraStores};
