@@ -2233,10 +2233,13 @@ def _error(resp) -> tuple[str, str]:
 
 
 def test_backup_and_table_names_are_validated(dynamodb_client):
-    """BackupName and TableName on CreateBackup and ListBackups: length 3 to
+    """BackupName and TableName on CreateBackup and ListBackups, and the
+    IndexName of an index override on RestoreTableFromBackup: length 3 to
     255 and [a-zA-Z0-9_.-]+, with the service's texts (measured on DynamoDB;
     the order of the two clauses when both fail was not captured, so it is
-    asserted exactly on ExtendDB and as membership on the service). Sent
+    asserted exactly on ExtendDB and as membership on the service). The
+    restore names a backup that does not exist: the service checks the
+    IndexName before it reads the backup. Sent
     signed by hand: botocore refuses a too-short name
     before sending (its validator checks the minimum, not the pattern or
     the maximum). Before the check, a 200 KB name was a 500 on Cassandra and a
@@ -2272,6 +2275,33 @@ def test_backup_and_table_names_are_validated(dynamodb_client):
              + constraint.format(v="a*", path="tableName", c=short) + "; "
              + constraint.format(v="a*", path="tableName", c=pattern)),
         ]
+        # The IndexName of an index override (measured on 18 Nov 2026).
+        missing = (
+            client.describe_table(TableName=source)["Table"]["TableArn"]
+            + "/backup/01700000000000-abcdef12"
+        )
+        emoji = "\U0001F600\U0001F600"
+        for field, key_schema in (
+            ("GlobalSecondaryIndexOverride", [{"AttributeName": "g", "KeyType": "HASH"}]),
+            ("LocalSecondaryIndexOverride", [{"AttributeName": "pk", "KeyType": "HASH"},
+                                             {"AttributeName": "l", "KeyType": "RANGE"}]),
+        ):
+            path = field[0].lower() + field[1:] + ".1.member.indexName"
+            for name, expected in (
+                ("ab", "1 validation error detected: "
+                 + constraint.format(v="ab", path=path, c=short)),
+                (emoji, "2 validation errors detected: "
+                 + constraint.format(v=emoji, path=path, c=short) + "; "
+                 + constraint.format(v=emoji, path=path, c=pattern)),
+                ("g i", "1 validation error detected: "
+                 + constraint.format(v="g i", path=path, c=pattern)),
+            ):
+                entry = {"IndexName": name, "KeySchema": key_schema,
+                         "Projection": {"ProjectionType": "KEYS_ONLY"}}
+                cases.append(("RestoreTableFromBackup",
+                              {"TargetTableName": f"{source}-r", "BackupArn": missing,
+                               field: [entry]},
+                              expected))
         for operation, body, expected in cases:
             resp = _signed(operation, body)
             assert resp.status_code == 400, (operation, body, resp.text)

@@ -4972,6 +4972,63 @@ async fn a_malformed_index_override_is_refused_before_any_storage_read() {
     assert_eq!(fake.source_reads(), 0);
 }
 
+/// An index override's `IndexName` is checked at the entry's member path
+/// after the `BackupArn` account and the `TargetTableName`, and before the
+/// backup is read. The answers are DynamoDB's for a backup that does not
+/// exist (measured in us-east-1 on 18 and 20 Nov 2026), except the text for
+/// the target name, which is CreateTable's.
+#[tokio::test]
+async fn an_index_override_name_is_checked_before_the_backup_is_read() {
+    let short = "Member must have length greater than or equal to 3";
+    let long = "Member must have length less than or equal to 255";
+    let pattern = "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+";
+    let target_ab = validation_message(
+        extenddb_core::validation::validate_table_name("ab", &LimitsConfig::default()).unwrap_err(),
+    );
+    let (emoji, x256): (&str, &str) = ("\u{1F600}\u{1F600}", &"x".repeat(256));
+    for (field, mut entry) in [
+        ("GlobalSecondaryIndexOverride", gsi_entry(None)),
+        ("LocalSecondaryIndexOverride", lsi_entry()),
+    ] {
+        let member = format!("{}{}", field[..1].to_lowercase(), &field[1..]);
+        let at = |name: &str, c: &str| {
+            format!(
+                "Value '{name}' at '{member}.1.member.indexName' failed to satisfy constraint: {c}"
+            )
+        };
+        let one = |name: &str, c: &str| format!("1 validation error detected: {}", at(name, c));
+        let both = format!(
+            "2 validation errors detected: {}; {}",
+            at(emoji, short),
+            at(emoji, pattern)
+        );
+        let (valid, denied) = ("ValidationException", "AccessDeniedException");
+        let (own, other, to) = (ACCOUNT, "111111111111", "MusicRestored");
+        // (IndexName, TargetTableName, account of the BackupArn, answer)
+        for (name, target, account, answer) in [
+            ("ab", to, own, (valid, one("ab", short))),
+            (emoji, to, own, (valid, both)),
+            ("g i", to, own, (valid, one("g i", pattern))),
+            (x256, to, own, (valid, one(x256, long))),
+            ("g i", to, other, (denied, "Access is denied".to_owned())),
+            ("g i", "ab", own, (valid, target_ab.clone())),
+        ] {
+            entry["IndexName"] = json!(name);
+            let fake = Arc::new(Fake::default());
+            let body = restore_body(json!({
+                "TargetTableName": target, "BackupArn": arn(account), field: [entry.clone()],
+            }));
+            let got = match restore(&fake, body).await.unwrap_err() {
+                DynamoDbError::ValidationException(m) => (valid, m),
+                DynamoDbError::AccessDeniedException(m) => (denied, m),
+                other => panic!("{field} {name}: {other:?}"),
+            };
+            assert_eq!(got, answer, "{field} {name} {target} {account}");
+            assert_eq!(fake.source_reads(), 0, "{field} {name}");
+        }
+    }
+}
+
 /// The backup's GSI and LSI as a client would send them back: the shape
 /// `definition` records, in the wire's own form.
 fn gsi_entry(pt: Option<(i64, i64)>) -> Value {
