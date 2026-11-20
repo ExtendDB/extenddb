@@ -112,6 +112,12 @@ pub struct TableThroughput {
     pub wcu: f64,
     /// Whether this is an on-demand table.
     pub on_demand: bool,
+    /// Whether the read rate is an `OnDemandThroughput` cap set on the table
+    /// rather than the default on-demand ceiling. The service names the limit
+    /// differently on a throttle (`MaxOnDemandThroughputExceeded`).
+    pub read_capped: bool,
+    /// Whether the write rate is an `OnDemandThroughput` cap.
+    pub write_capped: bool,
 }
 
 impl TableThroughput {
@@ -123,6 +129,8 @@ impl TableThroughput {
             rcu: rcu as f64,
             wcu: wcu as f64,
             on_demand: false,
+            read_capped: false,
+            write_capped: false,
         }
     }
 
@@ -133,6 +141,34 @@ impl TableThroughput {
             rcu: ON_DEMAND_DEFAULT_RCU,
             wcu: ON_DEMAND_DEFAULT_WCU,
             on_demand: true,
+            read_capped: false,
+            write_capped: false,
+        }
+    }
+
+    /// Create throughput config for an on-demand table whose
+    /// `OnDemandThroughput` caps are set. A cap that is absent or not positive
+    /// (the service uses `-1` to remove one) keeps the default ceiling for
+    /// that direction, and only the capped direction reports the caps limit
+    /// on a throttle.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)] // request-unit caps are small enough for f64
+    pub fn on_demand_capped(
+        max_read_request_units: Option<i64>,
+        max_write_request_units: Option<i64>,
+    ) -> Self {
+        let cap = |units: Option<i64>, default: f64| match units {
+            Some(n) if n > 0 => (n as f64, true),
+            _ => (default, false),
+        };
+        let (rcu, read_capped) = cap(max_read_request_units, ON_DEMAND_DEFAULT_RCU);
+        let (wcu, write_capped) = cap(max_write_request_units, ON_DEMAND_DEFAULT_WCU);
+        Self {
+            rcu,
+            wcu,
+            on_demand: true,
+            read_capped,
+            write_capped,
         }
     }
 }
@@ -156,6 +192,12 @@ struct PartitionKey {
 struct TableBuckets {
     read: TokenBucket,
     write: TokenBucket,
+    /// Billing mode the table was registered with; carried into the
+    /// [`ThrottleCause`] so the server can name the limit the service would.
+    on_demand: bool,
+    /// Whether each rate is an `OnDemandThroughput` cap.
+    read_capped: bool,
+    write_capped: bool,
 }
 
 /// Account-level aggregate bucket pair.
@@ -170,9 +212,43 @@ pub enum ThrottleResult {
     /// Request may proceed.
     Allowed,
     /// Request is throttled on reads.
-    ThrottledRead,
+    ThrottledRead(ThrottleCause),
     /// Request is throttled on writes.
-    ThrottledWrite,
+    ThrottledWrite(ThrottleCause),
+}
+
+impl ThrottleResult {
+    /// The bucket that refused, or `None` when the request was allowed.
+    #[must_use]
+    pub fn cause(&self) -> Option<ThrottleCause> {
+        match self {
+            Self::Allowed => None,
+            Self::ThrottledRead(c) | Self::ThrottledWrite(c) => Some(*c),
+        }
+    }
+}
+
+/// Which bucket refused a request. The service names the throttled resource
+/// and the limit on a throttle error (`ThrottlingReasons`); the server maps
+/// this cause and the table's billing mode onto that vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThrottleCause {
+    /// The table's own bucket: its provisioned capacity, the default ceiling
+    /// of an on-demand table, or an `OnDemandThroughput` cap set on one.
+    Table {
+        /// Whether the table is billed on demand.
+        on_demand: bool,
+        /// Whether the rate of the bucket that refused (read or write) is an
+        /// `OnDemandThroughput` cap.
+        capped: bool,
+    },
+    /// The per-partition-key bucket (a hot key).
+    Partition {
+        /// Whether the table is billed on demand.
+        on_demand: bool,
+    },
+    /// The per-account aggregate bucket.
+    Account,
 }
 
 /// Thread-safe throttle manager holding all token buckets.
@@ -230,12 +306,18 @@ impl ThrottleManager {
         if let Some(existing) = tables.get_mut(&key) {
             existing.read.update_rate(throughput.rcu);
             existing.write.update_rate(throughput.wcu);
+            existing.on_demand = throughput.on_demand;
+            existing.read_capped = throughput.read_capped;
+            existing.write_capped = throughput.write_capped;
         } else {
             tables.insert(
                 key,
                 TableBuckets {
                     read: TokenBucket::new(throughput.rcu),
                     write: TokenBucket::new(throughput.wcu),
+                    on_demand: throughput.on_demand,
+                    read_capped: throughput.read_capped,
+                    write_capped: throughput.write_capped,
                 },
             );
         }
@@ -296,6 +378,7 @@ impl ThrottleManager {
         }
 
         let now = Instant::now();
+        let mut on_demand = false;
 
         // Check per-table bucket.
         if let Ok(mut tables) = self.tables.write() {
@@ -304,11 +387,18 @@ impl ThrottleManager {
                 table_name: table_name.to_owned(),
             };
             if let Some(buckets) = tables.get_mut(&key) {
+                on_demand = buckets.on_demand;
                 if is_read && !buckets.read.has_capacity(now) {
-                    return ThrottleResult::ThrottledRead;
+                    return ThrottleResult::ThrottledRead(ThrottleCause::Table {
+                        on_demand,
+                        capped: buckets.read_capped,
+                    });
                 }
                 if is_write && !buckets.write.has_capacity(now) {
-                    return ThrottleResult::ThrottledWrite;
+                    return ThrottleResult::ThrottledWrite(ThrottleCause::Table {
+                        on_demand,
+                        capped: buckets.write_capped,
+                    });
                 }
             }
         }
@@ -325,12 +415,16 @@ impl ThrottleManager {
             let buckets = partitions.entry(pk).or_insert_with(|| TableBuckets {
                 read: TokenBucket::new(PARTITION_RCU_LIMIT),
                 write: TokenBucket::new(PARTITION_WCU_LIMIT),
+                on_demand,
+                read_capped: false,
+                write_capped: false,
             });
+            let cause = ThrottleCause::Partition { on_demand };
             if is_read && !buckets.read.has_capacity(now) {
-                return ThrottleResult::ThrottledRead;
+                return ThrottleResult::ThrottledRead(cause);
             }
             if is_write && !buckets.write.has_capacity(now) {
-                return ThrottleResult::ThrottledWrite;
+                return ThrottleResult::ThrottledWrite(cause);
             }
         }
 
@@ -343,10 +437,10 @@ impl ThrottleManager {
                     write: TokenBucket::new(self.account_wcu_limit),
                 });
             if is_read && !acct.read.has_capacity(now) {
-                return ThrottleResult::ThrottledRead;
+                return ThrottleResult::ThrottledRead(ThrottleCause::Account);
             }
             if is_write && !acct.write.has_capacity(now) {
-                return ThrottleResult::ThrottledWrite;
+                return ThrottleResult::ThrottledWrite(ThrottleCause::Account);
             }
         }
 
@@ -402,6 +496,11 @@ impl ThrottleManager {
             let buckets = partitions.entry(pk).or_insert_with(|| TableBuckets {
                 read: TokenBucket::new(PARTITION_RCU_LIMIT),
                 write: TokenBucket::new(PARTITION_WCU_LIMIT),
+                // Partition buckets take their limits from the constants; the
+                // billing mode is read from the table's bucket at check time.
+                on_demand: false,
+                read_capped: false,
+                write_capped: false,
             });
             if read_units > 0.0 {
                 buckets.read.consume(read_units, now);
@@ -495,7 +594,10 @@ mod tests {
         mgr.consume("acct", "tbl", 2.0, 0.0);
         assert_eq!(
             mgr.check_capacity("acct", "tbl", true, false),
-            ThrottleResult::ThrottledRead
+            ThrottleResult::ThrottledRead(ThrottleCause::Table {
+                on_demand: false,
+                capped: false,
+            })
         );
     }
 
@@ -506,7 +608,10 @@ mod tests {
         mgr.consume("acct", "tbl", 0.0, 2.0);
         assert_eq!(
             mgr.check_capacity("acct", "tbl", false, true),
-            ThrottleResult::ThrottledWrite
+            ThrottleResult::ThrottledWrite(ThrottleCause::Table {
+                on_demand: false,
+                capped: false,
+            })
         );
     }
 
@@ -535,7 +640,7 @@ mod tests {
         mgr.consume("acct", "tbl", 2.0, 0.0);
         assert_eq!(
             mgr.check_capacity("acct", "tbl", true, false),
-            ThrottleResult::ThrottledRead
+            ThrottleResult::ThrottledRead(ThrottleCause::Account)
         );
     }
 
@@ -559,3 +664,6 @@ mod tests {
         assert_eq!(bucket.refill_rate, 200.0);
     }
 }
+
+#[cfg(test)]
+mod cause_tests;
