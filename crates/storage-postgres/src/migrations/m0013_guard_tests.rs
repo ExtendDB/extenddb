@@ -189,10 +189,13 @@ async fn only_a_store_with_rows_is_checked() {
     let s = scratch().await;
     assert!(!catalog_has_rows(&s.db).await.unwrap());
     assert!(!data_has_rows(&s.db, &s.db).await.unwrap());
-    // A store whose only row is a stream record waiting for its number.
-    sqlx::query(
-        "INSERT INTO stream_pending (shard_id, table_id, event_name, record_data, \
-         record_bytes, created_at) VALUES ('shard-1', 't1', 'INSERT', '{}', 2, now())",
+    // A store whose only counted row is a stream record waiting for its
+    // number. Its shard row is not one that the check counts.
+    sqlx::raw_sql(
+        "INSERT INTO stream_shards (shard_id, table_id, starting_sequence_number) \
+         VALUES ('shard-0', 't0', '1'); \
+         INSERT INTO stream_pending (shard_id, table_id, event_name, record_data, \
+         record_bytes, created_at) VALUES ('shard-0', 't0', 'INSERT', '{}', 2, now())",
     )
     .execute(&s.db)
     .await
