@@ -154,6 +154,21 @@ def _length_refusal(token: str) -> str:
     )
 
 
+def _token_of(shape: str) -> str:
+    """A token of one measured shape, with 32 characters taken from a fresh
+    UUID: ASCII hex digits, or one two-byte character per digit where the
+    shape fixes the UTF-8 length."""
+    unique = uuid.uuid4().hex
+    wide = "".join(chr(0xC0 + int(digit, 16)) for digit in unique)
+    return {
+        "1024-ascii": unique + "a" * 992,
+        "1025-ascii": unique + "a" * 993,
+        "513-chars-1025-bytes": wide + "\u00e9" * 480 + "a",
+        "emoji-1024-chars": "\U0001F600" + unique + "a" * 991,
+        "emoji-1025-chars": "\U0001F600" + unique + "a" * 992,
+    }[shape]
+
+
 class TestClientToken:
     """The ClientToken bounds, measured on the service on 2026-11-19."""
 
@@ -168,19 +183,20 @@ class TestClientToken:
         )
 
     # The length is counted in characters (Unicode code points), not bytes.
-    @pytest.mark.parametrize("token,accepted", [
-        ("a" * 1024, True),
-        ("a" * 1025, False),
-        ("\u00e9" * 512 + "a", True),
-        ("\U0001F600" + "a" * 1023, True),
-        ("\U0001F600" + "a" * 1024, False),
-    ], ids=[
-        "1024-ascii", "1025-ascii", "513-chars-1025-bytes", "emoji-1024-chars",
-        "emoji-1025-chars",
+    # Each case gets a token of its own, so a second run within the
+    # eight-hour window does not replay another table's operation.
+    @pytest.mark.parametrize("shape,chars,utf8_bytes,accepted", [
+        ("1024-ascii", 1024, 1024, True),
+        ("1025-ascii", 1025, 1025, False),
+        ("513-chars-1025-bytes", 513, 1025, True),
+        ("emoji-1024-chars", 1024, 1027, True),
+        ("emoji-1025-chars", 1025, 1028, False),
     ])
     def test_the_token_length_is_counted_in_characters(
-        self, bulk_table, bulk_bucket, token, accepted
+        self, bulk_table, bulk_bucket, shape, chars, utf8_bytes, accepted
     ):
+        token = _token_of(shape)
+        assert (len(token), len(token.encode("utf-8"))) == (chars, utf8_bytes)
         body = start_body(bulk_table, bulk_bucket, ClientToken=token)
         if not accepted:
             expect_error(
