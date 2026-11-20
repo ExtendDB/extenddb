@@ -15,6 +15,7 @@
 
 use super::ast::{CompareOp, Expr, PathElement};
 use super::parser_common;
+use super::resolver::ExpressionMaps;
 use super::tokenizer::Token;
 use crate::error::DynamoDbError;
 use crate::types::{
@@ -530,8 +531,32 @@ impl SortKeyCondition {
 ///
 /// Returns `ValidationException` for syntax errors or unsupported constructs.
 pub fn parse_key_condition(tokens: &[Token]) -> Result<KeyCondition, DynamoDbError> {
-    let mut clauses = parse_clauses(tokens)?;
+    classify_clauses(parse_clauses(tokens, None)?)
+}
 
+/// [`parse_key_condition`] for a request. Once the expression parses, one pass
+/// in text order checks every `#name` and `:value` reference against `maps`
+/// and every document path's length. The pass runs before the
+/// nested-attribute refusal and the clause shapes.
+///
+/// Measured 2026-11-12 (us-east-1): `pk = :nope AND <33 elements> = :s`
+/// answers the undefined `:nope`. `<33 elements> = :s AND pk = :nope` and
+/// `pk = :p AND <33 elements> = :nope` answer the length.
+/// `#m.#k = :s AND #zz = :p` answers the undefined `#zz`, and `pk < :nope`
+/// the undefined `:nope`.
+///
+/// # Errors
+///
+/// Returns `ValidationException` for the errors of [`parse_key_condition`],
+/// an undefined reference and a path of more than 32 elements.
+pub fn parse_key_condition_with_maps(
+    tokens: &[Token],
+    maps: &ExpressionMaps,
+) -> Result<KeyCondition, DynamoDbError> {
+    classify_clauses(parse_clauses(tokens, Some(maps))?)
+}
+
+fn classify_clauses(mut clauses: Vec<RawClause>) -> Result<KeyCondition, DynamoDbError> {
     match clauses.len() {
         1 => classify_single(clauses.remove(0)),
         2 => classify_pair(clauses.remove(0), clauses.remove(0)),
@@ -555,7 +580,7 @@ pub fn parse_key_condition(tokens: &[Token]) -> Result<KeyCondition, DynamoDbErr
 pub fn key_condition_clause_operands(
     tokens: &[Token],
 ) -> Result<Vec<KeyClauseOperand>, DynamoDbError> {
-    Ok(parse_clauses(tokens)?
+    Ok(parse_clauses(tokens, None)?
         .into_iter()
         .filter_map(|clause| match clause {
             RawClause::Eq(path, value) => Some(KeyClauseOperand {
@@ -589,7 +614,12 @@ pub struct KeyClauseOperand {
 
 /// Parse a `KeyConditionExpression` token stream into its AND-ed clauses,
 /// before any of them is read as the partition or the sort key condition.
-fn parse_clauses(tokens: &[Token]) -> Result<Vec<RawClause>, DynamoDbError> {
+/// With `maps`, the references and path lengths are checked once the clauses
+/// parse (see [`check_references`]).
+fn parse_clauses(
+    tokens: &[Token],
+    maps: Option<&ExpressionMaps>,
+) -> Result<Vec<RawClause>, DynamoDbError> {
     parser_common::check_redundant_parens(tokens)
         .map_err(|body| validation_err(&format!("Invalid KeyConditionExpression: {body}")))?;
 
@@ -625,14 +655,44 @@ fn parse_clauses(tokens: &[Token]) -> Result<Vec<RawClause>, DynamoDbError> {
         ));
     }
 
+    if let Some(maps) = maps {
+        check_references(tokens, maps)?;
+    }
+
     // A key condition may only reference a top-level key attribute. Any document
     // path (`attr.sub` or `attr[i]`) on a key is rejected, matching Amazon
-    // DynamoDB. Runs after the reserved-word check and before key-schema checks.
+    // DynamoDB. Runs after the reserved-word check, the references and the
+    // path lengths, and before key-schema checks.
     for clause in &clauses {
         reject_nested_key_path(raw_clause_path(clause))?;
     }
 
     Ok(clauses)
+}
+
+/// Refuse the first `#name` or `:value` reference that `maps` does not define
+/// and the first document path of more than 32 elements. One pass in text
+/// order checks each path's names, then its length, with the semantic walk's
+/// checks.
+fn check_references(tokens: &[Token], maps: &ExpressionMaps) -> Result<(), DynamoDbError> {
+    use super::semantics::{check_path_refs, check_value_defined};
+    let kind = super::ExpressionKind::KeyCondition;
+    let mut pos = 0;
+    while pos < tokens.len() {
+        match &tokens[pos] {
+            Token::Placeholder(value) => {
+                check_value_defined(value, maps, kind)?;
+                pos += 1;
+            }
+            // A function name such as `begins_with` is not a path.
+            Token::Ident(_) if tokens.get(pos + 1) == Some(&Token::LParen) => pos += 1,
+            Token::Ident(_) | Token::NameRef(_) => {
+                check_path_refs(&parser_common::parse_path(tokens, &mut pos)?, maps, kind)?;
+            }
+            _ => pos += 1,
+        }
+    }
+    Ok(())
 }
 
 /// The attribute-side path of a raw clause.
