@@ -8,6 +8,9 @@
 // are therefore allowed module-wide; the behaviour that matters (the fidelity
 // contract below) is covered by the module docs and the tests.
 #![allow(
+    // `clippy::unused_async_trait_impl` below is newer than some clippy
+    // toolchains; `unknown_lints` keeps an older clippy from erroring on it.
+    unknown_lints,
     clippy::missing_errors_doc,
     clippy::missing_panics_doc,
     clippy::must_use_candidate,
