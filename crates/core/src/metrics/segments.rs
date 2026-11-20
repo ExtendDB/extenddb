@@ -356,3 +356,7 @@ impl SegmentStore {
 #[cfg(test)]
 #[path = "segments_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "segments_bound_tests.rs"]
+mod bound_tests;
