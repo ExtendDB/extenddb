@@ -304,6 +304,16 @@ pub mod string_coerce {
     pub fn u16<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u16, D::Error> {
         coerce(deserializer, "u16")
     }
+
+    /// Deserialize a `u64` from either a number or its string form.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the value is neither a `u64` nor a string that
+    /// parses as one.
+    pub fn u64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+        coerce(deserializer, "u64")
+    }
 }
 
 /// Deserializer function type for storage configurations.

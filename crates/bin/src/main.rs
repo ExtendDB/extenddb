@@ -11,7 +11,8 @@
 //!
 //! In-tree backends are selected by mutually exclusive Cargo features:
 //! `postgres` (the default production backend), `mongodb` (production, built with
-//! `--no-default-features --features mongodb`), `cassandra`, and `sqlite`/`sqlite-memory`.
+//! `--no-default-features --features mongodb`), `cassandra` (experimental),
+//! `bigtable` (experimental), and `sqlite`/`sqlite-memory`.
 //! `sqlite` is for production on a single node, and `sqlite-memory` keeps the database
 //! in memory for development and CI. Exactly one must be enabled. [`set_backend`]
 //! installs one backend per process, so a build with more than one would be ambiguous
@@ -57,7 +58,7 @@ compile_error!(
 #[cfg(all(feature = "dev-mode", not(feature = "sqlite")))]
 compile_error!(
     "the `dev-mode` feature requires the `sqlite` backend and does not build with \
-     `postgres`, `mongodb` or `cassandra` (build with \
+     `postgres`, `mongodb`, `cassandra` or `bigtable` (build with \
      `--no-default-features --features sqlite-memory,dev-mode`)"
 );
 

@@ -163,24 +163,4 @@ impl SqliteCatalogStore {
 
 // ── Key generation & crypto helpers ─────────────────────────────────────
 
-/// Generate a 20-character access key id (`AKIAEXTENDDB` + 8 uppercase
-/// alphanumerics), matching the prefix convention used across ExtendDB backends
-/// so generated keys are distinguishable from real AWS keys.
-fn generate_access_key_id() -> String {
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let mut rng = rand::rng();
-    let suffix: String = (0..8)
-        .map(|_| CHARSET[rand::Rng::random_range(&mut rng, 0..CHARSET.len())] as char)
-        .collect();
-    format!("AKIAEXTENDDB{suffix}")
-}
-
-/// Generate a 40-character secret access key, matching the AWS secret shape.
-fn generate_secret_key() -> String {
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut rng = rand::rng();
-    let suffix: String = (0..32)
-        .map(|_| CHARSET[rand::Rng::random_range(&mut rng, 0..CHARSET.len())] as char)
-        .collect();
-    format!("extenddb{suffix}")
-}
+use extenddb_storage::management_store::{generate_access_key_id, generate_secret_key};

@@ -55,19 +55,9 @@ impl PostgresCatalogStore {
         delete_login_history(&mut tx, account_id, user_name).await?;
 
         // Seed default self-service policy.
-        let self_service_policy = serde_json::json!({
-            "Version": "2012-10-17",
-            "Statement": [{
-                "Effect": "Allow",
-                "Action": [
-                    "iam:CreateAccessKey",
-                    "iam:DeleteAccessKey",
-                    "iam:ListAccessKeys",
-                    "iam:ChangePassword"
-                ],
-                "Resource": format!("arn:aws:iam::{account_id}:user/{user_name}")
-            }]
-        });
+        let user_arn = format!("arn:aws:iam::{account_id}:user/{user_name}");
+        let self_service_policy =
+            extenddb_storage::management_store::self_service_policy(&user_arn);
 
         if let Err(e) = sqlx::query(
             "INSERT INTO iam_policies (account_id, principal_type, principal_name, policy_name, policy_document) \

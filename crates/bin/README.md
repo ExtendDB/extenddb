@@ -17,6 +17,7 @@ You need Rust 1.91.1 or later and a C compiler. Each build contains one storage 
 | PostgreSQL (the default) | `cargo install extenddb --locked` |
 | MongoDB | `cargo install extenddb --locked --no-default-features --features mongodb` |
 | Apache Cassandra (experimental) | `cargo install extenddb --locked --no-default-features --features cassandra` |
+| Google Cloud Bigtable (experimental) | `cargo install extenddb --locked --no-default-features --features bigtable` |
 | SQLite dev server | `cargo install extenddb --locked --no-default-features --features sqlite,dev-mode` |
 
 Every build installs a binary named `extenddb`, so you can have one of them installed at a time.
@@ -55,11 +56,12 @@ systems only, so on Windows always pass `--foreground`.
 
 ## Run a server build
 
-The PostgreSQL, MongoDB and Cassandra builds each need a running database:
+The PostgreSQL, MongoDB, Cassandra and Google Cloud Bigtable builds each need a running database:
 
 - PostgreSQL 14 or later
 - MongoDB 7.0 or later, configured as a replica set
 - Apache Cassandra 4.1 or later
+- Google Cloud Bigtable (or the Cloud Bigtable emulator)
 
 Run `extenddb init` once to create the catalog, the admin user, a TLS certificate and `extenddb.toml`. Then run
 `extenddb serve`, which listens with TLS on port 18443.

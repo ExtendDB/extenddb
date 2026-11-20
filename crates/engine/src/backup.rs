@@ -498,6 +498,13 @@ where
         Err(e) => return Err(create_backup_storage_err_to_dynamo(e, table_name)),
     };
     check_backup_arn_fits(region)?;
+    if runtime.create_unsupported() {
+        let permit = runtime.take_permit().await?;
+        return storage
+            .create(account_id, table_name, backup_name, permit)
+            .await
+            .map_err(|e| create_backup_storage_err_to_dynamo(e, table_name));
+    }
     let store_backed = runtime.configured_store().is_some() && !runtime.legacy_create_only();
     if store_backed {
         check_store_prefix_fits(region, account_id, table_name)?;
