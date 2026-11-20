@@ -157,7 +157,7 @@ fn constraint_violations_join_one_message_in_the_service_order() {
         ),
         (
             json!({"ShardId": "shardId-short", "ShardIteratorType": "TRIM_HORIZON"}),
-            Some(super::SHARD_ID_TOO_SHORT.to_owned()),
+            Some(format!("1 validation error detected: {SHARD}")),
         ),
         (
             json!({"ShardId": long, "ShardIteratorType": "AT_TIMESTAMP", "SequenceNumber": "000000000000000000001"}),
@@ -179,9 +179,11 @@ fn constraint_violations_join_one_message_in_the_service_order() {
 
 #[test]
 fn the_constraint_sentences_match_the_measured_ones() {
+    // `GetShardIterator` with a `ShardId` under 28 characters (measured
+    // 2026-10-24 with `nope`).
     assert_eq!(
         super::constraint("shardId", "have length greater than or equal to 28"),
-        super::SHARD_ID_TOO_SHORT
+        "1 validation error detected: Value at 'shardId' failed to satisfy constraint: Member must have length greater than or equal to 28"
     );
     assert_eq!(
         super::constraint("limit", "have value greater than or equal to 1"),

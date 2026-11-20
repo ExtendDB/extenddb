@@ -4,13 +4,13 @@
 """DynamoDB Streams AT_TIMESTAMP shard iterator.
 
 Every expected value here was measured on the service (us-east-1,
-2026-10-23): positioning at millisecond precision, the four validation
-messages and their order, the future buffer, and the error classes for
-malformed Timestamp values.
+2026-10-23 and 2026-11-20): positioning at millisecond precision with the
+Timestamp rounded half up, the validation messages and their order, the
+future buffer, and the error classes for malformed member values.
 
-These tests require a running extenddb server (EXTENDDB_TEST_ENDPOINT must be
-set) because the service routes Streams to a separate endpoint; extenddb
-serves both on the same endpoint.
+Dual-target: with EXTENDDB_TEST_ENDPOINT set, both clients use that endpoint;
+without it, the streams client and the raw requests go to the service's
+Streams endpoint of the region.
 """
 
 from __future__ import annotations
@@ -30,20 +30,19 @@ from conftest import wait_for_active, wait_for_deleted
 PREFIX = "One or more parameter values were invalid: "
 
 
-@pytest.fixture(scope="module")
-def endpoint_url() -> str:
-    return os.environ["EXTENDDB_TEST_ENDPOINT"].strip()
+REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 
 
-def _client(service: str, endpoint_url: str, validate: bool = True):
+def _client(service: str, endpoint_url: str | None, validate: bool = True):
     kwargs: dict = dict(
         service_name=service,
-        region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
-        endpoint_url=endpoint_url,
+        region_name=REGION,
         config=Config(parameter_validation=validate, retries={"max_attempts": 1}),
     )
-    if endpoint_url.startswith("https://"):
-        kwargs["verify"] = False
+    if endpoint_url:
+        kwargs["endpoint_url"] = endpoint_url
+        if endpoint_url.startswith("https://"):
+            kwargs["verify"] = False
     return boto3.client(**kwargs)
 
 
@@ -136,28 +135,30 @@ def _error(fn, **kw) -> tuple[str, str]:
     raise AssertionError("expected a ClientError")
 
 
-def _raw_error(endpoint_url: str, body: dict) -> tuple[str, str]:
+def _raw_error(endpoint_url: str | None, body: dict) -> tuple[str, str]:
     """POST a GetShardIterator body exactly as given, SigV4-signed with the
-    test user's key from the environment, for shapes the SDK cannot
-    serialise (JSON null, an object). Returns (code, message)."""
+    session's credentials, for shapes the SDK cannot serialise (JSON null, an
+    object, a member of the wrong type). Returns (code, message); the message
+    is "" when the answer carries none."""
     import ssl
     import urllib.request
 
     from botocore.auth import SigV4Auth
     from botocore.awsrequest import AWSRequest
-    from botocore.credentials import Credentials
 
+    url = endpoint_url or f"https://streams.dynamodb.{REGION}.amazonaws.com/"
     data = json.dumps(body).encode()
-    req = AWSRequest(method="POST", url=endpoint_url, data=data, headers={
+    req = AWSRequest(method="POST", url=url, data=data, headers={
         "Content-Type": "application/x-amz-json-1.0",
         "X-Amz-Target": "DynamoDBStreams_20120810.GetShardIterator",
     })
-    signer_creds = Credentials(os.environ["AWS_ACCESS_KEY_ID"], os.environ["AWS_SECRET_ACCESS_KEY"])
-    SigV4Auth(signer_creds, "dynamodb", os.environ.get("AWS_DEFAULT_REGION", "us-east-1")).add_auth(req)
+    creds = boto3.Session().get_credentials().get_frozen_credentials()
+    SigV4Auth(creds, "dynamodb", REGION).add_auth(req)
     prepped = req.prepare()
     ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    if endpoint_url:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
     hr = urllib.request.Request(prepped.url, data=data, headers=dict(prepped.headers), method="POST")
     try:
         with urllib.request.urlopen(hr, timeout=30, context=ctx) as r:
@@ -208,19 +209,30 @@ class TestPositioning:
         for r in recs:
             assert r["dynamodb"]["ApproximateCreationDateTime"].microsecond == 0
 
-    def test_boundary_is_at_or_after_the_record_millisecond(self, dynamodb_client, streams_client, stream_table):
+    def test_boundary_is_at_or_after_the_record_millisecond(self, dynamodb_client, streams_client, raw_streams_client, stream_table):
         """T equal to a record's own creation millisecond returns that record
-        (the service's at-or-after); one millisecond later does not."""
+        (the service's at-or-after); one millisecond later does not. The
+        record's millisecond lies in the write's wall-clock window, so a
+        store that keeps whole seconds fails here: the write lands mid-second."""
         table, arn = stream_table
+        now = time.time()
+        time.sleep((1.3 - (now % 1.0)) % 1.0)
+        start = time.time()
         dynamodb_client.put_item(TableName=table, Item={"pk": {"S": "k"}, "v": {"S": "only"}})
+        end = time.time()
+        assert 0.25 < start % 1.0 < 0.75, f"the write did not land mid-second ({start:.3f})"
         shard = _shard_with_records(streams_client, arn)
         it = streams_client.get_shard_iterator(StreamArn=arn, ShardId=shard, ShardIteratorType="TRIM_HORIZON")["ShardIterator"]
         rec = _drain(streams_client, it)[0]
         second = int(rec["dynamodb"]["ApproximateCreationDateTime"].timestamp())
+        assert second == int(start), "ApproximateCreationDateTime is the write's second"
 
         def returns_it(ms: int) -> bool:
-            t = datetime.fromtimestamp(second + ms / 1000.0, tz=timezone.utc)
-            return _values(_at(streams_client, arn, shard, t)) == ["only"]
+            # A raw number, so the fraction reaches the server as written.
+            resp = raw_streams_client.get_shard_iterator(
+                StreamArn=arn, ShardId=shard, ShardIteratorType="AT_TIMESTAMP", Timestamp=second + ms / 1000.0
+            )
+            return _values(_drain(streams_client, resp["ShardIterator"])) == ["only"]
 
         # Bisect within the record's second for the last millisecond that
         # still returns it: that is the record's own creation millisecond.
@@ -234,6 +246,13 @@ class TestPositioning:
                 hi = mid
         assert returns_it(lo), "T at the record's millisecond returns it"
         assert not returns_it(lo + 1), "T one millisecond later does not"
+        # The record's millisecond is inside the write's window (50 ms of
+        # clock skew allowed). A seek at a fraction before the window returns
+        # the record, one past the window does not.
+        window = (int(start * 1000) - second * 1000, int(end * 1000) - second * 1000)
+        assert window[0] - 50 <= lo <= window[1] + 50, f"record ms {lo} outside the write window {window}"
+        assert returns_it(window[0] - 50)
+        assert not returns_it(window[1] + 51)
 
     def test_after_tip_returns_only_later_writes(self, dynamodb_client, streams_client, stream_table):
         table, arn = stream_table
@@ -255,18 +274,20 @@ class TestTimestampShapes:
         table, arn = stream_table
         g = _write_group(dynamodb_client, table, "g", 2)
         shard = _shard_with_records(streams_client, arn)
-        for ts in (int(g[0]), round(g[0], 3), g[0] + 0.123456):
+        for ts in (int(g[0]), round(g[0], 3), g[0] + 0.123456, 0.0005, 0.00051):
             resp = raw_streams_client.get_shard_iterator(
                 StreamArn=arn, ShardId=shard, ShardIteratorType="AT_TIMESTAMP", Timestamp=ts
             )
             assert "ShardIterator" in resp, ts
 
     def test_zero_negative_and_null_refuse(self, dynamodb_client, streams_client, raw_streams_client, stream_table, endpoint_url):
+        """The Timestamp rounds to a millisecond first: 0.0004 and 0.00049
+        round to zero and are refused (0.0005 is accepted above)."""
         table, arn = stream_table
         _write_group(dynamodb_client, table, "g", 1)
         shard = _shard_with_records(streams_client, arn)
         expected = PREFIX + "Valid timestamp must be provided when the iterator type is AT_TIMESTAMP"
-        for ts in (0, -1):
+        for ts in (0, -1, 0.0004, 0.00049, -0.0004):
             code, msg = _error(
                 raw_streams_client.get_shard_iterator,
                 StreamArn=arn, ShardId=shard, ShardIteratorType="AT_TIMESTAMP", Timestamp=ts,
@@ -289,21 +310,36 @@ class TestTimestampShapes:
             assert code == "ValidationException", ts
             assert msg == PREFIX + "Timestamp parameter cannot be greater than the current timestamp", ts
 
-    def test_non_numeric_timestamp_is_a_serialization_error(self, dynamodb_client, streams_client, stream_table, endpoint_url):
+    def test_ill_typed_members_are_serialization_errors(self, dynamodb_client, streams_client, stream_table, endpoint_url):
+        """A member of the wrong JSON type is refused before the enum, null and
+        length checks, with the deserializer's text; SequenceNumber is read
+        before Timestamp; an array has no message."""
         table, arn = stream_table
         g = _write_group(dynamodb_client, table, "g", 1)
         shard = _shard_with_records(streams_client, arn)
+        date_s = "STRING_VALUE cannot be converted to Date"
+        structure = "Start of structure or map found where not expected"
         cases = [
-            (f"{int(g[0])}.5", "STRING_VALUE cannot be converted to Date"),
-            ("", "STRING_VALUE cannot be converted to Date"),
-            (True, "TRUE_VALUE cannot be converted to Date"),
-            ({"S": "x"}, "Start of structure or map found where not expected"),
+            ({"ShardIteratorType": "AT_TIMESTAMP", "Timestamp": f"{int(g[0])}.5"}, date_s),
+            ({"ShardIteratorType": "AT_TIMESTAMP", "Timestamp": ""}, date_s),
+            ({"ShardIteratorType": "AT_TIMESTAMP", "Timestamp": True}, "TRUE_VALUE cannot be converted to Date"),
+            ({"ShardIteratorType": "AT_TIMESTAMP", "Timestamp": {"S": "x"}}, structure),
+            ({"ShardIteratorType": "AT_TIMESTAMP", "Timestamp": []}, ""),
+            ({"ShardIteratorType": "BOGUS", "Timestamp": "1792764248"}, date_s),
+            ({"Timestamp": "1792764248"}, date_s),
+            ({"ShardIteratorType": "BOGUS", "SequenceNumber": 5}, "NUMBER_VALUE cannot be converted to String"),
+            ({"ShardIteratorType": "TRIM_HORIZON", "SequenceNumber": True}, "TRUE_VALUE cannot be converted to String"),
+            ({"ShardIteratorType": "TRIM_HORIZON", "SequenceNumber": {}}, structure),
+            ({"ShardIteratorType": "AT_TIMESTAMP", "SequenceNumber": 5, "Timestamp": "x"}, "NUMBER_VALUE cannot be converted to String"),
         ]
-        for ts, expected in cases:
-            code, msg = _raw_error(endpoint_url, {
-                "StreamArn": arn, "ShardId": shard, "ShardIteratorType": "AT_TIMESTAMP", "Timestamp": ts,
-            })
-            assert (code, msg) == ("SerializationException", expected), ts
+        for extra, expected in cases:
+            code, msg = _raw_error(endpoint_url, {"StreamArn": arn, "ShardId": shard, **extra})
+            assert (code, msg) == ("SerializationException", expected), extra
+        # The type check comes before the ShardId length constraint too.
+        code, msg = _raw_error(endpoint_url, {
+            "StreamArn": arn, "ShardId": "shardId-short", "ShardIteratorType": "AT_TIMESTAMP", "Timestamp": "x",
+        })
+        assert (code, msg) == ("SerializationException", date_s)
 
 
 class TestValidationMatrix:
@@ -336,33 +372,69 @@ class TestValidationMatrix:
             (dict(ShardIteratorType="TRIM_HORIZON", SequenceNumber=seq), seq_refused),
             (dict(ShardIteratorType="LATEST", SequenceNumber=seq), seq_refused),
             (dict(ShardIteratorType="AT_SEQUENCE_NUMBER"), "SequenceNumber cannot be null"),
+            (dict(ShardIteratorType="AFTER_SEQUENCE_NUMBER"), "SequenceNumber cannot be null"),
+            # The missing SequenceNumber is refused before the Timestamp.
+            (dict(ShardIteratorType="AT_SEQUENCE_NUMBER", Timestamp=ts), "SequenceNumber cannot be null"),
+            (dict(ShardIteratorType="AFTER_SEQUENCE_NUMBER", Timestamp=ts), "SequenceNumber cannot be null"),
         ]
         for extra, expected in cases:
             code, msg = _error(raw_streams_client.get_shard_iterator, StreamArn=arn, ShardId=shard, **extra)
             assert code == "ValidationException", extra
             assert msg == PREFIX + expected, extra
 
+    def test_positional_types_check_the_shard_before_refusing_a_sequence_number(self, dynamodb_client, streams_client, raw_streams_client, stream_table):
+        """On a shard that does not exist, TRIM_HORIZON and LATEST answer the
+        shard before the SequenceNumber; AT_TIMESTAMP refuses the
+        SequenceNumber first, and a Timestamp is refused first for every type."""
+        table, arn = stream_table
+        g = _write_group(dynamodb_client, table, "g", 1)
+        _shard_with_records(streams_client, arn)
+        missing = "shardId-00000000000000000000-ffffffff"
+        seq = "000000000000000000001"
+        not_found = ("ResourceNotFoundException", "Requested resource not found: Shard does not exist")
+        seq_refused = ("ValidationException", PREFIX + "SequenceNumber should not be passed for this iterator type")
+        ts_refused = ("ValidationException", PREFIX + "Timestamp should not be passed for this iterator type")
+        cases = [
+            (dict(ShardIteratorType="TRIM_HORIZON", SequenceNumber=seq), not_found),
+            (dict(ShardIteratorType="LATEST", SequenceNumber=seq), not_found),
+            (dict(ShardIteratorType="TRIM_HORIZON"), not_found),
+            (dict(ShardIteratorType="AT_TIMESTAMP", SequenceNumber=seq, Timestamp=int(g[0])), seq_refused),
+            (dict(ShardIteratorType="TRIM_HORIZON", Timestamp=int(g[0])), ts_refused),
+            (dict(ShardIteratorType="LATEST", SequenceNumber=seq, Timestamp=int(g[0])), ts_refused),
+            (dict(ShardIteratorType="AT_SEQUENCE_NUMBER"), ("ValidationException", PREFIX + "SequenceNumber cannot be null")),
+        ]
+        for extra, expected in cases:
+            got = _error(raw_streams_client.get_shard_iterator, StreamArn=arn, ShardId=missing, **extra)
+            assert got == expected, extra
+
     def test_unknown_or_missing_type_renders_without_the_value(self, dynamodb_client, streams_client, raw_streams_client, stream_table, endpoint_url):
         table, arn = stream_table
         _write_group(dynamodb_client, table, "g", 1)
         shard = _shard_with_records(streams_client, arn)
         members = "[AFTER_SEQUENCE_NUMBER, LATEST, AT_TIMESTAMP, AT_SEQUENCE_NUMBER, TRIM_HORIZON]"
+        enum_clause = f"Value at 'shardIteratorType' failed to satisfy constraint: Member must satisfy enum value set: {members}"
+        null_clause = "Value at 'shardIteratorType' failed to satisfy constraint: Member must not be null"
+        shard_clause = "Value at 'shardId' failed to satisfy constraint: Member must have length greater than or equal to 28"
+        seq_clause = "Value at 'sequenceNumber' failed to satisfy constraint: Member must have length greater than or equal to 21"
         # The service omits the offending value from the enum violation.
         for bad in ("BOGUS", "at_timestamp"):
             code, msg = _error(raw_streams_client.get_shard_iterator, StreamArn=arn, ShardId=shard, ShardIteratorType=bad)
-            assert code == "ValidationException"
-            assert msg == (
-                "1 validation error detected: Value at 'shardIteratorType' failed to satisfy "
-                f"constraint: Member must satisfy enum value set: {members}"
-            )
-        # A missing or null type is a ValidationException, not a serialization error.
-        for body in ({"Timestamp": 1792764248.0}, {"ShardIteratorType": None}):
-            code, msg = _raw_error(endpoint_url, {"StreamArn": arn, "ShardId": shard, **body})
-            assert (code, msg) == (
-                "ValidationException",
-                "1 validation error detected: Value at 'shardIteratorType' failed to satisfy "
-                "constraint: Member must not be null",
-            ), body
+            assert (code, msg) == ("ValidationException", f"1 validation error detected: {enum_clause}")
+        # A missing or null type is a ValidationException, not a serialization
+        # error, and it joins the other constraint violations in one message:
+        # sequenceNumber, shardIteratorType, shardId.
+        cases = [
+            ({"ShardId": shard, "Timestamp": 1792764248.0}, f"1 validation error detected: {null_clause}"),
+            ({"ShardId": shard, "ShardIteratorType": None}, f"1 validation error detected: {null_clause}"),
+            ({"ShardId": "shardId-short"}, f"2 validation errors detected: {null_clause}; {shard_clause}"),
+            ({"ShardId": "shardId-short", "ShardIteratorType": "BOGUS"}, f"2 validation errors detected: {enum_clause}; {shard_clause}"),
+            ({"ShardId": shard, "SequenceNumber": "0"}, f"2 validation errors detected: {seq_clause}; {null_clause}"),
+            ({"ShardId": "shardId-short", "SequenceNumber": "0"}, f"3 validation errors detected: {seq_clause}; {null_clause}; {shard_clause}"),
+            ({"ShardId": "shardId-short", "ShardIteratorType": "TRIM_HORIZON"}, f"1 validation error detected: {shard_clause}"),
+        ]
+        for body, expected in cases:
+            code, msg = _raw_error(endpoint_url, {"StreamArn": arn, **body})
+            assert (code, msg) == ("ValidationException", expected), body
 
     def test_future_check_runs_before_shard_existence(self, dynamodb_client, streams_client, raw_streams_client, stream_table):
         table, arn = stream_table

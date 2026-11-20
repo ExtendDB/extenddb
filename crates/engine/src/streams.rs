@@ -293,10 +293,6 @@ fn clause(member: &str, rule: &str) -> String {
     format!("Value at '{member}' failed to satisfy constraint: Member must {rule}")
 }
 
-/// `GetShardIterator` with a `ShardId` under 28 characters (measured 2026-10-24
-/// with `nope`); the same shape `constraint` renders.
-pub const SHARD_ID_TOO_SHORT: &str = "1 validation error detected: Value at 'shardId' failed to satisfy constraint: Member must have length greater than or equal to 28";
-
 /// The message `DynamoDB` returns for an expired shard iterator (measured live,
 /// `live-r2/iter-live.json`: an iterator 990 seconds old returns
 /// `ExpiredIteratorException` with exactly this text). Shared so the
