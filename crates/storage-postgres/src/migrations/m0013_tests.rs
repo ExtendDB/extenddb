@@ -135,10 +135,10 @@ pub(crate) async fn run(s: &Scratch) -> Result<Vec<String>, MigrationError> {
     run_pool(&s.db).await
 }
 
-/// Seed a data table, an index table, `gsi_pending`, `stream_records`, and
-/// `backup_items` with three row kinds: raw U+0001 in key columns and
-/// inside jsonb strings and object keys, the literal six-character text
-/// backslash-u-0001 inside a jsonb string, and plain rows.
+/// Seed a data table, an index table, `gsi_pending`, `stream_records`,
+/// `stream_pending` and `backup_items` with three row kinds: raw U+0001 in
+/// key columns and inside jsonb strings and object keys, the literal
+/// six-character text backslash-u-0001 inside a jsonb string, and plain rows.
 pub(crate) async fn seed(db: &PgPool) {
     let ks = json!([
         {"AttributeName": "pk", "KeyType": "HASH"},
@@ -279,6 +279,20 @@ pub(crate) async fn seed(db: &PgPool) {
         .await
         .expect("seed a stream record");
     }
+    for (record_bytes, record) in [
+        (40_i64, json!({"Keys": {"pk": {"S": "q\u{1}"}}})),
+        (30_i64, json!({"Keys": {"pk": {"S": "q"}}})),
+    ] {
+        sqlx::query(
+            "INSERT INTO stream_pending (shard_id, table_id, event_name, record_data, \
+             record_bytes, created_at) VALUES ('shard-1', 't1', 'INSERT', $1, $2, now())",
+        )
+        .bind(record)
+        .bind(record_bytes)
+        .execute(db)
+        .await
+        .expect("seed a pending stream record");
+    }
 
     sqlx::query(
         "INSERT INTO backups (backup_arn, backup_name, table_id, table_name, account_id, \
@@ -326,6 +340,7 @@ async fn reencodes_legacy_rows() {
             "_ddb_i1 (index \"gsi1\" of table \"t\" of account 111122223333): 5 row update(s)",
             "gsi_pending: 1 row update(s)",
             "stream_records: 1 row update(s)",
+            "stream_pending: 1 row update(s)",
         ]
     );
 
@@ -419,6 +434,21 @@ async fn reencodes_legacy_rows() {
         vec![
             (json!({"Keys": {"pk": {"S": "a\u{1}\u{2}b"}}}),),
             (json!({"Keys": {"pk": {"S": "p"}}}),),
+        ]
+    );
+
+    // stream_pending: the record waiting for its number is re-encoded, and
+    // its record_bytes is left as the write sent it.
+    let rows: Vec<(serde_json::Value, i64)> =
+        sqlx::query_as("SELECT record_data, record_bytes FROM stream_pending ORDER BY id")
+            .fetch_all(&s.db)
+            .await
+            .expect("read stream_pending");
+    assert_eq!(
+        rows,
+        vec![
+            (json!({"Keys": {"pk": {"S": "q\u{1}\u{2}"}}}), 40),
+            (json!({"Keys": {"pk": {"S": "q"}}}), 30),
         ]
     );
 

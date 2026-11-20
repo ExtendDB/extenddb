@@ -63,14 +63,16 @@ pub(crate) async fn catalog_has_rows(catalog: &PgPool) -> Result<bool, Migration
 }
 
 /// Whether the data body may have rows to rewrite: the catalog lists a table,
-/// or `gsi_pending` or `stream_records` holds a row.
+/// or `gsi_pending`, `stream_records` or `stream_pending` holds a row.
+/// `stream_pending` is missing while migration 7 is pending in the same run.
 pub(crate) async fn data_has_rows(catalog: &PgPool, data: &PgPool) -> Result<bool, MigrationError> {
     if std::env::var_os(IGNORE_CONNECTIONS_ENV).is_some() {
         return Ok(false);
     }
     Ok(has_row(catalog, "tables").await?
         || has_row(data, "gsi_pending").await?
-        || has_row(data, "stream_records").await?)
+        || has_row(data, "stream_records").await?
+        || has_row(data, "stream_pending").await?)
 }
 
 /// One item naming the other sessions on the database `pool` reaches, or none;

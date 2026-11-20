@@ -18,11 +18,12 @@
 //! which lives in the catalog database; the data body rewrites every data
 //! table, index table and vector index table (the text key columns and
 //! `item_data`), the item images of `gsi_pending` (`old_item`, `new_item`)
-//! and `stream_records`, and recomputes `gsi_pending.worker_partition` for
-//! the rows it changes. `gsi_pending.index_context` is not rewritten: catalog
-//! migration 11, `attribute_name_escape`, applies the same escape to it once.
-//! Tables are listed from the catalog rows; a row whose table is `DELETING`,
-//! or whose physical table is missing, is skipped and noted.
+//! and the stream records of `stream_records` and `stream_pending`, and
+//! recomputes `gsi_pending.worker_partition` for the rows it changes.
+//! `gsi_pending.index_context` is not rewritten: catalog migration 11,
+//! `attribute_name_escape`, applies the same escape to it once. Tables are
+//! listed from the catalog rows; a row whose table is `DELETING`, or whose
+//! physical table is missing, is skipped and noted.
 //!
 //! The escape is not idempotent: an escaped row also holds U+0001, and a
 //! legacy U+0001 U+0002 cannot be told from an escaped U+0001. Each body runs
@@ -76,7 +77,7 @@ const FINGERPRINT: &str = "0013_escape_control_chars/postgres/1";
 pub(crate) struct EscapeBackupItems;
 
 /// The data body: the data, index and vector index tables, the item images
-/// of `gsi_pending`, and `stream_records`.
+/// of `gsi_pending`, `stream_records` and `stream_pending`.
 pub(crate) struct EscapeDataRows;
 
 #[async_trait]
@@ -111,7 +112,7 @@ impl CodeBody<PostgresStores> for EscapeDataRows {
     }
 
     /// Another session on the data database, while the catalog lists a table
-    /// or `gsi_pending` or `stream_records` holds a row.
+    /// or `gsi_pending`, `stream_records` or `stream_pending` holds a row.
     async fn detect(&self, stores: &PostgresStores) -> Result<Vec<String>, MigrationError> {
         if !stores.checks_sessions || !guard::data_has_rows(&stores.catalog, &stores.data).await? {
             return Ok(Vec::new());
@@ -572,8 +573,14 @@ pub(crate) async fn escape_data(
         w.recompute_worker_partition = true;
         work.push(w);
     }
-    if let Some(w) = fixed_table_work(conn, "stream_records", &[], &["record_data"]).await? {
-        work.push(w);
+    // A stream record waits in `stream_pending` until the numbering moves it
+    // to `stream_records` (migration 7), so both hold item documents.
+    // `record_bytes`, the numbering's estimate of a batch's size, keeps the
+    // length the write sent.
+    for table in ["stream_records", "stream_pending"] {
+        if let Some(w) = fixed_table_work(conn, table, &[], &["record_data"]).await? {
+            work.push(w);
+        }
     }
 
     escape_all(conn, &work, &mut notes).await?;
