@@ -88,11 +88,11 @@ async fn crash_first_claim(
     source: Arc<dyn BulkSource>,
     notify: &tokio::sync::Notify,
 ) -> BulkOperationRecord {
-    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let record = h.claim("runner-1", STORE_LEASE).await;
     let mut cfg = config();
     cfg.batch_size = 5;
-    cfg.lease = Duration::from_millis(100);
-    let deps = h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink()));
+    let deps =
+        h.with_short_store_lease(h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink())));
     tokio::select! {
         _ = runner::run(&deps, record) => panic!("the runner must not finish while the reader pends"),
         () = notify.notified() => {}

@@ -175,7 +175,7 @@ async fn a_crash_resume_continues_the_record_cap_from_the_persisted_count() {
     );
     let files = h.enumerate().await;
     let op = h.start(files, input_config(false), both_reports()).await;
-    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let record = h.claim("runner-1", STORE_LEASE).await;
 
     // Rows 0 and 1 checkpoint with two kept records, exhausting the cap;
     // the runner dies with rows 2 and 3 unread.
@@ -189,8 +189,8 @@ async fn a_crash_resume_continues_the_record_cap_from_the_persisted_count() {
     let mut cfg = config();
     cfg.batch_size = 2;
     cfg.max_report_records = 2;
-    cfg.lease = Duration::from_millis(100);
-    let deps = h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink()));
+    let deps =
+        h.with_short_store_lease(h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink())));
     tokio::select! {
         _ = runner::run(&deps, record) => panic!("the runner must not finish while the reader pends"),
         () = notify.notified() => {}

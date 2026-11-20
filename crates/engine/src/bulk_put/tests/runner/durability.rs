@@ -16,7 +16,7 @@ async fn a_resumed_run_matches_an_uninterrupted_run() {
     let op = h
         .start(files.clone(), input_config(false), both_reports())
         .await;
-    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let record = h.claim("runner-1", STORE_LEASE).await;
 
     // First runner: checkpoints at rows 5 and 10, then dies while rows 10
     // to 12 sit in an uncommitted batch (row 12 is a failed row whose
@@ -30,8 +30,8 @@ async fn a_resumed_run_matches_an_uninterrupted_run() {
     });
     let mut cfg = config();
     cfg.batch_size = 5;
-    cfg.lease = Duration::from_millis(100);
-    let deps = h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink()));
+    let deps =
+        h.with_short_store_lease(h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink())));
     tokio::select! {
         _ = runner::run(&deps, record) => panic!("the runner must not finish while the reader pends"),
         () = notify.notified() => {}
@@ -90,7 +90,7 @@ async fn a_replayed_passing_condition_row_is_not_re_evaluated_on_resume() {
     h.write_input("part-000.json", &file_of(&rows));
     let files = h.enumerate().await;
     let op = h.start(files, input_config(false), both_reports()).await;
-    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let record = h.claim("runner-1", STORE_LEASE).await;
 
     // The condition row at index 10 is applied (write plus ledger marker in
     // one data transaction), then the runner dies before the checkpoint
@@ -108,8 +108,8 @@ async fn a_replayed_passing_condition_row_is_not_re_evaluated_on_resume() {
     // soon as it is read and the crash lands between that commit and
     // the checkpoint that would cover it.
     cfg.write_batch_rows = 1;
-    cfg.lease = Duration::from_millis(100);
-    let deps = h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink()));
+    let deps =
+        h.with_short_store_lease(h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink())));
     tokio::select! {
         _ = runner::run(&deps, record) => panic!("the runner must not finish while the reader pends"),
         () = notify.notified() => {}
@@ -189,7 +189,7 @@ async fn a_replayed_applied_condition_row_does_not_resurrect_an_externally_delet
     h.write_input("part-000.json", &file_of(&rows));
     let files = h.enumerate().await;
     let op = h.start(files, input_config(false), both_reports()).await;
-    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let record = h.claim("runner-1", STORE_LEASE).await;
 
     // Row 10 is applied (write plus Applied marker in one transaction),
     // then the runner dies before the covering checkpoint.
@@ -206,8 +206,8 @@ async fn a_replayed_applied_condition_row_does_not_resurrect_an_externally_delet
     // soon as it is read and the crash lands between that commit and
     // the checkpoint that would cover it.
     cfg.write_batch_rows = 1;
-    cfg.lease = Duration::from_millis(100);
-    let deps = h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink()));
+    let deps =
+        h.with_short_store_lease(h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink())));
     tokio::select! {
         _ = runner::run(&deps, record) => panic!("the runner must not finish while the reader pends"),
         () = notify.notified() => {}
@@ -281,7 +281,7 @@ async fn a_re_render_after_a_crash_between_rendering_and_finish_replaces_the_fil
     );
     let files = h.enumerate().await;
     let op = h.start(files, input_config(false), both_reports()).await;
-    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let record = h.claim("runner-1", STORE_LEASE).await;
 
     // The first runner renders the error report, then dies before finish.
     let notify = Arc::new(tokio::sync::Notify::new());
@@ -289,9 +289,8 @@ async fn a_re_render_after_a_crash_between_rendering_and_finish_replaces_the_fil
         inner: h.fs_sink(),
         notify: Arc::clone(&notify),
     });
-    let mut cfg = config();
-    cfg.lease = Duration::from_millis(100);
-    let deps = h.deps_with("runner-1", cfg, Arc::new(h.fs_source()), sink);
+    let deps =
+        h.with_short_store_lease(h.deps_with("runner-1", config(), Arc::new(h.fs_source()), sink));
     tokio::select! {
         _ = runner::run(&deps, record) => panic!("the runner must not finish while the sink pends"),
         () = notify.notified() => {}

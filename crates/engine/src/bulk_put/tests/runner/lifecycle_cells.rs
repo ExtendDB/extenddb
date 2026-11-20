@@ -294,7 +294,7 @@ async fn a_cut_file_stays_cut_across_a_restart() {
     let files = h.enumerate().await;
     let second_size = files[1].size;
     let op = h.start(files, input_config(false), both_reports()).await;
-    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let record = h.claim("runner-1", STORE_LEASE).await;
 
     // The first runner cuts file 0, checkpoints its end of file, and dies
     // inside the open of file 1.
@@ -305,9 +305,8 @@ async fn a_cut_file_stays_cut_across_a_restart() {
         opens: Arc::new(AtomicU64::new(0)),
         notify: Arc::clone(&notify),
     });
-    let mut cfg = config();
-    cfg.lease = Duration::from_millis(100);
-    let deps = h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink()));
+    let deps =
+        h.with_short_store_lease(h.deps_with("runner-1", config(), source, Arc::new(h.fs_sink())));
     tokio::select! {
         _ = runner::run(&deps, record) => panic!("the runner must not finish while the open pends"),
         () = notify.notified() => {}

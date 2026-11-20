@@ -367,7 +367,7 @@ async fn a_resumed_open_is_checked_and_a_denial_there_is_not_available() {
             Some(run_context_with_caller()),
         )
         .await;
-    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let record = h.claim("runner-1", STORE_LEASE).await;
     let notify = Arc::new(tokio::sync::Notify::new());
     let source = Arc::new(PendAfterSource {
         inner: h.fs_source(),
@@ -377,8 +377,8 @@ async fn a_resumed_open_is_checked_and_a_denial_there_is_not_available() {
     });
     let mut cfg = config();
     cfg.batch_size = 5;
-    cfg.lease = Duration::from_millis(100);
-    let mut deps = h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink()));
+    let mut deps =
+        h.with_short_store_lease(h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink())));
     deps.authorizer = Some(Arc::new(FakeAuthorizer::default()));
     tokio::select! {
         _ = runner::run(&deps, record) => panic!("the runner must not finish while the reader pends"),

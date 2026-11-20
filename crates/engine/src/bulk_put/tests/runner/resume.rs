@@ -11,7 +11,7 @@ async fn an_io_error_inside_the_resumed_skip_region_fails_the_operation() {
     h.write_input("part-000.json", &file_of(&plain_rows(30)));
     let files = h.enumerate().await;
     let op = h.start(files, input_config(false), both_reports()).await;
-    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let record = h.claim("runner-1", STORE_LEASE).await;
 
     // First runner checkpoints at row 10 and dies.
     let notify = Arc::new(tokio::sync::Notify::new());
@@ -23,8 +23,8 @@ async fn an_io_error_inside_the_resumed_skip_region_fails_the_operation() {
     });
     let mut cfg = config();
     cfg.batch_size = 5;
-    cfg.lease = Duration::from_millis(100);
-    let deps = h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink()));
+    let deps =
+        h.with_short_store_lease(h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink())));
     tokio::select! {
         _ = runner::run(&deps, record) => panic!("the runner must not finish while the reader pends"),
         () = notify.notified() => {}
@@ -77,7 +77,7 @@ async fn a_crash_between_the_final_checkpoint_and_finish_keeps_the_retried_rows_
     h.write_input("part-000.json", &file_of(&rows));
     let files = h.enumerate().await;
     let op = h.start(files, input_config(false), both_reports()).await;
-    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let record = h.claim("runner-1", STORE_LEASE).await;
 
     // Row 1's marked write commits the item and its Applied ledger marker
     // in one data transaction, then reports a storage error, the way an
@@ -89,9 +89,8 @@ async fn a_crash_between_the_final_checkpoint_and_finish_keeps_the_retried_rows_
     let mut faulting = FaultingStorage::new(&h.storage);
     faulting.commit_then_error_row = Some((0, 1));
     faulting.pend_finish = Some(Arc::clone(&notify));
-    let mut cfg = config();
-    cfg.lease = Duration::from_millis(100);
-    let deps = h.deps_with_storage("runner-1", cfg, Arc::new(faulting));
+    let deps =
+        h.with_short_store_lease(h.deps_with_storage("runner-1", config(), Arc::new(faulting)));
     tokio::select! {
         _ = runner::run(&deps, record) => panic!("the runner must not finish while the terminal write pends"),
         () = notify.notified() => {}
@@ -164,7 +163,7 @@ async fn a_crash_after_the_cap_trips_resumes_at_the_tripping_line() {
     h.write_input("part-001.json", &file_of(&tail));
     let files = h.enumerate().await;
     let op = h.start(files, input_config(false), both_reports()).await;
-    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let record = h.claim("runner-1", STORE_LEASE).await;
 
     // The runner pends inside finish after the final checkpoint, modelling
     // a crash between the checkpoint and the terminal transition.
@@ -173,8 +172,7 @@ async fn a_crash_after_the_cap_trips_resumes_at_the_tripping_line() {
     faulting.pend_finish = Some(Arc::clone(&notify));
     let mut cfg = config();
     cfg.max_item_count = 10;
-    cfg.lease = Duration::from_millis(100);
-    let deps = h.deps_with_storage("runner-1", cfg, Arc::new(faulting));
+    let deps = h.with_short_store_lease(h.deps_with_storage("runner-1", cfg, Arc::new(faulting)));
     tokio::select! {
         _ = runner::run(&deps, record) => panic!("the runner must not finish while the terminal write pends"),
         () = notify.notified() => {}
@@ -282,7 +280,7 @@ async fn a_replayed_failed_condition_row_is_reemitted_even_after_the_item_is_del
     h.write_input("part-000.json", &file_of(&rows));
     let files = h.enumerate().await;
     let op = h.start(files, input_config(false), both_reports()).await;
-    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let record = h.claim("runner-1", STORE_LEASE).await;
 
     // The condition at row 10 fails against the seeded item; its marker
     // commits in its own transaction, then the runner dies before the
@@ -300,8 +298,8 @@ async fn a_replayed_failed_condition_row_is_reemitted_even_after_the_item_is_del
     // soon as it is read and the crash lands between that commit and
     // the checkpoint that would cover it.
     cfg.write_batch_rows = 1;
-    cfg.lease = Duration::from_millis(100);
-    let deps = h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink()));
+    let deps =
+        h.with_short_store_lease(h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink())));
     tokio::select! {
         _ = runner::run(&deps, record) => panic!("the runner must not finish while the reader pends"),
         () = notify.notified() => {}
@@ -515,7 +513,7 @@ async fn a_transient_write_batch_fault_leaves_the_operation_to_resume() {
 
     // First claim: the transient fault on the write batch surfaces as a
     // runner storage error, not a terminal transition.
-    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let record = h.claim("runner-1", STORE_LEASE).await;
     let deps = h.deps_with_storage("runner-1", config(), Arc::clone(&storage));
     let result = runner::run(&deps, record).await;
     assert!(

@@ -105,7 +105,7 @@ async fn uninterrupted(
 /// Run `rows` until `after` lines were handed out, then drop the runner, as
 /// a killed process stops; the lease runs out before this returns.
 async fn kill_after(h: &Harness, after: u64, cfg: RunnerConfig) {
-    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let record = h.claim("runner-1", STORE_LEASE).await;
     let notify = Arc::new(tokio::sync::Notify::new());
     let source = Arc::new(PendAfterSource {
         inner: h.fs_source(),
@@ -223,13 +223,13 @@ async fn a_transient_fault_on_a_later_write_batch_of_the_window_applies_no_row_t
     h.write_input("part-000.json", &file_of(&rows));
     let files = h.enumerate().await;
     let op = h.start(files, input_config(false), both_reports()).await;
-    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let record = h.claim("runner-1", STORE_LEASE).await;
     // The checkpoint window is ten rows and a write batch two: the batches
     // of rows 0 and 1 and of rows 2 and 3 commit, and the batch of rows 4
     // and 5 fails with a transient fault before the window's checkpoint.
     let mut faulting = FaultingStorage::new(&h.storage);
     faulting.fail_put_pk = Some("k5".to_owned());
-    faulting.checkpoint_lease = Some(Duration::from_millis(100));
+    faulting.checkpoint_lease = Some(STORE_LEASE);
     let deps = h.deps_with_storage("runner-1", window(10, 2), Arc::new(faulting));
     assert!(
         runner::run(&deps, record).await.is_err(),

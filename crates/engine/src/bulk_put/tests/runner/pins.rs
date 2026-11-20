@@ -25,11 +25,11 @@ fn marked_row(i: usize) -> String {
 /// crash falling between the checkpoint at `checkpoint_rows` and the next
 /// one. Each row is its own storage transaction, so rows read after the
 /// checkpoint are committed (with their ledger markers) and not covered.
-/// The lease is long enough that a loaded host does not run it out before
-/// a write batch, and the sleep after the crash outlasts it.
+/// The runner keeps the lease of `config()`, so a loaded host does not run
+/// it out before a write batch, and the sleep after the crash outlasts the
+/// store's lease (`STORE_LEASE`).
 async fn crash_after(h: &Harness, after: u64, checkpoint_rows: usize) {
-    let lease = Duration::from_secs(1);
-    let record = h.claim("runner-1", lease).await;
+    let record = h.claim("runner-1", STORE_LEASE).await;
     let notify = Arc::new(tokio::sync::Notify::new());
     let source = Arc::new(PendAfterSource {
         inner: h.fs_source(),
@@ -40,14 +40,14 @@ async fn crash_after(h: &Harness, after: u64, checkpoint_rows: usize) {
     let mut cfg = config();
     cfg.batch_size = checkpoint_rows;
     cfg.write_batch_rows = 1;
-    cfg.lease = lease;
-    let deps = h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink()));
+    let deps =
+        h.with_short_store_lease(h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink())));
     tokio::select! {
         _ = runner::run(&deps, record) => panic!("the runner must not finish while the reader pends"),
         () = notify.notified() => {}
     }
-    // The lease expires before a second owner can claim.
-    tokio::time::sleep(lease + Duration::from_millis(500)).await;
+    // The store's lease expires before a second owner can claim.
+    tokio::time::sleep(Duration::from_millis(250)).await;
 }
 
 /// Rows an earlier incarnation already wrote are found in the ledger on

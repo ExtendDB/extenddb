@@ -59,7 +59,7 @@ async fn a_cut_file_still_fails_the_operation_after_a_kill_inside_the_next_file_
     stage(&h);
     let files = h.enumerate().await;
     let op = h.start(files, input_config(false), both_reports()).await;
-    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let record = h.claim("runner-1", STORE_LEASE).await;
     // The faulting line of file 0, then 300 rows of file 1: the checkpoint
     // at row 300 of file 1 has persisted more bytes than file 0's size.
     let notify = Arc::new(tokio::sync::Notify::new());

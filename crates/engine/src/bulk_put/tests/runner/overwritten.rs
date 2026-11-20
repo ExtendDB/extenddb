@@ -239,7 +239,7 @@ async fn an_object_overwritten_before_a_resumed_open_keeps_the_counted_rows() {
     let op = h.start(files, input_config(false), both_reports()).await;
 
     // The first claim checkpoints 5 rows and stops.
-    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let record = h.claim("runner-1", STORE_LEASE).await;
     let notify = Arc::new(tokio::sync::Notify::new());
     let source = Arc::new(PendAfterSource {
         inner: h.fs_source(),
@@ -249,8 +249,8 @@ async fn an_object_overwritten_before_a_resumed_open_keeps_the_counted_rows() {
     });
     let mut cfg = config();
     cfg.batch_size = 5;
-    cfg.lease = Duration::from_millis(100);
-    let deps = h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink()));
+    let deps =
+        h.with_short_store_lease(h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink())));
     tokio::select! {
         _ = runner::run(&deps, record) => panic!("the runner must not finish while the reader pends"),
         () = notify.notified() => {}

@@ -17,7 +17,7 @@ async fn rows_staged_at_a_crash_are_unwritten_and_written_once_on_resume() {
     h.write_input("part-000.json", &file_of(&plain_rows(12)));
     let files = h.enumerate().await;
     let op = h.start(files, input_config(false), both_reports()).await;
-    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let record = h.claim("runner-1", STORE_LEASE).await;
 
     let notify = Arc::new(tokio::sync::Notify::new());
     let source = Arc::new(PendAfterSource {
@@ -28,8 +28,8 @@ async fn rows_staged_at_a_crash_are_unwritten_and_written_once_on_resume() {
     });
     let mut cfg = config();
     cfg.batch_size = 5;
-    cfg.lease = Duration::from_millis(100);
-    let deps = h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink()));
+    let deps =
+        h.with_short_store_lease(h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink())));
     tokio::select! {
         _ = runner::run(&deps, record) => panic!("the runner must not finish while the reader pends"),
         () = notify.notified() => {}
@@ -174,7 +174,7 @@ async fn a_committed_multi_row_batch_crashing_before_the_checkpoint_replays_once
     h.write_input("part-000.json", &file_of(&rows));
     let files = h.enumerate().await;
     let op = h.start(files, input_config(false), both_reports()).await;
-    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let record = h.claim("runner-1", STORE_LEASE).await;
 
     // Rows 0,1,2 commit as one batch, then 3,4,5 as a second; row 6 is read
     // and staged, then the next read pends. No checkpoint has run.
@@ -188,8 +188,8 @@ async fn a_committed_multi_row_batch_crashing_before_the_checkpoint_replays_once
     let mut cfg = config();
     cfg.batch_size = 25;
     cfg.write_batch_rows = 3;
-    cfg.lease = Duration::from_millis(100);
-    let deps = h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink()));
+    let deps =
+        h.with_short_store_lease(h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink())));
     tokio::select! {
         _ = runner::run(&deps, record) => panic!("the runner must not finish while the reader pends"),
         () = notify.notified() => {}
@@ -278,7 +278,7 @@ async fn a_crashed_run_charges_the_index_as_an_uninterrupted_run_does() {
     h.write_input("part-000.json", &file_of(&rows));
     let files = h.enumerate().await;
     let op = h.start(files, input_config(false), both_reports()).await;
-    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let record = h.claim("runner-1", STORE_LEASE).await;
 
     // Rows 0 to 5 commit as two batches of three with no checkpoint behind
     // them; the read of row 7 pends and the first incarnation is abandoned.
@@ -292,8 +292,8 @@ async fn a_crashed_run_charges_the_index_as_an_uninterrupted_run_does() {
     let mut cfg = config();
     cfg.batch_size = 25;
     cfg.write_batch_rows = 3;
-    cfg.lease = Duration::from_millis(100);
-    let deps = h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink()));
+    let deps =
+        h.with_short_store_lease(h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink())));
     tokio::select! {
         _ = runner::run(&deps, record) => panic!("the runner must not finish while the reader pends"),
         () = notify.notified() => {}
@@ -386,7 +386,7 @@ async fn a_fault_inside_the_resumed_skip_region_abandons_the_file_without_record
     h.write_input("part-000.json", &file_of(&plain_rows(30)));
     let files = h.enumerate().await;
     let op = h.start(files, input_config(false), both_reports()).await;
-    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let record = h.claim("runner-1", STORE_LEASE).await;
 
     // First runner checkpoints at row 10 and dies.
     let notify = Arc::new(tokio::sync::Notify::new());
@@ -398,8 +398,8 @@ async fn a_fault_inside_the_resumed_skip_region_abandons_the_file_without_record
     });
     let mut cfg = config();
     cfg.batch_size = 5;
-    cfg.lease = Duration::from_millis(100);
-    let deps = h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink()));
+    let deps =
+        h.with_short_store_lease(h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink())));
     tokio::select! {
         _ = runner::run(&deps, record) => panic!("the runner must not finish while the reader pends"),
         () = notify.notified() => {}
@@ -448,7 +448,7 @@ async fn a_resume_at_a_file_boundary_opens_the_next_file_without_double_count() 
     let op = h
         .start(files.clone(), input_config(false), both_reports())
         .await;
-    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let record = h.claim("runner-1", STORE_LEASE).await;
 
     // The runner finishes the first file (its end-of-file checkpoint
     // commits) and dies opening the second.
@@ -461,8 +461,8 @@ async fn a_resume_at_a_file_boundary_opens_the_next_file_without_double_count() 
     });
     let mut cfg = config();
     cfg.batch_size = 5;
-    cfg.lease = Duration::from_millis(100);
-    let deps = h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink()));
+    let deps =
+        h.with_short_store_lease(h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink())));
     tokio::select! {
         _ = runner::run(&deps, record) => panic!("the runner must not finish while the open pends"),
         () = notify.notified() => {}
@@ -507,7 +507,7 @@ async fn a_resumed_run_reports_full_input_bytes_and_usage() {
     h.write_input("part-000.json", &file_of(&rows));
     let files = h.enumerate().await;
     let op = h.start(files, input_config(false), both_reports()).await;
-    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let record = h.claim("runner-1", STORE_LEASE).await;
 
     let notify = Arc::new(tokio::sync::Notify::new());
     let source = Arc::new(PendAfterSource {
@@ -518,8 +518,8 @@ async fn a_resumed_run_reports_full_input_bytes_and_usage() {
     });
     let mut cfg = config();
     cfg.batch_size = 5;
-    cfg.lease = Duration::from_millis(100);
-    let deps = h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink()));
+    let deps =
+        h.with_short_store_lease(h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink())));
     tokio::select! {
         _ = runner::run(&deps, record) => panic!("the runner must not finish while the reader pends"),
         () = notify.notified() => {}

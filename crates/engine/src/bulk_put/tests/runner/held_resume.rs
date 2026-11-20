@@ -17,10 +17,9 @@ fn rows_failing_at_one() -> Vec<String> {
     rows
 }
 
-fn runner_cfg(lease: Duration) -> RunnerConfig {
+fn runner_cfg() -> RunnerConfig {
     let mut cfg = config();
     cfg.batch_size = 5;
-    cfg.lease = lease;
     cfg
 }
 
@@ -98,7 +97,7 @@ async fn uninterrupted(output: Value, authorizer: Option<Arc<FakeAuthorizer>>) -
     let deps = deps_for(
         &h,
         "runner-1",
-        runner_cfg(Duration::from_secs(60)),
+        runner_cfg(),
         Arc::new(h.fs_source()),
         &authorizer,
         Arc::clone(&h.storage),
@@ -112,7 +111,7 @@ async fn uninterrupted(output: Value, authorizer: Option<Arc<FakeAuthorizer>>) -
 async fn crashed_mid_input(output: Value, authorizer: Option<Arc<FakeAuthorizer>>) -> Outcome {
     let h = Harness::new().await;
     let op = start_rows(&h, output).await;
-    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let record = h.claim("runner-1", STORE_LEASE).await;
     let notify = Arc::new(tokio::sync::Notify::new());
     let source = Arc::new(PendAfterSource {
         inner: h.fs_source(),
@@ -120,14 +119,14 @@ async fn crashed_mid_input(output: Value, authorizer: Option<Arc<FakeAuthorizer>
         handed: Arc::new(AtomicU64::new(0)),
         notify: Arc::clone(&notify),
     });
-    let deps = deps_for(
+    let deps = h.with_short_store_lease(deps_for(
         &h,
         "runner-1",
-        runner_cfg(Duration::from_millis(100)),
+        runner_cfg(),
         source,
         &authorizer,
         Arc::clone(&h.storage),
-    );
+    ));
     tokio::select! {
         _ = runner::run(&deps, record) => panic!("the runner must not finish while the reader pends"),
         () = notify.notified() => {}
@@ -142,7 +141,7 @@ async fn crashed_mid_input(output: Value, authorizer: Option<Arc<FakeAuthorizer>
     let deps = deps_for(
         &h,
         "runner-2",
-        runner_cfg(Duration::from_secs(60)),
+        runner_cfg(),
         Arc::new(h.fs_source()),
         &authorizer,
         Arc::clone(&h.storage),
@@ -156,18 +155,18 @@ async fn crashed_mid_input(output: Value, authorizer: Option<Arc<FakeAuthorizer>
 async fn crashed_before_finish(output: Value, authorizer: Option<Arc<FakeAuthorizer>>) -> Outcome {
     let h = Harness::new().await;
     let op = start_rows(&h, output).await;
-    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let record = h.claim("runner-1", STORE_LEASE).await;
     let notify = Arc::new(tokio::sync::Notify::new());
     let mut faulting = FaultingStorage::new(&h.storage);
     faulting.pend_finish = Some(Arc::clone(&notify));
-    let deps = deps_for(
+    let deps = h.with_short_store_lease(deps_for(
         &h,
         "runner-1",
-        runner_cfg(Duration::from_millis(100)),
+        runner_cfg(),
         Arc::new(h.fs_source()),
         &authorizer,
         Arc::new(faulting),
-    );
+    ));
     tokio::select! {
         _ = runner::run(&deps, record) => panic!("the runner must not finish while finish pends"),
         () = notify.notified() => {}
@@ -180,7 +179,7 @@ async fn crashed_before_finish(output: Value, authorizer: Option<Arc<FakeAuthori
     let deps = deps_for(
         &h,
         "runner-2",
-        runner_cfg(Duration::from_secs(60)),
+        runner_cfg(),
         Arc::new(h.fs_source()),
         &authorizer,
         Arc::clone(&h.storage),
@@ -249,7 +248,7 @@ async fn a_denied_report_write_held_before_a_crash_ends_as_without_the_crash() {
 async fn the_checkpoints_store_the_held_fault_beside_the_usage() {
     let h = Harness::new().await;
     let op = start_rows(&h, output_config(Some("absent-reports"), &["ERROR"])).await;
-    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let record = h.claim("runner-1", STORE_LEASE).await;
     let notify = Arc::new(tokio::sync::Notify::new());
     let source = Arc::new(PendAfterSource {
         inner: h.fs_source(),
@@ -257,12 +256,12 @@ async fn the_checkpoints_store_the_held_fault_beside_the_usage() {
         handed: Arc::new(AtomicU64::new(0)),
         notify: Arc::clone(&notify),
     });
-    let deps = h.deps_with(
+    let deps = h.with_short_store_lease(h.deps_with(
         "runner-1",
-        runner_cfg(Duration::from_millis(100)),
+        runner_cfg(),
         source,
         Arc::new(h.fs_sink()),
-    );
+    ));
     tokio::select! {
         _ = runner::run(&deps, record) => panic!("the runner must not finish while the reader pends"),
         () = notify.notified() => {}

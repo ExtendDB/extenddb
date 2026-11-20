@@ -8,6 +8,14 @@ mod tables;
 
 pub(crate) use postgres::{Backend, on_both_backends, postgres_configured, postgres_permit};
 
+/// The store's lease on an operation whose run a case stops part way: the
+/// case's first claim takes it, and `with_short_store_lease` has every
+/// checkpoint ask for it. The runner keeps the lease of `config()`, so a
+/// loaded host cannot run that lease out and stop the run before the point
+/// the case stops it at. The cases sleep 250 ms after the stop, longer
+/// than this lease, before a second owner claims.
+pub(crate) const STORE_LEASE: Duration = Duration::from_millis(100);
+
 /// A fresh directory acting as a configured import or export root.
 pub(crate) struct Root(pub(crate) PathBuf);
 
@@ -265,13 +273,13 @@ impl Harness {
         }
     }
 
-    /// `deps` with every checkpoint asking the store for a 100 ms lease, so
+    /// `deps` with every checkpoint asking the store for `STORE_LEASE`, so
     /// the operation is claimable soon after its run stops, while the
     /// runner's own lease, from `deps.config`, forces no renewal and no stop
     /// inside the test however slowly the host runs it.
     pub(crate) fn with_short_store_lease(&self, mut deps: RunnerDeps) -> RunnerDeps {
         let mut faulting = FaultingStorage::new(&deps.storage);
-        faulting.checkpoint_lease = Some(Duration::from_millis(100));
+        faulting.checkpoint_lease = Some(STORE_LEASE);
         deps.storage = Arc::new(faulting);
         deps
     }

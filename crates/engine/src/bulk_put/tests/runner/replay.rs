@@ -12,7 +12,7 @@ async fn a_replayed_failed_condition_row_reemits_the_record_without_evaluation()
     h.write_input("part-000.json", &file_of(&rows));
     let files = h.enumerate().await;
     let op = h.start(files, input_config(false), both_reports()).await;
-    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let record = h.claim("runner-1", STORE_LEASE).await;
 
     // The condition at row 10 fails against the seeded item; its marker
     // commits in its own transaction, then the runner dies before the
@@ -30,8 +30,8 @@ async fn a_replayed_failed_condition_row_reemits_the_record_without_evaluation()
     // soon as it is read and the crash lands between that commit and
     // the checkpoint that would cover it.
     cfg.write_batch_rows = 1;
-    cfg.lease = Duration::from_millis(100);
-    let deps = h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink()));
+    let deps =
+        h.with_short_store_lease(h.deps_with("runner-1", cfg, source, Arc::new(h.fs_sink())));
     tokio::select! {
         _ = runner::run(&deps, record) => panic!("the runner must not finish while the reader pends"),
         () = notify.notified() => {}
@@ -94,7 +94,7 @@ async fn a_storage_error_row_resumes_at_that_row_and_counts_it_once() {
     h.write_input("part-000.json", &file_of(&plain_rows(12)));
     let files = h.enumerate().await;
     let op = h.start(files, input_config(false), both_reports()).await;
-    let record = h.claim("runner-1", Duration::from_millis(100)).await;
+    let record = h.claim("runner-1", STORE_LEASE).await;
 
     // Row 7's write fails with a transient storage error. The batch it was
     // in does not commit, so the operation stays non-terminal at the last
@@ -105,8 +105,7 @@ async fn a_storage_error_row_resumes_at_that_row_and_counts_it_once() {
     faulting.fail_put_pk = Some("k7".to_owned());
     let mut cfg = config();
     cfg.batch_size = 5;
-    cfg.lease = Duration::from_millis(100);
-    let deps = h.deps_with_storage("runner-1", cfg, Arc::new(faulting));
+    let deps = h.with_short_store_lease(h.deps_with_storage("runner-1", cfg, Arc::new(faulting)));
     assert!(
         matches!(
             runner::run(&deps, record).await,
