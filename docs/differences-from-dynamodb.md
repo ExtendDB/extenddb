@@ -77,7 +77,7 @@ describes the behaviour in full; the differences are:
 | Operation limits | Service-defined quotas | Configurable `[limits]` keys (`max_bulk_input_bytes`, `max_bulk_input_files`, `max_bulk_item_count`, and the rest); the admin guide lists them. |
 | Operation record retention | Service-managed | `bulk_operation_retention_days` (default 30). A purged operation answers `ResourceNotFoundException`; report files are not deleted. |
 | Bulk operations on the MongoDB and Cassandra backends | n/a | Not supported: the four operations return `ValidationException`, `Bulk operations are not supported on this storage backend`. |
-| U+0000 in an attribute name or string value | Stored | The row fails as an item-level record with `One or more parameter values were invalid: Attribute names and string values may not contain U+0000`, and the load continues. PostgreSQL's `jsonb` cannot store the character. Binary values containing zero bytes are stored. |
+| U+0000 in an attribute name, a string value or a key value | Stored, and `GetItem` returns it (measured 2026-11-19) | SQLite: the same. PostgreSQL: the row fails as an item-level record with `One or more parameter values were invalid: Attribute names and string values may not contain U+0000`, and the load continues, because `jsonb` cannot store the character. SQLite and PostgreSQL store binary values that contain zero bytes. |
 | Manifest entry of a file being read when a cancel lands | `NOT_AVAILABLE` with no range | `PARTIALLY_PROCESSED` with the range of rows the operation counted. The runner checkpoints at row boundaries, so it knows the range. |
 
 ## Control Plane
