@@ -335,6 +335,37 @@ fn a_long_attribute_name_is_reported_ahead_of_a_missing_key_with_the_other_kind(
     }
 }
 
+/// A base key value fault reports the rule that fired, key by key in schema
+/// order: an empty string key gets the empty-value kind, whose record
+/// carries the image, and a key over its size limit gets the other kind,
+/// also when a later key is empty.
+#[test]
+fn a_base_key_value_fault_reports_the_rule_that_fired() {
+    let long = "k".repeat(2049);
+    let empty_text = "One or more parameter values are not valid. The AttributeValue for a key \
+                      attribute cannot contain an empty string value. Key: pk";
+    let size_text = "One or more parameter values were invalid: Size of hashkey has exceeded the \
+                     maximum size limit of2048 bytes";
+    let cases = [
+        ("", "b", empty_text, PutPayloadFault::KeyEmptyValue),
+        (long.as_str(), "b", size_text, PutPayloadFault::Other),
+        (long.as_str(), "", size_text, PutPayloadFault::Other),
+    ];
+    for (pk, sk, text, want) in cases {
+        let row = Row {
+            item: item(&[("pk", pk), ("sk", sk)]),
+            condition: None,
+            repeated_member_bytes: 0,
+        };
+        let case = format!("pk of {} bytes, sk {sk:?}", pk.len());
+        let Admission::Fault { message, kind } = admit_row(&row, &key_info(), &limits()) else {
+            panic!("{case}: the row must be refused");
+        };
+        assert_eq!(message, text, "{case}");
+        assert_eq!(kind, Some(want), "{case}");
+    }
+}
+
 // Skip-region fault routing.
 
 #[test]

@@ -66,23 +66,6 @@ impl PutPayloadError {
     }
 }
 
-/// The fault a primary-key value check reports: the empty-value rule is
-/// named so the bulk record can attach the submitted image to it, which the
-/// byte-size rule does not get. Both rules share one validator, so the rule
-/// is read from the message it produced; the bulk row test for the
-/// empty-string key asserts that message, so a reword of the
-/// validator fails there rather than silently dropping the image.
-fn key_fault(error: DynamoDbError) -> PutPayloadError {
-    if error.to_string().contains("cannot contain an empty") {
-        PutPayloadError {
-            kind: PutPayloadFault::KeyEmptyValue,
-            error,
-        }
-    } else {
-        PutPayloadError::other(error)
-    }
-}
-
 /// Resolve the condition fields of a put: `resolve_condition`, the
 /// unused-attribute check (skipped when a non-empty `Expected` supplies the
 /// condition, whose placeholders are merged rather than referenced), then
@@ -182,7 +165,16 @@ pub(crate) fn validate_put_payload(
             ),
         });
     }
-    validation::validate_key_sizes(item, &key_info.key_schema, limits).map_err(key_fault)?;
+    // Each key's empty-value rule, then its size rule, in schema order as
+    // `validate_key_sizes` runs them. The rule that fires names the kind.
+    for ks in &key_info.key_schema {
+        let key = std::slice::from_ref(ks);
+        validation::validate_key_not_empty(item, key).map_err(|error| PutPayloadError {
+            kind: PutPayloadFault::KeyEmptyValue,
+            error,
+        })?;
+        validation::validate_key_size_limits(item, key, limits).map_err(PutPayloadError::other)?;
+    }
     validation::validate_vector_write(
         item,
         &key_info.vector_indexes,
