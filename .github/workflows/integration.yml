@@ -87,10 +87,12 @@ jobs:
     # rather than "latest" because ubuntu-latest migrates to 26.04 in Oct–Nov
     # 2026 and this compiles Rust; move to 26 deliberately.
     runs-on: extenddb_ubuntu-2404_4-core
-    # With the backup store and job suites it ends with (3 min 3 s of it), the
-    # job took 39 min 49 s on #740's CI, at the old 40-minute bound. With the
-    # PartiQL wire tests it took 48 min 4 s on #411's CI, before #740. A run
-    # with both should take about 50 min; 70 leaves room for a slow runner.
+    # On #911's CI (run 42637473269) the three shards took 16 min 52 s to
+    # 18 min 14 s. Of that, 3 min 14 s to 3 min 32 s went to the backup store
+    # and job suites and their S3 mock, which run-integration-backup now runs
+    # once per run, so a shard should take 13 min 38 s to 14 min 44 s. 70 is
+    # the bound of the unsharded job (39 min 49 s on #740's CI, 48 min 4 s
+    # with the PartiQL wire tests on #411's) and leaves room for a slow runner.
     timeout-minutes: 70
     needs: build-postgres
     # Three shards by test file (devtools/test-shards); the integration job
@@ -245,34 +247,6 @@ jobs:
           EXTENDDB_TEST_BACKUP_STORE: filesystem
         run: devtools/run-tests --extenddb --pytest --comprehensive --terraform --parallel
 
-      # moto for the job suite's store-outage cell, the one cell that
-      # exercises `spool_path` on PostgreSQL (an S3 download into the spool,
-      # the retry under a cut, the spool entry removed); without the endpoint
-      # the cell skips. Same environment as the s3 job's.
-      - name: Start S3 mock
-        run: |
-          python3 -m venv "$RUNNER_TEMP/moto"
-          "$RUNNER_TEMP/moto/bin/pip" install -r requirements-moto.txt
-          nohup "$RUNNER_TEMP/moto/bin/moto_server" -p 9000 > moto.log 2>&1 &
-          for _ in $(seq 1 30); do
-            if curl -sf http://127.0.0.1:9000/ > /dev/null; then exit 0; fi
-            sleep 1
-          done
-          echo "moto_server did not start"; cat moto.log; exit 1
-
-      # The backup store and job suites start servers of their own, so they
-      # are excluded from run-tests' line and run by name.
-      - name: Run the backup store and job suites
-        env:
-          EXTENDDB_TEST_PG_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
-          EXTENDDB_TEST_PG_ADMIN_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
-          EXTENDDB_TEST_S3_ENDPOINT: http://127.0.0.1:9000
-        run: python3 -m pytest tests/test_backup_store_config.py tests/test_backup_job.py -v -rP -p no:cacheprovider
-
-      - name: Print the S3 mock's log
-        if: failure()
-        run: cat moto.log || true
-
       # run-tests restarts the server daemonized to apply the import/export
       # config, and a daemonized server logs to syslog, not the job log. Without
       # this dump, the storage error behind a client-visible 500 leaves no
@@ -292,12 +266,93 @@ jobs:
           # A re-run of a failed job uploads the same name again.
           overwrite: true
 
+  # The backup store and job suites on the PostgreSQL build, by name, once
+  # per run. Both start servers of their own (the store configuration suite
+  # on a catalog database it creates per test, the job suite on deployments
+  # of its own), so they need the binary, the PostgreSQL service and moto,
+  # not the shards' server. run-tests' main suite excludes them. Its CLI
+  # lifecycle list still runs the store configuration suite's PostgreSQL
+  # cells on one shard, without moto. run-integration-sqlite-s3 runs the two
+  # files on the SQLite build.
+  run-integration-backup:
+    runs-on: extenddb_ubuntu-2404_4-core
+    # On each shard of #911's CI (run 42637473269) the suites took 2 min 52 s
+    # to 3 min 8 s and the S3 mock 22 to 28 s. With about 30 s of job setup,
+    # the PostgreSQL container's start, checkout, download and pip install,
+    # the job should take about 4 min. 15 leaves room for a slow runner.
+    timeout-minutes: 15
+    needs: build-postgres
+    services:
+      postgres:
+        # The shards' image, so the suites' servers run against the same
+        # PostgreSQL.
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: devpass
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 127.0.0.1:5432:5432
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: extenddb-postgres
+          path: target/release
+
+      # Artifacts do not keep file modes.
+      - run: chmod +x target/release/extenddb
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # moto for the job suite's store-outage cell, the one cell that
+      # exercises `spool_path` on PostgreSQL (an S3 download into the spool,
+      # the retry under a cut, the spool entry removed); without the endpoint
+      # the cell skips. Same environment as the s3 job's.
+      - name: Start S3 mock
+        run: |
+          python3 -m venv "$RUNNER_TEMP/moto"
+          "$RUNNER_TEMP/moto/bin/pip" install -r requirements-moto.txt
+          nohup "$RUNNER_TEMP/moto/bin/moto_server" -p 9000 > moto.log 2>&1 &
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:9000/ > /dev/null; then exit 0; fi
+            sleep 1
+          done
+          echo "moto_server did not start"; cat moto.log; exit 1
+
+      - name: Run the backup store and job suites
+        env:
+          EXTENDDB_TEST_PG_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
+          EXTENDDB_TEST_PG_ADMIN_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
+          EXTENDDB_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+        run: python3 -m pytest tests/test_backup_store_config.py tests/test_backup_job.py -v -rP -p no:cacheprovider
+
+      # The suites' servers run in the foreground and log to files the cells
+      # quote in their assertions, so there is no syslog to dump here.
+      - name: Print the S3 mock's log
+        if: failure()
+        run: cat moto.log || true
+
   run-integration-sqlite:
     runs-on: extenddb_ubuntu-2404_4-core
-    # With the backup store and job suites it ends with (4 min 16 s of it), the
-    # job took 40 min 31 s on #740's CI, past the old 40-minute bound. With the
-    # PartiQL wire tests it took 43 min 27 s on #411's CI, before #740. 60
-    # leaves room for both and a slow runner.
+    # On #911's CI (run 42637473269) the three shards took 20 min 6 s to
+    # 21 min 52 s. Of that, 4 min 28 s to 4 min 30 s went to the backup store
+    # and job suites run by name, 2 min 45 s to 2 min 46 s to run-tests' run
+    # of the store configuration suite, and 25 to 28 s to the S3 mock it
+    # used. The shards now run neither file (run-integration-sqlite-s3 runs
+    # both), so a shard should take 12 min 26 s to 14 min 7 s. 60 is the
+    # bound of the unsharded job (40 min 31 s on #740's CI, 43 min 27 s with
+    # the PartiQL wire tests on #411's) and leaves room for a slow runner.
     timeout-minutes: 60
     needs: build-sqlite
     strategy:
@@ -389,25 +444,9 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      # Local S3 endpoint for tests/test_backup_store_config.py's S3 cells
-      # (an S3 store's /health against an endpoint that refuses, stalls and
-      # recovers), which devtools/run-tests runs on a SQLite build after the
-      # main suite. Same moto as the unit-test workflow, pinned in
-      # requirements-moto.txt, installed into a virtualenv of its own: its
-      # boto3 and botocore pins differ from requirements.txt's, and the
-      # suite keeps running on the environment installed above. On port
-      # 9200, clear of the server's.
-      - name: Start S3 mock
-        run: |
-          python -m venv "$RUNNER_TEMP/moto-venv"
-          "$RUNNER_TEMP/moto-venv/bin/pip" install -r requirements-moto.txt
-          nohup "$RUNNER_TEMP/moto-venv/bin/moto_server" -p 9200 > moto.log 2>&1 &
-          for _ in $(seq 1 30); do
-            if curl -sf http://127.0.0.1:9200/ > /dev/null; then exit 0; fi
-            sleep 1
-          done
-          echo "moto_server did not start"; cat moto.log; exit 1
-
+      # No S3 mock here: its one reader on a shard was run-tests' run of
+      # tests/test_backup_store_config.py, which a sharded run skips.
+      # run-integration-sqlite-s3 runs that file with its own S3 mock.
       - name: Install Terraform (pinned version, checksum asserted)
         run: echo "TERRAFORM=$(tests/terraform/install-terraform.sh "$RUNNER_TEMP/terraform")" >> "$GITHUB_ENV"
 
@@ -416,26 +455,16 @@ jobs:
           EXTENDDB_TEST_ENDPOINT: https://127.0.0.1:18443
           EXTENDDB_ADMIN_USER: admin
           EXTENDDB_ADMIN_PASSWORD: ${{ steps.init.outputs.admin_password }}
-          # The backup store wire tests' S3 cells; the file sets the AWS_*
-          # variables for the servers it starts, so none leaks here.
-          EXTENDDB_TEST_S3_ENDPOINT: http://127.0.0.1:9200
           # A file-backed SQLite server without [backup.store] writes to the
           # defaulted root beside the database file.
           EXTENDDB_TEST_BACKUP_STORE: filesystem
         run: devtools/run-tests --extenddb --pytest --comprehensive --terraform --parallel
-
-      - name: Run the backup store and job suites
-        run: python3 -m pytest tests/test_backup_store_config.py tests/test_backup_job.py -v -rP -p no:cacheprovider
 
       # Same rationale as the postgres job: the daemonized server logs to
       # syslog, so this dump is the only server-side evidence on failure.
       - name: Dump server syslog on failure
         if: failure()
         run: sudo journalctl -t extenddb --no-pager -n 500 || true
-
-      - name: Print the S3 mock's log
-        if: failure()
-        run: cat moto.log || true
 
       # The integration job checks these lists.
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
@@ -454,10 +483,11 @@ jobs:
   # confirms the server's store is the S3 one; the store configuration
   # suite's S3 cells need the same endpoint. The job suite
   # (tests/test_backup_job.py) starts servers of its own: most of its cells
-  # on the SQLite build's defaulted filesystem root, as on the SQLite job,
-  # and the store-outage cell on an S3 store at the moto endpoint, which it
-  # cuts mid-download and restores, so this job runs one restore from an S3
-  # store.
+  # on the SQLite build's defaulted filesystem root, and the store-outage
+  # cell on an S3 store at the moto endpoint, which it cuts mid-download and
+  # restores, so this job runs one restore from an S3 store. The SQLite
+  # shards run neither file, so this job is where the SQLite build runs
+  # them. The PostgreSQL build runs them in run-integration-backup.
   run-integration-sqlite-s3:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40
@@ -973,6 +1003,7 @@ jobs:
     needs:
       [
         run-integration,
+        run-integration-backup,
         run-integration-sqlite,
         run-integration-sqlite-s3,
         run-integration-dev-mode,
@@ -985,6 +1016,7 @@ jobs:
     steps:
       - run: |
           if [ "${{ needs.run-integration.result }}" != "success" ] || \
+             [ "${{ needs.run-integration-backup.result }}" != "success" ] || \
              [ "${{ needs.run-integration-sqlite.result }}" != "success" ] || \
              [ "${{ needs.run-integration-sqlite-s3.result }}" != "success" ] || \
              [ "${{ needs.run-integration-dev-mode.result }}" != "success" ] || \
