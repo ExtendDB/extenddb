@@ -424,7 +424,7 @@ The PostgreSQL backend uses two categories of tables:
   0x00 and is a different key from the six-character text `\u0000`).
   PostgreSQL `TEXT` rejects the byte and `jsonb` rejects the `\u0000` escape,
   so every string that reaches a key column or an `item_data`, `gsi_pending`,
-  `stream_records`, or `backup_items` document goes through the escape in
+  `stream_pending`, `stream_records`, or `backup_items` document goes through the escape in
   `extenddb_storage::util::escape_control`: U+0000 is stored as U+0001 U+0001
   and U+0001 as U+0001 U+0002; every other character is unchanged, so ordinary
   data is stored exactly as before. The mapping preserves UTF-8 byte order and
