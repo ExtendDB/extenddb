@@ -8,7 +8,8 @@
 //! one request runs them inside [`scope`], and the backend measures the
 //! deadline from the instant the scope carries, so the calls share one
 //! deadline instead of each getting a deadline of its own. `BatchWriteItem`
-//! does this for its write requests. Outside a scope [`started`] is `None`
+//! does this for its write requests, and `BatchExecuteStatement` for its
+//! statements. Outside a scope [`started`] is `None`
 //! and the backend measures from the start of each call, which is what a
 //! single-item request and a background worker get.
 

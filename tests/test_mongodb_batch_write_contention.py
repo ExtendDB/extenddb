@@ -1,7 +1,7 @@
 # Copyright 2026 ExtendDB contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""BatchWriteItem on the MongoDB backend when one of its items stays contended.
+"""BatchWriteItem and BatchExecuteStatement on the MongoDB backend when their items stay contended.
 
 A mongosh session holds an item inside a MongoDB transaction it does not
 commit, so every attempt of a write to that item conflicts until the session
@@ -205,3 +205,42 @@ def test_the_requests_of_a_batch_share_one_contention_deadline(
     assert elapsed < DEADLINE + SLACK, f"the batch answered in {elapsed:.2f} s"
     assert _w(dynamodb_client, gsi_table, b1) == "v1"
     assert _w(dynamodb_client, gsi_table, b2) == "v0"
+
+
+def test_the_statements_of_a_batch_execute_statement_share_one_contention_deadline(
+    dynamodb_client, endpoint_url, mongodb_container, gsi_table
+):
+    """A BatchExecuteStatement whose items are all held answers within one deadline.
+
+    Three UPDATE statements name three items, each held past the deadline. The
+    first statement gives up when the deadline passes, and the other two give
+    up after one attempt each, because the deadline is measured from the start
+    of the batch. A deadline per statement would keep the batch open until the
+    holds end and let the later statements commit.
+    """
+    pks = [f"s{i}-{uuid.uuid4().hex[:8]}" for i in range(3)]
+    for pk in pks:
+        dynamodb_client.put_item(TableName=gsi_table, Item=_item(pk, "v0"))
+    client = _client(endpoint_url, retries=False)
+
+    # The three holds start one after another, so each lasts 5 s longer than
+    # HOLD to be sure the first is still held when the deadline passes.
+    holds = [Hold(mongodb_container, gsi_table, pk, HOLD + 5) for pk in pks]
+    started = time.monotonic()
+    resp = client.batch_execute_statement(
+        Statements=[
+            {
+                "Statement": f'UPDATE "{gsi_table}" SET w = ? WHERE pk = ?',
+                "Parameters": [{"S": "v1"}, {"S": pk}],
+            }
+            for pk in pks
+        ]
+    )
+    elapsed = time.monotonic() - started
+    for hold in holds:
+        hold.wait()
+
+    print(f"the batch answered in {elapsed:.2f} s: {resp['Responses']}")
+    assert elapsed < DEADLINE + SLACK, f"the batch answered in {elapsed:.2f} s"
+    assert all("Error" in r for r in resp["Responses"]), resp["Responses"]
+    assert [_w(dynamodb_client, gsi_table, pk) for pk in pks] == ["v0"] * 3

@@ -122,7 +122,12 @@ impl PartiqlExecutor for OperationContext {
     }
 
     async fn batch_execute_statement(&self, body: Value) -> Result<DispatchResult, DynamoDbError> {
-        batch::run(&translation_context(self), &body).await
+        // One contention deadline for the batch's statements: see `request_clock`.
+        extenddb_storage::request_clock::scope(
+            std::time::Instant::now(),
+            batch::run(&translation_context(self), &body),
+        )
+        .await
     }
 
     async fn execute_transaction(&self, body: Value) -> Result<DispatchResult, DynamoDbError> {
