@@ -7,7 +7,7 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::types::{
     ListTagsOfResourceInput, ListTagsOfResourceOutput, TagResourceInput, UntagResourceInput,
 };
-use extenddb_core::validation::{validate_tag_keys, validate_tags};
+use extenddb_core::validation::{validate_folded_tag_prefix, validate_tag_keys, validate_tags};
 use serde_json::Value;
 
 use crate::OperationContext;
@@ -109,15 +109,17 @@ fn extract_table_name_from_arn(arn: &str) -> Option<&str> {
 ///
 /// The two halves are called separately by the tag-writing handlers, because
 /// tag keys and values are checked between them: a request carrying an invalid
-/// tag key is refused for the tag on a cross-region ARN and on an ARN naming no
-/// existing table, and denied on a cross-account ARN (measured).
+/// tag key is refused for the tag on a cross-region table ARN and on an ARN
+/// naming no existing table, and denied on a cross-account ARN (measured). A
+/// stream ARN with another partition, service or region is refused in the
+/// first half, before the tags (measured 2026-11-20).
 async fn validate_resource_arn(arn: &str, ctx: &OperationContext) -> Result<(), DynamoDbError> {
     validate_arn_shape_and_account(arn, ctx)?;
     validate_arn_region_and_table(arn, ctx).await
 }
 
 /// First half of [`validate_resource_arn`]: the ARN prefix, its resource kind,
-/// and the account.
+/// the account, and the deployment scope of a stream ARN.
 fn validate_arn_shape_and_account(arn: &str, ctx: &OperationContext) -> Result<(), DynamoDbError> {
     if !arn.starts_with("arn:") {
         return Err(DynamoDbError::ValidationException(format!(
@@ -170,6 +172,12 @@ fn validate_arn_shape_and_account(arn: &str, ctx: &OperationContext) -> Result<(
         return Err(DynamoDbError::AccessDeniedException(
             "Access is denied".to_owned(),
         ));
+    }
+
+    if tag_subresource_is_stream(resource)
+        && let Some(err) = deployment_scope_error(&fields, arn, &ctx.region)
+    {
+        return Err(err);
     }
 
     Ok(())
@@ -237,6 +245,7 @@ pub async fn handle_tag_resource(
     validate_arn_shape_and_account(&input.resource_arn, ctx)?;
     validate_tags(&input.tags)?;
     validate_arn_region_and_table(&input.resource_arn, ctx).await?;
+    validate_folded_tag_prefix(&input.tags)?;
 
     ctx.storage
         .tag_resource(&input.resource_arn, &input.tags)

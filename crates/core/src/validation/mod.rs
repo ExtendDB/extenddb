@@ -10,7 +10,10 @@ pub use restorable_item::{
     RestorableItemError, RestorableItemReason, RestorableKeySchema, RestorableLimits,
     SHOWN_VALUE_BYTES, validate_restorable_item,
 };
-pub use tag::{validate_tag_key, validate_tag_keys, validate_tag_value, validate_tags};
+pub use tag::{
+    validate_folded_tag_prefix, validate_tag_key, validate_tag_keys, validate_tag_value,
+    validate_tags,
+};
 pub use vector_item::{
     MAX_HASH_KEY_SIZE, MAX_INLINE_FILTER_SIZE, validate_vector_write,
     validate_vector_write_changed, vector_components, vector_norm,
