@@ -14,9 +14,17 @@ use super::*;
 /// A conditional row keyed `k{i}` whose condition passes against an empty
 /// table, so the row takes the marked write path and its outcome lands in
 /// the row-outcome ledger. A distinct key per row keeps every row writable.
-fn marked_row(i: usize) -> String {
+/// Above one, `units` pads the item to that many write units (1 KB each,
+/// rounded up).
+fn marked_row(i: usize, units: usize) -> String {
+    let pad = if units > 1 {
+        let filler = "p".repeat((units - 1) * 1024 + 512);
+        format!(", \"pad\": {{\"S\": \"{filler}\"}}")
+    } else {
+        String::new()
+    };
     format!(
-        "{{\"Item\": {{\"pk\": {{\"S\": \"k{i}\"}}, \"sk\": {{\"S\": \"s\"}}, \"v\": {{\"N\": \"{i}\"}}}}, \
+        "{{\"Item\": {{\"pk\": {{\"S\": \"k{i}\"}}, \"sk\": {{\"S\": \"s\"}}, \"v\": {{\"N\": \"{i}\"}}{pad}}}, \
          \"ConditionExpression\": \"attribute_not_exists(pk)\"}}"
     )
 }
@@ -53,18 +61,18 @@ async fn crash_after(h: &Harness, after: u64, checkpoint_rows: usize) {
 /// Rows an earlier incarnation already wrote are found in the ledger on
 /// resume and are not sent again, so they take no write units.
 /// Runner-1 checkpoints at row 10 and dies with rows 10 to 12 written under
-/// their markers. The resume accounts for those three from the ledger and
-/// writes rows 13 and 14, so a bucket of ten units ends with two spent:
-/// eight left. Were the three charged, five would be left. Refill between
-/// the acquires adds at most ten units per second of the resume's wall
-/// time, so the balance is read as settled and the refill bound is taken
-/// from the measured duration; a host too slow to keep the two outcomes
-/// apart fails the precondition rather than passing by refill.
+/// their markers. Each of those three rows is three units. The resume
+/// accounts for them from the ledger and writes rows 13 and 14, one unit
+/// each, from a full bucket of two units. Two units never put the bucket in
+/// deficit, while one of the three-unit rows charged again would ask for a
+/// wait at its acquire. The refill between acquires only adds units, so
+/// neither outcome depends on how fast the host runs the resume.
 #[tokio::test]
 async fn rows_found_in_the_ledger_on_resume_take_no_write_units() {
     let h = Harness::new().await;
     let mut rows = plain_rows(10);
-    rows.extend((10..15).map(marked_row));
+    rows.extend((10..13).map(|i| marked_row(i, 3)));
+    rows.extend((13..15).map(|i| marked_row(i, 1)));
     h.write_input("part-000.json", &file_of(&rows));
     let files = h.enumerate().await;
     let op = h.start(files, input_config(false), both_reports()).await;
@@ -83,17 +91,14 @@ async fn rows_found_in_the_ledger_on_resume_take_no_write_units() {
         );
     }
 
-    let rate = 10;
-    let pacer = Arc::new(WritePacer::new(rate));
+    let pacer = Arc::new(WritePacer::new(2));
     let record = h.claim("runner-2", Duration::from_secs(60)).await;
     let mut cfg = config();
     cfg.batch_size = 5;
     cfg.write_batch_rows = 1;
     let mut deps = h.deps("runner-2", cfg);
     deps.pacer = Arc::clone(&pacer);
-    let started = std::time::Instant::now();
     runner::run(&deps, record).await.expect("resumed run");
-    let elapsed = started.elapsed();
 
     let record = h.record(&op).await;
     assert_eq!(record.status, "COMPLETED");
@@ -102,22 +107,13 @@ async fn rows_found_in_the_ledger_on_resume_take_no_write_units() {
     assert_eq!(
         pacer.waited(),
         Duration::ZERO,
-        "five one-unit rows never put a ten-unit bucket in deficit"
-    );
-    // Refill over the whole resume bounds what the bucket could have gained
-    // between its first and last acquire. Under 0.2 s that is under two
-    // units, which keeps "eight plus refill" apart from "five plus refill".
-    let refill_bound = elapsed.as_secs_f64() * rate as f64;
-    assert!(
-        refill_bound < 2.0,
-        "the resume took {elapsed:?}; too slow to tell the refund apart from refill"
+        "the resume takes no units for the three replayed rows: one of them \
+         would put the two-unit bucket in deficit"
     );
     let left = pacer.settled_tokens();
     assert!(
-        (8.0..8.0 + refill_bound).contains(&left) || left == 8.0,
-        "the resume is charged for the two rows it wrote, not the three it \
-         replayed: eight units of ten remain (plus at most {refill_bound:.2} of \
-         refill), got {left}"
+        (0.0..=1.0).contains(&left),
+        "rows 13 and 14 take their units: at most one of two remains, got {left}"
     );
 }
 

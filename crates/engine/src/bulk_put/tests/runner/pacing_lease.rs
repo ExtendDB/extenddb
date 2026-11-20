@@ -7,10 +7,14 @@ use super::lease_keeper::{Wait, WaitSource};
 
 // Write pacing. Each row's write units (1 KB rounded up, so one per test
 // row) come out of the process bucket and the operation bucket right before
-// the write. A bucket holds one second of capacity and starts full, so a
-// run of 30 one-unit rows against a 20-per-second bucket pays 10 units of
-// deficit: half a second of sleep. Lower bounds only; an upper bound on wall
-// time is not asserted.
+// the write. A bucket holds one second of capacity and starts full. With
+// the default write batch of 25 rows, a run of 30 one-unit rows takes 25
+// units from a full 20-per-second bucket at its first batch, which asks
+// for 250 ms of sleep whatever the host's speed. The refill during the
+// first batch's writes pays part of the second batch's 5 units, so its
+// sleep depends on the host, but the sleep and those writes together take
+// at least the 250 ms that the 5 units are worth. Lower bounds only; an
+// upper bound on wall time is not asserted.
 
 #[tokio::test]
 async fn the_process_pacer_bounds_plain_row_writes() {
@@ -30,11 +34,15 @@ async fn the_process_pacer_bounds_plain_row_writes() {
     assert_eq!(record.status, "COMPLETED");
     assert_eq!(h.count_items().await, 30);
     assert!(
-        pacer.waited() >= Duration::from_millis(400),
-        "30 units against a 20/s bucket wait about 500 ms, waited {:?}",
+        pacer.waited() >= Duration::from_millis(250),
+        "the first batch's 25 units against a full 20/s bucket wait 250 ms, waited {:?}",
         pacer.waited()
     );
-    assert!(before.elapsed() >= Duration::from_millis(400));
+    assert!(
+        before.elapsed() >= Duration::from_millis(500),
+        "30 units against a 20/s bucket take 500 ms past its capacity, took {:?}",
+        before.elapsed()
+    );
 }
 
 #[tokio::test]
@@ -64,7 +72,7 @@ async fn the_process_pacer_bounds_conditional_row_writes_too() {
     assert_eq!(record.status, "COMPLETED");
     assert_eq!(h.count_items().await, 30);
     assert!(
-        pacer.waited() >= Duration::from_millis(400),
+        pacer.waited() >= Duration::from_millis(250),
         "conditional writes are paced like plain ones, waited {:?}",
         pacer.waited()
     );
