@@ -2110,7 +2110,6 @@ dependencies = [
  "extenddb-engine",
  "extenddb-storage",
  "extenddb-storage-sqlite",
- "futures",
  "js-sys",
  "serde_json",
  "tokio",

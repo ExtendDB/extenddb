@@ -36,7 +36,6 @@ extenddb-storage = { workspace = true }
 # changes `SqliteConfig::default().path`, and would unify across the whole
 # workspace; this crate opens `:memory:` explicitly through `new_in_memory`.
 extenddb-storage-sqlite = { workspace = true }
-futures = { workspace = true }
 serde_json = { workspace = true }
 
 # The JS <-> wasm boundary. Only the browser build needs it, so it is
