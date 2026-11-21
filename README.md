@@ -342,8 +342,8 @@ that names the build:
   `DeleteBackup`, `RestoreTableFromBackup` — "… it does not include the backup
   subsystem." The engine's backup subsystem does not build for `wasm32`, so the
   engine refuses these four there, after the body parse: a malformed body gets
-  `SerializationException`, as on a server. Natively, the same build of the
-  adapter runs the engine's backup handlers, and with no backup store
+  `SerializationException`, as on a server. Built natively, the adapter runs
+  the engine's backup handlers instead, and with no backup store
   `CreateBackup` backs a table up in the catalog, as a server without one does.
 - The PartiQL operations — `ExecuteStatement`, `BatchExecuteStatement`,
   `ExecuteTransaction` — "… the PartiQL surface is not part of the browser build."
