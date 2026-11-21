@@ -19,7 +19,9 @@
 //! outcome `sqlx` gives and the outcome the shim gives; each stands for an
 //! entry of the "Documented differences" list in the shim's module
 //! documentation. The test fails if a difference row's two outcomes are equal,
-//! or if the number of difference rows is not [`DIFFERENCE_ROWS`].
+//! if the number of difference rows is not [`DIFFERENCE_ROWS`], or if the
+//! number of rows whose outcome it compared is not the number of rows of the
+//! table.
 //!
 //! Natively the pool's acquire timeout is cut from `sqlx`'s 30 s default to
 //! 50 ms, so the rows that find the connection checked out return
@@ -862,9 +864,9 @@ fn cases() -> Vec<Case> {
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn each_row_gives_its_expected_outcome() {
     let cases = cases();
-    let total = cases.len();
     let mut failures = Vec::new();
     let mut differences = 0;
+    let mut compared = 0;
     for case in cases {
         let named = case.name.starts_with("difference: ");
         differences += usize::from(named);
@@ -884,6 +886,7 @@ async fn each_row_gives_its_expected_outcome() {
             Ok(outcome) => outcome,
             Err(e) => format!("setup failed: {}", render::<()>(Err(e))),
         };
+        compared += 1;
         if actual != expected {
             failures.push(format!(
                 "{}\n    expected: {expected}\n    actual:   {actual}",
@@ -891,6 +894,13 @@ async fn each_row_gives_its_expected_outcome() {
             ));
         }
     }
+    // Counted against a fresh table from `cases()`, so that a filter on the
+    // rows above fails here rather than passing with fewer rows.
+    let total = crate::cases().len();
+    assert_eq!(
+        compared, total,
+        "the rows whose outcome was compared, against the rows of the table"
+    );
     assert!(
         failures.is_empty(),
         "{} of {total} rows fail:\n{}",
