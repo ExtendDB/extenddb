@@ -27,7 +27,10 @@
 //!   refusal comes before the engine is reached, whether or not the engine was
 //!   built with its `partiql` feature: a workspace build turns it on for the
 //!   server, and a build of this crate alone leaves it off); and
-//!   `DescribeEndpoints`, as the build has no network address to report.
+//!   `DescribeEndpoints`, as the build has no network address to report. Both
+//!   refusals go by the operation name alone, before the body is parsed, so a
+//!   body that is not JSON gets them too, where the server answers
+//!   `SerializationException`.
 //! - **Refused as the server refuses them**: every
 //!   `RestoreTableToPointInTime`, and an `UpdateContinuousBackups` that enables
 //!   point-in-time recovery, through `extenddb_engine::parse_request` and
@@ -69,11 +72,13 @@
 //! (`handle_request` in `crates/server/src/handler.rs`) and its authorization
 //! (`authorize_request` in `crates/server/src/request_helpers.rs`) check it.
 //! Of the server's checks, [`Engine::dispatch`] runs only the two the engine
-//! owns, `extenddb_engine::parse_request` and `ParsedRequest::admit`. A
-//! request one of the others would refuse gets the answer this build gives
-//! it anyway: the engine handler's for the operation, or one of the refusals
-//! above. The README section "Checks the server makes that this build does
-//! not" describes the others, with the server's answer and this build's.
+//! owns, `extenddb_engine::parse_request` and `ParsedRequest::admit`, and runs
+//! neither for the `PartiQL` operations and `DescribeEndpoints`, which it
+//! refuses first. A request one of the others would refuse gets the answer
+//! this build gives it anyway: the engine handler's for the operation, or one
+//! of the refusals above. The README section "Checks the server makes that
+//! this build does not" describes the others, with the server's answer and
+//! this build's.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

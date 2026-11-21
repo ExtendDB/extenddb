@@ -366,8 +366,16 @@ that names the build:
   without one does.
 - The PartiQL operations — `ExecuteStatement`, `BatchExecuteStatement`,
   `ExecuteTransaction` — "… the PartiQL surface is not part of the browser build."
+  This build refuses them by name, before it parses the body, so every body
+  gets the refusal: a body that is not JSON, which a server answers with
+  `SerializationException` "Start of structure or map found where not
+  expected: …", and a JSON body the handler would refuse, such as an
+  `ExecuteStatement` with no `Statement` (on a server, "1 validation error
+  detected: Value null at 'statement' failed to satisfy constraint: Member
+  must not be null").
 - `DescribeEndpoints` — "… it is called in-process and has no network endpoint
-  to report."
+  to report." It is refused by name too, so a body that is not JSON gets the
+  refusal, where a server answers `SerializationException`.
 - An `UpdateTable` that creates a vector index — "… it cannot build a vector
   index; create the table with its vector indexes instead." The SQLite backend
   refuses it after the engine has validated the request, so a request for a
@@ -407,10 +415,12 @@ Before the HTTP server passes a request to the engine, its request handler
 (`handle_request` in `crates/server/src/handler.rs`) and its authorization
 (`authorize_request` in `crates/server/src/request_helpers.rs`) check it. Both
 builds run the checks the engine owns, `parse_request` and
-`ParsedRequest::admit` in `crates/engine/src/pre_dispatch.rs`. This build makes
-none of the server's other checks: it passes the request to the engine's
-handler for the operation, so where a check below refuses a request, this
-build answers what the handler answers, and the two answers can differ.
+`ParsedRequest::admit` in `crates/engine/src/pre_dispatch.rs`, except that
+this build refuses the PartiQL operations and `DescribeEndpoints` before them,
+whatever the body (see "What it refuses"). This build makes none of the
+server's other checks: it passes the request to the engine's handler for the
+operation, so where a check below refuses a request, this build answers what
+the handler answers, and the two answers can differ.
 
 The server makes the checks in the table for every caller, in developer mode
 too, except the IAM decision of **signature**, which it makes only outside
