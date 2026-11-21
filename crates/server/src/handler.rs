@@ -90,9 +90,10 @@ pub(crate) async fn handle_request(
     // and a malformed request gets 400 regardless of auth state. The engine
     // owns these two checks and their order (`extenddb_engine::parse_request`
     // here, `ParsedRequest::admit` after authentication), and the WebAssembly
-    // adapter calls them too. Every other check this function and
-    // `authorize_request` make before dispatch is the server's own, and the
-    // adapter makes none of them.
+    // adapter calls them too, for every operation except the four it refuses
+    // before them (the three PartiQL operations and DescribeEndpoints). Every
+    // other check this function and `authorize_request` make before dispatch
+    // is the server's own, and the adapter makes none of them.
     let request = match extenddb_engine::parse_request(&operation, &body) {
         Ok(request) => request,
         Err(e) => return error_response(&e, &request_id),
