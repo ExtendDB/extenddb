@@ -713,6 +713,28 @@ class TestAuthErrors:
             "message": "Request is missing Authentication Token",
         }
         assert resp.headers["X-Amz-Crc32"] == "2088342776"
+
+    # DynamoDB answers each of these requests with no X-Amz-Target, or one
+    # that is not text, with HTTP 400 and the body below, whose X-Amz-Crc32 is
+    # 1368724161 (measured 2026-11-21).
+    @pytest.mark.parametrize("query,headers,body", [
+        ("", {}, b'{"Limit": 1}'),
+        ("", {}, b"not json"),
+        ("?X-Amz-Algorithm=AWS4-HMAC-SHA256", {}, b'{"Limit": 1}'),
+        ("", {"X-Amz-Target": b"\xff"}, b'{"Limit": 1}'),
+        ("", {"Authorization": "Bearer abc"}, b'{"Limit": 1}'),
+    ])
+    def test_missing_target(self, query, headers, body):
+        resp = requests.post(
+            self.endpoint + query,
+            headers={"Content-Type": "application/x-amz-json-1.0", **headers},
+            data=body,
+            timeout=30,
+            verify=not self.endpoint.startswith("https://"),
+        )
+        assert resp.status_code == 400, resp.text
+        assert resp.json() == {"__type": "com.amazon.coral.service#UnknownOperationException"}
+        assert resp.headers["X-Amz-Crc32"] == "1368724161"
 # ---------------------------------------------------------------------------
 # Mode 1 Backward Compatibility
 # ---------------------------------------------------------------------------

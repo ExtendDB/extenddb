@@ -65,10 +65,6 @@ async fn empty_body() {
 
 #[tokio::test]
 async fn missing_target_header() {
-    // Real DynamoDB requires SigV4 auth on all requests.
-    if is_real_dynamodb() {
-        return;
-    }
     let c = http_client();
     let resp = c
         .post(endpoint())
@@ -79,7 +75,7 @@ async fn missing_target_header() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 400);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("Missing"), "body: {body}");
+    assert!(body.contains("UnknownOperationException"), "body: {body}");
 }
 
 #[tokio::test]
