@@ -140,8 +140,7 @@ impl AuthProvider for BuiltinAuthProvider {
             .map_or(&b""[..], |value| value.as_bytes());
 
         // Parse Authorization header
-        let has_date = headers.contains_key("x-amz-date") || headers.contains_key("date");
-        let parsed = sigv4::parse::parse_authorization(auth_header, has_date)?;
+        let has_date = sigv4::verify::request_date(headers).is_some();
 
         // The service checks the request timestamp, then the credential
         // scope, then looks the key up (measured 2026-10-23: an unknown key
@@ -152,12 +151,17 @@ impl AuthProvider for BuiltinAuthProvider {
         // Neither check reads the stored credential, so running them first
         // leaves the S-5 timing argument below unchanged.
         //
-        // Validate timestamp (within 15 minutes). The X-Amz-Date value it
+        // The parse runs the timestamp check (within 15 minutes) after the
+        // missing parameters and before the algorithm and the credential,
+        // as the service does (measured 2026-11-21). The request date it
         // returns is what the scope date is compared against.
-        let timestamp = sigv4::verify::validate_timestamp(headers)?;
+        let (parsed, timestamp) =
+            sigv4::parse::parse_authorization_with_date_check(auth_header, has_date, || {
+                sigv4::verify::validate_timestamp(headers)
+            })?;
 
         // The credential scope must name this server's region, the dynamodb
-        // service and the date of X-Amz-Date; the service reports every
+        // service and the request date; the service reports every
         // complaint in one message when more than one is wrong.
         sigv4::verify::check_scope(&parsed, self.credentials.region(), &timestamp)?;
 
