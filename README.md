@@ -365,6 +365,37 @@ request that panicked stays pending. The instance is then in an undefined
 state (a later call may answer, fail or hang), so reload the page to get a
 fresh one.
 
+### Checks the server makes that this build does not
+
+Before the HTTP server dispatches a request to the engine, it checks the body
+size, the signature, the IAM policies, the names, ARNs and accounts the request
+carries, and, when throttling is on, the table's throughput. This build makes
+none of these checks: it passes each request to the engine's handler for the
+operation, so the handler answers a request the server would have refused, and
+the two answers can differ. Apart from the IAM decision, the server makes these
+checks for every caller, in developer mode too. This build's answer to each
+example request is the one its parity corpus
+(`crates/wasm-adapter/parity/corpus.json`) records, with two exceptions: a
+unit test in `crates/wasm-adapter/src/runtime.rs` records the answer to the
+17 MiB body, and no test covers throttling, which takes a sustained run of
+requests.
+
+| The server checks | Example request | The server answers | This build answers |
+|---|---|---|---|
+| the body is at most 16 MiB | `ListTables` with a 17 MiB body | `RequestEntityTooLargeException` (HTTP 413) | `{"TableNames":[]}`: it has no size limit |
+| the SigV4 signature and the IAM policies | any | its authentication and authorization errors | the request, under account `000000000000` |
+| table names and table ARNs, in `TableName` and the other fields that carry one | `GetItem` with `TableName` `bad name!` | `ValidationException` "1 validation error detected: Value 'bad name!' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+" | `ResourceNotFoundException` "Requested resource not found" |
+| | `ListStreams` with `TableName` `ab` | `ValidationException` "TableName must be at least 3 characters long and at most 255 characters long" | `{"Streams":[]}` |
+| a `StreamArn` is a stream ARN | `DescribeStream` with a table ARN | `ValidationException` "Invalid StreamArn" | `ValidationException` "Invalid stream ARN format: …" |
+| a `StreamArn` names the server's partition, service and region | `DescribeStream` and `GetShardIterator` with a stream's ARN respelled with region `us-west-2` | `ValidationException` "Invalid StreamArn" | the stream's description; an iterator for the stream |
+| a resource named by an ARN is in the caller's account | `GetItem` with a table ARN of account `111111111111`; `DescribeStream` with a stream's ARN respelled with that account | `AccessDeniedException`, for an account the server does not hold "The caller is not authorized to access the specified resource." (`GetItem`) and "Access is denied" (`DescribeStream`) | `ResourceNotFoundException` "Requested resource not found"; the stream's description |
+| a tag operation's `ResourceArn` names a table or a stream | `TagResource` on an index ARN | `ValidationException` "One or more parameter values were invalid: Invalid resource arn provided, only table or stream is accepted. …" | the same answer, from the tag handler |
+| a `BackupArn` is a backup ARN | `DescribeBackup` with a `BackupArn` that is not one | `ValidationException` "Invalid Backup ARN" | the refusal of `DescribeBackup` (see "What it refuses") |
+| an export `TableArn` parses as an ARN | `ExportTableToPointInTime` with `TableArn` `table/Products` | `ValidationException` "One or more parameter values were invalid: tableArn is not a valid ARN" | `ValidationException` "Export is disabled. Configure [export] paths in extenddb.toml to enable." |
+| a `GetRecords` iterator decodes and carries its stream ARN | `GetRecords` with an iterator that does not decode; with one from before iterators carried their stream ARN | `ValidationException` "Invalid ShardIterator"; `ExpiredIteratorException` "Shard iterator has expired" | the same answers, from the `GetRecords` handler |
+| a `GetRecords` iterator's stream ARN names the server's partition, service and region and the caller's account | `GetRecords` with the iterator this build issued for the `us-west-2` spelling above | `ValidationException` "Invalid ShardIterator" | the stream's records |
+| a table's throughput, when `throttling_enabled` is on (it is off by default) | reads or writes past a table's capacity | `ProvisionedThroughputExceededException` | the request: it never throttles |
+
 ### Building it
 
 The module is built with [`wasm-pack`](https://rustwasm.github.io/wasm-pack/):

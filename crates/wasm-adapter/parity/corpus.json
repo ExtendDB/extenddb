@@ -925,7 +925,8 @@
         }
       ],
       "save": {
-        "streamArn": "/Streams/0/StreamArn"
+        "streamArn": "/Streams/0/StreamArn",
+        "streamLabel": "/Streams/0/StreamLabel"
       }
     },
     {
@@ -2302,6 +2303,224 @@
         {
           "path": "/message",
           "equals": "Start of structure or map found where not expected: key must be a string at line 1 column 3"
+        }
+      ]
+    },
+    {
+      "name": "ListStreams with a two-character TableName lists no streams",
+      "op": "ListStreams",
+      "body": {
+        "TableName": "ab"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "",
+          "equals": {
+            "Streams": []
+          }
+        }
+      ]
+    },
+    {
+      "name": "GetItem with a TableName outside the name pattern reaches the engine: ResourceNotFoundException",
+      "op": "GetItem",
+      "body": {
+        "TableName": "bad name!",
+        "Key": {
+          "productId": {
+            "S": "p1"
+          }
+        }
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found"
+        }
+      ]
+    },
+    {
+      "name": "DescribeStream with a table ARN as StreamArn is refused by the stream lookup",
+      "op": "DescribeStream",
+      "body": {
+        "StreamArn": "arn:aws:dynamodb:us-east-1:000000000000:table/Str"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Invalid stream ARN format: arn:aws:dynamodb:us-east-1:000000000000:table/Str"
+        }
+      ]
+    },
+    {
+      "name": "GetItem naming a table in another account by ARN reaches the engine: ResourceNotFoundException",
+      "op": "GetItem",
+      "body": {
+        "TableName": "arn:aws:dynamodb:us-east-1:111111111111:table/Products",
+        "Key": {
+          "productId": {
+            "S": "p1"
+          }
+        }
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found"
+        }
+      ]
+    },
+    {
+      "name": "TagResource on an index ARN is refused by the tag handler",
+      "op": "TagResource",
+      "body": {
+        "ResourceArn": "arn:aws:dynamodb:us-east-1:000000000000:table/Gsi/index/byGsiKey",
+        "Tags": [
+          {
+            "Key": "k",
+            "Value": "v"
+          }
+        ]
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "One or more parameter values were invalid: Invalid resource arn provided, only table or stream is accepted. Provided resource arn: arn:aws:dynamodb:us-east-1:000000000000:table/Gsi/index/byGsiKey"
+        }
+      ]
+    },
+    {
+      "name": "DescribeStream with the stream's ARN respelled in another region describes the table's stream",
+      "op": "DescribeStream",
+      "body": {
+        "StreamArn": "arn:aws:dynamodb:us-west-2:000000000000:table/Str/stream/${streamLabel}"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/StreamDescription/TableName",
+          "equals": "Str"
+        },
+        {
+          "path": "/StreamDescription/StreamArn",
+          "contains": "arn:aws:dynamodb:us-west-2:"
+        }
+      ]
+    },
+    {
+      "name": "DescribeStream with the stream's ARN respelled in another account describes the table's stream",
+      "op": "DescribeStream",
+      "body": {
+        "StreamArn": "arn:aws:dynamodb:us-east-1:111111111111:table/Str/stream/${streamLabel}"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/StreamDescription/TableName",
+          "equals": "Str"
+        },
+        {
+          "path": "/StreamDescription/StreamArn",
+          "contains": ":111111111111:"
+        }
+      ]
+    },
+    {
+      "name": "GetShardIterator with the stream's ARN respelled in another region returns an iterator",
+      "op": "GetShardIterator",
+      "body": {
+        "StreamArn": "arn:aws:dynamodb:us-west-2:000000000000:table/Str/stream/${streamLabel}",
+        "ShardId": "${shardId}",
+        "ShardIteratorType": "TRIM_HORIZON"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/ShardIterator",
+          "present": true
+        }
+      ],
+      "save": {
+        "westIterator": "/ShardIterator"
+      }
+    },
+    {
+      "name": "GetRecords with an iterator that does not decode is refused by the handler",
+      "op": "GetRecords",
+      "body": {
+        "ShardIterator": "not-an-iterator"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Invalid ShardIterator"
+        }
+      ]
+    },
+    {
+      "name": "GetRecords with a pre-upgrade iterator is ExpiredIteratorException",
+      "op": "GetRecords",
+      "body": {
+        "ShardIterator": "c2hhcmRJZC0wMDAwMDAwMDAwMDAwMDAwMDAwMC0wMDAwMDAwMHxBRlRFUl9TRVFVRU5DRV9OVU1CRVJ8fDEwMDA="
+      },
+      "error": "ExpiredIteratorException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Shard iterator has expired"
+        }
+      ]
+    },
+    {
+      "name": "GetRecords with an iterator for the respelled stream ARN reads the stream's records",
+      "op": "GetRecords",
+      "body": {
+        "ShardIterator": "${westIterator}"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/Records/0/eventName",
+          "equals": "INSERT"
+        },
+        {
+          "path": "/Records/0/dynamodb/Keys/pk/S",
+          "equals": "s1"
+        }
+      ]
+    },
+    {
+      "name": "DescribeBackup with a BackupArn that is not a backup ARN gets the build's refusal",
+      "op": "DescribeBackup",
+      "body": {
+        "BackupArn": "not-a-backup-arn"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "DescribeBackup is not supported by the ExtendDB WebAssembly build: the browser build runs entirely in memory with no backup store."
+        }
+      ]
+    },
+    {
+      "name": "ExportTableToPointInTime with a TableArn that does not parse answers that export is disabled",
+      "op": "ExportTableToPointInTime",
+      "body": {
+        "TableArn": "table/Products",
+        "S3Bucket": "b"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Export is disabled. Configure [export] paths in extenddb.toml to enable."
         }
       ]
     }
