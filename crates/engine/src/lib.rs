@@ -12,9 +12,9 @@ pub use backup::{
     BackupRuntime, ConfiguredStore, HeldClaim, JobSettings, KillPoint, LOCAL_CHECK_TIMEOUT,
     OTHER_STORE, RESTORE_REGISTRATION_TIMEOUT, S3_CHECK_TIMEOUT, STORE_IDENTITY_KEY, Spool,
     StoreFence, StoreHealth, StoreHealthReport, StoreIdentityFile, StoreProblem, TARGET_NOT_EMPTY,
-    check_configured_store, check_configured_store_read_only, check_restore_table_name,
-    maintenance, migrate_legacy, read_identity_bounded, reconciler, refuse_point_in_time_recovery,
-    store_identity, store_maintenance, sync,
+    check_configured_store, check_configured_store_read_only, check_restore_override_kinds,
+    check_restore_table_name, maintenance, migrate_legacy, read_identity_bounded, reconciler,
+    refuse_point_in_time_recovery, store_identity, store_maintenance, sync,
 };
 mod batch_get_item;
 mod batch_write_item;
