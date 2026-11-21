@@ -37,9 +37,11 @@ web-time = { workspace = true }
 aws-lc-rs = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-# On wasm32 `uuid` cannot choose a randomness source on its own and fails to
-# compile without one; the `js` feature wires it to the browser's crypto
-# through getrandom's JS backend.
+# On wasm32-unknown-unknown `uuid`'s v4 generator needs one of its `js`,
+# `rng-getrandom` or `rng-rand` features to name a randomness source, and
+# fails to compile without one. With `js` it calls the Web Crypto
+# `crypto.getRandomValues` through its own wasm-bindgen binding, not through
+# getrandom.
 uuid = { workspace = true, features = ["js"] }
 # Pure-Rust crypto backend for wasm32 (src/crypto.rs): HMAC-SHA256 via `hmac`
 # over `sha2`, constant-time compare via `subtle`, AES-256-GCM via `aes-gcm`,
