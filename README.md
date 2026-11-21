@@ -485,6 +485,11 @@ the answer to an oversized body, which the unit test
 `tests` module that holds it is not compiled for `wasm32`); and the signature
 and throttling answers, which no test records.
 
+This table is kept by hand against the server source. No test checks it
+against the server, because the corpus records only this build's answers, so
+a server check that is added or changed leaves the table out of date until
+someone edits it.
+
 | Check | The requests it refuses | The server answers | This build answers |
 |---|---|---|---|
 | **body size** | any request whose body is over 16 MiB | `RequestEntityTooLargeException` (HTTP 413) "Request size has exceeded the maximum allowed size" | the request: it has no size limit, so `ListTables` with a 17 MiB body answers `{"TableNames":[]}` |
