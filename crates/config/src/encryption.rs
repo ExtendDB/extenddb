@@ -46,8 +46,7 @@ impl EncryptionConfig {
 }
 
 /// `key_file` as written, refused when it is relative after the `~`
-/// expansion of [`EncryptionConfig::key_file_path`]: `serve` detaches into
-/// `/` before it reads the file, so a relative path names another file.
+/// expansion of [`EncryptionConfig::key_file_path`].
 fn absolute_key_file<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
     let path = Option::<String>::deserialize(d)?;
     if let Some(path) = &path
@@ -55,8 +54,7 @@ fn absolute_key_file<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, 
     {
         return Err(serde::de::Error::custom(format!(
             "[auth.encryption] key_file = {path:?} is a relative path; the path must be absolute \
-             (a leading `~/` expands to the home directory), because `extenddb serve` changes \
-             its working directory to `/` when it detaches"
+             (a leading `~/` expands to the home directory)"
         )));
     }
     Ok(path)

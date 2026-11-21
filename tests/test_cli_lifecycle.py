@@ -395,6 +395,46 @@ class TestCliLifecycle:
         # Stop
         _run_extenddb("stop", config=cli_env["config_path"])
 
+    def test_daemon_resolves_relative_paths_from_its_start_directory(self, cli_env, tmp_path):
+        """serve without --foreground keeps the directory it was started in as
+        its working directory, so the relative run_dir, TLS files and import
+        and export roots of its config resolve there, as with --foreground,
+        and so do relative paths in requests. The fixture's teardown stops
+        the daemon."""
+        import platform
+        import re
+        import shutil
+
+        _run_extenddb(
+            "init", *_init_args(cli_env),
+            config=cli_env["config_path"],
+            env_override={"EXTENDDB_ADMIN_PASSWORD": "TestPass1!"},
+        )
+        _patch_config_port(cli_env["config_path"], cli_env["port"])
+        shutil.copytree(cli_env["tls_dir"], tmp_path / "tls")
+        config = (tmp_path / "extenddb.toml").read_text()
+        for pattern, line in (
+            (r"(?m)^cert_path = .*$", 'cert_path = "tls/cert.pem"'),
+            (r"(?m)^key_path = .*$", 'key_path = "tls/key.pem"'),
+            (r"(?m)^# run_dir = .*$", 'run_dir = "rel-run"'),
+        ):
+            config, n = re.subn(pattern, line, config, count=1)
+            assert n == 1, pattern
+        config += '\n[import]\npaths = ["rel-imports"]\n\n[export]\npaths = ["rel-exports"]\n'
+        (tmp_path / "extenddb.toml").write_text(config)
+
+        result = _run_extenddb("serve", config="extenddb.toml", cwd=tmp_path, check=False)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert _wait_for_server(cli_env["port"]), "Server did not become healthy"
+        for root in ("rel-imports", "rel-exports"):
+            assert (tmp_path / root).is_dir(), root
+        pid_file = tmp_path / "rel-run" / f"extenddb-{cli_env['port']}.pid"
+        assert pid_file.is_file(), f"no PID file at {pid_file}"
+        if platform.system() == "Linux":
+            # A relative FilePath or FileSource.Path resolves against it.
+            cwd = os.readlink(f"/proc/{int(pid_file.read_text())}/cwd")
+            assert cwd == os.path.realpath(tmp_path), cwd
+
 
 class TestCliMultiInstance:
     """Test multi-instance isolation — two extenddb instances on different ports/databases."""

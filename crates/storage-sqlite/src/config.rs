@@ -114,10 +114,7 @@ pub fn deserialize_config(table: &toml::Table) -> Result<Box<dyn StorageConfig>,
 /// Resolve a relative database file path to absolute, against the current
 /// working directory.
 ///
-/// This runs at config load — before `serve` daemonizes. Daemonization changes
-/// the process working directory, so a relative `path` would otherwise resolve
-/// differently (or fail to open) in the daemonized child. In-memory and URI
-/// paths are left untouched.
+/// This runs at config load. In-memory and URI paths are left untouched.
 fn resolve_path(path: String) -> String {
     if path.contains(":memory:") || path.starts_with("file:") || path.starts_with("sqlite:") {
         return path;

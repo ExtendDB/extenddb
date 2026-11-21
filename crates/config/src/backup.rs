@@ -101,8 +101,7 @@
 //!
 //! A relative `[backup.store.filesystem] path` or `spool_path` is made
 //! absolute against the working directory at config load
-//! ([`BackupConfig::make_paths_absolute`]), where `storage.path` is: `serve`
-//! daemonizes after loading, and the child's working directory is `/`.
+//! ([`BackupConfig::make_paths_absolute`]), where `storage.path` is.
 
 use std::path::{Path, PathBuf};
 

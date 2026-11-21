@@ -1032,9 +1032,8 @@ class TestSqlite:
     def test_a_relative_root_resolves_against_the_shell_in_daemon_mode(self, sqlite_deployment, tmp_path):
         """A relative `[backup.store.filesystem] path` is made absolute at
         config load, against the shell's directory, so the daemonized child
-        (whose working directory is `/`) opens the same root the operator
-        named: the root beside the config gets the identity file and nothing
-        appears under `/`."""
+        opens the same root the operator named: the root beside the config
+        gets the identity file and nothing appears under `/`."""
         d = sqlite_deployment
         os.mkdir(os.path.join(d.dir, "rel-backups"), 0o700)
         run_dir = os.path.join(d.dir, "run")
