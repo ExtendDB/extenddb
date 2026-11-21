@@ -110,7 +110,7 @@ use extenddb_core::types::{BillingMode, CreateTableInput, TableDescription};
 use extenddb_core::validation::{RestorableKeySchema, RestorableLimits};
 use extenddb_storage::backup_catalog::{
     BackupKey, Heartbeat, JobStatus, RestoreJobRow, RestoreRegistrationRow, RestoreTargetKey,
-    StatusFields, UNOWNED_GENERATION, billing_mode_name,
+    StatusFields, UNOWNED_GENERATION,
 };
 use extenddb_storage::backup_definition::{restore_input_from_manifest, vector_index_refusal};
 use extenddb_storage::{
@@ -129,7 +129,7 @@ use super::reconciler::{MANIFEST_READ_BOUND, ReadObject, SIDECAR_READ_BOUND};
 use super::runtime::{BackupRuntime, ConfiguredStore};
 use super::{
     backup_not_found, maintenance_held, restore_response, restore_storage_err_to_dynamo,
-    storage_err_to_dynamo, validate_override_for_source,
+    storage_err_to_dynamo,
 };
 use download::{Dest, Downloader, Stop};
 use load::{FileLoad, Source};
@@ -281,9 +281,8 @@ where
     }
 
     // The target's input, with the overrides, validated as CreateTable does.
-    validate_override_for_source(overrides, billing_mode_name(source_table.billing_mode))?;
     let mut input = restore_input_from_manifest(source_table, target_table_name, overrides);
-    index_overrides.apply(&mut input, overrides.billing_mode)?;
+    index_overrides.apply(&mut input, overrides)?;
     extenddb_core::validation::validate_create_table(&input, limits)?;
     // The key schema the validator holds every item to: a pure function of
     // the manifest, resolved here with step 2's refusals rather than after
