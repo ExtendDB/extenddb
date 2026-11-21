@@ -5,17 +5,22 @@
 //! service's sentences (measured 2026-10-24 unless marked derived).
 //!
 //! A `TableName` may be a table ARN. On the item operations the service checks
-//! the shape, the vendor, the region, the table segment and the account, in
-//! that order (the order measured 2026-11-07, except the region before the
-//! table segment, which is derived):
+//! the shape, the vendor, the region, the table segment's length, its pattern
+//! and the account, in that order (measured 2026-11-07, and 2026-11-20 for the
+//! length, except the region before the pattern, which is derived):
 //!
 //! | `TableName` | sentence at `'tableName'` |
 //! |---|---|
 //! | not a plain table ARN (too few fields, a resource that is not `table/<name>`, an index, stream or backup suffix) | the `Valid ARN format is ...` frame |
 //! | a plain table ARN of another service | `Invalid vendor code` (measured 2026-11-07) |
 //! | a bad region segment | `Invalid AWS region` |
+//! | a table segment shorter than 3, the empty one included | `Table name of ARN must have length greater than or equal to 3` (measured 2026-11-20) |
+//! | a table segment longer than 255 | `Table name of ARN must have length less than or equal to 255` (measured 2026-11-20) |
 //! | a table segment that fails the pattern | `Table name of ARN must satisfy regular expression pattern: ...` |
 //! | an account segment that is not 12 ASCII digits, the empty one included | `Invalid subscriber ID` |
+//!
+//! The item operations count the table segment's length in UTF-8 bytes, the
+//! control-plane operations in UTF-16 code units (measured 2026-11-20).
 //!
 //! The control-plane operations in [`CONTROL_PLANE`] check the account first
 //! (measured 2026-11-07): an ARN whose account segment is not the caller's
@@ -102,12 +107,16 @@ fn one_error(value: &str, location: &str, constraint: &str) -> DynamoDbError {
 pub(crate) enum ArnFault {
     /// Not a plain table ARN: too few fields, a resource that is not
     /// `table/<name>`, an index, stream or backup suffix, or a shape
-    /// `arn::parse` rejects.
+    /// `arn::parse` rejects other than an empty table segment.
     NotPlainTable,
     /// A plain table ARN of another service.
     Vendor,
     /// A region segment that carries a character outside `[a-z0-9-]`.
     Region,
+    /// A table segment shorter than 3, the empty one included.
+    ShortTable,
+    /// A table segment longer than 255.
+    LongTable,
     /// A table segment that fails the pattern.
     TableSegment,
     /// An account segment that is not 12 ASCII digits, the empty one included.
@@ -117,26 +126,41 @@ pub(crate) enum ArnFault {
 /// Inspect an `arn:` value the way the service checks a `TableName` ARN on
 /// the item operations. `None` means a well-formed plain table ARN whose
 /// segments all pass.
-pub(crate) fn table_arn_fault(arn: &str) -> Option<ArnFault> {
-    let res = match parse(arn) {
-        Some(res) if res.sub.is_none() => res,
+pub(crate) fn table_arn_fault(arn: &str, control_plane: bool) -> Option<ArnFault> {
+    let Some(f) = fields(arn) else {
+        return Some(ArnFault::NotPlainTable);
+    };
+    let table = match parse(arn) {
+        Some(res) if res.sub.is_none() => res.table,
+        // `parse` reads no empty table segment.
+        None if f.resource == "table/" => String::new(),
         _ => return Some(ArnFault::NotPlainTable),
     };
-    if res.service != "dynamodb" {
+    if f.service != "dynamodb" {
         return Some(ArnFault::Vendor);
     }
-    if !res
+    if !f
         .region
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {
         return Some(ArnFault::Region);
     }
-    if !in_pattern(&res.table) {
+    let length = if control_plane {
+        table.encode_utf16().count()
+    } else {
+        table.len()
+    };
+    match length {
+        ..3 => return Some(ArnFault::ShortTable),
+        256.. => return Some(ArnFault::LongTable),
+        _ => {}
+    }
+    if !in_pattern(&table) {
         return Some(ArnFault::TableSegment);
     }
     // 11 and 13 digits measured 2026-11-06, the empty account 2026-11-07.
-    (!extenddb_core::arn::is_account_id(&res.account)).then_some(ArnFault::Account)
+    (!extenddb_core::arn::is_account_id(f.account)).then_some(ArnFault::Account)
 }
 
 fn arn_constraint(fault: ArnFault) -> &'static str {
@@ -144,6 +168,8 @@ fn arn_constraint(fault: ArnFault) -> &'static str {
         ArnFault::NotPlainTable => FRAME,
         ArnFault::Vendor => "Invalid vendor code",
         ArnFault::Region => "Invalid AWS region",
+        ArnFault::ShortTable => "Table name of ARN must have length greater than or equal to 3",
+        ArnFault::LongTable => "Table name of ARN must have length less than or equal to 255",
         ArnFault::TableSegment => {
             "Table name of ARN must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
         }
@@ -171,7 +197,7 @@ pub(crate) fn check_table_name_arn(
             operation, operation, arn, false, "",
         ));
     }
-    let Some(fault) = table_arn_fault(arn) else {
+    let Some(fault) = table_arn_fault(arn, control_plane) else {
         return Ok(());
     };
     if control_plane {
@@ -194,7 +220,7 @@ pub(crate) fn check_table_name_arn(
 /// table segment is measured; the other faults take the same constraints as a
 /// top-level `TableName` (derived).
 pub(crate) fn check_transact_member_arn(arn: &str, location: &str) -> Result<(), DynamoDbError> {
-    match table_arn_fault(arn) {
+    match table_arn_fault(arn, false) {
         None => Ok(()),
         Some(fault) => Err(one_error(arn, location, arn_constraint(fault))),
     }
@@ -290,6 +316,9 @@ mod tests {
              constraint: {constraint}"
         )
     }
+    const MIN: &str = "Table name of ARN must have length greater than or equal to 3";
+    const MAX: &str = "Table name of ARN must have length less than or equal to 255";
+    const PAT: &str = "Table name of ARN must satisfy regular expression pattern: [a-zA-Z0-9_.-]+";
 
     #[test]
     fn a_plain_table_arn_with_a_bad_segment_gets_the_table_name_of_arn_sentence() {
@@ -380,6 +409,24 @@ mod tests {
                 "arn:aws:dynamodb:us-east-1::table/t367name",
                 "Invalid subscriber ID",
             ),
+            // Measured 2026-11-20 with GetItem: an empty table segment gets
+            // the vendor and region faults, the length comes before the
+            // account, and a sub-resource keeps the frame.
+            (
+                "arn:aws:s3:us-east-1:123456789012:table/",
+                "Invalid vendor code",
+            ),
+            (
+                "arn:aws:dynamodb:US-EAST-1:123456789012:table/",
+                "Invalid AWS region",
+            ),
+            ("arn:aws:dynamodb:us-east-1:12345:table/", MIN),
+            ("arn:aws:dynamodb:us-east-1:12345:table/ab", MIN),
+            ("arn:aws:dynamodb:us-east-1:111122223333:table/", MIN),
+            (
+                "arn:aws:dynamodb:us-east-1:123456789012:table/ab/index/gsi",
+                FRAME,
+            ),
         ];
         for (arn, constraint) in cases {
             assert_eq!(
@@ -393,6 +440,47 @@ mod tests {
             ))
             .unwrap();
             assert!(m.ends_with(&format!("constraint: {constraint}")), "{m}");
+        }
+    }
+
+    /// Measured 2026-11-20 with `DescribeTable`, `GetItem` and the
+    /// `TransactGetItems` member: a table segment outside 3 to 255 gets a
+    /// length sentence before the pattern sentence. The control plane counts
+    /// the segment in UTF-16 code units and the item operations in UTF-8
+    /// bytes. One U+1F600 is 2 code units and 4 bytes.
+    #[test]
+    fn a_table_segment_outside_3_to_255_gets_a_length_sentence() {
+        let emoji = |n: usize| "\u{1F600}".repeat(n);
+        // (table segment, control plane, item operations); `None` passes.
+        let rows = [
+            (String::new(), Some(MIN), Some(MIN)),
+            ("a".to_owned(), Some(MIN), Some(MIN)),
+            ("ab".to_owned(), Some(MIN), Some(MIN)),
+            ("a*".to_owned(), Some(MIN), Some(MIN)),
+            ("a b".to_owned(), Some(PAT), Some(PAT)),
+            ("abc".to_owned(), None, None),
+            ("x".repeat(255), None, None),
+            ("x".repeat(256), Some(MAX), Some(MAX)),
+            (emoji(1), Some(MIN), Some(PAT)),
+            (emoji(2), Some(PAT), Some(PAT)),
+            (emoji(85), Some(PAT), Some(MAX)),
+            (emoji(128), Some(MAX), Some(MAX)),
+        ];
+        let get = "transactItems.1.member.get.tableName";
+        for (segment, control, item) in rows {
+            let arn = table(&segment);
+            let at = |c: Option<&str>| c.map(|c| at_table_name(&arn, c));
+            assert_eq!(
+                message(arn_check("DescribeTable", &arn)),
+                at(control),
+                "{segment:?}"
+            );
+            assert_eq!(message(arn_check("GetItem", &arn)), at(item), "{segment:?}");
+            assert_eq!(
+                message(check_transact_member_arn(&arn, get)),
+                at(item).map(|m| m.replace("'tableName'", &format!("'{get}'"))),
+                "{segment:?}"
+            );
         }
     }
 
@@ -421,6 +509,7 @@ mod tests {
                 assert!(arn_check(op, &s3).is_ok(), "{op} {s3:?}");
                 for unread in [
                     format!("arn:aws:dynamodb:us-east-1:{account}:tbl"),
+                    format!("arn:aws:dynamodb:us-east-1:{account}:table/"),
                     format!("arn:aws:dynamodb:us-east-1:{account}:table/t/"),
                     format!("arn:aws:dynamodb:us-east-1:{account}:table/t/stream/a/b"),
                     format!("arn:aws:dynamodb:us-ea\u{0}st-1:{account}:tbl"),
@@ -444,19 +533,22 @@ mod tests {
 
     #[test]
     fn control_plane_operations_word_vendor_and_region_faults_alone() {
-        let region = format!("arn:aws:dynamodb:us-ea\u{0}st-1:{ACCT}:table/t367name");
-        let vendor = format!("arn:aws:s3:us-ea\u{0}st-1:{ACCT}:table/t367\u{0}name");
         for op in CONTROL_PLANE {
-            assert_eq!(
-                message(arn_check(op, &region)).unwrap(),
-                format!("1 validation error detected: Invalid AWS region in '{region}'"),
-                "{op}"
-            );
-            assert_eq!(
-                message(arn_check(op, &vendor)).unwrap(),
-                format!("1 validation error detected: Invalid vendor code in '{vendor}'"),
-                "{op}"
-            );
+            // The empty table segment was measured 2026-11-20 on DescribeTable.
+            for (segment, vendor_segment) in [("t367name", "t367\u{0}name"), ("", "")] {
+                let region = format!("arn:aws:dynamodb:us-ea\u{0}st-1:{ACCT}:table/{segment}");
+                let vendor = format!("arn:aws:s3:us-ea\u{0}st-1:{ACCT}:table/{vendor_segment}");
+                assert_eq!(
+                    message(arn_check(op, &region)).unwrap(),
+                    format!("1 validation error detected: Invalid AWS region in '{region}'"),
+                    "{op}"
+                );
+                assert_eq!(
+                    message(arn_check(op, &vendor)).unwrap(),
+                    format!("1 validation error detected: Invalid vendor code in '{vendor}'"),
+                    "{op}"
+                );
+            }
             // The shape and the table segment are the item operations' answers.
             for arn in [
                 format!("arn:aws:dynamodb:us-ea\u{0}st-1:{ACCT}:tbl"),
