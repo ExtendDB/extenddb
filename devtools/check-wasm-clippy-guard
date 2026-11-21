@@ -20,10 +20,15 @@ This script fails, with one line per problem, unless all of these hold:
    workspace crates it depends on for wasm32, read from `cargo metadata`), no
    source file under src/ allows or expects clippy::all, clippy::style or
    warnings, nor clippy::disallowed_methods or clippy::disallowed_types (or
-   their former names) without a `reason`. The one exception is the frozen
-   migration modules named in FROZEN_MODULES: the `mod` line of each carries
-   #[allow(clippy::all, deprecated)] because its body is checksummed and no
-   lint may ask for an edit. The `[lints]` tables of those crates and the
+   their former names) without a `reason`. The one exception is a catalog
+   migration's code-body module: CONTRIBUTING.md ("Adding a catalog
+   migration") declares each one, in src/migrations/mod.rs, with
+   #[rustfmt::skip] and #[allow(clippy::all, deprecated)], because its body is
+   checksummed once released and no lint may ask for an edit. An allow of
+   clippy::all is accepted only in that exact form, on a `mod mNNNN_<name>;`
+   line of a src/migrations/mod.rs whose src/migrations/mNNNN_<name>.rs
+   exists; the guard does not see those bodies, and the headless parity
+   corpus runs every migration when it creates an engine. The `[lints]` tables of those crates and the
    workspace's `[workspace.lints]` allow none of these lints, and
    .cargo/config.toml passes rustc no flag that allows lints or caps them.
 3. In a copy of the working tree (the files git tracks or does not ignore,
@@ -85,17 +90,12 @@ CLIPPY = [
 PROBE_CRATE = "extenddb-storage"
 PROBE_MODULE = "wasm_clippy_guard_probes"
 
-# The frozen migration modules of the wasm-compiled crates: (file, module) of
-# each `mod` line that carries #[allow(clippy::all, deprecated)]. A module
-# frozen later goes here; the guard linted it until it was frozen.
-FROZEN_MODULES = {
-    ("crates/storage/src/migrations/mod.rs", "m0002_resource_tag_condition_keys"),
-    ("crates/storage-sqlite/src/migrations/mod.rs", "m0001_baseline"),
-    ("crates/storage-sqlite/src/migrations/mod.rs", "m0003_sort_key_definitions"),
-    ("crates/storage-sqlite/src/migrations/mod.rs", "m0004_index_table_base_key"),
-    ("crates/storage-sqlite/src/migrations/mod.rs", "m0006_backup_catalog_index"),
-    ("crates/storage-sqlite/src/migrations/mod.rs", "m0009_warm_throughput"),
-}
+# A catalog migration's code-body module, declared as CONTRIBUTING.md
+# ("Adding a catalog migration") prescribes: in src/migrations/mod.rs, a
+# `mod mNNNN_<name>;` line with #[rustfmt::skip] and exactly
+# #[allow(clippy::all, deprecated)].
+MIGRATION_MODULE = re.compile(r"m[0-9]{4}_[a-z0-9_]+")
+MIGRATION_ALLOW = {"clippy::all", "deprecated"}
 # Allowing one of these turns the guard off: clippy::all and clippy::style
 # contain disallowed_methods and disallowed_types, and warnings covers every
 # lint at the warn level, where both sit.
@@ -523,9 +523,10 @@ _NEXT_ATTRIBUTE = re.compile(r"\s*#\s*\[")
 _MOD = re.compile(r"\s*(?:pub\s*(?:\([^)]*\))?\s*)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;")
 
 
-def attribute_problems(rel: str, text: str, used_frozen: set) -> tuple[list[str], int]:
+def attribute_problems(rel: str, text: str, used_migration: set) -> tuple[list[str], int]:
     """Problems in the lint attributes of one file, and how many of its
-    attributes allow a disallowed lint with a reason."""
+    attributes allow a disallowed lint with a reason. `used_migration` collects
+    the migration code-body modules whose allow of clippy::all is accepted."""
     code = code_only(text)
     problems, reasoned = [], 0
     for attribute in _ATTRIBUTE.finditer(code):
@@ -552,13 +553,14 @@ def attribute_problems(rel: str, text: str, used_frozen: set) -> tuple[list[str]
             blanket = sorted(names & BLANKET)
             if blanket:
                 declared = _declared_module(code, end)
-                if declared and (rel, declared) in FROZEN_MODULES:
-                    used_frozen.add((rel, declared))
+                if is_migration_module(rel, code, attribute.start(), declared, level, names):
+                    used_migration.add((rel, declared))
                 else:
                     problems.append(
                         f"{rel}:{line}: {level}({', '.join(blanket)}) switches the wasm clippy"
-                        " guard off; allow only the lints the code needs (a newly frozen"
-                        " migration module goes in FROZEN_MODULES of this script)"
+                        " guard off; allow only the lints the code needs (only a catalog"
+                        " migration's code-body module, declared as CONTRIBUTING.md"
+                        " prescribes, may allow clippy::all)"
                     )
             unreasoned = sorted(names & NEED_REASON)
             if unreasoned and not has_reason:
@@ -569,6 +571,30 @@ def attribute_problems(rel: str, text: str, used_frozen: set) -> tuple[list[str]
             elif unreasoned:
                 reasoned += 1
     return problems, reasoned
+
+
+def is_migration_module(
+    rel: str, code: str, start: int, declared: str | None, level: str, names: set
+) -> bool:
+    """Whether the attribute at `start` is the allow CONTRIBUTING.md prescribes
+    for a catalog migration's code-body module: `allow(clippy::all,
+    deprecated)` and nothing else, on a `mod mNNNN_<name>;` line of a
+    src/migrations/mod.rs that also carries #[rustfmt::skip], with the module's
+    file beside it."""
+    if level != "allow" or names != MIGRATION_ALLOW or declared is None:
+        return False
+    path = Path(rel)
+    if path.name != "mod.rs" or path.parent.name != "migrations" or path.parent.parent.name != "src":
+        return False
+    if not MIGRATION_MODULE.fullmatch(declared):
+        return False
+    if not (ROOT / path.parent / f"{declared}.rs").is_file():
+        return False
+    # The attributes of the item: from the end of the previous item (or the
+    # start of the file) to the `mod` keyword.
+    item_start = max(code.rfind(";", 0, start), code.rfind("}", 0, start)) + 1
+    mod_at = code.find("mod", start)
+    return re.search(r"#\s*\[\s*rustfmt\s*::\s*skip\s*\]", code[item_start:mod_at]) is not None
 
 
 def _declared_module(code: str, index: int) -> str | None:
@@ -621,24 +647,19 @@ def manifest_problems(crates: dict[str, dict], metadata: dict) -> list[str]:
 
 
 def lint_setting_problems(crates: dict[str, dict], metadata: dict) -> tuple[list[str], str]:
-    problems, used_frozen, reasoned, files = [], set(), 0, 0
+    problems, used_migration, reasoned, files = [], set(), 0, 0
     for name in sorted(crates):
         source = Path(crates[name]["manifest_path"]).parent / "src"
         for path in sorted(source.rglob("*.rs")):
             rel = path.relative_to(ROOT).as_posix()
-            found, count = attribute_problems(rel, path.read_text(encoding="utf-8"), used_frozen)
+            found, count = attribute_problems(rel, path.read_text(encoding="utf-8"), used_migration)
             problems += found
             reasoned += count
             files += 1
-    for rel, module in sorted(FROZEN_MODULES - used_frozen):
-        problems.append(
-            f"{rel}: FROZEN_MODULES names `mod {module};` but no allow of clippy::all is on"
-            " that line any more; remove it from this script's list"
-        )
     problems += manifest_problems(crates, metadata)
     summary = (
         f"lint settings: {files} source files of {len(crates)} crates read;"
-        f" {len(used_frozen)} frozen migration modules allow clippy::all;"
+        f" {len(used_migration)} migration code-body modules allow clippy::all;"
         f" {reasoned} allows of a disallowed lint, each with a reason"
     )
     return problems, summary
