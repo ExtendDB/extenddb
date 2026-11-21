@@ -1,20 +1,32 @@
 #!/usr/bin/env python3
 # Copyright 2026 ExtendDB contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Check the wasm32 clippy guard: its configuration, and that it refuses a
-call to each entry.
+"""Check the wasm32 clippy guard: its configuration, the lint settings that
+could switch it off, and that it refuses a call to each entry.
 
 The guard is the clippy step of the WebAssembly workflow, run with
 CLIPPY_CONF_DIR pointing at devtools/wasm-clippy, whose clippy.toml lists
 methods. A path there that does not resolve only makes clippy print a
 warning, and under -D warnings the step still exits 0 (clippy 0.1.97), so a
-misspelt entry would leave the step green with that call unguarded. This
-script fails, with one line per problem, unless all of these hold:
+misspelt entry would leave the step green with that call unguarded. Allowing
+clippy::all, clippy::style or warnings, or the two disallowed lints, switches
+the guard off for the code the setting covers, and the step again exits 0.
+This script fails, with one line per problem, unless all of these hold:
 
 1. clippy.toml holds only `disallowed-methods`; each entry is a table with a
    `path` and a `reason` and nothing else; no path is listed twice; each
    entry has a probe below and each probe names an entry.
-2. In a copy of the working tree (the files git tracks or does not ignore,
+2. In the crates the wasm build compiles (extenddb-wasm-adapter and the
+   workspace crates it depends on for wasm32, read from `cargo metadata`), no
+   source file under src/ allows or expects clippy::all, clippy::style or
+   warnings, nor clippy::disallowed_methods or clippy::disallowed_types (or
+   their former names) without a `reason`. The one exception is the frozen
+   migration modules named in FROZEN_MODULES: the `mod` line of each carries
+   #[allow(clippy::all, deprecated)] because its body is checksummed and no
+   lint may ask for an edit. The `[lints]` tables of those crates and the
+   workspace's `[workspace.lints]` allow none of these lints, and
+   .cargo/config.toml passes rustc no flag that allows lints or caps them.
+3. In a copy of the working tree (the files git tracks or does not ignore,
    uncommitted edits included), with every probe added to a source file of
    PROBE_CRATE, the clippy step of the workflow fails with clippy's
    disallowed-method error naming the probed path inside each probe, and
@@ -73,6 +85,29 @@ CLIPPY = [
 PROBE_CRATE = "extenddb-storage"
 PROBE_MODULE = "wasm_clippy_guard_probes"
 
+# The frozen migration modules of the wasm-compiled crates: (file, module) of
+# each `mod` line that carries #[allow(clippy::all, deprecated)]. A module
+# frozen later goes here; the guard linted it until it was frozen.
+FROZEN_MODULES = {
+    ("crates/storage/src/migrations/mod.rs", "m0002_resource_tag_condition_keys"),
+    ("crates/storage-sqlite/src/migrations/mod.rs", "m0001_baseline"),
+    ("crates/storage-sqlite/src/migrations/mod.rs", "m0003_sort_key_definitions"),
+    ("crates/storage-sqlite/src/migrations/mod.rs", "m0004_index_table_base_key"),
+    ("crates/storage-sqlite/src/migrations/mod.rs", "m0006_backup_catalog_index"),
+    ("crates/storage-sqlite/src/migrations/mod.rs", "m0009_warm_throughput"),
+}
+# Allowing one of these turns the guard off: clippy::all and clippy::style
+# contain disallowed_methods and disallowed_types, and warnings covers every
+# lint at the warn level, where both sit.
+BLANKET = {"clippy::all", "clippy::style", "warnings"}
+# These may be allowed only with a reason. The last two are the lints' former
+# names, which rustc still applies to them.
+NEED_REASON = {
+    "clippy::disallowed_methods",
+    "clippy::disallowed_types",
+    "clippy::disallowed_method",
+    "clippy::disallowed_type",
+}
 CONFIG_WARNINGS = (
     "does not refer to a reachable",
     "expected a function, found",
@@ -337,6 +372,210 @@ def wasm_crates(metadata: dict) -> dict[str, dict]:
     return {packages[i]["name"]: packages[i] | {"node": nodes[i]} for i in seen if i in members}
 
 
+# ---------------------------------------------------------------- lint settings
+
+_SCAN = re.compile(r'//|/\*|(?<!\w)(?:b|c)?r#*"|(?<!\w)(?:b|c)?"|\'')
+_CHAR = re.compile(r"'(?:\\(?:u\{[0-9A-Fa-f]{1,6}\}|x[0-9A-Fa-f]{2}|.)|[^\\'\n])'")
+
+
+def code_only(text: str) -> str:
+    """`text` with comments and the contents of string and character literals
+    blanked (line breaks kept), so offsets and line numbers still match."""
+    out = []
+    i = 0
+    n = len(text)
+
+    def blank(a: int, b: int) -> None:
+        out.append(re.sub(r"[^\n]", " ", text[a:b]))
+
+    while True:
+        match = _SCAN.search(text, i)
+        if not match:
+            out.append(text[i:])
+            break
+        start = match.start()
+        out.append(text[i:start])
+        token = match.group()
+        if token == "//":
+            end = text.find("\n", start)
+            end = n if end < 0 else end
+            blank(start, end)
+        elif token == "/*":
+            depth, end = 1, start + 2
+            while end < n and depth:
+                if text.startswith("/*", end):
+                    depth, end = depth + 1, end + 2
+                elif text.startswith("*/", end):
+                    depth, end = depth - 1, end + 2
+                else:
+                    end += 1
+            blank(start, end)
+        elif token == "'":
+            char = _CHAR.match(text, start)
+            end = char.end() if char else start + 1  # a lifetime or a label
+            out.append(text[start] + re.sub(r"[^\n]", " ", text[start + 1 : end - 1]))
+            if char:
+                out.append("'")
+        elif token.endswith('"') and "r" in token:
+            hashes = token.count("#")
+            close = text.find('"' + "#" * hashes, match.end())
+            close = n if close < 0 else close
+            end = min(n, close + 1 + hashes)
+            out.append(token)
+            blank(match.end(), close)
+            out.append(text[close:end])
+        else:
+            end = match.end()
+            while end < n and text[end] != '"':
+                end += 2 if text[end] == "\\" else 1
+            out.append(token)
+            blank(match.end(), end)
+            out.append(text[end : end + 1])
+            end += 1
+        i = end
+    return "".join(out)
+
+
+def _closing(code: str, start: int, opening: str, closing: str) -> int:
+    """The index just past the bracket that closes the one at `start`."""
+    depth = 0
+    for index in range(start, len(code)):
+        if code[index] == opening:
+            depth += 1
+        elif code[index] == closing:
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return len(code)
+
+
+_ATTRIBUTE = re.compile(r"#\s*!?\s*\[")
+_LINT_LIST = re.compile(r"\b(allow|expect)\s*\(")
+_NEXT_ATTRIBUTE = re.compile(r"\s*#\s*\[")
+_MOD = re.compile(r"\s*(?:pub\s*(?:\([^)]*\))?\s*)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;")
+
+
+def attribute_problems(rel: str, text: str, used_frozen: set) -> tuple[list[str], int]:
+    """Problems in the lint attributes of one file, and how many of its
+    attributes allow a disallowed lint with a reason."""
+    code = code_only(text)
+    problems, reasoned = [], 0
+    for attribute in _ATTRIBUTE.finditer(code):
+        end = _closing(code, attribute.end() - 1, "[", "]")
+        body = code[attribute.start() : end]
+        line = code.count("\n", 0, attribute.start()) + 1
+        for lint_list in _LINT_LIST.finditer(body):
+            close = _closing(body, lint_list.end() - 1, "(", ")")
+            items, depth, item = [], 0, ""
+            for char in body[lint_list.end() : close - 1]:
+                if char in "([{":
+                    depth += 1
+                elif char in ")]}":
+                    depth -= 1
+                if char == "," and depth == 0:
+                    items.append(item)
+                    item = ""
+                else:
+                    item += char
+            items.append(item)
+            names = {re.sub(r"\s", "", i) for i in items} - {""}
+            has_reason = any(name.startswith("reason=") for name in names)
+            level = lint_list.group(1)
+            blanket = sorted(names & BLANKET)
+            if blanket:
+                declared = _declared_module(code, end)
+                if declared and (rel, declared) in FROZEN_MODULES:
+                    used_frozen.add((rel, declared))
+                else:
+                    problems.append(
+                        f"{rel}:{line}: {level}({', '.join(blanket)}) switches the wasm clippy"
+                        " guard off; allow only the lints the code needs (a newly frozen"
+                        " migration module goes in FROZEN_MODULES of this script)"
+                    )
+            unreasoned = sorted(names & NEED_REASON)
+            if unreasoned and not has_reason:
+                problems.append(
+                    f"{rel}:{line}: {level}({', '.join(unreasoned)}) has no `reason = \"...\"`"
+                    " naming the callers and why none runs on wasm"
+                )
+            elif unreasoned:
+                reasoned += 1
+    return problems, reasoned
+
+
+def _declared_module(code: str, index: int) -> str | None:
+    """The module a `mod name;` item after more attributes at `index` declares."""
+    while match := _NEXT_ATTRIBUTE.match(code, index):
+        index = _closing(code, match.end() - 1, "[", "]")
+    match = _MOD.match(code, index)
+    return match.group(1) if match else None
+
+
+def manifest_problems(crates: dict[str, dict], metadata: dict) -> list[str]:
+    problems = []
+    root_manifest = Path(metadata["workspace_root"]) / "Cargo.toml"
+    workspace = tomllib.loads(root_manifest.read_text(encoding="utf-8")).get("workspace", {})
+    tables = [(root_manifest, workspace.get("lints", {}))]
+    for package in crates.values():
+        manifest = Path(package["manifest_path"])
+        lints = tomllib.loads(manifest.read_text(encoding="utf-8")).get("lints", {})
+        tables.append((manifest, lints))
+    for manifest, table in tables:
+        for tool, lints in table.items():
+            if not isinstance(lints, dict):
+                continue
+            for name, setting in lints.items():
+                level = setting.get("level") if isinstance(setting, dict) else setting
+                lint = name if tool == "rust" else f"{tool}::{name}"
+                if level in ("allow", "expect") and lint in BLANKET | NEED_REASON:
+                    problems.append(
+                        f"{manifest.relative_to(ROOT)}: [lints] sets {lint} to {level!r},"
+                        " which switches the wasm clippy guard off"
+                    )
+    for name in ("config.toml", "config"):
+        config = ROOT / ".cargo" / name
+        if not config.is_file():
+            continue
+        settings = tomllib.loads(config.read_text(encoding="utf-8"))
+        flag_lists = [settings.get("build", {}).get("rustflags")]
+        flag_lists += [
+            t.get("rustflags") for t in settings.get("target", {}).values() if isinstance(t, dict)
+        ]
+        for flags in flag_lists:
+            if isinstance(flags, str):
+                flags = flags.split()
+            if any(re.match(r"(-A|--allow|--cap-lints)", str(flag)) for flag in flags or []):
+                problems.append(
+                    f".cargo/{name}: rustflags {flags!r} allow lints or cap them, which can"
+                    " switch the wasm clippy guard off"
+                )
+    return problems
+
+
+def lint_setting_problems(crates: dict[str, dict], metadata: dict) -> tuple[list[str], str]:
+    problems, used_frozen, reasoned, files = [], set(), 0, 0
+    for name in sorted(crates):
+        source = Path(crates[name]["manifest_path"]).parent / "src"
+        for path in sorted(source.rglob("*.rs")):
+            rel = path.relative_to(ROOT).as_posix()
+            found, count = attribute_problems(rel, path.read_text(encoding="utf-8"), used_frozen)
+            problems += found
+            reasoned += count
+            files += 1
+    for rel, module in sorted(FROZEN_MODULES - used_frozen):
+        problems.append(
+            f"{rel}: FROZEN_MODULES names `mod {module};` but no allow of clippy::all is on"
+            " that line any more; remove it from this script's list"
+        )
+    problems += manifest_problems(crates, metadata)
+    summary = (
+        f"lint settings: {files} source files of {len(crates)} crates read;"
+        f" {len(used_frozen)} frozen migration modules allow clippy::all;"
+        f" {reasoned} allows of a disallowed lint, each with a reason"
+    )
+    return problems, summary
+
+
 # ---------------------------------------------------------------- probe run
 
 
@@ -511,6 +750,9 @@ def main() -> int:
     metadata = cargo_metadata()
     crates = wasm_crates(metadata)
     print(f"crates the wasm build compiles: {', '.join(sorted(crates))}")
+    found, settings = lint_setting_problems(crates, metadata)
+    failures += found
+    print(settings)
     found, probes = probe_problems(crates, metadata)
     failures += found
     for failure in failures:

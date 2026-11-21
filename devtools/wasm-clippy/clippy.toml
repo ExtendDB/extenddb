@@ -36,7 +36,10 @@
 # error. devtools/check-wasm-clippy-guard, run by the workflow after the clippy
 # step, reads the paths from this file and fails if one has no probe in the
 # script, if clippy reports one as unresolved, or if the step accepts a call to
-# one.
+# one. It also fails on a lint setting that switches the disallowed-methods and
+# disallowed-types lints off in a crate the wasm build compiles: allowing
+# clippy::all, clippy::style or warnings, or allowing clippy::disallowed_methods
+# or clippy::disallowed_types without a reason.
 
 disallowed-methods = [
     { path = "std::time::Instant::now", reason = "std has no clock on wasm32-unknown-unknown; read it through web_time" },

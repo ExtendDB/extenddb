@@ -122,7 +122,9 @@ jobs:
       # Reads clippy.toml and fails if an entry has no probe in the script or
       # does not resolve, or if the step above accepts a call to one, made
       # directly or through an import; the probes go into a copy of the
-      # checkout. Needs Python 3.11 or later (tomllib), as
+      # checkout. It also fails if a crate the wasm build compiles allows
+      # clippy::all, clippy::style or warnings, or the disallowed lints
+      # without a reason. Needs Python 3.11 or later (tomllib), as
       # devtools/check-crate-packages does in test.yml's package job, which
       # runs on the same runner.
       - name: Self-test the wasm32 clippy guard
