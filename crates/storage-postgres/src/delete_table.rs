@@ -46,7 +46,8 @@ impl PostgresEngine {
         let row: Option<TableRow> = sqlx::query_as(
             r"SELECT table_name, key_schema, attribute_definitions, billing_mode,
                       provisioned_throughput, stream_specification, table_status,
-                      EXTRACT(EPOCH FROM creation_date_time)::FLOAT8 as creation_epoch,
+                      EXTRACT(EPOCH FROM date_trunc('milliseconds', creation_date_time))::FLOAT8
+                          as creation_epoch,
                       table_size_bytes, item_count, table_arn, table_id,
                       deletion_protection_enabled, stream_label,
                       table_class, sse_specification, on_demand_throughput,

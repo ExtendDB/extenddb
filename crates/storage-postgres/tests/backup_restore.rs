@@ -2194,6 +2194,81 @@ async fn restore_summary_and_backup_in_use() {
     s.cleanup().await;
 }
 
+/// DynamoDB sends these date members with at most three decimal places
+/// (measured 2026-11-14, 2026-11-16 and 2026-11-20). The catalog keeps the
+/// creation time to the microsecond, so the table is given a stored time
+/// with a microsecond remainder before the reads that follow CreateTable.
+#[tokio::test]
+async fn date_members_carry_at_most_milliseconds() {
+    if base_conn().is_none() {
+        eprintln!("SKIP date_members_carry_at_most_milliseconds: no PostgreSQL");
+        return;
+    }
+    let s = scratch().await;
+    let created = s
+        .engine
+        .create_table(ACCOUNT, composite_table("dm_od"))
+        .await
+        .expect("create the on-demand table");
+    // The shortest decimal form, the one the JSON response carries.
+    let text = created.creation_date_time.to_string();
+    let decimals = text
+        .split_once('.')
+        .map_or(0, |(_, fraction)| fraction.len());
+    assert!(decimals <= 3, "CreateTable CreationDateTime is {text}");
+    sqlx::query(
+        "UPDATE tables SET creation_date_time = \
+         TIMESTAMPTZ 'epoch' + INTERVAL '1794835907.194914 seconds' WHERE account_id = $1",
+    )
+    .bind(ACCOUNT)
+    .execute(&s.catalog)
+    .await
+    .expect("store a creation time with microseconds");
+    let described = s
+        .engine
+        .describe_table(
+            ACCOUNT,
+            DescribeTableInput {
+                table_name: "dm_od".to_owned(),
+            },
+        )
+        .await
+        .expect("describe");
+    let backup = s
+        .engine
+        .create(ACCOUNT, "dm_od", "b", JobPermit::detached())
+        .await
+        .expect("back up");
+    let source_created = s
+        .engine
+        .describe(ACCOUNT, &backup.backup_arn)
+        .await
+        .expect("describe the backup")
+        .source_table_details
+        .table_creation_date_time;
+    let deleted = s
+        .engine
+        .delete_table(
+            ACCOUNT,
+            extenddb_core::types::DeleteTableInput {
+                table_name: "dm_od".to_owned(),
+            },
+        )
+        .await
+        .expect("delete");
+    let pay_per_request = described
+        .billing_mode_summary
+        .as_ref()
+        .and_then(|summary| summary.last_update_to_pay_per_request_date_time)
+        .expect("an on-demand table's LastUpdateToPayPerRequestDateTime");
+    // Truncated, not rounded: a stored .194914 reads as .194.
+    assert_eq!(described.creation_date_time.to_string(), "1794835907.194");
+    assert_eq!(pay_per_request.to_string(), "1794835907.194");
+    assert_eq!(deleted.creation_date_time.to_string(), "1794835907.194");
+    assert_eq!(source_created.to_string(), "1794835907.194");
+    s.cleanup().await;
+}
+
 /// Backup rows for an [`indexed_source`] table, every one inside both the GSI
 /// (`g`) and the LSI (`l`).
 fn bulk_rows(n: usize) -> Vec<serde_json::Value> {

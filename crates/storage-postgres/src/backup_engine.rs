@@ -1563,7 +1563,7 @@ impl LegacyBackupReader for PostgresEngine {
                  COALESCE(t.table_arn, \
                    'arn:aws:dynamodb:' || $2 || ':' || b.account_id || ':table/' || b.table_name), \
                  b.created_at, \
-                 COALESCE(t.creation_date_time, b.created_at) \
+                 COALESCE(date_trunc('milliseconds', t.creation_date_time), b.created_at) \
                  FROM backups b \
                  LEFT JOIN tables t ON t.table_id = b.table_id \
                  WHERE b.backup_arn = $1 AND b.account_id = $3 AND b.backup_status != 'DELETED'",
@@ -1813,7 +1813,8 @@ impl LegacyBackupReader for PostgresEngine {
                    'arn:aws:dynamodb:' || $3 || ':' || b.account_id || ':table/' || b.table_name), \
                  b.key_schema, b.attribute_definitions, b.billing_mode, \
                  b.provisioned_throughput, b.item_count, b.backup_size_bytes, b.created_at, \
-                 COALESCE(t.creation_date_time, b.created_at), b.vector_indexes, d.definition \
+                 COALESCE(date_trunc('milliseconds', t.creation_date_time), b.created_at), \
+                 b.vector_indexes, d.definition \
                  FROM backups b \
                  LEFT JOIN tables t ON t.table_id = b.table_id \
                  LEFT JOIN backup_definitions d ON d.backup_arn = b.backup_arn \
