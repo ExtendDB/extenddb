@@ -1516,12 +1516,12 @@ pub fn check_format_version(found: u32) -> Result<(), FormatError> {
 }
 
 /// The service's `BackupName` rule: 3 to 255 characters of `[a-zA-Z0-9_.-]`,
-/// the table-name alphabet of `validate_table_name_chars`. That is not the
-/// only copy of the alphabet: the engine's `validate_name_member`
-/// (`BackupName` on `CreateBackup`) and `validate_index_name` spell it again,
-/// and the engine counts the bounds in characters where this counts bytes
-/// (the same for this ASCII alphabet). `extenddb backup migrate-legacy`
-/// checks an in-catalog backup's name with it before it writes the copy.
+/// the table-name alphabet of `validate_table_name_chars`. The engine checks
+/// `BackupName` on `CreateBackup` with `validate_name_member`, which takes the
+/// alphabet from the same function and counts the bounds in characters where
+/// this counts bytes (the same for this ASCII alphabet). `extenddb backup
+/// migrate-legacy` checks an in-catalog backup's name with it before it
+/// writes the copy.
 #[must_use]
 pub fn is_valid_backup_name(name: &str) -> bool {
     (3..=255).contains(&name.len()) && crate::validation::validate_table_name_chars(name).is_ok()

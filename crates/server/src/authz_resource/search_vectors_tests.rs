@@ -63,7 +63,7 @@ fn search_vectors_adversarial_index_names_name_no_real_index() {
     ] {
         let t = single(json!({ "TableName": "bb", "IndexName": name }));
         assert_eq!(t.resource, format!("{TABLE}/index/{name}"), "{name}");
-        assert!(validate_index_name(name).is_err(), "{name}");
+        assert!(validate_index_name(name, "indexName").is_err(), "{name}");
     }
     for name in ["vidx/extra", "vidx/index/other"] {
         let t = single(json!({ "TableName": "bb", "IndexName": name }));
