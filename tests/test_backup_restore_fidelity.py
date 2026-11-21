@@ -1256,8 +1256,9 @@ def test_restore_into_a_creating_target_and_a_second_restore_of_its_backup_are_r
 
 
 def test_target_and_backup_are_held_while_the_copy_runs(dynamodb_client, large_backup):
-    """DeleteTable of a CREATING restore target is ResourceInUseException, and
-    (ExtendDB) DeleteBackup of its source is BackupInUseException.
+    """DeleteTable of a CREATING restore target is ResourceInUseException, with
+    DynamoDB's text on the service and ExtendDB's on ExtendDB, and (ExtendDB)
+    DeleteBackup of its source is BackupInUseException.
 
     Each probe is judged on the status read just before it: if the target was
     CREATING the probe must be refused. A probe that found the target already
@@ -1274,27 +1275,37 @@ def test_target_and_backup_are_held_while_the_copy_runs(dynamodb_client, large_b
             "DeleteBackup",
             lambda: client.delete_backup(BackupArn=large_backup["backup_arn"]),
             client.exceptions.BackupInUseException,
+            None,
         ))
+    # DynamoDB's text (measured on 2026-11-21) and ExtendDB's, which differ.
+    in_use = (
+        f"Table: {target} is being used."
+        if _is_real_dynamodb()
+        else f"Table is being restored: {target}"
+    )
     probes.append((
         "DeleteTable",
         lambda: client.delete_table(TableName=target),
         client.exceptions.ResourceInUseException,
+        "Attempt to change a resource which is still in use: " + in_use,
     ))
     in_window, after = [], []
     try:
         client.restore_table_from_backup(
             TargetTableName=target, BackupArn=large_backup["backup_arn"]
         )
-        for name, call, refusal in probes:
+        for name, call, refusal, message in probes:
             before = client.describe_table(TableName=target)["Table"]["TableStatus"]
             try:
                 call()
-            except refusal:
-                refused = True
+            except refusal as e:
+                refused = e.response["Error"]["Message"]
             else:
-                refused = False
+                refused = None
             if before == "CREATING":
-                assert refused, f"{name} succeeded while its restore target was CREATING"
+                assert refused is not None, f"{name} succeeded while its restore target was CREATING"
+                if message is not None:
+                    assert refused == message, name
                 in_window.append(name)
             else:
                 assert before == "ACTIVE", f"restore target {target} is {before}"
