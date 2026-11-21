@@ -49,7 +49,10 @@ homepage = "https://extenddb.org/"
 extenddb-core = { path = "crates/core", version = "=1.0.0" }
 extenddb-cache = { path = "crates/cache", version = "=1.0.0" }
 extenddb-backup-store = { path = "crates/backup-store", version = "=1.0.0" }
-extenddb-engine = { path = "crates/engine", version = "=1.0.0" }
+# The engine entry turns default features off so that a member can choose
+# them: `server` and `app` ask for `default`, the WebAssembly adapter asks for
+# none.
+extenddb-engine = { path = "crates/engine", version = "=1.0.0", default-features = false }
 extenddb-storage = { path = "crates/storage", version = "=1.0.0" }
 extenddb-config = { path = "crates/config", version = "=1.0.0" }
 extenddb-storage-cassandra = { path = "crates/storage-cassandra", version = "=1.0.0" }

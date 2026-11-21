@@ -23,18 +23,13 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 extenddb-auth = { workspace = true }
 extenddb-core = { workspace = true }
-# The browser build refuses the PartiQL operations in this crate, before
-# dispatch, so the engine is built without its PartiQL surface: that surface
+# The engine is built without its default `partiql` feature (the workspace
+# entry turns default features off). The browser build refuses the PartiQL
+# operations in this crate, before dispatch: the engine's PartiQL surface
 # needs an item authorizer the browser build does not install, and its
 # snapshot path reads the backup runtime, which the wasm engine build does not
 # carry.
-#
-# Declared directly rather than inherited from the workspace: the workspace
-# entry does not set `default-features`, and cargo rejects a member turning it
-# off on an inherited dependency ("`default-features = false` cannot override
-# workspace's `default-features`"). The path and version match the workspace
-# entry.
-extenddb-engine = { path = "../engine", version = "=1.0.0", default-features = false }
+extenddb-engine = { workspace = true }
 extenddb-storage = { workspace = true }
 # The in-browser backend: the SQLite storage engine opened on a `:memory:`
 # database. The `memory` cargo feature is deliberately not enabled — it only
