@@ -83,7 +83,7 @@ RUN_CATALOG_CHECK=false
 # step with the lists of devtools/wasm-clippy, their self-test and the adapter's
 # pedantic clippy), --headless builds the wasm module and runs the parity corpus
 # through it under Node, and --wasm-test runs the on-target wasm-bindgen-test
-# suites (crypto, SQLite shim) under Node.
+# suites (extenddb-core's and the SQLite shim's) under Node.
 RUN_WASM=false
 RUN_HEADLESS=false
 RUN_WASM_TEST=false
