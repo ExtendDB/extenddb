@@ -133,7 +133,7 @@ fn pool_options() -> sqlx::sqlite::SqlitePoolOptions {
 /// Pool options; the shim has no acquire timeout to set.
 #[cfg(target_arch = "wasm32")]
 fn pool_options() -> sqlx::sqlite::SqlitePoolOptions {
-    sqlx::sqlite::SqlitePoolOptions::new()
+    sqlx::pool_options()
 }
 
 /// The variant name of an error: its `Debug` text up to the first character

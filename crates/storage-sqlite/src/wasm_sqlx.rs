@@ -722,7 +722,12 @@ pub struct SqlitePoolOptions {
 
 impl SqlitePoolOptions {
     /// A fresh pool builder.
-    pub fn new() -> Self {
+    ///
+    /// Crate-private, where `sqlx`'s is public, so that clippy's
+    /// `new_without_default` does not ask for a `Default` impl that nothing
+    /// would use. The backend calls it; `tests/wasm_shim.rs` starts from
+    /// `wasm_sqlx_for_tests::pool_options`.
+    pub(crate) fn new() -> Self {
         SqlitePoolOptions {
             max_connections: 1,
             after_connect: None,
@@ -783,14 +788,6 @@ impl SqlitePoolOptions {
             max_connections: self.max_connections,
             closed: Arc::new(AtomicBool::new(false)),
         })
-    }
-}
-
-// Not used by the backend; clippy's `new_without_default` asks a public
-// `new()` to come with it.
-impl Default for SqlitePoolOptions {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

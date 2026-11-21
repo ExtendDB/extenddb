@@ -63,6 +63,13 @@ pub mod wasm_sqlx_for_tests {
     pub use crate::wasm_sqlx::{
         Error, FromRow, Row, SqlitePool, query, query_as, query_scalar, raw_sql, sqlite,
     };
+
+    /// A fresh pool builder from the shim's crate-private
+    /// `SqlitePoolOptions::new()`. The tests call this where they call
+    /// `sqlx::sqlite::SqlitePoolOptions::new()` natively.
+    pub fn pool_options() -> sqlite::SqlitePoolOptions {
+        sqlite::SqlitePoolOptions::new()
+    }
 }
 
 /// Declare a catalog-row struct with a single field list that decodes the same
