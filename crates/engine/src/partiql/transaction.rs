@@ -33,7 +33,7 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::Projection as ItemProjection;
 use extenddb_core::partiql::Statement;
 use extenddb_core::partiql::ast::{Projection, Returning, SelectStatement};
-use extenddb_core::partiql::parser::parse_for_request;
+use extenddb_core::partiql::parser::parse_for_transaction;
 use extenddb_core::types::{CancellationReason, Item};
 
 use super::common;
@@ -135,10 +135,12 @@ pub(super) async fn run(
 /// 2026-11-05), but after their JSON types, which the request checked first
 /// (measured 2026-11-06). A malformed statement fails the whole request, its
 /// message prefixed with the statement's position (measured 2026-11-02 on an
-/// empty WHERE). A parameter that cannot be converted is reported without the
-/// statement's position (measured 2026-11-02), and so is one the service
-/// refuses for its content, such as an empty set (measured 2026-11-06); the
-/// checks on a parsed statement name it.
+/// empty WHERE), and so does a statement that is a call, as an operation a
+/// transaction does not run (measured 2026-11-13; see
+/// `parse_for_transaction`). A parameter that cannot be converted is reported
+/// without the statement's position (measured 2026-11-02), and so is one the
+/// service refuses for its content, such as an empty set (measured
+/// 2026-11-06); the checks on a parsed statement name it.
 /// A projected call (`COUNT(*)`) is among those checks, so it is refused
 /// ahead of every table lookup (measured 2026-11-02), and so are a
 /// projection list that names an identifier twice or two paths that
@@ -157,7 +159,7 @@ fn parse_member(i: usize, obj: &Value) -> Result<(SingleRequest, Statement), Dyn
     }
     super::check_parameters(obj.get("Parameters")).map_err(DynamoDbError::ValidationException)?;
     let req = SingleRequest::from_body(obj)?;
-    let stmt = parse_for_request(&req.statement, req.parameters.len())
+    let stmt = parse_for_transaction(&req.statement, req.parameters.len())
         .map_err(|e| positional(&e.message))?;
     super::check_statement(&stmt, &req.parameters, &req.statement)
         .map_err(|message| positional(&message))?;
@@ -563,81 +565,4 @@ fn reject_returning(stmt: &Statement, index: usize) -> Result<(), DynamoDbError>
 const RETURNING_REFUSAL: &str = "RETURNING clause is not supported in ExecuteTransaction.";
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use extenddb_core::partiql::parse;
-
-    fn refusal(sql: &str, index: usize) -> Option<String> {
-        reject_returning(&parse(sql).unwrap(), index)
-            .err()
-            .map(|e| e.message().to_owned())
-    }
-
-    #[test]
-    fn a_cancellation_lists_every_reason_code_in_order() {
-        let err = cancellation(vec![
-            CancellationReason::none(),
-            not_found_reason(),
-            CancellationReason::validation_error(common::KEY_SCHEMA_MISMATCH),
-        ]);
-        assert_eq!(
-            err.message(),
-            "Transaction cancelled, please refer cancellation reasons for specific reasons \
-             [None, ResourceNotFound, ValidationError]"
-        );
-    }
-
-    #[test]
-    fn every_update_returning_mode_is_refused_with_its_position() {
-        for mode in ["ALL OLD", "MODIFIED OLD", "ALL NEW", "MODIFIED NEW"] {
-            let sql = format!("UPDATE \"t\" SET a = 1 WHERE pk = 'k' RETURNING {mode} *");
-            assert_eq!(
-                refusal(&sql, 3).as_deref(),
-                Some(
-                    "Validation failed in TransactStatements[3]: RETURNING clause is not \
-                     supported in ExecuteTransaction."
-                ),
-                "{mode}"
-            );
-        }
-    }
-
-    #[test]
-    fn delete_returning_all_old_is_refused_like_an_update() {
-        assert_eq!(
-            refusal("DELETE FROM \"t\" WHERE pk = 'k' RETURNING ALL OLD *", 0).as_deref(),
-            Some(
-                "Validation failed in TransactStatements[0]: RETURNING clause is not \
-                 supported in ExecuteTransaction."
-            )
-        );
-    }
-
-    #[test]
-    fn delete_with_another_returning_clause_reports_the_invalid_clause() {
-        assert_eq!(
-            refusal(
-                "DELETE FROM \"t\" WHERE pk = 'k' RETURNING MODIFIED OLD *",
-                1
-            )
-            .as_deref(),
-            Some(
-                "Validation failed in TransactStatements[1]: Invalid returning clause: \
-                 RETURNING MODIFIED OLD *. Only RETURNING ALL OLD * is allowed in DELETE \
-                 statements."
-            )
-        );
-    }
-
-    #[test]
-    fn members_without_returning_pass() {
-        for sql in [
-            "UPDATE \"t\" SET a = 1 WHERE pk = 'k'",
-            "DELETE FROM \"t\" WHERE pk = 'k'",
-            "INSERT INTO \"t\" VALUE {'pk': 'k'}",
-            "SELECT * FROM \"t\" WHERE pk = 'k'",
-        ] {
-            assert_eq!(refusal(sql, 0), None, "{sql}");
-        }
-    }
-}
+mod tests;

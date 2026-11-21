@@ -205,6 +205,8 @@ def test_is_filters(dynamodb_client, stable, typed_item, condition, matches):
         ("VARCHAR", "CharacterVaryingType"),
         ("SYMBOL", "SymbolType"),
         ("BAG", "BagType"),
+        ("CHAR VARYING(5)", "CharacterVaryingType"),
+        ("TIME(3) WITH TIME ZONE", "TimeWithTimeZoneType"),
     ],
 )
 def test_an_is_filter_on_a_type_with_no_filter(dynamodb_client, stable, type_name, service_name):
@@ -540,7 +542,7 @@ def test_a_statement_may_end_with_a_semicolon(dynamodb_client, stable):
     assert _message(dynamodb_client, "x IS INT4;") == "Unsupported operation: IsType"
 
 
-@pytest.mark.parametrize("tail", ["{'pk': 'x'}", "t", "'x'"])
+@pytest.mark.parametrize("tail", ["{'pk': 'x'}", "t", "'x'", "<<{'pk': 'a'}, {'pk': 'b'}>>"])
 def test_an_insert_without_value_is_refused_as_many_items(dynamodb_client, stable, tail):
     assert _message(dynamodb_client, f"INSERT INTO \"{stable}\" {tail}") == (
         "Unsupported operation: Inserting multiple items in a single statement is not "
@@ -652,6 +654,9 @@ CHECK = "EXISTS can only be used in ExecuteTransaction write requests."
         ("x IS VARCHAR(10)", "Unsupported operation: IsType"),
         ("x IS TIME WITH TIME ZONE", "Unsupported operation: IsType"),
         ("'a' IS STRING", "Unsupported operation: IsType"),
+        ('"foo"(1)', CHECK),
+        ("count(1)", "Unsupported operation: CallAgg"),
+        ("foo(1).a", "Unsupported operation: Path"),
     ],
 )
 def test_a_bare_expression_is_refused_by_what_it_is(dynamodb_client, statement, message):

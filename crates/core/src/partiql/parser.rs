@@ -16,6 +16,7 @@ mod forms;
 mod limits;
 mod literals;
 mod operands;
+mod paths;
 mod predicates;
 mod statements;
 mod terms;
@@ -23,7 +24,7 @@ mod walk;
 
 pub use limits::{MAX_STATEMENT_LENGTH, statement_length_refusal};
 use limits::{Nest, Nesting};
-use operands::Brackets;
+use paths::Brackets;
 use walk::Findings;
 
 /// A parse failure. `message` is the full `ValidationException` string the
@@ -87,6 +88,20 @@ const IS_LEFT_SIDE: &str =
 pub const EXISTS_OUTSIDE_TRANSACTION: &str =
     "EXISTS can only be used in ExecuteTransaction write requests.";
 
+/// The refusal of a statement that is a call in an ExecuteTransaction
+/// (measured 2026-11-13 and 2026-11-14 with `foo(1)`, `size(1)`,
+/// `attribute_exists(a)`, `EXISTS()`, `exists(foo(1))` and `EXISTS(SELECT *
+/// FROM "t" WHERE pk = 1, 1)`, among others).
+pub const UNSUPPORTED_IN_TRANSACTION: &str = "Unsupported operation in transaction.";
+
+/// The refusal of a statement the service reads and does not run: `what`
+/// names the statement's form as the service does (`Id`, `Lit`, `IsType`,
+/// `CallAgg`, ...) or says what the statement does (an INSERT of several
+/// items).
+pub(crate) fn unsupported_operation(what: &str) -> String {
+    format!("Unsupported operation: {what}")
+}
+
 /// The refusal of an operand that is the whole WHERE condition (measured
 /// 2026-11-02 with a name, a path, a number, a string, a list, `true` and a
 /// parameter).
@@ -121,7 +136,7 @@ const NO_COMPARISON: &str = "Expected a comparison operator";
 /// Returns a [`ParseError`] whose `message` is the service's
 /// `ValidationException` text for the failure.
 pub fn parse(input: &str) -> PResult<Statement> {
-    limits::parse_on_a_fitting_stack(|inline| parse_attempt(input, None, false, inline))
+    limits::parse_on_a_fitting_stack(|inline| parse_attempt(input, None, Request::Any, inline))
 }
 
 /// [`parse`] for a request that gives `parameters` values for the statement's
@@ -133,7 +148,9 @@ pub fn parse(input: &str) -> PResult<Statement> {
 ///
 /// As [`parse`].
 pub fn parse_for_request(input: &str, parameters: usize) -> PResult<Statement> {
-    limits::parse_on_a_fitting_stack(|inline| parse_attempt(input, Some(parameters), false, inline))
+    limits::parse_on_a_fitting_stack(|inline| {
+        parse_attempt(input, Some(parameters), Request::Any, inline)
+    })
 }
 
 /// [`parse_for_request`] for an ExecuteStatement request, which refuses an
@@ -145,24 +162,52 @@ pub fn parse_for_request(input: &str, parameters: usize) -> PResult<Statement> {
 ///
 /// As [`parse`].
 pub fn parse_for_execute_statement(input: &str, parameters: usize) -> PResult<Statement> {
-    limits::parse_on_a_fitting_stack(|inline| parse_attempt(input, Some(parameters), true, inline))
+    limits::parse_on_a_fitting_stack(|inline| {
+        parse_attempt(input, Some(parameters), Request::ExecuteStatement, inline)
+    })
+}
+
+/// [`parse_for_request`] for a member of an ExecuteTransaction request, which
+/// refuses a statement that is a call as an operation a transaction does not
+/// run (see [`UNSUPPORTED_IN_TRANSACTION`]).
+///
+/// # Errors
+///
+/// As [`parse`].
+pub fn parse_for_transaction(input: &str, parameters: usize) -> PResult<Statement> {
+    limits::parse_on_a_fitting_stack(|inline| {
+        parse_attempt(input, Some(parameters), Request::ExecuteTransaction, inline)
+    })
 }
 
 /// [`parse`] with the full caps on the calling thread, for the tests that
 /// measure the stack a deep statement needs.
 #[cfg(test)]
 pub(crate) fn parse_with_full_caps(input: &str) -> PResult<Statement> {
-    parse_attempt(input, None, false, false).expect("only an inline parse runs out of budget")
+    parse_attempt(input, None, Request::Any, false)
+        .expect("only an inline parse runs out of budget")
+}
+
+/// The request a statement is parsed for, where the request changes the
+/// answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Request {
+    /// A request that changes none, or no request.
+    Any,
+    /// ExecuteStatement, which refuses an `EXISTS(SELECT ...)` statement.
+    ExecuteStatement,
+    /// ExecuteTransaction, which refuses a statement that is a call.
+    ExecuteTransaction,
 }
 
 /// One parse of `input`, for a request with `parameters` values when that is
-/// known, refusing an EXISTS statement when `refuse_exists`. `inline` keeps
-/// the parse within the depth budget of the caller's thread; `None` means it
-/// ran out (see [`limits`]).
+/// known, with the answers of `request`. `inline` keeps the parse within the
+/// depth budget of the caller's thread; `None` means it ran out (see
+/// [`limits`]).
 fn parse_attempt(
     input: &str,
     parameters: Option<usize>,
-    refuse_exists: bool,
+    request: Request,
     inline: bool,
 ) -> Option<PResult<Statement>> {
     // A lexing failure carries nothing after the prefix (see the lexer).
@@ -174,7 +219,7 @@ fn parse_attempt(
         pos: 0,
         next_param: 0,
         parameters,
-        refuse_exists,
+        request,
         found: Findings::default(),
         select_list_call: None,
         table: None,
@@ -219,8 +264,8 @@ struct Parser {
     /// How many parameters the request gives, when the statement is parsed
     /// for a request.
     parameters: Option<usize>,
-    /// Whether an `EXISTS(SELECT ...)` statement is refused (ExecuteStatement).
-    refuse_exists: bool,
+    /// The request the statement is parsed for.
+    request: Request,
     /// The refusals found in a statement that is still being read (an alias,
     /// a refused `FROM` path). They are reported only once the statement
     /// parses; see [`walk`].

@@ -3,7 +3,7 @@
 
 //! The statements: SELECT, INSERT, UPDATE and DELETE, their targets and their clauses.
 
-use super::{Brackets, PResult, ParseError, Parser};
+use super::{Brackets, Nest, PResult, ParseError, Parser, unsupported_operation};
 use crate::partiql::ast::{
     DeleteStatement, FromSource, InsertStatement, OrderBy, OrderTerm, Path, Projection, Returning,
     SelectStatement, Statement, UpdateStatement,
@@ -31,7 +31,7 @@ impl Parser {
             self.bump();
             Ok(Statement::Update(self.update_led_by_from()?))
         } else if self.at_exists_statement() {
-            Ok(Statement::Exists(self.exists_statement()?))
+            self.exists_statement()
         } else {
             // A statement that starts with none of the statement keywords is
             // read as a bare expression and refused by what it is.
@@ -371,20 +371,27 @@ impl Parser {
     /// `INSERT INTO <table>` followed by something other than VALUE: the
     /// service reads an expression there, the items to insert, and refuses a
     /// statement that ends after it (measured 2026-11-02 with a map, a name
-    /// and a string). Tokens after the expression are a leftover token
-    /// (`INSERT INTO "t" t VALUE {...}`), and no expression at all is the term
-    /// error ("Unexpected term" at the end of the statement).
+    /// and a string, and 2026-11-13 with a bag of two maps). A bag there is
+    /// read as the bag after IN is, not as a set literal. Tokens after the
+    /// expression are a leftover token (`INSERT INTO "t" t VALUE {...}`), and
+    /// no expression at all is the term error ("Unexpected term" at the end
+    /// of the statement).
     fn insert_without_value(&mut self) -> ParseError {
-        if let Err(e) = self.operand() {
+        let read = if matches!(self.peek().kind, TokenKind::LDoubleAngle) {
+            self.nested(Nest::Literal, Self::in_bag).map(drop)
+        } else {
+            self.operand().map(drop)
+        };
+        if let Err(e) = read {
             return e;
         }
         self.eat_final_semicolon();
         if !matches!(self.peek().kind, TokenKind::Eof) {
             return self.trailing_error();
         }
-        ParseError::new(
-            "Unsupported operation: Inserting multiple items in a single statement is not supported, use \"INSERT INTO tableName VALUE item\" instead",
-        )
+        ParseError::new(unsupported_operation(
+            "Inserting multiple items in a single statement is not supported, use \"INSERT INTO tableName VALUE item\" instead",
+        ))
     }
 
     fn update(&mut self) -> PResult<UpdateStatement> {
@@ -411,7 +418,7 @@ impl Parser {
         })
     }
 
-    fn delete(&mut self) -> PResult<DeleteStatement> {
+    pub(super) fn delete(&mut self) -> PResult<DeleteStatement> {
         if !self.eat_keyword("FROM") {
             return Err(ParseError::well_formed("Expected FROM after DELETE"));
         }

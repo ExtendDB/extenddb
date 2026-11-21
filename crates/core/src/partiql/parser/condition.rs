@@ -370,8 +370,9 @@ impl Parser {
     }
 
     /// The type name after `IS` / `IS NOT`: one of the service's type keywords
-    /// (`DOUBLE PRECISION` and `CHARACTER VARYING` are two words), else
-    /// "Expected type name" (measured 2026-11-02).
+    /// (`DOUBLE PRECISION`, `CHARACTER VARYING` and `CHAR VARYING` are two
+    /// words), else "Expected type name" (measured 2026-11-02, and 2026-11-13
+    /// for `CHAR VARYING(5)`).
     pub(super) fn type_name(&mut self) -> PResult<TypeName> {
         let word = match &self.peek().kind {
             TokenKind::Ident(w) => w.to_ascii_lowercase(),
@@ -381,9 +382,9 @@ impl Parser {
             Some(TokenKind::Ident(w)) => w.to_ascii_lowercase(),
             _ => String::new(),
         };
-        let (ty, words) = match (word.as_str(), second.as_str()) {
+        let (mut ty, words) = match (word.as_str(), second.as_str()) {
             ("double", "precision") => (TypeName::DoublePrecision, 2),
-            ("character", "varying") => (TypeName::CharacterVarying, 2),
+            ("character" | "char", "varying") => (TypeName::CharacterVarying, 2),
             (w, _) => match TypeName::from_keyword(w) {
                 Some(ty) => (ty, 1),
                 None => return Err(ParseError::well_formed("Expected type name")),
@@ -392,9 +393,11 @@ impl Parser {
         for _ in 0..words {
             self.bump();
         }
-        // A length or precision in parentheses, and the time zone of a time,
-        // are read and do not change the type (measured 2026-11-02:
-        // `IS VARCHAR(10)` and `IS TIME WITH TIME ZONE` parse).
+        // A length or precision in parentheses is read and does not change
+        // the type (measured 2026-11-02: `IS VARCHAR(10)` parses). A time
+        // zone makes a time a type of its own (measured 2026-11-13: `IS
+        // TIME(3) WITH TIME ZONE` is refused as TimeWithTimeZoneType); a
+        // timestamp with one is not measured and keeps its type.
         if self.eat(&TokenKind::LParen) {
             loop {
                 if !matches!(self.peek().kind, TokenKind::Number(_)) {
@@ -409,11 +412,13 @@ impl Parser {
                 return Err(ParseError::well_formed("Expected RIGHT_PAREN"));
             }
         }
-        if matches!(ty, TypeName::Time | TypeName::Timestamp)
-            && self.eat_keyword("WITH")
-            && !(self.eat_keyword("TIME") && self.eat_keyword("ZONE"))
-        {
-            return Err(ParseError::well_formed("Expected type name"));
+        if matches!(ty, TypeName::Time | TypeName::Timestamp) && self.eat_keyword("WITH") {
+            if !(self.eat_keyword("TIME") && self.eat_keyword("ZONE")) {
+                return Err(ParseError::well_formed("Expected type name"));
+            }
+            if ty == TypeName::Time {
+                ty = TypeName::TimeWithTimeZone;
+            }
         }
         Ok(ty)
     }

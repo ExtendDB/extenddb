@@ -68,6 +68,18 @@ fn any_other_call_is_unrecognized_at_its_name() {
         ),
         ("(upper(m))", "Unrecognized function: upper at 1:23:5"),
         ("upper()", "Unrecognized function: upper at 1:22:5"),
+        // A set function with an arithmetic operator after it is not the
+        // value on its own, and the empty bag in one comes first.
+        ("set_add(a) + 1", "Unrecognized function: set_add at 1:22:7"),
+        (
+            "set_add(a, <<'b'>>) + 1",
+            "Unrecognized function: set_add at 1:22:7",
+        ),
+        (
+            "set_delete(a, <<'b'>>) - 1",
+            "Unrecognized function: set_delete at 1:22:10",
+        ),
+        ("set_add(<<>>) + 1", EMPTY_BAG),
     ] {
         assert_eq!(written(&update(call)), Err(message.to_owned()), "{call}");
     }

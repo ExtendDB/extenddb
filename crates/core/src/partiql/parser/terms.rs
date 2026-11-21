@@ -16,10 +16,11 @@
 //! (`SELECT <w> FROM ...`). Where such a form reads to its end, the answer is
 //! not measured and the word keeps the term error of its class.
 
-use super::{Brackets, PResult, ParseError, Parser};
+use super::{Brackets, Nest, PResult, ParseError, Parser, Request, unsupported_operation};
 use crate::partiql::ast::{Operand, Path, Statement};
 use crate::partiql::lexer::{TokenKind, WordClass, word_class};
 use crate::partiql::parse_error;
+use crate::partiql::values::AGGREGATES;
 use crate::types::AttributeValue;
 
 /// The keywords that end a select list rather than start an item. In an item's
@@ -43,16 +44,19 @@ const PAREN_UNNAMED: [&str; 5] = ["date_add", "date_diff", "extract", "substring
 
 const SIMPLE_PATH: &str = "Expected identifier for simple path";
 
-/// How a bare expression statement is refused: by the kind of expression it is.
-enum BareForm {
-    /// An operator expression (`x = 1`, `NOT x`, `x IS NOT INT4`) or a call
-    /// (`size(x)`): the service takes it for a condition check, which only a
-    /// transaction runs.
+/// How a statement that is an expression is refused: by the kind of
+/// expression it is.
+pub(super) enum BareForm {
+    /// A call (`size(x)`, `EXISTS(1, 2)`): the service takes it for a
+    /// condition check, which only a transaction runs, and a transaction does
+    /// not run a call.
+    Call,
+    /// An operator expression (`x = 1`, `NOT x`, `x IS NOT INT4`): the
+    /// service takes it for a condition check, which only a transaction runs.
     Operator,
-    /// `x IS <type>`.
-    IsType,
-    /// A single term, named as the service names it (`Id`, `Lit`, ...).
-    Term(&'static str),
+    /// An expression named as the service names it (`Id`, `Lit`, `IsType`,
+    /// `CallAgg`, ...).
+    Unsupported(&'static str),
 }
 
 impl Parser {
@@ -88,15 +92,9 @@ impl Parser {
                 self.operand()?;
                 Err(fallback)
             }
-            // A query: its select list starts at the next token.
-            "select" => {
-                self.bump();
-                if let Some(e) = self.select_list_keyword() {
-                    return Err(e);
-                }
-                self.operand()?;
-                Err(fallback)
-            }
+            // A query: it reads to its end and is refused once the statement
+            // parses (see [`Parser::subquery_term`]).
+            "select" => self.subquery_term(),
             // `FROM <source> [WHERE ...]` followed by a data manipulation.
             "from" => {
                 self.bump();
@@ -154,10 +152,14 @@ impl Parser {
                     word.to_ascii_uppercase()
                 ))),
             },
-            "delete" => match next {
-                Some(TokenKind::Ident(w)) if w.eq_ignore_ascii_case("from") => Err(fallback),
-                _ => Err(ParseError::well_formed("Expected FROM after DELETE")),
-            },
+            // A DELETE reads to its end, and is then refused for its place
+            // (measured 2026-11-13: `foo(DELETE FROM "t" WHERE pk = 1)`). It
+            // nests as a query does (see [`limits`]).
+            "delete" => {
+                self.bump();
+                self.nested(Nest::Query, Self::delete)?;
+                Err(ParseError::new(top_level_only("delete")))
+            }
             "set" | "remove" | "update" if !self.name_follows() => {
                 Err(ParseError::well_formed(SIMPLE_PATH))
             }
@@ -186,9 +188,28 @@ impl Parser {
                 }
             }
         }
-        self.defer(&parse_error(&format!(
-            "Keyword {name} only expected at the top level in the query"
-        )));
+        self.defer(&top_level_only(&name));
+        Ok(Operand::Literal(AttributeValue::Null))
+    }
+
+    /// A query where a term starts, with the current token on its SELECT: the
+    /// service reads it and refuses the statement at the SELECT once it
+    /// parses (measured 2026-11-13 and 2026-11-14: `pk = (SELECT * FROM "t")`
+    /// and `a IN [SELECT a FROM "t"]` in a condition, and `SET a = (SELECT *
+    /// FROM "t") + 1`). The query is only read, as an expression in brackets
+    /// is: what it finds is dropped, and the state the parse keeps for the
+    /// statement is put back. It nests as a query does (see [`limits`]). The
+    /// operand returned stands for it and never runs.
+    fn subquery_term(&mut self) -> PResult<Operand> {
+        let refusal = format!("Unsupported token in expression: SELECT at {}", self.span());
+        self.bump();
+        let table = self.table.take();
+        let after_where = self.after_where;
+        let read = self.read_and_drop(Nest::Query, |p| p.select(false));
+        self.table = table;
+        self.after_where = after_where;
+        read?;
+        self.defer(&refusal);
         Ok(Operand::Literal(AttributeValue::Null))
     }
 
@@ -256,6 +277,14 @@ impl Parser {
     /// semicolon is accepted.
     pub(super) fn bare_statement(&mut self) -> PResult<Statement> {
         let form = self.bare_expression()?;
+        self.refuse_statement(form)
+    }
+
+    /// The refusal of a statement that is an expression of `form`, read to
+    /// its end. A call in a transaction is an operation a transaction does
+    /// not run (measured 2026-11-13 and 2026-11-14 with fourteen calls,
+    /// `EXISTS(1, 2)` and `exists(foo(1))` among them).
+    pub(super) fn refuse_statement(&mut self, form: BareForm) -> PResult<Statement> {
         self.eat_final_semicolon();
         if !matches!(self.peek().kind, TokenKind::Eof) {
             return Err(self.trailing_error());
@@ -264,9 +293,11 @@ impl Parser {
         // is refused by its form.
         self.forget_findings();
         Err(ParseError::new(match form {
-            BareForm::Operator => super::EXISTS_OUTSIDE_TRANSACTION.to_owned(),
-            BareForm::IsType => "Unsupported operation: IsType".to_owned(),
-            BareForm::Term(name) => format!("Unsupported operation: {name}"),
+            BareForm::Call if self.request == Request::ExecuteTransaction => {
+                super::UNSUPPORTED_IN_TRANSACTION.to_owned()
+            }
+            BareForm::Call | BareForm::Operator => super::EXISTS_OUTSIDE_TRANSACTION.to_owned(),
+            BareForm::Unsupported(name) => unsupported_operation(name),
         }))
     }
 
@@ -291,7 +322,14 @@ impl Parser {
     }
 
     fn bare_term(&mut self) -> PResult<BareForm> {
-        let operand = self.operand()?;
+        let mut operand = self.operand()?;
+        // A call with path steps after it is a path (measured 2026-11-13:
+        // `foo(1).a` is "Unsupported operation: Path").
+        if matches!(operand, Operand::Function(..))
+            && matches!(self.peek().kind, TokenKind::Dot | TokenKind::LBracket)
+        {
+            operand = Operand::Path(self.path_steps(Path::default())?);
+        }
         // `*` outside a condition is left to the caller (see `operand`).
         if self.eat(&TokenKind::Star) {
             self.require_rhs()?;
@@ -304,7 +342,7 @@ impl Parser {
             return Ok(if negated {
                 BareForm::Operator
             } else {
-                BareForm::IsType
+                BareForm::Unsupported("IsType")
             });
         }
         let comparison = matches!(
@@ -332,18 +370,23 @@ impl Parser {
             return Ok(BareForm::Operator);
         }
         Ok(match operand {
-            Operand::Path(path) if path.steps.is_empty() => BareForm::Term("Id"),
-            Operand::Path(_) => BareForm::Term("Path"),
-            Operand::Literal(AttributeValue::M(_)) => BareForm::Term("Struct"),
-            Operand::Literal(AttributeValue::L(_)) => BareForm::Term("List"),
+            Operand::Path(path) if path.steps.is_empty() => BareForm::Unsupported("Id"),
+            Operand::Path(_) => BareForm::Unsupported("Path"),
+            Operand::Literal(AttributeValue::M(_)) => BareForm::Unsupported("Struct"),
+            Operand::Literal(AttributeValue::L(_)) => BareForm::Unsupported("List"),
             Operand::Literal(AttributeValue::SS(_) | AttributeValue::NS(_)) => {
-                BareForm::Term("Bag")
+                BareForm::Unsupported("Bag")
             }
-            Operand::Literal(_) => BareForm::Term("Lit"),
-            Operand::Parameter(_) => BareForm::Term("Parameter"),
-            // A call is taken for a condition check like an operator
-            // expression (measured 2026-11-02 with `size(x)`).
-            Operand::Function(..) | Operand::Arith(..) => BareForm::Operator,
+            Operand::Literal(_) => BareForm::Unsupported("Lit"),
+            Operand::Parameter(_) => BareForm::Unsupported("Parameter"),
+            // An aggregate call is named as such (measured 2026-11-13 with
+            // `count(1)`); any other call is taken for a condition check like
+            // an operator expression (measured 2026-11-02 with `size(x)`).
+            Operand::Function(name, _) if AGGREGATES.contains(&name.as_str()) => {
+                BareForm::Unsupported("CallAgg")
+            }
+            Operand::Function(..) => BareForm::Call,
+            Operand::Arith(..) => BareForm::Operator,
         })
     }
 
@@ -356,6 +399,15 @@ impl Parser {
             self.bump();
         }
     }
+}
+
+/// The syntax error that names `word` as a keyword only a statement starts
+/// with: a DELETE where a term starts, and the token read as the name of an
+/// EXEC (see [`Parser::exec_term`]).
+fn top_level_only(word: &str) -> String {
+    parse_error(&format!(
+        "Keyword {word} only expected at the top level in the query"
+    ))
 }
 
 /// The text of a token as a message names it.

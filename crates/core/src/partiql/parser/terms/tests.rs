@@ -3,6 +3,10 @@
 
 //! Unit tests for the answers for a reserved word where a term or a name starts.
 
+use crate::partiql::parser::{
+    EXISTS_OUTSIDE_TRANSACTION, UNSUPPORTED_IN_TRANSACTION, parse_for_execute_statement,
+    parse_for_transaction, unsupported_operation,
+};
 use crate::partiql::{Statement, parse};
 
 const WF: &str = "Statement wasn't well formed, can't be processed: ";
@@ -249,4 +253,91 @@ fn ion_type_names() {
     assert_eq!(ion_type_name("{a: 1}"), "STRUCT");
     assert_eq!(ion_type_name("[1]"), "LIST");
     assert_eq!(ion_type_name("abc"), "SYMBOL");
+}
+
+/// The statements that are a call: ExecuteStatement takes each for a
+/// condition check, and a transaction answers each as an operation it does
+/// not run.
+const CALL_STATEMENTS: [&str; 14] = [
+    "foo(1)",
+    "foo()",
+    "FOO (1)",
+    "foo(?)",
+    "foo(<<>>)",
+    "foo(1e999999)",
+    "foo(foo(1), a.b[0])",
+    "size(1)",
+    "attribute_exists(a)",
+    "upper('a')",
+    "EXISTS()",
+    "EXISTS(1, 2)",
+    "exists(foo(1))",
+    "\"foo\"(1)",
+];
+
+#[test]
+fn a_statement_that_is_a_call_is_refused_by_the_request() {
+    for statement in CALL_STATEMENTS {
+        let parameters = usize::from(statement.contains('?'));
+        assert_eq!(
+            parse_for_execute_statement(statement, parameters)
+                .unwrap_err()
+                .message,
+            EXISTS_OUTSIDE_TRANSACTION,
+            "{statement}"
+        );
+        assert_eq!(
+            parse_for_transaction(statement, parameters)
+                .unwrap_err()
+                .message,
+            UNSUPPORTED_IN_TRANSACTION,
+            "{statement}"
+        );
+    }
+    // A query with more arguments after it is a call like any other.
+    let exists = "EXISTS(SELECT * FROM \"tbl\" WHERE pk = 1, 1)";
+    assert_eq!(
+        parse_for_transaction(exists, 0).unwrap_err().message,
+        UNSUPPORTED_IN_TRANSACTION
+    );
+    assert!(parse_for_transaction("EXISTS(SELECT * FROM \"tbl\" WHERE pk = 1)", 0).is_ok());
+}
+
+#[test]
+fn a_statement_the_service_reads_and_does_not_run_is_named_by_its_form() {
+    for (statement, expected) in [
+        ("count(1)", unsupported_operation("CallAgg")),
+        ("sum(1)", unsupported_operation("CallAgg")),
+        ("foo(1).a", unsupported_operation("Path")),
+        ("foo(1)[0].a", unsupported_operation("Path")),
+        (
+            "foo(DELETE FROM \"tbl\" WHERE pk = 1)",
+            wf("Keyword delete only expected at the top level in the query"),
+        ),
+    ] {
+        assert_eq!(answer(statement), expected, "{statement}");
+    }
+}
+
+#[test]
+fn a_query_where_a_term_starts_is_refused_at_its_select() {
+    for statement in [
+        "SELECT * FROM \"tbl\" WHERE pk = (SELECT * FROM \"tbl\")",
+        "SELECT * FROM \"tbl\" WHERE a IN [SELECT a FROM \"tbl\"]",
+        "UPDATE \"tbl\" SET a = (SELECT * FROM \"tbl\") + 1 WHERE pk = 'a'",
+        "SELECT * FROM \"tbl\" WHERE pk = (SELECT * FROM \"other\" WHERE pk = 'p' ORDER BY pk)",
+    ] {
+        // The nested SELECT is the last one in each statement.
+        let column = statement.rfind("SELECT").unwrap() + 1;
+        assert_eq!(
+            answer(statement),
+            format!("Unsupported token in expression: SELECT at 1:{column}:6"),
+            "{statement}"
+        );
+    }
+    // A fault in the query itself is a syntax error.
+    assert_eq!(
+        answer("SELECT * FROM \"tbl\" WHERE pk = (SELECT a)"),
+        wf("Expected FROM after SELECT list")
+    );
 }
