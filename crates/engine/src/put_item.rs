@@ -31,12 +31,15 @@ pub async fn handle_put_item(
 ) -> Result<DispatchResult, DynamoDbError> {
     // Validate table name from raw body first (takes priority over enum errors)
     if let Some(table_name) = body.get("TableName").and_then(|v| v.as_str()) {
-        extenddb_core::validation::validate_table_name(table_name, &ctx.limits)?;
+        extenddb_core::validation::table_name_length::validate_item_table_name(
+            table_name,
+            &ctx.limits,
+        )?;
     } else if body
         .get("TableName")
         .is_some_and(serde_json::Value::is_string)
     {
-        // empty string — caught by validate_table_name above
+        // An empty string is refused by validate_item_table_name above.
     } else if body.get("TableName").is_none()
         || body
             .get("TableName")

@@ -23,6 +23,8 @@ pub use warm_throughput::{
     validate_warm_throughput_on_update,
 };
 
+pub mod table_name_length;
+
 use crate::error::{DynamoDbError, ErrorMessageKey, error_message};
 use crate::limits::LimitsConfig;
 use crate::types::{

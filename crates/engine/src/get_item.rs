@@ -125,6 +125,14 @@ pub async fn handle_get_item(
         None => None,
     };
 
+    // See core's table_name_length for this order. An ARN is checked after the lookup.
+    if !input.table_name.starts_with("arn:") {
+        extenddb_core::validation::table_name_length::validate_item_table_name(
+            &input.table_name,
+            &ctx.limits,
+        )?;
+    }
+
     let key_info = ctx
         .table_key_info(&input.table_name)
         .await
@@ -172,3 +180,7 @@ pub async fn handle_get_item(
         },
     })
 }
+
+#[cfg(all(test, feature = "partiql"))]
+#[path = "table_name_length_tests.rs"]
+mod table_name_length_tests;

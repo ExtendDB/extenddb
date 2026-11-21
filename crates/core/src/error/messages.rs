@@ -4,6 +4,8 @@
 //! Error message templates captured from real `DynamoDB`.
 //! These are the exact messages `DynamoDB` returns — tenet 4 (errors are contracts).
 
+use crate::validation::table_name_length::{TOO_LONG, TOO_SHORT};
+
 /// Format a single validation constraint error in `DynamoDB`'s exact format.
 #[must_use]
 pub fn validation_error(value: &str, field: &str, constraint: &str) -> String {
@@ -36,6 +38,8 @@ pub enum ErrorMessageKey {
     TableNameTooLong,
     TableNameNull,
     TableNameEmpty,
+    /// An empty name in `GetItem` and `PutItem` (measured 2026-11-18).
+    ItemTableNameEmpty,
     TableNameInvalidChars,
     TableNotFound,
     TableAlreadyExists,
@@ -54,17 +58,16 @@ pub enum ErrorMessageKey {
 #[must_use]
 pub fn error_message(key: ErrorMessageKey, args: &[&str]) -> String {
     match key {
-        ErrorMessageKey::TableNameTooShort => {
-            format!("1 validation error detected: Value '{}' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3", args[0])
-        }
-        ErrorMessageKey::TableNameTooLong => {
-            format!("1 validation error detected: Value '{}' at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255", args[0])
-        }
+        ErrorMessageKey::TableNameTooShort => validation_error(args[0], "tableName", TOO_SHORT),
+        ErrorMessageKey::TableNameTooLong => validation_error(args[0], "tableName", TOO_LONG),
         ErrorMessageKey::TableNameNull => {
             "1 validation error detected: Value null at 'tableName' failed to satisfy constraint: Member must not be null".to_owned()
         }
         ErrorMessageKey::TableNameEmpty => {
             "1 validation error detected: Value '' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 1".to_owned()
+        }
+        ErrorMessageKey::ItemTableNameEmpty => {
+            "1 validation error detected: Value at 'TableName' failed to satisfy constraint: Member must have length greater than or equal to 1".to_owned()
         }
         ErrorMessageKey::TableNameInvalidChars => {
             format!(
