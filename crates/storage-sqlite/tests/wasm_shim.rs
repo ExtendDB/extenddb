@@ -28,6 +28,7 @@
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
+use std::str::FromStr;
 
 use extenddb_storage_sqlite as sqlx;
 use futures::StreamExt;

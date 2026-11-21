@@ -83,7 +83,7 @@
 //!   [`SqlitePool::close`] they fail with [`Error::PoolClosed`]. A `begin_with`
 //!   statement that leaves the connection in autocommit mode fails with
 //!   [`Error::BeginFailed`].
-//! * **Connect options.** [`SqliteConnectOptions::from_str`] removes leading
+//! * **Connect options.** Parsing a [`SqliteConnectOptions`] removes leading
 //!   `sqlite://` and `sqlite:` schemes, takes what follows the first `?` as
 //!   form-encoded query parameters, and percent-decodes the rest into the file
 //!   name; `:memory:` names an in-memory database `file:sqlx-in-memory-<n>`.
@@ -661,7 +661,7 @@ impl<DB> Drop for Transaction<'_, DB> {
 
 // ─────────────────────────── connect options ───────────────────────────
 
-/// Numbers the in-memory databases [`SqliteConnectOptions::from_str`] names,
+/// Numbers the in-memory databases a parsed [`SqliteConnectOptions`] names,
 /// as `sqlx-sqlite` does.
 static IN_MEMORY_DB_SEQ: AtomicUsize = AtomicUsize::new(0);
 
@@ -689,12 +689,9 @@ impl SqliteConnectOptions {
     /// a fresh in-memory database. Each parameter is checked as `sqlx` checks
     /// it, so an unknown key or value is [`Error::Configuration`] with `sqlx`'s
     /// text; of the accepted ones only `mode=memory` changes how the database
-    /// opens (see the module documentation).
-    // Named `from_str` to match the inherent method the backend calls
-    // (`SqliteConnectOptions::from_str(url)`), which mirrors sqlx's own
-    // inherent method; the `FromStr` trait is also implemented, below.
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(url: &str) -> Result<Self, Error> {
+    /// opens (see the module documentation). Reached through the `FromStr`
+    /// impl, as in `sqlx`, which has no inherent `from_str`.
+    fn parse(url: &str) -> Result<Self, Error> {
         let url = url
             .trim_start_matches("sqlite://")
             .trim_start_matches("sqlite:");
@@ -818,7 +815,7 @@ impl Default for SqliteConnectOptions {
 impl std::str::FromStr for SqliteConnectOptions {
     type Err = Error;
     fn from_str(s: &str) -> Result<Self, Error> {
-        SqliteConnectOptions::from_str(s)
+        SqliteConnectOptions::parse(s)
     }
 }
 
@@ -924,7 +921,7 @@ impl SqlitePoolOptions {
 
     /// Open the pool from a URL string.
     pub async fn connect(self, url: &str) -> Result<SqlitePool, Error> {
-        let handle = open(&SqliteConnectOptions::from_str(url)?)?;
+        let handle = open(&SqliteConnectOptions::parse(url)?)?;
         self.finish(handle).await
     }
 
