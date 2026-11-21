@@ -23,28 +23,13 @@
 //! Requests go to the engine's handlers over an in-memory `SQLite` database
 //! (the synchronous `sqlx`-shaped shim over `sqlite-wasm-rs` on wasm, and
 //! `sqlx` with C `SQLite` natively). The shared parity corpus
-//! (`parity/corpus.json`) runs on both targets. Its successful requests are
-//! `CreateTable`, `DescribeTable`, `DeleteTable`, `PutItem`, `GetItem`,
-//! `UpdateItem`, `DeleteItem`, Query, Scan, `BatchWriteItem`, `BatchGetItem`,
-//! `TransactWriteItems`, `TransactGetItems`, `ListStreams`, `DescribeStream`,
-//! `GetShardIterator`, `GetRecords`, `UpdateTimeToLive`, `DescribeTimeToLive`,
-//! `TagResource`, `ListTagsOfResource`, `UntagResource`, `ListBackups`,
-//! `DescribeContinuousBackups`, `UpdateContinuousBackups` and `DescribeLimits`,
-//! and natively `UpdateTable` and `CreateBackup`, which the wasm build refuses
-//! (a vector-index create, and every store-backed backup operation). Its cases
-//! for `ImportTable`, `ExportTableToPointInTime`, `ListTables`,
-//! `SearchVectors`, the refused operations below and an unknown operation
-//! answer errors.
+//! (`parity/corpus.json`) runs on both targets; its cases are the record of
+//! which requests it covers and what each answers.
 //! The build authenticates no request and authorizes none; every request runs
 //! under a single fixed account.
 //!
-//! [`runtime`] refuses, the same way on both targets, `PartiQL` and
-//! `DescribeEndpoints`, and, as the server does, the point-in-time recovery
-//! requests. On wasm, the engine also refuses the store-backed backup
-//! operations, whose subsystem does not build for wasm32, and the `SQLite`
-//! backend refuses an `UpdateTable` that creates a vector index, after the
-//! engine has validated the request. The module doc of [`runtime`] lists each
-//! answer.
+//! The module doc of [`runtime`] lists the requests the build refuses, on
+//! both targets or on wasm only, and the answer to each.
 
 mod runtime;
 
