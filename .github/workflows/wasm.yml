@@ -135,7 +135,8 @@ jobs:
       # The synchronous SQLite shim is the wasm backend; tests/wasm_shim.rs is
       # one table with a row per shim rule (decoding, binding, multi-statement
       # SQL, fetch, transactions, the pool, connect options), run on wasm32
-      # under Node.
+      # under Node. The same table runs natively against sqlx in the
+      # workspace `cargo test`, which checks its expected outcomes.
       - name: SQLite shim wasm tests under Node
         run: cargo test --locked -p extenddb-storage-sqlite --test wasm_shim --target wasm32-unknown-unknown
 

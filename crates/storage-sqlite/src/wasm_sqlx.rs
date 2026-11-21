@@ -40,9 +40,10 @@
 //! # What follows `sqlx-sqlite` 0.8.6
 //!
 //! The rules below are taken from `sqlx-sqlite` 0.8.6 and `sqlx-core` 0.8.6.
-//! The crate's `tests/wasm_shim.rs` holds a row per rule; outside its rows
-//! named `difference: ...`, the expected value of a row is the outcome `sqlx`
-//! returns natively for the same calls.
+//! The crate's `tests/wasm_shim.rs` holds a row per rule and runs on both
+//! targets: natively against `sqlx` over the C SQLite, on wasm32 against this
+//! module. A row expects the same outcome from both, except its rows named
+//! `difference: ...`, which expect each side's own outcome.
 //!
 //! * **Errors.** [`Error`] has the variants of `sqlx::Error` this module can
 //!   produce, with `sqlx`'s `Display` text. A database error carries the
@@ -92,11 +93,18 @@
 //!
 //! # Documented differences from `sqlx-sqlite` 0.8.6
 //!
+//! The table in `tests/wasm_shim.rs` has six `difference: ...` rows: one each
+//! for **One connection**, **Nested transactions** and **After a failed
+//! `begin_with`**, and one per terminal (`fetch_one`, `fetch_optional`,
+//! `execute`) for **`$0`**. The other entries have no row.
+//!
 //! * **No acquire wait.** `sqlx` waits up to the pool's acquire timeout (30 s
 //!   by default) for the connection before it returns
 //!   [`Error::PoolTimedOut`]; this module returns it at once. The transport is
 //!   synchronous on a single thread, so nothing could hand the connection back
-//!   during a wait.
+//!   during a wait. The table's native pools set a 50 ms acquire timeout, so
+//!   its rows that find the connection checked out expect `PoolTimedOut` from
+//!   both sides.
 //! * **One connection.** `max_connections`, `min_connections`, `idle_timeout`
 //!   and `max_lifetime` are accepted and not used: the pool never opens a
 //!   second connection and never recycles the one it has. Under `sqlx` an
@@ -111,9 +119,13 @@
 //!   [`Error::BeginFailed`], so its next `begin_with` on that connection fails
 //!   with `InvalidSavePointStatement`; here the connection is left as it was
 //!   and the next `begin_with` runs.
-//! * **`$0`.** A `$0` placeholder is [`Error::Protocol`]. Under `sqlx` the
-//!   argument lookup for it (`arguments.rs:116`) panics the connection's
-//!   worker thread, and the call returns [`Error::RowNotFound`].
+//! * **`$0`.** A `$0` placeholder is [`Error::Protocol`] from every terminal.
+//!   Under `sqlx` the argument lookup for it (`arguments.rs:116`, the index
+//!   `n - 1` with `n = 0`) panics the connection's worker thread while it
+//!   binds, before the statement runs, and the call returns as if the
+//!   statement had produced no row: `execute` returns `Ok` with 0 rows
+//!   affected, `fetch_optional` returns `Ok(None)` and `fetch_one` returns
+//!   [`Error::RowNotFound`].
 //! * **Connect options.** Of the accepted query parameters only
 //!   `mode=memory` is acted on; `mode=ro`, `mode=rw`, `mode=rwc`, `cache`,
 //!   `immutable` and `vfs` are checked and then not used. Every connection

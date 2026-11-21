@@ -1,58 +1,82 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! wasm32 runtime tests for the synchronous SQLite shim.
+//! The rules of the crate's synchronous SQLite shim, as one table run on both
+//! targets.
 //!
 //! On wasm the backend cannot use `sqlx` + the C `libsqlite3-sys` (a dedicated
 //! OS thread per connection, a C sysroot), so the crate aliases itself to
-//! `sqlx` and the bundled shim drives `sqlite-wasm-rs`'s raw libsqlite3 C ABI
+//! `sqlx` and its shim drives `sqlite-wasm-rs`'s raw libsqlite3 C ABI
 //! synchronously. Native builds keep the real `sqlx`, which is the behaviour
 //! this backend is defined against.
 //!
-//! The test is one table. Each row runs its request on a fresh in-memory pool
-//! with one connection, the pool the backend opens for an in-memory database,
-//! and renders the outcome as `Ok(<value>)` or `Err[<variant>] <message>`.
-//! The expected outcome of a row is what `sqlx-sqlite` 0.8.6 returns for the
-//! same calls natively, except in the rows named `difference: ...`, which pin
-//! the shim's side of a difference listed in the shim's module documentation.
+//! Each row runs its request on a fresh in-memory pool with one connection,
+//! the pool the backend opens for an in-memory database, and renders the
+//! outcome as `Ok(<value>)` or `Err[<variant>] <message>`. On native targets
+//! the row runs against `sqlx-sqlite` (the version `Cargo.lock` pins) over the
+//! C SQLite; on wasm32 it runs against the shim. A row has one expected
+//! outcome for both, except the rows named `difference: ...`, which carry the
+//! outcome `sqlx` gives and the outcome the shim gives; each stands for an
+//! entry of the "Documented differences" list in the shim's module
+//! documentation. The test fails if a difference row's two outcomes are equal,
+//! or if the number of difference rows is not [`DIFFERENCE_ROWS`].
 //!
-//! The cases live in an integration test rather than the shim module so the
+//! Natively the pool's acquire timeout is cut from `sqlx`'s 30 s default to
+//! 50 ms, so the rows that find the connection checked out return
+//! `PoolTimedOut` without the wait; the shim does not wait at all.
+//!
+//! The table is an integration test rather than an inline test module so the
 //! wasm test binary compiles against only the crate and `wasm-bindgen-test`:
 //! the crate's inline unit tests and the native integration tests pull the
 //! engine, the backup store and tokio's net stack, none of which build for
-//! wasm32. They run under Node through `wasm-bindgen-test`; the shim's items
-//! are reached through the crate's `#[doc(hidden)]` `wasm_sqlx_for_tests`
+//! wasm32. On wasm32 it runs under Node through `wasm-bindgen-test`, and
+//! reaches the shim through the crate's `#[doc(hidden)]` `wasm_sqlx_for_tests`
 //! module.
-#![cfg(target_arch = "wasm32")]
 
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
 
+#[cfg(target_arch = "wasm32")]
 use extenddb_storage_sqlite::wasm_sqlx_for_tests as sqlx;
 use futures::StreamExt;
 use sqlx::Connection;
-use wasm_bindgen_test::wasm_bindgen_test;
+#[cfg(not(target_arch = "wasm32"))]
+use sqlx::Row as _;
+
+/// The number of rows named `difference: ...`.
+const DIFFERENCE_ROWS: usize = 6;
 
 /// A row's rendered outcome, or the error of a setup step that failed.
 type R = Result<String, sqlx::Error>;
 
 /// One row of the table: its name (the stored value and the Rust type of a
-/// decode row, the rule for the others), the expected outcome, and the
-/// request.
+/// decode row, the rule for the others), the expected outcome under `sqlx` and
+/// under the shim, and the request.
 struct Case {
     name: String,
-    expected: String,
+    native: String,
+    wasm: String,
     run: Box<dyn Fn() -> Pin<Box<dyn Future<Output = R>>>>,
 }
 
-/// A row whose request runs with `$pool`, a fresh pool.
+/// A row whose request runs with `$pool`, a fresh pool, and whose outcome is
+/// `$expected` on both targets.
 macro_rules! row {
-    ($name:expr, $expected:expr, |$pool:ident| $body:expr) => {
+    ($name:expr, $expected:expr, |$pool:ident| $body:expr) => {{
+        let expected: String = $expected.into();
+        difference!($name, native: expected.clone(), wasm: expected, |$pool| $body)
+    }};
+}
+
+/// A row whose outcome is `$native` under `sqlx` and `$wasm` under the shim.
+macro_rules! difference {
+    ($name:expr, native: $native:expr, wasm: $wasm:expr, |$pool:ident| $body:expr) => {
         Case {
             name: $name.into(),
-            expected: $expected.into(),
+            native: $native.into(),
+            wasm: $wasm.into(),
             run: Box::new(|| {
                 Box::pin(async {
                     let $pool = pool().await?;
@@ -80,10 +104,19 @@ macro_rules! decode {
 
 /// The pool the backend opens for an in-memory database: one connection.
 async fn pool() -> Result<sqlx::SqlitePool, sqlx::Error> {
+    pool_options().max_connections(1).connect(":memory:").await
+}
+
+/// Pool options with a 50 ms acquire timeout (see the module documentation).
+#[cfg(not(target_arch = "wasm32"))]
+fn pool_options() -> sqlx::sqlite::SqlitePoolOptions {
+    sqlx::sqlite::SqlitePoolOptions::new().acquire_timeout(std::time::Duration::from_millis(50))
+}
+
+/// Pool options; the shim has no acquire timeout to set.
+#[cfg(target_arch = "wasm32")]
+fn pool_options() -> sqlx::sqlite::SqlitePoolOptions {
     sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect(":memory:")
-        .await
 }
 
 /// The variant name of an error: its `Debug` text up to the first character
@@ -106,6 +139,9 @@ fn render<T: Debug>(result: Result<T, sqlx::Error>) -> String {
 const DECODE: &str = "Err[ColumnDecode] error occurred while decoding column";
 const OVERFLOW: &str = "Err[Database] error returned from database: (code: 1) integer overflow";
 const TIMED_OUT: &str = "Err[PoolTimedOut] pool timed out while waiting for an open connection";
+/// The shim's refusal of a `$0` placeholder.
+const ZERO_REFUSED: &str =
+    "Err[Protocol] encountered unexpected or invalid data: parameter $0 has no argument position";
 const CLOSED: &str = "Err[PoolClosed] attempted to acquire a connection on a closed pool";
 /// A statement whose second part fails at run time, after a first row.
 const ROW_THEN_ERROR: &str = "SELECT 1; SELECT abs(-9223372036854775808)";
@@ -168,6 +204,7 @@ async fn stream(pool: &sqlx::SqlitePool, sql: &str) -> String {
     format!("[{}]", items.join(", "))
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), derive(sqlx::FromRow))]
 struct Person {
     id: i64,
     name: String,
@@ -175,9 +212,10 @@ struct Person {
 }
 
 // The backend's catalog structs implement `FromRow` by decoding each field
-// from the column of the same name; this stands in for one of them to pin
-// that by-name decode path. The one-field-list declaration macro that
-// generates this for the real structs lives with those structs.
+// from the column of the same name: natively through `sqlx`'s derive, on wasm
+// through an impl like this one, which the crate's `sqlite_row_struct!`
+// generates for the real structs.
+#[cfg(target_arch = "wasm32")]
 impl sqlx::FromRow for Person {
     fn from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
         Ok(Self {
@@ -424,15 +462,39 @@ fn cases() -> Vec<Case> {
                     .await
             )
         ),
-        row!(
-            "difference: a $0 placeholder is refused (sqlx's worker thread panics)",
-            "Err[Protocol] encountered unexpected or invalid data: parameter $0 has no argument \
-             position",
+        difference!(
+            "difference: fetch_one with a $0 placeholder",
+            native: "Err[RowNotFound] no rows returned by a query that expected to return at least \
+                     one row",
+            wasm: ZERO_REFUSED,
             |pool| render(
                 sqlx::query_scalar::<_, i64>("SELECT $0")
                     .bind(7_i64)
                     .fetch_one(&pool)
                     .await
+            )
+        ),
+        difference!(
+            "difference: fetch_optional with a $0 placeholder",
+            native: "Ok(None)",
+            wasm: ZERO_REFUSED,
+            |pool| render(
+                sqlx::query_scalar::<_, i64>("SELECT $0")
+                    .bind(7_i64)
+                    .fetch_optional(&pool)
+                    .await
+            )
+        ),
+        difference!(
+            "difference: execute with a $0 placeholder",
+            native: "Ok(0)",
+            wasm: ZERO_REFUSED,
+            |pool| render(
+                sqlx::query("SELECT $0")
+                    .bind(7_i64)
+                    .execute(&pool)
+                    .await
+                    .map(|r| r.rows_affected())
             )
         ),
         row!(
@@ -640,11 +702,12 @@ fn cases() -> Vec<Case> {
                 ids(&pool).await
             }
         ),
-        row!(
+        difference!(
             "difference: with max_connections(2) there is still one connection",
-            TIMED_OUT,
+            native: "Ok(())",
+            wasm: TIMED_OUT,
             |_pool| {
-                let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                let pool = pool_options()
                     .max_connections(2)
                     .min_connections(2)
                     .idle_timeout(None)
@@ -662,20 +725,22 @@ fn cases() -> Vec<Case> {
              transaction",
             |pool| render(pool.begin_with("SELECT 1").await.map(drop))
         ),
-        row!(
-            "difference: begin_with after a failed begin_with runs \
-             (sqlx: InvalidSavePointStatement)",
-            "Ok(())",
+        difference!(
+            "difference: begin_with after a failed begin_with",
+            native: "Err[InvalidSavePointStatement] attempted to call begin_with at non-zero \
+                     transaction depth",
+            wasm: "Ok(())",
             |pool| {
                 let failed = pool.begin_with("SELECT 1").await.map(drop);
                 assert!(failed.is_err(), "SELECT 1 opens no transaction");
                 render(pool.begin_with("BEGIN IMMEDIATE").await.map(drop))
             }
         ),
-        row!(
-            "difference: a nested begin fails (sqlx opens a savepoint)",
-            "Err[Database] error returned from database: (code: 1) cannot start a transaction \
-             within a transaction",
+        difference!(
+            "difference: a nested begin",
+            native: "Ok(())",
+            wasm: "Err[Database] error returned from database: (code: 1) cannot start a \
+                   transaction within a transaction",
             |pool| {
                 let mut tx = pool.begin().await?;
                 render(Connection::begin(&mut *tx).await.map(drop))
@@ -794,27 +859,47 @@ fn cases() -> Vec<Case> {
     ]
 }
 
-#[wasm_bindgen_test]
-async fn shim_follows_sqlx_sqlite() {
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+async fn each_row_gives_its_expected_outcome() {
     let cases = cases();
     let total = cases.len();
     let mut failures = Vec::new();
+    let mut differences = 0;
     for case in cases {
+        let named = case.name.starts_with("difference: ");
+        differences += usize::from(named);
+        if named == (case.native == case.wasm) {
+            failures.push(format!(
+                "{}\n    a row is named `difference: ...` exactly when its native and wasm \
+                 outcomes differ",
+                case.name
+            ));
+        }
+        let expected = if cfg!(target_arch = "wasm32") {
+            case.wasm
+        } else {
+            case.native
+        };
         let actual = match (case.run)().await {
             Ok(outcome) => outcome,
             Err(e) => format!("setup failed: {}", render::<()>(Err(e))),
         };
-        if actual != case.expected {
+        if actual != expected {
             failures.push(format!(
-                "{}\n    expected: {}\n    actual:   {actual}",
-                case.name, case.expected
+                "{}\n    expected: {expected}\n    actual:   {actual}",
+                case.name
             ));
         }
     }
     assert!(
         failures.is_empty(),
-        "{} of {total} rows differ:\n{}",
+        "{} of {total} rows fail:\n{}",
         failures.len(),
         failures.join("\n")
+    );
+    assert_eq!(
+        differences, DIFFERENCE_ROWS,
+        "the number of difference rows"
     );
 }
