@@ -18,8 +18,9 @@ use zeroize::Zeroizing;
 /// The prefixed secret and the three intermediate keys live in `Zeroizing`
 /// buffers and are wiped before this returns, so the only copy of key
 /// material left behind is in `out`. The caller passes a slot of the locked
-/// key store, or a `Zeroizing` buffer. (The tag that `hmac::sign` returns is
-/// a stack value this function cannot wipe.)
+/// key store, or a `Zeroizing` buffer. (The 32-byte array that
+/// `extenddb_core::crypto::hmac_sha256` returns for each step, and the tag its
+/// backend computes, are stack values this function cannot wipe.)
 ///
 /// # Arguments
 /// * `secret` - The plaintext secret access key.
