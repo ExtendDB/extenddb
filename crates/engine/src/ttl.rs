@@ -5,8 +5,9 @@
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::types::{
-    DescribeTimeToLiveInput, DescribeTimeToLiveOutput, TimeToLiveSpecificationOutput,
-    TimeToLiveStatus, UpdateTimeToLiveInput, UpdateTimeToLiveOutput,
+    DescribeTimeToLiveInput, DescribeTimeToLiveOutput, TimeToLiveDescription,
+    TimeToLiveSpecification, TimeToLiveSpecificationOutput, TimeToLiveStatus,
+    UpdateTimeToLiveInput, UpdateTimeToLiveOutput,
 };
 use extenddb_core::validation::validate_table_name;
 use extenddb_storage::error::StorageError;
@@ -42,30 +43,22 @@ pub async fn handle_describe_time_to_live(
     serialize_output(&output)
 }
 
-/// Handle `UpdateTimeToLive` — enable or disable TTL on a table attribute.
-///
-/// When enabling, kicks off creation of a `PostgreSQL` expression index on the
-/// TTL attribute. When disabling, marks TTL disabled (sweeper stops) then
-/// drops the index.
-///
-/// # Errors
-///
-/// Returns `ValidationException` if the attribute name is empty, or if TTL
-/// is already in the requested state (idempotency check).
-/// Returns `ResourceNotFoundException` if the table does not exist.
-/// Returns `InternalServerError` on storage failures.
 /// Gate an `UpdateTimeToLive` request on the table's current TTL state.
 ///
 /// A table mid-transition rejects further changes: the backfill and the queue
 /// drain are both keyed to the current generation, and admitting a toggle now
 /// would race them. The client retries once the transition lands (matching
-/// DynamoDB, which also refuses updates in ENABLING and DISABLING). Steady
-/// states reject only the idempotent no-op, as before.
+/// DynamoDB, which also refuses updates in ENABLING and DISABLING).
+///
+/// With TTL enabled, a request that names another attribute is refused in
+/// both forms, and the message carries the stored name. The comparison is
+/// byte-exact: `DynamoDB` refuses `TTL` and `ttl ` for a table enabled on
+/// `ttl`. Steady states otherwise reject only the idempotent no-op.
 fn check_ttl_transition(
-    current: TimeToLiveStatus,
-    requested_enabled: bool,
+    current: &TimeToLiveDescription,
+    requested: &TimeToLiveSpecification,
 ) -> Result<(), DynamoDbError> {
-    match current {
+    match current.time_to_live_status {
         TimeToLiveStatus::Enabling | TimeToLiveStatus::Disabling => {
             Err(DynamoDbError::ValidationException(
                 "Time to live is being updated for this table. Retry the request once the \
@@ -73,16 +66,38 @@ fn check_ttl_transition(
                     .to_owned(),
             ))
         }
-        TimeToLiveStatus::Enabled if requested_enabled => Err(DynamoDbError::ValidationException(
-            "TimeToLive is already enabled".to_owned(),
-        )),
-        TimeToLiveStatus::Disabled if !requested_enabled => Err(
+        TimeToLiveStatus::Enabled => match current.attribute_name.as_deref() {
+            Some(stored) if stored != requested.attribute_name => {
+                Err(DynamoDbError::ValidationException(format!(
+                    "TimeToLive is active on a different AttributeName: current AttributeName \
+                     is {stored}"
+                )))
+            }
+            _ if requested.enabled => Err(DynamoDbError::ValidationException(
+                "TimeToLive is already enabled".to_owned(),
+            )),
+            _ => Ok(()),
+        },
+        TimeToLiveStatus::Disabled if !requested.enabled => Err(
             DynamoDbError::ValidationException("TimeToLive is already disabled".to_owned()),
         ),
-        _ => Ok(()),
+        TimeToLiveStatus::Disabled => Ok(()),
     }
 }
 
+/// Handle `UpdateTimeToLive`: enable or disable TTL on a table attribute.
+///
+/// When enabling, kicks off creation of a `PostgreSQL` expression index on the
+/// TTL attribute. When disabling, marks TTL disabled (sweeper stops) then
+/// drops the index.
+///
+/// # Errors
+///
+/// Returns `ValidationException` if the attribute name is empty, if TTL is
+/// already in the requested state (idempotency check), or if TTL is enabled
+/// on an attribute other than the one the request names.
+/// Returns `ResourceNotFoundException` if the table does not exist.
+/// Returns `InternalServerError` on storage failures.
 pub async fn handle_update_time_to_live(
     body: Value,
     ctx: &OperationContext,
@@ -93,18 +108,13 @@ pub async fn handle_update_time_to_live(
     validate_table_name(&input.table_name, &ctx.limits)?;
     validate_ttl_attribute_name(&input.time_to_live_specification.attribute_name)?;
 
-    // S4: Idempotency check — DynamoDB rejects enabling TTL when already
-    // enabled, and disabling when already disabled.
     let current = ctx
         .storage
         .describe_ttl(&ctx.account_id, &input.table_name)
         .await
         .map_err(storage_to_dynamo)?;
 
-    check_ttl_transition(
-        current.time_to_live_status,
-        input.time_to_live_specification.enabled,
-    )?;
+    check_ttl_transition(&current, &input.time_to_live_specification)?;
 
     // Resolve the old attribute before committing the disable. If the catalog
     // is inconsistent, fail without leaving a partially applied request.
@@ -266,20 +276,57 @@ mod tests {
     #[test]
     fn transition_gate() {
         use TimeToLiveStatus::{Disabled, Disabling, Enabled, Enabling};
-        // Steady states admit the toggle and reject the no-op.
-        assert!(check_ttl_transition(Disabled, true).is_ok());
-        assert!(check_ttl_transition(Enabled, false).is_ok());
-        assert!(check_ttl_transition(Enabled, true).is_err());
-        assert!(check_ttl_transition(Disabled, false).is_err());
-        // Mid-transition rejects both directions.
-        for state in [Enabling, Disabling] {
-            for requested in [true, false] {
-                let error = check_ttl_transition(state, requested).unwrap_err();
-                assert!(
-                    format!("{error:?}").contains("being updated"),
-                    "expected transition rejection, got {error:?}"
-                );
-            }
+        const BEING_UPDATED: &str = "Time to live is being updated for this table. Retry the \
+                                     request once the current change completes.";
+        const OTHER_ATTRIBUTE: &str =
+            "TimeToLive is active on a different AttributeName: current AttributeName is ttl";
+        const ALREADY_ENABLED: &str = "TimeToLive is already enabled";
+        const ALREADY_DISABLED: &str = "TimeToLive is already disabled";
+        // (stored state, stored name, request Enabled, request name, answer).
+        // The ENABLED rows are what DynamoDB answers for a table enabled on
+        // `ttl` (measured 2026-11-21 in us-east-1); the comparison is
+        // byte-exact, so `TTL` and `ttl ` are other attributes (the handler's
+        // charset check refuses the space before this gate sees it). A disable
+        // with the stored name is admitted: the service's cooldown is a
+        // documented difference. The name check does not apply to
+        // mid-transition rows or to rows without a stored name.
+        let rows = [
+            (Disabled, None, true, "ttl", Ok(())),
+            (Disabled, None, false, "other", Err(ALREADY_DISABLED)),
+            (Enabled, Some("ttl"), true, "ttl", Err(ALREADY_ENABLED)),
+            (Enabled, Some("ttl"), false, "ttl", Ok(())),
+            (Enabled, Some("ttl"), true, "expires", Err(OTHER_ATTRIBUTE)),
+            (Enabled, Some("ttl"), false, "other", Err(OTHER_ATTRIBUTE)),
+            (Enabled, Some("ttl"), true, "TTL", Err(OTHER_ATTRIBUTE)),
+            (Enabled, Some("ttl"), false, "TTL", Err(OTHER_ATTRIBUTE)),
+            (Enabled, Some("ttl"), true, "ttl ", Err(OTHER_ATTRIBUTE)),
+            (Enabled, Some("ttl"), false, "ttl ", Err(OTHER_ATTRIBUTE)),
+            (Enabled, None, true, "ttl", Err(ALREADY_ENABLED)),
+            (Enabled, None, false, "ttl", Ok(())),
+            (Enabling, Some("ttl"), true, "expires", Err(BEING_UPDATED)),
+            (Enabling, Some("ttl"), false, "ttl", Err(BEING_UPDATED)),
+            (Disabling, None, true, "ttl", Err(BEING_UPDATED)),
+            (Disabling, None, false, "other", Err(BEING_UPDATED)),
+        ];
+        for (status, stored, enabled, name, expected) in rows {
+            let current = TimeToLiveDescription {
+                time_to_live_status: status,
+                attribute_name: stored.map(str::to_owned),
+            };
+            let requested = TimeToLiveSpecification {
+                enabled,
+                attribute_name: name.to_owned(),
+            };
+            let result = check_ttl_transition(&current, &requested);
+            let answer: Result<(), &str> = match &result {
+                Ok(()) => Ok(()),
+                Err(DynamoDbError::ValidationException(message)) => Err(message),
+                Err(other) => panic!("{status:?} {stored:?} {enabled} {name:?}: {other:?}"),
+            };
+            assert_eq!(
+                answer, expected,
+                "{status:?} stored {stored:?}, request Enabled={enabled} AttributeName={name:?}"
+            );
         }
     }
 
