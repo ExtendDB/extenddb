@@ -9,8 +9,8 @@
 
 // The store-backed backup subsystem depends on an S3/filesystem store,
 // networking and background threads that have no wasm32 target, so it is
-// compiled only off wasm; the WebAssembly adapter refuses its four
-// operations before dispatch. `backup_requests` holds the backup and point-in-time
+// compiled only off wasm; on wasm32 `dispatch` refuses its four operations
+// with a ValidationException. `backup_requests` holds the backup and point-in-time
 // recovery requests that read no store, and compiles on both targets.
 #[cfg(not(target_arch = "wasm32"))]
 mod backup;
@@ -413,8 +413,8 @@ pub struct OperationContext {
     pub storage: Arc<dyn extenddb_storage::StorageEngine>,
     /// The process's job slots and configured backup store, which the
     /// store-backed backup operations read. That subsystem is compiled only
-    /// off wasm, so this field is absent in the wasm build, which refuses
-    /// those operations before dispatch.
+    /// off wasm, so this field is absent in the wasm build, where
+    /// [`dispatch`] refuses those operations.
     #[cfg(not(target_arch = "wasm32"))]
     pub backup: Arc<BackupRuntime>,
     pub limits: Arc<LimitsConfig>,
@@ -599,6 +599,19 @@ pub async fn dispatch(
         "RestoreTableFromBackup" => backup::handle_restore_table_from_backup(body, ctx)
             .await
             .map(DispatchResult::body_only),
+        // Off wasm32 the arms above serve these four through the `backup`
+        // module, which needs a backup store and does not build for wasm32.
+        // They stay known operations there, so they are refused with a
+        // ValidationException that names the build, not answered as unknown.
+        #[cfg(target_arch = "wasm32")]
+        "CreateBackup" | "DescribeBackup" | "DeleteBackup" | "RestoreTableFromBackup" => {
+            Err(DynamoDbError::ValidationException(
+                extenddb_core::error::webassembly_unsupported_message(
+                    operation,
+                    "it runs entirely in memory with no backup store",
+                ),
+            ))
+        }
         "DescribeContinuousBackups" => {
             backup_requests::handle_describe_continuous_backups(body, ctx)
                 .await
