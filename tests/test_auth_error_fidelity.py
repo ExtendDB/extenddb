@@ -529,6 +529,7 @@ class TestRequestChecks:
             pytest.param(None, f"{_ALG} {_CRED}, garbage, {_SIG}", _EQ, id="no-equal-sign-middle"),
             pytest.param(None, f"{_ALG} Credential", _EQ, id="key-only"),
             pytest.param(None, f"{_ALG}\tgarbage", _EQ, id="tab-after-algorithm"),
+            pytest.param("X-Amz-Date", f"{_ALG},garbage", _EQ, id="comma-after-algorithm"),
             pytest.param(None, f"{_ALG} garbag\u00c3\u00a9", _EQ, id="utf-8-bytes"),
             pytest.param(None, f"{_ALG} garbag\u00e9", _EQ, id="latin-1-byte"),
             pytest.param(None, f"{_ALG} =x", _KEY, id="no-key"),
@@ -571,6 +572,8 @@ class TestRequestChecks:
             pytest.param("X-Amz-Date", f"{_ALG}X {_CRED}, {_SH}, {_SIG}", _UNSUPPORTED.format(f"{_ALG}X"),
                          id="algorithm-with-suffix"),
             pytest.param("X-Amz-Date", "AWS4-X garbage", _EQ, id="no-equal-sign-other-algorithm"),
+            pytest.param("X-Amz-Date", f"AWS4-X,{_CRED}, {_SH}, {_SIG}", _UNSUPPORTED.format("AWS4-X"),
+                         id="comma-after-other-algorithm"),
             pytest.param(None, "AWS4-X", _missing("Credential", "Signature", "SignedHeaders", date=True),
                          id="other-algorithm-only"),
             pytest.param(None, f"AWS4-HMAC-SHA512 {_CRED}, {_SH}, {_SIG}", _missing(date=True),
@@ -608,13 +611,16 @@ class TestRequestChecks:
             pytest.param("X-Amz-Date", "Basic abc", None, id="basic"),
             pytest.param("X-Amz-Date", f"{_ALG} {_CRED} {_SH} {_SIG}", f"{_ALG} {_CRED}, {_SH}, {_SIG}",
                          id="split-by-spaces-with-date"),
+            pytest.param("X-Amz-Date", f"{_ALG},{_CRED}, {_SH}, {_SIG}", f"{_ALG} {_CRED}, {_SH}, {_SIG}",
+                         id="comma-after-algorithm-with-date"),
         ],
     )
     def test_authorization_answered_as_another(self, date, header, reference):
         # Measured against the service on 2026-11-21: a value that starts with
         # neither AWS4- nor "Bearer ", ignoring ASCII case, gets the answer to a
         # request with no Authorization header. Pairs split by spaces get the
-        # answer to the same pairs split by commas.
+        # answer to the same pairs split by commas. A comma after the algorithm
+        # ends it as a space does.
         assert self._describe(header, date) == self._describe(reference, date)
 
     def test_session_token_with_a_long_term_key_is_rejected(self):
