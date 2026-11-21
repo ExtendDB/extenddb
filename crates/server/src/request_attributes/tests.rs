@@ -525,18 +525,49 @@ fn scan_holds_its_filter_projection_and_start_key_names() {
     );
 }
 
+/// The paths in `ProjectionExpression` only. A key without `#` resolves no
+/// name, and the engine refuses that request. The names in
+/// `SearchConditionExpression` are not in the value: the service served a
+/// search whose condition named `ssn` under a Deny on `ssn` (measured
+/// 2026-11-21).
 #[test]
 fn search_vectors_holds_its_projected_paths() {
-    let input = json!({
-        "TableName": "t",
-        "IndexName": "vi",
-        "ProjectionExpression": "#v.x, name",
-        "ExpressionAttributeNames": {"#v": "vec"},
-    });
-    assert_eq!(
-        single("SearchVectors", &input, Some(&hash_table())),
-        names(&["name", "vec"])
-    );
+    let v = || json!({":v": {"S": "1"}});
+    let rows = [
+        (
+            "projected paths",
+            json!({
+                "ProjectionExpression": "#v.x, name",
+                "ExpressionAttributeNames": {"#v": "vec"},
+            }),
+            names(&["name", "vec"]),
+        ),
+        (
+            "a key without #",
+            json!({"ProjectionExpression": "#n", "ExpressionAttributeNames": {"n": "ssn"}}),
+            None,
+        ),
+        (
+            "a condition on ssn",
+            json!({
+                "SearchConditionExpression": "ssn = :v",
+                "ExpressionAttributeValues": v(),
+                "ProjectionExpression": "cat",
+            }),
+            names(&["cat"]),
+        ),
+        (
+            "a condition and no projection",
+            json!({"SearchConditionExpression": "ssn = :v", "ExpressionAttributeValues": v()}),
+            None,
+        ),
+    ];
+    for (row, mut input, expected) in rows {
+        input["TableName"] = json!("t");
+        input["IndexName"] = json!("vi");
+        let found = single("SearchVectors", &input, Some(&hash_table()));
+        assert_eq!(found, expected, "{row}");
+    }
 }
 
 #[test]
