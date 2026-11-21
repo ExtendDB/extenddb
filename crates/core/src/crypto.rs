@@ -232,6 +232,8 @@ mod imp {
     }
 }
 
+/// One test set for both backends: each case runs as a native `#[test]`
+/// (AWS-LC) and, on `wasm32`, as a `wasm_bindgen_test` under Node (RustCrypto).
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,7 +245,13 @@ mod tests {
         0x15, 0xad,
     ];
 
-    #[test]
+    /// Decode a hex string written in a test constant.
+    fn unhex(s: &str) -> Vec<u8> {
+        hex::decode(s).expect("test vector is hex")
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn sha256_known_vector() {
         assert_eq!(sha256(b"abc"), ABC_SHA256);
         // SHA-256 of the empty string.
@@ -253,7 +261,8 @@ mod tests {
         );
     }
 
-    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn hmac_sha256_rfc4231_case2() {
         // RFC 4231 test case 2: key "Jefe", data "what do ya want for nothing?".
         assert_eq!(
@@ -262,15 +271,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn constant_time_eq_matches_contents_and_length() {
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn constant_time_eq_compares_contents_and_length() {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"ab"));
         assert!(constant_time_eq(b"", b""));
     }
 
-    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn fill_random_produces_distinct_buffers() {
         let mut a = [0u8; 32];
         let mut b = [0u8; 32];
@@ -279,7 +290,8 @@ mod tests {
         assert_ne!(a, b, "two random fills collided");
     }
 
-    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn seal_open_round_trip_with_fresh_nonce() {
         let key = [7u8; KEY_LEN];
         let aad = b"context-01";
@@ -296,7 +308,8 @@ mod tests {
         assert_eq!(&*open(&key, &empty, aad).expect("open"), b"");
     }
 
-    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn open_rejects_wrong_aad_wrong_key_and_tampering() {
         let key = [7u8; KEY_LEN];
         let sealed = seal(&key, b"secret", b"aad-a").expect("seal");
@@ -316,7 +329,8 @@ mod tests {
         );
     }
 
-    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn open_rejects_input_too_short() {
         let key = [7u8; KEY_LEN];
         for len in [0, NONCE_LEN, NONCE_LEN + TAG_LEN - 1] {
@@ -329,9 +343,9 @@ mod tests {
     }
 
     /// A secret sealed by the aes-gcm 0.10.3 code that encrypted secrets before
-    /// the storage cipher existed opens unchanged, proving the layout and
-    /// algorithm are interoperable across backends.
-    #[test]
+    /// the storage cipher existed opens on both backends.
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn open_decrypts_historical_aes_gcm_vector() {
         use base64::Engine;
         use base64::engine::general_purpose::STANDARD as BASE64;
@@ -345,76 +359,39 @@ mod tests {
 
         let mut key = [0u8; KEY_LEN];
         key.copy_from_slice(&BASE64.decode(KEY_B64).expect("key b64"));
-        let sealed: Vec<u8> = (0..VECTOR_HEX.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&VECTOR_HEX[i..i + 2], 16).expect("hex"))
-            .collect();
+        let sealed = unhex(VECTOR_HEX);
         assert_eq!(sealed.len(), NONCE_LEN + PLAINTEXT.len() + TAG_LEN);
         assert_eq!(
             &*open(&key, &sealed, AAD.as_bytes()).expect("open"),
             PLAINTEXT.as_bytes()
         );
     }
-}
 
-/// wasm32 equivalents of the native unit tests, run under `wasm-bindgen-test`
-/// (Node) in CI so the pure-Rust crypto backend is exercised on its own target.
-#[cfg(all(test, target_arch = "wasm32"))]
-mod wasm_tests {
-    use super::*;
-    use wasm_bindgen_test::wasm_bindgen_test;
+    /// A value sealed by this module's native backend (AWS-LC through
+    /// `aws-lc-rs`, with its random nonce) and stored here opens on both
+    /// backends, so a secret sealed by a server opens in the wasm build.
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn open_decrypts_aws_lc_sealed_vector() {
+        // Key bytes 0x00..=0x1f.
+        const KEY_HEX: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        const AAD: &str = "extenddb-aws-lc-vector";
+        const PLAINTEXT: &str = "sealed by AWS-LC on the native backend";
+        const VECTOR_HEX: &str = "f31394933b8b764dbe2413878d77f301e2fb4beecc26905f9fc70fd1\
+                                  78a544f5f30a27b5c516e07801b8200a81ca171250d2850a41b3062a\
+                                  e36a6339783633018b70";
 
-    #[wasm_bindgen_test]
-    fn sha256_and_hmac_known_vectors() {
-        assert_eq!(
-            hex::encode(sha256(b"abc")),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-        assert_eq!(
-            hex::encode(hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
-            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
-        );
-    }
-
-    #[wasm_bindgen_test]
-    fn constant_time_eq_matches_contents_and_length() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"ab"));
-    }
-
-    #[wasm_bindgen_test]
-    fn seal_open_round_trip() {
-        let key = [7u8; KEY_LEN];
-        let sealed = seal(&key, b"hello world", b"ctx").expect("seal");
-        assert_eq!(&*open(&key, &sealed, b"ctx").expect("open"), b"hello world");
-        assert_eq!(
-            open(&key, &sealed, b"other").unwrap_err(),
-            "decrypt: authentication failed"
-        );
-    }
-
-    #[wasm_bindgen_test]
-    fn opens_native_sealed_value() {
-        // A value sealed by the native (AWS-LC) backend, base64. AES-256-GCM is
-        // standard, so the wasm backend opens it byte-for-byte.
-        use base64::Engine;
-        use base64::engine::general_purpose::STANDARD as BASE64;
-        const KEY_B64: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
-        const AAD: &str = "AKIAEXTENDDBCOMPAT01";
-        const PLAINTEXT: &str = "extenddbCompatibilityVectorPlaintext0001";
-        const VECTOR_HEX: &str = "06529a648732e136c8641182e54dc913f77542c595fd935fc84fbb3f\
-                                  9eccb80eb543fc2d5d93dcd1f77b50b12388a02a39940964151c9fab\
-                                  570f0cffb74ccff7285645f3";
         let mut key = [0u8; KEY_LEN];
-        key.copy_from_slice(&BASE64.decode(KEY_B64).expect("key b64"));
-        let sealed: Vec<u8> = (0..VECTOR_HEX.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&VECTOR_HEX[i..i + 2], 16).expect("hex"))
-            .collect();
+        key.copy_from_slice(&unhex(KEY_HEX));
+        let sealed = unhex(VECTOR_HEX);
+        assert_eq!(sealed.len(), NONCE_LEN + PLAINTEXT.len() + TAG_LEN);
         assert_eq!(
             &*open(&key, &sealed, AAD.as_bytes()).expect("open"),
             PLAINTEXT.as_bytes()
+        );
+        assert_eq!(
+            open(&key, &sealed, b"another aad").unwrap_err(),
+            "decrypt: authentication failed"
         );
     }
 }
