@@ -108,8 +108,8 @@ use extenddb_storage::error::StorageError;
 use extenddb_storage::{
     BackupRestoreSource, JobPermit, LegacyBackupReader, MetadataEngine, RestoreRequest,
 };
-use futures::StreamExt;
 use futures::future::BoxFuture;
+use futures::{StreamExt, TryStreamExt};
 
 use crate::CassandraEngine;
 use crate::create_table::RestoreTargetColumns;
@@ -122,9 +122,12 @@ use crate::delete_table::DeleteTableCaller;
 const BACKUP_ITEMS_PER_BUCKET: i64 = 64;
 const BACKUP_SCAN_PAGE_SIZE: i64 = 1_000;
 
-/// Items of one bucket a restore copy writes concurrently. Shared by the
-/// legacy copy and the store-backed `bulk_load`.
+/// Items a restore copy writes concurrently. Shared by the legacy copy and
+/// the store-backed `bulk_load`.
 pub(crate) const RESTORE_WRITE_CONCURRENCY: usize = 8;
+
+/// Backup payload buckets a restore copy reads ahead of its writes.
+const RESTORE_READ_AHEAD_BUCKETS: usize = 2;
 
 /// Heartbeats that error in a row after which a job stops: three beats could
 /// not confirm the claim, so the row may already be another owner's. One
@@ -1223,6 +1226,44 @@ impl CassandraEngine {
         }
     }
 
+    /// The items of one payload bucket of `backup_arn`, each with the byte
+    /// length of its stored JSON.
+    async fn read_backup_bucket(
+        &self,
+        account_keyspace: &str,
+        backup_arn: &str,
+        bucket: i64,
+    ) -> Result<Vec<(Item, usize)>, StorageError> {
+        let query = format!(
+            "SELECT item_data FROM {account_keyspace}.backup_items WHERE backup_arn = ? AND bucket = ?"
+        );
+        #[allow(clippy::cast_possible_truncation)]
+        let bucket = bucket as i32;
+        let rows = self
+            .session
+            .run(
+                Stmt::Read,
+                &query,
+                cdrs_tokio::query_values!(backup_arn, bucket),
+            )
+            .await
+            .map_err(|e| StorageError::Internal(format!("Read backup payload: {e}")))?
+            .response_body()
+            .map_err(|e| StorageError::Internal(format!("Parse backup payload: {e}")))?
+            .into_rows()
+            .unwrap_or_default();
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            let item_data: String = row
+                .get_r_by_name("item_data")
+                .map_err(|e| StorageError::Internal(format!("Parse backup item: {e}")))?;
+            let item: Item = serde_json::from_str(&item_data)
+                .map_err(|e| StorageError::Internal(format!("Deserialize backup item: {e}")))?;
+            items.push((item, item_data.len()));
+        }
+        Ok(items)
+    }
+
     async fn copy_backup_into_target(
         &self,
         job: &RestoreJob,
@@ -1235,65 +1276,83 @@ impl CassandraEngine {
             key_schema: job.key_schema.clone(),
             base_key_schema: job.key_schema.clone(),
             attribute_definitions: job.attribute_definitions.clone(),
-            // The put path reads the target's indexes from the catalog by
-            // table_id; these routing fields are not consulted by it.
+            // The copy reads the target's indexes from the catalog by
+            // table_id (below); the writer does not consult these routing
+            // fields.
             has_lsi: false,
             global_secondary_indexes: Vec::new(),
             local_secondary_indexes: Vec::new(),
             stream_specification: None,
             vector_indexes: Vec::new(),
         };
+        // The target's indexes, read at LOCAL_QUORUM: the restore wrote them
+        // moments ago, and an index a lagging replica omits would be left
+        // empty for every restored item. Every GSI is written in the item's
+        // own batch, as LSIs always are: the target turns ACTIVE only after
+        // its last item is written, and DynamoDB reports a restored table's
+        // indexes as complete at ACTIVE.
+        let mut indexes = crate::data::index::fetch_indexes_for_table(
+            &job.table_id,
+            &self.session,
+            &self.catalog_keyspace(),
+        )
+        .await
+        .map_err(CopyError::Failed)?;
+        for index in &mut indexes {
+            index.propagation_delay_ms = Some(0);
+        }
         let account_keyspace = self.account_keyspace(&job.account_id);
-        let query = format!(
-            "SELECT item_data FROM {account_keyspace}.backup_items WHERE backup_arn = ? AND bucket = ?"
-        );
+        let read_bucket = |bucket: i64| {
+            let account_keyspace = &account_keyspace;
+            async move {
+                if heartbeat.is_lost() {
+                    return Err(CopyError::OwnershipLost);
+                }
+                self.read_backup_bucket(account_keyspace, &job.backup_arn, bucket)
+                    .await
+                    .map_err(CopyError::Failed)
+            }
+        };
+        // Buckets are read ahead of the writes so the copy is never waiting on
+        // a payload read with nothing in flight; the write stage runs
+        // RESTORE_WRITE_CONCURRENCY items at a time across bucket boundaries.
         let mut restored_count = 0_i64;
         let mut restored_size = 0_i64;
-        for bucket in 0..bucket_count(job.item_count) {
-            if heartbeat.is_lost() {
-                return Err(CopyError::OwnershipLost);
-            }
-            #[allow(clippy::cast_possible_truncation)]
-            let bucket_i32 = bucket as i32;
-            let rows = self
-                .session
-                .run(
-                    Stmt::Read,
-                    &query,
-                    cdrs_tokio::query_values!(job.backup_arn.as_str(), bucket_i32),
-                )
-                .await
-                .map_err(|e| {
-                    CopyError::Failed(StorageError::Internal(format!("Read backup payload: {e}")))
-                })?
-                .response_body()
-                .map_err(|e| {
-                    CopyError::Failed(StorageError::Internal(format!("Parse backup payload: {e}")))
-                })?
-                .into_rows()
-                .unwrap_or_default();
-            let mut items = Vec::with_capacity(rows.len());
-            for row in rows {
-                let item_data: String = row.get_r_by_name("item_data").map_err(|e| {
-                    CopyError::Failed(StorageError::Internal(format!("Parse backup item: {e}")))
-                })?;
-                #[allow(clippy::cast_possible_wrap)]
-                let item_len = item_data.len() as i64;
-                restored_size = restored_size.saturating_add(item_len);
-                let item = serde_json::from_str(&item_data).map_err(|e| {
-                    CopyError::Failed(StorageError::Internal(format!(
-                        "Deserialize backup item: {e}"
-                    )))
-                })?;
-                items.push(item);
-            }
-            let mut writes = futures::stream::iter(items)
-                .map(|item| self.put_restored_item(&key_info, item))
-                .buffer_unordered(RESTORE_WRITE_CONCURRENCY);
-            while let Some(result) = writes.next().await {
-                result.map_err(CopyError::Failed)?;
-                restored_count += 1;
-            }
+        let mut writes = futures::stream::iter(0..bucket_count(job.item_count))
+            .map(read_bucket)
+            .buffered(RESTORE_READ_AHEAD_BUCKETS)
+            .map_ok(|items| futures::stream::iter(items.into_iter().map(Ok)))
+            .try_flatten()
+            .map_ok(|(item, item_len)| {
+                let key_info = &key_info;
+                let indexes = &indexes;
+                async move {
+                    // The read stage checks ownership per bucket; with the
+                    // buckets read ahead and the writes in flight, items of
+                    // up to three buckets would otherwise still be written
+                    // into a target the sweep has claimed.
+                    if heartbeat.is_lost() {
+                        return Err(CopyError::OwnershipLost);
+                    }
+                    // The clock reading a new row's version takes
+                    // (`data::version`), also the write timestamp of the
+                    // item's base and index rows, so the host and node
+                    // clock rule of `restore_engine`'s module doc applies to
+                    // this copy too.
+                    let stamp = crate::data::version::now_micros();
+                    self.put_restored_item_at(key_info, indexes, &item, stamp)
+                        .await
+                        .map_err(CopyError::Failed)?;
+                    Ok::<usize, CopyError>(item_len)
+                }
+            })
+            .try_buffer_unordered(RESTORE_WRITE_CONCURRENCY);
+        while let Some(result) = writes.next().await {
+            let item_len = result?;
+            #[allow(clippy::cast_possible_wrap)]
+            let item_len = item_len as i64;
+            restored_size = restored_size.saturating_add(item_len);
+            restored_count += 1;
         }
         if restored_count != job.item_count {
             return Err(CopyError::Failed(StorageError::Internal(format!(
