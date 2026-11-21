@@ -369,12 +369,12 @@ that names the build:
 
 The parity corpus (`crates/wasm-adapter/parity/corpus.json`) runs on the
 native build and on this one with the same expectations, except in the cases
-that carry an `onWasm` expectation for this build. Seven do. Two are for the
+that carry an `onWasm` expectation for this build. Eight do. Two are for the
 vector-index refusal: "UpdateTable creating a vector index on VecT adds the
 index to the table" expects the refusal here, and "DescribeTable VecT after the
 vector-index create" expects the table to keep only the index it was created
-with. The other five are the backup cases with a well-formed body (one
-`CreateBackup`, two `DescribeBackup`, one `DeleteBackup` and one
+with. The other six are the backup cases with a JSON body (one
+`CreateBackup`, three `DescribeBackup`, one `DeleteBackup` and one
 `RestoreTableFromBackup`), which expect the backup refusal here and the backup
 handlers' answers natively.
 

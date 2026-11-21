@@ -2675,6 +2675,28 @@
       }
     },
     {
+      "name": "DescribeBackup with no BackupArn gets the handler's answer natively and is refused on wasm32",
+      "op": "DescribeBackup",
+      "body": {},
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "1 validation error detected: Value null at 'backupArn' failed to satisfy constraint: Member must not be null"
+        }
+      ],
+      "onWasm": {
+        "error": "ValidationException",
+        "checks": [
+          {
+            "path": "/message",
+            "equals": "DescribeBackup is not supported by the ExtendDB WebAssembly build: it does not include the backup subsystem."
+          }
+        ],
+        "reason": "the engine's backup subsystem does not build for wasm32, so on wasm32 the engine refuses the four store-backed backup operations after the body parse, whatever the JSON body holds"
+      }
+    },
+    {
       "name": "export TableArn: ExportTableToPointInTime with a TableArn that does not parse answers that export is disabled",
       "op": "ExportTableToPointInTime",
       "body": {
