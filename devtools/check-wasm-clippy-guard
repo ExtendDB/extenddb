@@ -106,17 +106,17 @@ fails, with one line per problem, unless all of these hold:
    warning level must not count.
 4. In the adapter's wasm32 build, as `cargo tree -p extenddb-wasm-adapter
    --target wasm32-unknown-unknown -e normal` resolves its features, each
-   crate of ZEROIZE_CRATES (aes-gcm, ghash, polyval) has its `zeroize`
-   feature on: each wipes its own key material only under that feature,
+   crate of ZEROIZE_CRATES (aes-gcm, ghash) has its `zeroize` feature on:
+   each wipes, only under that feature, keys its constructor derives,
    crates/core/Cargo.toml turns it on, and no other step of the workflow
    fails without it. cargo tree resolves the features of the adapter's own
    build; `cargo metadata --filter-platform` unifies those of every
    workspace member and dev-dependency (it lists extenddb-storage's
    test-util and tokio's net and fs features, none of which the wasm build
-   compiles). The fourth crate of the stack, aes, is checked by core's
-   wasm32 build instead (crates/core/src/crypto.rs). In the copy, with each
-   of the three in turn without that feature in crates/core/Cargo.toml, the
-   check must report that crate and no other.
+   compiles). The other two crates of the stack, aes and polyval, are
+   checked by core's wasm32 build instead (crates/core/src/crypto.rs). In
+   the copy, with each of the two in turn without that feature in
+   crates/core/Cargo.toml, the check must report that crate and no other.
 
 The clippy step runs, as devtools/run-wasm-step holds it, in the working tree
 and in the copy, each with its own devtools/wasm-clippy/clippy.toml (the
@@ -1603,14 +1603,15 @@ def _stop(signum: int, _frame) -> None:
 # ---------------------------------------------------------------- zeroize features
 
 # The crates of the wasm32 AES-256-GCM stack whose `zeroize` feature must be on
-# in the adapter's wasm32 build: each wipes its own key material, and only under
-# that feature, and none of them has an item, such as a ZeroizeOnDrop
-# implementation, that a compile-time bound could require. CORE_MANIFEST's
-# wasm32 dependencies turn each one on. aes, the fourth crate of the stack, is
-# not listed: core's wasm32 crypto backend (crates/core/src/crypto.rs) requires
-# the ZeroizeOnDrop marker that aes's feature gives its cipher, so the build
-# fails without it.
-ZEROIZE_CRATES = ("aes-gcm", "ghash", "polyval")
+# in the adapter's wasm32 build and that no compile-time check can require:
+# each wipes, only under that feature, keys its constructor derives (aes-gcm
+# the GHASH key, ghash the key it derives for POLYVAL), and the feature changes
+# none of its types. CORE_MANIFEST's wasm32 dependencies turn each one on. The
+# other two crates of the stack are not listed: core's wasm32 crypto backend
+# (crates/core/src/crypto.rs) requires the ZeroizeOnDrop marker that aes's
+# feature gives its cipher and the Drop implementation that polyval's gives
+# Polyval, so the build fails without either.
+ZEROIZE_CRATES = ("aes-gcm", "ghash")
 CORE_MANIFEST = "crates/core/Cargo.toml"
 
 
