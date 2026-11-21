@@ -277,7 +277,7 @@ pub fn dispatch(
             c.req("DELETE", &format!("/management/accounts/{account_id}"), None),
         M::CreateUser { account_id, user_name, user_password } => {
             if user_password.is_none() {
-                eprintln!("Warning: No console password set — this user cannot log into the management console.");
+                eprintln!("Warning: No console password set, so this user cannot log in to the management console.");
             }
             let mut b = serde_json::json!({ "user_name": user_name });
             if let Some(pw) = user_password { b["password"] = serde_json::Value::String(pw); }

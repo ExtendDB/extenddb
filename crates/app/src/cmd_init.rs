@@ -286,8 +286,8 @@ pub async fn run(args: InitArgs, release: &str) -> anyhow::Result<u8> {
             "\n  ┌─────────────────────────────────────────────────┐\
              \n  │  Admin credentials (shown once, save them now)  │\
              \n  │                                                 │\
-             \n  │  Username: {:<37} │\
-             \n  │  Password: {:<37} │\
+             \n  │  Username: {:<36} │\
+             \n  │  Password: {:<36} │\
              \n  └─────────────────────────────────────────────────┘\n",
             admin_result.username, password,
         );
