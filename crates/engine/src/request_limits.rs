@@ -23,6 +23,7 @@
 //! the same text.
 
 use extenddb_core::error::DynamoDbError;
+use extenddb_core::types::{BatchGetItemInput, BatchWriteItemInput};
 use serde_json::Value;
 
 /// Maximum number of keys across all tables in one `BatchGetItem` request,
@@ -150,12 +151,14 @@ fn count_error(limit: usize, failed: &[(String, usize)]) -> DynamoDbError {
 /// Runs [`check_batch_counts`] or [`check_transact_count`], the checks the
 /// handlers run on the parsed request. A body whose top-level container is
 /// missing or not the expected type is left to the handler, which rejects it
-/// when it parses the request. Any other operation passes.
+/// when it parses the request. A batch outside its counts can get the
+/// handler's `SerializationException` instead, as `type_fault` says. Any
+/// other operation passes.
 ///
 /// # Errors
 ///
-/// Returns the `ValidationException` the operation's handler returns for the
-/// same request.
+/// Returns the `ValidationException` or `SerializationException` the
+/// operation's handler returns for the same request.
 pub fn check_request_item_counts(operation: &str, body: &Value) -> Result<(), DynamoDbError> {
     match operation {
         "TransactGetItems" | "TransactWriteItems" => {
@@ -184,12 +187,38 @@ pub fn check_request_item_counts(operation: &str, body: &Value) -> Result<(), Dy
                         )
                     })
                     .collect();
-                check_batch_counts(operation, &tables)?;
+                check_batch_counts(operation, &tables)
+                    .map_err(|count| type_fault(operation, body).unwrap_or(count))?;
             }
         }
         _ => {}
     }
     Ok(())
+}
+
+/// The handler's `SerializationException` for a batch body, when its parse
+/// finds a value of another JSON type than the member's. The service answers
+/// that ahead of the counts. It answers the count clause for a missing or null
+/// member and for the string `"true"` or `"false"` where a boolean goes
+/// (measured 2026-11-20 and 2026-11-21). The `AttributeValue` reader names its
+/// faults in its own words, which do not tell a null or an accepted string
+/// from a value of another type, so those keep the count clause too.
+fn type_fault(operation: &str, body: &Value) -> Option<DynamoDbError> {
+    let e = if operation == "BatchGetItem" {
+        <BatchGetItemInput as serde::Deserialize>::deserialize(body).err()
+    } else {
+        <BatchWriteItemInput as serde::Deserialize>::deserialize(body).err()
+    }?;
+    let text = e.to_string();
+    let boolean = text == "invalid type: string \"true\", expected a boolean"
+        || text == "invalid type: string \"false\", expected a boolean";
+    if !text.starts_with("invalid type: ") || text.starts_with("invalid type: null") || boolean {
+        return None;
+    }
+    match crate::deserialize_error(e) {
+        fault @ DynamoDbError::SerializationException(_) => Some(fault),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -407,24 +436,90 @@ mod tests {
     }
 
     #[test]
-    fn malformed_entries_count_as_tables_only() {
-        // A table entry of the wrong shape is left to the handler, but it still
-        // counts towards the number of tables.
-        assert!(
-            check_request_item_counts("BatchWriteItem", &json!({"RequestItems": {"a": 1}})).is_ok()
-        );
-        assert!(
-            check_request_item_counts("BatchGetItem", &json!({"RequestItems": {"a": {}}})).is_ok()
-        );
-        let map: serde_json::Map<String, Value> =
-            names(101).into_iter().map(|t| (t, json!({}))).collect();
-        assert!(
-            message(check_request_item_counts(
-                "BatchGetItem",
-                &json!({ "RequestItems": map })
-            ))
-            .ends_with("Member must have length less than or equal to 100")
-        );
+    fn malformed_entries_in_order() {
+        // Measured 2026-11-20 and 2026-11-21. Rows 0 to 4, 6 and 7 have the
+        // service's error type, and row 4 its text too. Rows 8 to 10 and 13 to
+        // 16 pin this server's answer, which has the service's type only. Rows
+        // 5, 11 and 12 are within the counts, where the check passes.
+        let many = names(101);
+        // `n` tables of one item each, with the value of `odd` at its indexes.
+        let body = |op: &str, n: usize, odd: &[(usize, Value)]| {
+            let tables: Vec<(&str, usize)> = many[..n].iter().map(|t| (t.as_str(), 1)).collect();
+            let mut body = if op == "BatchGetItem" {
+                bgi(&tables)
+            } else {
+                bwi(&tables)
+            };
+            for (i, value) in odd {
+                body["RequestItems"][many[*i].as_str()] = value.clone();
+            }
+            body
+        };
+        let count = |limit: usize| {
+            format!(
+                "Value at 'RequestItems' failed to satisfy constraint: Member must have length less than or equal to {limit}"
+            )
+        };
+        let one = |c: String| format!("1 validation error detected: {c}");
+        // A write list of one put whose attribute `x` is `v`.
+        let put_x = |v: Value| json!([{"PutRequest": {"Item": {"pk": {"S": "a"}, "x": v}}}]);
+        let ser = || "SerializationException".to_owned();
+        let ok = || "Ok".to_owned();
+        let (bw, bg) = ("BatchWriteItem", "BatchGetItem");
+        let cases = [
+            (bw, 26, vec![(5, json!(1))], ser()),
+            (bw, 26, vec![(5, json!(1)), (9, json!([]))], ser()),
+            (bw, 26, vec![(5, json!({}))], ser()),
+            (bw, 26, vec![(5, json!([1]))], ser()),
+            (bw, 26, vec![(5, json!([{}]))], one(count(25))),
+            (bw, 2, vec![(1, json!(1))], ok()),
+            (bg, 101, vec![(5, json!(1))], ser()),
+            (bg, 101, vec![(5, json!({"Keys": 1}))], ser()),
+            (bg, 101, vec![(5, json!({}))], one(count(100))),
+            (bg, 101, vec![(5, json!({"Keys": null}))], one(count(100))),
+            (
+                bg,
+                101,
+                vec![(5, json!({})), (9, json!({"Keys": []}))],
+                format!(
+                    "2 validation errors detected: {}; Value at 'RequestItems.t009.member.Keys' failed to satisfy constraint: Member must have length greater than or equal to 1",
+                    count(100)
+                ),
+            ),
+            (bg, 2, vec![(1, json!({}))], ok()),
+            (bg, 2, vec![(1, json!(1))], ok()),
+            (bw, 26, vec![(5, put_x(json!({"S": null})))], one(count(25))),
+            (bw, 26, vec![(5, put_x(json!({"X": "a"})))], one(count(25))),
+            (
+                bw,
+                26,
+                vec![(5, put_x(json!({"BOOL": "true"})))],
+                one(count(25)),
+            ),
+            (
+                bg,
+                101,
+                vec![(
+                    5,
+                    json!({"Keys": [{"pk": {"S": "a"}}], "ConsistentRead": "true"}),
+                )],
+                one(count(100)),
+            ),
+        ];
+        let failed: Vec<String> = cases
+            .into_iter()
+            .enumerate()
+            .filter_map(|(row, (op, n, odd, expected))| {
+                let got = match check_request_item_counts(op, &body(op, n, &odd)) {
+                    Ok(()) => ok(),
+                    Err(DynamoDbError::SerializationException(_)) => ser(),
+                    Err(DynamoDbError::ValidationException(m)) => m,
+                    Err(other) => format!("{other:?}"),
+                };
+                (got != expected).then(|| format!("row {row}: {got}"))
+            })
+            .collect();
+        assert!(failed.is_empty(), "{}", failed.join("\n"));
         assert!(check_request_item_counts("TransactWriteItems", &json!({})).is_ok());
         assert!(check_request_item_counts("Query", &transact("TransactGetItems", 101)).is_ok());
     }

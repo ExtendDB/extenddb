@@ -309,8 +309,9 @@ fn answer(
 /// decision, with the answer in the module docs. `Ok` when every resource the
 /// request names by ARN is in `account_id`.
 ///
-/// A batch or transaction outside its count limits gets the count error
-/// first, and the ARN shape checks run as [`answer`] describes.
+/// A batch or transaction outside its count limits gets the answer of
+/// `check_request_item_counts` first, and the ARN shape checks run as
+/// [`answer`] describes.
 pub(crate) async fn refuse(
     state: &AppState,
     identity: &AuthIdentity,
