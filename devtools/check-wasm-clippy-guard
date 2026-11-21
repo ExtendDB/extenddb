@@ -101,10 +101,19 @@ fails, with one line per problem, unless all of these hold:
    compiler messages that the function counting those refusals must count,
    or not count, as refusing a probe, as the list says; a report at the
    warning level must not count.
-4. ZEROIZE_CRATES lists the crates of the wasm32 AES-256-GCM stack whose
-   `zeroize` feature must be on in the adapter's wasm32 build. In the copy,
-   with each of them in turn without that feature in crates/core/Cargo.toml,
-   the check of those features must report that crate and no other.
+4. In the adapter's wasm32 build, as `cargo tree -p extenddb-wasm-adapter
+   --target wasm32-unknown-unknown -e normal` resolves its features, each
+   crate of ZEROIZE_CRATES (aes-gcm, ghash, polyval) has its `zeroize`
+   feature on: each wipes its own key material only under that feature,
+   crates/core/Cargo.toml turns it on, and no other step of the workflow
+   fails without it. cargo tree resolves the features of the adapter's own
+   build; `cargo metadata --filter-platform` unifies those of every
+   workspace member and dev-dependency (it lists extenddb-storage's
+   test-util and tokio's net and fs features, none of which the wasm build
+   compiles). The fourth crate of the stack, aes, is checked by core's
+   wasm32 build instead (crates/core/src/crypto.rs). In the copy, with each
+   of the three in turn without that feature in crates/core/Cargo.toml, the
+   check must report that crate and no other.
 
 The clippy step runs in the working tree and in the copy with the caller's
 clippy.toml and the caller's cargo target directory, so cargo reuses what the
@@ -1594,17 +1603,31 @@ def _stop(signum: int, _frame) -> None:
 # in the adapter's wasm32 build: each wipes its own key material, and only under
 # that feature, and none of them has an item, such as a ZeroizeOnDrop
 # implementation, that a compile-time bound could require. CORE_MANIFEST's
-# wasm32 dependencies turn each one on.
+# wasm32 dependencies turn each one on. aes, the fourth crate of the stack, is
+# not listed: core's wasm32 crypto backend (crates/core/src/crypto.rs) requires
+# the ZeroizeOnDrop marker that aes's feature gives its cipher, so the build
+# fails without it.
 ZEROIZE_CRATES = ("aes-gcm", "ghash", "polyval")
 CORE_MANIFEST = "crates/core/Cargo.toml"
 
 
 def zeroize_problems(features: dict[str, set[str]]) -> list[str]:
     """Problems with the `zeroize` features of ZEROIZE_CRATES among the
-    resolved `features` of the adapter's wasm32 build. This function looks
-    for none."""
-    del features
-    return []
+    resolved `features` of the adapter's wasm32 build: a crate that is not in
+    the build, or whose feature is off."""
+    problems = []
+    for crate in ZEROIZE_CRATES:
+        if crate not in features:
+            problems.append(
+                f"{crate}: not in the adapter's wasm32 build; update ZEROIZE_CRATES and"
+                f" {CORE_MANIFEST} together"
+            )
+        elif "zeroize" not in features[crate]:
+            problems.append(
+                f"{crate}: its zeroize feature is off in the adapter's wasm32 build, so it"
+                f" leaves its key material in memory; {CORE_MANIFEST} turns it on for wasm32"
+            )
+    return problems
 
 
 def resolved_features(tree: Path, locked: bool) -> tuple[dict[str, set[str]], list[str]]:
@@ -1703,6 +1726,13 @@ def main() -> int:
     found, settings = message_probe_problems()
     failures += found
     print(settings)
+    features, found = resolved_features(ROOT, locked=True)
+    failures += found + (zeroize_problems(features) if features else [])
+    on = [crate for crate in ZEROIZE_CRATES if "zeroize" in features.get(crate, ())]
+    print(
+        f"zeroize features on in the adapter's wasm32 build: {', '.join(on) or 'none'}"
+        f" (of {', '.join(ZEROIZE_CRATES)})"
+    )
     copy = Path(tempfile.mkdtemp(prefix="wasm-clippy-guard-"))
     try:
         files = copy_tree(copy)

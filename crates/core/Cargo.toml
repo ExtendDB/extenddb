@@ -65,7 +65,9 @@ aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "al
 # are named here only to turn the feature on. aes wipes its round keys from
 # 0.8.2; in 0.8.0 and 0.8.1 its `zeroize` feature only enables cipher's.
 # Without aes's feature the wasm32 build fails: src/crypto.rs requires the
-# `ZeroizeOnDrop` marker that the feature gives the cipher.
+# `ZeroizeOnDrop` marker that the feature gives the cipher. The other three
+# have no such item; devtools/check-wasm-clippy-guard checks that their
+# features are on in the adapter's wasm32 build.
 aes = { version = "0.8.2", features = ["zeroize"] }
 ghash = { version = "0.5", features = ["zeroize"] }
 polyval = { version = "0.6", features = ["zeroize"] }
