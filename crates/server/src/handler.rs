@@ -404,8 +404,7 @@ pub(crate) async fn handle_request(
     state.metrics.record_segments(
         &ctx.account_id,
         &operation,
-        metric_table.as_deref(),
-        extenddb_core::metrics::LatencySegments {
+        &extenddb_core::metrics::LatencySegments {
             auth_us,
             authz_us,
             throttle_us,

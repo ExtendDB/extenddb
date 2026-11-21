@@ -9,6 +9,7 @@ use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use super::accumulator::Accumulator;
+use super::segments::SegmentStore;
 use super::types::{LatencySegments, MetricName, TimeWindow};
 
 /// Returns `None` for `AllTime` (no cutoff), or `Some(cutoff)` for bounded windows.
@@ -41,23 +42,13 @@ pub(super) struct MetricKey {
 /// metrics endpoint). Individual `record_*` calls take a write lock briefly.
 pub struct MetricsCollector {
     pub(super) data: RwLock<HashMap<MetricKey, Accumulator>>,
-    /// Per-operation latency segment breakdowns for the console deep-dive.
-    pub(super) segments: RwLock<Vec<SegmentPoint>>,
+    /// Per-account, per-operation latency segment sums for the console
+    /// deep-dive, bucketed by time so memory is bounded by the number of
+    /// accounts and operations.
+    pub(super) segments: RwLock<SegmentStore>,
     /// Serializes drains, so each one takes and keeps points in record order.
     /// `record` and `prune` never take it.
     pub(super) drain_lock: Mutex<()>,
-}
-
-/// A single latency segment data point with metadata.
-#[derive(Debug, Clone)]
-pub(super) struct SegmentPoint {
-    pub(super) operation: String,
-    /// The account of the request, which `query_segments` filters on.
-    pub(super) account_id: String,
-    #[allow(dead_code)] // TODO(cleanup): used when console adds table-scoped latency breakdown
-    pub(super) table_name: Option<String>,
-    pub(super) segments: LatencySegments,
-    pub(super) timestamp: Instant,
 }
 
 impl MetricsCollector {
@@ -66,7 +57,7 @@ impl MetricsCollector {
     pub fn new() -> Self {
         Self {
             data: RwLock::new(HashMap::new()),
-            segments: RwLock::new(Vec::with_capacity(256)),
+            segments: RwLock::new(SegmentStore::new(Instant::now())),
             drain_lock: Mutex::new(()),
         }
     }
@@ -113,29 +104,49 @@ impl MetricsCollector {
     }
 
     /// Record per-segment latency breakdown for a request.
-    pub fn record_segments(
+    ///
+    /// The breakdown is summed into the current time buckets of the account's
+    /// operation, so the memory held does not grow with the request count
+    /// (issue #397). The account is a dimension because `query_segments`
+    /// filters on it. The table is not: a per-table breakdown would multiply
+    /// the bound by the table count, and the console reads per-operation
+    /// averages.
+    pub fn record_segments(&self, account_id: &str, operation: &str, segments: &LatencySegments) {
+        self.record_segments_with(account_id, operation, segments, Instant::now);
+    }
+
+    /// `record_segments` with the clock it reads. The clock is read under the
+    /// lock, as in `query_segments`, so a stored record is never ahead of a
+    /// query that follows it; otherwise a writer that crosses a bucket
+    /// boundary between its clock read and its lock could drop the oldest
+    /// in-window bucket before a reader with an earlier clock reads it.
+    pub(super) fn record_segments_with(
         &self,
         account_id: &str,
         operation: &str,
-        table_name: Option<&str>,
-        segments: LatencySegments,
+        segments: &LatencySegments,
+        clock: impl FnOnce() -> Instant,
     ) {
-        let point = SegmentPoint {
-            operation: operation.to_owned(),
-            account_id: account_id.to_owned(),
-            table_name: table_name.map(ToOwned::to_owned),
-            segments,
-            timestamp: Instant::now(),
-        };
-        let Ok(mut vec) = self.segments.write() else {
+        let Ok(mut store) = self.segments.write() else {
             return;
         };
-        vec.push(point);
+        store.record(account_id, operation, segments, clock());
     }
 
     /// Prune data points older than 1 day.
+    ///
+    /// Segment buckets leave their ring as time advances; the prune drops the
+    /// rings of an account's operation once its newest bucket is older than a
+    /// day, so an account that stopped sending requests, or was deleted, frees
+    /// its segment buckets after a day.
     pub fn prune(&self) {
-        let now = Instant::now();
+        self.prune_at(Instant::now());
+    }
+
+    /// `prune` at the clock `now`, which may be read before the locks: a
+    /// point or a segment recorded in between is newer than `now`, so the
+    /// prune keeps it.
+    pub(super) fn prune_at(&self, now: Instant) {
         let cutoff = now.checked_sub(Duration::from_secs(86400)).unwrap_or(now);
         let Ok(mut map) = self.data.write() else {
             return;
@@ -145,9 +156,8 @@ impl MetricsCollector {
         }
         map.retain(|_, acc| !acc.is_empty());
         drop(map);
-        // Prune segment points too.
-        if let Ok(mut segs) = self.segments.write() {
-            segs.retain(|p| p.timestamp >= cutoff);
+        if let Ok(mut store) = self.segments.write() {
+            store.prune(now);
         }
     }
 }
