@@ -483,10 +483,14 @@ fn get_records_limit(limit: Option<i64>) -> Result<i64, DynamoDbError> {
     }
 }
 
-fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
+pub(crate) fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
     match e {
         StorageError::Validation(msg) => DynamoDbError::ValidationException(msg),
         StorageError::TableNotFound(name) => DynamoDbError::ResourceNotFoundException(name),
+        // The backend already classified this failure into the service error
+        // vocabulary and chose the client-facing message. Pass it through
+        // unchanged; it is not a storage fault, so it is not logged as one.
+        StorageError::Service(e) => e,
         other => {
             tracing::error!(internal_error = %other, "storage internal error");
             DynamoDbError::InternalServerError("Internal server error".to_owned())
