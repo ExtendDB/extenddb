@@ -407,9 +407,12 @@ finish_if_only_wasm_suites_left() {
 # `node-version:` value). When rustup is installed the toolchain is found
 # through rustup's proxies even when another cargo comes first on PATH, and a
 # missing one fails the suite with the command that installs it; without
-# rustup the cargo on PATH runs and the suite says so. A suite that runs Node
-# fails, with an install hint, unless a Node of that major version is on PATH
-# as node, node-<major> or node<major>. Each suite prints what it used.
+# rustup the cargo on PATH runs and the suite says so. Besides the
+# toolchain's tools and the Node link below, nothing moves ahead of the
+# caller's PATH: wasm-pack, wasm-bindgen-test-runner and the other tools a
+# suite starts are the caller's. A suite that runs Node fails, with an install
+# hint, unless a Node of that major version is on PATH as node, node-<major>
+# or node<major>. Each suite prints what it used.
 wasm_workflow_toolchain() {
     sed -n 's/^[[:space:]]*toolchain:[[:space:]]*"\{0,1\}\([^"#[:space:]]*\)"\{0,1\}.*/\1/p' \
         .github/workflows/wasm.yml | head -n 1
@@ -418,15 +421,22 @@ wasm_workflow_node_major() {
     sed -n 's/^[[:space:]]*node-version:[[:space:]]*"\{0,1\}\([0-9][0-9]*\).*/\1/p' \
         .github/workflows/wasm.yml | head -n 1
 }
+# The directories of links that wasm_select_toolchain and wasm_select_node put
+# first on PATH; removed when a suite ends and when the script exits.
+WASM_TOOLCHAIN_DIR=""
 WASM_NODE_DIR=""
-wasm_remove_node_dir() {
+wasm_remove_link_dirs() {
+    if [ -n "$WASM_TOOLCHAIN_DIR" ]; then
+        rm -rf "$WASM_TOOLCHAIN_DIR"
+        WASM_TOOLCHAIN_DIR=""
+    fi
     if [ -n "$WASM_NODE_DIR" ]; then
         rm -rf "$WASM_NODE_DIR"
         WASM_NODE_DIR=""
     fi
     return 0
 }
-trap wasm_remove_node_dir EXIT
+trap wasm_remove_link_dirs EXIT
 # Saves PATH and RUSTUP_TOOLCHAIN for wasm_restore_env, then puts the
 # workflow's toolchain first. Sets WASM_TOOLCHAIN_NOTE; returns 1 when the
 # toolchain is missing.
@@ -434,11 +444,14 @@ wasm_select_toolchain() {
     WASM_SAVED_PATH="$PATH"
     WASM_SAVED_TOOLCHAIN="${RUSTUP_TOOLCHAIN-}"
     WASM_SAVED_TOOLCHAIN_SET="${RUSTUP_TOOLCHAIN+set}"
-    local toolchain rustup
+    local toolchain rustup tool
     toolchain="$(wasm_workflow_toolchain)"
     rustup="$(command -v rustup || true)"
     if [ -z "$rustup" ] && [ -x "${CARGO_HOME:-$HOME/.cargo}/bin/rustup" ]; then
         rustup="${CARGO_HOME:-$HOME/.cargo}/bin/rustup"
+    fi
+    if [ -n "$rustup" ] && [ "${rustup#/}" = "$rustup" ]; then
+        rustup="$(cd "$(dirname "$rustup")" && pwd)/$(basename "$rustup")"
     fi
     if [ -z "$toolchain" ]; then
         WASM_TOOLCHAIN_NOTE="no toolchain: value found in .github/workflows/wasm.yml; using the cargo on PATH"
@@ -448,10 +461,18 @@ wasm_select_toolchain() {
         WASM_TOOLCHAIN_NOTE="toolchain ${toolchain} (from .github/workflows/wasm.yml) is not installed; run: rustup toolchain install ${toolchain} --profile minimal --component clippy --target wasm32-unknown-unknown"
         return 1
     else
-        # rustup's proxies (cargo, clippy-driver, rustc) honour
-        # RUSTUP_TOOLCHAIN; put them first so that the cargo the self-test and
-        # wasm-pack start resolves to them too.
-        PATH="$(dirname "$rustup"):$PATH"
+        # rustup runs as the tool it is started as (its argv[0]), from the
+        # toolchain RUSTUP_TOOLCHAIN names, so a directory of links to it, one
+        # per tool of the toolchain, put first on PATH makes each cargo and
+        # rustc that this script, the self-test or wasm-pack start by name the
+        # workflow's. rustup's own directory, usually cargo's bin directory,
+        # where `cargo install` puts wasm-pack and wasm-bindgen-test-runner,
+        # keeps its place on the caller's PATH.
+        WASM_TOOLCHAIN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/run-tests-toolchain.XXXXXX")"
+        for tool in cargo rustc rustdoc cargo-clippy clippy-driver rustfmt cargo-fmt; do
+            ln -s "$rustup" "$WASM_TOOLCHAIN_DIR/$tool"
+        done
+        PATH="$WASM_TOOLCHAIN_DIR:$PATH"
         export RUSTUP_TOOLCHAIN="$toolchain"
         WASM_TOOLCHAIN_NOTE="${toolchain} via rustup (from .github/workflows/wasm.yml)"
     fi
@@ -495,7 +516,7 @@ wasm_restore_env() {
     else
         unset RUSTUP_TOOLCHAIN
     fi
-    wasm_remove_node_dir
+    wasm_remove_link_dirs
 }
 # A Python 3.11 or later, which devtools/check-wasm-clippy-guard needs (it
 # reads TOML with tomllib): python3 when it is new enough, else the newest
