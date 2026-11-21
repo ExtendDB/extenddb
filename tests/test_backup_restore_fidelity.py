@@ -2341,6 +2341,26 @@ def test_backup_and_table_names_are_validated(dynamodb_client):
             {"BackupArn": missing, "TargetTableName": 5, "BillingModeOverride": "X"},
         ):
             cases.append(("RestoreTableFromBackup", body, serialization))
+        # A BackupArn of another JSON type is answered before the target name, a
+        # missing target and the overrides (measured 21 Nov 2026). A null one is an
+        # absent member, whose text is #1272, so only its type is checked.
+        restored = f"{source}-r"
+        for arn in (5, True, {}, [], ["a"], 5.5):
+            cases.append(("RestoreTableFromBackup",
+                          {"BackupArn": arn, "TargetTableName": restored}, serialization))
+        for body in (
+            {"BackupArn": 5, "TargetTableName": "a*"},
+            {"TargetTableName": "a*", "BackupArn": 5},
+            {"BackupArn": 5, "TargetTableName": "ab"},
+            {"BackupArn": 5},
+            {"BackupArn": 5, "TargetTableName": restored, "BillingModeOverride": "PAY"},
+            {"BillingModeOverride": "PAY", "BackupArn": 5, "TargetTableName": restored},
+            {"BackupArn": 5, "TargetTableName": restored, "GlobalSecondaryIndexOverride": [{}]},
+        ):
+            cases.append(("RestoreTableFromBackup", body, serialization))
+        invalid = "ValidationException"
+        cases.append(("RestoreTableFromBackup",
+                      {"BackupArn": None, "TargetTableName": restored}, invalid))
         # With a TargetTableName outside the pattern, an override member of another JSON
         # kind and a BackupArn of another account are answered first, and any other
         # override fault after the name (measured 20 Nov 2026). The SerializationException
@@ -2373,8 +2393,8 @@ def test_backup_and_table_names_are_validated(dynamodb_client):
             resp = _signed(operation, body)
             assert resp.status_code == 400, (operation, body, resp.text)
             code, message = _error(resp)
-            if expected == serialization:
-                assert code == serialization, (operation, body, resp.text)
+            if expected in (serialization, invalid):
+                assert code == expected, (operation, body, resp.text)
                 continue
             if expected == denied:
                 assert (code, message) == ("AccessDeniedException", denied), (body, resp.text)
@@ -2458,6 +2478,13 @@ def test_backup_arn_shapes_the_service_refuses_and_trims(dynamodb_client):
                     assert message == expected, (operation, arn, message)
                 else:
                     assert message in (not_valid, invalid_id), (operation, arn, message)
+        # A BackupArn of another JSON type is a SerializationException (measured
+        # 21 Nov 2026). Only its type is checked (#1012).
+        for operation in ("DescribeBackup", "DeleteBackup"):
+            for arn in (5, {}):
+                resp = _signed(operation, {"BackupArn": arn})
+                assert resp.status_code == 400, (operation, arn, resp.text)
+                assert _error(resp)[0] == "SerializationException", (operation, arn, resp.text)
         # Liveness: the real ARN still resolves, and nothing was created.
         assert (
             client.describe_backup(BackupArn=backup_arn)["BackupDescription"]["BackupDetails"][
