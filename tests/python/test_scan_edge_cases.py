@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 from botocore.exceptions import ClientError
 
-from helpers import unique_name
+from helpers import assert_validation, unique_name, wait_for_active, wait_for_deleted
 
 
 class TestScanEdgeCases:
@@ -478,3 +478,116 @@ class TestScanEdgeCases:
         err = exc.value.response["Error"]
         assert err["Code"] == "ValidationException"
         assert "greater than or equal to 0" in err["Message"]
+
+
+# Index start keys of the wrong type (issue #1033), measured on Amazon
+# DynamoDB in us-east-1 on 2026-11-14, 2026-11-16 and 2026-11-19.
+INVALID_START_KEY = "The provided starting key is invalid"
+INDEX_HASH_KEY = {"gsi2": "lsi1sk", "lsi1": "pk"}
+GSI2, LSI1 = ("lsi1sk", "lsi2sk", "pk", "sk"), ("pk", "sk", "lsi1sk")
+A, SS = {"S": "a"}, {"SS": ["a"]}
+
+
+def _key(keys, **changes):
+    """Every key set to "a", then `changes`. A change to None leaves the key out."""
+    key = dict.fromkeys(keys, A) | changes
+    return {name: value for name, value in key.items() if value is not None}
+
+
+# (operation, index, ExclusiveStartKey, expected): the key and sent type that the
+# index key type sentence names, the short sentence, or the count of an accepted read.
+INDEX_START_KEY_ROWS = [
+    # The rows of the issue.
+    ("scan", "gsi2", _key(GSI2, lsi2sk=SS), ("lsi2sk", "SS")),
+    ("scan", "lsi1", _key(LSI1, lsi1sk=SS), ("lsi1sk", "SS")),
+    ("query", "gsi2", _key(GSI2, lsi2sk=SS), INVALID_START_KEY),
+    ("query", "lsi1", _key(LSI1, lsi1sk=SS), INVALID_START_KEY),
+    # A key left out, an attribute beside every key and an empty map.
+    ("scan", "gsi2", _key(GSI2, lsi2sk=None), INVALID_START_KEY),
+    ("scan", "lsi1", _key(LSI1, lsi1sk=None), INVALID_START_KEY),
+    ("query", "gsi2", _key(GSI2, lsi2sk=None), INVALID_START_KEY),
+    ("query", "lsi1", _key(LSI1, lsi1sk=None), INVALID_START_KEY),
+    ("scan", "gsi2", _key(GSI2, extra=A), INVALID_START_KEY),
+    ("scan", "lsi1", _key(LSI1, extra=A), INVALID_START_KEY),
+    ("query", "gsi2", _key(GSI2, extra=A), INVALID_START_KEY),
+    ("query", "lsi1", _key(LSI1, extra=A), INVALID_START_KEY),
+    ("scan", "gsi2", {}, INVALID_START_KEY),
+    ("scan", "lsi1", {}, INVALID_START_KEY),
+    ("query", "gsi2", {}, INVALID_START_KEY),
+    ("query", "lsi1", {}, INVALID_START_KEY),
+    # Measured on 2026-11-19.
+    ("scan", "gsi2", _key(GSI2, lsi1sk=SS), ("lsi1sk", "SS")),
+    ("scan", "gsi2", _key(GSI2, sk=SS), ("sk", "SS")),
+    ("scan", "lsi1", _key(LSI1, pk=SS), ("pk", "SS")),
+    ("scan", "lsi1", _key(LSI1, lsi1sk={"N": "1"}), ("lsi1sk", "N")),
+    ("scan", "lsi1", _key(LSI1, lsi1sk={"B": b"a"}), ("lsi1sk", "B")),
+    ("scan", "gsi2", _key(GSI2, lsi2sk=SS, sk=None), ("lsi2sk", "SS")),
+    # Every key of its declared type.
+    ("scan", "gsi2", _key(GSI2), 0),
+    ("scan", "lsi1", _key(LSI1), 0),
+]
+
+
+def _row_id(row):
+    operation, index, key, _ = row
+    types = "-".join(f"{name}:{next(iter(value))}" for name, value in key.items())
+    return f"{operation}-{index}-{types or 'empty'}"
+
+
+@pytest.fixture(scope="module")
+def index_type_table(dynamodb_client):
+    """Keys pk and sk, the LSI lsi1 on (pk, lsi1sk), the GSI gsi2 on (lsi1sk, lsi2sk)."""
+    def keys(*names):
+        return [{"AttributeName": n, "KeyType": t} for n, t in zip(names, ("HASH", "RANGE"))]
+
+    def index(index_name, hash_key, range_key):
+        return {
+            "IndexName": index_name,
+            "KeySchema": keys(hash_key, range_key),
+            "Projection": {"ProjectionType": "ALL"},
+        }
+
+    name = unique_name("esk-index-type")
+    dynamodb_client.create_table(
+        TableName=name,
+        AttributeDefinitions=[
+            {"AttributeName": a, "AttributeType": "S"} for a in ("pk", "sk", "lsi1sk", "lsi2sk")
+        ],
+        KeySchema=keys("pk", "sk"),
+        LocalSecondaryIndexes=[index("lsi1", "pk", "lsi1sk")],
+        GlobalSecondaryIndexes=[index("gsi2", "lsi1sk", "lsi2sk")],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    try:
+        wait_for_active(dynamodb_client, name)
+        yield name
+    finally:
+        dynamodb_client.delete_table(TableName=name)
+        wait_for_deleted(dynamodb_client, name)
+
+
+@pytest.mark.parametrize(
+    "operation,index,start_key,expected",
+    INDEX_START_KEY_ROWS,
+    ids=[_row_id(row) for row in INDEX_START_KEY_ROWS],
+)
+def test_index_start_key_types(
+    index_type_table, dynamodb_client, operation, index, start_key, expected
+):
+    request = {"TableName": index_type_table, "IndexName": index, "ExclusiveStartKey": start_key}
+    if operation == "query":
+        request["KeyConditionExpression"] = f"{INDEX_HASH_KEY[index]} = :p"
+        request["ExpressionAttributeValues"] = {":p": A}
+    read = getattr(dynamodb_client, operation)
+    if isinstance(expected, int):
+        assert read(**request)["Count"] == expected
+        return
+    if isinstance(expected, tuple):
+        key, actual = expected
+        expected = (
+            "One or more parameter values were invalid: Type mismatch for Index Key "
+            f"{key} Expected: S Actual: {actual} IndexName: {index}"
+        )
+    with pytest.raises(ClientError) as exc_info:
+        read(**request)
+    assert_validation(exc_info.value, expected)
