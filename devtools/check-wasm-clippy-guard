@@ -13,22 +13,27 @@ also runs clippy's await_holding_lock and await_holding_refcell_ref lints,
 which warn by default and report a std Mutex or RwLock guard, or a RefCell
 borrow, held across an .await; on wasm32-unknown-unknown such code traps when
 another task takes a conflicting lock or borrow of the same value (std's Mutex
-panics with "cannot recursively acquire mutex"). Allowing clippy::all,
-clippy::style, clippy::suspicious or warnings, one of the two disallowed lints
-or one of those two lints switches the guard off for the code the setting
-covers, and the step again exits 0. This script fails, with one line per
-problem, unless all of these hold:
+panics with "cannot recursively acquire mutex"). A setting that switches one
+of the two disallowed lints or one of those two lints off, or keeps its
+reports warnings, directly or through clippy::all, clippy::style,
+clippy::suspicious or warnings, switches the guard off for the code it
+covers, and the step again exits 0: for example an allow of one of them,
+#![warn(warnings)] (the step's -D warnings then leaves every warning of that
+code a warning), or a --force-warn or --cap-lints in rustflags. This script
+fails, with one line per problem, unless all of these hold:
 
 1. clippy.toml holds only `disallowed-methods` and `disallowed-types`; each
    entry is a table with a `path` and a `reason` and nothing else; no path is
    listed twice; each entry has a probe below and each probe names an entry.
 2. In the crates the wasm build compiles (extenddb-wasm-adapter and the
    workspace crates it depends on for wasm32, read from `cargo metadata`), no
-   source file under src/ allows or expects clippy::all, clippy::style,
-   clippy::suspicious or warnings, nor clippy::await_holding_lock or
-   clippy::await_holding_refcell_ref with or without a reason, nor
+   source file under src/ allows, expects or warns clippy::all,
+   clippy::style, clippy::suspicious or warnings, nor clippy::await_holding_lock
+   or clippy::await_holding_refcell_ref with or without a reason; none warns
    clippy::disallowed_methods or clippy::disallowed_types (or their former
-   names) without a `reason` that holds more than whitespace. The one
+   names), and none allows or expects one of those two without a `reason`
+   that holds more than whitespace. A lint named with a raw identifier
+   (`clippy::r#all`) is read as rustc reads it, as the plain name. The one
    exception is a catalog migration's code-body module: CONTRIBUTING.md
    ("Adding a catalog migration") declares each one, in src/migrations/mod.rs,
    with #[rustfmt::skip] and #[allow(clippy::all, deprecated)], because its
@@ -36,9 +41,24 @@ problem, unless all of these hold:
    of clippy::all is accepted only in that exact form, on a `mod mNNNN_<name>;`
    line of a src/migrations/mod.rs whose src/migrations/mNNNN_<name>.rs
    exists; the guard does not see those bodies, and the headless parity
-   corpus runs every migration when it creates an engine. The `[lints]` tables of those crates and the
-   workspace's `[workspace.lints]` allow none of these lints, and
-   .cargo/config.toml passes rustc no flag that allows lints or caps them.
+   corpus runs every migration when it creates an engine. The `[lints]`
+   tables of those crates and the workspace's `[workspace.lints]` set none of
+   these lints or groups to a level other than deny or forbid (a key spelt
+   with hyphens is read with underscores, as rustc reads it). No `rustflags`
+   setting, in any table of .cargo/config.toml or .cargo/config, holds -A,
+   -W, -Z, --allow, --warn, --force-warn or --cap-lints, with its value
+   apart, attached or after `=`, or an @-file of further arguments; and
+   neither file's [build] table sets rustc, rustc-wrapper or
+   rustc-workspace-wrapper, which run another program as the compiler.
+   .github/workflows/wasm.yml, read as text, names outside its comments no
+   variable that sets rustc flags (RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS,
+   CARGO_BUILD_RUSTFLAGS or CARGO_TARGET_<TRIPLE>_RUSTFLAGS) or the compiler
+   (RUSTC, RUSTC_WRAPPER, RUSTC_WORKSPACE_WRAPPER, or CARGO_BUILD_RUSTC and
+   its two wrapper forms). A warn of one of these lints or groups, or a -W in
+   rustflags, does not stop the step from failing on a guarded call, as its
+   -D warnings raises the warning to an error again; they are refused too.
+   CLIPPY_ARGS in the workflow is not looked for: cargo clippy sets that
+   variable from the arguments after `--` and replaces a value it inherits.
    SETTING_PROBES lists lint settings in each of these spellings (attribute,
    inner attribute, cfg_attr, `[lints]` table, rustflags, workflow lines); the
    functions that read the crates' files and the workflow must refuse or
@@ -85,6 +105,7 @@ CONFIG = CONF_DIR / "clippy.toml"
 CONFIG_REL = CONFIG.relative_to(ROOT).as_posix()
 ADAPTER = "extenddb-wasm-adapter"
 TARGET = "wasm32-unknown-unknown"
+WORKFLOW_REL = ".github/workflows/wasm.yml"
 # The clippy step of .github/workflows/wasm.yml, with JSON messages.
 CLIPPY = [
     "cargo",
@@ -112,21 +133,28 @@ PROBE_MODULE = "wasm_clippy_guard_probes"
 # #[allow(clippy::all, deprecated)].
 MIGRATION_MODULE = re.compile(r"m[0-9]{4}_[a-z0-9_]+")
 MIGRATION_ALLOW = {"clippy::all", "deprecated"}
-# Allowing one of these turns the guard off: clippy::all and clippy::style
-# contain disallowed_methods and disallowed_types, clippy::all and
-# clippy::suspicious contain await_holding_lock and await_holding_refcell_ref,
-# and warnings covers every lint at the warn level, where all four sit.
+# Setting one of these below deny turns the guard off: clippy::all and
+# clippy::style contain disallowed_methods and disallowed_types, clippy::all
+# and clippy::suspicious contain await_holding_lock and
+# await_holding_refcell_ref, and warnings covers every lint at the warn level,
+# where all four sit. An allow or expect of one switches those lints off, and a
+# warn of warnings keeps every warning a warning under the clippy step's
+# -D warnings. A warn of one of the groups, or of one of the four lints, does
+# not stop the clippy step from failing on a guarded call (-D warnings raises
+# the warning to an error again); it is refused as well, so that no lint
+# setting puts these below deny but the reasoned allows NEED_REASON describes.
 BLANKET = {"clippy::all", "clippy::style", "clippy::suspicious", "warnings"}
-# These may be allowed only with a reason that is not empty or whitespace. The
-# last two are the lints' former names, which rustc still applies to them.
+# These may be allowed or expected only with a reason that is not empty or
+# whitespace, and never warned. The last two are the lints' former names,
+# which rustc still applies to them.
 NEED_REASON = {
     "clippy::disallowed_methods",
     "clippy::disallowed_types",
     "clippy::disallowed_method",
     "clippy::disallowed_type",
 }
-# These may not be allowed or expected at all. They report a std Mutex or
-# RwLock guard, or a RefCell borrow, held across an .await, which traps on
+# These may not be set below deny at all. They report a std Mutex or RwLock
+# guard, or a RefCell borrow, held across an .await, which traps on
 # wasm32-unknown-unknown when another task takes a conflicting lock or borrow
 # of the same value: every task runs on the one thread there, std's Mutex and
 # RwLock then panic or abort, and so does the RefCell.
@@ -541,9 +569,16 @@ def _closing(code: str, start: int, opening: str, closing: str) -> int:
 
 
 _ATTRIBUTE = re.compile(r"#\s*!?\s*\[")
-_LINT_LIST = re.compile(r"\b(allow|expect)\s*\(")
+_LINT_LIST = re.compile(r"\b(allow|expect|warn)\s*\(")
 _NEXT_ATTRIBUTE = re.compile(r"\s*#\s*\[")
 _MOD = re.compile(r"\s*(?:pub\s*(?:\([^)]*\))?\s*)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;")
+_RAW = re.compile(r"(?:^|(?<=::))r#")
+
+
+def lint_name(item: str) -> str:
+    """An item of a lint list as rustc reads the lint's name: without
+    whitespace, and with a raw identifier (`r#all`) read as the plain one."""
+    return _RAW.sub("", re.sub(r"\s", "", item))
 
 
 def attribute_problems(rel: str, text: str, used_migration: set) -> tuple[list[str], int]:
@@ -569,7 +604,7 @@ def attribute_problems(rel: str, text: str, used_migration: set) -> tuple[list[s
                     items.append((attribute.start() + start, attribute.start() + index))
                     start = index + 1
             items.append((attribute.start() + start, attribute.start() + close - 1))
-            names = {re.sub(r"\s", "", code[a:b]) for a, b in items} - {""}
+            names = {lint_name(code[a:b]) for a, b in items} - {""}
             reasons = [reason_value(text, code, a, b) for a, b in items]
             reasons = [r for r in reasons if r is not None]
             has_reason = any(r.strip() for r in reasons)
@@ -581,27 +616,34 @@ def attribute_problems(rel: str, text: str, used_migration: set) -> tuple[list[s
                     used_migration.add((rel, declared))
                 else:
                     problems.append(
-                        f"{rel}:{line}: {level}({', '.join(blanket)}) switches the wasm clippy"
-                        " guard off; allow only the lints the code needs (only a catalog"
-                        " migration's code-body module, declared as CONTRIBUTING.md"
-                        " prescribes, may allow clippy::all)"
+                        f"{rel}:{line}: {level}({', '.join(blanket)}) sets lints the wasm"
+                        " clippy guard needs below deny for the code it covers; name only"
+                        " the lints the code needs (only a catalog migration's code-body"
+                        " module, declared as CONTRIBUTING.md prescribes, may allow"
+                        " clippy::all)"
                     )
             never = sorted(names & NEVER)
             if never:
                 problems.append(
-                    f"{rel}:{line}: {level}({', '.join(never)}) switches off the lint that"
+                    f"{rel}:{line}: {level}({', '.join(never)}) sets below deny the lint that"
                     " reports a std lock guard or a RefCell borrow held across an .await,"
                     " which traps on wasm32 when another task takes it; hold none across an"
                     " .await (no reason makes this setting acceptable)"
                 )
-            unreasoned = sorted(names & NEED_REASON)
-            if unreasoned and not has_reason:
+            disallowed = sorted(names & NEED_REASON)
+            if disallowed and level == "warn":
+                problems.append(
+                    f"{rel}:{line}: warn({', '.join(disallowed)}) sets a disallowed lint"
+                    " below deny; only an allow or expect with a reason may, on a call that"
+                    " never runs on wasm"
+                )
+            elif disallowed and not has_reason:
                 empty = " is empty or only whitespace" if reasons else " is missing"
                 problems.append(
-                    f"{rel}:{line}: {level}({', '.join(unreasoned)}): its `reason = \"...\"`"
+                    f"{rel}:{line}: {level}({', '.join(disallowed)}): its `reason = \"...\"`"
                     f"{empty}; it must name the callers and why none runs on wasm"
                 )
-            elif unreasoned:
+            elif disallowed:
                 reasoned += 1
     return problems, reasoned
 
@@ -678,45 +720,105 @@ def _declared_module(code: str, index: int) -> str | None:
 
 
 def lint_table_problems(manifest: str, table: dict) -> list[str]:
-    """Problems in one `[lints]` (or `[workspace.lints]`) table of `manifest`."""
+    """Problems in one `[lints]` (or `[workspace.lints]`) table of `manifest`.
+    Cargo passes a key spelt with hyphens to rustc, which reads them as
+    underscores, so the keys are compared that way."""
     problems = []
     for tool, lints in table.items():
         if not isinstance(lints, dict):
             continue
         for name, setting in lints.items():
             level = setting.get("level") if isinstance(setting, dict) else setting
-            lint = name if tool == "rust" else f"{tool}::{name}"
-            if level in ("allow", "expect") and lint in BLANKET | NEED_REASON | NEVER:
+            name = name.replace("-", "_")
+            lint = name if tool == "rust" else f"{tool.replace('-', '_')}::{name}"
+            if level not in ("deny", "forbid") and lint in BLANKET | NEED_REASON | NEVER:
                 problems.append(
-                    f"{manifest}: [lints] sets {lint} to {level!r},"
-                    " which switches the wasm clippy guard off"
+                    f"{manifest}: [lints] sets {lint} to {level!r}, below deny, which the"
+                    " wasm clippy guard refuses for the lints it needs"
                 )
     return problems
 
 
+# A rustc flag that sets a lint level below deny or caps lint levels, in each
+# spelling (the value after it, attached to it, or after `=`), and the flags
+# that can carry one: a -Z option (-Z crate-attr adds a crate-level attribute,
+# where the compiler accepts -Z options) and an @-file of further arguments.
+_LOWERING_FLAG = re.compile(r"-[AWZ]|--(?:allow|warn|force-warn|cap-lints)(?:=|$)|@")
+# Cargo configuration keys that run another program as the compiler, which can
+# pass it any flag.
+_COMPILER_KEYS = ("rustc", "rustc-wrapper", "rustc-workspace-wrapper")
+
+
+def _rustflags_settings(settings: dict, keys: tuple = ()):
+    """Each `rustflags` setting of a cargo configuration, in any table, with
+    its dotted key."""
+    for key, value in settings.items():
+        if key == "rustflags":
+            yield ".".join(keys + (key,)), value
+        elif isinstance(value, dict):
+            yield from _rustflags_settings(value, keys + (key,))
+
+
 def rustflags_problems(config: str, settings: dict) -> list[str]:
-    """Problems in the rustflags of one cargo configuration file `config`."""
+    """Problems in the rustflags, in any table, and the compiler settings of one
+    cargo configuration file `config`."""
     problems = []
-    flag_lists = [settings.get("build", {}).get("rustflags")]
-    flag_lists += [
-        t.get("rustflags") for t in settings.get("target", {}).values() if isinstance(t, dict)
-    ]
-    for flags in flag_lists:
+    for key, flags in _rustflags_settings(settings):
         if isinstance(flags, str):
             flags = flags.split()
-        if any(re.match(r"(-A|--allow|--cap-lints)", str(flag)) for flag in flags or []):
+        lowering = [f for f in flags if isinstance(f, str) and _LOWERING_FLAG.match(f)]
+        if lowering:
             problems.append(
-                f"{config}: rustflags {flags!r} allow lints or cap them, which can"
-                " switch the wasm clippy guard off"
+                f"{config}: {key} holds {lowering!r}, which can set lint levels below deny"
+                " or cap them, and the wasm clippy guard refuses"
+            )
+    build = settings.get("build", {})
+    for key in _COMPILER_KEYS:
+        if isinstance(build, dict) and key in build:
+            problems.append(
+                f"{config}: build.{key} = {build[key]!r} runs another program as the"
+                " compiler, which can pass it any lint flag; the wasm clippy guard refuses it"
             )
     return problems
 
 
+# Workflow variables that set the wasm build's rustc flags (RUSTFLAGS,
+# CARGO_ENCODED_RUSTFLAGS, CARGO_BUILD_RUSTFLAGS, CARGO_TARGET_<TRIPLE>_RUSTFLAGS)
+# or its compiler or compiler wrapper.
+_WORKFLOW_VARIABLE = re.compile(
+    r"\b(?:[A-Z0-9_]*RUSTFLAGS|RUSTC|RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER"
+    r"|CARGO_BUILD_RUSTC|CARGO_BUILD_RUSTC_WRAPPER|CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER)\b"
+)
+
+
+def _without_comment(line: str) -> str:
+    """`line` up to a `#` that starts a YAML or shell comment: one at the start
+    of the line or after whitespace, outside quotes."""
+    quote = None
+    for index, char in enumerate(line):
+        if quote:
+            quote = None if char == quote else quote
+        elif char in "'\"":
+            quote = char
+        elif char == "#" and (index == 0 or line[index - 1].isspace()):
+            return line[:index]
+    return line
+
+
 def workflow_problems(workflow: str, text: str) -> list[str]:
-    """Problems in the environment that the lines `text` of the workflow file
-    `workflow` set for its steps. This function looks for none."""
-    del workflow, text
-    return []
+    """Problems in the lines `text` of the workflow file `workflow`: a line that,
+    outside its comment, names a variable that sets rustc flags or the compiler.
+    The file is read as text, so a step's env, a run script and a write to
+    $GITHUB_ENV are all seen."""
+    problems = []
+    for number, line in enumerate(text.splitlines(), 1):
+        for name in _WORKFLOW_VARIABLE.findall(_without_comment(line)):
+            problems.append(
+                f"{workflow}:{number}: names {name}, which sets the flags or the compiler"
+                " of the steps it reaches and can lower the lints the wasm clippy guard"
+                " needs; the guard refuses it in this workflow"
+            )
+    return problems
 
 
 def manifest_problems(crates: dict[str, dict], metadata: dict) -> list[str]:
@@ -736,7 +838,11 @@ def manifest_problems(crates: dict[str, dict], metadata: dict) -> list[str]:
             continue
         settings = tomllib.loads(config.read_text(encoding="utf-8"))
         problems += rustflags_problems(f".cargo/{name}", settings)
-    return problems
+    try:
+        workflow = (ROOT / WORKFLOW_REL).read_text(encoding="utf-8")
+    except OSError as error:
+        return problems + [f"{WORKFLOW_REL}: cannot be read: {error}"]
+    return problems + workflow_problems(WORKFLOW_REL, workflow)
 
 
 def lint_setting_problems(crates: dict[str, dict], metadata: dict) -> tuple[list[str], str]:
@@ -889,7 +995,7 @@ def setting_probe_problems() -> tuple[list[str], str]:
         elif kind == "config":
             found = rustflags_problems(".cargo/config.toml", tomllib.loads(text))
         else:
-            found = workflow_problems(".github/workflows/wasm.yml", text)
+            found = workflow_problems(WORKFLOW_REL, text)
         if refuse and not found:
             problems.append(f"lint-setting probe {index} ({kind}) was not refused: {text!r}")
         elif found and not refuse:

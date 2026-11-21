@@ -60,16 +60,10 @@
 # -D warnings does not turn into an error. devtools/check-wasm-clippy-guard,
 # run by the workflow after the clippy step, fails if an entry has no probe in
 # that script, if clippy reports one as unresolved, or if the step accepts a
-# call to one. It also fails on a lint setting (an allow or an expect) that
-# switches the clippy step's checks off in a crate the wasm build compiles:
-# one of clippy::all, clippy::style, clippy::suspicious or warnings; one of
-# clippy::disallowed_methods or clippy::disallowed_types without a reason, or
-# with one that is empty or only whitespace; or one of
-# clippy::await_holding_lock or clippy::await_holding_refcell_ref, with or
-# without a reason. It reads lint settings as they are written in the crates'
-# files: a setting that a macro builds from its input (for example
-# `#[$level(clippy::all)]` in a macro_rules! body), or that a procedural macro
-# emits, is not seen.
+# call to one. It also fails on a setting that can switch the clippy step's
+# checks off, such as an allow of clippy::all in a crate the wasm build
+# compiles or a --cap-lints in rustflags; the script's documentation lists
+# each setting it reads and refuses, and what it does not see.
 
 disallowed-methods = [
     # Clock
