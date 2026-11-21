@@ -253,11 +253,13 @@ impl Engine {
             return Err(unsupported(operation, reason));
         }
 
-        // The checks every entry point applies before dispatch, in the
-        // engine's order: the operation name, then the body parse, then the
+        // The engine's own pre-dispatch checks, which the server calls too, in
+        // the engine's order: the operation name, then the body parse, then the
         // engine's refusals of requests no deployment serves (point-in-time
         // recovery). The server authenticates between the first two steps and
-        // the last; this build authenticates no request.
+        // the last, and makes its other checks (listed in the module doc)
+        // around them; this build authenticates no request and makes none of
+        // those.
         let body = extenddb_engine::parse_request(operation, body_json.as_bytes())?.admit()?;
 
         let ctx = self.operation_context();
