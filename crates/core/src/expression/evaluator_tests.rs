@@ -44,6 +44,29 @@ fn string_equality_false() {
     assert!(!eval("name = :v", &item, HashMap::new(), values).unwrap());
 }
 
+/// Live (eu-north-1, 2026-11-21, each Scan twice): a FilterExpression tells
+/// apart numbers that share a binary64 value. Only the SearchVectors inline
+/// filters compare at binary64.
+#[test]
+fn numbers_compare_exactly_past_binary64() {
+    for (price, bound) in [
+        (
+            "99999999999999999999999999999999999999",
+            "99999999999999999999999999999999999998",
+        ),
+        ("9007199254740993", "9007199254740992"),
+    ] {
+        let mut item = BTreeMap::new();
+        item.insert("Price".into(), AttributeValue::N(price.into()));
+        let values: HashMap<String, AttributeValue> =
+            [("v".to_owned(), AttributeValue::N(bound.into()))].into();
+        assert!(
+            eval("Price > :v", &item, HashMap::new(), values).unwrap(),
+            "{price} > {bound}"
+        );
+    }
+}
+
 #[test]
 fn numeric_greater_than() {
     let item = simple_item();
