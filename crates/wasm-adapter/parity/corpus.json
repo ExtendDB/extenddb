@@ -95,7 +95,12 @@
         }
       },
       "error": null,
-      "checks": []
+      "checks": [
+        {
+          "path": "",
+          "equals": {}
+        }
+      ]
     },
     {
       "name": "GetItem p1 returns the stored item",
@@ -186,7 +191,12 @@
         }
       },
       "error": "ConditionalCheckFailedException",
-      "checks": []
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "The conditional request failed"
+        }
+      ]
     },
     {
       "name": "GetItem p1 is unchanged after the refused update",
@@ -219,7 +229,12 @@
         }
       },
       "error": null,
-      "checks": []
+      "checks": [
+        {
+          "path": "",
+          "equals": {}
+        }
+      ]
     },
     {
       "name": "GetItem p1 after delete has no Item",
@@ -252,7 +267,12 @@
         }
       },
       "error": "ResourceNotFoundException",
-      "checks": []
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found"
+        }
+      ]
     },
     {
       "name": "CreateTable Products again is ResourceInUseException",
@@ -274,7 +294,12 @@
         "BillingMode": "PAY_PER_REQUEST"
       },
       "error": "ResourceInUseException",
-      "checks": []
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Table already exists: Products"
+        }
+      ]
     },
     {
       "name": "CreateTable Account",
@@ -322,7 +347,12 @@
         "ConditionExpression": "attribute_not_exists(accountId)"
       },
       "error": null,
-      "checks": []
+      "checks": [
+        {
+          "path": "",
+          "equals": {}
+        }
+      ]
     },
     {
       "name": "PutItem demo account again is refused (create-once)",
@@ -343,7 +373,12 @@
         "ConditionExpression": "attribute_not_exists(accountId)"
       },
       "error": "ConditionalCheckFailedException",
-      "checks": []
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "The conditional request failed"
+        }
+      ]
     },
     {
       "name": "Checkout: conditional UpdateItem accepts within the cap",
@@ -404,7 +439,12 @@
         }
       },
       "error": "ConditionalCheckFailedException",
-      "checks": []
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "The conditional request failed"
+        }
+      ]
     },
     {
       "name": "GetItem demo account is unchanged after the refused checkout",
@@ -482,7 +522,12 @@
         }
       },
       "error": null,
-      "checks": []
+      "checks": [
+        {
+          "path": "",
+          "equals": {}
+        }
+      ]
     },
     {
       "name": "PutItem Cart line a1/p2",
@@ -502,7 +547,12 @@
         }
       },
       "error": null,
-      "checks": []
+      "checks": [
+        {
+          "path": "",
+          "equals": {}
+        }
+      ]
     },
     {
       "name": "Query Cart partition a1 returns both lines in sort-key order",
@@ -595,7 +645,12 @@
         }
       },
       "error": null,
-      "checks": []
+      "checks": [
+        {
+          "path": "",
+          "equals": {}
+        }
+      ]
     },
     {
       "name": "PutItem Gsi b/g1",
@@ -615,7 +670,12 @@
         }
       },
       "error": null,
-      "checks": []
+      "checks": [
+        {
+          "path": "",
+          "equals": {}
+        }
+      ]
     },
     {
       "name": "Query the GSI returns both items sharing the index key",
@@ -713,7 +773,12 @@
         }
       },
       "error": null,
-      "checks": []
+      "checks": [
+        {
+          "path": "",
+          "equals": {}
+        }
+      ]
     },
     {
       "name": "PutItem Lsi a/y (lsiSk 3)",
@@ -733,7 +798,12 @@
         }
       },
       "error": null,
-      "checks": []
+      "checks": [
+        {
+          "path": "",
+          "equals": {}
+        }
+      ]
     },
     {
       "name": "Query the LSI returns the partition ordered by the index range key",
@@ -813,7 +883,12 @@
         }
       },
       "error": null,
-      "checks": []
+      "checks": [
+        {
+          "path": "",
+          "equals": {}
+        }
+      ]
     },
     {
       "name": "ListStreams names the table's stream",
@@ -931,7 +1006,12 @@
         ]
       },
       "error": null,
-      "checks": []
+      "checks": [
+        {
+          "path": "",
+          "equals": {}
+        }
+      ]
     },
     {
       "name": "ListTagsOfResource lists both tags",
@@ -965,7 +1045,12 @@
         ]
       },
       "error": null,
-      "checks": []
+      "checks": [
+        {
+          "path": "",
+          "equals": {}
+        }
+      ]
     },
     {
       "name": "ListTagsOfResource lists only the team tag",
@@ -1002,7 +1087,12 @@
         ]
       },
       "error": "ResourceNotFoundException",
-      "checks": []
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found: ResourceArn: arn:aws:dynamodb:us-east-1:000000000000:table/NoSuchTable not found"
+        }
+      ]
     },
     {
       "name": "CreateTable Page",
@@ -1024,7 +1114,16 @@
         "BillingMode": "PAY_PER_REQUEST"
       },
       "error": null,
-      "checks": []
+      "checks": [
+        {
+          "path": "/TableDescription/TableName",
+          "equals": "Page"
+        },
+        {
+          "path": "/TableDescription/TableStatus",
+          "equals": "ACTIVE"
+        }
+      ]
     },
     {
       "name": "PutItem Page k0",
@@ -1038,7 +1137,12 @@
         }
       },
       "error": null,
-      "checks": []
+      "checks": [
+        {
+          "path": "",
+          "equals": {}
+        }
+      ]
     },
     {
       "name": "PutItem Page k1",
@@ -1052,7 +1156,12 @@
         }
       },
       "error": null,
-      "checks": []
+      "checks": [
+        {
+          "path": "",
+          "equals": {}
+        }
+      ]
     },
     {
       "name": "PutItem Page k2",
@@ -1066,7 +1175,12 @@
         }
       },
       "error": null,
-      "checks": []
+      "checks": [
+        {
+          "path": "",
+          "equals": {}
+        }
+      ]
     },
     {
       "name": "Scan Page with Limit 1 returns one item and a paging cursor",
@@ -1125,7 +1239,12 @@
         ]
       },
       "error": null,
-      "checks": []
+      "checks": [
+        {
+          "path": "",
+          "equals": {}
+        }
+      ]
     },
     {
       "name": "TransactGetItems reads both items in request order",
@@ -1192,6 +1311,10 @@
         {
           "path": "/CancellationReasons/0/Code",
           "equals": "ConditionalCheckFailed"
+        },
+        {
+          "path": "/message",
+          "equals": "Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]"
         }
       ]
     },
@@ -1451,7 +1574,12 @@
         }
       },
       "error": null,
-      "checks": []
+      "checks": [
+        {
+          "path": "",
+          "equals": {}
+        }
+      ]
     },
     {
       "name": "GetItem VecT after the refusal returns the item",
@@ -1597,7 +1725,12 @@
         }
       },
       "error": null,
-      "checks": []
+      "checks": [
+        {
+          "path": "",
+          "equals": {}
+        }
+      ]
     },
     {
       "name": "GetItem still returns the expired item (no background sweep removes it)",
@@ -2132,15 +2265,24 @@
       "op": "NoSuchOperation",
       "body": {},
       "error": "UnknownOperationException",
-      "checks": []
+      "checks": [
+        {
+          "path": "/message",
+          "absent": true
+        }
+      ]
     },
     {
       "name": "Malformed body on a known operation is SerializationException",
       "op": "GetItem",
-      "body": {},
       "rawBody": "{ this is not json",
       "error": "SerializationException",
-      "checks": []
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Start of structure or map found where not expected: key must be a string at line 1 column 3"
+        }
+      ]
     }
   ]
 }
