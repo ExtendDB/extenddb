@@ -753,13 +753,15 @@ re-run, and `classify_commit_error` retries `commitTransaction` in place,
 which is idempotent.
 
 **Retry loop.** Session-scoped writes (Put / Delete / Update / TWI) wrap
-the transaction body in a `for attempt in 0..TRANSIENT_RETRY_ATTEMPTS`
-loop (50 attempts). Each attempt starts a fresh transaction, runs the
-body, and either commits, aborts and retries (transient), or aborts and
-returns (fatal). Retries sleep with jittered exponential backoff:
+the transaction body in a `for attempt in 0..CONTENTION_RETRY_ATTEMPTS`
+loop (1,000 attempts). Before each attempt after the first, the loop stops
+once `CONTENTION_DEADLINE` (10 s) has passed since the request started.
+Each attempt starts a fresh transaction, runs the body, and either
+commits, aborts and retries (transient), or aborts and returns (fatal).
+Retries sleep with jittered exponential backoff:
 `backoff_sleep` waits a uniform 0 to 50 µs × 2^min(attempt, 8), which is at
-most 12.8 ms from the ninth attempt on and sums to at most about 550 ms
-over the 50 attempts (275 ms expected). Tokio's timer ticks every
+most 12.8 ms from the ninth attempt on and sums to at most about 12.7 s
+over the 1,000 attempts (6.4 s expected). Tokio's timer ticks every
 millisecond and rounds a sleep up to the next tick, so for the first five
 attempts (longest jitter under 1 ms) the wait is set by the tick, not by
 the jitter. The helpers that run inside the transaction (index entry
@@ -1142,7 +1144,7 @@ The backend implements every trait in `extenddb-storage`:
 | Sequence assignment | Inside the write session | Prevents ordering holes where a fast writer commits a higher seq before a slower earlier one does. |
 | Stream shard ID | `shardId-{table_id}-{i:012}` | Cross-tenant isolation on same-named tables. |
 | Stream retention | 24h TTL index on `stream_records.created_at` + hourly cleanup worker | Primary enforcement at storage; worker is defense in depth. |
-| WriteConflict handling | Retry with jittered exponential backoff (50 attempts); TWI exhaustion → `TransactionCanceled` with synthetic `TransactionConflict` reasons | Bounded tail latency; DDB-canonical error surface. |
+| WriteConflict handling | Retry with jittered exponential backoff (up to 1,000 attempts or 10 s, whichever comes first); TWI exhaustion → `TransactionCanceled` with synthetic `TransactionConflict` reasons | Bounded tail latency; DDB-canonical error surface. |
 | UpdateItem concurrency | Configured transaction read concern + `_v` version filter + retry; native fast-path always `$inc: {_v: 1}` | Prevents lost updates; snapshot mode additionally supplies a point-in-time read view. |
 | Idempotency retention | Unique `(account_id, token)` index + 540s TTL + 600 ms data-plane age filter | Unique-index race safety under every accepted read concern; ≤10-min worst-case retention regardless of TTL-monitor cadence. |
 | Backups | Per-backup collection via server-side `$out` aggregation | No per-item driver traffic; metadata schema decoupled from collection name. |

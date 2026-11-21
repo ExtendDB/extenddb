@@ -77,10 +77,11 @@ pub enum StorageError {
     /// and the worker dropped claimed rows on transient errors.
     ///
     /// The MongoDB backend also returns it for a single-item write that could
-    /// not commit in its 50 attempts; the message names the operation, the
-    /// attempt count and the last error that ended an attempt. The engine logs
-    /// the message and answers HTTP 503 `ServiceUnavailable`, which the SDKs
-    /// retry.
+    /// not commit in 1,000 attempts or within its 10 s contention deadline. The
+    /// message names the operation, the bound that ended the retries (the
+    /// attempts or the seconds) and the last error that ended an attempt. The
+    /// engine logs the message and answers HTTP 503 `ServiceUnavailable`, which
+    /// the SDKs retry.
     #[error("{0}")]
     Transient(String),
     /// The backend discarded a consistent snapshot before the reader drained

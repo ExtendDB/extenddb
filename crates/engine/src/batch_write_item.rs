@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde_json::Value;
 
@@ -45,6 +46,7 @@ pub async fn handle_batch_write_item(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
+    let started = Instant::now();
     let input: BatchWriteItemInput =
         serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
@@ -106,13 +108,17 @@ pub async fn handle_batch_write_item(
         lookups.push(ctx.table_key_info_uncached(table_name).await);
     }
 
-    write_batch(
-        &*ctx.storage,
-        &ctx.limits,
-        &ctx.region,
-        &input,
-        &tables,
-        lookups,
+    // One contention deadline for the batch's writes: see `request_clock`.
+    extenddb_storage::request_clock::scope(
+        started,
+        write_batch(
+            &*ctx.storage,
+            &ctx.limits,
+            &ctx.region,
+            &input,
+            &tables,
+            lookups,
+        ),
     )
     .await
 }
@@ -181,7 +187,10 @@ async fn write_batch(
     // retry with backoff, so a client's UnprocessedItems loop cannot spin on a
     // batch that makes no progress. Each failed request spends its own retry
     // budget first, so a batch of 25 contended requests can spend 25 budgets
-    // before it answers.
+    // before it answers. On MongoDB the requests also share one contention
+    // deadline, measured from the start of the batch (the request clock scope
+    // `handle_batch_write_item` opens), and no transaction retry starts once
+    // it has passed.
     //
     // The request faults the same page lists reject the whole batch before
     // anything is written. `check_batch` finds a missing table, a key that

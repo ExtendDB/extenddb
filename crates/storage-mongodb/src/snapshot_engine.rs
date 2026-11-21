@@ -530,13 +530,8 @@ mod tests {
             .await
             .expect("setting");
         let engine = MongoEngine {
-            client: client.clone(),
-            catalog_db,
-            data_db: client.database(&names[1]),
-            region: "us-east-1".to_owned(),
-            gsi_cache: Arc::default(),
             tx_read_concern: ReadConcern::majority(),
-            backup_liveness: crate::backup_engine::BackupLiveness::default(),
+            ..MongoEngine::for_test(&client, catalog_db, client.database(&names[1]))
         };
         let worker = tokio::spawn(crate::ttl_worker::gsi_backfill_worker(
             Arc::new(engine.clone()),

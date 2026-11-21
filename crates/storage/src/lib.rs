@@ -37,6 +37,7 @@ pub mod migrations;
 pub mod operations;
 pub mod password;
 pub mod policy_migration;
+pub mod request_clock;
 pub mod restore_engine;
 pub mod secret_cipher;
 pub mod secret_keys;

@@ -32,38 +32,19 @@ WRITERS = 8
 ROUNDS = 15
 
 
-# TEMPORARY: on MongoDB, a put without a condition on a table with no index and
-# no stream returns HTTP 500 when it loses the create race. The MongoDB
-# write-race fix repairs it. That fix lands separately.
-# TODO: remove this marker once the MongoDB write-race fix is on main.
-# Only an assertion counts as the expected failure. The marker is not strict,
-# because the race does not fire in every run: these tests still pass now and
-# then on MongoDB without the fix. The MongoDB test runner sets
-# EXTENDDB_TEST_MONGODB_CONTAINER.
-XFAIL_UNTIL_MONGODB_FIX = pytest.mark.xfail(
-    bool(os.environ.get("EXTENDDB_TEST_MONGODB_CONTAINER", "").strip()),
-    reason="MongoDB returns HTTP 500 for a lost create race, fixed by the MongoDB write-race fix",
-    raises=AssertionError,
-    strict=False,
-)
-
-
 @pytest.fixture(scope="module")
-def raw_client(endpoint_url):
-    """A client that never retries, so every failure is seen."""
+def raw_clients(endpoint_url):
+    """One client per writer thread, none of which retries, so every failure is seen."""
     kwargs: dict = {
         "service_name": "dynamodb",
         "region_name": os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
-        "config": Config(
-            retries={"total_max_attempts": 1, "mode": "standard"},
-            max_pool_connections=WRITERS * 2,
-        ),
+        "config": Config(retries={"total_max_attempts": 1, "mode": "standard"}),
     }
     if endpoint_url:
         kwargs["endpoint_url"] = endpoint_url
         if endpoint_url.startswith("https://"):
             kwargs["verify"] = False
-    return boto3.client(**kwargs)
+    return [boto3.client(**kwargs) for _ in range(WRITERS)]
 
 
 @pytest.fixture(scope="module")
@@ -153,9 +134,9 @@ def _key(table_kind: str, pk: str) -> dict:
 
 
 def _race(
-    client, table: str, table_kind: str, extra: dict, batch: bool = False
+    clients: list, table: str, table_kind: str, extra: dict, batch: bool = False
 ) -> tuple[str, list]:
-    """WRITERS clients put the same new key at once, each with its own `w`.
+    """WRITERS writers put the same new key at once, each with its own `w` and its own client.
 
     Each writer's item also carries index keys unique to it: `gk` across the
     whole table, and `lk` within the key. With `batch`, each writer sends a
@@ -170,6 +151,7 @@ def _race(
     errors: list[BaseException] = []
 
     def run(i: int):
+        client = clients[i]
         item = {
             **_key(table_kind, pk),
             "w": {"S": f"w{i}"},
@@ -225,25 +207,23 @@ def _assert_one_chain(out: list, final: str):
     assert seen == WRITERS, f"old images do not form one chain: {prev}, final {final}"
 
 
-@XFAIL_UNTIL_MONGODB_FIX
 @pytest.mark.parametrize("table_kind", ["hash", "range"])
 def test_racing_puts_with_all_old_all_succeed(
-    request, dynamodb_client, raw_client, table_kind
+    request, dynamodb_client, raw_clients, table_kind
 ):
     table = request.getfixturevalue(f"{table_kind}_table")
     for _ in range(ROUNDS):
-        pk, out = _race(raw_client, table, table_kind, {"ReturnValues": "ALL_OLD"})
+        pk, out = _race(raw_clients, table, table_kind, {"ReturnValues": "ALL_OLD"})
         _assert_all_succeed(out)
         _assert_one_chain(out, _final_w(dynamodb_client, table, table_kind, pk))
 
 
-@XFAIL_UNTIL_MONGODB_FIX
 def test_racing_puts_that_return_consumed_capacity_all_succeed(
-    dynamodb_client, raw_client, hash_table
+    dynamodb_client, raw_clients, hash_table
 ):
     extra = {"ReturnConsumedCapacity": "TOTAL"}
     for _ in range(ROUNDS):
-        pk, out = _race(raw_client, hash_table, "hash", extra)
+        pk, out = _race(raw_clients, hash_table, "hash", extra)
         _assert_all_succeed(out)
         assert _final_w(dynamodb_client, hash_table, "hash", pk) in {
             f"w{i}" for i in range(WRITERS)
@@ -251,21 +231,21 @@ def test_racing_puts_that_return_consumed_capacity_all_succeed(
 
 
 def test_racing_puts_check_their_condition_against_the_winner(
-    dynamodb_client, raw_client, range_table
+    dynamodb_client, raw_clients, range_table
 ):
     """A condition that every item satisfies never fails, whoever created the item."""
     extra = {"ConditionExpression": "attribute_not_exists(zz)", "ReturnValues": "ALL_OLD"}
     for _ in range(ROUNDS):
-        pk, out = _race(raw_client, range_table, "range", extra)
+        pk, out = _race(raw_clients, range_table, "range", extra)
         _assert_all_succeed(out)
         _assert_one_chain(out, _final_w(dynamodb_client, range_table, "range", pk))
 
 
-def test_racing_conditional_creates_have_one_winner(raw_client, hash_table):
+def test_racing_conditional_creates_have_one_winner(raw_clients, hash_table):
     """Control: with attribute_not_exists(pk), exactly one put creates the item."""
     for _ in range(ROUNDS):
         _, out = _race(
-            raw_client, hash_table, "hash", {"ConditionExpression": "attribute_not_exists(pk)"}
+            raw_clients, hash_table, "hash", {"ConditionExpression": "attribute_not_exists(pk)"}
         )
         codes = sorted(o[1] if o[0] == "error" else "ok" for o in out)
         assert codes == ["ConditionalCheckFailedException"] * (WRITERS - 1) + ["ok"], codes
@@ -285,12 +265,12 @@ def _gsi_keys(client, table: str) -> dict[str, list[str]]:
 
 
 def test_racing_puts_on_a_gsi_table_leave_only_the_final_entry(
-    dynamodb_client, raw_client, gsi_table
+    dynamodb_client, raw_clients, gsi_table
 ):
     """The GSI holds the final item's entry and none of the items it replaced."""
     want: dict[str, list[str]] = {}
     for _ in range(ROUNDS):
-        pk, out = _race(raw_client, gsi_table, "hash", {})
+        pk, out = _race(raw_clients, gsi_table, "hash", {})
         _assert_all_succeed(out)
         want[pk] = [_final(dynamodb_client, gsi_table, "hash", pk)["gk"]["S"]]
     # The GSI is eventually consistent on Amazon DynamoDB, so poll.
@@ -302,11 +282,11 @@ def test_racing_puts_on_a_gsi_table_leave_only_the_final_entry(
 
 
 def test_racing_puts_on_an_lsi_table_leave_only_the_final_entry(
-    dynamodb_client, raw_client, lsi_table
+    dynamodb_client, raw_clients, lsi_table
 ):
     """A strongly consistent LSI query returns the final item's entry only."""
     for _ in range(ROUNDS):
-        pk, out = _race(raw_client, lsi_table, "range", {"ReturnValues": "ALL_OLD"})
+        pk, out = _race(raw_clients, lsi_table, "range", {"ReturnValues": "ALL_OLD"})
         _assert_all_succeed(out)
         final = _final(dynamodb_client, lsi_table, "range", pk)
         _assert_one_chain(out, final["w"]["S"])
@@ -365,23 +345,23 @@ def _assert_stream_chains(dynamodb_client, streams_client, table: str, pks: list
 
 
 def test_racing_puts_on_a_stream_table_all_succeed(
-    dynamodb_client, raw_client, streams_client, stream_table
+    dynamodb_client, raw_clients, streams_client, stream_table
 ):
     pks = []
     for _ in range(ROUNDS):
-        pk, out = _race(raw_client, stream_table, "hash", {})
+        pk, out = _race(raw_clients, stream_table, "hash", {})
         _assert_all_succeed(out)
         pks.append(pk)
     _assert_stream_chains(dynamodb_client, streams_client, stream_table, pks)
 
 
 def test_racing_batch_puts_on_a_stream_table_all_succeed(
-    dynamodb_client, raw_client, streams_client, stream_table
+    dynamodb_client, raw_clients, streams_client, stream_table
 ):
     """BatchWriteItem puts read the current item for the stream record too."""
     pks = []
     for _ in range(ROUNDS):
-        pk, out = _race(raw_client, stream_table, "hash", {}, batch=True)
+        pk, out = _race(raw_clients, stream_table, "hash", {}, batch=True)
         _assert_all_succeed(out)
         pks.append(pk)
     _assert_stream_chains(dynamodb_client, streams_client, stream_table, pks)

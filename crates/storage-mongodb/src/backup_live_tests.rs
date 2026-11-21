@@ -145,13 +145,8 @@ impl Fixture {
 async fn engine_on(catalog: &str, data: &str, liveness: BackupLiveness) -> MongoEngine {
     let client = mongodb::Client::with_uri_str(uri()).await.expect("client");
     MongoEngine {
-        client: client.clone(),
-        catalog_db: client.database(catalog),
-        data_db: client.database(data),
-        region: REGION.to_owned(),
-        gsi_cache: Arc::default(),
-        tx_read_concern: mongodb::options::ReadConcern::snapshot(),
         backup_liveness: liveness,
+        ..MongoEngine::for_test(&client, client.database(catalog), client.database(data))
     }
 }
 

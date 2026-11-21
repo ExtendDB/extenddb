@@ -427,6 +427,12 @@ pub struct MongoEngine {
     tx_read_concern: mongodb::options::ReadConcern,
     /// Heartbeat timing of a restore's job record (see [`backup_engine`]).
     pub(crate) backup_liveness: backup_engine::BackupLiveness,
+    /// Wall-clock deadline for the contention retry loop of one request; see
+    /// [`crate::data_engine::CONTENTION_DEADLINE`], which every production
+    /// construction uses. A test sets it short to make the deadline the bound
+    /// a contended write reaches, or long to make the attempt budget the
+    /// bound, instead of racing the two.
+    pub(crate) contention_deadline: std::time::Duration,
 }
 
 /// Build a MongoDB client from a connection string, applying the shared
@@ -616,7 +622,27 @@ impl MongoEngine {
         let catalog_db = catalog_database(&client);
         let data_db = client.database("extenddb_data");
 
-        Ok(Self {
+        Ok(Self::from_parts(
+            client,
+            catalog_db,
+            data_db,
+            region,
+            tx_read_concern,
+        ))
+    }
+
+    /// The engine on `catalog_db` and `data_db` of `client`, with every other
+    /// field at the value `new` gives it. `new` and [`MongoEngine::for_test`]
+    /// both build the engine here, so a field added to `MongoEngine` is set in
+    /// this function and in no test.
+    fn from_parts(
+        client: mongodb::Client,
+        catalog_db: mongodb::Database,
+        data_db: mongodb::Database,
+        region: &str,
+        tx_read_concern: mongodb::options::ReadConcern,
+    ) -> Self {
+        Self {
             client,
             catalog_db,
             data_db,
@@ -624,7 +650,27 @@ impl MongoEngine {
             gsi_cache: Arc::default(),
             tx_read_concern,
             backup_liveness: backup_engine::BackupLiveness::default(),
-        })
+            contention_deadline: data_engine::CONTENTION_DEADLINE,
+        }
+    }
+
+    /// An engine for a test, on `catalog_db` and `data_db` of `client`, in
+    /// region `us-east-1` with snapshot read concern, and every other field
+    /// as `new` sets it. A test that needs another value for a field sets it
+    /// with struct update syntax on the result.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        client: &mongodb::Client,
+        catalog_db: mongodb::Database,
+        data_db: mongodb::Database,
+    ) -> Self {
+        Self::from_parts(
+            client.clone(),
+            catalog_db,
+            data_db,
+            "us-east-1",
+            mongodb::options::ReadConcern::snapshot(),
+        )
     }
 
     /// Read concern to use for a newly-opened multi-document transaction.

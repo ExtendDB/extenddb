@@ -389,11 +389,12 @@ def test_transactions_on_a_stream_table_all_commit(
     such a conflict has to run again; a server that reports the conflict as an
     error, whether 500 or 503, fails here.
 
-    After 50 attempts the MongoDB backend cancels a transaction with a
-    TransactionConflict reason on every operation (the answer for sustained
-    contention in docs/differences-from-dynamodb.md). Nothing was applied, so
-    the writer sends the transaction again, up to REPLAY_PASSES times, and the
-    checks at the end show each transaction applied once.
+    After 1,000 attempts or 10 seconds, whichever comes first, the MongoDB
+    backend cancels a transaction with a TransactionConflict reason on every
+    operation (the answer for sustained contention in
+    docs/differences-from-dynamodb.md). Nothing was applied, so the writer
+    sends the transaction again, up to REPLAY_PASSES times, and the checks at
+    the end show each transaction applied once.
     """
     prefix = f"txn-{uuid.uuid4().hex[:8]}-"
     for i in range(TXN_WRITERS):
