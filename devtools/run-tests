@@ -114,8 +114,9 @@ Suites (at least one required):
                     binary, and downloads the AWS provider; not part of --all)
   --all             all suites above except --terraform
   --catalog-check   post-test catalog integrity check
-  --wasm            wasm32 build check of the WebAssembly adapter crate, with
-                    the reachability lint. Standalone: needs no server, target
+  --wasm            wasm32 build and clippy of the WebAssembly adapter crate,
+                    with the disallowed-methods list of devtools/wasm-clippy
+                    and its self-test. Standalone: needs no server, target
                     flag or credentials; writes discussions/test-wasm-<hash>.txt.
                     Override the crate with EXTENDDB_WASM_PKG
                     (default: extenddb-wasm-adapter)
@@ -368,10 +369,11 @@ PASS=true
 CLEANUP_TRUSTSTORE=""
 
 # --- WebAssembly adapter build check (standalone) ---------------------------
-# The WebAssembly build compiles the engine + adapter to wasm32. This suite is a
-# build check plus the reachability lint; it needs no running server, no target
-# flag and no credentials, so it runs before the pre-flight the server-backed
-# suites require. When it is the only suite requested it exits with its own
+# The WebAssembly build compiles the engine + adapter to wasm32. This suite is
+# the build, the wasm32 clippy step with the disallowed-methods list of
+# devtools/wasm-clippy, and that list's self-test. It needs no running server,
+# no target flag and no credentials, so it runs before the pre-flight the
+# server-backed suites require. When it is the only suite requested it exits with its own
 # status. It is placed after PASS=true so a failure here is not later reset.
 #
 # The getrandom wasm backend cfg is passed merged into RUSTFLAGS rather than left
@@ -392,23 +394,29 @@ if $RUN_WASM; then
         echo
     } > "$WASM_OUTFILE"
     WASM_RC=0
-    # The reachability lint catches std::time / thread / tokio calls that compile
-    # to wasm but trap at runtime, which the build check below cannot see. A lint
-    # failure fails the wasm suite.
-    echo "--- wasm-reachability lint ---" | tee -a "$WASM_OUTFILE"
-    if ! python3 devtools/wasm-reachability-lint.py 2>&1 | tee -a "$WASM_OUTFILE"; then
-        WASM_RC=1
-    fi
-    if RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$WASM_RUSTFLAGS" \
+    echo "--- cargo build ---" | tee -a "$WASM_OUTFILE"
+    if ! RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$WASM_RUSTFLAGS" \
         cargo build --locked -p "$WASM_PKG" --target wasm32-unknown-unknown \
         2>&1 | tee -a "$WASM_OUTFILE"; then
-        if [ "$WASM_RC" -eq 0 ]; then
-            echo "RESULT: PASS" | tee -a "$WASM_OUTFILE"
-        else
-            echo "RESULT: FAIL (build ok, lint failed)" | tee -a "$WASM_OUTFILE"
-        fi
-    else
         WASM_RC=1
+    fi
+    # The clock, thread, timer and task calls that compile for wasm32 but fail
+    # when they run in a browser, which the build cannot see.
+    echo "--- cargo clippy (devtools/wasm-clippy) ---" | tee -a "$WASM_OUTFILE"
+    if ! RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$WASM_RUSTFLAGS" \
+        CLIPPY_CONF_DIR="$PROJECT_DIR/devtools/wasm-clippy" \
+        cargo clippy --locked -p "$WASM_PKG" --lib --target wasm32-unknown-unknown \
+        -- -D warnings 2>&1 | tee -a "$WASM_OUTFILE"; then
+        WASM_RC=1
+    fi
+    echo "--- clippy guard self-test ---" | tee -a "$WASM_OUTFILE"
+    if ! RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$WASM_RUSTFLAGS" \
+        python3 devtools/check-wasm-clippy-guard 2>&1 | tee -a "$WASM_OUTFILE"; then
+        WASM_RC=1
+    fi
+    if [ "$WASM_RC" -eq 0 ]; then
+        echo "RESULT: PASS" | tee -a "$WASM_OUTFILE"
+    else
         echo "RESULT: FAIL" | tee -a "$WASM_OUTFILE"
     fi
     echo "=== wrote ${WASM_OUTFILE} ==="
