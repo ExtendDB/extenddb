@@ -27,19 +27,21 @@
 //! `GetShardIterator`, `GetRecords`, `UpdateTimeToLive`, `DescribeTimeToLive`,
 //! `TagResource`, `ListTagsOfResource`, `UntagResource`, `ListBackups`,
 //! `DescribeContinuousBackups` and `UpdateContinuousBackups`, and natively
-//! `UpdateTable`, whose vector-index create the wasm build refuses. Its cases
+//! `UpdateTable` and `CreateBackup`, which the wasm build refuses (a
+//! vector-index create, and every store-backed backup operation). Its cases
 //! for `ImportTable`, `ExportTableToPointInTime`, the refused operations below
 //! and an unknown operation answer errors. `ListTables`, `DescribeLimits` and
 //! `SearchVectors` reach the engine's handlers too but have no corpus case.
 //! The build authenticates no request and authorizes none; every request runs
 //! under a single fixed account.
 //!
-//! [`runtime`] refuses, the same way on both targets, the operations a browser
-//! cannot serve: the store-backed backup operations, `PartiQL` and
+//! [`runtime`] refuses, the same way on both targets, `PartiQL` and
 //! `DescribeEndpoints`, and, as the server does, the point-in-time recovery
-//! requests. On wasm, the `SQLite` backend also refuses an `UpdateTable` that
-//! creates a vector index, after the engine has validated the request. The
-//! module doc of [`runtime`] lists each answer.
+//! requests. On wasm, the engine also refuses the store-backed backup
+//! operations, whose subsystem does not build for wasm32, and the `SQLite`
+//! backend refuses an `UpdateTable` that creates a vector index, after the
+//! engine has validated the request. The module doc of [`runtime`] lists each
+//! answer.
 
 mod runtime;
 

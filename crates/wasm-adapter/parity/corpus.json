@@ -2141,22 +2141,40 @@
       ]
     },
     {
-      "name": "CreateBackup is refused by the WebAssembly build",
+      "name": "CreateBackup backs Products up in the catalog natively and is refused on wasm32",
       "op": "CreateBackup",
       "body": {
         "TableName": "Products",
         "BackupName": "snap"
       },
-      "error": "ValidationException",
+      "error": null,
       "checks": [
         {
-          "path": "/message",
-          "contains": "ExtendDB WebAssembly build"
+          "path": "/BackupDetails/BackupName",
+          "equals": "snap"
+        },
+        {
+          "path": "/BackupDetails/BackupStatus",
+          "equals": "AVAILABLE"
+        },
+        {
+          "path": "/BackupDetails/BackupType",
+          "equals": "USER"
         }
-      ]
+      ],
+      "onWasm": {
+        "error": "ValidationException",
+        "checks": [
+          {
+            "path": "/message",
+            "equals": "CreateBackup is not supported by the ExtendDB WebAssembly build: it does not include the backup subsystem."
+          }
+        ],
+        "reason": "the engine's backup subsystem does not build for wasm32, so on wasm32 the engine refuses the four store-backed backup operations after the body parse"
+      }
     },
     {
-      "name": "DescribeBackup is refused by the WebAssembly build",
+      "name": "DescribeBackup with a malformed backup id is Invalid Backup ARN natively and is refused on wasm32",
       "op": "DescribeBackup",
       "body": {
         "BackupArn": "arn:aws:dynamodb:us-east-1:000000000000:table/Products/backup/01"
@@ -2165,12 +2183,22 @@
       "checks": [
         {
           "path": "/message",
-          "contains": "ExtendDB WebAssembly build"
+          "equals": "Invalid Backup ARN"
         }
-      ]
+      ],
+      "onWasm": {
+        "error": "ValidationException",
+        "checks": [
+          {
+            "path": "/message",
+            "equals": "DescribeBackup is not supported by the ExtendDB WebAssembly build: it does not include the backup subsystem."
+          }
+        ],
+        "reason": "the engine's backup subsystem does not build for wasm32, so on wasm32 the engine refuses the four store-backed backup operations after the body parse"
+      }
     },
     {
-      "name": "DeleteBackup is refused by the WebAssembly build",
+      "name": "DeleteBackup with a malformed backup id is Invalid Backup ARN natively and is refused on wasm32",
       "op": "DeleteBackup",
       "body": {
         "BackupArn": "arn:aws:dynamodb:us-east-1:000000000000:table/Products/backup/01"
@@ -2179,12 +2207,22 @@
       "checks": [
         {
           "path": "/message",
-          "contains": "ExtendDB WebAssembly build"
+          "equals": "Invalid Backup ARN"
         }
-      ]
+      ],
+      "onWasm": {
+        "error": "ValidationException",
+        "checks": [
+          {
+            "path": "/message",
+            "equals": "DeleteBackup is not supported by the ExtendDB WebAssembly build: it does not include the backup subsystem."
+          }
+        ],
+        "reason": "the engine's backup subsystem does not build for wasm32, so on wasm32 the engine refuses the four store-backed backup operations after the body parse"
+      }
     },
     {
-      "name": "RestoreTableFromBackup is refused by the WebAssembly build",
+      "name": "RestoreTableFromBackup with a malformed backup id is Invalid Backup ARN natively and is refused on wasm32",
       "op": "RestoreTableFromBackup",
       "body": {
         "TargetTableName": "R",
@@ -2194,7 +2232,29 @@
       "checks": [
         {
           "path": "/message",
-          "contains": "ExtendDB WebAssembly build"
+          "equals": "Invalid Backup ARN"
+        }
+      ],
+      "onWasm": {
+        "error": "ValidationException",
+        "checks": [
+          {
+            "path": "/message",
+            "equals": "RestoreTableFromBackup is not supported by the ExtendDB WebAssembly build: it does not include the backup subsystem."
+          }
+        ],
+        "reason": "the engine's backup subsystem does not build for wasm32, so on wasm32 the engine refuses the four store-backed backup operations after the body parse"
+      }
+    },
+    {
+      "name": "CreateBackup with a malformed body is SerializationException on both targets",
+      "op": "CreateBackup",
+      "rawBody": "{ not json",
+      "error": "SerializationException",
+      "checks": [
+        {
+          "path": "/message",
+          "contains": "Start of structure or map found where not expected"
         }
       ]
     },
@@ -2590,7 +2650,7 @@
       ]
     },
     {
-      "name": "DescribeBackup with a BackupArn that is not a backup ARN gets the build's refusal",
+      "name": "DescribeBackup with a BackupArn that is not a backup ARN gets the handler's answer natively and is refused on wasm32",
       "op": "DescribeBackup",
       "body": {
         "BackupArn": "not-a-backup-arn"
@@ -2599,9 +2659,19 @@
       "checks": [
         {
           "path": "/message",
-          "equals": "DescribeBackup is not supported by the ExtendDB WebAssembly build: the browser build runs entirely in memory with no backup store."
+          "equals": "Invalid Request: BackupArn is not valid"
         }
-      ]
+      ],
+      "onWasm": {
+        "error": "ValidationException",
+        "checks": [
+          {
+            "path": "/message",
+            "equals": "DescribeBackup is not supported by the ExtendDB WebAssembly build: it does not include the backup subsystem."
+          }
+        ],
+        "reason": "the engine's backup subsystem does not build for wasm32, so on wasm32 the engine refuses the four store-backed backup operations after the body parse"
+      }
     },
     {
       "name": "ExportTableToPointInTime with a TableArn that does not parse answers that export is disabled",

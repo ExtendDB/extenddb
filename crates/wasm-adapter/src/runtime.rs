@@ -13,17 +13,15 @@
 //!
 //! # Operations the browser build cannot serve
 //!
-//! Some operations need a facility the in-memory browser build does not have —
-//! a backup store, or the `PartiQL` surface (left out of this build). The
-//! policy that answers them lives here, in [`Engine::dispatch`], and the same
-//! code applies it on both targets, so the native build and the wasm build
-//! refuse the same requests with the same error:
+//! Some operations need a facility the in-memory browser build does not have.
+//! The adapter's own policy, in [`Engine::dispatch`], applies on both targets,
+//! so the native build and the wasm build refuse the same requests with the
+//! same error:
 //!
 //! - **Refused on both targets** with a `ValidationException` that names the
-//!   build: the store-backed backup operations (`CreateBackup`,
-//!   `DescribeBackup`, `DeleteBackup`, `RestoreTableFromBackup`); the three
-//!   `PartiQL` operations; and `DescribeEndpoints`, as the build has no
-//!   network address to report.
+//!   build: the three `PartiQL` operations (the `PartiQL` surface is left out
+//!   of this build); and `DescribeEndpoints`, as the build has no network
+//!   address to report.
 //! - **Refused as the server refuses them**: every
 //!   `RestoreTableToPointInTime`, and an `UpdateContinuousBackups` that enables
 //!   point-in-time recovery, through [`extenddb_engine::parse_request`] and
@@ -32,23 +30,32 @@
 //!   build authenticates no request). They run before any table is read.
 //! - **Passed through** to the engine's handlers: everything else, including
 //!   the data-plane operations, `DescribeTable` / `ListTables`, streams,
-//!   time-to-live, tagging, every `UpdateTable`, `ListBackups`,
+//!   time-to-live, tagging, every `UpdateTable`, the backup operations,
 //!   `DescribeContinuousBackups`, an `UpdateContinuousBackups` that does not
 //!   enable point-in-time recovery, and `ImportTable` /
 //!   `ExportTableToPointInTime`.
-//!   The wasm build compiles those handlers too, so a malformed request gets
-//!   the handler's own validation answer on both targets. The adapter
-//!   configures no backup store and no import or export paths, so `ListBackups`
-//!   lists nothing and the import and export handlers answer that the
+//!   The adapter configures no backup store and no import or export paths, so
+//!   `CreateBackup` backs a table up in the catalog, as a server with no
+//!   backup store does, and the import and export handlers answer that the
 //!   operation is disabled.
 //!
-//! One refusal is not made here, and differs between the targets: an
-//! `UpdateTable` that creates a vector index. The engine validates the request
-//! first, so a missing table or a malformed `Create` gets the engine's answer
-//! on both targets. The `SQLite` backend then starts the index backfill
-//! natively, as the server does. On wasm it has no task runtime to run the
-//! backfill, so it refuses the create with a `ValidationException` that names
-//! the build, before the catalog commit, and the table is left as it was.
+//! Two refusals are not made here, and differ between the targets:
+//!
+//! - An `UpdateTable` that creates a vector index. The engine validates the
+//!   request first, so a missing table or a malformed `Create` gets the
+//!   engine's answer on both targets. The `SQLite` backend then starts the
+//!   index backfill natively, as the server does. On wasm it has no task
+//!   runtime to run the backfill, so it refuses the create with a
+//!   `ValidationException` that names the build, before the catalog commit,
+//!   and the table is left as it was.
+//! - The four store-backed backup operations (`CreateBackup`,
+//!   `DescribeBackup`, `DeleteBackup`, `RestoreTableFromBackup`). Natively the
+//!   engine's backup handlers answer them. The engine's backup subsystem does
+//!   not build for wasm32, so there the engine refuses them, after the body
+//!   parse, with a `ValidationException` that names the build.
+//!
+//! The other handlers compile for wasm32 too, so a malformed request gets the
+//! handler's own validation answer on both targets.
 //!
 //! # Checks the HTTP server makes that this build does not
 //!
@@ -95,9 +102,11 @@
 //!   `Access is denied`; this build describes the stream.
 //! - **A tag operation's `ResourceArn` that names an index.** Both answer the
 //!   same `ValidationException`; this build's comes from the tag handler.
-//! - **A `BackupArn` that is not a backup ARN.** The server answers
-//!   `ValidationException` `Invalid Backup ARN`; this build refuses
-//!   `DescribeBackup` and `DeleteBackup` whatever the body (above).
+//! - **A `BackupArn` that is not a backup ARN.** `DescribeBackup` with
+//!   `not-a-backup-arn`: the server answers `ValidationException` `Invalid
+//!   Backup ARN`; natively this build's `DescribeBackup` handler answers
+//!   `ValidationException` `Invalid Request: BackupArn is not valid`, and on
+//!   wasm32 the engine refuses the operation (above).
 //! - **An export `TableArn` that does not parse.** The server answers
 //!   `ValidationException` `One or more parameter values were invalid:
 //!   tableArn is not a valid ARN`; this build, the export handler's
@@ -141,8 +150,9 @@ const ACCOUNT_ID: &str = "000000000000";
 const SERVER_ADDR: &str = "";
 
 /// Backup job-slot count for the native backup runtime. One is enough: the
-/// runtime has no backup store, and the operations that would use a slot are
-/// refused before dispatch. Native only — the field it feeds is absent on wasm.
+/// runtime has no backup store, so a `CreateBackup` takes the slot only while
+/// it backs a table up in the catalog. Native only — the field it feeds is
+/// absent on wasm.
 #[cfg(not(target_arch = "wasm32"))]
 const BACKUP_JOB_SLOTS: usize = 1;
 
@@ -156,10 +166,10 @@ const BACKUP_JOB_SLOTS: usize = 1;
 #[derive(Clone)]
 pub struct Engine {
     storage: Arc<dyn StorageEngine>,
-    /// The process's backup job slots and (unconfigured) backup store. The
-    /// store-backed backup subsystem is compiled only off wasm, so this field
-    /// is absent in the wasm build; the adapter refuses the operations that
-    /// read it before dispatch.
+    /// The process's backup job slots and (unconfigured) backup store, which
+    /// the engine's backup handlers read natively. The backup subsystem is
+    /// compiled only off wasm, so this field is absent in the wasm build, where
+    /// the engine refuses those operations.
     #[cfg(not(target_arch = "wasm32"))]
     backup: Arc<BackupRuntime>,
     limits: Arc<LimitsConfig>,
@@ -234,11 +244,11 @@ impl Engine {
     /// Apply the browser-build operation policy and the engine's pre-dispatch
     /// checks, then dispatch into the engine.
     async fn dispatch(&self, operation: &str, body_json: &str) -> Result<Value, DynamoDbError> {
-        // Refusals that need no request body: the store-backed backup
-        // operations and PartiQL. Answered before the operation-known check so
-        // a PartiQL request is refused for the stated reason rather than
-        // reported as unknown — this build is compiled without the PartiQL
-        // surface, so `parse_request` would report it as unknown otherwise.
+        // Refusals that need no request body: PartiQL and DescribeEndpoints.
+        // Answered before the operation-known check so a PartiQL request is
+        // refused for the stated reason rather than reported as unknown — this
+        // build is compiled without the PartiQL surface, so `parse_request`
+        // would report it as unknown otherwise.
         if let Some(reason) = unsupported_reason(operation) {
             return Err(unsupported(operation, reason));
         }
@@ -264,9 +274,8 @@ impl Engine {
     /// the item reads and writes `PartiQL` names in its statement body) because
     /// the `PartiQL` operations are refused before dispatch. Imports and exports
     /// are disabled (empty allow-lists — the browser has no filesystem). The
-    /// backup runtime is present only off wasm; the store-backed backup
-    /// operations that would read it are refused before dispatch on both
-    /// targets.
+    /// backup runtime is present only off wasm, where the engine's backup
+    /// handlers read it; on wasm the engine refuses those operations.
     fn operation_context(&self) -> OperationContext {
         OperationContext {
             storage: Arc::clone(&self.storage),
@@ -286,15 +295,11 @@ impl Engine {
 }
 
 /// The reason an operation is refused outright in the browser build, or `None`
-/// if it is not refused here. The store-backed backup operations need a backup
-/// store the in-memory build does not have; the `PartiQL` operations are not part
-/// of the build; `DescribeEndpoints` reports the address a client sends
-/// requests to, and the build is called in-process with no network address.
+/// if it is not refused here. The `PartiQL` operations are not part of the
+/// build; `DescribeEndpoints` reports the address a client sends requests to,
+/// and the build is called in-process with no network address.
 fn unsupported_reason(operation: &str) -> Option<&'static str> {
     match operation {
-        "CreateBackup" | "DescribeBackup" | "DeleteBackup" | "RestoreTableFromBackup" => {
-            Some("the browser build runs entirely in memory with no backup store")
-        }
         "ExecuteStatement" | "BatchExecuteStatement" | "ExecuteTransaction" => {
             Some("the PartiQL surface is not part of the browser build")
         }

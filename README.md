@@ -339,8 +339,12 @@ Operations that need a facility the in-browser build lacks return a
 that names the build:
 
 - The store-backed backup operations — `CreateBackup`, `DescribeBackup`,
-  `DeleteBackup`, `RestoreTableFromBackup` — "… the browser build runs entirely
-  in memory with no backup store."
+  `DeleteBackup`, `RestoreTableFromBackup` — "… it does not include the backup
+  subsystem." The engine's backup subsystem does not build for `wasm32`, so the
+  engine refuses these four there, after the body parse: a malformed body gets
+  `SerializationException`, as on a server. Natively, the same build of the
+  adapter runs the engine's backup handlers, and with no backup store
+  `CreateBackup` backs a table up in the catalog, as a server without one does.
 - The PartiQL operations — `ExecuteStatement`, `BatchExecuteStatement`,
   `ExecuteTransaction` — "… the PartiQL surface is not part of the browser build."
 - `DescribeEndpoints` — "… it is called in-process and has no network endpoint
@@ -355,17 +359,20 @@ that names the build:
 
 The parity corpus (`crates/wasm-adapter/parity/corpus.json`) runs on the
 native build and on this one with the same expectations, except in the cases
-that carry an `onWasm` expectation for this build. Two do, both for the
+that carry an `onWasm` expectation for this build. Seven do. Two are for the
 vector-index refusal: "UpdateTable creating a vector index on VecT adds the
 index to the table" expects the refusal here, and "DescribeTable VecT after the
 vector-index create" expects the table to keep only the index it was created
-with.
+with. The other five are the backup cases with a well-formed body (one
+`CreateBackup`, two `DescribeBackup`, one `DeleteBackup` and one
+`RestoreTableFromBackup`), which expect the backup refusal here and the backup
+handlers' answers natively.
 
 `ListBackups`, `DescribeContinuousBackups`, `UpdateContinuousBackups`,
 `ImportTable` and `ExportTableToPointInTime` run the engine's own handlers, as
 on a server, so a malformed request gets the handler's validation error on both
-builds. This build has no backup store and no import or export paths, so
-`ListBackups` lists no backups, `DescribeContinuousBackups` reports
+builds. This build creates no backup (see above) and has no import or export
+paths, so `ListBackups` lists no backups, `DescribeContinuousBackups` reports
 point-in-time recovery `DISABLED` for a table that exists and
 `TableNotFoundException` for one that does not, and `ImportTable` /
 `ExportTableToPointInTime` return the "disabled" `ValidationException` of a
