@@ -181,6 +181,8 @@ fn default_enforce_reserved_keywords() -> bool {
 /// convert. Saturating keeps it larger than any list that target can hold, so
 /// the page holds the whole list, as a 64-bit target's page does for such a
 /// limit.
+// Not part of this crate's API: extenddb-storage and extenddb-storage-sqlite call it.
+#[doc(hidden)]
 #[must_use]
 pub fn page_size(limit: i64) -> usize {
     if limit < 1 {
