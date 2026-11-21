@@ -190,6 +190,27 @@ fn an_internal_failure_is_still_an_internal_server_error() {
     assert!(matches!(err, DynamoDbError::InternalServerError(_)));
 }
 
+/// UpdateTable on a DELETING table: the measured sentence (2026-10-24),
+/// byte for byte, and the other non-ACTIVE statuses keep theirs.
+#[test]
+fn a_deleting_table_has_its_own_sentence() {
+    let err = update_table_err_to_dynamo(StorageError::TableBeingDeleted("t".to_owned()), "t");
+    match err {
+        DynamoDbError::ResourceInUseException(msg) => assert_eq!(
+            msg,
+            "Attempt to change a resource which is still in use: Table is being deleted: t"
+        ),
+        other => panic!("expected ResourceInUseException, got {other:?}"),
+    }
+    let err = update_table_err_to_dynamo(StorageError::TableNotActive("t".to_owned()), "t");
+    match err {
+        DynamoDbError::ResourceInUseException(msg) => {
+            assert_eq!(msg, "Table t is not in ACTIVE state");
+        }
+        other => panic!("expected ResourceInUseException, got {other:?}"),
+    }
+}
+
 /// Measured 2026-10-24: a `StreamSpecification` object without `StreamEnabled`
 /// gets the null-member sentence. A member that is not an object (a string, a
 /// number, an array) is not that case: it is left to deserialisation, which

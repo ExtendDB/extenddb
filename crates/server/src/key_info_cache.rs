@@ -160,10 +160,11 @@ impl CachedTableKeyInfoStore {
 /// cached and is what the caller sees.
 ///
 /// Every backend's `table_key_info` answers `TableNotFound` both for a name
-/// the catalog does not have and for one it has in a state other than
-/// `ACTIVE` (a `CreateTable` or `RestoreTableFromBackup` target that is still
-/// `CREATING`; the data plane reports both as `ResourceNotFoundException`, as
-/// the service does). Caching the second as a negative entry made reads on a
+/// the catalog does not have and for one it has as `CREATING` (a `CreateTable`
+/// or `RestoreTableFromBackup` target; the data plane reports both as
+/// `ResourceNotFoundException`, as the service does). PostgreSQL and SQLite
+/// answer the key info for a `DELETING` row, since the service serves the data
+/// plane until the table is gone. Caching the second as a negative entry made reads on a
 /// restored table fail for up to `negative_ttl` after `DescribeTable` reported
 /// it `ACTIVE`: a probe during the copy stored the entry, and nothing
 /// invalidated it at the transition (the service's first

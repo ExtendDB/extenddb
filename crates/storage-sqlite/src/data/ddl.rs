@@ -358,11 +358,17 @@ impl SqliteEngine {
             row.ok_or_else(|| StorageError::TableNotFound(table_name.to_owned()))?;
 
         match status.as_str() {
-            "ACTIVE" => {}
-            // A table still being created, or being deleted, is not usable for
-            // data-plane operations; DynamoDB reports it as not found (not
-            // in-use). UPDATING keeps the not-active classification.
-            "CREATING" | "DELETING" => {
+            // DynamoDB serves reads and writes on a DELETING table until the
+            // table is gone (measured 2026-10-25); a write made in that window
+            // goes away with the table. The data tables stay until the control
+            // plane drops them, so the data plane reads a DELETING row as found;
+            // a statement that reaches a dropped data table is answered as not
+            // found by the `DataEngine` implementation.
+            "ACTIVE" | "DELETING" => {}
+            // A table still being created is not usable for data-plane
+            // operations; DynamoDB reports it as not found (not in-use).
+            // UPDATING keeps the not-active classification.
+            "CREATING" => {
                 return Err(StorageError::TableNotFound(table_name.to_owned()));
             }
             _ => return Err(StorageError::TableNotActive(table_name.to_owned())),
@@ -505,11 +511,10 @@ impl SqliteEngine {
         let (table_id, status) =
             row.ok_or_else(|| StorageError::TableNotFound(table_name.to_owned()))?;
         match status.as_str() {
-            "ACTIVE" => {}
-            // A table still being created, or being deleted, is not usable for
-            // data-plane operations; DynamoDB reports it as not found (not
-            // in-use). UPDATING keeps the not-active classification.
-            "CREATING" | "DELETING" => {
+            // Same classification as `fetch_table_key_info`: a DELETING table
+            // is served until it is gone, a CREATING one is not found.
+            "ACTIVE" | "DELETING" => {}
+            "CREATING" => {
                 return Err(StorageError::TableNotFound(table_name.to_owned()));
             }
             _ => return Err(StorageError::TableNotActive(table_name.to_owned())),

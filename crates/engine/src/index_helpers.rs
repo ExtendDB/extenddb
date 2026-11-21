@@ -127,6 +127,38 @@ pub fn classify_vector_index_read(
     }
 }
 
+/// The answer for a GSI or LSI name that `index_info_by_table_id` reported
+/// missing (`err`) on the table `key_info` describes.
+///
+/// The key info can come from the key-info cache, and the cache keeps an entry
+/// read while the table was `DELETING` after the control plane removes the
+/// table, since that removal does not reach the cache. The index rows go with
+/// the table, so a cached entry would turn a read on a table that is gone into
+/// `The table does not have the specified index` until the entry expires. The
+/// catalog is therefore asked for the table again. A table it no longer has is
+/// answered as a read on a missing table (`ResourceNotFoundException`) and its
+/// cache entry is dropped; a table it still has keeps `err`. The extra read
+/// runs only for an index name that does not resolve.
+pub async fn unresolved_index_error(
+    ctx: &OperationContext,
+    key_info: &TableKeyInfo,
+    err: extenddb_storage::error::StorageError,
+) -> DynamoDbError {
+    match ctx
+        .storage
+        .table_key_info(&ctx.account_id, &key_info.table_name)
+        .await
+    {
+        Err(gone @ extenddb_storage::error::StorageError::TableNotFound(_)) => {
+            ctx.auth_cache
+                .invalidate_table_key_info(&ctx.account_id, &key_info.table_name)
+                .await;
+            crate::create_table::storage_err_to_dynamo(gone)
+        }
+        _ => crate::create_table::storage_err_to_dynamo(err),
+    }
+}
+
 /// Resolve an index name that `index_info_by_table_id` reported missing
 /// against the table's vector index metadata.
 ///

@@ -40,6 +40,10 @@ pub enum ErrorMessageKey {
     TableNotFound,
     TableAlreadyExists,
     TableInUse,
+    /// A control-plane change refused because the table is `DELETING`.
+    /// Measured on the service 2026-10-24 for a second `DeleteTable` and for
+    /// `UpdateTable` during the window.
+    TableBeingDeleted,
     MissingKeySchema,
     KeySchemaTooMany,
     KeySchemaFirstNotHash,
@@ -81,6 +85,12 @@ pub fn error_message(key: ErrorMessageKey, args: &[&str]) -> String {
         }
         ErrorMessageKey::TableInUse => {
             format!("Table is being created, updated, or deleted: {}", args[0])
+        }
+        ErrorMessageKey::TableBeingDeleted => {
+            format!(
+                "Attempt to change a resource which is still in use: Table is being deleted: {}",
+                args[0]
+            )
         }
         ErrorMessageKey::MissingKeySchema => {
             "1 validation error detected: Value null at 'keySchema' failed to satisfy constraint: \

@@ -21,6 +21,7 @@ use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::{build_expression_maps, parse_optional_filter};
 use crate::index_helpers::{
     VectorIndexReadRefusal, classify_unresolved_index_read, combined_lek_key_schema,
+    unresolved_index_error,
 };
 use crate::legacy_filter::desugar_filter;
 use crate::read_helpers::{PostRead, read_page};
@@ -259,7 +260,9 @@ pub async fn handle_scan(
                 Err(err @ StorageError::IndexNotFound(_)) => {
                     return Err(
                         match classify_unresolved_index_read(ctx, &key_info, idx_name).await? {
-                            VectorIndexReadRefusal::NotFound => storage_err_to_dynamo(err),
+                            VectorIndexReadRefusal::NotFound => {
+                                unresolved_index_error(ctx, &key_info, err).await
+                            }
                             VectorIndexReadRefusal::Backfilling => {
                                 DynamoDbError::ValidationException(format!(
                                     "{VECTOR_INDEX_BACKFILLING_SCAN_PREFIX}{idx_name}"
