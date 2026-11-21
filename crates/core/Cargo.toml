@@ -23,8 +23,8 @@ time = { workspace = true }
 uuid = { workspace = true }
 zeroize = { workspace = true }
 # A `std::time` drop-in that also works on wasm32. On every target except
-# wasm32 it is `pub use std::time::*`;
-# on wasm32 it backs `Instant`/`SystemTime` with the browser clock
+# wasm32-unknown-unknown it is `pub use std::time::*`;
+# on wasm32-unknown-unknown it backs `Instant`/`SystemTime` with the browser clock
 # (`performance.now()` / `Date.now()`) instead of the host monotonic/realtime
 # clocks, which are unavailable there and panic at runtime if called.
 web-time = { workspace = true }

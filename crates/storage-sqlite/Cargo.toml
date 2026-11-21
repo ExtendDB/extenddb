@@ -39,8 +39,8 @@ bigdecimal = { workspace = true }
 crc32fast = { workspace = true }
 zeroize = { workspace = true }
 # The clock, so the browser build reads time through a backend that works on
-# wasm. On every non-wasm target `web-time` is `pub use std::time::*`; on wasm
-# it reads the host clock. Without it the
+# wasm. On every target except wasm32-unknown-unknown `web-time` is
+# `pub use std::time::*`; on wasm32-unknown-unknown it reads the host clock. Without it the
 # `std::time` clock reads on the write path (stream-record and TTL timestamps)
 # compile on wasm but trap when called.
 web-time = { workspace = true }

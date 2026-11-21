@@ -17,7 +17,8 @@ test-util = []
 
 [dependencies]
 # `web-time` is a drop-in replacement for `std::time` that also compiles on
-# wasm32; on native targets it is `pub use std::time::*`.
+# wasm32; on every target except wasm32-unknown-unknown it is
+# `pub use std::time::*`.
 web-time = { workspace = true }
 moka = { workspace = true }
 serde = { workspace = true }
