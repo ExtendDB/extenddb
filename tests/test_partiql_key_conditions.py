@@ -22,8 +22,9 @@ that is a scan ends the reading. What follows from that, pinned here:
   * the filter of a read by key may not compare a key attribute with another
     path or read a path into one (refused at once, ahead of the key type and
     overlap refusals, beside other disjuncts and when another makes a scan),
-    and a NOT over an AND or an OR stays in that filter, while an IN with a
-    path in its list makes a scan;
+    and a NOT over an AND or an OR stays in that filter, as does an OR that
+    tests a key attribute only under a NOT, while an IN with a path in its
+    list makes a scan;
   * a path into a key attribute is refused wherever it is in the WHERE of a
     table read, in a scan too;
   * a read of one disjunct has its key value sizes checked, and a batch
@@ -34,7 +35,8 @@ that is a scan ends the reading. What follows from that, pinned here:
 Dual-target: EXTENDDB_TEST_ENDPOINT selects an extenddb server; unset, the
 tests run against the live service with the default credential chain. The
 assertions are identical on both. Every expected value was measured on the
-service (2026-11-02).
+service (2026-11-02; the rows of an OR that tests a key attribute only under
+a NOT from 2026-11-12 to 2026-11-19).
 """
 
 from __future__ import annotations
@@ -471,6 +473,10 @@ def test_a_transaction_read_with_a_value_of_the_wrong_type_on_the_left(dynamodb_
 # ---- key attributes in the filter of a read by key ---------------------------
 
 
+def _pairs(n):
+    return " AND ".join(f"(NOT sk = 's{i}' OR x = {i})" for i in range(n))
+
+
 @pytest.mark.parametrize(
     ("table", "condition", "message"),
     [
@@ -492,6 +498,15 @@ def test_a_transaction_read_with_a_value_of_the_wrong_type_on_the_left(dynamodb_
         ("ctable", "pk = 'a' AND NOT (sk.q = 1 AND n = 1)", FILTER_KEY.format("sk")),
         ("ctable", "pk = 'a' AND NOT (sk.q = 1 AND pk = b)", FILTER_KEY.format("sk")),
         ("ctable", "pk = 'a' AND NOT (pk = b AND sk.q = 1)", FILTER_KEY.format("sk")),
+        # An OR that tests a key attribute only under a NOT.
+        ("ctable", f"pk = 'a' AND {_pairs(1)}", FILTER_KEY.format("sk")),
+        ("ctable", f"pk = 'a' AND {_pairs(2)}", FILTER_KEY.format("sk")),
+        ("ctable", f"pk = 'a' AND {_pairs(9)}", FILTER_KEY.format("sk")),
+        ("ctable", "pk = 'a' AND (x = 0 OR NOT sk = 's0')", FILTER_KEY.format("sk")),
+        ("ctable", "pk = 'a' AND (NOT sk > 's0' OR x = 0)", FILTER_KEY.format("sk")),
+        ("ctable", "pk = 'a' AND (NOT begins_with(sk, 's') OR x = 0)", FILTER_KEY.format("sk")),
+        ("ctable", "pk = 'a' AND (NOT sk = 's0' OR NOT sk = 's1')", FILTER_KEY.format("sk")),
+        ("ctable", "pk = 'a' AND (NOT pk = 'b' OR x = 0)", FILTER_KEY.format("pk")),
     ],
 )
 def test_a_keyed_filter_naming_a_key_attribute_is_refused(
@@ -572,6 +587,35 @@ def test_a_not_over_a_compound_condition_keeps_its_disjunct_read_by_key(
         "OR pk = 'a' AND sk = 'y'"
     )
     assert _message(dynamodb_client, statement) == OVERLAP
+
+
+@pytest.fixture(scope="module")
+def otable(dynamodb_client):
+    """A table keyed on string pk and sk, holding P/1, P/2, P/6 and P/x."""
+    with _keyed_table(dynamodb_client, "S") as name:
+        for sk in ["1", "2", "6", "x"]:
+            dynamodb_client.put_item(TableName=name, Item={"pk": {"S": "P"}, "sk": {"S": sk}})
+        yield name
+
+
+@pytest.mark.parametrize(
+    ("condition", "rows"),
+    [
+        # Measured 2026-11-12 (the statements run) and 2026-11-19 (these items
+        # on this fixture).
+        ("pk = 'P' AND NOT sk = '1' OR pk = 'P' AND sk = '2'", ["2", "6", "x"]),
+        ("pk = 'P' AND sk <> '1' OR pk = 'P' AND sk = '2'", ["2", "6", "x"]),
+        ("pk = 'P' AND NOT begins_with(sk, 'x') OR pk = 'P' AND sk = '2'", ["1", "2", "6"]),
+        ("pk = 'P' AND NOT sk IN ['1', '3'] OR pk = 'P' AND sk = '2'", ["2", "6", "x"]),
+        ("pk = 'P' AND NOT sk > '5' OR pk = 'P' AND sk = '2'", ["1", "2"]),
+        ("pk = 'P' AND NOT (sk = '1') OR pk = 'P' AND sk = '2'", ["2", "6", "x"]),
+        ("pk = 'P' OR pk = 'P' AND NOT sk = '1'", ["1", "2", "6", "x"]),
+    ],
+)
+def test_a_negated_sort_key_outside_an_or_kept_whole_runs(
+    dynamodb_client, otable, condition, rows
+):
+    assert _sort_keys(dynamodb_client, otable, condition) == rows
 
 
 @pytest.mark.parametrize(

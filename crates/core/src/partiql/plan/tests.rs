@@ -340,9 +340,23 @@ fn disjuncts_are_read_in_order_until_the_first_scan() {
         ),
         // An OR with no key attribute on either side is one condition.
         ("pk = 'a' AND (x = 1 OR y = 2)", vec!["a +1"], true),
+        // A negated sort key outside an OR kept whole makes its disjunct a
+        // scan.
+        ("pk = 'P' OR pk = 'P' AND NOT sk = '1'", vec!["P +0"], false),
     ] {
         let reads: Vec<String> = reads.into_iter().map(str::to_owned).collect();
         assert_eq!(reading(condition, KEYS), (reads, keyed), "{condition}");
+    }
+    // In the first disjunct, a negated sort key makes the statement a scan.
+    for condition in [
+        "pk = 'P' AND NOT sk = '1' OR pk = 'P' AND sk = '2'",
+        "pk = 'P' AND sk <> '1' OR pk = 'P' AND sk = '2'",
+        "pk = 'P' AND NOT begins_with(sk, 'x') OR pk = 'P' AND sk = '2'",
+        "pk = 'P' AND NOT sk IN ['1', '3'] OR pk = 'P' AND sk = '2'",
+        "pk = 'P' AND NOT sk > '5' OR pk = 'P' AND sk = '2'",
+        "pk = 'P' AND NOT (sk = '1') OR pk = 'P' AND sk = '2'",
+    ] {
+        assert_eq!(reading(condition, KEYS), (vec![], false), "{condition}");
     }
 }
 
@@ -365,7 +379,7 @@ fn a_key_against_a_path_or_into_a_key_is_named_in_the_filter() {
     let refusal = |condition: &str, keys: KeyNames<'_>| {
         let w = where_of(&select(condition));
         let analysis = WhereAnalysis::new(&w, keys, &literal);
-        let filter = analysis.shared_filter().unwrap();
+        let filter = analysis.shared_filter().expect(condition);
         scalar_key_refusal(&filter, keys).or_else(|| filter_key_refusal(&filter, keys))
     };
     let path = |key: &str| {
@@ -380,6 +394,11 @@ fn a_key_against_a_path_or_into_a_key_is_named_in_the_filter() {
              are not allowed: Key {key}"
         ))
     };
+    // Nine ORs `(NOT sk = 's<i>' OR x = <i>)` beside `pk = 'a'`.
+    let nine: Vec<String> = (0..9)
+        .map(|i| format!("(NOT sk = 's{i}' OR x = {i})"))
+        .collect();
+    let nine = format!("pk = 'a' AND {}", nine.join(" AND "));
     for (condition, want) in [
         ("pk = 'a' AND sk = a", path("sk")),
         ("pk = 'a' AND a = sk", path("sk")),
@@ -402,6 +421,21 @@ fn a_key_against_a_path_or_into_a_key_is_named_in_the_filter() {
         // Naming both keys, it names the sort key.
         ("pk = 'a' AND NOT (sk.q = 1 AND pk = b)", path("sk")),
         ("pk = 'a' AND NOT (pk = b AND sk.q = 1)", path("sk")),
+        // An OR that tests a key attribute only under a NOT.
+        ("pk = 'a' AND (NOT sk = 's0' OR x = 0)", path("sk")),
+        (
+            "pk = 'a' AND (NOT sk = 's0' OR x = 0) AND (NOT sk = 's1' OR x = 1)",
+            path("sk"),
+        ),
+        (nine.as_str(), path("sk")),
+        ("pk = 'a' AND (x = 0 OR NOT sk = 's0')", path("sk")),
+        ("pk = 'a' AND (NOT sk > 's0' OR x = 0)", path("sk")),
+        (
+            "pk = 'a' AND (NOT begins_with(sk, 's') OR x = 0)",
+            path("sk"),
+        ),
+        ("pk = 'a' AND (NOT sk = 's0' OR NOT sk = 's1')", path("sk")),
+        ("pk = 'a' AND (NOT pk = 'b' OR x = 0)", path("pk")),
     ] {
         assert_eq!(refusal(condition, KEYS), want, "{condition}");
     }

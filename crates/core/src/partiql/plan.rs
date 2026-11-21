@@ -21,7 +21,9 @@
 //! * A key attribute compared with another path (`sk = a`), a path into a key
 //!   attribute (`sk.x`), and a NOT over an AND or an OR that names a key
 //!   attribute, are not predicates on the key: they stay in the disjunct's
-//!   filter, which a keyed read refuses.
+//!   filter, which a keyed read refuses. So does an OR that tests a key
+//!   attribute only under a NOT, which does not split (measured 2026-11-14:
+//!   `pk = 'a' AND (NOT sk = 's0' OR x = 0)`).
 //! * A key condition (an equality of the partition key with a value, a key
 //!   condition on the sort key, or an AND of them) compared with a boolean
 //!   literal is read by that key condition, and the literal alone decides:
