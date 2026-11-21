@@ -375,12 +375,6 @@ CLEANUP_TRUSTSTORE=""
 # no target flag and no credentials, so it runs before the pre-flight the
 # server-backed suites require. When it is the only suite requested it exits with its own
 # status. It is placed after PASS=true so a failure here is not later reset.
-#
-# The getrandom wasm backend cfg is passed merged into RUSTFLAGS rather than left
-# to .cargo/config.toml: a RUSTFLAGS set in the environment shadows a target's
-# config-file rustflags, which would drop the cfg and break the build. Merging
-# keeps it set regardless of the caller's environment.
-WASM_RUSTFLAGS='--cfg getrandom_backend="wasm_js"'
 if $RUN_WASM; then
     WASM_PKG="${EXTENDDB_WASM_PKG:-extenddb-wasm-adapter}"
     WASM_OUTFILE="discussions/test-wasm-${HASH}.txt"
@@ -395,23 +389,20 @@ if $RUN_WASM; then
     } > "$WASM_OUTFILE"
     WASM_RC=0
     echo "--- cargo build ---" | tee -a "$WASM_OUTFILE"
-    if ! RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$WASM_RUSTFLAGS" \
-        cargo build --locked -p "$WASM_PKG" --target wasm32-unknown-unknown \
+    if ! cargo build --locked -p "$WASM_PKG" --target wasm32-unknown-unknown \
         2>&1 | tee -a "$WASM_OUTFILE"; then
         WASM_RC=1
     fi
     # The clock, thread, timer and task calls that compile for wasm32 but fail
     # when they run in a browser, which the build cannot see.
     echo "--- cargo clippy (devtools/wasm-clippy) ---" | tee -a "$WASM_OUTFILE"
-    if ! RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$WASM_RUSTFLAGS" \
-        CLIPPY_CONF_DIR="$PROJECT_DIR/devtools/wasm-clippy" \
+    if ! CLIPPY_CONF_DIR="$PROJECT_DIR/devtools/wasm-clippy" \
         cargo clippy --locked -p "$WASM_PKG" --lib --target wasm32-unknown-unknown \
         -- -D warnings 2>&1 | tee -a "$WASM_OUTFILE"; then
         WASM_RC=1
     fi
     echo "--- clippy guard self-test ---" | tee -a "$WASM_OUTFILE"
-    if ! RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$WASM_RUSTFLAGS" \
-        python3 devtools/check-wasm-clippy-guard 2>&1 | tee -a "$WASM_OUTFILE"; then
+    if ! python3 devtools/check-wasm-clippy-guard 2>&1 | tee -a "$WASM_OUTFILE"; then
         WASM_RC=1
     fi
     if [ "$WASM_RC" -eq 0 ]; then
@@ -453,8 +444,7 @@ if $RUN_HEADLESS; then
         HEADLESS_RC=1
     else
         echo "--- wasm-pack build --target web --release ---" | tee -a "$HEADLESS_OUTFILE"
-        if RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$WASM_RUSTFLAGS" \
-            wasm-pack build --target web --release crates/wasm-adapter \
+        if wasm-pack build --target web --release crates/wasm-adapter \
             --out-dir parity/pkg 2>&1 | tee -a "$HEADLESS_OUTFILE"; then
             echo "--- node parity runner ---" | tee -a "$HEADLESS_OUTFILE"
             if ! node crates/wasm-adapter/parity/run.mjs 2>&1 | tee -a "$HEADLESS_OUTFILE"; then
@@ -554,7 +544,6 @@ if $RUN_WASM_TEST; then
             if ! PATH="$NODE_SHIM_DIR:$CARGO_BIN_DIR:$PATH" \
                 CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
                 WASM_BINDGEN_TEST_ONLY_NODE=1 \
-                RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$WASM_RUSTFLAGS" \
                 cargo test --locked $suite_args --target wasm32-unknown-unknown \
                 2>&1 | tee -a "$WASM_TEST_OUTFILE"; then
                 WASM_TEST_RC=1

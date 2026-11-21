@@ -13,12 +13,6 @@
 # every pull request rather than a path-filtered one — a path-filtered required
 # check never reports on a pull request outside its paths, and that pull
 # request can never merge (see licenses.yml).
-#
-# The getrandom browser backend cfg is set through RUSTFLAGS on each wasm
-# compile step rather than left to .cargo/config.toml, so the job does not
-# depend on an ambient RUSTFLAGS being absent: a RUSTFLAGS in the environment
-# shadows a target's config-file rustflags and would drop the cfg, breaking the
-# build.
 
 name: WebAssembly
 
@@ -77,11 +71,11 @@ jobs:
           # one in Node 18.
           node-version: "22"
 
-      # sqlite-wasm-rs compiles SQLite with clang for wasm32; lld provides the
-      # wasm linker. Pinning the packages keeps the build off whatever the
-      # runner image ships by default.
-      - name: Install clang and lld
-        run: sudo apt-get update && sudo apt-get install -y clang lld
+      # sqlite-wasm-rs compiles SQLite from C through the cc crate, which uses
+      # clang for wasm32. The package is unversioned: the step only makes sure
+      # a clang is on PATH. Rust links wasm32 with its bundled rust-lld.
+      - name: Install clang
+        run: sudo apt-get update && sudo apt-get install -y clang
 
       # wasm-bindgen-cli must match the wasm-bindgen crate in Cargo.lock
       # (0.2.130): the JS glue it generates and the test harness it runs are
@@ -106,8 +100,6 @@ jobs:
           cargo install --locked --version 0.15.1 wasm-pack
 
       - name: Build the adapter for wasm32
-        env:
-          RUSTFLAGS: --cfg getrandom_backend="wasm_js"
         run: cargo build --locked -p extenddb-wasm-adapter --target wasm32-unknown-unknown
 
       # Lints the adapter and every workspace crate it compiles for wasm32
@@ -119,30 +111,23 @@ jobs:
       # host-only integration tests out of the wasm build.
       - name: Clippy the wasm32 build
         env:
-          RUSTFLAGS: --cfg getrandom_backend="wasm_js"
           CLIPPY_CONF_DIR: ${{ github.workspace }}/devtools/wasm-clippy
         run: cargo clippy --locked -p extenddb-wasm-adapter --lib --target wasm32-unknown-unknown -- -D warnings
 
       # Checks that the step above fails on each disallowed method, called
       # directly or through an import, in a wasm-compiled file.
       - name: Self-test the wasm32 clippy guard
-        env:
-          RUSTFLAGS: --cfg getrandom_backend="wasm_js"
         run: python3 devtools/check-wasm-clippy-guard
 
       # The adapter's own code, with the pedantic group the step above does
       # not enable.
       - name: Clippy the adapter (pedantic) for wasm32
-        env:
-          RUSTFLAGS: --cfg getrandom_backend="wasm_js"
         run: cargo clippy --locked --no-deps -p extenddb-wasm-adapter --lib --target wasm32-unknown-unknown -- -D warnings -W clippy::pedantic
 
       # core's wasm crypto backend (sha2/hmac/subtle/aes-gcm/getrandom) runs in
       # no native test; this runs its known-vector and seal/open cases on
       # wasm32 under Node.
       - name: Crypto wasm tests under Node
-        env:
-          RUSTFLAGS: --cfg getrandom_backend="wasm_js"
         run: cargo test --locked -p extenddb-core --lib --target wasm32-unknown-unknown
 
       # The synchronous SQLite shim is the wasm backend; tests/wasm_shim.rs is
@@ -150,8 +135,6 @@ jobs:
       # SQL, fetch, transactions, the pool, connect options), run on wasm32
       # under Node.
       - name: SQLite shim wasm tests under Node
-        env:
-          RUSTFLAGS: --cfg getrandom_backend="wasm_js"
         run: cargo test --locked -p extenddb-storage-sqlite --test wasm_shim --target wasm32-unknown-unknown
 
       # Builds the browser module with wasm-bindgen and runs the shared parity
@@ -159,8 +142,6 @@ jobs:
       # responses, that the native oracle test (crates/wasm-adapter/tests/
       # parity.rs) runs against sqlx + the C SQLite.
       - name: Headless parity corpus under Node
-        env:
-          RUSTFLAGS: --cfg getrandom_backend="wasm_js"
         run: |
           wasm-pack build --target web --release crates/wasm-adapter --out-dir parity/pkg
           node crates/wasm-adapter/parity/run.mjs
