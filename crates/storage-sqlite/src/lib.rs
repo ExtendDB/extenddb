@@ -205,9 +205,9 @@ mod worker;
 mod workers;
 
 // On wasm, the synchronous reimplementation of the slice of the `sqlx` API the
-// backend uses, over this crate's bundled SQLite (in-memory VFS). The crate
-// root aliases it to `sqlx` (above), so the modules' `sqlx::` paths resolve to
-// it.
+// backend uses, over the SQLite that `sqlite-wasm-rs` bundles (in-memory VFS).
+// The crate root aliases it to `sqlx` (above), so the modules' `sqlx::` paths
+// resolve to it.
 #[cfg(target_arch = "wasm32")]
 mod wasm_sqlx;
 

@@ -31,8 +31,8 @@
 //!
 //! The management stores (users, access keys, policies, groups, roles,
 //! accounts, admin, settings, metrics) write through the separate catalog
-//! pool in `lib.rs`, which for a file-backed database opens the same file;
-//! the server wiring shares this same lock instance into
+//! pool in `server_backend.rs`, which for a file-backed database opens the
+//! same file; the server wiring there shares this same lock instance into
 //! `SqliteCatalogStore`, so those writers queue with the engine's. The
 //! credential store only reads. The one deliberate exclusion from the lock,
 //! so the invariant stays auditable, is init-time bootstrap (in this file and
@@ -757,8 +757,8 @@ mod d1_write_lock_tests {
     }
 
     /// Build a catalog store over the engine's pool and, critically, the
-    /// engine's OWN write lock, mirroring the server wiring in `lib.rs`. The
-    /// key holder lets access-key creation encrypt.
+    /// engine's OWN write lock, mirroring the server wiring in
+    /// `server_backend.rs`. The key holder lets access-key creation encrypt.
     fn catalog_store(engine: &SqliteEngine) -> crate::SqliteCatalogStore {
         let keys = extenddb_storage::secret_keys::SecretKeys::dek_for_tests([0; 32], 1, "test");
         crate::SqliteCatalogStore::with_secret_keys(
