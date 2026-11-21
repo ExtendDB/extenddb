@@ -403,7 +403,7 @@
       ]
     },
     {
-      "name": "Checkout: conditional UpdateItem accepts within the cap",
+      "name": "UpdateItem with a ConditionExpression that holds applies the update and returns ALL_NEW",
       "op": "UpdateItem",
       "body": {
         "TableName": "Account",
@@ -440,7 +440,7 @@
       ]
     },
     {
-      "name": "Checkout: conditional UpdateItem rejects over the cap",
+      "name": "UpdateItem with a ConditionExpression that does not hold is ConditionalCheckFailedException",
       "op": "UpdateItem",
       "body": {
         "TableName": "Account",
@@ -469,7 +469,7 @@
       ]
     },
     {
-      "name": "GetItem demo account is unchanged after the refused checkout",
+      "name": "GetItem demo account is unchanged by the refused conditional UpdateItem",
       "op": "GetItem",
       "body": {
         "TableName": "Account",
