@@ -10,7 +10,9 @@
 //! The four gate tests, on hash and on hash and range tables, also delete the
 //! winner before the put re-reads it, so the put retries its insert, and they
 //! bound those retries. The last test runs the race on a table with an LSI and
-//! a stream, and checks that both get the winner as the old image.
+//! a stream, and checks that both get the winner as the old image. One test
+//! runs the first race on a database whose default isolation is REPEATABLE
+//! READ.
 //!
 //! Each test builds its own throwaway database, applies the shipped migrations
 //! to it, and drops it when it passes. A failing test leaves its database behind
@@ -113,6 +115,13 @@ fn skip(test: &str) {
 }
 
 async fn scratch() -> Scratch {
+    scratch_at(None).await
+}
+
+/// [`scratch`] whose database sets `default_isolation` as its
+/// `default_transaction_isolation` for the sessions opened after the
+/// migrations, the engine's among them.
+async fn scratch_at(default_isolation: Option<&str>) -> Scratch {
     let base = base_conn().expect("caller checks base_conn() first");
     let db_name = format!("eddb_putr_{}", uuid::Uuid::new_v4().simple())[..24].to_owned();
     let admin = PgPoolOptions::new()
@@ -152,6 +161,14 @@ async fn scratch() -> Scratch {
         .execute(&db)
         .await
         .expect("seed the account row");
+    if let Some(level) = default_isolation {
+        sqlx::query(&format!(
+            "ALTER DATABASE \"{db_name}\" SET default_transaction_isolation = '{level}'"
+        ))
+        .execute(&admin)
+        .await
+        .expect("set the default isolation level");
+    }
     let engine = PostgresEngine::new(
         &PostgresConfig {
             connection_string: url,
@@ -326,11 +343,11 @@ async fn stored_v(s: &Scratch) -> String {
     .expect("read the stored item")
 }
 
-async fn overwrites_the_winner(test: &str, range: bool) {
+async fn overwrites_the_winner(test: &str, range: bool, default_isolation: Option<&str>) {
     if base_conn().is_none() {
         return skip(test);
     }
-    let s = scratch().await;
+    let s = scratch_at(default_isolation).await;
     let key_info = table(&s, range).await;
     let old = put_after_winner(&s, &key_info, range, None)
         .await
@@ -353,6 +370,7 @@ async fn a_put_that_loses_the_create_race_overwrites_the_winner() {
     overwrites_the_winner(
         "a_put_that_loses_the_create_race_overwrites_the_winner",
         false,
+        None,
     )
     .await;
 }
@@ -362,6 +380,20 @@ async fn a_put_that_loses_the_create_race_overwrites_the_winner_on_a_range_table
     overwrites_the_winner(
         "a_put_that_loses_the_create_race_overwrites_the_winner_on_a_range_table",
         true,
+        None,
+    )
+    .await;
+}
+
+/// The engine's sessions run at READ COMMITTED whatever the database's
+/// default, so the put re-reads the winner instead of failing on its first
+/// statement's snapshot.
+#[tokio::test]
+async fn a_put_that_loses_the_create_race_overwrites_the_winner_under_repeatable_read() {
+    overwrites_the_winner(
+        "a_put_that_loses_the_create_race_overwrites_the_winner_under_repeatable_read",
+        false,
+        Some("repeatable read"),
     )
     .await;
 }

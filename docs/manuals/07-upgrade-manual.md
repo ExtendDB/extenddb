@@ -138,7 +138,7 @@ extenddb migrate --config extenddb.toml --yes
 
 `migrate` finds the data database through the name `init` recorded in the catalog's `settings` (`data_database_name`), and connects to it with the connection string `init` recorded beside it (`data_database_connection_string`), which the server connects with. A catalog that has no recorded name falls back to the catalog database name without its `_catalog` suffix. `--data-db <name>` overrides both and uses that database on the recorded connection string's server. When the two rows name different databases and `--data-db` is not given, `migrate`, `verify` and `serve` refuse with exit status 1 and name both; correct the row that is wrong.
 
-The PostgreSQL commands and `serve` work through PgBouncer in transaction mode and in session mode: no session sets a parameter at login other than `application_name`, which PgBouncer passes on to the server, and every other setting is sent inside the transaction that needs it.
+The PostgreSQL commands and `serve` work through PgBouncer in transaction mode and in session mode: no session sets a parameter at login other than `application_name`, which PgBouncer passes on to the server, and every other setting is sent inside the transaction that needs it, except `default_transaction_isolation`. Behind PgBouncer in transaction mode, keep the role's and the database's `default_transaction_isolation` at `read committed`, as [Transaction isolation](11-deployment-guide.md#transaction-isolation) in the deployment guide describes.
 
 `migrate --yes` finds running servers through the key each one holds on the catalog database while it serves. In two layouts the key does not match the servers that run, and stopping every server before the upgrade (step 1) covers both:
 
@@ -387,6 +387,12 @@ The first release, so all 0.0.2 deployments were fresh installs.
 Catalog upgrades change the schema; behavior changes alter how the running server
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
+
+### v1.1.0: PostgreSQL sets `READ COMMITTED` on the server's and the stores' sessions
+
+**What changed.** The PostgreSQL backend sets `default_transaction_isolation` to `read committed` before the first statement of each connection of the pools that serve requests and run background work, and of the session that holds a backup or restore job's claim. [Transaction isolation](11-deployment-guide.md#transaction-isolation) in the deployment guide lists the commands that set it too. A default from `postgresql.conf`, `ALTER DATABASE`, `ALTER ROLE` or the connection string's `options` no longer applies to them. 1.0.0 ran them at that default. Under `repeatable read` or `serializable`, a write that waited for another write to the same item failed. A PutItem or DeleteItem answered HTTP 500 (`InternalServerError`), and a TransactWriteItems was canceled with a `TransactionConflict` reason. Transactions that need one snapshot (TransactGetItems, the reads of a backup and of a table snapshot) name their own level, as before.
+
+**Who is affected.** A PostgreSQL deployment whose `default_transaction_isolation` is not `read committed`. Behind a connection pooler in transaction mode, keep the role's and the database's default at `read committed`, as [Transaction isolation](11-deployment-guide.md#transaction-isolation) in the deployment guide describes. SQLite, Cassandra and MongoDB are not affected. No catalog migration is required.
 
 ### v1.0.0: Cassandra reads and writes at `LOCAL_QUORUM`
 
