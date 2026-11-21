@@ -26,12 +26,18 @@
 //! `PoolTimedOut` without the wait; the shim does not wait at all.
 //!
 //! The table is an integration test rather than an inline test module so the
-//! wasm test binary compiles against only the crate and `wasm-bindgen-test`:
-//! the crate's inline unit tests and the native integration tests pull the
-//! engine, the backup store and tokio's net stack, none of which build for
-//! wasm32. On wasm32 it runs under Node through `wasm-bindgen-test`, and
-//! reaches the shim through the crate's `#[doc(hidden)]` `wasm_sqlx_for_tests`
-//! module.
+//! wasm test binary compiles against only the crate, its dependencies and
+//! `wasm-bindgen-test`: the crate's inline unit tests and the native
+//! integration tests pull the engine, the backup store and tokio's net stack,
+//! none of which build for wasm32. On wasm32 it runs under Node through
+//! `wasm-bindgen-test`, and reaches the shim through the crate's
+//! `#[doc(hidden)]` `wasm_sqlx_for_tests` module.
+//!
+//! The test after the table drives the backend itself, an in-memory
+//! `SqliteEngine` opened as the WebAssembly adapter opens it, through a
+//! request whose answer depends on the target: an `UpdateTable` that creates
+//! a vector index, which the wasm32 build refuses because it cannot run the
+//! index backfill. It too gives each target's expected outcome.
 
 use std::fmt::Debug;
 use std::future::Future;
@@ -934,4 +940,134 @@ async fn each_row_gives_its_expected_outcome() {
         differences, DIFFERENCE_ROWS,
         "the number of difference rows"
     );
+}
+
+/// The account the backend tests below run as.
+const ACCOUNT: &str = "000000000000";
+
+/// A fresh in-memory engine, as the WebAssembly adapter opens it, holding the
+/// PAY_PER_REQUEST table `t` keyed on the string `pk`.
+async fn engine_with_table() -> extenddb_storage_sqlite::SqliteEngine {
+    use extenddb_storage::TableEngine;
+    let engine = extenddb_storage_sqlite::SqliteEngine::new_in_memory(
+        "us-east-1",
+        ACCOUNT,
+        extenddb_core::limits::DEFAULT_MAX_ITEM_SIZE_BYTES,
+    )
+    .await
+    .expect("in-memory engine");
+    let input: extenddb_core::types::CreateTableInput = serde_json::from_value(serde_json::json!({
+        "TableName": "t",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "BillingMode": "PAY_PER_REQUEST"
+    }))
+    .expect("CreateTable input");
+    engine
+        .create_table(ACCOUNT, input)
+        .await
+        .expect("create table");
+    engine
+}
+
+/// An `UpdateTable` that creates a vector index, alone and beside a global
+/// secondary index create and a deletion-protection change, sent to the
+/// backend on a fresh table: the answer, the indexes and deletion protection
+/// the table has afterwards, and whether its description changed.
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+async fn an_update_table_that_creates_a_vector_index() {
+    use extenddb_storage::TableEngine;
+    let describe = |engine: &extenddb_storage_sqlite::SqliteEngine| {
+        let input = extenddb_core::types::DescribeTableInput {
+            table_name: "t".to_owned(),
+        };
+        let engine = engine.clone();
+        async move {
+            engine
+                .describe_table(ACCOUNT, input)
+                .await
+                .expect("describe")
+        }
+    };
+    let create_vector = serde_json::json!({"Create": {
+        "IndexName": "vidx",
+        "VectorAttribute": {"AttributeName": "emb"},
+        "Dimensions": 3,
+        "DistanceFunction": "COSINE",
+        "Projection": {"ProjectionType": "ALL"}
+    }});
+    let refused = "Err(Unsupported(\"UpdateTable is not supported by the ExtendDB WebAssembly \
+                   build: it cannot build a vector index; create the table with its vector \
+                   indexes instead.\"))";
+    let cases = [
+        (
+            "a vector index create",
+            serde_json::json!({"TableName": "t", "VectorIndexUpdates": [create_vector.clone()]}),
+            "Ok | vector [\"vidx\"] global [] deletion protection false | changed".to_owned(),
+            format!("{refused} | vector [] global [] deletion protection false | unchanged"),
+        ),
+        (
+            "a vector index create beside other changes",
+            serde_json::json!({
+                "TableName": "t",
+                "AttributeDefinitions": [{"AttributeName": "g", "AttributeType": "S"}],
+                "GlobalSecondaryIndexUpdates": [{"Create": {
+                    "IndexName": "gsi",
+                    "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"}
+                }}],
+                "DeletionProtectionEnabled": true,
+                "VectorIndexUpdates": [create_vector]
+            }),
+            "Ok | vector [\"vidx\"] global [\"gsi\"] deletion protection true | changed".to_owned(),
+            format!("{refused} | vector [] global [] deletion protection false | unchanged"),
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (name, request, native, wasm) in cases {
+        let engine = engine_with_table().await;
+        let before = describe(&engine).await;
+        let input: extenddb_core::types::UpdateTableInput =
+            serde_json::from_value(request).expect("UpdateTable input");
+        let answer = match engine.update_table(ACCOUNT, input).await {
+            Ok(_) => "Ok".to_owned(),
+            Err(e) => format!("Err({e:?})"),
+        };
+        let after = describe(&engine).await;
+        let vector: Vec<&str> = after
+            .vector_indexes
+            .iter()
+            .flatten()
+            .map(|index| index.index_name.as_str())
+            .collect();
+        let global: Vec<&str> = after
+            .global_secondary_indexes
+            .iter()
+            .flatten()
+            .map(|index| index.index_name.as_str())
+            .collect();
+        let changed = if serde_json::to_value(&after).expect("after")
+            == serde_json::to_value(&before).expect("before")
+        {
+            "unchanged"
+        } else {
+            "changed"
+        };
+        let actual = format!(
+            "{answer} | vector {vector:?} global {global:?} deletion protection {} | {changed}",
+            after.deletion_protection_enabled
+        );
+        let expected = if cfg!(target_arch = "wasm32") {
+            wasm
+        } else {
+            native
+        };
+        if actual != expected {
+            failures.push(format!(
+                "{name}\n    expected: {expected}\n    actual:   {actual}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
