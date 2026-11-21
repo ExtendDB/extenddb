@@ -235,8 +235,8 @@ fn unsupported_reason(operation: &str) -> Option<&'static str> {
 /// retry it, unlike the 500 an `InternalServerError` would carry. The message
 /// names the build so the reason is clear to a caller.
 fn unsupported(operation: &str, reason: &str) -> DynamoDbError {
-    DynamoDbError::ValidationException(format!(
-        "{operation} is not supported by the ExtendDB WebAssembly build: {reason}."
+    DynamoDbError::ValidationException(extenddb_core::error::webassembly_unsupported_message(
+        operation, reason,
     ))
 }
 

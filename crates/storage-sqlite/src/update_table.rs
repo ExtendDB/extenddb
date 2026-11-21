@@ -1000,10 +1000,14 @@ impl SqliteEngine {
         }
         #[cfg(target_arch = "wasm32")]
         {
+            // The WebAssembly adapter refuses a vector-index create before
+            // dispatch, so no request reaches this branch through it. It returns
+            // an error instead of panicking for a caller that reaches the
+            // backend some other way; the caller above then removes the
+            // CREATING catalog row.
             let _ = create;
-            Err(StorageError::Unsupported(
-                "creating a vector index is not available in the in-memory WebAssembly build"
-                    .to_owned(),
+            Err(StorageError::Internal(
+                "this build has no task runtime to run a vector index backfill".to_owned(),
             ))
         }
     }

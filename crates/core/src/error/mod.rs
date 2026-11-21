@@ -412,6 +412,18 @@ pub fn malformed_body_error(error: &serde_json::Error) -> DynamoDbError {
     ))
 }
 
+/// The message of a request the WebAssembly build refuses because it lacks
+/// the facility the request needs: `"{subject} is not supported by the ExtendDB
+/// WebAssembly build: {reason}."`.
+///
+/// Every refusal of that build, in the engine, the `SQLite` backend and the
+/// adapter, builds its message here so a caller sees one wording.
+#[doc(hidden)]
+#[must_use]
+pub fn webassembly_unsupported_message(subject: &str, reason: &str) -> String {
+    format!("{subject} is not supported by the ExtendDB WebAssembly build: {reason}.")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,6 +587,14 @@ mod tests {
                 .starts_with("Start of structure or map found where not expected: "),
             "{}",
             err.message()
+        );
+    }
+
+    #[test]
+    fn webassembly_unsupported_message_names_the_subject_build_and_reason() {
+        assert_eq!(
+            webassembly_unsupported_message("ImportTable", "it has no filesystem"),
+            "ImportTable is not supported by the ExtendDB WebAssembly build: it has no filesystem."
         );
     }
 }

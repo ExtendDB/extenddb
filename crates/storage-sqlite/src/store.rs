@@ -499,8 +499,8 @@ impl SqliteEngine {
 // Table snapshots copy the database file on disk; the real `SnapshotEngine`
 // impl (`snapshot_engine`) is compiled off the browser build. The
 // `StorageEngine` blanket impl still requires the subtrait, so the wasm build
-// answers it with an out-of-scope error — matching the parity scope, where
-// anything needing a real filesystem is out of scope.
+// answers it with an `Unsupported` error: a browser gives the module no
+// filesystem to copy the database file on.
 #[cfg(target_arch = "wasm32")]
 impl extenddb_storage::snapshot::SnapshotEngine for SqliteEngine {
     fn open_table_snapshot(
@@ -514,9 +514,10 @@ impl extenddb_storage::snapshot::SnapshotEngine for SqliteEngine {
         let _ = (account_id, table_name);
         Box::pin(async {
             Err(StorageError::Unsupported(
-                "table snapshots require a filesystem and are not available in the in-memory \
-                 WebAssembly build"
-                    .to_owned(),
+                extenddb_core::error::webassembly_unsupported_message(
+                    "A table snapshot",
+                    "it has no filesystem",
+                ),
             ))
         })
     }

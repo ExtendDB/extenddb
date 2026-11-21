@@ -43,8 +43,9 @@ mod files {
     }
 
     fn no_filesystem(operation: &str) -> DynamoDbError {
-        DynamoDbError::ValidationException(format!(
-            "{operation} is not supported by the ExtendDB WebAssembly build: it has no filesystem."
+        DynamoDbError::ValidationException(extenddb_core::error::webassembly_unsupported_message(
+            operation,
+            "it has no filesystem",
         ))
     }
 }
