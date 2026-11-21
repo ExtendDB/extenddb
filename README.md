@@ -463,23 +463,24 @@ batch or transaction outside its item counts gets the count error, which its
 handler gives as well.
 
 The table gives, for each check, the requests it refuses and both answers. In
-an answer, `<name>`, `<arn>` and `<value>` stand for the value the request
-sent in the member the check reads (in **GetRecords iterator scope**, the ARN
-field of the iterator), and `<member>` for that member's location as the
-**table names** row writes it; the **accounts** row says what its
-`<principal>`, `<action>` and `<arn>` stand for. "The pattern" is
-`[a-zA-Z0-9_.-]+`. This build's answer is the one to a request that
-is otherwise well formed. The server makes these checks before the handler
-reads the rest of the body, so where the rest of the body is something the
-handler refuses, this build gives the handler's error for it instead (for
-example `SerializationException` "Start of structure or map found where not
-expected: missing field `Key`"), and an operation that ignores the member a
-check reads answers as it always does (`DescribeLimits` with any `TableName`
-answers its limits). A request for an operation this build refuses (see "What
-it refuses") gets that refusal. The parity corpus records each of this build's
-answers below in a case whose name starts with the check and a colon, except
-these: the refusals, which the cases listed under "What it refuses" record;
-the answer to an oversized body, which the unit test
+an answer, `<name>`, `<arn>` and `<value>` stand for the value the request sent
+in the member the check reads, and `<member>` for that member's location as the
+**table names** row writes it. Three rows read a placeholder from elsewhere:
+the `ListBackups` row of **table ARNs** takes `<name>` from the ARN's
+`table/<name>` resource, **GetRecords iterator scope** takes `<value>` from the
+iterator's ARN field, and **accounts** says what its `<principal>`, `<action>`
+and `<arn>` stand for. "The pattern" is `[a-zA-Z0-9_.-]+`. This build's answer
+is the one to a request that is otherwise well formed. The server makes these
+checks before the handler reads the rest of the body, so where the rest of the
+body is something the handler refuses, this build gives the handler's error for
+it instead (for example `SerializationException` "Start of structure or map
+found where not expected: missing field `Key`"), and an operation that ignores
+the member a check reads answers as it always does (`DescribeLimits` with any
+`TableName` answers its limits). A request for an operation this build refuses
+(see "What it refuses") gets that refusal. The parity corpus records each of
+this build's answers below in a case whose name starts with the check and a
+colon, except these: the refusals, which the cases listed under "What it
+refuses" record; the answer to an oversized body, which the unit test
 `a_list_tables_body_over_16_mib_is_answered` in
 `crates/wasm-adapter/src/runtime.rs` records, in native builds only (the
 `tests` module that holds it is not compiled for `wasm32`); and the signature
