@@ -899,12 +899,8 @@ impl SqliteEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
         ops.meta = Some(metas);
 
-        // UpdateTable vector-index creation spawns a detached backfill driven by
-        // the server's runtime. The browser build has no such runtime and the
-        // adapter refuses this operation before dispatch, so the spawn and its
-        // timer are compiled off wasm and the build returns an error here rather
-        // than spawn a task nothing would poll. This path is unreachable on wasm
-        // (the refusal comes first); the error is a non-panicking floor.
+        // Native only: the backfill is a detached `tokio::spawn` task timed by
+        // tokio's clock, and the wasm build has no tokio runtime or timer to run it.
         #[cfg(not(target_arch = "wasm32"))]
         {
             let batch_delay =

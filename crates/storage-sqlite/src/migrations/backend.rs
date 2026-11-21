@@ -205,6 +205,7 @@ impl SqliteMigrations {
     /// # Errors
     ///
     /// The location does not parse, or the database cannot be opened.
+    // Opens a database file, which the browser build does not have.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn open(location: &str) -> Result<Self, MigrationError> {
         Self::open_with(location, true).await
@@ -217,11 +218,13 @@ impl SqliteMigrations {
     /// # Errors
     ///
     /// As [`Self::open`].
+    // Opens a database file, which the browser build does not have.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn open_for_status(location: &str) -> Result<Self, MigrationError> {
         Self::open_with(location, false).await
     }
 
+    // Calls `super::open` and `super::copy`, which the browser build does not compile.
     #[cfg(not(target_arch = "wasm32"))]
     async fn open_with(location: &str, write: bool) -> Result<Self, MigrationError> {
         let file = crate::serve_lock::database_file(location).map_err(MigrationError::Store)?;
@@ -657,9 +660,9 @@ impl MigrationBackend for SqliteMigrations {
             // An empty database (init) holds nothing to keep.
             return Ok(Vec::new());
         }
-        // A file-backed migration copies the database first through SQLite's
-        // online-backup C API; the browser build opens no file (`self.file` is
-        // always `None` above) and takes no copy.
+        // Native only: `super::copy` calls SQLite's online-backup C API through
+        // `libsqlite3-sys`, which the wasm build does not link; there `self.file`
+        // is always `None`, so the arm below is never reached.
         #[cfg(not(target_arch = "wasm32"))]
         {
             let from = from.map_or_else(|| "legacy".to_owned(), |v| v.to_string());
