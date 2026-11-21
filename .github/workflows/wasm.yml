@@ -46,12 +46,12 @@ jobs:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 30
     env:
-      # core's crypto tests (src/crypto.rs) and the SQLite shim's tests/wasm_shim.rs are
-      # wasm-bindgen-test cases; they run under Node through the matching
-      # wasm-bindgen-test-runner (installed below, same version as the
-      # wasm-bindgen crate in Cargo.lock). The variable is read only when a
-      # wasm `cargo test` executes, so it does not affect the build or clippy
-      # steps.
+      # core's wasm tests (src/crypto.rs, src/limits/mod.rs) and the SQLite
+      # shim's tests/wasm_shim.rs are wasm-bindgen-test cases; they run under
+      # Node through the matching wasm-bindgen-test-runner (installed below,
+      # same version as the wasm-bindgen crate in Cargo.lock). The variable is
+      # read only when a wasm `cargo test` executes, so it does not affect the
+      # build or clippy steps.
       CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -140,20 +140,24 @@ jobs:
       - name: Clippy the adapter (pedantic) for wasm32
         run: cargo clippy --locked --no-deps -p extenddb-wasm-adapter --lib --target wasm32-unknown-unknown -- -D warnings -W clippy::pedantic
 
-      # core's wasm crypto backend (sha2/hmac/subtle/aes-gcm/getrandom) runs in
-      # no native test; this runs its known-vector and seal/open cases on
-      # wasm32 under Node.
-      - name: Crypto wasm tests under Node
+      # extenddb-core's wasm32 unit tests, under Node: the cases of its wasm
+      # crypto backend (sha2/hmac/subtle/aes-gcm/getrandom), which runs in no
+      # native test (known vectors, constant-time equality, random fill, and
+      # seal/open round trips, refusals and sealed vectors), and the test of
+      # limits::page_size, which on wasm32 runs with a 32-bit usize.
+      - name: Core wasm tests under Node
         run: cargo test --locked -p extenddb-core --lib --target wasm32-unknown-unknown
 
       # The synchronous SQLite shim is the wasm backend. tests/wasm_shim.rs
       # holds one table with a row per shim rule (decoding, binding,
       # multi-statement SQL, fetch, transactions, the pool, the one location
-      # it opens, connection settings) and two tests of the backend whose
-      # answer depends on the target (an UpdateTable that creates a vector
-      # index, a Scan whose Limit is above u32::MAX), run on wasm32 under
-      # Node. The same tests run natively against sqlx in the workspace
-      # `cargo test`, which checks their expected outcomes.
+      # it opens, connection settings) and two tests that drive the backend
+      # with requests whose handling depends on the target: an UpdateTable
+      # that creates a vector index, with an expected answer per target, and a
+      # Scan whose Limit is above u32::MAX, which expects the same answer on
+      # both. This step runs them on wasm32 under Node; the same tests run
+      # natively against sqlx in the workspace `cargo test`, which checks
+      # their expected outcomes.
       - name: SQLite shim wasm tests under Node
         run: cargo test --locked -p extenddb-storage-sqlite --test wasm_shim --target wasm32-unknown-unknown
 

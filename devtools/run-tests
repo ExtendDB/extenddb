@@ -132,8 +132,9 @@ Suites (at least one required):
                     workflow runs it: it skips wasm-opt and downloads
                     nothing), but no server/creds. Writes
                     discussions/test-headless-<hash>.txt
-  --wasm-test       run the on-target wasm-bindgen-test suites (core's crypto
-                    backend and the SQLite shim) on wasm32 under Node. Standalone
+  --wasm-test       run the on-target wasm-bindgen-test suites (extenddb-core's,
+                    for its crypto backend and limits::page_size, and the
+                    SQLite shim's) on wasm32 under Node. Standalone
                     like --wasm; needs Node and wasm-bindgen-test-runner
                     (matching the wasm-bindgen crate in Cargo.lock) but no
                     server/creds. Writes discussions/test-wasm-bindgen-<hash>.txt
@@ -643,9 +644,10 @@ fi
 # core's wasm crypto backend (sha2/hmac/subtle/aes-gcm/getrandom) and the
 # synchronous SQLite shim run in no native test — they exist only on wasm32.
 # Their behavior is pinned by wasm-bindgen-test cases that execute on wasm32
-# under Node, the same two suites the WebAssembly CI workflow runs. Standalone
-# like --wasm: no server, target flag or credentials. Placed after PASS=true so
-# a failure here is not later reset.
+# under Node, the same two suites the WebAssembly CI workflow runs; core's
+# also runs the test of limits::page_size, which on wasm32 runs with a 32-bit
+# usize. Standalone like --wasm: no server, target flag or credentials. Placed
+# after PASS=true so a failure here is not later reset.
 #
 # wasm-bindgen-test drives the compiled test module through
 # wasm-bindgen-test-runner, which must match the wasm-bindgen crate in
@@ -665,7 +667,7 @@ if $RUN_WASM_TEST; then
     {
         echo "WebAssembly on-target wasm-bindgen-test suites"
         echo "target:    wasm32-unknown-unknown (in-memory SQLite in the browser) via Node"
-        echo "suites:    extenddb-core crypto (--lib), extenddb-storage-sqlite shim (--test wasm_shim)"
+        echo "suites:    extenddb-core (--lib: the crypto backend, limits::page_size), extenddb-storage-sqlite (--test wasm_shim: the shim)"
         echo "commit:    ${HASH}"
         echo "date:      $(date -u +%Y-%m-%dT%H:%M:%SZ)"
         echo "toolchain: ${WASM_TOOLCHAIN_NOTE}"
