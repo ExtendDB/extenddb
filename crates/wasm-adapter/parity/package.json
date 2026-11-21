@@ -1,5 +1,0 @@
-{
-  "private": true,
-  "type": "module",
-  "description": "Marks run.mjs and the generated pkg/ as ES modules for Node; no build step, no dependencies."
-}
