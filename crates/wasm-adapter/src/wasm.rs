@@ -69,13 +69,21 @@ impl ExtendDb {
     /// replaces an unpaired surrogate with U+FFFD.
     ///
     /// Call `submit` only on an object that [`ExtendDb::create`] returned and
-    /// that has not been freed. The generated JavaScript passes the receiver's
-    /// `__wbg_ptr` to the module, which checks only that it is not null, so a
-    /// call on anything else is undefined: it can throw (an instance after
-    /// `free()`, and an object made with `new ExtendDb()`, throw `Error: null
-    /// pointer passed to rust`), trap, or read another instance's memory (an
-    /// object that carries a live instance's `__wbg_ptr` answers from that
-    /// instance's database).
+    /// that has not been freed. The generated JavaScript passes the
+    /// `__wbg_ptr` property of the object `submit` is called on to the module
+    /// as the address of an instance. wasm-bindgen's conversion of that
+    /// receiver (`borrow_rust_object` in its runtime) refuses a null address
+    /// and an address whose borrow flag reads as mutably borrowed, and takes
+    /// the memory at any other address to be an instance. So a call on any
+    /// other object is undefined. It can throw from `submit` itself: an
+    /// instance after `free()`, an object made with `new ExtendDb()` and an
+    /// object with no `__wbg_ptr` throw `Error: null pointer passed to rust`,
+    /// and an address whose flag reads as mutably borrowed throws
+    /// `Error: recursive use of an object detected which would lead to unsafe aliasing in rust`.
+    /// It can trap: an address past the end of linear memory throws
+    /// `RuntimeError: memory access out of bounds`. Or it can answer from
+    /// another instance: an object that carries a live instance's `__wbg_ptr`,
+    /// such as `{...db}`, answers from that instance's database.
     ///
     /// On an instance, a trap before `submit` returns its promise throws out of
     /// `submit` itself. When the module cannot allocate the copy of an argument

@@ -317,10 +317,14 @@ to crates.io.
   aborts, which traps the module. After the first write fails this way, a read
   can trap too: in a test that filled a table to the limit, a `Scan` with
   `Select` `COUNT` over the table did. Deleting data before any request has
-  trapped frees space, and the instance then keeps serving writes. After a trap
-  the instance is in an undefined state (see the `submit` documentation in
-  `crates/wasm-adapter/src/wasm.rs`), and the page must be reloaded to load a
-  fresh module instance.
+  trapped frees space, and the instance then keeps serving writes. What a trap
+  leaves behind is in the next item.
+- **No recovery from a trap.** On `wasm32` a panic cannot unwind, so it
+  traps. A trap leaves the instance in an undefined state (a later call may
+  answer, fail or hang), so reload the page to get a fresh module instance.
+  The calling contract of `submit` (which objects it may be called on, and how
+  it delivers errors and traps to the caller) is in its documentation,
+  `ExtendDb::submit` in `crates/wasm-adapter/src/wasm.rs`.
 - **No background tasks.** The build runs no background workers, so: an item
   past its time-to-live is still returned (TTL never deletes it); `ItemCount`
   and `TableSizeBytes` stay `0`; and stream records are never trimmed.
@@ -396,25 +400,6 @@ every `RestoreTableToPointInTime` (`PointInTimeRecoveryUnavailableException`)
 and an `UpdateContinuousBackups` that enables point-in-time recovery
 (`ContinuousBackupsUnavailableException`) before any table is read, so a
 request naming a missing table gets the refusal too.
-
-On `wasm32` a panic cannot unwind: it traps, and the `submit` promise of the
-request that panicked stays pending. The instance is then in an undefined
-state (a later call may answer, fail or hang), so reload the page to get a
-fresh one.
-
-Call `submit` only on an object that `ExtendDb.create()` returned and that has
-not been freed. On such an instance a `submit` promise never rejects: it
-resolves with the response to every request that does not trap, including the
-`ValidationException` for an argument that is not a string. A trap before
-`submit` returns its promise throws out of `submit` itself: when the module
-cannot allocate the copy of an argument in its linear memory, a release build
-traps there, and the call throws `RuntimeError: unreachable`. The generated
-JavaScript passes the receiver's `__wbg_ptr` to the module, which checks only
-that it is not null, so a call on anything else is undefined: it can throw (an
-instance after `free()`, and an object made with `new ExtendDb()`, throw
-`Error: null pointer passed to rust`), trap, or read another instance's memory
-(an object that carries a live instance's `__wbg_ptr`, such as `{...db}`,
-answers from that instance's database).
 
 ### Checks the server makes that this build does not
 
