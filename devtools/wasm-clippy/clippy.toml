@@ -40,6 +40,16 @@
 # std::env::current_dir, and std::thread::Builder::spawn and spawn_scoped each
 # return an Err there, which the caller has to handle.
 #
+# A std Mutex or RwLock guard, or a RefCell borrow, held across an .await
+# traps on wasm32-unknown-unknown when another task takes a conflicting lock
+# or borrow of the same value before the first lets go, as every task runs on
+# the one thread there: std's Mutex panics ("cannot recursively acquire
+# mutex"), its RwLock aborts, and the RefCell panics. No single call causes
+# that, so no list here names it. Clippy's await_holding_lock and
+# await_holding_refcell_ref lints report it; they warn by default, so -D
+# warnings makes them errors in the clippy step. They report a guard or a
+# borrow held as itself, not one held inside another value such as an Option.
+#
 # A call that compiles for wasm but is never reached there carries
 # `#[allow(clippy::disallowed_methods, reason = "...")]` (for a type,
 # `clippy::disallowed_types`), on its function or, when the rest of the
@@ -50,10 +60,16 @@
 # -D warnings does not turn into an error. devtools/check-wasm-clippy-guard,
 # run by the workflow after the clippy step, fails if an entry has no probe in
 # that script, if clippy reports one as unresolved, or if the step accepts a
-# call to one. It also fails on a lint setting that switches the
-# disallowed-methods and disallowed-types lints off in a crate the wasm build
-# compiles: allowing clippy::all, clippy::style or warnings, or allowing
-# clippy::disallowed_methods or clippy::disallowed_types without a reason.
+# call to one. It also fails on a lint setting (an allow or an expect) that
+# switches the clippy step's checks off in a crate the wasm build compiles:
+# one of clippy::all, clippy::style, clippy::suspicious or warnings; one of
+# clippy::disallowed_methods or clippy::disallowed_types without a reason, or
+# with one that is empty or only whitespace; or one of
+# clippy::await_holding_lock or clippy::await_holding_refcell_ref, with or
+# without a reason. It reads lint settings as they are written in the crates'
+# files: a setting that a macro builds from its input (for example
+# `#[$level(clippy::all)]` in a macro_rules! body), or that a procedural macro
+# emits, is not seen.
 
 disallowed-methods = [
     # Clock

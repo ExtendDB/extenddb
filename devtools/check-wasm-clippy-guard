@@ -8,24 +8,32 @@ The guard is the clippy step of the WebAssembly workflow, run with
 CLIPPY_CONF_DIR pointing at devtools/wasm-clippy, whose clippy.toml lists
 methods and types. A path there that does not resolve only makes clippy print
 a warning, and under -D warnings the step still exits 0 (clippy 0.1.97), so a
-misspelt entry would leave the step green with that call unguarded. Allowing
-clippy::all, clippy::style or warnings, or the two disallowed lints, switches
-the guard off for the code the setting covers, and the step again exits 0.
-This script fails, with one line per problem, unless all of these hold:
+misspelt entry would leave the step green with that call unguarded. The step
+also runs clippy's await_holding_lock and await_holding_refcell_ref lints,
+which warn by default and report a std Mutex or RwLock guard, or a RefCell
+borrow, held across an .await; on wasm32-unknown-unknown such code traps when
+another task takes a conflicting lock or borrow of the same value (std's Mutex
+panics with "cannot recursively acquire mutex"). Allowing clippy::all,
+clippy::style, clippy::suspicious or warnings, one of the two disallowed lints
+or one of those two lints switches the guard off for the code the setting
+covers, and the step again exits 0. This script fails, with one line per
+problem, unless all of these hold:
 
 1. clippy.toml holds only `disallowed-methods` and `disallowed-types`; each
    entry is a table with a `path` and a `reason` and nothing else; no path is
    listed twice; each entry has a probe below and each probe names an entry.
 2. In the crates the wasm build compiles (extenddb-wasm-adapter and the
    workspace crates it depends on for wasm32, read from `cargo metadata`), no
-   source file under src/ allows or expects clippy::all, clippy::style or
-   warnings, nor clippy::disallowed_methods or clippy::disallowed_types (or
-   their former names) without a `reason`. The one exception is a catalog
-   migration's code-body module: CONTRIBUTING.md ("Adding a catalog
-   migration") declares each one, in src/migrations/mod.rs, with
-   #[rustfmt::skip] and #[allow(clippy::all, deprecated)], because its body is
-   checksummed once released and no lint may ask for an edit. An allow of
-   clippy::all is accepted only in that exact form, on a `mod mNNNN_<name>;`
+   source file under src/ allows or expects clippy::all, clippy::style,
+   clippy::suspicious or warnings, nor clippy::await_holding_lock or
+   clippy::await_holding_refcell_ref with or without a reason, nor
+   clippy::disallowed_methods or clippy::disallowed_types (or their former
+   names) without a `reason` that holds more than whitespace. The one
+   exception is a catalog migration's code-body module: CONTRIBUTING.md
+   ("Adding a catalog migration") declares each one, in src/migrations/mod.rs,
+   with #[rustfmt::skip] and #[allow(clippy::all, deprecated)], because its
+   body is checksummed once released and no lint may ask for an edit. An allow
+   of clippy::all is accepted only in that exact form, on a `mod mNNNN_<name>;`
    line of a src/migrations/mod.rs whose src/migrations/mNNNN_<name>.rs
    exists; the guard does not see those bodies, and the headless parity
    corpus runs every migration when it creates an engine. The `[lints]` tables of those crates and the
@@ -34,6 +42,10 @@ This script fails, with one line per problem, unless all of these hold:
    SETTING_PROBES lists lint settings in each of these spellings (attribute,
    inner attribute, cfg_attr, `[lints]` table, rustflags); the functions that
    read the crates' files must refuse or accept each one as the list says.
+   Those functions read lint settings as they are written in the files and
+   expand no macro: a setting that a macro builds from its input (for example
+   `#[$level(clippy::all)]` in a macro_rules! body), or that a procedural
+   macro emits, is not seen.
 3. In a copy of the working tree (the files git tracks or does not ignore,
    uncommitted edits included), with every probe added to a source file of
    PROBE_CRATE, the clippy step of the workflow fails with clippy's
@@ -100,17 +112,24 @@ PROBE_MODULE = "wasm_clippy_guard_probes"
 MIGRATION_MODULE = re.compile(r"m[0-9]{4}_[a-z0-9_]+")
 MIGRATION_ALLOW = {"clippy::all", "deprecated"}
 # Allowing one of these turns the guard off: clippy::all and clippy::style
-# contain disallowed_methods and disallowed_types, and warnings covers every
-# lint at the warn level, where both sit.
-BLANKET = {"clippy::all", "clippy::style", "warnings"}
-# These may be allowed only with a reason. The last two are the lints' former
-# names, which rustc still applies to them.
+# contain disallowed_methods and disallowed_types, clippy::all and
+# clippy::suspicious contain await_holding_lock and await_holding_refcell_ref,
+# and warnings covers every lint at the warn level, where all four sit.
+BLANKET = {"clippy::all", "clippy::style", "clippy::suspicious", "warnings"}
+# These may be allowed only with a reason that is not empty or whitespace. The
+# last two are the lints' former names, which rustc still applies to them.
 NEED_REASON = {
     "clippy::disallowed_methods",
     "clippy::disallowed_types",
     "clippy::disallowed_method",
     "clippy::disallowed_type",
 }
+# These may not be allowed or expected at all. They report a std Mutex or
+# RwLock guard, or a RefCell borrow, held across an .await, which traps on
+# wasm32-unknown-unknown when another task takes a conflicting lock or borrow
+# of the same value: every task runs on the one thread there, std's Mutex and
+# RwLock then panic or abort, and so does the RefCell.
+NEVER = {"clippy::await_holding_lock", "clippy::await_holding_refcell_ref"}
 CONFIG_WARNINGS = (
     "does not refer to a reachable",
     "expected a function, found",
@@ -538,20 +557,21 @@ def attribute_problems(rel: str, text: str, used_migration: set) -> tuple[list[s
         line = code.count("\n", 0, attribute.start()) + 1
         for lint_list in _LINT_LIST.finditer(body):
             close = _closing(body, lint_list.end() - 1, "(", ")")
-            items, depth, item = [], 0, ""
-            for char in body[lint_list.end() : close - 1]:
-                if char in "([{":
+            # The items of the list, as (start, end) offsets into `code`.
+            items, depth, start = [], 0, lint_list.end()
+            for index in range(lint_list.end(), close - 1):
+                if body[index] in "([{":
                     depth += 1
-                elif char in ")]}":
+                elif body[index] in ")]}":
                     depth -= 1
-                if char == "," and depth == 0:
-                    items.append(item)
-                    item = ""
-                else:
-                    item += char
-            items.append(item)
-            names = {re.sub(r"\s", "", i) for i in items} - {""}
-            has_reason = any(name.startswith("reason=") for name in names)
+                elif body[index] == "," and depth == 0:
+                    items.append((attribute.start() + start, attribute.start() + index))
+                    start = index + 1
+            items.append((attribute.start() + start, attribute.start() + close - 1))
+            names = {re.sub(r"\s", "", code[a:b]) for a, b in items} - {""}
+            reasons = [reason_value(text, code, a, b) for a, b in items]
+            reasons = [r for r in reasons if r is not None]
+            has_reason = any(r.strip() for r in reasons)
             level = lint_list.group(1)
             blanket = sorted(names & BLANKET)
             if blanket:
@@ -565,15 +585,63 @@ def attribute_problems(rel: str, text: str, used_migration: set) -> tuple[list[s
                         " migration's code-body module, declared as CONTRIBUTING.md"
                         " prescribes, may allow clippy::all)"
                     )
+            never = sorted(names & NEVER)
+            if never:
+                problems.append(
+                    f"{rel}:{line}: {level}({', '.join(never)}) switches off the lint that"
+                    " reports a std lock guard or a RefCell borrow held across an .await,"
+                    " which traps on wasm32 when another task takes it; hold none across an"
+                    " .await (no reason makes this setting acceptable)"
+                )
             unreasoned = sorted(names & NEED_REASON)
             if unreasoned and not has_reason:
+                empty = " is empty or only whitespace" if reasons else " is missing"
                 problems.append(
-                    f"{rel}:{line}: {level}({', '.join(unreasoned)}) has no `reason = \"...\"`"
-                    " naming the callers and why none runs on wasm"
+                    f"{rel}:{line}: {level}({', '.join(unreasoned)}): its `reason = \"...\"`"
+                    f"{empty}; it must name the callers and why none runs on wasm"
                 )
             elif unreasoned:
                 reasoned += 1
     return problems, reasoned
+
+
+_REASON = re.compile(r'\s*reason\s*=\s*(?:(r)(#*))?"')
+_ESCAPE = re.compile(r"\\(?:x([0-9A-Fa-f]{2})|u\{([0-9A-Fa-f_]{1,8})\}|\n[ \t\r\n]*|(.))", re.S)
+_SIMPLE_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\", "0": "\0", "'": "'", '"': '"'}
+
+
+def reason_value(text: str, code: str, start: int, end: int) -> str | None:
+    """The text of the string literal in a `reason = "..."` item of a lint list,
+    the item being code[start:end], or None when the item is not one. `code` is
+    `text` with comments and literal contents blanked, so the literal's quotes
+    are found in `code` and its contents read from `text`; escapes are decoded,
+    a raw string's contents are taken as written."""
+    match = _REASON.match(code, start, end)
+    if not match:
+        return None
+    raw, hashes = match.group(1), match.group(2) or ""
+    close = code.find('"' + hashes if raw else '"', match.end(), end)
+    if close < 0:
+        return None
+    contents = text[match.end() : close]
+    return contents if raw else _ESCAPE.sub(_unescape, contents)
+
+
+def _unescape(escape: re.Match) -> str:
+    """The character one escape of a Rust string literal stands for; a line
+    continuation (a backslash at the end of a line, and the next line's
+    indentation) stands for nothing."""
+    hex_byte, code_point, simple = escape.groups()
+    try:
+        if hex_byte:
+            return chr(int(hex_byte, 16))
+        if code_point:
+            return chr(int(code_point.replace("_", ""), 16))
+    except ValueError:  # not a character; rustc refuses the literal
+        return escape.group()
+    if simple is not None:
+        return _SIMPLE_ESCAPES.get(simple, escape.group())
+    return ""
 
 
 def is_migration_module(
@@ -617,7 +685,7 @@ def lint_table_problems(manifest: str, table: dict) -> list[str]:
         for name, setting in lints.items():
             level = setting.get("level") if isinstance(setting, dict) else setting
             lint = name if tool == "rust" else f"{tool}::{name}"
-            if level in ("allow", "expect") and lint in BLANKET | NEED_REASON:
+            if level in ("allow", "expect") and lint in BLANKET | NEED_REASON | NEVER:
                 problems.append(
                     f"{manifest}: [lints] sets {lint} to {level!r},"
                     " which switches the wasm clippy guard off"

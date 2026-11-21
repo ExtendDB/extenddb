@@ -111,13 +111,16 @@ jobs:
       # Lints the adapter and every workspace crate it compiles for wasm32
       # (without --no-deps, clippy lints each workspace dependency too), with
       # the lists in devtools/wasm-clippy/clippy.toml, which name the calls
-      # known to trap or hang when they run on wasm32. It sees workspace code
-      # only: a call a dependency makes in its own code is not seen (the
-      # file's header names the known case), nor is a call the lists do not
-      # name. The headless parity corpus below is the runtime check.
-      # CLIPPY_CONF_DIR is set on this step only, so native clippy keeps the
-      # repository's defaults. --lib keeps the host-only integration tests out
-      # of the wasm build.
+      # known to trap or hang when they run on wasm32. -D warnings also makes
+      # errors of clippy's await_holding_lock and await_holding_refcell_ref,
+      # which report a std lock guard or a RefCell borrow held across an
+      # .await (that file's header says why that traps on wasm32). It sees
+      # workspace code only: a call a dependency makes in its own code is not
+      # seen (the file's header names the known case), nor is a call the
+      # lists do not name. The headless parity corpus below is the runtime
+      # check. CLIPPY_CONF_DIR is set on this step only, so native clippy
+      # keeps the repository's defaults. --lib keeps the host-only
+      # integration tests out of the wasm build.
       - name: Clippy the wasm32 build
         env:
           CLIPPY_CONF_DIR: ${{ github.workspace }}/devtools/wasm-clippy
@@ -126,12 +129,15 @@ jobs:
       # Reads clippy.toml and fails if an entry has no probe in the script or
       # does not resolve, or if the step above accepts a call to one, made
       # directly or through an import; the probes go into a copy of the
-      # checkout. It also fails if a crate the wasm build compiles allows
-      # clippy::all, clippy::style or warnings (except on the `mod` line of a
-      # catalog migration's code-body module, which CONTRIBUTING.md declares
-      # that way), or the disallowed lints without a reason. Needs Python
-      # 3.11 or later (tomllib), as devtools/check-crate-packages does in
-      # test.yml's package job, which runs on the same runner.
+      # checkout. It also fails if a crate the wasm build compiles allows or
+      # expects clippy::all, clippy::style, clippy::suspicious or warnings
+      # (except on the `mod` line of a catalog migration's code-body module,
+      # which CONTRIBUTING.md declares that way), the disallowed lints without
+      # a reason or with an empty or whitespace-only one, or
+      # await_holding_lock or await_holding_refcell_ref at all, and if its own
+      # probes of those lint settings are not refused or accepted as it lists.
+      # Needs Python 3.11 or later (tomllib), as devtools/check-crate-packages
+      # does in test.yml's package job, which runs on the same runner.
       - name: Self-test the wasm32 clippy guard
         run: python3 devtools/check-wasm-clippy-guard
 
