@@ -15,6 +15,7 @@ import uuid
 
 import boto3
 import botocore.config
+from botocore.exceptions import ClientError
 
 
 def make_dynamodb_client(endpoint_url: str | None):
@@ -66,6 +67,19 @@ def wait_for_deleted(client, table_name: str, timeout: float = 60.0) -> None:
         time.sleep(max(0, min(delay, deadline - time.monotonic())))
         delay = min(delay * 2, 2.0)
     raise TimeoutError(f"Table {table_name} was not deleted within {timeout}s")
+
+
+def list_streams(client, **params):
+    """ListStreams, sent again after a ThrottlingException (the service's rate
+    for this operation is low)."""
+    for attempt in range(5):
+        try:
+            return client.list_streams(**params)
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ThrottlingException" or attempt == 4:
+                raise
+            time.sleep(2 * (attempt + 1))
+    raise AssertionError("unreachable")
 
 
 def unique_name(prefix: str = "test") -> str:

@@ -24,14 +24,13 @@ item operations, the transaction members and `BatchGetItem` refuse it as a
 validation error after the shape, vendor, region and table segment checks.
 """
 
-import time
-
 import pytest
 from botocore.exceptions import ClientError
 
 from helpers import (
     PITR_REFUSAL,
     assert_validation,
+    list_streams,
     unique_name,
     wait_for_active,
     wait_for_deleted,
@@ -530,19 +529,6 @@ class TestArnCheckOrder:
         assert exc.response["ResponseMetadata"]["HTTPStatusCode"] == 400
 
 
-def _list_streams(client, **params):
-    """ListStreams, sent again after a ThrottlingException (the service's rate
-    for this operation is low)."""
-    for attempt in range(5):
-        try:
-            return client.list_streams(**params)
-        except ClientError as e:
-            if e.response["Error"]["Code"] != "ThrottlingException" or attempt == 4:
-                raise
-            time.sleep(2 * (attempt + 1))
-    raise AssertionError("unreachable")
-
-
 class TestListStreamsExclusiveStartStreamArn:
     """Storage reads the start ARN's table segment and label. U+0000 in either
     answered 500 `Internal server error` on PostgreSQL."""
@@ -557,7 +543,7 @@ class TestListStreamsExclusiveStartStreamArn:
         ]:
             for extra in [{}, {"TableName": caller["name"]}]:
                 with pytest.raises(ClientError) as exc:
-                    _list_streams(raw_streams_client, ExclusiveStartStreamArn=start, **extra)
+                    list_streams(raw_streams_client, ExclusiveStartStreamArn=start, **extra)
                 assert_validation(exc.value, "Invalid StreamArn")
 
     def test_nul_in_the_account_or_region_is_accepted(self, raw_streams_client, caller):
@@ -566,7 +552,7 @@ class TestListStreamsExclusiveStartStreamArn:
             f"{_table_arn(caller, caller['account'], table=caller['name'], region='us-ea' + NUL + 'st-1')}"
             f"/stream/{LABEL}",
         ]:
-            resp = _list_streams(raw_streams_client, ExclusiveStartStreamArn=start, Limit=1)
+            resp = list_streams(raw_streams_client, ExclusiveStartStreamArn=start, Limit=1)
             assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
             assert "Streams" in resp
 
@@ -587,15 +573,15 @@ class TestListStreamsTableName:
                 {"ExclusiveStartStreamArn": start, "TableName": name},
             ]:
                 with pytest.raises(ClientError) as exc:
-                    _list_streams(raw_streams_client, **params)
+                    list_streams(raw_streams_client, **params)
                 assert_validation(exc.value, LIST_STREAMS_NAME)
 
     def test_table_name_length(self, raw_streams_client):
         for name in ["a", "ab", "a" * 256]:
             with pytest.raises(ClientError) as exc:
-                _list_streams(raw_streams_client, TableName=name)
+                list_streams(raw_streams_client, TableName=name)
             assert_validation(exc.value, LIST_STREAMS_NAME)
         for name in ["abc", "a" * 255]:
-            resp = _list_streams(raw_streams_client, TableName=name)
+            resp = list_streams(raw_streams_client, TableName=name)
             assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
             assert resp["Streams"] == []
