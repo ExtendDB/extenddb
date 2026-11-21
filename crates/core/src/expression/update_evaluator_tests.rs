@@ -6,6 +6,7 @@ use crate::expression::resolver::ExpressionMaps;
 use crate::expression::tokenizer::tokenize;
 use crate::expression::update_parser::parse_update;
 use crate::types::{Projection, ProjectionType};
+use serde_json::json;
 use std::collections::HashMap;
 
 fn apply(
@@ -556,6 +557,46 @@ fn list_append_function() {
         assert_eq!(l[1], AttributeValue::S("b".into()));
     } else {
         panic!("Expected L");
+    }
+}
+
+/// `s` is a string, `n` a number, `k` a list, `m` a map without `q`, and `z`
+/// is absent. The last row runs on a key that holds no item.
+#[test]
+fn the_first_operand_that_fails_is_reported() {
+    const TYPE: &str = "An operand in the update expression has an incorrect data type";
+    const ABSENT: &str =
+        "The provided expression refers to an attribute that does not exist in the item";
+    let stored: BTreeMap<String, AttributeValue> = serde_json::from_value(json!({
+        "pk": {"S": "em-upd-operand"},
+        "n": {"N": "10"},
+        "k": {"L": [{"N": "4"}, {"N": "5"}]},
+        "m": {"M": {"x": {"N": "1"}}},
+        "s": {"S": "str"},
+    }))
+    .unwrap();
+    let key = BTreeMap::from([("pk".to_owned(), stored["pk"].clone())]);
+    let values: HashMap<String, AttributeValue> =
+        serde_json::from_value(json!({"v": {"N": "2"}, "l": {"L": [{"S": "x"}]}})).unwrap();
+    for (expression, item, expected) in [
+        ("SET a = s + z", &stored, TYPE),
+        ("SET l = list_append(s, z)", &stored, TYPE),
+        ("SET a = z + s", &stored, ABSENT),
+        ("SET a = s + :v", &stored, TYPE),
+        ("SET l = list_append(s, :l)", &stored, TYPE),
+        ("SET a = s - z", &stored, TYPE),
+        ("SET a = n + z", &stored, ABSENT),
+        ("SET a = s + m.q", &stored, TYPE),
+        ("SET l = list_append(k, z)", &stored, ABSENT),
+        ("SET a = s + z", &key, ABSENT),
+    ] {
+        let mut updated = item.clone();
+        let result = apply(expression, &mut updated, HashMap::new(), values.clone());
+        assert!(
+            matches!(&result, Err(DynamoDbError::ValidationException(m)) if m == expected),
+            "`{expression}`: {result:?}"
+        );
+        assert_eq!(&updated, item, "`{expression}`");
     }
 }
 
