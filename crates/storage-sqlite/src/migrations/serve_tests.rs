@@ -36,7 +36,8 @@ async fn start(path: &str, dev: bool) -> Result<ServerComponents, BackendError> 
         path: path.to_owned(),
         pool_size: 2,
     };
-    crate::sqlite_server_components_factory(&config, "us-east-1", options(dev)).await
+    crate::server_backend::sqlite_server_components_factory(&config, "us-east-1", options(dev))
+        .await
 }
 
 /// The refusal a factory returned, with its exit code.
@@ -329,7 +330,9 @@ async fn an_in_memory_server_refuses_a_key_file() {
     };
     let mut options = options(false);
     options.key_source = KeySource::Kek(zeroize::Zeroizing::new([3; 32]).into());
-    match crate::sqlite_server_components_factory(&config, "us-east-1", options).await {
+    match crate::server_backend::sqlite_server_components_factory(&config, "us-east-1", options)
+        .await
+    {
         Err(BackendError::InitializationFailed(message)) => {
             assert!(message.contains("in-memory"), "{message}");
         }
@@ -377,7 +380,8 @@ async fn a_server_loads_the_dek_of_a_switched_catalog_with_its_kek() {
             };
             let mut options = options(false);
             options.key_source = key_source;
-            crate::sqlite_server_components_factory(&config, "us-east-1", options).await
+            crate::server_backend::sqlite_server_components_factory(&config, "us-east-1", options)
+                .await
         }
     };
     let kek = |bytes: [u8; 32]| KeySource::Kek(zeroize::Zeroizing::new(bytes).into());
