@@ -34,6 +34,8 @@ pub use key_condition::{
 };
 pub use kind::ExpressionKind;
 pub use parser::{parse_condition, parse_condition_with_depth_limit};
+pub use parser_common::is_list_index_refusal;
+pub(crate) use parser_common::list_index_range_refusal;
 pub use projection::{Projection, parse_projection};
 pub use reserved_words::validate_no_reserved_words;
 pub use resolver::{

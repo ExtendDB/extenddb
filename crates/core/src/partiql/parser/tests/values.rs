@@ -422,6 +422,11 @@ fn other_contents_of_brackets_are_refused() {
             "List index is not within the allowable range; index: [-1] at 1:41:1".to_owned(),
         ),
         (
+            "m[2147483648] = 1",
+            "List index is not within the allowable range; index: [2147483648] at 1:40:10"
+                .to_owned(),
+        ),
+        (
             "m[-1.5] = 1",
             "Unexpected path component at 1:41:3".to_owned(),
         ),

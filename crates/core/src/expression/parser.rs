@@ -55,6 +55,7 @@ pub fn parse_condition_with_depth_limit(
             "Invalid ConditionExpression: unexpected token at position {pos}"
         )));
     }
+    parser_common::check_list_indexes(tokens)?;
     Ok(expr)
 }
 

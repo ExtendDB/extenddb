@@ -8,8 +8,9 @@ use std::collections::HashMap;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
     Expr, ExpressionKind, ExpressionMaps, KeyCondition, PathElement, Token, UpdateAction,
-    parse_condition_with_depth_limit, parse_key_condition, parse_projection, parse_update_from,
-    tokenize_for, tokenize_with_limit, validate_no_reserved_words, validate_ordering_operand_types,
+    is_list_index_refusal, parse_condition_with_depth_limit, parse_key_condition, parse_projection,
+    parse_update_from, tokenize_for, tokenize_with_limit, validate_no_reserved_words,
+    validate_ordering_operand_types,
 };
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{AttributeValue, ConditionalOperator, ExpectedAttributeValue};
@@ -201,7 +202,8 @@ pub fn resolve_condition(
     }
 
     let maps = build_expression_maps(names, values);
-    let condition = parse_optional_condition(condition_expression, limits)?;
+    let condition =
+        parse_optional_condition(condition_expression, limits).map_err(count_list_index_refusal)?;
     if let Some(ref expr) = condition {
         validate_ordering_operand_types(expr, &maps)
             .map_err(|e| prefix_expression_error(e, ExpressionKind::Condition))?;
@@ -280,6 +282,22 @@ pub fn prefix_expression_error(err: DynamoDbError, kind: ExpressionKind) -> Dyna
             } else {
                 DynamoDbError::ValidationException(format!("Invalid {kind}: {msg}"))
             }
+        }
+        other => other,
+    }
+}
+
+/// The `1 validation error detected: ` UpdateItem, PutItem and DeleteItem put
+/// ahead of a refused list index in an update or condition expression.
+/// TransactWriteItems does not (measured 2026-11-17).
+pub fn count_list_index_refusal(err: DynamoDbError) -> DynamoDbError {
+    match err {
+        DynamoDbError::ValidationException(msg)
+            if msg
+                .split_once(": ")
+                .is_some_and(|(_, body)| is_list_index_refusal(body)) =>
+        {
+            DynamoDbError::ValidationException(format!("1 validation error detected: {msg}"))
         }
         other => other,
     }
@@ -506,5 +524,53 @@ mod tests {
                 if msg == "Invalid FilterExpression: expression nesting depth exceeded"),
             "got {err:?}"
         );
+    }
+
+    /// A refused list index, in Amazon DynamoDB's words (measured 2026-11-17):
+    /// the parse functions label it with the expression, and the single-item
+    /// writes count it (see [`count_list_index_refusal`]). TransactWriteItems
+    /// parses through `parse_update_expr` and gets no count.
+    #[test]
+    fn a_refused_list_index_is_counted_where_a_single_item_write_parses() {
+        let limits = LimitsConfig::default();
+        let count = "1 validation error detected: ";
+        for (index, refusal) in [
+            (
+                "2147483648",
+                "List index is not within the allowable range; index: [2147483648]",
+            ),
+            ("01", "Syntax error; token: \"1\", near: \"01]\""),
+        ] {
+            let path = format!("l[{index}]");
+            let condition = format!("{path} = :v");
+            let update = format!("SET {path} = :v");
+            let rows = [
+                (
+                    parse_update_expr(&update, &limits).err(),
+                    format!("Invalid UpdateExpression: {refusal}"),
+                ),
+                (
+                    resolve_condition(Some(&condition), None, None, None, None, &limits).err(),
+                    format!("{count}Invalid ConditionExpression: {refusal}"),
+                ),
+                (
+                    parse_update_expr(&update, &limits)
+                        .map_err(count_list_index_refusal)
+                        .err(),
+                    format!("{count}Invalid UpdateExpression: {refusal}"),
+                ),
+            ];
+            for (err, expected) in rows {
+                assert!(
+                    matches!(&err, Some(DynamoDbError::ValidationException(m)) if *m == expected),
+                    "got {err:?}, expected {expected}"
+                );
+            }
+        }
+        let other = DynamoDbError::ValidationException(CONDITION_REDUNDANT.to_owned());
+        assert!(matches!(
+            count_list_index_refusal(other),
+            DynamoDbError::ValidationException(m) if m == CONDITION_REDUNDANT
+        ));
     }
 }

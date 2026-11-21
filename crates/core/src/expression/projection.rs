@@ -36,6 +36,7 @@ pub fn parse_projection(tokens: &[Token]) -> Result<Vec<Vec<PathElement>>, Dynam
         pos += 1;
         paths.push(super::parser_common::parse_path(tokens, &mut pos)?);
     }
+    super::parser_common::check_list_indexes(tokens)?;
     Ok(paths)
 }
 
