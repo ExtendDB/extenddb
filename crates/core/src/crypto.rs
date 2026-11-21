@@ -183,6 +183,16 @@ mod imp {
     use sha2::{Digest, Sha256};
     use zeroize::Zeroizing;
 
+    // aes wipes the AES-256 round keys when the cipher drops only under its
+    // `zeroize` feature, which also marks the cipher `ZeroizeOnDrop` (aes 0.8.4
+    // src/soft.rs, the backend wasm32 compiles). Requiring that marker of the
+    // block cipher inside `Aes256Gcm` makes this build fail when the feature
+    // is off; core's manifest turns it on.
+    const _: () = {
+        const fn wiped_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        wiped_on_drop::<aes_gcm::aes::Aes256>();
+    };
+
     pub(super) fn sha256(data: &[u8]) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(data);
