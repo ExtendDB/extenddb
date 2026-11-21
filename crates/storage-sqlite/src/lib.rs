@@ -51,10 +51,12 @@ pub mod wasm_sqlx_for_tests {
 /// `try_get`, so a new or renamed column changes one place.
 ///
 /// Every field decodes from the column with the field's own name, which is the
-/// derive's default mapping. A `#[sqlx(...)]` attribute, on the struct (such as
-/// `rename_all`) or on a field (such as `rename`, `default` or `flatten`),
-/// would change that on native only, so the macro refuses one with a compile
-/// error, including one inside a `#[cfg_attr(...)]` at any depth.
+/// derive's default mapping; as the derive does, the `r#` of a raw identifier
+/// is not part of the name, so `r#type` reads the column `type`. A
+/// `#[sqlx(...)]` attribute, on the struct (such as `rename_all`) or on a field
+/// (such as `rename`, `default` or `flatten`), would change that on native
+/// only, so the macro refuses one with a compile error, including one inside a
+/// `#[cfg_attr(...)]` at any depth.
 ///
 /// Exported, and hidden from the documentation, only so that the crate's
 /// `tests/wasm_shim.rs` declares its row structs with this macro on both
@@ -82,7 +84,10 @@ macro_rules! sqlite_row_struct {
         impl sqlx::FromRow for $name {
             fn from_row(row: &sqlx::Row) -> ::core::result::Result<Self, sqlx::Error> {
                 ::core::result::Result::Ok(Self {
-                    $( $field: sqlx::Row::try_get(row, stringify!($field))? ),*
+                    $( $field: sqlx::Row::try_get(
+                        row,
+                        stringify!($field).trim_start_matches("r#"),
+                    )? ),*
                 })
             }
         }

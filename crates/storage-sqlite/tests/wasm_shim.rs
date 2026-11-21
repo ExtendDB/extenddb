@@ -259,6 +259,13 @@ extenddb_storage_sqlite::sqlite_row_struct! {
     }
 }
 
+extenddb_storage_sqlite::sqlite_row_struct! {
+    /// A text column named `type`, a Rust keyword, held in a raw identifier.
+    struct Keyword {
+        r#type: String,
+    }
+}
+
 fn cases() -> Vec<Case> {
     let i32_overflow = i32::try_from(1_099_511_627_776_i64)
         .map(|_| ())
@@ -368,6 +375,16 @@ fn cases() -> Vec<Case> {
                     .fetch_one(&pool)
                     .await
                     .map(|row| row.x)
+            )
+        ),
+        row!(
+            "a raw identifier field reads the column of its name without r#",
+            "Ok(\"k\")",
+            |pool| render(
+                sqlx::query_as::<_, Keyword>("SELECT 'k' AS \"type\"")
+                    .fetch_one(&pool)
+                    .await
+                    .map(|row| row.r#type)
             )
         ),
         row!(
