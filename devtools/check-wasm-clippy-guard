@@ -71,7 +71,10 @@ fails, with one line per problem, unless all of these hold:
    uncommitted edits included), with every probe added to a source file of
    PROBE_CRATE, the clippy step of the workflow fails with clippy's
    disallowed-method or disallowed-type error naming the probed path inside
-   each probe, and prints no warning about clippy.toml.
+   each probe, and prints no warning about clippy.toml. MESSAGE_PROBES lists
+   compiler messages that the function counting those refusals must count,
+   or not count, as refusing a probe, as the list says; a report at the
+   warning level must not count.
 
 The copy is built with the caller's clippy.toml and the caller's cargo target
 directory, so cargo reuses what the clippy step already checked. Nothing in
@@ -1139,6 +1142,24 @@ def probe_problems(crates: dict[str, dict], metadata: dict) -> tuple[list[str], 
     if code == 0:
         problems.append("the clippy step passed with every probe in place")
     problems += [f"warning about {CONFIG_REL}:\n{w}" for w in config_warnings(messages, stderr)]
+    refused, other = refused_probes(messages, rel, spans)
+    for index, (kind, path, first, _) in enumerate(spans):
+        if index in refused:
+            print(f"refused: {path} ({kind}, {rel}:{first})")
+        else:
+            problems.append(f"{path}: the {kind} probe at {rel}:{first} was not refused")
+    if len(refused) < len(spans) and other:
+        problems.append("other errors in the probe file:\n" + "\n".join(other))
+    if len(refused) < len(spans) and not messages:
+        problems.append(f"cargo clippy printed no compiler message; its stderr:\n{stderr}")
+    summary = f"{len(refused)} of {len(spans)} probes refused (in a copy of {files} files)"
+    return problems, summary
+
+
+def refused_probes(messages: list[dict], rel: str, spans: list[tuple]) -> tuple[set, list]:
+    """The probes that clippy's `messages` refuse, as indexes into `spans` (the
+    kind, the path, and the first and last line of each probe in the file
+    `rel`), and clippy's other errors in that file."""
     refused, other = set(), []
     for message in messages:
         primary = [s for s in message.get("spans", []) if s.get("is_primary")]
@@ -1151,16 +1172,50 @@ def probe_problems(crates: dict[str, dict], metadata: dict) -> tuple[list[str], 
                         refused.add(index)
         elif in_probes and message.get("level") == "error":
             other.append(message.get("rendered") or message["message"])
-    for index, (kind, path, first, _) in enumerate(spans):
-        if index in refused:
-            print(f"refused: {path} ({kind}, {rel}:{first})")
-        else:
-            problems.append(f"{path}: the {kind} probe at {rel}:{first} was not refused")
-    if len(refused) < len(spans) and other:
-        problems.append("other errors in the probe file:\n" + "\n".join(other))
-    if len(refused) < len(spans) and not messages:
-        problems.append(f"cargo clippy printed no compiler message; its stderr:\n{stderr}")
-    summary = f"{len(refused)} of {len(spans)} probes refused (in a copy of {files} files)"
+    return refused, other
+
+
+# Compiler messages, in the shape of cargo's JSON messages, that refused_probes
+# must count (True) or not count (False) as refusing a probe of
+# MESSAGE_PROBE_SPANS: (level, message, line of its primary span, counted).
+MESSAGE_PROBE_FILE = "crates/probe/src/wasm_clippy_guard_probes.rs"
+MESSAGE_PROBE_SPANS = [
+    ("method", "std::thread::sleep", 3, 3),
+    ("type", "std::sync::mpsc::Receiver", 6, 6),
+]
+MESSAGE_PROBES = [
+    ("error", "use of a disallowed method `std::thread::sleep`", 3, True),
+    ("error", "use of a disallowed type `std::sync::mpsc::Receiver`", 6, True),
+    # A report at the warning level (a lint forced to warn, or code under
+    # warn(warnings)) lets the step pass; that is not a refusal.
+    ("warning", "use of a disallowed method `std::thread::sleep`", 3, False),
+    ("warning", "use of a disallowed type `std::sync::mpsc::Receiver`", 6, False),
+    ("error", "use of a disallowed method `std::thread::spawn`", 3, False),
+    ("error", "use of a disallowed method `std::thread::sleep`", 6, False),
+]
+
+
+def message_probe_problems() -> tuple[list[str], str]:
+    """Problems with MESSAGE_PROBES: a message refused_probes counts as a
+    refusal that it must not, or does not count that it must."""
+    problems = []
+    for index, (level, text, line, counted) in enumerate(MESSAGE_PROBES):
+        message = {
+            "level": level,
+            "message": text,
+            "rendered": f"{level}: {text}",
+            "spans": [{"file_name": MESSAGE_PROBE_FILE, "line_start": line, "is_primary": True}],
+        }
+        refused, _ = refused_probes([message], MESSAGE_PROBE_FILE, MESSAGE_PROBE_SPANS)
+        if bool(refused) != counted:
+            problems.append(
+                f"message probe {index} ({level}: {text}, line {line}) was"
+                f"{' not' if counted else ''} counted as refusing a probe"
+            )
+    summary = (
+        f"message probes: {len(MESSAGE_PROBES) - len(problems)} of {len(MESSAGE_PROBES)}"
+        " counted as expected"
+    )
     return problems, summary
 
 
@@ -1189,6 +1244,9 @@ def main() -> int:
     failures += found
     print(settings)
     found, settings = setting_probe_problems()
+    failures += found
+    print(settings)
+    found, settings = message_probe_problems()
     failures += found
     print(settings)
     found, probes = probe_problems(crates, metadata)
