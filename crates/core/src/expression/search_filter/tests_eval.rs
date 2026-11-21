@@ -4,10 +4,12 @@
 //! Which items a search condition matches.
 //!
 //! Evaluation uses the FilterExpression semantics: a comparison with a
-//! missing attribute is false except `<>`, which is true; numbers compare as
-//! decimals, so `1E2` equals `100` and 38-digit values keep their order; a
-//! value of another type than the attribute's compares unequal. Not yet
-//! measured against the live service for SearchVectors.
+//! missing attribute is false except `<>`, which is true; a value of another
+//! type than the attribute's compares unequal. Numbers compare as the nearest
+//! binary64 value of each side, so `1E2` equals `100` and two 38-digit values
+//! that share a binary64 value are equal. The number cases were measured
+//! against the live service (eu-north-1, 2026-11-21, each request twice); the
+//! others are not yet measured for SearchVectors.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -193,16 +195,94 @@ fn a_missing_attribute_under_not_equal_and_not() {
 /// Unmeasured, needs live confirmation: `1E2` against `100`, and 38-digit
 /// values.
 #[test]
-fn numbers_compare_as_decimals() {
+fn numbers_compare_as_binary64() {
     let cases = [
         (h("Price = :p100"), vec!["i6", "i7"]),
-        (h("Price > :big"), vec!["i9"]),
+        (h("Price > :big"), vec![]),
+        (h("Price >= :big"), vec!["i9"]),
     ];
     let refs: Vec<(&str, &[&str])> = cases
         .iter()
         .map(|(e, x)| (e.as_str(), x.as_slice()))
         .collect();
     assert_matches(&refs);
+}
+
+/// Live: two items whose Prices differ in the last significant digit, and
+/// whether the service tells them apart. Pairs that share a binary64 value
+/// compare equal under every operator.
+#[test]
+fn a_last_digit_difference_counts_only_beyond_binary64() {
+    let pairs = [
+        ("16777216", "16777217", true),
+        ("100000000000000", "100000000000001", true),
+        ("1000000000000000", "1000000000000001", true),
+        ("9007199254740992", "9007199254740993", false),
+        ("10000000000000000", "10000000000000001", false),
+        ("10000000000000000000", "10000000000000000001", false),
+        (
+            "99999999999999999999999999999999999998",
+            "99999999999999999999999999999999999999",
+            false,
+        ),
+        ("-1000000000000001", "-1000000000000000", true),
+        ("-10000000000000001", "-10000000000000000", false),
+        ("1E-10", "1.00000000000001E-10", true),
+        ("1E-10", "1.0000000000000001E-10", false),
+        ("0.1", "0.10000000000000001", false),
+        ("1E+100", "1.0000000000000001E+100", false),
+    ];
+    let mut mismatches = Vec::new();
+    for (lo, hi, distinct) in pairs {
+        let rows = [("lo", lo), ("hi", hi)];
+        let values: HashMap<String, AttributeValue> =
+            [(":us", s("US")), (":lo", n(lo)), (":hi", n(hi))]
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v))
+                .collect();
+        let both = vec!["lo", "hi"];
+        let cases = [
+            ("Price > :lo", if distinct { vec!["hi"] } else { vec![] }),
+            ("Price < :hi", if distinct { vec!["lo"] } else { vec![] }),
+            (
+                "Price = :lo",
+                if distinct { vec!["lo"] } else { both.clone() },
+            ),
+            ("Price <> :lo", if distinct { vec!["hi"] } else { vec![] }),
+            (
+                "Price BETWEEN :hi AND :hi",
+                if distinct { vec!["hi"] } else { both.clone() },
+            ),
+            (
+                "Price IN (:lo)",
+                if distinct { vec!["lo"] } else { both.clone() },
+            ),
+            (":lo < Price", if distinct { vec!["hi"] } else { vec![] }),
+        ];
+        for (rest, expected) in cases {
+            let expr = h(rest);
+            let used = used_values(&expr, &values);
+            let filter = parse_search_filter(&expr, None, Some(&used), 50)
+                .unwrap_or_else(|e| panic!("{expr}: {e:?}"));
+            let actual: Vec<&str> = rows
+                .iter()
+                .filter(|(_, price)| {
+                    let item: Item = [("Country", s("US")), ("Price", n(price))]
+                        .into_iter()
+                        .map(|(k, v)| (k.to_owned(), v))
+                        .collect();
+                    filter.matches(&item).unwrap()
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            if actual != expected {
+                mismatches.push(format!(
+                    "{lo} / {hi}: {rest}: expected {expected:?}, got {actual:?}"
+                ));
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
 /// Unmeasured, needs live confirmation: an item whose attribute has another

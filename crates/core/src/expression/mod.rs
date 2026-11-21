@@ -20,9 +20,9 @@ mod projection;
 mod reserved_words;
 mod resolver;
 mod search_condition;
-pub mod search_params;
 #[cfg(feature = "search-inequality-filters")]
 pub mod search_filter;
+pub mod search_params;
 #[cfg(test)]
 mod test_timeout;
 mod tokenizer;
@@ -30,7 +30,7 @@ mod update_evaluator;
 mod update_parser;
 
 pub use ast::{ArithOp, CompareOp, Expr, PathElement, UpdateAction, removes_only};
-pub use evaluator::evaluate_condition;
+pub use evaluator::{NumberPrecision, evaluate_condition, evaluate_condition_at};
 pub use key_condition::{
     KeyClauseOperand, KeyCondition, SortKeyCondition, key_condition_clause_operands,
     parse_key_condition,

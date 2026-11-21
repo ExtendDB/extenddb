@@ -23,8 +23,10 @@
 //! known, and its messages carry no prefix either.
 //!
 //! Evaluation uses the condition evaluator that FilterExpression uses, so a
-//! missing attribute, a number comparison and a type mismatch behave as they
-//! do in a Query or Scan filter.
+//! missing attribute and a type mismatch behave as they do in a Query or Scan
+//! filter. Numbers compare as the nearest binary64 value of each side, as the
+//! service compares inline filters: `99999999999999999999999999999999999999 >
+//! 99999999999999999999999999999999999998` is false.
 //!
 //! Pure synchronous Rust: no async, no I/O.
 
@@ -187,7 +189,12 @@ impl SearchFilter {
     /// condition the evaluator would refuse, so this does not happen for a
     /// parsed filter.
     pub fn matches(&self, item: &Item) -> Result<bool, DynamoDbError> {
-        crate::expression::evaluate_condition(&self.expr, item, &self.maps)
+        crate::expression::evaluate_condition_at(
+            &self.expr,
+            item,
+            &self.maps,
+            crate::expression::NumberPrecision::Binary64,
+        )
     }
 }
 

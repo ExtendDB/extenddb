@@ -18,7 +18,19 @@ use super::resolver::{
     ExpressionMaps, ParsedNumber, attribute_type_code, number_value, resolve_path,
 };
 
-/// Evaluate a condition expression against an item.
+/// How two `N` values compare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumberPrecision {
+    /// As decimals, exactly: condition, filter and key condition expressions.
+    Exact,
+    /// As the nearest IEEE 754 binary64 value of each side: the inline
+    /// filters of a `SearchVectors` search condition. The validity of each
+    /// number, and the BETWEEN bound check, stay exact.
+    Binary64,
+}
+
+/// Evaluate a condition expression against an item, comparing numbers
+/// exactly.
 ///
 /// Returns `true` if the condition is satisfied, `false` otherwise.
 ///
@@ -30,6 +42,21 @@ pub fn evaluate_condition(
     item: &BTreeMap<String, AttributeValue>,
     maps: &ExpressionMaps,
 ) -> Result<bool, DynamoDbError> {
+    evaluate_condition_at(expr, item, maps, NumberPrecision::Exact)
+}
+
+/// Evaluate a condition expression against an item, comparing numbers at
+/// `precision`.
+///
+/// # Errors
+///
+/// Returns `ValidationException` for unresolvable placeholders or type errors.
+pub fn evaluate_condition_at(
+    expr: &Expr,
+    item: &BTreeMap<String, AttributeValue>,
+    maps: &ExpressionMaps,
+    precision: NumberPrecision,
+) -> Result<bool, DynamoDbError> {
     match expr {
         Expr::Compare { left, op, right } => {
             let lv = resolve_to_value(left, item, maps)?;
@@ -38,18 +65,16 @@ pub fn evaluate_condition(
                 (Some(l), Some(r)) => {
                     let lpn = placeholder_numeric(left, maps);
                     let rpn = placeholder_numeric(right, maps);
-                    Ok(compare_values(l, r, *op, lpn, rpn))
+                    Ok(compare_values(l, r, *op, lpn, rpn, precision))
                 }
                 _ => Ok(*op == CompareOp::Ne),
             }
         }
-        Expr::And(left, right) => {
-            Ok(evaluate_condition(left, item, maps)? && evaluate_condition(right, item, maps)?)
-        }
-        Expr::Or(left, right) => {
-            Ok(evaluate_condition(left, item, maps)? || evaluate_condition(right, item, maps)?)
-        }
-        Expr::Not(inner) => Ok(!evaluate_condition(inner, item, maps)?),
+        Expr::And(left, right) => Ok(evaluate_condition_at(left, item, maps, precision)?
+            && evaluate_condition_at(right, item, maps, precision)?),
+        Expr::Or(left, right) => Ok(evaluate_condition_at(left, item, maps, precision)?
+            || evaluate_condition_at(right, item, maps, precision)?),
+        Expr::Not(inner) => Ok(!evaluate_condition_at(inner, item, maps, precision)?),
         Expr::Function { name, args } => evaluate_function(name, args, item, maps),
         Expr::Between { operand, low, high } => {
             let val = resolve_to_value(operand, item, maps)?;
@@ -71,7 +96,7 @@ pub fn evaluate_condition(
                 }
                 let lpn = placeholder_numeric(low, maps);
                 let hpn = placeholder_numeric(high, maps);
-                if compare_values(l, h, CompareOp::Gt, lpn, hpn) {
+                if compare_values(l, h, CompareOp::Gt, lpn, hpn, NumberPrecision::Exact) {
                     return Err(DynamoDbError::ValidationException(format!(
                         "Invalid ConditionExpression: The BETWEEN operator requires upper bound to be greater than or equal to lower bound; lower bound operand: AttributeValue: {{{}}}, upper bound operand: AttributeValue: {{{}}}",
                         format_attribute_value(l),
@@ -84,8 +109,8 @@ pub fn evaluate_condition(
                     let vpn = placeholder_numeric(operand, maps);
                     let lpn = placeholder_numeric(low, maps);
                     let hpn = placeholder_numeric(high, maps);
-                    Ok(compare_values(v, l, CompareOp::Ge, vpn, lpn)
-                        && compare_values(v, h, CompareOp::Le, vpn, hpn))
+                    Ok(compare_values(v, l, CompareOp::Ge, vpn, lpn, precision)
+                        && compare_values(v, h, CompareOp::Le, vpn, hpn, precision))
                 }
                 _ => Ok(false),
             }
@@ -98,7 +123,7 @@ pub fn evaluate_condition(
                 let cv = resolve_to_value(candidate, item, maps)?;
                 if let Some(ref c) = cv {
                     let cpn = placeholder_numeric(candidate, maps);
-                    if compare_values(v, c, CompareOp::Eq, vpn, cpn) {
+                    if compare_values(v, c, CompareOp::Eq, vpn, cpn, precision) {
                         return Ok(true);
                     }
                 }
@@ -160,7 +185,8 @@ fn comparison_number<'a>(
 /// `DynamoDB` comparison rules:
 /// - Same-type comparisons only (except N vs N which is numeric)
 /// - S: lexicographic UTF-8
-/// - N: numeric comparison via `BigDecimal` (pre-parsed values used when available).
+/// - N: numeric comparison via `BigDecimal` (pre-parsed values used when available),
+///   or of the nearest binary64 values under [`NumberPrecision::Binary64`].
 ///   An `N` that is not a number the service can store compares as a value of
 ///   another type: only `<>` is true, so `a <> b` agrees with `NOT (a = b)`.
 /// - B: lexicographic byte comparison
@@ -171,6 +197,7 @@ fn compare_values(
     op: CompareOp,
     left_parsed: Option<ParsedNumber<'_>>,
     right_parsed: Option<ParsedNumber<'_>>,
+    precision: NumberPrecision,
 ) -> bool {
     match (left, right) {
         (AttributeValue::S(l), AttributeValue::S(r)) => apply_op(l.cmp(r), op),
@@ -181,13 +208,25 @@ fn compare_values(
             let Some(rd) = comparison_number(r, right_parsed) else {
                 return matches!(op, CompareOp::Ne);
             };
-            apply_op(ld.as_ref().cmp(rd.as_ref()), op)
+            let ordering = match precision {
+                NumberPrecision::Exact => None,
+                NumberPrecision::Binary64 => binary64_ordering(l, r),
+            };
+            apply_op(ordering.unwrap_or_else(|| ld.as_ref().cmp(rd.as_ref())), op)
         }
         (AttributeValue::B(l), AttributeValue::B(r)) => apply_op(l.cmp(r), op),
         // For non-orderable types, only equality is meaningful
         (l, r) if l == r => matches!(op, CompareOp::Eq | CompareOp::Le | CompareOp::Ge),
         _ => matches!(op, CompareOp::Ne),
     }
+}
+
+/// The order of the nearest binary64 values of two numbers. Rust's parse
+/// rounds to nearest, ties to even, as IEEE 754 does.
+fn binary64_ordering(left: &str, right: &str) -> Option<Ordering> {
+    let left: f64 = left.trim().parse().ok()?;
+    let right: f64 = right.trim().parse().ok()?;
+    left.partial_cmp(&right)
 }
 
 fn apply_op(ordering: Ordering, op: CompareOp) -> bool {
