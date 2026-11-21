@@ -190,8 +190,8 @@ async fn ids(pool: &sqlx::SqlitePool) -> String {
 }
 
 /// `SqliteConnectOptions::from_str(url).get_filename()`. The counter in the
-/// name of an in-memory database is replaced by `<n>`, since it depends on how
-/// many locations the process parsed before.
+/// name `sqlx` gives an in-memory database is replaced by `<n>`, since it
+/// depends on how many locations the process parsed before.
 fn filename(url: &str) -> String {
     match sqlx::sqlite::SqliteConnectOptions::from_str(url) {
         Ok(options) => {
@@ -807,11 +807,6 @@ fn cases() -> Vec<Case> {
                 };
                 format!("{:?}", config.database_location())
             }
-        ),
-        row!(
-            "sqlite::memory: file name",
-            "Ok(\"file:sqlx-in-memory-<n>\")",
-            |_pool| filename("sqlite::memory:")
         ),
         difference!(
             "difference: a location other than sqlite::memory: is refused",

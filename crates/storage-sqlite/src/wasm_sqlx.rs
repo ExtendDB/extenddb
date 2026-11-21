@@ -69,16 +69,13 @@
 //!   with foreign keys enforced (`PRAGMA foreign_keys = ON`), as
 //!   `sqlx-sqlite`'s default connect options set them on every connection it
 //!   opens.
-//! * **Connect options.** `sqlite::memory:` parses into options whose file
-//!   name is `file:sqlx-in-memory-<n>`, the name `sqlx-sqlite` gives an
-//!   in-memory database.
 //!
 //! # Documented differences from `sqlx-sqlite` 0.8.6
 //!
 //! The table in `tests/wasm_shim.rs` has six `difference: ...` rows: one each
 //! for **One location**, **One connection** and **After a failed
 //! `begin_with`**, and one per terminal (`fetch_one`, `fetch_optional`,
-//! `execute`) for **`$0`**. The other entries have no row.
+//! `execute`) for **`$0`**. The other entries have no `difference: ...` row.
 //!
 //! * **One location.** The only location that parses is `sqlite::memory:`,
 //!   the URL the backend builds for the in-memory database
@@ -87,6 +84,13 @@
 //!   [`Error::Configuration`] saying that the WebAssembly build opens only an
 //!   in-memory database; `sqlx` parses each of them. The connection opens a
 //!   private `:memory:` database, not the shared-cache one `sqlx` names.
+//! * **The in-memory file name.** [`SqliteConnectOptions::get_filename`]
+//!   returns `:memory:`, the name the connection opens; `sqlx` returns
+//!   `file:sqlx-in-memory-<n>`, the name of its shared-cache database. The
+//!   backend reads the name only in `serve_lock::database_file`, which takes
+//!   either name for an in-memory location; a row of the table checks its
+//!   answer for the location `:memory:` (the URL `sqlite::memory:`), no
+//!   database file, on both targets.
 //!
 //! * **No acquire wait.** `sqlx` waits up to the pool's acquire timeout (30 s
 //!   by default) for the connection before it returns
@@ -136,11 +140,11 @@ use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::os::raw::c_char;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::pin::Pin;
 use std::ptr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use sqlite_wasm_rs as ffi;
@@ -654,22 +658,18 @@ impl<DB> Drop for Transaction<'_, DB> {
 /// database `SqliteEngine::new_in_memory` opens (`sqlite_url(":memory:")`).
 const IN_MEMORY_URL: &str = "sqlite::memory:";
 
-/// Numbers the in-memory databases a parsed [`SqliteConnectOptions`] names,
-/// as `sqlx-sqlite` does.
-static IN_MEMORY_DB_SEQ: AtomicUsize = AtomicUsize::new(0);
-
 /// Connection options, mirroring `sqlx::sqlite::SqliteConnectOptions` for the
-/// one location the WebAssembly build opens, an in-memory database.
+/// one location the WebAssembly build opens, an in-memory database. They hold
+/// nothing: that location is the only one that parses, and the pool's
+/// connection opens a private `:memory:` database whatever the options.
 #[derive(Clone, Debug)]
-pub struct SqliteConnectOptions {
-    filename: PathBuf,
-}
+pub struct SqliteConnectOptions;
 
 impl SqliteConnectOptions {
-    /// The database file name: for `sqlite::memory:`, the name
-    /// `file:sqlx-in-memory-<n>` that `sqlx-sqlite` gives it.
+    /// The database file name: `:memory:`, the name the connection passes to
+    /// `sqlite3_open_v2`.
     pub fn get_filename(&self) -> &Path {
-        &self.filename
+        Path::new(":memory:")
     }
 
     /// The driver's row look-ahead buffer. There is no driver worker here, so
@@ -695,10 +695,7 @@ impl std::str::FromStr for SqliteConnectOptions {
                 .into(),
             ));
         }
-        let seqno = IN_MEMORY_DB_SEQ.fetch_add(1, Ordering::Relaxed);
-        Ok(SqliteConnectOptions {
-            filename: PathBuf::from(format!("file:sqlx-in-memory-{seqno}")),
-        })
+        Ok(SqliteConnectOptions)
     }
 }
 
