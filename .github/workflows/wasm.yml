@@ -116,8 +116,10 @@ jobs:
           CLIPPY_CONF_DIR: ${{ github.workspace }}/devtools/wasm-clippy
         run: cargo clippy --locked -p extenddb-wasm-adapter --lib --target wasm32-unknown-unknown -- -D warnings
 
-      # Checks that the step above fails on each disallowed method, called
-      # directly or through an import, in a wasm-compiled file.
+      # Reads the paths from clippy.toml and fails if one has no probe in the
+      # script or does not resolve, then checks that the step above fails on a
+      # call to each, made directly or through an import, in a wasm-compiled
+      # file.
       - name: Self-test the wasm32 clippy guard
         run: python3 devtools/check-wasm-clippy-guard
 

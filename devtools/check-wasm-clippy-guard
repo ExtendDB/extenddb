@@ -1,36 +1,49 @@
 #!/usr/bin/env python3
 # Copyright 2026 ExtendDB contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Check that the wasm32 clippy step refuses each disallowed method.
+"""Check that the wasm32 clippy step refuses each method in its deny list.
 
-devtools/wasm-clippy/clippy.toml lists the clock, thread, timer and task calls
-that compile for wasm32-unknown-unknown and fail when they run in a browser.
-For a path in that list that does not resolve, clippy prints a warning that
--D warnings does not turn into an error (clippy 0.1.97), so a misspelt path,
-like a dropped entry, leaves the step green with that method unguarded. This
-script appends one probe function at a time to a source
-file the wasm build compiles, runs the step exactly as the WebAssembly
-workflow does, and requires it to fail with clippy's disallowed-method error
-naming the probed path. Some probes reach the method through an import
-(`use tokio::time; time::sleep`), as code usually does.
+The list is the `disallowed-methods` paths in devtools/wasm-clippy/clippy.toml,
+read from that file. For a path in the list that does not resolve, clippy
+prints a "does not refer to a reachable function" warning and, under
+-D warnings, still exits 0 (clippy 0.1.97), so a misspelt entry would leave
+the step green with that method unguarded. This script:
 
-The probed file is restored after each run and on any exit. Run from anywhere
-in the repository; exit status 0 means every probe was refused.
+1. fails if an entry in clippy.toml has no probe below, or a probe names a
+   path that is not in clippy.toml;
+2. runs the step exactly as the WebAssembly workflow does on the unmodified
+   tree (after touching the probed file so clippy re-lints it), and fails if
+   the step fails or prints an unresolved-path warning;
+3. appends every probe to a source file the wasm build compiles, runs the
+   step once more, and fails unless the step fails with clippy's
+   disallowed-method error naming the probed path inside each probe, and
+   prints no unresolved-path warning.
+
+Some probes reach the method through an import or a re-export
+(`use tokio::time; time::sleep`, `tokio::spawn`), as code usually does.
+
+The probed file is restored on any exit. Run from anywhere in the
+repository; exit status 0 means every entry resolved and every probe was
+refused.
 """
 
+import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CONF_DIR = ROOT / "devtools" / "wasm-clippy"
+CONFIG = CONF_DIR / "clippy.toml"
 # A file of the engine, which the adapter compiles for wasm32.
 PROBED = ROOT / "crates" / "engine" / "src" / "get_item.rs"
 CLIPPY = [
     "cargo",
     "clippy",
     "--locked",
+    "--message-format=json",
     "-p",
     "extenddb-wasm-adapter",
     "--lib",
@@ -40,98 +53,164 @@ CLIPPY = [
     "-D",
     "warnings",
 ]
+UNRESOLVED = "does not refer to a reachable function"
 
-# (disallowed path, probe function). Each probe is an item appended to PROBED.
-PROBES = [
-    (
-        "std::time::Instant::now",
+_DUR = "std::time::Duration::ZERO"
+_SET = "set: &mut tokio::task::JoinSet<()>"
+
+# Disallowed path -> probe items. Each item is appended to PROBED inside its
+# own module and must draw clippy's disallowed-method error for that path.
+PROBES = {
+    "std::time::Instant::now": [
         "fn probe() { use std::time; let _ = time::Instant::now(); }",
-    ),
-    ("std::time::SystemTime::now", "fn probe() { let _ = std::time::SystemTime::now(); }"),
-    (
-        "std::time::Instant::elapsed",
+    ],
+    "std::time::SystemTime::now": ["fn probe() { let _ = std::time::SystemTime::now(); }"],
+    "std::time::Instant::elapsed": [
         "fn probe(at: std::time::Instant) { let _ = at.elapsed(); }",
-    ),
-    (
-        "std::time::SystemTime::elapsed",
+    ],
+    "std::time::SystemTime::elapsed": [
         "fn probe() { let _ = std::time::UNIX_EPOCH.elapsed(); }",
-    ),
-    ("std::thread::sleep", "fn probe() { std::thread::sleep(std::time::Duration::ZERO); }"),
-    ("std::thread::spawn", "fn probe() { drop(std::thread::spawn(|| ())); }"),
-    ("std::thread::scope", "fn probe() { std::thread::scope(|_| ()); }"),
-    (
-        "std::thread::Builder::spawn",
+    ],
+    "std::thread::sleep": [f"fn probe() {{ std::thread::sleep({_DUR}); }}"],
+    "std::thread::spawn": ["fn probe() { drop(std::thread::spawn(|| ())); }"],
+    "std::thread::scope": ["fn probe() { std::thread::scope(|_| ()); }"],
+    "std::thread::Builder::spawn": [
         "fn probe() { drop(std::thread::Builder::new().spawn(|| ())); }",
-    ),
-    (
-        "std::thread::Builder::spawn_scoped",
+    ],
+    "std::thread::Builder::spawn_scoped": [
         "fn probe<'s>(s: &'s std::thread::Scope<'s, '_>) {"
         " drop(std::thread::Builder::new().spawn_scoped(s, || ())); }",
-    ),
-    (
-        "tokio::time::sleep",
-        "async fn probe() { use tokio::time; time::sleep(std::time::Duration::ZERO).await; }",
-    ),
-    (
-        "tokio::time::sleep_until",
+    ],
+    "tokio::time::sleep": [
+        f"async fn probe() {{ use tokio::time; time::sleep({_DUR}).await; }}",
+    ],
+    "tokio::time::sleep_until": [
         "async fn probe(at: tokio::time::Instant) { tokio::time::sleep_until(at).await; }",
-    ),
-    (
-        "tokio::time::timeout",
-        "async fn probe() {"
-        " let _ = tokio::time::timeout(std::time::Duration::ZERO, async {}).await; }",
-    ),
-    (
-        "tokio::time::timeout_at",
+    ],
+    "tokio::time::timeout": [
+        f"async fn probe() {{ let _ = tokio::time::timeout({_DUR}, async {{}}).await; }}",
+    ],
+    "tokio::time::timeout_at": [
         "async fn probe(at: tokio::time::Instant) {"
         " let _ = tokio::time::timeout_at(at, async {}).await; }",
-    ),
-    (
-        "tokio::time::interval",
+    ],
+    "tokio::time::interval": [
         "fn probe() { drop(tokio::time::interval(std::time::Duration::from_secs(1))); }",
-    ),
-    (
-        "tokio::time::interval_at",
+    ],
+    "tokio::time::interval_at": [
         "fn probe(at: tokio::time::Instant) {"
         " drop(tokio::time::interval_at(at, std::time::Duration::from_secs(1))); }",
-    ),
-    ("tokio::time::Instant::now", "fn probe() { let _ = tokio::time::Instant::now(); }"),
-    (
-        "tokio::time::Instant::elapsed",
+    ],
+    "tokio::time::Instant::now": ["fn probe() { let _ = tokio::time::Instant::now(); }"],
+    "tokio::time::Instant::elapsed": [
         "fn probe(at: tokio::time::Instant) { let _ = at.elapsed(); }",
-    ),
-    ("tokio::task::spawn", "fn probe() { drop(tokio::spawn(async {})); }"),
-    ("tokio::task::spawn_blocking", "fn probe() { drop(tokio::task::spawn_blocking(|| ())); }"),
-    ("tokio::task::spawn_local", "fn probe() { drop(tokio::task::spawn_local(async {})); }"),
-    (
-        "tokio::task::JoinSet::spawn",
-        "fn probe(set: &mut tokio::task::JoinSet<()>) { drop(set.spawn(async {})); }",
-    ),
-]
+    ],
+    "tokio::task::spawn": [
+        "fn probe() { drop(tokio::spawn(async {})); }",
+        "fn probe() { drop(tokio::task::spawn(async {})); }",
+    ],
+    "tokio::task::spawn_blocking": ["fn probe() { drop(tokio::task::spawn_blocking(|| ())); }"],
+    "tokio::task::spawn_local": ["fn probe() { drop(tokio::task::spawn_local(async {})); }"],
+    "tokio::task::JoinSet::spawn": [f"fn probe({_SET}) {{ drop(set.spawn(async {{}})); }}"],
+}
+
+
+def configured_paths() -> list[str]:
+    """The `path` of every disallowed-methods entry in clippy.toml."""
+    text = "\n".join(
+        line for line in CONFIG.read_text().splitlines() if not line.lstrip().startswith("#")
+    )
+    return re.findall(r'\bpath\s*=\s*"([^"]+)"', text)
+
+
+def run_clippy() -> tuple[int, list[dict], str]:
+    env = dict(os.environ, CLIPPY_CONF_DIR=str(CONF_DIR))
+    run = subprocess.run(CLIPPY, cwd=ROOT, env=env, capture_output=True, text=True, check=False)
+    messages = []
+    for line in run.stdout.splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if record.get("reason") == "compiler-message":
+            messages.append(record["message"])
+    return run.returncode, messages, run.stderr
+
+
+def unresolved(messages: list[dict], stderr: str) -> list[str]:
+    # Cargo replays the warning once per linted crate; report each once.
+    found = {m.get("rendered") or m["message"] for m in messages if UNRESOLVED in m["message"]}
+    if not found and UNRESOLVED in stderr:
+        found.add(stderr)
+    return sorted(found)
 
 
 def main() -> int:
-    original = PROBED.read_text()
-    env = dict(os.environ, CLIPPY_CONF_DIR=str(CONF_DIR))
     failures = []
+    paths = configured_paths()
+    if not paths:
+        failures.append(f"no disallowed-methods entries found in {CONFIG}")
+    if len(paths) != len(set(paths)):
+        failures.append("clippy.toml lists a path more than once")
+    for path in paths:
+        if path not in PROBES:
+            failures.append(f"{path}: listed in clippy.toml but has no probe in this script")
+    for path in PROBES:
+        if path not in paths:
+            failures.append(f"{path}: has a probe but is not listed in clippy.toml")
+    if failures:
+        for failure in failures:
+            print(f"FAIL: {failure}", file=sys.stderr)
+        return 1
+
+    original = PROBED.read_text()
+    rel = PROBED.relative_to(ROOT).as_posix()
+    spans = []  # (path, first line, last line) of each probe, 1-based, inclusive
+    refused = set()  # indexes into spans
     try:
-        for path, probe in PROBES:
-            PROBED.write_text(f"{original}\n#[allow(dead_code)]\n{probe}\n")
-            run = subprocess.run(
-                CLIPPY, cwd=ROOT, env=env, capture_output=True, text=True, check=False
-            )
-            expected = f"use of a disallowed method `{path}`"
-            if run.returncode == 0:
-                failures.append(f"{path}: the clippy step passed")
-            elif expected not in run.stderr:
-                failures.append(f"{path}: the clippy step failed without {expected!r}:\n{run.stderr}")
+        # Rewriting the file updates its mtime, so cargo re-lints the engine
+        # and clippy prints its warnings about the configuration again.
+        PROBED.write_text(original)
+        code, messages, stderr = run_clippy()
+        if code != 0:
+            failures.append(f"the clippy step fails on the unmodified tree:\n{stderr}")
+        failures += [f"unresolved entry:\n{w}" for w in unresolved(messages, stderr)]
+
+        lines = original.splitlines()
+        for n, (path, snippets) in enumerate(
+            (p, s) for p, items in PROBES.items() for s in items
+        ):
+            lines.append("#[allow(dead_code, unused)]")
+            lines.append(f"mod wasm_clippy_guard_probe_{n} {{")
+            first = len(lines) + 1
+            lines.append(snippets)
+            spans.append((path, first, len(lines)))
+            lines.append("}")
+        PROBED.write_text("\n".join(lines) + "\n")
+        code, messages, stderr = run_clippy()
+        if code == 0:
+            failures.append("the clippy step passed with every probe in place")
+        failures += [f"unresolved entry:\n{w}" for w in unresolved(messages, stderr)]
+        for message in messages:
+            match = re.match(r"use of a disallowed method `([^`]+)`", message["message"])
+            if not match:
+                continue
+            for span in message.get("spans", []):
+                if not span.get("is_primary") or not span["file_name"].endswith(rel):
+                    continue
+                for index, (path, first, last) in enumerate(spans):
+                    if path == match.group(1) and first <= span["line_start"] <= last:
+                        refused.add(index)
+        for index, (path, first, _) in enumerate(spans):
+            if index in refused:
+                print(f"refused: {path} ({rel}:{first})")
             else:
-                print(f"refused: {path}")
+                failures.append(f"{path}: the probe at {rel}:{first} was not refused")
     finally:
         PROBED.write_text(original)
     for failure in failures:
-        print(f"NOT REFUSED: {failure}", file=sys.stderr)
-    print(f"{len(PROBES) - len(failures)} of {len(PROBES)} probes refused")
+        print(f"FAIL: {failure}", file=sys.stderr)
+    print(f"{len(paths)} entries in clippy.toml; {len(refused)} of {len(spans)} probes refused")
     return 1 if failures else 0
 
 

@@ -14,9 +14,12 @@
 # carries `#[allow(clippy::disallowed_methods, reason = "...")]` on its
 # function, naming the callers and why none runs on wasm.
 #
-# A path here that does not resolve only makes clippy print a warning, which
-# -D warnings does not turn into an error. devtools/check-wasm-clippy-guard,
-# run by the workflow after the clippy step, checks that each entry is refused.
+# A path here that does not resolve only makes clippy print a "does not refer
+# to a reachable function" warning, which -D warnings does not turn into an
+# error. devtools/check-wasm-clippy-guard, run by the workflow after the clippy
+# step, reads the paths from this file and fails if one has no probe in the
+# script, if clippy reports one as unresolved, or if the step accepts a call to
+# one.
 
 disallowed-methods = [
     { path = "std::time::Instant::now", reason = "std has no clock on wasm32-unknown-unknown; read it through web_time" },
