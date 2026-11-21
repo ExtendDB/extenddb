@@ -32,10 +32,11 @@
 //! under a single fixed account.
 //!
 //! [`runtime`] refuses, the same way on both targets, the operations a browser
-//! cannot serve: the store-backed backup operations, `PartiQL`,
-//! `DescribeEndpoints`, creating a vector index through `UpdateTable`, and, as
-//! the server does, the point-in-time recovery requests. The module doc of
-//! [`runtime`] lists each answer.
+//! cannot serve: the store-backed backup operations, `PartiQL` and
+//! `DescribeEndpoints`, and, as the server does, the point-in-time recovery
+//! requests. On wasm, the `SQLite` backend also refuses an `UpdateTable` that
+//! creates a vector index, after the engine has validated the request. The
+//! module doc of [`runtime`] lists each answer.
 
 mod runtime;
 

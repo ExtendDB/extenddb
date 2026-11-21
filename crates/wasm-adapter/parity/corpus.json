@@ -1553,7 +1553,55 @@
       ]
     },
     {
-      "name": "UpdateTable creating a vector index is refused by the WebAssembly build",
+      "name": "UpdateTable creating a vector index on a missing table is ResourceNotFoundException",
+      "op": "UpdateTable",
+      "body": {
+        "TableName": "NoSuchTable",
+        "VectorIndexUpdates": [
+          {
+            "Create": {
+              "IndexName": "vidx2",
+              "VectorAttribute": {
+                "AttributeName": "emb"
+              },
+              "Dimensions": 3,
+              "DistanceFunction": "COSINE",
+              "Projection": {
+                "ProjectionType": "ALL"
+              }
+            }
+          }
+        ]
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found"
+        }
+      ]
+    },
+    {
+      "name": "UpdateTable with a vector-index Create that has no IndexName is SerializationException",
+      "op": "UpdateTable",
+      "body": {
+        "TableName": "VecT",
+        "VectorIndexUpdates": [
+          {
+            "Create": {}
+          }
+        ]
+      },
+      "error": "SerializationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Start of structure or map found where not expected: missing field `IndexName`"
+        }
+      ]
+    },
+    {
+      "name": "UpdateTable creating a vector index on VecT adds the index to the table",
       "op": "UpdateTable",
       "body": {
         "TableName": "VecT",
@@ -1573,16 +1621,62 @@
           }
         ]
       },
-      "error": "ValidationException",
+      "error": null,
       "checks": [
         {
-          "path": "/message",
-          "contains": "ExtendDB WebAssembly build"
+          "path": "/TableDescription/VectorIndexes/1/IndexName",
+          "equals": "vidx2"
+        },
+        {
+          "path": "/TableDescription/TableStatus",
+          "equals": "ACTIVE"
         }
-      ]
+      ],
+      "onWasm": {
+        "error": "ValidationException",
+        "checks": [
+          {
+            "path": "/message",
+            "equals": "UpdateTable is not supported by the ExtendDB WebAssembly build: it cannot build a vector index; create the table with its vector indexes instead."
+          }
+        ],
+        "reason": "the WebAssembly build has no task runtime to run the index backfill, so its SQLite backend refuses the create after the engine has validated the request"
+      }
     },
     {
-      "name": "PutItem VecT after the refusal (the instance still serves)",
+      "name": "DescribeTable VecT after the vector-index create",
+      "op": "DescribeTable",
+      "body": {
+        "TableName": "VecT"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/Table/VectorIndexes/0/IndexName",
+          "equals": "vidx"
+        },
+        {
+          "path": "/Table/VectorIndexes/1/IndexName",
+          "equals": "vidx2"
+        }
+      ],
+      "onWasm": {
+        "error": null,
+        "checks": [
+          {
+            "path": "/Table/VectorIndexes/0/IndexName",
+            "equals": "vidx"
+          },
+          {
+            "path": "/Table/VectorIndexes/1",
+            "absent": true
+          }
+        ],
+        "reason": "the WebAssembly build refused the create, which leaves the table with only the index it was created with"
+      }
+    },
+    {
+      "name": "PutItem VecT after the vector-index create",
       "op": "PutItem",
       "body": {
         "TableName": "VecT",
@@ -1604,7 +1698,7 @@
       ]
     },
     {
-      "name": "GetItem VecT after the refusal returns the item",
+      "name": "GetItem VecT after the vector-index create returns the item",
       "op": "GetItem",
       "body": {
         "TableName": "VecT",
@@ -1623,7 +1717,7 @@
       ]
     },
     {
-      "name": "UpdateItem VecT after the refusal updates the item",
+      "name": "UpdateItem VecT after the vector-index create updates the item",
       "op": "UpdateItem",
       "body": {
         "TableName": "VecT",
@@ -1652,10 +1746,10 @@
       ]
     },
     {
-      "name": "CreateTable after the refusal creates a table",
+      "name": "CreateTable after the vector-index create creates a table",
       "op": "CreateTable",
       "body": {
-        "TableName": "AfterRefusal",
+        "TableName": "AfterVectorCreate",
         "KeySchema": [
           {
             "AttributeName": "pk",
@@ -1674,21 +1768,21 @@
       "checks": [
         {
           "path": "/TableDescription/TableName",
-          "equals": "AfterRefusal"
+          "equals": "AfterVectorCreate"
         }
       ]
     },
     {
-      "name": "DeleteTable after the refusal deletes that table",
+      "name": "DeleteTable after the vector-index create deletes that table",
       "op": "DeleteTable",
       "body": {
-        "TableName": "AfterRefusal"
+        "TableName": "AfterVectorCreate"
       },
       "error": null,
       "checks": [
         {
           "path": "/TableDescription/TableName",
-          "equals": "AfterRefusal"
+          "equals": "AfterVectorCreate"
         }
       ]
     },

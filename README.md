@@ -342,9 +342,20 @@ that names the build:
 - `DescribeEndpoints` — "… it is called in-process and has no network endpoint
   to report."
 - An `UpdateTable` that creates a vector index — "… it cannot build a vector
-  index; create the table with its vector indexes instead." The refusal lands
-  before any catalog write, so the table is unchanged and the instance keeps
-  serving.
+  index; create the table with its vector indexes instead." The SQLite backend
+  refuses it after the engine has validated the request, so a request for a
+  missing table or with a malformed `Create` gets the engine's own answer
+  (`ResourceNotFoundException`, `SerializationException`). The refusal comes
+  before the catalog commit, so the table is left as it was and the instance
+  keeps serving. On a server, the same request starts the index build.
+
+The parity corpus (`crates/wasm-adapter/parity/corpus.json`) runs on the
+native build and on this one with the same expectations, except in the cases
+that carry an `onWasm` expectation for this build. Two do, both for the
+vector-index refusal: "UpdateTable creating a vector index on VecT adds the
+index to the table" expects the refusal here, and "DescribeTable VecT after the
+vector-index create" expects the table to keep only the index it was created
+with.
 
 `ListBackups`, `DescribeContinuousBackups`, `UpdateContinuousBackups`,
 `ImportTable` and `ExportTableToPointInTime` run the engine's own handlers, as

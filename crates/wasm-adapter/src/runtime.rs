@@ -22,10 +22,8 @@
 //! - **Refused on both targets** with a `ValidationException` that names the
 //!   build: the store-backed backup operations (`CreateBackup`,
 //!   `DescribeBackup`, `DeleteBackup`, `RestoreTableFromBackup`); the three
-//!   `PartiQL` operations; `DescribeEndpoints`, as the build has no network
-//!   address to report; and an `UpdateTable` that creates a vector index
-//!   (refused before any catalog write, as the build cannot run the index
-//!   backfill — create the table with its vector indexes instead).
+//!   `PartiQL` operations; and `DescribeEndpoints`, as the build has no
+//!   network address to report.
 //! - **Refused as the server refuses them**: every
 //!   `RestoreTableToPointInTime`, and an `UpdateContinuousBackups` that enables
 //!   point-in-time recovery, through [`extenddb_engine::parse_request`] and
@@ -34,15 +32,23 @@
 //!   build authenticates no request). They run before any table is read.
 //! - **Passed through** to the engine's handlers: everything else, including
 //!   the data-plane operations, `DescribeTable` / `ListTables`, streams,
-//!   time-to-live, tagging, an `UpdateTable` that does not create a vector
-//!   index, `ListBackups`, `DescribeContinuousBackups`, an
-//!   `UpdateContinuousBackups` that does not enable point-in-time recovery, and
-//!   `ImportTable` / `ExportTableToPointInTime`.
+//!   time-to-live, tagging, every `UpdateTable`, `ListBackups`,
+//!   `DescribeContinuousBackups`, an `UpdateContinuousBackups` that does not
+//!   enable point-in-time recovery, and `ImportTable` /
+//!   `ExportTableToPointInTime`.
 //!   The wasm build compiles those handlers too, so a malformed request gets
 //!   the handler's own validation answer on both targets. The adapter
 //!   configures no backup store and no import or export paths, so `ListBackups`
 //!   lists nothing and the import and export handlers answer that the
 //!   operation is disabled.
+//!
+//! One refusal is not made here, and differs between the targets: an
+//! `UpdateTable` that creates a vector index. The engine validates the request
+//! first, so a missing table or a malformed `Create` gets the engine's answer
+//! on both targets. The `SQLite` backend then starts the index backfill
+//! natively, as the server does. On wasm it has no task runtime to run the
+//! backfill, so it refuses the create with a `ValidationException` that names
+//! the build, before the catalog commit, and the table is left as it was.
 //!
 //! # Checks the HTTP server makes that this build does not
 //!
@@ -242,15 +248,6 @@ impl Engine {
         // recovery). The server authenticates between the first two steps and
         // the last; this build authenticates no request.
         let body = extenddb_engine::parse_request(operation, body_json.as_bytes())?.admit()?;
-        // An UpdateTable that creates a vector index is refused here, before
-        // dispatch and so before any catalog write: the build cannot run the
-        // index backfill. Every other UpdateTable change passes through.
-        if operation == "UpdateTable" && creates_vector_index(&body) {
-            return Err(unsupported(
-                "UpdateTable",
-                "it cannot build a vector index; create the table with its vector indexes instead",
-            ));
-        }
 
         let ctx = self.operation_context();
         let result = extenddb_engine::dispatch(operation, body, &ctx, SERVER_ADDR).await?;
@@ -317,20 +314,6 @@ fn unsupported(operation: &str, reason: &str) -> DynamoDbError {
     ))
 }
 
-/// Whether an `UpdateTable` body carries a `VectorIndexUpdates` entry that
-/// creates an index. Inspected as JSON, before deserialization, so the refusal
-/// lands before dispatch and any catalog write; a non-null `Create` member on
-/// any entry is a create.
-fn creates_vector_index(body: &Value) -> bool {
-    body.get("VectorIndexUpdates")
-        .and_then(Value::as_array)
-        .is_some_and(|updates| {
-            updates
-                .iter()
-                .any(|update| update.get("Create").is_some_and(|create| !create.is_null()))
-        })
-}
-
 // These tests drive the portable runtime on a current-thread tokio runtime,
 // which is a non-wasm dev-dependency, so the module compiles only off wasm.
 // The wasm build is exercised through the module's wasm-bindgen surface.
@@ -362,25 +345,6 @@ mod tests {
             .to_owned()
     }
 
-    /// Create a simple single-key `Products` table via the engine.
-    async fn create_products(engine: &Engine) {
-        let out = engine
-            .submit(
-                "CreateTable",
-                r#"{"TableName":"Products",
-                    "KeySchema":[{"AttributeName":"productId","KeyType":"HASH"}],
-                    "AttributeDefinitions":[{"AttributeName":"productId","AttributeType":"S"}],
-                    "BillingMode":"PAY_PER_REQUEST"}"#,
-            )
-            .await;
-        let value = ok_value(&out);
-        assert_eq!(
-            value["TableDescription"]["TableName"].as_str(),
-            Some("Products"),
-            "{out}"
-        );
-    }
-
     /// `DescribeLimits` answers through the adapter with the engine's configured
     /// account and table limits — a no-storage operation.
     #[tokio::test]
@@ -409,25 +373,6 @@ mod tests {
             error_type(&out),
             "com.amazon.coral.service#UnknownOperationException",
             "{out}"
-        );
-    }
-
-    /// An `UpdateTable` that does not create a vector index is not refused by
-    /// the adapter — it passes through to the engine (its outcome is the
-    /// engine's, never the build's "not supported" answer).
-    #[tokio::test]
-    async fn update_table_without_a_vector_create_is_not_refused() {
-        let engine = engine().await;
-        create_products(&engine).await;
-        let out = engine
-            .submit(
-                "UpdateTable",
-                r#"{"TableName":"Products","DeletionProtectionEnabled":true}"#,
-            )
-            .await;
-        assert!(
-            !out.contains("ExtendDB WebAssembly build"),
-            "a non-vector-create UpdateTable must pass through, not be refused: {out}"
         );
     }
 
