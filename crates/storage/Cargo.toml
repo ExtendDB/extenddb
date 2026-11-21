@@ -43,10 +43,6 @@ tokio-util = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-# web-time is `pub use std::time::*` on every target except those where
-# `target_family = "wasm"` and `target_os = "unknown"` (wasm32-unknown-unknown
-# among them). There it reads the JavaScript host's clock, because std::time's
-# SystemTime and Instant panic when read. Used by new_backup_id.
 web-time = { workspace = true }
 zeroize = { workspace = true }
 

@@ -38,13 +38,6 @@ rand = { workspace = true }
 bigdecimal = { workspace = true }
 crc32fast = { workspace = true }
 zeroize = { workspace = true }
-# The clock, so the browser build reads time through a backend that works
-# there. `web-time` is `pub use std::time::*` on every target except those
-# where `target_family = "wasm"` and `target_os = "unknown"`
-# (wasm32-unknown-unknown among them); there it reads the JavaScript host's
-# clock. Without it the `std::time` clock reads on the write path
-# (stream-record and TTL timestamps) compile on wasm32-unknown-unknown but
-# trap when called.
 web-time = { workspace = true }
 
 # Storage transport, split per target. Native keeps `sqlx` (SQLite feature) and

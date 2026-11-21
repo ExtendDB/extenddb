@@ -22,12 +22,6 @@ sha2 = { workspace = true }
 time = { workspace = true }
 uuid = { workspace = true }
 zeroize = { workspace = true }
-# A `std::time` drop-in that also works on wasm32-unknown-unknown. Where
-# `target_family = "wasm"` and `target_os = "unknown"` (wasm32-unknown-unknown
-# and wasm64-unknown-unknown) it backs `Instant`/`SystemTime` with the
-# JavaScript host's clock (`performance.now()` / `Date.now()`) instead of
-# std's, which panics there when read; on every other target it is
-# `pub use std::time::*`.
 web-time = { workspace = true }
 
 # The shared crypto module (src/crypto.rs) uses AWS-LC through aws-lc-rs on

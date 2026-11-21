@@ -26,10 +26,6 @@ sha2 = "0.10"
 hex = "0.4"
 serde_json = { workspace = true }
 time = { workspace = true }
-# web-time is std::time on every target except those where
-# `target_family = "wasm"` and `target_os = "unknown"` (wasm32-unknown-unknown
-# among them). There std's SystemTime::now and Instant::now panic, and
-# web-time reads the JavaScript host's clock instead.
 web-time = { workspace = true }
 tracing = { workspace = true }
 zeroize = { workspace = true }

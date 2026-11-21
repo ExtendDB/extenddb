@@ -182,10 +182,12 @@ rand = "0.9"
 # Time
 chrono = "0.4"
 time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
-# Drop-in for `std::time` that works in a JavaScript host: where
+# Drop-in for `std::time` that works in a JavaScript host. Where
 # `target_family = "wasm"` and `target_os = "unknown"` (wasm32-unknown-unknown
-# and wasm64-unknown-unknown) it backs the clock with the host's `Date.now()`
-# and `performance.now()`; on every other target it is `pub use std::time::*`.
+# and wasm64-unknown-unknown), std's `SystemTime::now` and `Instant::now`
+# panic when called, and web-time reads the host's `Date.now()` and
+# `performance.now()` instead; on every other target it is
+# `pub use std::time::*`.
 web-time = "1"
 
 # TLS
