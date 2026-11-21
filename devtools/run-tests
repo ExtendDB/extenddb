@@ -649,7 +649,8 @@ fi
 #
 # wasm-bindgen-test drives the compiled test module through
 # wasm-bindgen-test-runner, which must match the wasm-bindgen crate in
-# Cargo.lock (a mismatch crashes at run time, not at build time), and runs it
+# Cargo.lock (a runner of another schema version stops with a "different
+# bindgen format" error when cargo hands it the built module), and runs it
 # under the Node on PATH. CARGO_TARGET_..._RUNNER is read only when a wasm
 # `cargo test` executes.
 if $RUN_WASM_TEST; then
