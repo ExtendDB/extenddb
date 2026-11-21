@@ -763,8 +763,9 @@ jobs:
       # storage layer directly against this job's PostgreSQL. The PutItem create
       # race tests hold a create open in an outside transaction, the
       # write-transaction conflict tests force a deadlock, the stream clock test
-      # holds a row lock open while a write waits on it, and the backup restore
-      # cases need catalog rows the current binary would not write; all need
+      # holds a row lock open while a write waits on it, the backup restore
+      # cases need catalog rows the current binary would not write, and the GSI
+      # queue tests seed the queue table and start the workers directly; all need
       # direct access. The online GSI build tests reorder queue rows by hand and
       # pause writers with a test hook. They build their own throwaway databases;
       # the connection string is the server, not a database. `--tests` runs

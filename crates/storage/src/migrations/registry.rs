@@ -112,6 +112,11 @@ migration_ids! {
     /// import stored a second key under an ID that a key already had.
     UniqueAccessKeyIds = 12, "unique_access_key_ids",
         "make every access key ID unique, which the MongoDB catalog did not enforce";
+    /// Adds `idx_gsi_pending_table_claim` on `gsi_pending (worker_partition,
+    /// table_id, id)` in the PostgreSQL data database, which the queue
+    /// workers' per-table claim and per-batch table listing walk (#476).
+    GsiPendingTableClaim = 13, "gsi_pending_table_claim",
+        "add the per-table claim index to the PostgreSQL GSI propagation queue";
 }
 
 /// Highest id that has shipped in a release. Bodies at or below it are frozen:
