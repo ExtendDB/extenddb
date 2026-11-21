@@ -6,10 +6,12 @@
 //! single module and nowhere else.
 //!
 //! On every target except `wasm32` the backend is AWS-LC (through `aws-lc-rs`),
-//! the implementation the server has always used. On `wasm32`, where AWS-LC's C
-//! and assembly do not build, the backend is the pure-Rust RustCrypto stack
-//! (`sha2`, `hmac`, `aes-gcm`), constant-time comparison from `subtle`, and
-//! randomness from `getrandom`'s browser backend.
+//! the library ADR-0026 (`docs/adr/0026-credential-crypto-on-aws-lc.md`) chose
+//! for secret encryption and the SigV4 SHA-256, HMAC-SHA256 and signature
+//! compare. On `wasm32`, where AWS-LC's C and assembly do not build, the
+//! backend is the pure-Rust RustCrypto stack (`sha2`, `hmac`, `aes-gcm`),
+//! constant-time comparison from `subtle`, and randomness from `getrandom`'s
+//! browser backend.
 //!
 //! Both backends compute the same standard algorithms — SHA-256, HMAC-SHA256
 //! and AES-256-GCM — so a value sealed on one target opens on the other. This
