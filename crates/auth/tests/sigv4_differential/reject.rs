@@ -157,7 +157,7 @@ fn method_path_and_query_string_are_covered_by_the_signature() {
         for (shape_name, shape) in corpus::client_shapes(key, corpus::PUT_ITEM) {
             let signed = sign(&shape);
             let header = signed.wire.value("authorization").unwrap();
-            let parsed = parse::parse_authorization(header).unwrap();
+            let parsed = parse::parse_authorization(header.as_bytes(), true).unwrap();
             let headers = signed.wire.header_map();
             let signing_key = signing_key::derive_signing_key(
                 key.secret(),

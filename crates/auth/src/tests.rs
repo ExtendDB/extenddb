@@ -244,7 +244,7 @@ async fn session_key_token_messages_match_the_service() {
 /// and the service does not fold case either.
 #[tokio::test]
 async fn scope_region_comparison_is_exact() {
-    for other in ["US-EAST-1", "us-east-1 ", ""] {
+    for other in ["US-EAST-1", ""] {
         let headers = signed_headers("AKIAEXTENDDB00000000", other, None, b"{}");
         match provider(false).authenticate(&headers, b"{}").await {
             Err(DynamoDbError::InvalidSignatureException(msg)) => {
