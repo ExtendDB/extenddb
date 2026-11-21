@@ -76,7 +76,7 @@ const INEQUALITY: &str = "Country = :c AND Price > :p";
 
 async fn parsed(expr: Option<&str>) -> Result<bool, DynamoDbError> {
     let values = values();
-    parse_request(&Served, CALLER, expr, None, Some(&values))
+    parse_request(&Served, CALLER, expr, None, Some(&values), None)
         .await
         .map(|parsed| parsed.is_some())
 }
@@ -143,7 +143,7 @@ async fn the_scope_selects_the_hash_partition_and_filters_items() {
     let _serial = SERIAL.lock().await;
     install(Ok(Some("all")));
     let values = values();
-    let extended = parse_request(&Served, CALLER, Some(INEQUALITY), None, Some(&values))
+    let extended = parse_request(&Served, CALLER, Some(INEQUALITY), None, Some(&values), None)
         .await
         .unwrap()
         .expect("parsed with the extended grammar");

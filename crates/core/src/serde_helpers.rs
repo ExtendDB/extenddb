@@ -20,7 +20,7 @@ const MAX_PLACEHOLDER_KEY_BYTES: usize = 255;
 
 /// A placeholder identifier (the text after the `#` / `:`) is one or more of
 /// `[A-Za-z0-9_]`.
-fn is_placeholder_ident(rest: &str) -> bool {
+pub(crate) fn is_placeholder_ident(rest: &str) -> bool {
     !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 

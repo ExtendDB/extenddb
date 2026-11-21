@@ -20,6 +20,7 @@ mod projection;
 mod reserved_words;
 mod resolver;
 mod search_condition;
+pub mod search_params;
 #[cfg(feature = "search-inequality-filters")]
 pub mod search_filter;
 #[cfg(test)]

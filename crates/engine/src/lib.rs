@@ -46,6 +46,7 @@ mod request_limits;
 mod scan;
 mod search_vectors;
 mod search_vectors_extended;
+mod search_vectors_params;
 mod start_key;
 pub mod stream_capture;
 mod streams;

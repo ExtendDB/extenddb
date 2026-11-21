@@ -28,6 +28,7 @@ mod imp {
     use extenddb_core::expression::search_filter::{
         DEFAULT_MAX_CONDITIONS, EnabledAccounts, SearchFilter, parse_search_filter,
     };
+    use extenddb_core::expression::search_params::with_unused_names;
     use extenddb_core::settings_keys::SEARCH_INEQUALITY_FILTERS;
     use extenddb_core::types::{AttributeDefinition, AttributeValue, Item, SearchSchemaElement};
     use extenddb_storage::error::StorageError;
@@ -77,7 +78,8 @@ mod imp {
     /// Parse the request's search condition with the extended grammar when
     /// the setting enables it for the caller. `None` when it does not, or when
     /// the request has no search condition; the handler then runs its
-    /// equality-only validator.
+    /// equality-only validator. A name that neither the search condition nor
+    /// `projection` uses is refused once the condition parses.
     ///
     /// Taking the backend's vector search engine means the grammar is only
     /// parsed once the backend has been found to serve vector search: a
@@ -92,6 +94,7 @@ mod imp {
         expr: Option<&str>,
         names: Option<&HashMap<String, String>>,
         values: Option<&HashMap<String, AttributeValue>>,
+        projection: Option<&str>,
     ) -> Result<Option<Extended>, DynamoDbError> {
         let Some(expr) = expr else {
             return Ok(None);
@@ -101,8 +104,12 @@ mod imp {
         if !enabled_accounts().await.enabled_for(account_id, None) {
             return Ok(None);
         }
-        parse_search_filter(expr, names, values, DEFAULT_MAX_CONDITIONS)
-            .map(|filter| Some(Extended(Arc::new(filter))))
+        with_unused_names(
+            parse_search_filter(expr, names, values, DEFAULT_MAX_CONDITIONS),
+            names,
+            &[expr, projection.unwrap_or_default()],
+        )
+        .map(|filter| Some(Extended(Arc::new(filter))))
     }
 
     /// The partition the HASH condition selects and the filter the backend
@@ -161,6 +168,7 @@ mod imp {
         _expr: Option<&str>,
         _names: Option<&HashMap<String, String>>,
         _values: Option<&HashMap<String, AttributeValue>>,
+        _projection: Option<&str>,
     ) -> Result<Option<Extended>, DynamoDbError> {
         Ok(None)
     }

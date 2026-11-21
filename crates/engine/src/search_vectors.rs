@@ -16,7 +16,6 @@ use serde_json::Value;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
     ExpressionMaps, Projection, validate_conditions_against_search_schema,
-    validate_search_condition_expression,
 };
 use extenddb_core::types::{
     AttributeValue, DescribeTableInput, Item, ReturnConsumedCapacity, SearchSchemaElementType,
@@ -123,6 +122,14 @@ pub async fn handle_search_vectors(
         )));
     }
 
+    crate::search_vectors_params::check(
+        input.expression_attribute_names.as_ref(),
+        input.expression_attribute_values.as_ref(),
+        input.search_condition_expression.as_deref(),
+        input.projection_expression.as_deref(),
+        &ctx.limits,
+    )?;
+
     // Structural validation of the filter expression (schema-independent).
     // An account the extended grammar is enabled for gets that parser instead.
     let extended = crate::search_vectors_extended::parse_request(
@@ -131,14 +138,16 @@ pub async fn handle_search_vectors(
         input.search_condition_expression.as_deref(),
         input.expression_attribute_names.as_ref(),
         input.expression_attribute_values.as_ref(),
+        input.projection_expression.as_deref(),
     )
     .await?;
     let conditions = match input.search_condition_expression.as_deref() {
         Some(_) if extended.is_some() => Vec::new(),
-        Some(expr) => validate_search_condition_expression(
+        Some(expr) => crate::search_vectors_params::equality_conditions(
             expr,
             input.expression_attribute_names.as_ref(),
             input.expression_attribute_values.as_ref(),
+            input.projection_expression.as_deref(),
         )?,
         None => Vec::new(),
     };
