@@ -189,7 +189,7 @@ async fn handle_dynamodb_request<S: StorageEngine + 'static>(
 fn extract_operation(headers: &HeaderMap) -> Result<String, DynamoDbError> {
     let target = headers.get("x-amz-target")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| DynamoDbError::missing_auth_token("Missing X-Amz-Target header"))?;
+        .ok_or_else(|| DynamoDbError::unknown_operation(String::new()))?;
 
     // DynamoDB and DynamoDB Streams are separate services in every SDK but
     // extenddb serves both on the same port. The X-Amz-Target prefix distinguishes them:
