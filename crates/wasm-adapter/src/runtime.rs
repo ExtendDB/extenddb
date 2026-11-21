@@ -59,69 +59,15 @@
 //!
 //! # Checks the HTTP server makes that this build does not
 //!
-//! Before the server dispatches a request, it checks the body size, the
-//! signature, the IAM policies, the names, ARNs and accounts the request
-//! carries, and, when throttling is on, the table's throughput. Apart from
-//! the IAM decision it makes these checks for every caller, in developer mode
-//! too. [`Engine::dispatch`] makes none of them: the engine's handler for the
-//! operation answers the request instead. For each check, the server's answer
-//! and this build's answer to the same request follow. The parity corpus
-//! records this build's answers, except the body-size one, which the unit
-//! test `a_list_tables_body_over_16_mib_is_answered` records; nothing records
-//! throttling.
-//!
-//! - **Body size.** A body over 16 MiB: the server answers
-//!   `RequestEntityTooLargeException` (HTTP 413). This build has no limit and
-//!   answers the request.
-//! - **Signature and IAM policies.** The server answers its authentication
-//!   and authorization errors. This build verifies no signature and
-//!   evaluates no policy; every request runs under [`ACCOUNT_ID`].
-//! - **Table names and table ARNs**, in `TableName` and the other fields
-//!   that carry one. `GetItem` with `TableName` `bad name!`: the server
-//!   answers `ValidationException` `1 validation error detected: Value 'bad
-//!   name!' at 'tableName' failed to satisfy constraint: Member must satisfy
-//!   regular expression pattern: [a-zA-Z0-9_.-]+`; this build,
-//!   `ResourceNotFoundException`. `ListStreams` with `TableName` `ab`: the
-//!   server answers `ValidationException` `TableName must be at least 3
-//!   characters long and at most 255 characters long`; this build lists no
-//!   streams.
-//! - **A `StreamArn` that is not a stream ARN.** `DescribeStream` with a table
-//!   ARN: the server answers `ValidationException` `Invalid StreamArn`; this
-//!   build, `ValidationException` `Invalid stream ARN format: <the ARN>`.
-//! - **A `StreamArn` outside the server's partition, service and region.**
-//!   `DescribeStream` and `GetShardIterator` with a stream's ARN respelled with
-//!   region `us-west-2`: the server answers `ValidationException`
-//!   `Invalid StreamArn`; this build describes the stream and issues an
-//!   iterator for it.
-//! - **A resource named by an ARN in another account.** `GetItem` with
-//!   another account's table ARN: the server answers `AccessDeniedException`,
-//!   for an account it does not hold `The caller is not authorized to access
-//!   the specified resource.`; this build, `ResourceNotFoundException`.
-//!   `DescribeStream` with a stream's ARN respelled with another account: the
-//!   server answers `AccessDeniedException`, for an account it does not hold
-//!   `Access is denied`; this build describes the stream.
-//! - **A tag operation's `ResourceArn` that names an index.** Both answer the
-//!   same `ValidationException`; this build's comes from the tag handler.
-//! - **A `BackupArn` that is not a backup ARN.** `DescribeBackup` with
-//!   `not-a-backup-arn`: the server answers `ValidationException` `Invalid
-//!   Backup ARN`; natively this build's `DescribeBackup` handler answers
-//!   `ValidationException` `Invalid Request: BackupArn is not valid`, and on
-//!   wasm32 the engine refuses the operation (above).
-//! - **An export `TableArn` that does not parse.** The server answers
-//!   `ValidationException` `One or more parameter values were invalid:
-//!   tableArn is not a valid ARN`; this build, the export handler's
-//!   `ValidationException` that export is disabled.
-//! - **A `GetRecords` iterator.** One that does not decode, and one from
-//!   before iterators carried their stream ARN, get the same answers from both
-//!   (`ValidationException` `Invalid ShardIterator` and
-//!   `ExpiredIteratorException`); this build's come from the `GetRecords`
-//!   handler. One whose stream ARN is outside the server's partition, service
-//!   and region or the caller's account: the server answers
-//!   `ValidationException` `Invalid ShardIterator`; this build reads the
-//!   stream's records.
-//! - **Throttling.** A server with throttling on answers
-//!   `ProvisionedThroughputExceededException` to reads or writes past a
-//!   table's capacity. This build never throttles.
+//! Before the server dispatches a request, its request handler
+//! (`handle_request` in `crates/server/src/handler.rs`) and its authorization
+//! (`authorize_request` in `crates/server/src/request_helpers.rs`) check it.
+//! Of the server's checks, [`Engine::dispatch`] runs only the two the engine
+//! owns, `extenddb_engine::parse_request` and `ParsedRequest::admit`. A
+//! request one of the others would refuse gets the answer this build gives
+//! it anyway: the engine handler's for the operation, or one of the refusals
+//! above. The README section "Checks the server makes that this build does
+//! not" describes the others, with the server's answer and this build's.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -257,9 +203,8 @@ impl Engine {
         // the engine's order: the operation name, then the body parse, then the
         // engine's refusals of requests no deployment serves (point-in-time
         // recovery). The server authenticates between the first two steps and
-        // the last, and makes its other checks (listed in the module doc)
-        // around them; this build authenticates no request and makes none of
-        // those.
+        // the last, and makes its other checks (see the module doc) around
+        // them; this build authenticates no request and makes none of those.
         let body = extenddb_engine::parse_request(operation, body_json.as_bytes())?.admit()?;
 
         let ctx = self.operation_context();

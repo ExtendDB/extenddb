@@ -398,34 +398,87 @@ linear memory (`RuntimeError: unreachable` in a release build).
 
 ### Checks the server makes that this build does not
 
-Before the HTTP server dispatches a request to the engine, it checks the body
-size, the signature, the IAM policies, the names, ARNs and accounts the request
-carries, and, when throttling is on, the table's throughput. This build makes
-none of these checks: it passes each request to the engine's handler for the
-operation, so the handler answers a request the server would have refused, and
-the two answers can differ. Apart from the IAM decision, the server makes these
-checks for every caller, in developer mode too. This build's answer to each
-example request is the one its parity corpus
-(`crates/wasm-adapter/parity/corpus.json`) records, with two exceptions: a
-unit test in `crates/wasm-adapter/src/runtime.rs` records the answer to the
-17 MiB body, and no test covers throttling, which takes a sustained run of
-requests.
+Before the HTTP server passes a request to the engine, its request handler
+(`handle_request` in `crates/server/src/handler.rs`) and its authorization
+(`authorize_request` in `crates/server/src/request_helpers.rs`) check it. Both
+builds run the checks the engine owns, `parse_request` and
+`ParsedRequest::admit` in `crates/engine/src/pre_dispatch.rs`. This build makes
+none of the server's other checks: it passes the request to the engine's
+handler for the operation, so where a check below refuses a request, this
+build answers what the handler answers, and the two answers can differ. Apart
+from the IAM decision, the server makes these checks for every caller, in
+developer mode too. Its HTTP framing checks (the headers, `X-Amz-Target` among
+them, and the body read timeout) have no counterpart in
+`submit(operation, body)`, and neither has its refusal of every request while
+a Cassandra, MongoDB or PostgreSQL backend registers again with its catalog.
+Its authorization also looks up the key schema of the table that a `GetItem`,
+`PutItem`, `DeleteItem`, `UpdateItem`, `Query` or `Scan` names, and answers a
+storage fault in that lookup, before dispatch, with the error the engine's
+`storage_err_to_dynamo` gives for it; this build makes no lookup before the
+handler's own.
 
-| The server checks | Example request | The server answers | This build answers |
+The table gives, for each check, the requests it refuses and both answers;
+`<name>`, `<arn>` and `<value>` stand for the value the request sent, and "the
+pattern" is `[a-zA-Z0-9_.-]+`. This build's answer is the one to a request that
+is otherwise well formed. The server makes these checks before the handler
+reads the rest of the body, so where the rest of the body is something the
+handler refuses, this build gives the handler's error for it instead (for
+example `SerializationException` "Start of structure or map found where not
+expected: missing field `Key`"), and an operation that ignores the member a
+check reads answers as it always does (`DescribeLimits` with any `TableName`
+answers its limits). A request for an operation this build refuses (see "What
+it refuses") gets that refusal. The parity corpus records each of this build's
+answers below in a case whose name starts with the check and a colon, except
+these: the refusals, which the cases listed under "What it refuses" record;
+the answer to an oversized body, which the unit test
+`a_list_tables_body_over_16_mib_is_answered` in
+`crates/wasm-adapter/src/runtime.rs` records, in native builds only (the
+`tests` module that holds it is not compiled for `wasm32`); and the signature
+and throttling answers, which no test records.
+
+| Check | The requests it refuses | The server answers | This build answers |
 |---|---|---|---|
-| the body is at most 16 MiB | `ListTables` with a 17 MiB body | `RequestEntityTooLargeException` (HTTP 413) | `{"TableNames":[]}`: it has no size limit |
-| the SigV4 signature and the IAM policies | any | its authentication and authorization errors | the request, under account `000000000000` |
-| table names and table ARNs, in `TableName` and the other fields that carry one | `GetItem` with `TableName` `bad name!` | `ValidationException` "1 validation error detected: Value 'bad name!' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+" | `ResourceNotFoundException` "Requested resource not found" |
-| | `ListStreams` with `TableName` `ab` | `ValidationException` "TableName must be at least 3 characters long and at most 255 characters long" | `{"Streams":[]}` |
-| a `StreamArn` is a stream ARN | `DescribeStream` with a table ARN | `ValidationException` "Invalid StreamArn" | `ValidationException` "Invalid stream ARN format: …" |
-| a `StreamArn` names the server's partition, service and region | `DescribeStream` and `GetShardIterator` with a stream's ARN respelled with region `us-west-2` | `ValidationException` "Invalid StreamArn" | the stream's description; an iterator for the stream |
-| a resource named by an ARN is in the caller's account | `GetItem` with a table ARN of account `111111111111`; `DescribeStream` with a stream's ARN respelled with that account | `AccessDeniedException`, for an account the server does not hold "The caller is not authorized to access the specified resource." (`GetItem`) and "Access is denied" (`DescribeStream`) | `ResourceNotFoundException` "Requested resource not found"; the stream's description |
-| a tag operation's `ResourceArn` names a table or a stream | `TagResource` on an index ARN | `ValidationException` "One or more parameter values were invalid: Invalid resource arn provided, only table or stream is accepted. …" | the same answer, from the tag handler |
-| a `BackupArn` is a backup ARN | `DescribeBackup` with a `BackupArn` that is not one | `ValidationException` "Invalid Backup ARN" | the refusal of `DescribeBackup` (see "What it refuses") |
-| an export `TableArn` parses as an ARN | `ExportTableToPointInTime` with `TableArn` `table/Products` | `ValidationException` "One or more parameter values were invalid: tableArn is not a valid ARN" | `ValidationException` "Export is disabled. Configure [export] paths in extenddb.toml to enable." |
-| a `GetRecords` iterator decodes and carries its stream ARN | `GetRecords` with an iterator that does not decode; with one from before iterators carried their stream ARN | `ValidationException` "Invalid ShardIterator"; `ExpiredIteratorException` "Shard iterator has expired" | the same answers, from the `GetRecords` handler |
-| a `GetRecords` iterator's stream ARN names the server's partition, service and region and the caller's account | `GetRecords` with the iterator this build issued for the `us-west-2` spelling above | `ValidationException` "Invalid ShardIterator" | the stream's records |
-| a table's throughput, when `throttling_enabled` is on (it is off by default) | reads or writes past a table's capacity | `ProvisionedThroughputExceededException` | the request: it never throttles |
+| **body size** | any request whose body is over 16 MiB | `RequestEntityTooLargeException` (HTTP 413) "Request size has exceeded the maximum allowed size" | the request: it has no size limit, so `ListTables` with a 17 MiB body answers `{"TableNames":[]}` |
+| **signature** | a request without a SigV4 signature the server can verify with a key it issued and, outside developer mode, one its IAM policies do not allow | its authentication errors, such as `MissingAuthenticationToken`, `IncompleteSignatureException`, `UnrecognizedClientException` and `InvalidSignatureException`, and its authorization errors | the request, under account `000000000000` |
+| **table names** | a `TableName` outside the pattern (`bad name!`) on `GetItem`, `Query`, `Scan`, `SearchVectors` and `UpdateTable` | `ValidationException` "1 validation error detected: Value '<name>' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"; for a name shorter than 3 or longer than 255 characters, "2 validation errors detected: ", the length clause ("Member must have length greater than or equal to 3" or "… less than or equal to 255") and then the pattern clause, joined by "; " | `ResourceNotFoundException` "Requested resource not found" |
+| | a `RequestItems` key outside the pattern on `BatchGetItem` and `BatchWriteItem` | the same, at 'requestItems', with the constraint "Map keys must satisfy constraint: [Member must have length less than or equal to 255, Member must have length greater than or equal to 3, Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+]" | `ResourceNotFoundException` "Requested resource not found" |
+| | a `TableName` outside the pattern in a `TransactItems` member on `TransactGetItems` and `TransactWriteItems` | the same, at 'transactItems.<n>.member.<op>.tableName', with `<n>` counted from 1 and `<op>` one of `get`, `put`, `delete`, `update` and `conditionCheck` | `ResourceNotFoundException` "Requested resource not found" |
+| | a `TableName` outside the pattern on `PutItem`, `UpdateItem`, `DeleteItem`, `CreateTable`, `DescribeTable`, `DeleteTable`, `DescribeTimeToLive` and `UpdateTimeToLive` | the answer at 'tableName' above | the same answer for a name of 3 to 255 characters; for a shorter or longer name, its length clause alone: "1 validation error detected: Value '<name>' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3" (or "… less than or equal to 255") |
+| | a `TableName` outside the pattern on `DescribeContinuousBackups`, `UpdateContinuousBackups` and `ListBackups` | the answer at 'tableName' above | the same answer |
+| | a `TableName` outside the pattern on an operation that takes none, `DescribeLimits` and `GetRecords` | the answer at 'tableName' above | the operation's answer to the rest of the request: `DescribeLimits` answers its limits, and `GetRecords` answers for its `ShardIterator` |
+| | an `ExclusiveStartTableName` outside the pattern on `ListTables` (a value starting with `arn:` is refused only when it carries U+0000) | the same, at 'exclusiveStartTableName' | `ValidationException` "1 validation error detected: Value '<name>' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+", with no length clause |
+| | a `TableCreationParameters.TableName` outside the pattern on `ImportTable` (as above for `arn:`) | the same, at 'tableCreationParameters.tableName' | `ValidationException` "Import is disabled. Configure [import] paths in extenddb.toml to enable." |
+| | a `TableName` on `ListStreams` that is outside the pattern, has 1, 2 or more than 255 characters, or is an ARN | `ValidationException` "TableName must be at least 3 characters long and at most 255 characters long" | `{"Streams":[]}` |
+| **index names** | an `IndexName` outside the pattern (`bad index!`) on `Query`, `Scan` and `SearchVectors` | `ValidationException` "1 validation error detected: Value '<name>' at 'indexName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+" | `ValidationException` "The table does not have the specified index: <name>", and `ResourceNotFoundException` "Requested resource not found" when the table does not exist |
+| **table ARNs** | a `TableName`, a `RequestItems` key or a `TransactItems` member's `TableName` that starts with `arn:` and is not a plain table ARN (`arn:bogus`, an index, stream or backup ARN), names another vendor (`arn:aws:s3:…:table/T`), has a region with a character outside `[a-z0-9-]`, a table segment outside the pattern, or an account segment that is not 12 digits; on `GetItem`, `Query`, `Scan`, `SearchVectors`, `UpdateTable`, `BatchGetItem`, `BatchWriteItem`, `TransactGetItems` and `TransactWriteItems` | `ValidationException` "1 validation error detected: Value '<arn>' at '<member>' failed to satisfy constraint: <reason>", with the first of these reasons that applies: "Valid ARN format is 'arn:<awsPartition>:<vendor>:<region>:<subscriber>:resourceType/resourceName', …", "Invalid vendor code", "Invalid AWS region", "Table name of ARN must satisfy regular expression pattern: [a-zA-Z0-9_.-]+", "Invalid subscriber ID"; at 'requestItems' the constraint is "Map keys must satisfy constraint: [Valid resource name or resource arn must be given. …]". On `CreateTable`, `DescribeTable`, `UpdateTable`, `DeleteTable`, `DescribeTimeToLive`, `UpdateTimeToLive`, `DescribeContinuousBackups`, `UpdateContinuousBackups`, `CreateBackup` and `ListBackups`, a vendor or region fault is "1 validation error detected: Invalid vendor code in '<arn>'" (or "Invalid AWS region in '<arn>'"), and an account fault, as on `BatchWriteItem` unless the account carries U+0000, gets the **accounts** answer | `ResourceNotFoundException` "Requested resource not found" |
+| | the same on `PutItem`, `UpdateItem`, `DeleteItem`, `CreateTable`, `DescribeTable`, `DeleteTable`, `DescribeTimeToLive` and `UpdateTimeToLive` | as above | `ValidationException` "1 validation error detected: Value '<arn>' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+" |
+| | the same on `DescribeContinuousBackups` and `UpdateContinuousBackups` | as above | `TableNotFoundException` "Table not found: <arn>" |
+| | the same on an operation that takes no `TableName`, `DescribeLimits` and `GetRecords` | as above | the operation's answer to the rest of the request, as for **table names** |
+| | the same on `ListBackups` | as above | `ValidationException` "Invalid Request: TableName is not a valid table name or table ARN"; for a region fault, the server's answer; for an empty table segment, "1 validation error detected: Value '' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3"; for a table segment outside the pattern, the pattern clause for that segment at 'tableName' |
+| **names inside other ARNs** | a stream ARN whose table segment is outside the pattern or whose label carries U+0000, as the `StreamArn` of `DescribeStream` | `ValidationException` "Invalid StreamArn" | `ResourceNotFoundException` "Requested resource not found: Stream: <arn> not found" |
+| | the same, as the `StreamArn` of `GetShardIterator` | `ValidationException` "Invalid StreamArn" | `ResourceNotFoundException` "Requested resource not found: Stream does not exist" |
+| | the same, as the `ExclusiveStartStreamArn` of `ListStreams` | `ValidationException` "Invalid StreamArn" | the handler's list of streams from that start ARN; with a `TableName` and a table segment outside the pattern, `ValidationException` "One or more parameter values were invalid: ExclusiveStartStreamArn provided is invalid: <arn>" |
+| | the same, as the `ResourceArn` of `TagResource`, `UntagResource` and `ListTagsOfResource` | `ValidationException` "Invalid StreamArn" | for U+0000 in the label, the tag handler's answer for that ARN: `TagResource` and `UntagResource` answer `{}` and change its tags, and `ListTagsOfResource` lists them; for a table segment outside the pattern, `ResourceNotFoundException` "Requested resource not found: ResourceArn: <arn> not found" |
+| | a table ARN whose table segment is outside the pattern, as the `ResourceArn` of the same three operations | `ValidationException` "Invalid TableArn: Invalid ResourceArn provided as input <arn>" | `ResourceNotFoundException` "Requested resource not found: ResourceArn: <arn> not found" |
+| | a table ARN whose table segment is outside the pattern, as the `TableArn` of `ExportTableToPointInTime` | `ValidationException` "Invalid TableArn: Invalid Table ARN" | `ValidationException` "Export is disabled. Configure [export] paths in extenddb.toml to enable." |
+| **StreamArn kind** | a `StreamArn` of `DescribeStream` and `GetShardIterator` that is not a stream ARN (a table, index or backup ARN, `not-an-arn`) | `ValidationException` "Invalid StreamArn" | `ValidationException` "Invalid stream ARN format: <value>" |
+| | a stream ARN with an empty partition, service or account field | `ValidationException` "Invalid StreamArn" | the stream's description; an iterator for the stream |
+| **StreamArn scope** | a stream ARN as the `StreamArn` of `DescribeStream` and `GetShardIterator` whose partition is not `aws`, service not `dynamodb` or region not the server's (`aws-cn`, `DYNAMODB`, `us-west-2`, an empty region) | `ValidationException` "Invalid StreamArn" | the stream's description; an iterator for the stream |
+| **accounts** | a table, stream or backup ARN in another account (an account segment that is not 12 digits, where the **table ARNs** check does not refuse it first, counts as an account the server does not hold), as a `TableName`, a `RequestItems` key, a `TransactItems` member's `TableName`, a `StreamArn`, a tag operation's `ResourceArn`, a `BackupArn` or an export `TableArn`; on `GetItem`, `Query`, `Scan`, `SearchVectors`, `UpdateTable`, `BatchGetItem`, `BatchWriteItem`, `TransactGetItems` and `TransactWriteItems` | for an account the server does not hold, `AccessDeniedException` "The caller is not authorized to access the specified resource." on `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query`, `Scan` and `BatchGetItem`, and "Access is denied" on the others; for an account it holds, `ValidationException` "This action is only supported by accounts that match the resource owner’s account." on `CreateTable`, `DescribeTimeToLive`, `UpdateTimeToLive`, `DescribeContinuousBackups`, `UpdateContinuousBackups`, `CreateBackup`, `ListBackups`, `DescribeBackup`, `DeleteBackup`, `RestoreTableFromBackup` and `ExportTableToPointInTime`, and `AccessDeniedException` "User: <principal> is not authorized to perform: dynamodb:<action> on resource: <arn> because no resource-based policy allows the dynamodb:<action> action" on the others; for a batch or transaction whose tables are in more than one account, `ValidationException` "Invalid request! All tables in the request must be from a single account." | `ResourceNotFoundException` "Requested resource not found" |
+| | the same on `PutItem`, `UpdateItem`, `DeleteItem`, `CreateTable`, `DescribeTable`, `DeleteTable`, `DescribeTimeToLive` and `UpdateTimeToLive` | as above | `ValidationException` "1 validation error detected: Value '<arn>' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+" |
+| | the same on `DescribeContinuousBackups` and `UpdateContinuousBackups` | as above | `TableNotFoundException` "Table not found: <arn>" |
+| | the same on `ListBackups`, `TagResource`, `UntagResource` and `ListTagsOfResource` | as above | `AccessDeniedException` "Access is denied", the server's answer for an account it does not hold; on `ListBackups`, for an account segment that is empty or has a character other than a digit, `ValidationException` "Invalid Request: TableName is not a valid table name or table ARN" |
+| | the same on `DescribeStream` and `GetShardIterator` | as above | the stream's description; an iterator for the stream |
+| | the same on `ExportTableToPointInTime` | as above | `ValidationException` "Export is disabled. Configure [export] paths in extenddb.toml to enable." |
+| **tag ResourceArn kind** | a non-empty `ResourceArn` of `TagResource`, `UntagResource` and `ListTagsOfResource` that does not start with `arn:`, is an index or backup ARN, or is a DynamoDB ARN of no table | `ValidationException` "One or more parameter values were invalid: ARNs must start with 'arn:': <value>", "… Invalid resource arn provided, only table or stream is accepted. Provided resource arn: <arn>" or "… Provided Arn is not a DynamoDB resource arn: <arn>" | the same answer, from the tag handler |
+| **BackupArn kind** | a `BackupArn` of `DescribeBackup` and `DeleteBackup` that is not a backup ARN, and a backup ARN whose table segment is outside the pattern (also as the `BackupArn` of `RestoreTableFromBackup`) | `ValidationException` "Invalid Backup ARN" | the refusal of the operation (see "What it refuses") |
+| **export TableArn** | a `TableArn` of `ExportTableToPointInTime` that does not parse as a table resource ARN (`table/Products`, a repeated `table/` segment) | `ValidationException` "One or more parameter values were invalid: tableArn is not a valid ARN" | `ValidationException` "Export is disabled. Configure [export] paths in extenddb.toml to enable." |
+| **GetRecords iterator** | `GetRecords` with no `ShardIterator`, a `ShardIterator` that is not a string, or a body that is not an object | `ValidationException` "Invalid ShardIterator" | `SerializationException` from the body parse: "missing field `ShardIterator`", "invalid type: integer `5`, expected a string", "invalid length 0, expected struct GetRecordsInput with 2 elements" and the like |
+| | an iterator that does not decode, beside a member the handler cannot read (`"Limit":"5"`) | `ValidationException` "Invalid ShardIterator" | `SerializationException` `invalid type: string "5", expected i64` |
+| | any other iterator that does not decode, the empty string included | `ValidationException` "Invalid ShardIterator" | the same answer |
+| | an iterator from before iterators carried their stream ARN | `ExpiredIteratorException` "Shard iterator has expired" | the same answer |
+| **GetRecords iterator scope** | an iterator whose stream ARN is not in the server's partition, service and region and the caller's account | `ValidationException` "Invalid ShardIterator" | the records of the stream the iterator names (this build issues such an iterator for a respelled `StreamArn`; see **StreamArn scope**), or `ResourceNotFoundException` "Requested resource not found: Stream does not exist" when no table has that stream |
+| **throttling** | reads and writes past a table's provisioned throughput, when `throttling_enabled` is on (it is off by default) | `ProvisionedThroughputExceededException` | the request: it never throttles |
 
 ### Building it
 

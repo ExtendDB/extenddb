@@ -11,14 +11,13 @@
 //! [`crate::dispatch`]. A check added to either step reaches both entry
 //! points.
 //!
-//! They are not every check a request meets. Around the engine, the server
-//! also caps the request body at 16 MiB and authenticates the request between
-//! the two steps. After `admit`, in authorization and in developer mode too,
-//! it refuses the table names and ARNs the service refuses, refuses a request
-//! for a resource in another account, and refuses a `GetRecords` shard
-//! iterator it cannot decode. When throttling is on, it then throttles reads
-//! and writes against the table's throughput. The WebAssembly adapter applies
-//! none of these.
+//! They are the only checks both entry points make before dispatch. Every
+//! other check the server makes before it dispatches a request is its own
+//! (most of them are in its request handler, `handle_request`, and its
+//! authorization, `authorize_request`), and apart from the IAM decision each
+//! runs in developer mode too. The WebAssembly adapter makes none of them, so
+//! a check that must reach both entry points belongs in one of the two steps
+//! here.
 //!
 //! The types fix the order of the two steps: `admit` is a method of
 //! [`ParsedRequest`], which only `parse_request` constructs, so `admit` runs
