@@ -45,11 +45,18 @@ uuid = { workspace = true, features = ["js"] }
 # over `sha2`, constant-time compare via `subtle`, AES-256-GCM via `aes-gcm`,
 # and randomness via `getrandom`'s browser backend. `aes-gcm` runs with default
 # features off (dropping its built-in getrandom 0.2 RNG, which does not build on
-# wasm32) and `zeroize` on so key material is wiped on drop; the nonce is drawn
-# from getrandom 0.3 directly.
+# wasm32); the nonce is drawn from getrandom 0.3 directly.
 hmac = "0.12"
 subtle = "2"
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc", "zeroize"] }
+# Each crate in the AES-256-GCM stack wipes only its own key material, and only
+# under its own `zeroize` feature: aes-gcm wipes the GHASH key it derives, aes
+# the AES round keys, ghash the keys it derives for POLYVAL, and polyval the
+# POLYVAL key and state. aes-gcm's feature does not enable the others, so they
+# are named here only to turn the feature on.
+aes = { version = "0.8", features = ["zeroize"] }
+ghash = { version = "0.5", features = ["zeroize"] }
+polyval = { version = "0.6", features = ["zeroize"] }
 getrandom = { version = "0.3", features = ["wasm_js"] }
 # On wasm32 the `time` crate's `OffsetDateTime::now_utc()` reads the clock via
 # `std::time::SystemTime::now()`, which panics on wasm32-unknown-unknown. The
