@@ -362,7 +362,7 @@ if [[ " ${RUN_TESTS_ARGS[*]} " == *" --rust"* ]]; then
     EXTENDDB_TEST_MONGODB_REQUIRED=1 \
         cargo test -p extenddb-storage-mongodb --test migrations_fresh --test migrations_guards \
             --test migrations_holders --test migrations_locks --test migrations_released \
-            --test migrations_spill --test metrics_store
+            --test migrations_spill --test metrics_store --test migrations_startup
     echo ""
 fi
 echo "=== Running test suite via devtools/run-tests --backend mongodb ==="

@@ -71,7 +71,7 @@ See `docs/local-postgres-setup.md` for full setup instructions.
 
 **Cause:** The catalog's status, read from its migration ledgers, is not one this binary serves: exit 3 means migrations are pending, 4 that the catalog has a breaking migration this binary does not know, 5 that a person must act, and 6 that the migration lock or a running server outlasted `--lock-timeout`. The [status table](manuals/07-upgrade-manual.md#the-catalog-status) of the upgrade manual lists each status with its exit codes.
 
-**Fix:** Run the command the message prints. For pending migrations that is `extenddb migrate --config extenddb.toml --yes`, after the backup the message names.
+**Fix:** Run the command the message prints. For pending migrations that is `extenddb migrate --config extenddb.toml --yes`, after the backup the message names, or start the server with `--migrate`. For `serve`, exit 6 means that the wait outlasted `[server] catalog_upgrade_lock_timeout`, or that a migration held the lock when the server registered; start the server again once the lock is free.
 
 ### `the catalog at <location> is not initialized; create it with 'extenddb init'`
 
@@ -330,7 +330,7 @@ The last ring write of `rotate` is conditional too, on the two-DEK ring of its f
 
 **Cause:** The server keeps the key that opens stored secrets and the cached signing keys in memory it locks out of swap and core dumps, sized by `[auth.cache] max_entries` (two 32-byte slots per entry, 640,000 bytes for the default, plus one buffer per runtime worker thread). The process's memlock limit is below that size: 64 KiB is the kernel default before Linux 5.16, and `mlock` of 1 MiB fails with `ENOMEM` under it. With `key_file` set the server refuses to start and names the memlock limit it needs; without `key_file` it logs a warning and starts with the keys in unlocked memory.
 
-**Fix:** Raise the limit: `LimitMEMLOCK=16M` in the systemd unit, `--ulimit memlock=` for a container, or a smaller `max_entries`. To start anyway with `key_file` set, `[auth.encryption] require_locked_memory = false` turns the refusal into a warning. The startup log line names the protection in force: `memfd_secret`, locked pages, or none. `serve` sets the key store up before it reads the catalog, so a refusal from the catalog (one of the entries above) can follow at the next start once the limit is raised.
+**Fix:** Raise the limit: `LimitMEMLOCK=16M` in the systemd unit, `--ulimit memlock=` for a container, or a smaller `max_entries`. To start anyway with `key_file` set, `[auth.encryption] require_locked_memory = false` turns the refusal into a warning. The startup log line names the protection in force: `memfd_secret`, locked pages, or none. `serve` checks the catalog, and under `catalog_upgrade = "apply"` migrates it, before it sets the key store up. A catalog refusal (one of the entries above) therefore comes first. This refusal can follow once the catalog is current.
 
 ### A request fails with `InternalServerError` (HTTP 500) after a key change
 

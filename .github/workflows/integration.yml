@@ -317,8 +317,9 @@ jobs:
       # Artifacts do not keep file modes.
       - run: chmod +x target/release/extenddb
 
-      # The migration lock between serve and migrate, on a catalog of its own
-      # (port 18450), before the suite's server starts.
+      # The migration lock between serve and migrate, on a catalog of its own,
+      # before the suite's server starts. The script serves on ports 18450 and
+      # 18451; the next step uses 18451 after this one has ended.
       - name: Check serve and migrate on one catalog
         run: devtools/check-sqlite-catalog-lock ./target/release/extenddb 18450
 
@@ -877,6 +878,7 @@ jobs:
           --test migrations_fresh --test migrations_released --test migrations_crash
           --test migrations_golden --test migrations_guards --test migrations_runs
           --test migrations_name_escape
+          --test migrations_startup
 
       # The daemonized server logs to syslog; dump it so server-side failures
       # are diagnosable from the job log.

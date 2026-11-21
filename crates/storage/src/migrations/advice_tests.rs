@@ -114,6 +114,7 @@ fn the_config_path_is_quoted_for_a_posix_shell() {
         backup: "back up /srv/x.sqlite",
         config: Some("/srv/sp ace's dir/extenddb.toml"),
         assignment: None,
+        serving: false,
     };
     assert_eq!(
         advised(&written_by_older_release(), &advice),

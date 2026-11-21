@@ -177,7 +177,7 @@ version mismatch. Apply migrations:
 
 ```bash
 cargo build --release
-./target/release/extenddb migrate --config extenddb.toml
+./target/release/extenddb migrate --config extenddb.toml --yes
 ```
 
 No data is lost; only the catalog schema is updated.
@@ -197,7 +197,7 @@ No data is lost; only the catalog schema is updated.
 | Symptom                                                | Fix                                                                 |
 |--------------------------------------------------------|---------------------------------------------------------------------|
 | `connection refused` on port 18443                      | Server not running. `./target/release/extenddb serve --config extenddb.toml`|
-| `Catalog version X.Y.Z (binary expects A.B.C)`        | `./target/release/extenddb migrate --config extenddb.toml`                  |
+| `Catalog version X.Y.Z (binary expects A.B.C)`        | `./target/release/extenddb migrate --config extenddb.toml --yes`            |
 | `role "postgres" does not exist`                       | Use `--pg-user $(whoami)` if PG runs as your user                   |
 | `FATAL: Peer authentication failed`                    | Edit `pg_hba.conf` to allow `trust` or `md5` for local connections  |
 | DROP DATABASE hangs after hard kill                    | Check for lingering backends: `ps -eo pid,command \| grep postgres` |

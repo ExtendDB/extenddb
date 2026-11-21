@@ -145,6 +145,16 @@ exists, treat backend failures as something clients retry through.
 
 For Kubernetes, run `extenddb init` as an init container or a one-time Job, then deploy extenddb as a Deployment with the generated `extenddb.toml` mounted as a ConfigMap or Secret. A deployment that keeps its stored secrets under a key-encryption key (KEK) file (the admin guide's [Encryption Key](05-admin-guide.md#encryption-key) section) mounts the KEK as a Secret volume with `defaultMode: 0400`, runs the pod with `securityContext: {runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001}`, and points `EXTENDDB__AUTH__ENCRYPTION__KEY_FILE` at the mounted file. kubelet gives the file to root with group 10001 at mode 0440, which the server accepts only when its effective group is 10001. The server cannot see who belongs to that group, and every member can read the file, so give group 10001 no other members. Without `fsGroup` the file belongs to group root and uid 10001 cannot open it. Secrets are unencrypted in etcd unless the cluster enables encryption at rest. The `extenddb encryption-key` commands that need every server stopped run as a Job that mounts the same Secret while the Deployment has 0 replicas.
 
+To upgrade on Kubernetes, run one replica with the Deployment strategy `Recreate`, and apply the new release's Deployment together with a migration Job that uses the serving Secret. On PostgreSQL with `[auth.encryption] key_file` set, the Job also mounts the KEK Secret and sets `EXTENDDB__AUTH__ENCRYPTION__KEY_FILE` and the `securityContext` as the Deployment does. `migrate` opens the catalog's `data_database_connection_string` row with that KEK. The Job runs the preview first, which takes no lock, and `migrate --yes` only when the preview exits 3. Its container runs this as its `command`, with `CONFIG` set to the path of the config file:
+
+```sh
+sh -c 'extenddb migrate --config "$CONFIG"; rc=$?; [ "$rc" -eq 3 ] || exit "$rc"; exec extenddb migrate --config "$CONFIG" --yes'
+```
+
+On a release with nothing to apply, the preview exits 0, so the Job succeeds even when a pod of the new release is already serving; `migrate --yes` would wait for that server and exit 6. When migrations are pending, the Job's `migrate --yes` waits for the old pod's registration to end while that pod finishes its termination grace period, for up to its `--lock-timeout`. That timeout, 60 seconds by default, has to be longer than the old pod takes to stop. A pod of the new release that starts before the Job finishes exits 3, and Kubernetes restarts it after its CrashLoopBackOff delay, which grows up to 5 minutes.
+
+Do not run the Job as a Helm pre-upgrade hook: Helm runs the hook while the old pod still serves, so from 0.1.15 on its `migrate --yes` would exit 6 on every release that has a migration to apply, and on the upgrade from 0.1.14 or an earlier release it would migrate the catalog under the old server. Do not migrate in the pod either. Leave the `migrate` line out of the entrypoint above, and leave `catalog_upgrade` at its default, `refuse`, with no `EXTENDDB__SERVER__CATALOG_UPGRADE` in the pod's environment: the port accepts no connection while the server migrates, so a liveness probe would fail and restart the pod during a long migration. The [upgrade manual](07-upgrade-manual.md#deployment-recipes) describes the recipe and the upgrade from 0.1.14 and earlier releases.
+
 ### Air-Gapped
 
 ExtendDB requires no internet connectivity. All functionality is self-contained in the binary. Build on a connected host, transfer the binary and `extenddb.toml` to the air-gapped environment, and run.
@@ -245,7 +255,7 @@ extenddb init \
 ### Upgrades
 
 - [ ] Test upgrades in a staging environment first
-- [ ] Run `extenddb migrate --config extenddb.toml` after binary upgrade
+- [ ] Run `extenddb migrate --config extenddb.toml --yes` after the binary upgrade, or start the new server once with `extenddb serve --migrate --config extenddb.toml` ([Upgrade Manual](07-upgrade-manual.md#applying-migrations-at-startup))
 - [ ] Verify catalog version matches: `extenddb verify --config extenddb.toml`
 
 ## systemd Service
