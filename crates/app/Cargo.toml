@@ -22,7 +22,7 @@ backup-test-hooks = ["extenddb-server/backup-test-hooks"]
 [dependencies]
 extenddb-auth = { workspace = true }
 extenddb-core = { workspace = true }
-extenddb-engine = { workspace = true, features = ["default"] }
+extenddb-engine = { workspace = true }
 extenddb-storage = { workspace = true }
 extenddb-config = { workspace = true }
 extenddb-server = { workspace = true }
