@@ -24,7 +24,7 @@ use crate::serialize_output;
 /// Returns `ResourceInUseException` if the table is not ACTIVE.
 /// Returns `InternalServerError` on storage failures.
 pub async fn handle_update_table(
-    body: Value,
+    mut body: Value,
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
     // Per-member enum validation precedes everything else, including the table
@@ -46,8 +46,10 @@ pub async fn handle_update_table(
     )?;
 
     crate::require_stream_enabled_member(&body)?;
+    let enum_faults = crate::nested_enums::EnumFaults::update_table(&mut body);
     let mut input: UpdateTableInput =
         serde_json::from_value(body).map_err(crate::deserialize_error)?;
+    enum_faults.check()?;
     input.resolve_table_throughput_mode();
 
     if input.table_name.is_empty() {
