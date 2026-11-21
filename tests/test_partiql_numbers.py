@@ -18,28 +18,12 @@ Tables use the ``extenddb-measure-pqn-`` prefix and are deleted at the end.
 
 from __future__ import annotations
 
-import os
 import uuid
 
 import pytest
 from botocore.exceptions import ClientError
 
 from conftest import wait_for_active
-
-# ExtendDB walks the members of a parameter map in the order the parsed request
-# holds them. That is the order the request sent, as the service walks them
-# (measured 2026-11-02), when the server is built together with the MongoDB
-# backend crate, whose JSON dependency keeps map order: any build of the whole
-# workspace, as CI's are. A build of the server package alone with another
-# backend sorts map members by name, and answers differently when a map's first
-# member in request order is not its first by name. Not strict, because which
-# order a server has depends on how it was built.
-MAP_MEMBERS_IN_NAME_ORDER = pytest.mark.xfail(
-    bool(os.environ.get("EXTENDDB_TEST_ENDPOINT", "").strip()),
-    reason="a server built without the MongoDB crate checks parameter map members in name order",
-    raises=AssertionError,
-    strict=False,
-)
 
 NOT_WELL_FORMED = "Statement wasn't well formed, can't be processed: "
 UNCONVERTIBLE = "The parameter cannot be converted to a numeric value"
@@ -367,7 +351,6 @@ class TestParameterNesting:
             == f"{UNCONVERTIBLE}: abc"
         )
 
-    @MAP_MEMBERS_IN_NAME_ORDER
     def test_the_first_problem_in_map_member_order_is_reported(self, dynamodb_client, tables):
         deep_first = {"M": {"d": deep(40), "bad": {"N": "abc"}}}
         assert message(dynamodb_client, self.single(tables), [deep_first]) == NESTED

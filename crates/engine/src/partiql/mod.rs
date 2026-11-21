@@ -325,13 +325,11 @@ pub(crate) fn member_parameters(list: Option<&Value>) -> impl Iterator<Item = Op
 /// statement-position prefix (measured 2026-11-02 and 2026-11-06), so it runs
 /// before the statement is parsed.
 ///
-/// The walk follows the parsed body: parameters and list elements in request
-/// order, the members of a map in the order the parsed request holds them,
-/// which is the request's when the build includes the MongoDB storage crate
-/// (any build of the whole workspace) and name order otherwise. The service
-/// walks map members in request order (measured 2026-11-02), so in name order,
-/// when two members of one map both have a problem, the one reported here can
-/// differ.
+/// The walk follows the parsed body, with parameters and list elements in
+/// request order. It visits the members of a map in the order the service
+/// checks them, the order a Java `HashMap` of the map yields them (see
+/// `extenddb_core::map_order::hash_map_order`; measured 2026-11-12 and
+/// 2026-11-19).
 ///
 /// # Errors
 ///

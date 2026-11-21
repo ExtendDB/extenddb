@@ -292,8 +292,8 @@ copied under the new root and `extenddb backup sync --move-store <old root>` re-
 store to a new root](#moving-a-store-to-a-new-root)).
 
 `/health` reports the store as the `backup_store` component, for example
-`{"components":{"backup_store":{"kind":"filesystem","status":"healthy"}},"status":"healthy"}` (on MongoDB
-`status` comes first). An unhealthy store (unreachable, or failing its identity check) is `status` `degraded`
+`{"status":"healthy","components":{"backup_store":{"status":"healthy","kind":"filesystem"}}}`.
+An unhealthy store (unreachable, or failing its identity check) is `status` `degraded`
 with HTTP 200 kept, so a store outage never takes the data plane out of rotation; `CreateBackup`, and the
 restore and delete of a backup in that store, are refused with a `ValidationException` until the next check
 passes.
@@ -635,13 +635,13 @@ With the sections back, the store's `extenddb-store.json` still names the old ca
 starts with the store unhealthy:
 
 ```
-{"components":{"backup_store":{"kind":"filesystem","reason":"owned by another catalog","status":"unhealthy"}},"status":"degraded"}
+{"status":"degraded","components":{"backup_store":{"status":"unhealthy","kind":"filesystem","reason":"owned by another catalog"}}}
 ```
 
 On file-backed SQLite with the default root (no `[backup.store]` section) the server instead logs a warning,
 "the default root ... failed its check (extenddb-store.json names catalog <old id>; this catalog is <new
 id>); the catalog has no backup rows for it, so the store is unconfigured and CreateBackup writes in-catalog
-backups", and `/health` shows no `backup_store` component (`{"components":{},"status":"healthy"}`). Until
+backups", and `/health` shows no `backup_store` component (`{"status":"healthy","components":{}}`). Until
 the adoption below, `CreateBackup` answers `AVAILABLE` at once and writes an in-catalog backup into the
 database file, the failure domain this manual's first paragraph warns about; such a backup stays in-catalog
 after the adoption until `extenddb backup migrate-legacy` copies it into the store ([Legacy

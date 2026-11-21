@@ -53,15 +53,13 @@ SIGTERM directly. Alternatively start it with
 
 ```bash
 curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
-# {"components":{},"status":"healthy"}
-# (the order of the keys depends on the build: the default PostgreSQL build
-# writes "status" first, the SQLite build "components" first; read the keys)
+# {"status":"healthy","components":{}}
 # with a backup store configured:
-# {"components":{"backup_store":{"kind":"filesystem","status":"healthy"}},"status":"healthy"}
+# {"status":"healthy","components":{"backup_store":{"status":"healthy","kind":"filesystem"}}}
 # while it cannot be reached:
-# {"components":{"backup_store":{"kind":"s3","reason":"unreachable","status":"unhealthy"}},"status":"degraded"}
+# {"status":"degraded","components":{"backup_store":{"status":"unhealthy","kind":"s3","reason":"unreachable"}}}
 # right after startup, before an S3 store's first check has returned:
-# {"components":{"backup_store":{"kind":"s3","status":"checking"}},"status":"healthy"}
+# {"status":"healthy","components":{"backup_store":{"status":"checking","kind":"s3"}}}
 ```
 
 `status` is `healthy`, or `degraded` when a component is unhealthy; the HTTP
@@ -1191,8 +1189,7 @@ JSON metrics endpoint with DynamoDB CloudWatch-style metric names and dimensions
 ```bash
 curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
 # {"status":"healthy","components":{}}
-# (the key order depends on the build; the earlier Health Check section
-# shows the components a backup store adds)
+# (the earlier Health Check section shows the components a backup store adds)
 ```
 
 The `components` object carries the `backup_store` component when a backup

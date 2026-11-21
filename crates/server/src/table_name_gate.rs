@@ -44,10 +44,9 @@
 //! - A `RequestItems` key outside the pattern: `at 'requestItems'` with the
 //!   map-key constraint list. The service renders its own dump of the whole
 //!   map inside `Value '...'`; the first offending key the parsed map yields
-//!   is rendered alone here. That is request order only when `serde_json`'s
-//!   `preserve_order` feature is in the build (the MongoDB driver turns it
-//!   on), and key order otherwise. A key that is an ARN takes the ARN
-//!   constraint list (`arn_gate::MAP_KEYS_ARN`).
+//!   is rendered alone here, which is the first in request order: this crate
+//!   turns on `serde_json`'s `preserve_order` feature. A key that is an ARN
+//!   takes the ARN constraint list (`arn_gate::MAP_KEYS_ARN`).
 //! - ARN-shaped values: see `arn_gate`.
 //!
 //! The service reads `SourceTableName`, `TargetTableName` (both restores),

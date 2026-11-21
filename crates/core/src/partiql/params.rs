@@ -20,7 +20,7 @@
 //!   and `{"S": "a", "X": "1"}` is the string `a`.
 //! - It then converts each statement's parameters before it looks at the
 //!   statement, and reports the first problem it reaches walking the values
-//!   in document order (see [`check_parameter_values`]): a map or list nested
+//!   in the order below (see [`check_parameter_values`]): a map or list nested
 //!   past the item limit, an `N` (or `NS` member) that cannot be converted or
 //!   breaks a number rule, an attribute value with no type or with two, a
 //!   null member of a set, map or list, an empty set, a set that holds a
@@ -36,23 +36,25 @@
 //!   2026-11-06). Such a problem is the statement's own: in a
 //!   `BatchExecuteStatement` the other statements run.
 //!
-//! The walks here run over the parsed request body: parameters and list
-//! elements in request order, the members of a map in the order the parsed
-//! JSON object holds them. That is the request's order when the build
-//! includes the MongoDB storage crate, whose JSON dependency makes every JSON
-//! map keep it (any build of the whole workspace), and name order otherwise.
-//! In name order, when two members of one map both have a problem, the one
-//! reported can differ from the service's, which walks the request's order
-//! (measured 2026-11-02).
+//! Both walks run over the parsed request body, with parameters and list
+//! elements in request order. The first pass visits the members of a map in
+//! the order the parsed JSON object holds them. That is the request's order
+//! in every build that includes the server, whose crate turns on
+//! serde_json's `preserve_order` feature, and name order in a build without
+//! it, such as this crate's own tests. The second pass visits them in the
+//! order the service checks them, the order a Java `HashMap` of the map
+//! yields them, and the members of one bucket in the order of the first pass
+//! (see [`crate::map_order::hash_map_order`]; measured 2026-11-12 and
+//! 2026-11-19).
 
 use std::collections::HashSet;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use super::number::{check_number, parameter_message};
+pub use crate::serde_helpers::check_parameter_types;
+use crate::serde_helpers::typed_members;
 use crate::types::AttributeValue;
 use crate::validation::MAX_ITEM_NESTING_DEPTH;
 use crate::validation::number::validate_and_normalize_number;
@@ -85,99 +87,6 @@ const NULL_NUMBER_SET_MEMBER: &str =
 const NULL_BINARY_SET_MEMBER: &str =
     "One or more parameter values were invalid: Binary sets may not contain null or empty values";
 const NULL_MEMBER: &str = "The supplied Item contains a null AttributeValue";
-
-/// The members an attribute value may hold. Any other member is ignored.
-const TYPES: [&str; 10] = ["S", "N", "B", "SS", "NS", "BS", "M", "L", "NULL", "BOOL"];
-
-/// Check the JSON types of a statement's parameters (wire attribute values),
-/// the first of the two passes (see the module documentation). The caller
-/// checks every statement of the request this way before it checks
-/// anything else of the request.
-///
-/// The walk visits every map and list. The request body's JSON nesting
-/// limit bounds its depth, at most one level for each two JSON levels.
-///
-/// # Errors
-///
-/// Returns a description of the first value whose JSON the attribute value
-/// model cannot read: a value that is not a JSON object, or a member with a
-/// payload of the wrong JSON type.
-pub fn check_parameter_types(parameters: &[Value]) -> Result<(), String> {
-    parameters.iter().try_for_each(check_types)
-}
-
-fn check_types(value: &Value) -> Result<(), String> {
-    let Value::Object(members) = value else {
-        return Err(AttributeValue::deserialize(value).err().map_or_else(
-            || "an attribute value must be a JSON object".to_owned(),
-            |e| e.to_string(),
-        ));
-    };
-    for (tag, payload) in typed_members(members) {
-        match (tag, payload) {
-            ("S" | "N", Value::String(_)) | ("NULL" | "BOOL", Value::Bool(_)) => {}
-            ("B", Value::String(text)) => check_base64(text)?,
-            ("SS" | "NS", Value::Array(items)) => {
-                if items
-                    .iter()
-                    .any(|item| !item.is_string() && !item.is_null())
-                {
-                    return Err(format!("{tag} member must be a string"));
-                }
-            }
-            ("BS", Value::Array(items)) => {
-                for item in items {
-                    match item {
-                        Value::String(text) => check_base64(text)?,
-                        Value::Null => {}
-                        _ => return Err("BS member must be a base64 string".to_owned()),
-                    }
-                }
-            }
-            ("M", Value::Object(entries)) => {
-                for member in entries.values().filter(|member| !member.is_null()) {
-                    check_types(member)?;
-                }
-            }
-            ("L", Value::Array(items)) => {
-                for item in items.iter().filter(|item| !item.is_null()) {
-                    check_types(item)?;
-                }
-            }
-            (tag, _) => return Err(wrong_payload(tag)),
-        }
-    }
-    Ok(())
-}
-
-/// The description of a payload of the wrong JSON type, in the attribute
-/// value deserializer's words.
-fn wrong_payload(tag: &str) -> String {
-    let expected = match tag {
-        "S" | "N" => "a string",
-        "B" => "a base64 string",
-        "NULL" | "BOOL" => "a boolean",
-        "M" => "an object",
-        _ => "an array",
-    };
-    format!("{tag} value must be {expected}")
-}
-
-fn check_base64(text: &str) -> Result<(), String> {
-    BASE64
-        .decode(text)
-        .map(drop)
-        .map_err(|e| format!("invalid base64: {e}"))
-}
-
-/// The members of an attribute value the model reads: those it names whose
-/// value is not null, in the order the value holds them.
-fn typed_members(members: &Map<String, Value>) -> impl Iterator<Item = (&str, &Value)> {
-    members
-        .iter()
-        .filter(|(tag, payload)| !payload.is_null() && TYPES.contains(&tag.as_str()))
-        .map(|(tag, payload)| (tag.as_str(), payload))
-}
 
 /// `value` as the attribute value model reads it: without the members it
 /// ignores, at every level. Its parameters passed [`check_parameter_types`]
@@ -235,7 +144,7 @@ fn check_value(value: &Value, depth: usize) -> Result<(), String> {
     match (tag, payload) {
         ("M", Value::Object(entries)) => {
             let next = enter(depth)?;
-            for (name, member) in entries {
+            for (name, member) in crate::map_order::hash_map_order(entries) {
                 if member.is_null() {
                     return Err(format!("{NULL_MEMBER}: {name} is null"));
                 }
@@ -341,7 +250,7 @@ mod tests {
     const ABC: &str = "The parameter cannot be converted to a numeric value: abc";
 
     #[test]
-    fn parameters_are_walked_in_request_order_and_map_members_as_the_map_holds_them() {
+    fn parameters_are_walked_in_request_order_and_map_members_in_hash_map_order() {
         let d = deep(40, "{\"S\":\"leaf\"}");
         let bad = "{\"N\":\"abc\"}";
         assert_eq!(
@@ -352,16 +261,47 @@ mod tests {
             check_parameter_values(&doc(&format!("[{bad},{d}]"))),
             Err(ABC.to_owned())
         );
-        // Within one map the member the parsed map holds first is reached
-        // first: the one whose name sorts first, or the one the request wrote
-        // first in a build whose JSON maps keep the request's order.
+        // Within one map the members are reached in the order a Java
+        // `HashMap` of the map yields them, in either order written
+        // (measured 2026-11-12 and 2026-11-19). In 4 buckets `bad` and `x`
+        // are in bucket 0, `a` and `e` in 1 and `n` in 2. In the 8 buckets of
+        // a map of four members, `a` is in bucket 1 and `bad` in 4.
+        let x = "{\"S\":\"1\"}";
+        for (members, want) in [
+            (vec![("e", d.as_str()), ("bad", bad)], ABC),
+            (vec![("n", d.as_str()), ("bad", bad)], ABC),
+            (vec![("bad", bad), ("a", d.as_str())], ABC),
+            (vec![("bad", bad), ("a", d.as_str()), ("x", x)], ABC),
+            (
+                vec![("bad", bad), ("a", d.as_str()), ("x", x), ("y", x)],
+                NESTING_MESSAGE,
+            ),
+        ] {
+            let reversed = members.iter().rev().copied().collect();
+            for order in [members, reversed] {
+                let written: Vec<String> = order
+                    .iter()
+                    .map(|(name, value)| format!("\"{name}\":{value}"))
+                    .collect();
+                let written = written.join(",");
+                assert_eq!(
+                    check_parameter_values(&doc(&format!("[{{\"M\":{{{written}}}}}]"))),
+                    Err(want.to_owned()),
+                    "{written}"
+                );
+            }
+        }
+        // `d` and `bad` share bucket 0 of 4, so the member the parsed map
+        // holds first is reached first: the one the request wrote first in a
+        // build whose JSON maps keep the request's order, as the service
+        // does (measured 2026-11-12).
         for members in [
-            format!("\"a\":{d},\"b\":{bad}"),
-            format!("\"b\":{bad},\"a\":{d}"),
+            format!("\"d\":{d},\"bad\":{bad}"),
+            format!("\"bad\":{bad},\"d\":{d}"),
         ] {
             let params = doc(&format!("[{{\"M\":{{{members}}}}}]"));
             let first = params[0]["M"].as_object().unwrap().keys().next().unwrap();
-            let want = if first == "a" { NESTING_MESSAGE } else { ABC };
+            let want = if first == "d" { NESTING_MESSAGE } else { ABC };
             assert_eq!(
                 check_parameter_values(&params),
                 Err(want.to_owned()),
