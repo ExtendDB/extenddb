@@ -797,6 +797,18 @@ fn cases() -> Vec<Case> {
         ),
         // ── connect options ──
         row!(
+            "the database file the backend finds for :memory:",
+            "Ok(None)",
+            |_pool| {
+                use extenddb_storage::config::StorageConfig;
+                let config = extenddb_storage_sqlite::SqliteConfig {
+                    path: ":memory:".to_owned(),
+                    pool_size: 1,
+                };
+                format!("{:?}", config.database_location())
+            }
+        ),
+        row!(
             "sqlite::memory: file name",
             "Ok(\"file:sqlx-in-memory-<n>\")",
             |_pool| filename("sqlite::memory:")
