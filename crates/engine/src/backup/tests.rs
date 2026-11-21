@@ -4461,6 +4461,12 @@ async fn malformed_arn_is_a_validation_exception_with_the_services_text() {
             ),
             INVALID_ID,
         ),
+        // Whitespace before the ARN, and whitespace after it other than one
+        // line terminator (measured on 2026-11-21, the whitespace rows of
+        // tests/test_backup_restore_fidelity.py).
+        (format!(" {}", arn(ACCOUNT)), INVALID_ID),
+        (format!("\u{a0}{}", arn(ACCOUNT)), INVALID_ID),
+        (format!("{} ", arn(ACCOUNT)), NOT_VALID),
     ];
     let fake = Fake::with_source(source(Some(definition("PROVISIONED"))));
     for (candidate, expected) in &cases {
@@ -4487,15 +4493,14 @@ async fn malformed_arn_is_a_validation_exception_with_the_services_text() {
     assert!(fake.restores().is_empty());
 }
 
-/// Measured on DynamoDB: the service trims a trailing newline and resolves an ARN
-/// naming another region of the caller's account. The engine hands the
-/// backend the ARN it issued: trimmed, in its own region.
+/// Measured on DynamoDB: the service strips one trailing line terminator and
+/// resolves an ARN naming another region of the caller's account. The engine
+/// hands the backend the ARN it issued: stripped, in its own region.
 #[tokio::test]
-async fn whitespace_is_trimmed_and_another_region_resolves() {
+async fn a_trailing_line_terminator_is_stripped_and_another_region_resolves() {
     let ours = arn(ACCOUNT);
     for candidate in [
         format!("{ours}\n"),
-        format!("  {ours}\t\r\n"),
         format!("arn:aws:dynamodb:eu-west-1:{ACCOUNT}:table/Music/backup/01791976431438-73d8d5bc"),
         format!(
             "arn:aws:dynamodb:eu-west-1:{ACCOUNT}:table/Music/backup/01791976431438-73d8d5bc\n"
@@ -4544,7 +4549,7 @@ async fn a_backup_stored_under_another_region_resolves_as_written() {
     assert_eq!(spellings.as_written.as_deref(), Some(stored.as_str()));
     // The server's own spelling has no second spelling to try.
     assert_eq!(own(&ours).as_written, None);
-    assert_eq!(own(&format!(" {ours}\n")).as_written, None, "trimmed first");
+    assert_eq!(own(&format!("{ours}\n")).as_written, None, "stripped first");
 
     let stored_source = || {
         let mut src = source(Some(definition("PROVISIONED")));

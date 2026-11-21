@@ -49,11 +49,11 @@ fn every_resource_arn_field_is_read() {
         );
     }
     for op in ["DescribeBackup", "DeleteBackup", "RestoreTableFromBackup"] {
-        let input = json!({ "BackupArn": format!(" {BACKUP}\n"), "TargetTableName": "r" });
+        let input = json!({ "BackupArn": format!("{BACKUP}\n"), "TargetTableName": "r" });
         assert_eq!(
             find(op, &input, A),
             other(op, BACKUP),
-            "{op}: the trimmed ARN"
+            "{op}: the stripped ARN"
         );
     }
     let input = json!({ "TableArn": FOREIGN, "S3Bucket": "b" });

@@ -345,7 +345,8 @@ enum BackupCommand {
             long,
             value_name = "ARN",
             action = clap::ArgAction::Append,
-            conflicts_with_all = ["adopt_store", "prune_missing"]
+            conflicts_with_all = ["adopt_store", "prune_missing"],
+            value_parser = |s: &str| Ok::<_, String>(s.trim().to_owned())
         )]
         forget_backup: Vec<String>,
     },
@@ -3339,7 +3340,8 @@ mod tests {
 
     /// `backup sync`'s options as clap parses them: the three store options
     /// conflict with each other, with `--adopt-store` and with
-    /// `--prune-missing`; `--forget-backup` repeats, its ARNs in order.
+    /// `--prune-missing`; `--forget-backup` repeats, its ARNs in order and
+    /// trimmed.
     #[test]
     fn the_store_options_conflict_and_forget_backup_repeats() {
         use clap::Parser;
@@ -3372,7 +3374,7 @@ mod tests {
                 "{refused:?}"
             );
         }
-        match parse(&["sync", "--forget-backup", "a", "--forget-backup", "b"]).unwrap() {
+        match parse(&["sync", "--forget-backup", "a", "--forget-backup", " b\t"]).unwrap() {
             super::BackupCommand::Sync {
                 forget_backup,
                 move_store: None,

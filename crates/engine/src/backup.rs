@@ -64,12 +64,13 @@ const LIST_BACKUPS_MAX_LIMIT: i64 = 100;
 /// therefore tell "my backup does not exist" (`BackupNotFoundException`, from
 /// the backend) from "that ARN belongs to another account".
 ///
-/// The service trims a trailing newline and resolves an ARN naming another
-/// region of the caller's account (measured on DynamoDB). The backends look
-/// up the exact string they stored, which carries the `server.region` in
-/// force when the backup was created, so the engine tries the ARN rebuilt in
-/// this deployment's region first and, when that is not found and the caller
-/// wrote a different ARN, the ARN as written (trimmed); see
+/// The service ignores one trailing line terminator and resolves an ARN
+/// naming another region of the caller's account (measured on DynamoDB). The
+/// backends look up the exact string they stored, which carries the
+/// `server.region` in force when the backup was created, so the engine tries
+/// the ARN rebuilt in this deployment's region first and, when that is not
+/// found and the caller wrote a different ARN, the ARN as written (the
+/// terminator stripped); see
 /// [`resolve_backup`]. A backup created under an earlier `server.region`
 /// therefore stays reachable by the ARN `ListBackups` reports for it.
 ///
@@ -176,6 +177,17 @@ fn backup_not_found(arn: &str) -> DynamoDbError {
     ))
 }
 
+/// A `BackupNotFoundException` of `DescribeBackup`, `DeleteBackup` or
+/// `RestoreTableFromBackup` names the `BackupArn` as the request wrote it,
+/// its trailing line terminator included, where the lookup used the stripped
+/// spelling (measured on DynamoDB on 2026-11-21).
+fn named_as_requested(e: DynamoDbError, requested: Option<&str>) -> DynamoDbError {
+    match (e, requested) {
+        (DynamoDbError::BackupNotFoundException(_), Some(arn)) => backup_not_found(arn),
+        (e, _) => e,
+    }
+}
+
 /// The error for a CREATING row, or one whose backup a CREATING restore
 /// target still reads: `BackupInUseException`, as the service answers. The
 /// in-use text names the backup, not the target (the service's text); the
@@ -251,15 +263,24 @@ fn canonical_backup_arn(
 /// measured on DynamoDB; its text was not captured, so the "not valid" one
 /// is used), before the account is looked at.
 ///
+/// An ARN that starts with whitespace is `Invalid Backup ARN`, also when one
+/// line terminator follows it (the rows measured in
+/// `tests/test_backup_restore_fidelity.py`).
+///
 /// [`ARN_PARTITION`]: extenddb_storage::util::ARN_PARTITION
 fn check_backup_arn(
     backup_arn: &str,
 ) -> Result<extenddb_storage::util::BackupArnParts<'_>, DynamoDbError> {
     use extenddb_storage::util::BackupArnError;
+    if backup_arn.starts_with(char::is_whitespace) {
+        return Err(DynamoDbError::ValidationException(
+            INVALID_BACKUP_ARN.to_owned(),
+        ));
+    }
     let parts = extenddb_storage::util::check_backup_arn(backup_arn).map_err(|e| {
         DynamoDbError::ValidationException(match e {
             BackupArnError::Invalid => BACKUP_ARN_NOT_VALID.to_owned(),
-            BackupArnError::Id => "Invalid Backup ARN".to_owned(),
+            BackupArnError::Id => INVALID_BACKUP_ARN.to_owned(),
         })
     })?;
     if parts.partition != extenddb_storage::util::ARN_PARTITION {
@@ -273,6 +294,10 @@ fn check_backup_arn(
 /// The service's text for a `BackupArn` that is not an ARN of the right
 /// shape (measured on DynamoDB).
 const BACKUP_ARN_NOT_VALID: &str = "Invalid Request: BackupArn is not valid";
+
+/// The service's text for a `BackupArn` whose backup id is not one, or that
+/// starts with whitespace (measured on DynamoDB).
+const INVALID_BACKUP_ARN: &str = "Invalid Backup ARN";
 
 fn required_str<'a>(body: &'a Value, member: &str, path: &str) -> Result<&'a str, DynamoDbError> {
     body.get(member).and_then(|v| v.as_str()).ok_or_else(|| {
@@ -685,7 +710,9 @@ pub(crate) async fn handle_describe_backup(
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
     let backup_arn = backup_arn_field(&body, &ctx.account_id, &ctx.region)?;
-    let desc = describe_backup(&*ctx.storage, &ctx.account_id, &ctx.region, &backup_arn).await?;
+    let desc = describe_backup(&*ctx.storage, &ctx.account_id, &ctx.region, &backup_arn)
+        .await
+        .map_err(|e| named_as_requested(e, body["BackupArn"].as_str()))?;
     serialize_output(&json!({ "BackupDescription": desc }))
 }
 
@@ -1015,7 +1042,7 @@ async fn list_backups<S: BackupCatalog + LegacyBackupReader + ?Sized>(
 /// the region and table-name texts were captured as fragments ("does not
 /// match the region", "does not match the table name predicate") and are
 /// completed on the account text's pattern. Returns the cursor as this
-/// deployment issued it (whitespace trimmed).
+/// deployment issued it (one trailing line terminator stripped).
 fn list_backups_cursor(
     arn: &str,
     account_id: &str,
@@ -1221,7 +1248,8 @@ pub(crate) async fn handle_delete_backup(
         &ctx.region,
         &backup_arn,
     )
-    .await?;
+    .await
+    .map_err(|e| named_as_requested(e, body["BackupArn"].as_str()))?;
     serialize_output(&json!({ "BackupDescription": desc }))
 }
 
@@ -1648,6 +1676,7 @@ pub(crate) async fn handle_restore_table_from_backup(
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
     let auth_cache = ctx.auth_cache.clone();
+    let requested = body["BackupArn"].as_str().map(str::to_owned);
     restore_table_from_backup_detached(
         Arc::clone(&ctx.storage),
         Arc::clone(&ctx.backup),
@@ -1674,6 +1703,7 @@ pub(crate) async fn handle_restore_table_from_backup(
         },
     )
     .await
+    .map_err(|e| named_as_requested(e, requested.as_deref()))
 }
 
 /// Run one restore, and then `after` with the target name, in a task of its

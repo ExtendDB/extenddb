@@ -238,7 +238,7 @@ pub(crate) fn check_stream_arn(arn: &str) -> Result<(), DynamoDbError> {
 /// `RestoreTableFromBackup`). U+0000 in the backup id keeps the engine's
 /// `Invalid Request: BackupArn is not valid`, as measured.
 pub(crate) fn check_backup_arn(arn: &str) -> Result<(), DynamoDbError> {
-    match parse(arn.trim_matches(|c: char| c.is_ascii_whitespace())) {
+    match parse(extenddb_core::backup_format::trim_backup_arn(arn)) {
         Some(res) if matches!(res.sub, Some(SubResource::Backup(_))) && !in_pattern(&res.table) => {
             Err(validation("Invalid Backup ARN".to_owned()))
         }
@@ -539,6 +539,16 @@ mod tests {
         );
         let backup_id = format!("{}/backup/0170\u{0}", table("ok"));
         assert!(check_backup_arn(&backup_id).is_ok(), "left to the engine");
+        // The gate reads the ARN as the engine does: one trailing line
+        // terminator stripped, and whitespace before it left for the engine.
+        assert_eq!(
+            message(check_backup_arn(&format!("{backup}\n"))).unwrap(),
+            "Invalid Backup ARN"
+        );
+        assert!(
+            check_backup_arn(&format!(" {backup}")).is_ok(),
+            "left to the engine"
+        );
         assert_eq!(
             message(check_tag_resource_arn(&bad)).unwrap(),
             format!("Invalid TableArn: Invalid ResourceArn provided as input {bad}")
