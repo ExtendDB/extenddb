@@ -556,7 +556,7 @@ mod init_tests {
             (Some("ops"), Some("Supplied-pw-1"), "ops", true),
         ];
         let timeout = Duration::from_secs(10);
-        for (user, password, name, from_env) in cases {
+        for (row, (user, password, name, from_env)) in cases.into_iter().enumerate() {
             let dir = std::env::temp_dir().join(format!(
                 "extenddb-admin-env-{}",
                 uuid::Uuid::new_v4().simple()
@@ -586,7 +586,7 @@ mod init_tests {
                     admin.generated_password.is_some()
                 ),
                 (name, from_env, !from_env),
-                "{user:?} {password:?}"
+                "row {row}"
             );
         }
     }
