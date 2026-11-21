@@ -162,8 +162,11 @@ fn parse_empty_expression_rejected() {
 
 #[test]
 fn parse_invalid_action_keyword_rejected() {
+    // A token where a section keyword is required is the service's syntax
+    // error; without a source the window joins the token texts.
     let err = parse("price = :v").unwrap_err();
-    assert!(matches!(err, DynamoDbError::ValidationException(msg) if msg.contains("expected SET")));
+    assert!(matches!(err, DynamoDbError::ValidationException(msg)
+        if msg == "Invalid UpdateExpression: Syntax error; token: \"price\", near: \"price =\""));
 }
 
 #[test]
@@ -209,5 +212,72 @@ fn unmatched_close_paren_rejected() {
     assert!(
         matches!(&err, DynamoDbError::ValidationException(_)),
         "Expected validation error for stray ')', got: {err:?}"
+    );
+}
+
+// Syntax error wording measured 2026-10-25 (us-east-1) on UpdateItem.
+
+fn upd_msg(src: &str) -> String {
+    match parse_update_from(&tokenize(src).unwrap(), src, DEFAULT_MAX_DEPTH) {
+        Err(DynamoDbError::ValidationException(m)) => m,
+        other => panic!("expected ValidationException, got {other:?}"),
+    }
+}
+
+fn syntax(token: &str, near: &str) -> String {
+    format!("Invalid UpdateExpression: Syntax error; token: \"{token}\", near: \"{near}\"")
+}
+
+#[test]
+fn measured_update_syntax_errors() {
+    assert_eq!(upd_msg("SET #v = = :v"), syntax("=", "= = :v")); // [d24]
+    assert_eq!(upd_msg("SET #v = :v + + :v"), syntax("+", "+ + :v")); // [d25]
+    assert_eq!(upd_msg("SET #v = :v,"), syntax("<EOF>", ",")); // [d26]
+    assert_eq!(upd_msg("SET #v = :v + :v + :v"), syntax("+", ":v + :v")); // [b07]
+    assert_eq!(upd_msg("SET #v = :v +"), syntax("<EOF>", "+")); // [u08]
+    assert_eq!(upd_msg("SET #v = :v REMOVE"), syntax("<EOF>", "REMOVE")); // [u10]
+    assert_eq!(upd_msg("SET = :v"), syntax("=", "SET = :v")); // [u11]
+    assert_eq!(upd_msg("SET #v :v"), syntax(":v", "#v :v")); // [u12]
+}
+
+#[test]
+fn the_window_is_found_by_token_position() {
+    // [x26] measured 2026-11-19: the second `+` of the second action is the
+    // offending token. A search for the token's text would find the first
+    // `+` and quote "+ :b, #w".
+    assert_eq!(
+        upd_msg("SET #v = :a + :b, #w = :c + :d + :e"),
+        syntax("+", ":d + :e")
+    );
+}
+
+#[test]
+fn add_and_delete_values_answer_the_syntax_error() {
+    // Measured 2026-11-19 (us-east-1), probe cases in brackets: any token
+    // where the value is required, and the end of input.
+    let rows = [
+        ("x07", "ADD #v = :v", "=", "#v = :v"),
+        ("x08", "DELETE #v = :v", "=", "#v = :v"),
+        ("x09", "ADD #v", "<EOF>", "#v"),
+        ("x10", "DELETE #v", "<EOF>", "#v"),
+        ("x11", "ADD #v #w", "#w", "#v #w"),
+        ("x27", "ADD #v, #w", ",", "#v, #w"),
+        ("x29", "ADD #v (:v)", "(", "#v (:v"),
+        ("x30", "DELETE #v AND :v", "AND", "#v AND :v"),
+    ];
+    for (case, src, token, near) in rows {
+        assert_eq!(upd_msg(src), syntax(token, near), "{case}");
+    }
+}
+
+#[test]
+fn other_update_texts_are_unchanged() {
+    assert_eq!(
+        upd_msg("SET #v #w = :v"),
+        "Invalid UpdateExpression: expected '='"
+    );
+    assert_eq!(
+        upd_msg("SET #v = (:v"),
+        "Invalid UpdateExpression: expected closing ')'"
     );
 }

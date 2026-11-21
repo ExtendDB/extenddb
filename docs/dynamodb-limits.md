@@ -67,6 +67,7 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 | Condition expression size | 4 KB | Enforced | `check_expression_size`, `LimitsConfig::max_expression_length_bytes` |
 | Update expression size | 4 KB | Enforced | `check_expression_size`, `LimitsConfig::max_expression_length_bytes` |
 | Key condition expression size | 4 KB | Enforced | `check_expression_size`, `LimitsConfig::max_expression_length_bytes` |
+| Operators and functions in an expression | 300 | Enforced | `validate_operator_count`, `LimitsConfig::max_expression_operators`; condition, filter and key condition expressions, not on TransactWriteItems |
 | Expression attribute names | 2 MB total | Not enforced | Per-entry key/value validated (`serde_helpers`); no aggregate size validation |
 | Expression attribute values | 2 MB total | Not enforced | Per-entry key/value validated (`serde_helpers`); no aggregate size validation |
 
