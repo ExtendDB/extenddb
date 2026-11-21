@@ -52,8 +52,12 @@ pub fn encrypt_secret(plaintext: &str, key_b64: &str, aad: &str) -> Result<Vec<u
 /// UTF-8.
 pub fn decrypt_secret(encrypted: &[u8], key_b64: &str, aad: &str) -> Result<String, String> {
     require_aad(aad)?;
+    // The length is checked before the key is decoded, so a short value is
+    // reported as short whatever the key; `open` is not called here, since it
+    // would check the length again.
     require_length(encrypted)?;
-    let mut plaintext = open_text(&*decode_key(key_b64)?, encrypted, aad)?;
+    let opened = crypto::open(&*decode_key(key_b64)?, encrypted, aad.as_bytes())?;
+    let mut plaintext = into_text(opened)?;
     Ok(std::mem::take(&mut *plaintext))
 }
 
@@ -82,7 +86,12 @@ pub(crate) fn open_text(
     encrypted: &[u8],
     aad: &str,
 ) -> Result<Zeroizing<String>, String> {
-    let mut plaintext = open(key, encrypted, aad)?;
+    into_text(open(key, encrypted, aad)?)
+}
+
+/// The UTF-8 text of an opened secret, in a wrapper that wipes it on drop.
+/// Bytes that are not UTF-8 are wiped before the error returns.
+fn into_text(mut plaintext: Zeroizing<Vec<u8>>) -> Result<Zeroizing<String>, String> {
     match String::from_utf8(std::mem::take(&mut *plaintext)) {
         Ok(text) => Ok(Zeroizing::new(text)),
         Err(e) => {
@@ -95,7 +104,9 @@ pub(crate) fn open_text(
 
 /// Refuse input too short to hold a nonce and a tag, with a message that names
 /// its length. The length rule is `crypto::split_nonce`, the check
-/// `crypto::open` applies; this only words the refusal.
+/// `crypto::open` applies; this only words the refusal. Each path through this
+/// module calls it once: `decrypt_secret` before it decodes the key, `open`
+/// before it opens.
 fn require_length(encrypted: &[u8]) -> Result<(), String> {
     match crypto::split_nonce(encrypted) {
         Some(_) => Ok(()),
@@ -271,6 +282,44 @@ mod tests {
                 decrypt_secret(&sealed[..len], KEY_B64, AAD).unwrap_err(),
                 "decrypt: authentication failed",
                 "length {len}"
+            );
+        }
+    }
+
+    /// A value too short for a nonce and a tag is refused before the key is
+    /// decoded, so under a key that does not decode the refusal still names
+    /// the value's length.
+    #[test]
+    fn a_short_value_is_refused_before_the_key_is_decoded() {
+        for key in ["not base64!", ""] {
+            assert_eq!(
+                decrypt_secret(&[0; NONCE_LEN], key, AAD).unwrap_err(),
+                "ciphertext too short: 12 bytes (need at least 12-byte nonce + 16-byte auth tag)",
+                "key {key:?}"
+            );
+        }
+    }
+
+    /// `open` and `open_text`, which the key ring and the secret-key rows
+    /// call with the decoded key, refuse a short value with the same message
+    /// as `decrypt_secret`.
+    #[test]
+    fn open_refuses_a_short_value_with_its_length() {
+        let key = decode_key(KEY_B64).expect("key");
+        for len in [0, 1, NONCE_LEN, NONCE_LEN + TAG_LEN - 1] {
+            let short = vec![0u8; len];
+            let expected = format!(
+                "ciphertext too short: {len} bytes (need at least 12-byte nonce + 16-byte auth tag)"
+            );
+            assert_eq!(
+                open(&key, &short, AAD).err(),
+                Some(expected.clone()),
+                "open, length {len}"
+            );
+            assert_eq!(
+                open_text(&key, &short, AAD).err(),
+                Some(expected),
+                "open_text, length {len}"
             );
         }
     }
