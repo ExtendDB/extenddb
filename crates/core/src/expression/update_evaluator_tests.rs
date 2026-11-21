@@ -496,6 +496,181 @@ fn delete_all_elements_removes_attribute() {
 }
 
 #[test]
+fn delete_list_element_string_set_reporter_measurements() {
+    // Issue #812 reporter measurement for DELETE:
+    // Initial item has l = [{"SS": ["a", "b"]}].
+    // Request: DELETE l[0] :v with :v = {"SS": ["a"]} -> DynamoDB returns 200, l = [{"SS": ["b"]}].
+    let mut item = BTreeMap::new();
+    let mut initial_set = BTreeSet::new();
+    initial_set.insert("a".into());
+    initial_set.insert("b".into());
+    item.insert(
+        "l".into(),
+        AttributeValue::L(vec![AttributeValue::SS(initial_set)]),
+    );
+
+    let mut del_set = BTreeSet::new();
+    del_set.insert("a".into());
+    let mut del_values = HashMap::new();
+    del_values.insert("v".into(), AttributeValue::SS(del_set));
+    apply("DELETE l[0] :v", &mut item, HashMap::new(), del_values).unwrap();
+
+    let list = match item.get("l") {
+        Some(AttributeValue::L(l)) => l,
+        other => panic!("expected AttributeValue::L, got {other:?}"),
+    };
+    assert_eq!(list.len(), 1, "list length must remain 1");
+
+    let mut expected_set = BTreeSet::new();
+    expected_set.insert("b".into());
+    assert_eq!(list[0], AttributeValue::SS(expected_set));
+}
+
+#[test]
+fn delete_list_element_number_and_binary_sets() {
+    let mut item = BTreeMap::new();
+    let mut ns = BTreeSet::new();
+    ns.insert("10".into());
+    ns.insert("20".into());
+    let mut bs = BTreeSet::new();
+    bs.insert(vec![1, 2, 3]);
+    bs.insert(vec![4, 5]);
+
+    item.insert(
+        "l".into(),
+        AttributeValue::L(vec![AttributeValue::NS(ns), AttributeValue::BS(bs)]),
+    );
+
+    // DELETE from NS at index 0
+    let mut del_ns = BTreeSet::new();
+    del_ns.insert("10".into());
+    let mut del_vals_ns = HashMap::new();
+    del_vals_ns.insert("v".into(), AttributeValue::NS(del_ns));
+    apply("DELETE l[0] :v", &mut item, HashMap::new(), del_vals_ns).unwrap();
+
+    // DELETE from BS at index 1
+    let mut del_bs = BTreeSet::new();
+    del_bs.insert(vec![1, 2, 3]);
+    let mut del_vals_bs = HashMap::new();
+    del_vals_bs.insert("v".into(), AttributeValue::BS(del_bs));
+    apply("DELETE l[1] :v", &mut item, HashMap::new(), del_vals_bs).unwrap();
+
+    let list = match item.get("l") {
+        Some(AttributeValue::L(l)) => l,
+        other => panic!("expected AttributeValue::L, got {other:?}"),
+    };
+    assert_eq!(list.len(), 2, "list length must remain 2");
+
+    let mut expected_ns = BTreeSet::new();
+    expected_ns.insert("20".into());
+    match &list[0] {
+        AttributeValue::NS(s) => assert_eq!(s, &expected_ns),
+        other => panic!("expected AttributeValue::NS at l[0], got {other:?}"),
+    }
+
+    let mut expected_bs = BTreeSet::new();
+    expected_bs.insert(vec![4, 5]);
+    match &list[1] {
+        AttributeValue::BS(s) => assert_eq!(s, &expected_bs),
+        other => panic!("expected AttributeValue::BS at l[1], got {other:?}"),
+    }
+}
+
+#[test]
+fn delete_nested_map_list_paths() {
+    let mut item = BTreeMap::new();
+    let mut inner_set = BTreeSet::new();
+    inner_set.insert("val1".into());
+    inner_set.insert("val2".into());
+
+    let mut inner_map = BTreeMap::new();
+    inner_map.insert("tags".into(), AttributeValue::SS(inner_set));
+
+    // Structure: m.l[0] = {"tags": SS["val1", "val2"]}
+    let mut outer_map = BTreeMap::new();
+    outer_map.insert(
+        "l".into(),
+        AttributeValue::L(vec![AttributeValue::M(inner_map)]),
+    );
+    item.insert("m".into(), AttributeValue::M(outer_map));
+
+    // DELETE m.l[0].tags :v with "val1"
+    let mut del_set = BTreeSet::new();
+    del_set.insert("val1".into());
+    let mut del_values = HashMap::new();
+    del_values.insert("v".into(), AttributeValue::SS(del_set));
+    apply(
+        "DELETE m.l[0].tags :v",
+        &mut item,
+        HashMap::new(),
+        del_values,
+    )
+    .unwrap();
+
+    // Verify val1 removed, val2 remains
+    let tags = match item.get("m") {
+        Some(AttributeValue::M(m)) => match m.get("l") {
+            Some(AttributeValue::L(l)) => match &l[0] {
+                AttributeValue::M(inner) => match inner.get("tags") {
+                    Some(AttributeValue::SS(s)) => s.clone(),
+                    _ => panic!("expected SS"),
+                },
+                _ => panic!("expected M"),
+            },
+            _ => panic!("expected L"),
+        },
+        _ => panic!("expected M"),
+    };
+    let mut expected_tags = BTreeSet::new();
+    expected_tags.insert("val2".into());
+    assert_eq!(tags, expected_tags);
+}
+
+#[test]
+fn delete_list_type_mismatches_and_missing_paths() {
+    let mut item = BTreeMap::new();
+    let mut set = BTreeSet::new();
+    set.insert("a".into());
+    item.insert(
+        "l".into(),
+        AttributeValue::L(vec![
+            AttributeValue::SS(set),
+            AttributeValue::N("42".into()),
+        ]),
+    );
+
+    // Mismatched operand type: DELETE set from N at l[1] -> ValidationException
+    let mut val_ss = HashMap::new();
+    let mut ss = BTreeSet::new();
+    ss.insert("a".into());
+    val_ss.insert("v".into(), AttributeValue::SS(ss));
+    let err = apply("DELETE l[1] :v", &mut item, HashMap::new(), val_ss).unwrap_err();
+    assert!(matches!(err, DynamoDbError::ValidationException(_)));
+
+    // Out-of-bounds index: DELETE l[99] :v -> no-op (parent path doesn't exist)
+    let mut val_del = HashMap::new();
+    let mut ss_del = BTreeSet::new();
+    ss_del.insert("x".into());
+    val_del.insert("v".into(), AttributeValue::SS(ss_del));
+    let res = apply(
+        "DELETE l[99] :v",
+        &mut item,
+        HashMap::new(),
+        val_del.clone(),
+    );
+    assert!(res.is_ok());
+
+    // Missing top-level map: DELETE nonexistent.tags :v -> no-op in ExtendDB
+    let res_missing = apply(
+        "DELETE nonexistent.tags :v",
+        &mut item,
+        HashMap::new(),
+        val_del,
+    );
+    assert!(res_missing.is_ok());
+}
+
+#[test]
 fn set_nested_path() {
     let mut inner = BTreeMap::new();
     inner.insert("city".into(), AttributeValue::S("old".into()));
