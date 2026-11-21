@@ -349,12 +349,17 @@ Operations that need a facility the in-browser build lacks return a
 that names the build:
 
 - The store-backed backup operations — `CreateBackup`, `DescribeBackup`,
-  `DeleteBackup`, `RestoreTableFromBackup` — "… it does not include the backup
-  subsystem." The engine's backup subsystem does not build for `wasm32`, so the
-  engine refuses these four there, after the body parse: a malformed body gets
-  `SerializationException`, as on a server. Built natively, the adapter runs
-  the engine's backup handlers instead, and with no backup store
-  `CreateBackup` backs a table up in the catalog, as a server without one does.
+  `DeleteBackup`, `RestoreTableFromBackup` — "… the code that serves it is not
+  compiled for wasm32." The engine's backup subsystem does not build for
+  `wasm32`, so the engine refuses these four there, after the body parse, as
+  it refuses any other known operation whose handler is compiled only off
+  `wasm32`. A body that is not JSON gets `SerializationException`, as on a
+  server; a JSON body gets the refusal, even one the handler would refuse,
+  such as a `DescribeBackup` with no `BackupArn` (natively and on a server,
+  "1 validation error detected: Value null at 'backupArn' …"). Built
+  natively, the adapter runs the engine's backup handlers instead, and with no
+  backup store `CreateBackup` backs a table up in the catalog, as a server
+  without one does.
 - The PartiQL operations — `ExecuteStatement`, `BatchExecuteStatement`,
   `ExecuteTransaction` — "… the PartiQL surface is not part of the browser build."
 - `DescribeEndpoints` — "… it is called in-process and has no network endpoint

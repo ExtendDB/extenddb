@@ -599,20 +599,6 @@ pub async fn dispatch(
         "RestoreTableFromBackup" => backup::handle_restore_table_from_backup(body, ctx)
             .await
             .map(DispatchResult::body_only),
-        // Off wasm32 the arms above serve these four through the `backup`
-        // module, which does not build for wasm32: it uses the backup store's
-        // S3 client, whose network stack needs mio, and tokio's file I/O. They
-        // stay known operations there, so they are refused with a
-        // ValidationException that names the build, not answered as unknown.
-        #[cfg(target_arch = "wasm32")]
-        "CreateBackup" | "DescribeBackup" | "DeleteBackup" | "RestoreTableFromBackup" => {
-            Err(DynamoDbError::ValidationException(
-                extenddb_core::error::webassembly_unsupported_message(
-                    operation,
-                    "it does not include the backup subsystem",
-                ),
-            ))
-        }
         "DescribeContinuousBackups" => {
             backup_requests::handle_describe_continuous_backups(body, ctx)
                 .await
@@ -632,6 +618,21 @@ pub async fn dispatch(
         "BatchExecuteStatement" => ctx.batch_execute_statement(body).await,
         #[cfg(feature = "partiql")]
         "ExecuteTransaction" => ctx.execute_transaction(body).await,
+        // An arm above that is compiled only off wasm32 leaves its operation
+        // known on wasm32 (`is_known_operation` is the same on every target)
+        // but unserved there. Today these are the four store-backed backup
+        // operations: the `backup` module does not build for wasm32, because
+        // it uses the backup store's S3 client, whose network stack needs mio,
+        // and tokio's file I/O. Such an operation is refused with a
+        // ValidationException that names the build, not answered as unknown,
+        // and an arm gated the same way later is refused here too.
+        #[cfg(target_arch = "wasm32")]
+        _ if is_known_operation(operation) => Err(DynamoDbError::ValidationException(
+            extenddb_core::error::webassembly_unsupported_message(
+                operation,
+                "the code that serves it is not compiled for wasm32",
+            ),
+        )),
         _ => Err(DynamoDbError::UnknownOperationException(String::new())),
     }
 }

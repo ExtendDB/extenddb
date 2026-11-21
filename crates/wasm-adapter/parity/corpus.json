@@ -2168,7 +2168,7 @@
         "checks": [
           {
             "path": "/message",
-            "equals": "CreateBackup is not supported by the ExtendDB WebAssembly build: it does not include the backup subsystem."
+            "equals": "CreateBackup is not supported by the ExtendDB WebAssembly build: the code that serves it is not compiled for wasm32."
           }
         ],
         "reason": "the engine's backup subsystem does not build for wasm32, so on wasm32 the engine refuses the four store-backed backup operations after the body parse"
@@ -2192,7 +2192,7 @@
         "checks": [
           {
             "path": "/message",
-            "equals": "DescribeBackup is not supported by the ExtendDB WebAssembly build: it does not include the backup subsystem."
+            "equals": "DescribeBackup is not supported by the ExtendDB WebAssembly build: the code that serves it is not compiled for wasm32."
           }
         ],
         "reason": "the engine's backup subsystem does not build for wasm32, so on wasm32 the engine refuses the four store-backed backup operations after the body parse"
@@ -2216,7 +2216,7 @@
         "checks": [
           {
             "path": "/message",
-            "equals": "DeleteBackup is not supported by the ExtendDB WebAssembly build: it does not include the backup subsystem."
+            "equals": "DeleteBackup is not supported by the ExtendDB WebAssembly build: the code that serves it is not compiled for wasm32."
           }
         ],
         "reason": "the engine's backup subsystem does not build for wasm32, so on wasm32 the engine refuses the four store-backed backup operations after the body parse"
@@ -2241,7 +2241,7 @@
         "checks": [
           {
             "path": "/message",
-            "equals": "RestoreTableFromBackup is not supported by the ExtendDB WebAssembly build: it does not include the backup subsystem."
+            "equals": "RestoreTableFromBackup is not supported by the ExtendDB WebAssembly build: the code that serves it is not compiled for wasm32."
           }
         ],
         "reason": "the engine's backup subsystem does not build for wasm32, so on wasm32 the engine refuses the four store-backed backup operations after the body parse"
@@ -2668,7 +2668,7 @@
         "checks": [
           {
             "path": "/message",
-            "equals": "DescribeBackup is not supported by the ExtendDB WebAssembly build: it does not include the backup subsystem."
+            "equals": "DescribeBackup is not supported by the ExtendDB WebAssembly build: the code that serves it is not compiled for wasm32."
           }
         ],
         "reason": "the engine's backup subsystem does not build for wasm32, so on wasm32 the engine refuses the four store-backed backup operations after the body parse"
@@ -2690,7 +2690,7 @@
         "checks": [
           {
             "path": "/message",
-            "equals": "DescribeBackup is not supported by the ExtendDB WebAssembly build: it does not include the backup subsystem."
+            "equals": "DescribeBackup is not supported by the ExtendDB WebAssembly build: the code that serves it is not compiled for wasm32."
           }
         ],
         "reason": "the engine's backup subsystem does not build for wasm32, so on wasm32 the engine refuses the four store-backed backup operations after the body parse, whatever the JSON body holds"
