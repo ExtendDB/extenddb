@@ -118,9 +118,10 @@ fails, with one line per problem, unless all of these hold:
    of the three in turn without that feature in crates/core/Cargo.toml, the
    check must report that crate and no other.
 
-The clippy step runs in the working tree and in the copy with the caller's
-clippy.toml and the caller's cargo target directory, so cargo reuses what the
-clippy step already checked. Nothing in the caller's working tree but that
+The clippy step runs, as devtools/run-wasm-step holds it, in the working tree
+and in the copy, each with its own devtools/wasm-clippy/clippy.toml (the
+copy's is the caller's, copied) and both with the caller's cargo target
+directory, so cargo reuses what the clippy step already checked. Nothing in the caller's working tree but that
 target directory is written. The copy is removed on exit, also on SIGINT,
 SIGTERM and SIGHUP, and a clippy run is stopped with it. Some probes reach
 the method through an import or a re-export (`use tokio::time; time::sleep`,
@@ -153,21 +154,12 @@ CONFIG_REL = CONFIG.relative_to(ROOT).as_posix()
 ADAPTER = "extenddb-wasm-adapter"
 TARGET = "wasm32-unknown-unknown"
 WORKFLOW_REL = ".github/workflows/wasm.yml"
-# The clippy step of .github/workflows/wasm.yml, with JSON messages.
-CLIPPY = [
-    "cargo",
-    "clippy",
-    "--locked",
-    "--message-format=json",
-    "-p",
-    ADAPTER,
-    "--lib",
-    "--target",
-    TARGET,
-    "--",
-    "-D",
-    "warnings",
-]
+# The clippy step of .github/workflows/wasm.yml, which the workflow runs as
+# `devtools/run-wasm-step clippy`, with JSON messages. Started from the root
+# of the tree it checks, the script sets CLIPPY_CONF_DIR to that tree's
+# devtools/wasm-clippy and passes the option to cargo before its `--`, so the
+# step's command is written only in the script.
+CLIPPY = ["devtools/run-wasm-step", "clippy", "--message-format=json"]
 # A crate the wasm build compiles that depends directly on every crate a probe
 # names (tokio, time, futures), so each probe compiles there. The probes go in
 # a new module of it, declared from its crate root.
@@ -1424,11 +1416,11 @@ def copy_tree(destination: Path) -> int:
 
 
 def run_clippy(tree: Path, target_dir: str) -> tuple[int, list[dict], list[dict], str]:
-    """Run the clippy step in the tree at `tree`, with the caller's clippy.toml
-    and the cargo target directory `target_dir`. Returns its exit status, the
-    compiler messages and the compiler-artifact records of its JSON output,
-    and its stderr."""
-    env = dict(os.environ, CLIPPY_CONF_DIR=str(CONF_DIR), CARGO_TARGET_DIR=target_dir)
+    """Run the clippy step in the tree at `tree`, with that tree's
+    devtools/wasm-clippy/clippy.toml and the cargo target directory
+    `target_dir`. Returns its exit status, the compiler messages and the
+    compiler-artifact records of its JSON output, and its stderr."""
+    env = dict(os.environ, CARGO_TARGET_DIR=target_dir)
     # In its own process group, so that it can be stopped with every compiler
     # it started.
     process = subprocess.Popen(
@@ -1463,11 +1455,14 @@ def run_clippy(tree: Path, target_dir: str) -> tuple[int, list[dict], list[dict]
     return process.returncode, messages, artifacts, stderr
 
 
-def config_warnings(messages: list[dict], stderr: str) -> list[str]:
+def config_warnings(messages: list[dict], stderr: str, tree: Path) -> list[str]:
+    """The warnings about clippy.toml among the messages and stderr of a clippy
+    step run in the tree at `tree`, which read that tree's copy of it."""
     found = set()
+    config = (tree / CONFIG_REL).resolve()
     for message in messages:
         in_config = any(
-            Path(s["file_name"]).resolve() == CONFIG.resolve() for s in message.get("spans", [])
+            (tree / s["file_name"]).resolve() == config for s in message.get("spans", [])
         )
         if in_config or any(text in message["message"] for text in CONFIG_WARNINGS):
             found.add(message.get("rendered") or message["message"])
@@ -1518,7 +1513,9 @@ def probe_problems(
 
     if code == 0:
         problems.append("the clippy step passed with every probe in place")
-    problems += [f"warning about {CONFIG_REL}:\n{w}" for w in config_warnings(messages, stderr)]
+    problems += [
+        f"warning about {CONFIG_REL}:\n{w}" for w in config_warnings(messages, stderr, copy)
+    ]
     refused, other = refused_probes(messages, rel, spans)
     for index, (kind, path, first, _) in enumerate(spans):
         if index in refused:
