@@ -137,9 +137,10 @@ jobs:
           RUSTFLAGS: --cfg getrandom_backend="wasm_js"
         run: cargo test --locked -p extenddb-core --lib --target wasm32-unknown-unknown
 
-      # The synchronous SQLite shim is the wasm backend; tests/wasm_shim.rs pins
-      # its storage-class, NULL, UTF-8, duplicate-column, multi-statement,
-      # empty-SQL, transaction and FromRow rules on wasm32 under Node.
+      # The synchronous SQLite shim is the wasm backend; tests/wasm_shim.rs is
+      # one table with a row per shim rule (decoding, binding, multi-statement
+      # SQL, fetch, transactions, the pool, connect options), run on wasm32
+      # under Node.
       - name: SQLite shim wasm tests under Node
         env:
           RUSTFLAGS: --cfg getrandom_backend="wasm_js"
