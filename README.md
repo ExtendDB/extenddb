@@ -314,9 +314,13 @@ to crates.io.
   wasm32 limit of 4 GiB (65,536 pages of 64 KiB), or less if the JavaScript
   engine allows less. Near that limit, a write that SQLite cannot allocate for
   answers `InternalServerError`, and a request whose Rust code cannot allocate
-  aborts, which traps the module. After a trap the instance is in an undefined
-  state (see the `submit` documentation in `crates/wasm-adapter/src/wasm.rs`),
-  and the page must be reloaded to load a fresh module instance.
+  aborts, which traps the module. After the first write fails this way, a read
+  can trap too: in a test that filled a table to the limit, a `Scan` with
+  `Select` `COUNT` over the table did. Deleting data before any request has
+  trapped frees space, and the instance then keeps serving writes. After a trap
+  the instance is in an undefined state (see the `submit` documentation in
+  `crates/wasm-adapter/src/wasm.rs`), and the page must be reloaded to load a
+  fresh module instance.
 - **No background tasks.** The build runs no background workers, so: an item
   past its time-to-live is still returned (TTL never deletes it); `ItemCount`
   and `TableSizeBytes` stay `0`; and stream records are never trimmed.
@@ -375,6 +379,15 @@ On `wasm32` a panic cannot unwind: it traps, and the `submit` promise of the
 request that panicked stays pending. The instance is then in an undefined
 state (a later call may answer, fail or hang), so reload the page to get a
 fresh one.
+
+A `submit` promise never rejects. On a live instance it resolves with the
+response to every request that does not trap, including the
+`ValidationException` for an argument that is not a string. `submit` itself
+throws, synchronously and before any promise exists, in two cases: when it is
+called after `free()` or on an object that is not an instance (`Error: null
+pointer passed to rust`, or a `TypeError` for a `null` or `undefined`
+receiver), and when the module cannot allocate the copy of an argument in its
+linear memory (`RuntimeError: unreachable` in a release build).
 
 ### Checks the server makes that this build does not
 

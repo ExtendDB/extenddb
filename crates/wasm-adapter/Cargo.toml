@@ -43,8 +43,8 @@ serde_json = { workspace = true }
 # the portable `runtime` module without any wasm-bindgen surface. `js-sys`
 # supplies the `Promise` the async `submit` resolves; `wasm-bindgen-futures`
 # drives the engine's async dispatch on the browser microtask queue;
-# `console_error_panic_hook` routes a wasm panic to `console.error` instead of
-# an opaque trap.
+# `console_error_panic_hook` writes a wasm panic's message and stack to
+# `console.error` before the trap that follows the panic.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"

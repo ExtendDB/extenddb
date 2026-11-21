@@ -26,8 +26,11 @@
 //! `TransactWriteItems`, `TransactGetItems`, `ListStreams`, `DescribeStream`,
 //! `GetShardIterator`, `GetRecords`, `UpdateTimeToLive`, `DescribeTimeToLive`,
 //! `TagResource`, `ListTagsOfResource`, `UntagResource`, `ListBackups`,
-//! `DescribeContinuousBackups` and `UpdateContinuousBackups`. Other operations
-//! reach the engine's handlers too but have no corpus case.
+//! `DescribeContinuousBackups` and `UpdateContinuousBackups`, and natively
+//! `UpdateTable`, whose vector-index create the wasm build refuses. Its cases
+//! for `ImportTable`, `ExportTableToPointInTime`, the refused operations below
+//! and an unknown operation answer errors. `ListTables`, `DescribeLimits` and
+//! `SearchVectors` reach the engine's handlers too but have no corpus case.
 //! The build authenticates no request and authorizes none; every request runs
 //! under a single fixed account.
 //!

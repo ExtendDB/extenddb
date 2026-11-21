@@ -199,9 +199,10 @@ impl Engine {
     /// Errors are values, not exceptions: an engine error, a malformed request
     /// body, and a request the browser build does not support all come back as
     /// a DynamoDB-shaped error document with a `__type` member — the same JSON
-    /// the HTTP server would have put in the response body. The caller tells
-    /// success from failure by the presence of `__type`, as a `DynamoDB` SDK
-    /// does.
+    /// the HTTP server would have put in the response body. The server also
+    /// sends an HTTP status, which an SDK such as botocore reads to tell an
+    /// error from a success; this method returns no status, so an error answer
+    /// here is the document with a top-level `__type` member.
     ///
     /// `operation` is the `X-Amz-Target` operation name (e.g. `"DescribeLimits"`);
     /// `body_json` is the request body as a JSON string (`"{}"` for an

@@ -4,11 +4,11 @@
 //! The `wasm-bindgen` surface exposed to JavaScript.
 //!
 //! This module compiles only for `wasm32`. It is a thin wrapper over
-//! [`crate::runtime::Engine`]: it installs a panic hook (so a wasm panic
-//! reaches `console.error` instead of an opaque trap) and exposes two entry
-//! points to JavaScript — construct the engine, and submit a `DynamoDB` request.
-//! All engine logic lives in the portable `runtime` module, which the native
-//! unit tests cover.
+//! [`crate::runtime::Engine`]: it installs a panic hook, which writes a
+//! panic's message and stack to `console.error` before the trap that follows
+//! it, and exposes two entry points to JavaScript — construct the engine, and
+//! submit a `DynamoDB` request. All engine logic lives in the portable
+//! `runtime` module, which the native unit tests cover.
 
 use wasm_bindgen::prelude::*;
 
@@ -28,18 +28,24 @@ impl ExtendDb {
     /// Create an engine instance backed by a fresh in-browser in-memory `SQLite`
     /// database.
     ///
-    /// Installs [`console_error_panic_hook`] once so a panic inside the wasm
-    /// module surfaces as a readable `console.error` with a stack trace rather
-    /// than an unhelpful `RuntimeError: unreachable`.
+    /// Installs [`console_error_panic_hook`] once, so that a panic inside the
+    /// wasm module writes its message and a stack trace to `console.error`.
+    /// The hook only logs: the panic still traps, and the trap surfaces as
+    /// `RuntimeError: unreachable`.
     ///
     /// Async because opening the database and running the catalog migrations is
-    /// async; it resolves with the ready engine or rejects with an
-    /// initialization error. In JavaScript: `const db = await ExtendDb.create();`
+    /// async. In JavaScript: `const db = await ExtendDb.create();`. The promise
+    /// resolves with the ready engine, or rejects as described under Errors. A
+    /// panic during creation traps instead, and the promise then stays pending.
+    /// One such panic comes from a host with no Web Crypto
+    /// (`globalThis.crypto`, which Node 18 does not define in an ES module):
+    /// the `uuid` crate panics when it cannot draw random bytes.
     ///
     /// # Errors
     ///
     /// Rejects with the initialization error as a string when the in-memory
-    /// database cannot be opened or its catalog migrations fail.
+    /// database cannot be opened or its catalog migrations or account setup
+    /// fail.
     pub async fn create() -> Result<ExtendDb, JsValue> {
         console_error_panic_hook::set_once();
         let engine = Engine::new().await.map_err(|e| JsValue::from_str(&e))?;
@@ -52,9 +58,9 @@ impl ExtendDb {
     /// `X-Amz-Target` suffix, e.g. `"DescribeLimits"`); `body` is the request
     /// body as a JSON string (`"{}"` when the operation takes no parameters).
     ///
-    /// Errors are delivered as values, not rejections: an engine error, a
-    /// malformed body, a request the browser build does not support, or an
-    /// `operation` or `body` that is not a JavaScript string resolves the
+    /// The promise never rejects. Errors are delivered as values: an engine
+    /// error, a malformed body, a request the browser build does not support,
+    /// or an `operation` or `body` that is not a JavaScript string resolves the
     /// promise with `ExtendDB`'s error document, a JSON object carrying a
     /// `__type` member. Both arguments are taken as any JavaScript value and
     /// checked here, so a number, `undefined` or an object answers a
@@ -62,13 +68,21 @@ impl ExtendDb {
     /// encoded to UTF-8 by the generated JavaScript glue's `TextEncoder`, which
     /// replaces an unpaired surrogate with U+FFFD.
     ///
-    /// The promise does not reject. On `wasm32` a panic cannot unwind: it traps,
-    /// and the trap throws out of the task that was running the request, so
-    /// that request's promise stays **pending** (it neither resolves nor
-    /// rejects). The instance is then in an undefined state: whatever the
-    /// panicking request held when it stopped is never released, so a later
-    /// call may answer, fail or hang. Reload the page to get a fresh instance.
-    /// The panic hook writes the panic and its stack to `console.error` first.
+    /// `submit` itself throws, synchronously and before any promise exists,
+    /// when it cannot start: called after `free()` or on an object that is not
+    /// an instance, it throws `Error: null pointer passed to rust` (or a
+    /// `TypeError` when the receiver is `null` or `undefined`); and when the
+    /// module cannot allocate the copy of an argument in its linear memory, a
+    /// release build traps and the call throws `RuntimeError: unreachable` (a
+    /// debug build throws `Error: invalid malloc request`).
+    ///
+    /// On `wasm32` a panic cannot unwind: it traps, and the trap throws out of
+    /// the task that was running the request, so that request's promise stays
+    /// **pending** (it neither resolves nor rejects). The instance is then in an
+    /// undefined state: whatever the panicking request held when it stopped is
+    /// never released, so a later call may answer, fail or hang. Reload the
+    /// page to get a fresh instance. The panic hook writes the panic and its
+    /// stack to `console.error` first.
     pub fn submit(&self, operation: &JsValue, body: &JsValue) -> js_sys::Promise {
         // `as_string` is `Some` only for a JavaScript string. It copies the
         // value into linear memory, so nothing below borrows a JS value.

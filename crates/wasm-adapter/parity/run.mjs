@@ -26,9 +26,10 @@
 // build answers differently; this runner judges the case against it in place
 // of the case's `error` and `checks`.
 //
-// After the corpus, this runner also calls `submit` with arguments that are
-// not strings, which only a JavaScript caller can pass, and expects a
-// ValidationException for each.
+// After the corpus, this runner also checks what only a JavaScript caller can
+// do: it calls `submit` with arguments that are not strings and expects a
+// ValidationException for each, and calls it after `free()` and on objects
+// that are not instances and expects a synchronous exception for each.
 //
 // The corpus and the self-test rows are read with `parseJson` below rather
 // than `JSON.parse`, so that this runner sees each number as written (`1.0`
@@ -38,10 +39,11 @@
 // The module is loaded from `./pkg`, the `wasm-bindgen --target web` output
 // (built by the test harness before this runner is invoked).
 //
-// Node-hosting note: a browser always defines `globalThis.crypto`; Node's ESM
-// scope does not, so Node's Web Crypto is installed before the module loads.
-// The runner adds nothing else to the environment; it loads the same module
-// files a browser would.
+// Node-hosting note: a browser always defines `globalThis.crypto`, and Node 22
+// does; Node 18 does not define it in an ES module, so the runner installs
+// Node's Web Crypto when it is missing, before the module loads. The runner
+// adds nothing else to the environment; it loads the same module files a
+// browser would.
 
 import { webcrypto } from 'node:crypto';
 if (!globalThis.crypto) globalThis.crypto = webcrypto;
@@ -753,19 +755,45 @@ for (const [label, args, argument] of badArguments) {
     }, resp);
     if (why !== undefined) fail(`submit with ${label}: ${why}`);
 }
+
+// ---- calls that throw before a promise exists ------------------------------
+// `submit` throws synchronously when it cannot start: called after `free()` or
+// on an object that is not an instance. The instance under test keeps serving.
+
+const spare = await mod.ExtendDb.create();
+spare.free();
+const throwingCalls = [
+    ['after free()', () => spare.submit('ListTables', '{}'), Error, 'null pointer passed to rust'],
+    ['on an object that is not an instance', () => mod.ExtendDb.prototype.submit.call({}, 'ListTables', '{}'),
+        Error, 'null pointer passed to rust'],
+    ['with a null receiver', () => mod.ExtendDb.prototype.submit.call(null, 'ListTables', '{}'), TypeError, undefined],
+];
+for (const [label, call, type, message] of throwingCalls) {
+    extraChecks += 1;
+    let threw;
+    try {
+        call();
+    } catch (e) {
+        threw = e;
+    }
+    if (!(threw instanceof type) || (message !== undefined && threw.message !== message)) {
+        const got = threw === undefined ? 'no exception' : `${threw.name}: ${threw.message}`;
+        fail(`submit ${label}: expected a synchronous ${type.name}${message === undefined ? '' : ` "${message}"`}, got ${got}`);
+    }
+}
 extraChecks += 1;
 try {
     const after = JSON.parse(await db.submit('ListTables', '{}'));
     const why = judge({ error: null, checks: [{ path: '/TableNames', kind: 'present', value: true }] }, after);
-    if (why !== undefined) fail(`ListTables after the bad arguments: ${why}`);
+    if (why !== undefined) fail(`ListTables after the bad calls: ${why}`);
 } catch (e) {
-    fail(`ListTables after the bad arguments: threw ${e.name}: ${e.message}`);
+    fail(`ListTables after the bad calls: threw ${e.name}: ${e.message}`);
 }
 
 // ---- summary ---------------------------------------------------------------
 
 console.log('');
-const counts = `${cases.length} cases, ${corpusChecks} corpus checks, ${extraChecks} submit-argument checks`;
+const counts = `${cases.length} cases, ${corpusChecks} corpus checks, ${extraChecks} checks of submit's JavaScript boundary`;
 if (failures === 0) {
     console.log(`RESULT: PASS (${counts})`);
     process.exit(0);
