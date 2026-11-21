@@ -150,7 +150,7 @@ mod tests {
                 .collect();
             let parsed = config::Config::builder()
                 .add_source(config::File::from_str(text, config::FileFormat::Toml))
-                .add_source(environment(Some(vars)))
+                .add_source(environment(vars))
                 .build()
                 .and_then(|c| c.try_deserialize::<Auth>())
                 .map(|Auth { auth }| {
