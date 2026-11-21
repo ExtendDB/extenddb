@@ -81,8 +81,9 @@ pub fn parse_authorization(
         )));
     }
 
-    // A tab after the algorithm ends it as a space does.
-    let (algorithm, rest) = header.split_once([' ', '\t']).unwrap_or((header, ""));
+    // A tab or a comma after the algorithm ends it as a space does (measured
+    // 2026-11-21).
+    let (algorithm, rest) = header.split_once([' ', '\t', ',']).unwrap_or((header, ""));
 
     let mut credential = None;
     let mut signed_headers = None;
@@ -362,6 +363,11 @@ mod tests {
                 format!("{alg}\tgarbage"),
                 false,
                 pair(eq, "XUinbQeSOqQmlK+0Rlsvau5dUqd+5nD9Uuw1MpQxMDE="),
+            ),
+            (
+                format!("{alg},{cred}, {sh}, {sig}"),
+                false,
+                hashed(&[d], "k9ZniCm661ym+L0+NfddBO1S3uB45sGroJr9Eyehky4="),
             ),
             (
                 format!("{alg} {cred} {sh} {sig}"),
