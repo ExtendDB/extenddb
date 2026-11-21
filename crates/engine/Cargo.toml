@@ -25,7 +25,6 @@ partiql = ["extenddb-core/partiql"]
 extenddb-auth = { workspace = true }
 extenddb-core = { workspace = true }
 extenddb-storage = { workspace = true }
-extenddb-backup-store = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -35,13 +34,32 @@ crc32fast = { workspace = true }
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
+bytes = { workspace = true }
+futures = { workspace = true }
+# A `std::time` drop-in that re-exports `std::time` on every target except
+# wasm32, where it backs the clock with the browser APIs. The stream iterator
+# timestamps read the clock and compile into the wasm32 build, so they go
+# through this; native is unchanged.
+web-time = { workspace = true }
+
+# The backup/PITR and import/export subsystems depend on an S3/filesystem
+# store (`extenddb-backup-store`) and the tokio networking/`fs`/`spawn` and
+# `tokio-util` machinery, none of which build for wasm32. They are compiled
+# only off wasm; the modules that use them are gated the same way in lib.rs.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+extenddb-backup-store = { workspace = true }
 tokio = { workspace = true }
 # `TaskTracker` for the backup jobs the server drains at shutdown;
 # `StreamReader` and `SyncIoBridge` for the restore's in-place decode of a
 # store object on the blocking pool.
 tokio-util = { workspace = true, features = ["rt", "io", "io-util"] }
-bytes = { workspace = true }
-futures = { workspace = true }
+
+# The workspace `full` tokio feature pulls in `mio` (networking), which has no
+# wasm32 target. The wasm-reachable engine surface (dispatch, the data-plane
+# and stream handlers) uses only the runtime/sync/time/macros API. Target-scoped
+# and additive; native keeps the workspace `full` set above.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "time", "macros"] }
 
 [dev-dependencies]
 # `start_paused` for the tests of timers that must not depend on the wall clock.

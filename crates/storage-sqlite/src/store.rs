@@ -472,6 +472,99 @@ impl SqliteEngine {
     }
 }
 
+// Table snapshots copy the database file on disk; the real `SnapshotEngine`
+// impl (`snapshot_engine`) is compiled off the browser build. The
+// `StorageEngine` blanket impl still requires the subtrait, so the wasm build
+// answers it with an out-of-scope error — matching the parity scope, where
+// anything needing a real filesystem is out of scope.
+#[cfg(target_arch = "wasm32")]
+impl extenddb_storage::snapshot::SnapshotEngine for SqliteEngine {
+    fn open_table_snapshot(
+        &self,
+        account_id: &str,
+        table_name: &str,
+    ) -> futures::future::BoxFuture<
+        '_,
+        Result<extenddb_storage::snapshot::TableSnapshot, StorageError>,
+    > {
+        let _ = (account_id, table_name);
+        Box::pin(async {
+            Err(StorageError::Unsupported(
+                "table snapshots require a filesystem and are not available in the in-memory \
+                 WebAssembly build"
+                    .to_owned(),
+            ))
+        })
+    }
+}
+
+impl SqliteEngine {
+    /// Build a ready-to-use in-memory engine for an embedded (browser) caller:
+    /// open a `:memory:` database, run the catalog migrations on its single
+    /// connection, register `account_id`, and switch the control plane to
+    /// synchronous (`control_plane_delay_seconds = 0`,
+    /// `index_propagation_delay_ms = 0`) so a created table is `ACTIVE` at once
+    /// and index maintenance happens on the write path — there are no
+    /// background workers in this configuration to drive an asynchronous one.
+    ///
+    /// The migration run reuses the same runner the server's in-memory startup
+    /// uses, so the schema is identical. No encryption key or admin user is
+    /// written: an embedded build does no authentication, and the data-plane
+    /// operations need only the account row to exist.
+    ///
+    /// # Errors
+    ///
+    /// The database cannot be opened, the migrations fail, or a setup statement
+    /// fails.
+    #[doc(hidden)]
+    pub async fn new_in_memory(
+        region: &str,
+        account_id: &str,
+        max_item_size_bytes: usize,
+    ) -> Result<Self, StorageError> {
+        let engine = Self::new(":memory:", 1, region, max_item_size_bytes).await?;
+
+        // An in-memory database lives only on the engine's single connection,
+        // so its catalog is created there, by the runner, at startup — the
+        // same runner the server's in-memory bootstrap uses.
+        let on_pool = crate::migrations::SqliteMigrations::on_pool(engine.pool.clone(), ":memory:")
+            .map_err(|e| StorageError::Internal(format!("prepare in-memory migrations: {e}")))?;
+        extenddb_storage::migrations::Runner::new(&on_pool, "")
+            .migrate()
+            .await
+            .map_err(|e| StorageError::Internal(format!("run in-memory migrations: {e}")))?;
+
+        // The account the data-plane operations write under. CreateTable
+        // records the owning account, so the row must exist first.
+        Self::validate_account_id(account_id)?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO accounts (account_id, account_name) VALUES (?, 'default')",
+        )
+        .bind(account_id)
+        .execute(&engine.pool)
+        .await
+        .map_err(|e| StorageError::Internal(format!("register account: {e}")))?;
+
+        // No background workers run here, so make the control plane synchronous:
+        // a created table is `ACTIVE` at once and index maintenance happens on
+        // the write path, not via a poller that never runs. Zero means
+        // synchronous for both settings.
+        for (key, value) in [
+            ("control_plane_delay_seconds", "0"),
+            ("index_propagation_delay_ms", "0"),
+        ] {
+            sqlx::query("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
+                .bind(key)
+                .bind(value)
+                .execute(&engine.pool)
+                .await
+                .map_err(|e| StorageError::Internal(format!("set {key}: {e}")))?;
+        }
+
+        Ok(engine)
+    }
+}
+
 #[cfg(test)]
 mod d1_write_lock_tests {
     use super::SqliteEngine;

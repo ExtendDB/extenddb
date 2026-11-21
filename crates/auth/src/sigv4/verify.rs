@@ -7,8 +7,8 @@
 //! against the signature in the `Authorization` header using constant-time
 //! comparison to prevent timing attacks.
 
-use axum::http::HeaderMap;
 use extenddb_core::error::DynamoDbError;
+use http::HeaderMap;
 
 use super::canonical;
 use super::parse::ParsedAuthorization;
@@ -165,9 +165,10 @@ pub fn verify_signature(
 pub fn validate_timestamp(headers: &HeaderMap) -> Result<String, DynamoDbError> {
     let timestamp = extract_timestamp(headers)?;
 
-    // Parse X-Amz-Date: YYYYMMDDTHHMMSSZ
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    // Parse X-Amz-Date: YYYYMMDDTHHMMSSZ. web-time is std::time on the server
+    // and the browser clock on wasm; the host clock has no now() on wasm.
+    let now = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .ok()
         .and_then(|d| i64::try_from(d.as_secs()).ok())
         .ok_or_else(|| DynamoDbError::InternalServerError("server clock error".to_owned()))?;
@@ -225,15 +226,15 @@ fn parse_iso8601_basic(s: &str) -> Option<i64> {
     Some(days * 86400 + hour * 3600 + min * 60 + sec)
 }
 
-/// Constant-time byte comparison to prevent timing attacks, through AWS-LC's
-/// `CRYPTO_memcmp` (`aws_lc_rs::constant_time::verify_slices_are_equal`).
+/// Constant-time byte comparison to prevent timing attacks, through the shared
+/// crypto module (AWS-LC's `CRYPTO_memcmp` on the server, `subtle` on wasm).
 ///
 /// The comparison of the contents is constant time; the length check is not.
 /// Inputs of different lengths return `false` at once, which reveals whether
 /// the lengths match. Callers compare against values of a fixed length that
 /// is not secret: hex-encoded signatures (always 64 bytes) and session tokens.
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    aws_lc_rs::constant_time::verify_slices_are_equal(a, b).is_ok()
+    extenddb_core::crypto::constant_time_eq(a, b)
 }
 
 #[cfg(test)]

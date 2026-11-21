@@ -1,5 +1,7 @@
 /target
 /target-*
+# Generated wasm-bindgen module output for the headless parity runner.
+/crates/wasm-adapter/parity/pkg/
 extenddb.toml
 __pycache__/
 .coverage

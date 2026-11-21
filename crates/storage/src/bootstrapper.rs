@@ -247,8 +247,8 @@ pub mod helpers {
 
     /// Generate a 256-bit AES-GCM encryption key and return it as base64.
     ///
-    /// The key bytes come from AWS-LC's random number generator through
-    /// `aws_lc_rs::rand::fill`.
+    /// The key bytes come from the shared crypto module's random source
+    /// (`extenddb_core::crypto::fill_random`).
     ///
     /// # Errors
     ///
@@ -258,7 +258,7 @@ pub mod helpers {
         use base64::Engine;
 
         let mut key = zeroize::Zeroizing::new([0u8; 32]);
-        aws_lc_rs::rand::fill(&mut key[..])
+        extenddb_core::crypto::fill_random(&mut key[..])
             .map_err(|_| "generate encryption key: random number generator failed".to_owned())?;
         Ok(base64::engine::general_purpose::STANDARD.encode(&key[..]))
     }

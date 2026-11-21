@@ -28,8 +28,6 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sqlx = { workspace = true, features = ["sqlite"] }
-tokio = { workspace = true, features = ["sync"] }
 toml = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
@@ -40,10 +38,55 @@ rand = { workspace = true }
 bigdecimal = { workspace = true }
 crc32fast = { workspace = true }
 zeroize = { workspace = true }
-libc = { workspace = true }
-libsqlite3-sys = { workspace = true }
+# The clock, so the browser build reads time through a backend that works on
+# wasm. `web-time` re-exports `std::time` verbatim on every non-wasm target, so
+# native builds are unchanged; on wasm it reads the host clock. Without it the
+# `std::time` clock reads on the write path (stream-record and TTL timestamps)
+# compile on wasm but trap when called.
+web-time = { workspace = true }
 
-[dev-dependencies]
+# Storage transport, split per target. Native keeps `sqlx` (SQLite feature) and
+# the C `libsqlite3-sys` verbatim: the native build is unchanged and native
+# SQLite is the behaviour this backend is defined against. On a browser
+# `wasm32-unknown-unknown` target neither can run — `sqlx-sqlite` dedicates an
+# OS thread to each connection and `libsqlite3-sys` needs a C sysroot — so both
+# are dropped and the crate's `sqlx::` paths resolve instead to the in-crate
+# `wasm_sqlx` module (aliased to `sqlx` at the crate root), a synchronous
+# reimplementation of the slice of the `sqlx` API this backend uses. It drives
+# `sqlite-wasm-rs` (a SQLite bundled for wasm with an in-memory VFS, no threads,
+# no sysroot) over its raw libsqlite3 C ABI. The SQL and the backend's logic are
+# unchanged; only the transport differs.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+sqlx = { workspace = true, features = ["sqlite"] }
+# SQLite's C API, for the online-backup copy that sqlx does not expose. The
+# version is the one `sqlx-sqlite` depends on.
+libsqlite3-sys = { workspace = true }
+# `flock(2)` for the one-owner-per-file serve lock (Unix only).
+libc = { workspace = true }
+# The workspace `full` tokio feature pulls in `mio` (networking), which has no
+# wasm32 target. Native keeps the workspace `full` set; the wasm build below
+# takes only the runtime/sync/time/macros API the in-scope data plane uses.
+tokio = { workspace = true, features = ["sync"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Real SQLite compiled for wasm with an in-memory VFS (no threads, no C
+# sysroot, no Emscripten). The `wasm_sqlx` shim drives its raw libsqlite3 C ABI
+# synchronously, standing in for sqlx + libsqlite3-sys. The `wasm-bindgen`
+# feature supplies the runtime host hooks (clock, randomness, VFS glue) the
+# module links against in a JavaScript host.
+sqlite-wasm-rs = { version = "0.6", features = ["wasm-bindgen"] }
+# `rt-multi-thread` is deliberately absent: a browser wasm module is
+# single-threaded.
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "time", "macros"] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+# The native test dependencies pull the engine, the backup store and tokio's
+# full (net) stack, none of which build for wasm32. Scoping them off wasm lets
+# the wasm32 shim integration test (`tests/wasm_shim.rs`) compile against only
+# the crate and `wasm-bindgen-test`; on every other target the set is unchanged.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 extenddb-storage = { path = "../storage", features = ["test-util"] }
 # `tests/backup_job_panic.rs` drives the engine's CreateBackup job and
 # reconciler against a `SqliteEngine` (the engine depends on `extenddb-storage`,

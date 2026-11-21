@@ -21,6 +21,48 @@ md-5 = { workspace = true }
 sha2 = { workspace = true }
 time = { workspace = true }
 uuid = { workspace = true }
+zeroize = { workspace = true }
+# A `std::time` drop-in that also works on wasm32. On every target except
+# wasm32 it re-exports `std::time` unchanged, so native builds are unaffected;
+# on wasm32 it backs `Instant`/`SystemTime` with the browser clock
+# (`performance.now()` / `Date.now()`) instead of the host monotonic/realtime
+# clocks, which are unavailable there and panic at runtime if called.
+web-time = { workspace = true }
+
+# The shared crypto module (src/crypto.rs) uses AWS-LC through aws-lc-rs on
+# every target except wasm32. aws-lc-rs is already in the native dependency
+# closure through extenddb-auth and extenddb-storage, so this edge adds nothing
+# new to native builds.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+aws-lc-rs = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# On wasm32 `uuid` cannot choose a randomness source on its own and fails to
+# compile without one; the `js` feature wires it to the browser's crypto
+# through getrandom's JS backend.
+uuid = { workspace = true, features = ["js"] }
+# Pure-Rust crypto backend for wasm32 (src/crypto.rs): HMAC-SHA256 via `hmac`
+# over `sha2`, constant-time compare via `subtle`, AES-256-GCM via `aes-gcm`,
+# and randomness via `getrandom`'s browser backend. `aes-gcm` runs with default
+# features off (dropping its built-in getrandom 0.2 RNG, which does not build on
+# wasm32) and `zeroize` on so key material is wiped on drop; the nonce is drawn
+# from getrandom 0.3 directly.
+hmac = "0.12"
+subtle = "2"
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc", "zeroize"] }
+getrandom = { version = "0.3", features = ["wasm_js"] }
+# On wasm32 the `time` crate's `OffsetDateTime::now_utc()` reads the clock via
+# `std::time::SystemTime::now()`, which panics on wasm32-unknown-unknown. The
+# `wasm-bindgen` feature makes it read `js_sys::Date` instead. This feature
+# unifies across the whole wasm build, so every crate that calls `now_utc()`
+# benefits. Target-scoped, so native is unchanged.
+time = { workspace = true, features = ["wasm-bindgen"] }
+
+[dev-dependencies]
+hex = "0.4"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
 
 [features]
 default = ["partiql"]

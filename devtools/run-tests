@@ -77,6 +77,14 @@ RUN_EXTERNAL=false
 RUN_COMPREHENSIVE=false
 RUN_TERRAFORM=false
 RUN_CATALOG_CHECK=false
+# Standalone WebAssembly suites. Unlike the others these need no running server,
+# target flag or credentials: --wasm is a wasm32 build check of the adapter
+# crate, --headless builds the wasm module and runs it under Node, and
+# --wasm-test runs the on-target wasm-bindgen-test suites (crypto, SQLite shim)
+# under Node.
+RUN_WASM=false
+RUN_HEADLESS=false
+RUN_WASM_TEST=false
 
 # Options
 RELEASE=false
@@ -106,6 +114,20 @@ Suites (at least one required):
                     binary, and downloads the AWS provider; not part of --all)
   --all             all suites above except --terraform
   --catalog-check   post-test catalog integrity check
+  --wasm            wasm32 build check of the WebAssembly adapter crate, with
+                    the reachability lint. Standalone: needs no server, target
+                    flag or credentials; writes discussions/test-wasm-<hash>.txt.
+                    Override the crate with EXTENDDB_WASM_PKG
+                    (default: extenddb-wasm-adapter)
+  --headless        build the wasm-pack --target web module and run the shared
+                    parity corpus through it under Node. Standalone like --wasm;
+                    needs node and wasm-pack but no server/creds. Writes
+                    discussions/test-headless-<hash>.txt
+  --wasm-test       run the on-target wasm-bindgen-test suites (core's crypto
+                    backend and the SQLite shim) on wasm32 under Node. Standalone
+                    like --wasm; needs a Node >= 20 and wasm-bindgen-test-runner
+                    (matching the wasm-bindgen crate in Cargo.lock) but no
+                    server/creds. Writes discussions/test-wasm-bindgen-<hash>.txt
 
 Options:
   --backend NAME    storage backend the running server uses:
@@ -147,6 +169,9 @@ while [[ $# -gt 0 ]]; do
         --release)        RELEASE=true; shift ;;
         --filter)         FILTER="$2"; shift 2 ;;
         --catalog-check)  RUN_CATALOG_CHECK=true; shift ;;
+        --wasm)           RUN_WASM=true; shift ;;
+        --headless)       RUN_HEADLESS=true; shift ;;
+        --wasm-test)      RUN_WASM_TEST=true; shift ;;
         --config)         CONFIG_PATH="$2"; shift 2 ;;
         --backend)        BACKEND="$2"; BACKEND_GIVEN=1; shift 2 ;;
         --parallel)
@@ -179,14 +204,18 @@ if [[ -n "${BACKEND_GIVEN:-}" ]]; then
 fi
 
 # --- Validate: target flag required ---
-if [[ -z "$TARGET" ]]; then
+# The standalone wasm suites (--wasm, --headless, --wasm-test) need no server, so
+# they do not require a target; every other suite does.
+if [[ -z "$TARGET" ]] \
+    && ( $RUN_RUST || $RUN_RUST_INTEGRATION || $RUN_PYTEST || $RUN_EXTERNAL \
+         || $RUN_COMPREHENSIVE || $RUN_TERRAFORM || $RUN_CATALOG_CHECK ); then
     echo "error: target flag is required (--extenddb or --real-dynamodb)"
     exit 1
 fi
 
 # --- Validate: at least one suite ---
-if ! $RUN_RUST && ! $RUN_RUST_INTEGRATION && ! $RUN_PYTEST && ! $RUN_EXTERNAL && ! $RUN_COMPREHENSIVE && ! $RUN_TERRAFORM && ! $RUN_CATALOG_CHECK; then
-    echo "error: at least one suite flag is required (--rust, --rust-integration, --pytest, --external, --comprehensive, --terraform, --all, --catalog-check)"
+if ! $RUN_RUST && ! $RUN_RUST_INTEGRATION && ! $RUN_PYTEST && ! $RUN_EXTERNAL && ! $RUN_COMPREHENSIVE && ! $RUN_TERRAFORM && ! $RUN_CATALOG_CHECK && ! $RUN_WASM && ! $RUN_HEADLESS && ! $RUN_WASM_TEST; then
+    echo "error: at least one suite flag is required (--rust, --rust-integration, --pytest, --external, --comprehensive, --terraform, --all, --catalog-check, --wasm, --headless, --wasm-test)"
     exit 1
 fi
 
@@ -279,17 +308,20 @@ if $NEEDS_INTEGRATION; then
 fi
 
 # --- Echo target info (D3: always, before any tests) ---
-echo "=== Test target: $TARGET ==="
-echo "  commit:              $HASH"
-if [[ "$TARGET" == "real-dynamodb" ]]; then
-    echo "  EXTENDDB_TEST_ENDPOINT = (not set — using AWS SDK defaults)"
-    echo "  AWS_ACCESS_KEY_ID  = ${AWS_ACCESS_KEY_ID:-(from ~/.aws)}"
-else
-    echo "  backend            = $BACKEND"
-    echo "  EXTENDDB_TEST_ENDPOINT = ${EXTENDDB_TEST_ENDPOINT:-}"
-    echo "  AWS_ACCESS_KEY_ID  = ${AWS_ACCESS_KEY_ID:-(will be provisioned)}"
+# Skipped when no target was given: the standalone wasm suites run no server.
+if [[ -n "$TARGET" ]]; then
+    echo "=== Test target: $TARGET ==="
+    echo "  commit:              $HASH"
+    if [[ "$TARGET" == "real-dynamodb" ]]; then
+        echo "  EXTENDDB_TEST_ENDPOINT = (not set — using AWS SDK defaults)"
+        echo "  AWS_ACCESS_KEY_ID  = ${AWS_ACCESS_KEY_ID:-(from ~/.aws)}"
+    else
+        echo "  backend            = $BACKEND"
+        echo "  EXTENDDB_TEST_ENDPOINT = ${EXTENDDB_TEST_ENDPOINT:-}"
+        echo "  AWS_ACCESS_KEY_ID  = ${AWS_ACCESS_KEY_ID:-(will be provisioned)}"
+    fi
+    echo ""
 fi
-echo ""
 
 # --- Health check (local targets only) ---
 # With EXTENDDB_TEST_BACKUP_STORE at filesystem or s3 the check also waits for
@@ -334,6 +366,209 @@ sys.exit(0 if h.get("components", {}).get("backup_store", {}).get("status") == "
 
 PASS=true
 CLEANUP_TRUSTSTORE=""
+
+# --- WebAssembly adapter build check (standalone) ---------------------------
+# The WebAssembly build compiles the engine + adapter to wasm32. This suite is a
+# build check plus the reachability lint; it needs no running server, no target
+# flag and no credentials, so it runs before the pre-flight the server-backed
+# suites require. When it is the only suite requested it exits with its own
+# status. It is placed after PASS=true so a failure here is not later reset.
+#
+# The getrandom wasm backend cfg is passed merged into RUSTFLAGS rather than left
+# to .cargo/config.toml: a RUSTFLAGS set in the environment shadows a target's
+# config-file rustflags, which would drop the cfg and break the build. Merging
+# keeps it set regardless of the caller's environment.
+WASM_RUSTFLAGS='--cfg getrandom_backend="wasm_js"'
+if $RUN_WASM; then
+    WASM_PKG="${EXTENDDB_WASM_PKG:-extenddb-wasm-adapter}"
+    WASM_OUTFILE="discussions/test-wasm-${HASH}.txt"
+    echo "=== wasm32 build check: ${WASM_PKG} (target wasm32-unknown-unknown) ==="
+    {
+        echo "WebAssembly adapter build check"
+        echo "target:  wasm32-unknown-unknown (in-memory SQLite in the browser)"
+        echo "package: ${WASM_PKG}"
+        echo "commit:  ${HASH}"
+        echo "date:    $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo
+    } > "$WASM_OUTFILE"
+    WASM_RC=0
+    # The reachability lint catches std::time / thread / tokio calls that compile
+    # to wasm but trap at runtime, which the build check below cannot see. A lint
+    # failure fails the wasm suite.
+    echo "--- wasm-reachability lint ---" | tee -a "$WASM_OUTFILE"
+    if ! python3 devtools/wasm-reachability-lint.py 2>&1 | tee -a "$WASM_OUTFILE"; then
+        WASM_RC=1
+    fi
+    if RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$WASM_RUSTFLAGS" \
+        cargo build --locked -p "$WASM_PKG" --target wasm32-unknown-unknown \
+        2>&1 | tee -a "$WASM_OUTFILE"; then
+        if [ "$WASM_RC" -eq 0 ]; then
+            echo "RESULT: PASS" | tee -a "$WASM_OUTFILE"
+        else
+            echo "RESULT: FAIL (build ok, lint failed)" | tee -a "$WASM_OUTFILE"
+        fi
+    else
+        WASM_RC=1
+        echo "RESULT: FAIL" | tee -a "$WASM_OUTFILE"
+    fi
+    echo "=== wrote ${WASM_OUTFILE} ==="
+    # The only suite requested: its status is the whole run.
+    if ! $RUN_RUST && ! $RUN_RUST_INTEGRATION && ! $RUN_PYTEST \
+        && ! $RUN_EXTERNAL && ! $RUN_COMPREHENSIVE && ! $RUN_TERRAFORM \
+        && ! $RUN_CATALOG_CHECK && ! $RUN_HEADLESS && ! $RUN_WASM_TEST; then
+        exit "$WASM_RC"
+    fi
+    [ "$WASM_RC" -ne 0 ] && PASS=false
+fi
+
+# --- WebAssembly headless parity run (standalone) ---------------------------
+# Builds the wasm-pack --target web module and runs the shared parity corpus
+# through it under Node, the same cases the native oracle test (the adapter's
+# tests/parity.rs) runs. Standalone like --wasm: no server, target flag or
+# credentials. Placed after PASS=true for the same reason.
+if $RUN_HEADLESS; then
+    HEADLESS_OUTFILE="discussions/test-headless-${HASH}.txt"
+    echo "=== wasm headless parity run → ${HEADLESS_OUTFILE} ==="
+    {
+        echo "WebAssembly headless parity run"
+        echo "target:  wasm32-unknown-unknown (in-memory SQLite in the browser) via Node"
+        echo "commit:  ${HASH}"
+        echo "date:    $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo
+    } > "$HEADLESS_OUTFILE"
+    HEADLESS_RC=0
+    if ! command -v node >/dev/null 2>&1; then
+        echo "error: node not found — install nodejs to run the headless suite" | tee -a "$HEADLESS_OUTFILE"
+        HEADLESS_RC=1
+    elif ! command -v wasm-pack >/dev/null 2>&1; then
+        echo "error: wasm-pack not found — needed to build the browser module" | tee -a "$HEADLESS_OUTFILE"
+        HEADLESS_RC=1
+    else
+        echo "--- wasm-pack build --target web --release ---" | tee -a "$HEADLESS_OUTFILE"
+        if RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$WASM_RUSTFLAGS" \
+            wasm-pack build --target web --release crates/wasm-adapter \
+            --out-dir parity/pkg 2>&1 | tee -a "$HEADLESS_OUTFILE"; then
+            echo "--- node parity runner ---" | tee -a "$HEADLESS_OUTFILE"
+            if ! node crates/wasm-adapter/parity/run.mjs 2>&1 | tee -a "$HEADLESS_OUTFILE"; then
+                HEADLESS_RC=1
+            fi
+        else
+            echo "wasm-pack build failed" | tee -a "$HEADLESS_OUTFILE"
+            HEADLESS_RC=1
+        fi
+    fi
+    if [ "$HEADLESS_RC" -eq 0 ]; then
+        echo "RESULT: PASS" | tee -a "$HEADLESS_OUTFILE"
+    else
+        echo "RESULT: FAIL" | tee -a "$HEADLESS_OUTFILE"
+    fi
+    echo "=== wrote ${HEADLESS_OUTFILE} ==="
+    # The only remaining suite requested: its status is the whole run.
+    if ! $RUN_RUST && ! $RUN_RUST_INTEGRATION && ! $RUN_PYTEST \
+        && ! $RUN_EXTERNAL && ! $RUN_COMPREHENSIVE && ! $RUN_TERRAFORM \
+        && ! $RUN_CATALOG_CHECK && ! $RUN_WASM_TEST; then
+        exit "$HEADLESS_RC"
+    fi
+    [ "$HEADLESS_RC" -ne 0 ] && PASS=false
+fi
+
+# --- On-target wasm-bindgen-test suites (standalone) ------------------------
+# core's wasm crypto backend (sha2/hmac/subtle/aes-gcm/getrandom) and the
+# synchronous SQLite shim run in no native test — they exist only on wasm32.
+# Their behavior is pinned by wasm-bindgen-test cases that execute on wasm32
+# under Node, the same two suites the WebAssembly CI workflow runs. Standalone
+# like --wasm: no server, target flag or credentials. Placed after PASS=true so
+# a failure here is not later reset.
+#
+# wasm-bindgen-test drives the compiled test module through
+# wasm-bindgen-test-runner, which must match the wasm-bindgen crate in
+# Cargo.lock (a mismatch crashes at run time, not at build time), and runs it on
+# a Node whose V8 is newer than Node 18's. CARGO_TARGET_..._RUNNER and
+# WASM_BINDGEN_TEST_ONLY_NODE are read only when a wasm `cargo test` executes.
+if $RUN_WASM_TEST; then
+    WASM_TEST_OUTFILE="discussions/test-wasm-bindgen-${HASH}.txt"
+    echo "=== on-target wasm-bindgen-test suites → ${WASM_TEST_OUTFILE} ==="
+    {
+        echo "WebAssembly on-target wasm-bindgen-test suites"
+        echo "target:  wasm32-unknown-unknown (in-memory SQLite in the browser) via Node"
+        echo "suites:  extenddb-core crypto (--lib), extenddb-storage-sqlite shim (--test wasm_shim)"
+        echo "commit:  ${HASH}"
+        echo "date:    $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo
+    } > "$WASM_TEST_OUTFILE"
+    WASM_TEST_RC=0
+
+    # Pick a Node >= 20 for the harness. The host default `node` may be 18
+    # (whose V8 crashes the wasm-bindgen-test harness), with a newer build
+    # installed under a versioned name such as `node-22`. The runner spawns
+    # `node` from PATH, so a shim directory makes the chosen binary resolve as
+    # `node` without disturbing the rest of the environment.
+    WASM_TEST_NODE=""
+    for cand in node node-22 node-21 node-20; do
+        if command -v "$cand" >/dev/null 2>&1; then
+            node_major=$("$cand" -e 'process.stdout.write(process.versions.node.split(".")[0])' 2>/dev/null) || continue
+            if [[ "$node_major" =~ ^[0-9]+$ ]] && [ "$node_major" -ge 20 ]; then
+                WASM_TEST_NODE=$(command -v "$cand")
+                break
+            fi
+        fi
+    done
+
+    # wasm-bindgen-test-runner is a cargo-installed binary; it is on PATH in CI
+    # but cargo's bin directory is not always on an interactive PATH, so fall
+    # back to it. It must match the wasm-bindgen crate in Cargo.lock.
+    CARGO_BIN_DIR="${CARGO_HOME:-$HOME/.cargo}/bin"
+    if command -v wasm-bindgen-test-runner >/dev/null 2>&1; then
+        HAVE_RUNNER=1
+    elif [ -x "$CARGO_BIN_DIR/wasm-bindgen-test-runner" ]; then
+        HAVE_RUNNER=1
+    else
+        HAVE_RUNNER=0
+    fi
+
+    if [ -z "$WASM_TEST_NODE" ]; then
+        echo "error: no Node >= 20 found (node, node-22, node-21, node-20); the wasm-bindgen-test harness needs a V8 newer than Node 18's" | tee -a "$WASM_TEST_OUTFILE"
+        WASM_TEST_RC=1
+    elif [ "$HAVE_RUNNER" -ne 1 ]; then
+        echo "error: wasm-bindgen-test-runner not found on PATH or in $CARGO_BIN_DIR — install it with the Cargo.lock wasm-bindgen version, e.g. 'cargo install --locked --version 0.2.130 wasm-bindgen-cli'" | tee -a "$WASM_TEST_OUTFILE"
+        WASM_TEST_RC=1
+    else
+        echo "node:    ${WASM_TEST_NODE} ($("$WASM_TEST_NODE" --version 2>/dev/null))" | tee -a "$WASM_TEST_OUTFILE"
+        NODE_SHIM_DIR=$(mktemp -d)
+        ln -sf "$WASM_TEST_NODE" "$NODE_SHIM_DIR/node"
+        for suite in \
+            "crypto|-p extenddb-core --lib" \
+            "shim|-p extenddb-storage-sqlite --test wasm_shim"; do
+            suite_name="${suite%%|*}"
+            suite_args="${suite#*|}"
+            echo "--- ${suite_name} (cargo test ${suite_args} --target wasm32-unknown-unknown) ---" | tee -a "$WASM_TEST_OUTFILE"
+            # shellcheck disable=SC2086
+            if ! PATH="$NODE_SHIM_DIR:$CARGO_BIN_DIR:$PATH" \
+                CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+                WASM_BINDGEN_TEST_ONLY_NODE=1 \
+                RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$WASM_RUSTFLAGS" \
+                cargo test --locked $suite_args --target wasm32-unknown-unknown \
+                2>&1 | tee -a "$WASM_TEST_OUTFILE"; then
+                WASM_TEST_RC=1
+            fi
+        done
+        rm -rf "$NODE_SHIM_DIR"
+    fi
+
+    if [ "$WASM_TEST_RC" -eq 0 ]; then
+        echo "RESULT: PASS" | tee -a "$WASM_TEST_OUTFILE"
+    else
+        echo "RESULT: FAIL" | tee -a "$WASM_TEST_OUTFILE"
+    fi
+    echo "=== wrote ${WASM_TEST_OUTFILE} ==="
+    # The only remaining suite requested: its status is the whole run.
+    if ! $RUN_RUST && ! $RUN_RUST_INTEGRATION && ! $RUN_PYTEST \
+        && ! $RUN_EXTERNAL && ! $RUN_COMPREHENSIVE && ! $RUN_TERRAFORM \
+        && ! $RUN_CATALOG_CHECK; then
+        exit "$WASM_TEST_RC"
+    fi
+    [ "$WASM_TEST_RC" -ne 0 ] && PASS=false
+fi
 
 # --- Pre-flight for integration suites (local targets) ---
 if $NEEDS_INTEGRATION && [[ "$TARGET" != "real-dynamodb" ]]; then
@@ -477,14 +712,16 @@ fi
 
 # --- Rust tests ---
 if $RUN_RUST; then
+    # --no-fail-fast runs every test binary even after one fails, so a single
+    # failing suite does not hide the result of the rest in one run.
     if $RELEASE; then
         OUTFILE="discussions/test-rust-release-${HASH}.txt"
         echo "=== Rust tests (release) → ${OUTFILE} ==="
-        CARGO_ARGS=(cargo test --release)
+        CARGO_ARGS=(cargo test --release --no-fail-fast)
     else
         OUTFILE="discussions/test-rust-${HASH}.txt"
         echo "=== Rust tests (debug) → ${OUTFILE} ==="
-        CARGO_ARGS=(cargo test)
+        CARGO_ARGS=(cargo test --no-fail-fast)
     fi
     if [[ -n "$FILTER" ]]; then
         CARGO_ARGS+=(-- "$FILTER")

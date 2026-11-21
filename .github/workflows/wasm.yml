@@ -1,0 +1,157 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# WebAssembly browser-build gate for extenddb-wasm-adapter.
+#
+# The adapter compiles the engine, auth, core and the SQLite backend to
+# wasm32-unknown-unknown and runs them in a browser over an in-memory SQLite
+# (sqlite-wasm-rs) behind a synchronous shim. No other workflow builds that
+# target, so without this job a change can break the wasm build with every
+# other check green: a new aws-lc-rs call, a std::time or a tokio::spawn in a
+# wasm-reachable path, or a shim regression are all invisible to the native
+# test and clippy jobs. That is why this is a required check that reports on
+# every pull request rather than a path-filtered one — a path-filtered required
+# check never reports on a pull request outside its paths, and that pull
+# request can never merge (see licenses.yml).
+#
+# The getrandom browser backend cfg is set through RUSTFLAGS on each wasm
+# compile step rather than left to .cargo/config.toml, so the job does not
+# depend on an ambient RUSTFLAGS being absent: a RUSTFLAGS in the environment
+# shadows a target's config-file rustflags and would drop the cfg, breaking the
+# build.
+
+name: WebAssembly
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Supersede an in-flight run of the SAME pull request when a new push arrives,
+# so repeated pushes do not stack up on a capped pool. Non-PR runs get a group
+# unique to the run (run_id): merge-group runs reuse a ref across re-queues,
+# and GitHub concurrency replaces a PENDING run in a group even with
+# cancel-in-progress false, so keying them by ref would let one merge-group
+# run cancel another and evict its queue entry.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  wasm:
+    # Dedicated ExtendDB runner group (Ubuntu 24.04, 4 vCPU / 16 GB, capped at
+    # 20 concurrent). ubuntu-latest is an Amazon-wide shared pool where our jobs
+    # waited 10-90 minutes to start (2026-09-29/30); see integration.yml.
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 30
+    env:
+      # core's crypto table and the SQLite shim's tests/wasm_shim.rs are
+      # wasm-bindgen-test cases; they run under Node through the matching
+      # wasm-bindgen-test-runner (installed below, same version as the
+      # wasm-bindgen crate in Cargo.lock). These two variables are read only
+      # when a wasm `cargo test` executes, so they do not affect the build or
+      # clippy steps.
+      CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+      WASM_BINDGEN_TEST_ONLY_NODE: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          # Pinned, like the clippy job, so a new stable does not change which
+          # lints fire. The crates build with the workspace rust-version
+          # (1.91.1); this is the lint/build toolchain, above that floor.
+          toolchain: 1.97.0
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Only pushes to main save, so other runs restore main's cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          # wasm-bindgen-test 0.3.80's Node harness needs a V8 newer than the
+          # one in Node 18.
+          node-version: "22"
+
+      # sqlite-wasm-rs compiles SQLite with clang for wasm32; lld provides the
+      # wasm linker. Pinning the packages keeps the build off whatever the
+      # runner image ships by default.
+      - name: Install clang and lld
+        run: sudo apt-get update && sudo apt-get install -y clang lld
+
+      # wasm-bindgen-cli must match the wasm-bindgen crate in Cargo.lock
+      # (0.2.130): the JS glue it generates and the test harness it runs are
+      # version-locked to the crate, and a mismatch crashes at run time rather
+      # than failing to build. wasm-pack builds the --target web module for the
+      # headless parity run. Both land in ~/.cargo/bin; caching them skips the
+      # multi-minute compile on a hit.
+      - name: Cache wasm tooling
+        id: cache-wasm-tools
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/bin/wasm-bindgen
+            ~/.cargo/bin/wasm-bindgen-test-runner
+            ~/.cargo/bin/wasm2es6js
+            ~/.cargo/bin/wasm-pack
+          key: wasm-tools-wbindgen0.2.130-wpack0.15.1-${{ runner.os }}
+      - name: Install wasm tooling
+        if: steps.cache-wasm-tools.outputs.cache-hit != 'true'
+        run: |
+          cargo install --locked --version 0.2.130 wasm-bindgen-cli
+          cargo install --locked --version 0.15.1 wasm-pack
+
+      # Catches std::time / std::thread / tokio::time / tokio::spawn in
+      # wasm-reachable code: those compile to wasm32 but trap when called, which
+      # the build below cannot see.
+      - name: Reachability lint
+        run: python3 devtools/wasm-reachability-lint.py
+
+      - name: Build the adapter for wasm32
+        env:
+          RUSTFLAGS: --cfg getrandom_backend="wasm_js"
+        run: cargo build --locked -p extenddb-wasm-adapter --target wasm32-unknown-unknown
+
+      # --no-deps and --lib keep the lint on the crate's own wasm library code:
+      # its native dependencies carry their own clippy state, and the host-only
+      # integration tests (the native parity oracle) do not compile for wasm32.
+      - name: Clippy the adapter (pedantic) for wasm32
+        env:
+          RUSTFLAGS: --cfg getrandom_backend="wasm_js"
+        run: cargo clippy --locked --no-deps -p extenddb-wasm-adapter --lib --target wasm32-unknown-unknown -- -D warnings -W clippy::pedantic
+
+      - name: Clippy the SQLite backend (with the shim) for wasm32
+        env:
+          RUSTFLAGS: --cfg getrandom_backend="wasm_js"
+        run: cargo clippy --locked --no-deps -p extenddb-storage-sqlite --lib --target wasm32-unknown-unknown -- -D warnings
+
+      # core's wasm crypto backend (sha2/hmac/subtle/aes-gcm/getrandom) runs in
+      # no native test; this runs its known-vector and seal/open cases on
+      # wasm32 under Node.
+      - name: Crypto wasm tests under Node
+        env:
+          RUSTFLAGS: --cfg getrandom_backend="wasm_js"
+        run: cargo test --locked -p extenddb-core --lib --target wasm32-unknown-unknown
+
+      # The synchronous SQLite shim is the wasm backend; tests/wasm_shim.rs pins
+      # its storage-class, NULL, UTF-8, duplicate-column, multi-statement,
+      # empty-SQL, transaction and FromRow rules on wasm32 under Node.
+      - name: SQLite shim wasm tests under Node
+        env:
+          RUSTFLAGS: --cfg getrandom_backend="wasm_js"
+        run: cargo test --locked -p extenddb-storage-sqlite --test wasm_shim --target wasm32-unknown-unknown
+
+      # Builds the browser module with wasm-bindgen and runs the shared parity
+      # corpus through it under Node — the same cases, with the same expected
+      # responses, that the native oracle test (crates/wasm-adapter/tests/
+      # parity.rs) runs against sqlx + the C SQLite.
+      - name: Headless parity corpus under Node
+        env:
+          RUSTFLAGS: --cfg getrandom_backend="wasm_js"
+        run: |
+          wasm-pack build --target web --release crates/wasm-adapter --out-dir parity/pkg
+          node crates/wasm-adapter/parity/run.mjs

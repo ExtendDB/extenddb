@@ -25,6 +25,7 @@ members = [
     "crates/server",
     "crates/app",
     "crates/bin",
+    "crates/wasm-adapter",
 ]
 
 [workspace.package]
@@ -178,6 +179,9 @@ rand = "0.9"
 # Time
 chrono = "0.4"
 time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+# Drop-in for `std::time` that works on wasm32: re-exports `std::time` verbatim
+# on native and backs the clock with the host's time source on wasm.
+web-time = "1"
 
 # TLS
 axum-server = { version = "0.8", features = ["tls-rustls"] }

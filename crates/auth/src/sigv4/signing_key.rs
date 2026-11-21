@@ -11,7 +11,6 @@
 //! kSigning = HMAC(kService, "aws4_request")
 //! ```
 
-use aws_lc_rs::hmac;
 use zeroize::Zeroizing;
 
 /// Derive the `SigV4` signing key of `secret` into `out`.
@@ -70,11 +69,10 @@ pub fn compute_signature(signing_key: &[u8; 32], string_to_sign: &str) -> String
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8], out: &mut [u8; 32]) {
-    // HMAC-SHA256 accepts a key of any length (RFC 2104). `Key::new` panics
-    // only if AWS-LC cannot set up the HMAC context, which does not depend on
-    // the key. AWS-LC cleanses its copy of the key when `key` drops.
-    let key = hmac::Key::new(hmac::HMAC_SHA256, key);
-    out.copy_from_slice(hmac::sign(&key, data).as_ref());
+    // HMAC-SHA256 accepts a key of any length (RFC 2104). The shared crypto
+    // module chooses the backend (AWS-LC on the server, pure-Rust on wasm) and
+    // owns any key cleansing its backend performs.
+    out.copy_from_slice(&extenddb_core::crypto::hmac_sha256(key, data));
 }
 
 #[cfg(test)]
