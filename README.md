@@ -545,7 +545,7 @@ compiled from C by the `sqlite-wasm-rs` dependency, so a `clang` with a wasm32
 target must be on `PATH`, or the build stops in that crate's build script.
 
 The emitted module is about 6.6 MiB after `wasm-bindgen`; `wasm-pack --release`
-runs `wasm-opt`, which brings it to about 4.9 MiB.
+runs `wasm-opt`, which brings it to about 5.0 MiB.
 
 ## Project Structure
 
