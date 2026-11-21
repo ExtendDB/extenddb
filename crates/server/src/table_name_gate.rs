@@ -50,19 +50,21 @@
 //!   constraint list (`arn_gate::MAP_KEYS_ARN`).
 //! - ARN-shaped values: see `arn_gate`.
 //! - A RestoreTableFromBackup `TargetTableName` outside the pattern gets the
-//!   answer of `extenddb_engine::check_restore_table_name`: `TableName must
-//!   be at least 3 characters long and at most 255 characters long` when its
-//!   length in UTF-16 code units is outside 3 to 255, and the clauses at
-//!   `targetTableName` otherwise. An override member of another JSON kind
-//!   that the overrides' parse refuses
-//!   (`extenddb_engine::check_restore_override_kinds`) and a `BackupArn` of
-//!   another account (the cross-account refusal) are answered before it
-//!   (measured 2026-11-20), and so are the account and the shape of the
-//!   `BackupArn` (`extenddb_engine::check_restore_backup_arn`: an absent or
-//!   malformed one is `Invalid Backup ARN`, measured 2026-11-21). The parse
-//!   accepts a `ProvisionedThroughputOverride` list of two integers and a
-//!   `BillingModeOverride` object of one key, which the service refuses
-//!   before the name (#1106).
+//!   answer of `extenddb_engine::check_restore_name_and_overrides`:
+//!   `TableName must be at least 3 characters long and at most 255
+//!   characters long` when its length in UTF-16 code units is outside 3 to
+//!   255, and otherwise one message with the clauses of the override values
+//!   the model refuses and then the clauses at `targetTableName` (measured
+//!   2026-11-21). A `BackupArn` of another account (the cross-account
+//!   refusal) is answered before it (measured 2026-11-20), and so are the
+//!   account and the shape of the `BackupArn`
+//!   (`extenddb_engine::check_restore_backup_arn`: an absent or malformed
+//!   one is `Invalid Backup ARN`, measured 2026-11-21).
+//! - A RestoreTableFromBackup override member of another JSON kind than the
+//!   model's, at any depth and a list in place of a structure included
+//!   (`extenddb_engine::check_restore_override_kinds`), is answered before
+//!   every check of a value, whatever the name and the account (measured
+//!   2026-11-21).
 //! - A RestoreTableFromBackup `TargetTableName` or `BackupArn`, a
 //!   DescribeBackup or DeleteBackup `BackupArn` and a
 //!   DescribeContinuousBackups or UpdateContinuousBackups `TableName` that
@@ -137,12 +139,15 @@ pub(crate) fn check_table_name_chars(
             let target = input.get("TargetTableName");
             string_member(input, "TargetTableName")?;
             string_member(input, "BackupArn")?;
+            // An override member of another JSON kind is answered before the
+            // values, whatever the name and the account (measured on DynamoDB
+            // on 21 Nov 2026).
+            extenddb_engine::check_restore_override_kinds(input)?;
             with_str(input, "BackupArn", arn_gate::check_backup_arn)?;
             // A target name refused here gets the restore's own answer, its
             // length text before the member constraints, with the model's
             // bounds (measured on DynamoDB on 20 Nov 2026).
             check_name_member(target, "targetTableName").or_else(|_| {
-                extenddb_engine::check_restore_override_kinds(input)?;
                 // The cross-account refusal answers it, and `authorize_request`
                 // looks no table up before that refusal.
                 if cross_account::find(operation, input, account_id).is_some() {
@@ -152,7 +157,7 @@ pub(crate) fn check_table_name_chars(
                 // name, an absent one included (measured on 21 Nov 2026).
                 extenddb_engine::check_restore_backup_arn(input, account_id)?;
                 let name = target.and_then(Value::as_str).unwrap_or_default();
-                extenddb_engine::check_restore_table_name(name, "targetTableName", (3, 255))
+                extenddb_engine::check_restore_name_and_overrides(input, name, (3, 255))
             })
         }
         // The server refuses every RestoreTableToPointInTime before this
@@ -744,14 +749,18 @@ mod tests {
         }
     }
 
-    /// Measured on DynamoDB on 20 and 21 Nov 2026: with a target name the gate
-    /// refuses, an override member of another JSON kind is answered first, and
-    /// a `BackupArn` of another account is passed on to the cross-account
-    /// refusal. Then the account and the shape of the `BackupArn` are answered
-    /// (a null one stands for an absent one); its id is answered after the
-    /// name. Any other override fault keeps the name's answer. Each body has
-    /// the caller's `BackupArn` unless the row gives one. Only the type of a
-    /// `SerializationException` is checked (#1012).
+    /// Measured on DynamoDB on 20 and 21 Nov 2026: an override member of
+    /// another JSON kind at any depth, a list in place of a structure
+    /// included, is answered first, whatever the name and the account.
+    /// With a target name the gate refuses, a `BackupArn` of another account is
+    /// passed on to the cross-account refusal. Then the account and the shape
+    /// of the `BackupArn` are answered (a null one stands for an absent one),
+    /// then the name's length, then one message with the clauses of the
+    /// throughput members below 1, the billing mode's enum and the name; the
+    /// `BackupArn`'s id is answered after the name. Any other override fault
+    /// keeps the name's answer. Each body has the caller's `BackupArn` unless
+    /// the row gives one. Only the type of a `SerializationException` is
+    /// checked (#1012).
     #[test]
     fn a_refused_restore_target_name_is_answered_after_the_types_and_the_account() {
         let own =
@@ -764,6 +773,25 @@ mod tests {
         let bm = "BillingModeOverride";
         let ser = "SerializationException";
         let len = "TableName must be at least 3 characters long and at most 255 characters long";
+        let at = |value: &str, path: &str, c: &str| {
+            format!("Value '{value}' at '{path}' failed to satisfy constraint: {c}")
+        };
+        let rcu = at(
+            "0",
+            "provisionedThroughputOverride.readCapacityUnits",
+            "Member must have value greater than or equal to 1",
+        );
+        let mode = at(
+            "PAY",
+            "billingModeOverride",
+            "Member must satisfy enum value set: [PROVISIONED, PAY_PER_REQUEST]",
+        );
+        let pat = at("a b", "targetTableName", PAT);
+        let rcu0 = json!({ "ReadCapacityUnits": 0, "WriteCapacityUnits": 1 });
+        let pay_pat = format!("2 validation errors detected: {mode}; {pat}");
+        let rcu_pat = format!("2 validation errors detected: {rcu}; {pat}");
+        let all = format!("3 validation errors detected: {rcu}; {mode}; {pat}");
+        let pat_only = format!("1 validation error detected: {pat}");
         let rows = [
             (json!({ "BackupArn": other }), "a*", "passed"),
             (json!({ "BackupArn": other }), "a b", "passed"),
@@ -822,8 +850,68 @@ mod tests {
                 "a*",
                 len,
             ),
-            // A name inside the pattern is passed on to the later checks.
-            (json!({ gsi: {} }), "ab", "passed"),
+            (json!({}), "a b", pat_only.as_str()),
+            (json!({ bm: "PAY" }), "a b", pay_pat.as_str()),
+            (json!({ bm: "PROVISIONED" }), "a b", pat_only.as_str()),
+            (json!({ pt: rcu0 }), "a b", rcu_pat.as_str()),
+            (json!({ bm: "PAY", pt: rcu0 }), "a b", all.as_str()),
+            (
+                json!({ "BackupArn": own.replace("01700000000000-abcdef12", "bad"), bm: "PAY" }),
+                "a b",
+                pay_pat.as_str(),
+            ),
+            (
+                json!({ "BackupArn": other, bm: "PAY", pt: rcu0 }),
+                "a b",
+                "passed",
+            ),
+            (
+                json!({ "BackupArn": "x", bm: "PAY", pt: rcu0 }),
+                "a b",
+                invalid,
+            ),
+            // A name inside the pattern is passed on to the later checks,
+            // after an override member of another JSON kind.
+            (json!({ bm: "PAY", pt: rcu0 }), "ab", "passed"),
+            (json!({ gsi: {} }), "ab", ser),
+            (json!({ gsi: {} }), "t367name", ser),
+            (json!({ "BackupArn": other, sse: 5 }), "t367name", ser),
+            (json!({ "BackupArn": "x", bm: 5 }), "ab", ser),
+            (json!({ "BackupArn": null, bm: 5 }), "t367name", ser),
+            // A member of another JSON kind inside an override, first too.
+            (
+                json!({ "BackupArn": "x", "VectorIndexOverride": {} }),
+                "t367name",
+                ser,
+            ),
+            (json!({ "BackupArn": other, gsi: [5] }), "t367name", ser),
+            (
+                json!({ gsi: [{ "IndexName": 5, "Projection": { "ProjectionType": "ALL" },
+                    "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }] }] }),
+                "a b",
+                ser,
+            ),
+            (
+                json!({ "BackupArn": "x", "LocalSecondaryIndexOverride": [{ "IndexName": 5 }] }),
+                "t367name",
+                ser,
+            ),
+            (
+                json!({ "OnDemandThroughputOverride": { "MaxReadRequestUnits": "x" } }),
+                "a b",
+                ser,
+            ),
+            (json!({ "BackupArn": "x", pt: [0, 1] }), "t367name", ser),
+            (
+                json!({ "BackupArn": other, pt: { "ReadCapacityUnits": "x", "WriteCapacityUnits": 1 } }),
+                "a b",
+                ser,
+            ),
+            (
+                json!({ "BackupArn": other, sse: { "Enabled": "x" } }),
+                "t367name",
+                ser,
+            ),
         ];
         for (members, name, expected) in rows {
             let mut input = json!({ "BackupArn": own, "TargetTableName": name });

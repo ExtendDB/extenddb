@@ -290,7 +290,12 @@ fn the_restore_source_name_is_checked_for_length_then_pattern() {
     let length = "TableName must be at least 3 characters long and at most 255 characters long";
     for name in [String::new(), "ab".to_owned(), "x".repeat(256)] {
         assert_eq!(
-            validation_message(check_restore_table_name(&name, "sourceTableName", BOUNDS)),
+            validation_message(check_restore_table_name(
+                &name,
+                "sourceTableName",
+                BOUNDS,
+                &[]
+            )),
             length,
             "{name:?}"
         );
@@ -304,7 +309,7 @@ fn the_restore_source_name_is_checked_for_length_then_pattern() {
         );
     }
     let e = "\u{1F600}";
-    let target = |name: &str| check_restore_table_name(name, "targetTableName", BOUNDS);
+    let target = |name: &str| check_restore_table_name(name, "targetTableName", BOUNDS, &[]);
     for name in ["a*".into(), e.into(), "\u{e9}\u{e9}".into(), e.repeat(128)] {
         assert_eq!(validation_message(target(&name)), length, "{name:?}");
     }
@@ -325,7 +330,12 @@ fn the_restore_source_name_is_checked_for_length_then_pattern() {
     }
     assert!(target(&"x".repeat(255)).is_ok());
     assert_eq!(
-        validation_message(check_restore_table_name("ab", "sourceTableName", (5, 10))),
+        validation_message(check_restore_table_name(
+            "ab",
+            "sourceTableName",
+            (5, 10),
+            &[]
+        )),
         "TableName must be at least 5 characters long and at most 10 characters long"
     );
     let arn = format!("{P}Music");

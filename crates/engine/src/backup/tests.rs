@@ -4846,20 +4846,136 @@ fn throughput_override_under_pay_per_request_is_refused() {
     ));
 }
 
-#[test]
-fn invalid_provisioned_throughput_override_matches_create_table() {
-    let expected = "One or more parameter values were invalid: ReadCapacityUnits and \
-                    WriteCapacityUnits must both be greater than or equal to 1 for table";
-    for (read, write) in [(0, 5), (5, 0), (-1, 5), (5, -1)] {
-        let overrides = parse_restore_table_overrides(&json!({
-            "BillingModeOverride": "PROVISIONED",
-            "ProvisionedThroughputOverride": { "ReadCapacityUnits": read, "WriteCapacityUnits": write },
-        }))
-        .unwrap();
-        assert_eq!(
-            validation_message(validate_override_shape(&overrides).unwrap_err()),
-            expected
-        );
+/// The order of a restore's checks, on both paths, with no storage read:
+/// an override member of another JSON kind at any depth (a list in place of
+/// a structure included), then the `BackupArn`'s account and shape, then a
+/// missing or short `TargetTableName`, then one message with the model's
+/// clauses (each throughput member below 1, the billing mode's enum, the
+/// name's pattern), then the `BackupArn`'s id, then the PROVISIONED rule.
+/// Measured on DynamoDB in us-east-1 on 21 Nov 2026; the
+/// `{0, 0}` row on 13 and 14 Nov 2026 (#1048). Only the type of a
+/// `SerializationException` is checked (#1012).
+#[tokio::test]
+async fn a_restore_checks_its_members_in_the_services_order() {
+    let at = |value: &str, path: &str, c: &str| {
+        format!("Value '{value}' at '{path}' failed to satisfy constraint: {c}")
+    };
+    let units = "Member must have value greater than or equal to 1";
+    let pto = "provisionedThroughputOverride";
+    let rcu = at("0", &format!("{pto}.readCapacityUnits"), units);
+    let wcu = at("0", &format!("{pto}.writeCapacityUnits"), units);
+    let modes = "Member must satisfy enum value set: [PROVISIONED, PAY_PER_REQUEST]";
+    let mode = at("PAY", "billingModeOverride", modes);
+    let pattern = "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+";
+    let pat = at("a b", "targetTableName", pattern);
+    let one = |c: &str| format!("ValidationException: 1 validation error detected: {c}");
+    let two =
+        |a: &str, b: &str| format!("ValidationException: 2 validation errors detected: {a}; {b}");
+    let three = format!("ValidationException: 3 validation errors detected: {rcu}; {mode}; {pat}");
+    let length = "ValidationException: TableName must be at least 3 characters long and at \
+                  most 255 characters long"
+        .to_owned();
+    let required = "ValidationException: The parameter 'TableName' is required but was not \
+                    present in the request"
+        .to_owned();
+    let invalid = "ValidationException: Invalid Backup ARN".to_owned();
+    let not_valid = "ValidationException: Invalid Request: BackupArn is not valid".to_owned();
+    let denied = "AccessDeniedException: Access is denied".to_owned();
+    let ser = "SerializationException".to_owned();
+    let (own, other) = (arn(ACCOUNT), arn("111122223333"));
+    let table = source_arn();
+    let bad_id = format!("{table}/backup/bad");
+    let west = own.replace(REGION, "us-west-2");
+    let (ok, short, spaced) = (json!("MusicRestored"), json!("ab"), json!("a b"));
+    let pay = json!({ "BillingModeOverride": "PAY" });
+    let prov = json!({ "BillingModeOverride": "PROVISIONED" });
+    let pt = |read: i64, write: i64| {
+        json!({ "ProvisionedThroughputOverride":
+            { "ReadCapacityUnits": read, "WriteCapacityUnits": write } })
+    };
+    let rcu0 = pt(0, 1);
+    let both = json!({ "BillingModeOverride": "PAY",
+        "ProvisionedThroughputOverride": { "ReadCapacityUnits": 0, "WriteCapacityUnits": 1 } });
+    let gsi = json!({ "GlobalSecondaryIndexOverride": {} });
+    let sse = json!({ "SSESpecificationOverride": 5 });
+    let number = json!({ "BillingModeOverride": 5 });
+    let on_demand = json!({ "OnDemandThroughputOverride": [1] });
+    let pay_sse = json!({ "BillingModeOverride": "PAY", "SSESpecificationOverride": 5 });
+    let pay_pto = json!({ "BillingModeOverride": "PAY", "ProvisionedThroughputOverride": "x" });
+    let vector = json!({ "VectorIndexOverride": {} });
+    let gsi_entry = json!({ "GlobalSecondaryIndexOverride": [5] });
+    let gsi_name = json!({ "GlobalSecondaryIndexOverride": [{ "IndexName": 5,
+        "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
+        "Projection": { "ProjectionType": "ALL" } }] });
+    let lsi_name = json!({ "LocalSecondaryIndexOverride": [{ "IndexName": 5 }] });
+    let max_read = json!({ "OnDemandThroughputOverride": { "MaxReadRequestUnits": "x" } });
+    let read_string = json!({ "ProvisionedThroughputOverride":
+        { "ReadCapacityUnits": "x", "WriteCapacityUnits": 1 } });
+    let enabled = json!({ "SSESpecificationOverride": { "Enabled": "x" } });
+    let pto_list = json!({ "ProvisionedThroughputOverride": [0, 1] });
+    // (BackupArn, TargetTableName, overrides, answer); a null member stands
+    // for an absent one.
+    let rows: Vec<(Value, Value, Value, String)> = vec![
+        (json!(own), ok.clone(), pay.clone(), one(&mode)),
+        (json!(own), ok.clone(), rcu0.clone(), one(&rcu)),
+        (json!(own), ok.clone(), both.clone(), two(&rcu, &mode)),
+        (json!(own), ok.clone(), pt(0, 0), two(&wcu, &rcu)),
+        (json!(own), short.clone(), both.clone(), length.clone()),
+        (json!(own), spaced.clone(), json!({}), one(&pat)),
+        (json!(own), spaced.clone(), pay.clone(), two(&mode, &pat)),
+        (json!(own), spaced.clone(), prov.clone(), one(&pat)),
+        (json!(own), spaced.clone(), rcu0.clone(), two(&rcu, &pat)),
+        (json!(own), spaced.clone(), both.clone(), three.clone()),
+        (json!(own), Value::Null, both.clone(), required.clone()),
+        (json!("x"), short.clone(), pay.clone(), invalid.clone()),
+        (json!("x"), spaced.clone(), both.clone(), invalid.clone()),
+        (Value::Null, spaced.clone(), rcu0.clone(), invalid.clone()),
+        (Value::Null, Value::Null, both.clone(), invalid.clone()),
+        (json!(table), ok.clone(), both.clone(), invalid.clone()),
+        (json!(bad_id), ok.clone(), json!({}), not_valid.clone()),
+        (json!(bad_id), ok.clone(), prov.clone(), not_valid.clone()),
+        (json!(bad_id), ok.clone(), pay.clone(), one(&mode)),
+        (json!(bad_id), ok.clone(), both.clone(), two(&rcu, &mode)),
+        (json!(bad_id), short.clone(), rcu0.clone(), length.clone()),
+        (json!(bad_id), spaced.clone(), both.clone(), three.clone()),
+        (json!(bad_id), Value::Null, pay.clone(), required.clone()),
+        (json!(west), ok.clone(), rcu0.clone(), one(&rcu)),
+        (json!(west), short.clone(), pay.clone(), length.clone()),
+        (json!(west), spaced.clone(), pay.clone(), two(&mode, &pat)),
+        (json!(other), ok.clone(), both.clone(), denied.clone()),
+        (json!(other), spaced.clone(), both.clone(), denied.clone()),
+        (json!(other), Value::Null, pay.clone(), denied.clone()),
+        // An override member of another JSON kind, first.
+        (json!(own), ok.clone(), gsi.clone(), ser.clone()),
+        (json!("x"), short.clone(), sse.clone(), ser.clone()),
+        (Value::Null, Value::Null, number.clone(), ser.clone()),
+        (json!(bad_id), spaced.clone(), gsi.clone(), ser.clone()),
+        (json!(other), spaced.clone(), number.clone(), ser.clone()),
+        (json!(own), ok.clone(), pay_sse.clone(), ser.clone()),
+        (json!(own), ok.clone(), pay_pto.clone(), ser.clone()),
+        (json!(own), ok.clone(), on_demand.clone(), ser.clone()),
+        // A member of another JSON kind inside an override, first too.
+        (json!("x"), ok.clone(), vector, ser.clone()),
+        (json!(own), short.clone(), gsi_entry, ser.clone()),
+        (json!(bad_id), ok.clone(), gsi_name, ser.clone()),
+        (json!(own), spaced.clone(), lsi_name, ser.clone()),
+        (json!(other), ok.clone(), max_read, ser.clone()),
+        (json!(bad_id), ok.clone(), read_string, ser.clone()),
+        (json!("x"), short.clone(), enabled, ser.clone()),
+        (json!(own), ok.clone(), pto_list, ser.clone()),
+    ];
+    for (backup_arn, target, overrides, expected) in rows {
+        let mut body = overrides.clone();
+        body["BackupArn"] = backup_arn;
+        body["TargetTableName"] = target;
+        let err = restored_input(source(Some(definition("PROVISIONED"))), body.clone())
+            .await
+            .unwrap_err();
+        let answer = match err {
+            DynamoDbError::SerializationException(_) => ser.clone(),
+            e => format!("{}: {}", e.error_type(), e.message()),
+        };
+        assert_eq!(answer, expected, "{body}");
     }
 }
 

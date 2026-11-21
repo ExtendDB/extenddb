@@ -14,7 +14,7 @@
 //! (`LastEvaluatedBackupArn`), `RestoreTableFromBackupInput`, `RestoreSummary`,
 //! `SourceTableFeatureDetails`, and the operation's `TableAlreadyExistsException`.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use extenddb_core::backup_format::{
     BackupArn, BackupArnParts, check_store_prefix_table_name, is_region,
@@ -22,7 +22,7 @@ use extenddb_core::backup_format::{
 use extenddb_core::error::{DynamoDbError, ErrorMessageKey, error_message};
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{
-    BackupDescription, BackupSummary, BillingMode, CreateTableInput, GlobalSecondaryIndexInfo,
+    BackupDescription, BackupSummary, BillingMode, GlobalSecondaryIndexInfo,
     LocalSecondaryIndexInfo, ProvisionedThroughput, RestoreSummary, SourceTableFeatureDetails,
     SseDescription, StreamSpecification, TableDescription, TableStatus,
 };
@@ -1538,9 +1538,10 @@ pub(crate) async fn finish_backup_delete<S: BackupCatalog + ?Sized>(
 /// [`overrides`].
 const UNSUPPORTED_RESTORE_TABLE_OVERRIDE_FIELDS: [&str; 1] = ["VectorIndexOverride"];
 
-/// The rules that depend only on the request itself: a PROVISIONED override
-/// needs a throughput, and a throughput must be well formed. Checked before
-/// anything is read from storage.
+/// The rule that depends only on the request itself: a PROVISIONED override
+/// needs a throughput. Checked before anything is read from storage, after
+/// the `BackupArn`'s id and region. DynamoDB checks it after it reads the
+/// backup (#1097).
 fn validate_override_shape(overrides: &RestoreTableOverrides) -> Result<(), DynamoDbError> {
     if matches!(overrides.billing_mode, Some(BillingMode::Provisioned))
         && overrides.provisioned_throughput.is_none()
@@ -1551,16 +1552,62 @@ fn validate_override_shape(overrides: &RestoreTableOverrides) -> Result<(), Dyna
                 .to_owned(),
         ));
     }
-
-    if let Some(throughput) = &overrides.provisioned_throughput {
-        let input = CreateTableInput {
-            billing_mode: Some(BillingMode::Provisioned),
-            provisioned_throughput: Some(throughput.clone()),
-            ..Default::default()
-        };
-        extenddb_core::validation::validate_provisioned_throughput(&input)?;
-    }
     Ok(())
+}
+
+/// The values of `BillingModeOverride`, in the order the service lists them.
+const BILLING_MODES: &[&str] = &["PROVISIONED", "PAY_PER_REQUEST"];
+
+/// A restore's `TargetTableName` and the override values the service model
+/// refuses, checked after the `BackupArn`'s account and shape and before its
+/// id and region (measured on DynamoDB in us-east-1 on 21 Nov 2026). A name
+/// of a bad length gets the restore's length text alone. Otherwise every
+/// failed constraint is listed in one message, whatever the order of the
+/// members in the request: each `ProvisionedThroughputOverride` member
+/// below 1 (`WriteCapacityUnits` first), then a `BillingModeOverride`
+/// outside its enum, then the name's constraints
+/// ([`pitr::check_restore_table_name`]). A member of another JSON kind is
+/// [`check_restore_override_kinds`]'s, which runs first. Reads no storage.
+///
+/// # Errors
+///
+/// `ValidationException` with the length text or with the clauses.
+pub fn check_restore_name_and_overrides(
+    body: &Value,
+    name: &str,
+    bounds: (usize, usize),
+) -> Result<(), DynamoDbError> {
+    let throughput = body.get("ProvisionedThroughputOverride");
+    let below_one: Vec<(String, &str)> = [
+        (
+            "WriteCapacityUnits",
+            "provisionedThroughputOverride.writeCapacityUnits",
+        ),
+        (
+            "ReadCapacityUnits",
+            "provisionedThroughputOverride.readCapacityUnits",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(member, path)| {
+        let units = throughput?.get(member)?.as_i64().filter(|&u| u < 1)?;
+        Some((units.to_string(), path))
+    })
+    .collect();
+    let constraint = "Member must have value greater than or equal to 1";
+    let mut earlier: Vec<_> = below_one
+        .iter()
+        .map(|(value, path)| (value.as_str(), *path, constraint))
+        .collect();
+    let in_set = crate::enum_constraint(BILLING_MODES);
+    if let Some(mode) = body
+        .get("BillingModeOverride")
+        .and_then(Value::as_str)
+        .filter(|mode| !BILLING_MODES.contains(mode))
+    {
+        earlier.push((mode, "billingModeOverride", &in_set));
+    }
+    pitr::check_restore_table_name(name, "targetTableName", bounds, &earlier)
 }
 
 /// The rule that needs the backup's own billing mode: a throughput override
@@ -1586,16 +1633,9 @@ fn validate_override_for_source(
     Ok(())
 }
 
+/// The overrides, parsed. A `BillingModeOverride` outside its enum is
+/// [`check_restore_name_and_overrides`]'s, which runs first.
 fn parse_restore_table_overrides(body: &Value) -> Result<RestoreTableOverrides, DynamoDbError> {
-    crate::validate_enum_fields(
-        body,
-        &[crate::EnumField {
-            json_name: "BillingModeOverride",
-            valid: &["PROVISIONED", "PAY_PER_REQUEST"],
-            clause: crate::EnumClause::Named("billingModeOverride"),
-        }],
-    )?;
-
     for field in UNSUPPORTED_RESTORE_TABLE_OVERRIDE_FIELDS {
         if body.get(field).is_some_and(|v| !v.is_null()) {
             return Err(DynamoDbError::ValidationException(format!(
@@ -1630,25 +1670,85 @@ fn parse_restore_table_overrides(body: &Value) -> Result<RestoreTableOverrides, 
     })
 }
 
-/// The `SerializationException` the overrides' parse gives a top-level override
-/// member whose JSON kind is not the model's. The parse reads a
-/// `ProvisionedThroughputOverride` list of two integers and a
-/// `BillingModeOverride` object of one key with no error (#1106). Reads no
-/// storage.
+/// The JSON kind of each override member and of each of its members, by
+/// example: `""` a string, `0` a number, `false` a boolean, a list of its one
+/// entry, an object of its members (`RestoreTableFromBackupInput` in the
+/// botocore 1.43.81 model).
+static RESTORE_OVERRIDE_KINDS: LazyLock<Value> = LazyLock::new(|| {
+    let throughput = json!({ "ReadCapacityUnits": 0, "WriteCapacityUnits": 0 });
+    let on_demand = json!({ "MaxReadRequestUnits": 0, "MaxWriteRequestUnits": 0 });
+    let projection = json!({ "ProjectionType": "", "NonKeyAttributes": [""] });
+    let lsi = json!({
+        "IndexName": "",
+        "KeySchema": [{ "AttributeName": "", "KeyType": "" }],
+        "Projection": projection,
+    });
+    let mut gsi = lsi.clone();
+    gsi["ProvisionedThroughput"] = throughput.clone();
+    gsi["OnDemandThroughput"] = on_demand.clone();
+    gsi["WarmThroughput"] = json!({ "ReadUnitsPerSecond": 0, "WriteUnitsPerSecond": 0 });
+    json!({
+        "BillingModeOverride": "",
+        "ProvisionedThroughputOverride": throughput,
+        "OnDemandThroughputOverride": on_demand,
+        "SSESpecificationOverride": { "Enabled": false, "SSEType": "", "KMSMasterKeyId": "" },
+        "GlobalSecondaryIndexOverride": [gsi],
+        "LocalSecondaryIndexOverride": [lsi],
+        "VectorIndexOverride": [{
+            "IndexName": "",
+            "VectorAttribute": { "AttributeName": "" },
+            "SearchSchema": [{ "AttributeName": "", "SearchSchemaElementType": "" }],
+            "Projection": projection,
+            "Dimensions": 0,
+            "DistanceFunction": "",
+        }],
+    })
+});
+
+/// Whether `sent`, or a member of it at any depth, has another JSON kind
+/// than `kind` gives it. A null is an absent member, and a member that
+/// `kind` does not list is not read.
+fn other_kind(kind: &Value, sent: &Value) -> bool {
+    match (kind, sent) {
+        (_, Value::Null)
+        | (Value::String(_), Value::String(_))
+        | (Value::Number(_), Value::Number(_))
+        | (Value::Bool(_), Value::Bool(_)) => false,
+        (Value::Array(entry), Value::Array(sent)) => sent.iter().any(|v| other_kind(&entry[0], v)),
+        (Value::Object(members), Value::Object(sent)) => members
+            .iter()
+            .any(|(name, kind)| sent.get(name).is_some_and(|v| other_kind(kind, v))),
+        _ => true,
+    }
+}
+
+/// The `SerializationException` for an override member that has, at any
+/// depth, another JSON kind than the model gives it
+/// ([`RESTORE_OVERRIDE_KINDS`]): the overrides' parse's text where the parse
+/// refuses the member, else one that names the member. The parse reads a
+/// list of two integers as a throughput (#1106) and keeps
+/// `SSESpecificationOverride` as JSON. A missing member and a number with a
+/// fraction are not refused here. Reads no storage.
 pub fn check_restore_override_kinds(body: &Value) -> Result<(), DynamoDbError> {
     let mut wrong_kinds = body.clone();
     if let Value::Object(members) = &mut wrong_kinds {
-        members.retain(|member, value| match member.as_str() {
-            "BillingModeOverride" => !value.is_string(),
-            "GlobalSecondaryIndexOverride" | "LocalSecondaryIndexOverride" => !value.is_array(),
-            "ProvisionedThroughputOverride"
-            | "OnDemandThroughputOverride"
-            | "SSESpecificationOverride" => !value.is_object(),
-            _ => false,
+        members.retain(|member, value| {
+            RESTORE_OVERRIDE_KINDS
+                .get(member)
+                .is_some_and(|kind| other_kind(kind, value))
         });
     }
-    parse_restore_table_overrides(&wrong_kinds)?;
-    overrides::IndexOverrides::parse(&wrong_kinds).map(drop)
+    let Some(member) = wrong_kinds.as_object().and_then(|m| m.keys().next()) else {
+        return Ok(());
+    };
+    match parse_restore_table_overrides(&wrong_kinds)
+        .and_then(|_| overrides::IndexOverrides::parse(&wrong_kinds))
+    {
+        Err(e @ DynamoDbError::SerializationException(_)) => Err(e),
+        _ => Err(DynamoDbError::SerializationException(format!(
+            "Start of structure or map found where not expected: {member}"
+        ))),
+    }
 }
 
 /// Handle `RestoreTableFromBackup`.
@@ -1727,11 +1827,13 @@ where
 }
 
 /// One restore, returning the target name and the response body. Steps, in
-/// order: (1) parse the overrides and check their shape, with no storage
-/// read; (2) check `BackupArn`'s account and shape ([`backup_arn_member`]);
-/// (3) check `TargetTableName`'s syntax, then the rest of the `BackupArn`
-/// checks, then the `IndexName` of each
-/// index override ([`overrides::IndexOverrides::check_index_names`]);
+/// order: (1) refuse an override member of another JSON kind
+/// ([`check_restore_override_kinds`]); (2) check `BackupArn`'s account and
+/// shape ([`backup_arn_member`]); (3) check `TargetTableName` and the
+/// override values ([`check_restore_name_and_overrides`]), then the rest
+/// of the `BackupArn` checks, then parse the overrides and check their
+/// shape and the `IndexName` of each index override
+/// ([`overrides::IndexOverrides::check_index_names`]), with no storage read;
 /// (4) read the backup: the catalog
 /// index's row first ([`check_catalog_row_status`]: a CREATING row is
 /// `BackupInUseException`, a DELETING, DELETED or FAILED row
@@ -1791,28 +1893,27 @@ where
         + Sync
         + 'static,
 {
-    // 1. The overrides, parsed and shape-checked: no storage I/O, so a
-    // malformed request is refused before a missing backup can take
-    // precedence over the request's own error.
-    let overrides = parse_restore_table_overrides(body)?;
-    validate_override_shape(&overrides)?;
-    let index_overrides = overrides::IndexOverrides::parse(body)?;
+    // 1. An override member of another JSON kind at any depth, before every
+    // other check (measured on DynamoDB on 21 Nov 2026).
+    check_restore_override_kinds(body)?;
 
     // 2. The ARN's account and shape before the target name, its region and
     // id after (measured on DynamoDB on 21 Nov 2026; `backup_arn_member`).
     let backup_arn = backup_arn_member(body, account_id)?;
 
-    // 3. The names' syntax, before the backup is read: the target name with
-    // the restore's checks, not CreateTable's, then each index override's
-    // name. DynamoDB answers a bad override name only after the ARN's
-    // account and the target name (measured on 20 Nov 2026).
+    // 3. Before the backup is read: the target name with the restore's
+    // checks, not CreateTable's, in one message with the override values
+    // the model refuses (measured on 21 Nov 2026), then the rest of the ARN
+    // checks, then the overrides, parsed, each index override's name and the
+    // PROVISIONED rule. DynamoDB answers a bad override name only after the
+    // ARN's account and the target name (measured on 20 Nov 2026), and the
+    // PROVISIONED rule after it reads the backup (#1097).
     let target_table_name = pitr::table_name_member(body, "TargetTableName")?;
-    pitr::check_restore_table_name(
-        target_table_name,
-        "targetTableName",
-        table_name_bounds(limits),
-    )?;
+    check_restore_name_and_overrides(body, target_table_name, table_name_bounds(limits))?;
     let backup_arn = BackupArnSpellings::new(&backup_arn?, region);
+    let overrides = parse_restore_table_overrides(body)?;
+    validate_override_shape(&overrides)?;
+    let index_overrides = overrides::IndexOverrides::parse(body)?;
     index_overrides.check_index_names()?;
 
     // 4. The catalog index first: a row of the healthy configured store is
@@ -2204,7 +2305,6 @@ pub mod sync;
 #[cfg(test)]
 mod tests;
 
-pub use pitr::check_restore_table_name;
 pub use pitr::refuse_before_authorization as refuse_point_in_time_recovery;
 pub(crate) use pitr::{
     handle_describe_continuous_backups, handle_restore_table_to_point_in_time,
