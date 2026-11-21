@@ -600,15 +600,16 @@ pub async fn dispatch(
             .await
             .map(DispatchResult::body_only),
         // Off wasm32 the arms above serve these four through the `backup`
-        // module, which needs a backup store and does not build for wasm32.
-        // They stay known operations there, so they are refused with a
+        // module, which does not build for wasm32: it uses the backup store's
+        // S3 client, whose network stack needs mio, and tokio's file I/O. They
+        // stay known operations there, so they are refused with a
         // ValidationException that names the build, not answered as unknown.
         #[cfg(target_arch = "wasm32")]
         "CreateBackup" | "DescribeBackup" | "DeleteBackup" | "RestoreTableFromBackup" => {
             Err(DynamoDbError::ValidationException(
                 extenddb_core::error::webassembly_unsupported_message(
                     operation,
-                    "it runs entirely in memory with no backup store",
+                    "it does not include the backup subsystem",
                 ),
             ))
         }
