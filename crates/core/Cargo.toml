@@ -42,8 +42,10 @@ aws-lc-rs = { workspace = true }
 # `rng-getrandom` or `rng-rand` features to name a randomness source, and
 # fails to compile without one. With `js` it calls the Web Crypto
 # `crypto.getRandomValues` through its own wasm-bindgen binding, not through
-# getrandom.
-uuid = { workspace = true, features = ["js"] }
+# getrandom. Both hold from 1.13.0, which this entry requires on top of the
+# workspace's `uuid` (`[dependencies]` above); before it, `js` enabled
+# getrandom 0.2's `js` backend.
+uuid = { version = "1.13", features = ["js"] }
 # Pure-Rust crypto backend for wasm32 (src/crypto.rs): HMAC-SHA256 via `hmac`
 # over `sha2`, constant-time compare via `subtle`, AES-256-GCM via `aes-gcm`,
 # and randomness via `getrandom`'s browser backend. `aes-gcm` runs with default
@@ -81,7 +83,10 @@ time = { workspace = true, features = ["wasm-bindgen"] }
 hex = "0.4"
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
-wasm-bindgen-test = "0.3"
+# 0.3.80 is the release for wasm-bindgen 0.2.130, the version of the test
+# runner (wasm-bindgen-cli) the wasm workflow installs. Under that runner the
+# test module of an older release is refused or runs no test.
+wasm-bindgen-test = "0.3.80"
 
 [features]
 default = ["partiql"]

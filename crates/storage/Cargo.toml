@@ -57,8 +57,11 @@ zeroize = { workspace = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true }
 
+# 1.30 is the first tokio release that compiles `Semaphore::const_new`
+# (src/password.rs) without its `parking_lot` feature, which this entry does
+# not enable.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-tokio = { version = "1", default-features = false, features = [
+tokio = { version = "1.30", default-features = false, features = [
     "rt",
     "sync",
     "time",

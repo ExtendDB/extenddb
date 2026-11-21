@@ -45,11 +45,19 @@ serde_json = { workspace = true }
 # drives the engine's async dispatch on the browser microtask queue;
 # `console_error_panic_hook` writes a wasm panic's message and stack to
 # `console.error` before the trap that follows the panic.
+#
+# The first three name the releases in Cargo.lock: wasm-bindgen-test 0.3.80,
+# which runs the wasm tests of extenddb-core and extenddb-storage-sqlite,
+# requires exactly these wasm-bindgen, wasm-bindgen-futures and js-sys
+# releases, so no lower one resolves in this workspace.
+# console_error_panic_hook 0.1.6 is the first release whose hook adds the
+# JavaScript stack to the message; 0.1.0 to 0.1.4 need a nightly compiler
+# (they use `#![feature]`).
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
-js-sys = "0.3"
-console_error_panic_hook = "0.1"
+wasm-bindgen = "0.2.130"
+wasm-bindgen-futures = "0.4.80"
+js-sys = "0.3.107"
+console_error_panic_hook = "0.1.6"
 
 # A current-thread runtime drives the adapter's async `submit` in the native
 # unit tests (the browser build uses `wasm-bindgen-futures` instead). Scoped to
