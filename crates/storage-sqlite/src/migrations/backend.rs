@@ -157,6 +157,14 @@ pub struct SqliteMigrations {
     stores: SqliteStores,
     location: String,
     /// The database file; `None` for an in-memory database.
+    #[cfg_attr(
+        target_arch = "wasm32",
+        expect(
+            dead_code,
+            reason = "set by with_pool, which both builds run, and read only by open_with and the \
+                      before_first_write that takes the copy, which wasm32 does not compile"
+        )
+    )]
     file: Option<PathBuf>,
     /// Whether the connection is this runner's own, closed by [`Self::close`].
     owned: bool,
@@ -655,6 +663,10 @@ impl MigrationBackend for SqliteMigrations {
         Ok(tables == 0)
     }
 
+    // Calls `super::copy`, which wasm32 does not compile, so wasm32 has the
+    // method below. (A wasm32 stand-in for `copy` would compile this body
+    // there, and the WebAssembly clippy step refuses its `SystemTime::now()`.)
+    #[cfg(not(target_arch = "wasm32"))]
     async fn before_first_write(
         &self,
         from: Option<u32>,
@@ -667,35 +679,37 @@ impl MigrationBackend for SqliteMigrations {
             // An empty database (init) holds nothing to keep.
             return Ok(Vec::new());
         }
-        // `super::copy` is compiled off wasm32, where `self.file` is always `None`.
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let from = from.map_or_else(|| "legacy".to_owned(), |v| v.to_string());
-            let copy = super::copy::copy_path(file, &from, to, std::time::SystemTime::now());
-            let lines = super::copy::pre_migration_copy(
-                &self.stores.pool,
-                file,
-                &copy,
-                super::copy::Hooks::RUN,
-            )
-            .await?;
-            // An earlier copy with the same bytes holds nothing this copy does
-            // not, so it is removed now, before the run's first commit: a crash
-            // loop that kills each run before that commit then leaves one copy,
-            // not one per run.
-            let replaced = super::copy::remove_superseded(file, &copy).await;
-            self.replaced
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .extend(replaced);
-            *self.copy.lock().unwrap_or_else(PoisonError::into_inner) = Some(copy);
-            Ok(lines)
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            let _ = (file, from, to);
-            Ok(Vec::new())
-        }
+        let from = from.map_or_else(|| "legacy".to_owned(), |v| v.to_string());
+        let copy = super::copy::copy_path(file, &from, to, std::time::SystemTime::now());
+        let lines = super::copy::pre_migration_copy(
+            &self.stores.pool,
+            file,
+            &copy,
+            super::copy::Hooks::RUN,
+        )
+        .await?;
+        // An earlier copy with the same bytes holds nothing this copy does
+        // not, so it is removed now, before the run's first commit: a crash
+        // loop that kills each run before that commit then leaves one copy,
+        // not one per run.
+        let replaced = super::copy::remove_superseded(file, &copy).await;
+        self.replaced
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(replaced);
+        *self.copy.lock().unwrap_or_else(PoisonError::into_inner) = Some(copy);
+        Ok(lines)
+    }
+
+    // On wasm32 every database is in memory (`self.file` is `None`), and the
+    // method above returns `Ok(Vec::new())` for one.
+    #[cfg(target_arch = "wasm32")]
+    async fn before_first_write(
+        &self,
+        _from: Option<u32>,
+        _to: u32,
+    ) -> Result<Vec<String>, MigrationError> {
+        Ok(Vec::new())
     }
 
     async fn apply(
