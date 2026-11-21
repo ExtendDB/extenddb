@@ -338,6 +338,18 @@ pub fn migration(id: MigrationId) -> Migration<PostgresStores> {
         MigrationId::UniqueAccessKeyIds => Migration::NotApplicable(
             "access_key_id is the primary key of access_keys, so an ID can be stored once",
         ),
+        MigrationId::BulkOperations => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![
+                file_body!(StoreKind::Catalog, "migrations", "0013_bulk_operations.sql"),
+                file_body!(
+                    StoreKind::Data,
+                    "data_migrations",
+                    "0013_bulk_operations.sql"
+                ),
+            ],
+        },
     }
 }
 
@@ -366,7 +378,8 @@ pub(crate) const fn runs_in(id: MigrationId) -> RunsIn {
         | MigrationId::WarmThroughput
         | MigrationId::AccountMetrics
         | MigrationId::AttributeNameEscape
-        | MigrationId::UniqueAccessKeyIds => RunsIn::Transaction,
+        | MigrationId::UniqueAccessKeyIds
+        | MigrationId::BulkOperations => RunsIn::Transaction,
         MigrationId::IndexTableBaseKey => RunsIn::Autocommit,
     }
 }

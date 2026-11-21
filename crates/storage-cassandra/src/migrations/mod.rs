@@ -313,6 +313,10 @@ pub fn migration(id: MigrationId) -> Migration<CassandraStores> {
             "access_key_id is the primary key of access_keys, and an import writes with IF NOT \
              EXISTS, so an ID can be stored once",
         ),
+        MigrationId::BulkOperations => Migration::NotApplicable(
+            "the Cassandra backend has no bulk operation store: a bulk operation request that \
+             reaches the store is refused with ValidationException",
+        ),
     }
 }
 

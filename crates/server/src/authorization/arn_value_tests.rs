@@ -85,6 +85,7 @@ async fn get_item_from(store: CountingAuthzStore) -> Result<(), DynamoDbError> {
         &cache,
         ACCOUNT,
         "u",
+        "dynamodb:GetItem",
         &AuthzTarget::new("GetItem", TABLE.to_owned()),
         false,
         params,

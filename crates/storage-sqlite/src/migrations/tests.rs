@@ -29,7 +29,7 @@ pub(super) const LATEST: u32 = MigrationId::LATEST.number();
 
 /// A database path in a directory of its own, removed when dropped, so a
 /// failed test leaves nothing behind.
-pub(super) struct TempDb(PathBuf);
+pub(crate) struct TempDb(PathBuf);
 
 impl std::ops::Deref for TempDb {
     type Target = Path;
@@ -52,7 +52,7 @@ impl Drop for TempDb {
     }
 }
 
-pub(super) fn temp_db(name: &str) -> TempDb {
+pub(crate) fn temp_db(name: &str) -> TempDb {
     let dir = std::env::temp_dir().join(format!(
         "extenddb-migrations-{name}-{}",
         uuid::Uuid::new_v4().simple()

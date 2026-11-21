@@ -71,7 +71,12 @@ extenddb-cache = { path = "../cache", features = ["test-util"] }
 # in-memory SQLite catalog, and the dev-credential seeding tests run against a
 # SQLite catalog file.
 extenddb-storage = { path = "../storage", features = ["test-util"] }
-extenddb-storage-sqlite = { path = "../storage-sqlite" }
+# The bulk authorization tests drive `authorize_request` against a real
+# `AppState`. The server crate is backend-agnostic at runtime (it holds an
+# `Arc<dyn StorageEngine>`), so a concrete backend appears here only as a
+# test dependency; the sqlite in-memory database gives each test an
+# isolated engine with no file on disk, matching the engine crate's tests.
+extenddb-storage-sqlite = { path = "../storage-sqlite", features = ["memory"] }
 sqlx = { workspace = true, features = ["sqlite"] }
 # Self-signed certificates for the TLS listener tests.
 rcgen = { workspace = true }

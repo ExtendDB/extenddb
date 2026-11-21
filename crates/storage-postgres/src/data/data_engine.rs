@@ -58,6 +58,81 @@ impl DataEngine for PostgresEngine {
         })
     }
 
+    fn put_items_batch(
+        &self,
+        key_info: &TableKeyInfo,
+        rows: Vec<extenddb_storage::BatchRow>,
+        stream: Option<&StreamCapture>,
+    ) -> BoxFuture<'_, Result<Vec<extenddb_storage::BatchRowResult>, StorageError>> {
+        let key_info = key_info.clone();
+        let stream = stream.cloned();
+        Box::pin(async move {
+            self.put_items_batch_impl(&key_info, rows, stream.as_ref())
+                .await
+                .map_err(|e| table_gone(e, &key_info.table_name))
+        })
+    }
+
+    fn bulk_row_outcome(
+        &self,
+        account_id: &str,
+        operation_id: &str,
+        file_index: i64,
+        row_index: i64,
+    ) -> BoxFuture<'_, Result<Option<extenddb_storage::RowOutcome>, StorageError>> {
+        let account_id = account_id.to_owned();
+        let operation_id = operation_id.to_owned();
+        Box::pin(async move {
+            self.bulk_row_outcome_impl(&account_id, &operation_id, file_index, row_index)
+                .await
+        })
+    }
+
+    fn bulk_write_takeover(
+        &self,
+        account_id: &str,
+        operation_id: &str,
+        owner: &str,
+        cursor: (i64, i64),
+    ) -> BoxFuture<'_, Result<u32, StorageError>> {
+        let account_id = account_id.to_owned();
+        let operation_id = operation_id.to_owned();
+        let owner = owner.to_owned();
+        Box::pin(async move {
+            self.bulk_write_takeover_impl(&account_id, &operation_id, &owner, cursor)
+                .await
+        })
+    }
+
+    fn bulk_rows_recorded(
+        &self,
+        account_id: &str,
+        operation_id: &str,
+        file_index: i64,
+        from_row: i64,
+        limit: i64,
+    ) -> BoxFuture<'_, Result<Vec<extenddb_storage::RecordedRow>, StorageError>> {
+        let account_id = account_id.to_owned();
+        let operation_id = operation_id.to_owned();
+        Box::pin(async move {
+            self.bulk_rows_recorded_impl(&account_id, &operation_id, file_index, from_row, limit)
+                .await
+        })
+    }
+
+    fn delete_bulk_row_outcomes(
+        &self,
+        account_id: &str,
+        operation_id: &str,
+    ) -> BoxFuture<'_, Result<u64, StorageError>> {
+        let account_id = account_id.to_owned();
+        let operation_id = operation_id.to_owned();
+        Box::pin(async move {
+            self.delete_bulk_row_outcomes_impl(&account_id, &operation_id)
+                .await
+        })
+    }
+
     fn get_item(
         &self,
         key_info: &TableKeyInfo,

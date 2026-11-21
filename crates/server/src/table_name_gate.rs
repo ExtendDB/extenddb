@@ -152,6 +152,14 @@ pub(crate) fn check_table_name_chars(
                 _ => Ok(()),
             }
         }
+        // `request_helpers/bulk.rs`, and the bulk handler in developer mode,
+        // answer a TableName that starts with `arn:` with the bulk sentences,
+        // before any lookup. A bare name gets the check below; the bulk handler
+        // gives the same sentence for a name of up to 1024 characters.
+        "StartBulkPutItems" => match input.get("TableName").and_then(Value::as_str) {
+            Some(name) if name.starts_with("arn:") => Ok(()),
+            _ => check_name(input.get("TableName"), "tableName", operation, account_id),
+        },
         _ => check_name(input.get("TableName"), "tableName", operation, account_id),
     }
 }
@@ -428,6 +436,11 @@ mod tests {
             ),
             ("ListBackups", json!({ "TableName": NUL }), "tableName"),
             ("UpdateTimeToLive", json!({ "TableName": NUL }), "tableName"),
+            (
+                "StartBulkPutItems",
+                json!({ "TableName": NUL }),
+                "tableName",
+            ),
         ];
         for (op, input, location) in cases {
             assert_eq!(
@@ -581,6 +594,8 @@ mod tests {
     fn arn_bearing_fields_are_checked_before_authorization() {
         let m = message("DescribeTable", json!({ "TableName": ARN })).expect("refused");
         assert!(m.contains("Table name of ARN must satisfy"), "{m}");
+        // The bulk checks answer an `arn:` TableName of StartBulkPutItems.
+        assert!(message("StartBulkPutItems", json!({ "TableName": ARN })).is_none());
         assert_eq!(
             message(
                 "RestoreTableToPointInTime",

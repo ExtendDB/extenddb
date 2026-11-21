@@ -265,6 +265,15 @@ pub fn migration(id: MigrationId) -> Migration<SqliteStores> {
         MigrationId::UniqueAccessKeyIds => Migration::NotApplicable(
             "access_key_id is the primary key of access_keys, so an ID can be stored once",
         ),
+        MigrationId::BulkOperations => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Catalog,
+                "migrations",
+                "0013_bulk_operations.sql"
+            )],
+        },
     }
 }
 
@@ -511,4 +520,4 @@ mod released_tests;
 #[cfg(test)]
 mod serve_tests;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -136,6 +136,21 @@ mod tests {
         assert!(cfg.server.tls.enabled);
     }
 
+    /// The dev-mode bulk root is made absolute at load, against the
+    /// directory `serve` starts in, because the daemon runs in `/`.
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn builtin_defaults_make_the_dev_mode_bulk_root_absolute() {
+        install_backend();
+        let cfg = extenddb_config::load_builtin_defaults()
+            .expect("postgres storage config defaults to a local dev connection");
+        let cwd = std::env::current_dir().expect("a working directory");
+        assert_eq!(
+            cfg.dev_default_bulk_path,
+            cwd.join(".extenddb/buckets").to_string_lossy()
+        );
+    }
+
     /// No PostgreSQL migration is declared additive until CI runs the
     /// previous release against a catalog this binary migrated; the PR that
     /// adds that job deletes this test. It lives here because the backend's

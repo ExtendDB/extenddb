@@ -3,6 +3,7 @@
 
 //! Helpers for `extenddb init`: TLS certificate generation and config file creation.
 
+use bulk::{BULK_LIMITS_TEMPLATE, BULK_STORE_TEMPLATE};
 use rustls::pki_types::{CertificateDer, pem::PemObject};
 
 /// Generate a self-signed TLS certificate and key if they don't already exist.
@@ -213,6 +214,9 @@ fn ensure_cert_covers_sans(
     )
 }
 
+#[path = "init_helpers_bulk.rs"]
+mod bulk;
+
 /// Generate a comprehensive config file with all settings.
 ///
 /// Computed values (connection string, bind address) are uncommented.
@@ -320,6 +324,8 @@ key_path = "{tls_key}"
 # max_import_item_count = 10000000
 # max_export_item_count = 10000000
 
+{BULK_LIMITS_TEMPLATE}
+
 # [backup]
 # Backup and restore jobs. stale_job_after_secs must be at least three
 # heartbeat periods, the larger of heartbeat_interval_secs and the 15 s the
@@ -365,6 +371,8 @@ key_path = "{tls_key}"
 # paths = []                     # Allowed directories for export operations
 
 # max_import_bytes = 10737418240 # Maximum import file size (10 GB)
+
+{BULK_STORE_TEMPLATE}
 "#,
     );
 

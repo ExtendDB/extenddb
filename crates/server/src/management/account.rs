@@ -74,6 +74,28 @@ pub async fn create_account(
         .await
     {
         Ok(()) => {
+            // Create the account's bulk store directory so a caller can
+            // place files without a first StartBulkPutItems. A failure is
+            // logged and the request still succeeds: Start creates the
+            // directory again when it is missing.
+            if let Some(root) = state
+                .bulk
+                .as_ref()
+                .and_then(|store| store.filesystem_root())
+                .cloned()
+            {
+                let dir_account = account_id.clone();
+                let created = tokio::task::spawn_blocking(move || {
+                    extenddb_engine::bulk_put::store_root::ensure_account_dir(&root, &dir_account)
+                })
+                .await
+                .unwrap_or_else(|join_error| Err(std::io::Error::other(join_error)));
+                if let Err(e) = created {
+                    tracing::warn!(
+                        "Cannot create bulk store directory for account {account_id}: {e}"
+                    );
+                }
+            }
             let resp =
                 serde_json::json!({ "account_id": account_id, "message": "Account created" });
             (StatusCode::CREATED, axum::Json(resp)).into_response()

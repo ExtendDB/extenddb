@@ -28,7 +28,11 @@ pub(super) fn context_with_key_info(
         export_paths: Arc::clone(&ctx.export_paths),
         authorized_key_info,
         auth_cache: ctx.auth_cache.clone(),
+        bulk: ctx.bulk.clone(),
+        bulk_authorizer: ctx.bulk_authorizer.clone(),
+        bulk_principal: ctx.bulk_principal.clone(),
         table_key_info_lookup: ctx.table_key_info_lookup.clone(),
+        metrics: Arc::clone(&ctx.metrics),
         item_authorizer: ctx.item_authorizer.clone(),
     }
 }

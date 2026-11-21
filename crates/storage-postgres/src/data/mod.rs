@@ -132,6 +132,7 @@ macro_rules! bind_sk_execute {
 }
 
 // Submodules declared after macros so they can use bind_sk_fetch_optional/bind_sk_execute.
+mod bulk_row_outcomes;
 mod data_engine;
 mod ddl;
 mod delete_item;

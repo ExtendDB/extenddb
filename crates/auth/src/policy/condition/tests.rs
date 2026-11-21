@@ -74,4 +74,5 @@ mod arn_operators;
 mod multivalued;
 mod operators;
 mod resource_tag;
+mod s3_prefix;
 mod three_case;

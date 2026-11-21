@@ -43,6 +43,49 @@ impl DataEngine for CassandraEngine {
         })
     }
 
+    fn put_items_batch(
+        &self,
+        _key_info: &TableKeyInfo,
+        _rows: Vec<extenddb_storage::BatchRow>,
+        _stream: Option<&StreamCapture>,
+    ) -> BoxFuture<'_, Result<Vec<extenddb_storage::BatchRowResult>, StorageError>> {
+        // Bulk operations are not supported on this backend; the engine
+        // refuses the request at start, so no batch reaches storage. The
+        // refusal here keeps the contract explicit now that the trait method
+        // is required.
+        Box::pin(async {
+            Err(StorageError::Validation(
+                "Bulk operations are not supported on this storage backend".to_owned(),
+            ))
+        })
+    }
+
+    fn bulk_row_outcome(
+        &self,
+        _account_id: &str,
+        _operation_id: &str,
+        _file_index: i64,
+        _row_index: i64,
+    ) -> BoxFuture<'_, Result<Option<extenddb_storage::RowOutcome>, StorageError>> {
+        Box::pin(async {
+            Err(StorageError::Validation(
+                "Bulk operations are not supported on this storage backend".to_owned(),
+            ))
+        })
+    }
+
+    fn delete_bulk_row_outcomes(
+        &self,
+        _account_id: &str,
+        _operation_id: &str,
+    ) -> BoxFuture<'_, Result<u64, StorageError>> {
+        Box::pin(async {
+            Err(StorageError::Validation(
+                "Bulk operations are not supported on this storage backend".to_owned(),
+            ))
+        })
+    }
+
     fn get_item(
         &self,
         key_info: &TableKeyInfo,

@@ -30,6 +30,35 @@ pub(crate) async fn set_connection_pragmas(
     Ok(())
 }
 
+/// The `after_release` hook of the server's SQLite pools: roll back the
+/// transaction a connection still has open when it goes back to the pool.
+///
+/// sqlx runs the statement of `begin_with`, then waits for the connection
+/// handle to check that a transaction is open. A future dropped during that
+/// wait (a `select!` branch that lost, a timeout, a request whose client
+/// went away) leaves the connection inside the transaction with no
+/// `Transaction` value to roll it back. The pool would hand it out again:
+/// its next `begin_with` fails with "attempted to call begin_with at
+/// non-zero transaction depth", and its `BEGIN IMMEDIATE` keeps the write
+/// lock of the database file, so a write on any other connection waits out
+/// `busy_timeout` and fails with "database is locked".
+///
+/// The depth also counts a rollback that a dropped `Transaction` has queued
+/// and the connection has not run yet. The rollback here then runs after
+/// it, finds no transaction and does nothing.
+pub(crate) fn roll_back_on_release(
+    conn: &mut sqlx::SqliteConnection,
+    _meta: sqlx::pool::PoolConnectionMetadata,
+) -> futures::future::BoxFuture<'_, Result<bool, sqlx::Error>> {
+    use sqlx::{Connection, TransactionManager};
+    Box::pin(async move {
+        while conn.is_in_transaction() {
+            sqlx::sqlite::SqliteTransactionManager::rollback(conn).await?;
+        }
+        Ok(true)
+    })
+}
+
 /// Normalize a configured path or connection string into a sqlx-openable
 /// SQLite URL.
 ///
@@ -265,3 +294,7 @@ mod map_sqlx_err_tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "pool_release_tests.rs"]
+mod pool_release_tests;

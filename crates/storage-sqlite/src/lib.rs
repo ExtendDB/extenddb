@@ -25,6 +25,7 @@ mod authorization_store;
 mod backup;
 mod backup_catalog;
 mod bootstrapper;
+mod bulk_operation_store;
 mod catalog_store;
 pub mod config;
 mod create_table;
@@ -127,6 +128,7 @@ async fn catalog_pool(connection_string: &str) -> Result<sqlx::SqlitePool, sqlx:
         .after_connect(|conn, _| {
             Box::pin(async move { crate::sqlite_util::set_connection_pragmas(conn, true).await })
         })
+        .after_release(crate::sqlite_util::roll_back_on_release)
         .connect(&sqlite_url(connection_string))
         .await
 }

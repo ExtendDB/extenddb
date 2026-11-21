@@ -46,7 +46,11 @@ pub(super) async fn context(authorizer: Option<Arc<dyn ItemAuthorizer>>) -> Oper
         export_paths: Arc::from(Vec::new()),
         authorized_key_info,
         auth_cache: extenddb_auth::AuthCacheRegistry::default(),
+        bulk: None,
+        bulk_authorizer: None,
+        bulk_principal: None,
         table_key_info_lookup: None,
+        metrics: Arc::new(extenddb_core::metrics::MetricsCollector::new()),
         item_authorizer: authorizer,
     }
 }

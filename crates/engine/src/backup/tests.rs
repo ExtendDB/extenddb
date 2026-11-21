@@ -3373,6 +3373,33 @@ impl DataEngine for Fake {
         unused()
     }
 
+    fn put_items_batch(
+        &self,
+        _: &TableKeyInfo,
+        _: Vec<extenddb_storage::BatchRow>,
+        _: Option<&extenddb_storage::StreamCapture>,
+    ) -> BoxedFuture<'_, Result<Vec<extenddb_storage::BatchRowResult>, StorageError>> {
+        unused()
+    }
+
+    fn bulk_row_outcome(
+        &self,
+        _: &str,
+        _: &str,
+        _: i64,
+        _: i64,
+    ) -> BoxedFuture<'_, Result<Option<extenddb_storage::RowOutcome>, StorageError>> {
+        unused()
+    }
+
+    fn delete_bulk_row_outcomes(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> BoxedFuture<'_, Result<u64, StorageError>> {
+        unused()
+    }
+
     fn get_item(
         &self,
         _: &TableKeyInfo,

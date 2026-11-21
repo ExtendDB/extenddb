@@ -395,8 +395,10 @@ fn is_loopback_host(host: &str) -> bool {
 }
 
 /// Print the developer-mode banner lines: the mode notice, the credentials to
-/// sign with, a warning block when the server is not bound to loopback, and an
-/// advisory when an ambient `AWS_ACCESS_KEY_ID` would not verify.
+/// sign with, the bulk store when dev mode substitutes the default or an S3
+/// store is configured, a warning block when the server is not bound to
+/// loopback, and an advisory when an ambient `AWS_ACCESS_KEY_ID` would not
+/// verify.
 ///
 /// Resolving here (not just in `serve()`) fails fast on a misconfigured
 /// `EXTENDDB_DEV_*` pair before daemonizing, and gives the invoking user the
@@ -411,11 +413,24 @@ fn print_dev_mode_banner(
     use extenddb_server::dev_credentials;
 
     let dev_creds = dev_credentials::resolve()?;
+    let bulk_store = if app_config.bulk.is_none() {
+        // Dev mode substitutes the default store when [bulk] is absent, at
+        // the root the configuration loader made absolute. The banner prints
+        // before the server canonicalizes the root; the startup log carries
+        // the canonical path.
+        Some(format!(
+            "  Bulk store: {} (dev-mode default; the startup log names the canonical path)",
+            app_config.dev_default_bulk_path
+        ))
+    } else {
+        dev_mode_s3_line(app_config.bulk.as_ref(), &app_config.server.region)?
+    };
     let lines = dev_mode_banner_lines(
         &config::redact_password(app_config.storage.connection_config()),
         app_config.server.bind_addr.trim(),
         port,
         &dev_creds,
+        bulk_store.as_deref(),
         dev_credentials::ignored_aws_env_key(&dev_creds).as_deref(),
     );
     // Same stream split as the main banner: stdout for the daemon parent,
@@ -430,7 +445,38 @@ fn print_dev_mode_banner(
     Ok(())
 }
 
+/// The dev-mode banner line of an explicit S3 store, which is honoured in dev
+/// mode (every caller has the reach of the server's own AWS credentials);
+/// `None` for any other `[bulk]` section. A `[bulk.s3]` section is checked
+/// first, so a value the startup checks refuse never reaches the banner.
+///
+/// # Errors
+///
+/// The startup refusal of the `[bulk.s3]` section, which never repeats the
+/// value.
+fn dev_mode_s3_line(
+    bulk: Option<&config::BulkConfig>,
+    server_region: &str,
+) -> anyhow::Result<Option<String>> {
+    let Some(bulk) = bulk else {
+        return Ok(None);
+    };
+    if let Some(s3) = &bulk.s3 {
+        s3.validate().map_err(anyhow::Error::msg)?;
+    }
+    if bulk.store != config::BulkStoreKind::S3 {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "  Bulk store: {} with the server's AWS credentials",
+        bulk.s3.clone().unwrap_or_default().describe(server_region)
+    )))
+}
+
 /// Build the developer-mode banner. Pure, so the wording is unit tested.
+///
+/// `bulk_store` is the bulk store line, printed after the credentials line;
+/// `None` prints no store line.
 ///
 /// A non-loopback bind gets a multi-line warning block rather than one log
 /// line: it is the dev image's normal state (a container must bind 0.0.0.0
@@ -442,6 +488,7 @@ fn dev_mode_banner_lines(
     host: &str,
     port: u16,
     dev_creds: &[extenddb_server::dev_credentials::DevCredential],
+    bulk_store: Option<&str>,
     ignored_aws_key: Option<&str>,
 ) -> Vec<String> {
     use extenddb_server::dev_credentials;
@@ -463,6 +510,9 @@ fn dev_mode_banner_lines(
             dev_credentials::describe(dev_creds)
         ),
     ];
+    if let Some(bulk_store) = bulk_store {
+        lines.push(bulk_store.to_owned());
+    }
     if !loopback {
         let credential = if example_active {
             "the signing credential above is public, so anyone who can reach this port \
@@ -504,192 +554,5 @@ fn dev_mode_banner_lines(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{ServeArgs, dev_mode_banner_lines, is_loopback_host, render_startup_warnings};
-    use clap::Parser;
-    use extenddb_server::dev_credentials::{
-        DevCredential, ENV_DISABLE_EXAMPLE, EXAMPLE_ACCESS_KEY_ID, EXAMPLE_SECRET_ACCESS_KEY,
-    };
-    use extenddb_storage::config::StartupWarning;
-
-    fn example() -> DevCredential {
-        DevCredential {
-            access_key_id: EXAMPLE_ACCESS_KEY_ID.to_owned(),
-            secret_access_key: EXAMPLE_SECRET_ACCESS_KEY.to_owned(),
-            is_builtin: true,
-        }
-    }
-
-    fn team() -> DevCredential {
-        DevCredential {
-            access_key_id: "AKIADEVTEAMKEY000001".to_owned(),
-            secret_access_key: "team-secret".to_owned(),
-            is_builtin: false,
-        }
-    }
-
-    #[test]
-    fn loopback_hosts_are_recognised() {
-        for host in ["127.0.0.1", "127.1.2.3", "::1", "localhost"] {
-            assert!(is_loopback_host(host), "{host}");
-        }
-        for host in ["0.0.0.0", "::", "192.168.1.10", "example.com", ""] {
-            assert!(!is_loopback_host(host), "{host}");
-        }
-    }
-
-    #[test]
-    fn loopback_dev_banner_has_no_exposure_warning() {
-        let text =
-            dev_mode_banner_lines(":memory:", "127.0.0.1", 18080, &[example()], None).join("\n");
-        assert!(text.contains("plain HTTP on loopback"), "{text}");
-        assert!(!text.contains("WARNING"), "{text}");
-    }
-
-    #[test]
-    fn non_loopback_dev_banner_warns_with_the_publish_command() {
-        let text =
-            dev_mode_banner_lines(":memory:", "0.0.0.0", 18080, &[example()], None).join("\n");
-        // The banner used to say "on loopback" whatever the bind was.
-        assert!(!text.contains("plain HTTP on loopback"), "{text}");
-        assert!(text.contains("plain HTTP on 0.0.0.0"), "{text}");
-        assert!(
-            text.contains("WARNING: dev mode is listening on 0.0.0.0:18080"),
-            "{text}"
-        );
-        assert!(text.contains("credential above is public"), "{text}");
-        assert!(text.contains("-p 127.0.0.1:18080:18080"), "{text}");
-        assert!(text.contains(&format!("{ENV_DISABLE_EXAMPLE}=1")), "{text}");
-    }
-
-    #[test]
-    fn non_loopback_dev_banner_without_the_example_pair_drops_the_public_wording() {
-        let text = dev_mode_banner_lines(":memory:", "0.0.0.0", 9000, &[team()], None).join("\n");
-        assert!(
-            text.contains("WARNING: dev mode is listening on 0.0.0.0:9000"),
-            "{text}"
-        );
-        assert!(text.contains("-p 127.0.0.1:9000:9000"), "{text}");
-        assert!(!text.contains("is public"), "{text}");
-        assert!(!text.contains(EXAMPLE_ACCESS_KEY_ID), "{text}");
-        // The switch is already set; do not tell the operator to set it.
-        assert!(
-            !text.contains(&format!("{ENV_DISABLE_EXAMPLE}=1")),
-            "{text}"
-        );
-        assert!(!text.contains("team-secret"), "{text}");
-    }
-
-    #[test]
-    fn dev_banner_keeps_the_ignored_aws_key_note() {
-        let text = dev_mode_banner_lines(
-            ":memory:",
-            "127.0.0.1",
-            18080,
-            &[example()],
-            Some("ASIAFOREIGNSESSION01"),
-        )
-        .join("\n");
-        assert!(
-            text.contains("'ASIAFOREIGNSESSION01' will be rejected"),
-            "{text}"
-        );
-        assert!(!text.contains("is not accepted because"), "{text}");
-    }
-
-    #[test]
-    fn dev_banner_names_the_switch_when_it_removed_the_ignored_example_key() {
-        let text = dev_mode_banner_lines(
-            ":memory:",
-            "127.0.0.1",
-            18080,
-            &[team()],
-            Some(EXAMPLE_ACCESS_KEY_ID),
-        )
-        .join("\n");
-        assert!(
-            text.contains(&format!("'{EXAMPLE_ACCESS_KEY_ID}' will be rejected")),
-            "{text}"
-        );
-        assert!(
-            text.contains(&format!("because {ENV_DISABLE_EXAMPLE} is set")),
-            "{text}"
-        );
-    }
-
-    /// Test wrapper so clap has a top-level `Parser` to drive `ServeArgs`.
-    #[derive(Parser)]
-    struct TestCli {
-        #[command(flatten)]
-        args: ServeArgs,
-    }
-
-    fn parse(argv: &[&str]) -> ServeArgs {
-        TestCli::try_parse_from(argv)
-            .expect("ServeArgs should parse from valid argv")
-            .args
-    }
-
-    #[test]
-    fn defaults_run_in_daemon_mode() {
-        // No --foreground flag preserves the historical daemon behavior so
-        // existing users and scripts are unaffected by the new flag.
-        let args = parse(&["extenddb-serve"]);
-        assert!(!args.foreground);
-        assert_eq!(args.config, "extenddb.toml");
-        assert!(args.port.is_none());
-    }
-
-    #[test]
-    fn foreground_flag_is_recognized() {
-        let args = parse(&["extenddb-serve", "--foreground"]);
-        assert!(args.foreground);
-    }
-
-    #[test]
-    fn no_daemon_alias_is_recognized() {
-        // The issue proposed either `--foreground` or `--no-daemon`; make
-        // sure the alias keeps working so users have a choice.
-        let args = parse(&["extenddb-serve", "--no-daemon"]);
-        assert!(args.foreground);
-    }
-
-    #[test]
-    fn foreground_combines_with_other_flags() {
-        let args = parse(&[
-            "extenddb-serve",
-            "--config",
-            "/etc/extenddb/extenddb.toml",
-            "--port",
-            "9000",
-            "--foreground",
-        ]);
-        assert!(args.foreground);
-        assert_eq!(args.config, "/etc/extenddb/extenddb.toml");
-        assert_eq!(args.port, Some(9000));
-    }
-
-    #[test]
-    fn unknown_flag_is_rejected() {
-        // Guard against accidental future renames silently dropping the flag.
-        let result = TestCli::try_parse_from(["extenddb-serve", "--daemon-off"]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn startup_warning_banner_is_prominent_and_actionable() {
-        let rendered = render_startup_warnings(&[StartupWarning {
-            title: "transaction_read_concern = \"majority\" (default: \"snapshot\").".to_owned(),
-            details: vec![
-                "Transactions run below DynamoDB isolation.".to_owned(),
-                "Writes remain atomic and durable.".to_owned(),
-                "Remove the setting to restore full DynamoDB transaction semantics.".to_owned(),
-            ],
-        }]);
-
-        assert!(rendered.starts_with("\n  WARNING: transaction_read_concern"));
-        assert!(rendered.contains("below DynamoDB isolation"));
-        assert!(rendered.contains("Writes remain atomic and durable"));
-        assert!(rendered.contains("restore full DynamoDB transaction semantics"));
-    }
-}
+#[path = "cmd_serve_tests.rs"]
+mod tests;
