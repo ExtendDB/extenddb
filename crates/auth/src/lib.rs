@@ -133,16 +133,15 @@ impl AuthProvider for BuiltinAuthProvider {
         headers: &HeaderMap,
         body: &[u8],
     ) -> Result<AuthIdentity, DynamoDbError> {
-        // Extract Authorization header
+        // Extract Authorization header. An absent header reads as an empty
+        // value, which the parse answers as a request with no header.
         let auth_header = headers
             .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| {
-                DynamoDbError::MissingAuthenticationToken("Missing Authentication Token".to_owned())
-            })?;
+            .map_or(&b""[..], |value| value.as_bytes());
 
         // Parse Authorization header
-        let parsed = sigv4::parse::parse_authorization(auth_header)?;
+        let has_date = headers.contains_key("x-amz-date") || headers.contains_key("date");
+        let parsed = sigv4::parse::parse_authorization(auth_header, has_date)?;
 
         // The service checks the request timestamp, then the credential
         // scope, then looks the key up (measured 2026-10-23: an unknown key
