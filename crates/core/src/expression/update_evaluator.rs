@@ -432,15 +432,11 @@ fn navigate_to_parent_map_or_create<'a>(
                 }
             }
             PathElement::Index(idx) => {
-                if let AttributeValue::L(list) = current {
-                    if *idx < list.len() {
-                        current = &mut list[*idx];
-                    } else {
-                        return Err(DynamoDbError::ValidationException(
-                            "The provided expression refers to an attribute that does not exist in the item"
-                                .to_owned(),
-                        ));
-                    }
+                // An index past the end is invalid for update (measured 2026-11-20).
+                if let AttributeValue::L(list) = current
+                    && *idx < list.len()
+                {
+                    current = &mut list[*idx];
                 } else {
                     return Err(DynamoDbError::ValidationException(
                         "The document path provided in the update expression is invalid for update"
@@ -575,15 +571,9 @@ fn set_nested(
                 )),
             }
         }
-        (PathElement::Index(idx), AttributeValue::L(list)) => {
-            if *idx < list.len() {
-                set_nested(&mut list[*idx], &path[1..], value, maps)
-            } else {
-                Err(DynamoDbError::ValidationException(
-                    "The provided expression refers to an attribute that does not exist in the item"
-                        .to_owned(),
-                ))
-            }
+        // An index past the end is invalid for update (measured 2026-11-20).
+        (PathElement::Index(idx), AttributeValue::L(list)) if *idx < list.len() => {
+            set_nested(&mut list[*idx], &path[1..], value, maps)
         }
         _ => Err(DynamoDbError::ValidationException(
             "The document path provided in the update expression is invalid for update".to_owned(),
