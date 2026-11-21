@@ -47,12 +47,12 @@
 
 use std::collections::HashSet;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use super::number::{check_number, parameter_message};
+pub use crate::serde_helpers::check_parameter_types;
+use crate::serde_helpers::{NULL_MEMBER, null_member, typed_members};
 use crate::types::AttributeValue;
 use crate::validation::MAX_ITEM_NESTING_DEPTH;
 use crate::validation::number::validate_and_normalize_number;
@@ -76,108 +76,15 @@ const EMPTY_ATTRIBUTE_VALUE: &str =
 const MULTI_ATTRIBUTE_VALUE: &str = "Supplied AttributeValue has more than one datatypes \
      set, must contain exactly one of the supported datatypes";
 
-/// The refusals of a null member, for each kind of value that holds one
-/// (measured 2026-11-06). A null member of a map is named after it.
+/// The refusals of a null member of a set (measured 2026-11-06). A null
+/// member of a map or a list is refused with [`NULL_MEMBER`], and one of a
+/// map is named after it.
 const NULL_STRING_SET_MEMBER: &str = "One or more parameter values were invalid: \
      An string set may not have a null string as a member";
 const NULL_NUMBER_SET_MEMBER: &str =
     "One or more parameter values were invalid: Numeric sets may not contain null";
 const NULL_BINARY_SET_MEMBER: &str =
     "One or more parameter values were invalid: Binary sets may not contain null or empty values";
-const NULL_MEMBER: &str = "The supplied Item contains a null AttributeValue";
-
-/// The members an attribute value may hold. Any other member is ignored.
-const TYPES: [&str; 10] = ["S", "N", "B", "SS", "NS", "BS", "M", "L", "NULL", "BOOL"];
-
-/// Check the JSON types of a statement's parameters (wire attribute values),
-/// the first of the two passes (see the module documentation). The caller
-/// checks every statement of the request this way before it checks
-/// anything else of the request.
-///
-/// The walk visits every map and list. The request body's JSON nesting
-/// limit bounds its depth, at most one level for each two JSON levels.
-///
-/// # Errors
-///
-/// Returns a description of the first value whose JSON the attribute value
-/// model cannot read: a value that is not a JSON object, or a member with a
-/// payload of the wrong JSON type.
-pub fn check_parameter_types(parameters: &[Value]) -> Result<(), String> {
-    parameters.iter().try_for_each(check_types)
-}
-
-fn check_types(value: &Value) -> Result<(), String> {
-    let Value::Object(members) = value else {
-        return Err(AttributeValue::deserialize(value).err().map_or_else(
-            || "an attribute value must be a JSON object".to_owned(),
-            |e| e.to_string(),
-        ));
-    };
-    for (tag, payload) in typed_members(members) {
-        match (tag, payload) {
-            ("S" | "N", Value::String(_)) | ("NULL" | "BOOL", Value::Bool(_)) => {}
-            ("B", Value::String(text)) => check_base64(text)?,
-            ("SS" | "NS", Value::Array(items)) => {
-                if items
-                    .iter()
-                    .any(|item| !item.is_string() && !item.is_null())
-                {
-                    return Err(format!("{tag} member must be a string"));
-                }
-            }
-            ("BS", Value::Array(items)) => {
-                for item in items {
-                    match item {
-                        Value::String(text) => check_base64(text)?,
-                        Value::Null => {}
-                        _ => return Err("BS member must be a base64 string".to_owned()),
-                    }
-                }
-            }
-            ("M", Value::Object(entries)) => {
-                for member in entries.values().filter(|member| !member.is_null()) {
-                    check_types(member)?;
-                }
-            }
-            ("L", Value::Array(items)) => {
-                for item in items.iter().filter(|item| !item.is_null()) {
-                    check_types(item)?;
-                }
-            }
-            (tag, _) => return Err(wrong_payload(tag)),
-        }
-    }
-    Ok(())
-}
-
-/// The description of a payload of the wrong JSON type, in the attribute
-/// value deserializer's words.
-fn wrong_payload(tag: &str) -> String {
-    let expected = match tag {
-        "S" | "N" => "a string",
-        "B" => "a base64 string",
-        "NULL" | "BOOL" => "a boolean",
-        "M" => "an object",
-        _ => "an array",
-    };
-    format!("{tag} value must be {expected}")
-}
-
-fn check_base64(text: &str) -> Result<(), String> {
-    BASE64
-        .decode(text)
-        .map(drop)
-        .map_err(|e| format!("invalid base64: {e}"))
-}
-
-/// The members of an attribute value the model reads: those it names whose
-/// value is not null, in the order the value holds them.
-fn typed_members(members: &Map<String, Value>) -> impl Iterator<Item = (&str, &Value)> {
-    members
-        .iter()
-        .filter(|(tag, payload)| !payload.is_null() && TYPES.contains(&tag.as_str()))
-        .map(|(tag, payload)| (tag.as_str(), payload))
-}
 
 /// `value` as the attribute value model reads it: without the members it
 /// ignores, at every level. Its parameters passed [`check_parameter_types`]
@@ -237,7 +144,7 @@ fn check_value(value: &Value, depth: usize) -> Result<(), String> {
             let next = enter(depth)?;
             for (name, member) in entries {
                 if member.is_null() {
-                    return Err(format!("{NULL_MEMBER}: {name} is null"));
+                    return Err(null_member(name));
                 }
                 check_value(member, next)?;
             }
