@@ -13,7 +13,7 @@ pub use backup::{
     OTHER_STORE, RESTORE_REGISTRATION_TIMEOUT, S3_CHECK_TIMEOUT, STORE_IDENTITY_KEY, Spool,
     StoreFence, StoreHealth, StoreHealthReport, StoreIdentityFile, StoreProblem, TARGET_NOT_EMPTY,
     check_configured_store, check_configured_store_read_only, check_restore_backup_arn,
-    check_restore_override_kinds, check_restore_table_name, maintenance, migrate_legacy,
+    check_restore_name_and_overrides, check_restore_override_kinds, maintenance, migrate_legacy,
     read_identity_bounded, reconciler, refuse_point_in_time_recovery, store_identity,
     store_maintenance, sync,
 };
@@ -287,9 +287,8 @@ pub(crate) fn validate_enum_fields(
         {
             errors.push(match field.clause {
                 EnumClause::Named(api_name) => format!(
-                    "Value '{s}' at '{api_name}' failed to satisfy constraint: \
-                         Member must satisfy enum value set: [{}]",
-                    field.valid.join(", ")
+                    "Value '{s}' at '{api_name}' failed to satisfy constraint: {}",
+                    enum_constraint(field.valid)
                 ),
                 EnumClause::Bare(clause) => clause.to_owned(),
             });
@@ -305,6 +304,12 @@ pub(crate) fn validate_enum_fields(
         errors.join("; ")
     );
     Err(DynamoDbError::ValidationException(msg))
+}
+
+/// The constraint a value outside the enum `valid` fails, as the service
+/// words it.
+pub(crate) fn enum_constraint(valid: &[&str]) -> String {
+    format!("Member must satisfy enum value set: [{}]", valid.join(", "))
 }
 
 /// Validate the `ReturnValues` field for `PutItem` / `DeleteItem`, which accept

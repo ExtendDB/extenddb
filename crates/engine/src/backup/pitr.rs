@@ -116,11 +116,14 @@ fn check_table_name(name: &str, (min, max): (usize, usize)) -> Result<(), Dynamo
 /// service, the deployment's bounds here). That length counts UTF-16 code
 /// units. A name within the bounds is then checked against the model's
 /// constraints at `path`, which count characters (measured on DynamoDB in
-/// us-east-1 on 20 Nov 2026 for both members).
+/// us-east-1 on 20 Nov 2026 for both members), and its clauses are listed
+/// after `earlier`, the failed constraints of the request's other members
+/// (`validate_name_member_after`).
 pub fn check_restore_table_name(
     name: &str,
     path: &str,
     (min, max): (usize, usize),
+    earlier: &[(&str, &str, &str)],
 ) -> Result<(), DynamoDbError> {
     let length = name.encode_utf16().count();
     if length < min || length > max {
@@ -128,7 +131,7 @@ pub fn check_restore_table_name(
             "TableName must be at least {min} characters long and at most {max} characters long"
         )));
     }
-    super::validate_name_member(name, path, (min, max))
+    extenddb_core::validation::validate_name_member_after(name, path, (min, max), earlier)
 }
 
 /// The service's refusal for a missing member, by its model path.
@@ -256,7 +259,7 @@ fn restore_source_table_name(
     let arn = body.get("SourceTableArn").and_then(Value::as_str);
     match (name, arn) {
         (Some(name), None) => {
-            check_restore_table_name(name, "sourceTableName", bounds)?;
+            check_restore_table_name(name, "sourceTableName", bounds, &[])?;
             Ok(name.to_owned())
         }
         (None, Some(arn)) => crate::import_export::extract_table_name_from_arn(arn),

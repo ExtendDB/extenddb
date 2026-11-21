@@ -91,12 +91,29 @@ pub fn validate_table_name_chars(name: &str) -> Result<(), DynamoDbError> {
 pub fn validate_name_member(
     value: &str,
     path: &str,
+    bounds: (usize, usize),
+) -> Result<(), DynamoDbError> {
+    validate_name_member_after(value, path, bounds, &[])
+}
+
+/// [`validate_name_member`] for a member whose clauses the service lists
+/// after `earlier`, the failed constraints of other members of the request,
+/// in one message.
+///
+/// # Errors
+///
+/// `ValidationException` with every clause of `earlier`, then one clause
+/// per failed constraint of the name.
+pub fn validate_name_member_after(
+    value: &str,
+    path: &str,
     (min, max): (usize, usize),
+    earlier: &[(&str, &str, &str)],
 ) -> Result<(), DynamoDbError> {
     let length = value.chars().count();
     let too_short = format!("Member must have length greater than or equal to {min}");
     let too_long = format!("Member must have length less than or equal to {max}");
-    let mut failed = Vec::new();
+    let mut failed: Vec<(&str, &str, &str)> = earlier.to_vec();
     if length < min {
         failed.push((value, path, too_short.as_str()));
     } else if length > max {
