@@ -564,8 +564,8 @@ fi
 # wasm-bindgen-test drives the compiled test module through
 # wasm-bindgen-test-runner, which must match the wasm-bindgen crate in
 # Cargo.lock (a mismatch crashes at run time, not at build time), and runs it on
-# a Node whose V8 is newer than Node 18's. CARGO_TARGET_..._RUNNER and
-# WASM_BINDGEN_TEST_ONLY_NODE are read only when a wasm `cargo test` executes.
+# a Node whose V8 is newer than Node 18's. CARGO_TARGET_..._RUNNER is read
+# only when a wasm `cargo test` executes.
 if $RUN_WASM_TEST; then
     WASM_TEST_OUTFILE="discussions/test-wasm-bindgen-${HASH}.txt"
     echo "=== on-target wasm-bindgen-test suites → ${WASM_TEST_OUTFILE} ==="
@@ -627,7 +627,6 @@ if $RUN_WASM_TEST; then
             # shellcheck disable=SC2086
             if ! PATH="$NODE_SHIM_DIR:$PATH" \
                 CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="$WASM_TEST_RUNNER" \
-                WASM_BINDGEN_TEST_ONLY_NODE=1 \
                 cargo test --locked $suite_args --target wasm32-unknown-unknown \
                 2>&1 | tee -a "$WASM_TEST_OUTFILE"; then
                 WASM_TEST_RC=1

@@ -49,11 +49,10 @@ jobs:
       # core's crypto tests (src/crypto.rs) and the SQLite shim's tests/wasm_shim.rs are
       # wasm-bindgen-test cases; they run under Node through the matching
       # wasm-bindgen-test-runner (installed below, same version as the
-      # wasm-bindgen crate in Cargo.lock). These two variables are read only
-      # when a wasm `cargo test` executes, so they do not affect the build or
-      # clippy steps.
+      # wasm-bindgen crate in Cargo.lock). The variable is read only when a
+      # wasm `cargo test` executes, so it does not affect the build or clippy
+      # steps.
       CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
-      WASM_BINDGEN_TEST_ONLY_NODE: "1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
