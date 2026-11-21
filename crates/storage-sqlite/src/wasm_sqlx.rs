@@ -1057,11 +1057,6 @@ impl ColIndex for &str {
 }
 
 impl Row {
-    /// Decode a column, panicking on error (mirrors `sqlx::Row::get`).
-    pub fn get<T: Decode, I: ColIndex>(&self, index: I) -> T {
-        self.try_get(index).unwrap_or_else(|e| panic!("{e}"))
-    }
-
     /// Decode a column, as `sqlx::Row::try_get` does: a non-NULL value whose
     /// storage class the type does not accept is a "mismatched types" error,
     /// and any decode error names the column.
