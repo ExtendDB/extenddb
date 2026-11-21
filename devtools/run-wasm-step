@@ -62,11 +62,11 @@ run() {
 #
 # Cargo runs each test module with CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER,
 # which must be the wasm-bindgen-test-runner of the version of the
-# wasm-bindgen crate in Cargo.lock (the workflow's install step says why); the
-# runner runs the module under the node on PATH. A runner the caller sets is
-# used as given; otherwise this sets the one on PATH, else the one in cargo's
-# bin directory ($CARGO_HOME/bin), where `cargo install` puts it, by its full
-# path.
+# wasm-bindgen crate in Cargo.lock (the workflow's comment on its wasm tooling
+# says why); the runner runs the module under the node on PATH. A runner the
+# caller sets is used as given; otherwise this sets the one on PATH, else the
+# one in cargo's bin directory ($CARGO_HOME/bin), where `cargo install` puts
+# it, by its full path.
 LOG=""
 run_suite() {
     local suite="$1" runner status=0 output results line name state expected reported problems=()

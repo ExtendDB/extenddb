@@ -567,8 +567,9 @@ wasm_stop() {
     fi
     exit "$status"
 }
-# Prints a line for each way in which .github/workflows/wasm.yml would run a
-# step otherwise than run-tests runs it, and returns 1 when it printed any:
+# Prints a line for each of these that .github/workflows/wasm.yml breaks, as
+# each is a way the workflow could run a step otherwise than run-tests runs
+# it, and returns 1 when it printed any:
 # - each step a WASM_STEPS_ list names is run by exactly one step of the
 #   workflow, whose run: is `devtools/run-wasm-step <step>` and nothing else,
 #   and which sets no key besides name:, id: and timeout-minutes:;
