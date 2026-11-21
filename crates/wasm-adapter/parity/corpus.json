@@ -4273,6 +4273,769 @@
           }
         }
       ]
+    },
+    {
+      "name": "table names: PutItem with a TableName of 2 characters and 3 bytes outside the pattern answers the pattern clause alone",
+      "op": "PutItem",
+      "body": {
+        "TableName": "\u00e9a",
+        "Item": {
+          "pk": {
+            "S": "x"
+          }
+        }
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "1 validation error detected: Value '\u00e9a' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+        }
+      ]
+    },
+    {
+      "name": "table names: DescribeTable with a TableName of 128 characters and 256 bytes answers the length clause alone",
+      "op": "DescribeTable",
+      "body": {
+        "TableName": "\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "1 validation error detected: Value '\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9' at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255"
+        }
+      ]
+    },
+    {
+      "name": "table names: ListBackups with a TableName of 2 characters and 3 bytes outside the pattern answers both clauses",
+      "op": "ListBackups",
+      "body": {
+        "TableName": "\u00e9a"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "2 validation errors detected: Value '\u00e9a' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3; Value '\u00e9a' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+        }
+      ]
+    },
+    {
+      "name": "table names: DescribeContinuousBackups with a TableName of 128 characters and 256 bytes answers the pattern clause",
+      "op": "DescribeContinuousBackups",
+      "body": {
+        "TableName": "\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "1 validation error detected: Value '\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+        }
+      ]
+    },
+    {
+      "name": "table ARNs: PutItem with a 259-byte TableName that is not a table ARN answers the length clause",
+      "op": "PutItem",
+      "body": {
+        "TableName": "arn:bogusxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "Item": {
+          "pk": {
+            "S": "x"
+          }
+        }
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "1 validation error detected: Value 'arn:bogusxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255"
+        }
+      ]
+    },
+    {
+      "name": "table ARNs: ListBackups with a TableName ARN in partition aws-cn whose region is in capitals answers that it is not a table name or ARN",
+      "op": "ListBackups",
+      "body": {
+        "TableName": "arn:aws-cn:dynamodb:US-EAST-1:000000000000:table/Products"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Invalid Request: TableName is not a valid table name or table ARN"
+        }
+      ]
+    },
+    {
+      "name": "table ARNs: ListBackups with a two-character table segment outside the pattern answers both clauses",
+      "op": "ListBackups",
+      "body": {
+        "TableName": "arn:aws:dynamodb:us-east-1:000000000000:table/a!"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "2 validation errors detected: Value 'a!' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3; Value 'a!' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+        }
+      ]
+    },
+    {
+      "name": "table ARNs: ListBackups with a colon in the table segment answers that it is not a table name or ARN",
+      "op": "ListBackups",
+      "body": {
+        "TableName": "arn:aws:dynamodb:us-east-1:000000000000:table/a:b"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Invalid Request: TableName is not a valid table name or table ARN"
+        }
+      ]
+    },
+    {
+      "name": "accounts: UpdateTable with an index ARN of another account answers ResourceNotFoundException",
+      "op": "UpdateTable",
+      "body": {
+        "TableName": "arn:aws:dynamodb:us-east-1:111111111111:table/Products/index/x",
+        "BillingMode": "PAY_PER_REQUEST"
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found"
+        }
+      ]
+    },
+    {
+      "name": "accounts: DescribeTable with a TableName ARN of another vendor in another account answers the pattern clause",
+      "op": "DescribeTable",
+      "body": {
+        "TableName": "arn:aws:s3:us-east-1:111111111111:table/Products"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "1 validation error detected: Value 'arn:aws:s3:us-east-1:111111111111:table/Products' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+        }
+      ]
+    },
+    {
+      "name": "accounts: DescribeTimeToLive with an ARN of another account that names no table resource answers the pattern clause",
+      "op": "DescribeTimeToLive",
+      "body": {
+        "TableName": "arn:aws:dynamodb:us-east-1:111111111111:table/Products/foo/x"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "1 validation error detected: Value 'arn:aws:dynamodb:us-east-1:111111111111:table/Products/foo/x' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+        }
+      ]
+    },
+    {
+      "name": "accounts: DescribeContinuousBackups with an ARN of another account that names no table resource answers TableNotFoundException",
+      "op": "DescribeContinuousBackups",
+      "body": {
+        "TableName": "arn:aws:dynamodb:us-east-1:111111111111:foo/bar"
+      },
+      "error": "TableNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Table not found: arn:aws:dynamodb:us-east-1:111111111111:foo/bar"
+        }
+      ]
+    },
+    {
+      "name": "accounts: ListBackups with a stream ARN of another account answers that it is not a table name or ARN",
+      "op": "ListBackups",
+      "body": {
+        "TableName": "arn:aws:dynamodb:us-east-1:111111111111:table/Products/stream/x"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Invalid Request: TableName is not a valid table name or table ARN"
+        }
+      ]
+    },
+    {
+      "name": "accounts: ListBackups with a TableName ARN of another account whose region is in capitals answers Access is denied",
+      "op": "ListBackups",
+      "body": {
+        "TableName": "arn:aws:dynamodb:US-EAST-1:111111111111:table/Products"
+      },
+      "error": "AccessDeniedException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Access is denied"
+        }
+      ]
+    },
+    {
+      "name": "accounts: TagResource on a backup ARN of another account answers that it is not a DynamoDB resource ARN",
+      "op": "TagResource",
+      "body": {
+        "ResourceArn": "arn:aws:dynamodb:us-east-1:111111111111:table/Products/backup/01791976431438-73d8d5bc",
+        "Tags": [
+          {
+            "Key": "k",
+            "Value": "v"
+          }
+        ]
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "One or more parameter values were invalid: Provided Arn is not a DynamoDB resource arn: arn:aws:dynamodb:us-east-1:111111111111:table/Products/backup/01791976431438-73d8d5bc"
+        }
+      ]
+    },
+    {
+      "name": "accounts: ListTagsOfResource on an index ARN of another account answers that only a table or stream is accepted",
+      "op": "ListTagsOfResource",
+      "body": {
+        "ResourceArn": "arn:aws:dynamodb:us-east-1:111111111111:table/Gsi/index/byGsiKey"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "One or more parameter values were invalid: Invalid resource arn provided, only table or stream is accepted. Provided resource arn: arn:aws:dynamodb:us-east-1:111111111111:table/Gsi/index/byGsiKey"
+        }
+      ]
+    },
+    {
+      "name": "accounts: BatchWriteItem with 26 requests on a table in another account answers the count error",
+      "op": "BatchWriteItem",
+      "body": {
+        "RequestItems": {
+          "arn:aws:dynamodb:us-east-1:111111111111:table/Products": [
+            {
+              "PutRequest": {
+                "Item": {
+                  "productId": {
+                    "S": "c0"
+                  }
+                }
+              }
+            },
+            {
+              "PutRequest": {
+                "Item": {
+                  "productId": {
+                    "S": "c1"
+                  }
+                }
+              }
+            },
+            {
+              "PutRequest": {
+                "Item": {
+                  "productId": {
+                    "S": "c2"
+                  }
+                }
+              }
+            },
+            {
+              "PutRequest": {
+                "Item": {
+                  "productId": {
+                    "S": "c3"
+                  }
+                }
+              }
+            },
+            {
+              "PutRequest": {
+                "Item": {
+                  "productId": {
+                    "S": "c4"
+                  }
+                }
+              }
+            },
+            {
+              "PutRequest": {
+                "Item": {
+                  "productId": {
+                    "S": "c5"
+                  }
+                }
+              }
+            },
+            {
+              "PutRequest": {
+                "Item": {
+                  "productId": {
+                    "S": "c6"
+                  }
+                }
+              }
+            },
+            {
+              "PutRequest": {
+                "Item": {
+                  "productId": {
+                    "S": "c7"
+                  }
+                }
+              }
+            },
+            {
+              "PutRequest": {
+                "Item": {
+                  "productId": {
+                    "S": "c8"
+                  }
+                }
+              }
+            },
+            {
+              "PutRequest": {
+                "Item": {
+                  "productId": {
+                    "S": "c9"
+                  }
+                }
+              }
+            },
+            {
+              "PutRequest": {
+                "Item": {
+                  "productId": {
+                    "S": "c10"
+                  }
+                }
+              }
+            },
+            {
+              "PutRequest": {
+                "Item": {
+                  "productId": {
+                    "S": "c11"
+                  }
+                }
+              }
+            },
+            {
+              "PutRequest": {
+                "Item": {
+                  "productId": {
+                    "S": "c12"
+                  }
+                }
+              }
+            },
+            {
+              "PutRequest": {
+                "Item": {
+                  "productId": {
+                    "S": "c13"
+                  }
+                }
+              }
+            },
+            {
+              "PutRequest": {
+                "Item": {
+                  "productId": {
+                    "S": "c14"
+                  }
+                }
+              }
+            },
+            {
+              "PutRequest": {
+                "Item": {
+                  "productId": {
+                    "S": "c15"
+                  }
+                }
+              }
+            },
+            {
+              "PutRequest": {
+                "Item": {
+                  "productId": {
+                    "S": "c16"
+                  }
+                }
+              }
+            },
+            {
+              "PutRequest": {
+                "Item": {
+                  "productId": {
+                    "S": "c17"
+                  }
+                }
+              }
+            },
+            {
+              "PutRequest": {
+                "Item": {
+                  "productId": {
+                    "S": "c18"
+                  }
+                }
+              }
+            },
+            {
+              "PutRequest": {
+                "Item": {
+                  "productId": {
+                    "S": "c19"
+                  }
+                }
+              }
+            },
+            {
+              "PutRequest": {
+                "Item": {
+                  "productId": {
+                    "S": "c20"
+                  }
+                }
+              }
+            },
+            {
+              "PutRequest": {
+                "Item": {
+                  "productId": {
+                    "S": "c21"
+                  }
+                }
+              }
+            },
+            {
+              "PutRequest": {
+                "Item": {
+                  "productId": {
+                    "S": "c22"
+                  }
+                }
+              }
+            },
+            {
+              "PutRequest": {
+                "Item": {
+                  "productId": {
+                    "S": "c23"
+                  }
+                }
+              }
+            },
+            {
+              "PutRequest": {
+                "Item": {
+                  "productId": {
+                    "S": "c24"
+                  }
+                }
+              }
+            },
+            {
+              "PutRequest": {
+                "Item": {
+                  "productId": {
+                    "S": "c25"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "1 validation error detected: Value '{arn:aws:dynamodb:us-east-1:111111111111:table/Products=[WriteRequest, WriteRequest, WriteRequest, WriteRequest, WriteRequest, WriteRequest, WriteRequest, WriteRequest, WriteRequest, WriteRequest, WriteRequest, WriteRequest, WriteRequest, WriteRequest, WriteRequest, WriteRequest, WriteRequest, WriteRequest, WriteRequest, WriteRequest, WriteRequest, WriteRequest, WriteRequest, WriteRequest, WriteRequest, WriteRequest]}' at 'requestItems' failed to satisfy constraint: Map value must satisfy constraint: [Member must have length less than or equal to 25, Member must have length greater than or equal to 1]"
+        }
+      ]
+    },
+    {
+      "name": "tag ResourceArn kind: TagResource on a table ARN with an unknown sub-resource answers that only a table or stream is accepted",
+      "op": "TagResource",
+      "body": {
+        "ResourceArn": "arn:aws:dynamodb:us-east-1:000000000000:table/Products/foo/x",
+        "Tags": [
+          {
+            "Key": "k",
+            "Value": "v"
+          }
+        ]
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "One or more parameter values were invalid: Invalid resource arn provided, only table or stream is accepted. Provided resource arn: arn:aws:dynamodb:us-east-1:000000000000:table/Products/foo/x"
+        }
+      ]
+    },
+    {
+      "name": "tag ResourceArn kind: ListTagsOfResource on an index ARN with no index name answers that only a table or stream is accepted",
+      "op": "ListTagsOfResource",
+      "body": {
+        "ResourceArn": "arn:aws:dynamodb:us-east-1:000000000000:table/Gsi/index/"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "One or more parameter values were invalid: Invalid resource arn provided, only table or stream is accepted. Provided resource arn: arn:aws:dynamodb:us-east-1:000000000000:table/Gsi/index/"
+        }
+      ]
+    },
+    {
+      "name": "tag ResourceArn kind: UntagResource on an export ARN answers that it is not a DynamoDB resource ARN",
+      "op": "UntagResource",
+      "body": {
+        "ResourceArn": "arn:aws:dynamodb:us-east-1:000000000000:table/Products/export/x",
+        "TagKeys": [
+          "k"
+        ]
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "One or more parameter values were invalid: Provided Arn is not a DynamoDB resource arn: arn:aws:dynamodb:us-east-1:000000000000:table/Products/export/x"
+        }
+      ]
+    },
+    {
+      "name": "tag ResourceArn kind: TagResource on a table ARN with an empty table segment answers ResourceNotFoundException",
+      "op": "TagResource",
+      "body": {
+        "ResourceArn": "arn:aws:dynamodb:us-east-1:000000000000:table/",
+        "Tags": [
+          {
+            "Key": "k",
+            "Value": "v"
+          }
+        ]
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found: ResourceArn: arn:aws:dynamodb:us-east-1:000000000000:table/ not found"
+        }
+      ]
+    },
+    {
+      "name": "tag ResourceArn kind: TagResource on a table ARN with a trailing slash stores the tag under that ARN",
+      "op": "TagResource",
+      "body": {
+        "ResourceArn": "arn:aws:dynamodb:us-east-1:000000000000:table/Products/",
+        "Tags": [
+          {
+            "Key": "k",
+            "Value": "v"
+          }
+        ]
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "",
+          "equals": {}
+        }
+      ]
+    },
+    {
+      "name": "tag ResourceArn kind: ListTagsOfResource on that ARN lists the tag",
+      "op": "ListTagsOfResource",
+      "body": {
+        "ResourceArn": "arn:aws:dynamodb:us-east-1:000000000000:table/Products/"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "",
+          "equals": {
+            "Tags": [
+              {
+                "Key": "k",
+                "Value": "v"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "tag ResourceArn kind: ListTagsOfResource on the table's own ARN lists no tags",
+      "op": "ListTagsOfResource",
+      "body": {
+        "ResourceArn": "arn:aws:dynamodb:us-east-1:000000000000:table/Products"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "",
+          "equals": {
+            "Tags": []
+          }
+        }
+      ]
+    },
+    {
+      "name": "tag ResourceArn kind: UntagResource on a stream ARN whose label has a slash answers {}",
+      "op": "UntagResource",
+      "body": {
+        "ResourceArn": "arn:aws:dynamodb:us-east-1:000000000000:table/Str/stream/a/b",
+        "TagKeys": [
+          "k"
+        ]
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "",
+          "equals": {}
+        }
+      ]
+    },
+    {
+      "name": "tag ResourceArn kind: ListTagsOfResource on a stream ARN with an empty label of a missing table answers ResourceNotFoundException",
+      "op": "ListTagsOfResource",
+      "body": {
+        "ResourceArn": "arn:aws:dynamodb:us-east-1:000000000000:table/NoSuchTable/stream/"
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found: ResourceArn: arn:aws:dynamodb:us-east-1:000000000000:table/NoSuchTable/stream/ not found"
+        }
+      ]
+    },
+    {
+      "name": "tag ResourceArn kind: ListTagsOfResource on a table ARN with a trailing slash in another account answers Access is denied",
+      "op": "ListTagsOfResource",
+      "body": {
+        "ResourceArn": "arn:aws:dynamodb:us-east-1:111111111111:table/Products/"
+      },
+      "error": "AccessDeniedException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Access is denied"
+        }
+      ]
+    },
+    {
+      "name": "tag ResourceArn kind: ListTagsOfResource on a table ARN with an unknown sub-resource in another account answers that only a table or stream is accepted",
+      "op": "ListTagsOfResource",
+      "body": {
+        "ResourceArn": "arn:aws:dynamodb:us-east-1:111111111111:table/Products/foo/x"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "One or more parameter values were invalid: Invalid resource arn provided, only table or stream is accepted. Provided resource arn: arn:aws:dynamodb:us-east-1:111111111111:table/Products/foo/x"
+        }
+      ]
+    },
+    {
+      "name": "tag ResourceArn kind: ListTagsOfResource on a table ARN with a trailing slash in another region answers Invalid TableArn",
+      "op": "ListTagsOfResource",
+      "body": {
+        "ResourceArn": "arn:aws:dynamodb:us-west-2:000000000000:table/Products/"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Invalid TableArn: Invalid ResourceArn provided as input arn:aws:dynamodb:us-west-2:000000000000:table/Products/"
+        }
+      ]
+    },
+    {
+      "name": "tag ResourceArn kind: ListTagsOfResource on a stream ARN whose label has a slash in another region answers Invalid StreamArn",
+      "op": "ListTagsOfResource",
+      "body": {
+        "ResourceArn": "arn:aws:dynamodb:us-west-2:000000000000:table/Str/stream/a/b"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Invalid StreamArn"
+        }
+      ]
+    },
+    {
+      "name": "GetRecords iterator scope: GetRecords with an iterator that carries a table ARN answers Invalid stream ARN format",
+      "op": "GetRecords",
+      "body": {
+        "ShardIterator": "c2hhcmRJZC14fFRSSU1fSE9SSVpPTnx8OTk5OTk5OTk5OTl8YXJuOmF3czpkeW5hbW9kYjp1cy1lYXN0LTE6MDAwMDAwMDAwMDAwOnRhYmxlL1N0cm0="
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Invalid stream ARN format: arn:aws:dynamodb:us-east-1:000000000000:table/Strm"
+        }
+      ]
+    },
+    {
+      "name": "GetRecords iterator scope: GetRecords with an iterator that carries no timestamp and a value that is not an ARN answers Invalid stream ARN format",
+      "op": "GetRecords",
+      "body": {
+        "ShardIterator": "c2hhcmRJZC14fFRSSU1fSE9SSVpPTnx8fG5vdC1hbi1hcm4="
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Invalid stream ARN format: not-an-arn"
+        }
+      ]
+    },
+    {
+      "name": "GetRecords iterator scope: GetRecords with an iterator more than 15 minutes old that carries a table ARN answers ExpiredIteratorException",
+      "op": "GetRecords",
+      "body": {
+        "ShardIterator": "c2hhcmRJZC14fFRSSU1fSE9SSVpPTnx8MTAwMHxhcm46YXdzOmR5bmFtb2RiOnVzLWVhc3QtMTowMDAwMDAwMDAwMDA6dGFibGUvU3RybQ=="
+      },
+      "error": "ExpiredIteratorException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Shard iterator has expired"
+        }
+      ]
+    },
+    {
+      "name": "GetRecords iterator scope: GetRecords with an iterator more than 15 minutes old for a stream in another region answers ExpiredIteratorException",
+      "op": "GetRecords",
+      "body": {
+        "ShardIterator": "c2hhcmRJZC14fFRSSU1fSE9SSVpPTnx8MTAwMHxhcm46YXdzOmR5bmFtb2RiOnVzLXdlc3QtMjowMDAwMDAwMDAwMDA6dGFibGUvU3RybS9zdHJlYW0vMjAyNi0wMS0wMVQwMDowMDowMC4wMDA="
+      },
+      "error": "ExpiredIteratorException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Shard iterator has expired"
+        }
+      ]
     }
   ]
 }
