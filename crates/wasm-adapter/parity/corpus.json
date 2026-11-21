@@ -4142,6 +4142,82 @@
           "equals": "Requested resource not found: Stream does not exist"
         }
       ]
+    },
+    {
+      "name": "table names: GetItem with a TableName outside the pattern and no Key answers SerializationException",
+      "op": "GetItem",
+      "body": {
+        "TableName": "bad name!"
+      },
+      "error": "SerializationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Start of structure or map found where not expected: missing field `Key`"
+        }
+      ]
+    },
+    {
+      "name": "table ARNs: DescribeLimits with a TableName that is not a table ARN answers its limits",
+      "op": "DescribeLimits",
+      "body": {
+        "TableName": "arn:bogus"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/AccountMaxReadCapacityUnits",
+          "present": true
+        },
+        {
+          "path": "/TableMaxWriteCapacityUnits",
+          "present": true
+        }
+      ]
+    },
+    {
+      "name": "table names: GetRecords with a TableName outside the pattern answers for its ShardIterator",
+      "op": "GetRecords",
+      "body": {
+        "TableName": "bad name!",
+        "ShardIterator": "not-an-iterator"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Invalid ShardIterator"
+        }
+      ]
+    },
+    {
+      "name": "table ARNs: GetRecords with a TableName that is not a table ARN answers for its ShardIterator",
+      "op": "GetRecords",
+      "body": {
+        "TableName": "arn:bogus",
+        "ShardIterator": "not-an-iterator"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Invalid ShardIterator"
+        }
+      ]
+    },
+    {
+      "name": "accounts: ListBackups naming a table ARN with an empty account segment answers that it is not a table name or ARN",
+      "op": "ListBackups",
+      "body": {
+        "TableName": "arn:aws:dynamodb:us-east-1::table/Products"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Invalid Request: TableName is not a valid table name or table ARN"
+        }
+      ]
     }
   ]
 }
