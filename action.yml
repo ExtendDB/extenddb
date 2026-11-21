@@ -1,0 +1,47 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# The GitHub Action of this repository. The action at a release tag starts
+# the dev server of that release; packaging/README.md describes how.
+
+name: ExtendDB dev server
+description: Start a DynamoDB-compatible ExtendDB dev server on 127.0.0.1 for the rest of the job.
+author: ExtendDB contributors
+branding:
+  icon: database
+  color: blue
+
+inputs:
+  port:
+    description: The port on 127.0.0.1. Empty picks a free port.
+  export-env:
+    description: >-
+      Set AWS_ENDPOINT_URL_DYNAMODB, AWS_ENDPOINT_URL_DYNAMODB_STREAMS,
+      AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION and
+      AWS_DEFAULT_REGION for the later steps of the job. A session token that
+      an earlier step set in AWS_SESSION_TOKEN or AWS_SECURITY_TOKEN becomes
+      an empty value. Set it to "false" in a job whose later steps also call
+      AWS: the outputs carry the same values.
+    default: "true"
+  binary:
+    description: >-
+      The path of an extenddb dev binary of this release, to run instead of
+      the binary that the action downloads from registry.npmjs.org. A runner
+      that cannot reach registry.npmjs.org needs it.
+
+outputs:
+  endpoint:
+    description: The server's URL, such as http://127.0.0.1:43121.
+  port:
+    description: The server's port.
+  access-key-id:
+    description: The access key ID of the example credential that the server accepts.
+  secret-access-key:
+    description: The secret access key of the example credential.
+  region:
+    description: The region to sign requests for.
+
+runs:
+  using: node24
+  main: packaging/github-action/main.js
+  post: packaging/github-action/post.js

@@ -80,7 +80,11 @@ jobs:
       #      input on setup-node. There is no cache entry to poison.
       #
       # Keep both true if this job grows: adding a cache step here would make
-      # the finding real, and it would then need a trusted-ref guard.
+      # the finding real, and it would then need a trusted-ref guard. The
+      # step that runs the GitHub Action in action.yml (`uses: ./`) runs
+      # checked-out code too, and property 1 covers it. As a JavaScript
+      # action it receives the runner's cache token, which a `run` step does
+      # not, and it reads and writes no cache entry.
       - name: Check out the requested commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
@@ -163,6 +167,40 @@ jobs:
           set -euo pipefail
           cd packaging/npm
           node test/launcher.test.js
+
+      - name: Act as an earlier step that exported an AWS session token
+        # The action must clear it: the dev server refuses a request that
+        # carries one. The AWS CLI step below checks that.
+        if: matrix.pkg == 'linux-x64'
+        shell: bash
+        run: echo "AWS_SESSION_TOKEN=token-of-an-earlier-step" >> "${GITHUB_ENV}"
+
+      - name: Start the GitHub Action against the built binary
+        # action.yml at the repository root starts the binary detached, for the
+        # rest of the job, and its post step stops it when the job ends.
+        id: extenddb
+        uses: ./
+        with:
+          binary: ${{ github.workspace }}/${{ env.BIN_PATH }}
+
+      - name: The action's server answers on the endpoint that it exported
+        shell: bash
+        env:
+          OUTPUT_ENDPOINT: ${{ steps.extenddb.outputs.endpoint }}
+          PKG: ${{ matrix.pkg }}
+        run: |
+          set -euo pipefail
+          test "${OUTPUT_ENDPOINT}" = "${AWS_ENDPOINT_URL_DYNAMODB}"
+          curl -fsS --max-time 10 "${AWS_ENDPOINT_URL_DYNAMODB}/health"
+          # Without an earlier token, the action sets no token variable.
+          if [ "${PKG}" != linux-x64 ]; then test -z "${AWS_SESSION_TOKEN+set}"; fi
+
+      - name: The AWS CLI reaches the server with the variables that the action set
+        # ubuntu-latest has the AWS CLI. It signs with the example key that
+        # the action exported, and sends no session token.
+        if: matrix.pkg == 'linux-x64'
+        shell: bash
+        run: aws dynamodb list-tables
 
       - name: Portability gate - the binary must run on the oldest libc we support
         if: contains(matrix.target, 'musl')

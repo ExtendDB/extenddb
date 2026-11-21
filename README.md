@@ -65,6 +65,19 @@ On every backend, run one ExtendDB server for each catalog. Only SQLite enforces
 
 The `@extenddb/dev` npm package and the `extenddb/extenddb-dev` image run a dev-mode SQLite build, for local development and CI. Dev mode uses plain HTTP and seeds an example key that can do everything, so keep a dev-mode server on loopback. At startup it migrates a catalog that is behind it, after it copies the database file.
 
+## GitHub Actions
+
+This repository is also a GitHub Action. The action starts the dev server of its own release on 127.0.0.1, with memory storage, on Linux and macOS runners (x64 and arm64) and on x64 Windows runners. The server runs until the job ends:
+
+```yaml
+steps:
+  - uses: actions/checkout@<commit SHA>
+  - uses: ExtendDB/extenddb@<release tag, or its commit SHA>
+  - run: pytest
+```
+
+The later steps get `AWS_ENDPOINT_URL_DYNAMODB`, `AWS_ENDPOINT_URL_DYNAMODB_STREAMS`, the example key and the region, so an AWS SDK or the AWS CLI that reads `AWS_ENDPOINT_URL_DYNAMODB` sends its DynamoDB requests to the server. A session token that an earlier step set becomes an empty `AWS_SESSION_TOKEN`. In a job whose later steps also call AWS, set `export-env: false` and give the action's outputs to the steps that need them. [`action.yml`](action.yml) lists the inputs and the outputs.
+
 ## Quick Start
 
 ```bash
