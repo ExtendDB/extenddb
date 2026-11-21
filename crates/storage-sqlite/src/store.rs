@@ -43,6 +43,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use extenddb_storage::error::StorageError;
+use extenddb_storage::management_store::SettingsStore as _;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tokio::sync::Mutex;
@@ -244,6 +245,20 @@ impl SqliteEngine {
         Arc::clone(&self.control_plane_notify)
     }
 
+    /// Insert the account `account_id` under the name `default`, unless it
+    /// exists. The server's bootstrap ([`Self::bootstrap_dev_rows`]) and the
+    /// embedded in-memory engine ([`Self::new_in_memory`]) both register their
+    /// account through this one statement.
+    async fn insert_default_account(&self, account_id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO accounts (account_id, account_name) VALUES (?, 'default')",
+        )
+        .bind(account_id)
+        .execute(&self.pool)
+        .await
+        .map(drop)
+    }
+
     /// Write the rows a server needs that `init` writes on a production
     /// deployment (encryption key, default account, admin user) on the
     /// engine's own connection, each only when absent. Used for an in-memory
@@ -286,26 +301,21 @@ impl SqliteEngine {
         // Default account + canonical marker. Record the default account id in
         // settings (idempotent, backfill-safe) so callers resolve it explicitly
         // rather than inferring it from account-list ordering.
-        let account_id: String = match sqlx::query_scalar(
-            "SELECT account_id FROM accounts ORDER BY account_id LIMIT 1",
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| internal(format!("check accounts: {e}")))?
-        {
-            Some(id) => id,
-            None => {
-                let id = helpers::generate_account_id();
-                sqlx::query(
-                    "INSERT OR IGNORE INTO accounts (account_id, account_name) VALUES (?, 'default')",
-                )
-                .bind(&id)
-                .execute(&self.pool)
+        let account_id: String =
+            match sqlx::query_scalar("SELECT account_id FROM accounts ORDER BY account_id LIMIT 1")
+                .fetch_optional(&self.pool)
                 .await
-                .map_err(|e| internal(format!("create default account: {e}")))?;
-                id
-            }
-        };
+                .map_err(|e| internal(format!("check accounts: {e}")))?
+            {
+                Some(id) => id,
+                None => {
+                    let id = helpers::generate_account_id();
+                    self.insert_default_account(&id)
+                        .await
+                        .map_err(|e| internal(format!("create default account: {e}")))?;
+                    id
+                }
+            };
         sqlx::query("INSERT OR IGNORE INTO settings (key, value) VALUES ('default_account_id', ?)")
             .bind(&account_id)
             .execute(&self.pool)
@@ -507,10 +517,11 @@ impl SqliteEngine {
     /// and index maintenance happens on the write path — there are no
     /// background workers in this configuration to drive an asynchronous one.
     ///
-    /// The migration run reuses the same runner the server's in-memory startup
-    /// uses, so the schema is identical. No encryption key or admin user is
-    /// written: an embedded build does no authentication, and the data-plane
-    /// operations need only the account row to exist.
+    /// The migrations run through the function the server's in-memory startup
+    /// calls, and the account row through the statement its bootstrap uses. No
+    /// encryption key or admin user is written: an embedded build does no
+    /// authentication, and the data-plane operations need only the account row
+    /// to exist.
     ///
     /// # Errors
     ///
@@ -525,40 +536,36 @@ impl SqliteEngine {
         let engine = Self::new(":memory:", 1, region, max_item_size_bytes).await?;
 
         // An in-memory database lives only on the engine's single connection,
-        // so its catalog is created there, by the runner, at startup — the
-        // same runner the server's in-memory bootstrap uses.
-        let on_pool = crate::migrations::SqliteMigrations::on_pool(engine.pool.clone(), ":memory:")
-            .map_err(|e| StorageError::Internal(format!("prepare in-memory migrations: {e}")))?;
-        extenddb_storage::migrations::Runner::new(&on_pool, "")
-            .migrate()
+        // so its catalog is created there, by the call the server's in-memory
+        // startup makes.
+        crate::migrations::migrate_in_memory(&engine.pool, ":memory:", "")
             .await
             .map_err(|e| StorageError::Internal(format!("run in-memory migrations: {e}")))?;
 
         // The account the data-plane operations write under. CreateTable
-        // records the owning account, so the row must exist first.
+        // records the owning account, so the row must exist first. The rest of
+        // `bootstrap_dev_rows` is not run: it generates the account id and an
+        // encryption key and hashes an admin password, none of which an
+        // embedded build without authentication uses.
         Self::validate_account_id(account_id)?;
-        sqlx::query(
-            "INSERT OR IGNORE INTO accounts (account_id, account_name) VALUES (?, 'default')",
-        )
-        .bind(account_id)
-        .execute(&engine.pool)
-        .await
-        .map_err(|e| StorageError::Internal(format!("register account: {e}")))?;
+        engine
+            .insert_default_account(account_id)
+            .await
+            .map_err(|e| StorageError::Internal(format!("register account: {e}")))?;
 
         // No background workers run here, so make the control plane synchronous:
         // a created table is `ACTIVE` at once and index maintenance happens on
         // the write path, not via a poller that never runs. Zero means
         // synchronous for both settings.
+        let settings = crate::SqliteCatalogStore::new(engine.pool.clone());
         for (key, value) in [
             ("control_plane_delay_seconds", "0"),
             ("index_propagation_delay_ms", "0"),
         ] {
-            sqlx::query("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
-                .bind(key)
-                .bind(value)
-                .execute(&engine.pool)
+            settings
+                .set_setting(key, value)
                 .await
-                .map_err(|e| StorageError::Internal(format!("set {key}: {e}")))?;
+                .map_err(|e| StorageError::Internal(format!("set {key}: {e:?}")))?;
         }
 
         Ok(engine)

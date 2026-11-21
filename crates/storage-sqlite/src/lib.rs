@@ -311,7 +311,7 @@ use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use extenddb_auth::CredentialStore;
 #[cfg(not(target_arch = "wasm32"))]
-use extenddb_storage::migrations::{MigrationError, Runner};
+use extenddb_storage::migrations::MigrationError;
 #[cfg(not(target_arch = "wasm32"))]
 use extenddb_storage::server_components::{
     BackendError, KeySource, ServerComponents, load_secret_keys,
@@ -409,10 +409,7 @@ fn sqlite_server_components_factory(
         // time the server starts.
         let in_memory = engine.in_memory;
         if in_memory {
-            let on_pool = migrations::SqliteMigrations::on_pool(engine.pool.clone(), &db_path)
-                .map_err(BackendError::Catalog)?;
-            let report = Runner::new(&on_pool, options.release)
-                .migrate()
+            let report = migrations::migrate_in_memory(&engine.pool, &db_path, options.release)
                 .await
                 .map_err(BackendError::Catalog)?;
             migrations::log_report(&report);

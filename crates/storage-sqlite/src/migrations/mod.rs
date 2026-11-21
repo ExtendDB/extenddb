@@ -456,6 +456,24 @@ async fn holds_tables(location: &str) -> Result<bool, MigrationError> {
     Ok(!empty?)
 }
 
+/// Create or bring up to date the catalog of an in-memory database, on the
+/// engine's own pool: a new connection to an in-memory location opens another,
+/// empty database, so the runner must use the one connection the engine holds.
+/// The server's in-memory startup and the embedded in-memory engine both
+/// migrate through this function.
+///
+/// # Errors
+///
+/// The pool allows more than one connection, or the run fails.
+pub(crate) async fn migrate_in_memory(
+    pool: &sqlx::SqlitePool,
+    location: &str,
+    release: &str,
+) -> Result<RunReport, MigrationError> {
+    let migrations = SqliteMigrations::on_pool(pool.clone(), location)?;
+    Runner::new(&migrations, release).migrate().await
+}
+
 /// Log what a run the server started did: the copy's path, then each step
 /// with its notes.
 pub(crate) fn log_report(report: &RunReport) {
@@ -487,10 +505,7 @@ async fn run_on_file(location: &str, release: &str) -> Result<RunReport, Migrati
 #[cfg(test)]
 pub(crate) async fn apply_for_tests(pool: &sqlx::SqlitePool) {
     if pool.options().get_max_connections() == 1 {
-        let migrations =
-            SqliteMigrations::on_pool(pool.clone(), ":memory:").expect("one connection");
-        Runner::new(&migrations, "test")
-            .migrate()
+        migrate_in_memory(pool, ":memory:", "test")
             .await
             .expect("migrate the test database");
     } else {
