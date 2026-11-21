@@ -130,6 +130,41 @@ async fn an_enabled_account_gets_the_extended_messages() {
     );
 }
 
+#[tokio::test]
+async fn a_name_neither_expression_uses_is_refused() {
+    let _serial = SERIAL.lock().await;
+    install(Ok(Some("all")));
+    let values = values();
+    let names: HashMap<String, String> = [("#u".to_owned(), "x".to_owned())].into();
+    let err = parse_request(
+        &Served,
+        CALLER,
+        Some(INEQUALITY),
+        Some(&names),
+        Some(&values),
+        None,
+    )
+    .await
+    .err()
+    .expect("refused");
+    assert!(
+        matches!(&err, DynamoDbError::ValidationException(m)
+            if m == "Value provided in ExpressionAttributeNames unused in expressions: keys: {#u}"),
+        "{err:?}"
+    );
+    let used: HashMap<String, String> = [("#u".to_owned(), "Price".to_owned())].into();
+    let projected = parse_request(
+        &Served,
+        CALLER,
+        Some(INEQUALITY),
+        Some(&used),
+        Some(&values),
+        Some("#u"),
+    )
+    .await;
+    assert!(projected.is_ok_and(|e| e.is_some()));
+}
+
 fn item(country: &str, price: &str) -> Item {
     [
         ("Country".to_owned(), AttributeValue::S(country.to_owned())),

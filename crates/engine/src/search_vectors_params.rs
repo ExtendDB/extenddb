@@ -69,3 +69,7 @@ pub(crate) fn equality_conditions(
         &[expr, projection.unwrap_or_default()],
     )
 }
+
+#[cfg(test)]
+#[path = "search_vectors_params_tests.rs"]
+mod tests;
