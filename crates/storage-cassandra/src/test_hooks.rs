@@ -63,6 +63,8 @@
 //! * a pause in `set_backup_deleted` between its read of the row and its
 //!   lightweight transaction, so a test can move the row in that gap and see
 //!   the transaction's store condition send it under the root it names.
+//! * a count of the schema agreement waits that `destroy` runs for a keyspace
+//!   prefix, so a test can see that `drop_databases` waits on every run.
 
 use std::time::Duration;
 
@@ -163,6 +165,7 @@ mod armed {
         pub(super) before_legacy_registration: HashMap<String, Arc<Pause>>,
         pub(super) convert_refusals: HashMap<String, usize>,
         pub(super) legacy_keys_page: Option<i32>,
+        pub(super) destroy_waits: HashMap<String, usize>,
     }
 
     pub(super) static HOOKS: LazyLock<Mutex<Hooks>> = LazyLock::new(Mutex::default);
@@ -909,6 +912,33 @@ pub(crate) async fn before_abandoned_fence(backup_arn: &str) {
         pause.hold().await;
     }
     let _ = backup_arn;
+}
+
+/// Count one schema agreement wait of `destroy`, run to the end with the
+/// nodes in agreement, for the deployment of `keyspace_prefix`.
+pub(crate) fn destroy_waited(keyspace_prefix: &str) {
+    #[cfg(feature = "test-hooks")]
+    armed::with_hooks(|hooks| {
+        *hooks
+            .destroy_waits
+            .entry(keyspace_prefix.to_owned())
+            .or_insert(0) += 1;
+    });
+    let _ = keyspace_prefix;
+}
+
+/// How many schema agreement waits `destroy` has run for the deployment of
+/// `keyspace_prefix` in this process.
+#[cfg(feature = "test-hooks")]
+#[must_use]
+pub fn destroy_waits(keyspace_prefix: &str) -> usize {
+    armed::with_hooks(|hooks| {
+        hooks
+            .destroy_waits
+            .get(keyspace_prefix)
+            .copied()
+            .unwrap_or(0)
+    })
 }
 
 /// Hold here if a test armed a pause for the takeover of restore target

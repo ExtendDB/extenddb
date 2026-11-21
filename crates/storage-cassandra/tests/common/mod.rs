@@ -786,7 +786,8 @@ pub async fn isolated_queue_keyspace(isolated: &IsolatedEngine) -> String {
     keyspace
 }
 
-/// The account keyspaces on `isolated`'s prefix, in the order the GSI
+/// The account keyspaces on `isolated`'s prefix: `<prefix>_account_` and a
+/// 12-digit id, as `list_account_keyspaces` lists them, in the order the GSI
 /// workers read them (`system_schema` order).
 pub async fn isolated_account_keyspaces(isolated: &IsolatedEngine) -> Vec<String> {
     use cdrs_tokio::types::IntoRustByName as _;
@@ -806,7 +807,10 @@ pub async fn isolated_account_keyspaces(isolated: &IsolatedEngine) -> Vec<String
             let name: Result<String, _> = row.get_r_by_name("keyspace_name");
             name.ok()
         })
-        .filter(|name| name.starts_with(&prefix))
+        .filter(|name| {
+            name.strip_prefix(&prefix)
+                .is_some_and(extenddb_core::arn::is_account_id)
+        })
         .collect()
 }
 

@@ -167,7 +167,11 @@ impl CassandraBootstrapper {
         let cassandra_contact_points = extract_arg(cli_args, "--cassandra-contact-points");
         let cassandra_user = extract_arg(cli_args, "--cassandra-user");
         let cassandra_pass = extract_arg(cli_args, "--cassandra-pass");
-        let keyspace_prefix = extract_arg(cli_args, "--keyspace-prefix");
+        let keyspace_prefix_flag = extract_arg(cli_args, "--keyspace-prefix");
+        let (keyspace_prefix, prefix_note) = fold_prefix_flag(keyspace_prefix_flag.as_deref())?;
+        if let Some(note) = prefix_note {
+            println!("{note}");
+        }
         let replication_factor = extract_arg(cli_args, "--replication-factor");
         let datacenter = extract_arg(cli_args, "--datacenter");
         let extenddb_user = extract_arg(cli_args, "--extenddb-user");
@@ -238,7 +242,8 @@ impl CassandraBootstrapper {
             {
                 return Err(StorageError::Internal(format!(
                     "--keyspace-prefix '{}' conflicts with config file keyspace prefix '{}'",
-                    cli_prefix, config.keyspace_prefix
+                    keyspace_prefix_flag.as_deref().unwrap_or(cli_prefix),
+                    config.keyspace_prefix
                 )));
             }
 
@@ -899,12 +904,6 @@ impl Bootstrapper for CassandraBootstrapper {
     async fn drop_databases(&self, _data_db: &str) -> OpResult<()> {
         println!("--- Dropping all ExtendDB keyspaces...");
 
-        // List all keyspaces with our prefix
-        let prefix = format!(
-            "{}_",
-            self.engine.catalog_keyspace().trim_end_matches("_catalog")
-        );
-
         let cql = "SELECT keyspace_name FROM system_schema.keyspaces";
         let rows = self
             .engine
@@ -921,16 +920,20 @@ impl Bootstrapper for CassandraBootstrapper {
             .into_rows()
             .ok_or_else(|| OpError::Internal("No rows returned".to_string()))?;
 
-        let keyspaces: Vec<String> = rows
+        let all_keyspaces: Vec<String> = rows
             .into_iter()
             .filter_map(|row| {
                 TryFromRowTrait::try_from_row(row)
                     .ok()
                     .map(|r: KeyspaceNameRow| r.keyspace_name)
             })
-            .filter(|name| name.starts_with(&prefix))
             .collect();
+        let (keyspaces, left_alone) = split_keyspaces(all_keyspaces, &self.keyspace_prefix);
 
+        for keyspace in &left_alone {
+            println!("{}", left_alone_line(keyspace, &self.keyspace_prefix));
+        }
+        let dropped = keyspaces.len();
         for keyspace in keyspaces {
             println!("    Dropping keyspace: {keyspace}");
             self.engine
@@ -939,8 +942,24 @@ impl Bootstrapper for CassandraBootstrapper {
                 .map_err(|e| OpError::Internal(e.to_string()))?;
         }
 
-        println!("    All ExtendDB keyspaces dropped");
-        Ok(())
+        // `DROP KEYSPACE` returns once the node that took it has applied it;
+        // the other nodes follow later. A read of `system_schema` on another
+        // node, or an `init` that follows at once, would find the keyspace
+        // still there. The wait runs when nothing was dropped too: a run that
+        // dropped keyspaces and then timed out in the wait leaves a second run
+        // that finds nothing to drop, and the nodes may still disagree.
+        finish_destroy(dropped, left_alone.len(), || async {
+            let agreed = crate::migrations::wait_for_agreement(
+                self.engine.session(),
+                crate::migrations::AGREEMENT_TIMEOUT,
+            )
+            .await;
+            if agreed.is_ok() {
+                crate::test_hooks::destroy_waited(&self.keyspace_prefix);
+            }
+            agreed
+        })
+        .await
     }
 
     /// The deployment `init` creates, reached as the admin role `init`
@@ -1017,9 +1036,322 @@ max_connections = 10"#
     }
 }
 
+/// Split the keyspaces of a cluster into those `destroy` drops and those it
+/// leaves in place but names to the operator.
+///
+/// `destroy` drops a keyspace only when it is this deployment's catalog
+/// (`<prefix>_catalog`) or one of its account keyspaces (`<prefix>_account_`
+/// and a 12-digit account id). A keyspace that merely starts with `<prefix>_`
+/// belongs to something else: another deployment whose prefix begins with
+/// this one (`acme_test` beside `acme`), or a keyspace an operator created by
+/// hand. Dropping it loses data that no command of this deployment owns.
+/// A keyspace that does not start with `<prefix>_` is ignored without a
+/// word, as the system keyspaces are.
+///
+/// Each list keeps the order of `keyspaces`.
+fn split_keyspaces(keyspaces: Vec<String>, prefix: &str) -> (Vec<String>, Vec<String>) {
+    let start = format!("{prefix}_");
+    let mut owned = Vec::new();
+    let mut left_alone = Vec::new();
+    for keyspace in keyspaces {
+        if crate::migrations::is_deployment_keyspace(&keyspace, prefix) {
+            owned.push(keyspace);
+        } else if keyspace.starts_with(&start) {
+            left_alone.push(keyspace);
+        }
+    }
+    (owned, left_alone)
+}
+
+/// The `--keyspace-prefix` flag as `init` uses it: checked as typed, so an
+/// error shows what the operator wrote, and then in lower case (see
+/// `fold_keyspace_prefix`). The second value is the line to print when the
+/// fold changed the prefix.
+fn fold_prefix_flag(
+    flag: Option<&str>,
+) -> Result<(Option<String>, Option<String>), extenddb_storage::error::StorageError> {
+    let Some(given) = flag else {
+        return Ok((None, None));
+    };
+    check_name("the keyspace prefix (--keyspace-prefix)", given)?;
+    let folded = crate::config::fold_keyspace_prefix(given);
+    let note = (folded != given).then(|| {
+        format!(
+            "--- Keyspace prefix '{given}' is used as '{folded}': Cassandra stores a \
+             keyspace name in lower case."
+        )
+    });
+    Ok((Some(folded), note))
+}
+
+/// The end of `destroy`: wait with `wait` until the nodes agree on the
+/// schema, then print the summary.
+///
+/// When the wait fails after keyspaces were dropped, the error says so and
+/// says to run `destroy` again, which waits again. When nothing was dropped,
+/// the error says that and names the disagreement.
+async fn finish_destroy<W, Fut>(dropped: usize, left_alone: usize, wait: W) -> OpResult<()>
+where
+    W: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), extenddb_storage::migrations::MigrationError>>,
+{
+    wait().await.map_err(|e| {
+        OpError::Internal(if dropped > 0 {
+            format!(
+                "{dropped} keyspace(s) were dropped, but {e}; check the nodes \
+                 (`nodetool status`) and run `extenddb destroy` again to wait again"
+            )
+        } else {
+            format!("no keyspace was dropped, and {e}")
+        })
+    })?;
+    println!("{}", drop_summary(dropped, left_alone));
+    Ok(())
+}
+
+/// The line `destroy` prints for a keyspace that starts with `<prefix>_` and
+/// that it leaves in place.
+fn left_alone_line(keyspace: &str, prefix: &str) -> String {
+    format!(
+        "    Leaving keyspace {keyspace}: it starts with `{prefix}_` but is not this \
+         deployment's catalog or an account keyspace"
+    )
+}
+
+/// The last line `destroy` prints: how many keyspaces it dropped and left.
+/// It does not say "All ... dropped" when it found none to drop, because a
+/// wrong prefix or another cluster also finds none.
+fn drop_summary(dropped: usize, left_alone: usize) -> String {
+    match (dropped, left_alone) {
+        (0, 0) => "    No keyspace of this deployment found to drop".to_owned(),
+        (0, left) => format!(
+            "    No keyspace of this deployment found to drop. {left} other keyspace(s) left in place"
+        ),
+        (_, 0) => "    All ExtendDB keyspaces dropped".to_owned(),
+        (_, left) => {
+            format!("    ExtendDB keyspaces dropped. {left} other keyspace(s) left in place")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::CassandraBootstrapper;
+    use super::{
+        CassandraBootstrapper, drop_summary, finish_destroy, fold_prefix_flag, left_alone_line,
+        split_keyspaces,
+    };
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn destroy_names_each_keyspace_it_leaves_and_counts_them() {
+        assert_eq!(
+            left_alone_line("cui_reports", "cui"),
+            "    Leaving keyspace cui_reports: it starts with `cui_` but is not this \
+             deployment's catalog or an account keyspace"
+        );
+        assert_eq!(drop_summary(2, 0), "    All ExtendDB keyspaces dropped");
+        assert_eq!(
+            drop_summary(2, 3),
+            "    ExtendDB keyspaces dropped. 3 other keyspace(s) left in place"
+        );
+        assert_eq!(
+            drop_summary(0, 1),
+            "    No keyspace of this deployment found to drop. 1 other keyspace(s) left in place"
+        );
+    }
+
+    /// A destroy that finds nothing of the deployment does not report that
+    /// keyspaces were dropped, with or without keyspaces left in place. A
+    /// wrong prefix or another cluster finds nothing too.
+    #[test]
+    fn destroy_that_drops_nothing_does_not_say_it_dropped() {
+        for left in [0, 3] {
+            let line = drop_summary(0, left);
+            assert!(!line.contains("All"), "{line}");
+            assert!(!line.contains("keyspaces dropped"), "{line}");
+            assert!(
+                line.starts_with("    No keyspace of this deployment"),
+                "{line}"
+            );
+        }
+    }
+
+    /// `--keyspace-prefix` is checked as typed and then lower-cased, and the
+    /// operator is told when it changed.
+    #[test]
+    fn the_prefix_flag_is_checked_as_typed_then_lower_cased() {
+        assert_eq!(fold_prefix_flag(None).expect("no flag"), (None, None));
+        assert_eq!(
+            fold_prefix_flag(Some("acme_1")).expect("lower case"),
+            (Some("acme_1".to_owned()), None)
+        );
+        let (prefix, note) = fold_prefix_flag(Some("Acme_1")).expect("mixed case");
+        assert_eq!(prefix.as_deref(), Some("acme_1"));
+        let note = note.expect("a note");
+        assert!(
+            note.contains("'Acme_1'") && note.contains("'acme_1'"),
+            "{note}"
+        );
+        // The error shows what the operator typed, not the lower-case form.
+        let err = format!(
+            "{:?}",
+            fold_prefix_flag(Some("Acme-1")).expect_err("a dash")
+        );
+        assert!(err.contains("Acme-1") && !err.contains("acme-1"), "{err}");
+    }
+
+    /// `destroy` waits for the nodes to agree on the schema, once, whether it
+    /// dropped keyspaces or found none: a second run after a wait that timed
+    /// out finds nothing to drop, and the nodes may still disagree.
+    #[tokio::test]
+    async fn destroy_waits_for_the_nodes_to_agree_on_every_run() {
+        for (dropped, left_alone) in [(3, 0), (2, 1), (0, 0), (0, 2)] {
+            let waits = std::cell::Cell::new(0);
+            let result = finish_destroy(dropped, left_alone, || {
+                waits.set(waits.get() + 1);
+                async { Ok(()) }
+            })
+            .await;
+            assert!(result.is_ok(), "{result:?}");
+            assert_eq!(waits.get(), 1, "dropped {dropped}, left {left_alone}");
+        }
+    }
+
+    /// A wait that fails is an error that says the keyspaces were dropped and
+    /// says what to do.
+    #[tokio::test]
+    async fn destroy_whose_wait_fails_says_the_keyspaces_were_dropped() {
+        let result = finish_destroy(2, 0, || async {
+            Err(extenddb_storage::migrations::MigrationError::Store(
+                "the live Cassandra nodes did not agree on the schema within 30 s: n1".to_owned(),
+            ))
+        })
+        .await;
+        let message = format!("{:?}", result.expect_err("an error"));
+        assert!(
+            message
+                .contains("2 keyspace(s) were dropped, but the live Cassandra nodes did not agree")
+                && message.contains("run `extenddb destroy` again"),
+            "{message}"
+        );
+    }
+
+    /// A wait that fails when nothing was dropped does not say that
+    /// keyspaces were dropped.
+    #[tokio::test]
+    async fn destroy_that_dropped_nothing_does_not_say_it_dropped_keyspaces() {
+        let result = finish_destroy(0, 1, || async {
+            Err(extenddb_storage::migrations::MigrationError::Store(
+                "the live Cassandra nodes did not agree on the schema within 30 s: n1".to_owned(),
+            ))
+        })
+        .await;
+        let message = format!("{:?}", result.expect_err("an error"));
+        assert!(
+            message.contains("no keyspace was dropped, and the live Cassandra nodes did not agree")
+                && !message.contains("were dropped"),
+            "{message}"
+        );
+    }
+
+    /// The keyspaces of issue #645: the deployment `cui` beside a second
+    /// deployment (`cui_test`) and a keyspace made by hand (`cui_reports`).
+    #[test]
+    fn destroy_keeps_the_keyspaces_of_another_deployment_with_the_same_start() {
+        let (owned, left_alone) = split_keyspaces(
+            names(&[
+                "cui_catalog",
+                "cui_account_346032218963",
+                "cui_reports",
+                "cui_test_account_123456789012",
+                "cui_test_catalog",
+                "system",
+                "system_schema",
+            ]),
+            "cui",
+        );
+        assert_eq!(owned, names(&["cui_catalog", "cui_account_346032218963"]));
+        assert_eq!(
+            left_alone,
+            names(&[
+                "cui_reports",
+                "cui_test_account_123456789012",
+                "cui_test_catalog"
+            ])
+        );
+    }
+
+    /// A deployment whose prefix is `acme_account` has `acme_account_catalog`
+    /// and `acme_account_account_<id>`. Neither is the deployment `acme`'s.
+    #[test]
+    fn destroy_keeps_a_deployment_whose_prefix_continues_with_account() {
+        let (owned, left_alone) = split_keyspaces(
+            names(&[
+                "acme_catalog",
+                "acme_account_catalog",
+                "acme_account_account_123456789012",
+                "acme_account_123456789012",
+            ]),
+            "acme",
+        );
+        assert_eq!(owned, names(&["acme_catalog", "acme_account_123456789012"]));
+        assert_eq!(
+            left_alone,
+            names(&["acme_account_catalog", "acme_account_account_123456789012"])
+        );
+    }
+
+    /// An account keyspace needs a 12-digit id. The management API and the
+    /// console require it of every account.
+    #[test]
+    fn destroy_keeps_a_keyspace_whose_account_id_is_not_twelve_digits() {
+        let (owned, left_alone) = split_keyspaces(
+            names(&[
+                "acme_account_12345",
+                "acme_account_1234567890123",
+                "acme_account_12345678901a",
+                "acme_account_",
+            ]),
+            "acme",
+        );
+        assert!(owned.is_empty(), "{owned:?}");
+        assert_eq!(left_alone.len(), 4, "{left_alone:?}");
+    }
+
+    /// `split_keyspaces` takes the prefix as given. A prefix that ends in
+    /// `_catalog` is not shortened (the catalog keyspace of prefix
+    /// `a_catalog` is `a_catalog_catalog`). That `drop_databases` passes the
+    /// configured prefix, and does not cut every trailing `_catalog` off the
+    /// catalog keyspace name as it did before, is tested by
+    /// `destroy_uses_the_configured_prefix_when_it_ends_in_catalog` in
+    /// `tests/migrations.rs`, which needs a node.
+    #[test]
+    fn split_keyspaces_takes_the_prefix_whole_when_it_ends_in_catalog() {
+        let (owned, left_alone) = split_keyspaces(
+            names(&[
+                "a_catalog_catalog",
+                "a_catalog_account_123456789012",
+                "a_users",
+            ]),
+            "a_catalog",
+        );
+        assert_eq!(
+            owned,
+            names(&["a_catalog_catalog", "a_catalog_account_123456789012"])
+        );
+        assert!(left_alone.is_empty(), "{left_alone:?}");
+    }
+
+    #[test]
+    fn destroy_of_an_empty_cluster_drops_and_names_nothing() {
+        assert_eq!(
+            split_keyspaces(Vec::new(), "acme"),
+            (Vec::new(), Vec::new())
+        );
+    }
 
     #[test]
     fn backend_config_section_uses_actual_keyspace_prefix() {

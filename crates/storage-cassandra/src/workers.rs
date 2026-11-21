@@ -185,11 +185,14 @@ pub(crate) async fn poll_transaction_recovery(
     }
 }
 
-/// List all account keyspaces for this engine (keyspaces matching `{prefix}_account_*`).
+/// List the account keyspaces of this engine's deployment:
+/// `<keyspace_prefix>_account_` and a 12-digit account id. A keyspace of
+/// another deployment whose prefix starts with this one's, such as
+/// `acme_account_catalog` beside the deployment `acme`, is not listed. The
+/// workers would otherwise run their statements in it.
 pub(crate) async fn list_account_keyspaces(
     engine: &CassandraEngine,
 ) -> Result<Vec<String>, extenddb_storage::error::StorageError> {
-    let prefix = format!("{}_account_", engine.keyspace_prefix);
     let rows: Vec<cdrs_tokio::types::rows::Row> = crate::cassandra_util::system_read(
         &engine.session,
         "SELECT keyspace_name FROM system_schema.keyspaces",
@@ -199,16 +202,36 @@ pub(crate) async fn list_account_keyspaces(
     .await?;
 
     use cdrs_tokio::types::IntoRustByName as _;
-    let mut keyspaces = Vec::new();
-    for row in rows {
+    let names = rows.iter().filter_map(|row| {
         let name: Result<String, _> = row.get_r_by_name("keyspace_name");
-        if let Ok(name) = name
-            && name.starts_with(&prefix)
-        {
-            keyspaces.push(name);
-        }
-    }
-    Ok(keyspaces)
+        name.ok()
+    });
+    Ok(account_keyspaces_among(names, &engine.keyspace_prefix))
+}
+
+/// [`list_account_keyspaces`], for the integration tests that check which
+/// keyspaces the workers run in.
+///
+/// # Errors
+/// Returns an error if the listing query fails.
+#[cfg(any(test, feature = "test-util"))]
+#[doc(hidden)]
+pub async fn list_account_keyspaces_for_tests(
+    engine: &CassandraEngine,
+) -> Result<Vec<String>, extenddb_storage::error::StorageError> {
+    list_account_keyspaces(engine).await
+}
+
+/// The names in `keyspaces` that are account keyspaces of the deployment of
+/// `keyspace_prefix`, in the order given.
+fn account_keyspaces_among(
+    keyspaces: impl IntoIterator<Item = String>,
+    keyspace_prefix: &str,
+) -> Vec<String> {
+    keyspaces
+        .into_iter()
+        .filter(|name| crate::migrations::is_account_keyspace(name, keyspace_prefix))
+        .collect()
 }
 
 async fn read_control_plane_delay<S: SettingsStore + ?Sized>(store: &S) -> f64 {
@@ -998,6 +1021,8 @@ pub(crate) fn is_table_not_found(err: &extenddb_storage::error::StorageError) ->
 mod tests {
     use std::time::Duration;
 
+    use super::account_keyspaces_among;
+
     use extenddb_storage::management_store::{OpResult, SettingsStore};
     use futures::future::BoxFuture;
     use tokio::time::Instant;
@@ -1136,5 +1161,28 @@ mod tests {
             None
         );
         assert_eq!(read(Vec::new()).await, None);
+    }
+
+    /// The workers run statements in each keyspace of this list, so it holds
+    /// only the account keyspaces of this deployment (#645). The deployment
+    /// `acme_account` shares the cluster with `acme`.
+    #[test]
+    fn the_account_keyspaces_are_those_of_this_deployment_only() {
+        let all = [
+            "system",
+            "acme_catalog",
+            "acme_account_123456789012",
+            "acme_account_999999999999",
+            "acme_account_catalog",
+            "acme_account_account_123456789012",
+            "acme_account_12345",
+            "acme_test_account_123456789012",
+            "other_account_123456789012",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            account_keyspaces_among(all, "acme"),
+            ["acme_account_123456789012", "acme_account_999999999999"]
+        );
     }
 }
