@@ -62,7 +62,7 @@ Content-Length: <n>
 - REQ-WIRE-004: Parse `Authorization` header for SigV4 authentication
 - REQ-WIRE-005: Parse `X-Amz-Date` header for request timestamp validation
 - REQ-WIRE-006: Support `Accept-Encoding: gzip` and return compressed responses
-- REQ-WIRE-007: Return `UnknownOperationException` (HTTP 404) for unrecognized operations
+- REQ-WIRE-007: Return `UnknownOperationException` (HTTP 400) for unrecognized operations
 
 ### 2.2 HTTP Response Format
 
@@ -108,7 +108,7 @@ Error responses must be byte-for-byte compatible with DynamoDB:
 | `AccessDeniedException` | 400 | IAM policy denies the action |
 | `ConditionalCheckFailedException` | 400 | Condition expression evaluates to false |
 | `IdempotentParameterMismatchException` | 400 | TransactWriteItems with same client token but different params |
-| `IncompleteSignature` | 403 | SigV4 Authorization header is malformed |
+| `IncompleteSignature` | 400 | SigV4 Authorization header is malformed |
 | `InternalServerError` | 500 | Unhandled server error |
 | `ItemCollectionSizeLimitExceededException` | 400 | Item collection exceeds 10 GB (tables with LSIs) |
 | `MalformedHttpRequestException` | 400 | Request body cannot be decompressed or parsed |
@@ -125,8 +125,8 @@ Error responses must be byte-for-byte compatible with DynamoDB:
 | `TransactionCanceledException` | 400 | Transaction cancelled due to condition failure or conflict |
 | `TransactionConflictException` | 400 | Concurrent transaction conflict on same item |
 | `TransactionInProgressException` | 400 | Transaction with same client token already in progress |
-| `UnknownOperationException` | 404 | Unrecognized operation in X-Amz-Target |
-| `UnrecognizedClientException` | 403 | Invalid access key or signature mismatch |
+| `UnknownOperationException` | 400 | Unrecognized operation in X-Amz-Target |
+| `UnrecognizedClientException` | 400 | Invalid access key or signature mismatch |
 | `ValidationException` | 400 | Input validation failure (bad table name, missing required field, etc.) |
 
 ## 3. Functional Requirements — Operations
