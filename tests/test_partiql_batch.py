@@ -998,6 +998,9 @@ def test_an_index_key_change_reports_the_index_units(dynamodb_client, gtable):
          (3.0, None, None)),
         ([UPDATE_A, "UPDATE {t} SET a.b = 1 WHERE pk = '{ok2}' AND sk = 'b'"], "TOTAL",
          (3.0, None, None)),
+        # Measured 2026-11-20.
+        ([UPDATE_A, "UPDATE {t} SET a = z + gs WHERE pk = '{ok2}' AND sk = 'b'"], "TOTAL",
+         (3.0, None, None)),
         ([UPDATE_A, "UPDATE {t} SET pk = 'z' WHERE pk = '{ok2}' AND sk = 'b'"], "TOTAL",
          (2.0, None, None)),
         ([UPDATE_A, "UPDATE {t} SET g = 1 WHERE pk = '{ok2}' AND sk = 'b'"], "TOTAL",
@@ -1019,6 +1022,7 @@ def test_an_index_key_change_reports_the_index_units(dynamodb_client, gtable):
         "failed-delete-condition",
         "operand-type",
         "document-path",
+        "absent-attribute",
         "key-update-is-not-charged",
         "index-key-type-is-not-charged",
         "deletes",
