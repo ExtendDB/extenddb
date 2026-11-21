@@ -525,7 +525,7 @@ fn bare(message: String) -> DynamoDbError {
 }
 
 /// A message with the prefix `PutItem`, `UpdateItem` and `DeleteItem` use.
-fn single_write(message: String) -> DynamoDbError {
+pub fn single_write(message: String) -> DynamoDbError {
     DynamoDbError::ValidationException(format!("{SINGLE_WRITE_PREFIX}{message}"))
 }
 
