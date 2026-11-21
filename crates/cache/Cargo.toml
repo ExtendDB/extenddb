@@ -16,8 +16,9 @@ homepage.workspace = true
 test-util = []
 
 [dependencies]
-# `web-time` is a drop-in replacement for `std::time` that also compiles on
-# wasm32; on every target except wasm32-unknown-unknown it is
+# `web-time` is a drop-in replacement for `std::time` that also works on
+# wasm32-unknown-unknown; on every target except those where
+# `target_family = "wasm"` and `target_os = "unknown"` it is
 # `pub use std::time::*`.
 web-time = { workspace = true }
 moka = { workspace = true }
