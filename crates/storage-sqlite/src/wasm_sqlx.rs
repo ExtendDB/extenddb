@@ -66,6 +66,10 @@
 //!   [`SqlitePool::close`] they fail with [`Error::PoolClosed`]. A `begin_with`
 //!   statement that leaves the connection in autocommit mode fails with
 //!   [`Error::BeginFailed`].
+//! * **Connection settings.** A connection opens with a 5 s busy timeout and
+//!   with foreign keys enforced (`PRAGMA foreign_keys = ON`), as
+//!   `sqlx-sqlite`'s default connect options set them on every connection it
+//!   opens.
 //! * **Connect options.** Parsing a [`SqliteConnectOptions`] removes leading
 //!   `sqlite://` and `sqlite:` schemes, takes what follows the first `?` as
 //!   form-encoded query parameters, and percent-decodes the rest into the file
@@ -339,7 +343,8 @@ fn autocommit(handle: &Handle) -> bool {
     unsafe { ffi::sqlite3_get_autocommit(handle.db) != 0 }
 }
 
-/// Open the database `options` name and return the shared handle.
+/// Open the database `options` name and return the shared handle, with a
+/// 5 s busy timeout and foreign keys enforced.
 fn open(options: &SqliteConnectOptions) -> Result<Handle, Error> {
     let filename = if options.in_memory {
         Cow::Borrowed(":memory:")
@@ -367,6 +372,17 @@ fn open(options: &SqliteConnectOptions) -> Result<Handle, Error> {
     if rc != ffi::SQLITE_OK {
         return Err(db_error(db));
     }
+    // Unless its options say otherwise, `sqlx-sqlite` gives every connection
+    // it opens a 5 s busy timeout, set through the C API, and
+    // `PRAGMA foreign_keys = ON`, one of its default pragmas. SQLite leaves
+    // foreign keys off unless it is built with `SQLITE_DEFAULT_FOREIGN_KEYS`,
+    // which `sqlite-wasm-rs` does not set.
+    // SAFETY: `db` is the live handle opened above.
+    let rc = unsafe { ffi::sqlite3_busy_timeout(db, 5_000) };
+    if rc != ffi::SQLITE_OK {
+        return Err(db_error(db));
+    }
+    run_exec(&handle, "PRAGMA foreign_keys = ON")?;
     Ok(handle)
 }
 

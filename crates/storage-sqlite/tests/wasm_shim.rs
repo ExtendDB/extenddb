@@ -855,6 +855,39 @@ fn cases() -> Vec<Case> {
              parsing connection URL",
             |_pool| filename("sqlite://x?a+b=1")
         ),
+        // ── connection settings ──
+        row!("a connection's busy timeout", "Ok(5000)", |pool| render(
+            sqlx::query_scalar::<_, i64>("PRAGMA busy_timeout")
+                .fetch_one(&pool)
+                .await
+        )),
+        row!(
+            "a connection enforces foreign keys",
+            "Ok(1)",
+            |pool| render(
+                sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+                    .fetch_one(&pool)
+                    .await
+            )
+        ),
+        row!(
+            "an insert that breaks a foreign key",
+            "Err[Database] error returned from database: (code: 787) FOREIGN KEY constraint failed",
+            |pool| {
+                sqlx::raw_sql(
+                    "CREATE TABLE p (id INTEGER PRIMARY KEY); \
+                     CREATE TABLE c (pid INTEGER REFERENCES p (id))",
+                )
+                .execute(&pool)
+                .await?;
+                render(
+                    sqlx::query("INSERT INTO c (pid) VALUES (1)")
+                        .execute(&pool)
+                        .await
+                        .map(drop),
+                )
+            }
+        ),
     ]
 }
 
