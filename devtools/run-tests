@@ -114,10 +114,13 @@ Suites (at least one required):
                     binary, and downloads the AWS provider; not part of --all)
   --all             all suites above except --terraform
   --catalog-check   post-test catalog integrity check
-  --wasm            wasm32 build and clippy of the WebAssembly adapter crate,
-                    with the disallowed-methods list of devtools/wasm-clippy
-                    and its self-test. Standalone: needs no server, target
-                    flag or credentials; writes discussions/test-wasm-<hash>.txt.
+  --wasm            the build, clippy and guard steps of the WebAssembly
+                    workflow: wasm32 build, clippy with the disallowed-methods
+                    list of devtools/wasm-clippy, its self-test, and the
+                    adapter's pedantic clippy, on the workflow's pinned
+                    toolchain when rustup is installed. Standalone: needs no
+                    server, target flag or credentials; writes
+                    discussions/test-wasm-<hash>.txt.
                     Override the crate with EXTENDDB_WASM_PKG
                     (default: extenddb-wasm-adapter)
   --headless        build the wasm-pack --target web module and run the shared
@@ -385,39 +388,91 @@ finish_if_only_wasm_suites_left() {
 }
 
 # --- WebAssembly adapter build check (standalone) ---------------------------
-# The WebAssembly build compiles the engine + adapter to wasm32. This suite is
-# the build, the wasm32 clippy step with the disallowed-methods list of
-# devtools/wasm-clippy, and that list's self-test, as the WebAssembly CI
-# workflow runs them.
+# The build, clippy and guard steps of .github/workflows/wasm.yml, which is the
+# source of this list: the wasm32 build, the wasm32 clippy step with the
+# disallowed-methods list of devtools/wasm-clippy, that list's self-test, and
+# the adapter's pedantic clippy step. Keep the commands below in step with the
+# workflow's.
+#
+# Clippy's findings depend on its version, so when rustup is installed the
+# suite runs on the toolchain the workflow pins (its `toolchain:` value),
+# found through rustup's proxies even when another cargo comes first on PATH.
+# Without rustup it uses the cargo on PATH and says so.
+wasm_workflow_toolchain() {
+    sed -n 's/^[[:space:]]*toolchain:[[:space:]]*"\{0,1\}\([^"#[:space:]]*\)"\{0,1\}.*/\1/p' \
+        .github/workflows/wasm.yml | head -n 1
+}
 if $RUN_WASM; then
     WASM_PKG="${EXTENDDB_WASM_PKG:-extenddb-wasm-adapter}"
     WASM_OUTFILE="discussions/test-wasm-${HASH}.txt"
     echo "=== wasm32 build check: ${WASM_PKG} (target wasm32-unknown-unknown) ==="
+    WASM_RC=0
+    WASM_SAVED_PATH="$PATH"
+    WASM_SAVED_TOOLCHAIN="${RUSTUP_TOOLCHAIN-}"
+    WASM_SAVED_TOOLCHAIN_SET="${RUSTUP_TOOLCHAIN+set}"
+    WASM_TOOLCHAIN="$(wasm_workflow_toolchain)"
+    WASM_RUSTUP="$(command -v rustup || true)"
+    if [ -z "$WASM_RUSTUP" ] && [ -x "${CARGO_HOME:-$HOME/.cargo}/bin/rustup" ]; then
+        WASM_RUSTUP="${CARGO_HOME:-$HOME/.cargo}/bin/rustup"
+    fi
+    if [ -z "$WASM_TOOLCHAIN" ]; then
+        WASM_TOOLCHAIN_NOTE="no toolchain: value found in .github/workflows/wasm.yml; using the cargo on PATH"
+    elif [ -z "$WASM_RUSTUP" ]; then
+        WASM_TOOLCHAIN_NOTE="rustup not found; using the cargo on PATH, not the workflow's ${WASM_TOOLCHAIN}"
+    elif ! "$WASM_RUSTUP" run "$WASM_TOOLCHAIN" cargo --version >/dev/null 2>&1; then
+        WASM_TOOLCHAIN_NOTE="toolchain ${WASM_TOOLCHAIN} (from .github/workflows/wasm.yml) is not installed; run: rustup toolchain install ${WASM_TOOLCHAIN} --profile minimal --component clippy --target wasm32-unknown-unknown"
+        WASM_RC=1
+    else
+        # rustup's proxies (cargo, clippy-driver) honour RUSTUP_TOOLCHAIN; put
+        # them first so the self-test's `cargo` resolves to them too.
+        PATH="$(dirname "$WASM_RUSTUP"):$PATH"
+        export RUSTUP_TOOLCHAIN="$WASM_TOOLCHAIN"
+        WASM_TOOLCHAIN_NOTE="${WASM_TOOLCHAIN} via rustup (from .github/workflows/wasm.yml)"
+    fi
     {
         echo "WebAssembly adapter build check"
-        echo "target:  wasm32-unknown-unknown (in-memory SQLite in the browser)"
-        echo "package: ${WASM_PKG}"
-        echo "commit:  ${HASH}"
-        echo "date:    $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "target:    wasm32-unknown-unknown (in-memory SQLite in the browser)"
+        echo "package:   ${WASM_PKG}"
+        echo "commit:    ${HASH}"
+        echo "date:      $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "toolchain: ${WASM_TOOLCHAIN_NOTE}"
+        echo "cargo:     $(cargo --version 2>&1)"
         echo
     } > "$WASM_OUTFILE"
-    WASM_RC=0
-    echo "--- cargo build ---" | tee -a "$WASM_OUTFILE"
-    if ! cargo build --locked -p "$WASM_PKG" --target wasm32-unknown-unknown \
-        2>&1 | tee -a "$WASM_OUTFILE"; then
-        WASM_RC=1
+    echo "toolchain: ${WASM_TOOLCHAIN_NOTE}"
+    if [ "$WASM_RC" -eq 0 ]; then
+        echo "--- cargo build ---" | tee -a "$WASM_OUTFILE"
+        if ! cargo build --locked -p "$WASM_PKG" --target wasm32-unknown-unknown \
+            2>&1 | tee -a "$WASM_OUTFILE"; then
+            WASM_RC=1
+        fi
+        # The std and tokio methods listed in devtools/wasm-clippy/clippy.toml,
+        # called from workspace crates, that compile for wasm32 but panic, trap
+        # or never complete in a browser. Calls made inside dependencies are
+        # not seen.
+        echo "--- cargo clippy (devtools/wasm-clippy) ---" | tee -a "$WASM_OUTFILE"
+        if ! CLIPPY_CONF_DIR="$PROJECT_DIR/devtools/wasm-clippy" \
+            cargo clippy --locked -p "$WASM_PKG" --lib --target wasm32-unknown-unknown \
+            -- -D warnings 2>&1 | tee -a "$WASM_OUTFILE"; then
+            WASM_RC=1
+        fi
+        echo "--- clippy guard self-test ---" | tee -a "$WASM_OUTFILE"
+        if ! python3 devtools/check-wasm-clippy-guard 2>&1 | tee -a "$WASM_OUTFILE"; then
+            WASM_RC=1
+        fi
+        echo "--- cargo clippy (pedantic, --no-deps) ---" | tee -a "$WASM_OUTFILE"
+        if ! cargo clippy --locked --no-deps -p "$WASM_PKG" --lib --target wasm32-unknown-unknown \
+            -- -D warnings -W clippy::pedantic 2>&1 | tee -a "$WASM_OUTFILE"; then
+            WASM_RC=1
+        fi
+    else
+        echo "${WASM_TOOLCHAIN_NOTE}" | tee -a "$WASM_OUTFILE"
     fi
-    # The clock, thread, timer and task calls that compile for wasm32 but fail
-    # when they run in a browser, which the build cannot see.
-    echo "--- cargo clippy (devtools/wasm-clippy) ---" | tee -a "$WASM_OUTFILE"
-    if ! CLIPPY_CONF_DIR="$PROJECT_DIR/devtools/wasm-clippy" \
-        cargo clippy --locked -p "$WASM_PKG" --lib --target wasm32-unknown-unknown \
-        -- -D warnings 2>&1 | tee -a "$WASM_OUTFILE"; then
-        WASM_RC=1
-    fi
-    echo "--- clippy guard self-test ---" | tee -a "$WASM_OUTFILE"
-    if ! python3 devtools/check-wasm-clippy-guard 2>&1 | tee -a "$WASM_OUTFILE"; then
-        WASM_RC=1
+    PATH="$WASM_SAVED_PATH"
+    if [ -n "$WASM_SAVED_TOOLCHAIN_SET" ]; then
+        export RUSTUP_TOOLCHAIN="$WASM_SAVED_TOOLCHAIN"
+    else
+        unset RUSTUP_TOOLCHAIN
     fi
     if [ "$WASM_RC" -eq 0 ]; then
         echo "RESULT: PASS" | tee -a "$WASM_OUTFILE"
