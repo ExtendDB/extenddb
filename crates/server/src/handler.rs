@@ -88,8 +88,11 @@ pub(crate) async fn handle_request(
     // (empty body, invalid JSON), before checking authentication: an unknown
     // operation returns UnknownOperationException even without auth headers,
     // and a malformed request gets 400 regardless of auth state. The engine
-    // owns these checks and their order, so every entry point applies the same
-    // ones.
+    // owns these two checks and their order, and the WebAssembly adapter calls
+    // them too. The server's own request checks, which the adapter does not
+    // apply, include the body cap above, authentication below, the table
+    // name, ARN, cross-account and GetRecords iterator checks in
+    // `authorize_request`, and throttling.
     let request = match extenddb_engine::parse_request(&operation, &body) {
         Ok(request) => request,
         Err(e) => return error_response(&e, &request_id),
