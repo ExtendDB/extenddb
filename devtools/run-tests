@@ -721,9 +721,9 @@ if $RUN_WASM_TEST; then
     else
         echo "runner:    ${WASM_TEST_RUNNER}" | tee -a "$WASM_TEST_OUTFILE"
         # The suites run through devtools/run-wasm-test-suite, as the workflow
-        # runs them: it fails a suite whose run passed fewer tests than the
-        # suite has, or not the shim's table test, where a bare `cargo test`
-        # exits 0.
+        # runs them: it fails a suite unless the run reports each test the
+        # suite names `ok` and no other test, where a bare `cargo test` can
+        # exit 0 with tests missing.
         for suite in core shim; do
             echo "--- ${suite} (devtools/run-wasm-test-suite ${suite}) ---" | tee -a "$WASM_TEST_OUTFILE"
             if ! CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="$WASM_TEST_RUNNER" \

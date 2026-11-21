@@ -3,7 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Runs one of the wasm-bindgen-test suites of .github/workflows/wasm.yml and
-# fails unless the tests it exists to run ran and passed.
+# fails unless the run reports each test the suite names below `ok`, and no
+# other test.
 #
 #   devtools/run-wasm-test-suite core|shim
 #
@@ -11,14 +12,11 @@
 #   shim  the SQLite shim's tests (cargo test -p extenddb-storage-sqlite
 #         --test wasm_shim)
 #
-# `cargo test` exits 0 when a test binary holds no test: it prints "no tests to
-# run!" when every case lost its `wasm_bindgen_test` attribute, and passes
-# with the rest when some did. So besides cargo's exit status this script
-# requires the run's one "test result:" line to report no failure and at least
-# the suite's minimum number of passed tests, and requires each test the suite
-# names below to be reported "ok". A change that adds tests to a suite can
-# raise its minimum; one that removes or renames a counted or named test
-# changes the minimum or the name here with it.
+# `cargo test` exits 0 when a test binary holds no test, and passes with the
+# rest when some tests lost their `wasm_bindgen_test` attribute, so its exit
+# status is not enough. Each suite below names every one of its wasm tests, as
+# the runner reports it; a change that adds, renames or removes a wasm test of
+# a suite adds, renames or removes its line here.
 #
 # The workflow and `devtools/run-tests --wasm-test` both run the suites through
 # this script, so the expectations exist once. The caller sets
@@ -38,17 +36,29 @@ case "$1" in
     core)
         args=(-p extenddb-core --lib)
         # The nine cases of the crypto backend (src/crypto.rs) and the test of
-        # limits::page_size (src/limits/mod.rs). No one of them holds the
-        # others' cases, as the shim's table does, so the count is the check.
-        minimum=10
-        required=()
+        # limits::page_size (src/limits/mod.rs).
+        tests=(
+            crypto::tests::constant_time_eq_compares_contents_and_length
+            crypto::tests::fill_random_produces_distinct_buffers
+            crypto::tests::hmac_sha256_rfc4231_case2
+            crypto::tests::open_decrypts_aws_lc_sealed_vector
+            crypto::tests::open_decrypts_historical_aes_gcm_vector
+            crypto::tests::open_rejects_input_too_short
+            crypto::tests::open_rejects_wrong_aad_wrong_key_and_tampering
+            crypto::tests::seal_open_round_trip_with_fresh_nonce
+            crypto::tests::sha256_known_vector
+            limits::tests::page_size_is_at_least_one_and_never_below_the_limit_it_can_hold
+        )
         ;;
     shim)
         args=(-p extenddb-storage-sqlite --test wasm_shim)
         # The table of the shim's rules and the two tests that drive the
-        # backend. The table holds every rule, so it is also named.
-        minimum=3
-        required=(each_row_gives_its_expected_outcome)
+        # backend (tests/wasm_shim.rs).
+        tests=(
+            a_scan_limit_above_u32_max_returns_every_item
+            an_update_table_that_creates_a_vector_index
+            each_row_gives_its_expected_outcome
+        )
         ;;
     *)
         usage
@@ -81,18 +91,29 @@ results="$(grep -c '^test result: ' <<<"$output" || true)"
 if [ "$results" -ne 1 ]; then
     problems+=("expected one 'test result:' line, found ${results}")
 else
-    passed="$(sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed; 0 failed;.*$/\1/p' <<<"$output")"
-    if [ -z "$passed" ]; then
-        problems+=("the run did not pass: $(grep '^test result: ' <<<"$output")")
-    elif [ "$passed" -lt "$minimum" ]; then
-        problems+=("${passed} tests passed; the ${suite} suite has at least ${minimum}")
-    fi
+    line="$(grep '^test result: ' <<<"$output")"
+    case "$line" in
+        "test result: ok. ${#tests[@]} passed; 0 failed;"*) ;;
+        *) problems+=("expected 'test result: ok. ${#tests[@]} passed; 0 failed;', found '${line}'") ;;
+    esac
 fi
-for name in ${required[@]+"${required[@]}"}; do
-    if ! grep -qxF "test ${name} ... ok" <<<"$output"; then
-        problems+=("the test ${name} was not reported ok")
+# One "<name> <state>" line per test the run reports, and the lines the suite
+# expects, each sorted the same way for comm.
+reported="$(sed -n 's/^test \(.*\) \.\.\. \([^ ]*\)$/\1 \2/p' <<<"$output" | LC_ALL=C sort)"
+expected="$(printf '%s ok\n' "${tests[@]}" | LC_ALL=C sort)"
+while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    name="${line% ok}"
+    state="$(awk -v n="$name" '$1 == n { print $2; exit }' <<<"$reported")"
+    problems+=("the test ${name} was ${state:+reported }${state:-not run}")
+done < <(LC_ALL=C comm -23 <(printf '%s\n' "$expected") <(printf '%s\n' "$reported"))
+while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    name="${line% *}"
+    if ! grep -qxF -- "$name" < <(printf '%s\n' "${tests[@]}"); then
+        problems+=("the run reported ${line##* } for ${name}, a test the ${suite} suite here does not name")
     fi
-done
+done < <(LC_ALL=C comm -13 <(printf '%s\n' "$expected") <(printf '%s\n' "$reported"))
 
 if [ ${#problems[@]} -ne 0 ]; then
     for problem in "${problems[@]}"; do
@@ -100,4 +121,4 @@ if [ ${#problems[@]} -ne 0 ]; then
     done
     exit 1
 fi
-echo "${suite} suite: ${passed} tests passed (at least ${minimum})${required[0]:+, including ${required[*]}}"
+echo "${suite} suite: ${#tests[@]} tests passed, the ${#tests[@]} it names, and no other test ran"
