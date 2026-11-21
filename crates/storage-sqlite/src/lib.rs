@@ -28,8 +28,9 @@
 //!    the shim does not provide, or an item that rule 1 or 2 removes):
 //!    `#[cfg(not(target_arch = "wasm32"))]` on the smallest item that fails,
 //!    the `mod` line where a whole module does, with a one-line reason.
-//! 2. **Compiles for wasm32, but no wasm32 code calls it** (the dead-code lint
-//!    reports it there): removed the same way, together with its callers, with
+//! 2. **Compiles for wasm32, and the dead-code lint reports it there** (no
+//!    wasm32 code calls it, and it is not part of the crate's public API):
+//!    removed the same way, together with its callers, with
 //!    a one-line reason. Only where removing it would put a `cfg` into code
 //!    both builds run, such as a field that a constructor both builds run
 //!    sets, does it carry
