@@ -124,14 +124,6 @@ mod restore_engine;
 #[cfg(test)]
 mod restore_job_tests;
 mod schema;
-#[cfg(not(target_arch = "wasm32"))]
-mod serve_lock;
-// The browser build owns a single in-memory database and takes no file lock;
-// `serve_lock`'s `flock(2)` guard has no meaning there. This floor provides the
-// in-memory location classifier and the lock-field type name the shared engine
-// code references.
-#[cfg(target_arch = "wasm32")]
-#[path = "serve_lock_wasm.rs"]
 mod serve_lock;
 // Table snapshots copy the database file on disk (`std::fs`, `std::os::unix`),
 // which the browser's in-memory build cannot do; the `SnapshotEngine` subtrait
