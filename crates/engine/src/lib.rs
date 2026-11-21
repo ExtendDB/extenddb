@@ -19,6 +19,8 @@ pub use backup::{
 mod batch_get_item;
 mod batch_write_item;
 pub mod capacity_helpers;
+#[cfg(all(test, feature = "partiql"))]
+mod conditional_operator_tests;
 mod create_table;
 mod delete_item;
 mod delete_table;
@@ -229,6 +231,23 @@ pub(crate) fn deserialize_error(e: serde_json::Error) -> DynamoDbError {
         DynamoDbError::SerializationException(format!(
             "Start of structure or map found where not expected: {e}"
         ))
+    }
+}
+
+/// [`deserialize_error`] for Query and Scan, which send a refused
+/// `ConditionalOperator` as the enum clause alone. PutItem, UpdateItem and
+/// DeleteItem keep the "1 validation error detected: " envelope the type's
+/// `Deserialize` impl writes. Measured 2026-11-13 and 2026-11-14 (us-east-1).
+pub(crate) fn query_scan_deserialize_error(e: serde_json::Error) -> DynamoDbError {
+    match deserialize_error(e) {
+        DynamoDbError::ValidationException(msg) if msg.contains("at 'conditionalOperator'") => {
+            DynamoDbError::ValidationException(
+                msg.strip_prefix("1 validation error detected: ")
+                    .unwrap_or(&msg)
+                    .to_owned(),
+            )
+        }
+        other => other,
     }
 }
 
