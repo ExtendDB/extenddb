@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # Copyright 2026 ExtendDB contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Check the wasm32 clippy guard: its configuration, the lint settings that
-could switch it off, and that it refuses a call to each entry.
+"""Check the wasm32 clippy guard: its configuration, the settings that could
+switch it off, and that it refuses a call to each entry.
 
 The guard is the clippy step of the WebAssembly workflow, run with
 CLIPPY_CONF_DIR pointing at devtools/wasm-clippy, whose clippy.toml lists
@@ -26,22 +26,34 @@ fails, with one line per problem, unless all of these hold:
    entry is a table with a `path` and a `reason` and nothing else; no path is
    listed twice; each entry has a probe below and each probe names an entry.
 2. In the crates the wasm build compiles (extenddb-wasm-adapter and the
-   workspace crates it depends on for wasm32, read from `cargo metadata`), no
-   source file under src/ allows, expects or warns clippy::all,
-   clippy::style, clippy::suspicious or warnings, nor clippy::await_holding_lock
-   or clippy::await_holding_refcell_ref with or without a reason; none warns
-   clippy::disallowed_methods or clippy::disallowed_types (or their former
-   names), and none allows or expects one of those two without a `reason`
-   that holds more than whitespace. A lint named with a raw identifier
-   (`clippy::r#all`) is read as rustc reads it, as the plain name. The one
-   exception is a catalog migration's code-body module: CONTRIBUTING.md
-   ("Adding a catalog migration") declares each one, in src/migrations/mod.rs,
-   with #[rustfmt::skip] and #[allow(clippy::all, deprecated)], because its
-   body is checksummed once released and no lint may ask for an edit. An allow
-   of clippy::all is accepted only in that exact form, on a `mod mNNNN_<name>;`
-   line of a src/migrations/mod.rs whose src/migrations/mNNNN_<name>.rs
-   exists; the guard does not see those bodies, and the headless parity
-   corpus runs every migration when it creates an engine. The `[lints]`
+   workspace crates it depends on for wasm32, read from `cargo metadata`), the
+   script runs the clippy step in the working tree and reads every file rustc
+   lists in each crate's dep-info: its source files wherever they are (a
+   module that #[path] names included), and every file that include!,
+   include_str! or include_bytes! reads, each read as Rust source; the
+   Cargo.toml and the clippy configuration that clippy adds there are left
+   out. A crate the step leaves no dep-info for, or a step that fails, is a
+   problem. In those files no attribute allows, expects or warns clippy::all,
+   clippy::style, clippy::suspicious or warnings, nor
+   clippy::await_holding_lock or clippy::await_holding_refcell_ref with or
+   without a reason; none warns clippy::disallowed_methods or
+   clippy::disallowed_types (or their former names), and none allows or
+   expects one of those two without a `reason` that holds more than
+   whitespace. An allow or expect of one of those two, with a reason, is
+   refused as an inner attribute (`#![...]`), which covers all of its
+   module, crate or function, and on a module, an impl block or a trait,
+   which covers every function in it; clippy.toml asks for it on the
+   function or the statement that needs it. A lint named with a raw
+   identifier (`clippy::r#all`) is read as rustc reads it, as the plain name.
+   The one exception is a catalog migration's code-body module:
+   CONTRIBUTING.md ("Adding a catalog migration") declares each one, in
+   src/migrations/mod.rs, with #[rustfmt::skip] and #[allow(clippy::all,
+   deprecated)], because its body is checksummed once released and no lint
+   may ask for an edit. An allow of clippy::all is accepted only in that
+   exact form, on a `mod mNNNN_<name>;` line of a src/migrations/mod.rs whose
+   src/migrations/mNNNN_<name>.rs exists; the guard does not see those
+   bodies, and the headless parity corpus runs every migration when it
+   creates an engine. The `[lints]`
    tables of those crates and the workspace's `[workspace.lints]` set none of
    these lints or groups to a level other than deny or forbid (a key spelt
    with hyphens is read with underscores, as rustc reads it). No `rustflags`
@@ -65,7 +77,8 @@ fails, with one line per problem, unless all of these hold:
    accept each one as the list says. FILE_PROBES adds to FILE_PROBE_CRATE, in
    a copy of the working tree, a module outside src/ that #[path] names and a
    file of another extension that include! reads, each with a lint setting
-   the scan must refuse; the scan must read and refuse both.
+   the scan must refuse; the scan, run on that copy, must read and refuse
+   both.
    Those functions read lint settings as they are written in the files and
    expand no macro: a setting that a macro builds from its input (for example
    `#[$level(clippy::all)]` in a macro_rules! body), or that a procedural
@@ -79,12 +92,13 @@ fails, with one line per problem, unless all of these hold:
    or not count, as refusing a probe, as the list says; a report at the
    warning level must not count.
 
-The copy is built with the caller's clippy.toml and the caller's cargo target
-directory, so cargo reuses what the clippy step already checked. Nothing in
-the caller's working tree is written. The copy is removed on exit, also on
-SIGINT, SIGTERM and SIGHUP, and the clippy run is stopped with it. Some
-probes reach the method through an import or a re-export
-(`use tokio::time; time::sleep`, `tokio::spawn`), as code usually does.
+The clippy step runs in the working tree and in the copy with the caller's
+clippy.toml and the caller's cargo target directory, so cargo reuses what the
+clippy step already checked. Nothing in the caller's working tree but that
+target directory is written. The copy is removed on exit, also on SIGINT,
+SIGTERM and SIGHUP, and a clippy run is stopped with it. Some probes reach
+the method through an import or a re-export (`use tokio::time; time::sleep`,
+`tokio::spawn`), as code usually does.
 
 Needs Python 3.11 or later (for tomllib) and git. Run from anywhere in the
 repository; exit status 0 means every check passed.
@@ -650,8 +664,41 @@ def attribute_problems(rel: str, text: str, used_migration: set) -> tuple[list[s
                     f"{empty}; it must name the callers and why none runs on wasm"
                 )
             elif disallowed:
-                reasoned += 1
+                inner = "!" in code[attribute.start() : attribute.end()]
+                covered = None if inner else _covered_item(code, end)
+                if inner or covered:
+                    where = (
+                        "an inner attribute, which covers all of the module, crate or function"
+                        " it is in"
+                        if inner
+                        else f"on {covered}, which covers every function in it"
+                    )
+                    problems.append(
+                        f"{rel}:{line}: {level}({', '.join(disallowed)}) is {where}; put it, as"
+                        " an outer attribute, on the function or the one statement that never"
+                        " runs on wasm"
+                    )
+                else:
+                    reasoned += 1
     return problems, reasoned
+
+
+# An item that an outer attribute covers as a whole, with every function in it:
+# a module, an impl block or a trait.
+_COVERING_ITEM = re.compile(
+    r"\s*(?:pub\s*(?:\([^)]*\))?\s*)?(?:(?:unsafe|auto|default)\s+)*(mod|impl|trait)\b"
+)
+_COVERING_NAMES = {"mod": "a module", "impl": "an impl block", "trait": "a trait"}
+
+
+def _covered_item(code: str, index: int) -> str | None:
+    """What an outer attribute ending at `index` is on, after any further
+    attributes, when that is a module, an impl block or a trait; None when it
+    is another item, a statement or an expression."""
+    while match := _NEXT_ATTRIBUTE.match(code, index):
+        index = _closing(code, match.end() - 1, "[", "]")
+    match = _COVERING_ITEM.match(code, index)
+    return _COVERING_NAMES[match.group(1)] if match else None
 
 
 _REASON = re.compile(r'\s*reason\s*=\s*(?:(r)(#*))?"')
@@ -852,34 +899,87 @@ def manifest_problems(crates: dict[str, dict], metadata: dict) -> list[str]:
 
 
 def compiled_files(
-    crates: dict[str, dict], root: Path
+    crates: dict[str, dict], root: Path, target_dir: str
 ) -> tuple[dict[str, list[Path]], list[str]]:
-    """The files of each crate that the lint-setting scan reads, in the tree at
-    `root` (the working tree or a copy of it), and the problems found: the
-    `.rs` files under each crate's src/ directory."""
-    files = {}
-    for name, package in crates.items():
-        source = root / Path(package["manifest_path"]).parent.relative_to(ROOT) / "src"
-        files[name] = sorted(source.rglob("*.rs"))
-    return files, []
+    """The files rustc reads to compile each of `crates`, and the problems
+    found. It runs the clippy step in the tree at `root` (the working tree or a
+    copy of it) and reads, for each crate, the dep-info file that rustc writes
+    next to the metadata file cargo's compiler-artifact record names: every
+    source file of the crate wherever it is (a module that #[path] names
+    included), every file include!, include_str! or include_bytes! reads, and
+    the Cargo.toml and the clippy configuration that clippy adds, which are
+    left out. rustc writes the dep-info of a crate whose lints then fail as
+    well, but cargo names no artifact for that crate, so it is not read. A
+    crate with no dep-info read is a problem, and so is a listed file that
+    does not exist."""
+    code, messages, artifacts, stderr = run_clippy(root, target_dir)
+    root = root.resolve()
+    by_manifest = {
+        Path(package["manifest_path"]).relative_to(ROOT): name for name, package in crates.items()
+    }
+    files, problems = {}, []
+    for artifact in artifacts:
+        manifest = Path(artifact["manifest_path"]).resolve()
+        if not manifest.is_relative_to(root) or "custom-build" in artifact["target"]["kind"]:
+            continue
+        name = by_manifest.get(manifest.relative_to(root))
+        for output in map(Path, artifact["filenames"] if name else []):
+            dep_info = output.with_name(output.name.removeprefix("lib")).with_suffix(".d")
+            if dep_info.is_file():
+                files[name] = dep_info_files(dep_info, root)
+                break
+    for name in sorted(set(crates) - set(files)):
+        problems.append(
+            f"{name}: the clippy step in {root} left no dep-info for it, so the files it"
+            " compiles were not read"
+        )
+    if code != 0:
+        errors = [m.get("rendered") or m["message"] for m in messages if m["level"] == "error"]
+        problems.append(
+            f"the clippy step failed in {root} (exit status {code}):\n"
+            + ("\n".join(errors) or stderr)
+        )
+    for name, paths in sorted(files.items()):
+        missing = [path for path in paths if not path.is_file()]
+        problems += [f"{path}: in the dep-info of {name}, but missing" for path in missing]
+    return files, problems
+
+
+def dep_info_files(dep_info: Path, root: Path) -> list[Path]:
+    """The files a rustc dep-info file lists, other than the Cargo.toml and
+    the clippy configuration that clippy adds to it. rustc writes a line
+    `<file>:` for each, with a space in the name written `\\ `; a relative
+    name is relative to `root`, where cargo ran rustc."""
+    found = []
+    for line in dep_info.read_text(encoding="utf-8").splitlines():
+        if line.startswith("#") or not line.endswith(":"):
+            continue
+        path = Path(os.path.normpath(root / line[:-1].replace("\\ ", " ")))
+        if path.name not in ("Cargo.toml", "clippy.toml", ".clippy.toml"):
+            found.append(path)
+    return found
 
 
 def lint_setting_problems(crates: dict[str, dict], metadata: dict) -> tuple[list[str], str]:
-    used_migration, reasoned, count = set(), 0, 0
-    files, problems = compiled_files(crates, ROOT)
-    for name in sorted(crates):
+    used_migration, reasoned, read = set(), 0, set()
+    files, problems = compiled_files(crates, ROOT, metadata["target_directory"])
+    for name in sorted(files):
         for path in files[name]:
-            rel = path.relative_to(ROOT).as_posix()
-            found, reasons = attribute_problems(
-                rel, path.read_text(encoding="utf-8"), used_migration
-            )
+            if path in read or not path.is_file():
+                continue
+            read.add(path)
+            rel = path.relative_to(ROOT).as_posix() if path.is_relative_to(ROOT) else str(path)
+            # A file include_str! or include_bytes! reads is read as Rust source
+            # too: the dep-info does not say which macro read a file, and
+            # include! takes a file of any name.
+            text = path.read_bytes().decode("utf-8", errors="replace")
+            found, reasons = attribute_problems(rel, text, used_migration)
             problems += found
             reasoned += reasons
-            count += 1
     problems += manifest_problems(crates, metadata)
     summary = (
-        f"lint settings: {count} source files of {len(crates)} crates read;"
-        f" {len(used_migration)} migration code-body modules allow clippy::all;"
+        f"lint settings: {len(read)} files of {len(crates)} crates read (from their"
+        f" dep-info); {len(used_migration)} migration code-body modules allow clippy::all;"
         f" {reasoned} allows of a disallowed lint, each with a reason"
     )
     return problems, summary
@@ -1082,7 +1182,9 @@ def lib_root(package: dict) -> Path:
     )
 
 
-def file_probe_problems(crates: dict[str, dict], copy: Path) -> tuple[list[str], str]:
+def file_probe_problems(
+    crates: dict[str, dict], metadata: dict, copy: Path
+) -> tuple[list[str], str]:
     """Problems with FILE_PROBES, added to the copy of the tree at `copy`: a
     probe file that is not among the files the scan reads of FILE_PROBE_CRATE,
     or whose lint setting it does not refuse."""
@@ -1098,7 +1200,9 @@ def file_probe_problems(crates: dict[str, dict], copy: Path) -> tuple[list[str],
         (copy / crate_dir / rel).write_text(text, encoding="utf-8")
         with open(copy / crate_root, "a", encoding="utf-8") as root_file:
             root_file.write("\n" + declaration)
-    files, problems = compiled_files({FILE_PROBE_CRATE: package}, copy)
+    files, problems = compiled_files(
+        {FILE_PROBE_CRATE: package}, copy, metadata["target_directory"]
+    )
     read = {path.resolve() for path in files.get(FILE_PROBE_CRATE, [])}
     refused = 0
     for rel, _, _ in FILE_PROBES:
@@ -1148,7 +1252,11 @@ def copy_tree(destination: Path) -> int:
     return copied
 
 
-def run_clippy(tree: Path, target_dir: str) -> tuple[int, list[dict], str]:
+def run_clippy(tree: Path, target_dir: str) -> tuple[int, list[dict], list[dict], str]:
+    """Run the clippy step in the tree at `tree`, with the caller's clippy.toml
+    and the cargo target directory `target_dir`. Returns its exit status, the
+    compiler messages and the compiler-artifact records of its JSON output,
+    and its stderr."""
     env = dict(os.environ, CLIPPY_CONF_DIR=str(CONF_DIR), CARGO_TARGET_DIR=target_dir)
     # In its own process group, so that it can be stopped with every compiler
     # it started.
@@ -1171,7 +1279,7 @@ def run_clippy(tree: Path, target_dir: str) -> tuple[int, list[dict], str]:
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
-    messages = []
+    messages, artifacts = [], []
     for line in stdout.splitlines():
         try:
             record = json.loads(line)
@@ -1179,7 +1287,9 @@ def run_clippy(tree: Path, target_dir: str) -> tuple[int, list[dict], str]:
             continue
         if record.get("reason") == "compiler-message":
             messages.append(record["message"])
-    return process.returncode, messages, stderr
+        elif record.get("reason") == "compiler-artifact":
+            artifacts.append(record)
+    return process.returncode, messages, artifacts, stderr
 
 
 def config_warnings(messages: list[dict], stderr: str) -> list[str]:
@@ -1233,7 +1343,7 @@ def probe_problems(
     (copy / rel).write_text("\n".join(lines) + "\n", encoding="utf-8")
     with open(copy / crate_root.relative_to(ROOT), "a", encoding="utf-8") as declaration:
         declaration.write(f"\n#[allow(dead_code, unused, deprecated)]\nmod {PROBE_MODULE};\n")
-    code, messages, stderr = run_clippy(copy, metadata["target_directory"])
+    code, messages, _, stderr = run_clippy(copy, metadata["target_directory"])
 
     if code == 0:
         problems.append("the clippy step passed with every probe in place")
@@ -1351,7 +1461,7 @@ def main() -> int:
     copy = Path(tempfile.mkdtemp(prefix="wasm-clippy-guard-"))
     try:
         files = copy_tree(copy)
-        found, settings = file_probe_problems(crates, copy)
+        found, settings = file_probe_problems(crates, metadata, copy)
         failures += found
         print(settings)
         found, probes = probe_problems(crates, metadata, copy, files)
