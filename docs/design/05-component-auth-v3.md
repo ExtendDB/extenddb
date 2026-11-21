@@ -479,11 +479,12 @@ The `[server].account_id` config key is used only when `provider = "none"`. When
 ## 14. Error Fidelity
 
 Auth-related DynamoDB errors:
-- `UnrecognizedClientException` — invalid access key or signature mismatch
-- `IncompleteSignatureException` — malformed Authorization header
-- `MissingAuthenticationTokenException` — no Authorization header
-- `ExpiredTokenException` — expired session credentials
-- `AccessDeniedException` — policy evaluation denied the request
+- `UnrecognizedClientException`: invalid access key or security token
+- `IncompleteSignatureException`: malformed Authorization header
+- `InvalidSignatureException`: signature or credential scope does not match the request
+- `MissingAuthenticationTokenException`: no Authorization header
+- `ExpiredTokenException`: expired session credentials
+- `AccessDeniedException`: policy evaluation denied the request
 
 These must match real DynamoDB error format (HTTP status, error code, message structure).
 
