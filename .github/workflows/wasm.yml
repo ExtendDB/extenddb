@@ -136,9 +136,14 @@ jobs:
         run: python3 devtools/check-wasm-clippy-guard
 
       # The adapter's own code, with the pedantic group the step above does
-      # not enable.
+      # not enable. --all-targets also checks the adapter's test targets for
+      # wasm32, with the dev-dependencies that target selects. Their tests are
+      # native only (tests/parity.rs and the library's test module are
+      # cfg-gated off wasm32), so on wasm32 the step lints the library in its
+      # test configuration as well and fails when a test target or a
+      # dev-dependency stops building there.
       - name: Clippy the adapter (pedantic) for wasm32
-        run: cargo clippy --locked --no-deps -p extenddb-wasm-adapter --lib --target wasm32-unknown-unknown -- -D warnings -W clippy::pedantic
+        run: cargo clippy --locked --no-deps -p extenddb-wasm-adapter --all-targets --target wasm32-unknown-unknown -- -D warnings -W clippy::pedantic
 
       # extenddb-core's wasm32 unit tests, under Node: the cases of its wasm
       # crypto backend (sha2/hmac/subtle/aes-gcm/getrandom), which runs in no
