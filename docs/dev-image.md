@@ -1,4 +1,8 @@
-# The `extenddb-dev` Image
+---
+description: "The extenddb/extenddb-dev container: one process over SQLite with plain HTTP and a seeded example credential, for local development and CI."
+---
+
+# Development image
 
 > **Local development and CI only.** The dev image serves plain HTTP, its
 > authorization is open, and by default it accepts AWS's public example
@@ -24,8 +28,9 @@ aws dynamodb list-tables \
   --region us-east-1 --endpoint-url http://127.0.0.1:18080
 ```
 
-It is **not the production image**. For a durable, TLS-terminated deployment use
-[`extenddb/extenddb-postgres`](local-dev-docker-compose.md).
+It is **not the production image**. For a server with TLS and PostgreSQL, start
+[`extenddb/extenddb-postgres` with Docker Compose](local-dev-docker-compose.md);
+for running on your own servers, see the [deployment guide](manuals/11-deployment-guide.md).
 
 ## What "dev-mode" means
 
@@ -119,7 +124,7 @@ docker run -d -p 127.0.0.1:18080:18080 -v extenddb:/var/lib/extenddb \
 ```
 
 **In-memory.** Everything lives in process memory and vanishes when the
-container stops — useful for test suites that want a pristine database per run:
+container stops, useful for test suites that want a pristine database per run:
 
 ```bash
 docker run -d -p 127.0.0.1:18080:18080 \
@@ -127,8 +132,9 @@ docker run -d -p 127.0.0.1:18080:18080 \
   extenddb/extenddb-dev
 ```
 
-`docker-compose.dev.yml` at the repository root defines both as services
-(`extenddb-dev`, and `extenddb-dev-memory` under the `memory` profile).
+The repository's [`docker-compose.dev.yml`](https://github.com/ExtendDB/extenddb/blob/main/docker-compose.dev.yml)
+defines both as services (`extenddb-dev`, and `extenddb-dev-memory` under the
+`memory` profile).
 
 **Export files.** The image configures no import or export root. When you set
 one, for example with `-e EXTENDDB__IMPORT_EXPORT_ROOT=/exports` and a bind
