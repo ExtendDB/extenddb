@@ -324,6 +324,16 @@ to crates.io.
 - **No background tasks.** The build runs no background workers, so: an item
   past its time-to-live is still returned (TTL never deletes it); `ItemCount`
   and `TableSizeBytes` stay `0`; and stream records are never trimmed.
+- **A synchronous control plane.** The in-memory engine sets the control-plane
+  delay and the index propagation delay (the `control_plane_delay_seconds` and
+  `index_propagation_delay_ms` settings) to 0, where a server uses 0.25 s and
+  10 ms while they are not set, so a table it creates is `ACTIVE` at once and
+  its indexes are maintained on the write path. Right after a `CreateTable`
+  with a global secondary index, a server answers that `CreateTable` and a
+  `DescribeTable` with `TableStatus` `CREATING`, and a `PutItem` on the table
+  and a `Query` on the index with `ResourceNotFoundException`; this build
+  answers `ACTIVE`, `{}` and the item. The corpus cases whose names start with
+  "control plane:" record this build's answers.
 
 The SigV4 key-derivation code in `extenddb-auth` compiles into this build, but
 the adapter never calls it: it builds no credential store and verifies no
