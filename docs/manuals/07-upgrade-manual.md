@@ -388,6 +388,12 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
+### v1.1.0: SearchVectors refuses a malformed `ExpressionAttributeNames` map
+
+**What changed.** SearchVectors refuses an `ExpressionAttributeNames` key that is not `#` followed by letters, digits and underscores, such as `n` or `##n`, with `ValidationException` `ExpressionAttributeNames contains invalid key: Syntax error; key: "n"`. It also refuses an empty map, a key longer than 255 bytes and an empty attribute name, with the messages GetItem gives. These checks run after the `IndexName`, `SearchVector` and `TopK` checks. DynamoDB answers SearchVectors with the same messages. It answered an `IndexName` of two characters, an empty `SearchVector` and a `TopK` of 0 ahead of a bad key (measured 2026-11-21). Earlier releases served such requests: a search with `ProjectionExpression` `#n` and the key `n` or `##n` returned the attribute the key named. `dynamodb:Attributes` did not hold that attribute, so a `Deny` on it did not refuse the search.
+
+**Who is affected.** A client that sends SearchVectors with such a map gets `ValidationException`, as it does on the other operations that take the map. No catalog migration is required.
+
 ### v1.0.0: Cassandra reads and writes at `LOCAL_QUORUM`
 
 **What changed.** The Cassandra backend runs its reads and writes at `LOCAL_QUORUM`. 0.1.15 ran many of them at `ONE`, the driver's default, in each area: items (the reads of GetItem, Query and Scan among them), transactions, TTL, streams, the catalog, IAM and `init`. A read with `ConsistentRead` `false` also runs at `LOCAL_QUORUM`. A lightweight transaction runs Paxos at `LOCAL_SERIAL` and commits at `LOCAL_QUORUM`. 0.1.15 ran many of its lightweight transactions at those levels already, and others, among them the admin user creation and most IAM writes, at the driver's defaults, `SERIAL` and `ONE`. Batches ran at `LOCAL_QUORUM` before and still do. No setting changes these levels (#945).
