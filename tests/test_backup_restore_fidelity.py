@@ -2423,14 +2423,15 @@ def test_backup_and_table_names_are_validated(dynamodb_client):
 
 def test_backup_arn_shapes_the_service_refuses_and_trims(dynamodb_client):
     """BackupArn shapes the service refuses as ValidationException "Invalid
-    Request: BackupArn is not valid" (not an ARN, oversize, control
-    characters, a slash in the region) or "Invalid Backup ARN" (an id suffix
-    of the wrong length or not hex, a wildcard), on DescribeBackup,
-    DeleteBackup, RestoreTableFromBackup and as ExclusiveStartBackupArn; a
-    trailing newline is trimmed and an ARN naming another region of the
-    caller's account resolves (all measured on DynamoDB).
-    Which text goes with which input was not captured; the pairing here is
-    ExtendDB's and is checked on ExtendDB only.
+    Request: BackupArn is not valid" (control characters in the id, a slash
+    in the region, an id suffix of the wrong length or not hex) or "Invalid
+    Backup ARN" (oversize, a wildcard id), on DescribeBackup, DeleteBackup
+    and RestoreTableFromBackup (measured on DynamoDB in us-east-1 on
+    21 Nov 2026; the restore answers the region with its cross-region text).
+    ExtendDB gives ExclusiveStartBackupArn the same texts; the service's
+    are its own. A trailing newline is trimmed and an ARN naming another
+    region of the caller's account resolves (measured on DynamoDB). The
+    texts are checked on ExtendDB only.
     """
     client = dynamodb_client
     source = f"restore-arnshape-{uuid.uuid4().hex[:10]}"
@@ -2452,16 +2453,16 @@ def test_backup_arn_shapes_the_service_refuses_and_trims(dynamodb_client):
             assert desc["BackupDetails"]["BackupStatus"] == "AVAILABLE"
 
         not_valid = "Invalid Request: BackupArn is not valid"
-        invalid_id = "Invalid Backup ARN"
+        invalid_arn = "Invalid Backup ARN"
         bad = [
             (f"{prefix}/{backup_id}\x00", not_valid),
             (f"{prefix}/{backup_id}\x07", not_valid),
             (backup_arn.replace(f":{region}:", f":{region}/..:"), not_valid),
-            (backup_arn.replace(f"table/{source}", "table/" + "x" * 1000), not_valid),
-            (f"{prefix}/*", invalid_id),
-            (f"{prefix}/{backup_id[:-1]}", invalid_id),
-            (f"{prefix}/{backup_id}0", invalid_id),
-            (f"{prefix}/{backup_id[:-2]}zz", invalid_id),
+            (backup_arn.replace(f"table/{source}", "table/" + "x" * 1000), invalid_arn),
+            (f"{prefix}/*", invalid_arn),
+            (f"{prefix}/{backup_id[:-1]}", not_valid),
+            (f"{prefix}/{backup_id}0", not_valid),
+            (f"{prefix}/{backup_id[:-2]}zz", not_valid),
         ]
         for arn, expected in bad:
             for operation, body in (
@@ -2477,7 +2478,7 @@ def test_backup_arn_shapes_the_service_refuses_and_trims(dynamodb_client):
                 if not _is_real_dynamodb():
                     assert message == expected, (operation, arn, message)
                 else:
-                    assert message in (not_valid, invalid_id), (operation, arn, message)
+                    assert message in (not_valid, invalid_arn), (operation, arn, message)
         # A BackupArn of another JSON type is a SerializationException (measured
         # 21 Nov 2026). Only its type is checked (#1012).
         for operation in ("DescribeBackup", "DeleteBackup"):

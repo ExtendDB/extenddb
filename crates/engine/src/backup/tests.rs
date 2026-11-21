@@ -4364,139 +4364,95 @@ fn account_prefix_does_not_match() {
     ));
 }
 
-/// Measured on DynamoDB: the shapes the service refuses as `ValidationException`
-/// with `Invalid Request: BackupArn is not valid` (not an ARN, oversize,
-/// control characters, a slash or `..` in the region) or `Invalid Backup ARN`
-/// (an id suffix of the wrong length or not hex, a wildcard id), on every
-/// member that carries a backup ARN. Which text goes with which input was
-/// not captured, so the split is the parser's (see `BackupArnError`).
+/// Measured on DynamoDB in us-east-1 on 21 Nov 2026 with
+/// `RestoreTableFromBackup`, `DescribeBackup` and `DeleteBackup`, which
+/// answered each shape alike, except that the restore answers a slash or
+/// `..` in the region with its cross-region text, which ExtendDB does not
+/// give. The `ListBackups` cursor is checked by the same parser before its
+/// account is compared, with no not-found answer; the service's texts for it
+/// are its own.
 #[tokio::test]
 async fn malformed_arn_is_a_validation_exception_with_the_services_text() {
-    const NOT_VALID: &str = "Invalid Request: BackupArn is not valid";
-    const INVALID_ID: &str = "Invalid Backup ARN";
+    const NOT_VALID: &str = "ValidationException: Invalid Request: BackupArn is not valid";
+    const INVALID: &str = "ValidationException: Invalid Backup ARN";
+    const DENIED: &str = "AccessDeniedException: Access is denied";
     let id = "01791976431438-73d8d5bc";
-    let long_table = "x".repeat(1000);
+    let base = format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Music");
+    let in_region = |region: &str| format!("arn:aws:dynamodb:{region}:{ACCOUNT}:table/Music");
+    let upper = format!("{base}/backup/01791976431438-73D8D5BC");
+    let not_found = format!("BackupNotFoundException: Backup not found: {upper}");
     let cases: Vec<(String, &str)> = vec![
-        ("not-an-arn".to_owned(), NOT_VALID),
-        ("arn:aws:dynamodb".to_owned(), NOT_VALID),
-        (format!("arn:aws:dynamodb:{REGION}"), NOT_VALID),
-        (String::new(), NOT_VALID),
-        (
-            format!("arn:aws:dynamodb:{REGION}::table/Music/backup/{id}"),
-            NOT_VALID,
-        ),
+        ("x".to_owned(), INVALID),
+        ("not-an-arn".to_owned(), INVALID),
+        ("arn:".to_owned(), INVALID),
+        ("arn:aws:dynamodb".to_owned(), INVALID),
+        (format!("arn:aws:dynamodb:{REGION}"), INVALID),
+        (String::new(), INVALID),
+        ("x".repeat(1025), INVALID),
         (
             format!("arn:aws:dynamodb:{REGION}:table/Music/backup/{ACCOUNT}"),
-            NOT_VALID,
+            INVALID,
+        ),
+        (format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:x"), INVALID),
+        (base.clone(), INVALID),
+        (format!("{base}/stream/{id}"), INVALID),
+        (format!("{base}/index/x"), INVALID),
+        // The table segment: 1000 characters (the ARN is then longer than
+        // the model's 1024), a control character, a space.
+        (
+            base.replace("Music", &"x".repeat(1000)) + "/backup/" + id,
+            INVALID,
         ),
         (
-            format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Music"),
-            NOT_VALID,
+            base.replace("Music", "Mu\u{1}sic") + "/backup/" + id,
+            INVALID,
         ),
-        (
-            format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Music/stream/{id}"),
-            NOT_VALID,
-        ),
-        (
-            format!("arn:aws:dynamodb:{REGION}:999999999999:table/Music/index/x"),
-            NOT_VALID,
-        ),
-        // Oversize (the model's max is 1024).
-        (
-            format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/{long_table}/backup/{id}"),
-            NOT_VALID,
-        ),
-        // Control characters, inside and at the end (a NUL byte was a 500 on
-        // PostgreSQL before the check).
-        (
-            format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Music/backup/{id}\u{0}"),
-            NOT_VALID,
-        ),
-        (
-            format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Mu\u{1}sic/backup/{id}"),
-            NOT_VALID,
-        ),
-        (
-            format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Music/backup/{id}\n\u{7}"),
-            NOT_VALID,
-        ),
+        (base.replace("Music", "Mu sic") + "/backup/" + id, INVALID),
+        // The id: empty or of one character, then 3 characters or more that
+        // are not an id, control characters at the end included.
+        (format!("{base}/backup/"), INVALID),
+        (format!("{base}/backup/1"), INVALID),
+        (format!("{base}/backup/*"), INVALID),
+        (format!("{base}/backup/bad"), NOT_VALID),
+        (format!("{base}/backup/01791976431438-*"), NOT_VALID),
+        (format!("{base}/backup/01791976431438-73d8d5b"), NOT_VALID),
+        (format!("{base}/backup/01791976431438-73d8d5bcd"), NOT_VALID),
+        (format!("{base}/backup/01791976431438-73d8d5bg"), NOT_VALID),
+        (format!("{base}/backup/0179197643143x-73d8d5bc"), NOT_VALID),
+        (format!("{base}/backup/{id}\u{0}"), NOT_VALID),
+        (format!("{base}/backup/{id}\n\u{7}"), NOT_VALID),
         // A slash or `..` in the region.
+        (format!("{}/backup/{id}", in_region("us/east-1")), NOT_VALID),
+        (format!("{}/backup/{id}", in_region("..")), NOT_VALID),
         (
-            format!("arn:aws:dynamodb:us/east-1:{ACCOUNT}:table/Music/backup/{id}"),
+            format!("{}/backup/{id}", in_region("us-east-1/..")),
             NOT_VALID,
         ),
-        (
-            format!("arn:aws:dynamodb:..:{ACCOUNT}:table/Music/backup/{id}"),
-            NOT_VALID,
-        ),
-        (
-            format!("arn:aws:dynamodb:us-east-1/..:{ACCOUNT}:table/Music/backup/{id}"),
-            NOT_VALID,
-        ),
-        // The id: wrong length, not hex, a wildcard.
-        (
-            format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Music/backup/1"),
-            INVALID_ID,
-        ),
-        (
-            format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Music/backup/*"),
-            INVALID_ID,
-        ),
-        (
-            format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Music/backup/01791976431438-*"),
-            INVALID_ID,
-        ),
-        (
-            format!(
-                "arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Music/backup/01791976431438-73d8d5b"
-            ),
-            INVALID_ID,
-        ),
-        (
-            format!(
-                "arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Music/backup/01791976431438-73d8d5bcd"
-            ),
-            INVALID_ID,
-        ),
-        (
-            format!(
-                "arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Music/backup/01791976431438-73D8D5BC"
-            ),
-            INVALID_ID,
-        ),
-        (
-            format!(
-                "arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Music/backup/01791976431438-73d8d5bg"
-            ),
-            INVALID_ID,
-        ),
-        (
-            format!(
-                "arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Music/backup/0179197643143x-73d8d5bc"
-            ),
-            INVALID_ID,
-        ),
+        // The account first, whatever the rest of the ARN.
+        (base.replace(ACCOUNT, "") + "/backup/" + id, DENIED),
+        ("arn:aws:s3:::bucket".to_owned(), DENIED),
+        // The service's id shape in upper-case hex, which no build issues.
+        (upper.clone(), not_found.as_str()),
     ];
     let fake = Fake::with_source(source(Some(definition("PROVISIONED"))));
+    let answer = |e: DynamoDbError| format!("{}: {}", e.error_type(), e.message());
     for (candidate, expected) in &cases {
-        for (member, result) in [
-            ("BackupArn", arn_field(&json!({ "BackupArn": candidate }))),
-            (
-                "RestoreTableFromBackup",
-                restore(&fake, restore_body(json!({ "BackupArn": candidate })))
-                    .await
-                    .map(|_| String::new()),
-            ),
-            (
-                "ExclusiveStartBackupArn",
-                list(&fake, json!({ "ExclusiveStartBackupArn": candidate }))
-                    .await
-                    .map(|_| String::new()),
-            ),
-        ] {
-            let msg = validation_message(result.unwrap_err());
-            assert_eq!(msg, *expected, "{member} {candidate:?}");
+        let field = arn_field(&json!({ "BackupArn": candidate })).map(drop);
+        let restored = restore(&fake, restore_body(json!({ "BackupArn": candidate }))).await;
+        for (member, result) in [("BackupArn", field), ("Restore", restored.map(drop))] {
+            assert_eq!(
+                answer(result.unwrap_err()),
+                *expected,
+                "{member} {candidate:?}"
+            );
         }
+        let cursor = match *expected {
+            DENIED => INVALID,
+            e if e == not_found => NOT_VALID,
+            e => e,
+        };
+        let listed = list(&fake, json!({ "ExclusiveStartBackupArn": candidate })).await;
+        assert_eq!(answer(listed.unwrap_err()), cursor, "cursor {candidate:?}");
     }
     assert_eq!(fake.source_reads(), 0);
     assert!(fake.restores().is_empty());
@@ -4539,7 +4495,7 @@ async fn whitespace_is_trimmed_and_another_region_resolves() {
         format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Mu sic/backup/01791976431438-73d8d5bc");
     assert_eq!(
         validation_message(arn_field(&json!({ "BackupArn": inside })).unwrap_err()),
-        "Invalid Request: BackupArn is not valid"
+        "Invalid Backup ARN"
     );
 }
 
@@ -4675,9 +4631,14 @@ async fn a_backup_stored_under_another_region_resolves_as_written() {
     assert!(fake.restores().is_empty());
 }
 
-/// An ARN in another partition names nothing here: `ValidationException`
-/// (the service's class for one naming the caller's account), before the
-/// account is compared, on every member that carries a backup ARN.
+/// An ARN in another partition names nothing here. One naming the caller's
+/// account is `ValidationException` `Invalid Request: BackupArn is not
+/// valid` on every member that carries a backup ARN, after a restore's
+/// `TargetTableName`. One of another account is `AccessDeniedException`
+/// first, as one with an empty account is. Measured on DynamoDB in us-east-1
+/// on 21 Nov 2026 for `aws-cn` on RestoreTableFromBackup and DescribeBackup;
+/// the other partitions here are derived from it. The `ListBackups` cursor
+/// is refused before its account is compared.
 #[tokio::test]
 async fn an_arn_in_another_partition_is_a_validation_exception() {
     let ours = arn(ACCOUNT);
@@ -4692,18 +4653,32 @@ async fn an_arn_in_another_partition_is_a_validation_exception() {
             let candidate = format!(
                 "arn:{partition}:dynamodb:{REGION}:{account}:table/Music/backup/01791976431438-73d8d5bc"
             );
-            let err = arn_field(&json!({ "BackupArn": candidate })).unwrap_err();
-            assert_eq!(
-                validation_message(err),
-                "Invalid Request: BackupArn is not valid"
-            );
-            let err = restore(&fake, restore_body(json!({ "BackupArn": candidate })))
+            let expected = if account == ACCOUNT {
+                "ValidationException: Invalid Request: BackupArn is not valid"
+            } else {
+                "AccessDeniedException: Access is denied"
+            };
+            let field = arn_field(&json!({ "BackupArn": candidate })).map(drop);
+            let restored = restore(&fake, restore_body(json!({ "BackupArn": candidate })))
                 .await
-                .unwrap_err();
-            assert!(
-                matches!(err, DynamoDbError::ValidationException(_)),
-                "{err:?}"
-            );
+                .map(drop);
+            for err in [field.unwrap_err(), restored.unwrap_err()] {
+                let answer = format!("{}: {}", err.error_type(), err.message());
+                assert_eq!(answer, expected, "{candidate}");
+            }
+            let short = json!({ "BackupArn": candidate, "TargetTableName": "ab" });
+            let err = restore(&fake, short).await.unwrap_err();
+            let answer = format!("{}: {}", err.error_type(), err.message());
+            if account == ACCOUNT {
+                assert_eq!(
+                    answer,
+                    "ValidationException: TableName must be at least 3 characters long and \
+                     at most 255 characters long",
+                    "{candidate}"
+                );
+            } else {
+                assert_eq!(answer, expected, "{candidate}");
+            }
             let err = list(&fake, json!({ "ExclusiveStartBackupArn": candidate }))
                 .await
                 .unwrap_err();
@@ -4725,10 +4700,19 @@ async fn an_arn_in_another_partition_is_a_validation_exception() {
     assert_eq!(fake.restores().len(), 1);
 }
 
-#[test]
-fn missing_arn_field_is_a_validation_error() {
+/// Measured on DynamoDB in us-east-1 on 21 Nov 2026: an absent `BackupArn`
+/// is `Invalid Backup ARN`, before a restore's `TargetTableName`.
+#[tokio::test]
+async fn missing_arn_field_is_a_validation_error() {
     let err = arn_field(&json!({})).unwrap_err();
-    assert!(matches!(err, DynamoDbError::ValidationException(m) if m.contains("backupArn")));
+    assert_eq!(validation_message(err), "Invalid Backup ARN");
+    let fake = Fake::with_source(source(Some(definition("PROVISIONED"))));
+    for target in [json!("MusicRestored"), json!("ab"), Value::Null] {
+        let err = restore(&fake, json!({ "TargetTableName": target }))
+            .await
+            .unwrap_err();
+        assert_eq!(validation_message(err), "Invalid Backup ARN", "{target}");
+    }
 }
 
 /// A request dropped while the engine is still reading the backup (the client
@@ -4792,7 +4776,7 @@ async fn restore_checks_the_arn_before_the_target_name() {
     // "x" is shorter than the 3-character minimum table name.
     let malformed = json!({ "TargetTableName": "x", "BackupArn": "garbage" });
     let msg = validation_message(restore(&fake, malformed).await.unwrap_err());
-    assert!(msg.contains("BackupArn"), "{msg}");
+    assert_eq!(msg, "Invalid Backup ARN");
 
     let foreign = json!({ "TargetTableName": "x", "BackupArn": arn("999999999999") });
     assert!(matches!(
@@ -7233,7 +7217,7 @@ async fn list_backups_refuses_a_cursor_it_cannot_place() {
                 .await
                 .unwrap_err()
         ),
-        "Invalid Request: BackupArn is not valid"
+        "Invalid Backup ARN"
     );
 }
 
