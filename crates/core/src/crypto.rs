@@ -185,12 +185,20 @@ mod imp {
 
     // aes wipes the AES-256 round keys when the cipher drops only under its
     // `zeroize` feature, which also marks the cipher `ZeroizeOnDrop` (aes 0.8.4
-    // src/soft.rs, the backend wasm32 compiles). Requiring that marker of the
-    // block cipher inside `Aes256Gcm` makes this build fail when the feature
-    // is off; core's manifest turns it on.
+    // src/soft.rs, the backend wasm32 compiles). polyval wipes its key and
+    // state only under its own `zeroize` feature, which is what gives
+    // `Polyval` a `Drop` implementation (polyval 0.6.2 src/backend/soft32.rs,
+    // the backend wasm32 compiles); without it the type holds plain integers
+    // and has no drop glue. Requiring that marker of the block cipher inside
+    // `Aes256Gcm`, and drop glue of the `Polyval` inside its GHASH, makes this
+    // build fail when either feature is off; core's manifest turns both on.
     const _: () = {
         const fn wiped_on_drop<T: zeroize::ZeroizeOnDrop>() {}
         wiped_on_drop::<aes_gcm::aes::Aes256>();
+        assert!(
+            core::mem::needs_drop::<polyval::Polyval>(),
+            "polyval is built without its zeroize feature, so Polyval does not wipe its key on drop"
+        );
     };
 
     pub(super) fn sha256(data: &[u8]) -> [u8; 32] {
