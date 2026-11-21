@@ -253,10 +253,7 @@ impl Bootstrapper for SqliteBootstrapper {
         env_password: Option<&str>,
     ) -> OpResult<AdminBootstrapResult> {
         let pool = self.pool().await?;
-        let username = env_user
-            .filter(|s| !s.is_empty())
-            .unwrap_or("admin")
-            .to_owned();
+        let username = env_user.unwrap_or("admin").to_owned();
 
         let exists: bool =
             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM admin_users WHERE admin_name = ?)")
@@ -273,7 +270,7 @@ impl Bootstrapper for SqliteBootstrapper {
             });
         }
 
-        let (password, from_env) = match env_password.filter(|s| !s.is_empty()) {
+        let (password, from_env) = match env_password {
             Some(p) => (p.to_owned(), true),
             None => (helpers::generate_random_password(), false),
         };
@@ -544,5 +541,53 @@ mod init_tests {
             "{refused}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `write_bootstrap_rows` passes an empty `EXTENDDB_ADMIN_USER` or
+    /// `EXTENDDB_ADMIN_PASSWORD` on as no value, and returns a password only
+    /// when it generated one.
+    #[tokio::test]
+    async fn empty_admin_variables_are_unset_and_a_supplied_password_is_not_returned() {
+        // (EXTENDDB_ADMIN_USER, EXTENDDB_ADMIN_PASSWORD, admin name, from the environment)
+        let cases = [
+            (Some(""), Some(""), "admin", false),
+            (None, Some("Supplied-pw-1"), "admin", true),
+            (Some("ops"), None, "ops", false),
+            (Some("ops"), Some("Supplied-pw-1"), "ops", true),
+        ];
+        let timeout = Duration::from_secs(10);
+        for (user, password, name, from_env) in cases {
+            let dir = std::env::temp_dir().join(format!(
+                "extenddb-admin-env-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            let path = dir.join("extenddb.sqlite").to_string_lossy().into_owned();
+            let bootstrapper = SqliteBootstrapper::new(path);
+            let migrations = SqliteCatalogMigrations;
+            let target = bootstrapper.init_target();
+            bootstrapper.create_catalog_db().await.expect("file");
+            let lock = migrations.lock(&target, timeout).await.expect("lock");
+            let status = migrations
+                .status_under_lock(&lock, &target)
+                .await
+                .expect("status");
+            run_with_status(&migrations, &status, &lock, "1.0.0-test", RunKind::Create)
+                .await
+                .expect("create");
+            bootstrapper.hold(&lock);
+            let admin = write_bootstrap_rows(&bootstrapper, user, password).await;
+            migrations.release(lock).await;
+            let _ = std::fs::remove_dir_all(&dir);
+            let admin = admin.expect("rows");
+            assert_eq!(
+                (
+                    admin.username.as_str(),
+                    admin.from_env,
+                    admin.generated_password.is_some()
+                ),
+                (name, from_env, !from_env),
+                "{user:?} {password:?}"
+            );
+        }
     }
 }

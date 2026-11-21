@@ -388,6 +388,12 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
+### v1.1.0: `init` takes an empty admin variable as unset on every backend
+
+**What changed.** `extenddb init` takes an empty `EXTENDDB_ADMIN_USER` or `EXTENDDB_ADMIN_PASSWORD` as unset on every backend: it names the admin `admin`, or generates a password. On MongoDB and Cassandra, 1.0.0 took the empty string as the name or the password. On Cassandra, `init` with `EXTENDDB_ADMIN_PASSWORD` set and `EXTENDDB_ADMIN_USER` not set no longer prints the supplied password (#1339).
+
+**Who is affected.** A MongoDB or Cassandra catalog that an earlier release initialized with an empty `EXTENDDB_ADMIN_PASSWORD` keeps an admin whose password is empty. Give it a password with `extenddb manage change-admin-password`, with `EXTENDDB_PASSWORD` set to an empty value for the login. The output of a Cassandra `init` from an earlier release with only `EXTENDDB_ADMIN_PASSWORD` set holds that password, so change it if that output was kept. No catalog migration is required.
+
 ### v1.0.0: Cassandra reads and writes at `LOCAL_QUORUM`
 
 **What changed.** The Cassandra backend runs its reads and writes at `LOCAL_QUORUM`. 0.1.15 ran many of them at `ONE`, the driver's default, in each area: items (the reads of GetItem, Query and Scan among them), transactions, TTL, streams, the catalog, IAM and `init`. A read with `ConsistentRead` `false` also runs at `LOCAL_QUORUM`. A lightweight transaction runs Paxos at `LOCAL_SERIAL` and commits at `LOCAL_QUORUM`. 0.1.15 ran many of its lightweight transactions at those levels already, and others, among them the admin user creation and most IAM writes, at the driver's defaults, `SERIAL` and `ONE`. Batches ran at `LOCAL_QUORUM` before and still do. No setting changes these levels (#945).

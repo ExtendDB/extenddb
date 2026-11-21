@@ -1521,6 +1521,7 @@ async fn init_refuses_an_account_keyspace_at_simple_strategy_until_it_is_altered
     .await;
     let admin = resume().await.expect("init finishes after ALTER KEYSPACE");
     assert_eq!(admin.username, "admin");
+    assert!(!admin.already_existed && !admin.from_env && admin.generated_password.is_some());
     assert_eq!(store.list_all_accounts().await.expect("list"), accounts);
     drop(drops);
     helpers::flush_pending_drops(&session).await;
@@ -1532,7 +1533,8 @@ async fn init_refuses_an_account_keyspace_at_simple_strategy_until_it_is_altered
 /// `init`, a new process, takes the keyspace as `init` does, and its steps
 /// under the lock run no migration, keep the key, create no second account
 /// and write the admin user; the `init` after that is refused as
-/// initialized.
+/// initialized. The next `init` has an admin password from the environment
+/// and no user name, and gets no generated password back.
 #[tokio::test]
 async fn init_finishes_a_catalog_stopped_before_its_admin_user() {
     use extenddb_storage::bootstrapper::{
@@ -1606,13 +1608,22 @@ async fn init_finishes_a_catalog_stopped_before_its_admin_user() {
             .expect("decided")
     );
     next.hold(&lock);
-    let admin = write_bootstrap_rows(&next, None, None).await.expect("rows");
+    let admin = write_bootstrap_rows(&next, None, Some("Supplied-pw-1"))
+        .await
+        .expect("rows");
     next.record_data_connection()
         .await
         .expect("data connection");
     migrations.release(lock).await;
-    assert_eq!(admin.username, "admin");
-    assert!(!admin.already_existed && admin.generated_password.is_some());
+    assert_eq!(
+        (
+            admin.username.as_str(),
+            admin.already_existed,
+            admin.from_env,
+            admin.generated_password
+        ),
+        ("admin", false, true, None)
+    );
     assert_eq!(
         store.get_setting("encryption_key").await.expect("read"),
         key

@@ -70,7 +70,9 @@ pub trait Bootstrapper: Send + Sync {
     /// Create the default account. Idempotent — skips if any account exists.
     async fn bootstrap_default_account(&self) -> OpResult<()>;
 
-    /// Create the initial admin user.
+    /// Create the initial admin user. `init` passes `None` for an
+    /// `EXTENDDB_ADMIN_USER` or `EXTENDDB_ADMIN_PASSWORD` that is unset or
+    /// empty ([`write_bootstrap_rows`]).
     async fn bootstrap_admin_user(
         &self,
         env_user: Option<&str>,
@@ -151,7 +153,7 @@ pub async fn finishes_a_stopped_init(
 /// writes its row only when the catalog lacks it, so on a catalog an earlier
 /// `init` stopped in this writes the rows that `init` did not.
 /// `admin_user` and `admin_password` come from `EXTENDDB_ADMIN_USER` and
-/// `EXTENDDB_ADMIN_PASSWORD`.
+/// `EXTENDDB_ADMIN_PASSWORD`. An empty value is passed on as no value.
 ///
 /// # Errors
 ///
@@ -165,7 +167,10 @@ pub async fn write_bootstrap_rows(
     bootstrapper.bootstrap_default_account().await?;
     // REQ-AUTH-003
     bootstrapper
-        .bootstrap_admin_user(admin_user, admin_password)
+        .bootstrap_admin_user(
+            admin_user.filter(|s| !s.is_empty()),
+            admin_password.filter(|s| !s.is_empty()),
+        )
         .await
 }
 

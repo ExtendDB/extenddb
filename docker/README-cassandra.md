@@ -83,8 +83,9 @@ Pass the passwords through the environment rather than as arguments:
   or check its password and writes the value you supplied into the config, so
   a wrong value surfaces only when `serve` fails to connect.
 * `EXTENDDB_ADMIN_USER` and `EXTENDDB_ADMIN_PASSWORD`: the first ExtendDB
-  administrator. Set both; with only the password set, `init` prints that
-  password in its output, and so in the container's logs.
+  administrator, named `admin` when `EXTENDDB_ADMIN_USER` is unset or empty.
+  Without `EXTENDDB_ADMIN_PASSWORD`, `init` generates a password and prints it
+  in its output, and so in the container's logs.
 
 `init` writes only the first of the `--cassandra-contact-points` into
 `extenddb.toml`; add the others to `contact_points` there afterwards. The file
