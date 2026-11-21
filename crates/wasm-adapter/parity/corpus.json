@@ -2879,6 +2879,480 @@
       ]
     },
     {
+      "name": "control plane: DescribeTable right after that CreateTable reports the table and its index ACTIVE with their WarmThroughput",
+      "op": "DescribeTable",
+      "body": {
+        "TableName": "CpGsi"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/Table/TableStatus",
+          "equals": "ACTIVE"
+        },
+        {
+          "path": "/Table/WarmThroughput",
+          "equals": {
+            "ReadUnitsPerSecond": 12000,
+            "Status": "ACTIVE",
+            "WriteUnitsPerSecond": 4000
+          }
+        },
+        {
+          "path": "/Table/GlobalSecondaryIndexes/0/IndexStatus",
+          "equals": "ACTIVE"
+        },
+        {
+          "path": "/Table/GlobalSecondaryIndexes/0/WarmThroughput",
+          "equals": {
+            "ReadUnitsPerSecond": 12000,
+            "Status": "ACTIVE",
+            "WriteUnitsPerSecond": 4000
+          }
+        }
+      ]
+    },
+    {
+      "name": "control plane: GetItem right after that CreateTable returns the item",
+      "op": "GetItem",
+      "body": {
+        "TableName": "CpGsi",
+        "Key": {
+          "pk": {
+            "S": "a"
+          }
+        }
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "",
+          "equals": {
+            "Item": {
+              "g": {
+                "S": "x"
+              },
+              "pk": {
+                "S": "a"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "control plane: BatchGetItem right after that CreateTable returns the item",
+      "op": "BatchGetItem",
+      "body": {
+        "RequestItems": {
+          "CpGsi": {
+            "Keys": [
+              {
+                "pk": {
+                  "S": "a"
+                }
+              }
+            ]
+          }
+        }
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "",
+          "equals": {
+            "Responses": {
+              "CpGsi": [
+                {
+                  "g": {
+                    "S": "x"
+                  },
+                  "pk": {
+                    "S": "a"
+                  }
+                }
+              ]
+            },
+            "UnprocessedKeys": {}
+          }
+        }
+      ]
+    },
+    {
+      "name": "control plane: UpdateTimeToLive right after that CreateTable enables time to live",
+      "op": "UpdateTimeToLive",
+      "body": {
+        "TableName": "CpGsi",
+        "TimeToLiveSpecification": {
+          "Enabled": true,
+          "AttributeName": "ttl"
+        }
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "",
+          "equals": {
+            "TimeToLiveSpecification": {
+              "AttributeName": "ttl",
+              "Enabled": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "control plane: UpdateTable right after that CreateTable changes the table class",
+      "op": "UpdateTable",
+      "body": {
+        "TableName": "CpGsi",
+        "TableClass": "STANDARD_INFREQUENT_ACCESS"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/TableDescription/TableStatus",
+          "equals": "ACTIVE"
+        },
+        {
+          "path": "/TableDescription/TableClassSummary",
+          "equals": {
+            "TableClass": "STANDARD_INFREQUENT_ACCESS"
+          }
+        }
+      ]
+    },
+    {
+      "name": "control plane: TagResource right after that CreateTable tags the table",
+      "op": "TagResource",
+      "body": {
+        "ResourceArn": "arn:aws:dynamodb:us-east-1:000000000000:table/CpGsi",
+        "Tags": [
+          {
+            "Key": "k",
+            "Value": "v"
+          }
+        ]
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "",
+          "equals": {}
+        }
+      ]
+    },
+    {
+      "name": "control plane: ListTagsOfResource right after that TagResource lists the tag",
+      "op": "ListTagsOfResource",
+      "body": {
+        "ResourceArn": "arn:aws:dynamodb:us-east-1:000000000000:table/CpGsi"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "",
+          "equals": {
+            "Tags": [
+              {
+                "Key": "k",
+                "Value": "v"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "control plane: CreateTable with WarmThroughput on the table and its index reports both ACTIVE",
+      "op": "CreateTable",
+      "body": {
+        "TableName": "CpWarm",
+        "KeySchema": [
+          {
+            "AttributeName": "pk",
+            "KeyType": "HASH"
+          }
+        ],
+        "AttributeDefinitions": [
+          {
+            "AttributeName": "pk",
+            "AttributeType": "S"
+          },
+          {
+            "AttributeName": "g",
+            "AttributeType": "S"
+          }
+        ],
+        "BillingMode": "PAY_PER_REQUEST",
+        "WarmThroughput": {
+          "ReadUnitsPerSecond": 13000,
+          "WriteUnitsPerSecond": 5000
+        },
+        "GlobalSecondaryIndexes": [
+          {
+            "IndexName": "byG",
+            "KeySchema": [
+              {
+                "AttributeName": "g",
+                "KeyType": "HASH"
+              }
+            ],
+            "Projection": {
+              "ProjectionType": "ALL"
+            },
+            "WarmThroughput": {
+              "ReadUnitsPerSecond": 13000,
+              "WriteUnitsPerSecond": 5000
+            }
+          }
+        ]
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/TableDescription/TableStatus",
+          "equals": "ACTIVE"
+        },
+        {
+          "path": "/TableDescription/WarmThroughput",
+          "equals": {
+            "ReadUnitsPerSecond": 13000,
+            "Status": "ACTIVE",
+            "WriteUnitsPerSecond": 5000
+          }
+        },
+        {
+          "path": "/TableDescription/GlobalSecondaryIndexes/0/WarmThroughput",
+          "equals": {
+            "ReadUnitsPerSecond": 13000,
+            "Status": "ACTIVE",
+            "WriteUnitsPerSecond": 5000
+          }
+        }
+      ]
+    },
+    {
+      "name": "control plane: UpdateTable raising the WarmThroughput of the table reports the new values ACTIVE",
+      "op": "UpdateTable",
+      "body": {
+        "TableName": "CpWarm",
+        "WarmThroughput": {
+          "ReadUnitsPerSecond": 14000,
+          "WriteUnitsPerSecond": 6000
+        }
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/TableDescription/TableStatus",
+          "equals": "ACTIVE"
+        },
+        {
+          "path": "/TableDescription/WarmThroughput",
+          "equals": {
+            "ReadUnitsPerSecond": 14000,
+            "Status": "ACTIVE",
+            "WriteUnitsPerSecond": 6000
+          }
+        }
+      ]
+    },
+    {
+      "name": "control plane: DescribeTable right after that UpdateTable reports the new WarmThroughput ACTIVE",
+      "op": "DescribeTable",
+      "body": {
+        "TableName": "CpWarm"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/Table/WarmThroughput",
+          "equals": {
+            "ReadUnitsPerSecond": 14000,
+            "Status": "ACTIVE",
+            "WriteUnitsPerSecond": 6000
+          }
+        },
+        {
+          "path": "/Table/GlobalSecondaryIndexes/0/WarmThroughput",
+          "equals": {
+            "ReadUnitsPerSecond": 13000,
+            "Status": "ACTIVE",
+            "WriteUnitsPerSecond": 5000
+          }
+        }
+      ]
+    },
+    {
+      "name": "control plane: DeleteTable right after that UpdateTable reports DELETING with the new WarmThroughput ACTIVE",
+      "op": "DeleteTable",
+      "body": {
+        "TableName": "CpWarm"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/TableDescription/TableStatus",
+          "equals": "DELETING"
+        },
+        {
+          "path": "/TableDescription/WarmThroughput",
+          "equals": {
+            "ReadUnitsPerSecond": 14000,
+            "Status": "ACTIVE",
+            "WriteUnitsPerSecond": 6000
+          }
+        }
+      ]
+    },
+    {
+      "name": "control plane: DescribeTable right after that DeleteTable answers ResourceNotFoundException",
+      "op": "DescribeTable",
+      "body": {
+        "TableName": "CpWarm"
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found"
+        }
+      ]
+    },
+    {
+      "name": "control plane: CreateTable with a vector index answers the index ACTIVE",
+      "op": "CreateTable",
+      "body": {
+        "TableName": "CpVec",
+        "KeySchema": [
+          {
+            "AttributeName": "pk",
+            "KeyType": "HASH"
+          }
+        ],
+        "AttributeDefinitions": [
+          {
+            "AttributeName": "pk",
+            "AttributeType": "S"
+          }
+        ],
+        "BillingMode": "PAY_PER_REQUEST",
+        "VectorIndexes": [
+          {
+            "IndexName": "vidx",
+            "Dimensions": 3,
+            "DistanceFunction": "COSINE",
+            "VectorAttribute": {
+              "AttributeName": "emb"
+            },
+            "Projection": {
+              "ProjectionType": "ALL"
+            }
+          }
+        ]
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/TableDescription/TableStatus",
+          "equals": "ACTIVE"
+        },
+        {
+          "path": "/TableDescription/VectorIndexes/0/IndexStatus",
+          "equals": "ACTIVE"
+        }
+      ]
+    },
+    {
+      "name": "control plane: DescribeTable right after that CreateTable reports the vector index ACTIVE",
+      "op": "DescribeTable",
+      "body": {
+        "TableName": "CpVec"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/Table/TableStatus",
+          "equals": "ACTIVE"
+        },
+        {
+          "path": "/Table/VectorIndexes/0/IndexStatus",
+          "equals": "ACTIVE"
+        }
+      ]
+    },
+    {
+      "name": "control plane: PutItem of a vector right after that CreateTable writes the item",
+      "op": "PutItem",
+      "body": {
+        "TableName": "CpVec",
+        "Item": {
+          "pk": {
+            "S": "v1"
+          },
+          "emb": {
+            "L": [
+              {
+                "N": "1"
+              },
+              {
+                "N": "0"
+              },
+              {
+                "N": "0"
+              }
+            ]
+          }
+        }
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "",
+          "equals": {}
+        }
+      ]
+    },
+    {
+      "name": "control plane: SearchVectors right after that PutItem returns the item",
+      "op": "SearchVectors",
+      "body": {
+        "TableName": "CpVec",
+        "IndexName": "vidx",
+        "SearchVector": [
+          {
+            "N": "1"
+          },
+          {
+            "N": "0"
+          },
+          {
+            "N": "0"
+          }
+        ],
+        "TopK": 1
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "",
+          "equals": {
+            "SearchResults": [
+              {
+                "Item": {
+                  "pk": {
+                    "S": "v1"
+                  }
+                },
+                "Score": 0
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
       "name": "table names: Query with a TableName outside the pattern answers ResourceNotFoundException",
       "op": "Query",
       "body": {
