@@ -83,7 +83,7 @@ pub enum DynamoDbError {
     InternalServerError(String),
     #[error("{0}")]
     AccessDeniedException(String),
-    /// SP-ERR-002: HTTP 403.
+    /// SP-ERR-002: HTTP 400.
     #[error("{0}")]
     MissingAuthenticationToken(String),
     /// SP-ERR-002: HTTP 403.
@@ -148,6 +148,12 @@ pub enum DynamoDbError {
 }
 
 impl DynamoDbError {
+    /// The error for a request with no `Authorization` header (measured 2026-11-21).
+    #[must_use]
+    pub fn missing_authentication_token() -> Self {
+        Self::MissingAuthenticationToken("Request is missing Authentication Token".to_owned())
+    }
+
     /// HTTP status code for this error.
     ///
     /// SP-ERR-002: status codes match the real `DynamoDB` error catalog.
@@ -219,7 +225,7 @@ impl DynamoDbError {
             Self::UnknownOperationException(_) => "UnknownOperationException",
             Self::InternalServerError(_) => "InternalServerError",
             Self::AccessDeniedException(_) => "AccessDeniedException",
-            Self::MissingAuthenticationToken(_) => "MissingAuthenticationToken",
+            Self::MissingAuthenticationToken(_) => "MissingAuthenticationTokenException",
             Self::IncompleteSignature(_) => "IncompleteSignatureException",
             Self::UnrecognizedClientException(_) => "UnrecognizedClientException",
             Self::ExpiredTokenException(_) => "ExpiredTokenException",

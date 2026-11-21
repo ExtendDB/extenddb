@@ -137,9 +137,7 @@ impl AuthProvider for BuiltinAuthProvider {
         let auth_header = headers
             .get("authorization")
             .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| {
-                DynamoDbError::MissingAuthenticationToken("Missing Authentication Token".to_owned())
-            })?;
+            .ok_or_else(DynamoDbError::missing_authentication_token)?;
 
         // Parse Authorization header
         let parsed = sigv4::parse::parse_authorization(auth_header)?;
