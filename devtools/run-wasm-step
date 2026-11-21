@@ -260,14 +260,14 @@ case "$step" in
         # the wasm32 target with rustup if the toolchain lacked it; the
         # workflow's toolchain step installs it.
         #
-        # wasm-pack does make one request of its own: at the start of every
-        # run it asks crates.io (https://crates.io/api/v1/crates/wasm-pack) for
-        # the latest wasm-pack version, unless the wasm-pack.stamp file it
-        # writes beside its binary after asking is less than 25 hours old. The
-        # workflow's tool cache does not keep that file. The answer only
-        # decides whether wasm-pack ends with a warning; when the request
-        # fails, the warning is "failed to get wasm-pack version" and the build
-        # goes on.
+        # wasm-pack does make one request of its own: at the start of a run,
+        # when no wasm-pack.stamp file is beside its binary or the one there
+        # records a check made 25 or more hours before, it asks crates.io
+        # (https://crates.io/api/v1/crates/wasm-pack) for the latest wasm-pack
+        # version and then writes that file. The workflow's tool cache does
+        # not keep the file. The answer only decides whether wasm-pack ends
+        # with a warning; when the request fails, the warning is "failed to
+        # get wasm-pack version" and the build goes on.
         if ! command -v wasm-pack >/dev/null 2>&1; then
             die "wasm-pack is not on PATH; install the version .github/workflows/wasm.yml installs (cargo install --locked --version <that version> wasm-pack)"
         fi
