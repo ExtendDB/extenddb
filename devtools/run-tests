@@ -430,22 +430,20 @@ wasm_workflow_node_major() {
     sed -n 's/^[[:space:]]*node-version:[[:space:]]*"\{0,1\}\([0-9][0-9]*\).*/\1/p' \
         .github/workflows/wasm.yml | head -n 1
 }
-# The directories of links that wasm_select_toolchain and wasm_select_node put
-# first on PATH; removed when a mode ends and when the script exits.
-WASM_TOOLCHAIN_DIR=""
-WASM_NODE_DIR=""
-wasm_remove_link_dirs() {
-    if [ -n "$WASM_TOOLCHAIN_DIR" ]; then
-        rm -rf "$WASM_TOOLCHAIN_DIR"
-        WASM_TOOLCHAIN_DIR=""
-    fi
-    if [ -n "$WASM_NODE_DIR" ]; then
-        rm -rf "$WASM_NODE_DIR"
-        WASM_NODE_DIR=""
+# The directory of the running mode, removed when the mode ends and when the
+# script exits, also on SIGINT, SIGTERM or SIGHUP during a mode (see
+# wasm_stop): it holds the directories of links that wasm_select_toolchain and
+# wasm_select_node put first on PATH, and tmp/, the steps' TMPDIR, so that
+# what a step's programs leave in TMPDIR when they are stopped goes with it.
+WASM_TMP=""
+wasm_remove_tmp() {
+    if [ -n "$WASM_TMP" ]; then
+        rm -rf "$WASM_TMP"
+        WASM_TMP=""
     fi
     return 0
 }
-trap wasm_remove_link_dirs EXIT
+trap wasm_remove_tmp EXIT
 # Saves PATH and RUSTUP_TOOLCHAIN for wasm_restore_env, then puts the
 # workflow's toolchain first. Sets WASM_TOOLCHAIN_NOTE; returns 1 when the
 # toolchain is missing.
@@ -477,11 +475,11 @@ wasm_select_toolchain() {
         # the workflow's. The caller's PATH follows the links unchanged; rustup
         # adds cargo's bin directory ahead of both for the tools it runs (see
         # the section comment above).
-        WASM_TOOLCHAIN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/run-tests-toolchain.XXXXXX")"
+        mkdir "$WASM_TMP/toolchain"
         for tool in cargo rustc rustdoc cargo-clippy clippy-driver rustfmt cargo-fmt; do
-            ln -s "$rustup" "$WASM_TOOLCHAIN_DIR/$tool"
+            ln -s "$rustup" "$WASM_TMP/toolchain/$tool"
         done
-        PATH="$WASM_TOOLCHAIN_DIR:$PATH"
+        PATH="$WASM_TMP/toolchain:$PATH"
         export RUSTUP_TOOLCHAIN="$toolchain"
         WASM_TOOLCHAIN_NOTE="${toolchain} via rustup (from .github/workflows/wasm.yml)"
     fi
@@ -512,9 +510,9 @@ wasm_select_node() {
         WASM_NODE_NOTE="Node ${major} (the version .github/workflows/wasm.yml sets up) is not on PATH as node, node-${major} or node${major}; install Node ${major}, for example from https://nodejs.org or with nvm (\`nvm install ${major}\`)"
         return 1
     fi
-    WASM_NODE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/run-tests-node.XXXXXX")"
-    ln -s "$found" "$WASM_NODE_DIR/node"
-    PATH="$WASM_NODE_DIR:$PATH"
+    mkdir "$WASM_TMP/node"
+    ln -s "$found" "$WASM_TMP/node/node"
+    PATH="$WASM_TMP/node:$PATH"
     WASM_NODE_NOTE="${found} (${version}; Node ${major} from .github/workflows/wasm.yml)"
     return 0
 }
@@ -525,7 +523,49 @@ wasm_restore_env() {
     else
         unset RUSTUP_TOOLCHAIN
     fi
-    wasm_remove_link_dirs
+    wasm_remove_tmp
+}
+# The process group of the running step and the artifact of the running mode,
+# which wasm_stop uses.
+WASM_STEP_PGID=""
+WASM_OUT=""
+# Runs `devtools/run-wasm-step STEP` with its output copied to the artifact
+# OUT, with the mode's tmp/ as its TMPDIR, in a process group of its own
+# (bash's job control, switched on only to start it), and returns its status.
+# A signal to run-tests is not sent to that group, so wasm_stop stops it.
+#   wasm_run_step OUT STEP
+wasm_run_step() {
+    local out="$1" step="$2" rc=0
+    echo "--- devtools/run-wasm-step ${step} ---" | tee -a "$out"
+    set -m
+    TMPDIR="$WASM_TMP/tmp" devtools/run-wasm-step "$step" 2>&1 | tee -a "$out" &
+    set +m
+    WASM_STEP_PGID="$(jobs -p %+)"
+    wait %+ || rc=$?
+    WASM_STEP_PGID=""
+    return "$rc"
+}
+# Run on SIGINT, SIGTERM or SIGHUP while a mode runs: stops the running step's
+# process group (SIGTERM, then SIGKILL if a process of it is left after 60
+# seconds), ends the artifact with "RESULT: FAIL (stopped by SIG<name>)", and
+# exits with STATUS; the EXIT trap then removes the mode's directory.
+#   wasm_stop NAME STATUS
+wasm_stop() {
+    local name="$1" status="$2" waited=0
+    trap - INT TERM HUP
+    if [ -n "$WASM_STEP_PGID" ]; then
+        kill -TERM -- "-$WASM_STEP_PGID" 2>/dev/null || true
+        while kill -0 -- "-$WASM_STEP_PGID" 2>/dev/null && [ "$waited" -lt 60 ]; do
+            sleep 1
+            waited=$((waited + 1))
+        done
+        kill -KILL -- "-$WASM_STEP_PGID" 2>/dev/null || true
+        wait 2>/dev/null || true
+    fi
+    if [ -n "$WASM_OUT" ]; then
+        echo "RESULT: FAIL (stopped by SIG${name})" | tee -a "$WASM_OUT"
+    fi
+    exit "$status"
 }
 # Prints a line for each way in which .github/workflows/wasm.yml would run a
 # step otherwise than run-tests runs it, and returns 1 when it printed any:
@@ -670,15 +710,21 @@ END {
 }
 # Runs one WebAssembly mode: selects the workflow's toolchain (and its Node,
 # when NODE is "node"), writes the header of the mode's artifact, checks the
-# workflow with wasm_workflow_problems, runs each STEP through
-# devtools/run-wasm-step with its output copied to the artifact when the check
-# passed, and ends the artifact with "RESULT: PASS" or "RESULT: FAIL" (and
-# then sets PASS=false).
+# workflow with wasm_workflow_problems, runs each STEP with wasm_run_step when
+# the check passed, and ends the artifact with "RESULT: PASS" or "RESULT:
+# FAIL" (and then sets PASS=false). While it runs, SIGINT, SIGTERM and SIGHUP
+# run wasm_stop.
 #   wasm_mode ARTIFACT TITLE TARGET NODE STEP...
 wasm_mode() {
     local out="$1" title="$2" target="$3" node="$4" rc=0 ready=true step problems
     shift 4
     echo "=== ${title} → ${out} ==="
+    WASM_OUT="$out"
+    trap 'wasm_stop INT 130' INT
+    trap 'wasm_stop TERM 143' TERM
+    trap 'wasm_stop HUP 129' HUP
+    WASM_TMP="$(mktemp -d "${TMPDIR:-/tmp}/run-tests-wasm.XXXXXX")"
+    mkdir "$WASM_TMP/tmp"
     wasm_select_toolchain || ready=false
     WASM_NODE_NOTE="not looked up"
     if [ "$node" = node ] && $ready; then
@@ -729,13 +775,12 @@ wasm_mode() {
         echo "error: none of the steps was run" | tee -a "$out"
     else
         for step in "$@"; do
-            echo "--- devtools/run-wasm-step ${step} ---" | tee -a "$out"
-            if ! devtools/run-wasm-step "$step" 2>&1 | tee -a "$out"; then
-                rc=1
-            fi
+            wasm_run_step "$out" "$step" || rc=1
         done
     fi
     wasm_restore_env
+    trap - INT TERM HUP
+    WASM_OUT=""
     if [ "$rc" -eq 0 ]; then
         echo "RESULT: PASS" | tee -a "$out"
     else
