@@ -26,11 +26,17 @@ const PAGE_BYTES: u64 = crate::read_helpers::PAGE_BYTE_BUDGET as u64;
 /// Read a page of the disjuncts `steps`, numbered in read order: all of them
 /// for the first page, else those a NextToken says the last page left, in
 /// the order the visit rules give (see the `visits` module). Measured
-/// 2026-11-02:
+/// 2026-11-02, the first rule 2026-11-14 and 2026-11-18:
 ///
-/// * a disjunct that names one item takes one unit of `Limit`, whether the
-///   item exists or not (`pk IN ['a', 'zz']` with `Limit` 1 gives [a] and a
-///   NextToken, then an empty page with none);
+/// * a disjunct that names one item takes one unit of `Limit` when the item
+///   exists, also when the filter drops it, and none when it does not, so
+///   the page goes on to the next disjunct and is charged for the read of
+///   the missing key (measured 2026-11-14: with row-0 missing, `pk = 'p' AND
+///   (sk = 'row-0' OR sk = 'row-2')` with `Limit` 1 gives [row-2], no
+///   NextToken and 1 capacity unit; measured 2026-11-18: with row-0 and
+///   row-9 missing, `(sk = 'row-0' OR sk = 'row-9')` gives an empty page, no
+///   NextToken and 1 unit, and with no `v` on row-1, `(sk = 'row-1' OR sk =
+///   'row-2') AND v = 1` gives an empty page and a NextToken, then [row-2]);
 /// * any other disjunct is a Query with the units left; a Query that stops
 ///   at the limit ends the page, and a later page goes on inside it; a
 ///   Query that runs out leaves the units it did not evaluate to the next
@@ -217,8 +223,8 @@ impl Reader<'_> {
         {
             return Ok(Read::Unread);
         }
-        page.add(result, read);
-        Ok(Read::Done(1))
+        let (_, evaluated) = page.add(result, read);
+        Ok(Read::Done(evaluated))
     }
 
     /// Read the Query of the disjunct `read` from `start` into `page`, with

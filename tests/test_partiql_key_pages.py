@@ -5,15 +5,15 @@
 disjuncts read by key.
 
 When every disjunct gives the full primary key of the table, the service
-reads the items in key order, `Limit` keys a page (a key with no item counts
-as one), and returns no NextToken once the last key is read, so a read of one
-item never has one. Disjuncts that read a whole partition page as a Query and
-Scan do.
+reads the items in key order, `Limit` counts the items it reads (a key with no
+item counts none, and the page goes on to the next key), and returns no
+NextToken once the last key is read, so a read of one item never has one.
+Disjuncts that read a whole partition page as a Query and Scan do.
 
 A statement mixing reads of whole items and reads of partitions takes its
-disjuncts in key order, one after another: a whole item takes one unit of
-`Limit`, a partition is a Query with the units left. A page of such a read
-that holds `Limit` items has a LastEvaluatedKey, the table key of its last
+disjuncts in key order, one after another: a whole item that exists takes one
+unit of `Limit`, a partition is a Query with the units left. A page of such a
+read that holds `Limit` items has a LastEvaluatedKey, the table key of its last
 item, with or without a NextToken; any other page has none. A page of whole
 items stops before the item that would take it past 1 MB.
 
