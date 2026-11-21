@@ -40,8 +40,9 @@ problem, unless all of these hold:
    workspace's `[workspace.lints]` allow none of these lints, and
    .cargo/config.toml passes rustc no flag that allows lints or caps them.
    SETTING_PROBES lists lint settings in each of these spellings (attribute,
-   inner attribute, cfg_attr, `[lints]` table, rustflags); the functions that
-   read the crates' files must refuse or accept each one as the list says.
+   inner attribute, cfg_attr, `[lints]` table, rustflags, workflow lines); the
+   functions that read the crates' files and the workflow must refuse or
+   accept each one as the list says.
    Those functions read lint settings as they are written in the files and
    expand no macro: a setting that a macro builds from its input (for example
    `#[$level(clippy::all)]` in a macro_rules! body), or that a procedural
@@ -711,6 +712,13 @@ def rustflags_problems(config: str, settings: dict) -> list[str]:
     return problems
 
 
+def workflow_problems(workflow: str, text: str) -> list[str]:
+    """Problems in the environment that the lines `text` of the workflow file
+    `workflow` set for its steps. This function looks for none."""
+    del workflow, text
+    return []
+
+
 def manifest_problems(crates: dict[str, dict], metadata: dict) -> list[str]:
     problems = []
     root_manifest = Path(metadata["workspace_root"]) / "Cargo.toml"
@@ -759,10 +767,85 @@ _AHL = "clippy::await_holding_lock"
 
 # Lint settings, each in one of the spellings the scan above reads, that it must
 # refuse (True) or accept (False). A "source" probe is read as a source file of
-# a crate the wasm build compiles, a "lints" probe as a manifest's [lints]
-# table, a "config" probe as .cargo/config.toml, by the functions that read the
-# crates' own files.
+# a crate the wasm build compiles, a "lints" probe as a manifest's [lints] (or
+# [workspace.lints]) table, a "config" probe as .cargo/config.toml, and a
+# "workflow" probe as lines of .github/workflows/wasm.yml, by the functions that
+# read the crates' own files and the workflow.
 SETTING_PROBES = [
+    # Lint levels below deny other than allow and expect: warn(warnings) keeps
+    # every warning of the code it covers a warning under the clippy step's
+    # -D warnings; warn of a guarded lint or group sets it below deny.
+    ("source", "#![warn(warnings)]\n", True),
+    ("source", "#[warn(warnings)]" + _FN, True),
+    ("source", '#[cfg_attr(target_arch = "wasm32", warn(warnings))]' + _FN, True),
+    ("source", "fn f() {\n    #[warn(warnings)]\n    g();\n}\n", True),
+    ("source", "#![warn(clippy::all)]\n", True),
+    ("source", f'#[warn({_DM}, reason = "only the server calls it")]' + _FN, True),
+    ("source", "#[warn(clippy::await_holding_refcell_ref)]" + _AFN, True),
+    # A raw identifier names the same attribute or lint.
+    ("source", "#![allow(r#warnings)]\n", True),
+    ("source", "#[allow(clippy::r#all)]" + _FN, True),
+    ("source", "#[allow(r#clippy::style)]" + _FN, True),
+    ("source", "#[r#allow(warnings)]" + _FN, True),
+    ("source", "#[allow(clippy::r#disallowed_methods)]" + _FN, True),
+    ("source", "#![warn(clippy::pedantic)]\n", False),
+    ("source", "#[warn(dead_code)]" + _FN, False),
+    ("source", "#![deny(warnings)]\n", False),
+    ("source", f"#[forbid({_DM})]" + _FN, False),
+    ("lints", '[lints.clippy]\ndisallowed-methods = "allow"\n', True),
+    ("lints", '[lints.clippy]\ndisallowed_methods = "warn"\n', True),
+    ("lints", '[lints.rust]\nwarnings = "warn"\n', True),
+    ("lints", '[lints.clippy]\nstyle = { level = "allow", priority = -1 }\n', True),
+    ("lints", '[workspace.lints.clippy]\nall = "warn"\n', True),
+    ("lints", '[lints.clippy]\ndisallowed_methods = "deny"\n', False),
+    ("lints", '[lints.clippy]\npedantic = "warn"\n', False),
+    (
+        "config",
+        '[target.wasm32-unknown-unknown]\n'
+        'rustflags = ["--force-warn", "clippy::disallowed-methods"]\n',
+        True,
+    ),
+    ("config", '[build]\nrustflags = ["--force-warn=clippy::all"]\n', True),
+    ("config", '[build]\nrustflags = ["-W", "warnings"]\n', True),
+    ("config", '[build]\nrustflags = ["-Wwarnings"]\n', True),
+    ("config", '[build]\nrustflags = ["--warn", "warnings"]\n', True),
+    ("config", '[build]\nrustflags = ["--warn=warnings"]\n', True),
+    ("config", f'[build]\nrustflags = ["-A", "{_DM}"]\n', True),
+    ("config", '[build]\nrustflags = ["--allow", "warnings"]\n', True),
+    ("config", '[build]\nrustflags = ["--allow=warnings"]\n', True),
+    ("config", '[build]\nrustflags = ["--cap-lints=warn"]\n', True),
+    ("config", '[build]\nrustflags = "-W warnings"\n', True),
+    ("config", "[target.'cfg(target_arch = \"wasm32\")']\nrustflags = [\"-Awarnings\"]\n", True),
+    ("config", '[profile.dev]\nrustflags = ["--cap-lints", "allow"]\n', True),
+    ("config", '[profile.dev.package.extenddb-engine]\nrustflags = ["-Awarnings"]\n', True),
+    ("config", '[host]\nrustflags = ["-Awarnings"]\n', True),
+    ("config", '[build]\nrustflags = ["-Zcrate-attr=allow(warnings)"]\n', True),
+    ("config", '[build]\nrustflags = ["-Z", "crate-attr=allow(warnings)"]\n', True),
+    ("config", '[build]\nrustflags = ["@lint-flags.txt"]\n', True),
+    ("config", '[build]\nrustc-wrapper = "lint-wrapper"\n', True),
+    ("config", '[build]\nrustc-workspace-wrapper = "lint-wrapper"\n', True),
+    ("config", '[build]\nrustc = "lint-rustc"\n', True),
+    (
+        "config",
+        '[build]\nrustflags = ["--cfg", "web_sys_unstable_apis", "-C", "target-feature=+simd128",'
+        ' "-D", "warnings", "-Dclippy::all"]\n',
+        False,
+    ),
+    ("config", '[resolver]\nincompatible-rust-versions = "fallback"\n', False),
+    ("workflow", "    env:\n      RUSTFLAGS: --force-warn clippy::disallowed-methods\n", True),
+    ("workflow", "        env:\n          CARGO_ENCODED_RUSTFLAGS: -Awarnings\n", True),
+    ("workflow", "      CARGO_BUILD_RUSTFLAGS: -Awarnings\n", True),
+    ("workflow", "      CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS: -Awarnings\n", True),
+    ("workflow", '        run: echo "RUSTFLAGS=-Awarnings" >> "$GITHUB_ENV"\n', True),
+    ("workflow", "        run: RUSTFLAGS=-Awarnings cargo clippy\n", True),
+    ("workflow", "      RUSTC_WRAPPER: lint-wrapper\n", True),
+    ("workflow", "  # RUSTFLAGS is not set in this workflow.\n", False),
+    (
+        "workflow",
+        "      CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner\n",
+        False,
+    ),
+    ("workflow", "        run: devtools/run-wasm-step clippy\n", False),
     ("source", "#[allow(clippy::all)]" + _FN, True),
     ("source", "#![allow(warnings)]\n", True),
     ("source", '#[cfg_attr(target_arch = "wasm32", allow(clippy::style))]' + _FN, True),
@@ -800,9 +883,13 @@ def setting_probe_problems() -> tuple[list[str], str]:
         if kind == "source":
             found, _ = attribute_problems("crates/probe/src/lib.rs", text, set())
         elif kind == "lints":
-            found = lint_table_problems("crates/probe/Cargo.toml", tomllib.loads(text)["lints"])
-        else:
+            manifest = tomllib.loads(text)
+            table = manifest.get("lints") or manifest.get("workspace", {}).get("lints", {})
+            found = lint_table_problems("crates/probe/Cargo.toml", table)
+        elif kind == "config":
             found = rustflags_problems(".cargo/config.toml", tomllib.loads(text))
+        else:
+            found = workflow_problems(".github/workflows/wasm.yml", text)
         if refuse and not found:
             problems.append(f"lint-setting probe {index} ({kind}) was not refused: {text!r}")
         elif found and not refuse:
