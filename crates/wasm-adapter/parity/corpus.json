@@ -25,8 +25,9 @@
     "          \\r, every other code point below U+0020 as \\u00xx in lower-case",
     "          hex, and every other code point as itself.",
     "  rawBody in place of body: a request string sent as written, for a request",
-    "          a body cannot express (malformed JSON, or a number the rule below",
-    "          refuses). A case has exactly one of body and rawBody.",
+    "          a body cannot express (malformed JSON, JSON that is not an object, or a",
+    "          number the rule below refuses). A case has exactly one of body and",
+    "          rawBody.",
     "  error   null for success, else the expected DynamoDB error short-name",
     "          (the segment of __type after '#', then after '.').",
     "  checks  assertions on the parsed response. Each is one of",
@@ -2461,7 +2462,7 @@
       ]
     },
     {
-      "name": "ListStreams with a two-character TableName lists no streams",
+      "name": "table names: ListStreams with a two-character TableName lists no streams",
       "op": "ListStreams",
       "body": {
         "TableName": "ab"
@@ -2477,7 +2478,7 @@
       ]
     },
     {
-      "name": "GetItem with a TableName outside the name pattern reaches the engine: ResourceNotFoundException",
+      "name": "table names: GetItem with a TableName outside the pattern answers ResourceNotFoundException",
       "op": "GetItem",
       "body": {
         "TableName": "bad name!",
@@ -2496,7 +2497,7 @@
       ]
     },
     {
-      "name": "DescribeStream with a table ARN as StreamArn is refused by the stream lookup",
+      "name": "StreamArn kind: DescribeStream with a table ARN as StreamArn answers Invalid stream ARN format",
       "op": "DescribeStream",
       "body": {
         "StreamArn": "arn:aws:dynamodb:us-east-1:000000000000:table/Str"
@@ -2510,7 +2511,7 @@
       ]
     },
     {
-      "name": "GetItem naming a table in another account by ARN reaches the engine: ResourceNotFoundException",
+      "name": "accounts: GetItem naming a table in another account by ARN answers ResourceNotFoundException",
       "op": "GetItem",
       "body": {
         "TableName": "arn:aws:dynamodb:us-east-1:111111111111:table/Products",
@@ -2529,7 +2530,7 @@
       ]
     },
     {
-      "name": "TagResource on an index ARN is refused by the tag handler",
+      "name": "tag ResourceArn kind: TagResource on an index ARN answers that only a table or stream is accepted",
       "op": "TagResource",
       "body": {
         "ResourceArn": "arn:aws:dynamodb:us-east-1:000000000000:table/Gsi/index/byGsiKey",
@@ -2549,7 +2550,7 @@
       ]
     },
     {
-      "name": "DescribeStream with the stream's ARN respelled in another region describes the table's stream",
+      "name": "StreamArn scope: DescribeStream with the stream's ARN respelled in another region describes the table's stream",
       "op": "DescribeStream",
       "body": {
         "StreamArn": "arn:aws:dynamodb:us-west-2:000000000000:table/Str/stream/${streamLabel}"
@@ -2567,7 +2568,7 @@
       ]
     },
     {
-      "name": "DescribeStream with the stream's ARN respelled in another account describes the table's stream",
+      "name": "accounts: DescribeStream with the stream's ARN respelled in another account describes the table's stream",
       "op": "DescribeStream",
       "body": {
         "StreamArn": "arn:aws:dynamodb:us-east-1:111111111111:table/Str/stream/${streamLabel}"
@@ -2585,7 +2586,7 @@
       ]
     },
     {
-      "name": "GetShardIterator with the stream's ARN respelled in another region returns an iterator",
+      "name": "StreamArn scope: GetShardIterator with the stream's ARN respelled in another region returns an iterator",
       "op": "GetShardIterator",
       "body": {
         "StreamArn": "arn:aws:dynamodb:us-west-2:000000000000:table/Str/stream/${streamLabel}",
@@ -2604,7 +2605,7 @@
       }
     },
     {
-      "name": "GetRecords with an iterator that does not decode is refused by the handler",
+      "name": "GetRecords iterator: GetRecords with an iterator that does not decode answers Invalid ShardIterator",
       "op": "GetRecords",
       "body": {
         "ShardIterator": "not-an-iterator"
@@ -2618,7 +2619,7 @@
       ]
     },
     {
-      "name": "GetRecords with a pre-upgrade iterator is ExpiredIteratorException",
+      "name": "GetRecords iterator: GetRecords with a pre-upgrade iterator answers ExpiredIteratorException",
       "op": "GetRecords",
       "body": {
         "ShardIterator": "c2hhcmRJZC0wMDAwMDAwMDAwMDAwMDAwMDAwMC0wMDAwMDAwMHxBRlRFUl9TRVFVRU5DRV9OVU1CRVJ8fDEwMDA="
@@ -2632,7 +2633,7 @@
       ]
     },
     {
-      "name": "GetRecords with an iterator for the respelled stream ARN reads the stream's records",
+      "name": "GetRecords iterator scope: GetRecords with an iterator for the respelled stream ARN reads the stream's records",
       "op": "GetRecords",
       "body": {
         "ShardIterator": "${westIterator}"
@@ -2674,7 +2675,7 @@
       }
     },
     {
-      "name": "ExportTableToPointInTime with a TableArn that does not parse answers that export is disabled",
+      "name": "export TableArn: ExportTableToPointInTime with a TableArn that does not parse answers that export is disabled",
       "op": "ExportTableToPointInTime",
       "body": {
         "TableArn": "table/Products",
@@ -2756,6 +2757,1389 @@
         {
           "path": "/StreamDescription/LastEvaluatedShardId",
           "absent": true
+        }
+      ]
+    },
+    {
+      "name": "control plane: CreateTable with a global secondary index answers ACTIVE at once",
+      "op": "CreateTable",
+      "body": {
+        "TableName": "CpGsi",
+        "KeySchema": [
+          {
+            "AttributeName": "pk",
+            "KeyType": "HASH"
+          }
+        ],
+        "AttributeDefinitions": [
+          {
+            "AttributeName": "pk",
+            "AttributeType": "S"
+          },
+          {
+            "AttributeName": "g",
+            "AttributeType": "S"
+          }
+        ],
+        "BillingMode": "PAY_PER_REQUEST",
+        "GlobalSecondaryIndexes": [
+          {
+            "IndexName": "byG",
+            "KeySchema": [
+              {
+                "AttributeName": "g",
+                "KeyType": "HASH"
+              }
+            ],
+            "Projection": {
+              "ProjectionType": "ALL"
+            }
+          }
+        ]
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/TableDescription/TableStatus",
+          "equals": "ACTIVE"
+        },
+        {
+          "path": "/TableDescription/GlobalSecondaryIndexes/0/IndexStatus",
+          "equals": "ACTIVE"
+        }
+      ]
+    },
+    {
+      "name": "control plane: PutItem right after that CreateTable writes the item",
+      "op": "PutItem",
+      "body": {
+        "TableName": "CpGsi",
+        "Item": {
+          "pk": {
+            "S": "a"
+          },
+          "g": {
+            "S": "x"
+          }
+        }
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "",
+          "equals": {}
+        }
+      ]
+    },
+    {
+      "name": "control plane: Query on the new index right after the PutItem returns the item",
+      "op": "Query",
+      "body": {
+        "TableName": "CpGsi",
+        "IndexName": "byG",
+        "KeyConditionExpression": "g = :g",
+        "ExpressionAttributeValues": {
+          ":g": {
+            "S": "x"
+          }
+        }
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/Count",
+          "equals": 1
+        },
+        {
+          "path": "/Items/0/pk/S",
+          "equals": "a"
+        }
+      ]
+    },
+    {
+      "name": "table names: Query with a TableName outside the pattern answers ResourceNotFoundException",
+      "op": "Query",
+      "body": {
+        "TableName": "bad name!",
+        "KeyConditionExpression": "pk = :p",
+        "ExpressionAttributeValues": {
+          ":p": {
+            "S": "a"
+          }
+        }
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found"
+        }
+      ]
+    },
+    {
+      "name": "table names: GetItem with a two-character TableName outside the pattern answers ResourceNotFoundException",
+      "op": "GetItem",
+      "body": {
+        "TableName": "a!",
+        "Key": {
+          "productId": {
+            "S": "p1"
+          }
+        }
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found"
+        }
+      ]
+    },
+    {
+      "name": "table names: GetItem with a 301-character TableName outside the pattern answers ResourceNotFoundException",
+      "op": "GetItem",
+      "body": {
+        "TableName": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy!",
+        "Key": {
+          "productId": {
+            "S": "p1"
+          }
+        }
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found"
+        }
+      ]
+    },
+    {
+      "name": "table names: BatchWriteItem with a RequestItems key outside the pattern answers ResourceNotFoundException",
+      "op": "BatchWriteItem",
+      "body": {
+        "RequestItems": {
+          "bad name!": [
+            {
+              "PutRequest": {
+                "Item": {
+                  "pk": {
+                    "S": "x"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found"
+        }
+      ]
+    },
+    {
+      "name": "table names: TransactWriteItems with a member TableName outside the pattern answers ResourceNotFoundException",
+      "op": "TransactWriteItems",
+      "body": {
+        "TransactItems": [
+          {
+            "Put": {
+              "TableName": "bad name!",
+              "Item": {
+                "pk": {
+                  "S": "x"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found"
+        }
+      ]
+    },
+    {
+      "name": "table names: PutItem with a TableName outside the pattern answers the pattern clause",
+      "op": "PutItem",
+      "body": {
+        "TableName": "bad name!",
+        "Item": {
+          "pk": {
+            "S": "x"
+          }
+        }
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "1 validation error detected: Value 'bad name!' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+        }
+      ]
+    },
+    {
+      "name": "table names: PutItem with a TableName of U+0000 and two letters answers the pattern clause",
+      "op": "PutItem",
+      "body": {
+        "TableName": "a\u0000b",
+        "Item": {
+          "pk": {
+            "S": "x"
+          }
+        }
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "1 validation error detected: Value 'a\u0000b' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+        }
+      ]
+    },
+    {
+      "name": "table names: PutItem with a two-character TableName outside the pattern answers the length clause alone",
+      "op": "PutItem",
+      "body": {
+        "TableName": "a!",
+        "Item": {
+          "pk": {
+            "S": "x"
+          }
+        }
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "1 validation error detected: Value 'a!' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3"
+        }
+      ]
+    },
+    {
+      "name": "table names: DescribeTable with a 301-character TableName outside the pattern answers the length clause alone",
+      "op": "DescribeTable",
+      "body": {
+        "TableName": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy!"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "1 validation error detected: Value 'yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy!' at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255"
+        }
+      ]
+    },
+    {
+      "name": "table names: ListBackups with a TableName outside the pattern answers the pattern clause",
+      "op": "ListBackups",
+      "body": {
+        "TableName": "bad name!"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "1 validation error detected: Value 'bad name!' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+        }
+      ]
+    },
+    {
+      "name": "table names: ListBackups with a two-character TableName outside the pattern answers both clauses",
+      "op": "ListBackups",
+      "body": {
+        "TableName": "a!"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "2 validation errors detected: Value 'a!' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3; Value 'a!' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+        }
+      ]
+    },
+    {
+      "name": "table names: DescribeContinuousBackups with a 301-character TableName outside the pattern answers both clauses",
+      "op": "DescribeContinuousBackups",
+      "body": {
+        "TableName": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy!"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "2 validation errors detected: Value 'yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy!' at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255; Value 'yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy!' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+        }
+      ]
+    },
+    {
+      "name": "table names: DescribeLimits with a TableName outside the pattern answers its limits",
+      "op": "DescribeLimits",
+      "body": {
+        "TableName": "bad name!"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/AccountMaxReadCapacityUnits",
+          "present": true
+        },
+        {
+          "path": "/TableMaxWriteCapacityUnits",
+          "present": true
+        }
+      ]
+    },
+    {
+      "name": "table names: ListTables with an ExclusiveStartTableName outside the pattern answers the pattern clause at tableName",
+      "op": "ListTables",
+      "body": {
+        "ExclusiveStartTableName": "bad name!"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "1 validation error detected: Value 'bad name!' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+        }
+      ]
+    },
+    {
+      "name": "table names: ListTables with a two-character ExclusiveStartTableName outside the pattern answers the pattern clause alone",
+      "op": "ListTables",
+      "body": {
+        "ExclusiveStartTableName": "a!"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "1 validation error detected: Value 'a!' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+        }
+      ]
+    },
+    {
+      "name": "table names: ImportTable with a table name outside the pattern answers that import is disabled",
+      "op": "ImportTable",
+      "body": {
+        "TableCreationParameters": {
+          "TableName": "bad name!",
+          "KeySchema": [
+            {
+              "AttributeName": "k",
+              "KeyType": "HASH"
+            }
+          ],
+          "AttributeDefinitions": [
+            {
+              "AttributeName": "k",
+              "AttributeType": "S"
+            }
+          ]
+        },
+        "InputFormat": "DYNAMODB_JSON",
+        "S3BucketSource": {
+          "S3Bucket": "b"
+        }
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Import is disabled. Configure [import] paths in extenddb.toml to enable."
+        }
+      ]
+    },
+    {
+      "name": "table names: ListStreams with a TableName outside the pattern lists no streams",
+      "op": "ListStreams",
+      "body": {
+        "TableName": "bad name!"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "",
+          "equals": {
+            "Streams": []
+          }
+        }
+      ]
+    },
+    {
+      "name": "table names: ListStreams with a table ARN as TableName lists no streams",
+      "op": "ListStreams",
+      "body": {
+        "TableName": "arn:aws:dynamodb:us-east-1:000000000000:table/Str"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "",
+          "equals": {
+            "Streams": []
+          }
+        }
+      ]
+    },
+    {
+      "name": "index names: Query with an IndexName outside the pattern answers that the table has no such index",
+      "op": "Query",
+      "body": {
+        "TableName": "Gsi",
+        "IndexName": "bad index!",
+        "KeyConditionExpression": "gsiKey = :g",
+        "ExpressionAttributeValues": {
+          ":g": {
+            "S": "g1"
+          }
+        }
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "The table does not have the specified index: bad index!"
+        }
+      ]
+    },
+    {
+      "name": "index names: Scan with an IndexName of U+0000 and two letters answers that the table has no such index",
+      "op": "Scan",
+      "body": {
+        "TableName": "Gsi",
+        "IndexName": "g\u0000x"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "The table does not have the specified index: g\u0000x"
+        }
+      ]
+    },
+    {
+      "name": "index names: SearchVectors with an IndexName outside the pattern answers that the table has no such index",
+      "op": "SearchVectors",
+      "body": {
+        "TableName": "VecT",
+        "IndexName": "bad index!",
+        "SearchVector": [
+          {
+            "N": "1"
+          },
+          {
+            "N": "0"
+          },
+          {
+            "N": "0"
+          }
+        ],
+        "TopK": 1
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "The table does not have the specified index: bad index!"
+        }
+      ]
+    },
+    {
+      "name": "index names: Query with an IndexName outside the pattern on a missing table answers ResourceNotFoundException",
+      "op": "Query",
+      "body": {
+        "TableName": "NoSuchTable",
+        "IndexName": "bad index!",
+        "KeyConditionExpression": "gsiKey = :g",
+        "ExpressionAttributeValues": {
+          ":g": {
+            "S": "g1"
+          }
+        }
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found"
+        }
+      ]
+    },
+    {
+      "name": "table ARNs: GetItem with an index ARN as TableName answers ResourceNotFoundException",
+      "op": "GetItem",
+      "body": {
+        "TableName": "arn:aws:dynamodb:us-east-1:000000000000:table/Gsi/index/byGsiKey",
+        "Key": {
+          "pk": {
+            "S": "a"
+          }
+        }
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found"
+        }
+      ]
+    },
+    {
+      "name": "table ARNs: GetItem with a TableName ARN of another vendor answers ResourceNotFoundException",
+      "op": "GetItem",
+      "body": {
+        "TableName": "arn:aws:s3:us-east-1:000000000000:table/Products",
+        "Key": {
+          "productId": {
+            "S": "p1"
+          }
+        }
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found"
+        }
+      ]
+    },
+    {
+      "name": "table ARNs: Query with a TableName ARN whose region is in capitals answers ResourceNotFoundException",
+      "op": "Query",
+      "body": {
+        "TableName": "arn:aws:dynamodb:US-EAST-1:000000000000:table/Cart",
+        "KeyConditionExpression": "pk = :p",
+        "ExpressionAttributeValues": {
+          ":p": {
+            "S": "a"
+          }
+        }
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found"
+        }
+      ]
+    },
+    {
+      "name": "table ARNs: Scan with a TableName ARN whose table is outside the pattern answers ResourceNotFoundException",
+      "op": "Scan",
+      "body": {
+        "TableName": "arn:aws:dynamodb:us-east-1:000000000000:table/bad!"
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found"
+        }
+      ]
+    },
+    {
+      "name": "table ARNs: GetItem with a TableName ARN whose account has five digits answers ResourceNotFoundException",
+      "op": "GetItem",
+      "body": {
+        "TableName": "arn:aws:dynamodb:us-east-1:12345:table/Products",
+        "Key": {
+          "productId": {
+            "S": "p1"
+          }
+        }
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found"
+        }
+      ]
+    },
+    {
+      "name": "table ARNs: PutItem with a TableName that is not a table ARN answers the pattern clause",
+      "op": "PutItem",
+      "body": {
+        "TableName": "arn:bogus",
+        "Item": {
+          "pk": {
+            "S": "x"
+          }
+        }
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "1 validation error detected: Value 'arn:bogus' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+        }
+      ]
+    },
+    {
+      "name": "table ARNs: DescribeTable with a TableName ARN of another vendor answers the pattern clause",
+      "op": "DescribeTable",
+      "body": {
+        "TableName": "arn:aws:s3:us-east-1:000000000000:table/Products"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "1 validation error detected: Value 'arn:aws:s3:us-east-1:000000000000:table/Products' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+        }
+      ]
+    },
+    {
+      "name": "table ARNs: DescribeContinuousBackups with an index ARN as TableName answers TableNotFoundException",
+      "op": "DescribeContinuousBackups",
+      "body": {
+        "TableName": "arn:aws:dynamodb:us-east-1:000000000000:table/Gsi/index/byGsiKey"
+      },
+      "error": "TableNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Table not found: arn:aws:dynamodb:us-east-1:000000000000:table/Gsi/index/byGsiKey"
+        }
+      ]
+    },
+    {
+      "name": "table ARNs: ListBackups with a TableName that is not a table ARN answers that it is not a table name or ARN",
+      "op": "ListBackups",
+      "body": {
+        "TableName": "arn:bogus"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Invalid Request: TableName is not a valid table name or table ARN"
+        }
+      ]
+    },
+    {
+      "name": "table ARNs: ListBackups with an empty table segment answers the length clause",
+      "op": "ListBackups",
+      "body": {
+        "TableName": "arn:aws:dynamodb:us-east-1:000000000000:table/"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "1 validation error detected: Value '' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3"
+        }
+      ]
+    },
+    {
+      "name": "table ARNs: ListBackups with a table segment outside the pattern answers the pattern clause",
+      "op": "ListBackups",
+      "body": {
+        "TableName": "arn:aws:dynamodb:us-east-1:000000000000:table/bad!"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "1 validation error detected: Value 'bad!' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+        }
+      ]
+    },
+    {
+      "name": "table ARNs: ListBackups with a region in capitals answers Invalid AWS region",
+      "op": "ListBackups",
+      "body": {
+        "TableName": "arn:aws:dynamodb:US-EAST-1:000000000000:table/Products"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "1 validation error detected: Invalid AWS region in 'arn:aws:dynamodb:US-EAST-1:000000000000:table/Products'"
+        }
+      ]
+    },
+    {
+      "name": "table ARNs: BatchGetItem with a RequestItems key that is not a table ARN answers ResourceNotFoundException",
+      "op": "BatchGetItem",
+      "body": {
+        "RequestItems": {
+          "arn:bogus": {
+            "Keys": [
+              {
+                "productId": {
+                  "S": "p1"
+                }
+              }
+            ]
+          }
+        }
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found"
+        }
+      ]
+    },
+    {
+      "name": "table ARNs: TransactGetItems with a member TableName ARN of another vendor answers ResourceNotFoundException",
+      "op": "TransactGetItems",
+      "body": {
+        "TransactItems": [
+          {
+            "Get": {
+              "TableName": "arn:aws:s3:us-east-1:000000000000:table/Products",
+              "Key": {
+                "productId": {
+                  "S": "p1"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found"
+        }
+      ]
+    },
+    {
+      "name": "names inside other ARNs: DescribeStream with a stream ARN whose table is outside the pattern answers ResourceNotFoundException",
+      "op": "DescribeStream",
+      "body": {
+        "StreamArn": "arn:aws:dynamodb:us-east-1:000000000000:table/bad name/stream/${streamLabel}"
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "contains": "Requested resource not found: Stream: arn:aws:dynamodb:us-east-1:000000000000:table/bad name/stream/"
+        }
+      ]
+    },
+    {
+      "name": "names inside other ARNs: GetShardIterator with a stream ARN whose label has U+0000 answers ResourceNotFoundException",
+      "op": "GetShardIterator",
+      "body": {
+        "StreamArn": "arn:aws:dynamodb:us-east-1:000000000000:table/Str/stream/x\u0000y",
+        "ShardId": "${shardId}",
+        "ShardIteratorType": "TRIM_HORIZON"
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found: Stream does not exist"
+        }
+      ]
+    },
+    {
+      "name": "names inside other ARNs: ListStreams with an ExclusiveStartStreamArn whose label has U+0000 lists the streams after it",
+      "op": "ListStreams",
+      "body": {
+        "ExclusiveStartStreamArn": "arn:aws:dynamodb:us-east-1:000000000000:table/Str/stream/x\u0000y"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/Streams/0/TableName",
+          "equals": "Str"
+        },
+        {
+          "path": "/Streams/1",
+          "absent": true
+        }
+      ]
+    },
+    {
+      "name": "names inside other ARNs: ListStreams with TableName and an ExclusiveStartStreamArn whose table is outside the pattern answers that it is invalid",
+      "op": "ListStreams",
+      "body": {
+        "TableName": "Str",
+        "ExclusiveStartStreamArn": "arn:aws:dynamodb:us-east-1:000000000000:table/bad name/stream/${streamLabel}"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "contains": "One or more parameter values were invalid: ExclusiveStartStreamArn provided is invalid: arn:aws:dynamodb:us-east-1:000000000000:table/bad name/stream/"
+        }
+      ]
+    },
+    {
+      "name": "names inside other ARNs: TagResource on a stream ARN whose label has U+0000 stores the tag",
+      "op": "TagResource",
+      "body": {
+        "ResourceArn": "arn:aws:dynamodb:us-east-1:000000000000:table/Str/stream/x\u0000y",
+        "Tags": [
+          {
+            "Key": "k",
+            "Value": "v"
+          }
+        ]
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "",
+          "equals": {}
+        }
+      ]
+    },
+    {
+      "name": "names inside other ARNs: ListTagsOfResource on that stream ARN lists the tag",
+      "op": "ListTagsOfResource",
+      "body": {
+        "ResourceArn": "arn:aws:dynamodb:us-east-1:000000000000:table/Str/stream/x\u0000y"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "",
+          "equals": {
+            "Tags": [
+              {
+                "Key": "k",
+                "Value": "v"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "names inside other ARNs: TagResource on a table ARN whose table is outside the pattern answers ResourceNotFoundException",
+      "op": "TagResource",
+      "body": {
+        "ResourceArn": "arn:aws:dynamodb:us-east-1:000000000000:table/bad name",
+        "Tags": [
+          {
+            "Key": "k",
+            "Value": "v"
+          }
+        ]
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found: ResourceArn: arn:aws:dynamodb:us-east-1:000000000000:table/bad name not found"
+        }
+      ]
+    },
+    {
+      "name": "names inside other ARNs: UntagResource on a stream ARN whose table is outside the pattern answers ResourceNotFoundException",
+      "op": "UntagResource",
+      "body": {
+        "ResourceArn": "arn:aws:dynamodb:us-east-1:000000000000:table/bad name/stream/x",
+        "TagKeys": [
+          "k"
+        ]
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found: ResourceArn: arn:aws:dynamodb:us-east-1:000000000000:table/bad name/stream/x not found"
+        }
+      ]
+    },
+    {
+      "name": "names inside other ARNs: ExportTableToPointInTime with a TableArn whose table is outside the pattern answers that export is disabled",
+      "op": "ExportTableToPointInTime",
+      "body": {
+        "TableArn": "arn:aws:dynamodb:us-east-1:000000000000:table/bad!",
+        "S3Bucket": "b"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Export is disabled. Configure [export] paths in extenddb.toml to enable."
+        }
+      ]
+    },
+    {
+      "name": "StreamArn kind: GetShardIterator with a table ARN as StreamArn answers Invalid stream ARN format",
+      "op": "GetShardIterator",
+      "body": {
+        "StreamArn": "arn:aws:dynamodb:us-east-1:000000000000:table/Str",
+        "ShardId": "${shardId}",
+        "ShardIteratorType": "TRIM_HORIZON"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Invalid stream ARN format: arn:aws:dynamodb:us-east-1:000000000000:table/Str"
+        }
+      ]
+    },
+    {
+      "name": "StreamArn kind: DescribeStream with a backup ARN as StreamArn answers Invalid stream ARN format",
+      "op": "DescribeStream",
+      "body": {
+        "StreamArn": "arn:aws:dynamodb:us-east-1:000000000000:table/Str/backup/01791976431438-73d8d5bc"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Invalid stream ARN format: arn:aws:dynamodb:us-east-1:000000000000:table/Str/backup/01791976431438-73d8d5bc"
+        }
+      ]
+    },
+    {
+      "name": "StreamArn kind: DescribeStream with an empty partition field describes the table's stream",
+      "op": "DescribeStream",
+      "body": {
+        "StreamArn": "arn::dynamodb:us-east-1:000000000000:table/Str/stream/${streamLabel}"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/StreamDescription/TableName",
+          "equals": "Str"
+        },
+        {
+          "path": "/StreamDescription/StreamArn",
+          "contains": "arn::dynamodb:us-east-1:000000000000:table/Str/stream/"
+        }
+      ]
+    },
+    {
+      "name": "StreamArn kind: GetShardIterator with an empty account field returns an iterator",
+      "op": "GetShardIterator",
+      "body": {
+        "StreamArn": "arn:aws:dynamodb:us-east-1::table/Str/stream/${streamLabel}",
+        "ShardId": "${shardId}",
+        "ShardIteratorType": "TRIM_HORIZON"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/ShardIterator",
+          "present": true
+        }
+      ]
+    },
+    {
+      "name": "StreamArn scope: DescribeStream with the stream's ARN in partition aws-cn describes the table's stream",
+      "op": "DescribeStream",
+      "body": {
+        "StreamArn": "arn:aws-cn:dynamodb:us-east-1:000000000000:table/Str/stream/${streamLabel}"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/StreamDescription/TableName",
+          "equals": "Str"
+        },
+        {
+          "path": "/StreamDescription/StreamArn",
+          "contains": "arn:aws-cn:dynamodb:us-east-1:"
+        }
+      ]
+    },
+    {
+      "name": "StreamArn scope: DescribeStream with the stream's ARN in service DYNAMODB describes the table's stream",
+      "op": "DescribeStream",
+      "body": {
+        "StreamArn": "arn:aws:DYNAMODB:us-east-1:000000000000:table/Str/stream/${streamLabel}"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/StreamDescription/TableName",
+          "equals": "Str"
+        }
+      ]
+    },
+    {
+      "name": "StreamArn scope: GetShardIterator with the stream's ARN with an empty region returns an iterator",
+      "op": "GetShardIterator",
+      "body": {
+        "StreamArn": "arn:aws:dynamodb::000000000000:table/Str/stream/${streamLabel}",
+        "ShardId": "${shardId}",
+        "ShardIteratorType": "TRIM_HORIZON"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/ShardIterator",
+          "present": true
+        }
+      ]
+    },
+    {
+      "name": "accounts: PutItem naming a table in another account by ARN answers the pattern clause",
+      "op": "PutItem",
+      "body": {
+        "TableName": "arn:aws:dynamodb:us-east-1:111111111111:table/Products",
+        "Item": {
+          "productId": {
+            "S": "x"
+          }
+        }
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "1 validation error detected: Value 'arn:aws:dynamodb:us-east-1:111111111111:table/Products' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+        }
+      ]
+    },
+    {
+      "name": "accounts: UpdateTable naming a table in another account by ARN answers ResourceNotFoundException",
+      "op": "UpdateTable",
+      "body": {
+        "TableName": "arn:aws:dynamodb:us-east-1:111111111111:table/Products",
+        "BillingMode": "PAY_PER_REQUEST"
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found"
+        }
+      ]
+    },
+    {
+      "name": "accounts: DescribeContinuousBackups naming a table in another account by ARN answers TableNotFoundException",
+      "op": "DescribeContinuousBackups",
+      "body": {
+        "TableName": "arn:aws:dynamodb:us-east-1:111111111111:table/Products"
+      },
+      "error": "TableNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Table not found: arn:aws:dynamodb:us-east-1:111111111111:table/Products"
+        }
+      ]
+    },
+    {
+      "name": "accounts: ListBackups naming a table in another account by ARN answers Access is denied",
+      "op": "ListBackups",
+      "body": {
+        "TableName": "arn:aws:dynamodb:us-east-1:111111111111:table/Products"
+      },
+      "error": "AccessDeniedException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Access is denied"
+        }
+      ]
+    },
+    {
+      "name": "accounts: TagResource naming a table in another account answers Access is denied",
+      "op": "TagResource",
+      "body": {
+        "ResourceArn": "arn:aws:dynamodb:us-east-1:111111111111:table/Products",
+        "Tags": [
+          {
+            "Key": "k",
+            "Value": "v"
+          }
+        ]
+      },
+      "error": "AccessDeniedException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Access is denied"
+        }
+      ]
+    },
+    {
+      "name": "accounts: GetShardIterator with the stream's ARN respelled in another account returns an iterator",
+      "op": "GetShardIterator",
+      "body": {
+        "StreamArn": "arn:aws:dynamodb:us-east-1:111111111111:table/Str/stream/${streamLabel}",
+        "ShardId": "${shardId}",
+        "ShardIteratorType": "TRIM_HORIZON"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/ShardIterator",
+          "present": true
+        }
+      ]
+    },
+    {
+      "name": "accounts: ExportTableToPointInTime naming a table in another account answers that export is disabled",
+      "op": "ExportTableToPointInTime",
+      "body": {
+        "TableArn": "arn:aws:dynamodb:us-east-1:111111111111:table/Products",
+        "S3Bucket": "b"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Export is disabled. Configure [export] paths in extenddb.toml to enable."
+        }
+      ]
+    },
+    {
+      "name": "accounts: BatchWriteItem with tables in two accounts answers ResourceNotFoundException",
+      "op": "BatchWriteItem",
+      "body": {
+        "RequestItems": {
+          "arn:aws:dynamodb:us-east-1:111111111111:table/Products": [
+            {
+              "PutRequest": {
+                "Item": {
+                  "productId": {
+                    "S": "x"
+                  }
+                }
+              }
+            }
+          ],
+          "Products": [
+            {
+              "PutRequest": {
+                "Item": {
+                  "productId": {
+                    "S": "mixed"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found"
+        }
+      ]
+    },
+    {
+      "name": "accounts: TransactGetItems with tables in two accounts answers ResourceNotFoundException",
+      "op": "TransactGetItems",
+      "body": {
+        "TransactItems": [
+          {
+            "Get": {
+              "TableName": "arn:aws:dynamodb:us-east-1:111111111111:table/Products",
+              "Key": {
+                "productId": {
+                  "S": "p1"
+                }
+              }
+            }
+          },
+          {
+            "Get": {
+              "TableName": "Products",
+              "Key": {
+                "productId": {
+                  "S": "p1"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found"
+        }
+      ]
+    },
+    {
+      "name": "tag ResourceArn kind: TagResource with a ResourceArn that is not an ARN answers that ARNs must start with arn:",
+      "op": "TagResource",
+      "body": {
+        "ResourceArn": "notanarn",
+        "Tags": [
+          {
+            "Key": "k",
+            "Value": "v"
+          }
+        ]
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "One or more parameter values were invalid: ARNs must start with 'arn:': notanarn"
+        }
+      ]
+    },
+    {
+      "name": "tag ResourceArn kind: UntagResource on a backup ARN answers that it is not a DynamoDB resource ARN",
+      "op": "UntagResource",
+      "body": {
+        "ResourceArn": "arn:aws:dynamodb:us-east-1:000000000000:table/Products/backup/01791976431438-73d8d5bc",
+        "TagKeys": [
+          "k"
+        ]
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "One or more parameter values were invalid: Provided Arn is not a DynamoDB resource arn: arn:aws:dynamodb:us-east-1:000000000000:table/Products/backup/01791976431438-73d8d5bc"
+        }
+      ]
+    },
+    {
+      "name": "tag ResourceArn kind: ListTagsOfResource on a DynamoDB ARN of no table answers that it is not a DynamoDB resource ARN",
+      "op": "ListTagsOfResource",
+      "body": {
+        "ResourceArn": "arn:aws:dynamodb:us-east-1:000000000000:foo/bar"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "One or more parameter values were invalid: Provided Arn is not a DynamoDB resource arn: arn:aws:dynamodb:us-east-1:000000000000:foo/bar"
+        }
+      ]
+    },
+    {
+      "name": "tag ResourceArn kind: ListTagsOfResource on an index ARN answers that only a table or stream is accepted",
+      "op": "ListTagsOfResource",
+      "body": {
+        "ResourceArn": "arn:aws:dynamodb:us-east-1:000000000000:table/Gsi/index/byGsiKey"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "One or more parameter values were invalid: Invalid resource arn provided, only table or stream is accepted. Provided resource arn: arn:aws:dynamodb:us-east-1:000000000000:table/Gsi/index/byGsiKey"
+        }
+      ]
+    },
+    {
+      "name": "export TableArn: ExportTableToPointInTime with a repeated table segment answers that export is disabled",
+      "op": "ExportTableToPointInTime",
+      "body": {
+        "TableArn": "arn:aws:dynamodb:us-east-1:000000000000:table/a/stream/table/b",
+        "S3Bucket": "b"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Export is disabled. Configure [export] paths in extenddb.toml to enable."
+        }
+      ]
+    },
+    {
+      "name": "GetRecords iterator: GetRecords with no ShardIterator answers SerializationException",
+      "op": "GetRecords",
+      "body": {},
+      "error": "SerializationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "missing field `ShardIterator`"
+        }
+      ]
+    },
+    {
+      "name": "GetRecords iterator: GetRecords with a number as ShardIterator answers SerializationException",
+      "op": "GetRecords",
+      "body": {
+        "ShardIterator": 5
+      },
+      "error": "SerializationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "invalid type: integer `5`, expected a string"
+        }
+      ]
+    },
+    {
+      "name": "GetRecords iterator: GetRecords with a null ShardIterator answers SerializationException",
+      "op": "GetRecords",
+      "body": {
+        "ShardIterator": null
+      },
+      "error": "SerializationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "invalid type: null, expected a string"
+        }
+      ]
+    },
+    {
+      "name": "GetRecords iterator: GetRecords with an array as the body answers SerializationException",
+      "op": "GetRecords",
+      "rawBody": "[]",
+      "error": "SerializationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "invalid length 0, expected struct GetRecordsInput with 2 elements"
+        }
+      ]
+    },
+    {
+      "name": "GetRecords iterator: GetRecords with an iterator that does not decode and a string Limit answers SerializationException",
+      "op": "GetRecords",
+      "body": {
+        "ShardIterator": "x",
+        "Limit": "5"
+      },
+      "error": "SerializationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "invalid type: string \"5\", expected i64"
+        }
+      ]
+    },
+    {
+      "name": "GetRecords iterator: GetRecords with an empty ShardIterator answers Invalid ShardIterator",
+      "op": "GetRecords",
+      "body": {
+        "ShardIterator": ""
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Invalid ShardIterator"
+        }
+      ]
+    },
+    {
+      "name": "GetRecords iterator scope: GetRecords with an iterator for a stream in another region that no table has answers ResourceNotFoundException",
+      "op": "GetRecords",
+      "body": {
+        "ShardIterator": "c2hhcmRJZC14fFRSSU1fSE9SSVpPTnx8OTk5OTk5OTk5OTl8YXJuOmF3czpkeW5hbW9kYjp1cy13ZXN0LTI6MDAwMDAwMDAwMDAwOnRhYmxlL1N0cm0vc3RyZWFtLzIwMjYtMDEtMDFUMDA6MDA6MDAuMDAw"
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found: Stream does not exist"
         }
       ]
     }
