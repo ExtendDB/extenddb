@@ -5,7 +5,7 @@
 
 use extenddb_core::expression::ExpressionMaps;
 use extenddb_core::types::{AttributeValue, Item, ReturnValuesOnConditionCheckFailure};
-use extenddb_storage::{DataEngine, IdempotencyKey, TransactWriteOp};
+use extenddb_storage::{DataEngine, IdempotencyKey, ReadOptions, TransactWriteOp};
 
 use crate::helpers::{TestTable, setup_engine};
 
@@ -48,7 +48,7 @@ async fn test_transact_write_put_simple() {
     key.insert("id".to_string(), AttributeValue::S("test_key".to_string()));
 
     let retrieved = engine
-        .get_item(&table.key_info, &key)
+        .get_item(&table.key_info, &key, ReadOptions::default())
         .await
         .expect("get_item should succeed");
 
@@ -122,7 +122,7 @@ async fn test_transact_write_put_and_delete() {
 
     // Verify key1 was deleted
     let retrieved1 = engine
-        .get_item(&table.key_info, &key1)
+        .get_item(&table.key_info, &key1, ReadOptions::default())
         .await
         .expect("get_item should succeed");
     assert!(retrieved1.is_none(), "key1 should be deleted");
@@ -132,7 +132,7 @@ async fn test_transact_write_put_and_delete() {
     key2.insert("id".to_string(), AttributeValue::S("key2".to_string()));
 
     let retrieved2 = engine
-        .get_item(&table.key_info, &key2)
+        .get_item(&table.key_info, &key2, ReadOptions::default())
         .await
         .expect("get_item should succeed");
     assert!(retrieved2.is_some(), "key2 should exist");
@@ -217,7 +217,7 @@ async fn test_transact_write_rollback_on_condition_failure() {
     key2.insert("id".to_string(), AttributeValue::S("key2".to_string()));
 
     let retrieved2 = engine
-        .get_item(&table.key_info, &key2)
+        .get_item(&table.key_info, &key2, ReadOptions::default())
         .await
         .expect("get_item should succeed");
     assert!(
@@ -230,7 +230,7 @@ async fn test_transact_write_rollback_on_condition_failure() {
     key1.insert("id".to_string(), AttributeValue::S("key1".to_string()));
 
     let retrieved1 = engine
-        .get_item(&table.key_info, &key1)
+        .get_item(&table.key_info, &key1, ReadOptions::default())
         .await
         .expect("get_item should succeed");
     assert!(retrieved1.is_some(), "key1 should still exist");
@@ -324,7 +324,7 @@ async fn test_transact_write_rollback_update_existing_item() {
 
     // Item must still exist with original value and be unlocked
     let retrieved = engine
-        .get_item(&table.key_info, &key)
+        .get_item(&table.key_info, &key, ReadOptions::default())
         .await
         .expect("get_item");
     assert!(retrieved.is_some(), "item must still exist after rollback");
@@ -405,7 +405,7 @@ async fn test_transact_write_rollback_delete_existing_item() {
 
     // Item must still exist and be readable (not locked)
     let retrieved = engine
-        .get_item(&table.key_info, &key)
+        .get_item(&table.key_info, &key, ReadOptions::default())
         .await
         .expect("get_item");
     assert!(retrieved.is_some(), "item must still exist after rollback");

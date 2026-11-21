@@ -11,7 +11,7 @@ use extenddb_core::expression::{Expr, ExpressionMaps, PathElement, UpdateAction}
 use extenddb_core::types::{
     AttributeValue, Item, ReturnValuesOnConditionCheckFailure, StreamViewType,
 };
-use extenddb_storage::{DataEngine, StreamCapture, TransactWriteOp};
+use extenddb_storage::{DataEngine, ReadOptions, StreamCapture, TransactWriteOp};
 use extenddb_storage_cassandra::CassandraEngine;
 
 use crate::helpers::{TestTable, setup_engine};
@@ -499,7 +499,7 @@ async fn test_cancelled_transaction_records_nothing() {
     // The uncancelled op's item is not written either.
     assert!(
         engine
-            .get_item(&table.key_info, &key_for("free"))
+            .get_item(&table.key_info, &key_for("free"), ReadOptions::default())
             .await
             .unwrap()
             .is_none(),

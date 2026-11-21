@@ -11,6 +11,7 @@
 mod helpers;
 
 use extenddb_storage::MetadataEngine;
+use extenddb_storage::ReadOptions;
 
 use crate::helpers::setup_engine;
 
@@ -452,7 +453,7 @@ async fn test_ttl_queue_sweep_and_stale_candidate_protection() {
         let mut key = std::collections::BTreeMap::new();
         key.insert("id".to_owned(), AttributeValue::S(id.to_owned()));
         let current = engine
-            .get_item(&table.key_info, &key)
+            .get_item(&table.key_info, &key, ReadOptions::default())
             .await
             .expect("get item after TTL sweep");
         if id == "expired" {
@@ -568,7 +569,7 @@ async fn test_ttl_sweep_emits_service_remove_stream_record() {
     );
     assert!(
         engine
-            .get_item(&key_info, &key)
+            .get_item(&key_info, &key, ReadOptions::default())
             .await
             .expect("read item after failed TTL effects")
             .is_some()
@@ -654,10 +655,15 @@ async fn test_ttl_sweep_emits_service_remove_stream_record() {
         extenddb_core::types::AttributeValue::S("ttl-stream-item".to_owned()),
     );
     assert!(
-        extenddb_storage::DataEngine::get_item(engine.as_ref(), &key_info, &key)
-            .await
-            .unwrap()
-            .is_none(),
+        extenddb_storage::DataEngine::get_item(
+            engine.as_ref(),
+            &key_info,
+            &key,
+            ReadOptions::default()
+        )
+        .await
+        .unwrap()
+        .is_none(),
         "the retried sweep must also complete the base-row delete"
     );
 }
@@ -734,7 +740,7 @@ async fn test_transactional_write_reconciles_ttl_queue() {
     key.insert("id".to_owned(), AttributeValue::S("txn-ttl".to_owned()));
     assert!(
         engine
-            .get_item(&table.key_info, &key)
+            .get_item(&table.key_info, &key, ReadOptions::default())
             .await
             .expect("read transactional TTL item")
             .is_none()
@@ -871,7 +877,7 @@ async fn test_ttl_claim_serializes_delayed_writer() {
         .expect("delete succeeds after immediate put follow-up");
     assert!(
         engine
-            .get_item(&table.key_info, &key)
+            .get_item(&table.key_info, &key, ReadOptions::default())
             .await
             .expect("read after claimed delete")
             .is_none(),
@@ -969,7 +975,7 @@ async fn test_concurrent_ordinary_writes_on_ttl_table_both_succeed() {
     let mut key = Item::new();
     key.insert("id".to_owned(), AttributeValue::S("contended".to_owned()));
     let stored = engine
-        .get_item(&table.key_info, &key)
+        .get_item(&table.key_info, &key, ReadOptions::default())
         .await
         .expect("read after contended writes")
         .expect("one of the writes is durable");
@@ -1271,7 +1277,7 @@ async fn test_disable_drains_claimed_work_and_releases_its_claim() {
     );
     assert!(
         engine
-            .get_item(&table.key_info, &key)
+            .get_item(&table.key_info, &key, ReadOptions::default())
             .await
             .unwrap()
             .is_some(),
@@ -1316,7 +1322,7 @@ async fn test_disable_completes_effects_applying_work() {
     );
     assert!(
         engine
-            .get_item(&table.key_info, &key)
+            .get_item(&table.key_info, &key, ReadOptions::default())
             .await
             .unwrap()
             .is_none()
@@ -1648,7 +1654,7 @@ async fn test_effects_applying_with_changed_image_completes_not_wedges() {
     let mut key = Item::new();
     key.insert("id".to_owned(), AttributeValue::S("drain".to_owned()));
     let survivor = engine
-        .get_item(&table.key_info, &key)
+        .get_item(&table.key_info, &key, ReadOptions::default())
         .await
         .unwrap()
         .expect("the changed item must survive — it postdates the recorded image");
@@ -1863,6 +1869,7 @@ async fn test_effects_applying_recovery_restores_shared_key_gsi_row() {
             None,
             None,
             Some("StatusIndex"),
+            ReadOptions::default(),
         )
         .await
         .unwrap();
@@ -1921,7 +1928,7 @@ async fn test_disable_completes_effects_applied_work() {
     );
     assert!(
         engine
-            .get_item(&table.key_info, &key)
+            .get_item(&table.key_info, &key, ReadOptions::default())
             .await
             .unwrap()
             .is_none(),
@@ -1982,10 +1989,15 @@ async fn test_drained_past_bucket_registration_is_retired() {
         extenddb_core::types::AttributeValue::S("drain".to_owned()),
     );
     assert!(
-        extenddb_storage::DataEngine::get_item(&engine, &table.key_info, &key)
-            .await
-            .unwrap()
-            .is_none(),
+        extenddb_storage::DataEngine::get_item(
+            &engine,
+            &table.key_info,
+            &key,
+            ReadOptions::default()
+        )
+        .await
+        .unwrap()
+        .is_none(),
         "the expired item must have been deleted by the sweep"
     );
     assert_eq!(
@@ -2090,6 +2102,7 @@ async fn test_ttl_sweep_removes_synchronous_gsi_entry() {
                 None,
                 None,
                 Some("StatusIndex"),
+                ReadOptions::default()
             )
             .await
             .unwrap()
@@ -2109,6 +2122,7 @@ async fn test_ttl_sweep_removes_synchronous_gsi_entry() {
                 None,
                 None,
                 Some("StatusIndex"),
+                ReadOptions::default()
             )
             .await
             .unwrap()
@@ -2343,7 +2357,7 @@ async fn test_ttl_reconciles_same_expiry_after_queue_only_claim() {
     key.insert("id".to_owned(), AttributeValue::S("queue-race".to_owned()));
     assert!(
         engine
-            .get_item(&table.key_info, &key)
+            .get_item(&table.key_info, &key, ReadOptions::default())
             .await
             .expect("read eventually expired same-TTL update")
             .is_none()
@@ -2421,7 +2435,7 @@ async fn test_ttl_reconciles_same_expiry_after_queue_only_claim() {
         .expect("worker releases orphaned exact work owner before retiring queue work");
     // Prove the recreation is durable and unclaimed, not merely accepted.
     let stored = engine
-        .get_item(&table.key_info, &key)
+        .get_item(&table.key_info, &key, ReadOptions::default())
         .await
         .unwrap()
         .expect("the recreated item must be durable");
@@ -2503,7 +2517,7 @@ async fn test_ttl_update_recreates_logically_absent_item() {
     // Without this the test would pass on a no-op first update followed by a
     // no-op delete, which is the failure it exists to catch.
     let created = engine
-        .get_item(&table.key_info, &key)
+        .get_item(&table.key_info, &key, ReadOptions::default())
         .await
         .unwrap()
         .expect("the first update must have created the item");
@@ -2524,7 +2538,7 @@ async fn test_ttl_update_recreates_logically_absent_item() {
         .unwrap();
     assert!(
         engine
-            .get_item(&table.key_info, &key)
+            .get_item(&table.key_info, &key, ReadOptions::default())
             .await
             .unwrap()
             .is_none(),
@@ -2552,7 +2566,7 @@ async fn test_ttl_update_recreates_logically_absent_item() {
         .await
         .expect("TTL UpdateItem recreates a row that retains partition metadata");
     let item = engine
-        .get_item(&table.key_info, &key)
+        .get_item(&table.key_info, &key, ReadOptions::default())
         .await
         .unwrap()
         .expect("recreated item exists");
@@ -2603,7 +2617,15 @@ async fn test_conditional_put_recreates_metadata_only_row() {
         .unwrap();
 
     let (scanned, _) = engine
-        .scan(&table.key_info, None, None, None, None, None)
+        .scan(
+            &table.key_info,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ReadOptions::default(),
+        )
         .await
         .expect("scan must ignore a metadata-only physical row");
     assert!(
@@ -2628,7 +2650,7 @@ async fn test_conditional_put_recreates_metadata_only_row() {
         .await
         .expect("conditional put treats metadata-only row as absent");
     let stored = engine
-        .get_item(&table.key_info, &key)
+        .get_item(&table.key_info, &key, ReadOptions::default())
         .await
         .unwrap()
         .expect("the conditional put must be durable");
@@ -3684,7 +3706,15 @@ async fn test_backfill_cursor_is_honored() {
     // order, so ask the engine rather than assuming. Key only: the cursor is
     // an exclusive start key, so the planted item itself is also skipped.
     let (scanned, tail) = engine
-        .scan(&table.key_info, None, None, None, None, None)
+        .scan(
+            &table.key_info,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ReadOptions::default(),
+        )
         .await
         .expect("scan for token order");
     assert!(

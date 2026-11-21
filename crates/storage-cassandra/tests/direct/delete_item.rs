@@ -4,6 +4,7 @@
 //! Direct integration tests for delete_item operation.
 
 use extenddb_storage::DataEngine;
+use extenddb_storage::ReadOptions;
 use std::collections::BTreeMap;
 
 use crate::helpers::{TestTable, setup_engine};
@@ -59,7 +60,7 @@ async fn test_delete_item_pk_only_exists() {
 
     // Verify item is deleted
     let get_result = engine
-        .get_item(&table.key_info, &key)
+        .get_item(&table.key_info, &key, ReadOptions::default())
         .await
         .expect("get_item failed");
     assert!(get_result.is_none());
@@ -222,7 +223,7 @@ async fn test_delete_item_return_old_false() {
 
     // Verify deletion
     let get_result = engine
-        .get_item(&table.key_info, &key)
+        .get_item(&table.key_info, &key, ReadOptions::default())
         .await
         .expect("get_item failed");
     assert!(get_result.is_none());
@@ -376,7 +377,7 @@ async fn test_delete_item_sets_partition_max_delete_timestamp_pk_only() {
     // actually removed the item.
     assert!(
         engine
-            .get_item(&table.key_info, &key)
+            .get_item(&table.key_info, &key, ReadOptions::default())
             .await
             .expect("get after delete")
             .is_none(),
@@ -738,7 +739,7 @@ async fn test_transaction_put_rejected_by_partition_max_delete_timestamp() {
     key.insert("sort".to_string(), AttributeValue::S("sk-new".to_string()));
 
     let retrieved = engine
-        .get_item(&table.key_info, &key)
+        .get_item(&table.key_info, &key, ReadOptions::default())
         .await
         .expect("get_item should succeed");
     assert!(

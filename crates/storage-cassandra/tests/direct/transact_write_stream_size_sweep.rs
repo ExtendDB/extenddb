@@ -12,7 +12,7 @@
 use extenddb_core::expression::ExpressionMaps;
 use extenddb_core::types::{ReturnValuesOnConditionCheckFailure, StreamViewType, TableKeyInfo};
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{DataEngine, IdempotencyKey, TransactWriteOp};
+use extenddb_storage::{DataEngine, IdempotencyKey, ReadOptions, TransactWriteOp};
 use extenddb_storage_cassandra::CassandraEngine;
 
 use crate::helpers::{TestTable, setup_engine};
@@ -97,7 +97,11 @@ async fn test_transact_write_records_at_every_item_size_around_the_batch_limit()
     for kb in [16_usize, 20, 24, 28, 32] {
         let small = key_for(&format!("pair-small-{kb}"));
         assert!(
-            engine.get_item(key_info, &small).await.unwrap().is_some(),
+            engine
+                .get_item(key_info, &small, ReadOptions::default())
+                .await
+                .unwrap()
+                .is_some(),
             "the second op of the {kb} KB pair did not commit"
         );
     }
