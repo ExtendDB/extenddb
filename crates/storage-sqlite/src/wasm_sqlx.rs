@@ -55,11 +55,10 @@
 //! * **Running SQL.** The SQL is trimmed and every statement in it runs in
 //!   turn. `rows_affected` adds up `sqlite3_changes` after each statement (so a
 //!   `SELECT` counts the changes of the last write before it, as SQLite reports
-//!   them) and `last_insert_rowid` is read after the last one; SQL with no
-//!   statement reports 0 for both. `fetch_optional` and `fetch_one` stop at the
-//!   first row: later rows and statements do not run and their errors are not
-//!   seen. `fetch` yields each row in order, a row that fails to decode as an
-//!   error in its place, and stops after a database error.
+//!   them); SQL with no statement reports 0. `fetch_optional` and `fetch_one`
+//!   stop at the first row: later rows and statements do not run and their
+//!   errors are not seen. `fetch` yields each row in order, a row that fails to
+//!   decode as an error in its place, and stops after a database error.
 //! * **The pool.** The pool holds one connection. While a [`Transaction`] or a
 //!   [`PoolConnection`] holds it, a statement on the pool, `acquire`, `begin`
 //!   and `begin_with` fail with [`Error::PoolTimedOut`]; after
@@ -76,10 +75,10 @@
 //!
 //! # Documented differences from `sqlx-sqlite` 0.8.6
 //!
-//! The table in `tests/wasm_shim.rs` has seven `difference: ...` rows: one
-//! each for **One location**, **One connection**, **Nested transactions** and
-//! **After a failed `begin_with`**, and one per terminal (`fetch_one`,
-//! `fetch_optional`, `execute`) for **`$0`**. The other entries have no row.
+//! The table in `tests/wasm_shim.rs` has six `difference: ...` rows: one each
+//! for **One location**, **One connection** and **After a failed
+//! `begin_with`**, and one per terminal (`fetch_one`, `fetch_optional`,
+//! `execute`) for **`$0`**. The other entries have no row.
 //!
 //! * **One location.** The only location that parses is `sqlite::memory:`,
 //!   the URL the backend builds for the in-memory database
@@ -102,9 +101,6 @@
 //!   in-memory pool with `max_connections(2)` runs a statement while a
 //!   transaction holds the first connection; here it fails with
 //!   [`Error::PoolTimedOut`].
-//! * **Nested transactions.** `begin()` on a connection that is already in a
-//!   transaction issues a second `BEGIN`, which SQLite rejects, where `sqlx`
-//!   opens a savepoint. The backend never nests transactions.
 //! * **After a failed `begin_with`.** `sqlx` counts the transaction a
 //!   `begin_with` statement was meant to open even when it fails with
 //!   [`Error::BeginFailed`], so its next `begin_with` on that connection fails
@@ -269,8 +265,6 @@ impl fmt::Display for Error {
         }
     }
 }
-
-impl std::error::Error for Error {}
 
 // ───────────────────────── raw connection ──────────────────────────────
 
@@ -501,13 +495,13 @@ impl SqlitePool {
     /// Begin a deferred transaction (`BEGIN`).
     pub async fn begin(&self) -> Result<Transaction<'static, Sqlite>, Error> {
         let PoolConnection { conn, checkout, .. } = self.acquire().await?;
-        Transaction::start(conn, Some(checkout), None)
+        Transaction::start(conn, checkout, None)
     }
 
     /// Begin a transaction with an explicit statement, e.g. `BEGIN IMMEDIATE`.
     pub async fn begin_with(&self, stmt: &str) -> Result<Transaction<'static, Sqlite>, Error> {
         let PoolConnection { conn, checkout, .. } = self.acquire().await?;
-        Transaction::start(conn, Some(checkout), Some(stmt))
+        Transaction::start(conn, checkout, Some(stmt))
     }
 
     /// Check the connection out of the pool until the returned value drops.
@@ -591,15 +585,15 @@ impl<DB> std::ops::DerefMut for PoolConnection<DB> {
 /// `sqlx`'s.
 ///
 /// Carries a lifetime and database-marker parameter so the backend's
-/// `sqlx::Transaction<'_, sqlx::Sqlite>` spellings resolve; the database
-/// marker is phantom, and the lifetime ties a transaction begun on a borrowed
-/// connection to that borrow.
+/// `sqlx::Transaction<'_, sqlx::Sqlite>` spellings resolve; both are phantom,
+/// since a transaction is begun only on the pool.
 pub struct Transaction<'c, DB = Sqlite> {
     conn: SqliteConnection,
     open: bool,
-    /// Held for a transaction begun on the pool; released after the rollback
-    /// in `Drop`, since fields drop after `Drop::drop` runs.
-    _checkout: Option<Checkout>,
+    /// The pool's connection, checked out until the transaction drops;
+    /// released after the rollback in `Drop`, since fields drop after
+    /// `Drop::drop` runs.
+    _checkout: Checkout,
     _marker: PhantomData<(&'c (), DB)>,
 }
 
@@ -609,7 +603,7 @@ impl<DB> Transaction<'_, DB> {
     /// in `sqlx-sqlite`.
     fn start(
         conn: SqliteConnection,
-        checkout: Option<Checkout>,
+        checkout: Checkout,
         statement: Option<&str>,
     ) -> Result<Self, Error> {
         run_exec(&conn.handle, statement.unwrap_or("BEGIN"))?;
@@ -679,14 +673,6 @@ pub struct SqliteConnectOptions {
 }
 
 impl SqliteConnectOptions {
-    /// Options for the database file `:memory:`, which SQLite opens as a
-    /// private in-memory database.
-    pub fn new() -> Self {
-        SqliteConnectOptions {
-            filename: PathBuf::from(":memory:"),
-        }
-    }
-
     /// The database file name: for `sqlite::memory:`, the name
     /// `file:sqlx-in-memory-<n>` that `sqlx-sqlite` gives it.
     pub fn get_filename(&self) -> &Path {
@@ -697,12 +683,6 @@ impl SqliteConnectOptions {
     /// the value is not used; the method exists for the backend's call.
     pub fn row_buffer_size(self, _rows: usize) -> Self {
         self
-    }
-}
-
-impl Default for SqliteConnectOptions {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -726,24 +706,6 @@ impl std::str::FromStr for SqliteConnectOptions {
         Ok(SqliteConnectOptions {
             filename: PathBuf::from(format!("file:sqlx-in-memory-{seqno}")),
         })
-    }
-}
-
-/// Mirrors the slice of `sqlx::Connection` the backend uses on a bare
-/// connection.
-pub trait Connection {
-    /// Begin a deferred transaction on this connection.
-    fn begin(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Transaction<'_, Sqlite>, Error>> + '_>>;
-}
-
-impl Connection for SqliteConnection {
-    fn begin(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Transaction<'_, Sqlite>, Error>> + '_>> {
-        let conn = self.clone();
-        Box::pin(async move { Transaction::start(conn, None, None) })
     }
 }
 
@@ -816,13 +778,6 @@ impl SqlitePoolOptions {
         self.finish(handle).await
     }
 
-    /// Open the pool from a URL string.
-    pub async fn connect(self, url: &str) -> Result<SqlitePool, Error> {
-        url.parse::<SqliteConnectOptions>()?;
-        let handle = open()?;
-        self.finish(handle).await
-    }
-
     async fn finish(self, handle: Handle) -> Result<SqlitePool, Error> {
         if let Some(cb) = &self.after_connect {
             let mut conn = SqliteConnection {
@@ -838,6 +793,8 @@ impl SqlitePoolOptions {
     }
 }
 
+// Not used by the backend; clippy's `new_without_default` asks a public
+// `new()` to come with it.
 impl Default for SqlitePoolOptions {
     fn default() -> Self {
         Self::new()
@@ -862,11 +819,6 @@ pub trait Bind {
     fn into_param(self) -> Param;
 }
 
-impl Bind for Param {
-    fn into_param(self) -> Param {
-        self
-    }
-}
 impl Bind for String {
     fn into_param(self) -> Param {
         Param::Text(self)
@@ -885,16 +837,6 @@ impl Bind for &str {
 impl Bind for i64 {
     fn into_param(self) -> Param {
         Param::Int(self)
-    }
-}
-impl Bind for i32 {
-    fn into_param(self) -> Param {
-        Param::Int(i64::from(self))
-    }
-}
-impl Bind for u32 {
-    fn into_param(self) -> Param {
-        Param::Int(i64::from(self))
     }
 }
 impl Bind for bool {
@@ -920,17 +862,6 @@ impl Bind for &[u8] {
 impl Bind for &Vec<u8> {
     fn into_param(self) -> Param {
         Param::Blob(self.clone())
-    }
-}
-impl Bind for serde_json::Value {
-    fn into_param(self) -> Param {
-        // sqlx's `json` encoding stores a `Value` as its JSON text.
-        Param::Text(self.to_string())
-    }
-}
-impl Bind for &serde_json::Value {
-    fn into_param(self) -> Param {
-        Param::Text(self.to_string())
     }
 }
 impl<T: Bind> Bind for Option<T> {
@@ -1101,6 +1032,9 @@ impl Decode for i64 {
         }
     }
 }
+// The backend decodes no `i32` on wasm32. This impl serves the shim table's
+// `i32` rows, a REAL, an `i64` too large for `i32` and a NULL read as `i32`,
+// which compare this module's integer decoding with `sqlx`'s.
 impl Decode for i32 {
     fn sql_type() -> &'static str {
         "INTEGER"
@@ -1200,6 +1134,8 @@ macro_rules! tuple_from_row {
         }
     };
 }
+// One line per tuple arity the backend's queries decode; a query that
+// decodes a tuple of another arity needs its line here.
 tuple_from_row!(0: A);
 tuple_from_row!(0: A, 1: B);
 tuple_from_row!(0: A, 1: B, 2: C);
@@ -1208,15 +1144,9 @@ tuple_from_row!(0: A, 1: B, 2: C, 3: D, 4: E);
 tuple_from_row!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F);
 tuple_from_row!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G);
 tuple_from_row!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G, 7: H);
-tuple_from_row!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G, 7: H, 8: I);
 tuple_from_row!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G, 7: H, 8: I, 9: J);
 tuple_from_row!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G, 7: H, 8: I, 9: J, 10: K);
-tuple_from_row!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G, 7: H, 8: I, 9: J, 10: K, 11: L);
-tuple_from_row!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G, 7: H, 8: I, 9: J, 10: K, 11: L, 12: M);
-tuple_from_row!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G, 7: H, 8: I, 9: J, 10: K, 11: L, 12: M, 13: N);
-tuple_from_row!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G, 7: H, 8: I, 9: J, 10: K, 11: L, 12: M, 13: N, 14: O);
 tuple_from_row!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G, 7: H, 8: I, 9: J, 10: K, 11: L, 12: M, 13: N, 14: O, 15: P);
-tuple_from_row!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G, 7: H, 8: I, 9: J, 10: K, 11: L, 12: M, 13: N, 14: O, 15: P, 16: Q);
 
 // ───────────────────────── statement execution ─────────────────────────
 
@@ -1430,21 +1360,16 @@ unsafe fn column_bytes(stmt: *mut ffi::sqlite3_stmt, i: i32, text: bool) -> Vec<
     }
 }
 
-/// Rows affected and last insert id of a run, mirroring `SqliteQueryResult`.
+/// Rows affected by a run, mirroring `SqliteQueryResult`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct QueryResult {
     rows_affected: u64,
-    last_insert_rowid: i64,
 }
 
 impl QueryResult {
     /// `sqlite3_changes` added up over the statements that ran.
     pub fn rows_affected(&self) -> u64 {
         self.rows_affected
-    }
-    /// `sqlite3_last_insert_rowid` after the last statement that ran.
-    pub fn last_insert_rowid(&self) -> i64 {
-        self.last_insert_rowid
     }
 }
 
@@ -1481,9 +1406,9 @@ impl Run {
 /// Prepare, bind and step each statement of `sql` in turn, the way
 /// `sqlx-sqlite` 0.8.6 runs a query: the SQL is trimmed, each statement binds
 /// its own placeholders with the argument offset carried over (see
-/// [`bind_all`]), `sqlite3_changes` is added up after each statement and
-/// `sqlite3_last_insert_rowid` read after it, and the first error stops the
-/// run. SQL with no statement runs nothing and reports zeroes.
+/// [`bind_all`]), `sqlite3_changes` is added up after each statement, and the
+/// first error stops the run. SQL with no statement runs nothing and reports
+/// zero.
 fn run_query(handle: &Handle, sql: &str, params: &[Param], keep: Rows) -> Run {
     let mut run = Run {
         rows: Vec::new(),
@@ -1554,11 +1479,9 @@ fn run_statements(
                 _ => return Err(db_error(db)),
             }
         }
-        // SAFETY: `db` is live; both counters are simple reads.
-        let (changes, rowid) =
-            unsafe { (ffi::sqlite3_changes(db), ffi::sqlite3_last_insert_rowid(db)) };
+        // SAFETY: `db` is live; the counter is a simple read.
+        let changes = unsafe { ffi::sqlite3_changes(db) };
         run.result.rows_affected += u64::try_from(changes).unwrap_or(0);
-        run.result.last_insert_rowid = rowid;
         drop(statement);
     }
     Ok(())
@@ -1620,19 +1543,6 @@ impl<DB> Query<DB> {
     /// Execute for side effect.
     pub async fn execute<E: Executor<Database = DB>>(self, ex: E) -> Result<QueryResult, Error> {
         execute(&ex, &self.sql, &self.params)
-    }
-
-    /// Fetch at most one row; nothing runs after the first row.
-    pub async fn fetch_optional<E: Executor<Database = DB>>(
-        self,
-        ex: E,
-    ) -> Result<Option<Row>, Error> {
-        first_row(&ex, &self.sql, &self.params)
-    }
-
-    /// Fetch exactly one row, erroring if none.
-    pub async fn fetch_one<E: Executor<Database = DB>>(self, ex: E) -> Result<Row, Error> {
-        self.fetch_optional(ex).await?.ok_or(Error::RowNotFound)
     }
 }
 
@@ -1790,5 +1700,5 @@ impl RawSql {
 
 /// Mirrors the `sqlx::sqlite` module the backend imports from.
 pub mod sqlite {
-    pub use super::{Row as SqliteRow, SqliteConnectOptions, SqlitePoolOptions};
+    pub use super::{SqliteConnectOptions, SqlitePoolOptions};
 }

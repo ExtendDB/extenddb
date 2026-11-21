@@ -52,12 +52,9 @@ use std::str::FromStr;
 #[cfg(target_arch = "wasm32")]
 use extenddb_storage_sqlite::wasm_sqlx_for_tests as sqlx;
 use futures::StreamExt;
-use sqlx::Connection;
-#[cfg(not(target_arch = "wasm32"))]
-use sqlx::Row as _;
 
 /// The number of rows named `difference: ...`.
-const DIFFERENCE_ROWS: usize = 7;
+const DIFFERENCE_ROWS: usize = 6;
 
 /// A row's rendered outcome, or the error of a setup step that failed.
 type R = Result<String, sqlx::Error>;
@@ -113,12 +110,18 @@ macro_rules! decode {
     };
 }
 
-/// The pool the backend opens for an in-memory database: one connection.
+/// The pool the backend opens for an in-memory database: one connection, to
+/// the location `sqlite::memory:`.
 async fn pool() -> Result<sqlx::SqlitePool, sqlx::Error> {
     pool_options()
         .max_connections(1)
-        .connect("sqlite::memory:")
+        .connect_with(in_memory()?)
         .await
+}
+
+/// The connect options of the location `sqlite::memory:`.
+fn in_memory() -> Result<sqlx::sqlite::SqliteConnectOptions, sqlx::Error> {
+    sqlx::sqlite::SqliteConnectOptions::from_str("sqlite::memory:")
 }
 
 /// Pool options with a 50 ms acquire timeout (see the module documentation).
@@ -168,15 +171,11 @@ fn mismatch(column: &str, rust: &str, as_sql: &str, found: &str) -> String {
     )
 }
 
-/// `rows_affected` and `last_insert_rowid` of `sql`, run after `setup`.
-async fn counters(pool: &sqlx::SqlitePool, setup: &str, sql: &str) -> R {
+/// `rows_affected` of `sql`, run after `setup`.
+async fn rows_affected(pool: &sqlx::SqlitePool, setup: &str, sql: &str) -> R {
     sqlx::raw_sql(setup).execute(pool).await?;
     Ok(match sqlx::query(sql).execute(pool).await {
-        Ok(r) => format!(
-            "rows_affected={} last_insert_rowid={}",
-            r.rows_affected(),
-            r.last_insert_rowid()
-        ),
+        Ok(r) => format!("rows_affected={}", r.rows_affected()),
         Err(e) => render::<()>(Err(e)),
     })
 }
@@ -228,7 +227,7 @@ async fn stream(pool: &sqlx::SqlitePool, sql: &str) -> String {
 }
 
 // Declared with the crate's `sqlite_row_struct!`, as the backend's catalog row
-// structs are: natively the struct derives `sqlx::FromRow`; on wasm32 the
+// structs are: natively each struct derives `sqlx::FromRow`; on wasm32 the
 // macro generates the impl that reads each field from the column of the
 // field's name through the shim.
 extenddb_storage_sqlite::sqlite_row_struct! {
@@ -236,6 +235,27 @@ extenddb_storage_sqlite::sqlite_row_struct! {
         id: i64,
         name: String,
         nickname: Option<String>,
+    }
+}
+
+extenddb_storage_sqlite::sqlite_row_struct! {
+    /// An integer column `x`.
+    struct IntegerX {
+        x: i64,
+    }
+}
+
+extenddb_storage_sqlite::sqlite_row_struct! {
+    /// A text column `x`.
+    struct TextX {
+        x: String,
+    }
+}
+
+extenddb_storage_sqlite::sqlite_row_struct! {
+    /// An integer column `nope`.
+    struct Nope {
+        nope: i64,
     }
 }
 
@@ -313,35 +333,42 @@ fn cases() -> Vec<Case> {
         }),
         // ── column lookup ──
         row!("a repeated column name finds the last", "Ok(2)", |pool| {
-            let row = sqlx::query("SELECT 1 AS x, 2 AS x")
-                .fetch_one(&pool)
-                .await?;
-            render(row.try_get::<i64, _>("x"))
+            render(
+                sqlx::query_as::<_, IntegerX>("SELECT 1 AS x, 2 AS x")
+                    .fetch_one(&pool)
+                    .await
+                    .map(|row| row.x),
+            )
         }),
         row!(
             "a missing column name",
             "Err[ColumnNotFound] no column found for name: nope",
-            |pool| {
-                let row = sqlx::query("SELECT 1 AS x").fetch_one(&pool).await?;
-                render(row.try_get::<i64, _>("nope"))
-            }
+            |pool| render(
+                sqlx::query_as::<_, Nope>("SELECT 1 AS x")
+                    .fetch_one(&pool)
+                    .await
+                    .map(|row| row.nope)
+            )
         ),
         row!(
             "a column index past the end",
             "Err[ColumnIndexOutOfBounds] column index out of bounds: the len is 2, but the \
-             index is 5",
-            |pool| {
-                let row = sqlx::query("SELECT 1, 2").fetch_one(&pool).await?;
-                render(row.try_get::<i64, _>(5_usize))
-            }
+             index is 2",
+            |pool| render(
+                sqlx::query_as::<_, (i64, i64, i64)>("SELECT 1, 2")
+                    .fetch_one(&pool)
+                    .await
+            )
         ),
         row!(
             "a mismatch read by name names the column",
             mismatch("\"x\"", string, "TEXT", "INTEGER"),
-            |pool| {
-                let row = sqlx::query("SELECT 1 AS x").fetch_one(&pool).await?;
-                render(row.try_get::<String, _>("x"))
-            }
+            |pool| render(
+                sqlx::query_as::<_, TextX>("SELECT 1 AS x")
+                    .fetch_one(&pool)
+                    .await
+                    .map(|row| row.x)
+            )
         ),
         row!(
             "a tuple mismatch names its position",
@@ -527,8 +554,8 @@ fn cases() -> Vec<Case> {
         // ── result counters ──
         row!(
             "rows affected add up over the statements",
-            "rows_affected=3 last_insert_rowid=3",
-            |pool| counters(
+            "rows_affected=3",
+            |pool| rows_affected(
                 &pool,
                 "CREATE TABLE t (id INTEGER)",
                 "INSERT INTO t VALUES (1), (2); INSERT INTO t VALUES (3)"
@@ -537,8 +564,8 @@ fn cases() -> Vec<Case> {
         ),
         row!(
             "empty SQL after a write reports nothing",
-            "rows_affected=0 last_insert_rowid=0",
-            |pool| counters(
+            "rows_affected=0",
+            |pool| rows_affected(
                 &pool,
                 "CREATE TABLE t (id); INSERT INTO t VALUES (1), (2)",
                 ""
@@ -547,8 +574,8 @@ fn cases() -> Vec<Case> {
         ),
         row!(
             "whitespace-only SQL after a write reports nothing",
-            "rows_affected=0 last_insert_rowid=0",
-            |pool| counters(
+            "rows_affected=0",
+            |pool| rows_affected(
                 &pool,
                 "CREATE TABLE t (id); INSERT INTO t VALUES (1)",
                 " \n "
@@ -557,8 +584,8 @@ fn cases() -> Vec<Case> {
         ),
         row!(
             "comment-only SQL after a write reports nothing",
-            "rows_affected=0 last_insert_rowid=0",
-            |pool| counters(
+            "rows_affected=0",
+            |pool| rows_affected(
                 &pool,
                 "CREATE TABLE t (id); INSERT INTO t VALUES (1)",
                 "-- c\n"
@@ -567,8 +594,8 @@ fn cases() -> Vec<Case> {
         ),
         row!(
             "a SELECT after a write reports the write's sqlite3_changes",
-            "rows_affected=2 last_insert_rowid=2",
-            |pool| counters(
+            "rows_affected=2",
+            |pool| rows_affected(
                 &pool,
                 "CREATE TABLE t (id); INSERT INTO t VALUES (1), (2)",
                 "SELECT 1"
@@ -592,16 +619,6 @@ fn cases() -> Vec<Case> {
                 );
                 format!("{first} then {}", ids(&pool).await)
             }
-        ),
-        row!(
-            "query fetch_one does not see a later error",
-            "Ok(1)",
-            |pool| render(
-                sqlx::query(ROW_THEN_ERROR)
-                    .fetch_one(&pool)
-                    .await
-                    .and_then(|row| row.try_get::<i64, _>(0_usize))
-            )
         ),
         row!(
             "query_as fetch_one does not see a later error",
@@ -724,7 +741,7 @@ fn cases() -> Vec<Case> {
                     .min_connections(2)
                     .idle_timeout(None)
                     .max_lifetime(None)
-                    .connect("sqlite::memory:")
+                    .connect_with(in_memory()?)
                     .await?;
                 let _tx = pool.begin().await?;
                 render(sqlx::query("SELECT 1").execute(&pool).await.map(drop))
@@ -746,16 +763,6 @@ fn cases() -> Vec<Case> {
                 let failed = pool.begin_with("SELECT 1").await.map(drop);
                 assert!(failed.is_err(), "SELECT 1 opens no transaction");
                 render(pool.begin_with("BEGIN IMMEDIATE").await.map(drop))
-            }
-        ),
-        difference!(
-            "difference: a nested begin",
-            native: "Ok(())",
-            wasm: "Err[Database] error returned from database: (code: 1) cannot start a \
-                   transaction within a transaction",
-            |pool| {
-                let mut tx = pool.begin().await?;
-                render(Connection::begin(&mut *tx).await.map(drop))
             }
         ),
         // ── close ──
