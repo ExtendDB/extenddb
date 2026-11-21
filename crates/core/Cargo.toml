@@ -51,13 +51,17 @@ uuid = { workspace = true, features = ["js"] }
 # wasm32); the nonce is drawn from getrandom 0.3 directly.
 hmac = "0.12"
 subtle = "2"
-aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc", "zeroize"] }
+# 0.10.3 is the first 0.10 release of aes-gcm that checks the tag before it
+# decrypts: 0.10.0 to 0.10.2 decrypt in place first, so a value whose tag check
+# fails leaves its plaintext in the buffer (RUSTSEC-2023-0096).
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc", "zeroize"] }
 # Each crate in the AES-256-GCM stack wipes only its own key material, and only
 # under its own `zeroize` feature: aes-gcm wipes the GHASH key it derives, aes
 # the AES round keys, ghash the keys it derives for POLYVAL, and polyval the
 # POLYVAL key and state. aes-gcm's feature does not enable the others, so they
-# are named here only to turn the feature on.
-aes = { version = "0.8", features = ["zeroize"] }
+# are named here only to turn the feature on. aes wipes its round keys from
+# 0.8.2; in 0.8.0 and 0.8.1 its `zeroize` feature only enables cipher's.
+aes = { version = "0.8.2", features = ["zeroize"] }
 ghash = { version = "0.5", features = ["zeroize"] }
 polyval = { version = "0.6", features = ["zeroize"] }
 # 0.3.4 is the lowest release this build compiles with: from 0.3.4 the
