@@ -39,7 +39,7 @@ futures = { workspace = true }
 # A `std::time` drop-in that re-exports `std::time` on every target except
 # wasm32, where it backs the clock with the browser APIs. The stream iterator
 # timestamps read the clock and compile into the wasm32 build, so they go
-# through this; native is unchanged.
+# through this.
 web-time = { workspace = true }
 
 # The store-backed backup subsystem and the import/export file I/O depend on

@@ -88,8 +88,7 @@ fn split_nonce(sealed: &[u8]) -> Result<(&[u8; NONCE_LEN], &[u8]), String> {
     }
 }
 
-/// Native backend: AWS-LC through `aws-lc-rs`, unchanged from the server's
-/// historical implementation.
+/// Native backend: AWS-LC through `aws-lc-rs`.
 #[cfg(not(target_arch = "wasm32"))]
 mod imp {
     use super::{KEY_LEN, NONCE_LEN, TAG_LEN, split_nonce};

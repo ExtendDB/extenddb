@@ -39,23 +39,23 @@ bigdecimal = { workspace = true }
 crc32fast = { workspace = true }
 zeroize = { workspace = true }
 # The clock, so the browser build reads time through a backend that works on
-# wasm. `web-time` re-exports `std::time` verbatim on every non-wasm target, so
-# native builds are unchanged; on wasm it reads the host clock. Without it the
+# wasm. On every non-wasm target `web-time` is `pub use std::time::*`; on wasm
+# it reads the host clock. Without it the
 # `std::time` clock reads on the write path (stream-record and TTL timestamps)
 # compile on wasm but trap when called.
 web-time = { workspace = true }
 
 # Storage transport, split per target. Native keeps `sqlx` (SQLite feature) and
-# the C `libsqlite3-sys` verbatim: the native build is unchanged and native
-# SQLite is the behaviour this backend is defined against. On a browser
+# the C `libsqlite3-sys`; native SQLite is the behaviour this backend is
+# defined against. On a browser
 # `wasm32-unknown-unknown` target neither can run — `sqlx-sqlite` dedicates an
 # OS thread to each connection and `libsqlite3-sys` needs a C sysroot — so both
 # are dropped and the crate's `sqlx::` paths resolve instead to the in-crate
 # `wasm_sqlx` module (aliased to `sqlx` at the crate root), a synchronous
 # reimplementation of the slice of the `sqlx` API this backend uses. It drives
 # `sqlite-wasm-rs` (a SQLite bundled for wasm with an in-memory VFS, no threads,
-# no sysroot) over its raw libsqlite3 C ABI. The SQL and the backend's logic are
-# unchanged; only the transport differs.
+# no sysroot) over its raw libsqlite3 C ABI. Both targets run the same SQL
+# text.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 sqlx = { workspace = true, features = ["sqlite"] }
 # SQLite's C API, for the online-backup copy that sqlx does not expose. The
@@ -85,7 +85,7 @@ wasm-bindgen-test = "0.3"
 # The native test dependencies pull the engine, the backup store and tokio's
 # full (net) stack, none of which build for wasm32. Scoping them off wasm lets
 # the wasm32 shim integration test (`tests/wasm_shim.rs`) compile against only
-# the crate and `wasm-bindgen-test`; on every other target the set is unchanged.
+# the crate and `wasm-bindgen-test`; every other target gets the full set.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 extenddb-storage = { path = "../storage", features = ["test-util"] }
 # `tests/backup_job_panic.rs` drives the engine's CreateBackup job and

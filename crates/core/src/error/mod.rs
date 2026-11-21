@@ -348,8 +348,8 @@ impl DynamoDbError {
 /// A last resort: it gives the client a well-formed DynamoDB error document
 /// (`InternalServerError`) instead of empty bytes when `serde_json` cannot
 /// serialize the response value. Every transport that writes a response body
-/// shares this one constant so the fallback is identical on the wire and over
-/// an in-process call.
+/// shares this one constant, so the fallback bytes are the same on the wire and
+/// over an in-process call.
 #[doc(hidden)]
 pub const SERIALIZATION_FAILURE_BODY: &[u8] =
     br#"{"__type":"com.amazonaws.dynamodb.v20120810#InternalServerError","message":"Internal error"}"#;
@@ -403,7 +403,7 @@ fn message_key(error: &DynamoDbError) -> &'static str {
 /// Real DynamoDB validates request format before authentication and answers an
 /// unparseable JSON body with this exact message. Every entry point that parses
 /// a raw request body builds the error from this helper so a malformed request
-/// is reported identically regardless of transport.
+/// gets the same answer on every transport.
 #[doc(hidden)]
 #[must_use]
 pub fn malformed_body_error(error: &serde_json::Error) -> DynamoDbError {

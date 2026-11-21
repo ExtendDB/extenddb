@@ -17,8 +17,7 @@ test-util = []
 
 [dependencies]
 # `web-time` is a drop-in replacement for `std::time` that also compiles on
-# wasm32; it re-exports `std::time` verbatim on native, so native builds are
-# byte-identical.
+# wasm32; on native targets it is `pub use std::time::*`.
 web-time = { workspace = true }
 moka = { workspace = true }
 serde = { workspace = true }
@@ -29,7 +28,7 @@ futures = { workspace = true }
 # wasm32 the workspace's `full` feature pulls in `mio` (networking), which has
 # no wasm32 target and fails to compile. The cache's only production use of
 # tokio is the background-refresh `tokio::spawn`, which needs just `rt`.
-# Target-scoped and additive, so native is unchanged.
+# The native entry below keeps the workspace feature set.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true }
 
