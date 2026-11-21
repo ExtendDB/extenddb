@@ -115,12 +115,12 @@ Suites (at least one required):
   --all             all suites above except --terraform
   --catalog-check   post-test catalog integrity check
   --wasm            the build, clippy and guard steps of the WebAssembly
-                    workflow: wasm32 build, clippy with the disallowed-methods
-                    list of devtools/wasm-clippy, its self-test (needs Python
-                    3.11 or later and git), and the adapter's pedantic clippy,
-                    on the workflow's pinned toolchain when rustup is
-                    installed. Standalone: needs no server, target flag or
-                    credentials; writes discussions/test-wasm-<hash>.txt.
+                    workflow: wasm32 build, clippy with the lists of
+                    devtools/wasm-clippy, their self-test (needs Python 3.11
+                    or later and git), and the adapter's pedantic clippy, on
+                    the workflow's pinned toolchain when rustup is installed.
+                    Standalone: needs no server, target flag or credentials;
+                    writes discussions/test-wasm-<hash>.txt.
                     Override the crate with EXTENDDB_WASM_PKG
                     (default: extenddb-wasm-adapter)
   --headless        build the wasm-pack --target web module and run the shared
@@ -389,10 +389,9 @@ finish_if_only_wasm_suites_left() {
 
 # --- WebAssembly adapter build check (standalone) ---------------------------
 # The build, clippy and guard steps of .github/workflows/wasm.yml, which is the
-# source of this list: the wasm32 build, the wasm32 clippy step with the
-# disallowed-methods list of devtools/wasm-clippy, that list's self-test, and
-# the adapter's pedantic clippy step. Keep the commands below in step with the
-# workflow's.
+# source of this list: the wasm32 build, the wasm32 clippy step with the lists
+# of devtools/wasm-clippy, their self-test, and the adapter's pedantic clippy
+# step. Keep the commands below in step with the workflow's.
 #
 # Clippy's findings depend on its version, so when rustup is installed the
 # suite runs on the toolchain the workflow pins (its `toolchain:` value),
@@ -461,10 +460,10 @@ if $RUN_WASM; then
             2>&1 | tee -a "$WASM_OUTFILE"; then
             WASM_RC=1
         fi
-        # The std and tokio methods listed in devtools/wasm-clippy/clippy.toml,
-        # called from workspace crates, that compile for wasm32 but panic, trap
-        # or never complete in a browser. Calls made inside dependencies are
-        # not seen.
+        # Refuses, in workspace code, the calls devtools/wasm-clippy/clippy.toml
+        # lists as known to trap or hang on wasm32. Calls made inside
+        # dependencies are not seen; the headless parity corpus (--headless)
+        # is the runtime check.
         echo "--- cargo clippy (devtools/wasm-clippy) ---" | tee -a "$WASM_OUTFILE"
         if ! CLIPPY_CONF_DIR="$PROJECT_DIR/devtools/wasm-clippy" \
             cargo clippy --locked -p "$WASM_PKG" --lib --target wasm32-unknown-unknown \

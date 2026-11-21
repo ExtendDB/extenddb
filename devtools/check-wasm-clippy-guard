@@ -6,16 +6,16 @@ could switch it off, and that it refuses a call to each entry.
 
 The guard is the clippy step of the WebAssembly workflow, run with
 CLIPPY_CONF_DIR pointing at devtools/wasm-clippy, whose clippy.toml lists
-methods. A path there that does not resolve only makes clippy print a
-warning, and under -D warnings the step still exits 0 (clippy 0.1.97), so a
+methods and types. A path there that does not resolve only makes clippy print
+a warning, and under -D warnings the step still exits 0 (clippy 0.1.97), so a
 misspelt entry would leave the step green with that call unguarded. Allowing
 clippy::all, clippy::style or warnings, or the two disallowed lints, switches
 the guard off for the code the setting covers, and the step again exits 0.
 This script fails, with one line per problem, unless all of these hold:
 
-1. clippy.toml holds only `disallowed-methods`; each entry is a table with a
-   `path` and a `reason` and nothing else; no path is listed twice; each
-   entry has a probe below and each probe names an entry.
+1. clippy.toml holds only `disallowed-methods` and `disallowed-types`; each
+   entry is a table with a `path` and a `reason` and nothing else; no path is
+   listed twice; each entry has a probe below and each probe names an entry.
 2. In the crates the wasm build compiles (extenddb-wasm-adapter and the
    workspace crates it depends on for wasm32, read from `cargo metadata`), no
    source file under src/ allows or expects clippy::all, clippy::style or
@@ -29,8 +29,8 @@ This script fails, with one line per problem, unless all of these hold:
 3. In a copy of the working tree (the files git tracks or does not ignore,
    uncommitted edits included), with every probe added to a source file of
    PROBE_CRATE, the clippy step of the workflow fails with clippy's
-   disallowed-method error naming the probed path inside each probe, and
-   prints no warning about clippy.toml.
+   disallowed-method or disallowed-type error naming the probed path inside
+   each probe, and prints no warning about clippy.toml.
 
 The copy is built with the caller's clippy.toml and the caller's cargo target
 directory, so cargo reuses what the clippy step already checked. Nothing in
@@ -80,7 +80,7 @@ CLIPPY = [
     "warnings",
 ]
 # A crate the wasm build compiles that depends directly on every crate a probe
-# names (tokio), so each probe compiles there. The probes go in
+# names (tokio, time, futures), so each probe compiles there. The probes go in
 # a new module of it, declared from its crate root.
 PROBE_CRATE = "extenddb-storage"
 PROBE_MODULE = "wasm_clippy_guard_probes"
@@ -120,7 +120,9 @@ _DUR = "std::time::Duration::ZERO"
 _SET = "set: &mut tokio::task::JoinSet<()>"
 _HANDLE = "h: &tokio::runtime::Handle"
 _RT = "rt: &tokio::runtime::Runtime"
+_LRT = "rt: &tokio::runtime::LocalRuntime"
 _CONDVAR = "c: &std::sync::Condvar, m: &std::sync::Mutex<()>"
+_POOL = "p: &mut futures::executor::LocalPool"
 
 # Disallowed method path -> probe items. Each item goes into its own module of
 # the probe file and must draw clippy's disallowed-method error for that path.
@@ -135,16 +137,66 @@ METHOD_PROBES = {
     "std::time::SystemTime::elapsed": [
         "fn probe() { let _ = std::time::UNIX_EPOCH.elapsed(); }",
     ],
+    "time::Instant::now": ["fn probe() { let _ = time::Instant::now(); }"],
+    "time::Instant::elapsed": ["fn probe(at: time::Instant) { let _ = at.elapsed(); }"],
     "std::thread::sleep": [f"fn probe() {{ std::thread::sleep({_DUR}); }}"],
+    "std::thread::sleep_ms": ["fn probe() { std::thread::sleep_ms(0); }"],
     "std::thread::spawn": ["fn probe() { drop(std::thread::spawn(|| ())); }"],
-    "std::thread::scope": ["fn probe() { std::thread::scope(|_| ()); }"],
-    "std::thread::Builder::spawn": [
-        "fn probe() { drop(std::thread::Builder::new().spawn(|| ())); }",
+    "std::thread::Scope::spawn": [
+        "fn probe() { std::thread::scope(|s| { s.spawn(|| ()); }); }",
+        "fn probe<'s>(s: &'s std::thread::Scope<'s, '_>) { drop(s.spawn(|| ())); }",
     ],
-    "std::thread::Builder::spawn_scoped": [
-        "fn probe<'s>(s: &'s std::thread::Scope<'s, '_>) {"
-        " drop(std::thread::Builder::new().spawn_scoped(s, || ())); }",
+    "std::process::id": ["fn probe() { let _ = std::process::id(); }"],
+    "std::process::exit": ["fn probe() -> ! { std::process::exit(0) }"],
+    "std::process::abort": ["fn probe() -> ! { use std::process; process::abort() }"],
+    "std::env::temp_dir": [
+        "fn probe() { let _ = std::env::temp_dir(); }",
+        "fn probe() { use std::env::temp_dir as scratch; let _ = scratch(); }",
     ],
+    "std::env::vars": ["fn probe() { let _ = std::env::vars().count(); }"],
+    "std::env::vars_os": ["fn probe() { use std::env; let _ = env::vars_os().count(); }"],
+    "std::env::set_var": ['fn probe() { unsafe { std::env::set_var("K", "V") } }'],
+    "std::env::remove_var": ['fn probe() { unsafe { std::env::remove_var("K") } }'],
+    "std::env::split_paths": ['fn probe() { let _ = std::env::split_paths("a").count(); }'],
+    "std::sync::mpsc::channel": [
+        "fn probe() { let (_tx, rx) = std::sync::mpsc::channel::<u8>(); for _ in &rx {} }",
+        "fn probe() { use std::sync::mpsc; drop(mpsc::channel::<u8>()); }",
+    ],
+    "std::sync::mpsc::sync_channel": [
+        "fn probe() { drop(std::sync::mpsc::sync_channel::<u8>(0)); }",
+    ],
+    "std::sync::mpsc::Receiver::recv": [
+        "fn probe(rx: &std::sync::mpsc::Receiver<u8>) { let _ = rx.recv(); }",
+    ],
+    "std::sync::mpsc::Receiver::recv_timeout": [
+        f"fn probe(rx: &std::sync::mpsc::Receiver<u8>) {{ let _ = rx.recv_timeout({_DUR}); }}",
+    ],
+    "std::sync::mpsc::Receiver::iter": [
+        "fn probe(rx: &std::sync::mpsc::Receiver<u8>) { for _ in rx.iter() {} }",
+    ],
+    "std::sync::mpsc::SyncSender::send": [
+        "fn probe(tx: &std::sync::mpsc::SyncSender<u8>) { let _ = tx.send(0); }",
+    ],
+    "std::sync::Condvar::wait": [
+        f"fn probe({_CONDVAR}) {{ drop(c.wait(m.lock().unwrap())); }}",
+    ],
+    "std::sync::Condvar::wait_while": [
+        f"fn probe({_CONDVAR}) {{ drop(c.wait_while(m.lock().unwrap(), |()| false)); }}",
+    ],
+    "std::sync::Condvar::wait_timeout": [
+        f"fn probe({_CONDVAR}) {{ drop(c.wait_timeout(m.lock().unwrap(), {_DUR})); }}",
+    ],
+    "std::sync::Condvar::wait_timeout_ms": [
+        f"fn probe({_CONDVAR}) {{ drop(c.wait_timeout_ms(m.lock().unwrap(), 0)); }}",
+    ],
+    "std::sync::Condvar::wait_timeout_while": [
+        f"fn probe({_CONDVAR}) {{"
+        f" drop(c.wait_timeout_while(m.lock().unwrap(), {_DUR}, |()| false)); }}",
+    ],
+    "std::sync::Barrier::wait": ["fn probe(b: &std::sync::Barrier) { let _ = b.wait(); }"],
+    "std::sync::Once::wait": ["fn probe(o: &std::sync::Once) { o.wait(); }"],
+    "std::sync::Once::wait_force": ["fn probe(o: &std::sync::Once) { o.wait_force(); }"],
+    "std::sync::OnceLock::wait": ["fn probe(l: &std::sync::OnceLock<u8>) { let _ = l.wait(); }"],
     "tokio::time::sleep": [
         f"async fn probe() {{ use tokio::time; time::sleep({_DUR}).await; }}",
     ],
@@ -175,6 +227,7 @@ METHOD_PROBES = {
     ],
     "tokio::task::spawn_blocking": ["fn probe() { drop(tokio::task::spawn_blocking(|| ())); }"],
     "tokio::task::spawn_local": ["fn probe() { drop(tokio::task::spawn_local(async {})); }"],
+    "tokio::task::id": ["fn probe() { let _ = tokio::task::id(); }"],
     "tokio::task::JoinSet::spawn": [f"fn probe({_SET}) {{ drop(set.spawn(async {{}})); }}"],
     "tokio::task::JoinSet::spawn_on": [
         f"fn probe({_SET}, {_HANDLE}) {{ drop(set.spawn_on(async {{}}, h)); }}",
@@ -198,6 +251,17 @@ METHOD_PROBES = {
     "tokio::task::LocalSet::block_on": [
         f"fn probe(l: &tokio::task::LocalSet, {_RT}) {{ l.block_on(rt, async {{}}); }}",
     ],
+    "tokio::runtime::Builder::enable_all": [
+        "fn probe() {"
+        " let _ = tokio::runtime::Builder::new_current_thread().enable_all().build(); }",
+    ],
+    "tokio::runtime::Builder::enable_time": [
+        "fn probe() {"
+        " let _ = tokio::runtime::Builder::new_current_thread().enable_time().build(); }",
+    ],
+    "tokio::runtime::LocalRuntime::new": [
+        "fn probe() { let _ = tokio::runtime::LocalRuntime::new(); }",
+    ],
     "tokio::runtime::Handle::current": [
         "fn probe() { drop(tokio::runtime::Handle::current()); }",
         "fn probe() { use tokio::runtime::Handle; drop(Handle::current()); }",
@@ -212,6 +276,21 @@ METHOD_PROBES = {
         f"fn probe({_RT}) {{ drop(rt.spawn_blocking(|| ())); }}",
     ],
     "tokio::runtime::Runtime::block_on": [f"fn probe({_RT}) {{ rt.block_on(async {{}}); }}"],
+    "tokio::runtime::Runtime::shutdown_timeout": [
+        f"fn probe(rt: tokio::runtime::Runtime) {{ rt.shutdown_timeout({_DUR}); }}",
+    ],
+    "tokio::runtime::LocalRuntime::spawn_local": [
+        f"fn probe({_LRT}) {{ drop(rt.spawn_local(async {{}})); }}",
+    ],
+    "tokio::runtime::LocalRuntime::spawn_blocking": [
+        f"fn probe({_LRT}) {{ drop(rt.spawn_blocking(|| ())); }}",
+    ],
+    "tokio::runtime::LocalRuntime::block_on": [
+        f"fn probe({_LRT}) {{ rt.block_on(async {{}}); }}",
+    ],
+    "tokio::runtime::LocalRuntime::shutdown_timeout": [
+        f"fn probe(rt: tokio::runtime::LocalRuntime) {{ rt.shutdown_timeout({_DUR}); }}",
+    ],
     "tokio::sync::mpsc::Sender::send_timeout": [
         f"async fn probe(tx: tokio::sync::mpsc::Sender<u8>) {{"
         f" let _ = tx.send_timeout(0, {_DUR}).await; }}",
@@ -252,41 +331,30 @@ METHOD_PROBES = {
     "tokio::sync::RwLock::blocking_write": [
         "fn probe(l: &tokio::sync::RwLock<u8>) { drop(l.blocking_write()); }",
     ],
-    "std::sync::mpsc::Receiver::recv": [
-        "fn probe(rx: &std::sync::mpsc::Receiver<u8>) { let _ = rx.recv(); }",
-        "fn probe() { use std::sync::mpsc; let (_tx, rx) = mpsc::channel::<u8>();"
-        " let _ = rx.recv(); }",
+    "futures::executor::block_on": [
+        "fn probe() { futures::executor::block_on(async {}); }",
+        "fn probe() { use futures::executor::block_on as wait; wait(async {}); }",
     ],
-    "std::sync::mpsc::Receiver::recv_timeout": [
-        f"fn probe(rx: &std::sync::mpsc::Receiver<u8>) {{ let _ = rx.recv_timeout({_DUR}); }}",
+    "futures::executor::block_on_stream": [
+        "fn probe() {"
+        " let _ = futures::executor::block_on_stream(futures::stream::empty::<u8>()); }",
     ],
-    "std::sync::Condvar::wait": [
-        f"fn probe({_CONDVAR}) {{ drop(c.wait(m.lock().unwrap())); }}",
+    "futures::executor::LocalPool::run": [f"fn probe({_POOL}) {{ p.run(); }}"],
+    "futures::executor::LocalPool::run_until": [
+        f"fn probe({_POOL}) {{ p.run_until(async {{}}); }}",
     ],
-    "std::sync::Condvar::wait_while": [
-        f"fn probe({_CONDVAR}) {{ drop(c.wait_while(m.lock().unwrap(), |()| false)); }}",
-    ],
-    "std::sync::Condvar::wait_timeout": [
-        f"fn probe({_CONDVAR}) {{ drop(c.wait_timeout(m.lock().unwrap(), {_DUR})); }}",
-    ],
-    "std::sync::Condvar::wait_timeout_while": [
-        f"fn probe({_CONDVAR}) {{"
-        f" drop(c.wait_timeout_while(m.lock().unwrap(), {_DUR}, |()| false)); }}",
-    ],
-    "std::env::temp_dir": [
-        "fn probe() { let _ = std::env::temp_dir(); }",
-        "fn probe() { use std::env::temp_dir as scratch; let _ = scratch(); }",
-    ],
-    "std::env::vars": ["fn probe() { let _ = std::env::vars().count(); }"],
-    "std::env::vars_os": ["fn probe() { use std::env; let _ = env::vars_os().count(); }"],
-    "std::env::set_var": ['fn probe() { unsafe { std::env::set_var("K", "V") } }'],
-    "std::env::remove_var": ['fn probe() { unsafe { std::env::remove_var("K") } }'],
-    "std::env::split_paths": ['fn probe() { let _ = std::env::split_paths("a").count(); }'],
-    "std::process::id": ["fn probe() { let _ = std::process::id(); }"],
-    "std::process::exit": ["fn probe() -> ! { std::process::exit(0) }"],
 }
 
-KINDS = {"disallowed-methods": ("method", METHOD_PROBES)}
+# Disallowed type path -> probe items, which must draw clippy's
+# disallowed-type error for that path.
+TYPE_PROBES = {
+    "std::sync::mpsc::Receiver": [
+        "fn probe(rx: &std::sync::mpsc::Receiver<u8>) { for _ in rx {} }",
+        "fn probe() { use std::sync::mpsc::Receiver as Inbox; let _: Option<Inbox<u8>> = None; }",
+    ],
+}
+
+KINDS = {"disallowed-methods": ("method", METHOD_PROBES), "disallowed-types": ("type", TYPE_PROBES)}
 
 
 def read_config() -> tuple[dict[str, list[str]], list[str]]:
@@ -757,7 +825,12 @@ def main() -> int:
     failures += found
     for failure in failures:
         print(f"FAIL: {failure}", file=sys.stderr)
-    print(f"{entries} entries in clippy.toml; {probes or 'no probe run'}")
+    methods = len(paths.get("disallowed-methods", []))
+    types = len(paths.get("disallowed-types", []))
+    print(
+        f"{entries} entries in clippy.toml ({methods} methods, {types}"
+        f" type{'' if types == 1 else 's'}); {probes or 'no probe run'}"
+    )
     return 1 if failures else 0
 
 

@@ -8,7 +8,7 @@
 # (sqlite-wasm-rs) behind a synchronous shim. No other workflow builds that
 # target, so without this job a change can break the wasm build with every
 # other check green: a new aws-lc-rs call, a call in a wasm-compiled workspace
-# crate that panics or never completes in a browser (the methods listed in
+# crate that is known to trap or hang on wasm32 (the calls listed in
 # devtools/wasm-clippy/clippy.toml), or a shim regression are all invisible to
 # the native test and clippy jobs. It is not a required status check on main
 # today; it must become one (a maintainer adds it to main's required checks)
@@ -107,13 +107,14 @@ jobs:
 
       # Lints the adapter and every workspace crate it compiles for wasm32
       # (without --no-deps, clippy lints each workspace dependency too), with
-      # the disallowed-methods list in devtools/wasm-clippy/clippy.toml: std
-      # and tokio methods that compile for wasm32 and panic, trap or never
-      # complete when they run in a browser. It refuses calls written in
-      # workspace crates only; a call a dependency makes in its own code is not
-      # seen (the file's header names the known case). CLIPPY_CONF_DIR is set
-      # on this step only, so native clippy keeps the repository's defaults.
-      # --lib keeps the host-only integration tests out of the wasm build.
+      # the lists in devtools/wasm-clippy/clippy.toml, which name the calls
+      # known to trap or hang when they run on wasm32. It sees workspace code
+      # only: a call a dependency makes in its own code is not seen (the
+      # file's header names the known case), nor is a call the lists do not
+      # name. The headless parity corpus below is the runtime check.
+      # CLIPPY_CONF_DIR is set on this step only, so native clippy keeps the
+      # repository's defaults. --lib keeps the host-only integration tests out
+      # of the wasm build.
       - name: Clippy the wasm32 build
         env:
           CLIPPY_CONF_DIR: ${{ github.workspace }}/devtools/wasm-clippy
