@@ -78,7 +78,10 @@ fails, with one line per problem, unless all of these hold:
    a copy of the working tree, a module outside src/ that #[path] names and a
    file of another extension that include! reads, each with a lint setting
    the scan must refuse; the scan, run on that copy, must read and refuse
-   both.
+   both. DRIVER_PROBES lists values of CLIPPY_ARGS and CLIPPY_CONF_DIR, as a
+   crate's dep-info records what clippy-driver read, and reports of the
+   clippy step, that the function reading them must refuse or accept as the
+   list says.
    Those functions read lint settings as they are written in the files and
    expand no macro: a setting that a macro builds from its input (for example
    `#[$level(clippy::all)]` in a macro_rules! body), or that a procedural
@@ -113,6 +116,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import NamedTuple
 
 try:
     import tomllib
@@ -898,9 +902,18 @@ def manifest_problems(crates: dict[str, dict], metadata: dict) -> list[str]:
     return problems + workflow_problems(WORKFLOW_REL, workflow)
 
 
-def compiled_files(
-    crates: dict[str, dict], root: Path, target_dir: str
-) -> tuple[dict[str, list[Path]], list[str]]:
+class Compiled(NamedTuple):
+    """What compiled_files found: the files and the environment variables that
+    each crate's dep-info lists, the clippy step's compiler messages, and the
+    problems."""
+
+    files: dict[str, list[Path]]
+    envs: dict[str, dict[str, str]]
+    messages: list[dict]
+    problems: list[str]
+
+
+def compiled_files(crates: dict[str, dict], root: Path, target_dir: str) -> Compiled:
     """The files rustc reads to compile each of `crates`, and the problems
     found. It runs the clippy step in the tree at `root` (the working tree or a
     copy of it) and reads, for each crate, the dep-info file that rustc writes
@@ -917,7 +930,7 @@ def compiled_files(
     by_manifest = {
         Path(package["manifest_path"]).relative_to(ROOT): name for name, package in crates.items()
     }
-    files, problems = {}, []
+    files, envs, problems = {}, {}, []
     for artifact in artifacts:
         manifest = Path(artifact["manifest_path"]).resolve()
         if not manifest.is_relative_to(root) or "custom-build" in artifact["target"]["kind"]:
@@ -926,7 +939,7 @@ def compiled_files(
         for output in map(Path, artifact["filenames"] if name else []):
             dep_info = output.with_name(output.name.removeprefix("lib")).with_suffix(".d")
             if dep_info.is_file():
-                files[name] = dep_info_files(dep_info, root)
+                files[name], envs[name] = read_dep_info(dep_info, root)
                 break
     for name in sorted(set(crates) - set(files)):
         problems.append(
@@ -942,27 +955,42 @@ def compiled_files(
     for name, paths in sorted(files.items()):
         missing = [path for path in paths if not path.is_file()]
         problems += [f"{path}: in the dep-info of {name}, but missing" for path in missing]
-    return files, problems
+    return Compiled(files, envs, messages, problems)
 
 
-def dep_info_files(dep_info: Path, root: Path) -> list[Path]:
+def read_dep_info(dep_info: Path, root: Path) -> tuple[list[Path], dict[str, str]]:
     """The files a rustc dep-info file lists, other than the Cargo.toml and
-    the clippy configuration that clippy adds to it. rustc writes a line
-    `<file>:` for each, with a space in the name written `\\ `; a relative
-    name is relative to `root`, where cargo ran rustc."""
-    found = []
+    the clippy configuration that clippy adds to it, and the environment
+    variables it records (`# env-dep:NAME=VALUE`): those the compilation
+    tracks, which include each that the crate reads with env! or option_env!
+    and the CLIPPY_ARGS and CLIPPY_CONF_DIR that clippy-driver reads. rustc
+    writes a line `<file>:` for each file, with a space in the name written
+    `\\ `; a relative name is relative to `root`, where cargo ran rustc."""
+    found, env = [], {}
     for line in dep_info.read_text(encoding="utf-8").splitlines():
+        if line.startswith("# env-dep:"):
+            name, _, value = line.removeprefix("# env-dep:").partition("=")
+            env[name] = value
         if line.startswith("#") or not line.endswith(":"):
             continue
         path = Path(os.path.normpath(root / line[:-1].replace("\\ ", " ")))
         if path.name not in ("Cargo.toml", "clippy.toml", ".clippy.toml"):
             found.append(path)
-    return found
+    return found, env
+
+
+def driver_problems(envs: dict[str, dict[str, str]], messages: list[dict]) -> list[str]:
+    """Problems in what clippy-driver ran with for each crate of the clippy
+    step, as `envs` (the variables each crate's dep-info records) holds it, and
+    in the step's reports `messages`. This function looks for none."""
+    del envs, messages
+    return []
 
 
 def lint_setting_problems(crates: dict[str, dict], metadata: dict) -> tuple[list[str], str]:
     used_migration, reasoned, read = set(), 0, set()
-    files, problems = compiled_files(crates, ROOT, metadata["target_directory"])
+    compiled = compiled_files(crates, ROOT, metadata["target_directory"])
+    files, problems = compiled.files, compiled.problems
     for name in sorted(files):
         for path in files[name]:
             if path in read or not path.is_file():
@@ -1150,6 +1178,76 @@ def setting_probe_problems() -> tuple[list[str], str]:
     return problems, summary
 
 
+# cargo clippy passes the arguments after `--` to clippy-driver in the variable
+# CLIPPY_ARGS, each followed by this separator (clippy 0.1.97); rustc records
+# the variable in the dep-info, as `-D__CLIPPY_HACKERY__warnings__CLIPPY_HACKERY__`
+# for the clippy step.
+CLIPPY_ARGS_SEPARATOR = "__CLIPPY_HACKERY__"
+
+
+def _driver_env(args: list[str] | None, conf_dir: str | None = str(CONF_DIR)) -> dict:
+    """The variables a crate's dep-info records for a clippy-driver run with
+    `args` after `--` and CLIPPY_CONF_DIR `conf_dir` (None: not recorded)."""
+    env = {} if conf_dir is None else {"CLIPPY_CONF_DIR": conf_dir}
+    if args is not None:
+        env["CLIPPY_ARGS"] = "".join(arg + CLIPPY_ARGS_SEPARATOR for arg in args)
+    return env
+
+
+def _report(level: str, lint: str) -> dict:
+    """A compiler message of `lint` at `level`, in the shape of cargo's JSON."""
+    return {
+        "level": level,
+        "code": {"code": lint, "explanation": None},
+        "message": f"a report of {lint}",
+        "rendered": f"{level}: a report of {lint}",
+        "spans": [{"file_name": "crates/probe/src/lib.rs", "line_start": 1, "is_primary": True}],
+    }
+
+
+_STEP_ARGS = ["-D", "warnings"]
+# What the dep-info of a crate of the clippy step may record, and what the
+# step may report, that driver_problems must refuse (True) or accept (False):
+# (the variables of crate "probe", the step's messages, refuse). A build
+# script's cargo::rustc-env, or an [env] entry with force = true in the cargo
+# configuration, changes CLIPPY_ARGS or CLIPPY_CONF_DIR for the crate's
+# compilation.
+DRIVER_PROBES = [
+    (_driver_env(_STEP_ARGS), [], False),
+    (_driver_env(["-Dwarnings", "-D", "clippy::all"]), [], False),
+    (_driver_env(["--force-warn", "clippy::disallowed-methods"]), [], True),
+    (_driver_env(_STEP_ARGS + ["--cap-lints", "allow"]), [], True),
+    (_driver_env(_STEP_ARGS + ["-A", "clippy::disallowed_methods"]), [], True),
+    (_driver_env([]), [], True),
+    (_driver_env(None), [], True),
+    (_driver_env(_STEP_ARGS, "/"), [], True),
+    (_driver_env(_STEP_ARGS, None), [], True),
+    (_driver_env(_STEP_ARGS), [_report("warning", "clippy::disallowed_methods")], True),
+    (_driver_env(_STEP_ARGS), [_report("warning", "clippy::disallowed_types")], True),
+    (_driver_env(_STEP_ARGS), [_report("warning", "clippy::await_holding_refcell_ref")], True),
+    (_driver_env(_STEP_ARGS), [_report("error", "clippy::await_holding_lock")], False),
+    (_driver_env(_STEP_ARGS), [_report("warning", "dead_code")], False),
+]
+
+
+def driver_probe_problems() -> tuple[list[str], str]:
+    """Problems with DRIVER_PROBES: one driver_problems does not refuse, or
+    refuses that it must accept."""
+    problems = []
+    for index, (env, messages, refuse) in enumerate(DRIVER_PROBES):
+        found = driver_problems({"probe": env}, messages)
+        reports = [f"{m['level']} {m['code']['code']}" for m in messages]
+        if refuse and not found:
+            problems.append(f"driver probe {index} was not refused: {env}, reports {reports}")
+        elif found and not refuse:
+            problems.append(f"driver probe {index} was refused, which it must not be: {found}")
+    summary = (
+        f"driver probes: {len(DRIVER_PROBES) - len(problems)} of {len(DRIVER_PROBES)}"
+        " read as expected"
+    )
+    return problems, summary
+
+
 # ---------------------------------------------------------------- probe run
 
 # Files added, in the copy of the tree, to FILE_PROBE_CRATE, each with a lint
@@ -1200,10 +1298,9 @@ def file_probe_problems(
         (copy / crate_dir / rel).write_text(text, encoding="utf-8")
         with open(copy / crate_root, "a", encoding="utf-8") as root_file:
             root_file.write("\n" + declaration)
-    files, problems = compiled_files(
-        {FILE_PROBE_CRATE: package}, copy, metadata["target_directory"]
-    )
-    read = {path.resolve() for path in files.get(FILE_PROBE_CRATE, [])}
+    compiled = compiled_files({FILE_PROBE_CRATE: package}, copy, metadata["target_directory"])
+    problems = compiled.problems
+    read = {path.resolve() for path in compiled.files.get(FILE_PROBE_CRATE, [])}
     refused = 0
     for rel, _, _ in FILE_PROBES:
         path = (copy / crate_dir / rel).resolve()
@@ -1453,6 +1550,9 @@ def main() -> int:
     failures += found
     print(settings)
     found, settings = setting_probe_problems()
+    failures += found
+    print(settings)
+    found, settings = driver_probe_problems()
     failures += found
     print(settings)
     found, settings = message_probe_problems()
