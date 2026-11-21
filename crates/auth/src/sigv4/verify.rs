@@ -18,7 +18,7 @@ use super::signing_key;
 const MAX_CLOCK_SKEW_SECS: i64 = 15 * 60;
 
 /// The scope complaint for a date that is not the `YYYYMMDD` prefix of
-/// `X-Amz-Date`, with the trailing period and space the service sends.
+/// the request date, with the trailing period and space the service sends.
 pub(crate) const SCOPE_DATE_COMPLAINT: &str =
     "Date in Credential scope does not match YYYYMMDD from ISO-8601 version of date from HTTP. ";
 
@@ -33,7 +33,7 @@ fn scope_date_matches(date: &str, timestamp: &str) -> bool {
 /// Check the credential scope's region, service and date against this server
 /// and the request timestamp.
 ///
-/// `timestamp` is the `X-Amz-Date` value, which `validate_timestamp` returns.
+/// `timestamp` is the request date, which `validate_timestamp` returns.
 ///
 /// The service reports every scope complaint in one message, region first,
 /// then service, then the date, each sentence ending with a space (measured
@@ -106,7 +106,7 @@ pub fn verify_signature(
         ));
     }
 
-    // CB-5: Validate credential-scope date matches X-Amz-Date[..8]. The
+    // CB-5: Validate credential-scope date matches the request date[..8]. The
     // pre-lookup check_scope compares it too; this keeps the refusal for a
     // caller that verifies a signature on its own.
     let timestamp = extract_timestamp(headers)?;
@@ -158,7 +158,8 @@ pub fn verify_signature(
 
 /// Validate the request timestamp is within ±15 minutes of now.
 ///
-/// Returns the `X-Amz-Date` value, which the caller passes to `check_scope`.
+/// Returns the request date (see `request_date`), which the caller passes to
+/// `check_scope`.
 ///
 /// Returns `UnrecognizedClientException` if the timestamp is missing or out of range.
 /// Returns `InternalServerError` if the system clock is misconfigured.
@@ -173,9 +174,10 @@ pub fn validate_timestamp(headers: &HeaderMap) -> Result<String, DynamoDbError> 
         .ok_or_else(|| DynamoDbError::InternalServerError("server clock error".to_owned()))?;
 
     let request_epoch = parse_iso8601_basic(&timestamp).ok_or_else(|| {
-        DynamoDbError::IncompleteSignature(
-            "Date must be in ISO 8601 basic format (YYYYMMDDTHHMMSSZ)".to_owned(),
-        )
+        // Measured 2026-11-21: the service echoes the value it refuses.
+        DynamoDbError::IncompleteSignature(format!(
+            "Date must be in ISO-8601 'basic format'. Got '{timestamp}'. See http://en.wikipedia.org/wiki/ISO_8601"
+        ))
     })?;
 
     let skew = (now - request_epoch).abs();
@@ -189,16 +191,24 @@ pub fn validate_timestamp(headers: &HeaderMap) -> Result<String, DynamoDbError> 
 }
 
 /// Extract the timestamp from `X-Amz-Date` header.
+/// Without that header, the `Date` value counts (see `request_date`).
 fn extract_timestamp(headers: &HeaderMap) -> Result<String, DynamoDbError> {
+    request_date(headers).map(str::to_owned).ok_or_else(|| {
+        DynamoDbError::IncompleteSignature(
+            "Authorization header requires existence of 'X-Amz-Date' header".to_owned(),
+        )
+    })
+}
+
+/// The request's date: the `X-Amz-Date` value when the request has that
+/// header, else the `Date` value. Measured 2026-11-21: the service reads
+/// `Date` only when `X-Amz-Date` is absent, and an empty value is no date.
+pub(crate) fn request_date(headers: &HeaderMap) -> Option<&str> {
     headers
         .get("x-amz-date")
+        .or_else(|| headers.get("date"))
         .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            DynamoDbError::IncompleteSignature(
-                "Authorization header requires existence of 'X-Amz-Date' header".to_owned(),
-            )
-        })
+        .filter(|v| !v.is_empty())
 }
 
 /// Parse ISO 8601 basic format `YYYYMMDDTHHMMSSZ` to Unix epoch seconds.
@@ -273,11 +283,47 @@ mod tests {
         assert!(extract_timestamp(&headers).is_err());
     }
 
+    /// Measured 2026-11-21: `Date` is read only when `X-Amz-Date` is absent,
+    /// and an empty value is no date.
     #[test]
-    fn extract_timestamp_present() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-amz-date", "20260415T120000Z".parse().unwrap());
-        assert_eq!(extract_timestamp(&headers).unwrap(), "20260415T120000Z");
+    fn the_request_date_is_x_amz_date_else_date() {
+        let http = "Sat, 21 Nov 2026 01:36:16 GMT";
+        let rows = [
+            (vec![], None),
+            (
+                vec![("x-amz-date", "20260415T120000Z")],
+                Some("20260415T120000Z"),
+            ),
+            (vec![("date", http)], Some(http)),
+            (
+                vec![("x-amz-date", http), ("date", "20260415T120000Z")],
+                Some(http),
+            ),
+            (vec![("x-amz-date", ""), ("date", http)], None),
+            (vec![("date", "")], None),
+        ];
+        for (pairs, want) in rows {
+            let mut headers = HeaderMap::new();
+            for (name, value) in &pairs {
+                headers.insert(*name, value.parse().unwrap());
+            }
+            assert_eq!(request_date(&headers), want, "{pairs:?}");
+        }
+    }
+
+    /// Measured 2026-11-21: the service echoes a date it cannot read.
+    #[test]
+    fn a_date_in_another_form_is_refused_with_its_value() {
+        let err = validate_timestamp(&make_headers("Sat, 21 Nov 2026 01:36:16 GMT")).unwrap_err();
+        assert!(
+            matches!(err, DynamoDbError::IncompleteSignature(_)),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.message(),
+            "Date must be in ISO-8601 'basic format'. Got 'Sat, 21 Nov 2026 01:36:16 GMT'. \
+             See http://en.wikipedia.org/wiki/ISO_8601"
+        );
     }
 
     fn make_parsed(service: &str, date: &str, signed_headers: &str) -> ParsedAuthorization {

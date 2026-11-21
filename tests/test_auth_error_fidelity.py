@@ -277,6 +277,8 @@ _EQ = _PAIR.format("missing equal-sign")
 _KEY = _PAIR.format("missing key")
 _CASE = "Algorithm must start with 'AWS4-'; got '{header}'"
 _UNSUPPORTED = "Unsupported AWS 'algorithm': '{}'. "
+_HTTP_DATE = "Sat, 21 Nov 2026 01:36:16 GMT"
+_DATE = f"Date must be in ISO-8601 'basic format'. Got '{_HTTP_DATE}'. See http://en.wikipedia.org/wiki/ISO_8601"
 
 
 def _missing(*names: str, date: bool = False) -> str:
@@ -496,12 +498,13 @@ class TestRequestChecks:
         if self.endpoint_url is not None:
             assert text == "400 Bad Request", text[:200]
 
-    def _describe(self, authorization: str | None, date: str | None) -> tuple[int, dict]:
+    def _describe(self, authorization: str | None, date: str | list | None) -> tuple[int, dict]:
         """Send a DescribeTable of a table that does not exist.
 
         ``authorization`` goes out one byte per character, and None sends no
         Authorization header. ``date`` names a date header to send with the
-        current time: "X-Amz-Date", "Date" or None.
+        current time: "X-Amz-Date", "Date" or None. A list of (name, value)
+        pairs sends those headers instead.
         """
         u = urlparse(self.url)
         headers = [
@@ -513,6 +516,8 @@ class TestRequestChecks:
             headers.append((date, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())))
         elif date == "Date":
             headers.append((date, email.utils.formatdate(usegmt=True)))
+        elif date is not None:
+            headers.extend(date)
         if authorization is not None:
             headers.append(("Authorization", authorization))
         status, text, _ = self._raw_request(
@@ -581,13 +586,31 @@ class TestRequestChecks:
             pytest.param(None, "Bearer a=b", _missing("Credential", "Signature", "SignedHeaders", date=True),
                          id="bearer-unknown-key"),
             pytest.param(None, f"Bearer {_CRED}, {_SH}, {_SIG}", _missing(date=True), id="bearer-no-date"),
+            pytest.param([("Date", _HTTP_DATE)], f"{_ALG} {_CRED}, {_SH}, {_SIG}", _DATE, id="http-date-header"),
+            pytest.param([("X-Amz-Date", _HTTP_DATE)], f"{_ALG} {_CRED}, {_SH}, {_SIG}", _DATE,
+                         id="http-x-amz-date"),
+            pytest.param([("X-Amz-Date", _HTTP_DATE), ("Date", "20261121T013616Z")],
+                         f"{_ALG} {_CRED}, {_SH}, {_SIG}", _DATE, id="x-amz-date-before-date"),
+            pytest.param([("Date", _HTTP_DATE)], f"{_ALG} Credential=x, {_SH}, {_SIG}", _DATE,
+                         id="http-date-before-credential"),
+            pytest.param([("Date", _HTTP_DATE)], f"AWS4-X {_CRED}, {_SH}, {_SIG}", _DATE,
+                         id="http-date-before-algorithm"),
+            pytest.param([("Date", _HTTP_DATE)], f"Bearer {_CRED}, {_SH}, {_SIG}", _DATE,
+                         id="http-date-before-bearer"),
+            pytest.param([("Date", "")], f"{_ALG} {_CRED}, {_SH}, {_SIG}", _missing(date=True),
+                         id="empty-date-header"),
+            pytest.param([("X-Amz-Date", ""), ("Date", _HTTP_DATE)], f"{_ALG} {_CRED}, {_SH}, {_SIG}",
+                         _missing(date=True), id="empty-x-amz-date-and-http-date"),
         ],
     )
     def test_malformed_authorization_header(self, date, header, want):
         # Measured against the service on 2026-11-20 and 2026-11-21. AWS4- in
         # another case is refused first. A part with no '=' or no key is named
         # before any missing parameter. Every missing parameter and a missing
-        # date header are named in one message. Another algorithm comes last.
+        # date header are named in one message. A date the service cannot
+        # read comes next, before the Bearer answer, another algorithm and
+        # the credential. The service reads Date only when the request has no
+        # X-Amz-Date, and an empty value is no date.
         status, payload = self._describe(header, date)
         assert status == 400, (status, payload)
         assert payload["__type"].endswith("#IncompleteSignatureException"), payload
@@ -616,6 +639,14 @@ class TestRequestChecks:
         # request with no Authorization header. Pairs split by spaces get the
         # answer to the same pairs split by commas.
         assert self._describe(header, date) == self._describe(reference, date)
+
+    def test_basic_date_header_is_the_request_date(self):
+        # Measured against the service on 2026-11-21: with no X-Amz-Date, a
+        # Date value in the basic format is the request date. Both requests
+        # get the complaint about the scope date of _CRED.
+        header = f"{_ALG} {_CRED}, {_SH}, {_SIG}"
+        now = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        assert self._describe(header, [("Date", now)]) == self._describe(header, "X-Amz-Date")
 
     def test_session_token_with_a_long_term_key_is_rejected(self):
         _, _, env_token = _env_credentials()

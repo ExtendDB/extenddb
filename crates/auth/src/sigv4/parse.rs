@@ -46,6 +46,18 @@ pub fn parse_authorization(
     header: &[u8],
     has_date: bool,
 ) -> Result<ParsedAuthorization, DynamoDbError> {
+    parse_authorization_with_date_check(header, has_date, || Ok(())).map(|(parsed, ())| parsed)
+}
+
+/// [`parse_authorization`], running `check_date` where the service checks the
+/// request date: after the missing parameters, before the `Bearer` answer,
+/// the algorithm and the credential (measured 2026-11-21). Returns the parsed
+/// header and the value `check_date` returns.
+pub fn parse_authorization_with_date_check<T>(
+    header: &[u8],
+    has_date: bool,
+    check_date: impl FnOnce() -> Result<T, DynamoDbError>,
+) -> Result<(ParsedAuthorization, T), DynamoDbError> {
     // S-2: Cap Authorization header length to prevent heap abuse from oversized headers.
     const MAX_AUTH_HEADER_LEN: usize = 8 * 1024;
     if header.len() > MAX_AUTH_HEADER_LEN {
@@ -140,6 +152,8 @@ pub fn parse_authorization(
         )));
     };
 
+    let checked = check_date()?;
+
     // Measured 2026-11-21: DynamoDB answers a `Bearer` value that passes the
     // checks above with this text. Its text for a request with no
     // Authorization header is `Request is missing Authentication Token`, which
@@ -174,6 +188,7 @@ pub fn parse_authorization(
         signed_headers: signed_headers.to_owned(),
         signature: signature.to_owned(),
     })
+    .map(|parsed| (parsed, checked))
 }
 
 fn incomplete(msg: &str) -> DynamoDbError {
@@ -387,6 +402,40 @@ mod tests {
         let header = "AWS4-HMAC-SHA256 Credential=AKID/20260415/us-east-1, \
             SignedHeaders=host, Signature=abc";
         assert!(parse_authorization(header.as_bytes(), true).is_err());
+    }
+
+    /// Measured 2026-11-21 with a `Date` value the service refuses: a missing
+    /// parameter, a part with no '=' and `AWS4-` in another case come first,
+    /// and the date before the `Bearer` answer, another algorithm and the
+    /// credential's form.
+    #[test]
+    fn the_date_check_runs_after_the_missing_parameters() {
+        let cred = "Credential=AKID/20260415/us-east-1/dynamodb/aws4_request";
+        let rest = format!("{cred}, SignedHeaders=host, Signature=abc");
+        let rows = [
+            (
+                format!("AWS4-HMAC-SHA256 {cred}, SignedHeaders=host"),
+                false,
+            ),
+            (
+                "AWS4-HMAC-SHA256 Credential, SignedHeaders=host, Signature=abc".to_owned(),
+                false,
+            ),
+            (format!("aws4-hmac-sha256 {rest}"), false),
+            (format!("Bearer {rest}"), true),
+            (format!("AWS4-X {rest}"), true),
+            (
+                "AWS4-HMAC-SHA256 Credential=x, SignedHeaders=host, Signature=abc".to_owned(),
+                true,
+            ),
+            (format!("AWS4-HMAC-SHA256 {rest}"), true),
+        ];
+        let date = || Err::<(), _>(incomplete("date"));
+        for (header, date_first) in rows {
+            let got = parse_authorization_with_date_check(header.as_bytes(), true, date);
+            let is_date = matches!(&got, Err(DynamoDbError::IncompleteSignature(m)) if m == "date");
+            assert_eq!(is_date, date_first, "{header}: {got:?}");
+        }
     }
 
     #[test]
