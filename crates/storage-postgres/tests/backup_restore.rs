@@ -5397,14 +5397,41 @@ mod catalog_index {
         s.cleanup().await;
     }
 
+    /// An engine on the scratch catalog whose connections pass through a
+    /// proxy holding each chunk to the server for 100 ms. A close's
+    /// Terminate then reaches the server 100 ms after the close returns, so
+    /// a check right after a take sees only what the take unlocked.
+    async fn slow_engine(s: &Scratch) -> (PostgresEngine, Proxy) {
+        let upstream: sqlx::postgres::PgConnectOptions =
+            s.catalog_url.parse().expect("a postgres URL");
+        let proxy = Proxy::start((upstream.get_host().to_owned(), upstream.get_port())).await;
+        proxy.to_server_delay_ms.store(100, Ordering::SeqCst);
+        let engine = PostgresEngine::new(
+            &PostgresConfig {
+                connection_string: through_port(&s.catalog_url, proxy.port),
+                pool_size: 2,
+                max_item_size_bytes: 400_000,
+            },
+            REGION,
+        )
+        .await
+        .expect("an engine through the proxy");
+        (engine, proxy)
+    }
+
+    /// Whether the maintenance lock reads as held on the direct engine. A
+    /// 1 ms window means a young row alone does not answer held.
+    async fn lock_reads_held(s: &Scratch) -> bool {
+        s.engine
+            .check_maintenance_claim(std::time::Duration::from_millis(1))
+            .await
+            .expect("check")
+    }
+
     /// A take refused for a young row unlocks its claim session before it
     /// closes it. The close returns before the server's backend exits, so a
     /// lock left to the close would read as a live claim to every
-    /// CreateBackup's and RestoreTableFromBackup's check until then. The
-    /// take goes through a proxy that holds each chunk to the server for
-    /// 100 ms, so the close's Terminate arrives 100 ms after the take
-    /// returns, and the check right after it sees only what the take
-    /// unlocked.
+    /// CreateBackup's and RestoreTableFromBackup's check until then.
     #[tokio::test]
     async fn a_refused_maintenance_take_leaves_no_lock_behind() {
         if base_conn().is_none() {
@@ -5421,20 +5448,7 @@ mod catalog_index {
         .execute(&s.catalog)
         .await
         .expect("young row");
-        let upstream: sqlx::postgres::PgConnectOptions =
-            s.catalog_url.parse().expect("a postgres URL");
-        let proxy = Proxy::start((upstream.get_host().to_owned(), upstream.get_port())).await;
-        proxy.to_server_delay_ms.store(100, Ordering::SeqCst);
-        let slow = PostgresEngine::new(
-            &PostgresConfig {
-                connection_string: through_port(&s.catalog_url, proxy.port),
-                pool_size: 2,
-                max_item_size_bytes: 400_000,
-            },
-            REGION,
-        )
-        .await
-        .expect("an engine through the proxy");
+        let (slow, _proxy) = slow_engine(&s).await;
         let stale = std::time::Duration::from_secs(300);
         match slow.maintenance_claim("purge on host-b", stale).await {
             Err(StorageError::AlreadyExists(m)) => {
@@ -5443,14 +5457,77 @@ mod catalog_index {
             Err(other) => panic!("refused otherwise: {other:?}"),
             Ok(_) => panic!("a young row's claim is not taken over"),
         }
-        // A 1 ms window: the row is older than that, so only a held lock
-        // answers held.
         assert!(
-            !s.engine
-                .check_maintenance_claim(std::time::Duration::from_millis(1))
-                .await
-                .expect("check"),
+            !lock_reads_held(&s).await,
             "the refused take's lock is still held after it returned"
+        );
+        drop(slow);
+        s.cleanup().await;
+    }
+
+    /// A take stopped by a failing INSERT unlocks before it closes, as a
+    /// refused one does. A BEFORE INSERT trigger that raises makes the
+    /// INSERT fail after the young-row read found no row.
+    #[tokio::test]
+    async fn a_maintenance_take_whose_insert_fails_leaves_no_lock_behind() {
+        if base_conn().is_none() {
+            eprintln!(
+                "SKIP a_maintenance_take_whose_insert_fails_leaves_no_lock_behind: no PostgreSQL"
+            );
+            return;
+        }
+        let s = scratch().await;
+        for ddl in [
+            "CREATE FUNCTION refuse_maintenance_insert() RETURNS trigger \
+             LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'insert refused'; END $$",
+            "CREATE TRIGGER refuse_maintenance_insert BEFORE INSERT ON backup_maintenance \
+             FOR EACH ROW EXECUTE FUNCTION refuse_maintenance_insert()",
+        ] {
+            sqlx::query(ddl).execute(&s.catalog).await.expect("trigger");
+        }
+        let (slow, _proxy) = slow_engine(&s).await;
+        let stale = std::time::Duration::from_secs(300);
+        assert!(
+            slow.maintenance_claim("purge on host-b", stale)
+                .await
+                .is_err(),
+            "the take's INSERT was refused by the trigger"
+        );
+        assert!(
+            !lock_reads_held(&s).await,
+            "the failed take's lock is still held after it returned"
+        );
+        drop(slow);
+        s.cleanup().await;
+    }
+
+    /// A take stopped by a failing young-row read unlocks before it closes.
+    /// With `heartbeat_at` renamed, the read fails on its own; the column
+    /// is renamed back before the check, which reads it too.
+    #[tokio::test]
+    async fn a_maintenance_take_whose_young_row_read_fails_leaves_no_lock_behind() {
+        if base_conn().is_none() {
+            eprintln!(
+                "SKIP a_maintenance_take_whose_young_row_read_fails_leaves_no_lock_behind: no PostgreSQL"
+            );
+            return;
+        }
+        let s = scratch().await;
+        sqlx::query("ALTER TABLE backup_maintenance RENAME COLUMN heartbeat_at TO heartbeat_at_x")
+            .execute(&s.catalog)
+            .await
+            .expect("rename");
+        let (slow, _proxy) = slow_engine(&s).await;
+        let stale = std::time::Duration::from_secs(300);
+        let taken = slow.maintenance_claim("purge on host-b", stale).await;
+        sqlx::query("ALTER TABLE backup_maintenance RENAME COLUMN heartbeat_at_x TO heartbeat_at")
+            .execute(&s.catalog)
+            .await
+            .expect("rename back");
+        assert!(taken.is_err(), "the young-row read failed");
+        assert!(
+            !lock_reads_held(&s).await,
+            "the failed take's lock is still held after it returned"
         );
         drop(slow);
         s.cleanup().await;

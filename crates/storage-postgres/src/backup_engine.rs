@@ -308,11 +308,11 @@ impl ClaimSession {
         &mut self.conn
     }
 
-    /// Release this session's advisory lock on `key`. A caller that ends the
-    /// session runs it before [`Self::close`]: the close returns before the
-    /// server's backend exits and drops the session's locks, so another
-    /// connection's check right after the close would otherwise still find
-    /// the lock held.
+    /// Release this session's advisory lock on `key`. A caller whose lock
+    /// another connection can check right after the close runs it before
+    /// [`Self::close`]: the close returns before the server's backend exits
+    /// and drops the session's locks, so that check would otherwise still
+    /// find the lock held.
     pub(crate) async fn unlock(&mut self, key: &str) -> Result<(), sqlx::Error> {
         sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, $2))")
             .bind(key)
