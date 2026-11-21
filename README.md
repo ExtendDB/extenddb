@@ -380,7 +380,7 @@ crates/
   storage-mongodb/    — MongoDB backend
   storage-postgres/   — PostgreSQL backend (default/reference)
   storage-sqlite/     — SQLite backend (embedded)
-  wasm-adapter/       — experimental WebAssembly build (see below; publish = false)
+  wasm-adapter/       — experimental WebAssembly build (see its section above; publish = false)
 
 
 docs/

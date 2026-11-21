@@ -15,13 +15,14 @@ applications point their AWS SDKs at extenddb and get identical DynamoDB behavio
 
 ## Cargo Workspace
 
-The project is structured as a Cargo workspace with 13 crates. Crate boundaries enforce dependency rules at compile time.
+The project is structured as a Cargo workspace with 15 crates. Crate boundaries enforce dependency rules at compile time.
 
 ```
 extenddb/
 ├── crates/
 │   ├── app/                Application/CLI library the bin crate dispatches to
 │   ├── auth/               AuthProvider trait, SigV4 verification, IAM policy engine
+│   ├── backup-store/       Backup object store (filesystem and S3)
 │   ├── bin/                CLI entry point, config loading, daemon lifecycle
 │   ├── cache/              Stale-while-revalidate cache used by the auth and server layers
 │   ├── config/             Configuration types and loading
@@ -32,7 +33,8 @@ extenddb/
 │   ├── storage-cassandra/  Cassandra backend implementation (experimental)
 │   ├── storage-mongodb/    MongoDB backend implementation
 │   ├── storage-postgres/   PostgreSQL backend implementation (default)
-│   └── storage-sqlite/     SQLite backend implementation (embedded)
+│   ├── storage-sqlite/     SQLite backend implementation (embedded)
+│   └── wasm-adapter/       Experimental WebAssembly build of the engine (publish = false)
 ```
 
 ## Crate Dependency Graph
