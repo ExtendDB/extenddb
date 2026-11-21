@@ -78,10 +78,12 @@ RUN_COMPREHENSIVE=false
 RUN_TERRAFORM=false
 RUN_CATALOG_CHECK=false
 # Standalone WebAssembly suites. Unlike the others these need no running server,
-# target flag or credentials: --wasm is a wasm32 build check of the adapter
-# crate, --headless builds the wasm module and runs it under Node, and
-# --wasm-test runs the on-target wasm-bindgen-test suites (crypto, SQLite shim)
-# under Node.
+# target flag or credentials: --wasm runs the build, clippy and guard steps of
+# the WebAssembly workflow (the wasm32 build of the adapter crate, the clippy
+# step with the lists of devtools/wasm-clippy, their self-test and the adapter's
+# pedantic clippy), --headless builds the wasm module and runs the parity corpus
+# through it under Node, and --wasm-test runs the on-target wasm-bindgen-test
+# suites (crypto, SQLite shim) under Node.
 RUN_WASM=false
 RUN_HEADLESS=false
 RUN_WASM_TEST=false
