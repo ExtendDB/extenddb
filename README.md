@@ -330,14 +330,70 @@ to crates.io.
   and `TableSizeBytes` stay `0`; and stream records are never trimmed.
 - **A synchronous control plane.** The in-memory engine sets the control-plane
   delay and the index propagation delay (the `control_plane_delay_seconds` and
-  `index_propagation_delay_ms` settings) to 0, where a server uses 0.25 s and
-  10 ms while they are not set, so a table it creates is `ACTIVE` at once and
-  its indexes are maintained on the write path. Right after a `CreateTable`
-  with a global secondary index, a server answers that `CreateTable` and a
-  `DescribeTable` with `TableStatus` `CREATING`, and a `PutItem` on the table
-  and a `Query` on the index with `ResourceNotFoundException`; this build
-  answers `ACTIVE`, `{}` and the item. The corpus cases whose names start with
-  "control plane:" record this build's answers.
+  `index_propagation_delay_ms` settings) to 0. So a table it creates is
+  `ACTIVE` when `CreateTable` answers, a change that `CreateTable` or
+  `UpdateTable` makes is complete when it answers, and a write has updated
+  every index of the table when it answers. A server with the SQLite backend
+  uses 0.25 s and 10 ms while the settings are not set, and then answers
+  differently in the cases below. A request that it refuses in one of them
+  leaves its tables as they were, where this build makes the change. The
+  corpus cases whose names start with "control plane:" record this build's
+  answers.
+  - **A new table.** After `CreateTable`, the server's table is `CREATING`
+    until the server's control-plane worker, which runs about once a second,
+    next runs at least 0.25 s later. Until then the server answers
+    `CreateTable` and `DescribeTable` with `TableStatus` `CREATING` and with no
+    `WarmThroughput` on the table or on its global secondary indexes (for a
+    table or index whose `CreateTable` set `WarmThroughput` units, with those
+    units and `Status` `UPDATING`), and `DescribeTable` with `IndexStatus`
+    `CREATING` for each vector index. Unless its handler refuses the request
+    first for another reason (a body that does not parse, or a request to
+    disable a time to live that is not enabled, for example), it answers
+    `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query`, `Scan`,
+    `SearchVectors`, `BatchGetItem`, `BatchWriteItem`, `TransactGetItems` and
+    `TransactWriteItems` on the table with `ResourceNotFoundException`
+    "Requested resource not found"; `UpdateTable` and `UpdateTimeToLive` with
+    `ResourceInUseException` "Table <name> is not in ACTIVE state"; and
+    `TagResource`, `UntagResource` and `ListTagsOfResource` on the table's
+    ARN or its stream's with `ResourceNotFoundException` "Requested resource
+    not found: ResourceArn: <arn> not found". Every other operation gets the
+    answer it gets for an `ACTIVE` table, apart from the next case and the
+    operations this build refuses (see "What it refuses").
+  - **A changed warm throughput.** A `CreateTable` or `UpdateTable` that
+    carries a `WarmThroughput` for the table or for a global secondary index
+    (an empty one, and one for an index that the `UpdateTable` creates,
+    included) sets it, and an `UpdateTable` that switches a provisioned table
+    to on-demand can set the table's. For 0.25 s after that, the server's
+    answers that describe the table while it is not `CREATING` (those of
+    `UpdateTable`, `DescribeTable` and `DeleteTable`) give that
+    `WarmThroughput` `Status` `UPDATING` and the values that
+    `WarmThroughputRecord::reported` (in
+    `crates/core/src/types/warm_throughput.rs`) gives while it is `UPDATING`.
+    This build gives `Status` `ACTIVE` and the values after the request.
+  - **A write.** The server's background worker applies a write to a global
+    secondary index or a vector index no sooner than 6 ms after the write (it
+    waits a random 6 to 10 ms, from just over half of the 10 ms delay to all of
+    it), so a `Query` or `Scan` of that global secondary index, or a
+    `SearchVectors` on that vector index, that arrives before the worker has
+    applied the write answers as before the write. A local secondary index is
+    written with the table on both.
+  - **A vector index that `UpdateTable` adds.** This build refuses the
+    request (see "What it refuses"). The server adds the index and builds it
+    after it has answered, so from then on its table has an index that this
+    build's does not. Its `DescribeTable` and `UpdateTable` answers list the
+    index with `IndexStatus` `CREATING` for at least 1 s (the default of the
+    `vector_index_min_creating_ms` setting) and while it is built; until then
+    it answers `DeleteTable` with `ResourceInUseException` "Cannot delete
+    table while indexes are being created, updated, or deleted."; and, as for
+    any table with a vector index, it answers an `UpdateTable` that switches
+    the table to provisioned billing with `ValidationException` "One or more
+    parameter values were invalid: Vector indexes are only supported for
+    PAY_PER_REQUEST tables".
+  - **No other state.** With a control-plane delay under 1 s the server drops
+    a table before `DeleteTable` answers, so it has no `DELETING` table;
+    `UpdateTable` leaves a table `ACTIVE`; and a global secondary index that
+    `UpdateTable` creates or deletes is built or dropped before `UpdateTable`
+    answers.
 
 The SigV4 key-derivation code in `extenddb-auth` compiles into this build, but
 the adapter never calls it: it builds no credential store and verifies no
