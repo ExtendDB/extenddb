@@ -80,18 +80,26 @@ pub fn open(key: &[u8; KEY_LEN], sealed: &[u8], aad: &[u8]) -> Result<Zeroizing<
 }
 
 /// Split a sealed value into its nonce prefix and the ciphertext-plus-tag
-/// remainder, refusing anything too short to hold both.
-fn split_nonce(sealed: &[u8]) -> Result<(&[u8; NONCE_LEN], &[u8]), String> {
-    match sealed.split_first_chunk::<NONCE_LEN>() {
-        Some((nonce, rest)) if rest.len() >= TAG_LEN => Ok((nonce, rest)),
-        _ => Err("sealed value is shorter than a 12-byte nonce plus 16-byte tag".to_owned()),
-    }
+/// remainder. `None` when `sealed` is too short to hold a nonce and a tag.
+/// [`open`] refuses such a value through this check; a caller that reports the
+/// short input in its own words calls it first.
+#[must_use]
+pub fn split_nonce(sealed: &[u8]) -> Option<(&[u8; NONCE_LEN], &[u8])> {
+    sealed
+        .split_first_chunk::<NONCE_LEN>()
+        .filter(|(_, rest)| rest.len() >= TAG_LEN)
+}
+
+/// [`split_nonce`], with the error [`open`] returns for a short input.
+fn split_or_refuse(sealed: &[u8]) -> Result<(&[u8; NONCE_LEN], &[u8]), String> {
+    split_nonce(sealed)
+        .ok_or_else(|| "sealed value is shorter than a 12-byte nonce plus 16-byte tag".to_owned())
 }
 
 /// Native backend: AWS-LC through `aws-lc-rs`.
 #[cfg(not(target_arch = "wasm32"))]
 mod imp {
-    use super::{KEY_LEN, NONCE_LEN, TAG_LEN, split_nonce};
+    use super::{KEY_LEN, NONCE_LEN, TAG_LEN, split_or_refuse};
     use aws_lc_rs::aead::{AES_256_GCM, Aad, Nonce, RandomizedNonceKey};
     use zeroize::Zeroizing;
 
@@ -143,7 +151,7 @@ mod imp {
         sealed: &[u8],
         aad: &[u8],
     ) -> Result<Zeroizing<Vec<u8>>, String> {
-        let (nonce, rest) = split_nonce(sealed)?;
+        let (nonce, rest) = split_or_refuse(sealed)?;
         let key = RandomizedNonceKey::new(&AES_256_GCM, key)
             .map_err(|_| "load encryption key: AES-256-GCM key setup failed".to_owned())?;
         let mut in_out = Zeroizing::new(rest.to_vec());
@@ -160,7 +168,7 @@ mod imp {
 /// HMAC-SHA256 are standard, so the bytes match the native backend.
 #[cfg(target_arch = "wasm32")]
 mod imp {
-    use super::{KEY_LEN, split_nonce};
+    use super::{KEY_LEN, split_or_refuse};
     use aes_gcm::aead::{Aead, KeyInit, Payload};
     use aes_gcm::{Aes256Gcm, Nonce};
     use hmac::{Hmac, Mac};
@@ -221,7 +229,7 @@ mod imp {
         sealed: &[u8],
         aad: &[u8],
     ) -> Result<Zeroizing<Vec<u8>>, String> {
-        let (nonce, rest) = split_nonce(sealed)?;
+        let (nonce, rest) = split_or_refuse(sealed)?;
         let cipher = Aes256Gcm::new_from_slice(key)
             .map_err(|_| "load encryption key: AES-256-GCM key setup failed".to_owned())?;
         let plaintext = cipher

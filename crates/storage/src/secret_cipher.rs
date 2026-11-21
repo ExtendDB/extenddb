@@ -22,7 +22,7 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use extenddb_core::crypto::{self, NONCE_LEN, TAG_LEN};
+use extenddb_core::crypto;
 use zeroize::Zeroizing;
 
 /// Length of the decoded encryption key.
@@ -52,7 +52,7 @@ pub fn encrypt_secret(plaintext: &str, key_b64: &str, aad: &str) -> Result<Vec<u
 /// UTF-8.
 pub fn decrypt_secret(encrypted: &[u8], key_b64: &str, aad: &str) -> Result<String, String> {
     require_aad(aad)?;
-    split_sealed(encrypted)?;
+    require_length(encrypted)?;
     let mut plaintext = open_text(&*decode_key(key_b64)?, encrypted, aad)?;
     Ok(std::mem::take(&mut *plaintext))
 }
@@ -72,10 +72,7 @@ pub(crate) fn open(
     aad: &str,
 ) -> Result<Zeroizing<Vec<u8>>, String> {
     require_aad(aad)?;
-    // Refuse a value too short to hold a nonce and tag with this module's
-    // message; the shared crypto module's own length check gives different
-    // wording.
-    split_sealed(encrypted)?;
+    require_length(encrypted)?;
     crypto::open(key, encrypted, aad.as_bytes())
 }
 
@@ -96,11 +93,13 @@ pub(crate) fn open_text(
     }
 }
 
-/// Split `nonce(12) || sealed` and refuse input too short to hold a tag.
-fn split_sealed(encrypted: &[u8]) -> Result<(&[u8; NONCE_LEN], &[u8]), String> {
-    match encrypted.split_first_chunk::<NONCE_LEN>() {
-        Some((nonce, sealed)) if sealed.len() >= TAG_LEN => Ok((nonce, sealed)),
-        _ => Err(format!(
+/// Refuse input too short to hold a nonce and a tag, with a message that names
+/// its length. The length rule is `crypto::split_nonce`, the check
+/// `crypto::open` applies; this only words the refusal.
+fn require_length(encrypted: &[u8]) -> Result<(), String> {
+    match crypto::split_nonce(encrypted) {
+        Some(_) => Ok(()),
+        None => Err(format!(
             "ciphertext too short: {} bytes (need at least 12-byte nonce + 16-byte auth tag)",
             encrypted.len()
         )),
@@ -157,6 +156,7 @@ pub(crate) fn decode_key_into(key_b64: &str, key: &mut [u8; KEY_LEN]) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use extenddb_core::crypto::{NONCE_LEN, TAG_LEN};
 
     const KEY_B64: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
     const AAD: &str = "AKIAEXTENDDBCOMPAT01";
