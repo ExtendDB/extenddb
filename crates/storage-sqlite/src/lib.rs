@@ -44,24 +44,31 @@ pub use wasm_sqlx::*;
 /// Declare a catalog-row struct with a single field list that decodes the same
 /// way on both targets.
 ///
-/// On native the struct derives `sqlx::FromRow` (decode by column name). On
-/// wasm, where `sqlx` is the in-crate shim and a derive macro is unavailable,
-/// the same field list generates a `FromRow` impl that reads each column by its
-/// field name through the shim's `try_get` — matching what the derive emits —
-/// so a new or renamed column changes one place and fails or compiles
-/// identically on both targets.
+/// On native the struct derives `sqlx::FromRow`. On wasm, where `sqlx` is the
+/// in-crate shim and a derive macro is unavailable, the same field list
+/// generates a `FromRow` impl that reads each column through the shim's
+/// `try_get`, so a new or renamed column changes one place.
+///
+/// Every field decodes from the column with the field's own name, which is the
+/// derive's default mapping. A `#[sqlx(...)]` attribute, on the struct (such as
+/// `rename_all`) or on a field (such as `rename`, `default` or `flatten`),
+/// would change that on native only, so the macro refuses one with a compile
+/// error.
 mod row_macro {
     macro_rules! sqlite_row_struct {
         (
-            $(#[$meta:meta])*
+            $(#[$($meta:tt)*])*
             $vis:vis struct $name:ident {
-                $( $(#[$fmeta:meta])* $fvis:vis $field:ident : $ty:ty ),* $(,)?
+                $( $(#[$($fattr:tt)*])* $fvis:vis $field:ident : $ty:ty ),* $(,)?
             }
         ) => {
-            $(#[$meta])*
+            $( $crate::row_macro::sqlite_row_attr!($($meta)*); )*
+            $( $( $crate::row_macro::sqlite_row_attr!($($fattr)*); )* )*
+
+            $(#[$($meta)*])*
             #[cfg_attr(not(target_arch = "wasm32"), derive(sqlx::FromRow))]
             $vis struct $name {
-                $( $(#[$fmeta])* $fvis $field : $ty ),*
+                $( $(#[$($fattr)*])* $fvis $field : $ty ),*
             }
 
             #[cfg(target_arch = "wasm32")]
@@ -75,6 +82,19 @@ mod row_macro {
         };
     }
     pub(crate) use sqlite_row_struct;
+
+    /// Refuses a `#[sqlx(...)]` attribute of a `sqlite_row_struct!` struct or
+    /// field and passes every other attribute (doc comments, `allow`s).
+    macro_rules! sqlite_row_attr {
+        (sqlx $($rest:tt)*) => {
+            compile_error!(
+                "sqlite_row_struct! decodes every field from the column of the field's name on \
+                 both targets; a #[sqlx(...)] attribute would change that on native only"
+            );
+        };
+        ($($other:tt)*) => {};
+    }
+    pub(crate) use sqlite_row_attr;
 }
 
 mod admin_store;
