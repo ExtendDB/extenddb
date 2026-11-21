@@ -116,11 +116,11 @@ Suites (at least one required):
   --catalog-check   post-test catalog integrity check
   --wasm            the build, clippy and guard steps of the WebAssembly
                     workflow: wasm32 build, clippy with the disallowed-methods
-                    list of devtools/wasm-clippy, its self-test, and the
-                    adapter's pedantic clippy, on the workflow's pinned
-                    toolchain when rustup is installed. Standalone: needs no
-                    server, target flag or credentials; writes
-                    discussions/test-wasm-<hash>.txt.
+                    list of devtools/wasm-clippy, its self-test (needs Python
+                    3.11 or later and git), and the adapter's pedantic clippy,
+                    on the workflow's pinned toolchain when rustup is
+                    installed. Standalone: needs no server, target flag or
+                    credentials; writes discussions/test-wasm-<hash>.txt.
                     Override the crate with EXTENDDB_WASM_PKG
                     (default: extenddb-wasm-adapter)
   --headless        build the wasm-pack --target web module and run the shared
@@ -402,6 +402,21 @@ wasm_workflow_toolchain() {
     sed -n 's/^[[:space:]]*toolchain:[[:space:]]*"\{0,1\}\([^"#[:space:]]*\)"\{0,1\}.*/\1/p' \
         .github/workflows/wasm.yml | head -n 1
 }
+# A Python 3.11 or later, which devtools/check-wasm-clippy-guard needs (it
+# reads TOML with tomllib): python3 when it is new enough, else the newest
+# python3.N on PATH.
+wasm_python() {
+    local candidate
+    for candidate in python3 python3.14 python3.13 python3.12 python3.11; do
+        if command -v "$candidate" >/dev/null 2>&1 \
+            && "$candidate" -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then
+            command -v "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
 if $RUN_WASM; then
     WASM_PKG="${EXTENDDB_WASM_PKG:-extenddb-wasm-adapter}"
     WASM_OUTFILE="discussions/test-wasm-${HASH}.txt"
@@ -457,7 +472,13 @@ if $RUN_WASM; then
             WASM_RC=1
         fi
         echo "--- clippy guard self-test ---" | tee -a "$WASM_OUTFILE"
-        if ! python3 devtools/check-wasm-clippy-guard 2>&1 | tee -a "$WASM_OUTFILE"; then
+        if WASM_PYTHON="$(wasm_python)"; then
+            echo "python:    ${WASM_PYTHON} ($("$WASM_PYTHON" --version 2>&1))" | tee -a "$WASM_OUTFILE"
+            if ! "$WASM_PYTHON" devtools/check-wasm-clippy-guard 2>&1 | tee -a "$WASM_OUTFILE"; then
+                WASM_RC=1
+            fi
+        else
+            echo "error: devtools/check-wasm-clippy-guard needs Python 3.11 or later (python3, python3.11 to python3.14 on PATH); install one, for example the python3.11 package of your distribution" | tee -a "$WASM_OUTFILE"
             WASM_RC=1
         fi
         echo "--- cargo clippy (pedantic, --no-deps) ---" | tee -a "$WASM_OUTFILE"

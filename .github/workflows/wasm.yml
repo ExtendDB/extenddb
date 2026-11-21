@@ -119,10 +119,12 @@ jobs:
           CLIPPY_CONF_DIR: ${{ github.workspace }}/devtools/wasm-clippy
         run: cargo clippy --locked -p extenddb-wasm-adapter --lib --target wasm32-unknown-unknown -- -D warnings
 
-      # Reads the paths from clippy.toml and fails if one has no probe in the
-      # script or does not resolve, then checks that the step above fails on a
-      # call to each, made directly or through an import, in a wasm-compiled
-      # file.
+      # Reads clippy.toml and fails if an entry has no probe in the script or
+      # does not resolve, or if the step above accepts a call to one, made
+      # directly or through an import; the probes go into a copy of the
+      # checkout. Needs Python 3.11 or later (tomllib), as
+      # devtools/check-crate-packages does in test.yml's package job, which
+      # runs on the same runner.
       - name: Self-test the wasm32 clippy guard
         run: python3 devtools/check-wasm-clippy-guard
 

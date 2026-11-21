@@ -1,59 +1,85 @@
 #!/usr/bin/env python3
 # Copyright 2026 ExtendDB contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Check that the wasm32 clippy step refuses each method in its deny list.
+"""Check the wasm32 clippy guard: its configuration, and that it refuses a
+call to each entry.
 
-The list is the `disallowed-methods` paths in devtools/wasm-clippy/clippy.toml,
-read from that file. For a path in the list that does not resolve, clippy
-prints a "does not refer to a reachable function" warning and, under
--D warnings, still exits 0 (clippy 0.1.97), so a misspelt entry would leave
-the step green with that method unguarded. This script:
+The guard is the clippy step of the WebAssembly workflow, run with
+CLIPPY_CONF_DIR pointing at devtools/wasm-clippy, whose clippy.toml lists
+methods. A path there that does not resolve only makes clippy print a
+warning, and under -D warnings the step still exits 0 (clippy 0.1.97), so a
+misspelt entry would leave the step green with that call unguarded. This
+script fails, with one line per problem, unless all of these hold:
 
-1. fails if an entry in clippy.toml has no probe below, or a probe names a
-   path that is not in clippy.toml;
-2. runs the step exactly as the WebAssembly workflow does on the unmodified
-   tree (after touching the probed file so clippy re-lints it), and fails if
-   the step fails or prints an unresolved-path warning;
-3. appends every probe to a source file the wasm build compiles, runs the
-   step once more, and fails unless the step fails with clippy's
+1. clippy.toml holds only `disallowed-methods`; each entry is a table with a
+   `path` and a `reason` and nothing else; no path is listed twice; each
+   entry has a probe below and each probe names an entry.
+2. In a copy of the working tree (the files git tracks or does not ignore,
+   uncommitted edits included), with every probe added to a source file of
+   PROBE_CRATE, the clippy step of the workflow fails with clippy's
    disallowed-method error naming the probed path inside each probe, and
-   prints no unresolved-path warning.
+   prints no warning about clippy.toml.
 
-Some probes reach the method through an import or a re-export
+The copy is built with the caller's clippy.toml and the caller's cargo target
+directory, so cargo reuses what the clippy step already checked. Nothing in
+the caller's working tree is written. The copy is removed on exit, also on
+SIGINT, SIGTERM and SIGHUP, and the clippy run is stopped with it. Some
+probes reach the method through an import or a re-export
 (`use tokio::time; time::sleep`, `tokio::spawn`), as code usually does.
 
-The probed file is restored on any exit. Run from anywhere in the
-repository; exit status 0 means every entry resolved and every probe was
-refused.
+Needs Python 3.11 or later (for tomllib) and git. Run from anywhere in the
+repository; exit status 0 means every check passed.
 """
 
 import json
 import os
 import re
+import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 and older
+    sys.exit("error: devtools/check-wasm-clippy-guard needs Python 3.11 or later (for tomllib)")
 
 ROOT = Path(__file__).resolve().parent.parent
 CONF_DIR = ROOT / "devtools" / "wasm-clippy"
 CONFIG = CONF_DIR / "clippy.toml"
-# A file of the engine, which the adapter compiles for wasm32.
-PROBED = ROOT / "crates" / "engine" / "src" / "get_item.rs"
+CONFIG_REL = CONFIG.relative_to(ROOT).as_posix()
+ADAPTER = "extenddb-wasm-adapter"
+TARGET = "wasm32-unknown-unknown"
+# The clippy step of .github/workflows/wasm.yml, with JSON messages.
 CLIPPY = [
     "cargo",
     "clippy",
     "--locked",
     "--message-format=json",
     "-p",
-    "extenddb-wasm-adapter",
+    ADAPTER,
     "--lib",
     "--target",
-    "wasm32-unknown-unknown",
+    TARGET,
     "--",
     "-D",
     "warnings",
 ]
-UNRESOLVED = "does not refer to a reachable function"
+# A crate the wasm build compiles that depends directly on every crate a probe
+# names (tokio), so each probe compiles there. The probes go in
+# a new module of it, declared from its crate root.
+PROBE_CRATE = "extenddb-storage"
+PROBE_MODULE = "wasm_clippy_guard_probes"
+
+CONFIG_WARNINGS = (
+    "does not refer to a reachable",
+    "expected a function, found",
+    "expected a type, found",
+    "error reading Clippy's configuration file",
+)
+REFUSAL = re.compile(r"use of a disallowed (method|type) `([^`]+)`")
 
 _DUR = "std::time::Duration::ZERO"
 _SET = "set: &mut tokio::task::JoinSet<()>"
@@ -61,9 +87,9 @@ _HANDLE = "h: &tokio::runtime::Handle"
 _RT = "rt: &tokio::runtime::Runtime"
 _CONDVAR = "c: &std::sync::Condvar, m: &std::sync::Mutex<()>"
 
-# Disallowed path -> probe items. Each item is appended to PROBED inside its
-# own module and must draw clippy's disallowed-method error for that path.
-PROBES = {
+# Disallowed method path -> probe items. Each item goes into its own module of
+# the probe file and must draw clippy's disallowed-method error for that path.
+METHOD_PROBES = {
     "std::time::Instant::now": [
         "fn probe() { use std::time; let _ = time::Instant::now(); }",
     ],
@@ -225,103 +251,271 @@ PROBES = {
     "std::process::exit": ["fn probe() -> ! { std::process::exit(0) }"],
 }
 
+KINDS = {"disallowed-methods": ("method", METHOD_PROBES)}
 
-def configured_paths() -> list[str]:
-    """The `path` of every disallowed-methods entry in clippy.toml."""
-    text = "\n".join(
-        line for line in CONFIG.read_text().splitlines() if not line.lstrip().startswith("#")
+
+def read_config() -> tuple[dict[str, list[str]], list[str]]:
+    """The entry paths of each list in clippy.toml, and the problems found."""
+    problems = []
+    try:
+        config = tomllib.loads(CONFIG.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        return {}, [f"{CONFIG_REL}: cannot be read: {error}"]
+    paths = {}
+    for key, value in config.items():
+        if key not in KINDS:
+            problems.append(
+                f"{CONFIG_REL}: unexpected key {key!r}; this script checks only {sorted(KINDS)}"
+            )
+            continue
+        if not isinstance(value, list):
+            problems.append(f"{CONFIG_REL}: {key} is not a list")
+            continue
+        paths[key] = []
+        for entry in value:
+            if (
+                not isinstance(entry, dict)
+                or set(entry) != {"path", "reason"}
+                or not all(isinstance(entry[k], str) and entry[k].strip() for k in entry)
+            ):
+                problems.append(
+                    f"{CONFIG_REL}: {key} entry {entry!r} is not a table of exactly a"
+                    " non-empty `path` and `reason`"
+                )
+                continue
+            paths[key].append(entry["path"])
+    for key, (kind, probes) in KINDS.items():
+        listed = paths.get(key, [])
+        if len(listed) != len(set(listed)):
+            problems.append(f"{CONFIG_REL}: {key} lists a path more than once")
+        for path in listed:
+            if path not in probes:
+                problems.append(f"{path}: listed in {key} but has no {kind} probe in this script")
+        for path in probes:
+            if path not in listed:
+                problems.append(f"{path}: has a {kind} probe but is not listed in {key}")
+    return paths, problems
+
+
+def cargo_metadata() -> dict:
+    try:
+        run = subprocess.run(
+            ["cargo", "metadata", "--format-version", "1", "--locked", "--filter-platform", TARGET],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        sys.exit("error: cargo is not on PATH")
+    if run.returncode != 0:
+        sys.exit(f"error: cargo metadata failed:\n{run.stderr}")
+    return json.loads(run.stdout)
+
+
+def wasm_crates(metadata: dict) -> dict[str, dict]:
+    """The workspace packages the adapter's wasm32 build compiles, by name."""
+    members = set(metadata["workspace_members"])
+    packages = {p["id"]: p for p in metadata["packages"]}
+    nodes = {n["id"]: n for n in metadata["resolve"]["nodes"]}
+    start = [i for i in members if packages[i]["name"] == ADAPTER]
+    if not start:
+        sys.exit(f"error: cargo metadata lists no workspace member named {ADAPTER}")
+    seen, todo = set(), start
+    while todo:
+        package = todo.pop()
+        if package in seen:
+            continue
+        seen.add(package)
+        # --filter-platform already dropped dependencies of other targets;
+        # kind None is a normal dependency.
+        todo += [
+            d["pkg"]
+            for d in nodes[package]["deps"]
+            if any(k["kind"] is None for k in d["dep_kinds"])
+        ]
+    return {packages[i]["name"]: packages[i] | {"node": nodes[i]} for i in seen if i in members}
+
+
+# ---------------------------------------------------------------- probe run
+
+
+def copy_tree(destination: Path) -> int:
+    """Copy the files git tracks or does not ignore, as they are now."""
+    try:
+        listing = subprocess.run(
+            ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            cwd=ROOT,
+            capture_output=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        sys.exit("error: git is not on PATH; the probes run in a copy of the files git lists")
+    if listing.returncode != 0:
+        sys.exit(f"error: git ls-files failed in {ROOT}:\n{listing.stderr.decode()}")
+    copied = 0
+    for rel in sorted(set(listing.stdout.decode().split("\0")) - {""}):
+        source, target = ROOT / rel, destination / rel
+        if not os.path.lexists(source):  # deleted in the working tree
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_symlink():
+            os.symlink(os.readlink(source), target)
+        elif source.is_file():
+            # copy2 keeps the modification time, so cargo finds the copied
+            # crates as fresh as the caller's.
+            shutil.copy2(source, target)
+        else:
+            continue
+        copied += 1
+    return copied
+
+
+def run_clippy(tree: Path, target_dir: str) -> tuple[int, list[dict], str]:
+    env = dict(os.environ, CLIPPY_CONF_DIR=str(CONF_DIR), CARGO_TARGET_DIR=target_dir)
+    # In its own process group, so that it can be stopped with every compiler
+    # it started.
+    process = subprocess.Popen(
+        CLIPPY,
+        cwd=tree,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
     )
-    return re.findall(r'\bpath\s*=\s*"([^"]+)"', text)
-
-
-def run_clippy() -> tuple[int, list[dict], str]:
-    env = dict(os.environ, CLIPPY_CONF_DIR=str(CONF_DIR))
-    run = subprocess.run(CLIPPY, cwd=ROOT, env=env, capture_output=True, text=True, check=False)
+    try:
+        stdout, stderr = process.communicate()
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
     messages = []
-    for line in run.stdout.splitlines():
+    for line in stdout.splitlines():
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
             continue
         if record.get("reason") == "compiler-message":
             messages.append(record["message"])
-    return run.returncode, messages, run.stderr
+    return process.returncode, messages, stderr
 
 
-def unresolved(messages: list[dict], stderr: str) -> list[str]:
-    # Cargo replays the warning once per linted crate; report each once.
-    found = {m.get("rendered") or m["message"] for m in messages if UNRESOLVED in m["message"]}
-    if not found and UNRESOLVED in stderr:
+def config_warnings(messages: list[dict], stderr: str) -> list[str]:
+    found = set()
+    for message in messages:
+        in_config = any(
+            Path(s["file_name"]).resolve() == CONFIG.resolve() for s in message.get("spans", [])
+        )
+        if in_config or any(text in message["message"] for text in CONFIG_WARNINGS):
+            found.add(message.get("rendered") or message["message"])
+    if not found and any(text in stderr for text in CONFIG_WARNINGS):
         found.add(stderr)
     return sorted(found)
 
 
+def probe_problems(crates: dict[str, dict], metadata: dict) -> tuple[list[str], str]:
+    probe = crates.get(PROBE_CRATE)
+    if probe is None:
+        return [f"PROBE_CRATE {PROBE_CRATE} is not compiled by the wasm build"], ""
+    needed = {p.split("::")[0] for _, probes in KINDS.values() for p in probes} - {"std"}
+    direct = {
+        d["name"] for d in probe["node"]["deps"] if any(k["kind"] is None for k in d["dep_kinds"])
+    }
+    if needed - direct:
+        return [
+            f"PROBE_CRATE {PROBE_CRATE} does not depend directly on"
+            f" {', '.join(sorted(needed - direct))}, which the probes name"
+        ], ""
+    crate_root = Path(
+        next(t["src_path"] for t in probe["targets"] if {"lib", "rlib"} & set(t["kind"]))
+    )
+    probe_file = crate_root.parent / f"{PROBE_MODULE}.rs"
+    if probe_file.exists():
+        return [f"{probe_file.relative_to(ROOT)} exists; the probes need that name"], ""
+    rel = probe_file.relative_to(ROOT).as_posix()
+
+    lines = ["// Probes of devtools/check-wasm-clippy-guard (in its copy of the tree only)."]
+    spans = []  # (kind, path, first line, last line) of each probe, 1-based, inclusive
+    for kind, probes in KINDS.values():
+        for path, items in probes.items():
+            for item in items:
+                lines.append(f"mod probe_{len(spans)} {{")
+                first = len(lines) + 1
+                lines.append(item)
+                spans.append((kind, path, first, len(lines)))
+                lines.append("}")
+
+    problems = []
+    copy = Path(tempfile.mkdtemp(prefix="wasm-clippy-guard-"))
+    try:
+        files = copy_tree(copy)
+        (copy / rel).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        root_rel = crate_root.relative_to(ROOT)
+        with open(copy / root_rel, "a", encoding="utf-8") as declaration:
+            declaration.write(f"\n#[allow(dead_code, unused, deprecated)]\nmod {PROBE_MODULE};\n")
+        code, messages, stderr = run_clippy(copy, metadata["target_directory"])
+    finally:
+        shutil.rmtree(copy, ignore_errors=True)
+
+    if code == 0:
+        problems.append("the clippy step passed with every probe in place")
+    problems += [f"warning about {CONFIG_REL}:\n{w}" for w in config_warnings(messages, stderr)]
+    refused, other = set(), []
+    for message in messages:
+        primary = [s for s in message.get("spans", []) if s.get("is_primary")]
+        in_probes = [s for s in primary if s["file_name"].endswith(rel)]
+        match = REFUSAL.match(message["message"])
+        if match and in_probes:
+            for span in in_probes:
+                for index, (kind, path, first, last) in enumerate(spans):
+                    if (kind, path) == match.groups() and first <= span["line_start"] <= last:
+                        refused.add(index)
+        elif in_probes and message.get("level") == "error":
+            other.append(message.get("rendered") or message["message"])
+    for index, (kind, path, first, _) in enumerate(spans):
+        if index in refused:
+            print(f"refused: {path} ({kind}, {rel}:{first})")
+        else:
+            problems.append(f"{path}: the {kind} probe at {rel}:{first} was not refused")
+    if len(refused) < len(spans) and other:
+        problems.append("other errors in the probe file:\n" + "\n".join(other))
+    if len(refused) < len(spans) and not messages:
+        problems.append(f"cargo clippy printed no compiler message; its stderr:\n{stderr}")
+    summary = f"{len(refused)} of {len(spans)} probes refused (in a copy of {files} files)"
+    return problems, summary
+
+
+def _stop(signum: int, _frame) -> None:
+    raise SystemExit(128 + signum)
+
+
 def main() -> int:
-    failures = []
-    paths = configured_paths()
-    if not paths:
-        failures.append(f"no disallowed-methods entries found in {CONFIG}")
-    if len(paths) != len(set(paths)):
-        failures.append("clippy.toml lists a path more than once")
-    for path in paths:
-        if path not in PROBES:
-            failures.append(f"{path}: listed in clippy.toml but has no probe in this script")
-    for path in PROBES:
-        if path not in paths:
-            failures.append(f"{path}: has a probe but is not listed in clippy.toml")
+    # Line-buffered, so the FAIL lines on stderr keep their place among these
+    # lines when both streams go to one log.
+    sys.stdout.reconfigure(line_buffering=True)
+    for stop in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(stop, _stop)
+    paths, failures = read_config()
+    entries = sum(len(p) for p in paths.values())
     if failures:
         for failure in failures:
             print(f"FAIL: {failure}", file=sys.stderr)
+        print(f"{entries} entries in {CONFIG_REL}; no probe run")
         return 1
 
-    original = PROBED.read_text()
-    rel = PROBED.relative_to(ROOT).as_posix()
-    spans = []  # (path, first line, last line) of each probe, 1-based, inclusive
-    refused = set()  # indexes into spans
-    try:
-        # Rewriting the file updates its mtime, so cargo re-lints the engine
-        # and clippy prints its warnings about the configuration again.
-        PROBED.write_text(original)
-        code, messages, stderr = run_clippy()
-        if code != 0:
-            failures.append(f"the clippy step fails on the unmodified tree:\n{stderr}")
-        failures += [f"unresolved entry:\n{w}" for w in unresolved(messages, stderr)]
-
-        lines = original.splitlines()
-        for n, (path, snippets) in enumerate(
-            (p, s) for p, items in PROBES.items() for s in items
-        ):
-            lines.append("#[allow(dead_code, unused)]")
-            lines.append(f"mod wasm_clippy_guard_probe_{n} {{")
-            first = len(lines) + 1
-            lines.append(snippets)
-            spans.append((path, first, len(lines)))
-            lines.append("}")
-        PROBED.write_text("\n".join(lines) + "\n")
-        code, messages, stderr = run_clippy()
-        if code == 0:
-            failures.append("the clippy step passed with every probe in place")
-        failures += [f"unresolved entry:\n{w}" for w in unresolved(messages, stderr)]
-        for message in messages:
-            match = re.match(r"use of a disallowed method `([^`]+)`", message["message"])
-            if not match:
-                continue
-            for span in message.get("spans", []):
-                if not span.get("is_primary") or not span["file_name"].endswith(rel):
-                    continue
-                for index, (path, first, last) in enumerate(spans):
-                    if path == match.group(1) and first <= span["line_start"] <= last:
-                        refused.add(index)
-        for index, (path, first, _) in enumerate(spans):
-            if index in refused:
-                print(f"refused: {path} ({rel}:{first})")
-            else:
-                failures.append(f"{path}: the probe at {rel}:{first} was not refused")
-    finally:
-        PROBED.write_text(original)
+    metadata = cargo_metadata()
+    crates = wasm_crates(metadata)
+    print(f"crates the wasm build compiles: {', '.join(sorted(crates))}")
+    found, probes = probe_problems(crates, metadata)
+    failures += found
     for failure in failures:
         print(f"FAIL: {failure}", file=sys.stderr)
-    print(f"{len(paths)} entries in clippy.toml; {len(refused)} of {len(spans)} probes refused")
+    print(f"{entries} entries in clippy.toml; {probes or 'no probe run'}")
     return 1 if failures else 0
 
 
