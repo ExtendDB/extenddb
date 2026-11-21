@@ -732,10 +732,63 @@ fn cases() -> Vec<Case> {
              from index 1",
             |_pool| filename("sqlite:x%ff")
         ),
+        // The serve lock's `database_file` passes a location through
+        // `sqlite_url` and reads the file name off these options on both
+        // targets; these are the URLs it builds for the locations named.
         row!(
-            "difference: an unknown query parameter is accepted",
-            "Ok(\"file:sqlx-in-memory-<n>\")",
+            "database_file(\"file::memory:?cache=shared\") reads \
+             sqlite://file::memory:?cache=shared?mode=rwc",
+            "Err[Configuration] error with configuration: unknown value \"shared?mode=rwc\" \
+             for `cache`",
+            |_pool| filename("sqlite://file::memory:?cache=shared?mode=rwc")
+        ),
+        row!(
+            "database_file(\"file:/abs\") reads sqlite://file:/abs?mode=rwc",
+            "Ok(\"file:/abs\")",
+            |_pool| filename("sqlite://file:/abs?mode=rwc")
+        ),
+        // ── connect options: query parameters ──
+        row!(
+            "an unknown query parameter",
+            "Err[Configuration] error with configuration: unknown query parameter `bogus` while \
+             parsing connection URL",
             |_pool| filename("sqlite::memory:?bogus=1")
+        ),
+        row!(
+            "an unknown mode",
+            "Err[Configuration] error with configuration: unknown value \"bad\" for `mode`",
+            |_pool| filename("sqlite://x?mode=bad")
+        ),
+        row!(
+            "a mode with no value",
+            "Err[Configuration] error with configuration: unknown value \"\" for `mode`",
+            |_pool| filename("sqlite://x?mode")
+        ),
+        row!(
+            "an unknown cache",
+            "Err[Configuration] error with configuration: unknown value \"no\" for `cache`",
+            |_pool| filename("sqlite://x?cache=no")
+        ),
+        row!(
+            "an unknown immutable",
+            "Err[Configuration] error with configuration: unknown value \"yes\" for `immutable`",
+            |_pool| filename("sqlite://x?immutable=yes")
+        ),
+        row!(
+            "known parameters, empty pairs and an encoded key",
+            "Ok(\"x\") | Ok(\"x\") | Ok(\"x\")",
+            |_pool| format!(
+                "{} | {} | {}",
+                filename("sqlite://x?vfs=a&mode=ro"),
+                filename("sqlite://x?&&mode=rw"),
+                filename("sqlite://x?mo%64e=memory")
+            )
+        ),
+        row!(
+            "a + in a key decodes to a space",
+            "Err[Configuration] error with configuration: unknown query parameter `a b` while \
+             parsing connection URL",
+            |_pool| filename("sqlite://x?a+b=1")
         ),
     ]
 }

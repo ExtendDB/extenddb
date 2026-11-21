@@ -84,9 +84,11 @@
 //!   statement that leaves the connection in autocommit mode fails with
 //!   [`Error::BeginFailed`].
 //! * **Connect options.** [`SqliteConnectOptions::from_str`] removes leading
-//!   `sqlite://` and `sqlite:` schemes and everything from the first `?`, and
-//!   percent-decodes the rest into the file name; `:memory:` names an
-//!   in-memory database `file:sqlx-in-memory-<n>`.
+//!   `sqlite://` and `sqlite:` schemes, takes what follows the first `?` as
+//!   form-encoded query parameters, and percent-decodes the rest into the file
+//!   name; `:memory:` names an in-memory database `file:sqlx-in-memory-<n>`.
+//!   An unknown parameter, or a `mode`, `cache` or `immutable` value `sqlx`
+//!   does not accept, is [`Error::Configuration`] with `sqlx`'s text.
 //!
 //! # Documented differences from `sqlx-sqlite` 0.8.6
 //!
@@ -112,12 +114,14 @@
 //! * **`$0`.** A `$0` placeholder is [`Error::Protocol`]. Under `sqlx` the
 //!   argument lookup for it (`arguments.rs:116`) panics the connection's
 //!   worker thread, and the call returns [`Error::RowNotFound`].
-//! * **Connect options.** Query parameters (`mode`, `cache`, `immutable`,
-//!   `vfs`, or an unknown one, which `sqlx` refuses) are not read, and every
-//!   connection opens its own database: an in-memory location opens a private
-//!   `:memory:` database rather than the shared-cache one `sqlx` names, and
-//!   any other name is a database of that name in `sqlite-wasm-rs`'s in-memory
-//!   VFS. The backend passes only its own locations.
+//! * **Connect options.** Of the accepted query parameters only
+//!   `mode=memory` is acted on; `mode=ro`, `mode=rw`, `mode=rwc`, `cache`,
+//!   `immutable` and `vfs` are checked and then not used. Every connection
+//!   opens its own database: an in-memory location (`:memory:` or
+//!   `mode=memory`) opens a private `:memory:` database rather than the
+//!   shared-cache one `sqlx` names, and any other name is a database of that
+//!   name in `sqlite-wasm-rs`'s in-memory VFS. The only location the
+//!   WebAssembly adapter opens is `:memory:` (`SqliteEngine::new_in_memory`).
 //! * **`fetch` runs ahead.** `fetch` runs the whole query before it yields the
 //!   first row, so dropping the stream early does not stop later statements
 //!   from running.
@@ -678,12 +682,14 @@ impl SqliteConnectOptions {
         }
     }
 
-    /// Parse a connection string the way `sqlx-sqlite` 0.8.6 finds its file
-    /// name: leading `sqlite://` and `sqlite:` schemes are removed, the part
-    /// from the first `?` on holds the query parameters, and the rest is the
-    /// percent-decoded file name, except that `:memory:` names a fresh
-    /// in-memory database. The query parameters are not read (see the module
-    /// documentation).
+    /// Parse a connection string the way `sqlx-sqlite` 0.8.6 does
+    /// (`options/parse.rs`): leading `sqlite://` and `sqlite:` schemes are
+    /// removed, the part after the first `?` holds the query parameters, and
+    /// the rest is the percent-decoded file name, except that `:memory:` names
+    /// a fresh in-memory database. Each parameter is checked as `sqlx` checks
+    /// it, so an unknown key or value is [`Error::Configuration`] with `sqlx`'s
+    /// text; of the accepted ones only `mode=memory` changes how the database
+    /// opens (see the module documentation).
     // Named `from_str` to match the inherent method the backend calls
     // (`SqliteConnectOptions::from_str(url)`), which mirrors sqlx's own
     // inherent method; the `FromStr` trait is also implemented, below.
@@ -692,18 +698,47 @@ impl SqliteConnectOptions {
         let url = url
             .trim_start_matches("sqlite://")
             .trim_start_matches("sqlite:");
-        let database = url.split('?').next().unwrap_or_default();
-        if database == ":memory:" {
+        let (database, params) = match url.split_once('?') {
+            Some((database, params)) => (database, Some(params)),
+            None => (url, None),
+        };
+        let mut options = if database == ":memory:" {
             let seqno = IN_MEMORY_DB_SEQ.fetch_add(1, Ordering::Relaxed);
-            return Ok(SqliteConnectOptions {
+            SqliteConnectOptions {
                 filename: PathBuf::from(format!("file:sqlx-in-memory-{seqno}")),
                 in_memory: true,
-            });
+            }
+        } else {
+            SqliteConnectOptions {
+                filename: PathBuf::from(percent_decode(database)?),
+                in_memory: false,
+            }
+        };
+        for (key, value) in params.map(form_pairs).into_iter().flatten() {
+            let known = match key.as_str() {
+                "mode" => {
+                    if value == "memory" {
+                        options.in_memory = true;
+                    }
+                    matches!(value.as_str(), "ro" | "rw" | "rwc" | "memory")
+                }
+                "cache" => matches!(value.as_str(), "private" | "shared"),
+                "immutable" => matches!(value.as_str(), "true" | "1" | "false" | "0"),
+                "vfs" => true,
+                _ => {
+                    return Err(Error::Configuration(
+                        format!("unknown query parameter `{key}` while parsing connection URL")
+                            .into(),
+                    ));
+                }
+            };
+            if !known {
+                return Err(Error::Configuration(
+                    format!("unknown value {value:?} for `{key}`").into(),
+                ));
+            }
         }
-        Ok(SqliteConnectOptions {
-            filename: PathBuf::from(percent_decode(database)?),
-            in_memory: false,
-        })
+        Ok(options)
     }
 
     /// The database file name.
@@ -722,12 +757,40 @@ impl SqliteConnectOptions {
 /// .decode_utf8()` does for `sqlx-sqlite`: a `%` not followed by two hex
 /// digits stays as it is.
 fn percent_decode(s: &str) -> Result<String, Error> {
+    String::from_utf8(percent_decode_bytes(s.as_bytes()))
+        .map_err(|e| Error::Configuration(Box::new(e.utf8_error())))
+}
+
+/// The `key=value` pairs of a query string, decoded as
+/// `url::form_urlencoded::parse` decodes them for `sqlx-sqlite`: pairs are
+/// separated by `&` and empty ones skipped, a pair with no `=` has an empty
+/// value, `+` is a space, `%XX` escapes are decoded, and invalid UTF-8 is
+/// replaced.
+fn form_pairs(query: &str) -> Vec<(String, String)> {
+    let decode = |part: &str| {
+        let plus_as_space: Vec<u8> = part
+            .bytes()
+            .map(|b| if b == b'+' { b' ' } else { b })
+            .collect();
+        String::from_utf8_lossy(&percent_decode_bytes(&plus_as_space)).into_owned()
+    };
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (decode(key), decode(value))
+        })
+        .collect()
+}
+
+/// Decode `%XX` escapes; a `%` not followed by two hex digits stays as it is.
+fn percent_decode_bytes(bytes: &[u8]) -> Vec<u8> {
     fn hex(b: u8) -> Option<u8> {
         char::from(b)
             .to_digit(16)
             .and_then(|d| u8::try_from(d).ok())
     }
-    let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while let Some(&b) = bytes.get(i) {
@@ -743,7 +806,7 @@ fn percent_decode(s: &str) -> Result<String, Error> {
         out.push(b);
         i += 1;
     }
-    String::from_utf8(out).map_err(|e| Error::Configuration(Box::new(e.utf8_error())))
+    out
 }
 
 impl Default for SqliteConnectOptions {
