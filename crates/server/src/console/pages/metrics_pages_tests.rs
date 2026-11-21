@@ -216,11 +216,13 @@ async fn admin_gets_the_metrics_page() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
     assert!(body.contains("<h1>Metrics</h1>"), "{body}");
-    assert!(body.contains("/console/metrics-data"), "{body}");
-    assert!(!body.contains("accountFilter"), "{body}");
+    let script_tag = format!(
+        r#"<script src="/console/assets/metrics.js" data-ops="{}"></script>"#,
+        super::DATA_OPS.join(" ")
+    );
+    assert!(body.contains(&script_tag), "{body}");
     // The raw metrics table names each row's account.
     assert!(body.contains("<th>Metric</th><th>Account</th><th>Table</th>"));
-    assert!(body.contains("d.AccountId"));
 }
 
 #[test]

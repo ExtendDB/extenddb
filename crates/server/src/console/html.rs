@@ -65,23 +65,6 @@ pub fn layout_full_with_url(
         Some(t) => format!(r#"<meta name="csrf-token" content="{}">"#, escape(t)),
         None => String::new(),
     };
-    let csrf_script = if csrf_token.is_some() {
-        r#"<script>
-document.addEventListener('DOMContentLoaded',function(){
-var t=document.querySelector('meta[name="csrf-token"]');
-if(!t)return;
-var v=t.getAttribute('content');
-document.querySelectorAll('form').forEach(function(f){
-if(f.method&&f.method.toLowerCase()==='post'){
-var i=document.createElement('input');
-i.type='hidden';i.name='_csrf';i.value=v;
-f.appendChild(i);
-}});
-});
-</script>"#
-    } else {
-        ""
-    };
     let tls_line = match listen_url {
         Some(url) => format!(
             r"Self-signed TLS certificate bound to <strong>{}</strong>",
@@ -151,7 +134,7 @@ label{{display:block;margin:0.5rem 0 0.2rem;font-weight:500;font-size:0.9rem}}
 {content}
 </main>
 {footer}
-{csrf_script}
+<script src="/console/assets/console.js"></script>
 </body>
 </html>"#,
         title = escape(title),
@@ -159,7 +142,6 @@ label{{display:block;margin:0.5rem 0 0.2rem;font-weight:500;font-size:0.9rem}}
         content = content,
         footer = footer,
         csrf_meta = csrf_meta,
-        csrf_script = csrf_script,
     )
 }
 

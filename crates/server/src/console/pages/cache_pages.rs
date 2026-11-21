@@ -109,25 +109,6 @@ test needs a deterministic flush.
 <a href="/console" class="btn">Cancel</a>
 </div>
 </form>
-<script>
-// Progressive disclosure: hide selector fields that don't apply to the
-// chosen scope. Submitted values for hidden fields are ignored by the
-// server (the shared `apply` helper validates per-scope), so this is
-// purely UX. The page works without JS — every field is visible.
-(function() {{
-  var sel = document.getElementById('scope');
-  var rows = document.querySelectorAll('.sel');
-  function apply() {{
-    var s = sel.value;
-    rows.forEach(function(row) {{
-      var scopes = row.getAttribute('data-scopes').split(' ');
-      row.style.display = scopes.indexOf(s) >= 0 ? '' : 'none';
-    }});
-  }}
-  sel.addEventListener('change', apply);
-  apply();
-}})();
-</script>
 </div>"#
     );
 

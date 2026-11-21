@@ -184,7 +184,7 @@ pub async fn group_detail(
         let _ = write!(
             content,
             r#"<form class="inline" method="post" action="/console/accounts/{eid}/groups/{egn}/delete"
-                onsubmit="return confirm('Delete group {egn}?')">
+                data-confirm="Delete group {egn}?">
 <button class="btn btn-danger btn-sm" type="submit">Delete Group</button>
 </form>"#
         );
@@ -241,7 +241,7 @@ pub async fn group_detail(
         let delete_btn = if is_admin(&session.identity) {
             format!(
                 r#"<form class="inline" method="post" action="/console/accounts/{eid}/groups/{egn}/policies/{ep}/delete"
-                      onsubmit="return confirm('Delete policy {ep}?')">
+                      data-confirm="Delete policy {ep}?">
 <button class="btn btn-danger btn-sm" type="submit">Delete</button>
 </form>"#
             )
