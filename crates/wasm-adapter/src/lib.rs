@@ -4,16 +4,19 @@
 //! WebAssembly adapter for `ExtendDB`.
 //!
 //! Runs the `ExtendDB` engine (`extenddb-engine`, over `extenddb-core` and
-//! `extenddb-auth`) inside a WebAssembly module in the browser, and replaces
-//! the one thing a browser cannot provide — the tokio TCP listener — with a
-//! direct in-process call: JavaScript hands a `DynamoDB` request in and gets the
-//! response back.
+//! `extenddb-auth`) inside a WebAssembly module in the browser. A browser
+//! cannot run the HTTP server, which listens on a TCP socket, so in its place
+//! JavaScript makes a direct in-process call: it hands a `DynamoDB` request in
+//! and gets the response back. The calls skip the server's own checks of a
+//! request; the README section "Checks the server makes that this build does
+//! not" lists them.
 //!
 //! # Layout
 //! - [`runtime`] — the portable engine wrapper: builds an `OperationContext`
 //!   over the in-memory `SQLite` backend and calls [`extenddb_engine::dispatch`].
-//!   Target-agnostic; the native unit tests exercise it against the native
-//!   `ExtendDB` `SQLite` build.
+//!   The same code on both targets except the backup runtime, which it holds
+//!   natively only, and its unit tests, which build natively only and
+//!   exercise it against the native `ExtendDB` `SQLite` build.
 //! - `wasm` — the `wasm-bindgen` entry points (`wasm32` only).
 //!
 //! # Scope and limits

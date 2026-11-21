@@ -4,12 +4,15 @@
 //! The portable adapter runtime: build an [`OperationContext`] and answer a
 //! `DynamoDB` request by calling the `ExtendDB` engine in-process.
 //!
-//! This module is target-agnostic — it compiles and runs natively (where the
-//! unit tests exercise it against the native `ExtendDB` `SQLite` build) and on
-//! `wasm32` (where [`crate::wasm`] wraps it in a `wasm-bindgen` surface). It
+//! This module compiles and runs natively (where the unit tests exercise it
+//! against the native `ExtendDB` `SQLite` build) and on `wasm32` (where
+//! [`crate::wasm`] wraps it in a `wasm-bindgen` surface). Apart from its unit
+//! tests, which build natively only, its one difference between the targets
+//! is the backup runtime, which it holds and passes to the engine natively
+//! only, as the engine's backup subsystem does not build for `wasm32`. It
 //! contains no `wasm-bindgen` and no network code: the "transport" is a direct
-//! function call into [`extenddb_engine::dispatch`], which is what the tokio
-//! TCP listener would have called after parsing an HTTP request.
+//! function call into [`extenddb_engine::dispatch`], the call the HTTP server
+//! makes after its own checks of a request.
 //!
 //! # Operations the browser build cannot serve
 //!
@@ -19,9 +22,12 @@
 //! same error:
 //!
 //! - **Refused on both targets** with a `ValidationException` that names the
-//!   build: the three `PartiQL` operations (the `PartiQL` surface is left out
-//!   of this build); and `DescribeEndpoints`, as the build has no network
-//!   address to report.
+//!   build: the three `PartiQL` operations, whose statements the engine
+//!   authorizes through an item authorizer this build does not install (the
+//!   refusal comes before the engine is reached, whether or not the engine was
+//!   built with its `partiql` feature: a workspace build turns it on for the
+//!   server, and a build of this crate alone leaves it off); and
+//!   `DescribeEndpoints`, as the build has no network address to report.
 //! - **Refused as the server refuses them**: every
 //!   `RestoreTableToPointInTime`, and an `UpdateContinuousBackups` that enables
 //!   point-in-time recovery, through [`extenddb_engine::parse_request`] and
@@ -191,10 +197,10 @@ impl Engine {
     /// checks, then dispatch into the engine.
     async fn dispatch(&self, operation: &str, body_json: &str) -> Result<Value, DynamoDbError> {
         // Refusals that need no request body: PartiQL and DescribeEndpoints.
-        // Answered before the operation-known check so a PartiQL request is
-        // refused for the stated reason rather than reported as unknown — this
-        // build is compiled without the PartiQL surface, so `parse_request`
-        // would report it as unknown otherwise.
+        // Answered before the operation-known check, so a PartiQL request gets
+        // the stated reason whether or not the engine was built with its
+        // `partiql` feature: without it, `parse_request` would answer
+        // `UnknownOperationException`.
         if let Some(reason) = unsupported_reason(operation) {
             return Err(unsupported(operation, reason));
         }
@@ -332,7 +338,8 @@ mod tests {
     /// The HTTP server refuses a body over 16 MiB with
     /// `RequestEntityTooLargeException` before it parses it; the adapter has
     /// no size limit, so a `ListTables` body of 17 MiB (padded with JSON
-    /// whitespace) is answered.
+    /// whitespace) is answered. Like every test in this `tests` module, it runs
+    /// in native builds only.
     #[tokio::test]
     async fn a_list_tables_body_over_16_mib_is_answered() {
         let engine = engine().await;
