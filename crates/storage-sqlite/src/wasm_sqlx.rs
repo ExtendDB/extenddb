@@ -550,13 +550,6 @@ pub struct SqliteConnection {
     handle: Handle,
 }
 
-impl SqliteConnection {
-    /// Close the connection. Closes when the last handle drops.
-    pub async fn close(self) -> Result<(), Error> {
-        Ok(())
-    }
-}
-
 /// A connection checked out of a [`SqlitePool`], mirroring
 /// `sqlx::pool::PoolConnection`. Dereferences to the connection, so
 /// `&mut *conn` is an [`Executor`]; the pool gets the connection back when
