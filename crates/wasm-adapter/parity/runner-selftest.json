@@ -1,0 +1,253 @@
+{
+  "_comment": [
+    "Copyright 2026 ExtendDB contributors \u2014 SPDX-License-Identifier: Apache-2.0.",
+    "Self-tests of the two corpus runners' case judging. Both tests/parity.rs",
+    "(native) and parity/run.mjs (Node) judge every row before they run the",
+    "corpus, and fail if a row's outcome is not its expect value. Each row:",
+    "  name      human label.",
+    "  case      a corpus case's assertions: error and checks (see corpus.json).",
+    "  response  the response document the case is judged against.",
+    "  expect    pass   - the response satisfies the case;",
+    "            fail   - the case is well formed and the response does not",
+    "                     satisfy it;",
+    "            reject - the case itself is malformed (an unknown check shape,",
+    "                     a member that is not part of a check, a non-string",
+    "                     error), whatever the response."
+  ],
+  "rows": [
+    {
+      "name": "equals on a scalar member",
+      "case": { "error": null, "checks": [{ "path": "/A", "equals": "x" }] },
+      "response": { "A": "x" },
+      "expect": "pass"
+    },
+    {
+      "name": "equals on a different scalar",
+      "case": { "error": null, "checks": [{ "path": "/A", "equals": "y" }] },
+      "response": { "A": "x" },
+      "expect": "fail"
+    },
+    {
+      "name": "equals compares object members regardless of their order",
+      "case": { "error": null, "checks": [{ "path": "/A", "equals": { "y": 2, "x": 1 } }] },
+      "response": { "A": { "x": 1, "y": 2 } },
+      "expect": "pass"
+    },
+    {
+      "name": "equals compares nested object members regardless of their order",
+      "case": { "error": null, "checks": [{ "path": "/A", "equals": [{ "b": [1, 2], "a": { "d": 4, "c": 3 } }] }] },
+      "response": { "A": [{ "a": { "c": 3, "d": 4 }, "b": [1, 2] }] },
+      "expect": "pass"
+    },
+    {
+      "name": "equals compares array elements in order",
+      "case": { "error": null, "checks": [{ "path": "/A", "equals": [1, 2] }] },
+      "response": { "A": [2, 1] },
+      "expect": "fail"
+    },
+    {
+      "name": "equals fails on an extra object member",
+      "case": { "error": null, "checks": [{ "path": "/A", "equals": { "x": 1 } }] },
+      "response": { "A": { "x": 1, "y": 2 } },
+      "expect": "fail"
+    },
+    {
+      "name": "equals compares numbers by value (1 and 1.0)",
+      "case": { "error": null, "checks": [{ "path": "/A", "equals": 1 }] },
+      "response": { "A": 1.0 },
+      "expect": "pass"
+    },
+    {
+      "name": "equals does not equate a number and its string",
+      "case": { "error": null, "checks": [{ "path": "/A", "equals": 1 }] },
+      "response": { "A": "1" },
+      "expect": "fail"
+    },
+    {
+      "name": "equals null on a missing member fails",
+      "case": { "error": null, "checks": [{ "path": "/A", "equals": null }] },
+      "response": {},
+      "expect": "fail"
+    },
+    {
+      "name": "equals null on a null member",
+      "case": { "error": null, "checks": [{ "path": "/A", "equals": null }] },
+      "response": { "A": null },
+      "expect": "pass"
+    },
+    {
+      "name": "contains on a string member",
+      "case": { "error": null, "checks": [{ "path": "/A", "contains": "ell" }] },
+      "response": { "A": "hello" },
+      "expect": "pass"
+    },
+    {
+      "name": "contains on a string without the substring",
+      "case": { "error": null, "checks": [{ "path": "/A", "contains": "xyz" }] },
+      "response": { "A": "hello" },
+      "expect": "fail"
+    },
+    {
+      "name": "contains on a member that is not a string",
+      "case": { "error": null, "checks": [{ "path": "/A", "contains": "1" }] },
+      "response": { "A": 1 },
+      "expect": "fail"
+    },
+    {
+      "name": "absent on a missing member",
+      "case": { "error": null, "checks": [{ "path": "/A", "absent": true }] },
+      "response": { "B": 1 },
+      "expect": "pass"
+    },
+    {
+      "name": "absent on a present null member",
+      "case": { "error": null, "checks": [{ "path": "/A", "absent": true }] },
+      "response": { "A": null },
+      "expect": "fail"
+    },
+    {
+      "name": "present on a present member",
+      "case": { "error": null, "checks": [{ "path": "/A/0", "present": true }] },
+      "response": { "A": [0] },
+      "expect": "pass"
+    },
+    {
+      "name": "present on a missing member",
+      "case": { "error": null, "checks": [{ "path": "/A/1", "present": true }] },
+      "response": { "A": [0] },
+      "expect": "fail"
+    },
+    {
+      "name": "the expected error name",
+      "case": { "error": "ValidationException", "checks": [] },
+      "response": { "__type": "com.amazon.coral.validate#ValidationException", "message": "m" },
+      "expect": "pass"
+    },
+    {
+      "name": "a different error name",
+      "case": { "error": "ValidationException", "checks": [] },
+      "response": { "__type": "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException" },
+      "expect": "fail"
+    },
+    {
+      "name": "an error where success is expected",
+      "case": { "error": null, "checks": [] },
+      "response": { "__type": "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException" },
+      "expect": "fail"
+    },
+    {
+      "name": "success where an error is expected",
+      "case": { "error": "ValidationException", "checks": [] },
+      "response": {},
+      "expect": "fail"
+    },
+    {
+      "name": "a pointer without a leading slash addresses nothing",
+      "case": { "error": null, "checks": [{ "path": "A", "absent": true }] },
+      "response": { "A": 1 },
+      "expect": "pass"
+    },
+    {
+      "name": "an array index with a leading zero addresses nothing",
+      "case": { "error": null, "checks": [{ "path": "/A/01", "absent": true }] },
+      "response": { "A": [0, 1] },
+      "expect": "pass"
+    },
+    {
+      "name": "an empty array index addresses nothing",
+      "case": { "error": null, "checks": [{ "path": "/A/", "absent": true }] },
+      "response": { "A": [0, 1] },
+      "expect": "pass"
+    },
+    {
+      "name": "a pointer addresses only the document's own members",
+      "case": { "error": null, "checks": [{ "path": "/constructor", "absent": true }] },
+      "response": {},
+      "expect": "pass"
+    },
+    {
+      "name": "escaped pointer tokens address their member",
+      "case": { "error": null, "checks": [{ "path": "/a~1b/c~0d", "equals": 1 }] },
+      "response": { "a/b": { "c~d": 1 } },
+      "expect": "pass"
+    },
+    {
+      "name": "the empty pointer addresses the whole document",
+      "case": { "error": null, "checks": [{ "path": "", "equals": { "A": 1 } }] },
+      "response": { "A": 1 },
+      "expect": "pass"
+    },
+    {
+      "name": "a misspelt check kind is rejected",
+      "case": { "error": null, "checks": [{ "path": "/NoSuchMember", "equal": "x" }] },
+      "response": {},
+      "expect": "reject"
+    },
+    {
+      "name": "a check with an extra member is rejected",
+      "case": { "error": null, "checks": [{ "path": "/A", "equals": "x", "note": "extra" }] },
+      "response": { "A": "x" },
+      "expect": "reject"
+    },
+    {
+      "name": "a check with two kinds is rejected",
+      "case": { "error": null, "checks": [{ "path": "/A", "equals": "hello", "contains": "ell" }] },
+      "response": { "A": "hello" },
+      "expect": "reject"
+    },
+    {
+      "name": "a check without a path is rejected",
+      "case": { "error": null, "checks": [{ "equals": "x" }] },
+      "response": { "A": "x" },
+      "expect": "reject"
+    },
+    {
+      "name": "a check whose path is not a string is rejected",
+      "case": { "error": null, "checks": [{ "path": 1, "absent": true }] },
+      "response": {},
+      "expect": "reject"
+    },
+    {
+      "name": "absent false is rejected",
+      "case": { "error": null, "checks": [{ "path": "/A", "absent": false }] },
+      "response": { "A": 1 },
+      "expect": "reject"
+    },
+    {
+      "name": "present false is rejected",
+      "case": { "error": null, "checks": [{ "path": "/A", "present": false }] },
+      "response": {},
+      "expect": "reject"
+    },
+    {
+      "name": "contains with a non-string value is rejected",
+      "case": { "error": null, "checks": [{ "path": "/A", "contains": 1 }] },
+      "response": { "A": "1" },
+      "expect": "reject"
+    },
+    {
+      "name": "a check that is not an object is rejected",
+      "case": { "error": null, "checks": ["/A"] },
+      "response": { "A": 1 },
+      "expect": "reject"
+    },
+    {
+      "name": "checks that are not an array are rejected",
+      "case": { "error": null, "checks": { "path": "/A", "equals": 1 } },
+      "response": { "A": 1 },
+      "expect": "reject"
+    },
+    {
+      "name": "an error name that is not a string is rejected",
+      "case": { "error": 1, "checks": [] },
+      "response": { "__type": "x#1" },
+      "expect": "reject"
+    },
+    {
+      "name": "an empty error name is rejected",
+      "case": { "error": "", "checks": [] },
+      "response": {},
+      "expect": "reject"
+    }
+  ]
+}

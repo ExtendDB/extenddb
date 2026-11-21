@@ -13,7 +13,9 @@
 // It runs the same cases with the same assertions as the native test
 // (`../tests/parity.rs`), which drives them through sqlx + C SQLite. When both
 // pass, each build gave every case the error name and the checked members the
-// corpus asserts; members a case does not check are not compared.
+// corpus asserts; members a case does not check are not compared. Before the
+// corpus, both runners judge the rows of `./runner-selftest.json` and fail if
+// any row's outcome differs from the one it records.
 //
 // The module is loaded from `./pkg`, the `wasm-bindgen --target web` output
 // (built by the test harness before this runner is invoked).
@@ -33,6 +35,7 @@ import { dirname, resolve } from 'node:path';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PKG = resolve(HERE, 'pkg');
 const CORPUS_PATH = resolve(HERE, 'corpus.json');
+const SELFTEST_PATH = resolve(HERE, 'runner-selftest.json');
 
 // ---- tiny assertion helpers ------------------------------------------------
 
@@ -43,14 +46,27 @@ function fail(msg) {
     console.error(`  \u2717 ${msg}`);
 }
 
-/** Resolve a JSON Pointer (RFC 6901), returning undefined if absent. */
+/**
+ * Resolve a JSON Pointer (RFC 6901), returning undefined if absent. Follows
+ * serde_json's `Value::pointer`, which the native runner uses: a pointer that
+ * is not empty and does not start with `/` addresses nothing, an array index
+ * is decimal digits with no leading zero, and only a document's own members
+ * are addressed.
+ */
 function pointer(doc, path) {
     if (path === '') return doc;
+    if (!path.startsWith('/')) return undefined;
     const parts = path.split('/').slice(1).map((p) => p.replace(/~1/g, '/').replace(/~0/g, '~'));
     let cur = doc;
     for (const part of parts) {
-        if (cur === null || typeof cur !== 'object') return undefined;
-        cur = Array.isArray(cur) ? cur[Number(part)] : cur[part];
+        if (Array.isArray(cur)) {
+            if (!/^(0|[1-9][0-9]*)$/.test(part)) return undefined;
+            cur = cur[Number(part)];
+        } else if (cur !== null && typeof cur === 'object') {
+            cur = Object.hasOwn(cur, part) ? cur[part] : undefined;
+        } else {
+            return undefined;
+        }
         if (cur === undefined) return undefined;
     }
     return cur;
@@ -64,35 +80,106 @@ function errorShortName(resp) {
     return afterHash.includes('.') ? afterHash.slice(afterHash.lastIndexOf('.') + 1) : afterHash;
 }
 
-/** Apply one case's assertions to a parsed response. */
-function assertCase(c, resp) {
+// The judging rules below are the native runner's (`judge` in
+// `../tests/parity.rs`); the rows of `./runner-selftest.json` hold the two to
+// the same outcomes.
+
+/** A case that is malformed, as opposed to one the response does not satisfy. */
+class Reject extends Error {}
+
+const CHECK_SHAPE = 'must have a string path and exactly one of equals, contains (a string), '
+    + 'absent: true or present: true, and no other member';
+
+function isObject(v) {
+    return v !== null && typeof v === 'object' && !Array.isArray(v);
+}
+
+/** Read one check into `{ path, kind, value }`, throwing Reject on any other shape. */
+function parseCheck(check) {
+    const bad = () => new Reject(`check ${JSON.stringify(check)} ${CHECK_SHAPE}`);
+    if (!isObject(check) || typeof check.path !== 'string') throw bad();
+    const keys = Object.keys(check);
+    if (keys.length !== 2) throw bad();
+    const kind = keys.find((k) => k !== 'path');
+    const value = check[kind];
+    if (kind === 'equals') return { path: check.path, kind, value };
+    if (kind === 'contains' && typeof value === 'string') return { path: check.path, kind, value };
+    if ((kind === 'absent' || kind === 'present') && value === true) return { path: check.path, kind, value };
+    throw bad();
+}
+
+/** JSON equality: object members regardless of order, array elements in order. */
+function jsonEqual(a, b) {
+    if (Array.isArray(a) || Array.isArray(b)) {
+        return Array.isArray(a) && Array.isArray(b)
+            && a.length === b.length && a.every((x, i) => jsonEqual(x, b[i]));
+    }
+    if (isObject(a) || isObject(b)) {
+        if (!isObject(a) || !isObject(b)) return false;
+        const keys = Object.keys(a);
+        return keys.length === Object.keys(b).length
+            && keys.every((k) => Object.hasOwn(b, k) && jsonEqual(a[k], b[k]));
+    }
+    return a === b;
+}
+
+/**
+ * Judge one case against a parsed response: undefined when it holds, else a
+ * failure message. Throws Reject when the case itself is malformed.
+ */
+function judge(c, resp) {
+    let expected;
+    if (c.error === undefined || c.error === null) {
+        expected = undefined;
+    } else if (typeof c.error === 'string' && c.error !== '') {
+        expected = c.error;
+    } else {
+        throw new Reject(`case '${c.name}': error ${JSON.stringify(c.error)} is neither null nor a non-empty string`);
+    }
+    let checkList = [];
+    if (c.checks !== undefined) {
+        if (!Array.isArray(c.checks)) throw new Reject(`case '${c.name}': checks ${JSON.stringify(c.checks)} is not an array`);
+        checkList = c.checks.map((check) => {
+            try {
+                return parseCheck(check);
+            } catch (e) {
+                if (e instanceof Reject) throw new Reject(`case '${c.name}': ${e.message}`);
+                throw e;
+            }
+        });
+    }
+
     const got = errorShortName(resp);
-    if (c.error) {
-        if (got !== c.error) {
-            fail(`case '${c.name}': expected error ${c.error}, got ${JSON.stringify(resp)}`);
-        }
-    } else if (got !== undefined) {
-        fail(`case '${c.name}': expected success, got error ${JSON.stringify(resp)}`);
+    if (expected !== undefined && got !== expected) {
+        return `case '${c.name}': expected error ${expected}, got response ${JSON.stringify(resp)}`;
     }
-    for (const check of c.checks || []) {
-        const val = pointer(resp, check.path);
-        checks += 1;
-        if (check.absent === true) {
-            if (val !== undefined) {
-                fail(`case '${c.name}': expected ${check.path} absent, got ${JSON.stringify(val)}`);
-            }
-        } else if (check.present === true) {
-            if (val === undefined) {
-                fail(`case '${c.name}': expected ${check.path} present, got undefined`);
-            }
-        } else if (typeof check.contains === 'string') {
-            if (typeof val !== 'string' || !val.includes(check.contains)) {
-                fail(`case '${c.name}': at ${check.path} expected a string containing ${JSON.stringify(check.contains)}, got ${JSON.stringify(val)}`);
-            }
-        } else if (JSON.stringify(val) !== JSON.stringify(check.equals)) {
-            fail(`case '${c.name}': at ${check.path} expected ${JSON.stringify(check.equals)}, got ${JSON.stringify(val)}`);
+    if (expected === undefined && got !== undefined) {
+        return `case '${c.name}': expected success, got error document ${JSON.stringify(resp)}`;
+    }
+    for (const { path, kind, value } of checkList) {
+        const val = pointer(resp, path);
+        let holds;
+        if (kind === 'absent') holds = val === undefined;
+        else if (kind === 'present') holds = val !== undefined;
+        else if (kind === 'contains') holds = typeof val === 'string' && val.includes(value);
+        else holds = val !== undefined && jsonEqual(val, value);
+        if (!holds) {
+            return `case '${c.name}': at ${path} expected ${kind} ${JSON.stringify(value)}, response ${JSON.stringify(resp)}`;
         }
     }
+    return undefined;
+}
+
+/** Apply one case's assertions to a parsed response, counting its checks. */
+function assertCase(c, resp) {
+    checks += Array.isArray(c.checks) ? c.checks.length : 0;
+    let why;
+    try {
+        why = judge(c, resp);
+    } catch (e) {
+        why = e instanceof Reject ? `malformed case: ${e.message}` : `judging threw: ${e.message}`;
+    }
+    if (why !== undefined) fail(why);
 }
 
 /** Replace every string of the form `${name}` with the value an earlier case saved. */
@@ -122,6 +209,28 @@ function save(c, resp, saved) {
     }
 }
 
+// ---- judge the shared runner self-test rows before the corpus --------------
+
+const selftest = JSON.parse(await readFile(SELFTEST_PATH, 'utf8'));
+let selftestDisagreements = 0;
+for (const row of selftest.rows) {
+    let got;
+    try {
+        got = judge({ name: row.name, ...row.case }, row.response) === undefined ? 'pass' : 'fail';
+    } catch (e) {
+        if (!(e instanceof Reject)) throw e;
+        got = 'reject';
+    }
+    if (got !== row.expect) {
+        selftestDisagreements += 1;
+        console.error(`  \u2717 self-test '${row.name}': expected ${row.expect}, got ${got}`);
+    }
+}
+if (selftestDisagreements !== 0) {
+    console.log(`RESULT: FAIL (${selftestDisagreements} of ${selftest.rows.length} runner self-test rows judged differently than expected)`);
+    process.exit(1);
+}
+
 // ---- load the wasm module (pass bytes; Node has no fetch for file://) -------
 
 const mod = await import(`${PKG}/extenddb_wasm_adapter.js`);
@@ -132,6 +241,7 @@ console.log('=== Headless wasm parity runner ===');
 console.log('  target: wasm32-unknown-unknown (in-memory SQLite, in browser/wasm)');
 console.log(`  module: ${PKG}/extenddb_wasm_adapter_bg.wasm`);
 console.log(`  node:   ${process.version}`);
+console.log(`  runner self-test: ${selftest.rows.length} rows judged as expected`);
 console.log('');
 
 // ---- run the shared parity corpus through the wasm module ------------------
