@@ -54,7 +54,7 @@ pub mod wasm_sqlx_for_tests {
 /// derive's default mapping. A `#[sqlx(...)]` attribute, on the struct (such as
 /// `rename_all`) or on a field (such as `rename`, `default` or `flatten`),
 /// would change that on native only, so the macro refuses one with a compile
-/// error.
+/// error, including one inside a `#[cfg_attr(...)]` at any depth.
 mod row_macro {
     macro_rules! sqlite_row_struct {
         (
@@ -85,13 +85,30 @@ mod row_macro {
     pub(crate) use sqlite_row_struct;
 
     /// Refuses a `#[sqlx(...)]` attribute of a `sqlite_row_struct!` struct or
-    /// field and passes every other attribute (doc comments, `allow`s).
+    /// field, or one among the attributes of a `#[cfg_attr(...)]`, and passes
+    /// every other attribute (doc comments, `allow`s).
     macro_rules! sqlite_row_attr {
         (sqlx $($rest:tt)*) => {
             compile_error!(
                 "sqlite_row_struct! decodes every field from the column of the field's name on \
                  both targets; a #[sqlx(...)] attribute would change that on native only"
             );
+        };
+        (cfg_attr ( $predicate:meta $(, $($attrs:tt)*)? )) => {
+            $( $crate::row_macro::sqlite_row_attr!(@list [] $($attrs)*); )?
+        };
+        // The comma-separated attributes of a `cfg_attr`: each one is checked
+        // as an attribute of its own. The bracket holds the tokens of the
+        // attribute read so far.
+        (@list [$($attr:tt)*]) => {
+            $crate::row_macro::sqlite_row_attr!($($attr)*);
+        };
+        (@list [$($attr:tt)*] , $($rest:tt)*) => {
+            $crate::row_macro::sqlite_row_attr!($($attr)*);
+            $crate::row_macro::sqlite_row_attr!(@list [] $($rest)*);
+        };
+        (@list [$($attr:tt)*] $next:tt $($rest:tt)*) => {
+            $crate::row_macro::sqlite_row_attr!(@list [$($attr)* $next] $($rest)*);
         };
         ($($other:tt)*) => {};
     }
