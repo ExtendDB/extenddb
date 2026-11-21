@@ -175,6 +175,7 @@ Policy sources collected for evaluation:
 ### Fail-Closed Design
 
 - **Unparseable policies deny**: A stored policy that cannot be parsed results in access denied, not silent skip. A corrupted Deny policy still denies; a corrupted Allow policy is treated as absent.
+- **Unreadable documents fail the request on MongoDB**: A stored policy, permissions boundary, session policy, session tags value, group membership or tag that the MongoDB store cannot read (a field missing, or of another type) fails each request that needs it with HTTP 500 (`InternalServerError`). The server logs the collection and the document's `_id`.
 - **Auth before JSON parse**: SigV4 signature verification runs before the request body is parsed. Invalid signatures are rejected with constant-time comparison before any business logic executes.
 - **Concurrent policy fetching**: Identity policies, group policies, and permissions boundaries are fetched concurrently from the catalog when they are not in the server's cache (see Credential and Policy Caching). All must succeed for evaluation to proceed.
 - **Constant-time rejection for inactive keys**: Inactive or expired access keys are rejected without timing differences that could reveal key existence.

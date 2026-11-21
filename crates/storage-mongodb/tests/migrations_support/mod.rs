@@ -21,6 +21,7 @@ use bson::{Document, doc};
 use extenddb_storage::migrations::{
     CatalogStatus, LedgerRow, MigrationError, MigrationId, RunReport, Runner,
 };
+use extenddb_storage_mongodb::MongoCatalogStore;
 use extenddb_storage_mongodb::migrations::{
     Definitions, Index, MigrationLock, MongoMigrations, MongoTarget, Timing, catalog_status, lock,
     migrate_holding,
@@ -100,6 +101,17 @@ pub fn server() -> Option<String> {
             None
         }
     }
+}
+
+/// A catalog store on a new deployment, created with every migration as
+/// `init` creates it, or `None` to skip.
+pub async fn scratch(tag: &str) -> Option<(Deployment, MongoCatalogStore)> {
+    let uri = server()?;
+    let deployment = Deployment::new(&uri, tag).await;
+    deployment.create().await;
+    let store =
+        MongoCatalogStore::on_database_for_tests(deployment.client.clone(), deployment.catalog());
+    Some((deployment, store))
 }
 
 static NEXT: AtomicU32 = AtomicU32::new(0);

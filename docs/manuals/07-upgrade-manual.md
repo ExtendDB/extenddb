@@ -388,6 +388,31 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
+### v1.1.0: on MongoDB, a stored IAM document that cannot be read fails the request
+
+**What changed.** On MongoDB, the authorization store left out a stored IAM document that it could not read, and the request was evaluated without it. A Deny, a permissions boundary or a session policy in that document did not apply. Now each request that needs the document gets HTTP 500 (`InternalServerError`, "Internal error during authorization"), and the server logs `a stored IAM document cannot be read` with the collection and the document's `_id` (#920). These documents are:
+
+- a policy or a permissions boundary with no `policy_document`, or with a value that has no JSON form (a Decimal128, or binary data of the generic subtype)
+- a group membership or a group policy whose group name is not a string
+- a session policy or session tags with no JSON form
+- a user, role or resource tag whose key or value is not a string
+
+**Who is affected.** A MongoDB deployment whose catalog holds such a document. ExtendDB writes none of them, so the case needs a change made outside ExtendDB, or damage. SQLite, PostgreSQL and Cassandra are not affected. No catalog migration is required.
+
+**Before upgrading**, look for such documents in the catalog database with `mongosh`. These queries list each document with a field that is missing or not a string, or with a Decimal128 or binary value as the whole `policy_document`, `session_policy` or `session_tags`:
+
+```js
+db.iam_policies.find({ $expr: { $or: [{ $in: [{ $type: "$policy_document" }, ["missing", "decimal", "binData"]] }, { $ne: [{ $type: "$principal_name" }, "string"] }] } })
+db.iam_permissions_boundaries.find({ $expr: { $in: [{ $type: "$policy_document" }, ["missing", "decimal", "binData"]] } })
+db.iam_group_members.find({ $expr: { $ne: [{ $type: "$group_name" }, "string"] } })
+db.iam_sessions.find({ $expr: { $or: [{ $in: [{ $type: "$session_policy" }, ["decimal", "binData"]] }, { $in: [{ $type: "$session_tags" }, ["decimal", "binData"]] }] } })
+db.iam_user_tags.find({ $expr: { $or: [{ $ne: [{ $type: "$tag_key" }, "string"] }, { $ne: [{ $type: "$tag_value" }, "string"] }] } })
+db.iam_role_tags.find({ $expr: { $or: [{ $ne: [{ $type: "$tag_key" }, "string"] }, { $ne: [{ $type: "$tag_value" }, "string"] }] } })
+db.tags.find({ $expr: { $or: [{ $ne: [{ $type: "$tag_key" }, "string"] }, { $ne: [{ $type: "$tag_value" }, "string"] }] } })
+```
+
+They do not find a Decimal128 or binary value nested inside one of those documents. The server log names each such document when a request needs it. Repair a document from its source, for example by writing the policy again with `extenddb manage put-user-policy`, or delete it.
+
 ### v1.0.0: Cassandra reads and writes at `LOCAL_QUORUM`
 
 **What changed.** The Cassandra backend runs its reads and writes at `LOCAL_QUORUM`. 0.1.15 ran many of them at `ONE`, the driver's default, in each area: items (the reads of GetItem, Query and Scan among them), transactions, TTL, streams, the catalog, IAM and `init`. A read with `ConsistentRead` `false` also runs at `LOCAL_QUORUM`. A lightweight transaction runs Paxos at `LOCAL_SERIAL` and commits at `LOCAL_QUORUM`. 0.1.15 ran many of its lightweight transactions at those levels already, and others, among them the admin user creation and most IAM writes, at the driver's defaults, `SERIAL` and `ONE`. Batches ran at `LOCAL_QUORUM` before and still do. No setting changes these levels (#945).

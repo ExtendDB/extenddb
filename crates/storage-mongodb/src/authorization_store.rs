@@ -2,6 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `AuthorizationStore` trait implementation for `MongoDB`.
+//!
+//! A stored policy, permissions boundary, session policy, session tags value,
+//! group membership or tag that these loaders cannot read (a field missing or
+//! of another type) fails the load with `OpError::Internal`, as a failed query
+//! does: a document left out can hold the Deny that matches the request. Two
+//! reads stay lenient, as on the other backends. A session tag entry whose key
+//! or value is not a string is left out, because `AssumeRole` stores the
+//! session tags as the caller sent them. A `created_at` that cannot be read
+//! gives `None`, because sessions written before 0.1.14 have none.
 
 use futures::TryStreamExt;
 use futures::future::BoxFuture;
@@ -11,6 +20,7 @@ use extenddb_storage::authorization_store::{AuthorizationStore, SessionData};
 use extenddb_storage::management_store::{OpError, OpResult};
 
 use crate::catalog_store::MongoCatalogStore;
+use crate::management_store::stored_document;
 
 impl AuthorizationStore for MongoCatalogStore {
     fn fetch_user_policies(
@@ -37,14 +47,9 @@ impl AuthorizationStore for MongoCatalogStore {
                 tracing::error!("fetch_user_policies cursor: {e}");
                 OpError::Internal("Database error".to_owned())
             })?;
-            Ok(docs
-                .into_iter()
-                .filter_map(|d| {
-                    let bson_val = d.get("policy_document")?;
-                    let json_val: serde_json::Value = bson::from_bson(bson_val.clone()).ok()?;
-                    Some(json_val.to_string())
-                })
-                .collect())
+            docs.iter()
+                .map(|d| policy_document("iam_policies", d))
+                .collect()
         })
     }
 
@@ -72,10 +77,10 @@ impl AuthorizationStore for MongoCatalogStore {
                 OpError::Internal("Database error".to_owned())
             })?;
 
-            let group_names: Vec<&str> = member_docs
+            let group_names = member_docs
                 .iter()
-                .filter_map(|d| d.get_str("group_name").ok())
-                .collect();
+                .map(|d| string_field("iam_group_members", d, "group_name"))
+                .collect::<OpResult<Vec<&str>>>()?;
 
             if group_names.is_empty() {
                 return Ok(Vec::new());
@@ -98,15 +103,13 @@ impl AuthorizationStore for MongoCatalogStore {
                 tracing::error!("fetch_user_group_policies policies cursor: {e}");
                 OpError::Internal("Database error".to_owned())
             })?;
-            Ok(docs
-                .into_iter()
-                .filter_map(|d| {
-                    let group = d.get_str("principal_name").ok()?.to_owned();
-                    let bson_val = d.get("policy_document")?;
-                    let json_val: serde_json::Value = bson::from_bson(bson_val.clone()).ok()?;
-                    Some((group, json_val.to_string()))
+            docs.iter()
+                .map(|d| {
+                    let group = string_field("iam_policies", d, "principal_name")?;
+                    let policy = policy_document("iam_policies", d)?;
+                    Ok((group.to_owned(), policy))
                 })
-                .collect())
+                .collect()
         })
     }
 
@@ -132,11 +135,8 @@ impl AuthorizationStore for MongoCatalogStore {
                     tracing::error!("fetch_user_boundary: {e}");
                     OpError::Internal("Database error".to_owned())
                 })?;
-            Ok(doc.and_then(|d| {
-                let bson_val = d.get("policy_document")?;
-                let json_val: serde_json::Value = bson::from_bson(bson_val.clone()).ok()?;
-                Some(json_val.to_string())
-            }))
+            doc.map(|d| policy_document("iam_permissions_boundaries", &d))
+                .transpose()
         })
     }
 
@@ -164,14 +164,9 @@ impl AuthorizationStore for MongoCatalogStore {
                 tracing::error!("fetch_role_policies cursor: {e}");
                 OpError::Internal("Database error".to_owned())
             })?;
-            Ok(docs
-                .into_iter()
-                .filter_map(|d| {
-                    let bson_val = d.get("policy_document")?;
-                    let json_val: serde_json::Value = bson::from_bson(bson_val.clone()).ok()?;
-                    Some(json_val.to_string())
-                })
-                .collect())
+            docs.iter()
+                .map(|d| policy_document("iam_policies", d))
+                .collect()
         })
     }
 
@@ -197,11 +192,8 @@ impl AuthorizationStore for MongoCatalogStore {
                     tracing::error!("fetch_role_boundary: {e}");
                     OpError::Internal("Database error".to_owned())
                 })?;
-            Ok(doc.and_then(|d| {
-                let bson_val = d.get("policy_document")?;
-                let json_val: serde_json::Value = bson::from_bson(bson_val.clone()).ok()?;
-                Some(json_val.to_string())
-            }))
+            doc.map(|d| policy_document("iam_permissions_boundaries", &d))
+                .transpose()
         })
     }
 
@@ -234,15 +226,11 @@ impl AuthorizationStore for MongoCatalogStore {
                 return Ok(None);
             };
 
-            let session_policy = session_doc.get("session_policy").and_then(|b| {
-                let json_val: serde_json::Value = bson::from_bson(b.clone()).ok()?;
-                Some(json_val.to_string())
-            });
+            let session_policy =
+                json_field("iam_sessions", &session_doc, "session_policy")?.map(|v| v.to_string());
 
             let mut session_tags = Vec::new();
-            if let Some(tags_bson) = session_doc.get("session_tags")
-                && let Ok(tags_val) = bson::from_bson::<serde_json::Value>(tags_bson.clone())
-            {
+            if let Some(tags_val) = json_field("iam_sessions", &session_doc, "session_tags")? {
                 if let Some(arr) = tags_val.as_array() {
                     for tag in arr {
                         if let (Some(k), Some(v)) = (
@@ -292,15 +280,7 @@ impl AuthorizationStore for MongoCatalogStore {
                 tracing::error!("fetch_user_tags cursor: {e}");
                 OpError::Internal("Database error".to_owned())
             })?;
-            Ok(docs
-                .into_iter()
-                .filter_map(|d| {
-                    Some((
-                        d.get_str("tag_key").ok()?.to_owned(),
-                        d.get_str("tag_value").ok()?.to_owned(),
-                    ))
-                })
-                .collect())
+            docs.iter().map(|d| tag("iam_user_tags", d)).collect()
         })
     }
 
@@ -324,15 +304,7 @@ impl AuthorizationStore for MongoCatalogStore {
                 tracing::error!("fetch_role_tags cursor: {e}");
                 OpError::Internal("Database error".to_owned())
             })?;
-            Ok(docs
-                .into_iter()
-                .filter_map(|d| {
-                    Some((
-                        d.get_str("tag_key").ok()?.to_owned(),
-                        d.get_str("tag_value").ok()?.to_owned(),
-                    ))
-                })
-                .collect())
+            docs.iter().map(|d| tag("iam_role_tags", d)).collect()
         })
     }
 
@@ -351,15 +323,7 @@ impl AuthorizationStore for MongoCatalogStore {
                 tracing::error!("fetch_resource_tags cursor: {e}");
                 OpError::Internal("Database error".to_owned())
             })?;
-            Ok(docs
-                .into_iter()
-                .filter_map(|d| {
-                    Some((
-                        d.get_str("tag_key").ok()?.to_owned(),
-                        d.get_str("tag_value").ok()?.to_owned(),
-                    ))
-                })
-                .collect())
+            docs.iter().map(|d| tag("tags", d)).collect()
         })
     }
 
@@ -410,6 +374,53 @@ impl AuthorizationStore for MongoCatalogStore {
             }))
         })
     }
+}
+
+/// Log a stored document of `collection` that cannot be read, and give the
+/// error of the load that needs it.
+fn unreadable(collection: &str, d: &Document, fault: &str) -> OpError {
+    tracing::error!(
+        collection,
+        id = %d.get("_id").map_or_else(String::new, ToString::to_string),
+        "a stored IAM document cannot be read ({fault}); an authorization load \
+         that needs it fails until the document is repaired or deleted"
+    );
+    OpError::Internal("Stored IAM document cannot be read".to_owned())
+}
+
+/// A string field of a stored document. `ExtendDB` writes these fields as
+/// strings.
+fn string_field<'d>(collection: &str, d: &'d Document, field: &str) -> OpResult<&'d str> {
+    d.get_str(field)
+        .map_err(|e| unreadable(collection, d, &format!("{field}: {e}")))
+}
+
+/// A field of a stored document as JSON, or `None` when the document has no
+/// such field. A value with no JSON form, such as a Decimal128 or binary data
+/// of the generic subtype, cannot be read.
+fn json_field(collection: &str, d: &Document, field: &str) -> OpResult<Option<serde_json::Value>> {
+    d.get(field)
+        .map(|value| {
+            bson::from_bson(value.clone())
+                .map_err(|e| unreadable(collection, d, &format!("{field}: {e}")))
+        })
+        .transpose()
+}
+
+/// The `policy_document` of a stored policy or permissions boundary, as
+/// JSON text.
+fn policy_document(collection: &str, d: &Document) -> OpResult<String> {
+    stored_document(d)
+        .map(|v| v.to_string())
+        .map_err(|fault| unreadable(collection, d, &fault))
+}
+
+/// The key and the value of a stored tag.
+fn tag(collection: &str, d: &Document) -> OpResult<(String, String)> {
+    Ok((
+        string_field(collection, d, "tag_key")?.to_owned(),
+        string_field(collection, d, "tag_value")?.to_owned(),
+    ))
 }
 
 /// Format a BSON datetime as RFC 3339 UTC, matching how the other backends
