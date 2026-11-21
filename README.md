@@ -551,6 +551,28 @@ target must be on `PATH`, or the build stops in that crate's build script.
 The emitted module is about 6.6 MiB after `wasm-bindgen`; `wasm-pack --release`
 runs `wasm-opt`, which brings it to about 5.0 MiB.
 
+The command above can download two tools. wasm-pack 0.15.1 uses the
+`wasm-bindgen` on `PATH` when it is the version `Cargo.lock` names, and any
+`wasm-opt` on `PATH`. For each one it finds neither there nor in its own
+cache, it downloads a prebuilt archive from GitHub releases (wasm-bindgen at
+the version in `Cargo.lock`, binaryen at `version_130`; when the wasm-bindgen
+download fails, it runs `cargo install` instead) and checks no checksum of
+it. To build without those downloads, build the `wasm-bindgen-cli` of the
+`wasm-bindgen` version in `Cargo.lock` from crates.io, and skip `wasm-opt`:
+
+```bash
+cargo install --locked --version 0.2.130 wasm-bindgen-cli
+wasm-pack build --target web --release --no-opt --mode no-install crates/wasm-adapter
+```
+
+With `--mode no-install`, wasm-pack stops with an error instead of
+downloading when it finds no `wasm-bindgen` of that version; with `--no-opt`,
+it does not run `wasm-opt`, so the module stays at about 6.6 MiB. In either
+form wasm-pack also runs `rustup target add wasm32-unknown-unknown` when the
+toolchain is a rustup one without that target, and asks crates.io for the
+latest wasm-pack version unless the `wasm-pack.stamp` file beside its binary
+is less than 24 hours old; the answer only feeds a warning.
+
 The `wasm32` build is the adapter's dependency graph, built through
 `extenddb-wasm-adapter` as above. Two crates of that graph do not build for
 `wasm32-unknown-unknown` on their own: `extenddb-engine` with its default
