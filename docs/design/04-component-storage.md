@@ -409,10 +409,11 @@ The PostgreSQL backend uses two categories of tables:
     same way). The query builders also qualify every string key predicate and
     `ORDER BY` with `COLLATE "C"`, so results are byte-ordered on tables
     created before the columns carried the collation; on those tables the
-    indexes cannot serve the predicates (see technical debt C-11). The same
-    columns on index tables (`pk`, `sk_s`, `base_pk`, `base_sk_s`) carry the
-    collation, so a GSI or LSI cursor is a row comparison the ordering index
-    serves in one seek.
+    indexes cannot serve the predicates (see technical debt C-11). On index
+    tables created with the collated key columns, the same columns (`pk`,
+    `sk_s`, `base_pk`, `base_sk_s`) carry the collation. A GSI cursor there is
+    a row comparison the ordering index serves in one seek (the LSI case is in
+    section 7).
 
 - **Item storage**: `item_data` JSONB contains the complete item including key
   attributes, matching the DynamoDB model where key attributes are part of the
@@ -733,41 +734,121 @@ serialized as standard DynamoDB JSON.
 pub type PaginationKey = BTreeMap<String, AttributeValue>;
 ```
 
-The storage backend translates this to a SQL `WHERE` clause:
+The PostgreSQL and SQLite backends translate this to a SQL `WHERE` clause. The
+cursor compares the same columns the statement's `ORDER BY` sorts on, in the
+same order and in the same direction. So the predicate is one row comparison,
+`>` for a forward page and `<` for a reverse one. It is a plain comparison when
+the cursor has one column. In the Scan, base table Query, GSI and hash-only
+index shapes below, a key index whose columns follow the cursor's serves the
+page. The page comes out in order with no sort step, except the Scan on an
+index with more than one RANGE attribute (see Index Scan). For the Scan and
+the base table Query that index is the primary key. For a GSI it is the
+ordering index `(pk, sk_*, base_pk, base_sk_*)`. A hash-only index has no
+ordering index, because `create_index_data_table` creates one only when the
+index declares a sort key. Its page comes from the primary key
+`(pk, base_pk, base_sk_*)` or from the base-key index `(base_pk, base_sk_*)`
+with a filter on `pk`. All of this holds on tables created with the collated
+key columns. On older PostgreSQL tables the key columns keep the database
+collation, so the indexes do not serve a `COLLATE "C"` predicate or
+`ORDER BY`. The statements put `COLLATE "C"` on `base_pk` and on every string
+sort key column. Where the first cursor column other than `pk` is one of
+these, PostgreSQL reads the rows through the `pk` prefix of the key index. It
+then filters the cursor and sorts the rest, on every page (technical debt
+C-11). The statements below show PostgreSQL. SQLite emits the same shape with
+`?` placeholders and without `COLLATE`, because its text columns already
+compare by byte value.
 
-**Base table pagination (forward scan):**
+**Base table Scan:**
 ```sql
-WHERE (pk = $last_pk AND sk_n > $last_sk)
-   OR pk > $last_pk
+WHERE (pk, sk_n) > ($last_pk, $last_sk)
+ORDER BY pk, sk_n
 ```
 
-**Base table pagination (reverse scan):**
+**Base table Query:** the key condition fixes `pk`, so the sort key alone is
+the cursor. `ScanIndexForward = false` flips the comparison and the sort:
 ```sql
-WHERE (pk = $last_pk AND sk_n < $last_sk)
-   OR pk < $last_pk
+WHERE pk = $pk AND sk_n > $last_sk
+ORDER BY sk_n ASC
+```
+```sql
+WHERE pk = $pk AND sk_n < $last_sk
+ORDER BY sk_n DESC
 ```
 
-**GSI pagination (forward scan):**
-GSI keys are not unique, so the base table primary key is used as a tiebreaker.
-Every column of the cursor runs in the same direction as the `ORDER BY`, so the
-predicate is one row comparison, which the ordering index on
-`(pk, sk_s, base_pk, base_sk_*)` serves as a single seek:
+**GSI Query (forward):**
+GSI keys are not unique, so the base table primary key follows the index sort
+key as a tiebreaker, in the cursor and in the `ORDER BY`:
 ```sql
 WHERE pk = $gsi_pk
   AND (sk_s COLLATE "C", base_pk COLLATE "C", base_sk_n) > ($gsi_sk, $base_pk, $base_sk)
-ORDER BY sk_s COLLATE "C", base_pk COLLATE "C", base_sk_n
+ORDER BY sk_s COLLATE "C" ASC, base_pk COLLATE "C" ASC, base_sk_n ASC
 ```
 
-For a reverse query (`ScanIndexForward = false`) the index sort key runs
-backwards while the base-key tiebreaker stays ascending, so the cursor keeps
-the expanded form:
+**GSI Query (reverse, `ScanIndexForward = false`):** every column runs
+backwards, the base-key tiebreaker included, so the cursor stays a row
+comparison and the page sequence is the exact mirror of the forward one. The
+service has the same mirror property: a reverse Query returns the forward
+order reversed, among items that share an index sort key and among the items
+of a hash-only index partition (measured 2026-09-17). An ascending tiebreaker
+under a descending sort key is not a mirror, and on a hash-only index, where
+the tiebreaker is the whole order, an ascending cursor under a descending
+`ORDER BY` repeated the first page's items and skipped the rest.
 ```sql
 WHERE pk = $gsi_pk
-  AND (sk_s COLLATE "C" < $gsi_sk
-       OR (sk_s COLLATE "C" = $gsi_sk
-           AND (base_pk COLLATE "C" > $base_pk
-                OR (base_pk = $base_pk AND base_sk_n > $base_sk))))
+  AND (sk_s COLLATE "C", base_pk COLLATE "C", base_sk_n) < ($gsi_sk, $base_pk, $base_sk)
+ORDER BY sk_s COLLATE "C" DESC, base_pk COLLATE "C" DESC, base_sk_n DESC
 ```
+
+**GSI with more than one RANGE attribute:** every RANGE attribute of the index
+key schema has its own column (`sk_s`, `sk2_n`, ...), in key-schema order. All
+of them precede the base key in the cursor and in the `ORDER BY`. A GSI with
+RANGE attributes `r1` (S) and `r2` (N) over a base table with a numeric sort
+key compares four columns. The ordering index
+`(pk, sk_s, sk2_n, base_pk, base_sk_n)` serves the page in one seek in both
+directions:
+```sql
+WHERE pk = $gsi_pk
+  AND (sk_s COLLATE "C", sk2_n, base_pk COLLATE "C", base_sk_n) > ($r1, $r2, $base_pk, $base_sk)
+ORDER BY sk_s COLLATE "C" ASC, sk2_n ASC, base_pk COLLATE "C" ASC, base_sk_n ASC
+```
+
+**LSI Query:** every row of an LSI partition shares the base partition key. So
+the cursor and the `ORDER BY` use the index sort key and the base sort key:
+`(sk_s COLLATE "C", base_sk_n) > ($lsi_sk, $base_sk)` forward and `<` in
+reverse. The ordering index on the LSI table is `(pk, sk_s, base_pk, base_sk_n)`,
+so after the fixed `pk` it orders by `sk_s` only. The database applies the
+cursor while it reads the index. It then sorts the rows that share an index
+sort key value by the base sort key, and applies the `LIMIT` after that sort.
+PostgreSQL adds an Incremental Sort node with `Presorted Key: sk_s`, and SQLite
+a temporary B-tree for the last `ORDER BY` term. The first page sorts the same
+way. The sort changes neither the result nor the page boundaries.
+
+**Hash-only index:** there is no index sort key, so the cursor is the base
+primary key alone, `(base_pk COLLATE "C", base_sk_n) > ($base_pk, $base_sk)`
+forward and `<` in reverse.
+
+**Index Scan:** a Scan on an index has no fixed partition, so the cursor
+compares the whole index row key, `pk` first. On a GSI or LSI with one sort
+key the cursor is
+`(pk, sk_s COLLATE "C", base_pk COLLATE "C", base_sk_n) > ($last_pk, $last_sk, $base_pk, $base_sk)`,
+with `ORDER BY pk, sk_s COLLATE "C", base_pk COLLATE "C", base_sk_n`. On a
+hash-only index it is `(pk, base_pk COLLATE "C", base_sk_n) > ($last_pk, $base_pk, $base_sk)`,
+with `ORDER BY pk, base_pk COLLATE "C", base_sk_n`. The LSI Scan keeps
+`base_pk`, which the LSI Query drops, so the ordering index serves it with no
+sort step. The primary key serves the hash-only index Scan. A Scan on an index
+with more than one RANGE attribute compares and orders by the first RANGE
+column only (`sk_s`, `sk_n` or `sk_b`), ahead of `base_pk`. That is still a
+total order, because the cursor holds the full base key. The ordering index
+does not serve it without a sort step: PostgreSQL adds an Incremental Sort,
+SQLite a temporary B-tree.
+
+On a base table without a sort key, the Scan cursor is `pk > $last_pk` with
+`ORDER BY pk`. A Query with an `ExclusiveStartKey` on such a table returns no
+items and runs no statement, because the key condition fixes the only key
+column. The `base_sk_*` column drops out of every index cursor, Query and Scan
+alike. A GSI Query cursor is then `(sk_s COLLATE "C", base_pk COLLATE "C")`, a
+hash-only index Query cursor is `base_pk COLLATE "C"` alone, and an LSI cannot
+exist.
 
 For GSI queries, the pagination key includes both the GSI key attributes and the base table primary key (needed to
 uniquely identify the position, since GSI keys are not unique). This is why the GSI PostgreSQL table includes `base_pk`
