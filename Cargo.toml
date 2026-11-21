@@ -51,7 +51,12 @@ extenddb-cache = { path = "crates/cache", version = "=1.0.0" }
 extenddb-backup-store = { path = "crates/backup-store", version = "=1.0.0" }
 # The engine entry turns default features off so that a member can choose
 # them: `server` asks for `default`, the WebAssembly adapter asks for none.
-# A member that depends on `server` as well gets the defaults through it.
+# Cargo unifies features over everything one command builds, so a member
+# that asks for none gets the defaults whenever the build includes a package
+# that asks for them, as `server` does: with `--workspace`, with
+# `-p <member> -p extenddb-server`, or when the member depends on `server`.
+# Built with nothing that asks for them, the engine answers the PartiQL
+# operations with UnknownOperationException.
 extenddb-engine = { path = "crates/engine", version = "=1.0.0", default-features = false }
 extenddb-storage = { path = "crates/storage", version = "=1.0.0" }
 extenddb-config = { path = "crates/config", version = "=1.0.0" }

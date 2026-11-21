@@ -551,6 +551,15 @@ target must be on `PATH`, or the build stops in that crate's build script.
 The emitted module is about 6.6 MiB after `wasm-bindgen`; `wasm-pack --release`
 runs `wasm-opt`, which brings it to about 5.0 MiB.
 
+The `wasm32` build is the adapter's dependency graph, built through
+`extenddb-wasm-adapter` as above. Two crates of that graph do not build for
+`wasm32-unknown-unknown` on their own: `extenddb-engine` with its default
+`partiql` feature, whose PartiQL code (`crates/engine/src/partiql/snapshot.rs`)
+sets the backup runtime field that `OperationContext` has only on other
+targets (the adapter takes the engine without default features), and
+`extenddb-cache`, because the `uuid` crate needs a source of randomness on
+that target and in this workspace only `extenddb-core` selects one.
+
 ## Project Structure
 
 ```
