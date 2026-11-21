@@ -368,13 +368,27 @@ sys.exit(0 if h.get("components", {}).get("backup_store", {}).get("status") == "
 PASS=true
 CLEANUP_TRUSTSTORE=""
 
+# The three WebAssembly suites below need no running server, no target flag
+# and no credentials, so they run before the pre-flight the server-backed
+# suites require. They are placed after PASS=true so a failure is not later
+# reset. When no server-backed suite was requested, the last of them that runs
+# ends the run, failing it if any of them failed.
+only_wasm_suites_left() {
+    ! $RUN_RUST && ! $RUN_RUST_INTEGRATION && ! $RUN_PYTEST \
+        && ! $RUN_EXTERNAL && ! $RUN_COMPREHENSIVE && ! $RUN_TERRAFORM \
+        && ! $RUN_CATALOG_CHECK
+}
+finish_if_only_wasm_suites_left() {
+    if only_wasm_suites_left; then
+        if $PASS; then exit 0; else exit 1; fi
+    fi
+}
+
 # --- WebAssembly adapter build check (standalone) ---------------------------
 # The WebAssembly build compiles the engine + adapter to wasm32. This suite is
 # the build, the wasm32 clippy step with the disallowed-methods list of
-# devtools/wasm-clippy, and that list's self-test. It needs no running server,
-# no target flag and no credentials, so it runs before the pre-flight the
-# server-backed suites require. When it is the only suite requested it exits with its own
-# status. It is placed after PASS=true so a failure here is not later reset.
+# devtools/wasm-clippy, and that list's self-test, as the WebAssembly CI
+# workflow runs them.
 if $RUN_WASM; then
     WASM_PKG="${EXTENDDB_WASM_PKG:-extenddb-wasm-adapter}"
     WASM_OUTFILE="discussions/test-wasm-${HASH}.txt"
@@ -409,15 +423,12 @@ if $RUN_WASM; then
         echo "RESULT: PASS" | tee -a "$WASM_OUTFILE"
     else
         echo "RESULT: FAIL" | tee -a "$WASM_OUTFILE"
+        PASS=false
     fi
     echo "=== wrote ${WASM_OUTFILE} ==="
-    # The only suite requested: its status is the whole run.
-    if ! $RUN_RUST && ! $RUN_RUST_INTEGRATION && ! $RUN_PYTEST \
-        && ! $RUN_EXTERNAL && ! $RUN_COMPREHENSIVE && ! $RUN_TERRAFORM \
-        && ! $RUN_CATALOG_CHECK && ! $RUN_HEADLESS && ! $RUN_WASM_TEST; then
-        exit "$WASM_RC"
+    if ! $RUN_HEADLESS && ! $RUN_WASM_TEST; then
+        finish_if_only_wasm_suites_left
     fi
-    [ "$WASM_RC" -ne 0 ] && PASS=false
 fi
 
 # --- WebAssembly headless parity run (standalone) ---------------------------
@@ -459,15 +470,12 @@ if $RUN_HEADLESS; then
         echo "RESULT: PASS" | tee -a "$HEADLESS_OUTFILE"
     else
         echo "RESULT: FAIL" | tee -a "$HEADLESS_OUTFILE"
+        PASS=false
     fi
     echo "=== wrote ${HEADLESS_OUTFILE} ==="
-    # The only remaining suite requested: its status is the whole run.
-    if ! $RUN_RUST && ! $RUN_RUST_INTEGRATION && ! $RUN_PYTEST \
-        && ! $RUN_EXTERNAL && ! $RUN_COMPREHENSIVE && ! $RUN_TERRAFORM \
-        && ! $RUN_CATALOG_CHECK && ! $RUN_WASM_TEST; then
-        exit "$HEADLESS_RC"
+    if ! $RUN_WASM_TEST; then
+        finish_if_only_wasm_suites_left
     fi
-    [ "$HEADLESS_RC" -ne 0 ] && PASS=false
 fi
 
 # --- On-target wasm-bindgen-test suites (standalone) ------------------------
@@ -514,20 +522,21 @@ if $RUN_WASM_TEST; then
 
     # wasm-bindgen-test-runner is a cargo-installed binary; it is on PATH in CI
     # but cargo's bin directory is not always on an interactive PATH, so fall
-    # back to it. It must match the wasm-bindgen crate in Cargo.lock.
+    # back to it. It must match the wasm-bindgen crate in Cargo.lock. Cargo is
+    # given the runner's full path, so the bin directory is not added to PATH
+    # and the caller's `cargo` stays the one that runs.
     CARGO_BIN_DIR="${CARGO_HOME:-$HOME/.cargo}/bin"
+    WASM_TEST_RUNNER=""
     if command -v wasm-bindgen-test-runner >/dev/null 2>&1; then
-        HAVE_RUNNER=1
+        WASM_TEST_RUNNER=$(command -v wasm-bindgen-test-runner)
     elif [ -x "$CARGO_BIN_DIR/wasm-bindgen-test-runner" ]; then
-        HAVE_RUNNER=1
-    else
-        HAVE_RUNNER=0
+        WASM_TEST_RUNNER="$CARGO_BIN_DIR/wasm-bindgen-test-runner"
     fi
 
     if [ -z "$WASM_TEST_NODE" ]; then
         echo "error: no Node >= 20 found (node, node-22, node-21, node-20); the wasm-bindgen-test harness needs a V8 newer than Node 18's" | tee -a "$WASM_TEST_OUTFILE"
         WASM_TEST_RC=1
-    elif [ "$HAVE_RUNNER" -ne 1 ]; then
+    elif [ -z "$WASM_TEST_RUNNER" ]; then
         echo "error: wasm-bindgen-test-runner not found on PATH or in $CARGO_BIN_DIR — install it with the Cargo.lock wasm-bindgen version, e.g. 'cargo install --locked --version 0.2.130 wasm-bindgen-cli'" | tee -a "$WASM_TEST_OUTFILE"
         WASM_TEST_RC=1
     else
@@ -541,8 +550,8 @@ if $RUN_WASM_TEST; then
             suite_args="${suite#*|}"
             echo "--- ${suite_name} (cargo test ${suite_args} --target wasm32-unknown-unknown) ---" | tee -a "$WASM_TEST_OUTFILE"
             # shellcheck disable=SC2086
-            if ! PATH="$NODE_SHIM_DIR:$CARGO_BIN_DIR:$PATH" \
-                CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+            if ! PATH="$NODE_SHIM_DIR:$PATH" \
+                CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="$WASM_TEST_RUNNER" \
                 WASM_BINDGEN_TEST_ONLY_NODE=1 \
                 cargo test --locked $suite_args --target wasm32-unknown-unknown \
                 2>&1 | tee -a "$WASM_TEST_OUTFILE"; then
@@ -556,15 +565,10 @@ if $RUN_WASM_TEST; then
         echo "RESULT: PASS" | tee -a "$WASM_TEST_OUTFILE"
     else
         echo "RESULT: FAIL" | tee -a "$WASM_TEST_OUTFILE"
+        PASS=false
     fi
     echo "=== wrote ${WASM_TEST_OUTFILE} ==="
-    # The only remaining suite requested: its status is the whole run.
-    if ! $RUN_RUST && ! $RUN_RUST_INTEGRATION && ! $RUN_PYTEST \
-        && ! $RUN_EXTERNAL && ! $RUN_COMPREHENSIVE && ! $RUN_TERRAFORM \
-        && ! $RUN_CATALOG_CHECK; then
-        exit "$WASM_TEST_RC"
-    fi
-    [ "$WASM_TEST_RC" -ne 0 ] && PASS=false
+    finish_if_only_wasm_suites_left
 fi
 
 # --- Pre-flight for integration suites (local targets) ---
