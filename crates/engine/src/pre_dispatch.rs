@@ -1,20 +1,29 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! The request checks every entry point applies, in one order, before it
-//! dispatches a request into the engine.
+//! The request checks the engine owns, which every entry point calls in one
+//! order before it dispatches a request into the engine: the operation name,
+//! the body parse, and the refusal of point-in-time recovery.
 //!
 //! An entry point (the HTTP server, the WebAssembly adapter) calls
 //! [`parse_request`] with the operation name and the raw request body, then
 //! calls [`ParsedRequest::admit`] on the result to get the body it passes to
-//! [`crate::dispatch`]. Between the two calls it does its own transport work:
-//! the server authenticates the request there, and authorizes it after
-//! `admit`. Keeping the checks here, not in each entry point, means a check
-//! added to either step reaches every entry point.
+//! [`crate::dispatch`]. A check added to either step reaches both entry
+//! points.
 //!
-//! The order is fixed by the types: `admit` exists only on the value
-//! `parse_request` returns, so no entry point can apply the second step's
-//! refusals to a request whose name or body failed the first.
+//! They are not every check a request meets. Around the engine, the server
+//! also caps the request body at 16 MiB and authenticates the request between
+//! the two steps. After `admit`, in authorization and in developer mode too,
+//! it refuses the table names and ARNs the service refuses, refuses a request
+//! for a resource in another account, and decodes the `GetRecords` shard
+//! iterator. It then throttles reads and writes against the table's
+//! throughput. The WebAssembly adapter applies none of these.
+//!
+//! The types fix the order of the two steps: `admit` is a method of
+//! [`ParsedRequest`], which only `parse_request` constructs, so `admit` runs
+//! only on a request whose operation is known and whose body parsed. The
+//! refusal `admit` applies, [`crate::refuse_point_in_time_recovery`], is also
+//! public on its own and checks whatever body it is given.
 
 use extenddb_core::error::{DynamoDbError, malformed_body_error};
 use serde_json::Value;
