@@ -16,7 +16,8 @@
 //! rejection, and `ClientRequestToken` idempotency). It translates each
 //! PartiQL statement into the corresponding transact member, cancels the write
 //! form with positional reasons when a member cannot be translated against its
-//! table, and remaps two error strings the PartiQL surface words differently.
+//! table, and remaps the cancellation reason of a duplicate-key `INSERT`, which
+//! the PartiQL surface words differently.
 //!
 //! The members are authorized after the checks of their form (see
 //! `authorize_members`). In an all-read transaction, a member on a table
@@ -497,13 +498,14 @@ fn reshape_write(result: DispatchResult) -> DispatchResult {
     }
 }
 
-/// Remap the two write errors the PartiQL surface words differently from the
+/// Remap the write error the PartiQL surface words differently from the
 /// classic `TransactWriteItems` handler.
 ///
 /// A duplicate-key `INSERT` fails the underlying `Put`'s `attribute_not_exists`
 /// condition, which the handler reports as `ConditionalCheckFailed`; the PartiQL
 /// surface reports `DuplicateItem` for that position. A reused idempotency token
-/// with a different body uses the PartiQL message.
+/// with a different body passes through: both surfaces answer it with
+/// `transact_write_helpers::IDEMPOTENT_MISMATCH_MESSAGE`.
 fn remap_write_error(err: DynamoDbError, is_insert: &[bool]) -> DynamoDbError {
     match err {
         DynamoDbError::TransactionCanceledException {
@@ -517,12 +519,6 @@ fn remap_write_error(err: DynamoDbError, is_insert: &[bool]) -> DynamoDbError {
                 }
             }
             cancellation(reasons)
-        }
-        DynamoDbError::IdempotentParameterMismatchException(_) => {
-            DynamoDbError::IdempotentParameterMismatchException(
-                "Specified idempotent token was used with different request parameters within the idempotency window"
-                    .to_owned(),
-            )
         }
         other => other,
     }
