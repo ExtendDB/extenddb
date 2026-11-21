@@ -83,8 +83,20 @@ impl Target {
 
 /// Run the health check. Returns `Ok(())` when healthy, `Err` otherwise.
 pub fn run(args: &HealthcheckArgs) -> anyhow::Result<()> {
-    let target = resolve_target(args)?;
-    let status = probe(&target)?;
+    check(&resolve_target(args)?)
+}
+
+/// The health check of the server `serve` started on `bind_addr` and `port`.
+pub(crate) fn check_started(bind_addr: &str, port: u16) -> anyhow::Result<()> {
+    check(&Target {
+        host: probe_host(bind_addr),
+        port,
+    })
+}
+
+/// `Ok(())` when `target` answers `GET /health` with a 2xx status.
+fn check(target: &Target) -> anyhow::Result<()> {
+    let status = probe(target)?;
     if (200..300).contains(&status) {
         Ok(())
     } else {

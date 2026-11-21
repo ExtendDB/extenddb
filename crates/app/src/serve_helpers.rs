@@ -18,11 +18,20 @@ fn syslog_hint() -> &'static str {
 }
 
 /// P57 Bug 7: After daemonizing, the parent waits for the PID file to appear
-/// and then verifies the daemon process is still alive. This catches early
-/// startup failures (bad config, missing catalog tables, TLS cert errors)
-/// that would otherwise be invisible because stderr is /dev/null after fork.
+/// and then for the daemon to answer `GET /health`, which the server serves
+/// only after its storage backend has connected. A daemon that exits first
+/// (bad config, missing catalog tables, TLS cert errors, a backend it cannot
+/// reach) is reported failed: its stderr is /dev/null after the fork.
 #[cfg(unix)]
-pub fn verify_daemon_started(pid_file: &PathBuf, bind_addr: &str) -> anyhow::Result<()> {
+pub fn verify_daemon_started(
+    pid_file: &PathBuf,
+    bound: std::net::SocketAddr,
+) -> anyhow::Result<()> {
+    // Longer than the waits after which a backend's startup gives up (10 s
+    // for the catalog registration, 30 s for the SQLite and PostgreSQL
+    // pools), and shorter than the 90 s that systemd gives a `Type=forking`
+    // unit's `serve` by default.
+    const READY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
     let hint = syslog_hint();
 
     // Wait up to 5 seconds for the PID file to be written with a valid PID.
@@ -43,26 +52,31 @@ pub fn verify_daemon_started(pid_file: &PathBuf, bind_addr: &str) -> anyhow::Res
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
 
-    // Give the daemon a moment to initialize (connect to Postgres, load TLS
-    // certs, etc.). Check every 200ms for up to 3 seconds.
-    let check_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let ready_deadline = std::time::Instant::now() + READY_WAIT;
     loop {
-        // kill(pid, 0) checks if the process exists without sending a signal.
-        // SAFETY: Standard POSIX signal check. pid is from our own PID file.
-        let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
-        if !alive {
+        if !crate::util::is_process_alive(pid as i32) {
             eprintln!(
                 "Server failed to start: daemon process {pid} exited during startup.\n{hint}"
             );
             std::process::exit(1);
         }
-        if std::time::Instant::now() >= check_deadline {
+        if crate::cmd_healthcheck::check_started(&bound.ip().to_string(), bound.port()).is_ok() {
+            break;
+        }
+        if std::time::Instant::now() >= ready_deadline {
+            // A longer start, such as an index rebuild after a crash, goes on
+            // and is reported started.
+            eprintln!(
+                "warning: daemon process {pid} has not answered /health within {} seconds; \
+                 it is still starting, and `extenddb healthcheck` reports when it answers.\n{hint}",
+                READY_WAIT.as_secs()
+            );
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
-    println!("extenddb server started (pid {pid}, {bind_addr})");
+    println!("extenddb server started (pid {pid}, {bound})");
     Ok(())
 }
 

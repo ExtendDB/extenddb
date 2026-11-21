@@ -238,6 +238,7 @@ class TestCliLifecycle:
         # Serve (daemonizes)
         result = _run_extenddb("serve", config=cli_env["config_path"])
         assert result.returncode == 0
+        assert "has not answered /health" not in result.stderr, result.stderr
 
         # Wait for server to be healthy
         assert _wait_for_server(cli_env["port"]), "Server did not become healthy"
@@ -283,6 +284,80 @@ class TestCliLifecycle:
         """extenddb serve without init should fail."""
         result = _run_extenddb("serve", config=cli_env["config_path"], check=False)
         assert result.returncode != 0
+
+    def test_serve_fails_when_the_daemon_cannot_reach_its_catalog(self, cli_env):
+        """serve exits 1 when the daemon exits before it answers /health: here its
+        catalog connection gets no answer, later than the 3 s serve used to watch."""
+        import socket
+
+        _run_extenddb(
+            "init", *_init_args(cli_env),
+            config=cli_env["config_path"],
+            env_override={"EXTENDDB_ADMIN_PASSWORD": "TestPass1!"},
+        )
+        _patch_config_port(cli_env["config_path"], cli_env["port"])
+        # A listener that never accepts: connections wait in its backlog.
+        with socket.create_server(("127.0.0.1", 0)) as silent:
+            catalog = f"postgresql://u:p@127.0.0.1:{silent.getsockname()[1]}/{cli_env['db_name']}"
+            started = time.monotonic()
+            result = _run_extenddb(
+                "serve", config=cli_env["config_path"], check=False, timeout=180,
+                env_override={"EXTENDDB__STORAGE__POSTGRES__CONNECTION_STRING": catalog},
+            )
+            took = time.monotonic() - started
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert "exited during startup" in result.stderr, result.stderr
+        assert 3 < took < 60, f"the daemon failed after {took:.1f} s"
+
+    def test_serve_reports_a_daemon_still_starting_after_its_wait(self, cli_env):
+        """A daemon that has not answered /health 60 s after the fork is reported
+        started with a warning, and goes on: here its startup waits on a lock
+        that the test holds in its catalog."""
+        import psycopg2
+
+        _run_extenddb(
+            "init", *_init_args(cli_env),
+            config=cli_env["config_path"],
+            env_override={"EXTENDDB_ADMIN_PASSWORD": "TestPass1!"},
+        )
+        _patch_config_port(cli_env["config_path"], cli_env["port"])
+        holder = psycopg2.connect(PG_ADMIN_CONN + "/" + cli_env["db_name"])
+        try:
+            holder.cursor().execute("LOCK TABLE vector_indexes IN ACCESS EXCLUSIVE MODE")
+            started = time.monotonic()
+            result = _run_extenddb("serve", config=cli_env["config_path"], check=False, timeout=180)
+            took = time.monotonic() - started
+        finally:
+            holder.close()
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "has not answered /health within 60 seconds; it is still starting" in result.stderr, (
+            result.stderr
+        )
+        assert 60 <= took < 90, f"serve returned after {took:.1f} s"
+        assert _wait_for_server(cli_env["port"]), "the daemon did not finish starting"
+
+    def test_serve_checks_the_port_a_daemon_bound_with_port_0(self, cli_env):
+        """With --port 0 the system picks the daemon's port, and serve checks that
+        port: it reports the daemon started at once and names the port."""
+        import re
+
+        _run_extenddb(
+            "init", *_init_args(cli_env),
+            config=cli_env["config_path"],
+            env_override={"EXTENDDB_ADMIN_PASSWORD": "TestPass1!"},
+        )
+        try:
+            result = _run_extenddb(
+                "serve", "--port", "0", config=cli_env["config_path"], check=False
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert "has not answered /health" not in result.stderr, result.stderr
+            started = re.search(r"server started \(pid \d+, 127\.0\.0\.1:(\d+)\)", result.stdout)
+            assert started and int(started.group(1)) != 0, result.stdout
+        finally:
+            _run_extenddb(
+                "stop", "--port", "0", config=cli_env["config_path"], check=False, timeout=10
+            )
 
     def test_destroy_without_yes_fails(self, cli_env):
         """extenddb destroy without --yes should fail."""

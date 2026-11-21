@@ -388,6 +388,12 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
+### v1.1.0: `serve` waits for the daemon to answer `/health`
+
+**What changed.** `extenddb serve` without `--foreground` reports `extenddb server started` once the daemon answers `GET /health`, which the server serves after its storage backend has connected. It exits 1 when the daemon exits first. 1.0.0 watched the daemon for 3 seconds and reported it started if it was still running then. A daemon that failed later was reported started (#736). A daemon that has not answered within 60 seconds is reported started, as before, with a warning on stderr, and it goes on starting.
+
+**Who is affected.** A script or service manager that runs `serve` and reads its exit status. `serve` now returns when the daemon answers or exits, or 60 seconds after the daemon's PID file appears. A last probe can add up to 3 seconds. That is less than the 90 seconds that systemd gives a `Type=forking` unit to start by default. A daemon that cannot reach its backend makes `serve` exit 1 once the backend's startup gives up. In one run on PostgreSQL, with a catalog address that accepts connections and never answers, 1.0.0's check reported the daemon started after 3.6 seconds. This release exited 1 after 13.3 seconds. No catalog migration is required.
+
 ### v1.0.0: Cassandra reads and writes at `LOCAL_QUORUM`
 
 **What changed.** The Cassandra backend runs its reads and writes at `LOCAL_QUORUM`. 0.1.15 ran many of them at `ONE`, the driver's default, in each area: items (the reads of GetItem, Query and Scan among them), transactions, TTL, streams, the catalog, IAM and `init`. A read with `ConsistentRead` `false` also runs at `LOCAL_QUORUM`. A lightweight transaction runs Paxos at `LOCAL_SERIAL` and commits at `LOCAL_QUORUM`. 0.1.15 ran many of its lightweight transactions at those levels already, and others, among them the admin user creation and most IAM writes, at the driver's defaults, `SERIAL` and `ONE`. Batches ran at `LOCAL_QUORUM` before and still do. No setting changes these levels (#945).

@@ -147,6 +147,9 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     std_listener
         .set_nonblocking(true)
         .map_err(|e| anyhow::anyhow!("Failed to set listener non-blocking: {e}"))?;
+    // With port 0 the system picks the port: the banner and the start check
+    // name the bound one.
+    let bound = std_listener.local_addr()?;
 
     // D-2: Print startup banner before daemonizing so the user gets
     // confirmation the server is starting. P57 Bug 4 fix: say "starting" not
@@ -167,7 +170,7 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     let wordmark = render_wordmark(banner_colors_enabled(args.foreground));
     let banner_line1 = format!(
         "extenddb {} (catalog {}) starting on {}",
-        build.version, catalog_version, bind_addr,
+        build.version, catalog_version, bound,
     );
     let banner_line2 = format!(
         "  storage: {} ({})",
@@ -247,10 +250,10 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
             match daemon.execute() {
                 daemonize::Outcome::Parent(Ok(_)) => {
                     // Parent process: wait for the PID file to appear (written by
-                    // the grandchild after the double-fork), then verify the daemon
-                    // is still alive. This catches crashes during early startup
-                    // (bad config, missing tables, TLS cert errors).
-                    return verify_daemon_started(pid_file, &bind_addr);
+                    // the grandchild after the double-fork), then for the daemon
+                    // to answer /health. This catches a daemon that exits during
+                    // startup (bad config, missing tables, TLS cert errors).
+                    return verify_daemon_started(pid_file, bound);
                 }
                 daemonize::Outcome::Parent(Err(e)) => {
                     return Err(anyhow::anyhow!("Failed to daemonize: {e}"));
