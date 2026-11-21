@@ -15,9 +15,10 @@
 //! also caps the request body at 16 MiB and authenticates the request between
 //! the two steps. After `admit`, in authorization and in developer mode too,
 //! it refuses the table names and ARNs the service refuses, refuses a request
-//! for a resource in another account, and decodes the `GetRecords` shard
-//! iterator. It then throttles reads and writes against the table's
-//! throughput. The WebAssembly adapter applies none of these.
+//! for a resource in another account, and refuses a `GetRecords` shard
+//! iterator it cannot decode. When throttling is on, it then throttles reads
+//! and writes against the table's throughput. The WebAssembly adapter applies
+//! none of these.
 //!
 //! The types fix the order of the two steps: `admit` is a method of
 //! [`ParsedRequest`], which only `parse_request` constructs, so `admit` runs

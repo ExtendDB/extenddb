@@ -92,7 +92,7 @@ pub(crate) async fn handle_request(
     // them too. The server's own request checks, which the adapter does not
     // apply, include the body cap above, authentication below, the table
     // name, ARN, cross-account and GetRecords iterator checks in
-    // `authorize_request`, and throttling.
+    // `authorize_request`, and throttling when it is on.
     let request = match extenddb_engine::parse_request(&operation, &body) {
         Ok(request) => request,
         Err(e) => return error_response(&e, &request_id),
