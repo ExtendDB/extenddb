@@ -158,7 +158,21 @@ jobs:
       # (crates/wasm-adapter/tests/parity.rs, against sqlx and the C SQLite),
       # with its assertions except where a case carries an `onWasm`
       # expectation.
+      #
+      # wasm-pack downloads nothing here. Unless --no-opt is given, it runs
+      # wasm-opt over the module, and with no wasm-opt on PATH it first
+      # downloads binaryen (version_130) from GitHub releases without checking
+      # a checksum; the tool cache above does not keep that download, so it
+      # would come again on every run. The step skips wasm-opt rather than
+      # pin a checksum for it: wasm-opt is an optimizer (here it makes the
+      # module about a quarter smaller) and is not meant to change the answers
+      # the corpus checks. No step runs the corpus over wasm-opt's output,
+      # which is the module the README's build command produces.
+      # --mode no-install forbids wasm-pack to download or install
+      # wasm-bindgen: it uses the one installed above when that is the version
+      # in Cargo.lock, and otherwise stops, as its download cache is empty on
+      # a fresh runner.
       - name: Headless parity corpus under Node
         run: |
-          wasm-pack build --target web --release crates/wasm-adapter --out-dir parity/pkg
+          wasm-pack build --target web --release --no-opt --mode no-install crates/wasm-adapter --out-dir parity/pkg
           node crates/wasm-adapter/parity/run.mjs

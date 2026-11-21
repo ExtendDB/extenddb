@@ -126,7 +126,11 @@ Suites (at least one required):
                     (default: extenddb-wasm-adapter)
   --headless        build the wasm-pack --target web module and run the shared
                     parity corpus through it under Node. Standalone like --wasm;
-                    needs wasm-pack and Node but no server/creds. Writes
+                    needs wasm-pack, Node and the wasm-bindgen CLI of the
+                    version of the wasm-bindgen crate in Cargo.lock, on PATH
+                    or in wasm-pack's download cache (wasm-pack runs as the
+                    workflow runs it: it skips wasm-opt and downloads
+                    nothing), but no server/creds. Writes
                     discussions/test-headless-<hash>.txt
   --wasm-test       run the on-target wasm-bindgen-test suites (core's crypto
                     backend and the SQLite shim) on wasm32 under Node. Standalone
@@ -576,8 +580,12 @@ fi
 # --- WebAssembly headless parity run (standalone) ---------------------------
 # Builds the wasm-pack --target web module and runs the shared parity corpus
 # through it under Node, the same cases the native oracle test (the adapter's
-# tests/parity.rs) runs. Standalone like --wasm: no server, target flag or
-# credentials. Placed after PASS=true for the same reason.
+# tests/parity.rs) runs. wasm-pack runs with the workflow's flags: --no-opt
+# skips wasm-opt, which wasm-pack downloads when it has none, and --mode
+# no-install makes it take the wasm-bindgen of Cargo.lock's version from PATH
+# or from its download cache and download none. Standalone like --wasm: no
+# server, target flag or credentials. Placed after PASS=true for the same
+# reason.
 if $RUN_HEADLESS; then
     HEADLESS_OUTFILE="discussions/test-headless-${HASH}.txt"
     echo "=== wasm headless parity run → ${HEADLESS_OUTFILE} ==="
@@ -606,15 +614,15 @@ if $RUN_HEADLESS; then
         HEADLESS_RC=1
     else
         echo "wasm-pack: $(command -v wasm-pack) ($(wasm-pack --version 2>&1))" | tee -a "$HEADLESS_OUTFILE"
-        echo "--- wasm-pack build --target web --release ---" | tee -a "$HEADLESS_OUTFILE"
-        if wasm-pack build --target web --release crates/wasm-adapter \
+        echo "--- wasm-pack build --target web --release --no-opt --mode no-install ---" | tee -a "$HEADLESS_OUTFILE"
+        if wasm-pack build --target web --release --no-opt --mode no-install crates/wasm-adapter \
             --out-dir parity/pkg 2>&1 | tee -a "$HEADLESS_OUTFILE"; then
             echo "--- node parity runner ---" | tee -a "$HEADLESS_OUTFILE"
             if ! node crates/wasm-adapter/parity/run.mjs 2>&1 | tee -a "$HEADLESS_OUTFILE"; then
                 HEADLESS_RC=1
             fi
         else
-            echo "wasm-pack build failed" | tee -a "$HEADLESS_OUTFILE"
+            echo "wasm-pack build failed (if it found no wasm-bindgen: with --mode no-install it downloads none, so install the version of the wasm-bindgen crate in Cargo.lock with 'cargo install --locked --version <that version> wasm-bindgen-cli', as .github/workflows/wasm.yml does)" | tee -a "$HEADLESS_OUTFILE"
             HEADLESS_RC=1
         fi
     fi
