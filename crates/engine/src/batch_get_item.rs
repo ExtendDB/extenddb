@@ -38,13 +38,9 @@ pub async fn handle_batch_get_item(
 
     // Validate the table and key counts: RequestItems not empty, at most 100
     // tables, at most 100 keys per table and in total, at least one key per
-    // table. The server runs the same checks before authorization.
-    let counts: Vec<(&str, Option<usize>)> = input
-        .request_items
-        .iter()
-        .map(|(table_name, ka)| (table_name.as_str(), Some(ka.keys.len())))
-        .collect();
-    request_limits::check_batch_counts("BatchGetItem", &counts)?;
+    // table. The server runs the same checks before authorization. Then
+    // refuse a table value with no Keys list, so every table below has one.
+    request_limits::check_batch_get(&input)?;
 
     // Reject mixing expression and non-expression parameters anywhere in the
     // request. The check is request-wide: ProjectionExpression on one table and
@@ -138,8 +134,9 @@ pub async fn handle_batch_get_item(
         }
 
         // Reject duplicate keys (pre-existence on Amazon DynamoDB).
-        let mut seen_keys: HashSet<Vec<u8>> = HashSet::with_capacity(ka.keys.len());
-        for key in &ka.keys {
+        let keys = ka.keys.as_deref().unwrap_or_default();
+        let mut seen_keys: HashSet<Vec<u8>> = HashSet::with_capacity(keys.len());
+        for key in keys {
             if !seen_keys.insert(serialize_key_for_dedup(key)) {
                 return Err(DynamoDbError::ValidationException(
                     "Provided list of item keys contains duplicates".to_owned(),
@@ -161,7 +158,10 @@ pub async fn handle_batch_get_item(
     let mut table_names: Vec<&String> = input.request_items.keys().collect();
     table_names.sort();
     for table_name in table_names {
-        let keys = &input.request_items[table_name].keys;
+        let keys = input.request_items[table_name]
+            .keys
+            .as_deref()
+            .unwrap_or_default();
         extenddb_core::validation::number::operations::batch_get_keys(keys)?;
     }
 
@@ -180,7 +180,7 @@ pub async fn handle_batch_get_item(
         let projection = table_projections.get(table_name).and_then(Option::as_ref);
 
         let mut table_items: Vec<Item> = Vec::new();
-        for key in &ka.keys {
+        for key in ka.keys.iter().flatten() {
             validate_batch_key_only(key, &key_info.key_schema, &key_info.attribute_definitions)?;
             validate_key_sizes(key, &key_info.key_schema, &ctx.limits)?;
 

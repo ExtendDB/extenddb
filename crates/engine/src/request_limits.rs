@@ -65,11 +65,11 @@ pub(crate) fn check_transact_count(count: usize, member: &str) -> Result<(), Dyn
 ///
 /// `tables` lists each entry of `RequestItems` with its key count
 /// (`BatchGetItem`) or write-request count (`BatchWriteItem`), or `None` when
-/// the entry is not the expected shape; the handler's deserialization rejects
-/// such an entry, so it counts towards the number of tables only. The checks
-/// run in this order: an empty `RequestItems`, then too many tables and the
-/// tables with too many items or none, in one refusal, then too many items in
-/// total.
+/// the entry is not the expected shape or has no `Keys` list; the handler
+/// rejects such an entry, so it counts towards the number of tables only.
+/// The checks run in this order: an empty `RequestItems`, then too many
+/// tables and the tables with too many items or none, in one refusal, then
+/// too many items in total.
 ///
 /// # Errors
 ///
@@ -121,11 +121,46 @@ pub(crate) fn check_batch_counts(
     Ok(())
 }
 
+/// Check a parsed `BatchGetItem`: [`check_batch_counts`], then each table
+/// value with no `Keys` or a null one. The service names each such table in
+/// one refusal, in table name order, not the order of the request (measured
+/// 2026-11-20 and 2026-11-21).
+///
+/// # Errors
+///
+/// `ValidationException` for the first check that fails.
+pub(crate) fn check_batch_get(input: &BatchGetItemInput) -> Result<(), DynamoDbError> {
+    let tables: Vec<(&str, Option<usize>)> = input
+        .request_items
+        .iter()
+        .map(|(table, ka)| (table.as_str(), ka.keys.as_ref().map(Vec::len)))
+        .collect();
+    check_batch_counts("BatchGetItem", &tables)?;
+    let mut missing: Vec<&str> = tables
+        .iter()
+        .filter_map(|&(table, keys)| keys.is_none().then_some(table))
+        .collect();
+    missing.sort_unstable();
+    let clauses: Vec<String> = missing
+        .iter()
+        .take(MAX_PARTS)
+        .map(|t| {
+            format!(
+                "Value null at 'requestItems.{t}.member.keys' failed to satisfy constraint: Member must not be null"
+            )
+        })
+        .collect();
+    if clauses.is_empty() {
+        Ok(())
+    } else {
+        Err(refusal(&clauses))
+    }
+}
+
 /// The refusal naming each path of `failed`, `RequestItems` or a table's
 /// member path, whose count is 0 or over `limit` (measured 2026-11-20).
 fn count_error(limit: usize, failed: &[(String, usize)]) -> DynamoDbError {
-    let n = failed.len();
-    let errors = failed
+    let clauses: Vec<String> = failed
         .iter()
         .map(|(path, count)| {
             let bound = if *count == 0 {
@@ -137,11 +172,17 @@ fn count_error(limit: usize, failed: &[(String, usize)]) -> DynamoDbError {
                 "Value at '{path}' failed to satisfy constraint: Member must have length {bound}"
             )
         })
-        .collect::<Vec<_>>()
-        .join("; ");
+        .collect();
+    refusal(&clauses)
+}
+
+/// One refusal listing `clauses`, each a failed constraint.
+fn refusal(clauses: &[String]) -> DynamoDbError {
+    let n = clauses.len();
     DynamoDbError::ValidationException(format!(
-        "{n} validation error{} detected: {errors}",
-        if n == 1 { "" } else { "s" }
+        "{n} validation error{} detected: {}",
+        if n == 1 { "" } else { "s" },
+        clauses.join("; ")
     ))
 }
 
@@ -522,5 +563,75 @@ mod tests {
         assert!(failed.is_empty(), "{}", failed.join("\n"));
         assert!(check_request_item_counts("TransactWriteItems", &json!({})).is_ok());
         assert!(check_request_item_counts("Query", &transact("TransactGetItems", 101)).is_ok());
+    }
+
+    #[test]
+    fn batch_get_tables_without_keys() {
+        // The service's answers, measured 2026-11-20 for rows 0 to 2 and
+        // 2026-11-21 for the rest. Rows 6 and 7 compare the type only.
+        let null = |t: &str| {
+            format!(
+                "Value null at 'requestItems.{t}.member.keys' failed to satisfy constraint: Member must not be null"
+            )
+        };
+        let one = |c: String| format!("1 validation error detected: {c}");
+        let two =
+            |a: &str, b: &str| format!("2 validation errors detected: {}; {}", null(a), null(b));
+        let get = |items: Value| json!({ "RequestItems": items });
+        let keys = || json!({"Keys": [{"pk": {"S": "a"}}]});
+        let ser = || "SerializationException".to_owned();
+        let cases = [
+            (get(json!({"t000": keys(), "t001": {}})), one(null("t001"))),
+            (
+                get(json!({"t000": keys(), "t001": {"Keys": null}})),
+                one(null("t001")),
+            ),
+            (get(json!({"t000": {}})), one(null("t000"))),
+            (get(json!({"t000": {}, "t001": {}})), two("t000", "t001")),
+            (
+                get(json!({"t000": {}, "t001": keys(), "t002": {"Keys": null}})),
+                two("t000", "t002"),
+            ),
+            (
+                get(json!({"zz": {}, "a": {}, "mmm": {}})),
+                format!(
+                    "3 validation errors detected: {}; {}; {}",
+                    null("a"),
+                    null("mmm"),
+                    null("zz")
+                ),
+            ),
+            (
+                get(json!({"t000": {"Keys": null, "ConsistentRead": "x"}})),
+                ser(),
+            ),
+            (
+                get(json!({"t000": {"Keys": null, "ProjectionExpression": 5}})),
+                ser(),
+            ),
+            (
+                get(json!({"t000": {"Keys": []}})),
+                one(
+                    "Value at 'RequestItems.t000.member.Keys' failed to satisfy constraint: Member must have length greater than or equal to 1".to_owned(),
+                ),
+            ),
+        ];
+        let failed: Vec<String> = cases
+            .into_iter()
+            .enumerate()
+            .filter_map(|(row, (body, expected))| {
+                let checked = serde_json::from_value::<BatchGetItemInput>(body)
+                    .map_err(crate::deserialize_error)
+                    .and_then(|input| check_batch_get(&input));
+                let got = match checked {
+                    Ok(()) => "Ok".to_owned(),
+                    Err(DynamoDbError::SerializationException(_)) => ser(),
+                    Err(DynamoDbError::ValidationException(m)) => m,
+                    Err(other) => format!("{other:?}"),
+                };
+                (got != expected).then(|| format!("row {row}: {got}"))
+            })
+            .collect();
+        assert!(failed.is_empty(), "{}", failed.join("\n"));
     }
 }
