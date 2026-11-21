@@ -170,7 +170,11 @@ def test_the_recovery_specification_is_required_before_the_table_is_looked_up(
 def test_a_missing_table_name_member_is_the_required_parameter_text(
     dynamodb_client_no_validation, create_and_cleanup_table, unique_table_name
 ):
-    """No TableName on a describe or a disable: the service's text."""
+    """No TableName on a describe or a disable: the service's text. A null
+    TableName is missing too, and another JSON type is a SerializationException
+    (type only, #1012), sent by hand since botocore refuses it."""
+    from test_vector_index_query_scan import _error_message, _signed_post
+
     create_and_cleanup_table()
     client = dynamodb_client_no_validation
     _assert_error(
@@ -182,6 +186,17 @@ def test_a_missing_table_name_member_is_the_required_parameter_text(
         TABLE_NAME_REQUIRED,
         PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": False},
     )
+    describe, ser = "DescribeContinuousBackups", "SerializationException"
+    disable = {"PointInTimeRecoverySpecification": {"PointInTimeRecoveryEnabled": False}}
+    rows = [(describe, {"TableName": name}, ser, None) for name in (5, True, {}, [], 5.5)]
+    rows += [(describe, {"TableName": None}, "ValidationException", TABLE_NAME_REQUIRED),
+             ("UpdateContinuousBackups", {"TableName": 5, **disable}, ser, None)]
+    for operation, body, code, message in rows:
+        resp = _signed_post(operation, body)
+        assert resp.status_code == 400, (operation, body, resp.text)
+        assert resp.json()["__type"].endswith("#" + code), (operation, body, resp.text)
+        if message is not None:
+            assert _error_message(resp) == message, (operation, body, resp.text)
 
 
 def test_an_empty_table_name_is_refused_before_the_table_is_looked_up(
