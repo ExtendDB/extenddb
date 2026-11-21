@@ -11,10 +11,9 @@
 // actually run.
 //
 // It runs the SAME cases with the SAME expectations as the native oracle test
-// (`../tests/parity.rs`), which drives them through real sqlx + C SQLite. Both
-// agreeing is what makes the port's fidelity checkable: the in-scope data-plane
-// operations answer identically, and the operations the browser build cannot
-// serve answer the same refusal or no-store answer on both.
+// (`../tests/parity.rs`), which drives them through real sqlx + C SQLite. When
+// both pass, each build gave every case the answer the corpus asserts, for the
+// data-plane operations and for the operations the browser build refuses.
 //
 // The module is loaded from `./pkg`, the `wasm-bindgen --target web` output
 // (built by the test harness before this runner is invoked).

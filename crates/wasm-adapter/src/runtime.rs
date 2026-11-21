@@ -14,29 +14,34 @@
 //! # Operations the browser build cannot serve
 //!
 //! Some operations need a facility the in-memory browser build does not have —
-//! a backup store, a filesystem, or the `PartiQL` surface (left out of this
-//! build). The policy that answers them lives here, in [`Engine::dispatch`],
-//! and is applied the same way on both targets, so the native build (the
-//! fidelity oracle) and the wasm build return the same thing for the same
-//! request. There are three classes:
+//! a backup store, or the `PartiQL` surface (left out of this build). The
+//! policy that answers them lives here, in [`Engine::dispatch`], and is applied
+//! the same way on both targets, so the native build (the fidelity oracle) and
+//! the wasm build return the same thing for the same request:
 //!
 //! - **Refused on both targets** with a `ValidationException` that names the
-//!   build: the store-backed backup, restore and point-in-time operations
-//!   (`CreateBackup`, `DescribeBackup`, `DeleteBackup`,
-//!   `RestoreTableFromBackup`, `RestoreTableToPointInTime`); the three `PartiQL`
-//!   operations; and an `UpdateTable` that creates a vector index (refused
-//!   before any catalog write, as the build cannot run the index backfill —
-//!   create the table with its vector indexes instead).
-//! - **Answered with the no-store answer**: the backup and import/export
-//!   operations that a server with no backup store and no import/export paths
-//!   also answers without a store — `ListBackups` (empty), continuous-backups
-//!   describe/update (point-in-time recovery reported and refused as disabled),
-//!   and `ImportTable` / `ExportTableToPointInTime` (disabled). Natively the
-//!   engine computes these; the wasm build, which does not compile those
-//!   handlers, returns the identical answer from [`no_store_answer`].
-//! - **Passed through**: everything else, including the data-plane operations,
-//!   `DescribeTable` / `ListTables`, streams, time-to-live, tagging, and an
-//!   `UpdateTable` that does not create a vector index.
+//!   build: the store-backed backup operations (`CreateBackup`,
+//!   `DescribeBackup`, `DeleteBackup`, `RestoreTableFromBackup`); the three
+//!   `PartiQL` operations; and an `UpdateTable` that creates a vector index
+//!   (refused before any catalog write, as the build cannot run the index
+//!   backfill — create the table with its vector indexes instead).
+//! - **Refused as the server refuses them**: every
+//!   `RestoreTableToPointInTime`, and an `UpdateContinuousBackups` that enables
+//!   point-in-time recovery, through
+//!   [`extenddb_engine::refuse_point_in_time_recovery`], called where the
+//!   server calls it: after the body is parsed (the server also authenticates
+//!   first; this build authenticates no request) and before any table is read.
+//! - **Passed through** to the engine's handlers: everything else, including
+//!   the data-plane operations, `DescribeTable` / `ListTables`, streams,
+//!   time-to-live, tagging, an `UpdateTable` that does not create a vector
+//!   index, `ListBackups`, `DescribeContinuousBackups`, an
+//!   `UpdateContinuousBackups` that does not enable point-in-time recovery, and
+//!   `ImportTable` / `ExportTableToPointInTime`.
+//!   The wasm build compiles those handlers too, so a malformed request gets
+//!   the handler's own validation answer on both targets. The adapter
+//!   configures no backup store and no import or export paths, so `ListBackups`
+//!   lists nothing and the import and export handlers answer that the
+//!   operation is disabled.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -65,8 +70,8 @@ const ACCOUNT_ID: &str = "000000000000";
 const SERVER_ADDR: &str = "localhost:8000";
 
 /// Backup job-slot count for the native backup runtime. One is enough: the
-/// browser build has no backup store, and the native unit tests reach only the
-/// no-store answers. Native only — the field it feeds is absent on wasm.
+/// runtime has no backup store, and the operations that would use a slot are
+/// refused before dispatch. Native only — the field it feeds is absent on wasm.
 #[cfg(not(target_arch = "wasm32"))]
 const BACKUP_JOB_SLOTS: usize = 1;
 
@@ -81,9 +86,9 @@ const BACKUP_JOB_SLOTS: usize = 1;
 pub struct Engine {
     storage: Arc<dyn StorageEngine>,
     /// The process's backup job slots and (unconfigured) backup store. The
-    /// backup subsystem is compiled only off wasm, so this field is absent in
-    /// the wasm build, where the adapter answers the backup operations before
-    /// dispatch.
+    /// store-backed backup subsystem is compiled only off wasm, so this field
+    /// is absent in the wasm build; the adapter refuses the operations that
+    /// read it before dispatch.
     #[cfg(not(target_arch = "wasm32"))]
     backup: Arc<BackupRuntime>,
     limits: Arc<LimitsConfig>,
@@ -149,12 +154,11 @@ impl Engine {
     /// Apply the browser-build operation policy, then validate the operation,
     /// parse the body, and dispatch into the engine.
     async fn dispatch(&self, operation: &str, body_json: &str) -> Result<Value, DynamoDbError> {
-        // Refusals that need no request body: the store-backed backup/restore/
-        // point-in-time operations and PartiQL. Answered before the
-        // operation-known check so a PartiQL request is refused for the stated
-        // reason rather than reported as unknown — this build is compiled
-        // without the PartiQL surface, so `is_known_operation` would not
-        // recognize it otherwise.
+        // Refusals that need no request body: the store-backed backup
+        // operations and PartiQL. Answered before the operation-known check so
+        // a PartiQL request is refused for the stated reason rather than
+        // reported as unknown — this build is compiled without the PartiQL
+        // surface, so `is_known_operation` would not recognize it otherwise.
         if let Some(reason) = unsupported_reason(operation) {
             return Err(unsupported(operation, reason));
         }
@@ -174,6 +178,14 @@ impl Engine {
         // malformed request looks identical in the browser.
         let body: Value = serde_json::from_str(body_json).map_err(|e| malformed_body_error(&e))?;
 
+        // The server refuses a point-in-time restore and an enable at this
+        // point, after the body parse and before any table is read
+        // (crates/server/src/handler.rs). Calling the same engine function
+        // here gives both builds the server's answer.
+        if let Some(err) = extenddb_engine::refuse_point_in_time_recovery(operation, &body) {
+            return Err(err);
+        }
+
         // An UpdateTable that creates a vector index is refused here, before
         // dispatch and so before any catalog write: the build cannot run the
         // index backfill. Every other UpdateTable change passes through.
@@ -182,16 +194,6 @@ impl Engine {
                 "UpdateTable",
                 "it cannot build a vector index; create the table with its vector indexes instead",
             ));
-        }
-
-        // The backup and import/export operations with a no-store answer. The
-        // wasm build does not compile those engine handlers, so it returns the
-        // same answer the native no-store path produces. Natively this falls
-        // through to the real handler, which is the oracle the wasm answer is
-        // checked against.
-        #[cfg(target_arch = "wasm32")]
-        if let Some(answer) = no_store_answer(operation, &body) {
-            return answer;
         }
 
         let ctx = self.operation_context();
@@ -208,8 +210,9 @@ impl Engine {
     /// the item reads and writes `PartiQL` names in its statement body) because
     /// the `PartiQL` operations are refused before dispatch. Imports and exports
     /// are disabled (empty allow-lists — the browser has no filesystem). The
-    /// backup runtime is present only off wasm, where the backup operations
-    /// reach the engine; on wasm the adapter answers them before dispatch.
+    /// backup runtime is present only off wasm; the store-backed backup
+    /// operations that would read it are refused before dispatch on both
+    /// targets.
     fn operation_context(&self) -> OperationContext {
         OperationContext {
             storage: Arc::clone(&self.storage),
@@ -234,11 +237,7 @@ impl Engine {
 /// of the build.
 fn unsupported_reason(operation: &str) -> Option<&'static str> {
     match operation {
-        "CreateBackup"
-        | "DescribeBackup"
-        | "DeleteBackup"
-        | "RestoreTableFromBackup"
-        | "RestoreTableToPointInTime" => {
+        "CreateBackup" | "DescribeBackup" | "DeleteBackup" | "RestoreTableFromBackup" => {
             Some("the browser build runs entirely in memory with no backup store")
         }
         "ExecuteStatement" | "BatchExecuteStatement" | "ExecuteTransaction" => {
@@ -270,97 +269,6 @@ fn creates_vector_index(body: &Value) -> bool {
                 .iter()
                 .any(|update| update.get("Create").is_some_and(|create| !create.is_null()))
         })
-}
-
-/// The answer the browser build gives for a backup or import/export operation
-/// that a server with no backup store and no import/export paths answers
-/// without a store. Returned only on wasm, where the engine handlers are not
-/// compiled; natively the engine computes the identical answer, which is the
-/// oracle these values are checked against. The messages are the native
-/// no-store messages, reproduced so the two builds match.
-///
-/// `UpdateContinuousBackups` is the one body-sensitive case, and it reproduces
-/// native's three answers (`handle_update_continuous_backups`): disabling
-/// point-in-time recovery returns the description `DescribeContinuousBackups`
-/// reports; enabling it is refused with `ContinuousBackupsUnavailableException`
-/// (no backend implements it); and a request whose
-/// `PointInTimeRecoverySpecification` is missing or whose
-/// `PointInTimeRecoveryEnabled` flag is absent or malformed is refused with the
-/// service's "Member must not be null" `ValidationException`, exactly as native
-/// does — not treated as an enable. It does not check that the table exists
-/// first (the describe handler is not compiled here), so a request naming a
-/// missing table is answered from the specification rather than with
-/// `TableNotFoundException`. The README's refusal section documents this
-/// missing-table difference.
-#[cfg(target_arch = "wasm32")]
-fn no_store_answer(operation: &str, body: &Value) -> Option<Result<Value, DynamoDbError>> {
-    let answer = match operation {
-        "ListBackups" => Ok(serde_json::json!({ "BackupSummaries": [] })),
-        "DescribeContinuousBackups" => Ok(continuous_backups_disabled_document()),
-        "UpdateContinuousBackups" => match point_in_time_recovery_enabled(body) {
-            Ok(false) => Ok(continuous_backups_disabled_document()),
-            Ok(true) => Err(DynamoDbError::ContinuousBackupsUnavailableException(
-                "Point-in-time recovery is not supported by this storage backend".to_owned(),
-            )),
-            Err(err) => Err(err),
-        },
-        "ImportTable" => Err(DynamoDbError::ValidationException(
-            "Import is disabled. Configure [import] paths in extenddb.toml to enable.".to_owned(),
-        )),
-        "ExportTableToPointInTime" => Err(DynamoDbError::ValidationException(
-            "Export is disabled. Configure [export] paths in extenddb.toml to enable.".to_owned(),
-        )),
-        _ => return None,
-    };
-    Some(answer)
-}
-
-/// The `ContinuousBackupsDescription` document for a backend with point-in-time
-/// recovery off — continuous backups enabled, point-in-time recovery disabled.
-/// Both `DescribeContinuousBackups` and a disabling `UpdateContinuousBackups`
-/// return it, matching the native description.
-#[cfg(target_arch = "wasm32")]
-fn continuous_backups_disabled_document() -> Value {
-    serde_json::json!({
-        "ContinuousBackupsDescription": {
-            "ContinuousBackupsStatus": "ENABLED",
-            "PointInTimeRecoveryDescription": { "PointInTimeRecoveryStatus": "DISABLED" }
-        }
-    })
-}
-
-/// `PointInTimeRecoverySpecification.PointInTimeRecoveryEnabled` from an
-/// `UpdateContinuousBackups` body, reproducing the native reader in
-/// `handle_update_continuous_backups`: the boolean flag, or the JSON strings
-/// `"true"`/`"false"` the service also accepts as the booleans. A request
-/// without the specification, or with one that does not hold the flag as one
-/// of those forms, is refused with the service's "Member must not be null"
-/// text at the member's model path — the same `ValidationException` native
-/// returns, so a malformed request is answered identically on both builds.
-#[cfg(target_arch = "wasm32")]
-fn point_in_time_recovery_enabled(body: &Value) -> Result<bool, DynamoDbError> {
-    let spec = body
-        .get("PointInTimeRecoverySpecification")
-        .filter(|v| !v.is_null())
-        .ok_or_else(|| member_null("pointInTimeRecoverySpecification"))?;
-    match spec.get("PointInTimeRecoveryEnabled") {
-        Some(Value::Bool(flag)) => Ok(*flag),
-        Some(Value::String(s)) if s == "true" => Ok(true),
-        Some(Value::String(s)) if s == "false" => Ok(false),
-        _ => Err(member_null(
-            "pointInTimeRecoverySpecification.pointInTimeRecoveryEnabled",
-        )),
-    }
-}
-
-/// The service's refusal for a required member given as null, by its model
-/// path — the message native's `member_null` produces.
-#[cfg(target_arch = "wasm32")]
-fn member_null(path: &str) -> DynamoDbError {
-    DynamoDbError::ValidationException(format!(
-        "1 validation error detected: Value null at '{path}' \
-         failed to satisfy constraint: Member must not be null"
-    ))
 }
 
 // These tests drive the portable runtime on a current-thread tokio runtime,
@@ -455,121 +363,6 @@ mod tests {
         );
     }
 
-    /// A store-backed backup operation is refused with a `ValidationException`
-    /// that names the WebAssembly build — not an `InternalServerError`, which an
-    /// SDK would retry. The adapter applies this on both targets.
-    #[tokio::test]
-    async fn create_backup_is_unsupported() {
-        let engine = engine().await;
-        create_products(&engine).await;
-        let out = engine
-            .submit(
-                "CreateBackup",
-                r#"{"TableName":"Products","BackupName":"snap"}"#,
-            )
-            .await;
-        assert_eq!(
-            error_type(&out),
-            "com.amazon.coral.validate#ValidationException",
-            "{out}"
-        );
-        let value: Value = serde_json::from_str(&out).unwrap();
-        assert!(
-            value["message"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("ExtendDB WebAssembly build"),
-            "the message must name the build: {out}"
-        );
-    }
-
-    /// A `PartiQL` operation is refused with a `ValidationException` naming the
-    /// build, even though this build is compiled without the `PartiQL` surface
-    /// (so the engine would otherwise report it as unknown). Refused before the
-    /// body is parsed, so a malformed statement body does not change the answer.
-    #[tokio::test]
-    async fn execute_statement_is_unsupported() {
-        let engine = engine().await;
-        let out = engine
-            .submit(
-                "ExecuteStatement",
-                r#"{"Statement":"SELECT * FROM Products"}"#,
-            )
-            .await;
-        assert_eq!(
-            error_type(&out),
-            "com.amazon.coral.validate#ValidationException",
-            "{out}"
-        );
-        let value: Value = serde_json::from_str(&out).unwrap();
-        assert!(
-            value["message"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("ExtendDB WebAssembly build"),
-            "the message must name the build: {out}"
-        );
-        // A malformed body does not change the refusal (refused before parsing).
-        let out = engine.submit("ExecuteStatement", "{ not json").await;
-        assert_eq!(
-            error_type(&out),
-            "com.amazon.coral.validate#ValidationException",
-            "{out}"
-        );
-    }
-
-    /// An `UpdateTable` that creates a vector index is refused with a
-    /// `ValidationException` naming the build, and because the refusal lands
-    /// before dispatch — before any catalog write — the instance keeps serving:
-    /// a following `PutItem`/`GetItem` round-trip on the same table succeeds.
-    #[tokio::test]
-    async fn update_table_creating_a_vector_index_is_refused_and_the_instance_still_serves() {
-        let engine = engine().await;
-        create_products(&engine).await;
-        let out = engine
-            .submit(
-                "UpdateTable",
-                r#"{"TableName":"Products",
-                    "VectorIndexUpdates":[{"Create":{"IndexName":"vec",
-                        "VectorAttributeName":"embedding","Dimensions":3,
-                        "DistanceMetric":"cosine"}}]}"#,
-            )
-            .await;
-        assert_eq!(
-            error_type(&out),
-            "com.amazon.coral.validate#ValidationException",
-            "{out}"
-        );
-        let value: Value = serde_json::from_str(&out).unwrap();
-        assert!(
-            value["message"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("ExtendDB WebAssembly build"),
-            "the message must name the build: {out}"
-        );
-        // The table still serves writes and reads after the refusal.
-        ok_value(
-            &engine
-                .submit(
-                    "PutItem",
-                    r#"{"TableName":"Products","Item":{"productId":{"S":"p1"},"name":{"S":"Widget"}}}"#,
-                )
-                .await,
-        );
-        let out = engine
-            .submit(
-                "GetItem",
-                r#"{"TableName":"Products","Key":{"productId":{"S":"p1"}}}"#,
-            )
-            .await;
-        assert_eq!(
-            ok_value(&out)["Item"]["name"]["S"].as_str(),
-            Some("Widget"),
-            "the instance must still serve after the refusal: {out}"
-        );
-    }
-
     /// An `UpdateTable` that does not create a vector index is not refused by
     /// the adapter — it passes through to the engine (its outcome is the
     /// engine's, never the build's "not supported" answer).
@@ -586,127 +379,6 @@ mod tests {
         assert!(
             !out.contains("ExtendDB WebAssembly build"),
             "a non-vector-create UpdateTable must pass through, not be refused: {out}"
-        );
-    }
-
-    /// `ListBackups` with no backup store answers with an empty list. Natively
-    /// this is the engine's no-store answer; the wasm build returns the same
-    /// document from `no_store_answer`.
-    #[tokio::test]
-    async fn list_backups_returns_an_empty_list() {
-        let engine = engine().await;
-        let out = engine.submit("ListBackups", "{}").await;
-        let value = ok_value(&out);
-        assert_eq!(
-            value["BackupSummaries"].as_array().map(Vec::len),
-            Some(0),
-            "{out}"
-        );
-        assert!(
-            value.get("LastEvaluatedBackupArn").is_none(),
-            "an empty listing has no cursor: {out}"
-        );
-    }
-
-    /// `DescribeContinuousBackups` reports point-in-time recovery as disabled.
-    /// Natively this is the engine's answer for an existing table; the wasm
-    /// build returns the same document from `no_store_answer`.
-    #[tokio::test]
-    async fn describe_continuous_backups_reports_disabled() {
-        let engine = engine().await;
-        create_products(&engine).await;
-        let out = engine
-            .submit("DescribeContinuousBackups", r#"{"TableName":"Products"}"#)
-            .await;
-        let value = ok_value(&out);
-        assert_eq!(
-            value["ContinuousBackupsDescription"]["ContinuousBackupsStatus"].as_str(),
-            Some("ENABLED"),
-            "{out}"
-        );
-        assert_eq!(
-            value["ContinuousBackupsDescription"]["PointInTimeRecoveryDescription"]
-                ["PointInTimeRecoveryStatus"]
-                .as_str(),
-            Some("DISABLED"),
-            "{out}"
-        );
-    }
-
-    /// Enabling point-in-time recovery through `UpdateContinuousBackups` is
-    /// refused with `ContinuousBackupsUnavailableException`. Natively this is
-    /// the engine's answer; the wasm build returns the same error from
-    /// `no_store_answer`.
-    #[tokio::test]
-    async fn update_continuous_backups_enable_is_unavailable() {
-        let engine = engine().await;
-        create_products(&engine).await;
-        let out = engine
-            .submit(
-                "UpdateContinuousBackups",
-                r#"{"TableName":"Products",
-                    "PointInTimeRecoverySpecification":{"PointInTimeRecoveryEnabled":true}}"#,
-            )
-            .await;
-        assert_eq!(
-            error_type(&out),
-            "com.amazonaws.dynamodb.v20120810#ContinuousBackupsUnavailableException",
-            "{out}"
-        );
-    }
-
-    /// `ImportTable` is disabled (no import paths). Natively this is the
-    /// engine's answer; the wasm build returns the same `ValidationException`
-    /// from `no_store_answer`.
-    #[tokio::test]
-    async fn import_table_is_disabled() {
-        let engine = engine().await;
-        let out = engine
-            .submit(
-                "ImportTable",
-                r#"{"TableCreationParameters":{"TableName":"T",
-                    "KeySchema":[{"AttributeName":"k","KeyType":"HASH"}],
-                    "AttributeDefinitions":[{"AttributeName":"k","AttributeType":"S"}]},
-                    "InputFormat":"DYNAMODB_JSON",
-                    "S3BucketSource":{"S3Bucket":"b"}}"#,
-            )
-            .await;
-        assert_eq!(
-            error_type(&out),
-            "com.amazon.coral.validate#ValidationException",
-            "{out}"
-        );
-        let value: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(
-            value["message"].as_str(),
-            Some("Import is disabled. Configure [import] paths in extenddb.toml to enable."),
-            "{out}"
-        );
-    }
-
-    /// `ExportTableToPointInTime` is disabled (no export paths). Natively this
-    /// is the engine's answer; the wasm build returns the same
-    /// `ValidationException` from `no_store_answer`.
-    #[tokio::test]
-    async fn export_table_is_disabled() {
-        let engine = engine().await;
-        let out = engine
-            .submit(
-                "ExportTableToPointInTime",
-                r#"{"TableArn":"arn:aws:dynamodb:us-east-1:000000000000:table/Products",
-                    "S3Bucket":"b","ExportFormat":"DYNAMODB_JSON"}"#,
-            )
-            .await;
-        assert_eq!(
-            error_type(&out),
-            "com.amazon.coral.validate#ValidationException",
-            "{out}"
-        );
-        let value: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(
-            value["message"].as_str(),
-            Some("Export is disabled. Configure [export] paths in extenddb.toml to enable."),
-            "{out}"
         );
     }
 }

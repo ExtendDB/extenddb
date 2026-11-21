@@ -320,10 +320,9 @@ Operations that need a facility the in-browser build lacks return a
 `ValidationException` (HTTP 400, which an SDK does not retry), with a message
 that names the build:
 
-- The store-backed backup, restore and point-in-time operations — `CreateBackup`,
-  `DescribeBackup`, `DeleteBackup`, `RestoreTableFromBackup`,
-  `RestoreTableToPointInTime` — "… the browser build runs entirely in memory with
-  no backup store."
+- The store-backed backup operations — `CreateBackup`, `DescribeBackup`,
+  `DeleteBackup`, `RestoreTableFromBackup` — "… the browser build runs entirely
+  in memory with no backup store."
 - The PartiQL operations — `ExecuteStatement`, `BatchExecuteStatement`,
   `ExecuteTransaction` — "… the PartiQL surface is not part of the browser build."
 - An `UpdateTable` that creates a vector index — "… it cannot build a vector
@@ -331,18 +330,19 @@ that names the build:
   before any catalog write, so the table is unchanged and the instance keeps
   serving.
 
-Operations that a server with no backup store and no import/export paths also
-answers without a store return that same answer here: `ListBackups` is empty,
-`DescribeContinuousBackups` reports point-in-time recovery `DISABLED`, enabling
-it with `UpdateContinuousBackups` returns `ContinuousBackupsUnavailableException`,
-and `ImportTable` / `ExportTableToPointInTime` return the service's "disabled"
-`ValidationException`. These answers do not first check that the named table
-exists, so a `DescribeContinuousBackups` or disabling `UpdateContinuousBackups`
-request for a table that does not exist returns the point-in-time-disabled
-description rather than the `TableNotFoundException` a server returns. A malformed
-`UpdateContinuousBackups` specification is still rejected with the same
-`ValidationException` a server returns, because that check precedes the
-table lookup on a server too.
+`ListBackups`, `DescribeContinuousBackups`, `UpdateContinuousBackups`,
+`ImportTable` and `ExportTableToPointInTime` run the engine's own handlers, as
+on a server, so a malformed request gets the handler's validation error on both
+builds. This build has no backup store and no import or export paths, so
+`ListBackups` lists no backups, `DescribeContinuousBackups` reports
+point-in-time recovery `DISABLED` for a table that exists and
+`TableNotFoundException` for one that does not, and `ImportTable` /
+`ExportTableToPointInTime` return the "disabled" `ValidationException` of a
+server with no import or export paths. As the server does, the build refuses
+every `RestoreTableToPointInTime` (`PointInTimeRecoveryUnavailableException`)
+and an `UpdateContinuousBackups` that enables point-in-time recovery
+(`ContinuousBackupsUnavailableException`) before any table is read, so a
+request naming a missing table gets the refusal too.
 
 On `wasm32` a panic cannot unwind: it is an unrecoverable trap that aborts the
 instance permanently. A trap leaves the pending `submit` promise unresolved and

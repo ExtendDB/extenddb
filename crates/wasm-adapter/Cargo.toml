@@ -23,11 +23,11 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 extenddb-auth = { workspace = true }
 extenddb-core = { workspace = true }
-# The browser build answers the PartiQL and backup/PITR/import/export
-# operations in this crate, before dispatch, so the engine is built without its
-# PartiQL surface: that surface needs an item authorizer the browser build does
-# not install, and its snapshot path reads the backup runtime, which the wasm
-# engine build does not carry.
+# The browser build refuses the PartiQL operations in this crate, before
+# dispatch, so the engine is built without its PartiQL surface: that surface
+# needs an item authorizer the browser build does not install, and its
+# snapshot path reads the backup runtime, which the wasm engine build does not
+# carry.
 #
 # Declared directly rather than inherited from the workspace: the workspace
 # entry does not set `default-features`, and cargo rejects a member turning it

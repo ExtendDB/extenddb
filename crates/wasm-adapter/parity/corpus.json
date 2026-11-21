@@ -1290,6 +1290,76 @@
       ]
     },
     {
+      "name": "UpdateItem VecT after the refusal updates the item",
+      "op": "UpdateItem",
+      "body": {
+        "TableName": "VecT",
+        "Key": {
+          "pk": {
+            "S": "v1"
+          }
+        },
+        "UpdateExpression": "SET #n = :n",
+        "ExpressionAttributeNames": {
+          "#n": "name"
+        },
+        "ExpressionAttributeValues": {
+          ":n": {
+            "S": "V2"
+          }
+        },
+        "ReturnValues": "ALL_NEW"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/Attributes/name/S",
+          "equals": "V2"
+        }
+      ]
+    },
+    {
+      "name": "CreateTable after the refusal creates a table",
+      "op": "CreateTable",
+      "body": {
+        "TableName": "AfterRefusal",
+        "KeySchema": [
+          {
+            "AttributeName": "pk",
+            "KeyType": "HASH"
+          }
+        ],
+        "AttributeDefinitions": [
+          {
+            "AttributeName": "pk",
+            "AttributeType": "S"
+          }
+        ],
+        "BillingMode": "PAY_PER_REQUEST"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/TableDescription/TableName",
+          "equals": "AfterRefusal"
+        }
+      ]
+    },
+    {
+      "name": "DeleteTable after the refusal deletes that table",
+      "op": "DeleteTable",
+      "body": {
+        "TableName": "AfterRefusal"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/TableDescription/TableName",
+          "equals": "AfterRefusal"
+        }
+      ]
+    },
+    {
       "name": "UpdateTimeToLive enables TTL on Products",
       "op": "UpdateTimeToLive",
       "body": {
@@ -1376,8 +1446,8 @@
       "error": null,
       "checks": [
         {
-          "path": "/BackupSummaries/0",
-          "absent": true
+          "path": "/BackupSummaries",
+          "equals": []
         },
         {
           "path": "/LastEvaluatedBackupArn",
@@ -1413,7 +1483,12 @@
         }
       },
       "error": "ContinuousBackupsUnavailableException",
-      "checks": []
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Point-in-time recovery is not supported by this storage backend"
+        }
+      ]
     },
     {
       "name": "Disabling point-in-time recovery succeeds",
@@ -1466,6 +1541,126 @@
       ]
     },
     {
+      "name": "DescribeContinuousBackups without TableName is the missing-parameter refusal",
+      "op": "DescribeContinuousBackups",
+      "body": {},
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "The parameter 'TableName' is required but was not present in the request"
+        }
+      ]
+    },
+    {
+      "name": "DescribeContinuousBackups on a missing table is TableNotFoundException",
+      "op": "DescribeContinuousBackups",
+      "body": {
+        "TableName": "Nope"
+      },
+      "error": "TableNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Table not found: Nope"
+        }
+      ]
+    },
+    {
+      "name": "UpdateContinuousBackups with an empty TableName fails both name constraints",
+      "op": "UpdateContinuousBackups",
+      "body": {
+        "TableName": "",
+        "PointInTimeRecoverySpecification": {
+          "PointInTimeRecoveryEnabled": false
+        }
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "2 validation errors detected: Value '' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3; Value '' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+        }
+      ]
+    },
+    {
+      "name": "Enabling point-in-time recovery on a missing table is refused before the lookup",
+      "op": "UpdateContinuousBackups",
+      "body": {
+        "TableName": "Nope",
+        "PointInTimeRecoverySpecification": {
+          "PointInTimeRecoveryEnabled": true
+        }
+      },
+      "error": "ContinuousBackupsUnavailableException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Point-in-time recovery is not supported by this storage backend"
+        }
+      ]
+    },
+    {
+      "name": "ListBackups with Limit 0 is below the minimum",
+      "op": "ListBackups",
+      "body": {
+        "Limit": 0
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
+        }
+      ]
+    },
+    {
+      "name": "ListBackups with Limit 101 is above the maximum",
+      "op": "ListBackups",
+      "body": {
+        "Limit": 101
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "1 validation error detected: Value '101' at 'limit' failed to satisfy constraint: Member must have value less than or equal to 100"
+        }
+      ]
+    },
+    {
+      "name": "ListBackups for a table lists nothing",
+      "op": "ListBackups",
+      "body": {
+        "TableName": "Products"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/BackupSummaries",
+          "equals": []
+        },
+        {
+          "path": "/LastEvaluatedBackupArn",
+          "absent": true
+        }
+      ]
+    },
+    {
+      "name": "ListBackups with an ExclusiveStartBackupArn that is not an ARN is refused",
+      "op": "ListBackups",
+      "body": {
+        "ExclusiveStartBackupArn": "nope"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Invalid Request: BackupArn is not valid"
+        }
+      ]
+    },
+    {
       "name": "ImportTable is disabled",
       "op": "ImportTable",
       "body": {
@@ -1493,7 +1688,7 @@
       "checks": [
         {
           "path": "/message",
-          "contains": "Import is disabled"
+          "equals": "Import is disabled. Configure [import] paths in extenddb.toml to enable."
         }
       ]
     },
@@ -1509,7 +1704,7 @@
       "checks": [
         {
           "path": "/message",
-          "contains": "Export is disabled"
+          "equals": "Export is disabled. Configure [export] paths in extenddb.toml to enable."
         }
       ]
     },
@@ -1572,11 +1767,40 @@
       ]
     },
     {
-      "name": "RestoreTableToPointInTime is refused by the WebAssembly build",
+      "name": "RestoreTableToPointInTime is refused before the source table is read",
       "op": "RestoreTableToPointInTime",
       "body": {
         "SourceTableName": "Products",
         "TargetTableName": "R2"
+      },
+      "error": "PointInTimeRecoveryUnavailableException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Point-in-time recovery is not supported by this storage backend"
+        }
+      ]
+    },
+    {
+      "name": "RestoreTableToPointInTime from a missing table gets the same refusal",
+      "op": "RestoreTableToPointInTime",
+      "body": {
+        "SourceTableName": "Nope",
+        "TargetTableName": "R3"
+      },
+      "error": "PointInTimeRecoveryUnavailableException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Point-in-time recovery is not supported by this storage backend"
+        }
+      ]
+    },
+    {
+      "name": "ExecuteStatement is refused by the WebAssembly build",
+      "op": "ExecuteStatement",
+      "body": {
+        "Statement": "SELECT * FROM \"Products\" WHERE productId = 'p1'"
       },
       "error": "ValidationException",
       "checks": [
@@ -1587,11 +1811,9 @@
       ]
     },
     {
-      "name": "ExecuteStatement is refused by the WebAssembly build",
+      "name": "ExecuteStatement with a malformed body is refused before the body is parsed",
       "op": "ExecuteStatement",
-      "body": {
-        "Statement": "SELECT * FROM \"Products\" WHERE productId = 'p1'"
-      },
+      "rawBody": "{ not json",
       "error": "ValidationException",
       "checks": [
         {
