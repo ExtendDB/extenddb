@@ -70,19 +70,24 @@
 //!   with foreign keys enforced (`PRAGMA foreign_keys = ON`), as
 //!   `sqlx-sqlite`'s default connect options set them on every connection it
 //!   opens.
-//! * **Connect options.** Parsing a [`SqliteConnectOptions`] removes leading
-//!   `sqlite://` and `sqlite:` schemes, takes what follows the first `?` as
-//!   form-encoded query parameters, and percent-decodes the rest into the file
-//!   name; `:memory:` names an in-memory database `file:sqlx-in-memory-<n>`.
-//!   An unknown parameter, or a `mode`, `cache` or `immutable` value `sqlx`
-//!   does not accept, is [`Error::Configuration`] with `sqlx`'s text.
+//! * **Connect options.** `sqlite::memory:` parses into options whose file
+//!   name is `file:sqlx-in-memory-<n>`, the name `sqlx-sqlite` gives an
+//!   in-memory database.
 //!
 //! # Documented differences from `sqlx-sqlite` 0.8.6
 //!
-//! The table in `tests/wasm_shim.rs` has six `difference: ...` rows: one each
-//! for **One connection**, **Nested transactions** and **After a failed
-//! `begin_with`**, and one per terminal (`fetch_one`, `fetch_optional`,
-//! `execute`) for **`$0`**. The other entries have no row.
+//! The table in `tests/wasm_shim.rs` has seven `difference: ...` rows: one
+//! each for **One location**, **One connection**, **Nested transactions** and
+//! **After a failed `begin_with`**, and one per terminal (`fetch_one`,
+//! `fetch_optional`, `execute`) for **`$0`**. The other entries have no row.
+//!
+//! * **One location.** The only location that parses is `sqlite::memory:`,
+//!   the URL the backend builds for the in-memory database
+//!   `SqliteEngine::new_in_memory` opens. Every other location, a file path or
+//!   another spelling of an in-memory database such as `:memory:`, is
+//!   [`Error::Configuration`] saying that the WebAssembly build opens only an
+//!   in-memory database; `sqlx` parses each of them. The connection opens a
+//!   private `:memory:` database, not the shared-cache one `sqlx` names.
 //!
 //! * **No acquire wait.** `sqlx` waits up to the pool's acquire timeout (30 s
 //!   by default) for the connection before it returns
@@ -112,14 +117,6 @@
 //!   statement had produced no row: `execute` returns `Ok` with 0 rows
 //!   affected, `fetch_optional` returns `Ok(None)` and `fetch_one` returns
 //!   [`Error::RowNotFound`].
-//! * **Connect options.** Of the accepted query parameters only
-//!   `mode=memory` is acted on; `mode=ro`, `mode=rw`, `mode=rwc`, `cache`,
-//!   `immutable` and `vfs` are checked and then not used. Every connection
-//!   opens its own database: an in-memory location (`:memory:` or
-//!   `mode=memory`) opens a private `:memory:` database rather than the
-//!   shared-cache one `sqlx` names, and any other name is a database of that
-//!   name in `sqlite-wasm-rs`'s in-memory VFS. The only location the
-//!   WebAssembly adapter opens is `:memory:` (`SqliteEngine::new_in_memory`).
 //! * **`fetch` runs ahead.** `fetch` runs the whole query before it yields the
 //!   first row, so dropping the stream early does not stop later statements
 //!   from running.
@@ -343,15 +340,10 @@ fn autocommit(handle: &Handle) -> bool {
     unsafe { ffi::sqlite3_get_autocommit(handle.db) != 0 }
 }
 
-/// Open the database `options` name and return the shared handle, with a
-/// 5 s busy timeout and foreign keys enforced.
-fn open(options: &SqliteConnectOptions) -> Result<Handle, Error> {
-    let filename = if options.in_memory {
-        Cow::Borrowed(":memory:")
-    } else {
-        options.filename.to_string_lossy()
-    };
-    let c_name = CString::new(filename.as_bytes()).map_err(|e| Error::Protocol(e.to_string()))?;
+/// Open a private in-memory database, the only kind of database a location
+/// that parses names, and return the shared handle, with a 5 s busy timeout
+/// and foreign keys enforced.
+fn open() -> Result<Handle, Error> {
     let mut db: *mut ffi::sqlite3 = ptr::null_mut();
     // SAFETY: a valid NUL-terminated name and a valid out-pointer are passed;
     // the returned handle is stored in `RawConn`, which closes it on drop. On a
@@ -359,7 +351,7 @@ fn open(options: &SqliteConnectOptions) -> Result<Handle, Error> {
     // handle is wrapped before the result is checked.
     let rc = unsafe {
         ffi::sqlite3_open_v2(
-            c_name.as_ptr(),
+            c":memory:".as_ptr(),
             &raw mut db,
             ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE,
             ptr::null(),
@@ -671,15 +663,19 @@ impl<DB> Drop for Transaction<'_, DB> {
 
 // ─────────────────────────── connect options ───────────────────────────
 
+/// The one location that parses: the URL the backend builds for the in-memory
+/// database `SqliteEngine::new_in_memory` opens (`sqlite_url(":memory:")`).
+const IN_MEMORY_URL: &str = "sqlite::memory:";
+
 /// Numbers the in-memory databases a parsed [`SqliteConnectOptions`] names,
 /// as `sqlx-sqlite` does.
 static IN_MEMORY_DB_SEQ: AtomicUsize = AtomicUsize::new(0);
 
-/// Connection options, mirroring `sqlx::sqlite::SqliteConnectOptions`.
+/// Connection options, mirroring `sqlx::sqlite::SqliteConnectOptions` for the
+/// one location the WebAssembly build opens, an in-memory database.
 #[derive(Clone, Debug)]
 pub struct SqliteConnectOptions {
     filename: PathBuf,
-    in_memory: bool,
 }
 
 impl SqliteConnectOptions {
@@ -688,67 +684,11 @@ impl SqliteConnectOptions {
     pub fn new() -> Self {
         SqliteConnectOptions {
             filename: PathBuf::from(":memory:"),
-            in_memory: false,
         }
     }
 
-    /// Parse a connection string the way `sqlx-sqlite` 0.8.6 does
-    /// (`options/parse.rs`): leading `sqlite://` and `sqlite:` schemes are
-    /// removed, the part after the first `?` holds the query parameters, and
-    /// the rest is the percent-decoded file name, except that `:memory:` names
-    /// a fresh in-memory database. Each parameter is checked as `sqlx` checks
-    /// it, so an unknown key or value is [`Error::Configuration`] with `sqlx`'s
-    /// text; of the accepted ones only `mode=memory` changes how the database
-    /// opens (see the module documentation). Reached through the `FromStr`
-    /// impl, as in `sqlx`, which has no inherent `from_str`.
-    fn parse(url: &str) -> Result<Self, Error> {
-        let url = url
-            .trim_start_matches("sqlite://")
-            .trim_start_matches("sqlite:");
-        let (database, params) = match url.split_once('?') {
-            Some((database, params)) => (database, Some(params)),
-            None => (url, None),
-        };
-        let mut options = if database == ":memory:" {
-            let seqno = IN_MEMORY_DB_SEQ.fetch_add(1, Ordering::Relaxed);
-            SqliteConnectOptions {
-                filename: PathBuf::from(format!("file:sqlx-in-memory-{seqno}")),
-                in_memory: true,
-            }
-        } else {
-            SqliteConnectOptions {
-                filename: PathBuf::from(percent_decode(database)?),
-                in_memory: false,
-            }
-        };
-        for (key, value) in params.map(form_pairs).into_iter().flatten() {
-            let known = match key.as_str() {
-                "mode" => {
-                    if value == "memory" {
-                        options.in_memory = true;
-                    }
-                    matches!(value.as_str(), "ro" | "rw" | "rwc" | "memory")
-                }
-                "cache" => matches!(value.as_str(), "private" | "shared"),
-                "immutable" => matches!(value.as_str(), "true" | "1" | "false" | "0"),
-                "vfs" => true,
-                _ => {
-                    return Err(Error::Configuration(
-                        format!("unknown query parameter `{key}` while parsing connection URL")
-                            .into(),
-                    ));
-                }
-            };
-            if !known {
-                return Err(Error::Configuration(
-                    format!("unknown value {value:?} for `{key}`").into(),
-                ));
-            }
-        }
-        Ok(options)
-    }
-
-    /// The database file name.
+    /// The database file name: for `sqlite::memory:`, the name
+    /// `file:sqlx-in-memory-<n>` that `sqlx-sqlite` gives it.
     pub fn get_filename(&self) -> &Path {
         &self.filename
     }
@@ -760,62 +700,6 @@ impl SqliteConnectOptions {
     }
 }
 
-/// Decode `%XX` escapes and require UTF-8, as `percent_decode_str(s)
-/// .decode_utf8()` does for `sqlx-sqlite`: a `%` not followed by two hex
-/// digits stays as it is.
-fn percent_decode(s: &str) -> Result<String, Error> {
-    String::from_utf8(percent_decode_bytes(s.as_bytes()))
-        .map_err(|e| Error::Configuration(Box::new(e.utf8_error())))
-}
-
-/// The `key=value` pairs of a query string, decoded as
-/// `url::form_urlencoded::parse` decodes them for `sqlx-sqlite`: pairs are
-/// separated by `&` and empty ones skipped, a pair with no `=` has an empty
-/// value, `+` is a space, `%XX` escapes are decoded, and invalid UTF-8 is
-/// replaced.
-fn form_pairs(query: &str) -> Vec<(String, String)> {
-    let decode = |part: &str| {
-        let plus_as_space: Vec<u8> = part
-            .bytes()
-            .map(|b| if b == b'+' { b' ' } else { b })
-            .collect();
-        String::from_utf8_lossy(&percent_decode_bytes(&plus_as_space)).into_owned()
-    };
-    query
-        .split('&')
-        .filter(|pair| !pair.is_empty())
-        .map(|pair| {
-            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-            (decode(key), decode(value))
-        })
-        .collect()
-}
-
-/// Decode `%XX` escapes; a `%` not followed by two hex digits stays as it is.
-fn percent_decode_bytes(bytes: &[u8]) -> Vec<u8> {
-    fn hex(b: u8) -> Option<u8> {
-        char::from(b)
-            .to_digit(16)
-            .and_then(|d| u8::try_from(d).ok())
-    }
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while let Some(&b) = bytes.get(i) {
-        if b == b'%' {
-            let high = bytes.get(i + 1).copied().and_then(hex);
-            let low = bytes.get(i + 2).copied().and_then(hex);
-            if let (Some(high), Some(low)) = (high, low) {
-                out.push(high * 16 + low);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(b);
-        i += 1;
-    }
-    out
-}
-
 impl Default for SqliteConnectOptions {
     fn default() -> Self {
         Self::new()
@@ -824,8 +708,24 @@ impl Default for SqliteConnectOptions {
 
 impl std::str::FromStr for SqliteConnectOptions {
     type Err = Error;
-    fn from_str(s: &str) -> Result<Self, Error> {
-        SqliteConnectOptions::parse(s)
+
+    /// Parse `sqlite::memory:`, the location the backend opens on wasm32, and
+    /// refuse every other location with [`Error::Configuration`]: the
+    /// WebAssembly build opens only an in-memory database.
+    fn from_str(url: &str) -> Result<Self, Error> {
+        if url != IN_MEMORY_URL {
+            return Err(Error::Configuration(
+                extenddb_core::error::webassembly_unsupported_message(
+                    &format!("The SQLite location {url:?}"),
+                    "it opens only an in-memory database (sqlite::memory:)",
+                )
+                .into(),
+            ));
+        }
+        let seqno = IN_MEMORY_DB_SEQ.fetch_add(1, Ordering::Relaxed);
+        Ok(SqliteConnectOptions {
+            filename: PathBuf::from(format!("file:sqlx-in-memory-{seqno}")),
+        })
     }
 }
 
@@ -908,15 +808,18 @@ impl SqlitePoolOptions {
         self
     }
 
-    /// Open the pool with the given connect options.
-    pub async fn connect_with(self, options: SqliteConnectOptions) -> Result<SqlitePool, Error> {
-        let handle = open(&options)?;
+    /// Open the pool with the given connect options. Every location that
+    /// parses names an in-memory database, so the options carry nothing the
+    /// connection needs: it opens a private in-memory database.
+    pub async fn connect_with(self, _options: SqliteConnectOptions) -> Result<SqlitePool, Error> {
+        let handle = open()?;
         self.finish(handle).await
     }
 
     /// Open the pool from a URL string.
     pub async fn connect(self, url: &str) -> Result<SqlitePool, Error> {
-        let handle = open(&SqliteConnectOptions::parse(url)?)?;
+        url.parse::<SqliteConnectOptions>()?;
+        let handle = open()?;
         self.finish(handle).await
     }
 

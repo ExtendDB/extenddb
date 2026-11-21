@@ -54,7 +54,7 @@ use sqlx::Connection;
 use sqlx::Row as _;
 
 /// The number of rows named `difference: ...`.
-const DIFFERENCE_ROWS: usize = 6;
+const DIFFERENCE_ROWS: usize = 7;
 
 /// A row's rendered outcome, or the error of a setup step that failed.
 type R = Result<String, sqlx::Error>;
@@ -112,7 +112,10 @@ macro_rules! decode {
 
 /// The pool the backend opens for an in-memory database: one connection.
 async fn pool() -> Result<sqlx::SqlitePool, sqlx::Error> {
-    pool_options().max_connections(1).connect(":memory:").await
+    pool_options()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
 }
 
 /// Pool options with a 50 ms acquire timeout (see the module documentation).
@@ -200,6 +203,15 @@ fn filename(url: &str) -> String {
         }
         Err(e) => render::<()>(Err(e)),
     }
+}
+
+/// The shim's refusal of a location other than `sqlite::memory:`, rendered.
+fn refused_location(url: &str) -> String {
+    format!(
+        "Err[Configuration] error with configuration: The SQLite location {url:?} is not \
+         supported by the ExtendDB WebAssembly build: it opens only an in-memory database \
+         (sqlite::memory:)."
+    )
 }
 
 /// The items of a `fetch` stream of one-column rows, rendered.
@@ -719,7 +731,7 @@ fn cases() -> Vec<Case> {
                     .min_connections(2)
                     .idle_timeout(None)
                     .max_lifetime(None)
-                    .connect(":memory:")
+                    .connect("sqlite::memory:")
                     .await?;
                 let _tx = pool.begin().await?;
                 render(sqlx::query("SELECT 1").execute(&pool).await.map(drop))
@@ -768,100 +780,23 @@ fn cases() -> Vec<Case> {
         ),
         // ── connect options ──
         row!(
-            ":memory: file name",
-            "Ok(\"file:sqlx-in-memory-<n>\")",
-            |_pool| filename(":memory:")
-        ),
-        row!(
             "sqlite::memory: file name",
             "Ok(\"file:sqlx-in-memory-<n>\")",
             |_pool| filename("sqlite::memory:")
         ),
-        row!(
-            "sqlite://:memory: file name",
-            "Ok(\"file:sqlx-in-memory-<n>\")",
-            |_pool| filename("sqlite://:memory:")
-        ),
-        row!(
-            "file::memory:?cache=shared file name",
-            "Ok(\"file::memory:\")",
-            |_pool| filename("file::memory:?cache=shared")
-        ),
-        row!("file:/abs file name", "Ok(\"file:/abs\")", |_pool| {
-            filename("file:/abs")
-        }),
-        row!("a percent-encoded file name", "Ok(\"a?b.db\")", |_pool| {
-            filename("sqlite://a%3Fb.db?mode=rwc")
-        }),
-        row!("a stray % stays in the file name", "Ok(\"%zz\")", |_pool| {
-            filename("%zz")
-        }),
-        row!("every leading scheme is removed", "Ok(\"x\")", |_pool| {
-            filename("sqlite:sqlite:x")
-        }),
-        row!(
-            "a file name that decodes to invalid UTF-8",
-            "Err[Configuration] error with configuration: invalid utf-8 sequence of 1 bytes \
-             from index 1",
-            |_pool| filename("sqlite:x%ff")
-        ),
-        // The serve lock's `database_file` passes a location through
-        // `sqlite_url` and reads the file name off these options on both
-        // targets; these are the URLs it builds for the locations named.
-        row!(
-            "database_file(\"file::memory:?cache=shared\") reads \
-             sqlite://file::memory:?cache=shared?mode=rwc",
-            "Err[Configuration] error with configuration: unknown value \"shared?mode=rwc\" \
-             for `cache`",
-            |_pool| filename("sqlite://file::memory:?cache=shared?mode=rwc")
-        ),
-        row!(
-            "database_file(\"file:/abs\") reads sqlite://file:/abs?mode=rwc",
-            "Ok(\"file:/abs\")",
-            |_pool| filename("sqlite://file:/abs?mode=rwc")
-        ),
-        // ── connect options: query parameters ──
-        row!(
-            "an unknown query parameter",
-            "Err[Configuration] error with configuration: unknown query parameter `bogus` while \
-             parsing connection URL",
-            |_pool| filename("sqlite::memory:?bogus=1")
-        ),
-        row!(
-            "an unknown mode",
-            "Err[Configuration] error with configuration: unknown value \"bad\" for `mode`",
-            |_pool| filename("sqlite://x?mode=bad")
-        ),
-        row!(
-            "a mode with no value",
-            "Err[Configuration] error with configuration: unknown value \"\" for `mode`",
-            |_pool| filename("sqlite://x?mode")
-        ),
-        row!(
-            "an unknown cache",
-            "Err[Configuration] error with configuration: unknown value \"no\" for `cache`",
-            |_pool| filename("sqlite://x?cache=no")
-        ),
-        row!(
-            "an unknown immutable",
-            "Err[Configuration] error with configuration: unknown value \"yes\" for `immutable`",
-            |_pool| filename("sqlite://x?immutable=yes")
-        ),
-        row!(
-            "known parameters, empty pairs and an encoded key",
-            "Ok(\"x\") | Ok(\"x\") | Ok(\"x\")",
+        difference!(
+            "difference: a location other than sqlite::memory: is refused",
+            native: "Ok(\"x.db\") | Ok(\"file:sqlx-in-memory-<n>\")",
+            wasm: format!(
+                "{} | {}",
+                refused_location("sqlite://x.db?mode=rwc"),
+                refused_location(":memory:")
+            ),
             |_pool| format!(
-                "{} | {} | {}",
-                filename("sqlite://x?vfs=a&mode=ro"),
-                filename("sqlite://x?&&mode=rw"),
-                filename("sqlite://x?mo%64e=memory")
+                "{} | {}",
+                filename("sqlite://x.db?mode=rwc"),
+                filename(":memory:")
             )
-        ),
-        row!(
-            "a + in a key decodes to a space",
-            "Err[Configuration] error with configuration: unknown query parameter `a b` while \
-             parsing connection URL",
-            |_pool| filename("sqlite://x?a+b=1")
         ),
         // ── connection settings ──
         row!("a connection's busy timeout", "Ok(5000)", |pool| render(
