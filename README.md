@@ -628,7 +628,7 @@ it does not run `wasm-opt`, so the module stays at about 6.6 MiB. In either
 form wasm-pack also runs `rustup target add wasm32-unknown-unknown` when the
 toolchain is a rustup one without that target, and asks crates.io for the
 latest wasm-pack version unless the `wasm-pack.stamp` file beside its binary
-is less than 24 hours old; the answer only feeds a warning.
+is less than 25 hours old; the answer only feeds a warning.
 
 The `wasm32` build is the adapter's dependency graph, built through
 `extenddb-wasm-adapter` as above. Two crates of that graph do not build for
