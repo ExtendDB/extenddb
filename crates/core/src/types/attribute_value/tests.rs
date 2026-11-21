@@ -420,9 +420,10 @@ fn empty_map_inside_map_rejected_with_ddb_message() {
 }
 
 /// The service's answer to each `B` value (measured 2026-11-20, and
-/// 2026-11-21 for the values with their padding left out or cut short):
-/// the decoded bytes, or the text of the refusal, empty for no message. A
-/// `BS` member, and a value inside an `M` or an `L`, get the same text.
+/// 2026-11-21 for the values with their padding left out or cut short
+/// and for the values with `=` or another character inside): the decoded
+/// bytes, or the text of the refusal, empty for no message. A `BS`
+/// member, and a value inside an `M` or an `L`, get the same text.
 #[test]
 fn a_value_that_is_not_base64_gets_the_service_text() {
     let short = || Err("Buffer is too short for base64 encoding".to_owned());
@@ -433,17 +434,17 @@ fn a_value_that_is_not_base64_gets_the_service_text() {
     };
     let last = || Err("Invalid last non-pad Base64 character dectected".to_owned());
     let none = || Err(String::new());
-    let rows: [(&str, Result<&str, String>); 54] = [
-        ("YWJj", Ok("abc")),
-        ("YQ==", Ok("a")),
-        ("YWE=", Ok("aa")),
-        ("AA==", Ok("\0")),
-        ("AAA=", Ok("\0\0")),
-        ("YQ", Ok("a")),
-        ("YQ=", Ok("a")),
-        ("YWJjZA", Ok("abcd")),
-        ("YWJjZA=", Ok("abcd")),
-        ("YWI", Ok("ab")),
+    let rows: [(&str, Result<&[u8], String>); 154] = [
+        ("YWJj", Ok(b"abc")),
+        ("YQ==", Ok(b"a")),
+        ("YWE=", Ok(b"aa")),
+        ("AA==", Ok(b"\0")),
+        ("AAA=", Ok(b"\0\0")),
+        ("YQ", Ok(b"a")),
+        ("YQ=", Ok(b"a")),
+        ("YWJjZA", Ok(b"abcd")),
+        ("YWJjZA=", Ok(b"abcd")),
+        ("YWI", Ok(b"ab")),
         ("a", short()),
         ("Y", short()),
         ("!", short()),
@@ -488,9 +489,112 @@ fn a_value_that_is_not_base64_gets_the_service_text() {
         ("\u{e9}\u{e9}", none()),
         ("\u{1f600}", none()),
         ("YQ\u{e9}", none()),
+        // Measured 2026-11-21: `=` or another byte outside the alphabet
+        // inside a value, with the bytes GetItem returns.
+        ("=YQ=", Ok(b"\xfd\x84")),
+        (",YQ=", Ok(b"\xfd\x84")),
+        ("@YQ=", Ok(b"\xfd\x84")),
+        ("`YQ=", Ok(b"\xfd\x84")),
+        ("=A==", Ok(b"\xfc")),
+        ("=AA=", Ok(b"\xfc\0")),
+        ("Y=Q=", Ok(b"\xff\xf4")),
+        ("A=Q=", Ok(b"\xff\xf4")),
+        ("==Q=", Ok(b"\xff\xf4")),
+        ("Y(Q=", Ok(b"\xff\xf4")),
+        ("Y)Q=", Ok(b"\xff\xf4")),
+        ("Y*Q=", Ok(b"\xff\xf4")),
+        ("Y,Q=", Ok(b"\xff\xf4")),
+        ("Y-Q=", Ok(b"\xff\xf4")),
+        ("Y.Q=", Ok(b"\xff\xf4")),
+        ("Y:Q=", Ok(b"\xff\xf4")),
+        ("Y;Q=", Ok(b"\xff\xf4")),
+        ("Y<Q=", Ok(b"\xff\xf4")),
+        ("Y>Q=", Ok(b"\xff\xf4")),
+        ("Y?Q=", Ok(b"\xff\xf4")),
+        ("Y@Q=", Ok(b"\xff\xf4")),
+        ("Y[Q=", Ok(b"\xff\xf4")),
+        ("Y\\Q=", Ok(b"\xff\xf4")),
+        ("Y]Q=", Ok(b"\xff\xf4")),
+        ("Y^Q=", Ok(b"\xff\xf4")),
+        ("Y_Q=", Ok(b"\xff\xf4")),
+        ("Y`Q=", Ok(b"\xff\xf4")),
+        ("Y{Q=", Ok(b"\xff\xf4")),
+        ("Y|Q=", Ok(b"\xff\xf4")),
+        ("Y}Q=", Ok(b"\xff\xf4")),
+        ("Y~Q=", Ok(b"\xff\xf4")),
+        ("Y\u{7f}Q=", Ok(b"\xff\xf4")),
+        ("A=A=", Ok(b"\xff\xf0")),
+        ("/=A=", Ok(b"\xff\xf0")),
+        ("==A=", Ok(b"\xff\xf0")),
+        ("YWJj=YQ=", Ok(b"abc\xfd\x84")),
+        ("YWJj,YQ=", Ok(b"abc\xfd\x84")),
+        ("YWJjY=Q=", Ok(b"abc\xff\xf4")),
+        ("YWJjY-Q=", Ok(b"abc\xff\xf4")),
+        ("YWJjYWJjY=Q=", Ok(b"abcabc\xff\xf4")),
+        ("=Y", length(2)),
+        ("Y-", length(2)),
+        ("=YQ", length(3)),
+        ("Y=Q", length(3)),
+        ("Y-Q", length(3)),
+        ("YW=Jj", length(5)),
+        ("Y=Q=\n", length(5)),
+        ("\u{e9}YQ=", length(5)),
+        ("YWJjY=", length(6)),
+        ("YWJj=YQ", length(7)),
+        ("YWJjY=Q", length(7)),
+        ("=Y==", last()),
+        ("YW==", last()),
+        ("A=B=", last()),
+        ("Y=R=", last()),
+        ("Y,==", last()),
+        ("A,==", last()),
+        ("A@==", last()),
+        ("YQ,=", last()),
+        ("YQ@=", last()),
+        ("=YQA", none()),
+        ("=AAA", none()),
+        ("=///", none()),
+        ("Y=QA", none()),
+        ("A=AA", none()),
+        ("A=//", none()),
+        ("==QA", none()),
+        ("==AA", none()),
+        ("YQ=Q", none()),
+        ("AA=A", none()),
+        ("Y,QA", none()),
+        ("YW-j", none()),
+        ("Y=QAYWJj", none()),
+        ("=YQAYWJj", none()),
+        ("Y=QA=YQ=", none()),
+        ("YWJjY=QA", none()),
+        ("YWJj=YQA", none()),
+        ("Y=Q=YWJj", none()),
+        ("Y-QAYWJj", none()),
+        ("YWJjY,QA", none()),
+        ("Y Q=", none()),
+        ("Y!Q=", none()),
+        ("Y\"Q=", none()),
+        ("Y#Q=", none()),
+        ("Y$Q=", none()),
+        ("Y%Q=", none()),
+        ("Y&Q=", none()),
+        ("Y'Q=", none()),
+        ("!YQ=", none()),
+        ("Y\0Q=", none()),
+        ("Y\tQ=", none()),
+        ("Y\nQ=", none()),
+        ("Y\u{e9}=", none()),
+        // Measured 2026-11-21: more `=` at the end than the padding.
+        ("YQ======", none()),
+        ("========", none()),
+        ("YWJjYQ======", none()),
+        ("Y=======", none()),
+        ("AAAA====", last()),
+        ("YWJjYWJj====", last()),
+        ("YQ=====", length(7)),
     ];
     for (text, want) in rows {
-        let want = want.map(|bytes| bytes.as_bytes().to_vec());
+        let want = want.map(<[u8]>::to_vec);
         assert_eq!(decode_base64(text), want, "{text:?}");
         for json in [
             serde_json::json!({"B": text}),
@@ -506,7 +610,34 @@ fn a_value_that_is_not_base64_gets_the_service_text() {
             );
         }
     }
-    let set = serde_json::json!({"BS": ["YQ==", "!!!!"]});
-    let got = serde_json::from_value::<AttributeValue>(set);
-    assert_eq!(got.err().map(|e| e.to_string()), Some(String::new()));
+    // A set: a member that does not decode gets its text, and members
+    // with the same bytes are duplicates, each printed as the base64 of
+    // its bytes (measured 2026-11-20 and 2026-11-21).
+    let duplicates = |members: &str| {
+        Err(format!(
+            "One or more parameter values were invalid: Input collection [{members}]of type \
+             BS contains duplicates."
+        ))
+    };
+    for (members, want) in [
+        (serde_json::json!(["YQ==", "!!!!"]), Err(String::new())),
+        (
+            serde_json::json!(["Y=Q=", "//Q="]),
+            duplicates("//Q=, //Q="),
+        ),
+        (
+            serde_json::json!(["=YQ=", "/YQ="]),
+            duplicates("/YQ=, /YQ="),
+        ),
+        (
+            serde_json::json!(["Y=Q=", "=YQ="]),
+            Ok(serde_json::json!({"BS": ["/YQ=", "//Q="]})),
+        ),
+    ] {
+        let set = serde_json::json!({ "BS": members });
+        let got = serde_json::from_value::<AttributeValue>(set.clone())
+            .map(|value| serde_json::to_value(value).unwrap())
+            .map_err(|e| e.to_string());
+        assert_eq!(got, want, "{set}");
+    }
 }

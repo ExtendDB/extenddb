@@ -28,6 +28,7 @@ import pytest
 from botocore.exceptions import ClientError
 
 from conftest import scoped_table
+from raw_signed_request import client_post
 
 MAX_LENGTH = 8192
 TOO_LONG = f"Member must have length less than or equal to {MAX_LENGTH}"
@@ -375,6 +376,43 @@ def test_a_transaction_past_its_limit_echoes_every_field_of_a_statement(client, 
     )
     assert message == _errors(
         _list_part("ParameterizedStatement", members, "transactStatements", "Member must have length less than or equal to 100")
+    )
+
+
+# A first parameter that only the second base64 reading reads, such as Y=Q=
+# (the bytes FF F4), echoes the buffer of its bytes (measured 2026-11-21).
+# boto3 encodes a binary value itself, so these requests are posted as
+# written.
+TWO_BYTES = _value(b="java.nio.HeapByteBuffer[pos=0 lim=2 cap=2]")
+BINARY_ECHOES = [
+    ("BatchExecuteStatement", "Statements", "BatchStatementRequest", 25, "Y=Q="),
+    ("BatchExecuteStatement", "Statements", "BatchStatementRequest", 25, "=YQ="),
+    ("ExecuteTransaction", "TransactStatements", "ParameterizedStatement", 100, "Y=Q="),
+    ("ExecuteTransaction", "TransactStatements", "ParameterizedStatement", 100, "=YQ="),
+]
+
+
+@pytest.mark.parametrize(
+    "operation, field, kind, limit, value",
+    BINARY_ECHOES,
+    ids=[f"{row[0]} {row[4]}" for row in BINARY_ECHOES],
+)
+def test_a_list_past_its_limit_echoes_the_bytes_of_a_binary(
+    client, table, operation, field, kind, limit, value
+):
+    statement = f'SELECT * FROM "{table}" WHERE pk = ?'
+    first = {"Statement": statement, "Parameters": [{"B": value}]}
+    rest = {"Statement": statement, "Parameters": [{"S": "x"}]}
+    status, payload = client_post(client, operation, {field: [first] + [rest] * limit})
+    assert status == 400, payload
+    assert payload.get("__type", "").rsplit("#", 1)[-1] == "ValidationException", payload
+    member = _batch_member if kind == "BatchStatementRequest" else _transaction_member
+    members = [member(statement, f"[{TWO_BYTES}]")] + [
+        member(statement, f"[{_value(s='x')}]")
+    ] * limit
+    path = field[0].lower() + field[1:]
+    assert payload.get("message", payload.get("Message")) == _errors(
+        _list_part(kind, members, path, f"Member must have length less than or equal to {limit}")
     )
 
 

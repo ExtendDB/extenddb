@@ -100,21 +100,68 @@ pub fn decode_padded_base64(text: &str) -> Result<Vec<u8>, String> {
     decode_with(&BASE64, text)
 }
 
+/// Decode `text` with `engine`, and a value it refuses with
+/// [`second_reading`].
 fn decode_with(engine: &GeneralPurpose, text: &str) -> Result<Vec<u8>, String> {
+    engine.decode(text).or_else(|_| second_reading(text))
+}
+
+/// The service's reading of a value the standard decoder refuses: the bytes,
+/// or the text of the refusal, empty for no message (measured 2026-11-20 and
+/// 2026-11-21). The steps, on the UTF-8 bytes, in this order:
+///
+/// 1. One byte is too short, and `==` gets no message. Another length that
+///    is not a multiple of 4 is named.
+/// 2. Up to two `=` at the end are the padding. Every group of four ahead of
+///    the last one, and the last one when there is no padding, must hold
+///    only base64 characters. Else there is no message.
+/// 3. In the last group, a byte from `(` to DEL outside the alphabet reads
+///    as -1, all bits set. Any other byte outside it gets no message.
+/// 4. The last character ahead of the padding must have no bits past the
+///    last byte. -1 has them. Else the last character is invalid.
+///
+/// The bytes take the -1 values with a sign-extending shift: `Y=Q=` reads as
+/// FF F4 and `=YQ=` as FD 84.
+fn second_reading(text: &str) -> Result<Vec<u8>, String> {
     let [too_short, length, last_character] = BASE64_TEXTS;
-    engine.decode(text).map_err(|_| match text.len() {
-        1 => too_short.to_owned(),
-        2 if text == "==" => String::new(),
-        n if n % 4 != 0 => format!("{length}{n}"),
-        _ if text
-            .trim_end_matches('=')
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/') =>
-        {
-            last_character.to_owned()
-        }
-        _ => String::new(),
-    })
+    match text.len() {
+        1 => return Err(too_short.to_owned()),
+        2 if text == "==" => return Err(String::new()),
+        n if n % 4 != 0 => return Err(format!("{length}{n}")),
+        _ => {}
+    }
+    let pads = (text.len() - text.trim_end_matches('=').len()).min(2);
+    let (head, last) = text.as_bytes().split_at(text.len().saturating_sub(4));
+    // A value with no padding that the standard decoder refuses holds a byte
+    // outside the alphabet.
+    if pads == 0 || head.contains(&b'=') {
+        return Err(String::new());
+    }
+    let mut bytes = BASE64.decode(head).map_err(|_| String::new())?;
+    let values = last[..4 - pads]
+        .iter()
+        .map(|&b| sextet(b))
+        .collect::<Option<Vec<i32>>>()
+        .ok_or_else(String::new)?;
+    let past_last_byte = if pads == 1 { 0x3 } else { 0xF };
+    if values.last().is_some_and(|v| v & past_last_byte != 0) {
+        return Err(last_character.to_owned());
+    }
+    // Each byte is the low 8 bits of its value.
+    bytes.push(((values[0] << 2) | (values[1] >> 4)) as u8);
+    if pads == 1 {
+        bytes.push((((values[1] & 0xF) << 4) | (values[2] >> 2)) as u8);
+    }
+    Ok(bytes)
+}
+
+/// The value of a byte in the last group of [`second_reading`]: its place in
+/// the alphabet, -1 for another byte from `(` to DEL, else none.
+fn sextet(byte: u8) -> Option<i32> {
+    match base64::alphabet::STANDARD.as_str().find(char::from(byte)) {
+        Some(place) => i32::try_from(place).ok(),
+        None => (b'('..=0x7F).contains(&byte).then_some(-1),
+    }
 }
 
 /// Whether `message` is a text of [`decode_base64`], which the service sends
@@ -322,7 +369,13 @@ fn binary_set(value: &serde_json::Value) -> Result<AttributeValue, String> {
         })
         .collect::<Result<_, _>>()?;
     if set.len() != arr.len() {
-        let values: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+        // Each member as the base64 of its bytes (measured 2026-11-21:
+        // `["Y=Q=", "//Q="]` prints `[//Q=, //Q=]`).
+        let values = arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|text| decode_base64(text).map(|bytes| BASE64.encode(bytes)))
+            .collect::<Result<Vec<_>, _>>()?;
         let repr = values.join(", ");
         // The binary form names the set type, with the service's
         // own missing space before 'of' ("...]of type BS...") --
