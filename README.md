@@ -314,6 +314,13 @@ to crates.io.
   past its time-to-live is still returned (TTL never deletes it); `ItemCount`
   and `TableSizeBytes` stay `0`; and stream records are never trimmed.
 
+The SigV4 key-derivation code in `extenddb-auth` compiles into this build, but
+the adapter never calls it: it builds no credential store and verifies no
+signature. If that code were called on `wasm32`, its HMAC-SHA256 (the RustCrypto
+`hmac` 0.12 crate over `sha2` 0.10, which have no zeroize support) leaves the
+zero-padded key block and the key-derived SHA-256 states in memory unwiped,
+where the server's AWS-LC backend wipes its HMAC context.
+
 ### What it refuses
 
 Operations that need a facility the in-browser build lacks return a

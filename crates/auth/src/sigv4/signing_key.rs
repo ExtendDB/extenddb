@@ -16,11 +16,18 @@ use zeroize::Zeroizing;
 /// Derive the `SigV4` signing key of `secret` into `out`.
 ///
 /// The prefixed secret and the three intermediate keys live in `Zeroizing`
-/// buffers and are wiped before this returns, so the only copy of key
-/// material left behind is in `out`. The caller passes a slot of the locked
-/// key store, or a `Zeroizing` buffer. (The 32-byte array that
-/// `extenddb_core::crypto::hmac_sha256` returns for each step, and the tag its
-/// backend computes, are stack values this function cannot wipe.)
+/// buffers and are wiped before this returns. The caller passes `out` as a
+/// slot of the locked key store, or a `Zeroizing` buffer. Copies of key
+/// material this function cannot wipe are also left behind:
+///
+/// - the 32-byte array that `extenddb_core::crypto::hmac_sha256` returns for
+///   each step, and the tag its backend computes, on the stack;
+/// - on `wasm32` only, the HMAC state of each step. That backend is the
+///   RustCrypto `hmac` 0.12 crate over `sha2` 0.10, which has no zeroize
+///   support and does not wipe on drop, so the zero-padded key block and the
+///   inner and outer SHA-256 states derived from each step's key stay in
+///   memory after the call returns. The native backend, AWS-LC, wipes its
+///   HMAC context when it drops.
 ///
 /// # Arguments
 /// * `secret` - The plaintext secret access key.
@@ -71,8 +78,9 @@ pub fn compute_signature(signing_key: &[u8; 32], string_to_sign: &str) -> String
 
 fn hmac_sha256(key: &[u8], data: &[u8], out: &mut [u8; 32]) {
     // HMAC-SHA256 accepts a key of any length (RFC 2104). The shared crypto
-    // module chooses the backend (AWS-LC on the server, pure-Rust on wasm) and
-    // owns any key cleansing its backend performs.
+    // module chooses the backend (AWS-LC on the server, pure-Rust on wasm);
+    // which of them wipes its key-derived state is listed on
+    // `derive_signing_key_into`.
     out.copy_from_slice(&extenddb_core::crypto::hmac_sha256(key, data));
 }
 
