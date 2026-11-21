@@ -142,6 +142,7 @@ pub(crate) fn check_table_name_chars(
             // service refuses U+0000 in either (measured 2026-11-06).
             with_str(input, "ExclusiveStartStreamArn", arn_gate::check_stream_arn)
         }
+        _ if has_no_table_member(operation) => Ok(()),
         "Query" | "Scan" | "SearchVectors" => {
             check_name(input.get("TableName"), "tableName", operation, account_id)?;
             match input.get("IndexName").and_then(Value::as_str) {
@@ -165,6 +166,21 @@ fn with_str(
         Some(s) if !s.is_empty() => check(s),
         _ => Ok(()),
     }
+}
+
+/// True for an operation whose request has no member that holds a table name
+/// or ARN. The service ignores a `TableName` sent to one of them (measured
+/// 2026-11-21).
+pub(crate) fn has_no_table_member(operation: &str) -> bool {
+    matches!(
+        operation,
+        "DescribeLimits"
+            | "DescribeEndpoints"
+            | "GetRecords"
+            | "ExecuteStatement"
+            | "BatchExecuteStatement"
+            | "ExecuteTransaction"
+    )
 }
 
 fn pattern_clause() -> String {
@@ -538,6 +554,40 @@ mod tests {
         }
         assert!(message("ListStreams", json!({ "TableName": "t367name" })).is_none());
         assert!(message("ListStreams", json!({})).is_none());
+    }
+
+    #[test]
+    fn a_table_name_is_ignored_where_the_request_has_no_table_member() {
+        let own = "arn:aws:dynamodb:us-east-1:123456789012:table/";
+        let names = [
+            own.to_owned(),
+            format!("{own}a b"),
+            format!("{own}ab"),
+            "a*".to_owned(),
+            "ab".to_owned(),
+            "t\u{0}x".to_owned(),
+            format!("{own}t\u{0}x"),
+            "x".repeat(256),
+            "arn:aws:dynamodb:us-east-1:111122223333:table/abc".to_owned(),
+        ];
+        for op in [
+            "DescribeLimits",
+            "DescribeEndpoints",
+            "ExecuteStatement",
+            "BatchExecuteStatement",
+            "ExecuteTransaction",
+            "GetRecords",
+        ] {
+            for name in &names {
+                let input = json!({ "TableName": name });
+                assert_eq!(message(op, input.clone()), None, "{op} {name:?}");
+                assert_eq!(
+                    crate::authz_resource::cross_account::find(op, &input, "123456789012"),
+                    None,
+                    "{op} {name:?}"
+                );
+            }
+        }
     }
 
     /// Measured 2026-11-07: 1, 2 and 256 characters get the sentence, alone

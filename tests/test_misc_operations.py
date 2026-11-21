@@ -4,16 +4,20 @@
 """Tests for operations with zero prior coverage.
 
 Covers: TagResource, UntagResource, ListTagsOfResource,
-        DescribeEndpoints, DescribeLimits.
+        DescribeEndpoints, DescribeLimits, and a TableName sent to an
+        operation whose request has no table member.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import uuid
 
+import boto3
 import pytest
 from botocore.exceptions import ClientError
-from conftest import wait_for_active, wait_for_deleted
+from conftest import scoped_table, wait_for_active, wait_for_deleted
 @pytest.fixture()
 def tagged_table(dynamodb_client):
     """Create a table for tagging tests, yield (table_name, table_arn), cleanup."""
@@ -178,3 +182,95 @@ class TestDescribeLimits:
         assert resp["AccountMaxWriteCapacityUnits"] > 0
         assert resp["TableMaxReadCapacityUnits"] > 0
         assert resp["TableMaxWriteCapacityUnits"] > 0
+
+
+# The operations whose request has no member that holds a table name or ARN,
+# with the client, method and members each request needs. The statements read
+# a table that does not exist and the iterator is not valid, so no request
+# changes anything.
+_SELECT = f"SELECT * FROM \"extenddb-missing-{uuid.uuid4().hex[:8]}\" WHERE pk = 'a'"
+NO_TABLE_MEMBER = {
+    "DescribeLimits": ("dynamodb", "describe_limits", {}),
+    "DescribeEndpoints": ("dynamodb", "describe_endpoints", {}),
+    "ExecuteStatement": ("dynamodb", "execute_statement", {"Statement": _SELECT}),
+    "BatchExecuteStatement": (
+        "dynamodb",
+        "batch_execute_statement",
+        {"Statements": [{"Statement": _SELECT}]},
+    ),
+    "ExecuteTransaction": (
+        "dynamodb",
+        "execute_transaction",
+        {"TransactStatements": [{"Statement": _SELECT}]},
+    ),
+    "GetRecords": ("dynamodbstreams", "get_records", {"ShardIterator": "x" * 8}),
+}
+# The TableName values sent to each; {own} is the caller's account.
+STRAY_TABLE_NAMES = [
+    "arn:aws:dynamodb:{region}:{own}:table/",
+    "arn:aws:dynamodb:{region}:{own}:table/a b",
+    "arn:aws:dynamodb:{region}:{own}:table/ab",
+    "a*",
+    "ab",
+    "t\u0000x",
+    "arn:aws:dynamodb:{region}:{own}:table/t\u0000x",
+    "x" * 256,
+    "arn:aws:dynamodb:{region}:111122223333:table/abc",
+]
+
+
+@pytest.fixture(scope="module")
+def streams_client(endpoint_url):
+    kwargs: dict = {
+        "service_name": "dynamodbstreams",
+        "region_name": os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+    }
+    if endpoint_url:
+        kwargs["endpoint_url"] = endpoint_url
+        if endpoint_url.startswith("https://"):
+            kwargs["verify"] = False
+    return boto3.client(**kwargs)
+
+
+def _answer(client, operation, method, members, body):
+    """The status and response of `method` called with `members`, with the
+    request body replaced by `body` before it is signed: botocore drops a
+    member that the operation's model does not name."""
+    payload = json.dumps(body).encode()
+
+    def swap(params, **_kwargs):
+        params["body"] = payload
+
+    event = f"before-call.{client.meta.service_model.service_id.hyphenize()}.{operation}"
+    client.meta.events.register(event, swap, unique_id="stray-table-name")
+    try:
+        response = getattr(client, method)(**members)
+    except ClientError as e:
+        response = e.response
+    finally:
+        client.meta.events.unregister(event, unique_id="stray-table-name")
+    return response.pop("ResponseMetadata")["HTTPStatusCode"], response
+
+
+class TestTableNameWhereTheRequestHasNone:
+    """DynamoDB answers each request as the same request without TableName
+    (measured 2026-11-21 in us-east-1, each request twice)."""
+
+    @pytest.fixture(scope="class")
+    def own_account(self, dynamodb_client):
+        with scoped_table(dynamodb_client) as name:
+            arn = dynamodb_client.describe_table(TableName=name)["Table"]["TableArn"]
+        return arn.split(":")[4]
+
+    @pytest.mark.parametrize("operation", list(NO_TABLE_MEMBER))
+    def test_table_name_is_ignored(
+        self, dynamodb_client, streams_client, own_account, operation
+    ):
+        service, method, members = NO_TABLE_MEMBER[operation]
+        client = streams_client if service == "dynamodbstreams" else dynamodb_client
+        expected = _answer(client, operation, method, members, members)
+        region = dynamodb_client.meta.region_name
+        for template in STRAY_TABLE_NAMES:
+            name = template.format(region=region, own=own_account)
+            body = {**members, "TableName": name}
+            assert _answer(client, operation, method, members, body) == expected, repr(name)
