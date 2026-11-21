@@ -119,7 +119,7 @@ use extenddb_core::types::TableKeyInfo;
 ///
 /// Real `DynamoDB` validates the operation name before checking authentication.
 /// An unknown operation with no auth headers returns `UnknownOperationException`,
-/// not `MissingAuthenticationToken`. [`parse_request`] applies this check, and
+/// not `MissingAuthenticationToken`. `parse_request` applies this check, and
 /// the server calls it before auth.
 #[must_use]
 pub fn is_known_operation(operation: &str) -> bool {
