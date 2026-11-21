@@ -31,6 +31,9 @@ This script fails, with one line per problem, unless all of these hold:
    corpus runs every migration when it creates an engine. The `[lints]` tables of those crates and the
    workspace's `[workspace.lints]` allow none of these lints, and
    .cargo/config.toml passes rustc no flag that allows lints or caps them.
+   SETTING_PROBES lists lint settings in each of these spellings (attribute,
+   inner attribute, cfg_attr, `[lints]` table, rustflags); the functions that
+   read the crates' files must refuse or accept each one as the list says.
 3. In a copy of the working tree (the files git tracks or does not ignore,
    uncommitted edits included), with every probe added to a source file of
    PROBE_CRATE, the clippy step of the workflow fails with clippy's
@@ -605,6 +608,41 @@ def _declared_module(code: str, index: int) -> str | None:
     return match.group(1) if match else None
 
 
+def lint_table_problems(manifest: str, table: dict) -> list[str]:
+    """Problems in one `[lints]` (or `[workspace.lints]`) table of `manifest`."""
+    problems = []
+    for tool, lints in table.items():
+        if not isinstance(lints, dict):
+            continue
+        for name, setting in lints.items():
+            level = setting.get("level") if isinstance(setting, dict) else setting
+            lint = name if tool == "rust" else f"{tool}::{name}"
+            if level in ("allow", "expect") and lint in BLANKET | NEED_REASON:
+                problems.append(
+                    f"{manifest}: [lints] sets {lint} to {level!r},"
+                    " which switches the wasm clippy guard off"
+                )
+    return problems
+
+
+def rustflags_problems(config: str, settings: dict) -> list[str]:
+    """Problems in the rustflags of one cargo configuration file `config`."""
+    problems = []
+    flag_lists = [settings.get("build", {}).get("rustflags")]
+    flag_lists += [
+        t.get("rustflags") for t in settings.get("target", {}).values() if isinstance(t, dict)
+    ]
+    for flags in flag_lists:
+        if isinstance(flags, str):
+            flags = flags.split()
+        if any(re.match(r"(-A|--allow|--cap-lints)", str(flag)) for flag in flags or []):
+            problems.append(
+                f"{config}: rustflags {flags!r} allow lints or cap them, which can"
+                " switch the wasm clippy guard off"
+            )
+    return problems
+
+
 def manifest_problems(crates: dict[str, dict], metadata: dict) -> list[str]:
     problems = []
     root_manifest = Path(metadata["workspace_root"]) / "Cargo.toml"
@@ -615,34 +653,13 @@ def manifest_problems(crates: dict[str, dict], metadata: dict) -> list[str]:
         lints = tomllib.loads(manifest.read_text(encoding="utf-8")).get("lints", {})
         tables.append((manifest, lints))
     for manifest, table in tables:
-        for tool, lints in table.items():
-            if not isinstance(lints, dict):
-                continue
-            for name, setting in lints.items():
-                level = setting.get("level") if isinstance(setting, dict) else setting
-                lint = name if tool == "rust" else f"{tool}::{name}"
-                if level in ("allow", "expect") and lint in BLANKET | NEED_REASON:
-                    problems.append(
-                        f"{manifest.relative_to(ROOT)}: [lints] sets {lint} to {level!r},"
-                        " which switches the wasm clippy guard off"
-                    )
+        problems += lint_table_problems(str(manifest.relative_to(ROOT)), table)
     for name in ("config.toml", "config"):
         config = ROOT / ".cargo" / name
         if not config.is_file():
             continue
         settings = tomllib.loads(config.read_text(encoding="utf-8"))
-        flag_lists = [settings.get("build", {}).get("rustflags")]
-        flag_lists += [
-            t.get("rustflags") for t in settings.get("target", {}).values() if isinstance(t, dict)
-        ]
-        for flags in flag_lists:
-            if isinstance(flags, str):
-                flags = flags.split()
-            if any(re.match(r"(-A|--allow|--cap-lints)", str(flag)) for flag in flags or []):
-                problems.append(
-                    f".cargo/{name}: rustflags {flags!r} allow lints or cap them, which can"
-                    " switch the wasm clippy guard off"
-                )
+        problems += rustflags_problems(f".cargo/{name}", settings)
     return problems
 
 
@@ -661,6 +678,74 @@ def lint_setting_problems(crates: dict[str, dict], metadata: dict) -> tuple[list
         f"lint settings: {files} source files of {len(crates)} crates read;"
         f" {len(used_migration)} migration code-body modules allow clippy::all;"
         f" {reasoned} allows of a disallowed lint, each with a reason"
+    )
+    return problems, summary
+
+
+# ---------------------------------------------------------------- setting probes
+
+_FN = "\nfn f() {}\n"
+_AFN = "\nasync fn f() {}\n"
+_DM = "clippy::disallowed_methods"
+_AHL = "clippy::await_holding_lock"
+
+# Lint settings, each in one of the spellings the scan above reads, that it must
+# refuse (True) or accept (False). A "source" probe is read as a source file of
+# a crate the wasm build compiles, a "lints" probe as a manifest's [lints]
+# table, a "config" probe as .cargo/config.toml, by the functions that read the
+# crates' own files.
+SETTING_PROBES = [
+    ("source", "#[allow(clippy::all)]" + _FN, True),
+    ("source", "#![allow(warnings)]\n", True),
+    ("source", '#[cfg_attr(target_arch = "wasm32", allow(clippy::style))]' + _FN, True),
+    ("source", f"#[allow({_DM})]" + _FN, True),
+    ("source", "#[expect(clippy::disallowed_type)]" + _FN, True),
+    ("source", f'#[allow({_DM}, reason = "only the server calls it")]' + _FN, False),
+    ("source", f'#[allow({_DM}, reason = r#"only the server calls it"#)]' + _FN, False),
+    ("source", f'#[allow({_DM}, reason = "")]' + _FN, True),
+    ("source", f'#[allow({_DM}, reason = " \\t ")]' + _FN, True),
+    ("source", f'#[allow({_DM}, reason = "\\n\\u{{20}}\\\n   ")]' + _FN, True),
+    ("source", f'#[allow({_DM}, reason = r#""#)]' + _FN, True),
+    ("source", "#[allow(clippy::await_holding_lock)]" + _AFN, True),
+    ("source", f'#[allow({_AHL}, reason = "never reached on wasm")]' + _AFN, True),
+    ("source", "#![expect(clippy::await_holding_refcell_ref)]\n", True),
+    ("source", '#[cfg_attr(test, allow(dead_code, clippy::await_holding_lock))]' + _AFN, True),
+    ("source", "#[allow(clippy::suspicious)]" + _AFN, True),
+    ("source", "#[deny(clippy::await_holding_lock)]" + _AFN, False),
+    ("source", "#[allow(dead_code)]" + _FN, False),
+    ("source", '// #[allow(clippy::all)]\nconst S: &str = "#[allow(warnings)]";\n', False),
+    ("lints", '[lints.clippy]\nall = "allow"\n', True),
+    ("lints", '[lints.clippy]\nawait_holding_lock = "allow"\n', True),
+    ("lints", '[lints.clippy]\nawait_holding_refcell_ref = { level = "expect" }\n', True),
+    ("lints", '[lints.clippy]\nsuspicious = "allow"\n', True),
+    ("lints", '[lints.clippy]\nawait_holding_lock = "deny"\n', False),
+    ("config", f'[target.wasm32-unknown-unknown]\nrustflags = ["-A{_AHL}"]\n', True),
+    ("config", '[build]\nrustflags = "--cap-lints warn"\n', True),
+]
+
+
+def setting_probe_problems() -> tuple[list[str], str]:
+    """Problems with SETTING_PROBES: a probe the scan does not refuse, or one it
+    refuses that it must accept."""
+    problems = []
+    for index, (kind, text, refuse) in enumerate(SETTING_PROBES):
+        if kind == "source":
+            found, _ = attribute_problems("crates/probe/src/lib.rs", text, set())
+        elif kind == "lints":
+            found = lint_table_problems("crates/probe/Cargo.toml", tomllib.loads(text)["lints"])
+        else:
+            found = rustflags_problems(".cargo/config.toml", tomllib.loads(text))
+        if refuse and not found:
+            problems.append(f"lint-setting probe {index} ({kind}) was not refused: {text!r}")
+        elif found and not refuse:
+            problems.append(
+                f"lint-setting probe {index} ({kind}) was refused, which the scan must"
+                f" accept: {text!r}: {found}"
+            )
+    refused = sum(1 for _, _, refuse in SETTING_PROBES if refuse)
+    summary = (
+        f"lint-setting probes: {len(SETTING_PROBES) - len(problems)} of {len(SETTING_PROBES)}"
+        f" read as expected ({refused} to refuse, {len(SETTING_PROBES) - refused} to accept)"
     )
     return problems, summary
 
@@ -840,6 +925,9 @@ def main() -> int:
     crates = wasm_crates(metadata)
     print(f"crates the wasm build compiles: {', '.join(sorted(crates))}")
     found, settings = lint_setting_problems(crates, metadata)
+    failures += found
+    print(settings)
+    found, settings = setting_probe_problems()
     failures += found
     print(settings)
     found, probes = probe_problems(crates, metadata)
