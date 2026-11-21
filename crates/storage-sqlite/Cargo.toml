@@ -66,7 +66,8 @@ libsqlite3-sys = { workspace = true }
 libc = { workspace = true }
 # The workspace `full` tokio feature pulls in `mio` (networking), which has no
 # wasm32 target. Native keeps the workspace `full` set; the wasm build below
-# takes only the runtime/sync/time/macros API the in-scope data plane uses.
+# takes only the runtime/sync/time/macros API, which the crate's wasm32 code
+# uses (for example tasks, mutexes, semaphores, timers and select!).
 tokio = { workspace = true, features = ["sync"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

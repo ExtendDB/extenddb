@@ -51,7 +51,7 @@ zeroize = { workspace = true }
 # Native keeps the full tokio feature set from the workspace. The workspace
 # `full` feature pulls in mio (networking), which has no wasm32 target, so the
 # wasm build takes only the runtime/sync/time/macros surface the storage code
-# links (semaphores, mutexes, timers, spawn/spawn_blocking, select!/join!).
+# links (semaphores, timers and timeouts, spawn_blocking, select!).
 # None of it runs for the control-plane work reached in the browser, but it
 # must link. The native entry keeps the workspace feature set.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

@@ -60,11 +60,11 @@ tokio-util = { workspace = true, features = ["rt", "io", "io-util"] }
 bytes = { workspace = true }
 
 # The workspace `full` tokio feature pulls in `mio` (networking), which has no
-# wasm32 target. The wasm-reachable engine surface (dispatch, the data-plane
-# and stream handlers) uses only the runtime/sync/time/macros API. Target-scoped
-# and additive; native keeps the workspace `full` set above.
+# wasm32 target. The engine's own wasm32 code names one tokio item,
+# `tokio::spawn` (the TTL backfill in src/ttl.rs), which needs `rt`.
+# Target-scoped and additive; native keeps the workspace `full` set above.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-tokio = { version = "1", default-features = false, features = ["rt", "sync", "time", "macros"] }
+tokio = { version = "1", default-features = false, features = ["rt"] }
 
 [dev-dependencies]
 # `start_paused` for the tests of timers that must not depend on the wall clock.
