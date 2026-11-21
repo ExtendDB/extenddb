@@ -408,12 +408,17 @@ finish_if_only_wasm_suites_left() {
 # `node-version:` value). When rustup is installed the toolchain is found
 # through rustup's proxies even when another cargo comes first on PATH, and a
 # missing one fails the suite with the command that installs it; without
-# rustup the cargo on PATH runs and the suite says so. Besides the
-# toolchain's tools and the Node link below, nothing moves ahead of the
-# caller's PATH: wasm-pack, wasm-bindgen-test-runner and the other tools a
-# suite starts are the caller's. A suite that runs Node fails, with an install
-# hint, unless a Node of that major version is on PATH as node, node-<major>
-# or node<major>. Each suite prints what it used.
+# rustup the cargo on PATH runs and the suite says so. run-tests puts only the
+# toolchain's tools and the Node link below ahead of the caller's PATH; it
+# starts wasm-pack and Python by name from the resulting PATH, and gives cargo
+# wasm-bindgen-test-runner by its full path. rustup in turn puts cargo's bin
+# directory ($CARGO_HOME/bin, where rustup and `cargo install` put their
+# programs) first on the PATH of each tool it runs, so cargo, rustc and every
+# program they start (build scripts, the C compiler the cc crate looks up,
+# cargo subcommands, the test runner and the node it starts) look there first.
+# A suite that runs Node fails, with an install hint, unless a Node of that
+# major version is on PATH as node, node-<major> or node<major>. Each suite
+# prints what it used.
 wasm_workflow_toolchain() {
     sed -n 's/^[[:space:]]*toolchain:[[:space:]]*"\{0,1\}\([^"#[:space:]]*\)"\{0,1\}.*/\1/p' \
         .github/workflows/wasm.yml | head -n 1
@@ -466,9 +471,9 @@ wasm_select_toolchain() {
         # toolchain RUSTUP_TOOLCHAIN names, so a directory of links to it, one
         # per tool of the toolchain, put first on PATH makes each cargo and
         # rustc that this script, the self-test or wasm-pack start by name the
-        # workflow's. rustup's own directory, usually cargo's bin directory,
-        # where `cargo install` puts wasm-pack and wasm-bindgen-test-runner,
-        # keeps its place on the caller's PATH.
+        # workflow's. The caller's PATH follows the links unchanged; rustup
+        # adds cargo's bin directory ahead of both for the tools it runs (see
+        # the section comment above).
         WASM_TOOLCHAIN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/run-tests-toolchain.XXXXXX")"
         for tool in cargo rustc rustdoc cargo-clippy clippy-driver rustfmt cargo-fmt; do
             ln -s "$rustup" "$WASM_TOOLCHAIN_DIR/$tool"
