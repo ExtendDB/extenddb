@@ -101,6 +101,10 @@ fails, with one line per problem, unless all of these hold:
    compiler messages that the function counting those refusals must count,
    or not count, as refusing a probe, as the list says; a report at the
    warning level must not count.
+4. ZEROIZE_CRATES lists the crates of the wasm32 AES-256-GCM stack whose
+   `zeroize` feature must be on in the adapter's wasm32 build. In the copy,
+   with each of them in turn without that feature in crates/core/Cargo.toml,
+   the check of those features must report that crate and no other.
 
 The clippy step runs in the working tree and in the copy with the caller's
 clippy.toml and the caller's cargo target directory, so cargo reuses what the
@@ -1584,6 +1588,92 @@ def _stop(signum: int, _frame) -> None:
     raise SystemExit(128 + signum)
 
 
+# ---------------------------------------------------------------- zeroize features
+
+# The crates of the wasm32 AES-256-GCM stack whose `zeroize` feature must be on
+# in the adapter's wasm32 build: each wipes its own key material, and only under
+# that feature, and none of them has an item, such as a ZeroizeOnDrop
+# implementation, that a compile-time bound could require. CORE_MANIFEST's
+# wasm32 dependencies turn each one on.
+ZEROIZE_CRATES = ("aes-gcm", "ghash", "polyval")
+CORE_MANIFEST = "crates/core/Cargo.toml"
+
+
+def zeroize_problems(features: dict[str, set[str]]) -> list[str]:
+    """Problems with the `zeroize` features of ZEROIZE_CRATES among the
+    resolved `features` of the adapter's wasm32 build. This function looks
+    for none."""
+    del features
+    return []
+
+
+def resolved_features(tree: Path, locked: bool) -> tuple[dict[str, set[str]], list[str]]:
+    """The features cargo resolves for each package of the adapter's wasm32
+    build, by name, in the tree at `tree`, and the problems found. `cargo tree
+    -e normal` resolves them for the adapter and its normal dependencies on
+    that target, as its build does. A tree whose manifests changed is resolved
+    offline, without --locked, so that cargo may rewrite its Cargo.lock."""
+    command = ["cargo", "tree", "-p", ADAPTER, "--target", TARGET, "-e", "normal"]
+    command += ["--prefix", "none", "--format", "{p}|{f}"]
+    command.append("--locked" if locked else "--offline")
+    try:
+        run = subprocess.run(command, cwd=tree, capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        sys.exit("error: cargo is not on PATH")
+    if run.returncode != 0:
+        return {}, [f"{' '.join(command)} failed in {tree}:\n{run.stderr}"]
+    features = {}
+    for line in run.stdout.splitlines():
+        package, _, enabled = line.removesuffix(" (*)").partition("|")
+        name = package.split(" ")[0]
+        features.setdefault(name, set()).update(enabled.split(",") if enabled else ())
+    return features, []
+
+
+def zeroize_probe_problems(copy: Path) -> tuple[list[str], str]:
+    """Problems with the zeroize check: in the copy of the tree at `copy`, with
+    each crate of ZEROIZE_CRATES in turn without its `zeroize` feature in
+    CORE_MANIFEST, the check must report that crate, and no other."""
+    manifest = copy / CORE_MANIFEST
+    lock = copy / "Cargo.lock"
+    original, original_lock = manifest.read_text(encoding="utf-8"), lock.read_bytes()
+    problems, reported = [], 0
+    try:
+        for crate in ZEROIZE_CRATES:
+            entry = re.compile(
+                rf'^(\s*{re.escape(crate)}\s*=\s*{{[^\n]*?features\s*=\s*\[)([^\]\n]*)\]', re.M
+            )
+            match = entry.search(original)
+            listed = [f.strip() for f in match.group(2).split(",")] if match else []
+            if '"zeroize"' not in listed:
+                problems.append(
+                    f"zeroize probe: {CORE_MANIFEST} has no `{crate} = {{ ... features = [...,"
+                    ' "zeroize"] }` entry to remove the feature from'
+                )
+                continue
+            kept = ", ".join(f for f in listed if f and f != '"zeroize"')
+            manifest.write_text(
+                original[: match.start(2)] + kept + original[match.end(2) :], encoding="utf-8"
+            )
+            features, found = resolved_features(copy, locked=False)
+            found += zeroize_problems(features)
+            if any(p.startswith(f"{crate}:") for p in found) and all(
+                p.startswith(f"{crate}:") for p in found
+            ):
+                reported += 1
+            else:
+                problems.append(
+                    f"zeroize probe: without {crate}'s zeroize feature in {CORE_MANIFEST},"
+                    f" the check reported {found or 'nothing'}"
+                )
+            manifest.write_text(original, encoding="utf-8")
+            lock.write_bytes(original_lock)
+    finally:
+        manifest.write_text(original, encoding="utf-8")
+        lock.write_bytes(original_lock)
+    return problems, f"zeroize probes: {reported} of {len(ZEROIZE_CRATES)} removals reported"
+
+
 def main() -> int:
     # Line-buffered, so the FAIL lines on stderr keep their place among these
     # lines when both streams go to one log.
@@ -1621,6 +1711,9 @@ def main() -> int:
         print(settings)
         found, probes = probe_problems(crates, metadata, copy, files)
         failures += found
+        found, settings = zeroize_probe_problems(copy)
+        failures += found
+        print(settings)
     finally:
         shutil.rmtree(copy, ignore_errors=True)
     for failure in failures:
