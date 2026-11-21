@@ -11,16 +11,19 @@ number literal that breaks an item number rule, `?` with no parameter left in
 the request, or refusal it meets on that walk, ahead of the operator count.
 An alias on the table and a table name outside the name rule come before all
 of those, then an alias in the select list, an UPDATE of an index and a LIMIT
-clause. In ExecuteStatement an EXISTS statement comes before the name rule.
+clause. In ExecuteStatement and BatchExecuteStatement an EXISTS statement
+comes before all of those, and before the checks made once it parses, unless
+it has a syntax error; a parameter refused for its content comes first.
 The SET clause of an UPDATE, and parameters beyond the ones the statement
 reads, come after the operator count; in the clause a number comes before a
-unary plus. ExecuteStatement, BatchExecuteStatement and ExecuteTransaction
-keep the same order.
+unary plus. Apart from EXISTS, ExecuteStatement, BatchExecuteStatement and
+ExecuteTransaction keep the same order.
 
 Dual-target: EXTENDDB_TEST_ENDPOINT selects an extenddb server; unset, the
 tests run against the live service with the default credential chain. The
 assertions are identical on both. Every expected value was measured on the
-service (2026-11-02).
+service (2026-11-02, and the EXISTS statements on 2026-11-13, 2026-11-14 and
+2026-11-18).
 """
 
 from __future__ import annotations
@@ -243,11 +246,86 @@ def test_the_table_name_rule_comes_before_a_select_list_alias_and_an_update_of_a
     assert _message(dynamodb_client, statement) == NAME_RULE
 
 
+EXISTS = "EXISTS can only be used in ExecuteTransaction write requests."
+SYNTAX = "Statement wasn't well formed, can't be processed: Unexpected term"
+
+
 def test_exists_in_execute_statement_comes_before_the_table_name_rule(dynamodb_client):
     statement = "EXISTS(SELECT * FROM \"tt\" WHERE pk = 'a' AND b = 1 + 1)"
-    assert _message(dynamodb_client, statement) == (
-        "EXISTS can only be used in ExecuteTransaction write requests."
+    assert _message(dynamodb_client, statement) == EXISTS
+
+
+# Each statement, "{t}" standing for the table, the Parameters it is sent
+# with, and the message ExecuteStatement and BatchExecuteStatement answer.
+EXISTS_STATEMENTS = [
+    ('EXISTS(SELECT * FROM "{t}" AS x WHERE pk = 1)', None, EXISTS),
+    ('EXISTS(SELECT * FROM "{t}" WHERE attribute_exists(1))', None, EXISTS),
+    ('EXISTS(SELECT * FROM "{t}"."" WHERE pk = 1)', None, EXISTS),
+    ('EXISTS(SELECT * FROM "{t}"."i"."x" WHERE pk = 1)', None, EXISTS),
+    ('EXISTS(SELECT * FROM "{t}" WHERE pk = ?)', None, EXISTS),
+    ('EXISTS(SELECT * FROM "{t}" WHERE pk = ? AND foo(1))', None, EXISTS),
+    ('EXISTS(SELECT * FROM "{t}" WHERE foo(1) AND pk = ?)', None, EXISTS),
+    ('EXISTS(SELECT * FROM "{t}" WHERE pk = 1 AND s < true)', None, EXISTS),
+    ('EXISTS(SELECT * FROM "{t}" WHERE pk = 1 AND x = 99e999)', None, EXISTS),
+    ('EXISTS(SELECT * FROM "{t}" WHERE pk = <<>>)', None, EXISTS),
+    ('EXISTS(SELECT * FROM "{t}" WHERE x = [?])', None, EXISTS),
+    ('EXISTS(SELECT * FROM "{t}" WHERE l[99999999999] = 1)', None, EXISTS),
+    ('EXISTS(SELECT * FROM "{t}" WHERE pk = )', None, SYNTAX),
+    ('EXISTS(SELECT * FROM "{t}" WHERE attribute_exists(1) AND pk = )', None, SYNTAX),
+    ('EXISTS(SELECT * FROM "{t}" AS x WHERE pk = )', None, SYNTAX),
+    (
+        'EXISTS(SELECT * FROM "{t}" WHERE pk = ?)',
+        [{"S": "a", "N": "1"}],
+        "Supplied AttributeValue has more than one datatypes set, must contain exactly one "
+        "of the supported datatypes",
+    ),
+    ('EXISTS(SELECT * FROM "{t}" WHERE pk = 1)', [{"S": "a"}], EXISTS),
+    ('EXISTS(SELECT * FROM "{t}-missing" WHERE pk = 1)', None, EXISTS),
+]
+
+
+@pytest.mark.parametrize("operation", ["ExecuteStatement", "BatchExecuteStatement"])
+@pytest.mark.parametrize(
+    "statement, parameters, message",
+    EXISTS_STATEMENTS,
+    ids=[
+        "alias", "attribute-exists-operand", "empty-from-component", "three-from-components",
+        "missing-parameter", "missing-parameter-then-function", "function-then-parameter",
+        "operand-type", "overflow", "empty-bag", "parameter-in-a-list", "list-index",
+        "syntax-error", "operand-then-syntax-error", "alias-then-syntax-error",
+        "parameter-with-two-types", "one-parameter-more", "missing-table",
+    ],
+)
+def test_exists_outside_a_transaction_comes_before_its_other_faults(
+    dynamodb_client_no_validation, table, operation, statement, parameters, message
+):
+    # (measured 2026-11-13 and 2026-11-14 down to "syntax-error", 2026-11-18
+    # for the others)
+    sql = statement.format(t=table)
+    extra = {} if parameters is None else {"Parameters": parameters}
+    if operation == "ExecuteStatement":
+        assert _message(dynamodb_client_no_validation, sql, **extra) == message
+    else:
+        response = dynamodb_client_no_validation.batch_execute_statement(
+            Statements=[{"Statement": sql, **extra}]
+        )
+        assert response["Responses"] == [
+            {"Error": {"Code": "ValidationError", "Message": message}}
+        ]
+
+
+def test_a_select_beside_an_exists_in_a_batch_runs(dynamodb_client, table):
+    # (measured 2026-11-18)
+    response = dynamodb_client.batch_execute_statement(
+        Statements=[
+            {"Statement": f'EXISTS(SELECT * FROM "{table}" WHERE pk = 1)'},
+            {"Statement": f"SELECT * FROM \"{table}\" WHERE pk = 'a'"},
+        ]
     )
+    assert response["Responses"] == [
+        {"Error": {"Code": "ValidationError", "Message": EXISTS}},
+        {"TableName": table},
+    ]
 
 
 def test_a_select_list_call_comes_before_an_in_with_no_list(dynamodb_client, table):

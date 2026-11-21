@@ -32,7 +32,7 @@ use serde_json::{Map, Value, json};
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::partiql::Statement;
 use extenddb_core::partiql::ast::{FromSource, Projection, SelectStatement};
-use extenddb_core::partiql::parser::parse_for_request;
+use extenddb_core::partiql::parser::parse_for_execute_statement;
 use extenddb_core::types::{Item, TableKeyInfo, item_size_bytes};
 use extenddb_storage::error::StorageError;
 
@@ -89,7 +89,9 @@ pub(super) async fn run(
     // twice or a null member, a NULL that is not true, an attribute value
     // with no type or two, a null member of a map or a list). The JSON types
     // were checked above, so these are the only parameter errors left, and
-    // `from_body` reads the parameters that pass them.
+    // `from_body` reads the parameters that pass them. An EXISTS statement
+    // is refused by the parse, as in ExecuteStatement, and counts as neither
+    // a read nor a write: a SELECT beside it runs (measured 2026-11-18).
     let mut checked_all = Vec::with_capacity(statements.len());
     for obj in statements {
         let parameters = super::check_parameters(obj.get("Parameters"));
@@ -101,7 +103,8 @@ pub(super) async fn run(
             Err(super::request_checks::EMPTY_BATCH_STATEMENT.to_owned())
         } else {
             parameters.and_then(|()| {
-                parse_for_request(&req.statement, req.parameters.len()).map_err(|e| e.message)
+                parse_for_execute_statement(&req.statement, req.parameters.len())
+                    .map_err(|e| e.message)
             })
         };
         let projected_call = match &statement {
@@ -133,7 +136,7 @@ pub(super) async fn run(
     let tables: Vec<&str> = checked_all
         .iter()
         .filter_map(|(_, checked, projected)| match (checked, projected) {
-            (Ok(Statement::Exists(_)), _) | (Err(_), None) => None,
+            (Err(_), None) => None,
             (Ok(stmt), _) => Some(common::statement_table(stmt)),
             (Err(_), Some(from)) => Some(from.table.as_str()),
         })
@@ -147,13 +150,6 @@ pub(super) async fn run(
             (checked, _) => checked,
         };
         match checked {
-            // A condition check belongs to a transaction: in a batch it is a
-            // per-statement refusal and counts as neither a read nor a write.
-            Ok(Statement::Exists(_)) => parsed.push(Parsed {
-                req,
-                stmt: None,
-                parse_err: Some(write::exists_outside_transaction().message().to_owned()),
-            }),
             Ok(stmt) => parsed.push(Parsed {
                 req,
                 stmt: Some(stmt),

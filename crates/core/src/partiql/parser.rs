@@ -83,7 +83,8 @@ const IS_LEFT_SIDE: &str =
     "The left hand side argument to IS must be a Variable Reference, Literal, or Path";
 
 /// The refusal of a condition check outside an ExecuteTransaction: a bare
-/// expression statement, and `EXISTS(SELECT ...)` in ExecuteStatement.
+/// expression statement, and `EXISTS(SELECT ...)` in ExecuteStatement and
+/// BatchExecuteStatement.
 pub const EXISTS_OUTSIDE_TRANSACTION: &str =
     "EXISTS can only be used in ExecuteTransaction write requests.";
 
@@ -136,10 +137,10 @@ pub fn parse_for_request(input: &str, parameters: usize) -> PResult<Statement> {
     limits::parse_on_a_fitting_stack(|inline| parse_attempt(input, Some(parameters), false, inline))
 }
 
-/// [`parse_for_request`] for an ExecuteStatement request, which refuses an
-/// `EXISTS(SELECT ...)` statement ahead of the table name rule and of the
-/// walk of its condition (measured 2026-11-02 with a table name of two
-/// characters and a `+` in the condition).
+/// [`parse_for_request`] for an ExecuteStatement request and for each
+/// statement of a BatchExecuteStatement request. Both refuse an
+/// `EXISTS(SELECT ...)` statement with no syntax error ahead of its other
+/// refusals. [`walk`] gives the order and its measurements.
 ///
 /// # Errors
 ///
@@ -174,7 +175,7 @@ fn parse_attempt(
         pos: 0,
         next_param: 0,
         parameters,
-        refuse_exists,
+        refuse_exists: false,
         found: Findings::default(),
         select_list_call: None,
         table: None,
@@ -189,6 +190,7 @@ fn parse_attempt(
         brackets: Brackets::Refused,
         bracket_groups: None,
     };
+    p.refuse_exists = refuse_exists && p.at_exists_statement();
 
     // A number literal that cannot be converted fails the whole statement
     // before parsing starts.
@@ -219,7 +221,8 @@ struct Parser {
     /// How many parameters the request gives, when the statement is parsed
     /// for a request.
     parameters: Option<usize>,
-    /// Whether an `EXISTS(SELECT ...)` statement is refused (ExecuteStatement).
+    /// Whether the statement is an `EXISTS(SELECT ...)` that the request
+    /// refuses (ExecuteStatement and BatchExecuteStatement).
     refuse_exists: bool,
     /// The refusals found in a statement that is still being read (an alias,
     /// a refused `FROM` path). They are reported only once the statement
