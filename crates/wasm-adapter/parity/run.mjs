@@ -28,8 +28,9 @@
 //
 // After the corpus, this runner also checks what only a JavaScript caller can
 // do: it calls `submit` with arguments that are not strings and expects a
-// ValidationException for each, and calls it after `free()` and on objects
-// that are not instances and expects a synchronous exception for each.
+// ValidationException for each, and the instance to keep serving. It makes no
+// call on an object that is not a live instance: `submit` is defined only on an
+// object `ExtendDb.create()` returned and that has not been freed.
 //
 // The corpus and the self-test rows are read with `parseJson` below rather
 // than `JSON.parse`, so that this runner sees each number as written (`1.0`
@@ -756,38 +757,13 @@ for (const [label, args, argument] of badArguments) {
     if (why !== undefined) fail(`submit with ${label}: ${why}`);
 }
 
-// ---- calls that throw before a promise exists ------------------------------
-// `submit` throws synchronously when it cannot start: called after `free()` or
-// on an object that is not an instance. The instance under test keeps serving.
-
-const spare = await mod.ExtendDb.create();
-spare.free();
-const throwingCalls = [
-    ['after free()', () => spare.submit('ListTables', '{}'), Error, 'null pointer passed to rust'],
-    ['on an object that is not an instance', () => mod.ExtendDb.prototype.submit.call({}, 'ListTables', '{}'),
-        Error, 'null pointer passed to rust'],
-    ['with a null receiver', () => mod.ExtendDb.prototype.submit.call(null, 'ListTables', '{}'), TypeError, undefined],
-];
-for (const [label, call, type, message] of throwingCalls) {
-    extraChecks += 1;
-    let threw;
-    try {
-        call();
-    } catch (e) {
-        threw = e;
-    }
-    if (!(threw instanceof type) || (message !== undefined && threw.message !== message)) {
-        const got = threw === undefined ? 'no exception' : `${threw.name}: ${threw.message}`;
-        fail(`submit ${label}: expected a synchronous ${type.name}${message === undefined ? '' : ` "${message}"`}, got ${got}`);
-    }
-}
 extraChecks += 1;
 try {
     const after = JSON.parse(await db.submit('ListTables', '{}'));
     const why = judge({ error: null, checks: [{ path: '/TableNames', kind: 'present', value: true }] }, after);
-    if (why !== undefined) fail(`ListTables after the bad calls: ${why}`);
+    if (why !== undefined) fail(`ListTables after the arguments that are not strings: ${why}`);
 } catch (e) {
-    fail(`ListTables after the bad calls: threw ${e.name}: ${e.message}`);
+    fail(`ListTables after the arguments that are not strings: threw ${e.name}: ${e.message}`);
 }
 
 // ---- summary ---------------------------------------------------------------

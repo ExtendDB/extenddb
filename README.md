@@ -397,14 +397,19 @@ request that panicked stays pending. The instance is then in an undefined
 state (a later call may answer, fail or hang), so reload the page to get a
 fresh one.
 
-A `submit` promise never rejects. On a live instance it resolves with the
-response to every request that does not trap, including the
-`ValidationException` for an argument that is not a string. `submit` itself
-throws, synchronously and before any promise exists, in two cases: when it is
-called after `free()` or on an object that is not an instance (`Error: null
-pointer passed to rust`, or a `TypeError` for a `null` or `undefined`
-receiver), and when the module cannot allocate the copy of an argument in its
-linear memory (`RuntimeError: unreachable` in a release build).
+Call `submit` only on an object that `ExtendDb.create()` returned and that has
+not been freed. On such an instance a `submit` promise never rejects: it
+resolves with the response to every request that does not trap, including the
+`ValidationException` for an argument that is not a string. A trap before
+`submit` returns its promise throws out of `submit` itself: when the module
+cannot allocate the copy of an argument in its linear memory, a release build
+traps there, and the call throws `RuntimeError: unreachable`. The generated
+JavaScript passes the receiver's `__wbg_ptr` to the module, which checks only
+that it is not null, so a call on anything else is undefined: it can throw (an
+instance after `free()`, and an object made with `new ExtendDb()`, throw
+`Error: null pointer passed to rust`), trap, or read another instance's memory
+(an object that carries a live instance's `__wbg_ptr`, such as `{...db}`,
+answers from that instance's database).
 
 ### Checks the server makes that this build does not
 

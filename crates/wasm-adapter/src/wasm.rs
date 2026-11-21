@@ -68,13 +68,20 @@ impl ExtendDb {
     /// encoded to UTF-8 by the generated JavaScript glue's `TextEncoder`, which
     /// replaces an unpaired surrogate with U+FFFD.
     ///
-    /// `submit` itself throws, synchronously and before any promise exists,
-    /// when it cannot start: called after `free()` or on an object that is not
-    /// an instance, it throws `Error: null pointer passed to rust` (or a
-    /// `TypeError` when the receiver is `null` or `undefined`); and when the
-    /// module cannot allocate the copy of an argument in its linear memory, a
-    /// release build traps and the call throws `RuntimeError: unreachable` (a
-    /// debug build throws `Error: invalid malloc request`).
+    /// Call `submit` only on an object that [`ExtendDb::create`] returned and
+    /// that has not been freed. The generated JavaScript passes the receiver's
+    /// `__wbg_ptr` to the module, which checks only that it is not null, so a
+    /// call on anything else is undefined: it can throw (an instance after
+    /// `free()`, and an object made with `new ExtendDb()`, throw `Error: null
+    /// pointer passed to rust`), trap, or read another instance's memory (an
+    /// object that carries a live instance's `__wbg_ptr` answers from that
+    /// instance's database).
+    ///
+    /// On an instance, a trap before `submit` returns its promise throws out of
+    /// `submit` itself. When the module cannot allocate the copy of an argument
+    /// in its linear memory, a release build traps there and the call throws
+    /// `RuntimeError: unreachable`; a debug build throws `Error: invalid malloc
+    /// request` instead.
     ///
     /// On `wasm32` a panic cannot unwind: it traps, and the trap throws out of
     /// the task that was running the request, so that request's promise stays
