@@ -34,7 +34,6 @@ crc32fast = { workspace = true }
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
-bytes = { workspace = true }
 futures = { workspace = true }
 # A `std::time` drop-in that re-exports `std::time` on every target except
 # wasm32-unknown-unknown, where it backs the clock with the browser APIs. The stream iterator
@@ -54,6 +53,8 @@ tokio = { workspace = true }
 # `StreamReader` and `SyncIoBridge` for the restore's in-place decode of a
 # store object on the blocking pool.
 tokio-util = { workspace = true, features = ["rt", "io", "io-util"] }
+# The chunks the backup writer hands to the upload (`backup/job/writer.rs`).
+bytes = { workspace = true }
 
 # The workspace `full` tokio feature pulls in `mio` (networking), which has no
 # wasm32 target. The wasm-reachable engine surface (dispatch, the data-plane
