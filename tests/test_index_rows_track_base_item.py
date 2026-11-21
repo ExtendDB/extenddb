@@ -341,11 +341,16 @@ def test_a_delete_racing_a_create_of_the_same_index_row_leaves_the_indexes_agree
     to it lands while the item still exists. Against a transaction the create
     is resent until it succeeds or the delete has answered, with one last
     attempt after the answer, so the rounds reach the create that commits
-    after the delete."""
+    after the delete. A DeleteItem can also answer after a create sent once,
+    in every round of a run on a slow runner, so the DeleteItem form resends
+    the same way in the rounds where the delete is sent first, and sends the
+    create once in the others, so its rounds still include a create refused
+    by the item the delete then removes."""
     disagreements = []
     created = refused = 0
-    resend = delete_with == "TransactWriteItems"
     for n in range(RACE_ROUNDS):
+        # `_race` holds the delete back in odd rounds and the create in even.
+        resend = delete_with == "TransactWriteItems" or n % 2 == 0
         pk = f"same-row-{delete_with}-{n}"
         gk = f"g-{pk}"
         dynamodb_client.put_item(TableName=indexed_table, Item=_item(pk, "1", "same", gk, "v1"))
@@ -408,5 +413,5 @@ def test_a_delete_racing_a_create_of_the_same_index_row_leaves_the_indexes_agree
             disagreements.append((pk, outcome, want_lsi, got_lsi, got_gsi))
     assert not disagreements, f"an index disagrees with the base table: {disagreements}"
     assert created, f"no create landed after the delete in {RACE_ROUNDS} rounds"
-    if not resend:
+    if delete_with == "DeleteItem":
         assert refused, f"no create landed before the delete in {RACE_ROUNDS} rounds"
