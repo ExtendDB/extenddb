@@ -325,6 +325,8 @@ that names the build:
   in memory with no backup store."
 - The PartiQL operations — `ExecuteStatement`, `BatchExecuteStatement`,
   `ExecuteTransaction` — "… the PartiQL surface is not part of the browser build."
+- `DescribeEndpoints` — "… it is called in-process and has no network endpoint
+  to report."
 - An `UpdateTable` that creates a vector index — "… it cannot build a vector
   index; create the table with its vector indexes instead." The refusal lands
   before any catalog write, so the table is unchanged and the instance keeps

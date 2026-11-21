@@ -20,6 +20,8 @@
 //! `cargo clippy --target wasm32-unknown-unknown --all-targets` can build.
 #![cfg(not(target_arch = "wasm32"))]
 
+use std::collections::HashMap;
+
 use serde_json::Value;
 
 /// The shared corpus, embedded so the test is hermetic.
@@ -99,6 +101,48 @@ fn assert_case(name: &str, case: &Value, resp: &Value) {
     }
 }
 
+/// Replace every string in `body` of the form `${name}` with the value an
+/// earlier case saved under `name`, panicking if no case saved it.
+fn substitute(name: &str, body: &mut Value, saved: &HashMap<String, String>) {
+    match body {
+        Value::String(s) => {
+            if let Some(key) = s.strip_prefix("${").and_then(|r| r.strip_suffix('}')) {
+                let value = saved.get(key).unwrap_or_else(|| {
+                    panic!("case '{name}': no earlier case saved a value named {key:?}")
+                });
+                value.clone_into(s);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                substitute(name, item, saved);
+            }
+        }
+        Value::Object(members) => {
+            for member in members.values_mut() {
+                substitute(name, member, saved);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Record the string members a case's `save` names, for later cases' bodies.
+fn save(name: &str, case: &Value, resp: &Value, saved: &mut HashMap<String, String>) {
+    if let Some(members) = case.get("save").and_then(Value::as_object) {
+        for (key, path) in members {
+            let path = path.as_str().expect("save values are JSON Pointers");
+            let value = resp
+                .pointer(path)
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!("case '{name}': save path {path} is not a string in {resp}")
+                });
+            saved.insert(key.clone(), value.to_owned());
+        }
+    }
+}
+
 /// Run the whole corpus through the native engine in order, against one fresh
 /// in-memory database (state carries between cases, as the wasm runner drives
 /// it).
@@ -114,16 +158,21 @@ async fn parity_corpus_passes_on_the_native_build() {
         .await
         .expect("in-memory engine initializes");
 
+    let mut saved = HashMap::new();
     for case in cases {
         let name = case["name"].as_str().unwrap_or("<unnamed>");
         let op = case["op"].as_str().expect("case.op is a string");
-        let body_json = match case.get("rawBody").and_then(Value::as_str) {
-            Some(raw) => raw.to_owned(),
-            None => serde_json::to_string(&case["body"]).expect("case.body serializes"),
+        let body_json = if let Some(raw) = case.get("rawBody").and_then(Value::as_str) {
+            raw.to_owned()
+        } else {
+            let mut body = case["body"].clone();
+            substitute(name, &mut body, &saved);
+            serde_json::to_string(&body).expect("case.body serializes")
         };
         let out = engine.submit(op, &body_json).await;
         let resp: Value = serde_json::from_str(&out)
             .unwrap_or_else(|e| panic!("case '{name}': response is not JSON ({e}): {out}"));
         assert_case(name, case, &resp);
+        save(name, case, &resp, &mut saved);
     }
 }

@@ -24,6 +24,10 @@
     "          {path, equals}, {path, contains} (substring of a string member),",
     "          {path, present:true}, or {path, absent:true}. A JSON Pointer",
     "          addresses the member; N values are strings in the wire shape.",
+    "  save    optional: {name: JSON Pointer}; stores the string at each pointer",
+    "          of the response. A later case's body string \"${name}\" is",
+    "          replaced by the stored value (for ARNs and iterators the engine",
+    "          generates).",
     "Results that DynamoDB does not order (Scan, BatchGetItem) are asserted only",
     "on counts/membership, never on positional value; genuinely ordered results",
     "(Query within a partition or index) are asserted positionally."
@@ -789,7 +793,10 @@
           "path": "/TableDescription/LatestStreamArn",
           "present": true
         }
-      ]
+      ],
+      "save": {
+        "tableArn": "/TableDescription/TableArn"
+      }
     },
     {
       "name": "PutItem Str s1 (writes a stream record)",
@@ -820,7 +827,182 @@
           "path": "/Streams/0/TableName",
           "equals": "Str"
         }
+      ],
+      "save": {
+        "streamArn": "/Streams/0/StreamArn"
+      }
+    },
+    {
+      "name": "DescribeStream describes the table's stream and its shard",
+      "op": "DescribeStream",
+      "body": {
+        "StreamArn": "${streamArn}"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/StreamDescription/TableName",
+          "equals": "Str"
+        },
+        {
+          "path": "/StreamDescription/StreamStatus",
+          "equals": "ENABLED"
+        },
+        {
+          "path": "/StreamDescription/StreamViewType",
+          "equals": "NEW_AND_OLD_IMAGES"
+        },
+        {
+          "path": "/StreamDescription/Shards/0/ShardId",
+          "present": true
+        }
+      ],
+      "save": {
+        "shardId": "/StreamDescription/Shards/0/ShardId"
+      }
+    },
+    {
+      "name": "GetShardIterator from TRIM_HORIZON returns an iterator",
+      "op": "GetShardIterator",
+      "body": {
+        "StreamArn": "${streamArn}",
+        "ShardId": "${shardId}",
+        "ShardIteratorType": "TRIM_HORIZON"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/ShardIterator",
+          "present": true
+        }
+      ],
+      "save": {
+        "shardIterator": "/ShardIterator"
+      }
+    },
+    {
+      "name": "GetRecords returns the one INSERT record of PutItem s1",
+      "op": "GetRecords",
+      "body": {
+        "ShardIterator": "${shardIterator}"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/Records/0/eventName",
+          "equals": "INSERT"
+        },
+        {
+          "path": "/Records/0/dynamodb/Keys/pk/S",
+          "equals": "s1"
+        },
+        {
+          "path": "/Records/0/dynamodb/NewImage/v/N",
+          "equals": "1"
+        },
+        {
+          "path": "/Records/0/dynamodb/OldImage",
+          "absent": true
+        },
+        {
+          "path": "/Records/1",
+          "absent": true
+        },
+        {
+          "path": "/NextShardIterator",
+          "present": true
+        }
       ]
+    },
+    {
+      "name": "TagResource tags table Str with two tags",
+      "op": "TagResource",
+      "body": {
+        "ResourceArn": "${tableArn}",
+        "Tags": [
+          {
+            "Key": "env",
+            "Value": "test"
+          },
+          {
+            "Key": "team",
+            "Value": "db"
+          }
+        ]
+      },
+      "error": null,
+      "checks": []
+    },
+    {
+      "name": "ListTagsOfResource lists both tags",
+      "op": "ListTagsOfResource",
+      "body": {
+        "ResourceArn": "${tableArn}"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/Tags/0/Key",
+          "present": true
+        },
+        {
+          "path": "/Tags/1/Key",
+          "present": true
+        },
+        {
+          "path": "/Tags/2",
+          "absent": true
+        }
+      ]
+    },
+    {
+      "name": "UntagResource removes the env tag",
+      "op": "UntagResource",
+      "body": {
+        "ResourceArn": "${tableArn}",
+        "TagKeys": [
+          "env"
+        ]
+      },
+      "error": null,
+      "checks": []
+    },
+    {
+      "name": "ListTagsOfResource lists only the team tag",
+      "op": "ListTagsOfResource",
+      "body": {
+        "ResourceArn": "${tableArn}"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/Tags/0/Key",
+          "equals": "team"
+        },
+        {
+          "path": "/Tags/0/Value",
+          "equals": "db"
+        },
+        {
+          "path": "/Tags/1",
+          "absent": true
+        }
+      ]
+    },
+    {
+      "name": "TagResource on a missing table is ResourceNotFoundException",
+      "op": "TagResource",
+      "body": {
+        "ResourceArn": "arn:aws:dynamodb:us-east-1:000000000000:table/NoSuchTable",
+        "Tags": [
+          {
+            "Key": "env",
+            "Value": "test"
+          }
+        ]
+      },
+      "error": "ResourceNotFoundException",
+      "checks": []
     },
     {
       "name": "CreateTable Page",
@@ -1922,6 +2104,26 @@
         {
           "path": "/Item/name/S",
           "equals": "Tx1"
+        }
+      ]
+    },
+    {
+      "name": "DescribeEndpoints is refused by the WebAssembly build",
+      "op": "DescribeEndpoints",
+      "body": {},
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "contains": "DescribeEndpoints is not supported by the ExtendDB WebAssembly build"
+        },
+        {
+          "path": "/message",
+          "contains": "no network endpoint"
+        },
+        {
+          "path": "/Endpoints",
+          "absent": true
         }
       ]
     },

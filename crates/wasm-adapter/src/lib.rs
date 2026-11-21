@@ -17,18 +17,25 @@
 //! - `wasm` — the `wasm-bindgen` entry points (`wasm32` only).
 //!
 //! # Scope and limits
-//! The data-plane operations (`CreateTable`, `PutItem`, `GetItem`, Query, Scan,
-//! `UpdateItem`, `DeleteItem`, and the batch, transaction, stream, TTL and tagging
-//! operations) answer end-to-end against an in-memory `SQLite` database (the
-//! synchronous `sqlx`-shaped shim over `sqlite-wasm-rs` on wasm, and `sqlx`
-//! with C `SQLite` natively). The build authenticates no request and authorizes
-//! none; every request runs under a single fixed account.
+//! Requests go to the engine's handlers over an in-memory `SQLite` database
+//! (the synchronous `sqlx`-shaped shim over `sqlite-wasm-rs` on wasm, and
+//! `sqlx` with C `SQLite` natively). The shared parity corpus
+//! (`parity/corpus.json`) runs on both targets. Its successful requests are
+//! `CreateTable`, `DescribeTable`, `DeleteTable`, `PutItem`, `GetItem`,
+//! `UpdateItem`, `DeleteItem`, Query, Scan, `BatchWriteItem`, `BatchGetItem`,
+//! `TransactWriteItems`, `TransactGetItems`, `ListStreams`, `DescribeStream`,
+//! `GetShardIterator`, `GetRecords`, `UpdateTimeToLive`, `DescribeTimeToLive`,
+//! `TagResource`, `ListTagsOfResource`, `UntagResource`, `ListBackups`,
+//! `DescribeContinuousBackups` and `UpdateContinuousBackups`. Other operations
+//! reach the engine's handlers too but have no corpus case.
+//! The build authenticates no request and authorizes none; every request runs
+//! under a single fixed account.
 //!
-//! The operations a browser cannot serve are answered by [`runtime`] itself,
-//! identically on both targets, so the native and wasm builds stay in step:
-//! the backup, restore and point-in-time operations, table import and export,
-//! `PartiQL`, and creating a vector index through `UpdateTable` each return the
-//! answer documented on [`runtime::Engine::submit`].
+//! [`runtime`] refuses, the same way on both targets, the operations a browser
+//! cannot serve: the store-backed backup operations, `PartiQL`,
+//! `DescribeEndpoints`, creating a vector index through `UpdateTable`, and, as
+//! the server does, the point-in-time recovery requests. The module doc of
+//! [`runtime`] lists each answer.
 
 mod runtime;
 

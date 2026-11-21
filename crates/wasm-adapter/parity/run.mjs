@@ -10,18 +10,18 @@
 // primitives compile on wasm but only fail when called, so the engine must
 // actually run.
 //
-// It runs the SAME cases with the SAME expectations as the native oracle test
-// (`../tests/parity.rs`), which drives them through real sqlx + C SQLite. When
-// both pass, each build gave every case the answer the corpus asserts, for the
-// data-plane operations and for the operations the browser build refuses.
+// It runs the same cases with the same assertions as the native test
+// (`../tests/parity.rs`), which drives them through sqlx + C SQLite. When both
+// pass, each build gave every case the error name and the checked members the
+// corpus asserts; members a case does not check are not compared.
 //
 // The module is loaded from `./pkg`, the `wasm-bindgen --target web` output
 // (built by the test harness before this runner is invoked).
 //
 // Node-hosting note: a browser always defines `globalThis.crypto`; Node's ESM
 // scope does not, so Node's Web Crypto is installed before the module loads.
-// That is the only Node-vs-browser difference; the module itself is identical
-// to what a browser loads.
+// The runner adds nothing else to the environment; it loads the same module
+// files a browser would.
 
 import { webcrypto } from 'node:crypto';
 if (!globalThis.crypto) globalThis.crypto = webcrypto;
@@ -95,6 +95,33 @@ function assertCase(c, resp) {
     }
 }
 
+/** Replace every string of the form `${name}` with the value an earlier case saved. */
+function substitute(c, value, saved) {
+    if (typeof value === 'string') {
+        const m = /^\$\{(.*)\}$/.exec(value);
+        if (!m) return value;
+        if (!saved.has(m[1])) throw new Error(`case '${c.name}': no earlier case saved a value named ${JSON.stringify(m[1])}`);
+        return saved.get(m[1]);
+    }
+    if (Array.isArray(value)) return value.map((v) => substitute(c, v, saved));
+    if (value !== null && typeof value === 'object') {
+        return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, substitute(c, v, saved)]));
+    }
+    return value;
+}
+
+/** Record the string members a case's `save` names, for later cases' bodies. */
+function save(c, resp, saved) {
+    for (const [key, path] of Object.entries(c.save || {})) {
+        const val = pointer(resp, path);
+        if (typeof val !== 'string') {
+            fail(`case '${c.name}': save path ${path} is not a string in ${JSON.stringify(resp)}`);
+            continue;
+        }
+        saved.set(key, val);
+    }
+}
+
 // ---- load the wasm module (pass bytes; Node has no fetch for file://) -------
 
 const mod = await import(`${PKG}/extenddb_wasm_adapter.js`);
@@ -111,8 +138,15 @@ console.log('');
 
 const corpus = JSON.parse(await readFile(CORPUS_PATH, 'utf8'));
 const db = await mod.ExtendDb.create();
+const saved = new Map();
 for (const c of corpus.cases) {
-    const bodyJson = typeof c.rawBody === 'string' ? c.rawBody : JSON.stringify(c.body);
+    let bodyJson;
+    try {
+        bodyJson = typeof c.rawBody === 'string' ? c.rawBody : JSON.stringify(substitute(c, c.body, saved));
+    } catch (e) {
+        fail(e.message);
+        continue;
+    }
     let resp;
     try {
         resp = JSON.parse(await db.submit(c.op, bodyJson));
@@ -121,6 +155,7 @@ for (const c of corpus.cases) {
         continue;
     }
     assertCase(c, resp);
+    save(c, resp, saved);
 }
 
 // ---- summary ---------------------------------------------------------------

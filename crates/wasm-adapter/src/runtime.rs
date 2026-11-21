@@ -15,14 +15,15 @@
 //!
 //! Some operations need a facility the in-memory browser build does not have —
 //! a backup store, or the `PartiQL` surface (left out of this build). The
-//! policy that answers them lives here, in [`Engine::dispatch`], and is applied
-//! the same way on both targets, so the native build (the fidelity oracle) and
-//! the wasm build return the same thing for the same request:
+//! policy that answers them lives here, in [`Engine::dispatch`], and the same
+//! code applies it on both targets, so the native build and the wasm build
+//! refuse the same requests with the same error:
 //!
 //! - **Refused on both targets** with a `ValidationException` that names the
 //!   build: the store-backed backup operations (`CreateBackup`,
 //!   `DescribeBackup`, `DeleteBackup`, `RestoreTableFromBackup`); the three
-//!   `PartiQL` operations; and an `UpdateTable` that creates a vector index
+//!   `PartiQL` operations; `DescribeEndpoints`, as the build has no network
+//!   address to report; and an `UpdateTable` that creates a vector index
 //!   (refused before any catalog write, as the build cannot run the index
 //!   backfill — create the table with its vector indexes instead).
 //! - **Refused as the server refuses them**: every
@@ -64,10 +65,10 @@ const REGION: &str = "us-east-1";
 /// placeholder; the build authenticates no request and authorizes none.
 const ACCOUNT_ID: &str = "000000000000";
 
-/// Address reported by `DescribeEndpoints`. The browser has no network
-/// endpoint; this is the conventional local static-server origin, used only to
-/// fill the `DescribeEndpoints` response.
-const SERVER_ADDR: &str = "localhost:8000";
+/// The server address [`extenddb_engine::dispatch`] takes. Dispatch reads it
+/// only to answer `DescribeEndpoints`, which this build refuses before
+/// dispatch, so it is never reported.
+const SERVER_ADDR: &str = "";
 
 /// Backup job-slot count for the native backup runtime. One is enough: the
 /// runtime has no backup store, and the operations that would use a slot are
@@ -94,7 +95,6 @@ pub struct Engine {
     limits: Arc<LimitsConfig>,
     region: Arc<str>,
     account_id: Arc<str>,
-    server_addr: String,
 }
 
 impl Engine {
@@ -102,11 +102,8 @@ impl Engine {
     ///
     /// Opens a `:memory:` `SQLite` database through the `ExtendDB` `SQLite` backend
     /// (the synchronous `sqlx`-shaped shim over `sqlite-wasm-rs` on wasm, and
-    /// `sqlx` with C `SQLite` natively, which is the fidelity oracle), runs the
-    /// catalog migrations, and registers the account with a synchronous control
-    /// plane.
-    /// The data-plane operations then answer as the native `ExtendDB` `SQLite`
-    /// build answers them.
+    /// `sqlx` with C `SQLite` natively), runs the catalog migrations, and
+    /// registers the account with a synchronous control plane.
     ///
     /// # Errors
     ///
@@ -124,7 +121,6 @@ impl Engine {
             limits: Arc::new(LimitsConfig::default()),
             region: Arc::from(REGION),
             account_id: Arc::from(ACCOUNT_ID),
-            server_addr: SERVER_ADDR.to_owned(),
         })
     }
 
@@ -174,8 +170,8 @@ impl Engine {
 
         // The HTTP server parses the raw body the same way and answers a parse
         // failure with this SerializationException before auth
-        // (crates/server/src/handler.rs). Built from the shared helper so a
-        // malformed request looks identical in the browser.
+        // (crates/server/src/handler.rs). Built from the same shared helper as
+        // the server's, so both build the error from one function.
         let body: Value = serde_json::from_str(body_json).map_err(|e| malformed_body_error(&e))?;
 
         // The server refuses a point-in-time restore and an enable at this
@@ -197,7 +193,7 @@ impl Engine {
         }
 
         let ctx = self.operation_context();
-        let result = extenddb_engine::dispatch(operation, body, &ctx, &self.server_addr).await?;
+        let result = extenddb_engine::dispatch(operation, body, &ctx, SERVER_ADDR).await?;
         Ok(result.body)
     }
 
@@ -234,7 +230,8 @@ impl Engine {
 /// The reason an operation is refused outright in the browser build, or `None`
 /// if it is not refused here. The store-backed backup operations need a backup
 /// store the in-memory build does not have; the `PartiQL` operations are not part
-/// of the build.
+/// of the build; `DescribeEndpoints` reports the address a client sends
+/// requests to, and the build is called in-process with no network address.
 fn unsupported_reason(operation: &str) -> Option<&'static str> {
     match operation {
         "CreateBackup" | "DescribeBackup" | "DeleteBackup" | "RestoreTableFromBackup" => {
@@ -242,6 +239,9 @@ fn unsupported_reason(operation: &str) -> Option<&'static str> {
         }
         "ExecuteStatement" | "BatchExecuteStatement" | "ExecuteTransaction" => {
             Some("the PartiQL surface is not part of the browser build")
+        }
+        "DescribeEndpoints" => {
+            Some("it is called in-process and has no network endpoint to report")
         }
         _ => None,
     }
@@ -337,17 +337,6 @@ mod tests {
             value["TableMaxWriteCapacityUnits"].as_i64(),
             Some(i64::try_from(limits.per_table_max_wcu).unwrap()),
         );
-    }
-
-    /// `DescribeEndpoints` answers with the build's reported server address.
-    #[tokio::test]
-    async fn describe_endpoints_answers_with_the_server_address() {
-        let engine = engine().await;
-        let out = engine.submit("DescribeEndpoints", "{}").await;
-        let value = ok_value(&out);
-        let endpoints = value["Endpoints"].as_array().expect("Endpoints array");
-        assert_eq!(endpoints.len(), 1);
-        assert_eq!(endpoints[0]["Address"].as_str(), Some(SERVER_ADDR));
     }
 
     /// Validation order: an unknown op with a malformed body is still
