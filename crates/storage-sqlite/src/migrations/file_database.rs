@@ -3,9 +3,11 @@
 
 //! The migration entry points for a database file: take its lock, read its
 //! status, migrate it, and decide whether a server may open it. They open the
-//! file through [`SqliteMigrations::open`] and take the `flock`-based serve
-//! lock, so they are compiled for native targets only; the WebAssembly build
-//! migrates its in-memory database through [`super::migrate_in_memory`].
+//! file through [`SqliteMigrations::open`] or
+//! [`SqliteMigrations::open_for_status`], and the ones that write hold the
+//! `flock`-based serve lock, so they are compiled for native targets only; the
+//! WebAssembly build migrates its in-memory database through
+//! [`super::migrate_in_memory`].
 
 use std::time::Duration;
 

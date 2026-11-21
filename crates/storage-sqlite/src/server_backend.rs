@@ -6,8 +6,9 @@
 //! server-components factories it bundles.
 //!
 //! The factories open a database for a server process or a command run beside
-//! one; the server-components factory also takes the serve lock, runs startup
-//! recovery and installs the runtime hooks that start the background workers.
+//! one; for a server, the server-components factory also takes the serve lock,
+//! runs startup recovery and installs the runtime hooks that start the
+//! background workers.
 //! The WebAssembly build uses none of them: it opens a `SqliteEngine` over
 //! `:memory:` through `SqliteEngine::new_in_memory`, so this module is compiled
 //! for native targets only.
