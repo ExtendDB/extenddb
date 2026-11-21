@@ -1149,7 +1149,7 @@ def probe_problems(crates: dict[str, dict], metadata: dict) -> tuple[list[str], 
         else:
             problems.append(f"{path}: the {kind} probe at {rel}:{first} was not refused")
     if len(refused) < len(spans) and other:
-        problems.append("other errors in the probe file:\n" + "\n".join(other))
+        problems.append("clippy's other reports in the probe file:\n" + "\n".join(other))
     if len(refused) < len(spans) and not messages:
         problems.append(f"cargo clippy printed no compiler message; its stderr:\n{stderr}")
     summary = f"{len(refused)} of {len(spans)} probes refused (in a copy of {files} files)"
@@ -1159,18 +1159,21 @@ def probe_problems(crates: dict[str, dict], metadata: dict) -> tuple[list[str], 
 def refused_probes(messages: list[dict], rel: str, spans: list[tuple]) -> tuple[set, list]:
     """The probes that clippy's `messages` refuse, as indexes into `spans` (the
     kind, the path, and the first and last line of each probe in the file
-    `rel`), and clippy's other errors in that file."""
+    `rel`), and clippy's other reports in that file. A probe is refused by an
+    error-level report of its kind and path whose primary span lies inside it.
+    The other reports are clippy's errors and its reports of a disallowed path
+    at another level, which let the clippy step pass."""
     refused, other = set(), []
     for message in messages:
         primary = [s for s in message.get("spans", []) if s.get("is_primary")]
         in_probes = [s for s in primary if s["file_name"].endswith(rel)]
         match = REFUSAL.match(message["message"])
-        if match and in_probes:
+        if match and in_probes and message.get("level") == "error":
             for span in in_probes:
                 for index, (kind, path, first, last) in enumerate(spans):
                     if (kind, path) == match.groups() and first <= span["line_start"] <= last:
                         refused.add(index)
-        elif in_probes and message.get("level") == "error":
+        elif in_probes and (match or message.get("level") == "error"):
             other.append(message.get("rendered") or message["message"])
     return refused, other
 
