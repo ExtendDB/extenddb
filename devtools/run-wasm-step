@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# The commands of the steps of .github/workflows/wasm.yml that build, lint and
+# test the code for wasm32, with their documentation. The workflow runs each
+# of those steps as `devtools/run-wasm-step <step>`, and `devtools/run-tests
+# --wasm`, `--headless` and `--wasm-test` run them through this script too, so
+# the commands are written once, here.
+#
+#   devtools/run-wasm-step <step>
+#   devtools/run-wasm-step clippy [cargo option...]
+#
+#   build     build the adapter for wasm32
+#   clippy    clippy for wasm32 with the lists of devtools/wasm-clippy
+#   guard     the self-test of the clippy step
+#   pedantic  pedantic clippy of the adapter's own code, all its targets
+#   core      extenddb-core's wasm32 tests, under Node
+#   shim      the SQLite shim's wasm32 tests, under Node
+#   corpus    the browser module and the parity corpus, under Node
+#
+# A step runs from the repository root, prints each command before it runs it
+# (on stderr, after "+ "), and looks up cargo, wasm-pack, node and Python on
+# PATH, so the caller chooses the toolchain and the Node version: the
+# workflow's setup steps make the toolchain it pins rustup's default and put
+# the Node version it names on PATH, and run-tests puts the same two first on
+# PATH.
+
+set -euo pipefail
+
+ADAPTER=extenddb-wasm-adapter
+TARGET=wasm32-unknown-unknown
+
+usage() {
+    echo "usage: devtools/run-wasm-step build|clippy [cargo option...]|guard|pedantic|core|shim|corpus" >&2
+    exit 2
+}
+
+die() {
+    echo "error: $*" >&2
+    exit 1
+}
+
+# Prints a command after "+ ".
+show() {
+    printf '+' >&2
+    printf ' %s' "$@" >&2
+    printf '\n' >&2
+}
+
+# Prints a command, then runs it in place of this script.
+run() {
+    show "$@"
+    exec "$@"
+}
+
+# Runs `cargo test --locked <ARGS> --target wasm32-unknown-unknown` and fails
+# unless the run reports each test TESTS names `ok`, and no other test. `cargo
+# test` exits 0 when a test binary holds no test, and passes with the rest
+# when some tests lost their wasm_bindgen_test attribute, so its exit status
+# is not enough.
+#
+# Cargo runs each test module with CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER,
+# which must be the wasm-bindgen-test-runner of the version of the
+# wasm-bindgen crate in Cargo.lock (the workflow's install step says why); the
+# runner runs the module under the node on PATH. A runner the caller sets is
+# used as given; otherwise this sets the one on PATH, else the one in cargo's
+# bin directory ($CARGO_HOME/bin), where `cargo install` puts it, by its full
+# path.
+LOG=""
+run_suite() {
+    local suite="$1" runner status=0 output results line name state expected reported problems=()
+    runner="${CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER:-}"
+    if [ -z "$runner" ]; then
+        runner="$(command -v wasm-bindgen-test-runner || true)"
+        if [ -z "$runner" ] && [ -x "${CARGO_HOME:-$HOME/.cargo}/bin/wasm-bindgen-test-runner" ]; then
+            runner="${CARGO_HOME:-$HOME/.cargo}/bin/wasm-bindgen-test-runner"
+        fi
+    fi
+    if [ -z "$runner" ]; then
+        die "wasm-bindgen-test-runner is not on PATH or in ${CARGO_HOME:-$HOME/.cargo}/bin; install the wasm-bindgen-cli of the version of the wasm-bindgen crate in Cargo.lock (cargo install --locked --version <that version> wasm-bindgen-cli), as .github/workflows/wasm.yml does"
+    fi
+    export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="$runner"
+    echo "runner:    ${runner}"
+
+    LOG="$(mktemp "${TMPDIR:-/tmp}/run-wasm-step.XXXXXX")"
+    trap 'rm -f "$LOG"' EXIT
+    show cargo test --locked "${ARGS[@]}" --target "$TARGET"
+    cargo test --locked "${ARGS[@]}" --target "$TARGET" 2>&1 | tee "$LOG" || status=$?
+
+    # The run's output without colour escapes.
+    output="$(sed "s/$(printf '\033')\[[0-9;]*m//g" "$LOG")"
+    if [ "$status" -ne 0 ]; then
+        problems+=("cargo test exited with status ${status}")
+    fi
+    results="$(grep -c '^test result: ' <<<"$output" || true)"
+    if [ "$results" -ne 1 ]; then
+        problems+=("expected one 'test result:' line, found ${results}")
+    else
+        line="$(grep '^test result: ' <<<"$output")"
+        case "$line" in
+            "test result: ok. ${#TESTS[@]} passed; 0 failed;"*) ;;
+            *) problems+=("expected 'test result: ok. ${#TESTS[@]} passed; 0 failed;', found '${line}'") ;;
+        esac
+    fi
+    # One "<name> <state>" line per test the run reports, and the lines TESTS
+    # expects, each sorted the same way for comm.
+    reported="$(sed -n 's/^test \(.*\) \.\.\. \([^ ]*\)$/\1 \2/p' <<<"$output" | LC_ALL=C sort)"
+    expected="$(printf '%s ok\n' "${TESTS[@]}" | LC_ALL=C sort)"
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        name="${line% ok}"
+        state="$(awk -v n="$name" '$1 == n { print $2; exit }' <<<"$reported")"
+        problems+=("the test ${name} was ${state:+reported }${state:-not run}")
+    done < <(LC_ALL=C comm -23 <(printf '%s\n' "$expected") <(printf '%s\n' "$reported"))
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        name="${line% *}"
+        if ! grep -qxF -- "$name" < <(printf '%s\n' "${TESTS[@]}"); then
+            problems+=("the run reported ${line##* } for ${name}, a test the ${suite} list of devtools/run-wasm-step does not name")
+        fi
+    done < <(LC_ALL=C comm -13 <(printf '%s\n' "$expected") <(printf '%s\n' "$reported"))
+
+    if [ ${#problems[@]} -ne 0 ]; then
+        for line in "${problems[@]}"; do
+            echo "error: ${suite} suite: ${line}" >&2
+        done
+        exit 1
+    fi
+    echo "${suite} suite: ${#TESTS[@]} tests passed, the ${#TESTS[@]} its list names, and no other test ran"
+}
+
+[ $# -ge 1 ] || usage
+step="$1"
+shift
+if [ "$step" != clippy ] && [ $# -ne 0 ]; then
+    usage
+fi
+cd "$(dirname "$0")/.."
+
+case "$step" in
+    build)
+        # extenddb-wasm-adapter and every crate it depends on, for wasm32.
+        run cargo build --locked -p "$ADAPTER" --target "$TARGET"
+        ;;
+
+    clippy)
+        # Clippy for wasm32 with the lists of devtools/wasm-clippy/clippy.toml,
+        # whose header says what they refuse and why, and what this step does
+        # not see. Without --no-deps, clippy lints every workspace crate the
+        # adapter compiles for wasm32 as well as the adapter. CLIPPY_CONF_DIR
+        # is set for this cargo only, so other clippy runs (clippy.yml's, the
+        # pedantic step's) do not read those lists. --lib checks the adapter's
+        # library alone, which is also what cargo checks by default here: the
+        # adapter has no binary target, and tests are not a default target.
+        # Options given after the step name go to cargo before its `--`, for a
+        # caller that wants another message format.
+        run env CLIPPY_CONF_DIR="$PWD/devtools/wasm-clippy" \
+            cargo clippy --locked "$@" -p "$ADAPTER" --lib --target "$TARGET" -- -D warnings
+        ;;
+
+    guard)
+        # The self-test of the clippy step; the docstring of
+        # devtools/check-wasm-clippy-guard says what it checks. It needs Python
+        # 3.11 or later (it reads TOML with tomllib): python3 when it is new
+        # enough, else the newest of python3.14 to python3.11 on PATH.
+        python=""
+        for candidate in python3 python3.14 python3.13 python3.12 python3.11; do
+            if command -v "$candidate" >/dev/null 2>&1 \
+                && "$candidate" -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then
+                python="$(command -v "$candidate")"
+                break
+            fi
+        done
+        if [ -z "$python" ]; then
+            die "devtools/check-wasm-clippy-guard needs Python 3.11 or later, and none of python3, python3.14, python3.13, python3.12 or python3.11 on PATH is; install one, for example the python3.11 package of your distribution"
+        fi
+        echo "python:    ${python} ($("$python" --version 2>&1))"
+        run "$python" devtools/check-wasm-clippy-guard
+        ;;
+
+    pedantic)
+        # The adapter's own code (--no-deps), with the pedantic group the
+        # clippy step does not enable. --all-targets also checks the adapter's
+        # test targets for wasm32, with the dev-dependencies that target
+        # selects. Their tests are native only (tests/parity.rs and the
+        # library's test module are cfg-gated off wasm32), so on wasm32 the
+        # step lints the library in its test configuration as well and fails
+        # when a test target or a dev-dependency stops building there.
+        run cargo clippy --locked --no-deps -p "$ADAPTER" --all-targets --target "$TARGET" \
+            -- -D warnings -W clippy::pedantic
+        ;;
+
+    core)
+        # extenddb-core's wasm32 unit tests, under Node: the cases of
+        # src/crypto.rs, which on wasm32 run its RustCrypto backend (natively
+        # they run AWS-LC), and the test of limits::page_size in
+        # src/limits/mod.rs, which on wasm32 runs with a 32-bit usize.
+        #
+        # TESTS names every wasm test of the suite as the runner reports it,
+        # and the step fails unless the run reports each of them ok and no
+        # other test. A change that adds, renames or removes a wasm test of
+        # extenddb-core's library adds, renames or removes its line here.
+        ARGS=(-p extenddb-core --lib)
+        TESTS=(
+            crypto::tests::constant_time_eq_compares_contents_and_length
+            crypto::tests::fill_random_produces_distinct_buffers
+            crypto::tests::hmac_sha256_rfc4231_case2
+            crypto::tests::open_decrypts_aws_lc_sealed_vector
+            crypto::tests::open_decrypts_historical_aes_gcm_vector
+            crypto::tests::open_rejects_input_too_short
+            crypto::tests::open_rejects_wrong_aad_wrong_key_and_tampering
+            crypto::tests::seal_open_round_trip_with_fresh_nonce
+            crypto::tests::sha256_known_vector
+            limits::tests::page_size_is_at_least_one_and_never_below_the_limit_it_can_hold
+        )
+        run_suite core
+        ;;
+
+    shim)
+        # The tests of the SQLite shim, the wasm backend, in
+        # crates/storage-sqlite/tests/wasm_shim.rs, whose module documentation
+        # says what they check and how they run natively. This step runs them
+        # on wasm32, under Node.
+        #
+        # TESTS names every test of that file as the runner reports it, and
+        # the step fails unless the run reports each of them ok and no other
+        # test. A change that adds, renames or removes a test there adds,
+        # renames or removes its line here.
+        ARGS=(-p extenddb-storage-sqlite --test wasm_shim)
+        TESTS=(
+            a_scan_limit_above_u32_max_returns_every_item
+            an_update_table_that_creates_a_vector_index
+            each_row_gives_its_expected_outcome
+        )
+        run_suite shim
+        ;;
+
+    corpus)
+        # Builds the browser module with wasm-bindgen and runs the shared parity
+        # corpus through it under Node: the same cases as the native test
+        # (crates/wasm-adapter/tests/parity.rs, against sqlx and the C SQLite),
+        # with its assertions except where a case carries an `onWasm`
+        # expectation.
+        #
+        # wasm-pack downloads no tool here. --no-opt skips wasm-opt. Without
+        # it, wasm-pack runs the wasm-opt on PATH or in its download cache,
+        # and, in its default install mode, when it has neither it first
+        # downloads binaryen version_130 from GitHub releases, which it does
+        # not check against a checksum. The step skips wasm-opt rather than
+        # pin a checksum for it: wasm-opt is an optimizer (here it makes the
+        # module about a quarter smaller) and is not meant to change the
+        # answers the corpus checks. No step runs the corpus over wasm-opt's
+        # output, which is the module the README's build command produces.
+        # --mode no-install forbids wasm-pack to download or install
+        # wasm-bindgen: it uses a wasm-bindgen of the version in Cargo.lock
+        # from PATH (the workflow's tool cache or install step puts one there)
+        # or from its download cache, and otherwise stops. wasm-pack would add
+        # the wasm32 target with rustup if the toolchain lacked it; the
+        # workflow's toolchain step installs it.
+        #
+        # wasm-pack does make one request of its own: at the start of every
+        # run it asks crates.io (https://crates.io/api/v1/crates/wasm-pack) for
+        # the latest wasm-pack version, unless the wasm-pack.stamp file it
+        # writes beside its binary after asking is less than 25 hours old. The
+        # workflow's tool cache does not keep that file. The answer only
+        # decides whether wasm-pack ends with a warning; when the request
+        # fails, the warning is "failed to get wasm-pack version" and the build
+        # goes on.
+        if ! command -v wasm-pack >/dev/null 2>&1; then
+            die "wasm-pack is not on PATH; install the version .github/workflows/wasm.yml installs (cargo install --locked --version <that version> wasm-pack)"
+        fi
+        show wasm-pack build --target web --release --no-opt --mode no-install crates/wasm-adapter --out-dir parity/pkg
+        if ! wasm-pack build --target web --release --no-opt --mode no-install crates/wasm-adapter --out-dir parity/pkg; then
+            die "wasm-pack build failed; if it found no wasm-bindgen: with --mode no-install it downloads none, so install the version of the wasm-bindgen crate in Cargo.lock (cargo install --locked --version <that version> wasm-bindgen-cli), as .github/workflows/wasm.yml does"
+        fi
+        run node crates/wasm-adapter/parity/run.mjs
+        ;;
+
+    *)
+        usage
+        ;;
+esac

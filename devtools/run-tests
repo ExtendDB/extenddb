@@ -78,12 +78,8 @@ RUN_COMPREHENSIVE=false
 RUN_TERRAFORM=false
 RUN_CATALOG_CHECK=false
 # Standalone WebAssembly suites. Unlike the others these need no running server,
-# target flag or credentials: --wasm runs the build, clippy and guard steps of
-# the WebAssembly workflow (the wasm32 build of the adapter crate, the clippy
-# step with the lists of devtools/wasm-clippy, their self-test and the adapter's
-# pedantic clippy), --headless builds the wasm module and runs the parity corpus
-# through it under Node, and --wasm-test runs the on-target wasm-bindgen-test
-# suites (extenddb-core's and the SQLite shim's) under Node.
+# target flag or credentials: each runs steps of the WebAssembly workflow
+# through devtools/run-wasm-step (see the WebAssembly section below).
 RUN_WASM=false
 RUN_HEADLESS=false
 RUN_WASM_TEST=false
@@ -116,30 +112,25 @@ Suites (at least one required):
                     binary, and downloads the AWS provider; not part of --all)
   --all             all suites above except --terraform
   --catalog-check   post-test catalog integrity check
-  --wasm            the build, clippy and guard steps of the WebAssembly
-                    workflow: wasm32 build, clippy with the lists of
-                    devtools/wasm-clippy, their self-test (needs Python 3.11
-                    or later and git), and the adapter's pedantic clippy
-                    of all its targets.
-                    Standalone: needs no server, target flag or credentials;
-                    writes discussions/test-wasm-<hash>.txt.
-                    Override the crate with EXTENDDB_WASM_PKG
-                    (default: extenddb-wasm-adapter)
-  --headless        build the wasm-pack --target web module and run the shared
-                    parity corpus through it under Node. Standalone like --wasm;
+  --wasm            the build, clippy, guard and pedantic steps of the
+                    WebAssembly workflow (devtools/run-wasm-step says what
+                    each does; the guard step needs Python 3.11 or later and
+                    git). Standalone: needs no server, target flag or
+                    credentials; writes discussions/test-wasm-<hash>.txt
+  --headless        the corpus step of the WebAssembly workflow: builds the
+                    browser module with wasm-pack and runs the shared parity
+                    corpus through it under Node. Standalone like --wasm;
                     needs wasm-pack, Node and the wasm-bindgen CLI of the
                     version of the wasm-bindgen crate in Cargo.lock, on PATH
-                    or in wasm-pack's download cache (wasm-pack runs as the
-                    workflow runs it: it skips wasm-opt and downloads no tool,
-                    though it asks crates.io for its latest version), but no
-                    server/creds. Writes
-                    discussions/test-headless-<hash>.txt
-  --wasm-test       run the on-target wasm-bindgen-test suites (extenddb-core's,
-                    for its crypto backend and limits::page_size, and the
-                    SQLite shim's) on wasm32 under Node. Standalone
-                    like --wasm; needs Node and wasm-bindgen-test-runner
-                    (matching the wasm-bindgen crate in Cargo.lock) but no
-                    server/creds. Writes discussions/test-wasm-bindgen-<hash>.txt
+                    or in wasm-pack's download cache (wasm-pack skips wasm-opt
+                    and downloads no tool, though it asks crates.io for its
+                    latest version). Writes discussions/test-headless-<hash>.txt
+  --wasm-test       the core and shim steps of the WebAssembly workflow: the
+                    wasm-bindgen-test suites of extenddb-core and of the SQLite
+                    shim, on wasm32 under Node. Standalone like --wasm; needs
+                    Node and wasm-bindgen-test-runner (matching the
+                    wasm-bindgen crate in Cargo.lock). Writes
+                    discussions/test-wasm-bindgen-<hash>.txt
                     The three WebAssembly suites run on the toolchain that
                     .github/workflows/wasm.yml pins (through rustup, when it
                     is installed) and under the Node major version it sets
@@ -399,26 +390,35 @@ finish_if_only_wasm_suites_left() {
     fi
 }
 
-# --- WebAssembly suites: the workflow's toolchain and Node ------------------
-# The three suites below run steps of .github/workflows/wasm.yml, which is the
-# source of their commands; keep them in step with the workflow's. Clippy's
-# findings depend on its version and the wasm-bindgen-test harness depends on
-# Node's, so each suite reads from the workflow the toolchain it pins (its
-# `toolchain:` value) and the Node major version it sets up (its
+# --- WebAssembly suites ------------------------------------------------------
+# --wasm, --headless and --wasm-test run steps of .github/workflows/wasm.yml:
+# each mode runs the steps its WASM_STEPS_ list below names, in that order,
+# through devtools/run-wasm-step, which holds the commands of every workflow
+# step that builds, lints or tests the code and which the workflow runs too.
+#
+# Clippy's findings depend on its version and the wasm-bindgen-test harness
+# depends on Node's, so each mode reads from the workflow the toolchain it pins
+# (its `toolchain:` value) and the Node major version it sets up (its
 # `node-version:` value). When rustup is installed the toolchain is found
 # through rustup's proxies even when another cargo comes first on PATH, and a
-# missing one fails the suite with the command that installs it; without
-# rustup the cargo on PATH runs and the suite says so. run-tests puts only the
-# toolchain's tools and the Node link below ahead of the caller's PATH; it
-# starts wasm-pack and Python by name from the resulting PATH, and gives cargo
-# wasm-bindgen-test-runner by its full path. rustup in turn puts cargo's bin
-# directory ($CARGO_HOME/bin, where rustup and `cargo install` put their
-# programs) first on the PATH of each tool it runs, so cargo, rustc and every
-# program they start (build scripts, the C compiler the cc crate looks up,
-# cargo subcommands, the test runner and the node it starts) look there first.
-# A suite that runs Node fails, with an install hint, unless a Node of that
-# major version is on PATH as node, node-<major> or node<major>. Each suite
-# prints what it used.
+# missing one fails the mode with the command that installs it; without rustup
+# the cargo on PATH runs and the mode says so. A mode that runs Node fails,
+# with an install hint, unless a Node of that major version is on PATH as
+# node, node-<major> or node<major>.
+#
+# run-tests puts only the toolchain's tools and that Node, through directories
+# of links, ahead of the caller's PATH, and starts devtools/run-wasm-step with
+# the resulting PATH; the steps look up wasm-pack, node and Python on it, and
+# the test runner on it or in cargo's bin directory, which they give cargo by
+# its full path. rustup in turn puts cargo's bin directory ($CARGO_HOME/bin,
+# where rustup and `cargo install` put their programs) first on the PATH of
+# each tool it runs, so cargo, rustc and every program they start (build
+# scripts, the C compiler the cc crate looks up, cargo subcommands, the test
+# runner and the node it starts) look there first. Each mode prints what it
+# used.
+WASM_STEPS_WASM="build clippy guard pedantic"
+WASM_STEPS_HEADLESS="corpus"
+WASM_STEPS_WASM_TEST="core shim"
 wasm_workflow_toolchain() {
     sed -n 's/^[[:space:]]*toolchain:[[:space:]]*"\{0,1\}\([^"#[:space:]]*\)"\{0,1\}.*/\1/p' \
         .github/workflows/wasm.yml | head -n 1
@@ -428,7 +428,7 @@ wasm_workflow_node_major() {
         .github/workflows/wasm.yml | head -n 1
 }
 # The directories of links that wasm_select_toolchain and wasm_select_node put
-# first on PATH; removed when a suite ends and when the script exits.
+# first on PATH; removed when a mode ends and when the script exits.
 WASM_TOOLCHAIN_DIR=""
 WASM_NODE_DIR=""
 wasm_remove_link_dirs() {
@@ -470,8 +470,8 @@ wasm_select_toolchain() {
         # rustup runs as the tool it is started as (its argv[0]), from the
         # toolchain RUSTUP_TOOLCHAIN names, so a directory of links to it, one
         # per tool of the toolchain, put first on PATH makes each cargo and
-        # rustc that this script, the self-test or wasm-pack start by name the
-        # workflow's. The caller's PATH follows the links unchanged; rustup
+        # rustc that a step, the guard's self-test or wasm-pack start by name
+        # the workflow's. The caller's PATH follows the links unchanged; rustup
         # adds cargo's bin directory ahead of both for the tools it runs (see
         # the section comment above).
         WASM_TOOLCHAIN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/run-tests-toolchain.XXXXXX")"
@@ -524,230 +524,103 @@ wasm_restore_env() {
     fi
     wasm_remove_link_dirs
 }
-# A Python 3.11 or later, which devtools/check-wasm-clippy-guard needs (it
-# reads TOML with tomllib): python3 when it is new enough, else the newest
-# python3.N on PATH.
-wasm_python() {
-    local candidate
-    for candidate in python3 python3.14 python3.13 python3.12 python3.11; do
-        if command -v "$candidate" >/dev/null 2>&1 \
-            && "$candidate" -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then
-            command -v "$candidate"
-            return 0
-        fi
-    done
-    return 1
-}
-
-# --- WebAssembly adapter build, clippy and guard steps (standalone) ---------
-# The wasm32 build, the wasm32 clippy step with the lists of devtools/wasm-clippy,
-# their self-test, and the adapter's pedantic clippy step, which checks all of
-# its targets (--all-targets).
-if $RUN_WASM; then
-    WASM_PKG="${EXTENDDB_WASM_PKG:-extenddb-wasm-adapter}"
-    WASM_OUTFILE="discussions/test-wasm-${HASH}.txt"
-    echo "=== wasm32 build, clippy and guard: ${WASM_PKG} (target wasm32-unknown-unknown) ==="
-    WASM_RC=0
-    wasm_select_toolchain || WASM_RC=1
+# Runs one WebAssembly mode: selects the workflow's toolchain (and its Node,
+# when NODE is "node"), writes the header of the mode's artifact, runs each
+# STEP through devtools/run-wasm-step with its output copied to the artifact,
+# and ends the artifact with "RESULT: PASS" or "RESULT: FAIL" (and then sets
+# PASS=false).
+#   wasm_mode ARTIFACT TITLE TARGET NODE STEP...
+wasm_mode() {
+    local out="$1" title="$2" target="$3" node="$4" rc=0 step
+    shift 4
+    echo "=== ${title} → ${out} ==="
+    wasm_select_toolchain || rc=1
+    WASM_NODE_NOTE="not looked up"
+    if [ "$node" = node ] && [ "$rc" -eq 0 ]; then
+        wasm_select_node || rc=1
+    fi
     {
-        echo "WebAssembly adapter build, clippy and guard steps"
-        echo "target:    wasm32-unknown-unknown (in-memory SQLite in the browser)"
-        echo "package:   ${WASM_PKG}"
+        echo "$title"
+        echo "target:    ${target}"
+        echo "steps:     $* (devtools/run-wasm-step)"
         echo "commit:    ${HASH}"
         echo "date:      $(date -u +%Y-%m-%dT%H:%M:%SZ)"
         echo "toolchain: ${WASM_TOOLCHAIN_NOTE}"
         echo "cargo:     $(cargo --version 2>&1)"
+        if [ "$node" = node ]; then
+            echo "node:      ${WASM_NODE_NOTE}"
+        fi
+        case " $* " in
+            *" corpus "*)
+                if command -v wasm-pack >/dev/null 2>&1; then
+                    echo "wasm-pack: $(command -v wasm-pack) ($(wasm-pack --version 2>&1))"
+                else
+                    echo "wasm-pack: not on PATH"
+                fi
+                ;;
+        esac
         echo
-    } > "$WASM_OUTFILE"
+    } > "$out"
     echo "toolchain: ${WASM_TOOLCHAIN_NOTE}"
-    if [ "$WASM_RC" -eq 0 ]; then
-        echo "--- cargo build ---" | tee -a "$WASM_OUTFILE"
-        if ! cargo build --locked -p "$WASM_PKG" --target wasm32-unknown-unknown \
-            2>&1 | tee -a "$WASM_OUTFILE"; then
-            WASM_RC=1
-        fi
-        # Refuses, in workspace code, the calls devtools/wasm-clippy/clippy.toml
-        # lists as known to trap or hang on wasm32. Calls made inside
-        # dependencies are not seen; the headless parity corpus (--headless)
-        # is the runtime check.
-        echo "--- cargo clippy (devtools/wasm-clippy) ---" | tee -a "$WASM_OUTFILE"
-        if ! CLIPPY_CONF_DIR="$PROJECT_DIR/devtools/wasm-clippy" \
-            cargo clippy --locked -p "$WASM_PKG" --lib --target wasm32-unknown-unknown \
-            -- -D warnings 2>&1 | tee -a "$WASM_OUTFILE"; then
-            WASM_RC=1
-        fi
-        echo "--- clippy guard self-test ---" | tee -a "$WASM_OUTFILE"
-        if WASM_PYTHON="$(wasm_python)"; then
-            echo "python:    ${WASM_PYTHON} ($("$WASM_PYTHON" --version 2>&1))" | tee -a "$WASM_OUTFILE"
-            if ! "$WASM_PYTHON" devtools/check-wasm-clippy-guard 2>&1 | tee -a "$WASM_OUTFILE"; then
-                WASM_RC=1
-            fi
+    if [ "$node" = node ]; then
+        echo "node:      ${WASM_NODE_NOTE}"
+    fi
+    if [ "$rc" -ne 0 ]; then
+        if [ "$node" = node ]; then
+            echo "error: the steps need the toolchain and the Node above; none was run" | tee -a "$out"
         else
-            echo "error: devtools/check-wasm-clippy-guard needs Python 3.11 or later (python3, python3.11 to python3.14 on PATH); install one, for example the python3.11 package of your distribution" | tee -a "$WASM_OUTFILE"
-            WASM_RC=1
-        fi
-        echo "--- cargo clippy (pedantic, --no-deps, --all-targets) ---" | tee -a "$WASM_OUTFILE"
-        if ! cargo clippy --locked --no-deps -p "$WASM_PKG" --all-targets --target wasm32-unknown-unknown \
-            -- -D warnings -W clippy::pedantic 2>&1 | tee -a "$WASM_OUTFILE"; then
-            WASM_RC=1
+            echo "error: the steps need the toolchain above; none was run" | tee -a "$out"
         fi
     else
-        echo "${WASM_TOOLCHAIN_NOTE}" | tee -a "$WASM_OUTFILE"
+        for step in "$@"; do
+            echo "--- devtools/run-wasm-step ${step} ---" | tee -a "$out"
+            if ! devtools/run-wasm-step "$step" 2>&1 | tee -a "$out"; then
+                rc=1
+            fi
+        done
     fi
     wasm_restore_env
-    if [ "$WASM_RC" -eq 0 ]; then
-        echo "RESULT: PASS" | tee -a "$WASM_OUTFILE"
+    if [ "$rc" -eq 0 ]; then
+        echo "RESULT: PASS" | tee -a "$out"
     else
-        echo "RESULT: FAIL" | tee -a "$WASM_OUTFILE"
+        echo "RESULT: FAIL" | tee -a "$out"
         PASS=false
     fi
-    echo "=== wrote ${WASM_OUTFILE} ==="
+    echo "=== wrote ${out} ==="
+}
+
+# The workflow's build, clippy, guard and pedantic steps.
+if $RUN_WASM; then
+    wasm_mode "discussions/test-wasm-${HASH}.txt" \
+        "WebAssembly adapter build, clippy and guard steps" \
+        "wasm32-unknown-unknown (in-memory SQLite in the browser)" \
+        no-node $WASM_STEPS_WASM
     if ! $RUN_HEADLESS && ! $RUN_WASM_TEST; then
         finish_if_only_wasm_suites_left
     fi
 fi
 
-# --- WebAssembly headless parity run (standalone) ---------------------------
-# Builds the wasm-pack --target web module and runs the shared parity corpus
-# through it under Node, the same cases the native oracle test (the adapter's
-# tests/parity.rs) runs. wasm-pack runs with the workflow's flags: --no-opt
-# skips wasm-opt, which wasm-pack downloads in its default install mode when
-# it has none, and --mode no-install makes it take the wasm-bindgen of
-# Cargo.lock's version from PATH or from its download cache and download
-# none. The workflow's corpus step says what else wasm-pack asks the network
-# for. Standalone like --wasm: no server, target flag or credentials. Placed
-# after PASS=true for the same reason.
+# The workflow's corpus step: the shared parity corpus through the browser
+# module under Node, the same cases the native oracle test (the adapter's
+# tests/parity.rs) runs.
 if $RUN_HEADLESS; then
-    HEADLESS_OUTFILE="discussions/test-headless-${HASH}.txt"
-    echo "=== wasm headless parity run → ${HEADLESS_OUTFILE} ==="
-    HEADLESS_RC=0
-    wasm_select_toolchain || HEADLESS_RC=1
-    WASM_NODE_NOTE="not looked up"
-    if [ "$HEADLESS_RC" -eq 0 ]; then
-        wasm_select_node || HEADLESS_RC=1
-    fi
-    {
-        echo "WebAssembly headless parity run"
-        echo "target:    wasm32-unknown-unknown (in-memory SQLite in the browser) via Node"
-        echo "commit:    ${HASH}"
-        echo "date:      $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        echo "toolchain: ${WASM_TOOLCHAIN_NOTE}"
-        echo "cargo:     $(cargo --version 2>&1)"
-        echo "node:      ${WASM_NODE_NOTE}"
-        echo
-    } > "$HEADLESS_OUTFILE"
-    echo "toolchain: ${WASM_TOOLCHAIN_NOTE}"
-    echo "node:      ${WASM_NODE_NOTE}"
-    if [ "$HEADLESS_RC" -ne 0 ]; then
-        echo "error: the headless suite needs the toolchain and Node above" | tee -a "$HEADLESS_OUTFILE"
-    elif ! command -v wasm-pack >/dev/null 2>&1; then
-        echo "error: wasm-pack not found — needed to build the browser module ('cargo install --locked --version 0.15.1 wasm-pack', as .github/workflows/wasm.yml does)" | tee -a "$HEADLESS_OUTFILE"
-        HEADLESS_RC=1
-    else
-        echo "wasm-pack: $(command -v wasm-pack) ($(wasm-pack --version 2>&1))" | tee -a "$HEADLESS_OUTFILE"
-        echo "--- wasm-pack build --target web --release --no-opt --mode no-install ---" | tee -a "$HEADLESS_OUTFILE"
-        if wasm-pack build --target web --release --no-opt --mode no-install crates/wasm-adapter \
-            --out-dir parity/pkg 2>&1 | tee -a "$HEADLESS_OUTFILE"; then
-            echo "--- node parity runner ---" | tee -a "$HEADLESS_OUTFILE"
-            if ! node crates/wasm-adapter/parity/run.mjs 2>&1 | tee -a "$HEADLESS_OUTFILE"; then
-                HEADLESS_RC=1
-            fi
-        else
-            echo "wasm-pack build failed (if it found no wasm-bindgen: with --mode no-install it downloads none, so install the version of the wasm-bindgen crate in Cargo.lock with 'cargo install --locked --version <that version> wasm-bindgen-cli', as .github/workflows/wasm.yml does)" | tee -a "$HEADLESS_OUTFILE"
-            HEADLESS_RC=1
-        fi
-    fi
-    wasm_restore_env
-    if [ "$HEADLESS_RC" -eq 0 ]; then
-        echo "RESULT: PASS" | tee -a "$HEADLESS_OUTFILE"
-    else
-        echo "RESULT: FAIL" | tee -a "$HEADLESS_OUTFILE"
-        PASS=false
-    fi
-    echo "=== wrote ${HEADLESS_OUTFILE} ==="
+    wasm_mode "discussions/test-headless-${HASH}.txt" \
+        "WebAssembly headless parity run" \
+        "wasm32-unknown-unknown (in-memory SQLite in the browser) via Node" \
+        node $WASM_STEPS_HEADLESS
     if ! $RUN_WASM_TEST; then
         finish_if_only_wasm_suites_left
     fi
 fi
 
-# --- On-target wasm-bindgen-test suites (standalone) ------------------------
-# core's wasm crypto backend (sha2/hmac/subtle/aes-gcm/getrandom) and the
-# synchronous SQLite shim run in no native test — they exist only on wasm32.
-# Their behavior is pinned by wasm-bindgen-test cases that execute on wasm32
-# under Node, the same two suites the WebAssembly CI workflow runs; core's
-# also runs the test of limits::page_size, which on wasm32 runs with a 32-bit
-# usize. Standalone like --wasm: no server, target flag or credentials. Placed
-# after PASS=true so a failure here is not later reset.
-#
-# wasm-bindgen-test drives the compiled test module through
-# wasm-bindgen-test-runner, which must match the wasm-bindgen crate in
-# Cargo.lock (a runner of another schema version stops with a "different
-# bindgen format" error when cargo hands it the built module), and runs it
-# under the Node on PATH. CARGO_TARGET_..._RUNNER is read only when a wasm
-# `cargo test` executes.
+# The workflow's core and shim steps: the wasm-bindgen-test suites that run on
+# wasm32 under Node. core's wasm crypto backend and the synchronous SQLite shim
+# run in no native test; they exist only on wasm32.
 if $RUN_WASM_TEST; then
-    WASM_TEST_OUTFILE="discussions/test-wasm-bindgen-${HASH}.txt"
-    echo "=== on-target wasm-bindgen-test suites → ${WASM_TEST_OUTFILE} ==="
-    WASM_TEST_RC=0
-    wasm_select_toolchain || WASM_TEST_RC=1
-    WASM_NODE_NOTE="not looked up"
-    if [ "$WASM_TEST_RC" -eq 0 ]; then
-        wasm_select_node || WASM_TEST_RC=1
-    fi
-    {
-        echo "WebAssembly on-target wasm-bindgen-test suites"
-        echo "target:    wasm32-unknown-unknown (in-memory SQLite in the browser) via Node"
-        echo "suites:    extenddb-core (--lib: the crypto backend, limits::page_size), extenddb-storage-sqlite (--test wasm_shim: the shim)"
-        echo "commit:    ${HASH}"
-        echo "date:      $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        echo "toolchain: ${WASM_TOOLCHAIN_NOTE}"
-        echo "cargo:     $(cargo --version 2>&1)"
-        echo "node:      ${WASM_NODE_NOTE}"
-        echo
-    } > "$WASM_TEST_OUTFILE"
-    echo "toolchain: ${WASM_TOOLCHAIN_NOTE}"
-    echo "node:      ${WASM_NODE_NOTE}"
-
-    # wasm-bindgen-test-runner is a cargo-installed binary; it is on PATH in CI
-    # but cargo's bin directory is not always on an interactive PATH, so fall
-    # back to it. It must match the wasm-bindgen crate in Cargo.lock. Cargo is
-    # given the runner's full path.
-    CARGO_BIN_DIR="${CARGO_HOME:-$HOME/.cargo}/bin"
-    WASM_TEST_RUNNER=""
-    if command -v wasm-bindgen-test-runner >/dev/null 2>&1; then
-        WASM_TEST_RUNNER=$(command -v wasm-bindgen-test-runner)
-    elif [ -x "$CARGO_BIN_DIR/wasm-bindgen-test-runner" ]; then
-        WASM_TEST_RUNNER="$CARGO_BIN_DIR/wasm-bindgen-test-runner"
-    fi
-
-    if [ "$WASM_TEST_RC" -ne 0 ]; then
-        echo "error: the wasm-bindgen-test suites need the toolchain and Node above" | tee -a "$WASM_TEST_OUTFILE"
-    elif [ -z "$WASM_TEST_RUNNER" ]; then
-        echo "error: wasm-bindgen-test-runner not found on PATH or in $CARGO_BIN_DIR — install it with the Cargo.lock wasm-bindgen version, e.g. 'cargo install --locked --version 0.2.130 wasm-bindgen-cli'" | tee -a "$WASM_TEST_OUTFILE"
-        WASM_TEST_RC=1
-    else
-        echo "runner:    ${WASM_TEST_RUNNER}" | tee -a "$WASM_TEST_OUTFILE"
-        # The suites run through devtools/run-wasm-test-suite, as the workflow
-        # runs them: it fails a suite unless the run reports each test the
-        # suite names `ok` and no other test, where a bare `cargo test` can
-        # exit 0 with tests missing.
-        for suite in core shim; do
-            echo "--- ${suite} (devtools/run-wasm-test-suite ${suite}) ---" | tee -a "$WASM_TEST_OUTFILE"
-            if ! CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="$WASM_TEST_RUNNER" \
-                devtools/run-wasm-test-suite "$suite" 2>&1 | tee -a "$WASM_TEST_OUTFILE"; then
-                WASM_TEST_RC=1
-            fi
-        done
-    fi
-    wasm_restore_env
-
-    if [ "$WASM_TEST_RC" -eq 0 ]; then
-        echo "RESULT: PASS" | tee -a "$WASM_TEST_OUTFILE"
-    else
-        echo "RESULT: FAIL" | tee -a "$WASM_TEST_OUTFILE"
-        PASS=false
-    fi
-    echo "=== wrote ${WASM_TEST_OUTFILE} ==="
+    wasm_mode "discussions/test-wasm-bindgen-${HASH}.txt" \
+        "WebAssembly on-target wasm-bindgen-test suites" \
+        "wasm32-unknown-unknown (in-memory SQLite in the browser) via Node" \
+        node $WASM_STEPS_WASM_TEST
     finish_if_only_wasm_suites_left
 fi
 
