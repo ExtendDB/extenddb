@@ -14,6 +14,7 @@ use serde_json::Value;
 
 use crate::OperationContext;
 use crate::serialize_output;
+use crate::streams_iterator_params as iterator_params;
 
 /// Handle `DescribeStream`.
 ///
@@ -100,6 +101,12 @@ pub async fn handle_list_streams(
 ///
 /// Encodes the shard ID and starting position into a base64 iterator token.
 ///
+/// Validation runs in the service's order, measured 2026-10-23 and 2026-11-20
+/// (us-east-1): the members' JSON types, then the model's constraints in one
+/// message (`SequenceNumber` length, `ShardIteratorType` null or enum,
+/// `ShardId` length), then the parameter rules per type, then stream and shard
+/// existence, then the `SequenceNumber` refusal of `TRIM_HORIZON` and `LATEST`.
+///
 /// # Errors
 ///
 /// Returns [`DynamoDbError::ResourceNotFoundException`] if the stream/shard does not exist.
@@ -108,39 +115,22 @@ pub async fn handle_get_shard_iterator(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
-    let input: GetShardIteratorInput = serde_json::from_value(body)
-        .map_err(|e| DynamoDbError::SerializationException(e.to_string()))?;
+    iterator_params::check_member_shapes(&body)?;
+    constraint_violations(&body)?;
 
-    // The service's ShardId bound is 28 to 65 characters, checked before any
-    // lookup with the model's constraint sentences (both measured 2026-10-24).
-    // A SequenceNumber, when given, is at least 21 characters (measured with
-    // "0" on AT_SEQUENCE_NUMBER). The maximum is applied once the shard is
-    // not found (`shard_lookup_error`): the shards a release before v0.1.14
-    // wrote are named after the table, and a table name over 40 characters
-    // puts them past 65.
+    let input: GetShardIteratorInput =
+        serde_json::from_value(body).map_err(crate::deserialize_error)?;
     let shard_len = input.shard_id.chars().count();
-    if shard_len < SHARD_ID_MIN_LEN {
-        return Err(DynamoDbError::ValidationException(
-            SHARD_ID_TOO_SHORT.to_owned(),
-        ));
-    }
-    if input
-        .sequence_number
-        .as_ref()
-        .is_some_and(|n| n.chars().count() < 21)
-    {
-        return Err(DynamoDbError::ValidationException(constraint(
-            "sequenceNumber",
-            "have length greater than or equal to 21",
-        )));
-    }
+    let at_timestamp_ms = iterator_params::validate_iterator_parameters(&input)?;
 
     // Validate the stream and shard exist before issuing an iterator.
     ctx.storage
         .validate_shard(&ctx.account_id, &input.stream_arn, &input.shard_id)
         .await
         .map_err(|e| shard_lookup_error(shard_len, e))?;
+    iterator_params::refuse_sequence_number_after_shard(&input)?;
 
+    let width = ctx.storage.sequence_number_width();
     let seq = match input.shard_iterator_type {
         ShardIteratorType::TrimHorizon => String::new(),
         ShardIteratorType::Latest => {
@@ -153,36 +143,18 @@ pub async fn handle_get_shard_iterator(
                 .unwrap_or_default()
         }
         ShardIteratorType::AtSequenceNumber => {
-            // Convert to AFTER_SEQUENCE_NUMBER by subtracting 1, so the
-            // exclusive "after" semantics produce inclusive "at" behavior.
-            // Measured 2026-10-24 for AT_SEQUENCE_NUMBER; AFTER_SEQUENCE_NUMBER
-            // without a number is not measured and keeps its sentence below.
-            let raw = input.sequence_number.clone().ok_or_else(|| {
-                DynamoDbError::ValidationException(
-                    "One or more parameter values were invalid: SequenceNumber cannot be null"
-                        .to_owned(),
-                )
-            })?;
-            let n = raw.parse::<u128>().map_err(|_| {
-                DynamoDbError::ValidationException("Invalid SequenceNumber".to_owned())
-            })?;
-            // n == 0: sequence 0 is the first possible record, so "at 0"
-            // means "read from the beginning" — same as TRIM_HORIZON.
-            if n > 0 {
-                // Pad to the backend's stored width so lexicographic order
-                // matches numeric order against stored sequence numbers.
-                let width = ctx.storage.sequence_number_width();
-                format!("{:0>width$}", n - 1)
-            } else {
-                String::new()
-            }
+            let raw = input.sequence_number.as_deref().unwrap_or_default();
+            iterator_params::at_sequence_to_after(raw, width)?
         }
-        ShardIteratorType::AfterSequenceNumber => {
-            input.sequence_number.clone().ok_or_else(|| {
-                DynamoDbError::ValidationException(
-                    "SequenceNumber is required for AFTER_SEQUENCE_NUMBER iterator type".to_owned(),
-                )
-            })?
+        ShardIteratorType::AfterSequenceNumber => input.sequence_number.clone().unwrap_or_default(),
+        ShardIteratorType::AtTimestamp => {
+            resolve_at_timestamp(
+                ctx.storage.as_ref(),
+                &input.shard_id,
+                at_timestamp_ms.unwrap_or_default(),
+                width,
+            )
+            .await?
         }
     };
 
@@ -192,8 +164,8 @@ pub async fn handle_get_shard_iterator(
     let type_str = "AFTER_SEQUENCE_NUMBER";
 
     // Encode creation timestamp (seconds since epoch) for 15-minute expiration.
-    // unwrap_or_default: returns epoch 0 if system clock is before 1970 — safe
-    // because the iterator would just expire immediately on the next GetRecords.
+    // unwrap_or_default: returns epoch 0 if the system clock is before 1970,
+    // which only makes the iterator expire on the next GetRecords.
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -211,6 +183,76 @@ pub async fn handle_get_shard_iterator(
         shard_iterator: Some(encoded),
     };
     serialize_output(&output)
+}
+
+/// The model's constraints on a `GetShardIterator` body, in one message: the
+/// `SequenceNumber` is at least 21 characters (measured 2026-10-24 with "0"),
+/// the `ShardIteratorType` is present and a member, the `ShardId` is at least
+/// 28 characters. The service joins every violation under one `N validation
+/// errors detected`, in this order and with no value quoted (measured
+/// 2026-11-20, us-east-1). The `ShardId` maximum is applied once the shard is
+/// not found (`shard_lookup_error`): the shards a release before v0.1.14 wrote
+/// are named after the table, and a table name over 40 characters puts them
+/// past 65.
+fn constraint_violations(body: &Value) -> Result<(), DynamoDbError> {
+    let mut clauses = Vec::new();
+    if body
+        .get("SequenceNumber")
+        .and_then(Value::as_str)
+        .is_some_and(|n| n.chars().count() < 21)
+    {
+        clauses.push(clause(
+            "sequenceNumber",
+            "have length greater than or equal to 21",
+        ));
+    }
+    match body.get("ShardIteratorType") {
+        None | Some(Value::Null) => clauses.push(clause("shardIteratorType", "not be null")),
+        Some(Value::String(t)) if !iterator_params::SHARD_ITERATOR_TYPES.contains(&t.as_str()) => {
+            clauses.push(iterator_params::SHARD_ITERATOR_TYPE_ENUM_CLAUSE.to_owned());
+        }
+        _ => {}
+    }
+    if body
+        .get("ShardId")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s.chars().count() < SHARD_ID_MIN_LEN)
+    {
+        clauses.push(clause("shardId", "have length greater than or equal to 28"));
+    }
+    if clauses.is_empty() {
+        return Ok(());
+    }
+    Err(DynamoDbError::ValidationException(
+        extenddb_core::error::validation_errors_detected(&clauses),
+    ))
+}
+
+/// The AFTER position for an `AT_TIMESTAMP` request: at the first record
+/// created at or after `at_ms`, or after the newest record when none
+/// qualifies (the service's tip-plus-one resolution).
+///
+/// The tip is read before the seek. If the seek then finds nothing, the
+/// iterator starts after that tip, and a record landing between the two
+/// reads is still ahead of it. The other order would skip such a record.
+pub(crate) async fn resolve_at_timestamp(
+    storage: &dyn extenddb_storage::StreamEngine,
+    shard_id: &str,
+    at_ms: i64,
+    width: usize,
+) -> Result<String, DynamoDbError> {
+    let tip = storage
+        .latest_sequence_number(shard_id)
+        .await
+        .map_err(storage_to_dynamo)?;
+    let first = storage
+        .first_sequence_number_at_or_after(shard_id, at_ms)
+        .await
+        .map_err(storage_to_dynamo)?;
+    match first {
+        Some(first) => iterator_params::at_sequence_to_after(&first, width),
+        None => Ok(tip.unwrap_or_default()),
+    }
 }
 
 /// The answer when the shard a `GetShardIterator` names is not found: for a
@@ -241,14 +283,15 @@ const SHARD_ID_MAX_LEN: usize = 65;
 /// `exclusiveStartShardId`, `sequenceNumber`, `limit` and
 /// `exclusiveStartStreamArn`).
 fn constraint(member: &str, rule: &str) -> String {
-    format!(
-        "1 validation error detected: Value at '{member}' failed to satisfy constraint: Member must {rule}"
-    )
+    extenddb_core::error::validation_errors_detected(&[clause(member, rule)])
 }
 
-/// `GetShardIterator` with a `ShardId` under 28 characters (measured 2026-10-24
-/// with `nope`); the same shape `constraint` renders.
-pub const SHARD_ID_TOO_SHORT: &str = "1 validation error detected: Value at 'shardId' failed to satisfy constraint: Member must have length greater than or equal to 28";
+/// One constraint clause of [`constraint`], as the service joins several of
+/// them under one `N validation errors detected` (measured 2026-11-20 on
+/// `GetShardIterator`).
+fn clause(member: &str, rule: &str) -> String {
+    format!("Value at '{member}' failed to satisfy constraint: Member must {rule}")
+}
 
 /// The message `DynamoDB` returns for an expired shard iterator (measured live,
 /// `live-r2/iter-live.json`: an iterator 990 seconds old returns
