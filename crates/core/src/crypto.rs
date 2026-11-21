@@ -93,6 +93,12 @@ pub fn split_nonce(sealed: &[u8]) -> Option<(&[u8; NONCE_LEN], &[u8])> {
 }
 
 /// [`split_nonce`], with the error [`open`] returns for a short input.
+///
+/// `open` is public and reads the nonce from the front of `sealed`, so it
+/// refuses a value too short for a nonce and a tag itself rather than rely on
+/// every caller to. extenddb-storage's secret cipher checks first, with
+/// [`split_nonce`], to name the value's length in its own refusal, so on its
+/// paths this refusal does not fire.
 fn split_or_refuse(sealed: &[u8]) -> Result<(&[u8; NONCE_LEN], &[u8]), String> {
     split_nonce(sealed)
         .ok_or_else(|| "sealed value is shorter than a 12-byte nonce plus 16-byte tag".to_owned())
