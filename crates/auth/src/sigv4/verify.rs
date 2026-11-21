@@ -165,8 +165,9 @@ pub fn verify_signature(
 pub fn validate_timestamp(headers: &HeaderMap) -> Result<String, DynamoDbError> {
     let timestamp = extract_timestamp(headers)?;
 
-    // Parse X-Amz-Date: YYYYMMDDTHHMMSSZ. web-time is std::time on the server
-    // and the browser clock on wasm; the host clock has no now() on wasm.
+    // Parse X-Amz-Date: YYYYMMDDTHHMMSSZ. web-time is std::time except on
+    // wasm32-unknown-unknown and wasm64-unknown-unknown, where std's clock
+    // panics when read and web-time reads the JavaScript host's clock.
     let now = web_time::SystemTime::now()
         .duration_since(web_time::UNIX_EPOCH)
         .ok()
