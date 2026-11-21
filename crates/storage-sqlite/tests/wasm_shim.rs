@@ -31,7 +31,10 @@
 //! integration tests pull the engine, the backup store and tokio's net stack,
 //! none of which build for wasm32. On wasm32 it runs under Node through
 //! `wasm-bindgen-test`, and reaches the shim through the crate's
-//! `#[doc(hidden)]` `wasm_sqlx_for_tests` module.
+//! `#[doc(hidden)]` `wasm_sqlx_for_tests` module. Its rows that decode by
+//! column name use structs declared with the crate's `#[doc(hidden)]`
+//! `sqlite_row_struct!` macro, the one the backend declares its catalog row
+//! structs with.
 //!
 //! The two tests after the table drive the backend itself, an in-memory
 //! `SqliteEngine` opened as the WebAssembly adapter opens it, with requests
@@ -224,25 +227,15 @@ async fn stream(pool: &sqlx::SqlitePool, sql: &str) -> String {
     format!("[{}]", items.join(", "))
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), derive(sqlx::FromRow))]
-struct Person {
-    id: i64,
-    name: String,
-    nickname: Option<String>,
-}
-
-// The backend's catalog structs implement `FromRow` by decoding each field
-// from the column of the same name: natively through `sqlx`'s derive, on wasm
-// through an impl like this one, which the crate's `sqlite_row_struct!`
-// generates for the real structs.
-#[cfg(target_arch = "wasm32")]
-impl sqlx::FromRow for Person {
-    fn from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
-        Ok(Self {
-            id: row.try_get("id")?,
-            name: row.try_get("name")?,
-            nickname: row.try_get("nickname")?,
-        })
+// Declared with the crate's `sqlite_row_struct!`, as the backend's catalog row
+// structs are: natively the struct derives `sqlx::FromRow`; on wasm32 the
+// macro generates the impl that reads each field from the column of the
+// field's name through the shim.
+extenddb_storage_sqlite::sqlite_row_struct! {
+    struct Person {
+        id: i64,
+        name: String,
+        nickname: Option<String>,
     }
 }
 

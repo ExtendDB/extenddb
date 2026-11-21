@@ -15,7 +15,6 @@ use extenddb_storage::util::{index_arn, parse_warm_throughput_record, stream_arn
 use extenddb_storage::vector_catalog::{VectorIndexCatalogRow, vector_index_descriptions};
 
 use crate::data;
-use crate::row_macro::sqlite_row_struct;
 use crate::sqlite_util::parse_timestamp;
 use crate::store::SqliteEngine;
 

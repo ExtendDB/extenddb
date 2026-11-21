@@ -47,7 +47,6 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::row_macro::sqlite_row_struct;
 use extenddb_core::backup_format::BackupArn;
 use extenddb_core::types::{CreateTableInput, RestoreSummary};
 use extenddb_storage::JobPermit;

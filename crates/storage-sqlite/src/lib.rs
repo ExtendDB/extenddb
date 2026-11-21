@@ -38,7 +38,7 @@ pub(crate) use wasm_sqlx::*;
 #[doc(hidden)]
 pub mod wasm_sqlx_for_tests {
     pub use crate::wasm_sqlx::{
-        Connection, Error, FromRow, SqlitePool, query, query_as, query_scalar, raw_sql, sqlite,
+        Connection, Error, FromRow, Row, SqlitePool, query, query_as, query_scalar, raw_sql, sqlite,
     };
 }
 
@@ -55,64 +55,70 @@ pub mod wasm_sqlx_for_tests {
 /// `rename_all`) or on a field (such as `rename`, `default` or `flatten`),
 /// would change that on native only, so the macro refuses one with a compile
 /// error, including one inside a `#[cfg_attr(...)]` at any depth.
-mod row_macro {
-    macro_rules! sqlite_row_struct {
-        (
-            $(#[$($meta:tt)*])*
-            $vis:vis struct $name:ident {
-                $( $(#[$($fattr:tt)*])* $fvis:vis $field:ident : $ty:ty ),* $(,)?
-            }
-        ) => {
-            $( $crate::row_macro::sqlite_row_attr!($($meta)*); )*
-            $( $( $crate::row_macro::sqlite_row_attr!($($fattr)*); )* )*
+///
+/// Exported, and hidden from the documentation, only so that the crate's
+/// `tests/wasm_shim.rs` declares its row structs with this macro on both
+/// targets; it is not part of this crate's API. The expansion names `sqlx`,
+/// which resolves where the macro is invoked.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! sqlite_row_struct {
+    (
+        $(#[$($meta:tt)*])*
+        $vis:vis struct $name:ident {
+            $( $(#[$($fattr:tt)*])* $fvis:vis $field:ident : $ty:ty ),* $(,)?
+        }
+    ) => {
+        $( $crate::sqlite_row_attr!($($meta)*); )*
+        $( $( $crate::sqlite_row_attr!($($fattr)*); )* )*
 
-            $(#[$($meta)*])*
-            #[cfg_attr(not(target_arch = "wasm32"), derive(sqlx::FromRow))]
-            $vis struct $name {
-                $( $(#[$($fattr)*])* $fvis $field : $ty ),*
-            }
+        $(#[$($meta)*])*
+        #[cfg_attr(not(target_arch = "wasm32"), derive(sqlx::FromRow))]
+        $vis struct $name {
+            $( $(#[$($fattr)*])* $fvis $field : $ty ),*
+        }
 
-            #[cfg(target_arch = "wasm32")]
-            impl sqlx::FromRow for $name {
-                fn from_row(row: &sqlx::Row) -> ::core::result::Result<Self, sqlx::Error> {
-                    ::core::result::Result::Ok(Self {
-                        $( $field: sqlx::Row::try_get(row, stringify!($field))? ),*
-                    })
-                }
+        #[cfg(target_arch = "wasm32")]
+        impl sqlx::FromRow for $name {
+            fn from_row(row: &sqlx::Row) -> ::core::result::Result<Self, sqlx::Error> {
+                ::core::result::Result::Ok(Self {
+                    $( $field: sqlx::Row::try_get(row, stringify!($field))? ),*
+                })
             }
-        };
-    }
-    pub(crate) use sqlite_row_struct;
+        }
+    };
+}
 
-    /// Refuses a `#[sqlx(...)]` attribute of a `sqlite_row_struct!` struct or
-    /// field, or one among the attributes of a `#[cfg_attr(...)]`, and passes
-    /// every other attribute (doc comments, `allow`s).
-    macro_rules! sqlite_row_attr {
-        (sqlx $($rest:tt)*) => {
-            compile_error!(
-                "sqlite_row_struct! decodes every field from the column of the field's name on \
-                 both targets; a #[sqlx(...)] attribute would change that on native only"
-            );
-        };
-        (cfg_attr ( $predicate:meta $(, $($attrs:tt)*)? )) => {
-            $( $crate::row_macro::sqlite_row_attr!(@list [] $($attrs)*); )?
-        };
-        // The comma-separated attributes of a `cfg_attr`: each one is checked
-        // as an attribute of its own. The bracket holds the tokens of the
-        // attribute read so far.
-        (@list [$($attr:tt)*]) => {
-            $crate::row_macro::sqlite_row_attr!($($attr)*);
-        };
-        (@list [$($attr:tt)*] , $($rest:tt)*) => {
-            $crate::row_macro::sqlite_row_attr!($($attr)*);
-            $crate::row_macro::sqlite_row_attr!(@list [] $($rest)*);
-        };
-        (@list [$($attr:tt)*] $next:tt $($rest:tt)*) => {
-            $crate::row_macro::sqlite_row_attr!(@list [$($attr)* $next] $($rest)*);
-        };
-        ($($other:tt)*) => {};
-    }
-    pub(crate) use sqlite_row_attr;
+/// Refuses a `#[sqlx(...)]` attribute of a `sqlite_row_struct!` struct or
+/// field, or one among the attributes of a `#[cfg_attr(...)]`, and passes
+/// every other attribute (doc comments, `allow`s). Exported with
+/// `sqlite_row_struct!`, which expands to it.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! sqlite_row_attr {
+    (sqlx $($rest:tt)*) => {
+        compile_error!(
+            "sqlite_row_struct! decodes every field from the column of the field's name on \
+             both targets; a #[sqlx(...)] attribute would change that on native only"
+        );
+    };
+    (cfg_attr ( $predicate:meta $(, $($attrs:tt)*)? )) => {
+        $( $crate::sqlite_row_attr!(@list [] $($attrs)*); )?
+    };
+    // The comma-separated attributes of a `cfg_attr`: each one is checked
+    // as an attribute of its own. The bracket holds the tokens of the
+    // attribute read so far.
+    (@list [$($attr:tt)*]) => {
+        $crate::sqlite_row_attr!($($attr)*);
+    };
+    (@list [$($attr:tt)*] , $($rest:tt)*) => {
+        $crate::sqlite_row_attr!($($attr)*);
+        $crate::sqlite_row_attr!(@list [] $($rest)*);
+    };
+    (@list [$($attr:tt)*] $next:tt $($rest:tt)*) => {
+        $crate::sqlite_row_attr!(@list [$($attr)* $next] $($rest)*);
+    };
+    ($($other:tt)*) => {};
 }
 
 mod admin_store;

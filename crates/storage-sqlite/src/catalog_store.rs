@@ -9,7 +9,6 @@
 
 use std::sync::Arc;
 
-use crate::row_macro::sqlite_row_struct;
 use extenddb_storage::CatalogStore;
 use extenddb_storage::diagnostics::{DiagError, DiagResult, DiagnosticsStore};
 use extenddb_storage::management_store::{
