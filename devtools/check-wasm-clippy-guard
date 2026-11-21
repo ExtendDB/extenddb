@@ -62,7 +62,10 @@ fails, with one line per problem, unless all of these hold:
    SETTING_PROBES lists lint settings in each of these spellings (attribute,
    inner attribute, cfg_attr, `[lints]` table, rustflags, workflow lines); the
    functions that read the crates' files and the workflow must refuse or
-   accept each one as the list says.
+   accept each one as the list says. FILE_PROBES adds to FILE_PROBE_CRATE, in
+   a copy of the working tree, a module outside src/ that #[path] names and a
+   file of another extension that include! reads, each with a lint setting
+   the scan must refuse; the scan must read and refuse both.
    Those functions read lint settings as they are written in the files and
    expand no macro: a setting that a macro builds from its input (for example
    `#[$level(clippy::all)]` in a macro_rules! body), or that a procedural
@@ -848,19 +851,34 @@ def manifest_problems(crates: dict[str, dict], metadata: dict) -> list[str]:
     return problems + workflow_problems(WORKFLOW_REL, workflow)
 
 
+def compiled_files(
+    crates: dict[str, dict], root: Path
+) -> tuple[dict[str, list[Path]], list[str]]:
+    """The files of each crate that the lint-setting scan reads, in the tree at
+    `root` (the working tree or a copy of it), and the problems found: the
+    `.rs` files under each crate's src/ directory."""
+    files = {}
+    for name, package in crates.items():
+        source = root / Path(package["manifest_path"]).parent.relative_to(ROOT) / "src"
+        files[name] = sorted(source.rglob("*.rs"))
+    return files, []
+
+
 def lint_setting_problems(crates: dict[str, dict], metadata: dict) -> tuple[list[str], str]:
-    problems, used_migration, reasoned, files = [], set(), 0, 0
+    used_migration, reasoned, count = set(), 0, 0
+    files, problems = compiled_files(crates, ROOT)
     for name in sorted(crates):
-        source = Path(crates[name]["manifest_path"]).parent / "src"
-        for path in sorted(source.rglob("*.rs")):
+        for path in files[name]:
             rel = path.relative_to(ROOT).as_posix()
-            found, count = attribute_problems(rel, path.read_text(encoding="utf-8"), used_migration)
+            found, reasons = attribute_problems(
+                rel, path.read_text(encoding="utf-8"), used_migration
+            )
             problems += found
-            reasoned += count
-            files += 1
+            reasoned += reasons
+            count += 1
     problems += manifest_problems(crates, metadata)
     summary = (
-        f"lint settings: {files} source files of {len(crates)} crates read;"
+        f"lint settings: {count} source files of {len(crates)} crates read;"
         f" {len(used_migration)} migration code-body modules allow clippy::all;"
         f" {reasoned} allows of a disallowed lint, each with a reason"
     )
@@ -974,6 +992,24 @@ SETTING_PROBES = [
     ("source", "#[deny(clippy::await_holding_lock)]" + _AFN, False),
     ("source", "#[allow(dead_code)]" + _FN, False),
     ("source", '// #[allow(clippy::all)]\nconst S: &str = "#[allow(warnings)]";\n', False),
+    # An allow or expect of a disallowed lint, with a reason, covers what it is
+    # on: it goes as an outer attribute on a function or a statement, not as an
+    # inner attribute or on a module, an impl block or a trait.
+    ("source", f'#![allow({_DM}, reason = "only the server calls it")]\n', True),
+    ("source", f'#![cfg_attr(target_arch = "wasm32", expect({_DM}, reason = "x"))]\n', True),
+    ("source", f'fn f() {{\n    #![allow({_DM}, reason = "x")]\n}}\n', True),
+    ("source", f'#[allow({_DM}, reason = "x")]\nmod m {{}}\n', True),
+    ("source", f'#[allow({_DM}, reason = "x")]\npub(crate) mod m;\n', True),
+    ("source", f'#[allow({_DM}, reason = "x")]\nimpl S {{}}\n', True),
+    ("source", f'#[allow({_DM}, reason = "x")]\nunsafe impl Send for S {{}}\n', True),
+    ("source", f'#[allow({_DM}, reason = "x")]\n/// A trait.\npub trait T {{}}\n', True),
+    (
+        "source",
+        f'#[allow({_DM}, reason = "x")]\n#[inline]\npub(crate) async unsafe fn f() {{}}\n',
+        False,
+    ),
+    ("source", f'fn f() {{\n    #[allow({_DM}, reason = "x")]\n    g();\n}}\n', False),
+    ("source", f'#[allow({_DM}, reason = "x")]\nextern "C" fn f() {{}}\n', False),
     ("lints", '[lints.clippy]\nall = "allow"\n', True),
     ("lints", '[lints.clippy]\nawait_holding_lock = "allow"\n', True),
     ("lints", '[lints.clippy]\nawait_holding_refcell_ref = { level = "expect" }\n', True),
@@ -1015,6 +1051,70 @@ def setting_probe_problems() -> tuple[list[str], str]:
 
 
 # ---------------------------------------------------------------- probe run
+
+# Files added, in the copy of the tree, to FILE_PROBE_CRATE, each with a lint
+# setting the scan must refuse, to check that the scan reads a file wherever the
+# crate's build reads it: a module outside src/ that #[path] names, and a file
+# of another extension that include! reads. Each is the file, relative to the
+# crate's directory; its text; and what the copy appends to the crate root.
+# FILE_PROBE_CRATE is the adapter, on which no other crate the wasm build
+# compiles depends.
+FILE_PROBE_CRATE = ADAPTER
+FILE_PROBES = [
+    (
+        "wasm_clippy_guard_probe/outside_src.rs",
+        f"#![allow({_DM})]\n",
+        '#[path = "../wasm_clippy_guard_probe/outside_src.rs"]\n'
+        "mod wasm_clippy_guard_outside_src;\n",
+    ),
+    (
+        "src/wasm_clippy_guard_probe.inc",
+        f"#[allow({_DM})]\nconst _: () = ();\n",
+        'include!("wasm_clippy_guard_probe.inc");\n',
+    ),
+]
+
+
+def lib_root(package: dict) -> Path:
+    """The crate root of a package's library target, from `cargo metadata`."""
+    return Path(
+        next(t["src_path"] for t in package["targets"] if {"lib", "rlib"} & set(t["kind"]))
+    )
+
+
+def file_probe_problems(crates: dict[str, dict], copy: Path) -> tuple[list[str], str]:
+    """Problems with FILE_PROBES, added to the copy of the tree at `copy`: a
+    probe file that is not among the files the scan reads of FILE_PROBE_CRATE,
+    or whose lint setting it does not refuse."""
+    package = crates.get(FILE_PROBE_CRATE)
+    if package is None:
+        return [f"FILE_PROBE_CRATE {FILE_PROBE_CRATE} is not compiled by the wasm build"], ""
+    crate_dir = Path(package["manifest_path"]).parent.relative_to(ROOT)
+    crate_root = lib_root(package).relative_to(ROOT)
+    for rel, text, declaration in FILE_PROBES:
+        if (ROOT / crate_dir / rel).exists():
+            return [f"{crate_dir / rel} exists; the file probes need that name"], ""
+        (copy / crate_dir / rel).parent.mkdir(parents=True, exist_ok=True)
+        (copy / crate_dir / rel).write_text(text, encoding="utf-8")
+        with open(copy / crate_root, "a", encoding="utf-8") as root_file:
+            root_file.write("\n" + declaration)
+    files, problems = compiled_files({FILE_PROBE_CRATE: package}, copy)
+    read = {path.resolve() for path in files.get(FILE_PROBE_CRATE, [])}
+    refused = 0
+    for rel, _, _ in FILE_PROBES:
+        path = (copy / crate_dir / rel).resolve()
+        if path not in read:
+            problems.append(
+                f"file probe {crate_dir / rel}: not among the files the lint-setting scan"
+                f" reads of {FILE_PROBE_CRATE}"
+            )
+            continue
+        found, _ = attribute_problems((crate_dir / rel).as_posix(), path.read_text(), set())
+        if found:
+            refused += 1
+        else:
+            problems.append(f"file probe {crate_dir / rel}: read, but its setting not refused")
+    return problems, f"file probes: {refused} of {len(FILE_PROBES)} read and refused"
 
 
 def copy_tree(destination: Path) -> int:
@@ -1095,7 +1195,11 @@ def config_warnings(messages: list[dict], stderr: str) -> list[str]:
     return sorted(found)
 
 
-def probe_problems(crates: dict[str, dict], metadata: dict) -> tuple[list[str], str]:
+def probe_problems(
+    crates: dict[str, dict], metadata: dict, copy: Path, files: int
+) -> tuple[list[str], str]:
+    """Problems with the probe run: the clippy step, in the copy of the tree at
+    `copy` (`files` files), with every probe added to PROBE_CRATE."""
     probe = crates.get(PROBE_CRATE)
     if probe is None:
         return [f"PROBE_CRATE {PROBE_CRATE} is not compiled by the wasm build"], ""
@@ -1108,9 +1212,7 @@ def probe_problems(crates: dict[str, dict], metadata: dict) -> tuple[list[str], 
             f"PROBE_CRATE {PROBE_CRATE} does not depend directly on"
             f" {', '.join(sorted(needed - direct))}, which the probes name"
         ], ""
-    crate_root = Path(
-        next(t["src_path"] for t in probe["targets"] if {"lib", "rlib"} & set(t["kind"]))
-    )
+    crate_root = lib_root(probe)
     probe_file = crate_root.parent / f"{PROBE_MODULE}.rs"
     if probe_file.exists():
         return [f"{probe_file.relative_to(ROOT)} exists; the probes need that name"], ""
@@ -1128,16 +1230,10 @@ def probe_problems(crates: dict[str, dict], metadata: dict) -> tuple[list[str], 
                 lines.append("}")
 
     problems = []
-    copy = Path(tempfile.mkdtemp(prefix="wasm-clippy-guard-"))
-    try:
-        files = copy_tree(copy)
-        (copy / rel).write_text("\n".join(lines) + "\n", encoding="utf-8")
-        root_rel = crate_root.relative_to(ROOT)
-        with open(copy / root_rel, "a", encoding="utf-8") as declaration:
-            declaration.write(f"\n#[allow(dead_code, unused, deprecated)]\nmod {PROBE_MODULE};\n")
-        code, messages, stderr = run_clippy(copy, metadata["target_directory"])
-    finally:
-        shutil.rmtree(copy, ignore_errors=True)
+    (copy / rel).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    with open(copy / crate_root.relative_to(ROOT), "a", encoding="utf-8") as declaration:
+        declaration.write(f"\n#[allow(dead_code, unused, deprecated)]\nmod {PROBE_MODULE};\n")
+    code, messages, stderr = run_clippy(copy, metadata["target_directory"])
 
     if code == 0:
         problems.append("the clippy step passed with every probe in place")
@@ -1252,8 +1348,16 @@ def main() -> int:
     found, settings = message_probe_problems()
     failures += found
     print(settings)
-    found, probes = probe_problems(crates, metadata)
-    failures += found
+    copy = Path(tempfile.mkdtemp(prefix="wasm-clippy-guard-"))
+    try:
+        files = copy_tree(copy)
+        found, settings = file_probe_problems(crates, copy)
+        failures += found
+        print(settings)
+        found, probes = probe_problems(crates, metadata, copy, files)
+        failures += found
+    finally:
+        shutil.rmtree(copy, ignore_errors=True)
     for failure in failures:
         print(f"FAIL: {failure}", file=sys.stderr)
     methods = len(paths.get("disallowed-methods", []))
