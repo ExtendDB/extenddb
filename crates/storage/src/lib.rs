@@ -423,8 +423,8 @@ pub trait DataEngine: Send + Sync {
     /// scan, under this backend's own segment-assignment function.
     ///
     /// Segment assignment is backend-private (Postgres hashes the partition
-    /// key with `hashtext`, MongoDB with CRC32, SQLite partitions by rowid),
-    /// so only the backend can answer this. The engine owns the rule and the
+    /// key with `hashtext`, MongoDB and SQLite with CRC32), so only the
+    /// backend can answer this. The engine owns the rule and the
     /// error: a `Scan` whose `ExclusiveStartKey` reports `false` here is
     /// refused before storage is asked to scan, because resuming a segment
     /// with another segment's key would otherwise return a silently wrong
@@ -432,9 +432,9 @@ pub trait DataEngine: Send + Sync {
     ///
     /// `Ok(true)` means "cannot be proven foreign" rather than "proven local":
     /// a backend whose assignment depends on storage identity rather than key
-    /// content (SQLite's rowid) MUST return `true` for a key it cannot resolve,
-    /// because DynamoDB permits an `ExclusiveStartKey` that no longer exists
-    /// and refusing it would reject legitimate resumptions after a delete.
+    /// content MUST return `true` for a key it cannot resolve, because
+    /// DynamoDB permits an `ExclusiveStartKey` that no longer exists and
+    /// refusing it would reject legitimate resumptions after a delete.
     ///
     /// Required, not defaulted: a new backend must decide its answer
     /// explicitly, since returning a constant `true` silently disables the

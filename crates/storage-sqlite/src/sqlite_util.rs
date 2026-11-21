@@ -2,9 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Shared helpers for the SQLite backend: connection-URL building, the
-//! connection pragmas, RFC 3339 timestamp conversion, and constraint-violation
-//! classification.
+//! connection pragmas, the parallel Scan segment function, RFC 3339 timestamp
+//! conversion, and constraint-violation classification.
 
+use std::ffi::c_int;
+
+use extenddb_storage::util::scan_segment;
+use libsqlite3_sys as ffi;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -28,6 +32,71 @@ pub(crate) async fn set_connection_pragmas(
     conn.execute("PRAGMA busy_timeout = 5000").await?;
     conn.execute("PRAGMA cache_size = -32000").await?;
     Ok(())
+}
+
+/// Register the SQL function `extenddb_scan_segment` on `conn`, which
+/// evaluates [`scan_segment`] on a data or index table's `pk` column. Every
+/// connection of the engine's pool registers it when it opens.
+///
+/// # Errors
+///
+/// SQLite refused the registration.
+pub(crate) async fn register_scan_segment(
+    conn: &mut sqlx::SqliteConnection,
+) -> Result<(), sqlx::Error> {
+    let mut handle = conn.lock_handle().await?;
+    // SAFETY: the handle is the open connection the lock guards, the name is
+    // NUL-terminated, and `scan_segment_sql` has the signature of an SQLite
+    // scalar function. No user data and no destructor are registered.
+    let rc = unsafe {
+        ffi::sqlite3_create_function_v2(
+            handle.as_raw_handle().as_ptr(),
+            c"extenddb_scan_segment".as_ptr(),
+            2,
+            ffi::SQLITE_UTF8 | ffi::SQLITE_DETERMINISTIC,
+            std::ptr::null_mut(),
+            Some(scan_segment_sql),
+            None,
+            None,
+            None,
+        )
+    };
+    if rc == ffi::SQLITE_OK {
+        Ok(())
+    } else {
+        Err(sqlx::Error::Protocol(format!(
+            "register extenddb_scan_segment: SQLite error code {rc}"
+        )))
+    }
+}
+
+/// [`scan_segment`] as SQLite calls it: `(pk, total_segments)`. A NULL `pk`,
+/// which no row has, answers NULL as SQLite's own functions do.
+unsafe extern "C" fn scan_segment_sql(
+    ctx: *mut ffi::sqlite3_context,
+    _argc: c_int,
+    argv: *mut *mut ffi::sqlite3_value,
+) {
+    // SAFETY: the function is registered with two arguments, so SQLite passes
+    // two values that stay valid for the call. The text pointer is read
+    // before its byte count, the order SQLite documents for a text value.
+    unsafe {
+        let pk = *argv;
+        if ffi::sqlite3_value_type(pk) == ffi::SQLITE_NULL {
+            ffi::sqlite3_result_null(ctx);
+            return;
+        }
+        let text = ffi::sqlite3_value_text(pk);
+        if text.is_null() {
+            // The conversion of a non-NULL value to text ran out of memory.
+            ffi::sqlite3_result_error_nomem(ctx);
+            return;
+        }
+        let len = usize::try_from(ffi::sqlite3_value_bytes(pk)).unwrap_or(0);
+        let total = ffi::sqlite3_value_int64(*argv.add(1));
+        let segment = scan_segment(std::slice::from_raw_parts(text, len), total);
+        ffi::sqlite3_result_int64(ctx, segment);
+    }
 }
 
 /// Normalize a configured path or connection string into a sqlx-openable
