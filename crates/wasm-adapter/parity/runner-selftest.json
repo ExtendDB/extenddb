@@ -1,253 +1,2385 @@
 {
   "_comment": [
     "Copyright 2026 ExtendDB contributors \u2014 SPDX-License-Identifier: Apache-2.0.",
-    "Self-tests of the two corpus runners' case judging. Both tests/parity.rs",
-    "(native) and parity/run.mjs (Node) judge every row before they run the",
-    "corpus, and fail if a row's outcome is not its expect value. Each row:",
+    "Self-tests of the two corpus runners. tests/parity.rs (native) and",
+    "parity/run.mjs (Node) each judge every row before they run the corpus,",
+    "and fail if a row's outcome is not its expect value. Each row:",
     "  name      human label.",
-    "  case      a corpus case's assertions: error and checks (see corpus.json).",
-    "  response  the response document the case is judged against.",
-    "  expect    pass   - the response satisfies the case;",
-    "            fail   - the case is well formed and the response does not",
-    "                     satisfy it;",
-    "            reject - the case itself is malformed (an unknown check shape,",
-    "                     a member that is not part of a check, a non-string",
-    "                     error), whatever the response."
+    "  case      a corpus case (see corpus.json), read with the case schema;",
+    "  caseText  or the case as JSON text, which each runner parses itself, for",
+    "            rows about the text: numbers as written, unpaired surrogates,",
+    "            repeated members, whitespace, nesting depth.",
+    "  saved     optional: {name: string}, the values earlier cases saved, for",
+    "            the case's ${name} body strings.",
+    "  bytes     optional: the exact request text the case submits.",
+    "  response  optional: a response document the case is judged against with",
+    "            its error and checks (not onWasm); its save paths must then",
+    "            address strings in it.",
+    "  expect    pass   - the case follows the schema, and it submits bytes and",
+    "                     is satisfied by response, where those are given;",
+    "            fail   - the case follows the schema, and it submits other",
+    "                     bytes or response does not satisfy it;",
+    "            reject - the case does not follow the schema, or its text does",
+    "                     not parse."
   ],
   "rows": [
     {
       "name": "equals on a scalar member",
-      "case": { "error": null, "checks": [{ "path": "/A", "equals": "x" }] },
-      "response": { "A": "x" },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/A",
+            "equals": "x"
+          }
+        ]
+      },
+      "response": {
+        "A": "x"
+      },
       "expect": "pass"
     },
     {
       "name": "equals on a different scalar",
-      "case": { "error": null, "checks": [{ "path": "/A", "equals": "y" }] },
-      "response": { "A": "x" },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/A",
+            "equals": "y"
+          }
+        ]
+      },
+      "response": {
+        "A": "x"
+      },
       "expect": "fail"
     },
     {
       "name": "equals compares object members regardless of their order",
-      "case": { "error": null, "checks": [{ "path": "/A", "equals": { "y": 2, "x": 1 } }] },
-      "response": { "A": { "x": 1, "y": 2 } },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/A",
+            "equals": {
+              "y": 2,
+              "x": 1
+            }
+          }
+        ]
+      },
+      "response": {
+        "A": {
+          "x": 1,
+          "y": 2
+        }
+      },
       "expect": "pass"
     },
     {
       "name": "equals compares nested object members regardless of their order",
-      "case": { "error": null, "checks": [{ "path": "/A", "equals": [{ "b": [1, 2], "a": { "d": 4, "c": 3 } }] }] },
-      "response": { "A": [{ "a": { "c": 3, "d": 4 }, "b": [1, 2] }] },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/A",
+            "equals": [
+              {
+                "b": [
+                  1,
+                  2
+                ],
+                "a": {
+                  "d": 4,
+                  "c": 3
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "response": {
+        "A": [
+          {
+            "a": {
+              "c": 3,
+              "d": 4
+            },
+            "b": [
+              1,
+              2
+            ]
+          }
+        ]
+      },
       "expect": "pass"
     },
     {
       "name": "equals compares array elements in order",
-      "case": { "error": null, "checks": [{ "path": "/A", "equals": [1, 2] }] },
-      "response": { "A": [2, 1] },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/A",
+            "equals": [
+              1,
+              2
+            ]
+          }
+        ]
+      },
+      "response": {
+        "A": [
+          2,
+          1
+        ]
+      },
       "expect": "fail"
     },
     {
       "name": "equals fails on an extra object member",
-      "case": { "error": null, "checks": [{ "path": "/A", "equals": { "x": 1 } }] },
-      "response": { "A": { "x": 1, "y": 2 } },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/A",
+            "equals": {
+              "x": 1
+            }
+          }
+        ]
+      },
+      "response": {
+        "A": {
+          "x": 1,
+          "y": 2
+        }
+      },
       "expect": "fail"
     },
     {
-      "name": "equals compares numbers by value (1 and 1.0)",
-      "case": { "error": null, "checks": [{ "path": "/A", "equals": 1 }] },
-      "response": { "A": 1.0 },
+      "name": "equals compares numbers by value (1 and a response's 1.0)",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/A",
+            "equals": 1
+          }
+        ]
+      },
+      "response": {
+        "A": 1.0
+      },
       "expect": "pass"
     },
     {
       "name": "equals does not equate a number and its string",
-      "case": { "error": null, "checks": [{ "path": "/A", "equals": 1 }] },
-      "response": { "A": "1" },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/A",
+            "equals": 1
+          }
+        ]
+      },
+      "response": {
+        "A": "1"
+      },
       "expect": "fail"
     },
     {
       "name": "equals null on a missing member fails",
-      "case": { "error": null, "checks": [{ "path": "/A", "equals": null }] },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/A",
+            "equals": null
+          }
+        ]
+      },
       "response": {},
       "expect": "fail"
     },
     {
       "name": "equals null on a null member",
-      "case": { "error": null, "checks": [{ "path": "/A", "equals": null }] },
-      "response": { "A": null },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/A",
+            "equals": null
+          }
+        ]
+      },
+      "response": {
+        "A": null
+      },
       "expect": "pass"
     },
     {
       "name": "contains on a string member",
-      "case": { "error": null, "checks": [{ "path": "/A", "contains": "ell" }] },
-      "response": { "A": "hello" },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/A",
+            "contains": "ell"
+          }
+        ]
+      },
+      "response": {
+        "A": "hello"
+      },
       "expect": "pass"
     },
     {
       "name": "contains on a string without the substring",
-      "case": { "error": null, "checks": [{ "path": "/A", "contains": "xyz" }] },
-      "response": { "A": "hello" },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/A",
+            "contains": "xyz"
+          }
+        ]
+      },
+      "response": {
+        "A": "hello"
+      },
       "expect": "fail"
     },
     {
       "name": "contains on a member that is not a string",
-      "case": { "error": null, "checks": [{ "path": "/A", "contains": "1" }] },
-      "response": { "A": 1 },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/A",
+            "contains": "1"
+          }
+        ]
+      },
+      "response": {
+        "A": 1
+      },
       "expect": "fail"
     },
     {
       "name": "absent on a missing member",
-      "case": { "error": null, "checks": [{ "path": "/A", "absent": true }] },
-      "response": { "B": 1 },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/A",
+            "absent": true
+          }
+        ]
+      },
+      "response": {
+        "B": 1
+      },
       "expect": "pass"
     },
     {
       "name": "absent on a present null member",
-      "case": { "error": null, "checks": [{ "path": "/A", "absent": true }] },
-      "response": { "A": null },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/A",
+            "absent": true
+          }
+        ]
+      },
+      "response": {
+        "A": null
+      },
       "expect": "fail"
     },
     {
       "name": "present on a present member",
-      "case": { "error": null, "checks": [{ "path": "/A/0", "present": true }] },
-      "response": { "A": [0] },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/A/0",
+            "present": true
+          }
+        ]
+      },
+      "response": {
+        "A": [
+          0
+        ]
+      },
       "expect": "pass"
     },
     {
       "name": "present on a missing member",
-      "case": { "error": null, "checks": [{ "path": "/A/1", "present": true }] },
-      "response": { "A": [0] },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/A/1",
+            "present": true
+          }
+        ]
+      },
+      "response": {
+        "A": [
+          0
+        ]
+      },
       "expect": "fail"
     },
     {
-      "name": "the expected error name",
-      "case": { "error": "ValidationException", "checks": [] },
-      "response": { "__type": "com.amazon.coral.validate#ValidationException", "message": "m" },
+      "name": "the expected error name and message",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": "ValidationException",
+        "checks": [
+          {
+            "path": "/message",
+            "equals": "m"
+          }
+        ]
+      },
+      "response": {
+        "__type": "com.amazon.coral.validate#ValidationException",
+        "message": "m"
+      },
       "expect": "pass"
     },
     {
+      "name": "the expected error name with another message",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": "ValidationException",
+        "checks": [
+          {
+            "path": "/message",
+            "equals": "m"
+          }
+        ]
+      },
+      "response": {
+        "__type": "com.amazon.coral.validate#ValidationException",
+        "message": "n"
+      },
+      "expect": "fail"
+    },
+    {
       "name": "a different error name",
-      "case": { "error": "ValidationException", "checks": [] },
-      "response": { "__type": "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException" },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": "ValidationException",
+        "checks": [
+          {
+            "path": "/message",
+            "equals": "m"
+          }
+        ]
+      },
+      "response": {
+        "__type": "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException",
+        "message": "m"
+      },
       "expect": "fail"
     },
     {
       "name": "an error where success is expected",
-      "case": { "error": null, "checks": [] },
-      "response": { "__type": "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException" },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/A",
+            "absent": true
+          }
+        ]
+      },
+      "response": {
+        "__type": "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException",
+        "message": "m"
+      },
       "expect": "fail"
     },
     {
       "name": "success where an error is expected",
-      "case": { "error": "ValidationException", "checks": [] },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": "ValidationException",
+        "checks": [
+          {
+            "path": "/message",
+            "equals": "m"
+          }
+        ]
+      },
       "response": {},
       "expect": "fail"
     },
     {
-      "name": "a pointer without a leading slash addresses nothing",
-      "case": { "error": null, "checks": [{ "path": "A", "absent": true }] },
-      "response": { "A": 1 },
+      "name": "absent on /message holds for an error document without a message",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": "UnknownOperationException",
+        "checks": [
+          {
+            "path": "/message",
+            "absent": true
+          }
+        ]
+      },
+      "response": {
+        "__type": "com.amazon.coral.service#UnknownOperationException"
+      },
       "expect": "pass"
     },
     {
       "name": "an array index with a leading zero addresses nothing",
-      "case": { "error": null, "checks": [{ "path": "/A/01", "absent": true }] },
-      "response": { "A": [0, 1] },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/A/01",
+            "absent": true
+          }
+        ]
+      },
+      "response": {
+        "A": [
+          0,
+          1
+        ]
+      },
       "expect": "pass"
     },
     {
       "name": "an empty array index addresses nothing",
-      "case": { "error": null, "checks": [{ "path": "/A/", "absent": true }] },
-      "response": { "A": [0, 1] },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/A/",
+            "absent": true
+          }
+        ]
+      },
+      "response": {
+        "A": [
+          0,
+          1
+        ]
+      },
       "expect": "pass"
     },
     {
       "name": "a pointer addresses only the document's own members",
-      "case": { "error": null, "checks": [{ "path": "/constructor", "absent": true }] },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/constructor",
+            "absent": true
+          }
+        ]
+      },
       "response": {},
       "expect": "pass"
     },
     {
       "name": "escaped pointer tokens address their member",
-      "case": { "error": null, "checks": [{ "path": "/a~1b/c~0d", "equals": 1 }] },
-      "response": { "a/b": { "c~d": 1 } },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/a~1b/c~0d",
+            "equals": 1
+          }
+        ]
+      },
+      "response": {
+        "a/b": {
+          "c~d": 1
+        }
+      },
       "expect": "pass"
     },
     {
       "name": "the empty pointer addresses the whole document",
-      "case": { "error": null, "checks": [{ "path": "", "equals": { "A": 1 } }] },
-      "response": { "A": 1 },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "",
+            "equals": {
+              "A": 1
+            }
+          }
+        ]
+      },
+      "response": {
+        "A": 1
+      },
       "expect": "pass"
     },
     {
+      "name": "a save path that addresses a string is saved",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/TableNames",
+            "equals": [
+              "Products"
+            ]
+          }
+        ],
+        "save": {
+          "first": "/TableNames/0"
+        }
+      },
+      "response": {
+        "TableNames": [
+          "Products"
+        ]
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "a save path that does not address a string fails",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/TableNames",
+            "equals": [
+              "Products"
+            ]
+          }
+        ],
+        "save": {
+          "all": "/TableNames"
+        }
+      },
+      "response": {
+        "TableNames": [
+          "Products"
+        ]
+      },
+      "expect": "fail"
+    },
+    {
       "name": "a misspelt check kind is rejected",
-      "case": { "error": null, "checks": [{ "path": "/NoSuchMember", "equal": "x" }] },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/NoSuchMember",
+            "equal": "x"
+          }
+        ]
+      },
       "response": {},
       "expect": "reject"
     },
     {
       "name": "a check with an extra member is rejected",
-      "case": { "error": null, "checks": [{ "path": "/A", "equals": "x", "note": "extra" }] },
-      "response": { "A": "x" },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/A",
+            "equals": "x",
+            "note": "extra"
+          }
+        ]
+      },
+      "response": {
+        "A": "x"
+      },
       "expect": "reject"
     },
     {
       "name": "a check with two kinds is rejected",
-      "case": { "error": null, "checks": [{ "path": "/A", "equals": "hello", "contains": "ell" }] },
-      "response": { "A": "hello" },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/A",
+            "equals": "hello",
+            "contains": "ell"
+          }
+        ]
+      },
+      "response": {
+        "A": "hello"
+      },
       "expect": "reject"
     },
     {
       "name": "a check without a path is rejected",
-      "case": { "error": null, "checks": [{ "equals": "x" }] },
-      "response": { "A": "x" },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "equals": "x"
+          }
+        ]
+      },
+      "response": {
+        "A": "x"
+      },
       "expect": "reject"
     },
     {
       "name": "a check whose path is not a string is rejected",
-      "case": { "error": null, "checks": [{ "path": 1, "absent": true }] },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": 1,
+            "absent": true
+          }
+        ]
+      },
+      "response": {},
+      "expect": "reject"
+    },
+    {
+      "name": "a check path without a leading slash is rejected",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "A",
+            "absent": true
+          }
+        ]
+      },
+      "response": {
+        "A": 1
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "a check path with ~ not followed by 0 or 1 is rejected",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/a~2b",
+            "absent": true
+          }
+        ]
+      },
+      "response": {},
+      "expect": "reject"
+    },
+    {
+      "name": "a check path ending in ~ is rejected",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/a~",
+            "absent": true
+          }
+        ]
+      },
       "response": {},
       "expect": "reject"
     },
     {
       "name": "absent false is rejected",
-      "case": { "error": null, "checks": [{ "path": "/A", "absent": false }] },
-      "response": { "A": 1 },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/A",
+            "absent": false
+          }
+        ]
+      },
+      "response": {
+        "A": 1
+      },
       "expect": "reject"
     },
     {
       "name": "present false is rejected",
-      "case": { "error": null, "checks": [{ "path": "/A", "present": false }] },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/A",
+            "present": false
+          }
+        ]
+      },
       "response": {},
       "expect": "reject"
     },
     {
       "name": "contains with a non-string value is rejected",
-      "case": { "error": null, "checks": [{ "path": "/A", "contains": 1 }] },
-      "response": { "A": "1" },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/A",
+            "contains": 1
+          }
+        ]
+      },
+      "response": {
+        "A": "1"
+      },
       "expect": "reject"
     },
     {
       "name": "a check that is not an object is rejected",
-      "case": { "error": null, "checks": ["/A"] },
-      "response": { "A": 1 },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          "/A"
+        ]
+      },
+      "response": {
+        "A": 1
+      },
       "expect": "reject"
     },
     {
       "name": "checks that are not an array are rejected",
-      "case": { "error": null, "checks": { "path": "/A", "equals": 1 } },
-      "response": { "A": 1 },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": {
+          "path": "/A",
+          "equals": 1
+        }
+      },
+      "response": {
+        "A": 1
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "a well-formed case",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/TableNames",
+            "equals": [
+              "Products"
+            ]
+          }
+        ]
+      },
+      "response": {
+        "TableNames": [
+          "Products"
+        ]
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "a case's members are read in any order",
+      "caseText": "{\"checks\":[{\"equals\":[\"Products\"],\"path\":\"/TableNames\"}],\"error\":null,\"body\":{},\"op\":\"ListTables\",\"name\":\"x\"}",
+      "response": {
+        "TableNames": [
+          "Products"
+        ]
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "a case that is not an object is rejected",
+      "case": [
+        "ListTables"
+      ],
+      "expect": "reject"
+    },
+    {
+      "name": "a case without name is rejected",
+      "case": {
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/TableNames",
+            "equals": [
+              "Products"
+            ]
+          }
+        ]
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "a case whose name is not a string is rejected",
+      "case": {
+        "name": 1,
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/TableNames",
+            "equals": [
+              "Products"
+            ]
+          }
+        ]
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "a case with an empty name is rejected",
+      "case": {
+        "name": "",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/TableNames",
+            "equals": [
+              "Products"
+            ]
+          }
+        ]
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "a case without op is rejected",
+      "case": {
+        "name": "x",
+        "body": {},
+        "error": "ValidationException",
+        "checks": [
+          {
+            "path": "/message",
+            "equals": "m"
+          }
+        ]
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "a case whose op is a number is rejected",
+      "case": {
+        "name": "x",
+        "op": 123,
+        "body": {},
+        "error": "ValidationException",
+        "checks": [
+          {
+            "path": "/message",
+            "equals": "m"
+          }
+        ]
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "a case with an empty op is rejected",
+      "case": {
+        "name": "x",
+        "op": "",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/TableNames",
+            "equals": [
+              "Products"
+            ]
+          }
+        ]
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "a case with neither body nor rawBody is rejected (expecting ValidationException)",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "error": "ValidationException",
+        "checks": [
+          {
+            "path": "/message",
+            "equals": "m"
+          }
+        ]
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "a case with neither body nor rawBody is rejected (expecting SerializationException)",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "error": "SerializationException",
+        "checks": [
+          {
+            "path": "/message",
+            "equals": "m"
+          }
+        ]
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "a case with both body and rawBody is rejected",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "rawBody": "{}",
+        "error": null,
+        "checks": [
+          {
+            "path": "/TableNames",
+            "equals": [
+              "Products"
+            ]
+          }
+        ]
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "a rawBody that is a number is rejected",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "rawBody": 5,
+        "error": "ValidationException",
+        "checks": [
+          {
+            "path": "/message",
+            "equals": "m"
+          }
+        ]
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "a body that is not an object is rejected",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": [],
+        "error": null,
+        "checks": [
+          {
+            "path": "/TableNames",
+            "equals": [
+              "Products"
+            ]
+          }
+        ]
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "a null body is rejected",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": null,
+        "error": null,
+        "checks": [
+          {
+            "path": "/TableNames",
+            "equals": [
+              "Products"
+            ]
+          }
+        ]
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "a case without error is rejected",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "checks": [
+          {
+            "path": "/TableNames",
+            "equals": [
+              "Products"
+            ]
+          }
+        ]
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "a misspelt error member is rejected",
+      "case": {
+        "name": "x",
+        "op": "GetItem",
+        "body": {
+          "TableName": "Nope",
+          "Key": {
+            "productId": {
+              "S": "p"
+            }
+          }
+        },
+        "eror": "ValidationException",
+        "checks": [
+          {
+            "path": "/message",
+            "equals": "m"
+          }
+        ]
+      },
       "expect": "reject"
     },
     {
       "name": "an error name that is not a string is rejected",
-      "case": { "error": 1, "checks": [] },
-      "response": { "__type": "x#1" },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": 1,
+        "checks": [
+          {
+            "path": "/message",
+            "equals": "m"
+          }
+        ]
+      },
+      "response": {
+        "__type": "x#1"
+      },
       "expect": "reject"
     },
     {
       "name": "an empty error name is rejected",
-      "case": { "error": "", "checks": [] },
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": "",
+        "checks": [
+          {
+            "path": "/message",
+            "equals": "m"
+          }
+        ]
+      },
       "response": {},
       "expect": "reject"
+    },
+    {
+      "name": "a case without checks is rejected",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "a misspelt checks member is rejected",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "chekcs": [
+          {
+            "path": "/TableNames/0",
+            "equals": "WRONG"
+          }
+        ]
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "an empty checks array is rejected",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": []
+      },
+      "response": {
+        "TableNames": [
+          "Products"
+        ]
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "a success case that checks only /__type is rejected",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/__type",
+            "absent": true
+          }
+        ]
+      },
+      "response": {
+        "TableNames": [
+          "Products"
+        ]
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "an error case with no check on /message is rejected",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": "ValidationException",
+        "checks": [
+          {
+            "path": "/__type",
+            "contains": "Validation"
+          }
+        ]
+      },
+      "response": {
+        "__type": "com.amazon.coral.validate#ValidationException",
+        "message": "m"
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "an error case whose only /message check is present is rejected",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": "ValidationException",
+        "checks": [
+          {
+            "path": "/message",
+            "present": true
+          }
+        ]
+      },
+      "response": {
+        "__type": "com.amazon.coral.validate#ValidationException",
+        "message": "m"
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "an error case may check other members besides /message",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": "ValidationException",
+        "checks": [
+          {
+            "path": "/message",
+            "contains": "m"
+          },
+          {
+            "path": "/Reason",
+            "equals": "r"
+          }
+        ]
+      },
+      "response": {
+        "__type": "com.amazon.coral.validate#ValidationException",
+        "message": "m",
+        "Reason": "r"
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "an unknown case member is rejected",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/TableNames",
+            "equals": [
+              "Products"
+            ]
+          }
+        ],
+        "note": "extra"
+      },
+      "response": {
+        "TableNames": [
+          "Products"
+        ]
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "an unknown member holding a number out of range is rejected",
+      "caseText": "{\"name\":\"x\",\"op\":\"ListTables\",\"body\":{},\"error\":null,\"checks\":[{\"path\":\"/Nope\",\"absent\":true}],\"extra\":1e400}",
+      "expect": "reject"
+    },
+    {
+      "name": "a later duplicate member replaces an earlier one, in both runners",
+      "caseText": "{\"name\":\"x\",\"op\":\"ListTables\",\"body\":{},\"error\":\"ValidationException\",\"error\":null,\"checks\":[{\"path\":\"/TableNames\",\"equals\":[\"Products\"]}]}",
+      "response": {
+        "TableNames": [
+          "Products"
+        ]
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "a duplicate member does not save a case that checks nothing",
+      "caseText": "{\"name\":\"x\",\"op\":\"ListTables\",\"body\":{},\"error\":\"ValidationException\",\"error\":null,\"checks\":[]}",
+      "expect": "reject"
+    },
+    {
+      "name": "a save that is a string is rejected",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/TableNames",
+            "equals": [
+              "Products"
+            ]
+          }
+        ],
+        "save": "x"
+      },
+      "response": {
+        "TableNames": [
+          "Products"
+        ]
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "a save that is an array is rejected",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/TableNames",
+            "equals": [
+              "Products"
+            ]
+          }
+        ],
+        "save": [
+          "/TableNames/0"
+        ]
+      },
+      "response": {
+        "TableNames": [
+          "Products"
+        ]
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "a save value that is not a JSON Pointer is rejected",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/TableNames",
+            "equals": [
+              "Products"
+            ]
+          }
+        ],
+        "save": {
+          "first": "TableNames/0"
+        }
+      },
+      "response": {
+        "TableNames": [
+          "Products"
+        ]
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "a save value that is not a string is rejected",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/TableNames",
+            "equals": [
+              "Products"
+            ]
+          }
+        ],
+        "save": {
+          "first": 0
+        }
+      },
+      "response": {
+        "TableNames": [
+          "Products"
+        ]
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "a save name that is not a plain name is rejected",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/TableNames",
+            "equals": [
+              "Products"
+            ]
+          }
+        ],
+        "save": {
+          "first-name": "/TableNames/0"
+        }
+      },
+      "response": {
+        "TableNames": [
+          "Products"
+        ]
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "a save name that starts with a digit is rejected",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/TableNames",
+            "equals": [
+              "Products"
+            ]
+          }
+        ],
+        "save": {
+          "1st": "/TableNames/0"
+        }
+      },
+      "response": {
+        "TableNames": [
+          "Products"
+        ]
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "a well-formed onWasm is accepted, and this runner judges the case's own expectation",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/TableNames",
+            "equals": [
+              "Products"
+            ]
+          }
+        ],
+        "onWasm": {
+          "error": "ValidationException",
+          "checks": [
+            {
+              "path": "/message",
+              "equals": "m"
+            }
+          ],
+          "reason": "the build lacks it"
+        }
+      },
+      "response": {
+        "TableNames": [
+          "Products"
+        ]
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "an onWasm that is not an object is rejected",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/TableNames",
+            "equals": [
+              "Products"
+            ]
+          }
+        ],
+        "onWasm": "no"
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "an onWasm without reason is rejected",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/TableNames",
+            "equals": [
+              "Products"
+            ]
+          }
+        ],
+        "onWasm": {
+          "error": "ValidationException",
+          "checks": [
+            {
+              "path": "/message",
+              "equals": "m"
+            }
+          ]
+        }
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "an onWasm with an empty reason is rejected",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/TableNames",
+            "equals": [
+              "Products"
+            ]
+          }
+        ],
+        "onWasm": {
+          "error": "ValidationException",
+          "checks": [
+            {
+              "path": "/message",
+              "equals": "m"
+            }
+          ],
+          "reason": ""
+        }
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "an onWasm without error is rejected",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/TableNames",
+            "equals": [
+              "Products"
+            ]
+          }
+        ],
+        "onWasm": {
+          "checks": [
+            {
+              "path": "/message",
+              "equals": "m"
+            }
+          ],
+          "reason": "r"
+        }
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "an onWasm with an unknown member is rejected",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/TableNames",
+            "equals": [
+              "Products"
+            ]
+          }
+        ],
+        "onWasm": {
+          "error": null,
+          "checks": [
+            {
+              "path": "/TableNames",
+              "equals": [
+                "Products"
+              ]
+            }
+          ],
+          "reason": "r",
+          "note": "x"
+        }
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "an onWasm whose checks check nothing is rejected",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/TableNames",
+            "equals": [
+              "Products"
+            ]
+          }
+        ],
+        "onWasm": {
+          "error": "ValidationException",
+          "checks": [],
+          "reason": "r"
+        }
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "an onWasm with a malformed check is rejected",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/TableNames",
+            "equals": [
+              "Products"
+            ]
+          }
+        ],
+        "onWasm": {
+          "error": null,
+          "checks": [
+            {
+              "path": "/A",
+              "equal": 1
+            }
+          ],
+          "reason": "r"
+        }
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "a case with both onWasm and save is rejected",
+      "case": {
+        "name": "x",
+        "op": "ListTables",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "/TableNames",
+            "equals": [
+              "Products"
+            ]
+          }
+        ],
+        "onWasm": {
+          "error": "ValidationException",
+          "checks": [
+            {
+              "path": "/message",
+              "equals": "m"
+            }
+          ],
+          "reason": "the build lacks it"
+        },
+        "save": {
+          "first": "/TableNames/0"
+        }
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "a body number written as 1.0 is rejected",
+      "caseText": "{\"name\":\"x\",\"op\":\"ListTables\",\"body\":{\"Limit\":1.0},\"error\":null,\"checks\":[{\"path\":\"/TableNames\",\"present\":true}]}",
+      "expect": "reject"
+    },
+    {
+      "name": "a body number written as 1e1 is rejected",
+      "caseText": "{\"name\":\"x\",\"op\":\"ListTables\",\"body\":{\"Limit\":1e1},\"error\":null,\"checks\":[{\"path\":\"/TableNames\",\"present\":true}]}",
+      "expect": "reject"
+    },
+    {
+      "name": "a body number written as 1E2 is rejected",
+      "caseText": "{\"name\":\"x\",\"op\":\"ListTables\",\"body\":{\"Limit\":1E2},\"error\":null,\"checks\":[{\"path\":\"/TableNames\",\"present\":true}]}",
+      "expect": "reject"
+    },
+    {
+      "name": "a body number written as -0 is rejected",
+      "caseText": "{\"name\":\"x\",\"op\":\"ListTables\",\"body\":{\"Limit\":-0},\"error\":null,\"checks\":[{\"path\":\"/TableNames\",\"present\":true}]}",
+      "expect": "reject"
+    },
+    {
+      "name": "a body number of 2^53 is rejected",
+      "caseText": "{\"name\":\"x\",\"op\":\"ListTables\",\"body\":{\"Limit\":9007199254740992},\"error\":null,\"checks\":[{\"path\":\"/TableNames\",\"present\":true}]}",
+      "expect": "reject"
+    },
+    {
+      "name": "a body number of -2^53 is rejected",
+      "caseText": "{\"name\":\"x\",\"op\":\"ListTables\",\"body\":{\"Limit\":-9007199254740992},\"error\":null,\"checks\":[{\"path\":\"/TableNames\",\"present\":true}]}",
+      "expect": "reject"
+    },
+    {
+      "name": "a body number past the u64 range is rejected",
+      "caseText": "{\"name\":\"x\",\"op\":\"ListTables\",\"body\":{\"Limit\":123456789012345678901234567890},\"error\":null,\"checks\":[{\"path\":\"/TableNames\",\"present\":true}]}",
+      "expect": "reject"
+    },
+    {
+      "name": "a body number out of the double range is rejected",
+      "caseText": "{\"name\":\"x\",\"op\":\"ListTables\",\"body\":{\"Limit\":1e400},\"error\":null,\"checks\":[{\"path\":\"/TableNames\",\"present\":true}]}",
+      "expect": "reject"
+    },
+    {
+      "name": "a check value written with a fraction is rejected",
+      "caseText": "{\"name\":\"x\",\"op\":\"ListTables\",\"body\":{},\"error\":null,\"checks\":[{\"path\":\"/A\",\"equals\":0.5}]}",
+      "expect": "reject"
+    },
+    {
+      "name": "a check value out of the double range is rejected",
+      "caseText": "{\"name\":\"x\",\"op\":\"ListTables\",\"body\":{},\"error\":null,\"checks\":[{\"path\":\"/A\",\"equals\":-1e400}]}",
+      "expect": "reject"
+    },
+    {
+      "name": "an onWasm check value written with an exponent is rejected",
+      "caseText": "{\"name\":\"x\",\"op\":\"ListTables\",\"body\":{},\"error\":null,\"checks\":[{\"path\":\"/A\",\"absent\":true}],\"onWasm\":{\"error\":null,\"checks\":[{\"path\":\"/A\",\"equals\":1e0}],\"reason\":\"r\"}}",
+      "expect": "reject"
+    },
+    {
+      "name": "a lone leading surrogate in a body string is rejected",
+      "caseText": "{\"name\":\"x\",\"op\":\"ListTables\",\"body\":{\"Note\":\"\\ud800\"},\"error\":null,\"checks\":[{\"path\":\"/TableNames\",\"present\":true}]}",
+      "expect": "reject"
+    },
+    {
+      "name": "a lone trailing surrogate in a body string is rejected",
+      "caseText": "{\"name\":\"x\",\"op\":\"ListTables\",\"body\":{\"Note\":\"\\udc00\"},\"error\":null,\"checks\":[{\"path\":\"/TableNames\",\"present\":true}]}",
+      "expect": "reject"
+    },
+    {
+      "name": "two leading surrogates in a row are rejected",
+      "caseText": "{\"name\":\"x\",\"op\":\"ListTables\",\"body\":{\"Note\":\"\\ud800\\ud800\"},\"error\":null,\"checks\":[{\"path\":\"/TableNames\",\"present\":true}]}",
+      "expect": "reject"
+    },
+    {
+      "name": "a lone surrogate in a check value is rejected",
+      "caseText": "{\"name\":\"x\",\"op\":\"ListTables\",\"body\":{},\"error\":null,\"checks\":[{\"path\":\"/A\",\"equals\":\"\\udfff\"}]}",
+      "expect": "reject"
+    },
+    {
+      "name": "a lone surrogate in a member name is rejected",
+      "caseText": "{\"name\":\"x\",\"op\":\"ListTables\",\"body\":{\"\\ud800\":1},\"error\":null,\"checks\":[{\"path\":\"/TableNames\",\"present\":true}]}",
+      "expect": "reject"
+    },
+    {
+      "name": "a lone surrogate in the case name is rejected",
+      "caseText": "{\"name\":\"\\ud800\",\"op\":\"ListTables\",\"body\":{},\"error\":null,\"checks\":[{\"path\":\"/TableNames\",\"present\":true}]}",
+      "expect": "reject"
+    },
+    {
+      "name": "an unescaped control character in a string is rejected",
+      "caseText": "{\"name\":\"x\u0001\",\"op\":\"ListTables\",\"body\":{},\"error\":null,\"checks\":[{\"path\":\"/TableNames\",\"present\":true}]}",
+      "expect": "reject"
+    },
+    {
+      "name": "an unknown escape in a string is rejected",
+      "caseText": "{\"name\":\"x\\q\",\"op\":\"ListTables\",\"body\":{},\"error\":null,\"checks\":[{\"path\":\"/TableNames\",\"present\":true}]}",
+      "expect": "reject"
+    },
+    {
+      "name": "a reference to a name no earlier case saves is rejected",
+      "case": {
+        "name": "x",
+        "op": "GetItem",
+        "body": {
+          "TableName": "${a\nb}",
+          "Key": {
+            "productId": {
+              "S": "p"
+            }
+          }
+        },
+        "error": "ValidationException",
+        "checks": [
+          {
+            "path": "/message",
+            "equals": "m"
+          }
+        ]
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "a reference to an unsaved plain name is rejected",
+      "case": {
+        "name": "x",
+        "op": "DescribeStream",
+        "body": {
+          "StreamArn": "${streamArn}"
+        },
+        "error": null,
+        "checks": [
+          {
+            "path": "/StreamDescription",
+            "present": true
+          }
+        ]
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "JSON whitespace around tokens is accepted",
+      "caseText": " {\t\"name\" : \"x\",\r\n \"op\":\"ListTables\" , \"body\":{ } ,\"error\":null,\"checks\":[{\"path\":\"/TableNames\",\"equals\":[\"Products\"]}] } \n",
+      "response": {
+        "TableNames": [
+          "Products"
+        ]
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "a form feed between tokens is rejected",
+      "caseText": "{\f\"name\":\"x\",\"op\":\"ListTables\",\"body\":{},\"error\":null,\"checks\":[{\"path\":\"/TableNames\",\"present\":true}]}",
+      "expect": "reject"
+    },
+    {
+      "name": "a byte order mark before the case is rejected",
+      "caseText": "\ufeff{\"name\":\"x\",\"op\":\"ListTables\",\"body\":{},\"error\":null,\"checks\":[{\"path\":\"/TableNames\",\"present\":true}]}",
+      "expect": "reject"
+    },
+    {
+      "name": "text after the case is rejected",
+      "caseText": "{\"name\":\"x\",\"op\":\"ListTables\",\"body\":{},\"error\":null,\"checks\":[{\"path\":\"/TableNames\",\"present\":true}]} x",
+      "expect": "reject"
+    },
+    {
+      "name": "a trailing comma is rejected",
+      "caseText": "{\"name\":\"x\",\"op\":\"ListTables\",\"body\":{},\"error\":null,\"checks\":[{\"path\":\"/TableNames\",\"present\":true}],}",
+      "expect": "reject"
+    },
+    {
+      "name": "a number with a leading zero is rejected",
+      "caseText": "{\"name\":\"x\",\"op\":\"ListTables\",\"body\":{\"Limit\":01},\"error\":null,\"checks\":[{\"path\":\"/TableNames\",\"present\":true}]}",
+      "expect": "reject"
+    },
+    {
+      "name": "127 levels of nesting are accepted",
+      "caseText": "{\"name\":\"x\",\"op\":\"ListTables\",\"body\":{},\"error\":null,\"checks\":[{\"path\":\"/A\",\"equals\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}]}",
+      "expect": "pass"
+    },
+    {
+      "name": "128 levels of nesting are rejected",
+      "caseText": "{\"name\":\"x\",\"op\":\"ListTables\",\"body\":{},\"error\":null,\"checks\":[{\"path\":\"/A\",\"equals\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}]}",
+      "expect": "reject"
+    },
+    {
+      "name": "a body is written with no whitespace and its members sorted",
+      "case": {
+        "name": "x",
+        "op": "PutItem",
+        "body": {
+          "b": 1,
+          "a": {
+            "d": [
+              3,
+              {
+                "f": true,
+                "e": null
+              }
+            ],
+            "c": "x"
+          }
+        },
+        "error": null,
+        "checks": [
+          {
+            "path": "",
+            "equals": {}
+          }
+        ]
+      },
+      "bytes": "{\"a\":{\"c\":\"x\",\"d\":[3,{\"e\":null,\"f\":true}]},\"b\":1}",
+      "expect": "pass"
+    },
+    {
+      "name": "members are sorted by code point, not by UTF-16 code unit",
+      "case": {
+        "name": "x",
+        "op": "PutItem",
+        "body": {
+          "\ud83d\ude00": 4,
+          "\uffff": 3,
+          "\u00e9": 2,
+          "a": 1,
+          "B": 0
+        },
+        "error": null,
+        "checks": [
+          {
+            "path": "",
+            "equals": {}
+          }
+        ]
+      },
+      "bytes": "{\"B\":0,\"a\":1,\"\u00e9\":2,\"\uffff\":3,\"\ud83d\ude00\":4}",
+      "expect": "pass"
+    },
+    {
+      "name": "a name that is a prefix of another sorts first",
+      "case": {
+        "name": "x",
+        "op": "PutItem",
+        "body": {
+          "ab": 2,
+          "a": 1,
+          "": 0
+        },
+        "error": null,
+        "checks": [
+          {
+            "path": "",
+            "equals": {}
+          }
+        ]
+      },
+      "bytes": "{\"\":0,\"a\":1,\"ab\":2}",
+      "expect": "pass"
+    },
+    {
+      "name": "strings are escaped as the canonical form writes them",
+      "case": {
+        "name": "x",
+        "op": "PutItem",
+        "body": {
+          "s": "\"\\/\b\f\n\r\t\u0000\u001f\u007f\u2028\u2029\u00e9\ud83d\ude00"
+        },
+        "error": null,
+        "checks": [
+          {
+            "path": "",
+            "equals": {}
+          }
+        ]
+      },
+      "bytes": "{\"s\":\"\\\"\\\\/\\b\\f\\n\\r\\t\\u0000\\u001f\u007f\u2028\u2029\u00e9\ud83d\ude00\"}",
+      "expect": "pass"
+    },
+    {
+      "name": "integers are written as their decimal digits",
+      "case": {
+        "name": "x",
+        "op": "PutItem",
+        "body": {
+          "n": [
+            0,
+            -1,
+            42,
+            9007199254740991,
+            -9007199254740991
+          ]
+        },
+        "error": null,
+        "checks": [
+          {
+            "path": "",
+            "equals": {}
+          }
+        ]
+      },
+      "bytes": "{\"n\":[0,-1,42,9007199254740991,-9007199254740991]}",
+      "expect": "pass"
+    },
+    {
+      "name": "empty objects and arrays are written as {} and []",
+      "case": {
+        "name": "x",
+        "op": "PutItem",
+        "body": {
+          "o": {},
+          "a": [],
+          "n": [
+            [],
+            {}
+          ]
+        },
+        "error": null,
+        "checks": [
+          {
+            "path": "",
+            "equals": {}
+          }
+        ]
+      },
+      "bytes": "{\"a\":[],\"n\":[[],{}],\"o\":{}}",
+      "expect": "pass"
+    },
+    {
+      "name": "an empty body is written as {}",
+      "case": {
+        "name": "x",
+        "op": "PutItem",
+        "body": {},
+        "error": null,
+        "checks": [
+          {
+            "path": "",
+            "equals": {}
+          }
+        ]
+      },
+      "bytes": "{}",
+      "expect": "pass"
+    },
+    {
+      "name": "a reference is replaced by the saved string",
+      "case": {
+        "name": "x",
+        "op": "PutItem",
+        "body": {
+          "StreamArn": "${streamArn}",
+          "Nested": [
+            {
+              "Arn": "${streamArn}"
+            }
+          ]
+        },
+        "error": null,
+        "checks": [
+          {
+            "path": "",
+            "equals": {}
+          }
+        ]
+      },
+      "saved": {
+        "streamArn": "arn:aws:dynamodb:us-east-1:000000000000:table/T/stream/L"
+      },
+      "bytes": "{\"Nested\":[{\"Arn\":\"arn:aws:dynamodb:us-east-1:000000000000:table/T/stream/L\"}],\"StreamArn\":\"arn:aws:dynamodb:us-east-1:000000000000:table/T/stream/L\"}",
+      "expect": "pass"
+    },
+    {
+      "name": "a saved string is escaped when written",
+      "case": {
+        "name": "x",
+        "op": "PutItem",
+        "body": {
+          "K": "${k}"
+        },
+        "error": null,
+        "checks": [
+          {
+            "path": "",
+            "equals": {}
+          }
+        ]
+      },
+      "saved": {
+        "k": "a\"b\\c\n"
+      },
+      "bytes": "{\"K\":\"a\\\"b\\\\c\\n\"}",
+      "expect": "pass"
+    },
+    {
+      "name": "a reference may be all or part of a string",
+      "case": {
+        "name": "x",
+        "op": "PutItem",
+        "body": {
+          "A": "x${k}",
+          "B": "${k}x",
+          "C": "a${k}b${k}c",
+          "D": "{k}",
+          "E": "$k",
+          "F": "$${k}"
+        },
+        "error": null,
+        "checks": [
+          {
+            "path": "",
+            "equals": {}
+          }
+        ]
+      },
+      "saved": {
+        "k": "v"
+      },
+      "bytes": "{\"A\":\"xv\",\"B\":\"vx\",\"C\":\"avbvc\",\"D\":\"{k}\",\"E\":\"$k\",\"F\":\"$v\"}",
+      "expect": "pass"
+    },
+    {
+      "name": "a saved value is not searched for references",
+      "case": {
+        "name": "x",
+        "op": "PutItem",
+        "body": {
+          "K": "${k}"
+        },
+        "error": null,
+        "checks": [
+          {
+            "path": "",
+            "equals": {}
+          }
+        ]
+      },
+      "saved": {
+        "k": "${k}"
+      },
+      "bytes": "{\"K\":\"${k}\"}",
+      "expect": "pass"
+    },
+    {
+      "name": "a member name is not a reference",
+      "case": {
+        "name": "x",
+        "op": "PutItem",
+        "body": {
+          "${k}": 1,
+          "${": 2
+        },
+        "error": null,
+        "checks": [
+          {
+            "path": "",
+            "equals": {}
+          }
+        ]
+      },
+      "saved": {
+        "k": "v"
+      },
+      "bytes": "{\"${\":2,\"${k}\":1}",
+      "expect": "pass"
+    },
+    {
+      "name": "a ${ that does not begin a reference is rejected",
+      "case": {
+        "name": "x",
+        "op": "PutItem",
+        "body": {
+          "C": "a ${ b"
+        },
+        "error": null,
+        "checks": [
+          {
+            "path": "",
+            "equals": {}
+          }
+        ]
+      },
+      "saved": {
+        "k": "v"
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "an empty reference is rejected",
+      "case": {
+        "name": "x",
+        "op": "PutItem",
+        "body": {
+          "C": "${}"
+        },
+        "error": null,
+        "checks": [
+          {
+            "path": "",
+            "equals": {}
+          }
+        ]
+      },
+      "saved": {
+        "k": "v"
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "a reference whose name starts with a digit is rejected",
+      "case": {
+        "name": "x",
+        "op": "PutItem",
+        "body": {
+          "C": "${1k}"
+        },
+        "error": null,
+        "checks": [
+          {
+            "path": "",
+            "equals": {}
+          }
+        ]
+      },
+      "saved": {
+        "1k": "v"
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "a reference without its closing brace is rejected",
+      "case": {
+        "name": "x",
+        "op": "PutItem",
+        "body": {
+          "C": "${k"
+        },
+        "error": null,
+        "checks": [
+          {
+            "path": "",
+            "equals": {}
+          }
+        ]
+      },
+      "saved": {
+        "k": "v"
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "a rawBody is sent as written",
+      "case": {
+        "name": "x",
+        "op": "GetItem",
+        "rawBody": " { not json ",
+        "error": "SerializationException",
+        "checks": [
+          {
+            "path": "/message",
+            "equals": "m"
+          }
+        ]
+      },
+      "bytes": " { not json ",
+      "expect": "pass"
+    },
+    {
+      "name": "a rawBody is not read as a reference",
+      "case": {
+        "name": "x",
+        "op": "GetItem",
+        "rawBody": "${k}",
+        "error": "SerializationException",
+        "checks": [
+          {
+            "path": "/message",
+            "equals": "m"
+          }
+        ]
+      },
+      "bytes": "${k}",
+      "expect": "pass"
+    },
+    {
+      "name": "a body whose bytes differ from the recorded ones fails",
+      "case": {
+        "name": "x",
+        "op": "PutItem",
+        "body": {
+          "b": 1,
+          "a": 2
+        },
+        "error": null,
+        "checks": [
+          {
+            "path": "",
+            "equals": {}
+          }
+        ]
+      },
+      "bytes": "{\"b\":1,\"a\":2}",
+      "expect": "fail"
     }
   ]
 }
