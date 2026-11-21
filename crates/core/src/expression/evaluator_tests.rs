@@ -470,6 +470,16 @@ fn a_number_with_millions_of_digits_is_not_parsed() {
     assert!(!eval_within_10_s("n > :v", item, values).unwrap());
 }
 
+/// A legacy `BETWEEN` bound with millions of trailing zeros is read through
+/// the number check, at its value, and not parsed as written.
+#[test]
+fn a_bound_with_millions_of_trailing_zeros_compares_at_its_value() {
+    let long = AttributeValue::N(format!("1.{}", "0".repeat(2_000_000)));
+    let one = AttributeValue::N("1".to_owned());
+    let order = within_10_s("a long bound", move || compare_orderable(&long, &one));
+    assert_eq!(order, Some(Ordering::Equal));
+}
+
 /// A placeholder refused when the maps are built stays refused: a filter
 /// does not read its text again for each item it compares.
 #[test]

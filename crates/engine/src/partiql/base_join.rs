@@ -30,7 +30,7 @@ use super::index_read;
 use crate::capacity_helpers::read_capacity_units;
 use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::{
-    build_expression_maps, parse_optional_filter, prefix_expression_error,
+    build_expression_maps, parse_condition_checked, prefix_expression_error,
 };
 use crate::{DispatchResult, OperationContext};
 
@@ -87,14 +87,21 @@ impl BaseTableJoin {
             .map(|t| bridge.render_condition(t))
             .collect::<Result<_, _>>()?;
         let maps = build_expression_maps(Some(&bridge.names_map()), Some(&bridge.values_map()));
-        let filter = parse_optional_filter(Some(&parts.join(" AND ")), limits)?;
-        if let Some(f) = &filter {
-            validate_begins_with_operands(f, &maps)
-                .map_err(|e| prefix_expression_error(e, ExpressionKind::Filter))?;
-            validate_ordering_operand_types(f, &maps)
-                .map_err(|e| prefix_expression_error(e, ExpressionKind::Filter))?;
-        }
-        Ok(Self { filter, maps })
+        let filter = parse_condition_checked(
+            &parts.join(" AND "),
+            &maps,
+            limits,
+            true,
+            ExpressionKind::Filter,
+        )?;
+        validate_begins_with_operands(&filter, &maps)
+            .map_err(|e| prefix_expression_error(e, ExpressionKind::Filter))?;
+        validate_ordering_operand_types(&filter, &maps)
+            .map_err(|e| prefix_expression_error(e, ExpressionKind::Filter))?;
+        Ok(Self {
+            filter: Some(filter),
+            maps,
+        })
     }
 
     /// Replace each row of an unfiltered index read with its base-table item,
