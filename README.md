@@ -310,6 +310,13 @@ to crates.io.
   browser memory.
 - **Memory-only storage.** The database lives in wasm linear memory and is gone
   when the page unloads. There is no persistence, no file, and no import/export.
+  The module declares no memory maximum, so linear memory can grow to the
+  wasm32 limit of 4 GiB (65,536 pages of 64 KiB), or less if the JavaScript
+  engine allows less. Near that limit, a write that SQLite cannot allocate for
+  answers `InternalServerError`, and a request whose Rust code cannot allocate
+  aborts, which traps the module. After a trap the instance is in an undefined
+  state (see the `submit` documentation in `crates/wasm-adapter/src/wasm.rs`),
+  and the page must be reloaded to load a fresh module instance.
 - **No background tasks.** The build runs no background workers, so: an item
   past its time-to-live is still returned (TTL never deletes it); `ItemCount`
   and `TableSizeBytes` stay `0`; and stream records are never trimmed.
