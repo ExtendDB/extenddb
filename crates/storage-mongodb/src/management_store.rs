@@ -2791,10 +2791,11 @@ fn generate_secret_key() -> String {
     format!("extenddb{suffix}")
 }
 
-/// A stored policy or boundary as the resource-tag migration reads it: its
-/// `policy_document` as JSON, or why that cannot be read. `list_policies`
-/// and the boundary getters skip such a document.
-fn stored_document(d: &Document) -> StoredDocument {
+/// A stored policy or boundary's `policy_document` as JSON, or why that
+/// cannot be read. The resource-tag migration reads documents this way;
+/// `list_policies` and the boundary getters skip such a document, and the
+/// authorization store fails the load that needs it.
+pub(crate) fn stored_document(d: &Document) -> StoredDocument {
     match d.get("policy_document") {
         None => Err("the stored policy has no policy_document field".to_owned()),
         Some(b) => bson::from_bson::<serde_json::Value>(b.clone()).map_err(|e| e.to_string()),

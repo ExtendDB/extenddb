@@ -17,18 +17,7 @@ mod migrations_support;
 
 use bson::{Document, doc};
 use extenddb_storage::management_store::{ManagementStore, PasswordHashStore};
-use extenddb_storage_mongodb::MongoCatalogStore;
-use migrations_support::{Deployment, server};
-
-/// A catalog store on a new deployment, or `None` to skip.
-async fn scratch(tag: &str) -> Option<(Deployment, MongoCatalogStore)> {
-    let uri = server()?;
-    let deployment = Deployment::new(&uri, tag).await;
-    deployment.create().await;
-    let store =
-        MongoCatalogStore::on_database_for_tests(deployment.client.clone(), deployment.catalog());
-    Some((deployment, store))
-}
+use migrations_support::scratch;
 
 #[tokio::test]
 async fn deleted_principals_and_accounts_leave_nothing() {
