@@ -66,7 +66,7 @@ pub async fn handle_scan(
             },
         ],
     )?;
-    let input: ScanInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
+    let input: ScanInput = crate::read_input(body, &["TableName"], crate::deserialize_error)?;
 
     // Validate Filter/Projection expressions before the existence
     // check; index resolution, Segment/Limit/Select and key checks stay after.

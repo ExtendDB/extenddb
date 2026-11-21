@@ -10,7 +10,7 @@ use crate::OperationContext;
 use crate::serialize_output;
 
 pub async fn handle_create_table(
-    body: Value,
+    mut body: Value,
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
     crate::validate_enum_fields(
@@ -30,6 +30,8 @@ pub async fn handle_create_table(
     )?;
 
     crate::require_stream_enabled_member(&body)?;
+    // A null name gets the answer of an absent one (measured 2026-11-17).
+    crate::drop_null_members(&mut body, &["TableName"]);
     let mut input: CreateTableInput = serde_json::from_value(body).map_err(|e| {
         let msg = e.to_string();
         if msg.contains("validation error detected")

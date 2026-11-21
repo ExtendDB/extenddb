@@ -298,13 +298,7 @@ pub(crate) fn validate_enum_fields(
     if errors.is_empty() {
         return Ok(());
     }
-    let count = errors.len();
-    let msg = format!(
-        "{count} validation error{} detected: {}",
-        if count == 1 { "" } else { "s" },
-        errors.join("; ")
-    );
-    Err(DynamoDbError::ValidationException(msg))
+    Err(validation_failure(&errors))
 }
 
 /// Validate the `ReturnValues` field for `PutItem` / `DeleteItem`, which accept
@@ -337,6 +331,83 @@ pub(crate) fn validate_put_delete_return_values(
     }
     Ok(())
 }
+
+/// The service's refusal of a request that fails the constraints `clauses`
+/// state, one clause for each constraint.
+fn validation_failure(clauses: &[String]) -> DynamoDbError {
+    let count = clauses.len();
+    DynamoDbError::ValidationException(format!(
+        "{count} validation error{} detected: {}",
+        if count == 1 { "" } else { "s" },
+        clauses.join("; ")
+    ))
+}
+
+/// The clause for a member at `path` that the request does not carry.
+pub(crate) fn null_clause(path: &str) -> String {
+    format!("Value null at '{path}' failed to satisfy constraint: Member must not be null")
+}
+
+/// Refuse a request that lacks a member of `required` or sends it as JSON
+/// null. The refusal holds a `Value null at '<path>'` clause for each such
+/// member, in the order of `required`, and the path is the member's name with
+/// a lower-case first letter.
+pub(crate) fn require_members(
+    body: &serde_json::Value,
+    required: &[&str],
+) -> Result<(), DynamoDbError> {
+    let clauses: Vec<String> = required
+        .iter()
+        .filter(|&&member| body.get(member).is_none_or(serde_json::Value::is_null))
+        .map(|member| {
+            let (first, rest) = member.split_at(1);
+            null_clause(&format!("{}{rest}", first.to_ascii_lowercase()))
+        })
+        .collect();
+    if clauses.is_empty() {
+        Ok(())
+    } else {
+        Err(validation_failure(&clauses))
+    }
+}
+
+/// Read a request body into an operation's input. A member of `required`
+/// that is absent or JSON null gets the refusal of [`require_members`]. A
+/// member of the wrong JSON type is answered ahead of it, through `other`, as
+/// the service answers it (measured 2026-11-20). serde reports a wrong type
+/// while it reads the members and a missing member after them, so a null
+/// member of `required` is taken out of the body before the read.
+pub(crate) fn read_input<T: serde::de::DeserializeOwned>(
+    mut body: serde_json::Value,
+    required: &[&str],
+    other: impl FnOnce(serde_json::Error) -> DynamoDbError,
+) -> Result<T, DynamoDbError> {
+    let missing = require_members(&body, required);
+    drop_null_members(&mut body, required);
+    serde_json::from_value(body).map_err(|e| {
+        let msg = e.to_string();
+        let named = required
+            .iter()
+            .any(|m| msg == format!("missing field `{m}`"));
+        match missing {
+            Err(refusal) if named => refusal,
+            _ => other(e),
+        }
+    })
+}
+
+/// Take the members of `names` that are JSON null out of `body`, and keep
+/// the order of the other members. The service answers a null member as it
+/// answers an absent one.
+pub(crate) fn drop_null_members(body: &mut serde_json::Value, names: &[&str]) {
+    if let Some(members) = body.as_object_mut() {
+        members.retain(|name, value| !value.is_null() || !names.contains(&name.as_str()));
+    }
+}
+
+#[cfg(all(test, feature = "partiql"))]
+mod missing_members_tests;
+
 ///
 /// Populated by engine handlers so the server layer can record capacity,
 /// returned item counts, and returned byte counts without parsing the JSON

@@ -1027,7 +1027,7 @@ pub struct CreateTableInput {
     pub vector_indexes: Option<Vec<VectorIndexSpecification>>,
     #[serde(rename = "StreamSpecification")]
     pub stream_specification: Option<StreamSpecification>,
-    #[serde(rename = "SSESpecification")]
+    #[serde(rename = "SSESpecification", default, deserialize_with = "json_object")]
     pub sse_specification: Option<serde_json::Value>,
     #[serde(rename = "Tags")]
     pub tags: Option<Vec<Tag>>,
@@ -1039,6 +1039,23 @@ pub struct CreateTableInput {
     pub on_demand_throughput: Option<OnDemandThroughput>,
     #[serde(rename = "WarmThroughput", default)]
     pub warm_throughput: Option<super::WarmThroughput>,
+    // CreateTable does not act on the members below. Each is typed so that a
+    // member of the wrong JSON type is refused at the read, ahead of a
+    // missing TableName (measured 2026-11-20 for ResourcePolicy).
+    #[serde(rename = "ResourcePolicy", default)]
+    pub resource_policy: Option<String>,
+    #[serde(rename = "GlobalTableSettingsReplicationMode", default)]
+    pub global_table_settings_replication_mode: Option<String>,
+    #[serde(rename = "GlobalTableSourceArn", default)]
+    pub global_table_source_arn: Option<String>,
+}
+
+/// Reads a member that must be a JSON object, so that any other JSON type
+/// fails the read, and keeps it as a `Value`.
+fn json_object<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<serde_json::Value>, D::Error> {
+    Ok(Option::<serde_json::Map<_, _>>::deserialize(d)?.map(serde_json::Value::Object))
 }
 
 /// `CreateTable` response body.
@@ -1212,8 +1229,22 @@ pub struct UpdateTableInput {
     /// Accepted so that a request carrying it is recognised: `UpdateTable`
     /// does not act on it (as before), but a table-level `WarmThroughput`
     /// beside it is refused with the service's sentence.
-    #[serde(rename = "SSESpecification", default)]
+    #[serde(rename = "SSESpecification", default, deserialize_with = "json_object")]
     pub sse_specification: Option<serde_json::Value>,
+    // UpdateTable does not act on the members below. Each is typed so that a
+    // member of the wrong JSON type is refused at the read, ahead of a
+    // missing TableName (measured 2026-11-20 for ReplicaUpdates,
+    // MultiRegionConsistency and GlobalTableWitnessUpdates).
+    #[serde(rename = "ReplicaUpdates", default)]
+    pub replica_updates: Option<Vec<serde_json::Map<String, serde_json::Value>>>,
+    #[serde(rename = "MultiRegionConsistency", default)]
+    pub multi_region_consistency: Option<String>,
+    #[serde(rename = "GlobalTableWitnessUpdates", default)]
+    pub global_table_witness_updates: Option<Vec<serde_json::Map<String, serde_json::Value>>>,
+    #[serde(rename = "GlobalTableSettingsReplicationMode", default)]
+    pub global_table_settings_replication_mode: Option<String>,
+    #[serde(rename = "DisassociationProtectionEnabled", default)]
+    pub disassociation_protection_enabled: Option<bool>,
 }
 
 /// `UpdateTable` response body.

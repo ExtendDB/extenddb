@@ -82,6 +82,9 @@ fn table_input(name: &str, with_gsi: bool, with_lsi: bool) -> CreateTableInput {
         table_class: None,
         deletion_protection_enabled: None,
         warm_throughput: None,
+        resource_policy: None,
+        global_table_settings_replication_mode: None,
+        global_table_source_arn: None,
     }
 }
 

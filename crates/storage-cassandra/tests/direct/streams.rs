@@ -66,6 +66,9 @@ pub(crate) async fn setup_stream_table(
         table_class: None,
         deletion_protection_enabled: None,
         warm_throughput: None,
+        resource_policy: None,
+        global_table_settings_replication_mode: None,
+        global_table_source_arn: None,
     };
 
     let desc = engine.create_table(&account_id, input).await.unwrap();
