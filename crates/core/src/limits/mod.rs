@@ -54,8 +54,8 @@ pub struct LimitsConfig {
     #[serde(default = "default_max_expression_length_bytes")]
     pub max_expression_length_bytes: usize,
     /// Maximum nesting depth in condition and update expressions: parentheses,
-    /// NOT and a nested `size` call in a condition, parentheses and function
-    /// calls in an update.
+    /// NOT and a function call read as an operand in a condition, parentheses
+    /// and function calls in an update.
     #[serde(default = "default_max_expression_depth")]
     pub max_expression_depth: usize,
     /// Maximum policy document size in bytes (before JSON parsing).

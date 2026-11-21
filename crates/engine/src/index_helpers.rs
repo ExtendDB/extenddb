@@ -69,10 +69,10 @@ pub fn apply_index_projection(
 
 /// `Select=ALL_ATTRIBUTES` against a GSI whose projection is not `ALL`.
 ///
-/// A Query without an `ExclusiveStartKey` checks this early. With one, the
-/// start key checks come first (measured 2026-10-23: an outside start key on
-/// a KEYS_ONLY GSI with `Select=ALL_ATTRIBUTES` answers the start key
-/// sentence), so the handler calls this again after them.
+/// Query checks this after all of its key condition, Select, empty key
+/// value, `QueryFilter` key and start key checks: the service reports each
+/// of those first (measured 2026-10-23 for an outside start key, which
+/// answers the start key sentence, and 2026-11-12 for the others).
 ///
 /// # Errors
 ///

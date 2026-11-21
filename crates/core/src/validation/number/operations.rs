@@ -167,6 +167,22 @@ pub fn expected_values(
     Ok(())
 }
 
+/// Refuse the `AttributeValueList` of a legacy `ScanFilter`, `QueryFilter` or
+/// `KeyConditions` entry holding a number the service cannot read, with no
+/// prefix. An empty number answers with the colon, on its own and inside an
+/// `NS`, `L` or `M`. Measured on a top-level value on 2026-10-24, and on
+/// 2026-11-12 inside `NS`, `L`, `M` and an `M` in an `L`, in all three maps.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` with the service's text.
+pub fn condition_values(values: &[AttributeValue]) -> Result<(), DynamoDbError> {
+    values
+        .iter()
+        .try_for_each(|value| attribute_numbers(EmptyText::WithColon, value))
+        .map_err(bare)
+}
+
 /// Refuse a `PutItem` item holding a number the service cannot read or a
 /// value nested too deep, ahead of the mixed-parameter check, the table lookup
 /// and the key schema checks (measured 2026-10-27).
