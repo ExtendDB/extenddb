@@ -346,9 +346,10 @@ and an `UpdateContinuousBackups` that enables point-in-time recovery
 (`ContinuousBackupsUnavailableException`) before any table is read, so a
 request naming a missing table gets the refusal too.
 
-On `wasm32` a panic cannot unwind: it is an unrecoverable trap that aborts the
-instance permanently. A trap leaves the pending `submit` promise unresolved and
-every later call traps as well, so recovering requires reloading the page.
+On `wasm32` a panic cannot unwind: it traps, and the `submit` promise of the
+request that panicked stays pending. The instance is then in an undefined
+state (a later call may answer, fail or hang), so reload the page to get a
+fresh one.
 
 ### Building it
 
