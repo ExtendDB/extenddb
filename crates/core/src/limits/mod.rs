@@ -173,3 +173,47 @@ fn default_max_export_item_count() -> u64 {
 fn default_enforce_reserved_keywords() -> bool {
     true
 }
+
+/// The page size a request's `Limit` asks for: `limit` as a `usize`, at least
+/// 1, and `usize::MAX` for a limit too large for `usize`.
+///
+/// On `wasm32`, where `usize` is 32 bits, a limit above `u32::MAX` does not
+/// convert. Saturating keeps it larger than any list that target can hold, so
+/// the page holds the whole list, as a 64-bit target's page does for such a
+/// limit.
+#[must_use]
+pub fn page_size(limit: i64) -> usize {
+    if limit < 1 {
+        1
+    } else {
+        usize::try_from(limit).unwrap_or(usize::MAX)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::page_size;
+
+    /// Runs as a native `#[test]` and, on `wasm32`, where `usize` is 32 bits,
+    /// as a `wasm_bindgen_test` under Node.
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn page_size_is_at_least_one_and_never_below_the_limit_it_can_hold() {
+        for limit in [i64::MIN, -1, 0, 1] {
+            assert_eq!(page_size(limit), 1, "Limit {limit}");
+        }
+        assert_eq!(page_size(100), 100);
+        let u32_max = usize::try_from(u32::MAX).expect("usize holds u32::MAX on every target");
+        assert_eq!(page_size(i64::from(u32::MAX)), u32_max);
+        // A 64-bit `usize` holds each of these exactly; a 32-bit one holds
+        // none of them, and the page is then as large as a page can be.
+        for limit in [4_294_967_296, 4_294_967_297, i64::MAX] {
+            let size = page_size(limit);
+            assert!(size >= u32_max, "Limit {limit} gave a page of {size}");
+            assert!(
+                size == usize::MAX || i64::try_from(size) == Ok(limit),
+                "Limit {limit} gave a page of {size}"
+            );
+        }
+    }
+}
