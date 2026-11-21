@@ -3,18 +3,22 @@
 
 //! Native side of the shared parity harness.
 //!
-//! Runs the shared case corpus (`../parity/corpus.json`) through the real
-//! [`extenddb_wasm_adapter::Engine`] — the `ExtendDB` engine over `sqlx` + the C
-//! SQLite library, which is the fidelity **oracle**. The wasm side
-//! (`../parity/run.mjs`) runs the *same* corpus with the *same* expectations
-//! through the browser wasm module under Node. Both asserting the same
-//! observable responses is what makes the port's fidelity checkable end to end:
-//! if the oracle and the wasm build agree on every case, the browser build is
-//! faithful for the in-scope data plane, and the operations it answers
-//! differently (the ones it cannot serve) answer the same way on both.
+//! Runs the shared case corpus (`../parity/corpus.json`) through
+//! [`extenddb_wasm_adapter::Engine`] built natively — the `ExtendDB` engine over
+//! `sqlx` and the C `SQLite` library. The wasm side (`../parity/run.mjs`) runs
+//! the same corpus through the browser wasm module under Node and applies the
+//! same assertions: each case's expected error name and its `checks` on chosen
+//! response members. Neither runner compares the full responses of the two
+//! builds with each other; a member a case does not check can differ between
+//! them without either run failing.
 //!
 //! Keep this test and the Node runner reading the one corpus file so the two
-//! can never drift apart.
+//! apply the same assertions.
+//!
+//! Native only: it drives the engine on a tokio runtime, a native-only
+//! dev-dependency, so the file compiles to nothing on `wasm32` and
+//! `cargo clippy --target wasm32-unknown-unknown --all-targets` can build.
+#![cfg(not(target_arch = "wasm32"))]
 
 use serde_json::Value;
 
@@ -95,11 +99,11 @@ fn assert_case(name: &str, case: &Value, resp: &Value) {
     }
 }
 
-/// Run the whole corpus through the native oracle engine in order, against one
-/// fresh in-memory database (state carries between cases, exactly as the wasm
-/// runner drives it).
+/// Run the whole corpus through the native engine in order, against one fresh
+/// in-memory database (state carries between cases, as the wasm runner drives
+/// it).
 #[tokio::test]
-async fn parity_corpus_matches_the_native_oracle() {
+async fn parity_corpus_passes_on_the_native_build() {
     let corpus: Value = serde_json::from_str(CORPUS).expect("corpus.json parses");
     let cases = corpus["cases"]
         .as_array()
