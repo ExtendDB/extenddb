@@ -23,9 +23,21 @@ pub mod session;
 use std::sync::Arc;
 
 use axum::Router;
+use axum::http::{HeaderValue, header};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 
 use session::SessionStore;
+
+/// The Content-Security-Policy of the console's HTML pages. Scripts run only
+/// from the server's own origin, and an inline script, an event handler
+/// attribute or a `javascript:` URL does not run. The console's scripts are
+/// the two files under `/console/assets/`. Styles can still be inline,
+/// because the pages use `style` attributes. Forms post to the server's own
+/// origin, and no page loads a plugin or shows in a frame.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; \
+     style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; \
+     base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
 /// Shared state for console handlers.
 pub struct ConsoleState {
@@ -171,4 +183,98 @@ pub fn router() -> Router<Arc<ConsoleState>> {
             "/accounts/{id}/roles/{name}/policies/{policy}/delete",
             post(pages::delete_role_policy),
         )
+        // Scripts (accessible without login: the files are the repository's)
+        .route(
+            "/assets/console.js",
+            get(|| async { script(include_str!("assets/console.js")) }),
+        )
+        .route(
+            "/assets/metrics.js",
+            get(|| async { script(include_str!("assets/metrics.js")) }),
+        )
+}
+
+/// A script file of the console. With `no-cache`, the browser asks the server
+/// for the file each time, so a page that an upgraded server sends runs that
+/// server's script.
+fn script(body: &'static str) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// [`CONTENT_SECURITY_POLICY`] for an HTML response, which `start_server`
+/// sets on the responses of the console router. A script, JSON, PDF or
+/// redirect response gets none.
+pub(crate) fn html_policy(response: &Response) -> Option<HeaderValue> {
+    let kind = response.headers().get(header::CONTENT_TYPE)?.as_bytes();
+    kind.get(..9)
+        .is_some_and(|k| k.eq_ignore_ascii_case(b"text/html"))
+        .then(|| HeaderValue::from_static(CONTENT_SECURITY_POLICY))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::response::{Html, Redirect};
+
+    use super::*;
+
+    /// An HTML page gets the policy, with any case in its media type, and the
+    /// other responses of the console (a script, JSON, a PDF, a redirect) get
+    /// none.
+    #[test]
+    fn the_policy_goes_on_html_responses_only() {
+        let upper = ([(header::CONTENT_TYPE, "Text/HTML")], "<p>x</p>").into_response();
+        let pdf = ([(header::CONTENT_TYPE, "application/pdf")], "%PDF").into_response();
+        let json = axum::Json(serde_json::json!({})).into_response();
+        let rows: [(&str, Response, bool); 6] = [
+            ("page", Html("<p>x</p>").into_response(), true),
+            ("upper-case page", upper, true),
+            ("script", script("var x;"), false),
+            ("json", json, false),
+            ("pdf", pdf, false),
+            ("redirect", Redirect::to("/console").into_response(), false),
+        ];
+        for (name, response, expected) in rows {
+            assert_eq!(html_policy(&response).is_some(), expected, "{name}");
+        }
+        assert_eq!(
+            CONTENT_SECURITY_POLICY,
+            "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+             img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; \
+             frame-ancestors 'none'"
+        );
+    }
+
+    /// The scripts read the names that the pages and the server write: the
+    /// `data-confirm` question of a delete form, the `_csrf` field that the
+    /// POST form handlers read, the `data-ops` list of the metrics page, and
+    /// the session-authenticated metrics feed with each row's account. The
+    /// rows hold those names and the calls and events that use them. This
+    /// checks the text of the scripts, not what they do.
+    #[test]
+    fn the_scripts_read_the_names_the_pages_write() {
+        let console = include_str!("assets/console.js");
+        let metrics = include_str!("assets/metrics.js");
+        for (script, name) in [
+            (console, "addEventListener('DOMContentLoaded'"),
+            (console, "addEventListener('submit'"),
+            (console, "getAttribute('data-confirm')"),
+            (console, "window.confirm(question)"),
+            (console, "e.preventDefault()"),
+            (console, "i.name = '_csrf'"),
+            (console, "meta[name=\"csrf-token\"]"),
+            (metrics, "document.currentScript.dataset.ops"),
+            (metrics, "/console/metrics-data"),
+            (metrics, "d.AccountId"),
+        ] {
+            assert!(script.contains(name), "{name}");
+        }
+        assert!(!metrics.contains("accountFilter"));
+    }
 }

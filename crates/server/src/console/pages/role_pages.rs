@@ -233,7 +233,7 @@ pub async fn role_detail(
         let _ = write!(
             content,
             r#"<form class="inline" method="post" action="/console/accounts/{eid}/roles/{ern}/delete"
-                onsubmit="return confirm('Delete role {ern}?')">
+                data-confirm="Delete role {ern}?">
 <button class="btn btn-danger btn-sm" type="submit">Delete Role</button>
 </form>"#
         );
@@ -262,7 +262,7 @@ pub async fn role_detail(
         let delete_btn = if is_admin(&session.identity) {
             format!(
                 r#"<form class="inline" method="post" action="/console/accounts/{eid}/roles/{ern}/policies/{ep}/delete"
-                      onsubmit="return confirm('Delete policy {ep}?')">
+                      data-confirm="Delete policy {ep}?">
 <button class="btn btn-danger btn-sm" type="submit">Delete</button>
 </form>"#
             )

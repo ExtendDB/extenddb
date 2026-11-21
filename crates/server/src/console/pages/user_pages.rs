@@ -272,7 +272,7 @@ fn render_user_page(
         let _ = write!(
             content,
             r#"<form class="inline" method="post" action="/console/accounts/{eid}/users/{eun}/delete"
-                onsubmit="return confirm('Delete user {eun}?')">
+                data-confirm="Delete user {eun}?">
 <button class="btn btn-danger btn-sm" type="submit">Delete User</button>
 </form>"#
         );
@@ -296,7 +296,7 @@ fn render_user_page(
             content,
             r#"<tr><td><code>{ekid}</code></td><td>{status}</td><td>
 <form class="inline" method="post" action="/console/accounts/{eid}/users/{eun}/access-keys/{ekid}/delete"
-      onsubmit="return confirm('Delete key {ekid}?')">
+      data-confirm="Delete key {ekid}?">
 <button class="btn btn-danger btn-sm" type="submit">Delete</button>
 </form></td></tr>"#
         );
@@ -326,7 +326,7 @@ fn render_user_page(
         let _ = write!(
             content,
             r#"<tr><td>{ep}</td><td><form class="inline" method="post" action="/console/accounts/{eid}/users/{eun}/policies/{ep}/delete"
-                      onsubmit="return confirm('Delete policy {ep}?')">
+                      data-confirm="Delete policy {ep}?">
 <button class="btn btn-danger btn-sm" type="submit">Delete</button>
 </form></td></tr>"#
         );
