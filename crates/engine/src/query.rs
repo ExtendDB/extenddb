@@ -131,12 +131,6 @@ pub async fn handle_query(
         ));
     }
 
-    // Select=ALL_ATTRIBUTES requires an ALL-projection GSI (shared with Scan).
-    // With an ExclusiveStartKey this runs after the start key checks below.
-    if input.exclusive_start_key.is_none() {
-        validate_query_select_index_support(input.select, index_info.as_ref())?;
-    }
-
     // Validate Limit >= 1 (REQ-QUERY-001)
     if let Some(limit) = input.limit
         && limit < 1
@@ -488,6 +482,22 @@ pub async fn handle_query(
         )?;
     }
 
+    // Refuse key values over the key size limits (hash 2048 bytes, all range
+    // values together 1024 bytes) before any storage read. Order measured
+    // 2026-10-23 with a 2049-byte hash value plus one other fault: a missing
+    // table, a wrong IndexName, ConsistentRead on a GSI, Limit 0, a key
+    // condition that misses the key schema, a wrong-typed key value (checked
+    // above, in `resolve_key_schema_with`), a FilterExpression syntax error
+    // and an unused expression value are all reported ahead of the size; an
+    // invalid ExclusiveStartKey is reported after it. KeyConditions is checked
+    // like the expression.
+    extenddb_core::validation::validate_query_key_sizes(
+        &key_condition,
+        &query_key_info.key_schema,
+        effective_maps,
+        &ctx.limits,
+    )?;
+
     // Validate ExclusiveStartKey matches the key schema
     if let Some(ref start_key) = input.exclusive_start_key {
         validate_query_exclusive_start_key(start_key, &key_info, index_info.as_ref())?;
@@ -501,8 +511,13 @@ pub async fn handle_query(
                 forward: input.scan_index_forward,
             },
         )?;
-        validate_query_select_index_support(input.select, index_info.as_ref())?;
     }
+
+    // Select=ALL_ATTRIBUTES requires an ALL-projection GSI (shared with Scan).
+    // The service makes this check after the other request checks, the key
+    // size and start key checks included (measured 2026-11-20 in us-east-1 on
+    // a KEYS_ONLY GSI).
+    validate_query_select_index_support(input.select, index_info.as_ref())?;
 
     // Determine which key schema to use for LastEvaluatedKey extraction.
     // For index queries, the LEK includes both the index key and the base table key,
