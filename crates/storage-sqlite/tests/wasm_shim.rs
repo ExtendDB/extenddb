@@ -226,7 +226,6 @@ impl sqlx::FromRow for Person {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn cases() -> Vec<Case> {
     let i32_overflow = i32::try_from(1_099_511_627_776_i64)
         .map(|_| ())

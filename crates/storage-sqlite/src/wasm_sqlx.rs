@@ -1,25 +1,6 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-// This module mirrors the shape of the `sqlx` API, so it carries many small
-// public items whose contract is the same as `sqlx`'s; documenting `# Errors`
-// and `# Panics` on each, or marking every builder `#[must_use]`, would only
-// restate `sqlx`. The error type is uniform ([`Error`]). These pedantic lints
-// are therefore allowed module-wide; the behaviour that matters (the rules
-// below) is covered by the module docs and the tests.
-#![allow(
-    clippy::missing_errors_doc,
-    clippy::missing_panics_doc,
-    clippy::must_use_candidate,
-    clippy::module_name_repetitions,
-    clippy::return_self_not_must_use,
-    clippy::doc_markdown,
-    // The query terminals and connection methods are `async fn`s even though
-    // the in-memory transport completes synchronously: they mirror `sqlx`,
-    // whose call sites `.await` them, so the signatures must stay async.
-    clippy::unused_async
-)]
-
 //! A bounded, synchronous reimplementation of the slice of the `sqlx` API that
 //! the SQLite storage backend uses, driven over `sqlite-wasm-rs`'s raw
 //! `libsqlite3` C ABI.
@@ -1792,10 +1773,6 @@ impl<O: FromRow, DB> QueryAs<O, DB> {
     /// The transport is synchronous, so the query runs to completion first and
     /// the stream yields what it produced. The stream owns its items and
     /// borrows nothing from `ex`.
-    // The executor is taken by value to match sqlx's `fetch(self, ex)`; the
-    // executor types here are cheap references (`&SqlitePool`, `&mut
-    // Transaction`), so this moves only a reference.
-    #[allow(clippy::needless_pass_by_value)]
     pub fn fetch<'e, E: Executor<Database = DB>>(
         self,
         ex: E,
