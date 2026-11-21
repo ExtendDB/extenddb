@@ -28,10 +28,10 @@
 //!   backfill — create the table with its vector indexes instead).
 //! - **Refused as the server refuses them**: every
 //!   `RestoreTableToPointInTime`, and an `UpdateContinuousBackups` that enables
-//!   point-in-time recovery, through
-//!   [`extenddb_engine::refuse_point_in_time_recovery`], called where the
-//!   server calls it: after the body is parsed (the server also authenticates
-//!   first; this build authenticates no request) and before any table is read.
+//!   point-in-time recovery, through [`extenddb_engine::parse_request`] and
+//!   [`extenddb_engine::ParsedRequest::admit`], the pre-dispatch checks the
+//!   server applies too (the server also authenticates between them; this
+//!   build authenticates no request). They run before any table is read.
 //! - **Passed through** to the engine's handlers: everything else, including
 //!   the data-plane operations, `DescribeTable` / `ListTables`, streams,
 //!   time-to-live, tagging, an `UpdateTable` that does not create a vector
@@ -48,7 +48,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use extenddb_core::error::{DynamoDbError, error_document, malformed_body_error};
+use extenddb_core::error::{DynamoDbError, error_document};
 use extenddb_core::limits::{DEFAULT_MAX_ITEM_SIZE_BYTES, LimitsConfig};
 #[cfg(not(target_arch = "wasm32"))]
 use extenddb_engine::BackupRuntime;
@@ -147,41 +147,24 @@ impl Engine {
         })
     }
 
-    /// Apply the browser-build operation policy, then validate the operation,
-    /// parse the body, and dispatch into the engine.
+    /// Apply the browser-build operation policy and the engine's pre-dispatch
+    /// checks, then dispatch into the engine.
     async fn dispatch(&self, operation: &str, body_json: &str) -> Result<Value, DynamoDbError> {
         // Refusals that need no request body: the store-backed backup
         // operations and PartiQL. Answered before the operation-known check so
         // a PartiQL request is refused for the stated reason rather than
         // reported as unknown — this build is compiled without the PartiQL
-        // surface, so `is_known_operation` would not recognize it otherwise.
+        // surface, so `parse_request` would report it as unknown otherwise.
         if let Some(reason) = unsupported_reason(operation) {
             return Err(unsupported(operation, reason));
         }
 
-        // Mirror the server's pre-auth order (crates/server/src/handler.rs): the
-        // operation name is validated before the body is parsed, so an unknown
-        // operation returns UnknownOperationException even when the body is also
-        // malformed. Parsing first would answer that case with
-        // SerializationException instead.
-        if !extenddb_engine::is_known_operation(operation) {
-            return Err(DynamoDbError::UnknownOperationException(String::new()));
-        }
-
-        // The HTTP server parses the raw body the same way and answers a parse
-        // failure with this SerializationException before auth
-        // (crates/server/src/handler.rs). Built from the same shared helper as
-        // the server's, so both build the error from one function.
-        let body: Value = serde_json::from_str(body_json).map_err(|e| malformed_body_error(&e))?;
-
-        // The server refuses a point-in-time restore and an enable at this
-        // point, after the body parse and before any table is read
-        // (crates/server/src/handler.rs). Calling the same engine function
-        // here gives both builds the server's answer.
-        if let Some(err) = extenddb_engine::refuse_point_in_time_recovery(operation, &body) {
-            return Err(err);
-        }
-
+        // The checks every entry point applies before dispatch, in the
+        // engine's order: the operation name, then the body parse, then the
+        // engine's refusals of requests no deployment serves (point-in-time
+        // recovery). The server authenticates between the first two steps and
+        // the last; this build authenticates no request.
+        let body = extenddb_engine::parse_request(operation, body_json.as_bytes())?.admit()?;
         // An UpdateTable that creates a vector index is refused here, before
         // dispatch and so before any catalog write: the build cannot run the
         // index backfill. Every other UpdateTable change passes through.
