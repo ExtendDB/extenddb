@@ -71,6 +71,13 @@ fails, with one line per problem, unless all of these hold:
    -D warnings raises the warning to an error again; they are refused too.
    CLIPPY_ARGS in the workflow is not looked for: cargo clippy sets that
    variable from the arguments after `--` and replaces a value it inherits.
+   In the clippy step's run, each crate's dep-info records that
+   clippy-driver read CLIPPY_ARGS with -D warnings and none of the flags
+   above, and CLIPPY_CONF_DIR naming devtools/wasm-clippy (a build script's
+   cargo::rustc-env, or an [env] entry with force = true in the cargo
+   configuration, can change either for a crate); and the run reports no
+   disallowed-method, disallowed-type or await-holding lint at a level other
+   than error, which would let the step pass.
    SETTING_PROBES lists lint settings in each of these spellings (attribute,
    inner attribute, cfg_attr, `[lints]` table, rustflags, workflow lines); the
    functions that read the crates' files and the workflow must refuse or
@@ -982,15 +989,63 @@ def read_dep_info(dep_info: Path, root: Path) -> tuple[list[Path], dict[str, str
 def driver_problems(envs: dict[str, dict[str, str]], messages: list[dict]) -> list[str]:
     """Problems in what clippy-driver ran with for each crate of the clippy
     step, as `envs` (the variables each crate's dep-info records) holds it, and
-    in the step's reports `messages`. This function looks for none."""
-    del envs, messages
-    return []
+    in the step's reports `messages`: CLIPPY_ARGS that is not recorded, holds
+    a flag that sets a lint level below deny or caps lint levels, or does not
+    deny warnings; CLIPPY_CONF_DIR that is not recorded or names another
+    directory than devtools/wasm-clippy; and a report of a disallowed or
+    await-holding lint at a level other than error, which lets the step pass."""
+    problems = []
+    for name, env in sorted(envs.items()):
+        if "CLIPPY_ARGS" not in env:
+            problems.append(f"{name}: its dep-info records no CLIPPY_ARGS for clippy-driver")
+        else:
+            args = [arg for arg in env["CLIPPY_ARGS"].split(CLIPPY_ARGS_SEPARATOR) if arg]
+            lowering = [arg for arg in args if _LOWERING_FLAG.match(arg)]
+            if lowering or not _denies_warnings(args):
+                problems.append(
+                    f"{name}: clippy-driver ran with CLIPPY_ARGS {args!r}, which"
+                    f" {f'holds {lowering!r}' if lowering else 'does not deny warnings'};"
+                    " a build script's cargo::rustc-env, or an [env] entry with force = true"
+                    " in the cargo configuration, can set it for a crate"
+                )
+        conf = env.get("CLIPPY_CONF_DIR")
+        if not conf or Path(conf).resolve() != CONF_DIR.resolve():
+            problems.append(
+                f"{name}: clippy-driver read CLIPPY_CONF_DIR {conf!r}, not {CONF_DIR}, so the"
+                f" lists of {CONFIG_REL} did not apply to it; a build script's"
+                " cargo::rustc-env, or an [env] entry with force = true, can set it"
+            )
+    for message in messages:
+        lint = (message.get("code") or {}).get("code")
+        if lint in GUARD_LINTS and message.get("level") != "error":
+            spans = [s for s in message.get("spans", []) if s.get("is_primary")]
+            where = f"{spans[0]['file_name']}:{spans[0]['line_start']}: " if spans else ""
+            problems.append(
+                f"{where}clippy reports {lint} as a {message.get('level')}, which lets the"
+                f" clippy step pass; a setting lowers the lint there: {message['message']}"
+            )
+    return problems
+
+
+# The lints whose reports the clippy step must give as errors.
+GUARD_LINTS = NEED_REASON | NEVER
+
+
+def _denies_warnings(args: list[str]) -> bool:
+    """Whether the rustc arguments `args` deny or forbid warnings."""
+    for arg, following in zip(args, args[1:] + [None]):
+        if arg in ("-D", "--deny", "-F", "--forbid") and following == "warnings":
+            return True
+        if arg in ("-Dwarnings", "-Fwarnings", "--deny=warnings", "--forbid=warnings"):
+            return True
+    return False
 
 
 def lint_setting_problems(crates: dict[str, dict], metadata: dict) -> tuple[list[str], str]:
     used_migration, reasoned, read = set(), 0, set()
     compiled = compiled_files(crates, ROOT, metadata["target_directory"])
     files, problems = compiled.files, compiled.problems
+    problems += driver_problems(compiled.envs, compiled.messages)
     for name in sorted(files):
         for path in files[name]:
             if path in read or not path.is_file():
