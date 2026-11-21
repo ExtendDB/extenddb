@@ -217,6 +217,12 @@ impl SqliteJobClaim {
 
     /// Heartbeat the record every `period` until a heartbeat is not
     /// confirmed; returns why. Never returns while the claim is confirmed.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "its only caller is finish_restore, in the task LegacyBackupReader::restore \
+                  spawns, which only the engine's backup runtime calls; the wasm build does not \
+                  compile that runtime"
+    )]
     pub(crate) async fn heartbeat_loop(&self, period: Duration) -> StorageError {
         let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -291,6 +297,11 @@ impl JobClaim for SqliteJobClaim {
     /// for the lock is this process's own queue (a writer holding it past a
     /// heartbeat period, a GSI backfill say, delays the beat and does not end
     /// the job), and only the `UPDATE` itself is held to `bound`.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "its callers are the engine's backup job heartbeats, which the wasm build does \
+                  not compile"
+    )]
     fn heartbeat_within(
         &self,
         bound: Duration,
@@ -1730,6 +1741,11 @@ impl MaintenanceClaim for SqliteMaintenanceClaim {
     /// job claim's does: a writer of this process holding the lock past a
     /// period (the replacement of a large in-catalog backup) delays the
     /// beat and does not lose the claim.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "its callers are the engine's backup maintenance claims, which the wasm build \
+                  does not compile"
+    )]
     fn heartbeat_within(
         &self,
         bound: Duration,

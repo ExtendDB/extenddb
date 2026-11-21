@@ -238,6 +238,11 @@ pub mod helpers {
     ///
     /// bcrypt is CPU-intensive and should not block the async runtime.
     /// This function spawns a blocking task to perform the hash operation.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "its callers are the server's admin bootstrap and the backends' bootstrappers, \
+                  none of which the wasm build runs"
+    )]
     pub async fn hash_password_async(password: String) -> OpResult<String> {
         tokio::task::spawn_blocking(move || bcrypt::hash(password, bcrypt::DEFAULT_COST))
             .await

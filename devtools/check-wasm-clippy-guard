@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+"""Check that the wasm32 clippy step refuses each disallowed method.
+
+devtools/wasm-clippy/clippy.toml lists the clock, thread, timer and task calls
+that compile for wasm32-unknown-unknown and fail when they run in a browser.
+For a path in that list that does not resolve, clippy prints a warning that
+-D warnings does not turn into an error (clippy 0.1.97), so a misspelt path,
+like a dropped entry, leaves the step green with that method unguarded. This
+script appends one probe function at a time to a source
+file the wasm build compiles, runs the step exactly as the WebAssembly
+workflow does, and requires it to fail with clippy's disallowed-method error
+naming the probed path. Some probes reach the method through an import
+(`use tokio::time; time::sleep`), as code usually does.
+
+The probed file is restored after each run and on any exit. Run from anywhere
+in the repository; exit status 0 means every probe was refused.
+"""
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+CONF_DIR = ROOT / "devtools" / "wasm-clippy"
+# A file of the engine, which the adapter compiles for wasm32.
+PROBED = ROOT / "crates" / "engine" / "src" / "get_item.rs"
+CLIPPY = [
+    "cargo",
+    "clippy",
+    "--locked",
+    "-p",
+    "extenddb-wasm-adapter",
+    "--lib",
+    "--target",
+    "wasm32-unknown-unknown",
+    "--",
+    "-D",
+    "warnings",
+]
+
+# (disallowed path, probe function). Each probe is an item appended to PROBED.
+PROBES = [
+    (
+        "std::time::Instant::now",
+        "fn probe() { use std::time; let _ = time::Instant::now(); }",
+    ),
+    ("std::time::SystemTime::now", "fn probe() { let _ = std::time::SystemTime::now(); }"),
+    (
+        "std::time::Instant::elapsed",
+        "fn probe(at: std::time::Instant) { let _ = at.elapsed(); }",
+    ),
+    (
+        "std::time::SystemTime::elapsed",
+        "fn probe() { let _ = std::time::UNIX_EPOCH.elapsed(); }",
+    ),
+    ("std::thread::sleep", "fn probe() { std::thread::sleep(std::time::Duration::ZERO); }"),
+    ("std::thread::spawn", "fn probe() { drop(std::thread::spawn(|| ())); }"),
+    ("std::thread::scope", "fn probe() { std::thread::scope(|_| ()); }"),
+    (
+        "std::thread::Builder::spawn",
+        "fn probe() { drop(std::thread::Builder::new().spawn(|| ())); }",
+    ),
+    (
+        "std::thread::Builder::spawn_scoped",
+        "fn probe<'s>(s: &'s std::thread::Scope<'s, '_>) {"
+        " drop(std::thread::Builder::new().spawn_scoped(s, || ())); }",
+    ),
+    (
+        "tokio::time::sleep",
+        "async fn probe() { use tokio::time; time::sleep(std::time::Duration::ZERO).await; }",
+    ),
+    (
+        "tokio::time::sleep_until",
+        "async fn probe(at: tokio::time::Instant) { tokio::time::sleep_until(at).await; }",
+    ),
+    (
+        "tokio::time::timeout",
+        "async fn probe() {"
+        " let _ = tokio::time::timeout(std::time::Duration::ZERO, async {}).await; }",
+    ),
+    (
+        "tokio::time::timeout_at",
+        "async fn probe(at: tokio::time::Instant) {"
+        " let _ = tokio::time::timeout_at(at, async {}).await; }",
+    ),
+    (
+        "tokio::time::interval",
+        "fn probe() { drop(tokio::time::interval(std::time::Duration::from_secs(1))); }",
+    ),
+    (
+        "tokio::time::interval_at",
+        "fn probe(at: tokio::time::Instant) {"
+        " drop(tokio::time::interval_at(at, std::time::Duration::from_secs(1))); }",
+    ),
+    ("tokio::time::Instant::now", "fn probe() { let _ = tokio::time::Instant::now(); }"),
+    (
+        "tokio::time::Instant::elapsed",
+        "fn probe(at: tokio::time::Instant) { let _ = at.elapsed(); }",
+    ),
+    ("tokio::task::spawn", "fn probe() { drop(tokio::spawn(async {})); }"),
+    ("tokio::task::spawn_blocking", "fn probe() { drop(tokio::task::spawn_blocking(|| ())); }"),
+    ("tokio::task::spawn_local", "fn probe() { drop(tokio::task::spawn_local(async {})); }"),
+    (
+        "tokio::task::JoinSet::spawn",
+        "fn probe(set: &mut tokio::task::JoinSet<()>) { drop(set.spawn(async {})); }",
+    ),
+]
+
+
+def main() -> int:
+    original = PROBED.read_text()
+    env = dict(os.environ, CLIPPY_CONF_DIR=str(CONF_DIR))
+    failures = []
+    try:
+        for path, probe in PROBES:
+            PROBED.write_text(f"{original}\n#[allow(dead_code)]\n{probe}\n")
+            run = subprocess.run(
+                CLIPPY, cwd=ROOT, env=env, capture_output=True, text=True, check=False
+            )
+            expected = f"use of a disallowed method `{path}`"
+            if run.returncode == 0:
+                failures.append(f"{path}: the clippy step passed")
+            elif expected not in run.stderr:
+                failures.append(f"{path}: the clippy step failed without {expected!r}:\n{run.stderr}")
+            else:
+                print(f"refused: {path}")
+    finally:
+        PROBED.write_text(original)
+    for failure in failures:
+        print(f"NOT REFUSED: {failure}", file=sys.stderr)
+    print(f"{len(PROBES) - len(failures)} of {len(PROBES)} probes refused")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

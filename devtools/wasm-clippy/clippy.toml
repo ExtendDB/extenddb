@@ -1,0 +1,43 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Clippy configuration for the WebAssembly build only. The wasm workflow points
+# CLIPPY_CONF_DIR at this directory for its clippy step, so these entries apply
+# to every workspace crate that step lints, and native clippy, which uses the
+# repository's defaults, is not affected.
+#
+# Each method below compiles for wasm32-unknown-unknown and fails when it runs
+# in a browser: std has no clock or threads on that target, and the adapter
+# drives tokio without a timer or a task runner. Clippy resolves each path, so
+# an import or a re-export (`use tokio::time; time::sleep(..)`, `tokio::spawn`)
+# is caught as well. A call that compiles for wasm but is never reached there
+# carries `#[allow(clippy::disallowed_methods, reason = "...")]` on its
+# function, naming the callers and why none runs on wasm.
+#
+# A path here that does not resolve only makes clippy print a warning, which
+# -D warnings does not turn into an error. devtools/check-wasm-clippy-guard,
+# run by the workflow after the clippy step, checks that each entry is refused.
+
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "std has no clock on wasm32-unknown-unknown; read it through web_time" },
+    { path = "std::time::SystemTime::now", reason = "std has no clock on wasm32-unknown-unknown; read it through web_time" },
+    { path = "std::time::Instant::elapsed", reason = "reads std's clock, which wasm32-unknown-unknown does not have" },
+    { path = "std::time::SystemTime::elapsed", reason = "reads std's clock, which wasm32-unknown-unknown does not have" },
+    { path = "std::thread::sleep", reason = "wasm32-unknown-unknown has no threads to block" },
+    { path = "std::thread::spawn", reason = "wasm32-unknown-unknown has no threads" },
+    { path = "std::thread::scope", reason = "wasm32-unknown-unknown has no threads" },
+    { path = "std::thread::Builder::spawn", reason = "wasm32-unknown-unknown has no threads" },
+    { path = "std::thread::Builder::spawn_scoped", reason = "wasm32-unknown-unknown has no threads" },
+    { path = "tokio::time::sleep", reason = "the wasm build has no tokio timer driver" },
+    { path = "tokio::time::sleep_until", reason = "the wasm build has no tokio timer driver" },
+    { path = "tokio::time::timeout", reason = "the wasm build has no tokio timer driver" },
+    { path = "tokio::time::timeout_at", reason = "the wasm build has no tokio timer driver" },
+    { path = "tokio::time::interval", reason = "the wasm build has no tokio timer driver" },
+    { path = "tokio::time::interval_at", reason = "the wasm build has no tokio timer driver" },
+    { path = "tokio::time::Instant::now", reason = "reads std's clock, which wasm32-unknown-unknown does not have" },
+    { path = "tokio::time::Instant::elapsed", reason = "reads std's clock, which wasm32-unknown-unknown does not have" },
+    { path = "tokio::task::spawn", reason = "the wasm build runs no tokio runtime to drive a task" },
+    { path = "tokio::task::spawn_blocking", reason = "the wasm build runs no tokio runtime or blocking pool" },
+    { path = "tokio::task::spawn_local", reason = "the wasm build runs no tokio LocalSet" },
+    { path = "tokio::task::JoinSet::spawn", reason = "the wasm build runs no tokio runtime to drive a task" },
+]

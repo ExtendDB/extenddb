@@ -219,6 +219,12 @@ impl Parser {
 /// inline budget and on a thread with [`LARGE_STACK_BYTES`] of stack when it
 /// does not. `attempt` takes whether the parse is inline and returns `None`
 /// when the inline budget ran out.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the PartiQL parser is compiled into the wasm build, but nothing there calls \
+              it: extenddb-engine's partiql feature is off and the WebAssembly adapter \
+              refuses the PartiQL operations before dispatch"
+)]
 pub(super) fn parse_on_a_fitting_stack(
     attempt: impl Fn(bool) -> Option<PResult<Statement>> + Sync,
 ) -> PResult<Statement> {
