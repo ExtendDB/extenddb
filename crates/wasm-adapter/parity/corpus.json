@@ -2617,6 +2617,77 @@
           "equals": "Export is disabled. Configure [export] paths in extenddb.toml to enable."
         }
       ]
+    },
+    {
+      "name": "CreateTable Strm with a KEYS_ONLY stream",
+      "op": "CreateTable",
+      "body": {
+        "TableName": "Strm",
+        "KeySchema": [
+          {
+            "AttributeName": "pk",
+            "KeyType": "HASH"
+          }
+        ],
+        "AttributeDefinitions": [
+          {
+            "AttributeName": "pk",
+            "AttributeType": "S"
+          }
+        ],
+        "BillingMode": "PAY_PER_REQUEST",
+        "StreamSpecification": {
+          "StreamEnabled": true,
+          "StreamViewType": "KEYS_ONLY"
+        }
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/TableDescription/StreamSpecification/StreamViewType",
+          "equals": "KEYS_ONLY"
+        }
+      ]
+    },
+    {
+      "name": "ListStreams names Strm's stream",
+      "op": "ListStreams",
+      "body": {
+        "TableName": "Strm"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/Streams/0/TableName",
+          "equals": "Strm"
+        }
+      ],
+      "save": {
+        "strmArn": "/Streams/0/StreamArn"
+      }
+    },
+    {
+      "name": "DescribeStream with a Limit above 2^32 returns all four shards and no LastEvaluatedShardId",
+      "op": "DescribeStream",
+      "body": {
+        "StreamArn": "${strmArn}",
+        "Limit": 4294967297
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/StreamDescription/Shards/3/ShardId",
+          "present": true
+        },
+        {
+          "path": "/StreamDescription/Shards/4",
+          "absent": true
+        },
+        {
+          "path": "/StreamDescription/LastEvaluatedShardId",
+          "absent": true
+        }
+      ]
     }
   ]
 }
