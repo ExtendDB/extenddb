@@ -395,6 +395,9 @@ finish_if_only_wasm_suites_left() {
 # each mode runs the steps its WASM_STEPS_ list below names, in that order,
 # through devtools/run-wasm-step, which holds the commands of every workflow
 # step that builds, lints or tests the code and which the workflow runs too.
+# Before it runs them, each mode checks with wasm_workflow_problems that the
+# workflow runs those steps as run-tests does, and fails, naming the step,
+# when it does not.
 #
 # Clippy's findings depend on its version and the wasm-bindgen-test harness
 # depends on Node's, so each mode reads from the workflow the toolchain it pins
@@ -524,20 +527,162 @@ wasm_restore_env() {
     fi
     wasm_remove_link_dirs
 }
+# Prints a line for each way in which .github/workflows/wasm.yml would run a
+# step otherwise than run-tests runs it, and returns 1 when it printed any:
+# - each step a WASM_STEPS_ list names is run by exactly one step of the
+#   workflow, whose run: is `devtools/run-wasm-step <step>` and nothing else,
+#   and which sets no key besides name:, id: and timeout-minutes:;
+# - every other step of the workflow uses one of the actions in
+#   WASM_SETUP_ACTIONS, or runs nothing but `apt-get update`, `apt-get
+#   install -y <packages>` and `cargo install --locked --version <version>
+#   <crate>` (with or without sudo), so that no other step builds, lints or
+#   tests the code;
+# - neither the workflow nor its job sets env:, defaults: or container:,
+#   which would apply to every step.
+# The file is read as text: a step is a `- ` item of a `steps:` list, and its
+# keys are the lines indented as its first key. A run: value may be plain or
+# quoted on one line, a plain value continued on lines indented more than its
+# key, or a block (| or >); a YAML merge key (<<:) or a step line that is not
+# a key fails the check. The check does not compare what the setup steps
+# install, apart from the toolchain and Node version read above, nor what an
+# action does.
+WASM_SETUP_ACTIONS="actions/checkout dtolnay/rust-toolchain Swatinem/rust-cache actions/setup-node actions/cache"
+wasm_workflow_problems() {
+    awk -v steps="$WASM_STEPS_WASM $WASM_STEPS_HEADLESS $WASM_STEPS_WASM_TEST" \
+        -v actions="$WASM_SETUP_ACTIONS" -v q="'" '
+function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+# The value of a plain or quoted scalar written on one line.
+function scalar(v) {
+    if (v ~ /^".*"$/ || v ~ ("^" q ".*" q "$")) return substr(v, 2, length(v) - 2)
+    sub(/[ \t]+#.*$/, "", v)
+    return v
+}
+function problem(text) { print ".github/workflows/wasm.yml:" text; bad = 1 }
+function key(text, at, k, v, u) {
+    if (!match(text, /^[A-Za-z0-9_-]+[ \t]*:([ \t]|$)/)) {
+        problem(NR ": run-tests cannot read this line of a step")
+        return
+    }
+    k = text
+    sub(/[ \t]*:.*$/, "", k)
+    v = trim(substr(text, index(text, ":") + 1))
+    keys[n] = keys[n] " " k
+    if (k == "name") title[n] = scalar(v)
+    else if (k == "uses") { u = scalar(v); sub(/@.*$/, "", u); uses[n] = u }
+    else if (k == "run") {
+        hasrun[n] = 1
+        run_at = at
+        if (v ~ /^[|>]/) { block = 1; run[n] = "" }
+        else { plain = 1; run[n] = scalar(v) }
+    }
+}
+# The first command of a run text that does not install a tool, or "".
+function not_install(r, lines, pieces, nl, np, i, j, c) {
+    nl = split(r, lines, "\n")
+    for (i = 1; i <= nl; i++) {
+        np = split(lines[i], pieces, "&&")
+        for (j = 1; j <= np; j++) {
+            c = trim(pieces[j])
+            if (c == "" || c ~ /^#/) continue
+            sub(/^sudo[ \t]+/, "", c)
+            if (c ~ /^apt-get[ \t]+update$/) continue
+            if (c ~ /^apt-get[ \t]+install[ \t]+-y([ \t]+[A-Za-z0-9.+_-]+)+$/) continue
+            if (c ~ /^cargo[ \t]+install[ \t]+--locked[ \t]+--version[ \t]+[A-Za-z0-9.+_-]+[ \t]+[A-Za-z0-9_-]+$/) continue
+            return trim(pieces[j])
+        }
+    }
+    return ""
+}
+{
+    line = $0
+    sub(/\r$/, "", line)
+    if (line ~ /^[ \t]*$/) next
+    match(line, /^ */)
+    at = RLENGTH
+    if (block) {
+        if (at > run_at) { run[n] = run[n] (run[n] == "" ? "" : "\n") trim(line); next }
+        block = 0
+    }
+    if (line ~ /^[ \t]*#/) next
+    if (plain) {
+        if (at > run_at) { run[n] = run[n] " " scalar(trim(line)); next }
+        plain = 0
+    }
+    if (line ~ /^[ \t]*(- +)?<<[ \t]*:/) { problem(NR ": run-tests does not read YAML merge keys"); next }
+    if (in_steps && at <= steps_at) in_steps = 0
+    if (line ~ /^[ \t]*steps[ \t]*:[ \t]*$/) { in_steps = 1; steps_at = at; item_at = -1; next }
+    if (in_steps) {
+        if (line ~ /^[ \t]*-([ \t]|$)/ && (item_at < 0 || at == item_at)) {
+            item_at = at
+            n++
+            first[n] = NR
+            rest = substr(line, at + 2)
+            match(rest, /^[ \t]*/)
+            key_at = at + 1 + RLENGTH
+            if (substr(rest, RLENGTH + 1) != "") key(substr(rest, RLENGTH + 1), key_at)
+        } else if (n > 0 && at == key_at) {
+            key(trim(line), at)
+        } else if (n == 0 || at < key_at) {
+            problem(NR ": run-tests cannot read this line of a step")
+        }
+        next
+    }
+    if (line ~ /^[ \t]*(env|defaults|container)[ \t]*:/) {
+        k = trim(line)
+        sub(/[ \t]*:.*$/, "", k)
+        problem(NR ": sets " k ":, which applies to every step; run-tests does not apply it")
+    }
+}
+END {
+    nw = split(steps, want, " ")
+    na = split(actions, act, " ")
+    for (j = 1; j <= n; j++) {
+        name = (title[j] != "" ? "the step \"" title[j] "\"" : "the step")
+        if (uses[j] != "") {
+            known = 0
+            for (i = 1; i <= na; i++) if (uses[j] == act[i]) known = 1
+            if (!known) problem(first[j] ": " name " uses " uses[j] ", which is not one of the setup actions run-tests knows (WASM_SETUP_ACTIONS)")
+            continue
+        }
+        if (!hasrun[j]) { problem(first[j] ": " name " has neither a run: nor a uses: that run-tests can read"); continue }
+        r = trim(run[j])
+        mirrored = 0
+        for (i = 1; i <= nw; i++) if (r == "devtools/run-wasm-step " want[i]) { count[i]++; mirrored = 1 }
+        if (mirrored) {
+            m = split(keys[j], ks, " ")
+            extra = ""
+            for (x = 1; x <= m; x++)
+                if (ks[x] != "name" && ks[x] != "run" && ks[x] != "id" && ks[x] != "timeout-minutes") extra = extra " " ks[x] ":"
+            if (extra != "") problem(first[j] ": " name " (" r ") also sets" extra ", which run-tests does not apply")
+        } else if (r ~ /run-wasm-step/) {
+            gsub(/\n/, "; ", r)
+            problem(first[j] ": " name " runs `" r "`, which is not exactly `devtools/run-wasm-step <step>` for a step run-tests runs")
+        } else if ((c = not_install(r)) != "") {
+            problem(first[j] ": " name " runs `" c "`, which is neither `devtools/run-wasm-step <step>` for a step run-tests runs nor an install of a tool, so run-tests does not run it")
+        }
+    }
+    for (i = 1; i <= nw; i++) {
+        if (count[i] == 0) problem(" no step runs exactly `devtools/run-wasm-step " want[i] "`, a step run-tests runs")
+        else if (count[i] > 1) problem(" " count[i] " steps run exactly `devtools/run-wasm-step " want[i] "`; run-tests runs it once")
+    }
+    exit bad
+}' .github/workflows/wasm.yml
+}
 # Runs one WebAssembly mode: selects the workflow's toolchain (and its Node,
-# when NODE is "node"), writes the header of the mode's artifact, runs each
-# STEP through devtools/run-wasm-step with its output copied to the artifact,
-# and ends the artifact with "RESULT: PASS" or "RESULT: FAIL" (and then sets
-# PASS=false).
+# when NODE is "node"), writes the header of the mode's artifact, checks the
+# workflow with wasm_workflow_problems, runs each STEP through
+# devtools/run-wasm-step with its output copied to the artifact when the check
+# passed, and ends the artifact with "RESULT: PASS" or "RESULT: FAIL" (and
+# then sets PASS=false).
 #   wasm_mode ARTIFACT TITLE TARGET NODE STEP...
 wasm_mode() {
-    local out="$1" title="$2" target="$3" node="$4" rc=0 step
+    local out="$1" title="$2" target="$3" node="$4" rc=0 ready=true step problems
     shift 4
     echo "=== ${title} → ${out} ==="
-    wasm_select_toolchain || rc=1
+    wasm_select_toolchain || ready=false
     WASM_NODE_NOTE="not looked up"
-    if [ "$node" = node ] && [ "$rc" -eq 0 ]; then
-        wasm_select_node || rc=1
+    if [ "$node" = node ] && $ready; then
+        wasm_select_node || ready=false
     fi
     {
         echo "$title"
@@ -565,12 +710,23 @@ wasm_mode() {
     if [ "$node" = node ]; then
         echo "node:      ${WASM_NODE_NOTE}"
     fi
-    if [ "$rc" -ne 0 ]; then
+    echo "--- .github/workflows/wasm.yml ---" | tee -a "$out"
+    if problems="$(wasm_workflow_problems)"; then
+        echo "checked: each of ${WASM_STEPS_WASM} ${WASM_STEPS_HEADLESS} ${WASM_STEPS_WASM_TEST} runs there as \`devtools/run-wasm-step <step>\` and nothing else, and every other step is a setup step" | tee -a "$out"
+    else
+        printf '%s\n' "$problems" | sed 's/^/error: /' | tee -a "$out"
+        rc=1
+    fi
+    if ! $ready; then
         if [ "$node" = node ]; then
-            echo "error: the steps need the toolchain and the Node above; none was run" | tee -a "$out"
+            echo "error: the steps need the toolchain and the Node above" | tee -a "$out"
         else
-            echo "error: the steps need the toolchain above; none was run" | tee -a "$out"
+            echo "error: the steps need the toolchain above" | tee -a "$out"
         fi
+        rc=1
+    fi
+    if [ "$rc" -ne 0 ]; then
+        echo "error: none of the steps was run" | tee -a "$out"
     else
         for step in "$@"; do
             echo "--- devtools/run-wasm-step ${step} ---" | tee -a "$out"
