@@ -104,7 +104,7 @@ async fn add_base_key_indexes(pool: &SqlitePool) -> Result<Vec<String>, Migratio
             continue;
         }
         let mut key_columns: Vec<(i64, String)> = sqlx::query_as::<_, (i64, String, String, i64, Option<String>, i64)>(
-            &format!("PRAGMA table_info(\"{index_table}\")"),
+            sqlx::AssertSqlSafe(format!("PRAGMA table_info(\"{index_table}\")")),
         )
         .fetch_all(pool)
         .await
@@ -125,10 +125,10 @@ async fn add_base_key_indexes(pool: &SqlitePool) -> Result<Vec<String>, Migratio
             ));
             continue;
         }
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "CREATE INDEX IF NOT EXISTS \"{index}\" ON \"{index_table}\" ({})",
             base_columns.join(", ")
-        ))
+        )))
         .execute(pool)
         .await
         .map_err(|e| store_error(&format!("create {index}"), e))?;

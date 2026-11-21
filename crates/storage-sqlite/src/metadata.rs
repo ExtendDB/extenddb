@@ -255,9 +255,12 @@ impl MetadataEngine for SqliteEngine {
                      (CAST(json_extract(item_data, '{path}') AS INTEGER)) \
                      WHERE json_extract(item_data, '{path}') IS NOT NULL"
                 );
-                sqlx::query(&sql).execute(&self.pool).await.map_err(|e| {
-                    StorageError::Internal(format!("TTL index creation failed: {e}"))
-                })?;
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| {
+                        StorageError::Internal(format!("TTL index creation failed: {e}"))
+                    })?;
             }
 
             sqlx::query(
@@ -294,10 +297,12 @@ impl MetadataEngine for SqliteEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
             let index_name = format!("idx_ttl_{table_id}");
-            sqlx::query(&format!("DROP INDEX IF EXISTS \"{index_name}\""))
-                .execute(&self.pool)
-                .await
-                .map_err(|e| StorageError::Internal(format!("TTL index drop failed: {e}")))?;
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP INDEX IF EXISTS \"{index_name}\""
+            )))
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(format!("TTL index drop failed: {e}")))?;
             Ok(())
         })
     }
@@ -333,7 +338,7 @@ impl MetadataEngine for SqliteEngine {
                  WHERE CAST(json_extract(item_data, ?) AS INTEGER) BETWEEN 1 AND ? \
                  ORDER BY CAST(json_extract(item_data, ?) AS INTEGER) LIMIT ?"
             );
-            let rows: Vec<(String,)> = sqlx::query_as(&sql)
+            let rows: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(&path)
                 .bind(now)
                 .bind(&path)
@@ -363,8 +368,8 @@ impl MetadataEngine for SqliteEngine {
             let _writer = self.write_lock.lock().await;
             let table_id = self.table_id_for(&account_id, &table_name).await?;
             let data_table = data::data_table_name(&table_id);
-            let (item_count, table_size): (i64, i64) = sqlx::query_as(&format!(
-                "SELECT COUNT(*), COALESCE(SUM(length(item_data)), 0) FROM {data_table}"
+            let (item_count, table_size): (i64, i64) = sqlx::query_as(sqlx::AssertSqlSafe(
+                format!("SELECT COUNT(*), COALESCE(SUM(length(item_data)), 0) FROM {data_table}"),
             ))
             .fetch_one(&self.pool)
             .await

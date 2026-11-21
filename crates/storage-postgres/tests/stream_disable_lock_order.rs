@@ -54,14 +54,14 @@ async fn connect(s: &Scratch) -> (PgConnection, i32) {
 /// Make a write wait at the end of each stream record it stores while the gate
 /// is closed. The write has locked the record's shard row by then.
 async fn install_record_gate(s: &Scratch) {
-    sqlx::raw_sql(&format!(
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "CREATE FUNCTION hold_record() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
            PERFORM pg_advisory_xact_lock_shared({GATE}); \
            RETURN NULL; \
          END $$; \
          CREATE TRIGGER hold_record AFTER INSERT ON stream_pending \
            FOR EACH ROW EXECUTE FUNCTION hold_record();"
-    ))
+    )))
     .execute(&s.db)
     .await
     .expect("install the gate trigger");
@@ -302,10 +302,10 @@ async fn a_disable_locks_its_shard_rows_in_shard_id_order_whatever_order_they_ar
         "enable_indexonlyscan",
         "enable_bitmapscan",
     ] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER DATABASE \"{}\" SET {setting} = off",
             s.db_name
-        ))
+        )))
         .execute(&s.admin)
         .await
         .expect("turn index scans off");

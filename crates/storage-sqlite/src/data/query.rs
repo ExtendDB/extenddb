@@ -159,7 +159,7 @@ pub(super) async fn execute_dynamic_query(
     values: Vec<BoundValue>,
     pool: &sqlx::SqlitePool,
 ) -> Result<Vec<serde_json::Value>, StorageError> {
-    let mut query = sqlx::query_as::<_, (serde_json::Value,)>(sql);
+    let mut query = sqlx::query_as::<_, (serde_json::Value,)>(sqlx::AssertSqlSafe(sql));
     for v in values {
         query = match v {
             BoundValue::Text(s) => query.bind(s),

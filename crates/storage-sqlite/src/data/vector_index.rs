@@ -279,7 +279,7 @@ async fn apply_vector_index(
     if let Some(source) = old_item.or(new_item) {
         let binds = base_key_binds(source, base_key_schema, attr_defs)?;
         let sql = format!("DELETE FROM {vec_table} WHERE {where_clause}");
-        let mut q = sqlx::query(&sql);
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
         for b in binds {
             q = super::bind_bound!(q, b);
         }
@@ -400,7 +400,7 @@ pub(crate) async fn insert_vector_row(
         cols.join(", ")
     );
     let key_binds = base_key_binds(item, base_key_schema, attr_defs)?;
-    let mut q = sqlx::query(&sql).bind(part);
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(part);
     for b in key_binds {
         q = super::bind_bound!(q, b);
     }
@@ -487,7 +487,7 @@ async fn backfill_vector_batch(
     let after_rowid = after_rowid.unwrap_or(0);
     let sql =
         format!("SELECT rowid, item_data FROM {base_table} WHERE rowid > ? ORDER BY rowid LIMIT ?");
-    let rows: Vec<(i64, String)> = sqlx::query_as(&sql)
+    let rows: Vec<(i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(after_rowid)
         .bind(limit)
         .fetch_all(&mut **tx)
@@ -762,9 +762,9 @@ mod tests {
             ("a", "5"),
             ("b", "1"),
         ] {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "INSERT INTO {base_table} (pk, sk_s, item_data) VALUES (?, ?, ?)"
-            ))
+            )))
             .bind(pk)
             .bind(sk)
             .bind(format!(
@@ -807,10 +807,12 @@ mod tests {
             "every row must be indexed; the pk-only cursor wrote 4 and skipped 2"
         );
         let vec_table = super::super::vector_table_name(table_id, "vidx-1");
-        let (rows,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {vec_table}"))
-            .fetch_one(&engine.pool)
-            .await
-            .expect("count");
+        let (rows,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {vec_table}"
+        )))
+        .fetch_one(&engine.pool)
+        .await
+        .expect("count");
         assert_eq!(rows, 6, "the index must hold all six rows");
     }
 
@@ -880,9 +882,9 @@ mod tests {
             ),
         ];
         for (pk, item) in &rows {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "INSERT INTO {base_table} (pk, item_data) VALUES (?, ?)"
-            ))
+            )))
             .bind(pk)
             .bind(item)
             .execute(&mut *tx)
@@ -914,10 +916,12 @@ mod tests {
         // The good rows AFTER the poison rows made it in, which is the part the
         // pre-fix behaviour cannot do: it stopped at p1.
         let vec_table = super::super::vector_table_name(table_id, "vidx-p");
-        let (rows,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {vec_table}"))
-            .fetch_one(&engine.pool)
-            .await
-            .expect("count");
+        let (rows,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {vec_table}"
+        )))
+        .fetch_one(&engine.pool)
+        .await
+        .expect("count");
         assert_eq!(rows, 3);
     }
     /// A synchronous-visibility write (`index_propagation_delay_ms == 0`)
@@ -984,9 +988,9 @@ mod tests {
         .await
         .expect("index row");
         let base_table = super::super::data_table_name(table_id);
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO {base_table} (pk, item_data) VALUES ('z', ?)"
-        ))
+        )))
         .bind(r#"{"pk":{"S":"z"},"emb":{"L":[{"N":"1"},{"N":"0"}]}}"#)
         .execute(&mut *tx)
         .await
@@ -1038,10 +1042,12 @@ mod tests {
         .expect("backfill must not wedge on the inline write's row");
         assert_eq!(outcome.skipped, 0);
         let vec_table = super::super::vector_table_name(table_id, "vidx-c");
-        let (rows,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {vec_table}"))
-            .fetch_one(&engine.pool)
-            .await
-            .expect("count");
+        let (rows,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {vec_table}"
+        )))
+        .fetch_one(&engine.pool)
+        .await
+        .expect("count");
         assert_eq!(
             rows, 1,
             "one base key must yield one index row, not a duplicate"

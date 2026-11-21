@@ -194,12 +194,30 @@ pub(crate) const RELEASED: &[Released] = &[
     },
     Released {
         id: MigrationId::AttributeNameEscape,
+        store: StoreKind::Catalog,
+        checksum: "6213bb92a491bac7ba8477364985340555195b891cd1267c8f4e239d4229f81a",
+        fingerprint: Some("0011_attribute_name_escape/postgres/1"),
+        kind: Kind::Breaking,
+        convergent: false,
+        rebless: Some("sqlx 0.9 takes dynamic SQL only through sqlx::AssertSqlSafe"),
+    },
+    Released {
+        id: MigrationId::AttributeNameEscape,
         store: StoreKind::Data,
         checksum: "284c9e0acc37bc8fe0390188b1fc4b0a74467854b7919c616b525aafff8bba05",
         fingerprint: Some("0011_attribute_name_escape/postgres/1"),
         kind: Kind::Breaking,
         convergent: false,
         rebless: None,
+    },
+    Released {
+        id: MigrationId::AttributeNameEscape,
+        store: StoreKind::Data,
+        checksum: "6213bb92a491bac7ba8477364985340555195b891cd1267c8f4e239d4229f81a",
+        fingerprint: Some("0011_attribute_name_escape/postgres/1"),
+        kind: Kind::Breaking,
+        convergent: false,
+        rebless: Some("sqlx 0.9 takes dynamic SQL only through sqlx::AssertSqlSafe"),
     },
     Released {
         id: MigrationId::UniqueAccessKeyIds,
@@ -643,7 +661,7 @@ pub async fn apply_all_migrations(
         for id in MigrationId::ALL {
             for body in migration(id).bodies() {
                 if let extenddb_storage::migrations::Body::File { name, text } = &body.body {
-                    sqlx::raw_sql(text)
+                    sqlx::raw_sql(*text)
                         .execute(catalog)
                         .await
                         .map_err(|e| format!("{name}: {e:?}"))?;

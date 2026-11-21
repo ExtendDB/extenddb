@@ -55,9 +55,9 @@ impl Scratch {
         } = self;
         drop(engine);
         db.close().await;
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
-        ))
+        )))
         .execute(&admin)
         .await
         .expect("drop the scratch database");
@@ -115,10 +115,12 @@ async fn scratch() -> Scratch {
         .connect(&format!("{base}/postgres"))
         .await
         .expect("connect to the postgres maintenance database");
-    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
-        .execute(&admin)
-        .await
-        .expect("create the scratch database");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE \"{db_name}\""
+    )))
+    .execute(&admin)
+    .await
+    .expect("create the scratch database");
     let url = format!("{base}/{db_name}");
     let db = PgPoolOptions::new()
         .max_connections(2)
@@ -127,7 +129,7 @@ async fn scratch() -> Scratch {
         .expect("connect to the scratch database");
     // One scratch database stands in for both the catalog and the data database.
     for sql in shipped_migrations() {
-        sqlx::raw_sql(&sql)
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
             .execute(&db)
             .await
             .expect("apply a shipped migration");
@@ -261,9 +263,9 @@ async fn ids(db: &PgPool) -> (String, String, String) {
 
 /// `(base_pk, base_sk, g)` for every row of the index.
 async fn index_rows(db: &PgPool, index_id: &str) -> BTreeSet<(String, String, String)> {
-    let rows: Vec<(String, String, String)> = sqlx::query_as(&format!(
+    let rows: Vec<(String, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT base_pk, base_sk_n::text, pk FROM \"_ddb_{index_id}\""
-    ))
+    )))
     .fetch_all(db)
     .await
     .expect("read the index table");
@@ -272,10 +274,10 @@ async fn index_rows(db: &PgPool, index_id: &str) -> BTreeSet<(String, String, St
 
 /// `(pk, sk, g)` for every base item carrying `g`.
 async fn expected_rows(db: &PgPool, table_id: &str) -> BTreeSet<(String, String, String)> {
-    let rows: Vec<(String, String, String)> = sqlx::query_as(&format!(
+    let rows: Vec<(String, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT pk, sk_n::text, item_data->'g'->>'S' FROM \"_ddb_{table_id}\" \
          WHERE item_data ? 'g'"
-    ))
+    )))
     .fetch_all(db)
     .await
     .expect("read the base table");

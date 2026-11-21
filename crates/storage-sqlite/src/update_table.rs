@@ -1265,7 +1265,7 @@ async fn update_col(
 ) -> Result<(), StorageError> {
     // `column` is a compile-time constant from this module, never user input.
     let sql = format!("UPDATE tables SET {column} = ? WHERE account_id = ? AND table_name = ?");
-    sqlx::query(&sql)
+    sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(value)
         .bind(account_id)
         .bind(table_name)
@@ -1575,16 +1575,18 @@ mod reconciler_tests {
                 .fetch_one(&engine.pool)
                 .await
                 .expect("index id");
-        let missing: i64 = sqlx::query_scalar(&format!(
+        let missing: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM \"_ddb_{index_id}\" WHERE sk_n IS NULL"
-        ))
+        )))
         .fetch_one(&engine.pool)
         .await
         .expect("count rows without a sort key");
-        let rows: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM \"_ddb_{index_id}\""))
-            .fetch_one(&engine.pool)
-            .await
-            .expect("count rows");
+        let rows: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM \"_ddb_{index_id}\""
+        )))
+        .fetch_one(&engine.pool)
+        .await
+        .expect("count rows");
         assert_eq!((rows, missing), (1, 0), "one index row, with its sort key");
     }
 
@@ -1754,9 +1756,9 @@ mod reconciler_tests {
                 if vec == "[1,0]" { 1 } else { 0 },
                 if vec == "[1,0]" { 0 } else { 1 }
             );
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "INSERT INTO {base_table} (pk, item_data) VALUES (?, ?)"
-            ))
+            )))
             .bind(pk)
             .bind(&item)
             .execute(&engine.pool)
@@ -1801,10 +1803,12 @@ mod reconciler_tests {
 
         // The rebuilt table must actually hold the rows.
         let vec_table = crate::data::vector_table_name(&table_id, "vidx-1");
-        let (rows,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {vec_table}"))
-            .fetch_one(&engine.pool)
-            .await
-            .expect("count");
+        let (rows,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {vec_table}"
+        )))
+        .fetch_one(&engine.pool)
+        .await
+        .expect("count");
         assert_eq!(rows, 2, "the rebuild must backfill both seeded items");
 
         // Idempotent, and the second run must not duplicate the rows it already
@@ -1817,10 +1821,12 @@ mod reconciler_tests {
             0,
             "reconciler must be idempotent"
         );
-        let (rows_after,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {vec_table}"))
-            .fetch_one(&engine.pool)
-            .await
-            .expect("count again");
+        let (rows_after,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {vec_table}"
+        )))
+        .fetch_one(&engine.pool)
+        .await
+        .expect("count again");
         assert_eq!(rows_after, 2, "a second pass must not duplicate rows");
     }
 
@@ -1861,9 +1867,9 @@ mod reconciler_tests {
 
         let base_table = crate::data::data_table_name(&table_id);
         for pk in ["a", "b"] {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "INSERT INTO {base_table} (pk, item_data) VALUES (?, ?)"
-            ))
+            )))
             .bind(pk)
             .bind(format!(
                 r#"{{"pk":{{"S":"{pk}"}},"emb":{{"L":[{{"N":"1"}},{{"N":"0"}}]}}}}"#
@@ -1924,10 +1930,12 @@ mod reconciler_tests {
         tx.commit().await.expect("commit");
 
         let vec_table = crate::data::vector_table_name(&table_id, "vidx-2");
-        let (before,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {vec_table}"))
-            .fetch_one(&engine.pool)
-            .await
-            .expect("count before");
+        let (before,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {vec_table}"
+        )))
+        .fetch_one(&engine.pool)
+        .await
+        .expect("count before");
         assert_eq!(before, 1, "the setup must leave a genuinely partial table");
 
         engine
@@ -1935,10 +1943,12 @@ mod reconciler_tests {
             .await
             .expect("reconcile");
 
-        let (after,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {vec_table}"))
-            .fetch_one(&engine.pool)
-            .await
-            .expect("count after");
+        let (after,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {vec_table}"
+        )))
+        .fetch_one(&engine.pool)
+        .await
+        .expect("count after");
         assert_eq!(
             after, 2,
             "the rebuild must drop the partial table, not append to it: 3 rows would mean \
@@ -1986,9 +1996,9 @@ mod reconciler_tests {
                 .expect("table_id");
 
         let base_table = crate::data::data_table_name(&table_id);
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO {base_table} (pk, item_data) VALUES ('a', ?)"
-        ))
+        )))
         .bind(r#"{"pk":{"S":"a"},"emb":{"L":[{"N":"1"},{"N":"0"}]}}"#)
         .execute(&engine.pool)
         .await
@@ -2032,10 +2042,12 @@ mod reconciler_tests {
         // Recovered means populated, not merely flipped: the seeded row must be
         // in the rebuilt index, or the "recovery" published an empty index.
         let vec_table = crate::data::vector_table_name(&table_id, "vidx-dead");
-        let (rows,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {vec_table}"))
-            .fetch_one(&engine.pool)
-            .await
-            .expect("count");
+        let (rows,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {vec_table}"
+        )))
+        .fetch_one(&engine.pool)
+        .await
+        .expect("count");
         assert_eq!(rows, 1, "recovery must backfill the seeded row");
     }
 
@@ -2258,9 +2270,9 @@ mod reconciler_tests {
                 .await
                 .expect("table_id");
         let base_table = crate::data::data_table_name(&table_id);
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO {base_table} (pk, item_data) VALUES ('a', ?)"
-        ))
+        )))
         .bind(r#"{"pk":{"S":"a"},"emb":{"L":[{"N":"1"},{"N":"0"}]}}"#)
         .execute(&engine.pool)
         .await

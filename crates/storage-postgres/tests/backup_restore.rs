@@ -86,9 +86,11 @@ impl Scratch {
 
 async fn drop_databases(admin: &PgPool, names: &[String]) {
     for name in names {
-        let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
-            .execute(admin)
-            .await;
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"
+        )))
+        .execute(admin)
+        .await;
     }
 }
 
@@ -168,7 +170,7 @@ async fn scratch_with_pool(pool_size: u32) -> Scratch {
         names: vec![catalog_name.clone(), data_name.clone()],
     };
     for name in [&catalog_name, &data_name] {
-        sqlx::query(&format!("CREATE DATABASE \"{name}\""))
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{name}\"")))
             .execute(&admin)
             .await
             .expect("create a scratch database");
@@ -774,10 +776,12 @@ async fn index_ids(s: &Scratch, table_id: &str) -> Vec<(String, String)> {
 }
 
 async fn data_rows(s: &Scratch, physical_id: &str) -> i64 {
-    sqlx::query_scalar(&format!("SELECT count(*) FROM \"_ddb_{physical_id}\""))
-        .fetch_one(&s.db)
-        .await
-        .expect("count rows")
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM \"_ddb_{physical_id}\""
+    )))
+    .fetch_one(&s.db)
+    .await
+    .expect("count rows")
 }
 
 async fn data_table_exists(s: &Scratch, physical_id: &str) -> bool {
@@ -823,9 +827,9 @@ async fn snapshot_source(s: &Scratch, name: &str) -> (String, String) {
 }
 
 async fn insert_snapshot_item(db: &PgPool, table: &str, key: &str) {
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {table} (pk, item_data) VALUES ($1, $2)"
-    ))
+    )))
     .bind(key)
     .bind(serde_json::json!({"pk": {"S": key}}))
     .execute(db)
@@ -834,7 +838,7 @@ async fn insert_snapshot_item(db: &PgPool, table: &str, key: &str) {
 }
 
 async fn snapshot_row_count(db: &PgPool, table: &str) -> i64 {
-    sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
         .fetch_one(db)
         .await
         .expect("count snapshot rows")
@@ -950,10 +954,10 @@ async fn abandoned_restore_is_removed_only_when_its_heartbeat_is_stale() {
             .execute(&catalog)
             .await
             .expect("simulate a crash");
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE table_restores SET status = 'RUNNING', completed_at = NULL, \
                  heartbeat_at = NOW() - INTERVAL '{age}' WHERE table_id = $1"
-            ))
+            )))
             .bind(&id)
             .execute(&catalog)
             .await
@@ -1801,18 +1805,21 @@ async fn backup_snapshot_with_lock_only_includes_later_insert() {
         s.db.begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .await
             .expect("begin old-shape snapshot");
-    sqlx::query(&format!("LOCK TABLE {table} IN ACCESS SHARE MODE"))
-        .execute(&mut *snapshot)
-        .await
-        .expect("lock the source relation");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "LOCK TABLE {table} IN ACCESS SHARE MODE"
+    )))
+    .execute(&mut *snapshot)
+    .await
+    .expect("lock the source relation");
 
     // This commits after the point where CreateBackup released its catalog
     // barrier. Because no SELECT fixed the snapshot, the item read sees it.
     insert_snapshot_item(&s.db, &table, "after").await;
-    let visible: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
-        .fetch_one(&mut *snapshot)
-        .await
-        .expect("read through the old snapshot shape");
+    let visible: i64 =
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
+            .fetch_one(&mut *snapshot)
+            .await
+            .expect("read through the old snapshot shape");
     assert_eq!(visible, 2, "LOCK TABLE unexpectedly fixed the snapshot");
     snapshot.commit().await.expect("commit snapshot");
     s.cleanup().await;
@@ -1834,22 +1841,27 @@ async fn backup_snapshot_with_relation_read_excludes_later_insert() {
         s.db.begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .await
             .expect("begin backup-shaped snapshot");
-    sqlx::query(&format!("LOCK TABLE {table} IN ACCESS SHARE MODE"))
-        .execute(&mut *snapshot)
-        .await
-        .expect("lock the source relation");
-    let first: Option<i32> = sqlx::query_scalar(&format!("SELECT 1 FROM {table} LIMIT 1"))
-        .fetch_optional(&mut *snapshot)
-        .await
-        .expect("fix the snapshot by reading the relation");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "LOCK TABLE {table} IN ACCESS SHARE MODE"
+    )))
+    .execute(&mut *snapshot)
+    .await
+    .expect("lock the source relation");
+    let first: Option<i32> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT 1 FROM {table} LIMIT 1"
+    )))
+    .fetch_optional(&mut *snapshot)
+    .await
+    .expect("fix the snapshot by reading the relation");
     assert_eq!(first, Some(1));
 
     // This is the first write after the catalog barrier is released.
     insert_snapshot_item(&s.db, &table, "after").await;
-    let visible: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
-        .fetch_one(&mut *snapshot)
-        .await
-        .expect("read through the fixed snapshot");
+    let visible: i64 =
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
+            .fetch_one(&mut *snapshot)
+            .await
+            .expect("read through the fixed snapshot");
     assert_eq!(visible, 1, "the fixed snapshot included a later item");
     snapshot.commit().await.expect("commit snapshot");
 
@@ -1883,14 +1895,18 @@ async fn control_plane_drop_timeout_leaves_table_deleting_for_retry() {
         s.db.begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .await
             .expect("begin backup-shaped snapshot");
-    sqlx::query(&format!("LOCK TABLE {table} IN ACCESS SHARE MODE"))
-        .execute(&mut *backup)
-        .await
-        .expect("hold the backup table lock");
-    let _: Option<i32> = sqlx::query_scalar(&format!("SELECT 1 FROM {table} LIMIT 1"))
-        .fetch_optional(&mut *backup)
-        .await
-        .expect("fix the backup snapshot");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "LOCK TABLE {table} IN ACCESS SHARE MODE"
+    )))
+    .execute(&mut *backup)
+    .await
+    .expect("hold the backup table lock");
+    let _: Option<i32> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT 1 FROM {table} LIMIT 1"
+    )))
+    .fetch_optional(&mut *backup)
+    .await
+    .expect("fix the backup snapshot");
 
     let first = tokio::time::timeout(
         std::time::Duration::from_secs(15),
@@ -1992,7 +2008,7 @@ async fn backup_leaves_out_a_gsi_still_being_built() {
         .find(|(n, _)| n == "gix")
         .expect("gix")
         .1;
-    sqlx::query(&format!("DROP TABLE \"_ddb_{gi}\""))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE \"_ddb_{gi}\"")))
         .execute(&s.db)
         .await
         .expect("make the GSI look half-built");
@@ -2236,9 +2252,9 @@ async fn gi_li(s: &Scratch, table_id: &str) -> (String, String) {
 
 /// Distinct inserting transactions of a data table's rows.
 async fn xmins(s: &Scratch, physical_id: &str) -> Vec<String> {
-    sqlx::query_scalar(&format!(
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT DISTINCT xmin::text FROM \"_ddb_{physical_id}\" ORDER BY 1"
-    ))
+    )))
     .fetch_all(&s.db)
     .await
     .expect("xmins")
@@ -2646,9 +2662,9 @@ async fn restored_index_rows_match_the_write_path() {
     let rows = |id: String| {
         let db = s.db.clone();
         async move {
-            sqlx::query_scalar::<_, String>(&format!(
+            sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
                 "SELECT to_jsonb(t)::text FROM \"_ddb_{id}\" t ORDER BY 1"
-            ))
+            )))
             .fetch_all(&db)
             .await
             .expect("rows")
@@ -4684,7 +4700,7 @@ mod catalog_index {
         );
         let mut defaults = Vec::new();
         for name in ["lock_timeout", "statement_timeout"] {
-            let value: String = sqlx::query_scalar(&format!("SHOW {name}"))
+            let value: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SHOW {name}")))
                 .fetch_one(&s.catalog)
                 .await
                 .expect("SHOW on another session");
@@ -6472,10 +6488,10 @@ mod reconciler_fencing {
         .execute(&s.catalog)
         .await
         .expect("crash");
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE table_restores SET status = 'RUNNING', completed_at = NULL, \
              heartbeat_at = now() - interval '{age}' WHERE table_id = $1"
-        ))
+        )))
         .bind(table_id)
         .execute(&s.catalog)
         .await

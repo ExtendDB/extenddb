@@ -160,9 +160,9 @@ impl SqliteEngine {
         account_id: &str,
         table_name: &str,
     ) -> Result<TableDescription, StorageError> {
-        let row: Option<TableRow> = sqlx::query_as(&format!(
+        let row: Option<TableRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {TABLE_COLUMNS} FROM tables WHERE account_id = ? AND table_name = ?"
-        ))
+        )))
         .bind(account_id)
         .bind(table_name)
         .fetch_optional(&mut *conn)
@@ -171,17 +171,17 @@ impl SqliteEngine {
 
         let row = row.ok_or_else(|| StorageError::TableNotFound(table_name.to_owned()))?;
 
-        let index_rows: Vec<IndexRow> = sqlx::query_as(&format!(
+        let index_rows: Vec<IndexRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {INDEX_COLUMNS} FROM indexes WHERE table_id = ?"
-        ))
+        )))
         .bind(&row.table_id)
         .fetch_all(&mut *conn)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let vector_rows: Vec<VectorIndexRow> = sqlx::query_as(&format!(
+        let vector_rows: Vec<VectorIndexRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {VECTOR_INDEX_COLUMNS} FROM vector_indexes WHERE table_id = ?"
-        ))
+        )))
         .bind(&row.table_id)
         .fetch_all(&mut *conn)
         .await
@@ -379,7 +379,7 @@ impl SqliteEngine {
         let sql = format!("SELECT item_data FROM {base_table} ORDER BY pk LIMIT ? OFFSET ?");
         let mut offset: i64 = 0;
         loop {
-            let rows: Vec<(String,)> = sqlx::query_as(&sql)
+            let rows: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(BATCH)
                 .bind(offset)
                 .fetch_all(&mut **tx)

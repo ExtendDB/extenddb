@@ -213,7 +213,7 @@ pub(crate) async fn insert_restore_rows(
         cols.join(", "),
         tuples.join(", ")
     );
-    let mut query = sqlx::query(&sql);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
     for (item, item_json) in batch {
         query = query.bind(composite_pk_to_text(item, key_schema)?);
         for &(name, sk_type) in sort_keys {
@@ -323,7 +323,7 @@ impl ClaimSession {
         statement: &str,
         key: &[&str],
     ) -> Result<bool, sqlx::Error> {
-        let mut query = sqlx::query(statement);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(statement));
         for part in key {
             query = query.bind(*part);
         }
@@ -450,7 +450,7 @@ pub(crate) async fn try_claim_with(
     // session setting a managed service may refuse; a refusal is a warning
     // and the server's defaults stay.
     for (name, value) in CLAIM_KEEPALIVES {
-        if let Err(e) = sqlx::query(&format!("SET {name} = {value}"))
+        if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(format!("SET {name} = {value}")))
             .execute(&mut conn)
             .await
         {
@@ -500,7 +500,7 @@ pub async fn claim_session_settings(
     };
     let mut values = Vec::with_capacity(settings.len());
     for name in settings {
-        let value: String = sqlx::query_scalar(&format!("SHOW {name}"))
+        let value: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SHOW {name}")))
             .fetch_one(session.connection())
             .await
             .map_err(|e| StorageError::Internal(format!("SHOW {name}: {e}")))?;
@@ -796,9 +796,9 @@ impl PostgresEngine {
             item_count += i64::try_from(batch.len()).unwrap_or(i64::MAX);
         }
 
-        let (table_size,): (i64,) = sqlx::query_as(&format!(
+        let (table_size,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT COALESCE(pg_total_relation_size('{ddb_table}'), 0)"
-        ))
+        )))
         .fetch_one(&self.data_pool)
         .await
         .map_err(db_err)?;
@@ -983,7 +983,7 @@ impl PostgresEngine {
             return Ok(false);
         }
         for t in table_storage_relations(table_id, &index_ids, &vector_index_ids) {
-            sqlx::query(&format!("DROP TABLE IF EXISTS {t}"))
+            sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE IF EXISTS {t}")))
                 .execute(&self.data_pool)
                 .await
                 .map_err(db_err)?;
@@ -1363,14 +1363,18 @@ impl LegacyBackupReader for PostgresEngine {
                 Arc::clone(&self.control_plane_notify),
             );
             let snapshot = held.open_conn()?;
-            sqlx::query(&format!("LOCK TABLE {ddb_table} IN ACCESS SHARE MODE"))
-                .execute(&mut *snapshot)
-                .await
-                .map_err(db_err)?;
-            let _: Option<i32> = sqlx::query_scalar(&format!("SELECT 1 FROM {ddb_table} LIMIT 1"))
-                .fetch_optional(&mut *snapshot)
-                .await
-                .map_err(db_err)?;
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "LOCK TABLE {ddb_table} IN ACCESS SHARE MODE"
+            )))
+            .execute(&mut *snapshot)
+            .await
+            .map_err(db_err)?;
+            let _: Option<i32> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT 1 FROM {ddb_table} LIMIT 1"
+            )))
+            .fetch_optional(&mut *snapshot)
+            .await
+            .map_err(db_err)?;
             meta.commit().await.map_err(db_err)?;
 
             // Since #401 UpdateTable creates a new GSI's data table before it
@@ -1489,7 +1493,8 @@ impl LegacyBackupReader for PostgresEngine {
                 let select_sql = format!("SELECT pk, item_data::text FROM {ddb_table}");
                 {
                     let mut rows =
-                        sqlx::query_as::<_, (String, String)>(&select_sql).fetch(&mut *snapshot);
+                        sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(select_sql))
+                            .fetch(&mut *snapshot);
                     while let Some((pk, data)) = rows.try_next().await.map_err(db_err)? {
                         let item: Item = serde_json::from_str(&data)
                             .map_err(|e| StorageError::Internal(format!("Parse item: {e}")))?;
@@ -2139,10 +2144,10 @@ impl PostgresEngine {
     /// The `backups` rows `filter` keeps, of every account, by creation
     /// time and then ARN.
     async fn legacy_keys(&self, filter: &str) -> Result<Vec<LegacyBackupKey>, StorageError> {
-        let rows: Vec<(String, String, String)> = sqlx::query_as(&format!(
+        let rows: Vec<(String, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT account_id, backup_arn, backup_status FROM backups WHERE {filter} \
              ORDER BY created_at, backup_arn"
-        ))
+        )))
         .fetch_all(&self.pool)
         .await
         .map_err(read_err)?;

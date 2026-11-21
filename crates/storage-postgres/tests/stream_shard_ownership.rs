@@ -57,9 +57,9 @@ impl Scratch {
         } = self;
         drop(engine);
         db.close().await;
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
-        ))
+        )))
         .execute(&admin)
         .await
         .expect("drop the scratch database");
@@ -226,10 +226,12 @@ async fn scratch() -> Scratch {
         .connect(&format!("{base}/postgres"))
         .await
         .expect("connect to the postgres maintenance database");
-    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
-        .execute(&admin)
-        .await
-        .expect("create the scratch database");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE \"{db_name}\""
+    )))
+    .execute(&admin)
+    .await
+    .expect("create the scratch database");
     let url = format!("{base}/{db_name}");
     let db = PgPoolOptions::new()
         .max_connections(2)
@@ -240,7 +242,7 @@ async fn scratch() -> Scratch {
     // database; the catalog schema's foreign key from `stream_shards` to
     // `tables` cannot exist in a real deployment, so it is dropped.
     for sql in shipped_migrations() {
-        sqlx::raw_sql(&sql)
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
             .execute(&db)
             .await
             .expect("apply a shipped migration");
@@ -332,10 +334,12 @@ fn assert_stream_not_found(result: StreamRecordsResult) {
 /// The plan `EXPLAIN (ANALYZE, FORMAT JSON)` reports for `statement`, run on
 /// `conn`.
 async fn plan_of(conn: &mut sqlx::PgConnection, statement: &str) -> serde_json::Value {
-    let row = sqlx::raw_sql(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {statement}"))
-        .fetch_one(conn)
-        .await
-        .expect("explain the statement");
+    let row = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "EXPLAIN (ANALYZE, FORMAT JSON) {statement}"
+    )))
+    .fetch_one(conn)
+    .await
+    .expect("explain the statement");
     let document: serde_json::Value = row.try_get(0).expect("the plan document");
     document[0]["Plan"].clone()
 }
@@ -619,15 +623,17 @@ async fn a_page_visits_at_most_the_page_size_of_the_shards_records() {
 
     let mut conn = s.db.acquire().await.expect("a connection");
     for mode in ["force_custom_plan", "force_generic_plan"] {
-        sqlx::raw_sql(&format!("SET plan_cache_mode = {mode}"))
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("SET plan_cache_mode = {mode}")))
             .execute(&mut *conn)
             .await
             .expect("set the plan mode");
         for (name, statement, arguments) in &cases {
-            sqlx::raw_sql(&format!("PREPARE page_probe AS {statement}"))
-                .execute(&mut *conn)
-                .await
-                .expect("prepare the statement");
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "PREPARE page_probe AS {statement}"
+            )))
+            .execute(&mut *conn)
+            .await
+            .expect("prepare the statement");
             let plan = plan_of(&mut conn, &format!("EXECUTE page_probe{arguments}")).await;
             sqlx::raw_sql("DEALLOCATE page_probe")
                 .execute(&mut *conn)

@@ -131,7 +131,7 @@ impl CodeBody<SqliteStores> for BackupCatalogIndex {
             if present.iter().any(|c| c == name) {
                 continue;
             }
-            sqlx::query(&format!("ALTER TABLE table_restores ADD COLUMN {name} {declaration}"))
+            sqlx::query(sqlx::AssertSqlSafe(format!("ALTER TABLE table_restores ADD COLUMN {name} {declaration}")))
                 .execute(pool)
                 .await
                 .map_err(|e| MigrationError::store(&format!("add table_restores.{name}"), e))?;
