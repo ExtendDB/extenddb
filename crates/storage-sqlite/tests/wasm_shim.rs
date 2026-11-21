@@ -33,11 +33,13 @@
 //! `wasm-bindgen-test`, and reaches the shim through the crate's
 //! `#[doc(hidden)]` `wasm_sqlx_for_tests` module.
 //!
-//! The test after the table drives the backend itself, an in-memory
-//! `SqliteEngine` opened as the WebAssembly adapter opens it, through a
-//! request whose answer depends on the target: an `UpdateTable` that creates
-//! a vector index, which the wasm32 build refuses because it cannot run the
-//! index backfill. It too gives each target's expected outcome.
+//! The two tests after the table drive the backend itself, an in-memory
+//! `SqliteEngine` opened as the WebAssembly adapter opens it, with requests
+//! whose handling depends on the target: an `UpdateTable` that creates a
+//! vector index, which the wasm32 build refuses because it cannot run the
+//! index backfill (the test gives each target's expected outcome), and a scan
+//! whose `Limit` does not fit wasm32's 32-bit `usize` (the same answer on
+//! both).
 
 use std::fmt::Debug;
 use std::future::Future;
@@ -1070,4 +1072,39 @@ async fn an_update_table_that_creates_a_vector_index() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A scan whose `Limit` is above `u32::MAX` reads like one with no limit on
+/// both targets: every item and no `LastEvaluatedKey`. `usize` is 32 bits on
+/// wasm32, where the limit does not fit it.
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+async fn a_scan_limit_above_u32_max_returns_every_item() {
+    use extenddb_storage::{DataEngine, TableEngine};
+    let engine = engine_with_table().await;
+    let key_info = engine.table_key_info(ACCOUNT, "t").await.expect("key info");
+    for pk in ["a", "b", "c"] {
+        let item: extenddb_core::types::Item =
+            serde_json::from_value(serde_json::json!({"pk": {"S": pk}})).expect("item");
+        engine
+            .put_item(
+                &key_info,
+                item,
+                false,
+                None,
+                &extenddb_core::expression::ExpressionMaps::default(),
+                None,
+            )
+            .await
+            .expect("put");
+    }
+    let (items, last_key) = engine
+        .scan(&key_info, Some(4_294_967_297), None, None, None, None)
+        .await
+        .expect("scan");
+    assert_eq!(
+        (items.len(), last_key),
+        (3, None),
+        "a Limit of 2^32 + 1 over three items"
+    );
 }

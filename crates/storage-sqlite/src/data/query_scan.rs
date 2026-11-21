@@ -570,8 +570,11 @@ fn finalize(
     limit: Option<i64>,
     key_schema: &[extenddb_core::types::KeySchemaElement],
 ) -> Result<(Vec<Item>, Option<Item>), StorageError> {
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    let actual_limit = limit.map_or(1_000_000_usize, |l| l.max(0) as usize);
+    // A limit too large for `usize`, which is 32 bits on wasm32, keeps every
+    // row, as it does where `usize` is 64 bits.
+    let actual_limit = limit.map_or(1_000_000_usize, |l| {
+        usize::try_from(l.max(0)).unwrap_or(usize::MAX)
+    });
     let has_more = rows.len() > actual_limit;
     let items: Vec<Item> = rows
         .into_iter()
