@@ -57,6 +57,9 @@ UNRESOLVED = "does not refer to a reachable function"
 
 _DUR = "std::time::Duration::ZERO"
 _SET = "set: &mut tokio::task::JoinSet<()>"
+_HANDLE = "h: &tokio::runtime::Handle"
+_RT = "rt: &tokio::runtime::Runtime"
+_CONDVAR = "c: &std::sync::Condvar, m: &std::sync::Mutex<()>"
 
 # Disallowed path -> probe items. Each item is appended to PROBED inside its
 # own module and must draw clippy's disallowed-method error for that path.
@@ -112,6 +115,114 @@ PROBES = {
     "tokio::task::spawn_blocking": ["fn probe() { drop(tokio::task::spawn_blocking(|| ())); }"],
     "tokio::task::spawn_local": ["fn probe() { drop(tokio::task::spawn_local(async {})); }"],
     "tokio::task::JoinSet::spawn": [f"fn probe({_SET}) {{ drop(set.spawn(async {{}})); }}"],
+    "tokio::task::JoinSet::spawn_on": [
+        f"fn probe({_SET}, {_HANDLE}) {{ drop(set.spawn_on(async {{}}, h)); }}",
+    ],
+    "tokio::task::JoinSet::spawn_local": [
+        f"fn probe({_SET}) {{ drop(set.spawn_local(async {{}})); }}",
+    ],
+    "tokio::task::JoinSet::spawn_local_on": [
+        f"fn probe({_SET}, l: &tokio::task::LocalSet) {{"
+        " drop(set.spawn_local_on(async {}, l)); }",
+    ],
+    "tokio::task::JoinSet::spawn_blocking": [
+        f"fn probe({_SET}) {{ drop(set.spawn_blocking(|| ())); }}",
+    ],
+    "tokio::task::JoinSet::spawn_blocking_on": [
+        f"fn probe({_SET}, {_HANDLE}) {{ drop(set.spawn_blocking_on(|| (), h)); }}",
+    ],
+    "tokio::task::LocalSet::spawn_local": [
+        "fn probe(l: &tokio::task::LocalSet) { drop(l.spawn_local(async {})); }",
+    ],
+    "tokio::task::LocalSet::block_on": [
+        f"fn probe(l: &tokio::task::LocalSet, {_RT}) {{ l.block_on(rt, async {{}}); }}",
+    ],
+    "tokio::runtime::Handle::current": [
+        "fn probe() { drop(tokio::runtime::Handle::current()); }",
+        "fn probe() { use tokio::runtime::Handle; drop(Handle::current()); }",
+    ],
+    "tokio::runtime::Handle::spawn": [f"fn probe({_HANDLE}) {{ drop(h.spawn(async {{}})); }}"],
+    "tokio::runtime::Handle::spawn_blocking": [
+        f"fn probe({_HANDLE}) {{ drop(h.spawn_blocking(|| ())); }}",
+    ],
+    "tokio::runtime::Handle::block_on": [f"fn probe({_HANDLE}) {{ h.block_on(async {{}}); }}"],
+    "tokio::runtime::Runtime::spawn": [f"fn probe({_RT}) {{ drop(rt.spawn(async {{}})); }}"],
+    "tokio::runtime::Runtime::spawn_blocking": [
+        f"fn probe({_RT}) {{ drop(rt.spawn_blocking(|| ())); }}",
+    ],
+    "tokio::runtime::Runtime::block_on": [f"fn probe({_RT}) {{ rt.block_on(async {{}}); }}"],
+    "tokio::sync::mpsc::Sender::send_timeout": [
+        f"async fn probe(tx: tokio::sync::mpsc::Sender<u8>) {{"
+        f" let _ = tx.send_timeout(0, {_DUR}).await; }}",
+    ],
+    "tokio::sync::mpsc::Sender::blocking_send": [
+        "fn probe(tx: &tokio::sync::mpsc::Sender<u8>) { let _ = tx.blocking_send(0); }",
+    ],
+    "tokio::sync::mpsc::Receiver::blocking_recv": [
+        "fn probe(rx: &mut tokio::sync::mpsc::Receiver<u8>) { let _ = rx.blocking_recv(); }",
+    ],
+    "tokio::sync::mpsc::Receiver::blocking_recv_many": [
+        "fn probe(rx: &mut tokio::sync::mpsc::Receiver<u8>, b: &mut Vec<u8>) {"
+        " let _ = rx.blocking_recv_many(b, 1); }",
+    ],
+    "tokio::sync::mpsc::UnboundedReceiver::blocking_recv": [
+        "fn probe(rx: &mut tokio::sync::mpsc::UnboundedReceiver<u8>) {"
+        " let _ = rx.blocking_recv(); }",
+    ],
+    "tokio::sync::mpsc::UnboundedReceiver::blocking_recv_many": [
+        "fn probe(rx: &mut tokio::sync::mpsc::UnboundedReceiver<u8>, b: &mut Vec<u8>) {"
+        " let _ = rx.blocking_recv_many(b, 1); }",
+    ],
+    "tokio::sync::oneshot::Receiver::blocking_recv": [
+        "fn probe(rx: tokio::sync::oneshot::Receiver<u8>) { let _ = rx.blocking_recv(); }",
+    ],
+    "tokio::sync::broadcast::Receiver::blocking_recv": [
+        "fn probe(rx: &mut tokio::sync::broadcast::Receiver<u8>) { let _ = rx.blocking_recv(); }",
+    ],
+    "tokio::sync::Mutex::blocking_lock": [
+        "fn probe(m: &tokio::sync::Mutex<u8>) { drop(m.blocking_lock()); }",
+    ],
+    "tokio::sync::Mutex::blocking_lock_owned": [
+        "fn probe(m: std::sync::Arc<tokio::sync::Mutex<u8>>) { drop(m.blocking_lock_owned()); }",
+    ],
+    "tokio::sync::RwLock::blocking_read": [
+        "fn probe(l: &tokio::sync::RwLock<u8>) { drop(l.blocking_read()); }",
+    ],
+    "tokio::sync::RwLock::blocking_write": [
+        "fn probe(l: &tokio::sync::RwLock<u8>) { drop(l.blocking_write()); }",
+    ],
+    "std::sync::mpsc::Receiver::recv": [
+        "fn probe(rx: &std::sync::mpsc::Receiver<u8>) { let _ = rx.recv(); }",
+        "fn probe() { use std::sync::mpsc; let (_tx, rx) = mpsc::channel::<u8>();"
+        " let _ = rx.recv(); }",
+    ],
+    "std::sync::mpsc::Receiver::recv_timeout": [
+        f"fn probe(rx: &std::sync::mpsc::Receiver<u8>) {{ let _ = rx.recv_timeout({_DUR}); }}",
+    ],
+    "std::sync::Condvar::wait": [
+        f"fn probe({_CONDVAR}) {{ drop(c.wait(m.lock().unwrap())); }}",
+    ],
+    "std::sync::Condvar::wait_while": [
+        f"fn probe({_CONDVAR}) {{ drop(c.wait_while(m.lock().unwrap(), |()| false)); }}",
+    ],
+    "std::sync::Condvar::wait_timeout": [
+        f"fn probe({_CONDVAR}) {{ drop(c.wait_timeout(m.lock().unwrap(), {_DUR})); }}",
+    ],
+    "std::sync::Condvar::wait_timeout_while": [
+        f"fn probe({_CONDVAR}) {{"
+        f" drop(c.wait_timeout_while(m.lock().unwrap(), {_DUR}, |()| false)); }}",
+    ],
+    "std::env::temp_dir": [
+        "fn probe() { let _ = std::env::temp_dir(); }",
+        "fn probe() { use std::env::temp_dir as scratch; let _ = scratch(); }",
+    ],
+    "std::env::vars": ["fn probe() { let _ = std::env::vars().count(); }"],
+    "std::env::vars_os": ["fn probe() { use std::env; let _ = env::vars_os().count(); }"],
+    "std::env::set_var": ['fn probe() { unsafe { std::env::set_var("K", "V") } }'],
+    "std::env::remove_var": ['fn probe() { unsafe { std::env::remove_var("K") } }'],
+    "std::env::split_paths": ['fn probe() { let _ = std::env::split_paths("a").count(); }'],
+    "std::process::id": ["fn probe() { let _ = std::process::id(); }"],
+    "std::process::exit": ["fn probe() -> ! { std::process::exit(0) }"],
 }
 
 

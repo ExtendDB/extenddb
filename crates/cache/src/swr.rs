@@ -230,6 +230,11 @@ where
     /// The loader is invoked on a hard miss (request blocks) and from a
     /// spawned task on stale-hit refresh (request does not block).
     ///
+    /// On wasm32-unknown-unknown this traps: building the moka map reads
+    /// `std::time::Instant::now()` inside moka, which that target does not
+    /// provide, and the wasm clippy guard does not see calls inside
+    /// dependencies. Only the server builds a non-pass-through cache.
+    ///
     /// # Errors
     /// Returns `ConfigError` if `config` fails [`SwrCacheConfig::validate`].
     pub fn try_new(loader: Loader<K, V, E>, config: SwrCacheConfig) -> Result<Self, ConfigError> {

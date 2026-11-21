@@ -6,13 +6,30 @@
 # to every workspace crate that step lints, and native clippy, which uses the
 # repository's defaults, is not affected.
 #
-# Each method below compiles for wasm32-unknown-unknown and fails when it runs
-# in a browser: std has no clock or threads on that target, and the adapter
-# drives tokio without a timer or a task runner. Clippy resolves each path, so
-# an import or a re-export (`use tokio::time; time::sleep(..)`, `tokio::spawn`)
-# is caught as well. A call that compiles for wasm but is never reached there
-# carries `#[allow(clippy::disallowed_methods, reason = "...")]` on its
-# function, naming the callers and why none runs on wasm.
+# Each method below compiles for wasm32-unknown-unknown and, when it runs in a
+# browser, panics, traps or never completes. On that target std has no clock,
+# threads, process id, environment or filesystem; a blocking wait has no other
+# thread to wake it; and the adapter drives its futures through the browser's
+# event loop (wasm-bindgen-futures) with no tokio runtime, timer, blocking pool
+# or LocalSet behind them. Clippy resolves each path, so a call made through an
+# import or a re-export (`use tokio::time; time::sleep(..)`, `tokio::spawn`) is
+# refused as well.
+#
+# What this list does not cover:
+# - Calls a dependency makes in its own code. Clippy lints workspace crates
+#   only. For example, moka 0.12.15 calls std::time::Instant::now() when a
+#   cache is built (src/common/time/clock.rs), so building an extenddb-cache
+#   SwrCache with SwrCache::try_new or SwrCache::new traps on wasm32 while this
+#   step passes. Only the server builds one today.
+# - std calls that return an error on this target instead of panicking, such as
+#   std::fs, std::net, std::process::Command, std::env::var and
+#   std::env::current_dir: each returns an Err there.
+# - Methods not named here. The list names methods, not types or modules.
+#
+# A call that compiles for wasm but is never reached there carries
+# `#[allow(clippy::disallowed_methods, reason = "...")]`, on its function or,
+# when the rest of the function runs on wasm, on that one statement. The reason
+# names the callers and why none runs on wasm.
 #
 # A path here that does not resolve only makes clippy print a "does not refer
 # to a reachable function" warning, which -D warnings does not turn into an
@@ -43,4 +60,44 @@ disallowed-methods = [
     { path = "tokio::task::spawn_blocking", reason = "the wasm build runs no tokio runtime or blocking pool" },
     { path = "tokio::task::spawn_local", reason = "the wasm build runs no tokio LocalSet" },
     { path = "tokio::task::JoinSet::spawn", reason = "the wasm build runs no tokio runtime to drive a task" },
+    { path = "tokio::task::JoinSet::spawn_on", reason = "the wasm build runs no tokio runtime to drive a task" },
+    { path = "tokio::task::JoinSet::spawn_local", reason = "the wasm build runs no tokio LocalSet" },
+    { path = "tokio::task::JoinSet::spawn_local_on", reason = "the wasm build runs no tokio LocalSet" },
+    { path = "tokio::task::JoinSet::spawn_blocking", reason = "the wasm build runs no tokio blocking pool" },
+    { path = "tokio::task::JoinSet::spawn_blocking_on", reason = "the wasm build runs no tokio blocking pool" },
+    { path = "tokio::task::LocalSet::spawn_local", reason = "the task runs only while the LocalSet is driven, and the wasm build drives none" },
+    { path = "tokio::task::LocalSet::block_on", reason = "blocks the only thread; parking panics on wasm32-unknown-unknown" },
+    { path = "tokio::runtime::Handle::current", reason = "panics: the wasm build enters no tokio runtime" },
+    { path = "tokio::runtime::Handle::spawn", reason = "nothing drives a runtime's tasks in the wasm build, so the task never runs" },
+    { path = "tokio::runtime::Handle::spawn_blocking", reason = "the blocking pool needs threads, which wasm32-unknown-unknown does not have" },
+    { path = "tokio::runtime::Handle::block_on", reason = "blocks the only thread; parking panics on wasm32-unknown-unknown" },
+    { path = "tokio::runtime::Runtime::spawn", reason = "nothing drives a runtime's tasks in the wasm build, so the task never runs" },
+    { path = "tokio::runtime::Runtime::spawn_blocking", reason = "the blocking pool needs threads, which wasm32-unknown-unknown does not have" },
+    { path = "tokio::runtime::Runtime::block_on", reason = "blocks the only thread; parking panics on wasm32-unknown-unknown" },
+    { path = "tokio::sync::mpsc::Sender::send_timeout", reason = "reads std's clock, which wasm32-unknown-unknown does not have" },
+    { path = "tokio::sync::mpsc::Sender::blocking_send", reason = "blocks the only thread; parking panics on wasm32-unknown-unknown" },
+    { path = "tokio::sync::mpsc::Receiver::blocking_recv", reason = "blocks the only thread; parking panics on wasm32-unknown-unknown" },
+    { path = "tokio::sync::mpsc::Receiver::blocking_recv_many", reason = "blocks the only thread; parking panics on wasm32-unknown-unknown" },
+    { path = "tokio::sync::mpsc::UnboundedReceiver::blocking_recv", reason = "blocks the only thread; parking panics on wasm32-unknown-unknown" },
+    { path = "tokio::sync::mpsc::UnboundedReceiver::blocking_recv_many", reason = "blocks the only thread; parking panics on wasm32-unknown-unknown" },
+    { path = "tokio::sync::oneshot::Receiver::blocking_recv", reason = "blocks the only thread; parking panics on wasm32-unknown-unknown" },
+    { path = "tokio::sync::broadcast::Receiver::blocking_recv", reason = "blocks the only thread; parking panics on wasm32-unknown-unknown" },
+    { path = "tokio::sync::Mutex::blocking_lock", reason = "blocks the only thread; parking panics on wasm32-unknown-unknown" },
+    { path = "tokio::sync::Mutex::blocking_lock_owned", reason = "blocks the only thread; parking panics on wasm32-unknown-unknown" },
+    { path = "tokio::sync::RwLock::blocking_read", reason = "blocks the only thread; parking panics on wasm32-unknown-unknown" },
+    { path = "tokio::sync::RwLock::blocking_write", reason = "blocks the only thread; parking panics on wasm32-unknown-unknown" },
+    { path = "std::sync::mpsc::Receiver::recv", reason = "blocks the only thread; on wasm32-unknown-unknown an empty channel never wakes it" },
+    { path = "std::sync::mpsc::Receiver::recv_timeout", reason = "reads std's clock, which wasm32-unknown-unknown does not have" },
+    { path = "std::sync::Condvar::wait", reason = "std's condvar cannot wait on wasm32-unknown-unknown and panics" },
+    { path = "std::sync::Condvar::wait_while", reason = "std's condvar cannot wait on wasm32-unknown-unknown and panics" },
+    { path = "std::sync::Condvar::wait_timeout", reason = "std's condvar cannot wait on wasm32-unknown-unknown and panics" },
+    { path = "std::sync::Condvar::wait_timeout_while", reason = "std's condvar cannot wait on wasm32-unknown-unknown and panics" },
+    { path = "std::env::temp_dir", reason = "panics: wasm32-unknown-unknown has no filesystem" },
+    { path = "std::env::vars", reason = "panics: wasm32-unknown-unknown has no environment to list" },
+    { path = "std::env::vars_os", reason = "panics: wasm32-unknown-unknown has no environment to list" },
+    { path = "std::env::set_var", reason = "panics: wasm32-unknown-unknown cannot set environment variables" },
+    { path = "std::env::remove_var", reason = "panics: wasm32-unknown-unknown cannot remove environment variables" },
+    { path = "std::env::split_paths", reason = "panics on wasm32-unknown-unknown" },
+    { path = "std::process::id", reason = "panics: wasm32-unknown-unknown has no process ids" },
+    { path = "std::process::exit", reason = "traps on wasm32-unknown-unknown instead of exiting" },
 ]

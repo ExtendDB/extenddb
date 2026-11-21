@@ -7,11 +7,12 @@
 # wasm32-unknown-unknown and runs them in a browser over an in-memory SQLite
 # (sqlite-wasm-rs) behind a synchronous shim. No other workflow builds that
 # target, so without this job a change can break the wasm build with every
-# other check green: a new aws-lc-rs call, a std::time or a tokio::spawn in a
-# wasm-compiled path, or a shim regression are all invisible to the native
-# test and clippy jobs. It is not a required status check on main today; it
-# must become one (a maintainer adds it to main's required checks) for
-# a red run to block a merge. It reports on every pull request rather than
+# other check green: a new aws-lc-rs call, a call in a wasm-compiled workspace
+# crate that panics or never completes in a browser (the methods listed in
+# devtools/wasm-clippy/clippy.toml), or a shim regression are all invisible to
+# the native test and clippy jobs. It is not a required status check on main
+# today; it must become one (a maintainer adds it to main's required checks)
+# for a red run to block a merge. It reports on every pull request rather than
 # being path-filtered so that it can be made required: a path-filtered required
 # check never reports on a pull request outside its paths, and that pull
 # request can never merge (see licenses.yml).
@@ -106,11 +107,13 @@ jobs:
 
       # Lints the adapter and every workspace crate it compiles for wasm32
       # (without --no-deps, clippy lints each workspace dependency too), with
-      # the disallowed-methods list in devtools/wasm-clippy/clippy.toml: the
-      # clock, thread, timer and task calls that compile for wasm32 and fail
-      # when they run in a browser. CLIPPY_CONF_DIR is set on this step only,
-      # so native clippy keeps the repository's defaults. --lib keeps the
-      # host-only integration tests out of the wasm build.
+      # the disallowed-methods list in devtools/wasm-clippy/clippy.toml: std
+      # and tokio methods that compile for wasm32 and panic, trap or never
+      # complete when they run in a browser. It refuses calls written in
+      # workspace crates only; a call a dependency makes in its own code is not
+      # seen (the file's header names the known case). CLIPPY_CONF_DIR is set
+      # on this step only, so native clippy keeps the repository's defaults.
+      # --lib keeps the host-only integration tests out of the wasm build.
       - name: Clippy the wasm32 build
         env:
           CLIPPY_CONF_DIR: ${{ github.workspace }}/devtools/wasm-clippy
