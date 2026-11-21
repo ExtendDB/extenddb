@@ -2,7 +2,8 @@
 # Copyright 2026 ExtendDB contributors
 # SPDX-License-Identifier: Apache-2.0
 """Check the wasm32 clippy guard: its configuration, the settings that could
-switch it off, and that it refuses a call to each entry.
+switch it off, and that it refuses a call to each entry; and check that the
+wasm32 AES-GCM stack is built with its zeroize features.
 
 The guard is the clippy step of the WebAssembly workflow, run with
 CLIPPY_CONF_DIR pointing at devtools/wasm-clippy, whose clippy.toml lists
@@ -30,11 +31,12 @@ fails, with one line per problem, unless all of these hold:
    script runs the clippy step in the working tree and reads every file rustc
    lists in each crate's dep-info: its source files wherever they are (a
    module that #[path] names included), and every file that include!,
-   include_str! or include_bytes! reads, each read as Rust source; the
-   Cargo.toml and the clippy configuration that clippy adds there are left
-   out. A crate the step leaves no dep-info for, or a step that fails, is a
-   problem. In those files no attribute allows, expects or warns clippy::all,
-   clippy::style, clippy::suspicious or warnings, nor
+   include_str! or include_bytes! reads, each read as Rust source; files
+   named Cargo.toml, clippy.toml or .clippy.toml are left out (clippy adds
+   the manifest and its configuration there). A crate the step leaves no
+   dep-info for, a listed file that does not exist, and a step that fails
+   are problems. In those files no attribute allows, expects or warns
+   clippy::all, clippy::style, clippy::suspicious or warnings, nor
    clippy::await_holding_lock or clippy::await_holding_refcell_ref with or
    without a reason; none warns clippy::disallowed_methods or
    clippy::disallowed_types (or their former names), and none allows or
@@ -53,20 +55,21 @@ fails, with one line per problem, unless all of these hold:
    exact form, on a `mod mNNNN_<name>;` line of a src/migrations/mod.rs whose
    src/migrations/mNNNN_<name>.rs exists; the guard does not see those
    bodies, and the headless parity corpus runs every migration when it
-   creates an engine. The `[lints]`
-   tables of those crates and the workspace's `[workspace.lints]` set none of
-   these lints or groups to a level other than deny or forbid (a key spelt
-   with hyphens is read with underscores, as rustc reads it). No `rustflags`
+   creates an engine. The `[lints]` tables of those crates and the
+   workspace's `[workspace.lints]` set none of these lints or groups to a
+   level other than deny or forbid (a key spelt with hyphens is read with
+   underscores, as rustc reads it). No `rustflags`
    setting, in any table of .cargo/config.toml or .cargo/config, holds -A,
    -W, -Z, --allow, --warn, --force-warn or --cap-lints, with its value
    apart, attached or after `=`, or an @-file of further arguments; and
    neither file's [build] table sets rustc, rustc-wrapper or
    rustc-workspace-wrapper, which run another program as the compiler.
    .github/workflows/wasm.yml, read as text, names outside its comments no
-   variable that sets rustc flags (RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS,
-   CARGO_BUILD_RUSTFLAGS or CARGO_TARGET_<TRIPLE>_RUSTFLAGS) or the compiler
-   (RUSTC, RUSTC_WRAPPER, RUSTC_WORKSPACE_WRAPPER, or CARGO_BUILD_RUSTC and
-   its two wrapper forms). A warn of one of these lints or groups, or a -W in
+   variable whose name ends in RUSTFLAGS (RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS,
+   CARGO_BUILD_RUSTFLAGS and CARGO_TARGET_<TRIPLE>_RUSTFLAGS set rustc
+   flags) and none that sets the compiler (RUSTC, RUSTC_WRAPPER,
+   RUSTC_WORKSPACE_WRAPPER, or CARGO_BUILD_RUSTC and its two wrapper
+   forms). A warn of one of these lints or groups, or a -W in
    rustflags, does not stop the step from failing on a guarded call, as its
    -D warnings raises the warning to an error again; they are refused too.
    CLIPPY_ARGS in the workflow is not looked for: cargo clippy sets that
@@ -189,8 +192,9 @@ MIGRATION_ALLOW = {"clippy::all", "deprecated"}
 # setting puts these below deny but the reasoned allows NEED_REASON describes.
 BLANKET = {"clippy::all", "clippy::style", "clippy::suspicious", "warnings"}
 # These may be allowed or expected only with a reason that is not empty or
-# whitespace, and never warned. The last two are the lints' former names,
-# which rustc still applies to them.
+# whitespace, and only in an outer attribute on something other than a module,
+# an impl block or a trait; they are never warned. The last two are the lints'
+# former names, which rustc still applies to them.
 NEED_REASON = {
     "clippy::disallowed_methods",
     "clippy::disallowed_types",
@@ -859,9 +863,10 @@ def rustflags_problems(config: str, settings: dict) -> list[str]:
     return problems
 
 
-# Workflow variables that set the wasm build's rustc flags (RUSTFLAGS,
-# CARGO_ENCODED_RUSTFLAGS, CARGO_BUILD_RUSTFLAGS, CARGO_TARGET_<TRIPLE>_RUSTFLAGS)
-# or its compiler or compiler wrapper.
+# Workflow variables whose names end in RUSTFLAGS (RUSTFLAGS,
+# CARGO_ENCODED_RUSTFLAGS, CARGO_BUILD_RUSTFLAGS and
+# CARGO_TARGET_<TRIPLE>_RUSTFLAGS set the wasm build's rustc flags), and those
+# that set its compiler or compiler wrapper.
 _WORKFLOW_VARIABLE = re.compile(
     r"\b(?:[A-Z0-9_]*RUSTFLAGS|RUSTC|RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER"
     r"|CARGO_BUILD_RUSTC|CARGO_BUILD_RUSTC_WRAPPER|CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER)\b"
@@ -939,12 +944,12 @@ def compiled_files(crates: dict[str, dict], root: Path, target_dir: str) -> Comp
     copy of it) and reads, for each crate, the dep-info file that rustc writes
     next to the metadata file cargo's compiler-artifact record names: every
     source file of the crate wherever it is (a module that #[path] names
-    included), every file include!, include_str! or include_bytes! reads, and
-    the Cargo.toml and the clippy configuration that clippy adds, which are
-    left out. rustc writes the dep-info of a crate whose lints then fail as
-    well, but cargo names no artifact for that crate, so it is not read. A
-    crate with no dep-info read is a problem, and so is a listed file that
-    does not exist."""
+    included) and every file include!, include_str! or include_bytes! reads,
+    but not the files named Cargo.toml, clippy.toml or .clippy.toml, as clippy
+    adds the manifest and its configuration there. rustc writes the dep-info
+    of a crate whose lints then fail as well, but cargo names no artifact for
+    that crate, so it is not read. A crate with no dep-info read is a problem,
+    and so is a listed file that does not exist."""
     code, messages, artifacts, stderr = run_clippy(root, target_dir)
     root = root.resolve()
     by_manifest = {
@@ -979,13 +984,14 @@ def compiled_files(crates: dict[str, dict], root: Path, target_dir: str) -> Comp
 
 
 def read_dep_info(dep_info: Path, root: Path) -> tuple[list[Path], dict[str, str]]:
-    """The files a rustc dep-info file lists, other than the Cargo.toml and
-    the clippy configuration that clippy adds to it, and the environment
-    variables it records (`# env-dep:NAME=VALUE`): those the compilation
-    tracks, which include each that the crate reads with env! or option_env!
-    and the CLIPPY_ARGS and CLIPPY_CONF_DIR that clippy-driver reads. rustc
-    writes a line `<file>:` for each file, with a space in the name written
-    `\\ `; a relative name is relative to `root`, where cargo ran rustc."""
+    """The files a rustc dep-info file lists, other than those named
+    Cargo.toml, clippy.toml or .clippy.toml (clippy adds the manifest and its
+    configuration), and the environment variables it records
+    (`# env-dep:NAME=VALUE`): those the compilation tracks, which include each
+    that the crate reads with env! or option_env! and the CLIPPY_ARGS and
+    CLIPPY_CONF_DIR that clippy-driver reads. rustc writes a line `<file>:`
+    for each file, with a space in the name written `\\ `; a relative name is
+    relative to `root`, where cargo ran rustc."""
     found, env = [], {}
     for line in dep_info.read_text(encoding="utf-8").splitlines():
         if line.startswith("# env-dep:"):
