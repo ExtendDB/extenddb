@@ -25,4 +25,5 @@ mod corpus;
 mod generated;
 mod harness;
 mod mutate;
+mod paths;
 mod reject;

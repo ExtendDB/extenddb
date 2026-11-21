@@ -32,6 +32,7 @@ from botocore.credentials import Credentials
 from botocore.exceptions import ClientError
 
 from conftest import scoped_table
+from raw_signed_request import raw_request
 def _make_client(endpoint_url: str | None, access_key: str, secret_key: str) -> Any:
     """Create a boto3 DynamoDB client with explicit credentials."""
     region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
@@ -380,31 +381,14 @@ class TestRequestChecks:
         Returns (status, body text, Connection header). http.client sends the
         headers in the order given, so a repeated name goes out twice.
         """
-        import http.client  # noqa: PLC0415
-        import ssl  # noqa: PLC0415
-        from urllib.parse import urlparse  # noqa: PLC0415
+        status, resp_headers, data = raw_request(
+            self.url, method, path, headers, body, verify_tls=self.endpoint_url is None
+        )
+        return status, data.decode(errors="replace"), resp_headers.get("connection")
 
-        u = urlparse(self.url)
-        ctx = ssl.create_default_context()
-        if self.endpoint_url is not None:
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-        conn = http.client.HTTPSConnection(u.hostname, u.port or 443, context=ctx, timeout=30)
-        conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
-        for k, v in headers:
-            conn.putheader(k, v)
-        if body or method == "POST":
-            conn.putheader("Content-Length", str(len(body)))
-        conn.endheaders()
-        if body:
-            conn.send(body)
-        resp = conn.getresponse()
-        text = resp.read().decode(errors="replace")
-        connection = resp.getheader("Connection")
-        conn.close()
-        return resp.status, text, connection
-
-    @pytest.mark.parametrize("path", ["/console/login", "/management/accounts", "/health"])
+    @pytest.mark.parametrize(
+        "path", ["/console/login", "/management/accounts", "/health", "/ping", "/other/path"]
+    )
     def test_duplicate_host_header_is_refused_on_every_route(self, path):
         # The refusal is a property of the listener, not of the DynamoDB
         # route: the console, the management API and the health check get
@@ -571,7 +555,8 @@ class TestRequestChecks:
         assert resp.json()["message"].startswith("The request signature we calculated does not match"), resp.text
         assert "UNSIGNED-PAYLOAD" not in resp.json()["message"]
 
-    def test_stalled_body_is_closed_by_the_server(self):
+    @pytest.mark.parametrize("path", ["/", "/ping"])
+    def test_stalled_body_is_closed_by_the_server(self, path):
         """A Content-Length the client never delivers must not hold the connection.
 
         Runs against extenddb only. The server's `request_timeout_secs` bounds the
@@ -592,7 +577,7 @@ class TestRequestChecks:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         conn = http.client.HTTPSConnection(u.hostname, u.port or 443, context=ctx, timeout=timeout + 10)
-        conn.putrequest("POST", "/", skip_host=True, skip_accept_encoding=True)
+        conn.putrequest("POST", path, skip_host=True, skip_accept_encoding=True)
         conn.putheader("Host", f"{u.hostname}:{u.port or 443}")
         conn.putheader("X-Amz-Target", "DynamoDB_20120810.ListTables")
         conn.putheader("Content-Type", "application/x-amz-json-1.0")

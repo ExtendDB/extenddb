@@ -145,7 +145,10 @@ The IAM policy engine evaluates identity-based policies, group policies, role po
 
 HTTP/HTTPS server built on axum + tower. Responsibilities:
 
-- DynamoDB wire protocol endpoint (`POST /`)
+- DynamoDB wire protocol endpoint: a `POST` at any path the other routes do not
+  take, with `Content-Type` `application/x-amz-json-1.0` or `application/json`.
+  A `GET` of `/` or `/ping` gets a health text, and every other request gets the
+  404 page
 - Management REST API (`/management/*`)
 - Web console (`/console/*`) with CSRF protection and security headers
 - Health check (`/health`) and JSON metrics (`/metrics`)
@@ -164,15 +167,16 @@ Thin binary that wires everything together:
 
 ## Request Lifecycle
 
-1. AWS SDK sends `POST /` with `X-Amz-Target` header and JSON body
-2. axum extracts headers and body
-3. `X-Amz-Target` is parsed to determine the operation (e.g., `DynamoDB_20120810.PutItem`)
-4. Authentication: SigV4 signature verified against the local credential store
-5. Authorization: IAM policies evaluated against the operation and resource ARN
-6. Operation handler in `engine` validates input, parses expressions
-7. Storage trait methods called to read/write data
-8. Response formatted with correct DynamoDB JSON structure
-9. HTTP response includes `x-amzn-RequestId`, `x-amz-crc32`, and `Content-Type` headers
+1. AWS SDK sends a `POST` (to `/`, or any path the other routes do not take) with `X-Amz-Target` header and JSON body
+2. The fallback checks the media type. For a `Content-Type` other than `application/x-amz-json-1.0` or `application/json`, it reads the body through the 16 MiB limit: a body over the limit gets 413, and any other body gets the 404 page. In the two served media types, a body over the limit gets 413 in step 3
+3. axum extracts headers and body
+4. `X-Amz-Target` is parsed to determine the operation (e.g., `DynamoDB_20120810.PutItem`)
+5. Authentication: SigV4 signature verified against the local credential store
+6. Authorization: IAM policies evaluated against the operation and resource ARN
+7. Operation handler in `engine` validates input, parses expressions
+8. Storage trait methods called to read/write data
+9. Response formatted with correct DynamoDB JSON structure
+10. HTTP response includes `x-amzn-RequestId`, `x-amz-crc32`, and `Content-Type` (the request's media type: `application/x-amz-json-1.0` or `application/json`) headers
 
 ## Process Lifecycle
 

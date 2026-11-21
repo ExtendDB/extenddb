@@ -431,32 +431,47 @@ impl Authorization {
     }
 }
 
-/// The authentication call the HTTP layer makes for a DynamoDB request, on a
-/// server deployed as `SERVER_REGION`.
-pub fn authenticate(wire: &Wire) -> Result<AuthIdentity, DynamoDbError> {
+/// The authentication call the HTTP layer makes for a DynamoDB request sent
+/// to `path` with `query`, on a server deployed as `SERVER_REGION`.
+pub fn authenticate_at(
+    path: &str,
+    query: &str,
+    wire: &Wire,
+) -> Result<AuthIdentity, DynamoDbError> {
     let provider = BuiltinAuthProvider::new(CachedCredentialStore::pass_through(
         MemoryStore,
         extenddb_cache::SwrCacheConfig::default(),
         SERVER_REGION,
         1,
     ));
-    futures::executor::block_on(provider.authenticate(&wire.header_map(), &wire.body))
+    futures::executor::block_on(provider.authenticate(path, query, &wire.header_map(), &wire.body))
 }
 
-/// The canonical request the server builds for `wire`.
-pub fn server_canonical_request(wire: &Wire) -> String {
+/// [`authenticate_at`] for a request to `/` with no query string.
+pub fn authenticate(wire: &Wire) -> Result<AuthIdentity, DynamoDbError> {
+    authenticate_at("/", "", wire)
+}
+
+/// The canonical request the server builds for `wire` sent to `path` with
+/// `query`.
+pub fn server_canonical_request_at(path: &str, query: &str, wire: &Wire) -> String {
     let value = wire
         .value("authorization")
         .expect("an authorization header");
     let parsed = parse::parse_authorization(value).expect("the server parses the header");
     canonical::canonical_request(
         "POST",
-        "/",
-        "",
+        path,
+        query,
         &wire.header_map(),
         &parsed.signed_headers,
         &wire.body,
     )
+}
+
+/// [`server_canonical_request_at`] for a request to `/` with no query string.
+pub fn server_canonical_request(wire: &Wire) -> String {
+    server_canonical_request_at("/", "", wire)
 }
 
 /// How the server refuses a request.

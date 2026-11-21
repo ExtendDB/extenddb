@@ -12,6 +12,7 @@ from a request sent to that service or backend.
 | Area | DynamoDB | ExtendDB |
 |------|----------|------|
 | Storage backend | Proprietary distributed storage | PostgreSQL (default), SQLite, MongoDB, or Cassandra, selected by mutually exclusive Cargo features at build time; one backend per binary |
+| HTTP endpoint and path | Serves the API for a POST at any path (measured) | Serves the API for a POST at any path except ExtendDB's own routes: `/health`, `/metrics` and the paths under `/management` and `/console` keep their answers. A POST to `/health` or `/metrics` gets 405, and a POST under `/management` or `/console` that no route takes gets an empty 404 |
 | Global Tables | CreateGlobalTable, replication | Not implemented (returns UnknownOperationException) |
 | DAX (Accelerator) | In-memory caching layer | Not applicable |
 | PartiQL | ExecuteStatement, BatchExecuteStatement, ExecuteTransaction | Supported for all four statement types (see the PartiQL section below). Built behind a default-on `partiql` build feature. |

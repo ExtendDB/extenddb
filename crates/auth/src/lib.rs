@@ -24,10 +24,15 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 ///
 /// `BuiltinAuthProvider` performs `SigV4` verification.
 /// Fix #11: Accept `&HeaderMap` directly to avoid per-request `HashMap` allocation.
+/// `path` and `query` are the request's path and query string as its request
+/// line carries them (`query` is empty when there is none): the signature
+/// covers both.
 #[async_trait::async_trait]
 pub trait AuthProvider: Send + Sync {
     async fn authenticate(
         &self,
+        path: &str,
+        query: &str,
         headers: &HeaderMap,
         body: &[u8],
     ) -> Result<AuthIdentity, DynamoDbError>;
@@ -130,6 +135,8 @@ impl BuiltinAuthProvider {
 impl AuthProvider for BuiltinAuthProvider {
     async fn authenticate(
         &self,
+        path: &str,
+        query: &str,
         headers: &HeaderMap,
         body: &[u8],
     ) -> Result<AuthIdentity, DynamoDbError> {
@@ -203,13 +210,17 @@ impl AuthProvider for BuiltinAuthProvider {
             !token_header_present
         };
 
-        // Verify the SigV4 signature, always, even for inactive keys (S-5).
+        // Verify the SigV4 signature, always, even for inactive keys (S-5). It
+        // covers the request's own path and query string: the service answers
+        // InvalidSignatureException for a request signed for `/` and sent to
+        // `/ping`, one signed for `/ping` and sent to `/`, and one sent with a
+        // query string it was not signed with (measured 2026-11-17).
         sigv4::verify::verify_signature(
             &parsed,
             resolved.signing_key(),
-            "POST", // DynamoDB is always POST
-            "/",    // DynamoDB is always /
-            "",     // DynamoDB has no query string
+            "POST", // only a POST reaches authentication
+            path,
+            query,
             headers,
             body,
         )?;
