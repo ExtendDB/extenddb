@@ -123,11 +123,8 @@ mod restore_job_tests;
 mod schema;
 // The browser build calls only `database_file` (to classify `:memory:`) and
 // names the `ServeLock` type of the engine's lock field, which stays `None`;
-// taking a lock is for the server and the CLI.
-#[cfg_attr(
-    target_arch = "wasm32",
-    expect(dead_code, reason = "the wasm build takes no file lock")
-)]
+// taking a lock is for the server and the CLI, so the lock-taking items are
+// marked dead on wasm where they are declared.
 mod serve_lock;
 // The `backend()` registration and the server factories it bundles: they open
 // databases for a server process and install its background workers, which the
