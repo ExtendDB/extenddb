@@ -12,7 +12,7 @@
 //! not" lists them.
 //!
 //! # Layout
-//! - [`runtime`] — the portable engine wrapper: builds an `OperationContext`
+//! - `runtime` — the portable engine wrapper: builds an `OperationContext`
 //!   over the in-memory `SQLite` backend and calls [`extenddb_engine::dispatch`].
 //!   The same code on both targets except the backup runtime, which it holds
 //!   natively only, and its unit tests, which build natively only and
@@ -28,7 +28,7 @@
 //! The build authenticates no request and authorizes none; every request runs
 //! under a single fixed account.
 //!
-//! The module doc of [`runtime`] lists the requests the build refuses, on
+//! The module doc of `runtime` lists the requests the build refuses, on
 //! both targets or on wasm only, and the answer to each.
 
 mod runtime;
