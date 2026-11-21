@@ -21,8 +21,8 @@
 //! the crate's inline unit tests and the native integration tests pull the
 //! engine, the backup store and tokio's net stack, none of which build for
 //! wasm32. They run under Node through `wasm-bindgen-test`; the shim's items
-//! are reached through the crate's public surface (the crate re-exports the
-//! shim at its root on wasm).
+//! are reached through the crate's `#[doc(hidden)]` `wasm_sqlx_for_tests`
+//! module.
 #![cfg(target_arch = "wasm32")]
 
 use std::fmt::Debug;
@@ -30,7 +30,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
 
-use extenddb_storage_sqlite as sqlx;
+use extenddb_storage_sqlite::wasm_sqlx_for_tests as sqlx;
 use futures::StreamExt;
 use sqlx::Connection;
 use wasm_bindgen_test::wasm_bindgen_test;
@@ -179,7 +179,7 @@ struct Person {
 // that by-name decode path. The one-field-list declaration macro that
 // generates this for the real structs lives with those structs.
 impl sqlx::FromRow for Person {
-    fn from_row(row: &sqlx::Row) -> Result<Self, sqlx::Error> {
+    fn from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
         Ok(Self {
             id: row.try_get("id")?,
             name: row.try_get("name")?,

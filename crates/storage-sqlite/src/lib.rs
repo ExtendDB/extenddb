@@ -23,14 +23,24 @@
 // On wasm the backend cannot use `sqlx` + the C `libsqlite3-sys` (a dedicated
 // OS thread per connection, a C sysroot), so every `sqlx::` path in this crate
 // resolves instead to the in-crate `wasm_sqlx` module: aliasing this crate to
-// `sqlx` and re-exporting the shim at the crate root makes bare `sqlx::` paths
-// (and the `#[derive(sqlx::FromRow)]`-equivalent) resolve to it from every
-// module, without a per-module import. Native keeps the real `sqlx` crate and
-// is the behaviour this backend is defined against.
+// `sqlx` and re-exporting the shim at the crate root, crate-privately, makes
+// bare `sqlx::` paths resolve to it from every module without a per-module
+// import. Native keeps the real `sqlx` crate and is the behaviour this backend
+// is defined against.
 #[cfg(target_arch = "wasm32")]
 extern crate self as sqlx;
 #[cfg(target_arch = "wasm32")]
-pub use wasm_sqlx::*;
+pub(crate) use wasm_sqlx::*;
+
+/// The shim items `tests/wasm_shim.rs` drives on wasm, under the paths `sqlx`
+/// gives them. Not part of this crate's API.
+#[cfg(target_arch = "wasm32")]
+#[doc(hidden)]
+pub mod wasm_sqlx_for_tests {
+    pub use crate::wasm_sqlx::{
+        Connection, Error, FromRow, SqlitePool, query, query_as, query_scalar, raw_sql, sqlite,
+    };
+}
 
 /// Declare a catalog-row struct with a single field list that decodes the same
 /// way on both targets.

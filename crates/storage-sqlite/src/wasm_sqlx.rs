@@ -32,7 +32,7 @@
 //! sysroot). The WebAssembly build of the SQLite backend therefore drops
 //! `sqlx` + `libsqlite3-sys` and resolves its `sqlx::` paths to this module
 //! instead (`extern crate self as sqlx;` at the crate root, with this module
-//! re-exported), running the backend's SQL against a real SQLite compiled for
+//! re-exported there crate-privately), running the backend's SQL against a real SQLite compiled for
 //! wasm (`sqlite-wasm-rs`, in-memory VFS). On every other target the backend
 //! keeps real `sqlx` + C SQLite; this module is excluded there (see the
 //! `#[cfg(target_arch = "wasm32")]` on its declaration).
@@ -816,21 +816,6 @@ impl std::str::FromStr for SqliteConnectOptions {
     type Err = Error;
     fn from_str(s: &str) -> Result<Self, Error> {
         SqliteConnectOptions::parse(s)
-    }
-}
-
-/// Mirrors `sqlx::ConnectOptions::connect`.
-pub trait ConnectOptions {
-    /// Open a single connection with these options.
-    fn connect(&self) -> Pin<Box<dyn Future<Output = Result<SqliteConnection, Error>> + '_>>;
-}
-
-impl ConnectOptions for SqliteConnectOptions {
-    fn connect(&self) -> Pin<Box<dyn Future<Output = Result<SqliteConnection, Error>> + '_>> {
-        Box::pin(async move {
-            let handle = open(self)?;
-            Ok(SqliteConnection { handle })
-        })
     }
 }
 
@@ -1736,11 +1721,6 @@ impl<DB> Query<DB> {
     pub async fn fetch_one<E: Executor<Database = DB>>(self, ex: E) -> Result<Row, Error> {
         self.fetch_optional(ex).await?.ok_or(Error::RowNotFound)
     }
-
-    /// Fetch all rows.
-    pub async fn fetch_all<E: Executor<Database = DB>>(self, ex: E) -> Result<Vec<Row>, Error> {
-        all_rows(&ex, &self.sql, &self.params)
-    }
 }
 
 /// A query decoding each row into `O: FromRow`, mirroring `sqlx::query_as`.
@@ -1901,17 +1881,5 @@ impl RawSql {
 
 /// Mirrors the `sqlx::sqlite` module the backend imports from.
 pub mod sqlite {
-    pub use super::{
-        Row as SqliteRow, SqliteConnectOptions, SqliteConnection, SqlitePool, SqlitePoolOptions,
-    };
-}
-
-/// Mirrors the `sqlx::pool` module path (`sqlx::pool::PoolConnection`).
-pub mod pool {
-    pub use super::PoolConnection;
-}
-
-/// Mirrors the `sqlx::error` module path (`sqlx::error::DatabaseError`).
-pub mod error {
-    pub use super::DatabaseError;
+    pub use super::{Row as SqliteRow, SqliteConnectOptions, SqlitePoolOptions};
 }
