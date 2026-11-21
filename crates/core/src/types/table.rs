@@ -39,6 +39,15 @@ pub enum TableStatus {
     Updating,
 }
 
+impl TableStatus {
+    /// Whether the table serves requests: `ACTIVE`, or `UPDATING` while an
+    /// UpdateTable change applies.
+    #[must_use]
+    pub fn serves(self) -> bool {
+        matches!(self, Self::Active | Self::Updating)
+    }
+}
+
 /// Projection type for a secondary index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]

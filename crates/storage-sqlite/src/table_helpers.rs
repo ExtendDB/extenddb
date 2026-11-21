@@ -11,7 +11,9 @@ use extenddb_core::types::{
     SseDescription, SseType, TableDescription, TableStatus,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{index_arn, parse_warm_throughput_record, stream_arn};
+use extenddb_storage::util::{
+    index_arn, parse_warm_throughput_record, reported_status, stream_arn,
+};
 use extenddb_storage::vector_catalog::{VectorIndexCatalogRow, vector_index_descriptions};
 
 use crate::data;
@@ -39,6 +41,7 @@ pub(crate) struct TableRow {
     pub sse_specification: Option<String>,
     pub on_demand_throughput: Option<String>,
     pub warm_throughput: Option<String>,
+    pub status_transition_at: Option<String>,
 }
 
 /// Catalog `indexes` row.
@@ -107,7 +110,7 @@ pub(crate) const TABLE_COLUMNS: &str = "table_name, key_schema, attribute_defini
      billing_mode, provisioned_throughput, stream_specification, table_status, \
      creation_date_time, table_size_bytes, item_count, table_arn, table_id, \
      deletion_protection_enabled, stream_label, table_class, sse_specification, \
-     on_demand_throughput, warm_throughput";
+     on_demand_throughput, warm_throughput, status_transition_at";
 
 /// Columns selected for an `IndexRow`, in `FromRow` field order.
 pub(crate) const INDEX_COLUMNS: &str = "index_name, index_id, index_type, key_schema, \
@@ -271,7 +274,7 @@ impl SqliteEngine {
             None => (0, 0),
         };
 
-        let table_status = match row.table_status.as_str() {
+        let stored_status = match row.table_status.as_str() {
             "ACTIVE" => TableStatus::Active,
             "CREATING" => TableStatus::Creating,
             "DELETING" => TableStatus::Deleting,
@@ -282,6 +285,13 @@ impl SqliteEngine {
                 )));
             }
         };
+        let table_status = reported_status(
+            stored_status,
+            row.status_transition_at
+                .as_deref()
+                .and_then(|at| parse_timestamp(at).ok()),
+            time::OffsetDateTime::now_utc(),
+        );
 
         let creation_epoch = parse_timestamp(&row.creation_date_time)
             .map(|dt| dt.unix_timestamp() as f64)

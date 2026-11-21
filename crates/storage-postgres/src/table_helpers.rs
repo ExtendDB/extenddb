@@ -8,7 +8,9 @@ use extenddb_core::types::{
     ProvisionedThroughputDescription, SseDescription, SseType, TableDescription, TableStatus,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{index_arn, parse_warm_throughput_record, stream_arn};
+use extenddb_storage::util::{
+    index_arn, parse_warm_throughput_record, reported_status, stream_arn,
+};
 use extenddb_storage::vector_catalog::{VectorIndexCatalogRow, vector_index_descriptions};
 
 use crate::PostgresEngine;
@@ -36,6 +38,9 @@ pub(crate) struct TableRow {
     pub sse_specification: Option<serde_json::Value>,
     pub on_demand_throughput: Option<serde_json::Value>,
     pub warm_throughput: Option<serde_json::Value>,
+    /// Seconds from `NOW()` to `status_transition_at`.
+    #[sqlx(default)]
+    pub transition_in_secs: Option<f64>,
 }
 
 /// Row type for index metadata queries.
@@ -143,7 +148,9 @@ impl PostgresEngine {
                       table_size_bytes, item_count, table_arn, table_id,
                       deletion_protection_enabled, stream_label,
                       table_class, sse_specification, on_demand_throughput,
-                      warm_throughput
+                      warm_throughput,
+                      EXTRACT(EPOCH FROM status_transition_at - NOW())::FLOAT8
+                          AS transition_in_secs
                FROM tables WHERE account_id = $1 AND table_name = $2",
         )
         .bind(account_id)
@@ -286,7 +293,7 @@ impl PostgresEngine {
         };
 
         // Fix #12: Unknown table_status is an error, not a silent fallback
-        let table_status = match row.table_status.as_str() {
+        let stored_status = match row.table_status.as_str() {
             "ACTIVE" => TableStatus::Active,
             "CREATING" => TableStatus::Creating,
             "DELETING" => TableStatus::Deleting,
@@ -297,6 +304,7 @@ impl PostgresEngine {
                 )));
             }
         };
+        let table_status = reported_status(stored_status, row.transition_in_secs, 0.0);
 
         let creation_epoch = row.creation_epoch.unwrap_or(0.0);
 

@@ -561,7 +561,8 @@ pub trait SnapshotEngine: Send + Sync {
     ///
     /// [`StorageError::TableNotFound`] when the table does not exist in the
     /// account, [`StorageError::TableNotActive`] (or the backend's
-    /// equivalent) when it is not `ACTIVE`, [`StorageError::Unsupported`]
+    /// equivalent) when it is neither `ACTIVE` nor `UPDATING`,
+    /// [`StorageError::Unsupported`]
     /// when the backend cannot take a consistent snapshot at all (Cassandra,
     /// which answers `Unsupported` before it resolves the table and so never
     /// returns `TableNotFound` or `TableNotActive`) or in this configuration

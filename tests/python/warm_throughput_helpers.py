@@ -120,11 +120,14 @@ def _assert_opened(warm: dict, previous: dict, new: dict, is_extenddb: bool, too
     assert warm == {**previous, "Status": "UPDATING"}
 
 
-def _assert_opened_status(status: str, is_extenddb: bool, took: float) -> None:
-    """The Status that `_assert_opened` allows, for a check of the status alone."""
+def _assert_opened_status(
+    status: str, is_extenddb: bool, took: float, expected: str = "UPDATING"
+) -> None:
+    """The Status that `_assert_opened` allows, for a check of the status alone:
+    `expected`, or ACTIVE on ExtendDB after a call of at least EXTENDDB_WINDOW_SECONDS."""
     if is_extenddb and took >= EXTENDDB_WINDOW_SECONDS and status == "ACTIVE":
         return
-    assert status == "UPDATING"
+    assert status == expected
 
 
 @pytest.fixture()
