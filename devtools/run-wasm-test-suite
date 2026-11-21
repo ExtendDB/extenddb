@@ -69,27 +69,27 @@ echo "+ cargo test --locked ${args[*]} --target wasm32-unknown-unknown"
 status=0
 cargo test --locked "${args[@]}" --target wasm32-unknown-unknown 2>&1 | tee "$log" || status=$?
 
-# The runner's lines, without any colour escapes, for the checks below.
+# The run's output without any colour escapes, for the checks below.
 esc=$'\033'
-sed -i "s/${esc}\[[0-9;]*m//g" "$log"
+output="$(sed "s/${esc}\[[0-9;]*m//g" "$log")"
 
 problems=()
 if [ "$status" -ne 0 ]; then
     problems+=("cargo test exited with status ${status}")
 fi
-results="$(grep -c '^test result: ' "$log" || true)"
+results="$(grep -c '^test result: ' <<<"$output" || true)"
 if [ "$results" -ne 1 ]; then
     problems+=("expected one 'test result:' line, found ${results}")
 else
-    passed="$(sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed; 0 failed;.*$/\1/p' "$log")"
+    passed="$(sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed; 0 failed;.*$/\1/p' <<<"$output")"
     if [ -z "$passed" ]; then
-        problems+=("the run did not pass: $(grep '^test result: ' "$log")")
+        problems+=("the run did not pass: $(grep '^test result: ' <<<"$output")")
     elif [ "$passed" -lt "$minimum" ]; then
         problems+=("${passed} tests passed; the ${suite} suite has at least ${minimum}")
     fi
 fi
 for name in ${required[@]+"${required[@]}"}; do
-    if ! grep -qxF "test ${name} ... ok" "$log"; then
+    if ! grep -qxF "test ${name} ... ok" <<<"$output"; then
         problems+=("the test ${name} was not reported ok")
     fi
 done
