@@ -411,7 +411,8 @@ This drops both databases after confirmation.
 | `connection refused` on port 18443 | Server not running. Start with `extenddb serve --config extenddb.toml` |
 | `serve` exits 3, naming pending catalog migrations | Run `extenddb migrate --config extenddb.toml --yes`, then start the server |
 | `ResourceNotFoundException` on CreateTable | Table is still in CREATING status. Poll DescribeTable until `TableStatus` is `ACTIVE` |
-| `UnrecognizedClientException` | Invalid access key. Check credentials — verify the access key ID and secret match what was returned by `create-access-key` |
+| `UnrecognizedClientException` | The access key ID is unknown or inactive. Check the access key ID returned by `create-access-key` |
+| `InvalidSignatureException` | The secret key does not match the access key ID, or the client's region is not this server's `[server] region`. Check the secret returned by `create-access-key`, and the client's region |
 | `AccessDeniedException` | IAM policy does not allow the operation. Attach a policy with the required permissions |
 
 See `docs/troubleshooting.md` for the full troubleshooting guide.
