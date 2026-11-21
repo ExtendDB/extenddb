@@ -122,8 +122,7 @@ impl PendingApplyContext {
 /// Both arms tolerate a data table that no longer exists, so a base table or index
 /// dropped while a row was in flight is applied-as-skip rather than logged and
 /// dropped as unprocessable.
-// Applies a row the GSI propagation worker claimed; the browser build runs no
-// worker and maintains its indexes on the write path.
+// The GSI propagation worker's apply path; wasm32 runs no worker.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn apply_pending_context(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,

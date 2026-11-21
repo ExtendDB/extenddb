@@ -271,7 +271,7 @@ impl SqliteEngine {
     /// Returns `Some(password)` when a new admin user was created with a
     /// generated password (so the caller can surface it once), or `None` when
     /// the admin already existed or the password came from the environment.
-    // Called by the server's startup only (`lib.rs`).
+    // Called only by the server's startup (`server_backend.rs`).
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn bootstrap_dev_rows(
         &self,

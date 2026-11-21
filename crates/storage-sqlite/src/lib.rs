@@ -17,6 +17,29 @@
 //!   full precision retained in the item JSON. See `docs/design-decisions.md`.
 //! - One file holds catalog and data (no separate catalog/data databases).
 //!
+//! # The WebAssembly build
+//!
+//! On `wasm32` the crate runs over the in-crate `sqlx` shim (`wasm_sqlx`),
+//! which opens only an in-memory database (`sqlite::memory:`); it runs no
+//! server, no command and no background worker. Code that build does not run
+//! is marked by one rule per concern:
+//!
+//! 1. **Does not compile for wasm32** (it calls `libsqlite3-sys`, `sqlx` API
+//!    the shim does not provide, or an item that rule 1 or 2 removes):
+//!    `#[cfg(not(target_arch = "wasm32"))]` on the smallest item that fails,
+//!    the `mod` line where a whole module does, with a one-line reason.
+//! 2. **Compiles for wasm32, but no wasm32 code calls it** (the dead-code lint
+//!    reports it there): removed the same way, together with its callers, with
+//!    a one-line reason. Only where removing it would put a `cfg` into code
+//!    both builds run, such as a field that a constructor both builds run
+//!    sets, does it carry
+//!    `#[cfg_attr(target_arch = "wasm32", expect(dead_code, reason = "..."))]`
+//!    instead, the reason naming that code.
+//! 3. **Compiled and called on wasm32, but reached by no wasm32 request**, and
+//!    calling a method the WebAssembly clippy step disallows:
+//!    `#[allow(clippy::disallowed_methods, reason = "...")]` on the smallest
+//!    enclosing item, the reason naming why no wasm32 request reaches it.
+//!
 //! NOTE: this is the catalog-layer build slice. The data-plane engine modules
 //! and the `ServerComponents` registration are added in the engine slice.
 
@@ -130,10 +153,7 @@ mod admin_store;
 mod authorization_store;
 mod backup;
 mod backup_catalog;
-// Stands up a file-backed server from config on disk, taking the serve lock
-// (`std::fs`, `std::os::unix`, the `flock`-based `ServeLock`): a server-only
-// path with no meaning in the browser, where the engine is built directly
-// against `:memory:`. Compiled off the wasm build.
+// Sets up a file-backed server; it takes the serve lock, compiled off wasm32.
 #[cfg(not(target_arch = "wasm32"))]
 mod bootstrapper;
 mod catalog_store;
@@ -142,16 +162,14 @@ mod create_table;
 mod credential_store;
 mod data;
 mod delete_table;
-// The server's background workers (`hooks` spawns `workers`); the browser
-// build runs no background task.
+// Starts the server's background workers, which wasm32 does not run.
 #[cfg(not(target_arch = "wasm32"))]
 mod hooks;
 mod management_store;
 mod metadata;
 pub mod migrations;
 mod number_key;
-// The lifecycle commands' backend helpers, which only the native `backend()`
-// installs.
+// The lifecycle commands' helpers, which only `server_backend` installs.
 #[cfg(not(target_arch = "wasm32"))]
 mod operations;
 mod password_hash_store;
@@ -159,20 +177,13 @@ mod restore_engine;
 #[cfg(test)]
 mod restore_job_tests;
 mod schema;
-// The browser build calls only `database_file` (to classify `:memory:`) and
-// names the `ServeLock` type of the engine's lock field, which stays `None`;
-// taking a lock is for the server and the CLI, so the lock-taking items are
-// marked dead on wasm where they are declared.
+// wasm32 calls only `database_file`; the module compiles its lock-taking
+// items off wasm32.
 mod serve_lock;
-// The `backend()` registration and the server factories it bundles: they open
-// databases for a server process and install its background workers, which the
-// browser build does not run.
+// The server's registration and factories, which use the modules gated here.
 #[cfg(not(target_arch = "wasm32"))]
 mod server_backend;
-// Table snapshots copy the database file on disk (`std::fs`, `std::os::unix`),
-// which the browser's in-memory build cannot do; the `SnapshotEngine` subtrait
-// the storage engine requires is answered with an out-of-scope error on wasm
-// (see `store.rs`).
+// Uses `sqlx` API the shim does not provide; on wasm32 `SnapshotEngine` answers `Unsupported`.
 #[cfg(not(target_arch = "wasm32"))]
 mod snapshot_engine;
 mod sqlite_util;
@@ -229,7 +240,6 @@ pub use catalog_store::SqliteCatalogStore;
 pub use config::SqliteConfig;
 pub use credential_store::SqliteCredentialStore;
 pub use store::SqliteEngine;
-// The server's entry points, which the browser build does not compile (see
-// `bootstrapper` and `server_backend` above).
+// From `bootstrapper` and `server_backend`, which wasm32 does not compile.
 #[cfg(not(target_arch = "wasm32"))]
 pub use {bootstrapper::SqliteBootstrapper, server_backend::backend};

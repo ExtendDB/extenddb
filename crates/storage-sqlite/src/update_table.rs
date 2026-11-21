@@ -1017,9 +1017,7 @@ impl SqliteEngine {
     }
 }
 
-// Startup and worker recovery of interrupted index builds. The server's startup
-// and its GSI worker call these; the browser build runs neither and refuses to
-// start a vector build.
+// Recovery of interrupted index builds, run only by the server's startup and GSI worker.
 #[cfg(not(target_arch = "wasm32"))]
 impl SqliteEngine {
     /// Rebuild any GSI left in `CREATING` by a crash between the catalog commit

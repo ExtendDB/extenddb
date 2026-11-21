@@ -16,19 +16,16 @@
 //! connection.
 
 mod backend;
-// CLI migration commands, the online-backup copy (`libsqlite3-sys`), and the
-// file-open helpers (`std::fs` create/`create_private`) are the server and CLI
-// migration surface. The browser build migrates an in-memory database on the
-// engine's single connection (`SqliteMigrations::on_pool`) and opens no file,
-// so these are compiled off it.
+// The CLI's migration commands.
 #[cfg(not(target_arch = "wasm32"))]
 mod commands;
+// The copy taken before a migration, through `libsqlite3-sys`'s online backup.
 #[cfg(not(target_arch = "wasm32"))]
 mod copy;
+// Creates and opens database files, for `SqliteMigrations::open_with` only.
 #[cfg(not(target_arch = "wasm32"))]
 mod open;
-// The entry points that lock, read and migrate a database file; the browser
-// build opens no file.
+// Locks, reads and migrates a database file; wasm32 opens none.
 #[cfg(not(target_arch = "wasm32"))]
 mod file_database;
 // The migration bodies are frozen once released: neither rustfmt nor a later
@@ -59,8 +56,7 @@ use extenddb_storage::migrations::{
 };
 
 pub use backend::{SqliteMigrations, SqliteStores};
-// The CLI commands and the file-database entry points, which the browser build
-// does not compile (see `file_database` above).
+// From `commands` and `file_database`, which wasm32 does not compile.
 #[cfg(not(target_arch = "wasm32"))]
 pub use {
     commands::SqliteCatalogMigrations,

@@ -34,9 +34,7 @@ use sqlx::SqlitePool;
 
 use crate::catalog_store::SqliteCatalogStore;
 
-// Used by the file-database paths (`open_with`, `forget`, the copy report) and
-// the encryption-key commands' `LockedCatalog`, none of which the browser
-// build compiles: it migrates only the engine's in-memory pool.
+// Used only by the file-database paths and `LockedCatalog`, compiled off wasm32.
 #[cfg(not(target_arch = "wasm32"))]
 use {
     crate::sqlite_util::{set_connection_pragmas, sqlite_url},
@@ -66,13 +64,11 @@ impl HasManagementStore for SqliteStores {
 /// switch`, `rotate` and `reset` (RFC-0000 section 8, common rules): the
 /// management store over the runner's one connection, holding no key.
 /// Dropping it closes the connection.
-// Server and CLI only: the encryption-key commands, which the browser build
-// does not have.
+// For the encryption-key commands, which wasm32 does not compile.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) struct LockedCatalog(SqliteMigrations);
 
-// Server and CLI only: the encryption-key commands, which the browser build
-// does not have.
+// For the encryption-key commands, which wasm32 does not compile.
 #[cfg(not(target_arch = "wasm32"))]
 impl LockedCatalog {
     pub(crate) fn new(migrations: SqliteMigrations) -> Self {
@@ -80,8 +76,7 @@ impl LockedCatalog {
     }
 }
 
-// Server and CLI only: the encryption-key commands, which the browser build
-// does not have.
+// For the encryption-key commands, which wasm32 does not compile.
 #[cfg(not(target_arch = "wasm32"))]
 impl LockedStores for LockedCatalog {
     fn management(&self) -> &dyn ManagementStore {
@@ -168,21 +163,33 @@ pub struct SqliteMigrations {
     /// The copy this run took before its first write, if it took one.
     #[cfg_attr(
         target_arch = "wasm32",
-        expect(dead_code, reason = "the wasm build copies no database file")
+        expect(
+            dead_code,
+            reason = "set by with_pool, which both builds run, and read only on the file-database \
+                      paths, which wasm32 does not compile"
+        )
     )]
     copy: Mutex<Option<PathBuf>>,
     /// The lines naming the earlier copies this run's copy replaced,
     /// reported with the run, also when it stops before its first commit.
     #[cfg_attr(
         target_arch = "wasm32",
-        expect(dead_code, reason = "the wasm build copies no database file")
+        expect(
+            dead_code,
+            reason = "set by with_pool, which both builds run, and read only on the file-database \
+                      paths, which wasm32 does not compile"
+        )
     )]
     replaced: Mutex<Vec<String>>,
     /// The lines naming the partial copies of stopped runs that opening the
     /// database for writing removed, reported with the run.
     #[cfg_attr(
         target_arch = "wasm32",
-        expect(dead_code, reason = "the wasm build copies no database file")
+        expect(
+            dead_code,
+            reason = "set by with_pool, which both builds run, and read only on the file-database \
+                      paths, which wasm32 does not compile"
+        )
     )]
     removed: Mutex<Vec<String>>,
     /// `PRAGMA foreign_keys = ON` failed after a step committed: the step is
@@ -660,9 +667,7 @@ impl MigrationBackend for SqliteMigrations {
             // An empty database (init) holds nothing to keep.
             return Ok(Vec::new());
         }
-        // Native only: `super::copy` calls SQLite's online-backup C API through
-        // `libsqlite3-sys`, which the wasm build does not link; there `self.file`
-        // is always `None`, so the arm below is never reached.
+        // `super::copy` is compiled off wasm32, where `self.file` is always `None`.
         #[cfg(not(target_arch = "wasm32"))]
         {
             let from = from.map_or_else(|| "legacy".to_owned(), |v| v.to_string());
