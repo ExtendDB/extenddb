@@ -21,6 +21,7 @@ aws-lc-rs = { workspace = true }
 libc = { workspace = true }
 sha2 = "0.10"
 hex = "0.4"
+base64 = { workspace = true }
 serde_json = { workspace = true }
 time = { workspace = true }
 tracing = { workspace = true }

@@ -16,6 +16,7 @@ REQ-TEST-001, REQ-AUTH-001
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -257,6 +258,12 @@ def _env_credentials() -> tuple[str, str, str | None]:
     return frozen.access_key, frozen.secret_key, frozen.token
 
 
+# The documentation's example key and a zero signature.
+_CRED = "Credential=AKIAIOSFODNN7EXAMPLE/20261120/us-east-1/dynamodb/aws4_request"
+_SH = "SignedHeaders=host;x-amz-target"
+_SIG = "Signature=" + "0" * 64
+
+
 class TestRequestChecks:
     """Checks on the signed request other than the signature itself.
 
@@ -463,6 +470,49 @@ class TestRequestChecks:
         assert connection == "close", connection
         if self.endpoint_url is not None:
             assert text == "400 Bad Request", text[:200]
+
+    @pytest.mark.parametrize(
+        "pairs,same_text",
+        [
+            ("garbage", True),
+            (f"garbage, {_CRED}, {_SH}, {_SIG}", True),
+            (f"{_CRED}, {_SH}, {_SIG}, garbage", True),
+            (f"{_CRED}, garbage, {_SIG}", True),
+            ("Credential", True),
+            ("=x", False),
+            ("Foo=bar", False),
+        ],
+        ids=["alone", "first", "last", "middle", "key-only", "no-key", "unknown-key"],
+    )
+    def test_authorization_part_without_equal_sign(self, pairs, same_text):
+        # Measured against the service on 2026-11-20: a part with no '=' gets
+        # this text wherever it sits, before any missing parameter is named.
+        header = f"AWS4-HMAC-SHA256 {pairs}"
+        u = urlparse(self.url)
+        status, text, _ = self._raw_request(
+            "POST",
+            "/",
+            [
+                ("Host", u.netloc),
+                ("X-Amz-Target", "DynamoDB_20120810.DescribeTable"),
+                ("Content-Type", "application/x-amz-json-1.0"),
+                ("Authorization", header),
+            ],
+            body=b'{"TableName": "no-such-table"}',
+        )
+        assert status == 400, (status, text[:300])
+        payload = json.loads(text)
+        assert payload["__type"].endswith("#IncompleteSignatureException"), text
+        if not same_text:
+            # Every part holds '=' here, and the service and extenddb answer
+            # with different texts, so only the type is checked.
+            assert not payload["message"].startswith("Invalid key=value pair (missing equal-sign)"), text
+            return
+        digest = base64.b64encode(hashlib.sha256(header.encode()).digest()).decode()
+        assert payload["message"] == (
+            "Invalid key=value pair (missing equal-sign) in Authorization header "
+            f"(hashed with SHA-256 and encoded with Base64): '{digest}'."
+        ), text
 
     def test_session_token_with_a_long_term_key_is_rejected(self):
         _, _, env_token = _env_credentials()
