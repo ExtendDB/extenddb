@@ -43,6 +43,23 @@ def ttl_table(dynamodb_client, unique_table_name):
             raise
     else:
         wait_for_deleted(dynamodb_client, unique_table_name)
+
+
+def wait_until_not_enabling(client, table_name: str, timeout: float = 120.0) -> None:
+    """Poll DescribeTimeToLive while the status is ENABLING. Cassandra and
+    PostgreSQL report it until the backfill lands and refuse a second
+    UpdateTimeToLive until then; on a loaded server that outlasts a fixed wait."""
+    deadline = time.monotonic() + timeout
+    while (
+        client.describe_time_to_live(TableName=table_name)["TimeToLiveDescription"][
+            "TimeToLiveStatus"
+        ]
+        == "ENABLING"
+    ):
+        assert time.monotonic() < deadline, f"TTL still ENABLING after {timeout} s"
+        time.sleep(0.5)
+
+
 class TestUpdateTimeToLive:
     """UpdateTimeToLive operation tests."""
 
@@ -69,17 +86,7 @@ class TestUpdateTimeToLive:
         )
         # DynamoDB rate-limits TTL modifications; wait before disabling.
         time.sleep(6)
-        # A disable is refused while the enable is still ENABLING; on a loaded
-        # server that can outlast the fixed wait.
-        deadline = time.monotonic() + 120
-        while (
-            dynamodb_client.describe_time_to_live(TableName=ttl_table)[
-                "TimeToLiveDescription"
-            ]["TimeToLiveStatus"]
-            == "ENABLING"
-        ):
-            assert time.monotonic() < deadline, "TTL still ENABLING after 120 s"
-            time.sleep(0.5)
+        wait_until_not_enabling(dynamodb_client, ttl_table)
         # Disable.
         resp = dynamodb_client.update_time_to_live(
             TableName=ttl_table,
@@ -167,6 +174,53 @@ class TestUpdateTimeToLive:
                 wait_for_deleted(dynamodb_client, unique_table_name)
             except ClientError:
                 pass
+
+
+OTHER_ATTRIBUTE = (
+    "TimeToLive is active on a different AttributeName: current AttributeName is ttl"
+)
+
+
+class TestUpdateTimeToLiveOnAnotherAttribute:
+    """With TTL ENABLED on ``ttl``, an UpdateTimeToLive that names another
+    attribute is refused in the enable and in the disable form, the message
+    carries the stored name, and the comparison is case-sensitive (measured
+    on DynamoDB 2026-11-21 in us-east-1).
+    """
+
+    @pytest.mark.parametrize(
+        "enabled, attribute, message",
+        [
+            (True, "expires", OTHER_ATTRIBUTE),
+            (False, "other", OTHER_ATTRIBUTE),
+            (True, "TTL", OTHER_ATTRIBUTE),
+            (False, "TTL", OTHER_ATTRIBUTE),
+            (True, "ttl", "TimeToLive is already enabled"),
+        ],
+    )
+    def test_update_while_enabled_on_ttl_is_refused(
+        self, dynamodb_client, ttl_table, enabled, attribute, message
+    ):
+        dynamodb_client.update_time_to_live(
+            TableName=ttl_table,
+            TimeToLiveSpecification={"Enabled": True, "AttributeName": "ttl"},
+        )
+        wait_until_not_enabling(dynamodb_client, ttl_table)
+        row = f"Enabled={enabled} AttributeName={attribute!r}"
+        with pytest.raises(ClientError) as exc:
+            dynamodb_client.update_time_to_live(
+                TableName=ttl_table,
+                TimeToLiveSpecification={"Enabled": enabled, "AttributeName": attribute},
+            )
+        response = exc.value.response
+        assert response["ResponseMetadata"]["HTTPStatusCode"] == 400, (row, response)
+        assert response["Error"]["Code"] == "ValidationException", (row, response)
+        assert response["Error"]["Message"] == message, (row, response)
+        desc = dynamodb_client.describe_time_to_live(TableName=ttl_table)
+        assert desc["TimeToLiveDescription"] == {
+            "TimeToLiveStatus": "ENABLED",
+            "AttributeName": "ttl",
+        }, (row, desc)
 
 
 class TestDescribeTimeToLive:
