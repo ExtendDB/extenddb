@@ -405,7 +405,7 @@ The last ring write of `rotate` is conditional too, on the two-DEK ring of its f
 
 These errors occur when `auth.provider = "builtin"` is enabled.
 
-### `MissingAuthenticationToken: Request must contain a valid authentication token`
+### `MissingAuthenticationTokenException: Request is missing Authentication Token`
 
 **Cause:** The request has no `Authorization` header. This happens when an SDK is configured without credentials, or when making raw HTTP requests without SigV4 signing.
 

@@ -53,7 +53,7 @@ extenddb uses SigV4 signature verification with a local credential store and IAM
 
 The steps run in this order; every rejection is HTTP 400.
 
-1. Extract the `Authorization` header (AWS4-HMAC-SHA256 scheme); absent: `MissingAuthenticationToken`
+1. Extract the `Authorization` header (AWS4-HMAC-SHA256 scheme); absent: `MissingAuthenticationTokenException`
 2. Parse credential scope, signed headers, and signature; malformed: `IncompleteSignatureException`. A request with more than one `host` or `authorization` header is refused before this point with a plain 400, as the service's front end does
 3. Look up the access key in the credential store (through the credential cache, see below); unknown: `UnrecognizedClientException`
 4. Check `X-Amz-Date` against the server clock: more than 15 minutes of skew is `UnrecognizedClientException` (signature expired)
