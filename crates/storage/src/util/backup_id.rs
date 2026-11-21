@@ -127,9 +127,9 @@ mod tests {
             assert_eq!(parse_backup_arn(&arn).unwrap().backup_id, id, "{id}");
             assert!(is_backup_id(id), "{id}");
         }
-        // Surrounding ASCII whitespace is trimmed (the service resolves an
+        // One trailing line terminator is stripped (the service resolves an
         // ARN with a trailing newline).
-        let padded = format!(" \t{arn}\n");
+        let padded = format!("{arn}\n");
         let p = check_backup_arn(&padded).unwrap();
         assert_eq!(p.arn, arn);
         assert_eq!(p.backup_id, "01489602797149-73d8d5bc");

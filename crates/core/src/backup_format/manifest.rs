@@ -2384,8 +2384,10 @@ mod tests {
         let good = sample_manifest();
         good.validate_identity().unwrap();
 
+        // A trailing newline parses (`trim_backup_arn`), and the spelling is
+        // still not the canonical one.
         let mut padded = good.clone();
-        padded.backup_arn = format!(" {}\n", good.backup_arn);
+        padded.backup_arn = format!("{}\n", good.backup_arn);
         let err = padded.validate_identity().unwrap_err();
         assert!(err.to_string().contains("canonical"), "{err}");
 
