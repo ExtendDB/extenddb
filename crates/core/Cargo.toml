@@ -30,9 +30,10 @@ zeroize = { workspace = true }
 web-time = { workspace = true }
 
 # The shared crypto module (src/crypto.rs) uses AWS-LC through aws-lc-rs on
-# every target except wasm32. aws-lc-rs is already in the native dependency
-# closure through extenddb-auth and extenddb-storage, so this edge adds nothing
-# new to native builds.
+# every target except wasm32. The server already links aws-lc-rs through
+# rustls, and the extenddb binary through rcgen as well, so this edge adds no
+# package to their builds; it adds AWS-LC to the dependency closure of
+# extenddb-core itself.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 aws-lc-rs = { workspace = true }
 
