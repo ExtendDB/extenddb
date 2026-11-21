@@ -30,8 +30,8 @@
 //!   `DescribeEndpoints`, as the build has no network address to report.
 //! - **Refused as the server refuses them**: every
 //!   `RestoreTableToPointInTime`, and an `UpdateContinuousBackups` that enables
-//!   point-in-time recovery, through [`extenddb_engine::parse_request`] and
-//!   [`extenddb_engine::ParsedRequest::admit`], the pre-dispatch checks the
+//!   point-in-time recovery, through `extenddb_engine::parse_request` and
+//!   `ParsedRequest::admit`, the pre-dispatch checks the
 //!   server applies too (the server also authenticates between them; this
 //!   build authenticates no request). They run before any table is read.
 //! - **Passed through** to the engine's handlers: everything else, including

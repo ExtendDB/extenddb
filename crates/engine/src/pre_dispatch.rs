@@ -32,6 +32,9 @@ use serde_json::Value;
 ///
 /// Returned by [`parse_request`]; [`ParsedRequest::admit`] applies the
 /// refusals that follow and yields the body to dispatch.
+// Public for its two callers, the HTTP server's `handle_request` and the
+// WebAssembly adapter's `Engine::dispatch`, not for other users of the crate.
+#[doc(hidden)]
 #[derive(Debug)]
 pub struct ParsedRequest<'a> {
     operation: &'a str,
@@ -51,6 +54,9 @@ pub struct ParsedRequest<'a> {
 ///
 /// `UnknownOperationException` for an operation the engine does not
 /// dispatch; `SerializationException` for a body that is not valid JSON.
+// Public for its two callers, the HTTP server's `handle_request` and the
+// WebAssembly adapter's `Engine::dispatch`, not for other users of the crate.
+#[doc(hidden)]
 pub fn parse_request<'a>(
     operation: &'a str,
     body: &[u8],
