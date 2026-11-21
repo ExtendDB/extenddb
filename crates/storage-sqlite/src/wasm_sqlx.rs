@@ -13,10 +13,11 @@
 //! sysroot). The WebAssembly build of the SQLite backend therefore drops
 //! `sqlx` + `libsqlite3-sys` and resolves its `sqlx::` paths to this module
 //! instead (`extern crate self as sqlx;` at the crate root, with this module
-//! re-exported there crate-privately), running the backend's SQL against a real SQLite compiled for
-//! wasm (`sqlite-wasm-rs`, in-memory VFS). On every other target the backend
-//! keeps real `sqlx` + C SQLite; this module is excluded there (see the
-//! `#[cfg(target_arch = "wasm32")]` on its declaration).
+//! re-exported there crate-privately), running the backend's SQL against a
+//! real SQLite compiled for wasm (`sqlite-wasm-rs`, in-memory VFS). On every
+//! other target the backend keeps real `sqlx` + C SQLite; this module is
+//! excluded there (see the `#[cfg(target_arch = "wasm32")]` on its
+//! declaration).
 //!
 //! # What follows `sqlx-sqlite` 0.8.6
 //!
