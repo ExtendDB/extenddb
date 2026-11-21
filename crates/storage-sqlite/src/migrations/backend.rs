@@ -198,7 +198,13 @@ impl SqliteMigrations {
                     MigrationError::store(format!("create the directory of {location}"), e)
                 })?;
             }
-            super::open::create_private(path)?;
+            // A dangling symlink names the file it will become, so the target
+            // is created here and the connection never creates the database.
+            super::open::create_private(&crate::serve_lock::resolve_dangling_symlinks(path))?;
+            // Files an earlier version left wider than 0600 are narrowed
+            // before SQLite opens them, so the sidecars this connection
+            // creates take 0600 from the database file.
+            crate::file_mode::prepare(location).map_err(MigrationError::Store)?;
         }
         let options = sqlx::sqlite::SqliteConnectOptions::from_str(&sqlite_url(location))
             .map_err(|e| MigrationError::store(format!("open SQLite database {location}"), e))?
