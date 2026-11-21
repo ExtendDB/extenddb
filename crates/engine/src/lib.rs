@@ -7,10 +7,11 @@
 //! inputs, dispatches operations by name, and translates storage errors into
 //! `DynamoDB`-format error responses.
 
-// The backup/PITR subsystem depends on an S3/filesystem store, networking and
-// background threads that have no wasm32 target, and backup is outside the
-// browser build's scope. It is compiled only off wasm; the adapter answers the
-// backup/PITR operations itself before dispatch in that build.
+// The store-backed backup subsystem depends on an S3/filesystem store,
+// networking and background threads that have no wasm32 target, so it is
+// compiled only off wasm; the WebAssembly adapter refuses its four
+// operations before dispatch. `backup_requests` holds the backup and point-in-time
+// recovery requests that read no store, and compiles on both targets.
 #[cfg(not(target_arch = "wasm32"))]
 mod backup;
 #[cfg(not(target_arch = "wasm32"))]
@@ -19,9 +20,10 @@ pub use backup::{
     OTHER_STORE, RESTORE_REGISTRATION_TIMEOUT, S3_CHECK_TIMEOUT, STORE_IDENTITY_KEY, Spool,
     StoreFence, StoreHealth, StoreHealthReport, StoreIdentityFile, StoreProblem, TARGET_NOT_EMPTY,
     check_configured_store, check_configured_store_read_only, maintenance, migrate_legacy,
-    read_identity_bounded, reconciler, refuse_point_in_time_recovery, store_identity,
-    store_maintenance, sync,
+    read_identity_bounded, reconciler, store_identity, store_maintenance, sync,
 };
+mod backup_requests;
+pub use backup_requests::refuse_point_in_time_recovery;
 mod batch_get_item;
 mod batch_write_item;
 pub mod capacity_helpers;
@@ -35,11 +37,9 @@ mod expected;
 mod expression_helpers;
 mod get_item;
 mod gsi_updates;
-// Import/Export are filesystem-backed and outside the browser build's scope
-// (it has no filesystem). Compiled only off wasm; the adapter answers the
-// Import/Export operations itself before dispatch in that build.
-#[cfg(not(target_arch = "wasm32"))]
 mod import_export;
+// The filesystem helpers of import/export; the WebAssembly build has no
+// filesystem, and `import_export` keeps its file I/O off that target.
 #[cfg(not(target_arch = "wasm32"))]
 mod import_export_io;
 mod index_helpers;
@@ -86,7 +86,6 @@ pub use describe_endpoints::handle_describe_endpoints;
 pub use describe_limits::handle_describe_limits;
 pub use describe_table::handle_describe_table;
 pub use get_item::handle_get_item;
-#[cfg(not(target_arch = "wasm32"))]
 pub use import_export::{handle_export_table, handle_import_table};
 pub use item_authorizer::{ItemAccess, ItemAuthorization, ItemAuthorizer};
 pub use list_tables::handle_list_tables;
@@ -409,10 +408,10 @@ pub type AuthorizedKeyInfo = std::collections::HashMap<String, Option<TableKeyIn
 /// the discussion file and principal reviewer approval.
 pub struct OperationContext {
     pub storage: Arc<dyn extenddb_storage::StorageEngine>,
-    /// The process's job slots and configured backup store, which the backup
-    /// operations read. The backup subsystem is compiled only off wasm, so
-    /// this field is absent in the wasm build, where the adapter answers the
-    /// backup/PITR operations before dispatch.
+    /// The process's job slots and configured backup store, which the
+    /// store-backed backup operations read. That subsystem is compiled only
+    /// off wasm, so this field is absent in the wasm build, which refuses
+    /// those operations before dispatch.
     #[cfg(not(target_arch = "wasm32"))]
     pub backup: Arc<BackupRuntime>,
     pub limits: Arc<LimitsConfig>,
@@ -572,11 +571,9 @@ pub async fn dispatch(
         "GetRecords" => handle_get_records(body, ctx)
             .await
             .map(DispatchResult::body_only),
-        #[cfg(not(target_arch = "wasm32"))]
         "ImportTable" => handle_import_table(body, ctx)
             .await
             .map(DispatchResult::body_only),
-        #[cfg(not(target_arch = "wasm32"))]
         "ExportTableToPointInTime" => handle_export_table(body, ctx)
             .await
             .map(DispatchResult::body_only),
@@ -588,8 +585,7 @@ pub async fn dispatch(
         "DescribeBackup" => backup::handle_describe_backup(body, ctx)
             .await
             .map(DispatchResult::body_only),
-        #[cfg(not(target_arch = "wasm32"))]
-        "ListBackups" => backup::handle_list_backups(body, ctx)
+        "ListBackups" => backup_requests::handle_list_backups(body, ctx)
             .await
             .map(DispatchResult::body_only),
         #[cfg(not(target_arch = "wasm32"))]
@@ -600,18 +596,19 @@ pub async fn dispatch(
         "RestoreTableFromBackup" => backup::handle_restore_table_from_backup(body, ctx)
             .await
             .map(DispatchResult::body_only),
-        #[cfg(not(target_arch = "wasm32"))]
-        "DescribeContinuousBackups" => backup::handle_describe_continuous_backups(body, ctx)
+        "DescribeContinuousBackups" => {
+            backup_requests::handle_describe_continuous_backups(body, ctx)
+                .await
+                .map(DispatchResult::body_only)
+        }
+        "UpdateContinuousBackups" => backup_requests::handle_update_continuous_backups(body, ctx)
             .await
             .map(DispatchResult::body_only),
-        #[cfg(not(target_arch = "wasm32"))]
-        "UpdateContinuousBackups" => backup::handle_update_continuous_backups(body, ctx)
-            .await
-            .map(DispatchResult::body_only),
-        #[cfg(not(target_arch = "wasm32"))]
-        "RestoreTableToPointInTime" => backup::handle_restore_table_to_point_in_time(body, ctx)
-            .await
-            .map(DispatchResult::body_only),
+        "RestoreTableToPointInTime" => {
+            backup_requests::handle_restore_table_to_point_in_time(body, ctx)
+                .await
+                .map(DispatchResult::body_only)
+        }
         #[cfg(feature = "partiql")]
         "ExecuteStatement" => ctx.execute_statement(body).await,
         #[cfg(feature = "partiql")]

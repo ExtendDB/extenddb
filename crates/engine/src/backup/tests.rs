@@ -39,6 +39,7 @@ use futures::{StreamExt, TryStreamExt};
 use serde_json::{Value, json};
 
 use super::*;
+use crate::backup_requests::{BACKUP_ARN_NOT_VALID, list_backups};
 
 mod migrate_legacy;
 

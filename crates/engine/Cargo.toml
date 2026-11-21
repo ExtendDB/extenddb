@@ -42,10 +42,11 @@ futures = { workspace = true }
 # through this; native is unchanged.
 web-time = { workspace = true }
 
-# The backup/PITR and import/export subsystems depend on an S3/filesystem
-# store (`extenddb-backup-store`) and the tokio networking/`fs`/`spawn` and
-# `tokio-util` machinery, none of which build for wasm32. They are compiled
-# only off wasm; the modules that use them are gated the same way in lib.rs.
+# The store-backed backup subsystem and the import/export file I/O depend on
+# an S3/filesystem store (`extenddb-backup-store`) and the tokio
+# networking/`fs`/`spawn` and `tokio-util` machinery, none of which build for
+# wasm32. They are compiled only off wasm; the modules that use them are gated
+# the same way (`backup` in lib.rs, `files` in import_export.rs).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 extenddb-backup-store = { workspace = true }
 tokio = { workspace = true }
