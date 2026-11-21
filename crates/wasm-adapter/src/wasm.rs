@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `wasm-bindgen` surface exposed to the browser app.
+//! The `wasm-bindgen` surface exposed to JavaScript.
 //!
 //! This module compiles only for `wasm32`. It is a thin wrapper over
 //! [`crate::runtime::Engine`]: it installs a panic hook (so a wasm panic
@@ -53,24 +53,37 @@ impl ExtendDb {
     /// body as a JSON string (`"{}"` when the operation takes no parameters).
     ///
     /// Errors are delivered as values, not rejections: an engine error, a
-    /// malformed body, or a request the browser build does not support resolves
-    /// the promise with a DynamoDB-shaped error document carrying a `__type`
-    /// member — the same JSON a real `DynamoDB` endpoint returns.
+    /// malformed body, a request the browser build does not support, or an
+    /// `operation` or `body` that is not a JavaScript string resolves the
+    /// promise with `ExtendDB`'s error document, a JSON object carrying a
+    /// `__type` member. Both arguments are taken as any JavaScript value and
+    /// checked here, so a number, `undefined` or an object answers a
+    /// `ValidationException` instead of reaching the engine. A string is
+    /// encoded to UTF-8 by the generated JavaScript glue's `TextEncoder`, which
+    /// replaces an unpaired surrogate with U+FFFD.
     ///
-    /// The promise never rejects. On `wasm32` a panic cannot unwind: it traps,
+    /// The promise does not reject. On `wasm32` a panic cannot unwind: it traps,
     /// and the trap throws out of the task that was running the request, so
     /// that request's promise stays **pending** (it neither resolves nor
     /// rejects). The instance is then in an undefined state: whatever the
     /// panicking request held when it stopped is never released, so a later
     /// call may answer, fail or hang. Reload the page to get a fresh instance.
     /// The panic hook writes the panic and its stack to `console.error` first.
-    pub fn submit(&self, operation: String, body: String) -> js_sys::Promise {
+    pub fn submit(&self, operation: &JsValue, body: &JsValue) -> js_sys::Promise {
+        // `as_string` is `Some` only for a JavaScript string. It copies the
+        // value into linear memory, so nothing below borrows a JS value.
+        let operation = operation.as_string();
+        let body = body.as_string();
         // Clone the cheap, Arc-backed engine into the future so it owns its
         // state and does not borrow `self` across the JS boundary (a borrowed
         // future would not be `'static`, which `future_to_promise` requires).
         let engine = self.engine.clone();
         wasm_bindgen_futures::future_to_promise(async move {
-            let response = engine.submit(&operation, &body).await;
+            let response = match (operation, body) {
+                (Some(operation), Some(body)) => engine.submit(&operation, &body).await,
+                (None, _) => Engine::non_string_argument("operation"),
+                (Some(_), None) => Engine::non_string_argument("body"),
+            };
             Ok(JsValue::from_str(&response))
         })
     }

@@ -15,7 +15,9 @@
 // pass, each build gave every case the error name and the checked members the
 // corpus asserts; members a case does not check are not compared. Before the
 // corpus, both runners judge the rows of `./runner-selftest.json` and fail if
-// any row's outcome differs from the one it records.
+// any row's outcome differs from the one it records. After the corpus, this
+// runner also calls `submit` with arguments that are not strings, which only a
+// JavaScript caller can pass, and expects a ValidationException for each.
 //
 // The module is loaded from `./pkg`, the `wasm-bindgen --target web` output
 // (built by the test harness before this runner is invoked).
@@ -266,6 +268,46 @@ for (const c of corpus.cases) {
     }
     assertCase(c, resp);
     save(c, resp, saved);
+}
+
+// ---- arguments that are not strings ---------------------------------------
+// JavaScript can pass any value to `submit`. Each call below must resolve with
+// a ValidationException error document naming the argument, and the instance
+// must keep serving afterwards. These live here rather than in corpus.json
+// because the native runner passes `&str` and cannot express them.
+
+const badArguments = [
+    ['a number operation', [123, '{}'], 'operation'],
+    ['an undefined operation and body', [undefined, undefined], 'operation'],
+    ['a null operation', [null, '{}'], 'operation'],
+    ['an object operation', [{ op: 'ListTables' }, '{}'], 'operation'],
+    ['a number body', ['ListTables', 7], 'body'],
+    ['an undefined body', ['ListTables', undefined], 'body'],
+    ['an object body', ['ListTables', {}], 'body'],
+];
+for (const [label, args, argument] of badArguments) {
+    checks += 1;
+    let resp;
+    try {
+        resp = JSON.parse(await db.submit(...args));
+    } catch (e) {
+        fail(`submit with ${label}: threw ${e.name}: ${e.message}`);
+        continue;
+    }
+    const why = judge({
+        name: `submit with ${label}`,
+        error: 'ValidationException',
+        checks: [{ path: '/message', equals: `${argument} must be a string` }],
+    }, resp);
+    if (why !== undefined) fail(why);
+}
+checks += 1;
+try {
+    const after = JSON.parse(await db.submit('ListTables', '{}'));
+    const why = judge({ name: 'ListTables after the bad arguments', error: null, checks: [{ path: '/TableNames', present: true }] }, after);
+    if (why !== undefined) fail(why);
+} catch (e) {
+    fail(`ListTables after the bad arguments: threw ${e.name}: ${e.message}`);
 }
 
 // ---- summary ---------------------------------------------------------------

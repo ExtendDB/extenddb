@@ -76,7 +76,7 @@ const SERVER_ADDR: &str = "";
 #[cfg(not(target_arch = "wasm32"))]
 const BACKUP_JOB_SLOTS: usize = 1;
 
-/// The in-process `ExtendDB` engine the browser app talks to.
+/// The in-process `ExtendDB` engine a JavaScript caller talks to.
 ///
 /// Holds the shared, per-process state the engine needs (storage backend,
 /// limits, identity, and — off wasm — the backup runtime). Cloning is cheap:
@@ -143,6 +143,19 @@ impl Engine {
             Err(err) => error_document(&err),
         };
         serde_json::to_string(&value).unwrap_or_else(|_| {
+            String::from_utf8_lossy(extenddb_core::error::SERIALIZATION_FAILURE_BODY).into_owned()
+        })
+    }
+
+    /// The response to a call whose `argument` (`"operation"` or `"body"`) is
+    /// not a string: a `ValidationException` error document, serialized as
+    /// [`Engine::submit`] serializes every answer. The `wasm-bindgen` surface
+    /// accepts any JavaScript value and answers with this instead of passing a
+    /// non-string into the engine.
+    #[must_use]
+    pub fn non_string_argument(argument: &str) -> String {
+        let err = DynamoDbError::ValidationException(format!("{argument} must be a string"));
+        serde_json::to_string(&error_document(&err)).unwrap_or_else(|_| {
             String::from_utf8_lossy(extenddb_core::error::SERIALIZATION_FAILURE_BODY).into_owned()
         })
     }
@@ -352,5 +365,21 @@ mod tests {
             !out.contains("ExtendDB WebAssembly build"),
             "a non-vector-create UpdateTable must pass through, not be refused: {out}"
         );
+    }
+
+    /// The answer to a non-string `submit` argument is a `ValidationException`
+    /// document that names the argument.
+    #[test]
+    fn a_non_string_argument_answers_a_validation_exception() {
+        for argument in ["operation", "body"] {
+            let out = Engine::non_string_argument(argument);
+            assert!(error_type(&out).ends_with("#ValidationException"), "{out}");
+            let value: Value = serde_json::from_str(&out).expect("response is JSON");
+            assert_eq!(
+                value["message"],
+                format!("{argument} must be a string"),
+                "{out}"
+            );
+        }
     }
 }
