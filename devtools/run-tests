@@ -130,8 +130,9 @@ Suites (at least one required):
                     needs wasm-pack, Node and the wasm-bindgen CLI of the
                     version of the wasm-bindgen crate in Cargo.lock, on PATH
                     or in wasm-pack's download cache (wasm-pack runs as the
-                    workflow runs it: it skips wasm-opt and downloads
-                    nothing), but no server/creds. Writes
+                    workflow runs it: it skips wasm-opt and downloads no tool,
+                    though it asks crates.io for its latest version), but no
+                    server/creds. Writes
                     discussions/test-headless-<hash>.txt
   --wasm-test       run the on-target wasm-bindgen-test suites (extenddb-core's,
                     for its crypto backend and limits::page_size, and the
@@ -605,11 +606,12 @@ fi
 # Builds the wasm-pack --target web module and runs the shared parity corpus
 # through it under Node, the same cases the native oracle test (the adapter's
 # tests/parity.rs) runs. wasm-pack runs with the workflow's flags: --no-opt
-# skips wasm-opt, which wasm-pack downloads when it has none, and --mode
-# no-install makes it take the wasm-bindgen of Cargo.lock's version from PATH
-# or from its download cache and download none. Standalone like --wasm: no
-# server, target flag or credentials. Placed after PASS=true for the same
-# reason.
+# skips wasm-opt, which wasm-pack downloads in its default install mode when
+# it has none, and --mode no-install makes it take the wasm-bindgen of
+# Cargo.lock's version from PATH or from its download cache and download
+# none. The workflow's corpus step says what else wasm-pack asks the network
+# for. Standalone like --wasm: no server, target flag or credentials. Placed
+# after PASS=true for the same reason.
 if $RUN_HEADLESS; then
     HEADLESS_OUTFILE="discussions/test-headless-${HASH}.txt"
     echo "=== wasm headless parity run → ${HEADLESS_OUTFILE} ==="

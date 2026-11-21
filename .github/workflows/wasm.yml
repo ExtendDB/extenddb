@@ -119,8 +119,9 @@ jobs:
       # seen (the file's header names the known case), nor is a call the
       # lists do not name. The headless parity corpus below is the runtime
       # check. CLIPPY_CONF_DIR is set on this step only, so native clippy
-      # keeps the repository's defaults. --lib keeps the host-only
-      # integration tests out of the wasm build.
+      # keeps the repository's defaults. --lib checks the adapter's library
+      # alone, which is also what cargo checks by default here: the adapter
+      # has no binary target, and tests are not a default target.
       - name: Clippy the wasm32 build
         env:
           CLIPPY_CONF_DIR: ${{ github.workspace }}/devtools/wasm-clippy
@@ -185,19 +186,28 @@ jobs:
       # with its assertions except where a case carries an `onWasm`
       # expectation.
       #
-      # wasm-pack downloads nothing here. Unless --no-opt is given, it runs
-      # wasm-opt over the module, and with no wasm-opt on PATH it first
-      # downloads binaryen (version_130) from GitHub releases without checking
-      # a checksum; the tool cache above does not keep that download, so it
-      # would come again on every run. The step skips wasm-opt rather than
-      # pin a checksum for it: wasm-opt is an optimizer (here it makes the
-      # module about a quarter smaller) and is not meant to change the answers
-      # the corpus checks. No step runs the corpus over wasm-opt's output,
-      # which is the module the README's build command produces.
-      # --mode no-install forbids wasm-pack to download or install
-      # wasm-bindgen: it uses the one installed above when that is the version
-      # in Cargo.lock, and otherwise stops, as its download cache is empty on
-      # a fresh runner.
+      # wasm-pack downloads no tool here. --no-opt skips wasm-opt. Without
+      # it, wasm-pack runs the wasm-opt on PATH or in its download cache, and,
+      # in its default install mode, when it has neither it first downloads
+      # binaryen version_130 from GitHub releases, which it does not check
+      # against a checksum. The step skips wasm-opt rather than pin a checksum
+      # for it: wasm-opt is an optimizer (here it makes the module about a
+      # quarter smaller) and is not meant to change the answers the corpus
+      # checks. No step runs the corpus over wasm-opt's output, which is the
+      # module the README's build command produces. --mode no-install forbids
+      # wasm-pack to download or install wasm-bindgen: it uses a wasm-bindgen
+      # of the version in Cargo.lock from PATH (the tool cache or the install
+      # step above puts one there) or from its download cache, and otherwise
+      # stops. wasm-pack would add the wasm32 target with rustup if the
+      # toolchain lacked it; the toolchain step installs it.
+      #
+      # wasm-pack does make one request of its own: at the start of every run
+      # it asks crates.io (https://crates.io/api/v1/crates/wasm-pack) for the
+      # latest wasm-pack version, unless the wasm-pack.stamp file it writes
+      # beside its binary after asking is less than 25 hours old. The tool
+      # cache above does not keep that file. The answer only decides whether
+      # wasm-pack ends with a warning; when the request fails, the warning is
+      # "failed to get wasm-pack version" and the build goes on.
       - name: Headless parity corpus under Node
         run: |
           wasm-pack build --target web --release --no-opt --mode no-install crates/wasm-adapter --out-dir parity/pkg
