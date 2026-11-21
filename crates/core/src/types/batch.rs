@@ -15,8 +15,10 @@ use super::capacity::{
 /// Per-table key set and options for `BatchGetItem`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct KeysAndAttributes {
+    /// `None` when the table value has no `Keys` or a null one, which the
+    /// handler refuses after the count checks.
     #[serde(rename = "Keys")]
-    pub keys: Vec<Item>,
+    pub keys: Option<Vec<Item>>,
     #[serde(rename = "ConsistentRead")]
     pub consistent_read: Option<bool>,
     #[serde(rename = "ProjectionExpression")]

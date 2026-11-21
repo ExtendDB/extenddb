@@ -438,3 +438,50 @@ def test_batch_type_fault_over_the_table_count(raw_client, operation, tables, od
         assert error["Message"] == "1 validation error detected: " + CLAUSE.format(
             "RequestItems", "less than or equal to 25"
         )
+
+
+# BatchGetItem table values by the suffix of each table name, within the table
+# count. DynamoDB refused each value with no Keys or a null Keys at its member
+# path, in one message, in table name order, not the order of the request. It
+# answered a SerializationException when another member of such a value is of
+# another JSON type (measured 2026-11-20 and 2026-11-21).
+NULL_KEYS = (
+    "Value null at 'requestItems.{}.member.keys' failed to satisfy constraint: "
+    "Member must not be null"
+)
+GET_KEYS = {"Keys": [{"pk": {"S": "k0"}}]}
+
+
+@pytest.mark.parametrize(
+    ("values", "named"),
+    [
+        pytest.param({"000": GET_KEYS, "001": {}}, ["001"], id="second_no_keys"),
+        pytest.param({"000": GET_KEYS, "001": {"Keys": None}}, ["001"], id="second_null"),
+        pytest.param({"000": {}}, ["000"], id="one_no_keys"),
+        pytest.param({"000": {"ProjectionExpression": "pk"}}, ["000"], id="projection_only"),
+        pytest.param({"000": {}, "001": {}}, ["000", "001"], id="two_no_keys"),
+        pytest.param(
+            {"000": {}, "001": GET_KEYS, "002": {"Keys": None}}, ["000", "002"], id="first_third"
+        ),
+        pytest.param({"002": {}, "000": {}, "001": GET_KEYS}, ["000", "002"], id="name_order"),
+        pytest.param({"zz": {}, "a": {}, "mmm": {}}, ["a", "mmm", "zz"], id="letter_order"),
+        pytest.param({"000": {"Keys": None, "ConsistentRead": "x"}}, None, id="string_read"),
+        pytest.param(
+            {"000": {"Keys": None, "ProjectionExpression": 5}}, None, id="number_projection"
+        ),
+    ],
+)
+def test_batch_get_table_without_keys(raw_client, values, named):
+    """A table value with no Keys list is refused at its member path."""
+    prefix = unique_name()
+    # The tables do not exist, as measured.
+    with pytest.raises(ClientError) as exc:
+        _raw_batch(raw_client, "BatchGetItem", {f"{prefix}-{s}": v for s, v in values.items()})
+    error = exc.value.response["Error"]
+    if named is None:
+        assert error["Code"] == "SerializationException"
+        return
+    assert error["Code"] == "ValidationException"
+    clauses = [NULL_KEYS.format(f"{prefix}-{s}") for s in named]
+    _assert_clauses(error["Message"], clauses)
+    assert error["Message"].endswith("; ".join(clauses))
