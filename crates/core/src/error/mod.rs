@@ -400,10 +400,11 @@ fn message_key(error: &DynamoDbError) -> &'static str {
 
 /// The `SerializationException` a malformed request body produces.
 ///
-/// Real DynamoDB validates request format before authentication and answers an
-/// unparseable JSON body with this exact message. Every entry point that parses
-/// a raw request body builds the error from this helper so a malformed request
-/// gets the same answer on every transport.
+/// Real DynamoDB validates request format before authentication. The message
+/// is `Start of structure or map found where not expected: ` followed by the
+/// `Display` text of the `serde_json` parse error. Every entry point that
+/// parses a raw request body builds the error from this helper so a malformed
+/// request gets the same answer on every transport.
 #[doc(hidden)]
 #[must_use]
 pub fn malformed_body_error(error: &serde_json::Error) -> DynamoDbError {
