@@ -60,7 +60,12 @@ aes-gcm = { version = "0.10", default-features = false, features = ["aes", "allo
 aes = { version = "0.8", features = ["zeroize"] }
 ghash = { version = "0.5", features = ["zeroize"] }
 polyval = { version = "0.6", features = ["zeroize"] }
-getrandom = { version = "0.3", features = ["wasm_js"] }
+# 0.3.4 is the lowest release this build compiles with: from 0.3.4 the
+# `wasm_js` feature alone selects the browser backend on
+# wasm32-unknown-unknown, where 0.3.0 to 0.3.3 also need
+# `--cfg getrandom_backend="wasm_js"` in RUSTFLAGS and fail to compile without
+# it (getrandom's CHANGELOG for 0.3.4).
+getrandom = { version = "0.3.4", features = ["wasm_js"] }
 # On wasm32 the `time` crate's `OffsetDateTime::now_utc()` reads the clock via
 # `std::time::SystemTime::now()`, which panics on wasm32-unknown-unknown. The
 # `wasm-bindgen` feature makes it read `js_sys::Date` instead. This feature
