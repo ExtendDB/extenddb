@@ -123,10 +123,11 @@ jobs:
       # does not resolve, or if the step above accepts a call to one, made
       # directly or through an import; the probes go into a copy of the
       # checkout. It also fails if a crate the wasm build compiles allows
-      # clippy::all, clippy::style or warnings, or the disallowed lints
-      # without a reason. Needs Python 3.11 or later (tomllib), as
-      # devtools/check-crate-packages does in test.yml's package job, which
-      # runs on the same runner.
+      # clippy::all, clippy::style or warnings (except on the `mod` line of a
+      # catalog migration's code-body module, which CONTRIBUTING.md declares
+      # that way), or the disallowed lints without a reason. Needs Python
+      # 3.11 or later (tomllib), as devtools/check-crate-packages does in
+      # test.yml's package job, which runs on the same runner.
       - name: Self-test the wasm32 clippy guard
         run: python3 devtools/check-wasm-clippy-guard
 
@@ -141,18 +142,22 @@ jobs:
       - name: Crypto wasm tests under Node
         run: cargo test --locked -p extenddb-core --lib --target wasm32-unknown-unknown
 
-      # The synchronous SQLite shim is the wasm backend; tests/wasm_shim.rs is
-      # one table with a row per shim rule (decoding, binding, multi-statement
-      # SQL, fetch, transactions, the pool, connect options), run on wasm32
-      # under Node. The same table runs natively against sqlx in the
-      # workspace `cargo test`, which checks its expected outcomes.
+      # The synchronous SQLite shim is the wasm backend. tests/wasm_shim.rs
+      # holds one table with a row per shim rule (decoding, binding,
+      # multi-statement SQL, fetch, transactions, the pool, the one location
+      # it opens, connection settings) and two tests of the backend whose
+      # answer depends on the target (an UpdateTable that creates a vector
+      # index, a Scan whose Limit is above u32::MAX), run on wasm32 under
+      # Node. The same tests run natively against sqlx in the workspace
+      # `cargo test`, which checks their expected outcomes.
       - name: SQLite shim wasm tests under Node
         run: cargo test --locked -p extenddb-storage-sqlite --test wasm_shim --target wasm32-unknown-unknown
 
       # Builds the browser module with wasm-bindgen and runs the shared parity
-      # corpus through it under Node: the same cases and assertions that the
-      # native test (crates/wasm-adapter/tests/parity.rs) runs against sqlx +
-      # the C SQLite.
+      # corpus through it under Node: the same cases as the native test
+      # (crates/wasm-adapter/tests/parity.rs, against sqlx and the C SQLite),
+      # with its assertions except where a case carries an `onWasm`
+      # expectation.
       - name: Headless parity corpus under Node
         run: |
           wasm-pack build --target web --release crates/wasm-adapter --out-dir parity/pkg
