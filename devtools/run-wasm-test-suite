@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Runs one of the wasm-bindgen-test suites of .github/workflows/wasm.yml and
+# fails unless the tests it exists to run ran and passed.
+#
+#   devtools/run-wasm-test-suite core|shim
+#
+#   core  extenddb-core's wasm32 unit tests (cargo test -p extenddb-core --lib)
+#   shim  the SQLite shim's tests (cargo test -p extenddb-storage-sqlite
+#         --test wasm_shim)
+#
+# `cargo test` exits 0 when a test binary holds no test: it prints "no tests to
+# run!" when every case lost its `wasm_bindgen_test` attribute, and passes
+# with the rest when some did. So besides cargo's exit status this script
+# requires the run's one "test result:" line to report no failure and at least
+# the suite's minimum number of passed tests, and requires each test the suite
+# names below to be reported "ok". A change that adds tests to a suite can
+# raise its minimum; one that removes or renames a counted or named test
+# changes the minimum or the name here with it.
+#
+# The workflow and `devtools/run-tests --wasm-test` both run the suites through
+# this script, so the expectations exist once. The caller sets
+# CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER to wasm-bindgen-test-runner (of the
+# version of the wasm-bindgen crate in Cargo.lock), which runs each test module
+# under the `node` on PATH. The script runs the cargo on PATH.
+
+set -euo pipefail
+
+usage() {
+    echo "usage: devtools/run-wasm-test-suite core|shim" >&2
+    exit 2
+}
+
+[ $# -eq 1 ] || usage
+case "$1" in
+    core)
+        args=(-p extenddb-core --lib)
+        # The nine cases of the crypto backend (src/crypto.rs) and the test of
+        # limits::page_size (src/limits/mod.rs). No one of them holds the
+        # others' cases, as the shim's table does, so the count is the check.
+        minimum=10
+        required=()
+        ;;
+    shim)
+        args=(-p extenddb-storage-sqlite --test wasm_shim)
+        # The table of the shim's rules and the two tests that drive the
+        # backend. The table holds every rule, so it is also named.
+        minimum=3
+        required=(each_row_gives_its_expected_outcome)
+        ;;
+    *)
+        usage
+        ;;
+esac
+suite="$1"
+
+if [ -z "${CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER:-}" ]; then
+    echo "error: set CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER to wasm-bindgen-test-runner (the wasm-bindgen-cli of the version of the wasm-bindgen crate in Cargo.lock)" >&2
+    exit 2
+fi
+
+cd "$(dirname "$0")/.."
+log="$(mktemp "${TMPDIR:-/tmp}/run-wasm-test-suite.XXXXXX")"
+trap 'rm -f "$log"' EXIT
+
+echo "+ cargo test --locked ${args[*]} --target wasm32-unknown-unknown"
+status=0
+cargo test --locked "${args[@]}" --target wasm32-unknown-unknown 2>&1 | tee "$log" || status=$?
+
+# The runner's lines, without any colour escapes, for the checks below.
+esc=$'\033'
+sed -i "s/${esc}\[[0-9;]*m//g" "$log"
+
+problems=()
+if [ "$status" -ne 0 ]; then
+    problems+=("cargo test exited with status ${status}")
+fi
+results="$(grep -c '^test result: ' "$log" || true)"
+if [ "$results" -ne 1 ]; then
+    problems+=("expected one 'test result:' line, found ${results}")
+else
+    passed="$(sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed; 0 failed;.*$/\1/p' "$log")"
+    if [ -z "$passed" ]; then
+        problems+=("the run did not pass: $(grep '^test result: ' "$log")")
+    elif [ "$passed" -lt "$minimum" ]; then
+        problems+=("${passed} tests passed; the ${suite} suite has at least ${minimum}")
+    fi
+fi
+for name in ${required[@]+"${required[@]}"}; do
+    if ! grep -qxF "test ${name} ... ok" "$log"; then
+        problems+=("the test ${name} was not reported ok")
+    fi
+done
+
+if [ ${#problems[@]} -ne 0 ]; then
+    for problem in "${problems[@]}"; do
+        echo "error: ${suite} suite: ${problem}" >&2
+    done
+    exit 1
+fi
+echo "${suite} suite: ${passed} tests passed (at least ${minimum})${required[0]:+, including ${required[*]}}"

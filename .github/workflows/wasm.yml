@@ -145,8 +145,15 @@ jobs:
       # native test (known vectors, constant-time equality, random fill, and
       # seal/open round trips, refusals and sealed vectors), and the test of
       # limits::page_size, which on wasm32 runs with a 32-bit usize.
+      #
+      # This step and the next run `cargo test` through
+      # devtools/run-wasm-test-suite, because `cargo test` exits 0 when a
+      # test binary holds no test: if the cases lost their wasm_bindgen_test
+      # attributes, the step would pass with nothing run. The script fails
+      # unless the run passed at least the suite's number of tests, and, for
+      # the shim, its table test.
       - name: Core wasm tests under Node
-        run: cargo test --locked -p extenddb-core --lib --target wasm32-unknown-unknown
+        run: devtools/run-wasm-test-suite core
 
       # The synchronous SQLite shim is the wasm backend. tests/wasm_shim.rs
       # holds one table with a row per shim rule (decoding, binding,
@@ -159,7 +166,7 @@ jobs:
       # natively against sqlx in the workspace `cargo test`, which checks
       # their expected outcomes.
       - name: SQLite shim wasm tests under Node
-        run: cargo test --locked -p extenddb-storage-sqlite --test wasm_shim --target wasm32-unknown-unknown
+        run: devtools/run-wasm-test-suite shim
 
       # Builds the browser module with wasm-bindgen and runs the shared parity
       # corpus through it under Node: the same cases as the native test

@@ -697,16 +697,14 @@ if $RUN_WASM_TEST; then
         WASM_TEST_RC=1
     else
         echo "runner:    ${WASM_TEST_RUNNER}" | tee -a "$WASM_TEST_OUTFILE"
-        for suite in \
-            "crypto|-p extenddb-core --lib" \
-            "shim|-p extenddb-storage-sqlite --test wasm_shim"; do
-            suite_name="${suite%%|*}"
-            suite_args="${suite#*|}"
-            echo "--- ${suite_name} (cargo test ${suite_args} --target wasm32-unknown-unknown) ---" | tee -a "$WASM_TEST_OUTFILE"
-            # shellcheck disable=SC2086
+        # The suites run through devtools/run-wasm-test-suite, as the workflow
+        # runs them: it fails a suite whose run passed fewer tests than the
+        # suite has, or not the shim's table test, where a bare `cargo test`
+        # exits 0.
+        for suite in core shim; do
+            echo "--- ${suite} (devtools/run-wasm-test-suite ${suite}) ---" | tee -a "$WASM_TEST_OUTFILE"
             if ! CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="$WASM_TEST_RUNNER" \
-                cargo test --locked $suite_args --target wasm32-unknown-unknown \
-                2>&1 | tee -a "$WASM_TEST_OUTFILE"; then
+                devtools/run-wasm-test-suite "$suite" 2>&1 | tee -a "$WASM_TEST_OUTFILE"; then
                 WASM_TEST_RC=1
             fi
         done
