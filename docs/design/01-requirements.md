@@ -108,8 +108,9 @@ Error responses must be byte-for-byte compatible with DynamoDB:
 | `AccessDeniedException` | 400 | IAM policy denies the action |
 | `ConditionalCheckFailedException` | 400 | Condition expression evaluates to false |
 | `IdempotentParameterMismatchException` | 400 | TransactWriteItems with same client token but different params |
-| `IncompleteSignature` | 400 | SigV4 Authorization header is malformed |
+| `IncompleteSignatureException` | 400 | SigV4 Authorization header is malformed |
 | `InternalServerError` | 500 | Unhandled server error |
+| `InvalidSignatureException` | 400 | SigV4 signature or credential scope does not match the request |
 | `ItemCollectionSizeLimitExceededException` | 400 | Item collection exceeds 10 GB (tables with LSIs) |
 | `MalformedHttpRequestException` | 400 | Request body cannot be decompressed or parsed |
 | `MissingAuthenticationToken` | 403 | No Authorization header present |
@@ -126,7 +127,7 @@ Error responses must be byte-for-byte compatible with DynamoDB:
 | `TransactionConflictException` | 400 | Concurrent transaction conflict on same item |
 | `TransactionInProgressException` | 400 | Transaction with same client token already in progress |
 | `UnknownOperationException` | 400 | Unrecognized operation in X-Amz-Target |
-| `UnrecognizedClientException` | 400 | Invalid access key or signature mismatch |
+| `UnrecognizedClientException` | 400 | Invalid access key or security token |
 | `ValidationException` | 400 | Input validation failure (bad table name, missing required field, etc.) |
 
 ## 3. Functional Requirements — Operations

@@ -1255,7 +1255,7 @@ On PostgreSQL, SQLite, Cassandra and MongoDB, `serve` reads the catalog's migrat
 
 The access key ID is not found. Verify the key exists with `list-access-keys`.
 
-**SignatureDoesNotMatch:**
+**InvalidSignatureException:**
 
 The secret key does not match. Re-create the access key.
 
