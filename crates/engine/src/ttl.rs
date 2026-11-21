@@ -147,23 +147,19 @@ pub async fn handle_update_time_to_live(
             let account_id = ctx.account_id.clone();
             let table_name = input.table_name.clone();
             let attr = input.time_to_live_specification.attribute_name.clone();
-            let backfill = async move {
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "reached only when the backend reports Enabling; the SQLite backend, \
+                          the only one in the wasm build, reports Enabled or Disabled"
+            )]
+            tokio::spawn(async move {
                 if let Err(e) = storage
                     .create_ttl_index(&account_id, &table_name, &attr)
                     .await
                 {
                     tracing::warn!("TTL queue backfill deferred for {table_name}: {e}");
                 }
-            };
-            // Off wasm the backfill is detached so the API call returns while a
-            // large table is indexed. The wasm build has no background runtime;
-            // the in-memory backend it runs reports Enabled rather than
-            // Enabling, so this branch is not reached there, but awaiting the
-            // backfill keeps it correct without a spawn that would need one.
-            #[cfg(not(target_arch = "wasm32"))]
-            tokio::spawn(backfill);
-            #[cfg(target_arch = "wasm32")]
-            backfill.await;
+            });
         } else if let Err(e) = ctx
             .storage
             .create_ttl_index(
