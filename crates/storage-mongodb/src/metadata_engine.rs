@@ -18,6 +18,7 @@ use extenddb_storage::error::StorageError;
 
 use crate::MongoEngine;
 use crate::data::{data_collection_name, document_to_item};
+use extenddb_storage::util::escape_control;
 
 fn extract_id_fields(doc: &Document) -> (String, String) {
     let id = doc.get_document("_id").ok();
@@ -35,13 +36,15 @@ fn extract_id_fields(doc: &Document) -> (String, String) {
 /// Build the expression that reads a DynamoDB attribute from `item_data` as a
 /// literal field name. MongoDB normally interprets dots in a query field path
 /// as nested-document traversal, but DynamoDB permits dots in attribute names.
+/// The stored field name is the escaped form of the attribute name (see
+/// `extenddb_storage::util::escape_control`), so the lookup targets that form.
 fn literal_ttl_value_expression(ttl_attribute: &str) -> Document {
     doc! {
         "$getField": {
             "field": "N",
             "input": {
                 "$getField": {
-                    "field": ttl_attribute,
+                    "field": escape_control(ttl_attribute).as_ref(),
                     "input": "$item_data",
                 }
             }
@@ -69,7 +72,7 @@ fn literal_ttl_epoch_expression(ttl_attribute: &str) -> Document {
 /// also performs the expiry comparison in MongoDB, so non-expired low-`_id`
 /// documents cannot starve expired documents later in the collection.
 fn ttl_candidate_query(ttl_attribute: &str, now_epoch: i64) -> (Document, Document) {
-    let ttl_field = format!("item_data.{ttl_attribute}.N");
+    let ttl_field = format!("item_data.{}.N", escape_control(ttl_attribute));
     if ttl_attribute.contains('.') {
         let ttl_epoch = literal_ttl_epoch_expression(ttl_attribute);
         (
@@ -374,8 +377,12 @@ impl MetadataEngine for MongoEngine {
             let coll_name = data_collection_name(table_id);
             let data_coll = self.data_db.collection::<Document>(&coll_name);
 
-            let index_name = format!("idx_ttl_{ttl_attribute}");
-            let index_key = format!("item_data.{ttl_attribute}.N");
+            // The stored field name is the escaped attribute name, and the
+            // escape also keeps U+0000 out of the index name. Names without
+            // U+0000 or U+0001 escape to themselves, so existing index names
+            // do not change.
+            let index_name = format!("idx_ttl_{}", escape_control(&ttl_attribute));
+            let index_key = format!("item_data.{}.N", escape_control(&ttl_attribute));
 
             let index = IndexModel::builder()
                 .keys(doc! { &index_key: 1 })
@@ -433,7 +440,9 @@ impl MetadataEngine for MongoEngine {
                 .get_str("table_id")
                 .map_err(|_| StorageError::Internal("missing table_id".to_string()))?;
 
-            let index_name = format!("idx_ttl_{ttl_attribute}");
+            // Same escaped form as create_ttl_index so the drop targets the
+            // index that was created.
+            let index_name = format!("idx_ttl_{}", escape_control(&ttl_attribute));
 
             let coll_name = data_collection_name(table_id);
             let data_coll = self.data_db.collection::<Document>(&coll_name);
@@ -513,9 +522,11 @@ impl MetadataEngine for MongoEngine {
                 if items.len() >= limit {
                     break;
                 }
-                // Parse the TTL value and check if expired
+                // Parse the TTL value and check if expired. The stored field
+                // name is the escaped attribute name.
                 if let Ok(item_data) = doc.get_document("item_data")
-                    && let Ok(ttl_obj) = item_data.get_document(&ttl_attribute)
+                    && let Ok(ttl_obj) =
+                        item_data.get_document(escape_control(&ttl_attribute).as_ref())
                     && let Ok(n_str) = ttl_obj.get_str("N")
                     && let Ok(ttl_val) = n_str.parse::<i64>()
                     && ttl_val >= 1

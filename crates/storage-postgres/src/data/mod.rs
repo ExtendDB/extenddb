@@ -10,6 +10,8 @@
 use extenddb_core::types::{AttributeDefinition, Item, KeySchemaElement, ScalarAttributeType};
 use extenddb_storage::error::StorageError;
 
+use crate::catalog_json::{from_catalog_json, to_catalog_json};
+
 /// SQL table name for a Virtual `DynamoDB` table.
 ///
 /// Uses `_ddb_` prefix to avoid collisions with catalog metadata tables.
@@ -63,8 +65,22 @@ pub(crate) fn all_sort_key_info<'a>(
 }
 
 /// Deserialize an `item_data` JSONB value into an `Item`.
+///
+/// Reverses [`item_to_json`]: every string in the stored tree is unescaped
+/// before deserialization, so an item written with U+0000 anywhere in it comes
+/// back byte-identical.
 pub(crate) fn json_to_item(v: serde_json::Value) -> Result<Item, StorageError> {
-    serde_json::from_value(v).map_err(|e| StorageError::Internal(e.to_string()))
+    from_catalog_json(v)
+}
+
+/// Serialize an `Item` for an `item_data` JSONB column.
+///
+/// PostgreSQL `jsonb` rejects the `\u0000` escape, so every string in the tree
+/// (attribute names, map keys, string values) goes through the order-preserving
+/// escape from `extenddb_storage::util` before it reaches the column. Items
+/// without U+0000 or U+0001 serialize to exactly what they did before.
+pub(crate) fn item_to_json(item: &Item) -> Result<serde_json::Value, StorageError> {
+    to_catalog_json(item)
 }
 
 /// Bind a `SortKeyValue` to a positional parameter in a sqlx query and execute it.
@@ -137,6 +153,7 @@ mod ddl;
 mod delete_item;
 pub(crate) mod gsi_build;
 pub(crate) mod index;
+pub(crate) mod key_text;
 mod put_item;
 mod query;
 mod query_scan;

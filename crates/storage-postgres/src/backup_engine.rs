@@ -31,8 +31,7 @@ use extenddb_storage::backup_definition::{
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{
-    SortKeyValue, backup_arn, backup_id_epoch_millis, composite_pk_to_text, new_backup_id,
-    parse_sk, sk_column_n,
+    SortKeyValue, backup_arn, backup_id_epoch_millis, new_backup_id, sk_column_n,
 };
 use extenddb_storage::{BackupRestoreSource, JobPermit, LegacyBackupReader, RestoreRequest};
 use futures::future::BoxFuture;
@@ -40,9 +39,10 @@ use futures::future::BoxFuture;
 use crate::PostgresEngine;
 use crate::catalog_json::{escape_json, from_catalog_json, to_catalog_json, unescape_json};
 use crate::create_table::{RestoreRegistration, RestoreSource};
+use crate::data::key_text::{composite_pk_to_text, parse_sk};
 use crate::data::{
     all_sort_key_info, data_table_name, index_table_name, insert_index_rows_multi,
-    item_has_index_keys, project_item_for_index, table_storage_relations,
+    item_has_index_keys, json_to_item, project_item_for_index, table_storage_relations,
 };
 
 /// Convert a `PostgreSQL` `TIMESTAMPTZ` to epoch seconds as `f64`, keeping the
@@ -776,8 +776,14 @@ impl PostgresEngine {
         let mut batch_bytes: usize = 0;
         let mut item_count: i64 = 0;
         while let Some(item_json) = rows.try_next().await.map_err(db_err)? {
-            let item: Item = serde_json::from_str(&item_json)
-                .map_err(|e| StorageError::Internal(format!("Parse backup item: {e}")))?;
+            // The stored text carries the control-character escape; it is
+            // copied into the target's `item_data` as it is, and decoded here
+            // so that the key columns and index rows derived from it are
+            // escaped exactly once by the same helpers the write path uses.
+            let item = json_to_item(
+                serde_json::from_str(&item_json)
+                    .map_err(|e| StorageError::Internal(format!("Parse backup item: {e}")))?,
+            )?;
             // The parsed item is kept for its keys and index projections; the
             // budget counts its stored text, which bounds both forms.
             batch_bytes += item_json.len();
@@ -1491,8 +1497,10 @@ impl LegacyBackupReader for PostgresEngine {
                     let mut rows =
                         sqlx::query_as::<_, (String, String)>(&select_sql).fetch(&mut *snapshot);
                     while let Some((pk, data)) = rows.try_next().await.map_err(db_err)? {
-                        let item: Item = serde_json::from_str(&data)
-                            .map_err(|e| StorageError::Internal(format!("Parse item: {e}")))?;
+                        let item =
+                            json_to_item(serde_json::from_str(&data).map_err(|e| {
+                                StorageError::Internal(format!("Parse item: {e}"))
+                            })?)?;
                         let item_bytes = extenddb_core::types::item_size_bytes(&item);
                         drop(item);
                         size += i64::try_from(item_bytes).unwrap_or(i64::MAX);
@@ -2229,8 +2237,10 @@ async fn send_legacy_items(
         loop {
             match rows.try_next().await {
                 Ok(Some(item_json)) => {
-                    let item = serde_json::from_str::<Item>(&item_json)
-                        .map_err(|e| StorageError::Internal(format!("Parse backup item: {e}")));
+                    // The stored form carries the escape of `data::item_to_json`.
+                    let item = serde_json::from_str(&item_json)
+                        .map_err(|e| StorageError::Internal(format!("Parse backup item: {e}")))
+                        .and_then(json_to_item);
                     let parsed = item.is_ok();
                     if sender.send(item).await.is_err() || !parsed {
                         break None;

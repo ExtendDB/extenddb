@@ -521,6 +521,51 @@ async fn legacy_collation_table_streams_unordered_and_complete(shared: bool) {
 }
 on_both_layouts!(legacy_collation_table_streams_unordered_and_complete);
 
+/// An item with U+0000 in an attribute name and U+0001 in a value is stored
+/// through the escape (`data::item_to_json`), and the stream yields it as it
+/// was written, not in its stored form.
+#[tokio::test]
+async fn an_item_with_control_characters_streams_as_written() {
+    use extenddb_core::expression::ExpressionMaps;
+    use extenddb_core::types::{AttributeValue, Item};
+    use extenddb_storage::DataEngine;
+    use futures::StreamExt;
+    if base_conn().is_none() {
+        eprintln!("SKIP an_item_with_control_characters_streams_as_written: no PostgreSQL");
+        return;
+    }
+    let s = scratch().await;
+    create_active(&s, plain_input("control")).await;
+    let item: Item = [
+        ("pk".to_owned(), AttributeValue::S("p".to_owned())),
+        (
+            "a\u{0}b".to_owned(),
+            AttributeValue::S("v\u{1}w".to_owned()),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let ki = key_info(&s, "control").await;
+    s.engine
+        .put_item(
+            &ki,
+            item.clone(),
+            false,
+            None,
+            &ExpressionMaps::default(),
+            None,
+        )
+        .await
+        .expect("put");
+    let snapshot = s
+        .engine
+        .open_table_snapshot(ACCOUNT, "control")
+        .await
+        .expect("open");
+    let streamed: Vec<Item> = snapshot.items.map(|r| r.expect("item")).collect().await;
+    assert_eq!(streamed, vec![item]);
+}
+
 /// The snapshot bound is half the pool, with a separate data database or one
 /// shared pool: five snapshots holding their data connections on a
 /// ten-connection pool, the sixth open refused at once with `LimitExceeded`,

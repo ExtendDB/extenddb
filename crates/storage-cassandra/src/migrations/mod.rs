@@ -313,6 +313,10 @@ pub fn migration(id: MigrationId) -> Migration<CassandraStores> {
             "access_key_id is the primary key of access_keys, and an import writes with IF NOT \
              EXISTS, so an ID can be stored once",
         ),
+        MigrationId::EscapeControlChars => Migration::NotApplicable(
+            "Cassandra stores U+0000 in strings as written, so its stored form of strings does \
+             not change",
+        ),
     }
 }
 

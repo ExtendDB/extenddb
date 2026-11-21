@@ -265,6 +265,10 @@ pub fn migration(id: MigrationId) -> Migration<SqliteStores> {
         MigrationId::UniqueAccessKeyIds => Migration::NotApplicable(
             "access_key_id is the primary key of access_keys, so an ID can be stored once",
         ),
+        MigrationId::EscapeControlChars => Migration::NotApplicable(
+            "SQLite stores U+0000 in strings as written, so its stored form of strings does not \
+             change",
+        ),
     }
 }
 

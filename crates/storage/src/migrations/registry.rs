@@ -112,6 +112,10 @@ migration_ids! {
     /// import stored a second key under an ID that a key already had.
     UniqueAccessKeyIds = 12, "unique_access_key_ids",
         "make every access key ID unique, which the MongoDB catalog did not enforce";
+    /// Re-encodes the strings a PostgreSQL store holds from an earlier
+    /// release into the escape that stores U+0000 (#364).
+    EscapeControlChars = 13, "escape_control_chars",
+        "re-encode the strings PostgreSQL stores so that they can hold U+0000";
 }
 
 /// Highest id that has shipped in a release. Bodies at or below it are frozen:

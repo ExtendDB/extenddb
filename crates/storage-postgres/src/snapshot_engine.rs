@@ -928,8 +928,7 @@ async fn fetch_page(
         }
         let data: String = row.try_get("item").map_err(|e| db_err(&e))?;
         drop(row);
-        let item = serde_json::from_str::<Item>(&data)
-            .map_err(|e| StorageError::Internal(format!("Parse item: {e}")))?;
+        let item = decode_row(&data)?;
         page.row_bytes.push(data.len());
         drop(data);
         page.items.push(item);
@@ -1072,6 +1071,16 @@ fn keyset_stream(
             }
         },
     ))
+}
+
+/// One cursor row, `item_data::text`, as the item it stores. `item_data` holds
+/// every string through the escape of U+0000 and U+0001 (`data::item_to_json`),
+/// so the row is decoded by `data::json_to_item`, as every other reader of the
+/// column decodes it.
+fn decode_row(data: &str) -> Result<Item, StorageError> {
+    let value: serde_json::Value = serde_json::from_str(data)
+        .map_err(|e| StorageError::Internal(format!("Parse item: {e}")))?;
+    crate::data::json_to_item(value)
 }
 
 /// Two SQLSTATEs mean the server discarded the snapshot's rows before the
@@ -1228,5 +1237,24 @@ mod tests {
             after.contains("> ($1::text, $2::bytea, $3::text) ORDER BY t.pk COLLATE \"C\", t.sk_b, t.sk2_s COLLATE \"C\" LIMIT $4"),
             "{after}"
         );
+    }
+
+    #[test]
+    fn a_row_decodes_to_the_item_it_stores() {
+        use extenddb_core::types::AttributeValue;
+
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "m\u{1}".to_owned(),
+            AttributeValue::S("\u{1}\u{2}".to_owned()),
+        );
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::S("a\u{0}b".to_owned()));
+        item.insert("k\u{0}".to_owned(), AttributeValue::M(map));
+        let stored = crate::data::item_to_json(&item)
+            .expect("stored form")
+            .to_string();
+        assert!(!stored.contains("\\u0000"), "{stored}");
+        assert_eq!(decode_row(&stored).expect("decode"), item);
     }
 }

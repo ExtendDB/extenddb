@@ -11,8 +11,8 @@
 //! the name would find no such attribute on the items, and the index would
 //! stay empty. A second GSI is keyed on a U+0000 name that the items do not
 //! carry, so every write with a delay stores a context that holds U+0000.
-//! An item attribute name that holds U+0000 is item data, which the PostgreSQL
-//! item columns cannot hold yet, so no item here carries one.
+//! The item columns store `item_data` through the same escape, so the test
+//! reads the names of each index row through `unescape_json_strings`.
 //!
 //! See `catalog_nul_support` for the database these tests need.
 
@@ -113,8 +113,9 @@ async fn index_rows(s: &Scratch, index_id: &str) -> Vec<Vec<String>> {
             .await
             .expect("read an index table");
     let mut out: Vec<Vec<String>> = rows
-        .iter()
+        .into_iter()
         .map(|row| {
+            let row = extenddb_storage::util::unescape_json_strings(row);
             let mut names: Vec<String> =
                 row.as_object().expect("an item").keys().cloned().collect();
             names.sort();

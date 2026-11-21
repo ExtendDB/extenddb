@@ -15,6 +15,7 @@ use std::fmt::Write as _;
 use extenddb_core::backup_format::BackupArn;
 use extenddb_core::types::{CreateTableInput, DescribeTableInput};
 use extenddb_storage::migrations::{CatalogStatus, MigrationId, Runner};
+use extenddb_storage::util::{escape_json_strings, unescape_json_strings};
 use extenddb_storage::{BackupCatalog, LegacyBackupReader, TableEngine};
 use extenddb_storage_postgres::migrations::PostgresMigrations;
 use extenddb_storage_postgres::{PostgresConfig, PostgresEngine};
@@ -333,6 +334,37 @@ async fn migration_11_rewrites_the_raw_names_of_every_document_that_carries_them
     );
     drop(engine);
     catalog.close().await;
+    data.close().await;
+}
+
+/// Migrations 11 and 13 in one run on the queued index update that a release
+/// before them wrote, with U+0001 in the names of its index context and of
+/// its item image: migration 11 escapes the context and migration 13 the
+/// image, each once, so both read back as that release wrote them.
+#[tokio::test]
+async fn migrations_11_and_13_escape_a_queued_index_update_once() {
+    let Some(base) = base_conn() else {
+        return skip("migrations 11 and 13 on a queued index update");
+    };
+    let s = Scratch::new(&base, "pgm_g1113").await;
+    s.load("0.1.14").await;
+    s.migrate_through(MigrationId::DropContinuousBackups).await;
+    let (catalog, data) = (s.catalog().await, s.data().await);
+    seed_raw_names(&catalog, &data).await;
+    let queued = "SELECT new_item, index_context FROM gsi_pending";
+    let (raw_item, raw_context): (serde_json::Value, serde_json::Value) =
+        sqlx::query_as(queued).fetch_one(&data).await.unwrap();
+    catalog.close().await;
+    data.close().await;
+    s.migrate_through(MigrationId::EscapeControlChars).await;
+
+    let data = s.data().await;
+    let (item, context): (serde_json::Value, serde_json::Value) =
+        sqlx::query_as(queued).fetch_one(&data).await.unwrap();
+    assert_eq!(context, escape_json_strings(raw_context.clone()));
+    assert_eq!(item, escape_json_strings(raw_item.clone()));
+    assert_eq!(unescape_json_strings(context), raw_context);
+    assert_eq!(unescape_json_strings(item), raw_item);
     data.close().await;
 }
 

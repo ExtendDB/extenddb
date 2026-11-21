@@ -14,11 +14,12 @@
 //! compare the names that `DescribeBackup` and `DescribeTable` return with
 //! the names of the source table, byte for byte.
 //!
-//! An item attribute name that holds U+0000 is item data, which the
-//! PostgreSQL item columns cannot hold yet. So the table whose key schema
-//! holds U+0000 has no items, and the items of the other table carry names
-//! that hold U+0001 only. See `catalog_nul_support` for the database these
-//! tests need.
+//! The item columns store an attribute name that holds U+0000 through the
+//! escape of `extenddb_storage::util`, and `restore_job/control_chars.rs`
+//! loads such an item. These tests check the catalog documents: the table
+//! whose key schema holds U+0000 has no items, and the items of the other
+//! table carry names that hold U+0001 only. See `catalog_nul_support` for the
+//! database these tests need.
 
 mod catalog_nul_support;
 

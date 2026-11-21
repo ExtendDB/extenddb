@@ -12,7 +12,7 @@
 
 use extenddb_core::types::StreamRecord;
 use extenddb_storage::error::StorageError;
-use mongodb::bson::{self, Document};
+use mongodb::bson::Document;
 
 /// The records in `docs`, in order. A document whose `has_record` is false
 /// carries none. One whose `has_record` is true must carry `record_data`.
@@ -23,8 +23,9 @@ pub(crate) fn records_from_docs(docs: Vec<Document>) -> Result<Vec<StreamRecord>
             let record_bson = d
                 .remove("record_data")
                 .ok_or_else(|| StorageError::Internal("Missing record_data".to_owned()))?;
-            let json_val: serde_json::Value =
-                bson::from_bson(record_bson).map_err(|e| StorageError::Internal(e.to_string()))?;
+            // Reverses the object-key escape applied when the record was
+            // written; see json_to_item_data.
+            let json_val = crate::data::item_data_to_json(&record_bson)?;
             serde_json::from_value(json_val).map_err(|e| StorageError::Internal(e.to_string()))
         })
         .collect()

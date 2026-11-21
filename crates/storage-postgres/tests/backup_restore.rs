@@ -2730,6 +2730,11 @@ async fn a_definition_read_that_loses_its_connection_is_transient() {
     s.cleanup().await;
 }
 
+// --- U+0000 and U+0001 in restored keys, indexes and items ----------------------
+
+#[path = "backup_restore/control_chars.rs"]
+mod control_chars;
+
 // --- the catalog index -----------------------------------------------------------
 
 /// A catalog row for a backup of `table` in `account` minted now, with the

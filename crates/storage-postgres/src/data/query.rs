@@ -12,7 +12,9 @@ use extenddb_core::types::{
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::SortKeyValue;
-use extenddb_storage::util::{parse_sk, pk_to_text, sk_info};
+use extenddb_storage::util::sk_info;
+
+use super::key_text::{parse_sk, pk_to_text};
 
 /// Extra pagination bind values for index queries.
 ///
