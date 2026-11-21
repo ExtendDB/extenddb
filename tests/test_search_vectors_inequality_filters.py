@@ -8,10 +8,11 @@ For an account the grammar is enabled for, a search condition takes ``<>``,
 ``attribute_exists`` and ``attribute_not_exists``, and more than one
 condition on an attribute, up to 50 conditions.
 
-None of the expected responses here has been measured against the live
-service yet. Each one is a prediction of the service's answer, and a live run
-on an enabled account confirms or corrects it before these tests are relied
-on.
+The number comparisons in ``TestEvaluation`` and every case in
+``TestExpressionMaps`` were measured against the live service on 2026-11-21 in
+eu-north-1, on an account with the extended grammar, each request twice with
+the same answer. The other expected responses are predictions of the
+service's answer.
 
 Against ExtendDB the module turns the grammar on for every account through the
 management API, as the admin in ``EXTENDDB_ADMIN_USER`` and
@@ -195,8 +196,9 @@ def _search(table: str, expr: str, top_k: int = 100, names=None) -> requests.Res
         "SearchVector": [{"N": "1"}, {"N": "0"}, {"N": "0"}, {"N": "0"}],
         "TopK": top_k,
         "SearchConditionExpression": expr,
-        "ExpressionAttributeValues": {k: v for k, v in VALUES.items() if k in used},
     }
+    if used:
+        body["ExpressionAttributeValues"] = {k: v for k, v in VALUES.items() if k in used}
     if names:
         body["ExpressionAttributeNames"] = names
     return _signed_post("SearchVectors", body)
@@ -319,7 +321,8 @@ class TestOperators:
 
 
 class TestEvaluation:
-    """Not yet measured: a missing attribute, ``1E2`` against ``100``, 38 digits."""
+    """Measured: numbers compare as the nearest binary64 value of each side, so the
+    two 38-digit Prices are equal. Not yet measured: a missing attribute."""
 
     def test_a_missing_attribute_under_not_equal_and_not(self, grammar_table):
         assert "i4" in _ids(_search(grammar_table, H + "Price <> :p10"))
@@ -331,9 +334,11 @@ class TestEvaluation:
         assert _ids(_search(grammar_table, H + "attribute_not_exists(Price)")) == {"i4"}
         assert _ids(_search(grammar_table, H + "attribute_exists(Price)")) == US - {"i4"}
 
-    def test_numbers_compare_as_decimals(self, grammar_table):
+    def test_numbers_compare_as_binary64(self, grammar_table):
         assert _ids(_search(grammar_table, H + "Price = :p100")) == {"i6", "i7"}
-        assert _ids(_search(grammar_table, H + "Price > :big")) == {"i9"}
+        assert _ids(_search(grammar_table, H + "Price > :big")) == set()
+        assert _ids(_search(grammar_table, H + "Price >= :big")) == {"i9"}
+        assert _ids(_search(grammar_table, H + "Price = :big")) == {"i9"}
         assert _ids(_search(grammar_table, H + "Price < :p0")) == {"i5"}
         assert _ids(_search(grammar_table, H + "Price > :p0 AND Price < :p5")) == {"i10"}
 
@@ -442,6 +447,102 @@ class TestRefusals:
             _search(grammar_table, H + " AND ".join([*conditions, "Price > :p0"])),
             P + "The expression contains too many conditions; number of conditions: "
             "51, maximum: 50",
+        )
+
+
+def _raw(table: str, **fields) -> requests.Response:
+    body = {
+        "TableName": table,
+        "IndexName": "vix",
+        "SearchVector": [{"N": "1"}, {"N": "0"}, {"N": "0"}, {"N": "0"}],
+        "TopK": 10,
+    }
+    body.update(fields)
+    return _signed_post("SearchVectors", body)
+
+
+class TestExpressionMaps:
+    """The two maps, checked before either expression is read."""
+
+    def test_empty_maps_names_first(self, grammar_table):
+        cond = {"SearchConditionExpression": "Country = :us"}
+        _refused(_raw(grammar_table, **cond, ExpressionAttributeValues={}),
+                 "ExpressionAttributeValues must not be empty")
+        _refused(
+            _raw(grammar_table, **cond, ExpressionAttributeNames={}, ExpressionAttributeValues={}),
+            "ExpressionAttributeNames must not be empty",
+        )
+        _refused(_raw(grammar_table, ExpressionAttributeValues={}),
+                 "ExpressionAttributeValues must not be empty")
+        resp = _raw(grammar_table, TopK=0, **cond, ExpressionAttributeValues={})
+        assert "TopK" in _message(resp), resp.text
+
+    def test_keys_and_names(self, grammar_table):
+        us = {":us": {"S": "US"}}
+        cases = [
+            ({"#c": ""}, {}, "#c = :us",
+             "ExpressionAttributeNames contains invalid value: Empty attribute name for key #c"),
+            ({"#a-b": "x"}, {**us, ":b-k": {"S": "y"}}, "Country = :us",
+             'ExpressionAttributeNames contains invalid key: Syntax error; key: "#a-b"'),
+            ({"": "x"}, us, "Country = :us",
+             "ExpressionAttributeNames contains invalid key: The expression attribute map "
+             "contains an empty key;"),
+            ({"#" + "k" * 300: "x"}, us, "Country = :us",
+             "ExpressionAttributeNames contains invalid key: The expression attribute map "
+             "contains a key that is too long; size of key: 301"),
+            ({"#c": "C" * 65536}, us, "#c = :us",
+             "Attribute name is too large, must be less than 65536 bytes for key #c"),
+            (None, {**us, ":": {"S": "y"}}, "Country = :us",
+             'ExpressionAttributeValues contains invalid key: Syntax error; key: ":"'),
+        ]
+        for names, values, cond, message in cases:
+            fields = {"SearchConditionExpression": cond, "ExpressionAttributeValues": values}
+            if names is not None:
+                fields["ExpressionAttributeNames"] = names
+            _refused(_raw(grammar_table, **fields), message)
+
+    def test_maps_need_their_expression(self, grammar_table):
+        names, us = {"#p": "Price"}, {":us": {"S": "US"}}
+        only = "can only be specified when using expressions"
+        _refused(_raw(grammar_table, ExpressionAttributeNames=names),
+                 "ExpressionAttributeNames " + only)
+        _refused(_raw(grammar_table, ExpressionAttributeNames=names, ExpressionAttributeValues=us),
+                 "ExpressionAttributeNames " + only)
+        _refused(_raw(grammar_table, ExpressionAttributeValues=us),
+                 "ExpressionAttributeValues " + only)
+        _refused(
+            _raw(grammar_table, ProjectionExpression="#p", ExpressionAttributeNames=names,
+                 ExpressionAttributeValues=us),
+            "ExpressionAttributeValues " + only,
+        )
+
+    def test_unused_names(self, grammar_table):
+        us = {":us": {"S": "US"}}
+        unused = "Value provided in ExpressionAttributeNames unused in expressions: keys: {#u}"
+        u = {"#u": "x"}
+        _refused(_raw(grammar_table, SearchConditionExpression="Country = :us",
+                      ExpressionAttributeNames=u,
+                      ExpressionAttributeValues={**us, ":w": {"S": "w"}}), unused)
+        _refused(_raw(grammar_table, SearchConditionExpression="Country = :us",
+                      ProjectionExpression="Price", ExpressionAttributeNames=u,
+                      ExpressionAttributeValues=us), unused)
+        _refused(_raw(grammar_table, SearchConditionExpression="Price > :p",
+                      ExpressionAttributeNames=u, ExpressionAttributeValues={":p": {"N": "0"}}),
+                 unused)
+        _refused(_raw(grammar_table, SearchConditionExpression="Country = = :us",
+                      ExpressionAttributeNames=u, ExpressionAttributeValues=us),
+                 P + 'Syntax error; token: "=", near: "= = :us"')
+        resp = _raw(grammar_table, SearchConditionExpression="Country = :us",
+                    ProjectionExpression="#p", ExpressionAttributeNames={"#p": "Price"},
+                    ExpressionAttributeValues=us)
+        assert resp.status_code == 200, resp.text
+
+    def test_the_projection_is_read_before_the_condition(self, grammar_table):
+        _refused(
+            _raw(grammar_table, ProjectionExpression="#p", SearchConditionExpression="Country = = :us",
+                 ExpressionAttributeValues={":us": {"S": "US"}}),
+            "Invalid ProjectionExpression: An expression attribute name used in the document "
+            "path is not defined; attribute name: #p",
         )
 
 

@@ -28,6 +28,16 @@ For syntax errors, undefined aliases, nested paths and logical operators,
 ExtendDB's wording differs from the service's. Those tests assert that the
 check, not the count, answers.
 
+An account can have the extended grammar instead (comparators other than
+``=``, OR, NOT, IN, BETWEEN, up to 50 conditions). The ``grammar`` fixture
+asks the target which grammar it serves, by sending ``h = :v0 AND f1 <> :v1``:
+the equality-only grammar refuses it with the comparator message and the
+extended grammar answers 200. Each test then asserts the answer of that
+grammar. The extended answers were measured on 2026-11-21 in eu-north-1, on an
+account with the extended grammar, each request twice: under it the 20th
+comparison is no fault of its own, and the schema, HASH and unused-value
+checks answer instead.
+
 Tests post raw SigV4-signed JSON. Against the service, SearchVectors is sent to
 the ``search-dynamodb`` host the SDKs use for it. The module skips when the
 target backend does not support vector indexes, unless
@@ -81,6 +91,31 @@ NOT_IN_SCHEMA = (
 )
 NESTED = "SearchConditionExpression cannot have conditions on nested attributes"
 OPERATOR = "Invalid operator used in SearchConditionExpression"
+
+# The extended grammar's answers.
+X_NESTED = PREFIX + ": " + NESTED
+X_MULTIPLE_NAMES = (
+    "Invalid SearchConditionExpression: Invalid condition in "
+    "SearchConditionExpression: Multiple attribute names used in one condition"
+)
+X_HASH_IN_OR = (
+    "SearchConditionExpression must use = on the HASH attribute, not inside OR or "
+    "NOT; HASH attribute: h"
+)
+X_STRING_ORDERING = (
+    "SearchConditionExpression allows this operator only on Number (N) "
+    "attributes; operator: <, attribute: f1, attribute type: S"
+)
+X_UNUSED = (
+    "Value provided in ExpressionAttributeValues unused in expressions: keys: {:unused}"
+)
+
+
+def _not_in_schema(attribute: str) -> str:
+    return (
+        "SearchConditionExpression must not contain any attributes that is not in "
+        f"SearchSchema. Invalid attribute: {attribute}"
+    )
 
 INLINE = [f"f{i}" for i in range(1, 19)]
 NINETEEN = ["h", *INLINE]
@@ -221,6 +256,30 @@ def search_table():
         _delete_table(name)
 
 
+@pytest.fixture(scope="module")
+def grammar(search_table) -> str:
+    """``equality`` or ``extended``: the grammar the target serves this account."""
+    resp = _search_expr(search_table, ["h = :v0", "f1 <> :v1"])
+    if resp.status_code == 200:
+        return "extended"
+    if resp.status_code == 400 and _error_message(resp) == COMPARATOR:
+        return "equality"
+    pytest.fail(f"neither grammar answered the probe: {resp.status_code} {resp.text}")
+
+
+def _either(grammar: str, equality, extended):
+    return equality if grammar == "equality" else extended
+
+
+def _answers(resp: requests.Response, grammar: str, equality: str | None, extended: str | None) -> None:
+    """Refused with the grammar's message, or 200 where the message is None."""
+    message = _either(grammar, equality, extended)
+    if message is None:
+        assert resp.status_code == 200, resp.text
+    else:
+        _refused_with(resp, message)
+
+
 def _comparisons(attrs: list[str]) -> list[str]:
     return [f"{a} = :v{i}" for i, a in enumerate(attrs)]
 
@@ -297,40 +356,42 @@ class TestSearchConditionLimit:
         assert resp.status_code == 200, resp.text
 
     def test_twentieth_condition_repeating_an_attribute_gets_count_message(
-        self, search_table
+        self, search_table, grammar
     ):
-        _refused_with(_search(search_table, [*NINETEEN, "f1"]), TOO_MANY)
+        _answers(_search(search_table, [*NINETEEN, "f1"]), grammar, TOO_MANY, None)
 
-    def test_twentieth_condition_outside_schema_gets_count_message(self, search_table):
-        _refused_with(_search(search_table, [*NINETEEN, "x"]), TOO_MANY)
+    def test_twentieth_condition_outside_schema_gets_count_message(self, search_table, grammar):
+        _answers(_search(search_table, [*NINETEEN, "x"]), grammar, TOO_MANY, NOT_IN_SCHEMA)
 
-    def test_twenty_one_conditions_get_count_message(self, search_table):
-        _refused_with(_search(search_table, [*NINETEEN, "x", "y"]), TOO_MANY)
+    def test_twenty_one_conditions_get_count_message(self, search_table, grammar):
+        resp = _search(search_table, [*NINETEEN, "x", "y"])
+        _answers(resp, grammar, TOO_MANY, NOT_IN_SCHEMA)
 
     def test_count_is_checked_before_an_early_out_of_schema_attribute(
-        self, search_table
+        self, search_table, grammar
     ):
-        _refused_with(_search(search_table, ["h", "x", *INLINE]), TOO_MANY)
+        resp = _search(search_table, ["h", "x", *INLINE])
+        _answers(resp, grammar, TOO_MANY, NOT_IN_SCHEMA)
 
     def test_out_of_schema_attribute_within_limit_gets_schema_message(
         self, search_table
     ):
         _refused_with(_search(search_table, [*NINETEEN[:-1], "x"]), NOT_IN_SCHEMA)
 
-    def test_repeat_within_limit_gets_duplicate_message(self, search_table):
-        _refused_with(_search(search_table, [*NINETEEN[:-1], "f1"]), DUPLICATE)
+    def test_repeat_within_limit_gets_duplicate_message(self, search_table, grammar):
+        resp = _search(search_table, [*NINETEEN[:-1], "f1"])
+        _answers(resp, grammar, DUPLICATE, None)
 
-    def test_twenty_plus_an_unused_value_gets_count_message(self, search_table):
-        _refused_with(
-            _search_expr(search_table, [*_base(), "x = :v19"], unused=(":unused",)),
-            TOO_MANY,
-        )
+    def test_twenty_plus_an_unused_value_gets_count_message(self, search_table, grammar):
+        resp = _search_expr(search_table, [*_base(), "x = :v19"], unused=(":unused",))
+        _answers(resp, grammar, TOO_MANY, X_UNUSED)
 
-    def test_count_ignores_case_and_spacing(self, search_table):
+    def test_count_ignores_case_and_spacing(self, search_table, grammar):
         lower = [*_base(), "x = :v19"]
-        _refused_with(_search_expr(search_table, lower, joiner=" and "), TOO_MANY)
+        expected = _either(grammar, TOO_MANY, NOT_IN_SCHEMA)
+        _refused_with(_search_expr(search_table, lower, joiner=" and "), expected)
         tight = [c.replace(" = ", "=") for c in lower]
-        _refused_with(_search_expr(search_table, tight, joiner="  AND  "), TOO_MANY)
+        _refused_with(_search_expr(search_table, tight, joiner="  AND  "), expected)
         resp = _search_expr(search_table, _base(), joiner=" and ")
         assert resp.status_code == 200, resp.text
 
@@ -436,21 +497,26 @@ class TestWholeExpressionPhase:
         assert _error_message(resp) != _undefined_value(":v1"), resp.text
 
     @pytest.mark.parametrize(
-        "comparisons",
+        "comparisons,extended",
         [
             pytest.param(
-                [*_base()[:-1], _base()[-1] + " OR x = :v19"], id="OR-before-20th"
+                [*_base()[:-1], _base()[-1] + " OR x = :v19"], X_HASH_IN_OR, id="OR-before-20th"
             ),
             pytest.param(
                 [_base()[0] + " OR " + _base()[1], *_base()[2:], "x = :v19"],
+                X_HASH_IN_OR,
                 id="OR-before-2nd",
             ),
-            pytest.param([*_base(), "NOT x = :v19"], id="NOT-in-20th"),
-            pytest.param([*_base(), "x IN (:v19)"], id="IN-in-20th"),
+            pytest.param([*_base(), "NOT x = :v19"], NOT_IN_SCHEMA, id="NOT-in-20th"),
+            pytest.param([*_base(), "x IN (:v19)"], NOT_IN_SCHEMA, id="IN-in-20th"),
         ],
     )
-    def test_logical_operator_past_the_limit(self, search_table, comparisons):
-        _refused_not_for_count(_search_expr(search_table, comparisons), OPERATOR)
+    def test_logical_operator_past_the_limit(self, search_table, grammar, comparisons, extended):
+        resp = _search_expr(search_table, comparisons)
+        if grammar == "equality":
+            _refused_not_for_count(resp, OPERATOR)
+        else:
+            _refused_with(resp, extended)
 
     def test_names_and_values_resolve_in_written_order(self, search_table):
         reserved_first = _with(2, "bucket = :v1")
@@ -468,41 +534,41 @@ class TestPerComparisonPhase:
     """Faults that the count preempts in the 20th comparison."""
 
     @pytest.mark.parametrize(
-        "comparison,names",
+        "comparison,names,extended",
         [
-            pytest.param("a.b = :v19", None, id="nested"),
-            pytest.param("#nn = :v19", {"#nn": "a.b"}, id="nested-through-alias"),
-            pytest.param("x = v19", None, id="value-without-colon"),
-            pytest.param("x < :v19", None, id="less-than"),
-            pytest.param("x <> :v19", None, id="not-equal-comparator"),
-            pytest.param("x <= :v19", None, id="less-or-equal"),
-            pytest.param("x = :v0", None, id="placeholder-reused"),
+            pytest.param("a.b = :v19", None, X_NESTED, id="nested"),
+            pytest.param("#nn = :v19", {"#nn": "a.b"}, _not_in_schema("a.b"), id="nested-through-alias"),
+            pytest.param("x = v19", None, X_MULTIPLE_NAMES, id="value-without-colon"),
+            pytest.param("x < :v19", None, NOT_IN_SCHEMA, id="less-than"),
+            pytest.param("x <> :v19", None, NOT_IN_SCHEMA, id="not-equal-comparator"),
+            pytest.param("x <= :v19", None, NOT_IN_SCHEMA, id="less-or-equal"),
+            pytest.param("x = :v0", None, NOT_IN_SCHEMA, id="placeholder-reused"),
         ],
     )
-    def test_twentieth_gets_count_message(self, search_table, comparison, names):
-        _refused_with(
-            _search_expr(search_table, [*_base(), comparison], names=names), TOO_MANY
-        )
+    def test_twentieth_gets_count_message(self, search_table, grammar, comparison, names, extended):
+        resp = _search_expr(search_table, [*_base(), comparison], names=names)
+        _answers(resp, grammar, TOO_MANY, extended)
 
-    def test_repeat_at_third_of_twenty_gets_duplicate_message(self, search_table):
-        _refused_with(
-            _search_expr(search_table, [*_with(3, "f1 = :v2"), "x = :v19"]), DUPLICATE
-        )
+    def test_repeat_at_third_of_twenty_gets_duplicate_message(self, search_table, grammar):
+        resp = _search_expr(search_table, [*_with(3, "f1 = :v2"), "x = :v19"])
+        _answers(resp, grammar, DUPLICATE, NOT_IN_SCHEMA)
 
-    def test_less_than_at_second_gets_comparator_message(self, search_table):
+    def test_less_than_at_second_gets_comparator_message(self, search_table, grammar):
+        expected = _either(grammar, COMPARATOR, X_STRING_ORDERING)
         _refused_with(
-            _search_expr(search_table, [*_with(2, "f1 < :v1"), "x = :v19"]), COMPARATOR
+            _search_expr(search_table, [*_with(2, "f1 < :v1"), "x = :v19"]), expected
         )
-        _refused_with(_search_expr(search_table, _with(2, "f1 < :v1")), COMPARATOR)
+        _refused_with(_search_expr(search_table, _with(2, "f1 < :v1")), expected)
 
     def test_nested_at_second_gets_nested_message(self, search_table):
         _refused_not_for_count(
             _search_expr(search_table, [*_with(2, "a.b = :v1"), "x = :v19"]), NESTED
         )
 
-    def test_comparator_is_checked_before_nested_and_repeat(self, search_table):
-        _refused_with(_search_expr(search_table, _with(2, "a.b < :v1")), COMPARATOR)
-        _refused_with(_search_expr(search_table, _with(3, "f1 < :v2")), COMPARATOR)
+    def test_comparator_is_checked_before_nested_and_repeat(self, search_table, grammar):
+        _answers(_search_expr(search_table, _with(2, "a.b < :v1")), grammar, COMPARATOR, X_NESTED)
+        resp = _search_expr(search_table, _with(3, "f1 < :v2"))
+        _answers(resp, grammar, COMPARATOR, X_STRING_ORDERING)
         nested_then_less = _with(2, "a.b = :v1")
         nested_then_less[2] = "f2 < :v2"
         _refused_not_for_count(_search_expr(search_table, nested_then_less), NESTED)
