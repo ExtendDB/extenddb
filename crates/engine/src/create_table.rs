@@ -4,7 +4,9 @@ use serde_json::Value;
 
 use extenddb_core::error::{DynamoDbError, ErrorMessageKey, error_message};
 use extenddb_core::types::{CreateTableInput, CreateTableOutput};
-use extenddb_core::validation::validate_create_table;
+use extenddb_core::validation::{
+    validate_create_table, validate_folded_tag_prefix, validate_table_name, validate_tags_member,
+};
 
 use crate::OperationContext;
 use crate::serialize_output;
@@ -13,6 +15,21 @@ pub async fn handle_create_table(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
+    // The service checks the TableName and then the Tags before every other
+    // member: a request with an invalid tag and a definition error (an
+    // undefined key attribute, an enum value outside its set, PROVISIONED
+    // without throughput, a missing KeySchema) is refused for the tag, while a
+    // missing TableName or one of bad length is reported first (measured
+    // 2026-11-20). CreateTable stores its Tags through the same rows
+    // TagResource writes, so the same grammar applies. A Tags member that does
+    // not parse is left to the deserialization below. Restore and import
+    // build their own CreateTableInput further in and do not pass through
+    // this handler.
+    if let Some(name) = body.get("TableName").and_then(Value::as_str) {
+        validate_table_name(name, &ctx.limits)?;
+        validate_tags_member(&body)?;
+    }
+
     crate::validate_enum_fields(
         &body,
         &[
@@ -50,6 +67,14 @@ pub async fn handle_create_table(
         }
     })?;
     input.resolve_table_throughput_mode();
+
+    // A key that starts with `aws:` once U+017F is read as `s` is refused
+    // here: the service reports the enum and missing-member errors before it,
+    // and the key schema, attribute definition and stream errors after it
+    // (measured 2026-11-20). The service also reports the throughput errors
+    // before it. `validate_create_table` checks those after the key schema, so
+    // a request with both faults gets this error here instead.
+    validate_folded_tag_prefix(input.tags.as_deref().unwrap_or_default())?;
 
     validate_create_table(&input, &ctx.limits)?;
 

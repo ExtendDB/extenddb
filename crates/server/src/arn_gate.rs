@@ -251,12 +251,21 @@ pub(crate) fn check_backup_arn(arn: &str) -> Result<(), DynamoDbError> {
 /// for `TagResource`; `UntagResource` and `ListTagsOfResource` the same), a
 /// stream ARN with a bad table segment or U+0000 in the label is
 /// `Invalid StreamArn`. An index or backup ARN keeps the shape check's verdict.
-pub(crate) fn check_tag_resource_arn(arn: &str) -> Result<(), DynamoDbError> {
+/// `check_tags` checks the request's tag keys and values, which the service
+/// reports before a bad table segment and after a bad stream ARN (measured
+/// 2026-11-20 for `TagResource` and `UntagResource`).
+pub(crate) fn check_tag_resource_arn(
+    arn: &str,
+    check_tags: impl FnOnce() -> Result<(), DynamoDbError>,
+) -> Result<(), DynamoDbError> {
     check_stream_arn(arn)?;
     match parse(arn) {
-        Some(res) if res.sub.is_none() && !in_pattern(&res.table) => Err(validation(format!(
-            "Invalid TableArn: Invalid ResourceArn provided as input {arn}"
-        ))),
+        Some(res) if res.sub.is_none() && !in_pattern(&res.table) => {
+            check_tags()?;
+            Err(validation(format!(
+                "Invalid TableArn: Invalid ResourceArn provided as input {arn}"
+            )))
+        }
         _ => Ok(()),
     }
 }
@@ -540,13 +549,25 @@ mod tests {
         let backup_id = format!("{}/backup/0170\u{0}", table("ok"));
         assert!(check_backup_arn(&backup_id).is_ok(), "left to the engine");
         assert_eq!(
-            message(check_tag_resource_arn(&bad)).unwrap(),
+            message(check_tag_resource_arn(&bad, || Ok(()))).unwrap(),
             format!("Invalid TableArn: Invalid ResourceArn provided as input {bad}")
         );
         assert_eq!(
-            message(check_tag_resource_arn(&stream)).unwrap(),
+            message(check_tag_resource_arn(&stream, || Ok(()))).unwrap(),
             "Invalid StreamArn"
         );
-        assert!(check_tag_resource_arn(&format!("{bad}/index/i")).is_ok());
+        assert!(check_tag_resource_arn(&format!("{bad}/index/i"), || Ok(())).is_ok());
+        // The request's tags are reported before a bad table segment, and a
+        // bad stream ARN before the tags. A good ARN leaves them to the engine.
+        let tags = || Err(validation("bad tag".to_owned()));
+        assert_eq!(
+            message(check_tag_resource_arn(&bad, tags)).unwrap(),
+            "bad tag"
+        );
+        assert_eq!(
+            message(check_tag_resource_arn(&stream, tags)).unwrap(),
+            "Invalid StreamArn"
+        );
+        assert!(check_tag_resource_arn(&table("ok"), tags).is_ok());
     }
 }

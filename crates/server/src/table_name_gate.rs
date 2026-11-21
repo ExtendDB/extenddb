@@ -92,7 +92,11 @@ pub(crate) fn check_table_name_chars(
             check_transact_items(input, &["Put", "Delete", "Update", "ConditionCheck"])
         }
         "TagResource" | "UntagResource" | "ListTagsOfResource" => {
-            with_str(input, "ResourceArn", arn_gate::check_tag_resource_arn)
+            with_str(input, "ResourceArn", |arn| {
+                arn_gate::check_tag_resource_arn(arn, || {
+                    crate::request_tags::validate_request_tags(operation, input)
+                })
+            })
         }
         "DescribeStream" | "GetShardIterator" => {
             with_str(input, "StreamArn", arn_gate::check_stream_arn)
