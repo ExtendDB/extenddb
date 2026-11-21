@@ -251,7 +251,8 @@ case "$step" in
         # pin a checksum for it: wasm-opt is an optimizer (here it makes the
         # module about a quarter smaller) and is not meant to change the
         # answers the corpus checks. No step runs the corpus over wasm-opt's
-        # output, which is the module the README's build command produces.
+        # output, the module a build without --no-opt produces (as the first
+        # build command of the README does).
         # --mode no-install forbids wasm-pack to download or install
         # wasm-bindgen: it uses a wasm-bindgen of the version in Cargo.lock
         # from PATH (the workflow's tool cache or install step puts one there)
