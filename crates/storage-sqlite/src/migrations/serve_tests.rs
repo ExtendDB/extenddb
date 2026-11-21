@@ -462,7 +462,7 @@ async fn a_caller_holding_the_serve_lock_migrates_through_migrate_holding() {
         .await
         .expect_err("the lock is this process's own");
     assert_eq!(err.exit_code(), exit::LOCKED);
-    let report = super::migrate_holding(&location, RELEASE, &held)
+    let report = super::file_database::migrate_holding(&location, RELEASE, &held)
         .await
         .expect("migrate holding the lock");
     assert_eq!(report.to, Some(LATEST));
@@ -474,7 +474,7 @@ async fn a_caller_holding_the_serve_lock_migrates_through_migrate_holding() {
     // Another database's lock is not this one's.
     let other = temp_db("holding-other");
     let other_lock = crate::serve_lock::ServeLock::acquire(&other).expect("other lock");
-    let refused = super::migrate_holding(&location, RELEASE, &other_lock).await;
+    let refused = super::file_database::migrate_holding(&location, RELEASE, &other_lock).await;
     assert!(
         matches!(refused, Err(MigrationError::Refused(_))),
         "{refused:?}"
