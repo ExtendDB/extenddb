@@ -4218,6 +4218,39 @@
           "equals": "Invalid Request: TableName is not a valid table name or table ARN"
         }
       ]
+    },
+    {
+      "name": "names inside other ARNs: UntagResource on that stream ARN removes the tag",
+      "op": "UntagResource",
+      "body": {
+        "ResourceArn": "arn:aws:dynamodb:us-east-1:000000000000:table/Str/stream/x\u0000y",
+        "TagKeys": [
+          "k"
+        ]
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "",
+          "equals": {}
+        }
+      ]
+    },
+    {
+      "name": "names inside other ARNs: ListTagsOfResource on that stream ARN lists no tags after the UntagResource",
+      "op": "ListTagsOfResource",
+      "body": {
+        "ResourceArn": "arn:aws:dynamodb:us-east-1:000000000000:table/Str/stream/x\u0000y"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "",
+          "equals": {
+            "Tags": []
+          }
+        }
+      ]
     }
   ]
 }
