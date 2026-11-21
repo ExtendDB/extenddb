@@ -45,15 +45,19 @@ mod m0006_backup_catalog_index;
 mod m0009_warm_throughput;
 mod postcheck;
 
-use std::time::Duration;
-
 use extenddb_storage::file_body;
 use extenddb_storage::migrations::m0002_resource_tag_condition_keys::{
     self, ResourceTagConditionKeys,
 };
 use extenddb_storage::migrations::{
-    CatalogStatus, Kind, Migration, MigrationBackend, MigrationError, MigrationId, Released,
-    RunReport, Runner, StoreBody, StoreKind,
+    Kind, Migration, MigrationError, MigrationId, Released, RunReport, Runner, StoreBody, StoreKind,
+};
+// Used by the file-database entry points (lock, status, migrate), which the
+// browser build does not compile.
+#[cfg(not(target_arch = "wasm32"))]
+use {
+    extenddb_storage::migrations::{CatalogStatus, MigrationBackend},
+    std::time::Duration,
 };
 
 pub use backend::{SqliteMigrations, SqliteStores};
@@ -476,6 +480,8 @@ pub(crate) async fn migrate_in_memory(
 
 /// Log what a run the server started did: the copy's path, then each step
 /// with its notes.
+// Logs a run the server started (`lib.rs`).
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn log_report(report: &RunReport) {
     for note in &report.notes {
         tracing::info!("{note}");
@@ -522,6 +528,8 @@ pub(crate) async fn apply_for_tests(pool: &sqlx::SqlitePool) {
 
 /// A new connection to an in-memory location opens a new, empty database,
 /// so the file-based entry points refuse one.
+// Returned by the file-database entry points only.
+#[cfg(not(target_arch = "wasm32"))]
 fn in_memory_refusal() -> MigrationError {
     MigrationError::Refused(
         "an in-memory SQLite database exists only inside a running server, which creates its \

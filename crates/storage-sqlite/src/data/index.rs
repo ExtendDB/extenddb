@@ -122,6 +122,9 @@ impl PendingApplyContext {
 /// Both arms tolerate a data table that no longer exists, so a base table or index
 /// dropped while a row was in flight is applied-as-skip rather than logged and
 /// dropped as unprocessable.
+// Applies a row the GSI propagation worker claimed; the browser build runs no
+// worker and maintains its indexes on the write path.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn apply_pending_context(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     old_item: Option<&Item>,
@@ -528,6 +531,8 @@ pub(crate) fn index_sk_column(index: usize, sk_type: ScalarAttributeType) -> Str
 /// True if a storage error is a "missing table" error (the `_ddb_*` index table
 /// or a `_vidx_*` vector table was dropped, e.g. the base table was deleted
 /// while a `gsi_pending` row was in flight). Such rows are benignly skipped.
+// Used only by the worker's apply path (`apply_pending_context`).
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn is_no_such_table(e: &StorageError) -> bool {
     matches!(e, StorageError::Internal(msg) if msg.contains("no such table"))
 }
@@ -536,6 +541,8 @@ pub(crate) fn is_no_such_table(e: &StorageError) -> bool {
 /// worker's transaction, using the row's self-describing `index_context` — no
 /// catalog read. A missing index data table (the base table was deleted while
 /// the row was in flight) is skipped benignly.
+// Used only by the worker's apply path (`apply_pending_context`).
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn apply_claimed_row(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     old_item: Option<&Item>,

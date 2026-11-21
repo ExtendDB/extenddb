@@ -85,6 +85,10 @@ pub struct SqliteEngine {
     /// task deregisters too. The GSI worker recovers any `CREATING` index with
     /// no entry, because nothing else ever will until a restart, and until then
     /// the per-table queue hold blocks every write's index maintenance.
+    #[cfg_attr(
+        target_arch = "wasm32",
+        expect(dead_code, reason = "the wasm build starts no vector backfill task")
+    )]
     pub(crate) vector_builds_running: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// The `extenddb serve` lock on the database file, held for as long as any
     /// clone of the engine lives. `None` outside `serve` and for in-memory
@@ -241,6 +245,8 @@ impl SqliteEngine {
     }
 
     /// Handle to the control-plane notifier, for the background poller.
+    // Read by the control-plane worker, which the browser build does not run.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn control_plane_notify(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.control_plane_notify)
     }
@@ -269,6 +275,8 @@ impl SqliteEngine {
     /// Returns `Some(password)` when a new admin user was created with a
     /// generated password (so the caller can surface it once), or `None` when
     /// the admin already existed or the password came from the environment.
+    // Called by the server's startup only (`lib.rs`).
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn bootstrap_dev_rows(
         &self,
         admin_user: Option<&str>,
@@ -390,6 +398,8 @@ impl SqliteEngine {
     /// `settings set` and needs it to apply to the next backfill, not up to 30 s
     /// later. Zero when unset or unparseable, which is the production value, so a
     /// malformed setting cannot slow a real backfill down.
+    // Read by the vector backfill task, which the browser build refuses to start.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn vector_backfill_batch_delay(&self) -> u64 {
         let live: Result<Option<(String,)>, _> =
             sqlx::query_as("SELECT value FROM settings WHERE key = ?")
@@ -409,6 +419,8 @@ impl SqliteEngine {
     /// before its `ACTIVE` flip. See
     /// [`extenddb_core::settings_keys::VECTOR_INDEX_MIN_CREATING_MS`] for why the
     /// hold exists. Defaults to 1000 when unset or unparseable; zero disables it.
+    // Read by the vector backfill task, which the browser build refuses to start.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn vector_index_min_creating_ms(&self) -> u64 {
         const DEFAULT_MS: u64 = 1_000;
         let live: Result<Option<(String,)>, _> =
@@ -435,6 +447,8 @@ impl SqliteEngine {
     /// delay is. Held inside the detached build task rather than in the request
     /// path, because the phase is only observable to a client after `UpdateTable`
     /// has returned.
+    // Read by the vector backfill task, which the browser build refuses to start.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn vector_allocation_phase_delay(&self) -> u64 {
         let live: Result<Option<(String,)>, _> =
             sqlx::query_as("SELECT value FROM settings WHERE key = ?")

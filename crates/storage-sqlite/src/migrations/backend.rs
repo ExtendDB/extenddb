@@ -21,22 +21,33 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Mutex, PoisonError};
 
 use async_trait::async_trait;
-use extenddb_storage::management_store::{ManagementStore, SettingsStore};
+use extenddb_storage::management_store::ManagementStore;
 use extenddb_storage::migrations::{
-    CatalogTraces, Done, HasManagementStore, LedgerColumns, LedgerRow, LedgerWrites, LockedStores,
-    Migration, MigrationBackend, MigrationError, MigrationId, Released, RunReport, Runner, Step,
-    StoreKind, StoreRef, in_transaction, record_rows, sql_ledger_ddl,
+    CatalogTraces, Done, HasManagementStore, LedgerColumns, LedgerRow, LedgerWrites, Migration,
+    MigrationBackend, MigrationError, MigrationId, Released, Step, StoreKind, StoreRef,
+    in_transaction, record_rows, sql_ledger_ddl,
 };
-use sqlx::sqlite::SqlitePoolOptions;
-use sqlx::{ConnectOptions, Connection, SqlitePool};
+use sqlx::SqlitePool;
 
 use crate::catalog_store::SqliteCatalogStore;
-use crate::sqlite_util::{set_connection_pragmas, sqlite_url};
+
+// Used by the file-database paths (`open_with`, `forget`, the copy report) and
+// the encryption-key commands' `LockedCatalog`, none of which the browser
+// build compiles: it migrates only the engine's in-memory pool.
+#[cfg(not(target_arch = "wasm32"))]
+use {
+    crate::sqlite_util::{set_connection_pragmas, sqlite_url},
+    extenddb_storage::management_store::SettingsStore,
+    extenddb_storage::migrations::{LockedStores, RunReport, Runner},
+    sqlx::sqlite::SqlitePoolOptions,
+    sqlx::{ConnectOptions, Connection},
+    std::str::FromStr,
+    std::sync::Arc,
+    std::sync::atomic::{AtomicUsize, Ordering},
+};
 
 /// What SQLite code bodies receive: the runner's connection, and a
 /// management store over it.
@@ -55,14 +66,23 @@ impl HasManagementStore for SqliteStores {
 /// switch`, `rotate` and `reset` (RFC-0000 section 8, common rules): the
 /// management store over the runner's one connection, holding no key.
 /// Dropping it closes the connection.
+// Server and CLI only: the encryption-key commands, which the browser build
+// does not have.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) struct LockedCatalog(SqliteMigrations);
 
+// Server and CLI only: the encryption-key commands, which the browser build
+// does not have.
+#[cfg(not(target_arch = "wasm32"))]
 impl LockedCatalog {
     pub(crate) fn new(migrations: SqliteMigrations) -> Self {
         Self(migrations)
     }
 }
 
+// Server and CLI only: the encryption-key commands, which the browser build
+// does not have.
+#[cfg(not(target_arch = "wasm32"))]
 impl LockedStores for LockedCatalog {
     fn management(&self) -> &dyn ManagementStore {
         &self.0.stores.management
@@ -146,12 +166,24 @@ pub struct SqliteMigrations {
     /// Whether the connection is this runner's own, closed by [`Self::close`].
     owned: bool,
     /// The copy this run took before its first write, if it took one.
+    #[cfg_attr(
+        target_arch = "wasm32",
+        expect(dead_code, reason = "the wasm build copies no database file")
+    )]
     copy: Mutex<Option<PathBuf>>,
     /// The lines naming the earlier copies this run's copy replaced,
     /// reported with the run, also when it stops before its first commit.
+    #[cfg_attr(
+        target_arch = "wasm32",
+        expect(dead_code, reason = "the wasm build copies no database file")
+    )]
     replaced: Mutex<Vec<String>>,
     /// The lines naming the partial copies of stopped runs that opening the
     /// database for writing removed, reported with the run.
+    #[cfg_attr(
+        target_arch = "wasm32",
+        expect(dead_code, reason = "the wasm build copies no database file")
+    )]
     removed: Mutex<Vec<String>>,
     /// `PRAGMA foreign_keys = ON` failed after a step committed: the step is
     /// reported as applied, and the run stops with this error at its next
@@ -335,6 +367,8 @@ impl SqliteMigrations {
     /// # Errors
     ///
     /// As [`Runner::forget`]; the database is then as it was.
+    // The CLI's `migrate --forget` only.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn forget(&self, id: u32) -> Result<(), MigrationError> {
         self.forget_with(&Runner::new(self, ""), id).await
     }
@@ -345,6 +379,8 @@ impl SqliteMigrations {
     /// # Errors
     ///
     /// As [`SqliteMigrations::forget`].
+    // The CLI's `migrate --forget` only.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn forget_with(
         &self,
         runner: &Runner<'_, Self>,
@@ -385,64 +421,57 @@ impl SqliteMigrations {
     /// committed and whose pragma after it failed stops with that error and
     /// keeps its copy. A report starts with the partial copies of stopped
     /// runs that opening the database removed.
+    // File-database runs only: the browser build takes no copy.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn discard_unused_copy(
         &self,
         result: Result<RunReport, MigrationError>,
     ) -> Result<RunReport, MigrationError> {
-        #[cfg(target_arch = "wasm32")]
-        {
-            // The pre-migration copy is a file-backed, online-backup concern
-            // the browser build never takes; nothing to discard.
-            result
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let result = match (result, self.take_restore_failure()) {
-                (Ok(report), Some(error)) => Err(MigrationError::Stopped {
-                    error: Box::new(error),
-                    report,
-                }),
-                (result, _) => result,
-            };
-            let removed =
-                std::mem::take(&mut *self.removed.lock().unwrap_or_else(PoisonError::into_inner));
-            let replaced =
-                std::mem::take(&mut *self.replaced.lock().unwrap_or_else(PoisonError::into_inner));
-            match result {
-                Ok(mut report) => {
-                    report.notes.splice(0..0, removed);
-                    report.notes.extend(replaced);
-                    Ok(report)
-                }
-                Err(MigrationError::Stopped { error, report }) if report.applied.is_empty() => {
-                    // The run's own notes name the copy removed here, so only
-                    // the lines naming the other files it removed are kept.
-                    let copy = self
-                        .copy
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .take();
-                    let mut notes = removed;
-                    notes.extend(replaced);
-                    if let Some(Err(note)) = copy.map(|copy| super::copy::remove_copy(&copy)) {
-                        notes.push(note);
-                    }
-                    if notes.is_empty() {
-                        Err(*error)
-                    } else {
-                        Err(MigrationError::Stopped {
-                            error,
-                            report: RunReport { notes, ..report },
-                        })
-                    }
-                }
-                Err(MigrationError::Stopped { error, mut report }) => {
-                    report.notes.splice(0..0, removed);
-                    report.notes.extend(replaced);
-                    Err(MigrationError::Stopped { error, report })
-                }
-                other => other,
+        let result = match (result, self.take_restore_failure()) {
+            (Ok(report), Some(error)) => Err(MigrationError::Stopped {
+                error: Box::new(error),
+                report,
+            }),
+            (result, _) => result,
+        };
+        let removed =
+            std::mem::take(&mut *self.removed.lock().unwrap_or_else(PoisonError::into_inner));
+        let replaced =
+            std::mem::take(&mut *self.replaced.lock().unwrap_or_else(PoisonError::into_inner));
+        match result {
+            Ok(mut report) => {
+                report.notes.splice(0..0, removed);
+                report.notes.extend(replaced);
+                Ok(report)
             }
+            Err(MigrationError::Stopped { error, report }) if report.applied.is_empty() => {
+                // The run's own notes name the copy removed here, so only
+                // the lines naming the other files it removed are kept.
+                let copy = self
+                    .copy
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+                let mut notes = removed;
+                notes.extend(replaced);
+                if let Some(Err(note)) = copy.map(|copy| super::copy::remove_copy(&copy)) {
+                    notes.push(note);
+                }
+                if notes.is_empty() {
+                    Err(*error)
+                } else {
+                    Err(MigrationError::Stopped {
+                        error,
+                        report: RunReport { notes, ..report },
+                    })
+                }
+            }
+            Err(MigrationError::Stopped { error, mut report }) => {
+                report.notes.splice(0..0, removed);
+                report.notes.extend(replaced);
+                Err(MigrationError::Stopped { error, report })
+            }
+            other => other,
         }
     }
 

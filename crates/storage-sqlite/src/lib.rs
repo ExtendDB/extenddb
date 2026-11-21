@@ -20,15 +20,6 @@
 //! NOTE: this is the catalog-layer build slice. The data-plane engine modules
 //! and the `ServerComponents` registration are added in the engine slice.
 
-// On a browser `wasm32-unknown-unknown` target this crate compiles a subset of
-// itself — the data plane over the `wasm_sqlx` shim — and the server, CLI,
-// file-lock and file-migration surface is either gated off (where it uses a C
-// sysroot, `flock`, or the online-backup C API) or compiled but unreachable.
-// Items live on native (which compiles the whole crate) but look unused to the
-// wasm compiler; silence that here for wasm only. Native keeps full warning
-// discipline (the clippy gate runs on native).
-#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
-
 // On wasm the backend cannot use `sqlx` + the C `libsqlite3-sys` (a dedicated
 // OS thread per connection, a C sysroot), so every `sqlx::` path in this crate
 // resolves instead to the in-crate `wasm_sqlx` module: aliasing this crate to
@@ -113,17 +104,30 @@ mod create_table;
 mod credential_store;
 mod data;
 mod delete_table;
+// The server's background workers (`hooks` spawns `workers`); the browser
+// build runs no background task.
+#[cfg(not(target_arch = "wasm32"))]
 mod hooks;
 mod management_store;
 mod metadata;
 pub mod migrations;
 mod number_key;
+// The lifecycle commands' backend helpers, which only the native `backend()`
+// installs.
+#[cfg(not(target_arch = "wasm32"))]
 mod operations;
 mod password_hash_store;
 mod restore_engine;
 #[cfg(test)]
 mod restore_job_tests;
 mod schema;
+// The browser build calls only `database_file` (to classify `:memory:`) and
+// names the `ServeLock` type of the engine's lock field, which stays `None`;
+// taking a lock is for the server and the CLI.
+#[cfg_attr(
+    target_arch = "wasm32",
+    expect(dead_code, reason = "the wasm build takes no file lock")
+)]
 mod serve_lock;
 // Table snapshots copy the database file on disk (`std::fs`, `std::os::unix`),
 // which the browser's in-memory build cannot do; the `SnapshotEngine` subtrait
@@ -145,6 +149,7 @@ mod vector_bench;
 mod vector_search;
 mod warm_throughput;
 mod worker;
+#[cfg(not(target_arch = "wasm32"))]
 mod workers;
 
 // On wasm, the synchronous reimplementation of the slice of the `sqlx` API the

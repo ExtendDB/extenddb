@@ -735,6 +735,9 @@ impl SqliteEngine {
     /// record was aged (one already at the epoch is not reported again).
     /// Runs before the server takes requests, so no restore of this process
     /// can be in flight.
+    // Server startup recovery only; the browser build has no earlier run to
+    // recover from.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn expire_restore_job_heartbeats(
         &self,
     ) -> Result<Vec<(String, RestoreKind)>, StorageError> {
@@ -765,6 +768,9 @@ impl SqliteEngine {
     /// the row with a heartbeat the jobs' check would otherwise honour for
     /// the whole stale window). Returns the holder's label when a row was
     /// removed.
+    // Server startup recovery only; the browser build has no earlier run to
+    // recover from.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn clear_maintenance_claim(&self) -> Result<Option<String>, StorageError> {
         let _writer = self.write_lock.lock().await;
         sqlx::query_scalar("DELETE FROM backup_maintenance RETURNING holder")
