@@ -9,15 +9,16 @@
 //! [`parse_request`] with the operation name and the raw request body, then
 //! calls [`ParsedRequest::admit`] on the result to get the body it passes to
 //! [`crate::dispatch`]. A check added to either step reaches both entry
-//! points.
+//! points, except on the operations the WebAssembly adapter refuses before
+//! it calls [`parse_request`]: the three PartiQL operations and
+//! `DescribeEndpoints`.
 //!
 //! They are the only checks both entry points make before dispatch. Every
 //! other check the server makes before it dispatches a request is its own
 //! (most of them are in its request handler, `handle_request`, and its
-//! authorization, `authorize_request`), and apart from the IAM decision each
-//! runs in developer mode too. The WebAssembly adapter makes none of them, so
-//! a check that must reach both entry points belongs in one of the two steps
-//! here.
+//! authorization, `authorize_request`). The WebAssembly adapter makes none of
+//! them, so a check that must reach both entry points belongs in one of the
+//! two steps here.
 //!
 //! The types fix the order of the two steps: `admit` is a method of
 //! [`ParsedRequest`], which only `parse_request` constructs, so `admit` runs
