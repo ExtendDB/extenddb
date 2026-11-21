@@ -284,6 +284,8 @@ pub fn migration(id: MigrationId) -> Migration<SqliteStores> {
 }
 
 /// The database file's lock, held for a migration. Dropping it releases it.
+// Only `file_database` takes one and `commands` reads it; wasm32 compiles neither.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
 pub struct MigrationLock {
     _lock: crate::serve_lock::ServeLock,
