@@ -4369,16 +4369,13 @@ fn account_prefix_does_not_match() {
 /// answered each shape alike. A region field the restore answers with its
 /// cross-region text is in
 /// `a_restore_of_a_backup_arn_in_another_region_is_the_cross_region_answer`.
-/// The `ListBackups` cursor is checked by the same parser before its
-/// account is compared, with no not-found answer; the service's texts for it
-/// are its own.
+/// The `ListBackups` cursor has its own texts and order
+/// (`list_backups_cursor_must_match_the_account_region_and_table`).
 #[tokio::test]
 async fn malformed_arn_is_a_validation_exception_with_the_services_text() {
     const NOT_VALID: &str = "ValidationException: Invalid Request: BackupArn is not valid";
     const INVALID: &str = "ValidationException: Invalid Backup ARN";
     const DENIED: &str = "AccessDeniedException: Access is denied";
-    const MISMATCH: &str = "ValidationException: Invalid Request: The supplied \
-                            ExclusiveStartBackupArn does not match the account";
     let id = "01791976431438-73d8d5bc";
     let base = format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Music");
     let upper = format!("{base}/backup/01791976431438-73D8D5BC");
@@ -4478,17 +4475,6 @@ async fn malformed_arn_is_a_validation_exception_with_the_services_text() {
                 "{member} {candidate:?}"
             );
         }
-        // The cursor compares the account after the shape: an ARN the parser
-        // refuses is `Invalid Backup ARN`, one it reads in another account
-        // does not match the account. Derived from the parser, not measured.
-        let cursor = match *expected {
-            DENIED if extenddb_storage::util::check_backup_arn(candidate).is_ok() => MISMATCH,
-            DENIED => INVALID,
-            e if e == not_found => NOT_VALID,
-            e => e,
-        };
-        let listed = list(&fake, json!({ "ExclusiveStartBackupArn": candidate })).await;
-        assert_eq!(answer(listed.unwrap_err()), cursor, "cursor {candidate:?}");
     }
     assert_eq!(fake.source_reads(), 0);
     assert!(fake.restores().is_empty());
@@ -4675,7 +4661,7 @@ async fn a_backup_stored_under_another_region_resolves_as_written() {
 /// of any content, `{}` included, the restore answers as for its own region.
 /// A table segment outside the length bounds is `Invalid Backup ARN` first,
 /// in another region and in the server's. DescribeBackup and DeleteBackup
-/// (`arn_field`) and the `ListBackups` cursor keep the shape's answer.
+/// (`arn_field`) keep the shape's answer.
 /// DescribeBackup and DeleteBackup give the length's answer for a backup
 /// they do not find; one stored under other bounds is found (ExtendDB's
 /// choice). Measured on DynamoDB in us-east-1 on 21 and 22 Nov 2026, each
@@ -4739,16 +4725,11 @@ async fn a_restore_of_a_backup_arn_in_another_region_is_the_cross_region_answer(
         assert_eq!(result.err(), Some(expected), "{candidate}");
     }
     // DescribeBackup and DeleteBackup (`arn_field`) keep the shape's answer
-    // for a region field outside it, and the `ListBackups` cursor its own
-    // text for the three its earlier test held.
+    // for a region field outside it.
     for region in ["us/east-1", "..", "us-east-1/..", "US-EAST-1"] {
         let candidate = arn_of("aws", region, "Music", ID);
         let field = arn_field(&json!({ "BackupArn": candidate }));
         assert_eq!(answer(field.unwrap_err()), NOT_VALID, "{region}");
-        if region != "US-EAST-1" {
-            let cursor = list(&fake, json!({ "ExclusiveStartBackupArn": candidate })).await;
-            assert_eq!(answer(cursor.unwrap_err()), NOT_VALID, "cursor {region}");
-        }
     }
     // A backup of `abc` stored before the minimum went up to 5 is described
     // and deleted. With no backup, they answer a table segment of 2 or 300
@@ -4782,7 +4763,7 @@ async fn a_restore_of_a_backup_arn_in_another_region_is_the_cross_region_answer(
 /// first, as one with an empty account is. Measured on DynamoDB in us-east-1
 /// on 21 Nov 2026 for `aws-cn` on RestoreTableFromBackup and DescribeBackup;
 /// the other partitions here are derived from it. The `ListBackups` cursor
-/// is refused before its account is compared.
+/// is refused with its own text before its account is compared.
 #[tokio::test]
 async fn an_arn_in_another_partition_is_a_validation_exception() {
     let ours = arn(ACCOUNT);
@@ -7543,60 +7524,157 @@ async fn list_backups_refuses_a_cursor_it_cannot_place() {
                 .await
                 .unwrap_err()
         ),
-        "Invalid Backup ARN"
+        "1 validation error detected: Value 'garbage' at 'exclusiveStartBackupArn' failed to \
+         satisfy constraint: Member must have length greater than or equal to 37"
     );
 }
 
-/// Measured on DynamoDB: a cursor of another account,
-/// another region, or a table other than `TableName`'s is a
-/// `ValidationException`, in that order; the account text is the service's,
-/// the other two complete the fragments captured ("does not match the
-/// region", "does not match the table name predicate").
+/// Measured on DynamoDB in us-east-1 on 6, 21 and 22 Nov 2026 (ListBackups,
+/// each cursor twice): the `ExclusiveStartBackupArn` checks in the service's
+/// order. The length (37 to 1024), the structure, a backup ARN (partition,
+/// service, region shape, account, id), then the region, the account and
+/// the table of `TableName`. Each row changes one or two fields of a cursor
+/// that names no listed backup.
 #[tokio::test]
 async fn list_backups_cursor_must_match_the_account_region_and_table() {
-    let fake = fake_with_summaries(vec![summary(1, 1), summary(2, 2)]);
+    const MIN: &str = "1 validation error detected: Value '{value}' at \
+                       'exclusiveStartBackupArn' failed to satisfy constraint: Member must \
+                       have length greater than or equal to 37";
+    const MAX: &str = "1 validation error detected: Value '{value}' at \
+                       'exclusiveStartBackupArn' failed to satisfy constraint: Member must \
+                       have length less than or equal to 1024";
+    const IBA: &str = "Invalid Backup ARN";
+    const NOT_BACKUP: &str =
+        "Invalid Request: The supplied ExclusiveStartBackupArn is not a valid backup arn";
+    const NO_REGION: &str =
+        "Invalid Request: The supplied ExclusiveStartBackupArn does not match the region";
+    const NO_ACCOUNT: &str =
+        "Invalid Request: The supplied ExclusiveStartBackupArn does not match the account";
+    const NO_TABLE: &str = "Invalid Request: The supplied ExclusiveStartBackupArn does not \
+                            match the table name predicate";
+    const OTHER: &str = "999999999999";
+    const WEST: &str = "us-west-2";
+    // A backup of a table outside the name bounds, stored under other
+    // `[limits]`: its ARN pages on.
+    let mut short = summary(3, 0);
+    short.backup_arn = short.backup_arn.replace("/Music/", "/ab/");
+    let fake = fake_with_summaries(vec![summary(1, 1), summary(2, 2), short.clone()]);
     let id = "01791976431438-73d8d5bc";
-    let cases = [
-        (
-            format!("arn:aws:dynamodb:{REGION}:999999999999:table/Music/backup/{id}"),
-            None,
-            "account",
-        ),
-        (
-            format!("arn:aws:dynamodb:eu-west-1:{ACCOUNT}:table/Music/backup/{id}"),
-            None,
-            "region",
-        ),
-        (
-            format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Other/backup/{id}"),
-            Some("Music"),
-            "table name predicate",
-        ),
-        // Account before region before table.
-        (
-            format!("arn:aws:dynamodb:eu-west-1:999999999999:table/Other/backup/{id}"),
-            Some("Music"),
-            "account",
-        ),
-        (
-            format!("arn:aws:dynamodb:eu-west-1:{ACCOUNT}:table/Other/backup/{id}"),
-            Some("Music"),
-            "region",
-        ),
+    let ok = format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Music/backup/{id}");
+    // `ok` with one field changed.
+    let region_is = |to: &str| ok.replace(REGION, to);
+    let account_is = |to: &str| ok.replace(ACCOUNT, to);
+    let table_is = |to: &str| ok.replace("/Music/", &format!("/{to}/"));
+    let id_is = |to: &str| ok.replace(id, to);
+    let pages = [
+        ok.clone(),
+        format!("{ok}\n"),
+        id_is("01791976431438-73D8D5BC"),
+        short.backup_arn.clone(),
     ];
-    for (cursor, table, what) in cases {
+    for page in pages {
+        let body = json!({ "ExclusiveStartBackupArn": page });
+        let listed = list(&fake, body).await;
+        assert!(listed.is_ok(), "{page:?}: {listed:?}");
+    }
+    let rows: Vec<(String, &str)> = vec![
+        // 1. The length, before anything else; 37 and 1024 themselves
+        // pass (the model's bounds).
+        (String::new(), MIN),
+        ("x".to_owned(), MIN),
+        ("not-an-arn".to_owned(), MIN),
+        ("arn:aws:dynamodb".to_owned(), MIN),
+        (format!("arn:aws:dynamodb:{REGION}"), MIN),
+        (ok[..36].to_owned(), MIN),
+        (ok[..37].to_owned(), IBA),
+        (format!("{ok}{}", "x".repeat(950)), MAX),
+        (table_is(&"x".repeat(1000)), MAX),
+        (format!("{ok}{}", "x".repeat(1024 - ok.len())), NOT_BACKUP),
+        // 2. The structure.
+        (format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}"), IBA),
+        (ok.replace(&format!("/backup/{id}"), ""), IBA),
+        (ok.replace("/backup/", "/stream/"), IBA),
+        (ok.replace(&format!("backup/{id}"), "index/x"), IBA),
+        (ok.replace(&format!("{ACCOUNT}:"), ""), IBA),
+        (format!("x{ok}"), IBA),
+        (ok.replace("arn:", "ARN:"), IBA),
+        (ok.replace("arn:aws:", "arn::"), IBA),
+        (ok.replace("table/", "TABLE/"), IBA),
+        (ok.replace("/backup/", "/BACKUP/"), IBA),
+        (format!("{ok}/x"), IBA),
+        (id_is(""), IBA),
+        (id_is("*"), IBA),
+        (id_is("ab"), IBA),
+        (table_is("ab"), IBA),
+        (table_is(&"a".repeat(256)), IBA),
+        (table_is("Mu sic"), IBA),
+        (table_is("Mu\u{0}sic"), IBA),
+        (table_is("Mu\u{1}sic"), IBA),
+        (table_is("Mu sic").replace(ACCOUNT, OTHER), IBA),
+        // 3. A backup ARN: the partition, the service, the region's shape,
+        // an account that is not empty and the id.
+        (ok.replace("arn:aws:", "arn:aws-cn:"), NOT_BACKUP),
+        (ok.replace(":dynamodb:", ":DynamoDB:"), NOT_BACKUP),
+        (ok.replace(":dynamodb:", ":s3:"), NOT_BACKUP),
+        (region_is(""), NOT_BACKUP),
+        (region_is("us/east-1"), NOT_BACKUP),
+        (region_is(".."), NOT_BACKUP),
+        (region_is("us-east-1/.."), NOT_BACKUP),
+        (account_is(""), NOT_BACKUP),
+        (id_is("abc"), NOT_BACKUP),
+        (id_is("bad-id"), NOT_BACKUP),
+        (format!("{ok}x"), NOT_BACKUP),
+        (format!("{ok}\u{0}"), NOT_BACKUP),
+        (format!("{ok}\n\u{7}"), NOT_BACKUP),
+        (id_is("0170\u{0}"), NOT_BACKUP),
+        (id_is("01791976431438-*"), NOT_BACKUP),
+        (id_is("01791976431438-73d8d5b"), NOT_BACKUP),
+        (id_is("01791976431438-73d8d5bcd"), NOT_BACKUP),
+        (id_is("01791976431438-73d8d5bg"), NOT_BACKUP),
+        (id_is("0179197643143x-73d8d5bc"), NOT_BACKUP),
+        (id_is("1791976431438-73D8D5BC"), NOT_BACKUP),
+        (id_is("01791976431438-73D8D5BCx"), NOT_BACKUP),
+        (id_is("bad-id").replace(ACCOUNT, OTHER), NOT_BACKUP),
+        (id_is("bad-id").replace(REGION, WEST), NOT_BACKUP),
+        (id_is("bad-id").replace(REGION, "US-EAST-1"), NOT_BACKUP),
+        (account_is(OTHER).replace(":dynamodb:", ":s3:"), NOT_BACKUP),
+        (region_is(WEST).replace(":dynamodb:", ":s3:"), NOT_BACKUP),
+        (account_is("").replace(REGION, WEST), NOT_BACKUP),
+        (account_is(OTHER).replace(REGION, ""), NOT_BACKUP),
+        (account_is(OTHER).replace("aws:", "aws-cn:"), NOT_BACKUP),
+        // 4. The region, compared as written.
+        (region_is(WEST), NO_REGION),
+        (region_is("US-EAST-1"), NO_REGION),
+        (region_is(WEST).replace(ACCOUNT, OTHER), NO_REGION),
+        (region_is("US-EAST-1").replace(ACCOUNT, OTHER), NO_REGION),
+        // 5. The account, of any characters.
+        (account_is(OTHER), NO_ACCOUNT),
+        (account_is("12345678901"), NO_ACCOUNT),
+        (account_is("1234567890123"), NO_ACCOUNT),
+        (account_is("abcdefghijkl"), NO_ACCOUNT),
+        (account_is("1234\u{0}"), NO_ACCOUNT),
+    ];
+    // With a `TableName` of another table unless the row says `Music`.
+    let filtered: Vec<(String, &str, &str)> = vec![
+        (ok.clone(), "Other", NO_TABLE),
+        (account_is(OTHER), "Other", NO_ACCOUNT),
+        (region_is(WEST), "Other", NO_REGION),
+        (id_is("bad-id"), "Other", NOT_BACKUP),
+        (id_is("bad-id"), "Music", NOT_BACKUP),
+        (table_is("Mu sic"), "Other", IBA),
+    ];
+    let filtered = filtered.into_iter().map(|(c, t, e)| (c, Some(t), e));
+    for (cursor, table, expected) in rows.into_iter().map(|(c, e)| (c, None, e)).chain(filtered) {
         let mut body = json!({ "ExclusiveStartBackupArn": cursor });
         if let Some(table) = table {
             body["TableName"] = json!(table);
         }
-        let msg = validation_message(list(&fake, body).await.unwrap_err());
-        assert_eq!(
-            msg,
-            format!(
-                "Invalid Request: The supplied ExclusiveStartBackupArn does not match the {what}"
-            ),
-            "{cursor}"
-        );
+        let answer = list(&fake, body)
+            .await
+            .map(drop)
+            .map_err(validation_message);
+        let expected = expected.replace("{value}", &cursor);
+        assert_eq!(answer, Err(expected), "{cursor:?} {table:?}");
     }
     // Another table's cursor without TableName is fine (the listing is the
     // account's), and a trailing newline is trimmed.
