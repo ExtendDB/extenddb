@@ -73,13 +73,20 @@ impl ExtendDb {
     /// `__wbg_ptr` property of the object `submit` is called on to the module
     /// as the address of an instance. wasm-bindgen's conversion of that
     /// receiver (`borrow_rust_object` in its runtime) refuses a null address
-    /// and an address whose borrow flag reads as mutably borrowed, and takes
+    /// and an address whose borrow flag allows no further shared borrow: a
+    /// negative flag (the value is mutably borrowed) or `isize::MAX` (the most
+    /// shared borrows the flag can count, `0x7fffffff` on wasm32). It takes
     /// the memory at any other address to be an instance. So a call on any
     /// other object is undefined. It can throw from `submit` itself: an
-    /// instance after `free()`, an object made with `new ExtendDb()` and an
-    /// object with no `__wbg_ptr` throw `Error: null pointer passed to rust`,
-    /// and an address whose flag reads as mutably borrowed throws
-    /// `Error: recursive use of an object detected which would lead to unsafe aliasing in rust`.
+    /// address whose flag allows no further shared borrow throws
+    /// `Error: recursive use of an object detected which would lead to unsafe aliasing in rust`,
+    /// and, in the JavaScript wasm-bindgen generates without `--debug` (as for
+    /// `wasm-pack build --release`), an instance after `free()`, an object
+    /// made with `new ExtendDb()` and an object with no `__wbg_ptr` throw
+    /// `Error: null pointer passed to rust`. The JavaScript it generates with
+    /// `--debug`, which `wasm-pack build --dev` passes, refuses those three
+    /// with errors of its own: `new ExtendDb()` itself throws, and `submit`
+    /// throws before it calls the module.
     /// It can trap: an address past the end of linear memory throws
     /// `RuntimeError: memory access out of bounds`. Or it can answer from
     /// another instance: an object that carries a live instance's `__wbg_ptr`,
