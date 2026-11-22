@@ -28,9 +28,10 @@ extenddb-core = { workspace = true }
 # native or wasm32) has no `partiql` feature; a native build of the whole
 # workspace has it, because the server asks for the engine's defaults. The
 # browser build's refusal of the PartiQL operations does not depend on it:
-# this crate refuses them before dispatch. The engine's PartiQL surface needs
-# an item authorizer the browser build does not install, and its snapshot
-# path reads the backup runtime, which the wasm engine build does not carry.
+# this crate refuses them before dispatch (`unsupported_reason` in
+# src/runtime.rs). The engine's PartiQL surface needs an item authorizer the
+# browser build does not install, and its snapshot path reads the backup
+# runtime, which the wasm engine build does not carry.
 extenddb-engine = { workspace = true }
 extenddb-storage = { workspace = true }
 # The in-browser backend: the SQLite storage engine opened on a `:memory:`
