@@ -1575,10 +1575,12 @@ pub(crate) async fn finish_backup_delete<S: BackupCatalog + ?Sized>(
         .map_err(|e| failed("marking the row DELETED", &e))
 }
 
-/// Overrides refused outright. `VectorIndexOverride` is not in the botocore
-/// 1.33.13 model; newer models and SDKs send it. The index overrides and
-/// `OnDemandThroughputOverride` are applied as the service applies them; see
-/// [`overrides`].
+/// Overrides refused outright, unless null or an empty list, which the
+/// service reads as no override (measured on DynamoDB in us-east-1 on 21 Nov
+/// 2026 with `VectorIndexOverride`). `VectorIndexOverride` is not in the
+/// botocore 1.33.13 model; newer models and SDKs send it. The index
+/// overrides and `OnDemandThroughputOverride` are applied as the service
+/// applies them; see [`overrides`].
 const UNSUPPORTED_RESTORE_TABLE_OVERRIDE_FIELDS: [&str; 1] = ["VectorIndexOverride"];
 
 /// The rule that depends only on the request itself: a PROVISIONED override
@@ -1601,15 +1603,23 @@ fn validate_override_shape(overrides: &RestoreTableOverrides) -> Result<(), Dyna
 /// The values of `BillingModeOverride`, in the order the service lists them.
 const BILLING_MODES: &[&str] = &["PROVISIONED", "PAY_PER_REQUEST"];
 
+/// The values of `SSESpecificationOverride.SSEType`, in the order the
+/// service lists them.
+const SSE_TYPES: &[&str] = &["AES256", "KMS"];
+
 /// A restore's `TargetTableName` and the override values the service model
 /// refuses, checked after the `BackupArn`'s account and shape and before its
 /// id and region (measured on DynamoDB in us-east-1 on 21 Nov 2026). A name
 /// of a bad length gets the restore's length text alone. Otherwise every
 /// failed constraint is listed in one message, whatever the order of the
-/// members in the request: each `ProvisionedThroughputOverride` member
-/// below 1 (`WriteCapacityUnits` first), then a `BillingModeOverride`
-/// outside its enum, then the name's constraints
-/// ([`pitr::check_restore_table_name`]). A member of another JSON kind is
+/// members in the request: each `ProvisionedThroughputOverride` member that
+/// is missing or below 1 once its fraction is dropped (`WriteCapacityUnits`
+/// first), then a `BillingModeOverride` outside its enum, then an
+/// `SSESpecificationOverride.SSEType` outside its enum, then the name's
+/// constraints ([`pitr::check_restore_table_name`]), then each member an
+/// index override entry is missing
+/// ([`overrides::IndexOverrides::missing_members`]). A null member is a
+/// missing one. A member of another JSON kind is
 /// [`check_restore_override_kinds`]'s, which runs first. Reads no storage.
 ///
 /// # Errors
@@ -1620,8 +1630,12 @@ pub fn check_restore_name_and_overrides(
     name: &str,
     bounds: (usize, usize),
 ) -> Result<(), DynamoDbError> {
-    let throughput = body.get("ProvisionedThroughputOverride");
-    let below_one: Vec<(String, &str)> = [
+    use extenddb_core::error::MEMBER_NOT_NULL;
+    let throughput = body
+        .get("ProvisionedThroughputOverride")
+        .filter(|v| v.is_object());
+    // A value of `None` is a missing member.
+    let failed_units: Vec<(Option<String>, &str)> = [
         (
             "WriteCapacityUnits",
             "provisionedThroughputOverride.writeCapacityUnits",
@@ -1633,14 +1647,20 @@ pub fn check_restore_name_and_overrides(
     ]
     .into_iter()
     .filter_map(|(member, path)| {
-        let units = throughput?.get(member)?.as_i64().filter(|&u| u < 1)?;
-        Some((units.to_string(), path))
+        let Some(units) = override_member(throughput?, member) else {
+            return Some((None, path));
+        };
+        let units = capacity_units(units.as_number()?);
+        (units < 1).then(|| (Some(units.to_string()), path))
     })
     .collect();
     let constraint = "Member must have value greater than or equal to 1";
-    let mut earlier: Vec<_> = below_one
+    let mut earlier: Vec<_> = failed_units
         .iter()
-        .map(|(value, path)| (value.as_str(), *path, constraint))
+        .map(|(value, path)| match value {
+            Some(value) => (value.as_str(), *path, constraint),
+            None => ("", *path, MEMBER_NOT_NULL),
+        })
         .collect();
     let in_set = crate::enum_constraint(BILLING_MODES);
     if let Some(mode) = body
@@ -1650,7 +1670,33 @@ pub fn check_restore_name_and_overrides(
     {
         earlier.push((mode, "billingModeOverride", &in_set));
     }
-    pitr::check_restore_table_name(name, "targetTableName", bounds, &earlier)
+    let sse_types = crate::enum_constraint(SSE_TYPES);
+    if let Some(sse_type) = body
+        .get("SSESpecificationOverride")
+        .and_then(|sse| sse.get("SSEType"))
+        .and_then(Value::as_str)
+        .filter(|sse_type| !SSE_TYPES.contains(sse_type))
+    {
+        earlier.push((sse_type, "sSESpecificationOverride.sSEType", &sse_types));
+    }
+    let missing = overrides::IndexOverrides::missing_members(body);
+    let later: Vec<_> = missing
+        .iter()
+        .map(|path| ("", path.as_str(), MEMBER_NOT_NULL))
+        .collect();
+    pitr::check_restore_table_name(name, "targetTableName", bounds, &earlier, &later)
+}
+
+/// A capacity figure as the range clause reads it: a fraction is dropped
+/// (measured on DynamoDB in us-east-1 on 21 Nov 2026: 0.5 is answered as
+/// 0) and a figure past the 64-bit range is saturated. The parse of the
+/// override still refuses a figure above `i64::MAX` and a fraction of 1 or
+/// more, which #1167 changes.
+fn capacity_units(units: &serde_json::Number) -> i64 {
+    // `as` truncates a float toward zero and saturates it at the 64-bit bounds.
+    units
+        .as_i64()
+        .unwrap_or_else(|| units.as_f64().map_or(0, |v| v as i64))
 }
 
 /// The rule that needs the backup's own billing mode: a throughput override
@@ -1686,7 +1732,7 @@ fn override_member<'a>(body: &'a Value, name: &str) -> Option<&'a Value> {
 /// [`check_restore_name_and_overrides`]'s, which runs first.
 fn parse_restore_table_overrides(body: &Value) -> Result<RestoreTableOverrides, DynamoDbError> {
     for field in UNSUPPORTED_RESTORE_TABLE_OVERRIDE_FIELDS {
-        if override_member(body, field).is_some() {
+        if override_member(body, field).is_some_and(|v| *v != json!([])) {
             return Err(DynamoDbError::ValidationException(format!(
                 "RestoreTableFromBackup does not support {field} on ExtendDB"
             )));
