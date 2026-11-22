@@ -38,8 +38,9 @@
 //!    instead, the reason naming that code.
 //! 3. **Compiled and called on wasm32, but reached by no wasm32 request**, and
 //!    calling a method the WebAssembly clippy step disallows:
-//!    `#[allow(clippy::disallowed_methods, reason = "...")]` on the smallest
-//!    enclosing item, the reason naming why no wasm32 request reaches it.
+//!    `#[allow(clippy::disallowed_methods, reason = "...")]` on the function
+//!    that holds the call, or on its statement, the reason naming why no
+//!    wasm32 request reaches it.
 //!
 //! NOTE: this is the catalog-layer build slice. The data-plane engine modules
 //! and the `ServerComponents` registration are added in the engine slice.

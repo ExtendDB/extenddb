@@ -52,18 +52,17 @@
 #
 # A call that compiles for wasm but is never reached there carries
 # `#[allow(clippy::disallowed_methods, reason = "...")]` (for a type,
-# `clippy::disallowed_types`), on its function or, when the rest of the
-# function runs on wasm, on that one statement. The reason names the callers
-# and why none runs on wasm.
+# `clippy::disallowed_types`), as an outer attribute on the function that
+# holds the call or, when the rest of the function runs on wasm, on that one
+# statement. The reason names the callers and why none runs on wasm. An item
+# written inside that function or statement needs an allow of its own.
 #
 # A path here that does not resolve only makes clippy print a warning, which
 # -D warnings does not turn into an error. devtools/check-wasm-clippy-guard,
 # run by the workflow after the clippy step, fails if an entry has no probe in
-# that script, if clippy reports one as unresolved, or if the step accepts a
-# call to one. It also fails on a setting that can switch the clippy step's
-# checks off, such as an allow of clippy::all in a crate the wasm build
-# compiles or a --cap-lints in rustflags; the script's documentation lists
-# each setting it reads and refuses, and what it does not see.
+# that script or does not resolve, if a call or a use of one is not under such
+# an allow, or if a lock guard or a RefCell borrow is held across an .await;
+# its documentation says how it checks that and what it does not see.
 
 disallowed-methods = [
     # Clock
