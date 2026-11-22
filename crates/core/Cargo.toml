@@ -83,9 +83,10 @@ time = { workspace = true, features = ["wasm-bindgen"] }
 hex = "0.4"
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
-# 0.3.80 is the release for wasm-bindgen 0.2.130, the version of the test
-# runner (wasm-bindgen-cli) the wasm workflow installs. Under that runner the
-# test module of an older release is refused or runs no test.
+# Keep this floor at the release that goes with the wasm-bindgen version in
+# Cargo.lock (0.3.80 goes with 0.2.130): the wasm workflow installs the test
+# runner (wasm-bindgen-cli) of that version, and under it the test module of
+# an older release is refused or runs no test.
 wasm-bindgen-test = "0.3.80"
 
 [features]

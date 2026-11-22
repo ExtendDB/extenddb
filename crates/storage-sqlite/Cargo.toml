@@ -80,9 +80,8 @@ sqlite-wasm-rs = { version = "0.6.3", features = ["wasm-bindgen"] }
 tokio = { version = "1", default-features = false, features = ["rt", "sync", "time", "macros"] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
-# 0.3.80 is the release for wasm-bindgen 0.2.130, the version of the test
-# runner (wasm-bindgen-cli) the wasm workflow installs. Under that runner the
-# test module of an older release is refused or runs no test.
+# The same floor as extenddb-core's wasm-bindgen-test, for the reason its
+# manifest gives.
 wasm-bindgen-test = "0.3.80"
 
 # The native test dependencies pull the engine, the backup store and tokio's
