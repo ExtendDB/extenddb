@@ -22,15 +22,10 @@
 //! same error:
 //!
 //! - **Refused on both targets** with a `ValidationException` that names the
-//!   build: the three `PartiQL` operations, whose statements the engine
-//!   authorizes through an item authorizer this build does not install (the
-//!   refusal comes before the engine is reached, whether or not the engine was
-//!   built with its `partiql` feature: a workspace build turns it on for the
-//!   server, and a build of this crate alone leaves it off); and
-//!   `DescribeEndpoints`, as the build has no network address to report. Both
-//!   refusals go by the operation name alone, before the body is parsed, so a
-//!   body that is not JSON gets them too, where the server answers
-//!   `SerializationException`.
+//!   build: the operations [`unsupported_reason`] names, each for the reason
+//!   its documentation gives. The refusal goes by the operation name alone,
+//!   before the body is parsed, so a body that is not JSON gets it too, where
+//!   the server answers `SerializationException`.
 //! - **Refused as the server refuses them**: every
 //!   `RestoreTableToPointInTime`, and an `UpdateContinuousBackups` that enables
 //!   point-in-time recovery, through `extenddb_engine::parse_request` and
@@ -73,8 +68,8 @@
 //! (`authorize_request` in `crates/server/src/request_helpers.rs`) check it.
 //! Of the server's checks, [`Engine::dispatch`] runs only the two the engine
 //! owns, `extenddb_engine::parse_request` and `ParsedRequest::admit`, and runs
-//! neither for the `PartiQL` operations and `DescribeEndpoints`, which it
-//! refuses first. A request one of the others would refuse gets the answer
+//! neither for an operation [`unsupported_reason`] names, which it refuses
+//! first. A request one of the others would refuse gets the answer
 //! this build gives it anyway: the engine handler's for the operation, or one
 //! of the refusals above. The README section "Checks the server makes that
 //! this build does not" describes the others, with the server's answer and
@@ -102,8 +97,8 @@ const REGION: &str = "us-east-1";
 const ACCOUNT_ID: &str = "000000000000";
 
 /// The server address [`extenddb_engine::dispatch`] takes. Dispatch reads it
-/// only to answer `DescribeEndpoints`, which this build refuses before
-/// dispatch, so it is never reported.
+/// only to answer `DescribeEndpoints`, which [`unsupported_reason`] refuses
+/// before dispatch, so it is never reported.
 const SERVER_ADDR: &str = "";
 
 /// Backup job-slot count for the native backup runtime. One is enough: the
@@ -201,11 +196,9 @@ impl Engine {
     /// Apply the browser-build operation policy and the engine's pre-dispatch
     /// checks, then dispatch into the engine.
     async fn dispatch(&self, operation: &str, body_json: &str) -> Result<Value, DynamoDbError> {
-        // Refusals that need no request body: PartiQL and DescribeEndpoints.
-        // Answered before the operation-known check, so a PartiQL request gets
-        // the stated reason whether or not the engine was built with its
-        // `partiql` feature: without it, `parse_request` would answer
-        // `UnknownOperationException`.
+        // Refuse the operations `unsupported_reason` names first, by name
+        // alone, so that neither the body nor the engine's features change
+        // their answer (its documentation says why each is refused here).
         if let Some(reason) = unsupported_reason(operation) {
             return Err(unsupported(operation, reason));
         }
@@ -228,9 +221,9 @@ impl Engine {
     /// The server builds this per request after authentication. The browser
     /// build verifies no signature and runs no authorization, so the
     /// auth-derived fields are empty: no pre-read key info, an empty auth cache,
-    /// no cached key lookup. There is no item authorizer (which would authorize
-    /// the item reads and writes `PartiQL` names in its statement body) because
-    /// the `PartiQL` operations are refused before dispatch. Imports and exports
+    /// no cached key lookup. There is no item authorizer: the engine asks one
+    /// only while it runs a `PartiQL` statement, and [`unsupported_reason`]
+    /// refuses those operations before dispatch. Imports and exports
     /// are disabled (empty allow-lists — the browser has no filesystem). The
     /// backup runtime is present only off wasm, where the engine's backup
     /// handlers read it; on wasm the engine refuses those operations.
@@ -253,9 +246,17 @@ impl Engine {
 }
 
 /// The reason an operation is refused outright in the browser build, or `None`
-/// if it is not refused here. The `PartiQL` operations are not part of the
-/// build; `DescribeEndpoints` reports the address a client sends requests to,
-/// and the build is called in-process with no network address.
+/// if it is not refused here. These are the operations the build refuses by
+/// name, before the engine's checks:
+///
+/// - The `PartiQL` operations. The engine authorizes the item reads and writes
+///   of a statement through an item authorizer, and the build installs none.
+///   They are refused here, before `parse_request`, because whether the engine
+///   knows them depends on its `partiql` feature (this crate's manifest says
+///   when a build has it): without it, `parse_request` would answer
+///   `UnknownOperationException`.
+/// - `DescribeEndpoints`. It reports the address a client sends requests to,
+///   and the build is called in-process with no network address.
 fn unsupported_reason(operation: &str) -> Option<&'static str> {
     match operation {
         "ExecuteStatement" | "BatchExecuteStatement" | "ExecuteTransaction" => {

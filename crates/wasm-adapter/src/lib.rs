@@ -28,7 +28,7 @@
 //! The build authenticates no request and authorizes none; every request runs
 //! under a single fixed account.
 //!
-//! The module doc of `runtime` lists the requests the build refuses, on
+//! The module doc of `runtime` says which requests the build refuses, on
 //! both targets or on wasm only, and the answer to each.
 
 mod runtime;
