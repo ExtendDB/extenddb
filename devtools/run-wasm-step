@@ -219,7 +219,8 @@ case "$step" in
         # checks the adapter's library alone, which is also what cargo checks
         # by default here: the adapter has no binary target, and tests are not
         # a default target. Options given after the step name go to cargo
-        # before its `--`, for a caller that wants another message format.
+        # before its `--`, for a caller that wants another message format or
+        # colour setting.
         # Options after a `--` go to clippy after the step's own `-D warnings`,
         # for a caller that adds lint options.
         cargo_options=()
