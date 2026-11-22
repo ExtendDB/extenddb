@@ -113,9 +113,12 @@ wasm_bindgen_cli_advice() {
 # it gives the runner. A value the caller sets goes to cargo as it is;
 # otherwise this sets the one on PATH, else the one in cargo's bin directory
 # ($CARGO_HOME/bin), where `cargo install` puts it, by its full path. Before
-# `cargo test` runs, the suite runs the value's first word, the runner's
-# path, with --version, checks that the second word it prints is the crate's
-# version, and otherwise stops with the command that installs that version.
+# `cargo test` runs, the suite runs the value's first word with --version,
+# checks that the second word it prints is the crate's version, and
+# otherwise stops with the command that installs that version. It splits the
+# value at ASCII whitespace only, where cargo splits at any Unicode
+# whitespace, so a value whose path and arguments other whitespace separates
+# stops at this check.
 # The runner itself refuses a module whose wasm-bindgen has another schema
 # version, after the build, and its message then offers first `cargo update
 # -p wasm-bindgen --precise <the runner's version>`, which would undo a change
