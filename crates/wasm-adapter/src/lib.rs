@@ -28,8 +28,9 @@
 //! The build authenticates no request and authorizes none; every request runs
 //! under a single fixed account.
 //!
-//! The module doc of `runtime` says which requests the build refuses, on
-//! both targets or on wasm only, and the answer to each.
+//! The module doc of `runtime` says what the adapter does with a request
+//! before the engine's handlers see it, and the README section "What it
+//! refuses" lists every request the build refuses, with its error.
 
 mod runtime;
 
