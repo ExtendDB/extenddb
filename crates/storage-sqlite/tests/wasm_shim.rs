@@ -18,10 +18,24 @@
 //! outcome for both, except the rows named `difference: ...`, which carry the
 //! outcome `sqlx` gives and the outcome the shim gives; each stands for an
 //! entry of the "Documented differences" list in the shim's module
-//! documentation. The test fails if a difference row's two outcomes are equal,
-//! if the number of difference rows is not [`DIFFERENCE_ROWS`], or if the
-//! number of rows whose outcome it compared is not the number of rows of the
-//! table.
+//! documentation.
+//!
+//! The table's test, `each_row_gives_its_expected_outcome`, runs the rows in
+//! order and records a row only in the statement that compares the row's
+//! outcome with the outcome the row expects on the target the test runs on.
+//! It then fails if a row's outcome is not the one it expects, if a row named
+//! `difference: ...` expects the same outcome on both targets or a row not so
+//! named expects two different ones, if two rows have the same name, if the
+//! number of rows recorded is not [`ROWS`], or if the number of difference
+//! rows recorded is not [`DIFFERENCE_ROWS`]. Both numbers are written by hand,
+//! so each of these changes, made alone, fails the test: a row deleted from or
+//! filtered out of the table, a repeated row, and a row the loop skips before
+//! comparing it. The test does not check the expectations themselves, so when
+//! a row's outcome changes and its expectation is edited to match, the test
+//! passes; and it counts rows rather than naming them, so two changes that
+//! keep both numbers pass together (a row removed and [`ROWS`] lowered, or a
+//! row skipped and another added). Such changes are for review to catch. The
+//! test does not read the shim's documentation.
 //!
 //! Natively the pool's acquire timeout is cut from `sqlx`'s 30 s default to
 //! 50 ms, so the rows that find the connection checked out return
@@ -46,6 +60,7 @@
 //! whose `Limit` does not fit wasm32's 32-bit `usize` (the same answer on
 //! both).
 
+use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
@@ -54,6 +69,11 @@ use std::str::FromStr;
 #[cfg(target_arch = "wasm32")]
 use extenddb_storage_sqlite::wasm_sqlx_for_tests as sqlx;
 use futures::StreamExt;
+
+/// The number of rows `cases()` returns, written here by hand rather than
+/// counted from `cases()`, so that a row deleted from or filtered out of
+/// `cases()` fails the test. Adding or removing a row changes this number.
+const ROWS: usize = 73;
 
 /// The number of rows named `difference: ...`.
 const DIFFERENCE_ROWS: usize = 6;
@@ -860,23 +880,17 @@ fn cases() -> Vec<Case> {
     ]
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
-async fn each_row_gives_its_expected_outcome() {
-    let cases = cases();
-    let mut failures = Vec::new();
-    let mut differences = 0;
-    let mut compared = 0;
-    for case in cases {
-        let named = case.name.starts_with("difference: ");
-        differences += usize::from(named);
-        if named == (case.native == case.wasm) {
-            failures.push(format!(
-                "{}\n    a row is named `difference: ...` exactly when its native and wasm \
-                 outcomes differ",
-                case.name
-            ));
-        }
+/// What the table test keeps of a row: its name, whether it gave the outcome
+/// it expects on this target, whether it expects the same outcome on both
+/// targets, the outcome it expects here and the outcome it gave.
+type Compared = (String, bool, bool, String, String);
+
+/// Runs the rows of `cases()` in order and returns one record per row whose
+/// outcome it compared, each made by the statement that compares it.
+async fn compare_rows() -> Vec<Compared> {
+    let mut rows = Vec::new();
+    for case in cases() {
+        let same = case.native == case.wasm;
         let expected = if cfg!(target_arch = "wasm32") {
             case.wasm
         } else {
@@ -886,31 +900,50 @@ async fn each_row_gives_its_expected_outcome() {
             Ok(outcome) => outcome,
             Err(e) => format!("setup failed: {}", render::<()>(Err(e))),
         };
-        compared += 1;
-        if actual != expected {
+        rows.push((case.name, actual == expected, same, expected, actual));
+    }
+    rows
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+async fn each_row_gives_its_expected_outcome() {
+    let rows = compare_rows().await;
+    let mut failures = Vec::new();
+    let mut names = BTreeSet::new();
+    for (name, passed, same, expected, actual) in &rows {
+        if !names.insert(name) {
+            failures.push(format!("{name}\n    another row has this name"));
+        }
+        if name.starts_with("difference: ") == *same {
             failures.push(format!(
-                "{}\n    expected: {expected}\n    actual:   {actual}",
-                case.name
+                "{name}\n    a row is named `difference: ...` exactly when its native and wasm \
+                 outcomes differ"
+            ));
+        }
+        if !passed {
+            failures.push(format!(
+                "{name}\n    expected: {expected}\n    actual:   {actual}"
             ));
         }
     }
-    // Counted against a fresh table from `cases()`, so that a filter on the
-    // rows above fails here rather than passing with fewer rows.
-    let total = crate::cases().len();
-    assert_eq!(
-        compared, total,
-        "the rows whose outcome was compared, against the rows of the table"
-    );
-    assert!(
-        failures.is_empty(),
-        "{} of {total} rows fail:\n{}",
-        failures.len(),
-        failures.join("\n")
-    );
-    assert_eq!(
-        differences, DIFFERENCE_ROWS,
-        "the number of difference rows"
-    );
+    if rows.len() != ROWS {
+        failures.push(format!(
+            "{} rows were compared, and ROWS is {ROWS}",
+            rows.len()
+        ));
+    }
+    let differences = rows
+        .iter()
+        .filter(|(name, ..)| name.starts_with("difference: "))
+        .count();
+    if differences != DIFFERENCE_ROWS {
+        failures.push(format!(
+            "{differences} rows compared are named `difference: ...`, and DIFFERENCE_ROWS is \
+             {DIFFERENCE_ROWS}"
+        ));
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// The account the backend tests below run as.
