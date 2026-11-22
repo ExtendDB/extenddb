@@ -69,7 +69,7 @@ pub(crate) fn seal(key: &[u8; KEY_LEN], plaintext: &[u8], aad: &str) -> Result<V
 }
 
 /// Decrypt `nonce(12) || ciphertext || tag(16)` under the 32 key bytes `key`,
-/// authenticating `aad`. The plaintext is wiped when the result drops.
+/// authenticating `aad`. The returned buffer is wiped when it drops.
 pub(crate) fn open(
     key: &[u8; KEY_LEN],
     encrypted: &[u8],
