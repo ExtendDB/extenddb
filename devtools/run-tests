@@ -77,12 +77,6 @@ RUN_EXTERNAL=false
 RUN_COMPREHENSIVE=false
 RUN_TERRAFORM=false
 RUN_CATALOG_CHECK=false
-# Standalone WebAssembly suites. Unlike the others these need no running server,
-# target flag or credentials: each runs steps of the WebAssembly workflow
-# through devtools/run-wasm-step (see the WebAssembly section below).
-RUN_WASM=false
-RUN_HEADLESS=false
-RUN_WASM_TEST=false
 
 # Options
 RELEASE=false
@@ -112,29 +106,6 @@ Suites (at least one required):
                     binary, and downloads the AWS provider; not part of --all)
   --all             all suites above except --terraform
   --catalog-check   post-test catalog integrity check
-  --wasm            the build, clippy, guard and pedantic steps of the
-                    WebAssembly workflow (devtools/run-wasm-step says what
-                    each does; the guard step needs Python 3.11 or later and
-                    git). Standalone: needs no server, target flag or
-                    credentials; writes discussions/test-wasm-<hash>.txt
-  --headless        the corpus step of the WebAssembly workflow: builds the
-                    browser module with wasm-pack and runs the shared parity
-                    corpus through it under Node. Standalone like --wasm;
-                    needs wasm-pack, Node and the wasm-bindgen CLI of the
-                    version of the wasm-bindgen crate in Cargo.lock, on PATH
-                    or in wasm-pack's download cache (wasm-pack skips wasm-opt
-                    and downloads no tool, though it asks crates.io for its
-                    latest version). Writes discussions/test-headless-<hash>.txt
-  --wasm-test       the core and shim steps of the WebAssembly workflow: the
-                    wasm-bindgen-test suites of extenddb-core and of the SQLite
-                    shim, on wasm32 under Node. Standalone like --wasm; needs
-                    Node and wasm-bindgen-test-runner (matching the
-                    wasm-bindgen crate in Cargo.lock). Writes
-                    discussions/test-wasm-bindgen-<hash>.txt
-                    The three WebAssembly suites run on the toolchain that
-                    .github/workflows/wasm.yml pins (through rustup, when it
-                    is installed) and under the Node major version it sets
-                    up, and print both.
 
 Options:
   --backend NAME    storage backend the running server uses:
@@ -176,9 +147,6 @@ while [[ $# -gt 0 ]]; do
         --release)        RELEASE=true; shift ;;
         --filter)         FILTER="$2"; shift 2 ;;
         --catalog-check)  RUN_CATALOG_CHECK=true; shift ;;
-        --wasm)           RUN_WASM=true; shift ;;
-        --headless)       RUN_HEADLESS=true; shift ;;
-        --wasm-test)      RUN_WASM_TEST=true; shift ;;
         --config)         CONFIG_PATH="$2"; shift 2 ;;
         --backend)        BACKEND="$2"; BACKEND_GIVEN=1; shift 2 ;;
         --parallel)
@@ -211,18 +179,14 @@ if [[ -n "${BACKEND_GIVEN:-}" ]]; then
 fi
 
 # --- Validate: target flag required ---
-# The standalone wasm suites (--wasm, --headless, --wasm-test) need no server, so
-# they do not require a target; every other suite does.
-if [[ -z "$TARGET" ]] \
-    && ( $RUN_RUST || $RUN_RUST_INTEGRATION || $RUN_PYTEST || $RUN_EXTERNAL \
-         || $RUN_COMPREHENSIVE || $RUN_TERRAFORM || $RUN_CATALOG_CHECK ); then
+if [[ -z "$TARGET" ]]; then
     echo "error: target flag is required (--extenddb or --real-dynamodb)"
     exit 1
 fi
 
 # --- Validate: at least one suite ---
-if ! $RUN_RUST && ! $RUN_RUST_INTEGRATION && ! $RUN_PYTEST && ! $RUN_EXTERNAL && ! $RUN_COMPREHENSIVE && ! $RUN_TERRAFORM && ! $RUN_CATALOG_CHECK && ! $RUN_WASM && ! $RUN_HEADLESS && ! $RUN_WASM_TEST; then
-    echo "error: at least one suite flag is required (--rust, --rust-integration, --pytest, --external, --comprehensive, --terraform, --all, --catalog-check, --wasm, --headless, --wasm-test)"
+if ! $RUN_RUST && ! $RUN_RUST_INTEGRATION && ! $RUN_PYTEST && ! $RUN_EXTERNAL && ! $RUN_COMPREHENSIVE && ! $RUN_TERRAFORM && ! $RUN_CATALOG_CHECK; then
+    echo "error: at least one suite flag is required (--rust, --rust-integration, --pytest, --external, --comprehensive, --terraform, --all, --catalog-check)"
     exit 1
 fi
 
@@ -315,20 +279,17 @@ if $NEEDS_INTEGRATION; then
 fi
 
 # --- Echo target info (D3: always, before any tests) ---
-# Skipped when no target was given: the standalone wasm suites run no server.
-if [[ -n "$TARGET" ]]; then
-    echo "=== Test target: $TARGET ==="
-    echo "  commit:              $HASH"
-    if [[ "$TARGET" == "real-dynamodb" ]]; then
-        echo "  EXTENDDB_TEST_ENDPOINT = (not set — using AWS SDK defaults)"
-        echo "  AWS_ACCESS_KEY_ID  = ${AWS_ACCESS_KEY_ID:-(from ~/.aws)}"
-    else
-        echo "  backend            = $BACKEND"
-        echo "  EXTENDDB_TEST_ENDPOINT = ${EXTENDDB_TEST_ENDPOINT:-}"
-        echo "  AWS_ACCESS_KEY_ID  = ${AWS_ACCESS_KEY_ID:-(will be provisioned)}"
-    fi
-    echo ""
+echo "=== Test target: $TARGET ==="
+echo "  commit:              $HASH"
+if [[ "$TARGET" == "real-dynamodb" ]]; then
+    echo "  EXTENDDB_TEST_ENDPOINT = (not set — using AWS SDK defaults)"
+    echo "  AWS_ACCESS_KEY_ID  = ${AWS_ACCESS_KEY_ID:-(from ~/.aws)}"
+else
+    echo "  backend            = $BACKEND"
+    echo "  EXTENDDB_TEST_ENDPOINT = ${EXTENDDB_TEST_ENDPOINT:-}"
+    echo "  AWS_ACCESS_KEY_ID  = ${AWS_ACCESS_KEY_ID:-(will be provisioned)}"
 fi
+echo ""
 
 # --- Health check (local targets only) ---
 # With EXTENDDB_TEST_BACKUP_STORE at filesystem or s3 the check also waits for
@@ -373,458 +334,6 @@ sys.exit(0 if h.get("components", {}).get("backup_store", {}).get("status") == "
 
 PASS=true
 CLEANUP_TRUSTSTORE=""
-
-# The three WebAssembly suites below need no running server, no target flag
-# and no credentials, so they run before the pre-flight the server-backed
-# suites require. They are placed after PASS=true so a failure is not later
-# reset. When no server-backed suite was requested, the last of them that runs
-# ends the run, failing it if any of them failed.
-only_wasm_suites_left() {
-    ! $RUN_RUST && ! $RUN_RUST_INTEGRATION && ! $RUN_PYTEST \
-        && ! $RUN_EXTERNAL && ! $RUN_COMPREHENSIVE && ! $RUN_TERRAFORM \
-        && ! $RUN_CATALOG_CHECK
-}
-finish_if_only_wasm_suites_left() {
-    if only_wasm_suites_left; then
-        if $PASS; then exit 0; else exit 1; fi
-    fi
-}
-
-# --- WebAssembly suites ------------------------------------------------------
-# --wasm, --headless and --wasm-test run steps of .github/workflows/wasm.yml:
-# each mode runs the steps its WASM_STEPS_ list below names, in that order,
-# through devtools/run-wasm-step, which holds the commands of every workflow
-# step that builds, lints or tests the code and which the workflow runs too.
-# Before it runs them, each mode checks with wasm_workflow_problems that the
-# workflow runs those steps as run-tests does, and fails, naming the step,
-# when it does not.
-#
-# Clippy's findings depend on its version and the wasm-bindgen-test harness
-# depends on Node's, so each mode reads from the workflow the toolchain it pins
-# (its `toolchain:` value) and the Node major version it sets up (its
-# `node-version:` value). When rustup is installed the toolchain is found
-# through rustup's proxies even when another cargo comes first on PATH, and a
-# missing one fails the mode with the command that installs it; without rustup
-# the cargo on PATH runs and the mode says so. A mode that runs Node fails,
-# with an install hint, unless a Node of that major version is on PATH as
-# node, node-<major> or node<major>.
-#
-# run-tests puts only the toolchain's tools and that Node, through directories
-# of links, ahead of the caller's PATH, and starts devtools/run-wasm-step with
-# the resulting PATH; the steps look up wasm-pack, node and Python on it, and
-# the test runner on it or in cargo's bin directory, which they give cargo by
-# its full path. rustup in turn puts cargo's bin directory ($CARGO_HOME/bin,
-# where rustup and `cargo install` put their programs) first on the PATH of
-# each tool it runs, so cargo, rustc and every program they start (build
-# scripts, the C compiler the cc crate looks up, cargo subcommands, the test
-# runner and the node it starts) look there first. Each mode prints what it
-# used.
-WASM_STEPS_WASM="build clippy guard pedantic"
-WASM_STEPS_HEADLESS="corpus"
-WASM_STEPS_WASM_TEST="core shim"
-wasm_workflow_toolchain() {
-    sed -n 's/^[[:space:]]*toolchain:[[:space:]]*"\{0,1\}\([^"#[:space:]]*\)"\{0,1\}.*/\1/p' \
-        .github/workflows/wasm.yml | head -n 1
-}
-wasm_workflow_node_major() {
-    sed -n 's/^[[:space:]]*node-version:[[:space:]]*"\{0,1\}\([0-9][0-9]*\).*/\1/p' \
-        .github/workflows/wasm.yml | head -n 1
-}
-# The directory of the running mode, removed when the mode ends and when the
-# script exits, also on SIGINT, SIGTERM or SIGHUP during a mode (see
-# wasm_stop): it holds the directories of links that wasm_select_toolchain and
-# wasm_select_node put first on PATH, and tmp/, the steps' TMPDIR, so that
-# what a step's programs leave in TMPDIR when they are stopped goes with it.
-WASM_TMP=""
-wasm_remove_tmp() {
-    if [ -n "$WASM_TMP" ]; then
-        rm -rf "$WASM_TMP"
-        WASM_TMP=""
-    fi
-    return 0
-}
-trap wasm_remove_tmp EXIT
-# Saves PATH and RUSTUP_TOOLCHAIN for wasm_restore_env, then puts the
-# workflow's toolchain first. Sets WASM_TOOLCHAIN_NOTE; returns 1 when the
-# toolchain is missing.
-wasm_select_toolchain() {
-    WASM_SAVED_PATH="$PATH"
-    WASM_SAVED_TOOLCHAIN="${RUSTUP_TOOLCHAIN-}"
-    WASM_SAVED_TOOLCHAIN_SET="${RUSTUP_TOOLCHAIN+set}"
-    local toolchain rustup tool
-    toolchain="$(wasm_workflow_toolchain)"
-    rustup="$(command -v rustup || true)"
-    if [ -z "$rustup" ] && [ -x "${CARGO_HOME:-$HOME/.cargo}/bin/rustup" ]; then
-        rustup="${CARGO_HOME:-$HOME/.cargo}/bin/rustup"
-    fi
-    if [ -n "$rustup" ] && [ "${rustup#/}" = "$rustup" ]; then
-        rustup="$(cd "$(dirname "$rustup")" && pwd)/$(basename "$rustup")"
-    fi
-    if [ -z "$toolchain" ]; then
-        WASM_TOOLCHAIN_NOTE="no toolchain: value found in .github/workflows/wasm.yml; using the cargo on PATH"
-    elif [ -z "$rustup" ]; then
-        WASM_TOOLCHAIN_NOTE="rustup not found; using the cargo on PATH, not the workflow's ${toolchain}"
-    elif ! "$rustup" run "$toolchain" cargo --version >/dev/null 2>&1; then
-        WASM_TOOLCHAIN_NOTE="toolchain ${toolchain} (from .github/workflows/wasm.yml) is not installed; run: rustup toolchain install ${toolchain} --profile minimal --component clippy --target wasm32-unknown-unknown"
-        return 1
-    else
-        # rustup runs as the tool it is started as (its argv[0]), from the
-        # toolchain RUSTUP_TOOLCHAIN names, so a directory of links to it, one
-        # per tool of the toolchain, put first on PATH makes each cargo and
-        # rustc that a step, the guard's self-test or wasm-pack start by name
-        # the workflow's. The caller's PATH follows the links unchanged; rustup
-        # adds cargo's bin directory ahead of both for the tools it runs (see
-        # the section comment above).
-        mkdir "$WASM_TMP/toolchain"
-        for tool in cargo rustc rustdoc cargo-clippy clippy-driver rustfmt cargo-fmt; do
-            ln -s "$rustup" "$WASM_TMP/toolchain/$tool"
-        done
-        PATH="$WASM_TMP/toolchain:$PATH"
-        export RUSTUP_TOOLCHAIN="$toolchain"
-        WASM_TOOLCHAIN_NOTE="${toolchain} via rustup (from .github/workflows/wasm.yml)"
-    fi
-    return 0
-}
-# Puts a `node` of the workflow's Node major version first on PATH (the
-# wasm-bindgen test runner and the parity runner start `node`), through a
-# directory holding a link to it, so that a build installed under a versioned
-# name such as `node-22` is used without changing the rest of PATH. Sets
-# WASM_NODE_NOTE; returns 1 when no such Node is found.
-wasm_select_node() {
-    local major candidate found="" version=""
-    major="$(wasm_workflow_node_major)"
-    if [ -z "$major" ]; then
-        WASM_NODE_NOTE="no node-version: value found in .github/workflows/wasm.yml"
-        return 1
-    fi
-    for candidate in node "node-${major}" "node${major}"; do
-        if command -v "$candidate" >/dev/null 2>&1; then
-            version="$("$candidate" --version 2>/dev/null)" || continue
-            if [[ "$version" == "v${major}."* ]]; then
-                found="$(command -v "$candidate")"
-                break
-            fi
-        fi
-    done
-    if [ -z "$found" ]; then
-        WASM_NODE_NOTE="Node ${major} (the version .github/workflows/wasm.yml sets up) is not on PATH as node, node-${major} or node${major}; install Node ${major}, for example from https://nodejs.org or with nvm (\`nvm install ${major}\`)"
-        return 1
-    fi
-    mkdir "$WASM_TMP/node"
-    ln -s "$found" "$WASM_TMP/node/node"
-    PATH="$WASM_TMP/node:$PATH"
-    WASM_NODE_NOTE="${found} (${version}; Node ${major} from .github/workflows/wasm.yml)"
-    return 0
-}
-wasm_restore_env() {
-    PATH="$WASM_SAVED_PATH"
-    if [ -n "$WASM_SAVED_TOOLCHAIN_SET" ]; then
-        export RUSTUP_TOOLCHAIN="$WASM_SAVED_TOOLCHAIN"
-    else
-        unset RUSTUP_TOOLCHAIN
-    fi
-    wasm_remove_tmp
-}
-# The process group of the running step and the artifact of the running mode,
-# which wasm_stop uses.
-WASM_STEP_PGID=""
-WASM_OUT=""
-# Runs `devtools/run-wasm-step STEP` with its output copied to the artifact
-# OUT, with the mode's tmp/ as its TMPDIR, in a process group of its own
-# (bash's job control, switched on only to start it), and returns its status.
-# A signal to run-tests is not sent to that group, so wasm_stop stops it.
-#   wasm_run_step OUT STEP
-wasm_run_step() {
-    local out="$1" step="$2" rc=0
-    echo "--- devtools/run-wasm-step ${step} ---" | tee -a "$out"
-    set -m
-    TMPDIR="$WASM_TMP/tmp" devtools/run-wasm-step "$step" 2>&1 | tee -a "$out" &
-    set +m
-    WASM_STEP_PGID="$(jobs -p %+)"
-    wait %+ || rc=$?
-    WASM_STEP_PGID=""
-    return "$rc"
-}
-# Run on SIGINT, SIGTERM or SIGHUP while a mode runs: stops the running step's
-# process group (SIGTERM, then SIGKILL if a process of it is left after 60
-# seconds), ends the artifact with "RESULT: FAIL (stopped by SIG<name>)", and
-# exits with STATUS; the EXIT trap then removes the mode's directory.
-#   wasm_stop NAME STATUS
-wasm_stop() {
-    local name="$1" status="$2" waited=0
-    trap - INT TERM HUP
-    if [ -n "$WASM_STEP_PGID" ]; then
-        kill -TERM -- "-$WASM_STEP_PGID" 2>/dev/null || true
-        while kill -0 -- "-$WASM_STEP_PGID" 2>/dev/null && [ "$waited" -lt 60 ]; do
-            sleep 1
-            waited=$((waited + 1))
-        done
-        kill -KILL -- "-$WASM_STEP_PGID" 2>/dev/null || true
-        wait 2>/dev/null || true
-    fi
-    if [ -n "$WASM_OUT" ]; then
-        echo "RESULT: FAIL (stopped by SIG${name})" | tee -a "$WASM_OUT"
-    fi
-    exit "$status"
-}
-# Prints a line for each of these that .github/workflows/wasm.yml breaks, as
-# each is a way the workflow could run a step otherwise than run-tests runs
-# it, and returns 1 when it printed any:
-# - each step a WASM_STEPS_ list names is run by exactly one step of the
-#   workflow, whose run: is `devtools/run-wasm-step <step>` and nothing else,
-#   and which sets no key besides name:, id: and timeout-minutes:;
-# - every other step of the workflow uses one of the actions in
-#   WASM_SETUP_ACTIONS, or runs nothing but `apt-get update`, `apt-get
-#   install -y <packages>` and `cargo install --locked --version <version>
-#   <crate>` (with or without sudo), so that no other step builds, lints or
-#   tests the code;
-# - neither the workflow nor its job sets env:, defaults: or container:,
-#   which would apply to every step.
-# The file is read as text: a step is a `- ` item of a `steps:` list, and its
-# keys are the lines indented as its first key. A run: value may be plain or
-# quoted on one line, a plain value continued on lines indented more than its
-# key, or a block (| or >); a YAML merge key (<<:) or a step line that is not
-# a key fails the check. The check does not compare what the setup steps
-# install, apart from the toolchain and Node version read above, nor what an
-# action does.
-WASM_SETUP_ACTIONS="actions/checkout dtolnay/rust-toolchain Swatinem/rust-cache actions/setup-node actions/cache"
-wasm_workflow_problems() {
-    awk -v steps="$WASM_STEPS_WASM $WASM_STEPS_HEADLESS $WASM_STEPS_WASM_TEST" \
-        -v actions="$WASM_SETUP_ACTIONS" -v q="'" '
-function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
-# The value of a plain or quoted scalar written on one line.
-function scalar(v) {
-    if (v ~ /^".*"$/ || v ~ ("^" q ".*" q "$")) return substr(v, 2, length(v) - 2)
-    sub(/[ \t]+#.*$/, "", v)
-    return v
-}
-function problem(text) { print ".github/workflows/wasm.yml:" text; bad = 1 }
-function key(text, at, k, v, u) {
-    if (!match(text, /^[A-Za-z0-9_-]+[ \t]*:([ \t]|$)/)) {
-        problem(NR ": run-tests cannot read this line of a step")
-        return
-    }
-    k = text
-    sub(/[ \t]*:.*$/, "", k)
-    v = trim(substr(text, index(text, ":") + 1))
-    keys[n] = keys[n] " " k
-    if (k == "name") title[n] = scalar(v)
-    else if (k == "uses") { u = scalar(v); sub(/@.*$/, "", u); uses[n] = u }
-    else if (k == "run") {
-        hasrun[n] = 1
-        run_at = at
-        if (v ~ /^[|>]/) { block = 1; run[n] = "" }
-        else { plain = 1; run[n] = scalar(v) }
-    }
-}
-# The first command of a run text that does not install a tool, or "".
-function not_install(r, lines, pieces, nl, np, i, j, c) {
-    nl = split(r, lines, "\n")
-    for (i = 1; i <= nl; i++) {
-        np = split(lines[i], pieces, "&&")
-        for (j = 1; j <= np; j++) {
-            c = trim(pieces[j])
-            if (c == "" || c ~ /^#/) continue
-            sub(/^sudo[ \t]+/, "", c)
-            if (c ~ /^apt-get[ \t]+update$/) continue
-            if (c ~ /^apt-get[ \t]+install[ \t]+-y([ \t]+[A-Za-z0-9.+_-]+)+$/) continue
-            if (c ~ /^cargo[ \t]+install[ \t]+--locked[ \t]+--version[ \t]+[A-Za-z0-9.+_-]+[ \t]+[A-Za-z0-9_-]+$/) continue
-            return trim(pieces[j])
-        }
-    }
-    return ""
-}
-{
-    line = $0
-    sub(/\r$/, "", line)
-    if (line ~ /^[ \t]*$/) next
-    match(line, /^ */)
-    at = RLENGTH
-    if (block) {
-        if (at > run_at) { run[n] = run[n] (run[n] == "" ? "" : "\n") trim(line); next }
-        block = 0
-    }
-    if (line ~ /^[ \t]*#/) next
-    if (plain) {
-        if (at > run_at) { run[n] = run[n] " " scalar(trim(line)); next }
-        plain = 0
-    }
-    if (line ~ /^[ \t]*(- +)?<<[ \t]*:/) { problem(NR ": run-tests does not read YAML merge keys"); next }
-    if (in_steps && at <= steps_at) in_steps = 0
-    if (line ~ /^[ \t]*steps[ \t]*:[ \t]*$/) { in_steps = 1; steps_at = at; item_at = -1; next }
-    if (in_steps) {
-        if (line ~ /^[ \t]*-([ \t]|$)/ && (item_at < 0 || at == item_at)) {
-            item_at = at
-            n++
-            first[n] = NR
-            rest = substr(line, at + 2)
-            match(rest, /^[ \t]*/)
-            key_at = at + 1 + RLENGTH
-            if (substr(rest, RLENGTH + 1) != "") key(substr(rest, RLENGTH + 1), key_at)
-        } else if (n > 0 && at == key_at) {
-            key(trim(line), at)
-        } else if (n == 0 || at < key_at) {
-            problem(NR ": run-tests cannot read this line of a step")
-        }
-        next
-    }
-    if (line ~ /^[ \t]*(env|defaults|container)[ \t]*:/) {
-        k = trim(line)
-        sub(/[ \t]*:.*$/, "", k)
-        problem(NR ": sets " k ":, which applies to every step; run-tests does not apply it")
-    }
-}
-END {
-    nw = split(steps, want, " ")
-    na = split(actions, act, " ")
-    for (j = 1; j <= n; j++) {
-        name = (title[j] != "" ? "the step \"" title[j] "\"" : "the step")
-        if (uses[j] != "") {
-            known = 0
-            for (i = 1; i <= na; i++) if (uses[j] == act[i]) known = 1
-            if (!known) problem(first[j] ": " name " uses " uses[j] ", which is not one of the setup actions run-tests knows (WASM_SETUP_ACTIONS)")
-            continue
-        }
-        if (!hasrun[j]) { problem(first[j] ": " name " has neither a run: nor a uses: that run-tests can read"); continue }
-        r = trim(run[j])
-        mirrored = 0
-        for (i = 1; i <= nw; i++) if (r == "devtools/run-wasm-step " want[i]) { count[i]++; mirrored = 1 }
-        if (mirrored) {
-            m = split(keys[j], ks, " ")
-            extra = ""
-            for (x = 1; x <= m; x++)
-                if (ks[x] != "name" && ks[x] != "run" && ks[x] != "id" && ks[x] != "timeout-minutes") extra = extra " " ks[x] ":"
-            if (extra != "") problem(first[j] ": " name " (" r ") also sets" extra ", which run-tests does not apply")
-        } else if (r ~ /run-wasm-step/) {
-            gsub(/\n/, "; ", r)
-            problem(first[j] ": " name " runs `" r "`, which is not exactly `devtools/run-wasm-step <step>` for a step run-tests runs")
-        } else if ((c = not_install(r)) != "") {
-            problem(first[j] ": " name " runs `" c "`, which is neither `devtools/run-wasm-step <step>` for a step run-tests runs nor an install of a tool, so run-tests does not run it")
-        }
-    }
-    for (i = 1; i <= nw; i++) {
-        if (count[i] == 0) problem(" no step runs exactly `devtools/run-wasm-step " want[i] "`, a step run-tests runs")
-        else if (count[i] > 1) problem(" " count[i] " steps run exactly `devtools/run-wasm-step " want[i] "`; run-tests runs it once")
-    }
-    exit bad
-}' .github/workflows/wasm.yml
-}
-# Runs one WebAssembly mode: selects the workflow's toolchain (and its Node,
-# when NODE is "node"), writes the header of the mode's artifact, checks the
-# workflow with wasm_workflow_problems, runs each STEP with wasm_run_step when
-# the check passed, and ends the artifact with "RESULT: PASS" or "RESULT:
-# FAIL" (and then sets PASS=false). While it runs, SIGINT, SIGTERM and SIGHUP
-# run wasm_stop.
-#   wasm_mode ARTIFACT TITLE TARGET NODE STEP...
-wasm_mode() {
-    local out="$1" title="$2" target="$3" node="$4" rc=0 ready=true step problems
-    shift 4
-    echo "=== ${title} → ${out} ==="
-    WASM_OUT="$out"
-    trap 'wasm_stop INT 130' INT
-    trap 'wasm_stop TERM 143' TERM
-    trap 'wasm_stop HUP 129' HUP
-    WASM_TMP="$(mktemp -d "${TMPDIR:-/tmp}/run-tests-wasm.XXXXXX")"
-    mkdir "$WASM_TMP/tmp"
-    wasm_select_toolchain || ready=false
-    WASM_NODE_NOTE="not looked up"
-    if [ "$node" = node ] && $ready; then
-        wasm_select_node || ready=false
-    fi
-    {
-        echo "$title"
-        echo "target:    ${target}"
-        echo "steps:     $* (devtools/run-wasm-step)"
-        echo "commit:    ${HASH}"
-        echo "date:      $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        echo "toolchain: ${WASM_TOOLCHAIN_NOTE}"
-        echo "cargo:     $(cargo --version 2>&1)"
-        if [ "$node" = node ]; then
-            echo "node:      ${WASM_NODE_NOTE}"
-        fi
-        case " $* " in
-            *" corpus "*)
-                if command -v wasm-pack >/dev/null 2>&1; then
-                    echo "wasm-pack: $(command -v wasm-pack) ($(wasm-pack --version 2>&1))"
-                else
-                    echo "wasm-pack: not on PATH"
-                fi
-                ;;
-        esac
-        echo
-    } > "$out"
-    echo "toolchain: ${WASM_TOOLCHAIN_NOTE}"
-    if [ "$node" = node ]; then
-        echo "node:      ${WASM_NODE_NOTE}"
-    fi
-    echo "--- .github/workflows/wasm.yml ---" | tee -a "$out"
-    if problems="$(wasm_workflow_problems)"; then
-        echo "checked: each of ${WASM_STEPS_WASM} ${WASM_STEPS_HEADLESS} ${WASM_STEPS_WASM_TEST} runs there as \`devtools/run-wasm-step <step>\` and nothing else, and every other step is a setup step" | tee -a "$out"
-    else
-        printf '%s\n' "$problems" | sed 's/^/error: /' | tee -a "$out"
-        rc=1
-    fi
-    if ! $ready; then
-        if [ "$node" = node ]; then
-            echo "error: the steps need the toolchain and the Node above" | tee -a "$out"
-        else
-            echo "error: the steps need the toolchain above" | tee -a "$out"
-        fi
-        rc=1
-    fi
-    if [ "$rc" -ne 0 ]; then
-        echo "error: none of the steps was run" | tee -a "$out"
-    else
-        for step in "$@"; do
-            wasm_run_step "$out" "$step" || rc=1
-        done
-    fi
-    wasm_restore_env
-    trap - INT TERM HUP
-    WASM_OUT=""
-    if [ "$rc" -eq 0 ]; then
-        echo "RESULT: PASS" | tee -a "$out"
-    else
-        echo "RESULT: FAIL" | tee -a "$out"
-        PASS=false
-    fi
-    echo "=== wrote ${out} ==="
-}
-
-# The workflow's build, clippy, guard and pedantic steps.
-if $RUN_WASM; then
-    wasm_mode "discussions/test-wasm-${HASH}.txt" \
-        "WebAssembly adapter build, clippy and guard steps" \
-        "wasm32-unknown-unknown (in-memory SQLite in the browser)" \
-        no-node $WASM_STEPS_WASM
-    if ! $RUN_HEADLESS && ! $RUN_WASM_TEST; then
-        finish_if_only_wasm_suites_left
-    fi
-fi
-
-# The workflow's corpus step: the shared parity corpus through the browser
-# module under Node, the same cases the native oracle test (the adapter's
-# tests/parity.rs) runs.
-if $RUN_HEADLESS; then
-    wasm_mode "discussions/test-headless-${HASH}.txt" \
-        "WebAssembly headless parity run" \
-        "wasm32-unknown-unknown (in-memory SQLite in the browser) via Node" \
-        node $WASM_STEPS_HEADLESS
-    if ! $RUN_WASM_TEST; then
-        finish_if_only_wasm_suites_left
-    fi
-fi
-
-# The workflow's core and shim steps: the wasm-bindgen-test suites that run on
-# wasm32 under Node. core's wasm crypto backend and the synchronous SQLite shim
-# run in no native test; they exist only on wasm32.
-if $RUN_WASM_TEST; then
-    wasm_mode "discussions/test-wasm-bindgen-${HASH}.txt" \
-        "WebAssembly on-target wasm-bindgen-test suites" \
-        "wasm32-unknown-unknown (in-memory SQLite in the browser) via Node" \
-        node $WASM_STEPS_WASM_TEST
-    finish_if_only_wasm_suites_left
-fi
 
 # --- Pre-flight for integration suites (local targets) ---
 if $NEEDS_INTEGRATION && [[ "$TARGET" != "real-dynamodb" ]]; then
@@ -968,16 +477,14 @@ fi
 
 # --- Rust tests ---
 if $RUN_RUST; then
-    # --no-fail-fast runs every test binary even after one fails, so a single
-    # failing suite does not hide the result of the rest in one run.
     if $RELEASE; then
         OUTFILE="discussions/test-rust-release-${HASH}.txt"
         echo "=== Rust tests (release) → ${OUTFILE} ==="
-        CARGO_ARGS=(cargo test --release --no-fail-fast)
+        CARGO_ARGS=(cargo test --release)
     else
         OUTFILE="discussions/test-rust-${HASH}.txt"
         echo "=== Rust tests (debug) → ${OUTFILE} ==="
-        CARGO_ARGS=(cargo test --no-fail-fast)
+        CARGO_ARGS=(cargo test)
     fi
     if [[ -n "$FILTER" ]]; then
         CARGO_ARGS+=(-- "$FILTER")

@@ -97,12 +97,9 @@ jobs:
           cargo install --locked --version 0.2.130 wasm-bindgen-cli
           cargo install --locked --version 0.15.1 wasm-pack
 
-      # Each step below runs the commands devtools/run-wasm-step holds for it,
-      # and that script documents them. devtools/run-tests --wasm, --headless
-      # and --wasm-test run the same steps through it, after checking that
-      # this file runs each of them as `devtools/run-wasm-step <step>` and
-      # nothing else, and that every other step is a setup step (see
-      # wasm_workflow_problems in devtools/run-tests).
+      # Each step below runs `devtools/run-wasm-step <step>`, which holds the
+      # step's commands and documents them. Its header says how to run the
+      # same step locally.
       - name: Build the adapter for wasm32
         run: devtools/run-wasm-step build
       - name: Clippy the wasm32 build

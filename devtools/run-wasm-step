@@ -4,9 +4,9 @@
 #
 # The commands of the steps of .github/workflows/wasm.yml that build, lint and
 # test the code for wasm32, with their documentation. The workflow runs each
-# of those steps as `devtools/run-wasm-step <step>`, and `devtools/run-tests
-# --wasm`, `--headless` and `--wasm-test` run them through this script too, so
-# the commands are written once, here.
+# of those steps as `devtools/run-wasm-step <step>`, and a developer runs the
+# same command to repeat a step locally, so the commands are written once,
+# here.
 #
 #   devtools/run-wasm-step <step>
 #   devtools/run-wasm-step clippy [cargo option...] [-- clippy option...]
@@ -21,10 +21,18 @@
 #
 # A step runs from the repository root, prints each command before it runs it
 # (on stderr, after "+ "), and looks up cargo, wasm-pack, node and Python on
-# PATH, so the caller chooses the toolchain and the Node version: the
-# workflow's setup steps make the toolchain it pins rustup's default and put
-# the Node version it names on PATH, and run-tests puts the same two first on
-# PATH.
+# PATH, so the caller chooses the toolchain and the Node version. In the
+# workflow, its setup steps make the toolchain it pins rustup's default and
+# put the Node version it names on PATH. A local run needs what those steps
+# install: that toolchain with the wasm32-unknown-unknown target and clippy,
+# a clang, a Node of that major version, and the wasm-bindgen-cli and
+# wasm-pack versions the workflow's install step names (the guard step's case
+# below says which Python it needs). With rustup's cargo the first cargo on
+# PATH, setting RUSTUP_TOOLCHAIN to the workflow's `toolchain:` selects that
+# toolchain; put the Node first on PATH, for example:
+#
+#   RUSTUP_TOOLCHAIN=<toolchain> PATH=<directory of that node>:$PATH \
+#       devtools/run-wasm-step corpus
 
 set -euo pipefail
 
