@@ -321,10 +321,16 @@ case "$step" in
         # and is not meant to change the answers the corpus checks; no step
         # runs the corpus over its output, the module the first build command
         # of the README produces. The README's "Building it" says how wasm-pack
-        # finds or downloads its tools, and what else it does.
+        # finds or downloads its tools, and what else it does, including the
+        # `cargo metadata` that updates an out-of-date Cargo.lock before the
+        # build. Running that command first with --locked makes the step stop
+        # on such a lock, as the build step's `cargo build --locked` does, and
+        # leaves the lock as it was.
         if ! command -v wasm-pack >/dev/null 2>&1; then
             die "wasm-pack is not on PATH; install the version .github/workflows/wasm.yml installs (cargo install --locked --version <that version> wasm-pack)"
         fi
+        show cargo metadata --locked --format-version 1 --manifest-path crates/wasm-adapter/Cargo.toml
+        cargo metadata --locked --format-version 1 --manifest-path crates/wasm-adapter/Cargo.toml >/dev/null
         show wasm-pack build --target web --release --no-opt --mode no-install crates/wasm-adapter --out-dir parity/pkg
         if ! wasm-pack build --target web --release --no-opt --mode no-install crates/wasm-adapter --out-dir parity/pkg; then
             lock="$(lock_wasm_bindgen_version)"

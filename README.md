@@ -641,11 +641,12 @@ wasm-pack build --target web --release --no-opt --mode no-install crates/wasm-ad
 With `--mode no-install`, wasm-pack stops with an error instead of
 downloading when it finds no `wasm-bindgen` of that version; with `--no-opt`,
 it does not run `wasm-opt`, so the module stays at about 6.6 MiB. In either
-form wasm-pack also runs `rustup target add wasm32-unknown-unknown` when the
-toolchain is a rustup one without that target, and asks crates.io for the
-latest wasm-pack version when no `wasm-pack.stamp` file is beside its binary
-or the one there records a check made 25 or more hours before; the answer
-only feeds a warning.
+form wasm-pack also runs `cargo metadata` on the crate's manifest before it
+builds, without `--locked`, so it updates a `Cargo.lock` that is out of date;
+runs `rustup target add wasm32-unknown-unknown` when the toolchain is a rustup
+one without that target; and asks crates.io for the latest wasm-pack version
+when no `wasm-pack.stamp` file is beside its binary or the one there records a
+check made 25 or more hours before (the answer only feeds a warning).
 
 The `wasm32` build is the adapter's dependency graph, built through
 `extenddb-wasm-adapter` as above. Two crates of that graph do not build for
