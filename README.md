@@ -595,7 +595,7 @@ someone edits it.
 
 ### Building it
 
-The module is built with [`wasm-pack`](https://rustwasm.github.io/wasm-pack/):
+The module is built with [`wasm-pack`](https://wasm-bindgen.github.io/wasm-pack/):
 
 ```bash
 wasm-pack build --target web --release crates/wasm-adapter
