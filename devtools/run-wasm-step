@@ -39,6 +39,11 @@ set -euo pipefail
 ADAPTER=extenddb-wasm-adapter
 TARGET=wasm32-unknown-unknown
 
+# The advice that the messages of the test and corpus steps give when they
+# find no wasm-bindgen of the right version. .github/workflows/wasm.yml writes
+# the version it installs by hand, so the advice names the two lines.
+WASM_BINDGEN_CLI_HELP="install the wasm-bindgen-cli of the version of the wasm-bindgen crate in Cargo.lock (cargo install --locked --version <that version> wasm-bindgen-cli; what cargo pkgid wasm-bindgen prints ends with that version). .github/workflows/wasm.yml writes the version it installs by hand, in its \"Install wasm tooling\" step and in the key of its \"Cache wasm tooling\" step, so when the version in Cargo.lock changes, both must change with it"
+
 usage() {
     echo "usage: devtools/run-wasm-step build|clippy [cargo option...] [-- clippy option...]|guard|pedantic|core|shim|corpus" >&2
     exit 2
@@ -86,7 +91,7 @@ run_suite() {
         fi
     fi
     if [ -z "$runner" ]; then
-        die "wasm-bindgen-test-runner is not on PATH or in ${CARGO_HOME:-$HOME/.cargo}/bin; install the wasm-bindgen-cli of the version of the wasm-bindgen crate in Cargo.lock (cargo install --locked --version <that version> wasm-bindgen-cli), as .github/workflows/wasm.yml does"
+        die "wasm-bindgen-test-runner is not on PATH or in ${CARGO_HOME:-$HOME/.cargo}/bin; ${WASM_BINDGEN_CLI_HELP}"
     fi
     export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="$runner"
     echo "runner:    ${runner}"
@@ -278,7 +283,7 @@ case "$step" in
         fi
         show wasm-pack build --target web --release --no-opt --mode no-install crates/wasm-adapter --out-dir parity/pkg
         if ! wasm-pack build --target web --release --no-opt --mode no-install crates/wasm-adapter --out-dir parity/pkg; then
-            die "wasm-pack build failed; if it found no wasm-bindgen: with --mode no-install it downloads none, so install the version of the wasm-bindgen crate in Cargo.lock (cargo install --locked --version <that version> wasm-bindgen-cli), as .github/workflows/wasm.yml does"
+            die "wasm-pack build failed. If it stopped with \"Not able to find or install a local wasm-bindgen.\", it found no wasm-bindgen of the version in Cargo.lock on PATH or in its cache, and --mode no-install lets it neither download nor build one: ${WASM_BINDGEN_CLI_HELP}"
         fi
         run node crates/wasm-adapter/parity/run.mjs
         ;;

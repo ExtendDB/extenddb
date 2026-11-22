@@ -72,8 +72,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y clang
 
       # The install step installs wasm-bindgen-cli at the version of the
-      # wasm-bindgen crate in Cargo.lock (0.2.130), and wasm-pack. The
-      # wasm-bindgen of wasm-bindgen-cli, which writes the JS glue, and its
+      # wasm-bindgen crate in Cargo.lock, and wasm-pack. Both versions are
+      # written by hand, in that step and in the cache key, so when the
+      # wasm-bindgen version in Cargo.lock (`cargo pkgid wasm-bindgen` prints
+      # it) changes, both lines must change with it. The wasm-bindgen of
+      # wasm-bindgen-cli, which writes the JS glue, and its
       # wasm-bindgen-test-runner, which runs the two test steps below, read
       # the description the crate's macros put into the module, and both stop
       # with a "different bindgen format" error when that description's schema
