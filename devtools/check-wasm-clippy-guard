@@ -47,9 +47,9 @@ force-warned lint). It fails, with one line per problem, unless:
 Each check runs, in the same call, on the tree and on controls planted for
 it: CONTROLS, OTHER_FILE_CONTROLS, LINTS_CONTROL with its [lints] table,
 BUILD_SCRIPT, CONTROL_PROBE, CONTROL_ENTRY, CONTROL_ENVIRONMENT,
-CONTROL_CARGO_CONFIG and two zeroize graphs. A control that does not give
-the finding it was planted for, and a finding no control expects, fail the
-guard.
+CONTROL_CARGO_CONFIG and two zeroize graphs; and each run's dep-info must be
+read for every crate of the build. A control that does not give the finding
+it was planted for, and a finding no control expects, fail the guard.
 
 What it does not see: calls a dependency makes in its own code, which clippy
 does not lint; and a build script or a procedural macro that behaves
@@ -561,10 +561,11 @@ def run_clippy(tree: Path, target_dir: str, clippy_options: list[str]) -> Run:
 def dep_info(run: Run, crates: dict, copy: Path, name: str) -> tuple[dict, list[Finding]]:
     """For each of `crates`, the files and the environment variables its
     dep-info lists, read from the dep-info file rustc writes next to the
-    metadata file the run's compiler-artifact record names; and a finding for
-    a run that failed or left a crate without that record. rustc writes the
-    dep-info of a crate whose lints fail too, but cargo names no artifact for
-    that crate."""
+    metadata file the run's compiler-artifact record names; a finding for a
+    run that failed or left a crate without that record; and an "examined"
+    finding for each crate read, which a control expects for every crate.
+    rustc writes the dep-info of a crate whose lints fail too, but cargo names
+    no artifact for that crate."""
     found = []
     if run.code != 0:
         errors = [m.get("rendered") or m["message"] for m in run.messages if m["level"] == "error"]
@@ -592,6 +593,12 @@ def dep_info(run: Run, crates: dict, copy: Path, name: str) -> tuple[dict, list[
                 break
     for crate in sorted(set(crates) - set(read)):
         found.append(Finding(name, crate, f"{crate}: the clippy step {name} left no dep-info"))
+    # One finding per crate read, which a control expects for each crate and
+    # run, so a run whose findings are dropped, or that lints fewer crates,
+    # fails the controls.
+    found += [
+        Finding("examined", f"{crate} ({name})", f"examined {crate} ({name})") for crate in read
+    ]
     return read, found
 
 
@@ -1616,6 +1623,11 @@ def plant_controls(copy: Path, crates: dict[str, dict]) -> tuple[list[Control], 
         Control("zeroize", "examined", "control: a second ghash"),
         Control("zeroize", "zeroize", "control: ghash without its zeroize feature: ghash", "built"),
         Control("zeroize", "zeroize", "control: a second ghash: ghash", " versions ("),
+    ]
+    controls += [
+        Control("dep-info", "examined", f"{crate} ({run})")
+        for crate in sorted(crates)
+        for run in ("without options", "with --force-warn")
     ]
     return controls, {Path(os.path.relpath(p, ROOT)).as_posix() for p in sources}, found
 
