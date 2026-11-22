@@ -18,12 +18,14 @@ a `let`, or an expression ending in `;` that is not a macro invocation and
 does not start with a block. It covers the code written in that function or
 statement, every call there, but not the items written inside it: each of
 those (a nested function, an impl and its methods) needs its own allow. One
-on the `mod mNNNN_<name>;` line of a crate's src/migrations/mod.rs, which
-declares a code-body migration (CONTRIBUTING.md), is accepted too and covers
-the module's file beside it whole: a checksum test pins a released body, so
-an allow cannot go inside it. Of the reason, the guard checks only that it
-is there; whether it says why the wasm32 build never runs the calls the
-allow covers is for review.
+on a `mod mNNNN_<name>;` item with no path attribute, in the migrations/mod.rs
+in the directory of a crate's library root, which declares a code-body
+migration (CONTRIBUTING.md), is accepted too and covers the module's file,
+mNNNN_<name>.rs beside it, whole: a checksum test pins a released body, so an
+allow cannot go inside it. The guard checks that form only; whether the
+module is a released body is for review. Of the reason, the guard checks
+only that it is there; whether it says why the wasm32 build never runs the
+calls the allow covers is for review.
 
 The script copies the working tree (the files git tracks or does not ignore,
 uncommitted edits included), plants probes and controls in the copy, and runs
@@ -877,13 +879,12 @@ _ITEM_NAMES = {
     "type": "a type alias",
     "macro_rules": "a macro definition",
 }
-# The `mod mNNNN_<name>;` line of a code-body migration in a crate's
-# src/migrations/mod.rs, the form CONTRIBUTING.md ("Adding a catalog
-# migration") gives. The module's file, mNNNN_<name>.rs beside it, holds a
-# body that a checksum test pins once it is released, so an allow for a call
-# in it can go only on this line, and it covers that file whole.
-_MIGRATIONS = re.compile(r"(?:.+/)?src/migrations/mod\.rs")
+# The `mod mNNNN_<name>;` line of a code-body migration, in the form
+# CONTRIBUTING.md ("Adding a catalog migration") gives; the docstring says where
+# an allow on it is accepted, and why. _PATH finds a path attribute among the
+# line's attributes.
 _MIGRATION_MOD = re.compile(_VISIBILITY + r"mod\s+(m[0-9]{4}_\w+)\s*;")
+_PATH = re.compile(r"\bpath\s*=")
 # An item inside a function or a statement. rustc applies the allow on the
 # function or statement to it too, but its code is not that function's: an
 # impl there, for one, adds methods that code elsewhere calls.
@@ -1006,21 +1007,21 @@ class Attributes(NamedTuple):
     modules: tuple[str, ...] = ()
 
 
-def lint_attributes(rel: str, text: str) -> Attributes:
+def lint_attributes(rel: str, text: str, migrations: bool = False) -> Attributes:
     """The allows and expects of the disallowed lints in one file, `text`
     holding its bytes one character each. An attribute names one when its lint
     list holds clippy::disallowed_methods or clippy::disallowed_types in that
     spelling (whitespace aside). It is accepted when it is an outer attribute
     with a `reason` that holds more than whitespace and sits on a `fn` item, or
     after a `{`, `;` or `}` on a statement: a `let`, or an expression ending in
-    `;` that is not a macro invocation and does not start with a block, or, in
-    a crate's src/migrations/mod.rs, on a `mod mNNNN_<name>;` line. It covers
-    that item or statement without the items written inside it, or the
-    module's file beside it whole. Any other attribute that names one, in
-    cfg_attr too, is a finding."""
+    `;` that is not a macro invocation and does not start with a block, or,
+    with `migrations` (the file is the migrations/mod.rs in the directory of a
+    crate's library root), on a `mod mNNNN_<name>;` item with no path
+    attribute. It covers that item or statement without the items written
+    inside it, or the module's file beside it whole. Any other attribute that
+    names one, in cfg_attr too, is a finding."""
     code = code_only(text)
     covered, counts, found, modules = [], Counter(), [], []
-    migrations = bool(_MIGRATIONS.fullmatch(rel))
     run_start, run_end = 0, None
     for attribute in _ATTRIBUTE.finditer(code):
         end = _closing(code, attribute.end() - 1, "[", "]")
@@ -1075,8 +1076,8 @@ def _placement(
     `attribute`, ending at `end`, in a run of attributes from `run_start`) is
     not accepted, or None and the span it covers: (kind, start, end, and the
     start and end of the part in which the items are left out). With
-    `migrations` (the file is a crate's src/migrations/mod.rs), one on a
-    migration's `mod` line is accepted, as kind "module"."""
+    `migrations` (as for lint_attributes), one on a migration's `mod` line with
+    no path attribute is accepted, as kind "module"."""
     index = end
     while following := _NEXT_ATTRIBUTE.match(code, index):
         index = _closing(code, following.end() - 1, "[", "]")
@@ -1094,9 +1095,15 @@ def _placement(
             return None, ("fn", run_start, stop, stop, stop)
         return None, ("fn", run_start, stop, body + 1, stop - 1)
     if item := _ITEM.match(code, index):
-        if migrations and (module := _MIGRATION_MOD.match(code, index)):
+        why = f"is on {_ITEM_NAMES.get(item.group(1), 'a ' + item.group(1))}"
+        module = _MIGRATION_MOD.match(code, index)
+        if module and not migrations:
+            why += ", in a file other than the migrations/mod.rs in the directory of a library root"
+        elif module and _PATH.search(code, run_start, index):
+            why += " with a path attribute, which a migration's `mod` line does not take"
+        elif module:
             return None, ("module", run_start, module.end(), module.end(), module.end())
-        return f"is on {_ITEM_NAMES.get(item.group(1), 'a ' + item.group(1))}", None
+        return why, None
     if _previous(code, run_start) not in ("{", ";", "}"):
         return "is not on a function or a statement", None
     if _BLOCK_LIKE.match(code, index):
@@ -1549,9 +1556,6 @@ async fn await_holding(m: &std::sync::Mutex<u8>) {
 #[path = "../wasm_clippy_guard_controls/outside_src.rs"]
 mod outside_src;
 
-#[allow(clippy::disallowed_methods, reason = "a control")] //@ migration-elsewhere allow
-mod m9998_wasm_clippy_guard_control;
-
 mod included {
     include!("wasm_clippy_guard_controls.inc");
 }
@@ -1574,8 +1578,12 @@ pub(crate) fn refused() {{
 
 # The allow on a migration module's `mod` line, in a src/migrations/mod.rs that
 # the copy adds to MIGRATIONS_CONTROL_CRATE, which has none: accepted on a
-# module of that form, whose file it covers, and refused on another module.
+# module of that form, whose file it covers; refused on another module, on one
+# with a path attribute, and in a src/migrations/mod.rs that the planted one
+# reaches through a module `src`, which is not in the directory of a library
+# root.
 MIGRATIONS_CONTROL_CRATE = "extenddb-engine"
+_EMPTY_MODULE = "// An empty module, a control of the guard's copy only.\n"
 MIGRATIONS_CONTROLS = {
     "mod.rs": """\
 // Controls of devtools/check-wasm-clippy-guard, in its copy of the tree only.
@@ -1584,6 +1592,14 @@ mod m9999_wasm_clippy_guard_control; //@ migration-mod end
 
 #[allow(clippy::disallowed_methods, reason = "a control")] //@ other-mod allow
 mod wasm_clippy_guard_control;
+
+#[allow(clippy::disallowed_methods, reason = "a control")] //@ migration-path allow
+#[path = "wasm_clippy_guard_control_path.rs"]
+mod m9998_wasm_clippy_guard_control;
+
+mod src {
+    mod migrations;
+}
 """,
     "m9999_wasm_clippy_guard_control.rs": """\
 // A control of devtools/check-wasm-clippy-guard, in its copy of the tree only.
@@ -1591,7 +1607,14 @@ pub(crate) fn nap() { //@ migration-body accepted
     std::thread::sleep(std::time::Duration::ZERO);
 } //@ migration-body end
 """,
-    "wasm_clippy_guard_control.rs": "// An empty module, a control of the guard's copy only.\n",
+    "wasm_clippy_guard_control.rs": _EMPTY_MODULE,
+    "wasm_clippy_guard_control_path.rs": _EMPTY_MODULE,
+    "src/migrations/mod.rs": """\
+// A control of devtools/check-wasm-clippy-guard, in its copy of the tree only.
+#[allow(clippy::disallowed_methods, reason = "a control")] //@ migration-nested allow
+mod m9997_wasm_clippy_guard_control;
+""",
+    "src/migrations/m9997_wasm_clippy_guard_control.rs": _EMPTY_MODULE,
 }
 
 # A control in LINTS_CONTROL_CRATE, whose manifest in the copy gets LINTS_TABLE.
@@ -1668,9 +1691,6 @@ def plant_controls(copy: Path, crates: dict[str, dict]) -> tuple[list[Control], 
             name="path"
         ),
         probe_root.parent / f"{CONTROL_MODULE}.inc": OTHER_FILE_CONTROLS.format(name="include"),
-        probe_root.parent / CONTROL_MODULE / "m9998_wasm_clippy_guard_control.rs": (
-            "// An empty module, a control of the guard's copy only.\n"
-        ),
         probe_root.parent / f"{RELEASE_MODULE}.rs": RELEASE_CONTROL,
         lints_root.parent / f"{LINTS_CONTROL_MODULE}.rs": LINTS_CONTROL,
     }
@@ -1812,12 +1832,18 @@ def check(crates: dict[str, dict], target_dir: str, copy: Path) -> int:
     probes[CONTROL_PROBE[0]][CONTROL_PROBE[1]] = [CONTROL_PROBE[2]]
     findings += config_problems((copy / CONFIG_REL).read_text(encoding="utf-8"), probes)
 
+    # The files, one for each crate, in which an allow on a migration's `mod`
+    # line is accepted.
+    migrations = {
+        Path(os.path.relpath(lib_root(p).parent / "migrations" / "mod.rs", ROOT)).as_posix()
+        for p in crates.values()
+    }
     covered, allows, modules = {}, Counter(), []
     for path in sorted({p for paths, _ in read_forced.values() for p in paths}):
         if not path.is_relative_to(copy) or not path.is_file():
             continue
         rel = path.relative_to(copy).as_posix()
-        attributes = lint_attributes(rel, path.read_bytes().decode("latin-1"))
+        attributes = lint_attributes(rel, path.read_bytes().decode("latin-1"), rel in migrations)
         covered[path] = attributes.covered
         findings += attributes.findings
         modules += [copy / module for module in attributes.modules]
