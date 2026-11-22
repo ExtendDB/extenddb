@@ -402,6 +402,14 @@ signature. If that code were called on `wasm32`, its HMAC-SHA256 (the RustCrypto
 zero-padded key block and the key-derived SHA-256 states in memory unwiped,
 where the server's AWS-LC backend wipes its HMAC context.
 
+The AES-256-GCM cipher that seals stored secrets (`seal` and `open` in
+`crates/core/src/crypto.rs`) compiles in too, but no request reaches it: the
+in-memory engine holds no encryption key. If it were called on `wasm32`, the
+`zeroize` features of its RustCrypto crates would wipe the cipher's AES round
+keys and POLYVAL key where the cipher is dropped, but not the copies of them
+that `seal` and `open` leave on the stack, which stay in linear memory after
+the calls return until later calls overwrite them.
+
 ### What it refuses
 
 Operations that need a facility the in-browser build lacks return a
