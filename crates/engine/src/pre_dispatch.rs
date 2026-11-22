@@ -8,17 +8,9 @@
 //! An entry point (the HTTP server, the WebAssembly adapter) calls
 //! [`parse_request`] with the operation name and the raw request body, then
 //! calls [`ParsedRequest::admit`] on the result to get the body it passes to
-//! [`crate::dispatch`]. A check added to either step reaches both entry
-//! points, except on the operations the WebAssembly adapter refuses before
-//! it calls [`parse_request`]: the three PartiQL operations and
-//! `DescribeEndpoints`.
-//!
-//! They are the only checks both entry points make before dispatch. Every
-//! other check the server makes before it dispatches a request is its own
-//! (most of them are in its request handler, `handle_request`, and its
-//! authorization, `authorize_request`). The WebAssembly adapter makes none of
-//! them, so a check that must reach both entry points belongs in one of the
-//! two steps here.
+//! [`crate::dispatch`]. A check that every request the engine dispatches must
+//! pass belongs in one of the two steps: a check that an entry point makes
+//! itself reaches only the requests that come through that entry point.
 //!
 //! The types fix the order of the two steps: `admit` is a method of
 //! [`ParsedRequest`], which only `parse_request` constructs, so `admit` runs
