@@ -33,14 +33,16 @@ force-warned lint). It fails, with one line per problem, unless:
    a warning, which -D warnings does not raise);
 3. each other allow or expect that names one of the two lints is a problem,
    with the reason it is not accepted;
-4. both runs finish, and in each, every crate's dep-info records the
-   CLIPPY_ARGS and CLIPPY_CONF_DIR the step passed (a build script's
-   cargo::rustc-env can change either for its crate, a forced [env] entry for
-   every crate); the environment sets none of RUSTC, RUSTC_WRAPPER,
-   RUSTC_WORKSPACE_WRAPPER and their CARGO_BUILD_ forms, and no cargo
-   configuration file the copy's runs read sets build.rustc,
-   build.rustc-wrapper or build.rustc-workspace-wrapper (another program as
-   the compiler can change its options for one crate);
+4. both runs finish (of a run that does not, the guard reports the errors
+   and the crates it did not finish linting, and judges nothing else), and
+   in each, every crate's dep-info records the CLIPPY_ARGS and
+   CLIPPY_CONF_DIR the step passed (a build script's cargo::rustc-env can
+   change either for its crate, a forced [env] entry for every crate); the
+   environment sets none of RUSTC, RUSTC_WRAPPER, RUSTC_WORKSPACE_WRAPPER and
+   their CARGO_BUILD_ forms, and no cargo configuration file the copy's runs
+   read sets build.rustc, build.rustc-wrapper or
+   build.rustc-workspace-wrapper (another program as the compiler can change
+   its options for one crate);
 5. in the adapter's wasm32 build as `cargo tree -e normal` resolves it, each
    of aes, aes-gcm, ghash and polyval is there as one copy (one package: one
    name, version and source), with its zeroize feature on.
@@ -562,22 +564,12 @@ def run_clippy(tree: Path, target_dir: str, clippy_options: list[str]) -> Run:
 def dep_info(run: Run, crates: dict, copy: Path, name: str) -> tuple[dict, list[Finding]]:
     """For each of `crates`, the files and the environment variables its
     dep-info lists, read from the dep-info file rustc writes next to the
-    metadata file the run's compiler-artifact record names; a finding for a
-    run that failed or left a crate without that record; and an "examined"
-    finding for each crate read, which a control expects for every crate.
-    rustc writes the dep-info of a crate whose lints fail too, but cargo names
-    no artifact for that crate."""
+    metadata file the run's compiler-artifact record names; a finding for each
+    crate the run left without that record; and an "examined" finding for
+    each crate read, which a control expects for every crate. rustc writes the
+    dep-info of a crate whose lints fail too, but cargo names no artifact for
+    that crate."""
     found = []
-    if run.code != 0:
-        errors = [m.get("rendered") or m["message"] for m in run.messages if m["level"] == "error"]
-        found.append(
-            Finding(
-                name,
-                "the copy",
-                f"the clippy step {name} failed in the copy (exit status {run.code}):\n"
-                + ("\n".join(errors) or run.stderr),
-            )
-        )
     by_manifest = {
         (copy / Path(p["manifest_path"]).relative_to(ROOT)).resolve(): crate
         for crate, p in crates.items()
@@ -601,6 +593,23 @@ def dep_info(run: Run, crates: dict, copy: Path, name: str) -> tuple[dict, list[
         Finding("examined", f"{crate} ({name})", f"examined {crate} ({name})") for crate in read
     ]
     return read, found
+
+
+def unfinished(run: Run, name: str, read: dict, crates: dict) -> int:
+    """Report a clippy run that did not finish (`read` holds the dep-info it
+    left, by crate) and return the guard's exit status. Once a crate fails,
+    cargo starts no other ("build failed, waiting for other jobs to
+    finish"), so the run's reports and dep-info cover only the crates it
+    finished: the guard judges nothing else."""
+    errors = [m.get("rendered") or m["message"] for m in run.messages if m["level"] == "error"]
+    print(
+        f"FAIL: the clippy step {name} did not finish in the copy (exit status {run.code}),"
+        " so the guard judges nothing else; the crates it did not finish linting:"
+        f" {', '.join(sorted(set(crates) - set(read))) or 'none'}. Its errors:\n"
+        + ("\n".join(errors) or run.stderr),
+        file=sys.stderr,
+    )
+    return 1
 
 
 def read_dep_info(info: Path, root: Path) -> tuple[list[Path], dict[str, str]]:
@@ -1693,11 +1702,15 @@ def check(crates: dict[str, dict], target_dir: str, copy: Path) -> int:
     plain = run_clippy(copy, target_dir, [])
     read_plain, found = dep_info(plain, crates, copy, "without options")
     findings += found
+    if plain.code != 0:
+        return unfinished(plain, "without options", read_plain, crates)
     probe_file, spans, found = plant_probes(copy, crates)
     findings += found
     forced = run_clippy(copy, target_dir, FORCE_WARN)
     read_forced, found = dep_info(forced, crates, copy, "with --force-warn")
     findings += found
+    if forced.code != 0:
+        return unfinished(forced, "with --force-warn", read_forced, crates)
     findings += driver_problems(read_plain, read_forced, str(copy / CONF_REL))
     findings += config_warnings({"plain": plain, "forced": forced}, (copy / CONFIG_REL).resolve())
     probes = {kind: dict(table) for kind, table in KINDS.values()}
