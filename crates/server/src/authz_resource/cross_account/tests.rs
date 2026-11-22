@@ -377,6 +377,28 @@ fn shape_checks_come_first_only_for_a_known_account() {
         message(&known).1,
         resource_policy_denial(p, "DescribeStream", STREAM)
     );
+    // A backup ARN with a table segment outside the pattern: "Access is
+    // denied" in an account the catalog does not hold (measured 2026-11-22
+    // on the three operations), the segment's answer in one it holds
+    // (derived); a well-formed one gets the owner-only answer.
+    let segment = BACKUP.replace("table/t/", "table/a b/");
+    let owner = ("ValidationException", OWNER_ONLY.to_owned());
+    let invalid_backup = ("ValidationException", "Invalid Backup ARN".to_owned());
+    for op in ["DescribeBackup", "DeleteBackup", "RestoreTableFromBackup"] {
+        for (arn, known_answer) in [(BACKUP, &owner), (segment.as_str(), &invalid_backup)] {
+            let input = json!({ "BackupArn": arn });
+            assert_eq!(
+                message(&answer(op, &input, op, arn, true, p, R)),
+                *known_answer,
+                "{op} {arn}"
+            );
+            assert_eq!(
+                message(&answer(op, &input, op, arn, false, p, R)),
+                access,
+                "{op} {arn}"
+            );
+        }
+    }
 }
 
 /// A stream ARN in another account with another partition, service or region,

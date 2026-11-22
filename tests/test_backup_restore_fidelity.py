@@ -2421,6 +2421,75 @@ def test_backup_and_table_names_are_validated(dynamodb_client):
         _cleanup(client, None, source)
 
 
+@pytest.fixture(scope="module")
+def caller_account(dynamodb_client) -> str:
+    """The caller's account, read from the ARN of a table created for it."""
+    name = f"restore-account-{uuid.uuid4().hex[:10]}"
+    _simple_source(dynamodb_client, name)
+    try:
+        yield dynamodb_client.describe_table(TableName=name)["Table"]["TableArn"].split(":")[4]
+    finally:
+        _cleanup(dynamodb_client, None, name)
+
+
+# A BackupArn of six fields with a non-empty resource whose account field is
+# not the caller's, an empty one included, whatever the partition, the
+# service and the table segment: AccessDeniedException "Access is denied"
+# before any other check of it. Fewer fields, an empty resource or the
+# caller's own account: the shape answer, ValidationException "Invalid Backup
+# ARN". Measured on DynamoDB in us-east-1 on 22 Nov 2026 with DescribeBackup
+# for every row; with DeleteBackup for the first three, the empty account,
+# the IAM role and the `a b` segment of another account, and `x` and the
+# caller's own table ARN (21 Nov 2026); with RestoreTableFromBackup for the
+# empty account, the five fields, the empty resource and the `a b` segment of
+# another account, and the S3 ARN, another account's backup ARN, `x` and the
+# caller's own table ARN (21 Nov 2026). Each row is sent to the three
+# operations, which answered alike on every row measured on more than one.
+# `{own}` is the caller's account; no backup exists.
+_DENIED = ("AccessDeniedException", "Access is denied")
+_INVALID_ARN = ("ValidationException", "Invalid Backup ARN")
+_BACKUP_ARN_ACCOUNT_ROWS = [
+    ("arn:aws:dynamodb:us-east-1:000000000000:x", _DENIED),
+    ("arn:aws:s3:::restore-arnacct-bucket", _DENIED),
+    ("arn:aws:dynamodb:us-east-1:000000000000:table/restore-arnacct-music", _DENIED),
+    ("arn:aws:dynamodb:us-east-1::x", _DENIED),
+    ("arn:aws:iam::000000000000:role/x", _DENIED),
+    ("arn:aws:dynamodb:us-east-1:000000000000:table/restore-arnacct-music"
+     "/backup/01700000000000-abcdef12", _DENIED),
+    ("arn:aws:dynamodb:us-west-2:000000000000:x", _DENIED),
+    ("arn:aws-cn:dynamodb:cn-north-1:000000000000:x", _DENIED),
+    ("arn:aws:dynamodb:us-east-1:000000000000:table/a b/backup/01700000000000-abcdef12",
+     _DENIED),
+    ("arn:aws:dynamodb:us-east-1:000000000000:table/" + "t" * 300
+     + "/backup/01700000000000-abcdef12", _DENIED),
+    ("arn:aws:dynamodb:us-east-1:{own}:x", _INVALID_ARN),
+    ("arn:aws:dynamodb:us-east-1:{own}:table/a b/backup/01700000000000-abcdef12",
+     _INVALID_ARN),
+    ("x", _INVALID_ARN),
+    ("arn:aws", _INVALID_ARN),
+    ("arn:aws:dynamodb:us-east-1:000000000000", _INVALID_ARN),
+    ("arn:aws:dynamodb:us-east-1:000000000000:", _INVALID_ARN),
+    ("arn:aws:dynamodb:us-east-1:{own}:table/restore-arnacct-music", _INVALID_ARN),
+]
+
+
+@pytest.mark.parametrize(("arn", "expected"), _BACKUP_ARN_ACCOUNT_ROWS)
+def test_backup_arn_account_is_checked_before_its_shape(dynamodb_client, caller_account,
+                                                         arn, expected):
+    arn = arn.format(own=caller_account)
+    target = f"restore-arnacct-{uuid.uuid4().hex[:10]}"
+    for operation, body in (
+        ("DescribeBackup", {"BackupArn": arn}),
+        ("DeleteBackup", {"BackupArn": arn}),
+        ("RestoreTableFromBackup", {"BackupArn": arn, "TargetTableName": target}),
+    ):
+        resp = _signed(operation, body)
+        assert resp.status_code == 400, (operation, arn, resp.text)
+        assert _error(resp) == expected, (operation, arn, resp.text)
+    with pytest.raises(dynamodb_client.exceptions.ResourceNotFoundException):
+        dynamodb_client.describe_table(TableName=target)
+
+
 def test_backup_arn_shapes_the_service_refuses_and_trims(dynamodb_client):
     """BackupArn shapes the service refuses as ValidationException "Invalid
     Request: BackupArn is not valid" (control characters in the id, a slash

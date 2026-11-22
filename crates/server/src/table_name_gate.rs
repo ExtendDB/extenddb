@@ -65,6 +65,9 @@
 //!   (`extenddb_engine::check_restore_override_kinds`), is answered before
 //!   every check of a value, whatever the name and the account (measured
 //!   2026-11-21).
+//! - A DescribeBackup, DeleteBackup or RestoreTableFromBackup `BackupArn` of
+//!   another account is `Access is denied` before its shape (measured
+//!   2026-11-22, `extenddb_engine::check_backup_arn_account`).
 //! - A RestoreTableFromBackup `TargetTableName` or `BackupArn`, a
 //!   DescribeBackup or DeleteBackup `BackupArn` and a
 //!   DescribeContinuousBackups or UpdateContinuousBackups `TableName` that
@@ -129,6 +132,10 @@ pub(crate) fn check_table_name_chars(
         }
         "DescribeBackup" | "DeleteBackup" => {
             string_member(input, "BackupArn")?;
+            if cross_account::find(operation, input, account_id).is_some() {
+                return Ok(());
+            }
+            extenddb_engine::check_backup_arn_account(input, account_id)?;
             with_str(input, "BackupArn", arn_gate::check_backup_arn)
         }
         "DescribeContinuousBackups" | "UpdateContinuousBackups" => {
@@ -143,16 +150,16 @@ pub(crate) fn check_table_name_chars(
             // values, whatever the name and the account (measured on DynamoDB
             // on 21 Nov 2026).
             extenddb_engine::check_restore_override_kinds(input)?;
+            // The cross-account refusal answers an ARN it reads, and
+            // `authorize_request` looks no table up before that refusal.
+            if cross_account::find(operation, input, account_id).is_some() {
+                return Ok(());
+            }
             with_str(input, "BackupArn", arn_gate::check_backup_arn)?;
             // A target name refused here gets the restore's own answer, its
             // length text before the member constraints, with the model's
             // bounds (measured on DynamoDB on 20 Nov 2026).
             check_name_member(target, "targetTableName").or_else(|_| {
-                // The cross-account refusal answers it, and `authorize_request`
-                // looks no table up before that refusal.
-                if cross_account::find(operation, input, account_id).is_some() {
-                    return Ok(());
-                }
                 // The account and the shape of the `BackupArn` come before the
                 // name, an absent one included (measured on 21 Nov 2026).
                 extenddb_engine::check_restore_backup_arn(input, account_id)?;
@@ -701,6 +708,78 @@ mod tests {
         }
     }
 
+    /// Measured on DynamoDB on 22 Nov 2026 on DescribeBackup, DeleteBackup and
+    /// RestoreTableFromBackup: denied, passed on to later checks, or invalid.
+    #[test]
+    fn a_backup_arn_of_another_account_is_refused_before_its_shape() {
+        let denied = "Access is denied";
+        let invalid = "Invalid Backup ARN";
+        let long_segment = format!(
+            "arn:aws:dynamodb:us-east-1:000000000000:table/{}/backup/01700000000000-abcdef12",
+            "t".repeat(300)
+        );
+        let rows = [
+            ("arn:aws:dynamodb:us-east-1:000000000000:x", denied),
+            ("arn:aws:s3:::b", denied),
+            ("arn:aws:dynamodb:us-east-1::x", denied),
+            ("arn:aws:iam::000000000000:role/x", denied),
+            ("arn:aws:dynamodb:us-west-2:000000000000:x", denied),
+            ("arn:aws-cn:dynamodb:cn-north-1:000000000000:x", denied),
+            ("arn:aws:dynamodb:us-east-1:000000000000:x\n", denied),
+            (
+                "arn:aws:dynamodb:us-east-1:000000000000:table/t367name",
+                "passed",
+            ),
+            (
+                "arn:aws:dynamodb:us-east-1:000000000000:table/t367name/backup/01700000000000-abcdef12",
+                "passed",
+            ),
+            (
+                "arn:aws:dynamodb:us-east-1:000000000000:table/a b/backup/01700000000000-abcdef12",
+                "passed",
+            ),
+            (long_segment.as_str(), "passed"),
+            (
+                "arn:aws:dynamodb:us-east-1:123456789012:table/a b/backup/01700000000000-abcdef12",
+                invalid,
+            ),
+            ("arn:aws:dynamodb:us-east-1:123456789012:x", "passed"),
+            (
+                "arn:aws:dynamodb:us-east-1:123456789012:table/t367name",
+                "passed",
+            ),
+            (BACKUP, "passed"),
+            ("x", "passed"),
+            ("arn:aws", "passed"),
+            ("arn:aws:dynamodb:us-east-1:000000000000", "passed"),
+            ("arn:aws:dynamodb:us-east-1:000000000000:", "passed"),
+            ("", "passed"),
+        ];
+        for (arn, expected) in rows {
+            for op in ["DescribeBackup", "DeleteBackup", "RestoreTableFromBackup"] {
+                let mut input = json!({ "BackupArn": arn });
+                let mut expected = expected;
+                if op == "RestoreTableFromBackup" {
+                    input["TargetTableName"] = json!("t367name");
+                    // The engine checks the restore's account, after the IAM
+                    // decision.
+                    if expected == denied {
+                        expected = "passed";
+                    }
+                }
+                let answer = match check_table_name_chars(op, &input, "123456789012") {
+                    Ok(()) => "passed".to_owned(),
+                    Err(
+                        DynamoDbError::AccessDeniedException(m)
+                        | DynamoDbError::ValidationException(m),
+                    ) => m,
+                    Err(other) => panic!("{op} {arn:?}: unexpected error {other:?}"),
+                };
+                assert_eq!(answer, expected, "{op} {arn:?}");
+            }
+        }
+    }
+
     /// Measured on DynamoDB on 20 and 21 Nov 2026 (see the module docs). Only
     /// the type of a `SerializationException` is checked (#1012).
     #[test]
@@ -809,6 +888,31 @@ mod tests {
                 json!({ "BackupArn": "arn:aws:s3:::b" }),
                 "a*",
                 "Access is denied",
+            ),
+            // The account needs a non-empty resource: an empty one, and
+            // fewer than six fields, are the shape's answer (measured on
+            // 22 Nov 2026). Another account's with a table segment outside
+            // the pattern is left to the cross-account refusal, before the
+            // segment (measured on 22 Nov 2026 with the restore).
+            (
+                json!({ "BackupArn": "arn:aws:dynamodb:us-east-1::x" }),
+                "a*",
+                "Access is denied",
+            ),
+            (
+                json!({ "BackupArn": other.replace("t367name", "a b") }),
+                "a*",
+                "passed",
+            ),
+            (
+                json!({ "BackupArn": "arn:aws:dynamodb:us-east-1:000000000000:" }),
+                "a*",
+                invalid,
+            ),
+            (
+                json!({ "BackupArn": "arn:aws:dynamodb:us-east-1:000000000000" }),
+                "a*",
+                invalid,
             ),
             (
                 json!({ "BackupArn": own.replace("01700000000000-abcdef12", "bad") }),
