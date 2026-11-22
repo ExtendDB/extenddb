@@ -1666,9 +1666,12 @@ def _plant(
     """Write `text` to a new file of the copy at `path` (a path of the working
     tree), or append it to the copy's file there; with `write` false, only find
     whether that can be done. It cannot when the working tree already uses the
-    new file's name, or when the file appended to holds what `text` adds
-    (_held): then nothing is written, and the finding says why."""
+    new file's name, when the file appended to holds what `text` adds (_held),
+    or when a write would follow a symbolic link out of the copy (_leaves_copy):
+    then nothing is written, and the finding says why."""
     rel = Path(os.path.relpath(path, ROOT))
+    if found := _leaves_copy(copy, rel):
+        return found
     if not append and os.path.lexists(path):
         return [Finding("plant", rel.as_posix(), f"{rel} exists; the guard plants a file there")]
     if append and (held := _held(copy, rel, text)):
@@ -1678,6 +1681,18 @@ def _plant(
         with open(copy / rel, "a" if append else "w", encoding="utf-8") as file:
             file.write(text)
     return []
+
+
+def _leaves_copy(copy: Path, rel: Path) -> list[Finding]:
+    """A finding when the copy's path `rel`, or a directory on the way to it,
+    is a symbolic link that leads out of the copy. copy_tree copies a link as
+    the link it is, so a write there would change a file outside the copy,
+    the caller's working tree among them."""
+    if (copy / rel).resolve().is_relative_to(copy.resolve()):
+        return []
+    where = Path(rel).as_posix()
+    text = f"{where} leads out of the copy through a symbolic link; the guard writes nothing to it"
+    return [Finding("plant", where, text)]
 
 
 def _held(copy: Path, rel: Path, text: str) -> str | None:
@@ -1759,7 +1774,9 @@ def plant_controls(copy: Path, crates: dict[str, dict]) -> tuple[list[Control], 
         count=1,
         flags=re.M,
     )
-    if CONTROL_ENTRY in current:
+    if leaves := _leaves_copy(copy, Path(CONFIG_REL)):
+        found += leaves
+    elif CONTROL_ENTRY in current:
         found.append(Finding("plant", CONFIG_REL, f"{CONFIG_REL} names {CONTROL_ENTRY} already"))
     elif count != 1:
         found.append(Finding("plant", CONFIG_REL, f"{CONFIG_REL}: no `disallowed-methods = [`"))
