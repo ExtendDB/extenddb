@@ -68,11 +68,15 @@ run() {
     exec "$@"
 }
 
-# Prints the version of the wasm-bindgen crate in Cargo.lock: what follows the
-# last "@" of the package id that `cargo pkgid` reads from the lock (it fails
-# when there is none, and leaves an out-of-date one as it is). The workflow
-# installs the wasm-bindgen-cli of this version, and the core, shim and corpus
-# steps need it. run_suite and the corpus step take the output with a command
+# Prints the version of the wasm-bindgen crate in Cargo.lock, from the package
+# id that `cargo pkgid` reads from the lock (it fails when there is none, and
+# leaves an out-of-date one as it is): what follows the id's last "#", and of
+# that what follows its last "@" when it has one. Cargo writes the id as
+# <source>#<name>@<version>, or as <source>#<version> when the last segment of
+# the source's path is the package's name (a path or git copy in a directory
+# or repository named wasm-bindgen). The workflow installs the
+# wasm-bindgen-cli of this version, and the core, shim and corpus steps need
+# it. run_suite and the corpus step take the output with a command
 # substitution, where bash clears `set -e`, so the function checks each
 # failure itself.
 lock_wasm_bindgen_version() {
@@ -80,9 +84,10 @@ lock_wasm_bindgen_version() {
     show cargo pkgid --color never wasm-bindgen
     id="$(cargo pkgid --color never wasm-bindgen)" \
         || die "cargo pkgid did not name the wasm-bindgen package of Cargo.lock (its error is above)"
-    version="${id##*@}"
+    version="${id##*#}"
+    version="${version##*@}"
     if ! [[ "$version" =~ $semver ]]; then
-        die "cargo pkgid wasm-bindgen printed '${id}', which does not end with @<version>"
+        die "cargo pkgid wasm-bindgen printed '${id}', which does not end with #<version> or @<version>"
     fi
     echo "$version"
 }
