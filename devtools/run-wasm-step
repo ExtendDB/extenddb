@@ -162,15 +162,18 @@ case "$step" in
         # Clippy for wasm32 with the lists of devtools/wasm-clippy/clippy.toml,
         # whose header says what they refuse and why, and what this step does
         # not see. Without --no-deps, clippy lints every workspace crate the
-        # adapter compiles for wasm32 as well as the adapter. CLIPPY_CONF_DIR
-        # is set for this cargo only, so other clippy runs (clippy.yml's, the
-        # pedantic step's) do not read those lists. --lib checks the adapter's
-        # library alone, which is also what cargo checks by default here: the
-        # adapter has no binary target, and tests are not a default target.
-        # Options given after the step name go to cargo before its `--`, for a
-        # caller that wants another message format. Options after a `--` go to
-        # clippy after the step's own `-D warnings`, for a caller that adds
-        # lint options.
+        # adapter compiles for wasm32 as well as the adapter. --release lints
+        # the profile the module ships in: the README and the corpus step build
+        # it with --release, so code compiled only without debug assertions is
+        # linted, and code that only a dev build compiles is not.
+        # CLIPPY_CONF_DIR is set for this cargo only, so other clippy runs
+        # (clippy.yml's, the pedantic step's) do not read those lists. --lib
+        # checks the adapter's library alone, which is also what cargo checks
+        # by default here: the adapter has no binary target, and tests are not
+        # a default target. Options given after the step name go to cargo
+        # before its `--`, for a caller that wants another message format.
+        # Options after a `--` go to clippy after the step's own `-D warnings`,
+        # for a caller that adds lint options.
         cargo_options=()
         while [ $# -gt 0 ] && [ "$1" != -- ]; do
             cargo_options+=("$1")
@@ -181,7 +184,7 @@ case "$step" in
         fi
         run env CLIPPY_CONF_DIR="$PWD/devtools/wasm-clippy" \
             cargo clippy --locked ${cargo_options[@]+"${cargo_options[@]}"} -p "$ADAPTER" --lib \
-            --target "$TARGET" -- -D warnings "$@"
+            --release --target "$TARGET" -- -D warnings "$@"
         ;;
 
     guard)

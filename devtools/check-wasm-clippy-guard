@@ -46,10 +46,11 @@ force-warned lint). It fails, with one line per problem, unless:
    zeroize feature on.
 Each check runs, in the same call, on the tree and on controls planted for
 it: CONTROLS, OTHER_FILE_CONTROLS, LINTS_CONTROL with its [lints] table,
-BUILD_SCRIPT, CONTROL_PROBE, CONTROL_ENTRY, CONTROL_ENVIRONMENT,
-CONTROL_CARGO_CONFIG and two zeroize graphs; and each run's dep-info must be
-read for every crate of the build. A control that does not give the finding
-it was planted for, and a finding no control expects, fail the guard.
+BUILD_SCRIPT, RELEASE_CONTROL, CONTROL_PROBE, CONTROL_ENTRY,
+CONTROL_ENVIRONMENT, CONTROL_CARGO_CONFIG and two zeroize graphs; and each
+run's dep-info must be read for every crate of the build. A control that does
+not give the finding it was planted for, and a finding no control expects,
+fail the guard.
 
 What it does not see: calls a dependency makes in its own code, which clippy
 does not lint; and a build script or a procedural macro that behaves
@@ -1536,6 +1537,19 @@ fn main() {
 }
 """
 
+# A control in PROBE_CRATE: a call no allow covers, compiled only without debug
+# assertions, as in the release build the module ships in. plant_probes
+# declares its module after the run without options, which the call would
+# fail.
+RELEASE_MODULE = "wasm_clippy_guard_release"
+RELEASE_CONTROL = """\
+// A control of devtools/check-wasm-clippy-guard, in its copy of the tree only.
+pub(crate) fn release_profile() {
+    #[cfg(not(debug_assertions))]
+    std::thread::sleep(std::time::Duration::ZERO); //@ release-profile call
+}
+"""
+
 
 def _plant(copy: Path, path: Path, text: str, append: bool = False) -> list[Finding]:
     """Write (or append) `text` to the copy's file at `path` (a path of the
@@ -1566,6 +1580,7 @@ def plant_controls(copy: Path, crates: dict[str, dict]) -> tuple[list[Control], 
             name="path"
         ),
         probe_root.parent / f"{CONTROL_MODULE}.inc": OTHER_FILE_CONTROLS.format(name="include"),
+        probe_root.parent / f"{RELEASE_MODULE}.rs": RELEASE_CONTROL,
         lints_root.parent / f"{LINTS_CONTROL_MODULE}.rs": LINTS_CONTROL,
     }
     if scripted:
@@ -1634,8 +1649,8 @@ def plant_controls(copy: Path, crates: dict[str, dict]) -> tuple[list[Control], 
 
 def plant_probes(copy: Path, crates: dict[str, dict]) -> tuple[Path, list[tuple], list[Finding]]:
     """Add every probe, and CONTROL_PROBE, to a new module of PROBE_CRATE in the
-    copy. Returns its file, the kind, path and line of each probe, and
-    findings."""
+    copy, and declare the module of RELEASE_CONTROL. Returns the probes' file,
+    the kind, path and line of each probe, and findings."""
     root = lib_root(crates[PROBE_CRATE])
     probes = [(kind, *entry) for kind, table in KINDS.values() for entry in table.items()]
     lines = ["// Probes of devtools/check-wasm-clippy-guard, in its copy of the tree only."]
@@ -1647,6 +1662,7 @@ def plant_probes(copy: Path, crates: dict[str, dict]) -> tuple[Path, list[tuple]
     found = _plant(copy, root.parent / f"{PROBE_MODULE}.rs", "\n".join(lines) + "\n")
     # warnings: no lint the run does not force to warn may fail it.
     found += _plant(copy, root, f"\n#[allow(warnings)]\nmod {PROBE_MODULE};\n", append=True)
+    found += _plant(copy, root, f"\n#[allow(dead_code)]\nmod {RELEASE_MODULE};\n", append=True)
     return copy / Path(os.path.relpath(root.parent, ROOT)) / f"{PROBE_MODULE}.rs", spans, found
 
 
