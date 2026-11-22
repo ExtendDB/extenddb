@@ -189,9 +189,13 @@ mod imp {
     // state only under its own `zeroize` feature, which is what gives
     // `Polyval` a `Drop` implementation (polyval 0.6.2 src/backend/soft32.rs,
     // the backend wasm32 compiles); without it the type holds plain integers
-    // and has no drop glue. Requiring that marker of the block cipher inside
-    // `Aes256Gcm`, and drop glue of the `Polyval` inside its GHASH, makes this
-    // build fail when either feature is off; core's manifest turns both on.
+    // and has no drop glue. This block requires that marker of the block
+    // cipher aes-gcm re-exports (`aes_gcm::aes`) and drop glue of
+    // `polyval::Polyval`, so the build fails when either feature is off;
+    // core's manifest turns both on. `polyval::Polyval` names core's own
+    // polyval dependency, which is the `Polyval` inside aes-gcm's GHASH only
+    // while the build holds one polyval version, as
+    // devtools/check-wasm-clippy-guard requires.
     const _: () = {
         const fn wiped_on_drop<T: zeroize::ZeroizeOnDrop>() {}
         wiped_on_drop::<aes_gcm::aes::Aes256>();

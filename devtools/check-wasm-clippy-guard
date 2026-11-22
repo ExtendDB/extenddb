@@ -106,17 +106,18 @@ fails, with one line per problem, unless all of these hold:
    warning level must not count.
 4. In the adapter's wasm32 build, as `cargo tree -p extenddb-wasm-adapter
    --target wasm32-unknown-unknown -e normal` resolves its features, each
-   crate of ZEROIZE_CRATES (aes-gcm, ghash) has its `zeroize` feature on:
-   each wipes, only under that feature, keys its constructor derives,
-   crates/core/Cargo.toml turns it on, and no other step of the workflow
-   fails without it. cargo tree resolves the features of the adapter's own
-   build; `cargo metadata --filter-platform` unifies those of every
-   workspace member and dev-dependency (it lists extenddb-storage's
-   test-util and tokio's net and fs features, none of which the wasm build
-   compiles). The other two crates of the stack, aes and polyval, are
-   checked by core's wasm32 build instead (crates/core/src/crypto.rs). In
-   the copy, with each of the two in turn without that feature in
-   crates/core/Cargo.toml, the check must report that crate and no other.
+   crate of ZEROIZE_CRATES (aes, aes-gcm, ghash, polyval) appears in one
+   version, and that version has its `zeroize` feature on: each wipes its own
+   key material only under that feature, and crates/core/Cargo.toml, which
+   turns the feature on, reaches only the version its entry resolves to.
+   cargo tree resolves the features of the adapter's own build; `cargo
+   metadata --filter-platform` unifies those of every workspace member and
+   dev-dependency (it lists extenddb-storage's test-util and tokio's net and
+   fs features, none of which the wasm build compiles). The check runs, in
+   one loop, on the copy and on two controls for ghash, each of which it must
+   report with the problem the control plants: the copy with ghash's feature
+   removed from crates/core/Cargo.toml, and the copy's graph with a second
+   ghash version added.
 
 The clippy step runs, as devtools/run-wasm-step holds it, in the working tree
 and in the copy, each with its own devtools/wasm-clippy/clippy.toml (the
@@ -1602,103 +1603,102 @@ def _stop(signum: int, _frame) -> None:
 
 # ---------------------------------------------------------------- zeroize features
 
-# The crates of the wasm32 AES-256-GCM stack whose `zeroize` feature must be on
-# in the adapter's wasm32 build and that no compile-time check can require:
-# each wipes, only under that feature, keys its constructor derives (aes-gcm
-# the GHASH key, ghash the key it derives for POLYVAL), and the feature changes
-# none of its types. CORE_MANIFEST's wasm32 dependencies turn each one on. The
-# other two crates of the stack are not listed: core's wasm32 crypto backend
-# (crates/core/src/crypto.rs) requires the ZeroizeOnDrop marker that aes's
-# feature gives its cipher and the Drop implementation that polyval's gives
-# Polyval, so the build fails without either.
-ZEROIZE_CRATES = ("aes-gcm", "ghash")
+# The crates of the wasm32 AES-256-GCM stack. Each wipes its own key material
+# only under its own `zeroize` feature, which CORE_MANIFEST turns on for each.
+ZEROIZE_CRATES = ("aes", "aes-gcm", "ghash", "polyval")
 CORE_MANIFEST = "crates/core/Cargo.toml"
 
 
-def zeroize_problems(features: dict[str, set[str]]) -> list[str]:
-    """Problems with the `zeroize` features of ZEROIZE_CRATES among the
-    resolved `features` of the adapter's wasm32 build: a crate that is not in
-    the build, or whose feature is off."""
-    problems = []
-    for crate in ZEROIZE_CRATES:
-        if crate not in features:
-            problems.append(
-                f"{crate}: not in the adapter's wasm32 build; update ZEROIZE_CRATES and"
-                f" {CORE_MANIFEST} together"
-            )
-        elif "zeroize" not in features[crate]:
-            problems.append(
-                f"{crate}: its zeroize feature is off in the adapter's wasm32 build, so it"
-                f" leaves its key material in memory; {CORE_MANIFEST} turns it on for wasm32"
-            )
-    return problems
-
-
-def resolved_features(tree: Path, locked: bool) -> tuple[dict[str, set[str]], list[str]]:
-    """The features cargo resolves for each package of the adapter's wasm32
-    build, by name, in the tree at `tree`, and the problems found. `cargo tree
-    -e normal` resolves them for the adapter and its normal dependencies on
-    that target, as its build does. A tree whose manifests changed is resolved
-    offline, without --locked, so that cargo may rewrite its Cargo.lock."""
-    command = ["cargo", "tree", "-p", ADAPTER, "--target", TARGET, "-e", "normal"]
-    command += ["--prefix", "none", "--format", "{p}|{f}"]
-    command.append("--locked" if locked else "--offline")
+def adapter_graph(tree: Path, locked: bool = True) -> tuple[list[str], list[str]]:
+    """The packages of the adapter's wasm32 build as `cargo tree -e normal`
+    resolves them in the tree at `tree` (the adapter and its normal
+    dependencies on that target, with the features its build compiles), one
+    `name version|features` line each, and the problems found. Unless
+    `locked`, cargo resolves offline and may rewrite the tree's Cargo.lock."""
+    command = ["cargo", "tree", "--locked" if locked else "--offline", "-p", ADAPTER]
+    command += ["--target", TARGET, "-e", "normal", "--prefix", "none", "--format", "{p}|{f}"]
     try:
         run = subprocess.run(command, cwd=tree, capture_output=True, text=True, check=False)
     except FileNotFoundError:
         sys.exit("error: cargo is not on PATH")
     if run.returncode != 0:
-        return {}, [f"{' '.join(command)} failed in {tree}:\n{run.stderr}"]
-    features = {}
-    for line in run.stdout.splitlines():
-        package, _, enabled = line.removesuffix(" (*)").partition("|")
-        name = package.split(" ")[0]
-        features.setdefault(name, set()).update(enabled.split(",") if enabled else ())
-    return features, []
+        return [], [f"{' '.join(command)} failed in {tree}:\n{run.stderr}"]
+    return [line.removesuffix(" (*)") for line in run.stdout.splitlines()], []
 
 
-def zeroize_probe_problems(copy: Path) -> tuple[list[str], str]:
-    """Problems with the zeroize check: in the copy of the tree at `copy`, with
-    each crate of ZEROIZE_CRATES in turn without its `zeroize` feature in
-    CORE_MANIFEST, the check must report that crate, and no other."""
-    manifest = copy / CORE_MANIFEST
-    lock = copy / "Cargo.lock"
+def zeroize_problems(graph: list[str], crates: tuple = ZEROIZE_CRATES) -> list[str]:
+    """Problems with `crates` in `graph` (adapter_graph's lines): a crate that
+    is missing, that is there in more than one version, or whose version has
+    its `zeroize` feature off."""
+    versions = {}
+    for line in graph:
+        package, _, features = line.partition("|")
+        name, _, version = package.partition(" ")
+        if name in crates:
+            versions.setdefault(name, {})[version.split(" ")[0]] = set(features.split(","))
+    problems = []
+    for crate in crates:
+        found = versions.get(crate, {})
+        if not found:
+            problems.append(
+                f"{crate} is not in the adapter's wasm32 build; update ZEROIZE_CRATES and"
+                f" {CORE_MANIFEST} together"
+            )
+        elif len(found) > 1:
+            problems.append(
+                f"{crate} is in the adapter's wasm32 build in {len(found)} versions"
+                f" ({', '.join(found)}); {CORE_MANIFEST} turns the zeroize feature on only in"
+                " the version its entry resolves to, which must be the one aes-gcm's stack uses"
+            )
+        elif "zeroize" not in next(iter(found.values())):
+            problems.append(
+                f"{crate} {next(iter(found))} is built without its zeroize feature, so it"
+                f" leaves key material in memory; {CORE_MANIFEST} turns it on for wasm32"
+            )
+    return problems
+
+
+def zeroize_check(copy: Path) -> tuple[list[str], str]:
+    """zeroize_problems, in one loop, of the adapter's wasm32 build in the copy
+    of the tree at `copy` and, for ghash, of two controls: that build with
+    ghash's zeroize feature removed from CORE_MANIFEST, and its graph with a
+    second ghash version added. Each control must give the problem its entry
+    names; the build's problems are problems."""
+    manifest, lock = copy / CORE_MANIFEST, copy / "Cargo.lock"
     original, original_lock = manifest.read_text(encoding="utf-8"), lock.read_bytes()
-    problems, reported = [], 0
+    graph, problems = adapter_graph(copy)
+    entry = re.compile(r'^(\s*ghash\s*=\s*\{[^\n]*?features\s*=\s*\[[^\]\n]*?)"zeroize",?\s*', re.M)
     try:
-        for crate in ZEROIZE_CRATES:
-            entry = re.compile(
-                rf'^(\s*{re.escape(crate)}\s*=\s*{{[^\n]*?features\s*=\s*\[)([^\]\n]*)\]', re.M
-            )
-            match = entry.search(original)
-            listed = [f.strip() for f in match.group(2).split(",")] if match else []
-            if '"zeroize"' not in listed:
-                problems.append(
-                    f"zeroize probe: {CORE_MANIFEST} has no `{crate} = {{ ... features = [...,"
-                    ' "zeroize"] }` entry to remove the feature from'
-                )
-                continue
-            kept = ", ".join(f for f in listed if f and f != '"zeroize"')
-            manifest.write_text(
-                original[: match.start(2)] + kept + original[match.end(2) :], encoding="utf-8"
-            )
-            features, found = resolved_features(copy, locked=False)
-            found += zeroize_problems(features)
-            if any(p.startswith(f"{crate}:") for p in found) and all(
-                p.startswith(f"{crate}:") for p in found
-            ):
-                reported += 1
-            else:
-                problems.append(
-                    f"zeroize probe: without {crate}'s zeroize feature in {CORE_MANIFEST},"
-                    f" the check reported {found or 'nothing'}"
-                )
-            manifest.write_text(original, encoding="utf-8")
-            lock.write_bytes(original_lock)
+        manifest.write_text(entry.sub(r"\1", original, count=1), encoding="utf-8")
+        without, failed = adapter_graph(copy, locked=False)
     finally:
         manifest.write_text(original, encoding="utf-8")
         lock.write_bytes(original_lock)
-    return problems, f"zeroize probes: {reported} of {len(ZEROIZE_CRATES)} removals reported"
+    problems += failed
+    # The second ghash: the build's ghash line under another version.
+    second = [
+        re.sub(r"^ghash v([^|]*)", r"ghash v\1-control", line)
+        for line in graph
+        if line.startswith("ghash ")
+    ]
+    subjects = [
+        ("the adapter's wasm32 build", graph, None),
+        ("control: ghash without its zeroize feature", without, "is built without"),
+        ("control: a second ghash", graph + second, " versions ("),
+    ]
+    examined = set()
+    for label, lines, expected in subjects:
+        examined.add(label)
+        if expected is None:
+            problems += zeroize_problems(lines)
+            continue
+        found = zeroize_problems(lines, ("ghash",))
+        if not any(expected in problem for problem in found):
+            problems.append(f"zeroize {label}: the check reported {found or 'nothing'}")
+    if "the adapter's wasm32 build" not in examined:
+        problems.append("the zeroize check did not examine the adapter's wasm32 build")
+    stack = dict.fromkeys(line for line in graph if line.partition(" ")[0] in ZEROIZE_CRATES)
+    return problems, f"zeroize: {', '.join(stack)} (controls: {len(subjects) - 1})"
 
 
 def main() -> int:
@@ -1730,13 +1730,6 @@ def main() -> int:
     found, settings = message_probe_problems()
     failures += found
     print(settings)
-    features, found = resolved_features(ROOT, locked=True)
-    failures += found + (zeroize_problems(features) if features else [])
-    on = [crate for crate in ZEROIZE_CRATES if "zeroize" in features.get(crate, ())]
-    print(
-        f"zeroize features on in the adapter's wasm32 build: {', '.join(on) or 'none'}"
-        f" (of {', '.join(ZEROIZE_CRATES)})"
-    )
     copy = Path(tempfile.mkdtemp(prefix="wasm-clippy-guard-"))
     try:
         files = copy_tree(copy)
@@ -1745,7 +1738,7 @@ def main() -> int:
         print(settings)
         found, probes = probe_problems(crates, metadata, copy, files)
         failures += found
-        found, settings = zeroize_probe_problems(copy)
+        found, settings = zeroize_check(copy)
         failures += found
         print(settings)
     finally:
