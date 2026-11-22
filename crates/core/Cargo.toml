@@ -59,10 +59,10 @@ aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "al
 # are named here to turn the feature on, which an entry does only in the
 # version it resolves to. aes wipes its round keys from 0.8.2; in 0.8.0 and
 # 0.8.1 its `zeroize` feature only enables cipher's.
-# devtools/check-wasm-clippy-guard checks that the adapter's wasm32 build holds
-# one version of each of the four, with its `zeroize` feature on. Without aes's
-# or polyval's feature the wasm32 build also fails (src/crypto.rs, which names
-# `polyval::Polyval` through the polyval entry below).
+# Without aes's or polyval's feature the wasm32 build fails (src/crypto.rs,
+# which names `polyval::Polyval` through the polyval entry below). The
+# docstring of devtools/check-wasm-clippy-guard says how the features of the
+# wasm32 build are checked.
 aes = { version = "0.8.2", features = ["zeroize"] }
 ghash = { version = "0.5", features = ["zeroize"] }
 polyval = { version = "0.6", features = ["zeroize"] }
