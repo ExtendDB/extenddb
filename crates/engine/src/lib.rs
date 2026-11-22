@@ -625,7 +625,11 @@ pub async fn dispatch(
         // it uses the backup store's S3 client, whose network stack needs mio,
         // and tokio's file I/O. Such an operation is refused with a
         // ValidationException that names the build, not answered as unknown,
-        // and an arm gated the same way later is refused here too.
+        // and an arm gated the same way later is refused here too. This arm
+        // is compiled for wasm32 only because its message names wasm32: off
+        // wasm32, a known operation without an arm (an arm with a cfg of its
+        // own can leave one) answers UnknownOperationException from the last
+        // arm.
         #[cfg(target_arch = "wasm32")]
         _ if is_known_operation(operation) => Err(DynamoDbError::ValidationException(
             extenddb_core::error::webassembly_unsupported_message(
