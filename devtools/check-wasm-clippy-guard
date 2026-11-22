@@ -65,8 +65,11 @@ the build. A control that does not give the finding it was planted for, and
 a finding no control expects, fail the guard. The environment and
 cargo-configuration checks are controlled on their control inputs only:
 handed an empty mapping or file list in place of the tree's, the guard would
-still pass. A wrapper that caps one crate's lints also fails that crate's
-dep-info check.
+still pass. A wrapper that caps one crate's lints is caught all the same:
+under --cap-lints allow, clippy-driver skips that crate, whose dep-info
+check then fails; under --cap-lints warn, the step still reports the
+crate's disallowed calls that no accepted allow covers, as warnings, which
+item 1 refuses.
 
 What it does not see is listed below. The headless parity corpus
 (`devtools/run-wasm-step corpus`), which runs the module under Node, finds a
@@ -1323,8 +1326,8 @@ def adapter_graph(tree: Path) -> tuple[list[str], list[Finding]]:
     resolves them in the tree at `tree` (the adapter and its normal
     dependencies on that target, with the features its build compiles), one
     `package|features` line each. A package is written as cargo tree's {p}
-    writes it: its name and version and, when it is not from crates.io, its
-    source."""
+    writes it: its name and version, then its source when it is not from
+    crates.io, and `(proc-macro)` for a procedural macro."""
     command = ["cargo", "tree", "--locked", "-p", ADAPTER]
     command += ["--target", TARGET, "-e", "normal", "--prefix", "none", "--format", "{p}|{f}"]
     try:
