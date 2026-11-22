@@ -87,9 +87,8 @@ fn backup_arn_field(
 
 /// `BackupArn` checked in the service's order (measured on DynamoDB in
 /// us-east-1 on 21 Nov 2026), an absent member as an empty one. The outer
-/// error is what a restore answers before its `TargetTableName`: an ARN whose
-/// account field is not the caller's, an empty one included, is
-/// `AccessDeniedException` whatever the rest of it, and a string
+/// error is what a restore answers before its `TargetTableName`: the
+/// `AccessDeniedException` of [`check_backup_arn_account`], and a string
 /// [`BackupArnError::Invalid`] refuses is `Invalid Backup ARN`. The inner
 /// result is answered after the name: `BackupNotFoundException` for the
 /// service's id shape in upper-case hex, which no build issues, or the rest
@@ -98,16 +97,12 @@ fn backup_arn_member<'a>(
     body: &'a Value,
     account_id: &str,
 ) -> Result<Result<BackupArnParts<'a>, DynamoDbError>, DynamoDbError> {
+    check_backup_arn_account(body, account_id)?;
     let backup_arn = body
         .get("BackupArn")
         .and_then(Value::as_str)
         .unwrap_or_default();
     let trimmed = extenddb_core::backup_format::trim_backup_arn(backup_arn);
-    if extenddb_core::arn::fields(trimmed).is_some_and(|f| f.account != account_id) {
-        return Err(DynamoDbError::AccessDeniedException(
-            "Access is denied".to_owned(),
-        ));
-    }
     Ok(match extenddb_storage::util::check_backup_arn(backup_arn) {
         Err(e @ BackupArnError::Invalid) => return Err(backup_arn_refusal(e)),
         Err(BackupArnError::Id)
@@ -126,6 +121,31 @@ fn backup_arn_member<'a>(
 /// ([`backup_arn_member`]). Reads no storage.
 pub fn check_restore_backup_arn(body: &Value, account_id: &str) -> Result<(), DynamoDbError> {
     backup_arn_member(body, account_id).map(drop)
+}
+
+/// The account of a `BackupArn`, checked before anything else about it: an
+/// ARN of six fields with a non-empty resource whose account field is not
+/// the caller's, an empty one included, is `AccessDeniedException` whatever
+/// its partition, service, region and resource, because the service
+/// authorizes on the ARN's account before it reads the backup. An ARN of
+/// fewer fields, or with an empty resource, passes here and gets `Invalid
+/// Backup ARN` from the shape check. Measured on DynamoDB in us-east-1 on
+/// 22 Nov 2026 with DescribeBackup, DeleteBackup and RestoreTableFromBackup.
+/// An absent member is an empty one. Reads no storage.
+pub fn check_backup_arn_account(body: &Value, account_id: &str) -> Result<(), DynamoDbError> {
+    let backup_arn = body
+        .get("BackupArn")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let trimmed = extenddb_core::backup_format::trim_backup_arn(backup_arn);
+    if extenddb_core::arn::fields(trimmed)
+        .is_some_and(|f| !f.resource.is_empty() && f.account != account_id)
+    {
+        return Err(DynamoDbError::AccessDeniedException(
+            "Access is denied".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// The spellings of one `BackupArn` the engine looks a backup up under:

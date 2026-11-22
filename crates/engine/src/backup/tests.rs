@@ -4376,6 +4376,8 @@ async fn malformed_arn_is_a_validation_exception_with_the_services_text() {
     const NOT_VALID: &str = "ValidationException: Invalid Request: BackupArn is not valid";
     const INVALID: &str = "ValidationException: Invalid Backup ARN";
     const DENIED: &str = "AccessDeniedException: Access is denied";
+    const MISMATCH: &str = "ValidationException: Invalid Request: The supplied \
+                            ExclusiveStartBackupArn does not match the account";
     let id = "01791976431438-73d8d5bc";
     let base = format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Music");
     let in_region = |region: &str| format!("arn:aws:dynamodb:{region}:{ACCOUNT}:table/Music");
@@ -4428,9 +4430,46 @@ async fn malformed_arn_is_a_validation_exception_with_the_services_text() {
             format!("{}/backup/{id}", in_region("us-east-1/..")),
             NOT_VALID,
         ),
-        // The account first, whatever the rest of the ARN.
+        // The account first, whatever the rest of a six-field ARN with a
+        // non-empty resource: an empty account, another service, another
+        // partition or region, a resource that is not a backup (measured on
+        // 22 Nov 2026 with DescribeBackup, DeleteBackup and
+        // RestoreTableFromBackup, in us-east-1).
         (base.replace(ACCOUNT, "") + "/backup/" + id, DENIED),
         ("arn:aws:s3:::bucket".to_owned(), DENIED),
+        (format!("arn:aws:dynamodb:{REGION}:000000000000:x"), DENIED),
+        (format!("arn:aws:dynamodb:{REGION}::x"), DENIED),
+        (base.replace(ACCOUNT, "000000000000"), DENIED),
+        ("arn:aws:iam::000000000000:role/x".to_owned(), DENIED),
+        (
+            "arn:aws:dynamodb:us-west-2:000000000000:x".to_owned(),
+            DENIED,
+        ),
+        (
+            "arn:aws-cn:dynamodb:cn-north-1:000000000000:x".to_owned(),
+            DENIED,
+        ),
+        // A table segment outside the pattern, or of 300 characters, in
+        // another account (measured on 22 Nov 2026 on the three operations);
+        // the caller's own with the same segment is the shape's answer.
+        (
+            format!("arn:aws:dynamodb:{REGION}:000000000000:table/a b/backup/{id}"),
+            DENIED,
+        ),
+        (
+            format!(
+                "arn:aws:dynamodb:{REGION}:000000000000:table/{}/backup/{id}",
+                "t".repeat(300)
+            ),
+            DENIED,
+        ),
+        (base.replace("Music", "a b") + "/backup/" + id, INVALID),
+        // Fewer than six fields, or an empty resource, is the shape's
+        // answer, whatever the account.
+        ("arn:aws".to_owned(), INVALID),
+        (format!("arn:aws:dynamodb:{REGION}:000000000000"), INVALID),
+        (format!("arn:aws:dynamodb:{REGION}:000000000000:"), INVALID),
+        (format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:"), INVALID),
         // The service's id shape in upper-case hex, which no build issues.
         (upper.clone(), not_found.as_str()),
     ];
@@ -4446,7 +4485,11 @@ async fn malformed_arn_is_a_validation_exception_with_the_services_text() {
                 "{member} {candidate:?}"
             );
         }
+        // The cursor compares the account after the shape: an ARN the parser
+        // refuses is `Invalid Backup ARN`, one it reads in another account
+        // does not match the account. Derived from the parser, not measured.
         let cursor = match *expected {
+            DENIED if extenddb_storage::util::check_backup_arn(candidate).is_ok() => MISMATCH,
             DENIED => INVALID,
             e if e == not_found => NOT_VALID,
             e => e,

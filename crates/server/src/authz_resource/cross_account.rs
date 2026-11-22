@@ -37,9 +37,15 @@
 //! an empty region included, is "Access is denied" in an account that does
 //! not exist and gets the shape ValidationException in one that does
 //! (measured 2026-11-03 and 2026-11-05). ExtendDB runs its own shape checks at
-//! that point ([`answer`]). A table ARN in `TableName` with another partition,
-//! service or region, or naming an index or backup, gets the answers above,
-//! where the service answers a ValidationException (#794). A stream ARN with
+//! that point ([`answer`]), the table segment of a `BackupArn` among them: in
+//! an account that does not exist, a `BackupArn` with a segment outside the
+//! pattern is "Access is denied" on `DescribeBackup`, `DeleteBackup` and
+//! `RestoreTableFromBackup` (measured 2026-11-22), so the name gate leaves
+//! another account's `BackupArn` whole to this refusal; the segment answer
+//! in an account that exists is derived. A table ARN in `TableName` with
+//! another partition, service or region, or naming an index or backup, gets
+//! the answers above, where the service answers a ValidationException
+//! (#794). A stream ARN with
 //! an empty region in a tag operation's `ResourceArn`, in an account that
 //! exists, gets [`resource_policy_denial`], where the service's denial ends
 //! after the resource ARN, with no reason clause (measured 2026-11-05). A
@@ -299,6 +305,14 @@ fn answer(
             super::validate_operation_arns(operation, input, region)
         };
         if let Err(e) = shape {
+            return e;
+        }
+        // The table segment of a `BackupArn`, derived (see the module docs).
+        if matches!(
+            operation,
+            "DescribeBackup" | "DeleteBackup" | "RestoreTableFromBackup"
+        ) && let Err(e) = crate::arn_gate::check_backup_arn(resource)
+        {
             return e;
         }
     }
