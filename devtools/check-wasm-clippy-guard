@@ -5,23 +5,25 @@
 the wasm32 AES-GCM stack is built with its zeroize features.
 
 The clippy step (`devtools/run-wasm-step clippy`) lints the workspace crates
-the adapter's wasm32 build compiles, with the method and type lists of
-devtools/wasm-clippy/clippy.toml and clippy's await_holding_lock and
-await_holding_refcell_ref lints. Its rule: every call to a listed method or
-use of a listed type sits under an accepted allow, and no std lock guard or
-RefCell borrow is held across an .await. An accepted allow is an outer
-`#[allow(..)]` or `#[expect(..)]` that names clippy::disallowed_methods or
+the adapter's wasm32 build compiles, in the release profile, with the method
+and type lists of devtools/wasm-clippy/clippy.toml and clippy's
+await_holding_lock and await_holding_refcell_ref lints. Its rule: every call
+to a listed method or use of a listed type that the step lints sits under an
+accepted allow, and the two await lints report no std lock guard or RefCell
+borrow held across an .await. An accepted allow is an outer `#[allow(..)]`
+or `#[expect(..)]` that names clippy::disallowed_methods or
 clippy::disallowed_types in that spelling and has a `reason` holding more
 than whitespace, on a `fn` item, or on a statement after a `{`, `;` or `}`:
 a `let`, or an expression ending in `;` that is not a macro invocation and
 does not start with a block. It covers the code written in that function or
 statement, every call there, but not the items written inside it: each of
 those (a nested function, an impl and its methods) needs its own allow. One
-on the `mod mNNNN_<name>;` line of a crate's src/migrations/mod.rs, the line
-that declares a code-body migration (CONTRIBUTING.md, "Adding a catalog
-migration"), is accepted too and covers the module's file, mNNNN_<name>.rs
-beside it, whole: that file holds a body that a checksum test pins once it is
-released, so an allow cannot go inside it.
+on the `mod mNNNN_<name>;` line of a crate's src/migrations/mod.rs, which
+declares a code-body migration (CONTRIBUTING.md), is accepted too and covers
+the module's file beside it whole: a checksum test pins a released body, so
+an allow cannot go inside it. The guard checks only that the reason is there;
+that it says why the wasm32 build never runs the calls the allow covers is
+for review.
 
 The script copies the working tree (the files git tracks or does not ignore,
 uncommitted edits included), plants probes and controls in the copy, and runs
@@ -36,8 +38,10 @@ force-warned lint). It fails, with one line per problem, unless:
    two lists, each entry has a probe and each probe an entry, and neither run
    prints a warning about clippy.toml (an entry that does not resolve is only
    a warning, which -D warnings does not raise);
-3. each other allow or expect that names one of the two lints is a problem,
-   with the reason it is not accepted;
+3. no allow or expect written in a file the build reads, in a cfg_attr too,
+   names one of the two lints in that spelling unless it is accepted (an
+   allow in another form, such as a lint group, a raw identifier or one a
+   macro builds, is not reported, and item 1 refuses the calls under it);
 4. both runs finish (of a run that does not, the guard reports the errors
    and the crates it did not finish linting, and judges nothing else), and
    in each, every crate's dep-info records the CLIPPY_ARGS and
@@ -57,16 +61,41 @@ BUILD_SCRIPT, RELEASE_CONTROL, MIGRATIONS_CONTROLS, CONTROL_PROBE,
 CONTROL_ENTRY, CONTROL_ENVIRONMENT, CONTROL_CARGO_CONFIG and two zeroize
 graphs; and each run's dep-info must be read for every crate of the build. A
 control that does not give the finding it was planted for, and a finding no
-control expects, fail the guard.
+control expects, fail the guard. The environment and cargo-configuration
+checks are controlled on their control inputs only: handed an empty mapping
+or file list in place of the tree's, the guard would still pass. A wrapper
+that caps one crate's lints also fails that crate's dep-info check.
 
-What it does not see: calls a dependency makes in its own code, which clippy
-does not lint; and a build script or a procedural macro that behaves
-differently in the copy (its path differs). A call that a macro defined
-elsewhere expands to is reported where the macro writes it, so an allow at
-the invocation does not cover it. A macro can build an item from tokens
-written under an accepted allow, which then covers that item; inside a
-function, rustc's non_local_definitions lint, an error under the step's
--D warnings, reports such an impl of a type defined outside it.
+What it does not see is listed below. The headless parity corpus
+(`devtools/run-wasm-step corpus`), which runs the module under Node, finds a
+trap in such code only on a path one of its cases takes.
+- code no clippy run compiles: code under a cfg that is false when clippy
+  runs, such as cfg(not(clippy)) (clippy-driver sets cfg(clippy)), or under
+  a cfg a build script sets from what it sees (it sees the CLIPPY_ARGS that
+  cargo clippy sets); code compiled only in another profile, such as a
+  cfg(debug_assertions) branch, which a dev build compiles and a release
+  build does not; and code compiled only under a feature the adapter's
+  wasm32 build does not enable;
+- calls a dependency makes in its own code, which clippy does not lint: moka
+  0.12.15 calls std::time::Instant::now() when a cache is built
+  (src/common/time/clock.rs), so building an extenddb-cache SwrCache with
+  SwrCache::try_new or SwrCache::new traps on wasm32 while the step passes
+  (only the server builds one today);
+- calls clippy.toml does not list;
+- who calls the code an accepted allow covers: the allow covers the calls
+  written there, whatever reaches them, so a new caller of an allowed
+  function, on a path a wasm32 request takes, passes the step and the guard
+  while the allow's reason no longer holds;
+- a std lock guard or a RefCell borrow held inside another value (an Option,
+  a struct, a tuple) across an .await, which the two await lints do not
+  report;
+- a build script or a procedural macro that behaves differently in the copy
+  (its path differs).
+A call that a macro defined elsewhere expands to is reported where the macro
+writes it, so an allow at the invocation does not cover it. A macro can build
+an item from tokens written under an accepted allow, which then covers that
+item; inside a function, rustc's non_local_definitions lint, an error under the
+step's -D warnings, reports such an impl of a type defined outside it.
 
 The runs use the caller's cargo target directory; nothing else of the
 caller's working tree is written. The copy is removed on exit, also on
@@ -1017,7 +1046,7 @@ def lint_attributes(rel: str, text: str) -> Attributes:
                     where,
                     f"{where}: an allow or expect of {', '.join(named)} {why}; an accepted one"
                     " is an outer #[allow] or #[expect] with a reason, on the function or the"
-                    " statement that holds the call",
+                    " statement that holds the call, or on a code-body migration's `mod` line",
                 )
             )
             continue

@@ -160,11 +160,12 @@ case "$step" in
 
     clippy)
         # Clippy for wasm32 with the lists of devtools/wasm-clippy/clippy.toml,
-        # whose header says what they refuse and why, and what this step does
-        # not see. Without --no-deps, clippy lints every workspace crate the
-        # adapter compiles for wasm32 as well as the adapter. --release lints
-        # the profile the module ships in: the README and the corpus step build
-        # it with --release, so code compiled only without debug assertions is
+        # whose header says what they refuse and why; the documentation of
+        # devtools/check-wasm-clippy-guard lists what this step does not see.
+        # Without --no-deps, clippy lints every workspace crate the adapter
+        # compiles for wasm32 as well as the adapter. --release lints the
+        # profile the module ships in: the README and the corpus step build it
+        # with --release, so code compiled only without debug assertions is
         # linted, and code that only a dev build compiles is not.
         # CLIPPY_CONF_DIR is set for this cargo only, so other clippy runs
         # (clippy.yml's, the pedantic step's) do not read those lists. --lib

@@ -25,15 +25,8 @@
 # a for loop makes, so std's channel constructors and its Receiver type are
 # listed too.
 #
-# The clippy step sees workspace code only. It does not see:
-# - Calls a dependency makes in its own code. For example, moka 0.12.15 calls
-#   std::time::Instant::now() when a cache is built (src/common/time/clock.rs),
-#   so building an extenddb-cache SwrCache with SwrCache::try_new or
-#   SwrCache::new traps on wasm32 while this step passes. Only the server
-#   builds one today.
-# - Calls not named here.
-# The headless parity corpus, which runs the wasm module under Node, is the
-# runtime check of the wasm build.
+# The documentation of devtools/check-wasm-clippy-guard lists what the clippy
+# step does not see.
 #
 # Calls that return an error on this target instead of trapping are not
 # listed: std::fs, std::net, std::process::Command, std::env::var,
@@ -46,23 +39,21 @@
 # the one thread there: std's Mutex panics ("cannot recursively acquire
 # mutex"), its RwLock aborts, and the RefCell panics. No single call causes
 # that, so no list here names it. Clippy's await_holding_lock and
-# await_holding_refcell_ref lints report it; they warn by default, so -D
-# warnings makes them errors in the clippy step. They report a guard or a
-# borrow held as itself, not one held inside another value such as an Option.
+# await_holding_refcell_ref lints report it, within the limit that
+# devtools/check-wasm-clippy-guard's documentation lists; they warn by default,
+# so -D warnings makes them errors in the clippy step.
 #
 # A call that compiles for wasm but is never reached there carries
 # `#[allow(clippy::disallowed_methods, reason = "...")]` (for a type,
-# `clippy::disallowed_types`), as an outer attribute on the function that
-# holds the call or, when the rest of the function runs on wasm, on that one
-# statement. The reason names the callers and why none runs on wasm. An item
-# written inside that function or statement needs an allow of its own.
+# `clippy::disallowed_types`); the documentation of
+# devtools/check-wasm-clippy-guard says where such an allow is accepted, what
+# it covers and what its reason is for.
 #
 # A path here that does not resolve only makes clippy print a warning, which
 # -D warnings does not turn into an error. devtools/check-wasm-clippy-guard,
-# run by the workflow after the clippy step, fails if an entry has no probe in
-# that script or does not resolve, if a call or a use of one is not under such
-# an allow, or if a lock guard or a RefCell borrow is held across an .await;
-# its documentation says how it checks that and what it does not see.
+# which the workflow runs after the clippy step, fails on such a path and on
+# an entry with no probe in that script; its documentation states the rest of
+# what it checks.
 
 disallowed-methods = [
     # Clock
