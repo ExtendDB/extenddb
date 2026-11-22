@@ -1015,6 +1015,15 @@ pub fn backup_in_use(table: &str, backup_arn: &str) -> StorageError {
     StorageError::BackupInUse(backup_in_use_message(backup_arn))
 }
 
+/// DeleteTable on a CREATING restore target, as every backend answers it
+/// (`ResourceInUseException`, the text measured on DynamoDB on 2026-11-21).
+#[must_use]
+pub fn restore_target_in_use(table_name: &str) -> StorageError {
+    StorageError::IndexesInUse(format!(
+        "Attempt to change a resource which is still in use: Table: {table_name} is being used."
+    ))
+}
+
 /// The one signal of a missing backup every backend emits inside a
 /// `Validation` error, which the engine turns into `BackupNotFoundException`
 /// ([`is_backup_not_found`]).

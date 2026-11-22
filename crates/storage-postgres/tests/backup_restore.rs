@@ -2069,7 +2069,12 @@ async fn delete_table_and_delete_backup_are_refused_during_the_copy() {
         )
         .await
         .expect_err("DeleteTable of a target being restored is refused");
-    assert!(matches!(err, StorageError::IndexesInUse(_)), "{err:?}");
+    // The service's text, measured on DynamoDB on 2026-11-21.
+    assert!(
+        matches!(&err, StorageError::IndexesInUse(m)
+            if m == "Attempt to change a resource which is still in use: Table: dt_dst is being used."),
+        "{err:?}"
+    );
     let err = s
         .engine
         .delete(ACCOUNT, &backup.backup_arn)

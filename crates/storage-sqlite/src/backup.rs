@@ -3964,8 +3964,10 @@ mod restore_tests {
         let err = delete_target()
             .await
             .expect_err("the target cannot be deleted while it is restored");
+        // The service's text, measured on DynamoDB on 2026-11-21.
         assert!(
-            matches!(&err, StorageError::IndexesInUse(m) if m.contains("being restored")),
+            matches!(&err, StorageError::IndexesInUse(m)
+                if m == "Attempt to change a resource which is still in use: Table: dst is being used."),
             "{err:?}"
         );
         // Both refusals were observed during the copy, not after it.
