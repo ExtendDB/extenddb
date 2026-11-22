@@ -16,7 +16,12 @@ than whitespace, on a `fn` item, or on a statement after a `{`, `;` or `}`:
 a `let`, or an expression ending in `;` that is not a macro invocation and
 does not start with a block. It covers the code written in that function or
 statement, every call there, but not the items written inside it: each of
-those (a nested function, an impl and its methods) needs its own allow.
+those (a nested function, an impl and its methods) needs its own allow. One
+on the `mod mNNNN_<name>;` line of a crate's src/migrations/mod.rs, the line
+that declares a code-body migration (CONTRIBUTING.md, "Adding a catalog
+migration"), is accepted too and covers the module's file, mNNNN_<name>.rs
+beside it, whole: that file holds a body that a checksum test pins once it is
+released, so an allow cannot go inside it.
 
 The script copies the working tree (the files git tracks or does not ignore,
 uncommitted edits included), plants probes and controls in the copy, and runs
@@ -48,11 +53,11 @@ force-warned lint). It fails, with one line per problem, unless:
    name, version and source), with its zeroize feature on.
 Each check runs, in the same call, on the tree and on controls planted for
 it: CONTROLS, OTHER_FILE_CONTROLS, LINTS_CONTROL with its [lints] table,
-BUILD_SCRIPT, RELEASE_CONTROL, CONTROL_PROBE, CONTROL_ENTRY,
-CONTROL_ENVIRONMENT, CONTROL_CARGO_CONFIG and two zeroize graphs; and each
-run's dep-info must be read for every crate of the build. A control that does
-not give the finding it was planted for, and a finding no control expects,
-fail the guard.
+BUILD_SCRIPT, RELEASE_CONTROL, MIGRATIONS_CONTROLS, CONTROL_PROBE,
+CONTROL_ENTRY, CONTROL_ENVIRONMENT, CONTROL_CARGO_CONFIG and two zeroize
+graphs; and each run's dep-info must be read for every crate of the build. A
+control that does not give the finding it was planted for, and a finding no
+control expects, fail the guard.
 
 What it does not see: calls a dependency makes in its own code, which clippy
 does not lint; and a build script or a procedural macro that behaves
@@ -835,6 +840,13 @@ _ITEM_NAMES = {
     "type": "a type alias",
     "macro_rules": "a macro definition",
 }
+# The `mod mNNNN_<name>;` line of a code-body migration in a crate's
+# src/migrations/mod.rs, the form CONTRIBUTING.md ("Adding a catalog
+# migration") gives. The module's file, mNNNN_<name>.rs beside it, holds a
+# body that a checksum test pins once it is released, so an allow for a call
+# in it can go only on this line, and it covers that file whole.
+_MIGRATIONS = re.compile(r"(?:.+/)?src/migrations/mod\.rs")
+_MIGRATION_MOD = re.compile(_VISIBILITY + r"mod\s+(m[0-9]{4}_\w+)\s*;")
 # An item inside a function or a statement. rustc applies the allow on the
 # function or statement to it too, but its code is not that function's: an
 # impl there, for one, adds methods that code elsewhere calls.
@@ -947,12 +959,14 @@ def _previous(code: str, index: int) -> str:
 class Attributes(NamedTuple):
     """What lint_attributes found in one file: the byte spans the accepted
     allows cover, how many of those allows are on functions and on statements,
-    and findings for the others."""
+    findings for the others, and the files (relative to the copy) that
+    accepted allows on migration `mod` lines cover whole."""
 
     covered: list[tuple[int, int]]
     on_functions: int
     on_statements: int
     findings: list[Finding]
+    modules: tuple[str, ...] = ()
 
 
 def lint_attributes(rel: str, text: str) -> Attributes:
@@ -962,11 +976,14 @@ def lint_attributes(rel: str, text: str) -> Attributes:
     spelling (whitespace aside). It is accepted when it is an outer attribute
     with a `reason` that holds more than whitespace and sits on a `fn` item, or
     after a `{`, `;` or `}` on a statement: a `let`, or an expression ending in
-    `;` that is not a macro invocation and does not start with a block. It
-    covers that item or statement without the items written inside it. Any
-    other attribute that names one, in cfg_attr too, is a finding."""
+    `;` that is not a macro invocation and does not start with a block, or, in
+    a crate's src/migrations/mod.rs, on a `mod mNNNN_<name>;` line. It covers
+    that item or statement without the items written inside it, or the
+    module's file beside it whole. Any other attribute that names one, in
+    cfg_attr too, is a finding."""
     code = code_only(text)
-    covered, counts, found = [], Counter(), []
+    covered, counts, found, modules = [], Counter(), [], []
+    migrations = bool(_MIGRATIONS.fullmatch(rel))
     run_start, run_end = 0, None
     for attribute in _ATTRIBUTE.finditer(code):
         end = _closing(code, attribute.end() - 1, "[", "]")
@@ -989,7 +1006,7 @@ def lint_attributes(rel: str, text: str) -> Attributes:
                 else:
                     reasons.append(reason)
             named = sorted(names & set(DISALLOWED))
-            why, span = _placement(code, attribute, end, run_start, reasons)
+            why, span = _placement(code, attribute, end, run_start, reasons, migrations)
         if not named:
             continue
         if why:
@@ -1008,14 +1025,21 @@ def lint_attributes(rel: str, text: str) -> Attributes:
         covered += [(first, inner_start)] + _without_items(code, inner_start, inner_end)
         covered.append((inner_end, last))
         counts[kind] += 1
-    return Attributes(covered, counts["fn"], counts["statement"], found)
+        if kind == "module":
+            module = _MIGRATION_MOD.search(code, first, last).group(1)
+            modules.append(f"{rel.rpartition('/')[0]}/{module}.rs")
+    return Attributes(covered, counts["fn"], counts["statement"], found, tuple(modules))
 
 
-def _placement(code: str, attribute: re.Match, end: int, run_start: int, reasons: list[str]):
+def _placement(
+    code: str, attribute: re.Match, end: int, run_start: int, reasons: list[str], migrations: bool
+):
     """Why an allow or expect of a disallowed lint (the attribute matched at
     `attribute`, ending at `end`, in a run of attributes from `run_start`) is
     not accepted, or None and the span it covers: (kind, start, end, and the
-    start and end of the part in which the items are left out)."""
+    start and end of the part in which the items are left out). With
+    `migrations` (the file is a crate's src/migrations/mod.rs), one on a
+    migration's `mod` line is accepted, as kind "module"."""
     index = end
     while following := _NEXT_ATTRIBUTE.match(code, index):
         index = _closing(code, following.end() - 1, "[", "]")
@@ -1033,6 +1057,8 @@ def _placement(code: str, attribute: re.Match, end: int, run_start: int, reasons
             return None, ("fn", run_start, stop, stop, stop)
         return None, ("fn", run_start, stop, body + 1, stop - 1)
     if item := _ITEM.match(code, index):
+        if migrations and (module := _MIGRATION_MOD.match(code, index)):
+            return None, ("module", run_start, module.end(), module.end(), module.end())
         return f"is on {_ITEM_NAMES.get(item.group(1), 'a ' + item.group(1))}", None
     if _previous(code, run_start) not in ("{", ";", "}"):
         return "is not on a function or a statement", None
@@ -1486,6 +1512,9 @@ async fn await_holding(m: &std::sync::Mutex<u8>) {
 #[path = "../wasm_clippy_guard_controls/outside_src.rs"]
 mod outside_src;
 
+#[allow(clippy::disallowed_methods, reason = "a control")] //@ migration-elsewhere allow
+mod m9998_wasm_clippy_guard_control;
+
 mod included {
     include!("wasm_clippy_guard_controls.inc");
 }
@@ -1505,6 +1534,28 @@ pub(crate) fn refused() {{
     std::thread::sleep(std::time::Duration::ZERO); //@ {name}-refused call
 }}
 """
+
+# The allow on a migration module's `mod` line, in a src/migrations/mod.rs that
+# the copy adds to MIGRATIONS_CONTROL_CRATE, which has none: accepted on a
+# module of that form, whose file it covers, and refused on another module.
+MIGRATIONS_CONTROL_CRATE = "extenddb-engine"
+MIGRATIONS_CONTROLS = {
+    "mod.rs": """\
+// Controls of devtools/check-wasm-clippy-guard, in its copy of the tree only.
+#[allow(clippy::disallowed_methods, reason = "a control")] //@ migration-mod accepted
+mod m9999_wasm_clippy_guard_control; //@ migration-mod end
+
+#[allow(clippy::disallowed_methods, reason = "a control")] //@ other-mod allow
+mod wasm_clippy_guard_control;
+""",
+    "m9999_wasm_clippy_guard_control.rs": """\
+// A control of devtools/check-wasm-clippy-guard, in its copy of the tree only.
+pub(crate) fn nap() { //@ migration-body accepted
+    std::thread::sleep(std::time::Duration::ZERO);
+} //@ migration-body end
+""",
+    "wasm_clippy_guard_control.rs": "// An empty module, a control of the guard's copy only.\n",
+}
 
 # A control in LINTS_CONTROL_CRATE, whose manifest in the copy gets LINTS_TABLE.
 LINTS_CONTROL_CRATE = "extenddb-core"
@@ -1568,6 +1619,7 @@ def plant_controls(copy: Path, crates: dict[str, dict]) -> tuple[list[Control], 
     hold them, and a finding for each that cannot be planted."""
     probe_root = lib_root(crates[PROBE_CRATE])
     lints_root = lib_root(crates[LINTS_CONTROL_CRATE])
+    migrations_root = lib_root(crates[MIGRATIONS_CONTROL_CRATE])
     scripted = [
         name
         for name, package in sorted(crates.items())
@@ -1579,9 +1631,14 @@ def plant_controls(copy: Path, crates: dict[str, dict]) -> tuple[list[Control], 
             name="path"
         ),
         probe_root.parent / f"{CONTROL_MODULE}.inc": OTHER_FILE_CONTROLS.format(name="include"),
+        probe_root.parent / CONTROL_MODULE / "m9998_wasm_clippy_guard_control.rs": (
+            "// An empty module, a control of the guard's copy only.\n"
+        ),
         probe_root.parent / f"{RELEASE_MODULE}.rs": RELEASE_CONTROL,
         lints_root.parent / f"{LINTS_CONTROL_MODULE}.rs": LINTS_CONTROL,
     }
+    migrations = migrations_root.parent / "migrations"
+    sources |= {migrations / name: text for name, text in MIGRATIONS_CONTROLS.items()}
     if scripted:
         sources[Path(crates[scripted[0]]["manifest_path"]).parent / "build.rs"] = BUILD_SCRIPT
     sources[ROOT / CONTROL_CARGO_CONFIG] = '[build]\nrustc-wrapper = "wasm-clippy-guard-control"\n'
@@ -1589,6 +1646,7 @@ def plant_controls(copy: Path, crates: dict[str, dict]) -> tuple[list[Control], 
     for path, text in (
         (probe_root, f"\n#[allow(dead_code)]\nmod {CONTROL_MODULE};\n"),
         (lints_root, f"\n#[allow(dead_code)]\nmod {LINTS_CONTROL_MODULE};\n"),
+        (migrations_root, "\n#[allow(dead_code)]\nmod migrations;\n"),
         (Path(crates[LINTS_CONTROL_CRATE]["manifest_path"]), LINTS_TABLE),
     ):
         found += _plant(copy, path, text, append=True)
@@ -1717,7 +1775,7 @@ def check(crates: dict[str, dict], target_dir: str, copy: Path) -> int:
     probes[CONTROL_PROBE[0]][CONTROL_PROBE[1]] = [CONTROL_PROBE[2]]
     findings += config_problems((copy / CONFIG_REL).read_text(encoding="utf-8"), probes)
 
-    covered, allows = {}, Counter()
+    covered, allows, modules = {}, Counter(), []
     for path in sorted({p for paths, _ in read_forced.values() for p in paths}):
         if not path.is_relative_to(copy) or not path.is_file():
             continue
@@ -1725,9 +1783,14 @@ def check(crates: dict[str, dict], target_dir: str, copy: Path) -> int:
         attributes = lint_attributes(rel, path.read_bytes().decode("latin-1"))
         covered[path] = attributes.covered
         findings += attributes.findings
+        modules += [copy / module for module in attributes.modules]
         if rel not in planted:
             allows["fn"] += attributes.on_functions
             allows["statement"] += attributes.on_statements
+            allows["module"] += len(attributes.modules)
+    for module in modules:
+        if module in covered:
+            covered[module].append((0, sys.maxsize))
     forced_reports = reports(forced, copy)
     findings += call_problems(forced_reports, reports(plain, copy), covered, copy, probe_file)
     findings += probe_problems(forced_reports, probe_file, spans)
@@ -1756,9 +1819,10 @@ def check(crates: dict[str, dict], target_dir: str, copy: Path) -> int:
     ]
     unreported = sum(1 for f in findings if f.check == "probe" and f.where != CONTROL_PROBE[1])
     print(
-        f"the tree: {len(calls)} reports with --force-warn, {allows['fn'] + allows['statement']}"
-        f" accepted allows ({allows['fn']} on functions, {allows['statement']} on statements),"
-        f" in {len(covered)} files of {len(crates)} crates (a copy of {files} files)"
+        f"the tree: {len(calls)} reports with --force-warn, {sum(allows.values())} accepted"
+        f" allows ({allows['fn']} on functions, {allows['statement']} on statements,"
+        f" {allows['module']} on migration modules), in {len(covered)} files of {len(crates)}"
+        f" crates (a copy of {files} files)"
     )
     print(f"probes: {len(spans) - 1 - unreported} of {len(spans) - 1} reported with --force-warn")
     print(f"controls: {len(controls)}, {len(failures)} not as planted")

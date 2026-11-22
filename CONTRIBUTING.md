@@ -196,7 +196,12 @@ SQLite, PostgreSQL, Cassandra and MongoDB migrate through this framework.
    transaction. Put it in its own module, `src/migrations/mNNNN_<name>.rs` in
    the backend's crate, and declare the module with `#[rustfmt::skip]` and
    `#[allow(clippy::all, deprecated)]`, so that neither tool can require an
-   edit to a released body. The module defines:
+   edit to a released body. When a method that a released body calls is
+   later listed in `devtools/wasm-clippy/clippy.toml`, add
+   `#[allow(clippy::disallowed_methods, reason = "...")]` to the module's
+   `mod` line, with a reason that says why no wasm32 database reaches the
+   call: the WebAssembly build opens only in-memory databases, and each runs
+   every migration when it opens. The module defines:
 
    - `SOURCE`, the module's own text through `include_str!`, followed by the
      text of any SQL file the body executes. The checksum test pins its
