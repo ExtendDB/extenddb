@@ -109,7 +109,7 @@ pub fn verify_signature(
     // CB-5: Validate credential-scope date matches the request date[..8]. The
     // pre-lookup check_scope compares it too; this keeps the refusal for a
     // caller that verifies a signature on its own.
-    let timestamp = extract_timestamp(headers)?;
+    let timestamp = basic_form(request_instant(headers)?);
     if !scope_date_matches(&parsed.date, &timestamp) {
         return Err(DynamoDbError::InvalidSignatureException(
             SCOPE_DATE_COMPLAINT.to_owned(),
@@ -158,27 +158,23 @@ pub fn verify_signature(
 
 /// Validate the request timestamp is within ±15 minutes of now.
 ///
-/// Returns the request date (see `request_date`), which the caller passes to
-/// `check_scope`.
+/// Returns the request date in the UTC basic form (see `basic_form`), which
+/// the caller passes to `check_scope`.
 ///
-/// Returns `UnrecognizedClientException` if the timestamp is missing or out of range.
-/// Returns `InternalServerError` if the system clock is misconfigured.
+/// Returns `IncompleteSignature` if the timestamp is missing or in a form
+/// the service does not read (see `request_instant`),
+/// `UnrecognizedClientException` if it is out of range, and
+/// `InternalServerError` if the system clock is misconfigured.
 pub fn validate_timestamp(headers: &HeaderMap) -> Result<String, DynamoDbError> {
-    let timestamp = extract_timestamp(headers)?;
+    let request = request_instant(headers)?;
 
-    // Parse X-Amz-Date: YYYYMMDDTHHMMSSZ
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .and_then(|d| i64::try_from(d.as_secs()).ok())
         .ok_or_else(|| DynamoDbError::InternalServerError("server clock error".to_owned()))?;
 
-    let request_epoch = parse_iso8601_basic(&timestamp).ok_or_else(|| {
-        // Measured 2026-11-21: the service echoes the value it refuses.
-        DynamoDbError::IncompleteSignature(format!(
-            "Date must be in ISO-8601 'basic format'. Got '{timestamp}'. See http://en.wikipedia.org/wiki/ISO_8601"
-        ))
-    })?;
+    let request_epoch = request.unix_timestamp();
 
     let skew = (now - request_epoch).abs();
     if skew > MAX_CLOCK_SKEW_SECS {
@@ -187,7 +183,21 @@ pub fn validate_timestamp(headers: &HeaderMap) -> Result<String, DynamoDbError> 
         ));
     }
 
-    Ok(timestamp)
+    Ok(basic_form(request))
+}
+
+/// The instant the request date names (see `request_date`).
+///
+/// Returns `IncompleteSignature` when the request has no date, or a date in
+/// a form the service does not read (see `parse_request_date`).
+fn request_instant(headers: &HeaderMap) -> Result<time::OffsetDateTime, DynamoDbError> {
+    let timestamp = extract_timestamp(headers)?;
+    parse_request_date(&timestamp).ok_or_else(|| {
+        // Measured 2026-11-21: the service echoes the value it refuses.
+        DynamoDbError::IncompleteSignature(format!(
+            "Date must be in ISO-8601 'basic format'. Got '{timestamp}'. See http://en.wikipedia.org/wiki/ISO_8601"
+        ))
+    })
 }
 
 /// Extract the timestamp from `X-Amz-Date` header.
@@ -211,28 +221,104 @@ pub(crate) fn request_date(headers: &HeaderMap) -> Option<&str> {
         .filter(|v| !v.is_empty())
 }
 
-/// Parse ISO 8601 basic format `YYYYMMDDTHHMMSSZ` to Unix epoch seconds.
-fn parse_iso8601_basic(s: &str) -> Option<i64> {
-    if s.len() != 16 || !s.ends_with('Z') || s.as_bytes()[8] != b'T' {
+/// Parse the request date as the service reads it (measured 2026-11-21 in
+/// us-east-1), to the instant in UTC. The date is `YYYYMMDD` or
+/// `YYYY-MM-DD`; the time, after an upper-case `T`, is `HHMMSS` or
+/// `HH:MM:SS`, each form chosen on its own (`2026-11-21T220639Z` and
+/// `20261121T22:06:40Z` are read), then an optional fraction (a `.` and any
+/// digits, none included) and an optional zone (`Z`, or an offset of two
+/// digits of hours and optional two digits of minutes: `+01:00`, `+0100`,
+/// `+01`); no zone is UTC. A date alone, or with a `T` and nothing after
+/// it, is midnight UTC. Each part is checked against a limit (month 12, day
+/// 31, hour 24, minute 60, second 60, offset 99 hours and 99 minutes) and
+/// the parts are then added up with no calendar check: month 00 is January,
+/// day 00 is the day before the first, `2026-02-30` is 2 March and
+/// `T24:00:00` is the next midnight. A part over its limit, a lower-case
+/// `t` or `z`, a space for `T`, a `,` before the fraction, a time without
+/// seconds and a `T` followed by a zone alone are refused.
+fn parse_request_date(s: &str) -> Option<time::OffsetDateTime> {
+    let (year, month, day, rest) = three(s, 4, '-')?;
+    if month > 12 || day > 31 {
         return None;
     }
-    let year: i64 = s[0..4].parse().ok()?;
-    let month: i64 = s[4..6].parse().ok()?;
-    let day: i64 = s[6..8].parse().ok()?;
-    let hour: i64 = s[9..11].parse().ok()?;
-    let min: i64 = s[11..13].parse().ok()?;
-    let sec: i64 = s[13..15].parse().ok()?;
 
-    // Days-since-epoch via Howard Hinnant's date algorithm (general, not range-limited).
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y / 400;
-    let yoe = y - era * 400;
-    let m = if month > 2 { month - 3 } else { month + 9 };
-    let doy = (153 * m + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
+    let (clock, rest) = match rest.strip_prefix('T') {
+        None if !rest.is_empty() => return None,
+        None | Some("") => (0, ""),
+        Some(rest) => {
+            let (hour, minute, second, rest) = three::<u8>(rest, 2, ':')?;
+            if hour > 24 || minute > 60 || second > 60 {
+                return None;
+            }
+            let rest = rest
+                .strip_prefix('.')
+                .map_or(rest, |f| f.trim_start_matches(|c: char| c.is_ascii_digit()));
+            let clock = i64::from(hour) * 3600 + i64::from(minute) * 60 + i64::from(second);
+            (clock, rest)
+        }
+    };
 
-    Some(days * 86400 + hour * 3600 + min * 60 + sec)
+    let offset = match rest {
+        "" | "Z" => 0,
+        _ => {
+            let (sign, rest) = match rest.strip_prefix('+') {
+                Some(rest) => (1, rest),
+                None => (-1, rest.strip_prefix('-')?),
+            };
+            let (hours, rest) = digits::<i64>(rest, 2)?;
+            let (minutes, rest) =
+                digits(rest.strip_prefix(':').unwrap_or(rest), 2).unwrap_or((0, rest));
+            if !rest.is_empty() {
+                return None;
+            }
+            sign * (hours * 3600 + minutes * 60)
+        }
+    };
+
+    time::Date::from_calendar_date(year, time::Month::try_from(month.max(1)).ok()?, 1)
+        .ok()?
+        .checked_add(time::Duration::days(i64::from(day) - 1))?
+        .midnight()
+        .assume_utc()
+        .checked_add(time::Duration::seconds(clock - offset))
+}
+
+/// Three numbers, the first of `first` digits and the others of two, with
+/// `sep` between them (the extended form) or nothing (the basic form), and
+/// the rest of `s`. A separator at one of the two places only is refused.
+fn three<T: std::str::FromStr>(s: &str, first: usize, sep: char) -> Option<(T, u8, u8, &str)> {
+    let (a, rest) = digits(s, first)?;
+    let ext = rest.starts_with(sep);
+    let (b, rest) = digits(rest.strip_prefix(sep).unwrap_or(rest), 2)?;
+    let rest = if ext { rest.strip_prefix(sep)? } else { rest };
+    let (c, rest) = digits(rest, 2)?;
+    Some((a, b, c, rest))
+}
+
+/// The leading `n` ASCII digits of `s` as a number, and the rest of `s`.
+fn digits<T: std::str::FromStr>(s: &str, n: usize) -> Option<(T, &str)> {
+    let (head, rest) = s.split_at_checked(n)?;
+    if !head.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((head.parse().ok()?, rest))
+}
+
+/// The UTC `YYYYMMDDTHHMMSSZ` form of `instant`, fraction dropped. The
+/// service uses it for the skew check, the scope date and the date line of
+/// the string to sign, whatever form the request sent (measured 2026-11-21);
+/// the `x-amz-date` and `date` canonical headers keep the value as sent.
+pub(crate) fn basic_form(instant: time::OffsetDateTime) -> String {
+    let utc = instant.to_offset(time::UtcOffset::UTC);
+    format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        utc.year(),
+        utc.month() as u8,
+        utc.day(),
+        utc.hour(),
+        utc.minute(),
+        utc.second(),
+    )
 }
 
 /// Constant-time byte comparison to prevent timing attacks, through AWS-LC's
@@ -247,383 +333,4 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_iso8601_basic_valid() {
-        // 2026-04-15T12:00:00Z
-        let epoch = parse_iso8601_basic("20260415T120000Z").unwrap();
-        // Verify against known value: 2026-04-15 is day 1,776,528,000 from epoch
-        // (verified with external tool)
-        assert!(epoch > 0);
-        // 2015-08-30T12:36:00Z — from AWS test vector
-        let epoch2 = parse_iso8601_basic("20150830T123600Z").unwrap();
-        assert!(epoch2 > 0);
-        assert!(epoch > epoch2); // 2026 > 2015
-    }
-
-    #[test]
-    fn parse_iso8601_basic_invalid() {
-        assert!(parse_iso8601_basic("2026-04-15T12:00:00Z").is_none());
-        assert!(parse_iso8601_basic("20260415T12000Z").is_none());
-        assert!(parse_iso8601_basic("").is_none());
-    }
-
-    #[test]
-    fn constant_time_eq_works() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"ab"));
-    }
-
-    #[test]
-    fn extract_timestamp_missing() {
-        let headers = HeaderMap::new();
-        assert!(extract_timestamp(&headers).is_err());
-    }
-
-    /// Measured 2026-11-21: `Date` is read only when `X-Amz-Date` is absent,
-    /// and an empty value is no date.
-    #[test]
-    fn the_request_date_is_x_amz_date_else_date() {
-        let http = "Sat, 21 Nov 2026 01:36:16 GMT";
-        let rows = [
-            (vec![], None),
-            (
-                vec![("x-amz-date", "20260415T120000Z")],
-                Some("20260415T120000Z"),
-            ),
-            (vec![("date", http)], Some(http)),
-            (
-                vec![("x-amz-date", http), ("date", "20260415T120000Z")],
-                Some(http),
-            ),
-            (vec![("x-amz-date", ""), ("date", http)], None),
-            (vec![("date", "")], None),
-        ];
-        for (pairs, want) in rows {
-            let mut headers = HeaderMap::new();
-            for (name, value) in &pairs {
-                headers.insert(*name, value.parse().unwrap());
-            }
-            assert_eq!(request_date(&headers), want, "{pairs:?}");
-        }
-    }
-
-    /// Measured 2026-11-21: the service echoes a date it cannot read.
-    #[test]
-    fn a_date_in_another_form_is_refused_with_its_value() {
-        let err = validate_timestamp(&make_headers("Sat, 21 Nov 2026 01:36:16 GMT")).unwrap_err();
-        assert!(
-            matches!(err, DynamoDbError::IncompleteSignature(_)),
-            "{err:?}"
-        );
-        assert_eq!(
-            err.message(),
-            "Date must be in ISO-8601 'basic format'. Got 'Sat, 21 Nov 2026 01:36:16 GMT'. \
-             See http://en.wikipedia.org/wiki/ISO_8601"
-        );
-    }
-
-    fn make_parsed(service: &str, date: &str, signed_headers: &str) -> ParsedAuthorization {
-        ParsedAuthorization {
-            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_owned(),
-            date: date.to_owned(),
-            region: "us-east-1".to_owned(),
-            service: service.to_owned(),
-            signed_headers: signed_headers.to_owned(),
-            signature: "0".repeat(64),
-        }
-    }
-
-    fn make_headers(date: &str) -> HeaderMap {
-        let mut h = HeaderMap::new();
-        h.insert("x-amz-date", date.parse().unwrap());
-        h.insert("host", "localhost:18443".parse().unwrap());
-        h.insert(
-            "content-type",
-            "application/x-amz-json-1.0".parse().unwrap(),
-        );
-        h
-    }
-
-    /// CB-5: Reject credential scope with wrong service.
-    #[test]
-    fn reject_wrong_service_in_scope() {
-        let parsed = make_parsed("s3", "20260415", "content-type;host;x-amz-date");
-        let headers = make_headers("20260415T120000Z");
-        let err = verify_signature(&parsed, &key(SECRET), "POST", "/", "", &headers, b"{}");
-        match err {
-            Err(DynamoDbError::InvalidSignatureException(msg)) => {
-                assert!(msg.contains("dynamodb"), "Expected 'dynamodb' in: {msg}");
-            }
-            other => panic!("Expected InvalidSignatureException, got: {other:?}"),
-        }
-    }
-
-    /// CB-5: Reject credential scope date mismatch with X-Amz-Date.
-    #[test]
-    fn reject_scope_date_mismatch() {
-        let parsed = make_parsed("dynamodb", "20260414", "content-type;host;x-amz-date");
-        let headers = make_headers("20260415T120000Z");
-        let err = verify_signature(&parsed, &key(SECRET), "POST", "/", "", &headers, b"{}");
-        match err {
-            Err(DynamoDbError::InvalidSignatureException(msg)) => {
-                assert_eq!(msg, SCOPE_DATE_COMPLAINT);
-            }
-            other => panic!("Expected InvalidSignatureException, got: {other:?}"),
-        }
-    }
-
-    /// `check_scope` accepts a scope whose date is the `YYYYMMDD` prefix of
-    /// the timestamp, and refuses one that is not.
-    #[test]
-    fn check_scope_compares_the_date_against_the_timestamp() {
-        let parsed = make_parsed("dynamodb", "20260415", "content-type;host;x-amz-date");
-        check_scope(&parsed, "us-east-1", "20260415T120000Z").unwrap();
-        match check_scope(&parsed, "us-east-1", "20260414T120000Z") {
-            Err(DynamoDbError::InvalidSignatureException(msg)) => {
-                assert_eq!(msg, SCOPE_DATE_COMPLAINT);
-            }
-            other => panic!("Expected InvalidSignatureException, got: {other:?}"),
-        }
-    }
-
-    /// A timestamp shorter than `YYYYMMDD` carries no date to compare, so
-    /// the scope date cannot match it. `validate_timestamp` rejects such a
-    /// value before `check_scope` sees it in `authenticate`; this holds the
-    /// behaviour for any other caller.
-    #[test]
-    fn check_scope_refuses_a_timestamp_too_short_to_carry_a_date() {
-        let parsed = make_parsed("dynamodb", "20260415", "content-type;host;x-amz-date");
-        for timestamp in ["", "2026", "2026041"] {
-            match check_scope(&parsed, "us-east-1", timestamp) {
-                Err(DynamoDbError::InvalidSignatureException(msg)) => {
-                    assert_eq!(msg, SCOPE_DATE_COMPLAINT, "{timestamp:?}");
-                }
-                other => panic!("{timestamp:?}: expected InvalidSignatureException, got {other:?}"),
-            }
-        }
-    }
-
-    /// `validate_timestamp` hands the `X-Amz-Date` value back so the caller
-    /// compares the scope date against the same string.
-    #[test]
-    fn validate_timestamp_returns_the_header_value() {
-        let now = time::OffsetDateTime::now_utc();
-        let value = format!(
-            "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
-            now.year(),
-            now.month() as u8,
-            now.day(),
-            now.hour(),
-            now.minute(),
-            now.second(),
-        );
-        let headers = make_headers(&value);
-        assert_eq!(validate_timestamp(&headers).unwrap(), value);
-    }
-
-    /// CB-6: Reject SignedHeaders missing "host".
-    #[test]
-    fn reject_missing_host_in_signed_headers() {
-        let parsed = make_parsed("dynamodb", "20260415", "content-type;x-amz-date");
-        let headers = make_headers("20260415T120000Z");
-        let err = verify_signature(&parsed, &key(SECRET), "POST", "/", "", &headers, b"{}");
-        match err {
-            Err(DynamoDbError::InvalidSignatureException(msg)) => {
-                assert!(msg.contains("Host"), "Expected 'Host' in message: {msg}");
-            }
-            other => panic!("Expected InvalidSignatureException, got: {other:?}"),
-        }
-    }
-
-    /// A client that signs the payload line as the `UNSIGNED-PAYLOAD` literal
-    /// (an S3 convention) fails with the plain mismatch, which is what the
-    /// service returns (measured 2026-09-16): the payload line is always the
-    /// hash of the received body.
-    #[test]
-    fn unsigned_payload_literal_is_a_plain_signature_mismatch() {
-        let mut headers = make_headers("20260415T120000Z");
-        headers.insert("x-amz-content-sha256", "UNSIGNED-PAYLOAD".parse().unwrap());
-        let signed = "content-type;host;x-amz-content-sha256;x-amz-date";
-        // Sign the way such a client does: the literal in place of the body hash.
-        let creq = canonical::canonical_request("POST", "/", "", &headers, signed, SIGNED_BODY)
-            .rsplit_once('\n')
-            .map(|(head, _)| format!("{head}\nUNSIGNED-PAYLOAD"))
-            .unwrap();
-        let sts = canonical::string_to_sign(
-            "20260415T120000Z",
-            "20260415/us-east-1/dynamodb/aws4_request",
-            &creq,
-        );
-        let mut parsed = make_parsed("dynamodb", "20260415", signed);
-        parsed.signature = signing_key::compute_signature(&key(SECRET), &sts);
-        match verify_signature(
-            &parsed,
-            &key(SECRET),
-            "POST",
-            "/",
-            "",
-            &headers,
-            SIGNED_BODY,
-        ) {
-            Err(DynamoDbError::InvalidSignatureException(msg)) => {
-                assert!(
-                    msg.starts_with("The request signature we calculated does not match"),
-                    "{msg}"
-                );
-                assert!(!msg.contains("UNSIGNED-PAYLOAD"), "{msg}");
-            }
-            other => panic!("Expected InvalidSignatureException, got: {other:?}"),
-        }
-    }
-
-    /// auth H-1: Signature mismatch returns InvalidSignatureException.
-    #[test]
-    fn signature_mismatch_returns_invalid_signature() {
-        let parsed = make_parsed("dynamodb", "20260415", "content-type;host;x-amz-date");
-        let headers = make_headers("20260415T120000Z");
-        // Wrong secret → wrong signature → InvalidSignatureException
-        let err = verify_signature(
-            &parsed,
-            &key("wrong-secret"),
-            "POST",
-            "/",
-            "",
-            &headers,
-            b"{}",
-        );
-        match err {
-            Err(DynamoDbError::InvalidSignatureException(msg)) => {
-                assert!(
-                    msg.contains("does not match"),
-                    "Expected 'does not match' in: {msg}"
-                );
-            }
-            other => panic!("Expected InvalidSignatureException, got: {other:?}"),
-        }
-    }
-
-    const SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
-    const SIGNED_BODY: &[u8] = br#"{"TableName":"t","Item":{"pk":{"S":"signed"}}}"#;
-    const TAMPERED_BODY: &[u8] = br#"{"TableName":"t","Item":{"pk":{"S":"tampered"}}}"#;
-
-    /// Sign `body` the way a client does: the same canonical request and
-    /// string-to-sign the server reconstructs, over the body the client sent.
-    fn sign(headers: &HeaderMap, signed_headers: &str, body: &[u8]) -> ParsedAuthorization {
-        let creq = canonical::canonical_request("POST", "/", "", headers, signed_headers, body);
-        let sts = canonical::string_to_sign(
-            "20260415T120000Z",
-            "20260415/us-east-1/dynamodb/aws4_request",
-            &creq,
-        );
-        let mut parsed = make_parsed("dynamodb", "20260415", signed_headers);
-        parsed.signature = signing_key::compute_signature(&key(SECRET), &sts);
-        parsed
-    }
-
-    /// The signing key of `secret` for the scope every test here signs with.
-    fn key(secret: &str) -> zeroize::Zeroizing<[u8; 32]> {
-        signing_key::derive_signing_key(secret, "20260415", "us-east-1", "dynamodb")
-    }
-
-    fn assert_signature_mismatch(result: Result<(), DynamoDbError>) {
-        match result {
-            Err(DynamoDbError::InvalidSignatureException(msg)) => {
-                assert!(
-                    msg.contains("does not match"),
-                    "Expected 'does not match' in: {msg}"
-                );
-            }
-            other => panic!("Expected InvalidSignatureException, got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn correctly_signed_body_verifies() {
-        let headers = make_headers("20260415T120000Z");
-        let parsed = sign(&headers, "content-type;host;x-amz-date", SIGNED_BODY);
-        verify_signature(
-            &parsed,
-            &key(SECRET),
-            "POST",
-            "/",
-            "",
-            &headers,
-            SIGNED_BODY,
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn body_changed_after_signing_is_rejected() {
-        let headers = make_headers("20260415T120000Z");
-        let parsed = sign(&headers, "content-type;host;x-amz-date", SIGNED_BODY);
-        assert_signature_mismatch(verify_signature(
-            &parsed,
-            &key(SECRET),
-            "POST",
-            "/",
-            "",
-            &headers,
-            TAMPERED_BODY,
-        ));
-    }
-
-    /// The client signs one body, sends another, and sets
-    /// x-amz-content-sha256 to the hash of the body it signed. The signature
-    /// is checked against the body received, so the header cannot be used to
-    /// make a rewritten request verify.
-    #[test]
-    fn body_changed_after_signing_is_rejected_when_header_carries_signed_hash() {
-        let mut headers = make_headers("20260415T120000Z");
-        headers.insert(
-            "x-amz-content-sha256",
-            canonical::sha256_hex(SIGNED_BODY).parse().unwrap(),
-        );
-        let signed = "content-type;host;x-amz-content-sha256;x-amz-date";
-        let parsed = sign(&headers, signed, SIGNED_BODY);
-        // Sanity: the same request with the signed body verifies.
-        verify_signature(
-            &parsed,
-            &key(SECRET),
-            "POST",
-            "/",
-            "",
-            &headers,
-            SIGNED_BODY,
-        )
-        .unwrap();
-        assert_signature_mismatch(verify_signature(
-            &parsed,
-            &key(SECRET),
-            "POST",
-            "/",
-            "",
-            &headers,
-            TAMPERED_BODY,
-        ));
-    }
-
-    /// A header the client did not sign is not part of the canonical request
-    /// and does not affect the payload hash, so a stray or wrong value is
-    /// neither trusted nor fatal.
-    #[test]
-    fn unsigned_content_sha256_header_does_not_affect_verification() {
-        let mut headers = make_headers("20260415T120000Z");
-        headers.insert("x-amz-content-sha256", "0".repeat(64).parse().unwrap());
-        let parsed = sign(&headers, "content-type;host;x-amz-date", SIGNED_BODY);
-        verify_signature(
-            &parsed,
-            &key(SECRET),
-            "POST",
-            "/",
-            "",
-            &headers,
-            SIGNED_BODY,
-        )
-        .unwrap();
-    }
-}
+mod tests;

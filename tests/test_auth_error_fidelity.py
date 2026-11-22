@@ -35,6 +35,9 @@ from botocore.credentials import Credentials
 from botocore.exceptions import ClientError
 
 from conftest import scoped_table
+from test_sigv4_scope_date import SCOPE_DATE_MESSAGE
+
+
 def _make_client(endpoint_url: str | None, access_key: str, secret_key: str) -> Any:
     """Create a boto3 DynamoDB client with explicit credentials."""
     region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
@@ -278,7 +281,80 @@ _KEY = _PAIR.format("missing key")
 _CASE = "Algorithm must start with 'AWS4-'; got '{header}'"
 _UNSUPPORTED = "Unsupported AWS 'algorithm': '{}'. "
 _HTTP_DATE = "Sat, 21 Nov 2026 01:36:16 GMT"
-_DATE = f"Date must be in ISO-8601 'basic format'. Got '{_HTTP_DATE}'. See http://en.wikipedia.org/wiki/ISO_8601"
+_BAD_DATE = "Date must be in ISO-8601 'basic format'. Got '{}'. See http://en.wikipedia.org/wiki/ISO_8601"
+_DATE = _BAD_DATE.format(_HTTP_DATE)
+_UNKNOWN_KEY = "The security token included in the request is invalid."
+
+# The forms of the request date, measured against the service on 2026-11-21
+# and 2026-11-22 with the documented example key and a zero signature: the
+# strftime template of X-Amz-Date, the shift of the time it shows in seconds
+# (a zone offset or a stale clock), the scope date (the UTC day, the day
+# before, or the day the shifted time shows) and the answer. "key" is the
+# unknown-key error: the date was read and the scope matched, so the key was
+# looked up. "format" is the basic format text with the value. "skew" is the
+# refusal of a date outside the window, whose type and text are not compared
+# here. The service checks each part against a limit (month 12, day 31, hour
+# 24, minute 60, second 60, two digits of offset hours and minutes) and adds
+# the parts up with no calendar check, so a row read that way is shifted to
+# land outside the window at any hour: a midnight is the day before, 24:00:00
+# is the day after, 31 November is next year's, month 00 is last year's
+# January, and minute 60 is the day before (it reads as the top of the next
+# hour, which is inside the window only during the last quarter of each hour).
+_DATE_FORMS = [
+    pytest.param("%Y-%m-%dT%H:%M:%SZ", 0, "utc", "key", id="extended"),
+    pytest.param("%Y-%m-%dT%H:%M:%S.123Z", 0, "utc", "key", id="extended-fraction"),
+    pytest.param("%Y-%m-%dT%H:%M:%S.123456Z", 0, "utc", "key", id="extended-microseconds"),
+    pytest.param("%Y-%m-%dT%H:%M:%S+00:00", 0, "utc", "key", id="extended-utc-offset"),
+    pytest.param("%Y-%m-%dT%H:%M:%S+01:00", 3600, "utc", "key", id="extended-plus-one"),
+    pytest.param("%Y-%m-%dT%H:%M:%S", 0, "utc", "key", id="extended-no-zone"),
+    pytest.param("%Y-%m-%dt%H:%M:%Sz", 0, "utc", "format", id="lower-case-t-and-z"),
+    pytest.param("%Y-%m-%d %H:%M:%SZ", 0, "utc", "format", id="space-for-t"),
+    pytest.param("%Y-%m-%d", -86400, "shown", "skew", id="date-only"),
+    pytest.param("%Y%m%dT%H%M%S.123Z", 0, "utc", "key", id="basic-fraction"),
+    pytest.param("%Y%m%dT%H%M%S", 0, "utc", "key", id="basic-no-zone"),
+    pytest.param("%Y-%m-%dT%H%M%SZ", 0, "utc", "key", id="extended-date-basic-time"),
+    pytest.param("%Y%m%dT%H:%M:%SZ", 0, "utc", "key", id="basic-date-extended-time"),
+    pytest.param("%Y-%m-%dT%H:%M:%SZ", -20 * 60, "utc", "skew", id="extended-twenty-minutes-old"),
+    pytest.param("%Y-%m-%dT%H:%M:%SZ", 0, "previous", "scope", id="extended-scope-day-before"),
+    pytest.param("%Y%m%dT%H%M%SZ", 0, "utc", "key", id="basic"),
+    pytest.param("%Y%m%dT%H%M%SZ", 0, "previous", "scope", id="basic-scope-day-before"),
+    pytest.param("%Y-%m-%dT%H:%M:%S+03:00", 3 * 3600, "utc", "key", id="extended-plus-three"),
+    pytest.param("%Y-%m-%dT%H:%M:%S+26:00", 26 * 3600, "shown", "scope", id="extended-offset-local-scope"),
+    pytest.param("%Y-%m-%dT%H:%M:%S-05:00", -5 * 3600, "utc", "key", id="extended-minus-five"),
+    pytest.param("%Y-%m-%dT%H:%M:%S+0100", 3600, "utc", "key", id="extended-offset-no-colon"),
+    pytest.param("%Y-%m-%dT%H:%M:%S+01", 3600, "utc", "key", id="extended-offset-hours"),
+    pytest.param("%Y-%m-%dT%H:%M:%S.Z", 0, "utc", "key", id="extended-empty-fraction"),
+    pytest.param("%Y-%m-%dT%H:%MZ", 0, "utc", "format", id="extended-no-seconds"),
+    pytest.param("%Y-%m%dT%H:%M:%SZ", 0, "utc", "format", id="half-extended-date-1"),
+    pytest.param("%Y%m-%dT%H:%M:%SZ", 0, "utc", "format", id="half-extended-date-2"),
+    pytest.param("%Y-%m-%dT%H:%M%SZ", 0, "utc", "format", id="half-extended-time"),
+    pytest.param("%Y-%m-%dZ", 0, "utc", "format", id="date-and-zone"),
+    pytest.param("%Y-%m-%dT", -86400, "shown", "skew", id="date-and-t"),
+    pytest.param("%Y-%m-%dT%H:%M:%S,123Z", 0, "utc", "format", id="comma-fraction"),
+    pytest.param("%Y%m%dT%H%MZ", 0, "utc", "format", id="basic-no-seconds"),
+    pytest.param("%Y-%m-%dT%H:%M:%S+26:00", 26 * 3600, "utc", "key", id="offset-26-hours"),
+    pytest.param("%Y-%m-%dT%H:%M:%S+01:60", 2 * 3600, "utc", "key", id="offset-01-60"),
+    pytest.param("20261399T000000Z", 0, "utc", "format", id="month-13-day-99"),
+    pytest.param("%Y%m%dT240000Z", 86400, "utc", "skew", id="hour-24"),
+    pytest.param("%Y%m%dT%H6000Z", -86400, "utc", "skew", id="minute-60"),
+    pytest.param("%Y%m%dT%H%M60Z", -60, "utc", "key", id="second-60"),
+    pytest.param("2026-02-30T%H:%M:%SZ", 0, "utc", "skew", id="february-30"),
+    pytest.param("%Y13%dT%H%M%SZ", 0, "utc", "format", id="month-13"),
+    pytest.param("%Y%m99T%H%M%SZ", 0, "utc", "format", id="day-99"),
+    pytest.param("%Y%m00T%H%M%SZ", 0, "utc", "skew", id="day-00"),
+    pytest.param("%Y1131T%H%M%SZ", 366 * 86400, "utc", "skew", id="november-31"),
+    pytest.param("%Y00%dT%H%M%SZ", -366 * 86400, "utc", "skew", id="month-00"),
+    pytest.param("%Y%m%dT25%M%SZ", 0, "utc", "format", id="hour-25"),
+    pytest.param("%Y%m%dT99%M%SZ", 0, "utc", "format", id="hour-99"),
+    pytest.param("%Y%m%dT%H99%SZ", 0, "utc", "format", id="minute-99"),
+    pytest.param("%Y%m%dT%H%M99Z", 0, "utc", "format", id="second-99"),
+    pytest.param("%Y-%m-%dT%H:%M:%S+99:00", 0, "utc", "skew", id="offset-99-hours"),
+    pytest.param("%Y-%m-%dT%H:%M:%S+00:99", 0, "utc", "skew", id="offset-99-minutes"),
+    pytest.param("%Y-%m-%dT24:00:00Z", 86400, "utc", "skew", id="extended-hour-24"),
+    # Five digits of time (measured 2026-11-22 00:52Z: `20261122T00524Z`).
+    pytest.param("%Y%m%dT%H%M0Z", 0, "utc", "format", id="five-digit-time"),
+    pytest.param("%Y-%m-%dTZ", 0, "utc", "format", id="t-and-zone"),
+]
 
 
 def _missing(*names: str, date: bool = False) -> str:
@@ -647,6 +723,37 @@ class TestRequestChecks:
         header = f"{_ALG} {_CRED}, {_SH}, {_SIG}"
         now = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
         assert self._describe(header, [("Date", now)]) == self._describe(header, "X-Amz-Date")
+
+    @pytest.mark.parametrize("template,shift,scope,want", _DATE_FORMS)
+    def test_request_date_forms(self, template, shift, scope, want):
+        # Measured against the service on 2026-11-21: X-Amz-Date is read as an
+        # ISO-8601 date and time in the basic or the extended form, with an
+        # optional fraction and an optional zone, and a date with no time as
+        # midnight UTC. The scope date is compared with the UTC day of that
+        # instant. A lower-case t or z, a space for T, a time without seconds
+        # and a part over its limit get the basic format text with the value.
+        now = time.time()
+        value = time.strftime(template, time.gmtime(now + shift))
+        day = time.strftime("%Y%m%d", time.gmtime(
+            {"utc": now, "previous": now - 86400, "shown": now + shift}[scope]))
+        header = (f"{_ALG} Credential=AKIAIOSFODNN7EXAMPLE/{day}/{self.region}/dynamodb/aws4_request, "
+                  f"SignedHeaders=host;x-amz-date;x-amz-target, {_SIG}")
+        status, payload = self._describe(header, [("X-Amz-Date", value)])
+        assert status == 400, (value, status, payload)
+        if want == "key":
+            assert payload["__type"].endswith("#UnrecognizedClientException"), (value, payload)
+            assert payload["message"] == _UNKNOWN_KEY, (value, payload)
+        elif want == "format":
+            assert payload["__type"].endswith("#IncompleteSignatureException"), (value, payload)
+            assert payload["message"] == _BAD_DATE.format(value), (value, payload)
+        elif want == "scope":
+            assert payload["__type"].endswith("#InvalidSignatureException"), (value, payload)
+            assert payload["message"] == SCOPE_DATE_MESSAGE, (value, payload)
+        else:
+            # "Signature expired" for a date in the past, "Signature not yet
+            # current" for one in the future.
+            expired = ("Signature expired", "Signature not yet current")
+            assert payload["message"].startswith(expired), (value, payload)
 
     def test_session_token_with_a_long_term_key_is_rejected(self):
         _, _, env_token = _env_credentials()
