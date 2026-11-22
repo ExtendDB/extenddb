@@ -204,8 +204,7 @@ case "$step" in
         # Without --no-deps, clippy lints every workspace crate the adapter
         # compiles for wasm32 as well as the adapter. --release lints the
         # profile the module ships in: the README and the corpus step build it
-        # with --release, so code compiled only without debug assertions is
-        # linted, and code that only a dev build compiles is not.
+        # with --release.
         # CLIPPY_CONF_DIR is set for this cargo only, so other clippy runs
         # (clippy.yml's, the pedantic step's) do not read those lists. --lib
         # checks the adapter's library alone, which is also what cargo checks
