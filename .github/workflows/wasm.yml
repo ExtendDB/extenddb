@@ -71,21 +71,24 @@ jobs:
       - name: Install clang
         run: sudo apt-get update && sudo apt-get install -y clang
 
-      # The install step installs wasm-bindgen-cli at the version of the
-      # wasm-bindgen crate in Cargo.lock, and wasm-pack. Both versions are
-      # written by hand, in that step and in the cache key, so when the
-      # wasm-bindgen version in Cargo.lock (`cargo pkgid wasm-bindgen` prints
-      # it) changes, both lines must change with it. The wasm-bindgen of
-      # wasm-bindgen-cli, which writes the JS glue, and its
-      # wasm-bindgen-test-runner, which runs the two test steps below, read
-      # the description the crate's macros put into the module, and both stop
-      # with a "different bindgen format" error when that description's schema
-      # version is not their own; the corpus step's wasm-pack uses a
-      # wasm-bindgen of the Cargo.lock version only (README.md, "Building it",
-      # says how wasm-pack finds its tools). wasm-pack is pinned at the release
-      # that section describes, so that a new release does not change how the
-      # corpus step builds the module. Both land in ~/.cargo/bin; caching them
-      # skips the multi-minute compile on a hit.
+      # wasm-bindgen-cli is installed at the version of the wasm-bindgen crate
+      # in Cargo.lock, which the first step below reads, and wasm-pack at the
+      # release README.md's "Building it" describes, so that a new wasm-pack
+      # release does not change how the corpus step builds the module. The
+      # CLI must be of the crate's version: its wasm-bindgen, which writes the
+      # JS glue, and its wasm-bindgen-test-runner, which runs the two test
+      # steps below, read the description the crate's macros put into the
+      # module, and both stop with a "different bindgen format" error when
+      # that description's schema version is not their own; the corpus step's
+      # wasm-pack needs a wasm-bindgen of that version too (README.md's
+      # "Building it" says where it looks for one). The cache key holds both
+      # versions, so a change of either installs the tools again; both land
+      # in ~/.cargo/bin, and a cache hit skips their multi-minute compile.
+      - name: Read the wasm-bindgen version from Cargo.lock
+        id: wasm-bindgen
+        run: |
+          version="$(devtools/run-wasm-step wasm-bindgen-version)"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
       - name: Cache wasm tooling
         id: cache-wasm-tools
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -95,11 +98,13 @@ jobs:
             ~/.cargo/bin/wasm-bindgen-test-runner
             ~/.cargo/bin/wasm2es6js
             ~/.cargo/bin/wasm-pack
-          key: wasm-tools-wbindgen0.2.130-wpack0.15.1-${{ runner.os }}
+          key: wasm-tools-wbindgen${{ steps.wasm-bindgen.outputs.version }}-wpack0.15.1-${{ runner.os }}
       - name: Install wasm tooling
         if: steps.cache-wasm-tools.outputs.cache-hit != 'true'
+        env:
+          WASM_BINDGEN_VERSION: ${{ steps.wasm-bindgen.outputs.version }}
         run: |
-          cargo install --locked --version 0.2.130 wasm-bindgen-cli
+          cargo install --locked --version "$WASM_BINDGEN_VERSION" wasm-bindgen-cli
           cargo install --locked --version 0.15.1 wasm-pack
 
       # Each step below runs `devtools/run-wasm-step <step>`, which holds the

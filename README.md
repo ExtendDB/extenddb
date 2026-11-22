@@ -630,11 +630,11 @@ platform or its download fails, it uses a `wasm-bindgen-cli` that an earlier
 `cargo install` of it left in that cache, or else builds one there with
 `cargo install`. To build without those downloads, build the
 `wasm-bindgen-cli` of the `wasm-bindgen` version in `Cargo.lock` from
-crates.io (the first command reads that version from the end of what
-`cargo pkgid wasm-bindgen` prints), and skip `wasm-opt`:
+crates.io (`devtools/run-wasm-step wasm-bindgen-version` prints that version),
+and skip `wasm-opt`:
 
 ```bash
-cargo install --locked --version "$(cargo pkgid wasm-bindgen | sed 's/.*@//')" wasm-bindgen-cli
+cargo install --locked --version "$(devtools/run-wasm-step wasm-bindgen-version)" wasm-bindgen-cli
 wasm-pack build --target web --release --no-opt --mode no-install crates/wasm-adapter
 ```
 

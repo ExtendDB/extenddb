@@ -3,10 +3,12 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The commands of the steps of .github/workflows/wasm.yml that build, lint and
-# test the code for wasm32, with their documentation. The workflow runs each
-# of those steps as `devtools/run-wasm-step <step>`, and a developer runs the
-# same command to repeat a step locally, so the commands are written once,
-# here.
+# test the code for wasm32, and of the step that reads the version of
+# wasm-bindgen-cli it installs, with their documentation. The workflow runs
+# each of those steps as `devtools/run-wasm-step <step>` (and writes what the
+# wasm-bindgen-version step prints to that step's outputs), and a developer
+# runs the same command to repeat a step locally, so the commands are written
+# once, here.
 #
 #   devtools/run-wasm-step <step>
 #   devtools/run-wasm-step clippy [cargo option...] [-- clippy option...]
@@ -18,6 +20,8 @@
 #   core      extenddb-core's wasm32 tests, under Node
 #   shim      the SQLite shim's wasm32 tests, under Node
 #   corpus    the browser module and the parity corpus, under Node
+#   wasm-bindgen-version
+#             print the version of the wasm-bindgen crate in Cargo.lock
 #
 # A step runs from the repository root, prints each command before it runs it
 # (on stderr, after "+ "), and looks up cargo, wasm-pack, node and Python on
@@ -26,11 +30,12 @@
 # put the Node version it names on PATH. To run a step locally as the
 # workflow runs it, install what those steps install: that toolchain with the
 # wasm32-unknown-unknown target and clippy, a clang, a Node of that major
-# version, and the wasm-bindgen-cli and wasm-pack versions the workflow's
-# install step names (the guard step's case below says which Python it
-# needs). With rustup's cargo the first cargo on PATH, setting
-# RUSTUP_TOOLCHAIN to the workflow's `toolchain:` selects that toolchain; put
-# the Node first on PATH, for example:
+# version, the wasm-bindgen-cli of the version the wasm-bindgen-version step
+# prints, and the wasm-pack version the workflow's install step names (the
+# guard step's case below says which Python it needs). With rustup's cargo
+# the first cargo on PATH, setting RUSTUP_TOOLCHAIN to the workflow's
+# `toolchain:` selects that toolchain; put the Node first on PATH, for
+# example:
 #
 #   RUSTUP_TOOLCHAIN=<toolchain> PATH=<directory of that node>:$PATH \
 #       devtools/run-wasm-step corpus
@@ -40,13 +45,8 @@ set -euo pipefail
 ADAPTER=extenddb-wasm-adapter
 TARGET=wasm32-unknown-unknown
 
-# The advice that the test and corpus steps give when the wasm-bindgen-cli
-# they need is missing. .github/workflows/wasm.yml writes the version it
-# installs by hand, so the advice names the two lines.
-WASM_BINDGEN_CLI_HELP="install the wasm-bindgen-cli of the version of the wasm-bindgen crate in Cargo.lock (cargo install --locked --version <that version> wasm-bindgen-cli; what cargo pkgid wasm-bindgen prints ends with that version). .github/workflows/wasm.yml writes the version it installs by hand, in its \"Install wasm tooling\" step and in the key of its \"Cache wasm tooling\" step, so when the version in Cargo.lock changes, both must change with it"
-
 usage() {
-    echo "usage: devtools/run-wasm-step build|clippy [cargo option...] [-- clippy option...]|guard|pedantic|core|shim|corpus" >&2
+    echo "usage: devtools/run-wasm-step build|clippy [cargo option...] [-- clippy option...]|guard|pedantic|core|shim|corpus|wasm-bindgen-version" >&2
     exit 2
 }
 
@@ -68,6 +68,32 @@ run() {
     exec "$@"
 }
 
+# Prints the version of the wasm-bindgen crate in Cargo.lock: what follows the
+# last "@" of the package id that `cargo pkgid` reads from the lock (it fails
+# when there is none, and leaves an out-of-date one as it is). The workflow
+# installs the wasm-bindgen-cli of this version, and the core, shim and corpus
+# steps need it. run_suite and the corpus step take the output with a command
+# substitution, where bash clears `set -e`, so the function checks each
+# failure itself.
+lock_wasm_bindgen_version() {
+    local id version semver='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+    show cargo pkgid wasm-bindgen
+    id="$(cargo pkgid wasm-bindgen)" \
+        || die "cargo pkgid did not name the wasm-bindgen package of Cargo.lock (its error is above)"
+    version="${id##*@}"
+    if ! [[ "$version" =~ $semver ]]; then
+        die "cargo pkgid wasm-bindgen printed '${id}', which does not end with @<version>"
+    fi
+    echo "$version"
+}
+
+# The advice that the core, shim and corpus steps give when the
+# wasm-bindgen-cli they need is missing or of another version; $1 is the
+# version of the wasm-bindgen crate in Cargo.lock.
+wasm_bindgen_cli_advice() {
+    echo "install it with: cargo install --locked --version ${1} wasm-bindgen-cli (what .github/workflows/wasm.yml runs, with the version it reads from Cargo.lock)"
+}
+
 # Runs `cargo test --locked <ARGS> --target wasm32-unknown-unknown` and fails
 # unless the run reports each test TESTS names `ok`, and no other test. `cargo
 # test` exits 0 when a test binary holds no test, and passes with the rest
@@ -80,10 +106,17 @@ run() {
 # says why); the runner runs the module under the node on PATH. A runner the
 # caller sets is used as given; otherwise this sets the one on PATH, else the
 # one in cargo's bin directory ($CARGO_HOME/bin), where `cargo install` puts
-# it, by its full path.
+# it, by its full path. Before `cargo test` runs, the suite checks that the
+# runner's version (the second word of what it prints for --version) is the
+# crate's, and otherwise stops with the command that installs that version.
+# The runner itself refuses a module whose wasm-bindgen has another schema
+# version, after the build, and its message then offers first `cargo update
+# -p wasm-bindgen --precise <the runner's version>`, which would undo a change
+# of Cargo.lock.
 LOG=""
 run_suite() {
-    local suite="$1" runner status=0 output results line name state expected reported problems=()
+    local suite="$1" lock runner printed version status=0 output results line name state expected reported problems=()
+    lock="$(lock_wasm_bindgen_version)"
     runner="${CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER:-}"
     if [ -z "$runner" ]; then
         runner="$(command -v wasm-bindgen-test-runner || true)"
@@ -92,10 +125,16 @@ run_suite() {
         fi
     fi
     if [ -z "$runner" ]; then
-        die "wasm-bindgen-test-runner is not on PATH or in ${CARGO_HOME:-$HOME/.cargo}/bin; ${WASM_BINDGEN_CLI_HELP}"
+        die "${suite} suite: wasm-bindgen-test-runner is not on PATH or in ${CARGO_HOME:-$HOME/.cargo}/bin, and the suite needs the wasm-bindgen-test-runner of the version of the wasm-bindgen crate in Cargo.lock, ${lock}; $(wasm_bindgen_cli_advice "$lock")"
+    fi
+    show "$runner" --version
+    printed="$("$runner" --version || true)"
+    read -r _ version _ <<<"$printed"
+    if [ "$version" != "$lock" ]; then
+        die "${suite} suite: the runner ${runner} reports '${printed}' for --version, and the suite needs the wasm-bindgen-test-runner of the version of the wasm-bindgen crate in Cargo.lock, ${lock}; $(wasm_bindgen_cli_advice "$lock")"
     fi
     export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="$runner"
-    echo "runner:    ${runner}"
+    echo "runner:    ${runner} (${printed})"
 
     LOG="$(mktemp "${TMPDIR:-/tmp}/run-wasm-step.XXXXXX")"
     trap 'rm -f "$LOG"' EXIT
@@ -288,9 +327,17 @@ case "$step" in
         fi
         show wasm-pack build --target web --release --no-opt --mode no-install crates/wasm-adapter --out-dir parity/pkg
         if ! wasm-pack build --target web --release --no-opt --mode no-install crates/wasm-adapter --out-dir parity/pkg; then
-            die "wasm-pack build failed. If it stopped with \"Not able to find or install a local wasm-bindgen.\", it found no wasm-bindgen of the version in Cargo.lock on PATH or in its cache, and --mode no-install lets it neither download nor build one: ${WASM_BINDGEN_CLI_HELP}"
+            lock="$(lock_wasm_bindgen_version)"
+            die "wasm-pack build failed. If it stopped with \"Not able to find or install a local wasm-bindgen.\", it found no wasm-bindgen of the version of the wasm-bindgen crate in Cargo.lock, ${lock}, on PATH or in its cache, and --mode no-install lets it neither download nor build one; $(wasm_bindgen_cli_advice "$lock")"
         fi
         run node crates/wasm-adapter/parity/run.mjs
+        ;;
+
+    wasm-bindgen-version)
+        # The workflow's step "Read the wasm-bindgen version from Cargo.lock"
+        # writes what this prints to its outputs, which the key of its tool
+        # cache and its install step use.
+        lock_wasm_bindgen_version
         ;;
 
     *)
