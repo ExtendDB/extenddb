@@ -256,37 +256,23 @@ case "$step" in
         ;;
 
     corpus)
-        # Builds the browser module with wasm-bindgen and runs the shared parity
-        # corpus through it under Node: the same cases as the native test
-        # (crates/wasm-adapter/tests/parity.rs, against sqlx and the C SQLite),
-        # with its assertions except where a case carries an `onWasm`
-        # expectation.
+        # Builds the browser module with wasm-pack, which runs wasm-bindgen,
+        # and runs the shared parity corpus through it under Node: the same
+        # cases as the native test (crates/wasm-adapter/tests/parity.rs, against
+        # sqlx and the C SQLite), with its assertions except where a case
+        # carries an `onWasm` expectation.
         #
-        # wasm-pack downloads no tool here. --no-opt skips wasm-opt. Without
-        # it, wasm-pack runs the wasm-opt on PATH or in its download cache,
-        # and, in its default install mode, when it has neither it first
-        # downloads binaryen version_130 from GitHub releases, which it does
-        # not check against a checksum. The step skips wasm-opt rather than
-        # pin a checksum for it: wasm-opt is an optimizer (here it makes the
-        # module about a quarter smaller) and is not meant to change the
-        # answers the corpus checks. No step runs the corpus over wasm-opt's
-        # output, the module a build without --no-opt produces (as the first
-        # build command of the README does).
-        # --mode no-install forbids wasm-pack to download or install
-        # wasm-bindgen: it uses a wasm-bindgen of the version in Cargo.lock
-        # from PATH (the workflow's tool cache or install step puts one there)
-        # or from its download cache, and otherwise stops. wasm-pack would add
-        # the wasm32 target with rustup if the toolchain lacked it; the
-        # workflow's toolchain step installs it.
-        #
-        # wasm-pack does make one request of its own: at the start of a run,
-        # when no wasm-pack.stamp file is beside its binary or the one there
-        # records a check made 25 or more hours before, it asks crates.io
-        # (https://crates.io/api/v1/crates/wasm-pack) for the latest wasm-pack
-        # version and then writes that file. The workflow's tool cache does
-        # not keep the file. The answer only decides whether wasm-pack ends
-        # with a warning; when the request fails, the warning is "failed to
-        # get wasm-pack version" and the build goes on.
+        # --mode no-install makes wasm-pack stop, rather than download or build
+        # a wasm-bindgen, when it finds none of the version in Cargo.lock (the
+        # workflow's tool cache or install step puts one in ~/.cargo/bin).
+        # --no-opt skips wasm-opt, which the workflow does not install: without
+        # it, wasm-pack would run a wasm-opt it finds on PATH or in its cache,
+        # so the module the corpus runs would depend on the machine. wasm-opt
+        # is an optimizer (here it makes the module about a quarter smaller)
+        # and is not meant to change the answers the corpus checks; no step
+        # runs the corpus over its output, the module the first build command
+        # of the README produces. The README's "Building it" says how wasm-pack
+        # finds or downloads its tools, and what else it does.
         if ! command -v wasm-pack >/dev/null 2>&1; then
             die "wasm-pack is not on PATH; install the version .github/workflows/wasm.yml installs (cargo install --locked --version <that version> wasm-pack)"
         fi

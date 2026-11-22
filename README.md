@@ -610,12 +610,17 @@ runs `wasm-opt`, which brings it to about 5.0 MiB.
 
 The command above can download two tools. wasm-pack 0.15.1 uses the
 `wasm-bindgen` on `PATH` when it is the version `Cargo.lock` names, and any
-`wasm-opt` on `PATH`. For each one it finds neither there nor in its own
-cache, it downloads a prebuilt archive from GitHub releases (wasm-bindgen at
-the version in `Cargo.lock`, binaryen at `version_130`; when the wasm-bindgen
-download fails, it runs `cargo install` instead) and checks no checksum of
-it. To build without those downloads, build the `wasm-bindgen-cli` of the
-`wasm-bindgen` version in `Cargo.lock` from crates.io, and skip `wasm-opt`:
+`wasm-opt` on `PATH`. For each one it does not find there, it uses the copy
+that an earlier run downloaded into its cache (the directory that
+`WASM_PACK_CACHE` names, by default `.wasm-pack` in the user's cache
+directory), and otherwise downloads a prebuilt archive from GitHub releases
+(wasm-bindgen at the version in `Cargo.lock`, binaryen at `version_130`) and
+checks no checksum of it. When there is no wasm-bindgen archive for the
+platform or its download fails, it uses a `wasm-bindgen-cli` that an earlier
+`cargo install` of it left in that cache, or else builds one there with
+`cargo install`. To build without those downloads, build the
+`wasm-bindgen-cli` of the `wasm-bindgen` version in `Cargo.lock` from
+crates.io, and skip `wasm-opt`:
 
 ```bash
 cargo install --locked --version 0.2.130 wasm-bindgen-cli
@@ -628,8 +633,8 @@ it does not run `wasm-opt`, so the module stays at about 6.6 MiB. In either
 form wasm-pack also runs `rustup target add wasm32-unknown-unknown` when the
 toolchain is a rustup one without that target, and asks crates.io for the
 latest wasm-pack version when no `wasm-pack.stamp` file is beside its binary
-or the one there records a check made 25 or more hours before (it writes
-that file after each check); the answer only feeds a warning.
+or the one there records a check made 25 or more hours before; the answer
+only feeds a warning.
 
 The `wasm32` build is the adapter's dependency graph, built through
 `extenddb-wasm-adapter` as above. Two crates of that graph do not build for
