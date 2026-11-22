@@ -323,6 +323,7 @@ where
                         table_name: target_table_name.to_owned(),
                         backup_arn: in_flight.backup_arn,
                     },
+                    &arn_text,
                 ));
             }
             tracing::info!(
@@ -485,7 +486,7 @@ pub(crate) async fn start<S>(
         Ok(registered) => registered,
         Err(e) => {
             drop(permit);
-            let error = restore_storage_err_to_dynamo(e);
+            let error = restore_storage_err_to_dynamo(e, &arn_text);
             if let Some(registration) = registration {
                 registration.finish(Err(error.clone()));
             }

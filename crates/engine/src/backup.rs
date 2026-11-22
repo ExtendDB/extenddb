@@ -26,6 +26,7 @@ use extenddb_core::types::{
 };
 use extenddb_storage::backup_catalog::{
     BackupKey, BackupRow, BackupStatus, DeleteStart, TimeBounds, is_backup_not_found,
+    restore_target_in_use_message,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{
@@ -1845,7 +1846,7 @@ where
 
     // 5. The target name, after the backup resolved and before the overrides
     // are checked against it.
-    check_restore_target_name(storage, account_id, target_table_name).await?;
+    check_restore_target_name(storage, account_id, target_table_name, &backup_arn).await?;
 
     // 6. Refusals every backend gets, whatever it stores.
     source.ensure_restorable().map_err(storage_err_to_dynamo)?;
@@ -1883,7 +1884,7 @@ where
                 .await
                 .map_err(storage_err_to_dynamo)?
             else {
-                return Err(restore_storage_err_to_dynamo(e));
+                return Err(restore_storage_err_to_dynamo(e, &backup_arn));
             };
             return restore_from_row(
                 storage_arc,
@@ -1899,7 +1900,7 @@ where
             .await;
         }
         // 10.
-        Err(e) => return Err(restore_storage_err_to_dynamo(e)),
+        Err(e) => return Err(restore_storage_err_to_dynamo(e, &backup_arn)),
     };
 
     let response = restore_response(desc, &RestoreSource::from(&source), on_demand)?;
@@ -1937,7 +1938,13 @@ where
     // backup into an existing table is TableAlreadyExistsException, a
     // backup into its own CREATING target TableInUseException, not
     // BackupInUseException) and before the manifest is read.
-    check_restore_target_name(&**storage, account_id, target_table_name).await?;
+    check_restore_target_name(
+        &**storage,
+        account_id,
+        target_table_name,
+        &arn.to_arn_string(),
+    )
+    .await?;
     let store = check_catalog_row_for_restore(&**storage, runtime, arn, row).await?;
     restore::request(
         storage,
@@ -1998,12 +2005,11 @@ async fn check_catalog_row_for_restore<'r, S: BackupCatalog + ?Sized>(
     runtime.require_healthy_store()
 }
 
-/// Step 5 of a restore, the target name under the account, read through
-/// `describe_table` after the backup resolved and before the permit: a
-/// CREATING table with a
-/// `RestoreSummary` is a restore target, `TableInUseException` naming its
-/// source backup (the text the backend's own registration answers with,
-/// [`StorageError::TableBeingRestored`]); any other table of that name is
+/// Step 5 of a restore of `backup_arn`, the target name under the account,
+/// read through `describe_table` after the backup resolved and before the
+/// permit: a CREATING table with a `RestoreSummary` is a restore target,
+/// answered as the backend's registration answers it
+/// ([`restore_storage_err_to_dynamo`]); any other table of that name is
 /// `TableAlreadyExistsException`; no table passes. Unfenced: the backend
 /// checks the name again under its registration, so two restores into one
 /// free name still have one winner.
@@ -2011,6 +2017,7 @@ async fn check_restore_target_name<S: TableEngine + ?Sized>(
     storage: &S,
     account_id: &str,
     target_table_name: &str,
+    backup_arn: &str,
 ) -> Result<(), DynamoDbError> {
     let probe = storage
         .describe_table(
@@ -2027,13 +2034,16 @@ async fn check_restore_target_name<S: TableEngine + ?Sized>(
                 .as_ref()
                 .filter(|_| desc.table_status == TableStatus::Creating)
                 .and_then(|s| s.source_backup_arn.clone());
-            Err(restore_storage_err_to_dynamo(match source {
-                Some(backup_arn) => StorageError::TableBeingRestored {
-                    table_name: target_table_name.to_owned(),
-                    backup_arn,
+            Err(restore_storage_err_to_dynamo(
+                match source {
+                    Some(backup_arn) => StorageError::TableBeingRestored {
+                        table_name: target_table_name.to_owned(),
+                        backup_arn,
+                    },
+                    None => StorageError::TableAlreadyExists(target_table_name.to_owned()),
                 },
-                None => StorageError::TableAlreadyExists(target_table_name.to_owned()),
-            }))
+                backup_arn,
+            ))
         }
         Err(StorageError::TableNotFound(_)) => Ok(()),
         Err(e) => Err(storage_err_to_dynamo(e)),
@@ -2113,20 +2123,30 @@ fn restore_response(
     Ok(out)
 }
 
-/// [`storage_err_to_dynamo`] for RestoreTableFromBackup, where a taken target
-/// name is `TableAlreadyExistsException` (the operation's own error in the
-/// service model, and what the service returns), and a name taken by a
-/// `CREATING` restore target is `TableInUseException` with the service's text
-/// (`Table: <name> is already being restored from backup: <arn>`, measured on
-/// DynamoDB), which the storage error's `Display` carries.
+/// [`storage_err_to_dynamo`] for a RestoreTableFromBackup of `backup_arn`,
+/// where a taken target name is `TableAlreadyExistsException` (the
+/// operation's own error in the service model, and what the service
+/// returns), and a name taken by a `CREATING` restore target is
+/// `TableInUseException` with the service's text (both measured on
+/// DynamoDB): `Table: <name> is already being restored from backup: <arn>`,
+/// the storage error's `Display`, when that target is restored from
+/// `backup_arn`, else [`restore_target_in_use_message`]. `backup_arn` is the
+/// ARN the request resolved to, the spelling a target's `RestoreSummary`
+/// holds, so the two compare as strings.
 /// A backup with a restore from it still `CREATING` is `BackupInUseException`
 /// (the generic mapping; measured on DynamoDB). Only this operation maps the
 /// first two so; CreateTable keeps `ResourceInUseException`.
-fn restore_storage_err_to_dynamo(e: StorageError) -> DynamoDbError {
+fn restore_storage_err_to_dynamo(e: StorageError, backup_arn: &str) -> DynamoDbError {
     match e {
         StorageError::TableAlreadyExists(name) => DynamoDbError::TableAlreadyExistsException(
             error_message(ErrorMessageKey::TableAlreadyExists, &[&name]),
         ),
+        StorageError::TableBeingRestored {
+            table_name,
+            backup_arn: restoring,
+        } if restoring != backup_arn => {
+            DynamoDbError::TableInUseException(restore_target_in_use_message(&table_name))
+        }
         e @ StorageError::TableBeingRestored { .. } => {
             DynamoDbError::TableInUseException(e.to_string())
         }
