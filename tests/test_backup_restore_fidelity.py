@@ -2490,13 +2490,77 @@ def test_backup_arn_account_is_checked_before_its_shape(dynamodb_client, caller_
         dynamodb_client.describe_table(TableName=target)
 
 
+# A BackupArn of the caller's account whose region field is not the
+# endpoint's, naming no backup: RestoreTableFromBackup answers the
+# cross-region text after the TargetTableName when the request has no
+# SSESpecificationOverride or has it as null; with one of any content, {}
+# included, it answers as for the endpoint's own region. DescribeBackup and
+# DeleteBackup answer a region field outside [a-z0-9-] with "Invalid Request:
+# BackupArn is not valid". A table segment outside the length bounds is
+# "Invalid Backup ARN" first, in another region and in the endpoint's.
+# Measured on DynamoDB in us-east-1 on 21 and 22 Nov 2026, each request
+# twice; None is not measured. The rows assume an endpoint in us-east-1.
+# Columns: region field, table segment, the restore's other members (a
+# TargetTableName when not a valid one), and the answers of
+# RestoreTableFromBackup ({arn} the ARN as sent), DescribeBackup and
+# DeleteBackup.
+_XREGION = ("ValidationException", "Invalid Request: sseSpecificationOverride must be "
+            "provided for cross-region restores")
+_NOT_VALID = ("ValidationException", "Invalid Request: BackupArn is not valid")
+_NOT_FOUND = ("BackupNotFoundException", "Backup not found: {arn}")
+_LENGTH = ("ValidationException",
+           "TableName must be at least 3 characters long and at most 255 characters long")
+_ENABLED = {"SSESpecificationOverride": {"Enabled": True}}
+_MUSIC = "restore-xregion-music"
+_BACKUP_ARN_REGION_ROWS = [
+    ("us-west-2", _MUSIC, {}, _XREGION, None, None),
+    ("us/east-1", _MUSIC, {}, _XREGION, _NOT_VALID, _NOT_VALID),
+    ("..", _MUSIC, {}, _XREGION, _NOT_VALID, _NOT_VALID),
+    ("us-east-1/..", _MUSIC, {}, _XREGION, _NOT_VALID, _NOT_VALID),
+    ("US-EAST-1", _MUSIC, {}, _XREGION, _NOT_VALID, None),
+    ("us-west-2", _MUSIC, {"TargetTableName": "a*"}, _LENGTH, None, None),
+    # 22 Nov 2026: a null override, then an override of any content.
+    ("us-west-2", _MUSIC, {"SSESpecificationOverride": None}, _XREGION, None, None),
+    ("us-west-2", _MUSIC, _ENABLED, _NOT_FOUND, None, None),
+    ("us/east-1", _MUSIC, _ENABLED, _NOT_VALID, None, None),
+    ("us-west-2", _MUSIC, {"SSESpecificationOverride": {}}, _NOT_FOUND, None, None),
+    # 22 Nov 2026: a table segment of 2 or 300 characters.
+    ("us-west-2", "ab", {}, _INVALID_ARN, None, None),
+    ("us-west-2", "t" * 300, {}, _INVALID_ARN, None, None),
+    ("us-east-1", "ab", {}, _INVALID_ARN, None, None),
+    ("us-east-1", "t" * 300, {}, _INVALID_ARN, None, None),
+]
+
+
+@pytest.mark.parametrize(("region", "table", "extra", "restore", "describe", "delete"),
+                         _BACKUP_ARN_REGION_ROWS)
+def test_a_restore_of_a_backup_arn_in_another_region_is_the_cross_region_answer(
+        caller_account, region, table, extra, restore, describe, delete):
+    arn = (f"arn:aws:dynamodb:{region}:{caller_account}:table/{table}"
+           "/backup/01791976431438-73d8d5bc")
+    target = f"restore-xregion-{uuid.uuid4().hex[:10]}"
+    restore_body = {"BackupArn": arn, "TargetTableName": target, **extra}
+    for operation, body, expected in (
+        ("RestoreTableFromBackup", restore_body, restore),
+        ("DescribeBackup", {"BackupArn": arn}, describe),
+        ("DeleteBackup", {"BackupArn": arn}, delete),
+    ):
+        if expected is None:
+            continue
+        resp = _signed(operation, body)
+        assert resp.status_code == 400, (operation, arn, resp.text)
+        expected = (expected[0], expected[1].format(arn=arn))
+        assert _error(resp) == expected, (operation, arn, resp.text)
+
+
 def test_backup_arn_shapes_the_service_refuses_and_trims(dynamodb_client):
     """BackupArn shapes the service refuses as ValidationException "Invalid
-    Request: BackupArn is not valid" (control characters in the id, a slash
-    in the region, an id suffix of the wrong length or not hex) or "Invalid
-    Backup ARN" (oversize, a wildcard id), on DescribeBackup, DeleteBackup
-    and RestoreTableFromBackup (measured on DynamoDB in us-east-1 on
-    21 Nov 2026; the restore answers the region with its cross-region text).
+    Request: BackupArn is not valid" (control characters in the id, an id
+    suffix of the wrong length or not hex) or "Invalid Backup ARN"
+    (oversize, a wildcard id), on DescribeBackup, DeleteBackup and
+    RestoreTableFromBackup (measured on DynamoDB in us-east-1 on
+    21 Nov 2026; a region field outside the shape is in
+    _BACKUP_ARN_REGION_ROWS).
     ExtendDB gives ExclusiveStartBackupArn the same texts; the service's
     are its own. A trailing newline is trimmed and an ARN naming another
     region of the caller's account resolves (measured on DynamoDB). The
@@ -2526,7 +2590,6 @@ def test_backup_arn_shapes_the_service_refuses_and_trims(dynamodb_client):
         bad = [
             (f"{prefix}/{backup_id}\x00", not_valid),
             (f"{prefix}/{backup_id}\x07", not_valid),
-            (backup_arn.replace(f":{region}:", f":{region}/..:"), not_valid),
             (backup_arn.replace(f"table/{source}", "table/" + "x" * 1000), invalid_arn),
             (f"{prefix}/*", invalid_arn),
             (f"{prefix}/{backup_id[:-1]}", not_valid),
