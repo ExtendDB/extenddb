@@ -21,9 +21,9 @@ those (a nested function, an impl and its methods) needs its own allow. One
 on the `mod mNNNN_<name>;` line of a crate's src/migrations/mod.rs, which
 declares a code-body migration (CONTRIBUTING.md), is accepted too and covers
 the module's file beside it whole: a checksum test pins a released body, so
-an allow cannot go inside it. The guard checks only that the reason is there;
-that it says why the wasm32 build never runs the calls the allow covers is
-for review.
+an allow cannot go inside it. Of the reason, the guard checks only that it
+is there; whether it says why the wasm32 build never runs the calls the
+allow covers is for review.
 
 The script copies the working tree (the files git tracks or does not ignore,
 uncommitted edits included), plants probes and controls in the copy, and runs
@@ -56,15 +56,17 @@ force-warned lint). It fails, with one line per problem, unless:
    of aes, aes-gcm, ghash and polyval is there as one copy (one package: one
    name, version and source), with its zeroize feature on.
 Each check runs, in the same call, on the tree and on controls planted for
-it: CONTROLS, OTHER_FILE_CONTROLS, LINTS_CONTROL with its [lints] table,
-BUILD_SCRIPT, RELEASE_CONTROL, MIGRATIONS_CONTROLS, CONTROL_PROBE,
-CONTROL_ENTRY, CONTROL_ENVIRONMENT, CONTROL_CARGO_CONFIG and two zeroize
-graphs; and each run's dep-info must be read for every crate of the build. A
-control that does not give the finding it was planted for, and a finding no
-control expects, fail the guard. The environment and cargo-configuration
-checks are controlled on their control inputs only: handed an empty mapping
-or file list in place of the tree's, the guard would still pass. A wrapper
-that caps one crate's lints also fails that crate's dep-info check.
+it, but for the check that both runs finish, which a control could test only
+by stopping the guard: CONTROLS, OTHER_FILE_CONTROLS, LINTS_CONTROL with its
+[lints] table, BUILD_SCRIPT, RELEASE_CONTROL, MIGRATIONS_CONTROLS,
+CONTROL_PROBE, CONTROL_ENTRY, CONTROL_ENVIRONMENT, CONTROL_CARGO_CONFIG and
+two zeroize graphs; and each run's dep-info must be read for every crate of
+the build. A control that does not give the finding it was planted for, and
+a finding no control expects, fail the guard. The environment and
+cargo-configuration checks are controlled on their control inputs only:
+handed an empty mapping or file list in place of the tree's, the guard would
+still pass. A wrapper that caps one crate's lints also fails that crate's
+dep-info check.
 
 What it does not see is listed below. The headless parity corpus
 (`devtools/run-wasm-step corpus`), which runs the module under Node, finds a
