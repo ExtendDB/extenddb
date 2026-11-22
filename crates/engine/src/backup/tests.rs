@@ -4970,27 +4970,56 @@ fn throughput_override_under_pay_per_request_is_refused() {
 /// an override member of another JSON kind at any depth (a list in place of
 /// a structure included), then the `BackupArn`'s account and shape, then a
 /// missing or short `TargetTableName`, then one message with the model's
-/// clauses (each throughput member below 1, the billing mode's enum, the
-/// name's pattern), then the `BackupArn`'s id, then the PROVISIONED rule.
-/// Measured on DynamoDB in us-east-1 on 21 Nov 2026; the
-/// `{0, 0}` row on 13 and 14 Nov 2026 (#1048). Only the type of a
-/// `SerializationException` is checked (#1012).
+/// clauses (each throughput member missing or below 1, a fraction read as
+/// its integer part, the billing mode's enum, the SSE type's enum, the
+/// name's pattern, each member an index override entry is missing), then
+/// the `BackupArn`'s id, then the PROVISIONED rule. An empty
+/// `VectorIndexOverride` is no override. Measured on DynamoDB in us-east-1
+/// on 21 Nov 2026; the `{0, 0}` row on 13 and 14 Nov 2026 (#1048). Only the
+/// type of a `SerializationException` is checked (#1012).
 #[tokio::test]
 async fn a_restore_checks_its_members_in_the_services_order() {
     let at = |value: &str, path: &str, c: &str| {
         format!("Value '{value}' at '{path}' failed to satisfy constraint: {c}")
     };
+    let null = |path: &str| {
+        format!("Value null at '{path}' failed to satisfy constraint: Member must not be null")
+    };
     let units = "Member must have value greater than or equal to 1";
     let pto = "provisionedThroughputOverride";
     let rcu = at("0", &format!("{pto}.readCapacityUnits"), units);
     let wcu = at("0", &format!("{pto}.writeCapacityUnits"), units);
+    let r_null = null(&format!("{pto}.readCapacityUnits"));
+    let w_null = null(&format!("{pto}.writeCapacityUnits"));
     let modes = "Member must satisfy enum value set: [PROVISIONED, PAY_PER_REQUEST]";
     let mode = at("PAY", "billingModeOverride", modes);
+    let sse_types = "Member must satisfy enum value set: [AES256, KMS]";
+    let sse_type = at("BAD", "sSESpecificationOverride.sSEType", sse_types);
     let pattern = "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+";
     let pat = at("a b", "targetTableName", pattern);
+    // The clauses of an index override entry with no member: the name's
+    // pattern clause, then the three, in the order DynamoDB lists them.
+    let entry = |kind: &str| {
+        let mut c = vec![pat.clone()];
+        for member in ["indexName", "keySchema", "projection"] {
+            c.push(null(&format!(
+                "{kind}SecondaryIndexOverride.1.member.{member}"
+            )));
+        }
+        c
+    };
+    let (gsi_nulls, lsi_nulls) = (entry("global"), entry("local"));
     let one = |c: &str| format!("ValidationException: 1 validation error detected: {c}");
     let two =
         |a: &str, b: &str| format!("ValidationException: 2 validation errors detected: {a}; {b}");
+    fn many<S: AsRef<str>>(c: &[S]) -> String {
+        let c: Vec<&str> = c.iter().map(AsRef::as_ref).collect();
+        format!(
+            "ValidationException: {} validation errors detected: {}",
+            c.len(),
+            c.join("; ")
+        )
+    }
     let three = format!("ValidationException: 3 validation errors detected: {rcu}; {mode}; {pat}");
     let length = "ValidationException: TableName must be at least 3 characters long and at \
                   most 255 characters long"
@@ -5033,9 +5062,24 @@ async fn a_restore_checks_its_members_in_the_services_order() {
         { "ReadCapacityUnits": "x", "WriteCapacityUnits": 1 } });
     let enabled = json!({ "SSESpecificationOverride": { "Enabled": "x" } });
     let pto_list = json!({ "ProvisionedThroughputOverride": [0, 1] });
+    let r1 = json!({ "ProvisionedThroughputOverride": { "ReadCapacityUnits": 1 } });
+    let r0 = json!({ "ProvisionedThroughputOverride": { "ReadCapacityUnits": 0 } });
+    let no_units = json!({ "ProvisionedThroughputOverride": {} });
+    let prov_r1 = json!({ "BillingModeOverride": "PROVISIONED",
+        "ProvisionedThroughputOverride": { "ReadCapacityUnits": 1 } });
+    let pay_r1 = json!({ "BillingModeOverride": "PAY",
+        "ProvisionedThroughputOverride": { "ReadCapacityUnits": 1 } });
+    let half = json!({ "ProvisionedThroughputOverride":
+        { "ReadCapacityUnits": 0.5, "WriteCapacityUnits": 1 } });
+    let gsi_empty = json!({ "GlobalSecondaryIndexOverride": [{}] });
+    let gsi_named = json!({ "GlobalSecondaryIndexOverride": [{ "IndexName": "gsi" }] });
+    let lsi_empty = json!({ "LocalSecondaryIndexOverride": [{}] });
+    let sse_bad = json!({ "SSESpecificationOverride": { "SSEType": "BAD" } });
+    let no_vector = json!({ "VectorIndexOverride": [] });
+    let named_pat = many(&[&pat, &gsi_nulls[2], &gsi_nulls[3]]);
     // (BackupArn, TargetTableName, overrides, answer); a null member stands
     // for an absent one.
-    let rows: Vec<(Value, Value, Value, String)> = vec![
+    let mut rows: Vec<(Value, Value, Value, String)> = vec![
         (json!(own), ok.clone(), pay.clone(), one(&mode)),
         (json!(own), ok.clone(), rcu0.clone(), one(&rcu)),
         (json!(own), ok.clone(), both.clone(), two(&rcu, &mode)),
@@ -5084,6 +5128,49 @@ async fn a_restore_checks_its_members_in_the_services_order() {
         (json!("x"), short.clone(), enabled, ser.clone()),
         (json!(own), ok.clone(), pto_list, ser.clone()),
     ];
+    // A missing member, an SSE type outside its enum and a fraction among
+    // the clauses, and an empty vector override (#1348).
+    let row = |arn: &str, name: &Value, overrides: &Value, answer: String| {
+        (json!(arn), name.clone(), overrides.clone(), answer)
+    };
+    rows.extend([
+        row(&own, &ok, &r1, one(&w_null)),
+        row(&own, &short, &r1, length.clone()),
+        row(&own, &spaced, &r1, two(&w_null, &pat)),
+        row("x", &ok, &r1, invalid.clone()),
+        row(&bad_id, &ok, &r1, one(&w_null)),
+        row(&other, &ok, &r1, denied.clone()),
+        row(&own, &ok, &no_units, two(&w_null, &r_null)),
+        row(&bad_id, &spaced, &no_units, many(&[&w_null, &r_null, &pat])),
+        row(&own, &ok, &r0, two(&w_null, &rcu)),
+        row(&own, &spaced, &r0, many(&[&w_null, &rcu, &pat])),
+        row(&bad_id, &ok, &r0, two(&w_null, &rcu)),
+        row(&own, &ok, &prov_r1, one(&w_null)),
+        row(&bad_id, &spaced, &prov_r1, two(&w_null, &pat)),
+        row(&own, &ok, &pay_r1, two(&w_null, &mode)),
+        row(&own, &spaced, &pay_r1, many(&[&w_null, &mode, &pat])),
+        row(&other, &spaced, &pay_r1, denied.clone()),
+        row(&bad_id, &ok, &half, one(&rcu)),
+        row(&own, &spaced, &half, two(&rcu, &pat)),
+        row(&own, &short, &half, length.clone()),
+        row("x", &ok, &half, invalid.clone()),
+        row(&other, &ok, &half, denied.clone()),
+        row(&own, &ok, &gsi_empty, many(&gsi_nulls[1..])),
+        row(&own, &short, &gsi_empty, length.clone()),
+        row(&own, &spaced, &gsi_empty, many(&gsi_nulls)),
+        row(&bad_id, &ok, &gsi_empty, many(&gsi_nulls[1..])),
+        row(&own, &ok, &gsi_named, many(&gsi_nulls[2..])),
+        row(&bad_id, &spaced, &gsi_named, named_pat),
+        row(&own, &ok, &lsi_empty, many(&lsi_nulls[1..])),
+        row(&bad_id, &spaced, &lsi_empty, many(&lsi_nulls)),
+        row(&own, &ok, &sse_bad, one(&sse_type)),
+        row(&own, &short, &sse_bad, length.clone()),
+        row(&own, &spaced, &sse_bad, two(&sse_type, &pat)),
+        row(&bad_id, &ok, &sse_bad, one(&sse_type)),
+        row("x", &spaced, &sse_bad, invalid.clone()),
+        row(&own, &spaced, &no_vector, one(&pat)),
+        row(&bad_id, &ok, &no_vector, not_valid.clone()),
+    ]);
     for (backup_arn, target, overrides, expected) in rows {
         let mut body = overrides.clone();
         body["BackupArn"] = backup_arn;
@@ -5099,36 +5186,24 @@ async fn a_restore_checks_its_members_in_the_services_order() {
     }
 }
 
-#[test]
-fn missing_provisioned_throughput_override_member_matches_create_table() {
-    for (member, body) in [
-        (
-            "ReadCapacityUnits",
-            json!({ "BillingModeOverride": "PROVISIONED",
-                    "ProvisionedThroughputOverride": { "WriteCapacityUnits": 5 } }),
-        ),
-        (
-            "WriteCapacityUnits",
-            json!({ "BillingModeOverride": "PROVISIONED",
-                    "ProvisionedThroughputOverride": { "ReadCapacityUnits": 5 } }),
-        ),
-    ] {
-        match parse_restore_table_overrides(&body).unwrap_err() {
-            DynamoDbError::SerializationException(m) => {
-                assert!(m.contains(&format!("missing field `{member}`")), "{m}");
-            }
-            other => panic!("expected SerializationException, got {other:?}"),
-        }
+/// An empty `VectorIndexOverride` is no override, as on DynamoDB (measured
+/// in us-east-1 on 21 Nov 2026); any other is refused with ExtendDB's text.
+#[tokio::test]
+async fn vector_index_override_is_refused() {
+    let entry = json!([{ "IndexName": "v1", "VectorAttribute": { "AttributeName": "emb" },
+        "Dimensions": 3, "DistanceFunction": "COSINE", "Projection": { "ProjectionType": "ALL" } }]);
+    for vector in [json!({}), entry] {
+        let body = restore_body(json!({ "VectorIndexOverride": vector }));
+        assert_eq!(
+            validation_message(parse_restore_table_overrides(&body).unwrap_err()),
+            "RestoreTableFromBackup does not support VectorIndexOverride on ExtendDB"
+        );
     }
-}
-
-#[test]
-fn vector_index_override_is_refused() {
-    let body = restore_body(json!({ "VectorIndexOverride": {} }));
-    assert_eq!(
-        validation_message(parse_restore_table_overrides(&body).unwrap_err()),
-        "RestoreTableFromBackup does not support VectorIndexOverride on ExtendDB"
-    );
+    let empty = json!({ "VectorIndexOverride": [] });
+    assert!(parse_restore_table_overrides(&empty).unwrap().is_empty());
+    restored_input(source(Some(definition("PROVISIONED"))), empty)
+        .await
+        .unwrap();
 }
 
 #[test]
@@ -5151,15 +5226,6 @@ fn index_and_on_demand_overrides_of_the_wrong_type_are_serialization_errors() {
         ("GlobalSecondaryIndexOverride", json!("nope")),
         ("LocalSecondaryIndexOverride", json!({})),
         ("OnDemandThroughputOverride", json!([1])),
-        // An entry without its required members.
-        (
-            "GlobalSecondaryIndexOverride",
-            json!([{ "IndexName": "gsi1" }]),
-        ),
-        (
-            "LocalSecondaryIndexOverride",
-            json!([{ "IndexName": "lsi1" }]),
-        ),
         (
             "OnDemandThroughputOverride",
             json!({ "MaxReadRequestUnits": "x" }),
@@ -5186,7 +5252,7 @@ async fn a_malformed_index_override_is_refused_before_any_storage_read() {
     .await
     .unwrap_err();
     assert!(
-        matches!(err, DynamoDbError::SerializationException(_)),
+        matches!(err, DynamoDbError::ValidationException(_)),
         "{err:?}"
     );
     assert_eq!(fake.source_reads(), 0);

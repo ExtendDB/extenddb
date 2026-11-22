@@ -93,22 +93,23 @@ pub fn validate_name_member(
     path: &str,
     bounds: (usize, usize),
 ) -> Result<(), DynamoDbError> {
-    validate_name_member_after(value, path, bounds, &[])
+    validate_name_member_after(value, path, bounds, &[], &[])
 }
 
 /// [`validate_name_member`] for a member whose clauses the service lists
-/// after `earlier`, the failed constraints of other members of the request,
-/// in one message.
+/// after `earlier` and before `later`, the failed constraints of other
+/// members of the request, in one message.
 ///
 /// # Errors
 ///
 /// `ValidationException` with every clause of `earlier`, then one clause
-/// per failed constraint of the name.
+/// per failed constraint of the name, then every clause of `later`.
 pub fn validate_name_member_after(
     value: &str,
     path: &str,
     (min, max): (usize, usize),
     earlier: &[(&str, &str, &str)],
+    later: &[(&str, &str, &str)],
 ) -> Result<(), DynamoDbError> {
     let length = value.chars().count();
     let too_short = format!("Member must have length greater than or equal to {min}");
@@ -126,6 +127,7 @@ pub fn validate_name_member_after(
             "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+",
         ));
     }
+    failed.extend_from_slice(later);
     if failed.is_empty() {
         return Ok(());
     }

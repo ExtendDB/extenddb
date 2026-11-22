@@ -12,14 +12,24 @@ pub fn validation_error(value: &str, field: &str, constraint: &str) -> String {
     )
 }
 
+/// The constraint a member the request does not carry fails.
+pub const MEMBER_NOT_NULL: &str = "Member must not be null";
+
 /// Format multiple validation constraint errors in `DynamoDB`'s exact format.
+/// A clause of [`MEMBER_NOT_NULL`] shows its value as `null`, as the service
+/// does; the value given for it is not read.
 #[must_use]
 pub fn validation_errors(errors: &[(&str, &str, &str)]) -> String {
     let count = errors.len();
     let details: Vec<String> = errors
         .iter()
         .map(|(value, field, constraint)| {
-            format!("Value '{value}' at '{field}' failed to satisfy constraint: {constraint}")
+            let value = if *constraint == MEMBER_NOT_NULL {
+                "null".to_owned()
+            } else {
+                format!("'{value}'")
+            };
+            format!("Value {value} at '{field}' failed to satisfy constraint: {constraint}")
         })
         .collect();
     format!(

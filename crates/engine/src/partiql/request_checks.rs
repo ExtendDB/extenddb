@@ -28,7 +28,7 @@
 
 use serde_json::Value;
 
-use extenddb_core::error::DynamoDbError;
+use extenddb_core::error::{DynamoDbError, MEMBER_NOT_NULL as NOT_NULL};
 use extenddb_core::partiql::statement_length_refusal;
 
 use echo::{Echo, echo_list, write_batch_member, write_transaction_member};
@@ -53,9 +53,6 @@ const MAX_PARTS: usize = 10;
 
 /// The constraint an empty statement or list fails.
 const AT_LEAST_ONE: &str = "Member must have length greater than or equal to 1";
-
-/// The constraint a member the request does not carry fails.
-const NOT_NULL: &str = "Member must not be null";
 
 /// The values of `ReturnValuesOnConditionCheckFailure`, as the service lists
 /// them.

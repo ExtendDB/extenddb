@@ -209,6 +209,37 @@ impl IndexOverrides {
         })
     }
 
+    /// The member path of each member the model requires of an index entry
+    /// (the three of an LSI entry, which a GSI entry has first) that an
+    /// entry of `body` does not carry, a null being an absent member, at the
+    /// paths [`Self::check_index_names`] uses. Measured on DynamoDB in
+    /// us-east-1 on 21 Nov 2026. An entry that is not an object is left to
+    /// [`Self::parse`].
+    pub(super) fn missing_members(body: &Value) -> Vec<String> {
+        let mut paths = Vec::new();
+        for (field, kind) in [(GSI_FIELD, "global"), (LSI_FIELD, "local")] {
+            let entries = body.get(field).and_then(Value::as_array).into_iter();
+            for (n, entry) in entries.flatten().enumerate() {
+                let Some(entry) = entry.as_object() else {
+                    continue;
+                };
+                for member in LSI_MEMBERS {
+                    if entry.get(member).is_none_or(Value::is_null) {
+                        // A member's path is its name with the first
+                        // letter in lower case.
+                        let (initial, rest) = member.split_at(1);
+                        paths.push(format!(
+                            "{kind}SecondaryIndexOverride.{}.member.{}{rest}",
+                            n + 1,
+                            initial.to_ascii_lowercase()
+                        ));
+                    }
+                }
+            }
+        }
+        paths
+    }
+
     /// Check each entry's `IndexName` with `validate_index_name` at the
     /// entry's member path, numbered from 1, the GSI list first.
     pub(super) fn check_index_names(&self) -> Result<(), DynamoDbError> {

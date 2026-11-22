@@ -2553,6 +2553,84 @@ def test_a_restore_of_a_backup_arn_in_another_region_is_the_cross_region_answer(
         assert _error(resp) == expected, (operation, arn, resp.text)
 
 
+# A member missing inside ProvisionedThroughputOverride or an index override
+# entry, an SSEType outside its enum and a fraction (read as its integer
+# part) are clauses of the restore's one validation message: after the
+# TargetTableName's length text, before the backup id. A missing member is
+# `Value null`; the index override clauses come after the name's clause. An
+# empty VectorIndexOverride is no override. Measured on DynamoDB in us-east-1
+# on 21 Nov 2026, each request twice, with the caller's account; no backup
+# exists. Columns: the overrides, the TargetTableName (None for a valid one),
+# the backup id (None for one of the right shape), and the clauses in order
+# or the whole answer.
+_NULL = "Value null at '{}' failed to satisfy constraint: Member must not be null"
+_W_NULL = _NULL.format("provisionedThroughputOverride.writeCapacityUnits")
+_R_NULL = _NULL.format("provisionedThroughputOverride.readCapacityUnits")
+_R_ZERO = ("Value '0' at 'provisionedThroughputOverride.readCapacityUnits' failed to "
+           "satisfy constraint: Member must have value greater than or equal to 1")
+_PAY = ("Value 'PAY' at 'billingModeOverride' failed to satisfy constraint: Member must "
+        "satisfy enum value set: [PROVISIONED, PAY_PER_REQUEST]")
+_SSE = ("Value 'BAD' at 'sSESpecificationOverride.sSEType' failed to satisfy constraint: "
+        "Member must satisfy enum value set: [AES256, KMS]")
+_PAT = ("Value 'a b' at 'targetTableName' failed to satisfy constraint: Member must "
+        "satisfy regular expression pattern: [a-zA-Z0-9_.-]+")
+_GSI = [_NULL.format(f"globalSecondaryIndexOverride.1.member.{m}")
+        for m in ("indexName", "keySchema", "projection")]
+_LSI = [_NULL.format(f"localSecondaryIndexOverride.1.member.{m}")
+        for m in ("indexName", "keySchema", "projection")]
+_NO_WRITE = {"ProvisionedThroughputOverride": {"ReadCapacityUnits": 1}}
+_HALF = {"ProvisionedThroughputOverride": {"ReadCapacityUnits": 0.5, "WriteCapacityUnits": 1}}
+_OVERRIDE_MEMBER_ROWS = [
+    (_NO_WRITE, None, None, [_W_NULL]),
+    (_NO_WRITE, "ab", None, _LENGTH),
+    (_NO_WRITE, "a b", None, [_W_NULL, _PAT]),
+    (_NO_WRITE, None, "bad", [_W_NULL]),
+    ({"ProvisionedThroughputOverride": {}}, None, None, [_W_NULL, _R_NULL]),
+    ({"ProvisionedThroughputOverride": {}}, "a b", "bad", [_W_NULL, _R_NULL, _PAT]),
+    ({"ProvisionedThroughputOverride": {"ReadCapacityUnits": 0}}, None, None,
+     [_W_NULL, _R_ZERO]),
+    ({"ProvisionedThroughputOverride": {"ReadCapacityUnits": 0}}, "a b", None,
+     [_W_NULL, _R_ZERO, _PAT]),
+    ({"BillingModeOverride": "PROVISIONED", **_NO_WRITE}, None, None, [_W_NULL]),
+    ({"BillingModeOverride": "PAY", **_NO_WRITE}, None, None, [_W_NULL, _PAY]),
+    ({"BillingModeOverride": "PAY", **_NO_WRITE}, "a b", "bad", [_W_NULL, _PAY, _PAT]),
+    (_HALF, None, "bad", [_R_ZERO]),
+    (_HALF, "a b", None, [_R_ZERO, _PAT]),
+    (_HALF, "ab", None, _LENGTH),
+    ({"GlobalSecondaryIndexOverride": [{}]}, None, None, _GSI),
+    ({"GlobalSecondaryIndexOverride": [{}]}, "a b", "bad", [_PAT, *_GSI]),
+    ({"GlobalSecondaryIndexOverride": [{}]}, "ab", None, _LENGTH),
+    ({"GlobalSecondaryIndexOverride": [{"IndexName": "gsi"}]}, None, "bad", _GSI[1:]),
+    ({"GlobalSecondaryIndexOverride": [{"IndexName": "gsi"}]}, "a b", None,
+     [_PAT, *_GSI[1:]]),
+    ({"LocalSecondaryIndexOverride": [{}]}, None, None, _LSI),
+    ({"LocalSecondaryIndexOverride": [{}]}, "a b", None, [_PAT, *_LSI]),
+    ({"SSESpecificationOverride": {"SSEType": "BAD"}}, None, None, [_SSE]),
+    ({"SSESpecificationOverride": {"SSEType": "BAD"}}, "a b", "bad", [_SSE, _PAT]),
+    ({"SSESpecificationOverride": {"SSEType": "BAD"}}, "ab", None, _LENGTH),
+    ({"VectorIndexOverride": []}, None, None, _NOT_FOUND),
+    ({"VectorIndexOverride": []}, "a b", None, [_PAT]),
+    ({"VectorIndexOverride": []}, None, "bad", _NOT_VALID),
+]
+
+
+@pytest.mark.parametrize(("overrides", "name", "backup_id", "expected"),
+                         _OVERRIDE_MEMBER_ROWS)
+def test_a_missing_or_out_of_range_override_member_is_a_clause(
+        dynamodb_client, caller_account, overrides, name, backup_id, expected):
+    region = dynamodb_client.meta.region_name
+    arn = (f"arn:aws:dynamodb:{region}:{caller_account}:table/restore-member-music"
+           f"/backup/{backup_id or '01700000000000-abcdef12'}")
+    target = name or f"restore-member-{uuid.uuid4().hex[:10]}"
+    resp = _signed("RestoreTableFromBackup",
+                   {"BackupArn": arn, "TargetTableName": target, **overrides})
+    assert resp.status_code == 400, (overrides, resp.text)
+    if isinstance(expected, list):
+        errors = f"{len(expected)} validation error{'s' if len(expected) > 1 else ''}"
+        expected = ("ValidationException", f"{errors} detected: " + "; ".join(expected))
+    assert _error(resp) == (expected[0], expected[1].format(arn=arn)), (overrides, resp.text)
+
+
 def test_backup_arn_shapes_the_service_refuses_and_trims(dynamodb_client):
     """BackupArn shapes the service refuses as ValidationException "Invalid
     Request: BackupArn is not valid" (control characters in the id, an id

@@ -54,7 +54,7 @@
 //!   `TableName must be at least 3 characters long and at most 255
 //!   characters long` when its length in UTF-16 code units is outside 3 to
 //!   255, and otherwise one message with the clauses of the override values
-//!   the model refuses and then the clauses at `targetTableName` (measured
+//!   the model refuses and the clauses at `targetTableName` (measured
 //!   2026-11-21). A `BackupArn` of another account (the cross-account
 //!   refusal) is answered before it (measured 2026-11-20), and so are the
 //!   account and the shape of the `BackupArn`
