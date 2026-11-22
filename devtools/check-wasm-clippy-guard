@@ -44,35 +44,35 @@ one line per problem, unless:
    names one of the two lints in that spelling unless it is accepted (an
    allow in another form, such as a lint group, a raw identifier or one a
    macro builds, is not reported, and item 1 refuses the calls under it);
-4. both runs finish (of a run that does not, the guard reports the errors
-   and the crates it did not finish linting, and judges nothing else), and
-   in each, every crate's dep-info records the CLIPPY_ARGS and
-   CLIPPY_CONF_DIR the step passed (a build script's cargo::rustc-env can
-   change either for its crate, a forced [env] entry for every crate); the
-   environment sets none of RUSTC, RUSTC_WRAPPER, RUSTC_WORKSPACE_WRAPPER and
-   their CARGO_BUILD_ forms, and no cargo configuration file the copy's runs
-   read sets build.rustc, build.rustc-wrapper or
-   build.rustc-workspace-wrapper (another program as the compiler can change
-   its options for one crate);
+4. both runs finish (of a run that does not, the guard reports the plants
+   it could not make, then the run's errors and the crates it did not
+   finish linting, and judges nothing else), and in each, every crate's
+   dep-info records the CLIPPY_ARGS and CLIPPY_CONF_DIR the step passed (a
+   build script's cargo::rustc-env can change either for its crate, a
+   forced [env] entry for every crate); the environment sets none of RUSTC,
+   RUSTC_WRAPPER, RUSTC_WORKSPACE_WRAPPER and their CARGO_BUILD_ forms, and
+   no cargo configuration file the copy's runs read sets build.rustc,
+   build.rustc-wrapper or build.rustc-workspace-wrapper (another program as
+   the compiler can change its options for one crate);
 5. in the adapter's wasm32 build as `cargo tree -e normal` resolves it, each
    of aes, aes-gcm, ghash and polyval is there as one copy (one package: one
    name, version and source), with its zeroize feature on;
 6. the guard can plant every probe and control (_plant and plant_controls
    say when it cannot); each of BUILD_SCRIPT and MIGRATIONS_CONTROLS goes
    into the first crate of the build, by name, that can take it
-   (_own_crate_plants). When a run does not finish, the plants that could
-   not be made are reported before its errors.
+   (_own_crate_plants).
 Each check runs, in the same call, on the tree and on controls planted for
 it, but for two: the plant check, which no control makes fail, and the check
 that both runs finish, which a control could test only by stopping the
 guard. The controls: CONTROLS, OTHER_FILE_CONTROLS, BUILD_SCRIPT,
 RELEASE_CONTROL, MIGRATIONS_CONTROLS, CONTROL_PROBE, CONTROL_ENTRY,
 CONTROL_ENVIRONMENT, CONTROL_CARGO_CONFIG and two zeroize graphs; and each
-run's dep-info must be read for every crate of the build. A control that does not give the finding it was planted for, and
-a finding no control expects, fail the guard. The environment and
-cargo-configuration checks are controlled on their control inputs only:
-handed an empty mapping or file list in place of the tree's, the guard would
-still pass. A wrapper that caps one crate's lints is caught all the same.
+run's dep-info must be read for every crate of the build. A control that
+does not give the finding it was planted for, and a finding no control
+expects, fail the guard. The environment and cargo-configuration checks are
+controlled on their control inputs only: handed an empty mapping or file
+list in place of the tree's, the guard would still pass. A wrapper that caps
+one crate's lints is caught all the same.
 rustc reports a force-warned lint under --cap-lints as well, so F reports
 that crate's calls, and item 1 refuses those no accepted allow covers.
 clippy-driver, though, lints no crate whose own compiler options hold
