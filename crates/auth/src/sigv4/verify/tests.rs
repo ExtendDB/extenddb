@@ -3,24 +3,70 @@
 
 use super::*;
 
+/// Measured 2026-11-21 in us-east-1 with the documented example key: the
+/// forms of `X-Amz-Date` the service reads, with the UTC basic form it
+/// uses for each (its skew texts show it), and the forms it refuses with
+/// the `basic format` text.
 #[test]
-fn parse_iso8601_basic_valid() {
-    // 2026-04-15T12:00:00Z
-    let epoch = parse_iso8601_basic("20260415T120000Z").unwrap();
-    // Verify against known value: 2026-04-15 is day 1,776,528,000 from epoch
-    // (verified with external tool)
-    assert!(epoch > 0);
-    // 2015-08-30T12:36:00Z — from AWS test vector
-    let epoch2 = parse_iso8601_basic("20150830T123600Z").unwrap();
-    assert!(epoch2 > 0);
-    assert!(epoch > epoch2); // 2026 > 2015
-}
-
-#[test]
-fn parse_iso8601_basic_invalid() {
-    assert!(parse_iso8601_basic("2026-04-15T12:00:00Z").is_none());
-    assert!(parse_iso8601_basic("20260415T12000Z").is_none());
-    assert!(parse_iso8601_basic("").is_none());
+fn the_request_date_is_read_in_the_basic_and_the_extended_form() {
+    let rows = [
+        ("20261121T220642Z", Some("20261121T220642Z")),
+        ("2026-11-21T22:06:32Z", Some("20261121T220632Z")),
+        ("2026-11-21T22:06:33.123Z", Some("20261121T220633Z")),
+        ("2026-11-21T22:06:34.123456Z", Some("20261121T220634Z")),
+        ("2026-11-21T22:06:34+00:00", Some("20261121T220634Z")),
+        ("2026-11-21T23:06:35+01:00", Some("20261121T220635Z")),
+        ("2026-11-21T22:06:36", Some("20261121T220636Z")),
+        ("2026-11-21", Some("20261121T000000Z")),
+        ("20261121T220638.123Z", Some("20261121T220638Z")),
+        ("20261121T220639", Some("20261121T220639Z")),
+        ("2026-11-21T220639Z", Some("20261121T220639Z")),
+        ("20261121T22:06:40Z", Some("20261121T220640Z")),
+        ("2026-11-22T01:07:13+03:00", Some("20261121T220713Z")),
+        ("2026-11-21T17:08:02-05:00", Some("20261121T220802Z")),
+        ("2026-11-21T23:08:02+0100", Some("20261121T220802Z")),
+        ("2026-11-21T23:08:03+01", Some("20261121T220803Z")),
+        ("2026-11-21T22:08:04.Z", Some("20261121T220804Z")),
+        ("2026-11-21t22:06:36z", None),
+        ("2026-11-21 22:06:37Z", None),
+        ("2026-11-21T22:08Z", None),
+        ("Sat, 21 Nov 2026 01:36:16 GMT", None),
+        // Five digits of time (measured 22 Nov 2026 00:52Z).
+        ("20261122T00524Z", None),
+        ("", None),
+        // Parts out of range and other forms (measured 22:56Z to 22:57Z).
+        ("2026-1121T22:56:13Z", None),
+        ("202611-21T22:56:14Z", None),
+        ("2026-11-21T22:5615Z", None),
+        ("2026-11-21Z", None),
+        ("2026-11-21T", Some("20261121T000000Z")),
+        ("2026-11-21T22:56:17,123Z", None),
+        ("20261121T2256Z", None),
+        ("2026-11-23T00:56:18+26:00", Some("20261121T225618Z")),
+        ("2026-11-22T00:56:19+01:60", Some("20261121T225619Z")),
+        ("20261399T000000Z", None),
+        ("20261121T240000Z", Some("20261122T000000Z")),
+        ("20261121T226000Z", Some("20261121T230000Z")),
+        ("20261121T225660Z", Some("20261121T225700Z")),
+        ("2026-02-30T22:56:22Z", Some("20260302T225622Z")),
+        ("20261321T225656Z", None),
+        ("20261199T225657Z", None),
+        ("20261100T225657Z", Some("20261031T225657Z")),
+        ("20261131T225658Z", Some("20261201T225658Z")),
+        ("20260021T225659Z", Some("20260121T225659Z")),
+        ("20261121T255659Z", None),
+        ("20261121T995700Z", None),
+        ("20261121T229901Z", None),
+        ("20261121T225799Z", None),
+        ("2026-11-21T22:57:02+99:00", Some("20261117T195702Z")),
+        ("2026-11-21T22:57:03+00:99", Some("20261121T211803Z")),
+        ("2026-11-21T24:00:00Z", Some("20261122T000000Z")),
+        ("2026-11-21TZ", None),
+    ];
+    for (value, want) in rows {
+        let got = parse_request_date(value).map(basic_form);
+        assert_eq!(got.as_deref(), want, "{value:?}");
+    }
 }
 
 #[test]
@@ -160,22 +206,86 @@ fn check_scope_refuses_a_timestamp_too_short_to_carry_a_date() {
     }
 }
 
-/// `validate_timestamp` hands the `X-Amz-Date` value back so the caller
-/// compares the scope date against the same string.
+/// `validate_timestamp` hands the request date back in the UTC basic
+/// form, whatever form the header sent, so the caller compares the scope
+/// date against the date the service would use (measured 2026-11-21: a
+/// scope date of the UTC day passes for `2026-11-22T01:07:13+03:00`,
+/// the local day does not).
 #[test]
-fn validate_timestamp_returns_the_header_value() {
-    let now = time::OffsetDateTime::now_utc();
-    let value = format!(
-        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
-        now.year(),
-        now.month() as u8,
-        now.day(),
-        now.hour(),
-        now.minute(),
-        now.second(),
-    );
-    let headers = make_headers(&value);
-    assert_eq!(validate_timestamp(&headers).unwrap(), value);
+fn validate_timestamp_returns_the_utc_basic_form() {
+    let now = time::OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .unwrap();
+    let plus_three = now.to_offset(time::UtcOffset::from_hms(3, 0, 0).unwrap());
+    let rfc3339 = time::format_description::well_known::Rfc3339;
+    for value in [
+        basic_form(now),
+        now.format(&rfc3339).unwrap(),
+        plus_three.format(&rfc3339).unwrap(),
+    ] {
+        let headers = make_headers(&value);
+        assert_eq!(
+            validate_timestamp(&headers).unwrap(),
+            basic_form(now),
+            "{value}"
+        );
+    }
+}
+
+/// Measured 2026-11-21 and 22 with signed ListTables requests: a request
+/// whose `X-Amz-Date` is in the extended form, or carries a second or a
+/// minute of 60, verifies when the date line of the string to sign is the
+/// UTC basic form of the instant read, fraction dropped, and fails as a
+/// signature mismatch when it is the value as sent or the local time. The
+/// `x-amz-date` canonical header keeps the value as sent.
+#[test]
+fn the_string_to_sign_carries_the_utc_basic_form_of_the_request_date() {
+    let rows = [
+        ("2026-04-15T12:00:00Z", "20260415T120000Z", true),
+        ("2026-04-15T12:00:00Z", "2026-04-15T12:00:00Z", false),
+        ("2026-04-15T12:00:00.123Z", "20260415T120000Z", true),
+        (
+            "2026-04-15T12:00:00.123Z",
+            "2026-04-15T12:00:00.123Z",
+            false,
+        ),
+        ("2026-04-15T12:00:00+00:00", "20260415T120000Z", true),
+        (
+            "2026-04-15T12:00:00+00:00",
+            "2026-04-15T12:00:00+00:00",
+            false,
+        ),
+        ("2026-04-15T15:00:00+03:00", "20260415T120000Z", true),
+        ("2026-04-15T15:00:00+03:00", "20260415T150000Z", false),
+        // A second of 60 reads as the next minute, a minute of 60 as the
+        // next hour, and the date line is that instant (22 Nov 2026 00:52Z:
+        // `20261122T005260Z` signed as `20261122T005300Z` answered 200 and
+        // signed as sent a mismatch; `20261122T006050Z` as `20261122T010050Z`
+        // answered 200 and `20261122T006051Z` as sent a mismatch).
+        ("20260415T120060Z", "20260415T120100Z", true),
+        ("20260415T120060Z", "20260415T120060Z", false),
+        ("20260415T126050Z", "20260415T130050Z", true),
+        ("20260415T126051Z", "20260415T126051Z", false),
+    ];
+    for (sent, date_line, verifies) in rows {
+        let headers = make_headers(sent);
+        let signed = "content-type;host;x-amz-date";
+        let parsed = sign_with_date(&headers, signed, SIGNED_BODY, date_line);
+        let result = verify_signature(
+            &parsed,
+            &key(SECRET),
+            "POST",
+            "/",
+            "",
+            &headers,
+            SIGNED_BODY,
+        );
+        if verifies {
+            result.unwrap_or_else(|e| panic!("{sent} signed as {date_line}: {e:?}"));
+        } else {
+            assert_signature_mismatch(result);
+        }
+    }
 }
 
 /// CB-6: Reject SignedHeaders missing "host".
@@ -266,12 +376,19 @@ const TAMPERED_BODY: &[u8] = br#"{"TableName":"t","Item":{"pk":{"S":"tampered"}}
 /// Sign `body` the way a client does: the same canonical request and
 /// string-to-sign the server reconstructs, over the body the client sent.
 fn sign(headers: &HeaderMap, signed_headers: &str, body: &[u8]) -> ParsedAuthorization {
+    sign_with_date(headers, signed_headers, body, "20260415T120000Z")
+}
+
+/// `sign` with `date_line` as the date line of the string to sign.
+fn sign_with_date(
+    headers: &HeaderMap,
+    signed_headers: &str,
+    body: &[u8],
+    date_line: &str,
+) -> ParsedAuthorization {
     let creq = canonical::canonical_request("POST", "/", "", headers, signed_headers, body);
-    let sts = canonical::string_to_sign(
-        "20260415T120000Z",
-        "20260415/us-east-1/dynamodb/aws4_request",
-        &creq,
-    );
+    let sts =
+        canonical::string_to_sign(date_line, "20260415/us-east-1/dynamodb/aws4_request", &creq);
     let mut parsed = make_parsed("dynamodb", "20260415", signed_headers);
     parsed.signature = signing_key::compute_signature(&key(SECRET), &sts);
     parsed

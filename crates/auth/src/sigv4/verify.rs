@@ -109,7 +109,7 @@ pub fn verify_signature(
     // CB-5: Validate credential-scope date matches the request date[..8]. The
     // pre-lookup check_scope compares it too; this keeps the refusal for a
     // caller that verifies a signature on its own.
-    let timestamp = extract_timestamp(headers)?;
+    let timestamp = basic_form(request_instant(headers)?);
     if !scope_date_matches(&parsed.date, &timestamp) {
         return Err(DynamoDbError::InvalidSignatureException(
             SCOPE_DATE_COMPLAINT.to_owned(),
@@ -158,27 +158,23 @@ pub fn verify_signature(
 
 /// Validate the request timestamp is within ±15 minutes of now.
 ///
-/// Returns the request date (see `request_date`), which the caller passes to
-/// `check_scope`.
+/// Returns the request date in the UTC basic form (see `basic_form`), which
+/// the caller passes to `check_scope`.
 ///
-/// Returns `UnrecognizedClientException` if the timestamp is missing or out of range.
-/// Returns `InternalServerError` if the system clock is misconfigured.
+/// Returns `IncompleteSignature` if the timestamp is missing or in a form
+/// the service does not read (see `request_instant`),
+/// `UnrecognizedClientException` if it is out of range, and
+/// `InternalServerError` if the system clock is misconfigured.
 pub fn validate_timestamp(headers: &HeaderMap) -> Result<String, DynamoDbError> {
-    let timestamp = extract_timestamp(headers)?;
+    let request = request_instant(headers)?;
 
-    // Parse X-Amz-Date: YYYYMMDDTHHMMSSZ
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .and_then(|d| i64::try_from(d.as_secs()).ok())
         .ok_or_else(|| DynamoDbError::InternalServerError("server clock error".to_owned()))?;
 
-    let request_epoch = parse_iso8601_basic(&timestamp).ok_or_else(|| {
-        // Measured 2026-11-21: the service echoes the value it refuses.
-        DynamoDbError::IncompleteSignature(format!(
-            "Date must be in ISO-8601 'basic format'. Got '{timestamp}'. See http://en.wikipedia.org/wiki/ISO_8601"
-        ))
-    })?;
+    let request_epoch = request.unix_timestamp();
 
     let skew = (now - request_epoch).abs();
     if skew > MAX_CLOCK_SKEW_SECS {
@@ -187,7 +183,21 @@ pub fn validate_timestamp(headers: &HeaderMap) -> Result<String, DynamoDbError> 
         ));
     }
 
-    Ok(timestamp)
+    Ok(basic_form(request))
+}
+
+/// The instant the request date names (see `request_date`).
+///
+/// Returns `IncompleteSignature` when the request has no date, or a date in
+/// a form the service does not read (see `parse_request_date`).
+fn request_instant(headers: &HeaderMap) -> Result<time::OffsetDateTime, DynamoDbError> {
+    let timestamp = extract_timestamp(headers)?;
+    parse_request_date(&timestamp).ok_or_else(|| {
+        // Measured 2026-11-21: the service echoes the value it refuses.
+        DynamoDbError::IncompleteSignature(format!(
+            "Date must be in ISO-8601 'basic format'. Got '{timestamp}'. See http://en.wikipedia.org/wiki/ISO_8601"
+        ))
+    })
 }
 
 /// Extract the timestamp from `X-Amz-Date` header.
@@ -211,28 +221,104 @@ pub(crate) fn request_date(headers: &HeaderMap) -> Option<&str> {
         .filter(|v| !v.is_empty())
 }
 
-/// Parse ISO 8601 basic format `YYYYMMDDTHHMMSSZ` to Unix epoch seconds.
-fn parse_iso8601_basic(s: &str) -> Option<i64> {
-    if s.len() != 16 || !s.ends_with('Z') || s.as_bytes()[8] != b'T' {
+/// Parse the request date as the service reads it (measured 2026-11-21 in
+/// us-east-1), to the instant in UTC. The date is `YYYYMMDD` or
+/// `YYYY-MM-DD`; the time, after an upper-case `T`, is `HHMMSS` or
+/// `HH:MM:SS`, each form chosen on its own (`2026-11-21T220639Z` and
+/// `20261121T22:06:40Z` are read), then an optional fraction (a `.` and any
+/// digits, none included) and an optional zone (`Z`, or an offset of two
+/// digits of hours and optional two digits of minutes: `+01:00`, `+0100`,
+/// `+01`); no zone is UTC. A date alone, or with a `T` and nothing after
+/// it, is midnight UTC. Each part is checked against a limit (month 12, day
+/// 31, hour 24, minute 60, second 60, offset 99 hours and 99 minutes) and
+/// the parts are then added up with no calendar check: month 00 is January,
+/// day 00 is the day before the first, `2026-02-30` is 2 March and
+/// `T24:00:00` is the next midnight. A part over its limit, a lower-case
+/// `t` or `z`, a space for `T`, a `,` before the fraction, a time without
+/// seconds and a `T` followed by a zone alone are refused.
+fn parse_request_date(s: &str) -> Option<time::OffsetDateTime> {
+    let (year, month, day, rest) = three(s, 4, '-')?;
+    if month > 12 || day > 31 {
         return None;
     }
-    let year: i64 = s[0..4].parse().ok()?;
-    let month: i64 = s[4..6].parse().ok()?;
-    let day: i64 = s[6..8].parse().ok()?;
-    let hour: i64 = s[9..11].parse().ok()?;
-    let min: i64 = s[11..13].parse().ok()?;
-    let sec: i64 = s[13..15].parse().ok()?;
 
-    // Days-since-epoch via Howard Hinnant's date algorithm (general, not range-limited).
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y / 400;
-    let yoe = y - era * 400;
-    let m = if month > 2 { month - 3 } else { month + 9 };
-    let doy = (153 * m + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
+    let (clock, rest) = match rest.strip_prefix('T') {
+        None if !rest.is_empty() => return None,
+        None | Some("") => (0, ""),
+        Some(rest) => {
+            let (hour, minute, second, rest) = three::<u8>(rest, 2, ':')?;
+            if hour > 24 || minute > 60 || second > 60 {
+                return None;
+            }
+            let rest = rest
+                .strip_prefix('.')
+                .map_or(rest, |f| f.trim_start_matches(|c: char| c.is_ascii_digit()));
+            let clock = i64::from(hour) * 3600 + i64::from(minute) * 60 + i64::from(second);
+            (clock, rest)
+        }
+    };
 
-    Some(days * 86400 + hour * 3600 + min * 60 + sec)
+    let offset = match rest {
+        "" | "Z" => 0,
+        _ => {
+            let (sign, rest) = match rest.strip_prefix('+') {
+                Some(rest) => (1, rest),
+                None => (-1, rest.strip_prefix('-')?),
+            };
+            let (hours, rest) = digits::<i64>(rest, 2)?;
+            let (minutes, rest) =
+                digits(rest.strip_prefix(':').unwrap_or(rest), 2).unwrap_or((0, rest));
+            if !rest.is_empty() {
+                return None;
+            }
+            sign * (hours * 3600 + minutes * 60)
+        }
+    };
+
+    time::Date::from_calendar_date(year, time::Month::try_from(month.max(1)).ok()?, 1)
+        .ok()?
+        .checked_add(time::Duration::days(i64::from(day) - 1))?
+        .midnight()
+        .assume_utc()
+        .checked_add(time::Duration::seconds(clock - offset))
+}
+
+/// Three numbers, the first of `first` digits and the others of two, with
+/// `sep` between them (the extended form) or nothing (the basic form), and
+/// the rest of `s`. A separator at one of the two places only is refused.
+fn three<T: std::str::FromStr>(s: &str, first: usize, sep: char) -> Option<(T, u8, u8, &str)> {
+    let (a, rest) = digits(s, first)?;
+    let ext = rest.starts_with(sep);
+    let (b, rest) = digits(rest.strip_prefix(sep).unwrap_or(rest), 2)?;
+    let rest = if ext { rest.strip_prefix(sep)? } else { rest };
+    let (c, rest) = digits(rest, 2)?;
+    Some((a, b, c, rest))
+}
+
+/// The leading `n` ASCII digits of `s` as a number, and the rest of `s`.
+fn digits<T: std::str::FromStr>(s: &str, n: usize) -> Option<(T, &str)> {
+    let (head, rest) = s.split_at_checked(n)?;
+    if !head.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((head.parse().ok()?, rest))
+}
+
+/// The UTC `YYYYMMDDTHHMMSSZ` form of `instant`, fraction dropped. The
+/// service uses it for the skew check, the scope date and the date line of
+/// the string to sign, whatever form the request sent (measured 2026-11-21);
+/// the `x-amz-date` and `date` canonical headers keep the value as sent.
+pub(crate) fn basic_form(instant: time::OffsetDateTime) -> String {
+    let utc = instant.to_offset(time::UtcOffset::UTC);
+    format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        utc.year(),
+        utc.month() as u8,
+        utc.day(),
+        utc.hour(),
+        utc.minute(),
+        utc.second(),
+    )
 }
 
 /// Constant-time byte comparison to prevent timing attacks, through AWS-LC's

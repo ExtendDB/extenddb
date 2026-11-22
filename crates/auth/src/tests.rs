@@ -30,16 +30,7 @@ impl CredentialStore for MockCredentialStore {
 fn make_headers_with_auth(access_key: &str, token: Option<&str>) -> HeaderMap {
     let mut headers = HeaderMap::new();
     // Use current time for the date to pass timestamp validation.
-    let now = time::OffsetDateTime::now_utc();
-    let date_str = format!(
-        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
-        now.year(),
-        now.month() as u8,
-        now.day(),
-        now.hour(),
-        now.minute(),
-        now.second(),
-    );
+    let date_str = sigv4::verify::basic_form(time::OffsetDateTime::now_utc());
     let date_short = &date_str[..8];
     // Signature is fake — these tests exercise error paths (expired token,
     // unknown key) that trigger before signature verification in
@@ -339,16 +330,8 @@ fn provider_without_credentials() -> BuiltinAuthProvider {
 /// date in the `Authorization` header to match.
 fn make_date_stale(headers: &mut HeaderMap) {
     let fresh = headers["x-amz-date"].to_str().unwrap().to_owned();
-    let stale = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
-    let stale_str = format!(
-        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
-        stale.year(),
-        stale.month() as u8,
-        stale.day(),
-        stale.hour(),
-        stale.minute(),
-        stale.second(),
-    );
+    let stale_str =
+        sigv4::verify::basic_form(time::OffsetDateTime::now_utc() - time::Duration::hours(1));
     let auth = headers["authorization"]
         .to_str()
         .unwrap()
