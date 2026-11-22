@@ -16,50 +16,24 @@
 //!
 //! # Operations the browser build cannot serve
 //!
-//! Some operations need a facility the in-memory browser build does not have.
-//! The adapter's own policy, in [`Engine::dispatch`], applies on both targets,
-//! so the native build and the wasm build refuse the same requests with the
-//! same error:
+//! [`Engine::dispatch`] applies the adapter's own policy, which is the same on
+//! both targets:
 //!
-//! - **Refused on both targets** with a `ValidationException` that names the
-//!   build: the operations [`unsupported_reason`] names, each for the reason
-//!   its documentation gives. The refusal goes by the operation name alone,
-//!   before the body is parsed, so a body that is not JSON gets it too, where
-//!   the server answers `SerializationException`.
-//! - **Refused as the server refuses them**: every
-//!   `RestoreTableToPointInTime`, and an `UpdateContinuousBackups` that enables
-//!   point-in-time recovery, through `extenddb_engine::parse_request` and
-//!   `ParsedRequest::admit`, the pre-dispatch checks the
-//!   server applies too (the server also authenticates between them; this
-//!   build authenticates no request). They run before any table is read.
-//! - **Passed through** to the engine's handlers: everything else, including
-//!   the data-plane operations, `DescribeTable` / `ListTables`, streams,
-//!   time-to-live, tagging, every `UpdateTable`, the backup operations,
-//!   `DescribeContinuousBackups`, an `UpdateContinuousBackups` that does not
-//!   enable point-in-time recovery, and `ImportTable` /
-//!   `ExportTableToPointInTime`.
-//!   The adapter configures no backup store and no import or export paths, so
-//!   `CreateBackup` backs a table up in the catalog, as a server with no
-//!   backup store does, and the import and export handlers answer that the
-//!   operation is disabled.
+//! 1. It refuses the operations [`unsupported_reason`] names, with a
+//!    `ValidationException` that names the build, each for the reason its
+//!    documentation gives. The refusal goes by the operation name alone,
+//!    before the body is parsed, so a body that is not JSON gets it too, where
+//!    the server answers `SerializationException`.
+//! 2. It runs `extenddb_engine::parse_request` and `ParsedRequest::admit`, the
+//!    pre-dispatch checks the server applies too (the server also
+//!    authenticates between them; this build authenticates no request).
+//! 3. It passes the request to [`extenddb_engine::dispatch`], with no backup
+//!    store and no import or export paths configured.
 //!
-//! Two refusals are not made here, and differ between the targets:
-//!
-//! - An `UpdateTable` that creates a vector index. The engine validates the
-//!   request first, so a missing table or a malformed `Create` gets the
-//!   engine's answer on both targets. The `SQLite` backend then starts the
-//!   index backfill natively, as the server does. On wasm it has no task
-//!   runtime to run the backfill, so it refuses the create with a
-//!   `ValidationException` that names the build, before the catalog commit,
-//!   and the table is left as it was.
-//! - The four store-backed backup operations (`CreateBackup`,
-//!   `DescribeBackup`, `DeleteBackup`, `RestoreTableFromBackup`). Natively the
-//!   engine's backup handlers answer them. The engine's backup subsystem does
-//!   not build for wasm32, so there the engine refuses them, after the body
-//!   parse, with a `ValidationException` that names the build.
-//!
-//! The other handlers compile for wasm32 too, so a malformed request gets the
-//! handler's own validation answer on both targets.
+//! On wasm32 the engine and the `SQLite` backend refuse some requests after
+//! that, where the code that would serve them is not compiled or cannot run
+//! there. The README section "What it refuses" lists every request this build
+//! refuses, with its error.
 //!
 //! # Checks the HTTP server makes that this build does not
 //!
