@@ -48,7 +48,8 @@ pub async fn handle_delete_item(
         ],
     )?;
     crate::validate_put_delete_return_values(&body)?;
-    let input: DeleteItemInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
+    let input: DeleteItemInput = serde_json::from_value(body)
+        .map_err(|e| crate::single_write_refusal(crate::deserialize_error(e)))?;
 
     extenddb_core::validation::validate_table_name(&input.table_name, &ctx.limits)?;
     // A number the service cannot read in the key comes next, ahead of the

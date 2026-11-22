@@ -48,10 +48,7 @@ impl Serialize for AttributeValue {
             Self::B(v) => map.serialize_entry("B", &BASE64.encode(v))?,
             Self::SS(v) => map.serialize_entry("SS", &v.iter().collect::<Vec<_>>())?,
             Self::NS(v) => map.serialize_entry("NS", &v.iter().collect::<Vec<_>>())?,
-            Self::BS(v) => {
-                let encoded: Vec<String> = v.iter().map(|b| BASE64.encode(b)).collect();
-                map.serialize_entry("BS", &encoded)?;
-            }
+            Self::BS(v) => map.serialize_entry("BS", &encoded(v))?,
             Self::Bool(v) => map.serialize_entry("BOOL", v)?,
             Self::Null => map.serialize_entry("NULL", &true)?,
             Self::L(v) => map.serialize_entry("L", v)?,
@@ -325,6 +322,114 @@ fn from_descriptor(key: &str, value: serde_json::Value) -> Result<AttributeValue
     }
 }
 
+/// The start of the duplicates text of a set.
+const INVALID: &str = "One or more parameter values were invalid: ";
+
+/// The text `BatchWriteItem` and a PartiQL parameter give for a number set
+/// two of whose members have one value, at any depth (measured 2026-11-06
+/// and 2026-11-22: `{"NS": ["1", "1.0"]}` and `{"NS": ["1", "1"]}`). The
+/// other operations give it after [`INVALID`] and with a period.
+pub const NUMBER_SET_DUPLICATES: &str = "Input collection contains duplicates";
+
+/// The members of a set as the service lists them in its duplicates text:
+/// the members ahead of the first one equal to an earlier one, sorted, then
+/// that member and the members after it, as sent. `None` when no member
+/// repeats. Measured 2026-11-22: `[b, a, b]` is listed as `[a, b, b]`,
+/// `[b, a, a]` as `[a, b, a]` and `[c, b, a, b]` as `[a, b, c, b]`. A `BS`
+/// compares its bytes unsigned and an `SS` its code points.
+fn listed<T: Ord + Clone>(members: &[T]) -> Option<Vec<T>> {
+    let mut ahead = BTreeSet::new();
+    let repeat = members.iter().position(|member| !ahead.insert(member))?;
+    Some(
+        ahead
+            .into_iter()
+            .chain(&members[repeat..])
+            .cloned()
+            .collect(),
+    )
+}
+
+/// The duplicates text of a set of type `tag`, `SS` or `BS`, with its
+/// members printed as `list`.
+fn duplicates_text(tag: &str, list: &str) -> String {
+    let of_type = if tag == "BS" { "of type BS" } else { "" };
+    format!("{INVALID}Input collection {list}{of_type} contains duplicates.")
+}
+
+/// Each member of a `BS` as the padded base64 of its bytes.
+fn encoded(members: impl IntoIterator<Item = impl AsRef<[u8]>>) -> Vec<String> {
+    members.into_iter().map(|b| BASE64.encode(b)).collect()
+}
+
+/// Whether `message` is a duplicates text of the deserializer that lists the
+/// members as [`listed`] does, or a number set's, which names no member.
+/// `PutItem`, `UpdateItem` and `DeleteItem` give such a text after
+/// `1 validation error detected: `, and the other operations without it
+/// (measured 2026-11-22). The text of a `BS` with a member that only the
+/// second reading decodes lists the members as sent and is no such text.
+#[must_use]
+pub fn is_listed_duplicates(message: &str) -> bool {
+    message.strip_prefix(INVALID).is_some_and(|text| {
+        text.strip_prefix(NUMBER_SET_DUPLICATES) == Some(".")
+            || (text.starts_with("Input collection [\"") && text.ends_with(" contains duplicates."))
+    })
+}
+
+/// The duplicates text of a set of type `tag` with the JSON `members`, the
+/// members as sent, when one repeats: the text of `BatchWriteItem` and of a
+/// PartiQL parameter (measured 2026-11-22 and 2026-11-06). `None` when no
+/// member repeats, and for a member that is not a string or a `BS` member
+/// that [`decode_padded_base64`] refuses, which the deserializer refuses.
+#[must_use]
+pub fn duplicates_as_sent(tag: &str, members: &[serde_json::Value]) -> Option<String> {
+    let texts: Vec<&str> = members
+        .iter()
+        .map(serde_json::Value::as_str)
+        .collect::<Option<_>>()?;
+    match tag {
+        "SS" => listed(&texts).map(|_| duplicates_text(tag, &format!("[{}]", texts.join(", ")))),
+        "NS" => {
+            let numbers: Vec<String> = texts
+                .iter()
+                .map(|text| {
+                    crate::validation::number::validate_and_normalize_number(text)
+                        .unwrap_or_else(|_| (*text).to_owned())
+                })
+                .collect();
+            listed(&numbers).map(|_| NUMBER_SET_DUPLICATES.to_owned())
+        }
+        "BS" => {
+            let bytes = texts
+                .iter()
+                .map(|text| decode_padded_base64(text))
+                .collect::<Result<Vec<_>, _>>()
+                .ok()?;
+            listed(&bytes)
+                .map(|_| duplicates_text(tag, &format!("[{}]", encoded(&bytes).join(", "))))
+        }
+        _ => None,
+    }
+}
+
+/// The text [`duplicates_as_sent`] gives for the first set in a wire value,
+/// at any depth, that holds a member twice, visited in the order the
+/// deserializer reads the value. Any other payload is walked. An `NS` is not
+/// compared, as [`NUMBER_SET_DUPLICATES`] names no member.
+#[must_use]
+pub fn first_duplicates_as_sent(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Object(members) => members.iter().find_map(|(tag, payload)| {
+            payload
+                .as_array()
+                .filter(|_| tag != "NS")
+                .and_then(|set| duplicates_as_sent(tag, set))
+                .or_else(|| first_duplicates_as_sent(payload))
+        }),
+        serde_json::Value::Array(items) => items.iter().find_map(first_duplicates_as_sent),
+        _ => None,
+    }
+}
+
 /// The payload of an `SS`.
 fn string_set(value: &serde_json::Value) -> Result<AttributeValue, String> {
     let arr = value
@@ -335,27 +440,22 @@ fn string_set(value: &serde_json::Value) -> Result<AttributeValue, String> {
             "One or more parameter values were invalid: An string set  may not be empty".to_owned(),
         );
     }
-    let set: BTreeSet<String> = arr
+    let members: Vec<&str> = arr
         .iter()
         .map(|v| {
-            v.as_str()
-                .map(std::borrow::ToOwned::to_owned)
-                .ok_or_else(|| {
-                    "One or more parameter values were invalid: An string set may not have a null string as a member".to_owned()
-                })
+            v.as_str().ok_or_else(|| {
+                "One or more parameter values were invalid: An string set may not have a null string as a member".to_owned()
+            })
         })
         .collect::<Result<_, _>>()?;
-    let values: Vec<String> = arr
-        .iter()
-        .filter_map(|v| v.as_str().map(std::borrow::ToOwned::to_owned))
-        .collect();
-    if values.len() != set.len() {
-        let repr = values.join(", ");
-        return Err(format!(
-            "One or more parameter values were invalid: Input collection [{repr}] contains duplicates."
-        ));
+    // Listed as Rust's `Debug` prints a list of strings (measured
+    // 2026-11-22: U+E000 is printed as `\u{e000}`).
+    if let Some(listed) = listed(&members) {
+        return Err(duplicates_text("SS", &format!("{listed:?}")));
     }
-    Ok(AttributeValue::SS(set))
+    Ok(AttributeValue::SS(
+        members.into_iter().map(str::to_owned).collect(),
+    ))
 }
 
 /// The payload of an `NS`.
@@ -377,11 +477,7 @@ fn number_set(value: &serde_json::Value) -> Result<AttributeValue, String> {
         })
         .collect::<Result<_, String>>()?;
     if set.len() != arr.len() {
-        let values: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
-        let repr = values.join(", ");
-        return Err(format!(
-            "One or more parameter values were invalid: Input collection [{repr}] contains duplicates."
-        ));
+        return Err(format!("{INVALID}{NUMBER_SET_DUPLICATES}."));
     }
     Ok(AttributeValue::NS(set))
 }
@@ -396,31 +492,29 @@ fn binary_set(value: &serde_json::Value) -> Result<AttributeValue, String> {
             "One or more parameter values were invalid: Binary sets should not be empty".to_owned(),
         );
     }
-    let set: BTreeSet<Vec<u8>> = arr
+    let members: Vec<Vec<u8>> = arr
         .iter()
         .map(|v| {
             let b64 = v.as_str().ok_or_else(|| EMPTY_ATTRIBUTE_VALUE.to_owned())?;
             decode_base64(b64)
         })
         .collect::<Result<_, _>>()?;
-    if set.len() != arr.len() {
-        // Each member as the base64 of its bytes (measured 2026-11-21:
-        // `["Y=Q=", "//Q="]` prints `[//Q=, //Q=]`).
-        let values = arr
-            .iter()
-            .filter_map(|v| v.as_str())
-            .map(|text| decode_base64(text).map(|bytes| BASE64.encode(bytes)))
-            .collect::<Result<Vec<_>, _>>()?;
-        let repr = values.join(", ");
-        // The binary form names the set type, with the service's
-        // own missing space before 'of' ("...]of type BS...") --
-        // invariant across regions; the S and N set forms do not
-        // name a type.
-        return Err(format!(
-            "One or more parameter values were invalid: Input collection [{repr}]of type BS contains duplicates."
-        ));
-    }
-    Ok(AttributeValue::BS(set))
+    let Some(listed) = listed(&members) else {
+        return Ok(AttributeValue::BS(members.into_iter().collect()));
+    };
+    // With a member that only the second reading decodes, wherever it
+    // stands, the members as sent, each as the base64 of its bytes. Else the
+    // JSON array of the listed members (measured 2026-11-21 and 2026-11-22).
+    let second_reading = arr
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .any(|text| UNPADDED.decode(text).is_err());
+    let list = if second_reading {
+        format!("[{}]", encoded(&members).join(", "))
+    } else {
+        serde_json::Value::from(encoded(&listed)).to_string()
+    };
+    Err(duplicates_text("BS", &list))
 }
 
 #[cfg(test)]

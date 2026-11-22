@@ -62,7 +62,7 @@ fn b_key() -> Value {
 /// A context on a bootstrapped `SqliteEngine` in a scratch directory, in the
 /// account it bootstrapped, creating its tables ACTIVE. The directory lives
 /// as long as the returned guard.
-async fn context() -> (OperationContext, TempDir) {
+pub(super) async fn context() -> (OperationContext, TempDir) {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let config = SqliteConfig {
         path: dir.path().join("catalog.sqlite").display().to_string(),

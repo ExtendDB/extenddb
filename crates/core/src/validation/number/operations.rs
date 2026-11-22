@@ -52,7 +52,7 @@ use crate::types::{
 };
 
 /// The prefix `PutItem`, `UpdateItem` and `DeleteItem` put on the message.
-const SINGLE_WRITE_PREFIX: &str = "1 validation error detected: ";
+pub const SINGLE_WRITE_PREFIX: &str = "1 validation error detected: ";
 
 /// The text an operation gives for an empty number.
 #[derive(Clone, Copy)]
