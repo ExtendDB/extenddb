@@ -103,7 +103,9 @@ item; inside a function, rustc's non_local_definitions lint, an error under the
 step's -D warnings, reports such an impl of a type defined outside it.
 
 The runs use the caller's cargo target directory; nothing else of the
-caller's working tree is written. The copy is removed on exit, also on
+caller's working tree is written. Every command the guard starts runs with
+CARGO_TERM_COLOR=always, and each cargo command whose output it reads with
+--color never. The copy is removed on exit, also on
 SIGINT, SIGTERM and SIGHUP, and a clippy run is stopped with it. Needs Python
 3.11 or later (for tomllib) and git; exit status 0 means every check passed.
 """
@@ -130,11 +132,11 @@ CONF_REL = "devtools/wasm-clippy"
 CONFIG_REL = f"{CONF_REL}/clippy.toml"
 ADAPTER = "extenddb-wasm-adapter"
 TARGET = "wasm32-unknown-unknown"
-# The clippy step of .github/workflows/wasm.yml, with JSON messages. Started
-# from the root of a tree, devtools/run-wasm-step points CLIPPY_CONF_DIR at that
-# tree's devtools/wasm-clippy and passes the options after a `--` to clippy
-# after its own.
-CLIPPY = ["devtools/run-wasm-step", "clippy", "--message-format=json"]
+# The clippy step of .github/workflows/wasm.yml, with JSON messages and no
+# colour. Started from the root of a tree, devtools/run-wasm-step points
+# CLIPPY_CONF_DIR at that tree's devtools/wasm-clippy, passes the options after
+# the step's name to cargo, and those after a `--` to clippy after its own.
+CLIPPY = ["devtools/run-wasm-step", "clippy", "--color", "never", "--message-format=json"]
 DISALLOWED = ("clippy::disallowed_methods", "clippy::disallowed_types")
 AWAIT = ("clippy::await_holding_lock", "clippy::await_holding_refcell_ref")
 # A force-warned lint is reported, as a warning, whatever setting would switch
@@ -476,7 +478,8 @@ def config_problems(text: str, probes: dict[str, dict[str, list[str]]]) -> list[
 def cargo_metadata() -> dict:
     try:
         run = subprocess.run(
-            ["cargo", "metadata", "--format-version", "1", "--locked", "--filter-platform", TARGET],
+            ["cargo", "metadata", "--color", "never", "--format-version", "1", "--locked"]
+            + ["--filter-platform", TARGET],
             cwd=ROOT,
             capture_output=True,
             text=True,
@@ -1328,7 +1331,7 @@ def adapter_graph(tree: Path) -> tuple[list[str], list[Finding]]:
     `package|features` line each. A package is written as cargo tree's {p}
     writes it: its name and version, then its source when it is not from
     crates.io, and `(proc-macro)` for a procedural macro."""
-    command = ["cargo", "tree", "--locked", "-p", ADAPTER]
+    command = ["cargo", "tree", "--color", "never", "--locked", "-p", ADAPTER]
     command += ["--target", TARGET, "-e", "normal", "--prefix", "none", "--format", "{p}|{f}"]
     try:
         run = subprocess.run(command, cwd=tree, capture_output=True, text=True, check=False)
@@ -1870,6 +1873,11 @@ def main() -> int:
     sys.stdout.reconfigure(line_buffering=True)
     for stop in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(stop, _stop)
+    # The workflow's toolchain action exports CARGO_TERM_COLOR=always to the
+    # steps after it, and under it cargo tree writes escape codes into its
+    # lines. Set for every command the guard starts, it makes a read that the
+    # setting changes fail on every machine, not only in CI.
+    os.environ["CARGO_TERM_COLOR"] = "always"
     metadata = cargo_metadata()
     crates = wasm_crates(metadata)
     print(f"crates the wasm build compiles: {', '.join(sorted(crates))}")
