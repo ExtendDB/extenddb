@@ -23,13 +23,14 @@
 # (on stderr, after "+ "), and looks up cargo, wasm-pack, node and Python on
 # PATH, so the caller chooses the toolchain and the Node version. In the
 # workflow, its setup steps make the toolchain it pins rustup's default and
-# put the Node version it names on PATH. A local run needs what those steps
-# install: that toolchain with the wasm32-unknown-unknown target and clippy,
-# a clang, a Node of that major version, and the wasm-bindgen-cli and
-# wasm-pack versions the workflow's install step names (the guard step's case
-# below says which Python it needs). With rustup's cargo the first cargo on
-# PATH, setting RUSTUP_TOOLCHAIN to the workflow's `toolchain:` selects that
-# toolchain; put the Node first on PATH, for example:
+# put the Node version it names on PATH. To run a step as the workflow runs
+# it, a local run uses what those steps install: that toolchain with the
+# wasm32-unknown-unknown target and clippy, a clang, a Node of that major
+# version, and the wasm-bindgen-cli and wasm-pack versions the workflow's
+# install step names (the guard step's case below says which Python it
+# needs). With rustup's cargo the first cargo on PATH, setting
+# RUSTUP_TOOLCHAIN to the workflow's `toolchain:` selects that toolchain; put
+# the Node first on PATH, for example:
 #
 #   RUSTUP_TOOLCHAIN=<toolchain> PATH=<directory of that node>:$PATH \
 #       devtools/run-wasm-step corpus
@@ -39,9 +40,9 @@ set -euo pipefail
 ADAPTER=extenddb-wasm-adapter
 TARGET=wasm32-unknown-unknown
 
-# The advice that the messages of the test and corpus steps give when they
-# find no wasm-bindgen of the right version. .github/workflows/wasm.yml writes
-# the version it installs by hand, so the advice names the two lines.
+# The advice that the test and corpus steps give when the wasm-bindgen-cli
+# they need is missing. .github/workflows/wasm.yml writes the version it
+# installs by hand, so the advice names the two lines.
 WASM_BINDGEN_CLI_HELP="install the wasm-bindgen-cli of the version of the wasm-bindgen crate in Cargo.lock (cargo install --locked --version <that version> wasm-bindgen-cli; what cargo pkgid wasm-bindgen prints ends with that version). .github/workflows/wasm.yml writes the version it installs by hand, in its \"Install wasm tooling\" step and in the key of its \"Cache wasm tooling\" step, so when the version in Cargo.lock changes, both must change with it"
 
 usage() {
