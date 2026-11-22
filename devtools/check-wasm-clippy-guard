@@ -30,9 +30,9 @@ calls the allow covers is for review.
 The script copies the working tree (the files git tracks or does not ignore,
 uncommitted edits included), plants probes and controls in the copy, and runs
 the clippy step there twice: as it is (W), and with --force-warn of the four
-lints (F), which reports each of them, as a warning, whatever setting would
-switch it off or lower it (of the lint settings, only --cap-lints silences a
-force-warned lint). It fails, with one line per problem, unless:
+lints (F), which reports each of them, as a warning, whatever lint setting
+would switch it off or lower it, in each crate clippy lints. It fails, with
+one line per problem, unless:
 1. each report of F, but those of the probes, is a disallowed call or type
    that an accepted allow covers as written (where the report points) and
    that W does not report; and F reports no await-holding lint;
@@ -73,11 +73,13 @@ the build. A control that does not give the finding it was planted for, and
 a finding no control expects, fail the guard. The environment and
 cargo-configuration checks are controlled on their control inputs only:
 handed an empty mapping or file list in place of the tree's, the guard would
-still pass. A wrapper that caps one crate's lints is caught all the same:
-under --cap-lints allow, clippy-driver skips that crate, whose dep-info
-check then fails; under --cap-lints warn, the step still reports the
-crate's disallowed calls that no accepted allow covers, as warnings, which
-item 1 refuses.
+still pass. A wrapper that caps one crate's lints is caught all the same.
+rustc reports a force-warned lint under --cap-lints as well, so F reports
+that crate's calls, and item 1 refuses those no accepted allow covers.
+clippy-driver, though, lints no crate whose own compiler options hold
+--cap-lints allow and no --force-warn of a clippy lint (the step's options,
+which reach it in CLIPPY_ARGS, do not count): that crate's dep-info then
+records no CLIPPY_CONF_DIR, which item 4 refuses.
 
 What it does not see is listed below. The headless parity corpus
 (`devtools/run-wasm-step corpus`), which runs the module under Node, finds a
@@ -90,7 +92,7 @@ trap in such code only on a path one of its cases takes.
   build does not; and code compiled only under a feature the adapter's
   wasm32 build does not enable;
 - calls a dependency makes in its own code, which clippy does not lint: moka
-  0.12.15 calls std::time::Instant::now() when a cache is built
+  calls std::time::Instant::now() when a cache is built
   (src/common/time/clock.rs), so building an extenddb-cache SwrCache with
   SwrCache::try_new or SwrCache::new traps on wasm32 while the step passes
   (only the server builds one today);
@@ -147,15 +149,16 @@ TARGET = "wasm32-unknown-unknown"
 CLIPPY = ["devtools/run-wasm-step", "clippy", "--color", "never", "--message-format=json"]
 DISALLOWED = ("clippy::disallowed_methods", "clippy::disallowed_types")
 AWAIT = ("clippy::await_holding_lock", "clippy::await_holding_refcell_ref")
-# A force-warned lint is reported, as a warning, whatever setting would switch
-# it off or lower it; of the lint settings, only --cap-lints silences it.
+# The options of the docstring's run F.
 FORCE_WARN = [arg for lint in DISALLOWED + AWAIT for arg in ("--force-warn", lint)]
 # cargo clippy hands clippy-driver the options after `--` in CLIPPY_ARGS, each
 # followed by this separator (clippy 0.1.97), and rustc records the value in the
 # crate's dep-info.
 CLIPPY_ARGS_SEPARATOR = "__CLIPPY_HACKERY__"
-# A crate the wasm build compiles that depends directly on every crate a probe
-# names (tokio, time, futures). The probes and most controls go into it.
+# The crate of the wasm build that the guard plants every probe in, so a probe
+# can call only what this crate can, such as std and the crates it depends on
+# directly (tokio, time and futures among them). CONTROLS, OTHER_FILE_CONTROLS
+# and RELEASE_CONTROL go into it too.
 PROBE_CRATE = "extenddb-storage"
 CONFIG_WARNINGS = (
     "does not refer to a reachable",

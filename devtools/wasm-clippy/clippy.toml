@@ -53,7 +53,10 @@
 # -D warnings does not turn into an error. devtools/check-wasm-clippy-guard,
 # which the workflow runs after the clippy step, fails on such a path and on
 # an entry with no probe in that script; its documentation states the rest of
-# what it checks.
+# what it checks. The script plants every probe in one crate, its PROBE_CRATE,
+# so an entry can name only a method that crate can call or a type it can use:
+# listing one of a crate it does not depend on needs that dependency in the
+# probe crate too.
 
 disallowed-methods = [
     # Clock
