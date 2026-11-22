@@ -522,13 +522,15 @@ The table gives, for each check, the requests it refuses and both answers. In
 an answer, `<name>`, `<arn>` and `<value>` stand for the value the request sent
 in the member the check reads, and `<member>` for that member's location as the
 **table names** row writes it. For these checks the server reads the keys of
-`RequestItems` in byte order (`B` before `a`), whatever order the request sends
-them in, except that a server built with the `mongodb` feature, whose JSON
-objects keep their order, reads them as sent; and it reads `TransactItems`
-members in order, and within a member its `Put`, `Delete`, `Update` and
-`ConditionCheck` in that order. Where a batch or transaction sends several
-values that the **table names** or **table ARNs** check refuses, the answer is
-for the first of them in that order.
+`RequestItems` in the order its JSON objects keep: byte order (`B` before `a`),
+whatever order the request sends them in, unless the build includes the
+MongoDB backend, whose `bson` dependency turns on `serde_json`'s
+`preserve_order` and so keeps the order the request sends (a build of the
+`extenddb` binary with its `mongodb` feature, or of the whole workspace); and it
+reads `TransactItems` members in order, and within a member its `Put`,
+`Delete`, `Update` and `ConditionCheck` in that order. Where a batch or
+transaction sends several values that the **table names** or **table ARNs**
+check refuses, the answer is for the first of them in that order.
 Three rows read a placeholder from elsewhere:
 the `ListBackups` row of **table ARNs** takes `<name>` from the ARN's
 `table/<name>` resource, **GetRecords iterator scope** takes `<value>` from the
