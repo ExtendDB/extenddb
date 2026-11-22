@@ -4,9 +4,10 @@
 //! any row is read.
 //!
 //! Measured on 2026-10-24 (tables with S/S, S/N and B/B keys, a GSI and an
-//! LSI) and on 2026-11-11:
+//! LSI), on 2026-11-11 and on 2026-11-22:
 //!
-//! 1. an `N` value in `ExpressionAttributeValues` that is not a number answers
+//! 1. an `N` value in `ExpressionAttributeValues`, or in the values of a
+//!    `QueryFilter` or `KeyConditions` condition, that is not a number answers
 //!    `The parameter cannot be converted to a numeric value: <value>` (or the
 //!    overflow, underflow and 38-digit messages). Every value in the map is
 //!    checked, whether the key condition, the filter or nothing reads it. The
@@ -69,8 +70,10 @@ const SELECT: &[&str] = &[
 /// deserialized and before the table is looked up, in the service's order:
 /// `Limit`, the `ReturnConsumedCapacity` enum, the expression and
 /// non-expression parameter mix, the `ExpressionAttributeNames` map (see
-/// `validate_names`), every number in `ExpressionAttributeValues`, then the
-/// `Select` enum (measured 2026-10-24 and 2026-11-11: a `Limit` of 0 is
+/// `validate_names`), every number in `ExpressionAttributeValues`, the
+/// numbers of the `QueryFilter` and then the `KeyConditions` values (see
+/// `validate_condition_value_numbers`), then the `Select` enum (measured
+/// 2026-10-24 and 2026-11-11: a `Limit` of 0 is
 /// reported ahead of an invalid enum value of either field and of a parameter
 /// mix, an invalid `ReturnConsumedCapacity` ahead of a mix with
 /// `AttributesToGet`, `QueryFilter`, `ConditionalOperator` or `KeyConditions`
@@ -190,6 +193,7 @@ fn query_request_checks(body: &Value) -> Result<(), DynamoDbError> {
     if let Some(values) = values {
         validate_expression_attribute_value_numbers(values)?;
     }
+    validate_condition_value_numbers(body)?;
 
     crate::validate_enum_fields(
         body,
@@ -421,10 +425,34 @@ fn number_fault(text: &str) -> Option<Fault<'_>> {
 fn validate_expression_attribute_value_numbers(
     values: &Map<String, Value>,
 ) -> Result<(), DynamoDbError> {
-    match sorted_entries(values)
-        .into_iter()
-        .find_map(|(_, value)| first_fault(value, None))
-    {
+    refuse_first_fault(sorted_entries(values).into_iter().map(|(_, value)| value))
+}
+
+/// Refuse the first `AttributeValueList` value of the `QueryFilter`, then of
+/// the `KeyConditions` conditions, that has a number fault, with the texts of
+/// [`validate_expression_attribute_value_numbers`] (rows K1 to K16, measured
+/// 2026-11-22). The handler's key type and value count checks come after it.
+/// The conditions are visited in attribute name order and each list in the
+/// order of its values. No measured request has two faults. A value the
+/// service cannot read as one type is left to the deserializer.
+fn validate_condition_value_numbers(body: &Value) -> Result<(), DynamoDbError> {
+    refuse_first_fault(
+        ["QueryFilter", "KeyConditions"]
+            .into_iter()
+            .filter_map(|field| body.get(field)?.as_object())
+            .flat_map(sorted_entries)
+            .filter_map(|(_, condition)| condition.get("AttributeValueList")?.as_array())
+            .flatten()
+            .filter(|value| !unreadable(value)),
+    )
+}
+
+/// Refuse the first fault [`first_fault`] finds in `values`, with its
+/// request-time text.
+fn refuse_first_fault<'a>(
+    mut values: impl Iterator<Item = &'a Value>,
+) -> Result<(), DynamoDbError> {
+    match values.find_map(|value| first_fault(value, None)) {
         Some(fault) => Err(DynamoDbError::ValidationException(
             fault.request_time_text(),
         )),
