@@ -1015,13 +1015,21 @@ pub fn backup_in_use(table: &str, backup_arn: &str) -> StorageError {
     StorageError::BackupInUse(backup_in_use_message(backup_arn))
 }
 
+/// The text the service answers for a change to a CREATING restore target:
+/// DeleteTable of it (measured on DynamoDB on 2026-11-21) and a restore of
+/// another backup into its name (measured on 2026-11-22).
+#[must_use]
+pub fn restore_target_in_use_message(table_name: &str) -> String {
+    format!(
+        "Attempt to change a resource which is still in use: Table: {table_name} is being used."
+    )
+}
+
 /// DeleteTable on a CREATING restore target, as every backend answers it
-/// (`ResourceInUseException`, the text measured on DynamoDB on 2026-11-21).
+/// (`ResourceInUseException`, [`restore_target_in_use_message`]).
 #[must_use]
 pub fn restore_target_in_use(table_name: &str) -> StorageError {
-    StorageError::IndexesInUse(format!(
-        "Attempt to change a resource which is still in use: Table: {table_name} is being used."
-    ))
+    StorageError::IndexesInUse(restore_target_in_use_message(table_name))
 }
 
 /// The one signal of a missing backup every backend emits inside a

@@ -6205,31 +6205,50 @@ async fn a_taken_name_is_table_already_exists_on_restore_only() {
 
 /// Measured on DynamoDB: a target name taken by a
 /// `CREATING` restore is `TableInUseException` `Table: <name> is already
-/// being restored from backup: <arn>`; a backup with a restore from it still
+/// being restored from backup: <arn>` for that restore's backup and
+/// `Attempt to change a resource which is still in use: Table: <name> is
+/// being used.` for another; a backup with a restore from it still
 /// `CREATING` is `BackupInUseException`. The backends raise the storage
-/// errors; this is their mapping.
+/// errors; this is their mapping, for the backup the request resolved to.
 #[tokio::test]
 async fn a_name_being_restored_is_table_in_use_and_a_backup_being_restored_is_backup_in_use() {
-    let fake = Fake::with_source(source(Some(definition("PROVISIONED"))));
-    *fake.restore_error.lock().unwrap() = Some(StorageError::TableBeingRestored {
-        table_name: "MusicRestored".to_owned(),
-        backup_arn: arn(ACCOUNT),
-    });
-    let err = restore(&fake, restore_body(json!({}))).await.unwrap_err();
-    match &err {
-        DynamoDbError::TableInUseException(m) => assert_eq!(
-            m,
-            &format!(
-                "Table: MusicRestored is already being restored from backup: {}",
-                arn(ACCOUNT)
-            )
-        ),
-        other => panic!("expected TableInUseException, got {other:?}"),
+    let ours = arn(ACCOUNT);
+    let earlier = ours.replace(REGION, "eu-west-1");
+    let b2 = arn_n(2);
+    let same =
+        |arn: &str| format!("Table: MusicRestored is already being restored from backup: {arn}");
+    let another = restore_target_in_use_message("MusicRestored");
+    // The backup's stored ARN, the request's `BackupArn`, the backup of the
+    // restore in progress, the text: the same backup as issued, trimmed,
+    // in another region and stored under an earlier `server.region`, then
+    // another backup.
+    let rows = [
+        (&ours, ours.clone(), &ours, same(&ours)),
+        (&ours, format!(" {ours}\n"), &ours, same(&ours)),
+        (&ours, earlier.clone(), &ours, same(&ours)),
+        (&earlier, earlier.clone(), &earlier, same(&earlier)),
+        (&ours, ours.clone(), &b2, another),
+    ];
+    for (stored, requested, restoring, text) in &rows {
+        let mut src = source(Some(definition("PROVISIONED")));
+        src.backup_arn.clone_from(stored);
+        let fake = Fake::with_source(src);
+        *fake.restore_error.lock().unwrap() = Some(StorageError::TableBeingRestored {
+            table_name: "MusicRestored".to_owned(),
+            backup_arn: restoring.to_string(),
+        });
+        let err = restore(&fake, restore_body(json!({ "BackupArn": requested })))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::TableInUseException(m) if m == text),
+            "{requested:?} into a target of {restoring}: {err:?}"
+        );
+        assert_eq!(
+            err.full_error_type(),
+            "com.amazonaws.dynamodb.v20120810#TableInUseException"
+        );
     }
-    assert_eq!(
-        err.full_error_type(),
-        "com.amazonaws.dynamodb.v20120810#TableInUseException"
-    );
 
     let fake = Fake::with_source(source(Some(definition("PROVISIONED"))));
     *fake.restore_error.lock().unwrap() = Some(StorageError::BackupInUse(format!(
@@ -8254,7 +8273,8 @@ async fn restore_takes_the_permit_last() {
 /// overrides and the permit, the order the service uses: with every permit
 /// held and the backup restorable, a restore into a name a table has is
 /// TableAlreadyExists, a retry into a CREATING restore target is TableInUse
-/// naming the target's source backup in the backend's own text, a CREATING
+/// naming the target's source backup in the backend's own text (the
+/// service's name-in-use text for a target of another backup), a CREATING
 /// table with no RestoreSummary (an ordinary create) and an ACTIVE former
 /// target (its summary no longer in progress) are TableAlreadyExists; the
 /// backup was read once and the backend not asked. With a missing backup,
@@ -8300,19 +8320,26 @@ async fn restore_checks_the_target_name_after_the_backup_and_before_the_permit()
         (fake, err)
     }
     let restorable = || Fake::with_source(source(Some(definition("PROVISIONED"))));
+    // Each target with its TableInUse text, `None` for TableAlreadyExists.
     let targets = [
-        table(TableStatus::Active, None),
-        table(TableStatus::Creating, None),
-        table(TableStatus::Creating, Some(&arn(ACCOUNT))),
-        table(TableStatus::Active, Some(&arn(ACCOUNT))),
+        (table(TableStatus::Active, None), None),
+        (table(TableStatus::Creating, None), None),
+        (
+            table(TableStatus::Creating, Some(&arn(ACCOUNT))),
+            Some(format!(
+                "Table: MusicRestored is already being restored from backup: {}",
+                arn(ACCOUNT)
+            )),
+        ),
+        (table(TableStatus::Active, Some(&arn(ACCOUNT))), None),
+        (
+            table(TableStatus::Creating, Some(&arn_n(2))),
+            Some(restore_target_in_use_message("MusicRestored")),
+        ),
     ];
 
     // The backup restorable: the name's refusal, after one read of the backup.
-    let in_use_text = format!(
-        "Table: MusicRestored is already being restored from backup: {}",
-        arn(ACCOUNT)
-    );
-    for (i, target) in targets.iter().enumerate() {
+    for (i, (target, in_use)) in targets.iter().enumerate() {
         let (fake, err) = check(restorable(), target.clone()).await;
         assert_eq!(fake.source_reads(), 1, "{i}: the backup was read first");
         assert_eq!(
@@ -8320,22 +8347,21 @@ async fn restore_checks_the_target_name_after_the_backup_and_before_the_permit()
             ["MusicRestored"],
             "{i}: the name was read once, under the request's spelling"
         );
-        if i == 2 {
-            assert!(
-                matches!(err, DynamoDbError::TableInUseException(ref m) if *m == in_use_text),
-                "a CREATING restore target: {err:?}"
-            );
-        } else {
-            assert!(
+        match in_use {
+            Some(text) => assert!(
+                matches!(err, DynamoDbError::TableInUseException(ref m) if m == text),
+                "{i}: a CREATING restore target: {err:?}"
+            ),
+            None => assert!(
                 matches!(err, DynamoDbError::TableAlreadyExistsException(ref m) if m.contains("MusicRestored")),
                 "{i}: {err:?}"
-            );
+            ),
         }
     }
 
     // The backup missing: BackupNotFound whatever the target's state, and
     // the name is never read.
-    for (i, target) in targets.iter().enumerate() {
+    for (i, (target, _)) in targets.iter().enumerate() {
         let (fake, err) = check(Arc::new(Fake::default()), target.clone()).await;
         assert!(
             matches!(err, DynamoDbError::BackupNotFoundException(ref m)
@@ -15127,7 +15153,7 @@ async fn the_registrations_refusals_keep_their_classes_and_return_the_slot() {
     );
     let runtime = job_runtime(&mem);
     type Expected = fn(&DynamoDbError) -> bool;
-    let cases: [(StorageError, Expected); 4] = [
+    let cases: [(StorageError, Expected); 5] = [
         (
             StorageError::TableAlreadyExists("MusicRestored".to_owned()),
             |e| matches!(e, DynamoDbError::TableAlreadyExistsException(_)),
@@ -15137,7 +15163,22 @@ async fn the_registrations_refusals_keep_their_classes_and_return_the_slot() {
                 table_name: "MusicRestored".to_owned(),
                 backup_arn: arn(ACCOUNT),
             },
-            |e| matches!(e, DynamoDbError::TableInUseException(_)),
+            |e| {
+                matches!(e, DynamoDbError::TableInUseException(m) if *m == format!(
+                    "Table: MusicRestored is already being restored from backup: {}",
+                    arn(ACCOUNT)
+                ))
+            },
+        ),
+        (
+            StorageError::TableBeingRestored {
+                table_name: "MusicRestored".to_owned(),
+                backup_arn: arn_n(2),
+            },
+            |e| {
+                matches!(e, DynamoDbError::TableInUseException(m)
+                if *m == restore_target_in_use_message("MusicRestored"))
+            },
         ),
         (
             extenddb_storage::backup_catalog::backup_not_found(&arn(ACCOUNT)),
@@ -15247,7 +15288,8 @@ async fn a_backup_being_restored_is_in_use_until_its_target_is_active() {
     .await
     .unwrap_err();
     assert!(
-        matches!(err, DynamoDbError::TableInUseException(_)),
+        matches!(err, DynamoDbError::TableInUseException(ref m)
+            if *m == restore_target_in_use_message("MusicRestored")),
         "another backup into the name being restored into: {err:?}"
     );
     gate.add_permits(1);
@@ -20007,7 +20049,8 @@ async fn a_retry_waits_on_its_registration_and_another_backup_is_refused() {
     .await
     .unwrap_err();
     assert!(
-        matches!(other, DynamoDbError::TableInUseException(_)),
+        matches!(other, DynamoDbError::TableInUseException(ref m)
+            if *m == restore_target_in_use_message("MusicRestored")),
         "{other:?}"
     );
     assert_eq!(fake.restore_claims.lock().unwrap().len(), 1);
