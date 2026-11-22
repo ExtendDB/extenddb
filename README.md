@@ -471,9 +471,9 @@ Before the HTTP server passes a request to the engine, its request handler
 (`handle_request` in `crates/server/src/handler.rs`) and its authorization
 (`authorize_request` in `crates/server/src/request_helpers.rs`) check it. Both
 builds run the checks the engine owns, `parse_request` and
-`ParsedRequest::admit` in `crates/engine/src/pre_dispatch.rs`, except that
-this build refuses the PartiQL operations and `DescribeEndpoints` before them,
-whatever the body (see "What it refuses"). This build makes none of the
+`ParsedRequest::admit` in `crates/engine/src/pre_dispatch.rs`, except on the
+operations this build refuses by name before them, whatever the body (see
+"What it refuses"). This build makes none of the
 server's other checks: it passes the request to the engine's handler for the
 operation, so where a check below refuses a request, this build answers what
 the handler answers, and the two answers can differ.
