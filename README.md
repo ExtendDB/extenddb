@@ -406,9 +406,16 @@ The AES-256-GCM cipher that seals stored secrets (`seal` and `open` in
 `crates/core/src/crypto.rs`) compiles in too, but no request reaches it: the
 in-memory engine holds no encryption key. If it were called on `wasm32`, the
 `zeroize` features of its RustCrypto crates would wipe the cipher's AES round
-keys and POLYVAL key where the cipher is dropped, but not the copies of them
-that `seal` and `open` leave on the stack, which stay in linear memory after
-the calls return until later calls overwrite them.
+keys and POLYVAL key where the cipher is dropped, but not the copies that
+`seal` and `open` leave on the stack, which stay in linear memory after the
+calls return until later calls overwrite them. They include copies of the AES
+round keys, of the GHASH key and the POLYVAL key derived from it, and of the
+call's working values: the CTR keystream blocks (the keystream XOR the
+ciphertext is the plaintext), the tag mask (the encryption of the first
+counter block) and plaintext blocks. Which of them a call leaves depends on
+the call, the length of the value and the build profile; in a release build
+as in a dev build, `open` can leave keystream or plaintext blocks of the value
+it returns.
 
 ### What it refuses
 
