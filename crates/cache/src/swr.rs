@@ -231,9 +231,8 @@ where
     /// spawned task on stale-hit refresh (request does not block).
     ///
     /// On wasm32-unknown-unknown this traps: building the moka map reads
-    /// `std::time::Instant::now()` inside moka, which that target does not
-    /// provide, and the wasm clippy guard does not see calls inside
-    /// dependencies. Only the server builds a non-pass-through cache.
+    /// `std::time::Instant::now()` inside moka, which panics on that target.
+    /// Only the server builds a non-pass-through cache.
     ///
     /// # Errors
     /// Returns `ConfigError` if `config` fails [`SwrCacheConfig::validate`].
