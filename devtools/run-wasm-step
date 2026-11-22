@@ -31,7 +31,7 @@
 # workflow runs it, install what those steps install: that toolchain with the
 # wasm32-unknown-unknown target and clippy, a clang, a Node of that major
 # version, the wasm-bindgen-cli of the version the wasm-bindgen-version step
-# prints, and the wasm-pack version the workflow's install step names (the
+# prints, and the wasm-pack version the workflow's WASM_PACK_VERSION names (the
 # guard step's case below says which Python it needs). With rustup's cargo
 # the first cargo on PATH, setting RUSTUP_TOOLCHAIN to the workflow's
 # `toolchain:` selects that toolchain; put the Node first on PATH, for
