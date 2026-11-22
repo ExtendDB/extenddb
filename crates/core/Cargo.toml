@@ -83,10 +83,10 @@ time = { workspace = true, features = ["wasm-bindgen"] }
 hex = "0.4"
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
-# Keep this floor at the release that goes with the wasm-bindgen version in
-# Cargo.lock (0.3.80 goes with 0.2.130): the wasm workflow installs the test
-# runner (wasm-bindgen-cli) of that version, and under it the test module of
-# an older release is refused or runs no test.
+# A floor of "0.3" here and in extenddb-storage-sqlite would admit 0.3.45,
+# which requires wasm-bindgen by a range and resolves with the rest of
+# Cargo.lock, and the wasm-bindgen-test-runner of the wasm-bindgen release
+# in Cargo.lock finds no test in the test module that 0.3.45 builds.
 wasm-bindgen-test = "0.3.80"
 
 [features]
