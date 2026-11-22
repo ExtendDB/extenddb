@@ -6,8 +6,9 @@
 //! on a table keyed on `pk` (S) and one keyed on `pk` (B): `BatchWriteItem`
 //! refuses such a value, and such a `BS` member, in a `PutRequest` item and in
 //! a `DeleteRequest` key with the text of its length, and every other
-//! operation reads it as the padded value. The rows send each request through
-//! [`dispatch`] and read a written item back with a `GetItem`.
+//! operation reads it as the padded value. `BatchWriteItem` reads `Y=Q=`
+//! through the second reading and stores `//Q=`. The rows send each request
+//! through [`dispatch`] and read a written item back with a `GetItem`.
 
 use std::sync::Arc;
 
@@ -104,9 +105,10 @@ async fn context() -> (OperationContext, TempDir) {
 #[tokio::test]
 async fn batch_write_item_alone_reads_a_binary_only_with_its_padding() {
     #[rustfmt::skip]
-    let rows: [(&str, &str, Value, Answer); 12] = [
+    let rows: [(&str, &str, Value, Answer); 13] = [
         ("w1", "BatchWriteItem", batch(S_TABLE, put(item("w1", json!({"B": "YQ"})))), length(2)),
         ("w2", "BatchWriteItem", batch(S_TABLE, put(item("w2", json!({"B": "YQ="})))), length(3)),
+        ("w3", "BatchWriteItem", batch(S_TABLE, put(item("w3", json!({"B": "Y=Q="})))), stored("//Q=")),
         ("w4", "BatchWriteItem", batch(S_TABLE, put(item("w4", json!({"BS": ["YQ"]})))), length(2)),
         ("w5", "BatchWriteItem", batch(B_TABLE, json!({"DeleteRequest": {"Key": b_key()}})), length(2)),
         ("w6", "BatchWriteItem", batch(B_TABLE, put(json!({"pk": {"B": "Yg"}}))), length(2)),
