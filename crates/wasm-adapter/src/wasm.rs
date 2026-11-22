@@ -64,9 +64,7 @@ impl ExtendDb {
     /// promise with `ExtendDB`'s error document, a JSON object carrying a
     /// `__type` member. Both arguments are taken as any JavaScript value and
     /// checked here, so a number, `undefined` or an object answers a
-    /// `ValidationException` instead of reaching the engine. A string is
-    /// encoded to UTF-8 by the generated JavaScript glue's `TextEncoder`, which
-    /// replaces an unpaired surrogate with U+FFFD.
+    /// `ValidationException` instead of reaching the engine.
     ///
     /// Call `submit` only on an object that [`ExtendDb::create`] returned and
     /// that has not been freed. The generated JavaScript passes the
