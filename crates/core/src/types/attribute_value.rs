@@ -124,6 +124,41 @@ pub fn is_base64_refusal(message: &str) -> bool {
     message.is_empty() || BASE64_TEXTS.iter().any(|text| message.starts_with(text))
 }
 
+/// Check every `B` text and `BS` member of a wire value with `decode`, at
+/// any depth. An operation whose decoder is not the deserializer's calls it
+/// on the raw JSON ahead of deserializing. Matching member names is safe: a
+/// value that deserializes holds attribute values there, and any other value
+/// is refused. A `B` or `BS` payload of another shape, such as the requests
+/// of a table of that name, is walked. `serde_json` caps the depth at 128.
+///
+/// # Errors
+///
+/// The refusal of the first text `decode` refuses.
+pub fn check_binaries<E>(
+    value: &serde_json::Value,
+    decode: fn(&str) -> Result<Vec<u8>, E>,
+) -> Result<(), E> {
+    use serde_json::Value;
+    match value {
+        Value::Object(members) => {
+            members
+                .iter()
+                .try_for_each(|(tag, payload)| match (tag.as_str(), payload) {
+                    ("B", Value::String(text)) => decode(text).map(drop),
+                    ("BS", Value::Array(set)) => set.iter().try_for_each(|member| match member {
+                        Value::String(text) => decode(text).map(drop),
+                        other => check_binaries(other, decode),
+                    }),
+                    _ => check_binaries(payload, decode),
+                })
+        }
+        Value::Array(items) => items
+            .iter()
+            .try_for_each(|item| check_binaries(item, decode)),
+        _ => Ok(()),
+    }
+}
+
 impl<'de> Visitor<'de> for AttributeValueVisitor {
     type Value = AttributeValue;
 

@@ -13,7 +13,7 @@ use extenddb_core::expression::ExpressionMaps;
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{
     BatchWriteItemInput, BatchWriteItemOutput, Item, KeySchemaElement, ReturnItemCollectionMetrics,
-    TableKeyInfo, WriteRequest, extract_key, item_size_bytes,
+    TableKeyInfo, WriteRequest, check_binaries, decode_padded_base64, extract_key, item_size_bytes,
 };
 use extenddb_core::validation::{
     AttributeNameRequestForm, IndexKeyRef, validate_attribute_name_sizes, validate_batch_item_keys,
@@ -45,6 +45,15 @@ pub async fn handle_batch_write_item(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
+    // The service reads a B value or a BS member of this operation only with
+    // its padding, in a PutRequest item and in a DeleteRequest key, and
+    // refuses one without it ahead of the rest of the request. Every other
+    // operation reads the padding left out or cut short (measured
+    // 2026-11-22), and so does the deserializer, so the raw RequestItems are
+    // checked with the decoder that requires the padding first. The other
+    // members of the body are the deserializer's.
+    check_binaries(&body["RequestItems"], decode_padded_base64)
+        .map_err(crate::serialization_exception)?;
     let input: BatchWriteItemInput =
         serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
@@ -578,6 +587,8 @@ fn collect_icm_if_needed(
     }
 }
 
+#[cfg(test)]
+mod padding_tests;
 #[cfg(test)]
 mod scripted;
 #[cfg(test)]

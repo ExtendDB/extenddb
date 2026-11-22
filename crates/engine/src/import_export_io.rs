@@ -14,7 +14,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::types::{AttributeValue, InputFormat, Item};
+use extenddb_core::types::{AttributeValue, InputFormat, Item, check_binaries};
 
 /// Read items from a file in the specified format.
 pub(crate) fn read_items(
@@ -38,7 +38,8 @@ pub(crate) fn read_items(
 ///
 /// The service's import reads a `B` value or a `BS` member only as canonical
 /// padded base64 (measured 2026-11-22), and the item deserializer reads other
-/// forms a request may send, so [`canonical_binaries`] checks the line first.
+/// forms a request may send, so `check_binaries` reads the line with the
+/// standard decoder first.
 fn read_dynamodb_json(reader: impl BufRead, max_items: u64) -> Result<Vec<Item>, DynamoDbError> {
     let mut items = Vec::new();
     for (line_num, line) in reader.lines().enumerate() {
@@ -68,7 +69,7 @@ fn read_dynamodb_json(reader: impl BufRead, max_items: u64) -> Result<Vec<Item>,
                 line_num + 1
             ))
         };
-        if !canonical_binaries(&item_value) {
+        if check_binaries(&item_value, |text| BASE64.decode(text)).is_err() {
             return Err(invalid_item());
         }
         let item: Item = serde_json::from_value(item_value).map_err(|_| invalid_item())?;
@@ -80,28 +81,6 @@ fn read_dynamodb_json(reader: impl BufRead, max_items: u64) -> Result<Vec<Item>,
         }
     }
     Ok(items)
-}
-
-/// Whether every `B` text and `BS` member in `value` decodes with `STANDARD`.
-/// Matching member names is safe: a line that parses holds attribute values
-/// there, and any other line is refused. `serde_json` caps the depth at 128.
-fn canonical_binaries(value: &Value) -> bool {
-    match value {
-        Value::Object(members) => {
-            members
-                .iter()
-                .all(|(tag, payload)| match (tag.as_str(), payload) {
-                    ("B", Value::String(text)) => BASE64.decode(text).is_ok(),
-                    ("BS", Value::Array(set)) => set
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .all(|text| BASE64.decode(text).is_ok()),
-                    _ => canonical_binaries(payload),
-                })
-        }
-        Value::Array(items) => items.iter().all(canonical_binaries),
-        _ => true,
-    }
 }
 
 /// Read CSV format.
