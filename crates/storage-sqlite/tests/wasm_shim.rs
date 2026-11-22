@@ -20,22 +20,25 @@
 //! entry of the "Documented differences" list in the shim's module
 //! documentation.
 //!
-//! The table's test, `each_row_gives_its_expected_outcome`, runs the rows in
-//! order and records a row only in the statement that compares the row's
-//! outcome with the outcome the row expects on the target the test runs on.
-//! It then fails if a row's outcome is not the one it expects, if a row named
-//! `difference: ...` expects the same outcome on both targets or a row not so
-//! named expects two different ones, if two rows have the same name, if the
-//! number of rows recorded is not [`ROWS`], or if the number of difference
-//! rows recorded is not [`DIFFERENCE_ROWS`]. Both numbers are written by hand,
-//! so each of these changes, made alone, fails the test: a row deleted from or
-//! filtered out of the table, a repeated row, and a row the loop skips before
-//! comparing it. The test does not check the expectations themselves, so when
-//! a row's outcome changes and its expectation is edited to match, the test
-//! passes; and it counts rows rather than naming them, so two changes that
-//! keep both numbers pass together (a row removed and [`ROWS`] lowered, or a
-//! row skipped and another added). Such changes are for review to catch. The
-//! test does not read the shim's documentation.
+//! The table's test, `each_row_gives_its_expected_outcome`, takes its verdict
+//! from `compare_rows`, which runs the rows in order. For each row, one
+//! statement compares the row's outcome with the outcome the row expects on
+//! the target the test runs on, counts the row and writes a failure text for
+//! each rule the row breaks: its outcome is not the one it expects; it is
+//! named `difference: ...` and expects the same outcome on both targets, or is
+//! not so named and expects two different ones; an earlier row has its name.
+//! The test fails unless there is no failure text, the count is [`ROWS`] and
+//! the number of difference rows counted is [`DIFFERENCE_ROWS`]. Both numbers
+//! are written by hand, so the test also fails when a row is deleted from,
+//! filtered out of or repeated in the table, and when the row loop skips a
+//! row's statement with a `continue`, a `break`, or a `return` of the verdict
+//! built so far or of an empty one. It does not check its expectations or its
+//! own code: an expectation edited to match a changed outcome passes, as can
+//! another edit to the code that runs or judges the rows (such as
+//! `compare_rows` and `Verdict::record`) or to the final assertion, and two
+//! changes that keep both numbers pass together (a row removed and [`ROWS`]
+//! lowered, or a row skipped and another added). Such changes are for review.
+//! The test does not read the shim's documentation.
 //!
 //! Natively the pool's acquire timeout is cut from `sqlx`'s 30 s default to
 //! 50 ms, so the rows that find the connection checked out return
@@ -880,15 +883,47 @@ fn cases() -> Vec<Case> {
     ]
 }
 
-/// What the table test keeps of a row: its name, whether it gave the outcome
-/// it expects on this target, whether it expects the same outcome on both
-/// targets, the outcome it expects here and the outcome it gave.
-type Compared = (String, bool, bool, String, String);
+/// What `compare_rows` makes of the rows: how many it judged, how many of
+/// those are named `difference: ...`, their names, and the failure texts.
+#[derive(Default)]
+struct Verdict {
+    rows: usize,
+    differences: usize,
+    names: BTreeSet<String>,
+    failures: Vec<String>,
+}
 
-/// Runs the rows of `cases()` in order and returns one record per row whose
-/// outcome it compared, each made by the statement that compares it.
-async fn compare_rows() -> Vec<Compared> {
-    let mut rows = Vec::new();
+impl Verdict {
+    /// Judges the row `name`: adds a failure text for each rule it breaks,
+    /// then counts it. `passed` is whether it gave the outcome it expects on
+    /// this target, and `same` whether it expects the same outcome on both
+    /// targets.
+    fn record(&mut self, name: String, passed: bool, same: bool, expected: &str, actual: &str) {
+        let difference = name.starts_with("difference: ");
+        if !self.names.insert(name.clone()) {
+            self.failures
+                .push(format!("{name}\n    another row has this name"));
+        }
+        if difference == same {
+            self.failures.push(format!(
+                "{name}\n    a row is named `difference: ...` exactly when its native and wasm \
+                 outcomes differ"
+            ));
+        }
+        if !passed {
+            self.failures.push(format!(
+                "{name}\n    expected: {expected}\n    actual:   {actual}"
+            ));
+        }
+        self.rows += 1;
+        self.differences += usize::from(difference);
+    }
+}
+
+/// Runs the rows of `cases()` in order and judges each one in the statement
+/// that compares its outcome with the outcome it expects on this target.
+async fn compare_rows() -> Verdict {
+    let mut verdict = Verdict::default();
     for case in cases() {
         let same = case.native == case.wasm;
         let expected = if cfg!(target_arch = "wasm32") {
@@ -900,50 +935,25 @@ async fn compare_rows() -> Vec<Compared> {
             Ok(outcome) => outcome,
             Err(e) => format!("setup failed: {}", render::<()>(Err(e))),
         };
-        rows.push((case.name, actual == expected, same, expected, actual));
+        verdict.record(case.name, actual == expected, same, &expected, &actual);
     }
-    rows
+    verdict
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn each_row_gives_its_expected_outcome() {
-    let rows = compare_rows().await;
-    let mut failures = Vec::new();
-    let mut names = BTreeSet::new();
-    for (name, passed, same, expected, actual) in &rows {
-        if !names.insert(name) {
-            failures.push(format!("{name}\n    another row has this name"));
-        }
-        if name.starts_with("difference: ") == *same {
-            failures.push(format!(
-                "{name}\n    a row is named `difference: ...` exactly when its native and wasm \
-                 outcomes differ"
-            ));
-        }
-        if !passed {
-            failures.push(format!(
-                "{name}\n    expected: {expected}\n    actual:   {actual}"
-            ));
-        }
-    }
-    if rows.len() != ROWS {
-        failures.push(format!(
-            "{} rows were compared, and ROWS is {ROWS}",
-            rows.len()
-        ));
-    }
-    let differences = rows
-        .iter()
-        .filter(|(name, ..)| name.starts_with("difference: "))
-        .count();
-    if differences != DIFFERENCE_ROWS {
-        failures.push(format!(
-            "{differences} rows compared are named `difference: ...`, and DIFFERENCE_ROWS is \
-             {DIFFERENCE_ROWS}"
-        ));
-    }
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    let verdict = compare_rows().await;
+    assert!(
+        verdict.failures.is_empty()
+            && verdict.rows == ROWS
+            && verdict.differences == DIFFERENCE_ROWS,
+        "{} rows judged (ROWS is {ROWS}), {} of them named `difference: ...` (DIFFERENCE_ROWS \
+         is {DIFFERENCE_ROWS})\n{}",
+        verdict.rows,
+        verdict.differences,
+        verdict.failures.join("\n")
+    );
 }
 
 /// The account the backend tests below run as.
