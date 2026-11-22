@@ -58,18 +58,17 @@ one line per problem, unless:
    of aes, aes-gcm, ghash and polyval is there as one copy (one package: one
    name, version and source), with its zeroize feature on;
 6. the guard can plant every probe and control (_plant and plant_controls
-   say when it cannot); each of BUILD_SCRIPT, LINTS_CONTROL and
-   MIGRATIONS_CONTROLS goes into the first crate of the build, by name, that
-   can take it (_own_crate_plants). When a run does not finish, the plants
-   that could not be made are reported before its errors.
+   say when it cannot); each of BUILD_SCRIPT and MIGRATIONS_CONTROLS goes
+   into the first crate of the build, by name, that can take it
+   (_own_crate_plants). When a run does not finish, the plants that could
+   not be made are reported before its errors.
 Each check runs, in the same call, on the tree and on controls planted for
 it, but for two: the plant check, which no control makes fail, and the check
 that both runs finish, which a control could test only by stopping the
-guard. The controls: CONTROLS, OTHER_FILE_CONTROLS, LINTS_CONTROL with its
-[lints] table, BUILD_SCRIPT, RELEASE_CONTROL, MIGRATIONS_CONTROLS,
-CONTROL_PROBE, CONTROL_ENTRY, CONTROL_ENVIRONMENT, CONTROL_CARGO_CONFIG and
-two zeroize graphs; and each run's dep-info must be read for every crate of
-the build. A control that does not give the finding it was planted for, and
+guard. The controls: CONTROLS, OTHER_FILE_CONTROLS, BUILD_SCRIPT,
+RELEASE_CONTROL, MIGRATIONS_CONTROLS, CONTROL_PROBE, CONTROL_ENTRY,
+CONTROL_ENVIRONMENT, CONTROL_CARGO_CONFIG and two zeroize graphs; and each
+run's dep-info must be read for every crate of the build. A control that does not give the finding it was planted for, and
 a finding no control expects, fail the guard. The environment and
 cargo-configuration checks are controlled on their control inputs only:
 handed an empty mapping or file list in place of the tree's, the guard would
@@ -1629,18 +1628,6 @@ mod m9997_wasm_clippy_guard_control;
     "src/migrations/m9997_wasm_clippy_guard_control.rs": _EMPTY_MODULE,
 }
 
-# A control in a crate of the build that can take it (plant_controls), whose
-# manifest in the copy gets LINTS_TABLE.
-LINTS_CONTROL_MODULE = "wasm_clippy_guard_control"
-LINTS_TABLE = '\n[lints.clippy]\ndisallowed-methods = "allow"\n'
-LINTS_CONTROL = """\
-// A control of devtools/check-wasm-clippy-guard, in its copy of the tree only:
-// this crate's manifest there allows clippy::disallowed_methods in [lints].
-pub(crate) fn lints_table() {
-    std::thread::sleep(std::time::Duration::ZERO); //@ lints-table call
-}
-"""
-
 # A build script, planted in a crate of the build with none (plant_controls),
 # that hands the crate's compiler the CLIPPY_ARGS and CLIPPY_CONF_DIR cargo
 # clippy set, written differently but read the same (an empty option
@@ -1694,28 +1681,21 @@ def _plant(
 
 
 def _held(copy: Path, rel: Path, text: str) -> str | None:
-    """What the copy's file `rel` already holds of what appending `text` adds,
-    or None. In Rust source, for a module that a `mod <name>;` line of `text`
-    declares: a use of its name in the file's code, or a <name>.rs or
-    <name>/mod.rs beside the file in the working tree. In TOML, a table that
-    `text` opens."""
+    """What the copy's Rust file `rel` already holds of what appending `text`
+    adds, or None: for a module that a `mod <name>;` line of `text` declares,
+    a use of its name in the file's code, or a <name>.rs or <name>/mod.rs
+    beside the file in the working tree."""
     current = (copy / rel).read_text(encoding="utf-8")
-    if rel.suffix == ".rs":
-        code = code_only(current)
-        for name in re.findall(r"^mod (\w+);$", text, re.M):
-            if use := re.search(rf"\b{name}\b", code):
-                line = code.count("\n", 0, use.start()) + 1
-                held = current.splitlines()[line - 1].strip()
-                return f"uses `{name}` at line {line} ({held}), the name of a module the guard adds"
-            for file in (rel.parent / f"{name}.rs", rel.parent / name / "mod.rs"):
-                if os.path.lexists(ROOT / file):
-                    return f"has {file.as_posix()} beside it, a file of a module the guard adds"
-        return None
-    try:
-        tables = sorted(set(tomllib.loads(text)) & set(tomllib.loads(current)))
-    except tomllib.TOMLDecodeError as error:
-        return f"cannot be read as TOML ({error})"
-    return f"already has a [{tables[0]}] table" if tables else None
+    code = code_only(current)
+    for name in re.findall(r"^mod (\w+);$", text, re.M):
+        if use := re.search(rf"\b{name}\b", code):
+            line = code.count("\n", 0, use.start()) + 1
+            held = current.splitlines()[line - 1].strip()
+            return f"uses `{name}` at line {line} ({held}), the name of a module the guard adds"
+        for file in (rel.parent / f"{name}.rs", rel.parent / name / "mod.rs"):
+            if os.path.lexists(ROOT / file):
+                return f"has {file.as_posix()} beside it, a file of a module the guard adds"
+    return None
 
 
 def _own_crate_plants(name: str, package: dict) -> dict[str, list[tuple[Path, str, bool]]]:
@@ -1727,11 +1707,6 @@ def _own_crate_plants(name: str, package: dict) -> dict[str, list[tuple[Path, st
     unfit = name == PROBE_CRATE or any("custom-build" in t["kind"] for t in package["targets"])
     return {
         "BUILD_SCRIPT": [] if unfit else [(manifest.parent / "build.rs", BUILD_SCRIPT, False)],
-        "LINTS_CONTROL": [
-            (root.parent / f"{LINTS_CONTROL_MODULE}.rs", LINTS_CONTROL, False),
-            (root, f"\n#[allow(dead_code)]\nmod {LINTS_CONTROL_MODULE};\n", True),
-            (manifest, LINTS_TABLE, True),
-        ],
         "MIGRATIONS_CONTROLS": [
             *((root.parent / "migrations" / n, t, False) for n, t in MIGRATIONS_CONTROLS.items()),
             (root, "\n#[allow(dead_code)]\nmod migrations;\n", True),
@@ -1755,7 +1730,7 @@ def plant_controls(copy: Path, crates: dict[str, dict]) -> tuple[list[Control], 
     appends = [(probe_root, f"\n#[allow(dead_code)]\nmod {CONTROL_MODULE};\n")]
     found, hosts = [], {}
     # The controls that go into a crate of their own (the docstring's item 6).
-    for control in ("BUILD_SCRIPT", "LINTS_CONTROL", "MIGRATIONS_CONTROLS"):
+    for control in ("BUILD_SCRIPT", "MIGRATIONS_CONTROLS"):
         unfit = []
         for name, package in sorted(crates.items()):
             plants = _own_crate_plants(name, package)[control]
