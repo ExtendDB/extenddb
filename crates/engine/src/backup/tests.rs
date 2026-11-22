@@ -4327,12 +4327,12 @@ fn validation_message(err: DynamoDbError) -> String {
 /// The ARN the engine looks a `BackupArn` up under first: the one this
 /// deployment issues for the backup named.
 fn arn_field(body: &Value) -> Result<String, DynamoDbError> {
-    backup_arn_field(body, ACCOUNT, REGION).map(|a| a.canonical().to_owned())
+    backup_arn_field(body, ACCOUNT, REGION, &limits()).map(|a| a.canonical().to_owned())
 }
 
 /// The spellings of an ARN as `backup_arn_field` resolves them for `arn`.
 fn own(arn: &str) -> BackupArnSpellings {
-    backup_arn_field(&json!({ "BackupArn": arn }), ACCOUNT, REGION).unwrap()
+    backup_arn_field(&json!({ "BackupArn": arn }), ACCOUNT, REGION, &limits()).unwrap()
 }
 
 fn limits() -> LimitsConfig {
@@ -4676,9 +4676,11 @@ async fn a_backup_stored_under_another_region_resolves_as_written() {
 /// A table segment outside the length bounds is `Invalid Backup ARN` first,
 /// in another region and in the server's. DescribeBackup and DeleteBackup
 /// (`arn_field`) and the `ListBackups` cursor keep the shape's answer.
-/// Measured on DynamoDB in us-east-1 on 21 and 22 Nov 2026, each request
-/// twice (DescribeBackup for the four region fields outside the shape,
-/// DeleteBackup for the first three of them).
+/// DescribeBackup and DeleteBackup give the length's answer for a backup
+/// they do not find; one stored under other bounds is found (ExtendDB's
+/// choice). Measured on DynamoDB in us-east-1 on 21 and 22 Nov 2026, each
+/// request twice (DescribeBackup for the four region fields outside the
+/// shape, DeleteBackup for the first three of them).
 #[tokio::test]
 async fn a_restore_of_a_backup_arn_in_another_region_is_the_cross_region_answer() {
     const XREGION: &str = "ValidationException: Invalid Request: sseSpecificationOverride \
@@ -4747,6 +4749,28 @@ async fn a_restore_of_a_backup_arn_in_another_region_is_the_cross_region_answer(
             let cursor = list(&fake, json!({ "ExclusiveStartBackupArn": candidate })).await;
             assert_eq!(answer(cursor.unwrap_err()), NOT_VALID, "cursor {region}");
         }
+    }
+    // A backup of `abc` stored before the minimum went up to 5 is described
+    // and deleted. With no backup, they answer a table segment of 2 or 300
+    // characters as the restore does (22 Nov 2026).
+    let abc = arn_of("aws", REGION, "abc", ID);
+    let held = backup_description("AVAILABLE", "PROVISIONED");
+    fake.descriptions.lock().unwrap().insert(abc.clone(), held);
+    let five = LimitsConfig {
+        min_table_name_length: 5,
+        ..limits()
+    };
+    let spellings = backup_arn_field(&json!({ "BackupArn": abc }), ACCOUNT, REGION, &five).unwrap();
+    let described = describe_backup(&*fake, ACCOUNT, REGION, &spellings).await;
+    assert_eq!(described.unwrap().backup_details.backup_status, "AVAILABLE");
+    let deleted = delete_backup(&*fake, &runtime(), ACCOUNT, REGION, &spellings).await;
+    assert_eq!(deleted.unwrap().backup_details.backup_status, "DELETED");
+    for table in ["ab", long.as_str()] {
+        let spellings = own(&arn_of("aws", REGION, table, ID));
+        let described = describe_backup(&*fake, ACCOUNT, REGION, &spellings).await;
+        assert_eq!(answer(described.unwrap_err()), INVALID, "{table}");
+        let deleted = delete_backup(&*fake, &runtime(), ACCOUNT, REGION, &spellings).await;
+        assert_eq!(answer(deleted.unwrap_err()), INVALID, "{table}");
     }
     assert!(fake.restores().is_empty());
 }
@@ -7916,7 +7940,7 @@ async fn describe_backup_of_another_accounts_id_is_not_found() {
 
 /// `own` for another account.
 fn own_for(arn: &str, account: &str) -> BackupArnSpellings {
-    backup_arn_field(&json!({ "BackupArn": arn }), account, REGION).unwrap()
+    backup_arn_field(&json!({ "BackupArn": arn }), account, REGION, &limits()).unwrap()
 }
 
 /// A row stored under another region resolves under the ARN as written,
@@ -9067,7 +9091,8 @@ async fn create_backup_under_a_region_outside_the_arn_alphabet_names_the_setting
         .lock()
         .unwrap()
         .insert(stored.clone(), row(&stored, BackupStatus::Available));
-    let spellings = backup_arn_field(&json!({ "BackupArn": stored }), ACCOUNT, "LOCAL").unwrap();
+    let spellings =
+        backup_arn_field(&json!({ "BackupArn": stored }), ACCOUNT, "LOCAL", &limits()).unwrap();
     let desc = describe_backup(&*fake, ACCOUNT, "LOCAL", &spellings)
         .await
         .unwrap();
@@ -9083,7 +9108,7 @@ async fn create_backup_under_a_region_outside_the_arn_alphabet_names_the_setting
     let local =
         format!("arn:aws:dynamodb:LOCAL:{ACCOUNT}:table/Music/backup/01791976431438-73d8d5bc");
     let msg = validation_message(
-        backup_arn_field(&json!({ "BackupArn": local }), ACCOUNT, "LOCAL").unwrap_err(),
+        backup_arn_field(&json!({ "BackupArn": local }), ACCOUNT, "LOCAL", &limits()).unwrap_err(),
     );
     assert_eq!(msg, BACKUP_ARN_NOT_VALID);
     assert_eq!(fake.row_reads.lock().unwrap().len(), 1, "no further read");

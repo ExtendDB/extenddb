@@ -2497,7 +2497,9 @@ def test_backup_arn_account_is_checked_before_its_shape(dynamodb_client, caller_
 # included, it answers as for the endpoint's own region. DescribeBackup and
 # DeleteBackup answer a region field outside [a-z0-9-] with "Invalid Request:
 # BackupArn is not valid". A table segment outside the length bounds is
-# "Invalid Backup ARN" first, in another region and in the endpoint's.
+# "Invalid Backup ARN" first, in another region and in the endpoint's, and
+# before a TargetTableName the restore refuses. DescribeBackup and
+# DeleteBackup give it too.
 # Measured on DynamoDB in us-east-1 on 21 and 22 Nov 2026, each request
 # twice; None is not measured. The rows assume an endpoint in us-east-1.
 # Columns: region field, table segment, the restore's other members (a
@@ -2524,11 +2526,16 @@ _BACKUP_ARN_REGION_ROWS = [
     ("us-west-2", _MUSIC, _ENABLED, _NOT_FOUND, None, None),
     ("us/east-1", _MUSIC, _ENABLED, _NOT_VALID, None, None),
     ("us-west-2", _MUSIC, {"SSESpecificationOverride": {}}, _NOT_FOUND, None, None),
-    # 22 Nov 2026: a table segment of 2 or 300 characters.
+    # 22 Nov 2026: a table segment of 2 or 300 characters, then one of 2 or
+    # 300 characters or outside the pattern with a TargetTableName the
+    # restore refuses.
     ("us-west-2", "ab", {}, _INVALID_ARN, None, None),
     ("us-west-2", "t" * 300, {}, _INVALID_ARN, None, None),
-    ("us-east-1", "ab", {}, _INVALID_ARN, None, None),
-    ("us-east-1", "t" * 300, {}, _INVALID_ARN, None, None),
+    ("us-east-1", "ab", {}, _INVALID_ARN, _INVALID_ARN, _INVALID_ARN),
+    ("us-east-1", "t" * 300, {}, _INVALID_ARN, _INVALID_ARN, _INVALID_ARN),
+    ("us-east-1", "ab", {"TargetTableName": "a*"}, _INVALID_ARN, None, None),
+    ("us-east-1", "t" * 300, {"TargetTableName": "a*"}, _INVALID_ARN, None, None),
+    ("us-east-1", "a b", {"TargetTableName": "a*"}, _INVALID_ARN, None, None),
 ]
 
 
