@@ -16,13 +16,22 @@ use serde_json::Value;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::types::{AttributeValue, InputFormat, Item, check_binaries};
 
+/// The items of one import file, and the first line the import cannot read.
+pub(crate) struct ReadItems {
+    pub items: Vec<Item>,
+    /// The number and the fault of the first line the import cannot read. The
+    /// lines after it are not read, and the import counts the line as one
+    /// error, as the service does (measured 2026-11-22).
+    pub unread: Option<(usize, &'static str)>,
+}
+
 /// Read items from a file in the specified format.
 pub(crate) fn read_items(
     path: &Path,
     format: InputFormat,
     options: Option<&extenddb_core::types::InputFormatOptions>,
     max_items: u64,
-) -> Result<Vec<Item>, DynamoDbError> {
+) -> Result<ReadItems, DynamoDbError> {
     let file = std::fs::File::open(path)
         .map_err(|_| DynamoDbError::ValidationException("Cannot open source file".to_owned()))?;
     let reader = std::io::BufReader::new(file);
@@ -30,18 +39,24 @@ pub(crate) fn read_items(
     match format {
         InputFormat::DynamoDbJson => read_dynamodb_json(reader, max_items),
         InputFormat::Ion => read_dynamodb_json(reader, max_items),
-        InputFormat::Csv => read_csv(reader, options, max_items),
+        InputFormat::Csv => read_csv(reader, options, max_items).map(|items| ReadItems {
+            items,
+            unread: None,
+        }),
     }
 }
 
-/// Read `DynamoDB` JSON format: one JSON object per line with `{"Item": {...}}` wrapper.
+/// Read `DynamoDB` JSON format: one `{"Item": {...}}` object per line.
 ///
-/// The service's import reads a `B` value or a `BS` member only as canonical
-/// padded base64 (measured 2026-11-22), and the item deserializer reads other
-/// forms a request may send, so `check_binaries` reads the line with the
-/// standard decoder first.
-fn read_dynamodb_json(reader: impl BufRead, max_items: u64) -> Result<Vec<Item>, DynamoDbError> {
-    let mut items = Vec::new();
+/// A line the import cannot read ends the reading of the file: the items
+/// before it are kept and the lines after it are not read (measured
+/// 2026-11-22). An empty line is skipped. An I/O error and the item count
+/// limit of the deployment are the request's own errors.
+fn read_dynamodb_json(reader: impl BufRead, max_items: u64) -> Result<ReadItems, DynamoDbError> {
+    let mut read = ReadItems {
+        items: Vec::new(),
+        unread: None,
+    };
     for (line_num, line) in reader.lines().enumerate() {
         let line = line.map_err(|_| {
             DynamoDbError::ValidationException(format!(
@@ -53,34 +68,40 @@ fn read_dynamodb_json(reader: impl BufRead, max_items: u64) -> Result<Vec<Item>,
         if trimmed.is_empty() {
             continue;
         }
-        let parsed: Value = serde_json::from_str(trimmed).map_err(|_| {
-            DynamoDbError::ValidationException(format!("Invalid JSON at line {}", line_num + 1))
-        })?;
-
-        let item_value = if let Some(inner) = parsed.get("Item") {
-            inner.clone()
-        } else {
-            parsed
-        };
-
-        let invalid_item = || {
-            DynamoDbError::ValidationException(format!(
-                "Invalid DynamoDB item at line {}",
-                line_num + 1
-            ))
-        };
-        if check_binaries(&item_value, |text| BASE64.decode(text)).is_err() {
-            return Err(invalid_item());
+        match read_line(trimmed) {
+            Ok(item) => read.items.push(item),
+            Err(fault) => {
+                read.unread = Some((line_num + 1, fault));
+                break;
+            }
         }
-        let item: Item = serde_json::from_value(item_value).map_err(|_| invalid_item())?;
-        items.push(item);
-        if u64::try_from(items.len()).unwrap_or(u64::MAX) > max_items {
+        if u64::try_from(read.items.len()).unwrap_or(u64::MAX) > max_items {
             return Err(DynamoDbError::ValidationException(format!(
                 "Import item count exceeds maximum ({max_items})"
             )));
         }
     }
-    Ok(items)
+    Ok(read)
+}
+
+/// Read one line, or say why the import cannot read it.
+///
+/// The faults carry the service's words for a line that is not JSON, an
+/// object without an `Item` member, and a `B` value or `BS` member that is
+/// not canonical padded base64 (measured 2026-11-22). The item deserializer
+/// reads other base64 forms a request may send, so `check_binaries` reads
+/// the item with the standard decoder first. An `Item` the deserializer
+/// refuses gets ExtendDB's own words.
+fn read_line(line: &str) -> Result<Item, &'static str> {
+    let mut parsed: Value = serde_json::from_str(line).map_err(|_| "Unexpected token")?;
+    let item_value = parsed
+        .get_mut("Item")
+        .map(Value::take)
+        .ok_or("Expected 'Item' top level container")?;
+    if check_binaries(&item_value, |text| BASE64.decode(text)).is_err() {
+        return Err("Expected a binary value in base64-encoded format");
+    }
+    serde_json::from_value(item_value).map_err(|_| "Invalid DynamoDB item")
 }
 
 /// Read CSV format.
@@ -719,14 +740,101 @@ mod tests {
             .filter_map(|(value, bytes)| {
                 let line = format!(r#"{{"Item": {{"pk": {{"S": "row"}}, "b": {value}}}}}"#);
                 let got = read_dynamodb_json(line.as_bytes(), 10)
-                    .map(|items| items[0]["b"].clone())
-                    .map_err(|e| message(&e));
+                    .map_err(|e| message(&e))
+                    .and_then(|read| match read.unread {
+                        None => Ok(read.items[0]["b"].clone()),
+                        Some((_, fault)) => Err(fault.to_owned()),
+                    });
                 let want = bytes
                     .map(|bytes| AttributeValue::B(bytes.to_vec()))
-                    .ok_or_else(|| "Invalid DynamoDB item at line 1".to_owned());
+                    .ok_or_else(|| "Expected a binary value in base64-encoded format".to_owned());
                 (got != want).then(|| format!("{value}: {got:?}"))
             })
             .collect();
         assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// The files of one import measured on DynamoDB on 2026-11-22: the lines
+    /// of each, the items the reader gives the handler, and the line that
+    /// ended the reading of the file with the service's words for it. The
+    /// two files whose first item the handler's key check refuses are read
+    /// whole, as `f` is, and are in the wire tests.
+    #[test]
+    fn a_line_the_import_cannot_read_ends_the_file() {
+        const BINARY: &str = "Expected a binary value in base64-encoded format";
+        /// A file: its name, its lines, the items read, the unread line.
+        type File = (
+            &'static str,
+            &'static [&'static str],
+            serde_json::Value,
+            Option<(usize, &'static str)>,
+        );
+        let rows: [File; 6] = [
+            (
+                "a",
+                &[
+                    r#"{"Item": {"pk": {"S": "A1"}}}"#,
+                    r#"{"Item": {"pk": {"S": "A2"}, "b": {"B": "YQ"}}}"#,
+                    r#"{"Item": {"pk": {"S": "A3"}}}"#,
+                ],
+                serde_json::json!([{"pk": {"S": "A1"}}]),
+                Some((2, BINARY)),
+            ),
+            (
+                "c",
+                &[
+                    r#"{"Item": {"pk": {"S": "C1"}}}"#,
+                    r#"{"Item": {"pk": {"S": "C2"}"#,
+                    r#"{"Item": {"pk": {"S": "C3"}}}"#,
+                ],
+                serde_json::json!([{"pk": {"S": "C1"}}]),
+                Some((2, "Unexpected token")),
+            ),
+            (
+                "f",
+                &[
+                    r#"{"Item": {"pk": {"S": "F1"}}}"#,
+                    r#"{"Item": {"pk": {"S": "F2"}}}"#,
+                ],
+                serde_json::json!([{"pk": {"S": "F1"}}, {"pk": {"S": "F2"}}]),
+                None,
+            ),
+            (
+                "g",
+                &[
+                    r#"{"Item": {"pk": {"S": "G1"}, "b": {"B": "YQ"}}}"#,
+                    r#"{"Item": {"pk": {"S": "G2"}}}"#,
+                ],
+                serde_json::json!([]),
+                Some((1, BINARY)),
+            ),
+            (
+                "i",
+                &[
+                    r#"{"Item": {"pk": {"S": "I1"}}}"#,
+                    "",
+                    r#"{"Item": {"pk": {"S": "I3"}}}"#,
+                ],
+                serde_json::json!([{"pk": {"S": "I1"}}, {"pk": {"S": "I3"}}]),
+                None,
+            ),
+            (
+                "j",
+                &[r#"{"pk": {"S": "J1"}}"#, r#"{"Item": {"pk": {"S": "J2"}}}"#],
+                serde_json::json!([]),
+                Some((1, "Expected 'Item' top level container")),
+            ),
+        ];
+        for (name, lines, items, unread) in rows {
+            let file = lines
+                .iter()
+                .map(|line| format!("{line}\n"))
+                .collect::<String>();
+            let read = read_dynamodb_json(file.as_bytes(), 10).unwrap_or_else(|e| {
+                panic!("{name}: {}", message(&e));
+            });
+            assert_eq!(serde_json::to_value(&read.items).unwrap(), items, "{name}");
+            assert_eq!(read.unread, unread, "{name}");
+        }
     }
 }

@@ -1024,11 +1024,11 @@ Keys imported earlier keep working while import is disabled.
 
 **Fix:** Check file permissions. The extenddb process must have read access to the file.
 
-### `Invalid JSON at line N: <error>`
+### An import ends `FAILED` with `ItemValidationError`
 
-**Cause:** A line in the DYNAMODB_JSON import file is not valid JSON.
+**Cause:** The import refused a line or an item of the file, as DynamoDB does. A DYNAMODB_JSON line it cannot read (not a JSON object, no `Item` member, or a `B` value that is not padded base64), or an item holding a value that is not a number, ends the import of its file: the items before it are imported, the lines after it are not read. An item that fails a check (a missing key, a key of another type, a number out of range, a size or nesting limit) is skipped and the next line is read. Each counts as one error in `ErrorCount`; `ProcessedItemCount` is the imported items plus the errors. The table keeps the imported items.
 
-**Fix:** Each line must be a valid JSON object. The format is one item per line: `{"Item": {"pk": {"S": "val"}, ...}}` or bare `{"pk": {"S": "val"}, ...}`.
+**Fix:** The server log has one line per refused line or item, with the import ARN, the line or item number and the cause. Each line must be one JSON object of the form `{"Item": {"pk": {"S": "val"}, ...}}`. Correct the file and import it into a new table.
 
 ### `Cannot write export file`
 
