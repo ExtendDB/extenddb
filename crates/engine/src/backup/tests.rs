@@ -4366,9 +4366,10 @@ fn account_prefix_does_not_match() {
 
 /// Measured on DynamoDB in us-east-1 on 21 Nov 2026 with
 /// `RestoreTableFromBackup`, `DescribeBackup` and `DeleteBackup`, which
-/// answered each shape alike, except that the restore answers a slash or
-/// `..` in the region with its cross-region text, which ExtendDB does not
-/// give. The `ListBackups` cursor is checked by the same parser before its
+/// answered each shape alike. A region field the restore answers with its
+/// cross-region text is in
+/// `a_restore_of_a_backup_arn_in_another_region_is_the_cross_region_answer`.
+/// The `ListBackups` cursor is checked by the same parser before its
 /// account is compared, with no not-found answer; the service's texts for it
 /// are its own.
 #[tokio::test]
@@ -4380,7 +4381,6 @@ async fn malformed_arn_is_a_validation_exception_with_the_services_text() {
                             ExclusiveStartBackupArn does not match the account";
     let id = "01791976431438-73d8d5bc";
     let base = format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Music");
-    let in_region = |region: &str| format!("arn:aws:dynamodb:{region}:{ACCOUNT}:table/Music");
     let upper = format!("{base}/backup/01791976431438-73D8D5BC");
     let not_found = format!("BackupNotFoundException: Backup not found: {upper}");
     let cases: Vec<(String, &str)> = vec![
@@ -4423,13 +4423,6 @@ async fn malformed_arn_is_a_validation_exception_with_the_services_text() {
         (format!("{base}/backup/0179197643143x-73d8d5bc"), NOT_VALID),
         (format!("{base}/backup/{id}\u{0}"), NOT_VALID),
         (format!("{base}/backup/{id}\n\u{7}"), NOT_VALID),
-        // A slash or `..` in the region.
-        (format!("{}/backup/{id}", in_region("us/east-1")), NOT_VALID),
-        (format!("{}/backup/{id}", in_region("..")), NOT_VALID),
-        (
-            format!("{}/backup/{id}", in_region("us-east-1/..")),
-            NOT_VALID,
-        ),
         // The account first, whatever the rest of a six-field ARN with a
         // non-empty resource: an empty account, another service, another
         // partition or region, a resource that is not a backup (measured on
@@ -4632,17 +4625,18 @@ async fn a_backup_stored_under_another_region_resolves_as_written() {
     assert!(!fake.descriptions.lock().unwrap().contains_key(&ours));
 
     // Neither spelling: BackupNotFoundException from the backend, after both
-    // were tried; the server's own spelling is tried once.
+    // were tried, the server's own spelling once; the restore answers
+    // another region's with the cross-region text.
     let fake = Arc::new(Fake::default());
-    for (body, reads) in [(stored.clone(), 2), (ours.clone(), 1)] {
+    for (body, reads, restored) in [
+        (stored.clone(), 2, "ValidationException"),
+        (ours.clone(), 1, "BackupNotFoundException"),
+    ] {
         let before = fake.source_reads();
         let err = restore(&fake, restore_body(json!({ "BackupArn": body })))
             .await
             .unwrap_err();
-        assert!(
-            matches!(err, DynamoDbError::BackupNotFoundException(_)),
-            "{err:?}"
-        );
+        assert_eq!(err.error_type(), restored, "{err:?}");
         assert_eq!(fake.source_reads() - before, reads);
         assert!(matches!(
             describe_backup(&*fake, ACCOUNT, REGION, &own(&body))
@@ -4671,6 +4665,89 @@ async fn a_backup_stored_under_another_region_resolves_as_written() {
         "{err:?}"
     );
     assert_eq!(fake.source_reads(), 1);
+    assert!(fake.restores().is_empty());
+}
+
+/// A restore of a `BackupArn` of the caller's account whose region field is
+/// not the server's and that names no backup is the cross-region text, after
+/// the `TargetTableName` and before the id and partition checks, when the
+/// request has no `SSESpecificationOverride` or has it as `null`; with one
+/// of any content, `{}` included, the restore answers as for its own region.
+/// A table segment outside the length bounds is `Invalid Backup ARN` first,
+/// in another region and in the server's. DescribeBackup and DeleteBackup
+/// (`arn_field`) and the `ListBackups` cursor keep the shape's answer.
+/// Measured on DynamoDB in us-east-1 on 21 and 22 Nov 2026, each request
+/// twice (DescribeBackup for the four region fields outside the shape,
+/// DeleteBackup for the first three of them).
+#[tokio::test]
+async fn a_restore_of_a_backup_arn_in_another_region_is_the_cross_region_answer() {
+    const XREGION: &str = "ValidationException: Invalid Request: sseSpecificationOverride \
+                           must be provided for cross-region restores";
+    const NOT_VALID: &str = "ValidationException: Invalid Request: BackupArn is not valid";
+    const INVALID: &str = "ValidationException: Invalid Backup ARN";
+    const LENGTH: &str = "ValidationException: TableName must be at least 3 characters long \
+                          and at most 255 characters long";
+    // `{arn}` is the ARN as sent.
+    const NOT_FOUND: &str = "BackupNotFoundException: Backup not found: {arn}";
+    const ID: &str = "01791976431438-73d8d5bc";
+    const UPPER: &str = "01791976431438-73D8D5BC";
+    let arn_of = |partition: &str, region: &str, table: &str, id: &str| {
+        format!("arn:{partition}:dynamodb:{region}:{ACCOUNT}:table/{table}/backup/{id}")
+    };
+    let fake = Arc::new(Fake::default());
+    let answer = |e: DynamoDbError| format!("{}: {}", e.error_type(), e.message());
+    let none = json!({});
+    let short = json!({ "TargetTableName": "a*" });
+    let null = json!({ "SSESpecificationOverride": null });
+    let on = json!({ "SSESpecificationOverride": { "Enabled": true } });
+    let empty = json!({ "SSESpecificationOverride": {} });
+    let long = "t".repeat(300);
+    // (BackupArn, the request's other members, the restore's answer)
+    let rows = [
+        (arn_of("aws", "us-west-2", "Music", ID), &none, XREGION),
+        (arn_of("aws", "us/east-1", "Music", ID), &none, XREGION),
+        (arn_of("aws", "..", "Music", ID), &none, XREGION),
+        (arn_of("aws", "us-east-1/..", "Music", ID), &none, XREGION),
+        (arn_of("aws", "US-EAST-1", "Music", ID), &none, XREGION),
+        (arn_of("aws", "us-west-2", "Music", ID), &short, LENGTH),
+        // 22 Nov 2026: an id or a partition the restore refuses too, and a
+        // `null` override.
+        (arn_of("aws", "us-west-2", "Music", "bad"), &none, XREGION),
+        (arn_of("aws", "us-west-2", "Music", UPPER), &none, XREGION),
+        (arn_of("aws-cn", "cn-north-1", "Music", ID), &none, XREGION),
+        (arn_of("aws-cn", "us/east-1", "Music", ID), &none, XREGION),
+        (arn_of("aws", "us-west-2", "Music", ID), &null, XREGION),
+        // 22 Nov 2026: with an override, the answers of the server's region.
+        (arn_of("aws", "us-west-2", "Music", ID), &on, NOT_FOUND),
+        (arn_of("aws", "us/east-1", "Music", ID), &on, NOT_VALID),
+        (arn_of("aws", "us-west-2", "Music", UPPER), &on, NOT_FOUND),
+        (arn_of("aws", "us-west-2", "Music", ID), &empty, NOT_FOUND),
+        // 22 Nov 2026: a table segment of 2 or 300 characters, in another
+        // region and in the server's.
+        (arn_of("aws", "us-west-2", "ab", ID), &none, INVALID),
+        (arn_of("aws", "us-west-2", &long, ID), &none, INVALID),
+        (arn_of("aws", REGION, "ab", ID), &none, INVALID),
+        (arn_of("aws", REGION, &long, ID), &none, INVALID),
+    ];
+    for (candidate, extra, restored) in rows {
+        let mut body = extra.clone();
+        body["BackupArn"] = json!(candidate);
+        let result = restore(&fake, restore_body(body)).await.map_err(answer);
+        let expected = restored.replace("{arn}", &candidate);
+        assert_eq!(result.err(), Some(expected), "{candidate}");
+    }
+    // DescribeBackup and DeleteBackup (`arn_field`) keep the shape's answer
+    // for a region field outside it, and the `ListBackups` cursor its own
+    // text for the three its earlier test held.
+    for region in ["us/east-1", "..", "us-east-1/..", "US-EAST-1"] {
+        let candidate = arn_of("aws", region, "Music", ID);
+        let field = arn_field(&json!({ "BackupArn": candidate }));
+        assert_eq!(answer(field.unwrap_err()), NOT_VALID, "{region}");
+        if region != "US-EAST-1" {
+            let cursor = list(&fake, json!({ "ExclusiveStartBackupArn": candidate })).await;
+            assert_eq!(answer(cursor.unwrap_err()), NOT_VALID, "cursor {region}");
+        }
+    }
     assert!(fake.restores().is_empty());
 }
 

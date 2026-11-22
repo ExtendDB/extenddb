@@ -98,12 +98,8 @@ fn backup_arn_member<'a>(
     account_id: &str,
 ) -> Result<Result<BackupArnParts<'a>, DynamoDbError>, DynamoDbError> {
     check_backup_arn_account(body, account_id)?;
-    let backup_arn = body
-        .get("BackupArn")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let trimmed = extenddb_core::backup_format::trim_backup_arn(backup_arn);
-    Ok(match extenddb_storage::util::check_backup_arn(backup_arn) {
+    let trimmed = backup_arn_text(body);
+    Ok(match extenddb_storage::util::check_backup_arn(trimmed) {
         Err(e @ BackupArnError::Invalid) => return Err(backup_arn_refusal(e)),
         Err(BackupArnError::Id)
             if extenddb_storage::util::backup_id_epoch_millis(&trimmed.to_ascii_lowercase())
@@ -123,6 +119,38 @@ pub fn check_restore_backup_arn(body: &Value, account_id: &str) -> Result<(), Dy
     backup_arn_member(body, account_id).map(drop)
 }
 
+/// The `BackupArn` member as sent, trimmed ([`trim_backup_arn`]); an absent
+/// one is empty. The one read of the member, for every check of it.
+///
+/// [`trim_backup_arn`]: extenddb_core::backup_format::trim_backup_arn
+fn backup_arn_text(body: &Value) -> &str {
+    extenddb_core::backup_format::trim_backup_arn(
+        body.get("BackupArn")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    )
+}
+
+/// The service's cross-region text (measured on DynamoDB in us-east-1 on 21
+/// and 22 Nov 2026) for a restore of a `BackupArn` whose region field is not
+/// `region` as written (an empty one included, not measured) with no
+/// `SSESpecificationOverride` or a `null` one; `None` with one of any
+/// content, `{}` included. Given after the `TargetTableName` and the
+/// override values, before the id, partition and region shape checks and the
+/// backup read, for an ARN naming no backup here: a stored backup named with
+/// another region restores, its service answer not measured.
+fn cross_region_restore(body: &Value, region: &str) -> Option<DynamoDbError> {
+    let fields = extenddb_core::arn::fields(backup_arn_text(body))?;
+    let cross_region =
+        fields.region != region && override_member(body, "SSESpecificationOverride").is_none();
+    cross_region.then(|| {
+        DynamoDbError::ValidationException(
+            "Invalid Request: sseSpecificationOverride must be provided for cross-region restores"
+                .to_owned(),
+        )
+    })
+}
+
 /// The account of a `BackupArn`, checked before anything else about it: an
 /// ARN of six fields with a non-empty resource whose account field is not
 /// the caller's, an empty one included, is `AccessDeniedException` whatever
@@ -133,12 +161,7 @@ pub fn check_restore_backup_arn(body: &Value, account_id: &str) -> Result<(), Dy
 /// 22 Nov 2026 with DescribeBackup, DeleteBackup and RestoreTableFromBackup.
 /// An absent member is an empty one. Reads no storage.
 pub fn check_backup_arn_account(body: &Value, account_id: &str) -> Result<(), DynamoDbError> {
-    let backup_arn = body
-        .get("BackupArn")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let trimmed = extenddb_core::backup_format::trim_backup_arn(backup_arn);
-    if extenddb_core::arn::fields(trimmed)
+    if extenddb_core::arn::fields(backup_arn_text(body))
         .is_some_and(|f| !f.resource.is_empty() && f.account != account_id)
     {
         return Err(DynamoDbError::AccessDeniedException(
@@ -1653,17 +1676,23 @@ fn validate_override_for_source(
     Ok(())
 }
 
+/// An override member of a restore as sent, a JSON `null` being an absent
+/// one.
+fn override_member<'a>(body: &'a Value, name: &str) -> Option<&'a Value> {
+    body.get(name).filter(|v| !v.is_null())
+}
+
 /// The overrides, parsed. A `BillingModeOverride` outside its enum is
 /// [`check_restore_name_and_overrides`]'s, which runs first.
 fn parse_restore_table_overrides(body: &Value) -> Result<RestoreTableOverrides, DynamoDbError> {
     for field in UNSUPPORTED_RESTORE_TABLE_OVERRIDE_FIELDS {
-        if body.get(field).is_some_and(|v| !v.is_null()) {
+        if override_member(body, field).is_some() {
             return Err(DynamoDbError::ValidationException(format!(
                 "RestoreTableFromBackup does not support {field} on ExtendDB"
             )));
         }
     }
-    let field = |name: &str| body.get(name).filter(|v| !v.is_null()).cloned();
+    let field = |name: &str| override_member(body, name).cloned();
     let billing_mode = field("BillingModeOverride")
         .map(serde_json::from_value)
         .transpose()
@@ -1851,15 +1880,17 @@ where
 /// ([`check_restore_override_kinds`]); (2) check `BackupArn`'s account and
 /// shape ([`backup_arn_member`]); (3) check `TargetTableName` and the
 /// override values ([`check_restore_name_and_overrides`]), then the rest
-/// of the `BackupArn` checks, then parse the overrides and check their
-/// shape and the `IndexName` of each index override
+/// of the `BackupArn` checks ([`cross_region_restore`] for one naming
+/// another region), then parse the overrides and check their shape and the
+/// `IndexName` of each index override
 /// ([`overrides::IndexOverrides::check_index_names`]), with no storage read;
-/// (4) read the backup: the catalog
-/// index's row first ([`check_catalog_row_status`]: a CREATING row is
-/// `BackupInUseException`, a DELETING, DELETED or FAILED row
-/// `BackupNotFoundException`), else the legacy reader's restore source, a
-/// missing backup being `BackupNotFoundException` whatever the target
-/// name's state; (5) check the target name under the account through
+/// (4) read the backup: the catalog index's row first
+/// ([`check_catalog_row_status`]: a CREATING row is `BackupInUseException`,
+/// a DELETING, DELETED or FAILED row `BackupNotFoundException`), else the
+/// legacy reader's restore source, a missing backup being
+/// `BackupNotFoundException` (named with another region and without an
+/// override, [`cross_region_restore`]'s answer) whatever the target name's
+/// state; (5) check the target name under the account through
 /// `describe_table` ([`check_restore_target_name`]: a table of that name is
 /// `TableAlreadyExistsException`, a CREATING restore target
 /// `TableInUseException` naming its source backup), after the backup is
@@ -1919,18 +1950,31 @@ where
 
     // 2. The ARN's account and shape before the target name, its region and
     // id after (measured on DynamoDB on 21 Nov 2026; `backup_arn_member`).
+    // A table segment outside the deployment's name bounds is the shape's
+    // answer too, before the cross-region text (measured on 22 Nov 2026 with
+    // 2 and 300 characters, in this region and in another); the alphabet is
+    // `check_backup_arn`'s, which takes no bounds, a backup's table being
+    // any name the deployment allowed.
     let backup_arn = backup_arn_member(body, account_id)?;
+    let (min, max) = table_name_bounds(limits);
+    if extenddb_core::arn::parse(backup_arn_text(body))
+        .is_some_and(|r| !(min..=max).contains(&r.table.len()))
+    {
+        return Err(backup_arn_refusal(BackupArnError::Invalid));
+    }
 
     // 3. Before the backup is read: the target name with the restore's
     // checks, not CreateTable's, in one message with the override values
     // the model refuses (measured on 21 Nov 2026), then the rest of the ARN
-    // checks, then the overrides, parsed, each index override's name and the
-    // PROVISIONED rule. DynamoDB answers a bad override name only after the
-    // ARN's account and the target name (measured on 20 Nov 2026), and the
-    // PROVISIONED rule after it reads the backup (#1097).
+    // checks, one naming another region without an override being the
+    // cross-region answer, then the overrides, parsed, each index override's
+    // name and the PROVISIONED rule. DynamoDB answers a bad override name
+    // only after the ARN's account and the target name (measured on 20 Nov
+    // 2026), and the PROVISIONED rule after it reads the backup (#1097).
     let target_table_name = pitr::table_name_member(body, "TargetTableName")?;
     check_restore_name_and_overrides(body, target_table_name, table_name_bounds(limits))?;
-    let backup_arn = BackupArnSpellings::new(&backup_arn?, region);
+    let backup_arn = backup_arn.map_err(|e| cross_region_restore(body, region).unwrap_or(e))?;
+    let backup_arn = BackupArnSpellings::new(&backup_arn, region);
     let overrides = parse_restore_table_overrides(body)?;
     validate_override_shape(&overrides)?;
     let index_overrides = overrides::IndexOverrides::parse(body)?;
@@ -1940,7 +1984,8 @@ where
     // restored from the store. With no row, the legacy reader under the ARN
     // spelling that resolves; the restore is registered against that
     // spelling, the one the backend stored. A legacy not-found re-reads the
-    // catalog index once.
+    // catalog index once; then an ARN naming another region without an
+    // override gets the cross-region answer.
     let mut held = read_catalog_row(&**storage, &backup_arn)
         .await
         .map_err(storage_err_to_dynamo)?;
@@ -1955,7 +2000,8 @@ where
                     .await
                     .map_err(storage_err_to_dynamo)?;
                 if held.is_none() {
-                    return Err(storage_err_to_dynamo(e));
+                    return Err(cross_region_restore(body, region)
+                        .unwrap_or_else(|| storage_err_to_dynamo(e)));
                 }
             }
             Err(e) => return Err(storage_err_to_dynamo(e)),
