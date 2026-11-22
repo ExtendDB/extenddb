@@ -77,8 +77,8 @@ run() {
 # failure itself.
 lock_wasm_bindgen_version() {
     local id version semver='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
-    show cargo pkgid wasm-bindgen
-    id="$(cargo pkgid wasm-bindgen)" \
+    show cargo pkgid --color never wasm-bindgen
+    id="$(cargo pkgid --color never wasm-bindgen)" \
         || die "cargo pkgid did not name the wasm-bindgen package of Cargo.lock (its error is above)"
     version="${id##*@}"
     if ! [[ "$version" =~ $semver ]]; then
@@ -94,11 +94,11 @@ wasm_bindgen_cli_advice() {
     echo "install it with: cargo install --locked --version ${1} wasm-bindgen-cli (what .github/workflows/wasm.yml runs, with the version it reads from Cargo.lock)"
 }
 
-# Runs `cargo test --locked <ARGS> --target wasm32-unknown-unknown` and fails
-# unless the run reports each test TESTS names `ok`, and no other test. `cargo
-# test` exits 0 when a test binary holds no test, and passes with the rest
-# when some tests lost their wasm_bindgen_test attribute, so its exit status
-# is not enough.
+# Runs `cargo test --locked --color never <ARGS>` for wasm32-unknown-unknown
+# and fails unless the run reports each test TESTS names `ok`, and no other
+# test. `cargo test` exits 0 when a test binary holds no test, and passes with
+# the rest when some tests lost their wasm_bindgen_test attribute, so its exit
+# status is not enough.
 #
 # Cargo runs each test module with CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER,
 # which must be the wasm-bindgen-test-runner of the version of the
@@ -138,10 +138,10 @@ run_suite() {
 
     LOG="$(mktemp "${TMPDIR:-/tmp}/run-wasm-step.XXXXXX")"
     trap 'rm -f "$LOG"' EXIT
-    show cargo test --locked "${ARGS[@]}" --target "$TARGET"
-    cargo test --locked "${ARGS[@]}" --target "$TARGET" 2>&1 | tee "$LOG" || status=$?
+    show cargo test --locked --color never "${ARGS[@]}" --target "$TARGET"
+    cargo test --locked --color never "${ARGS[@]}" --target "$TARGET" 2>&1 | tee "$LOG" || status=$?
 
-    # The run's output without colour escapes.
+    # Without colour escapes: cargo's --color never does not reach the runner's.
     output="$(sed "s/$(printf '\033')\[[0-9;]*m//g" "$LOG")"
     if [ "$status" -ne 0 ]; then
         problems+=("cargo test exited with status ${status}")
