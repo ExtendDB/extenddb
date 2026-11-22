@@ -9,6 +9,8 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
@@ -33,6 +35,10 @@ pub(crate) fn read_items(
 }
 
 /// Read `DynamoDB` JSON format: one JSON object per line with `{"Item": {...}}` wrapper.
+///
+/// The service's import reads a `B` value or a `BS` member only as canonical
+/// padded base64 (measured 2026-11-22), and the item deserializer reads other
+/// forms a request may send, so [`canonical_binaries`] checks the line first.
 fn read_dynamodb_json(reader: impl BufRead, max_items: u64) -> Result<Vec<Item>, DynamoDbError> {
     let mut items = Vec::new();
     for (line_num, line) in reader.lines().enumerate() {
@@ -56,12 +62,16 @@ fn read_dynamodb_json(reader: impl BufRead, max_items: u64) -> Result<Vec<Item>,
             parsed
         };
 
-        let item: Item = serde_json::from_value(item_value).map_err(|_| {
+        let invalid_item = || {
             DynamoDbError::ValidationException(format!(
                 "Invalid DynamoDB item at line {}",
                 line_num + 1
             ))
-        })?;
+        };
+        if !canonical_binaries(&item_value) {
+            return Err(invalid_item());
+        }
+        let item: Item = serde_json::from_value(item_value).map_err(|_| invalid_item())?;
         items.push(item);
         if u64::try_from(items.len()).unwrap_or(u64::MAX) > max_items {
             return Err(DynamoDbError::ValidationException(format!(
@@ -70,6 +80,28 @@ fn read_dynamodb_json(reader: impl BufRead, max_items: u64) -> Result<Vec<Item>,
         }
     }
     Ok(items)
+}
+
+/// Whether every `B` text and `BS` member in `value` decodes with `STANDARD`.
+/// Matching member names is safe: a line that parses holds attribute values
+/// there, and any other line is refused. `serde_json` caps the depth at 128.
+fn canonical_binaries(value: &Value) -> bool {
+    match value {
+        Value::Object(members) => {
+            members
+                .iter()
+                .all(|(tag, payload)| match (tag.as_str(), payload) {
+                    ("B", Value::String(text)) => BASE64.decode(text).is_ok(),
+                    ("BS", Value::Array(set)) => set
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .all(|text| BASE64.decode(text).is_ok()),
+                    _ => canonical_binaries(payload),
+                })
+        }
+        Value::Array(items) => items.iter().all(canonical_binaries),
+        _ => true,
+    }
 }
 
 /// Read CSV format.
@@ -673,5 +705,49 @@ mod tests {
                 PathBuf::from("/mnt/data/111122223333"),
             ]
         );
+    }
+
+    /// Measured on DynamoDB on 2026-11-22: an import of the first 18 values,
+    /// one line `{"Item": {"pk": {"S": ...}, "b": <value>}}` each, imported
+    /// the `YQ==` line and refused every other line. The last two rows, a
+    /// value inside an `M` and an `L`, were not measured.
+    #[test]
+    fn import_reads_a_binary_only_in_the_canonical_form() {
+        let rows: [(&str, Option<&[u8]>); 20] = [
+            (r#"{"B": "YQ=="}"#, Some(&[0x61])),
+            (r#"{"B": "YQ"}"#, None),
+            (r#"{"B": "YQ="}"#, None),
+            (r#"{"B": "Y=Q="}"#, None),
+            (r#"{"B": "=YQ="}"#, None),
+            (r#"{"B": "Y-Q="}"#, None),
+            (r#"{"B": "=A=="}"#, None),
+            (r#"{"B": "YWJjY=Q="}"#, None),
+            (r#"{"B": "Y=Q"}"#, None),
+            (r#"{"B": "=Y=="}"#, None),
+            (r#"{"B": "=YQA"}"#, None),
+            (r#"{"B": "Y Q="}"#, None),
+            (r#"{"B": "Y"}"#, None),
+            (r#"{"B": "=="}"#, None),
+            (r#"{"BS": ["Y=Q=", "//Q="]}"#, None),
+            (r#"{"BS": ["Y=Q=", "=YQ="]}"#, None),
+            (r#"{"BS": ["YQ", "YQ=="]}"#, None),
+            (r#"{"B": "Y=Q=\n"}"#, None),
+            (r#"{"M": {"b": {"B": "YQ"}}}"#, None),
+            (r#"{"L": [{"B": "YQ"}]}"#, None),
+        ];
+        let wrong: Vec<String> = rows
+            .into_iter()
+            .filter_map(|(value, bytes)| {
+                let line = format!(r#"{{"Item": {{"pk": {{"S": "row"}}, "b": {value}}}}}"#);
+                let got = read_dynamodb_json(line.as_bytes(), 10)
+                    .map(|items| items[0]["b"].clone())
+                    .map_err(|e| message(&e));
+                let want = bytes
+                    .map(|bytes| AttributeValue::B(bytes.to_vec()))
+                    .ok_or_else(|| "Invalid DynamoDB item at line 1".to_owned());
+                (got != want).then(|| format!("{value}: {got:?}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }
