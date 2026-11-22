@@ -702,7 +702,10 @@ impl MigrationBackend for SqliteMigrations {
     }
 
     // On wasm32 every database is in memory (`self.file` is `None`), and the
-    // method above returns `Ok(Vec::new())` for one.
+    // method above returns `Ok(Vec::new())` for one. The test
+    // `an_in_memory_database_gets_no_lines_before_the_first_write`, at the end
+    // of this file, checks that answer of the method above, and its failure
+    // message names this method.
     #[cfg(target_arch = "wasm32")]
     async fn before_first_write(
         &self,
@@ -767,5 +770,50 @@ impl MigrationBackend for SqliteMigrations {
             .await
             .map(|_| ())
             .map_err(|e| MigrationError::store(format!("forget migration {id}"), e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use extenddb_storage::migrations::{MigrationBackend, MigrationId, Runner};
+
+    use super::SqliteMigrations;
+
+    /// For an in-memory database, `before_first_write` reports no lines: on
+    /// an empty catalog, for a run from no version, and on a catalog holding
+    /// tables, for runs from no version, from version 1 and from the version
+    /// before the latest, each to the latest. The wasm32 build compiles
+    /// another `before_first_write` in place of this one, which returns no
+    /// lines for every database, since every database is in memory there; it
+    /// has to change with this answer.
+    #[tokio::test]
+    async fn an_in_memory_database_gets_no_lines_before_the_first_write() {
+        let engine = crate::SqliteEngine::new(":memory:", 1, "us-east-1", 400_000)
+            .await
+            .expect("engine");
+        let migrations =
+            SqliteMigrations::on_pool(engine.pool.clone(), ":memory:").expect("one connection");
+        let latest = MigrationId::LATEST.number();
+        let twin = "the wasm32 before_first_write returns no lines for every database, and has \
+                    to give the new answer too";
+        assert!(migrations.catalog_is_empty().await.expect("count tables"));
+        assert_eq!(
+            migrations.before_first_write(None, latest).await,
+            Ok(Vec::new()),
+            "an empty catalog: {twin}"
+        );
+        Runner::new(&migrations, "test")
+            .migrate()
+            .await
+            .expect("migrate");
+        assert!(!migrations.catalog_is_empty().await.expect("count tables"));
+        for from in [None, Some(1), Some(latest - 1)] {
+            assert_eq!(
+                migrations.before_first_write(from, latest).await,
+                Ok(Vec::new()),
+                "a catalog holding tables, from {from:?}: {twin}"
+            );
+        }
+        migrations.close().await;
     }
 }
