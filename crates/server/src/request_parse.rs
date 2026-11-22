@@ -142,15 +142,16 @@ pub(crate) fn nesting_depth(body: &[u8]) -> usize {
 
 /// Parse a request body whose [`nesting_depth`] is `depth` into a JSON
 /// [`Value`], matching `serde_json::from_slice` for everything within the depth
-/// ceiling except a number written with leading zeros (see [`read_json`]), and
-/// refusing a body nested past the ceiling.
+/// ceiling except a number [`rewrite_numbers`] rewrites (leading zeros, a lone
+/// `-`, digits that end in a `.`), and refusing a body nested past the
+/// ceiling.
 pub(crate) fn parse_request_value(body: &[u8], depth: usize) -> Result<Value, DynamoDbError> {
     if depth > MAX_REQUEST_JSON_DEPTH {
         return Err(serialization_refusal());
     }
     // The depth ceiling above keeps the disabled recursion limit from letting a
-    // deep body overflow the stack. It bounds the body without leading zeros
-    // too, whose nesting is the same.
+    // deep body overflow the stack. It bounds the body with its numbers
+    // rewritten too, whose nesting is the same.
     read_json(body, |body| {
         let mut de = serde_json::Deserializer::from_slice(body);
         de.disable_recursion_limit();
@@ -160,43 +161,84 @@ pub(crate) fn parse_request_value(body: &[u8], depth: usize) -> Result<Value, Dy
     })
 }
 
-/// Run `read` on `body`. When it fails and a number in `body` is written with
-/// leading zeros, run it again on the body without them, since the service
-/// reads such a number as the decimal number it spells and `serde_json`
-/// refuses it (measured 2026-11-21, us-east-1: `00`, `-01`, `-010` and
-/// `01000001` are read as 0, -1, -10 and 1000001, and `00.5` and `0001` are
-/// accepted). A body that `read` accepts takes one pass, as before.
+/// Run `read` on `body`. When it fails and [`rewrite_numbers`] rewrites a
+/// number in `body` (leading zeros, a lone `-`, digits that end in a `.`), run
+/// it again on the rewritten body. A body that `read` accepts takes one pass,
+/// as before.
 fn read_json<T>(
     body: &[u8],
     read: impl Fn(&[u8]) -> serde_json::Result<T>,
 ) -> Result<T, DynamoDbError> {
     read(body)
-        .or_else(|e| without_leading_zeros(body).map_or(Err(e), |body| read(&body)))
+        .or_else(|e| rewrite_numbers(body).map_or(Err(e), |body| read(&body)))
         .map_err(|_| serialization_refusal())
 }
 
-/// `body` with the leading zeros of each number outside a string removed, or
-/// `None` when no number has one. The `-` stays, and so does one `0` before a
-/// `.`, an exponent or the end of the number. Only `0` bytes outside strings
-/// are removed, so the bytes of every string and the structural nesting are
-/// unchanged. The pass never recurses.
-fn without_leading_zeros(body: &[u8]) -> Option<Vec<u8>> {
+/// Whether `b` can be part of a number as the service reads one. The service
+/// takes a run of these bytes that starts with a digit or `-` as one number.
+fn number_byte(b: u8) -> bool {
+    matches!(b, b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
+}
+
+/// What the bytes of a number read so far spell, for [`rewrite_numbers`].
+#[derive(Clone, Copy)]
+enum Token {
+    /// Nothing: the byte before is not part of a number.
+    Outside,
+    /// The number's `-` alone.
+    Minus,
+    /// An optional `-` and the digits of the integer part.
+    Digits,
+    /// Any other run of number bytes.
+    Other,
+}
+
+/// `body` with each number outside a string in one of the three forms below
+/// written as the JSON number the service reads, or `None` when `body` has
+/// none. The service reads a number written with
+/// leading zeros as the decimal number its digits spell (measured 2026-11-21,
+/// us-east-1: `00`, `-01`, `-010` and `01000001` are read as 0, -1, -10 and
+/// 1000001, and `00.5` and `0001` are accepted), a `-` on its own as 0, and
+/// digits that end in a `.` as the digits (measured 2026-11-21: a Scan `Limit`
+/// of `-`, `1.`, `0.` and `-1.` is read as 0, 1, 0 and -1, and a
+/// `TotalSegments` of `1000001.` as 1000001). The pass removes those zeros and
+/// that `.`, and writes `0` for that `-`. Every other number stays as sent,
+/// so `-.`, `1e`, `1.e`, `1e5.`, `1-`, `1.5.5` and `-.5` are still refused.
+/// Only bytes outside strings change, so the bytes of every string and the
+/// structural nesting are unchanged. The pass never recurses.
+fn rewrite_numbers(body: &[u8]) -> Option<Vec<u8>> {
     let mut out: Option<Vec<u8>> = None;
     let mut strings = StringScan::default();
-    // Whether the next byte starts a number's integer part: the byte before
-    // it is not part of a number, or is the number's `-` or a removed zero.
-    let mut at_start = true;
+    let mut token = Token::Outside;
     for (i, &b) in body.iter().enumerate() {
         let outside = strings.outside(b);
-        if outside && at_start && b == b'0' && body.get(i + 1).is_some_and(u8::is_ascii_digit) {
+        let next = body.get(i + 1).copied();
+        let last = !next.is_some_and(number_byte);
+        // The byte written for `b`, or `None` when `b` is removed.
+        let write = match (token, b) {
+            _ if !outside => Some(b),
+            (Token::Outside | Token::Minus, b'0') if next.is_some_and(|n| n.is_ascii_digit()) => {
+                None
+            }
+            (Token::Outside, b'-') if last => Some(b'0'),
+            (Token::Digits, b'.') if last => None,
+            _ => Some(b),
+        };
+        if write != Some(b) {
             out.get_or_insert_with(|| body[..i].to_vec());
-            continue;
         }
+        // A removed zero leaves the number before its digits; a removed `.`
+        // ends it, since no number byte follows.
+        let Some(write) = write else { continue };
         if let Some(out) = out.as_mut() {
-            out.push(b);
+            out.push(write);
         }
-        let number = outside && matches!(b, b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E');
-        at_start = !number || (at_start && b == b'-');
+        token = match (token, b) {
+            _ if !outside || !number_byte(b) => Token::Outside,
+            (Token::Outside, b'-') => Token::Minus,
+            (Token::Outside | Token::Minus | Token::Digits, b'0'..=b'9') => Token::Digits,
+            _ => Token::Other,
+        };
     }
     out
 }
@@ -212,7 +254,8 @@ fn without_leading_zeros(body: &[u8]) -> Option<Vec<u8>> {
 /// authentication does: bytes after a complete body, an invalid UTF-8 byte in
 /// a string and a lone surrogate escape all pass it (measured 2026-11-19,
 /// us-east-1: unsigned, each is a `MissingAuthenticationTokenException`). A
-/// number written with leading zeros passes it, as it passes the parse.
+/// number that [`rewrite_numbers`] rewrites passes it, as it passes the
+/// parse.
 pub(crate) fn check_request_syntax(body: &[u8]) -> Result<(), DynamoDbError> {
     read_json(body, |body| {
         IgnoredAny::deserialize(&mut serde_json::Deserializer::from_slice(body))
@@ -416,7 +459,8 @@ mod tests {
         // server reads, or `None` when it refuses the body. The service sends
         // no message field for a signed body with a syntax fault (measured
         // 2026-11-19 and 2026-11-20, us-east-1). It reads a number written
-        // with leading zeros as the decimal number it spells (measured
+        // with leading zeros as the decimal number it spells, a `-` on its
+        // own as 0 and digits that end in a `.` as the digits (measured
         // 2026-11-21, us-east-1), so such a body is read at every depth, with
         // the bytes of its strings as sent. The parse and the check give each
         // row the same answer. The parse recurses, so the rows run on a
@@ -445,11 +489,32 @@ mod tests {
             ),
             (nested(b"01"), Some(nested(b"1"))),
             (br#"{"x": 01,}"#.to_vec(), None),
+            (
+                br#"{"x": 1., "a": [0., -1., 1000001., -, 01., -0., 1.0], "m": {"y": -}}"#.to_vec(),
+                Some(
+                    br#"{"x": 1, "a": [0, -1, 1000001, 0, 1, -0.0, 1.0], "m": {"y": 0}}"#.to_vec(),
+                ),
+            ),
+            (
+                br#"{"k.": "1.", "N": "-", "x": [1., 1.5, 1e5, 1E+5, -1, 0]}"#.to_vec(),
+                Some(br#"{"k.": "1.", "N": "-", "x": [1, 1.5, 1e5, 1E+5, -1, 0]}"#.to_vec()),
+            ),
+            (nested(b"-"), Some(nested(b"0"))),
         ];
+        // Numbers the service refuses in an integer member with "Bad number
+        // format" and skips outside its model, the fractions `-.5` and `1.e7`
+        // it reads (#720), and `+1`, `.5` and `0x10`, which it refuses with no
+        // message (measured 2026-11-21 and 2026-11-22, us-east-1): each stays
+        // as sent, so the body is refused.
+        let refused = [
+            "-.", "1e", "1E", "1e+", "1.e", "1.5e", "1e5.", "--1", "1-", "1.5.5", "1+1", "-e",
+            "-.5", "1.e7", "+1", ".5", "0x10",
+        ]
+        .map(|number| (format!(r#"{{"x": {number}}}"#).into_bytes(), None));
         std::thread::Builder::new()
             .stack_size(REQUEST_WORKER_STACK_SIZE)
             .spawn(move || {
-                for (row, (body, reads_as)) in rows.iter().enumerate() {
+                for (row, (body, reads_as)) in rows.iter().chain(&refused).enumerate() {
                     let parsed = parse(body);
                     if let (Ok(value), Some(spelled)) = (&parsed, reads_as) {
                         assert_eq!(*value, parse(spelled).unwrap(), "row {row}");
