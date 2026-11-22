@@ -87,13 +87,10 @@ pub(crate) async fn handle_request(
     // Real DynamoDB validates the operation name, then the request format
     // (empty body, invalid JSON), before checking authentication: an unknown
     // operation returns UnknownOperationException even without auth headers,
-    // and a malformed request gets 400 regardless of auth state. The engine
-    // owns these two checks and their order (`extenddb_engine::parse_request`
-    // here, `ParsedRequest::admit` after authentication), and the WebAssembly
-    // adapter calls them too, for every operation except the four it refuses
-    // before them (the three PartiQL operations and DescribeEndpoints). Every
-    // other check this function and `authorize_request` make before dispatch
-    // is the server's own, and the adapter makes none of them.
+    // and a malformed request gets 400 regardless of auth state.
+    // `extenddb_engine::parse_request` makes both checks, in that order; the
+    // module doc of `crates/engine/src/pre_dispatch.rs` says which checks
+    // belong in the engine rather than here.
     let request = match extenddb_engine::parse_request(&operation, &body) {
         Ok(request) => request,
         Err(e) => return error_response(&e, &request_id),
