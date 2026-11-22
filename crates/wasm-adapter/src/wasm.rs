@@ -71,32 +71,14 @@ impl ExtendDb {
     /// Call `submit` only on an object that [`ExtendDb::create`] returned and
     /// that has not been freed. The generated JavaScript passes the
     /// `__wbg_ptr` property of the object `submit` is called on to the module
-    /// as the address of an instance. wasm-bindgen's conversion of that
-    /// receiver (`borrow_rust_object` in its runtime) refuses a null address
-    /// and an address whose borrow flag allows no further shared borrow: a
-    /// negative flag (the value is mutably borrowed) or `isize::MAX` (the most
-    /// shared borrows the flag can count, `0x7fffffff` on wasm32). It takes
-    /// the memory at any other address to be an instance. So a call on any
-    /// other object is undefined. It can throw from `submit` itself: an
-    /// address whose flag allows no further shared borrow throws
-    /// `Error: recursive use of an object detected which would lead to unsafe aliasing in rust`,
-    /// and, in the JavaScript wasm-bindgen generates without `--debug` (as for
-    /// `wasm-pack build --release`), an instance after `free()`, an object
-    /// made with `new ExtendDb()` and an object with no `__wbg_ptr` throw
-    /// `Error: null pointer passed to rust`. The JavaScript it generates with
-    /// `--debug`, which `wasm-pack build --dev` passes, refuses those three
-    /// with errors of its own: `new ExtendDb()` itself throws, and `submit`
-    /// throws before it calls the module.
-    /// It can trap: an address past the end of linear memory throws
-    /// `RuntimeError: memory access out of bounds`. Or it can answer from
-    /// another instance: an object that carries a live instance's `__wbg_ptr`,
-    /// such as `{...db}`, answers from that instance's database.
+    /// as the address of an instance, and wasm-bindgen's runtime takes the
+    /// memory at any address it does not refuse to be an instance. So a call
+    /// on any other object is undefined: it can throw, trap, or answer from
+    /// another instance.
     ///
     /// On an instance, a trap before `submit` returns its promise throws out of
-    /// `submit` itself. When the module cannot allocate the copy of an argument
-    /// in its linear memory, a release build traps there and the call throws
-    /// `RuntimeError: unreachable`; a debug build throws `Error: invalid malloc
-    /// request` instead.
+    /// `submit` itself, as does a failure to copy an argument into the
+    /// module's linear memory.
     ///
     /// On `wasm32` a panic cannot unwind: it traps, and the trap throws out of
     /// the task that was running the request, so that request's promise stays
