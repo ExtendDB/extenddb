@@ -56,10 +56,16 @@ force-warned lint). It fails, with one line per problem, unless:
    its options for one crate);
 5. in the adapter's wasm32 build as `cargo tree -e normal` resolves it, each
    of aes, aes-gcm, ghash and polyval is there as one copy (one package: one
-   name, version and source), with its zeroize feature on.
+   name, version and source), with its zeroize feature on;
+6. the guard can plant every probe and control (_plant and plant_controls
+   say when it cannot); each of BUILD_SCRIPT, LINTS_CONTROL and
+   MIGRATIONS_CONTROLS goes into the first crate of the build, by name, that
+   can take it (_own_crate_plants). When a run does not finish, the plants
+   that could not be made are reported before its errors.
 Each check runs, in the same call, on the tree and on controls planted for
-it, but for the check that both runs finish, which a control could test only
-by stopping the guard: CONTROLS, OTHER_FILE_CONTROLS, LINTS_CONTROL with its
+it, but for two: the plant check, which no control makes fail, and the check
+that both runs finish, which a control could test only by stopping the
+guard. The controls: CONTROLS, OTHER_FILE_CONTROLS, LINTS_CONTROL with its
 [lints] table, BUILD_SCRIPT, RELEASE_CONTROL, MIGRATIONS_CONTROLS,
 CONTROL_PROBE, CONTROL_ENTRY, CONTROL_ENVIRONMENT, CONTROL_CARGO_CONFIG and
 two zeroize graphs; and each run's dep-info must be read for every crate of
@@ -639,12 +645,16 @@ def dep_info(run: Run, crates: dict, copy: Path, name: str) -> tuple[dict, list[
     return read, found
 
 
-def unfinished(run: Run, name: str, read: dict, crates: dict) -> int:
+def unfinished(run: Run, name: str, read: dict, crates: dict, findings: list[Finding]) -> int:
     """Report a clippy run that did not finish (`read` holds the dep-info it
-    left, by crate) and return the guard's exit status. Once a crate fails,
+    left, by crate), after the plant findings among `findings`, one of which
+    can be the cause, and return the guard's exit status. Once a crate fails,
     cargo starts no other ("build failed, waiting for other jobs to
     finish"), so the run's reports and dep-info cover only the crates it
     finished: the guard judges nothing else."""
+    for finding in findings:
+        if finding.check == "plant":
+            print(f"FAIL: {finding.text}", file=sys.stderr)
     errors = [m.get("rendered") or m["message"] for m in run.messages if m["level"] == "error"]
     print(
         f"FAIL: the clippy step {name} did not finish in the copy (exit status {run.code}),"
@@ -1577,12 +1587,11 @@ pub(crate) fn refused() {{
 """
 
 # The allow on a migration module's `mod` line, in a src/migrations/mod.rs that
-# the copy adds to MIGRATIONS_CONTROL_CRATE, which has none: accepted on a
-# module of that form, whose file it covers; refused on another module, on one
-# with a path attribute, and in a src/migrations/mod.rs that the planted one
-# reaches through a module `src`, which is not in the directory of a library
-# root.
-MIGRATIONS_CONTROL_CRATE = "extenddb-engine"
+# the copy adds, with its module `migrations`, to a crate of the build that can
+# take it (plant_controls): accepted on a module of that form, whose file it
+# covers; refused on another module, on one with a path attribute, and in a
+# src/migrations/mod.rs that the planted one reaches through a module `src`,
+# which is not in the directory of a library root.
 _EMPTY_MODULE = "// An empty module, a control of the guard's copy only.\n"
 MIGRATIONS_CONTROLS = {
     "mod.rs": """\
@@ -1617,8 +1626,8 @@ mod m9997_wasm_clippy_guard_control;
     "src/migrations/m9997_wasm_clippy_guard_control.rs": _EMPTY_MODULE,
 }
 
-# A control in LINTS_CONTROL_CRATE, whose manifest in the copy gets LINTS_TABLE.
-LINTS_CONTROL_CRATE = "extenddb-core"
+# A control in a crate of the build that can take it (plant_controls), whose
+# manifest in the copy gets LINTS_TABLE.
 LINTS_CONTROL_MODULE = "wasm_clippy_guard_control"
 LINTS_TABLE = '\n[lints.clippy]\ndisallowed-methods = "allow"\n'
 LINTS_CONTROL = """\
@@ -1629,10 +1638,10 @@ pub(crate) fn lints_table() {
 }
 """
 
-# A build script, planted in the first crate of the wasm build with none, that
-# hands the crate's compiler the CLIPPY_ARGS and CLIPPY_CONF_DIR cargo clippy
-# set, written differently but read the same (an empty option clippy-driver
-# skips; the directory with `/.`).
+# A build script, planted in a crate of the build with none (plant_controls),
+# that hands the crate's compiler the CLIPPY_ARGS and CLIPPY_CONF_DIR cargo
+# clippy set, written differently but read the same (an empty option
+# clippy-driver skips; the directory with `/.`).
 BUILD_SCRIPT = """\
 // A control of devtools/check-wasm-clippy-guard, in its copy of the tree only.
 fn main() {
@@ -1661,30 +1670,76 @@ pub(crate) fn release_profile() {
 """
 
 
-def _plant(copy: Path, path: Path, text: str, append: bool = False) -> list[Finding]:
-    """Write (or append) `text` to the copy's file at `path` (a path of the
-    working tree); a new file whose name the working tree already uses is a
-    finding instead."""
+def _plant(
+    copy: Path, path: Path, text: str, append: bool = False, write: bool = True
+) -> list[Finding]:
+    """Write `text` to a new file of the copy at `path` (a path of the working
+    tree), or append it to the copy's file there; with `write` false, only find
+    whether that can be done. It cannot when the working tree already uses the
+    new file's name, or when the file appended to holds what `text` adds
+    (_held): then nothing is written, and the finding says why."""
     rel = Path(os.path.relpath(path, ROOT))
     if not append and os.path.lexists(path):
         return [Finding("plant", rel.as_posix(), f"{rel} exists; the guard plants a file there")]
-    (copy / rel).parent.mkdir(parents=True, exist_ok=True)
-    with open(copy / rel, "a" if append else "w", encoding="utf-8") as file:
-        file.write(text)
+    if append and (held := _held(copy, rel, text)):
+        return [Finding("plant", rel.as_posix(), f"{rel} {held}; the guard writes nothing to it")]
+    if write:
+        (copy / rel).parent.mkdir(parents=True, exist_ok=True)
+        with open(copy / rel, "a" if append else "w", encoding="utf-8") as file:
+            file.write(text)
     return []
+
+
+def _held(copy: Path, rel: Path, text: str) -> str | None:
+    """What the copy's file `rel` already holds of what appending `text` adds,
+    or None. In Rust source, for a module that a `mod <name>;` line of `text`
+    declares: a use of its name in the file's code, or a <name>.rs or
+    <name>/mod.rs beside the file in the working tree. In TOML, a table that
+    `text` opens."""
+    current = (copy / rel).read_text(encoding="utf-8")
+    if rel.suffix == ".rs":
+        code = code_only(current)
+        for name in re.findall(r"^mod (\w+);$", text, re.M):
+            if use := re.search(rf"\b{name}\b", code):
+                line = code.count("\n", 0, use.start()) + 1
+                held = current.splitlines()[line - 1].strip()
+                return f"uses `{name}` at line {line} ({held}), the name of a module the guard adds"
+            for file in (rel.parent / f"{name}.rs", rel.parent / name / "mod.rs"):
+                if os.path.lexists(ROOT / file):
+                    return f"has {file.as_posix()} beside it, a file of a module the guard adds"
+        return None
+    try:
+        tables = sorted(set(tomllib.loads(text)) & set(tomllib.loads(current)))
+    except tomllib.TOMLDecodeError as error:
+        return f"cannot be read as TOML ({error})"
+    return f"already has a [{tables[0]}] table" if tables else None
+
+
+def _own_crate_plants(name: str, package: dict) -> dict[str, list[tuple[Path, str, bool]]]:
+    """The plants (path, text, append) in the crate `name` of each control that
+    goes into a crate of its own, which can take it when the list is not empty
+    and _plant can make each of them: no plant of BUILD_SCRIPT goes into
+    PROBE_CRATE or into a crate with a build script."""
+    root, manifest = lib_root(package), Path(package["manifest_path"])
+    unfit = name == PROBE_CRATE or any("custom-build" in t["kind"] for t in package["targets"])
+    return {
+        "BUILD_SCRIPT": [] if unfit else [(manifest.parent / "build.rs", BUILD_SCRIPT, False)],
+        "LINTS_CONTROL": [
+            (root.parent / f"{LINTS_CONTROL_MODULE}.rs", LINTS_CONTROL, False),
+            (root, f"\n#[allow(dead_code)]\nmod {LINTS_CONTROL_MODULE};\n", True),
+            (manifest, LINTS_TABLE, True),
+        ],
+        "MIGRATIONS_CONTROLS": [
+            *((root.parent / "migrations" / n, t, False) for n, t in MIGRATIONS_CONTROLS.items()),
+            (root, "\n#[allow(dead_code)]\nmod migrations;\n", True),
+        ],
+    }
 
 
 def plant_controls(copy: Path, crates: dict[str, dict]) -> tuple[list[Control], set, list[Finding]]:
     """Plant the controls in the copy at `copy`. Returns them, the files that
     hold them, and a finding for each that cannot be planted."""
     probe_root = lib_root(crates[PROBE_CRATE])
-    lints_root = lib_root(crates[LINTS_CONTROL_CRATE])
-    migrations_root = lib_root(crates[MIGRATIONS_CONTROL_CRATE])
-    scripted = [
-        name
-        for name, package in sorted(crates.items())
-        if name != PROBE_CRATE and all("custom-build" not in t["kind"] for t in package["targets"])
-    ]
     sources = {
         probe_root.parent / f"{CONTROL_MODULE}.rs": CONTROLS,
         probe_root.parent.parent / CONTROL_MODULE / "outside_src.rs": OTHER_FILE_CONTROLS.format(
@@ -1692,34 +1747,46 @@ def plant_controls(copy: Path, crates: dict[str, dict]) -> tuple[list[Control], 
         ),
         probe_root.parent / f"{CONTROL_MODULE}.inc": OTHER_FILE_CONTROLS.format(name="include"),
         probe_root.parent / f"{RELEASE_MODULE}.rs": RELEASE_CONTROL,
-        lints_root.parent / f"{LINTS_CONTROL_MODULE}.rs": LINTS_CONTROL,
+        ROOT / CONTROL_CARGO_CONFIG: '[build]\nrustc-wrapper = "wasm-clippy-guard-control"\n',
     }
-    migrations = migrations_root.parent / "migrations"
-    sources |= {migrations / name: text for name, text in MIGRATIONS_CONTROLS.items()}
-    if scripted:
-        sources[Path(crates[scripted[0]]["manifest_path"]).parent / "build.rs"] = BUILD_SCRIPT
-    sources[ROOT / CONTROL_CARGO_CONFIG] = '[build]\nrustc-wrapper = "wasm-clippy-guard-control"\n'
-    found = [f for path, text in sources.items() for f in _plant(copy, path, text)]
-    for path, text in (
-        (probe_root, f"\n#[allow(dead_code)]\nmod {CONTROL_MODULE};\n"),
-        (lints_root, f"\n#[allow(dead_code)]\nmod {LINTS_CONTROL_MODULE};\n"),
-        (migrations_root, "\n#[allow(dead_code)]\nmod migrations;\n"),
-        (Path(crates[LINTS_CONTROL_CRATE]["manifest_path"]), LINTS_TABLE),
-    ):
+    appends = [(probe_root, f"\n#[allow(dead_code)]\nmod {CONTROL_MODULE};\n")]
+    found, hosts = [], {}
+    # The controls that go into a crate of their own (the docstring's item 6).
+    for control in ("BUILD_SCRIPT", "LINTS_CONTROL", "MIGRATIONS_CONTROLS"):
+        unfit = []
+        for name, package in sorted(crates.items()):
+            plants = _own_crate_plants(name, package)[control]
+            clashes = [f.text for plant in plants for f in _plant(copy, *plant, write=False)]
+            if plants and not clashes:
+                hosts[control] = name
+                for path, text, append in plants:
+                    if append:
+                        appends.append((path, text))
+                    else:
+                        sources[path] = text
+                break
+            unfit += clashes[:1] or [f"{name} is {PROBE_CRATE} or has a build script"]
+        else:
+            why = "".join(f"\n  {reason}" for reason in unfit)
+            found.append(Finding("plant", control, f"no crate of the build takes {control}:{why}"))
+    found += [f for path, text in sources.items() for f in _plant(copy, path, text)]
+    for path, text in appends:
         found += _plant(copy, path, text, append=True)
     config = copy / CONFIG_REL
+    current = config.read_text(encoding="utf-8")
     text, count = re.subn(
         r"^disallowed-methods = \[\n",
         lambda m: f'{m.group()}    {{ path = "{CONTROL_ENTRY}", reason = "a control" }},\n',
-        config.read_text(encoding="utf-8"),
+        current,
         count=1,
         flags=re.M,
     )
-    config.write_text(text, encoding="utf-8")
-    if count != 1:
+    if CONTROL_ENTRY in current:
+        found.append(Finding("plant", CONFIG_REL, f"{CONFIG_REL} names {CONTROL_ENTRY} already"))
+    elif count != 1:
         found.append(Finding("plant", CONFIG_REL, f"{CONFIG_REL}: no `disallowed-methods = [`"))
-    if not scripted:
-        found.append(Finding("plant", "build.rs", "each crate of the build has a build script"))
+    else:
+        config.write_text(text, encoding="utf-8")
 
     controls = []
     for path, text in sources.items():
@@ -1739,8 +1806,8 @@ def plant_controls(copy: Path, crates: dict[str, dict]) -> tuple[list[Control], 
         Control("unlisted probe", "probe", CONTROL_PROBE[1]),
         Control("unresolved entry", "entries", CONTROL_ENTRY, "no method probe"),
         Control("unresolved entry", "clippy.toml warning", CONTROL_ENTRY),
-        Control("build script", "dep-info", scripted[0] if scripted else "", "CLIPPY_ARGS"),
-        Control("build script", "dep-info", scripted[0] if scripted else "", "CLIPPY_CONF_DIR"),
+        Control("build script", "dep-info", hosts.get("BUILD_SCRIPT", ""), "CLIPPY_ARGS"),
+        Control("build script", "dep-info", hosts.get("BUILD_SCRIPT", ""), "CLIPPY_CONF_DIR"),
         Control("environment", "examined", "the environment"),
         Control("environment", "examined", "a control environment"),
         Control("environment", "environment", "a control environment", "RUSTC_WRAPPER"),
@@ -1818,14 +1885,14 @@ def check(crates: dict[str, dict], target_dir: str, copy: Path) -> int:
     read_plain, found = dep_info(plain, crates, copy, "without options")
     findings += found
     if plain.code != 0:
-        return unfinished(plain, "without options", read_plain, crates)
+        return unfinished(plain, "without options", read_plain, crates, findings)
     probe_file, spans, found = plant_probes(copy, crates)
     findings += found
     forced = run_clippy(copy, target_dir, FORCE_WARN)
     read_forced, found = dep_info(forced, crates, copy, "with --force-warn")
     findings += found
     if forced.code != 0:
-        return unfinished(forced, "with --force-warn", read_forced, crates)
+        return unfinished(forced, "with --force-warn", read_forced, crates, findings)
     findings += driver_problems(read_plain, read_forced, str(copy / CONF_REL))
     findings += config_warnings({"plain": plain, "forced": forced}, (copy / CONFIG_REL).resolve())
     probes = {kind: dict(table) for kind, table in KINDS.values()}
