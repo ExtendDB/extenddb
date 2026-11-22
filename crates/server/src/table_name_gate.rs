@@ -59,7 +59,9 @@
 //!   refusal) is answered before it (measured 2026-11-20), and so are the
 //!   account and the shape of the `BackupArn`
 //!   (`extenddb_engine::check_restore_backup_arn`: an absent or malformed
-//!   one is `Invalid Backup ARN`, measured 2026-11-21).
+//!   one is `Invalid Backup ARN`, measured 2026-11-21, and so is one whose
+//!   table segment is shorter than 3 or longer than 255 characters,
+//!   measured 2026-11-22).
 //! - A RestoreTableFromBackup override member of another JSON kind than the
 //!   model's, at any depth and a list in place of a structure included
 //!   (`extenddb_engine::check_restore_override_kinds`), is answered before
@@ -161,10 +163,12 @@ pub(crate) fn check_table_name_chars(
             // bounds (measured on DynamoDB on 20 Nov 2026).
             check_name_member(target, "targetTableName").or_else(|_| {
                 // The account and the shape of the `BackupArn` come before the
-                // name, an absent one included (measured on 21 Nov 2026).
-                extenddb_engine::check_restore_backup_arn(input, account_id)?;
+                // name, an absent one included (measured on 21 Nov 2026), its
+                // table segment with the name's bounds (22 Nov 2026).
+                let bounds = (3, 255);
+                extenddb_engine::check_restore_backup_arn(input, account_id, bounds)?;
                 let name = target.and_then(Value::as_str).unwrap_or_default();
-                extenddb_engine::check_restore_name_and_overrides(input, name, (3, 255))
+                extenddb_engine::check_restore_name_and_overrides(input, name, bounds)
             })
         }
         // The server refuses every RestoreTableToPointInTime before this
@@ -845,6 +849,9 @@ mod tests {
         let own =
             "arn:aws:dynamodb:us-east-1:123456789012:table/t367name/backup/01700000000000-abcdef12";
         let other = own.replace("123456789012", "111122223333");
+        let long = "t".repeat(300);
+        // The caller's `BackupArn` with `table` as its segment.
+        let segment = |table: &str| json!({ "BackupArn": own.replace("t367name", table) });
         let invalid = "Invalid Backup ARN";
         let gsi = "GlobalSecondaryIndexOverride";
         let pt = "ProvisionedThroughputOverride";
@@ -919,6 +926,15 @@ mod tests {
                 "a*",
                 len,
             ),
+            // The caller's table segment of 2 or 300 characters, or outside
+            // the pattern, is the shape's answer. With a name the gate
+            // passes, the engine checks the segment with the deployment's
+            // bounds (measured on 22 Nov 2026).
+            (segment("ab"), "a*", invalid),
+            (segment(&long), "a*", invalid),
+            (segment("a b"), "a*", invalid),
+            (segment("ab"), "t367name", "passed"),
+            (segment(&long), "t367name", "passed"),
             (json!({ "BackupArn": "x" }), "ab", "passed"),
             (json!({ gsi: {} }), "a*", ser),
             (json!({ gsi: {} }), "a b", ser),

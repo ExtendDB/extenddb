@@ -65,6 +65,12 @@ const LIST_BACKUPS_MAX_LIMIT: i64 = 100;
 /// (`BackupNotFoundException`, from the backend) from "that ARN belongs to
 /// another account".
 ///
+/// A table segment outside the deployment's name bounds is `Invalid Backup
+/// ARN` too, but only for an ARN that names no backup: one that passes the
+/// other checks is looked up, and the refusal is the answer when neither
+/// spelling is found ([`BackupArnSpellings::not_found`]). A backup taken
+/// under other `[limits]` is still described and deleted.
+///
 /// The service trims a trailing newline and resolves an ARN naming another
 /// region of the caller's account (measured on DynamoDB). The backends look
 /// up the exact string they stored, which carries the `server.region` in
@@ -80,25 +86,39 @@ fn backup_arn_field(
     body: &Value,
     account_id: &str,
     region: &str,
+    limits: &LimitsConfig,
 ) -> Result<BackupArnSpellings, DynamoDbError> {
-    let parts = backup_arn_member(body, account_id)??;
-    Ok(BackupArnSpellings::new(&parts, region))
+    let parts = backup_arn_member(body, account_id, (0, usize::MAX))?;
+    let refusal = backup_arn_member(body, account_id, table_name_bounds(limits)).err();
+    let out_of_bounds = refusal.is_some();
+    let parts = parts.map_err(|e| refusal.unwrap_or(e))?;
+    Ok(BackupArnSpellings {
+        out_of_bounds,
+        ..BackupArnSpellings::new(&parts, region)
+    })
 }
 
 /// `BackupArn` checked in the service's order (measured on DynamoDB in
 /// us-east-1 on 21 Nov 2026), an absent member as an empty one. The outer
 /// error is what a restore answers before its `TargetTableName`: the
-/// `AccessDeniedException` of [`check_backup_arn_account`], and a string
-/// [`BackupArnError::Invalid`] refuses is `Invalid Backup ARN`. The inner
-/// result is answered after the name: `BackupNotFoundException` for the
-/// service's id shape in upper-case hex, which no build issues, or the rest
-/// of [`check_backup_arn`].
+/// `AccessDeniedException` of [`check_backup_arn_account`], then `Invalid
+/// Backup ARN` for a string [`BackupArnError::Invalid`] refuses or a table
+/// segment whose length is outside `bounds` (measured on 22 Nov 2026 with 2
+/// and 300 characters, on DescribeBackup, DeleteBackup and the restore).
+/// [`check_backup_arn`] takes no bounds, because a backup's table can have
+/// any name the deployment allowed. The inner result is answered after the
+/// name: `BackupNotFoundException` for the service's id shape in upper-case
+/// hex, which no build issues, or the rest of [`check_backup_arn`].
 fn backup_arn_member<'a>(
     body: &'a Value,
     account_id: &str,
+    (min, max): (usize, usize),
 ) -> Result<Result<BackupArnParts<'a>, DynamoDbError>, DynamoDbError> {
     check_backup_arn_account(body, account_id)?;
     let trimmed = backup_arn_text(body);
+    if extenddb_core::arn::parse(trimmed).is_some_and(|r| !(min..=max).contains(&r.table.len())) {
+        return Err(backup_arn_refusal(BackupArnError::Invalid));
+    }
     Ok(match extenddb_storage::util::check_backup_arn(trimmed) {
         Err(e @ BackupArnError::Invalid) => return Err(backup_arn_refusal(e)),
         Err(BackupArnError::Id)
@@ -114,9 +134,14 @@ fn backup_arn_member<'a>(
 }
 
 /// The `BackupArn` answers a restore gives before its `TargetTableName`
-/// ([`backup_arn_member`]). Reads no storage.
-pub fn check_restore_backup_arn(body: &Value, account_id: &str) -> Result<(), DynamoDbError> {
-    backup_arn_member(body, account_id).map(drop)
+/// ([`backup_arn_member`]), with `bounds` for its table segment. Reads no
+/// storage.
+pub fn check_restore_backup_arn(
+    body: &Value,
+    account_id: &str,
+    bounds: (usize, usize),
+) -> Result<(), DynamoDbError> {
+    backup_arn_member(body, account_id, bounds).map(drop)
 }
 
 /// The `BackupArn` member as sent, trimmed ([`trim_backup_arn`]); an absent
@@ -192,6 +217,8 @@ pub(crate) struct BackupArnSpellings {
     as_written: Option<String>,
     canonical_arn: Option<BackupArn>,
     as_written_arn: Option<BackupArn>,
+    /// Set by [`backup_arn_field`], read by [`Self::not_found`].
+    out_of_bounds: bool,
 }
 
 impl BackupArnSpellings {
@@ -205,12 +232,22 @@ impl BackupArnSpellings {
             as_written,
             canonical_arn,
             as_written_arn,
+            out_of_bounds: false,
         }
     }
 
     /// The ARN this deployment issues for the backup named.
     fn canonical(&self) -> &str {
         &self.canonical
+    }
+
+    /// The answer for a backup found under neither spelling: IBA for an
+    /// out-of-bounds segment (22 Nov 2026), else `e`'s.
+    fn not_found(&self, e: StorageError) -> DynamoDbError {
+        if self.out_of_bounds {
+            return backup_arn_refusal(BackupArnError::Invalid);
+        }
+        storage_err_to_dynamo(e)
     }
 
     /// The parsed spellings in lookup order: canonical, then as written;
@@ -715,7 +752,7 @@ pub(crate) async fn handle_describe_backup(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
-    let backup_arn = backup_arn_field(&body, &ctx.account_id, &ctx.region)?;
+    let backup_arn = backup_arn_field(&body, &ctx.account_id, &ctx.region, &ctx.limits)?;
     let desc = describe_backup(&*ctx.storage, &ctx.account_id, &ctx.region, &backup_arn).await?;
     serialize_output(&json!({ "BackupDescription": desc }))
 }
@@ -761,7 +798,7 @@ async fn describe_backup<S: BackupCatalog + LegacyBackupReader + ?Sized>(
                     .map_err(storage_err_to_dynamo)?
                 {
                     Some(held) => described(held),
-                    None => Err(storage_err_to_dynamo(e)),
+                    None => Err(backup_arn.not_found(e)),
                 };
             }
             Err(e) => return Err(storage_err_to_dynamo(e)),
@@ -1244,7 +1281,7 @@ pub(crate) async fn handle_delete_backup(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
-    let backup_arn = backup_arn_field(&body, &ctx.account_id, &ctx.region)?;
+    let backup_arn = backup_arn_field(&body, &ctx.account_id, &ctx.region, &ctx.limits)?;
     let desc = delete_backup(
         &*ctx.storage,
         &ctx.backup,
@@ -1317,7 +1354,7 @@ async fn delete_backup<S: BackupCatalog + LegacyBackupReader + ?Sized>(
                 .map_err(storage_err_to_dynamo)?
             {
                 Some((arn, row)) => delete_catalog_backup(storage, runtime, &arn, &row).await,
-                None => Err(storage_err_to_dynamo(e)),
+                None => Err(backup_arn.not_found(e)),
             };
         }
         Err(e) => return Err(storage_err_to_dynamo(e)),
@@ -1997,17 +2034,8 @@ where
     // 2. The ARN's account and shape before the target name, its region and
     // id after (measured on DynamoDB on 21 Nov 2026; `backup_arn_member`).
     // A table segment outside the deployment's name bounds is the shape's
-    // answer too, before the cross-region text (measured on 22 Nov 2026 with
-    // 2 and 300 characters, in this region and in another); the alphabet is
-    // `check_backup_arn`'s, which takes no bounds, a backup's table being
-    // any name the deployment allowed.
-    let backup_arn = backup_arn_member(body, account_id)?;
-    let (min, max) = table_name_bounds(limits);
-    if extenddb_core::arn::parse(backup_arn_text(body))
-        .is_some_and(|r| !(min..=max).contains(&r.table.len()))
-    {
-        return Err(backup_arn_refusal(BackupArnError::Invalid));
-    }
+    // answer, before the cross-region text (measured on 22 Nov 2026).
+    let backup_arn = backup_arn_member(body, account_id, table_name_bounds(limits))?;
 
     // 3. Before the backup is read: the target name with the restore's
     // checks, not CreateTable's, in one message with the override values
