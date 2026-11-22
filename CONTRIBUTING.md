@@ -69,6 +69,12 @@ for its MongoDB and Cassandra cells) and runs nightly from
 (`docs/manuals/06-developer-test-guide.md`, "Test Runner Script") has a
 paragraph on each.
 
+The WebAssembly workflow (`.github/workflows/wasm.yml`) builds, lints and
+tests the code for `wasm32-unknown-unknown` on every pull request.
+`devtools/run-wasm-step <step>` runs one of its steps locally, as the
+script's header describes. The README's "Experimental: WebAssembly build"
+says what that build is.
+
 ### Code Style
 
 All contributions must pass:

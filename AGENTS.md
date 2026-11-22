@@ -275,6 +275,18 @@ devtools/run-coverage
 devtools/check-licenses
 ```
 
+### WebAssembly Build
+
+The WebAssembly workflow (`.github/workflows/wasm.yml`) builds, lints and tests the code for
+`wasm32-unknown-unknown` on every pull request. Run one of its steps locally as the header of
+`devtools/run-wasm-step` describes:
+
+```bash
+devtools/run-wasm-step <step>
+```
+
+The README's "Experimental: WebAssembly build" says what that build is.
+
 ## Configuration
 
 `extenddb init` generates `extenddb.toml`. See `extenddb.sample.toml` for all options.
