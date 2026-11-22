@@ -72,10 +72,11 @@
 //!
 //! # Documented differences from `sqlx-sqlite` 0.8.6
 //!
-//! The table in `tests/wasm_shim.rs` has six `difference: ...` rows: one each
-//! for **One location**, **One connection** and **After a failed
-//! `begin_with`**, and one per terminal (`fetch_one`, `fetch_optional`,
-//! `execute`) for **`$0`**. The other entries have no `difference: ...` row.
+//! The table in `tests/wasm_shim.rs` has a `difference: ...` row for each of
+//! **One location**, **One connection** and **After a failed `begin_with`**,
+//! and one per terminal (`fetch_one`, `fetch_optional`, `execute`) for
+//! **`$0`**; its `DIFFERENCE_ROWS` counts them. The other entries have no
+//! `difference: ...` row.
 //!
 //! * **One location.** The only location that parses is `sqlite::memory:`,
 //!   the URL the backend builds for the in-memory database
