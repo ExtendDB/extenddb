@@ -42,8 +42,8 @@ force-warned lint). It fails, with one line per problem, unless:
    build.rustc-wrapper or build.rustc-workspace-wrapper (another program as
    the compiler can change its options for one crate);
 5. in the adapter's wasm32 build as `cargo tree -e normal` resolves it, each
-   of aes, aes-gcm, ghash and polyval is there in one version, with its
-   zeroize feature on.
+   of aes, aes-gcm, ghash and polyval is there as one copy (one package: one
+   name, version and source), with its zeroize feature on.
 Each check runs, in the same call, on the tree and on controls planted for
 it: CONTROLS, OTHER_FILE_CONTROLS, LINTS_CONTROL with its [lints] table,
 BUILD_SCRIPT, RELEASE_CONTROL, CONTROL_PROBE, CONTROL_ENTRY,
@@ -1252,13 +1252,14 @@ ZEROIZE_CRATES = ("aes", "aes-gcm", "ghash", "polyval")
 CORE_MANIFEST = "crates/core/Cargo.toml"
 
 
-def adapter_graph(tree: Path, locked: bool = True) -> tuple[list[str], list[Finding]]:
+def adapter_graph(tree: Path) -> tuple[list[str], list[Finding]]:
     """The packages of the adapter's wasm32 build as `cargo tree -e normal`
     resolves them in the tree at `tree` (the adapter and its normal
     dependencies on that target, with the features its build compiles), one
-    `name version|features` line each. Unless `locked`, cargo resolves
-    offline and may rewrite the tree's Cargo.lock."""
-    command = ["cargo", "tree", "--locked" if locked else "--offline", "-p", ADAPTER]
+    `package|features` line each. A package is written as cargo tree's {p}
+    writes it: its name and version and, when it is not from crates.io, its
+    source."""
+    command = ["cargo", "tree", "--locked", "-p", ADAPTER]
     command += ["--target", TARGET, "-e", "normal", "--prefix", "none", "--format", "{p}|{f}"]
     try:
         run = subprocess.run(command, cwd=tree, capture_output=True, text=True, check=False)
@@ -1271,30 +1272,31 @@ def adapter_graph(tree: Path, locked: bool = True) -> tuple[list[str], list[Find
 
 def zeroize_problems(label: str, graph: list[str], crates: tuple = ZEROIZE_CRATES) -> list[Finding]:
     """Findings of `crates` in `graph` (adapter_graph's lines): a crate that is
-    missing, that is there in more than one version, or whose version has its
-    `zeroize` feature off."""
-    versions = {}
+    missing, that is there as more than one package (another version, or the
+    same version from another source), or whose package has its `zeroize`
+    feature off."""
+    packages = {}
     for line in graph:
         package, _, features = line.partition("|")
-        name, _, version = package.partition(" ")
+        name = package.partition(" ")[0]
         if name in crates:
-            versions.setdefault(name, {})[version.split(" ")[0]] = set(features.split(","))
+            packages.setdefault(name, {})[package] = set(features.split(","))
     found = [Finding("examined", label, f"examined {label}")]
     for crate in crates:
         where = f"{label}: {crate}"
-        present = versions.get(crate, {})
+        present = packages.get(crate, {})
         if not present:
             text = f"is not in the build; update ZEROIZE_CRATES and {CORE_MANIFEST} together"
         elif len(present) > 1:
             text = (
-                f"is in the build in {len(present)} versions ({', '.join(present)});"
-                f" {CORE_MANIFEST} turns the zeroize feature on only in the version its entry"
+                f"is in the build as {len(present)} packages ({', '.join(present)});"
+                f" {CORE_MANIFEST} turns the zeroize feature on only in the package its entry"
                 " resolves to, which must be the one aes-gcm's stack uses"
             )
         elif "zeroize" not in next(iter(present.values())):
             text = (
-                f"{next(iter(present))} is built without its zeroize feature, so it leaves key"
-                f" material in memory; {CORE_MANIFEST} turns it on for wasm32"
+                f"is built without its zeroize feature ({next(iter(present))}), so it leaves"
+                f" key material in memory; {CORE_MANIFEST} turns it on for wasm32"
             )
         else:
             continue
@@ -1304,30 +1306,18 @@ def zeroize_problems(label: str, graph: list[str], crates: tuple = ZEROIZE_CRATE
 
 def zeroize_check(copy: Path) -> tuple[list[Finding], list[str]]:
     """zeroize_problems, in one loop, of the adapter's wasm32 build in the copy
-    at `copy` and, for ghash, of two controls: that build with ghash's zeroize
-    feature removed from CORE_MANIFEST, and its graph with a second ghash
-    version added. Returns the findings and the build's line of each crate."""
-    manifest, lock = copy / CORE_MANIFEST, copy / "Cargo.lock"
-    original, original_lock = manifest.read_text(encoding="utf-8"), lock.read_bytes()
+    at `copy` and, for ghash, of two controls made from the build's ghash line
+    and checked alone: that line without its zeroize feature, and that line
+    beside a second package at its version from another source. Returns the
+    findings and the build's line of each crate."""
     graph, found = adapter_graph(copy)
-    entry = re.compile(r'^(\s*ghash\s*=\s*\{[^\n]*?features\s*=\s*\[[^\]\n]*?)"zeroize",?\s*', re.M)
-    try:
-        manifest.write_text(entry.sub(r"\1", original, count=1), encoding="utf-8")
-        without, failed = adapter_graph(copy, locked=False)
-    finally:
-        manifest.write_text(original, encoding="utf-8")
-        lock.write_bytes(original_lock)
-    # The second ghash: the build's ghash line under another version.
-    second = [
-        re.sub(r"^ghash v([^|]*)", r"ghash v\1-control", line)
-        for line in graph
-        if line.startswith("ghash ")
-    ]
-    found += failed
+    ghash = [line.partition("|") for line in graph if line.startswith("ghash ")][:1]
+    without = [f"{p}|{','.join(f for f in fs.split(',') if f != 'zeroize')}" for p, _, fs in ghash]
+    second = [f"{p}{source}|{fs}" for p, _, fs in ghash for source in ("", " (/control)")]
     for label, lines, crates in (
         ("the adapter's wasm32 build", graph, ZEROIZE_CRATES),
         ("control: ghash without its zeroize feature", without, ("ghash",)),
-        ("control: a second ghash", graph + second, ("ghash",)),
+        ("control: a second ghash", second, ("ghash",)),
     ):
         found += zeroize_problems(label, lines, crates)
     stack = dict.fromkeys(line for line in graph if line.partition(" ")[0] in ZEROIZE_CRATES)
@@ -1637,7 +1627,7 @@ def plant_controls(copy: Path, crates: dict[str, dict]) -> tuple[list[Control], 
         Control("zeroize", "examined", "control: ghash without its zeroize feature"),
         Control("zeroize", "examined", "control: a second ghash"),
         Control("zeroize", "zeroize", "control: ghash without its zeroize feature: ghash", "built"),
-        Control("zeroize", "zeroize", "control: a second ghash: ghash", " versions ("),
+        Control("zeroize", "zeroize", "control: a second ghash: ghash", " packages ("),
     ]
     controls += [
         Control("dep-info", "examined", f"{crate} ({run})")
