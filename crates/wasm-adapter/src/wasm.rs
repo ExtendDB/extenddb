@@ -67,12 +67,8 @@ impl ExtendDb {
     /// `ValidationException` instead of reaching the engine.
     ///
     /// Call `submit` only on an object that [`ExtendDb::create`] returned and
-    /// that has not been freed. The generated JavaScript passes the
-    /// `__wbg_ptr` property of the object `submit` is called on to the module
-    /// as the address of an instance, and wasm-bindgen's runtime takes the
-    /// memory at any address it does not refuse to be an instance. So a call
-    /// on any other object is undefined: it can throw, trap, or answer from
-    /// another instance.
+    /// that has not been freed: what a call on any other object does is
+    /// undefined.
     ///
     /// On an instance, a trap before `submit` returns its promise throws out of
     /// `submit` itself, as does a failure to copy an argument into the
