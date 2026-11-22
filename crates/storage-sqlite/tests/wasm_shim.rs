@@ -29,15 +29,17 @@
 //! not so named and expects two different ones; an earlier row has its name.
 //! The test fails unless there is no failure text, the count is [`ROWS`] and
 //! the number of difference rows counted is [`DIFFERENCE_ROWS`]. Both numbers
-//! are written by hand, so the test also fails when a row is deleted from,
-//! filtered out of or repeated in the table, and when the row loop skips a
-//! row's statement with a `continue`, a `break`, or a `return` of the verdict
-//! built so far or of an empty one. It does not check its expectations or its
-//! own code: an expectation edited to match a changed outcome passes, as can
-//! another edit to the code that runs or judges the rows (such as
-//! `compare_rows` and `Verdict::record`) or to the final assertion, and two
-//! changes that keep both numbers pass together (a row removed and [`ROWS`]
-//! lowered, or a row skipped and another added). Such changes are for review.
+//! are written by hand, so each of these changes fails the test when it is
+//! made alone: a row deleted from, filtered out of or repeated in the table,
+//! and a `continue`, a `break`, or a `return` of the verdict built so far or
+//! of an empty one by which the row loop skips a row's statement. The test
+//! does not check its expectations or its own code, so other changes can
+//! pass: an expectation edited to match a changed outcome, any other edit to
+//! the code that runs or judges the rows (such as `compare_rows` and
+//! `Verdict::record`) or to the final assertion, and a change listed above
+//! made together with another that keeps each count equal to its number (a
+//! deleted row with [`ROWS`] lowered, a skipped row with another row added,
+//! or a skipped row counted in `compare_rows`). Such changes are for review.
 //! The test does not read the shim's documentation.
 //!
 //! Natively the pool's acquire timeout is cut from `sqlx`'s 30 s default to
