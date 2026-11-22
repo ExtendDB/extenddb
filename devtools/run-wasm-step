@@ -108,19 +108,21 @@ wasm_bindgen_cli_advice() {
 # Cargo runs each test module with CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER,
 # which must be the wasm-bindgen-test-runner of the version of the
 # wasm-bindgen crate in Cargo.lock (the workflow's comment on its wasm tooling
-# says why); the runner runs the module under the node on PATH. A runner the
-# caller sets is used as given; otherwise this sets the one on PATH, else the
-# one in cargo's bin directory ($CARGO_HOME/bin), where `cargo install` puts
-# it, by its full path. Before `cargo test` runs, the suite checks that the
-# runner's version (the second word of what it prints for --version) is the
-# crate's, and otherwise stops with the command that installs that version.
+# says why); the runner runs the module under the node on PATH. Cargo splits
+# the variable's value at whitespace into the runner's path and the arguments
+# it gives the runner. A value the caller sets goes to cargo as it is;
+# otherwise this sets the one on PATH, else the one in cargo's bin directory
+# ($CARGO_HOME/bin), where `cargo install` puts it, by its full path. Before
+# `cargo test` runs, the suite runs the value's first word, the runner's
+# path, with --version, checks that the second word it prints is the crate's
+# version, and otherwise stops with the command that installs that version.
 # The runner itself refuses a module whose wasm-bindgen has another schema
 # version, after the build, and its message then offers first `cargo update
 # -p wasm-bindgen --precise <the runner's version>`, which would undo a change
 # of Cargo.lock.
 LOG=""
 run_suite() {
-    local suite="$1" lock runner printed version status=0 output results line name state expected reported problems=()
+    local suite="$1" lock runner words program printed version status=0 output results line name state expected reported problems=()
     lock="$(lock_wasm_bindgen_version)"
     runner="${CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER:-}"
     if [ -z "$runner" ]; then
@@ -132,11 +134,13 @@ run_suite() {
     if [ -z "$runner" ]; then
         die "${suite} suite: wasm-bindgen-test-runner is not on PATH or in ${CARGO_HOME:-$HOME/.cargo}/bin, and the suite needs the wasm-bindgen-test-runner of the version of the wasm-bindgen crate in Cargo.lock, ${lock}; $(wasm_bindgen_cli_advice "$lock")"
     fi
-    show "$runner" --version
-    printed="$("$runner" --version || true)"
+    IFS=$' \t\n\v\f\r' read -r -d '' -a words <<<"$runner" || true
+    program="${words[0]:-}"
+    show "$program" --version
+    printed="$("$program" --version || true)"
     read -r _ version _ <<<"$printed"
     if [ "$version" != "$lock" ]; then
-        die "${suite} suite: the runner ${runner} reports '${printed}' for --version, and the suite needs the wasm-bindgen-test-runner of the version of the wasm-bindgen crate in Cargo.lock, ${lock}; $(wasm_bindgen_cli_advice "$lock")"
+        die "${suite} suite: the runner ${program} reports '${printed}' for --version, and the suite needs the wasm-bindgen-test-runner of the version of the wasm-bindgen crate in Cargo.lock, ${lock}; $(wasm_bindgen_cli_advice "$lock")"
     fi
     export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="$runner"
     echo "runner:    ${runner} (${printed})"
