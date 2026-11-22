@@ -665,7 +665,8 @@ impl MigrationBackend for SqliteMigrations {
 
     // Calls `super::copy`, which wasm32 does not compile, so wasm32 has the
     // method below. (A wasm32 stand-in for `copy` would compile this body
-    // there, and the WebAssembly clippy step refuses its `SystemTime::now()`.)
+    // there, with its `SystemTime::now()`, which panics on
+    // wasm32-unknown-unknown.)
     #[cfg(not(target_arch = "wasm32"))]
     async fn before_first_write(
         &self,
