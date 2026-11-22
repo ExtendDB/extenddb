@@ -9,7 +9,7 @@
 # the commands are written once, here.
 #
 #   devtools/run-wasm-step <step>
-#   devtools/run-wasm-step clippy [cargo option...]
+#   devtools/run-wasm-step clippy [cargo option...] [-- clippy option...]
 #
 #   build     build the adapter for wasm32
 #   clippy    clippy for wasm32 with the lists of devtools/wasm-clippy
@@ -32,7 +32,7 @@ ADAPTER=extenddb-wasm-adapter
 TARGET=wasm32-unknown-unknown
 
 usage() {
-    echo "usage: devtools/run-wasm-step build|clippy [cargo option...]|guard|pedantic|core|shim|corpus" >&2
+    echo "usage: devtools/run-wasm-step build|clippy [cargo option...] [-- clippy option...]|guard|pedantic|core|shim|corpus" >&2
     exit 2
 }
 
@@ -154,9 +154,20 @@ case "$step" in
         # library alone, which is also what cargo checks by default here: the
         # adapter has no binary target, and tests are not a default target.
         # Options given after the step name go to cargo before its `--`, for a
-        # caller that wants another message format.
+        # caller that wants another message format. Options after a `--` go to
+        # clippy after the step's own `-D warnings`, for a caller that adds
+        # lint options.
+        cargo_options=()
+        while [ $# -gt 0 ] && [ "$1" != -- ]; do
+            cargo_options+=("$1")
+            shift
+        done
+        if [ $# -gt 0 ]; then
+            shift
+        fi
         run env CLIPPY_CONF_DIR="$PWD/devtools/wasm-clippy" \
-            cargo clippy --locked "$@" -p "$ADAPTER" --lib --target "$TARGET" -- -D warnings
+            cargo clippy --locked ${cargo_options[@]+"${cargo_options[@]}"} -p "$ADAPTER" --lib \
+            --target "$TARGET" -- -D warnings "$@"
         ;;
 
     guard)
