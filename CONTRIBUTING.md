@@ -206,8 +206,8 @@ SQLite, PostgreSQL, Cassandra and MongoDB migrate through this framework.
    later listed in `devtools/wasm-clippy/clippy.toml`, add
    `#[allow(clippy::disallowed_methods, reason = "...")]` to the module's
    `mod` line, with a reason that says why no wasm32 database reaches the
-   call: the WebAssembly build opens only in-memory databases, and each runs
-   every migration when it opens. The module defines:
+   call. (The WebAssembly build opens only in-memory databases, and each
+   runs every migration when it opens.) The module defines:
 
    - `SOURCE`, the module's own text through `include_str!`, followed by the
      text of any SQL file the body executes. The checksum test pins its
