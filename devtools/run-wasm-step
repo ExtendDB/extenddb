@@ -23,8 +23,8 @@
 # (on stderr, after "+ "), and looks up cargo, wasm-pack, node and Python on
 # PATH, so the caller chooses the toolchain and the Node version. In the
 # workflow, its setup steps make the toolchain it pins rustup's default and
-# put the Node version it names on PATH. To run a step as the workflow runs
-# it, a local run uses what those steps install: that toolchain with the
+# put the Node version it names on PATH. To run a step locally as the
+# workflow runs it, install what those steps install: that toolchain with the
 # wasm32-unknown-unknown target and clippy, a clang, a Node of that major
 # version, and the wasm-bindgen-cli and wasm-pack versions the workflow's
 # install step names (the guard step's case below says which Python it
