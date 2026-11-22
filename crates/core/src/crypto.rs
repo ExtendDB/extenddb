@@ -71,7 +71,7 @@ pub fn seal(key: &[u8; KEY_LEN], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>
 }
 
 /// Open `nonce(12) || ciphertext || tag(16)` under the 32-byte AES-256-GCM
-/// `key`, authenticating `aad`. The plaintext is wiped when the result drops.
+/// `key`, authenticating `aad`. The returned buffer is wiped when it drops.
 ///
 /// # Errors
 ///
@@ -238,6 +238,7 @@ mod imp {
         plaintext: &[u8],
         aad: &[u8],
     ) -> Result<Vec<u8>, String> {
+        // README.md, "What it does not do", says what this leaves on the stack.
         let cipher = Aes256Gcm::new_from_slice(key)
             .map_err(|_| "load encryption key: AES-256-GCM key setup failed".to_owned())?;
         let mut nonce = [0u8; super::NONCE_LEN];
@@ -264,6 +265,7 @@ mod imp {
         sealed: &[u8],
         aad: &[u8],
     ) -> Result<Zeroizing<Vec<u8>>, String> {
+        // README.md, "What it does not do", says what this leaves on the stack.
         let (nonce, rest) = split_or_refuse(sealed)?;
         let cipher = Aes256Gcm::new_from_slice(key)
             .map_err(|_| "load encryption key: AES-256-GCM key setup failed".to_owned())?;
