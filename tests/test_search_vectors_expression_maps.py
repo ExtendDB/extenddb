@@ -9,7 +9,8 @@ conditions both grammars accept, and the module runs under either one.
 
 Measured against the live service in eu-north-1, on an account with the
 extended grammar, each request twice with the same answer: on 2026-11-21, and
-the 254, 255 and 256 byte keys on 2026-11-23.
+the 254, 255 and 256 byte keys and the empty maps against a missing table on
+2026-11-23.
 
 The module skips when the target backend does not support vector indexes,
 unless ``EXTENDDB_EXPECT_VECTORS=1``, which makes that a failure.
@@ -118,6 +119,19 @@ class TestEmptyMaps:
         resp = _raw(table, TopK=0, **cond, ExpressionAttributeValues={})
         assert resp.status_code == 400, resp.text
         assert "TopK" in message(resp), resp.text
+
+    def test_an_empty_map_answers_before_a_missing_table(self, table):
+        """The map checks run before the table lookup. Measured on 2026-11-23."""
+        missing = table_name()
+        cond = {"SearchConditionExpression": "Country = :us"}
+        refused(_raw(missing, **cond, ExpressionAttributeValues={}),
+                "ExpressionAttributeValues must not be empty")
+        refused(_raw(missing, **cond, ExpressionAttributeNames={}, ExpressionAttributeValues=US),
+                "ExpressionAttributeNames must not be empty")
+        resp = _raw(missing, **cond, ExpressionAttributeValues=US)
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["__type"].endswith("ResourceNotFoundException"), resp.text
+        assert message(resp) == "Requested resource not found", resp.text
 
 
 class TestKeysAndNames:
