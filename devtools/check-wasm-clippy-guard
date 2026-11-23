@@ -6,10 +6,12 @@ stack is built with its zeroize features.
 
 The header of devtools/wasm-clippy/clippy.toml says what the clippy step
 (`devtools/run-wasm-step clippy`) refuses and what it does not see. This
-script fails, with one line per problem, unless:
+script prints a FAIL line per problem, with clippy's message after it where
+there is one, and fails, unless:
 1. clippy.toml parses and holds only the disallowed-methods and
    disallowed-types lists, each entry a table of exactly a non-empty `path`
-   and `reason`, and no path twice in a list;
+   and `reason`, and no path twice in a list; and devtools/wasm-clippy holds
+   no .clippy.toml, which clippy would read in its place;
 2. in a copy of the working tree (the files git tracks or does not ignore,
    uncommitted edits included), the clippy step passes; and with the PLANTS
    below written into the copy (tokio::time::sleep, time::sleep after `use
@@ -17,21 +19,26 @@ script fails, with one line per problem, unless:
    std::time::Instant::now in SqliteEngine::new_in_memory), the step, run
    again with --keep-going, fails and reports each planted call as an error
    at its line (an error that alone fails the step);
-3. neither run prints a warning about clippy.toml, but for one control: the
-   second run must warn about MISSPELT, an entry that names no function and
-   that the script adds to the copy's clippy.toml. Clippy warns about an
-   entry that does not resolve only in a crate that loads the entry's crate
-   (its code names it, or a crate it loads depends on it); -D warnings does
-   not turn that warning into an error;
+3. neither run prints a warning about clippy's configuration, but for one
+   control: for the second run the copy's clippy.toml is the tree's lists,
+   written out again with MISSPELT, an entry that names no function, added,
+   and that run must warn about it. Clippy warns about an entry that does not
+   resolve only in a crate that loads the entry's crate (its code names it,
+   or a crate it loads depends on it); -D warnings does not make it an error;
 4. in the adapter's wasm32 build as `cargo tree -e normal` resolves it, each
    of aes, aes-gcm, ghash and polyval is one package (one name, version and
    source) with its zeroize feature on (crates/core/Cargo.toml turns it on).
-A plant whose text is not in the copy's file, or is there more than once, or
-whose file is a link out of the copy, stops checks 2 and 3 with a line naming
-the file and what is wrong. The runs use the caller's cargo target
-directory, and nothing of the working tree is written. The copy is removed
-on exit, also on SIGINT, SIGTERM and SIGHUP, and a clippy run is stopped with
-it. Needs Python 3.11 or later (for tomllib) and git.
+Checks 2 and 3 run only when check 1 passes. A plant whose text is not in the
+copy's file, or is there more than once, or whose path resolves out of the
+copy, stops them with a line naming the file and what is wrong. A file the
+script cannot read is left out of the copy, with a line naming it. The runs
+use the caller's cargo target directory (by default target/, which git
+ignores) and write no file git tracks or does not ignore; as the step's
+CLIPPY_CONF_DIR names the copy, they re-lint every crate, and so does the
+next clippy step in the tree. The copy is removed on exit, also on SIGINT,
+SIGTERM and SIGHUP unless the script started with that signal ignored (a
+further signal is then ignored), and a clippy run is stopped with it. Needs
+Python 3.11 or later (for tomllib) and git.
 """
 
 import json
@@ -49,7 +56,9 @@ except ModuleNotFoundError:  # Python 3.10 and older
     sys.exit("error: devtools/check-wasm-clippy-guard needs Python 3.11 or later (for tomllib)")
 
 ROOT = Path(__file__).resolve().parent.parent
-CONFIG_REL = "devtools/wasm-clippy/clippy.toml"
+CONFIG_DIR = "devtools/wasm-clippy"
+CONFIG_REL = f"{CONFIG_DIR}/clippy.toml"
+SHADOW_REL = f"{CONFIG_DIR}/.clippy.toml"
 ADAPTER = "extenddb-wasm-adapter"
 TARGET = "wasm32-unknown-unknown"
 LISTS = ("disallowed-methods", "disallowed-types")
@@ -75,12 +84,13 @@ PLANTS = [
         [("    let _ = std::time::Instant::now();", "std::time::Instant::now")],
     ),
 ]
-# The control of check 3, and the line of clippy.toml it goes after.
+# The control of check 3.
 MISSPELT = "std::thread::sleep_misspelt_by_the_guard"
-MISSPELT_AFTER = "disallowed-methods = ["
 # The crates of the wasm32 AES-256-GCM stack. Each wipes its own key material
 # only under its own `zeroize` feature, which crates/core/Cargo.toml turns on.
 ZEROIZE_CRATES = ("aes", "aes-gcm", "ghash", "polyval")
+STOPS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+STARTED_WITH = {stop: signal.getsignal(stop) for stop in STOPS}
 
 
 def config_problems(text: str) -> list[str]:
@@ -112,9 +122,25 @@ def config_problems(text: str) -> list[str]:
     return found
 
 
+def with_control(config: dict) -> str:
+    """The lists of a clippy.toml that passed check 1, as TOML, with MISSPELT
+    added to disallowed-methods."""
+    def string(text: str) -> str:  # a TOML basic string
+        escape = {c for c in text if ord(c) < 0x20 or ord(c) == 0x7F or c in '"\\'}
+        return '"' + "".join(f"\\u{ord(c):04x}" if c in escape else c for c in text) + '"'
+    control = {"path": MISSPELT, "reason": "the guard's control"}
+    lines = []
+    for key in LISTS:
+        lines.append(f"{key} = [")
+        for e in config.get(key, []) + ([control] if key == "disallowed-methods" else []):
+            lines.append(f"    {{ path = {string(e['path'])}, reason = {string(e['reason'])} }},")
+        lines.append("]")
+    return "\n".join(lines) + "\n"
+
+
 def command(argv: list[str], cwd: Path) -> subprocess.CompletedProcess:
     try:
-        return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, check=False)
+        return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, errors="replace")
     except FileNotFoundError:
         sys.exit(f"error: {argv[0]} is not on PATH")
 
@@ -122,33 +148,41 @@ def command(argv: list[str], cwd: Path) -> subprocess.CompletedProcess:
 def copy_tree(destination: Path) -> None:
     """Copy the files git tracks or does not ignore, as they are now: a
     symbolic link as the link it is, and no file beyond a link, so that no
-    copy goes through a link."""
-    listing = command(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"], ROOT)
+    copy goes through a link. A file it cannot read is left out."""
+    argv = ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"]
+    listing = subprocess.run(argv, cwd=ROOT, capture_output=True, check=False)
     if listing.returncode != 0:
-        sys.exit(f"error: git ls-files failed in {ROOT}:\n{listing.stderr}")
-    for rel in sorted(set(listing.stdout.split("\0")) - {""}):
+        sys.exit(f"error: git ls-files failed in {ROOT}:\n{os.fsdecode(listing.stderr)}")
+    for rel in sorted({os.fsdecode(name) for name in listing.stdout.split(b"\0")} - {""}):
         source, target = ROOT / rel, destination / rel
         beyond_link = any(os.path.islink(ROOT / parent) for parent in list(Path(rel).parents)[:-1])
         if beyond_link or not os.path.lexists(source):  # or deleted in the working tree
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
-        if source.is_symlink():
-            os.symlink(os.readlink(source), target)
-        elif source.is_file():
-            # copy2 keeps the modification time, so cargo finds the copied
-            # crates as fresh as the caller's.
-            shutil.copy2(source, target)
+        try:
+            if source.is_symlink():
+                os.symlink(os.readlink(source), target)
+            elif source.is_file():
+                shutil.copy(source, target)  # its contents and mode
+        except OSError as error:
+            name = os.fsencode(rel).decode("utf-8", "backslashreplace")  # printable
+            print(f"left out of the copy: {name} ({error.strerror})")
 
 
-def insert(copy: Path, rel: str, find: str, lines: list[str], after_brace: bool) -> list[int] | str:
-    """Write `lines` into the copy's file `rel` after the line holding `find`,
-    which must be there once (with `after_brace`, after the first line from
-    there on that ends with `{`). Returns the 1-based numbers of the written
-    lines, or the problem."""
+def outside(copy: Path, rel: str) -> str | None:
+    """The problem with writing the copy's file `rel`, if its path leaves it."""
+    if not (real := Path(os.path.realpath(copy / rel))).is_relative_to(copy):
+        return f"cannot plant in {rel}: its path resolves to {real}, outside the copy"
+    return None
+
+
+def insert(copy: Path, rel: str, find: str, lines: list[str]) -> list[int] | str:
+    """Write `lines` into the copy's file `rel` after the first line ending
+    with `{` from the line holding `find` on; `find` must be there once.
+    Returns the 1-based numbers of the written lines, or the problem."""
     path = copy / rel
-    real = Path(os.path.realpath(path))
-    if not real.is_relative_to(copy):
-        return f"cannot plant in {rel}: it is a link to {real}, outside the copy"
+    if problem := outside(copy, rel):
+        return problem
     try:
         text = path.read_text(encoding="utf-8").splitlines(keepends=True)
     except (OSError, UnicodeDecodeError) as error:
@@ -158,7 +192,7 @@ def insert(copy: Path, rel: str, find: str, lines: list[str], after_brace: bool)
         found = "is not there" if not at else f"is there {len(at)} times"
         return f"cannot plant in {rel}: the text `{find}` the guard looks for {found}"
     index = at[0]
-    while after_brace and not text[index].rstrip().endswith("{"):
+    while not text[index].rstrip().endswith("{"):
         index += 1
         if index == len(text):
             return f"cannot plant in {rel}: no line ending with `{{` after `{find}`"
@@ -180,6 +214,7 @@ def run_clippy(copy: Path, target_dir: str, *cargo_options: str) -> tuple[int, l
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        errors="replace",
         start_new_session=True,
     )
     try:
@@ -203,6 +238,13 @@ def run_clippy(copy: Path, target_dir: str, *cargo_options: str) -> tuple[int, l
     return process.returncode, messages, stderr
 
 
+def quote(text: str, copy: Path) -> str:
+    """Clippy's text with the copy's paths made relative to it, and without
+    the help to add `allow-invalid`, which check 1 refuses."""
+    lines = text.replace(f"{copy}/", "").splitlines()
+    return "\n".join(line for line in lines if "allow-invalid" not in line)
+
+
 def location(span: dict, copy: Path) -> str:
     """A span's file, relative to the copy, and line."""
     path = Path(span["file_name"])
@@ -212,12 +254,14 @@ def location(span: dict, copy: Path) -> str:
 
 
 def config_warnings(messages: list[dict], copy: Path) -> dict[str, str]:
-    """The messages about the copy's clippy.toml, by their text."""
-    config = (copy / CONFIG_REL).resolve()
+    """The messages about clippy's configuration (a file of the copy's
+    devtools/wasm-clippy), by their text, each with its rendered form."""
+    directory = (copy / CONFIG_DIR).resolve()
     return {
-        m["message"]: m.get("rendered") or m["message"]
+        quote(m["message"], copy): quote(m.get("rendered") or m["message"], copy)
         for m in messages
-        if any(Path(s["file_name"]).resolve() == config for s in m.get("spans", []))
+        if any(Path(s["file_name"]).resolve().is_relative_to(directory) for s in m.get("spans", []))
+        or f"{directory}/" in m["message"]
         or "Clippy's configuration" in m["message"]
     }
 
@@ -258,36 +302,41 @@ def zeroize_problems() -> tuple[list[str], list[str]]:
 def check(copy: Path) -> list[str]:
     """Checks 1 to 3 of the docstring, in the empty directory `copy`."""
     try:
-        problems = config_problems((ROOT / CONFIG_REL).read_text(encoding="utf-8"))
+        text = (ROOT / CONFIG_REL).read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as error:
         return [f"{CONFIG_REL} cannot be read: {error}"]
+    problems = config_problems(text)
+    if os.path.lexists(ROOT / SHADOW_REL):
+        problems.append(f"{SHADOW_REL} exists; clippy reads it, not {CONFIG_REL}")
+    if problems:
+        return problems
     argv = ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"]
     metadata = command(argv, ROOT)
     if metadata.returncode != 0:
-        return problems + [f"{' '.join(argv)} failed:\n{metadata.stderr}"]
+        return [f"{' '.join(argv)} failed:\n{metadata.stderr}"]
     target_dir = json.loads(metadata.stdout)["target_directory"]
     copy_tree(copy)
 
     code, messages, stderr = run_clippy(copy, target_dir)
     if code != 0:
         errors = [m.get("rendered") or m["message"] for m in messages if m["level"] == "error"]
-        return problems + [
+        return [
             f"the clippy step failed in the copy before any plant (exit status {code}):\n"
-            + ("\n".join(errors) or stderr)
+            + quote("\n".join(errors) or stderr, copy)
         ]
     first = config_warnings(messages, copy)
-    problems += [f"the clippy step warned about {CONFIG_REL}:\n{text}" for text in first.values()]
+    problems += [f"the clippy step warned about its configuration:\n{t}" for t in first.values()]
 
     expected = {}
     for rel, find, lines in PLANTS:
-        written = insert(copy, rel, find, [line for line, _ in lines], True)
+        written = insert(copy, rel, find, [line for line, _ in lines])
         if isinstance(written, str):
             return problems + [written]
         expected |= {f"{rel}:{number}": path for number, (_, path) in zip(written, lines)}
-    entry = f'    {{ path = "{MISSPELT}", reason = "the guard\'s control" }},'
-    written = insert(copy, CONFIG_REL, MISSPELT_AFTER, [entry], False)
-    if isinstance(written, str):
-        return problems + [written]
+    if problem := outside(copy, CONFIG_REL):
+        return problems + [problem]
+    (copy / CONFIG_REL).unlink(missing_ok=True)
+    (copy / CONFIG_REL).write_text(with_control(tomllib.loads(text)), encoding="utf-8")
 
     code, messages, _ = run_clippy(copy, target_dir, "--keep-going")
     if code == 0:
@@ -307,7 +356,7 @@ def check(copy: Path) -> list[str]:
         problems.append(f"the clippy step did not warn about the control entry {MISSPELT}")
     # A warning the first run printed is reported once, above.
     problems += [
-        f"the clippy step warned about {CONFIG_REL}:\n{rendered}"
+        f"the clippy step warned about its configuration:\n{rendered}"
         for text, rendered in warned.items()
         if MISSPELT not in text and text not in first
     ]
@@ -316,7 +365,14 @@ def check(copy: Path) -> list[str]:
     return problems
 
 
+def _handle(handler) -> None:
+    for stop in STOPS:
+        if STARTED_WITH[stop] is not signal.SIG_IGN:  # as under nohup, or `&` in a script
+            signal.signal(stop, handler)
+
+
 def _stop(signum: int, _frame) -> None:
+    _handle(signal.SIG_IGN)  # a further signal cannot cut the cleanup short
     raise SystemExit(128 + signum)
 
 
@@ -324,13 +380,14 @@ def main() -> int:
     # Line-buffered, so the FAIL lines on stderr keep their place among these
     # lines when both streams go to one log.
     sys.stdout.reconfigure(line_buffering=True)
-    for stop in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(stop, _stop)
+    _handle(_stop)
     copy = Path(tempfile.mkdtemp(prefix="wasm-clippy-guard-")).resolve()
     try:
         problems = check(copy)
     finally:
+        _handle(signal.SIG_IGN)
         shutil.rmtree(copy, ignore_errors=True)
+    _handle(_stop)
     found, stack = zeroize_problems()
     for problem in problems + found:
         print(f"FAIL: {problem}", file=sys.stderr)
