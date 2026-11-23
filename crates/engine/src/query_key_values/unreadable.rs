@@ -16,11 +16,13 @@
 use std::borrow::Cow;
 
 use extenddb_core::error::{DynamoDbError, validation_errors};
+use extenddb_core::types::AttributeValue;
+use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use super::{
-    RETURN_CONSUMED_CAPACITY, SELECT, TYPE_DESCRIPTORS, first_fault, sorted_entries,
-    validate_name_keys, validate_names,
+    RETURN_CONSUMED_CAPACITY, SELECT, TYPE_DESCRIPTORS, first_fault, is_shape_fault,
+    sorted_entries, validate_name_keys, validate_names,
 };
 use crate::int32_member::{
     AT_LEAST_ONE_MEMBER, LIMIT, LengthField, RangeFault, RangeField, SEGMENT, TOTAL_SEGMENTS,
@@ -141,6 +143,26 @@ pub(crate) fn readable_for_shape_check<'a>(body: &'a Value, conditions: &[&str])
     } else {
         Cow::Borrowed(body)
     }
+}
+
+/// The first `SerializationException` among the values [`has_unreadable`]
+/// reads (see [`attribute_values`]), each deserialized on its own as an
+/// `AttributeValue` with the parts the service cannot read replaced (see
+/// [`readable_for_shape_check`]): a member of the wrong JSON type anywhere in
+/// an `ExpressionAttributeValues` entry, an `ExclusiveStartKey` value or a
+/// condition list value. Read on its own, such a member is found behind a
+/// value fault that comes first in the same map or list. Measured on `Scan`
+/// 2026-11-23 (us-east-1, each body twice): `{"pk": {"NS": []}, "sk": {"S":
+/// 5}}` as the key and `{"L": [{"S": 5}, {}]}` as an entry answer
+/// `SerializationException: NUMBER_VALUE cannot be converted to String`.
+pub(crate) fn value_shape_fault(body: &Value, conditions: &[&str]) -> Option<DynamoDbError> {
+    let readable = readable_for_shape_check(body, conditions);
+    attribute_values(&readable, conditions).find_map(|value| {
+        AttributeValue::deserialize(value)
+            .map_err(crate::deserialize_error)
+            .err()
+            .filter(is_shape_fault)
+    })
 }
 
 /// Replace each part of `value` the service cannot read as one type, in the

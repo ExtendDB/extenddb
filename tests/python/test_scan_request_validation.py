@@ -735,6 +735,19 @@ ROWS_2026_11_23 = [
      '{":x": {"S": "x"}}', EMPTY_KEY_VALUE),
 ]
 
+# Measured 2026-11-23 at 14:03 UTC on a table that does not exist (us-east-1,
+# each body twice): a member of the wrong JSON type behind a value fault in the
+# same map or list answers SerializationException. (id, fields, the message,
+# or None where the deserializer's text differs from the service's
+# "NUMBER_VALUE cannot be converted to String").
+SHAPE_ROWS_2026_11_23 = [
+    ("d3-eav-L-S5-empty", '"FilterExpression": "a = :a", "ExpressionAttributeValues": '
+     '{":a": {"L": [{"S": 5}, {}]}}', None),
+    ("d4-key-NSe-S5", '"ExclusiveStartKey": {"pk": {"NS": []}, "sk": {"S": 5}}', None),
+    ("d5-atg-NSe-limit-string", '"AttributesToGet": [], "ExclusiveStartKey": '
+     '{"pk": {"NS": []}}, "Limit": "5"', "STRING_VALUE cannot be converted to Integer"),
+]
+
 def unused_value(value: dict) -> str:
     """A filter that reads ``:p`` and ``value`` under ``:d``, which nothing reads."""
     return ('"FilterExpression": "a = :p", "ExpressionAttributeValues": '
@@ -1125,6 +1138,15 @@ class TestRowsOf20261123:
                              ids=[r[0] for r in ROWS_2026_11_23])
     def test_rows(self, dynamodb_client, fields, expected):
         _assert_row(dynamodb_client, unique_name("nosuch"), fields, expected)
+
+    @pytest.mark.parametrize("fields, expected", [r[1:] for r in SHAPE_ROWS_2026_11_23],
+                             ids=[r[0] for r in SHAPE_ROWS_2026_11_23])
+    def test_shape_rows(self, dynamodb_client, fields, expected):
+        status, payload = _scan(dynamodb_client, unique_name("nosuch"), fields)
+        assert status == 400, payload
+        assert payload.get("__type", "").endswith("SerializationException"), payload
+        if expected is not None:
+            assert payload.get("message", payload.get("Message")) == expected
 
 
 class TestNestingDepth:

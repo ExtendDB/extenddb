@@ -41,7 +41,7 @@ mod unreadable;
 
 pub(crate) use unreadable::{
     QUERY_CONDITIONS, SCAN_CONDITIONS, has_unreadable, older_form_checks,
-    older_form_request_checks, readable_for_shape_check,
+    older_form_request_checks, readable_for_shape_check, value_shape_fault,
 };
 
 /// The service's text for a key condition value of the wrong type.

@@ -1170,6 +1170,49 @@ fn a_scan_filter_list_value_is_checked_at_its_step() {
     );
 }
 
+/// A member of the wrong JSON type in a value is found behind a value fault
+/// that comes first in the same map or list, ahead of every check. Measured
+/// 2026-11-23 (us-east-1, each body twice): `{"L": [{"S": 5}, {}]}` as an
+/// entry and `{"pk": {"NS": []}, "sk": {"S": 5}}` as the key answer
+/// `SerializationException: NUMBER_VALUE cannot be converted to String`, and
+/// an empty `AttributesToGet` beside a key with an empty `NS` and `"Limit":
+/// "5"` answers `STRING_VALUE cannot be converted to Integer`. In the review
+/// of 2026-11-12, `{"pk": {}, "sk": {"N": 5}}` as the key and `{":a": {"NS":
+/// []}, ":b": {"S": 5}}` answered `SerializationException` too. The service's
+/// texts for a value differ from the deserializer's, so only the exception
+/// is asserted for them.
+#[test]
+fn a_value_of_the_wrong_json_type_is_found_behind_a_value_fault() {
+    let list =
+        |values: Value| json!({"a": {"ComparisonOperator": "EQ", "AttributeValueList": values}});
+    for body in [
+        scan(json!({"FilterExpression": "a = :a",
+                    "ExpressionAttributeValues": {":a": {"L": [{"S": 5}, {}]}}})),
+        with_key(json!({"pk": {"NS": []}, "sk": {"S": 5}})),
+        with_key(json!({"pk": {}, "sk": {"N": 5}})),
+        scan(json!({"ExpressionAttributeValues": {":a": {"NS": []}, ":b": {"S": 5}}})),
+        scan(json!({"ScanFilter": list(json!([{"L": [{"S": 5}, {}]}]))})),
+    ] {
+        assert!(
+            matches!(
+                request_checks(&body, ValuesDepth::Checked),
+                Err(DynamoDbError::SerializationException(_))
+            ),
+            "{body}"
+        );
+    }
+    let limit = scan(
+        json!({"AttributesToGet": [], "ExclusiveStartKey": {"pk": {"NS": []}},
+                            "Limit": "5"}),
+    );
+    match request_checks(&limit, ValuesDepth::Checked) {
+        Err(DynamoDbError::SerializationException(msg)) => {
+            assert_eq!(msg, "STRING_VALUE cannot be converted to Integer");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
 #[test]
 fn a_value_nested_32_levels_deep_is_refused_and_31_levels_pass() {
     let one = json!({"N": "1"});

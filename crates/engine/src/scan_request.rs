@@ -142,7 +142,7 @@ use crate::query_key_values::{
     Fault, RETURN_CONSUMED_CAPACITY, SCAN_CONDITIONS, SELECT, SetFault, first_fault,
     has_unreadable, is_shape_fault, non_empty, older_form_request_checks, present,
     readable_for_shape_check, shape_fault_first, sorted_entries,
-    validate_expression_attribute_value_numbers, validate_names,
+    validate_expression_attribute_value_numbers, validate_names, value_shape_fault,
 };
 
 /// Which of the service's two check orders a `Scan` request follows (see the
@@ -200,9 +200,12 @@ pub(crate) enum ValuesDepth {
 /// instead, as the service reports a shape fault ahead of every validation;
 /// see `shape_fault_first`. For that read the parts of a value that the
 /// service cannot read are replaced (see `readable_for_shape_check`), so a
-/// null value is not a shape fault. A body that passes every check is not
-/// deserialized here; the handler reads `Limit`, `Segment` and
-/// `TotalSegments` with `int32_member::saturate` before it deserializes.
+/// null value is not a shape fault. Ahead of the checks each value of
+/// `ExpressionAttributeValues`, `ExclusiveStartKey` and the `ScanFilter` lists
+/// is deserialized on its own (see [`request_checks`]); the rest of a body
+/// that passes every check is not deserialized here, and the handler reads
+/// `Limit`, `Segment` and `TotalSegments` with `int32_member::saturate`
+/// before it deserializes.
 ///
 /// The server runs the same function ahead of the IAM decision.
 ///
@@ -217,6 +220,12 @@ pub fn validate_scan_request_body(body: &Value) -> Result<(), DynamoDbError> {
 /// [`validate_scan_request_body`] with the nesting depth checked as `depth`
 /// says, and the order the request follows when every check passes.
 ///
+/// A member of the wrong JSON type inside an `ExpressionAttributeValues`
+/// entry, an `ExclusiveStartKey` value or a `ScanFilter` list value is found
+/// first, each value read on its own (see `value_shape_fault`), so a value
+/// fault ahead of it in the same map or list does not hide it, and the
+/// holders of the handler never take it out of the body unread.
+///
 /// # Errors
 ///
 /// As [`validate_scan_request_body`].
@@ -224,6 +233,9 @@ pub(crate) fn request_checks(
     body: &Value,
     depth: ValuesDepth,
 ) -> Result<CheckOrder, DynamoDbError> {
+    if let Some(shape) = value_shape_fault(body, SCAN_CONDITIONS) {
+        return Err(shape);
+    }
     scan_request_checks(body, depth).map_err(|check| {
         shape_fault_first::<ScanInput>(&readable_for_shape_check(body, SCAN_CONDITIONS), check)
     })
