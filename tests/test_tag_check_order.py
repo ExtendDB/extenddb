@@ -7,18 +7,22 @@ TagResource and UntagResource check, in this order: the ARN prefix, the
 resource kind, the account, the partition, service and region of a stream ARN,
 the tag keys and values, a table ARN's table segment, partition, service and
 region, the table's existence, and last a key that reads ``aws:`` once U+017F
-is read as ``s``. CreateTable checks the TableName, then the Tags, then the
-rest of the request. Every expected response in this file was measured against
-DynamoDB in us-east-1 on 2026-10-24 or on 2026-11-20.
+is read as ``s``. CreateTable checks a member of the wrong JSON type first,
+then a TableName of bad length or outside the pattern, then a missing
+TableName, then the Tags, then the rest of the request. Every expected
+response in this file was measured against DynamoDB in us-east-1 on
+2026-10-24, 2026-11-20 or 2026-11-23.
 
 REQ-TEST-001
 """
 
 from __future__ import annotations
 
+import json
 import uuid
 
 import pytest
+from botocore.exceptions import ClientError
 
 from conftest import scoped_table
 from test_tag_validation import (
@@ -307,3 +311,51 @@ def test_create_table_checks_the_table_name_first(
     params.update(definition)
     params = {k: v for k, v in params.items() if v is not None}
     assert_validation(lambda: dynamodb_client_no_validation.create_table(**params), expected)
+
+
+# A member of the wrong JSON type is reported before the TableName length and
+# the Tags (measured 2026-11-23). The service words the refusal as its JSON
+# reader does, `Unexpected field type`, and ExtendDB as its own deserializer
+# does, so only the code is compared; #1109 holds the message texts. botocore
+# cannot write a string where the model has a list, so the body is put in
+# place before the request is signed. Neither request can create a table.
+WRONG_TYPE_MEMBERS = [
+    ("tags-string-before-short-table-name", {"TableName": "ab", "Tags": "x"}),
+    ("key-schema-string-before-invalid-tag", {"KeySchema": "x", "Tags": K_BAD}),
+]
+
+
+@pytest.mark.parametrize("label,members", WRONG_TYPE_MEMBERS, ids=[r[0] for r in WRONG_TYPE_MEMBERS])
+def test_create_table_reports_a_member_of_the_wrong_type_first(
+    dynamodb_client_no_validation, label, members
+):
+    client = dynamodb_client_no_validation
+    body = {
+        "TableName": f"extenddb-test-{uuid.uuid4().hex[:12]}",
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "BillingMode": "PAY_PER_REQUEST",
+        **members,
+    }
+    payload = json.dumps(body).encode()
+
+    def swap(params, **_kwargs):
+        params["body"] = payload
+
+    event = "before-call.dynamodb.CreateTable"
+    client.meta.events.register(event, swap, unique_id="tag-order-raw-body")
+    try:
+        with pytest.raises(ClientError) as exc:
+            client.create_table(
+                TableName=body["TableName"],
+                AttributeDefinitions=body["AttributeDefinitions"],
+                KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+                BillingMode="PAY_PER_REQUEST",
+            )
+    finally:
+        client.meta.events.unregister(event, unique_id="tag-order-raw-body")
+    response = exc.value.response
+    assert (response["ResponseMetadata"]["HTTPStatusCode"], response["Error"]["Code"]) == (
+        400,
+        "SerializationException",
+    ), response["Error"]

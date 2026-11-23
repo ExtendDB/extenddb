@@ -1,5 +1,6 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
+use serde::Deserialize;
 use serde_json::Value;
 
 use extenddb_core::error::{DynamoDbError, ErrorMessageKey, error_message};
@@ -11,20 +12,53 @@ use extenddb_core::validation::{
 use crate::OperationContext;
 use crate::serialize_output;
 
+/// The error for a `CreateTable` body that does not deserialize. A missing
+/// `TableName` has the service's own sentence; every other failure takes the
+/// shared mapping.
+fn input_error(e: serde_json::Error) -> DynamoDbError {
+    let msg = e.to_string();
+    if msg.contains("missing field") && msg.contains("TableName") {
+        return DynamoDbError::ValidationException(
+            "The parameter 'TableName' is required but was not present in the request".to_owned(),
+        );
+    }
+    crate::deserialize_error(e)
+}
+
+/// Whether a deserialization message reports a member of the wrong JSON type,
+/// serde's `invalid type: <found>, expected <wanted>`. A null member is left
+/// out: the service reads it as a missing member, not as the wrong type, and
+/// a missing member, an enum value outside its set and a number out of range
+/// are reported after the checks that follow.
+fn is_type_fault(msg: &str) -> bool {
+    msg.contains("invalid type: ") && !msg.contains("invalid type: null")
+}
+
 pub async fn handle_create_table(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
-    // The service checks the TableName and then the Tags before every other
-    // member: a request with an invalid tag and a definition error (an
-    // undefined key attribute, an enum value outside its set, PROVISIONED
-    // without throughput, a missing KeySchema) is refused for the tag, while a
-    // missing TableName or one of bad length is reported first (measured
-    // 2026-11-20). CreateTable stores its Tags through the same rows
-    // TagResource writes, so the same grammar applies. A Tags member that does
-    // not parse is left to the deserialization below. Restore and import
-    // build their own CreateTableInput further in and do not pass through
-    // this handler.
+    // The service checks a member of the wrong JSON type before everything
+    // else (measured 2026-11-23: TableName `ab` with a Tags string, and an
+    // invalid tag with a KeySchema string, both get SerializationException).
+    // Then a TableName of bad length or outside the pattern, then a missing
+    // TableName, then the Tags, then the rest of the request: an invalid tag
+    // beside a definition error (an undefined key attribute, an enum value
+    // outside its set, PROVISIONED without throughput, a missing KeySchema) is
+    // refused for the tag (measured 2026-11-20). So the body is deserialized
+    // here and a type fault returned at once, while every other failure waits
+    // behind the checks below, where the deserialization ran before. A missing
+    // TableName beside an enum value outside its set still gets the enum error
+    // (#1109). CreateTable stores its Tags through the same rows TagResource
+    // writes, so the same grammar applies. Restore and import build their own
+    // CreateTableInput further in and do not pass through this handler.
+    let parsed = match CreateTableInput::deserialize(&body).map_err(input_error) {
+        Err(DynamoDbError::SerializationException(msg)) if is_type_fault(&msg) => {
+            return Err(DynamoDbError::SerializationException(msg));
+        }
+        parsed => parsed,
+    };
+
     if let Some(name) = body.get("TableName").and_then(Value::as_str) {
         validate_table_name(name, &ctx.limits)?;
         validate_tags_member(&body)?;
@@ -47,25 +81,7 @@ pub async fn handle_create_table(
     )?;
 
     crate::require_stream_enabled_member(&body)?;
-    let mut input: CreateTableInput = serde_json::from_value(body).map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("validation error detected")
-            || msg.contains("parameter values were invalid")
-            || msg.contains("must not be empty")
-            || msg.contains("Syntax error; key")
-        {
-            DynamoDbError::ValidationException(msg)
-        } else if msg.contains("missing field") && msg.contains("TableName") {
-            DynamoDbError::ValidationException(
-                "The parameter 'TableName' is required but was not present in the request"
-                    .to_owned(),
-            )
-        } else {
-            DynamoDbError::SerializationException(format!(
-                "Start of structure or map found where not expected: {e}"
-            ))
-        }
-    })?;
+    let mut input = parsed?;
     input.resolve_table_throughput_mode();
 
     // A key that starts with `aws:` once U+017F is read as `s` is refused
@@ -279,6 +295,70 @@ pub(crate) fn storage_err_to_dynamo_with_ccf(
             )
         }
         other => storage_err_to_dynamo(other),
+    }
+}
+
+#[cfg(test)]
+mod input_error_tests {
+    use serde::Deserialize;
+    use serde_json::{Value, json};
+
+    use extenddb_core::error::DynamoDbError;
+    use extenddb_core::types::CreateTableInput;
+
+    use super::{input_error, is_type_fault};
+
+    fn error_of(body: &Value) -> DynamoDbError {
+        input_error(CreateTableInput::deserialize(body).expect_err("the body must not parse"))
+    }
+
+    fn with(member: &str, value: Value) -> Value {
+        let mut body = json!({
+            "TableName": "t",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        });
+        body[member] = value;
+        body
+    }
+
+    /// A member of the wrong JSON type, at the top level or nested, is the one
+    /// failure reported before the TableName and Tags checks. A null member, a
+    /// missing member and an enum value outside its set wait behind them.
+    #[test]
+    fn only_a_member_of_the_wrong_type_is_a_type_fault() {
+        for (body, fault) in [
+            (with("Tags", json!("x")), true),
+            (with("KeySchema", json!("x")), true),
+            (
+                with(
+                    "KeySchema",
+                    json!([{"AttributeName": 5, "KeyType": "HASH"}]),
+                ),
+                true,
+            ),
+            (with("KeySchema", Value::Null), false),
+            (with("BillingMode", json!("FOO")), false),
+            (json!({"TableName": "t", "AttributeDefinitions": []}), false),
+        ] {
+            match error_of(&body) {
+                DynamoDbError::SerializationException(msg) => {
+                    assert_eq!(is_type_fault(&msg), fault, "{body}: {msg}");
+                }
+                other => panic!("{body}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_table_name_has_the_service_sentence() {
+        match error_of(&json!({"KeySchema": [], "AttributeDefinitions": []})) {
+            DynamoDbError::ValidationException(msg) => assert_eq!(
+                msg,
+                "The parameter 'TableName' is required but was not present in the request"
+            ),
+            other => panic!("{other:?}"),
+        }
     }
 }
 
