@@ -128,8 +128,6 @@ impl KeyCondition {
     ///
     /// The rules the service applies:
     ///
-    /// - Each key attribute may carry one condition; a second one is refused
-    ///   as `KeyConditionExpressions must only contain one condition per key`.
     /// - Every HASH attribute needs an equality condition. Every one without
     ///   it is named, in key-schema order, in `HASH key attributes ... must
     ///   have equality conditions specified in the query`.
@@ -171,8 +169,8 @@ impl KeyCondition {
 
     /// [`Self::resolve_multipart`] with a check on every clause's value,
     /// called with the clause's path and value after the structural rules
-    /// (one condition per key, condition count, HASH coverage, RANGE gap) and
-    /// before the non-key rule. That is where the service reports a value of
+    /// (condition count, HASH coverage, RANGE gap) and before the non-key
+    /// rule. That is where the service reports a value of
     /// the wrong type (measured 2026-10-21: a wrong-typed value loses to a
     /// duplicate, a count overflow, a missing HASH attribute and a RANGE gap,
     /// and wins over a condition on a non-key attribute).
@@ -241,20 +239,10 @@ impl KeyCondition {
             .as_deref()
             .and_then(|a| hash_attrs.iter().position(|h| *h == a));
 
-        // One condition per key attribute. The engine parses a request's key
-        // condition with `parse_key_condition_with_maps`, which refuses a
-        // second condition on one key attribute before this runs. This guards
-        // the map-less `parse_key_condition`, which authorization reads for
-        // `dynamodb:LeadingKeys`.
+        // Key-schema order: the first HASH equality becomes `pk_path`, and the
+        // RANGE equalities keep this order below.
         hash_eqs.sort_by_key(|(pos, _, _)| *pos);
         range_eqs.sort_by_key(|(pos, _, _)| *pos);
-        let duplicated = hash_eqs.windows(2).any(|w| w[0].0 == w[1].0)
-            || range_eqs.windows(2).any(|w| w[0].0 == w[1].0)
-            || non_eq_pos.is_some_and(|p| range_eqs.iter().any(|(q, _, _)| *q == p))
-            || non_eq_hash_pos.is_some_and(|p| hash_eqs.iter().any(|(q, _, _)| *q == p));
-        if duplicated {
-            return Err(validation_err(ONE_CONDITION_PER_KEY_ERR));
-        }
 
         // More conditions than key attributes (measured 2026-10-21: the count
         // is reported ahead of which attribute is missing).
@@ -1849,41 +1837,6 @@ mod tests {
     }
 
     #[test]
-    fn a_second_condition_on_one_key_attribute_is_refused() {
-        const WANT: &str = "Invalid KeyConditionExpression: KeyConditionExpressions must only \
-                            contain one condition per key";
-        for expr in [
-            "h = :x AND h = :y",
-            "h = :x AND h = :y AND a = :z",
-            "h = :x AND a = :y AND a = :z",
-            "h = :h AND a = :a AND a > :x",
-            "h = :h AND a > :x AND a = :a",
-            "h = :h AND a = :a AND b = :n AND b > :lo",
-            "h = :h AND h > :x",
-            "h = :h AND h = :y AND c = :c",
-            "a = :a AND a = :y",
-        ] {
-            let err = classify_one_hash(expr).unwrap_err();
-            assert!(
-                matches!(&err, DynamoDbError::ValidationException(msg) if msg == WANT),
-                "expr {expr}: got {err:?}"
-            );
-        }
-        for expr in [
-            "h1 = :x AND h1 = :y AND h2 = :z",
-            "h1 = :x AND h1 = :y",
-            "h1 = :x AND h2 = :n AND r = :r AND r > :y",
-            "h1 = :x AND r = :r AND r = :y",
-        ] {
-            let err = classify_two_hash(expr).unwrap_err();
-            assert!(
-                matches!(&err, DynamoDbError::ValidationException(msg) if msg == WANT),
-                "expr {expr}: got {err:?}"
-            );
-        }
-    }
-
-    #[test]
     fn a_condition_on_a_non_key_attribute_names_the_first_uncovered_range_attribute() {
         for (expr, missing) in [
             ("h = :h AND z = :z", "a"),
@@ -2188,7 +2141,7 @@ mod tests {
     /// sort key, written with plain names or through `#name` references and
     /// whatever the operators, answers the one-condition-per-key message; a
     /// nested path and redundant parentheses keep their own (measured
-    /// 2026-10-24, us-east-1).
+    /// 2026-10-24, us-east-1). The multi-attribute shapes are not measured.
     #[test]
     fn duplicate_condition_on_one_key_attribute_rejected() {
         const REDUNDANT_PARENS: &str =
@@ -2227,6 +2180,22 @@ mod tests {
             ("#hh = :x AND h = :y AND a = :z", &[("hh", "h")], dup),
             ("#p = :a AND #q = :b", &[("p", "pk"), ("q", "pk")], dup),
             ("pk = :a AND #s = :b AND sk = :c", &[("s", "sk")], dup),
+            // The shapes of a multi-attribute key schema: `h` with the RANGE
+            // attributes `a, b, c, d`, and `h1, h2` with `r`. The check reads
+            // attribute names, so it needs no key schema.
+            ("h = :x AND h = :y", &[], dup),
+            ("h = :x AND h = :y AND a = :z", &[], dup),
+            ("h = :x AND a = :y AND a = :z", &[], dup),
+            ("h = :h AND a = :a AND a > :x", &[], dup),
+            ("h = :h AND a > :x AND a = :a", &[], dup),
+            ("h = :h AND a = :a AND b = :n AND b > :lo", &[], dup),
+            ("h = :h AND h > :x", &[], dup),
+            ("h = :h AND h = :y AND c = :c", &[], dup),
+            ("a = :a AND a = :y", &[], dup),
+            ("h1 = :x AND h1 = :y AND h2 = :z", &[], dup),
+            ("h1 = :x AND h1 = :y", &[], dup),
+            ("h1 = :x AND h2 = :n AND r = :r AND r > :y", &[], dup),
+            ("h1 = :x AND r = :r AND r = :y", &[], dup),
             ("pk = :a AND pk.foo = :b", &[], NESTED_KEY_ERR),
             ("((pk = :a)) AND (pk = :b)", &[], REDUNDANT_PARENS),
         ];
