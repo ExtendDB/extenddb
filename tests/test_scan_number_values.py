@@ -28,10 +28,9 @@ and the values.
 
 Dual-target: runs against the service and against extenddb. Where extenddb
 gives another text than the service, the row names both, the issue that
-tracks the difference, and asserts the one for the target: the ``Segment``
-and ``TotalSegments`` range texts and a ``Limit`` outside int32 (#563), the
-duplicate set text (#1360), the value named among several faulty values
-(#1013), and the Segment pairing text.
+tracks the difference, and asserts the one for the target: the duplicate set
+text (#1360), the value named among several faulty values (#1013), and the
+Segment pairing text.
 
 Run:
   EXTENDDB_TEST_ENDPOINT=https://localhost:18443 \\
@@ -75,7 +74,6 @@ AT_LEAST_0 = "greater than or equal to 0"
 AT_LEAST_1 = "greater than or equal to 1"
 AT_MOST_999999 = "less than or equal to 999999"
 AT_MOST_1000000 = "less than or equal to 1000000"
-TOTAL_BELOW_ONE = "The parameter TotalSegments should be greater than or equal to 1"
 PAIRING = "The Segment parameter is zero-based and must be less than parameter TotalSegments"
 MIX = (
     "Can not use both expression and non-expression parameters in the same request: "
@@ -234,27 +232,22 @@ class TestChecksBeforeTheNumbers:
             dynamodb_client_no_validation, TableName=table, Limit=limit, **NB_FILTER,
         ) == ("ValidationException", "1 validation error detected: " + LIMIT_RANGE)
 
-    @pytest.mark.parametrize("kwargs, service, extenddb", [
+    @pytest.mark.parametrize("kwargs, expected", [
         pytest.param({"Segment": 0, "TotalSegments": 0}, _newer("TotalSegments", AT_LEAST_1),
-                     TOTAL_BELOW_ONE, id="TotalSegments-0"),
+                     id="TotalSegments-0"),
         pytest.param({"Segment": 0, "TotalSegments": 1_000_001},
-                     _newer("TotalSegments", AT_MOST_1000000),
-                     _older(1_000_001, "totalSegments", AT_MOST_1000000), id="TotalSegments-1000001"),
+                     _newer("TotalSegments", AT_MOST_1000000), id="TotalSegments-1000001"),
         pytest.param({"Segment": -1, "TotalSegments": 2}, _newer("Segment", AT_LEAST_0),
-                     _older(-1, "segment", AT_LEAST_0), id="Segment-minus-1"),
+                     id="Segment-minus-1"),
         pytest.param({"Segment": 1_000_000, "TotalSegments": 1_000_000},
-                     _newer("Segment", AT_MOST_999999),
-                     _older(1_000_000, "segment", AT_MOST_999999), id="Segment-1000000"),
-        pytest.param({"Segment": -1}, _newer("Segment", AT_LEAST_0),
-                     _older(-1, "segment", AT_LEAST_0), id="Segment-minus-1-alone"),
+                     _newer("Segment", AT_MOST_999999), id="Segment-1000000"),
+        pytest.param({"Segment": -1}, _newer("Segment", AT_LEAST_0), id="Segment-minus-1-alone"),
         pytest.param({"TotalSegments": 0}, _newer("TotalSegments", AT_LEAST_1),
-                     TOTAL_BELOW_ONE, id="TotalSegments-0-alone"),
+                     id="TotalSegments-0-alone"),
     ])
-    def test_segment_ranges(self, dynamodb_client_no_validation, table, kwargs, service, extenddb):
+    def test_segment_ranges(self, dynamodb_client_no_validation, table, kwargs, expected):
         # Measured 2026-11-23 13:59 and 16:47 UTC with the bad number beside
-        # each row: the range fault comes first. extenddb keeps the previous
-        # release's texts (#563).
-        expected = service if _is_real_dynamodb() else extenddb
+        # each row: the range fault comes first, in the service's newer form.
         assert _scan_error(
             dynamodb_client_no_validation, TableName=table, **kwargs, **NB_FILTER,
         ) == ("ValidationException", expected)
@@ -262,15 +255,13 @@ class TestChecksBeforeTheNumbers:
     def test_limit_range_is_reported_ahead_of_the_segment_ranges_and_the_number(
         self, dynamodb_client_no_validation, table,
     ):
-        # Measured 2026-11-19 16:15 UTC: the service reports the three range
-        # faults in one message; extenddb reports the first (#563).
-        service = (
+        # Measured 2026-11-19 16:15 UTC: the three range faults in one message.
+        expected = (
             "3 validation errors detected: Value at 'Limit' failed to satisfy constraint: "
             f"Member must have value {AT_LEAST_1}; Value at 'Segment' failed to satisfy "
             f"constraint: Member must have value {AT_LEAST_0}; Value at 'TotalSegments' "
             f"failed to satisfy constraint: Member must have value {AT_MOST_1000000}"
         )
-        expected = service if _is_real_dynamodb() else ONE_ERROR + LIMIT_RANGE
         assert _scan_error(
             dynamodb_client_no_validation, TableName=table,
             Limit=0, Segment=-1, TotalSegments=1_000_001, **NB_FILTER,
@@ -279,11 +270,9 @@ class TestChecksBeforeTheNumbers:
     def test_limit_at_and_below_the_int32_minimum(self, dynamodb_client_no_validation, table):
         # Measured 2026-10-25 10:38 and 10:55 UTC: outside int32 the service
         # echoes the saturated value in the older form, and beats the number.
-        # extenddb gives the text Query gives (#563).
-        service = _older(-2_147_483_648, "limit", AT_LEAST_1)
         assert _scan_error(
             dynamodb_client_no_validation, TableName=table, Limit=-2_147_483_649, **NB_FILTER,
-        ) == ("ValidationException", service if _is_real_dynamodb() else ONE_ERROR + LIMIT_RANGE)
+        ) == ("ValidationException", _older(-2_147_483_648, "limit", AT_LEAST_1))
         assert _scan_error(
             dynamodb_client_no_validation, TableName=table, Limit=-2_147_483_648, **NB_FILTER,
         ) == ("ValidationException", ONE_ERROR + LIMIT_RANGE)
