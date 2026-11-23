@@ -26,7 +26,7 @@ use crate::legacy_filter::desugar_filter;
 use crate::read_helpers::{PostRead, read_page};
 use crate::scan_request::{
     CheckOrder, ExpressionValuesBody, ScanFilterBody, SelectBody, StartKeyBody, ValuesDepth,
-    member_order,
+    member_orders,
 };
 use crate::serialize_output;
 use crate::start_key::validate_scan_exclusive_start_key;
@@ -39,7 +39,7 @@ use crate::{DispatchMetrics, DispatchResult};
 /// `raw_body` is the request text `body` was parsed from; the checks read the
 /// request's order of the `ExclusiveStartKey` members, the
 /// `ExpressionAttributeValues` entries and the `ScanFilter` conditions from it
-/// (see `scan_request::member_order`).
+/// in one pass (see `scan_request::member_orders`).
 ///
 /// # Errors
 ///
@@ -120,12 +120,10 @@ async fn run_scan(
     // list value (order U), or a Select value (order R), that the service
     // reports later is held back here, so that the typed deserialization does
     // not report it ahead of the checks the service makes first.
-    let key_order = member_order(raw_body, "ExclusiveStartKey");
-    let start_key = StartKeyBody::take(&mut body, key_order.as_deref());
-    let values_order = member_order(raw_body, "ExpressionAttributeValues");
-    let expression_values = ExpressionValuesBody::take(&mut body, order, values_order.as_deref());
-    let filter_order = member_order(raw_body, "ScanFilter");
-    let scan_filter_values = ScanFilterBody::take(&mut body, order, filter_order.as_deref());
+    let orders = member_orders(raw_body);
+    let start_key = StartKeyBody::take(&mut body, orders.key.as_deref());
+    let expression_values = ExpressionValuesBody::take(&mut body, order, orders.values.as_deref());
+    let scan_filter_values = ScanFilterBody::take(&mut body, order, orders.filter.as_deref());
     let select = SelectBody::take(&mut body, order);
     let input: ScanInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 

@@ -20,8 +20,9 @@ use extenddb_core::error::DynamoDbError;
 use serde_json::{Value, json};
 
 use super::{
-    CheckOrder, ExpressionValuesBody, ScanFilterBody, SelectBody, StartKeyBody, ValuesDepth,
-    fitted_member_order, hash_table_mask, java_hash_bucket, member_order, request_checks,
+    CheckOrder, ExpressionValuesBody, MemberOrders, ScanFilterBody, SelectBody, StartKeyBody,
+    ValuesDepth, fitted_member_order, hash_table_mask, java_hash_bucket, member_orders,
+    request_checks,
 };
 
 const MIX: &str = "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {ScanFilter} Expression parameters: {FilterExpression}";
@@ -574,40 +575,36 @@ fn the_fitted_member_order_follows_the_hash_buckets_then_the_request() {
     assert_eq!(hash_table_mask(seven.len()), 15);
 }
 
-/// `member_order` reads a top-level object's member names from the request
-/// text in document order; a repeated name keeps its first position; a body
-/// without the field, a field that is not an object or text that does not
-/// parse gives `None`.
+/// `member_orders` reads the member names of the three fields from the
+/// request text in document order, in one pass; a repeated name keeps its
+/// first position, a repeated field is read at its first position; a body
+/// without a field gives `None` for it, and text that does not parse or a
+/// field that is not an object gives `None` for all three.
 #[test]
 fn the_request_order_of_the_members_is_read_from_the_raw_body() {
     let raw = br#"{"TableName": "t", "ExclusiveStartKey": {"ts": {"N": "bob"}, "id": {}}, "ExpressionAttributeValues": {":p": {"S": "x"}, ":n": {"N": "bob"}}, "ScanFilter": {"b": {}, "a": {}}}"#;
     let names = |names: &[&str]| Some(names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>());
-    assert_eq!(member_order(raw, "ExclusiveStartKey"), names(&["ts", "id"]));
     assert_eq!(
-        member_order(raw, "ExpressionAttributeValues"),
-        names(&[":p", ":n"])
+        member_orders(raw),
+        MemberOrders {
+            key: names(&["ts", "id"]),
+            values: names(&[":p", ":n"]),
+            filter: names(&["b", "a"]),
+        }
     );
-    assert_eq!(member_order(raw, "ScanFilter"), names(&["b", "a"]));
-    let repeated =
-        br#"{"ExclusiveStartKey": {"b": {}, "a": {}, "b": {"S": "x"}}, "TableName": "t"}"#;
+    let repeated = br#"{"ExclusiveStartKey": {"b": {}, "a": {}, "b": {"S": "x"}}, "TableName": "t", "ExclusiveStartKey": {"c": {}}}"#;
+    assert_eq!(member_orders(repeated).key, names(&["b", "a"]));
     assert_eq!(
-        member_order(repeated, "ExclusiveStartKey"),
-        names(&["b", "a"])
+        member_orders(br#"{"TableName": "t"}"#),
+        MemberOrders::default()
     );
-    assert_eq!(member_order(raw, "ProjectionExpression"), None);
-    assert_eq!(
-        member_order(br#"{"TableName": "t"}"#, "ExclusiveStartKey"),
-        None
-    );
-    assert_eq!(
-        member_order(
-            br#"{"TableName": "t", "ExclusiveStartKey": "x"}"#,
-            "ExclusiveStartKey"
-        ),
-        None
-    );
-    assert_eq!(member_order(b"not json", "ExclusiveStartKey"), None);
-    assert_eq!(member_order(b"", "ExclusiveStartKey"), None);
+    for text in [
+        &br#"{"TableName": "t", "ExclusiveStartKey": "x", "ScanFilter": {"a": {}}}"#[..],
+        b"not json",
+        b"",
+    ] {
+        assert_eq!(member_orders(text), MemberOrders::default());
+    }
 }
 
 /// Faults in two members of one key: the first faulty member in the fitted

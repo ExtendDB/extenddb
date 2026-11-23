@@ -130,6 +130,8 @@
 //! item have nested levels beyond supported limit for key :d` (measured
 //! 2026-10-30), which this module does not reach.
 
+use std::collections::HashSet;
+
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::types::{
     AttributeValue, EMPTY_ATTRIBUTE_VALUE, Item, MULTI_ATTRIBUTE_VALUE, ScanInput,
@@ -357,14 +359,23 @@ fn validate_sets(values: &Map<String, Value>) -> Result<(), DynamoDbError> {
 /// key carries no prefix in either order.
 const START_KEY_PREFIX: &str = "The provided starting key is invalid: ";
 
-/// The member names of the body's object `field` (`ExclusiveStartKey`,
-/// `ExpressionAttributeValues` or `ScanFilter`) in the order the request wrote
-/// them, read from the raw request text, since the parsed body sorts object
-/// members on every build but the MongoDB one. `None` when the text does not
-/// parse, has no such field, or the field is not an object; a name that
-/// appears twice keeps its first position; a field that appears twice is read
-/// at its first position.
-pub(crate) fn member_order(raw_body: &[u8], field: &str) -> Option<Vec<String>> {
+/// The member names of the body's `ExclusiveStartKey`, `ExpressionAttributeValues`
+/// and `ScanFilter` in the order the request wrote them, read from the raw
+/// request text in one pass ([`member_orders`]), since the parsed body sorts
+/// object members on every build but the MongoDB one. A field is `None` when
+/// the body has no such field; every field is `None` when the text does not
+/// parse or one of the three is not an object, which the shape fault check
+/// refuses first. A name that appears twice keeps its first position, and a
+/// field that appears twice is read at its first position.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct MemberOrders {
+    pub(crate) key: Option<Vec<String>>,
+    pub(crate) values: Option<Vec<String>>,
+    pub(crate) filter: Option<Vec<String>>,
+}
+
+/// Reads the [`MemberOrders`] of `raw_body`, in time linear in its length.
+pub(crate) fn member_orders(raw_body: &[u8]) -> MemberOrders {
     /// The member names of one JSON object, in document order.
     struct MemberNames(Vec<String>);
 
@@ -384,9 +395,10 @@ pub(crate) fn member_order(raw_body: &[u8], field: &str) -> Option<Vec<String>> 
                     mut map: A,
                 ) -> Result<MemberNames, A::Error> {
                     let mut names: Vec<String> = Vec::new();
+                    let mut seen: HashSet<String> = HashSet::new();
                     while let Some(name) = map.next_key::<String>()? {
                         map.next_value::<serde::de::IgnoredAny>()?;
-                        if !names.contains(&name) {
+                        if seen.insert(name.clone()) {
                             names.push(name);
                         }
                     }
@@ -398,11 +410,12 @@ pub(crate) fn member_order(raw_body: &[u8], field: &str) -> Option<Vec<String>> 
         }
     }
 
-    /// The top-level object, with only the member names of `field` read.
-    struct FieldNames<'f>(&'f str);
+    /// The top-level object, with only the member names of the three fields
+    /// read.
+    struct FieldNames;
 
-    impl<'de> serde::de::Visitor<'de> for FieldNames<'_> {
-        type Value = Option<Vec<String>>;
+    impl<'de> serde::de::Visitor<'de> for FieldNames {
+        type Value = MemberOrders;
 
         fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.write_str("an object")
@@ -412,22 +425,29 @@ pub(crate) fn member_order(raw_body: &[u8], field: &str) -> Option<Vec<String>> 
             self,
             mut map: A,
         ) -> Result<Self::Value, A::Error> {
-            let mut found: Option<Vec<String>> = None;
+            let mut orders = MemberOrders::default();
             while let Some(name) = map.next_key::<String>()? {
-                if name == self.0 && found.is_none() {
-                    found = Some(map.next_value::<MemberNames>()?.0);
+                let slot = match name.as_str() {
+                    "ExclusiveStartKey" => &mut orders.key,
+                    "ExpressionAttributeValues" => &mut orders.values,
+                    "ScanFilter" => &mut orders.filter,
+                    _ => {
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                        continue;
+                    }
+                };
+                if slot.is_none() {
+                    *slot = Some(map.next_value::<MemberNames>()?.0);
                 } else {
                     map.next_value::<serde::de::IgnoredAny>()?;
                 }
             }
-            Ok(found)
+            Ok(orders)
         }
     }
 
     let mut deserializer = serde_json::Deserializer::from_slice(raw_body);
-    serde::Deserializer::deserialize_map(&mut deserializer, FieldNames(field))
-        .ok()
-        .flatten()
+    serde::Deserializer::deserialize_map(&mut deserializer, FieldNames).unwrap_or_default()
 }
 
 /// The order in which the service visits the members of an `ExclusiveStartKey`
@@ -567,7 +587,7 @@ pub(crate) struct StartKeyBody {
 impl StartKeyBody {
     /// Reads the key from `body` and takes it out of the body when it does not
     /// deserialize for a reason that is not a shape fault. `request_order` is
-    /// the key's member names as the request wrote them ([`member_order`]);
+    /// the key's member names as the request wrote them ([`member_orders`]);
     /// when it is `None` or does not name the key's members, the parsed body's
     /// order stands in for it.
     pub(crate) fn take(body: &mut Value, request_order: Option<&[String]>) -> Self {
@@ -688,7 +708,7 @@ pub(crate) struct ExpressionValuesBody {
 impl ExpressionValuesBody {
     /// Replaces each faulty entry and each empty name with a readable stand-in
     /// in order U and keeps the first fault. `request_order` is the entry
-    /// names as the request wrote them ([`member_order`]).
+    /// names as the request wrote them ([`member_orders`]).
     pub(crate) fn take(
         body: &mut Value,
         order: CheckOrder,
@@ -761,7 +781,7 @@ pub(crate) struct ScanFilterBody {
 impl ScanFilterBody {
     /// Replaces each faulty list value with a readable stand-in in order U and
     /// keeps the first fault. `request_order` is the condition names as the
-    /// request wrote them ([`member_order`]).
+    /// request wrote them ([`member_orders`]).
     pub(crate) fn take(
         body: &mut Value,
         order: CheckOrder,
