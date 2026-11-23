@@ -1499,8 +1499,11 @@ mod on_use {
     fn f(_at: Instant) {}
 }
 
-#[allow(clippy::disallowed_methods, reason = "a control")] //@ on-extern allow
-unsafe extern "C" {}
+mod on_extern {
+    #![allow(clippy::useless_attribute)]
+    #[allow(clippy::disallowed_methods, reason = "a control")] //@ on-extern allow
+    extern crate std as on_extern;
+}
 
 #[allow(clippy::disallowed_methods, reason = "a control")] //@ on-macro-rules allow
 #[allow(unused_macros)]
@@ -1510,6 +1513,9 @@ macro_rules! on_macro_rules {
 
 #[allow(clippy::disallowed_methods, reason = "a control")] //@ on-static allow
 static ON_STATIC: u8 = 0;
+
+#[allow(clippy::disallowed_methods, reason = "a control")] //@ on-named-const allow
+pub(crate) const ON_NAMED_CONST: u8 = 0;
 
 #[allow(clippy::disallowed_methods, reason = "a control")]
 fn with_a_nested_fn() {
@@ -1662,30 +1668,35 @@ CONFIG_CONTROLS = {
         ],
     ),
 }
-# For probe_dependencies, with the build: a library in two versions, and a
-# path of each, of the adapter's library and of a crate no package has. The
-# two control crates' names hold ": ", which no library name does, so no
-# library of a tree is taken for one of them.
+# For probe_dependencies, with the build: a library in two versions, the
+# adapter's package under another library name (check adds it), and a path
+# of each and of a crate no package has. The control crates' names hold
+# ": ", which rustc refuses in a crate name, so no library of a tree that
+# compiles is taken for one of them, and no probe path of the tree is one of
+# these.
 CONTROL_BUILD = [
     {"id": f"twice {version}", "name": "twice", "version": version}
     | {"targets": [{"name": "control: twice", "kind": ["lib"]}]}
     for version in ("1.0.0", "2.0.0")
 ]
+CONTROL_ADAPTER = {"targets": [{"name": "control: adapter", "kind": ["lib"]}]}
 CONTROL_PATHS = {
     "control: absent::f": "it has none",
     "control: twice::f": "it has twice v1.0.0, twice v2.0.0",
-    f"{ADAPTER.replace('-', '_')}::wasm_clippy_guard_control": f"it has {ADAPTER} v",
+    "control: adapter::f": f"it has {ADAPTER} v",
 }
 # For lock_problems, a package that a Cargo.lock gains.
 CONTROL_LOCK = '\n[[package]]\nname = "wasm-clippy-guard-control"\nversion = "0.0.0"\n'
 # The controls of the two checks above, which check matches before the first
-# run, where their findings on the tree stop the guard.
+# run, where their findings on the tree stop the guard; COPY_LOCK_CONTROL is
+# expected only when the copy's Cargo.lock was written, which a plant
+# problem stops.
 EARLY_CONTROLS = [
     *(Control("dependency", "plant", path, words) for path, words in CONTROL_PATHS.items()),
     Control("lock", "plant", "control: a lock", "wasm-clippy-guard-control 0.0.0 is added"),
-    Control("lock", "examined", "the copy's Cargo.lock"),
     Control("lock", "examined", "control: a lock"),
 ]
+COPY_LOCK_CONTROL = Control("lock", "examined", "the copy's Cargo.lock")
 
 
 def _inside(copy: Path, rel: str) -> list[Finding]:
@@ -1929,7 +1940,8 @@ def check(metadata: dict, copy: Path) -> int:
     ids = set(metadata["workspace_members"])
     paths = [*METHOD_PROBES, *TYPE_PROBES, *CONTROL_PATHS]
     adapter = members[ADAPTER]["id"]
-    dependencies, found = probe_dependencies(paths, build + CONTROL_BUILD, adapter, ids)
+    control_build = CONTROL_BUILD + [members[ADAPTER] | CONTROL_ADAPTER]
+    dependencies, found = probe_dependencies(paths, build + control_build, adapter, ids)
     files, spans = crate_files(dependencies)
     planted = plant(copy, metadata, members[ADAPTER], files) + _inside(copy, "Cargo.lock")
     copied, error = (None, "") if planted else cargo_metadata(copy, "--offline")
@@ -1939,10 +1951,9 @@ def check(metadata: dict, copy: Path) -> int:
         locks.append(("the copy's Cargo.lock", lock, (copy / "Cargo.lock").read_text("utf-8")))
     elif not planted:
         planted.append(Finding("plant", "Cargo.lock", f"cargo metadata --offline failed:\n{error}"))
-    failures, problems = match_controls(found + planted + lock_problems(locks), EARLY_CONTROLS)
-    # A plant problem leaves the copy's Cargo.lock unread, so its control
-    # fails too: the problems are printed alone.
-    for text in dict.fromkeys([f.text for f in problems] or failures):
+    early = EARLY_CONTROLS + [COPY_LOCK_CONTROL] * bool(copied)
+    failures, problems = match_controls(found + planted + lock_problems(locks), early)
+    for text in dict.fromkeys([f.text for f in problems] + failures):
         print(f"FAIL: {text}", file=sys.stderr)
     if failures or problems:
         return 1
@@ -2011,7 +2022,7 @@ def check(metadata: dict, copy: Path) -> int:
         f" files of its {len(crates) - 1} crates (a copy of {count} files)"
     )
     print(f"probes: {len(spans) - 1 - unreported} of {len(spans) - 1} reported with --force-warn")
-    print(f"controls: {len(EARLY_CONTROLS) + len(planted)}, {len(failures)} not as planted")
+    print(f"controls: {len(early) + len(planted)}, {len(failures)} not as planted")
     print(f"zeroize: {', '.join(stack)}")
     return 1 if failures or problems else 0
 
