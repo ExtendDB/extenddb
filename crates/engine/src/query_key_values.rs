@@ -526,7 +526,7 @@ impl SetFault<'_> {
 /// order of its own (measured 2026-11-05 and 2026-11-23: `{"M": {"k": {"N":
 /// "bob"}, "j": {}}}` in a key member answers the empty value, and `{"M":
 /// {"z": {"N": "bob"}, "b": {"N": "fred"}}}` answers `bob`, which sorted
-/// order would not; #<M-ORDER>). A value of another JSON type, and an `N` or
+/// order would not; #1013). A value of another JSON type, and an `N` or
 /// `NS` payload of the wrong JSON type, are shape faults the deserializer
 /// reports. A type descriptor with a null payload counts as absent, as the
 /// service reads it (measured 2026-11-19: `{"S": null}` answers the empty
