@@ -87,7 +87,8 @@ wasm-bindgen-test = "0.3.80"
 # The native test dependencies pull the engine, the backup store and tokio's
 # full (net) stack, none of which build for wasm32. Scoping them off wasm lets
 # the wasm32 shim integration test (`tests/wasm_shim.rs`) compile against only
-# the crate and `wasm-bindgen-test`; every other target gets the full set.
+# the crate, its dependencies and `wasm-bindgen-test`; every other target gets
+# the full set.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 extenddb-storage = { path = "../storage", features = ["test-util"] }
 # `tests/backup_job_panic.rs` drives the engine's CreateBackup job and

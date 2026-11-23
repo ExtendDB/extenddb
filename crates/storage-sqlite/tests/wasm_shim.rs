@@ -11,7 +11,8 @@
 //! this backend is defined against.
 //!
 //! Each row runs its request on a fresh in-memory pool with one connection,
-//! the pool the backend opens for an in-memory database, and renders the
+//! the pool the backend opens for an in-memory database (one row opens its own
+//! pool with `max_connections(2)` beside it), and renders the
 //! outcome as `Ok(<value>)` or `Err[<variant>] <message>`. On native targets
 //! the row runs against `sqlx-sqlite` (the version `Cargo.lock` pins) over the
 //! C SQLite; on wasm32 it runs against the shim. A row has one expected
@@ -78,7 +79,7 @@ use futures::StreamExt;
 /// The number of rows `cases()` returns, written here by hand rather than
 /// counted from `cases()`, so that a row deleted from or filtered out of
 /// `cases()` fails the test. Adding or removing a row changes this number.
-const ROWS: usize = 93;
+const ROWS: usize = 96;
 
 /// The number of rows named `difference: ...`.
 const DIFFERENCE_ROWS: usize = 6;
@@ -338,6 +339,7 @@ fn cases() -> Vec<Case> {
         ),
         decode!("2", bool, "Ok(true)"),
         decode!("'ab'", Vec<u8>, "Ok([97, 98])"),
+        decode!("x'0102'", Vec<u8>, "Ok([1, 2])"),
         decode!("1099511627776", i32, format!("{DECODE} 0: {i32_overflow}")),
         decode!(
             "'{\"a\":1}'",
@@ -461,6 +463,41 @@ fn cases() -> Vec<Case> {
                     .await
                     .map(drop)
             )
+        ),
+        row!(
+            "a UNIQUE violation shows its extended code and SQLite's message",
+            "Err[Database] error returned from database: (code: 2067) UNIQUE constraint failed: \
+             t.id",
+            |pool| {
+                sqlx::raw_sql("CREATE TABLE t (id INTEGER UNIQUE); INSERT INTO t VALUES (1)")
+                    .execute(&pool)
+                    .await?;
+                render(
+                    sqlx::query("INSERT INTO t VALUES (1)")
+                        .execute(&pool)
+                        .await
+                        .map(drop),
+                )
+            }
+        ),
+        row!(
+            "a foreign-key violation shows its extended code and SQLite's message",
+            "Err[Database] error returned from database: (code: 787) FOREIGN KEY constraint \
+             failed",
+            |pool| {
+                sqlx::raw_sql(
+                    "CREATE TABLE p (id INTEGER PRIMARY KEY); \
+                     CREATE TABLE c (p INTEGER REFERENCES p (id))",
+                )
+                .execute(&pool)
+                .await?;
+                render(
+                    sqlx::query("INSERT INTO c VALUES (1)")
+                        .execute(&pool)
+                        .await
+                        .map(drop),
+                )
+            }
         ),
         row!(
             "the Io error text",
