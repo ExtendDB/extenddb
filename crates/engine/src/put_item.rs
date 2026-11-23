@@ -79,6 +79,7 @@ pub async fn handle_put_item(
         if msg.contains("parameter values were invalid")
             || msg.contains("may not be empty")
             || msg.contains("contains duplicates")
+            || extenddb_core::partiql::number::is_problem_message(&msg)
             || msg.contains("Null attribute value")
             || msg.contains("validation error detected")
             || msg.contains("must not be empty")

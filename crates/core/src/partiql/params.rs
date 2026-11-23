@@ -220,7 +220,7 @@ fn check_value(value: &Value, depth: usize) -> Result<(), String> {
                 check_value(item, next)?;
             }
         }
-        ("N", Value::String(text)) => check_text(text)?,
+        ("N", _) => payload_refusal(tag, payload)?,
         // The members are converted in order, and a null member is refused
         // where it stands (measured 2026-11-06: `["abc", null]` is refused
         // for `abc`, `[null, "abc"]` for the null).
@@ -231,9 +231,7 @@ fn check_value(value: &Value, depth: usize) -> Result<(), String> {
                     _ => return Err(NULL_NUMBER_SET_MEMBER.to_owned()),
                 }
             }
-            if has_equal_numbers(items) {
-                return Err(NUMBER_SET_DUPLICATES.to_owned());
-            }
+            payload_refusal(tag, payload)?;
             content_refusal(tag, payload)?;
         }
         // A null member is refused ahead of a member given twice (measured
@@ -285,6 +283,30 @@ fn enter(depth: usize) -> Result<usize, String> {
 
 fn check_text(text: &str) -> Result<(), String> {
     check_number(text).map_err(|problem| parameter_message(text, problem))
+}
+
+/// The refusal of the payload of the type descriptor `tag`, as the service
+/// finds it when it converts the value: an `N` that cannot be converted or
+/// breaks a number rule, a number set two of whose members have one value, a
+/// string set that holds a member twice. [`check_value`] runs it on a
+/// parameter's `N` and `NS` descriptors. The attribute value deserializer
+/// runs it on each descriptor of a value that has two or more, ahead of the
+/// count (measured 2026-11-23: `{"S": "x", "N": "bob"}` is refused for `bob`
+/// and `{"S": "x", "N": "1"}` for the count, in UpdateItem, Query and
+/// PutItem alike).
+///
+/// # Errors
+///
+/// Returns the service's message for the fault.
+pub(crate) fn payload_refusal(tag: &str, payload: &Value) -> Result<(), String> {
+    match (tag, payload) {
+        ("N", Value::String(text)) => check_text(text),
+        ("NS", Value::Array(items)) if has_equal_numbers(items) => {
+            Err(NUMBER_SET_DUPLICATES.to_owned())
+        }
+        ("SS", Value::Array(items)) => crate::types::string_set_duplicates(items),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]
