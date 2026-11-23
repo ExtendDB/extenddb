@@ -386,19 +386,26 @@ ORDER BY mean_exec_time DESC LIMIT 10;
 The memory the metrics hold does not grow with the number of requests served.
 Counter metrics are held for at most two minutes before they are flushed to the
 catalog. So the memory they occupy scales with the request rate and not with
-uptime. A GetItem adds six 40-byte points, held for 60 to 120 seconds.
+uptime. A GetItem adds five or seven 40-byte points (seven when it returns an
+item), held for 60 to 120 seconds.
 Per-operation latency segments are summed into time buckets per account and
 operation. A bucket is 64 bytes and covers one second of the last five minutes
 or one minute of the last day. A bucket exists only for a second or minute in
 which the account sent that operation. An operation the account sends every
 second holds the most buckets, 1,742, which is 111,488 bytes (109 KiB). An
-operation the account sends once a day holds two buckets, about 340 bytes with
-its keys and map entries. With the 40 operations the server dispatches, an
-account that sends every operation every second holds about 4.46 MB (4.25 MiB)
-of buckets. An account that sends each operation once a day holds about 14 KB.
-The five-minute metrics prune drops the buckets of an account that sent no
-request for a day. That happens 1,440 to about 1,446 minutes after its last
-request. The buckets return to the allocator. The process's resident size can
+operation the account sends once a day holds two buckets. With its keys and
+map entries that is about 340 bytes when the account sends many operations,
+and about 810 bytes when the account sends only that operation (measured on a
+release build with a counting allocator, 23 November 2026). With the 40
+operations the server dispatches, an account that sends every operation every
+second holds about 4.46 MB (4.25 MiB) of buckets. An account that sends each
+operation once a day holds about 14 KB. The memory of an operation's buckets
+does not shrink when the account sends it less often. The operation keeps the
+largest allocation it reached, up to 111,488 bytes, until a day passes with no
+request for it. Then the five-minute metrics prune drops its buckets, and it
+drops the account once the account holds no operation. That happens 1,440 to
+about 1,446 minutes after the last request. The buckets return to the
+allocator. The process's resident size can
 stay at the high-water mark the allocator reached. So the segments grow with
 the number of accounts that sent a request in the last day. They also grow with
 the seconds and minutes in which each of those accounts was active. Below one
@@ -409,9 +416,12 @@ bucket for each partition key that a GetItem, PutItem, UpdateItem or DeleteItem
 names. It never drops one. Resident memory then grows with the number of
 distinct partition keys those requests name.
 
-Every release through 1.0.0 kept one latency segment record per data-plane
-request in memory for 24 hours. So does any later release before the one that
-carries this change. A record takes about 190 bytes through 0.1.14, and about
+Every release through 1.0.0 kept one latency segment record per request that
+reaches dispatch in memory for 24 hours. So does any later release before the
+one that carries this change. The upgrade manual's
+[v1.1.0 entry](07-upgrade-manual.md#v110-latency-segments-are-summed-into-time-buckets)
+lists what the change does to the `segments` that `/metrics` returns. A record
+takes about 190 bytes through 0.1.14, and about
 250 from 0.1.15 on, which also stores the account id. On those releases resident
 memory grows for the first 24 hours. It then holds at the level set by the
 busiest 24-hour window the process saw, and it does not come down short of a
