@@ -215,3 +215,6 @@ mod tests_eval;
 
 #[cfg(test)]
 mod tests_depth;
+
+#[cfg(test)]
+mod tests_operands;

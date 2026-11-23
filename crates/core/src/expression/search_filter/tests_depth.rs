@@ -160,6 +160,25 @@ fn deeply_nested_calls_answer_as_the_service_does() {
     assert_eq!(outcome(&expr), syntax("<EOF>", "a"));
 }
 
+#[test]
+fn parentheses_inside_between_in_and_function_arguments() {
+    let cases = [
+        (
+            "a BETWEEN ".to_owned() + &"(".repeat(2000) + ":v AND :w",
+            syntax("AND", ":v AND :w"),
+        ),
+        (
+            "a IN (".to_owned() + &"(".repeat(2000) + ":v)",
+            syntax("<EOF>", ")"),
+        ),
+        (
+            "attribute_exists(".to_owned() + &"(".repeat(2000) + "a)",
+            syntax("<EOF>", ")"),
+        ),
+    ];
+    assert_cases(&cases);
+}
+
 /// 300 operators is the most the grammar takes, so the deepest accepted tree
 /// is 300 levels. It parses, evaluates and drops on the worker stack.
 #[test]

@@ -13,13 +13,18 @@
 //!            | operand comparator operand
 //!            | operand BETWEEN operand AND operand
 //!            | operand IN '(' operand ( ',' operand )* ')'
-//! operand   := path | :value | call
+//! operand   := '(' operand ')' | path | :value | call
 //! call      := name '(' operand ( ',' operand )* ')'
 //! path      := ( name | #name ) ( '.' ( name | #name ) | '[' digits ']' )*
 //! ```
 //!
 //! Keywords are case-insensitive. A number is a token, but no rule takes
 //! one outside a list index, so `a = 10` is a syntax error at `10`.
+//!
+//! A `(` where a condition starts opens a parenthesised operand when an
+//! operand and its `)` follow, as in `(a) = :v` or `(attribute_exists(a))`,
+//! and a group otherwise, as in `(a = :v)`. No path step follows a
+//! parenthesised operand: `(a).b` is a syntax error at `.`.
 
 use super::lexer::{Kind, Tok, syntax_error};
 use crate::expression::CompareOp;
@@ -135,12 +140,18 @@ pub(super) fn parse(src: &str, toks: &[Tok]) -> Result<Node, String> {
 }
 
 /// A parenthesised group whose whole content is another parenthesised group,
-/// such as `((a = :v))`. The same rule as the other expression parsers.
+/// such as `((a = :v))` or `((a)) = :v`. The `(` of a call and of an IN list
+/// is not a group, so `attribute_exists((a))` and `a IN ((:v))` pass, while
+/// `attribute_exists(((a)))` does not.
 fn check_redundant_parens(toks: &[Tok]) -> Result<(), String> {
+    let group = |i: usize| {
+        toks[i].kind == Kind::LParen
+            && !(i > 0 && matches!(toks[i - 1].kind, Kind::Name | Kind::In))
+    };
     let mut stack: Vec<bool> = Vec::new();
     for (i, tok) in toks.iter().enumerate() {
         match tok.kind {
-            Kind::LParen => stack.push(i > 0 && toks[i - 1].kind == Kind::LParen),
+            Kind::LParen => stack.push(i > 0 && group(i - 1)),
             Kind::RParen => {
                 let doubled = stack.pop() == Some(true);
                 if doubled && toks.get(i + 1).map(|t| &t.kind) == Some(&Kind::RParen) {
@@ -160,6 +171,23 @@ struct Group {
     or: Option<Node>,
     and: Option<Node>,
     nots: usize,
+}
+
+/// A failed [`Parser::operand`]. `unclosed` is the number of open
+/// parentheses when the operand inside them was complete and the next token
+/// was not `)`, and no call was open.
+struct Unparsed {
+    message: String,
+    unclosed: Option<usize>,
+}
+
+impl Unparsed {
+    fn other(message: String) -> Self {
+        Self {
+            message,
+            unclosed: None,
+        }
+    }
 }
 
 struct Parser<'a> {
@@ -218,12 +246,33 @@ impl Parser<'_> {
                 self.bump();
                 top.nots += 1;
             }
-            if self.kind() == &Kind::LParen {
-                self.bump();
-                groups.push(Group::default());
-                continue;
-            }
-            let mut node = self.primary()?;
+            let mut node = if self.kind() == &Kind::LParen {
+                let start = self.pos;
+                let subject = match self.operand_traced() {
+                    Ok(subject) => subject,
+                    Err(failed) => {
+                        // When an operand followed the run of `(` but lacked a
+                        // `)` for each of the first `unclosed` of them, those
+                        // open groups and the rest open the operand. Otherwise
+                        // the whole run opens groups.
+                        let count = failed.unclosed.unwrap_or_else(|| {
+                            self.toks[start..]
+                                .iter()
+                                .take_while(|t| t.kind == Kind::LParen)
+                                .count()
+                        });
+                        self.pos = start;
+                        for _ in 0..count {
+                            self.bump();
+                            groups.push(Group::default());
+                        }
+                        continue;
+                    }
+                };
+                self.primary_after(subject)?
+            } else {
+                self.primary()?
+            };
             // Fold the finished primary into the open groups. A group that
             // ends at `)` becomes a primary of the group around it.
             loop {
@@ -259,6 +308,11 @@ impl Parser<'_> {
     /// A primary that does not open a group.
     fn primary(&mut self) -> Result<Node, String> {
         let subject = self.operand()?;
+        self.primary_after(subject)
+    }
+
+    /// The rest of a primary whose first operand is `subject`.
+    fn primary_after(&mut self, subject: Operand) -> Result<Node, String> {
         let op = match self.kind() {
             Kind::Eq => CompareOp::Eq,
             Kind::Ne => CompareOp::Ne,
@@ -301,12 +355,21 @@ impl Parser<'_> {
         })
     }
 
-    /// `operand`, with an explicit stack of the calls that are open, so a
-    /// nested call such as `f(f(f(x)))` never recurses.
     fn operand(&mut self) -> Result<Operand, String> {
-        let mut calls: Vec<Call> = Vec::new();
+        self.operand_traced().map_err(|e| e.message)
+    }
+
+    /// `operand`, with an explicit stack of the calls and parentheses that are
+    /// open, so a nested call such as `f(f(f(x)))` never recurses.
+    fn operand_traced(&mut self) -> Result<Operand, Unparsed> {
+        let mut open: Vec<Option<Call>> = Vec::new();
         loop {
             let mut done = match self.kind() {
+                Kind::LParen => {
+                    self.bump();
+                    open.push(None);
+                    continue;
+                }
                 Kind::ValueRef => {
                     let value = self.text().to_owned();
                     self.bump();
@@ -316,27 +379,39 @@ impl Parser<'_> {
                     let name = self.text().to_owned();
                     self.bump();
                     self.bump();
-                    calls.push(Call {
+                    open.push(Some(Call {
                         name,
                         args: Vec::new(),
-                    });
+                    }));
                     continue;
                 }
-                Kind::Name | Kind::NameRef => self.path()?,
-                _ => return Err(self.error()),
+                Kind::Name | Kind::NameRef => self.path().map_err(Unparsed::other)?,
+                _ => return Err(Unparsed::other(self.error())),
             };
             loop {
-                let Some(open) = calls.last_mut() else {
-                    return Ok(done);
-                };
-                open.args.push(done);
-                if self.kind() == &Kind::Comma {
-                    self.bump();
-                    break;
+                match open.last_mut() {
+                    None => return Ok(done),
+                    // A parenthesised operand is the operand inside.
+                    Some(None) => {
+                        if let Err(message) = self.expect(&Kind::RParen) {
+                            let unclosed = open.iter().all(Option::is_none).then_some(open.len());
+                            return Err(Unparsed { message, unclosed });
+                        }
+                        open.pop();
+                    }
+                    Some(Some(call)) => {
+                        call.args.push(done);
+                        if self.kind() == &Kind::Comma {
+                            self.bump();
+                            break;
+                        }
+                        self.expect(&Kind::RParen).map_err(Unparsed::other)?;
+                        let Some(Some(call)) = open.pop() else {
+                            unreachable!()
+                        };
+                        done = Operand::Call(call);
+                    }
                 }
-                self.expect(&Kind::RParen)?;
-                let call = calls.pop().unwrap_or_else(|| unreachable!());
-                done = Operand::Call(call);
             }
         }
     }
