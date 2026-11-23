@@ -62,8 +62,8 @@ aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "al
 # Without aes's or polyval's feature the wasm32 build fails (src/crypto.rs,
 # which names `polyval::Polyval` through the polyval entry below). The
 # docstring of devtools/check-wasm-clippy-guard, in the repository this
-# crate's manifest names, says how the features of the wasm32 build are
-# checked.
+# crate's manifest names, says how the zeroize features of these crates are
+# checked in the wasm32 build.
 aes = { version = "0.8.2", features = ["zeroize"] }
 ghash = { version = "0.5", features = ["zeroize"] }
 polyval = { version = "0.6", features = ["zeroize"] }

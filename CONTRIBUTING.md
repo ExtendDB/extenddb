@@ -202,11 +202,11 @@ SQLite, PostgreSQL, Cassandra and MongoDB migrate through this framework.
    the backend's crate, and declare the module with `#[rustfmt::skip]` and
    `#[allow(clippy::all, deprecated)]`, so that neither tool can require an
    edit to a released body. That allow also switches off, for the body, the
-   lists of calls in `devtools/wasm-clippy/clippy.toml` that the WebAssembly
-   clippy step refuses (the file's header says what that step does not see).
+   lists in `devtools/wasm-clippy/clippy.toml` of what the WebAssembly clippy
+   step refuses (the file's header says what that step does not see).
    The WebAssembly build opens only in-memory databases, and each runs every
    migration when it opens, so in a crate of that build, review checks that a
-   body calls none of the methods listed there. The module defines:
+   body calls none of the methods or types listed there. The module defines:
 
    - `SOURCE`, the module's own text through `include_str!`, followed by the
      text of any SQL file the body executes. The checksum test pins its
