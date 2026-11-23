@@ -76,20 +76,35 @@ impl PostgresCatalogStore {
 
 // ── SettingsStore ──────────────────────────────────────────────────────
 
+/// The server-side bound on a settings read: how long it waits for a lock
+/// on the `settings` table, and how long it runs in all.
+const SETTING_READ_BOUND: &str = "SELECT set_config('lock_timeout', '1s', true), \
+     set_config('statement_timeout', '1500ms', true)";
+
 impl extenddb_storage::management_store::SettingsStore for PostgresCatalogStore {
     fn get_setting(&self, key: &str) -> futures::future::BoxFuture<'_, OpResult<Option<String>>> {
         let key = key.to_string();
         let pool = self.pool.clone();
         Box::pin(async move {
+            let failed = |e: sqlx::Error| {
+                tracing::error!("get_setting: {e}");
+                OpError::Internal("Database error".to_owned())
+            };
+            // The bound is set on the server, so a read that waits on a lock
+            // ends there and gives its connection back even when the caller
+            // has stopped waiting for it.
+            let mut tx = pool.begin().await.map_err(failed)?;
+            sqlx::query(SETTING_READ_BOUND)
+                .execute(&mut *tx)
+                .await
+                .map_err(failed)?;
             let row: Option<(String,)> =
                 sqlx::query_as("SELECT value FROM settings WHERE key = $1")
                     .bind(&key)
-                    .fetch_optional(&pool)
+                    .fetch_optional(&mut *tx)
                     .await
-                    .map_err(|e| {
-                        tracing::error!("get_setting: {e}");
-                        OpError::Internal("Database error".to_owned())
-                    })?;
+                    .map_err(failed)?;
+            tx.commit().await.map_err(failed)?;
             Ok(row.map(|(v,)| v))
         })
     }
