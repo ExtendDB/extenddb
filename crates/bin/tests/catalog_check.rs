@@ -13,7 +13,7 @@
 
 #![cfg(feature = "postgres")]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use sqlx::Connection;
@@ -32,6 +32,18 @@ fn catalog_check(config: &Path, fix: bool) -> Command {
     }
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     command
+}
+
+/// The directory of the command's config, removed when the test ends, a
+/// failed test included.
+struct ConfigDir(PathBuf);
+
+impl Drop for ConfigDir {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.0) {
+            eprintln!("remove {}: {e}", self.0.display());
+        }
+    }
 }
 
 fn assert_run(run: &str, output: &Output, stdout: &str) {
@@ -53,15 +65,17 @@ async fn catalog_check_prints_each_finding_and_exits_with_status_1() {
     let gsi = d.index_relation(TABLE, "gsi1").await;
     d.remove_relation(&gsi).await;
 
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("catalog-check-{}", uuid::Uuid::new_v4().simple()));
-    std::fs::create_dir_all(&dir).expect("a directory for the config");
-    let config = dir.join("extenddb.toml");
+    let dir = ConfigDir(
+        Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("catalog-check-{}", uuid::Uuid::new_v4().simple())),
+    );
+    std::fs::create_dir_all(&dir.0).expect("a directory for the config");
+    let config = dir.0.join("extenddb.toml");
     std::fs::write(
         &config,
         format!(
             "[server]\nrun_dir = {:?}\n\n[storage.postgres]\nconnection_string = {:?}\n",
-            dir.join("run").display().to_string(),
+            dir.0.join("run").display().to_string(),
             d.catalog_url()
         ),
     )
@@ -131,6 +145,4 @@ async fn catalog_check_prints_each_finding_and_exits_with_status_1() {
         Some("Error: No data database connection string in settings. Run `extenddb init`."),
         "without the setting: stderr"
     );
-
-    std::fs::remove_dir_all(&dir).expect("remove the config");
 }
