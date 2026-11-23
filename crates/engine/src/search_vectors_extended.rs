@@ -14,7 +14,7 @@
 //! [`install_search_filter_settings`], so a change applies without a restart.
 //! Until a store is installed, no account gets the grammar.
 
-pub(crate) use imp::{parse_request, resolve_scope};
+pub(crate) use imp::{Extended, parse_request, resolve_scope};
 
 #[cfg(feature = "search-inequality-filters")]
 pub use imp::install_search_filter_settings;
