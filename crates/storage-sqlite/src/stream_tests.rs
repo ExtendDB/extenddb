@@ -482,7 +482,9 @@ async fn write_record_at(engine: &SqliteEngine, shard_id: &str, table_id: &str, 
 
 /// The `AT_TIMESTAMP` seek answers the first record created at or after the
 /// millisecond asked for: a record's own millisecond returns it, the next one
-/// does not, and another shard's records do not count.
+/// does not, and another shard's records do not count. The other shard's
+/// record has the lowest sequence number and a `created_at` inside the table's
+/// range, so without the shard filter it is the answer to the first five rows.
 #[tokio::test]
 async fn at_timestamp_seek_is_at_or_after_the_records_millisecond() {
     let engine = engine().await;
@@ -493,7 +495,7 @@ async fn at_timestamp_seek_is_at_or_after_the_records_millisecond() {
     write_record_at(&engine, &own, &table_id, 5, base).await;
     write_record_at(&engine, &own, &table_id, 6, base + 1).await;
     write_record_at(&engine, &own, &table_id, 7, base + 750).await;
-    write_record_at(&engine, &other, &table_id, 8, base - 1_000).await;
+    write_record_at(&engine, &other, &table_id, 4, base + 2).await;
 
     let cases: &[(i64, Option<u64>)] = &[
         (0, Some(5)),
