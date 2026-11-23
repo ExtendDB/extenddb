@@ -203,12 +203,15 @@ SQLite, PostgreSQL, Cassandra and MongoDB migrate through this framework.
    `#[allow(clippy::all, deprecated)]`, so that neither tool can require an
    edit to a released body. In a crate that the WebAssembly build compiles
    (`devtools/run-wasm-step guard` prints them, after "crates the wasm build
-   compiles:"), when a method that a released body calls is later listed in
-   `devtools/wasm-clippy/clippy.toml` (whose header says what an entry
-   needs), add `#[allow(clippy::disallowed_methods, reason = "...")]` to the
-   module's `mod` line, with a reason that says why no wasm32 database
-   reaches the call. (The WebAssembly build opens only in-memory databases,
-   and each runs every migration when it opens.) The module defines:
+   compiles:"), a call that a body makes to a method listed in
+   `devtools/wasm-clippy/clippy.toml` needs, before the body is released,
+   `#[allow(clippy::disallowed_methods, reason = "...")]` on the function or
+   the statement that holds it, inside the module's file, as in any other
+   code, with a reason that says why no wasm32 database reaches the call.
+   (The WebAssembly build opens only in-memory databases, and each runs every
+   migration when it opens.) The guard accepts no allow on the `mod` line, so
+   it refuses a call that a released body makes to a method listed later:
+   leave such a method out of `clippy.toml`. The module defines:
 
    - `SOURCE`, the module's own text through `include_str!`, followed by the
      text of any SQL file the body executes. The checksum test pins its
