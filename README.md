@@ -395,12 +395,23 @@ to crates.io.
     `UpdateTable` creates or deletes is built or dropped before `UpdateTable`
     answers.
 
-The SigV4 key-derivation code in `extenddb-auth` compiles into this build, but
-the adapter never calls it: it builds no credential store and verifies no
-signature. If that code were called on `wasm32`, its HMAC-SHA256 (the RustCrypto
-`hmac` 0.12 crate over `sha2` 0.10, which have no zeroize support) leaves the
-zero-padded key block and the key-derived SHA-256 states in memory unwiped,
-where the server's AWS-LC backend wipes its HMAC context.
+`hmac_sha256` (HMAC-SHA256, in `crates/core/src/crypto.rs`) is compiled for
+this build, and so are its two callers: the SigV4 signing-key and signature
+code in `crates/auth/src/sigv4/signing_key.rs`, and `key_id` in
+`crates/storage/src/key_ring.rs`, which gives the key ring's key ids. No
+request reaches them: the adapter builds no credential store, verifies no
+signature and uses no key ring. On `wasm32`, `hmac_sha256` uses the RustCrypto
+`hmac` 0.12 and `sha2` 0.10 crates, which have no zeroize support. A call
+there can leave copies on the stack, until later calls overwrite them, of the
+zero-padded key block, of the two SHA-256 states derived from it (together
+they compute the HMAC of any message under the key) and of the bytes of the
+message after its last whole 64-byte block (the message of `catalog_key_id` is
+the catalog key). Which of them a call leaves depends on the build profile,
+the caller and the length of the message; in a release build as in a dev
+build, a call can leave the states and the message bytes. A native build's
+AWS-LC backend wipes its copy of the key block and its HMAC context, but a
+call there can leave copies of the states and the message bytes on the stack
+too.
 
 The AES-256-GCM cipher that seals stored secrets (`seal` and `open` in
 `crates/core/src/crypto.rs`) compiles in too, but no request reaches it: the
