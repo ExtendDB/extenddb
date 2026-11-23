@@ -379,11 +379,10 @@ pub async fn handle_query(
         ExpressionMaps::new(names, values)
     };
 
-    // The filter's operand types against the values legacy KeyConditions or a
-    // QueryFilter add. A FilterExpression was checked against the request's own
-    // values when it was parsed.
+    // A desugared QueryFilter's operand types, against the values it adds. A
+    // FilterExpression was checked against the request's values when parsed.
     if let Some(f) = &filter
-        && (filter_maps.is_some() || legacy_kc_maps.is_some())
+        && filter_maps.is_some()
     {
         check_filter_operand_types(f, &combined_maps)?;
     }
