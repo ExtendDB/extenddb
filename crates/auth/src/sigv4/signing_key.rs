@@ -22,8 +22,10 @@ use zeroize::Zeroizing;
 ///
 /// - the 32-byte array that `extenddb_core::crypto::hmac_sha256` returns for
 ///   each step, and the tag its backend computes, on the stack;
-/// - on `wasm32` only, the HMAC state of each step, which that backend does
-///   not wipe (README.md, "What it does not do", says what stays in memory).
+/// - copies of the key-derived state that the HMAC of each step can leave on
+///   the stack, on either backend, and on `wasm32` copies of its key as well
+///   (the README at the root of the repository this crate's manifest names,
+///   in its section "What it does not do", says what each backend can leave).
 ///
 /// # Arguments
 /// * `secret` - The plaintext secret access key.

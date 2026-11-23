@@ -7,12 +7,12 @@
 //! in a single module and nowhere else.
 //!
 //! On every target except `wasm32` the backend is AWS-LC (through `aws-lc-rs`),
-//! the library ADR-0026 (`docs/adr/0026-credential-crypto-on-aws-lc.md`) chose
-//! for secret encryption and the SigV4 SHA-256, HMAC-SHA256 and signature
-//! compare. On `wasm32`, where AWS-LC's C and assembly do not build, the
-//! backend is the pure-Rust RustCrypto stack (`sha2`, `hmac`, `aes-gcm`),
-//! constant-time comparison from `subtle`, and randomness from `getrandom`'s
-//! browser backend.
+//! the library ADR-0026 (`docs/adr/0026-credential-crypto-on-aws-lc.md` in the
+//! repository this crate's manifest names) chose for secret encryption and the
+//! SigV4 SHA-256, HMAC-SHA256 and signature compare. On `wasm32`, where
+//! AWS-LC's C and assembly do not build, the backend is the pure-Rust
+//! RustCrypto stack (`sha2`, `hmac`, `aes-gcm`), constant-time comparison from
+//! `subtle`, and randomness from `getrandom`'s browser backend.
 //!
 //! Both backends compute the same standard algorithms — SHA-256, HMAC-SHA256
 //! and AES-256-GCM — so a value sealed on one target opens on the other. This
@@ -196,8 +196,8 @@ mod imp {
     // core's manifest turns both on. `polyval::Polyval` names core's own
     // polyval dependency, which is the `Polyval` inside aes-gcm's GHASH when
     // the build holds one copy of polyval; the docstring of
-    // devtools/check-wasm-clippy-guard says how the build's copies are
-    // checked.
+    // devtools/check-wasm-clippy-guard, in the repository this crate's
+    // manifest names, says how the build's copies are checked.
     const _: () = {
         const fn wiped_on_drop<T: zeroize::ZeroizeOnDrop>() {}
         wiped_on_drop::<aes_gcm::aes::Aes256>();
@@ -214,8 +214,9 @@ mod imp {
     }
 
     pub(super) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-        // HMAC accepts a key of any length, so this never errors.
-        // README.md, "What it does not do", says what this leaves in memory.
+        // HMAC accepts a key of any length, so this never errors. The README
+        // at the root of the repository this crate's manifest names, in its
+        // section "What it does not do", says what this leaves on the stack.
         let mut mac =
             <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
         mac.update(data);
@@ -236,7 +237,9 @@ mod imp {
         plaintext: &[u8],
         aad: &[u8],
     ) -> Result<Vec<u8>, String> {
-        // README.md, "What it does not do", says what this leaves on the stack.
+        // The README at the root of the repository this crate's manifest
+        // names, in its section "What it does not do", says what this leaves
+        // on the stack.
         let cipher = Aes256Gcm::new_from_slice(key)
             .map_err(|_| "load encryption key: AES-256-GCM key setup failed".to_owned())?;
         let mut nonce = [0u8; super::NONCE_LEN];
@@ -263,7 +266,9 @@ mod imp {
         sealed: &[u8],
         aad: &[u8],
     ) -> Result<Zeroizing<Vec<u8>>, String> {
-        // README.md, "What it does not do", says what this leaves on the stack.
+        // The README at the root of the repository this crate's manifest
+        // names, in its section "What it does not do", says what this leaves
+        // on the stack.
         let (nonce, rest) = split_or_refuse(sealed)?;
         let cipher = Aes256Gcm::new_from_slice(key)
             .map_err(|_| "load encryption key: AES-256-GCM key setup failed".to_owned())?;

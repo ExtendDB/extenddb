@@ -89,7 +89,7 @@ pub(crate) async fn handle_request(
     // operation returns UnknownOperationException even without auth headers,
     // and a malformed request gets 400 regardless of auth state.
     // `extenddb_engine::parse_request` makes both checks, in that order; the
-    // module doc of `crates/engine/src/pre_dispatch.rs` says which checks
+    // module doc of extenddb-engine's `src/pre_dispatch.rs` says which checks
     // belong in the engine rather than here.
     let request = match extenddb_engine::parse_request(&operation, &body) {
         Ok(request) => request,
