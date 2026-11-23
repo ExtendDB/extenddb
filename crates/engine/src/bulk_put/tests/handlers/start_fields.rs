@@ -311,35 +311,67 @@ async fn a_table_being_deleted_answers_the_table_not_found_validation() {
 /// stops one object past it, so the total is not known then. The count
 /// class is measured on the service (the Start is accepted and the
 /// operation ends FAILED with neither byte member); the size class has the
-/// documented code.
+/// documented code, and its message names the quota in GB to one decimal
+/// or, under 0.1 GiB, in bytes. The GiB case lists one sparse file: the
+/// listing reads sizes, not bytes, so the file costs no disk.
 #[tokio::test]
 async fn the_listing_quotas_end_the_run_before_the_files_are_recorded() {
-    for (label, files, limits, code) in [
+    const GIB: u64 = 1 << 30;
+    for (label, files, sparse_file, limits, code, message) in [
         (
             "the object count",
             5,
+            None,
             vec![("max_bulk_input_files", json!(2))],
             "S3ObjectsCountLimitExceeded",
+            None,
         ),
         (
-            "the total",
+            "the total against a quota in bytes",
             2,
+            None,
             vec![("max_bulk_input_bytes", json!(10))],
             "SizeLimitExceeded",
+            Some(
+                "The total size of the input objects of this bulk operation exceeds the \
+                 maximum allowed for this operation, which is 10 bytes.",
+            ),
+        ),
+        (
+            "the total against a quota in GiB",
+            0,
+            Some(GIB + 1),
+            vec![("max_bulk_input_bytes", json!(GIB))],
+            "SizeLimitExceeded",
+            Some(
+                "The total size of the input objects of this bulk operation exceeds the \
+                 maximum allowed for this operation, which is 1.0 GB.",
+            ),
         ),
         (
             "both, the count first",
             3,
+            None,
             vec![
                 ("max_bulk_input_files", json!(2)),
                 ("max_bulk_input_bytes", json!(10)),
             ],
             "S3ObjectsCountLimitExceeded",
+            None,
         ),
     ] {
         let h = Harness::new().await;
         for i in 0..files {
             h.write_input(&format!("part-{i}.json"), b"01234567");
+        }
+        if let Some(size) = sparse_file {
+            let path = h.store.file(ACCOUNT, IN_BUCKET, "part-sparse.json", b"");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .expect("open the sparse input")
+                .set_len(size)
+                .expect("extend the sparse input");
         }
         let ctx = ctx_with_limits(&h, bulk_limits(&limits));
         let started = start_ok(&ctx, start_body()).await;
@@ -351,12 +383,8 @@ async fn the_listing_quotas_end_the_run_before_the_files_are_recorded() {
         let ended = run_started(&h, &ctx, &started).await;
         assert_eq!(ended["BulkOperationStatus"], json!("FAILED"), "{label}");
         assert_eq!(ended["FailureCode"], json!(code), "{label}");
-        if code == "SizeLimitExceeded" {
-            let message = ended["FailureMessage"].as_str().unwrap_or_default();
-            assert!(
-                message.contains("exceeds the maximum allowed for this operation"),
-                "{label}: {message}"
-            );
+        if let Some(message) = message {
+            assert_eq!(ended["FailureMessage"], json!(message), "{label}");
         }
         assert!(ended.get("TotalInputBytes").is_none(), "{label}");
         assert!(ended.get("ProcessedInputBytes").is_none(), "{label}");

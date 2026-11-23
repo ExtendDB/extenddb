@@ -138,7 +138,8 @@ impl Failure {
     /// code is the documented one: the service ends such an operation
     /// `FAILED` with `SizeLimitExceeded`. The message is ExtendDB's own,
     /// since the service's text needs an input over 100 GB to measure; it
-    /// renders the quota as `input_object_too_large` does.
+    /// renders the quota as `input_object_too_large` does, in GB to one
+    /// decimal, or in bytes under 0.1 GiB.
     pub(super) fn size_limit_exceeded(limit_bytes: u64) -> Self {
         Self {
             code: Cow::Borrowed("SizeLimitExceeded"),
@@ -176,8 +177,14 @@ impl Failure {
 /// The cap figure as the measured message renders it: the byte count
 /// divided by 2^30 to one decimal place, labelled GB (measured on the
 /// service: an object of 5,369,000,000 bytes was refused against a cap the
-/// message spells `5.0 GB`, which is 5,368,709,120 bytes).
+/// message spells `5.0 GB`, which is 5,368,709,120 bytes). A cap under
+/// 0.1 GiB, which an operator can configure and the service cannot, is
+/// rendered as its byte count, since one decimal of GiB would read `0.0 GB`
+/// or round a few megabytes up to `0.1 GB`.
 fn format_gibibytes(bytes: u64) -> String {
+    if bytes.saturating_mul(10) < 1 << 30 {
+        return format!("{bytes} bytes");
+    }
     // The cap is a configuration value, far below the precision limit of
     // f64, so the division is exact to the one decimal the text carries.
     #[allow(clippy::cast_precision_loss)]
