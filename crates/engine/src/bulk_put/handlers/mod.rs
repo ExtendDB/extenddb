@@ -6,10 +6,14 @@
 //! `CancelBulkOperation`.
 //!
 //! `StartBulkPutItems` validates in seven observable steps: body
-//! deserialization, field constraints, feature support, the bulk store,
-//! table lookup, input enumeration, and the start transaction. The order is
-//! part of the wire contract because each step has its own error; a request
-//! wrong at two steps gets the earlier step's message. The other three
+//! deserialization with the model's constraints, this server's bounds on
+//! the stored configurations, feature support, the bulk store, the table
+//! lookup, the service's `Invalid Request:` checks, and the start
+//! transaction. The order is part of the wire contract because each step
+//! has its own error; a request wrong at two steps gets the earlier step's
+//! message. A missing table is answered before any `Invalid Request:`
+//! check, as the service answers it (measured). The input is listed by the
+//! runner on the operation's first claim, not here. The other three
 //! handlers share the three-layer operation ARN validation: shape, id
 //! shape, then existence in the caller's account. A foreign-account or
 //! foreign-region ARN answers the third layer without consulting storage,

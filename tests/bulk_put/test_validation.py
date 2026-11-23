@@ -94,10 +94,13 @@ class TestValidation:
             "or equal to 1024",
         )
 
-    def test_an_empty_output_type_list_is_refused(self, bulk_bucket):
+    # The service's `Invalid Request:` checks run after the table lookup
+    # (measured: a missing table answers ResourceNotFoundException before
+    # any of them), so each test of one runs on a table that exists.
+    def test_an_empty_output_type_list_is_refused(self, bulk_table, bulk_bucket):
         expect_error(
             "StartBulkPutItems",
-            start_body("orders", bulk_bucket, output_types=[]),
+            start_body(bulk_table, bulk_bucket, output_types=[]),
             "ValidationException",
             "Invalid Request: OutputS3Configuration.OutputType cannot be empty",
         )
@@ -116,19 +119,21 @@ class TestValidation:
          "when OutputS3Configuration.S3SseKmsKeyId is provided"),
     ])
     def test_an_inconsistent_output_encryption_pair_is_refused(
-        self, bulk_bucket, algorithm, key_id, message
+        self, bulk_table, bulk_bucket, algorithm, key_id, message
     ):
-        body = start_body("orders", bulk_bucket)
+        body = start_body(bulk_table, bulk_bucket)
         if algorithm is not None:
             body["OutputS3Configuration"]["S3SseAlgorithm"] = algorithm
         if key_id is not None:
             body["OutputS3Configuration"]["S3SseKmsKeyId"] = key_id
         expect_error("StartBulkPutItems", body, "ValidationException", message)
 
-    def test_an_output_configuration_without_a_bucket_is_refused(self, bulk_bucket):
+    def test_an_output_configuration_without_a_bucket_is_refused(
+        self, bulk_table, bulk_bucket
+    ):
         # Measured on the service: the output bucket member is
         # checked at Start, not at the first report record.
-        body = start_body("orders", bulk_bucket)
+        body = start_body(bulk_table, bulk_bucket)
         body["OutputS3Configuration"].pop("S3Bucket", None)
         expect_error(
             "StartBulkPutItems", body,
@@ -136,11 +141,11 @@ class TestValidation:
             "Invalid Request: OutputS3Configuration.S3Bucket is invalid",
         )
 
-    def test_a_dotted_ip_bucket_name_is_refused(self, bulk_bucket):
+    def test_a_dotted_ip_bucket_name_is_refused(self, bulk_table, bulk_bucket):
         # Measured on the service: a bucket name spelled as a dotted
         # IPv4 literal is refused even though it satisfies the name
         # pattern and both length bounds.
-        body = start_body("orders", bulk_bucket)
+        body = start_body(bulk_table, bulk_bucket)
         body["InputS3Configuration"]["S3Bucket"] = "10.20.30.40"
         expect_error(
             "StartBulkPutItems", body,
@@ -165,10 +170,12 @@ class TestValidation:
         )
 
     @filesystem_store_only
-    def test_a_prefix_with_a_parent_component_is_refused(self, bulk_bucket):
+    def test_a_prefix_with_a_parent_component_is_refused(
+        self, bulk_table, bulk_bucket
+    ):
         expect_error(
             "StartBulkPutItems",
-            start_body("orders", bulk_bucket, in_prefix="in/../out/"),
+            start_body(bulk_table, bulk_bucket, in_prefix="in/../out/"),
             "ValidationException",
             "S3KeyPrefix contains an invalid path component",
         )

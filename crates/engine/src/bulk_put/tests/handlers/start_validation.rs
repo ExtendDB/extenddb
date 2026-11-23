@@ -3,9 +3,22 @@
 
 use super::*;
 
+/// A valid start request with no `ClientToken` member, as only a raw
+/// request can send one.
+fn tokenless() -> Value {
+    let mut body = start_body();
+    body.as_object_mut()
+        .expect("an object")
+        .remove("ClientToken");
+    body
+}
+
 // Start: validation order. Each request is wrong at one step and also
 // wrong at a later step, so the answered error proves the earlier step ran
-// first.
+// first. The steps are numbered as in the handlers module doc: 1 the
+// model's constraints, 2 this server's configuration bounds, 3 feature
+// support, 4 the bulk store, 5 the table lookup, 6 the service's `Invalid
+// Request:` checks, 7 the start transaction.
 
 #[tokio::test]
 async fn a_bad_enum_value_is_rejected_before_a_bad_prefix() {
@@ -20,7 +33,7 @@ async fn a_bad_enum_value_is_rejected_before_a_bad_prefix() {
         message,
         "1 validation error detected: Value 'CSV' at 'inputS3Configuration.inputFormat' \
          failed to satisfy constraint: Member must satisfy enum value set: [ION, DYNAMODB_JSON]",
-        "step 1 must answer before step 2, with the measured nested path and set order"
+        "step 1 must answer before step 6, with the measured nested path and set order"
     );
 }
 
@@ -67,7 +80,10 @@ async fn a_table_name_over_1024_answers_before_a_short_prefix() {
 }
 
 #[tokio::test]
-async fn a_bad_prefix_is_rejected_before_unsupported_ion() {
+async fn unsupported_ion_is_rejected_before_a_bad_prefix() {
+    // Both refusals are this server's own on this pair (the service accepts
+    // ION), so the order is this server's: the feature refusal, then the
+    // prefix rule the store would apply.
     let h = Harness::new().await;
     let body = with_input(
         with_input(start_body(), "InputFormat", json!("ION")),
@@ -75,7 +91,7 @@ async fn a_bad_prefix_is_rejected_before_unsupported_ion() {
         json!("a/../b"),
     );
     let message = expect_validation(start(&base_ctx(&h), body).await);
-    assert_eq!(message, BAD_PREFIX, "step 2 must answer before step 3");
+    assert_eq!(message, ION_REFUSED, "step 3 must answer before step 6");
 }
 
 #[tokio::test]
@@ -87,11 +103,13 @@ async fn unsupported_ion_is_rejected_before_a_missing_store() {
 }
 
 #[tokio::test]
-async fn a_bad_prefix_is_rejected_before_a_missing_store() {
+async fn a_missing_store_is_rejected_before_a_bad_prefix() {
+    // With no store there is no table lookup to answer and no store whose
+    // path rules apply, so the disabled message is the answer.
     let h = Harness::new().await;
     let body = with_input(start_body(), "S3KeyPrefix", json!("a/../b"));
     let message = expect_validation(start(&ctx_without_store(&h), body).await);
-    assert_eq!(message, BAD_PREFIX, "step 2 must answer before step 4");
+    assert_eq!(message, BULK_DISABLED, "step 4 must answer before step 6");
 }
 
 #[tokio::test]
@@ -114,7 +132,7 @@ async fn a_missing_table_is_rejected_before_the_input_file_cap() {
     assert_eq!(
         message,
         format!("{TABLE_NOT_FOUND}: Table: absent not found"),
-        "step 5 must answer before step 6"
+        "step 5 must answer before the runner lists the input"
     );
 }
 
@@ -132,9 +150,9 @@ async fn the_table_guard_answers_an_input_over_the_object_count_cap() {
     assert_eq!(message, TABLE_BUSY);
 }
 
-// The three step 2 checks the prefix chain does not reach: each pairs the
-// field fault with a missing table, so the field's message proves the
-// check ran before the table lookup at step 5.
+// This server's configuration bound paired with a missing table: the
+// bound's message proves step 2 ran before the table lookup at step 5. The
+// bound is this server's own, so the order is too.
 
 #[tokio::test]
 async fn an_oversized_configuration_is_rejected_before_a_missing_table() {
@@ -151,28 +169,56 @@ async fn an_oversized_configuration_is_rejected_before_a_missing_table() {
     assert_eq!(message, CONFIG_TOO_BIG, "step 2 must answer before step 5");
 }
 
+/// A missing table answers the not-found text before any `Invalid Request:`
+/// check of step 6 (measured on the service 2026-11-23, twice each, with a
+/// table and buckets that do not exist): the token over the cap, the absent
+/// token, the three inconsistent encryption pairs, the empty OutputType and
+/// the one-character output prefix all answered `ResourceNotFoundException`
+/// `Requested resource not found: Table: <name> not found`.
 #[tokio::test]
-async fn a_token_over_the_length_cap_is_rejected_before_a_missing_table() {
+async fn a_missing_table_is_rejected_before_every_invalid_request_check() {
     let h = Harness::new().await;
-    let ctx = ctx_with_limits(
-        &h,
-        bulk_limits(&[("max_bulk_client_token_chars", json!(64))]),
-    );
-    let token = "t".repeat(65);
-    let body = with_top(
-        with_top(start_body(), "ClientToken", json!(token)),
-        "TableName",
-        json!("absent"),
-    );
-    let message = expect_validation(start(&ctx, body).await);
-    assert_eq!(
-        message,
-        format!(
-            "Invalid Request: 1 validation error detected: Value '{token}' at 'clientToken' \
-             failed to satisfy constraint: Member must have length less than or equal to 64"
+    let ctx = base_ctx(&h);
+    let key = "arn:aws:kms:us-east-1:111111111111:key/00000000-0000-0000-0000-000000000000";
+    for (shape, body) in [
+        (
+            "token of 1,025 characters",
+            with_top(start_body(), "ClientToken", json!("a".repeat(1025))),
         ),
-        "step 2 must answer before step 5"
-    );
+        ("no token", tokenless()),
+        (
+            "KMS with no key",
+            with_output(start_body(), "S3SseAlgorithm", json!("KMS")),
+        ),
+        (
+            "AES256 with a key",
+            with_output(
+                with_output(start_body(), "S3SseAlgorithm", json!("AES256")),
+                "S3SseKmsKeyId",
+                json!(key),
+            ),
+        ),
+        (
+            "a key with no algorithm",
+            with_output(start_body(), "S3SseKmsKeyId", json!(key)),
+        ),
+        (
+            "empty OutputType",
+            with_output(start_body(), "OutputType", json!([])),
+        ),
+        (
+            "output prefix of one character",
+            with_output(start_body(), "S3KeyPrefix", json!("o")),
+        ),
+    ] {
+        let body = with_top(body, "TableName", json!("absent"));
+        let message = expect_not_found(start(&ctx, body).await);
+        assert_eq!(
+            message,
+            format!("{TABLE_NOT_FOUND}: Table: absent not found"),
+            "{shape}: step 5 must answer before step 6"
+        );
+    }
 }
 
 #[tokio::test]
@@ -257,13 +303,6 @@ async fn a_missing_client_token_is_refused_before_the_encryption_pair() {
     let h = Harness::new().await;
     let missing = "Invalid Request: 1 validation error detected: Value null at 'clientToken' \
                    failed to satisfy constraint: Member must not be null";
-    let tokenless = || {
-        let mut body = start_body();
-        body.as_object_mut()
-            .expect("an object")
-            .remove("ClientToken");
-        body
-    };
     for body in [
         tokenless(),
         with_output(tokenless(), "S3SseAlgorithm", json!("KMS")),

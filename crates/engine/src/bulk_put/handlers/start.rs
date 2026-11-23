@@ -20,7 +20,7 @@ mod prefix;
 /// # Errors
 ///
 /// Returns the step's error per the validation order in the module doc.
-#[allow(clippy::too_many_lines)] // the seven validation steps, kept in spec order in one place
+#[allow(clippy::too_many_lines)] // the seven validation steps, kept in measured order in one place
 pub async fn handle_start_bulk_put_items(
     body: Value,
     ctx: &OperationContext,
@@ -98,53 +98,9 @@ pub async fn handle_start_bulk_put_items(
         None => arn::table_name_from_name_or_arn(&input.table_name, &ctx.region, &ctx.account_id)?,
     };
 
-    // Second pass: the service's own `Invalid Request:` checks, after every
-    // model constraint above. Their order among themselves is kept as it
-    // was, since it is unmeasured, except that the token checks come before
-    // the output encryption pair: a request with no ClientToken and a bad
-    // pair answers the missing token (measured on the service, six times).
-    // SDKs fill the token in from the model's idempotency trait, so only a
-    // raw request can arrive without one. The length is counted in
-    // characters, as the service counts it.
-    let Some(token) = &input.client_token else {
-        return Err(DynamoDbError::ValidationException(
-            "Invalid Request: 1 validation error detected: Value null at 'clientToken' failed \
-             to satisfy constraint: Member must not be null"
-                .to_owned(),
-        ));
-    };
-    let cap = ctx.limits.max_bulk_client_token_chars;
-    if token.chars().count() > cap {
-        return Err(DynamoDbError::ValidationException(format!(
-            "Invalid Request: 1 validation error detected: Value '{token}' at 'clientToken' \
-             failed to satisfy constraint: Member must have length less than or equal to {cap}"
-        )));
-    }
-    if input.output_s3_configuration.output_type.is_empty() {
-        return Err(DynamoDbError::ValidationException(
-            "Invalid Request: OutputS3Configuration.OutputType cannot be empty".to_owned(),
-        ));
-    }
-    validate_bucket_service(
-        &input.input_s3_configuration.s3_bucket,
-        "inputS3Configuration.s3Bucket",
-        INPUT_BUCKET_MEMBER,
-    )?;
-    // The output bucket's presence is checked at Start: an output
-    // configuration whose OutputType is set with no S3Bucket answers this
-    // message (measured on the service). Its existence and its owner
-    // are still decided when the first report record is produced. A
-    // present bucket with no S3KeyPrefix is accepted.
-    let Some(output_bucket) = &input.output_s3_configuration.s3_bucket else {
-        return Err(bucket_is_invalid(OUTPUT_BUCKET_MEMBER));
-    };
-    validate_bucket_service(
-        output_bucket,
-        "outputS3Configuration.s3Bucket",
-        OUTPUT_BUCKET_MEMBER,
-    )?;
-    prefix::check_prefixes(ctx, &input)?;
-    validate_output_encryption(&input.output_s3_configuration)?;
+    // Step 2: this server's own bounds on the stored configurations. The
+    // service's `Invalid Request:` checks are step 6, after the table
+    // lookup.
     let input_config = serialize_output(&input.input_s3_configuration)?;
     let output_config = serialize_output(&input.output_s3_configuration)?;
     // The description echoes the caller's account as the owner of both
@@ -180,9 +136,9 @@ pub async fn handle_start_bulk_put_items(
         ));
     };
 
-    // Step 5: table lookup. Not found and not-active reuse the existing
-    // messages; the hosted service's documentation accepts ACTIVE and
-    // UPDATING.
+    // Step 5: table lookup, existence then state. Not found and not-active
+    // reuse the existing messages; the hosted service's documentation
+    // accepts ACTIVE and UPDATING.
     let table = ctx
         .storage
         .describe_table(
@@ -203,6 +159,7 @@ pub async fn handle_start_bulk_put_items(
             }
             other => other,
         })?;
+
     // A table in DELETING answers a validation failure naming the table as
     // not found, measured both immediately after DeleteTable and three
     // seconds later. CREATING and UPDATING were not
@@ -249,6 +206,58 @@ pub async fn handle_start_bulk_put_items(
                 .to_owned(),
         ));
     }
+
+    // Step 6: the service's own `Invalid Request:` checks, after every
+    // model constraint and after the table lookup. A missing table answers
+    // the not-found text of step 5 whatever these checks would find
+    // (measured on the service with a 1,025-character token, no token, each
+    // inconsistent encryption pair, an empty OutputType and a one-character
+    // output prefix, twice each). Their order among themselves is kept as
+    // it was, since it is unmeasured, except that the token checks come
+    // before the output encryption pair: a request with no ClientToken and
+    // a bad pair answers the missing token (measured on the service, six
+    // times). SDKs fill the token in from the model's idempotency trait, so
+    // only a raw request can arrive without one. The length is counted in
+    // characters, as the service counts it.
+    let Some(token) = &input.client_token else {
+        return Err(DynamoDbError::ValidationException(
+            "Invalid Request: 1 validation error detected: Value null at 'clientToken' failed \
+             to satisfy constraint: Member must not be null"
+                .to_owned(),
+        ));
+    };
+    let cap = ctx.limits.max_bulk_client_token_chars;
+    if token.chars().count() > cap {
+        return Err(DynamoDbError::ValidationException(format!(
+            "Invalid Request: 1 validation error detected: Value '{token}' at 'clientToken' \
+             failed to satisfy constraint: Member must have length less than or equal to {cap}"
+        )));
+    }
+    if input.output_s3_configuration.output_type.is_empty() {
+        return Err(DynamoDbError::ValidationException(
+            "Invalid Request: OutputS3Configuration.OutputType cannot be empty".to_owned(),
+        ));
+    }
+    validate_bucket_service(
+        &input.input_s3_configuration.s3_bucket,
+        "inputS3Configuration.s3Bucket",
+        INPUT_BUCKET_MEMBER,
+    )?;
+    // The output bucket's presence is checked at Start: an output
+    // configuration whose OutputType is set with no S3Bucket answers this
+    // message (measured on the service). Its existence and its owner
+    // are still decided when the first report record is produced. A
+    // present bucket with no S3KeyPrefix is accepted.
+    let Some(output_bucket) = &input.output_s3_configuration.s3_bucket else {
+        return Err(bucket_is_invalid(OUTPUT_BUCKET_MEMBER));
+    };
+    validate_bucket_service(
+        output_bucket,
+        "outputS3Configuration.s3Bucket",
+        OUTPUT_BUCKET_MEMBER,
+    )?;
+    prefix::check_prefixes(store, &input)?;
+    validate_output_encryption(&input.output_s3_configuration)?;
 
     // The request identity. The fingerprint hashes the
     // request as submitted, except for the service defaults a retry may add
