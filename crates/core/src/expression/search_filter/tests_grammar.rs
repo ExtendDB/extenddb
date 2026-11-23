@@ -6,7 +6,7 @@
 //! Not yet measured against the live service: every expected message here is
 //! a prediction, and a live run confirms or corrects it.
 
-use super::tests_support::{OK, and_chain, assert_outcomes, in_list, outcome, p};
+use super::tests_support::{OK, and_chain, assert_outcomes, in_list, n, outcome, p};
 
 const IN_LIST_ATTRIBUTE: &str = "The IN operator list must contain only expression attribute \
                                  values (:value), not attribute names";
@@ -143,6 +143,82 @@ fn between_bounds_are_checked_while_the_tree_is_built() {
             ),
         ],
     );
+}
+
+/// The bound check compares numbers exactly, while evaluation compares them
+/// as binary64: each pair below is equal in binary64 and out of order exactly.
+/// The requests sent `1.0000000000000001E+100` and `1E+100`, and
+/// `1.0000000000000001E-10` and `1E-10`; the engine passes numbers here in
+/// the plain decimal form the service shows. Measured on the live service on
+/// 2026-11-23, two requests each.
+#[test]
+fn between_bounds_compare_numbers_exactly() {
+    use std::collections::HashMap;
+
+    use super::parse_search_filter;
+    use crate::error::DynamoDbError;
+
+    let out_of_order = |lo: &str, hi: &str| {
+        p(&format!(
+            "The BETWEEN operator requires upper bound to be greater than or equal to lower \
+             bound; lower bound operand: AttributeValue: {{N:{lo}}}, upper bound operand: \
+             AttributeValue: {{N:{hi}}}"
+        ))
+    };
+    let e100 = format!("10000000000000001{}", "0".repeat(84));
+    let e100_hi = format!("1{}", "0".repeat(100));
+    let cases = [
+        (
+            "9007199254740993",
+            "9007199254740992",
+            out_of_order("9007199254740993", "9007199254740992"),
+        ),
+        (
+            "99999999999999999999999999999999999999",
+            "99999999999999999999999999999999999998",
+            out_of_order(
+                "99999999999999999999999999999999999999",
+                "99999999999999999999999999999999999998",
+            ),
+        ),
+        (
+            e100.as_str(),
+            e100_hi.as_str(),
+            out_of_order(&e100, &e100_hi),
+        ),
+        (
+            "0.10000000000000001",
+            "0.1",
+            out_of_order("0.10000000000000001", "0.1"),
+        ),
+        (
+            "0.00000000010000000000000001",
+            "0.0000000001",
+            out_of_order("0.00000000010000000000000001", "0.0000000001"),
+        ),
+        (
+            "-10000000000000000",
+            "-10000000000000001",
+            out_of_order("-10000000000000000", "-10000000000000001"),
+        ),
+        ("1.0", "1", OK.to_owned()),
+        ("9007199254740992", "9007199254740993", OK.to_owned()),
+    ];
+    let mismatches: Vec<String> = cases
+        .iter()
+        .filter_map(|(lo, hi, expected)| {
+            let values = HashMap::from([(":lo".to_owned(), n(lo)), (":hi".to_owned(), n(hi))]);
+            let actual =
+                match parse_search_filter("Price BETWEEN :lo AND :hi", None, Some(&values), 50) {
+                    Ok(_) => OK.to_owned(),
+                    Err(DynamoDbError::ValidationException(m)) => m,
+                    Err(other) => format!("{other:?}"),
+                };
+            (&actual != expected)
+                .then(|| format!("{lo} / {hi}: expected {expected:?}, got {actual:?}"))
+        })
+        .collect();
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
 #[test]
