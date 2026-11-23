@@ -320,25 +320,18 @@ impl SegmentStore {
         });
     }
 
-    /// Number of buckets held, the quantity the memory bound is stated in.
+    /// Buckets held, the quantity the memory bound is stated in, and buckets
+    /// allocated, held or spare. The bucket memory is the second number times
+    /// [`Self::bucket_size`].
     #[cfg(test)]
-    pub(super) fn bucket_count(&self) -> usize {
+    pub(super) fn buckets(&self) -> (usize, usize) {
         self.by_account
             .values()
             .flat_map(HashMap::values)
-            .map(|r| r.fine.buckets.len() + r.coarse.buckets.len())
-            .sum()
-    }
-
-    /// Number of buckets allocated, held or spare: the bucket memory is this
-    /// times [`Self::bucket_size`].
-    #[cfg(test)]
-    pub(super) fn bucket_capacity(&self) -> usize {
-        self.by_account
-            .values()
-            .flat_map(HashMap::values)
-            .map(|r| r.fine.buckets.capacity() + r.coarse.buckets.capacity())
-            .sum()
+            .flat_map(|r| [&r.fine.buckets, &r.coarse.buckets])
+            .fold((0, 0), |(held, allocated), b| {
+                (held + b.len(), allocated + b.capacity())
+            })
     }
 
     /// Size in bytes of one bucket, for stating the bound in bytes.

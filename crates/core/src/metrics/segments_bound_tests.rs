@@ -33,16 +33,13 @@ fn boundedness_five_million_records() {
         store.record(account, op, &segs(1.0), now);
     }
     let bound = ACCOUNTS.len() * OPS.len() * BUCKETS_PER_OPERATION;
-    assert!(
-        store.bucket_count() <= bound,
-        "bucket count {} exceeds bound {bound}",
-        store.bucket_count()
-    );
-    assert!(store.bucket_capacity() * SegmentStore::bucket_size() <= bound * 64);
+    let (held, allocated) = store.buckets();
+    assert!(held <= bound, "bucket count {held} exceeds bound {bound}");
+    assert!(allocated * SegmentStore::bucket_size() <= bound * 64);
     // Every slot of every ring had a request, so the bound is reached
     // exactly, held and allocated.
-    assert_eq!(store.bucket_count(), bound);
-    assert_eq!(store.bucket_capacity(), bound);
+    assert_eq!(held, bound);
+    assert_eq!(allocated, bound);
     // The whole-ring query still answers, with at most 1441 minutes of data.
     let now = epoch + Duration::from_millis(total * 52);
     let out = store.query(TimeWindow::AllTime, None, now);
@@ -84,13 +81,13 @@ fn ring_lap_and_stale_slots() {
             .query(TimeWindow::LastDay, None, at(epoch, 86_460))
             .is_empty()
     );
-    assert_eq!(store.bucket_count(), 2);
+    assert_eq!(store.buckets().0, 2);
     // A record one full ring later drops minute 0 and second 0.
     store.record(ACCOUNTS[0], "Scan", &segs(5.0), at(epoch, 1441 * 60));
     let out = store.query(TimeWindow::AllTime, None, at(epoch, 1441 * 60));
     assert_eq!(count_of(&out, "Scan"), 1);
     assert!((out[0].avg.auth_us - 5.0).abs() < f64::EPSILON);
-    assert_eq!(store.bucket_count(), 2);
+    assert_eq!(store.buckets().0, 2);
 }
 
 /// The prune drops the rings of an account's operation once its newest coarse
@@ -107,12 +104,12 @@ fn prune_drops_idle_accounts_and_keeps_active_ones() {
     store.record(ACCOUNTS[1], "GetItem", &segs(1.0), at(epoch, 60));
     // Two buckets per pair with one request, two per ring for the pair with
     // requests in two seconds and two minutes.
-    assert_eq!(store.bucket_count(), 2 + 2 + 4);
+    assert_eq!(store.buckets().0, 2 + 2 + 4);
 
     // At 1440 minutes, minute 0 is the oldest slot of the ring: nothing goes.
     store.prune(at(epoch, 1440 * 60));
     assert_eq!(store.by_account.len(), 2);
-    assert_eq!(store.bucket_count(), 8);
+    assert_eq!(store.buckets().0, 8);
     assert_eq!(
         count_of(
             &store.query(TimeWindow::AllTime, None, at(epoch, 1440 * 60)),
@@ -126,7 +123,7 @@ fn prune_drops_idle_accounts_and_keeps_active_ones() {
     // them. The second account's GetItem ring has minute 1 and stays.
     store.prune(at(epoch, 1441 * 60));
     assert_eq!(store.by_account.len(), 1);
-    assert_eq!(store.bucket_count(), 4);
+    assert_eq!(store.buckets().0, 4);
     assert!(
         store
             .query(TimeWindow::AllTime, Some(ACCOUNTS[0]), at(epoch, 1441 * 60))
@@ -142,7 +139,7 @@ fn prune_drops_idle_accounts_and_keeps_active_ones() {
     // The dropped account's next request allocates its rings again.
     store.record(ACCOUNTS[0], "Scan", &segs(2.0), at(epoch, 1441 * 60));
     assert_eq!(store.by_account.len(), 2);
-    assert_eq!(store.bucket_count(), 6);
+    assert_eq!(store.buckets().0, 6);
 }
 
 /// A memory case: label, accounts, operations, request times in seconds (the
@@ -217,14 +214,11 @@ fn bucket_memory_follows_the_requests_up_to_the_ring_length() {
             }
         }
         let pairs = accounts * operations;
-        assert_eq!(store.bucket_count(), pairs * buckets, "{label}: buckets");
-        assert_eq!(
-            store.bucket_capacity(),
-            pairs * capacity,
-            "{label}: capacity"
-        );
+        let (held, allocated) = store.buckets();
+        assert_eq!(held, pairs * buckets, "{label}: buckets");
+        assert_eq!(allocated, pairs * capacity, "{label}: capacity");
         assert!(
-            store.bucket_capacity() <= pairs * BUCKETS_PER_OPERATION,
+            allocated <= pairs * BUCKETS_PER_OPERATION,
             "{label}: capacity over the ring length"
         );
         // Every request is still in the whole-ring window.

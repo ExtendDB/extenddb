@@ -238,7 +238,7 @@ fn prune_keeps_recent_segments_and_drops_them_a_day_later() {
     let held = |c: &MetricsCollector| {
         c.segments
             .read()
-            .map(|s| s.bucket_count())
+            .map(|s| s.buckets().0)
             .unwrap_or(usize::MAX)
     };
     assert_eq!(held(&c), 2);
