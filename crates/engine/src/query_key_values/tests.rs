@@ -10,8 +10,7 @@ use extenddb_core::types::{AttributeDefinition, AttributeValue, ScalarAttributeT
 use serde_json::{Value, json};
 
 use super::{
-    KEY_CONDITION_TYPE_MISMATCH, LIMIT_BELOW_ONE, validate_key_condition_types,
-    validate_query_request_body,
+    KEY_CONDITION_TYPE_MISMATCH, validate_key_condition_types, validate_query_request_body,
 };
 
 /// The request-time number check on typed values, serialized as a request
@@ -70,6 +69,9 @@ pub(super) fn message(result: Result<(), DynamoDbError>) -> Option<String> {
 }
 
 /// The service's texts that the request-time check tests expect.
+pub(super) const LIMIT_BELOW_ONE: &str = "1 validation error detected: Value at 'Limit' failed to \
+                                          satisfy constraint: Member must have value greater than \
+                                          or equal to 1";
 pub(super) const INVALID_VALUE: &str = "ExpressionAttributeValues contains invalid value: ";
 pub(super) const EMPTY: &str =
     "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes";

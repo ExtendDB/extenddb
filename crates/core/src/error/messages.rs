@@ -15,17 +15,25 @@ pub fn validation_error(value: &str, field: &str, constraint: &str) -> String {
 /// Format multiple validation constraint errors in `DynamoDB`'s exact format.
 #[must_use]
 pub fn validation_errors(errors: &[(&str, &str, &str)]) -> String {
-    let count = errors.len();
     let details: Vec<String> = errors
         .iter()
         .map(|(value, field, constraint)| {
             format!("Value '{value}' at '{field}' failed to satisfy constraint: {constraint}")
         })
         .collect();
+    validation_error_envelope(&details)
+}
+
+/// Wrap already rendered constraint clauses in `DynamoDB`'s envelope:
+/// `1 validation error detected: <clause>`, or `N validation errors detected:
+/// <clause>; <clause>` for several.
+#[must_use]
+pub fn validation_error_envelope(clauses: &[String]) -> String {
+    let count = clauses.len();
     format!(
         "{count} validation error{} detected: {}",
         if count == 1 { "" } else { "s" },
-        details.join("; ")
+        clauses.join("; ")
     )
 }
 

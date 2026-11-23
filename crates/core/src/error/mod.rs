@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 mod messages;
 
-pub use messages::{ErrorMessageKey, error_message, validation_error, validation_errors};
+pub use messages::{
+    ErrorMessageKey, error_message, validation_error, validation_error_envelope, validation_errors,
+};
 
 use crate::types::{CancellationReason, Item};
 

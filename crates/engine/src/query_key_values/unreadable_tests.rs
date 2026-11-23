@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for a `Query` whose `ExpressionAttributeValues` holds a value the
-//! service cannot read as one type.
+//! Tests for a `Query` on the service's older validation path: one whose
+//! `ExpressionAttributeValues`, `ExclusiveStartKey` or condition lists hold a
+//! value the service cannot read as one type, or whose `Limit` is a float or
+//! an integer outside int32.
 
 use extenddb_core::error::DynamoDbError;
 use serde_json::{Value, json};
@@ -382,4 +384,101 @@ fn a_type_descriptor_with_a_null_payload_counts_as_absent() {
         json!({"FilterExpression": "a = :v"}),
     );
     assert!(validate_query_request_body(&body).is_ok());
+}
+
+/// Measured 2026-11-23 14:51 and 18:45 UTC (us-east-1, each request twice, a
+/// table that does not exist): a `Limit` that is a float or outside int32
+/// puts a `Query` on the older path without any value the service cannot
+/// read. The `limit` clause echoes the value as the service reads it,
+/// saturated to int32, after the `select` and `returnConsumedCapacity`
+/// clauses; a float `Limit` that satisfies its constraint leaves the enum
+/// clauses alone; the aggregate comes ahead of the parameter mix, and the
+/// numbers are wrapped as on that path. Beside `{}` the echoed value is
+/// saturated too (measured 2026-10-31 12:36 UTC on the wire).
+#[test]
+fn a_limit_that_is_a_float_or_outside_int32_takes_the_older_path() {
+    let limit_min = LIMIT_ZERO.replace("'0'", "'-2147483648'");
+    let query_filter =
+        json!({"a": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "x"}]}});
+    let p = json!({":p": {"S": "p0"}});
+    for (values, extra, expected) in [
+        (
+            p.clone(),
+            json!({"Limit": -2_147_483_649_i64}),
+            one_error(&limit_min),
+        ),
+        (p.clone(), json!({"Limit": 0.0}), one_error(LIMIT_ZERO)),
+        (
+            json!({":p": {"S": "p0"}, ":a": {}}),
+            json!({"Limit": -2_147_483_649_i64}),
+            one_error(&limit_min),
+        ),
+        (
+            json!({":p": {"S": "p0"}, ":a": {}}),
+            json!({"Limit": 0, "ReturnConsumedCapacity": "BAD"}),
+            format!(
+                "2 validation errors detected: {}; {LIMIT_ZERO}",
+                RCC_BAD.replace("'bad'", "'BAD'")
+            ),
+        ),
+        (
+            p.clone(),
+            json!({"Limit": -2_147_483_649_i64, "Select": "BAD", "ReturnConsumedCapacity": "BAD"}),
+            format!(
+                "3 validation errors detected: {}; {}; {limit_min}",
+                SELECT_BAD.replace("'bad'", "'BAD'"),
+                RCC_BAD.replace("'bad'", "'BAD'")
+            ),
+        ),
+        (
+            p.clone(),
+            json!({"Limit": 1.5, "Select": "BAD", "ReturnConsumedCapacity": "BAD"}),
+            format!(
+                "2 validation errors detected: {}; {}",
+                SELECT_BAD.replace("'bad'", "'BAD'"),
+                RCC_BAD.replace("'bad'", "'BAD'")
+            ),
+        ),
+        (
+            json!({":p": {"S": "p0"}, ":n": {"N": "bob"}}),
+            json!({"Limit": 1.5, "FilterExpression": "a = :n"}),
+            format!("{INVALID_VALUE}{NUMERIC_BOB} for key :n"),
+        ),
+        (
+            p,
+            json!({"Limit": 0.0, "QueryFilter": query_filter, "FilterExpression": "a = :p"}),
+            one_error(LIMIT_ZERO),
+        ),
+    ] {
+        let body = body_with(values, extra.clone());
+        assert_eq!(
+            message(validate_query_request_body(&body)),
+            Some(expected),
+            "{body}"
+        );
+    }
+}
+
+/// Measured 2026-11-12 (demohan, each row twice): a null `AttributeValueList`
+/// entry of `KeyConditions` and an `L` nested in an `L` are values the service
+/// cannot read, so a `Limit` of 0 beside them takes the older form on `Query`.
+#[test]
+fn a_null_list_entry_and_a_nested_list_member_take_the_older_path() {
+    let bodies = [
+        json!({
+            "TableName": "t", "Limit": 0,
+            "KeyConditions": {"pk": {"ComparisonOperator": "EQ", "AttributeValueList": [null]}},
+        }),
+        body_with(
+            json!({":p": {"S": "p0"}, ":d": {"L": [{"L": [{}]}]}}),
+            json!({"Limit": 0}),
+        ),
+    ];
+    for body in bodies {
+        assert_eq!(
+            message(validate_query_request_body(&body)),
+            Some(one_error(LIMIT_ZERO)),
+            "{body}"
+        );
+    }
 }

@@ -142,30 +142,15 @@ pub struct ScanInput {
         deserialize_with = "crate::serde_helpers::deserialize_expression_values"
     )]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-    /// Any JSON number; see [`saturated_int32`].
-    #[serde(
-        rename = "Limit",
-        default,
-        deserialize_with = "deserialize_int32_field"
-    )]
+    #[serde(rename = "Limit")]
     pub limit: Option<i64>,
     #[serde(rename = "ExclusiveStartKey")]
     pub exclusive_start_key: Option<Item>,
     #[serde(rename = "Select")]
     pub select: Option<Select>,
-    /// Any JSON number; see [`saturated_int32`].
-    #[serde(
-        rename = "Segment",
-        default,
-        deserialize_with = "deserialize_int32_field"
-    )]
+    #[serde(rename = "Segment")]
     pub segment: Option<i64>,
-    /// Any JSON number; see [`saturated_int32`].
-    #[serde(
-        rename = "TotalSegments",
-        default,
-        deserialize_with = "deserialize_int32_field"
-    )]
+    #[serde(rename = "TotalSegments")]
     pub total_segments: Option<i64>,
     #[serde(rename = "ConsistentRead")]
     pub consistent_read: Option<bool>,
@@ -207,17 +192,6 @@ pub fn saturated_int32(number: &serde_json::Number) -> i32 {
     number.as_f64().map_or(0, |value| value as i32)
 }
 
-/// Deserialize an optional `Scan` range field from any JSON number, as
-/// [`saturated_int32`] reads it. A JSON value of another type is refused, as
-/// it was when the field deserialized as an integer.
-fn deserialize_int32_field<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Option::<serde_json::Number>::deserialize(deserializer)
-        .map(|number| number.map(|n| i64::from(saturated_int32(&n))))
-}
-
 /// `Scan` response body.
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanOutput {
@@ -236,16 +210,14 @@ pub struct ScanOutput {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
-    use super::{ScanInput, saturated_int32};
+    use super::saturated_int32;
 
     fn number(text: &str) -> serde_json::Number {
         serde_json::from_str(text).expect("a JSON number")
     }
 
     #[test]
-    fn range_fields_are_truncated_and_saturated_to_int32() {
+    fn a_json_number_is_truncated_toward_zero_and_saturated_to_int32() {
         for (text, expected) in [
             ("1", 1),
             ("-2147483648", i32::MIN),
@@ -265,39 +237,6 @@ mod tests {
             ("-1e40", i32::MIN),
         ] {
             assert_eq!(saturated_int32(&number(text)), expected, "{text}");
-        }
-    }
-
-    #[test]
-    fn scan_input_reads_any_number_in_the_range_fields() {
-        let input: ScanInput = serde_json::from_value(json!({
-            "TableName": "t", "Limit": 1.5, "Segment": 1.5, "TotalSegments": 2_147_483_648_i64,
-        }))
-        .expect("accepted");
-        assert_eq!(
-            (input.limit, input.segment, input.total_segments),
-            (Some(1), Some(1), Some(i64::from(i32::MAX)))
-        );
-        let input: ScanInput = serde_json::from_str(
-            r#"{"TableName": "t", "Limit": 9223372036854775808, "Segment": null}"#,
-        )
-        .expect("accepted");
-        assert_eq!(
-            (input.limit, input.segment),
-            (Some(i64::from(i32::MAX)), None)
-        );
-        let input: ScanInput = serde_json::from_value(json!({"TableName": "t"})).expect("accepted");
-        assert_eq!(input.total_segments, None);
-        // Another JSON type is still refused.
-        for body in [
-            json!({"TableName": "t", "Limit": "1"}),
-            json!({"TableName": "t", "Segment": true}),
-            json!({"TableName": "t", "TotalSegments": [1]}),
-        ] {
-            assert!(
-                serde_json::from_value::<ScanInput>(body.clone()).is_err(),
-                "{body}"
-            );
         }
     }
 }

@@ -39,13 +39,12 @@ use serde_json::{Map, Value};
 
 mod unreadable;
 
-pub(crate) use unreadable::{readable_for_shape_check, unreadable, unreadable_value_checks};
+pub(crate) use unreadable::{
+    QUERY_CONDITIONS, SCAN_CONDITIONS, has_unreadable, older_form_checks, readable_for_shape_check,
+};
 
 /// The service's text for a key condition value of the wrong type.
 pub const KEY_CONDITION_TYPE_MISMATCH: &str = "One or more parameter values were invalid: Condition parameter type does not match schema type";
-
-/// The service's text for a `Limit` below 1 on `Query`.
-pub const LIMIT_BELOW_ONE: &str = "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1";
 
 /// The service's text for a null value. Core's copy is a private constant of
 /// its `partiql` module, which a build without the `partiql` feature leaves
@@ -69,12 +68,14 @@ pub(crate) const SELECT: &[&str] = &[
 
 /// The `Query` checks that run on the request body alone, before the body is
 /// deserialized and before the table is looked up, in the service's order:
-/// `Limit`, the `ReturnConsumedCapacity` enum, the expression and
-/// non-expression parameter mix, the `ExpressionAttributeNames` map (see
-/// `validate_names`), every number in `ExpressionAttributeValues`, then the
-/// `Select` enum (measured 2026-10-24 and 2026-11-11: a `Limit` of 0 is
-/// reported ahead of an invalid enum value of either field and of a parameter
-/// mix, an invalid `ReturnConsumedCapacity` ahead of a mix with
+/// the `Limit` range (at least 1, the newer form `1 validation error
+/// detected: Value at 'Limit' failed to satisfy constraint: Member must have
+/// value greater than or equal to 1`), the `ReturnConsumedCapacity` enum, the
+/// expression and non-expression parameter mix, the `ExpressionAttributeNames`
+/// map (see `validate_names`), every number in `ExpressionAttributeValues`,
+/// then the `Select` enum (measured 2026-10-24 and 2026-11-11: a `Limit` of 0
+/// is reported ahead of an invalid enum value of either field and of a
+/// parameter mix, an invalid `ReturnConsumedCapacity` ahead of a mix with
 /// `AttributesToGet`, `QueryFilter`, `ConditionalOperator` or `KeyConditions`
 /// and ahead of an `N` value that is not a number, a mix ahead of that value,
 /// and that value ahead of an invalid `Select`. Measured 2026-11-19 in either
@@ -82,9 +83,15 @@ pub(crate) const SELECT: &[&str] = &[
 /// invalid `ReturnConsumedCapacity` and a mix, and ahead of an `N` value that
 /// is not a number, a set with a duplicate member and an invalid `Select`).
 ///
-/// A request whose `ExpressionAttributeValues` holds a value the service
-/// cannot read as one type takes another order; see
-/// `unreadable_value_checks`.
+/// A request that holds a value the service cannot read as one type (in
+/// `ExpressionAttributeValues`, `ExclusiveStartKey` or a `KeyConditions` or
+/// `QueryFilter` list; see `has_unreadable`), or whose `Limit` is a float or
+/// an integer outside int32, takes the service's older validation path, with
+/// the `Limit` fault in its older form, `Value '-2147483648' at 'limit' ...`,
+/// the value echoed as the service reads it (see `int32_member::ranges`); see
+/// `older_form_checks`. Measured 2026-11-23 (us-east-1, each request twice):
+/// `Limit: -2147483649` beside a readable value answers `Value '-2147483648'
+/// at 'limit'`, and `Limit: 0.0` answers `Value '0' at 'limit'`.
 ///
 /// The checks read the raw body, so a field that does not deserialize (an
 /// invalid `Select`, for one) does not stop the ones before it. When a check
@@ -119,8 +126,9 @@ pub(crate) const SELECT: &[&str] = &[
 /// Returns `DynamoDbError::ValidationException` with the service's text, or
 /// `DynamoDbError::SerializationException` for a body of the wrong shape.
 pub fn validate_query_request_body(body: &Value) -> Result<(), DynamoDbError> {
-    query_request_checks(body)
-        .map_err(|check| shape_fault_first::<QueryInput>(&readable_for_shape_check(body), check))
+    query_request_checks(body).map_err(|check| {
+        shape_fault_first::<QueryInput>(&readable_for_shape_check(body, QUERY_CONDITIONS), check)
+    })
 }
 
 /// When a request-time check has failed with `check`, the deserializer's
@@ -159,7 +167,12 @@ pub fn validate_query_request_body(body: &Value) -> Result<(), DynamoDbError> {
 ///   `SerializationException: Unexpected token received from parser`, and
 ///   `ConsistentRead: 1` `SerializationException: NUMBER_VALUE cannot be
 ///   converted to Boolean`. The handler's own deserialization still refuses
-///   every string in these members.
+///   every string in `ConsistentRead` and `ScanIndexForward`.
+///
+/// `Limit`, `Segment` and `TotalSegments` of another JSON type are shape
+/// faults with the texts of `int32_member::read` (`STRING_VALUE cannot be
+/// converted to Integer`, measured 2026-11-23 on `Query` and `Scan`), which
+/// the handlers read them with.
 pub(crate) fn shape_fault_first<T: DeserializeOwned>(
     body: &Value,
     check: DynamoDbError,
@@ -184,7 +197,9 @@ pub(crate) fn shape_fault_first<T: DeserializeOwned>(
             {
                 None
             }
-            ("Limit" | "Segment" | "TotalSegments", Value::Number(_)) => None,
+            ("Limit" | "Segment" | "TotalSegments", member) => {
+                crate::int32_member::read(Some(member)).err()
+            }
             ("ExpressionAttributeValues", Value::Object(entries)) => {
                 entries.iter().find_map(|(key, entry)| {
                     read(
@@ -228,31 +243,15 @@ const UNKNOWN_TYPE_DESCRIPTOR: &str = "unknown AttributeValue type descriptor";
 /// The `Query` checks in the service's order; see
 /// [`validate_query_request_body`].
 fn query_request_checks(body: &Value) -> Result<(), DynamoDbError> {
+    let ranges = crate::int32_member::ranges(body, &crate::int32_member::QUERY_RANGES);
     let values = body
         .get("ExpressionAttributeValues")
         .and_then(Value::as_object);
-    if let Some(values) = values
-        && values.values().any(unreadable)
-    {
-        return unreadable_value_checks(body, values, validate_no_parameter_mix);
+    if ranges.older_form || has_unreadable(body, QUERY_CONDITIONS) {
+        return older_form_checks(body, values, &ranges.faults, validate_no_parameter_mix);
     }
-
-    if let Some(limit) = body.get("Limit").and_then(Value::as_i64)
-        && limit < 1
-    {
-        // Beside a value that is not one AttributeValue the service answers
-        // its older form, with the value echoed (measured 2026-10-25 12:56 UTC
-        // on Query and Scan, and 2026-10-31 for the key and the lists).
-        if has_unreadable_attribute_value(body, QUERY_CONDITIONS) {
-            return Err(DynamoDbError::ValidationException(format!(
-                "1 validation error detected: Value '{}' at 'limit' failed to satisfy constraint: \
-                 Member must have value greater than or equal to 1",
-                limit.clamp(i64::from(i32::MIN), i64::from(i32::MAX))
-            )));
-        }
-        return Err(DynamoDbError::ValidationException(
-            LIMIT_BELOW_ONE.to_owned(),
-        ));
+    if !ranges.faults.is_empty() {
+        return Err(crate::int32_member::newer_form(&ranges.faults));
     }
 
     // Query stops at the first invalid enum: ReturnConsumedCapacity ahead of
@@ -335,7 +334,7 @@ pub(crate) fn validate_names(body: &Value) -> Result<(), DynamoDbError> {
 /// name that is not empty, so an empty name passes here. Beside a value the
 /// service cannot read as one type, the service makes the key checks ahead of
 /// the values and reports an empty name after them; see
-/// `unreadable_value_checks`.
+/// `older_form_checks`.
 fn validate_name_keys(body: &Value) -> Result<(), DynamoDbError> {
     match body.get("ExpressionAttributeNames") {
         Some(Value::Object(names)) => {
@@ -361,84 +360,6 @@ pub(crate) fn non_empty(body: &Value, field: &str) -> bool {
         Some(Value::Object(map)) => !map.is_empty(),
         Some(Value::Array(items)) => !items.is_empty(),
         _ => false,
-    }
-}
-
-/// The legacy condition maps of `Scan` whose `AttributeValueList` entries
-/// [`has_unreadable_attribute_value`] reads.
-pub(crate) const SCAN_CONDITIONS: &[&str] = &["ScanFilter"];
-
-/// The legacy condition maps of `Query` whose `AttributeValueList` entries
-/// [`has_unreadable_attribute_value`] reads.
-pub(crate) const QUERY_CONDITIONS: &[&str] = &["KeyConditions", "QueryFilter"];
-
-/// Whether the request holds an object that is not one AttributeValue: empty,
-/// with a type descriptor the service does not have (a lower-case `s`
-/// included), or with more than one, at the top or as a member of an `L` or
-/// `M` at any depth. The values read are the `ExpressionAttributeValues`
-/// entries, the `ExclusiveStartKey` values and the `AttributeValueList`
-/// entries of the `conditions` maps. Beside such a value the service reports a
-/// range fault in its older form, and beside a readable value, of the wrong
-/// type for a key or not, the newer form.
-///
-/// Measured on 2026-10-25 at 12:56 UTC: `Limit: 0` beside an entry `{}`,
-/// `{"X": "1"}` or `{"S": "x", "N": "1"}` answers `Value '0' at 'limit'` on
-/// Query and Scan, and beside an empty or duplicate `NS` the newer form. On
-/// 2026-10-30 at 12:40 UTC on Scan and 2026-10-31 at 12:36 UTC on Query:
-/// beside an entry `{"L": [{}]}`, `{"M": {"k": {"X": "1"}}}` or `{"s": "x"}`,
-/// the older form. On 2026-10-31 between 23:54 and 23:56 UTC: beside `{}` or
-/// `{"X": "1"}` as an `ExclusiveStartKey` value or a `ScanFilter`
-/// `AttributeValueList` entry on Scan, and `{}` as an `ExclusiveStartKey`
-/// value or a `KeyConditions` or `QueryFilter` `AttributeValueList` entry on
-/// Query, the older form, for a `Segment` fault too; beside `{"N": "1"}` as
-/// the value of an `S` key, `{"N": "1"}` in a `ScanFilter` list and `{"S":
-/// "p0"}` in a `KeyConditions` list, the newer form. An `L` or `M` member of
-/// an `ExclusiveStartKey` value or of a list entry is read as one of an
-/// `ExpressionAttributeValues` entry is; that is not measured.
-///
-/// A value that is not an object is a shape fault, reported ahead of the
-/// checks.
-pub(crate) fn has_unreadable_attribute_value(body: &Value, conditions: &[&str]) -> bool {
-    let in_map = |field: &str| {
-        body.get(field)
-            .and_then(Value::as_object)
-            .is_some_and(|values| values.values().any(is_unreadable_attribute_value))
-    };
-    let in_lists = |field: &&str| {
-        body.get(*field)
-            .and_then(Value::as_object)
-            .is_some_and(|conditions| {
-                conditions.values().any(|condition| {
-                    condition
-                        .get("AttributeValueList")
-                        .and_then(Value::as_array)
-                        .is_some_and(|list| list.iter().any(is_unreadable_attribute_value))
-                })
-            })
-    };
-    in_map("ExpressionAttributeValues")
-        || in_map("ExclusiveStartKey")
-        || conditions.iter().any(in_lists)
-}
-
-/// Whether `entry` is an object that is not one AttributeValue, or an `L` or
-/// `M` with such a member; see [`has_unreadable_attribute_value`].
-fn is_unreadable_attribute_value(entry: &Value) -> bool {
-    let Some(descriptors) = entry.as_object() else {
-        return false;
-    };
-    let mut fields = descriptors.iter();
-    match (fields.next(), fields.next()) {
-        (Some((descriptor, value)), None) => match descriptor.as_str() {
-            "L" => value
-                .as_array()
-                .is_some_and(|members| members.iter().any(is_unreadable_attribute_value)),
-            "M" => value
-                .as_object()
-                .is_some_and(|members| members.values().any(is_unreadable_attribute_value)),
-            descriptor => !TYPE_DESCRIPTORS.contains(&descriptor),
-        },
-        _ => true,
     }
 }
 
@@ -481,7 +402,7 @@ impl Fault<'_> {
         }
     }
 
-    /// The text [`unreadable_value_checks`] wraps: a number echoed as written
+    /// The text [`older_form_checks`] wraps: a number echoed as written
     /// and no colon after an empty one (measured 2026-11-11).
     fn reason(self) -> String {
         match self {
