@@ -29,7 +29,8 @@
 //!
 //! Native only: it drives the engine on a tokio runtime, a native-only
 //! dev-dependency, so the file compiles to nothing on `wasm32` and
-//! `cargo clippy --target wasm32-unknown-unknown --all-targets` can build.
+//! `cargo clippy -p extenddb-wasm-adapter --target wasm32-unknown-unknown
+//! --all-targets` can build.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::{HashMap, HashSet};

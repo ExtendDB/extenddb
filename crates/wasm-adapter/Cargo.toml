@@ -64,7 +64,8 @@ console_error_panic_hook = "0.1.6"
 
 # A current-thread runtime drives the adapter's async `submit` in the native
 # unit tests (the browser build uses `wasm-bindgen-futures` instead). Scoped to
-# non-wasm so `cargo clippy --target wasm32-unknown-unknown --all-targets` does
-# not pull tokio's net stack, which has no wasm32 target.
+# non-wasm so `cargo clippy -p extenddb-wasm-adapter --target
+# wasm32-unknown-unknown --all-targets` does not pull tokio's net stack, which
+# has no wasm32 target.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
