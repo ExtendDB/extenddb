@@ -27,12 +27,10 @@ from test_query_key_value_types import NB, NUMERIC
 from test_query_value_shapes import EMPTY_AV, INVALID_VALUE, X1, _raw_query
 
 
-class TestLeadingKeysWithAnInvalidKeyValue:
-    """A principal under each LeadingKeys fence form gets ValidationException and
-    no items for a Query whose ExpressionAttributeValues carries an N value that
-    is not a number, whether the key condition, the filter or nothing reads it.
-
-    extenddb only: the fences need users created through the management API."""
+class ManagementPrincipals:
+    """A fresh account per test, and `_client` for a user in it with a given
+    policy. extenddb only: the users are created through the management API,
+    so a test class built on this one is skipped against the service."""
 
     @pytest.fixture(autouse=True)
     def setup(self):
@@ -40,7 +38,7 @@ class TestLeadingKeysWithAnInvalidKeyValue:
         admin_user = os.environ.get("EXTENDDB_ADMIN_USER", "").strip()
         admin_pass = os.environ.get("EXTENDDB_ADMIN_PASSWORD", "").strip()
         if not endpoint:
-            pytest.skip("LeadingKeys fences need the extenddb management API")
+            pytest.skip("the users need the extenddb management API")
         if not admin_user or not admin_pass:
             pytest.fail("MISCONFIGURED: EXTENDDB_ADMIN_USER and EXTENDDB_ADMIN_PASSWORD are required")
         from management_helpers import ManagementClient
@@ -77,6 +75,14 @@ class TestLeadingKeysWithAnInvalidKeyValue:
             aws_secret_access_key=creds["secret_access_key"],
             verify=False,
             config=BotoConfig(retries={"max_attempts": 0}, parameter_validation=False))
+
+
+class TestLeadingKeysWithAnInvalidKeyValue(ManagementPrincipals):
+    """A principal under each LeadingKeys fence form gets ValidationException and
+    no items for a Query whose ExpressionAttributeValues carries an N value that
+    is not a number, whether the key condition, the filter or nothing reads it.
+
+    extenddb only: the fences need users created through the management API."""
 
     def _fence(self, condition: dict, table: str) -> dict:
         arn = f"arn:aws:dynamodb:{self.region}:{self.account_id}:table/{table}"
