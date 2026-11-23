@@ -105,8 +105,8 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 | ListTables: max per page | 100 | Enforced | `LimitsConfig::list_tables_max_per_page` |
 | DescribeTable: request rate | No specific limit | N/A | ExtendDB does not rate-limit             |
 | TagResource: max tags per resource | 50 | Not enforced | No tag count validation                  |
-| Tag key length | 1–128 characters | Not enforced | No tag key length validation             |
-| Tag value length | 0–256 characters | Not enforced | No tag value length validation           |
+| Tag key length | 1 to 128 UTF-16 code units | Enforced | `validate_tags` in `crates/core/src/validation/tag.rs` |
+| Tag value length | 0 to 256 UTF-16 code units | Enforced | `validate_tags` in `crates/core/src/validation/tag.rs` |
 
 ## Import from Amazon S3
 
@@ -165,11 +165,11 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 | Batch Operations | 3 | 0 | 2 | 0 |
 | Transactions | 3 | 0 | 1 | 0 |
 | Streams | 3 | 0 | 1 | 0 |
-| API-Level | 1 | 0 | 3 | 1 |
+| API-Level | 3 | 0 | 1 | 1 |
 | Import/Export/Backup | 2 | 2 | 0 | 7 |
 | Global Tables | 0 | 0 | 0 | 2 |
 | Contributor Insights | 0 | 0 | 0 | 1 |
-| **Total** | **34** | **2** | **14** | **13** |
+| **Total** | **36** | **2** | **12** | **13** |
 
 ### Unenforced Limits Requiring Tracking
 
@@ -182,7 +182,6 @@ The following unenforced limits are tracked in `docs/technical-debt.md`:
 5. **BatchWriteItem request size** (16 MB) — requires aggregate request size tracking
 6. **Transaction request size** (4 MB) — requires aggregate request size tracking
 7. **Tag count per resource** (50): requires count validation in TagResource
-8. **Tag key/value length** (128/256 chars): requires length validation in TagResource
 
 ---
 
