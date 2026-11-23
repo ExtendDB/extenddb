@@ -45,6 +45,7 @@ mod update_table;
 mod vector;
 mod vector_search;
 mod vector_search_filtered;
+mod vector_search_scan;
 mod warm_throughput;
 mod worker_store;
 mod workers;
