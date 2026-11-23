@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! How a server reads the `search_inequality_filters` setting: per server,
-//! kept for a short interval, bounded in time, and a fault answered as a
-//! retryable error.
+//! kept for a short interval, bounded in time, one read at a time, and a
+//! fault answered as a retryable error.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,6 +14,7 @@ use extenddb_storage::StorageEngine;
 use extenddb_storage::management_store::{OpError, OpResult, SettingsStore};
 use extenddb_storage_sqlite::SqliteEngine;
 use futures::future::BoxFuture;
+use tokio::sync::Notify;
 
 use super::{
     READ_TIMEOUT, REFRESH, Settings, enabled_accounts, install_search_filter_settings,
@@ -28,6 +29,8 @@ enum Answer {
     Slow(String),
     Fail,
     Hang,
+    /// The value, once the gate is opened.
+    Gated(Arc<Notify>, String),
 }
 
 /// A settings store with one answer for every read, counting the reads.
@@ -70,6 +73,10 @@ impl SettingsStore for Store {
                 }
                 Answer::Fail => Err(OpError::Internal("connection reset".to_owned())),
                 Answer::Hang => std::future::pending().await,
+                Answer::Gated(gate, v) => {
+                    gate.notified().await;
+                    Ok(Some(v))
+                }
             }
         })
     }
@@ -220,4 +227,61 @@ async fn a_change_through_the_management_api_applies_at_once() {
         enabled_accounts(&storage).await.unwrap(),
         EnabledAccounts::All
     );
+}
+
+/// A read that does not end is sent once: later requests wait on it rather
+/// than sending reads of their own, each of which would hold a catalog
+/// connection while it waits.
+#[tokio::test(start_paused = true)]
+async fn a_read_that_does_not_end_is_sent_once() {
+    let store = Store::new(Answer::Hang);
+    let settings = Arc::new(Settings::new(store.clone()));
+    for _ in 0..20 {
+        let tasks: Vec<_> = (0..4)
+            .map(|_| {
+                let settings = Arc::clone(&settings);
+                tokio::spawn(async move { settings.enabled_accounts().await })
+            })
+            .collect();
+        for task in tasks {
+            assert!(is_unavailable(&task.await.unwrap()));
+        }
+        tokio::time::advance(REFRESH).await;
+    }
+    assert_eq!(store.reads(), 1, "reads sent while the first had not ended");
+}
+
+/// When the read that outlasted the timeout ends, the next request uses its
+/// answer.
+#[tokio::test(start_paused = true)]
+async fn a_read_that_ends_late_answers_the_next_request() {
+    let gate = Arc::new(Notify::new());
+    let store = Store::new(Answer::Gated(Arc::clone(&gate), "all".to_owned()));
+    let settings = Settings::new(store.clone());
+    assert!(is_unavailable(&settings.enabled_accounts().await));
+    tokio::time::advance(REFRESH).await;
+    gate.notify_one();
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        settings.enabled_accounts().await.unwrap(),
+        EnabledAccounts::All
+    );
+    assert!(started.elapsed() < READ_TIMEOUT);
+    assert_eq!(store.reads(), 1);
+}
+
+/// A read sent before a change through the management API is not waited on
+/// after it: the next request sends a read of the changed value.
+#[tokio::test(start_paused = true)]
+async fn a_change_applies_while_an_earlier_read_has_not_ended() {
+    let store = Store::new(Answer::Hang);
+    let settings = Settings::new(store.clone());
+    assert!(is_unavailable(&settings.enabled_accounts().await));
+    store.set(Answer::Value(Some("all".to_owned())));
+    settings.changed();
+    assert_eq!(
+        settings.enabled_accounts().await.unwrap(),
+        EnabledAccounts::All
+    );
+    assert_eq!(store.reads(), 2);
 }
