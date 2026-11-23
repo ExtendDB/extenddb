@@ -153,6 +153,12 @@ pub(crate) async fn handle_update_item_with(
         Some(merged)
     };
 
+    // The numbers of ExpressionAttributeValues, nested ones included, come
+    // ahead of the parameter usage checks, the expressions, the undefined and
+    // unused names and values, and the table lookup (measured 2026-11-23 on a
+    // table that does not exist).
+    extenddb_core::validation::number::operations::update_item_values(&input)?;
+
     let has_expr = has_update_expr || has_condition;
     extenddb_core::expression::validate_expression_param_usage(
         input.expression_attribute_names.as_ref(),
