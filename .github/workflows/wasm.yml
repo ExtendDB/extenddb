@@ -121,7 +121,7 @@ jobs:
         run: devtools/run-wasm-step build
       - name: Clippy the wasm32 build
         run: devtools/run-wasm-step clippy
-      - name: Self-test the wasm32 clippy guard
+      - name: Self-test the wasm32 clippy step and check zeroize features
         run: devtools/run-wasm-step guard
       - name: Clippy the adapter (pedantic) for wasm32
         run: devtools/run-wasm-step pedantic
