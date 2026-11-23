@@ -296,30 +296,10 @@ pub fn parse_backup_arn(arn: &str) -> Option<BackupArnParts<'_>> {
 /// [`BackupArnError`], one class per service text.
 pub fn check_backup_arn(arn: &str) -> Result<BackupArnParts<'_>, BackupArnError> {
     let arn = trim_backup_arn(arn);
-    if arn.len() > MAX_BACKUP_ARN_LEN {
-        return Err(BackupArnError::Invalid);
-    }
-    let f = crate::arn::fields(arn).ok_or(BackupArnError::Invalid)?;
-    if !ascii_word(f.partition, b"-")
-        || f.service != "dynamodb"
+    let (f, table_name, backup_id) = split_backup_arn(arn)?;
+    if f.service != "dynamodb"
         || f.account.is_empty()
         || !f.account.bytes().all(|b| b.is_ascii_digit())
-        // `fields` keeps any further `:` inside the resource; a backup
-        // resource has none.
-        || f.resource.contains(':')
-    {
-        return Err(BackupArnError::Invalid);
-    }
-    let parts: Vec<&str> = f.resource.split('/').collect();
-    let ["table", table_name, "backup", backup_id] = parts.as_slice() else {
-        return Err(BackupArnError::Invalid);
-    };
-    // The table-name alphabet is CreateTable's, from the function CreateTable
-    // calls (`validate_table_name_chars`), so a name CreateTable accepts is a
-    // name this parser accepts.
-    if table_name.is_empty()
-        || crate::validation::validate_table_name_chars(table_name).is_err()
-        || backup_id.chars().count() < 3
     {
         return Err(BackupArnError::Invalid);
     }
@@ -337,6 +317,41 @@ pub fn check_backup_arn(arn: &str) -> Result<BackupArnParts<'_>, BackupArnError>
         table_name,
         backup_id,
     })
+}
+
+/// The structure checks of [`check_backup_arn`] on an ARN already trimmed,
+/// returning the fields, the name and the id. The service, region, account
+/// and id are left to the caller.
+///
+/// # Errors
+///
+/// [`BackupArnError::Invalid`].
+pub fn split_backup_arn(
+    arn: &str,
+) -> Result<(crate::arn::ArnFields<'_>, &str, &str), BackupArnError> {
+    if arn.len() > MAX_BACKUP_ARN_LEN {
+        return Err(BackupArnError::Invalid);
+    }
+    let f = crate::arn::fields(arn).ok_or(BackupArnError::Invalid)?;
+    // `fields` keeps any further `:` inside the resource; a backup resource
+    // has none.
+    if !ascii_word(f.partition, b"-") || f.resource.contains(':') {
+        return Err(BackupArnError::Invalid);
+    }
+    let parts: Vec<&str> = f.resource.split('/').collect();
+    let ["table", table_name, "backup", backup_id] = parts.as_slice() else {
+        return Err(BackupArnError::Invalid);
+    };
+    // The table-name alphabet is CreateTable's, from the function CreateTable
+    // calls (`validate_table_name_chars`), so a name CreateTable accepts is a
+    // name this parser accepts.
+    if table_name.is_empty()
+        || crate::validation::validate_table_name_chars(table_name).is_err()
+        || backup_id.chars().count() < 3
+    {
+        return Err(BackupArnError::Invalid);
+    }
+    Ok((f, *table_name, *backup_id))
 }
 
 /// A validated backup ARN.

@@ -89,7 +89,7 @@ pub use layout::{
     StoreKey, backup_creation_date_time, backup_id_epoch_millis, check_backup_arn,
     check_store_prefix_table_name, classify_store_key, data_file_key, format_backup_arn,
     format_backup_id, is_backup_id, is_region, parse_backup_arn, parse_store_prefix,
-    trim_backup_arn,
+    split_backup_arn, trim_backup_arn,
 };
 pub use manifest::{
     BackupGsi, BackupLsi, CURRENT_FORMAT_VERSION, DataFileEntry, DataFileReader, ExtenddbManifest,

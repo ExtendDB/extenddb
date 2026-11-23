@@ -2646,10 +2646,10 @@ def test_backup_arn_shapes_the_service_refuses_and_trims(dynamodb_client):
     RestoreTableFromBackup (measured on DynamoDB in us-east-1 on
     21 Nov 2026; a region field outside the shape is in
     _BACKUP_ARN_REGION_ROWS).
-    ExtendDB gives ExclusiveStartBackupArn the same texts; the service's
-    are its own. A trailing newline is trimmed and an ARN naming another
-    region of the caller's account resolves (measured on DynamoDB). The
-    texts are checked on ExtendDB only.
+    ExclusiveStartBackupArn gets its own texts (measured on DynamoDB in
+    us-east-1 on 6 and 21 Nov 2026). A trailing newline is trimmed and an
+    ARN naming another region of the caller's account resolves (measured on
+    DynamoDB). The BackupArn texts are checked on ExtendDB only.
     """
     client = dynamodb_client
     source = f"restore-arnshape-{uuid.uuid4().hex[:10]}"
@@ -2672,16 +2672,22 @@ def test_backup_arn_shapes_the_service_refuses_and_trims(dynamodb_client):
 
         not_valid = "Invalid Request: BackupArn is not valid"
         invalid_arn = "Invalid Backup ARN"
+        not_backup = ("Invalid Request: The supplied ExclusiveStartBackupArn is not a valid "
+                      "backup arn")
+        too_long = ("1 validation error detected: Value '{arn}' at 'exclusiveStartBackupArn' "
+                    "failed to satisfy constraint: Member must have length less than or "
+                    "equal to 1024")
+        # (BackupArn, its text, the text of that ARN as ExclusiveStartBackupArn)
         bad = [
-            (f"{prefix}/{backup_id}\x00", not_valid),
-            (f"{prefix}/{backup_id}\x07", not_valid),
-            (backup_arn.replace(f"table/{source}", "table/" + "x" * 1000), invalid_arn),
-            (f"{prefix}/*", invalid_arn),
-            (f"{prefix}/{backup_id[:-1]}", not_valid),
-            (f"{prefix}/{backup_id}0", not_valid),
-            (f"{prefix}/{backup_id[:-2]}zz", not_valid),
+            (f"{prefix}/{backup_id}\x00", not_valid, not_backup),
+            (f"{prefix}/{backup_id}\x07", not_valid, not_backup),
+            (backup_arn.replace(f"table/{source}", "table/" + "x" * 1000), invalid_arn, too_long),
+            (f"{prefix}/*", invalid_arn, invalid_arn),
+            (f"{prefix}/{backup_id[:-1]}", not_valid, not_backup),
+            (f"{prefix}/{backup_id}0", not_valid, not_backup),
+            (f"{prefix}/{backup_id[:-2]}zz", not_valid, not_backup),
         ]
-        for arn, expected in bad:
+        for arn, expected, cursor in bad:
             for operation, body in (
                 ("DescribeBackup", {"BackupArn": arn}),
                 ("DeleteBackup", {"BackupArn": arn}),
@@ -2692,7 +2698,9 @@ def test_backup_arn_shapes_the_service_refuses_and_trims(dynamodb_client):
                 assert resp.status_code == 400, (operation, arn, resp.text)
                 code, message = _error(resp)
                 assert code == "ValidationException", (operation, arn, resp.text)
-                if not _is_real_dynamodb():
+                if operation == "ListBackups":
+                    assert message == cursor.format(arn=arn), (operation, arn, message)
+                elif not _is_real_dynamodb():
                     assert message == expected, (operation, arn, message)
                 else:
                     assert message in (not_valid, invalid_arn), (operation, arn, message)

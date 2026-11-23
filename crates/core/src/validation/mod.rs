@@ -107,18 +107,14 @@ pub fn validate_name_member(
 pub fn validate_name_member_after(
     value: &str,
     path: &str,
-    (min, max): (usize, usize),
+    bounds: (usize, usize),
     earlier: &[(&str, &str, &str)],
     later: &[(&str, &str, &str)],
 ) -> Result<(), DynamoDbError> {
-    let length = value.chars().count();
-    let too_short = format!("Member must have length greater than or equal to {min}");
-    let too_long = format!("Member must have length less than or equal to {max}");
+    let length = length_clause(value, bounds);
     let mut failed: Vec<(&str, &str, &str)> = earlier.to_vec();
-    if length < min {
-        failed.push((value, path, too_short.as_str()));
-    } else if length > max {
-        failed.push((value, path, too_long.as_str()));
+    if let Some(clause) = &length {
+        failed.push((value, path, clause.as_str()));
     }
     if validate_table_name_chars(value).is_err() {
         failed.push((
@@ -134,6 +130,25 @@ pub fn validate_name_member_after(
     Err(DynamoDbError::ValidationException(
         crate::error::validation_errors(&failed),
     ))
+}
+
+/// The service's length clause for a value outside `min` to `max`
+/// characters, counted as [`validate_name_member`] counts them; `None`
+/// within them.
+#[must_use]
+pub fn length_clause(value: &str, (min, max): (usize, usize)) -> Option<String> {
+    let length = value.chars().count();
+    if length < min {
+        Some(format!(
+            "Member must have length greater than or equal to {min}"
+        ))
+    } else if length > max {
+        Some(format!(
+            "Member must have length less than or equal to {max}"
+        ))
+    } else {
+        None
+    }
 }
 
 /// Validate an index name: 3 to 255 characters of `[a-zA-Z0-9_.-]`. Each

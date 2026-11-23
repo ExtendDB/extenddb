@@ -17,7 +17,8 @@
 use std::sync::{Arc, LazyLock};
 
 use extenddb_core::backup_format::{
-    BackupArn, BackupArnParts, check_store_prefix_table_name, is_region,
+    BackupArn, BackupArnParts, MAX_BACKUP_ARN_LEN, check_store_prefix_table_name, is_backup_id,
+    is_region, split_backup_arn,
 };
 use extenddb_core::error::{DynamoDbError, ErrorMessageKey, error_message};
 use extenddb_core::limits::LimitsConfig;
@@ -26,7 +27,7 @@ use extenddb_core::types::{
     LocalSecondaryIndexInfo, ProvisionedThroughput, RestoreSummary, SourceTableFeatureDetails,
     SseDescription, StreamSpecification, TableDescription, TableStatus,
 };
-use extenddb_core::validation::validate_name_member;
+use extenddb_core::validation::{length_clause, validate_name_member};
 use extenddb_storage::backup_catalog::{
     BackupKey, BackupRow, BackupStatus, DeleteStart, TimeBounds, is_backup_not_found,
 };
@@ -109,6 +110,8 @@ fn backup_arn_field(
 /// any name the deployment allowed. The inner result is answered after the
 /// name: `BackupNotFoundException` for the service's id shape in upper-case
 /// hex, which no build issues, or the rest of [`check_backup_arn`].
+///
+/// [`check_backup_arn`]: extenddb_storage::util::check_backup_arn
 fn backup_arn_member<'a>(
     body: &'a Value,
     account_id: &str,
@@ -352,20 +355,13 @@ fn canonical_backup_arn(
     extenddb_storage::util::backup_arn(region, parts.account_id, parts.table_name, parts.backup_id)
 }
 
-/// The shape check of [`backup_arn_member`] and of the `ListBackups`
-/// cursor, with the service's texts (see [`BackupArnError`] for which inputs
-/// get which). A partition other than [`ARN_PARTITION`] is refused here too,
-/// with `Invalid Request: BackupArn is not valid` for one naming the caller's
-/// account, which a restore answers after its `TargetTableName` (measured on
-/// DynamoDB in us-east-1 on 21 Nov 2026 for `aws-cn`).
+/// The partition check of [`backup_arn_member`], after the shape: a
+/// partition other than [`ARN_PARTITION`] is refused with `Invalid Request:
+/// BackupArn is not valid` for an ARN naming the caller's account, which a
+/// restore answers after its `TargetTableName` (measured on DynamoDB in
+/// us-east-1 on 21 Nov 2026 for `aws-cn`).
 ///
 /// [`ARN_PARTITION`]: extenddb_storage::util::ARN_PARTITION
-fn check_backup_arn(backup_arn: &str) -> Result<BackupArnParts<'_>, DynamoDbError> {
-    extenddb_storage::util::check_backup_arn(backup_arn)
-        .map_err(backup_arn_refusal)
-        .and_then(check_partition)
-}
-
 fn check_partition(parts: BackupArnParts<'_>) -> Result<BackupArnParts<'_>, DynamoDbError> {
     if parts.partition != extenddb_storage::util::ARN_PARTITION {
         return Err(DynamoDbError::ValidationException(
@@ -1005,7 +1001,13 @@ async fn list_backups<S: BackupCatalog + LegacyBackupReader + ?Sized>(
                         .to_owned(),
                 )
             })?;
-            Some(list_backups_cursor(arn, account_id, region, table_name)?)
+            Some(list_backups_cursor(
+                arn,
+                account_id,
+                region,
+                table_name,
+                table_name_bounds(limits),
+            )?)
         }
     };
     let filter = ListBackupsFilter::parse(body)?;
@@ -1073,43 +1075,89 @@ async fn list_backups<S: BackupCatalog + LegacyBackupReader + ?Sized>(
     Ok(out)
 }
 
-/// The `ExclusiveStartBackupArn` of `ListBackups`, checked as the service
-/// checks it (measured on DynamoDB): the shape as any backup
-/// ARN, then the account, region, and (when `TableName` is given) the table
-/// name must be the listing's, each a `ValidationException`. Unlike
-/// `BackupArn`, another account's cursor is a `ValidationException`, not
-/// `AccessDeniedException`, and another region's is refused rather than
-/// resolved. The service's text for the account case was captured in full;
-/// the region and table-name texts were captured as fragments ("does not
-/// match the region", "does not match the table name predicate") and are
-/// completed on the account text's pattern. Returns the cursor as this
-/// deployment issued it (whitespace trimmed).
+/// The `ExclusiveStartBackupArn` of `ListBackups`, checked in the service's
+/// order (measured on DynamoDB in us-east-1 on 6, 21 and 22 Nov 2026), each
+/// refusal a `ValidationException`:
+///
+/// 1. The length as sent, [`BACKUP_ARN_BOUNDS`], with the model's clause.
+/// 2. The structure of the trimmed cursor ([`split_backup_arn`]) and a
+///    table segment in the deployment's name bounds, else `Invalid Backup
+///    ARN`.
+/// 3. The partition `aws`, the service `dynamodb`, a region of
+///    `[a-zA-Z0-9-]`, an account that is not empty and a backup id
+///    ([`is_backup_id`], or the service's shape in upper-case hex), else
+///    [`CURSOR_NOT_A_BACKUP_ARN`].
+/// 4. The region, 5. the account (of any characters) and 6. with
+///    `TableName`, the table, each the listing's, else "does not match the
+///    region", "the account" or "the table name predicate".
+///
+/// Unlike `BackupArn`, another account's cursor is a `ValidationException`,
+/// not `AccessDeniedException`, and another region's is refused rather than
+/// resolved. Returns the cursor as this deployment issues it (whitespace
+/// trimmed, the id in lower case), or a [`ListBackupsCursor::Stored`] one.
 fn list_backups_cursor(
     arn: &str,
     account_id: &str,
     region: &str,
     table_name: Option<&str>,
+    (min, max): (usize, usize),
 ) -> Result<ListBackupsCursor, DynamoDbError> {
-    let parts = check_backup_arn(arn)?;
-    if parts.account_id != account_id {
-        return Err(cursor_mismatch("account"));
+    if let Some(clause) = length_clause(arn, BACKUP_ARN_BOUNDS) {
+        return Err(DynamoDbError::ValidationException(
+            extenddb_core::error::validation_errors(&[(
+                arn,
+                "exclusiveStartBackupArn",
+                clause.as_str(),
+            )]),
+        ));
     }
-    let other_table = table_name.is_some_and(|t| t != parts.table_name);
-    if parts.region != region {
-        // Region before table name; a listed backup's ARN names the filter's
-        // table, so another table's cursor cannot be one.
-        if other_table {
-            return Err(cursor_mismatch("region"));
+    let trimmed = extenddb_core::backup_format::trim_backup_arn(arn);
+    let (f, table, id) = split_backup_arn(trimmed).map_err(backup_arn_refusal)?;
+    if !(min..=max).contains(&table.len()) {
+        let refusal = backup_arn_refusal(BackupArnError::Invalid);
+        return Ok(ListBackupsCursor::Stored(trimmed.to_owned(), refusal));
+    }
+    let lower_id = id.to_ascii_lowercase();
+    if f.partition != extenddb_storage::util::ARN_PARTITION
+        || f.service != "dynamodb"
+        || f.account.is_empty()
+        || !is_region(&f.region.to_ascii_lowercase())
+        || !(is_backup_id(id)
+            || extenddb_storage::util::backup_id_epoch_millis(&lower_id).is_some())
+    {
+        return Err(DynamoDbError::ValidationException(
+            CURSOR_NOT_A_BACKUP_ARN.to_owned(),
+        ));
+    }
+    let other_table = table_name.is_some_and(|t| t != table);
+    if f.region != region {
+        let refusal = cursor_mismatch("region");
+        // A listed backup's ARN names the account and the filter's table,
+        // so only such a cursor can be one.
+        if f.account != account_id || other_table {
+            return Err(refusal);
         }
-        return Ok(ListBackupsCursor::OtherRegion(parts.arn.to_owned()));
+        return Ok(ListBackupsCursor::Stored(trimmed.to_owned(), refusal));
+    }
+    if f.account != account_id {
+        return Err(cursor_mismatch("account"));
     }
     if other_table {
         return Err(cursor_mismatch("table name predicate"));
     }
-    Ok(ListBackupsCursor::Canonical(canonical_backup_arn(
-        &parts, region,
-    )))
+    Ok(ListBackupsCursor::Canonical(
+        extenddb_storage::util::backup_arn(region, account_id, table, &lower_id),
+    ))
 }
+
+/// The service model's `BackupArn` length bounds, which the service applies
+/// to `ExclusiveStartBackupArn` (measured on DynamoDB).
+const BACKUP_ARN_BOUNDS: (usize, usize) = (37, MAX_BACKUP_ARN_LEN);
+
+/// The service's text for an `ExclusiveStartBackupArn` of the structure of
+/// a backup ARN that is not one (measured on DynamoDB).
+const CURSOR_NOT_A_BACKUP_ARN: &str =
+    "Invalid Request: The supplied ExclusiveStartBackupArn is not a valid backup arn";
 
 fn cursor_mismatch(what: &str) -> DynamoDbError {
     DynamoDbError::ValidationException(format!(
@@ -1117,22 +1165,24 @@ fn cursor_mismatch(what: &str) -> DynamoDbError {
     ))
 }
 
-/// A checked `ExclusiveStartBackupArn`. One in another region is refused
-/// unless it is the stored ARN of a listed backup: a backup created under an
-/// earlier `server.region` keeps that region in its ARN, and `ListBackups`
-/// hands that ARN out as `LastEvaluatedBackupArn`, so the next page must
-/// accept it.
+/// A checked `ExclusiveStartBackupArn`. One in another region, or with a
+/// table segment outside the deployment's name bounds, is refused unless it
+/// is the stored ARN of a listed backup: a backup created under an earlier
+/// `server.region` or other `[limits]` keeps them in its ARN, and
+/// `ListBackups` hands that ARN out as `LastEvaluatedBackupArn`, so the next
+/// page must accept it.
 enum ListBackupsCursor {
     Canonical(String),
-    OtherRegion(String),
+    /// The cursor, and its refusal when it is no listed backup's ARN.
+    Stored(String, DynamoDbError),
 }
 
 impl ListBackupsCursor {
     fn resolve(self, listed: &[BackupSummary]) -> Result<String, DynamoDbError> {
         match self {
             Self::Canonical(arn) => Ok(arn),
-            Self::OtherRegion(arn) if listed.iter().any(|s| s.backup_arn == arn) => Ok(arn),
-            Self::OtherRegion(_) => Err(cursor_mismatch("region")),
+            Self::Stored(arn, _) if listed.iter().any(|s| s.backup_arn == arn) => Ok(arn),
+            Self::Stored(_, refusal) => Err(refusal),
         }
     }
 }
