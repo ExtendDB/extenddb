@@ -388,7 +388,7 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
-### v1.1.0: TagResource, UntagResource and CreateTable check tags as DynamoDB does
+### v1.1.0: TagResource, UntagResource and CreateTable check tag keys and values against DynamoDB's rules
 
 **What changed.** TagResource, UntagResource and CreateTable answer `ValidationException` for a tag key or value outside the rules below (#485). 1.0.0 and earlier releases stored any key and value. The rules:
 
