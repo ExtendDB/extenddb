@@ -39,7 +39,7 @@ use serde_json::{Map, Value};
 
 mod unreadable;
 
-use unreadable::{readable_for_shape_check, unreadable, unreadable_value_checks};
+pub(crate) use unreadable::{readable_for_shape_check, unreadable, unreadable_value_checks};
 
 /// The service's text for a key condition value of the wrong type.
 pub const KEY_CONDITION_TYPE_MISMATCH: &str = "One or more parameter values were invalid: Condition parameter type does not match schema type";
@@ -59,8 +59,8 @@ const NULL_VALUE: &str = "The supplied Item contains a null AttributeValue";
 const TYPE_DESCRIPTORS: [&str; 10] = ["S", "N", "B", "SS", "NS", "BS", "M", "L", "NULL", "BOOL"];
 
 /// The members of the two enums the request-time checks read.
-const RETURN_CONSUMED_CAPACITY: &[&str] = &["INDEXES", "TOTAL", "NONE"];
-const SELECT: &[&str] = &[
+pub(crate) const RETURN_CONSUMED_CAPACITY: &[&str] = &["INDEXES", "TOTAL", "NONE"];
+pub(crate) const SELECT: &[&str] = &[
     "SPECIFIC_ATTRIBUTES",
     "COUNT",
     "ALL_ATTRIBUTES",
@@ -148,10 +148,12 @@ pub fn validate_query_request_body(body: &Value) -> Result<(), DynamoDbError> {
 ///   `Limit` `ValidationException` (measured 2026-10-25 and 2026-11-23);
 /// - a member the service reads from a JSON type that `T` refuses: a string
 ///   in `ConsistentRead` or `ScanIndexForward` that the service reads as a
-///   boolean (see [`BOOLEAN_TEXTS`]), and any number in `Limit`. Measured
-///   2026-11-23: `ConsistentRead: "true"` or `"T"`, `ScanIndexForward:
-///   "true"` or `"0"`, and `Limit: 1.5` beside `Select: "NOPE"` answer the
-///   `Select` text on `Query`, as `ConsistentRead: "true"` does on `Scan`, and
+///   boolean (see [`BOOLEAN_TEXTS`]), and any number in `Limit`, `Segment` or
+///   `TotalSegments`. Measured 2026-11-23, beside `Select: "NOPE"`:
+///   `ConsistentRead: "true"` or `"T"`, `ScanIndexForward: "true"` or `"0"`,
+///   and `Limit: 1.5` answer the `Select` text on `Query`, and
+///   `ConsistentRead: "true"`, `Segment: 1.5` with `TotalSegments: 2`, and
+///   `TotalSegments: 2.5` with `Segment: 0` answer it on `Scan`.
 ///   `ConsistentRead: "yes"` with a table that does not exist answers
 ///   `ResourceNotFoundException`. `ConsistentRead: "on"` answers
 ///   `SerializationException: Unexpected token received from parser`, and
@@ -182,7 +184,7 @@ pub(crate) fn shape_fault_first<T: DeserializeOwned>(
             {
                 None
             }
-            ("Limit", Value::Number(_)) => None,
+            ("Limit" | "Segment" | "TotalSegments", Value::Number(_)) => None,
             ("ExpressionAttributeValues", Value::Object(entries)) => {
                 entries.iter().find_map(|(key, entry)| {
                     read(
@@ -232,7 +234,7 @@ fn query_request_checks(body: &Value) -> Result<(), DynamoDbError> {
     if let Some(values) = values
         && values.values().any(unreadable)
     {
-        return unreadable_value_checks(body, values);
+        return unreadable_value_checks(body, values, validate_no_parameter_mix);
     }
 
     if let Some(limit) = body.get("Limit").and_then(Value::as_i64)
@@ -354,7 +356,7 @@ pub(crate) fn non_empty(body: &Value, field: &str) -> bool {
 
 /// The entries of `values` by placeholder, so the reported value is
 /// deterministic when several are invalid.
-fn sorted_entries(values: &Map<String, Value>) -> Vec<(&String, &Value)> {
+pub(crate) fn sorted_entries(values: &Map<String, Value>) -> Vec<(&String, &Value)> {
     let mut entries: Vec<(&String, &Value)> = values.iter().collect();
     entries.sort_by_key(|(key, _)| *key);
     entries
@@ -491,7 +493,7 @@ fn number_fault(text: &str) -> Option<Fault<'_>> {
 /// # Errors
 ///
 /// Returns `DynamoDbError::ValidationException` with the service's text.
-fn validate_expression_attribute_value_numbers(
+pub(crate) fn validate_expression_attribute_value_numbers(
     values: &Map<String, Value>,
 ) -> Result<(), DynamoDbError> {
     match sorted_entries(values)

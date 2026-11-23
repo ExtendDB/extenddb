@@ -273,8 +273,10 @@ pub(crate) const RETURN_VALUES_MEMBERS: &[&str] =
 /// Pre-validate enum fields in a JSON body and return a combined error if
 /// multiple are invalid, in the order listed. Whether an operation aggregates
 /// its enum violations or stops at the first is per operation on the service
-/// (PutItem and DeleteItem aggregate; UpdateItem, Query and Scan stop at the
-/// first), so callers choose by passing one list or several sequential calls.
+/// (`PutItem` and `DeleteItem` aggregate; `UpdateItem` stops at the first, and
+/// so do `Query` and `Scan` for a body whose `ExpressionAttributeValues` the
+/// service can read), so callers choose by passing one list or several
+/// sequential calls.
 pub(crate) fn validate_enum_fields(
     body: &serde_json::Value,
     fields: &[EnumField<'_>],

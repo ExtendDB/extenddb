@@ -14,7 +14,7 @@ use serde_json::{Map, Value};
 
 use super::{
     RETURN_CONSUMED_CAPACITY, SELECT, TYPE_DESCRIPTORS, first_fault, sorted_entries,
-    validate_name_keys, validate_names, validate_no_parameter_mix,
+    validate_name_keys, validate_names,
 };
 
 /// Whether the service cannot read `value` as exactly one AttributeValue type:
@@ -23,7 +23,7 @@ use super::{
 /// value an `L` or `M` holds (measured 2026-11-19: `{"S": null}` beside a
 /// `Limit` of 0 answers `Value '0' at 'limit'`, as `{"X": "1"}` does). A value
 /// of another JSON type is a shape fault instead.
-pub(super) fn unreadable(value: &Value) -> bool {
+pub(crate) fn unreadable(value: &Value) -> bool {
     match value {
         Value::Null => true,
         Value::Object(map) => {
@@ -54,7 +54,7 @@ pub(super) fn unreadable(value: &Value) -> bool {
 /// 2026-11-11: `{"L": [null, "x"]}`, `{"L": [{"X": "1"}, {"N": 5}]}` and
 /// `{"L": [null, {"B": "!!"}]}`, and `{"S": 5, "X": "1"}` and `{"S": 5, "N":
 /// "1"}` beside a `Limit` of 0, all answer `SerializationException`.
-pub(super) fn readable_for_shape_check(body: &Value) -> Cow<'_, Value> {
+pub(crate) fn readable_for_shape_check(body: &Value) -> Cow<'_, Value> {
     match body
         .get("ExpressionAttributeValues")
         .and_then(Value::as_object)
@@ -129,7 +129,8 @@ fn null_value() -> Value {
 ///    'returnConsumedCapacity' failed to satisfy constraint: ...; Value '0' at
 ///    'limit' failed to satisfy constraint: Member must have value greater
 ///    than or equal to 1`;
-/// 2. the expression and non-expression parameter mix;
+/// 2. the expression and non-expression parameter mix, which
+///    `validate_parameter_mix` checks with the operation's members;
 /// 3. the `ExpressionAttributeNames` key checks: an invalid key, a key over
 ///    255 bytes and an empty map (measured 2026-11-19: an invalid names key
 ///    beside `{"X": "1"}`, `{}` or `{"N": "1", "S": "x"}` answers the names
@@ -162,9 +163,17 @@ fn null_value() -> Value {
 /// `:a` with `{"X": "1"}` beside `:b` with a null names `:b`, and `:a` with a
 /// null beside `:b` with `{"X": "1"}` names `:b`. This order names `:z`, `:a`
 /// and `:a` for them.
-pub(super) fn unreadable_value_checks(
+///
+/// The `Scan` request-time checks call this too, after their range checks.
+/// Measured on `Scan` 2026-11-23, each request twice: an invalid `Select` and
+/// `ReturnConsumedCapacity` beside `{}` answer both clauses in one message,
+/// and a null, `{"L": [null]}` or `{"S": null}` beside an invalid `Select`
+/// answers the `Select` text. `:a` with `{}` beside `:n` with `{"N": "bob"}`
+/// names `:n` there, where this order names `:a`.
+pub(crate) fn unreadable_value_checks(
     body: &Value,
     values: &Map<String, Value>,
+    validate_parameter_mix: fn(&Value) -> Result<(), DynamoDbError>,
 ) -> Result<(), DynamoDbError> {
     let mut violations: Vec<String> = [
         enum_violation(body, "Select", "select", SELECT),
@@ -195,7 +204,7 @@ pub(super) fn unreadable_value_checks(
         )));
     }
 
-    validate_no_parameter_mix(body)?;
+    validate_parameter_mix(body)?;
     validate_name_keys(body)?;
 
     // The values the service cannot read first; the sort is stable, so each

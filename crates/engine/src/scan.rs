@@ -42,12 +42,13 @@ pub async fn handle_scan(
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
     // Request-time checks on the raw body, in the service's order: the Limit,
-    // Segment and TotalSegments ranges, the expression and non-expression
-    // parameter mix, the ReturnConsumedCapacity enum, every number in
-    // ExpressionAttributeValues, the Select enum. They run before typed
-    // deserialization so a field that does not deserialize does not stop the
-    // ones before it; a field of the wrong JSON type anywhere in the body is
-    // reported ahead of them; see `scan_request`.
+    // Segment and TotalSegments ranges, the ReturnConsumedCapacity enum, the
+    // expression and non-expression parameter mix, the
+    // ExpressionAttributeNames checks, every number in
+    // ExpressionAttributeValues, the set faults, the Select enum. They run
+    // before typed deserialization so a field that does not deserialize does
+    // not stop the ones before it; a field of the wrong JSON type is reported
+    // ahead of them; see `scan_request`.
     crate::scan_request::validate_scan_request_body(&body)?;
     let input: ScanInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
