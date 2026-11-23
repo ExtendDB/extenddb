@@ -72,11 +72,13 @@ and each run's dep-info must be read for every crate of the build. A control
 that does not give its finding, and a finding no control expects, fail the
 guard. No control covers the checks that a command finishes (the two runs,
 cargo tree), the plant checks that read the tree and its copy themselves,
-or item 3's refusal of an allow on a function whose end the scan does not
-find. The environment and cargo-configuration checks are controlled on
-their control inputs only: handed an empty mapping or file list in place of
-the tree's, the guard would still pass. A wrapper that caps one crate's
-lints is caught all the same.
+item 3's refusal of an allow on a function whose end the scan does not find,
+or the two verdicts the controls feed (the stop before the first run and the
+exit status). The environment, cargo-configuration and Cargo.lock checks are
+controlled on their control inputs only: handed an empty mapping or file
+list in place of the tree's environment or configuration files, or the
+tree's Cargo.lock in place of the copy's, the guard would still pass. A
+wrapper that caps one crate's lints is caught all the same.
 rustc reports a force-warned lint under --cap-lints as well, so F reports
 that crate's calls, and item 1 refuses those no accepted allow covers.
 clippy-driver, though, lints no crate whose own compiler options hold
@@ -1473,6 +1475,42 @@ const _: () = {
     }
 };
 
+#[allow(clippy::disallowed_methods, reason = "a control")] //@ on-trait allow
+trait OnTrait {}
+
+#[allow(clippy::disallowed_methods, reason = "a control")] //@ on-struct allow
+struct OnStruct;
+
+#[allow(clippy::disallowed_methods, reason = "a control")] //@ on-enum allow
+enum OnEnum {}
+
+#[allow(clippy::disallowed_methods, reason = "a control")] //@ on-union allow
+union OnUnion {
+    a: u8,
+}
+
+#[allow(clippy::disallowed_methods, reason = "a control")] //@ on-type-alias allow
+type OnTypeAlias = u8;
+
+mod on_use {
+    #![allow(clippy::useless_attribute)]
+    #[allow(clippy::disallowed_methods, reason = "a control")] //@ on-use allow
+    use std::time::Instant;
+    fn f(_at: Instant) {}
+}
+
+#[allow(clippy::disallowed_methods, reason = "a control")] //@ on-extern allow
+unsafe extern "C" {}
+
+#[allow(clippy::disallowed_methods, reason = "a control")] //@ on-macro-rules allow
+#[allow(unused_macros)]
+macro_rules! on_macro_rules {
+    () => {};
+}
+
+#[allow(clippy::disallowed_methods, reason = "a control")] //@ on-static allow
+static ON_STATIC: u8 = 0;
+
 #[allow(clippy::disallowed_methods, reason = "a control")]
 fn with_a_nested_fn() {
     fn nested() {
@@ -1625,16 +1663,18 @@ CONFIG_CONTROLS = {
     ),
 }
 # For probe_dependencies, with the build: a library in two versions, and a
-# path of each, of the adapter's library and of a crate no package has.
+# path of each, of the adapter's library and of a crate no package has. The
+# two control crates' names hold ": ", which no library name does, so no
+# library of a tree is taken for one of them.
 CONTROL_BUILD = [
     {"id": f"twice {version}", "name": "twice", "version": version}
-    | {"targets": [{"name": "twice", "kind": ["lib"]}]}
+    | {"targets": [{"name": "control: twice", "kind": ["lib"]}]}
     for version in ("1.0.0", "2.0.0")
 ]
 CONTROL_PATHS = {
-    "absent::f": "it has none",
-    "twice::f": "it has twice v1.0.0, twice v2.0.0",
-    "extenddb_wasm_adapter::f": f"it has {ADAPTER} v",
+    "control: absent::f": "it has none",
+    "control: twice::f": "it has twice v1.0.0, twice v2.0.0",
+    f"{ADAPTER.replace('-', '_')}::wasm_clippy_guard_control": f"it has {ADAPTER} v",
 }
 # For lock_problems, a package that a Cargo.lock gains.
 CONTROL_LOCK = '\n[[package]]\nname = "wasm-clippy-guard-control"\nversion = "0.0.0"\n'
@@ -1643,6 +1683,8 @@ CONTROL_LOCK = '\n[[package]]\nname = "wasm-clippy-guard-control"\nversion = "0.
 EARLY_CONTROLS = [
     *(Control("dependency", "plant", path, words) for path, words in CONTROL_PATHS.items()),
     Control("lock", "plant", "control: a lock", "wasm-clippy-guard-control 0.0.0 is added"),
+    Control("lock", "examined", "the copy's Cargo.lock"),
+    Control("lock", "examined", "control: a lock"),
 ]
 
 
@@ -1722,9 +1764,11 @@ def probe_dependencies(
 def lock_problems(pairs: list[tuple[str, str, str]]) -> list[Finding]:
     """A finding, at each pair's label, for each package (by name, version and
     source) whose entry is not the same in the pair's two Cargo.lock texts,
-    the guard's crate and the dependencies on it left out."""
+    the guard's crate and the dependencies on it left out; and an "examined"
+    finding for each pair, which a control expects for the tree's pair."""
     found = []
     for label, *locks in pairs:
+        found.append(Finding("examined", label, f"examined {label}"))
         tree, copy = (
             {
                 (p["name"], p["version"], p.get("source")): p
@@ -1896,7 +1940,9 @@ def check(metadata: dict, copy: Path) -> int:
     elif not planted:
         planted.append(Finding("plant", "Cargo.lock", f"cargo metadata --offline failed:\n{error}"))
     failures, problems = match_controls(found + planted + lock_problems(locks), EARLY_CONTROLS)
-    for text in dict.fromkeys([f.text for f in problems] + failures):
+    # A plant problem leaves the copy's Cargo.lock unread, so its control
+    # fails too: the problems are printed alone.
+    for text in dict.fromkeys([f.text for f in problems] or failures):
         print(f"FAIL: {text}", file=sys.stderr)
     if failures or problems:
         return 1

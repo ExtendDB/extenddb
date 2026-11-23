@@ -56,10 +56,10 @@
 # that -D warnings does not turn into an error, and on an entry with no probe
 # in that script; its documentation states the rest of what it checks. An
 # entry can name a method or type of std, or of any library among the
-# adapter's normal dependencies for wasm32, direct or not, in one version,
-# other than the adapter itself, with a probe in the script's table; the
-# script compiles the probes in a crate of its own, in its copy of the tree,
-# so no manifest or Cargo.lock of the tree changes.
+# adapter's normal dependencies for wasm32, direct or not, that one package
+# of that build holds, other than the adapter itself, with a probe in the
+# script's table; the script compiles the probes in a crate of its own, in
+# its copy of the tree, so no manifest or Cargo.lock of the tree changes.
 
 disallowed-methods = [
     # Clock
