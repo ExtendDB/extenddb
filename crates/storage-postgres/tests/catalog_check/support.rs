@@ -453,7 +453,7 @@ impl Deployment {
             .expect("set a status");
     }
 
-    /// GetItem on every item written by `create_table_with_indexes`, and the
+    /// `GetItem` on every item written by `create_table_with_indexes`, and the
     /// row count of each index relation.
     pub(crate) async fn assert_data_intact(&self, key_info: &TableKeyInfo) {
         for n in 0..3 {

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `extenddb catalog-check` run as the binary, on the deployment that the
-//! PostgreSQL storage tests of the check build (`init`'s layout: a catalog
+//! `PostgreSQL` storage tests of the check build (`init`'s layout: a catalog
 //! database and a separate data database). What the command prints and its
 //! exit code for an orphaned relation and a missing one, with and without
 //! `--fix`, and its refusal of a catalog without the data database setting.

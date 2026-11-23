@@ -96,7 +96,7 @@ pub trait DiagnosticsStore: Send + Sync {
     ) -> BoxFuture<'_, DiagResult<String>>;
 
     /// Compare the data relations the backend created with the catalog, for
-    /// `extenddb catalog-check`. On PostgreSQL, `key` opens the data
+    /// `extenddb catalog-check`. On `PostgreSQL`, `key` opens the data
     /// database's connection string row, as for
     /// [`Self::test_data_database_connection`].
     ///

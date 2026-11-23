@@ -86,7 +86,7 @@ pub(crate) const INDEX_LOCK_BUDGET: Duration = Duration::from_secs(30);
 /// with indexes, a GSI add, a status change, the cascade of a
 /// `DeleteTable`) queues behind it, so this, plus the one catalog read taken
 /// once the lock is granted, is the longest a server write waits on the
-/// command. A tenth of PostgreSQL's default `deadlock_timeout` (1 s), and
+/// command. A tenth of the default `deadlock_timeout` of `PostgreSQL` (1 s), and
 /// well under the default `control_plane_delay_seconds` (0.25 s) that a
 /// `CreateTable` held this long eats into. The command holds no other lock
 /// while it waits, so it cannot be part of a deadlock.
@@ -402,7 +402,7 @@ pub(crate) async fn drop_orphaned(
 /// [`DROP_LOCK_TIMEOUT`] for its lock.
 ///
 /// Without `IF EXISTS`, so a relation another session dropped first is told
-/// apart from one dropped here, and PostgreSQL sends no notice to print.
+/// apart from one dropped here, and `PostgreSQL` sends no notice to print.
 async fn drop_relation(data: &PgPool, relation: &str) -> OrphanDrop {
     let dropped = async {
         let mut tx = data.begin().await?;
