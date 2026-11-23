@@ -5,9 +5,10 @@
 //! the request `Parameters`.
 //!
 //! The service reads a PartiQL number the way a Java `BigDecimal` reads a
-//! string, then applies the item number rules to the result. Two consequences
-//! differ from the classic data-plane number check (`validation::number`),
-//! which is why this module exists instead of reusing it (measured 2026-11-02):
+//! string, then applies the item number rules to the result. Three
+//! consequences differ from the classic data-plane number check
+//! (`validation::number`), which is why this module exists instead of reusing
+//! it (measured 2026-11-02, the third on 2026-11-11 and 2026-11-23):
 //!
 //! - A number whose exponent does not fit a 32-bit integer, or whose scale
 //!   (digits after the point less the exponent) does not, cannot be converted
@@ -18,6 +19,9 @@
 //! - The magnitude check works on precision minus scale in 32-bit arithmetic,
 //!   which wraps: `1e2147483647` converts and is then reported as an
 //!   underflow, not an overflow.
+//! - The magnitude range is checked before the 38-digit limit: forty digits
+//!   with the exponent 200 are an overflow, where the classic check reports
+//!   the digit count.
 //!
 //! A literal that converts but breaks a number rule gets the rule's message
 //! with the position inside the value appended (`under root`, `under root.x`,
@@ -166,17 +170,14 @@ fn read_exponent(rest: &[u8]) -> Option<i64> {
 ///
 /// # Errors
 ///
-/// Returns the first rule the text breaks: it cannot be converted, then more
-/// than 38 significant digits, then the magnitude range.
+/// Returns the first rule the text breaks: it cannot be converted, then the
+/// magnitude range, then more than 38 significant digits.
 pub fn check_number(text: &str) -> Result<(), NumberProblem> {
     let decimal = read_decimal(text).ok_or(NumberProblem::Unconvertible)?;
     let significant = decimal.digits.trim_start_matches('0');
     if significant.is_empty() {
         // Zero, whatever its scale.
         return Ok(());
-    }
-    if significant.trim_end_matches('0').len() > MAX_SIGNIFICANT_DIGITS {
-        return Err(NumberProblem::TooManyDigits);
     }
     // Precision (digits from the first non-zero one) minus scale, which the
     // service computes in 32-bit arithmetic. Past `i32::MAX` it wraps to a
@@ -191,6 +192,9 @@ pub fn check_number(text: &str) -> Result<(), NumberProblem> {
     }
     if magnitude < MIN_MAGNITUDE {
         return Err(NumberProblem::Underflow);
+    }
+    if significant.trim_end_matches('0').len() > MAX_SIGNIFICANT_DIGITS {
+        return Err(NumberProblem::TooManyDigits);
     }
     Ok(())
 }
