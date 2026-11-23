@@ -275,8 +275,8 @@ def check(copy: Path) -> list[str]:
             f"the clippy step failed in the copy before any plant (exit status {code}):\n"
             + ("\n".join(errors) or stderr)
         ]
-    warned = config_warnings(messages, copy).values()
-    problems += [f"the clippy step warned about {CONFIG_REL}:\n{text}" for text in warned]
+    first = config_warnings(messages, copy)
+    problems += [f"the clippy step warned about {CONFIG_REL}:\n{text}" for text in first.values()]
 
     expected = {}
     for rel, find, lines in PLANTS:
@@ -292,24 +292,24 @@ def check(copy: Path) -> list[str]:
     code, messages, _ = run_clippy(copy, target_dir, "--keep-going")
     if code == 0:
         problems.append("the clippy step passed in the copy with the plants")
-    reported = {
-        location(span, copy): message["message"]
-        for message in messages
-        if message["level"] == "error"
-        for span in message.get("spans", [])
-        if span.get("is_primary")
-    }
+    reported = {}
+    for message in messages:
+        for span in message.get("spans", []):
+            if span.get("is_primary"):
+                where = location(span, copy)
+                reported.setdefault(where, []).append(f"{message['level']}: {message['message']}")
     for where, path in expected.items():
-        if reported.get(where) != f"use of a disallowed method `{path}`":
-            got = reported.get(where, "no error there")
+        if f"error: use of a disallowed method `{path}`" not in reported.get(where, []):
+            got = "; ".join(reported.get(where, ["nothing reported there"]))
             problems.append(f"the clippy step did not refuse the plant at {where}, {path} ({got})")
     warned = config_warnings(messages, copy)
     if not any(MISSPELT in text for text in warned):
         problems.append(f"the clippy step did not warn about the control entry {MISSPELT}")
+    # A warning the first run printed is reported once, above.
     problems += [
         f"the clippy step warned about {CONFIG_REL}:\n{rendered}"
         for text, rendered in warned.items()
-        if MISSPELT not in text
+        if MISSPELT not in text and text not in first
     ]
     if not problems:
         print(f"plants: the clippy step passed without them and refused all {len(expected)}")
