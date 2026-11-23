@@ -493,11 +493,11 @@ fn check_references(tokens: &[Token], maps: &ExpressionMaps) -> Result<(), Dynam
 /// sk = :b` with `:n` a number answers this ahead of the one-condition-per-key
 /// message.
 fn check_begins_with_operands(
-    clauses: &[RawClause],
+    clauses: &[Clause],
     maps: &ExpressionMaps,
 ) -> Result<(), DynamoDbError> {
     for clause in clauses {
-        if let RawClause::BeginsWith(_, Expr::Placeholder(placeholder)) = clause
+        if let Clause::Supported(RawClause::BeginsWith(_, Expr::Placeholder(placeholder))) = clause
             && let Some(value) = maps.values.get(placeholder)
             && !matches!(value, AttributeValue::S(_) | AttributeValue::B(_))
         {
@@ -519,7 +519,7 @@ fn check_begins_with_operands(
 /// partition key and on the sort key alike, whatever the operators are
 /// (measured 2026-10-24, and 2026-11-11 for `<>` and `contains`).
 fn reject_duplicate_key_attrs(
-    clauses: &[RawClause],
+    clauses: &[Clause],
     names: &std::collections::HashMap<String, String>,
 ) -> Result<(), DynamoDbError> {
     let mut seen: Vec<&str> = Vec::with_capacity(clauses.len());
@@ -655,8 +655,8 @@ pub fn parse_key_condition_with_maps(
 /// Read the parsed clauses as a partition key condition and sort key
 /// conditions, after refusing the first clause whose operator a key condition
 /// does not support.
-fn classify_clauses(mut clauses: Vec<RawClause>) -> Result<KeyCondition, DynamoDbError> {
-    refuse_unsupported_clauses(&clauses)?;
+fn classify_clauses(clauses: Vec<Clause>) -> Result<KeyCondition, DynamoDbError> {
+    let mut clauses = refuse_unsupported_clauses(clauses)?;
     match clauses.len() {
         1 => classify_single(clauses.remove(0)),
         2 => classify_pair(clauses.remove(0), clauses.remove(0)),
@@ -665,15 +665,15 @@ fn classify_clauses(mut clauses: Vec<RawClause>) -> Result<KeyCondition, DynamoD
 }
 
 /// Refuse the first clause whose operator a key condition does not support,
-/// with its message.
-fn refuse_unsupported_clauses(clauses: &[RawClause]) -> Result<(), DynamoDbError> {
-    match clauses.iter().find_map(|clause| match clause {
-        RawClause::Unsupported(_, message) => Some(*message),
-        _ => None,
-    }) {
-        Some(message) => Err(validation_err(message)),
-        None => Ok(()),
-    }
+/// with its message, or return the clauses.
+fn refuse_unsupported_clauses(clauses: Vec<Clause>) -> Result<Vec<RawClause>, DynamoDbError> {
+    clauses
+        .into_iter()
+        .map(|clause| match clause {
+            Clause::Supported(raw) => Ok(raw),
+            Clause::Unsupported(_, message) => Err(validation_err(message)),
+        })
+        .collect()
 }
 
 /// The attribute path and single value operand of each clause of a
@@ -696,9 +696,7 @@ fn refuse_unsupported_clauses(clauses: &[RawClause]) -> Result<(), DynamoDbError
 pub fn key_condition_clause_operands(
     tokens: &[Token],
 ) -> Result<Vec<KeyClauseOperand>, DynamoDbError> {
-    let clauses = parse_clauses(tokens)?;
-    refuse_unsupported_clauses(&clauses)?;
-    Ok(clauses
+    Ok(refuse_unsupported_clauses(parse_clauses(tokens)?)?
         .into_iter()
         .filter_map(|clause| match clause {
             RawClause::Eq(path, value) => Some(KeyClauseOperand {
@@ -713,7 +711,7 @@ pub fn key_condition_clause_operands(
                     equality: false,
                 })
             }
-            RawClause::Between(..) | RawClause::Unsupported(..) => None,
+            RawClause::Between(..) => None,
         })
         .collect())
 }
@@ -732,7 +730,7 @@ pub struct KeyClauseOperand {
 
 /// Parse a `KeyConditionExpression` token stream into its AND-ed clauses,
 /// before any of them is read as the partition or the sort key condition.
-fn parse_clauses(tokens: &[Token]) -> Result<Vec<RawClause>, DynamoDbError> {
+fn parse_clauses(tokens: &[Token]) -> Result<Vec<Clause>, DynamoDbError> {
     parser_common::check_redundant_parens(tokens)
         .map_err(|body| validation_err(&format!("Invalid KeyConditionExpression: {body}")))?;
 
@@ -779,13 +777,15 @@ fn parse_clauses(tokens: &[Token]) -> Result<Vec<RawClause>, DynamoDbError> {
 }
 
 /// The attribute-side path of a raw clause.
-fn raw_clause_path(clause: &RawClause) -> &[PathElement] {
+fn raw_clause_path(clause: &Clause) -> &[PathElement] {
     match clause {
-        RawClause::Eq(path, _)
-        | RawClause::Compare(path, _, _)
-        | RawClause::Between(path, _, _)
-        | RawClause::BeginsWith(path, _)
-        | RawClause::Unsupported(path, _) => path,
+        Clause::Supported(
+            RawClause::Eq(path, _)
+            | RawClause::Compare(path, _, _)
+            | RawClause::Between(path, _, _)
+            | RawClause::BeginsWith(path, _),
+        )
+        | Clause::Unsupported(path, _) => path,
     }
 }
 
@@ -809,10 +809,14 @@ enum RawClause {
     Compare(Vec<PathElement>, CompareOp, Expr),
     Between(Vec<PathElement>, Expr, Expr),
     BeginsWith(Vec<PathElement>, Expr),
-    /// A clause whose operator a key condition does not support, with the
-    /// message it is refused with. It stays a clause until a second
-    /// condition on its attribute has been looked for, which the service
-    /// reports first.
+}
+
+/// A parsed clause. A clause whose operator a key condition does not support
+/// keeps its path and the message it is refused with until a second
+/// condition on its attribute has been looked for, which the service reports
+/// first.
+enum Clause {
+    Supported(RawClause),
     Unsupported(Vec<PathElement>, &'static str),
 }
 
@@ -847,7 +851,7 @@ fn classify_pair(a: RawClause, b: RawClause) -> Result<KeyCondition, DynamoDbErr
                 pk_path,
                 pk_value,
                 extra_pk_conditions: Vec::new(),
-                sk_condition: Some(raw_to_sk(sk)?),
+                sk_condition: Some(raw_to_sk(sk)),
                 extra_sk_conditions: Vec::new(),
             })
         }
@@ -877,7 +881,7 @@ fn classify_multi(clauses: Vec<RawClause>) -> Result<KeyCondition, DynamoDbError
                         "Invalid KeyConditionExpression: at most one non-equality condition is allowed",
                     ));
                 }
-                non_eq = Some(raw_to_sk(other)?);
+                non_eq = Some(raw_to_sk(other));
             }
         }
     }
@@ -913,10 +917,8 @@ fn classify_multi(clauses: Vec<RawClause>) -> Result<KeyCondition, DynamoDbError
     })
 }
 
-/// The sort key condition a clause becomes. [`classify_clauses`] refuses an
-/// unsupported clause before any clause reaches this.
-fn raw_to_sk(clause: RawClause) -> Result<SortKeyCondition, DynamoDbError> {
-    Ok(match clause {
+fn raw_to_sk(clause: RawClause) -> SortKeyCondition {
+    match clause {
         RawClause::Eq(path, value) => SortKeyCondition::Compare {
             path,
             op: CompareOp::Eq,
@@ -925,11 +927,10 @@ fn raw_to_sk(clause: RawClause) -> Result<SortKeyCondition, DynamoDbError> {
         RawClause::Compare(path, op, value) => SortKeyCondition::Compare { path, op, value },
         RawClause::Between(path, low, high) => SortKeyCondition::Between { path, low, high },
         RawClause::BeginsWith(path, prefix) => SortKeyCondition::BeginsWith { path, prefix },
-        RawClause::Unsupported(_, message) => return Err(validation_err(message)),
-    })
+    }
 }
 
-fn parse_key_clause(tokens: &[Token], pos: &mut usize) -> Result<RawClause, DynamoDbError> {
+fn parse_key_clause(tokens: &[Token], pos: &mut usize) -> Result<Clause, DynamoDbError> {
     if *pos >= tokens.len() {
         return Err(validation_err(
             "Invalid KeyConditionExpression: unexpected end of expression",
@@ -952,7 +953,7 @@ fn parse_key_clause(tokens: &[Token], pos: &mut usize) -> Result<RawClause, Dyna
     parse_key_clause_inner(tokens, pos)
 }
 
-fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause, DynamoDbError> {
+fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<Clause, DynamoDbError> {
     if *pos >= tokens.len() {
         return Err(validation_err(
             "Invalid KeyConditionExpression: unexpected end of expression",
@@ -971,7 +972,7 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
         parser_common::expect_token(tokens, pos, &Token::Comma, ",", "KeyConditionExpression")?;
         let prefix = parse_key_value(tokens, pos)?;
         parser_common::expect_token(tokens, pos, &Token::RParen, ")", "KeyConditionExpression")?;
-        return Ok(RawClause::BeginsWith(path, prefix));
+        return Ok(Clause::Supported(RawClause::BeginsWith(path, prefix)));
     }
 
     // contains(name, :val), with one top-level attribute and one value, is
@@ -992,7 +993,7 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
             return Err(validation_err(EXPECTED_COMPARISON_OPERATOR));
         };
         *pos += 6;
-        return Ok(RawClause::Unsupported(path, EXPECTED_COMPARISON_OPERATOR));
+        return Ok(Clause::Unsupported(path, EXPECTED_COMPARISON_OPERATOR));
     }
 
     // path op :value | :value op path | path BETWEEN :lo AND :hi
@@ -1016,7 +1017,7 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
             // other `<>` clause is refused here, as before.
             if op == CompareOp::Ne {
                 return match parse_key_operand_path(tokens, pos) {
-                    Ok(path) if path.len() == 1 => Ok(RawClause::Unsupported(path, NE_UNSUPPORTED)),
+                    Ok(path) if path.len() == 1 => Ok(Clause::Unsupported(path, NE_UNSUPPORTED)),
                     _ => Err(validation_err(NE_UNSUPPORTED)),
                 };
             }
@@ -1026,9 +1027,9 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
             let op = reverse_comparator(op);
 
             return if op == CompareOp::Eq {
-                Ok(RawClause::Eq(path, value))
+                Ok(Clause::Supported(RawClause::Eq(path, value)))
             } else {
-                Ok(RawClause::Compare(path, op, value))
+                Ok(Clause::Supported(RawClause::Compare(path, op, value)))
             };
         }
     };
@@ -1039,7 +1040,7 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
         let low = parse_key_value(tokens, pos)?;
         parser_common::expect_token(tokens, pos, &Token::And, "AND", "KeyConditionExpression")?;
         let high = parse_key_value(tokens, pos)?;
-        return Ok(RawClause::Between(path, low, high));
+        return Ok(Clause::Supported(RawClause::Between(path, low, high)));
     }
 
     // Comparison operator
@@ -1054,7 +1055,7 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
         return match tokens.get(*pos) {
             Some(Token::Placeholder(_)) if path.len() == 1 => {
                 *pos += 1;
-                Ok(RawClause::Unsupported(path, NE_UNSUPPORTED))
+                Ok(Clause::Unsupported(path, NE_UNSUPPORTED))
             }
             _ => Err(validation_err(NE_UNSUPPORTED)),
         };
@@ -1063,9 +1064,9 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
     let value = parse_key_value(tokens, pos)?;
 
     if op == CompareOp::Eq {
-        Ok(RawClause::Eq(path, value))
+        Ok(Clause::Supported(RawClause::Eq(path, value)))
     } else {
-        Ok(RawClause::Compare(path, op, value))
+        Ok(Clause::Supported(RawClause::Compare(path, op, value)))
     }
 }
 
