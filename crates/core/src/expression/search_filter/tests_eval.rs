@@ -4,12 +4,16 @@
 //! Which items a search condition matches.
 //!
 //! Evaluation uses the FilterExpression semantics: a comparison with a
-//! missing attribute is false except `<>`, which is true; a value of another
-//! type than the attribute's compares unequal. Numbers compare as the nearest
-//! binary64 value of each side, so `1E2` equals `100` and two 38-digit values
-//! that share a binary64 value are equal. The number cases were measured
-//! against the live service (eu-north-1, 2026-11-21, each request twice); the
-//! others are not yet measured for SearchVectors.
+//! missing attribute is false except `<>`, which is true. Numbers compare as
+//! the nearest binary64 value of each side, so `1E2` equals `100` and two
+//! 38-digit values that share a binary64 value are equal. An item cannot hold
+//! a search schema attribute of another type than the schema declares: the
+//! service refuses that PutItem with "Attribute 'Price' type mismatch".
+//!
+//! Every case was measured against the live service in eu-north-1, on a table
+//! with these items, each request twice with the same answer: on 2026-11-19
+//! and 2026-11-21, and `NOT (Category = :a)` and
+//! `(Price BETWEEN :p5 AND :p10 OR Price > :p100)` on 2026-11-23.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -44,8 +48,6 @@ fn items() -> Vec<Item> {
             None,
         ),
         ("i10", "US", Some("b"), Some(n("0.1")), None),
-        // a Price of another type than the schema declares
-        ("i11", "US", Some("c"), Some(s("ten")), None),
     ];
     rows.into_iter()
         .map(|(id, country, category, price, tag)| {
@@ -146,7 +148,7 @@ fn each_comparator_on_a_number() {
         ),
         (
             h("NOT Price BETWEEN :p5 AND :p10"),
-            vec!["i3", "i4", "i5", "i6", "i7", "i9", "i10", "i11"],
+            vec!["i3", "i4", "i5", "i6", "i7", "i9", "i10"],
         ),
         (h("Price IN (:p5, :p10)"), vec!["i1", "i2"]),
     ];
@@ -157,23 +159,22 @@ fn each_comparator_on_a_number() {
     assert_matches(&refs);
 }
 
-/// Unmeasured, needs live confirmation: a missing attribute under `<>` and
-/// under NOT. FilterExpression reads `<>` with a missing attribute as true,
-/// and NOT of a false comparison as true.
+/// A missing attribute under `<>` and under NOT. FilterExpression reads `<>`
+/// with a missing attribute as true, and NOT of a false comparison as true.
 #[test]
 fn a_missing_attribute_under_not_equal_and_not() {
     let cases = [
         (
             h("Price <> :p10"),
-            vec!["i1", "i3", "i4", "i5", "i6", "i7", "i9", "i10", "i11"],
+            vec!["i1", "i3", "i4", "i5", "i6", "i7", "i9", "i10"],
         ),
         (
             h("NOT (Price = :p10)"),
-            vec!["i1", "i3", "i4", "i5", "i6", "i7", "i9", "i10", "i11"],
+            vec!["i1", "i3", "i4", "i5", "i6", "i7", "i9", "i10"],
         ),
         (
             h("Category <> :a"),
-            vec!["i2", "i3", "i5", "i7", "i9", "i10", "i11"],
+            vec!["i2", "i3", "i5", "i7", "i9", "i10"],
         ),
         (
             h("Price > :p0"),
@@ -182,7 +183,7 @@ fn a_missing_attribute_under_not_equal_and_not() {
         (h("attribute_not_exists(Price)"), vec!["i4"]),
         (
             h("attribute_exists(Price)"),
-            vec!["i1", "i2", "i3", "i5", "i6", "i7", "i9", "i10", "i11"],
+            vec!["i1", "i2", "i3", "i5", "i6", "i7", "i9", "i10"],
         ),
     ];
     let refs: Vec<(&str, &[&str])> = cases
@@ -192,8 +193,7 @@ fn a_missing_attribute_under_not_equal_and_not() {
     assert_matches(&refs);
 }
 
-/// Unmeasured, needs live confirmation: `1E2` against `100`, and 38-digit
-/// values.
+/// `1E2` against `100`, and 38-digit values.
 #[test]
 fn numbers_compare_as_binary64() {
     let cases = [
@@ -285,16 +285,6 @@ fn a_last_digit_difference_counts_only_beyond_binary64() {
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
-/// Unmeasured, needs live confirmation: an item whose attribute has another
-/// type than the schema declares matches no ordering and no equality, and
-/// does match `<>`.
-#[test]
-fn a_stored_value_of_another_type() {
-    assert!(!matching(&h("Price >= :p0")).contains(&"i11".to_owned()));
-    assert!(!matching(&h("Price = :p0")).contains(&"i11".to_owned()));
-    assert!(matching(&h("Price <> :p0")).contains(&"i11".to_owned()));
-}
-
 #[test]
 fn strings_binaries_and_logic() {
     let cases = [
@@ -302,7 +292,7 @@ fn strings_binaries_and_logic() {
         (h("Tag = :t1"), vec!["i1"]),
         (
             h("Tag <> :t1"),
-            vec!["i2", "i3", "i4", "i5", "i6", "i7", "i9", "i10", "i11"],
+            vec!["i2", "i3", "i4", "i5", "i6", "i7", "i9", "i10"],
         ),
         (
             h("Category IN (:a, :b)"),
@@ -311,7 +301,7 @@ fn strings_binaries_and_logic() {
         (h("(Price = :p5 OR Price = :p10)"), vec!["i1", "i2"]),
         (
             h("NOT (Category = :a)"),
-            vec!["i2", "i3", "i5", "i7", "i9", "i10", "i11"],
+            vec!["i2", "i3", "i5", "i7", "i9", "i10"],
         ),
         (
             h("(Category = :a OR (Price > :p5 AND NOT Price = :p15))"),
@@ -320,7 +310,7 @@ fn strings_binaries_and_logic() {
         (h("NOT NOT Price = :p5"), vec!["i1"]),
         (
             "Country = :us and (Price = :p5 or not Price = :p10)".to_owned(),
-            vec!["i1", "i3", "i4", "i5", "i6", "i7", "i9", "i10", "i11"],
+            vec!["i1", "i3", "i4", "i5", "i6", "i7", "i9", "i10"],
         ),
         ("Country = :ca AND Price = :p5".to_owned(), vec!["i8"]),
     ];

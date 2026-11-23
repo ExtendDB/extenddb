@@ -5,8 +5,10 @@
 //!
 //! The backend applies the condition to each candidate before ranking, so
 //! `top_k` counts matching items only. The match semantics are the
-//! FilterExpression ones; the cases that turn on a missing attribute or a
-//! number written two ways are not yet measured against the live service.
+//! FilterExpression ones. The two that the cases below turn on, a missing
+//! attribute satisfying `<>` and `1E2` equal to `100`, were measured against
+//! the live service in eu-north-1 on 2026-11-19, each request twice, with the
+//! items of the wire tests.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -202,7 +204,7 @@ async fn the_hash_value_scopes_the_search() {
     );
 }
 
-/// Not yet measured: a missing Price under `<>`, and `1E2` equal to `100`.
+/// A missing Price satisfies `<>`, and `1E2` equals `100`.
 #[tokio::test]
 async fn a_missing_attribute_and_a_number_written_two_ways() {
     let (engine, key_info) = fixture().await;

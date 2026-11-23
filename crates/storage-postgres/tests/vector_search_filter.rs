@@ -7,8 +7,10 @@
 //! The backend reads the rows in score order and keeps the first `top_k`
 //! that satisfy the condition, so `top_k` counts matching items only. Equal
 //! scores are ordered by the base key. The match semantics are the
-//! FilterExpression ones; the cases that turn on a missing attribute or a
-//! number written two ways are not yet measured against the live service.
+//! FilterExpression ones. The two that the cases below turn on, a missing
+//! attribute satisfying `<>` and `1E2` equal to `100`, were measured against
+//! the live service in eu-north-1 on 2026-11-19, each request twice, with the
+//! items of the wire tests.
 //!
 //! The fixture is in `common/vector_filter_fixture.rs`.
 
@@ -64,7 +66,7 @@ async fn conditions_are_evaluated_before_the_top_k_cut() {
             ids_for(f, "Country = :us AND Price >= :p5", 10).await,
             ["n1", "n2", "t2", "n4", "n5"]
         );
-        // not yet measured: a missing Price under <>, and 1E2 equal to 100
+        // a missing Price satisfies <>, and 1E2 equals 100
         assert_eq!(
             ids_for(f, "Country = :us AND Price <> :p10", 10).await,
             ["n1", "n3", "n4", "n5"]

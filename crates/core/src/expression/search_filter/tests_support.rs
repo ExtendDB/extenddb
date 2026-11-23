@@ -1,11 +1,8 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Fixtures shared by the search filter tests.
-//!
-//! None of the expected messages in these tests has been measured against the
-//! live service yet. Each one is a prediction of the service's answer, and a
-//! live run confirms or corrects it.
+//! Fixtures shared by the search filter tests. Each test file states where
+//! its expected answers were measured.
 
 use std::collections::HashMap;
 
