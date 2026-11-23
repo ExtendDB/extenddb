@@ -49,6 +49,18 @@ XFAIL_ON_MONGODB_DEEP_OR = pytest.mark.xfail(
     strict=True,
 )
 
+# ExtendDB serves a KeyConditionExpression whose second clause names an
+# attribute outside the key schema, where the service refuses it. Its
+# one-condition-per-key check covers the key attributes only. This change does
+# not touch that check.
+# TODO: remove this marker once a non-key attribute in a key condition is refused.
+XFAIL_ON_EXTENDDB_NON_KEY_CONDITION = pytest.mark.xfail(
+    not _is_real_dynamodb(),
+    reason="ExtendDB serves a key condition on an attribute outside the key schema",
+    raises=pytest.fail.Exception,
+    strict=True,
+)
+
 
 class TestOperatorCount:
     """More than 300 operators is refused with the full count."""
@@ -192,10 +204,25 @@ class TestOperatorCount:
 
     def test_key_condition_count_precedes_the_key_grammar(self, dynamodb_client, table):
         # [a62] `pk = :v OR` + 150 terms answers the count, not the operator
-        # refusal. The service also runs the count ahead of its
-        # one-condition-per-key check (b05, a60); ExtendDB has no such check.
+        # refusal. [a60] `pk = :v AND` + 150 terms on one attribute answers
+        # the count ahead of the one-condition-per-key check, on the service
+        # and on ExtendDB (measured 2026-11-23).
         msg = _validation(query(dynamodb_client, table, "pk = :v OR " + chain("#v = :v", 150, " AND ")))
         assert msg == f"Invalid KeyConditionExpression: {TOO_MANY}301"
+        msg = _validation(query(dynamodb_client, table, "pk = :v AND " + chain("#v = :v", 150, " AND ")))
+        assert msg == f"Invalid KeyConditionExpression: {TOO_MANY}301"
+
+    @XFAIL_ON_EXTENDDB_NON_KEY_CONDITION
+    def test_one_condition_per_key_under_the_cap(self, dynamodb_client, table):
+        # [b05] `pk = :v AND` + 10 terms on one attribute, 21 operators
+        # (measured 2026-11-23): under the cap, the service refuses the
+        # repeated attribute, whether or not it is a key, before the table
+        # lookup.
+        msg = _validation(query(dynamodb_client, table, "pk = :v AND " + chain("#v = :v", 10, " AND ")))
+        assert msg == (
+            "Invalid KeyConditionExpression: KeyConditionExpressions must only "
+            "contain one condition per key"
+        )
 
 
 class TestOperatorCountOrder:
