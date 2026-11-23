@@ -159,7 +159,7 @@ fn bucket_memory_follows_the_requests_up_to_the_ring_length() {
         .map(|i| format!("{:012}", 100_000_000_000u64 + i))
         .collect();
     let every_second: Vec<u64> = (0..2 * DAY).collect();
-    let cases: [MemoryCase; 5] = [
+    let cases: [MemoryCase; 6] = [
         // One request a day holds one bucket per ring.
         (
             "1,000 accounts x 40 operations, one request",
@@ -171,6 +171,16 @@ fn bucket_memory_follows_the_requests_up_to_the_ring_length() {
         ),
         // Six seconds of one minute: six fine buckets in a capacity of 8, one coarse.
         ("six consecutive seconds", 1, 1, &[0, 1, 2, 3, 4, 5], 7, 9),
+        // A request a ring later drops all six fine buckets. The fine deque
+        // keeps its capacity of 8.
+        (
+            "six seconds, then one request a ring later",
+            1,
+            1,
+            &[0, 1, 2, 3, 4, 5, DAY],
+            2,
+            9,
+        ),
         // Five requests an hour apart: each drops the fine bucket before it;
         // five coarse buckets in a capacity of 8.
         (
