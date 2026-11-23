@@ -3,12 +3,23 @@
 
 //! The `SearchConditionExpression` of a `SearchVectors` request: the grammar
 //! that parses it, and the scope it hands the backend.
+//!
+//! A condition that the extended grammar parses still goes to the backend as
+//! equality pairs when that gives the same results, so the backend can apply
+//! it in its own query. The service compares inline-filter strings and binary
+//! values exactly and inline-filter numbers as binary64, and the equality
+//! pairs compare every value exactly. So the pairs carry a condition of
+//! equalities on distinct attributes when no inline-filter value is a
+//! number; any other condition goes to the backend as an item filter.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::expression::{SearchCondition, validate_conditions_against_search_schema};
+use extenddb_core::expression::{
+    SearchCondition, validate_conditions_against_search_schema,
+    validate_search_condition_expression,
+};
 use extenddb_core::types::{
     AttributeDefinition, AttributeValue, SearchSchemaElement, SearchSchemaElementType,
 };
@@ -17,6 +28,9 @@ use extenddb_storage::{StorageEngine, VectorItemFilter, VectorSearchEngine};
 use crate::search_vectors_extended::Extended;
 
 /// A search condition parsed by one of the two grammars.
+///
+/// With the extended grammar, `conditions` holds the equality pairs of the
+/// same condition when the equality-only grammar also accepts it.
 pub(crate) struct Parsed {
     extended: Option<Extended>,
     conditions: Vec<SearchCondition>,
@@ -56,7 +70,9 @@ pub(crate) async fn parse(
     )
     .await?;
     let conditions = match expr {
-        Some(_) if extended.is_some() => Vec::new(),
+        Some(expr) if extended.is_some() => {
+            validate_search_condition_expression(expr, names, values).unwrap_or_default()
+        }
         Some(expr) => {
             crate::search_vectors_params::equality_conditions(expr, names, values, projection)?
         }
@@ -85,7 +101,10 @@ pub(crate) fn resolve<'a>(
                 search_schema,
                 attribute_definitions,
             )?;
-            (hash_key, Vec::new(), Some(item_filter))
+            match equality_pairs(&parsed.conditions, search_schema) {
+                Some(filters) => (hash_key, filters, None),
+                None => (hash_key, Vec::new(), Some(item_filter)),
+            }
         }
         None => {
             let (hash_key, filters) =
@@ -93,6 +112,38 @@ pub(crate) fn resolve<'a>(
             (hash_key, filters, None)
         }
     })
+}
+
+/// The inline-filter equalities of an extended-grammar condition that the
+/// equality pairs express with the same results, or `None` when the backend
+/// needs the item filter. The HASH equality selects the partition and is not
+/// among them.
+fn equality_pairs<'a>(
+    conditions: &'a [SearchCondition],
+    search_schema: Option<&[SearchSchemaElement]>,
+) -> Option<Vec<(&'a str, &'a AttributeValue)>> {
+    let hash_attr = search_schema
+        .unwrap_or_default()
+        .iter()
+        .find(|e| e.element_type == SearchSchemaElementType::Hash)
+        .map(|e| e.attribute_name.as_str());
+    let mut filters: Vec<(&str, &AttributeValue)> = Vec::with_capacity(conditions.len());
+    for (i, c) in conditions.iter().enumerate() {
+        if conditions[..i]
+            .iter()
+            .any(|seen| seen.attribute_name == c.attribute_name)
+        {
+            return None;
+        }
+        if Some(c.attribute_name.as_str()) == hash_attr {
+            continue;
+        }
+        if !matches!(c.value, AttributeValue::S(_) | AttributeValue::B(_)) {
+            return None;
+        }
+        filters.push((c.attribute_name.as_str(), &c.value));
+    }
+    (!conditions.is_empty()).then_some(filters)
 }
 
 /// Resolved search scope: the partition-scoping HASH equality, if the index
@@ -181,3 +232,7 @@ pub(crate) fn resolve_search_scope<'a>(
 
     Ok((hash_key, filters))
 }
+
+#[cfg(all(test, feature = "search-inequality-filters"))]
+#[path = "search_vectors_condition_tests.rs"]
+mod tests;
