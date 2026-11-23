@@ -127,8 +127,9 @@ async fn rows_in_every_status_count_as_live() {
 /// A row being created or deleted is not expected to have its relations:
 /// a catalog-first path commits the row before it creates them, and a drop
 /// may run before the row goes. With the relations gone, a table or index in
-/// CREATING or DELETING is not reported missing; back in ACTIVE, the same
-/// rows are.
+/// CREATING or DELETING is not reported missing, and neither is an ACTIVE
+/// index of a table in CREATING or DELETING; back in ACTIVE, the same rows
+/// are.
 #[tokio::test]
 async fn rows_being_created_or_deleted_are_not_reported_missing() {
     let test = "rows_being_created_or_deleted_are_not_reported_missing";
@@ -176,6 +177,13 @@ async fn rows_being_created_or_deleted_are_not_reported_missing() {
         );
     }
 
+    // CreateTable inserts the index rows ACTIVE under a table row that can
+    // be CREATING, and DeleteTable leaves them ACTIVE under a DELETING one,
+    // so from here the table's status alone keeps the index relations from
+    // being reported missing.
+    d.set_status(index_status, "ACTIVE").await;
+    d.set_status(vector_status, "ACTIVE").await;
+
     // Then the base relation, with the table DELETING.
     let base: Vec<String> = all
         .iter()
@@ -201,8 +209,6 @@ async fn rows_being_created_or_deleted_are_not_reported_missing() {
 
     // Settled again, every relation is missing.
     d.set_status(table_status, "ACTIVE").await;
-    d.set_status(index_status, "ACTIVE").await;
-    d.set_status(vector_status, "ACTIVE").await;
     let check = d
         .diagnostics
         .check_storage_relations(&KeySource::CatalogKey)
