@@ -355,6 +355,50 @@ class TestRefusals:
             P + 'Syntax error; token: "<EOF>", near: "= "',
         )
 
+    def test_between_bounds_compare_exactly(self, grammar_table):
+        """The bound check compares the two numbers exactly, and the message
+        shows each in plain decimal. Each out-of-order pair below is one
+        binary64 value. Measured on 2026-11-23, two requests each."""
+
+        def between(lo: str, hi: str) -> requests.Response:
+            return _raw(
+                grammar_table,
+                SearchConditionExpression=H + "Price BETWEEN :lo AND :hi",
+                ExpressionAttributeValues={
+                    ":us": {"S": "US"}, ":lo": {"N": lo}, ":hi": {"N": hi}
+                },
+            )
+
+        e100 = "10000000000000001" + "0" * 84
+        out_of_order = [
+            ("9007199254740993", "9007199254740992", None, None),
+            (
+                "99999999999999999999999999999999999999",
+                "99999999999999999999999999999999999998",
+                None,
+                None,
+            ),
+            ("1.0000000000000001E+100", "1E+100", e100, "1" + "0" * 100),
+            ("0.10000000000000001", "0.1", None, None),
+            (
+                "1.0000000000000001E-10",
+                "1E-10",
+                "0.00000000010000000000000001",
+                "0.0000000001",
+            ),
+            ("-10000000000000000", "-10000000000000001", None, None),
+        ]
+        for lo, hi, shown_lo, shown_hi in out_of_order:
+            _refused(
+                between(lo, hi),
+                P + "The BETWEEN operator requires upper bound to be greater than or "
+                f"equal to lower bound; lower bound operand: AttributeValue: "
+                f"{{N:{shown_lo or lo}}}, upper bound operand: AttributeValue: "
+                f"{{N:{shown_hi or hi}}}",
+            )
+        assert _ids(between("1.0", "1")) == set()
+        assert _ids(between("9007199254740992", "9007199254740993")) == set()
+
     def test_schema_checks_in_written_order(self, grammar_table):
         _refused(_search(grammar_table, H + "Color = :a AND Category > :a"), _not_in_schema("Color"))
         _refused(
