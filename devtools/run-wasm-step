@@ -229,10 +229,13 @@ case "$step" in
 
     clippy)
         # Clippy for wasm32 with the lists of devtools/wasm-clippy/clippy.toml,
-        # whose header says what they refuse and why; the documentation of
-        # devtools/check-wasm-clippy-guard lists what this step does not see.
-        # Without --no-deps, clippy lints every workspace crate the adapter
-        # compiles for wasm32 as well as the adapter. --release lints the
+        # whose header says what they refuse and why, and what this step does
+        # not see. Without --no-deps, clippy lints every workspace crate the
+        # adapter compiles for wasm32 as well as the adapter, and also, with
+        # the same lists, the build scripts of those crates and the workspace's
+        # procedural-macro crates they use, which run on the host: a listed
+        # call there (a build script that reads std::time::SystemTime::now)
+        # fails the step unless an allow covers it. --release lints the
         # profile the module ships in: the README and the corpus step build it
         # with --release.
         # CLIPPY_CONF_DIR is set for this cargo only, so other clippy runs

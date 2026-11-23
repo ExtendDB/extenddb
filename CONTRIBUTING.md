@@ -201,18 +201,12 @@ SQLite, PostgreSQL, Cassandra and MongoDB migrate through this framework.
    transaction. Put it in its own module, `src/migrations/mNNNN_<name>.rs` in
    the backend's crate, and declare the module with `#[rustfmt::skip]` and
    `#[allow(clippy::all, deprecated)]`, so that neither tool can require an
-   edit to a released body. In a crate that the WebAssembly build compiles
-   (`devtools/run-wasm-step guard` prints them, after "crates the wasm build
-   compiles:"), a call that a body makes to a method listed in
-   `devtools/wasm-clippy/clippy.toml` needs, before the body is released,
-   `#[allow(clippy::disallowed_methods, reason = "...")]` on the function or
-   the statement that holds it, inside the module's file, as in any other
-   code, with a reason that says why no wasm32 database reaches the call.
-   (The WebAssembly build opens only in-memory databases, and each runs every
-   migration when it opens.) The guard accepts no allow on the `mod` line, so
-   it refuses a call that a released body makes to a method listed later;
-   such a method cannot be listed without a change to the guard. The module
-   defines:
+   edit to a released body. That allow also switches off, for the body, the
+   lists of calls in `devtools/wasm-clippy/clippy.toml` that the WebAssembly
+   clippy step refuses (the file's header says what that step does not see).
+   The WebAssembly build opens only in-memory databases, and each runs every
+   migration when it opens, so in a crate of that build, review checks that a
+   body calls none of the methods listed there. The module defines:
 
    - `SOURCE`, the module's own text through `include_str!`, followed by the
      text of any SQL file the body executes. The checksum test pins its

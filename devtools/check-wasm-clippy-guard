@@ -1,141 +1,47 @@
 #!/usr/bin/env python3
 # Copyright 2026 ExtendDB contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Check that the wasm32 clippy step refuses what it says it refuses, and that
-the wasm32 AES-GCM stack is built with its zeroize features.
+"""Self-test of the wasm32 clippy step, and a check that the wasm32 AES-GCM
+stack is built with its zeroize features.
 
-The clippy step (`devtools/run-wasm-step clippy`) lints the workspace crates
-the adapter's wasm32 build compiles, in the release profile, with the method
-and type lists of devtools/wasm-clippy/clippy.toml and clippy's
-await_holding_lock and await_holding_refcell_ref lints. Its rule: every call
-to a listed method or use of a listed type that the step lints sits under an
-accepted allow, and the two await lints report no std lock guard or RefCell
-borrow held across an .await. An accepted allow is an outer `#[allow(..)]`
-or `#[expect(..)]` that names clippy::disallowed_methods or
-clippy::disallowed_types in that spelling and has a `reason` holding more
-than whitespace, on a `fn` item, or on a statement after a `{`, `;` or `}`:
-a `let`, or an expression ending in `;` that is not a macro invocation and
-does not start with a block. It covers the code written in that function or
-statement, every call there, but not the items written inside it: each of
-those (a nested function, an impl and its methods) needs its own allow. Of
-the reason, the guard checks only that it is there; whether it says why the
-wasm32 build never runs the calls the allow covers is for review.
-
-The script copies the working tree (the files git tracks or does not ignore,
-uncommitted edits included), adds a crate of its own to the copy, and runs
-the clippy step there twice: as it is (W), and with --force-warn of the four
-lints (F), which reports each of them, as a warning, whatever lint setting
-would switch it off or lower it, in each crate clippy lints. It fails, with
-one line per problem, unless:
-1. each report of F, but those of the probes, is a disallowed call or type
-   that an accepted allow covers as written (where the report points) and
-   that W does not report; and F reports no await-holding lint;
-2. F reports the probe of each clippy.toml entry; clippy.toml parses and
-   holds only the two lists, of tables of exactly a non-empty `path` and
-   `reason` (so clippy's `replacement` is refused), no path twice, a probe
-   per entry and an entry per probe; neither run warns about clippy.toml (an
-   entry that does not resolve only warns, which -D warnings does not raise);
-3. no allow or expect written in a file the build reads, in a cfg_attr too,
-   names one of the two lints in that spelling unless it is accepted (an
-   allow in another form, such as a lint group, a raw identifier or one a
-   macro builds, is not reported, and item 1 refuses the calls under it);
-4. both runs finish (of a run that does not, the guard reports the run's
-   errors and the crates it did not finish linting, and judges nothing
-   else), and in each, every crate's dep-info records the CLIPPY_ARGS and
-   CLIPPY_CONF_DIR the step passed (a build script's cargo::rustc-env can
-   change either for its crate, a forced [env] entry for every crate); the
-   environment sets none of RUSTC, RUSTC_WRAPPER, RUSTC_WORKSPACE_WRAPPER
-   and their CARGO_BUILD_ forms, and each cargo configuration file the
-   copy's runs read parses and sets none of build.rustc, build.rustc-wrapper
-   and build.rustc-workspace-wrapper (another program as the compiler can
-   change its options for one crate);
-5. in the adapter's wasm32 build as `cargo tree -e normal` resolves it, each
-   of aes, aes-gcm, ghash and polyval is there as one copy (one package: one
-   name, version and source), with its zeroize feature on;
-6. the guard can add its crate to the copy, at wasm-clippy-guard (plant):
-   the working tree has nothing there and no package or adapter dependency
-   of that name, no write goes through a symbolic link out of the copy or
-   into a loop, each probe's crate is one package's library, not the
-   adapter's (probe_dependencies), clippy.toml has the line CONTROL_ENTRY
-   goes after, and the copy's Cargo.lock, which `cargo metadata --offline`
-   writes, differs from the tree's only by the crate (lock_problems); a
-   plant finding stops the guard before the first run, each printed once,
-   and so does a control of probe_dependencies or lock_problems that does
-   not give its finding (both are matched there). The step lints the crate,
-   which holds the probes, the controls and BUILD_SCRIPT, as a path
-   dependency of the adapter; no lint level of the tree's crates or
-   manifests reaches it, but rustflags do, and one that denies a lint a
-   probe or control trips stops a run.
-Each check runs, in the same call, on the tree and on controls (the
-constants whose names hold CONTROL, BUILD_SCRIPT and three zeroize graphs),
-and each run's dep-info must be read for every crate of the build. A control
-that does not give its finding, and a finding no control expects, fail the
-guard. No control covers the checks that a command finishes (the two runs,
-cargo tree), the plant checks that read the tree and its copy themselves,
-item 3's refusal of an allow on a function whose end the scan does not find,
-or the two verdicts the controls feed (the stop before the first run and the
-exit status). The environment, cargo-configuration and Cargo.lock checks are
-controlled on their control inputs only: handed an empty mapping or file
-list in place of the tree's environment or configuration files, or the
-tree's Cargo.lock in place of the copy's, the guard would still pass. A
-wrapper that caps one crate's lints is caught all the same.
-rustc reports a force-warned lint under --cap-lints as well, so F reports
-that crate's calls, and item 1 refuses those no accepted allow covers.
-clippy-driver, though, lints no crate whose own compiler options hold
---cap-lints allow and no --force-warn of a clippy lint (the step's options,
-which reach it in CLIPPY_ARGS, do not count): that crate's dep-info then
-records no CLIPPY_CONF_DIR, which item 4 refuses.
-
-What it does not see is listed below. The headless parity corpus
-(`devtools/run-wasm-step corpus`), which runs the module under Node, finds a
-trap in such code only on a path one of its cases takes.
-- code no clippy run compiles: code under a cfg that is false when clippy
-  runs, such as cfg(not(clippy)) (clippy-driver sets cfg(clippy)), or under
-  a cfg a build script sets from what it sees (it sees the CLIPPY_ARGS that
-  cargo clippy sets); code compiled only in another profile, such as a
-  cfg(debug_assertions) branch, which a dev build compiles and a release
-  build does not; and code compiled only under a feature the adapter's
-  wasm32 build does not enable;
-- calls a dependency makes in its own code, which clippy does not lint: moka
-  calls std::time::Instant::now() when a cache is built
-  (src/common/time/clock.rs), so building an extenddb-cache SwrCache with
-  SwrCache::try_new or SwrCache::new traps on wasm32 while the step passes
-  (only the server builds one today);
-- calls clippy.toml does not list;
-- who calls the code an accepted allow covers: the allow covers the calls
-  written there, whatever reaches them, so a new caller of an allowed
-  function, on a path a wasm32 request takes, passes the step and the guard
-  while the allow's reason no longer holds;
-- a std lock guard or a RefCell borrow held inside another value (an Option,
-  a struct, a tuple) across an .await, which the two await lints do not
-  report;
-- a build script or a procedural macro that behaves differently in the copy
-  (its path differs).
-A call that a macro defined elsewhere expands to is reported where the macro
-writes it, so an allow at the invocation does not cover it. A macro can build
-an item from tokens written under an accepted allow, which then covers that
-item; inside a function, rustc's non_local_definitions lint, an error under the
-step's -D warnings, reports such an impl of a type defined outside it.
-
-The runs use the caller's cargo target directory; nothing else of the
-caller's working tree is written. Every command the guard starts runs with
-CARGO_TERM_COLOR=always, and each cargo command whose output it reads with
---color never. The copy is removed on exit, also on SIGINT, SIGTERM and
-SIGHUP, and a clippy run is stopped with it. Needs Python 3.11 or later (for
-tomllib) and git; exit status 0 means every check passed.
+The header of devtools/wasm-clippy/clippy.toml says what the clippy step
+(`devtools/run-wasm-step clippy`) refuses and what it does not see. This
+script fails, with one line per problem, unless:
+1. clippy.toml parses and holds only the disallowed-methods and
+   disallowed-types lists, each entry a table of exactly a non-empty `path`
+   and `reason`, and no path twice in a list;
+2. in a copy of the working tree (the files git tracks or does not ignore,
+   uncommitted edits included), the clippy step passes; and with the PLANTS
+   below written into the copy (tokio::time::sleep, time::sleep after `use
+   tokio::time;` and std::thread::sleep in handle_get_item, and
+   std::time::Instant::now in SqliteEngine::new_in_memory), the step, run
+   again with --keep-going, fails and reports each planted call as an error
+   at its line (an error that alone fails the step);
+3. neither run prints a warning about clippy.toml, but for one control: the
+   second run must warn about MISSPELT, an entry that names no function and
+   that the script adds to the copy's clippy.toml. Clippy warns about an
+   entry that does not resolve only in a crate that loads the entry's crate
+   (its code names it, or a crate it loads depends on it); -D warnings does
+   not turn that warning into an error;
+4. in the adapter's wasm32 build as `cargo tree -e normal` resolves it, each
+   of aes, aes-gcm, ghash and polyval is one package (one name, version and
+   source) with its zeroize feature on (crates/core/Cargo.toml turns it on).
+A plant whose text is not in the copy's file, or is there more than once,
+stops checks 2 and 3 with a line naming the file and the text. The runs use
+the caller's cargo target directory, and nothing of the working tree is
+written. The copy is removed on exit, also on SIGINT, SIGTERM and SIGHUP, and
+a clippy run is stopped with it. Needs Python 3.11 or later (for tomllib) and
+git.
 """
 
 import json
 import os
-import re
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
-from collections import Counter
 from pathlib import Path
-from typing import NamedTuple
 
 try:
     import tomllib
@@ -143,401 +49,86 @@ except ModuleNotFoundError:  # Python 3.10 and older
     sys.exit("error: devtools/check-wasm-clippy-guard needs Python 3.11 or later (for tomllib)")
 
 ROOT = Path(__file__).resolve().parent.parent
-CONF_REL = "devtools/wasm-clippy"
-CONFIG_REL = f"{CONF_REL}/clippy.toml"
+CONFIG_REL = "devtools/wasm-clippy/clippy.toml"
 ADAPTER = "extenddb-wasm-adapter"
 TARGET = "wasm32-unknown-unknown"
-# The clippy step of .github/workflows/wasm.yml, with JSON messages and no
-# colour. Started from the root of a tree, devtools/run-wasm-step points
-# CLIPPY_CONF_DIR at that tree's devtools/wasm-clippy, passes the options after
-# the step's name to cargo, and those after a `--` to clippy after its own.
+LISTS = ("disallowed-methods", "disallowed-types")
+# The clippy step of .github/workflows/wasm.yml with JSON messages; options
+# after the step's name go to cargo.
 CLIPPY = ["devtools/run-wasm-step", "clippy", "--color", "never", "--message-format=json"]
-DISALLOWED = ("clippy::disallowed_methods", "clippy::disallowed_types")
-AWAIT = ("clippy::await_holding_lock", "clippy::await_holding_refcell_ref")
-# The options of the docstring's run F.
-FORCE_WARN = [arg for lint in DISALLOWED + AWAIT for arg in ("--force-warn", lint)]
-# cargo clippy hands clippy-driver the options after `--` in CLIPPY_ARGS, each
-# followed by this separator (clippy 0.1.97), and rustc records the value in the
-# crate's dep-info.
-CLIPPY_ARGS_SEPARATOR = "__CLIPPY_HACKERY__"
-# The guard's crate: its package name, and its directory at the root of the
-# copy, which the working tree must not have.
-GUARD = "wasm-clippy-guard"
-CONFIG_WARNINGS = (
-    "does not refer to a reachable",
-    "expected a function, found",
-    "expected a type, found",
-    "error reading Clippy's configuration file",
-)
-REFUSAL = re.compile(r"use of a disallowed (method|type) `([^`]+)`")
-
-_DUR = "std::time::Duration::ZERO"
-_SET = "set: &mut tokio::task::JoinSet<()>"
-_HANDLE = "h: &tokio::runtime::Handle"
-_RT = "rt: &tokio::runtime::Runtime"
-_LRT = "rt: &tokio::runtime::LocalRuntime"
-_CONDVAR = "c: &std::sync::Condvar, m: &std::sync::Mutex<()>"
-_POOL = "p: &mut futures::executor::LocalPool"
-
-# Disallowed method path -> probe items. Each item goes into its own module of
-# the probe file of the guard's crate, and the run with --force-warn must
-# report it as a disallowed method of that path.
-METHOD_PROBES = {
-    "std::time::Instant::now": [
-        "fn probe() { use std::time; let _ = time::Instant::now(); }",
-    ],
-    "std::time::SystemTime::now": ["fn probe() { let _ = std::time::SystemTime::now(); }"],
-    "std::time::Instant::elapsed": [
-        "fn probe(at: std::time::Instant) { let _ = at.elapsed(); }",
-    ],
-    "std::time::SystemTime::elapsed": [
-        "fn probe() { let _ = std::time::UNIX_EPOCH.elapsed(); }",
-    ],
-    "time::Instant::now": ["fn probe() { let _ = time::Instant::now(); }"],
-    "time::Instant::elapsed": ["fn probe(at: time::Instant) { let _ = at.elapsed(); }"],
-    "std::thread::sleep": [f"fn probe() {{ std::thread::sleep({_DUR}); }}"],
-    "std::thread::sleep_ms": ["fn probe() { std::thread::sleep_ms(0); }"],
-    "std::thread::spawn": ["fn probe() { drop(std::thread::spawn(|| ())); }"],
-    "std::thread::Scope::spawn": [
-        "fn probe() { std::thread::scope(|s| { s.spawn(|| ()); }); }",
-        "fn probe<'s>(s: &'s std::thread::Scope<'s, '_>) { drop(s.spawn(|| ())); }",
-    ],
-    "std::process::id": ["fn probe() { let _ = std::process::id(); }"],
-    "std::process::exit": ["fn probe() -> ! { std::process::exit(0) }"],
-    "std::process::abort": ["fn probe() -> ! { use std::process; process::abort() }"],
-    "std::env::temp_dir": [
-        "fn probe() { let _ = std::env::temp_dir(); }",
-        "fn probe() { use std::env::temp_dir as scratch; let _ = scratch(); }",
-    ],
-    "std::env::vars": ["fn probe() { let _ = std::env::vars().count(); }"],
-    "std::env::vars_os": ["fn probe() { use std::env; let _ = env::vars_os().count(); }"],
-    "std::env::set_var": ['fn probe() { unsafe { std::env::set_var("K", "V") } }'],
-    "std::env::remove_var": ['fn probe() { unsafe { std::env::remove_var("K") } }'],
-    "std::env::split_paths": ['fn probe() { let _ = std::env::split_paths("a").count(); }'],
-    "std::sync::mpsc::channel": [
-        "fn probe() { let (_tx, rx) = std::sync::mpsc::channel::<u8>(); for _ in &rx {} }",
-        "fn probe() { use std::sync::mpsc; drop(mpsc::channel::<u8>()); }",
-    ],
-    "std::sync::mpsc::sync_channel": [
-        "fn probe() { drop(std::sync::mpsc::sync_channel::<u8>(0)); }",
-    ],
-    "std::sync::mpsc::Receiver::recv": [
-        "fn probe(rx: &std::sync::mpsc::Receiver<u8>) { let _ = rx.recv(); }",
-    ],
-    "std::sync::mpsc::Receiver::recv_timeout": [
-        f"fn probe(rx: &std::sync::mpsc::Receiver<u8>) {{ let _ = rx.recv_timeout({_DUR}); }}",
-    ],
-    "std::sync::mpsc::Receiver::iter": [
-        "fn probe(rx: &std::sync::mpsc::Receiver<u8>) { for _ in rx.iter() {} }",
-    ],
-    "std::sync::mpsc::SyncSender::send": [
-        "fn probe(tx: &std::sync::mpsc::SyncSender<u8>) { let _ = tx.send(0); }",
-    ],
-    "std::sync::Condvar::wait": [
-        f"fn probe({_CONDVAR}) {{ drop(c.wait(m.lock().unwrap())); }}",
-    ],
-    "std::sync::Condvar::wait_while": [
-        f"fn probe({_CONDVAR}) {{ drop(c.wait_while(m.lock().unwrap(), |()| false)); }}",
-    ],
-    "std::sync::Condvar::wait_timeout": [
-        f"fn probe({_CONDVAR}) {{ drop(c.wait_timeout(m.lock().unwrap(), {_DUR})); }}",
-    ],
-    "std::sync::Condvar::wait_timeout_ms": [
-        f"fn probe({_CONDVAR}) {{ drop(c.wait_timeout_ms(m.lock().unwrap(), 0)); }}",
-    ],
-    "std::sync::Condvar::wait_timeout_while": [
-        f"fn probe({_CONDVAR}) {{"
-        f" drop(c.wait_timeout_while(m.lock().unwrap(), {_DUR}, |()| false)); }}",
-    ],
-    "std::sync::Barrier::wait": ["fn probe(b: &std::sync::Barrier) { let _ = b.wait(); }"],
-    "std::sync::Once::wait": ["fn probe(o: &std::sync::Once) { o.wait(); }"],
-    "std::sync::Once::wait_force": ["fn probe(o: &std::sync::Once) { o.wait_force(); }"],
-    "std::sync::OnceLock::wait": ["fn probe(l: &std::sync::OnceLock<u8>) { let _ = l.wait(); }"],
-    "tokio::time::sleep": [
-        f"async fn probe() {{ use tokio::time; time::sleep({_DUR}).await; }}",
-    ],
-    "tokio::time::sleep_until": [
-        "async fn probe(at: tokio::time::Instant) { tokio::time::sleep_until(at).await; }",
-    ],
-    "tokio::time::timeout": [
-        f"async fn probe() {{ let _ = tokio::time::timeout({_DUR}, async {{}}).await; }}",
-    ],
-    "tokio::time::timeout_at": [
-        "async fn probe(at: tokio::time::Instant) {"
-        " let _ = tokio::time::timeout_at(at, async {}).await; }",
-    ],
-    "tokio::time::interval": [
-        "fn probe() { drop(tokio::time::interval(std::time::Duration::from_secs(1))); }",
-    ],
-    "tokio::time::interval_at": [
-        "fn probe(at: tokio::time::Instant) {"
-        " drop(tokio::time::interval_at(at, std::time::Duration::from_secs(1))); }",
-    ],
-    "tokio::time::Instant::now": ["fn probe() { let _ = tokio::time::Instant::now(); }"],
-    "tokio::time::Instant::elapsed": [
-        "fn probe(at: tokio::time::Instant) { let _ = at.elapsed(); }",
-    ],
-    "tokio::task::spawn": [
-        "fn probe() { drop(tokio::spawn(async {})); }",
-        "fn probe() { drop(tokio::task::spawn(async {})); }",
-    ],
-    "tokio::task::spawn_blocking": ["fn probe() { drop(tokio::task::spawn_blocking(|| ())); }"],
-    "tokio::task::spawn_local": ["fn probe() { drop(tokio::task::spawn_local(async {})); }"],
-    "tokio::task::id": ["fn probe() { let _ = tokio::task::id(); }"],
-    "tokio::task::JoinSet::spawn": [f"fn probe({_SET}) {{ drop(set.spawn(async {{}})); }}"],
-    "tokio::task::JoinSet::spawn_on": [
-        f"fn probe({_SET}, {_HANDLE}) {{ drop(set.spawn_on(async {{}}, h)); }}",
-    ],
-    "tokio::task::JoinSet::spawn_local": [
-        f"fn probe({_SET}) {{ drop(set.spawn_local(async {{}})); }}",
-    ],
-    "tokio::task::JoinSet::spawn_local_on": [
-        f"fn probe({_SET}, l: &tokio::task::LocalSet) {{"
-        " drop(set.spawn_local_on(async {}, l)); }",
-    ],
-    "tokio::task::JoinSet::spawn_blocking": [
-        f"fn probe({_SET}) {{ drop(set.spawn_blocking(|| ())); }}",
-    ],
-    "tokio::task::JoinSet::spawn_blocking_on": [
-        f"fn probe({_SET}, {_HANDLE}) {{ drop(set.spawn_blocking_on(|| (), h)); }}",
-    ],
-    "tokio::task::LocalSet::spawn_local": [
-        "fn probe(l: &tokio::task::LocalSet) { drop(l.spawn_local(async {})); }",
-    ],
-    "tokio::task::LocalSet::block_on": [
-        f"fn probe(l: &tokio::task::LocalSet, {_RT}) {{ l.block_on(rt, async {{}}); }}",
-    ],
-    "tokio::runtime::Builder::enable_all": [
-        "fn probe() {"
-        " let _ = tokio::runtime::Builder::new_current_thread().enable_all().build(); }",
-    ],
-    "tokio::runtime::Builder::enable_time": [
-        "fn probe() {"
-        " let _ = tokio::runtime::Builder::new_current_thread().enable_time().build(); }",
-    ],
-    "tokio::runtime::LocalRuntime::new": [
-        "fn probe() { let _ = tokio::runtime::LocalRuntime::new(); }",
-    ],
-    "tokio::runtime::Handle::current": [
-        "fn probe() { drop(tokio::runtime::Handle::current()); }",
-        "fn probe() { use tokio::runtime::Handle; drop(Handle::current()); }",
-    ],
-    "tokio::runtime::Handle::spawn": [f"fn probe({_HANDLE}) {{ drop(h.spawn(async {{}})); }}"],
-    "tokio::runtime::Handle::spawn_blocking": [
-        f"fn probe({_HANDLE}) {{ drop(h.spawn_blocking(|| ())); }}",
-    ],
-    "tokio::runtime::Handle::block_on": [f"fn probe({_HANDLE}) {{ h.block_on(async {{}}); }}"],
-    "tokio::runtime::Runtime::spawn": [f"fn probe({_RT}) {{ drop(rt.spawn(async {{}})); }}"],
-    "tokio::runtime::Runtime::spawn_blocking": [
-        f"fn probe({_RT}) {{ drop(rt.spawn_blocking(|| ())); }}",
-    ],
-    "tokio::runtime::Runtime::block_on": [f"fn probe({_RT}) {{ rt.block_on(async {{}}); }}"],
-    "tokio::runtime::Runtime::shutdown_timeout": [
-        f"fn probe(rt: tokio::runtime::Runtime) {{ rt.shutdown_timeout({_DUR}); }}",
-    ],
-    "tokio::runtime::LocalRuntime::spawn_local": [
-        f"fn probe({_LRT}) {{ drop(rt.spawn_local(async {{}})); }}",
-    ],
-    "tokio::runtime::LocalRuntime::spawn_blocking": [
-        f"fn probe({_LRT}) {{ drop(rt.spawn_blocking(|| ())); }}",
-    ],
-    "tokio::runtime::LocalRuntime::block_on": [
-        f"fn probe({_LRT}) {{ rt.block_on(async {{}}); }}",
-    ],
-    "tokio::runtime::LocalRuntime::shutdown_timeout": [
-        f"fn probe(rt: tokio::runtime::LocalRuntime) {{ rt.shutdown_timeout({_DUR}); }}",
-    ],
-    "tokio::sync::mpsc::Sender::send_timeout": [
-        f"async fn probe(tx: tokio::sync::mpsc::Sender<u8>) {{"
-        f" let _ = tx.send_timeout(0, {_DUR}).await; }}",
-    ],
-    "tokio::sync::mpsc::Sender::blocking_send": [
-        "fn probe(tx: &tokio::sync::mpsc::Sender<u8>) { let _ = tx.blocking_send(0); }",
-    ],
-    "tokio::sync::mpsc::Receiver::blocking_recv": [
-        "fn probe(rx: &mut tokio::sync::mpsc::Receiver<u8>) { let _ = rx.blocking_recv(); }",
-    ],
-    "tokio::sync::mpsc::Receiver::blocking_recv_many": [
-        "fn probe(rx: &mut tokio::sync::mpsc::Receiver<u8>, b: &mut Vec<u8>) {"
-        " let _ = rx.blocking_recv_many(b, 1); }",
-    ],
-    "tokio::sync::mpsc::UnboundedReceiver::blocking_recv": [
-        "fn probe(rx: &mut tokio::sync::mpsc::UnboundedReceiver<u8>) {"
-        " let _ = rx.blocking_recv(); }",
-    ],
-    "tokio::sync::mpsc::UnboundedReceiver::blocking_recv_many": [
-        "fn probe(rx: &mut tokio::sync::mpsc::UnboundedReceiver<u8>, b: &mut Vec<u8>) {"
-        " let _ = rx.blocking_recv_many(b, 1); }",
-    ],
-    "tokio::sync::oneshot::Receiver::blocking_recv": [
-        "fn probe(rx: tokio::sync::oneshot::Receiver<u8>) { let _ = rx.blocking_recv(); }",
-    ],
-    "tokio::sync::broadcast::Receiver::blocking_recv": [
-        "fn probe(rx: &mut tokio::sync::broadcast::Receiver<u8>) { let _ = rx.blocking_recv(); }",
-    ],
-    "tokio::sync::Mutex::blocking_lock": [
-        "fn probe(m: &tokio::sync::Mutex<u8>) { drop(m.blocking_lock()); }",
-    ],
-    "tokio::sync::Mutex::blocking_lock_owned": [
-        "fn probe(m: std::sync::Arc<tokio::sync::Mutex<u8>>) { drop(m.blocking_lock_owned()); }",
-    ],
-    "tokio::sync::RwLock::blocking_read": [
-        "fn probe(l: &tokio::sync::RwLock<u8>) { drop(l.blocking_read()); }",
-    ],
-    "tokio::sync::RwLock::blocking_write": [
-        "fn probe(l: &tokio::sync::RwLock<u8>) { drop(l.blocking_write()); }",
-    ],
-    "futures::executor::block_on": [
-        "fn probe() { futures::executor::block_on(async {}); }",
-        "fn probe() { use futures::executor::block_on as wait; wait(async {}); }",
-    ],
-    "futures::executor::block_on_stream": [
-        "fn probe() {"
-        " let _ = futures::executor::block_on_stream(futures::stream::empty::<u8>()); }",
-    ],
-    "futures::executor::LocalPool::run": [f"fn probe({_POOL}) {{ p.run(); }}"],
-    "futures::executor::LocalPool::run_until": [
-        f"fn probe({_POOL}) {{ p.run_until(async {{}}); }}",
-    ],
-}
-
-# Disallowed type path -> probe items, which the run with --force-warn must
-# report as a disallowed type of that path.
-TYPE_PROBES = {
-    "std::sync::mpsc::Receiver": [
-        "fn probe(rx: &std::sync::mpsc::Receiver<u8>) { for _ in rx {} }",
-        "fn probe() { use std::sync::mpsc::Receiver as Inbox; let _: Option<Inbox<u8>> = None; }",
-    ],
-}
-
-KINDS = {"disallowed-methods": ("method", METHOD_PROBES), "disallowed-types": ("type", TYPE_PROBES)}
-# A probe of a path clippy.toml does not list, planted with the others: the
-# entry check must report it as unlisted, and the probe check as not reported.
-CONTROL_PROBE = ("method", "std::thread::yield_now", "fn probe() { std::thread::yield_now(); }")
-# An entry the copy's clippy.toml gets that names no item: clippy must warn that
-# it does not resolve, and the entry check must report that it has no probe.
-CONTROL_ENTRY = "std::thread::wasm_clippy_guard_control"
+ZERO = "std::time::Duration::ZERO"
+# (file, the text to find once, the lines that go after the first line from
+# that text on that ends with `{`, the listed path each line calls).
+PLANTS = [
+    (
+        "crates/engine/src/get_item.rs",
+        "pub async fn handle_get_item(",
+        [
+            (f"    tokio::time::sleep({ZERO}).await;", "tokio::time::sleep"),
+            (f"    {{ use tokio::time; time::sleep({ZERO}).await; }}", "tokio::time::sleep"),
+            (f"    std::thread::sleep({ZERO});", "std::thread::sleep"),
+        ],
+    ),
+    (
+        "crates/storage-sqlite/src/store.rs",
+        "pub async fn new_in_memory(",
+        [("    let _ = std::time::Instant::now();", "std::time::Instant::now")],
+    ),
+]
+# The control of check 3, and the line of clippy.toml it goes after.
+MISSPELT = "std::thread::sleep_misspelt_by_the_guard"
+MISSPELT_AFTER = "disallowed-methods = ["
+# The crates of the wasm32 AES-256-GCM stack. Each wipes its own key material
+# only under its own `zeroize` feature, which crates/core/Cargo.toml turns on.
+ZEROIZE_CRATES = ("aes", "aes-gcm", "ghash", "polyval")
 
 
-class Finding(NamedTuple):
-    """What a check found: its name, where (a `file:line`, a crate, a path or a
-    label) and a description. A finding that no control expects is a problem."""
-
-    check: str
-    where: str
-    text: str
-
-
-class Control(NamedTuple):
-    """A case planted in the copy and the finding it must give: one of `check`
-    at `where` whose text holds `expect`. With `check` None it is an accepted
-    case: no finding may name `where` (a file) at a line in `lines`."""
-
-    name: str
-    check: str | None
-    where: str
-    expect: str = ""
-    lines: range = range(0)
-
-
-# ---------------------------------------------------------------- clippy.toml
-
-
-def config_problems(label: str, text: str, probes: dict[str, set[str]]) -> list[Finding]:
-    """Findings, at `label`, of a clippy.toml's `text` against the paths with a
-    probe (`probes`, by kind): TOML that does not parse, a key other than the
-    two lists, a value of one that is not a list, an entry that is not a table
-    of exactly a non-empty `path` and `reason`, a path listed twice, an entry
-    with no probe, and a probe of a path not listed."""
+def config_problems(text: str) -> list[str]:
+    """Check 1 of the docstring, on the text of a clippy.toml."""
     try:
         config = tomllib.loads(text)
     except tomllib.TOMLDecodeError as error:
-        return [Finding("entries", label, f"{label} cannot be read: {error}")]
-    found = [f"{key} is not one of the two lists" for key in config if key not in KINDS]
-    for key, (kind, _) in KINDS.items():
-        value = config.get(key, [])
-        if not isinstance(value, list):
-            found.append(f"{key} is not a list")
-            value = []
+        return [f"{CONFIG_REL} cannot be read: {error}"]
+    others = [key for key in config if key not in LISTS]
+    found = [f"{CONFIG_REL}: {key} is not one of the two lists" for key in others]
+    for key in LISTS:
+        entries = config.get(key, [])
+        if not isinstance(entries, list):
+            found.append(f"{CONFIG_REL}: {key} is not a list")
+            continue
         paths = []
-        for entry in value:
+        for entry in entries:
             if isinstance(entry, dict) and set(entry) == {"path", "reason"} and all(
-                isinstance(v, str) and v.strip() for v in entry.values()
+                isinstance(value, str) and value.strip() for value in entry.values()
             ):
                 paths.append(entry["path"])
             else:
                 found.append(
-                    f"{key} entry {entry!r} is not a table of exactly a non-empty `path` and"
-                    " `reason`"
+                    f"{CONFIG_REL}: {key} entry {entry!r} is not a table of exactly a non-empty"
+                    " `path` and `reason`"
                 )
-        found += [f"{p}: listed in {key} more than once" for p in set(paths) if paths.count(p) > 1]
-        found += [f"{p}: listed in {key}, with no {kind} probe" for p in set(paths) - probes[kind]]
-        found += [f"{p}: has a {kind} probe, not listed" for p in probes[kind] - set(paths)]
-    return [Finding("entries", label, f"{label}: {text}") for text in sorted(found)]
+        twice = sorted({path for path in paths if paths.count(path) > 1})
+        found += [f"{CONFIG_REL}: {path} is listed in {key} more than once" for path in twice]
+    return found
 
 
-# ---------------------------------------------------------------- cargo
-
-
-def cargo_metadata(tree: Path, *options: str) -> tuple[dict | None, str]:
-    """`cargo metadata` for wasm32 in the tree at `tree`, with `options`: the
-    metadata, or None and cargo's error."""
-    command = ["cargo", "metadata", "--color", "never", "--format-version", "1", *options]
+def command(argv: list[str], cwd: Path) -> subprocess.CompletedProcess:
     try:
-        run = subprocess.run(
-            command + ["--filter-platform", TARGET], cwd=tree, capture_output=True, text=True
-        )
+        return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, check=False)
     except FileNotFoundError:
-        sys.exit("error: cargo is not on PATH")
-    return (json.loads(run.stdout), "") if run.returncode == 0 else (None, run.stderr)
+        sys.exit(f"error: {argv[0]} is not on PATH")
 
 
-def adapter_build(metadata: dict) -> tuple[list[dict], dict[str, dict]]:
-    """The packages the adapter's wasm32 build compiles (the adapter and its
-    normal dependencies on that target, as `cargo metadata --filter-platform`
-    resolves them), and of them the workspace members, by name."""
-    members = set(metadata["workspace_members"])
-    packages = {p["id"]: p for p in metadata["packages"]}
-    nodes = {n["id"]: n for n in metadata["resolve"]["nodes"]}
-    todo = [i for i in members if packages[i]["name"] == ADAPTER]
-    if not todo:
-        sys.exit(f"error: cargo metadata lists no workspace member named {ADAPTER}")
-    seen = set()
-    while todo:
-        package = todo.pop()
-        if package in seen:
-            continue
-        seen.add(package)
-        # kind None is a normal dependency.
-        todo += [
-            d["pkg"]
-            for d in nodes[package]["deps"]
-            if any(k["kind"] is None for k in d["dep_kinds"])
-        ]
-    build = [packages[i] for i in sorted(seen)]
-    return build, {p["name"]: p for p in build if p["id"] in members}
-
-
-def copy_tree(destination: Path) -> int:
+def copy_tree(destination: Path) -> None:
     """Copy the files git tracks or does not ignore, as they are now: a
-    symbolic link as the link it is, and no file beyond a link (git status
-    lists a tracked file there as deleted), so that no copy goes through a
-    link."""
-    try:
-        listing = subprocess.run(
-            ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-            cwd=ROOT,
-            capture_output=True,
-            check=False,
-        )
-    except FileNotFoundError:
-        sys.exit("error: git is not on PATH; the guard runs in a copy of the files git lists")
+    symbolic link as the link it is, and no file beyond a link, so that no
+    copy goes through a link."""
+    listing = command(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"], ROOT)
     if listing.returncode != 0:
-        sys.exit(f"error: git ls-files failed in {ROOT}:\n{listing.stderr.decode()}")
-    copied = 0
-    for rel in sorted(set(listing.stdout.decode().split("\0")) - {""}):
+        sys.exit(f"error: git ls-files failed in {ROOT}:\n{listing.stderr}")
+    for rel in sorted(set(listing.stdout.split("\0")) - {""}):
         source, target = ROOT / rel, destination / rel
-        beyond_link = any(os.path.islink(ROOT / d) for d in list(Path(rel).parents)[:-1])
+        beyond_link = any(os.path.islink(ROOT / parent) for parent in list(Path(rel).parents)[:-1])
         if beyond_link or not os.path.lexists(source):  # or deleted in the working tree
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -547,32 +138,46 @@ def copy_tree(destination: Path) -> int:
             # copy2 keeps the modification time, so cargo finds the copied
             # crates as fresh as the caller's.
             shutil.copy2(source, target)
-        else:
-            continue
-        copied += 1
-    return copied
 
 
-class Run(NamedTuple):
-    """One clippy step: its exit status, compiler messages, compiler-artifact
-    records and stderr."""
+def insert(copy: Path, rel: str, find: str, lines: list[str], after_brace: bool) -> list[int] | str:
+    """Write `lines` into the copy's file `rel` after the line holding `find`,
+    which must be there once (with `after_brace`, after the first line from
+    there on that ends with `{`). Returns the 1-based numbers of the written
+    lines, or the problem."""
+    path = copy / rel
+    try:
+        text = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    except (OSError, UnicodeDecodeError) as error:
+        return f"cannot plant in {rel}: {error}"
+    at = [index for index, line in enumerate(text) if find in line]
+    if len(at) != 1:
+        found = "is not there" if not at else f"is there {len(at)} times"
+        return f"cannot plant in {rel}: the text `{find}` the guard looks for {found}"
+    index = at[0]
+    while after_brace and not text[index].rstrip().endswith("{"):
+        index += 1
+        if index == len(text):
+            return f"cannot plant in {rel}: no line ending with `{{` after `{find}`"
+    text[index + 1 : index + 1] = [line + "\n" for line in lines]
+    path.write_text("".join(text), encoding="utf-8")
+    return list(range(index + 2, index + 2 + len(lines)))
 
-    code: int
-    messages: list[dict]
-    artifacts: list[dict]
-    stderr: str
 
-
-def run_clippy(tree: Path, target_dir: str, clippy_options: list[str]) -> Run:
-    """Run the clippy step in the tree at `tree`, with `clippy_options` after
-    its own, and the cargo target directory `target_dir`."""
+def run_clippy(copy: Path, target_dir: str, *cargo_options: str) -> tuple[int, list[dict], str]:
+    """Run the clippy step in the copy, with `cargo_options` before its own;
+    returns its exit status, its compiler messages and its stderr."""
     env = dict(os.environ, CARGO_TARGET_DIR=target_dir)
-    command = CLIPPY + (["--", *clippy_options] if clippy_options else [])
     # In its own process group, so that it can be stopped with every compiler
     # it started.
-    pipe = subprocess.PIPE
     process = subprocess.Popen(
-        command, cwd=tree, env=env, stdout=pipe, stderr=pipe, text=True, start_new_session=True
+        CLIPPY + list(cargo_options),
+        cwd=copy,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
     )
     try:
         stdout, stderr = process.communicate()
@@ -584,7 +189,7 @@ def run_clippy(tree: Path, target_dir: str, clippy_options: list[str]) -> Run:
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
-    messages, artifacts = [], []
+    messages = []
     for line in stdout.splitlines():
         try:
             record = json.loads(line)
@@ -592,1439 +197,121 @@ def run_clippy(tree: Path, target_dir: str, clippy_options: list[str]) -> Run:
             continue
         if record.get("reason") == "compiler-message":
             messages.append(record["message"])
-        elif record.get("reason") == "compiler-artifact":
-            artifacts.append(record)
-    return Run(process.returncode, messages, artifacts, stderr)
+    return process.returncode, messages, stderr
 
 
-def dep_info(run: Run, crates: dict, copy: Path, name: str) -> tuple[dict, list[Finding]]:
-    """For each of `crates` (packages of the copy's metadata, by name) that the
-    run's compiler-artifact records name, the files and the environment
-    variables its dep-info lists, read from the dep-info file rustc writes
-    next to the metadata file the record names; and an "examined" finding for
-    each crate read, which a control expects for every crate and run, so a run
-    that lints fewer crates, or whose findings are dropped, fails the
-    controls. rustc writes the dep-info of a crate whose lints fail too, but
-    cargo names no artifact for that crate."""
-    by_manifest = {Path(p["manifest_path"]).resolve(): crate for crate, p in crates.items()}
-    read = {}
-    for artifact in run.artifacts:
-        crate = by_manifest.get(Path(artifact["manifest_path"]).resolve())
-        if crate is None or "custom-build" in artifact["target"]["kind"]:
-            continue
-        for output in map(Path, artifact["filenames"]):
-            info = output.with_name(output.name.removeprefix("lib")).with_suffix(".d")
-            if info.is_file():
-                read[crate] = read_dep_info(info, copy)
-                break
-    found = [Finding("examined", f"{c} ({name})", f"examined {c} ({name})") for c in read]
-    return read, found
+def location(span: dict, copy: Path) -> str:
+    """A span's file, relative to the copy, and line."""
+    path = Path(span["file_name"])
+    if path.is_absolute() and path.resolve().is_relative_to(copy):
+        path = path.resolve().relative_to(copy)
+    return f"{path.as_posix()}:{span['line_start']}"
 
 
-def unfinished(run: Run, name: str, read: dict, crates: dict) -> int:
-    """Report a clippy run that did not finish (`read` holds the dep-info it
-    left, by crate), and return the guard's exit status. Once a crate fails,
-    cargo starts no other ("build failed, waiting for other jobs to
-    finish"), so the run's reports and dep-info cover only the crates it
-    finished: the guard judges nothing else."""
-    errors = [m.get("rendered") or m["message"] for m in run.messages if m["level"] == "error"]
-    print(
-        f"FAIL: the clippy step {name} did not finish in the copy (exit status {run.code}),"
-        " so the guard judges nothing else; the crates it did not finish linting:"
-        f" {', '.join(sorted(set(crates) - set(read))) or 'none'}. Its errors:\n"
-        + ("\n".join(errors) or run.stderr),
-        file=sys.stderr,
-    )
-    return 1
-
-
-def read_dep_info(info: Path, root: Path) -> tuple[list[Path], dict[str, str]]:
-    """The files a rustc dep-info file lists, other than those named
-    Cargo.toml, clippy.toml or .clippy.toml (clippy adds the manifest and its
-    configuration), and the environment variables it records
-    (`# env-dep:NAME=VALUE`), among them the CLIPPY_ARGS and CLIPPY_CONF_DIR
-    clippy-driver read. rustc writes a line `<file>:` for each file, with a
-    space in the name written `\\ `; a relative name is relative to `root`,
-    where cargo ran rustc."""
-    files, env = [], {}
-    for line in info.read_text(encoding="utf-8").splitlines():
-        if line.startswith("# env-dep:"):
-            name, _, value = line.removeprefix("# env-dep:").partition("=")
-            env[name] = value
-        if line.startswith("#") or not line.endswith(":"):
-            continue
-        path = Path(os.path.normpath(root / line[:-1].replace("\\ ", " ")))
-        if path.name not in ("Cargo.toml", "clippy.toml", ".clippy.toml"):
-            files.append(path)
-    return files, env
-
-
-def driver_problems(plain: dict, forced: dict, conf_dir: str) -> list[Finding]:
-    """Findings of what clippy-driver read for each crate, as its dep-info
-    records it in the run without options (`plain`) and the run with
-    FORCE_WARN (`forced`), each mapping a crate to its files and variables:
-    CLIPPY_CONF_DIR other than `conf_dir`, and CLIPPY_ARGS other than the
-    value most crates record in `plain` (the clippy step's own options),
-    followed in `forced` by FORCE_WARN. A build script's cargo::rustc-env can
-    set either for its crate, an [env] entry with force = true for every
-    crate."""
-    common = Counter(env.get("CLIPPY_ARGS") for _, env in plain.values()).most_common(1)
-    step = common[0][0] if common else None
-    found = []
-    for name, read, options in (
-        ("without options", plain, []),
-        ("with --force-warn", forced, FORCE_WARN),
-    ):
-        expected = step and step + "".join(o + CLIPPY_ARGS_SEPARATOR for o in options)
-        for crate, (_, env) in sorted(read.items()):
-            for variable, value in (("CLIPPY_ARGS", expected), ("CLIPPY_CONF_DIR", conf_dir)):
-                if value is None or env.get(variable) != value:
-                    text = (
-                        f"{crate}: in the clippy step {name}, clippy-driver read {variable}"
-                        f" {env.get(variable)!r}, not {value!r}"
-                    )
-                    found.append(Finding("dep-info", crate, text))
-    return found
-
-
-def config_warnings(runs: dict[str, Run], config: Path) -> list[Finding]:
-    """The warnings about clippy.toml (read at `config`) that the runs printed,
-    one finding per path they name."""
-    found = {}
-    for run in runs.values():
-        texts = [
-            m.get("rendered") or m["message"]
-            for m in run.messages
-            if any(Path(s["file_name"]).resolve() == config for s in m.get("spans", []))
-            or any(t in m["message"] for t in CONFIG_WARNINGS)
-        ]
-        if not texts and any(t in run.stderr for t in CONFIG_WARNINGS):
-            texts = [run.stderr]
-        for text in texts:
-            path = re.search(r"`([^`]+)`", text)
-            where = path.group(1) if path else CONFIG_REL
-            found[where] = Finding("clippy.toml warning", where, f"about {CONFIG_REL}:\n{text}")
-    return list(found.values())
-
-
-# ---------------------------------------------------------------- lint attributes
-
-_SCAN = re.compile(r'//|/\*|(?<!\w)(?:b|c)?r#*"|(?<!\w)(?:b|c)?"|\'')
-_CHAR = re.compile(r"'(?:\\(?:u\{[0-9A-Fa-f]{1,6}\}|x[0-9A-Fa-f]{2}|.)|[^\\'\n])'")
-
-
-def code_only(text: str) -> str:
-    """`text` with comments and the contents of string and character literals
-    blanked (line breaks kept), so offsets and line numbers still match."""
-    out = []
-    i = 0
-    n = len(text)
-
-    def blank(a: int, b: int) -> None:
-        out.append(re.sub(r"[^\n]", " ", text[a:b]))
-
-    while True:
-        match = _SCAN.search(text, i)
-        if not match:
-            out.append(text[i:])
-            break
-        start = match.start()
-        out.append(text[i:start])
-        token = match.group()
-        if token == "//":
-            end = text.find("\n", start)
-            end = n if end < 0 else end
-            blank(start, end)
-        elif token == "/*":
-            depth, end = 1, start + 2
-            while end < n and depth:
-                if text.startswith("/*", end):
-                    depth, end = depth + 1, end + 2
-                elif text.startswith("*/", end):
-                    depth, end = depth - 1, end + 2
-                else:
-                    end += 1
-            blank(start, end)
-        elif token == "'":
-            char = _CHAR.match(text, start)
-            end = char.end() if char else start + 1  # a lifetime or a label
-            out.append(text[start] + re.sub(r"[^\n]", " ", text[start + 1 : end - 1]))
-            if char:
-                out.append("'")
-        elif token.endswith('"') and "r" in token:
-            hashes = token.count("#")
-            close = text.find('"' + "#" * hashes, match.end())
-            close = n if close < 0 else close
-            end = min(n, close + 1 + hashes)
-            out.append(token)
-            blank(match.end(), close)
-            out.append(text[close:end])
-        else:
-            end = match.end()
-            while end < n and text[end] != '"':
-                end += 2 if text[end] == "\\" else 1
-            out.append(token)
-            blank(match.end(), end)
-            out.append(text[end : end + 1])
-            end += 1
-        i = end
-    return "".join(out)
-
-
-def _closing(code: str, start: int, opening: str, closing: str) -> int:
-    """The index just past the bracket that closes the one at `start`."""
-    depth = 0
-    for index in range(start, len(code)):
-        if code[index] == opening:
-            depth += 1
-        elif code[index] == closing:
-            depth -= 1
-            if depth == 0:
-                return index + 1
-    return len(code)
-
-
-def _items(code: str, start: int, end: int) -> list[tuple[int, int]]:
-    """The (start, end) of each comma-separated item of code[start:end]."""
-    items, depth, first = [], 0, start
-    for index in range(start, end):
-        if code[index] in "([{":
-            depth += 1
-        elif code[index] in ")]}":
-            depth -= 1
-        elif code[index] == "," and depth == 0:
-            items.append((first, index))
-            first = index + 1
-    return items + [(first, end)]
-
-
-_REASON = re.compile(r'\s*reason\s*=\s*(?:(r)(#*))?"')
-_ESCAPE = re.compile(r"\\(?:x([0-9A-Fa-f]{2})|u\{([0-9A-Fa-f_]{1,8})\}|\n[ \t\r\n]*|(.))", re.S)
-_SIMPLE_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\", "0": "\0", "'": "'", '"': '"'}
-
-
-def reason_value(text: str, code: str, start: int, end: int) -> str | None:
-    """The text of the string literal in a `reason = "..."` item of a lint list,
-    the item being code[start:end], or None when the item is not one. `code` is
-    `text` with comments and literal contents blanked, so the literal's quotes
-    are found in `code` and its contents read from `text` (which holds the
-    file's bytes, one character each) as UTF-8; escapes are decoded, a raw
-    string's contents are taken as written."""
-    match = _REASON.match(code, start, end)
-    if not match:
-        return None
-    raw, hashes = match.group(1), match.group(2) or ""
-    close = code.find('"' + hashes if raw else '"', match.end(), end)
-    if close < 0:
-        return None
-    contents = text[match.end() : close].encode("latin-1").decode("utf-8", "replace")
-    return contents if raw else _ESCAPE.sub(_unescape, contents)
-
-
-def _unescape(escape: re.Match) -> str:
-    """The character one escape of a Rust string literal stands for; a line
-    continuation (a backslash at the end of a line, and the next line's
-    indentation) stands for nothing."""
-    hex_byte, code_point, simple = escape.groups()
-    try:
-        if hex_byte:
-            return chr(int(hex_byte, 16))
-        if code_point:
-            return chr(int(code_point.replace("_", ""), 16))
-    except ValueError:  # not a character; rustc refuses the literal
-        return escape.group()
-    if simple is not None:
-        return _SIMPLE_ESCAPES.get(simple, escape.group())
-    return ""
-
-
-_ATTRIBUTE = re.compile(r"#\s*(!?)\s*\[")
-_NEXT_ATTRIBUTE = re.compile(r"\s*#\s*\[")
-_LEVEL = re.compile(r"\s*(allow|expect|cfg_attr)\s*\(")
-_VISIBILITY = r"(?:pub\s*(?:\([^()]*\))?\s*)?"
-_FN = re.compile(
-    _VISIBILITY + r"(?:(?:const|async|unsafe|safe|default|extern\s*(?:\"[^\"]*\")?)\s*)*fn\s+\w"
-)
-_ITEM = re.compile(
-    _VISIBILITY + r"(?:(?:unsafe|auto|default)\s+)*"
-    r"(mod|impl|trait|struct|enum|union|type|use|extern|macro_rules|const|static)\b"
-)
-_ITEM_NAMES = {
-    "mod": "a module",
-    "impl": "an impl block",
-    "enum": "an enum",
-    "extern": "an extern item",
-    "use": "a use item",
-    "type": "a type alias",
-    "macro_rules": "a macro definition",
-}
-# An item inside a function or a statement. rustc applies the allow on the
-# function or statement to it too, but its code is not that function's: an
-# impl there, for one, adds methods that code elsewhere calls.
-_NESTED_ITEM = re.compile(
-    r"\bfn\s+\w|\bimpl\b|\btrait\s+\w|\bmod\s+\w"
-    r"|(?<![\w*'])(?:const\s+\w+|static\s+(?:mut\s+)?\w+)\s*:"
-)
-_BLOCK_LIKE = re.compile(r"(?:if|match|loop|while|for|unsafe|async|const|move)\b|[{|]|'\w+\s*:")
-_MACRO_CALL = re.compile(r"(?:::)?\w+(?:\s*::\s*\w+)*\s*!\s*[(\[{]")
-_SPACE = re.compile(r"\s*")
-
-
-def _item_extent(code: str, index: int) -> tuple[int | None, int] | None:
-    """For the item whose header starts at `index`: the index of the `{` that
-    opens its body and the index just past the `}` that closes it, or None and
-    the index just past the `;` of a bodiless item. The body is the first `{`
-    outside the header's angle brackets; parentheses and brackets are skipped
-    whole, and a `{` inside angle brackets opens a const block. None when a
-    bracket of the enclosing code closes first."""
-    angles = 0
-    while index < len(code):
-        char = code[index]
-        if char in "([":
-            index = _closing(code, index, char, ")" if char == "(" else "]")
-            continue
-        if char == "<":
-            angles += 1
-        elif char == ">" and code[index - 1] != "-":
-            angles -= 1
-            if angles < 0:
-                return None
-        elif char == "{":
-            end = _closing(code, index, "{", "}")
-            if angles == 0:
-                return index, end
-            index = end
-            continue
-        elif char == ";" and angles == 0:
-            return None, index + 1
-        elif char in ")]};":
-            return None
-        index += 1
-    return None
-
-
-def _statement_end(code: str, index: int, separators: bool = True) -> int | None:
-    """The index just past the `;` that ends, at depth 0, the code from
-    `index`. None when a bracket of the enclosing code closes first, or, with
-    `separators`, when a `,` or a `=>` comes first at depth 0, as after a match
-    arm, a field or a parameter. A `<` after `::` (a turbofish) opens a depth
-    as a bracket does."""
-    open_brackets = []
-    while index < len(code):
-        char = code[index]
-        if code.startswith("::<", index):
-            open_brackets.append("<")
-            index += 3
-            continue
-        if char in "([{":
-            open_brackets.append(char)
-        elif char == ">" and open_brackets[-1:] == ["<"] and code[index - 1] not in "-=":
-            open_brackets.pop()
-        elif char in ")]}":
-            while open_brackets[-1:] == ["<"]:
-                open_brackets.pop()
-            if not open_brackets:
-                return None
-            open_brackets.pop()
-        elif not open_brackets and char == ";":
-            return index + 1
-        elif not open_brackets and separators and (char == "," or code.startswith("=>", index)):
-            return None
-        index += 1
-    return None
-
-
-def _without_items(code: str, start: int, end: int) -> list[tuple[int, int]]:
-    """code[start:end] as (start, end) spans, without the items in it."""
-    spans, index = [], start
-    for item in _NESTED_ITEM.finditer(code, start, end):
-        if item.start() < index:
-            continue
-        if item.group().startswith(("const", "static")):
-            stop = _statement_end(code, item.start(), separators=False)
-        else:
-            extent = _item_extent(code, item.start())
-            stop = extent[1] if extent else None
-        spans.append((index, item.start()))
-        index = end if stop is None else min(stop, end)
-    return spans + [(index, end)]
-
-
-def _bare_macro_call(code: str, call: re.Match) -> bool:
-    """Whether the macro invocation `call` matched is all of its statement:
-    delimited by braces, or followed by `;`."""
-    opening = code[call.end() - 1]
-    if opening == "{":
-        return True
-    close = _closing(code, call.end() - 1, opening, ")" if opening == "(" else "]")
-    return code[close:].lstrip()[:1] in (";", "")
-
-
-def _previous(code: str, index: int) -> str:
-    """The last character before `index` that is not whitespace, or ""."""
-    while index > 0 and code[index - 1].isspace():
-        index -= 1
-    return code[index - 1] if index else ""
-
-
-class Attributes(NamedTuple):
-    """What lint_attributes found in one file: the byte spans the accepted
-    allows cover, how many of those allows are on functions and on statements,
-    and findings for the others."""
-
-    covered: list[tuple[int, int]]
-    on_functions: int
-    on_statements: int
-    findings: list[Finding]
-
-
-def lint_attributes(rel: str, text: str) -> Attributes:
-    """The allows and expects of the disallowed lints in one file, `text`
-    holding its bytes one character each. An attribute names one when its lint
-    list holds clippy::disallowed_methods or clippy::disallowed_types in that
-    spelling (whitespace aside). It is accepted when it is an outer attribute
-    with a `reason` that holds more than whitespace and sits on a `fn` item, or
-    after a `{`, `;` or `}` on a statement: a `let`, or an expression ending in
-    `;` that is not a macro invocation and does not start with a block. It
-    covers that item or statement without the items written inside it. Any
-    other attribute that names one, in cfg_attr too, is a finding."""
-    code = code_only(text)
-    covered, counts, found = [], Counter(), []
-    run_start, run_end = 0, None
-    for attribute in _ATTRIBUTE.finditer(code):
-        end = _closing(code, attribute.end() - 1, "[", "]")
-        if run_end is None or code[run_end : attribute.start()].strip():
-            run_start = attribute.start()
-        run_end = end
-        level = _LEVEL.match(code, attribute.end())
-        if not level:
-            continue
-        close = _closing(code, level.end() - 1, "(", ")")
-        if level.group(1) == "cfg_attr":
-            named = sorted(_named_lints(code, level.end(), close - 1))
-            why = "is inside cfg_attr, which applies it only where its condition holds"
-        else:
-            names, reasons = set(), []
-            for start, stop in _items(code, level.end(), close - 1):
-                reason = reason_value(text, code, start, stop)
-                if reason is None:
-                    names.add(re.sub(r"\s", "", code[start:stop]))
-                else:
-                    reasons.append(reason)
-            named = sorted(names & set(DISALLOWED))
-            why, span = _placement(code, attribute, end, run_start, reasons)
-        if not named:
-            continue
-        if why:
-            where = f"{rel}:{code.count(chr(10), 0, attribute.start()) + 1}"
-            found.append(
-                Finding(
-                    "allow",
-                    where,
-                    f"{where}: an allow or expect of {', '.join(named)} {why}; an accepted one"
-                    " is an outer #[allow] or #[expect] with a reason, on the function or the"
-                    " statement that holds the call",
-                )
-            )
-            continue
-        kind, first, last, inner_start, inner_end = span
-        covered += [(first, inner_start)] + _without_items(code, inner_start, inner_end)
-        covered.append((inner_end, last))
-        counts[kind] += 1
-    return Attributes(covered, counts["fn"], counts["statement"], found)
-
-
-def _placement(code: str, attribute: re.Match, end: int, run_start: int, reasons: list[str]):
-    """Why an allow or expect of a disallowed lint (the attribute matched at
-    `attribute`, ending at `end`, in a run of attributes from `run_start`) is
-    not accepted, or None and the span it covers: (kind, start, end, and the
-    start and end of the part in which the items are left out)."""
-    index = end
-    while following := _NEXT_ATTRIBUTE.match(code, index):
-        index = _closing(code, following.end() - 1, "[", "]")
-    index = _SPACE.match(code, index).end()
-    if attribute.group(1):
-        return "is an inner attribute, which covers all of the module or function it is in", None
-    if not any(reason.strip() for reason in reasons):
-        return "has no `reason`, or one that holds only whitespace", None
-    if _FN.match(code, index):
-        extent = _item_extent(code, index)
-        if extent is None:
-            return "is on a function whose end the guard cannot find", None
-        body, stop = extent
-        if body is None:
-            return None, ("fn", run_start, stop, stop, stop)
-        return None, ("fn", run_start, stop, body + 1, stop - 1)
-    if item := _ITEM.match(code, index):
-        return f"is on {_ITEM_NAMES.get(item.group(1), 'a ' + item.group(1))}", None
-    if _previous(code, run_start) not in ("{", ";", "}"):
-        return "is not on a function or a statement", None
-    if _BLOCK_LIKE.match(code, index):
-        return "is on a statement that starts with a block", None
-    if (call := _MACRO_CALL.match(code, index)) and _bare_macro_call(code, call):
-        return "is on a macro invocation, which can expand to items it would cover", None
-    stop = _statement_end(code, index, separators=not re.match(r"let\b", code[index : index + 4]))
-    if stop is None:
-        return "is not on a function or a statement", None
-    return None, ("statement", run_start, stop, index, stop)
-
-
-def _named_lints(code: str, start: int, end: int) -> set[str]:
-    """The disallowed lints that an attribute of the list code[start:end]
-    (cfg_attr's predicate and attributes) allows or expects, at any depth."""
-    named = set()
-    for item_start, item_end in _items(code, start, end):
-        level = _LEVEL.match(code, item_start, item_end)
-        if not level:
-            continue
-        close = _closing(code, level.end() - 1, "(", ")")
-        if level.group(1) == "cfg_attr":
-            named |= _named_lints(code, level.end(), close - 1)
-        else:
-            items = _items(code, level.end(), close - 1)
-            named |= {re.sub(r"\s", "", code[a:b]) for a, b in items} & set(DISALLOWED)
-    return named
-
-
-# ---------------------------------------------------------------- reports
-
-
-class Report(NamedTuple):
-    """A report of one of the four lints, at its primary span."""
-
-    lint: str
-    path: Path
-    line: int
-    start: int
-    end: int
-    message: str
-    level: str
-
-
-def reports(run: Run, copy: Path) -> list[Report]:
-    found = []
-    for message in run.messages:
-        lint = (message.get("code") or {}).get("code")
-        spans = [s for s in message.get("spans", []) if s.get("is_primary")]
-        if lint in DISALLOWED + AWAIT and spans:
-            span = spans[0]
-            found.append(
-                Report(
-                    lint,
-                    Path(os.path.normpath(copy / span["file_name"])),
-                    span["line_start"],
-                    span["byte_start"],
-                    span["byte_end"],
-                    message["message"],
-                    message["level"],
-                )
-            )
-    return found
-
-
-def call_problems(
-    forced: list[Report],
-    plain: list[Report],
-    covered: dict[Path, list[tuple[int, int]]],
-    copy: Path,
-    probe_file: Path,
-) -> list[Finding]:
-    """Findings of the reports of the run with --force-warn (`forced`), which
-    holds every disallowed call clippy lints, against the run without options
-    (`plain`) and the spans the accepted allows cover: an await-holding
-    report; a call no accepted allow covers as written; and a call one covers
-    that the clippy step reports all the same. The probes are left to
-    probe_problems."""
-    levels = {r[:6]: r.level for r in plain}
-    found = []
-    for report in forced:
-        if report.path == probe_file:
-            continue
-        rel = report.path.relative_to(copy) if report.path.is_relative_to(copy) else report.path
-        where = f"{Path(rel).as_posix()}:{report.line}"
-        what = f"{where}: {report.message} ({report.lint})"
-        level = levels.get(report[:6])
-        if report.lint in AWAIT:
-            text = (
-                f"{what}: a std lock guard or a RefCell borrow held across an .await traps on"
-                " wasm32 when another task takes it; no allow makes it acceptable"
-            )
-            found.append(Finding("await", where, text))
-        elif not any(a <= report.start < b for a, b in covered.get(report.path, ())):
-            if level is None:
-                step = (
-                    "the clippy step does not report it, so a setting other than an accepted"
-                    " allow switches the lint off there (an allow of a lint group or of"
-                    " warnings, an allow a macro builds or an allow in another spelling, such"
-                    " as a raw identifier or a former name, a [lints] table, or an allow on"
-                    " the code that holds the call's function)"
-                )
-            elif level == "error":
-                step = "the clippy step reports it as an error"
-            else:
-                step = (
-                    f"the clippy step reports it as a {level}, so a setting keeps the lint"
-                    " below error there (a warn of warnings, --force-warn or --cap-lints)"
-                )
-            text = f"{what}: no accepted allow covers it as written, and {step}"
-            found.append(Finding("call", where, text))
-        elif level is not None:
-            text = (
-                f"{what}: an accepted allow covers it as written, but the clippy step reports"
-                f" it as a {level}: a setting between the allow and the call sets the lint again"
-            )
-            found.append(Finding("step", where, text))
-    return found
-
-
-def probe_problems(forced: list[Report], probe_file: Path, spans: list[tuple]) -> list[Finding]:
-    """A finding for each probe (`spans`: the kind, the path and the line of
-    each) that the run with --force-warn did not report, on its line, as a
-    disallowed method or type of its path."""
-    reported = {
-        (*match.groups(), report.line)
-        for report in forced
-        if report.path == probe_file and (match := REFUSAL.match(report.message))
+def config_warnings(messages: list[dict], copy: Path) -> dict[str, str]:
+    """The messages about the copy's clippy.toml, by their text."""
+    config = (copy / CONFIG_REL).resolve()
+    return {
+        m["message"]: m.get("rendered") or m["message"]
+        for m in messages
+        if any(Path(s["file_name"]).resolve() == config for s in m.get("spans", []))
+        or "Clippy's configuration" in m["message"]
     }
-    return [
-        Finding("probe", path, f"{path}: the {kind} probe at line {line} was not reported")
-        for kind, path, line in spans
-        if (kind, path, line) not in reported
-    ]
 
 
-# ---------------------------------------------------------------- the compiler and its wrappers
-
-COMPILER_VARIABLES = (
-    "RUSTC",
-    "RUSTC_WRAPPER",
-    "RUSTC_WORKSPACE_WRAPPER",
-    "CARGO_BUILD_RUSTC",
-    "CARGO_BUILD_RUSTC_WRAPPER",
-    "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
-)
-COMPILER_KEYS = ("rustc", "rustc-wrapper", "rustc-workspace-wrapper")
-_COMPILER = "makes cargo run another program as the compiler, which the guard cannot vouch for"
-CONTROL_ENVIRONMENT = {"RUSTC_WRAPPER": "wasm-clippy-guard-control"}
-# Files of the guard's crate that no cargo command reads, as cargo reads only
-# the files cargo_config_files names: the controls of the cargo-configuration
-# check, each a text and the words of the finding it must give.
-CONTROL_CARGO_CONFIGS = {
-    f"{GUARD}/cargo-configuration-control.toml": ("[build]\nrustc-wrapper = 'x'", "rustc-wrapper"),
-    f"{GUARD}/cargo-configuration-unreadable.toml": ("[build", ""),
-}
-
-
-def environment_problems(sources: list[tuple[str, dict]]) -> list[Finding]:
-    """A finding for each variable of COMPILER_VARIABLES that a source (a label
-    and a mapping) sets: each makes cargo run another program as the compiler,
-    which can change its options for one crate."""
-    found = []
-    for label, env in sources:
-        found.append(Finding("examined", label, f"examined {label}"))
-        for name in COMPILER_VARIABLES:
-            if name in env:
-                text = f"{label} sets {name}={env[name]!r}: that {_COMPILER}"
-                found.append(Finding("environment", label, text))
-    return found
-
-
-def cargo_config_files(copy: Path) -> list[Path]:
-    """The cargo configuration files a cargo run in `copy` reads: .cargo/config.toml
-    and .cargo/config in it and in each directory above it, and config.toml and
-    config in CARGO_HOME (~/.cargo when that is unset)."""
-    home = Path(os.environ.get("CARGO_HOME") or Path.home() / ".cargo")
-    files = [d / ".cargo" / n for d in (copy, *copy.parents) for n in ("config.toml", "config")]
-    return list(dict.fromkeys(files + [home / "config.toml", home / "config"]))
-
-
-def cargo_config_problems(sources: list[tuple[str, list[Path]]]) -> list[Finding]:
-    """A finding for each file of a source (a label and files) whose [build]
-    table sets one of COMPILER_KEYS, and for each that cannot be read."""
-    found = []
-    for label, paths in sources:
-        found.append(Finding("examined", label, f"examined {label}"))
-        for path in paths:
-            if not path.is_file():
-                continue
-            try:
-                build = tomllib.loads(path.read_text(encoding="utf-8")).get("build", {})
-            except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
-                found.append(Finding("cargo configuration", str(path), f"{path}: {error}"))
-                continue
-            for key in COMPILER_KEYS:
-                if isinstance(build, dict) and key in build:
-                    text = f"{path}: build.{key} = {build[key]!r} {_COMPILER}"
-                    found.append(Finding("cargo configuration", str(path), text))
-    return found
-
-
-# ---------------------------------------------------------------- zeroize features
-
-# The crates of the wasm32 AES-256-GCM stack. Each wipes its own key material
-# only under its own `zeroize` feature, which CORE_MANIFEST turns on for each.
-ZEROIZE_CRATES = ("aes", "aes-gcm", "ghash", "polyval")
-CORE_MANIFEST = "crates/core/Cargo.toml"
-
-
-def adapter_graph(tree: Path) -> tuple[list[str], list[Finding]]:
-    """The packages of the adapter's wasm32 build as `cargo tree -e normal`
-    resolves them in the tree at `tree` (the adapter and its normal
-    dependencies on that target, with the features its build compiles), one
-    `package|features` line each. A package is written as cargo tree's {p}
-    writes it: its name and version, then its source when it is not from
-    crates.io, and `(proc-macro)` for a procedural macro."""
-    command = ["cargo", "tree", "--color", "never", "--locked", "-p", ADAPTER]
-    command += ["--target", TARGET, "-e", "normal", "--prefix", "none", "--format", "{p}|{f}"]
-    try:
-        run = subprocess.run(command, cwd=tree, capture_output=True, text=True, check=False)
-    except FileNotFoundError:
-        sys.exit("error: cargo is not on PATH")
+def zeroize_problems() -> tuple[list[str], list[str]]:
+    """Check 4 of the docstring: the problems, and the build's line of each
+    crate."""
+    argv = ["cargo", "tree", "--color", "never", "--locked", "-p", ADAPTER, "--target", TARGET]
+    argv += ["-e", "normal", "--prefix", "none", "--format", "{p}|{f}"]
+    run = command(argv, ROOT)
     if run.returncode != 0:
-        return [], [Finding("zeroize", str(tree), f"{' '.join(command)} failed:\n{run.stderr}")]
-    return [line.removesuffix(" (*)") for line in run.stdout.splitlines()], []
-
-
-def zeroize_problems(label: str, graph: list[str], crates: tuple = ZEROIZE_CRATES) -> list[Finding]:
-    """Findings of `crates` in `graph` (adapter_graph's lines): a crate that is
-    missing, that is there as more than one package (another version, or the
-    same version from another source), or whose package has its `zeroize`
-    feature off."""
+        return [f"{' '.join(argv)} failed:\n{run.stderr}"], []
     packages = {}
-    for line in graph:
-        package, _, features = line.partition("|")
-        name = package.partition(" ")[0]
-        if name in crates:
-            packages.setdefault(name, {})[package] = set(features.split(","))
-    found = [Finding("examined", label, f"examined {label}")]
-    for crate in crates:
-        where = f"{label}: {crate}"
+    for line in run.stdout.splitlines():
+        package, _, features = line.removesuffix(" (*)").partition("|")
+        if package.partition(" ")[0] in ZEROIZE_CRATES:
+            packages.setdefault(package.partition(" ")[0], {})[package] = features.split(",")
+    found = []
+    for crate in ZEROIZE_CRATES:
         present = packages.get(crate, {})
         if not present:
-            text = f"is not in the build; update ZEROIZE_CRATES and {CORE_MANIFEST} together"
+            found.append(f"{crate} is not in the adapter's wasm32 build; update ZEROIZE_CRATES")
         elif len(present) > 1:
-            text = (
-                f"is in the build as {len(present)} packages ({', '.join(present)});"
-                f" {CORE_MANIFEST} turns the zeroize feature on only in the package its entry"
-                " resolves to, which must be the one aes-gcm's stack uses"
+            found.append(
+                f"{crate} is in the adapter's wasm32 build as {len(present)} packages"
+                f" ({', '.join(present)}); crates/core/Cargo.toml turns its zeroize feature on"
+                " only in the one its entry resolves to"
             )
         elif "zeroize" not in next(iter(present.values())):
-            text = (
-                f"is built without its zeroize feature ({next(iter(present))}), so it leaves"
-                f" key material in memory; {CORE_MANIFEST} turns it on for wasm32"
+            found.append(
+                f"{next(iter(present))} is built without its zeroize feature, so it leaves key"
+                " material in memory; crates/core/Cargo.toml turns it on for wasm32"
             )
-        else:
-            continue
-        found.append(Finding("zeroize", where, f"{where} {text}"))
-    return found
+    stack = [f"{package}|{','.join(f)}" for p in packages.values() for package, f in p.items()]
+    return found, stack
 
 
-def zeroize_check(copy: Path) -> tuple[list[Finding], list[str]]:
-    """zeroize_problems, in one loop, of the adapter's wasm32 build in the copy
-    at `copy` and, for ghash, of three controls made from the build's lines and
-    checked alone: the build's ghash line without its zeroize feature, that
-    line beside a second package at its version from another source, and the
-    build without its ghash line. Returns the findings and the build's line of
-    each crate."""
-    graph, found = adapter_graph(copy)
-    ghash = [line.partition("|") for line in graph if line.startswith("ghash ")][:1]
-    without = [f"{p}|{','.join(f for f in fs.split(',') if f != 'zeroize')}" for p, _, fs in ghash]
-    second = [f"{p}{source}|{fs}" for p, _, fs in ghash for source in ("", " (/control)")]
-    for label, lines, crates in (
-        ("the adapter's wasm32 build", graph, ZEROIZE_CRATES),
-        ("control: ghash without its zeroize feature", without, ("ghash",)),
-        ("control: a second ghash", second, ("ghash",)),
-        ("control: no ghash", [g for g in graph if not g.startswith("ghash ")], ("ghash",)),
-    ):
-        found += zeroize_problems(label, lines, crates)
-    stack = dict.fromkeys(line for line in graph if line.partition(" ")[0] in ZEROIZE_CRATES)
-    return found, list(stack)
+def check(copy: Path) -> list[str]:
+    """Checks 1 to 3 of the docstring, in the empty directory `copy`."""
+    problems = config_problems((ROOT / CONFIG_REL).read_text(encoding="utf-8"))
+    argv = ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"]
+    metadata = command(argv, ROOT)
+    if metadata.returncode != 0:
+        return problems + [f"{' '.join(argv)} failed:\n{metadata.stderr}"]
+    target_dir = json.loads(metadata.stdout)["target_directory"]
+    copy_tree(copy)
 
-
-# ---------------------------------------------------------------- the guard's crate
-
-# The manifest of the guard's crate, before its dependency lines
-# (probe_dependencies); the probes are written for edition 2024.
-MANIFEST = f"""\
-[package]
-name = "{GUARD}"
-version = "0.0.0"
-edition = "2024"
-publish = false
-
-[dependencies]
-"""
-# The crate's library root. check appends LATE_MODULES to it after the run
-# without options, which the calls in those modules would fail; warnings: no
-# lint that the run does not force to warn may fail it.
-LIB_ROOT = """\
-#[allow(dead_code)]
-mod controls;
-#[allow(dead_code)]
-mod migrations;
-"""
-LATE_MODULES = "\n#[allow(warnings)]\nmod probes;\n#[allow(dead_code)]\nmod release;\n"
-_MARK = re.compile(r"//@ (\S+) (\S+)")
-
-# Controls of the guard's crate. A `//@ <name> <check>` comment marks the line
-# a check must report; `//@ <name> accepted` and `//@ <name> end` mark the
-# lines of a case no check may report.
-CONTROLS = """\
-use std::time::Duration;
-
-#[allow(clippy::disallowed_methods, reason = "a control")] //@ on-fn accepted
-fn on_fn() {
-    std::thread::sleep(Duration::ZERO);
-} //@ on-fn end
-
-fn on_statement() {
-    #[allow(clippy::disallowed_methods, reason = "a control")] //@ on-statement accepted
-    std::thread::sleep(Duration::ZERO); //@ on-statement end
-}
-
-fn on_let() {
-    #[allow(clippy::disallowed_methods, reason = "a control")] //@ on-let accepted
-    let _at = std::time::Instant::now(); //@ on-let end
-}
-
-#[expect(clippy::disallowed_methods, reason = "a control")] //@ expect accepted
-fn expect() {
-    std::thread::sleep(Duration::ZERO);
-} //@ expect end
-
-#[allow(clippy::disallowed_types, reason = "a control")] //@ on-type accepted
-fn on_type(_rx: Option<std::sync::mpsc::Receiver<u8>>) {} //@ on-type end
-
-#[allow(clippy::disallowed_methods, reason = "a control")] //@ item-without-call accepted
-fn with_an_item_that_makes_no_call() {
-    struct Local;
-    impl Drop for Local {
-        fn drop(&mut self) {}
-    }
-    let _local = Local;
-    std::thread::sleep(Duration::ZERO);
-} //@ item-without-call end
-
-fn macro_built() {
-    macro_rules! hushed {
-        ($a:meta) => {
-            #[$a]
-            fn f() {
-                std::thread::sleep(Duration::ZERO); //@ macro-built call
-            }
-            f();
-        };
-    }
-    hushed!(allow(clippy::disallowed_methods));
-}
-
-#[allow(clippy::all)]
-fn group() {
-    std::thread::sleep(Duration::ZERO); //@ group call
-}
-
-#[warn(warnings)]
-fn warn_warnings() {
-    std::thread::sleep(Duration::ZERO); //@ warn-warnings call
-}
-
-mod module_warn_warnings {
-    #![warn(warnings)]
-    fn f() {
-        std::thread::sleep(std::time::Duration::ZERO); //@ module-warn-warnings call
-    }
-}
-
-#[allow(clippy::disallowed_methods)] //@ no-reason allow
-fn no_reason() {
-    std::thread::sleep(Duration::ZERO); //@ no-reason call
-}
-
-#[allow(clippy::disallowed_methods, reason = " ")] //@ blank-reason allow
-fn blank_reason() {
-    std::thread::sleep(Duration::ZERO); //@ blank-reason call
-}
-
-fn inner_attribute() {
-    #![allow(clippy::disallowed_methods, reason = "a control")] //@ inner allow
-    std::thread::sleep(Duration::ZERO); //@ inner call
-}
-
-#[allow(clippy::disallowed_methods, reason = "a control")] //@ on-module allow
-mod on_module {
-    fn f() {
-        std::thread::sleep(std::time::Duration::ZERO); //@ on-module call
-    }
-}
-
-struct OnImpl;
-#[allow(clippy::disallowed_methods, reason = "a control")] //@ on-impl allow
-impl OnImpl {
-    fn nap() {
-        std::thread::sleep(Duration::ZERO); //@ on-impl call
-    }
-}
-
-struct InConst;
-#[allow(clippy::disallowed_methods, reason = "a control")] //@ on-const allow
-const _: () = {
-    impl InConst {
-        fn nap() {
-            std::thread::sleep(Duration::ZERO); //@ on-const call
-        }
-    }
-};
-
-#[allow(clippy::disallowed_methods, reason = "a control")] //@ on-trait allow
-trait OnTrait {}
-
-#[allow(clippy::disallowed_methods, reason = "a control")] //@ on-struct allow
-struct OnStruct;
-
-#[allow(clippy::disallowed_methods, reason = "a control")] //@ on-enum allow
-enum OnEnum {}
-
-#[allow(clippy::disallowed_methods, reason = "a control")] //@ on-union allow
-union OnUnion {
-    a: u8,
-}
-
-#[allow(clippy::disallowed_methods, reason = "a control")] //@ on-type-alias allow
-type OnTypeAlias = u8;
-
-mod on_use {
-    #![allow(clippy::useless_attribute)]
-    #[allow(clippy::disallowed_methods, reason = "a control")] //@ on-use allow
-    use std::time::Instant;
-    fn f(_at: Instant) {}
-}
-
-mod on_extern {
-    #![allow(clippy::useless_attribute)]
-    #[allow(clippy::disallowed_methods, reason = "a control")] //@ on-extern allow
-    extern crate std as on_extern;
-}
-
-#[allow(clippy::disallowed_methods, reason = "a control")] //@ on-macro-rules allow
-#[allow(unused_macros)]
-macro_rules! on_macro_rules {
-    () => {};
-}
-
-#[allow(clippy::disallowed_methods, reason = "a control")] //@ on-static allow
-static ON_STATIC: u8 = 0;
-
-#[allow(clippy::disallowed_methods, reason = "a control")] //@ on-named-const allow
-pub(crate) const ON_NAMED_CONST: u8 = 0;
-
-#[allow(clippy::disallowed_methods, reason = "a control")]
-fn with_a_nested_fn() {
-    fn nested() {
-        std::thread::sleep(Duration::ZERO); //@ nested-fn call
-    }
-    nested();
-}
-
-#[allow(clippy::r#disallowed_methods, reason = "a control")]
-fn raw_identifier() {
-    std::thread::sleep(Duration::ZERO); //@ raw-identifier call
-}
-
-#[cfg_attr( //@ cfg-attr allow
-    target_arch = "wasm32",
-    allow(clippy::disallowed_methods, reason = "a control")
-)]
-fn in_cfg_attr() {
-    std::thread::sleep(Duration::ZERO); //@ cfg-attr call
-}
-
-#[allow(unused_attributes)]
-fn on_macro() {
-    macro_rules! nothing {
-        () => {};
-    }
-    #[allow(clippy::disallowed_methods, reason = "a control")] //@ on-macro allow
-    nothing!();
-}
-
-fn on_block() {
-    #[allow(clippy::disallowed_methods, reason = "a control")] //@ on-block allow
-    {
-        std::thread::sleep(Duration::ZERO); //@ on-block call
-    };
-}
-
-fn on_arm(x: u8) {
-    match x {
-        #[allow(clippy::disallowed_methods, reason = "a control")] //@ on-arm allow
-        0 => std::thread::sleep(Duration::ZERO), //@ on-arm call
-        _ => std::thread::yield_now(),
-    }
-}
-
-fn on_generic<#[allow(clippy::disallowed_methods, reason = "a control")] T>() {} //@ on-generic allow
-struct OnGeneric;
-
-#[allow(clippy::disallowed_methods, reason = "a control")]
-fn raised_inside() {
-    #[warn(warnings, clippy::disallowed_methods)]
-    std::thread::sleep(Duration::ZERO); //@ raised-inside step
-}
-
-#[allow(clippy::await_holding_lock, reason = "a control")]
-async fn await_holding(m: &std::sync::Mutex<u8>) {
-    let guard = m.lock().unwrap(); //@ await-holding await
-    std::future::ready(()).await;
-    drop(guard);
-}
-
-#[allow(clippy::disallowed_methods, reason = "a control")] //@ mod-line allow
-mod allowed_module;
-
-#[path = "../outside_src.rs"]
-mod outside_src;
-
-mod included {
-    include!("controls.inc");
-}
-"""
-
-# The same two cases in a file outside src/ that #[path] names and in a file of
-# another extension that include! reads.
-OTHER_FILE_CONTROLS = """\
-#[allow(clippy::disallowed_methods, reason = "a control")] //@ {name}-accepted accepted
-pub(crate) fn accepted() {{
-    std::thread::sleep(std::time::Duration::ZERO);
-}} //@ {name}-accepted end
-
-#[allow(clippy::disallowed_methods)] //@ {name}-refused allow
-pub(crate) fn refused() {{
-    std::thread::sleep(std::time::Duration::ZERO); //@ {name}-refused call
-}}
-"""
-
-# An allow with a reason on the `mod mNNNN_<name>;` line of a code-body
-# migration, in a src/migrations/mod.rs beside the library root, as
-# CONTRIBUTING.md lays one out: refused, as on any other `mod` item, and the
-# call in the module's file stays uncovered.
-MIGRATION_CONTROLS = {
-    "src/migrations/mod.rs": """\
-#[allow(clippy::disallowed_methods, reason = "a control")] //@ migration-mod allow
-mod m9999_wasm_clippy_guard_control;
-""",
-    "src/migrations/m9999_wasm_clippy_guard_control.rs": """\
-pub(crate) fn nap() {
-    std::thread::sleep(std::time::Duration::ZERO); //@ migration-body call
-}
-""",
-}
-
-# The crate's build script, which hands its compiler the CLIPPY_ARGS and
-# CLIPPY_CONF_DIR cargo clippy set, written differently but read the same by
-# clippy-driver (an empty option, which it skips; the directory with `/.`): the
-# dep-info check must report both for the crate, and clippy lints the crate's
-# probes and controls as it lints any other crate.
-BUILD_SCRIPT = """\
-fn main() {
-    println!("cargo::rerun-if-env-changed=CLIPPY_ARGS");
-    println!("cargo::rerun-if-env-changed=CLIPPY_CONF_DIR");
-    if let Ok(args) = std::env::var("CLIPPY_ARGS") {
-        println!("cargo::rustc-env=CLIPPY_ARGS={args}__CLIPPY_HACKERY__");
-    }
-    if let Ok(dir) = std::env::var("CLIPPY_CONF_DIR") {
-        println!("cargo::rustc-env=CLIPPY_CONF_DIR={dir}/.");
-    }
-}
-"""
-
-# A call no allow covers, compiled only without debug assertions, as in the
-# release build the module ships in; LATE_MODULES declares its module.
-RELEASE_CONTROL = """\
-pub(crate) fn release_profile() {
-    #[cfg(not(debug_assertions))]
-    std::thread::sleep(std::time::Duration::ZERO); //@ release-profile call
-}
-"""
-
-
-# Control inputs of the checks that no planted file reaches, each checked
-# alone, with the words of each finding it must give. For config_problems,
-# with a method probe of std::thread::sleep only: a text that does not parse,
-# and one with each refusal of a malformed text.
-_SLEEP = '{ path = "std::thread::sleep", reason = "a control" }'
-CONFIG_CONTROLS = {
-    "a clippy.toml that does not parse": ("disallowed-methods = [", ["cannot be read"]),
-    "a malformed clippy.toml": (
-        f"msrv = '1.91.1'\ndisallowed-types = 'x'\ndisallowed-methods = [{_SLEEP}, {_SLEEP}, 'x',"
-        " { path = 'std::thread::spawn', reason = 'r', replacement = 'y' },"
-        " { path = 'std::thread::park' }]",
-        [
-            "msrv is not one",
-            "types is not a list",
-            "entry 'x' is",
-            "'replacement'",
-            "{'path': 'std::thread::park'} is",
-            "more than",
-        ],
-    ),
-}
-# For probe_dependencies, with the build: a library in two versions, the
-# adapter's package under another library name (check adds it), and a path
-# of each and of a crate no package has. The control crates' names hold
-# ": ", which rustc refuses in a crate name, so no library that the
-# adapter's wasm32 build compiles is taken for one of them, and no probe's
-# path is one of these paths.
-CONTROL_BUILD = [
-    {"id": f"twice {version}", "name": "twice", "version": version}
-    | {"targets": [{"name": "control: twice", "kind": ["lib"]}]}
-    for version in ("1.0.0", "2.0.0")
-]
-CONTROL_ADAPTER = {"targets": [{"name": "control: adapter", "kind": ["lib"]}]}
-CONTROL_PATHS = {
-    "control: absent::f": "it has none",
-    "control: twice::f": "it has twice v1.0.0, twice v2.0.0",
-    "control: adapter::f": f"it has {ADAPTER} v",
-}
-# For lock_problems, a package that a Cargo.lock gains.
-CONTROL_LOCK = '\n[[package]]\nname = "wasm-clippy-guard-control"\nversion = "0.0.0"\n'
-# The controls of the two checks above, which check matches before the first
-# run, where their findings on the tree stop the guard; COPY_LOCK_CONTROL is
-# expected only when the copy's Cargo.lock was written, which a plant
-# problem stops.
-EARLY_CONTROLS = [
-    *(Control("dependency", "plant", path, words) for path, words in CONTROL_PATHS.items()),
-    Control("lock", "plant", "control: a lock", "wasm-clippy-guard-control 0.0.0 is added"),
-    Control("lock", "examined", "control: a lock"),
-]
-COPY_LOCK_CONTROL = Control("lock", "examined", "the copy's Cargo.lock")
-
-
-def _inside(copy: Path, rel: str) -> list[Finding]:
-    """A finding when the copy's path `rel`, or a directory on the way to it, is
-    a symbolic link out of the copy or into a loop (for which resolve raises
-    RuntimeError in Python 3.11 and 3.12): a write there would change a file
-    outside the copy, the caller's working tree among them."""
-    try:
-        if (copy / rel).resolve().is_relative_to(copy.resolve()):
-            return []
-    except (OSError, RuntimeError):
-        pass
-    text = f"{rel} leads out of the copy or into a loop through a symbolic link"
-    return [Finding("plant", rel, f"{text}; the guard writes nothing to it")]
-
-
-def _write(copy: Path, rel: str, text: str, mode: str = "x") -> list[Finding]:
-    """Write `text` to the copy's file `rel` (mode "x": a new file, "a": an
-    append, "w": a replacement), or give a finding that says why it cannot."""
-    if found := _inside(copy, rel):
-        return found
-    try:
-        (copy / rel).parent.mkdir(parents=True, exist_ok=True)
-        with open(copy / rel, mode, encoding="utf-8") as file:
-            file.write(text)
-    except (OSError, UnicodeError) as error:
-        return [Finding("plant", rel, f"{rel} cannot be written: {error}")]
-    return []
-
-
-def toml_string(text: str) -> str:
-    """`text` as a TOML basic string: JSON's escapes are TOML's, and TOML also
-    needs DEL escaped. A lone surrogate stays as it is, and writing it fails."""
-    return json.dumps(text, ensure_ascii=False).replace("\x7f", "\\u007f")
-
-
-def probe_dependencies(
-    paths: list[str], build: list[dict], adapter: str, members: set[str]
-) -> tuple[list[str], list[Finding]]:
-    """The [dependencies] lines of the guard's crate: for each crate that a
-    path of `paths` starts with, other than std, core and alloc, the one
-    package of `build` (the adapter's wasm32 build) whose library (a lib, rlib
-    or dylib target) has that name, `-` read as `_`; a workspace member (its
-    id in `members`) by its directory, any other package by its exact version,
-    each without default features, so that the crate adds no package and asks
-    for no feature. A finding names each path whose crate no package or more
-    than one has, or is the adapter's (`adapter`, its id), which depends on
-    the guard's crate."""
-    lines, found = [], []
-    for crate in sorted({p.partition("::")[0] for p in paths} - {"std", "core", "alloc"}):
-        named = [
-            p
-            for p in build
-            for t in p["targets"]
-            if {"lib", "rlib", "dylib"} & set(t["kind"]) and t["name"].replace("-", "_") == crate
+    code, messages, stderr = run_clippy(copy, target_dir)
+    if code != 0:
+        errors = [m.get("rendered") or m["message"] for m in messages if m["level"] == "error"]
+        return problems + [
+            f"the clippy step failed in the copy before any plant (exit status {code}):\n"
+            + ("\n".join(errors) or stderr)
         ]
-        if len(named) == 1 and named[0]["id"] != adapter:
-            package = named[0]
-            if package["id"] in members:
-                directory = os.path.relpath(Path(package["manifest_path"]).parent, ROOT / GUARD)
-                source = f"path = {toml_string(directory)}"
-            else:
-                source = f"version = {toml_string('=' + package['version'])}"
-            name = toml_string(package["name"])
-            lines.append(f"{crate} = {{ package = {name}, {source}, default-features = false }}")
-            continue
-        packages = ", ".join(f"{p['name']} v{p['version']}" for p in named) or "none"
-        why = (
-            f"its probe needs the library {crate} of one package of the adapter's wasm32 build"
-            f" other than the adapter, which depends on the guard's crate; it has {packages}"
-        )
-        found += [Finding("plant", p, f"{p}: {why}") for p in paths if p.startswith(crate + "::")]
-    return lines, found
+    warned = config_warnings(messages, copy).values()
+    problems += [f"the clippy step warned about {CONFIG_REL}:\n{text}" for text in warned]
 
+    expected = {}
+    for rel, find, lines in PLANTS:
+        written = insert(copy, rel, find, [line for line, _ in lines], True)
+        if isinstance(written, str):
+            return problems + [written]
+        expected |= {f"{rel}:{number}": path for number, (_, path) in zip(written, lines)}
+    entry = f'    {{ path = "{MISSPELT}", reason = "the guard\'s control" }},'
+    written = insert(copy, CONFIG_REL, MISSPELT_AFTER, [entry], False)
+    if isinstance(written, str):
+        return problems + [written]
 
-def lock_problems(pairs: list[tuple[str, str, str]]) -> list[Finding]:
-    """A finding, at each pair's label, for each package (by name, version and
-    source) whose entry is not the same in the pair's two Cargo.lock texts,
-    the guard's crate and the dependencies on it left out; and an "examined"
-    finding for each pair, which a control expects for the tree's pair."""
-    found = []
-    for label, *locks in pairs:
-        found.append(Finding("examined", label, f"examined {label}"))
-        tree, copy = (
-            {
-                (p["name"], p["version"], p.get("source")): p
-                | {"dependencies": [d for d in p.get("dependencies", []) if d != GUARD]}
-                for p in tomllib.loads(text).get("package", [])
-                if p["name"] != GUARD
-            }
-            for text in locks
-        )
-        for key in sorted(tree.keys() | copy.keys(), key=str):
-            if tree.get(key) != copy.get(key):
-                state = "added" if key not in tree else "dropped" if key not in copy else "changed"
-                text = f"{label}: {key[0]} {key[1]} is {state} by the guard's crate"
-                found.append(Finding("plant", label, text))
-    return found
-
-
-def crate_files(dependencies: list[str]) -> tuple[dict[str, str], list[tuple[str, str, int]]]:
-    """The files of the guard's crate, by their paths in the copy, and the
-    kind, path and line of each probe in its probe file, which holds each
-    probe item, and CONTROL_PROBE, in a module of its own."""
-    lines, spans = [], []
-    probes = [(kind, *entry) for kind, table in KINDS.values() for entry in table.items()]
-    for kind, path, items in probes + [(*CONTROL_PROBE[:2], [CONTROL_PROBE[2]])]:
-        for item in items:
-            lines += [f"mod probe_{len(spans)} {{", item, "}"]
-            spans.append((kind, path, len(lines) - 1))
-    files = {
-        "Cargo.toml": MANIFEST + "".join(f"{line}\n" for line in dependencies),
-        "build.rs": BUILD_SCRIPT,
-        "src/lib.rs": LIB_ROOT,
-        "src/controls.rs": CONTROLS,
-        "src/controls/allowed_module.rs": "",
-        "outside_src.rs": OTHER_FILE_CONTROLS.format(name="path"),
-        "src/controls.inc": OTHER_FILE_CONTROLS.format(name="include"),
-        **MIGRATION_CONTROLS,
-        "src/release.rs": RELEASE_CONTROL,
-        "src/probes.rs": "\n".join(lines) + "\n",
+    code, messages, _ = run_clippy(copy, target_dir, "--keep-going")
+    if code == 0:
+        problems.append("the clippy step passed in the copy with the plants")
+    reported = {
+        location(span, copy): message["message"]
+        for message in messages
+        if message["level"] == "error"
+        for span in message.get("spans", [])
+        if span.get("is_primary")
     }
-    files = {f"{GUARD}/{rel}": text for rel, text in files.items()}
-    return files | {rel: text for rel, (text, _) in CONTROL_CARGO_CONFIGS.items()}, spans
-
-
-def plant(copy: Path, metadata: dict, adapter: dict, files: dict[str, str]) -> list[Finding]:
-    """Add the guard's crate (`files`) to the copy, as a dependency of the
-    adapter (its package in the tree's `metadata`), and CONTROL_ENTRY to the
-    top of the copy's disallowed-methods list; a finding for each part that
-    cannot be made."""
-    taken = {p["name"] for p in metadata["packages"]}
-    taken |= {d.get("rename") for d in adapter["dependencies"]}
-    tree_has = {
-        f"{GUARD}, where the guard adds its crate": os.path.lexists(ROOT / GUARD),
-        f"a package or a dependency named {GUARD}": GUARD in taken,
-    }
-    found = [Finding("plant", GUARD, f"the tree has {what}") for what in tree_has if tree_has[what]]
-    for rel, text in () if found else files.items():
-        found += _write(copy, rel, text)
-    manifest = os.path.relpath(adapter["manifest_path"], ROOT)
-    path = toml_string(os.path.relpath(GUARD, os.path.dirname(manifest)))
-    found += _write(copy, manifest, f"\n[dependencies.{GUARD}]\npath = {path}\n", "a")
-    try:
-        config = (copy / CONFIG_REL).read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as error:
-        return found + [Finding("plant", CONFIG_REL, f"{CONFIG_REL} cannot be read: {error}")]
-    entry = f'    {{ path = "{CONTROL_ENTRY}", reason = "a control" }},\n'
-    text, count = re.subn(
-        r"^disallowed-methods = \[\n", lambda m: m.group() + entry, config, count=1, flags=re.M
-    )
-    if count != 1 or CONTROL_ENTRY in config:
-        why = f"has no `disallowed-methods = [` line, or names {CONTROL_ENTRY}"
-        return found + [Finding("plant", CONFIG_REL, f"{CONFIG_REL} {why}")]
-    return found + _write(copy, CONFIG_REL, text, "w")
-
-
-def all_controls(files: dict[str, str], copy: Path, crates: dict) -> list[Control]:
-    """The controls that the `//@` comments of `files` (path -> text) mark, and
-    those of the checks that no planted file reaches."""
-    marked = []
-    for rel, text in files.items():
-        opened = {}
-        for number, line in enumerate(text.splitlines(), 1):
-            for name, mark in _MARK.findall(line):
-                if mark == "accepted":
-                    opened[name] = number
-                elif mark == "end":
-                    lines = range(opened.pop(name), number + 1)
-                    marked.append(Control(name, None, rel, lines=lines))
-                else:
-                    marked.append(Control(name, mark, f"{rel}:{number}"))
-    zeroize = ("ghash without its zeroize feature", "a second ghash", "no ghash")
-    return marked + [
-        Control("unlisted probe", "entries", CONFIG_REL, f"{CONTROL_PROBE[1]}: has a method"),
-        Control("unlisted probe", "probe", CONTROL_PROBE[1]),
-        Control("unresolved entry", "entries", CONFIG_REL, f"{CONTROL_ENTRY}: listed in"),
-        Control("unresolved entry", "clippy.toml warning", CONTROL_ENTRY),
-        *(
-            Control("clippy.toml", "entries", f"control: {label}", words)
-            for label, (_, expected) in CONFIG_CONTROLS.items()
-            for words in expected
-        ),
-        Control("build script", "dep-info", GUARD, "CLIPPY_ARGS"),
-        Control("build script", "dep-info", GUARD, "CLIPPY_CONF_DIR"),
-        Control("environment", "examined", "the environment"),
-        Control("environment", "examined", "a control environment"),
-        Control("environment", "environment", "a control environment", "RUSTC_WRAPPER"),
-        Control("cargo configuration", "examined", "the copy's cargo configuration"),
-        Control("cargo configuration", "examined", "a control configuration"),
-        *(
-            Control("cargo configuration", "cargo configuration", str(copy / rel), words)
-            for rel, (_, words) in CONTROL_CARGO_CONFIGS.items()
-        ),
-        Control("zeroize", "examined", "the adapter's wasm32 build"),
-        *(Control("zeroize", "examined", f"control: {label}") for label in zeroize),
-        Control("zeroize", "zeroize", f"control: {zeroize[0]}: ghash", "without its zeroize"),
-        Control("zeroize", "zeroize", f"control: {zeroize[1]}: ghash", " packages ("),
-        Control("zeroize", "zeroize", f"control: {zeroize[2]}: ghash", "is not in the build"),
-        *(
-            Control("dep-info", "examined", f"{crate} ({run})")
-            for crate in sorted(crates)
-            for run in ("without options", "with --force-warn")
-        ),
+    for where, path in expected.items():
+        if reported.get(where) != f"use of a disallowed method `{path}`":
+            got = reported.get(where, "no error there")
+            problems.append(f"the clippy step did not refuse the plant at {where}, {path} ({got})")
+    warned = config_warnings(messages, copy)
+    if not any(MISSPELT in text for text in warned):
+        problems.append(f"the clippy step did not warn about the control entry {MISSPELT}")
+    problems += [
+        f"the clippy step warned about {CONFIG_REL}:\n{rendered}"
+        for text, rendered in warned.items()
+        if MISSPELT not in text
     ]
-
-
-def match_controls(findings: list[Finding], controls: list[Control]) -> tuple[list, list]:
-    """The controls that did not behave as planted, and the findings no control
-    expects (the problems)."""
-    failures, expected = [], set()
-    for control in controls:
-        if control.check is None:
-            for finding in findings:
-                file, _, line = finding.where.rpartition(":")
-                if file == control.where and line.isdigit() and int(line) in control.lines:
-                    failures.append(f"control {control.name} must be accepted: {finding.text}")
-                    expected.add(finding)
-            continue
-        hits = [
-            f
-            for f in findings
-            if (f.check, f.where) == (control.check, control.where) and control.expect in f.text
-        ]
-        if not hits:
-            failures.append(
-                f"control {control.name}: the {control.check} check reported nothing at"
-                f" {control.where}"
-            )
-        expected.update(hits)
-    return failures, [f for f in findings if f not in expected]
+    if not problems:
+        print(f"plants: the clippy step passed without them and refused all {len(expected)}")
+    return problems
 
 
 def _stop(signum: int, _frame) -> None:
     raise SystemExit(128 + signum)
-
-
-def check(metadata: dict, copy: Path) -> int:
-    count = copy_tree(copy)
-    build, members = adapter_build(metadata)
-    ids = set(metadata["workspace_members"])
-    paths = [*METHOD_PROBES, *TYPE_PROBES, *CONTROL_PATHS]
-    adapter = members[ADAPTER]["id"]
-    control_build = CONTROL_BUILD + [members[ADAPTER] | CONTROL_ADAPTER]
-    dependencies, found = probe_dependencies(paths, build + control_build, adapter, ids)
-    files, spans = crate_files(dependencies)
-    planted = plant(copy, metadata, members[ADAPTER], files) + _inside(copy, "Cargo.lock")
-    copied, error = (None, "") if planted else cargo_metadata(copy, "--offline")
-    lock = (ROOT / "Cargo.lock").read_text(encoding="utf-8")
-    locks = [("control: a lock", lock, lock + CONTROL_LOCK)]
-    if copied:
-        locks.append(("the copy's Cargo.lock", lock, (copy / "Cargo.lock").read_text("utf-8")))
-    elif not planted:
-        planted.append(Finding("plant", "Cargo.lock", f"cargo metadata --offline failed:\n{error}"))
-    early = EARLY_CONTROLS + [COPY_LOCK_CONTROL] * bool(copied)
-    failures, problems = match_controls(found + planted + lock_problems(locks), early)
-    for text in dict.fromkeys([f.text for f in problems] + failures):
-        print(f"FAIL: {text}", file=sys.stderr)
-    if failures or problems:
-        return 1
-    crates = adapter_build(copied)[1]
-    planted = all_controls(files, copy, crates)
-    target_dir = metadata["target_directory"]
-    # Each dep-info is read before the next run, which writes the same files.
-    plain = run_clippy(copy, target_dir, [])
-    read_plain, findings = dep_info(plain, crates, copy, "without options")
-    if plain.code != 0:
-        return unfinished(plain, "without options", read_plain, crates)
-    if late := _write(copy, f"{GUARD}/src/lib.rs", LATE_MODULES, "a"):
-        print(f"FAIL: {late[0].text}", file=sys.stderr)
-        return 1
-    forced = run_clippy(copy, target_dir, FORCE_WARN)
-    read_forced, found = dep_info(forced, crates, copy, "with --force-warn")
-    findings += found
-    if forced.code != 0:
-        return unfinished(forced, "with --force-warn", read_forced, crates)
-    findings += driver_problems(read_plain, read_forced, str(copy / CONF_REL))
-    findings += config_warnings({"plain": plain, "forced": forced}, (copy / CONFIG_REL).resolve())
-    probes = {kind: set(table) for kind, table in KINDS.values()}
-    probes[CONTROL_PROBE[0]].add(CONTROL_PROBE[1])
-    findings += config_problems(CONFIG_REL, (copy / CONFIG_REL).read_text(encoding="utf-8"), probes)
-    for label, (text, _) in CONFIG_CONTROLS.items():
-        sleep = {"method": {"std::thread::sleep"}, "type": set()}
-        findings += config_problems(f"control: {label}", text, sleep)
-
-    guard = copy / GUARD
-    covered, allows, read = {}, Counter(), 0
-    for path in sorted({p for listed, _ in read_forced.values() for p in listed}):
-        if not path.is_relative_to(copy) or not path.is_file():
-            continue
-        rel = path.relative_to(copy).as_posix()
-        attributes = lint_attributes(rel, path.read_bytes().decode("latin-1"))
-        covered[path] = attributes.covered
-        findings += attributes.findings
-        if not path.is_relative_to(guard):
-            allows["fn"] += attributes.on_functions
-            allows["statement"] += attributes.on_statements
-            read += 1
-    forced_reports = reports(forced, copy)
-    probe_path = guard / "src" / "probes.rs"
-    findings += call_problems(forced_reports, reports(plain, copy), covered, copy, probe_path)
-    findings += probe_problems(forced_reports, probe_path, spans)
-    findings += environment_problems(
-        [("the environment", os.environ), ("a control environment", CONTROL_ENVIRONMENT)]
-    )
-    findings += cargo_config_problems(
-        [
-            ("the copy's cargo configuration", cargo_config_files(copy)),
-            ("a control configuration", [copy / rel for rel in CONTROL_CARGO_CONFIGS]),
-        ]
-    )
-    found, stack = zeroize_check(copy)
-    findings += found
-
-    failures, problems = match_controls(findings, planted)
-    for text in [problem.text for problem in problems] + failures:
-        print(f"FAIL: {text}", file=sys.stderr)
-    calls = sum(not r.path.is_relative_to(guard) for r in forced_reports)
-    unreported = sum(1 for f in findings if f.check == "probe" and f.where != CONTROL_PROBE[1])
-    print(
-        f"the tree: {calls} reports with --force-warn, {sum(allows.values())} accepted"
-        f" allows ({allows['fn']} on functions, {allows['statement']} on statements), in {read}"
-        f" files of its {len(crates) - 1} crates (a copy of {count} files)"
-    )
-    print(f"probes: {len(spans) - 1 - unreported} of {len(spans) - 1} reported with --force-warn")
-    print(f"controls: {len(early) + len(planted)}, {len(failures)} not as planted")
-    print(f"zeroize: {', '.join(stack)}")
-    return 1 if failures or problems else 0
 
 
 def main() -> int:
@@ -2033,21 +320,16 @@ def main() -> int:
     sys.stdout.reconfigure(line_buffering=True)
     for stop in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(stop, _stop)
-    # The workflow's toolchain action exports CARGO_TERM_COLOR=always to the
-    # steps after it, and under it cargo tree writes escape codes into its
-    # lines. Set for every command the guard starts, it makes a read that the
-    # setting changes fail on every machine, not only in CI.
-    os.environ["CARGO_TERM_COLOR"] = "always"
-    metadata, error = cargo_metadata(ROOT, "--locked")
-    if metadata is None:
-        sys.exit(f"error: cargo metadata failed:\n{error}")
-    print(f"crates the wasm build compiles: {', '.join(sorted(adapter_build(metadata)[1]))}")
-    copy = Path(tempfile.mkdtemp(prefix="wasm-clippy-guard-"))
+    copy = Path(tempfile.mkdtemp(prefix="wasm-clippy-guard-")).resolve()
     try:
-        status = check(metadata, copy)
+        problems = check(copy)
     finally:
         shutil.rmtree(copy, ignore_errors=True)
-    return 0 if status == 0 else 1
+    found, stack = zeroize_problems()
+    for problem in problems + found:
+        print(f"FAIL: {problem}", file=sys.stderr)
+    print(f"zeroize: {', '.join(stack)}")
+    return 1 if problems or found else 0
 
 
 if __name__ == "__main__":
