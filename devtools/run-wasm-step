@@ -111,15 +111,15 @@ wasm_bindgen_cli_advice() {
 # says why); the runner runs the module under the node on PATH. Cargo splits
 # the variable's value at whitespace into the runner's path and the arguments
 # it gives the runner. A value the caller sets goes to cargo as it is, unless
-# it holds no word (it is empty or only whitespace, which cargo refuses);
-# then this sets the one on PATH, else the one in cargo's bin directory
-# ($CARGO_HOME/bin), where `cargo install` puts it, by its full path, and
-# stops if that path holds whitespace. Before `cargo test` runs, the suite
-# runs the value's first word with --version and stops unless the first line
-# it prints begins with the words wasm-bindgen-test-runner and the crate's
-# version; it gives the command that installs that version when it finds no
-# runner, or one of another version. It splits the value, and looks for
-# whitespace in the path it chooses, at ASCII whitespace only, where cargo
+# it holds no word (it is empty or only ASCII whitespace, a value cargo
+# refuses); then this sets the one on PATH, else the one in cargo's bin
+# directory ($CARGO_HOME/bin), where `cargo install` puts it, by its full
+# path, and stops if that path holds whitespace. Before `cargo test` runs,
+# the suite runs the value's first word with --version and stops unless the
+# first line it prints begins with the words wasm-bindgen-test-runner and the
+# crate's version; it gives the command that installs that version when it
+# finds no runner, or one of another version. It splits the value, and looks
+# for whitespace in the path it chooses, at ASCII whitespace only, where cargo
 # splits at any Unicode whitespace: a value whose path and arguments other
 # whitespace separates stops at this check, and a path that holds such
 # whitespace passes it, and cargo then takes the part before that whitespace
