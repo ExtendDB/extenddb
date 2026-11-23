@@ -408,10 +408,7 @@ they compute the HMAC of any message under the key) and of the bytes of the
 message after its last whole 64-byte block (the message of `catalog_key_id` is
 the catalog key). Which of them a call leaves depends on the build profile,
 the caller and the length of the message; in a release build as in a dev
-build, a call can leave the states and the message bytes. A native build's
-AWS-LC backend wipes its copy of the key block and its HMAC context, but a
-call there can leave copies of the states and the message bytes on the stack
-too.
+build, a call can leave the states and the message bytes.
 
 The AES-256-GCM cipher that seals stored secrets (`seal` and `open` in
 `crates/core/src/crypto.rs`) compiles in too, but no request reaches it: the

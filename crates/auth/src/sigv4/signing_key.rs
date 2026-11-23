@@ -23,9 +23,10 @@ use zeroize::Zeroizing;
 /// - the 32-byte array that `extenddb_core::crypto::hmac_sha256` returns for
 ///   each step, and the tag its backend computes, on the stack;
 /// - copies of the key-derived state that the HMAC of each step can leave on
-///   the stack, on either backend, and on `wasm32` copies of its key as well
+///   the stack, with either backend, and on `wasm32` copies of its key as well
 ///   (the README at the root of the repository this crate's manifest names,
-///   in its section "What it does not do", says what each backend can leave).
+///   in its section "What it does not do", says what the `wasm32` backend can
+///   leave).
 ///
 /// # Arguments
 /// * `secret` - The plaintext secret access key.
@@ -77,8 +78,7 @@ pub fn compute_signature(signing_key: &[u8; 32], string_to_sign: &str) -> String
 fn hmac_sha256(key: &[u8], data: &[u8], out: &mut [u8; 32]) {
     // HMAC-SHA256 accepts a key of any length (RFC 2104). The shared crypto
     // module chooses the backend (AWS-LC on the server, pure-Rust on wasm);
-    // which of them wipes its key-derived state is listed on
-    // `derive_signing_key_into`.
+    // what each can leave on the stack is listed on `derive_signing_key_into`.
     out.copy_from_slice(&extenddb_core::crypto::hmac_sha256(key, data));
 }
 
