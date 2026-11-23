@@ -47,7 +47,10 @@ jobs:
     timeout-minutes: 30
     env:
       # The wasm-pack release to install; the comment on the wasm tooling
-      # steps below says why.
+      # steps below says why. README.md's "Building it" describes what one
+      # named wasm-pack release does, so a change of this value needs that
+      # section checked against the new release, and the release it names
+      # changed to match.
       WASM_PACK_VERSION: "0.15.1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -77,10 +80,9 @@ jobs:
 
       # wasm-bindgen-cli is installed at the version of the wasm-bindgen crate
       # in Cargo.lock, which the first step below reads, and wasm-pack at the
-      # job's WASM_PACK_VERSION, the release README.md's "Building it"
-      # describes, so that a new wasm-pack release does not change how the
-      # corpus step builds the module. The CLI must be of the crate's version:
-      # its wasm-bindgen, which writes the JS glue, and its
+      # job's WASM_PACK_VERSION, so that a new wasm-pack release does not
+      # change how the corpus step builds the module. The CLI must be of the
+      # crate's version: its wasm-bindgen, which writes the JS glue, and its
       # wasm-bindgen-test-runner, which runs the two test steps below, read
       # the description the crate's macros put into the module, and both stop
       # with a "different bindgen format" error when that description's
