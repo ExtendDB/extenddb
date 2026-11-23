@@ -179,6 +179,33 @@ fn parentheses_inside_between_in_and_function_arguments() {
     assert_cases(&cases);
 }
 
+/// A size of a size answers the operand type of the innermost call that
+/// takes a number.
+#[test]
+fn nested_size_calls_answer_the_operand_type() {
+    let size_of_n = p(
+        "Incorrect operand type for operator or function; operator or \
+                       function: size, operand type: N",
+    );
+    let cases = [
+        (
+            "a BETWEEN ".to_owned() + &nested("size(", "b", ")", 678) + " AND :w",
+            size_of_n.clone(),
+        ),
+        (
+            "a IN (".to_owned() + &nested("size(", "b", ")", 680) + ")",
+            size_of_n.clone(),
+        ),
+        (nested("size(", "a", ")", 681) + " = :v", size_of_n.clone()),
+        (nested("size(", "a", ")", 150) + " = :v", size_of_n.clone()),
+        (
+            "begins_with(".to_owned() + &nested("size(", "a", ")", 600) + ", :v)",
+            size_of_n,
+        ),
+    ];
+    assert_cases(&cases);
+}
+
 /// 300 operators is the most the grammar takes, so the deepest accepted tree
 /// is 300 levels. It parses, evaluates and drops on the worker stack.
 #[test]

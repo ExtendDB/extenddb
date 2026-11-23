@@ -208,47 +208,62 @@ fn function(call: &Call, condition: bool, maps: &Maps<'_>) -> Result<(), String>
             "The function is not allowed to be used this way in an expression; function: {name}"
         ));
     }
+    // A nested call other than size failed above, when it was checked as an
+    // operand. Each operand's type must fit the function: a value has its
+    // own type, size returns a number, and a path may hold any type.
+    let fits: &[&str] = match name {
+        "size" => &["S", "B", "SS", "NS", "BS", "L", "M"],
+        "begins_with" => &["S", "B"],
+        _ => &TYPE_NAMES,
+    };
     for arg in &call.args {
-        if let Operand::Call(inner) = arg
-            && inner.name != "size"
+        if let Some(code) = operand_code(arg, maps)
+            && !fits.contains(&code)
         {
-            return Err(format!(
-                "The function is not allowed to be used this way in an expression; \
-                 function: {}",
-                inner.name
-            ));
+            return Err(operand_type_code(name, code));
         }
-    }
-    if !matches!(call.args[0], Operand::Path(_)) {
-        return Err(format!(
-            "Operator or function requires a document path; operator or function: {name}"
-        ));
-    }
-    match name {
-        "begins_with" => {
-            if let Some(value) = literal(&call.args[1], maps)
-                && !matches!(value, AttributeValue::S(_) | AttributeValue::B(_))
-            {
-                return Err(operand_type(name, value));
-            }
-        }
-        "attribute_type" => match literal(&call.args[1], maps) {
-            Some(AttributeValue::S(type_name)) if TYPE_NAMES.contains(&type_name.as_str()) => {}
-            Some(AttributeValue::S(type_name)) => {
-                return Err(format!(
-                    "Invalid attribute type name found; type: {type_name}, valid types: {{{}}}",
-                    TYPE_NAMES.join(",")
-                ));
-            }
-            Some(other) => return Err(operand_type(name, other)),
-            None => {}
-        },
-        _ => {}
     }
     if expected == 2 {
         distinct_first_operand(name, &call.args[0], [&call.args[1]], maps)?;
     }
-    Ok(())
+    match name {
+        "attribute_exists" | "attribute_not_exists"
+            if !matches!(call.args[0], Operand::Path(_)) =>
+        {
+            Err(format!(
+                "Operator or function requires a document path; operator or function: {name}"
+            ))
+        }
+        "attribute_type" => match literal(&call.args[1], maps) {
+            Some(AttributeValue::S(type_name)) if TYPE_NAMES.contains(&type_name.as_str()) => {
+                Ok(())
+            }
+            Some(AttributeValue::S(type_name)) => Err(format!(
+                "Invalid attribute type name found; type: {type_name}, valid types: {{{}}}",
+                TYPE_NAMES.join(",")
+            )),
+            Some(other) => Err(operand_type(name, other)),
+            None => Err(operand_type_code(
+                name,
+                operand_code(&call.args[1], maps).unwrap_or(ANY_TYPE),
+            )),
+        },
+        _ => Ok(()),
+    }
+}
+
+/// The type of every attribute a path may name, as the service lists it.
+const ANY_TYPE: &str = "{S,SS,N,NS,B,BS,BOOL,NULL,L,M,HD,DOUBLE,FLOAT,HDS,FS,DOUBLESET,DICT,\
+                        DECIMAL,INT,DECIMALSET,INTSET}";
+
+/// The type code of an operand whose type is known before evaluation: a
+/// value's own type, and `N` for a call, which can only be size.
+fn operand_code(o: &Operand, maps: &Maps<'_>) -> Option<&'static str> {
+    match o {
+        Operand::Value(_) => literal(o, maps).map(attribute_type_code),
+        Operand::Call(_) => Some("N"),
+        Operand::Path(_) => None,
+    }
 }
 
 fn literal<'a>(o: &Operand, maps: &Maps<'a>) -> Option<&'a AttributeValue> {
@@ -259,10 +274,13 @@ fn literal<'a>(o: &Operand, maps: &Maps<'a>) -> Option<&'a AttributeValue> {
 }
 
 fn operand_type(operator: &str, value: &AttributeValue) -> String {
+    operand_type_code(operator, attribute_type_code(value))
+}
+
+fn operand_type_code(operator: &str, code: &str) -> String {
     format!(
         "Incorrect operand type for operator or function; operator or function: {operator}, \
-         operand type: {}",
-        attribute_type_code(value)
+         operand type: {code}"
     )
 }
 
