@@ -15,6 +15,12 @@
 //! the backend is also sent `pg_cancel_backend`, so a request the caller has
 //! abandoned stops its statement in the server instead of running it to the
 //! end on a connection nobody reads.
+//!
+//! The cancel names the backend by process id and by the start time of the
+//! search transaction, and PostgreSQL signals it only while that backend is
+//! still inside that transaction. A transaction-pooling proxy can hand the
+//! backend to another client as soon as this one disconnects, and a process
+//! id alone would then cancel that client's statement.
 
 use sqlx::pool::PoolConnection;
 use sqlx::{PgConnection, PgPool, Postgres};
@@ -22,7 +28,9 @@ use sqlx::{PgConnection, PgPool, Postgres};
 /// One pooled connection inside the search transaction.
 pub(crate) struct ScanConnection {
     conn: Option<PoolConnection<Postgres>>,
-    backend_pid: Option<i32>,
+    /// The backend's process id and the transaction's start, in
+    /// microseconds since the epoch.
+    backend: Option<(i32, i64)>,
     pool: PgPool,
 }
 
@@ -39,16 +47,18 @@ impl ScanConnection {
         // handled like any other drop.
         let mut scan = Self {
             conn: Some(conn),
-            backend_pid: None,
+            backend: None,
             pool: pool.clone(),
         };
         sqlx::query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .execute(scan.connection())
             .await?;
-        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        // `now()` is the transaction's start, the value `pg_stat_activity`
+        // reports as `xact_start` while the transaction runs.
+        let backend: (i32, i64) = sqlx::query_as(XACT_OF_THIS_BACKEND)
             .fetch_one(scan.connection())
             .await?;
-        scan.backend_pid = Some(pid);
+        scan.backend = Some(backend);
         Ok(scan)
     }
 
@@ -79,23 +89,40 @@ impl Drop for ScanConnection {
         let Some(conn) = self.conn.take() else {
             return;
         };
-        // Detached first, so this backend can serve no other request: the
-        // cancel below then reaches only the statement this search started.
+        // Detached first, so the pool can lend this connection to no other
+        // request.
         drop(conn.detach());
-        let (Some(pid), Ok(runtime)) = (self.backend_pid, tokio::runtime::Handle::try_current())
+        let (Some(backend), Ok(runtime)) = (self.backend, tokio::runtime::Handle::try_current())
         else {
             return;
         };
         let pool = self.pool.clone();
-        runtime.spawn(async move {
-            // The backend may already have exited on the closed socket, and
-            // then PostgreSQL answers false. Neither answer changes anything.
-            let _ = sqlx::query("SELECT pg_cancel_backend($1)")
-                .bind(pid)
-                .execute(&pool)
-                .await;
-        });
+        runtime.spawn(cancel_if_in_transaction(pool, backend));
     }
+}
+
+/// The backend's process id and its transaction's start.
+const XACT_OF_THIS_BACKEND: &str =
+    "SELECT pg_backend_pid(), (extract(epoch FROM now()) * 1000000)::bigint";
+
+/// Cancel the statement of backend `pid` if that backend still runs the
+/// transaction that started at `xact_start`. Returns whether a cancel was
+/// sent.
+///
+/// No row matches once the backend has exited, has ended the transaction, or
+/// serves another client's transaction; then nothing is signalled.
+async fn cancel_if_in_transaction(pool: PgPool, (pid, xact_start): (i32, i64)) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT pg_cancel_backend(pid) FROM pg_stat_activity \
+         WHERE pid = $1 AND (extract(epoch FROM xact_start) * 1000000)::bigint = $2",
+    )
+    .bind(pid)
+    .bind(xact_start)
+    .fetch_optional(&pool)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -104,7 +131,7 @@ mod tests {
 
     use sqlx::postgres::PgPoolOptions;
 
-    use super::ScanConnection;
+    use super::{ScanConnection, XACT_OF_THIS_BACKEND, cancel_if_in_transaction};
 
     /// A pool on the server's maintenance database, or `None` to skip.
     async fn pool(max: u32) -> Option<sqlx::PgPool> {
@@ -204,5 +231,100 @@ mod tests {
                 .expect("reuse the connection");
         assert_eq!(again, pid, "a committed scan keeps its connection pooled");
         assert_eq!(isolation, "read committed");
+    }
+
+    /// One connection that ends a transaction and starts another, as a
+    /// transaction-pooling proxy hands a backend to its next client. Returns
+    /// the first transaction's stamp, the second's, the connection running
+    /// `pg_sleep(seconds)` in the second, and the pool to cancel through.
+    async fn reused_backend(
+        seconds: u32,
+    ) -> Option<(
+        (i32, i64),
+        (i32, i64),
+        tokio::task::JoinHandle<bool>,
+        sqlx::PgPool,
+    )> {
+        let (Some(pool), Some(observer)) = (pool(1).await, pool(1).await) else {
+            return None;
+        };
+        let mut conn = pool.acquire().await.expect("acquire");
+        sqlx::query("BEGIN")
+            .execute(&mut *conn)
+            .await
+            .expect("begin");
+        let earlier: (i32, i64) = sqlx::query_as(XACT_OF_THIS_BACKEND)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("the first stamp");
+        sqlx::query("COMMIT")
+            .execute(&mut *conn)
+            .await
+            .expect("commit");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        sqlx::query("BEGIN")
+            .execute(&mut *conn)
+            .await
+            .expect("begin again");
+        let later: (i32, i64) = sqlx::query_as(XACT_OF_THIS_BACKEND)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("the second stamp");
+        assert_eq!(earlier.0, later.0, "one backend serves both transactions");
+        assert_ne!(earlier.1, later.1, "the transactions start apart");
+        let query = format!(
+            "SELECT pg_sleep({seconds}), '{}'",
+            uuid::Uuid::new_v4().simple()
+        );
+        let statement = query.clone();
+        let sleeper =
+            tokio::spawn(async move { sqlx::query(&statement).execute(&mut *conn).await.is_ok() });
+        let start = std::time::Instant::now();
+        while !still_running(&observer, &query, Duration::ZERO).await {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "the statement never started"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Some((earlier, later, sleeper, observer))
+    }
+
+    #[tokio::test]
+    async fn a_cancel_spares_a_backend_that_serves_another_transaction() {
+        let Some((earlier, _, sleeper, observer)) = reused_backend(2).await else {
+            return;
+        };
+        assert!(
+            !cancel_if_in_transaction(observer, earlier).await,
+            "a cancel was sent for a transaction the backend no longer runs"
+        );
+        assert!(
+            sleeper.await.expect("the statement task"),
+            "the other transaction's statement was cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_stops_the_statement_of_its_own_transaction() {
+        // Long enough that the cancel reaches the statement while it runs on
+        // a loaded host; a cancel that arrives between statements is dropped.
+        let Some((_, later, sleeper, observer)) = reused_backend(30).await else {
+            return;
+        };
+        let start = std::time::Instant::now();
+        assert!(
+            cancel_if_in_transaction(observer, later).await,
+            "no cancel was sent for the running transaction"
+        );
+        assert!(
+            !sleeper.await.expect("the statement task"),
+            "the statement ran to the end"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "the statement stopped only after {:?}",
+            start.elapsed()
+        );
     }
 }
