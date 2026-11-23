@@ -3907,6 +3907,37 @@
       ]
     },
     {
+      "name": "table ARNs: UpdateContinuousBackups disabling recovery with an index ARN as TableName answers TableNotFoundException",
+      "op": "UpdateContinuousBackups",
+      "body": {
+        "TableName": "arn:aws:dynamodb:us-east-1:000000000000:table/Gsi/index/byGsiKey",
+        "PointInTimeRecoverySpecification": {
+          "PointInTimeRecoveryEnabled": false
+        }
+      },
+      "error": "TableNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Table not found: arn:aws:dynamodb:us-east-1:000000000000:table/Gsi/index/byGsiKey"
+        }
+      ]
+    },
+    {
+      "name": "table ARNs: UpdateContinuousBackups with an index ARN as TableName and no specification answers the null member",
+      "op": "UpdateContinuousBackups",
+      "body": {
+        "TableName": "arn:aws:dynamodb:us-east-1:000000000000:table/Gsi/index/byGsiKey"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "contains": "Value null at 'pointInTimeRecoverySpecification' failed to satisfy constraint: Member must not be null"
+        }
+      ]
+    },
+    {
       "name": "table ARNs: ListBackups with a TableName that is not a table ARN answers that it is not a table name or ARN",
       "op": "ListBackups",
       "body": {
@@ -4324,6 +4355,54 @@
         {
           "path": "/message",
           "equals": "Table not found: arn:aws:dynamodb:us-east-1:111111111111:table/Products"
+        }
+      ]
+    },
+    {
+      "name": "accounts: UpdateContinuousBackups disabling recovery on a table in another account by ARN answers TableNotFoundException",
+      "op": "UpdateContinuousBackups",
+      "body": {
+        "TableName": "arn:aws:dynamodb:us-east-1:111111111111:table/Products",
+        "PointInTimeRecoverySpecification": {
+          "PointInTimeRecoveryEnabled": false
+        }
+      },
+      "error": "TableNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Table not found: arn:aws:dynamodb:us-east-1:111111111111:table/Products"
+        }
+      ]
+    },
+    {
+      "name": "accounts: UpdateContinuousBackups with no specification on a table in another account by ARN answers the null member",
+      "op": "UpdateContinuousBackups",
+      "body": {
+        "TableName": "arn:aws:dynamodb:us-east-1:111111111111:table/Products"
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "contains": "Value null at 'pointInTimeRecoverySpecification' failed to satisfy constraint: Member must not be null"
+        }
+      ]
+    },
+    {
+      "name": "accounts: UpdateContinuousBackups enabling recovery on a table in another account by ARN answers the refusal",
+      "op": "UpdateContinuousBackups",
+      "body": {
+        "TableName": "arn:aws:dynamodb:us-east-1:111111111111:table/Products",
+        "PointInTimeRecoverySpecification": {
+          "PointInTimeRecoveryEnabled": true
+        }
+      },
+      "error": "ContinuousBackupsUnavailableException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Point-in-time recovery is not supported by this storage backend"
         }
       ]
     },
