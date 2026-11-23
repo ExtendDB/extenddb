@@ -37,6 +37,15 @@ pub(crate) fn ttl_description(
     }
 }
 
+/// How long one attempt to drop a table's TTL index waits for its lock.
+const TTL_DROP_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+/// The pause between attempts, in which requests queued behind a timed-out
+/// attempt get their locks.
+const TTL_DROP_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(250);
+/// How long `drop_ttl_index` keeps retrying a lock wait before it gives up.
+/// The index then stays, which only costs space: readiness is already off.
+const TTL_DROP_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl MetadataEngine for PostgresEngine {
     fn describe_ttl(
         &self,
@@ -389,13 +398,44 @@ impl MetadataEngine for PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
+            // The drop needs ACCESS EXCLUSIVE, and while it waits, every later
+            // lock request on the table queues behind it. So it waits only
+            // `TTL_DROP_LOCK_TIMEOUT` per attempt, which bounds the stall a
+            // long reader can cause, and retries until `TTL_DROP_BUDGET`.
             let sql = format!("DROP INDEX IF EXISTS \"{index_name}\"");
-            sqlx::query(&sql)
-                .execute(&self.data_pool)
-                .await
-                .map_err(|e| StorageError::Internal(format!("TTL index drop failed: {e}")))?;
-
-            Ok(())
+            let deadline = std::time::Instant::now() + TTL_DROP_BUDGET;
+            loop {
+                let mut tx =
+                    self.data_pool.begin().await.map_err(|e| {
+                        StorageError::Internal(format!("TTL index drop failed: {e}"))
+                    })?;
+                sqlx::query("SELECT set_config('lock_timeout', $1, true)")
+                    .bind(format!("{}ms", TTL_DROP_LOCK_TIMEOUT.as_millis()))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| StorageError::Internal(format!("TTL index drop failed: {e}")))?;
+                let dropped = sqlx::query(&sql).execute(&mut *tx).await;
+                match dropped {
+                    Ok(_) => {
+                        return tx.commit().await.map_err(|e| {
+                            StorageError::Internal(format!("TTL index drop failed: {e}"))
+                        });
+                    }
+                    Err(e)
+                        if data::lock_wait_failed(&e) && std::time::Instant::now() < deadline =>
+                    {
+                        // Roll back and pause, so the requests queued behind
+                        // the timed-out wait run before the next attempt.
+                        drop(tx);
+                        tokio::time::sleep(TTL_DROP_RETRY_PAUSE).await;
+                    }
+                    Err(e) => {
+                        return Err(StorageError::Internal(format!(
+                            "TTL index drop failed: {e}"
+                        )));
+                    }
+                }
+            }
         })
     }
 
