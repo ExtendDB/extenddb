@@ -224,7 +224,7 @@ fn prune_keeps_recent_segments_and_drops_them_a_day_later() {
     assert_eq!(segs[0].count, 1);
 
     // A day later the bucket has left the ring without any prune call.
-    let later = epoch + Duration::from_secs(1441 * 60);
+    let later = epoch + Duration::from_mins(1441);
     assert!(
         c.query_segments_with(TimeWindow::AllTime, None, || later)
             .is_empty()
@@ -235,12 +235,7 @@ fn prune_keeps_recent_segments_and_drops_them_a_day_later() {
     );
     // The buckets are still held until the collector's prune runs at that
     // time; then the account's rings and the account are gone.
-    let held = |c: &MetricsCollector| {
-        c.segments
-            .read()
-            .map(|s| s.buckets().0)
-            .unwrap_or(usize::MAX)
-    };
+    let held = |c: &MetricsCollector| c.segments.read().map_or(usize::MAX, |s| s.buckets().0);
     assert_eq!(held(&c), 2);
     c.prune_at(later);
     assert_eq!(held(&c), 0);
