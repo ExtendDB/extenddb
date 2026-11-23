@@ -138,6 +138,31 @@ pub(crate) fn pay_per_request_after(
     }
 }
 
+/// `validate_index_name` with the pattern clause located at the update's
+/// member path, as the service reports it (measured 2026-10-24). The length
+/// clauses keep the bare `indexName` location, which is not measured for
+/// UpdateTable.
+fn validate_update_index_name(
+    name: &str,
+    position: usize,
+    action: &str,
+) -> Result<(), DynamoDbError> {
+    match extenddb_core::validation::validate_index_name(name) {
+        Err(DynamoDbError::ValidationException(m))
+            if m.contains("' at 'indexName' ") && m.contains("regular expression pattern") =>
+        {
+            Err(DynamoDbError::ValidationException(m.replace(
+                "' at 'indexName' ",
+                &format!(
+                    "' at 'globalSecondaryIndexUpdates.{}.member.{action}.indexName' ",
+                    position + 1
+                ),
+            )))
+        }
+        other => other,
+    }
+}
+
 /// Apply the element rules to `input`.
 ///
 /// # Errors
@@ -171,7 +196,7 @@ pub(crate) fn validate_gsi_updates(input: &UpdateTableInput) -> Result<(), Dynam
             seen.push(name);
         }
     }
-    for update in updates {
+    for (position, update) in updates.iter().enumerate() {
         let actions = usize::from(update.create.is_some())
             + usize::from(update.update.is_some())
             + usize::from(update.delete.is_some());
@@ -200,8 +225,12 @@ pub(crate) fn validate_gsi_updates(input: &UpdateTableInput) -> Result<(), Dynam
                 ));
             }
         }
+        // Create and Delete names are validated the way CreateTable does,
+        // except that the pattern clause carries the member's path (measured
+        // 2026-10-24: `globalSecondaryIndexUpdates.<n>.member.create.indexName`,
+        // 1-based). The path of an Update's name is not measured.
         if let Some(create) = &update.create {
-            extenddb_core::validation::validate_index_name(&create.index_name)?;
+            validate_update_index_name(&create.index_name, position, "create")?;
             extenddb_core::validation::validate_index_throughput_minimum(
                 &create.index_name,
                 create.provisioned_throughput.as_ref(),
@@ -234,7 +263,7 @@ pub(crate) fn validate_gsi_updates(input: &UpdateTableInput) -> Result<(), Dynam
             }
         }
         if let Some(delete) = &update.delete {
-            extenddb_core::validation::validate_index_name(&delete.index_name)?;
+            validate_update_index_name(&delete.index_name, position, "delete")?;
         }
     }
     Ok(())
@@ -505,5 +534,36 @@ mod tests {
             message(validate_gsi_updates(&input(json!([c]))))
                 .contains("Some index key attributes are not defined")
         );
+    }
+
+    #[test]
+    fn an_index_name_outside_the_pattern_is_reported_at_its_member_path() {
+        let cases = [
+            (
+                json!([create("g\u{0}2")]),
+                "globalSecondaryIndexUpdates.1.member.create.indexName",
+            ),
+            (
+                json!([
+                    { "Delete": { "IndexName": "gix" } },
+                    { "Delete": { "IndexName": "g\u{0}2" } },
+                ]),
+                "globalSecondaryIndexUpdates.2.member.delete.indexName",
+            ),
+        ];
+        for (updates, path) in cases {
+            assert_eq!(
+                message(validate_gsi_updates(&input(updates))),
+                format!(
+                    "1 validation error detected: Value 'g\u{0}2' at '{path}' failed to \
+                     satisfy constraint: Member must satisfy regular expression pattern: \
+                     [a-zA-Z0-9_.-]+"
+                ),
+                "{path}"
+            );
+        }
+        // A length fault keeps the bare location, which is not measured here.
+        let m = message(validate_gsi_updates(&input(json!([create("ab")]))));
+        assert!(m.contains("' at 'indexName' "), "{m}");
     }
 }

@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use extenddb_storage::migrations::{
-    CatalogMigrations, CatalogStatus, HeldLock, LedgerRow, Listed, MigrationError, MigrationId,
-    RunKind, RunReport, Runner, Target,
+    CatalogMigrations, CatalogStatus, HeldLock, LedgerRow, Listed, LockedStores, MigrationError,
+    MigrationId, RunKind, RunReport, Runner, Target,
 };
 
 use super::foreign::foreign_unless_a_catalog;
@@ -42,6 +42,15 @@ fn held(lock: &HeldLock) -> Result<&Held, MigrationError> {
     lock.get::<Held>().ok_or_else(|| {
         MigrationError::Refused("the migration lock was not taken by the MongoDB backend".into())
     })
+}
+
+/// A [`HeldLock`] over a lock that [`lock`] took on `target`, for the
+/// crate's integration tests, whose deployments use databases of their own
+/// names, which [`CatalogMigrations::lock`] does not take.
+#[cfg(feature = "test-util")]
+#[must_use]
+pub fn held_lock_for_tests(lock: MigrationLock, target: MongoTarget) -> HeldLock {
+    HeldLock::new(target.connection_string.clone(), Held { lock, target })
 }
 
 /// The lease of a lock this backend took, which `init`'s bootstrapper checks
@@ -121,6 +130,20 @@ impl CatalogMigrations for MongoCatalogMigrations {
         let result = Runner::new(&migrations, "").forget(id).await;
         migrations.close().await;
         result
+    }
+
+    /// The catalog database's stores on a client of their own, under the
+    /// lock's lease. A MongoDB catalog stores its data connection string
+    /// with the password redacted, so `data_connection` is not read.
+    async fn locked_stores(
+        &self,
+        lock: &HeldLock,
+        _data_connection: Option<&str>,
+    ) -> Result<Box<dyn LockedStores>, MigrationError> {
+        let held = held(lock)?;
+        Ok(Box::new(
+            MongoMigrations::open(&held.target, Some(&held.lock)).await?,
+        ))
     }
 }
 

@@ -81,6 +81,7 @@ fn test_liveness() -> BackupLiveness {
         target_drop_fails: false,
         local_clock_behind: Duration::ZERO,
         heartbeat_fault: None,
+        replacement_commit_unknown: false,
     }
 }
 
@@ -129,6 +130,15 @@ impl Fixture {
         self.worker.abort();
         self.engine.catalog_db.drop().await.expect("drop catalog");
         self.engine.data_db.drop().await.expect("drop data");
+    }
+
+    /// [`Self::finish`] after a test body run under `catch_unwind`, whether
+    /// or not it panicked, and then the panic, if any, goes on.
+    async fn finish_after(self, outcome: std::thread::Result<()>) {
+        self.finish().await;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     }
 }
 
@@ -754,6 +764,611 @@ async fn live_read_store_ids_lists_the_distinct_ids_of_a_root() {
     fx.finish().await;
 }
 
+/// A row of `row(ACCOUNT, table, name)` with `status`, under the store of
+/// `kind`, `root` and `id`.
+fn row_at(
+    table: &str,
+    name: &str,
+    status: BackupStatus,
+    (kind, root, id): (StoreKind, &str, &str),
+) -> BackupRow {
+    let mut row = row(ACCOUNT, table, name);
+    row.status = status;
+    row.store = StoreIdentity {
+        store_kind: kind,
+        store_root: root.to_owned(),
+        store_id: id.to_owned(),
+    };
+    row.size_bytes = 10;
+    row.item_count = 2;
+    row
+}
+
+/// The ARNs of `rows` in the listings' (`created_at`, `backup_arn`) order.
+fn in_listing_order(rows: &[&BackupRow]) -> Vec<String> {
+    let mut rows = rows.to_vec();
+    rows.sort_by(|a, b| {
+        a.created_at
+            .total_cmp(&b.created_at)
+            .then_with(|| a.backup_arn.cmp(&b.backup_arn))
+    });
+    rows.into_iter().map(|r| r.backup_arn.clone()).collect()
+}
+
+/// `list_backup_rows_by_root`: every row of the kind and root, whatever its
+/// id, of every status or of one, whole and in the listings' order; nothing
+/// of a root that differs by one byte (a trailing `/`, one character fewer),
+/// of an S3 root that differs by its `?endpoint=` suffix, or of the other
+/// kind at the same label.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_list_backup_rows_by_root_returns_every_id_and_status_of_the_root_and_nothing_else() {
+    let fixture = Fixture::new().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let fx = &fixture;
+        let root = "/srv/backups-old";
+        let at = |id| (StoreKind::Filesystem, root, id);
+        let mut of_root = Vec::new();
+        for (i, status) in [
+            BackupStatus::Available,
+            BackupStatus::Deleting,
+            BackupStatus::Deleted,
+            BackupStatus::Failed,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = if i % 2 == 0 { "store-1" } else { "store-2" };
+            of_root.push(row_at("Music", &format!("r{i}"), status, at(id)));
+        }
+        // Inserted newest first: the order asserted is the listing's.
+        for row in of_root.iter().rev() {
+            assert!(fx.engine.insert_backup_row(row).await.expect("insert"));
+        }
+        let creating = row_at("Music", "job", BackupStatus::Creating, at("store-1"));
+        let claim = fx.engine.claim_backup(&creating).await.expect("claim");
+        let slash = format!("{root}/");
+        let s3 = "s3://bucket/prefix";
+        let s3_endpoint = "s3://bucket/prefix?endpoint=http://127.0.0.1:9200";
+        let others = [
+            row_at(
+                "Music",
+                "slash",
+                BackupStatus::Available,
+                (StoreKind::Filesystem, &slash, "store-1"),
+            ),
+            row_at(
+                "Music",
+                "shorter",
+                BackupStatus::Available,
+                (StoreKind::Filesystem, "/srv/backups-ol", "store-1"),
+            ),
+            row_at(
+                "Music",
+                "kind",
+                BackupStatus::Available,
+                (StoreKind::S3, root, "store-1"),
+            ),
+            row_at(
+                "Music",
+                "s3",
+                BackupStatus::Available,
+                (StoreKind::S3, s3, "store-3"),
+            ),
+            row_at(
+                "Music",
+                "endpoint",
+                BackupStatus::Available,
+                (StoreKind::S3, s3_endpoint, "store-3"),
+            ),
+        ];
+        for row in &others {
+            assert!(fx.engine.insert_backup_row(row).await.expect("insert"));
+        }
+        let listed = |kind: StoreKind, root: String, status: Option<BackupStatus>| {
+            let engine = &fx.engine;
+            async move {
+                let rows: Vec<BackupRow> = engine
+                    .list_backup_rows_by_root(kind, &root, status)
+                    .try_collect()
+                    .await
+                    .expect("listing");
+                rows
+            }
+        };
+        let arns = |rows: Vec<BackupRow>| -> Vec<String> {
+            rows.into_iter().map(|r| r.backup_arn).collect()
+        };
+        let mut all: Vec<&BackupRow> = of_root.iter().collect();
+        all.push(&creating);
+        let whole = listed(StoreKind::Filesystem, root.to_owned(), None).await;
+        assert_eq!(arns(whole.clone()), in_listing_order(&all));
+        for row in &whole {
+            assert_eq!(
+                Some(row),
+                fx.engine
+                    .read_backup_row(&arn_of(row))
+                    .await
+                    .expect("read")
+                    .as_ref(),
+                "the listing returns rows whole"
+            );
+        }
+        for status in BackupStatus::ALL {
+            let of_status: Vec<&BackupRow> =
+                all.iter().copied().filter(|r| r.status == status).collect();
+            assert_eq!(
+                arns(listed(StoreKind::Filesystem, root.to_owned(), Some(status)).await),
+                in_listing_order(&of_status),
+                "{status}"
+            );
+        }
+        for (kind, label, row) in [
+            (StoreKind::Filesystem, slash.as_str(), &others[0]),
+            (StoreKind::Filesystem, "/srv/backups-ol", &others[1]),
+            (StoreKind::S3, root, &others[2]),
+            (StoreKind::S3, s3, &others[3]),
+            (StoreKind::S3, s3_endpoint, &others[4]),
+        ] {
+            assert_eq!(
+                arns(listed(kind, label.to_owned(), None).await),
+                std::slice::from_ref(&row.backup_arn),
+                "{kind} {label}"
+            );
+        }
+        assert!(
+            listed(StoreKind::Filesystem, "/srv/backups".to_owned(), None)
+                .await
+                .is_empty()
+        );
+        drop(claim);
+    })
+    .catch_unwind()
+    .await;
+    fixture.finish_after(outcome).await;
+}
+
+/// `rewrite_store`: of the keys given, the rows still of the old kind and
+/// root and not CREATING get the new store, with every other column left,
+/// and are counted; a CREATING row, a row of another root, a row of the
+/// other kind at the same label and a key with no row are left and not
+/// counted; a second call counts 0; a row another writer moved to a third
+/// root before the call is left there. The `$inc` of `lock_seq` is the one
+/// other field the rewrite changes.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_rewrite_store_moves_only_the_old_roots_rows_that_are_not_creating() {
+    let fixture = Fixture::new().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let fx = &fixture;
+        let old = (StoreKind::Filesystem, "/srv/backups-old", "old-1");
+        let to = StoreIdentity {
+            store_kind: StoreKind::Filesystem,
+            store_root: "/srv/backups-new".to_owned(),
+            store_id: "new-1".to_owned(),
+        };
+        let mut movable = Vec::new();
+        for (i, status) in [
+            BackupStatus::Available,
+            BackupStatus::Deleting,
+            BackupStatus::Deleted,
+            BackupStatus::Failed,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            movable.push(row_at("Music", &format!("m{i}"), status, old));
+        }
+        let moved_away = row_at("Music", "away", BackupStatus::Available, old);
+        let other_root = row_at(
+            "Music",
+            "other-root",
+            BackupStatus::Available,
+            (StoreKind::Filesystem, "/srv/backups-other", "old-1"),
+        );
+        let other_kind = row_at(
+            "Music",
+            "other-kind",
+            BackupStatus::Available,
+            (StoreKind::S3, "/srv/backups-old", "old-1"),
+        );
+        for row in movable
+            .iter()
+            .chain([&moved_away, &other_root, &other_kind])
+        {
+            assert!(fx.engine.insert_backup_row(row).await.expect("insert"));
+        }
+        let creating = row_at("Music", "job", BackupStatus::Creating, old);
+        let claim = fx.engine.claim_backup(&creating).await.expect("claim");
+        let stored = |row: &BackupRow| {
+            let engine = &fx.engine;
+            let arn = arn_of(row);
+            async move {
+                engine
+                    .read_backup_row(&arn)
+                    .await
+                    .expect("read")
+                    .expect("the row exists")
+            }
+        };
+        let lock_seq = |row: &BackupRow| {
+            let engine = &fx.engine;
+            let id = row.backup_id.clone();
+            async move {
+                engine
+                    .catalog_db
+                    .collection::<Document>(BACKUP_INDEX)
+                    .find_one(doc! { "backup_id": &id })
+                    .await
+                    .expect("read")
+                    .expect("the document exists")
+                    .get_i64("lock_seq")
+                    .expect("lock_seq")
+            }
+        };
+        let mut before = Vec::new();
+        for row in &movable {
+            before.push((stored(row).await, lock_seq(row).await));
+        }
+        // Another writer moves one row to a third root first.
+        let third = StoreIdentity {
+            store_kind: StoreKind::Filesystem,
+            store_root: "/srv/backups-third".to_owned(),
+            store_id: "third-1".to_owned(),
+        };
+        assert_eq!(
+            fx.engine
+                .rewrite_store(old.0, old.1, &[moved_away.key()], &third)
+                .await
+                .expect("rewrite"),
+            1
+        );
+        let mut ghost = row_at("Music", "ghost", BackupStatus::Available, old).key();
+        ghost.backup_id = extenddb_storage::util::new_backup_id();
+        let keys: Vec<extenddb_storage::backup_catalog::BackupKey> = movable
+            .iter()
+            .chain([&creating, &moved_away, &other_root, &other_kind])
+            .map(BackupRow::key)
+            .chain([ghost])
+            .collect();
+        assert_eq!(
+            fx.engine
+                .rewrite_store(old.0, old.1, &keys, &to)
+                .await
+                .expect("rewrite"),
+            4,
+            "the four rows of the old root that are not CREATING"
+        );
+        for (row, (before, seq)) in movable.iter().zip(&before) {
+            assert_eq!(
+                stored(row).await,
+                BackupRow {
+                    store: to.clone(),
+                    ..before.clone()
+                },
+                "only the store changed"
+            );
+            assert_eq!(
+                lock_seq(row).await,
+                seq + 1,
+                "the move advances the row's lock counter"
+            );
+        }
+        let creating_now = stored(&creating).await;
+        assert_eq!(
+            (creating_now.status, creating_now.store.store_root.as_str()),
+            (BackupStatus::Creating, old.1)
+        );
+        assert_eq!(creating_now.owner_generation, claim.generation());
+        assert_eq!(stored(&moved_away).await.store, third);
+        assert_eq!(stored(&other_root).await.store, other_root.store);
+        assert_eq!(stored(&other_kind).await.store, other_kind.store);
+        assert_eq!(
+            fx.engine
+                .rewrite_store(old.0, old.1, &keys, &to)
+                .await
+                .expect("rewrite"),
+            0,
+            "a second call finds nothing left to move"
+        );
+        let listed: Vec<BackupRow> = fx
+            .engine
+            .list_backup_rows(None, &to)
+            .try_collect()
+            .await
+            .expect("listing");
+        let movable_refs: Vec<&BackupRow> = movable.iter().collect();
+        assert_eq!(
+            listed.into_iter().map(|r| r.backup_arn).collect::<Vec<_>>(),
+            in_listing_order(&movable_refs)
+        );
+        assert_eq!(
+            fx.engine.read_store_ids(old.0, old.1).await.expect("ids"),
+            ["old-1"],
+            "the CREATING row keeps the old root"
+        );
+        assert_eq!(
+            fx.engine
+                .rewrite_store(old.0, old.1, &[], &to)
+                .await
+                .expect("rewrite"),
+            0
+        );
+        drop(claim);
+    })
+    .catch_unwind()
+    .await;
+    fixture.finish_after(outcome).await;
+}
+
+/// `rewrite_store` over more keys than one statement takes moves them all,
+/// every chunk counted.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_rewrite_store_moves_every_chunk_of_keys() {
+    use crate::backup_catalog::REWRITE_CHUNK_KEYS;
+    let fixture = Fixture::new().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let fx = &fixture;
+        let old = (StoreKind::Filesystem, "/srv/backups-old", "old-1");
+        let to = StoreIdentity {
+            store_kind: StoreKind::Filesystem,
+            store_root: "/srv/backups-new".to_owned(),
+            store_id: "new-1".to_owned(),
+        };
+        let rows = REWRITE_CHUNK_KEYS + 1;
+        let mut keys = Vec::with_capacity(rows);
+        for i in 0..rows {
+            let row = row_at("Music", &format!("r{i}"), BackupStatus::Available, old);
+            assert!(fx.engine.insert_backup_row(&row).await.expect("insert"));
+            keys.push(row.key());
+        }
+        assert_eq!(
+            fx.engine
+                .rewrite_store(old.0, old.1, &keys, &to)
+                .await
+                .expect("rewrite"),
+            rows as u64
+        );
+        let left: Vec<BackupRow> = fx
+            .engine
+            .list_backup_rows_by_root(old.0, old.1, None)
+            .try_collect()
+            .await
+            .expect("listing");
+        assert!(left.is_empty(), "{} rows left", left.len());
+    })
+    .catch_unwind()
+    .await;
+    fixture.finish_after(outcome).await;
+}
+
+/// `summarize_store_roots`: one count per kind, root, id and status with a
+/// row, in the one order; two ids of one root, two statuses of one id, two
+/// roots and the two kinds are each counted apart.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_summarize_store_roots_counts_the_rows_of_each_store_and_status() {
+    use extenddb_storage::backup_catalog::StoreRootCount;
+    let fixture = Fixture::new().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let fx = &fixture;
+        assert!(
+            fx.engine
+                .summarize_store_roots()
+                .await
+                .expect("summary")
+                .is_empty()
+        );
+        let a1 = (StoreKind::Filesystem, "/srv/a", "id-1");
+        let a2 = (StoreKind::Filesystem, "/srv/a", "id-2");
+        let b1 = (StoreKind::Filesystem, "/srv/b", "id-1");
+        let s3 = (StoreKind::S3, "s3://bucket/a", "id-1");
+        let rows = [
+            row_at("Music", "1", BackupStatus::Available, a1),
+            row_at("Music", "2", BackupStatus::Available, a1),
+            row_at("Music", "3", BackupStatus::Failed, a1),
+            row_at("Music", "4", BackupStatus::Available, a2),
+            row_at("Music", "5", BackupStatus::Deleting, b1),
+            row_at("Music", "7", BackupStatus::Available, b1),
+            row_at("Music", "6", BackupStatus::Available, s3),
+        ];
+        for row in &rows {
+            assert!(fx.engine.insert_backup_row(row).await.expect("insert"));
+        }
+        let creating = row_at("Music", "job", BackupStatus::Creating, b1);
+        let claim = fx.engine.claim_backup(&creating).await.expect("claim");
+        let line = |(kind, root, id): (StoreKind, &str, &str), status, rows| StoreRootCount {
+            store: StoreIdentity {
+                store_kind: kind,
+                store_root: root.to_owned(),
+                store_id: id.to_owned(),
+            },
+            status,
+            rows,
+        };
+        assert_eq!(
+            fx.engine.summarize_store_roots().await.expect("summary"),
+            [
+                line(a1, BackupStatus::Available, 2),
+                line(a1, BackupStatus::Failed, 1),
+                line(a2, BackupStatus::Available, 1),
+                line(b1, BackupStatus::Creating, 1),
+                line(b1, BackupStatus::Available, 1),
+                line(b1, BackupStatus::Deleting, 1),
+                line(s3, BackupStatus::Available, 1),
+            ]
+        );
+        drop(claim);
+    })
+    .catch_unwind()
+    .await;
+    fixture.finish_after(outcome).await;
+}
+
+/// `insert_backup_row`: the row lands as given, unowned (the document
+/// carries `owner_generation: 0`, which the claim's upsert filter relies on),
+/// with `completed_at` and `heartbeat_at` on the server's clock; a second
+/// insert, an insert over a CREATING row a claim holds, and an insert of the
+/// id under another account (the unique `backup_id`) answer `false` and
+/// change nothing; a claim over the inserted row is refused; the row is read
+/// and listed like a created one.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_insert_backup_row_inserts_an_unowned_row_only_when_absent() {
+    let fx = Fixture::new().await;
+    let mut adopted = row(ACCOUNT, "Music", "adopted");
+    adopted.status = BackupStatus::Available;
+    adopted.size_bytes = 1234;
+    adopted.item_count = 5;
+    // Ignored: the insert sets these three itself.
+    adopted.owner_generation = 99;
+    adopted.completed_at = None;
+    adopted.heartbeat_at = 0.0;
+    // A year before the id's instant: the two clock columns must be
+    // the database's clock at the insert, not the row's `created_at`.
+    adopted.created_at -= 365.0 * 86_400.0;
+    assert!(fx.engine.insert_backup_row(&adopted).await.expect("insert"));
+    let stored = fx
+        .engine
+        .read_backup_row(&arn_of(&adopted))
+        .await
+        .expect("read")
+        .expect("the row exists");
+    assert_eq!(stored.owner_generation, UNOWNED_GENERATION);
+    let completed_at = stored.completed_at.expect("completed_at is set");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is after the epoch")
+        .as_secs_f64();
+    for at in [completed_at, stored.heartbeat_at] {
+        assert!(
+            (at - now).abs() < 60.0,
+            "{at} is not the insert's instant {now}"
+        );
+    }
+    assert!(
+        (stored.created_at - adopted.created_at).abs() < 1e-3,
+        "{} is the row's created_at {}",
+        stored.created_at,
+        adopted.created_at
+    );
+    assert_eq!(
+        BackupRow {
+            owner_generation: 99,
+            completed_at: None,
+            heartbeat_at: 0.0,
+            created_at: adopted.created_at,
+            ..stored.clone()
+        },
+        adopted,
+        "every other column is the row as given"
+    );
+
+    // A second insert of the key, with other values, writes nothing.
+    let mut again = adopted.clone();
+    again.backup_name = "again".to_owned();
+    again.size_bytes = 1;
+    again.status = BackupStatus::Failed;
+    assert!(!fx.engine.insert_backup_row(&again).await.expect("insert"));
+    // The id under another account: the unique `backup_id`.
+    let mut elsewhere = adopted.clone();
+    elsewhere.account_id = OTHER_ACCOUNT.to_owned();
+    elsewhere.backup_arn =
+        extenddb_storage::util::backup_arn(REGION, OTHER_ACCOUNT, "Music", &adopted.backup_id);
+    assert!(
+        !fx.engine
+            .insert_backup_row(&elsewhere)
+            .await
+            .expect("insert")
+    );
+    assert!(
+        fx.engine
+            .read_backup_row(&arn_of(&elsewhere))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        fx.engine.read_backup_row(&arn_of(&adopted)).await.unwrap(),
+        Some(stored.clone()),
+        "the refused inserts changed nothing"
+    );
+    let claimed = fx.engine.claim_backup(&adopted).await.err();
+    assert!(
+        matches!(claimed, Some(StorageError::AlreadyExists(_))),
+        "{claimed:?}"
+    );
+
+    // Over a CREATING row a live claim holds.
+    let creating = row(ACCOUNT, "Music", "job");
+    let claim = fx.engine.claim_backup(&creating).await.expect("claim");
+    let mut over = creating.clone();
+    over.status = BackupStatus::Available;
+    assert!(!fx.engine.insert_backup_row(&over).await.expect("insert"));
+    let job_row = fx
+        .engine
+        .read_backup_row(&arn_of(&creating))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job_row.status, BackupStatus::Creating);
+    assert_eq!(job_row.owner_generation, claim.generation());
+
+    // Read and listed like a created row.
+    let arns =
+        |rows: Vec<BackupRow>| -> Vec<String> { rows.into_iter().map(|r| r.backup_arn).collect() };
+    let available: Vec<BackupRow> = fx
+        .engine
+        .list_backup_rows(Some(BackupStatus::Available), &store())
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(available, std::slice::from_ref(&stored));
+    let creating_rows: Vec<BackupRow> = fx
+        .engine
+        .list_backup_rows(Some(BackupStatus::Creating), &store())
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        arns(creating_rows),
+        std::slice::from_ref(&creating.backup_arn)
+    );
+    for table in [None, Some("Music")] {
+        let listed: Vec<BackupRow> = fx
+            .engine
+            .list_account_backup_rows(ACCOUNT, table, &TimeBounds::default())
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(
+            listed.contains(&stored),
+            "{table:?}: {:?}",
+            arns(listed.clone())
+        );
+    }
+    drop(claim);
+
+    let document = fx
+        .engine
+        .backup_index()
+        .find_one(doc! { "backup_id": &adopted.backup_id })
+        .await
+        .expect("read")
+        .expect("the document");
+    assert_eq!(document.get_i64("owner_generation"), Ok(0), "{document}");
+    assert_eq!(
+        fx.engine
+            .backup_index()
+            .count_documents(doc! { "backup_id": &adopted.backup_id })
+            .await
+            .expect("count"),
+        1
+    );
+    fx.finish().await;
+}
+
 /// `remove_dead_creating_backup_row`: a CREATING row whose heartbeat is older
 /// than the window is removed outright; one with a live owner, one that is
 /// not CREATING, and one that is gone are left, answering `false`.
@@ -1290,6 +1905,11 @@ async fn live_start_backup_delete_checks_the_status_and_the_in_use_rule_under_th
         DeleteStart::InUse("del_target".to_owned())
     );
     assert_eq!(
+        fx.engine.forget_available_backup_row(&key).await.unwrap(),
+        extenddb_storage::backup_catalog::ForgetRow::InUse("del_target".to_owned()),
+        "the outright removal keeps the in-use rule"
+    );
+    assert_eq!(
         fx.engine
             .read_backup_row(&arn_of(&row))
             .await
@@ -1314,8 +1934,62 @@ async fn live_start_backup_delete_checks_the_status_and_the_in_use_rule_under_th
         DeleteStart::Status(BackupStatus::Deleting),
         "a retry finds the row DELETING"
     );
+    assert_eq!(
+        fx.engine.forget_available_backup_row(&key).await.unwrap(),
+        extenddb_storage::backup_catalog::ForgetRow::Status(BackupStatus::Deleting),
+        "only an AVAILABLE row is removed outright"
+    );
+    // An AVAILABLE row goes outright, read and listed nowhere, with no
+    // tombstone; a second removal finds no row.
+    let mut adopted = self::row(ACCOUNT, "Music", "adopted");
+    adopted.status = BackupStatus::Available;
+    assert!(fx.engine.insert_backup_row(&adopted).await.expect("insert"));
+    assert_eq!(
+        fx.engine
+            .forget_available_backup_row(&adopted.key())
+            .await
+            .unwrap(),
+        extenddb_storage::backup_catalog::ForgetRow::Removed
+    );
     assert!(
-        !fx.engine.remove_backup_row(&key).await.unwrap(),
+        fx.engine
+            .read_backup_row(&arn_of(&adopted))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    for status in [None, Some(BackupStatus::Available)] {
+        let listed: Vec<BackupRow> = fx
+            .engine
+            .list_backup_rows(status, &adopted.store)
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(
+            !listed.iter().any(|r| r.backup_arn == adopted.backup_arn),
+            "{status:?}"
+        );
+    }
+    let by_account: Vec<BackupRow> = fx
+        .engine
+        .list_account_backup_rows(&adopted.account_id, None, &TimeBounds::default())
+        .try_collect()
+        .await
+        .unwrap();
+    assert!(
+        !by_account
+            .iter()
+            .any(|r| r.backup_arn == adopted.backup_arn)
+    );
+    assert!(matches!(
+        fx.engine.forget_available_backup_row(&adopted.key()).await,
+        Err(StorageError::Validation(m)) if m.contains("Backup not found")
+    ));
+    assert!(
+        !fx.engine
+            .remove_backup_row(&key, row.store.store_kind, &row.store.store_root)
+            .await
+            .unwrap(),
         "DELETING is not a tombstone"
     );
     assert!(fx.engine.set_backup_deleted(&key).await.unwrap());
@@ -1328,8 +2002,82 @@ async fn live_start_backup_delete_checks_the_status_and_the_in_use_rule_under_th
         .unwrap();
     assert_eq!(stored.status, BackupStatus::Deleted);
     assert!(stored.completed_at.is_some());
-    assert!(fx.engine.remove_backup_row(&key).await.unwrap());
-    assert!(!fx.engine.remove_backup_row(&key).await.unwrap());
+    // A row another writer moved to another store after the caller read it
+    // is left by a removal that names the store read.
+    let moved_to = StoreIdentity {
+        store_kind: row.store.store_kind,
+        store_root: format!("{}-moved", row.store.store_root),
+        store_id: "moved-1".to_owned(),
+    };
+    assert_eq!(
+        fx.engine
+            .rewrite_store(
+                row.store.store_kind,
+                &row.store.store_root,
+                std::slice::from_ref(&key),
+                &moved_to
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(
+        !fx.engine
+            .remove_backup_row(&key, row.store.store_kind, &row.store.store_root)
+            .await
+            .unwrap(),
+        "a row moved to another store is left"
+    );
+    assert_eq!(
+        fx.engine
+            .read_backup_row(&arn_of(&row))
+            .await
+            .unwrap()
+            .map(|r| (r.status, r.store)),
+        Some((BackupStatus::Deleted, moved_to.clone()))
+    );
+    // The same root under the other kind is another store: a removal that
+    // names the kind it read leaves the row.
+    let other_kind = StoreIdentity {
+        store_kind: if moved_to.store_kind == StoreKind::S3 {
+            StoreKind::Filesystem
+        } else {
+            StoreKind::S3
+        },
+        ..moved_to.clone()
+    };
+    assert_eq!(
+        fx.engine
+            .rewrite_store(
+                moved_to.store_kind,
+                &moved_to.store_root,
+                std::slice::from_ref(&key),
+                &other_kind
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(
+        !fx.engine
+            .remove_backup_row(&key, moved_to.store_kind, &moved_to.store_root)
+            .await
+            .unwrap(),
+        "a row moved to the other kind is left"
+    );
+    let moved_to = other_kind;
+    assert!(
+        fx.engine
+            .remove_backup_row(&key, moved_to.store_kind, &moved_to.store_root)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !fx.engine
+            .remove_backup_row(&key, moved_to.store_kind, &moved_to.store_root)
+            .await
+            .unwrap()
+    );
     assert!(
         fx.engine
             .read_backup_row(&arn_of(&row))
@@ -2306,11 +3054,13 @@ async fn assert_deleting_then_resumed(engine: &MongoEngine, backup_arn: &str, ba
         "a restore must not start from a backup whose data was dropped: {source:?}"
     );
     assert!(table_doc(engine, "dst").await.is_none());
-    let resumed = engine
-        .delete(ACCOUNT, backup_arn)
-        .await
-        .expect("a retry resumes the delete");
-    assert_eq!(resumed.backup_details.backup_status, "DELETED");
+    // A retry resumes the drop and the DELETED write, and answers not found:
+    // only the DeleteBackup that wrote DELETING answers DELETED.
+    let resumed = engine.delete(ACCOUNT, backup_arn).await;
+    assert!(
+        matches!(&resumed, Err(StorageError::Validation(m)) if m.starts_with("Backup not found")),
+        "{resumed:?}"
+    );
     assert_eq!(
         backup_meta(engine, backup_arn)
             .await
@@ -2380,6 +3130,80 @@ async fn live_a_delete_dropped_while_waiting_for_its_drop_leaves_the_backup_dele
     fx.finish().await;
 }
 
+/// Concurrent DeleteBackups of one in-catalog backup: only the one that
+/// wrote DELETING answers DELETED, every other answers not found, as a
+/// DeleteBackup after them does. First with one held after its drop (a
+/// DeleteBackup reading DELETING resumes the drop and the DELETED write and
+/// answers not found), then three at once on fresh backups, three times.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_concurrent_deletes_of_one_backup_answer_deleted_once() {
+    let fx = Fixture::new().await;
+    source_table_with(&fx.engine, "src", 300).await;
+    let not_found = |r: &Result<_, StorageError>| matches!(r, Err(StorageError::Validation(m)) if m.starts_with("Backup not found"));
+    let backup = fx
+        .engine
+        .create(ACCOUNT, "src", "held", JobPermit::detached())
+        .await
+        .expect("backup");
+    let backup_id = backup_meta(&fx.engine, &backup.backup_arn)
+        .await
+        .get_str("backup_id")
+        .expect("backup_id")
+        .to_owned();
+    let faulty = with_drop_fault(&fx.engine, AfterBackupDrop::Hang);
+    let arn = backup.backup_arn.clone();
+    let held = tokio::spawn(async move { faulty.delete(ACCOUNT, &arn).await });
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !(backup_meta(&fx.engine, &backup.backup_arn)
+        .await
+        .get_str("backup_status")
+        == Ok("DELETING")
+        && !collection_exists(&fx.engine, &format!("_backup_{backup_id}")).await)
+    {
+        assert!(Instant::now() < deadline, "the held delete wrote DELETING");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let second = fx.engine.delete(ACCOUNT, &backup.backup_arn).await;
+    held.abort();
+    assert!(not_found(&second), "{second:?}");
+    assert_eq!(
+        backup_meta(&fx.engine, &backup.backup_arn)
+            .await
+            .get_str("backup_status"),
+        Ok("DELETED"),
+        "the second resumed the DELETED write"
+    );
+
+    for n in 0..3 {
+        let backup = fx
+            .engine
+            .create(ACCOUNT, "src", &format!("b{n}"), JobPermit::detached())
+            .await
+            .expect("backup");
+        let arn = &backup.backup_arn;
+        let (a, b, c) = tokio::join!(
+            fx.engine.delete(ACCOUNT, arn),
+            fx.engine.delete(ACCOUNT, arn),
+            fx.engine.delete(ACCOUNT, arn),
+        );
+        let answers = [a, b, c];
+        let deleted = answers
+            .iter()
+            .filter(|r| matches!(r, Ok(d) if d.backup_details.backup_status == "DELETED"))
+            .count();
+        let missing = answers.iter().filter(|r| not_found(r)).count();
+        assert_eq!((deleted, missing), (1, 2), "backup {n}: {answers:?}");
+        let after = fx.engine.delete(ACCOUNT, arn).await;
+        assert!(not_found(&after), "backup {n}: {after:?}");
+        assert_eq!(
+            backup_meta(&fx.engine, arn).await.get_str("backup_status"),
+            Ok("DELETED")
+        );
+    }
+    fx.finish().await;
+}
+
 /// A restore from a process whose clock is 10 minutes behind the server's
 /// is not dead to another process (stale window 5 minutes): the record's
 /// first heartbeat, written with the local clock at the insert, is replaced
@@ -2403,6 +3227,7 @@ async fn live_a_restore_from_a_process_with_a_slow_clock_is_not_dead() {
         target_drop_fails: false,
         local_clock_behind: Duration::from_secs(600),
         heartbeat_fault: None,
+        replacement_commit_unknown: false,
     };
     let behind = fx.second_instance(liveness.clone()).await;
     let (behind, gate) = gated(&behind);
@@ -4791,4 +5616,690 @@ async fn live_the_newest_available_row_and_the_running_restores_are_read_by_stat
         "the age-based listing misses a heartbeat ahead of the clock"
     );
     fx.finish().await;
+}
+
+// --- `extenddb backup migrate-legacy`: the item stream, `list_all`, the
+// replacement by an index row.
+
+/// The index row of the store copy of the legacy backup `backup_arn`, as
+/// the migration builds it.
+async fn migrated_row(engine: &MongoEngine, backup_arn: &str) -> BackupRow {
+    let source = engine
+        .restore_source(ACCOUNT, backup_arn)
+        .await
+        .expect("source");
+    let table = extenddb_storage::backup_definition::source_table_from_legacy(
+        &source,
+        extenddb_storage::backup_definition::LegacyVectorState::Unsupported,
+        REGION,
+        ACCOUNT,
+    )
+    .expect("source table");
+    BackupRow {
+        backup_id: BackupArn::parse(backup_arn)
+            .expect("arn")
+            .backup_id()
+            .to_owned(),
+        account_id: ACCOUNT.to_owned(),
+        table_name: source.source_table_name.clone(),
+        backup_arn: backup_arn.to_owned(),
+        backup_name: "b".to_owned(),
+        status: BackupStatus::Available,
+        store: store(),
+        size_bytes: 4321,
+        item_count: source.item_count,
+        created_at: source.backup_creation_date_time,
+        completed_at: None,
+        failure_reason: None,
+        source_table_details_json: serde_json::to_value(&table).expect("json"),
+        owner_generation: 77,
+        heartbeat_at: 0.0,
+    }
+}
+
+/// A legacy backup `b` of a new table `name` with `items` items, and the
+/// name of its item collection.
+async fn legacy_backup(engine: &MongoEngine, name: &str, items: usize) -> (String, String) {
+    source_table_with(engine, name, items).await;
+    let arn = engine
+        .create(ACCOUNT, name, "b", JobPermit::detached())
+        .await
+        .expect("backup")
+        .backup_arn;
+    let collection = super::backup_collection_name(
+        backup_meta(engine, &arn)
+            .await
+            .get_str("backup_id")
+            .expect("backup_id"),
+    );
+    (arn, collection)
+}
+
+/// The items of `collection`, by their JSON text, sorted.
+async fn collection_items(engine: &MongoEngine, collection: &str) -> Vec<String> {
+    let docs: Vec<Document> = engine
+        .data_db
+        .collection::<Document>(collection)
+        .find(doc! {})
+        .await
+        .expect("find")
+        .try_collect()
+        .await
+        .expect("documents");
+    let mut items: Vec<String> = docs
+        .iter()
+        .map(|d| serde_json::to_string(&document_to_item(d).expect("item")).expect("text"))
+        .collect();
+    items.sort();
+    items
+}
+
+/// The stream reads every document of the backup's collection, past one
+/// fetch batch (2,500 items, batches of 1,000), decoded as the data path
+/// decodes them; it carries the backup's name and source, and the vector
+/// state of a backend without vector support.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_legacy_items_stream_every_document_of_the_backup_collection() {
+    let fixture = Fixture::new().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let fx = &fixture;
+        let (arn, collection) = legacy_backup(&fx.engine, "src", 2_500).await;
+        let opened = fx.engine.items(ACCOUNT, &arn).await.expect("items");
+        assert_eq!(opened.backup_name, "b");
+        assert_eq!(
+            opened.source,
+            fx.engine
+                .restore_source(ACCOUNT, &arn)
+                .await
+                .expect("source")
+        );
+        assert_eq!(
+            opened.vector_state,
+            extenddb_storage::backup_definition::LegacyVectorState::Unsupported
+        );
+        let mut streamed: Vec<String> = opened
+            .items
+            .map(|item| serde_json::to_string(&item.expect("an item")).expect("text"))
+            .collect()
+            .await;
+        streamed.sort();
+        let expected = collection_items(&fx.engine, &collection).await;
+        assert_eq!(expected.len(), 2_500);
+        assert_eq!(streamed, expected);
+    })
+    .catch_unwind()
+    .await;
+    fixture.finish_after(outcome).await;
+}
+
+/// `items` refuses another account's backup, a missing one and a backup
+/// with no `backup_id` (no item collection), and a DeleteBackup's drop
+/// ends a running stream with an error.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_legacy_items_refuse_what_cannot_be_read_and_end_at_a_drop() {
+    let fixture = Fixture::new().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let fx = &fixture;
+        let (arn, _) = legacy_backup(&fx.engine, "src", 2_500).await;
+        for (account, backup_arn) in [(OTHER_ACCOUNT, arn.clone()), (ACCOUNT, flip_last_hex(&arn))]
+        {
+            let err = fx.engine.items(account, &backup_arn).await.err();
+            assert!(
+                matches!(&err, Some(StorageError::Validation(m)) if m.contains("Backup not found")),
+                "{err:?}"
+            );
+        }
+        let mut items = fx.engine.items(ACCOUNT, &arn).await.expect("items").items;
+        assert!(items.next().await.expect("one").is_ok());
+        fx.engine.delete(ACCOUNT, &arn).await.expect("delete");
+        let mut read = 1;
+        let mut ended_with = None;
+        while let Some(item) = items.next().await {
+            match item {
+                Ok(_) => read += 1,
+                Err(e) => {
+                    ended_with = Some(e);
+                    break;
+                }
+            }
+        }
+        assert!(ended_with.is_some(), "the drop ends the stream");
+        assert!(read < 2_500, "{read} items read");
+        assert!(items.next().await.is_none(), "nothing follows the error");
+
+        let (old, _) = legacy_backup(&fx.engine, "old", 3).await;
+        fx.engine
+            .catalog_db
+            .collection::<Document>("backups")
+            .update_one(doc! { "_id": &old }, doc! { "$unset": { "backup_id": "" } })
+            .await
+            .expect("a backup from before $out");
+        let err = fx.engine.items(ACCOUNT, &old).await.err();
+        assert!(
+            matches!(&err, Some(StorageError::Unsupported(m)) if m.contains("no item collection")),
+            "{err:?}"
+        );
+    })
+    .catch_unwind()
+    .await;
+    fixture.finish_after(outcome).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_list_all_lists_every_account_and_leaves_deleted_backups_out() {
+    let fixture = Fixture::new().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let fx = &fixture;
+        let mut arns = Vec::new();
+        for name in ["a", "b", "c", "d"] {
+            arns.push(legacy_backup(&fx.engine, name, 2).await.0);
+        }
+        let backups = fx.engine.catalog_db.collection::<Document>("backups");
+        backups
+            .update_one(
+                doc! { "_id": &arns[1] },
+                doc! { "$set": { "account_id": OTHER_ACCOUNT } },
+            )
+            .await
+            .expect("move");
+        backups
+            .update_one(
+                doc! { "_id": &arns[2] },
+                doc! { "$set": { "backup_status": "DELETING" } },
+            )
+            .await
+            .expect("deleting");
+        fx.engine.delete(ACCOUNT, &arns[3]).await.expect("delete");
+        let key =
+            |account: &str, arn: &str, status| extenddb_storage::backup_catalog::LegacyBackupKey {
+                account_id: account.to_owned(),
+                backup_arn: arn.to_owned(),
+                status,
+            };
+        assert_eq!(
+            fx.engine.list_all().await.expect("list"),
+            vec![
+                key(ACCOUNT, &arns[0], BackupStatus::Available),
+                key(OTHER_ACCOUNT, &arns[1], BackupStatus::Available),
+                key(ACCOUNT, &arns[2], BackupStatus::Deleting),
+            ]
+        );
+    })
+    .catch_unwind()
+    .await;
+    fixture.finish_after(outcome).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_a_replacement_inserts_the_unowned_row_and_removes_the_backup() {
+    let fixture = Fixture::new().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let fx = &fixture;
+        let (arn, collection) = legacy_backup(&fx.engine, "src", 30).await;
+        let row = migrated_row(&fx.engine, &arn).await;
+        assert!(collection_exists(&fx.engine, &collection).await);
+        assert_eq!(
+            fx.engine
+                .replace_with_index_row(&row)
+                .await
+                .expect("replace"),
+            extenddb_storage::backup_catalog::Replaced::Replaced
+        );
+        let read = fx
+            .engine
+            .read_backup_row(&arn_of(&row))
+            .await
+            .expect("read")
+            .expect("the index row");
+        assert_eq!(read.owner_generation, UNOWNED_GENERATION);
+        assert!(read.completed_at.is_some());
+        assert_eq!(read.status, BackupStatus::Available);
+        assert_eq!(read.store, row.store);
+        assert_eq!(
+            read.source_table().expect("source"),
+            row.source_table().expect("source")
+        );
+        let doc = backup_meta(&fx.engine, &arn).await;
+        assert_eq!(doc.get_str("backup_status"), Ok("DELETED"));
+        assert!(!collection_exists(&fx.engine, &collection).await);
+        assert!(fx.engine.describe(ACCOUNT, &arn).await.is_err());
+        assert!(
+            fx.engine
+                .list(ACCOUNT, None)
+                .await
+                .expect("list")
+                .is_empty()
+        );
+        assert!(fx.engine.list_all().await.expect("list").is_empty());
+        assert_eq!(
+            fx.engine
+                .replace_with_index_row(&row)
+                .await
+                .expect("replace"),
+            extenddb_storage::backup_catalog::Replaced::AlreadyReplaced
+        );
+    })
+    .catch_unwind()
+    .await;
+    fixture.finish_after(outcome).await;
+}
+
+/// A replacement whose drop fails after the commit leaves the document
+/// DELETING with the index row in: DeleteBackup of the legacy ARN reads it
+/// as not found and leaves it, `list_all` lists it, and the next
+/// replacement finishes it as `AlreadyReplaced`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_a_replacement_that_stopped_before_its_drop_is_finished_by_the_next() {
+    let fixture = Fixture::new().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let fx = &fixture;
+        let (arn, collection) = legacy_backup(&fx.engine, "src", 30).await;
+        let row = migrated_row(&fx.engine, &arn).await;
+        let faulty = with_drop_fault(&fx.engine, AfterBackupDrop::Fail);
+        assert!(faulty.replace_with_index_row(&row).await.is_err());
+        let doc = backup_meta(&fx.engine, &arn).await;
+        assert_eq!(doc.get_str("backup_status"), Ok("DELETING"));
+        assert_eq!(doc.get_bool(super::MIGRATED_TO_STORE), Ok(true));
+        assert!(
+            fx.engine
+                .read_backup_row(&arn_of(&row))
+                .await
+                .expect("read")
+                .is_some()
+        );
+        let err = fx.engine.delete(ACCOUNT, &arn).await.err();
+        assert!(
+            matches!(&err, Some(StorageError::Validation(m)) if m.contains("Backup not found")),
+            "{err:?}"
+        );
+        assert_eq!(
+            backup_meta(&fx.engine, &arn).await.get_str("backup_status"),
+            Ok("DELETING"),
+            "DeleteBackup left it"
+        );
+        assert_eq!(
+            fx.engine.list_all().await.expect("list"),
+            vec![extenddb_storage::backup_catalog::LegacyBackupKey {
+                account_id: ACCOUNT.to_owned(),
+                backup_arn: arn.clone(),
+                status: BackupStatus::Deleting,
+            }]
+        );
+        // A collection the failed drop left (the fault fires after the drop
+        // ran) is dropped again; then DELETED.
+        assert_eq!(
+            fx.engine
+                .replace_with_index_row(&row)
+                .await
+                .expect("replace"),
+            extenddb_storage::backup_catalog::Replaced::AlreadyReplaced
+        );
+        assert_eq!(
+            backup_meta(&fx.engine, &arn).await.get_str("backup_status"),
+            Ok("DELETED")
+        );
+        assert!(!collection_exists(&fx.engine, &collection).await);
+        assert!(fx.engine.list_all().await.expect("list").is_empty());
+    })
+    .catch_unwind()
+    .await;
+    fixture.finish_after(outcome).await;
+}
+
+/// A replacement that committed and stopped before its drop, then a
+/// DeleteBackup of the migrated backup whose index row is removed since
+/// (the tombstone duty, or `--forget-backup`): `finish_replacement` finishes
+/// the marked DELETING document whatever the index row holds, dropping the
+/// collection and writing DELETED; a second call has nothing to finish, and
+/// the document counts neither as an in-catalog backup nor as a deleted
+/// one.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_a_stopped_replacement_is_finished_after_its_row_is_gone() {
+    let fixture = Fixture::new().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let fx = &fixture;
+        let (arn, collection) = legacy_backup(&fx.engine, "src", 30).await;
+        let row = migrated_row(&fx.engine, &arn).await;
+        // The fault fires once the drop's command was sent; the copy of the
+        // collection a drop that never ran leaves is made here.
+        let faulty = with_drop_fault(&fx.engine, AfterBackupDrop::Fail);
+        assert!(faulty.replace_with_index_row(&row).await.is_err());
+        fx.engine
+            .data_db
+            .collection::<Document>(&collection)
+            .insert_one(doc! { "item_data": { "pk": { "S": "left" } } })
+            .await
+            .expect("a collection the drop left");
+        fx.engine
+            .backup_index()
+            .delete_one(doc! { "backup_id": &row.backup_id })
+            .await
+            .expect("the index row removed");
+        assert!(
+            fx.engine
+                .read_backup_row(&arn_of(&row))
+                .await
+                .expect("read")
+                .is_none()
+        );
+        assert_eq!(
+            fx.engine
+                .holder_status(ACCOUNT, &arn)
+                .await
+                .expect("holder"),
+            None,
+            "the migration replaced it"
+        );
+        assert!(
+            fx.engine
+                .finish_replacement(ACCOUNT, &arn)
+                .await
+                .expect("finish")
+        );
+        assert_eq!(
+            backup_meta(&fx.engine, &arn).await.get_str("backup_status"),
+            Ok("DELETED")
+        );
+        assert!(!collection_exists(&fx.engine, &collection).await);
+        assert!(
+            !fx.engine
+                .finish_replacement(ACCOUNT, &arn)
+                .await
+                .expect("finish again")
+        );
+        assert!(fx.engine.list_all().await.expect("list").is_empty());
+        assert!(fx.engine.list_deleted().await.expect("deleted").is_empty());
+    })
+    .catch_unwind()
+    .await;
+    fixture.finish_after(outcome).await;
+}
+
+/// `holder_status` answers for a backup document in any status, DELETED
+/// included, and for none the replacement marked; `list_deleted` lists the
+/// documents a DeleteBackup left DELETED and not a replaced one.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_holder_status_and_list_deleted_tell_a_delete_from_a_replacement() {
+    let fixture = Fixture::new().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let fx = &fixture;
+        let (deleted, _) = legacy_backup(&fx.engine, "gone", 3).await;
+        let (replaced, _) = legacy_backup(&fx.engine, "moved", 3).await;
+        assert_eq!(
+            fx.engine
+                .holder_status(ACCOUNT, &deleted)
+                .await
+                .expect("holder"),
+            Some(BackupStatus::Available)
+        );
+        fx.engine.delete(ACCOUNT, &deleted).await.expect("delete");
+        let row = migrated_row(&fx.engine, &replaced).await;
+        assert_eq!(
+            fx.engine
+                .replace_with_index_row(&row)
+                .await
+                .expect("replace"),
+            extenddb_storage::backup_catalog::Replaced::Replaced
+        );
+        assert_eq!(
+            backup_meta(&fx.engine, &replaced)
+                .await
+                .get_str("backup_status"),
+            Ok("DELETED")
+        );
+        assert_eq!(
+            fx.engine
+                .holder_status(ACCOUNT, &deleted)
+                .await
+                .expect("holder"),
+            Some(BackupStatus::Deleted)
+        );
+        assert_eq!(
+            fx.engine
+                .holder_status(ACCOUNT, &replaced)
+                .await
+                .expect("holder"),
+            None
+        );
+        assert_eq!(
+            fx.engine
+                .holder_status("999999999999", &deleted)
+                .await
+                .expect("holder"),
+            None
+        );
+        assert_eq!(
+            fx.engine.list_deleted().await.expect("deleted"),
+            vec![extenddb_storage::backup_catalog::LegacyBackupKey {
+                account_id: ACCOUNT.to_owned(),
+                backup_arn: deleted.clone(),
+                status: BackupStatus::Deleted,
+            }]
+        );
+        // The row the replacement wrote is found by its id alone, whatever
+        // its ARN and its account (the `backup_id` index is unique).
+        let by_id = fx
+            .engine
+            .row_holding_backup_id(&row.backup_id)
+            .await
+            .expect("by id");
+        assert_eq!(by_id.map(|r| r.backup_arn), Some(replaced.clone()));
+        assert_eq!(
+            fx.engine
+                .row_holding_backup_id("01791976430099-11110099")
+                .await
+                .expect("by id"),
+            None
+        );
+        // The removal of a DeleteBackup's record: only a DELETED document
+        // of the account without the replacement's marker, once.
+        for (account, arn) in [("999999999999", &deleted), (ACCOUNT, &replaced)] {
+            assert!(
+                !fx.engine
+                    .remove_deleted(account, arn)
+                    .await
+                    .expect("remove"),
+                "{account} {arn}"
+            );
+        }
+        assert_eq!(
+            backup_meta(&fx.engine, &replaced)
+                .await
+                .get_str("backup_status"),
+            Ok("DELETED"),
+            "the replacement's document is left"
+        );
+        assert!(
+            fx.engine
+                .remove_deleted(ACCOUNT, &deleted)
+                .await
+                .expect("remove")
+        );
+        assert!(
+            !fx.engine
+                .remove_deleted(ACCOUNT, &deleted)
+                .await
+                .expect("remove")
+        );
+        assert!(fx.engine.list_deleted().await.expect("deleted").is_empty());
+        assert_eq!(
+            fx.engine
+                .holder_status(ACCOUNT, &deleted)
+                .await
+                .expect("holder"),
+            None
+        );
+    })
+    .catch_unwind()
+    .await;
+    fixture.finish_after(outcome).await;
+}
+
+/// A replacement whose transaction committed and whose commit answer was
+/// lost settles it by reading back what it wrote: it answers `Replaced`
+/// (this call's), and finishes the drop.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_a_replacement_whose_commit_answer_is_lost_settles_it() {
+    let fixture = Fixture::new().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let fx = &fixture;
+        let (arn, collection) = legacy_backup(&fx.engine, "src", 10).await;
+        let row = migrated_row(&fx.engine, &arn).await;
+        let mut lost = fx.engine.clone();
+        lost.backup_liveness.replacement_commit_unknown = true;
+        assert_eq!(
+            lost.replace_with_index_row(&row).await.expect("replace"),
+            extenddb_storage::backup_catalog::Replaced::Replaced
+        );
+        assert_eq!(
+            backup_meta(&fx.engine, &arn).await.get_str("backup_status"),
+            Ok("DELETED")
+        );
+        assert!(!collection_exists(&fx.engine, &collection).await);
+        assert!(
+            fx.engine
+                .read_backup_row(&arn_of(&row))
+                .await
+                .expect("read")
+                .is_some()
+        );
+    })
+    .catch_unwind()
+    .await;
+    fixture.finish_after(outcome).await;
+}
+
+/// The replacement refuses, writing nothing, while a restore target of the
+/// backup is CREATING, when the backup is not AVAILABLE or missing, and
+/// when another store's row holds its id; a row `backup sync` adopted is
+/// finished.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_a_replacement_refuses_an_in_use_or_unavailable_backup_and_writes_nothing() {
+    use extenddb_storage::backup_catalog::Replaced;
+    let fixture = Fixture::new().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let fx = &fixture;
+        let (arn, collection) = legacy_backup(&fx.engine, "src", 30).await;
+        let row = migrated_row(&fx.engine, &arn).await;
+        let (gated, gate) = gated(&fx.engine);
+        let request = restore_request(&fx.engine, &arn, "dst").await;
+        gated
+            .restore(ACCOUNT, request, JobPermit::detached())
+            .await
+            .expect("registers");
+        assert_eq!(
+            fx.engine
+                .replace_with_index_row(&row)
+                .await
+                .expect("replace"),
+            Replaced::InUse("dst".to_owned())
+        );
+        assert_eq!(
+            backup_meta(&fx.engine, &arn).await.get_str("backup_status"),
+            Ok("AVAILABLE")
+        );
+        assert!(collection_exists(&fx.engine, &collection).await);
+        assert!(
+            fx.engine
+                .read_backup_row(&arn_of(&row))
+                .await
+                .expect("read")
+                .is_none()
+        );
+        gate.add_permits(1);
+        assert_fully_restored_with(&fx.engine, "dst", 30).await;
+
+        // Another store's row holds the id.
+        let mut elsewhere = row.clone();
+        elsewhere.store.store_root = "/srv/elsewhere".to_owned();
+        assert!(
+            fx.engine
+                .insert_backup_row(&elsewhere)
+                .await
+                .expect("insert")
+        );
+        let err = fx.engine.replace_with_index_row(&row).await.err();
+        assert!(
+            matches!(&err, Some(StorageError::AlreadyExists(m)) if m.contains("/srv/elsewhere")),
+            "{err:?}"
+        );
+        assert_eq!(
+            backup_meta(&fx.engine, &arn).await.get_str("backup_status"),
+            Ok("AVAILABLE")
+        );
+        assert!(collection_exists(&fx.engine, &collection).await);
+        // Deleted since: the other store's row is still answered as such,
+        // not as a backup that is no longer AVAILABLE.
+        fx.engine.delete(ACCOUNT, &arn).await.expect("delete");
+        let err = fx.engine.replace_with_index_row(&row).await.err();
+        assert!(
+            matches!(&err, Some(StorageError::AlreadyExists(m)) if m.contains("/srv/elsewhere")),
+            "{err:?}"
+        );
+
+        // A copy `backup sync` adopted: finished.
+        let (adopted, adopted_collection) = legacy_backup(&fx.engine, "adopted", 3).await;
+        let adopted_row = migrated_row(&fx.engine, &adopted).await;
+        assert!(
+            fx.engine
+                .insert_backup_row(&adopted_row)
+                .await
+                .expect("insert")
+        );
+        assert_eq!(
+            fx.engine
+                .replace_with_index_row(&adopted_row)
+                .await
+                .expect("replace"),
+            Replaced::AlreadyReplaced
+        );
+        assert_eq!(
+            backup_meta(&fx.engine, &adopted)
+                .await
+                .get_str("backup_status"),
+            Ok("DELETED")
+        );
+        assert!(!collection_exists(&fx.engine, &adopted_collection).await);
+
+        // Not AVAILABLE, then missing.
+        let (gone, _) = legacy_backup(&fx.engine, "gone", 3).await;
+        let gone_row = migrated_row(&fx.engine, &gone).await;
+        fx.engine.delete(ACCOUNT, &gone).await.expect("delete");
+        assert_eq!(
+            fx.engine
+                .replace_with_index_row(&gone_row)
+                .await
+                .expect("replace"),
+            Replaced::NotAvailable("the in-catalog backup is DELETED".to_owned())
+        );
+        let mut missing = gone_row.clone();
+        missing.backup_arn = flip_last_hex(&gone);
+        missing.backup_id = BackupArn::parse(&missing.backup_arn)
+            .unwrap()
+            .backup_id()
+            .to_owned();
+        assert!(matches!(
+            fx.engine.replace_with_index_row(&missing).await.expect("replace"),
+            Replaced::NotAvailable(m) if m.contains("Backup not found")
+        ));
+        assert!(
+            fx.engine
+                .read_backup_row(&arn_of(&gone_row))
+                .await
+                .expect("read")
+                .is_none()
+        );
+    })
+    .catch_unwind()
+    .await;
+    fixture.finish_after(outcome).await;
 }

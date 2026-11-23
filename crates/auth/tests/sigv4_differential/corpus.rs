@@ -4,7 +4,7 @@
 //! Fixed request parts: endpoints, regions, operations, the headers DynamoDB
 //! clients send, and bodies.
 
-use crate::harness::{Endpoint, Key, Shape};
+use crate::harness::{Endpoint, Key, SERVER_REGION, Shape};
 
 /// Endpoints a client is configured with. None names the scheme's default
 /// port, so the Host value the client's HTTP stack sends is the authority,
@@ -32,10 +32,13 @@ pub const ENDPOINTS: &[Endpoint] = &[
     },
 ];
 
-/// Regions a client signs for. `verify_signature` checks the credential
-/// scope's service and date but not its region, so a request signed for any
-/// region verifies. The list holds the AWS commercial, GovCloud, China and
-/// European Sovereign Cloud region codes, and names a local deployment uses.
+/// Regions a client signs for. The server checks the credential scope's
+/// region against the region it is deployed as, `SERVER_REGION`, before it
+/// looks the key up or compares the signature: a request signed for that
+/// region verifies, and a request signed for any other region is refused
+/// with `WRONG_REGION`. The list holds the AWS commercial, GovCloud, China
+/// and European Sovereign Cloud region codes, and names a local deployment
+/// uses.
 pub const REGIONS: &[&str] = &[
     "us-east-1",
     "us-east-2",
@@ -217,12 +220,13 @@ pub fn large_bodies() -> Vec<(&'static str, Vec<u8>)> {
 /// The server's request body limit, 16 MiB.
 pub const BODY_LIMIT: usize = 16 * 1024 * 1024;
 
-/// A DynamoDB PutItem to the server's default endpoint, signed for us-east-1.
+/// A DynamoDB PutItem to the server's default endpoint, signed for the
+/// server's region.
 pub fn base(key: Key, body: Vec<u8>) -> Shape {
     Shape::new(
         key,
         ENDPOINTS[0],
-        "us-east-1",
+        SERVER_REGION,
         "DynamoDB_20120810.PutItem",
         body,
     )

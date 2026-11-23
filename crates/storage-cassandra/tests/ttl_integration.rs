@@ -3,8 +3,9 @@
 
 //! Integration tests for Cassandra TTL against a live Cassandra.
 //!
-//! Requires Cassandra on 127.0.0.1:9042. There is no Cassandra CI workflow, so
-//! these are run locally.
+//! Requires Cassandra at the contact point in
+//! `EXTENDDB_TEST_CASSANDRA_CONTACT_POINT` (default 127.0.0.1:9042). The
+//! integration-cassandra workflow runs these against a service container.
 
 #[path = "common/mod.rs"]
 mod helpers;

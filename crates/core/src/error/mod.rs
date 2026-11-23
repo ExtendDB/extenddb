@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 mod messages;
 
-pub use messages::{ErrorMessageKey, error_message, validation_error, validation_errors};
+pub use messages::{
+    ErrorMessageKey, error_message, validation_error, validation_error_envelope, validation_errors,
+};
 
 use crate::types::{CancellationReason, Item};
 
@@ -220,7 +222,7 @@ impl DynamoDbError {
             Self::InternalServerError(_) => "InternalServerError",
             Self::AccessDeniedException(_) => "AccessDeniedException",
             Self::MissingAuthenticationToken(_) => "MissingAuthenticationToken",
-            Self::IncompleteSignature(_) => "IncompleteSignature",
+            Self::IncompleteSignature(_) => "IncompleteSignatureException",
             Self::UnrecognizedClientException(_) => "UnrecognizedClientException",
             Self::ExpiredTokenException(_) => "ExpiredTokenException",
             Self::ExpiredIteratorException(_) => "ExpiredIteratorException",

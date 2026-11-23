@@ -9,24 +9,27 @@ significant digits or an empty ``N`` is refused with ``ValidationException``
 before any row is read, whether a ``FilterExpression`` reads the value,
 nothing reads it, or the request carries no expression at all. Every expected
 answer below was measured against the service on 2026-10-25 (09:23 to 09:28,
-10:38, 10:55 and 11:31 UTC) with each request sent twice. A Unicode decimal
-digit in an ``N`` value counts as the digit it stands for; a field of the
-wrong JSON type anywhere in the body answers ``SerializationException`` ahead
+10:38, 10:55 and 11:31 UTC), 2026-11-19 or 2026-11-23 with each request sent
+twice. A Unicode decimal digit in an ``N`` value counts as the digit it stands
+for; a field of the wrong JSON type answers ``SerializationException`` ahead
 of every check.
 
 The rows also pin where the check falls against the other early Scan checks:
-after the ``Limit``, ``Segment`` and ``TotalSegments`` range constraints
-(``Value at 'Limit'`` with no value echoed for a ``Limit`` inside the int32
-range; the ``Segment`` and ``TotalSegments`` rows assert the position of the
-check, not its text), the expression and non-expression parameter mix and the
-``ReturnConsumedCapacity`` enum; and
-before the ``Select`` enum, the Segment pairing checks, the table lookup, the
+after the ``Limit``, ``Segment`` and ``TotalSegments`` range constraints, the
+``ReturnConsumedCapacity`` enum, the expression and non-expression parameter
+mix and the ``ExpressionAttributeNames`` checks; and before the set checks,
+the ``Select`` enum, the Segment pairing checks, the table lookup, the
 IndexName, ConsistentRead, Select with ProjectionExpression,
 ExclusiveStartKey, undefined placeholder, unused value and filter syntax
-checks.
+checks. A value the service cannot read as one type (a null, ``{}``, an
+unknown type descriptor) takes another order: an invalid ``Select`` and
+``ReturnConsumedCapacity`` are reported together, ahead of the mix, the names
+and the values.
 
-Dual-target: runs against the service and against extenddb with the same
-assertions.
+Dual-target: runs against the service and against extenddb. Where extenddb
+gives another text than the service, the row names both, the issue that
+tracks the difference, and asserts the one for the target: the value named
+among several faulty values (#1013) and the Segment pairing text.
 
 Run:
   EXTENDDB_TEST_ENDPOINT=https://localhost:18443 \\
@@ -39,7 +42,7 @@ from __future__ import annotations
 import pytest
 from botocore.exceptions import ClientError
 
-from conftest import scoped_table
+from conftest import _is_real_dynamodb, scoped_table
 
 NUMERIC = "The parameter cannot be converted to a numeric value: "
 OVERFLOW = (
@@ -64,6 +67,29 @@ SELECT_ENUM = (
     "constraint: Member must satisfy enum value set: "
     "[SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]"
 )
+SELECT_BAD = SELECT_ENUM.replace("'NOPE'", "'bad'")
+ONE_ERROR = "1 validation error detected: "
+AT_LEAST_0 = "greater than or equal to 0"
+AT_LEAST_1 = "greater than or equal to 1"
+AT_MOST_999999 = "less than or equal to 999999"
+AT_MOST_1000000 = "less than or equal to 1000000"
+PAIRING = "The Segment parameter is zero-based and must be less than parameter TotalSegments"
+MIX = (
+    "Can not use both expression and non-expression parameters in the same request: "
+    "Non-expression parameters: {ScanFilter} Expression parameters: {FilterExpression}"
+)
+EAN_KEY = 'ExpressionAttributeNames contains invalid key: Syntax error; key: "a"'
+INVALID_VALUE = "ExpressionAttributeValues contains invalid value: "
+
+
+def _newer(field: str, bound: str) -> str:
+    """The range text that names the field and not the value."""
+    return f"{ONE_ERROR}Value at '{field}' failed to satisfy constraint: Member must have value {bound}"
+
+
+def _older(value: int, field: str, bound: str) -> str:
+    """The range text that names the value and the field in lower camel case."""
+    return f"{ONE_ERROR}Value '{value}' at '{field}' failed to satisfy constraint: Member must have value {bound}"
 
 S = {"AttributeType": "S"}
 SX = {"S": "x"}
@@ -121,6 +147,9 @@ class TestNumberValues:
         pytest.param({"M": {"a": {"L": [{"M": {"b": NB}}]}}}, NUMERIC + "bob", id="M-L-M-N-bob"),
         pytest.param({"N": "1e200"}, OVERFLOW, id="overflow"),
         pytest.param({"N": "1e-200"}, UNDERFLOW, id="underflow"),
+        # Measured 2026-11-23 16:34 UTC: an exponent outside int32.
+        pytest.param({"N": "1e9999999999"}, OVERFLOW, id="exponent-above-int32"),
+        pytest.param({"N": "1e-9999999999"}, UNDERFLOW, id="exponent-below-int32"),
         pytest.param({"N": "1" * 39}, TOO_MANY_DIGITS, id="39-digits"),
         pytest.param({"N": ""}, NUMERIC, id="empty"),
         pytest.param({"N": " 1"}, NUMERIC + " 1", id="leading-space"),
@@ -173,7 +202,9 @@ class TestNumberValues:
         ) == ("ValidationException", NUMERIC + "bob")
 
     def test_two_bad_numbers_report_one_of_them(self, dynamodb_client, table):
-        """The service's choice between two bad values varied between two runs; either is accepted."""
+        """The service's choice between two bad values varied between two runs
+        (2026-10-25), and extenddb names the first by placeholder. The order the
+        service follows is #1013, so either value is accepted until that lands."""
         code, msg = _scan_error(
             dynamodb_client, TableName=table, FilterExpression="a = :a",
             ExpressionAttributeValues={":a": {"N": "one"}, ":b": {"N": "two"}},
@@ -199,45 +230,50 @@ class TestChecksBeforeTheNumbers:
             dynamodb_client_no_validation, TableName=table, Limit=limit, **NB_FILTER,
         ) == ("ValidationException", "1 validation error detected: " + LIMIT_RANGE)
 
-    @pytest.mark.parametrize("kwargs, field", [
-        pytest.param({"Segment": 0, "TotalSegments": 0}, "totalsegments", id="TotalSegments-0"),
-        pytest.param({"Segment": 0, "TotalSegments": 1_000_001}, "totalsegments", id="TotalSegments-1000001"),
-        pytest.param({"Segment": -1, "TotalSegments": 2}, "segment", id="Segment-minus-1"),
-        pytest.param({"Segment": 1_000_000, "TotalSegments": 1_000_000}, "segment", id="Segment-1000000"),
-        pytest.param({"Segment": -1}, "segment", id="Segment-minus-1-alone"),
-        pytest.param({"TotalSegments": 0}, "totalsegments", id="TotalSegments-0-alone"),
+    @pytest.mark.parametrize("kwargs, expected", [
+        pytest.param({"Segment": 0, "TotalSegments": 0}, _newer("TotalSegments", AT_LEAST_1),
+                     id="TotalSegments-0"),
+        pytest.param({"Segment": 0, "TotalSegments": 1_000_001},
+                     _newer("TotalSegments", AT_MOST_1000000), id="TotalSegments-1000001"),
+        pytest.param({"Segment": -1, "TotalSegments": 2}, _newer("Segment", AT_LEAST_0),
+                     id="Segment-minus-1"),
+        pytest.param({"Segment": 1_000_000, "TotalSegments": 1_000_000},
+                     _newer("Segment", AT_MOST_999999), id="Segment-1000000"),
+        pytest.param({"Segment": -1}, _newer("Segment", AT_LEAST_0), id="Segment-minus-1-alone"),
+        pytest.param({"TotalSegments": 0}, _newer("TotalSegments", AT_LEAST_1),
+                     id="TotalSegments-0-alone"),
     ])
-    def test_segment_ranges(self, dynamodb_client_no_validation, table, kwargs, field):
-        # The range fault names the field and is reported ahead of the number;
-        # the text itself differs between the service and extenddb.
-        code, msg = _scan_error(dynamodb_client_no_validation, TableName=table, **kwargs, **NB_FILTER)
-        assert code == "ValidationException"
-        assert field in msg.lower().replace("'", "")
-        assert "bob" not in msg
+    def test_segment_ranges(self, dynamodb_client_no_validation, table, kwargs, expected):
+        # Measured 2026-11-23 13:59 and 16:47 UTC with the bad number beside
+        # each row: the range fault comes first, in the service's newer form.
+        assert _scan_error(
+            dynamodb_client_no_validation, TableName=table, **kwargs, **NB_FILTER,
+        ) == ("ValidationException", expected)
 
     def test_limit_range_is_reported_ahead_of_the_segment_ranges_and_the_number(
         self, dynamodb_client_no_validation, table,
     ):
-        code, msg = _scan_error(
+        # Measured 2026-11-19 16:15 UTC: the three range faults in one message.
+        expected = (
+            "3 validation errors detected: Value at 'Limit' failed to satisfy constraint: "
+            f"Member must have value {AT_LEAST_1}; Value at 'Segment' failed to satisfy "
+            f"constraint: Member must have value {AT_LEAST_0}; Value at 'TotalSegments' "
+            f"failed to satisfy constraint: Member must have value {AT_MOST_1000000}"
+        )
+        assert _scan_error(
             dynamodb_client_no_validation, TableName=table,
             Limit=0, Segment=-1, TotalSegments=1_000_001, **NB_FILTER,
-        )
-        assert code == "ValidationException"
-        assert msg.endswith(LIMIT_RANGE) or msg.startswith("3 validation errors detected: " + LIMIT_RANGE)
-        assert "bob" not in msg
+        ) == ("ValidationException", expected)
 
-    def test_limit_below_int32_answers_the_saturated_value(self, dynamodb_client_no_validation, table):
+    def test_limit_at_and_below_the_int32_minimum(self, dynamodb_client_no_validation, table):
         # Measured 2026-10-25 10:38 and 10:55 UTC: outside int32 the service
         # echoes the saturated value in the older form, and beats the number.
         assert _scan_error(
             dynamodb_client_no_validation, TableName=table, Limit=-2_147_483_649, **NB_FILTER,
-        ) == ("ValidationException", (
-            "1 validation error detected: Value '-2147483648' at 'limit' failed to "
-            "satisfy constraint: Member must have value greater than or equal to 1"
-        ))
+        ) == ("ValidationException", _older(-2_147_483_648, "limit", AT_LEAST_1))
         assert _scan_error(
             dynamodb_client_no_validation, TableName=table, Limit=-2_147_483_648, **NB_FILTER,
-        ) == ("ValidationException", "1 validation error detected: " + LIMIT_RANGE)
+        ) == ("ValidationException", ONE_ERROR + LIMIT_RANGE)
 
     def test_limit_range_beats_the_missing_table(self, dynamodb_client_no_validation):
         assert _scan_error(
@@ -258,12 +294,18 @@ class TestChecksBeforeTheNumbers:
             f"Non-expression parameters: {{{non_expression}}} Expression parameters: {{{expression}}}",
         )
 
-    def test_return_consumed_capacity_beats_parameter_mix(self, dynamodb_client_no_validation, table):
-        # Measured 2026-11-05: the ReturnConsumedCapacity enum comes ahead of
-        # the parameter mix.
+    @pytest.mark.parametrize("extra", [
+        pytest.param({"ScanFilter": SCAN_FILTER, **OK_FILTER}, id="ScanFilter"),
+        pytest.param({"AttributesToGet": ["a"], "ProjectionExpression": "a"}, id="AttributesToGet"),
+        pytest.param({"ConditionalOperator": "AND", **OK_FILTER}, id="ConditionalOperator"),
+    ])
+    def test_return_consumed_capacity_beats_parameter_mix(
+        self, dynamodb_client_no_validation, table, extra,
+    ):
+        # Measured 2026-11-19 16:14 UTC and, for the ScanFilter form,
+        # 2026-11-23 13:59 UTC.
         assert _scan_error(
-            dynamodb_client_no_validation, TableName=table, ScanFilter=SCAN_FILTER,
-            ReturnConsumedCapacity="NOPE", **OK_FILTER,
+            dynamodb_client_no_validation, TableName=table, ReturnConsumedCapacity="NOPE", **extra,
         ) == ("ValidationException", RCC_ENUM)
 
     def test_limit_range_beats_parameter_mix(self, dynamodb_client_no_validation, table):
@@ -333,6 +375,23 @@ class TestChecksAfterTheNumbers:
             dynamodb_client, TableName=table, FilterExpression="a = = :n",
             ExpressionAttributeValues={":n": NB},
         ) == ("ValidationException", NUMERIC + "bob")
+
+
+class TestSegmentPairing:
+    """Segment not below TotalSegments, and the smallest pair the service
+    accepts (measured 2026-11-19 16:15 UTC and 2026-11-23 16:34 UTC). extenddb
+    adds the two values after the service's text."""
+
+    def test_segment_not_below_total_segments(self, dynamodb_client, table):
+        expected = PAIRING if _is_real_dynamodb() else (
+            PAIRING + ": Segment: 5 is not less than TotalSegments: 2")
+        assert _scan_error(
+            dynamodb_client, TableName=table, Segment=5, TotalSegments=2,
+        ) == ("ValidationException", expected)
+
+    def test_total_segments_1_is_accepted(self, dynamodb_client, table):
+        resp = dynamodb_client.scan(TableName=table, Segment=0, TotalSegments=1)
+        assert (resp["Count"], resp["ScannedCount"]) == (2, 2)
 
 
 FW_ONE = "\uff11"        # fullwidth digit one
@@ -409,6 +468,9 @@ SHAPE_FAULTS = [
     ("ExpressionAttributeNames string with N bob", {"ExpressionAttributeNames": "x", **NB_FILTER}),
     ("AttributesToGet object with ProjectionExpression",
      {"AttributesToGet": {"a": 1}, "ProjectionExpression": "a"}),
+    # Measured 2026-11-23 13:59 UTC: NUMBER_VALUE cannot be converted to String.
+    ("Select 5 after an unknown type descriptor beside Limit 0",
+     {"Limit": 0, "ExpressionAttributeValues": {":u": {"X": "1"}}, "Select": 5}),
 ]
 
 
@@ -429,3 +491,63 @@ class TestShapeFaultsAreReportedFirst:
         assert status == 400
         assert payload.get("__type", "").endswith("ValidationException")
         assert payload.get("message", payload.get("Message")) == "1 validation error detected: " + LIMIT_RANGE
+
+
+NULL_BESIDE_SELECT = {"FilterExpression": "attribute_exists(a) OR a = :v", "Select": "bad"}
+X1 = {"X": "1"}
+
+# (row, body, the service's message, extenddb's message when it differs).
+# Measured 2026-11-19 16:14 to 16:19 UTC and 2026-11-23 13:59 to 16:47 UTC,
+# each body twice on a table that does not exist.
+ORDER_ROWS = [
+    ("names key ahead of N bob",
+     {"ExpressionAttributeValues": {":n": NB}, "ExpressionAttributeNames": {"a": "b"}}, EAN_KEY, None),
+    ("empty names map ahead of N bob",
+     {"ExpressionAttributeValues": {":n": NB}, "ExpressionAttributeNames": {}},
+     "ExpressionAttributeNames must not be empty", None),
+    ("empty name ahead of N bob",
+     {"ExpressionAttributeValues": {":n": NB}, "ExpressionAttributeNames": {"#a": ""}},
+     "ExpressionAttributeNames contains invalid value: Empty attribute name for key #a", None),
+    ("duplicate NS member ahead of Select",
+     {"Select": "NOPE", "FilterExpression": "a = :d", "ExpressionAttributeValues": {":d": {"NS": ["1", "1"]}}},
+     "One or more parameter values were invalid: Input collection contains duplicates.", None),
+    ("empty NS ahead of Select",
+     {"Select": "NOPE", "ExpressionAttributeValues": {":d": {"NS": []}}},
+     "One or more parameter values were invalid: An number set  may not be empty", None),
+    ("null beside Select", {**NULL_BESIDE_SELECT, "ExpressionAttributeValues": {":v": None}}, SELECT_BAD, None),
+    ("L with a null beside Select",
+     {**NULL_BESIDE_SELECT, "ExpressionAttributeValues": {":v": {"L": [None]}}}, SELECT_BAD, None),
+    ("S null beside Select",
+     {**NULL_BESIDE_SELECT, "ExpressionAttributeValues": {":v": {"S": None}}}, SELECT_BAD, None),
+    ("both enums beside {}",
+     {"Select": "BAD", "ReturnConsumedCapacity": "BAD", "FilterExpression": "a = :a",
+      "ExpressionAttributeValues": {":a": {}}},
+     "2 validation errors detected: Value 'BAD' at 'select' failed to satisfy constraint: Member must "
+     "satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]; "
+     "Value 'BAD' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum "
+     "value set: [INDEXES, TOTAL, NONE]", None),
+    ("ScanFilter mix beside an unknown type descriptor",
+     {"ScanFilter": SCAN_FILTER, "FilterExpression": "a = :x", "ExpressionAttributeValues": {":x": X1}},
+     MIX, None),
+    # The entries in the fitted hash order of scan_request: :n in bucket 0
+    # ahead of :a in 3.
+    ("{} beside N bob",
+     {"FilterExpression": "a = :a OR a = :n", "ExpressionAttributeValues": {":a": {}, ":n": NB}},
+     INVALID_VALUE + NUMERIC + "bob for key :n", None),
+    ("Segment 1.5 beside Select", {"Segment": 1.5, "TotalSegments": 2, "Select": "NOPE"}, SELECT_ENUM, None),
+    ("TotalSegments 2.5 beside Select", {"Segment": 0, "TotalSegments": 2.5, "Select": "NOPE"},
+     SELECT_ENUM, None),
+]
+
+
+class TestRequestOrder:
+    """The names, set, unreadable value and float range rows, each against the
+    check it is reported ahead of."""
+
+    @pytest.mark.parametrize("row,body,service,extenddb", ORDER_ROWS, ids=[r[0] for r in ORDER_ROWS])
+    def test_rows(self, dynamodb_client, table, row, body, service, extenddb):
+        status, payload = _raw_scan(dynamodb_client, {"TableName": table, **body})
+        expected = service if _is_real_dynamodb() or extenddb is None else extenddb
+        assert (status, payload.get("__type", "").rsplit("#", 1)[-1],
+                payload.get("message", payload.get("Message"))) == (400, "ValidationException", expected)
+

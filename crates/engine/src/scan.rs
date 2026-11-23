@@ -78,19 +78,18 @@ async fn run_scan(
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
     // The checks run in one of the service's two orders, measured 2026-10-25
-    // to 2026-11-05 (see `scan_request`): order U when the body holds a value
-    // that is not one AttributeValue anywhere, order R otherwise. Order R:
+    // to 2026-11-23 (see `scan_request`): order U on the service's older
+    // validation path (a value it cannot read as one type, or a Limit,
+    // Segment or TotalSegments that is a float or outside int32), order R
+    // otherwise. Order R:
     //  - request-time, on the raw body: the AttributesToGet length and the
     //    Limit, Segment and TotalSegments ranges in one message, the
     //    ReturnConsumedCapacity enum, the expression and non-expression
-    //    parameter mix, every number in the ExpressionAttributeValues entries
-    //    that deserialize (the entries in the hash order of the key), the
-    //    first empty or duplicate set in ExpressionAttributeValues (the
-    //    entries in sorted name order), the nesting depth of the entries that
-    //    deserialize (the numbers of the ScanFilter lists are #507's check);
-    //  - a field of the wrong JSON type anywhere in the body;
-    //  - a malformed number inside an ExpressionAttributeValues entry the
-    //    deserializer refuses;
+    //    parameter mix, the ExpressionAttributeNames checks, every number in
+    //    ExpressionAttributeValues, the first empty or duplicate set there,
+    //    the nesting depth of the entries (the numbers of the ScanFilter
+    //    lists are #507's check);
+    //  - a member of the wrong JSON type anywhere in the body;
     //  - the request parameter checks: ExpressionAttributeNames and
     //    ExpressionAttributeValues with no expression, ConditionalOperator with
     //    no ScanFilter, a ScanFilter condition's value count;
@@ -103,25 +102,27 @@ async fn run_scan(
     //  - the table lookup, the index resolution and the index rules, the key
     //    schema.
     // Order U differs in these places: the constraint clauses take the older
-    // form and the Select enum joins them at request time; the numbers of
-    // ExpressionAttributeValues and the nesting check leave request time; the
-    // ScanFilter list values (a value that is not one AttributeValue) are
-    // checked after the no-expression checks and ahead of
+    // form with the Select and ReturnConsumedCapacity clauses in the same
+    // message; the parameter mix and the ExpressionAttributeNames key checks
+    // follow at request time, and the numbers, sets and nesting depth of
+    // ExpressionAttributeValues leave request time; the ScanFilter list values
+    // are checked after the no-expression checks and ahead of
     // ConditionalOperator; after the request parameter checks come the
-    // ExclusiveStartKey's faults, shape and value together, then the
-    // faulty ExpressionAttributeValues entries in the same member order (an
-    // unreadable entry, a malformed number, a set fault, each in the
-    // invalid-value form), then the nesting depth, then the expression and
-    // request checks and the table.
-    let order = CheckOrder::of(&body);
-    let values_order = member_order(raw_body, "ExpressionAttributeValues");
-    crate::scan_request::validate_scan_request_body(&body, order, values_order.as_deref(), depth)?;
-    // A key, an ExpressionAttributeValues entry, a ScanFilter list value (order
-    // U) or a Select value (order R) that the service reports later is held
-    // back here, so that the typed deserialization does not report it ahead of
-    // the checks the service makes first.
+    // ExclusiveStartKey's faults, then the faulty ExpressionAttributeValues
+    // entries in the same member order (each in the invalid-value form) and an
+    // empty name, then the nesting depth, then the expression and request
+    // checks and the table.
+    let order = crate::scan_request::request_checks(&body, depth)?;
+    // Limit, Segment and TotalSegments are read as the service reads them,
+    // from any JSON number the body parser reads; see `int32_member`.
+    crate::int32_member::saturate(&mut body, &crate::int32_member::SCAN_RANGES)?;
+    // A key, an ExpressionAttributeValues entry or empty name and a ScanFilter
+    // list value (order U), or a Select value (order R), that the service
+    // reports later is held back here, so that the typed deserialization does
+    // not report it ahead of the checks the service makes first.
     let key_order = member_order(raw_body, "ExclusiveStartKey");
     let start_key = StartKeyBody::take(&mut body, key_order.as_deref());
+    let values_order = member_order(raw_body, "ExpressionAttributeValues");
     let expression_values = ExpressionValuesBody::take(&mut body, order, values_order.as_deref());
     let filter_order = member_order(raw_body, "ScanFilter");
     let scan_filter_values = ScanFilterBody::take(&mut body, order, filter_order.as_deref());
@@ -134,13 +135,6 @@ async fn run_scan(
         input.expression_attribute_names.as_ref(),
         input.expression_attribute_values.as_ref(),
     );
-
-    // Order R: a malformed number inside an ExpressionAttributeValues entry
-    // the deserializer refuses, ahead of the no-expression check; the set
-    // faults are request-time checks (measured 2026-11-05).
-    if order == CheckOrder::Readable {
-        expression_values.validate()?;
-    }
 
     let has_filter_expr = input
         .filter_expression
@@ -158,10 +152,9 @@ async fn run_scan(
         &[ExpressionKind::Filter],
     )?;
 
-    // Order U: a ScanFilter list value that is not one AttributeValue, after
-    // the no-expression checks and ahead of ConditionalOperator, the value
-    // count and the key's faults (measured 2026-11-05; see
-    // `scan_request::ScanFilterBody`).
+    // Order U: a faulty ScanFilter list value, after the no-expression checks
+    // and ahead of ConditionalOperator, the value count and the key's faults
+    // (measured 2026-11-05; see `scan_request::ScanFilterBody`).
     scan_filter_values.validate()?;
 
     // ConditionalOperator requires a ScanFilter with two or more conditions.
@@ -184,11 +177,10 @@ async fn run_scan(
 
     match order {
         CheckOrder::Unreadable => {
-            // The key's faults, shape and value together, then the faulty
-            // ExpressionAttributeValues entries in the fitted order (an
-            // unreadable entry, a malformed number in the invalid-value form,
-            // a set fault), then the nesting depth (measured 2026-10-31 and
-            // 2026-11-05; see `scan_request::StartKeyBody` and
+            // The key's faults, then the faulty ExpressionAttributeValues
+            // entries in the fitted order (each in the invalid-value form) and
+            // an empty name, then the nesting depth (measured 2026-10-31,
+            // 2026-11-05 and 2026-11-19; see `scan_request::StartKeyBody` and
             // `ExpressionValuesBody`).
             start_key.validate(order)?;
             expression_values.validate()?;
@@ -492,7 +484,8 @@ async fn run_scan(
         && index_info.is_none()
     {
         return Err(DynamoDbError::ValidationException(
-            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName".to_owned(),
+            "1 validation error detected: ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName"
+                .to_owned(),
         ));
     }
     let index_proj = if matches!(input.select, Some(Select::AllProjectedAttributes)) {

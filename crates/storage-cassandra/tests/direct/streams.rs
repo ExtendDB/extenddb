@@ -144,6 +144,22 @@ pub(crate) fn shard_for(pk: &str, table_id: &str) -> String {
     extenddb_storage_cassandra::stream_util::assign_shard_id(pk, table_id)
 }
 
+/// The shard of the stream `label` (view type `view_type`) of `table_id` that
+/// records written under `pk` land in: the stream's shard for the partition
+/// `shard_for` names, which is the id `get_stream_records` reads it by.
+pub(crate) fn stream_shard_for(
+    pk: &str,
+    table_id: &str,
+    label: &str,
+    view_type: StreamViewType,
+) -> String {
+    let (_, index) =
+        extenddb_storage::stream_lineage::parse_shard_id(table_id, &shard_for(pk, table_id))
+            .expect("the partition id is the table's");
+    extenddb_storage::stream_lineage::shard_id(table_id, label, view_type, index)
+        .expect("label shape")
+}
+
 #[tokio::test]
 async fn test_put_item_insert_writes_stream_record() {
     if crate::helpers::skip_without_cassandra() {
@@ -407,7 +423,15 @@ async fn test_validate_shard_ok() {
         &key_info.table_name,
         &stream_label,
     );
-    let shard_id = shard_for("any-pk", &key_info.table_id);
+    // The stream's own shard id for the partition the record lands in.
+    let index = crc32fast::hash(b"any-pk") % 4;
+    let shard_id = extenddb_storage::stream_lineage::shard_id(
+        &key_info.table_id,
+        &stream_label,
+        StreamViewType::NewAndOldImages,
+        index,
+    )
+    .unwrap();
 
     engine
         .validate_shard(&key_info.account_id, &arn, &shard_id)
@@ -518,7 +542,12 @@ async fn test_get_stream_records_returns_written_records() {
             .unwrap();
     }
 
-    let shard_id = shard_for("pk-read", &key_info.table_id);
+    let shard_id = stream_shard_for(
+        "pk-read",
+        &key_info.table_id,
+        &stream_label,
+        StreamViewType::NewAndOldImages,
+    );
     let (records, last_seq) = engine
         .get_stream_records(&key_info.account_id, &arn, &shard_id, None, 10)
         .await
@@ -565,7 +594,12 @@ async fn test_get_stream_records_after_sequence_paginates() {
             .unwrap();
     }
 
-    let shard_id = shard_for("pk-page", &key_info.table_id);
+    let shard_id = stream_shard_for(
+        "pk-page",
+        &key_info.table_id,
+        &stream_label,
+        StreamViewType::NewAndOldImages,
+    );
     let (first_page, last_seq) = engine
         .get_stream_records(&key_info.account_id, &arn, &shard_id, None, 2)
         .await

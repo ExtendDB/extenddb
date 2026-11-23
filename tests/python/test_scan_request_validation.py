@@ -615,20 +615,23 @@ ROWS_2026_11_05 = [
     ("eavU-39-digits", "table", FILTER_P + ', "ExpressionAttributeValues": {":p": {"S": "x"}, '
      '":a": {"N": "123456789012345678901234567890123456789"}, ":e": {}}',
      EAV_VALUE + "Attempting to store more than 38 significant digits in a Number for key :a"),
-    # Order R, two faulty entries: the numbers in the hash order (:n in bucket 0
-    # ahead of :a in 3); the set faults in sorted name order, where the
-    # service's two sends disagreed (the SS text, then the NS text) and the
-    # sorted order is pinned so that the answer does not depend on the backend.
+    # Order R, two faulty entries: the numbers, then the set faults, each in
+    # placeholder order. The service named either number (fred in 4 of 6
+    # sends, bob in 2, 2026-11-23) and either set fault (the SS text, then the
+    # NS text, 2026-11-05).
     ("eavR-two-numbers", "table", '"FilterExpression": "a = :a", "ExpressionAttributeValues": '
-     '{":n": {"N": "fred"}, ":a": {"N": "bob"}}', NUMERIC_BOB.replace("bob", "fred")),
+     '{":n": {"N": "fred"}, ":a": {"N": "bob"}}', ("either", NUMERIC_FRED, NUMERIC_BOB)),
     ("eavR-two-set-faults", "table", '"ExpressionAttributeValues": {":n": {"NS": []}, ":a": {"SS": []}}',
      ("either", SS_EMPTY, NS_EMPTY)),
-    # Order R: a malformed number inside an entry the deserializer refuses comes
-    # after the nesting check of another entry; with the number ahead of the
-    # set fault in one L the service's two sends disagreed. The SS duplicates
-    # beside a nested value answered the duplicates text and the nesting text.
+    # Order R: a malformed number inside an entry with a set fault, beside the
+    # nesting fault of another entry, answered the number in 4 of 4 sends on
+    # 2026-11-23 and the nesting text in 3 of 6 on 2026-11-12; with the number
+    # ahead of the set fault in one L the service's two sends disagreed. The SS
+    # duplicates beside a nested value answered the duplicates text and the
+    # nesting text.
     ("eavR-NSbobdup-and-nest", "table", FILTER_P + ', "ExpressionAttributeValues": '
-     '{":p": {"S": "x"}, ":d": ' + NEST32_N + ', ":a": {"NS": ["bob", "1", "1"]}}', NESTING),
+     '{":p": {"S": "x"}, ":d": ' + NEST32_N + ', ":a": {"NS": ["bob", "1", "1"]}}',
+     ("either", NUMERIC_BOB, NESTING)),
     ("eavR-L-bob-then-NSe-and-nest", "table", FILTER_P + ', "ExpressionAttributeValues": '
      '{":p": {"S": "x"}, ":d": ' + NEST32_N + ', ":l": {"L": [{"N": "bob"}, {"NS": []}]}}',
      ("either", NUMERIC_BOB, NESTING)),

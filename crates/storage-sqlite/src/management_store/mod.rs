@@ -14,13 +14,16 @@ mod accounts;
 mod groups;
 mod policies;
 mod roles;
+mod secret_rows;
 mod users;
 
+use extenddb_storage::CatalogStore as _;
 use extenddb_storage::management_store::{
     AccessKeyCreated, AccountDetail, GroupDetail, GroupListEntry, ManagementStore, OpError,
-    OpResult, RoleDetail, RoleListEntry, SessionPolicyEntry, StoredDocument, UserDetail,
-    UserListEntry,
+    OpResult, RoleDetail, RoleListEntry, SecretPage, SecretWrite, SessionPolicyEntry,
+    StoredDocument, UserDetail, UserListEntry,
 };
+use extenddb_storage::secret_keys::SecretTable;
 use futures::future::BoxFuture;
 use time::OffsetDateTime;
 
@@ -587,8 +590,11 @@ impl ManagementStore for SqliteCatalogStore {
         let session_name = session_name.to_owned();
         let session_tags = session_tags.as_ref().map(ToString::to_string);
         let session_policy = session_policy.as_ref().map(ToString::to_string);
+        // AssumeRole truncated `expires_at` to whole seconds before its
+        // encrypt, so this text is the value in the secret's AAD.
         let expires = format_timestamp(expires_at);
         Box::pin(async move {
+            extenddb_storage::secret_keys::require_keys(self.secret_keys())?;
             // D1: every writer holds the write lock.
             let _writer = self.lock_writes().await;
             sqlx::query(
@@ -734,6 +740,44 @@ impl ManagementStore for SqliteCatalogStore {
             Ok(Vec::new())
         })
     }
+
+    // ── Encryption-key commands (in `secret_rows`) ─────────────────
+
+    fn read_secret_page(
+        &self,
+        table: SecretTable,
+        page: Option<&str>,
+        page_size: usize,
+    ) -> BoxFuture<'_, OpResult<SecretPage>> {
+        let page = page.map(ToOwned::to_owned);
+        Box::pin(async move {
+            self.read_secret_page_impl(table, page.as_deref(), page_size)
+                .await
+        })
+    }
+
+    fn write_secrets(
+        &self,
+        table: SecretTable,
+        rows: &[SecretWrite],
+    ) -> BoxFuture<'_, OpResult<()>> {
+        let rows = rows.to_vec();
+        Box::pin(async move { self.write_secrets_impl(table, &rows).await })
+    }
+
+    fn delete_secrets(&self, table: SecretTable, keys: &[String]) -> BoxFuture<'_, OpResult<()>> {
+        let keys = keys.to_vec();
+        Box::pin(async move { self.delete_secrets_impl(table, &keys).await })
+    }
+
+    fn delete_setting(&self, key: &str) -> BoxFuture<'_, OpResult<()>> {
+        let key = key.to_owned();
+        Box::pin(async move { self.delete_setting_impl(&key).await })
+    }
+
+    fn erase_free_space(&self) -> BoxFuture<'_, OpResult<()>> {
+        Box::pin(self.erase_free_space_impl())
+    }
 }
 
 #[cfg(test)]
@@ -756,7 +800,13 @@ mod migration_tests {
             .await
             .unwrap();
         crate::migrations::apply_for_tests(&pool).await;
-        SqliteCatalogStore::new(pool)
+        // A key holder, so the store writes the session the tests store.
+        let keys = extenddb_storage::secret_keys::SecretKeys::dek_for_tests([7; 32], 1, "test");
+        SqliteCatalogStore::with_secret_keys(
+            pool,
+            Some(std::sync::Arc::new(keys)),
+            std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        )
     }
 
     fn policy(resource_tag_key: &str) -> serde_json::Value {
@@ -964,5 +1014,28 @@ mod migration_tests {
             .map(|r| r.policy_name.as_str())
             .collect();
         assert_eq!(names, ["b_tagged", "<permissions-boundary>"]);
+    }
+}
+
+#[cfg(test)]
+mod leftover_tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    #[tokio::test]
+    async fn deleted_principals_and_accounts_leave_nothing() {
+        // One connection keeps the in-memory database alive for the test.
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory sqlite");
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+        crate::migrations::apply_for_tests(&pool).await;
+        let store = SqliteCatalogStore::new(pool);
+        extenddb_storage::iam_leftovers_conformance::run(&store, "111111111111").await;
     }
 }
