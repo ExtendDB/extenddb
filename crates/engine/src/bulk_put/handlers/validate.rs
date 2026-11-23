@@ -337,7 +337,6 @@ pub(super) fn validate_output_encryption(
     Err(DynamoDbError::ValidationException(message.to_owned()))
 }
 
-/// When present, `S3BucketOwner` must equal the caller's account id.
 /// The serialized configurations together may not exceed
 /// [`MAX_CONFIGURATION_BYTES`], so the catalog row is bounded.
 pub(super) fn validate_configuration_size(
