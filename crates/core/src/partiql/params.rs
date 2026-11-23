@@ -68,11 +68,14 @@ pub const NESTING_MESSAGE: &str = "Nesting Levels have exceeded supported limits
      Attributes in the item have nested levels beyond supported limit";
 
 /// The refusal of an attribute value with no type: `{}`, a value whose only
-/// members the model does not name, or whose members are all null.
+/// members the model does not name, or whose members are all null. The
+/// checks get it from `crate::types::type_descriptor`; the tests pin it.
+#[cfg(test)]
 const EMPTY_ATTRIBUTE_VALUE: &str =
     "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes";
 
-/// The refusal of an attribute value with two types.
+/// The refusal of an attribute value with two types, as above.
+#[cfg(test)]
 const MULTI_ATTRIBUTE_VALUE: &str = "Supplied AttributeValue has more than one datatypes \
      set, must contain exactly one of the supported datatypes";
 
@@ -85,9 +88,6 @@ const NULL_NUMBER_SET_MEMBER: &str =
 const NULL_BINARY_SET_MEMBER: &str =
     "One or more parameter values were invalid: Binary sets may not contain null or empty values";
 const NULL_MEMBER: &str = "The supplied Item contains a null AttributeValue";
-
-/// The members an attribute value may hold. Any other member is ignored.
-const TYPES: [&str; 10] = ["S", "N", "B", "SS", "NS", "BS", "M", "L", "NULL", "BOOL"];
 
 /// Check the JSON types of a statement's parameters (wire attribute values),
 /// the first of the two passes (see the module documentation). The caller
@@ -175,34 +175,8 @@ fn check_base64(text: &str) -> Result<(), String> {
 fn typed_members(members: &Map<String, Value>) -> impl Iterator<Item = (&str, &Value)> {
     members
         .iter()
-        .filter(|(tag, payload)| !payload.is_null() && TYPES.contains(&tag.as_str()))
+        .filter(|(tag, payload)| crate::types::is_type_descriptor(tag, payload))
         .map(|(tag, payload)| (tag.as_str(), payload))
-}
-
-/// `value` as the attribute value model reads it: without the members it
-/// ignores, at every level. Its parameters passed [`check_parameter_types`]
-/// and [`check_parameter_values`], so the result deserializes.
-#[must_use]
-pub fn modelled_value(value: &Value) -> Value {
-    let Value::Object(members) = value else {
-        return value.clone();
-    };
-    let modelled = typed_members(members).map(|(tag, payload)| {
-        let payload = match payload {
-            Value::Object(entries) if tag == "M" => Value::Object(
-                entries
-                    .iter()
-                    .map(|(name, member)| (name.clone(), modelled_value(member)))
-                    .collect(),
-            ),
-            Value::Array(items) if tag == "L" => {
-                Value::Array(items.iter().map(modelled_value).collect())
-            }
-            other => other.clone(),
-        };
-        (tag.to_owned(), payload)
-    });
-    Value::Object(modelled.collect())
 }
 
 /// Check a statement's parameters (wire attribute values) in order, the
@@ -226,13 +200,8 @@ fn check_value(value: &Value, depth: usize) -> Result<(), String> {
     let Value::Object(members) = value else {
         return Ok(());
     };
-    let mut typed = typed_members(members);
-    let (tag, payload) = match (typed.next(), typed.next()) {
-        (None, _) => return Err(EMPTY_ATTRIBUTE_VALUE.to_owned()),
-        (Some(_), Some(_)) => return Err(MULTI_ATTRIBUTE_VALUE.to_owned()),
-        (Some(member), None) => member,
-    };
-    match (tag, payload) {
+    let (tag, payload) = crate::types::type_descriptor(members)?;
+    match (tag.as_str(), payload) {
         ("M", Value::Object(entries)) => {
             let next = enter(depth)?;
             for (name, member) in entries {
@@ -638,29 +607,21 @@ mod tests {
     }
 
     #[test]
-    fn a_member_the_model_ignores_is_dropped_at_every_level() {
-        // (measured 2026-11-06: each is stored as the value without it)
-        for (json, modelled) in [
-            ("{\"S\":\"a\",\"X\":\"1\"}", "{\"S\":\"a\"}"),
-            ("{\"S\":\"a\",\"N\":null}", "{\"S\":\"a\"}"),
-            (
-                "{\"M\":{\"x\":{\"S\":\"a\",\"X\":\"1\"}}}",
-                "{\"M\":{\"x\":{\"S\":\"a\"}}}",
-            ),
-            (
-                "{\"L\":[{\"S\":\"a\",\"X\":[1]},{\"N\":\"1\",\"B\":null}]}",
-                "{\"L\":[{\"S\":\"a\"},{\"N\":\"1\"}]}",
-            ),
-            ("{\"SS\":[\"a\"]}", "{\"SS\":[\"a\"]}"),
+    fn a_member_the_model_ignores_passes_at_every_level() {
+        // (measured 2026-11-06: each is stored as the value without it, which
+        // the attribute value deserializer reads it as)
+        for json in [
+            "{\"S\":\"a\",\"X\":\"1\"}",
+            "{\"S\":\"a\",\"N\":null}",
+            "{\"M\":{\"x\":{\"S\":\"a\",\"X\":\"1\"}}}",
+            "{\"L\":[{\"S\":\"a\",\"X\":[1]},{\"N\":\"1\",\"B\":null}]}",
+            "{\"SS\":[\"a\"]}",
         ] {
-            let value: Value = serde_json::from_str(json).unwrap();
-            let params = [value.clone()];
+            let params = [serde_json::from_str::<Value>(json).unwrap()];
             assert_eq!(check_parameter_types(&params), Ok(()), "{json}");
             assert_eq!(check_parameter_values(&params), Ok(()), "{json}");
-            let want: Value = serde_json::from_str(modelled).unwrap();
-            assert_eq!(modelled_value(&value), want, "{json}");
             assert!(
-                serde_json::from_value::<AttributeValue>(modelled_value(&value)).is_ok(),
+                serde_json::from_value::<AttributeValue>(params[0].clone()).is_ok(),
                 "{json}"
             );
         }

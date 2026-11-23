@@ -32,9 +32,7 @@ use serde_json::Value;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::partiql::operand_types::check_ordering_operands;
-use extenddb_core::partiql::params::{
-    check_parameter_types, check_parameter_values, modelled_value,
-};
+use extenddb_core::partiql::params::{check_parameter_types, check_parameter_values};
 use extenddb_core::partiql::parser::{MAX_STATEMENT_LENGTH, parse_for_execute_statement};
 use extenddb_core::partiql::values::{check_condition_values, check_written_values};
 use extenddb_core::partiql::{Statement, table_name_refusal};
@@ -256,12 +254,11 @@ impl SingleRequest {
     }
 }
 
-/// Deserialize a PartiQL `Parameters` array (wire-form AttributeValues), each
-/// value as the attribute value model reads it, without the members it
-/// ignores (see `params::modelled_value`). [`check_request_parameter_types`]
-/// and [`check_parameters`] have already refused the values the service
-/// refuses, so a value the attribute value deserializer refuses here gets the
-/// error a classic request gets for it (see `crate::deserialize_error`).
+/// Deserialize a PartiQL `Parameters` array (wire-form AttributeValues).
+/// [`check_request_parameter_types`] and [`check_parameters`] have already
+/// refused the values the service refuses, so a value the attribute value
+/// deserializer refuses here gets the error a classic request gets for it
+/// (see `crate::deserialize_error`).
 pub(crate) fn parse_parameters(
     value: Option<&Value>,
 ) -> Result<Vec<AttributeValue>, DynamoDbError> {
@@ -273,8 +270,7 @@ pub(crate) fn parse_parameters(
     })?;
     arr.iter()
         .map(|v| {
-            serde_json::from_value::<AttributeValue>(modelled_value(v))
-                .map_err(crate::deserialize_error)
+            serde_json::from_value::<AttributeValue>(v.clone()).map_err(crate::deserialize_error)
         })
         .collect()
 }

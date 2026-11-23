@@ -8,6 +8,7 @@
 //! responses, and managing bucket lifecycle.
 
 use extenddb_core::throttle::ThrottleManager;
+use extenddb_core::types::type_descriptor;
 use serde_json::Value;
 
 /// Convert a `TableDescription` to a `TableThroughput` for throttle registration.
@@ -42,6 +43,9 @@ pub(crate) fn classify_data_operation(operation: &str) -> (bool, bool) {
         _ => (false, false),
     }
 }
+
+#[cfg(test)]
+mod tests;
 
 /// Update throttle buckets after a successful table lifecycle operation.
 ///
@@ -101,8 +105,11 @@ fn extract_throughput_from_response(
 /// Extract the partition key value from a request body for per-partition throttling.
 ///
 /// For item-level operations (`GetItem`, `PutItem`, `DeleteItem`, `UpdateItem`),
-/// extracts the first attribute value from `Key` or `Item` as a string.
-/// Returns `None` for batch, transact, query, scan, and control-plane operations.
+/// extracts the first attribute value from `Key` or `Item` as a string, read by
+/// the member the engine's deserializer reads it by (`type_descriptor`).
+/// Returns `None` for batch, transact, query, scan, and control-plane
+/// operations, and for a value with no type descriptor or with two, which the
+/// engine refuses.
 pub(crate) fn extract_partition_value(input: &Value, operation: &str) -> Option<String> {
     let map = match operation {
         "GetItem" | "DeleteItem" | "UpdateItem" => input.get("Key")?,
@@ -112,7 +119,6 @@ pub(crate) fn extract_partition_value(input: &Value, operation: &str) -> Option<
     // The first key in the map is the partition key (DynamoDB key maps are ordered).
     let obj = map.as_object()?;
     let (_, type_val) = obj.iter().next()?;
-    let type_obj = type_val.as_object()?;
-    let (_, val) = type_obj.iter().next()?;
+    let (_, val) = type_descriptor(type_val.as_object()?).ok()?;
     Some(val.as_str().unwrap_or_default().to_owned())
 }
