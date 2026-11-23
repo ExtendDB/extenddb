@@ -292,7 +292,7 @@ fn sorted_entries(values: &Map<String, Value>) -> Vec<(&String, &Value)> {
 }
 
 /// The first fault inside one value, in document order for `L` items and in
-/// key order for `M` members.
+/// the map's iteration order for `M` members (see [`first_fault`]).
 enum Fault<'a> {
     /// A null, with the member name when it is the value of an `M` member.
     Null(Option<&'a str>),
@@ -340,13 +340,15 @@ impl Fault<'_> {
 /// The first fault in `value` (`member` is its name when it is the value of an
 /// `M` member): a null or no type descriptor, then the numbers in `N`, `NS`
 /// and every value an `L` or `M` holds, then more than one type descriptor.
-/// `L` items are visited in document order and `M` members in key order: this
-/// build of `serde_json` keeps an object's members sorted by key. A value of
-/// another JSON type, and an `N` or `NS` payload of the wrong JSON type, are
-/// shape faults the deserializer reports. A type descriptor with a null
-/// payload counts as absent, as the service reads it (measured 2026-11-19:
-/// `{"S": null}` answers the empty value text, and `{"S": null, "N": "1"}` in
-/// a `FilterExpression` is accepted).
+/// `L` items are visited in document order and `M` members in the map's
+/// iteration order: sorted by key without the `preserve_order` feature of
+/// `serde_json`, in document order with it, as in the MongoDB build (bson
+/// turns the feature on). A value of another JSON type, and an `N` or `NS`
+/// payload of the wrong JSON type, are shape faults the deserializer
+/// reports. A type descriptor with a null payload counts as absent, as the
+/// service reads it (measured 2026-11-19: `{"S": null}` answers the empty
+/// value text, and `{"S": null, "N": "1"}` in a `FilterExpression` is
+/// accepted).
 ///
 /// With several type descriptors, the service reads each payload in the order
 /// of [`TYPE_DESCRIPTORS`], whatever order the request wrote them in, and
