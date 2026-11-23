@@ -688,6 +688,53 @@ ROWS_2026_11_05 = [
 ]
 
 
+# The older-form clause texts for the rows of 2026-11-23 below.
+OLDER_SELECT = ("Value 'BAD' at 'select' failed to satisfy constraint: Member must satisfy enum "
+                "value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]")
+OLDER_RCC = ("Value 'BAD' at 'returnConsumedCapacity' failed to satisfy constraint: Member must "
+             "satisfy enum value set: [INDEXES, TOTAL, NONE]")
+OLDER_LIMIT = ("Value '0' at 'limit' failed to satisfy constraint: Member must have value greater "
+               "than or equal to 1")
+OLDER_ATG = ("Value '[]' at 'attributesToGet' failed to satisfy constraint: Member must have "
+             "length greater than or equal to 1")
+OLDER_TOTAL = ("Value '1000001' at 'totalSegments' failed to satisfy constraint: Member must have "
+               "value less than or equal to 1000000")
+OLDER_SEGMENT = ("Value '-1' at 'segment' failed to satisfy constraint: Member must have value "
+                 "greater than or equal to 0")
+
+# Measured 2026-11-23 at 14:03 and 21:49 UTC on a table that does not exist
+# (us-east-1, each body twice): (id, fields, expected).
+ROWS_2026_11_23 = [
+    # The enum clauses inside the older-form message, in the service's order,
+    # and the AttributesToGet length clause last.
+    ("d1-select-rcc-unreadable", '"Select": "BAD", "ReturnConsumedCapacity": "BAD", '
+     '"FilterExpression": "a = :a", "ExpressionAttributeValues": {":a": {}}',
+     "2 validation errors detected: " + OLDER_SELECT + "; " + OLDER_RCC),
+    ("d1-limit-float-both-enums", '"Limit": 1.5, "Select": "BAD", "ReturnConsumedCapacity": "BAD"',
+     "2 validation errors detected: " + OLDER_SELECT + "; " + OLDER_RCC),
+    ("A1-atg-and-limit-older", '"AttributesToGet": [], "Limit": 0.0',
+     "2 validation errors detected: " + OLDER_LIMIT + "; " + OLDER_ATG),
+    ("A2-six-older-clauses", '"AttributesToGet": [], "Limit": 0.0, "Segment": -1, '
+     '"TotalSegments": 1000001, "Select": "BAD", "ReturnConsumedCapacity": "BAD"',
+     "6 validation errors detected: " + "; ".join(
+         [OLDER_SELECT, OLDER_TOTAL, OLDER_RCC, OLDER_SEGMENT, OLDER_LIMIT, OLDER_ATG])),
+    ("A3-atg-and-select-beside-empty", '"AttributesToGet": [], "Select": "BAD", '
+     '"FilterExpression": "a = :a", "ExpressionAttributeValues": {":a": {}}',
+     "2 validation errors detected: " + OLDER_SELECT + "; " + OLDER_ATG),
+    # One ScanFilter list in element order over shape, number and set faults.
+    ("d2-sf-empty-then-NSe", '"ScanFilter": {"a": {"ComparisonOperator": "EQ", '
+     '"AttributeValueList": [{}, {"NS": []}]}}', EMPTY_VALUE_BARE),
+    ("d2-sf-bob-then-empty", '"ScanFilter": {"a": {"ComparisonOperator": "EQ", '
+     '"AttributeValueList": [{"N": "bob"}, {}]}}', NUMERIC_BOB),
+    # One key member in element order.
+    ("d8-key-L-bob-empty", '"ExclusiveStartKey": {"pk": {"L": [{"N": "bob"}, {}]}, '
+     '"sk": {"S": "s"}}', NUMERIC_BOB),
+    # The key's faults ahead of an empty name.
+    ("E1-key-empty-and-empty-name", '"ExclusiveStartKey": {"pk": {}}, "FilterExpression": '
+     '"#a = :x", "ExpressionAttributeNames": {"#a": ""}, "ExpressionAttributeValues": '
+     '{":x": {"S": "x"}}', EMPTY_KEY_VALUE),
+]
+
 def unused_value(value: dict) -> str:
     """A filter that reads ``:p`` and ``value`` under ``:d``, which nothing reads."""
     return ('"FilterExpression": "a = :p", "ExpressionAttributeValues": '
@@ -1048,6 +1095,19 @@ def _rows_2026_11_05_params():
     ]
 
 
+def _assert_row(client, table: str, fields: str, expected) -> None:
+    """``fields`` answers ``expected``: a text, ("startswith", prefix) or
+    ("either", a, b)."""
+    message = _validation_message(*_scan(client, table, fields))
+    if isinstance(expected, tuple) and expected[0] == "startswith":
+        # The text predates this branch (#838): the check's place is asserted.
+        assert message.startswith(expected[1]), message
+    elif isinstance(expected, tuple):
+        assert message in expected[1:], message
+    else:
+        assert message == expected
+
+
 class TestRowsOf20261105:
     """The rows measured 2026-11-05 at 05:31, 06:20 and 07:38 UTC."""
 
@@ -1055,14 +1115,16 @@ class TestRowsOf20261105:
                              ids=[r[0] for r in ROWS_2026_11_05])
     def test_rows(self, dynamodb_client, request, fixture, fields, expected):
         name = request.getfixturevalue(fixture) if fixture else unique_name("nosuch")
-        message = _validation_message(*_scan(dynamodb_client, name, fields))
-        if isinstance(expected, tuple) and expected[0] == "startswith":
-            # The text predates this branch (#838): the check's place is asserted.
-            assert message.startswith(expected[1]), message
-        elif isinstance(expected, tuple):
-            assert message in expected[1:], message
-        else:
-            assert message == expected
+        _assert_row(dynamodb_client, name, fields, expected)
+
+
+class TestRowsOf20261123:
+    """The rows measured 2026-11-23, on a table that does not exist."""
+
+    @pytest.mark.parametrize("fields, expected", [r[1:] for r in ROWS_2026_11_23],
+                             ids=[r[0] for r in ROWS_2026_11_23])
+    def test_rows(self, dynamodb_client, fields, expected):
+        _assert_row(dynamodb_client, unique_name("nosuch"), fields, expected)
 
 
 class TestNestingDepth:

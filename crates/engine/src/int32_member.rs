@@ -176,7 +176,9 @@ pub(crate) struct LengthField {
 /// clauses in the newer form (measured 2026-10-30 12:40 UTC: `Limit: 0` with
 /// `AttributesToGet: []` answers the length clause, then the `Limit` clause),
 /// and `Value '[]' at 'attributesToGet' ...` after every other clause in the
-/// older form (see `older_form_request_checks`).
+/// older form (measured 2026-11-23 21:49 UTC: beside `Limit: 0.0`, beside
+/// `Select: "BAD"` and an empty value, and with the five other faults; see
+/// `older_form_request_checks`).
 pub(crate) const ATTRIBUTES_TO_GET: LengthField = LengthField {
     name: "AttributesToGet",
     older_name: "attributesToGet",

@@ -379,12 +379,17 @@ fn a_shape_fault_in_a_key_value_answers_the_prefixed_text() {
         check_key(&two),
         Some(format!("{KEY_PREFIX}{MORE_THAN_ONE}"))
     );
-    // Inside one member a shape fault comes ahead of a number (2026-11-05,
-    // `{"M": {"k": {"N": "bob"}, "j": {}}}` in a non-key member).
+    // Inside one member the first fault in the value's element order: the
+    // members of an `M` in sorted order (2026-11-05, `{"M": {"k": {"N":
+    // "bob"}, "j": {}}}` in a non-key member answers the empty value), the
+    // members of an `L` in their order (2026-11-23, `{"L": [{"N": "bob"},
+    // {}]}` answers the number).
     let inside = with_key(json!({
         "pk": {"S": "x"}, "sk": {"S": "x"}, "z": {"M": {"k": {"N": "bob"}, "j": {}}},
     }));
     assert_eq!(check_key(&inside).as_deref(), Some(empty.as_str()));
+    let in_a_list = with_key(json!({"pk": {"L": [{"N": "bob"}, {}]}, "sk": {"S": "s"}}));
+    assert_eq!(check_key(&in_a_list).as_deref(), Some(NUMERIC_BOB));
 }
 
 /// Measured 2026-11-05: in order R the set faults of a key answer the service's
@@ -1305,8 +1310,8 @@ fn combinations_measured_on_2026_10_31_follow_the_order_of_the_checks() {
             "2 validation errors detected: Value at 'AttributesToGet' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'Segment' failed to satisfy constraint: Member must have value greater than or equal to 0"
         )
     );
-    // In the older form the clauses are reversed and the values echoed, so
-    // the empty list comes last.
+    // In the older form the values are echoed and the empty list comes last
+    // (measured 2026-11-23 21:49 UTC).
     let older = scan(json!({"AttributesToGet": [], "Limit": 0.0}));
     assert_eq!(
         check(&older).as_deref(),

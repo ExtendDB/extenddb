@@ -212,7 +212,10 @@ fn null_value() -> Value {
 ///    answers `select`, `returnConsumedCapacity`, then `limit` with
 ///    `-2147483648`). Two invalid enums beside a float `Limit` that satisfies
 ///    its constraint answer the two enum clauses (measured 2026-11-23 on
-///    `Scan` and `Query`);
+///    `Scan` and `Query`). On `Scan` an empty `AttributesToGet` adds `Value
+///    '[]' at 'attributesToGet' failed to satisfy constraint: Member must have
+///    length greater than or equal to 1` after the `Limit` fault (measured
+///    2026-11-23 21:49 UTC, with the five other faults);
 /// 2. the expression and non-expression parameter mix, which
 ///    `validate_parameter_mix` checks with the operation's members (measured
 ///    2026-11-23 18:45 UTC: on `Scan` a mix beside `Limit: 1.5` and an
