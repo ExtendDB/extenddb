@@ -99,11 +99,11 @@ wasm_bindgen_cli_advice() {
     echo "install it with: cargo install --locked --version ${1} wasm-bindgen-cli (what .github/workflows/wasm.yml runs, with the version it reads from Cargo.lock)"
 }
 
-# Runs `cargo test --locked --color never <ARGS>` for wasm32-unknown-unknown
-# and fails unless the run reports each test TESTS names `ok`, and no other
-# test. `cargo test` exits 0 when a test binary holds no test, and passes with
-# the rest when some tests lost their wasm_bindgen_test attribute, so its exit
-# status is not enough.
+# Runs `CARGO_TERM_QUIET=false cargo test --locked --color never <ARGS>` for
+# wasm32-unknown-unknown and fails unless the run reports each test TESTS
+# names `ok`, and no other test. `cargo test` exits 0 when a test binary holds
+# no test, and passes with the rest when some tests lost their
+# wasm_bindgen_test attribute, so its exit status is not enough.
 #
 # Cargo runs each test module with CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER,
 # which must be the wasm-bindgen-test-runner of the version of the
@@ -123,6 +123,13 @@ wasm_bindgen_cli_advice() {
 # version, after the build, and its message then offers first `cargo update
 # -p wasm-bindgen --precise <the runner's version>`, which would undo a change
 # of Cargo.lock.
+#
+# At quiet verbosity (term.quiet in a cargo configuration file, or
+# CARGO_TERM_QUIET) cargo adds --quiet to the runner's command line, and the
+# runner refuses that option; CARGO_TERM_QUIET=false outranks the
+# configuration files and replaces the caller's value. At verbose verbosity
+# cargo gives the runner the same command line and prints more status lines,
+# none of which the checks below match.
 LOG=""
 run_suite() {
     local suite="$1" lock runner words program printed version status=0 output results line name state expected reported problems=()
@@ -150,8 +157,8 @@ run_suite() {
 
     LOG="$(mktemp "${TMPDIR:-/tmp}/run-wasm-step.XXXXXX")"
     trap 'rm -f "$LOG"' EXIT
-    show cargo test --locked --color never "${ARGS[@]}" --target "$TARGET"
-    cargo test --locked --color never "${ARGS[@]}" --target "$TARGET" 2>&1 | tee "$LOG" || status=$?
+    show CARGO_TERM_QUIET=false cargo test --locked --color never "${ARGS[@]}" --target "$TARGET"
+    CARGO_TERM_QUIET=false cargo test --locked --color never "${ARGS[@]}" --target "$TARGET" 2>&1 | tee "$LOG" || status=$?
 
     # Without colour escapes: cargo's --color never does not reach the runner's.
     output="$(sed "s/$(printf '\033')\[[0-9;]*m//g" "$LOG")"
