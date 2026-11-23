@@ -212,3 +212,6 @@ mod tests_schema;
 
 #[cfg(test)]
 mod tests_eval;
+
+#[cfg(test)]
+mod tests_depth;

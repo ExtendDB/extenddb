@@ -72,6 +72,49 @@ pub(super) enum Node {
     Function(Call),
 }
 
+// A tree can be as deep as the expression is long, and the drop glue of a
+// `Box` chain recurses once per level. These drops move the children onto a
+// heap stack instead, so dropping never recurses.
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        detach(self, &mut pending);
+        while let Some(mut node) = pending.pop() {
+            detach(&mut node, &mut pending);
+        }
+    }
+}
+
+/// Move the child nodes of `node` onto `pending`, leaving childless leaves.
+fn detach(node: &mut Node, pending: &mut Vec<Node>) {
+    let leaf = || {
+        Node::Function(Call {
+            name: String::new(),
+            args: Vec::new(),
+        })
+    };
+    match node {
+        Node::Or(l, r) | Node::And(l, r) => {
+            pending.push(std::mem::replace(&mut **l, leaf()));
+            pending.push(std::mem::replace(&mut **r, leaf()));
+        }
+        Node::Not(inner) => pending.push(std::mem::replace(&mut **inner, leaf())),
+        Node::Compare { .. } | Node::Between { .. } | Node::In { .. } | Node::Function(_) => {}
+    }
+}
+
+impl Drop for Call {
+    fn drop(&mut self) {
+        let mut pending = std::mem::take(&mut self.args);
+        while let Some(operand) = pending.pop() {
+            if let Operand::Call(mut call) = operand {
+                pending.append(&mut call.args);
+            }
+        }
+    }
+}
+
 /// Parse the whole expression.
 ///
 /// # Errors
@@ -108,6 +151,15 @@ fn check_redundant_parens(toks: &[Tok]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// One open group of [`Parser::condition`]: the OR and AND operands that
+/// wait for their right side, and the NOTs that wait for their operand.
+#[derive(Default)]
+struct Group {
+    or: Option<Node>,
+    and: Option<Node>,
+    nots: usize,
 }
 
 struct Parser<'a> {
@@ -151,41 +203,61 @@ impl Parser<'_> {
         }
     }
 
+    /// `condition`, with an explicit stack in place of recursion, so the
+    /// nesting depth of the input never reaches the thread stack. Each `(` that
+    /// opens a group pushes a [`Group`]; the group's pending OR and AND
+    /// operands and its pending NOT count live there. The tokens consumed and
+    /// the token an error names are those of the recursive grammar in the
+    /// module documentation.
     fn condition(&mut self) -> Result<Node, String> {
-        let mut left = self.and()?;
-        while self.kind() == &Kind::Or {
-            self.bump();
-            let right = self.and()?;
-            left = Node::Or(Box::new(left), Box::new(right));
+        let mut groups = vec![Group::default()];
+        loop {
+            // The start of a `not`: NOT* then a primary.
+            let top = groups.last_mut().unwrap_or_else(|| unreachable!());
+            while self.kind() == &Kind::Not {
+                self.bump();
+                top.nots += 1;
+            }
+            if self.kind() == &Kind::LParen {
+                self.bump();
+                groups.push(Group::default());
+                continue;
+            }
+            let mut node = self.primary()?;
+            // Fold the finished primary into the open groups. A group that
+            // ends at `)` becomes a primary of the group around it.
+            loop {
+                let group = groups.last_mut().unwrap_or_else(|| unreachable!());
+                for _ in 0..std::mem::take(&mut group.nots) {
+                    node = Node::Not(Box::new(node));
+                }
+                if let Some(left) = group.and.take() {
+                    node = Node::And(Box::new(left), Box::new(node));
+                }
+                if self.kind() == &Kind::And {
+                    self.bump();
+                    group.and = Some(node);
+                    break;
+                }
+                if let Some(left) = group.or.take() {
+                    node = Node::Or(Box::new(left), Box::new(node));
+                }
+                if self.kind() == &Kind::Or {
+                    self.bump();
+                    group.or = Some(node);
+                    break;
+                }
+                if groups.len() == 1 {
+                    return Ok(node);
+                }
+                self.expect(&Kind::RParen)?;
+                groups.pop();
+            }
         }
-        Ok(left)
     }
 
-    fn and(&mut self) -> Result<Node, String> {
-        let mut left = self.not()?;
-        while self.kind() == &Kind::And {
-            self.bump();
-            let right = self.not()?;
-            left = Node::And(Box::new(left), Box::new(right));
-        }
-        Ok(left)
-    }
-
-    fn not(&mut self) -> Result<Node, String> {
-        if self.kind() == &Kind::Not {
-            self.bump();
-            return Ok(Node::Not(Box::new(self.not()?)));
-        }
-        self.primary()
-    }
-
+    /// A primary that does not open a group.
     fn primary(&mut self) -> Result<Node, String> {
-        if self.kind() == &Kind::LParen {
-            self.bump();
-            let inner = self.condition()?;
-            self.expect(&Kind::RParen)?;
-            return Ok(inner);
-        }
         let subject = self.operand()?;
         let op = match self.kind() {
             Kind::Eq => CompareOp::Eq,
@@ -229,27 +301,43 @@ impl Parser<'_> {
         })
     }
 
+    /// `operand`, with an explicit stack of the calls that are open, so a
+    /// nested call such as `f(f(f(x)))` never recurses.
     fn operand(&mut self) -> Result<Operand, String> {
-        match self.kind() {
-            Kind::ValueRef => {
-                let value = self.text().to_owned();
-                self.bump();
-                Ok(Operand::Value(value))
-            }
-            Kind::Name if self.peek_kind(1) == &Kind::LParen => {
-                let name = self.text().to_owned();
-                self.bump();
-                self.bump();
-                let mut args = vec![self.operand()?];
-                while self.kind() == &Kind::Comma {
+        let mut calls: Vec<Call> = Vec::new();
+        loop {
+            let mut done = match self.kind() {
+                Kind::ValueRef => {
+                    let value = self.text().to_owned();
                     self.bump();
-                    args.push(self.operand()?);
+                    Operand::Value(value)
+                }
+                Kind::Name if self.peek_kind(1) == &Kind::LParen => {
+                    let name = self.text().to_owned();
+                    self.bump();
+                    self.bump();
+                    calls.push(Call {
+                        name,
+                        args: Vec::new(),
+                    });
+                    continue;
+                }
+                Kind::Name | Kind::NameRef => self.path()?,
+                _ => return Err(self.error()),
+            };
+            loop {
+                let Some(open) = calls.last_mut() else {
+                    return Ok(done);
+                };
+                open.args.push(done);
+                if self.kind() == &Kind::Comma {
+                    self.bump();
+                    break;
                 }
                 self.expect(&Kind::RParen)?;
-                Ok(Operand::Call(Call { name, args }))
+                let call = calls.pop().unwrap_or_else(|| unreachable!());
+                done = Operand::Call(call);
             }
-            Kind::Name | Kind::NameRef => self.path(),
-            _ => Err(self.error()),
         }
     }
 

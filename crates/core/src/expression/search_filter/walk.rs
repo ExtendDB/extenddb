@@ -43,16 +43,31 @@ impl<'a> Maps<'a> {
 
 /// Run the tree-building checks over `node`.
 ///
+/// The tree can be as deep as the expression is long, so the walk keeps its
+/// own stack rather than recursing. AND, OR and NOT carry no check of their
+/// own, so visiting the leaves left to right is the post-order walk.
+///
 /// # Errors
 ///
 /// Returns the first failure's message body, without the expression prefix.
 pub(super) fn check(node: &Node, maps: &Maps<'_>) -> Result<(), String> {
-    match node {
-        Node::Or(l, r) | Node::And(l, r) => {
-            check(l, maps)?;
-            check(r, maps)
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        match node {
+            Node::Or(l, r) | Node::And(l, r) => {
+                pending.push(r);
+                pending.push(l);
+            }
+            Node::Not(inner) => pending.push(inner),
+            leaf => check_leaf(leaf, maps)?,
         }
-        Node::Not(inner) => check(inner, maps),
+    }
+    Ok(())
+}
+
+fn check_leaf(node: &Node, maps: &Maps<'_>) -> Result<(), String> {
+    match node {
+        Node::Or(..) | Node::And(..) | Node::Not(_) => Ok(()),
         Node::Compare { left, op, right } => {
             operand(left, maps)?;
             operand(right, maps)?;
@@ -86,22 +101,53 @@ pub(super) fn check(node: &Node, maps: &Maps<'_>) -> Result<(), String> {
             }
             distinct_first_operand("IN", subject, list.iter(), maps)
         }
-        Node::Function(call) => function(call, true, maps),
+        Node::Function(call) => calls(Visit::Exit(call, true), maps),
     }
 }
 
+/// A step of the operand walk: check an operand, or run a call's own checks
+/// once its operands passed. The flag is true for a call that stands as a
+/// condition.
+enum Visit<'a> {
+    Enter(&'a Operand),
+    Exit(&'a Call, bool),
+}
+
 fn operand(o: &Operand, maps: &Maps<'_>) -> Result<(), String> {
-    match o {
-        Operand::Path(elements) => path(elements, maps),
-        Operand::Value(reference) => match maps.value(reference) {
-            Some(_) => Ok(()),
-            None => Err(format!(
-                "An expression attribute value used in expression is not defined; \
-                 attribute value: {reference}"
-            )),
-        },
-        Operand::Call(call) => function(call, false, maps),
+    calls(Visit::Enter(o), maps)
+}
+
+/// Check an operand tree post-order, left to right, with its own stack: a
+/// call's operands before the call. Calls nest as deep as the expression is
+/// long.
+fn calls(start: Visit<'_>, maps: &Maps<'_>) -> Result<(), String> {
+    let mut pending = Vec::new();
+    match start {
+        Visit::Exit(call, condition) => {
+            pending.push(Visit::Exit(call, condition));
+            pending.extend(call.args.iter().rev().map(Visit::Enter));
+        }
+        enter @ Visit::Enter(_) => pending.push(enter),
     }
+    while let Some(step) = pending.pop() {
+        match step {
+            Visit::Enter(Operand::Path(elements)) => path(elements, maps)?,
+            Visit::Enter(Operand::Value(reference)) => {
+                if maps.value(reference).is_none() {
+                    return Err(format!(
+                        "An expression attribute value used in expression is not defined; \
+                         attribute value: {reference}"
+                    ));
+                }
+            }
+            Visit::Enter(Operand::Call(call)) => {
+                pending.push(Visit::Exit(call, false));
+                pending.extend(call.args.iter().rev().map(Visit::Enter));
+            }
+            Visit::Exit(call, condition) => function(call, condition, maps)?,
+        }
+    }
+    Ok(())
 }
 
 fn path(elements: &[Element], maps: &Maps<'_>) -> Result<(), String> {
@@ -139,11 +185,8 @@ fn arity(name: &str) -> Option<usize> {
 const TYPE_NAMES: [&str; 10] = ["S", "SS", "N", "NS", "B", "BS", "BOOL", "NULL", "L", "M"];
 
 /// `condition` is true when the call stands as a condition and false when it
-/// is an operand.
+/// is an operand. The operands were already checked by [`calls`].
 fn function(call: &Call, condition: bool, maps: &Maps<'_>) -> Result<(), String> {
-    for arg in &call.args {
-        operand(arg, maps)?;
-    }
     let name = call.name.as_str();
     let Some(expected) = arity(name) else {
         return Err(if matches!(name, "if_not_exists" | "list_append") {
@@ -359,58 +402,72 @@ fn shown(value: &AttributeValue) -> String {
 /// IN and function is one, a function used as an operand included.
 /// Parentheses are none.
 pub(super) fn operators(node: &Node) -> usize {
-    fn in_operand(o: &Operand) -> usize {
-        match o {
-            Operand::Call(call) => 1 + call.args.iter().map(in_operand).sum::<usize>(),
-            Operand::Path(_) | Operand::Value(_) => 0,
+    let (mut calls, mut nodes) = (0, 0);
+    each_operand(
+        node,
+        |o| {
+            if matches!(o, Operand::Call(_)) {
+                calls += 1;
+            }
+        },
+        |_| nodes += 1,
+    );
+    calls + nodes
+}
+
+/// Visit every node and every operand of `node`, calls and their operands
+/// included, with an explicit stack.
+fn each_operand<'a>(
+    node: &'a Node,
+    mut on_operand: impl FnMut(&'a Operand),
+    mut on_node: impl FnMut(&'a Node),
+) {
+    let mut nodes = vec![node];
+    let mut operands: Vec<&'a Operand> = Vec::new();
+    while let Some(node) = nodes.pop() {
+        on_node(node);
+        match node {
+            Node::Or(l, r) | Node::And(l, r) => nodes.extend([&**l, &**r]),
+            Node::Not(inner) => nodes.push(inner),
+            Node::Compare { left, right, .. } => operands.extend([left, right]),
+            Node::Between { subject, low, high } => operands.extend([subject, low, high]),
+            Node::In { subject, list } => {
+                operands.push(subject);
+                operands.extend(list);
+            }
+            Node::Function(call) => operands.extend(&call.args),
         }
-    }
-    match node {
-        Node::Or(l, r) | Node::And(l, r) => 1 + operators(l) + operators(r),
-        Node::Not(inner) => 1 + operators(inner),
-        Node::Compare { left, right, .. } => 1 + in_operand(left) + in_operand(right),
-        Node::Between { subject, low, high } => {
-            1 + in_operand(subject) + in_operand(low) + in_operand(high)
+        while let Some(o) = operands.pop() {
+            on_operand(o);
+            if let Operand::Call(call) = o {
+                operands.extend(&call.args);
+            }
         }
-        Node::In { subject, list } => {
-            1 + in_operand(subject) + list.iter().map(in_operand).sum::<usize>()
-        }
-        Node::Function(call) => 1 + call.args.iter().map(in_operand).sum::<usize>(),
     }
 }
 
 /// The expression's bytes plus the bytes each substitution adds, counted at
 /// every use.
 pub(super) fn combined_bytes(src: &str, node: &Node, maps: &Maps<'_>) -> usize {
-    fn in_operand(o: &Operand, maps: &Maps<'_>) -> usize {
-        match o {
-            Operand::Path(elements) => elements
-                .iter()
-                .map(|e| match e {
-                    Element::Name(n) if n.starts_with('#') => maps.name(n).map_or(0, str::len),
-                    Element::Name(_) | Element::Index(_) => 0,
-                })
-                .sum(),
-            Operand::Value(reference) => maps
-                .value(reference)
-                .map_or(0, crate::types::attribute_value_size),
-            Operand::Call(call) => call.args.iter().map(|a| in_operand(a, maps)).sum(),
-        }
-    }
-    fn in_node(node: &Node, maps: &Maps<'_>) -> usize {
-        match node {
-            Node::Or(l, r) | Node::And(l, r) => in_node(l, maps) + in_node(r, maps),
-            Node::Not(inner) => in_node(inner, maps),
-            Node::Compare { left, right, .. } => in_operand(left, maps) + in_operand(right, maps),
-            Node::Between { subject, low, high } => [subject, low, high]
-                .into_iter()
-                .map(|o| in_operand(o, maps))
-                .sum(),
-            Node::In { subject, list } => {
-                in_operand(subject, maps) + list.iter().map(|o| in_operand(o, maps)).sum::<usize>()
-            }
-            Node::Function(call) => call.args.iter().map(|a| in_operand(a, maps)).sum(),
-        }
-    }
-    src.len() + in_node(node, maps)
+    let mut total = src.len();
+    each_operand(
+        node,
+        |o| {
+            total += match o {
+                Operand::Path(elements) => elements
+                    .iter()
+                    .map(|e| match e {
+                        Element::Name(n) if n.starts_with('#') => maps.name(n).map_or(0, str::len),
+                        Element::Name(_) | Element::Index(_) => 0,
+                    })
+                    .sum(),
+                Operand::Value(reference) => maps
+                    .value(reference)
+                    .map_or(0, crate::types::attribute_value_size),
+                Operand::Call(_) => 0,
+            };
+        },
+        |_| {},
+    );
+    total
 }
