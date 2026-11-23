@@ -22,12 +22,8 @@ use zeroize::Zeroizing;
 ///
 /// - the 32-byte array that `extenddb_core::crypto::hmac_sha256` returns for
 ///   each step, and the tag its backend computes, on the stack;
-/// - on `wasm32` only, the HMAC state of each step. That backend is the
-///   RustCrypto `hmac` 0.12 crate over `sha2` 0.10, which has no zeroize
-///   support and does not wipe on drop, so the zero-padded key block and the
-///   inner and outer SHA-256 states derived from each step's key stay in
-///   memory after the call returns. The native backend, AWS-LC, wipes its
-///   HMAC context when it drops.
+/// - on `wasm32` only, the HMAC state of each step, which that backend does
+///   not wipe (README.md, "What it does not do", says what stays in memory).
 ///
 /// # Arguments
 /// * `secret` - The plaintext secret access key.
