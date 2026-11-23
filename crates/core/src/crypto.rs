@@ -213,11 +213,8 @@ mod imp {
     }
 
     pub(super) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-        // HMAC accepts a key of any length, so this never errors. hmac 0.12
-        // and sha2 0.10 have no zeroize support: the zero-padded key block
-        // that `new_from_slice` builds and the key-derived inner and outer
-        // SHA-256 states held in `mac` are left in memory unwiped, where the
-        // native backend's AWS-LC context is wiped when it drops.
+        // HMAC accepts a key of any length, so this never errors.
+        // README.md, "What it does not do", says what this leaves in memory.
         let mut mac =
             <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
         mac.update(data);
