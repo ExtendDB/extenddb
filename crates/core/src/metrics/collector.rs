@@ -106,8 +106,8 @@ impl MetricsCollector {
     /// Record per-segment latency breakdown for a request.
     ///
     /// The breakdown is summed into the current time buckets of the account's
-    /// operation, so the memory held does not grow with the request count
-    /// (issue #397). The account is a dimension because `query_segments`
+    /// operation, so the memory held is bounded by the ring lengths, whatever
+    /// the request count. The account is a dimension because `query_segments`
     /// filters on it. The table is not: a per-table breakdown would multiply
     /// the bound by the table count, and the console reads per-operation
     /// averages.

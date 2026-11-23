@@ -13,23 +13,21 @@
 //! order, and a record drops the buckets that have left the ring's window, so
 //! a ring never holds more than `FINE_SLOTS` or `COARSE_SLOTS` buckets and
 //! its allocation grows by doubling up to that length and no further. The
-//! memory per process is therefore at most
+//! allocation does not shrink: a pair keeps the largest one it reached until
+//! the prune drops its rings. The memory per process is therefore at most
 //! `accounts * operations * (FINE_SLOTS + COARSE_SLOTS) * 64` bytes of
-//! buckets, reached only by a pair with a request in every second of the last
-//! five minutes and every minute of the last day; a pair with one request a
-//! day holds two buckets. The server only records operations that pass
-//! `is_known_operation`, which caps `operations` at the size of the dispatch
-//! table, and only for a request that reached dispatch. `accounts` is the
-//! number of accounts that sent a request within the coarse ring's window,
-//! the last 1,440 to 1,441 minutes: the collector's prune, every five minutes,
+//! buckets. A pair holds that many buckets only with a request in every
+//! second of the last five minutes and every minute of the last day; a pair
+//! with one request a day holds two buckets. The server only records
+//! operations that pass `is_known_operation`, which caps `operations` at the
+//! size of the dispatch table, and only for a request that reached dispatch.
+//! `accounts` is the number of accounts that sent a request in the last 1,440
+//! to about 1,446 minutes. The collector's prune runs every five minutes. It
 //! drops the rings of an account's operation once its newest bucket has left
-//! that window, and the account once it holds no operation.
+//! the coarse ring's window, and the account once it holds no operation.
 //!
 //! The account is a key because `/metrics` filters the segments by account.
 //! A query without the filter sums every account's buckets per operation.
-//!
-//! Issue #397: one `SegmentPoint` per request grew to about 4.3 GiB in a day at
-//! 274 requests per second.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::Instant;
