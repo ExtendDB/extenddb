@@ -1,9 +1,10 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cryptographic primitives shared by the SigV4 verifier and the stored-secret
-//! cipher, gathered here so the one target-specific backend choice lives in a
-//! single module and nowhere else.
+//! Cryptographic primitives shared by the SigV4 code of `extenddb-auth` and
+//! the code of `extenddb-storage` that encrypts stored secrets and manages
+//! their keys, gathered here so the one target-specific backend choice lives
+//! in a single module and nowhere else.
 //!
 //! On every target except `wasm32` the backend is AWS-LC (through `aws-lc-rs`),
 //! the library ADR-0026 (`docs/adr/0026-credential-crypto-on-aws-lc.md`) chose
