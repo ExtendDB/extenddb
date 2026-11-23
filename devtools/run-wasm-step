@@ -110,15 +110,20 @@ wasm_bindgen_cli_advice() {
 # wasm-bindgen crate in Cargo.lock (the workflow's comment on its wasm tooling
 # says why); the runner runs the module under the node on PATH. Cargo splits
 # the variable's value at whitespace into the runner's path and the arguments
-# it gives the runner. A value the caller sets goes to cargo as it is;
-# otherwise this sets the one on PATH, else the one in cargo's bin directory
-# ($CARGO_HOME/bin), where `cargo install` puts it, by its full path. Before
-# `cargo test` runs, the suite runs the value's first word with --version,
-# checks that the second word it prints is the crate's version, and
-# otherwise stops with the command that installs that version. It splits the
-# value at ASCII whitespace only, where cargo splits at any Unicode
-# whitespace, so a value whose path and arguments other whitespace separates
-# stops at this check.
+# it gives the runner. A value the caller sets goes to cargo as it is, unless
+# it holds no word (it is empty or only whitespace, which cargo refuses);
+# then this sets the one on PATH, else the one in cargo's bin directory
+# ($CARGO_HOME/bin), where `cargo install` puts it, by its full path, and
+# stops if that path holds whitespace. Before `cargo test` runs, the suite
+# runs the value's first word with --version and stops unless the first line
+# it prints begins with the words wasm-bindgen-test-runner and the crate's
+# version; it gives the command that installs that version when it finds no
+# runner, or one of another version. It splits the value, and looks for
+# whitespace in the path it chooses, at ASCII whitespace only, where cargo
+# splits at any Unicode whitespace: a value whose path and arguments other
+# whitespace separates stops at this check, and a path that holds such
+# whitespace passes it, and cargo then takes the part before that whitespace
+# for the runner's path.
 # The runner itself refuses a module whose wasm-bindgen has another schema
 # version, after the build, and its message then offers first `cargo update
 # -p wasm-bindgen --precise <the runner's version>`, which would undo a change
@@ -132,23 +137,31 @@ wasm_bindgen_cli_advice() {
 # none of which the checks below match.
 LOG=""
 run_suite() {
-    local suite="$1" lock runner words program printed version status=0 results line name state expected reported problems=()
+    local suite="$1" lock runner words program printed first tool version code=0 status=0 results line name state expected reported problems=()
     lock="$(lock_wasm_bindgen_version)"
     runner="${CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER:-}"
-    if [ -z "$runner" ]; then
+    IFS=$' \t\n\v\f\r' read -r -d '' -a words <<<"$runner" || true
+    if [ ${#words[@]} -eq 0 ]; then
         runner="$(command -v wasm-bindgen-test-runner || true)"
         if [ -z "$runner" ] && [ -x "${CARGO_HOME:-$HOME/.cargo}/bin/wasm-bindgen-test-runner" ]; then
             runner="${CARGO_HOME:-$HOME/.cargo}/bin/wasm-bindgen-test-runner"
         fi
+        if [ -z "$runner" ]; then
+            die "${suite} suite: wasm-bindgen-test-runner is not on PATH or in ${CARGO_HOME:-$HOME/.cargo}/bin, and the suite needs the wasm-bindgen-test-runner of the version of the wasm-bindgen crate in Cargo.lock, ${lock}; $(wasm_bindgen_cli_advice "$lock")"
+        fi
+        if [[ "$runner" == *[$' \t\n\v\f\r']* ]]; then
+            die "${suite} suite: the wasm-bindgen-test-runner it found, ${runner}, has whitespace in its path, and cargo splits CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER at whitespace into the runner's path and its arguments, so it could not run that path; set the variable to a path of the runner without whitespace, such as a symbolic link to it"
+        fi
+        words=("$runner")
     fi
-    if [ -z "$runner" ]; then
-        die "${suite} suite: wasm-bindgen-test-runner is not on PATH or in ${CARGO_HOME:-$HOME/.cargo}/bin, and the suite needs the wasm-bindgen-test-runner of the version of the wasm-bindgen crate in Cargo.lock, ${lock}; $(wasm_bindgen_cli_advice "$lock")"
-    fi
-    IFS=$' \t\n\v\f\r' read -r -d '' -a words <<<"$runner" || true
-    program="${words[0]:-}"
+    program="${words[0]}"
     show "$program" --version
-    printed="$("$program" --version || true)"
-    read -r _ version _ <<<"$printed"
+    printed="$("$program" --version)" || code=$?
+    first="${printed%%$'\n'*}"
+    read -r tool version _ <<<"$first"
+    if [ "$tool" != wasm-bindgen-test-runner ]; then
+        die "${suite} suite: ${program} --version exited with status ${code}, and the first line of its output, '${first}', is not 'wasm-bindgen-test-runner <version>', the line a wasm-bindgen-test-runner prints; the suite runs cargo test only when the first word of the CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER it gives cargo, split at ASCII whitespace, is the wasm-bindgen-test-runner of the version of the wasm-bindgen crate in Cargo.lock, ${lock}"
+    fi
     if [ "$version" != "$lock" ]; then
         die "${suite} suite: the runner ${program} reports '${printed}' for --version, and the suite needs the wasm-bindgen-test-runner of the version of the wasm-bindgen crate in Cargo.lock, ${lock}; $(wasm_bindgen_cli_advice "$lock")"
     fi
