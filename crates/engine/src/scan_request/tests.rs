@@ -15,6 +15,8 @@ const NUMERIC_BOB: &str = "The parameter cannot be converted to a numeric value:
 const LIMIT_RANGE: &str = "Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1";
 const RCC_ENUM: &str = "1 validation error detected: Value 'NOPE' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]";
 const SELECT_ENUM: &str = "1 validation error detected: Value 'NOPE' at 'select' failed to satisfy constraint: Member must satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]";
+const MIX_SCAN_FILTER: &str = "Can not use both expression and non-expression parameters in the same request: \
+     Non-expression parameters: {ScanFilter} Expression parameters: {FilterExpression}";
 
 fn message(result: Result<(), DynamoDbError>) -> Option<String> {
     match result {
@@ -89,6 +91,15 @@ fn nested_numbers_and_the_other_number_faults_are_reported_with_the_service_text
         ),
         (
             json!({"N": "1e-200"}),
+            "Number underflow. Attempting to store a number with magnitude smaller than supported range",
+        ),
+        // An exponent outside the int32 range (measured 2026-11-23).
+        (
+            json!({"N": "1e9999999999"}),
+            "Number overflow. Attempting to store a number with magnitude larger than supported range",
+        ),
+        (
+            json!({"N": "1e-9999999999"}),
             "Number underflow. Attempting to store a number with magnitude smaller than supported range",
         ),
         (
@@ -193,24 +204,36 @@ fn range_faults_come_first() {
 }
 
 #[test]
-fn parameter_mix_beats_the_enum_and_the_numbers() {
+fn return_consumed_capacity_beats_the_parameter_mix_and_the_mix_beats_the_numbers() {
     let scan_filter =
         json!({"a": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "x"}]}});
     let mix = with(bad_number(), "ScanFilter", scan_filter.clone());
-    assert_eq!(
-        check(&mix).as_deref(),
-        Some(
-            "Can not use both expression and non-expression parameters in the same request: \
-             Non-expression parameters: {ScanFilter} Expression parameters: {FilterExpression}"
-        )
-    );
-    assert_eq!(
-        check(&with(mix, "ReturnConsumedCapacity", json!("NOPE"))).as_deref(),
-        Some(
-            "Can not use both expression and non-expression parameters in the same request: \
-             Non-expression parameters: {ScanFilter} Expression parameters: {FilterExpression}"
-        )
-    );
+    assert_eq!(check(&mix).as_deref(), Some(MIX_SCAN_FILTER));
+    // Measured 2026-11-19 and 2026-11-23: an invalid ReturnConsumedCapacity
+    // is reported ahead of each form of the mix.
+    for mix in [
+        with(
+            with(bad_number(), "ScanFilter", scan_filter.clone()),
+            "ExpressionAttributeValues",
+            json!({":n": {"N": "1"}}),
+        ),
+        with(
+            json!({"TableName": "t", "AttributesToGet": ["a"]}),
+            "ProjectionExpression",
+            json!("a"),
+        ),
+        with(
+            with(bad_number(), "ConditionalOperator", json!("AND")),
+            "ExpressionAttributeValues",
+            json!({":n": {"N": "1"}}),
+        ),
+    ] {
+        assert_eq!(
+            check(&with(mix.clone(), "ReturnConsumedCapacity", json!("NOPE"))).as_deref(),
+            Some(RCC_ENUM),
+            "{mix}"
+        );
+    }
     let atg = with(
         with(bad_number(), "AttributesToGet", json!(["a"])),
         "ProjectionExpression",
@@ -304,6 +327,12 @@ fn a_shape_fault_anywhere_in_the_body_is_reported_first() {
         json!({"TableName": "t", "ScanFilter": [1], "FilterExpression": "a = :n",
                "ExpressionAttributeValues": {":n": {"N": "1"}}}),
         json!({"TableName": "t", "Limit": 0, "Select": 5}),
+        // Measured 2026-11-23: the shape fault after a value the service
+        // cannot read is still found, in either member order.
+        json!({"TableName": "t", "Limit": 0, "ExpressionAttributeValues": {":u": {"X": "1"}},
+               "Select": 5}),
+        json!({"TableName": "t", "Select": 5, "ExpressionAttributeValues": {":u": {"X": "1"}},
+               "Limit": 0}),
     ];
     for body in shape_faults {
         assert!(
@@ -335,13 +364,121 @@ fn a_shape_fault_anywhere_in_the_body_is_reported_first() {
         Some(&*format!("1 validation error detected: {LIMIT_RANGE}"))
     );
     // A body that passes every check is left to the handler's deserializer: a
-    // string Limit and a malformed AttributeValue are not range or number
-    // faults here.
+    // string Limit is not a range fault here.
     assert!(check(&json!({"TableName": "t", "Limit": "0"})).is_none());
-    assert!(
-        check(&json!({"TableName": "t", "ExpressionAttributeValues": {":n": {"X": "bob"}}}))
-            .is_none()
-    );
+}
+
+// The measured rows stay in one data table.
+#[allow(clippy::too_many_lines)]
+#[test]
+fn names_sets_and_unreadable_values_are_reported_in_the_measured_order() {
+    let select_bad = "1 validation error detected: Value 'bad' at 'select' failed to satisfy \
+                      constraint: Member must satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, \
+                      ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]";
+    let null_beside_select = |value: Value| {
+        json!({"TableName": "t", "FilterExpression": "attribute_exists(a) OR a = :v",
+               "ExpressionAttributeValues": {":v": value}, "Select": "bad"})
+    };
+    // Measured 2026-11-19 and 2026-11-23 (us-east-1, each body twice), except
+    // where a row says otherwise.
+    let rows = [
+        (
+            "names key ahead of the number",
+            with(bad_number(), "ExpressionAttributeNames", json!({"a": "b"})),
+            "ExpressionAttributeNames contains invalid key: Syntax error; key: \"a\"",
+        ),
+        (
+            "empty names map ahead of the number",
+            with(bad_number(), "ExpressionAttributeNames", json!({})),
+            "ExpressionAttributeNames must not be empty",
+        ),
+        (
+            "empty name ahead of the number",
+            with(bad_number(), "ExpressionAttributeNames", json!({"#a": ""})),
+            "ExpressionAttributeNames contains invalid value: Empty attribute name for key #a",
+        ),
+        (
+            "names key ahead of a duplicate NS member",
+            json!({"TableName": "t", "ExpressionAttributeNames": {"a": "b"},
+                   "ExpressionAttributeValues": {":d": {"NS": ["1", "1"]}}}),
+            "ExpressionAttributeNames contains invalid key: Syntax error; key: \"a\"",
+        ),
+        // The service answers `One or more parameter values were invalid:
+        // Input collection contains duplicates.` for an NS (#1360).
+        (
+            "duplicate NS member ahead of Select",
+            json!({"TableName": "t", "Select": "NOPE", "FilterExpression": "a = :d",
+                   "ExpressionAttributeValues": {":d": {"NS": ["1", "1"]}}}),
+            "One or more parameter values were invalid: Input collection [1, 1] contains duplicates.",
+        ),
+        (
+            "empty NS ahead of Select",
+            json!({"TableName": "t", "Select": "NOPE",
+                   "ExpressionAttributeValues": {":d": {"NS": []}}}),
+            "One or more parameter values were invalid: An number set  may not be empty",
+        ),
+        (
+            "null beside Select",
+            null_beside_select(Value::Null),
+            select_bad,
+        ),
+        (
+            "L with a null beside Select",
+            null_beside_select(json!({"L": [null]})),
+            select_bad,
+        ),
+        (
+            "S null beside Select",
+            null_beside_select(json!({"S": null})),
+            select_bad,
+        ),
+        (
+            "both enums beside {}",
+            json!({"TableName": "t", "Select": "BAD", "ReturnConsumedCapacity": "BAD",
+                   "FilterExpression": "a = :a", "ExpressionAttributeValues": {":a": {}}}),
+            "2 validation errors detected: Value 'BAD' at 'select' failed to satisfy \
+                 constraint: Member must satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, \
+                 ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]; Value 'BAD' at \
+                 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum \
+                 value set: [INDEXES, TOTAL, NONE]",
+        ),
+        (
+            "ScanFilter mix beside {\"X\": \"1\"}",
+            json!({"TableName": "t", "ScanFilter": {"a": {"ComparisonOperator": "EQ",
+                   "AttributeValueList": [{"S": "x"}]}}, "FilterExpression": "a = :x",
+                   "ExpressionAttributeValues": {":x": {"X": "1"}}}),
+            MIX_SCAN_FILTER,
+        ),
+        // The service names `:n` here (`... numeric value: bob for key :n`);
+        // it picks among faulty values by an order of its own (#1013).
+        (
+            "{} beside N bob",
+            json!({"TableName": "t", "FilterExpression": "a = :a OR a = :n",
+                   "ExpressionAttributeValues": {":a": {}, ":n": {"N": "bob"}}}),
+            "ExpressionAttributeValues contains invalid value: Supplied AttributeValue is \
+                 empty, must contain exactly one of the supported datatypes for key :a",
+        ),
+        (
+            "X 1 beside a filter that does not read it",
+            json!({"TableName": "t", "FilterExpression": "attribute_exists(a)",
+                   "ExpressionAttributeValues": {":x": {"X": "1"}}}),
+            "ExpressionAttributeValues contains invalid value: Supplied AttributeValue is \
+                 empty, must contain exactly one of the supported datatypes for key :x",
+        ),
+        (
+            "Segment 1.5 beside Select",
+            json!({"TableName": "t", "Segment": 1.5, "TotalSegments": 2, "Select": "NOPE"}),
+            SELECT_ENUM,
+        ),
+        (
+            "TotalSegments 2.5 beside Select",
+            json!({"TableName": "t", "Segment": 0, "TotalSegments": 2.5, "Select": "NOPE"}),
+            SELECT_ENUM,
+        ),
+    ];
+    for (row, body, expected) in rows {
+        assert_eq!(check(&body).as_deref(), Some(expected), "{row}");
+    }
 }
 
 #[test]

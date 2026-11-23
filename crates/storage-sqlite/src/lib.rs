@@ -47,6 +47,7 @@ mod snapshot_engine;
 mod sqlite_util;
 mod store;
 mod stream;
+mod stream_lifecycle;
 #[cfg(test)]
 mod stream_tests;
 mod table_engine;
@@ -60,7 +61,7 @@ mod workers;
 
 /// Default secondary-index propagation delay (milliseconds) when the
 /// `index_propagation_delay_ms` setting is absent, as it is on a catalog the
-/// migrations created (releases before 1.0 seeded the same value). The single
+/// migrations created (releases before 0.1.15 seeded the same value). The single
 /// definition used by both the live read on the write path and the background
 /// refresh worker.
 pub(crate) const DEFAULT_INDEX_PROPAGATION_DELAY_MS: u64 = 10;
@@ -200,19 +201,34 @@ use std::sync::Arc;
 
 use extenddb_auth::CredentialStore;
 use extenddb_storage::migrations::{MigrationError, Runner};
-use extenddb_storage::server_components::{BackendError, ServerComponents};
+use extenddb_storage::server_components::{
+    BackendError, KeySource, ServerComponents, load_secret_keys,
+};
 
 use crate::hooks::SqliteRuntimeHooks;
 
 fn sqlite_server_components_factory(
     config: &(dyn extenddb_storage::config::StorageConfig + 'static),
     region: &str,
-    options: extenddb_storage::server_components::ServerComponentsOptions,
+    mut options: extenddb_storage::server_components::ServerComponentsOptions,
 ) -> futures::future::BoxFuture<'static, Result<ServerComponents, BackendError>> {
     let db_path = config.connection_config().to_owned();
     let pool_size = config.max_connections();
     let region = region.to_owned();
+    let key_source = std::mem::take(&mut options.key_source);
     Box::pin(async move {
+        // An in-memory catalog is new at each start, so no command of
+        // another process can have switched it to a KEK file.
+        if matches!(key_source, KeySource::Kek(_))
+            && matches!(serve_lock::database_file(&db_path), Ok(None))
+        {
+            return Err(BackendError::InitializationFailed(
+                "an in-memory SQLite catalog cannot use [auth.encryption] key_file: the catalog \
+                 is created at each start and has no key ring; unset key_file, or store the \
+                 catalog in a database file"
+                    .to_owned(),
+            ));
+        }
         // One server per database file, taken before the database is opened:
         // startup recovery below assumes no other server is using it, and a
         // migration holds the same lock. A file database only; an in-memory
@@ -271,7 +287,7 @@ fn sqlite_server_components_factory(
             details: e.to_string(),
         })?;
         if options.beside_server {
-            return components_of(engine, &db_path).await;
+            return components_of(engine, &db_path, key_source).await;
         }
 
         // An in-memory database exists only on the engine's single
@@ -317,7 +333,7 @@ fn sqlite_server_components_factory(
         // command exits with none of it half done.
         if !options.startup_recovery {
             engine.serve_lock = serve_lock;
-            return components_of(engine, &db_path).await;
+            return components_of(engine, &db_path, key_source).await;
         }
 
         // Recover any in-flight control-plane transitions from a prior run.
@@ -392,17 +408,18 @@ fn sqlite_server_components_factory(
         }
 
         engine.serve_lock = serve_lock;
-        components_of(engine, &db_path).await
+        components_of(engine, &db_path, key_source).await
     })
 }
 
 /// The server components around an opened engine: the catalog and
 /// credential stores over a second pool on the same file (the engine's own
-/// connection for an in-memory database, whose data lives only there) and
-/// the runtime hooks.
+/// connection for an in-memory database, whose data lives only there),
+/// sharing the one key holder `key_source` loads, and the runtime hooks.
 async fn components_of(
     engine: SqliteEngine,
     db_path: &str,
+    key_source: KeySource,
 ) -> Result<ServerComponents, BackendError> {
     let in_memory = engine.in_memory;
     let control_plane_notify = engine.control_plane_notify();
@@ -423,14 +440,7 @@ async fn components_of(
             })?
     };
 
-    let enc_key: Option<String> =
-        sqlx::query_scalar("SELECT value FROM settings WHERE key = 'encryption_key'")
-            .fetch_optional(&catalog_pool)
-            .await
-            .map_err(|e| {
-                BackendError::InitializationFailed(format!("fetch encryption key: {e}"))
-            })?;
-    let enc_key = enc_key.ok_or(BackendError::MissingEncryptionKey)?;
+    let keys = load_secret_keys(&SqliteCatalogStore::new(catalog_pool.clone()), key_source).await?;
 
     // The catalog store writes through the second pool over the same
     // file, so its writers must hold the SAME lock instance as the
@@ -440,13 +450,13 @@ async fn components_of(
     // For an in-memory database the pools are one and the sharing is
     // harmless. The credential store only reads and needs no lock.
     let catalog_store: Arc<dyn extenddb_storage::CatalogStore> =
-        Arc::new(SqliteCatalogStore::with_encryption_key(
+        Arc::new(SqliteCatalogStore::with_secret_keys(
             catalog_pool.clone(),
-            enc_key.clone(),
+            keys.clone(),
             Arc::clone(&engine.write_lock),
         ));
     let credential_store: Arc<dyn CredentialStore> =
-        Arc::new(SqliteCredentialStore::new(catalog_pool, enc_key));
+        Arc::new(SqliteCredentialStore::new(catalog_pool, keys));
 
     let runtime_hooks = Box::new(SqliteRuntimeHooks {
         engine: engine.clone(),
@@ -478,10 +488,11 @@ mod serve_lock_tests {
         };
         let mut options = extenddb_storage::server_components::ServerComponentsOptions::default();
         options.bootstrap_if_uninitialized = true;
-        let first = super::sqlite_server_components_factory(&config, "us-east-1", options)
+        let first = super::sqlite_server_components_factory(&config, "us-east-1", options.clone())
             .await
             .expect("first server");
-        let Err(err) = super::sqlite_server_components_factory(&config, "us-east-1", options).await
+        let Err(err) =
+            super::sqlite_server_components_factory(&config, "us-east-1", options.clone()).await
         else {
             panic!("a second server on the same file started");
         };
@@ -515,7 +526,7 @@ mod serve_lock_tests {
         let mut options = extenddb_storage::server_components::ServerComponentsOptions::default();
         options.bootstrap_if_uninitialized = true;
         let stale = std::time::Duration::from_secs(300);
-        let first = super::sqlite_server_components_factory(&config, "us-east-1", options)
+        let first = super::sqlite_server_components_factory(&config, "us-east-1", options.clone())
             .await
             .expect("first server");
         let claim = first

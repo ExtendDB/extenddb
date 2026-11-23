@@ -96,9 +96,10 @@ pub async fn run(args: DestroyArgs) -> anyhow::Result<()> {
     println!("WARNING: This will permanently destroy ALL data in both databases.");
     println!(
         "The backup store ([backup.store]) is left untouched; `extenddb backup purge --confirm` \
-         deletes its backups. Its extenddb-store.json names this catalog: a catalog re-created \
-         with `init` needs that file removed (or a new root), or the store is reported owned \
-         by another catalog."
+         deletes its backups. Its extenddb-store.json names this catalog, so a catalog \
+         re-created with `init` finds the store owned by another catalog (on the default \
+         SQLite root, the server's warning, which leaves the store unconfigured) until \
+         `extenddb backup sync --adopt-store` makes it the owner and gives its backups rows."
     );
     println!();
 

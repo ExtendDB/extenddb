@@ -7,7 +7,7 @@
 //! The request ([`request`]) runs once `check_catalog_row_for_restore` has
 //! accepted the backup's row: it takes the job permit, reads the sidecar and
 //! the manifest from the store (a missing one is `BackupNotFoundException`
-//! and an error line naming `backup sync --prune-missing`; each read
+//! and an error line naming the remedies; each read
 //! collects at most its bound, [`super::reconciler::SIDECAR_READ_BOUND`] and
 //! [`super::reconciler::MANIFEST_READ_BOUND`], and an object over it is a
 //! `ValidationException` naming a corrupt prefix, as a bad sidecar is),
@@ -23,8 +23,10 @@
 //! the detached task ([`start`]) whose answer it awaits for at most
 //! [`RESTORE_REGISTRATION_TIMEOUT`]; past that it answers
 //! `InternalServerError` while the task goes on (the target then appears
-//! through DescribeTable). The task registers the target and its RUNNING
-//! record in one write (`claim_restore`, under the backup row's lock), sends
+//! through DescribeTable). The task reads the maintenance claim (held, the
+//! request is refused with `LimitExceededException` and nothing is
+//! registered, so no record lands while a command holds the claim), then
+//! registers the target and its RUNNING record in one write (`claim_restore`, under the backup row's lock), sends
 //! the job's first beat through the claim (the registration's own
 //! `heartbeat_at` stamp can be old: the design's 4(e) states each backend's
 //! clock, PostgreSQL's `now()` being the transaction's start, so a
@@ -145,8 +147,9 @@ pub const RESTORE_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(60);
 pub const TARGET_NOT_EMPTY: &str = "target_not_empty";
 
 /// The reason the reconciler writes on a RUNNING record whose store is not
-/// the configured one.
-pub const OTHER_STORE: &str = "the restore reads a store other than the configured one; backup sync --move-store re-points it";
+/// the configured one. `--move-store` re-points the backup's rows, not the
+/// record, so the restore is run again after the move.
+pub const OTHER_STORE: &str = "the restore reads a store other than the configured one; configure that store in [backup.store], or copy its tree under the configured root and move the backup's rows to the configured store with `extenddb backup sync --move-store <root>`, and restore again";
 
 /// What the request resolved before it spawned the task.
 pub(crate) struct RestoreRequestParts {
@@ -199,10 +202,20 @@ where
     let read = async |name: &str, bound: u64| -> Result<Vec<u8>, DynamoDbError> {
         match super::reconciler::read_object(&*env.store, &format!("{prefix}{name}"), bound).await {
             Ok(ReadObject::Bytes(bytes)) => Ok(bytes),
+            Ok(ReadObject::Absent) if name == EXTENDDB_MANIFEST_FILE => {
+                tracing::error!(
+                    "backup {arn_text} (account {account_id}): its row is AVAILABLE but the store \
+                     holds no {name} under its prefix; put the prefix back, or, unless it is the \
+                     store's newest backup (whose missing manifest makes the store unhealthy), \
+                     remove the row with backup sync --prune-missing"
+                );
+                Err(backup_not_found(&arn_text))
+            }
             Ok(ReadObject::Absent) => {
                 tracing::error!(
                     "backup {arn_text} (account {account_id}): its row is AVAILABLE but the store \
-                     holds no {name} under its prefix; backup sync --prune-missing marks the row"
+                     holds no {name} under its prefix; put the prefix back (backup sync \
+                     --prune-missing removes only a row whose manifest is gone)"
                 );
                 Err(backup_not_found(&arn_text))
             }
@@ -230,14 +243,15 @@ where
     })?;
     // The parser ran the version gate and the identity rule (the ARN's
     // table is `source_table.table_name`); what is left is that the
-    // manifest's backup is the row's.
+    // manifest's backup is the row's, in whichever region the manifest
+    // spells it (a backup adopted from another region's server).
     let manifest = ExtenddbManifest::from_json_bytes(&manifest_bytes).map_err(|e| {
         DynamoDbError::ValidationException(format!(
             "Backup {arn_text} has a manifest this server cannot restore from: {e}"
         ))
     })?;
     match manifest.backup_arn() {
-        Ok(named) if named == *arn => {}
+        Ok(named) if named.names_same_backup(arn) => {}
         Ok(named) => {
             return Err(DynamoDbError::ValidationException(format!(
                 "Backup {arn_text} has a manifest that names another backup, {}",
@@ -441,6 +455,27 @@ pub(crate) async fn start<S>(
         spool_host: spool_host.clone(),
         owner_generation: UNOWNED_GENERATION,
     };
+    // The maintenance claim immediately before the registration: the
+    // request's check ran before the manifest reads and the permit, and a
+    // command that took the claim since gets no record of this restore. A
+    // claim taken in the gap between this read and the registration is met
+    // by the check after it, below, and by the command's wait.
+    let refused = match storage
+        .check_maintenance_claim(env.settings.stale_job_after)
+        .await
+    {
+        Ok(false) => None,
+        Ok(true) => Some(maintenance_held()),
+        Err(e) => Some(storage_err_to_dynamo(e)),
+    };
+    if let Some(error) = refused {
+        drop(permit);
+        if let Some(registration) = registration {
+            registration.finish(Err(error.clone()));
+        }
+        let _ = reply.send(Err(error));
+        return;
+    }
     let registered = storage
         .claim_restore(&account_id, input, &registration_row)
         .await;
@@ -1319,7 +1354,8 @@ type Prepared = (
 );
 
 /// The manifest of a (manifest, sidecar) pair that verifies and names
-/// `arn`; the `Err` says what failed.
+/// `arn`'s backup (in any region, `BackupArn::names_same_backup`); the
+/// `Err` says what failed.
 fn verified_manifest(
     manifest_bytes: &[u8],
     sidecar_bytes: &[u8],
@@ -1330,7 +1366,7 @@ fn verified_manifest(
     let manifest = ExtenddbManifest::from_json_bytes(manifest_bytes)
         .map_err(|e| format!("the manifest is refused: {e}"))?;
     match manifest.backup_arn() {
-        Ok(named) if named == *arn => Ok(manifest),
+        Ok(named) if named.names_same_backup(arn) => Ok(manifest),
         Ok(named) => Err(format!(
             "the manifest names another backup, {}",
             named.to_arn_string()
