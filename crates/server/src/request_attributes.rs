@@ -355,12 +355,12 @@ impl<'a> Names<'a> {
         }
     }
 
-    /// The paths in a `KeyConditionExpression`, read as the engine's key
-    /// condition parser reads it (`parse_key_condition_expr` in
-    /// `crates/engine/src/expression_helpers.rs`): under the size and token
+    /// The paths in a `KeyConditionExpression`, under the size and token
     /// limits, with the reserved-word check when `enforce_reserved_keywords`
-    /// is set, then `parse_key_condition`. A key condition the key condition
-    /// parser refuses gives none.
+    /// is set, then the map-less `parse_key_condition`, which accepts key
+    /// conditions the engine refuses for an undefined reference, a
+    /// `begins_with` operand type or a second condition on one key attribute.
+    /// A key condition `parse_key_condition` refuses gives none.
     fn key_condition(&mut self, value: Option<&Value>) {
         let Some(text) = self.text(value) else {
             return;
