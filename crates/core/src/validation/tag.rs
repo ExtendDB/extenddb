@@ -67,7 +67,7 @@ fn is_tag_char(c: char) -> bool {
 /// # Errors
 ///
 /// Returns `ValidationException`.
-pub fn validate_tag_key(key: &str) -> Result<(), DynamoDbError> {
+fn validate_tag_key(key: &str) -> Result<(), DynamoDbError> {
     if key.is_empty()
         || key.encode_utf16().count() > MAX_TAG_KEY_UNITS
         || !key.chars().all(is_tag_char)
@@ -76,7 +76,7 @@ pub fn validate_tag_key(key: &str) -> Result<(), DynamoDbError> {
             "The Tag Key provided is invalid, Key: {key}"
         )));
     }
-    // `get` keeps a multi-byte first character from splitting: it yields None
+    // `get` keeps a character that spans byte 4 from splitting: it yields None
     // when 4 is not a character boundary.
     if key
         .get(..4)
@@ -94,7 +94,7 @@ pub fn validate_tag_key(key: &str) -> Result<(), DynamoDbError> {
 /// # Errors
 ///
 /// Returns `ValidationException`.
-pub fn validate_tag_value(value: &str) -> Result<(), DynamoDbError> {
+fn validate_tag_value(value: &str) -> Result<(), DynamoDbError> {
     if value.encode_utf16().count() > MAX_TAG_VALUE_UNITS || !value.chars().all(is_tag_char) {
         return Err(DynamoDbError::ValidationException(format!(
             "The Tag Value provided is invalid, Value: {value}"
@@ -118,7 +118,7 @@ pub fn validate_tags(tags: &[Tag]) -> Result<(), DynamoDbError> {
 }
 
 /// Refuse a tag key that starts with `aws:` once U+017F (`ſ`) is read as `s`,
-/// such as `awſ:foo`, which [`validate_tag_key`] accepts. The service refuses
+/// such as `awſ:foo`, which `validate_tag_key` accepts. The service refuses
 /// it on `TagResource` and `CreateTable` with this message, in a later check
 /// than [`validate_tags`]: on `TagResource` an absent table and a key outside
 /// the grammar later in the request are reported first. `UntagResource`
@@ -354,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    fn a_multi_byte_first_character_does_not_split_the_prefix_check() {
+    fn a_character_that_spans_byte_4_does_not_split_the_prefix_check() {
         // In the last three keys byte 4 falls inside a character, so slicing
         // the key at byte 4 would panic.
         for key in [
