@@ -15,12 +15,11 @@
 
 use super::ast::{CompareOp, Expr, PathElement};
 use super::parser_common;
-use super::resolver::{ExpressionMaps, attribute_type_code};
+use super::resolver::{ExpressionMaps, check_begins_with_operand};
 use super::tokenizer::Token;
 use crate::error::DynamoDbError;
 use crate::types::{
-    AttributeValue, KeySchemaElement, KeyType, hash_key_elements, is_multipart_key_schema,
-    range_key_elements,
+    KeySchemaElement, KeyType, hash_key_elements, is_multipart_key_schema, range_key_elements,
 };
 
 /// Parsed key condition: partition key value expression(s) and optional sort key condition.
@@ -497,15 +496,8 @@ fn check_begins_with_operands(
     maps: &ExpressionMaps,
 ) -> Result<(), DynamoDbError> {
     for clause in clauses {
-        if let Clause::Supported(RawClause::BeginsWith(_, Expr::Placeholder(placeholder))) = clause
-            && let Some(value) = maps.values.get(placeholder)
-            && !matches!(value, AttributeValue::S(_) | AttributeValue::B(_))
-        {
-            return Err(validation_err(&format!(
-                "Invalid KeyConditionExpression: Incorrect operand type for operator or \
-                 function; operator or function: begins_with, operand type: {}",
-                attribute_type_code(value)
-            )));
+        if let Clause::Supported(RawClause::BeginsWith(_, operand)) = clause {
+            check_begins_with_operand(operand, maps, "Invalid KeyConditionExpression: ")?;
         }
     }
     Ok(())
