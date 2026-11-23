@@ -310,10 +310,10 @@ case "$step" in
         ;;
 
     shim)
-        # The tests of the SQLite shim, the wasm backend, in
-        # crates/storage-sqlite/tests/wasm_shim.rs, whose module documentation
-        # says what they check and how they run natively. This step runs them
-        # on wasm32, under Node.
+        # The tests in crates/storage-sqlite/tests/wasm_shim.rs: the table of
+        # the SQLite shim's rules and two tests of the backend over the shim.
+        # The file's module documentation says what they check and how they
+        # run natively. This step runs them on wasm32, under Node.
         #
         # TESTS names every test of that file as the runner reports it, and
         # the step fails unless the run reports each of them ok and no other
