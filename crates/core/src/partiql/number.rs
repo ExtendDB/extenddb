@@ -240,6 +240,22 @@ pub fn parameter_message(text: &str, problem: NumberProblem) -> String {
     }
 }
 
+/// Whether `message` holds the message of a [`NumberProblem`], with or
+/// without the text [`parameter_message`] appends: the refusal the attribute
+/// value deserializer gives an `N` beside a second type descriptor, which
+/// the engine answers as a `ValidationException`.
+#[must_use]
+pub fn is_problem_message(message: &str) -> bool {
+    [
+        NumberProblem::Unconvertible,
+        NumberProblem::TooManyDigits,
+        NumberProblem::Overflow,
+        NumberProblem::Underflow,
+    ]
+    .iter()
+    .any(|problem| message.contains(problem.rule_message()))
+}
+
 /// Refuse a statement whose text holds a number literal that cannot be
 /// converted. The service reports it as a parse failure with nothing after the
 /// prefix, ahead of any other check on the statement (measured 2026-11-02).

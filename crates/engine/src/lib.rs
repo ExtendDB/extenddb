@@ -216,6 +216,7 @@ pub(crate) fn deserialize_error(e: serde_json::Error) -> DynamoDbError {
     if msg.contains("validation error detected")
         || msg.contains("may not be empty")
         || msg.contains("contains duplicates")
+        || extenddb_core::partiql::number::is_problem_message(&msg)
         || msg.contains("must not be empty")
         || msg.contains("contains invalid key")
         || msg.contains("contains invalid value")

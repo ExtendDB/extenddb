@@ -131,11 +131,26 @@ where
 }
 
 /// The value the members of one object describe, at any level: the one
-/// member [`type_descriptor`] leaves, read by [`from_descriptor`]. The
-/// payload is read after the count.
+/// member [`type_descriptor`] leaves, read by [`from_descriptor`]. A value
+/// with two or more descriptors is refused for the first of their payloads
+/// that the service checks ahead of the count, else for the count.
 fn from_members(
     members: impl IntoIterator<Item = (String, serde_json::Value)>,
 ) -> Result<AttributeValue, String> {
+    let members: Vec<(String, serde_json::Value)> = members.into_iter().collect();
+    let counted = type_descriptor(members.iter().map(|(name, payload)| (name, payload)));
+    if matches!(counted, Err(MULTI_ATTRIBUTE_VALUE)) {
+        // The service checks a string set, then an `N`, then a number set
+        // payload before it counts the descriptors, whatever order the
+        // members come in (measured 2026-11-23 on UpdateItem, Query and
+        // PutItem; the set shapes in both member orders). The other payloads
+        // are not read; the count refuses the value.
+        for tag in ["SS", "N", "NS"] {
+            for (_, payload) in members.iter().filter(|(name, _)| name == tag) {
+                crate::partiql::params::payload_refusal(tag, payload)?;
+            }
+        }
+    }
     let (name, payload) = type_descriptor(members)?;
     from_descriptor(&name, payload)
 }
@@ -245,17 +260,25 @@ fn string_set(value: &serde_json::Value) -> Result<AttributeValue, String> {
                 })
         })
         .collect::<Result<_, _>>()?;
-    let values: Vec<String> = arr
-        .iter()
-        .filter_map(|v| v.as_str().map(std::borrow::ToOwned::to_owned))
-        .collect();
-    if values.len() != set.len() {
-        let repr = values.join(", ");
-        return Err(format!(
-            "One or more parameter values were invalid: Input collection [{repr}] contains duplicates."
-        ));
-    }
+    string_set_duplicates(arr)?;
     Ok(AttributeValue::SS(set))
+}
+
+/// The refusal of a string set that holds a member twice, naming the members
+/// as written. A member that is no string is skipped.
+pub(crate) fn string_set_duplicates(members: &[serde_json::Value]) -> Result<(), String> {
+    let values: Vec<&str> = members
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    let distinct: BTreeSet<&str> = values.iter().copied().collect();
+    if values.len() == distinct.len() {
+        return Ok(());
+    }
+    let repr = values.join(", ");
+    Err(format!(
+        "One or more parameter values were invalid: Input collection [{repr}] contains duplicates."
+    ))
 }
 
 /// The payload of an `NS`.
@@ -556,6 +579,72 @@ mod tests {
                 name.as_str()
             });
             assert_eq!(got, want, "{json}");
+        }
+    }
+
+    /// A value with two type descriptors is refused for a string set
+    /// duplicate, then for its `N` by the PartiQL number rules, then for a
+    /// number set duplicate, and for the count only when those payloads pass.
+    /// Each row was measured on 2026-11-23 through UpdateItem, Query and
+    /// PutItem, twice: the set rows in both member orders with the same
+    /// answer, the number rows with `S` first. The rows give the members as
+    /// a list of pairs and are run in both orders, and as the
+    /// `serde_json::Value` object the engine reads.
+    #[test]
+    fn a_payload_fault_beside_a_second_descriptor_is_refused_before_the_count() {
+        use crate::partiql::number::{
+            OVERFLOW_MESSAGE, TOO_MANY_DIGITS_MESSAGE, UNCONVERTIBLE_PARAMETER_MESSAGE,
+            UNDERFLOW_MESSAGE,
+        };
+        let unconvertible = |text: &str| format!("{UNCONVERTIBLE_PARAMETER_MESSAGE}: {text}");
+        let with_s = |n: &str| format!(r#"[["S","x"],["N",{}]]"#, serde_json::json!(n));
+        let cases = [
+            (with_s("1"), MULTI_ATTRIBUTE_VALUE.to_owned()),
+            (with_s("bob"), unconvertible("bob")),
+            (with_s(""), UNCONVERTIBLE_PARAMETER_MESSAGE.to_owned()),
+            (with_s("1e9999999999"), unconvertible("1e9999999999")),
+            (with_s("1e-9999999999"), unconvertible("1e-9999999999")),
+            (with_s("1e2147483648"), unconvertible("1e2147483648")),
+            (with_s("1e2147483647"), UNDERFLOW_MESSAGE.to_owned()),
+            (with_s("1e126"), OVERFLOW_MESSAGE.to_owned()),
+            (with_s("1e-131"), UNDERFLOW_MESSAGE.to_owned()),
+            (
+                with_s("123456789012345678901234567890123456789"),
+                TOO_MANY_DIGITS_MESSAGE.to_owned(),
+            ),
+            (with_s(" 1"), unconvertible(" 1")),
+            (with_s("1.5e-2147483647"), unconvertible("1.5e-2147483647")),
+            (with_s("-0.0"), MULTI_ATTRIBUTE_VALUE.to_owned()),
+            (with_s("0x10"), unconvertible("0x10")),
+            (
+                r#"[["SS",["a","a"]],["N","bob"]]"#.to_owned(),
+                "One or more parameter values were invalid: Input collection [a, a] contains \
+                 duplicates."
+                    .to_owned(),
+            ),
+            (
+                r#"[["S","x"],["SS",["a","a"]]]"#.to_owned(),
+                "One or more parameter values were invalid: Input collection [a, a] contains \
+                 duplicates."
+                    .to_owned(),
+            ),
+            (
+                r#"[["S","x"],["NS",["1","1"]]]"#.to_owned(),
+                crate::partiql::params::NUMBER_SET_DUPLICATES.to_owned(),
+            ),
+            (
+                r#"[["NS",["1","1"]],["N","bob"]]"#.to_owned(),
+                unconvertible("bob"),
+            ),
+        ];
+        for (json, want) in cases {
+            let members: Vec<(String, serde_json::Value)> = serde_json::from_str(&json).unwrap();
+            let reversed: Vec<_> = members.iter().rev().cloned().collect();
+            assert_eq!(from_members(members.clone()), Err(want.clone()), "{json}");
+            assert_eq!(from_members(reversed), Err(want.clone()), "{json} reversed");
+            let object = serde_json::Value::Object(members.into_iter().collect());
+            let got = serde_json::from_value::<AttributeValue>(object).map_err(|e| e.to_string());
+            assert_eq!(got, Err(want), "{json} as an object");
         }
     }
 

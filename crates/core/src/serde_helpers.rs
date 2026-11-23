@@ -136,18 +136,20 @@ where
         "ExpressionAttributeValues",
         false,
         |key, value| {
-            // An AttributeValue with no type descriptor: `{}`, or members the
-            // deserializer ignores only. Caught here so the error names its
-            // key. Only the empty case is prefixed here.
-            if value.as_object().is_some_and(|members| {
-                !members
-                    .iter()
-                    .any(|(k, v)| crate::types::is_type_descriptor(k, v))
-            }) {
+            // A value with no type descriptor, or with two or more, is refused
+            // with the count's text or with the text of a payload the
+            // deserializer checks ahead of the count, named after its key
+            // (measured 2026-11-23 on UpdateItem and Query, each shape
+            // twice). Caught here because a serde error does not carry the
+            // key. A value with one descriptor is read by `convert`, whose
+            // refusals are bare.
+            if value
+                .as_object()
+                .is_some_and(|members| crate::types::type_descriptor(members).is_err())
+                && let Err(refusal) = AttributeValue::deserialize(value)
+            {
                 return Err(format!(
-                    "ExpressionAttributeValues contains invalid value: Supplied \
-                     AttributeValue is empty, must contain exactly one of the \
-                     supported datatypes for key {key}"
+                    "ExpressionAttributeValues contains invalid value: {refusal} for key {key}"
                 ));
             }
             Ok(())
@@ -278,23 +280,52 @@ mod tests {
         assert!(!msg.contains("size of key"), "{msg}");
     }
 
+    /// A value with no type descriptor (`{}`, or members the deserializer
+    /// ignores only) or with two or more is refused with the deserializer's
+    /// text named after its key: the count's text, or that of a payload
+    /// checked ahead of the count (measured 2026-11-23 on Query and
+    /// UpdateItem, each twice). A value with one descriptor keeps the
+    /// deserializer's bare text.
     #[test]
-    fn values_empty_attribute_value_rejected() {
-        // `{}`, and the values whose members the deserializer ignores
-        // (measured 2026-11-23 on Query, wrapped alike).
-        for value in [
-            "{}",
-            r#"{"X":"1"}"#,
-            r#"{"S":null}"#,
-            r#"{"S":null,"X":"1"}"#,
-        ] {
-            let msg = values_err(&format!(r#"{{"values":{{":v":{value}}}}}"#));
-            assert!(
-                msg.contains(
-                    "ExpressionAttributeValues contains invalid value: Supplied \
-                     AttributeValue is empty, must contain exactly one of the \
-                     supported datatypes for key :v"
+    fn values_with_no_single_descriptor_are_refused_by_key() {
+        const EMPTY: &str = "Supplied AttributeValue is empty, must contain exactly one of the \
+                             supported datatypes";
+        const MULTI: &str = "Supplied AttributeValue has more than one datatypes set, must \
+                             contain exactly one of the supported datatypes";
+        let wrapped = |text: &str| {
+            format!("ExpressionAttributeValues contains invalid value: {text} for key :v")
+        };
+        let cases = [
+            ("{}", wrapped(EMPTY)),
+            (r#"{"X":"1"}"#, wrapped(EMPTY)),
+            (r#"{"S":null}"#, wrapped(EMPTY)),
+            (r#"{"S":null,"X":"1"}"#, wrapped(EMPTY)),
+            (r#"{"S":"x","N":"1"}"#, wrapped(MULTI)),
+            (
+                r#"{"S":"x","N":"bob"}"#,
+                wrapped("The parameter cannot be converted to a numeric value: bob"),
+            ),
+            (
+                r#"{"SS":["a","a"],"N":"bob"}"#,
+                wrapped(
+                    "One or more parameter values were invalid: Input collection [a, a] \
+                     contains duplicates.",
                 ),
+            ),
+            (
+                r#"{"S":"x","NS":["1","1"]}"#,
+                wrapped(crate::partiql::params::NUMBER_SET_DUPLICATES),
+            ),
+            // ExtendDB's own text for a payload of the wrong JSON type, left
+            // unwrapped (not measured; #1012 tracks these texts).
+            (r#"{"S":1}"#, "S value must be a string".to_owned()),
+        ];
+        for (value, want) in cases {
+            let msg = values_err(&format!(r#"{{"values":{{":v":{value}}}}}"#));
+            // The text deserializer appends the position; the engine's
+            // `from_value` path does not.
+            assert!(
+                msg.starts_with(&format!("{want} at line 1 column ")),
                 "{value}: {msg}"
             );
         }

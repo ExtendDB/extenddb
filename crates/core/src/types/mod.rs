@@ -88,4 +88,6 @@ pub use warm_throughput::{
 /// reads a value by, for the readers that read a value before it is
 /// deserialized.
 pub(crate) use attribute_value::is_type_descriptor;
+/// The string set duplicate refusal, for the PartiQL payload check.
+pub(crate) use attribute_value::string_set_duplicates;
 pub use attribute_value::type_descriptor;
