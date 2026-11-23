@@ -5,7 +5,7 @@
 
 Amazon DynamoDB refuses a key condition that names the same key attribute
 twice, on the partition key and on the sort key alike, whatever the operators
-are (issue #430):
+are:
 
     ValidationException: Invalid KeyConditionExpression: KeyConditionExpressions
     must only contain one condition per key
@@ -159,9 +159,9 @@ def hash_table(dynamodb_client):
 
 
 class TestOneConditionPerKey:
-    """Every measured duplicate shape (2026-10-24, and 2026-11-11 for J1 and
-    J2), the shapes that keep their own error, and the distinct conditions
-    that are served."""
+    """The duplicate shapes of 2026-10-24 except the reserved word row, J1 and
+    J2 (2026-11-11), the shapes that keep their own error, and the distinct
+    conditions that are served."""
 
     ROWS = [
         ("pk = :a AND pk = :b", _q("pk = :a AND pk = :b", "a b"), ONE_PER_KEY),

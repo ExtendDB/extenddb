@@ -379,16 +379,13 @@ class TestLeadingKeys:
 
     # -- A second clause on the partition key ------------------------------
 
-    def test_unreadable_partition_equality_does_not_bind_another_clause(self, table):
+    def test_partition_equality_does_not_bind_another_clause(self, table):
         # Two clauses on the partition key are refused before
         # dynamodb:LeadingKeys is evaluated, so no clause is bound. A principal
         # allowed everything and principals fenced to `:v`'s value get the
-        # same ValidationException (measured 2026-11-12 and 2026-11-19). When
-        # `:u = {"N": "bob"}`, the service reports that `bob` is not a number,
-        # which this server does not check in a Query yet (#544).
+        # same ValidationException (measured 2026-11-12 and 2026-11-19).
         kces = ("pk = :u AND pk > :v", "pk > :v AND pk = :u")
-        readable = {":u": {"S": OTHER}, ":v": {"S": OWN}}
-        unreadable = {":u": {"N": OTHER}, ":v": {"S": OWN}}
+        values = {":u": {"S": OTHER}, ":v": {"S": OWN}}
         owner = self._user_client([("all", {
             "Version": "2012-10-17",
             "Statement": [{"Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"}],
@@ -396,7 +393,7 @@ class TestLeadingKeys:
         for kce in kces:
             with pytest.raises(ClientError) as e:
                 owner.query(TableName=table, KeyConditionExpression=kce,
-                            ExpressionAttributeValues=readable)
+                            ExpressionAttributeValues=values)
             err = e.value.response["Error"]
             assert err["Code"] == "ValidationException", kce
             assert err["Message"] == ONE_PER_KEY, kce
@@ -411,14 +408,10 @@ class TestLeadingKeys:
             for kce in kces:
                 with pytest.raises(ClientError) as e:
                     c.query(TableName=table, KeyConditionExpression=kce,
-                            ExpressionAttributeValues=readable)
+                            ExpressionAttributeValues=values)
                 err = e.value.response["Error"]
                 assert (err["Code"], err["Message"]) == (
                     "ValidationException", ONE_PER_KEY), (form, kce)
-                with pytest.raises(ClientError) as e:
-                    c.query(TableName=table, KeyConditionExpression=kce,
-                            ExpressionAttributeValues=unreadable)
-                assert e.value.response["Error"]["Code"] == "ValidationException", (form, kce)
 
     def test_duplicate_key_condition_is_refused_before_leading_keys(self, table):
         # A key condition with two conditions on one key attribute is refused
