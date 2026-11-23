@@ -72,16 +72,13 @@ fn deployment_scope_error(
     )))
 }
 
-/// Extract the table name from a `DynamoDB` table ARN, using the one shared
-/// resource parser ([`extenddb_core::arn::fields`]) so this layer splits an ARN
-/// the same way authorization and the engine stream resolver do.
-///
-/// Expected format: `arn:aws:dynamodb:{region}:{account}:table/{name}[/...]`
-fn extract_table_name_from_arn(arn: &str) -> Option<&str> {
-    let resource = extenddb_core::arn::fields(arn)?.resource;
-    let table_name = resource.strip_prefix("table/")?;
-    // Strip any sub-resource (e.g. /index/foo, /stream/label).
-    Some(table_name.split('/').next().unwrap_or(table_name))
+/// The table name of a `table/<name>[/<kind>/<id>]` resource, the shape
+/// [`validate_arn_shape_and_account`] leaves. The fields come from the one
+/// shared resource parser ([`extenddb_core::arn::fields`]), so this layer
+/// splits an ARN the same way authorization and the engine stream resolver do.
+fn table_name_of(resource: &str) -> &str {
+    let tail = resource.strip_prefix("table/").unwrap_or(resource);
+    tail.split('/').next().unwrap_or(tail)
 }
 
 /// Validate that the ARN refers to an existing table owned by the caller.
@@ -114,13 +111,18 @@ fn extract_table_name_from_arn(arn: &str) -> Option<&str> {
 /// stream ARN with another partition, service or region is refused in the
 /// first half, before the tags (measured 2026-11-20).
 async fn validate_resource_arn(arn: &str, ctx: &OperationContext) -> Result<(), DynamoDbError> {
-    validate_arn_shape_and_account(arn, ctx)?;
-    validate_arn_region_and_table(arn, ctx).await
+    let fields = validate_arn_shape_and_account(arn, ctx)?;
+    validate_arn_region_and_table(fields, arn, ctx).await
 }
 
 /// First half of [`validate_resource_arn`]: the ARN prefix, its resource kind,
-/// the account, and the deployment scope of a stream ARN.
-fn validate_arn_shape_and_account(arn: &str, ctx: &OperationContext) -> Result<(), DynamoDbError> {
+/// the account, and the deployment scope of a stream ARN. Returns the parsed
+/// fields, whose resource is `table/<name>` or `table/<name>/stream/<label>`,
+/// for the second half.
+fn validate_arn_shape_and_account<'a>(
+    arn: &'a str,
+    ctx: &OperationContext,
+) -> Result<extenddb_core::arn::ArnFields<'a>, DynamoDbError> {
     if !arn.starts_with("arn:") {
         return Err(DynamoDbError::ValidationException(format!(
             "One or more parameter values were invalid: ARNs must start with 'arn:': {arn}"
@@ -180,35 +182,23 @@ fn validate_arn_shape_and_account(arn: &str, ctx: &OperationContext) -> Result<(
         return Err(err);
     }
 
-    Ok(())
+    Ok(fields)
 }
 
 /// Second half of [`validate_resource_arn`]: the partition, service and region,
-/// then the table's existence.
+/// then the table's existence. `fields` is the first half's parse of `arn`.
 async fn validate_arn_region_and_table(
+    fields: extenddb_core::arn::ArnFields<'_>,
     arn: &str,
     ctx: &OperationContext,
 ) -> Result<(), DynamoDbError> {
-    let Some(fields) = extenddb_core::arn::fields(arn) else {
-        return Err(DynamoDbError::AccessDeniedException(
-            "Access is denied".to_owned(),
-        ));
-    };
-
     if let Some(err) = deployment_scope_error(&fields, arn, &ctx.region) {
         return Err(err);
     }
 
-    let table_name = extract_table_name_from_arn(arn).ok_or_else(|| {
-        DynamoDbError::ValidationException(format!(
-            "One or more parameter values were invalid: \
-             Provided Arn is not a DynamoDB resource arn: {arn}"
-        ))
-    })?;
-
     // Verify the table exists via table_key_info (lightweight check).
     ctx.storage
-        .table_key_info(&ctx.account_id, table_name)
+        .table_key_info(&ctx.account_id, table_name_of(fields.resource))
         .await
         .map_err(|e| match e {
             extenddb_storage::error::StorageError::TableNotFound(_) => {
@@ -242,9 +232,9 @@ pub async fn handle_tag_resource(
         ));
     }
 
-    validate_arn_shape_and_account(&input.resource_arn, ctx)?;
+    let fields = validate_arn_shape_and_account(&input.resource_arn, ctx)?;
     validate_tags(&input.tags)?;
-    validate_arn_region_and_table(&input.resource_arn, ctx).await?;
+    validate_arn_region_and_table(fields, &input.resource_arn, ctx).await?;
     validate_folded_tag_prefix(&input.tags)?;
 
     ctx.storage
@@ -283,9 +273,9 @@ pub async fn handle_untag_resource(
         ));
     }
 
-    validate_arn_shape_and_account(&input.resource_arn, ctx)?;
+    let fields = validate_arn_shape_and_account(&input.resource_arn, ctx)?;
     validate_tag_keys(&input.tag_keys)?;
-    validate_arn_region_and_table(&input.resource_arn, ctx).await?;
+    validate_arn_region_and_table(fields, &input.resource_arn, ctx).await?;
 
     ctx.storage
         .untag_resource(&input.resource_arn, &input.tag_keys)
@@ -338,10 +328,16 @@ pub async fn handle_list_tags_of_resource(
 #[cfg(test)]
 mod tests {
     use super::{
-        deployment_scope_error, tag_subresource_not_dynamodb_resource,
+        deployment_scope_error, table_name_of, tag_subresource_not_dynamodb_resource,
         tag_subresource_not_table_or_stream,
     };
     use extenddb_core::error::DynamoDbError;
+
+    #[test]
+    fn table_name_of_strips_the_sub_resource() {
+        assert_eq!(table_name_of("table/t"), "t");
+        assert_eq!(table_name_of("table/t/stream/2026-10-20T16:17:40.188"), "t");
+    }
 
     /// The tag handler refuses exactly the ARNs the shared predicate puts
     /// outside this deployment, the predicate the server's StreamArn scope
