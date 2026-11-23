@@ -6,7 +6,7 @@
 //! fault answered as a retryable error.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::search_filter::EnabledAccounts;
@@ -17,8 +17,8 @@ use futures::future::BoxFuture;
 use tokio::sync::Notify;
 
 use super::{
-    READ_TIMEOUT, REFRESH, Settings, enabled_accounts, install_search_filter_settings,
-    search_filter_settings_changed,
+    READ_TIMEOUT, REFRESH, SERVERS, Settings, enabled_accounts, install_search_filter_settings,
+    same, search_filter_settings_changed,
 };
 
 /// How a read of the store answers.
@@ -282,6 +282,53 @@ async fn a_change_applies_while_an_earlier_read_has_not_ended() {
     assert_eq!(
         settings.enabled_accounts().await.unwrap(),
         EnabledAccounts::All
+    );
+    assert_eq!(store.reads(), 2);
+}
+
+/// Poison `lock` with a thread that panics while holding it.
+fn poison<T: Send>(lock: &Mutex<T>) {
+    std::thread::scope(|s| {
+        let held = s.spawn(|| {
+            let _held = lock.lock();
+            panic!("poison the lock");
+        });
+        assert!(held.join().is_err());
+    });
+    assert!(lock.is_poisoned());
+}
+
+/// A thread that panicked while holding the server list or a server's kept
+/// read leaves the setting readable.
+#[tokio::test]
+async fn a_poisoned_lock_leaves_the_setting_readable() {
+    let storage = storage().await;
+    let store = Store::value("all");
+    install_search_filter_settings(&storage, store.clone());
+    let settings = SERVERS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(engine, _)| same(engine, &storage))
+        .map(|(_, settings)| Arc::clone(settings))
+        .expect("the server is installed");
+    poison(&SERVERS);
+    poison(&settings.kept);
+    poison(&settings.changes);
+    assert_eq!(
+        enabled_accounts(&storage).await.unwrap(),
+        EnabledAccounts::All
+    );
+    assert_eq!(
+        enabled_accounts(&storage).await.unwrap(),
+        EnabledAccounts::All
+    );
+    assert_eq!(store.reads(), 1, "the kept read is used");
+    store.set(Answer::Value(Some("off".to_owned())));
+    search_filter_settings_changed();
+    assert_eq!(
+        enabled_accounts(&storage).await.unwrap(),
+        EnabledAccounts::Off
     );
     assert_eq!(store.reads(), 2);
 }
