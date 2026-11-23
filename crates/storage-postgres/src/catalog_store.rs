@@ -214,22 +214,11 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for PostgresCatalogStore {
                     .await
                     .map_err(|e| DiagError::QueryFailed(e.to_string()))?;
             let (name,) = name_row.ok_or_else(not_configured)?;
-
-            // The connection string as the server reads it: in a catalog with
-            // a key ring the row is encrypted, and the KEK of key_file opens
-            // it (RFC-0000 section 12).
-            let target =
-                crate::migrations::PostgresTarget::new((*pool.connect_options()).clone(), &name)
-                    .with_key_source(key, false);
-            let conn = crate::migrations::data_connection_string(&target)
+            let conn = data_connection_row(&pool, key)
                 .await
                 .map_err(|e| DiagError::QueryFailed(e.to_string()))?
                 .ok_or_else(not_configured)?;
-            sqlx::postgres::PgPoolOptions::new()
-                .max_connections(1)
-                .connect(&conn)
-                .await
-                .map_err(|e| DiagError::ConnectionFailed(e.to_string()))?;
+            connect_data(&conn).await?;
             Ok(name)
         })
     }
@@ -279,28 +268,18 @@ fn catalog_check_error(e: &CheckFailure, budget: std::time::Duration, outcome: &
 }
 
 /// The pool that holds the data relations: the data database the catalog
-/// names, as `extenddb init` records it. The connection string is read as
-/// `test_data_database_connection` reads it: in a catalog with a key ring
-/// the row is encrypted, and `key` opens it (RFC-0000 section 12).
+/// names, as `extenddb init` records it.
 ///
 /// A catalog without the setting, or with an empty one, is refused: the data
 /// relations could then only be looked for in the catalog's own database, a
 /// layout `init` does not create, where another deployment's relations can
-/// sit unnamed by this catalog.
-///
-/// Statement logging is off, so a drop that waits out its lock timeout does
-/// not print a slow-statement line in the middle of the command's report.
+/// sit unnamed by this catalog. A row the key does not open is refused in
+/// the same way, so the command prints the refusal on its own.
 async fn data_pool(
     catalog: &PgPool,
     key: extenddb_storage::server_components::KeySource,
 ) -> DiagResult<PgPool> {
-    // `data_connection_string` reads the catalog's rows only, so the
-    // target's data database name is not used. A row the key does not open
-    // is refused as the absent setting is, so the command prints the refusal
-    // on its own.
-    let target = crate::migrations::PostgresTarget::new((*catalog.connect_options()).clone(), "")
-        .with_key_source(key, false);
-    let conn = crate::migrations::data_connection_string(&target)
+    let conn = data_connection_row(catalog, key)
         .await
         .map_err(|e| match e {
             extenddb_storage::migrations::MigrationError::Refused(refusal) => {
@@ -313,6 +292,26 @@ async fn data_pool(
             "No data database connection string in settings. Run `extenddb init`.".to_owned(),
         ));
     };
+    connect_data(&conn).await
+}
+
+/// The catalog's `data_database_connection_string` row as the server reads
+/// it: in a catalog with a key ring the row is encrypted, and `key` opens it
+/// (RFC-0000 section 12). The read takes only the catalog's rows, so the
+/// target needs no data database name.
+async fn data_connection_row(
+    catalog: &PgPool,
+    key: extenddb_storage::server_components::KeySource,
+) -> Result<Option<zeroize::Zeroizing<String>>, extenddb_storage::migrations::MigrationError> {
+    let target = crate::migrations::PostgresTarget::new((*catalog.connect_options()).clone(), "")
+        .with_key_source(key, false);
+    crate::migrations::data_connection_string(&target).await
+}
+
+/// A pool on the data database at `conn`. Statement logging is off, so a
+/// drop that waits out its lock timeout does not print a slow-statement line
+/// in the middle of the command's report.
+async fn connect_data(conn: &str) -> DiagResult<PgPool> {
     let options = conn
         .parse::<sqlx::postgres::PgConnectOptions>()
         .map_err(|e| DiagError::ConnectionFailed(e.to_string()))?;
