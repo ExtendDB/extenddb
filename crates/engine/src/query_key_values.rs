@@ -88,10 +88,11 @@ const SELECT: &[&str] = &[
 ///
 /// The checks read the raw body, so a field that does not deserialize (an
 /// invalid `Select`, for one) does not stop the ones before it. When a check
-/// fails, the body is deserialized as a [`QueryInput`], and a
-/// `SerializationException` from that (a field of the wrong JSON shape
-/// anywhere in the body) is the answer instead, as the service reports a shape
-/// fault ahead of every validation (measured 2026-10-25: a `Limit` of 0 with a
+/// fails, each member of the body is deserialized on its own as part of a
+/// [`QueryInput`] (see `shape_fault_first`), and a `SerializationException`
+/// from that (a member of the wrong JSON type, in any member order) is the
+/// answer instead, as the service reports a shape fault ahead of every
+/// validation (measured 2026-10-25: a `Limit` of 0 with a
 /// string `ExpressionAttributeValues`, a string `ExpressionAttributeNames` with
 /// an `N` value that is not a number, and a `Limit` of 0 with `Select: 5` all
 /// answer `SerializationException`). A `ValidationException` the deserializer
@@ -123,30 +124,98 @@ pub fn validate_query_request_body(body: &Value) -> Result<(), DynamoDbError> {
 }
 
 /// When a request-time check has failed with `check`, the deserializer's
-/// `SerializationException` for `body` if there is one, else `check`. The two
-/// enum fields stay in the body: an enum value that is a string but not a
-/// member deserializes to a `ValidationException`, which this ignores, and one
-/// of another JSON type is a shape fault the service reports ahead of the
-/// checks (measured 2026-10-25: `Select: 5` with a `Limit` of 0 answers
-/// `SerializationException: NUMBER_VALUE cannot be converted to String`).
+/// `SerializationException` for a member of `body` if there is one, else
+/// `check`. The service reports a member of the wrong JSON type ahead of the
+/// checks whatever the member order (measured 2026-11-23, each body twice:
+/// `Select: 5` beside `{"X": "1"}` or an empty `NS`, and `{"S": 5}` after an
+/// empty `NS` in another value, each with a `Limit` of 0, answer
+/// `SerializationException: NUMBER_VALUE cannot be converted to String` on
+/// `Query`, and the first of them on `Scan` too). So each member is
+/// deserialized on its own as a `T`, beside the body's `TableName` (the one
+/// member `T` must have), and each `ExpressionAttributeValues` entry on its
+/// own. The answer is the first shape fault in the map's iteration order (see
+/// [`first_fault`]). Inside one member or entry, the deserializer stops at the
+/// first fault.
 ///
-/// An AttributeValue with an unknown type descriptor is not a shape fault to
-/// the service: `Limit: 0` beside `{"X": "1"}` answers the `Limit`
-/// `ValidationException` (measured 2026-10-25), so the deserializer's
-/// `SerializationException` for that message does not preempt the check.
+/// These are not shape faults here:
+///
+/// - an enum value that is a string but not a member, which deserializes to a
+///   `ValidationException`. One of another JSON type is a shape fault
+///   (measured 2026-10-25: `Select: 5` with a `Limit` of 0 answers
+///   `SerializationException: NUMBER_VALUE cannot be converted to String`);
+/// - an AttributeValue with an unknown type descriptor, a value the service
+///   cannot read as one type: `Limit: 0` beside `{"X": "1"}` answers the
+///   `Limit` `ValidationException` (measured 2026-10-25 and 2026-11-23);
+/// - a member the service reads from a JSON type that `T` refuses: a string
+///   in `ConsistentRead` or `ScanIndexForward` that the service reads as a
+///   boolean (see [`BOOLEAN_TEXTS`]), and any number in `Limit`. Measured
+///   2026-11-23: `ConsistentRead: "true"` or `"T"`, `ScanIndexForward:
+///   "true"` or `"0"`, and `Limit: 1.5` beside `Select: "NOPE"` answer the
+///   `Select` text on `Query`, as `ConsistentRead: "true"` does on `Scan`, and
+///   `ConsistentRead: "yes"` with a table that does not exist answers
+///   `ResourceNotFoundException`. `ConsistentRead: "on"` answers
+///   `SerializationException: Unexpected token received from parser`, and
+///   `ConsistentRead: 1` `SerializationException: NUMBER_VALUE cannot be
+///   converted to Boolean`. The handler's own deserialization still refuses
+///   every string in these members.
 pub(crate) fn shape_fault_first<T: DeserializeOwned>(
     body: &Value,
     check: DynamoDbError,
 ) -> DynamoDbError {
-    match serde_json::from_value::<T>(body.clone()) {
-        Err(e) => match crate::deserialize_error(e) {
-            DynamoDbError::SerializationException(msg) if msg.contains(UNKNOWN_TYPE_DESCRIPTOR) => {
-                check
+    let read = |name: &str, value: Value| {
+        let mut one: Map<String, Value> = body
+            .get("TableName")
+            .map(|table_name| ("TableName".to_owned(), table_name.clone()))
+            .into_iter()
+            .collect();
+        one.insert(name.to_owned(), value);
+        shape_fault::<T>(Value::Object(one))
+    };
+    body.as_object()
+        .into_iter()
+        .flatten()
+        .find_map(|(name, value)| match (name.as_str(), value) {
+            ("ConsistentRead" | "ScanIndexForward", Value::String(text))
+                if BOOLEAN_TEXTS
+                    .iter()
+                    .any(|word| word.eq_ignore_ascii_case(text)) =>
+            {
+                None
             }
-            shape @ DynamoDbError::SerializationException(_) => shape,
-            _ => check,
-        },
-        Ok(_) => check,
+            ("Limit", Value::Number(_)) => None,
+            ("ExpressionAttributeValues", Value::Object(entries)) => {
+                entries.iter().find_map(|(key, entry)| {
+                    read(
+                        name,
+                        Value::Object(Map::from_iter([(key.clone(), entry.clone())])),
+                    )
+                })
+            }
+            _ => read(name, value.clone()),
+        })
+        .unwrap_or(check)
+}
+
+/// The strings the service reads as a boolean, in any ASCII case: the first
+/// five as true, the others as false. It refuses every other string with
+/// `SerializationException`. Measured 2026-11-10 for each of them in
+/// `UpdateContinuousBackups` `PointInTimeRecoveryEnabled`, 2026-11-11 for
+/// `"yes"` and `"TRUE"` in `GetItem` `ConsistentRead` and `"no"` in `Query`
+/// `ScanIndexForward`, and 2026-11-23 on `Query` for `"T"`, `"0"` and the
+/// refused `"on"`.
+const BOOLEAN_TEXTS: [&str; 10] = ["true", "t", "yes", "y", "1", "false", "f", "no", "n", "0"];
+
+/// The deserializer's `SerializationException` for `body` as a `T`, unless it
+/// is the one for an AttributeValue with an unknown type descriptor.
+fn shape_fault<T: DeserializeOwned>(body: Value) -> Option<DynamoDbError> {
+    match serde_json::from_value::<T>(body).map_err(crate::deserialize_error) {
+        Err(DynamoDbError::SerializationException(msg))
+            if msg.contains(UNKNOWN_TYPE_DESCRIPTOR) =>
+        {
+            None
+        }
+        Err(shape @ DynamoDbError::SerializationException(_)) => Some(shape),
+        _ => None,
     }
 }
 
