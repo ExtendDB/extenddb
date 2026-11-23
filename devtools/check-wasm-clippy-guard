@@ -1671,9 +1671,9 @@ CONFIG_CONTROLS = {
 # For probe_dependencies, with the build: a library in two versions, the
 # adapter's package under another library name (check adds it), and a path
 # of each and of a crate no package has. The control crates' names hold
-# ": ", which rustc refuses in a crate name, so no library of a tree that
-# compiles is taken for one of them, and no probe path of the tree is one of
-# these.
+# ": ", which rustc refuses in a crate name, so no library that the
+# adapter's wasm32 build compiles is taken for one of them, and no probe's
+# path is one of these paths.
 CONTROL_BUILD = [
     {"id": f"twice {version}", "name": "twice", "version": version}
     | {"targets": [{"name": "control: twice", "kind": ["lib"]}]}
