@@ -29,6 +29,34 @@ use super::syntax_error::{is_operator_or_keyword, syntax_error};
 use super::tokenizer::Token;
 use crate::error::DynamoDbError;
 
+/// Why the condition parser refused a token stream. A caller that reads a
+/// key condition with the condition grammar first keeps a `Syntax` refusal
+/// and leaves any other refusal to the key condition parser, which reports
+/// it in its own words.
+#[derive(Debug)]
+pub enum ConditionFault {
+    /// A repeated or misplaced operator, keyword or path, worded as the
+    /// service words it (`Syntax error; token: "=", near: "= = :v"`).
+    Syntax(DynamoDbError),
+    /// Any other refusal: redundant parentheses, the nesting depth, a bare
+    /// operand, a token the grammar has no rule for.
+    Other(DynamoDbError),
+}
+
+impl From<ConditionFault> for DynamoDbError {
+    fn from(fault: ConditionFault) -> Self {
+        match fault {
+            ConditionFault::Syntax(err) | ConditionFault::Other(err) => err,
+        }
+    }
+}
+
+impl From<DynamoDbError> for ConditionFault {
+    fn from(err: DynamoDbError) -> Self {
+        Self::Other(err)
+    }
+}
+
 /// Parse a condition expression token stream into an AST.
 ///
 /// # Errors
@@ -63,6 +91,21 @@ pub fn parse_condition_from(
     source: &str,
     max_depth: usize,
 ) -> Result<Expr, DynamoDbError> {
+    parse_condition_classified(tokens, source, max_depth).map_err(DynamoDbError::from)
+}
+
+/// Parse as [`parse_condition_from`] does, and tell a syntax error in the
+/// service's wording apart from the parser's other refusals.
+///
+/// # Errors
+///
+/// Returns [`ConditionFault::Syntax`] for a repeated or misplaced operator,
+/// keyword or path, and [`ConditionFault::Other`] for every other refusal.
+pub fn parse_condition_classified(
+    tokens: &[Token],
+    source: &str,
+    max_depth: usize,
+) -> Result<Expr, ConditionFault> {
     parser_common::check_redundant_parens(tokens)
         .map_err(|body| validation_err(&format!("Invalid ConditionExpression: {body}")))?;
     let mut pos = 0;
@@ -75,7 +118,7 @@ pub fn parse_condition_from(
         if is_operator_or_keyword(&tokens[pos])
             || matches!(tokens[pos], Token::Ident(_) | Token::NameRef(_))
         {
-            return Err(syntax_error(ExpressionKind::Condition, source, tokens, pos));
+            return Err(syntax_fault(source, tokens, pos));
         }
         return Err(validation_err(&format!(
             "Invalid ConditionExpression: unexpected token at position {pos}"
@@ -90,7 +133,7 @@ fn parse_or(
     pos: &mut usize,
     depth: &mut usize,
     max_depth: usize,
-) -> Result<Expr, DynamoDbError> {
+) -> Result<Expr, ConditionFault> {
     let mut left = parse_and(tokens, src, pos, depth, max_depth)?;
     while *pos < tokens.len() && tokens[*pos] == Token::Or {
         *pos += 1;
@@ -106,7 +149,7 @@ fn parse_and(
     pos: &mut usize,
     depth: &mut usize,
     max_depth: usize,
-) -> Result<Expr, DynamoDbError> {
+) -> Result<Expr, ConditionFault> {
     let mut left = parse_not(tokens, src, pos, depth, max_depth)?;
     while *pos < tokens.len() && tokens[*pos] == Token::And {
         *pos += 1;
@@ -122,7 +165,7 @@ fn parse_not(
     pos: &mut usize,
     depth: &mut usize,
     max_depth: usize,
-) -> Result<Expr, DynamoDbError> {
+) -> Result<Expr, ConditionFault> {
     if *pos < tokens.len() && tokens[*pos] == Token::Not {
         *pos += 1;
         *depth += 1;
@@ -144,7 +187,7 @@ fn parse_primary(
     pos: &mut usize,
     depth: &mut usize,
     max_depth: usize,
-) -> Result<Expr, DynamoDbError> {
+) -> Result<Expr, ConditionFault> {
     if *pos >= tokens.len() {
         if tokens.is_empty() {
             return Err(validation_err(
@@ -153,7 +196,7 @@ fn parse_primary(
         }
         // Input ends where a condition is required (`#v = :v AND`): measured
         // 2026-10-25 as token "<EOF>" with the last token as the window.
-        return Err(syntax_error(ExpressionKind::Condition, src, tokens, *pos));
+        return Err(syntax_fault(src, tokens, *pos));
     }
 
     // Parenthesized expression
@@ -217,7 +260,7 @@ fn parse_primary(
             // "IN", near "IN IN ("; `#v IN :v` token ":v"; `#v IN` token
             // "<EOF>", near "IN").
             if tokens.get(*pos) != Some(&Token::LParen) {
-                return Err(syntax_error(ExpressionKind::Condition, src, tokens, *pos));
+                return Err(syntax_fault(src, tokens, *pos));
             }
             *pos += 1;
             let mut list = vec![parse_operand(tokens, src, pos, depth, max_depth)?];
@@ -245,10 +288,10 @@ fn parse_operand(
     pos: &mut usize,
     depth: &mut usize,
     max_depth: usize,
-) -> Result<Expr, DynamoDbError> {
+) -> Result<Expr, ConditionFault> {
     if *pos >= tokens.len() {
         // Input ends where an operand is required (`#v = :v AND NOT`).
-        return Err(syntax_error(ExpressionKind::Condition, src, tokens, *pos));
+        return Err(syntax_fault(src, tokens, *pos));
     }
 
     match &tokens[*pos] {
@@ -282,9 +325,7 @@ fn parse_operand(
         }
         // An operator or keyword where an operand is required (`#v = = :v`,
         // `#v = :v AND AND #v = :v`, `AND #v = :v`): measured 2026-10-25.
-        token if is_operator_or_keyword(token) => {
-            Err(syntax_error(ExpressionKind::Condition, src, tokens, *pos))
-        }
+        token if is_operator_or_keyword(token) => Err(syntax_fault(src, tokens, *pos)),
         _ => Err(validation_err(
             "Invalid ConditionExpression: expected attribute path or value placeholder",
         )),
@@ -297,7 +338,7 @@ fn parse_function_call(
     pos: &mut usize,
     depth: &mut usize,
     max_depth: usize,
-) -> Result<Expr, DynamoDbError> {
+) -> Result<Expr, ConditionFault> {
     let name = match &tokens[*pos] {
         Token::Ident(n) => n.to_ascii_lowercase(),
         _ => {
@@ -343,8 +384,13 @@ fn is_function_name(name: &str) -> bool {
     )
 }
 
-fn validation_err(msg: &str) -> DynamoDbError {
-    DynamoDbError::ValidationException(msg.to_owned())
+fn validation_err(msg: &str) -> ConditionFault {
+    ConditionFault::Other(DynamoDbError::ValidationException(msg.to_owned()))
+}
+
+/// The service's syntax error at `pos`, as a [`ConditionFault::Syntax`].
+fn syntax_fault(src: &str, tokens: &[Token], pos: usize) -> ConditionFault {
+    ConditionFault::Syntax(syntax_error(ExpressionKind::Condition, src, tokens, pos))
 }
 
 #[cfg(test)]
@@ -607,5 +653,50 @@ mod tests {
                 "{case}: got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_classified_parse_tells_a_syntax_error_from_the_other_refusals() {
+        // The syntax variant carries the service's wording; every other
+        // refusal is the other variant with the parser's own text.
+        for (src, token, near) in [
+            ("#v = = :v", "=", "= = :v"),
+            ("#v = :v AND", "<EOF>", "AND"),
+            ("#v = :v #v = :v", "#v", ":v #v ="),
+            ("= #v = :v", "=", "= #v"),
+            ("#v IN :v", ":v", "IN :v"),
+        ] {
+            let fault = parse_condition_classified(&tokenize(src).unwrap(), src, 150).unwrap_err();
+            let want = format!(
+                "Invalid ConditionExpression: Syntax error; token: \"{token}\", near: \"{near}\""
+            );
+            assert!(
+                matches!(&fault, ConditionFault::Syntax(DynamoDbError::ValidationException(msg))
+                    if *msg == want),
+                "{src}: got {fault:?}"
+            );
+        }
+        for (src, text) in [
+            ("((#v = :v))", "The expression has redundant parentheses;"),
+            ("#v", "expected comparison operator or function call"),
+            ("(#v = :v", "expected ')'"),
+            ("#v = :v, #v = :v", "unexpected token at position 3"),
+        ] {
+            let fault = parse_condition_classified(&tokenize(src).unwrap(), src, 150).unwrap_err();
+            let want = format!("Invalid ConditionExpression: {text}");
+            assert!(
+                matches!(&fault, ConditionFault::Other(DynamoDbError::ValidationException(msg))
+                    if *msg == want),
+                "{src}: got {fault:?}"
+            );
+        }
+        // Depth is the other variant too, with the depth limit of the call.
+        let src = "NOT NOT #v = :v";
+        let fault = parse_condition_classified(&tokenize(src).unwrap(), src, 1).unwrap_err();
+        assert!(
+            matches!(&fault, ConditionFault::Other(DynamoDbError::ValidationException(msg))
+                if msg == "Invalid ConditionExpression: expression nesting depth exceeded"),
+            "got {fault:?}"
+        );
     }
 }

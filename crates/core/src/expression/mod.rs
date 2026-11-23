@@ -39,7 +39,10 @@ pub use key_condition::{
 pub use kind::ExpressionKind;
 pub use operand_check::validate_placeholders_and_operands;
 pub use operator_count::{MAX_EXPRESSION_OPERATORS, count_operators, validate_operator_count};
-pub use parser::{parse_condition, parse_condition_from, parse_condition_with_depth_limit};
+pub use parser::{
+    ConditionFault, parse_condition, parse_condition_classified, parse_condition_from,
+    parse_condition_with_depth_limit,
+};
 pub use projection::{Projection, parse_projection, parse_projection_from};
 pub use reserved_words::validate_no_reserved_words;
 pub use resolver::{
@@ -52,7 +55,7 @@ pub use search_condition::{
     SearchCondition, validate_conditions_against_search_schema,
     validate_search_condition_expression,
 };
-pub use syntax_error::{is_operator_or_keyword, is_syntax_error, syntax_error, token_text};
+pub use syntax_error::{is_operator_or_keyword, syntax_error, token_text};
 pub use tokenizer::{Token, tokenize, tokenize_for, tokenize_with_limit};
 pub use update_evaluator::apply_update_validated;
 pub use update_parser::{parse_update, parse_update_from};
