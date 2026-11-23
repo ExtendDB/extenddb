@@ -434,7 +434,7 @@ fn an_at_sign_must_have_a_name_after_it() {
             "Unsupported data type: a under key root at 1:50:1",
         ),
         // With an `@` before them or none, the service refuses `"b"` and `a.b`
-        // as item values with texts ExtendDB does not give.
+        // as item values with the same texts.
         ("INSERT INTO <T> VALUE {'pk': 'q', 'a': @\"b\"}", name),
         ("INSERT INTO <T> VALUE {'pk': 'q', 'a': @a.b}", name),
         // The other places where an operand or an alias starts.
@@ -499,8 +499,7 @@ fn an_at_sign_must_have_a_name_after_it() {
             "INSERT INTO <T> VALUE {'pk': 'q', 'm': {@a: 1}}",
             "Tuple keys must be of type String. Actual type: Id under root at 1:61:1",
         ),
-        // The service gives `<<a>>` and `<<@a>>` the Bag text, at the name;
-        // ExtendDB gives a name in a bag the name's own text (#1383).
+        // The service gives `<<a>>` and `<<@a>>` the Bag text, at the name.
         ("INSERT INTO <T> VALUE {'pk': 'q', 's': <<@a>>}", name),
         (
             "INSERT INTO <T> VALUE @a",

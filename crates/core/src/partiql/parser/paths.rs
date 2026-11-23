@@ -217,7 +217,11 @@ impl Parser {
                 let (step, _) = self.refuse_bracket(&at);
                 Ok((step, false))
             }
-            TokenKind::RBracket => Err(ParseError::well_formed("Unexpected term")),
+            // (measured 2026-11-23: `}`, `)`, `>>` and a comma in the
+            // brackets, as in `m[} = 1`, `m[) = 1`, `SET m[} = 1`, `REMOVE
+            // m[}`, `SELECT m[}` and `b[,]` in an INSERT value, are
+            // "Unexpected term")
+            _ if self.at_closing_token() => Err(self.term_error()),
             _ => Err(ParseError::new(format!(
                 "Unexpected path component at {at}"
             ))),
@@ -267,7 +271,7 @@ impl Parser {
 
     /// Whether a path starts at the current token: a name, a string or a
     /// quoted name with a dot or a bracket after it.
-    fn path_starts_here(&self) -> bool {
+    pub(super) fn path_starts_here(&self) -> bool {
         let first = match &self.peek().kind {
             TokenKind::String(_) | TokenKind::QuotedIdent(_) => true,
             TokenKind::Ident(word) => word_class(word) == WordClass::Name,

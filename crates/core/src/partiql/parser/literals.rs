@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::limits::{MAX_LITERAL_NESTING, Nest, literal_nesting_refusal};
-use super::{BAG_MEMBER_TYPES, LITERAL_ROOT, PResult, ParseError, Parser};
+use super::{BAG_MEMBER_TYPES, LITERAL_ROOT, PResult, ParseError, Parser, terms};
 use crate::partiql::ast::Operand;
 use crate::partiql::lexer::{TokenKind, WordClass, word_class};
 use crate::types::AttributeValue;
@@ -107,22 +107,17 @@ impl Parser {
                     Operand::Parameter(self.take_param_index())
                 } else if !at_sign && let Some(refusal) = self.function_as_item_value() {
                     return Err(refusal);
-                } else if let TokenKind::Ident(name) = &self.peek().kind
-                    && (self.at_name_in_literal(name)
-                        || (at_sign && self.nth_kind(1) == Some(&TokenKind::LParen)))
+                } else if self.at_name_in_literal()
+                    || (at_sign && self.at_name() && self.nth_kind(1) == Some(&TokenKind::LParen))
                 {
                     // A name as the whole value is refused naming itself
                     // (measured 2026-11-02: `{'pk': pk}` is "Unsupported
                     // data type: pk under key root"), also with `(` after a
                     // name after `@`, which the map then refuses as a
                     // missing `}` (measured 2026-11-23 with `{'pk': 'q', 'a':
-                    // @foo(b)}`).
-                    let refusal = format!(
-                        "Unsupported data type: {name} under key {LITERAL_ROOT} at {}",
-                        self.span()
-                    );
-                    self.bump();
-                    self.defer(&refusal);
+                    // @foo(b)}`). So are a quoted name and a path (see
+                    // [`Parser::refuse_name_in_literal`]).
+                    self.refuse_name_in_literal(LITERAL_ROOT, true)?;
                     Operand::Literal(AttributeValue::Null)
                 } else {
                     Operand::Literal(self.literal_value(LITERAL_ROOT)?)
@@ -184,18 +179,30 @@ impl Parser {
         // echoes the whole collection ("Input collection [a, a] ...").
         let mut members: Vec<String> = Vec::new();
         if !matches!(self.peek().kind, TokenKind::RDoubleAngle) {
+            let mut first = true;
             loop {
-                let at = self.span();
-                // A parameter as a member parses and is refused at its
-                // position (measured 2026-11-02 with `<<?>>`).
-                if matches!(self.peek().kind, TokenKind::Param) {
-                    self.bump();
+                // A member that is neither a number nor a string parses and
+                // is refused at its first token after any `@`, once the
+                // statement parses (measured 2026-11-02 with `<<?>>`,
+                // 2026-11-13 with `<<true>>`, and 2026-11-23: `{'s':
+                // <<true>>, 'c': }` is "Unexpected term"). As the first
+                // member so is a name, a quoted name or a path (measured
+                // 2026-11-23 with `<<a>>`, `<<@a>>`, `<<"a">>`, `<<a.b>>`,
+                // `<<a, 1>>` and `<<?, 1>>` in INSERT values, SET values and
+                // WHERE literals), ahead of what its steps hold. After a
+                // number or a string, a name or a parameter gets its own
+                // refusal from `literal_value` (measured 2026-11-23: `<<1,
+                // a>>` is "Unsupported data type: Id under key root" and `<<1,
+                // ?>>` the same with Parameter, at the member).
+                let refusal = format!("{BAG_MEMBER_TYPES} at {}", self.span());
+                self.eat_at_sign()?;
+                if first && self.eat(&TokenKind::Param) {
                     self.take_param_index();
-                    self.defer(&format!("{BAG_MEMBER_TYPES} at {at}"));
+                    self.defer(&refusal);
+                } else if first && self.at_name_in_literal() {
+                    self.defer(&refusal);
+                    self.path()?;
                 } else {
-                    // A member that is neither is refused at its position
-                    // (measured 2026-11-13: `<<true>>` in an INSERT value
-                    // names the `true`).
                     match self.literal_value(path)? {
                         AttributeValue::S(s) => {
                             saw_string = true;
@@ -207,9 +214,10 @@ impl Parser {
                             numbers.insert(n.clone());
                             members.push(n);
                         }
-                        _ => return Err(ParseError::new(format!("{BAG_MEMBER_TYPES} at {at}"))),
+                        _ => self.defer(&refusal),
                     }
                 }
+                first = false;
                 if !self.eat(&TokenKind::Comma) {
                     break;
                 }
@@ -240,10 +248,11 @@ impl Parser {
         }
     }
 
-    /// A literal value in a map/list/bag position (no paths), at `path` inside
-    /// the value being read. A value inside [`MAX_LITERAL_NESTING`] maps and
-    /// lists is refused once the statement parses, naming its path; the
-    /// first such value in the statement is named.
+    /// A literal value in a map/list/bag position, at `path` inside the value
+    /// being read; a name there is refused (see
+    /// [`Parser::at_name_in_literal`]). A value inside [`MAX_LITERAL_NESTING`]
+    /// maps and lists is refused once the statement parses, naming its path;
+    /// the first such value in the statement is named.
     pub(super) fn literal_value(&mut self, path: &str) -> PResult<AttributeValue> {
         if self.nesting.containers >= MAX_LITERAL_NESTING {
             self.defer(&literal_nesting_refusal(path));
@@ -276,10 +285,14 @@ impl Parser {
             TokenKind::LBrace => Ok(AttributeValue::M(self.map_literal(path)?)),
             TokenKind::LBracket => Ok(AttributeValue::L(self.list_literal(path)?)),
             TokenKind::LDoubleAngle => self.bag_literal(path),
-            TokenKind::Ident(name) if self.at_name_in_literal(&name) => {
-                self.refuse_name_in_literal(path);
+            _ if self.at_name_in_literal() => {
+                self.refuse_name_in_literal(path, false)?;
                 Ok(AttributeValue::Null)
             }
+            // (measured 2026-11-23 in INSERT values, SET values and WHERE
+            // literals: `{'pk': }`, `[}`, `[1, , 2]`, `[)]`, `{'x': )}`,
+            // `<<1,>>`, `{'x': >>}`, `[,]` and `()` are "Unexpected term")
+            _ if self.at_closing_token() => Err(self.term_error()),
             TokenKind::Ident(name) => {
                 let l = name.to_ascii_lowercase();
                 self.bump();
@@ -310,15 +323,19 @@ impl Parser {
         Ok(value)
     }
 
-    /// Whether the current token, the word `word`, is a name standing alone
-    /// inside a literal. A name that starts a path or a call is not measured
-    /// there, and keeps the syntax error.
-    pub(super) fn at_name_in_literal(&self, word: &str) -> bool {
-        word_class(word) == WordClass::Name
-            && !matches!(
-                self.tokens.get(self.pos + 1).map(|t| &t.kind),
-                Some(TokenKind::Dot | TokenKind::LBracket | TokenKind::LParen)
-            )
+    /// Whether the current token starts a name that a literal refuses (see
+    /// [`Parser::refuse_name_in_literal`]): a name or a quoted name, standing
+    /// alone or as the first step of a path (measured 2026-11-23 in INSERT
+    /// values, SET values and WHERE literals). A call keeps the syntax error
+    /// here, where DynamoDB names it (measured 2026-11-23: `[foo(1)]` is
+    /// "Unsupported data type: Call under key root[0]").
+    pub(super) fn at_name_in_literal(&self) -> bool {
+        let named = match &self.peek().kind {
+            TokenKind::Ident(word) => word_class(word) == WordClass::Name,
+            TokenKind::QuotedIdent(_) => true,
+            _ => false,
+        };
+        named && self.nth_kind(1) != Some(&TokenKind::LParen)
     }
 
     /// Refuse `key`, a key of the map at `path` that a member before it
@@ -344,16 +361,28 @@ impl Parser {
         ));
     }
 
-    /// Read a name inside a literal, at `path` inside the value: it parses
-    /// and is refused at its position (measured 2026-11-02: in `a IN ((pk,
-    /// 1))` the `pk` is root[0]). The value read stands in for it and is
-    /// never used. Kept out of [`Parser::literal_value`], which nests.
-    fn refuse_name_in_literal(&mut self, path: &str) {
-        let at = self.span();
-        self.bump();
+    /// Read a name inside a literal (see [`Parser::at_name_in_literal`] and
+    /// [`Parser::term_in_parentheses`]), at `path` inside the value: it
+    /// parses and is refused at its first token (measured 2026-11-02: in `a
+    /// IN ((pk, 1))` the `pk` is root[0]), as an Id, or as a Path when steps
+    /// follow it. As the whole of an INSERT item value (`whole`) it is named
+    /// by itself, or PATH (measured 2026-11-23: in `{'pk': 'q', 'a': "b"}`
+    /// the `"b"` is b, and `b.c`, `b[0]` and `"b".c` are PATH). The refusal
+    /// comes ahead of any in the steps, which are not measured. The value
+    /// read stands in for it and is never used. Kept out of
+    /// [`Parser::literal_value`], which nests.
+    pub(super) fn refuse_name_in_literal(&mut self, path: &str, whole: bool) -> PResult<()> {
+        let what = match (self.path_starts_here(), whole) {
+            (true, true) => "PATH".to_owned(),
+            (true, false) => "Path".to_owned(),
+            (false, true) => terms::token_text(&self.peek().kind),
+            (false, false) => "Id".to_owned(),
+        };
         self.defer(&format!(
-            "Unsupported data type: Id under key {path} at {at}"
+            "Unsupported data type: {what} under key {path} at {}",
+            self.span()
         ));
+        self.path().map(drop)
     }
 }
 

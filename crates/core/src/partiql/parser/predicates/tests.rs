@@ -401,6 +401,12 @@ fn a_name_in_a_bag_after_in_is_an_operand() {
         where_of("SELECT * FROM \"t\" WHERE a IN <<pk, 1>>"),
         WhereExpr::In(path("a"), vec![path("pk"), number("1")])
     );
+    // So is a quoted name (measured 2026-11-23: `a IN <<"pk">>` on a table
+    // that does not exist is refused for the missing table).
+    assert_eq!(
+        where_of("SELECT * FROM \"t\" WHERE a IN <<\"pk\", 1>>"),
+        WhereExpr::In(path("a"), vec![path("pk"), number("1")])
+    );
 }
 
 #[test]
@@ -420,11 +426,6 @@ fn a_quoted_name_a_path_or_a_call_in_a_list_in_parentheses_is_refused_at_its_pos
             "{members}"
         );
     }
-    // In a list in brackets they are not measured.
-    assert_eq!(
-        err("SELECT * FROM \"t\" WHERE a = [\"pk\"]"),
-        wf("Expected a literal value")
-    );
 }
 
 #[test]

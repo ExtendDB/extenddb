@@ -315,11 +315,14 @@ impl Parser {
     /// (("pk", 1))`, `a IN ((m.b, 1))` and `a IN ((foo(b), 1))` the first
     /// member is refused as an Id, a Path and a Call under root[0], at the
     /// first token). Returns false, having read nothing, for any other
-    /// element; a name alone is refused by [`Parser::literal_value`]. In a
-    /// list in brackets these are not measured. A name after `@` is never
-    /// called (see [`Parser::eat_at_sign`]), and is refused at the name
-    /// (measured 2026-11-23: `((@m.b, 1))` and `((@"pk", 1))` are a Path and
-    /// an Id at the name, and `((@foo(b), 1))` is "Expected RIGHT_PAREN").
+    /// element; a name alone is refused by [`Parser::literal_value`]. A
+    /// quoted name and a path are refused by
+    /// [`Parser::refuse_name_in_literal`], which also refuses them in a list
+    /// in brackets; a call in a list in brackets keeps the syntax error. A
+    /// name after `@` is never called (see
+    /// [`Parser::eat_at_sign`]), and is refused at the name (measured
+    /// 2026-11-23: `((@m.b, 1))` and `((@"pk", 1))` are a Path and an Id at
+    /// the name, and `((@foo(b), 1))` is "Expected RIGHT_PAREN").
     fn term_in_parentheses(&mut self, path: &str) -> PResult<bool> {
         let at_sign = self.eat_at_sign()?;
         let next = self.tokens.get(self.pos + 1).map(|t| &t.kind);
@@ -333,34 +336,27 @@ impl Parser {
                 &self.peek().kind,
                 TokenKind::Ident(w) if word_class(w) == WordClass::Name || is_function_keyword(w)
             );
-        let kind = match next {
-            Some(TokenKind::Dot | TokenKind::LBracket) if name => "Path",
-            Some(TokenKind::LParen) if callable => "Call",
-            _ if at_sign => "Id",
-            Some(TokenKind::LParen) => return Ok(false),
-            _ if matches!(self.peek().kind, TokenKind::QuotedIdent(_)) => "Id",
-            _ => return Ok(false),
-        };
-        self.defer(&format!(
-            "Unsupported data type: {kind} under key {path} at {}",
-            self.span()
-        ));
-        match kind {
-            "Path" => {
-                self.path()?;
-            }
-            "Call" => {
+        match next {
+            Some(TokenKind::Dot | TokenKind::LBracket) if name => {}
+            Some(TokenKind::LParen) if callable => {
+                self.defer(&format!(
+                    "Unsupported data type: Call under key {path} at {}",
+                    self.span()
+                ));
                 // What the arguments meet comes after the refusal.
                 self.bump();
                 let before = self.walk_part();
                 let args = self.call_args();
                 self.end_walk_part(before);
                 args?;
+                return Ok(true);
             }
-            _ => {
-                self.bump();
-            }
+            _ if at_sign => {}
+            Some(TokenKind::LParen) => return Ok(false),
+            _ if matches!(self.peek().kind, TokenKind::QuotedIdent(_)) => {}
+            _ => return Ok(false),
         }
+        self.refuse_name_in_literal(path, false)?;
         Ok(true)
     }
 
@@ -382,9 +378,7 @@ impl Parser {
                     let index = self.take_param_index();
                     self.walk_parameter(index);
                     Operand::Parameter(index)
-                } else if let TokenKind::Ident(w) = &self.peek().kind
-                    && self.at_name_in_literal(w)
-                {
+                } else if self.at_name_in_literal() {
                     Operand::Path(self.path()?)
                 } else {
                     Operand::Literal(self.literal_value(LITERAL_ROOT)?)
