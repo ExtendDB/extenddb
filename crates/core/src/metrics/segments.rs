@@ -67,14 +67,18 @@ struct Bucket {
 }
 
 impl Bucket {
-    fn add(&mut self, s: &LatencySegments) {
-        self.count += 1;
-        self.auth_us += s.auth_us;
-        self.authz_us += s.authz_us;
-        self.throttle_us += s.throttle_us;
-        self.dispatch_us += s.dispatch_us;
-        self.response_us += s.response_us;
-        self.total_us += s.total_us;
+    /// A bucket at `slot` that holds one request.
+    fn new(slot: u64, s: &LatencySegments) -> Self {
+        Self {
+            slot,
+            count: 1,
+            auth_us: s.auth_us,
+            authz_us: s.authz_us,
+            throttle_us: s.throttle_us,
+            dispatch_us: s.dispatch_us,
+            response_us: s.response_us,
+            total_us: s.total_us,
+        }
     }
 
     fn add_bucket(&mut self, b: &Bucket) {
@@ -122,7 +126,7 @@ impl Ring {
         {
             // The same slot, or a record behind the newest one, which the
             // clock read under the lock rules out: counted in the newest.
-            newest.add(segments);
+            newest.add_bucket(&Bucket::new(slot, segments));
             return;
         }
         let first_kept = (slot + 1).saturating_sub(self.slots());
@@ -135,12 +139,7 @@ impl Ring {
             let held = self.buckets.len();
             self.buckets.reserve_exact(held.max(1).min(self.len - held));
         }
-        let mut bucket = Bucket {
-            slot,
-            ..Bucket::default()
-        };
-        bucket.add(segments);
-        self.buckets.push_back(bucket);
+        self.buckets.push_back(Bucket::new(slot, segments));
     }
 
     /// Sums every bucket whose slot is at or after `first_slot` into `acc`.
