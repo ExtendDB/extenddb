@@ -406,9 +406,11 @@ there can leave copies on the stack, until later calls overwrite them, of the
 zero-padded key block, of the two SHA-256 states derived from it (together
 they compute the HMAC of any message under the key) and of the bytes of the
 message after its last whole 64-byte block (the message of `catalog_key_id` is
-the catalog key). Which of them a call leaves depends on the build profile,
-the caller and the length of the message; in a release build as in a dev
-build, a call can leave the states and the message bytes.
+the catalog key), and, in a release build, of the bytes of a key longer than
+64 bytes after its last whole 64-byte block. Which of them a call leaves
+depends on the build profile, the caller and the lengths of the message and
+the key; in a release build as in a dev build, a call can leave the states
+and the message bytes.
 
 The AES-256-GCM cipher that seals stored secrets (`seal` and `open` in
 `crates/core/src/crypto.rs`) compiles in too, but no request reaches it: the
@@ -487,6 +489,11 @@ every `RestoreTableToPointInTime` (`PointInTimeRecoveryUnavailableException`)
 and an `UpdateContinuousBackups` that enables point-in-time recovery
 (`ContinuousBackupsUnavailableException`) before any table is read, so a
 request naming a missing table gets the refusal too.
+
+The wasm workflow's clippy step refuses calls known to trap or hang on
+`wasm32` in the workspace crates this build compiles;
+`devtools/wasm-clippy/clippy.toml` lists them, and its header says what the
+step does not see.
 
 ### Checks the server makes that this build does not
 
