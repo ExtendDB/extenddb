@@ -598,7 +598,10 @@ passes, so check the output for skips; CI sets `EXTENDDB_TEST_PG_REQUIRED=1`,
 which turns a missing connection string into a failure. `EXTENDDB_TEST_PGVECTOR_CONNECTION_STRING`
 points the vector fixtures at a second server when the first has no
 pgvector. `migrations_tag_blobs` needs the release tags in your clone
-(`git fetch --tags`).
+(`git fetch --tags`). The engine's bulk put runner cases that hold on both
+backends (the `_on_postgres` tests) read the same variable and skip the
+same way: `cargo test -p extenddb-engine --lib bulk_put::` runs them, as
+CI's `run-postgres-storage-tests` job does.
 
 Two scripts check SQLite end to end with a release binary, as CI's
 `run-integration-sqlite` job runs them:
