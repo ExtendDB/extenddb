@@ -348,12 +348,30 @@ fn as_with_no_name_after_it_is_a_syntax_error() {
 }
 
 #[test]
-fn at_and_by_after_a_table_are_aliases() {
-    for sql in [
-        "SELECT * FROM \"t\" AT x WHERE pk = 'p'",
-        "SELECT * FROM \"t\" BY x WHERE pk = 'p'",
+fn at_and_by_after_a_table_take_a_name() {
+    // Measured 2026-11-23 on a table that does not exist, each statement
+    // twice, after `SELECT * FROM "t"`.
+    let at: &str = &wf("Expected identifier for AT-alias");
+    let by: &str = &wf("Expected identifier for BY-alias");
+    let as_alias: &str = &wf("Expected identifier for AS-alias");
+    for (rest, expected) in [
+        ("AT x WHERE pk = 'p'", "Aliasing is not supported"),
+        ("BY x WHERE pk = 'p'", "Aliasing is not supported"),
+        ("AT \"x\" WHERE pk = 'p'", "Aliasing is not supported"),
+        ("AT 1 WHERE pk = 'p'", at),
+        ("AT @x WHERE pk = 'p'", at),
+        ("AT WHERE pk = 'p'", at),
+        ("AT", at),
+        ("x AT 1 WHERE pk = 'p'", at),
+        ("at 1 WHERE pk = 'p'", at),
+        ("BY 1 WHERE pk = 'p'", by),
+        ("BY @x WHERE pk = 'p'", by),
+        ("by @x WHERE pk = 'p'", by),
+        ("BY", by),
+        ("AS @x WHERE pk = 'p'", as_alias),
     ] {
-        assert_eq!(err(sql), "Aliasing is not supported", "{sql}");
+        let sql = format!("SELECT * FROM \"t\" {rest}");
+        assert_eq!(err(&sql), expected, "{sql}");
     }
 }
 

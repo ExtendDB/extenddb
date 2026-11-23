@@ -510,17 +510,23 @@ impl Parser {
 
     /// The aliases a FROM source may carry: `AS` or a bare name, then `AT`
     /// and `BY` names, each refused like the first (measured 2026-11-02 with
-    /// `AT x` and `BY x` after the table). An alias on the table comes ahead
-    /// of the table name rule (measured 2026-11-02 with and without `AS`).
+    /// `AT x` and `BY x` after the table). `AT` and `BY` need a name after
+    /// them, a quoted one included; anything else, the end of the statement
+    /// included, is a syntax error that names the keyword in upper case
+    /// (measured 2026-11-23: `AT 1`, `at 1`, `AT @x` and `AT` at the end are
+    /// "Expected identifier for AT-alias", `BY 1` and `BY` at the end "...
+    /// BY-alias", and `AT "x"` is an alias).
+    /// An alias on the table comes ahead of the table name rule (measured
+    /// 2026-11-02 with and without `AS`).
     fn source_aliases(&mut self) -> PResult<()> {
         self.optional_alias()?;
         for word in ["AT", "BY"] {
-            if self.is_keyword(word)
-                && matches!(
-                    self.tokens.get(self.pos + 1).map(|t| &t.kind),
-                    Some(TokenKind::Ident(s)) if word_class(s) == WordClass::Name
-                )
-            {
+            if self.is_keyword(word) {
+                if !self.name_follows() {
+                    return Err(ParseError::well_formed(&format!(
+                        "Expected identifier for {word}-alias"
+                    )));
+                }
                 self.bump();
                 self.bump();
                 self.defer(ALIASING);
