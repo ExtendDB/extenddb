@@ -284,10 +284,17 @@ mod tests {
     fn files(dir: &Path) -> Vec<(String, Vec<u8>)> {
         std::fs::read_dir(dir)
             .expect("list the directory")
-            .map(|entry| {
+            .filter_map(|entry| {
                 let path = entry.expect("an entry").path();
-                let bytes = std::fs::read(&path).expect("read a file");
-                (path.display().to_string(), bytes)
+                // SQLite removes the WAL or shared-memory index when its last
+                // connection closes, which pool.close() can return before.
+                // Every overwrite truncates the WAL first, so a vanished WAL
+                // is empty here. Any other read error still fails the test.
+                match std::fs::read(&path) {
+                    Ok(bytes) => Some((path.display().to_string(), bytes)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => panic!("read a file: {e:?}"),
+                }
             })
             .collect()
     }
