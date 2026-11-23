@@ -32,6 +32,7 @@ mod gsi_updates;
 mod import_export;
 mod import_export_io;
 mod index_helpers;
+mod int32_member;
 mod item_authorizer;
 mod legacy_filter;
 mod list_tables;

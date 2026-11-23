@@ -156,12 +156,16 @@ impl Fixture {
 /// earliest not-yet-due row of its partition across all account keyspaces.
 ///
 /// The three accounts are numbered in the order a pass reads them.
-/// - Phase 1: account 0 holds one due row and rows due in 30 to 60 s.
-///   Account 1 holds rows due in 60 to 120 s. The earliest rows are in
+/// - Phase 1: account 0 holds one due row and rows due in 30 to 60 minutes.
+///   Account 1 holds rows due in 60 to 120 minutes. The earliest rows are in
 ///   account 0, which is not the last account a pass reads.
-/// - Phase 2: account 2 gets rows due in 15 to 30 s. Its queue was empty, so
+/// - Phase 2: account 2 gets rows due in 150 to 300 s. Its queue was empty, so
 ///   no earlier row holds them back. The earliest rows are now in account 2,
 ///   which is not the first account a pass reads.
+///
+/// The delays are far apart, so the order holds however long phase 1's puts,
+/// passes and queue reads take on a loaded host: account 2's rows are the
+/// earliest as long as phase 2 starts within 25 minutes of phase 1's rows.
 ///
 /// So a pass that keeps the next due time of the last keyspace it reads fails
 /// phase 1, and a pass that keeps the first keyspace's fails phase 2.
@@ -175,8 +179,8 @@ async fn pass_reads_images_of_due_rows_only_and_reports_earliest_due() {
     // Phase 1.
     f.queue(0, "due", 1, 1).await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    f.queue(0, "mid", ROWS_PER_BATCH, 60_000).await;
-    f.queue(1, "late", ROWS_PER_BATCH, 120_000).await;
+    f.queue(0, "mid", ROWS_PER_BATCH, 3_600_000).await;
+    f.queue(1, "late", ROWS_PER_BATCH, 7_200_000).await;
     let not_due_phase1 = 2 * ROWS_PER_BATCH;
 
     // The due row is applied in this pass; the rest stay queued.
@@ -197,7 +201,7 @@ async fn pass_reads_images_of_due_rows_only_and_reports_earliest_due() {
     f.check_next_due("phase 1", &batches, 0).await;
 
     // Phase 2.
-    f.queue(2, "soon", ROWS_PER_BATCH, 30_000).await;
+    f.queue(2, "soon", ROWS_PER_BATCH, 300_000).await;
     let batches = f.pass_every_worker().await;
     let payload_rows_read: usize = batches.iter().map(|b| b.payload_rows_read).sum();
     assert_eq!(

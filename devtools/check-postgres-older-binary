@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2026 ExtendDB contributors
 # SPDX-License-Identifier: Apache-2.0
-"""A PostgreSQL catalog this binary migrated, against the last 0.1.x image:
+"""A PostgreSQL catalog this binary migrated, against the 0.1.14 image:
 
     devtools/check-postgres-older-binary <extenddb binary> <admin URL> \\
         <released fixture directory> [image] [port]
@@ -14,7 +14,7 @@ catalog.sql and data.sql (crates/storage-postgres/tests/fixtures/released/).
 Two deployments: a fresh one from this binary's `init`, and the fixture
 loaded into new databases and upgraded with this binary's `migrate --yes`.
 On each, the image runs `verify`, then `migrate --yes`, then `serve`, and
-each must end as the last 0.1.x release does on a v1.0 catalog: `verify`
+each must end as the 0.1.14 release does on a migrated catalog: `verify`
 exits 1 and writes nothing, `migrate --yes` exits 0 and writes the catalog,
 and `serve` refuses and exits 1 by itself. For every run
 the script prints what changed in the settings rows, the ledgers and the
@@ -235,7 +235,7 @@ def check_case(label: str, d: Deployment, binary: str, image: str, name: str, wo
             continue
         code, out = run([binary, "migrate", "--config", config], env)
         report(
-            code == 5 and "a release before 1.0 wrote to this catalog" in out,
+            code == 5 and "a release before 0.1.15 wrote to this catalog" in out,
             f"exit {code}: {label}: after the image's {what}, migrate reports WrittenByOlderRelease",
             out,
         )
