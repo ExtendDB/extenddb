@@ -8,8 +8,8 @@ and separators plus ``_ . : / = + - @``, up to 128 UTF-16 code units for a key
 and 256 for a value. It refuses a key prefixed with ``aws:`` in any case, and,
 in a later check, a key that reads ``aws:`` once U+017F is read as ``s``. Every
 expected response in this file was measured against DynamoDB in us-east-1 on
-2026-10-24 or on 2026-11-20. ``test_tag_check_order.py`` holds the order of
-these checks against the ARN checks and the table definition.
+2026-10-24, 2026-11-20 or 2026-11-23. ``test_tag_check_order.py`` holds the
+order of these checks against the ARN checks and the table definition.
 
 The requests go through ``dynamodb_client_no_validation`` because botocore
 enforces the model's own 1-to-128 and 0-to-256 length bounds on the client, and
@@ -56,6 +56,7 @@ REJECTED_CHARACTERS = [
     "\U0001f600",
     "\u0301",
     "\u093e",
+    "\u200b",
     # Letters and digits that Unicode 14.0 to 17.0 assign.
     "\u0870",
     "\U00016ac0",
@@ -77,10 +78,14 @@ ACCEPTED_TAGS = [
     ("letter-unicode-13-arabic", "k\u08bey", "v\u08bex"),
     ("letter-unicode-13-yezidi", "k\U00010e80y", "v\U00010e80x"),
     ("letter-unicode-13-cjk", "k\U00030000y", "v\U00030000x"),
+    ("letter-titlecase", "k\u01c5y", "v\u01c5x"),
+    ("letter-modifier", "k\u02b0y", "v\u02b0x"),
     ("separator-no-break-space", "k\u00a0y", "v\u00a0x"),
     ("separator-line", "k\u2028y", "v\u2028x"),
+    ("separator-paragraph", "k\u2029y", "v\u2029x"),
     ("number-arabic-indic", "k\u0663y", "v\u0663x"),
     ("number-roman-numeral", "k\u2167y", "v\u2167x"),
+    ("number-superscript-two", "k\u00b2y", "v\u00b2x"),
     ("leading-space", " lead", " lead"),
     ("trailing-space", "trail ", "trail "),
     ("space-only-key", " ", " "),

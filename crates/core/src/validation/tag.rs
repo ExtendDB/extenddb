@@ -26,9 +26,10 @@ const MAX_TAG_VALUE_UNITS: usize = 256;
 /// The grammar is `[\p{L}\p{Z}\p{N}_.:/=+\-@]`: any Unicode Letter (Lu, Ll,
 /// Lt, Lm, Lo), Number (Nd, Nl, No) or Separator (Zs, Zl, Zp), plus the eight
 /// listed characters. Measured against the service: `é`, `ß`, a CJK ideograph
-/// and a Cyrillic letter are accepted, as are an Arabic-Indic digit (Nd), a
-/// Roman numeral (Nl), U+00A0 (Zs) and U+2028 (Zl); U+0301 and U+093E
-/// (combining marks), an emoji, a tab, a newline and the other ASCII
+/// and a Cyrillic letter are accepted, as are U+01C5 (Lt), U+02B0 (Lm), an
+/// Arabic-Indic digit (Nd), a Roman numeral (Nl), U+00B2 (No), U+00A0 (Zs),
+/// U+2028 (Zl) and U+2029 (Zp); U+0301 and U+093E (combining marks), U+200B
+/// (a format character), an emoji, a tab, a newline and the other ASCII
 /// punctuation characters are rejected.
 ///
 /// The categories are those of Unicode 13.0, from `unicode-general-category`
@@ -205,10 +206,14 @@ mod tests {
             "k\u{df}y",
             "k\u{4e2d}y",
             "k\u{434}y",
+            "k\u{1c5}y",
+            "k\u{2b0}y",
             "k\u{a0}y",
             "k\u{2028}y",
+            "k\u{2029}y",
             "k\u{663}y",
             "k\u{2167}y",
+            "k\u{b2}y",
             " lead",
             "trail ",
             " ",
@@ -228,6 +233,10 @@ mod tests {
             "",
             "Abc123 _.:/=+-@",
             "v\u{e9}x",
+            "v\u{1c5}x",
+            "v\u{2b0}x",
+            "v\u{b2}x",
+            "v\u{2029}x",
             "aws:foo",
             &"v".repeat(256),
             &"\u{e9}".repeat(256),
@@ -265,6 +274,7 @@ mod tests {
             '\u{1f600}',
             '\u{301}',
             '\u{93e}',
+            '\u{200b}',
             // Letters and digits assigned after Unicode 13.0.
             '\u{870}',
             '\u{16ac0}',
