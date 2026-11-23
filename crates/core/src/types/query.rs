@@ -168,6 +168,30 @@ pub struct ScanInput {
     pub conditional_operator: Option<ConditionalOperator>,
 }
 
+/// The value the service validates and uses for an int32 request member
+/// written as a JSON number of at most 15 significant digits. The number is
+/// read as a double, whose fraction `as` truncates toward zero, and a value
+/// outside the int32 range is saturated to the nearer bound. The service
+/// truncates the decimal as written, so a decimal of 16 or more significant
+/// digits can read as the next integer in magnitude here:
+/// `0.99999999999999999` reads as 1 here and as 0 in the service, and
+/// `-100.999999999999999` as -101 here and -100 there (measured 2026-11-20,
+/// us-east-1, #1203).
+///
+/// Measured on `Scan` 2026-10-25 (us-east-1): `Limit: 1.5` and `Limit: 1.0`
+/// return one item, `Limit: 1e2`, `Limit: 2147483648` and
+/// `Limit: 9223372036854775808` are accepted, `Segment: 1.5` of
+/// `TotalSegments: 2` returns the items of segment 1, `Limit: 0.0` is
+/// reported as `0`, `Limit: -2147483649` as `-2147483648` and
+/// `TotalSegments: 2147483648` as `2147483647`. Measured on `Scan` 2026-10-30
+/// 12:40 UTC: `Limit: -1.5` is reported as `-1`, and `Limit: -0.5` and
+/// `Limit: -0` as `0`.
+#[must_use]
+pub fn saturated_int32(number: &serde_json::Number) -> i32 {
+    #[allow(clippy::cast_possible_truncation)]
+    number.as_f64().map_or(0, |value| value as i32)
+}
+
 /// `Scan` response body.
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanOutput {

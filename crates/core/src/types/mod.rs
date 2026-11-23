@@ -14,7 +14,8 @@ mod transaction;
 mod warm_throughput;
 
 pub use attribute_value::{
-    AttributeValue, check_binaries, decode_base64, decode_padded_base64, is_base64_refusal,
+    AttributeValue, EMPTY_ATTRIBUTE_VALUE, MULTI_ATTRIBUTE_VALUE, check_binaries, decode_base64,
+    decode_padded_base64, is_base64_refusal,
 };
 pub use backup::{
     BackupDescription, BackupDetails, BackupSummary, ContinuousBackupsDescription,
@@ -45,7 +46,9 @@ pub use key_schema::{
     ScalarAttributeType, TableKeyInfo, VectorIndexKeyInfo, hash_key_elements,
     is_multipart_key_schema, partition_indexes, range_key_elements,
 };
-pub use query::{Condition, QueryInput, QueryOutput, ScanInput, ScanOutput, Select};
+pub use query::{
+    Condition, QueryInput, QueryOutput, ScanInput, ScanOutput, Select, saturated_int32,
+};
 pub use stream::{
     DescribeStreamInput, DescribeStreamOutput, GetRecordsInput, GetRecordsOutput,
     GetShardIteratorInput, GetShardIteratorOutput, ListStreamsInput, ListStreamsOutput,

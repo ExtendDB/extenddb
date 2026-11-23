@@ -17,7 +17,7 @@ pub(super) const MIN_MAGNITUDE: i64 = MIN_EXPONENT as i64 + 1;
 
 /// The service's text for a value that is not a number. A malformed value
 /// is named after a colon; an empty one is not.
-const NOT_A_NUMBER: &str = "The parameter cannot be converted to a numeric value";
+pub const NOT_A_NUMBER: &str = "The parameter cannot be converted to a numeric value";
 
 /// Why a string is not a number `DynamoDB` can store, as
 /// [`normalize_number`] reports it.

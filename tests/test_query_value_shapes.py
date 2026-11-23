@@ -34,35 +34,47 @@ from test_query_key_value_types import (  # noqa: F401  (ss_table is a fixture)
 
 
 SHAPE_FAULTS = [
+    # The service: "Unexpected field type".
     ("Limit 0 with ExpressionAttributeValues string",
      {"KeyConditionExpression": "pk = :p", "Limit": 0, "ExpressionAttributeValues": "x"}),
+    # The service: "Unexpected field type".
     ("ExpressionAttributeNames string with N bob",
      {"KeyConditionExpression": "pk = :p", "ExpressionAttributeNames": "x",
       "ExpressionAttributeValues": {":p": NB}}),
+    # The service: "STRING_VALUE cannot be converted to Integer".
     ("Limit string with N bob",
      {"KeyConditionExpression": "pk = :p", "Limit": "1", "ExpressionAttributeValues": {":p": NB}}),
+    # The service: "Start of structure or map found where not expected".
     ("AttributesToGet object with ProjectionExpression",
      {"KeyConditionExpression": "pk = :p", "AttributesToGet": {"a": 1}, "ProjectionExpression": "a",
       "ExpressionAttributeValues": {":p": SX}}),
+    # The service: no message.
     ("QueryFilter array with FilterExpression",
      {"KeyConditionExpression": "pk = :p", "QueryFilter": [1], "FilterExpression": "a = :p",
       "ExpressionAttributeValues": {":p": SX}}),
+    # The service: "NUMBER_VALUE cannot be converted to String".
     ("Select number with N bob",
      {"KeyConditionExpression": "pk = :p", "Select": 5, "ExpressionAttributeValues": {":p": NB}}),
+    # The service: "NUMBER_VALUE cannot be converted to String".
     ("Limit 0 with Select number",
      {"KeyConditionExpression": "pk = :p", "Limit": 0, "Select": 5,
       "ExpressionAttributeValues": {":p": SX}}),
     # A field of the wrong JSON type inside a value the service cannot read as
     # one type (measured 2026-11-11).
+    # The service: "Unexpected value type in payload".
     ("string beside a null in an L",
      {"KeyConditionExpression": "pk = :p",
       "ExpressionAttributeValues": {":p": SX, ":z": {"L": [None, "x"]}}}),
+    # The service: "NUMBER_VALUE cannot be converted to String".
     ("N number beside an unknown descriptor in an L",
      {"KeyConditionExpression": "pk = :p",
       "ExpressionAttributeValues": {":p": SX, ":z": {"L": [{"X": "1"}, {"N": 5}]}}}),
+    # The service: "NUMBER_VALUE cannot be converted to String".
     ("S number beside an unknown descriptor with Limit 0",
      {"KeyConditionExpression": "pk = :p", "Limit": 0,
       "ExpressionAttributeValues": {":p": SX, ":z": {"S": 5, "X": "1"}}}),
+    # The service: "Base64 encoded length is expected a multiple of 4 bytes but
+    # found: 2".
     ("B not base64 beside a null in an L",
      {"KeyConditionExpression": "pk = :p",
       "ExpressionAttributeValues": {":p": SX, ":z": {"L": [None, {"B": "!!"}]}}}),
@@ -73,7 +85,8 @@ class TestShapeFaultsAreReportedFirst:
     """A field of the wrong JSON type anywhere in the body answers
     SerializationException ahead of the Limit, parameter mix, enum and number
     checks (measured 2026-10-25 11:31 UTC). The message texts differ between
-    the service and extenddb, so only the error type is asserted."""
+    the service and extenddb (#1012), so only the error type is asserted. The
+    comment on each row gives the service's message."""
 
     @pytest.mark.parametrize("row,body", SHAPE_FAULTS, ids=[r[0] for r in SHAPE_FAULTS])
     def test_rows(self, dynamodb_client, ss_table, row, body):

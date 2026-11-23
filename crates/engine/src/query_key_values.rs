@@ -30,7 +30,10 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
     Expr, ExpressionMaps, KeyCondition, PathElement, SortKeyCondition,
 };
-use extenddb_core::types::{AttributeDefinition, QueryInput};
+use extenddb_core::types::{
+    AttributeDefinition, EMPTY_ATTRIBUTE_VALUE, MULTI_ATTRIBUTE_VALUE, QueryInput,
+};
+use extenddb_core::validation::number::NOT_A_NUMBER;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
@@ -44,16 +47,15 @@ pub const KEY_CONDITION_TYPE_MISMATCH: &str = "One or more parameter values were
 /// The service's text for a `Limit` below 1 on `Query`.
 pub const LIMIT_BELOW_ONE: &str = "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1";
 
-/// The bare numeric message the number validator uses for an empty `N`.
-const EMPTY_NUMBER: &str = "The parameter cannot be converted to a numeric value";
-
-/// The service's texts for a value it cannot read as one type.
+/// The service's text for a null value. Core's copy is a private constant of
+/// its `partiql` module, which a build without the `partiql` feature leaves
+/// out.
 const NULL_VALUE: &str = "The supplied Item contains a null AttributeValue";
-const EMPTY_VALUE: &str =
-    "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes";
-const SEVERAL_TYPES: &str = "Supplied AttributeValue has more than one datatypes set, must contain exactly one of the supported datatypes";
 
-/// The type descriptors of an AttributeValue.
+/// The type descriptors of an AttributeValue, in the order the service reads
+/// the payloads of a value with several type descriptors (see
+/// [`first_fault`]). Core's list is a private constant of its `partiql`
+/// module, as for [`NULL_VALUE`].
 const TYPE_DESCRIPTORS: [&str; 10] = ["S", "N", "B", "SS", "NS", "BS", "M", "L", "NULL", "BOOL"];
 
 /// The members of the two enums the request-time checks read.
@@ -290,7 +292,7 @@ fn sorted_entries(values: &Map<String, Value>) -> Vec<(&String, &Value)> {
 }
 
 /// The first fault inside one value, in document order for `L` items and in
-/// key order for `M` members.
+/// the map's iteration order for `M` members (see [`first_fault`]).
 enum Fault<'a> {
     /// A null, with the member name when it is the value of an `M` member.
     Null(Option<&'a str>),
@@ -313,7 +315,7 @@ impl Fault<'_> {
     fn request_time_text(self) -> String {
         match self {
             Fault::NotANumber(text) => format!(
-                "{EMPTY_NUMBER}: {}",
+                "{NOT_A_NUMBER}: {}",
                 crate::decimal_digits::fold_decimal_digits(text)
             ),
             other => other.reason(),
@@ -326,10 +328,10 @@ impl Fault<'_> {
         match self {
             Fault::Null(None) => NULL_VALUE.to_owned(),
             Fault::Null(Some(member)) => format!("{NULL_VALUE}: {member} is null"),
-            Fault::Empty => EMPTY_VALUE.to_owned(),
-            Fault::SeveralTypes => SEVERAL_TYPES.to_owned(),
-            Fault::NotANumber("") => EMPTY_NUMBER.to_owned(),
-            Fault::NotANumber(text) => format!("{EMPTY_NUMBER}: {text}"),
+            Fault::Empty => EMPTY_ATTRIBUTE_VALUE.to_owned(),
+            Fault::SeveralTypes => MULTI_ATTRIBUTE_VALUE.to_owned(),
+            Fault::NotANumber("") => NOT_A_NUMBER.to_owned(),
+            Fault::NotANumber(text) => format!("{NOT_A_NUMBER}: {text}"),
             Fault::Refused(msg) => msg,
         }
     }
@@ -338,13 +340,15 @@ impl Fault<'_> {
 /// The first fault in `value` (`member` is its name when it is the value of an
 /// `M` member): a null or no type descriptor, then the numbers in `N`, `NS`
 /// and every value an `L` or `M` holds, then more than one type descriptor.
-/// `L` items are visited in document order and `M` members in key order: this
-/// build of `serde_json` keeps an object's members sorted by key. A value of
-/// another JSON type, and an `N` or `NS` payload of the wrong JSON type, are
-/// shape faults the deserializer reports. A type descriptor with a null
-/// payload counts as absent, as the service reads it (measured 2026-11-19:
-/// `{"S": null}` answers the empty value text, and `{"S": null, "N": "1"}` in
-/// a `FilterExpression` is accepted).
+/// `L` items are visited in document order and `M` members in the map's
+/// iteration order: sorted by key without the `preserve_order` feature of
+/// `serde_json`, in document order with it, as in the MongoDB build (bson
+/// turns the feature on). A value of another JSON type, and an `N` or `NS`
+/// payload of the wrong JSON type, are shape faults the deserializer
+/// reports. A type descriptor with a null payload counts as absent, as the
+/// service reads it (measured 2026-11-19: `{"S": null}` answers the empty
+/// value text, and `{"S": null, "N": "1"}` in a `FilterExpression` is
+/// accepted).
 ///
 /// With several type descriptors, the service reads each payload in the order
 /// of [`TYPE_DESCRIPTORS`], whatever order the request wrote them in, and
@@ -388,7 +392,7 @@ fn number_fault(text: &str) -> Option<Fault<'_>> {
     let folded = crate::decimal_digits::fold_decimal_digits(text);
     match extenddb_core::validation::number::validate_and_normalize_number(&folded) {
         Ok(_) => None,
-        Err(DynamoDbError::ValidationException(msg)) if msg.starts_with(EMPTY_NUMBER) => {
+        Err(DynamoDbError::ValidationException(msg)) if msg.starts_with(NOT_A_NUMBER) => {
             Some(Fault::NotANumber(text))
         }
         Err(DynamoDbError::ValidationException(msg)) => Some(Fault::Refused(msg)),

@@ -137,13 +137,13 @@ fn null_value() -> Value {
 ///    an invalid `Select` or `ReturnConsumedCapacity` and a mix are reported
 ///    ahead of it); see [`validate_name_keys`];
 /// 4. the first fault inside a value, in document order for `L` items and in
-///    key order for `M` members, as `ExpressionAttributeValues contains
-///    invalid value: <reason> for key <placeholder>`: a null (`The supplied
-///    Item contains a null AttributeValue`, with `: <member> is null` when it
-///    is the value of an `M` member), no type descriptor, more than one, or an
-///    `N` that is not a number. Such an `N` is echoed as written, and an empty
-///    one has no colon after the message. No `M` with more than one member was
-///    measured;
+///    the map's iteration order for `M` members (see [`first_fault`]), as
+///    `ExpressionAttributeValues contains invalid value: <reason> for key
+///    <placeholder>`: a null (`The supplied Item contains a null
+///    AttributeValue`, with `: <member> is null` when it is the value of an
+///    `M` member), no type descriptor, more than one, or an `N` that is not a
+///    number. Such an `N` is echoed as written, and an empty one has no colon
+///    after the message. No `M` with more than one member was measured;
 /// 5. an empty name in `ExpressionAttributeNames` (measured 2026-11-19 in
 ///    either member order). `{"#a": ""}` beside `{"X": "1"}`, `{}`, `{"N":
 ///    "1", "S": "x"}`, a null or `{"S": null}` answers that value's text.
