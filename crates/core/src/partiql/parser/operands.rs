@@ -202,11 +202,13 @@ impl Parser {
     }
 
     /// The `line:column:length` span of the first token inside the group
-    /// that opens at token `open`, past any `(` of groups inside it.
+    /// that opens at token `open`, past any `(` of groups inside it and an
+    /// `@` (measured 2026-11-23: `@a IS INT4` names the `a`; see
+    /// [`Parser::span`]).
     pub(super) fn inner_span(&self, open: usize) -> String {
         self.tokens[open..]
             .iter()
-            .find(|t| t.kind != TokenKind::LParen)
+            .find(|t| !matches!(t.kind, TokenKind::LParen | TokenKind::At))
             .map(|t| format!("{}:{}:{}", t.line, t.column, t.length))
             .unwrap_or_default()
     }
@@ -299,7 +301,8 @@ impl Parser {
             TokenKind::QuotedIdent(name) if matches!(self.nth_kind(1), Some(TokenKind::LParen)) => {
                 self.call(name.to_ascii_lowercase())
             }
-            TokenKind::QuotedIdent(_) => Ok(Operand::Path(self.path()?)),
+            // A name after `@` starts a path, also with `(` after it.
+            TokenKind::QuotedIdent(_) | TokenKind::At => Ok(Operand::Path(self.path()?)),
             _ => Err(self.term_error()),
         }
     }

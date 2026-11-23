@@ -181,6 +181,9 @@ impl Parser {
     pub(super) fn in_list(&mut self, value: Operand) -> PResult<WhereExpr> {
         self.count_operator();
         self.require_rhs()?;
+        // (measured 2026-11-23: `a IN @` is "Identifier must follow
+        // @-operator", and `a IN @b` the IN operands text, as `a IN b` is)
+        self.eat_at_sign()?;
         let items = match self.peek().kind {
             TokenKind::LBracket => {
                 self.bump();
@@ -313,21 +316,27 @@ impl Parser {
     /// member is refused as an Id, a Path and a Call under root[0], at the
     /// first token). Returns false, having read nothing, for any other
     /// element; a name alone is refused by [`Parser::literal_value`]. In a
-    /// list in brackets these are not measured.
+    /// list in brackets these are not measured. A name after `@` is never
+    /// called (see [`Parser::eat_at_sign`]), and is refused at the name
+    /// (measured 2026-11-23: `((@m.b, 1))` and `((@"pk", 1))` are a Path and
+    /// an Id at the name, and `((@foo(b), 1))` is "Expected RIGHT_PAREN").
     fn term_in_parentheses(&mut self, path: &str) -> PResult<bool> {
+        let at_sign = self.eat_at_sign()?;
         let next = self.tokens.get(self.pos + 1).map(|t| &t.kind);
         let name = match &self.peek().kind {
             TokenKind::Ident(w) => word_class(w) == WordClass::Name,
             TokenKind::QuotedIdent(_) => true,
             _ => false,
         };
-        let callable = matches!(
-            &self.peek().kind,
-            TokenKind::Ident(w) if word_class(w) == WordClass::Name || is_function_keyword(w)
-        );
+        let callable = !at_sign
+            && matches!(
+                &self.peek().kind,
+                TokenKind::Ident(w) if word_class(w) == WordClass::Name || is_function_keyword(w)
+            );
         let kind = match next {
             Some(TokenKind::Dot | TokenKind::LBracket) if name => "Path",
             Some(TokenKind::LParen) if callable => "Call",
+            _ if at_sign => "Id",
             Some(TokenKind::LParen) => return Ok(false),
             _ if matches!(self.peek().kind, TokenKind::QuotedIdent(_)) => "Id",
             _ => return Ok(false),
@@ -359,13 +368,15 @@ impl Parser {
     /// (see `Parser::insert_without_value`), with the current token on its
     /// `<<`: the operands of the IN in the order they are written, each a
     /// value, a parameter or a name (measured 2026-11-02: `a IN <<?>>` and `a
-    /// IN <<pk>>` run). A member is named as the value itself in a refusal
-    /// (measured 2026-11-02: `a IN <<1e126>>` is refused under root).
+    /// IN <<pk>>` run), with an `@` before it or none (see
+    /// [`Parser::eat_at_sign`]). A member is named as the value itself in a
+    /// refusal (measured 2026-11-02: `a IN <<1e126>>` is refused under root).
     pub(super) fn in_bag(&mut self) -> PResult<Vec<Operand>> {
         self.bump();
         let mut members = Vec::new();
         if !matches!(self.peek().kind, TokenKind::RDoubleAngle) {
             loop {
+                self.eat_at_sign()?;
                 members.push(if matches!(self.peek().kind, TokenKind::Param) {
                     self.bump();
                     let index = self.take_param_index();

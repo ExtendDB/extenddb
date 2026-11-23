@@ -213,11 +213,13 @@ impl Parser {
         Ok(Operand::Literal(AttributeValue::Null))
     }
 
-    /// Whether the current token can start a term.
+    /// Whether the current token can start a term (measured 2026-11-23:
+    /// `WHERE exec foo @a` is refused for the EXEC, so `@a` is its argument).
     fn at_term_start(&self) -> bool {
         match &self.peek().kind {
             TokenKind::Ident(w) => word_class(w) == WordClass::Name,
             TokenKind::QuotedIdent(_)
+            | TokenKind::At
             | TokenKind::String(_)
             | TokenKind::Number(_)
             | TokenKind::Ion(_)
@@ -442,6 +444,7 @@ fn token_text(kind: &TokenKind) -> String {
         TokenKind::Percent => "%".to_owned(),
         TokenKind::Slash => "/".to_owned(),
         TokenKind::Concat => "||".to_owned(),
+        TokenKind::At => "@".to_owned(),
         TokenKind::Semicolon => ";".to_owned(),
         TokenKind::Eof => String::new(),
     }
