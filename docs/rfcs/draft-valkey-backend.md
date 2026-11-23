@@ -4,7 +4,7 @@
 - Author: @rlunar
 - Created: 2026-11-23
 - FCP ends: (set when entering Final Comment Period)
-- Tracking issue: TBD
+- Tracking issue: #1394
 
 ## Summary
 
