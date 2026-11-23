@@ -41,8 +41,8 @@ const TYPED_MEMBERS: &[(&str, &str)] = &[("SequenceNumber", "String"), ("Timesta
 /// converted to <type>`, an object the structure message, an array a
 /// `SerializationException` with no message. Null passes through to the
 /// parameter rules, which treat it as absent. The service runs this before
-/// every constraint and parameter check, the `ShardIteratorType` ones
-/// included.
+/// every constraint and parameter check, the `ShardIteratorType` ones and
+/// the `StreamArn` presence (measured 2026-11-23) included.
 pub(crate) fn check_member_shapes(body: &serde_json::Value) -> Result<(), DynamoDbError> {
     use serde_json::Value;
     for (member, kind) in TYPED_MEMBERS {

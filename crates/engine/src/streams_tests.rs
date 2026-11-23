@@ -108,8 +108,10 @@ fn the_shard_id_maximum_applies_once_the_shard_is_not_found() {
     }
 }
 
-/// Every constraint violation of a body joins one message, in the service's
-/// order (measured 2026-11-20): sequenceNumber, shardIteratorType, shardId.
+/// An absent, null or empty `StreamArn` is `Invalid StreamArn` before any
+/// clause, and every constraint violation of a body joins one message, in the
+/// service's order (measured 2026-11-20 and 2026-11-23): sequenceNumber,
+/// shardIteratorType, shardId (null before length).
 #[test]
 fn constraint_violations_join_one_message_in_the_service_order() {
     use serde_json::json;
@@ -117,54 +119,102 @@ fn constraint_violations_join_one_message_in_the_service_order() {
     const NULL: &str =
         "Value at 'shardIteratorType' failed to satisfy constraint: Member must not be null";
     const SHARD: &str = "Value at 'shardId' failed to satisfy constraint: Member must have length greater than or equal to 28";
+    const SHARD_NULL: &str =
+        "Value at 'shardId' failed to satisfy constraint: Member must not be null";
+    const INVALID_ARN: &str = "Invalid StreamArn";
+    let arn = "arn:aws:dynamodb:us-east-1:123456789012:table/T/stream/2026-10-23T14:03:56.871";
     let long = "shardId-00000001792764241200-b719fef1";
     let cases: &[(serde_json::Value, Option<String>)] = &[
         (
-            json!({"ShardId": "shardId-short"}),
+            json!({"StreamArn": arn, "ShardId": "shardId-short"}),
             Some(format!("2 validation errors detected: {NULL}; {SHARD}")),
         ),
         (
-            json!({"ShardId": "shardId-short", "ShardIteratorType": null}),
+            json!({"StreamArn": arn, "ShardId": "shardId-short", "ShardIteratorType": null}),
             Some(format!("2 validation errors detected: {NULL}; {SHARD}")),
         ),
         (
-            json!({"ShardId": "shardId-short", "ShardIteratorType": "BOGUS"}),
+            json!({"StreamArn": arn, "ShardId": "shardId-short", "ShardIteratorType": "BOGUS"}),
             Some(format!(
                 "2 validation errors detected: {}; {SHARD}",
                 super::iterator_params::SHARD_ITERATOR_TYPE_ENUM_CLAUSE
             )),
         ),
         (
-            json!({"ShardId": long, "SequenceNumber": "0"}),
+            json!({"StreamArn": arn, "ShardId": long, "SequenceNumber": "0"}),
             Some(format!("2 validation errors detected: {SEQ}; {NULL}")),
         ),
         (
-            json!({"ShardId": "shardId-short", "SequenceNumber": "0"}),
+            json!({"StreamArn": arn, "ShardId": "shardId-short", "SequenceNumber": "0"}),
             Some(format!(
                 "3 validation errors detected: {SEQ}; {NULL}; {SHARD}"
             )),
         ),
         (
-            json!({"ShardId": long, "Timestamp": 1792764248.0}),
+            json!({"StreamArn": arn, "ShardId": long, "Timestamp": 1792764248.0}),
             Some(format!("1 validation error detected: {NULL}")),
         ),
         (
-            json!({"ShardId": long, "ShardIteratorType": "at_timestamp"}),
+            json!({"StreamArn": arn, "ShardId": long, "ShardIteratorType": "at_timestamp"}),
             Some(format!(
                 "1 validation error detected: {}",
                 super::iterator_params::SHARD_ITERATOR_TYPE_ENUM_CLAUSE
             )),
         ),
         (
-            json!({"ShardId": "shardId-short", "ShardIteratorType": "TRIM_HORIZON"}),
+            json!({"StreamArn": arn, "ShardId": "shardId-short", "ShardIteratorType": "TRIM_HORIZON"}),
             Some(format!("1 validation error detected: {SHARD}")),
         ),
+        // A missing or null ShardId is its null clause, in the shardId position.
         (
-            json!({"ShardId": long, "ShardIteratorType": "AT_TIMESTAMP", "SequenceNumber": "000000000000000000001"}),
+            json!({"StreamArn": arn, "ShardIteratorType": "TRIM_HORIZON"}),
+            Some(format!("1 validation error detected: {SHARD_NULL}")),
+        ),
+        (
+            json!({"StreamArn": arn, "ShardId": null, "ShardIteratorType": "TRIM_HORIZON"}),
+            Some(format!("1 validation error detected: {SHARD_NULL}")),
+        ),
+        (
+            json!({"StreamArn": arn, "SequenceNumber": "0"}),
+            Some(format!(
+                "3 validation errors detected: {SEQ}; {NULL}; {SHARD_NULL}"
+            )),
+        ),
+        // An absent, null or empty StreamArn is refused alone, whatever else
+        // the body would violate.
+        (
+            json!({"ShardId": long, "ShardIteratorType": "TRIM_HORIZON"}),
+            Some(INVALID_ARN.to_owned()),
+        ),
+        (
+            json!({"ShardId": "shardId-short"}),
+            Some(INVALID_ARN.to_owned()),
+        ),
+        (
+            json!({"StreamArn": null, "ShardId": long, "ShardIteratorType": "TRIM_HORIZON"}),
+            Some(INVALID_ARN.to_owned()),
+        ),
+        (
+            json!({"StreamArn": "", "ShardId": long, "ShardIteratorType": "TRIM_HORIZON"}),
+            Some(INVALID_ARN.to_owned()),
+        ),
+        (
+            json!({"StreamArn": null, "SequenceNumber": "0"}),
+            Some(INVALID_ARN.to_owned()),
+        ),
+        (
+            json!({"StreamArn": "", "ShardId": "shardId-short"}),
+            Some(INVALID_ARN.to_owned()),
+        ),
+        (
+            json!({"StreamArn": arn, "ShardId": long, "ShardIteratorType": "AT_TIMESTAMP", "SequenceNumber": "000000000000000000001"}),
             None,
         ),
         // A ShardIteratorType of another JSON type is the deserializer's case.
-        (json!({"ShardId": long, "ShardIteratorType": 5}), None),
+        (
+            json!({"StreamArn": arn, "ShardId": long, "ShardIteratorType": 5}),
+            None,
+        ),
     ];
     for (body, expected) in cases {
         match (super::constraint_violations(body), expected) {

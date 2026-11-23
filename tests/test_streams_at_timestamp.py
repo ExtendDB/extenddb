@@ -335,11 +335,17 @@ class TestTimestampShapes:
         for extra, expected in cases:
             code, msg = _raw_error(endpoint_url, {"StreamArn": arn, "ShardId": shard, **extra})
             assert (code, msg) == ("SerializationException", expected), extra
-        # The type check comes before the ShardId length constraint too.
-        code, msg = _raw_error(endpoint_url, {
-            "StreamArn": arn, "ShardId": "shardId-short", "ShardIteratorType": "AT_TIMESTAMP", "Timestamp": "x",
-        })
-        assert (code, msg) == ("SerializationException", date_s)
+        # The type check comes before the ShardId length constraint too, and
+        # before the StreamArn check (measured 2026-11-23 with no StreamArn
+        # and with an empty one).
+        for body in (
+            {"StreamArn": arn, "ShardId": "shardId-short", "ShardIteratorType": "AT_TIMESTAMP", "Timestamp": "x"},
+            {"Timestamp": "x"},
+        ):
+            code, msg = _raw_error(endpoint_url, body)
+            assert (code, msg) == ("SerializationException", date_s), body
+        code, msg = _raw_error(endpoint_url, {"StreamArn": "", "SequenceNumber": 5})
+        assert (code, msg) == ("SerializationException", "NUMBER_VALUE cannot be converted to String")
 
 
 class TestValidationMatrix:
@@ -420,20 +426,32 @@ class TestValidationMatrix:
         for bad in ("BOGUS", "at_timestamp"):
             code, msg = _error(raw_streams_client.get_shard_iterator, StreamArn=arn, ShardId=shard, ShardIteratorType=bad)
             assert (code, msg) == ("ValidationException", f"1 validation error detected: {enum_clause}")
-        # A missing or null type is a ValidationException, not a serialization
-        # error, and it joins the other constraint violations in one message:
-        # sequenceNumber, shardIteratorType, shardId.
+        # A missing or null type or shard id is a ValidationException, not a
+        # serialization error, and it joins the other constraint violations in
+        # one message: sequenceNumber, shardIteratorType, shardId. An absent,
+        # null or empty StreamArn is refused alone, before the clauses
+        # (measured 2026-11-23).
+        shard_null = "Value at 'shardId' failed to satisfy constraint: Member must not be null"
         cases = [
-            ({"ShardId": shard, "Timestamp": 1792764248.0}, f"1 validation error detected: {null_clause}"),
-            ({"ShardId": shard, "ShardIteratorType": None}, f"1 validation error detected: {null_clause}"),
-            ({"ShardId": "shardId-short"}, f"2 validation errors detected: {null_clause}; {shard_clause}"),
-            ({"ShardId": "shardId-short", "ShardIteratorType": "BOGUS"}, f"2 validation errors detected: {enum_clause}; {shard_clause}"),
-            ({"ShardId": shard, "SequenceNumber": "0"}, f"2 validation errors detected: {seq_clause}; {null_clause}"),
-            ({"ShardId": "shardId-short", "SequenceNumber": "0"}, f"3 validation errors detected: {seq_clause}; {null_clause}; {shard_clause}"),
-            ({"ShardId": "shardId-short", "ShardIteratorType": "TRIM_HORIZON"}, f"1 validation error detected: {shard_clause}"),
+            ({"StreamArn": arn, "ShardId": shard, "Timestamp": 1792764248.0}, f"1 validation error detected: {null_clause}"),
+            ({"StreamArn": arn, "ShardId": shard, "ShardIteratorType": None}, f"1 validation error detected: {null_clause}"),
+            ({"StreamArn": arn, "ShardId": "shardId-short"}, f"2 validation errors detected: {null_clause}; {shard_clause}"),
+            ({"StreamArn": arn, "ShardId": "shardId-short", "ShardIteratorType": "BOGUS"}, f"2 validation errors detected: {enum_clause}; {shard_clause}"),
+            ({"StreamArn": arn, "ShardId": shard, "SequenceNumber": "0"}, f"2 validation errors detected: {seq_clause}; {null_clause}"),
+            ({"StreamArn": arn, "ShardId": "shardId-short", "SequenceNumber": "0"}, f"3 validation errors detected: {seq_clause}; {null_clause}; {shard_clause}"),
+            ({"StreamArn": arn, "ShardId": "shardId-short", "ShardIteratorType": "TRIM_HORIZON"}, f"1 validation error detected: {shard_clause}"),
+            ({"StreamArn": arn, "ShardIteratorType": "TRIM_HORIZON"}, f"1 validation error detected: {shard_null}"),
+            ({"StreamArn": arn, "ShardId": None, "ShardIteratorType": "TRIM_HORIZON"}, f"1 validation error detected: {shard_null}"),
+            ({"StreamArn": arn, "SequenceNumber": "0"}, f"3 validation errors detected: {seq_clause}; {null_clause}; {shard_null}"),
+            ({"ShardId": shard, "ShardIteratorType": "TRIM_HORIZON"}, "Invalid StreamArn"),
+            ({"ShardId": "shardId-short"}, "Invalid StreamArn"),
+            ({"StreamArn": None, "ShardId": shard, "ShardIteratorType": "TRIM_HORIZON"}, "Invalid StreamArn"),
+            ({"StreamArn": "", "ShardId": shard, "ShardIteratorType": "TRIM_HORIZON"}, "Invalid StreamArn"),
+            ({"StreamArn": None, "SequenceNumber": "0"}, "Invalid StreamArn"),
+            ({"StreamArn": "", "ShardId": "shardId-short"}, "Invalid StreamArn"),
         ]
         for body, expected in cases:
-            code, msg = _raw_error(endpoint_url, {"StreamArn": arn, **body})
+            code, msg = _raw_error(endpoint_url, body)
             assert (code, msg) == ("ValidationException", expected), body
 
     def test_future_check_runs_before_shard_existence(self, dynamodb_client, streams_client, raw_streams_client, stream_table):

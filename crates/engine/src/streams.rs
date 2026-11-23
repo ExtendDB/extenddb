@@ -101,11 +101,12 @@ pub async fn handle_list_streams(
 ///
 /// Encodes the shard ID and starting position into a base64 iterator token.
 ///
-/// Validation runs in the service's order, measured 2026-10-23 and 2026-11-20
-/// (us-east-1): the members' JSON types, then the model's constraints in one
-/// message (`SequenceNumber` length, `ShardIteratorType` null or enum,
-/// `ShardId` length), then the parameter rules per type, then stream and shard
-/// existence, then the `SequenceNumber` refusal of `TRIM_HORIZON` and `LATEST`.
+/// Validation runs in the service's order, measured 2026-10-23, 2026-11-20 and
+/// 2026-11-23 (us-east-1): the members' JSON types, then the `StreamArn`
+/// presence, then the model's constraints in one message (`SequenceNumber`
+/// length, `ShardIteratorType` null or enum, `ShardId` null or length), then
+/// the parameter rules per type, then stream and shard existence, then the
+/// `SequenceNumber` refusal of `TRIM_HORIZON` and `LATEST`.
 ///
 /// # Errors
 ///
@@ -185,16 +186,29 @@ pub async fn handle_get_shard_iterator(
     serialize_output(&output)
 }
 
-/// The model's constraints on a `GetShardIterator` body, in one message: the
-/// `SequenceNumber` is at least 21 characters (measured 2026-10-24 with "0"),
-/// the `ShardIteratorType` is present and a member, the `ShardId` is at least
-/// 28 characters. The service joins every violation under one `N validation
-/// errors detected`, in this order and with no value quoted (measured
-/// 2026-11-20, us-east-1). The `ShardId` maximum is applied once the shard is
-/// not found (`shard_lookup_error`): the shards a release before v0.1.14 wrote
-/// are named after the table, and a table name over 40 characters puts them
-/// past 65.
+/// The model's checks on a `GetShardIterator` body before it is deserialized.
+///
+/// An absent, null or empty `StreamArn` is `Invalid StreamArn` on its own,
+/// before any clause (measured 2026-11-23, us-east-1; the server refuses a
+/// malformed one before the handler). Then the constraints join one message:
+/// the `SequenceNumber` is at least 21 characters (measured 2026-10-24 with
+/// "0"), the `ShardIteratorType` is present and a member, the `ShardId` is
+/// present and at least 28 characters. The service joins every violation under
+/// one `N validation errors detected`, in this order and with no value quoted
+/// (measured 2026-11-20 and 2026-11-23, us-east-1). The `ShardId` maximum is
+/// applied once the shard is not found (`shard_lookup_error`): the shards a
+/// release before v0.1.14 wrote are named after the table, and a table name
+/// over 40 characters puts them past 65.
 fn constraint_violations(body: &Value) -> Result<(), DynamoDbError> {
+    if body
+        .get("StreamArn")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return Err(DynamoDbError::ValidationException(
+            extenddb_core::error::INVALID_STREAM_ARN.to_owned(),
+        ));
+    }
     let mut clauses = Vec::new();
     if body
         .get("SequenceNumber")
@@ -213,12 +227,12 @@ fn constraint_violations(body: &Value) -> Result<(), DynamoDbError> {
         }
         _ => {}
     }
-    if body
-        .get("ShardId")
-        .and_then(Value::as_str)
-        .is_some_and(|s| s.chars().count() < SHARD_ID_MIN_LEN)
-    {
-        clauses.push(clause("shardId", "have length greater than or equal to 28"));
+    match body.get("ShardId") {
+        None | Some(Value::Null) => clauses.push(clause("shardId", "not be null")),
+        Some(Value::String(s)) if s.chars().count() < SHARD_ID_MIN_LEN => {
+            clauses.push(clause("shardId", "have length greater than or equal to 28"));
+        }
+        _ => {}
     }
     if clauses.is_empty() {
         return Ok(());

@@ -36,6 +36,13 @@ pub fn validation_errors_detected(clauses: &[String]) -> String {
     )
 }
 
+/// The service's answer to a `StreamArn` that is not a stream ARN of the
+/// right shape (`DescribeStream` and `GetShardIterator`, measured 2026-10-23,
+/// us-east-1), and to a `GetShardIterator` whose `StreamArn` is absent, null
+/// or empty (measured 2026-11-23). The server checks the shape before
+/// authorization; the `GetShardIterator` handler checks the presence.
+pub const INVALID_STREAM_ARN: &str = "Invalid StreamArn";
+
 /// Keys for error message templates. Compile-time checked — no stringly-typed lookups.
 #[derive(Debug, Clone, Copy)]
 pub enum ErrorMessageKey {
