@@ -44,7 +44,7 @@ const MAX_BATCH_STATEMENTS: usize = 25;
 const MAX_TRANSACTION_STATEMENTS: usize = 100;
 
 /// The longest `ClientRequestToken`, in code points.
-const MAX_CLIENT_REQUEST_TOKEN: usize = 36;
+pub(crate) const MAX_CLIENT_REQUEST_TOKEN: usize = 36;
 
 /// The longest `NextToken`, in code points.
 const MAX_NEXT_TOKEN: usize = 32768;
@@ -166,6 +166,21 @@ pub(super) fn check_execute_transaction(body: &Value) -> Result<(), DynamoDbErro
     found.into_result()
 }
 
+/// The constraint a value of 1 to `max` code points fails, if any. The
+/// `TransactWriteItems` token check shares it.
+pub(crate) fn length_constraint(value: &str, max: usize) -> Option<String> {
+    let length = value.chars().count();
+    if length == 0 {
+        Some(AT_LEAST_ONE.to_owned())
+    } else if length > max {
+        Some(format!(
+            "Member must have length less than or equal to {max}"
+        ))
+    } else {
+        None
+    }
+}
+
 /// The failed constraints of one request, each worded as the service words
 /// it, in the order the service reports them.
 #[derive(Default)]
@@ -191,15 +206,8 @@ impl Found {
         let Some(Value::String(token)) = value else {
             return;
         };
-        let length = token.chars().count();
-        if length == 0 {
-            self.add(token, path, AT_LEAST_ONE);
-        } else if length > max {
-            self.add(
-                token,
-                path,
-                &format!("Member must have length less than or equal to {max}"),
-            );
+        if let Some(constraint) = length_constraint(token, max) {
+            self.add(token, path, &constraint);
         }
     }
 
