@@ -248,12 +248,14 @@ pub fn parse_projection_expr(
 /// # Errors
 ///
 /// Returns `DynamoDbError::ValidationException` for over-size, syntax, or
-/// reserved-word errors, and for the faults above.
+/// reserved-word errors, and for the faults above. A fault in the key
+/// condition's shape is the `Err` inside `Ok`, as
+/// [`parse_key_condition_with_maps`] returns it.
 pub fn parse_key_condition_expr(
     expr: &str,
     maps: &ExpressionMaps,
     limits: &LimitsConfig,
-) -> Result<KeyCondition, DynamoDbError> {
+) -> Result<Result<KeyCondition, DynamoDbError>, DynamoDbError> {
     check_expression_size(expr, ExpressionKind::KeyCondition, limits)?;
     tokenize_for(
         expr,

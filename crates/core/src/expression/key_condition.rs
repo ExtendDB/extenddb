@@ -612,7 +612,7 @@ impl SortKeyCondition {
 ///
 /// Returns `ValidationException` for syntax errors or unsupported constructs.
 pub fn parse_key_condition(tokens: &[Token]) -> Result<KeyCondition, DynamoDbError> {
-    classify_clauses(parse_clauses(tokens)?)
+    classify_clauses(refuse_unsupported_clauses(parse_clauses(tokens)?)?)
 }
 
 /// Whether the key condition in `tokens` names one attribute twice, reading
@@ -640,23 +640,22 @@ pub fn has_duplicate_key_condition(
 /// # Errors
 ///
 /// As [`parse_key_condition`], plus `ValidationException` for each of the
-/// faults above.
+/// faults above. A fault in the key condition's shape, such as no equality
+/// on the partition key, is the `Err` inside `Ok`: the engine answers it
+/// after the table checks, where the service does.
 pub fn parse_key_condition_with_maps(
     tokens: &[Token],
     maps: &ExpressionMaps,
-) -> Result<KeyCondition, DynamoDbError> {
+) -> Result<Result<KeyCondition, DynamoDbError>, DynamoDbError> {
     let clauses = parse_clauses(tokens)?;
     check_references(tokens, maps)?;
     check_begins_with_operands(&clauses, maps)?;
     reject_duplicate_key_attrs(&clauses, &maps.names)?;
-    classify_clauses(clauses)
+    Ok(classify_clauses(refuse_unsupported_clauses(clauses)?))
 }
 
-/// Read the parsed clauses as a partition key condition and sort key
-/// conditions, after refusing the first clause whose operator a key condition
-/// does not support.
-fn classify_clauses(clauses: Vec<Clause>) -> Result<KeyCondition, DynamoDbError> {
-    let mut clauses = refuse_unsupported_clauses(clauses)?;
+/// Read the clauses as a partition key condition and sort key conditions.
+fn classify_clauses(mut clauses: Vec<RawClause>) -> Result<KeyCondition, DynamoDbError> {
     match clauses.len() {
         1 => classify_single(clauses.remove(0)),
         2 => classify_pair(clauses.remove(0), clauses.remove(0)),
@@ -2110,7 +2109,7 @@ mod tests {
         values: &HashMap<String, AttributeValue>,
     ) -> Result<KeyCondition, DynamoDbError> {
         let tokens = tokenize(expr).unwrap();
-        parse_key_condition_with_maps(&tokens, &ExpressionMaps::new(names.clone(), values.clone()))
+        parse_key_condition_with_maps(&tokens, &ExpressionMaps::new(names.clone(), values.clone()))?
     }
 
     /// [`parse_with`] with every placeholder of `expr` defined.
@@ -2376,6 +2375,34 @@ mod tests {
             NE_UNSUPPORTED,
             "pk = :a AND pk <>",
         );
+    }
+
+    /// A key condition whose only fault is its shape passes the checks, and
+    /// its refusal comes inside `Ok`, for the engine to answer after the
+    /// table checks.
+    #[test]
+    fn the_shape_is_refused_after_the_checks() {
+        for (expr, want) in [
+            ("pk > :a", "partition key condition must use equality (=)"),
+            (
+                "pk > :a AND sk > :b",
+                "one condition must be an equality on the partition key",
+            ),
+            (
+                "pk = :a AND sk > :b AND zz < :c",
+                "at most one non-equality condition is allowed",
+            ),
+        ] {
+            let tokens = tokenize(expr).unwrap();
+            let maps = ExpressionMaps::new(HashMap::new(), values_of(expr));
+            let shape = parse_key_condition_with_maps(&tokens, &maps)
+                .unwrap_or_else(|err| panic!("expr {expr} should pass the checks: {err:?}"));
+            assert_refused(
+                shape,
+                &format!("Invalid KeyConditionExpression: {want}"),
+                expr,
+            );
+        }
     }
 
     #[test]

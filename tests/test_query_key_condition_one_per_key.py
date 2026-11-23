@@ -64,6 +64,7 @@ VALUES = {"a": A, "b": B, "c": C, "n": N1, "z": {"S": "zed"}, "v": A, "w": B, "e
 GSI = "g-keys"
 HASH = "hash-table"  # stands for the hash_table fixture in a row's TableName
 MISSING_TABLE = "extenddb-test-484-no-such-table"
+NOT_FOUND = ("ResourceNotFoundException", "Requested resource not found")
 LEGACY_PK = {"pk": {"ComparisonOperator": "EQ", "AttributeValueList": [A]}}
 
 
@@ -103,15 +104,17 @@ def _q(kce: str | None = None, values=None, names: dict | None = None, **kwargs)
     return request
 
 
-def _refused(client, table: str, request: dict, want: str) -> None:
+def _refused(client, table: str, request: dict, want) -> None:
     """Send the Query against `table` and compare the ValidationException's
-    text with `want`, or its prefix when `want` is one. With KCE_PREFIX the
-    text must also not contain "operator"."""
+    text with `want`, or its prefix when `want` is one. A (code, text) pair
+    names another error. With KCE_PREFIX the text must also not contain
+    "operator"."""
     request = {"TableName": table, **request}
+    code, want = want if isinstance(want, tuple) else ("ValidationException", want)
     with pytest.raises(ClientError) as exc_info:
         client.query(**request)
     err = exc_info.value.response["Error"]
-    assert err["Code"] == "ValidationException", err
+    assert err["Code"] == code, err
     if want in (KCE_PREFIX, FILTER_PREFIX):
         assert err["Message"].startswith(want), err["Message"]
         if want == KCE_PREFIX:
@@ -331,7 +334,8 @@ class TestQueryCheckOrder:
     12:44Z): parameters, then the FilterExpression, then the
     KeyConditionExpression, then Select, the table, the index and
     ConsistentRead. F3 is an undefined filter value on a partition with no
-    items."""
+    items. R10 and R11 (2026-11-23T16:58Z) have no equality on the partition
+    key: the service reads the key condition's shape after the table."""
 
     Q = "#q = :a"
     CO = {"ConditionalOperator": "AND"}
@@ -375,6 +379,8 @@ class TestQueryCheckOrder:
             _q("pk = :a", {":a": {"S": "p484-empty"}}, FilterExpression="foo = :zz"),
             _undefined(":zz", "FilterExpression"),
         ),
+        ("R10", _q("pk > :a", "a", TableName=MISSING_TABLE), NOT_FOUND),
+        ("R11", _q("pk > :a AND sk > :b", "a b", TableName=MISSING_TABLE), NOT_FOUND),
     ]
 
     @pytest.mark.parametrize("row", ROWS, ids=[r[0] for r in ROWS])
