@@ -16,37 +16,45 @@ Depth is the number of ``L`` wrappers around the leaf: 32 or more answers the
 nesting text, 31 reaches the unused-value check. A malformed number at the
 bottom is reported first, at the depths 31 to 60 that were measured.
 
-The service follows one of two check orders (measured 2026-10-31 and
-2026-11-05, each request twice). A request that
-holds a value that is not one AttributeValue (empty, an unknown or lower-case
-type descriptor, two descriptors) in ``ExpressionAttributeValues``,
-``ExclusiveStartKey`` or a ``ScanFilter`` list follows order U: the constraint
-clauses in the older form with the ``Select`` enum among them, the request
-parameter checks, the key's faults (shape and value together, the first faulty
-member in the fitted member order, a shape fault with the prefix ``The provided
-starting key is invalid: ``), the unreadable ``ExpressionAttributeValues``
-entries, the nesting depth, the expression checks, the table. Every other
-request follows order R: the constraint clauses in the newer form, the parameter
-mix, the nesting depth, a set fault in ``ExpressionAttributeValues``, the request
-parameter checks, the ``Select`` enum, the expression checks, the key's number
-and set faults, the table. The set texts quote their members in order R and not
-in order U. With two value faults in two key members the service's own sends
-disagreed, so those tests accept either fault.
+The service follows one of two check orders (measured 2026-10-31 to
+2026-11-23, each request twice). A request on the service's older validation
+path follows order U: one that holds a value the service cannot read as one
+type (a null, empty, an unknown or lower-case type descriptor, two
+descriptors) in ``ExpressionAttributeValues``, ``ExclusiveStartKey`` or a
+``ScanFilter`` list, or whose ``Limit``, ``Segment`` or ``TotalSegments`` is a
+float or outside int32. Order U: the constraint clauses in the older form with
+the ``Select`` and ``ReturnConsumedCapacity`` clauses among them, the parameter
+mix, the request parameter checks with the ``ScanFilter`` list values, the
+key's faults (the first faulty member in the fitted member order, a value the
+service cannot read with the prefix ``The provided starting key is invalid:
+``), the faulty ``ExpressionAttributeValues`` entries and then an empty name,
+the nesting depth, the expression checks, the table. Every other request
+follows order R: the constraint clauses in the newer form, the
+``ReturnConsumedCapacity`` enum, the parameter mix, the
+``ExpressionAttributeNames`` checks, the numbers and then the set faults of
+``ExpressionAttributeValues``, the nesting depth, the request parameter
+checks, the ``Select`` enum, the expression checks, the key's number and set
+faults, the table. The set texts quote their members in order R and not in
+order U. Where the service's own sends disagreed (two value faults in two key
+members, a number or a set fault beside another entry's fault), the tests
+accept either answer.
 
 A malformed number in a ``ScanFilter`` list answers the number text ahead of
-the key's faults (measured 2026-11-05); that check is #564 item 3, which PR
-#507 makes, so its two rows are expected to fail here. In order U the
+the key's faults (measured 2026-11-05); in order R that check is #564 item 3,
+which PR #507 makes, so its two rows are expected to fail here. In order U the
 ``ExpressionAttributeValues`` entries are visited in the same fitted order as
 the key's members (the hash buckets, then the request's order), a malformed
 number among them answers ``ExpressionAttributeValues contains invalid value:
-... for key :a``, and a ``ScanFilter`` list value that is not one AttributeValue
-answers the bare empty-value text after the no-expression checks. A key of four
+... for key :a``, and the first faulty ``ScanFilter`` list value in the list's
+order answers its bare text after the no-expression checks. A key of four
 members is visited with eight buckets (measured 2026-11-05 on a GSI with a
-range key).
+range key), and nine names in one bucket of sixteen double the table
+(measured 2026-11-23).
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 
 import pytest
@@ -496,7 +504,7 @@ NONASCII_KEY_E_EMPTY = '"ExclusiveStartKey": {"\\u00e9": {}, "\\u00e4": {"N": "b
 # service's two sends differed.
 ROWS_2026_11_05 = [
     # 7.1: a malformed number in a ScanFilter list, ahead of the key's number.
-    # The check is #564 item 3, which PR #507 makes (SCAN_FILTER_NUMBER_ROWS).
+    # The check is #564 item 3, which PR #507 makes (KNOWN_ROWS).
     ("sfR-N-bob", "table", SF_BOB, NUMERIC_BOB),
     ("sfR-N-bob-and-key-bob", "table",
      SF_BOB + ', "ExclusiveStartKey": {"pk": {"N": "fred"}, "sk": {"S": "x"}}', NUMERIC_BOB),
@@ -561,10 +569,12 @@ ROWS_2026_11_05 = [
     ("eavR-NSe-and-select-bad", "table", FILTER_P + ', "ExpressionAttributeValues": '
      '{":p": {"S": "x"}, ":e": {"NS": []}}, "Select": "BAD"', NS_EMPTY),
     # Re-measured 2026-11-05 at 06:20 UTC with the nested value written out
-    # (32 L levels): the empty set ahead of the nesting check in order R, and
-    # the empty leaf of a nested entry named in order U.
+    # (32 L levels): in order R an empty set beside a nested value answered
+    # the set text in both sends that day and in 4 of 4 on 2026-11-23, and
+    # the nesting text in 12 of 14 sends in the review of 2026-11-12. In order
+    # U the empty leaf of a nested entry is named.
     ("eavR-NSe-and-nest", "table", FILTER_P + ', "ExpressionAttributeValues": '
-     '{":p": {"S": "x"}, ":d": ' + NEST32_N + ', ":e": {"NS": []}}', NS_EMPTY),
+     '{":p": {"S": "x"}, ":d": ' + NEST32_N + ', ":e": {"NS": []}}', ("either", NS_EMPTY, NESTING)),
     ("eavU-nest32-empty-leaf", "table", FILTER_P + ', "ExpressionAttributeValues": '
      '{":p": {"S": "x"}, ":d": ' + json.dumps(nest({}, 32)) + '}', EAV_EMPTY_E.replace(":e", ":d")),
     ("eavU-empty-and-filter-syntax", "table", '"FilterExpression": "a = = :p", '
@@ -580,10 +590,11 @@ ROWS_2026_11_05 = [
      + ', "ExpressionAttributeValues": {":p": {"S": "x"}, ":e": {}}', RCC_ENUM),
     ("selR-condop-select-bad", "table", '"ConditionalOperator": "AND", "ScanFilter": {"a": '
      '{"ComparisonOperator": "EQ", "AttributeValueList": [{"N": "1"}]}}, "Select": "BAD"', CONDOP),
+    # The service's text (2026-11-23, 2 sends); the value count text here is
+    # #838's (KNOWN_ROWS).
     ("selR-arity-select-bad", "table", '"ScanFilter": {"a": {"ComparisonOperator": "EQ", '
      '"AttributeValueList": []}}, "Select": "BAD"',
-     ("either", "Invalid number of attribute values for comparison",
-      INVALID + "Invalid number of argument(s) for the EQ ComparisonOperator")),
+     INVALID + "Invalid number of argument(s) for the EQ ComparisonOperator"),
     ("flag-unknown-field-empty", "table", '"Limit": 0, "Foo": {}', LIMIT),
     ("flag-queryfilter-on-scan", "table", '"Limit": 0, "QueryFilter": {"a": {"ComparisonOperator": '
      '"EQ", "AttributeValueList": [{}]}}', LIMIT),
@@ -793,12 +804,38 @@ def _validation_message(status: int, payload: dict) -> str:
     return payload.get("message", payload.get("Message"))
 
 
+@contextlib.contextmanager
+def _created_table(client, prefix: str, seed=(), **params):
+    """Create a table named from ``prefix`` with ``params``, wait for it, put
+    the ``seed`` items, and delete it on exit, also when the wait or a put
+    raises."""
+    name = unique_name(prefix)
+    client.create_table(TableName=name, BillingMode="PAY_PER_REQUEST", **params)
+    try:
+        wait_for_active(client, name)
+        for item in seed:
+            client.put_item(TableName=name, Item=item)
+        yield name
+    finally:
+        client.delete_table(TableName=name)
+        wait_for_deleted(client, name)
+
+
+def _keys(*names: str) -> dict:
+    """The definitions and the key schema of an S hash key and an optional S
+    range key."""
+    return {
+        "AttributeDefinitions": [{"AttributeName": n, "AttributeType": "S"} for n in names],
+        "KeySchema": [{"AttributeName": n, "KeyType": t} for n, t in zip(names, ("HASH", "RANGE"))],
+    }
+
+
 @pytest.fixture(scope="module")
 def table(dynamodb_client):
     """pk S, sk S, a GSI ``gsi`` on gpk S, an LSI ``lsi`` on ln N, with ITEMS items."""
-    name = unique_name("scanreq")
-    dynamodb_client.create_table(
-        TableName=name,
+    with _created_table(
+        dynamodb_client, "scanreq",
+        seed=[{"pk": {"S": f"p{i}"}, "sk": {"S": "s"}, "a": {"N": str(i)}} for i in range(ITEMS)],
         AttributeDefinitions=[
             {"AttributeName": "pk", "AttributeType": "S"},
             {"AttributeName": "sk", "AttributeType": "S"},
@@ -822,82 +859,48 @@ def table(dynamodb_client):
             ],
             "Projection": {"ProjectionType": "ALL"},
         }],
-        BillingMode="PAY_PER_REQUEST",
-    )
-    wait_for_active(dynamodb_client, name)
-    for i in range(ITEMS):
-        dynamodb_client.put_item(TableName=name, Item={
-            "pk": {"S": f"p{i}"}, "sk": {"S": "s"}, "a": {"N": str(i)}})
-    yield name
-    dynamodb_client.delete_table(TableName=name)
-    wait_for_deleted(dynamodb_client, name)
+    ) as name:
+        yield name
 
 
 @pytest.fixture(scope="module")
 def n_table(dynamodb_client):
     """pk N, with items 1 to 6."""
-    name = unique_name("scanreqn")
-    dynamodb_client.create_table(
-        TableName=name,
+    with _created_table(
+        dynamodb_client, "scanreqn",
+        seed=[{"pk": {"N": str(i)}} for i in range(1, 7)],
         AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "N"}],
         KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
-        BillingMode="PAY_PER_REQUEST",
-    )
-    wait_for_active(dynamodb_client, name)
-    for i in range(1, 7):
-        dynamodb_client.put_item(TableName=name, Item={"pk": {"N": str(i)}})
-    yield name
-    dynamodb_client.delete_table(TableName=name)
-    wait_for_deleted(dynamodb_client, name)
-
-
-def _two_member_table(dynamodb_client, prefix: str, hash_key: str, range_key: str):
-    name = unique_name(prefix)
-    dynamodb_client.create_table(
-        TableName=name,
-        AttributeDefinitions=[{"AttributeName": hash_key, "AttributeType": "S"},
-                              {"AttributeName": range_key, "AttributeType": "S"}],
-        KeySchema=[{"AttributeName": hash_key, "KeyType": "HASH"},
-                   {"AttributeName": range_key, "KeyType": "RANGE"}],
-        BillingMode="PAY_PER_REQUEST",
-    )
-    wait_for_active(dynamodb_client, name)
-    return name
+    ) as name:
+        yield name
 
 
 @pytest.fixture(scope="module")
 def ab_table(dynamodb_client):
     """HASH a S, RANGE b S, no items."""
-    name = _two_member_table(dynamodb_client, "scanreqab", "a", "b")
-    yield name
-    dynamodb_client.delete_table(TableName=name)
-    wait_for_deleted(dynamodb_client, name)
+    with _created_table(dynamodb_client, "scanreqab", **_keys("a", "b")) as name:
+        yield name
 
 
 @pytest.fixture(scope="module")
 def pa_table(dynamodb_client):
     """HASH pk S, RANGE a S, no items."""
-    name = _two_member_table(dynamodb_client, "scanreqpa", "pk", "a")
-    yield name
-    dynamodb_client.delete_table(TableName=name)
-    wait_for_deleted(dynamodb_client, name)
+    with _created_table(dynamodb_client, "scanreqpa", **_keys("pk", "a")) as name:
+        yield name
 
 
 @pytest.fixture(scope="module")
 def it_table(dynamodb_client):
     """HASH id S, RANGE ts S, no items."""
-    name = _two_member_table(dynamodb_client, "scanreqit", "id", "ts")
-    yield name
-    dynamodb_client.delete_table(TableName=name)
-    wait_for_deleted(dynamodb_client, name)
+    with _created_table(dynamodb_client, "scanreqit", **_keys("id", "ts")) as name:
+        yield name
 
 
 @pytest.fixture(scope="module")
 def t4_table(dynamodb_client):
     """pk S, sk S, with a GSI ``gsi2`` on gpk S HASH and gsk S RANGE: a four-member index key."""
-    name = unique_name("scanreqt4")
-    dynamodb_client.create_table(
-        TableName=name,
+    with _created_table(
+        dynamodb_client, "scanreqt4",
         AttributeDefinitions=[{"AttributeName": n, "AttributeType": "S"}
                               for n in ("pk", "sk", "gpk", "gsk")],
         KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"},
@@ -908,30 +911,22 @@ def t4_table(dynamodb_client):
                           {"AttributeName": "gsk", "KeyType": "RANGE"}],
             "Projection": {"ProjectionType": "ALL"},
         }],
-        BillingMode="PAY_PER_REQUEST",
-    )
-    wait_for_active(dynamodb_client, name)
-    yield name
-    dynamodb_client.delete_table(TableName=name)
-    wait_for_deleted(dynamodb_client, name)
+    ) as name:
+        yield name
 
 
 @pytest.fixture(scope="module")
 def u_table(dynamodb_client):
     """HASH \u00e4 S, RANGE \u00e9 S: member names outside ASCII."""
-    name = _two_member_table(dynamodb_client, "scanrequ", "\u00e4", "\u00e9")
-    yield name
-    dynamodb_client.delete_table(TableName=name)
-    wait_for_deleted(dynamodb_client, name)
+    with _created_table(dynamodb_client, "scanrequ", **_keys("\u00e4", "\u00e9")) as name:
+        yield name
 
 
 @pytest.fixture(scope="module")
 def v_table(dynamodb_client):
     """HASH \U0001d11e S, RANGE a S: a member name outside the Basic Multilingual Plane."""
-    name = _two_member_table(dynamodb_client, "scanreqv", "\U0001d11e", "a")
-    yield name
-    dynamodb_client.delete_table(TableName=name)
-    wait_for_deleted(dynamodb_client, name)
+    with _created_table(dynamodb_client, "scanreqv", **_keys("\U0001d11e", "a")) as name:
+        yield name
 
 
 class TestRequestChecks:
@@ -1113,16 +1108,18 @@ class TestTwoOrders:
         assert _validation_message(*_scan(dynamodb_client, n_table, fields)) == NUMERIC_BOB
 
 
-# The two ScanFilter number rows: the measured answers are PR #507's check
-# (#564 item 3, measured 2026-11-05), so they are expected to fail here until
-# #507 lands.
-SCAN_FILTER_NUMBER_ROWS = {"sfR-N-bob", "sfR-N-bob-and-key-bob"}
+# The rows whose measured answers another issue's check gives, expected to
+# fail here until it lands: the two ScanFilter number rows are PR #507's check
+# (#564 item 3, measured 2026-11-05), and the value count text of a ScanFilter
+# condition is #838's.
+KNOWN_ROWS = {"sfR-N-bob": "#507", "sfR-N-bob-and-key-bob": "#507",
+              "selR-arity-select-bad": "#838"}
 
 
 def _rows_2026_11_05_params():
     return [
-        pytest.param(*r[1:], marks=pytest.mark.xfail(reason="#507"))
-        if r[0] in SCAN_FILTER_NUMBER_ROWS else r[1:]
+        pytest.param(*r[1:], marks=pytest.mark.xfail(reason=KNOWN_ROWS[r[0]]))
+        if r[0] in KNOWN_ROWS else r[1:]
         for r in ROWS_2026_11_05
     ]
 

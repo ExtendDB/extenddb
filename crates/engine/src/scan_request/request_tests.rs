@@ -1257,10 +1257,12 @@ fn a_value_nested_32_levels_deep_is_refused_and_31_levels_pass() {
     // ahead of the no-expression check.
     let no_expression = scan(json!({"ExpressionAttributeValues": {":d": nested(&one, 32)}}));
     assert_eq!(check(&no_expression).as_deref(), Some(NESTING));
-    // Measured 2026-11-05 (eavR-NSe-and-nest, both sends): an empty set in
-    // another entry answers the set text ahead of the nesting text, with the
-    // text of order R; a duplicate set too (not measured beside a nested
-    // value). A number in a third entry comes ahead of both.
+    // The set pass comes ahead of the nesting check: an empty set in another
+    // entry answers the set text, with the text of order R, and a duplicate
+    // set too. The service's answer varies there (eavR-NSe-and-nest: the set
+    // text in both sends on 2026-11-05 and 4 of 4 on 2026-11-23, the nesting
+    // text in 12 of 14 on 2026-11-12). A number in a third entry comes ahead
+    // of both.
     let beside_empty_set = scan(
         json!({"FilterExpression": "a = :p", "ExpressionAttributeValues":
         {":p": {"S": "x"}, ":d": nested(&one, 32), ":e": {"NS": []}}}),

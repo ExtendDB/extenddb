@@ -36,9 +36,15 @@
 //!    nested in `L` and `M` included, whether an expression reads the value or
 //!    not, the entries in placeholder order; a Unicode decimal digit counts as
 //!    the digit it stands for (see
-//!    `validate_expression_attribute_value_numbers`). The numbers of the
-//!    `ScanFilter` lists are #507's check (#564 item 3, measured 2026-11-05:
-//!    the number text ahead of a number in the key);
+//!    `validate_expression_attribute_value_numbers`). The service's answer
+//!    varies for a number beside another entry's fault: `{":n": {"N":
+//!    "fred"}, ":a": {"N": "bob"}}` answered `fred` in 4 of 6 sends and `bob`
+//!    in 2 on 2026-11-23 (7 of 14 each in the review of 2026-11-12), and
+//!    `{"NS": ["bob", "1", "1"]}` beside a value nested 32 levels answered
+//!    `bob` in 4 of 4 sends on 2026-11-23 and the nesting text in 3 of 6 on
+//!    2026-11-12. The numbers of the `ScanFilter` lists are #507's check (#564
+//!    item 3, measured 2026-11-05: the number text ahead of a number in the
+//!    key);
 //! 6. an empty set and a set with a duplicate member in
 //!    `ExpressionAttributeValues`, the entries in placeholder order (see
 //!    [`validate_sets`]);
@@ -322,10 +328,12 @@ fn validate_parameter_mix(body: &Value) -> Result<(), DynamoDbError> {
 /// the `ExpressionAttributeNames` checks and the numbers and ahead of the
 /// nesting depth and the `Select` enum (measured 2026-11-19 and 2026-11-23: a
 /// duplicate or an empty `NS`, a duplicate `SS` or `BS`, and a duplicate `NS`
-/// in an `L` beside `Select: "NOPE"` answer the set text; 2026-11-05: `{":d":
-/// <32 levels>, ":e": {"NS": []}}` answered the empty-set text in both sends,
-/// and `{":d": <32 levels>, ":s": {"SS": ["a", "a"]}}` the duplicates text in
-/// one of two). Beside a number fault in another value, the service named
+/// in an `L` beside `Select: "NOPE"` answer the set text). Beside a value
+/// nested 32 levels in another entry the answer varies: `{":e": {"NS": []}}`
+/// answered the empty-set text in both sends on 2026-11-05 and in 4 of 4 on
+/// 2026-11-23, and the nesting text in 12 of 14 sends on 2026-11-12, and
+/// `{":s": {"SS": ["a", "a"]}}` the duplicates text in one of two sends
+/// (2026-11-05). Beside a number fault in another value, the service named
 /// either value between two identical requests (measured 2026-11-05 and
 /// 2026-11-19), and this check comes after the numbers. With two set faults,
 /// `{":n": {"NS": []}, ":a": {"SS": []}}`, the service answered the `SS` text
