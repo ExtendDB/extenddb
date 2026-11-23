@@ -132,7 +132,7 @@ wasm_bindgen_cli_advice() {
 # none of which the checks below match.
 LOG=""
 run_suite() {
-    local suite="$1" lock runner words program printed version status=0 output results line name state expected reported problems=()
+    local suite="$1" lock runner words program printed version status=0 results line name state expected reported problems=()
     lock="$(lock_wasm_bindgen_version)"
     runner="${CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER:-}"
     if [ -z "$runner" ]; then
@@ -160,16 +160,14 @@ run_suite() {
     show CARGO_TERM_QUIET=false cargo test --locked --color never "${ARGS[@]}" --target "$TARGET"
     CARGO_TERM_QUIET=false cargo test --locked --color never "${ARGS[@]}" --target "$TARGET" 2>&1 | tee "$LOG" || status=$?
 
-    # Without colour escapes: cargo's --color never does not reach the runner's.
-    output="$(sed "s/$(printf '\033')\[[0-9;]*m//g" "$LOG")"
     if [ "$status" -ne 0 ]; then
         problems+=("cargo test exited with status ${status}")
     fi
-    results="$(grep -c '^test result: ' <<<"$output" || true)"
+    results="$(grep -c '^test result: ' "$LOG" || true)"
     if [ "$results" -ne 1 ]; then
         problems+=("expected one 'test result:' line, found ${results}")
     else
-        line="$(grep '^test result: ' <<<"$output")"
+        line="$(grep '^test result: ' "$LOG")"
         case "$line" in
             "test result: ok. ${#TESTS[@]} passed; 0 failed;"*) ;;
             *) problems+=("expected 'test result: ok. ${#TESTS[@]} passed; 0 failed;', found '${line}'") ;;
@@ -177,7 +175,7 @@ run_suite() {
     fi
     # One "<name> <state>" line per test the run reports, and the lines TESTS
     # expects, each sorted the same way for comm.
-    reported="$(sed -n 's/^test \(.*\) \.\.\. \([^ ]*\)$/\1 \2/p' <<<"$output" | LC_ALL=C sort)"
+    reported="$(sed -n 's/^test \(.*\) \.\.\. \([^ ]*\)$/\1 \2/p' "$LOG" | LC_ALL=C sort)"
     expected="$(printf '%s ok\n' "${TESTS[@]}" | LC_ALL=C sort)"
     while IFS= read -r line; do
         [ -n "$line" ] || continue
