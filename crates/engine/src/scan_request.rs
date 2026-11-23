@@ -105,11 +105,10 @@
 //! 2026-11-05); an empty value ahead of a malformed number inside one
 //! `ExpressionAttributeValues` entry (the empty value, the element order; the
 //! other way round is measured); a set fault in a `ScanFilter` list value
-//! (the texts of the older path, at the list's step); an empty name against
-//! the key's faults (the key first); nine or more names in one hash bucket
-//! (see [`fitted_member_order`]). The service refuses a member or entry name
-//! written twice as a `SerializationException` (`Duplicate key found in
-//! payload`, 2026-11-05, #630); the parser here keeps the last value.
+//! (the texts of the older path, at the list's step). The service refuses a
+//! member or entry name written twice as a `SerializationException`
+//! (`Duplicate key found in payload`, 2026-11-05, #630); the parser here keeps
+//! the last value.
 //!
 //! A member of the wrong JSON type anywhere in the body is reported ahead of
 //! all of them, as a `SerializationException` (see `shape_fault_first`; the
@@ -456,9 +455,11 @@ pub(crate) fn member_orders(raw_body: &[u8]) -> MemberOrders {
 /// fitted to the measured rows: the iteration order of a Java `HashMap` over
 /// the names, that is `String.hashCode()` of the name, spread as `h ^ (h >>>
 /// 16)`, masked to the table's buckets, the buckets in ascending order and the
-/// request's order inside a bucket. The table has four buckets for up to three
-/// names and doubles when it holds more than three quarters of its size
-/// ([`hash_table_mask`]): eight buckets for four to six names. With four
+/// request's order inside a bucket. The table starts with four buckets and
+/// doubles when it holds more than three quarters of its size, and when a
+/// name put in the request's order is the ninth in its bucket while the table
+/// has fewer than 64 buckets ([`hash_table_mask`]): eight buckets for four to
+/// six names spread over the buckets. With four
 /// buckets `sk` falls in bucket 0, `a` in 1, `b` in 2, `pk`, `gpk`, `id` and
 /// `ts` in 3; with eight, `sk` in 0, `gpk` and `pk` in 3, `gsk` in 6.
 ///
@@ -482,17 +483,24 @@ pub(crate) fn member_orders(raw_body: &[u8]) -> MemberOrders {
 /// `ExpressionAttributeValues` entries, two `ScanFilter` conditions, a key
 /// name outside the Basic Multilingual Plane (`𝄞`, hashed as its two UTF-16
 /// code units) and the request's order inside one bucket for the entries
-/// (`:e` ahead of `:a` when `:e` comes first); each as the rule gives. Java's
-/// `HashMap` also doubles a table under 64 buckets when one bucket reaches
-/// nine names; the model sizes the table by the count of names alone and
-/// departs from the JDK there (not measured).
+/// (`:e` ahead of `:a` when `:e` comes first); each as the rule gives.
+/// Measured 2026-11-23 (21:49 UTC, each body twice): of eight, nine and ten
+/// `ExpressionAttributeValues` entries in bucket 10 of sixteen, `:aa` first
+/// and `:dt` last in the request and both empty, the eight name `:aa` and the
+/// nine and ten name `:dt`, which the table doubled at the ninth name in one
+/// bucket puts in bucket 10 of 32, ahead of the others in 26. A bucket of a
+/// table of 64 buckets or more that reaches nine names becomes a tree in Java,
+/// which moves one of its names to the front of the bucket; the model keeps
+/// the request's order there (not measured).
 fn fitted_member_order<'a>(names_in_request_order: impl Iterator<Item = &'a str>) -> Vec<String> {
     let names: Vec<&str> = names_in_request_order.collect();
-    let mask = hash_table_mask(names.len());
+    let hashes: Vec<u32> = names.iter().map(|name| java_hash(name)).collect();
+    let mask = hash_table_mask(&hashes);
     let mut names: Vec<(u32, usize, &str)> = names
         .into_iter()
+        .zip(&hashes)
         .enumerate()
-        .map(|(position, name)| (java_hash_bucket(name, mask), position, name))
+        .map(|(position, (name, hash))| (hash & mask, position, name))
         .collect();
     names.sort_unstable();
     names
@@ -501,25 +509,61 @@ fn fitted_member_order<'a>(names_in_request_order: impl Iterator<Item = &'a str>
         .collect()
 }
 
-/// The bucket mask of a Java `HashMap` that starts with four buckets and
-/// doubles whenever it holds more than three quarters of its size: 3 for up to
-/// three names, 7 for four to six, 15 for seven to twelve, and so on.
-fn hash_table_mask(names: usize) -> u32 {
-    let mut buckets: usize = 4;
-    while names > buckets * 3 / 4 {
-        buckets *= 2;
+/// The bucket mask of a Java `HashMap` that starts with four buckets after
+/// names with the spread hashes `hashes` are put in that order: the table
+/// doubles when it holds more than three quarters of its size (3 for up to
+/// three names, 7 for four to six, 15 for seven to twelve, and so on), and
+/// when a put makes one bucket hold nine names while the table has fewer than
+/// 64 buckets (`HashMap.treeifyBin`). The count of each bucket is read again
+/// after each doubling, so the work grows with the name count times the
+/// number of doublings.
+fn hash_table_mask(hashes: &[u32]) -> u32 {
+    let bucket_counts = |hashes: &[u32], buckets: u32| {
+        let mut counts = vec![0usize; usize::try_from(buckets).unwrap_or(usize::MAX)];
+        for hash in hashes {
+            if let Some(count) = usize::try_from(hash & (buckets - 1))
+                .ok()
+                .and_then(|bucket| counts.get_mut(bucket))
+            {
+                *count += 1;
+            }
+        }
+        counts
+    };
+    let mut buckets: u32 = 4;
+    let mut counts = bucket_counts(&[], buckets);
+    for (put, hash) in hashes.iter().enumerate() {
+        let full_bucket = usize::try_from(hash & (buckets - 1))
+            .ok()
+            .and_then(|bucket| counts.get_mut(bucket))
+            .is_some_and(|count| {
+                *count += 1;
+                *count >= 9
+            });
+        let mut doubled = false;
+        if full_bucket && buckets < 64 {
+            buckets *= 2;
+            doubled = true;
+        }
+        if u64::try_from(put + 1).unwrap_or(u64::MAX) > u64::from(buckets) * 3 / 4 {
+            buckets = buckets.saturating_mul(2);
+            doubled = true;
+        }
+        if doubled {
+            counts = bucket_counts(&hashes[..=put], buckets);
+        }
     }
-    u32::try_from(buckets - 1).unwrap_or(u32::MAX)
+    buckets - 1
 }
 
-/// The bucket of `name` in a Java `HashMap` whose bucket mask is `mask`:
-/// `String.hashCode()` over the UTF-16 code units, spread as `h ^ (h >>> 16)`,
-/// masked. The arithmetic wraps as Java's `int` does.
-fn java_hash_bucket(name: &str, mask: u32) -> u32 {
+/// `String.hashCode()` of `name` in Java, over its UTF-16 code units, spread
+/// as `h ^ (h >>> 16)` as a `HashMap` spreads it before masking it to its
+/// buckets. The arithmetic wraps as Java's `int` does.
+fn java_hash(name: &str) -> u32 {
     let hash = name.encode_utf16().fold(0u32, |h, unit| {
         h.wrapping_mul(31).wrapping_add(u32::from(unit))
     });
-    (hash ^ (hash >> 16)) & mask
+    hash ^ (hash >> 16)
 }
 
 /// The names of the object `field` of the body in the fitted order
@@ -692,8 +736,8 @@ fn key_fault_text(fault: Fault<'_>, order: CheckOrder) -> DynamoDbError {
 ///
 /// After the entries the service reports an empty name in
 /// `ExpressionAttributeNames` (measured 2026-11-19: `{"#a": ""}` beside `{"X":
-/// "1"}` or `{}` answers the value's text); the name keys are request-time
-/// checks.
+/// "1"}` or `{}` answers the value's text; 2026-11-23: an empty key value
+/// comes ahead of it); the name keys are request-time checks.
 ///
 /// [`Self::take`] puts a readable stand-in in the body for each faulty entry
 /// and each empty name, so that the typed deserialization and the expression

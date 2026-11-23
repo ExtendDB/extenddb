@@ -21,8 +21,7 @@ use serde_json::{Value, json};
 
 use super::{
     CheckOrder, ExpressionValuesBody, MemberOrders, ScanFilterBody, SelectBody, StartKeyBody,
-    ValuesDepth, fitted_member_order, hash_table_mask, java_hash_bucket, member_orders,
-    request_checks,
+    ValuesDepth, fitted_member_order, hash_table_mask, java_hash, member_orders, request_checks,
 };
 
 const MIX: &str = "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {ScanFilter} Expression parameters: {FilterExpression}";
@@ -518,9 +517,12 @@ fn the_fitted_member_order_follows_the_hash_buckets_then_the_request() {
         (":a", 3),
         (":e", 3),
     ] {
-        assert_eq!(java_hash_bucket(name, 3), bucket, "{name}");
+        assert_eq!(java_hash(name) & 3, bucket, "{name}");
     }
     // The table doubles when it holds more than three quarters of its size.
+    // The names `n0`, `n1`, ... spread over the buckets.
+    let spread =
+        |count: usize| -> Vec<u32> { (0..count).map(|i| java_hash(&format!("n{i}"))).collect() };
     for (names, mask) in [
         (0, 3),
         (1, 3),
@@ -531,10 +533,10 @@ fn the_fitted_member_order_follows_the_hash_buckets_then_the_request() {
         (12, 15),
         (13, 31),
     ] {
-        assert_eq!(hash_table_mask(names), mask, "{names} names");
+        assert_eq!(hash_table_mask(&spread(names)), mask, "{names} names");
     }
     for (name, bucket) in [("sk", 0), ("gpk", 3), ("pk", 3), ("gsk", 6)] {
-        assert_eq!(java_hash_bucket(name, 7), bucket, "{name}");
+        assert_eq!(java_hash(name) & 7, bucket, "{name}");
     }
     let order = |names: &[&str]| fitted_member_order(names.iter().copied());
     // The pk, sk table: sk first in both request orders.
@@ -572,7 +574,33 @@ fn the_fitted_member_order_follows_the_hash_buckets_then_the_request() {
     // Seven names: sixteen buckets.
     let seven = ["a", "b", "c", "d", "e", "f", "g"];
     assert_eq!(order(&seven).len(), 7);
-    assert_eq!(hash_table_mask(seven.len()), 15);
+    assert_eq!(
+        hash_table_mask(&seven.iter().map(|name| java_hash(name)).collect::<Vec<_>>()),
+        15
+    );
+    // Measured 2026-11-23 at 21:49 UTC: every name below falls in bucket 10 of
+    // sixteen. Eight names keep sixteen buckets and the request's order; the
+    // ninth name in that bucket doubles the table, and with 32 buckets `:dt`
+    // falls in bucket 10, ahead of the others in 26.
+    let eight = [":aa", ":bb", ":cc", ":dd", ":ee", ":ff", ":gg", ":dt"];
+    let nine = [
+        ":aa", ":bb", ":cc", ":dd", ":ee", ":ff", ":gg", ":hh", ":dt",
+    ];
+    let ten = [
+        ":aa", ":bb", ":cc", ":dd", ":ee", ":ff", ":gg", ":hh", ":ii", ":dt",
+    ];
+    let hashes = |names: &[&str]| names.iter().map(|name| java_hash(name)).collect::<Vec<_>>();
+    for name in ten {
+        assert_eq!(java_hash(name) & 15, 10, "{name}");
+    }
+    assert_eq!(java_hash(":aa") & 31, 26);
+    assert_eq!(java_hash(":dt") & 31, 10);
+    assert_eq!(hash_table_mask(&hashes(&eight)), 15);
+    assert_eq!(hash_table_mask(&hashes(&nine)), 31);
+    assert_eq!(hash_table_mask(&hashes(&ten)), 31);
+    assert_eq!(order(&eight)[0], ":aa");
+    assert_eq!(order(&nine)[0], ":dt");
+    assert_eq!(order(&ten)[0], ":dt");
 }
 
 /// `member_orders` reads the member names of the three fields from the

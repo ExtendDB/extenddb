@@ -702,6 +702,17 @@ OLDER_TOTAL = ("Value '1000001' at 'totalSegments' failed to satisfy constraint:
 OLDER_SEGMENT = ("Value '-1' at 'segment' failed to satisfy constraint: Member must have value "
                  "greater than or equal to 0")
 
+# Names that share bucket 10 of a sixteen-bucket HashMap with :dt.
+BUCKET_10 = [":aa", ":bb", ":cc", ":dd", ":ee", ":ff", ":gg", ":hh", ":ii"]
+
+
+def _entries(names: list) -> str:
+    """An ExpressionAttributeValues object in the order of ``names``, :aa and
+    :dt empty, the others {"S": "x"}."""
+    return "{" + ", ".join(f'"{n}": {{}}' if n in (":aa", ":dt") else f'"{n}": {{"S": "x"}}'
+                           for n in names) + "}"
+
+
 # Measured 2026-11-23 at 14:03 and 21:49 UTC on a table that does not exist
 # (us-east-1, each body twice): (id, fields, expected).
 ROWS_2026_11_23 = [
@@ -729,6 +740,14 @@ ROWS_2026_11_23 = [
     # One key member in element order.
     ("d8-key-L-bob-empty", '"ExclusiveStartKey": {"pk": {"L": [{"N": "bob"}, {}]}, '
      '"sk": {"S": "s"}}', NUMERIC_BOB),
+    # Eight, nine and ten entries in bucket 10 of sixteen, :aa and :dt empty:
+    # the ninth name in one bucket doubles the table, and :dt comes first.
+    ("H8-eight-names-one-bucket", '"FilterExpression": "a = :bb", "ExpressionAttributeValues": '
+     + _entries(BUCKET_10[:7] + [":dt"]), EAV_VALUE + EMPTY_VALUE_BARE + " for key :aa"),
+    ("H9-nine-names-one-bucket", '"FilterExpression": "a = :bb", "ExpressionAttributeValues": '
+     + _entries(BUCKET_10[:8] + [":dt"]), EAV_VALUE + EMPTY_VALUE_BARE + " for key :dt"),
+    ("H10-ten-names-one-bucket", '"FilterExpression": "a = :bb", "ExpressionAttributeValues": '
+     + _entries(BUCKET_10 + [":dt"]), EAV_VALUE + EMPTY_VALUE_BARE + " for key :dt"),
     # The key's faults ahead of an empty name.
     ("E1-key-empty-and-empty-name", '"ExclusiveStartKey": {"pk": {}}, "FilterExpression": '
      '"#a = :x", "ExpressionAttributeNames": {"#a": ""}, "ExpressionAttributeValues": '
