@@ -1,28 +1,27 @@
 # Copyright 2026 ExtendDB contributors
 # SPDX-License-Identifier: Apache-2.0
 #
-# Clippy configuration for the WebAssembly build only. The clippy step of the
-# wasm workflow (`devtools/run-wasm-step clippy`) points CLIPPY_CONF_DIR at
-# this directory and runs with -D warnings, so each listed call is an error in
-# every workspace crate the step lints; native clippy does not read this file.
+# Clippy configuration for the WebAssembly build only. The wasm workflow's
+# clippy step (`devtools/run-wasm-step clippy`) points CLIPPY_CONF_DIR here and
+# runs with -D warnings, so a listed call is an error in the workspace crates it
+# lints; native clippy does not read this file.
 #
-# The lists name calls that compile for wasm32-unknown-unknown and trap or
-# hang when they run there: std there has no clock, threads, process ids or
-# environment, a wait that only another thread could end panics or never
-# ends, and the adapter runs its futures on the JavaScript event loop with no
-# tokio runtime, timer or blocking pool. Each entry's reason says what
-# happens. Clippy resolves each path, so a call through an import or a
-# re-export (`use tokio::time; time::sleep(..)`, `tokio::spawn`) is refused as
-# well. A for loop over a std mpsc Receiver waits in iterator methods clippy
-# does not check, so std's channel constructors and its Receiver type are
-# listed too.
-# Calls that return an error there instead of trapping (std::fs, std::net,
+# The lists name calls that compile for wasm32-unknown-unknown and trap or hang
+# when they run there: std there has no clock, threads, process ids or
+# environment, a wait that only another thread could end panics or never ends,
+# and the adapter runs its futures on the JavaScript event loop with no tokio
+# runtime, timer or blocking pool. Each entry's reason says what happens. Clippy
+# resolves each path, so a call through an import or a re-export (`use
+# tokio::time; time::sleep(..)`, `tokio::spawn`) is refused as well. A for loop
+# over a std mpsc Receiver waits in iterator methods clippy does not check, so
+# std's channel constructors and its Receiver type are listed too. Calls that
+# return an error there instead of trapping (std::fs, std::net,
 # std::process::Command, std::env::var, std::thread::Builder::spawn) are not
 # listed. The step's -D warnings also makes errors of clippy's
-# await_holding_lock and await_holding_refcell_ref lints, which warn by
-# default: a std lock guard or a RefCell borrow held across an .await traps
-# when another task takes a conflicting lock or borrow of the same value
-# before the first lets go, as every task runs on the one thread.
+# await_holding_lock and await_holding_refcell_ref lints, which warn by default:
+# a std lock guard or a RefCell borrow held across an .await traps when another
+# task takes a conflicting lock or borrow of the same value before the first
+# lets go, as every task runs on the one thread.
 #
 # A listed call that compiles for wasm32 but that no wasm32 request reaches
 # carries `#[allow(clippy::disallowed_methods, reason = "...")]` (for a type,
@@ -30,24 +29,25 @@
 # table of exactly a non-empty `path` and `reason`; `devtools/run-wasm-step
 # guard` checks that, and that the step refuses the calls its script plants.
 #
-# What the step does not see. An allow of either lint, or of a lint group that
-# holds it (such as the clippy::all on the `mod` line of a migration code
-# body), switches it off for the code it covers, whatever later calls that
-# code, and so does a lowered lint level (a crate attribute such as
-# `#![warn(warnings)]`, RUSTFLAGS, a compiler wrapper); review checks every
-# such allow and every new caller of code under one. Clippy does not see code
-# it does not compile: under a cfg that is false when it runs, such as
-# cfg(not(clippy)); in a cfg(debug_assertions) branch, as the step lints the
-# release profile; under a feature the wasm32 build does not enable. It does
-# not lint a dependency's own code: moka calls std::time::Instant::now when a
-# cache is built, so building an extenddb-cache SwrCache traps on wasm32 (only
-# the server builds one). It refuses only the calls listed here, and an entry
-# resolves only in a crate that loads the entry's crate, so one whose crate no
-# linted crate loads refuses nothing and clippy says nothing about it. The
-# await lints do not see a guard or borrow held inside another value (an
-# Option, a struct, a tuple). The headless parity corpus
-# (`devtools/run-wasm-step corpus`) finds a trap only on a path one of its
-# cases takes.
+# What the step does not see. An allow of either lint (in code or in a [lints]
+# table), or of a lint group that holds it (such as the clippy::all on the `mod`
+# line of a migration code body), switches it off for the code it covers,
+# whatever later calls that code. A lowered lint level (a crate attribute such
+# as `#![warn(warnings)]`, rustflags, a compiler wrapper) and a build script
+# that sets CLIPPY_CONF_DIR or CLIPPY_ARGS for its crate let a listed call
+# through too. Review checks each of them and every new caller of code under
+# one. Clippy does not see code it does not compile: under a cfg that is false
+# when it runs, such as cfg(not(clippy)); in a cfg(debug_assertions) branch, as
+# the step lints the release profile; under a feature the wasm32 build does not
+# enable. It does not lint a dependency's own code: moka calls
+# std::time::Instant::now when a cache is built, so building an extenddb-cache
+# SwrCache traps on wasm32 (only the server builds one). It refuses only the
+# calls listed here, and an entry resolves only in a crate that loads the
+# entry's crate, so one whose crate no linted crate loads refuses nothing and
+# clippy says nothing about it. The await lints do not see a guard or borrow
+# held inside another value (an Option, a struct, a tuple). The headless parity
+# corpus (`devtools/run-wasm-step corpus`) finds a trap only on a path one of
+# its cases takes.
 
 disallowed-methods = [
     # Clock
