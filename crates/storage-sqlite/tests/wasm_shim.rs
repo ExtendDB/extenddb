@@ -78,7 +78,7 @@ use futures::StreamExt;
 /// The number of rows `cases()` returns, written here by hand rather than
 /// counted from `cases()`, so that a row deleted from or filtered out of
 /// `cases()` fails the test. Adding or removing a row changes this number.
-const ROWS: usize = 73;
+const ROWS: usize = 93;
 
 /// The number of rows named `difference: ...`.
 const DIFFERENCE_ROWS: usize = 6;
@@ -130,6 +130,23 @@ macro_rules! decode {
             $expected,
             |pool| render(
                 sqlx::query_scalar::<_, $ty>(concat!("SELECT ", $stored))
+                    .fetch_one(&pool)
+                    .await
+            )
+        )
+    };
+}
+
+/// A bind row: `$value` bound to the one placeholder of a `SELECT` that reads
+/// back the storage class and the SQL text of the value it was given.
+macro_rules! bound {
+    ($value:expr, $expected:literal) => {
+        row!(
+            format!("{} binds as {}", stringify!($value), $expected),
+            format!("Ok({:?})", $expected),
+            |pool| render(
+                sqlx::query_scalar::<_, String>("SELECT typeof(?1) || ' ' || quote(?1)")
+                    .bind($value)
                     .fetch_one(&pool)
                     .await
             )
@@ -456,6 +473,26 @@ fn cases() -> Vec<Case> {
             |_pool| sqlx::Error::WorkerCrashed.to_string()
         ),
         // ── binding ──
+        bound!("hi", "text 'hi'"),
+        bound!("", "text ''"),
+        bound!("hi".to_owned(), "text 'hi'"),
+        bound!(&String::from("hi"), "text 'hi'"),
+        bound!(5_i64, "integer 5"),
+        bound!(i64::MIN, "integer -9223372036854775808"),
+        bound!(true, "integer 1"),
+        bound!(false, "integer 0"),
+        bound!(1.5_f64, "real 1.5"),
+        bound!(vec![1_u8, 2], "blob X'0102'"),
+        bound!(Vec::<u8>::new(), "blob X''"),
+        bound!(&[1_u8, 2][..], "blob X'0102'"),
+        bound!(&vec![1_u8, 2], "blob X'0102'"),
+        bound!(None::<i64>, "null NULL"),
+        bound!(Some(5_i64), "integer 5"),
+        bound!(None::<Vec<u8>>, "null NULL"),
+        bound!(Some(vec![1_u8]), "blob X'01'"),
+        bound!(Some(true), "integer 1"),
+        bound!(&None::<String>, "null NULL"),
+        bound!(&Some(String::from("hi")), "text 'hi'"),
         row!(
             "an argument past the placeholders is not bound",
             "Ok(1)",
