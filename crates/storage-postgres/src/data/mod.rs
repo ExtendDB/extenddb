@@ -153,6 +153,6 @@ pub mod vector_index;
 
 pub(crate) use ddl::{
     LockHolders, SQLSTATE_LOCK_NOT_AVAILABLE, delete_pending_queue_rows, drop_table_relations,
-    lock_not_available, lock_wait_failed, storage_in_use, table_storage_relations,
+    lock_not_available, lock_wait_failed, storage_in_use, table_storage_relations, undefined_table,
 };
 pub(crate) use index::{insert_index_rows_multi, item_has_index_keys, project_item_for_index};

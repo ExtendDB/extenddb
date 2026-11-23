@@ -73,7 +73,7 @@ use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 
 use super::{
     STORAGE_RELATION_PREFIX, data_table_name, index_table_name, lock_not_available,
-    table_storage_relations, vector_table_name,
+    table_storage_relations, undefined_table, vector_table_name,
 };
 
 /// How long `catalog-check` waits, in all, for the index changes in flight
@@ -99,9 +99,6 @@ const INDEX_LOCK_PAUSE: Duration = Duration::from_millis(50);
 /// The lock timeout of each drop: the bound the server's own synchronous
 /// drops use ([`crate::delete_table::SYNC_DROP_LOCK_TIMEOUT`], 1 s).
 pub(crate) const DROP_LOCK_TIMEOUT: Duration = crate::delete_table::SYNC_DROP_LOCK_TIMEOUT;
-
-/// SQLSTATE `undefined_table`: the relation to drop no longer exists.
-const SQLSTATE_UNDEFINED_TABLE: &str = "42P01";
 
 /// Every catalog row that names data relations, with its table's row. One
 /// statement, so the three tables are read from one snapshot.
@@ -422,9 +419,7 @@ async fn drop_relation(data: &PgPool, relation: &str) -> OrphanDrop {
     .await;
     match dropped {
         Ok(()) => OrphanDrop::Dropped,
-        Err(e) if sqlstate(&e).as_deref() == Some(SQLSTATE_UNDEFINED_TABLE) => {
-            OrphanDrop::AlreadyGone
-        }
+        Err(e) if undefined_table(&e) => OrphanDrop::AlreadyGone,
         Err(e) if lock_not_available(&e) => OrphanDrop::Failed(format!(
             "another session held a lock on it for more than {} ms, so it was kept; run the \
              command again: {e}",
@@ -432,12 +427,6 @@ async fn drop_relation(data: &PgPool, relation: &str) -> OrphanDrop {
         )),
         Err(e) => OrphanDrop::Failed(e.to_string()),
     }
-}
-
-fn sqlstate(e: &sqlx::Error) -> Option<String> {
-    e.as_database_error()
-        .and_then(sqlx::error::DatabaseError::code)
-        .map(std::borrow::Cow::into_owned)
 }
 
 /// Test hooks: hold the next check at a chosen point, so a test can change
