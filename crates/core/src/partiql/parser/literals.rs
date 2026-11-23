@@ -30,38 +30,132 @@ impl Parser {
         let mut map = BTreeMap::new();
         if !matches!(self.peek().kind, TokenKind::RBrace) {
             loop {
-                let key = match &self.peek().kind {
-                    TokenKind::String(s) => s.clone(),
-                    // (measured 2026-11-06: `{]`, `{)`, `{,}`, `{>>` and
-                    // `{'a': 1,}` are "Unexpected term", in a condition, a
-                    // SET value and brackets)
-                    _ if self.at_closing_token() => return Err(self.term_error()),
-                    _ => {
-                        self.eat_at_sign()?;
-                        return Err(ParseError::new(format!(
-                            "Tuple keys must be of type String. Actual type: Id under root at {}",
-                            self.span()
-                        )));
-                    }
-                };
-                if map.contains_key(&key) {
-                    self.refuse_duplicate_key(&key, path, &open);
+                let key = self.map_key(path)?;
+                if let Some(key) = &key
+                    && map.contains_key(key)
+                {
+                    self.refuse_duplicate_key(key, path, &open);
                 }
-                self.bump();
                 if !self.eat(&TokenKind::Colon) {
-                    return Err(ParseError::well_formed("Expected : in map literal"));
+                    return Err(ParseError::well_formed("Expected COLON"));
                 }
-                let val = self.literal_value(&format!("{path}.{key}"))?;
-                map.insert(key, val);
+                let val =
+                    self.literal_value(&format!("{path}.{}", key.as_deref().unwrap_or_default()))?;
+                if let Some(key) = key {
+                    map.insert(key, val);
+                }
                 if !self.eat(&TokenKind::Comma) {
                     break;
                 }
             }
         }
         if !self.eat(&TokenKind::RBrace) {
-            return Err(ParseError::well_formed("Expected } to close map literal"));
+            return Err(ParseError::well_formed("Expected RIGHT_CURLY"));
         }
         Ok(map)
+    }
+
+    /// The key of a member of a map literal or of the item map, or `None`
+    /// for a key that is refused. A string is the key, also in parentheses
+    /// (measured 2026-11-23: the item `{('a'): 1}` is refused for the
+    /// missing table, as `{'a': 1}` is), and a closing token is "Unexpected
+    /// term" (measured 2026-11-06: `{]`, `{)`, `{,}`, `{>>` and `{'a': 1,}`,
+    /// as an item, in a condition, a SET value and brackets). Another key
+    /// parses and is refused once the statement parses, by its type, at its
+    /// first token after any signs, parentheses and `@`; a list in
+    /// parentheses at its `(`, a NOT or a `-` at the operator (measured
+    /// 2026-11-23 as an item, in a map in it, in a SET value and in a
+    /// condition: `{1: 1}` is "Tuple keys must be of type String. Actual
+    /// type: INT under root at" the `1`, and `{1: 1, 'c': }` and `{{'a' 1}:
+    /// 1}` are syntax errors). A backtick literal is refused as an operand is
+    /// (see [`Parser::unsigned_atom`]). Any other token is refused at once,
+    /// as an Id. The text names `path`, the place of the map in the value:
+    /// `root` for the item and for a value's own map (measured 2026-11-23:
+    /// `{'pk': 'q', 'm': {1: 1}}` is under root), and `root.n` or `root[0]`
+    /// for a map inside it (measured 2026-11-23 with `{'m': {'n': {1: 1}}}`,
+    /// `[{1: 1}]` and `SET a = {'x': {1: 1}}`).
+    fn map_key(&mut self, path: &str) -> PResult<Option<String>> {
+        if let Some(number) = self.signed_number() {
+            let kind = if number.text.contains(['.', 'e', 'E']) {
+                "DECIMAL"
+            } else {
+                "INT"
+            };
+            self.defer(&key_refusal(kind, path, &number.at));
+            return Ok(None);
+        }
+        let at = self.span();
+        match self.peek().kind.clone() {
+            TokenKind::String(key) => {
+                self.bump();
+                return Ok(Some(key));
+            }
+            _ if self.at_closing_token() => return Err(self.term_error()),
+            TokenKind::LParen if !self.list_in_parentheses_ahead() => {
+                self.bump();
+                let key = self.nested(Nest::Group, |p| p.map_key(path))?;
+                if !self.eat(&TokenKind::RParen) {
+                    return Err(ParseError::well_formed("Expected RIGHT_PAREN"));
+                }
+                return Ok(key);
+            }
+            open @ (TokenKind::LParen
+            | TokenKind::LBracket
+            | TokenKind::LBrace
+            | TokenKind::LDoubleAngle) => {
+                let kind = match open {
+                    TokenKind::LBrace => "Struct",
+                    TokenKind::LDoubleAngle => "Bag",
+                    _ => "List",
+                };
+                self.defer(&key_refusal(kind, path, &at));
+                self.literal_value(LITERAL_ROOT)?;
+            }
+            TokenKind::Param => {
+                self.defer(&key_refusal("Parameter", path, &at));
+                self.bump();
+                self.take_param_index();
+            }
+            TokenKind::Ion(_) => {
+                self.unsigned_atom(&at)?;
+            }
+            TokenKind::Minus => {
+                self.defer(&key_refusal("Neg", path, &at));
+                self.bump();
+                self.operand()?;
+            }
+            _ if self.is_keyword("NOT") => {
+                self.defer(&key_refusal("Not", path, &at));
+                self.bump();
+                self.operand()?;
+            }
+            _ if self.call_starts_here() => {
+                self.defer(&key_refusal("Call", path, &at));
+                self.refused_call()?;
+            }
+            _ => {
+                // `@` needs a name before the key's type is read (measured
+                // 2026-11-23: `{@1: 1}` is "Identifier must follow
+                // @-operator").
+                self.eat_at_sign()?;
+                let kind = match &self.peek().kind {
+                    _ if self.path_starts_here() => "Path",
+                    TokenKind::QuotedIdent(_) => "Id",
+                    _ if self.at_name() => "Id",
+                    TokenKind::Ident(w) if word_class(w) == WordClass::Literal => {
+                        match w.to_ascii_lowercase().as_str() {
+                            "true" | "false" => "BOOL",
+                            "null" => "NULL",
+                            _ => "Missing",
+                        }
+                    }
+                    _ => return Err(ParseError::new(key_refusal("Id", path, &at))),
+                };
+                self.defer(&key_refusal(kind, path, &at));
+                self.path()?;
+            }
+        }
+        Ok(None)
     }
 
     /// The top-level `VALUE { ... }` item map, returned as ordered pairs. A
@@ -73,31 +167,22 @@ impl Parser {
         let mut pairs: Vec<(String, Operand)> = Vec::new();
         if !matches!(self.peek().kind, TokenKind::RBrace) {
             loop {
-                let key = match &self.peek().kind {
-                    TokenKind::String(s) => s.clone(),
-                    // (measured 2026-11-06: `VALUE {]`, `{)`, `{>>`, `{,}`,
-                    // `{'pk': 'a', ]` and `{'pk': 'a', 'sk': 's',}` are
-                    // "Unexpected term" in ExecuteStatement, a batch and a
-                    // transaction)
-                    _ if self.at_closing_token() => return Err(self.term_error()),
-                    _ => {
-                        // `@` needs a name before the key's type is read
-                        // (measured 2026-11-23: `{@1: 1}` is "Identifier must
-                        // follow @-operator").
-                        self.eat_at_sign()?;
-                        return Err(ParseError::new(format!(
-                            "Tuple keys must be of type String. Actual type: Id under root at {}",
-                            self.span()
-                        )));
-                    }
-                };
-                if pairs.iter().any(|(name, _)| *name == key) {
-                    let second = self.span();
-                    self.refuse_duplicate_key(&key, LITERAL_ROOT, &second);
+                // (measured 2026-11-06: `VALUE {]`, `{)`, `{>>`, `{,}`,
+                // `{'pk': 'a', ]` and `{'pk': 'a', 'sk': 's',}` are
+                // "Unexpected term" in ExecuteStatement, a batch and a
+                // transaction)
+                // A string key in parentheses is refused as repeated at the
+                // string (measured 2026-11-23: `{'pk': 'q', ('pk'): 'r'}` and
+                // `(('pk'))` name the `'pk'`).
+                let second = self.inner_span(self.pos);
+                let key = self.map_key(LITERAL_ROOT)?;
+                if let Some(key) = &key
+                    && pairs.iter().any(|(name, _)| name == key)
+                {
+                    self.refuse_duplicate_key(key, LITERAL_ROOT, &second);
                 }
-                self.bump();
                 if !self.eat(&TokenKind::Colon) {
-                    return Err(ParseError::well_formed("Expected : in item value"));
+                    return Err(ParseError::well_formed("Expected COLON"));
                 }
                 // A VALUE field may be a literal or a ? parameter. A name
                 // after `@` is never called (see `Parser::eat_at_sign`).
@@ -122,14 +207,16 @@ impl Parser {
                 } else {
                     Operand::Literal(self.literal_value(LITERAL_ROOT)?)
                 };
-                pairs.push((key, val));
+                if let Some(key) = key {
+                    pairs.push((key, val));
+                }
                 if !self.eat(&TokenKind::Comma) {
                     break;
                 }
             }
         }
         if !self.eat(&TokenKind::RBrace) {
-            return Err(ParseError::well_formed("Expected } to close item value"));
+            return Err(ParseError::well_formed("Expected RIGHT_CURLY"));
         }
         Ok(pairs)
     }
@@ -157,7 +244,7 @@ impl Parser {
             }
         }
         if !self.eat(&TokenKind::RBracket) {
-            return Err(ParseError::well_formed("Expected ] to close list literal"));
+            return Err(ParseError::well_formed("Expected RIGHT_BRACKET"));
         }
         Ok(items)
     }
@@ -202,6 +289,16 @@ impl Parser {
                 } else if first && self.at_name_in_literal() {
                     self.defer(&refusal);
                     self.path()?;
+                } else if first
+                    && matches!(
+                        self.peek().kind,
+                        TokenKind::LBrace | TokenKind::LBracket | TokenKind::LDoubleAngle
+                    )
+                {
+                    // Ahead of what the map, list or bag holds (measured
+                    // 2026-11-23: `<<{1: 1}>>` is the Bag text, not the key's).
+                    self.defer(&refusal);
+                    self.literal_value(path)?;
                 } else {
                     match self.literal_value(path)? {
                         AttributeValue::S(s) => {
@@ -384,6 +481,12 @@ impl Parser {
         ));
         self.path().map(drop)
     }
+}
+
+/// The refusal of a key of type `kind` at `at`, of the map at `path` (see
+/// [`Parser::map_key`]).
+fn key_refusal(kind: &str, path: &str, at: &str) -> String {
+    format!("Tuple keys must be of type String. Actual type: {kind} under {path} at {at}")
 }
 
 fn duplicate_bag_message(members: &[String]) -> String {

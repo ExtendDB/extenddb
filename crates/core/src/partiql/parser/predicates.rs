@@ -325,32 +325,22 @@ impl Parser {
     /// the name, and `((@foo(b), 1))` is "Expected RIGHT_PAREN").
     fn term_in_parentheses(&mut self, path: &str) -> PResult<bool> {
         let at_sign = self.eat_at_sign()?;
+        if !at_sign && self.call_starts_here() {
+            self.defer(&format!(
+                "Unsupported data type: Call under key {path} at {}",
+                self.span()
+            ));
+            self.refused_call()?;
+            return Ok(true);
+        }
         let next = self.tokens.get(self.pos + 1).map(|t| &t.kind);
         let name = match &self.peek().kind {
             TokenKind::Ident(w) => word_class(w) == WordClass::Name,
             TokenKind::QuotedIdent(_) => true,
             _ => false,
         };
-        let callable = !at_sign
-            && matches!(
-                &self.peek().kind,
-                TokenKind::Ident(w) if word_class(w) == WordClass::Name || is_function_keyword(w)
-            );
         match next {
             Some(TokenKind::Dot | TokenKind::LBracket) if name => {}
-            Some(TokenKind::LParen) if callable => {
-                self.defer(&format!(
-                    "Unsupported data type: Call under key {path} at {}",
-                    self.span()
-                ));
-                // What the arguments meet comes after the refusal.
-                self.bump();
-                let before = self.walk_part();
-                let args = self.call_args();
-                self.end_walk_part(before);
-                args?;
-                return Ok(true);
-            }
             _ if at_sign => {}
             Some(TokenKind::LParen) => return Ok(false),
             _ if matches!(self.peek().kind, TokenKind::QuotedIdent(_)) => {}
@@ -358,6 +348,25 @@ impl Parser {
         }
         self.refuse_name_in_literal(path, false)?;
         Ok(true)
+    }
+
+    /// Whether a call starts at the current token: a name, or a keyword that
+    /// names a function, with `(` after it.
+    pub(super) fn call_starts_here(&self) -> bool {
+        matches!(
+            &self.peek().kind,
+            TokenKind::Ident(w) if word_class(w) == WordClass::Name || is_function_keyword(w)
+        ) && self.nth_kind(1) == Some(&TokenKind::LParen)
+    }
+
+    /// Read the call at the current token, whose refusal has been kept: what
+    /// its arguments meet comes after the refusal.
+    pub(super) fn refused_call(&mut self) -> PResult<()> {
+        self.bump();
+        let before = self.walk_part();
+        let args = self.call_args();
+        self.end_walk_part(before);
+        args.map(drop)
     }
 
     /// The members of a bag after IN, or the items of an INSERT with no VALUE

@@ -608,11 +608,432 @@ fn names_paths_and_closing_tokens_in_literals() {
         ("SELECT * FROM <T> WHERE a = [,]", term),
         ("SELECT * FROM <T> WHERE a = {'x': ]}", term),
     ];
+    assert_rows(&rows);
+}
+
+#[test]
+fn literal_syntax_errors_and_tuple_keys() {
+    // The refusal of a map key that is not a string.
+    let key = |refused: &str| format!("Tuple keys must be of type String. Actual type: {refused}");
+    let ion = |refused: &str| format!("Ion Literals are not supported: {refused}");
+    // Measured 2026-11-23 on a table that does not exist, each statement
+    // twice. `<T>` is `"ets-parityat-missing"`, which the positions count.
+    let rows = [
+        // A missing colon, comma or closing token.
+        ("INSERT INTO <T> VALUE {'pk' 'q'}", wf("Expected COLON")),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q'",
+            wf("Expected RIGHT_CURLY"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q' 'a': 1}",
+            wf("Expected RIGHT_CURLY"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q']",
+            wf("Expected RIGHT_CURLY"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q'}}",
+            wf("Unexpected token after expression"),
+        ),
+        ("INSERT INTO <T> VALUE {'pk'}", wf("Expected COLON")),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'm': {'a' 1}}",
+            wf("Expected COLON"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'm': {'a': 1}",
+            wf("Expected RIGHT_CURLY"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'm': {'a': 1, 'b': 2",
+            wf("Expected RIGHT_CURLY"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'm': {'a': 1 'b': 2}}",
+            wf("Expected RIGHT_CURLY"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'm': {'a': 1]}",
+            wf("Expected RIGHT_CURLY"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'l': [1, 2}",
+            wf("Expected RIGHT_BRACKET"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'l': [1, 2",
+            wf("Expected RIGHT_BRACKET"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'l': [1 2]}",
+            wf("Expected RIGHT_BRACKET"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 's': <<1, 2}",
+            wf("Expected RIGHT_DOUBLE_ANGLE_BRACKET"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 's': <<1 2>>}",
+            wf("Expected RIGHT_DOUBLE_ANGLE_BRACKET"),
+        ),
+        (
+            "UPDATE <T> SET a = {'x' 1} WHERE pk = 'q'",
+            wf("Expected COLON"),
+        ),
+        (
+            "UPDATE <T> SET a = {'x': 1 WHERE pk = 'q'",
+            wf("Expected RIGHT_CURLY"),
+        ),
+        (
+            "UPDATE <T> SET a = [1, 2 WHERE pk = 'q'",
+            wf("Expected RIGHT_BRACKET"),
+        ),
+        (
+            "UPDATE <T> SET a = {'x': 1 'y': 2} WHERE pk = 'q'",
+            wf("Expected RIGHT_CURLY"),
+        ),
+        ("SELECT * FROM <T> WHERE a = {'x' 1}", wf("Expected COLON")),
+        (
+            "SELECT * FROM <T> WHERE a = {'x': 1",
+            wf("Expected RIGHT_CURLY"),
+        ),
+        (
+            "SELECT * FROM <T> WHERE a = [1, 2",
+            wf("Expected RIGHT_BRACKET"),
+        ),
+        (
+            "SELECT * FROM <T> WHERE a = [1 2]",
+            wf("Expected RIGHT_BRACKET"),
+        ),
+        (
+            "SELECT * FROM <T> WHERE a = {'x': 1 'y': 2}",
+            wf("Expected RIGHT_CURLY"),
+        ),
+        (
+            "SELECT * FROM <T> WHERE a = <<1, 2",
+            wf("Expected RIGHT_DOUBLE_ANGLE_BRACKET"),
+        ),
+        // Keys that are not strings, by type, at any depth.
+        (
+            "INSERT INTO <T> VALUE {1: 1}",
+            key("INT under root at 1:43:1"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {1: 1, 2: 2}",
+            key("INT under root at 1:43:1"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {-1: 1}",
+            key("INT under root at 1:44:1"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {+1: 1}",
+            key("INT under root at 1:44:1"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {(1): 1}",
+            key("INT under root at 1:44:1"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {1.5: 1}",
+            key("DECIMAL under root at 1:43:3"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {1e0: 1}",
+            key("DECIMAL under root at 1:43:3"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {1.0: 1}",
+            key("DECIMAL under root at 1:43:3"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {-1.5: 1}",
+            key("DECIMAL under root at 1:44:3"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {1e400: 1}",
+            key("DECIMAL under root at 1:43:5"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {true: 1}",
+            key("BOOL under root at 1:43:4"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {false: 1}",
+            key("BOOL under root at 1:43:5"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {null: 1}",
+            key("NULL under root at 1:43:4"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {NULL: 1}",
+            key("NULL under root at 1:43:4"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {missing: 1}",
+            key("Missing under root at 1:43:7"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {MISSING: 1}",
+            key("Missing under root at 1:43:7"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {{'a': 1}: 1}",
+            key("Struct under root at 1:43:1"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {{}: 1}",
+            key("Struct under root at 1:43:1"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {{'a': b}: 1}",
+            key("Struct under root at 1:43:1"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {[1]: 1}",
+            key("List under root at 1:43:1"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {[]: 1}",
+            key("List under root at 1:43:1"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {(1, 2): 1}",
+            key("List under root at 1:43:1"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {<<1>>: 1}",
+            key("Bag under root at 1:43:2"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {<<>>: 1}",
+            key("Bag under root at 1:43:2"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {?: 'q'}",
+            key("Parameter under root at 1:43:1"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {\"a\": 1}",
+            key("Id under root at 1:43:3"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {a.b: 1}",
+            key("Path under root at 1:43:1"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {a[0]: 1}",
+            key("Path under root at 1:43:1"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {a.b[0].c: 1}",
+            key("Path under root at 1:43:1"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {\"a\".b: 1}",
+            key("Path under root at 1:43:3"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {@a.b: 1}",
+            key("Path under root at 1:44:1"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {size(a): 1}",
+            key("Call under root at 1:43:4"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {NOT a: 1}",
+            key("Not under root at 1:43:3"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {-'a': 1}",
+            key("Neg under root at 1:43:1"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {`1`: 1}",
+            ion("INT under key root at 1:43:3"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {`\"pk\"`: 'q'}",
+            ion("STRING under key root at 1:43:6"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'm': {1: 1}}",
+            key("INT under root at 1:60:1"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'm': {true: 1}}",
+            key("BOOL under root at 1:60:4"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'm': {1.5: 1}}",
+            key("DECIMAL under root at 1:60:3"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'm': {?: 1}}",
+            key("Parameter under root at 1:60:1"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'm': {`1`: 1}}",
+            ion("INT under key root at 1:60:3"),
+        ),
+        (
+            "UPDATE <T> SET a = {1: 1} WHERE pk = 'q'",
+            key("INT under root at 1:40:1"),
+        ),
+        (
+            "UPDATE <T> SET a = {true: 1} WHERE pk = 'q'",
+            key("BOOL under root at 1:40:4"),
+        ),
+        (
+            "SELECT * FROM <T> WHERE a = {1: 1}",
+            key("INT under root at 1:49:1"),
+        ),
+        // A string in parentheses is a key: the service refuses the missing
+        // table.
+        ("INSERT INTO <T> VALUE {('a'): 1}", "parsed".to_owned()),
+        ("INSERT INTO <T> VALUE {(('a')): 1}", "parsed".to_owned()),
+        // The key refusal waits for the statement to parse, and the first
+        // refusal in the statement is reported.
+        ("INSERT INTO <T> VALUE {1: 1, 'c': }", wf("Unexpected term")),
+        ("INSERT INTO <T> VALUE {a: 1, 'c': }", wf("Unexpected term")),
+        ("INSERT INTO <T> VALUE {true: 1", wf("Expected RIGHT_CURLY")),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'm': {a: 1}, 'c': }",
+            wf("Unexpected term"),
+        ),
+        (
+            "UPDATE <T> SET a = {1: 1, 'c': } WHERE pk = 'q'",
+            wf("Unexpected term"),
+        ),
+        ("SELECT * FROM <T> WHERE a = {1: 1} AND", wf(MISSING_RHS)),
+        (
+            "INSERT INTO <T> VALUE {`1`: 1, 'c': }",
+            wf("Unexpected term"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {size(a): 1, 'c': }",
+            wf("Unexpected term"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {NOT a: 1, 'c': }",
+            wf("Unexpected term"),
+        ),
+        ("INSERT INTO <T> VALUE {size(: 1}", wf("Unexpected term")),
+        ("INSERT INTO <T> VALUE {{'a' 1}: 1}", wf("Expected COLON")),
+        (
+            "INSERT INTO <T> VALUE {[1 2]: 1}",
+            wf("Expected RIGHT_BRACKET"),
+        ),
+        ("INSERT INTO <T> VALUE {1 'b'}", wf("Expected COLON")),
+        ("INSERT INTO <T> VALUE {1}", wf("Expected COLON")),
+        ("INSERT INTO <T> VALUE {a b: 1}", wf("Expected COLON")),
+        (
+            "INSERT INTO <T> VALUE {\"a\" \"b\": 1}",
+            wf("Expected COLON"),
+        ),
+        ("INSERT INTO <T> VALUE {'a' 'b': 1}", wf("Expected COLON")),
+        (
+            "INSERT INTO <T> VALUE {'pk': b, 1: 1}",
+            "Unsupported data type: b under key root at 1:49:1".to_owned(),
+        ),
+        (
+            "INSERT INTO <T> VALUE {1: b}",
+            key("INT under root at 1:43:1"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'a': 1, 'a': 2, 1: 1}",
+            "Duplicate keys in tuple. Key: a under root at 1:62:3".to_owned(),
+        ),
+        (
+            "INSERT INTO <T> VALUE {1: 1, 'pk': 'q', 'pk': 'r'}",
+            key("INT under root at 1:43:1"),
+        ),
+        // The service names an expression key by its root operator (`Plus
+        // under root at 1:47:1` for the first), which the parser does not
+        // record (#887).
+        ("INSERT INTO <T> VALUE {'a' + 'b': 1}", wf("Expected COLON")),
+        ("INSERT INTO <T> VALUE {1 + 1: 1}", wf("Expected COLON")),
+        ("INSERT INTO <T> VALUE {'a' = 'b': 1}", wf("Expected COLON")),
+        (
+            "INSERT INTO <T> VALUE {'a' || 'b': 1}",
+            wf("Expected COLON"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {'a' || 'b' || 'c': 1}",
+            wf("Expected COLON"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {'a' LIKE 'b': 1}",
+            wf("Expected COLON"),
+        ),
+        ("INSERT INTO <T> VALUE {a IS NULL: 1}", wf("Expected COLON")),
+        // The key refusal comes ahead of the refusals of a bag.
+        (
+            "INSERT INTO <T> VALUE {<<1, 'a'>>: 1}",
+            key("Bag under root at 1:43:2"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {<<1, 1>>: 1}",
+            key("Bag under root at 1:43:2"),
+        ),
+        // The text names the place of the map in the value.
+        (
+            "UPDATE <T> SET a = {'x': {1: 1}} WHERE pk = 'q'",
+            key("INT under root.x at 1:46:1"),
+        ),
+        (
+            "UPDATE <T> SET a = [{1: 1}] WHERE pk = 'q'",
+            key("INT under root[0] at 1:41:1"),
+        ),
+        (
+            "UPDATE <T> SET a = list_append(a, [{1: 1}]) WHERE pk = 'q'",
+            key("INT under root[0] at 1:56:1"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'l': ({1: 1}, 2)}",
+            key("INT under root[0] at 1:61:1"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'l': [{1: 1}]}",
+            key("INT under root[0] at 1:61:1"),
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'm': {'n': {1: 1}}}",
+            key("INT under root.n at 1:66:1"),
+        ),
+        // A repeated string key in parentheses is named at the string.
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', ('pk'): 'r'}",
+            "Duplicate keys in tuple. Key: pk under root at 1:55:4".to_owned(),
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', (('pk')): 'r'}",
+            "Duplicate keys in tuple. Key: pk under root at 1:56:4".to_owned(),
+        ),
+        // A map as the first member of a bag gets the Bag refusal first.
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 's': <<{1: 1}>>}",
+            "Unsupported data type in Bag. DynamoDB only supports either numbers or strings in \
+             bags at 1:61:1"
+                .to_owned(),
+        ),
+    ];
+    assert_rows(&rows);
+}
+
+/// Check the answer of each statement, with `<T>` replaced by
+/// `"ets-parityat-missing"` and "parsed" for a statement that parses. Fails
+/// once, listing the rows that differ.
+fn assert_rows<S: AsRef<str>>(rows: &[(&str, S)]) {
     let mut differ = Vec::new();
-    for &(statement, expected) in &rows {
+    for (statement, expected) in rows {
         let statement = statement.replace("<T>", "\"ets-parityat-missing\"");
-        let answer = err(&statement);
-        if answer != expected {
+        let answer = parse(&statement).map_or_else(|e| e.message, |_| "parsed".to_owned());
+        if answer != expected.as_ref() {
             differ.push(format!("{statement}: {answer}"));
         }
     }
