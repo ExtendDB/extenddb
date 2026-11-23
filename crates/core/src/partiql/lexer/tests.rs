@@ -125,11 +125,14 @@ fn a_word_is_ascii_letters_digits_underscore_and_dollar() {
 }
 
 #[test]
-fn an_at_sign_before_a_word_reads_as_the_word() {
-    let tokens = lex("@n = 1").unwrap();
-    assert_eq!(tokens[0].kind, TokenKind::Ident("n".to_owned()));
-    assert_eq!((tokens[0].column, tokens[0].length), (1, 2));
-    assert!(lex("@ n").is_err());
+fn an_at_sign_is_a_token_of_its_own() {
+    assert_eq!(
+        numbers("@n @ n @1 @@"),
+        ["At", "word n", "At", "word n", "At", "1", "At", "At", "end"]
+    );
+    let tokens = lex("@n").unwrap();
+    let spans: Vec<_> = tokens.iter().map(|t| (t.column, t.length)).collect();
+    assert_eq!(spans, [(1, 1), (2, 1), (3, 0)]);
 }
 
 #[test]

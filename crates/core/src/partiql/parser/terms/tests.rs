@@ -1,7 +1,8 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Unit tests for the answers for a reserved word where a term or a name starts.
+//! Unit tests for the answers for a reserved word or an `@` where a term or a
+//! name starts.
 
 use crate::partiql::parser::{
     EXISTS_OUTSIDE_TRANSACTION, UNSUPPORTED_IN_TRANSACTION, parse_for_execute_statement,
@@ -340,4 +341,180 @@ fn a_query_where_a_term_starts_is_refused_at_its_select() {
         answer("SELECT * FROM \"tbl\" WHERE pk = (SELECT a)"),
         wf("Expected FROM after SELECT list")
     );
+}
+
+/// Stands for the answer a statement gets with each `@` replaced by a space:
+/// the name after an `@` reads as the name, at the name's position.
+const AS_THE_NAME: &str = "as the name";
+
+#[test]
+fn an_at_sign_must_have_a_name_after_it() {
+    let at: &str = &wf("Identifier must follow @-operator");
+    let from: &str = &wf("Expected FROM after SELECT list");
+    let after: &str = &wf("Unexpected token after expression");
+    let simple: &str = &wf("Expected identifier for simple path");
+    let not_simple: &str = &wf("Invalid path component for simple path");
+    let dot: &str = &wf("Invalid path dot component");
+    let paren: &str = &wf("Expected RIGHT_PAREN");
+    let alias: &str = &wf("Expected identifier for AS-alias");
+    let exec: &str = &wf("Keyword foo only expected at the top level in the query");
+    let exec_at: &str = &wf("Keyword @ only expected at the top level in the query");
+    let curly: &str = &wf("Expected } to close item value");
+    let lexing: &str = &wf("");
+    let (parsed, name) = ("parsed", AS_THE_NAME);
+    // Measured 2026-11-23 on tables that do not exist, each statement twice:
+    // "parsed" where the service refuses the missing table. `<T>` is
+    // `"ets-parityat-missing"`, which the positions count.
+    let rows = [
+        ("SELECT @a FROM <T> WHERE pk = 'q'", parsed),
+        ("SELECT @ a FROM <T> WHERE pk = 'q'", parsed),
+        ("SELECT @\"a\" FROM <T> WHERE pk = 'q'", parsed),
+        ("SELECT @ \"a\" FROM <T> WHERE pk = 'q'", parsed),
+        ("SELECT @a.b FROM <T> WHERE pk = 'q'", parsed),
+        ("SELECT @a[0] FROM <T> WHERE pk = 'q'", parsed),
+        (
+            "SELECT @a AS x FROM <T> WHERE pk = 'q'",
+            "Aliasing is not supported",
+        ),
+        ("SELECT @size(a) FROM <T> WHERE pk = 'q'", at),
+        ("SELECT @SIZE(a) FROM <T> WHERE pk = 'q'", at),
+        ("SELECT @ size(a) FROM <T> WHERE pk = 'q'", at),
+        ("SELECT @size FROM <T> WHERE pk = 'q'", at),
+        ("SELECT @select FROM <T> WHERE pk = 'q'", at),
+        ("SELECT @missing FROM <T> WHERE pk = 'q'", at),
+        ("SELECT @null FROM <T> WHERE pk = 'q'", at),
+        ("SELECT @and FROM <T> WHERE pk = 'q'", at),
+        ("SELECT @as FROM <T> WHERE pk = 'q'", at),
+        ("SELECT @1 FROM <T> WHERE pk = 'q'", at),
+        ("SELECT @'s' FROM <T> WHERE pk = 'q'", at),
+        ("SELECT @@a FROM <T> WHERE pk = 'q'", at),
+        ("SELECT @(a) FROM <T> WHERE pk = 'q'", at),
+        ("SELECT @ FROM <T> WHERE pk = 'q'", at),
+        ("SELECT @foo(a) FROM <T> WHERE pk = 'q'", from),
+        ("SELECT @begins_with(a, 'x') FROM <T> WHERE pk = 'q'", from),
+        ("SELECT @\"size\"(a) FROM <T> WHERE pk = 'q'", from),
+        ("SELECT a.@b FROM <T> WHERE pk = 'q'", dot),
+        ("SELECT @size FROM <T> WHERE pk = 'q' #", lexing),
+        ("SELECT * FROM <T> WHERE @pk = 'q'", parsed),
+        ("SELECT * FROM <T> WHERE size(@a) = 1", parsed),
+        ("SELECT * FROM <T> WHERE begins_with(@pk, 'q')", parsed),
+        ("SELECT * FROM <T> WHERE attribute_exists(@a)", parsed),
+        ("SELECT * FROM <T> WHERE @a IS MISSING", parsed),
+        ("SELECT * FROM <T> WHERE @a IN [1, 2]", parsed),
+        ("SELECT * FROM <T> WHERE @a BETWEEN 1 AND 2", parsed),
+        ("SELECT * FROM <T> WHERE pk = 'q' AND @\"a\" = 1", parsed),
+        ("SELECT * FROM <T> WHERE pk = 'q' ORDER BY @a", parsed),
+        ("SELECT * FROM <T> WHERE @size(a) = 1", at),
+        ("SELECT * FROM <T> WHERE pk = @", at),
+        ("SELECT * FROM <T> WHERE @foo(a) = 1", after),
+        ("SELECT * FROM <T> WHERE @begins_with(pk, 'q')", after),
+        ("SELECT * FROM <T> WHERE pk = 'q' @", after),
+        ("SELECT * FROM @<T> WHERE pk = 'q'", parsed),
+        ("SELECT * FROM @etsparityatmissing WHERE pk = 'q'", parsed),
+        ("UPDATE <T> SET a = @b WHERE pk = 'q'", parsed),
+        ("UPDATE <T> SET a = 1 WHERE @pk = 'q'", parsed),
+        (
+            "UPDATE <T> SET a = list_append(@b, [1]) WHERE pk = 'q'",
+            parsed,
+        ),
+        ("UPDATE <T> SET a = @size(b) WHERE pk = 'q'", at),
+        ("UPDATE <T> SET a = 1 WHERE pk = @", at),
+        ("UPDATE <T> SET a = @foo(b) WHERE pk = 'q'", after),
+        ("UPDATE <T> SET @a = 1 WHERE pk = 'q'", simple),
+        ("UPDATE <T> SET @size = 1 WHERE pk = 'q'", simple),
+        ("UPDATE <T> REMOVE @a WHERE pk = 'q'", simple),
+        ("UPDATE @<T> SET a = 1 WHERE pk = 'q'", simple),
+        ("DELETE FROM <T> WHERE @pk = 'q'", parsed),
+        ("DELETE FROM <T> WHERE pk = @size(a)", at),
+        ("DELETE FROM @<T> WHERE pk = 'q'", simple),
+        ("INSERT INTO @<T> VALUE {'pk': 'q'}", simple),
+        ("INSERT INTO <T> VALUE {'pk': 'q', 'a': @size(b)}", at),
+        (
+            "INSERT INTO <T> VALUE {'pk': @a}",
+            "Unsupported data type: a under key root at 1:50:1",
+        ),
+        // With an `@` before them or none, the service refuses `"b"` and `a.b`
+        // as item values with texts ExtendDB does not give.
+        ("INSERT INTO <T> VALUE {'pk': 'q', 'a': @\"b\"}", name),
+        ("INSERT INTO <T> VALUE {'pk': 'q', 'a': @a.b}", name),
+        // The other places where an operand or an alias starts.
+        ("SELECT * FROM <T> WHERE pk = 'q' ORDER BY pk, @a", parsed),
+        ("SELECT * FROM <T> WHERE pk = 'q' ORDER BY @m.x", parsed),
+        ("SELECT * FROM <T> WHERE a IN <<@b>>", parsed),
+        ("SELECT * FROM <T> WHERE m[@k] = 1", parsed),
+        ("UPDATE <T> SET m[@k] = 1 WHERE pk = 'q'", not_simple),
+        (
+            "UPDATE <T> SET a = [@b] WHERE pk = 'q'",
+            "Unsupported data type: Id under key root[0] at 1:41:1",
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'm': {'x': @y}}",
+            "Unsupported data type: Id under key root.x at 1:66:1",
+        ),
+        (
+            "SELECT * FROM <T> WHERE @a IS INT4",
+            "Unsupported data type for IS operator: Integer4Type. Supported data types are \
+             [MISSING, NULL, BOOLEAN, BLOB, STRING, NUMERIC, STRUCT, TUPLE, LIST] at 1:45:1",
+        ),
+        (
+            "UPDATE <T> SET s = set_add(@s, 5) WHERE pk = 'q'",
+            "The second argument to SET_ADD must be a value with type SET at 1:48:1",
+        ),
+        (
+            "INSERT INTO <T> VALUE {@a: 1}",
+            "Tuple keys must be of type String. Actual type: Id under root at 1:44:1",
+        ),
+        (
+            "SELECT * FROM <T> WHERE a IN ((@m.b, 1))",
+            "Unsupported data type: Path under key root[0] at 1:52:1",
+        ),
+        (
+            "SELECT * FROM <T> WHERE a IN ((@\"pk\", 1))",
+            "Unsupported data type: Id under key root[0] at 1:52:4",
+        ),
+        ("SELECT * FROM <T> WHERE a IN ((@foo(b), 1))", paren),
+        ("SELECT pk AS @x FROM <T> WHERE pk = 'q'", alias),
+        ("SELECT * FROM <T> @x WHERE pk = 'q'", after),
+        ("SELECT * FROM <T> WHERE exec foo @a", exec),
+        (
+            "UPDATE <T> SET a = @set_add(a, <<'x'>>) WHERE pk = 'q'",
+            after,
+        ),
+        ("@foo(1)", after),
+        // The service names the missing `}` "Expected RIGHT_CURLY", a text
+        // ExtendDB does not give for an item value (#887).
+        ("INSERT INTO <T> VALUE {'pk': 'q', 'a': @foo(b)}", curly),
+        ("INSERT INTO <T> VALUE {@1: 1}", at),
+        ("INSERT INTO <T> VALUE {'pk': 'q', 'm': {@1: 1}}", at),
+        ("INSERT INTO <T> VALUE {'pk': 'q', 'm': {@'x': 1}}", at),
+        ("SELECT * FROM <T> WHERE a IN @", at),
+        (
+            "SELECT * FROM <T> WHERE a IN @b",
+            "IN operator must have a left hand argument of type Variable Reference and \
+             right hand argument of type Seq with at least one member",
+        ),
+        ("SELECT * FROM <T> WHERE exec @a", exec_at),
+        ("UPDATE <T> REMOVE m[@k] WHERE pk = 'q'", not_simple),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'm': {@a: 1}}",
+            "Tuple keys must be of type String. Actual type: Id under root at 1:61:1",
+        ),
+        // The service gives `<<a>>` and `<<@a>>` the Bag text, at the name;
+        // ExtendDB gives a name in a bag the name's own text (#1383).
+        ("INSERT INTO <T> VALUE {'pk': 'q', 's': <<@a>>}", name),
+        (
+            "INSERT INTO <T> VALUE @a",
+            "Unsupported format in item expression. Please use struct format {...} to \
+             express item values for insert statement. at 1:43:1",
+        ),
+    ];
+    for (statement, expected) in rows {
+        let statement = statement.replace("<T>", "\"ets-parityat-missing\"");
+        let expected = if expected == AS_THE_NAME {
+            answer(&statement.replace('@', " "))
+        } else {
+            expected.to_owned()
+        };
+        assert_eq!(answer(&statement), expected, "{statement}");
+    }
 }

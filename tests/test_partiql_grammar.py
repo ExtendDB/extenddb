@@ -625,6 +625,29 @@ def test_at_and_dollar_words_are_names(dynamodb_client, stable):
     assert _select(dynamodb_client, f"SELECT pk FROM \"{stable}\" WHERE pk = 'at' AND $x = 1") == []
 
 
+# Measured 2026-11-23 on a table that does not exist: `@` must have a name
+# after it, a word that is not reserved or a quoted name, and a `(` after the
+# name does not start a call. A SET target takes no `@`. None stands for the
+# refusal of the missing table.
+@pytest.mark.parametrize(
+    ("statement", "reason"),
+    [
+        ("SELECT @ \"a\" FROM {t} WHERE pk = 'q'", None),
+        ("SELECT @size(a) FROM {t} WHERE pk = 'q'", "Identifier must follow @-operator"),
+        ("SELECT * FROM {t} WHERE pk = @", "Identifier must follow @-operator"),
+        ("SELECT @foo(a) FROM {t} WHERE pk = 'q'", "Expected FROM after SELECT list"),
+        ("SELECT * FROM {t} WHERE @foo(a) = 1", "Unexpected token after expression"),
+        ("UPDATE {t} SET @a = 1 WHERE pk = 'q'", "Expected identifier for simple path"),
+    ],
+)
+def test_an_at_sign_takes_a_name(dynamodb_client, stable, statement, reason):
+    code, message = _err(dynamodb_client, statement.format(t=f'"{stable}-absent"'))
+    if reason is None:
+        assert code == "ResourceNotFoundException", message
+    else:
+        assert (code, message) == ("ValidationException", f"{WF}{reason}")
+
+
 def test_a_word_with_a_letter_outside_ascii_does_not_lex(dynamodb_client, stable):
     statement = f"SELECT * FROM \"{stable}\" WHERE pk = 'p' AND café = 1"
     assert _message(dynamodb_client, statement) == WF

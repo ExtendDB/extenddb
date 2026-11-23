@@ -55,7 +55,10 @@ impl Parser {
         }
     }
 
+    /// A path: its first step, with an `@` before it or none (see
+    /// [`Parser::eat_at_sign`]), and the steps after it.
     pub(super) fn path(&mut self) -> PResult<Path> {
+        self.eat_at_sign()?;
         let root = match &self.peek().kind {
             TokenKind::Ident(s)
                 if matches!(word_class(s), WordClass::Name | WordClass::Literal) =>
@@ -140,8 +143,13 @@ impl Parser {
     /// `m[]` in a condition, a SET target and ORDER BY). The step returned
     /// for a refused content stands for it and is never used. In an inner
     /// bracket and in an ORDER BY term the content is only read (see
-    /// [`Brackets`]).
+    /// [`Brackets`]). An `@` may come before the content (see
+    /// [`Parser::eat_at_sign`]), except in a SET or REMOVE target (measured
+    /// 2026-11-23 on a table that does not exist: `WHERE m[@k] = 1` is
+    /// refused for the table, `SET m[@k] = 1` is "Invalid path component for
+    /// simple path").
     fn bracket_step(&mut self) -> PResult<(PathStep, bool)> {
+        let at_sign = self.eat_at_sign()?;
         let at = self.span();
         if self.path_starts_here() {
             self.bump();
@@ -172,12 +180,12 @@ impl Parser {
                 if name.is_empty() {
                     self.defer_bracket("Path component cannot be an empty string");
                 }
-                Ok((PathStep::Attribute(name), true))
+                Ok((PathStep::Attribute(name), !at_sign))
             }
             TokenKind::Ident(word) => match word_class(&word) {
                 WordClass::Name => {
                     self.bump();
-                    Ok((PathStep::Attribute(word), true))
+                    Ok((PathStep::Attribute(word), !at_sign))
                 }
                 WordClass::Literal => {
                     self.bump();

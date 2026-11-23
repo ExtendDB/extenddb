@@ -350,8 +350,12 @@ impl Parser {
     }
 
     /// Span string `line:column:length` for the current token, for `... at <l:c:len>` messages.
+    /// At an `@` it is the span of the name after it, which the service names
+    /// for an operand that starts with `@` (measured 2026-11-23: `{@a: 1}` and
+    /// `set_add(@s, 5)` are refused one column after `{a: 1}` and
+    /// `set_add(s, 5)`).
     fn span(&self) -> String {
-        let t = self.peek();
+        let t = &self.tokens[self.pos + usize::from(self.peek().kind == TokenKind::At)];
         format!("{}:{}:{}", t.line, t.column, t.length)
     }
 
@@ -442,6 +446,30 @@ impl Parser {
     /// Whether the current token is an unquoted word usable as a name.
     fn at_name(&self) -> bool {
         matches!(&self.peek().kind, TokenKind::Ident(s) if word_class(s) == WordClass::Name)
+    }
+
+    /// Read the `@` at the current token, if there is one, and return whether
+    /// there was. The service reads `@` as an operator that must have a name
+    /// after it: an unquoted word that is not reserved, or a quoted name, with
+    /// or without white space between them. Anything else after the `@`, the
+    /// end of the statement included, is a syntax error (measured 2026-11-23
+    /// with `size`, `select`, `and`, `as`, `null`, `missing`, FROM, a number,
+    /// a string, `(`, a second `@` and nothing after it). The current token is
+    /// then the name, which the caller reads as a name with no `@` before it,
+    /// except that a `(` after the name does not start a call (measured
+    /// 2026-11-23: `@foo(a)` is "Expected FROM after SELECT list" in the
+    /// select list and "Unexpected token after expression" in a condition and
+    /// a SET value). The refusal of a name in a value names the name, not the
+    /// `@` (measured 2026-11-23: `{'pk': @a}` is refused at the `a`).
+    fn eat_at_sign(&mut self) -> PResult<bool> {
+        if !matches!(self.peek().kind, TokenKind::At) {
+            return Ok(false);
+        }
+        if !self.name_follows() {
+            return Err(ParseError::well_formed("Identifier must follow @-operator"));
+        }
+        self.bump();
+        Ok(true)
     }
 
     /// An optional alias after a table. The service reads an alias and then

@@ -37,6 +37,7 @@ impl Parser {
                     // SET value and brackets)
                     _ if self.at_closing_token() => return Err(self.term_error()),
                     _ => {
+                        self.eat_at_sign()?;
                         return Err(ParseError::new(format!(
                             "Tuple keys must be of type String. Actual type: Id under root at {}",
                             self.span()
@@ -80,6 +81,10 @@ impl Parser {
                     // transaction)
                     _ if self.at_closing_token() => return Err(self.term_error()),
                     _ => {
+                        // `@` needs a name before the key's type is read
+                        // (measured 2026-11-23: `{@1: 1}` is "Identifier must
+                        // follow @-operator").
+                        self.eat_at_sign()?;
                         return Err(ParseError::new(format!(
                             "Tuple keys must be of type String. Actual type: Id under root at {}",
                             self.span()
@@ -94,18 +99,24 @@ impl Parser {
                 if !self.eat(&TokenKind::Colon) {
                     return Err(ParseError::well_formed("Expected : in item value"));
                 }
-                // A VALUE field may be a literal or a ? parameter.
+                // A VALUE field may be a literal or a ? parameter. A name
+                // after `@` is never called (see `Parser::eat_at_sign`).
+                let at_sign = self.eat_at_sign()?;
                 let val = if matches!(self.peek().kind, TokenKind::Param) {
                     self.bump();
                     Operand::Parameter(self.take_param_index())
-                } else if let Some(refusal) = self.function_as_item_value() {
+                } else if !at_sign && let Some(refusal) = self.function_as_item_value() {
                     return Err(refusal);
                 } else if let TokenKind::Ident(name) = &self.peek().kind
-                    && self.at_name_in_literal(name)
+                    && (self.at_name_in_literal(name)
+                        || (at_sign && self.nth_kind(1) == Some(&TokenKind::LParen)))
                 {
                     // A name as the whole value is refused naming itself
                     // (measured 2026-11-02: `{'pk': pk}` is "Unsupported
-                    // data type: pk under key root").
+                    // data type: pk under key root"), also with `(` after a
+                    // name after `@`, which the map then refuses as a
+                    // missing `}` (measured 2026-11-23 with `{'pk': 'q', 'a':
+                    // @foo(b)}`).
                     let refusal = format!(
                         "Unsupported data type: {name} under key {LITERAL_ROOT} at {}",
                         self.span()
@@ -241,6 +252,7 @@ impl Parser {
             self.note_number(&number, path);
             return Ok(AttributeValue::N(number.text));
         }
+        self.eat_at_sign()?;
         match self.peek().kind.clone() {
             TokenKind::LParen => self.literal_in_parentheses(path),
             // A parameter inside a literal parses and is refused at its

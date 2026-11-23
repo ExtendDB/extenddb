@@ -12,9 +12,10 @@
 //! `... at <l:c:len>` messages.
 //!
 //! An unquoted word is ASCII letters, digits, `_` and `$`, not starting with a
-//! digit, and `@` before a word reads as that word (measured 2026-11-02: `$x`
-//! and `@n` are names, `café` does not lex). `%`, `/` and `||` are operators
-//! the parser reads and then refuses.
+//! digit (measured 2026-11-02: `$x` is a name, `café` does not lex). `@` is a
+//! token of its own, which the parser reads before a name (see
+//! `Parser::eat_at_sign`). `%`, `/` and `||` are operators the parser reads
+//! and then refuses.
 //!
 //! A number is digits, an optional dot with optional digits, then an optional
 //! exponent that must have digits; it may also start with its decimal point
@@ -78,6 +79,8 @@ pub enum TokenKind {
     Slash,
     /// `||`
     Concat,
+    /// `@`, which the parser reads before a name.
+    At,
     Semicolon,
     Eof,
 }
@@ -264,18 +267,6 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                 });
                 advance(&mut i, &mut line, &mut col, len, &chars);
             }
-            // `@name` reads as the name; the span keeps the `@`.
-            '@' if chars.get(i + 1).copied().is_some_and(is_word_start) => {
-                let len = 1 + word_len(&chars, i + 1);
-                let text: String = chars[i + 1..i + len].iter().collect();
-                tokens.push(Token {
-                    kind: TokenKind::Ident(text),
-                    line: start_line,
-                    column: start_col,
-                    length: len,
-                });
-                advance(&mut i, &mut line, &mut col, len, &chars);
-            }
             '`' => {
                 let Some(close) = chars[i + 1..].iter().position(|&ch| ch == '`') else {
                     return Err(LexError {
@@ -324,6 +315,7 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                             '%' => TokenKind::Percent,
                             '/' => TokenKind::Slash,
                             '?' => TokenKind::Param,
+                            '@' => TokenKind::At,
                             ';' => TokenKind::Semicolon,
                             other => {
                                 return Err(LexError {

@@ -64,15 +64,15 @@ impl Parser {
             // 2026-11-03: `ORDER BY pk DESC, sk`, `pk, sk ASC` and `sk DESC,
             // pk` run). A comma that ends the statement is "Unexpected term"
             // (measured 2026-11-03). A comma before anything else but a name
-            // stays a token left over after the statement; the service
-            // answers `ORDER BY pk, 1` with an internal error.
+            // or an `@` stays a token left over after the statement; the
+            // service answers `ORDER BY pk, 1` with an internal error.
             let mut terms = vec![self.order_term()?];
             while matches!(self.peek().kind, TokenKind::Comma) {
                 if matches!(self.nth_kind(1), Some(TokenKind::Eof)) {
                     self.bump();
                     return Err(self.term_error());
                 }
-                if !self.name_follows() {
+                if !self.name_follows() && self.nth_kind(1) != Some(&TokenKind::At) {
                     break;
                 }
                 self.bump();
@@ -233,6 +233,9 @@ impl Parser {
     }
 
     fn parse_from_source(&mut self) -> PResult<FromSource> {
+        // (measured 2026-11-23: `FROM @"t"` and `FROM @t` on a table that does
+        // not exist are refused for the missing table)
+        self.eat_at_sign()?;
         let table = match &self.peek().kind {
             // A quoted or an unquoted name (measured 2026-11-02: `FROM t` runs).
             TokenKind::QuotedIdent(s) => {
