@@ -25,29 +25,29 @@
 #
 # A listed call that compiles for wasm32 but that no wasm32 request reaches
 # carries `#[allow(clippy::disallowed_methods, reason = "...")]` (for a type,
-# `clippy::disallowed_types`), with a reason that says why. Each entry is a
-# table of exactly a non-empty `path` and `reason`; `devtools/run-wasm-step
-# guard` checks that, and that the step refuses the calls its script plants.
+# `clippy::disallowed_types`), with a reason that says why.
+# `devtools/run-wasm-step guard` checks the form of each entry and that the step
+# refuses the calls it plants.
 #
-# What the step does not see. An allow of either lint (in code or in a [lints]
-# table), or of a lint group that holds it (such as the clippy::all on the `mod`
-# line of a migration code body), switches it off for the code it covers,
-# whatever later calls that code. A lowered lint level (a crate attribute such
-# as `#![warn(warnings)]`, rustflags, a compiler wrapper) and a build script
-# that sets CLIPPY_CONF_DIR or CLIPPY_ARGS for its crate let a listed call
-# through too. Review checks each of them and every new caller of code under
-# one. Clippy does not see code it does not compile: under a cfg that is false
-# when it runs, such as cfg(not(clippy)); in a cfg(debug_assertions) branch, as
-# the step lints the release profile; under a feature the wasm32 build does not
-# enable. It does not lint a dependency's own code: moka calls
-# std::time::Instant::now when a cache is built, so building an extenddb-cache
-# SwrCache traps on wasm32 (only the server builds one). It refuses only the
-# calls listed here, and an entry resolves only in a crate that loads the
-# entry's crate, so one whose crate no linted crate loads refuses nothing and
-# clippy says nothing about it. The await lints do not see a guard or borrow
-# held inside another value (an Option, a struct, a tuple). The headless parity
-# corpus (`devtools/run-wasm-step corpus`) finds a trap only on a path one of
-# its cases takes.
+# What the step does not see. An allow or expect of any of the four lints named
+# above (on the crate, an item or a statement, or in a [lints] table), or of a
+# lint group that holds one (such as the clippy::all on the `mod` line of a
+# migration code body), switches that lint off for the code it covers, whatever
+# later calls that code. A lowered lint level (an attribute such as
+# `#[warn(warnings)]`, rustflags, a compiler wrapper) and a build script that
+# sets CLIPPY_CONF_DIR or CLIPPY_ARGS for its crate let a listed call through
+# too. Review checks each of them and every new caller of code under one. Clippy
+# does not see code it does not compile: under a cfg that is false when it runs,
+# such as cfg(not(clippy)); in a cfg(debug_assertions) branch, as the step lints
+# the release profile; under a feature the wasm32 build does not enable. It does
+# not lint a dependency's own code: moka calls std::time::Instant::now when a
+# cache is built, so building an extenddb-cache SwrCache traps on wasm32 (only
+# the server builds one). It refuses only the calls listed here, and an entry
+# resolves only in a crate that loads the entry's crate, so one whose crate no
+# linted crate loads refuses nothing and clippy says nothing about it. The await
+# lints do not see a guard or borrow held inside another value (an Option, a
+# struct, a tuple). The headless parity corpus (`devtools/run-wasm-step corpus`)
+# finds a trap only on a path one of its cases takes.
 
 disallowed-methods = [
     # Clock
