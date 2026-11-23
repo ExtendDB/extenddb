@@ -250,8 +250,9 @@ pub(super) async fn delete_item_in_tx(
 /// Write a stream record within an existing transaction.
 ///
 /// Builds the stream record from the old/new items and the `StreamCapture`
-/// parameters, assigns a shard, and stores the record in `stream_pending`,
-/// all within the caller's transaction. The record gets its sequence number
+/// parameters, assigns a shard ([`stream_record_shard_in_tx`]), and stores the
+/// record in `stream_pending` ([`write_stream_record_to_shard_in_tx`]), all
+/// within the caller's transaction. The record gets its sequence number
 /// after the transaction commits (`number_shard_batch` in `stream_engine.rs`).
 ///
 /// The event type is determined from the old/new items:
@@ -260,13 +261,98 @@ pub(super) async fn delete_item_in_tx(
 /// - old=Some, new=None → Remove
 ///
 /// For Delete operations where the item didn't exist, no stream record is written.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn write_stream_record_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     key_info: &TableKeyInfo,
     capture: &StreamCapture,
     old_item: Option<&Item>,
     new_item: Option<&Item>,
+) -> Result<(), StorageError> {
+    let Some(shard_id) = stream_record_shard_in_tx(tx, key_info, old_item, new_item).await? else {
+        return Ok(());
+    };
+    write_stream_record_to_shard_in_tx(tx, key_info, capture, old_item, new_item, &shard_id).await
+}
+
+/// The open shard that receives the stream record of a write. `None` when
+/// the write records nothing: no item changed (a delete of an item that did
+/// not exist), or the table has no open shard. This reads the shard rows in
+/// the caller's transaction without a lock.
+/// [`write_stream_record_to_shard_in_tx`] locks the chosen shard and checks
+/// that it is still open.
+pub(super) async fn stream_record_shard_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    key_info: &TableKeyInfo,
+    old_item: Option<&Item>,
+    new_item: Option<&Item>,
+) -> Result<Option<String>, StorageError> {
+    // No stream record if nothing changed (e.g., delete of non-existent item).
+    let Some(source) = new_item.or(old_item) else {
+        return Ok(None);
+    };
+
+    // Assign shard within the transaction.
+    let pk_name = &key_info.key_schema[0].attribute_name;
+    let pk_str = source
+        .get(pk_name)
+        .map(|v| match v {
+            AttributeValue::S(s) => s.clone(),
+            AttributeValue::N(n) => n.clone(),
+            AttributeValue::B(b) => BASE64.encode(b),
+            _ => String::new(),
+        })
+        .unwrap_or_default();
+
+    // Only the open shards: they belong to the table's enabled stream. A
+    // disabled stream's shards are closed and take no new records, so a write
+    // that read the table's key info before a disable records nothing.
+    //
+    // The open set is read without a lock, and only the shard this record
+    // goes to is locked, FOR KEY SHARE, re-checking that it is still open
+    // (`write_stream_record_to_shard_in_tx`). Locking every open row
+    // FOR SHARE made concurrent writers to one table extend the same
+    // MultiXacts on all four rows for a record that goes into one.
+    let mut shards: Vec<(String,)> = sqlx::query_as(
+        "SELECT shard_id FROM stream_shards \
+         WHERE table_id = $1 AND ending_sequence_number IS NULL \
+         ORDER BY shard_id",
+    )
+    .bind(&key_info.table_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(db_error)?;
+
+    if shards.is_empty() {
+        // No shards — streams may not be fully set up yet. Skip silently.
+        return Ok(None);
+    }
+
+    let hash = crc32fast::hash(pk_str.as_bytes());
+    #[allow(clippy::cast_possible_truncation)]
+    let idx = (hash as usize) % shards.len();
+    Ok(Some(shards.swap_remove(idx).0))
+}
+
+/// Store the stream record of a write in `stream_pending`, in shard
+/// `shard_id` ([`stream_record_shard_in_tx`]), within the caller's
+/// transaction. Records nothing when no item changed, or when a disable
+/// closed the shard after [`stream_record_shard_in_tx`] chose it.
+///
+/// This locks the shard's row FOR KEY SHARE and checks again that the shard
+/// is open. A disable locks the open rows FOR UPDATE before it takes the
+/// ending numbers (`close_stream_shards`), and that mode conflicts with this
+/// lock. The write therefore commits before the close takes the ending
+/// number, or it waits here, finds the row closed and records nothing. A
+/// transaction that stores several records stores them in shard id order,
+/// the order in which the disable locks the rows
+/// (`transact_write_items_impl`).
+pub(super) async fn write_stream_record_to_shard_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    key_info: &TableKeyInfo,
+    capture: &StreamCapture,
+    old_item: Option<&Item>,
+    new_item: Option<&Item>,
+    shard_id: &str,
 ) -> Result<(), StorageError> {
     // No stream record if nothing changed (e.g., delete of non-existent item).
     let source_item = new_item.or(old_item);
@@ -306,37 +392,18 @@ pub(super) async fn write_stream_record_in_tx(
 
     let size = source_item.map_or(0, |i| i64::try_from(item_size_bytes(i)).unwrap_or(i64::MAX));
 
-    // Assign shard within the transaction.
-    let pk_name = &key_info.key_schema[0].attribute_name;
-    let pk_str = source
-        .get(pk_name)
-        .map(|v| match v {
-            AttributeValue::S(s) => s.clone(),
-            AttributeValue::N(n) => n.clone(),
-            AttributeValue::B(b) => BASE64.encode(b),
-            _ => String::new(),
-        })
-        .unwrap_or_default();
-
-    let shards: Vec<(String,)> = sqlx::query_as(
+    let still_open: Option<(String,)> = sqlx::query_as(
         "SELECT shard_id FROM stream_shards \
-         WHERE table_id = $1 \
-         ORDER BY shard_id",
+         WHERE shard_id = $1 AND ending_sequence_number IS NULL FOR KEY SHARE",
     )
-    .bind(&key_info.table_id)
-    .fetch_all(&mut **tx)
+    .bind(shard_id)
+    .fetch_optional(&mut **tx)
     .await
     .map_err(db_error)?;
-
-    if shards.is_empty() {
-        // No shards — streams may not be fully set up yet. Skip silently.
+    if still_open.is_none() {
+        // Closed between the read and the lock: the stream is disabled.
         return Ok(());
     }
-
-    let hash = crc32fast::hash(pk_str.as_bytes());
-    #[allow(clippy::cast_possible_truncation)]
-    let idx = (hash as usize) % shards.len();
-    let shard_id = &shards[idx].0;
 
     // The record's one clock read: clock_timestamp() is the database clock
     // when this statement runs, after the write's locking reads, while the

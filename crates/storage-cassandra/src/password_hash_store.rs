@@ -24,7 +24,7 @@ impl PasswordHashStore for CassandraCatalogStore {
             let query = format!(
                 "SELECT password_hash FROM {catalog_keyspace}.admin_users WHERE admin_name = ?"
             );
-            let rows = crate::cassandra_util::query_rows_quorum(
+            let rows = crate::cassandra_util::query_rows(
                 &session,
                 &query,
                 cdrs_tokio::query_values!(admin_name.as_str()),
@@ -49,14 +49,20 @@ impl PasswordHashStore for CassandraCatalogStore {
                 "SELECT password_hash FROM {catalog_keyspace}.iam_users \
                  WHERE account_id = ? AND user_name = ?"
             );
-            let rows = crate::cassandra_util::query_rows_quorum(
+            let rows = crate::cassandra_util::query_rows(
                 &session,
                 &query,
                 cdrs_tokio::query_values!(account_id.as_str(), user_name.as_str()),
                 "get_user_password_hash",
             )
             .await?;
-            password_hash_of(rows, "get_user_password_hash")
+            let hash = password_hash_of(rows, "get_user_password_hash")?;
+            // A user of a deleted account has no password: its console
+            // sessions end and it cannot log in.
+            if hash.is_some() && !self.account_exists_quorum(&account_id).await? {
+                return Ok(None);
+            }
+            Ok(hash)
         })
     }
 }

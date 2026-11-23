@@ -5,10 +5,12 @@ name: Cross-backend restore matrix (nightly)
 # The cross-backend restore matrix (design PR 9b): a backup taken on one
 # backend restores, through the store, into another. Each cell starts a source
 # and a target server from the per-backend binaries, copies the source's backup
-# prefix under a root the target owns, seeds the target's `backup_index` row as
-# `backup sync --adopt-store` will (PR 10), restores and compares. The cells are
-# heavy (two servers each, four backends, PostgreSQL + a MongoDB replica set +
-# Cassandra) so they run nightly rather than on every pull request.
+# prefix under a root the target owns, adopts it into the target's catalog with
+# `extenddb backup sync`, restores and compares; the --adopt-store cells point
+# the target at the source's root instead and adopt the root with `backup sync
+# --adopt-store`. The cells are heavy (two servers each, four backends,
+# PostgreSQL + a MongoDB replica set + Cassandra) so they run nightly rather
+# than on every pull request.
 
 on:
   schedule:
@@ -71,12 +73,12 @@ jobs:
           python-version: "3.11"
       - name: Install Python dependencies
         # requirements-matrix.txt adds the MongoDB and Cassandra drivers the
-        # script's seed and teardown use on those backends.
+        # script's setup and teardown use on those backends.
         run: pip install -r requirements.txt -r requirements-matrix.txt
 
       - name: Install the PostgreSQL client
-        # The matrix script seeds and tears down every PostgreSQL source and
-        # target through the host's psql; the runner image is not assumed to
+        # The matrix script tears down every PostgreSQL source and target
+        # through the host's psql; the runner image is not assumed to
         # carry one.
         run: |
           sudo apt-get update
@@ -170,6 +172,14 @@ jobs:
               python3 devtools/backup-restore-matrix --source "$s" --target "$t" --vector \
                 --work "matrix-logs/$s-$t-vector" || rc=1
             done
+          done
+          # The adoption of a root another catalog owns, both ways between
+          # SQLite and PostgreSQL.
+          for pair in "sqlite postgres" "postgres sqlite"; do
+            set -- $pair
+            echo "=== $1 -> $2 --adopt-store ==="
+            python3 devtools/backup-restore-matrix --source "$1" --target "$2" --adopt-store \
+              --work "matrix-logs/$1-$2-adopt" || rc=1
           done
           exit $rc
 
@@ -435,8 +445,9 @@ jobs:
         # Cassandra has no SnapshotEngine, so its CreateBackup is in-catalog
         # and no backup taken on it restores through the store-backed job: the
         # script takes each point's backup on a SQLite source server
-        # (`--source-bin`, a plain SQLite build) and adopts it into the
-        # Cassandra target's catalog, as the matrix does. One target
+        # (`--source-bin`, a plain SQLite build), copies its prefix under
+        # the Cassandra target's root and adopts it with `backup sync`
+        # beside the target's server, as the matrix does. One target
         # directory, two sequential builds.
         run: |
           cargo build --release -p extenddb --no-default-features --features sqlite

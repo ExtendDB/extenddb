@@ -17,12 +17,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use extenddb_storage::migrations::{
-    AdminRole, CatalogMigrations, CatalogStatus, HeldLock, LedgerRow, Listed, MigrationError,
-    MigrationId, RunKind, RunReport, Runner, StatusNote, StoreKind, Target,
+    AdminRole, CatalogMigrations, CatalogStatus, HeldLock, LedgerRow, Listed, LockedStores,
+    MigrationError, MigrationId, RunKind, RunReport, Runner, StatusNote, StoreKind, Target,
 };
 use sqlx::postgres::PgConnectOptions;
 
-use super::backend::{OpenError, PostgresMigrations};
+use super::backend::{LockedCatalog, OpenError, PostgresMigrations};
 use super::connect::{missing_database, one_connection, relation_exists, sql_error};
 use super::sessions::denied_with_notes;
 use super::{MigrationLock, PostgresTarget, catalog_status, migrate_holding};
@@ -93,6 +93,19 @@ impl CatalogMigrations for PostgresCatalogMigrations {
             }
         };
         explain_denied(target, status.await).await
+    }
+
+    /// The status of the catalog database alone: its ledger and settings.
+    /// No data database is reached, so no `data_database_connection_string`
+    /// row is read.
+    async fn catalog_store_status(&self, target: &Target) -> Result<CatalogStatus, MigrationError> {
+        match resolve(target).await? {
+            Some(mut target) => {
+                target.catalog_store_alone = true;
+                catalog_status(&target).await
+            }
+            None => Ok(CatalogStatus::Uninitialized),
+        }
     }
 
     async fn catalog_ledger(&self, target: &Target) -> Result<Vec<LedgerRow>, MigrationError> {
@@ -184,6 +197,25 @@ impl CatalogMigrations for PostgresCatalogMigrations {
         result
     }
 
+    /// The management store over the runner's catalog connection, opened
+    /// as `migrate --yes` opens it. The lock's target carries the key the
+    /// command read, which opens the data connection string row of a
+    /// catalog with a key ring; `data_connection` (`reset`) takes the place
+    /// of that row.
+    async fn locked_stores(
+        &self,
+        lock: &HeldLock,
+        data_connection: Option<&str>,
+    ) -> Result<Box<dyn LockedStores>, MigrationError> {
+        let held = held(lock)?;
+        let target = match data_connection {
+            Some(connection) => held.target.clone().with_given_data_connection(connection),
+            None => held.target.clone(),
+        };
+        let migrations = PostgresMigrations::open(&target, &held.lock).await?;
+        Ok(Box::new(LockedCatalog::new(migrations)))
+    }
+
     async fn status_notes(&self, target: &Target) -> Result<Vec<StatusNote>, MigrationError> {
         let notes = async {
             match resolve(target).await? {
@@ -247,21 +279,36 @@ fn no_catalog_database(catalog: &PgConnectOptions) -> MigrationError {
 
 /// The databases `target` names, or `None` when its catalog database does
 /// not exist. Reads the `data_database_name` row on a read-only connection.
+/// The result carries the key the command read (`target.key_source`), which
+/// opens the data connection string row of a catalog with a key ring, and
+/// for `encryption-key switch` alone (`target.plaintext_data_connection`)
+/// accepts the plaintext row of an unfinished switch. A data store
+/// connection string on the target (`init`'s, which migration 1 records, or
+/// the one `encryption-key reset` reads from standard input, RFC-0000
+/// section 8.6) reaches the data database in place of the row.
 ///
 /// # Errors
 ///
 /// The connection string is not a PostgreSQL URL, or the catalog cannot be
 /// reached or read.
 pub async fn resolve(target: &Target) -> Result<Option<PostgresTarget>, MigrationError> {
+    let keyed = |resolved: PostgresTarget| {
+        let resolved =
+            resolved.with_key_source(target.key_source.clone(), target.plaintext_data_connection);
+        match &target.data_connection {
+            Some(connection) => resolved.with_given_data_connection(connection),
+            None => resolved,
+        }
+    };
     let catalog = catalog_options(target)?;
     let catalog_db = catalog.get_database().unwrap_or("postgres").to_owned();
     if let Some(data) = &target.data_store {
         // Given on the command line (`--data-db`, or the name `init`
         // resolved), so it wins over the database the catalog's connection
         // string row names, on that row's server.
-        return Ok(Some(
+        return Ok(Some(keyed(
             PostgresTarget::new(catalog, data.clone()).with_given_data_database(),
-        ));
+        )));
     }
     let fallback = crate::bootstrapper::derive_data_db_name(&catalog_db);
     let pool = match one_connection(catalog.clone(), true, Duration::from_secs(10)).await {
@@ -288,7 +335,7 @@ pub async fn resolve(target: &Target) -> Result<Option<PostgresTarget>, Migratio
     .await;
     pool.close().await;
     let data = recorded?.unwrap_or(fallback);
-    Ok(Some(PostgresTarget::new(catalog, data)))
+    Ok(Some(keyed(PostgresTarget::new(catalog, data))))
 }
 
 /// The admin role's connection on the server of `data`, the data database
