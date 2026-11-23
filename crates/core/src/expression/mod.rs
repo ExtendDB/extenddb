@@ -38,7 +38,7 @@ pub use key_condition::{
 };
 pub use kind::ExpressionKind;
 pub use operand_check::validate_placeholders_and_operands;
-pub use operator_count::{MAX_EXPRESSION_OPERATORS, count_operators, validate_operator_count};
+pub use operator_count::{MAX_EXPRESSION_OPERATORS, validate_operator_count};
 pub use parser::{
     ConditionFault, parse_condition, parse_condition_classified, parse_condition_from,
     parse_condition_with_depth_limit,
@@ -55,7 +55,6 @@ pub use search_condition::{
     SearchCondition, validate_conditions_against_search_schema,
     validate_search_condition_expression,
 };
-pub use syntax_error::{is_operator_or_keyword, syntax_error, token_text};
 pub use tokenizer::{Token, tokenize, tokenize_for, tokenize_with_limit};
 pub use update_evaluator::apply_update_validated;
 pub use update_parser::{parse_update, parse_update_from};
