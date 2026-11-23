@@ -834,6 +834,18 @@ impl TableDescription {
     ///   disable response and on `DescribeTable` afterwards). Backends keep
     ///   the disabled specification stored, with the closed stream's view
     ///   type, so `DescribeStream` of that stream can still report it.
+    /// - A DELETING table is described without `AttributeDefinitions`,
+    ///   `KeySchema`, `CreationDateTime`, `WarmThroughput`,
+    ///   `GlobalSecondaryIndexes`, `LocalSecondaryIndexes` and
+    ///   `VectorIndexes` (measured on DynamoDB 2026-11-23, DeleteTable's answer
+    ///   and DescribeTable at the start of the window, on-demand and
+    ///   provisioned tables, with and without indexes, a vector index, a
+    ///   stream, a table class, KMS encryption and an on-demand throughput
+    ///   cap). The other members are kept. Later in the window the service
+    ///   sends less: first without `StreamSpecification`, then only
+    ///   `ItemCount`, `ProvisionedThroughput`, `TableArn`, `TableName`,
+    ///   `TableSizeBytes` and `TableStatus`. Neither later stage is
+    ///   reproduced.
     pub fn prepare_for_response(&mut self) {
         self.populate_table_throughput_mode_summary();
         if self
@@ -849,6 +861,15 @@ impl TableDescription {
             summary.restore_in_progress = true;
         }
         self.populate_warm_throughput(super::epoch_seconds_now());
+        if self.table_status == TableStatus::Deleting {
+            self.key_schema.clear();
+            self.attribute_definitions.clear();
+            self.creation_date_time = 0.0;
+            self.warm_throughput = None;
+            self.global_secondary_indexes = None;
+            self.local_secondary_indexes = None;
+            self.vector_indexes = None;
+        }
     }
 
     /// Derive the `WarmThroughput` member of the table and of each global
@@ -908,13 +929,26 @@ impl TableDescription {
 pub struct TableDescription {
     #[serde(rename = "TableName")]
     pub table_name: String,
-    #[serde(rename = "KeySchema")]
+    // KeySchema, AttributeDefinitions and CreationDateTime are omitted while the
+    // table is DELETING ([`Self::prepare_for_response`] empties them), so they
+    // skip serialisation when empty or zero. A table has a key schema, and a
+    // creation time unless a backend could not read the stored one (SQLite and
+    // MongoDB then report 0.0, and the member is now omitted).
+    #[serde(rename = "KeySchema", default, skip_serializing_if = "Vec::is_empty")]
     pub key_schema: Vec<KeySchemaElement>,
-    #[serde(rename = "AttributeDefinitions")]
+    #[serde(
+        rename = "AttributeDefinitions",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub attribute_definitions: Vec<AttributeDefinition>,
     #[serde(rename = "TableStatus")]
     pub table_status: TableStatus,
-    #[serde(rename = "CreationDateTime")]
+    #[serde(
+        rename = "CreationDateTime",
+        default,
+        skip_serializing_if = "is_zero_seconds"
+    )]
     pub creation_date_time: f64,
     #[serde(rename = "TableSizeBytes")]
     pub table_size_bytes: i64,
@@ -975,6 +1009,12 @@ pub struct TableDescription {
     /// wire member; see [`super::WarmThroughputRecord`]. Nothing acts on it.
     #[serde(skip)]
     pub warm_throughput_record: Option<super::WarmThroughputRecord>,
+}
+
+/// `skip_serializing_if` for a timestamp that is absent (zero).
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde passes a reference
+fn is_zero_seconds(seconds: &f64) -> bool {
+    *seconds == 0.0
 }
 
 /// Details of a restore reported on the restored table's description.
@@ -1516,6 +1556,115 @@ mod tests {
             let json = serde_json::to_value(&done).unwrap();
             assert!(json.get("RestoreSummary").is_none(), "{status:?}");
         }
+    }
+
+    /// A description carrying every member a table can have, ACTIVE unless
+    /// `status` says otherwise, on-demand or provisioned.
+    fn full_description(status: &str, on_demand: bool) -> TableDescription {
+        let mut json = serde_json::json!({
+            "TableName": "t",
+            "TableStatus": status,
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "CreationDateTime": 1_700_000_000.0,
+            "TableSizeBytes": 0,
+            "ItemCount": 0,
+            "TableArn": "arn",
+            "TableId": "id",
+            "ProvisionedThroughput": {
+                "ReadCapacityUnits": 0, "WriteCapacityUnits": 0, "NumberOfDecreasesToday": 0
+            },
+            "DeletionProtectionEnabled": false,
+            "GlobalSecondaryIndexes": [],
+            "LocalSecondaryIndexes": [],
+            "VectorIndexes": [{
+                "IndexName": "v", "VectorAttribute": {"AttributeName": "emb"},
+                "Dimensions": 3, "DistanceFunction": "COSINE", "IndexStatus": "ACTIVE",
+                "IndexSizeBytes": 0, "ItemCount": 0, "IndexArn": ""
+            }],
+            "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "NEW_IMAGE"},
+            "LatestStreamArn": "stream",
+            "LatestStreamLabel": "label",
+            "TableClassSummary": {"TableClass": "STANDARD"},
+            "SSEDescription": {"Status": "ENABLED", "SSEType": "KMS"},
+            "OnDemandThroughput": {"MaxReadRequestUnits": 1, "MaxWriteRequestUnits": 1},
+        });
+        if on_demand {
+            json["BillingModeSummary"] = serde_json::json!({"BillingMode": "PAY_PER_REQUEST"});
+        }
+        serde_json::from_value(json).unwrap()
+    }
+
+    /// The members of a description once `prepare_for_response` has run.
+    fn response_members(mut desc: TableDescription) -> Vec<String> {
+        desc.prepare_for_response();
+        let json = serde_json::to_value(&desc).unwrap();
+        let mut names: Vec<String> = json.as_object().unwrap().keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// A DELETING table is described with the members the service keeps and
+    /// without the seven it drops; an ACTIVE or UPDATING table keeps all of
+    /// them. The description still deserializes.
+    #[test]
+    fn a_deleting_description_omits_the_members_the_service_drops() {
+        let kept = [
+            "DeletionProtectionEnabled",
+            "ItemCount",
+            "LatestStreamArn",
+            "LatestStreamLabel",
+            "OnDemandThroughput",
+            "ProvisionedThroughput",
+            "SSEDescription",
+            "StreamSpecification",
+            "TableArn",
+            "TableClassSummary",
+            "TableId",
+            "TableName",
+            "TableSizeBytes",
+            "TableStatus",
+        ];
+        // An on-demand table also carries the two billing summaries.
+        let on_demand: Vec<&str> = {
+            let mut all = kept.to_vec();
+            all.extend(["BillingModeSummary", "TableThroughputModeSummary"]);
+            all.sort_unstable();
+            all
+        };
+        assert_eq!(
+            response_members(full_description("DELETING", true)),
+            on_demand
+        );
+        assert_eq!(response_members(full_description("DELETING", false)), kept);
+
+        let dropped = [
+            "AttributeDefinitions",
+            "CreationDateTime",
+            "GlobalSecondaryIndexes",
+            "KeySchema",
+            "LocalSecondaryIndexes",
+            "VectorIndexes",
+            "WarmThroughput",
+        ];
+        for status in ["ACTIVE", "UPDATING", "CREATING"] {
+            let members = response_members(full_description(status, true));
+            // A CREATING table has no warm throughput to report.
+            let expected = dropped
+                .iter()
+                .filter(|name| status != "CREATING" || **name != "WarmThroughput")
+                .chain(&kept);
+            for name in expected {
+                assert!(members.iter().any(|m| m == name), "{status} keeps {name}");
+            }
+        }
+
+        let mut deleting = full_description("DELETING", true);
+        deleting.prepare_for_response();
+        let json = serde_json::to_value(&deleting).unwrap();
+        let back: TableDescription = serde_json::from_value(json).unwrap();
+        assert_eq!(back.table_status, TableStatus::Deleting);
+        assert!(back.key_schema.is_empty() && back.creation_date_time == 0.0);
     }
 
     /// Wire shape: the timestamp member is omitted, not null, when absent,

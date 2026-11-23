@@ -3,7 +3,7 @@
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::types::{DeleteTableInput, DeleteTableOutput};
+use extenddb_core::types::{DeleteTableInput, DeleteTableOutput, TableDescription, TableStatus};
 use extenddb_core::validation::validate_table_name;
 
 use crate::OperationContext;
@@ -19,7 +19,7 @@ pub async fn handle_delete_table(
     validate_table_name(&input.table_name, &ctx.limits)?;
 
     let table_name = input.table_name.clone();
-    let mut table_desc = ctx
+    let table_desc = ctx
         .storage
         .delete_table(&ctx.account_id, input)
         .await
@@ -39,9 +39,37 @@ pub async fn handle_delete_table(
     );
     ctx.auth_cache.invalidate_resource_tags(&arn).await;
 
-    table_desc.prepare_for_response();
     let output = DeleteTableOutput {
-        table_description: table_desc,
+        table_description: deleting_description(table_desc),
     };
     serialize_output(&output)
+}
+
+/// The answer describes the table as DELETING whatever the backend read before
+/// it deleted (Cassandra reported ACTIVE).
+fn deleting_description(mut desc: TableDescription) -> TableDescription {
+    desc.table_status = TableStatus::Deleting;
+    desc.prepare_for_response();
+    desc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_description_read_before_the_delete_answers_as_deleting() {
+        let read_before_delete = TableDescription {
+            table_name: "t".to_owned(),
+            table_status: TableStatus::Active,
+            creation_date_time: 1_700_000_000.0,
+            ..Default::default()
+        };
+        let answer = deleting_description(read_before_delete);
+        assert_eq!(answer.table_status, TableStatus::Deleting);
+        assert_eq!(
+            answer.creation_date_time, 0.0,
+            "a DELETING answer has no CreationDateTime"
+        );
+    }
 }
