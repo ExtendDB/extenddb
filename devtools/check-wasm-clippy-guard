@@ -61,17 +61,20 @@ one line per problem, unless:
    writes, gains the crate and nothing else; a plant finding stops the guard
    before the first run, each printed once. The step lints the crate, which
    holds the probes, the controls and BUILD_SCRIPT, as a path dependency of
-   the adapter; no lint level of the tree's crates or manifests reaches it.
+   the adapter; no lint level of the tree's crates or manifests reaches it,
+   but rustflags do, and one that denies a lint a probe or control trips
+   stops a run.
 Each check runs, in the same call, on the tree and on controls (the
 constants whose names hold CONTROL, BUILD_SCRIPT and three zeroize graphs),
 and each run's dep-info must be read for every crate of the build. A control
 that does not give its finding, and a finding no control expects, fail the
 guard. No control covers the checks that a command finishes (the two runs,
-cargo tree) or the plant checks but those of the dependencies and the lock,
-which act on the tree and its copy themselves. The environment and
-cargo-configuration checks are controlled on their control inputs only:
-handed an empty mapping or file list in place of the tree's, the guard would
-still pass. A wrapper that caps one crate's lints is caught all the same.
+cargo tree), nor the plant checks that read the tree and its copy
+themselves; those of the dependencies and the lock have controls. The
+environment and cargo-configuration checks are controlled on their control
+inputs only: handed an empty mapping or file list in place of the tree's,
+the guard would still pass. A wrapper that caps one crate's lints is caught
+all the same.
 rustc reports a force-warned lint under --cap-lints as well, so F reports
 that crate's calls, and item 1 refuses those no accepted allow covers.
 clippy-driver, though, lints no crate whose own compiler options hold

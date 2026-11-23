@@ -210,8 +210,9 @@ SQLite, PostgreSQL, Cassandra and MongoDB migrate through this framework.
    code, with a reason that says why no wasm32 database reaches the call.
    (The WebAssembly build opens only in-memory databases, and each runs every
    migration when it opens.) The guard accepts no allow on the `mod` line, so
-   it refuses a call that a released body makes to a method listed later:
-   leave such a method out of `clippy.toml`. The module defines:
+   it refuses a call that a released body makes to a method listed later;
+   such a method cannot be listed without a change to the guard. The module
+   defines:
 
    - `SOURCE`, the module's own text through `include_str!`, followed by the
      text of any SQL file the body executes. The checksum test pins its
