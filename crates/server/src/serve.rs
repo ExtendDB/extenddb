@@ -735,9 +735,9 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         .map_or(config_throttling, |v| v == "true");
 
     // SearchVectors reads the `search_inequality_filters` setting from this
-    // store on every request, so a change applies without a restart.
+    // store, so a change applies without a restart.
     #[cfg(feature = "search-inequality-filters")]
-    extenddb_engine::install_search_filter_settings(catalog_store.clone());
+    extenddb_engine::install_search_filter_settings(&storage, catalog_store.clone());
 
     let throttle = Arc::new(extenddb_core::throttle::ThrottleManager::new(
         limits.per_account_max_rcu,

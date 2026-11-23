@@ -4,8 +4,7 @@
 //! Which requests the extended grammar parses, and the filter it hands the
 //! backend.
 //!
-//! The settings store is process-wide, so the tests that install one hold
-//! `SERIAL` for their whole run.
+//! Each test installs its store against a storage engine of its own.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -17,13 +16,14 @@ use extenddb_core::types::{
 };
 use extenddb_storage::management_store::{OpError, OpResult, SettingsStore};
 use extenddb_storage::{
-    BoxedFuture, VectorSearch, VectorSearchEngine, VectorSearchOutput, VectorSearchResult,
+    BoxedFuture, StorageEngine, VectorSearch, VectorSearchEngine, VectorSearchOutput,
+    VectorSearchResult,
 };
+use extenddb_storage_sqlite::SqliteEngine;
 use futures::future::BoxFuture;
 
-use super::imp::{install_search_filter_settings, parse_request, resolve_scope};
-
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+use super::imp::{parse_request, resolve_scope};
+use super::install_search_filter_settings;
 
 const CALLER: &str = "111111111111";
 
@@ -46,9 +46,16 @@ impl SettingsStore for Store {
     }
 }
 
-fn install(value: Result<Option<&str>, ()>) {
+/// A storage engine whose server reads `value` for the setting.
+async fn install(value: Result<Option<&str>, ()>) -> Arc<dyn StorageEngine> {
+    let storage: Arc<dyn StorageEngine> = Arc::new(
+        SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
+            .await
+            .expect("an in-memory database opens"),
+    );
     let value = value.map(|v| v.map(str::to_owned));
-    install_search_filter_settings(Arc::new(Store(Mutex::new(value))));
+    install_search_filter_settings(&storage, Arc::new(Store(Mutex::new(value))));
+    storage
 }
 
 struct Served;
@@ -74,16 +81,18 @@ fn values() -> HashMap<String, AttributeValue> {
 
 const INEQUALITY: &str = "Country = :c AND Price > :p";
 
-async fn parsed(expr: Option<&str>) -> Result<bool, DynamoDbError> {
+async fn parsed(
+    storage: &Arc<dyn StorageEngine>,
+    expr: Option<&str>,
+) -> Result<bool, DynamoDbError> {
     let values = values();
-    parse_request(&Served, CALLER, expr, None, Some(&values), None)
+    parse_request(storage, &Served, CALLER, expr, None, Some(&values), None)
         .await
         .map(|parsed| parsed.is_some())
 }
 
 #[tokio::test]
 async fn the_setting_selects_the_accounts() {
-    let _serial = SERIAL.lock().await;
     for (value, expected) in [
         (Ok(None), false),
         (Ok(Some("off")), false),
@@ -91,13 +100,12 @@ async fn the_setting_selects_the_accounts() {
         (Ok(Some("111111111111")), true),
         (Ok(Some("222222222222,111111111111")), true),
         (Ok(Some("222222222222")), false),
-        // a value that does not parse, and a store that fails, read as off
+        // a value that does not parse reads as off
         (Ok(Some("on")), false),
-        (Err(()), false),
     ] {
-        install(value);
+        let storage = install(value).await;
         assert_eq!(
-            parsed(Some(INEQUALITY)).await.unwrap(),
+            parsed(&storage, Some(INEQUALITY)).await.unwrap(),
             expected,
             "{value:?}"
         );
@@ -105,19 +113,39 @@ async fn the_setting_selects_the_accounts() {
 }
 
 #[tokio::test]
+async fn a_store_that_fails_answers_a_retryable_fault() {
+    let storage = install(Err(())).await;
+    let err = parsed(&storage, Some(INEQUALITY)).await.unwrap_err();
+    assert!(
+        matches!(&err, DynamoDbError::ServiceUnavailable(m)
+            if m == "Service is temporarily unavailable"),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn without_an_installed_store_no_account_gets_the_grammar() {
+    let storage: Arc<dyn StorageEngine> = Arc::new(
+        SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
+            .await
+            .expect("an in-memory database opens"),
+    );
+    assert!(!parsed(&storage, Some(INEQUALITY)).await.unwrap());
+}
+
+#[tokio::test]
 async fn no_expression_is_left_to_the_equality_path() {
-    let _serial = SERIAL.lock().await;
-    install(Ok(Some("all")));
-    assert!(!parsed(None).await.unwrap());
+    let storage = install(Ok(Some("all"))).await;
+    assert!(!parsed(&storage, None).await.unwrap());
 }
 
 #[tokio::test]
 async fn an_enabled_account_gets_the_extended_messages() {
-    let _serial = SERIAL.lock().await;
-    install(Ok(Some("all")));
-    let err = parsed(Some(
-        "Country = :c AND Price > :p AND begins_with(Category, :c)",
-    ))
+    let storage = install(Ok(Some("all"))).await;
+    let err = parsed(
+        &storage,
+        Some("Country = :c AND Price > :p AND begins_with(Category, :c)"),
+    )
     .await
     .unwrap_err();
     let DynamoDbError::ValidationException(message) = err else {
@@ -132,11 +160,11 @@ async fn an_enabled_account_gets_the_extended_messages() {
 
 #[tokio::test]
 async fn a_name_neither_expression_uses_is_refused() {
-    let _serial = SERIAL.lock().await;
-    install(Ok(Some("all")));
+    let storage = install(Ok(Some("all"))).await;
     let values = values();
     let names: HashMap<String, String> = [("#u".to_owned(), "x".to_owned())].into();
     let err = parse_request(
+        &storage,
         &Served,
         CALLER,
         Some(INEQUALITY),
@@ -154,6 +182,7 @@ async fn a_name_neither_expression_uses_is_refused() {
     );
     let used: HashMap<String, String> = [("#u".to_owned(), "Price".to_owned())].into();
     let projected = parse_request(
+        &storage,
         &Served,
         CALLER,
         Some(INEQUALITY),
@@ -175,13 +204,20 @@ fn item(country: &str, price: &str) -> Item {
 
 #[tokio::test]
 async fn the_scope_selects_the_hash_partition_and_filters_items() {
-    let _serial = SERIAL.lock().await;
-    install(Ok(Some("all")));
+    let storage = install(Ok(Some("all"))).await;
     let values = values();
-    let extended = parse_request(&Served, CALLER, Some(INEQUALITY), None, Some(&values), None)
-        .await
-        .unwrap()
-        .expect("parsed with the extended grammar");
+    let extended = parse_request(
+        &storage,
+        &Served,
+        CALLER,
+        Some(INEQUALITY),
+        None,
+        Some(&values),
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("parsed with the extended grammar");
     let schema = [
         SearchSchemaElement {
             attribute_name: "Country".to_owned(),

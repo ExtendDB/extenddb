@@ -198,6 +198,10 @@ pub async fn set_setting(
     // the read path actually consults instead of adding a second, ignored one.
     let key = extenddb_core::settings_keys::canonical_key(key);
     store.set_setting(key, value).await?;
+    #[cfg(feature = "search-inequality-filters")]
+    if key == extenddb_core::settings_keys::SEARCH_INEQUALITY_FILTERS {
+        extenddb_engine::search_filter_settings_changed();
+    }
 
     tracing::warn!(
         target: "extenddb::audit::settings",

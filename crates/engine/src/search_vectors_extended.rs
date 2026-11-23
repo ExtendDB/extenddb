@@ -9,33 +9,33 @@
 //! `None` and the handler runs exactly as it does without this module.
 //!
 //! With the feature on, the `search_inequality_filters` runtime setting says
-//! which accounts get the grammar. It is read on every request through the
-//! settings store the server installs with
-//! [`install_search_filter_settings`], so a change applies without a restart.
+//! which accounts get the grammar. It is read through the settings store the
+//! server installs with [`install_search_filter_settings`] (see
+//! `search_vectors_settings.rs`), so a change applies without a restart.
 //! Until a store is installed, no account gets the grammar.
 
 pub(crate) use imp::{Extended, parse_request, resolve_scope};
 
 #[cfg(feature = "search-inequality-filters")]
-pub use imp::install_search_filter_settings;
+#[path = "search_vectors_settings.rs"]
+mod settings;
+
+#[cfg(feature = "search-inequality-filters")]
+pub use settings::{install_search_filter_settings, search_filter_settings_changed};
 
 #[cfg(feature = "search-inequality-filters")]
 mod imp {
     use std::collections::HashMap;
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
 
     use extenddb_core::error::DynamoDbError;
     use extenddb_core::expression::search_filter::{
-        DEFAULT_MAX_CONDITIONS, EnabledAccounts, SearchFilter, parse_search_filter,
+        DEFAULT_MAX_CONDITIONS, SearchFilter, parse_search_filter,
     };
     use extenddb_core::expression::search_params::with_unused_names;
-    use extenddb_core::settings_keys::SEARCH_INEQUALITY_FILTERS;
     use extenddb_core::types::{AttributeDefinition, AttributeValue, Item, SearchSchemaElement};
     use extenddb_storage::error::StorageError;
-    use extenddb_storage::management_store::SettingsStore;
-    use extenddb_storage::{VectorItemFilter, VectorSearchEngine};
-
-    static SETTINGS: RwLock<Option<Arc<dyn SettingsStore>>> = RwLock::new(None);
+    use extenddb_storage::{StorageEngine, VectorItemFilter, VectorSearchEngine};
 
     /// The HASH attribute and the value that selects its partition, and the
     /// filter the backend applies to each candidate.
@@ -43,34 +43,6 @@ mod imp {
         Option<(&'a str, &'a AttributeValue)>,
         Arc<dyn VectorItemFilter>,
     );
-
-    /// Read the `search_inequality_filters` setting from `store` on every
-    /// SearchVectors request. The server calls this once at startup.
-    pub fn install_search_filter_settings(store: Arc<dyn SettingsStore>) {
-        if let Ok(mut slot) = SETTINGS.write() {
-            *slot = Some(store);
-        }
-    }
-
-    /// The accounts the setting enables. An absent, unreadable or malformed
-    /// value enables none, so a fault never widens the grammar.
-    async fn enabled_accounts() -> EnabledAccounts {
-        let store = SETTINGS.read().ok().and_then(|slot| slot.clone());
-        let Some(store) = store else {
-            return EnabledAccounts::Off;
-        };
-        match store.get_setting(SEARCH_INEQUALITY_FILTERS).await {
-            Ok(Some(value)) => EnabledAccounts::parse(&value).unwrap_or_else(|reason| {
-                tracing::warn!("{SEARCH_INEQUALITY_FILTERS} = {value:?} ignored: {reason}");
-                EnabledAccounts::Off
-            }),
-            Ok(None) => EnabledAccounts::Off,
-            Err(e) => {
-                tracing::warn!("{SEARCH_INEQUALITY_FILTERS} could not be read: {e:?}");
-                EnabledAccounts::Off
-            }
-        }
-    }
 
     /// A search condition parsed with the extended grammar.
     pub(crate) struct Extended(Arc<SearchFilter>);
@@ -87,8 +59,10 @@ mod imp {
     ///
     /// # Errors
     ///
-    /// Returns the `ValidationException` of the first failed check.
+    /// Returns the `ValidationException` of the first failed check, and
+    /// `ServiceUnavailableException` when the setting cannot be read.
     pub(crate) async fn parse_request(
+        storage: &Arc<dyn StorageEngine>,
         _served_by: &dyn VectorSearchEngine,
         account_id: &str,
         expr: Option<&str>,
@@ -101,7 +75,10 @@ mod imp {
         };
         // Cross-account access is refused before dispatch, so the caller is
         // the table owner.
-        if !enabled_accounts().await.enabled_for(account_id, None) {
+        if !super::settings::enabled_accounts(storage)
+            .await?
+            .enabled_for(account_id, None)
+        {
             return Ok(None);
         }
         with_unused_names(
@@ -149,7 +126,7 @@ mod imp {
 
     use extenddb_core::error::DynamoDbError;
     use extenddb_core::types::{AttributeDefinition, AttributeValue, SearchSchemaElement};
-    use extenddb_storage::{VectorItemFilter, VectorSearchEngine};
+    use extenddb_storage::{StorageEngine, VectorItemFilter, VectorSearchEngine};
 
     /// The HASH attribute and the value that selects its partition, and the
     /// filter the backend applies to each candidate.
@@ -163,6 +140,7 @@ mod imp {
 
     #[allow(clippy::unused_async)]
     pub(crate) async fn parse_request(
+        _storage: &Arc<dyn StorageEngine>,
         _served_by: &dyn VectorSearchEngine,
         _account_id: &str,
         _expr: Option<&str>,

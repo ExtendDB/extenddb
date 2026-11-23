@@ -12,7 +12,7 @@ use extenddb_core::expression::{SearchCondition, validate_conditions_against_sea
 use extenddb_core::types::{
     AttributeDefinition, AttributeValue, SearchSchemaElement, SearchSchemaElementType,
 };
-use extenddb_storage::{VectorItemFilter, VectorSearchEngine};
+use extenddb_storage::{StorageEngine, VectorItemFilter, VectorSearchEngine};
 
 use crate::search_vectors_extended::Extended;
 
@@ -37,6 +37,7 @@ pub(crate) type Scope<'a> = (
 ///
 /// Returns the `ValidationException` of the first failed check.
 pub(crate) async fn parse(
+    storage: &Arc<dyn StorageEngine>,
     vector_search: &dyn VectorSearchEngine,
     account_id: &str,
     expr: Option<&str>,
@@ -45,6 +46,7 @@ pub(crate) async fn parse(
     projection: Option<&str>,
 ) -> Result<Parsed, DynamoDbError> {
     let extended = crate::search_vectors_extended::parse_request(
+        storage,
         vector_search,
         account_id,
         expr,

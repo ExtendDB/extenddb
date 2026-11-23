@@ -131,6 +131,7 @@ pub async fn handle_search_vectors(
     )?;
 
     let parsed = condition::parse(
+        &ctx.storage,
         vector_search,
         &ctx.account_id,
         input.search_condition_expression.as_deref(),
