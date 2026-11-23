@@ -38,8 +38,8 @@
 //!    instead, the reason naming that code.
 //! 3. **Compiled and called on wasm32, but reached by no wasm32 request**, and
 //!    calling a method the WebAssembly clippy step disallows: the allow of
-//!    `clippy::disallowed_methods` that the docstring of
-//!    `devtools/check-wasm-clippy-guard`, in the repository this crate's
+//!    `clippy::disallowed_methods` that the header of
+//!    `devtools/wasm-clippy/clippy.toml`, in the repository this crate's
 //!    manifest names, describes.
 //!
 //! NOTE: this is the catalog-layer build slice. The data-plane engine modules
