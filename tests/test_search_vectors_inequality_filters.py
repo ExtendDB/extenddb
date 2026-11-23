@@ -8,51 +8,50 @@ For an account the grammar is enabled for, a search condition takes ``<>``,
 ``attribute_exists`` and ``attribute_not_exists``, and more than one
 condition on an attribute, up to 50 conditions.
 
-The number comparisons in ``TestEvaluation`` and every case in
-``TestExpressionMaps`` were measured against the live service on 2026-11-21 in
+Every expected response was measured against the live service in
 eu-north-1, on an account with the extended grammar, each request twice with
-the same answer. The other expected responses are predictions of the
-service's answer.
+the same answer, on 2026-11-19 and 2026-11-21.
 
-Against ExtendDB the module turns the grammar on for every account through the
-management API, as the admin in ``EXTENDDB_ADMIN_USER`` and
-``EXTENDDB_ADMIN_PASSWORD``, and restores the previous value afterwards. A
-build without the feature refuses the setting. The module then probes one
-inequality search, and skips when the target answers it with the
-equality-only message, which is the answer of a build without the feature and
-of an account the service has not enabled.
+The module probes one inequality search to learn the grammar the target
+serves. Against ExtendDB it also reads the ``search_inequality_filters``
+setting, as the admin in ``EXTENDDB_ADMIN_USER`` and
+``EXTENDDB_ADMIN_PASSWORD``, and fails when the probe gets the other grammar's
+answer. It never writes the setting: ``devtools/run-tests`` sets it from
+``EXTENDDB_TEST_SEARCH_INEQUALITY_FILTERS`` before any suite starts. Under the
+equality-only grammar the tests of the extended grammar skip;
+``test_the_grammar_matches_the_setting`` runs under both.
 
 On a backend without vector search, every SearchVectors request is refused by
-the backend, the extended grammar included; ``TestBackendWithoutVectors``
-pins that.
+the backend before the grammar runs; ``TestBackendWithoutVectors`` pins that.
+The module skips when the target backend does not support vector indexes,
+unless ``EXTENDDB_EXPECT_VECTORS=1``, which makes that a failure.
 
-Tests post raw SigV4-signed JSON. Against the service, SearchVectors is sent to
-the ``search-dynamodb`` host the SDKs use for it.
+The checks on the expression maps are in ``test_search_vectors_expression_maps.py``,
+which runs under both grammars.
 """
 
 from __future__ import annotations
 
-import json
-import os
 import re
 import time
-import uuid
-
-import boto3
 import pytest
 import requests
-from botocore.auth import SigV4Auth
-from botocore.awsrequest import AWSRequest
 
-_ENDPOINT_VAR = os.environ.get("EXTENDDB_TEST_ENDPOINT", "").strip()
-_REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
-ENDPOINT = _ENDPOINT_VAR or f"https://dynamodb.{_REGION}.amazonaws.com/"
-SEARCH_ENDPOINT = _ENDPOINT_VAR or f"https://search-dynamodb.{_REGION}.amazonaws.com/"
-SETTING = "search_inequality_filters"
+from search_vectors_wire import (
+    ENDPOINT_VAR,
+    EQUALITY_ONLY,
+    INDEX_NOT_SUPPORTED,
+    SEARCH_NOT_SUPPORTED,
+    create_vector_table,
+    delete_table,
+    expect_vectors,
+    grammar_of,
+    refused as _refused,
+    table_name,
+    signed_post as _signed_post,
+)
 
 P = "Invalid SearchConditionExpression: "
-EQUALITY_ONLY = P + "Invalid comparator used in SearchConditionExpression"
-NOT_SUPPORTED = "SearchVectors is not supported by this storage backend"
 HASH_NOT_EQUALS = (
     "SearchConditionExpression must use = on the HASH attribute, not inside OR or "
     "NOT; HASH attribute: Country"
@@ -89,58 +88,6 @@ def _wrong_type(attribute: str, given: str, declared: str) -> str:
     )
 
 
-def _signed_post(operation: str, body: dict) -> requests.Response:
-    """POST ``body`` under the DynamoDB JSON-1.0 protocol, SigV4-signed."""
-    url = SEARCH_ENDPOINT if operation == "SearchVectors" else ENDPOINT
-    body_bytes = json.dumps(body).encode("utf-8")
-    headers = {
-        "X-Amz-Target": f"DynamoDB_20120810.{operation}",
-        "Content-Type": "application/x-amz-json-1.0",
-    }
-    creds = boto3.Session().get_credentials()
-    if creds is not None:
-        aws_req = AWSRequest(method="POST", url=url, data=body_bytes, headers=headers)
-        SigV4Auth(creds.get_frozen_credentials(), "dynamodb", _REGION).add_auth(aws_req)
-        headers = dict(aws_req.headers)
-    verify = True if not _ENDPOINT_VAR else not url.startswith("https://")
-    return requests.post(url, data=body_bytes, headers=headers, verify=verify, timeout=30)
-
-
-def _message(resp: requests.Response) -> str:
-    payload = resp.json()
-    return payload.get("message", payload.get("Message", ""))
-
-
-def _settings_api():
-    """The settings URL and admin credentials, or ``None`` against the service."""
-    password = os.environ.get("EXTENDDB_ADMIN_PASSWORD", "").strip()
-    if not _ENDPOINT_VAR or not password:
-        return None
-    user = os.environ.get("EXTENDDB_ADMIN_USER", "").strip() or "admin"
-    return f"{_ENDPOINT_VAR.rstrip('/')}/management/settings/{SETTING}", (user, password)
-
-
-def _set_setting(value: str | None) -> bool:
-    """Write the setting; ``False`` when the target cannot take it."""
-    api = _settings_api()
-    if api is None:
-        return False
-    url, auth = api
-    if value is None:
-        value = "off"
-    resp = requests.put(url, auth=auth, json={"value": value}, timeout=30, verify=False)
-    return resp.status_code == 200
-
-
-def _previous_setting() -> str | None:
-    api = _settings_api()
-    if api is None:
-        return None
-    url, auth = api
-    resp = requests.get(url, auth=auth, timeout=30, verify=False)
-    return resp.json().get("value") if resp.status_code == 200 else None
-
-
 # id: (Country, Category, Price, Tag); None is an absent attribute.
 ITEMS = {
     "i1": ("US", "a", "5", "AQ=="),
@@ -174,20 +121,6 @@ H = "Country = :us AND "
 US = {k for k, v in ITEMS.items() if v[0] == "US"}
 
 
-def _wait_active(name: str) -> None:
-    deadline = time.monotonic() + (180.0 if _ENDPOINT_VAR else 1800.0)
-    while time.monotonic() < deadline:
-        resp = _signed_post("DescribeTable", {"TableName": name})
-        if resp.status_code == 200:
-            table = resp.json()["Table"]
-            if table["TableStatus"] == "ACTIVE" and all(
-                vi.get("IndexStatus") == "ACTIVE" for vi in table.get("VectorIndexes", [])
-            ):
-                return
-        time.sleep(0.05 if _ENDPOINT_VAR else 10.0)
-    raise TimeoutError(f"table {name} did not become ACTIVE")
-
-
 def _search(table: str, expr: str, top_k: int = 100, names=None) -> requests.Response:
     used = set(re.findall(r":[A-Za-z0-9_]+", expr))
     body = {
@@ -209,55 +142,40 @@ def _ids(resp: requests.Response) -> set[str]:
     return {r["Item"]["id"]["S"] for r in resp.json()["SearchResults"]}
 
 
-def _refused(resp: requests.Response, message: str) -> None:
-    assert resp.status_code == 400, resp.text
-    assert resp.json()["__type"].endswith("ValidationException"), resp.text
-    assert _message(resp) == message
+CREATE = {
+    "AttributeDefinitions": [
+        {"AttributeName": "id", "AttributeType": "S"},
+        {"AttributeName": "Country", "AttributeType": "S"},
+        {"AttributeName": "Category", "AttributeType": "S"},
+        {"AttributeName": "Price", "AttributeType": "N"},
+        {"AttributeName": "Tag", "AttributeType": "B"},
+    ],
+    "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}],
+    "BillingMode": "PAY_PER_REQUEST",
+    "VectorIndexes": [
+        {
+            "IndexName": "vix",
+            "Dimensions": 4,
+            "DistanceFunction": "COSINE",
+            "VectorAttribute": {"AttributeName": "emb"},
+            "SearchSchema": [
+                {"AttributeName": "Country", "SearchSchemaElementType": "HASH"},
+                {"AttributeName": "Category", "SearchSchemaElementType": "INLINE_FILTER"},
+                {"AttributeName": "Price", "SearchSchemaElementType": "INLINE_FILTER"},
+                {"AttributeName": "Tag", "SearchSchemaElementType": "INLINE_FILTER"},
+            ],
+            "Projection": {"ProjectionType": "ALL"},
+        }
+    ],
+}
 
 
 @pytest.fixture(scope="module")
-def grammar_table():
+def vector_table():
     """Table with HASH Country (S), inline filters Category (S), Price (N), Tag (B)."""
-    previous = _previous_setting()
-    managed = _set_setting("all")
-    name = f"extenddb-test-{uuid.uuid4().hex[:12]}"
-    created = False
+    name = table_name()
+    create_vector_table(name, CREATE)
     try:
-        resp = _signed_post(
-            "CreateTable",
-            {
-                "TableName": name,
-                "AttributeDefinitions": [
-                    {"AttributeName": "id", "AttributeType": "S"},
-                    {"AttributeName": "Country", "AttributeType": "S"},
-                    {"AttributeName": "Category", "AttributeType": "S"},
-                    {"AttributeName": "Price", "AttributeType": "N"},
-                    {"AttributeName": "Tag", "AttributeType": "B"},
-                ],
-                "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}],
-                "BillingMode": "PAY_PER_REQUEST",
-                "VectorIndexes": [
-                    {
-                        "IndexName": "vix",
-                        "Dimensions": 4,
-                        "DistanceFunction": "COSINE",
-                        "VectorAttribute": {"AttributeName": "emb"},
-                        "SearchSchema": [
-                            {"AttributeName": "Country", "SearchSchemaElementType": "HASH"},
-                            {"AttributeName": "Category", "SearchSchemaElementType": "INLINE_FILTER"},
-                            {"AttributeName": "Price", "SearchSchemaElementType": "INLINE_FILTER"},
-                            {"AttributeName": "Tag", "SearchSchemaElementType": "INLINE_FILTER"},
-                        ],
-                        "Projection": {"ProjectionType": "ALL"},
-                    }
-                ],
-            },
-        )
-        if resp.status_code == 400 and "not supported" in _message(resp):
-            pytest.skip("target backend does not support vector indexes")
-        assert resp.status_code == 200, resp.text
-        created = True
-        _wait_active(name)
         for rank, (item_id, (country, category, price, tag)) in enumerate(ITEMS.items()):
             item = {
                 "id": {"S": item_id},
@@ -273,23 +191,38 @@ def grammar_table():
                 item["Tag"] = {"B": tag}
             put = _signed_post("PutItem", {"TableName": name, "Item": item})
             assert put.status_code == 200, put.text
-        probe = _search(name, H + "Price > :p5")
-        if probe.status_code == 400 and _message(probe) == EQUALITY_ONLY:
-            pytest.skip("the extended grammar is off for this account")
         # Vector index maintenance may lag the write by the propagation delay.
+        # An equality search, so the wait holds under both grammars.
         deadline = time.monotonic() + 30
-        while _ids(_search(name, H + "Price <> :p0")) != US:
+        while _ids(_search(name, "Country = :us")) != US:
             if time.monotonic() > deadline:
                 raise TimeoutError("items did not reach the vector index")
             time.sleep(0.1)
         yield name
     finally:
-        if created:
-            _signed_post("DeleteTable", {"TableName": name})
-        if managed:
-            _set_setting(previous)
+        delete_table(name)
 
 
+@pytest.fixture(scope="module")
+def grammar(vector_table) -> str:
+    """``equality`` or ``extended``, checked against the setting on ExtendDB."""
+    return grammar_of(lambda: _search(vector_table, H + "Price > :p5"))
+
+
+@pytest.fixture(scope="module")
+def grammar_table(vector_table, grammar):
+    if grammar == "equality":
+        pytest.skip("the extended grammar is off for this account")
+    return vector_table
+
+
+class TestGate:
+    def test_the_grammar_matches_the_setting(self, vector_table, grammar):
+        resp = _search(vector_table, H + "Price > :p5")
+        if grammar == "equality":
+            _refused(resp, EQUALITY_ONLY)
+        else:
+            assert _ids(resp) == {"i2", "i3", "i6", "i7", "i9"}
 
 
 class TestOperators:
@@ -321,8 +254,8 @@ class TestOperators:
 
 
 class TestEvaluation:
-    """Measured: numbers compare as the nearest binary64 value of each side, so the
-    two 38-digit Prices are equal. Not yet measured: a missing attribute."""
+    """Numbers compare as the nearest binary64 value of each side, so the two
+    38-digit Prices are equal. A missing attribute satisfies ``<>`` and NOT."""
 
     def test_a_missing_attribute_under_not_equal_and_not(self, grammar_table):
         assert "i4" in _ids(_search(grammar_table, H + "Price <> :p10"))
@@ -347,6 +280,7 @@ class TestEvaluation:
 
     def test_the_filter_applies_before_top_k(self, grammar_table):
         resp = _search(grammar_table, H + "Price > :p5", top_k=2)
+        assert resp.status_code == 200, resp.text
         assert [r["Item"]["id"]["S"] for r in resp.json()["SearchResults"]] == ["i2", "i3"]
 
 
@@ -461,81 +395,18 @@ def _raw(table: str, **fields) -> requests.Response:
     return _signed_post("SearchVectors", body)
 
 
-class TestExpressionMaps:
-    """The two maps, checked before either expression is read."""
-
-    def test_empty_maps_names_first(self, grammar_table):
-        cond = {"SearchConditionExpression": "Country = :us"}
-        _refused(_raw(grammar_table, **cond, ExpressionAttributeValues={}),
-                 "ExpressionAttributeValues must not be empty")
-        _refused(
-            _raw(grammar_table, **cond, ExpressionAttributeNames={}, ExpressionAttributeValues={}),
-            "ExpressionAttributeNames must not be empty",
-        )
-        _refused(_raw(grammar_table, ExpressionAttributeValues={}),
-                 "ExpressionAttributeValues must not be empty")
-        resp = _raw(grammar_table, TopK=0, **cond, ExpressionAttributeValues={})
-        assert "TopK" in _message(resp), resp.text
-
-    def test_keys_and_names(self, grammar_table):
-        us = {":us": {"S": "US"}}
-        cases = [
-            ({"#c": ""}, {}, "#c = :us",
-             "ExpressionAttributeNames contains invalid value: Empty attribute name for key #c"),
-            ({"#a-b": "x"}, {**us, ":b-k": {"S": "y"}}, "Country = :us",
-             'ExpressionAttributeNames contains invalid key: Syntax error; key: "#a-b"'),
-            ({"": "x"}, us, "Country = :us",
-             "ExpressionAttributeNames contains invalid key: The expression attribute map "
-             "contains an empty key;"),
-            ({"#" + "k" * 300: "x"}, us, "Country = :us",
-             "ExpressionAttributeNames contains invalid key: The expression attribute map "
-             "contains a key that is too long; size of key: 301"),
-            ({"#c": "C" * 65536}, us, "#c = :us",
-             "Attribute name is too large, must be less than 65536 bytes for key #c"),
-            (None, {**us, ":": {"S": "y"}}, "Country = :us",
-             'ExpressionAttributeValues contains invalid key: Syntax error; key: ":"'),
-        ]
-        for names, values, cond, message in cases:
-            fields = {"SearchConditionExpression": cond, "ExpressionAttributeValues": values}
-            if names is not None:
-                fields["ExpressionAttributeNames"] = names
-            _refused(_raw(grammar_table, **fields), message)
-
-    def test_maps_need_their_expression(self, grammar_table):
-        names, us = {"#p": "Price"}, {":us": {"S": "US"}}
-        only = "can only be specified when using expressions"
-        _refused(_raw(grammar_table, ExpressionAttributeNames=names),
-                 "ExpressionAttributeNames " + only)
-        _refused(_raw(grammar_table, ExpressionAttributeNames=names, ExpressionAttributeValues=us),
-                 "ExpressionAttributeNames " + only)
-        _refused(_raw(grammar_table, ExpressionAttributeValues=us),
-                 "ExpressionAttributeValues " + only)
-        _refused(
-            _raw(grammar_table, ProjectionExpression="#p", ExpressionAttributeNames=names,
-                 ExpressionAttributeValues=us),
-            "ExpressionAttributeValues " + only,
-        )
+class TestExpressionMapsUnderTheExtendedGrammar:
+    """Map checks whose request only the extended grammar parses."""
 
     def test_unused_names(self, grammar_table):
-        us = {":us": {"S": "US"}}
         unused = "Value provided in ExpressionAttributeNames unused in expressions: keys: {#u}"
-        u = {"#u": "x"}
-        _refused(_raw(grammar_table, SearchConditionExpression="Country = :us",
-                      ExpressionAttributeNames=u,
-                      ExpressionAttributeValues={**us, ":w": {"S": "w"}}), unused)
-        _refused(_raw(grammar_table, SearchConditionExpression="Country = :us",
-                      ProjectionExpression="Price", ExpressionAttributeNames=u,
-                      ExpressionAttributeValues=us), unused)
+        us, u = {":us": {"S": "US"}}, {"#u": "x"}
         _refused(_raw(grammar_table, SearchConditionExpression="Price > :p",
                       ExpressionAttributeNames=u, ExpressionAttributeValues={":p": {"N": "0"}}),
                  unused)
         _refused(_raw(grammar_table, SearchConditionExpression="Country = = :us",
                       ExpressionAttributeNames=u, ExpressionAttributeValues=us),
                  P + 'Syntax error; token: "=", near: "= = :us"')
-        resp = _raw(grammar_table, SearchConditionExpression="Country = :us",
-                    ProjectionExpression="#p", ExpressionAttributeNames={"#p": "Price"},
-                    ExpressionAttributeValues=us)
-        assert resp.status_code == 200, resp.text
 
     def test_the_projection_is_read_before_the_condition(self, grammar_table):
         _refused(
@@ -548,16 +419,21 @@ class TestExpressionMaps:
 
 class TestBackendWithoutVectors:
     def test_the_backend_refuses_before_the_grammar_runs(self):
-        """On a backend without vector search the refusal is the backend's."""
-        if not _ENDPOINT_VAR:
+        """On a backend without vector search the refusal is the backend's.
+
+        The condition is a syntax error under both grammars, so a grammar that
+        ran before the backend check would answer with its own message.
+        """
+        if not ENDPOINT_VAR:
             pytest.skip("requires EXTENDDB_TEST_ENDPOINT")
-        previous = _previous_setting()
-        managed = _set_setting("all")
-        try:
-            resp = _search(f"extenddb-test-{uuid.uuid4().hex[:12]}", H + "Price > :p5")
-            if resp.status_code == 400 and _message(resp) == NOT_SUPPORTED:
-                return
+        expected = expect_vectors()
+        name = table_name()
+        resp = _signed_post("CreateTable", {"TableName": name, **CREATE})
+        if resp.status_code == 200:
+            delete_table(name)
+            assert expected is not False, (
+                "EXTENDDB_EXPECT_VECTORS=0 but the backend accepted a vector index"
+            )
             pytest.skip("target backend supports vector search")
-        finally:
-            if managed:
-                _set_setting(previous)
+        _refused(resp, INDEX_NOT_SUPPORTED)
+        _refused(_search(name, "Country = = :us"), SEARCH_NOT_SUPPORTED)

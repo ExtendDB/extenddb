@@ -38,7 +38,7 @@ from botocore.awsrequest import AWSRequest
 from botocore.credentials import Credentials
 
 from management_helpers import ManagementClient
-from test_search_vectors_condition_limit import _expect_vectors
+from search_vectors_wire import expect_vectors as _expect_vectors
 
 REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 VECTOR = [{"N": "0.1"}, {"N": "0.2"}, {"N": "0.3"}, {"N": "0.4"}]
