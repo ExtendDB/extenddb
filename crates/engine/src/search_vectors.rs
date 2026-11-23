@@ -448,6 +448,10 @@ fn search_request_bytes(
 }
 
 #[cfg(test)]
+#[path = "search_vectors_order_tests.rs"]
+mod order_tests;
+
+#[cfg(test)]
 mod tests {
     use super::condition::resolve_search_scope;
     use super::*;

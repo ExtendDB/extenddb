@@ -9,8 +9,8 @@
 //! it in its own query. The service compares inline-filter strings and binary
 //! values exactly and inline-filter numbers as binary64, and the equality
 //! pairs compare every value exactly. So the pairs carry a condition of
-//! equalities on distinct attributes when no inline-filter value is a
-//! number; any other condition goes to the backend as an item filter.
+//! equalities when no inline-filter value is a number; any other condition
+//! goes to the backend as an item filter.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -128,13 +128,7 @@ fn equality_pairs<'a>(
         .find(|e| e.element_type == SearchSchemaElementType::Hash)
         .map(|e| e.attribute_name.as_str());
     let mut filters: Vec<(&str, &AttributeValue)> = Vec::with_capacity(conditions.len());
-    for (i, c) in conditions.iter().enumerate() {
-        if conditions[..i]
-            .iter()
-            .any(|seen| seen.attribute_name == c.attribute_name)
-        {
-            return None;
-        }
+    for c in conditions {
         if Some(c.attribute_name.as_str()) == hash_attr {
             continue;
         }

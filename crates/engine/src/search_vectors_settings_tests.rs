@@ -24,6 +24,8 @@ use super::{
 #[derive(Clone)]
 enum Answer {
     Value(Option<String>),
+    /// The value, after a delay that lets concurrent readers interleave.
+    Slow(String),
     Fail,
     Hang,
 }
@@ -62,6 +64,10 @@ impl SettingsStore for Store {
         Box::pin(async move {
             match answer {
                 Answer::Value(v) => Ok(v),
+                Answer::Slow(v) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    Ok(Some(v))
+                }
                 Answer::Fail => Err(OpError::Internal("connection reset".to_owned())),
                 Answer::Hang => std::future::pending().await,
             }
@@ -136,7 +142,11 @@ async fn a_read_that_does_not_finish_is_a_retryable_fault() {
     let store = Store::new(Answer::Hang);
     let settings = Settings::new(store.clone());
     let started = tokio::time::Instant::now();
-    assert!(is_unavailable(&settings.enabled_accounts().await));
+    // the test's own deadline, so a read without a bound fails here
+    let answer = tokio::time::timeout(READ_TIMEOUT * 2, settings.enabled_accounts())
+        .await
+        .expect("the read is bounded");
+    assert!(is_unavailable(&answer));
     assert_eq!(started.elapsed(), READ_TIMEOUT);
 }
 
@@ -181,7 +191,7 @@ async fn a_read_is_kept_for_the_refresh_interval() {
 
 #[tokio::test(start_paused = true)]
 async fn concurrent_requests_share_one_read() {
-    let store = Store::value("all");
+    let store = Store::new(Answer::Slow("all".to_owned()));
     let settings = Arc::new(Settings::new(store.clone()));
     let tasks: Vec<_> = (0..16)
         .map(|_| {
