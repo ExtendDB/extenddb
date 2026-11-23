@@ -7,10 +7,10 @@ use std::collections::HashMap;
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
-    Expr, ExpressionKind, ExpressionMaps, KeyCondition, PathElement, Token, UpdateAction,
-    is_syntax_error, parse_condition_from, parse_key_condition_from, parse_projection_from,
-    parse_update_from, tokenize_for, tokenize_with_limit, validate_no_reserved_words,
-    validate_operator_count, validate_placeholders_and_operands,
+    ConditionFault, Expr, ExpressionKind, ExpressionMaps, KeyCondition, PathElement, Token,
+    UpdateAction, parse_condition_classified, parse_condition_from, parse_key_condition_from,
+    parse_projection_from, parse_update_from, tokenize_for, tokenize_with_limit,
+    validate_no_reserved_words, validate_operator_count, validate_placeholders_and_operands,
 };
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{AttributeValue, ConditionalOperator, ExpectedAttributeValue};
@@ -297,7 +297,7 @@ pub fn parse_key_condition_expr(
         // `#x = :p AND` 150 terms answers the undefined `#x`). When the
         // condition grammar refuses the text in another way, the key
         // condition parser reports the error in its own words.
-        match parse_condition_from(&tokens, expr, limits.max_expression_depth) {
+        match parse_condition_classified(&tokens, expr, limits.max_expression_depth) {
             Ok(condition) => {
                 if let Err(count) = validate_operator_count(
                     &condition,
@@ -308,8 +308,8 @@ pub fn parse_key_condition_expr(
                     return Err(count);
                 }
             }
-            Err(err) if is_syntax_error(&err) => return Err(err),
-            Err(_) => {}
+            Err(ConditionFault::Syntax(err)) => return Err(err),
+            Err(ConditionFault::Other(_)) => {}
         }
         parse_key_condition_from(&tokens, expr)
     })

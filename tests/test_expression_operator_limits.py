@@ -1,30 +1,26 @@
 # Copyright 2026 ExtendDB contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Expression operator cap and placeholder key length.
+"""Expression operator cap.
 
-Two request shapes Amazon DynamoDB refuses with texts ExtendDB did not match:
+Amazon DynamoDB refuses an expression with more than 300 operators:
+``Invalid <Kind>: The expression contains too many operators; operator
+count: <n>``, on ConditionExpression (PutItem, UpdateItem, DeleteItem),
+FilterExpression (Scan, Query) and KeyConditionExpression (Query). Every
+comparison operator, AND, OR, NOT, BETWEEN, IN and function call counts one;
+parentheses, paths, placeholders and list elements count zero. An undefined
+placeholder and an operand of the wrong type come before the count, and so
+do the Scan Limit, Segment and TotalSegments ranges. PartiQL counts the
+statement, not the text it writes for it.
 
-  - an expression with more than 300 operators:
-    ``Invalid <Kind>: The expression contains too many operators; operator
-    count: <n>``, on ConditionExpression (PutItem, UpdateItem, DeleteItem),
-    FilterExpression (Scan, Query) and KeyConditionExpression (Query). Every
-    comparison operator, AND, OR, NOT, BETWEEN, IN and function call counts
-    one; parentheses, paths, placeholders and list elements count zero. An
-    undefined placeholder and an operand of the wrong type come before the
-    count, and so do the Scan Limit, Segment and TotalSegments ranges. PartiQL
-    counts the statement, not the text it writes for it.
-  - an ExpressionAttributeNames or ExpressionAttributeValues key over 255
-    bytes on PutItem: a ValidationException carrying ``size of key: <n>``,
-    not a SerializationException.
-
-The syntax error wording tests are in test_expression_syntax_wording.py.
+The syntax error wording tests are in test_expression_syntax_wording.py and
+the placeholder key length tests in test_expression_placeholder_key_length.py.
 
 Every expected text was measured against Amazon DynamoDB on 2026-10-25,
-2026-11-19 or 2026-11-20 (us-east-1); the probe case id is noted on each
-assertion. The write paths carry a ``1 validation error detected: `` prefix
-on the service that ExtendDB does not emit; those assertions compare the
-text after the prefix.
+2026-11-19, 2026-11-20 or 2026-11-23 (us-east-1); the probe case id is noted
+on each assertion. The write paths carry a ``1 validation error detected: ``
+prefix on the service that ExtendDB does not emit; those assertions compare
+the text after the prefix.
 
 Dual-target against Amazon DynamoDB and extenddb.
 """
@@ -33,11 +29,24 @@ from __future__ import annotations
 
 import pytest
 
+from conftest import _is_real_dynamodb
 from expression_fault_helpers import (
     NAMES, VALUES, _after_prefix, _error, _validation, chain, put, query, scan, syntax, table,
 )
 
 TOO_MANY = "The expression contains too many operators; operator count: "
+
+# ExtendDB serves a KeyConditionExpression whose second clause names an
+# attribute outside the key schema, where the service refuses it. Its
+# one-condition-per-key check covers the key attributes only. This change does
+# not touch that check.
+# TODO: remove this marker once a non-key attribute in a key condition is refused.
+XFAIL_ON_EXTENDDB_NON_KEY_CONDITION = pytest.mark.xfail(
+    not _is_real_dynamodb(),
+    reason="ExtendDB serves a key condition on an attribute outside the key schema",
+    raises=pytest.fail.Exception,
+    strict=True,
+)
 
 
 class TestOperatorCount:
@@ -181,10 +190,25 @@ class TestOperatorCount:
 
     def test_key_condition_count_precedes_the_key_grammar(self, dynamodb_client, table):
         # [a62] `pk = :v OR` + 150 terms answers the count, not the operator
-        # refusal. The service also runs the count ahead of its
-        # one-condition-per-key check (b05, a60); ExtendDB has no such check.
+        # refusal. [a60] `pk = :v AND` + 150 terms on one attribute answers
+        # the count ahead of the one-condition-per-key check, on the service
+        # and on ExtendDB (measured 2026-11-23).
         msg = _validation(query(dynamodb_client, table, "pk = :v OR " + chain("#v = :v", 150, " AND ")))
         assert msg == f"Invalid KeyConditionExpression: {TOO_MANY}301"
+        msg = _validation(query(dynamodb_client, table, "pk = :v AND " + chain("#v = :v", 150, " AND ")))
+        assert msg == f"Invalid KeyConditionExpression: {TOO_MANY}301"
+
+    @XFAIL_ON_EXTENDDB_NON_KEY_CONDITION
+    def test_one_condition_per_key_under_the_cap(self, dynamodb_client, table):
+        # [b05] `pk = :v AND` + 10 terms on one attribute, 21 operators
+        # (measured 2026-11-23): under the cap, the service refuses the
+        # repeated attribute, whether or not it is a key, before the table
+        # lookup.
+        msg = _validation(query(dynamodb_client, table, "pk = :v AND " + chain("#v = :v", 10, " AND ")))
+        assert msg == (
+            "Invalid KeyConditionExpression: KeyConditionExpressions must only "
+            "contain one condition per key"
+        )
 
 
 class TestOperatorCountOrder:
@@ -281,133 +305,6 @@ class TestOperatorCountOrder:
                 )
             )
             assert _after_prefix(msg) == f"Invalid ConditionExpression: {TOO_MANY}599", update
-
-
-class TestPlaceholderKeyLength:
-    """A placeholder key over 255 bytes is a ValidationException with its size."""
-
-    @staticmethod
-    def _names_msg(field: str, size: int) -> str:
-        return (
-            f"{field} contains invalid key: The expression attribute map contains "
-            f"a key that is too long; size of key: {size}"
-        )
-
-    def test_put_item_names_key(self, dynamodb_client_no_validation, table):
-        # [c01] 255 accepted (condition evaluated), 256 and 257 refused.
-        ok = "#" + "a" * 254
-        code, _ = _error(
-            put(dynamodb_client_no_validation, table, f"{ok} = :v", ExpressionAttributeNames={ok: "v"})
-        )
-        assert code == "ConditionalCheckFailedException"
-        for size in (256, 257):
-            key = "#" + "a" * (size - 1)
-            msg = _validation(
-                put(dynamodb_client_no_validation, table, f"{key} = :v", ExpressionAttributeNames={key: "v"})
-            )
-            assert _after_prefix(msg) == self._names_msg("ExpressionAttributeNames", size)
-
-    def test_put_item_values_key(self, dynamodb_client_no_validation, table):
-        # [c02] 255 accepted, 256 and 257 refused with the size suffix.
-        ok = ":" + "a" * 254
-        code, _ = _error(
-            put(dynamodb_client_no_validation, table, f"#v = {ok}", ExpressionAttributeValues={ok: {"S": "x"}})
-        )
-        assert code == "ConditionalCheckFailedException"
-        for size in (256, 257):
-            key = ":" + "a" * (size - 1)
-            msg = _validation(
-                put(
-                    dynamodb_client_no_validation,
-                    table,
-                    f"#v = {key}",
-                    ExpressionAttributeValues={key: {"S": "x"}},
-                )
-            )
-            assert _after_prefix(msg) == self._names_msg("ExpressionAttributeValues", size)
-
-    def test_put_item_key_length_is_bytes_and_checked_before_syntax(
-        self, dynamodb_client_no_validation, table
-    ):
-        # [c03] 127 two-byte characters: 255 bytes, passes the length check and
-        # fails key syntax; [c04] 128: 257 bytes; [c05] 258 bytes with an
-        # invalid character reports the length.
-        key = "#" + "\u00e9" * 127
-        msg = _validation(
-            put(dynamodb_client_no_validation, table, "#v = :v", ExpressionAttributeNames={"#v": "v", key: "w"})
-        )
-        assert _after_prefix(msg) == (
-            f'ExpressionAttributeNames contains invalid key: Syntax error; key: "{key}"'
-        )
-        key = "#" + "\u00e9" * 128
-        msg = _validation(
-            put(dynamodb_client_no_validation, table, "#v = :v", ExpressionAttributeNames={"#v": "v", key: "w"})
-        )
-        assert _after_prefix(msg) == self._names_msg("ExpressionAttributeNames", 257)
-        key = "#" + "a" * 255 + "-x"
-        msg = _validation(
-            put(dynamodb_client_no_validation, table, "#v = :v", ExpressionAttributeNames={"#v": "v", key: "w"})
-        )
-        assert _after_prefix(msg) == self._names_msg("ExpressionAttributeNames", 258)
-
-    def test_put_item_too_long_key_beats_the_expression_checks(
-        self, dynamodb_client_no_validation, table
-    ):
-        # [c06] unreferenced, [c07] with a 300-term chain, [c08] with a syntax
-        # error, [c09] with an undefined name, [c10] with an unused value.
-        key = "#" + "w" * 255
-        names = {"#v": "v", key: "w"}
-        expected = self._names_msg("ExpressionAttributeNames", 256)
-        for condition, extra in [
-            ("#v = :v", {}),
-            (chain("#v = :v", 300), {}),
-            ("#v = = :v", {}),
-            ("#x = :v", {}),
-            ("#v = :v", {"ExpressionAttributeValues": {":v": {"S": "x"}, ":u": {"S": "y"}}}),
-        ]:
-            msg = _validation(
-                put(dynamodb_client_no_validation, table, condition, ExpressionAttributeNames=names, **extra)
-            )
-            assert _after_prefix(msg) == expected, condition
-
-    def test_scan_query_update_keys(self, dynamodb_client_no_validation, table):
-        # [c12] Scan names, [s10] Scan values, [s11] Query values, [s12] Query
-        # names: no prefix. [c13] UpdateItem names: prefix on the service.
-        nkey = "#" + "w" * 255
-        vkey = ":" + "w" * 255
-        assert _validation(
-            scan(dynamodb_client_no_validation, table, f"{nkey} = :v", ExpressionAttributeNames={nkey: "w"})
-        ) == self._names_msg("ExpressionAttributeNames", 256)
-        assert _validation(
-            scan(dynamodb_client_no_validation, table, f"#v = {vkey}", ExpressionAttributeValues={vkey: {"S": "x"}})
-        ) == self._names_msg("ExpressionAttributeValues", 256)
-        assert _validation(
-            query(
-                dynamodb_client_no_validation,
-                table,
-                "pk = :p",
-                FilterExpression=f"#v = {vkey}",
-                ExpressionAttributeValues={":p": {"S": "p1"}, vkey: {"S": "x"}},
-            )
-        ) == self._names_msg("ExpressionAttributeValues", 256)
-        assert _validation(
-            query(
-                dynamodb_client_no_validation,
-                table,
-                "pk = :v",
-                ExpressionAttributeNames={nkey: "w"},
-            )
-        ) == self._names_msg("ExpressionAttributeNames", 256)
-        msg = _validation(
-            lambda: dynamodb_client_no_validation.update_item(
-                TableName=table,
-                Key={"pk": {"S": "absent"}, "sk": {"S": "absent"}},
-                UpdateExpression=f"SET {nkey} = :v",
-                ExpressionAttributeNames={nkey: "w"},
-                ExpressionAttributeValues=VALUES,
-            )
-        )
-        assert _after_prefix(msg) == self._names_msg("ExpressionAttributeNames", 256)
 
 
 UNDEFINED_VALUE = (
@@ -608,25 +505,42 @@ class TestChecksAheadOfTheCount:
             assert _after_prefix(_validation(request)) == f"Invalid {kind}Expression: {want}", case
 
 
+# The range texts: the service's, then ExtendDB's. ExtendDB keeps its own
+# wording for the three Scan ranges.
+RANGE_TEXTS = {
+    "Limit": (
+        "1 validation error detected: Value at 'Limit' failed to satisfy constraint: "
+        "Member must have value greater than or equal to 1",
+        "1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: "
+        "Member must have value greater than or equal to 1",
+    ),
+    "TotalSegments": (
+        "1 validation error detected: Value at 'TotalSegments' failed to satisfy constraint: "
+        "Member must have value greater than or equal to 1",
+        "The parameter TotalSegments should be greater than or equal to 1",
+    ),
+}
+
+
 class TestScanRangesAheadOfTheCount:
     """The Scan Limit, Segment and TotalSegments ranges come first."""
 
     @pytest.mark.parametrize(
-        "case, expr, values, extra",
+        "case, expr, values, extra, field",
         [
-            ("s05", chain("#v = :v", 151), {}, {"Limit": 0}),
-            ("s16", "#v < :b", B, {"Limit": 0}),
-            ("s17", "#v = :zz", {}, {"Limit": 0}),
-            ("s22", "#v = = :v", {}, {"Limit": 0}),
-            ("s06", chain("#v = :v", 151), {}, {"Segment": 0, "TotalSegments": 0}),
+            ("s05", chain("#v = :v", 151), {}, {"Limit": 0}, "Limit"),
+            ("s16", "#v < :b", B, {"Limit": 0}, "Limit"),
+            ("s17", "#v = :zz", {}, {"Limit": 0}, "Limit"),
+            ("s22", "#v = = :v", {}, {"Limit": 0}, "Limit"),
+            ("s06", chain("#v = :v", 151), {}, {"Segment": 0, "TotalSegments": 0}, "TotalSegments"),
+            ("s41", chain("#v = :v", 151), {}, {"TotalSegments": 0}, "TotalSegments"),
         ],
     )
     def test_range_beats_the_filter_checks(
-        self, dynamodb_client_no_validation, table, case, expr, values, extra
+        self, dynamodb_client_no_validation, table, case, expr, values, extra, field
     ):
-        # Measured 2026-11-19. The service words the range as "Value at
-        # 'Limit' failed to satisfy constraint: ..."; ExtendDB keeps its own
-        # wording, so the assertion names the parameter and the bound.
+        # Measured 2026-11-19, and s41 on 2026-11-23: a TotalSegments out of
+        # range without a Segment answers the range, not the missing partner.
         msg = _validation(
             scan(
                 dynamodb_client_no_validation,
@@ -636,9 +550,7 @@ class TestScanRangesAheadOfTheCount:
                 **extra,
             )
         )
-        name = "TotalSegments" if "TotalSegments" in extra else "limit"
-        assert name in msg or name.capitalize() in msg, (case, msg)
-        assert "greater than or equal to 1" in msg, (case, msg)
+        assert msg == RANGE_TEXTS[field][0 if _is_real_dynamodb() else 1], (case, msg)
 
     def test_segment_pairing_comes_after_the_count(self, dynamodb_client_no_validation, table):
         # [s27] a Segment without TotalSegments beside 151 terms.
