@@ -4,7 +4,7 @@
 //! Statement forms and functions beyond the base productions in the parent
 //! module: the FROM-first UPDATE, SET and REMOVE clauses in any number and
 //! order, `set_add` and `set_delete` in a SET, `EXISTS(SELECT ...)`, the
-//! operand checks on the condition functions, and a condition function
+//! operand checks on the presence functions, and a condition function
 //! compared with a boolean.
 //!
 //! Every message is the service's (measured 2026-11-02).
@@ -18,16 +18,6 @@ use crate::partiql::ast::{
 use crate::partiql::lexer::TokenKind;
 use crate::partiql::values;
 use crate::types::AttributeValue;
-
-/// The functions a WHERE condition recognizes.
-const CONDITION_FUNCTIONS: [&str; 6] = [
-    "attribute_exists",
-    "attribute_not_exists",
-    "attribute_type",
-    "begins_with",
-    "contains",
-    "size",
-];
 
 /// The assignments of one or more SET and REMOVE clauses.
 #[derive(Default)]
@@ -281,9 +271,12 @@ impl Parser {
         }
     }
 
-    /// A function call as a top-level INSERT value: once the call parses, it is
-    /// refused naming the function and its position (measured 2026-11-02 for
-    /// `set_add`). `None` when the current token does not open a call.
+    /// A function call as a top-level INSERT value: once the call parses, read
+    /// as a call in a SET value is, it is refused naming the function and its
+    /// position (measured 2026-11-02 for `set_add`, and 2026-11-23: `count()`
+    /// is the aggregate's syntax error, `cast(m AS INT)` and `upper(NOT b)`
+    /// are refused by name). `None` when the current token does not open a
+    /// call.
     pub(super) fn function_as_item_value(&mut self) -> Option<ParseError> {
         if !self.at_call() {
             return None;
@@ -292,12 +285,12 @@ impl Parser {
         let TokenKind::Ident(name) = self.bump().kind else {
             return None;
         };
-        if let Err(e) = self.call_args() {
+        let name = values::call_name(&name, false);
+        if let Err(e) = self.form_arguments(&name, Self::operand) {
             return Some(e);
         }
         Some(ParseError::new(format!(
-            "Unsupported data type: {} under key root at {at}",
-            name.to_ascii_lowercase()
+            "Unsupported data type: {name} under key root at {at}"
         )))
     }
 }
@@ -318,14 +311,6 @@ pub(super) fn check_presence_operands(name: &str, args: &[Operand]) -> PResult<(
         )));
     }
     Ok(())
-}
-
-/// A call inside a WHERE condition to anything but a condition function, such
-/// as `EXISTS(a)` or `set_add(...)`, is refused naming the function in lower
-/// case and its position (measured 2026-11-02). `None` for a condition
-/// function.
-pub(super) fn where_function_refusal(name: &str, at: &str) -> Option<String> {
-    (!CONDITION_FUNCTIONS.contains(&name)).then(|| format!("Unrecognized function: {name} at {at}"))
 }
 
 #[cfg(test)]

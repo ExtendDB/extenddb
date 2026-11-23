@@ -4,9 +4,10 @@
 //! Operands: the signs and arithmetic of an operand and the term it starts with.
 
 use super::limits::Nest;
-use super::{LITERAL_ROOT, PResult, ParseError, Parser, forms, terms};
+use super::{LITERAL_ROOT, PResult, ParseError, Parser, terms};
 use crate::partiql::ast::{ArithOp, Operand};
 use crate::partiql::lexer::{TokenKind, WordClass, is_function_keyword, word_class};
+use crate::partiql::values::{AGGREGATES, Call, FORMS, call_name};
 use crate::types::AttributeValue;
 
 /// A number literal with the signs written before it folded in (see
@@ -288,7 +289,7 @@ impl Parser {
                 let callable = class == WordClass::Name
                     || (class == WordClass::Keyword && is_function_keyword(&name));
                 if call && callable {
-                    self.call(lname)
+                    self.call(call_name(&name, false))
                 } else if matches!(class, WordClass::Name | WordClass::Literal) {
                     // `missing` outside a condition is read as a name.
                     Ok(Operand::Path(self.path()?))
@@ -299,7 +300,7 @@ impl Parser {
             // A quoted name with `(` after it is a call (measured 2026-11-13:
             // `"foo"(1)` as a statement is refused as `foo(1)` is).
             TokenKind::QuotedIdent(name) if matches!(self.nth_kind(1), Some(TokenKind::LParen)) => {
-                self.call(name.to_ascii_lowercase())
+                self.call(call_name(&name, true))
             }
             // A name after `@` starts a path, also with `(` after it.
             TokenKind::QuotedIdent(_) | TokenKind::At => Ok(Operand::Path(self.path()?)),
@@ -307,18 +308,22 @@ impl Parser {
         }
     }
 
-    /// A call, with the current token on its name, `lname` in lower case. In
-    /// a condition only the condition functions are recognized (see
-    /// [`forms::where_function_refusal`]).
-    fn call(&mut self, lname: String) -> PResult<Operand> {
+    /// A call, with the current token on its name, `name` as the code
+    /// compares it (see [`call_name`]). Its arguments are read by the rules
+    /// of its form (see [`Parser::form_arguments`]). In a condition the call
+    /// is refused by its name once the statement parses (see
+    /// [`Call::refusal`]); in a SET value the checks made then refuse it (see
+    /// `values`).
+    fn call(&mut self, name: String) -> PResult<Operand> {
         self.count_operator();
         let at = self.span();
-        let refusal = if self.in_where {
-            forms::where_function_refusal(&lname, &at)
-        } else {
-            None
-        };
         self.bump();
+        let call = Call {
+            name,
+            at,
+            paren_at: self.span(),
+        };
+        let refusal = self.in_where.then(|| call.refusal(true)).flatten();
         // In a condition an argument may hold a LIKE (see
         // [`Parser::argument_with_like`]).
         let argument: fn(&mut Self) -> PResult<Operand> = if self.in_where {
@@ -326,14 +331,84 @@ impl Parser {
         } else {
             Self::operand
         };
-        let args = self.arguments(argument)?;
+        let args = self.form_arguments(&call.name, argument)?;
         // The walk meets a call's arguments before its name (measured
         // 2026-11-02: `foo(1e126)` is refused for the number, `foo(1 + 1)`
         // for the `+`).
         if let Some(refusal) = refusal {
             self.defer(&refusal);
         }
-        Ok(Operand::Function(lname, args))
+        Ok(Operand::Function(call.name, args))
+    }
+
+    /// The arguments of a call named `name` as the code compares it (see
+    /// [`call_name`]), with the current token on its `(`, each read with
+    /// `argument`. Measured 2026-11-23 in a SET value, in a condition and as a
+    /// statement:
+    ///
+    /// * an aggregate (`avg`, `count`, `max`, `min`, `sum`) takes one or more
+    ///   operands, the first after `DISTINCT` or `ALL` or neither, and `count`
+    ///   takes `*` alone: `count()`, `COUNT()`, `"count"()` and `max()` are
+    ///   "Aggregate functions are always unary", `count(*, 1)` is "Expected
+    ///   RIGHT_PAREN", `count(DISTINCT)` "Unexpected term" and `avg(*)` "avg(*)
+    ///   is not allowed";
+    /// * `nullif` takes two operands (`nullif(m)` is "Expected COMMA"),
+    ///   `coalesce` one or more, and `cast` an operand, `AS` and a type name
+    ///   (`cast(m INT)` is "Expected AS", `cast(m AS foo)` "Expected type
+    ///   name", `cast(m AS INT` "Expected RIGHT_PAREN"); with no operand each
+    ///   is "Unexpected term";
+    /// * any other call takes any arguments.
+    pub(super) fn form_arguments(
+        &mut self,
+        name: &str,
+        argument: fn(&mut Self) -> PResult<Operand>,
+    ) -> PResult<Vec<Operand>> {
+        let aggregate = AGGREGATES.contains(&name);
+        if !aggregate && !FORMS.contains(&name) {
+            return self.arguments(argument);
+        }
+        self.bump();
+        if aggregate && matches!(self.peek().kind, TokenKind::RParen) {
+            return Err(ParseError::well_formed(
+                "Aggregate functions are always unary",
+            ));
+        }
+        let mut args = Vec::new();
+        if aggregate && self.eat(&TokenKind::Star) {
+            if name != "count" {
+                return Err(ParseError::well_formed(&format!(
+                    "{name}(*) is not allowed"
+                )));
+            }
+        } else {
+            if aggregate && !self.eat_keyword("DISTINCT") {
+                self.eat_keyword("ALL");
+            }
+            args.push(argument(self)?);
+            match name {
+                "nullif" => {
+                    if !self.eat(&TokenKind::Comma) {
+                        return Err(ParseError::well_formed("Expected COMMA"));
+                    }
+                    args.push(argument(self)?);
+                }
+                "cast" => {
+                    if !self.eat_keyword("AS") {
+                        return Err(ParseError::well_formed("Expected AS"));
+                    }
+                    self.type_name()?;
+                }
+                _ => {
+                    while self.eat(&TokenKind::Comma) {
+                        args.push(argument(self)?);
+                    }
+                }
+            }
+        }
+        if !self.eat(&TokenKind::RParen) {
+            return Err(ParseError::well_formed("Expected RIGHT_PAREN"));
+        }
+        Ok(args)
     }
 
     /// Path steps after a literal: the statement parses, and the path is

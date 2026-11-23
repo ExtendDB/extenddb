@@ -225,6 +225,7 @@ fn parse_attempt(
         table: None,
         in_where: false,
         in_values: false,
+        in_insert: false,
         after_where: false,
         after_not: false,
         bare_left: false,
@@ -282,6 +283,9 @@ struct Parser {
     /// Set while the SET and REMOVE clauses of an UPDATE or the value of an
     /// INSERT are parsed.
     in_values: bool,
+    /// Set while the value of an INSERT is parsed, where `in_values` is set
+    /// too.
+    in_insert: bool,
     /// Set once the WHERE condition has been read.
     after_where: bool,
     /// Whether the predicate being read follows a NOT.
