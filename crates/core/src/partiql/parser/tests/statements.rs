@@ -172,6 +172,33 @@ fn a_projected_call_keeps_the_first_refusal_and_parses_on() {
 }
 
 #[test]
+fn a_projected_call_on_a_quoted_name_counts_its_quotes() {
+    // Measured on 2026-11-23, each statement twice.
+    for (list, at) in [
+        ("\"size\"(a)", "1:8:6"),
+        ("\"sz\"(a)", "1:8:4"),
+        ("\"foo\"(a)", "1:8:5"),
+        ("\"size\" (a)", "1:8:6"),
+        ("pk, \"size\"(a)", "1:12:6"),
+        ("\"a\"\"b\"(x)", "1:8:6"),
+        ("\"caf\u{e9}\"(a)", "1:8:6"),
+        ("\"\u{1f600}\"(a)", "1:8:3"),
+        ("size(a)", "1:8:4"),
+        ("foo(a)", "1:8:3"),
+    ] {
+        let sql = format!("SELECT {list} FROM \"t\" WHERE pk = 'q'");
+        let Statement::Select(s) = parse(&sql).unwrap() else {
+            panic!("expected select: {sql}");
+        };
+        assert_eq!(
+            s.projection_error.as_deref(),
+            Some(format!("Unexpected path component at {at}").as_str()),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn a_syntax_error_after_a_projected_call_wins() {
     let m = err("SELECT COUNT(*) FROM \"t\" WHERE");
     assert!(

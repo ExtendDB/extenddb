@@ -147,19 +147,13 @@ impl Parser {
     /// its refusal goes in `deferred` (see [`SelectStatement::projection_error`]).
     /// A reserved word gets the answer it gets where any term starts, and a
     /// path may have any number of steps (measured 2026-11-02: `SELECT m.a.b`
-    /// runs).
+    /// runs). A call is refused at the called name's span as written, so a
+    /// quoted name counts its quotes (measured 2026-11-23: `"size"(a)` is at
+    /// 1:8:6, `size(a)` at 1:8:4).
     fn projection_path(&mut self, deferred: &mut Option<String>) -> PResult<Path> {
         if let Some(e) = self.select_list_keyword() {
             return Err(e);
         }
-        let (line, column) = {
-            let t = self.peek();
-            (t.line, t.column)
-        };
-        let root_len = match &self.peek().kind {
-            TokenKind::Ident(s) | TokenKind::QuotedIdent(s) => s.len(),
-            _ => 0,
-        };
         // `COUNT(*)` and the like: a function call is not a projectable path
         // component. Checked before the path is read because a keyword such as
         // COUNT is not a name. An argument list that is never closed is
@@ -177,7 +171,7 @@ impl Parser {
                 Some(TokenKind::LParen)
             )
         {
-            let message = format!("Unexpected path component at {line}:{column}:{root_len}");
+            let message = format!("Unexpected path component at {}", self.span());
             self.bump();
             if !self.skip_parenthesized() {
                 return Err(ParseError::new(message));
