@@ -17,8 +17,8 @@ The syntax error wording tests are in test_expression_syntax_wording.py and
 the placeholder key length tests in test_expression_placeholder_key_length.py.
 
 Every expected text was measured against Amazon DynamoDB on 2026-10-25,
-2026-11-19 or 2026-11-20 (us-east-1); the probe case id is noted on each
-assertion. The write paths carry a ``1 validation error detected: ``
+2026-11-19, 2026-11-20 or 2026-11-23 (us-east-1); the probe case id is noted
+on each assertion. The write paths carry a ``1 validation error detected: ``
 prefix on the service that ExtendDB does not emit; those assertions compare
 the text after the prefix.
 
@@ -492,25 +492,42 @@ class TestChecksAheadOfTheCount:
             assert _after_prefix(_validation(request)) == f"Invalid {kind}Expression: {want}", case
 
 
+# The range texts: the service's, then ExtendDB's. ExtendDB keeps its own
+# wording for the three Scan ranges.
+RANGE_TEXTS = {
+    "Limit": (
+        "1 validation error detected: Value at 'Limit' failed to satisfy constraint: "
+        "Member must have value greater than or equal to 1",
+        "1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: "
+        "Member must have value greater than or equal to 1",
+    ),
+    "TotalSegments": (
+        "1 validation error detected: Value at 'TotalSegments' failed to satisfy constraint: "
+        "Member must have value greater than or equal to 1",
+        "The parameter TotalSegments should be greater than or equal to 1",
+    ),
+}
+
+
 class TestScanRangesAheadOfTheCount:
     """The Scan Limit, Segment and TotalSegments ranges come first."""
 
     @pytest.mark.parametrize(
-        "case, expr, values, extra",
+        "case, expr, values, extra, field",
         [
-            ("s05", chain("#v = :v", 151), {}, {"Limit": 0}),
-            ("s16", "#v < :b", B, {"Limit": 0}),
-            ("s17", "#v = :zz", {}, {"Limit": 0}),
-            ("s22", "#v = = :v", {}, {"Limit": 0}),
-            ("s06", chain("#v = :v", 151), {}, {"Segment": 0, "TotalSegments": 0}),
+            ("s05", chain("#v = :v", 151), {}, {"Limit": 0}, "Limit"),
+            ("s16", "#v < :b", B, {"Limit": 0}, "Limit"),
+            ("s17", "#v = :zz", {}, {"Limit": 0}, "Limit"),
+            ("s22", "#v = = :v", {}, {"Limit": 0}, "Limit"),
+            ("s06", chain("#v = :v", 151), {}, {"Segment": 0, "TotalSegments": 0}, "TotalSegments"),
+            ("s41", chain("#v = :v", 151), {}, {"TotalSegments": 0}, "TotalSegments"),
         ],
     )
     def test_range_beats_the_filter_checks(
-        self, dynamodb_client_no_validation, table, case, expr, values, extra
+        self, dynamodb_client_no_validation, table, case, expr, values, extra, field
     ):
-        # Measured 2026-11-19. The service words the range as "Value at
-        # 'Limit' failed to satisfy constraint: ..."; ExtendDB keeps its own
-        # wording, so the assertion names the parameter and the bound.
+        # Measured 2026-11-19, and s41 on 2026-11-23: a TotalSegments out of
+        # range without a Segment answers the range, not the missing partner.
         msg = _validation(
             scan(
                 dynamodb_client_no_validation,
@@ -520,9 +537,7 @@ class TestScanRangesAheadOfTheCount:
                 **extra,
             )
         )
-        name = "TotalSegments" if "TotalSegments" in extra else "limit"
-        assert name in msg or name.capitalize() in msg, (case, msg)
-        assert "greater than or equal to 1" in msg, (case, msg)
+        assert msg == RANGE_TEXTS[field][0 if _is_real_dynamodb() else 1], (case, msg)
 
     def test_segment_pairing_comes_after_the_count(self, dynamodb_client_no_validation, table):
         # [s27] a Segment without TotalSegments beside 151 terms.

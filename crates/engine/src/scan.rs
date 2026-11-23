@@ -520,21 +520,23 @@ pub async fn handle_scan(
     })
 }
 
-/// Refuse a Limit, Segment or TotalSegments value outside its range. The
-/// Segment and TotalSegments ranges are checked when both are present; a
-/// missing partner is reported by the pairing check in `handle_scan`.
+/// Refuse a Limit, Segment or TotalSegments value outside its range. Each
+/// field is checked when it is present, with or without its partner
+/// (measured 2026-10-25 and 2026-11-23: `TotalSegments: 0` alone, or
+/// `Segment: -1` alone, answers that field's range, not the missing
+/// partner). For values inside the int32 range the service lists every
+/// fault of one request in the order Limit, Segment, TotalSegments; this
+/// check reports the first of them. A missing partner is reported by the
+/// pairing check in `handle_scan`.
 fn validate_scan_ranges(input: &ScanInput) -> Result<(), DynamoDbError> {
-    if let (Some(seg), Some(total)) = (input.segment, input.total_segments) {
-        if total < 1 {
-            return Err(DynamoDbError::ValidationException(
-                "The parameter TotalSegments should be greater than or equal to 1".to_owned(),
-            ));
-        }
-        if total > 1_000_000 {
-            return Err(DynamoDbError::ValidationException(format!(
-                "1 validation error detected: Value '{total}' at 'totalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000"
-            )));
-        }
+    if let Some(limit) = input.limit
+        && limit < 1
+    {
+        return Err(DynamoDbError::ValidationException(format!(
+            "1 validation error detected: Value '{limit}' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
+        )));
+    }
+    if let Some(seg) = input.segment {
         if seg < 0 {
             return Err(DynamoDbError::ValidationException(format!(
                 "1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value greater than or equal to 0"
@@ -546,12 +548,17 @@ fn validate_scan_ranges(input: &ScanInput) -> Result<(), DynamoDbError> {
             )));
         }
     }
-    if let Some(limit) = input.limit
-        && limit < 1
-    {
-        return Err(DynamoDbError::ValidationException(format!(
-            "1 validation error detected: Value '{limit}' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
-        )));
+    if let Some(total) = input.total_segments {
+        if total < 1 {
+            return Err(DynamoDbError::ValidationException(
+                "The parameter TotalSegments should be greater than or equal to 1".to_owned(),
+            ));
+        }
+        if total > 1_000_000 {
+            return Err(DynamoDbError::ValidationException(format!(
+                "1 validation error detected: Value '{total}' at 'totalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000"
+            )));
+        }
     }
     Ok(())
 }
