@@ -26,12 +26,12 @@ script fails, with one line per problem, unless:
 4. in the adapter's wasm32 build as `cargo tree -e normal` resolves it, each
    of aes, aes-gcm, ghash and polyval is one package (one name, version and
    source) with its zeroize feature on (crates/core/Cargo.toml turns it on).
-A plant whose text is not in the copy's file, or is there more than once,
-stops checks 2 and 3 with a line naming the file and the text. The runs use
-the caller's cargo target directory, and nothing of the working tree is
-written. The copy is removed on exit, also on SIGINT, SIGTERM and SIGHUP, and
-a clippy run is stopped with it. Needs Python 3.11 or later (for tomllib) and
-git.
+A plant whose text is not in the copy's file, or is there more than once, or
+whose file is a link out of the copy, stops checks 2 and 3 with a line naming
+the file and what is wrong. The runs use the caller's cargo target
+directory, and nothing of the working tree is written. The copy is removed
+on exit, also on SIGINT, SIGTERM and SIGHUP, and a clippy run is stopped with
+it. Needs Python 3.11 or later (for tomllib) and git.
 """
 
 import json
@@ -146,6 +146,9 @@ def insert(copy: Path, rel: str, find: str, lines: list[str], after_brace: bool)
     there on that ends with `{`). Returns the 1-based numbers of the written
     lines, or the problem."""
     path = copy / rel
+    real = Path(os.path.realpath(path))
+    if not real.is_relative_to(copy):
+        return f"cannot plant in {rel}: it is a link to {real}, outside the copy"
     try:
         text = path.read_text(encoding="utf-8").splitlines(keepends=True)
     except (OSError, UnicodeDecodeError) as error:
@@ -254,7 +257,10 @@ def zeroize_problems() -> tuple[list[str], list[str]]:
 
 def check(copy: Path) -> list[str]:
     """Checks 1 to 3 of the docstring, in the empty directory `copy`."""
-    problems = config_problems((ROOT / CONFIG_REL).read_text(encoding="utf-8"))
+    try:
+        problems = config_problems((ROOT / CONFIG_REL).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError) as error:
+        return [f"{CONFIG_REL} cannot be read: {error}"]
     argv = ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"]
     metadata = command(argv, ROOT)
     if metadata.returncode != 0:
