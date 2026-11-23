@@ -3,6 +3,7 @@
 
 //! What the drop drops and keeps, and what it waits for.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use extenddb_storage::diagnostics::{DiagError, DiagnosticsStore, OrphanDrop};
@@ -123,15 +124,24 @@ async fn fix_drops_only_the_relation_no_catalog_row_names() {
         OrphanDrop::Kept("not a data relation of this backend".to_owned()),
         "{outcomes:?}"
     );
+    // Each relation of the later table is kept with the row that names it:
+    // an index row, or else the table row.
+    let mut owners = BTreeMap::new();
+    for index in ["gsi1", "lsi1"] {
+        let relation = d.index_relation("later", index).await;
+        owners.insert(relation, format!("index {index} of table"));
+    }
+    if d.pgvector().await {
+        let relation = d.vector_relation("later", "vec1").await;
+        owners.insert(relation, "vector index vec1 of table".to_owned());
+    }
     for (name, outcome) in &outcomes[2..] {
-        match outcome {
-            OrphanDrop::Kept(reason) => assert!(
-                reason.starts_with("the catalog names it: ")
-                    && reason.ends_with(&format!("table {ACCOUNT}/later")),
-                "{name}: {reason}"
-            ),
-            other => panic!("{name}: {other:?}"),
-        }
+        let owner = owners.get(name).map_or("table", String::as_str);
+        assert_eq!(
+            *outcome,
+            OrphanDrop::Kept(format!("the catalog names it: {owner} {ACCOUNT}/later")),
+            "{name}"
+        );
     }
 
     assert!(!d.relation_exists(&orphan).await, "the orphan was dropped");
@@ -324,9 +334,11 @@ async fn a_held_orphan_fails_within_its_lock_timeout_and_catalog_writes_go_on() 
     let outcomes = outcomes.expect("drop");
     assert_eq!(outcomes.len(), 1, "{outcomes:?}");
     match &outcomes[0] {
-        (name, OrphanDrop::Failed(reason)) if *name == orphan => assert!(
-            reason.starts_with("another session held a lock on it for more than 1000 ms"),
-            "{reason}"
+        (name, OrphanDrop::Failed(reason)) if *name == orphan => assert_eq!(
+            reason,
+            "another session held a lock on it for more than 1000 ms, so it was kept; run the \
+             command again: error returned from database: canceling statement due to lock \
+             timeout"
         ),
         other => panic!("{other:?}"),
     }
@@ -402,12 +414,14 @@ async fn an_index_write_open_past_the_budget_stops_the_check_and_the_drop() {
         ("drop", drop.map(|_| ()), "nothing was dropped"),
     ] {
         match result {
-            Err(DiagError::QueryFailed(msg)) => assert!(
-                msg.starts_with(&format!(
+            Err(DiagError::QueryFailed(msg)) => assert_eq!(
+                msg,
+                format!(
                     "index changes in progress kept the index catalog locked for more than 2 \
-                     seconds, so {outcome}; run the command again: "
-                )),
-                "{call}: {msg}"
+                     seconds, so {outcome}; run the command again: error returned from \
+                     database: canceling statement due to lock timeout"
+                ),
+                "{call}"
             ),
             other => panic!("{call}: {other:?}"),
         }

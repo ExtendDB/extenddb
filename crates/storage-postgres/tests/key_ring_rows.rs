@@ -363,12 +363,12 @@ async fn set_data_connection_writes_the_row_under_the_ring() {
                 .await
                 .unwrap_or_else(|e| panic!("{name}: catalog-check with the KEK: {e}"));
             match store.check_storage_relations(&KeySource::CatalogKey).await {
-                Err(DiagError::NotConfigured(msg)) => assert!(
-                    msg.starts_with(
-                        "the catalog has a key ring, so its data_database_connection_string \
-                         row is encrypted;"
-                    ),
-                    "{name}: {msg}"
+                Err(DiagError::NotConfigured(msg)) => assert_eq!(
+                    msg,
+                    "the catalog has a key ring, so its data_database_connection_string row is \
+                     encrypted; run the command with the configuration whose [auth.encryption] \
+                     key_file names the KEK of the ring",
+                    "{name}"
                 ),
                 other => panic!("{name}: catalog-check without the KEK gave {other:?}"),
             }
