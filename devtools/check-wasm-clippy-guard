@@ -58,23 +58,25 @@ one line per problem, unless:
    into a loop, each probe's crate is one package's library, not the
    adapter's (probe_dependencies), clippy.toml has the line CONTROL_ENTRY
    goes after, and the copy's Cargo.lock, which `cargo metadata --offline`
-   writes, gains the crate and nothing else; a plant finding stops the guard
-   before the first run, each printed once. The step lints the crate, which
-   holds the probes, the controls and BUILD_SCRIPT, as a path dependency of
-   the adapter; no lint level of the tree's crates or manifests reaches it,
-   but rustflags do, and one that denies a lint a probe or control trips
-   stops a run.
+   writes, differs from the tree's only by the crate (lock_problems); a
+   plant finding stops the guard before the first run, each printed once,
+   and so does a control of probe_dependencies or lock_problems that does
+   not give its finding (both are matched there). The step lints the crate,
+   which holds the probes, the controls and BUILD_SCRIPT, as a path
+   dependency of the adapter; no lint level of the tree's crates or
+   manifests reaches it, but rustflags do, and one that denies a lint a
+   probe or control trips stops a run.
 Each check runs, in the same call, on the tree and on controls (the
 constants whose names hold CONTROL, BUILD_SCRIPT and three zeroize graphs),
 and each run's dep-info must be read for every crate of the build. A control
 that does not give its finding, and a finding no control expects, fail the
 guard. No control covers the checks that a command finishes (the two runs,
-cargo tree), nor the plant checks that read the tree and its copy
-themselves; those of the dependencies and the lock have controls. The
-environment and cargo-configuration checks are controlled on their control
-inputs only: handed an empty mapping or file list in place of the tree's,
-the guard would still pass. A wrapper that caps one crate's lints is caught
-all the same.
+cargo tree), the plant checks that read the tree and its copy themselves,
+or item 3's refusal of an allow on a function whose end the scan does not
+find. The environment and cargo-configuration checks are controlled on
+their control inputs only: handed an empty mapping or file list in place of
+the tree's, the guard would still pass. A wrapper that caps one crate's
+lints is caught all the same.
 rustc reports a force-warned lint under --cap-lints as well, so F reports
 that crate's calls, and item 1 refuses those no accepted allow covers.
 clippy-driver, though, lints no crate whose own compiler options hold
@@ -1492,6 +1494,33 @@ fn in_cfg_attr() {
     std::thread::sleep(Duration::ZERO); //@ cfg-attr call
 }
 
+#[allow(unused_attributes)]
+fn on_macro() {
+    macro_rules! nothing {
+        () => {};
+    }
+    #[allow(clippy::disallowed_methods, reason = "a control")] //@ on-macro allow
+    nothing!();
+}
+
+fn on_block() {
+    #[allow(clippy::disallowed_methods, reason = "a control")] //@ on-block allow
+    {
+        std::thread::sleep(Duration::ZERO); //@ on-block call
+    };
+}
+
+fn on_arm(x: u8) {
+    match x {
+        #[allow(clippy::disallowed_methods, reason = "a control")] //@ on-arm allow
+        0 => std::thread::sleep(Duration::ZERO), //@ on-arm call
+        _ => std::thread::yield_now(),
+    }
+}
+
+fn on_generic<#[allow(clippy::disallowed_methods, reason = "a control")] T>() {} //@ on-generic allow
+struct OnGeneric;
+
 #[allow(clippy::disallowed_methods, reason = "a control")]
 fn raised_inside() {
     #[warn(warnings, clippy::disallowed_methods)]
@@ -1583,24 +1612,38 @@ CONFIG_CONTROLS = {
     "a clippy.toml that does not parse": ("disallowed-methods = [", ["cannot be read"]),
     "a malformed clippy.toml": (
         f"msrv = '1.91.1'\ndisallowed-types = 'x'\ndisallowed-methods = [{_SLEEP}, {_SLEEP}, 'x',"
-        " { path = 'std::thread::spawn', reason = 'r', replacement = 'y' }]",
-        ["msrv is not one", "types is not a list", "entry 'x' is", "'replacement'", "more than"],
+        " { path = 'std::thread::spawn', reason = 'r', replacement = 'y' },"
+        " { path = 'std::thread::park' }]",
+        [
+            "msrv is not one",
+            "types is not a list",
+            "entry 'x' is",
+            "'replacement'",
+            "{'path': 'std::thread::park'} is",
+            "more than",
+        ],
     ),
 }
-# For probe_dependencies, a build with a library in two versions and the
-# adapter's library, and a path of each and of a crate no package has.
+# For probe_dependencies, with the build: a library in two versions, and a
+# path of each, of the adapter's library and of a crate no package has.
 CONTROL_BUILD = [
-    {"id": f"{name} {version}", "name": name, "version": version}
-    | {"targets": [{"name": name.replace("-", "_"), "kind": ["lib"]}]}
-    for name, version in (("twice", "1.0.0"), ("twice", "2.0.0"), (ADAPTER, "1.0.0"))
+    {"id": f"twice {version}", "name": "twice", "version": version}
+    | {"targets": [{"name": "twice", "kind": ["lib"]}]}
+    for version in ("1.0.0", "2.0.0")
 ]
 CONTROL_PATHS = {
     "absent::f": "it has none",
     "twice::f": "it has twice v1.0.0, twice v2.0.0",
-    "extenddb_wasm_adapter::f": "it has extenddb-wasm-adapter v1.0.0",
+    "extenddb_wasm_adapter::f": f"it has {ADAPTER} v",
 }
-# For lock_problems, a package that the copy's Cargo.lock gains.
+# For lock_problems, a package that a Cargo.lock gains.
 CONTROL_LOCK = '\n[[package]]\nname = "wasm-clippy-guard-control"\nversion = "0.0.0"\n'
+# The controls of the two checks above, which check matches before the first
+# run, where their findings on the tree stop the guard.
+EARLY_CONTROLS = [
+    *(Control("dependency", "plant", path, words) for path, words in CONTROL_PATHS.items()),
+    Control("lock", "plant", "control: a lock", "wasm-clippy-guard-control 0.0.0 is added"),
+]
 
 
 def _inside(copy: Path, rel: str) -> list[Finding]:
@@ -1676,25 +1719,26 @@ def probe_dependencies(
     return lines, found
 
 
-def lock_problems(label: str, *locks: str) -> list[Finding]:
-    """A finding, at `label`, for each package (by name, version and source)
-    whose entry is not the same in the two Cargo.lock texts `locks`, the
-    guard's crate and the dependencies on it left out."""
-    tree, copy = (
-        {
-            (p["name"], p["version"], p.get("source")): p
-            | {"dependencies": [d for d in p.get("dependencies", []) if d != GUARD]}
-            for p in tomllib.loads(text).get("package", [])
-            if p["name"] != GUARD
-        }
-        for text in locks
-    )
+def lock_problems(pairs: list[tuple[str, str, str]]) -> list[Finding]:
+    """A finding, at each pair's label, for each package (by name, version and
+    source) whose entry is not the same in the pair's two Cargo.lock texts,
+    the guard's crate and the dependencies on it left out."""
     found = []
-    for key in sorted(tree.keys() | copy.keys(), key=str):
-        if tree.get(key) != copy.get(key):
-            state = "added" if key not in tree else "dropped" if key not in copy else "changed"
-            text = f"{label}: {key[0]} {key[1]} is {state} by the guard's crate"
-            found.append(Finding("plant", label, text))
+    for label, *locks in pairs:
+        tree, copy = (
+            {
+                (p["name"], p["version"], p.get("source")): p
+                | {"dependencies": [d for d in p.get("dependencies", []) if d != GUARD]}
+                for p in tomllib.loads(text).get("package", [])
+                if p["name"] != GUARD
+            }
+            for text in locks
+        )
+        for key in sorted(tree.keys() | copy.keys(), key=str):
+            if tree.get(key) != copy.get(key):
+                state = "added" if key not in tree else "dropped" if key not in copy else "changed"
+                text = f"{label}: {key[0]} {key[1]} is {state} by the guard's crate"
+                found.append(Finding("plant", label, text))
     return found
 
 
@@ -1781,8 +1825,6 @@ def all_controls(files: dict[str, str], copy: Path, crates: dict) -> list[Contro
             for label, (_, expected) in CONFIG_CONTROLS.items()
             for words in expected
         ),
-        *(Control("dependency", "plant", path, words) for path, words in CONTROL_PATHS.items()),
-        Control("lock", "plant", "control: a lock", "wasm-clippy-guard-control 0.0.0 is added"),
         Control("build script", "dep-info", GUARD, "CLIPPY_ARGS"),
         Control("build script", "dep-info", GUARD, "CLIPPY_CONF_DIR"),
         Control("environment", "examined", "the environment"),
@@ -1841,19 +1883,22 @@ def check(metadata: dict, copy: Path) -> int:
     count = copy_tree(copy)
     build, members = adapter_build(metadata)
     ids = set(metadata["workspace_members"])
-    paths = [*METHOD_PROBES, *TYPE_PROBES]
-    dependencies, found = probe_dependencies(paths, build, members[ADAPTER]["id"], ids)
+    paths = [*METHOD_PROBES, *TYPE_PROBES, *CONTROL_PATHS]
+    adapter = members[ADAPTER]["id"]
+    dependencies, found = probe_dependencies(paths, build + CONTROL_BUILD, adapter, ids)
     files, spans = crate_files(dependencies)
-    found += plant(copy, metadata, members[ADAPTER], files) + _inside(copy, "Cargo.lock")
-    copied, error = (None, "") if found else cargo_metadata(copy, "--offline")
+    planted = plant(copy, metadata, members[ADAPTER], files) + _inside(copy, "Cargo.lock")
+    copied, error = (None, "") if planted else cargo_metadata(copy, "--offline")
+    lock = (ROOT / "Cargo.lock").read_text(encoding="utf-8")
+    locks = [("control: a lock", lock, lock + CONTROL_LOCK)]
     if copied:
-        locks = [(tree / "Cargo.lock").read_text(encoding="utf-8") for tree in (ROOT, copy)]
-        found += lock_problems("the copy's Cargo.lock", *locks)
-    elif not found:
-        found.append(Finding("plant", "Cargo.lock", f"cargo metadata --offline failed:\n{error}"))
-    for text in dict.fromkeys(f.text for f in found):
+        locks.append(("the copy's Cargo.lock", lock, (copy / "Cargo.lock").read_text("utf-8")))
+    elif not planted:
+        planted.append(Finding("plant", "Cargo.lock", f"cargo metadata --offline failed:\n{error}"))
+    failures, problems = match_controls(found + planted + lock_problems(locks), EARLY_CONTROLS)
+    for text in dict.fromkeys([f.text for f in problems] + failures):
         print(f"FAIL: {text}", file=sys.stderr)
-    if found:
+    if failures or problems:
         return 1
     crates = adapter_build(copied)[1]
     planted = all_controls(files, copy, crates)
@@ -1863,8 +1908,9 @@ def check(metadata: dict, copy: Path) -> int:
     read_plain, findings = dep_info(plain, crates, copy, "without options")
     if plain.code != 0:
         return unfinished(plain, "without options", read_plain, crates)
-    with open(copy / GUARD / "src" / "lib.rs", "a", encoding="utf-8") as file:
-        file.write(LATE_MODULES)
+    if late := _write(copy, f"{GUARD}/src/lib.rs", LATE_MODULES, "a"):
+        print(f"FAIL: {late[0].text}", file=sys.stderr)
+        return 1
     forced = run_clippy(copy, target_dir, FORCE_WARN)
     read_forced, found = dep_info(forced, crates, copy, "with --force-warn")
     findings += found
@@ -1878,8 +1924,6 @@ def check(metadata: dict, copy: Path) -> int:
     for label, (text, _) in CONFIG_CONTROLS.items():
         sleep = {"method": {"std::thread::sleep"}, "type": set()}
         findings += config_problems(f"control: {label}", text, sleep)
-    findings += probe_dependencies([*CONTROL_PATHS], CONTROL_BUILD, f"{ADAPTER} 1.0.0", set())[1]
-    findings += lock_problems("control: a lock", locks[0], locks[1] + CONTROL_LOCK)
 
     guard = copy / GUARD
     covered, allows, read = {}, Counter(), 0
@@ -1921,7 +1965,7 @@ def check(metadata: dict, copy: Path) -> int:
         f" files of its {len(crates) - 1} crates (a copy of {count} files)"
     )
     print(f"probes: {len(spans) - 1 - unreported} of {len(spans) - 1} reported with --force-warn")
-    print(f"controls: {len(planted)}, {len(failures)} not as planted")
+    print(f"controls: {len(EARLY_CONTROLS) + len(planted)}, {len(failures)} not as planted")
     print(f"zeroize: {', '.join(stack)}")
     return 1 if failures or problems else 0
 
