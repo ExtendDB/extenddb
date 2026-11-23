@@ -359,7 +359,7 @@ fn an_at_sign_must_have_a_name_after_it() {
     let alias: &str = &wf("Expected identifier for AS-alias");
     let exec: &str = &wf("Keyword foo only expected at the top level in the query");
     let exec_at: &str = &wf("Keyword @ only expected at the top level in the query");
-    let curly: &str = &wf("Expected } to close item value");
+    let curly: &str = &wf("Expected RIGHT_CURLY");
     let lexing: &str = &wf("");
     let (parsed, name) = ("parsed", AS_THE_NAME);
     // Measured 2026-11-23 on tables that do not exist, each statement twice:
@@ -481,8 +481,7 @@ fn an_at_sign_must_have_a_name_after_it() {
             after,
         ),
         ("@foo(1)", after),
-        // The service names the missing `}` "Expected RIGHT_CURLY", a text
-        // ExtendDB does not give for an item value (#887).
+        // The `(` is where the item's `}` should be.
         ("INSERT INTO <T> VALUE {'pk': 'q', 'a': @foo(b)}", curly),
         ("INSERT INTO <T> VALUE {@1: 1}", at),
         ("INSERT INTO <T> VALUE {'pk': 'q', 'm': {@1: 1}}", at),

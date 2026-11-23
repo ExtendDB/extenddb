@@ -230,7 +230,7 @@ impl Parser {
     }
 
     /// An operand that does not start with a sign, at the span `at`.
-    fn unsigned_atom(&mut self, at: &str) -> PResult<Operand> {
+    pub(super) fn unsigned_atom(&mut self, at: &str) -> PResult<Operand> {
         match self.peek().kind.clone() {
             TokenKind::LParen => self.operand_in_parentheses(),
             // A backtick literal parses and is refused at its position, by

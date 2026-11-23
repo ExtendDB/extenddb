@@ -257,15 +257,23 @@ fn an_operand_may_nest_100_operands() {
 /// The worst parse the caps allow: groups, operands and a literal each
 /// at their cap.
 fn worst() -> String {
+    // Maps as keys take the most stack per literal level (see the module
+    // comment of `limits.rs`).
     format!(
-        "{SELECT}{}a = {}{}1{}{}{}",
+        "{SELECT}{}a = {}{}'k'{}{}{}",
         "(".repeat(MAX_GROUP_DEPTH),
         "size(".repeat(MAX_OPERAND_DEPTH - 1),
-        "{'a': ".repeat(MAX_LITERAL_DEPTH),
-        "}".repeat(MAX_LITERAL_DEPTH),
+        "{".repeat(MAX_LITERAL_DEPTH),
+        ": 1}".repeat(MAX_LITERAL_DEPTH),
         ")".repeat(MAX_OPERAND_DEPTH - 1),
         ")".repeat(MAX_GROUP_DEPTH)
     )
+}
+
+/// The refusal of [`worst`]: the key of its outermost map is a map.
+fn worst_refusal() -> String {
+    let column = worst().find('{').unwrap() + 2;
+    format!("Tuple keys must be of type String. Actual type: Struct under root at 1:{column}:1")
 }
 
 #[test]
@@ -277,7 +285,7 @@ fn the_worst_parse_fits_half_the_large_stack() {
         .unwrap()
         .join()
         .unwrap();
-    assert_eq!(answer.unwrap_err().message, nesting(".a"));
+    assert_eq!(answer.unwrap_err().message, worst_refusal());
 }
 
 mod stack;

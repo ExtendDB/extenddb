@@ -21,9 +21,12 @@
 //! Stack use per level on a debug build (measured 2026-11-02 by bisecting
 //! the stack of a thread that parses one statement): 8.6 KB per
 //! parenthesized group, 6.8 KB per nested operand and 2.5 to 2.8 KB per
-//! literal container. The inline budget keeps a parse within 310 KB of the
-//! caller's stack, and the worst parse the caps allow used 12.2 MB on its own
-//! thread. On a release build the same parses used 2.3 KB, 1.8 KB and 0.5 to
+//! literal container. A map read as a map key takes 6.2 KB per level
+//! (measured 2026-11-23). The inline budget keeps a parse within 310 KB of
+//! the caller's stack, and the worst parse within the length limit, 1000
+//! groups around 99 nested calls around 1000 maps as keys, used 15.6 MB on
+//! its own thread (measured 2026-11-23). On a release build the parses of
+//! 2026-11-02 used 2.3 KB, 1.8 KB and 0.5 to
 //! 0.7 KB per level, 86 KB of the caller's stack and 3.1 MB at the caps. An
 //! expression in brackets nests as an operand does. The tests parse every
 //! nesting form at the length limit on a thread with half the stack of a
@@ -77,9 +80,9 @@ const QUERY_WEIGHT: usize = 4;
 /// before it moves to a thread of its own.
 const INLINE_DEPTH: usize = 32;
 
-/// The stack of the thread a deep statement is parsed on: about five times
-/// what the worst parse the caps allow (1000 groups around 100 nested
-/// operands around a 1000-level literal) used on a debug build.
+/// The stack of the thread a deep statement is parsed on: about four times
+/// what the worst parse within the length limit (1000 groups around 99
+/// nested calls around 1000 maps as keys) used on a debug build.
 pub const LARGE_STACK_BYTES: usize = 64 << 20;
 
 /// The reason given for a statement nested past a cap. The service fails

@@ -284,6 +284,16 @@ fn nesting_forms() -> Vec<(&'static str, String, Result<(), String>)> {
             deep(),
         ),
         (
+            "a key in parentheses",
+            fill(&format!("{INSERT}{{"), "(", "'k'", ")", ": 1}}"),
+            deep(),
+        ),
+        (
+            "maps as keys",
+            fill(INSERT, "{", "'k'", ": 1}", "}"),
+            deep(),
+        ),
+        (
             "lists in a condition",
             keyed("a = ", "[", "1", "]", ""),
             deep(),
@@ -346,7 +356,7 @@ fn a_deep_statement_takes_little_of_the_callers_stack() {
         .join()
         .unwrap();
     assert_eq!(answers[0], Ok(()));
-    assert_eq!(answers[1].clone().unwrap_err().message, nesting(".a"));
+    assert_eq!(answers[1].clone().unwrap_err().message, worst_refusal());
 }
 
 /// The most deeply nested statements that parse, by the bound on each: the
