@@ -131,7 +131,9 @@ pub(super) fn lex(src: &str) -> Vec<Tok> {
                 }
                 Kind::Number
             }
-            b if b.is_ascii_alphabetic() || b == b'_' => {
+            // A name starts with a letter. An underscore may follow but not lead,
+            // so a leading `_` is a token of its own that no rule takes.
+            b if b.is_ascii_alphabetic() => {
                 while i < bytes.len() && is_word_byte(bytes[i]) {
                     i += 1;
                 }

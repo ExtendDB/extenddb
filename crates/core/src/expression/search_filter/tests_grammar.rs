@@ -335,3 +335,68 @@ fn an_unused_value_is_named_without_the_prefix() {
         p("Syntax error; token: \"<EOF>\", near: \"OR\"")
     );
 }
+
+/// Measured on the live service on 2026-11-23, two requests each: a bare
+/// name, a function name and a path element cannot start with `_`, and the
+/// syntax error names the `_` alone. An underscore inside or at the end of a
+/// name, and in a `#name` or `:value` reference, is accepted.
+#[test]
+fn a_name_cannot_start_with_an_underscore() {
+    use std::collections::HashMap;
+
+    use super::parse_search_filter;
+    use super::tests_support::used_values;
+    use crate::error::DynamoDbError;
+    use crate::types::AttributeValue;
+
+    let syntax = |token: &str, near: &str| {
+        p(&format!(
+            "Syntax error; token: \"{token}\", near: \"{near}\""
+        ))
+    };
+    let cases = [
+        ("Country = :us AND _Cat = :v", syntax("_", "AND _Cat")),
+        ("_ = :v", syntax("_", "_ =")),
+        ("_a = :v", syntax("_", "_a")),
+        ("__a = :v", syntax("_", "__")),
+        ("a._b = :v", syntax("_", "._b")),
+        ("attribute_exists(_a)", syntax("_", "(_a")),
+        ("_f(a)", syntax("_", "_f")),
+        ("size(_a) = :v", syntax("_", "(_a")),
+        ("a IN (_b)", syntax("_", "(_b")),
+        ("a = _b", syntax("_", "= _b")),
+        ("NOT _a = :v", syntax("_", "NOT _a")),
+        ("(_a = :v)", syntax("_", "(_a")),
+        ("a BETWEEN _b AND :v", syntax("_", "BETWEEN _b")),
+        ("1a = :v", syntax("1", "1a")),
+        ("a.1b = :v", syntax("1", ".1b")),
+        ("a_ = :v", OK.to_owned()),
+        ("a_b = :v", OK.to_owned()),
+        ("a1 = :v", OK.to_owned()),
+        ("#_x = :v", OK.to_owned()),
+        ("#_ = :v", OK.to_owned()),
+        ("a = :_v", OK.to_owned()),
+    ];
+    let names: HashMap<String, String> = [("#_x", "Category"), ("#_", "Category")]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+    let all: HashMap<String, AttributeValue> = [":v", ":us", ":_v"]
+        .into_iter()
+        .map(|k| (k.to_owned(), AttributeValue::S("x".to_owned())))
+        .collect();
+    let mismatches: Vec<String> = cases
+        .iter()
+        .filter_map(|(expr, expected)| {
+            let values = used_values(expr, &all);
+            let actual = match parse_search_filter(expr, Some(&names), Some(&values), 50) {
+                Ok(_) => OK.to_owned(),
+                Err(DynamoDbError::ValidationException(m)) => m,
+                Err(other) => format!("{other:?}"),
+            };
+            (&actual != expected)
+                .then(|| format!("{expr:?}: expected {expected:?}, got {actual:?}"))
+        })
+        .collect();
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
