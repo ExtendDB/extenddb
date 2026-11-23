@@ -30,7 +30,10 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
     Expr, ExpressionMaps, KeyCondition, PathElement, SortKeyCondition,
 };
-use extenddb_core::types::{AttributeDefinition, QueryInput};
+use extenddb_core::types::{
+    AttributeDefinition, EMPTY_ATTRIBUTE_VALUE, MULTI_ATTRIBUTE_VALUE, QueryInput,
+};
+use extenddb_core::validation::number::NOT_A_NUMBER;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
@@ -44,16 +47,15 @@ pub const KEY_CONDITION_TYPE_MISMATCH: &str = "One or more parameter values were
 /// The service's text for a `Limit` below 1 on `Query`.
 pub const LIMIT_BELOW_ONE: &str = "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1";
 
-/// The bare numeric message the number validator uses for an empty `N`.
-const EMPTY_NUMBER: &str = "The parameter cannot be converted to a numeric value";
-
-/// The service's texts for a value it cannot read as one type.
+/// The service's text for a null value. Core's copy is a private constant of
+/// its `partiql` module, which a build without the `partiql` feature leaves
+/// out.
 const NULL_VALUE: &str = "The supplied Item contains a null AttributeValue";
-const EMPTY_VALUE: &str =
-    "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes";
-const SEVERAL_TYPES: &str = "Supplied AttributeValue has more than one datatypes set, must contain exactly one of the supported datatypes";
 
-/// The type descriptors of an AttributeValue.
+/// The type descriptors of an AttributeValue, in the order the service reads
+/// the payloads of a value with several type descriptors (see
+/// [`first_fault`]). Core's list is a private constant of its `partiql`
+/// module, as for [`NULL_VALUE`].
 const TYPE_DESCRIPTORS: [&str; 10] = ["S", "N", "B", "SS", "NS", "BS", "M", "L", "NULL", "BOOL"];
 
 /// The members of the two enums the request-time checks read.
@@ -313,7 +315,7 @@ impl Fault<'_> {
     fn request_time_text(self) -> String {
         match self {
             Fault::NotANumber(text) => format!(
-                "{EMPTY_NUMBER}: {}",
+                "{NOT_A_NUMBER}: {}",
                 crate::decimal_digits::fold_decimal_digits(text)
             ),
             other => other.reason(),
@@ -326,10 +328,10 @@ impl Fault<'_> {
         match self {
             Fault::Null(None) => NULL_VALUE.to_owned(),
             Fault::Null(Some(member)) => format!("{NULL_VALUE}: {member} is null"),
-            Fault::Empty => EMPTY_VALUE.to_owned(),
-            Fault::SeveralTypes => SEVERAL_TYPES.to_owned(),
-            Fault::NotANumber("") => EMPTY_NUMBER.to_owned(),
-            Fault::NotANumber(text) => format!("{EMPTY_NUMBER}: {text}"),
+            Fault::Empty => EMPTY_ATTRIBUTE_VALUE.to_owned(),
+            Fault::SeveralTypes => MULTI_ATTRIBUTE_VALUE.to_owned(),
+            Fault::NotANumber("") => NOT_A_NUMBER.to_owned(),
+            Fault::NotANumber(text) => format!("{NOT_A_NUMBER}: {text}"),
             Fault::Refused(msg) => msg,
         }
     }
@@ -388,7 +390,7 @@ fn number_fault(text: &str) -> Option<Fault<'_>> {
     let folded = crate::decimal_digits::fold_decimal_digits(text);
     match extenddb_core::validation::number::validate_and_normalize_number(&folded) {
         Ok(_) => None,
-        Err(DynamoDbError::ValidationException(msg)) if msg.starts_with(EMPTY_NUMBER) => {
+        Err(DynamoDbError::ValidationException(msg)) if msg.starts_with(NOT_A_NUMBER) => {
             Some(Fault::NotANumber(text))
         }
         Err(DynamoDbError::ValidationException(msg)) => Some(Fault::Refused(msg)),
