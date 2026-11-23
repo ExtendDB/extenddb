@@ -384,6 +384,248 @@ fn a_name_as_an_insert_value_is_refused_naming_itself() {
 }
 
 #[test]
+fn names_paths_and_closing_tokens_in_literals() {
+    let term: &str = &wf("Unexpected term");
+    // Measured 2026-11-23 on a table that does not exist, each statement
+    // twice. `<T>` is `"ets-parityat-missing"`, which the positions count.
+    let rows = [
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'a': b}",
+            "Unsupported data type: b under key root at 1:59:1",
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'a': \"b\"}",
+            "Unsupported data type: b under key root at 1:59:3",
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'a': \"\"}",
+            "Unsupported data type:  under key root at 1:59:2",
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'a': b.c}",
+            "Unsupported data type: PATH under key root at 1:59:1",
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'a': b[0]}",
+            "Unsupported data type: PATH under key root at 1:59:1",
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'a': \"b\".c}",
+            "Unsupported data type: PATH under key root at 1:59:3",
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'a': b.c.d}",
+            "Unsupported data type: PATH under key root at 1:59:1",
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'a': a.b}",
+            "Unsupported data type: PATH under key root at 1:59:1",
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': a}",
+            "Unsupported data type: a under key root at 1:49:1",
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'a': @\"b\"}",
+            "Unsupported data type: b under key root at 1:60:3",
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'a': @a.b}",
+            "Unsupported data type: PATH under key root at 1:60:1",
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'a': {'x': \"b\"}}",
+            "Unsupported data type: Id under key root.x at 1:65:3",
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'a': {'x': b.c}}",
+            "Unsupported data type: Path under key root.x at 1:65:1",
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'a': [\"b\"]}",
+            "Unsupported data type: Id under key root[0] at 1:60:3",
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'a': [b.c]}",
+            "Unsupported data type: Path under key root[0] at 1:60:1",
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 'a': [b]}",
+            "Unsupported data type: Id under key root[0] at 1:60:1",
+        ),
+        (
+            "UPDATE <T> SET a = [\"b\"] WHERE pk = 'q'",
+            "Unsupported data type: Id under key root[0] at 1:40:3",
+        ),
+        (
+            "UPDATE <T> SET a = [b.c] WHERE pk = 'q'",
+            "Unsupported data type: Path under key root[0] at 1:40:1",
+        ),
+        (
+            "UPDATE <T> SET a = {'x': \"b\"} WHERE pk = 'q'",
+            "Unsupported data type: Id under key root.x at 1:45:3",
+        ),
+        (
+            "UPDATE <T> SET a = {'x': b.c} WHERE pk = 'q'",
+            "Unsupported data type: Path under key root.x at 1:45:1",
+        ),
+        (
+            "UPDATE <T> SET a = [b] WHERE pk = 'q'",
+            "Unsupported data type: Id under key root[0] at 1:40:1",
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 's': <<a>>}",
+            "Unsupported data type in Bag. DynamoDB only supports either numbers or strings in \
+             bags at 1:61:1",
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 's': <<@a>>}",
+            "Unsupported data type in Bag. DynamoDB only supports either numbers or strings in \
+             bags at 1:62:1",
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 's': <<\"a\">>}",
+            "Unsupported data type in Bag. DynamoDB only supports either numbers or strings in \
+             bags at 1:61:3",
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 's': <<a.b>>}",
+            "Unsupported data type in Bag. DynamoDB only supports either numbers or strings in \
+             bags at 1:61:1",
+        ),
+        (
+            "UPDATE <T> SET a = <<b>> WHERE pk = 'q'",
+            "Unsupported data type in Bag. DynamoDB only supports either numbers or strings in \
+             bags at 1:41:1",
+        ),
+        (
+            "UPDATE <T> SET a = <<\"b\">> WHERE pk = 'q'",
+            "Unsupported data type in Bag. DynamoDB only supports either numbers or strings in \
+             bags at 1:41:3",
+        ),
+        (
+            "UPDATE <T> SET a = <<b.c>> WHERE pk = 'q'",
+            "Unsupported data type in Bag. DynamoDB only supports either numbers or strings in \
+             bags at 1:41:1",
+        ),
+        // A syntax error later in the item comes first, and a `}` where a
+        // value starts is one.
+        ("INSERT INTO <T> VALUE {'pk': 'q', 'a': \"b\", 'c': }", term),
+        ("INSERT INTO <T> VALUE {'pk': 'q', 'a': b.c, 'c': }", term),
+        ("INSERT INTO <T> VALUE {'pk': 'q', 'a': b, 'c': }", term),
+        ("INSERT INTO <T> VALUE {'pk': 'q', 's': <<a>>, 'c': }", term),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 's': <<true>>, 'c': }",
+            term,
+        ),
+        ("INSERT INTO <T> VALUE {'pk': }", term),
+        ("INSERT INTO <T> VALUE {'pk': 'q', 'a': [}", term),
+        // So is any token that closes a value or separates two.
+        ("INSERT INTO <T> VALUE {'pk': 'q', 'l': [1, , 2]}", term),
+        ("INSERT INTO <T> VALUE {'pk': 'q', 'l': [)]}", term),
+        ("INSERT INTO <T> VALUE {'pk': 'q', 'm': {'x': )}}", term),
+        ("INSERT INTO <T> VALUE {'pk': 'q', 'a': ,}", term),
+        ("INSERT INTO <T> VALUE {'pk': 'q', 's': <<1,>>}", term),
+        ("INSERT INTO <T> VALUE {'pk': 'q', 'a': ()}", term),
+        ("INSERT INTO <T> VALUE {'pk': 'q', 'a': (,)}", term),
+        ("INSERT INTO <T> VALUE {'pk': 'q', 'a': [()]}", term),
+        ("UPDATE <T> SET a = [1,] WHERE pk = 'q'", term),
+        ("UPDATE <T> SET a = <<1,>> WHERE pk = 'q'", term),
+        ("UPDATE <T> SET a = {'x': >>} WHERE pk = 'q'", term),
+        ("UPDATE <T> SET a = [1, ()] WHERE pk = 'q'", term),
+        // So is such a token in the brackets of a path, in any part.
+        ("INSERT INTO <T> VALUE {'pk': 'q', 'a': b[}", term),
+        ("INSERT INTO <T> VALUE {'pk': 'q', 'a': b[)}", term),
+        ("INSERT INTO <T> VALUE {'pk': 'q', 'a': b[,]}", term),
+        ("INSERT INTO <T> VALUE {'pk': 'q', 'a': b[>>]}", term),
+        ("SELECT * FROM <T> WHERE a IN ((m[}, 1))", term),
+        ("SELECT * FROM <T> WHERE m[} = 1", term),
+        ("SELECT * FROM <T> WHERE m[) = 1", term),
+        ("SELECT * FROM <T> WHERE m[,] = 1", term),
+        ("SELECT * FROM <T> WHERE m[>>] = 1", term),
+        ("SELECT * FROM <T> WHERE size(m[}) = 1", term),
+        ("SELECT m[} FROM <T> WHERE pk = 'q'", term),
+        ("UPDATE <T> SET m[} = 1 WHERE pk = 'q'", term),
+        ("UPDATE <T> SET a = m[} WHERE pk = 'q'", term),
+        ("UPDATE <T> REMOVE m[} WHERE pk = 'q'", term),
+        // The Bag text is for the first member. After a number or a string, a
+        // name or a parameter gets its own refusal.
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 's': <<a, 1>>}",
+            "Unsupported data type in Bag. DynamoDB only supports either numbers or strings in \
+             bags at 1:61:1",
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 's': <<?, 1>>}",
+            "Unsupported data type in Bag. DynamoDB only supports either numbers or strings in \
+             bags at 1:61:1",
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 's': <<1, a>>}",
+            "Unsupported data type: Id under key root at 1:64:1",
+        ),
+        (
+            "INSERT INTO <T> VALUE {'pk': 'q', 's': <<1, ?>>}",
+            "Unsupported data type: Parameter under key root at 1:64:1",
+        ),
+        // A literal in a WHERE condition follows the same rules.
+        (
+            "SELECT * FROM <T> WHERE a = [\"b\"]",
+            "Unsupported data type: Id under key root[0] at 1:49:3",
+        ),
+        (
+            "SELECT * FROM <T> WHERE a = [b.c]",
+            "Unsupported data type: Path under key root[0] at 1:49:1",
+        ),
+        (
+            "SELECT * FROM <T> WHERE a = [\"b\".c]",
+            "Unsupported data type: Path under key root[0] at 1:49:3",
+        ),
+        (
+            "SELECT * FROM <T> WHERE a = {'x': \"b\"}",
+            "Unsupported data type: Id under key root.x at 1:54:3",
+        ),
+        (
+            "SELECT * FROM <T> WHERE a = <<\"b\">>",
+            "Unsupported data type in Bag. DynamoDB only supports either numbers or strings in \
+             bags at 1:50:3",
+        ),
+        (
+            "SELECT * FROM <T> WHERE a = <<b>>",
+            "Unsupported data type in Bag. DynamoDB only supports either numbers or strings in \
+             bags at 1:50:1",
+        ),
+        (
+            "SELECT * FROM <T> WHERE a = <<b.c>>",
+            "Unsupported data type in Bag. DynamoDB only supports either numbers or strings in \
+             bags at 1:50:1",
+        ),
+        ("SELECT * FROM <T> WHERE a = [}", term),
+        ("SELECT * FROM <T> WHERE a = [1,]", term),
+        ("SELECT * FROM <T> WHERE a = {'x': }", term),
+        ("SELECT * FROM <T> WHERE a = <<1,>>", term),
+        ("SELECT * FROM <T> WHERE a = [)", term),
+        ("SELECT * FROM <T> WHERE a = [,]", term),
+        ("SELECT * FROM <T> WHERE a = {'x': ]}", term),
+    ];
+    let mut differ = Vec::new();
+    for &(statement, expected) in &rows {
+        let statement = statement.replace("<T>", "\"ets-parityat-missing\"");
+        let answer = err(&statement);
+        if answer != expected {
+            differ.push(format!("{statement}: {answer}"));
+        }
+    }
+    assert!(
+        differ.is_empty(),
+        "{} of {} rows differ:\n{}",
+        differ.len(),
+        rows.len(),
+        differ.join("\n")
+    );
+}
+
+#[test]
 fn a_string_or_a_name_in_brackets_is_a_map_member() {
     let member = |name: &str| PathStep::Attribute(name.to_owned());
     for (condition, steps) in [

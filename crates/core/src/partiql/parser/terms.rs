@@ -413,7 +413,7 @@ fn top_level_only(word: &str) -> String {
 }
 
 /// The text of a token as a message names it.
-fn token_text(kind: &TokenKind) -> String {
+pub(super) fn token_text(kind: &TokenKind) -> String {
     match kind {
         TokenKind::Ident(s)
         | TokenKind::QuotedIdent(s)

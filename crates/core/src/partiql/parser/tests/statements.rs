@@ -327,6 +327,8 @@ fn an_insert_without_value_reads_the_items_to_insert() {
         "INSERT INTO \"t\" 'x'",
         "INSERT INTO \"t\" <<{'pk': 'a'}, {'pk': 'b'}>>",
         "INSERT INTO \"t\" <<>>",
+        // (measured 2026-11-23 on a table that does not exist)
+        "INSERT INTO \"t\" <<\"a\">>",
     ] {
         assert_eq!(err(sql), MANY, "{sql}");
     }
