@@ -14,29 +14,10 @@
 
 use crate::test_base::*;
 use aws_sdk_dynamodb::types::{
-    AttributeDefinition, CreateGlobalSecondaryIndexAction, GlobalSecondaryIndexUpdate, IndexStatus,
+    AttributeDefinition, CreateGlobalSecondaryIndexAction, GlobalSecondaryIndexUpdate,
     KeySchemaElement, KeyType, Projection, ProjectionType, ScalarAttributeType,
 };
 use std::time::Duration;
-
-/// Poll DescribeTable until the named index reports ACTIVE (up to 60s).
-async fn wait_for_index_active(c: &aws_sdk_dynamodb::Client, table: &str, index_name: &str) {
-    for _ in 0..60 {
-        if let Ok(resp) = c.describe_table().table_name(table).send().await {
-            if let Some(t) = resp.table() {
-                let active = t.global_secondary_indexes().iter().any(|i| {
-                    i.index_name() == Some(index_name)
-                        && i.index_status() == Some(&IndexStatus::Active)
-                });
-                if active {
-                    return;
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    panic!("Index {index_name} on {table} did not become ACTIVE within 60s");
-}
 
 const GSI_BACKFILL_TEST_GATE: &str = "gsi_backfill_test_gate";
 

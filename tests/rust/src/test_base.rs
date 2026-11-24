@@ -10,8 +10,8 @@ use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_credential_types::Credentials;
 use aws_sdk_dynamodb::config::Region;
 use aws_sdk_dynamodb::types::{
-    AttributeDefinition, AttributeValue, BillingMode, GlobalSecondaryIndex, KeySchemaElement,
-    KeyType, Projection, ProjectionType, ScalarAttributeType, TableStatus,
+    AttributeDefinition, AttributeValue, BillingMode, GlobalSecondaryIndex, IndexStatus,
+    KeySchemaElement, KeyType, Projection, ProjectionType, ScalarAttributeType, TableStatus,
 };
 use aws_sdk_dynamodb::Client;
 use aws_smithy_http_client::tls;
@@ -371,6 +371,25 @@ pub async fn wait_for_active(c: &Client, name: &str) {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     panic!("Table {name} did not become ACTIVE within 60s");
+}
+
+/// Poll DescribeTable until the named index reports ACTIVE (up to 60s).
+pub async fn wait_for_index_active(c: &Client, table: &str, index_name: &str) {
+    for _ in 0..60 {
+        if let Ok(resp) = c.describe_table().table_name(table).send().await {
+            if let Some(t) = resp.table() {
+                let active = t.global_secondary_indexes().iter().any(|i| {
+                    i.index_name() == Some(index_name)
+                        && i.index_status() == Some(&IndexStatus::Active)
+                });
+                if active {
+                    return;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    panic!("Index {index_name} on {table} did not become ACTIVE within 60s");
 }
 
 /// Poll DescribeTable until the table no longer exists (up to 60s).
