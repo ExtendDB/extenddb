@@ -3867,29 +3867,29 @@ pub(crate) struct GsiBackfillProgress {
 
 /// Maximum number of attempts of the backup and restore transactions, the
 /// in-place retry of `commitTransaction`, and the create-race give-up of an
-/// unconditional PutItem and of UpdateItem's native upsert. #431 measured it,
-/// with this backoff, for the create race. A put blocked by a document that
+/// unconditional `PutItem` and of `UpdateItem`'s native upsert. The create
+/// race was measured with this backoff: a put blocked by a document that
 /// another writer removes 100 ms later commits well inside 50 attempts. With a
 /// cap of 5 the storage tests fail.
 pub(crate) const TRANSIENT_RETRY_ATTEMPTS: u32 = 50;
 
 /// Maximum number of times a contention retry loop re-runs a transaction that
-/// MongoDB aborted as a transient conflict.
+/// `MongoDB` aborted as a transient conflict.
 ///
-/// MongoDB aborts the loser of a same-document conflict at once instead of
+/// `MongoDB` aborts the loser of a same-document conflict at once instead of
 /// queueing it, so a hot key is settled by retries with backoff: of N
 /// writers on one key, one commits per round and the rest start over. The
 /// backoff is random, so a writer can lose many rounds in a row, and the
 /// chance of losing every attempt falls off exponentially with the budget.
 /// Measured with 32 clients putting one key of a table with a GSI (2,016
-/// puts per run, MongoDB 7.0 on one 16-core host): 50 attempts left 15 to
+/// puts per run, `MongoDB` 7.0 on one 16-core host): 50 attempts left 15 to
 /// 25 percent of the puts without a commit; 400 left none in four runs at a
 /// load average of 15 and one put in 2,016 at a load average of 30, and 20
 /// of 1,984 with 64 clients. `backoff_sleep` draws each sleep uniformly from
 /// 0 to 12.8 ms once the base is capped, so 1,000 attempts sleep about 6.4 s
 /// in total on average and 12.8 s at worst, plus the attempts' own round
 /// trips, before the write gives up. Against a transaction another session
-/// holds open, where an attempt waits out MongoDB's lock timeout, a put that
+/// holds open, where an attempt waits out `MongoDB`'s lock timeout, a put that
 /// loses all 1,000 attempts returned in 9.5 to 12.7 s over six runs on a
 /// shared host, under the SDKs' request timeouts.
 ///
@@ -3903,57 +3903,44 @@ const CONTENTION_RETRY_ATTEMPTS: u32 = 1000;
 /// Wall-clock deadline for the contention retry loop of one request.
 ///
 /// The attempt budget bounds the number of attempts, not the time a caller
-/// waits, because an attempt's own round trip has no bound. The same 1,000
-/// attempts against a transaction another session holds open returned in 9.5
-/// to 12.7 s over six runs on a shared host, and under many writers on one
-/// key the attempts queue behind each other: at 256 writers putting one key
-/// of a GSI table, 89 of 5,120 calls were still waiting when the client's
-/// 120 s read timeout fired, and the 5,120 calls measured p50 29 s and p99
-/// 120 s. The budget alone therefore let a request outlive every SDK's
-/// default read timeout.
+/// waits: under many writers on one key the attempts queue behind each other,
+/// and the budget alone let a request outlive every SDK's default read
+/// timeout. The deadline is read before an attempt starts, so a request
+/// answers within the deadline plus the attempt already running. That attempt
+/// has no bound of its own: it waits for a connection from the pool
+/// (`pool_size`, 50 by default) and for the commit's own retries, which can
+/// take a couple of seconds.
 ///
-/// 10 s sits above the 9.5 to 12.7 s a put spends losing all 1,000 attempts
-/// and below botocore's 60 s default read timeout, so a caller gets an answer
-/// to retry rather than a socket timeout. Which bound a write reaches first
-/// depends on the host's load: against a held document, where the 1,000
-/// attempts and the deadline both land near 10 s, a DeleteItem reached its
-/// attempt budget first in 2 of 4 rounds. The caller gets the same error class
-/// on either bound: HTTP 503 for the single-item writes (see
-/// `write_conflict::retry_budget_exhausted` and
+/// 10 s sits above the time a put spends losing all 1,000 attempts against a
+/// document another transaction holds and below botocore's 60 s default read
+/// timeout, so a caller gets an answer to retry rather than a socket timeout.
+/// Which bound a write reaches first depends on the host's load. The caller
+/// gets the same error class on either bound: HTTP 503 for the single-item
+/// writes (see `write_conflict::retry_budget_exhausted` and
 /// `write_conflict::contention_deadline_exhausted`) and
 /// `TransactionCanceledException` for `TransactWriteItems`.
 ///
-/// The deadline is read before an attempt starts, so a request answers within
-/// the deadline plus the attempt already running. That attempt has no bound
-/// of its own: under many writers on one key it waits for a connection from
-/// the pool (`pool_size`, 50 by default) and for the commit's own retries,
-/// which can take a couple of seconds. At 256 writers on one key of a GSI table the
-/// longest call measured 11.7 s.
-///
-/// It governs the put, delete, update and transact loops. The single-item
-/// writes answer it with HTTP 503; a transaction answers it as it answers a
-/// spent attempt budget, with `TransactionCanceledException`. A loop measures
-/// the deadline from the start of its request (see `contention_clock_start`):
-/// the write requests of one `BatchWriteItem` share one deadline, and the
-/// handler returns a request that reaches it in UnprocessedItems when another
+/// It governs the put, delete, update and transact loops. A loop measures the
+/// deadline from the start of its request (see `contention_clock_start`): the
+/// write requests of one `BatchWriteItem` share one deadline, and the handler
+/// returns a request that reaches it in `UnprocessedItems` when another
 /// request of the batch applied, and answers 503 when none did. The
 /// statements of one `BatchExecuteStatement` share one deadline too. The TTL
-/// worker's conditional delete runs the delete loop too, outside any request,
-/// so an expired item that stays contended holds the sweep until the deadline
-/// or the attempt budget ends that loop, where 50 attempts ended it before
-/// the budget was raised. The worker then logs the failure and moves to the
-/// next item.
+/// worker's conditional delete runs the delete loop outside any request, so an
+/// expired item that stays contended holds the sweep until the deadline or the
+/// attempt budget ends that loop, where 50 attempts ended it before the budget
+/// was raised; the worker then logs the failure and moves to the next item.
 /// The GSI backfill loop shares the attempt budget and takes no deadline: it
 /// runs in the background worker in `ttl_worker.rs`, where no caller is
 /// waiting for a reply and giving up leaves the index CREATING.
 ///
-/// The cost of the longer retry is CPU on the MongoDB server: the losers of a
-/// hot key retry with a backoff capped at 12.8 ms for up to the deadline, so
-/// the server stays busy committing and aborting transactions on that key for
-/// as long as the contention lasts. With 64 and 256 writers putting one key of
-/// a GSI table for 20 s, on a 16-core host at a load average of about 20,
-/// mongod used about 1.3 cores and ran 1,670 and 1,810 transactions a second,
-/// of which 98.7 and 99.6 percent aborted.
+/// The longer retry costs CPU on the `MongoDB` server: the losers of a hot key
+/// retry with a backoff capped at 12.8 ms for up to the deadline, so the
+/// server stays busy committing and aborting transactions on that key for as
+/// long as the contention lasts. The measurements behind the value (how long
+/// the 1,000 attempts take, the 256-writer runs with and without the deadline,
+/// and the CPU cost) are in the write conflict handling section of
+/// `docs/rfcs/0000-mongodb-backend.md`.
 ///
 /// The engine carries the deadline in
 /// [`MongoEngine::contention_deadline`](crate::MongoEngine) so that a test can
@@ -4137,11 +4124,11 @@ fn contention_deadline_passed(
 /// The instant a contention retry loop measures the engine's deadline from.
 ///
 /// A caller that makes several storage calls for one API request runs them
-/// inside [`extenddb_storage::request_clock::scope`], as `BatchWriteItem`
-/// does, and then every loop of that request measures from the start the
-/// scope carries, so the request's writes share one deadline. Outside a
-/// scope, which is where a single-item request and the TTL worker call from,
-/// a loop measures from the start of its own call.
+/// inside [`extenddb_storage::request_clock::scope`], as `BatchWriteItem` and
+/// `BatchExecuteStatement` do, and then every loop of that request measures
+/// from the start the scope carries, so the request's writes share one
+/// deadline. Outside a scope, which is where a single-item request and the TTL
+/// worker call from, a loop measures from the start of its own call.
 fn contention_clock_start() -> std::time::Instant {
     extenddb_storage::request_clock::started().unwrap_or_else(std::time::Instant::now)
 }
