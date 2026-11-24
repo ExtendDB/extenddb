@@ -11,6 +11,7 @@ mod authorization_store;
 mod backup_catalog;
 mod backup_engine;
 mod bootstrapper;
+mod bulk_operation_store;
 mod catalog_store;
 pub mod condition;
 pub mod config;

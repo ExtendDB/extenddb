@@ -190,6 +190,7 @@ impl SqliteEngine {
                     async move { crate::sqlite_util::set_connection_pragmas(conn, true).await },
                 )
             })
+            .after_release(crate::sqlite_util::roll_back_on_release)
             .connect_with(connect)
             .await
             .map_err(|e| StorageError::Connection(e.to_string()))?;

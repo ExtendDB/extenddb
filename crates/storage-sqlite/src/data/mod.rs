@@ -34,6 +34,8 @@ mod ddl;
 mod delete_item;
 mod index;
 mod put_item;
+#[cfg(test)]
+mod put_item_tests;
 mod query;
 mod query_scan;
 mod transactions;

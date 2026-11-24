@@ -6,7 +6,7 @@
 
 1.0.0 carries the same catalog migrations as 0.1.15, 1 to 12. A catalog that 0.1.15 migrated is Current under 1.0.0, so a deployment on 0.1.15 stops its servers and starts the 1.0.0 binary with no `migrate` step, and a rollback to 0.1.15 starts the 0.1.15 binary on the same catalog and configuration while the deployment has not run `extenddb encryption-key switch`. 1.0.0 also refuses to start on a catalog key that is not 32 bytes in base64 (0.1.15 started on one and failed every signed request), keeps the key in locked memory, and adds an optional KEK file outside the catalog (see [the v1.0.0 entry](#v100-the-catalog-key-is-checked-at-startup-and-kept-in-locked-memory-a-kek-file-is-optional)). On Cassandra, 1.0.0 reads and writes at `LOCAL_QUORUM` where 0.1.15 read many of its rows at `ONE`, so a request fails while fewer than a quorum of its keyspace's replicas are up, which at a replication factor of 2 means one replica down: use a replication factor of 3 before the upgrade (see [the v1.0.0 entry](#v100-cassandra-reads-and-writes-at-local_quorum)). The paragraphs below on catalog migrations 1 to 12, and on a rollback to 0.1.14 or an earlier release, are for a deployment on 0.1.14 or an earlier release. The notes on `[backup.store]` and on backups taken by 0.1.14 and earlier releases apply to every deployment.
 
-This release versions the PostgreSQL, SQLite, Cassandra and MongoDB catalogs by a migration ledger and carries catalog migrations 1 to 12, which `extenddb migrate --list` prints. **Every deployment created by 0.1.14 or an earlier release runs `extenddb migrate --yes` once** before a server of this release starts on it: the server refuses a catalog with pending migrations. Migration 1 brings the catalog of every earlier release to migration 1's schema, migration 5 drops `continuous_backups`, a table and on MongoDB a collection (see [Catalog 0.0.5](#catalog-005)), and migration 6 adds the backup catalog index and the restore job records ([below](#migration-6-the-backup-catalog-index)). Migration 7 adds the `stream_pending` table to the PostgreSQL data database, where a write stores its stream record until the record gets its sequence number after the write commits; it does not apply to the other backends. Migration 8 adds the `restore_progress` table to the PostgreSQL data database, where a store-backed restore records each data file it applied; it does not apply on the other backends either.
+This release versions the PostgreSQL, SQLite, Cassandra and MongoDB catalogs by a migration ledger and carries catalog migrations 1 to 13, which `extenddb migrate --list` prints. **Every deployment created by 0.1.14 or an earlier release runs `extenddb migrate --yes` once** before a server of this release starts on it: the server refuses a catalog with pending migrations. Migration 1 brings the catalog of every earlier release to migration 1's schema, migration 5 drops `continuous_backups`, a table and on MongoDB a collection (see [Catalog 0.0.5](#catalog-005)), and migration 6 adds the backup catalog index and the restore job records ([below](#migration-6-the-backup-catalog-index)). Migration 7 adds the `stream_pending` table to the PostgreSQL data database, where a write stores its stream record until the record gets its sequence number after the write commits; it does not apply to the other backends. Migration 8 adds the `restore_progress` table to the PostgreSQL data database, where a store-backed restore records each data file it applied; it does not apply on the other backends either.
 
 Migration 9, `warm_throughput`, adds a nullable `warm_throughput` column to the `tables` and `indexes` catalog tables on PostgreSQL, SQLite and Cassandra. It holds the `WarmThroughput` a client sets on a table or a global secondary index, which `DescribeTable` reports; nothing acts on the value (see [Differences from DynamoDB](../differences-from-dynamodb.md)). Tables created before the migration report the defaults for their billing mode. On MongoDB it changes nothing, since the catalog collections have no validator, and the ledger records it as not applicable. Migration 9 is breaking: to go back to a release without it, restore the backup taken before the upgrade (see [Rollback Procedure](#rollback-procedure)).
 
@@ -15,6 +15,10 @@ Migration 10, `account_metrics`, replaces the catalog's `metrics` table (on Mong
 Migration 11 rewrites the attribute names that a PostgreSQL deployment stores in its catalog, so that a name can hold U+0000. It does not apply to the other backends (see step 4 of the [general upgrade procedure](#general-upgrade-procedure)).
 
 Migration 12, `unique_access_key_ids`, gives the MongoDB `access_keys` collection a unique index on the access key ID (see step 4 of the [general upgrade procedure](#general-upgrade-procedure)); it does not apply on the other backends.
+
+Migration 13, `bulk_operations`, adds the bulk put items tables on PostgreSQL and SQLite; Cassandra and MongoDB record it as not applicable.
+
+Migration 13 is breaking on PostgreSQL and SQLite. A 1.0.0 server refuses the migrated catalog (`AheadIncompatible`), so a rollback to 1.0.0 restores the backup taken before the upgrade. MongoDB and Cassandra record the migration as not applicable, and 1.0.0 serves their migrated catalogs with a warning.
 
 Configure `[backup.store]` before the release that stops creating in-catalog backups. The [Backup and Restore manual](14-backup-and-restore.md) covers choosing and securing a store, the recovery figures, the restore drill, catalog-loss recovery and what to do with in-catalog backups. This section says what the upgrade changes. In this release, CreateBackup and RestoreTableFromBackup work as follows:
 
@@ -76,7 +80,7 @@ Exit status 6 means the migration lock, or a running server, was still held when
 
 `verify` also checks the connection to the data database. When that check fails, `verify` exits 1 on a Behind catalog instead of 3, because `migrate --yes` cannot apply the pending migrations while the data database cannot be reached. It still exits 4 or 5 for the statuses that need a person.
 
-A migration is additive when the previous release serves the catalog correctly with it applied, and breaking otherwise. Migrations 1 to 7 and 9 to 12 are breaking. Migration 8 creates a table in the PostgreSQL data database that the previous release never reads; on PostgreSQL it is declared breaking only because the job that proves an additive declaration against the old binary does not yet exist (CONTRIBUTING, step 4 of adding a migration), and on SQLite, MongoDB and Cassandra it does not apply (`migrate --list` prints it as not applicable, and `migrate` counts it as additive). Do not run a server of 0.1.14 or an earlier release against a migrated catalog. A binary of those releases that writes to a migrated catalog (its `migrate --yes`, or a SQLite dev server) leaves it WrittenByOlderRelease. `migrate --yes --reconverge` repairs it by running the convergent migrations again. Migration 2, which rewrites stored policies, is not convergent: the repair skips it and prints a line that says so (see the v0.1.14 notes below).
+A migration is additive when the previous release serves the catalog correctly with it applied, and breaking otherwise. Migrations 1 to 7 and 9 to 13 are breaking. Migration 8 creates a table in the PostgreSQL data database that the previous release never reads; on PostgreSQL it is declared breaking only because the job that proves an additive declaration against the old binary does not yet exist (CONTRIBUTING, step 4 of adding a migration), and on SQLite, MongoDB and Cassandra it does not apply (`migrate --list` prints it as not applicable, and `migrate` counts it as additive). Do not run a server of 0.1.14 or an earlier release against a migrated catalog. A binary of those releases that writes to a migrated catalog (its `migrate --yes`, or a SQLite dev server) leaves it WrittenByOlderRelease. `migrate --yes --reconverge` repairs it by running the convergent migrations again. Migration 2, which rewrites stored policies, is not convergent: the repair skips it and prints a line that says so (see the v0.1.14 notes below).
 
 ### Migration 6: the backup catalog index
 
@@ -248,6 +252,46 @@ Until then they hold the upgraded copy: if a restore fails, drop the new, partly
 This manual has no tested rollback for Cassandra. Before migrating, with every server stopped, take a snapshot of the catalog keyspace and every account keyspace on every node with your usual Cassandra tooling; a rollback restores those snapshots, again with every server stopped, before the previous binary starts.
 
 Data written after the upgrade in schema shapes the previous version cannot represent is lost with the restore.
+
+## Bulk Operations During Backup and Restore
+
+A bulk operation's progress lives in both databases. The catalog holds its
+row in `bulk_operations` and its input files in `bulk_operation_input_files`:
+status, counters, resume cursor, and lease. The data database holds the rows
+the operation wrote, the `bulk_row_outcomes` ledger, which records each row
+written past the last checkpoint with its outcome and what it replaced, and
+the `bulk_write_owners` record that names the claim allowed to write. The
+two are a matched pair: the cursor names how far the data rows and the
+ledger have advanced.
+
+A backup taken while an operation is running holds whatever rows were
+committed when each `pg_dump` read began, which is some prefix of the load
+unrelated to any checkpoint, and the catalog dump holds the cursor as of its
+own read. If the two dumps are not taken at one quiet moment they are
+already a mismatched pair.
+
+On restore, bring both databases back to the same point. Restoring them to
+different points leaves a runner to resume against a mismatched pair. A
+resumed runner reads the input from the cursor forward and never re-reads the
+rows behind it:
+
+- Catalog behind the data (the rollback procedure above restores only the
+  catalog). The cursor moves back, so the runner applies the input rows
+  after it again. The ledger keeps only the rows past the latest checkpoint,
+  so it does not cover them. A plain put writes the same item again. A
+  condition row is evaluated again against the item now in the table, so it
+  can fail where it passed before, and the operation's counters and reports
+  come from the second evaluation.
+- Data behind the catalog. The cursor stays ahead of the rows the data
+  restore removed, so the runner starts past them and never writes them
+  again. Those rows are missing from the table while the catalog counters
+  report them as processed. This loses data with no error.
+
+Before a backup you intend to restore from, quiesce bulk operations first.
+Cancel every non-terminal operation (see the Admin Guide, Cancelling a bulk
+operation as the operator), or lower `max_concurrent_bulk_operations` to stop
+new starts and let the running operations finish. Then back up both
+databases, and on restore bring both back to the same point.
 
 ## Version History
 
@@ -1200,6 +1244,12 @@ This change needs no catalog migration of its own. Before upgrading a deployment
 - `Null` with value `false` matched only a single-table request with a `ProjectionExpression` before, and now matches every item request that carries the key. An `Allow` gated on it, written to require that a read names its attributes, now grants each of these requests that its `Action` covers, a read with no projection and its whole item included, and a `Deny` gated on it now refuses them.
 
 A `DeleteItem` and a read with no projection hold only the names the request gives, not those of the stored item, so a `Deny` on an attribute blocks neither deleting an item that holds it nor reading the item with no projection, as on DynamoDB (measured 2026-10-31). Nor does it stop an `UpdateItem` from copying the attribute's value into another attribute through a `SET` value such as `SET #n = ssn`, as on DynamoDB (measured 2026-11-01). No catalog migration is required. Before upgrading, check the policies of each account for the statements above.
+
+### v1.1.0: `PutItem` checks the nesting depth of `ExpressionAttributeValues` before the table lookup
+
+**What changed.** `PutItem` checks the nesting depth of every `ExpressionAttributeValues` value with its other condition checks, before it looks up the table and checks the item. Before this release that check ran after the table lookup and the item checks. The bulk put runner uses the same sequence for each row, so a row's condition fault carries the message `PutItem` returns.
+
+**Who is affected.** A `PutItem` request that carries a value nested deeper than the limit, and also names a table that does not exist or carries an item that fails its checks, now gets the nesting-depth `ValidationException`. Before this release it got the error of the table lookup or of the item. A request with one of those faults alone gets the answer it got before. No catalog migration is required.
 
 ---
 

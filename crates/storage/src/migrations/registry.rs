@@ -112,6 +112,11 @@ migration_ids! {
     /// import stored a second key under an ID that a key already had.
     UniqueAccessKeyIds = 12, "unique_access_key_ids",
         "make every access key ID unique, which the MongoDB catalog did not enforce";
+    /// Adds the bulk put items tables: the operation records, their input
+    /// files and their pending report records in the catalog, and the
+    /// row-outcome ledger and the write owners beside the items they record.
+    BulkOperations = 13, "bulk_operations",
+        "add the bulk put items tables: operations, input files, report records, row outcomes and write owners";
 }
 
 /// Highest id that has shipped in a release. Bodies at or below it are frozen:

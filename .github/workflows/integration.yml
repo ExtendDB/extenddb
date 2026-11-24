@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 # Supersede an in-flight run of the SAME pull request when a new push arrives,
-# so two pushes do not each hold six slots on a capped pool. Everything that is
+# so two pushes do not each hold slots on a capped pool. Everything that is
 # not a pull request gets a group unique to the run (run_id): merge-group runs
 # can share a ref (gh-readonly-queue/main/pr-N-<sha> is reused across
 # re-queues of the same PR), and GitHub concurrency replaces a PENDING run in
@@ -274,9 +274,9 @@ jobs:
         run: cat moto.log || true
 
       # run-tests restarts the server daemonized to apply the import/export
-      # config, and a daemonized server logs to syslog, not the job log. Without
-      # this dump, the storage error behind a client-visible 500 leaves no
-      # evidence anywhere in CI.
+      # and bulk store config, and a daemonized server logs to syslog, not the
+      # job log. Without this dump, the storage error behind a client-visible
+      # 500 leaves no evidence anywhere in CI.
       - name: Dump server syslog on failure
         if: failure()
         run: sudo journalctl -t extenddb --no-pager -n 500 || true
@@ -728,7 +728,10 @@ jobs:
   # run-rust-integration instead of after it.
   run-postgres-storage-tests:
     runs-on: extenddb_ubuntu-2404_4-core
-    timeout-minutes: 40
+    # The storage step alone took 22 min 37 s on the 20 Nov 2026 run at
+    # 27bcbbcb4. The engine step builds the engine's release test binary on
+    # top of that build and runs about 900 cases, 15 of them on PostgreSQL.
+    timeout-minutes: 60
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -782,6 +785,21 @@ jobs:
           # table_snapshot fails rather than skips without the string above.
           EXTENDDB_TEST_PG_REQUIRED: "1"
         run: cargo test --release -p extenddb-storage-postgres --tests
+
+      # The bulk put runner cases that hold on both backends (the
+      # `on_both_backends` macro in the engine's bulk_put tests: takeover,
+      # pacing under the lease, exactly-once resumes, U+0000 rows) run their
+      # PostgreSQL leg only with a connection string; without one each leg
+      # prints a skip and passes, and test.yml's `cargo test --workspace`
+      # sets none. They build their own throwaway databases on this job's
+      # server, one case at a time. EXTENDDB_TEST_PG_REQUIRED turns the skip
+      # into a failure here too.
+      - name: Run the engine's bulk put tests with their PostgreSQL cases
+        env:
+          EXTENDDB_TEST_PG_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
+          EXTENDDB_TEST_PG_REQUIRED: "1"
+        # Quoted: a plain scalar may not end in a colon.
+        run: "cargo test --release -p extenddb-engine --lib bulk_put::"
 
   # The runtime-detection proof: the same binary, against a PostgreSQL with no
   # pgvector, must refuse vector indexes over the wire. Today the job above runs
@@ -969,6 +987,10 @@ jobs:
         if: failure()
         run: sudo journalctl -t extenddb --no-pager -n 500 || true
 
+  # The bulk store on an S3-compatible service (integration-s3.yml).
+  run-integration-s3:
+    uses: ./.github/workflows/integration-s3.yml
+
   integration:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40
@@ -982,6 +1004,7 @@ jobs:
         run-postgres-storage-tests,
         run-rust-integration-postgres-novector,
         run-rust-integration-sqlite,
+        run-integration-s3,
       ]
     if: always()
     steps:
@@ -993,7 +1016,8 @@ jobs:
              [ "${{ needs.run-rust-integration.result }}" != "success" ] || \
              [ "${{ needs.run-postgres-storage-tests.result }}" != "success" ] || \
              [ "${{ needs.run-rust-integration-postgres-novector.result }}" != "success" ] || \
-             [ "${{ needs.run-rust-integration-sqlite.result }}" != "success" ]; then
+             [ "${{ needs.run-rust-integration-sqlite.result }}" != "success" ] || \
+             [ "${{ needs.run-integration-s3.result }}" != "success" ]; then
             exit 1
           fi
 

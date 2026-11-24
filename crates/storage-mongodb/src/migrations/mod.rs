@@ -326,6 +326,10 @@ pub fn migration(id: MigrationId) -> Migration<MongoStores> {
                 m0012_unique_access_key_ids::SOURCE,
             )],
         },
+        MigrationId::BulkOperations => Migration::NotApplicable(
+            "the MongoDB backend has no bulk operation store: a bulk operation request that \
+             reaches the store is refused with ValidationException",
+        ),
     }
 }
 
