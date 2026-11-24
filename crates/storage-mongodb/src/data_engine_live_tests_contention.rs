@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Live MongoDB tests for writes that lose to concurrent writers on one item:
+//! Live `MongoDB` tests for writes that lose to concurrent writers on one item:
 //! puts on one key of a table with a GSI, and the two bounds that end a
 //! contended write, the engine's contention deadline and the attempt budget.
 //!
@@ -20,8 +20,9 @@ use extenddb_core::types::{
     ReturnValuesOnConditionCheckFailure, TableKeyInfo,
 };
 use extenddb_storage::error::StorageError;
+use futures::TryStreamExt as _;
 
-use super::super::{CONTENTION_DEADLINE, OwnedTransactWriteOp};
+use super::super::OwnedTransactWriteOp;
 use super::{finish, scratch_engine, table};
 use crate::MongoEngine;
 use crate::data::{data_collection_name, document_to_item, item_to_document};
@@ -65,7 +66,7 @@ fn stored_document(item: &Item, key_info: &TableKeyInfo) -> Document {
         .expect("test item converts to a document")
 }
 
-/// `SET w = :w` with its placeholder, for an UpdateItem under contention.
+/// `SET w = :w` with its placeholder, for an `UpdateItem` under contention.
 fn set_w(value: &str) -> (Vec<UpdateAction>, ExpressionMaps) {
     let actions = vec![UpdateAction::Set {
         path: vec![PathElement::Attribute("w".to_owned())],
@@ -124,6 +125,12 @@ async fn stored_item(engine: &MongoEngine, key_info: &TableKeyInfo, pk: &str) ->
 /// index holds the final item's entry only. On the service every one of these
 /// puts answers 200; the backend reaches that through its retry budget.
 ///
+/// The deadline is set far above the time the budget takes, so the attempt
+/// budget is the one bound a put here can reach. With the production deadline
+/// of 10 s, a put that queued behind the other writers on a loaded host could
+/// reach the deadline first and fail the test, which would measure the host's
+/// load instead of the budget.
+///
 /// The table has a GSI row in the catalog, so `sync_indexes_in_session`
 /// writes an index entry per put and keeps the GSI cache at `true`. Without
 /// the row the first committed put flips the cache to `false`, the other
@@ -136,7 +143,7 @@ async fn stored_item(engine: &MongoEngine, key_info: &TableKeyInfo, pk: &str) ->
 async fn live_concurrent_unconditional_puts_on_one_key_of_a_gsi_table_all_commit() {
     const WRITERS: usize = 32;
     const PUTS: usize = 8;
-    let engine = Arc::new(engine_with_deadline(CONTENTION_DEADLINE).await);
+    let engine = Arc::new(engine_with_deadline(Duration::from_secs(600)).await);
     let key_info = Arc::new(gsi_path_table(&engine, "hot-key"));
     let gsi_key_schema = vec![KeySchemaElement {
         attribute_name: "gk".to_owned(),
@@ -201,7 +208,6 @@ async fn live_concurrent_unconditional_puts_on_one_key_of_a_gsi_table_all_commit
     let idx_coll = engine
         .data_db
         .collection::<Document>(&data_collection_name("hot-key-gk-index"));
-    use futures::TryStreamExt as _;
     let entries: Vec<Document> = idx_coll
         .find(doc! {})
         .await
@@ -376,7 +382,7 @@ async fn live_a_write_in_a_request_scope_measures_the_deadline_from_the_scope_st
 
 /// A `TransactWriteItems` that reaches the deadline answers a canceled
 /// transaction with a `TransactionConflict` reason per item, which is what
-/// live DynamoDB answers a transaction that loses to contention (107 of 160
+/// live `DynamoDB` answers a transaction that loses to contention (107 of 160
 /// calls at 16 writers on one key). It does not answer the HTTP 503 the
 /// single-item writes answer.
 #[tokio::test]
@@ -450,12 +456,12 @@ async fn live_a_transaction_that_reaches_the_deadline_answers_a_canceled_transac
     finish(engine).await;
 }
 
-/// An unconditional PutItem that spends its whole attempt budget on
+/// An unconditional `PutItem` that spends its whole attempt budget on
 /// contention gives up with the transient error naming the attempts, which
 /// the engine answers as HTTP 503.
 ///
 /// The deadline is set far above the time the budget takes (9.5 to 12.7 s
-/// against a document a transaction holds, over nine runs on a shared host),
+/// against a document a transaction holds, over six runs on a shared host),
 /// so the attempt budget is the bound this test reaches. With the production
 /// deadline of 10 s either bound can fire first, which is why the deadline is
 /// the test's input rather than its race.
