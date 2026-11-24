@@ -525,13 +525,12 @@ fn scan_holds_its_filter_projection_and_start_key_names() {
     );
 }
 
-/// The paths in `ProjectionExpression` only. A key without `#` resolves no
-/// name, and the engine refuses that request. The names in
-/// `SearchConditionExpression` are not in the value: the service served a
-/// search whose condition named `ssn` under a Deny on `ssn` (measured
-/// 2026-11-21).
+/// No value, whatever the request names: the service served a search that
+/// projected `ssn`, and one whose condition named `ssn`, under a Deny on
+/// `ssn`, and refused a projected search under a Deny gated on `Null` `true`
+/// (measured 2026-11-21).
 #[test]
-fn search_vectors_holds_its_projected_paths() {
+fn search_vectors_holds_no_attributes() {
     let v = || json!({":v": {"S": "1"}});
     let rows = [
         (
@@ -540,7 +539,12 @@ fn search_vectors_holds_its_projected_paths() {
                 "ProjectionExpression": "#v.x, name",
                 "ExpressionAttributeNames": {"#v": "vec"},
             }),
-            names(&["name", "vec"]),
+            None,
+        ),
+        (
+            "a projection of ssn",
+            json!({"ProjectionExpression": "ssn"}),
+            None,
         ),
         (
             "a key without #",
@@ -554,7 +558,7 @@ fn search_vectors_holds_its_projected_paths() {
                 "ExpressionAttributeValues": v(),
                 "ProjectionExpression": "cat",
             }),
-            names(&["cat"]),
+            None,
         ),
         (
             "a condition and no projection",

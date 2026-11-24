@@ -14,14 +14,15 @@ An IndexName outside ``[a-zA-Z0-9_.-]+`` (``vidx/extra``) gets ValidationExcepti
 for every caller, before the policy decision, as Query and Scan do.
 
 The ``ROWS`` were measured on DynamoDB in us-east-1 on 2026-11-21, each
-request twice with the same answer. The ``deny(ssn)`` rows ran under a session
-policy that allows ``dynamodb:*`` and denies ``dynamodb:*`` under
-``ForAnyValue:StringEquals {"dynamodb:Attributes": ["ssn"]}``, and the
-``allow-all`` rows with no session policy. The service checks the
-``ExpressionAttributeNames`` keys before the policy decision, and ExtendDB
-decides the policy first. The service sets no ``dynamodb:Attributes`` value
-on a SearchVectors request, so it serves a projection of ``ssn`` under
-``deny(ssn)``. ExtendDB holds the projected names, so that row is not here.
+request twice with the same answer. The ``deny(ssn)`` rows ran
+under a session policy that allows ``dynamodb:*`` and denies ``dynamodb:*``
+under ``ForAnyValue:StringEquals {"dynamodb:Attributes": ["ssn"]}``, the
+``deny(null)`` rows under one that denies under ``Null
+{"dynamodb:Attributes": "true"}``, and the ``allow-all`` rows with no session
+policy. The service sets no ``dynamodb:Attributes`` value on a SearchVectors
+request: it serves a projection of ``ssn`` under ``deny(ssn)``, and refuses
+every search under ``deny(null)``. ExtendDB decides the policy before it
+checks the ``ExpressionAttributeNames`` keys.
 
 The principals are builtin-IAM users provisioned through the management API.
 The module skips when the backend does not support vector indexes, unless
@@ -300,8 +301,25 @@ DENY_SSN = {
         },
     ],
 }
+DENY_NULL = {
+    "Version": "2012-10-17",
+    "Statement": [
+        {"Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"},
+        {
+            "Effect": "Deny",
+            "Action": "dynamodb:*",
+            "Resource": "*",
+            "Condition": {"Null": {"dynamodb:Attributes": "true"}},
+        },
+    ],
+}
 SSN_VALUE = {":v": SSN_ITEM["ssn"]}
 CAT_ONLY = [{"cat": {"S": "c1"}}]
+DENIED = "perform: dynamodb:SearchVectors on resource:"
+TOP_K_OF_ZERO = (
+    "1 validation error detected: Value at 'TopK' failed to satisfy constraint: "
+    "Member must have value greater than or equal to 1"
+)
 
 
 LONG_KEY = "#" + "a" * 255
@@ -314,6 +332,34 @@ def _invalid_key(key: str) -> str:
 # The measured rows: the policy, the members added to the search, then the
 # error type and message, or None and the items the search returns.
 ROWS = {
+    "projection-of-ssn": (
+        "deny(ssn)",
+        {"ProjectionExpression": "ssn"},
+        None,
+        [SSN_ITEM],
+    ),
+    "projection-of-cat-and-ssn": (
+        "deny(ssn)",
+        {"ProjectionExpression": "cat, ssn"},
+        None,
+        [{"cat": {"S": "c1"}, **SSN_ITEM}],
+    ),
+    "null-projection-of-cat": (
+        "deny(null)",
+        {"ProjectionExpression": "cat"},
+        "AccessDeniedException",
+        DENIED,
+    ),
+    "null-no-projection": ("deny(null)", {}, "AccessDeniedException", DENIED),
+    "null-condition-on-cat": (
+        "deny(null)",
+        {
+            "SearchConditionExpression": "cat = :v",
+            "ExpressionAttributeValues": SSN_VALUE,
+        },
+        "AccessDeniedException",
+        DENIED,
+    ),
     "projection-key-without-hash": (
         "deny(ssn)",
         {"ProjectionExpression": "#n", "ExpressionAttributeNames": {"n": "ssn"}},
@@ -381,8 +427,7 @@ ROWS = {
         "allow-all",
         {"TopK": 0, "ProjectionExpression": "#n", "ExpressionAttributeNames": {"n": "ssn"}},
         "ValidationException",
-        "1 validation error detected: Value at 'TopK' failed to satisfy constraint: "
-        "Member must have value greater than or equal to 1",
+        TOP_K_OF_ZERO,
     ),
     "value-not-a-string-text-tracked-by-1012": (
         "allow-all",
@@ -396,6 +441,11 @@ ROWS = {
 @pytest.fixture(scope="module")
 def deny_ssn(principal):
     return principal(DENY_SSN)
+
+
+@pytest.fixture(scope="module")
+def deny_null(principal):
+    return principal(DENY_NULL)
 
 
 def test_the_deny_on_ssn_refuses_a_get_item_of_ssn(deny_ssn, vector_table):
@@ -412,9 +462,9 @@ def test_the_deny_on_ssn_refuses_a_get_item_of_ssn(deny_ssn, vector_table):
 
 
 @pytest.mark.parametrize("row", list(ROWS))
-def test_search_expression_attribute_names(deny_ssn, vector_table, row):
+def test_search_expression_attribute_names(deny_ssn, deny_null, vector_table, row):
     policy, members, error, expected = ROWS[row]
-    p = deny_ssn if policy == "deny(ssn)" else vector_table["admin"]
+    p = {"deny(ssn)": deny_ssn, "deny(null)": deny_null}.get(policy, vector_table["admin"])
     resp = _search(p, vector_table["name"], **members)
     if error is None:
         assert resp.status_code == 200, f"{row}: {resp.text}"
@@ -423,9 +473,10 @@ def test_search_expression_attribute_names(deny_ssn, vector_table, row):
         assert resp.status_code == 400, f"{row}: {resp.text}"
         assert _error_type(resp) == error, f"{row}: {resp.text}"
         message = _error_message(resp)
-        if error == "SerializationException":
-            # The service ends this text with the position in the body, and
-            # ExtendDB puts a sentence of its own before it.
+        if error in ("SerializationException", "AccessDeniedException"):
+            # The service ends the first text with the position in the body,
+            # and ExtendDB puts a sentence of its own before it. The second
+            # names the principal and the resource.
             assert expected in message, f"{row}: {message}"
         else:
             assert message == expected, f"{row}: {message}"

@@ -238,7 +238,7 @@ extenddb supports the same access control patterns as real AWS IAM:
 | `DeleteItem` | The `Key` attributes, the table's key attributes, `Expected`, and the attributes in `ConditionExpression` |
 | `Query` | The key attributes of the table and of the queried index, the attributes in `KeyConditionExpression` and `KeyConditions`, `AttributesToGet`, `QueryFilter`, `ExclusiveStartKey`, and the attributes in `FilterExpression` and `ProjectionExpression` |
 | `Scan` | The table's key attributes, `AttributesToGet`, `ScanFilter`, `ExclusiveStartKey`, and the attributes in `FilterExpression` and `ProjectionExpression` |
-| `SearchVectors` | The attributes in `ProjectionExpression`; the key is absent when there is none |
+| `SearchVectors` | No value, whatever `ProjectionExpression` and `SearchConditionExpression` name, as on DynamoDB (measured 2026-11-21) |
 | `BatchGetItem` | Per table: the table's key attributes, `AttributesToGet`, and the attributes in `ProjectionExpression`, as for `GetItem`; the names in `Keys` add nothing |
 | `BatchWriteItem` | Per table: the attributes of every `PutRequest` item and `DeleteRequest` key, and the table's key attributes, evaluated once with the union of the table's items |
 | `TransactGetItems`, `TransactWriteItems` | Per item, what the single-item operation holds: `Get` as `GetItem`, `Put` as `PutItem`, `Update` as `UpdateItem`, `Delete` as `DeleteItem`; a `ConditionCheck` holds the table's key attributes and the attributes in its `ConditionExpression` |

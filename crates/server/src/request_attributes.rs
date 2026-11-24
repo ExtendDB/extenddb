@@ -61,11 +61,10 @@
 //!   projected name, and (measured 2026-11-10) under a Deny on the index's
 //!   sort key, so the index's sort key is not in the key. The other rules for
 //!   a local secondary index follow from that key content.
-//! - `SearchVectors`: the paths in `ProjectionExpression`. A `SearchVectors`
-//!   with no `ProjectionExpression` leaves the key absent. The names in
-//!   `SearchConditionExpression` are not in it. On the service the key is
-//!   absent on every `SearchVectors` (measured 2026-11-21). A Deny gated on
-//!   `Null` `true` refused each one. A Deny on an attribute refused none,
+//! - `SearchVectors`: the key is absent, whatever `ProjectionExpression` and
+//!   `SearchConditionExpression` name, as on the service (measured
+//!   2026-11-21): a Deny gated on `Null` `true` refused each `SearchVectors`
+//!   sent, a projected one included, and a Deny on an attribute refused none,
 //!   whether the projection or the condition named it.
 //! - `BatchGetItem`: per table, the table's key attributes, `AttributesToGet`,
 //!   and the paths in `ProjectionExpression`, as for `GetItem`. The names in
@@ -177,7 +176,6 @@ pub(crate) fn single_table_attributes(
             names.map_keys(input.get("ScanFilter"));
             names.range_read(input);
         }
-        "SearchVectors" => names.projection(input.get("ProjectionExpression")),
         _ => return None,
     }
     names.finish()
