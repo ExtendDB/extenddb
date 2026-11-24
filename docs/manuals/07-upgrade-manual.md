@@ -388,6 +388,12 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
+### v1.1.0: a request refused in the authorization step counts in `UserErrors` and `RequestCount`
+
+**What changed.** A request the server refuses in its authorization step, before the IAM decision or by it, now records `UserErrors` and `RequestCount` under the account and the operation, as a request the engine refuses does. The refusals in that step are a `TableName`, index name or ARN that breaks the naming rules, a batch or transaction outside its count limits, a malformed stream, backup, export or tag ARN, a shard iterator the server cannot read, a resource in another account, and the IAM denial itself (`AccessDeniedException`). 1.0.0 answered each of them with the same HTTP 400 and recorded no metric for it. A storage fault during the key lookup of that step records `SystemErrors` and `RequestCount`. The DynamoDB metrics documentation counts every request answered with an HTTP 400 in `UserErrors`.
+
+**Who is affected.** An operator who reads `UserErrors` or `RequestCount` from `/metrics` or the console sees the refused requests counted from this release, so a client that sends a refused request shape in a loop raises `UserErrors` where 1.0.0 showed nothing. A request refused before the account is known (a missing or failed signature, an unknown operation, a body that does not parse) still records no metric, and a throttled request still records the throttle metrics only. No catalog migration is required, and a rollback to 1.0.0 brings back the old counts.
+
 ### v1.0.0: Cassandra reads and writes at `LOCAL_QUORUM`
 
 **What changed.** The Cassandra backend runs its reads and writes at `LOCAL_QUORUM`. 0.1.15 ran many of them at `ONE`, the driver's default, in each area: items (the reads of GetItem, Query and Scan among them), transactions, TTL, streams, the catalog, IAM and `init`. A read with `ConsistentRead` `false` also runs at `LOCAL_QUORUM`. A lightweight transaction runs Paxos at `LOCAL_SERIAL` and commits at `LOCAL_QUORUM`. 0.1.15 ran many of its lightweight transactions at those levels already, and others, among them the admin user creation and most IAM writes, at the driver's defaults, `SERIAL` and `ONE`. Batches ran at `LOCAL_QUORUM` before and still do. No setting changes these levels (#945).

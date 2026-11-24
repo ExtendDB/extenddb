@@ -366,6 +366,18 @@ ExtendDB-internal:
 - `PoolActiveConnections`, `PoolIdleConnections`, `PoolAcquireLatency`
 - `WorkerLastSuccess`, `WorkerCycleLatency`, `WorkerErrorCount`
 
+`RequestCount` counts every request the server answers after authentication,
+except a throttled one, and `UserErrors` counts each of them answered with a
+4xx other than a failed condition (`ConditionalCheckFailedRequests`), with
+`SystemErrors` in place of `UserErrors` for a 5xx. That covers a request the
+engine refuses, a point-in-time recovery restore or enable, which is refused
+before authorization, and a request refused in the authorization step: a
+table name or ARN that breaks the rules, a batch outside its count limits, an
+IAM denial. A request refused before the account is known (a missing or
+failed signature, an unknown operation, a body that does not parse or is too
+large) records no metric. A throttled request records `ThrottledRequests` and
+`ReadThrottleEvents` or `WriteThrottleEvents` only.
+
 **Dimensions** (from the `Dimension` enum):
 
 - `AccountId(String)`, ExtendDB's own: the account of the request or table
