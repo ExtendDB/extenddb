@@ -814,7 +814,12 @@ async fn try_pass_through_validates_config() {
 /// not a panic. moka's `try_get_with` returns `Arc<E>` for racing callers; we
 /// surface each follower's own owned `E`. With single-flight, all 8 racing
 /// callers share one loader invocation.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+///
+/// Errors are not cached, so a caller that first runs after the load ended
+/// starts a second one. A paused current-thread runtime advances the clock
+/// only once every task waits, so all 8 callers join the in-flight load
+/// before the loader's sleep ends, however slow the runner (#1072).
+#[tokio::test(start_paused = true)]
 async fn concurrent_hard_miss_errors_are_returned_to_each_caller() {
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_loader = calls.clone();
