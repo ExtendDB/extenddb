@@ -971,6 +971,40 @@
       }
     },
     {
+      "name": "GetShardIterator AT_TIMESTAMP in the future is refused, after the clock is read",
+      "op": "GetShardIterator",
+      "body": {
+        "StreamArn": "${streamArn}",
+        "ShardId": "${shardId}",
+        "ShardIteratorType": "AT_TIMESTAMP",
+        "Timestamp": 4102444800
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "One or more parameter values were invalid: Timestamp parameter cannot be greater than the current timestamp"
+        }
+      ]
+    },
+    {
+      "name": "GetShardIterator AT_TIMESTAMP in the past returns an iterator",
+      "op": "GetShardIterator",
+      "body": {
+        "StreamArn": "${streamArn}",
+        "ShardId": "${shardId}",
+        "ShardIteratorType": "AT_TIMESTAMP",
+        "Timestamp": 1700000000
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/ShardIterator",
+          "present": true
+        }
+      ]
+    },
+    {
       "name": "GetRecords returns the one INSERT record of PutItem s1",
       "op": "GetRecords",
       "body": {
