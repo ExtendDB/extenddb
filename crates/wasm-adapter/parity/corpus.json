@@ -3702,6 +3702,142 @@
       ]
     },
     {
+      "name": "table names: GetItem with an empty TableName answers ResourceNotFoundException, as the server does",
+      "op": "GetItem",
+      "body": {
+        "TableName": "",
+        "Key": {
+          "productId": {
+            "S": "p1"
+          }
+        }
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found"
+        }
+      ]
+    },
+    {
+      "name": "table names: BatchGetItem with an empty RequestItems key answers ResourceNotFoundException, as the server does",
+      "op": "BatchGetItem",
+      "body": {
+        "RequestItems": {
+          "": {
+            "Keys": [
+              {
+                "pk": {
+                  "S": "a"
+                }
+              }
+            ]
+          }
+        }
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found"
+        }
+      ]
+    },
+    {
+      "name": "table names: TransactWriteItems with an empty member TableName answers ResourceNotFoundException, as the server does",
+      "op": "TransactWriteItems",
+      "body": {
+        "TransactItems": [
+          {
+            "Put": {
+              "TableName": "",
+              "Item": {
+                "pk": {
+                  "S": "a"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "error": "ResourceNotFoundException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Requested resource not found"
+        }
+      ]
+    },
+    {
+      "name": "table names: ListTables with an empty ExclusiveStartTableName lists from the first table, as the server does",
+      "op": "ListTables",
+      "body": {
+        "ExclusiveStartTableName": "",
+        "Limit": 1
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "",
+          "equals": {
+            "LastEvaluatedTableName": "Account",
+            "TableNames": [
+              "Account"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "table names: ImportTable with an empty table name answers that import is disabled, as the server does",
+      "op": "ImportTable",
+      "body": {
+        "TableCreationParameters": {
+          "TableName": "",
+          "KeySchema": [
+            {
+              "AttributeName": "k",
+              "KeyType": "HASH"
+            }
+          ],
+          "AttributeDefinitions": [
+            {
+              "AttributeName": "k",
+              "AttributeType": "S"
+            }
+          ]
+        },
+        "InputFormat": "DYNAMODB_JSON",
+        "S3BucketSource": {
+          "S3Bucket": "b"
+        }
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Import is disabled. Configure [import] paths in extenddb.toml to enable."
+        }
+      ]
+    },
+    {
+      "name": "table names: ListStreams with an empty TableName lists no streams, as the server does",
+      "op": "ListStreams",
+      "body": {
+        "TableName": ""
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "",
+          "equals": {
+            "Streams": []
+          }
+        }
+      ]
+    },
+    {
       "name": "index names: Query with an IndexName outside the pattern answers that the table has no such index",
       "op": "Query",
       "body": {
