@@ -420,8 +420,8 @@ if $NEEDS_INTEGRATION && [[ "$TARGET" != "real-dynamodb" ]]; then
             echo "  ✓ allow_credential_import set to true"
         fi
     fi
-    # The SearchVectors grammar setting. The suites read it and never write it,
-    # so parallel workers all see the value written here.
+    # The SearchVectors grammar setting. The suites read it and never change
+    # it, so parallel workers all see the value written here.
     if [[ -n "${EXTENDDB_TEST_SEARCH_INEQUALITY_FILTERS:-}" ]]; then
         if [[ ! -x "$BINARY" || ! -f "$CONFIG_FOR_SETTINGS" ]]; then
             echo "error: EXTENDDB_TEST_SEARCH_INEQUALITY_FILTERS is set and there is no $BINARY or $CONFIG_FOR_SETTINGS to write it with."

@@ -17,9 +17,16 @@ concurrency:
 # The search-inequality-filters Cargo feature is on by default, so the other
 # workflows build, lint and test it, and their wire tests run with the
 # search_inequality_filters setting absent, which gives every account the
-# extended grammar. These jobs cover what they do not: each crate that
-# declares the feature built and tested with it compiled out, and the vector
-# wire tests with the setting written as `off` and as `all`.
+# extended grammar. These jobs cover what they do not: the workspace built,
+# linted and tested with the feature compiled out, and the vector wire tests
+# with the setting written as `off` and as `all`, and against the build with
+# the feature compiled out.
+#
+# The crates take their internal dependencies with default features, so no
+# cargo command line compiles the feature out.
+# devtools/compile-out-search-inequality-filters removes it from the default
+# list of every crate that declares it, which compiles it out of the
+# workspace, and checks that nothing enables it.
 jobs:
   compiled-out:
     runs-on: extenddb_ubuntu-2404_4-core
@@ -33,21 +40,14 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # One crate per run: a crate built with others would get the feature
-      # back from a dependent that enables its defaults.
-      - name: Lint each crate with the feature off
+      - name: Compile the feature out
+        run: devtools/compile-out-search-inequality-filters
+      - name: Lint the workspace with the feature compiled out
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Unit tests with the feature compiled out
         run: |
-          set -e
-          cargo clippy --locked -p extenddb-core --all-targets --no-default-features --features partiql -- -D warnings
-          cargo clippy --locked -p extenddb-engine --all-targets --no-default-features --features partiql -- -D warnings
-          for crate in extenddb-server extenddb-app extenddb-storage-sqlite extenddb-storage-postgres; do
-            cargo clippy --locked -p "$crate" --all-targets --no-default-features -- -D warnings
-          done
-      - name: Unit tests of core and the engine with the feature off
-        run: |
-          set -e
-          cargo test --locked --no-fail-fast -p extenddb-core --no-default-features --features partiql
-          cargo test --locked --no-fail-fast -p extenddb-engine --no-default-features --features partiql
+          cargo test --locked --no-fail-fast -p extenddb-core -p extenddb-engine \
+            -p extenddb-server -p extenddb-app --lib
 
   wire:
     runs-on: extenddb_ubuntu-2404_4-core
@@ -56,7 +56,7 @@ jobs:
       fail-fast: false
       matrix:
         backend: [sqlite, postgres]
-        setting: ["off", all]
+        setting: ["off", all, compiled-out]
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -78,6 +78,10 @@ jobs:
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Compile the feature out
+        if: matrix.setting == 'compiled-out'
+        run: devtools/compile-out-search-inequality-filters
 
       - name: Build release
         run: cargo build --locked --release -p extenddb --no-default-features --features ${{ matrix.backend }}
@@ -121,15 +125,16 @@ jobs:
       # file, except the CLI catalog migration file, which builds catalogs of
       # its own and does not depend on the feature. devtools/run-tests writes
       # the setting before the suite starts; the modules read it and fail when
-      # the server serves the other grammar. Under `off` the tests of the
-      # extended grammar skip.
+      # the server serves the other grammar. Under `off`, and against the build
+      # with the feature compiled out, which has no such setting, the tests of
+      # the extended grammar skip.
       - name: Run the vector wire tests
         env:
           EXTENDDB_TEST_ENDPOINT: https://127.0.0.1:18443
           EXTENDDB_ADMIN_USER: admin
           EXTENDDB_ADMIN_PASSWORD: ${{ steps.init.outputs.admin_password }}
           EXTENDDB_TEST_BACKUP_STORE: ${{ matrix.backend == 'sqlite' && 'filesystem' || 'none' }}
-          EXTENDDB_TEST_SEARCH_INEQUALITY_FILTERS: ${{ matrix.setting }}
+          EXTENDDB_TEST_SEARCH_INEQUALITY_FILTERS: ${{ matrix.setting != 'compiled-out' && matrix.setting || '' }}
           EXTENDDB_EXPECT_VECTORS: "1"
         run: devtools/run-tests --extenddb --pytest --parallel --filter "vector and not test_cli"
 

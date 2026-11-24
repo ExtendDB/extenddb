@@ -11,8 +11,8 @@ The grammar a target serves an account is the equality-only grammar or the
 extended grammar. Against ExtendDB with admin credentials in the environment,
 ``expected_grammar`` reads it from the ``search_inequality_filters`` setting,
 and ``grammar_of`` fails when the target answers with the other grammar.
-These helpers only read the setting. ``devtools/run-tests`` writes it, from
-``EXTENDDB_TEST_SEARCH_INEQUALITY_FILTERS``, before any suite starts.
+These helpers never change the setting. ``devtools/run-tests`` writes it,
+from ``EXTENDDB_TEST_SEARCH_INEQUALITY_FILTERS``, before any suite starts.
 """
 
 from __future__ import annotations
@@ -171,7 +171,9 @@ def expected_grammar() -> str | None:
     An absent or empty setting is every account, so the extended grammar;
     ``off`` is the equality-only grammar. A list of accounts names the
     account in ``EXTENDDB_TEST_ACCOUNT_ID``, which
-    ``devtools/provision-test-credentials`` exports.
+    ``devtools/provision-test-credentials`` exports. A build without the
+    ``search-inequality-filters`` Cargo feature has no such setting and
+    serves the equality-only grammar.
     """
     api = _settings_api()
     if api is None:
@@ -179,7 +181,7 @@ def expected_grammar() -> str | None:
     url, auth = api
     resp = requests.get(url, auth=auth, timeout=30, verify=False)
     if resp.status_code == 404:
-        return "extended"
+        return "extended" if _setting_is_known(url, auth) else "equality"
     assert resp.status_code == 200, f"GET {url}: {resp.status_code} {resp.text}"
     value = resp.json()["value"].strip()
     if value == "off":
@@ -193,6 +195,18 @@ def expected_grammar() -> str | None:
         )
     listed = {entry.strip() for entry in value.split(",")}
     return "extended" if account in listed else "equality"
+
+
+def _setting_is_known(url: str, auth: tuple[str, str]) -> bool:
+    """Whether the server knows the setting, from a write of a value every
+    build refuses: a build with the feature refuses the value, and one
+    without it refuses the key. Neither stores anything."""
+    resp = requests.put(url, json={"value": "?"}, auth=auth, timeout=30, verify=False)
+    assert resp.status_code == 400, f"PUT {url}: {resp.status_code} {resp.text}"
+    if "Unknown setting" in resp.text:
+        return False
+    assert "Invalid value" in resp.text, f"PUT {url}: {resp.text}"
+    return True
 
 
 def grammar_of(probe: Callable[[], requests.Response]) -> str:

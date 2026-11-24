@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+"""Remove the search-inequality-filters Cargo feature from every default list.
+
+Each crate that declares the feature has it in its `default` list, and the
+crates take their internal dependencies with default features, so no cargo
+command line compiles it out. Removing it from every `default` list is how
+the feature is compiled out. This script edits the working tree's Cargo.toml
+files that way, then checks with `cargo tree` that nothing in the workspace
+enables the feature. CI builds, lints and tests the tree it leaves.
+
+Usage: devtools/compile-out-search-inequality-filters
+"""
+
+from __future__ import annotations
+
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+FEATURE = "search-inequality-filters"
+CRATES = 7
+
+
+def main() -> int:
+    root = Path(__file__).resolve().parent.parent
+    default = re.compile(r'^default = \[(.*)\]$', re.MULTILINE)
+    edited = []
+    for manifest in sorted(root.glob("crates/*/Cargo.toml")):
+        text = manifest.read_text()
+        match = default.search(text)
+        if match is None or f'"{FEATURE}"' not in match.group(1):
+            continue
+        kept = [f for f in (e.strip() for e in match.group(1).split(",")) if f and f != f'"{FEATURE}"']
+        text = text[: match.start()] + f"default = [{', '.join(kept)}]" + text[match.end() :]
+        manifest.write_text(text)
+        edited.append(manifest.relative_to(root))
+    if len(edited) != CRATES:
+        print(f"error: expected {CRATES} crates with {FEATURE} in default, edited {edited}", file=sys.stderr)
+        return 1
+    tree = subprocess.run(
+        ["cargo", "tree", "--locked", "--workspace", "-e", "features", "-i", "extenddb-core"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    if f'feature "{FEATURE}"' in tree:
+        print(f"error: the workspace still enables {FEATURE}:\n{tree}", file=sys.stderr)
+        return 1
+    for manifest in edited:
+        print(f"removed {FEATURE} from the default list of {manifest}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
