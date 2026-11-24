@@ -17,7 +17,7 @@ from contextlib import contextmanager
 import pytest
 from botocore.exceptions import ClientError
 
-from helpers import unique_name, wait_for_active, wait_for_deleted
+from helpers import assert_validation, unique_name, wait_for_active, wait_for_deleted
 
 HASH_MESSAGE = (
     "One or more parameter values were invalid: "
@@ -71,14 +71,11 @@ def make_table(client, prefix: str, **create_args):
         drop_table(client, name)
 
 
-def refused(client, message: str, **query) -> None:
-    """Run the Query and assert the refusal's code, status and exact text."""
+def refused(client, message: str, code: str = "ValidationException", **query) -> None:
+    """Run the Query and assert a 400 with ``code`` and exactly ``message``."""
     with pytest.raises(ClientError) as exc_info:
         client.query(**query)
-    err = exc_info.value.response
-    assert err["Error"]["Code"] == "ValidationException", err["Error"]["Message"]
-    assert err["ResponseMetadata"]["HTTPStatusCode"] == 400
-    assert err["Error"]["Message"] == message
+    assert_validation(exc_info.value, message, code)
 
 
 def refused_ending(client, suffix: str, **query) -> None:

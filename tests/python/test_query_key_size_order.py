@@ -47,8 +47,9 @@ def _error(client, **query) -> dict:
 
 def _first(client, table: str, message: str, **query) -> None:
     """The query on ``table`` with a 2049-byte ``pk`` reports ``message``."""
-    err = _error(
+    refused(
         client,
+        message,
         TableName=table,
         KeyConditionExpression="pk = :big",
         **{
@@ -56,71 +57,63 @@ def _first(client, table: str, message: str, **query) -> None:
             "ExpressionAttributeValues": {":big": BIG, **query.get("ExpressionAttributeValues", {})},
         },
     )
-    assert err["Code"] == "ValidationException"
-    assert err["Message"] == message
 
 
 def test_missing_table_is_reported_first(dynamodb_client):
-    err = _error(
+    refused(
         dynamodb_client,
+        "Requested resource not found",
+        code="ResourceNotFoundException",
         TableName=unique_name("qks-absent"),
         KeyConditionExpression="pk = :p",
         ExpressionAttributeValues={":p": BIG},
     )
-    assert err["Code"] == "ResourceNotFoundException"
-    assert err["Message"] == "Requested resource not found"
 
 
 def test_wrong_index_name_is_reported_first(dynamodb_client, index_table):
-    err = _error(
+    refused(
         dynamodb_client,
+        "The table does not have the specified index: nope",
         TableName=index_table,
         IndexName="nope",
         KeyConditionExpression="g = :p",
         ExpressionAttributeValues={":p": BIG},
     )
-    assert err["Code"] == "ValidationException"
-    assert err["Message"] == "The table does not have the specified index: nope"
 
 
 def test_consistent_read_on_a_gsi_is_reported_first(dynamodb_client, index_table):
-    err = _error(
+    refused(
         dynamodb_client,
+        "Consistent reads are not supported on global secondary indexes",
         TableName=index_table,
         IndexName="gsi",
         ConsistentRead=True,
         KeyConditionExpression="g = :p",
         ExpressionAttributeValues={":p": BIG},
     )
-    assert err["Code"] == "ValidationException"
-    assert err["Message"] == "Consistent reads are not supported on global secondary indexes"
 
 
 def test_limit_zero_is_reported_first(raw_client, index_table):
-    err = _error(
+    refused(
         raw_client,
+        "1 validation error detected: Value at 'Limit' failed to satisfy constraint: "
+        "Member must have value greater than or equal to 1",
         TableName=index_table,
         Limit=0,
         KeyConditionExpression="pk = :p",
         ExpressionAttributeValues={":p": BIG},
     )
-    assert err["Code"] == "ValidationException"
-    assert err["Message"] == (
-        "1 validation error detected: Value at 'Limit' failed to satisfy constraint: "
-        "Member must have value greater than or equal to 1"
-    )
 
 
 def test_missed_key_schema_element_is_reported_first(dynamodb_client, index_table):
-    err = _error(
+    refused(
         dynamodb_client,
+        "Query condition missed key schema element: g",
         TableName=index_table,
         IndexName="gsi",
         KeyConditionExpression="gs = :v",
         ExpressionAttributeValues={":v": S(1025, "r")},
     )
-    assert err["Code"] == "ValidationException"
-    assert err["Message"] == "Query condition missed key schema element: g"
 
 
 def test_projection_syntax_error_is_reported_first(dynamodb_client, index_table):

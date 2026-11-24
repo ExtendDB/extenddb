@@ -234,7 +234,7 @@ class TestBaseTableQueryKeySize:
         )
         assert resp["Count"] == 1
 
-    def test_hash_value_of_2049_bytes_isrefused(self, dynamodb_client, base_table):
+    def test_hash_value_of_2049_bytes_is_refused(self, dynamodb_client, base_table):
         refused(
             dynamodb_client,
             HASH_MESSAGE,
@@ -256,7 +256,7 @@ class TestBaseTableQueryKeySize:
         )
         assert resp["Count"] == 1
 
-    def test_range_value_of_1025_bytes_isrefused(self, dynamodb_client, base_table):
+    def test_range_value_of_1025_bytes_is_refused(self, dynamodb_client, base_table):
         refused(
             dynamodb_client,
             RANGE_MESSAGE,
@@ -295,7 +295,7 @@ class TestRangeOperatorsAreSized:
             "pk = :p AND begins_with(sk, :v)",
         ],
     )
-    def test_1025_byte_value_isrefused(self, dynamodb_client, base_table, expression):
+    def test_1025_byte_value_is_refused(self, dynamodb_client, base_table, expression):
         refused(
             dynamodb_client,
             RANGE_MESSAGE,
@@ -304,7 +304,7 @@ class TestRangeOperatorsAreSized:
             ExpressionAttributeValues={":p": {"S": "p"}, ":v": S(1025, "s")},
         )
 
-    def test_between_with_a_1025_byte_upper_bound_isrefused(
+    def test_between_with_a_1025_byte_upper_bound_is_refused(
         self, dynamodb_client, base_table
     ):
         refused(
@@ -331,7 +331,7 @@ class TestBinaryKeySize:
         )
         assert resp["Count"] == 0
 
-    def test_hash_value_of_2049_bytes_isrefused(self, dynamodb_client, binary_table):
+    def test_hash_value_of_2049_bytes_is_refused(self, dynamodb_client, binary_table):
         refused(
             dynamodb_client,
             HASH_MESSAGE,
@@ -348,7 +348,7 @@ class TestBinaryKeySize:
         )
         assert resp["Count"] == 0
 
-    def test_range_value_of_1025_bytes_isrefused(self, dynamodb_client, binary_table):
+    def test_range_value_of_1025_bytes_is_refused(self, dynamodb_client, binary_table):
         refused(
             dynamodb_client,
             RANGE_MESSAGE,
@@ -370,7 +370,7 @@ class TestLsiQueryKeySize:
         )
         assert resp["Count"] == 0
 
-    def test_range_value_of_1025_bytes_isrefused(self, dynamodb_client, index_table):
+    def test_range_value_of_1025_bytes_is_refused(self, dynamodb_client, index_table):
         refused(
             dynamodb_client,
             RANGE_MESSAGE,
@@ -384,7 +384,7 @@ class TestLsiQueryKeySize:
 class TestLegacyKeyConditionsKeySize:
     """Measured 2026-10-23 with the legacy KeyConditions parameter."""
 
-    def test_hash_value_of_2049_bytes_isrefused(self, dynamodb_client, base_table):
+    def test_hash_value_of_2049_bytes_is_refused(self, dynamodb_client, base_table):
         refused(
             dynamodb_client,
             HASH_MESSAGE,
@@ -394,7 +394,7 @@ class TestLegacyKeyConditionsKeySize:
             },
         )
 
-    def test_range_value_of_1025_bytes_isrefused(self, dynamodb_client, base_table):
+    def test_range_value_of_1025_bytes_is_refused(self, dynamodb_client, base_table):
         refused(
             dynamodb_client,
             RANGE_MESSAGE,
