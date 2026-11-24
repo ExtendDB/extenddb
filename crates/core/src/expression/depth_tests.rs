@@ -3,8 +3,9 @@
 
 //! The nesting depth limit of the update and condition parsers: an
 //! expression nested past `max_depth` is refused, and one nested far past it
-//! is refused on a thread with a small stack instead of overflowing it. A
-//! call refused by name is refused with the name refusal past the limit too.
+//! is refused on a thread with a small stack instead of overflowing it. The
+//! call that crosses the limit is checked by name, and a call refused by name
+//! gets the name refusal.
 
 use super::parser::parse_condition_with_depth_limit;
 use super::test_timeout::within_10_s;
@@ -165,10 +166,10 @@ fn condition_far_past_the_limit_is_refused_without_overflowing_the_stack() {
     );
 }
 
-/// Past the limit, a call the service refuses by name answers the name
-/// refusal, as the service does at 151, 200 and 300 calls (measured
-/// 2026-11-19, two sends each). `size` in a condition, and `if_not_exists`
-/// and `list_append` in a SET value, keep the depth error.
+/// When the call that crosses the limit is one the service refuses by name, it
+/// answers the name refusal, as the service does at 151, 200 and 300 calls
+/// (measured 2026-11-19, two sends each). `size` in a condition, and
+/// `if_not_exists` and `list_append` in a SET value, keep the depth error.
 #[test]
 fn calls_refused_by_name_past_the_limit_answer_the_name_refusal() {
     let past = LIMIT + 1;

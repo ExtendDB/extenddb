@@ -19,8 +19,9 @@
 //! A parenthesized value and a function call each nest one level. Past
 //! `max_expression_depth` levels the expression is refused before the parser
 //! recurses further, so the stack a parse takes stays bounded whatever the
-//! size and token limits allow. A call the semantic pass refuses by name is
-//! refused there with that message, not the depth error.
+//! size and token limits allow. The call that crosses the limit is checked by
+//! name, and a call the semantic pass refuses gets that refusal instead of the
+//! depth error. No other call is checked.
 
 use super::ast::{ArithOp, Expr, UpdateAction};
 use super::parser_common;
@@ -334,13 +335,12 @@ fn parse_value_expr(
 /// Any identifier followed by `(` is a function call, with the name kept as
 /// written. This pass checks grammar only: whether the name exists, its case,
 /// and its operand count are checked afterwards by
-/// `validate_update_semantics`, over the whole parsed expression. A call past
-/// the depth limit is the exception: that pass never runs, so its name is
-/// checked here (see `depth_tests.rs`). Amazon
-/// DynamoDB reports every syntax error before any semantic error (measured
-/// 2026-10-14: `SET x = foo(x), b = ` reports the syntax error at the end,
-/// not the unknown function name), and deferring the semantic checks gives
-/// the same precedence.
+/// `validate_update_semantics`, over the whole parsed expression. The call
+/// that crosses the depth limit is the exception: that pass never runs, so its
+/// name is checked here (see `depth_tests.rs`). Amazon DynamoDB reports every
+/// syntax error before any semantic error (measured 2026-10-14: `SET x =
+/// foo(x), b = ` reports the syntax error at the end, not the unknown function
+/// name), and deferring the semantic checks gives the same precedence.
 fn parse_set_operand(
     tokens: &[Token],
     pos: &mut usize,

@@ -21,8 +21,10 @@
 //!
 //! A parenthesized condition, a `NOT` and a function call read as an operand
 //! each nest one level, up to `max_depth`. A function call that is the
-//! condition itself nests none. Past `max_depth`, a call the semantic pass
-//! refuses by name is refused with that message, not the depth error.
+//! condition itself nests none. Past `max_depth`, the call that crosses the
+//! limit is checked by name, as an operand, and a call the semantic pass
+//! refuses there gets that refusal instead of the depth error. No other call
+//! is checked.
 
 use super::ast::{CompareOp, Expr};
 use super::kind::ExpressionKind;
@@ -230,9 +232,9 @@ fn parse_operand(
         }
         Token::Ident(name) => {
             // A function call, `size(path)` or any other name, nests one
-            // level. Its name is checked by `validate_condition_semantics`,
-            // except past the limit, where that pass never runs and the name
-            // is checked here (see `depth_tests.rs`).
+            // level. Its name is checked by `validate_condition_semantics`.
+            // When this call crosses the limit, that pass never runs, so its
+            // name is checked here (see `depth_tests.rs`).
             if *pos + 1 < tokens.len() && tokens[*pos + 1] == Token::LParen {
                 *depth += 1;
                 if *depth > max_depth {
