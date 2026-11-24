@@ -395,7 +395,10 @@ async fn overlapping_stream_changes_apply_exactly_one() {
         let table = describe_table(&engine, &account, name).await;
         let mixed = round % 3 != 0;
         if ok == 2 {
-            assert!(mixed, "round {round}: two disables both applied: {ra:?} {rb:?}");
+            assert!(
+                mixed,
+                "round {round}: two disables both applied: {ra:?} {rb:?}"
+            );
             assert!(
                 table
                     .stream_specification
