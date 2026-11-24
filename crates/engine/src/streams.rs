@@ -14,6 +14,7 @@ use serde_json::Value;
 
 use crate::OperationContext;
 use crate::serialize_output;
+use crate::streams_iterator_params as iterator_params;
 
 /// Handle `DescribeStream`.
 ///
@@ -27,6 +28,14 @@ pub async fn handle_describe_stream(
 ) -> Result<Value, DynamoDbError> {
     let input: DescribeStreamInput = serde_json::from_value(body)
         .map_err(|e| DynamoDbError::SerializationException(e.to_string()))?;
+    if let Some(start) = &input.exclusive_start_shard_id
+        && start.chars().count() < SHARD_ID_MIN_LEN
+    {
+        return Err(DynamoDbError::ValidationException(constraint(
+            "exclusiveStartShardId",
+            "have length greater than or equal to 28",
+        )));
+    }
 
     let desc = ctx
         .storage
@@ -51,6 +60,23 @@ pub async fn handle_list_streams(
 ) -> Result<Value, DynamoDbError> {
     let input: ListStreamsInput = serde_json::from_value(body)
         .map_err(|e| DynamoDbError::SerializationException(e.to_string()))?;
+    // Measured 2026-10-24: Limit=0 and a start ARN under 37 characters are
+    // refused with the model's constraint sentences (no value quoted). The
+    // upper bound of Limit is not measured; it is clamped to 100.
+    if input.limit.is_some_and(|l| l < 1) {
+        return Err(DynamoDbError::ValidationException(constraint(
+            "limit",
+            "have value greater than or equal to 1",
+        )));
+    }
+    if let Some(start) = &input.exclusive_start_stream_arn
+        && start.chars().count() < 37
+    {
+        return Err(DynamoDbError::ValidationException(constraint(
+            "exclusiveStartStreamArn",
+            "have length greater than or equal to 37",
+        )));
+    }
 
     let limit = input.limit.unwrap_or(100).min(100);
     let (streams, last_arn) = ctx
@@ -75,6 +101,13 @@ pub async fn handle_list_streams(
 ///
 /// Encodes the shard ID and starting position into a base64 iterator token.
 ///
+/// Validation runs in the service's order, measured 2026-10-23, 2026-11-20 and
+/// 2026-11-23 (us-east-1): the members' JSON types, then the `StreamArn`
+/// presence, then the model's constraints in one message (`SequenceNumber`
+/// length, `ShardIteratorType` null or enum, `ShardId` null or length), then
+/// the parameter rules per type, then stream and shard existence, then the
+/// `SequenceNumber` refusal of `TRIM_HORIZON` and `LATEST`.
+///
 /// # Errors
 ///
 /// Returns [`DynamoDbError::ResourceNotFoundException`] if the stream/shard does not exist.
@@ -83,15 +116,22 @@ pub async fn handle_get_shard_iterator(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
-    let input: GetShardIteratorInput = serde_json::from_value(body)
-        .map_err(|e| DynamoDbError::SerializationException(e.to_string()))?;
+    iterator_params::check_member_shapes(&body)?;
+    constraint_violations(&body)?;
+
+    let input: GetShardIteratorInput =
+        serde_json::from_value(body).map_err(crate::deserialize_error)?;
+    let shard_len = input.shard_id.chars().count();
+    let at_timestamp_ms = iterator_params::validate_iterator_parameters(&input)?;
 
     // Validate the stream and shard exist before issuing an iterator.
     ctx.storage
         .validate_shard(&ctx.account_id, &input.stream_arn, &input.shard_id)
         .await
-        .map_err(storage_to_dynamo)?;
+        .map_err(|e| shard_lookup_error(shard_len, e))?;
+    iterator_params::refuse_sequence_number_after_shard(&input)?;
 
+    let width = ctx.storage.sequence_number_width();
     let seq = match input.shard_iterator_type {
         ShardIteratorType::TrimHorizon => String::new(),
         ShardIteratorType::Latest => {
@@ -104,33 +144,18 @@ pub async fn handle_get_shard_iterator(
                 .unwrap_or_default()
         }
         ShardIteratorType::AtSequenceNumber => {
-            // Convert to AFTER_SEQUENCE_NUMBER by subtracting 1, so the
-            // exclusive "after" semantics produce inclusive "at" behavior.
-            let raw = input.sequence_number.clone().ok_or_else(|| {
-                DynamoDbError::ValidationException(
-                    "SequenceNumber is required for AT_SEQUENCE_NUMBER iterator type".to_owned(),
-                )
-            })?;
-            let n = raw.parse::<u128>().map_err(|_| {
-                DynamoDbError::ValidationException("Invalid SequenceNumber".to_owned())
-            })?;
-            // n == 0: sequence 0 is the first possible record, so "at 0"
-            // means "read from the beginning" — same as TRIM_HORIZON.
-            if n > 0 {
-                // Pad to the backend's stored width so lexicographic order
-                // matches numeric order against stored sequence numbers.
-                let width = ctx.storage.sequence_number_width();
-                format!("{:0>width$}", n - 1)
-            } else {
-                String::new()
-            }
+            let raw = input.sequence_number.as_deref().unwrap_or_default();
+            iterator_params::at_sequence_to_after(raw, width)?
         }
-        ShardIteratorType::AfterSequenceNumber => {
-            input.sequence_number.clone().ok_or_else(|| {
-                DynamoDbError::ValidationException(
-                    "SequenceNumber is required for AFTER_SEQUENCE_NUMBER iterator type".to_owned(),
-                )
-            })?
+        ShardIteratorType::AfterSequenceNumber => input.sequence_number.clone().unwrap_or_default(),
+        ShardIteratorType::AtTimestamp => {
+            resolve_at_timestamp(
+                ctx.storage.as_ref(),
+                &input.shard_id,
+                at_timestamp_ms.unwrap_or_default(),
+                width,
+            )
+            .await?
         }
     };
 
@@ -140,10 +165,10 @@ pub async fn handle_get_shard_iterator(
     let type_str = "AFTER_SEQUENCE_NUMBER";
 
     // Encode creation timestamp (seconds since epoch) for 15-minute expiration.
-    // unwrap_or_default: returns epoch 0 if system clock is before 1970 — safe
-    // because the iterator would just expire immediately on the next GetRecords.
-    let created_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    // unwrap_or_default: returns epoch 0 if the system clock is before 1970,
+    // which only makes the iterator expire on the next GetRecords.
+    let created_at = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
 
@@ -161,8 +186,126 @@ pub async fn handle_get_shard_iterator(
     serialize_output(&output)
 }
 
+/// The model's checks on a `GetShardIterator` body before it is deserialized.
+///
+/// An absent, null or empty `StreamArn` is `Invalid StreamArn` on its own,
+/// before any clause (measured 2026-11-23, us-east-1; the server refuses a
+/// malformed one before the handler). Then the constraints join one message:
+/// the `SequenceNumber` is at least 21 characters (measured 2026-10-24 with
+/// "0"), the `ShardIteratorType` is present and a member, the `ShardId` is
+/// present and at least 28 characters. The service joins every violation under
+/// one `N validation errors detected`, in this order and with no value quoted
+/// (measured 2026-11-20 and 2026-11-23, us-east-1). The `ShardId` maximum is
+/// applied once the shard is not found (`shard_lookup_error`): the shards a
+/// release before v0.1.14 wrote are named after the table, and a table name
+/// over 40 characters puts them past 65.
+fn constraint_violations(body: &Value) -> Result<(), DynamoDbError> {
+    if body
+        .get("StreamArn")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return Err(DynamoDbError::ValidationException(
+            extenddb_core::error::INVALID_STREAM_ARN.to_owned(),
+        ));
+    }
+    let mut clauses = Vec::new();
+    if body
+        .get("SequenceNumber")
+        .and_then(Value::as_str)
+        .is_some_and(|n| n.chars().count() < 21)
+    {
+        clauses.push(clause(
+            "sequenceNumber",
+            "have length greater than or equal to 21",
+        ));
+    }
+    match body.get("ShardIteratorType") {
+        None | Some(Value::Null) => clauses.push(clause("shardIteratorType", "not be null")),
+        Some(Value::String(t)) if !iterator_params::SHARD_ITERATOR_TYPES.contains(&t.as_str()) => {
+            clauses.push(iterator_params::SHARD_ITERATOR_TYPE_ENUM_CLAUSE.to_owned());
+        }
+        _ => {}
+    }
+    match body.get("ShardId") {
+        None | Some(Value::Null) => clauses.push(clause("shardId", "not be null")),
+        Some(Value::String(s)) if s.chars().count() < SHARD_ID_MIN_LEN => {
+            clauses.push(clause("shardId", "have length greater than or equal to 28"));
+        }
+        _ => {}
+    }
+    if clauses.is_empty() {
+        return Ok(());
+    }
+    Err(DynamoDbError::ValidationException(
+        extenddb_core::error::validation_errors_detected(&clauses),
+    ))
+}
+
+/// The AFTER position for an `AT_TIMESTAMP` request: at the first record
+/// created at or after `at_ms`, or after the newest record when none
+/// qualifies (the service's tip-plus-one resolution).
+///
+/// The tip is read before the seek. If the seek then finds nothing, the
+/// iterator starts after that tip, and a record landing between the two
+/// reads is still ahead of it. The other order would skip such a record.
+pub(crate) async fn resolve_at_timestamp(
+    storage: &dyn extenddb_storage::StreamEngine,
+    shard_id: &str,
+    at_ms: i64,
+    width: usize,
+) -> Result<String, DynamoDbError> {
+    let tip = storage
+        .latest_sequence_number(shard_id)
+        .await
+        .map_err(storage_to_dynamo)?;
+    let first = storage
+        .first_sequence_number_at_or_after(shard_id, at_ms)
+        .await
+        .map_err(storage_to_dynamo)?;
+    match first {
+        Some(first) => iterator_params::at_sequence_to_after(&first, width),
+        None => Ok(tip.unwrap_or_default()),
+    }
+}
+
+/// The answer when the shard a `GetShardIterator` names is not found: for a
+/// `ShardId` of `shard_len` characters over the service's maximum, the model's
+/// constraint sentence (the service checks it before any lookup, and never has
+/// a shard that long); otherwise the storage layer's not-found answer. A shard
+/// that long and found passes, so a stream from before v0.1.14 on a table whose
+/// name is over 40 characters stays readable.
+fn shard_lookup_error(shard_len: usize, err: StorageError) -> DynamoDbError {
+    if shard_len > SHARD_ID_MAX_LEN {
+        return DynamoDbError::ValidationException(constraint(
+            "shardId",
+            "have length less than or equal to 65",
+        ));
+    }
+    storage_to_dynamo(err)
+}
+
 /// Shard iterator expiration: 15 minutes (900 seconds), matching real `DynamoDB`.
 const SHARD_ITERATOR_EXPIRY_SECS: u64 = 900;
+
+/// The shortest and longest `ShardId` the service accepts.
+const SHARD_ID_MIN_LEN: usize = 28;
+const SHARD_ID_MAX_LEN: usize = 65;
+
+/// The model's constraint sentence for a member value, as the service renders
+/// it for the streams API (no value quoted; measured 2026-10-24 on `shardId`,
+/// `exclusiveStartShardId`, `sequenceNumber`, `limit` and
+/// `exclusiveStartStreamArn`).
+fn constraint(member: &str, rule: &str) -> String {
+    extenddb_core::error::validation_errors_detected(&[clause(member, rule)])
+}
+
+/// One constraint clause of [`constraint`], as the service joins several of
+/// them under one `N validation errors detected` (measured 2026-11-20 on
+/// `GetShardIterator`).
+fn clause(member: &str, rule: &str) -> String {
+    format!("Value at '{member}' failed to satisfy constraint: Member must {rule}")
+}
 
 /// The message `DynamoDB` returns for an expired shard iterator (measured live,
 /// `live-r2/iter-live.json`: an iterator 990 seconds old returns
@@ -262,14 +405,18 @@ pub fn classify_shard_iterator(token: &str) -> ShardIteratorClass {
 
 /// Handle `GetRecords`.
 ///
-/// Decodes the shard iterator, checks expiration, reads records, and returns
+/// Decodes the shard iterator, checks expiration, reads records from the
+/// shard as one of the shards of the stream the iterator names, and returns
 /// a new iterator.
 ///
 /// # Errors
 ///
 /// Returns [`DynamoDbError::ExpiredIteratorException`] if the iterator is older
-/// than 15 minutes.
-/// Returns [`DynamoDbError::ValidationException`] on invalid iterator.
+/// than 15 minutes, or carries a timestamp and no stream ARN.
+/// Returns [`DynamoDbError::ResourceNotFoundException`] if the stream does not
+/// exist for the caller's account or the shard is not one of its shards.
+/// Returns [`DynamoDbError::ValidationException`] on an invalid iterator,
+/// which includes one with neither a stream ARN nor a timestamp.
 pub async fn handle_get_records(
     body: Value,
     ctx: &OperationContext,
@@ -282,8 +429,8 @@ pub async fn handle_get_records(
 
     // Check iterator expiration (15 minutes).
     if let Some(created_at) = it.created_at {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let now = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         if now.saturating_sub(created_at) > SHARD_ITERATOR_EXPIRY_SECS {
@@ -293,18 +440,21 @@ pub async fn handle_get_records(
         }
     }
 
-    // Confirm the shard belongs to the stream named in the token before
-    // reading. The request is authorized against that stream ARN, so this
-    // stops a forged token that pairs an authorized stream ARN with another
-    // stream's shard id from reading the other stream's records.
-    if let Some(ref stream_arn) = it.stream_arn {
-        ctx.storage
-            .validate_shard(&ctx.account_id, stream_arn, &it.shard_id)
-            .await
-            .map_err(storage_to_dynamo)?;
-    }
+    // The request was authorized against the stream ARN carried in the token.
+    // The storage read below resolves the shard against that stream (table
+    // name and stream label, within the caller's account) as part of the read:
+    // SQLite in the statement that reads the records, PostgreSQL, MongoDB and
+    // Cassandra after reading the table. A forged token that pairs an
+    // authorized stream ARN with another stream's shard id reads nothing and
+    // gets the "stream does not exist" answer. A token with no stream ARN gets
+    // the answer the authorization layer gives it (`classify_shard_iterator`)
+    // in every build, developer mode included; the engine answers the same for
+    // a caller that reaches it without the layer.
+    let Some(stream_arn) = it.stream_arn.as_deref() else {
+        return Err(no_stream_arn_error(&it));
+    };
 
-    let limit = input.limit.unwrap_or(1000).min(1000);
+    let limit = get_records_limit(input.limit)?;
 
     // All iterator types are resolved to AFTER_SEQUENCE_NUMBER at
     // GetShardIterator time. Empty seq means "read from beginning".
@@ -318,6 +468,7 @@ pub async fn handle_get_records(
         .storage
         .get_stream_records(
             &ctx.account_id,
+            stream_arn,
             &it.shard_id,
             after_sequence.as_deref(),
             limit,
@@ -329,8 +480,8 @@ pub async fn handle_get_records(
     // so the 15-minute window resets.
     let next_iterator = {
         let next_seq = last_seq.unwrap_or_else(|| it.sequence.clone());
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let now = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         Some(encode_shard_iterator(
@@ -338,7 +489,7 @@ pub async fn handle_get_records(
             "AFTER_SEQUENCE_NUMBER",
             &next_seq,
             now,
-            it.stream_arn.as_deref().unwrap_or(""),
+            stream_arn,
         ))
     };
 
@@ -347,6 +498,46 @@ pub async fn handle_get_records(
         next_shard_iterator: next_iterator,
     };
     serialize_output(&output)
+}
+
+/// The answer for a token that carries no stream ARN, the same one
+/// [`classify_shard_iterator`] gives the authorization layer. A token with a
+/// timestamp comes from a build before the ARN was carried and is expired; one
+/// without a timestamp is invalid.
+fn no_stream_arn_error(it: &ShardIterator) -> DynamoDbError {
+    if it.created_at.is_some() {
+        DynamoDbError::ExpiredIteratorException(SHARD_ITERATOR_EXPIRED_MESSAGE.to_owned())
+    } else {
+        DynamoDbError::ValidationException("Invalid ShardIterator".to_owned())
+    }
+}
+
+/// `GetRecords` with a `Limit` over 1000 (measured 2026-10-25 with 1001).
+pub const GET_RECORDS_LIMIT_TOO_LARGE: &str =
+    "One or more parameter values were invalid: Limit should be less than or equal to 1000";
+
+/// The largest `Limit` `GetRecords` accepts.
+const GET_RECORDS_MAX_LIMIT: i64 = 1000;
+
+/// The page size a `GetRecords` call asked for, or the service's refusal.
+///
+/// Measured 2026-10-25: `Limit` 0 and -1 get the model's constraint sentence,
+/// 1001 the parameter sentence; 1 and 1000 are accepted. The bounds are
+/// checked before storage runs, so the records read never carries a limit
+/// under 1, which the backends read as a shard that is not the stream's (no
+/// row) or refuse outright.
+fn get_records_limit(limit: Option<i64>) -> Result<i64, DynamoDbError> {
+    match limit {
+        Some(l) if l < 1 => Err(DynamoDbError::ValidationException(constraint(
+            "limit",
+            "have value greater than or equal to 1",
+        ))),
+        Some(l) if l > GET_RECORDS_MAX_LIMIT => Err(DynamoDbError::ValidationException(
+            GET_RECORDS_LIMIT_TOO_LARGE.to_owned(),
+        )),
+        Some(l) => Ok(l),
+        None => Ok(GET_RECORDS_MAX_LIMIT),
+    }
 }
 
 fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
@@ -361,103 +552,5 @@ fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
 }
 
 #[cfg(test)]
-mod tests {
-    /// AT_SEQUENCE_NUMBER converts to AFTER by subtracting 1 and padding to
-    /// the backend's stored width. Verify that an unpadded client input is
-    /// normalised correctly for both the 21-digit (postgres/sqlite/mongodb)
-    /// and 23-digit (cassandra) cases, and that the edge case n=0 maps to
-    /// TRIM_HORIZON (empty string).
-    #[test]
-    fn at_sequence_number_padding() {
-        let cases: &[(&str, usize, &str)] = &[
-            ("5", 21, "000000000000000000004"),
-            ("000000000000000000005", 21, "000000000000000000004"),
-            ("5", 23, "00000000000000000000004"),
-            ("00000000000000000000005", 23, "00000000000000000000004"),
-            ("0", 21, ""),
-            ("1", 21, "000000000000000000000"),
-        ];
-        for (input, width, expected) in cases {
-            let n: u128 = input.parse().unwrap();
-            let result = if n > 0 {
-                format!("{:0>width$}", n - 1)
-            } else {
-                String::new()
-            };
-            assert_eq!(&result, expected, "input={input} width={width}");
-        }
-    }
-
-    #[test]
-    fn shard_iterator_round_trip_backward_compat_and_fail_closed() {
-        let stream = "arn:aws:dynamodb:us-east-1:1:table/T/stream/2026-10-20T16:17:40.188";
-        let enc =
-            super::encode_shard_iterator("shardId-1", "AFTER_SEQUENCE_NUMBER", "42", 1000, stream);
-        let d = super::decode_shard_iterator(&enc).expect("decode");
-        assert_eq!(d.shard_id, "shardId-1");
-        assert_eq!(d.sequence, "42");
-        assert_eq!(d.created_at, Some(1000));
-        assert_eq!(d.stream_arn.as_deref(), Some(stream));
-
-        // A token from an older build (four fields, no stream ARN) still
-        // decodes, with stream_arn None, so the authorization layer can fail
-        // closed on it.
-        let old = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            "shardId-2|AFTER_SEQUENCE_NUMBER|7|1000",
-        );
-        let d2 = super::decode_shard_iterator(&old).expect("decode old");
-        assert_eq!(d2.shard_id, "shardId-2");
-        assert_eq!(d2.created_at, Some(1000));
-        assert_eq!(d2.stream_arn, None);
-
-        // Garbage does not decode.
-        assert!(super::decode_shard_iterator("!!!not base64!!!").is_none());
-    }
-
-    fn b64(s: &str) -> String {
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, s)
-    }
-
-    #[test]
-    fn classify_current_token_is_stream() {
-        let stream = "arn:aws:dynamodb:us-east-1:1:table/T/stream/2026-10-20T16:17:40.188";
-        let enc =
-            super::encode_shard_iterator("shardId-1", "AFTER_SEQUENCE_NUMBER", "42", 1000, stream);
-        match super::classify_shard_iterator(&enc) {
-            super::ShardIteratorClass::Stream(arn) => assert_eq!(arn, stream),
-            other => panic!("expected Stream, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn classify_old_format_four_fields_is_expired() {
-        // Four pre-upgrade fields with a parseable timestamp, no stream ARN.
-        let old = b64("shardId-2|AFTER_SEQUENCE_NUMBER|7|1000");
-        assert!(matches!(
-            super::classify_shard_iterator(&old),
-            super::ShardIteratorClass::Expired
-        ));
-    }
-
-    #[test]
-    fn classify_undecodable_or_short_or_unparseable_is_invalid() {
-        // Not base64.
-        assert!(matches!(
-            super::classify_shard_iterator("!!!not base64!!!"),
-            super::ShardIteratorClass::Invalid
-        ));
-        // Three fields: decodes but is not the old four-field shape.
-        let three = b64("shardId-3|AFTER_SEQUENCE_NUMBER|7");
-        assert!(matches!(
-            super::classify_shard_iterator(&three),
-            super::ShardIteratorClass::Invalid
-        ));
-        // Four fields but an unparseable timestamp.
-        let bad_ts = b64("shardId-4|AFTER_SEQUENCE_NUMBER|7|notanumber");
-        assert!(matches!(
-            super::classify_shard_iterator(&bad_ts),
-            super::ShardIteratorClass::Invalid
-        ));
-    }
-}
+#[path = "streams_tests.rs"]
+mod tests;

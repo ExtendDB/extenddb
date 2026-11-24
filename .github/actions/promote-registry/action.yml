@@ -6,9 +6,10 @@
 # per-registry promotion rules:
 #
 #   * the signature comes FIRST: before any tag is placed, the Cosign
-#     signature for the digest must verify against the committed release
-#     public key (on the destination, or copied from the source). No tag can
-#     ever exist without a verified signature behind it.
+#     signature for the digest must verify as a keyless signature from an
+#     allowed signing workflow for this tier (on the destination, or copied
+#     from the source). No tag can ever exist without a verified signature
+#     behind it.
 #   * version tags are immutable: an existing version tag with a different
 #     digest fails; the identical digest is an idempotent no-op
 #   * `latest` only moves forward, judged against THE DESTINATION's own tags
@@ -39,9 +40,9 @@ inputs:
   move-latest:
     description: 'Whether this promotion also moves latest (true/false)'
     required: true
-  public-key:
-    description: 'Path to the release signing public key (PEM)'
-    default: extenddb-signing.pub.pem
+  signer-workflows:
+    description: 'Pipe-separated signing-workflow basenames whose keyless signature is accepted for THIS image tier, e.g. release-image|sign-image for a backend image or release-dev-image|sign-image for the dev image'
+    required: true
   cosign-version:
     description: 'Pinned cosign version (NOT preinstalled on GitHub runners)'
     default: v3.1.3
@@ -78,7 +79,7 @@ runs:
         VERSION: ${{ inputs.version }}
         DIGEST: ${{ inputs.digest }}
         MOVE_LATEST: ${{ inputs.move-latest }}
-        PUBKEY: ${{ inputs.public-key }}
+        SIGNER_WORKFLOWS: ${{ inputs.signer-workflows }}
       run: |
         set -euo pipefail
         SIG_TAG="sha256-${DIGEST#sha256:}.sig"
@@ -147,13 +148,25 @@ runs:
           settle "${DST}:${SIG_TAG}" "$SRC_SIG" || { echo "::error::signature missing or mismatched after copy"; exit 1; }
         fi
         # The signature must actually VERIFY, not merely exist: an empty or
-        # wrong-key manifest at the .sig tag name must not pass. Verified
-        # against the DESTINATION, so all three paths are covered — a sig
-        # copied just now, a sig from an earlier run, and whatever else may
-        # be sitting at the tag name on DST. ignore-tlog because pre-Rekor
-        # releases (<= 0.1.6) have no transparency entries; key verification
-        # is unaffected. Tighten when all live releases do.
-        cosign verify --key "$PUBKEY" --insecure-ignore-tlog=true "${DST}@${DIGEST}" >/dev/null
+        # wrong-identity manifest at the .sig tag name must not pass. Verified
+        # against the DESTINATION, so all three paths are covered: a sig copied
+        # just now, a sig from an earlier run, and whatever else may be sitting
+        # at the tag name on DST. Keyless: the signer must be one of the
+        # workflows this caller allows for THIS image tier (signer-workflows),
+        # from a workflow_dispatch run on main, proven through the Rekor entry.
+        # That is what stops a dev-image signature from promoting a backend
+        # image, and the reverse. A key-signed artifact from before the keyless
+        # cutover does not verify here; promoting one through this path is not
+        # supported.
+        # Fail closed on a malformed caller value before it reaches the regex.
+        [[ "$SIGNER_WORKFLOWS" =~ ^[a-z0-9-]+(\|[a-z0-9-]+)*$ ]] \
+          || { echo "::error::signer-workflows must be pipe-separated workflow basenames"; exit 1; }
+        IDENTITY_RE='^https://github\.com/ExtendDB/extenddb/\.github/workflows/('"${SIGNER_WORKFLOWS}"')\.yml@refs/heads/main$'
+        cosign verify \
+          --certificate-identity-regexp "$IDENTITY_RE" \
+          --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+          --certificate-github-workflow-trigger workflow_dispatch \
+          "${DST}@${DIGEST}" >/dev/null
 
         # --- 2. version tag: immutable, idempotent on the identical digest ---
         set +e; EXISTING=$(probe "${DST}:${VERSION}"); rc=$?; set -e

@@ -1,0 +1,423 @@
+{
+  "access_keys": {
+    "type": "collection",
+    "options": {},
+    "indexes": {
+      "_id_": {
+        "key": [
+          [
+            "_id",
+            1
+          ]
+        ],
+        "options": {}
+      },
+      "account_id_1_user_name_1": {
+        "key": [
+          [
+            "account_id",
+            1
+          ],
+          [
+            "user_name",
+            1
+          ]
+        ],
+        "options": {}
+      }
+    }
+  },
+  "accounts": {
+    "type": "collection",
+    "options": {},
+    "indexes": {
+      "_id_": {
+        "key": [
+          [
+            "_id",
+            1
+          ]
+        ],
+        "options": {}
+      },
+      "account_name_1": {
+        "key": [
+          [
+            "account_name",
+            1
+          ]
+        ],
+        "options": {
+          "unique": true
+        }
+      }
+    }
+  },
+  "admin_users": {
+    "type": "collection",
+    "options": {},
+    "indexes": {
+      "_id_": {
+        "key": [
+          [
+            "_id",
+            1
+          ]
+        ],
+        "options": {}
+      }
+    }
+  },
+  "backups": {
+    "type": "collection",
+    "options": {},
+    "indexes": {
+      "_id_": {
+        "key": [
+          [
+            "_id",
+            1
+          ]
+        ],
+        "options": {}
+      },
+      "account_id_1_table_name_1": {
+        "key": [
+          [
+            "account_id",
+            1
+          ],
+          [
+            "table_name",
+            1
+          ]
+        ],
+        "options": {}
+      }
+    }
+  },
+  "continuous_backups": {
+    "type": "collection",
+    "options": {},
+    "indexes": {
+      "_id_": {
+        "key": [
+          [
+            "_id",
+            1
+          ]
+        ],
+        "options": {}
+      }
+    }
+  },
+  "extenddb_servers": {
+    "type": "collection",
+    "options": {},
+    "indexes": {
+      "_id_": {
+        "key": [
+          [
+            "_id",
+            1
+          ]
+        ],
+        "options": {}
+      },
+      "expires_at_1": {
+        "key": [
+          [
+            "expires_at",
+            1
+          ]
+        ],
+        "options": {
+          "expireAfterSeconds": 0
+        }
+      }
+    }
+  },
+  "iam_groups": {
+    "type": "collection",
+    "options": {},
+    "indexes": {
+      "_id_": {
+        "key": [
+          [
+            "_id",
+            1
+          ]
+        ],
+        "options": {}
+      },
+      "group_arn_1": {
+        "key": [
+          [
+            "group_arn",
+            1
+          ]
+        ],
+        "options": {
+          "unique": true
+        }
+      }
+    }
+  },
+  "iam_permissions_boundaries": {
+    "type": "collection",
+    "options": {},
+    "indexes": {
+      "_id_": {
+        "key": [
+          [
+            "_id",
+            1
+          ]
+        ],
+        "options": {}
+      }
+    }
+  },
+  "iam_policies": {
+    "type": "collection",
+    "options": {},
+    "indexes": {
+      "_id_": {
+        "key": [
+          [
+            "_id",
+            1
+          ]
+        ],
+        "options": {}
+      }
+    }
+  },
+  "iam_roles": {
+    "type": "collection",
+    "options": {},
+    "indexes": {
+      "_id_": {
+        "key": [
+          [
+            "_id",
+            1
+          ]
+        ],
+        "options": {}
+      },
+      "role_arn_1": {
+        "key": [
+          [
+            "role_arn",
+            1
+          ]
+        ],
+        "options": {
+          "unique": true
+        }
+      }
+    }
+  },
+  "iam_sessions": {
+    "type": "collection",
+    "options": {},
+    "indexes": {
+      "_id_": {
+        "key": [
+          [
+            "_id",
+            1
+          ]
+        ],
+        "options": {}
+      },
+      "access_key_id_1": {
+        "key": [
+          [
+            "access_key_id",
+            1
+          ]
+        ],
+        "options": {
+          "unique": true
+        }
+      },
+      "expires_at_1": {
+        "key": [
+          [
+            "expires_at",
+            1
+          ]
+        ],
+        "options": {
+          "expireAfterSeconds": 0
+        }
+      }
+    }
+  },
+  "iam_users": {
+    "type": "collection",
+    "options": {},
+    "indexes": {
+      "_id_": {
+        "key": [
+          [
+            "_id",
+            1
+          ]
+        ],
+        "options": {}
+      },
+      "user_arn_1": {
+        "key": [
+          [
+            "user_arn",
+            1
+          ]
+        ],
+        "options": {
+          "unique": true
+        }
+      }
+    }
+  },
+  "indexes": {
+    "type": "collection",
+    "options": {},
+    "indexes": {
+      "_id_": {
+        "key": [
+          [
+            "_id",
+            1
+          ]
+        ],
+        "options": {}
+      }
+    }
+  },
+  "login_attempts": {
+    "type": "collection",
+    "options": {},
+    "indexes": {
+      "_id_": {
+        "key": [
+          [
+            "_id",
+            1
+          ]
+        ],
+        "options": {}
+      },
+      "principal_1_attempted_at_1": {
+        "key": [
+          [
+            "principal",
+            1
+          ],
+          [
+            "attempted_at",
+            1
+          ]
+        ],
+        "options": {}
+      }
+    }
+  },
+  "metrics": {
+    "type": "collection",
+    "options": {},
+    "indexes": {
+      "_id.bucket_1": {
+        "key": [
+          [
+            "_id.bucket",
+            1
+          ]
+        ],
+        "options": {}
+      },
+      "_id_": {
+        "key": [
+          [
+            "_id",
+            1
+          ]
+        ],
+        "options": {}
+      }
+    }
+  },
+  "schema_history": {
+    "type": "collection",
+    "options": {},
+    "indexes": {
+      "_id_": {
+        "key": [
+          [
+            "_id",
+            1
+          ]
+        ],
+        "options": {}
+      }
+    }
+  },
+  "settings": {
+    "type": "collection",
+    "options": {},
+    "indexes": {
+      "_id_": {
+        "key": [
+          [
+            "_id",
+            1
+          ]
+        ],
+        "options": {}
+      }
+    }
+  },
+  "tables": {
+    "type": "collection",
+    "options": {},
+    "indexes": {
+      "_id_": {
+        "key": [
+          [
+            "_id",
+            1
+          ]
+        ],
+        "options": {}
+      },
+      "table_id_1": {
+        "key": [
+          [
+            "table_id",
+            1
+          ]
+        ],
+        "options": {
+          "unique": true
+        }
+      }
+    }
+  },
+  "tags": {
+    "type": "collection",
+    "options": {},
+    "indexes": {
+      "_id_": {
+        "key": [
+          [
+            "_id",
+            1
+          ]
+        ],
+        "options": {}
+      }
+    }
+  }
+}

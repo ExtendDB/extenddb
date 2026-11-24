@@ -1,0 +1,1284 @@
+{
+  "columns": {
+    "access_keys.access_key_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "access_keys.account_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "access_keys.created_at": {
+      "type": "timestamp with time zone",
+      "not_null": true,
+      "default": "now()",
+      "collation": null
+    },
+    "access_keys.is_active": {
+      "type": "boolean",
+      "not_null": true,
+      "default": "true",
+      "collation": null
+    },
+    "access_keys.secret_key_encrypted": {
+      "type": "bytea",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "access_keys.user_name": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "accounts.account_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "accounts.account_name": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "accounts.created_at": {
+      "type": "timestamp with time zone",
+      "not_null": true,
+      "default": "now()",
+      "collation": null
+    },
+    "admin_users.admin_name": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "admin_users.created_at": {
+      "type": "timestamp with time zone",
+      "not_null": true,
+      "default": "now()",
+      "collation": null
+    },
+    "admin_users.password_hash": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "backup_definitions.backup_arn": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "backup_definitions.definition": {
+      "type": "jsonb",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "backup_items.backup_arn": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "backup_items.item_data": {
+      "type": "jsonb",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "backup_items.pk": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "backup_items.sk": {
+      "type": "text",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "backups.account_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "backups.attribute_definitions": {
+      "type": "jsonb",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "backups.backup_arn": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "backups.backup_name": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "backups.backup_size_bytes": {
+      "type": "bigint",
+      "not_null": true,
+      "default": "0",
+      "collation": null
+    },
+    "backups.backup_status": {
+      "type": "text",
+      "not_null": true,
+      "default": "'AVAILABLE'::text",
+      "collation": null
+    },
+    "backups.backup_type": {
+      "type": "text",
+      "not_null": true,
+      "default": "'USER'::text",
+      "collation": null
+    },
+    "backups.billing_mode": {
+      "type": "text",
+      "not_null": true,
+      "default": "'PAY_PER_REQUEST'::text",
+      "collation": null
+    },
+    "backups.created_at": {
+      "type": "timestamp with time zone",
+      "not_null": true,
+      "default": "now()",
+      "collation": null
+    },
+    "backups.item_count": {
+      "type": "bigint",
+      "not_null": true,
+      "default": "0",
+      "collation": null
+    },
+    "backups.key_schema": {
+      "type": "jsonb",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "backups.provisioned_throughput": {
+      "type": "jsonb",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "backups.stream_specification": {
+      "type": "jsonb",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "backups.table_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "backups.table_name": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "backups.vector_indexes": {
+      "type": "jsonb",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "continuous_backups.account_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "continuous_backups.earliest_restorable": {
+      "type": "timestamp with time zone",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "continuous_backups.latest_restorable": {
+      "type": "timestamp with time zone",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "continuous_backups.pitr_enabled": {
+      "type": "boolean",
+      "not_null": true,
+      "default": "false",
+      "collation": null
+    },
+    "continuous_backups.table_name": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_group_members.account_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_group_members.group_name": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_group_members.user_name": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_groups.account_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_groups.created_at": {
+      "type": "timestamp with time zone",
+      "not_null": true,
+      "default": "now()",
+      "collation": null
+    },
+    "iam_groups.group_arn": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_groups.group_name": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_permissions_boundaries.account_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_permissions_boundaries.policy_document": {
+      "type": "jsonb",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_permissions_boundaries.principal_name": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_permissions_boundaries.principal_type": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_policies.account_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_policies.created_at": {
+      "type": "timestamp with time zone",
+      "not_null": true,
+      "default": "now()",
+      "collation": null
+    },
+    "iam_policies.policy_document": {
+      "type": "jsonb",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_policies.policy_name": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_policies.principal_name": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_policies.principal_type": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_role_tags.account_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_role_tags.role_name": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_role_tags.tag_key": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_role_tags.tag_value": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_roles.account_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_roles.created_at": {
+      "type": "timestamp with time zone",
+      "not_null": true,
+      "default": "now()",
+      "collation": null
+    },
+    "iam_roles.permissions_boundary_arn": {
+      "type": "text",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "iam_roles.role_arn": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_roles.role_name": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_roles.trust_policy": {
+      "type": "jsonb",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_sessions.access_key_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_sessions.account_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_sessions.created_at": {
+      "type": "timestamp with time zone",
+      "not_null": true,
+      "default": "now()",
+      "collation": null
+    },
+    "iam_sessions.expires_at": {
+      "type": "timestamp with time zone",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_sessions.role_name": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_sessions.secret_key_encrypted": {
+      "type": "bytea",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_sessions.session_name": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_sessions.session_policy": {
+      "type": "jsonb",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "iam_sessions.session_tags": {
+      "type": "jsonb",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "iam_sessions.session_token": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_user_tags.account_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_user_tags.tag_key": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_user_tags.tag_value": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_user_tags.user_name": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_users.account_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_users.created_at": {
+      "type": "timestamp with time zone",
+      "not_null": true,
+      "default": "now()",
+      "collation": null
+    },
+    "iam_users.password_hash": {
+      "type": "text",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "iam_users.user_arn": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "iam_users.user_name": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "idempotency_tokens.created_at": {
+      "type": "timestamp with time zone",
+      "not_null": true,
+      "default": "now()",
+      "collation": null
+    },
+    "idempotency_tokens.fingerprint": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "idempotency_tokens.token": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "indexes.index_id": {
+      "type": "text",
+      "not_null": true,
+      "default": "(gen_random_uuid())::text",
+      "collation": null
+    },
+    "indexes.index_name": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "indexes.index_status": {
+      "type": "text",
+      "not_null": true,
+      "default": "'ACTIVE'::text",
+      "collation": null
+    },
+    "indexes.index_type": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "indexes.key_schema": {
+      "type": "jsonb",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "indexes.projection": {
+      "type": "jsonb",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "indexes.propagation_delay_ms": {
+      "type": "integer",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "indexes.provisioned_throughput": {
+      "type": "jsonb",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "indexes.table_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "login_attempts.attempted_at": {
+      "type": "timestamp with time zone",
+      "not_null": true,
+      "default": "now()",
+      "collation": null
+    },
+    "login_attempts.principal": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "login_attempts.source_ip": {
+      "type": "text",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "login_attempts.success": {
+      "type": "boolean",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "metrics.bucket": {
+      "type": "timestamp with time zone",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "metrics.count": {
+      "type": "bigint",
+      "not_null": true,
+      "default": "0",
+      "collation": null
+    },
+    "metrics.index_name": {
+      "type": "text",
+      "not_null": true,
+      "default": "''::text",
+      "collation": null
+    },
+    "metrics.max": {
+      "type": "double precision",
+      "not_null": true,
+      "default": "'-Infinity'::double precision",
+      "collation": null
+    },
+    "metrics.metric": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "metrics.min": {
+      "type": "double precision",
+      "not_null": true,
+      "default": "'Infinity'::double precision",
+      "collation": null
+    },
+    "metrics.operation": {
+      "type": "text",
+      "not_null": true,
+      "default": "''::text",
+      "collation": null
+    },
+    "metrics.sum": {
+      "type": "double precision",
+      "not_null": true,
+      "default": "0",
+      "collation": null
+    },
+    "metrics.table_name": {
+      "type": "text",
+      "not_null": true,
+      "default": "''::text",
+      "collation": null
+    },
+    "schema_history.applied_at": {
+      "type": "timestamp with time zone",
+      "not_null": true,
+      "default": "now()",
+      "collation": null
+    },
+    "schema_history.filename": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "settings.key": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "settings.value": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "stream_records.created_at": {
+      "type": "timestamp with time zone",
+      "not_null": true,
+      "default": "now()",
+      "collation": null
+    },
+    "stream_records.event_name": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "stream_records.record_data": {
+      "type": "jsonb",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "stream_records.sequence_number": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "stream_records.shard_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "stream_records.table_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "stream_shards.created_at": {
+      "type": "timestamp with time zone",
+      "not_null": true,
+      "default": "now()",
+      "collation": null
+    },
+    "stream_shards.ending_sequence_number": {
+      "type": "text",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "stream_shards.parent_shard_id": {
+      "type": "text",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "stream_shards.shard_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "stream_shards.starting_sequence_number": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "stream_shards.table_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "table_restores.restore_date_time": {
+      "type": "timestamp with time zone",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "table_restores.source_backup_arn": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "table_restores.source_table_arn": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "table_restores.table_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "tables.account_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "tables.attribute_definitions": {
+      "type": "jsonb",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "tables.billing_mode": {
+      "type": "text",
+      "not_null": true,
+      "default": "'PAY_PER_REQUEST'::text",
+      "collation": null
+    },
+    "tables.creation_date_time": {
+      "type": "timestamp with time zone",
+      "not_null": true,
+      "default": "now()",
+      "collation": null
+    },
+    "tables.deletion_protection_enabled": {
+      "type": "boolean",
+      "not_null": true,
+      "default": "false",
+      "collation": null
+    },
+    "tables.item_count": {
+      "type": "bigint",
+      "not_null": true,
+      "default": "0",
+      "collation": null
+    },
+    "tables.key_schema": {
+      "type": "jsonb",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "tables.on_demand_throughput": {
+      "type": "jsonb",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "tables.provisioned_throughput": {
+      "type": "jsonb",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "tables.sse_specification": {
+      "type": "jsonb",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "tables.status_transition_at": {
+      "type": "timestamp with time zone",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "tables.stream_label": {
+      "type": "text",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "tables.stream_specification": {
+      "type": "jsonb",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "tables.table_arn": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "tables.table_class": {
+      "type": "text",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "tables.table_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "tables.table_name": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "tables.table_size_bytes": {
+      "type": "bigint",
+      "not_null": true,
+      "default": "0",
+      "collation": null
+    },
+    "tables.table_status": {
+      "type": "text",
+      "not_null": true,
+      "default": "'CREATING'::text",
+      "collation": null
+    },
+    "tables.ttl_attribute": {
+      "type": "text",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "tables.ttl_index_ready": {
+      "type": "boolean",
+      "not_null": true,
+      "default": "false",
+      "collation": null
+    },
+    "tags.resource_arn": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "tags.tag_key": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "tags.tag_value": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "vector_indexes.backfilling": {
+      "type": "boolean",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "vector_indexes.build_heartbeat_at": {
+      "type": "timestamp with time zone",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "vector_indexes.build_owner": {
+      "type": "text",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "vector_indexes.dimensions": {
+      "type": "integer",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "vector_indexes.distance_function": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "vector_indexes.index_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "vector_indexes.index_name": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "vector_indexes.index_status": {
+      "type": "text",
+      "not_null": true,
+      "default": "'CREATING'::text",
+      "collation": null
+    },
+    "vector_indexes.projection": {
+      "type": "jsonb",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "vector_indexes.search_schema": {
+      "type": "jsonb",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "vector_indexes.skipped_item_count": {
+      "type": "bigint",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "vector_indexes.table_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "vector_indexes.vector_attribute": {
+      "type": "jsonb",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    }
+  },
+  "indexes": {
+    "access_keys_pkey": {
+      "table": "access_keys",
+      "definition": "CREATE UNIQUE INDEX access_keys_pkey ON public.access_keys USING btree (access_key_id)",
+      "valid": true
+    },
+    "accounts_account_name_key": {
+      "table": "accounts",
+      "definition": "CREATE UNIQUE INDEX accounts_account_name_key ON public.accounts USING btree (account_name)",
+      "valid": true
+    },
+    "accounts_pkey": {
+      "table": "accounts",
+      "definition": "CREATE UNIQUE INDEX accounts_pkey ON public.accounts USING btree (account_id)",
+      "valid": true
+    },
+    "admin_users_pkey": {
+      "table": "admin_users",
+      "definition": "CREATE UNIQUE INDEX admin_users_pkey ON public.admin_users USING btree (admin_name)",
+      "valid": true
+    },
+    "backup_definitions_pkey": {
+      "table": "backup_definitions",
+      "definition": "CREATE UNIQUE INDEX backup_definitions_pkey ON public.backup_definitions USING btree (backup_arn)",
+      "valid": true
+    },
+    "backups_pkey": {
+      "table": "backups",
+      "definition": "CREATE UNIQUE INDEX backups_pkey ON public.backups USING btree (backup_arn)",
+      "valid": true
+    },
+    "continuous_backups_pkey": {
+      "table": "continuous_backups",
+      "definition": "CREATE UNIQUE INDEX continuous_backups_pkey ON public.continuous_backups USING btree (account_id, table_name)",
+      "valid": true
+    },
+    "iam_group_members_pkey": {
+      "table": "iam_group_members",
+      "definition": "CREATE UNIQUE INDEX iam_group_members_pkey ON public.iam_group_members USING btree (account_id, group_name, user_name)",
+      "valid": true
+    },
+    "iam_groups_group_arn_key": {
+      "table": "iam_groups",
+      "definition": "CREATE UNIQUE INDEX iam_groups_group_arn_key ON public.iam_groups USING btree (group_arn)",
+      "valid": true
+    },
+    "iam_groups_pkey": {
+      "table": "iam_groups",
+      "definition": "CREATE UNIQUE INDEX iam_groups_pkey ON public.iam_groups USING btree (account_id, group_name)",
+      "valid": true
+    },
+    "iam_permissions_boundaries_pkey": {
+      "table": "iam_permissions_boundaries",
+      "definition": "CREATE UNIQUE INDEX iam_permissions_boundaries_pkey ON public.iam_permissions_boundaries USING btree (account_id, principal_type, principal_name)",
+      "valid": true
+    },
+    "iam_policies_pkey": {
+      "table": "iam_policies",
+      "definition": "CREATE UNIQUE INDEX iam_policies_pkey ON public.iam_policies USING btree (account_id, principal_type, principal_name, policy_name)",
+      "valid": true
+    },
+    "iam_role_tags_pkey": {
+      "table": "iam_role_tags",
+      "definition": "CREATE UNIQUE INDEX iam_role_tags_pkey ON public.iam_role_tags USING btree (account_id, role_name, tag_key)",
+      "valid": true
+    },
+    "iam_roles_pkey": {
+      "table": "iam_roles",
+      "definition": "CREATE UNIQUE INDEX iam_roles_pkey ON public.iam_roles USING btree (account_id, role_name)",
+      "valid": true
+    },
+    "iam_roles_role_arn_key": {
+      "table": "iam_roles",
+      "definition": "CREATE UNIQUE INDEX iam_roles_role_arn_key ON public.iam_roles USING btree (role_arn)",
+      "valid": true
+    },
+    "iam_sessions_access_key_id_key": {
+      "table": "iam_sessions",
+      "definition": "CREATE UNIQUE INDEX iam_sessions_access_key_id_key ON public.iam_sessions USING btree (access_key_id)",
+      "valid": true
+    },
+    "iam_sessions_pkey": {
+      "table": "iam_sessions",
+      "definition": "CREATE UNIQUE INDEX iam_sessions_pkey ON public.iam_sessions USING btree (session_token)",
+      "valid": true
+    },
+    "iam_user_tags_pkey": {
+      "table": "iam_user_tags",
+      "definition": "CREATE UNIQUE INDEX iam_user_tags_pkey ON public.iam_user_tags USING btree (account_id, user_name, tag_key)",
+      "valid": true
+    },
+    "iam_users_pkey": {
+      "table": "iam_users",
+      "definition": "CREATE UNIQUE INDEX iam_users_pkey ON public.iam_users USING btree (account_id, user_name)",
+      "valid": true
+    },
+    "iam_users_user_arn_key": {
+      "table": "iam_users",
+      "definition": "CREATE UNIQUE INDEX iam_users_user_arn_key ON public.iam_users USING btree (user_arn)",
+      "valid": true
+    },
+    "idempotency_tokens_pkey": {
+      "table": "idempotency_tokens",
+      "definition": "CREATE UNIQUE INDEX idempotency_tokens_pkey ON public.idempotency_tokens USING btree (token)",
+      "valid": true
+    },
+    "idx_backup_items_arn": {
+      "table": "backup_items",
+      "definition": "CREATE INDEX idx_backup_items_arn ON public.backup_items USING btree (backup_arn)",
+      "valid": true
+    },
+    "idx_backups_table": {
+      "table": "backups",
+      "definition": "CREATE INDEX idx_backups_table ON public.backups USING btree (account_id, table_name)",
+      "valid": true
+    },
+    "idx_idempotency_tokens_created": {
+      "table": "idempotency_tokens",
+      "definition": "CREATE INDEX idx_idempotency_tokens_created ON public.idempotency_tokens USING btree (created_at)",
+      "valid": true
+    },
+    "idx_login_attempts_principal_time": {
+      "table": "login_attempts",
+      "definition": "CREATE INDEX idx_login_attempts_principal_time ON public.login_attempts USING btree (principal, attempted_at DESC)",
+      "valid": true
+    },
+    "idx_login_attempts_source_ip_time": {
+      "table": "login_attempts",
+      "definition": "CREATE INDEX idx_login_attempts_source_ip_time ON public.login_attempts USING btree (source_ip, attempted_at DESC) WHERE (source_ip IS NOT NULL)",
+      "valid": true
+    },
+    "idx_metrics_bucket": {
+      "table": "metrics",
+      "definition": "CREATE INDEX idx_metrics_bucket ON public.metrics USING btree (bucket)",
+      "valid": true
+    },
+    "idx_stream_records_created": {
+      "table": "stream_records",
+      "definition": "CREATE INDEX idx_stream_records_created ON public.stream_records USING btree (created_at)",
+      "valid": true
+    },
+    "idx_stream_shards_table": {
+      "table": "stream_shards",
+      "definition": "CREATE INDEX idx_stream_shards_table ON public.stream_shards USING btree (table_id)",
+      "valid": true
+    },
+    "idx_table_restores_backup": {
+      "table": "table_restores",
+      "definition": "CREATE INDEX idx_table_restores_backup ON public.table_restores USING btree (source_backup_arn)",
+      "valid": true
+    },
+    "idx_tables_pending_transition": {
+      "table": "tables",
+      "definition": "CREATE INDEX idx_tables_pending_transition ON public.tables USING btree (status_transition_at) WHERE (status_transition_at IS NOT NULL)",
+      "valid": true
+    },
+    "idx_vector_indexes_index_id": {
+      "table": "vector_indexes",
+      "definition": "CREATE UNIQUE INDEX idx_vector_indexes_index_id ON public.vector_indexes USING btree (index_id)",
+      "valid": true
+    },
+    "indexes_pkey": {
+      "table": "indexes",
+      "definition": "CREATE UNIQUE INDEX indexes_pkey ON public.indexes USING btree (table_id, index_name)",
+      "valid": true
+    },
+    "metrics_pkey": {
+      "table": "metrics",
+      "definition": "CREATE UNIQUE INDEX metrics_pkey ON public.metrics USING btree (bucket, metric, table_name, index_name, operation)",
+      "valid": true
+    },
+    "schema_history_pkey": {
+      "table": "schema_history",
+      "definition": "CREATE UNIQUE INDEX schema_history_pkey ON public.schema_history USING btree (filename)",
+      "valid": true
+    },
+    "settings_pkey": {
+      "table": "settings",
+      "definition": "CREATE UNIQUE INDEX settings_pkey ON public.settings USING btree (key)",
+      "valid": true
+    },
+    "stream_records_pkey": {
+      "table": "stream_records",
+      "definition": "CREATE UNIQUE INDEX stream_records_pkey ON public.stream_records USING btree (shard_id, sequence_number)",
+      "valid": true
+    },
+    "stream_shards_pkey": {
+      "table": "stream_shards",
+      "definition": "CREATE UNIQUE INDEX stream_shards_pkey ON public.stream_shards USING btree (shard_id)",
+      "valid": true
+    },
+    "table_restores_pkey": {
+      "table": "table_restores",
+      "definition": "CREATE UNIQUE INDEX table_restores_pkey ON public.table_restores USING btree (table_id)",
+      "valid": true
+    },
+    "tables_pkey": {
+      "table": "tables",
+      "definition": "CREATE UNIQUE INDEX tables_pkey ON public.tables USING btree (account_id, table_name)",
+      "valid": true
+    },
+    "tables_table_id_unique": {
+      "table": "tables",
+      "definition": "CREATE UNIQUE INDEX tables_table_id_unique ON public.tables USING btree (table_id)",
+      "valid": true
+    },
+    "tags_pkey": {
+      "table": "tags",
+      "definition": "CREATE UNIQUE INDEX tags_pkey ON public.tags USING btree (resource_arn, tag_key)",
+      "valid": true
+    },
+    "vector_indexes_pkey": {
+      "table": "vector_indexes",
+      "definition": "CREATE UNIQUE INDEX vector_indexes_pkey ON public.vector_indexes USING btree (table_id, index_name)",
+      "valid": true
+    }
+  },
+  "constraints": {
+    "access_keys.access_keys_account_id_user_name_fkey": "FOREIGN KEY (account_id, user_name) REFERENCES iam_users(account_id, user_name) ON DELETE CASCADE",
+    "access_keys.access_keys_pkey": "PRIMARY KEY (access_key_id)",
+    "accounts.accounts_account_name_key": "UNIQUE (account_name)",
+    "accounts.accounts_pkey": "PRIMARY KEY (account_id)",
+    "admin_users.admin_users_pkey": "PRIMARY KEY (admin_name)",
+    "backup_definitions.backup_definitions_backup_arn_fkey": "FOREIGN KEY (backup_arn) REFERENCES backups(backup_arn) ON DELETE CASCADE",
+    "backup_definitions.backup_definitions_pkey": "PRIMARY KEY (backup_arn)",
+    "backup_items.backup_items_backup_arn_fkey": "FOREIGN KEY (backup_arn) REFERENCES backups(backup_arn) ON DELETE CASCADE",
+    "backups.backups_pkey": "PRIMARY KEY (backup_arn)",
+    "continuous_backups.continuous_backups_pkey": "PRIMARY KEY (account_id, table_name)",
+    "iam_group_members.iam_group_members_account_id_group_name_fkey": "FOREIGN KEY (account_id, group_name) REFERENCES iam_groups(account_id, group_name) ON DELETE CASCADE",
+    "iam_group_members.iam_group_members_account_id_user_name_fkey": "FOREIGN KEY (account_id, user_name) REFERENCES iam_users(account_id, user_name) ON DELETE CASCADE",
+    "iam_group_members.iam_group_members_pkey": "PRIMARY KEY (account_id, group_name, user_name)",
+    "iam_groups.iam_groups_account_id_fkey": "FOREIGN KEY (account_id) REFERENCES accounts(account_id) ON DELETE CASCADE",
+    "iam_groups.iam_groups_group_arn_key": "UNIQUE (group_arn)",
+    "iam_groups.iam_groups_pkey": "PRIMARY KEY (account_id, group_name)",
+    "iam_permissions_boundaries.iam_permissions_boundaries_account_id_fkey": "FOREIGN KEY (account_id) REFERENCES accounts(account_id) ON DELETE CASCADE",
+    "iam_permissions_boundaries.iam_permissions_boundaries_pkey": "PRIMARY KEY (account_id, principal_type, principal_name)",
+    "iam_permissions_boundaries.iam_permissions_boundaries_principal_type_check": "CHECK ((principal_type = ANY (ARRAY['user'::text, 'role'::text])))",
+    "iam_policies.iam_policies_account_id_fkey": "FOREIGN KEY (account_id) REFERENCES accounts(account_id) ON DELETE CASCADE",
+    "iam_policies.iam_policies_pkey": "PRIMARY KEY (account_id, principal_type, principal_name, policy_name)",
+    "iam_policies.iam_policies_principal_type_check": "CHECK ((principal_type = ANY (ARRAY['user'::text, 'group'::text, 'role'::text])))",
+    "iam_role_tags.iam_role_tags_account_id_role_name_fkey": "FOREIGN KEY (account_id, role_name) REFERENCES iam_roles(account_id, role_name) ON DELETE CASCADE",
+    "iam_role_tags.iam_role_tags_pkey": "PRIMARY KEY (account_id, role_name, tag_key)",
+    "iam_roles.iam_roles_account_id_fkey": "FOREIGN KEY (account_id) REFERENCES accounts(account_id) ON DELETE CASCADE",
+    "iam_roles.iam_roles_pkey": "PRIMARY KEY (account_id, role_name)",
+    "iam_roles.iam_roles_role_arn_key": "UNIQUE (role_arn)",
+    "iam_sessions.iam_sessions_access_key_id_key": "UNIQUE (access_key_id)",
+    "iam_sessions.iam_sessions_account_id_role_name_fkey": "FOREIGN KEY (account_id, role_name) REFERENCES iam_roles(account_id, role_name) ON DELETE CASCADE",
+    "iam_sessions.iam_sessions_pkey": "PRIMARY KEY (session_token)",
+    "iam_user_tags.iam_user_tags_account_id_user_name_fkey": "FOREIGN KEY (account_id, user_name) REFERENCES iam_users(account_id, user_name) ON DELETE CASCADE",
+    "iam_user_tags.iam_user_tags_pkey": "PRIMARY KEY (account_id, user_name, tag_key)",
+    "iam_users.iam_users_account_id_fkey": "FOREIGN KEY (account_id) REFERENCES accounts(account_id) ON DELETE CASCADE",
+    "iam_users.iam_users_pkey": "PRIMARY KEY (account_id, user_name)",
+    "iam_users.iam_users_user_arn_key": "UNIQUE (user_arn)",
+    "idempotency_tokens.idempotency_tokens_pkey": "PRIMARY KEY (token)",
+    "indexes.chk_propagation_delay_ms_non_negative": "CHECK (((propagation_delay_ms IS NULL) OR (propagation_delay_ms >= 0)))",
+    "indexes.indexes_pkey": "PRIMARY KEY (table_id, index_name)",
+    "indexes.indexes_table_id_fkey": "FOREIGN KEY (table_id) REFERENCES tables(table_id) ON DELETE CASCADE",
+    "metrics.metrics_pkey": "PRIMARY KEY (bucket, metric, table_name, index_name, operation)",
+    "schema_history.schema_history_pkey": "PRIMARY KEY (filename)",
+    "settings.settings_pkey": "PRIMARY KEY (key)",
+    "stream_records.stream_records_pkey": "PRIMARY KEY (shard_id, sequence_number)",
+    "stream_records.stream_records_shard_id_fkey": "FOREIGN KEY (shard_id) REFERENCES stream_shards(shard_id) ON DELETE CASCADE",
+    "stream_shards.stream_shards_pkey": "PRIMARY KEY (shard_id)",
+    "stream_shards.stream_shards_table_id_fkey": "FOREIGN KEY (table_id) REFERENCES tables(table_id) ON DELETE CASCADE",
+    "table_restores.table_restores_pkey": "PRIMARY KEY (table_id)",
+    "table_restores.table_restores_table_id_fkey": "FOREIGN KEY (table_id) REFERENCES tables(table_id) ON DELETE CASCADE",
+    "tables.tables_account_id_fkey": "FOREIGN KEY (account_id) REFERENCES accounts(account_id) ON DELETE CASCADE",
+    "tables.tables_pkey": "PRIMARY KEY (account_id, table_name)",
+    "tables.tables_table_id_unique": "UNIQUE (table_id)",
+    "tags.tags_pkey": "PRIMARY KEY (resource_arn, tag_key)",
+    "vector_indexes.chk_vector_active_has_no_backfilling": "CHECK (((index_status <> 'ACTIVE'::text) OR (backfilling IS NULL)))",
+    "vector_indexes.chk_vector_dimensions_positive": "CHECK ((dimensions > 0))",
+    "vector_indexes.vector_indexes_pkey": "PRIMARY KEY (table_id, index_name)",
+    "vector_indexes.vector_indexes_table_id_fkey": "FOREIGN KEY (table_id) REFERENCES tables(table_id) ON DELETE CASCADE"
+  },
+  "sequences": [
+    "stream_seq"
+  ]
+}

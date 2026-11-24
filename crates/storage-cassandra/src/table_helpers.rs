@@ -3,6 +3,8 @@
 
 //! Helper methods for `TableEngine` operations.
 
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use cdrs_tokio::types::{IntoRustByName, rows::Row};
 use extenddb_core::types::{
     BillingMode, BillingModeSummary, GsiDescription, LsiDescription,
@@ -10,7 +12,7 @@ use extenddb_core::types::{
     TableStatus,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{index_arn, stream_arn};
+use extenddb_storage::util::{index_arn, parse_warm_throughput_record, stream_arn};
 
 use crate::CassandraEngine;
 
@@ -34,7 +36,8 @@ impl CassandraEngine {
 
         let table_result = self
             .session
-            .query_with_values(
+            .run(
+                Stmt::Read,
                 &table_query,
                 cdrs_tokio::query_values!(account_id, table_name),
             )
@@ -63,7 +66,11 @@ impl CassandraEngine {
 
         let index_result = self
             .session
-            .query_with_values(&index_query, cdrs_tokio::query_values!(table_id.as_str()))
+            .run(
+                Stmt::Read,
+                &index_query,
+                cdrs_tokio::query_values!(table_id.as_str()),
+            )
             .await
             .map_err(|e| StorageError::Internal(format!("Query indexes failed: {e}")))?;
 
@@ -165,6 +172,9 @@ impl CassandraEngine {
             .ok()
             .flatten()
             .and_then(|s: String| serde_json::from_str(&s).ok());
+        // Added by catalog migration 9; null when the client never set it.
+        let warm_json: Option<String> = table_row.get_by_name("warm_throughput").ok().flatten();
+        let warm_throughput_record = parse_warm_throughput_record(warm_json.as_deref());
 
         // A restore target reports its registration for as long as the row
         // carries it; the engine shows it only while the table is CREATING.
@@ -218,6 +228,7 @@ impl CassandraEngine {
 
             if index_type == "GSI" {
                 let pt_str: Option<String> = row.get_r_by_name("provisioned_throughput").ok();
+                let warm_json: Option<String> = row.get_by_name("warm_throughput").ok().flatten();
 
                 gsis.push(GsiDescription {
                     index_name: index_name.clone(),
@@ -228,6 +239,8 @@ impl CassandraEngine {
                     index_size_bytes: 0,
                     item_count: 0,
                     index_arn: index_arn(&self.region, account_id, &table_name, &index_name),
+                    warm_throughput: None,
+                    warm_throughput_record: parse_warm_throughput_record(warm_json.as_deref()),
                 });
             } else {
                 lsis.push(LsiDescription {
@@ -301,6 +314,8 @@ impl CassandraEngine {
             on_demand_throughput,
             restore_summary,
             vector_indexes: None,
+            warm_throughput: None,
+            warm_throughput_record,
         })
     }
 }

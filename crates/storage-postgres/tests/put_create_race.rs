@@ -67,9 +67,22 @@ impl Scratch {
     }
 }
 
+/// The server's base URL, or `None` to skip. With `EXTENDDB_TEST_PG_REQUIRED`
+/// set to any value but `0`, a job that must reach a server fails here
+/// instead.
 fn base_conn() -> Option<String> {
-    let conn = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING").ok()?;
-    (!conn.trim().is_empty()).then(|| conn.trim_end_matches('/').to_owned())
+    let conn = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING").unwrap_or_default();
+    if conn.trim().is_empty() {
+        let required =
+            std::env::var("EXTENDDB_TEST_PG_REQUIRED").is_ok_and(|v| !v.is_empty() && v != "0");
+        assert!(
+            !required,
+            "EXTENDDB_TEST_PG_CONNECTION_STRING is not set, and EXTENDDB_TEST_PG_REQUIRED says \
+             this job must reach a PostgreSQL server"
+        );
+        return None;
+    }
+    Some(conn.trim_end_matches('/').to_owned())
 }
 
 /// Every `.sql` file under `migrations/` and `data_migrations/`, each
@@ -126,10 +139,13 @@ async fn scratch() -> Scratch {
             .await
             .expect("apply a shipped migration");
     }
-    sqlx::query("UPDATE settings SET value = '0' WHERE key = 'control_plane_delay_seconds'")
-        .execute(&db)
-        .await
-        .expect("pin the control-plane delay to zero");
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0') \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .execute(&db)
+    .await
+    .expect("pin the control-plane delay to zero");
     sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES ($1, $2)")
         .bind(ACCOUNT)
         .bind(format!("acct-{db_name}"))
@@ -831,6 +847,12 @@ async fn a_lost_create_race_gives_the_lsi_and_the_stream_the_winner() {
     .expect("read c");
     assert_eq!(v, "loser");
 
+    // A write leaves its stream record in stream_pending until a read or the
+    // numbering worker numbers it (#808). This test stands in for the worker.
+    s.engine
+        .number_pending_stream_records_for_tests()
+        .await
+        .expect("number the pending stream records");
     let records: Vec<(serde_json::Value,)> = sqlx::query_as(
         "SELECT record_data FROM stream_records WHERE table_id = $1 ORDER BY sequence_number",
     )
