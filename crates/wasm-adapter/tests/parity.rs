@@ -24,8 +24,11 @@
 //! builds with each other; a member a case does not check can differ between
 //! them without either run failing.
 //!
-//! `parity/run.mjs` checks what only a JavaScript caller can do: `submit` with
-//! arguments that are not strings, through the module `wasm-pack` emits.
+//! On wasm32 this test calls the Rust `ExtendDb::submit` directly, with string
+//! arguments, and does not load the module `wasm-pack build --target web`
+//! emits. `parity/run.mjs` is the only check of that module and of the
+//! `ExtendDb` class wasm-bindgen generates: it calls `submit` with arguments
+//! that are not strings, then a `ListTables`.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;

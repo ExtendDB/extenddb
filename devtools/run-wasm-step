@@ -340,8 +340,8 @@ case "$step" in
         run_suite corpus
 
         # Then the browser module, built with wasm-pack, which runs
-        # wasm-bindgen, and crates/wasm-adapter/parity/run.mjs, which checks
-        # through it what only a JavaScript caller can do with `submit`.
+        # wasm-bindgen, and crates/wasm-adapter/parity/run.mjs, the only check
+        # of that module and of the ExtendDb class wasm-bindgen generates.
         #
         # --mode no-install makes wasm-pack stop, rather than download or build
         # a wasm-bindgen, when it finds none of the version in Cargo.lock (the

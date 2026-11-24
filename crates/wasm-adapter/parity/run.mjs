@@ -4,16 +4,18 @@
 // run.mjs — the checks of `submit`'s JavaScript boundary.
 //
 // Loads the browser module that `wasm-pack build --target web` emits into
-// `./pkg` (built by devtools/run-wasm-step before this runs), under Node, and
-// checks what only a JavaScript caller can do: it calls `ExtendDb.create()`,
-// then `submit` with arguments that are not strings, expects a
-// ValidationException for each, and expects the instance to keep serving. It
-// makes no call on an object that is not a live instance: `submit` is defined
-// only on an object `ExtendDb.create()` returned and that has not been freed.
+// `./pkg` (built by devtools/run-wasm-step before this runs), under Node. It is
+// the only check of that module and of the `ExtendDb` class wasm-bindgen
+// generates for it: it calls `ExtendDb.create()`, then `submit` with
+// arguments that are not strings, expects a ValidationException for each, and
+// expects the instance to keep serving. It makes no call on an object that is
+// not a live instance: `submit` is defined only on an object
+// `ExtendDb.create()` returned and that has not been freed.
 //
 // The parity corpus (`./corpus.json`) is run by `../tests/parity.rs`, natively
-// and on wasm32 under wasm-bindgen-test; Rust passes only strings, so these
-// checks cannot be written there.
+// and on wasm32 under wasm-bindgen-test. On wasm32 that test calls the Rust
+// `ExtendDb::submit` directly, with string arguments, and does not load the
+// emitted module.
 //
 // Node-hosting note: a browser always defines `globalThis.crypto`, and Node 22
 // does; Node 18 does not define it in a file it runs, ES module or not, so
