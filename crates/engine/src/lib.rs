@@ -26,6 +26,7 @@ mod describe_endpoints;
 mod describe_limits;
 mod describe_table;
 mod expected;
+mod export_file;
 mod expression_helpers;
 mod get_item;
 mod gsi_updates;
