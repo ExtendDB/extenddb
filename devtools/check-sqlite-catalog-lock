@@ -14,6 +14,19 @@
 - once the database is free, migrate --yes and serve run;
 - on a catalog behind this binary, verify and the preview exit 3, and
   migrate --yes applies what is missing;
+- the startup policy on a catalog behind this binary: serve exits 3 and
+  names --migrate, and in daemon mode the invoking process exits 3 with the
+  message on its stderr; serve --migrate, catalog_upgrade = "apply" in the
+  config file, EXTENDDB__SERVER__CATALOG_UPGRADE=apply and serve --migrate in
+  daemon mode each apply the migration and serve; serve --migrate on a
+  current catalog adds no ledger row and takes no copy; on a catalog that
+  needs a person it exits 5 and the database's content (read through its
+  WAL) is unchanged; while another process holds the database's lock it
+  waits for catalog_upgrade_lock_timeout, 3 s here and not the 60 s default,
+  and exits 6;
+- two serve --migrate started together on a released catalog: the catalog
+  is migrated once, with one copy, exactly one of the two serves, and the
+  other finds nothing to apply or exits 6, and does not exit 1;
 - on a config whose database does not exist, migrate --yes exits 1, names
   extenddb init, and creates neither the database nor its directory.
 
@@ -22,14 +35,29 @@ it so its TLS certificate is not written to the caller's home. The server
 binds 127.0.0.1 only.
 """
 import fcntl
+import glob
 import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
+import time
 
-from catalog_checks import expect_exit, finish, healthy, report, run, start, stop
+from catalog_checks import (
+    expect_exit, finish, healthy, kill_daemon, pid_file, report, run, run_split, start, stop,
+)
+
+REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+RELEASED = os.path.join(REPO, "crates/storage-sqlite/tests/fixtures/released/dev-image-0.1.14.sql")
+MIGRATE_HINT = "or start this server with --migrate"
+NOTHING_TO_APPLY = "catalog migration: nothing to apply"
+COLLIDING = (
+    '{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"dynamodb:*",'
+    '"Resource":"*","Condition":{"StringEquals":{"aws:ResourceTag/env":"prod",'
+    '"dynamodb:ResourceTag/env":"dev"}}}]}'
+)
 
 
 def with_path(config: str, database: str, out: str) -> None:
@@ -40,14 +68,233 @@ def with_path(config: str, database: str, out: str) -> None:
         f.write(re.sub(r"(?m)^path = .*$", f'path = "{database}"', text))
 
 
+def with_server_line(config: str, line: str, out: str) -> None:
+    """Write `config` to `out` with `line` added to its [server] table."""
+    with open(config, encoding="utf-8") as f:
+        text = f.read()
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(re.sub(r"(?m)^\[server\]$", f"[server]\n{line}", text, count=1))
+    os.chmod(out, 0o600)
+
+
+def behind(database: str, first: int | None = None) -> None:
+    """Delete the catalog's last ledger row, or every row from id `first`
+    on, so the catalog is behind this binary."""
+    # The copy a run takes before it migrates is named by the second it is
+    # taken in and never replaced, so two runs from the same migration need
+    # a second between them.
+    time.sleep(1.1)
+    conn = sqlite3.connect(database)
+    if first is None:
+        conn.execute(
+            "DELETE FROM extenddb_migrations WHERE id = (SELECT MAX(id) FROM extenddb_migrations)"
+        )
+    else:
+        conn.execute("DELETE FROM extenddb_migrations WHERE id >= ?", (first,))
+    conn.commit()
+    conn.close()
+
+
+def ledger(database: str) -> list:
+    conn = sqlite3.connect(database)
+    rows = conn.execute("SELECT id, applied_at FROM extenddb_migrations ORDER BY id").fetchall()
+    conn.close()
+    return rows
+
+
+def copies(database: str) -> list:
+    return sorted(glob.glob(f"{glob.escape(database)}.pre-migration-*"))
+
+
+def content(database: str) -> list:
+    """The database's schema and rows as SQL. A connection reads through
+    the WAL, so a write a process left in `<db>-wal` shows here, where the
+    bytes of the main file would not change."""
+    conn = sqlite3.connect(database)
+    dump = list(conn.iterdump())
+    conn.close()
+    return dump
+
+
+def serves(cmd: list[str], env: dict | None, url: str, log: str, what: str, servers: list) -> bool:
+    """Start a foreground server, report whether it becomes healthy, and stop it."""
+    server = start(cmd, env, log)
+    servers.append(server)
+    up = healthy(url, server, 60)
+    stop(server)
+    with open(log, encoding="utf-8") as f:
+        return report(up, what, f.read())
+
+
+def startup_policy(binary: str, database: str, port: int, env: dict, servers: list) -> None:
+    """`serve`'s startup policy on catalogs behind this binary and on one
+    that is current, in the foreground and in daemon mode."""
+    url = f"https://127.0.0.1:{port}/health"
+    serve = [binary, "serve", "--config", "extenddb.toml", "--foreground", "--port", str(port)]
+    daemon = [binary, "serve", "--config", "extenddb.toml", "--port", str(port)]
+    daemon_pid = pid_file("extenddb.toml", env, port)
+    verify = [binary, "verify", "--config", "extenddb.toml"]
+
+    behind(database)
+    expect_exit(3, "serve on a catalog behind this binary", serve, env, contains=MIGRATE_HINT)
+    # The parent reads the status before it forks, so the code and the
+    # message reach the invoking shell.
+    code, out, err = run_split(daemon, env)
+    kill_daemon(daemon_pid, binary)
+    report(
+        code == 3 and MIGRATE_HINT in err,
+        f"exit {code}: serve in daemon mode on a catalog behind this binary, the message on stderr",
+        out + err,
+    )
+    serves(serve + ["--migrate"], env, url, "serve-migrate.log",
+           "serve --migrate applies the pending migration and serves", servers)
+    expect_exit(0, "verify after serve --migrate", verify, env, contains="OK: Current")
+
+    behind(database)
+    with_server_line("extenddb.toml", 'catalog_upgrade = "apply"', "apply.toml")
+    serves([binary, "serve", "--config", "apply.toml", "--foreground", "--port", str(port)], env, url,
+           "serve-apply.log", 'catalog_upgrade = "apply" applies the pending migration and serves',
+           servers)
+    expect_exit(0, 'verify after catalog_upgrade = "apply"', verify, env, contains="OK: Current")
+
+    behind(database)
+    serves(serve, dict(env, EXTENDDB__SERVER__CATALOG_UPGRADE="apply"), url, "serve-env.log",
+           "EXTENDDB__SERVER__CATALOG_UPGRADE=apply applies the pending migration and serves", servers)
+    expect_exit(0, "verify after EXTENDDB__SERVER__CATALOG_UPGRADE=apply", verify, env,
+                contains="OK: Current")
+
+    # Daemon mode applies before it forks, reporting progress on stderr.
+    behind(database)
+    code, out, err = run_split(daemon + ["--migrate"], env)
+    up = code == 0 and healthy(url, None, 30)
+    expect_exit(0, "stop the daemon", [binary, "stop", "--config", "extenddb.toml", "--port", str(port)], env)
+    kill_daemon(daemon_pid, binary)
+    report(
+        up and "catalog migration: applied " in err,
+        f"exit {code}: serve --migrate in daemon mode applies before it forks and serves",
+        out + err,
+    )
+    expect_exit(0, "verify after serve --migrate in daemon mode", verify, env, contains="OK: Current")
+
+    # A current catalog: serve --migrate adds no ledger row and takes no
+    # copy. The server it starts writes to the database as any server does,
+    # so the rest of the content is not compared here.
+    rows, taken = ledger(database), copies(database)
+    serves(serve + ["--migrate"], env, url, "serve-current.log",
+           "serve --migrate on a current catalog serves", servers)
+    report(ledger(database) == rows and copies(database) == taken,
+           "serve --migrate on a current catalog added no ledger row and took no copy")
+
+    # A catalog that needs a person: exit 5, and nothing written.
+    behind(database, first=2)
+    conn = sqlite3.connect(database)
+    account = conn.execute("SELECT account_id FROM accounts LIMIT 1").fetchone()[0]
+    conn.execute(
+        "INSERT INTO iam_users (account_id, user_name, user_arn) VALUES (?, 'collider', ?)",
+        (account, f"arn:aws:iam::{account}:user/collider"),
+    )
+    conn.execute(
+        "INSERT INTO iam_policies (account_id, principal_type, principal_name, policy_name, "
+        "policy_document) VALUES (?, 'user', 'collider', 'colliding', ?)",
+        (account, COLLIDING),
+    )
+    conn.commit()
+    conn.close()
+    before = content(database)
+    expect_exit(5, "serve --migrate on a catalog that needs a person", serve + ["--migrate"], env,
+                contains="needs a person")
+    report(content(database) == before and copies(database) == taken,
+           "serve --migrate on a catalog that needs a person left its content as it was and took no copy")
+    conn = sqlite3.connect(database)
+    conn.execute("DELETE FROM iam_policies WHERE policy_name = 'colliding'")
+    conn.execute("DELETE FROM iam_users WHERE user_name = 'collider'")
+    conn.commit()
+    conn.close()
+    expect_exit(0, "migrate --yes once the collision is gone",
+                [binary, "migrate", "--config", "extenddb.toml", "--yes", "--lock-timeout", "5"], env)
+
+    # Another process holds the database's lock: serve --migrate waits for
+    # catalog_upgrade_lock_timeout, then exits 6. Under 30 s tells the 3 s
+    # set here from the 60 s default.
+    behind(database)
+    holder = open(os.path.realpath(database) + ".lock", "a+b")
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    started = time.monotonic()
+    expect_exit(6, "serve --migrate while another process holds the database's lock",
+                serve + ["--migrate"], dict(env, EXTENDDB__SERVER__CATALOG_UPGRADE_LOCK_TIMEOUT="3"),
+                contains="another extenddb process")
+    waited = time.monotonic() - started
+    report(3 <= waited < 30, f"serve --migrate waited {waited:.1f} s for the lock, its 3 s timeout")
+    fcntl.flock(holder, fcntl.LOCK_UN)
+    holder.close()
+    expect_exit(0, "migrate --yes once the lock is free",
+                [binary, "migrate", "--config", "extenddb.toml", "--yes", "--lock-timeout", "5"], env)
+
+
+def two_servers(binary: str, work: str, port: int, env: dict, servers: list) -> None:
+    """Two serve --migrate started together on a released catalog: one of
+    them migrates it, with one copy, and exactly one of them serves. The
+    other finds nothing to apply, or exits 6 when it registers while the
+    first holds the database's lock. It does not exit 1, which is how a run
+    that collided with the first on the copy's name stops."""
+    database = os.path.join(work, "released.sqlite")
+    conn = sqlite3.connect(database)
+    with open(RELEASED, encoding="utf-8") as f:
+        conn.executescript(f.read())
+    conn.commit()
+    conn.close()
+    os.chmod(database, 0o600)
+    with_path("extenddb.toml", database, "released.toml")
+    lock_timeout_env = dict(env, EXTENDDB__SERVER__CATALOG_UPGRADE_LOCK_TIMEOUT="10")
+    ports = (port, port + 1)
+    procs = []
+    for i, p in enumerate(ports):
+        cmd = [binary, "serve", "--config", "released.toml", "--foreground", "--migrate", "--port", str(p)]
+        proc = start(cmd, lock_timeout_env, f"two-{i}.log")
+        servers.append(proc)
+        procs.append(proc)
+    up = [healthy(f"https://127.0.0.1:{p}/health", proc, 60) for p, proc in zip(ports, procs)]
+    # The one that does not serve has exited, or exits once its wait for
+    # the lock ends; -1 when it is still running after that.
+    codes = []
+    for serving, proc in zip(up, procs):
+        try:
+            codes.append(None if serving else proc.wait(timeout=30))
+        except subprocess.TimeoutExpired:
+            codes.append(-1)
+    logs = []
+    for i, proc in enumerate(procs):
+        stop(proc)
+        with open(f"two-{i}.log", encoding="utf-8") as f:
+            logs.append(f.read())
+    both = "\n---\n".join(logs)
+    report(up.count(True) == 1, f"one of two serve --migrate serves ({up.count(True)} did)", both)
+    for p, serving, code, log in zip(ports, up, codes, logs):
+        if serving:
+            continue
+        found = NOTHING_TO_APPLY in log
+        report(
+            code not in (1, -1) and (found or code == 6),
+            f"the serve --migrate on port {p} that does not serve exited {code}, "
+            f"{'with' if found else 'without'} {NOTHING_TO_APPLY!r} in its log",
+            log,
+        )
+    applied = [log for log in logs if "catalog migration: applied 1 baseline" in log]
+    report(len(applied) == 1, f"one of two serve --migrate applied the migrations ({len(applied)} did)", both)
+    report(len(copies(database)) == 1, "the released catalog was copied once", "\n".join(copies(database)))
+    expect_exit(0, "verify after two serve --migrate", [binary, "verify", "--config", "released.toml"], env,
+                contains="OK: Current")
+
+
 def main(binary: str, port: int) -> int:
     binary = os.path.realpath(binary)
     work = tempfile.mkdtemp()
     servers = []
     holder = None
+    env = dict(os.environ, HOME=os.path.join(work, "home"))
+    daemon_pid = pid_file(os.path.join(work, "extenddb.toml"), env, port)
     try:
         os.chdir(work)
-        env = dict(os.environ, HOME=os.path.join(work, "home"))
         database = os.path.join(work, "db.sqlite")
         code, output = run(
             [binary, "init", "--backend", "sqlite", "--config", "extenddb.toml",
@@ -107,6 +354,9 @@ def main(binary: str, port: int) -> int:
         expect_exit(3, "migrate preview on a catalog behind this binary", migrate)
         expect_exit(0, "migrate --yes applies what is missing", migrate + ["--yes", "--lock-timeout", "5"])
 
+        startup_policy(binary, database, port, env, servers)
+        two_servers(binary, work, port, env, servers)
+
         # A config whose database does not exist: migrate --yes refuses with
         # 1, names init, and creates neither the database nor its directory.
         missing = os.path.join(work, "missing")
@@ -122,6 +372,7 @@ def main(binary: str, port: int) -> int:
     finally:
         for server in servers:
             stop(server)
+        kill_daemon(daemon_pid, binary)
         if holder is not None:
             holder.close()
         os.chdir("/")

@@ -50,11 +50,21 @@ calls in an async function (top-level `await` is ESM-only).
 | `dbPath` | data dir | SQLite file location (file mode only). |
 | `port` | ephemeral | Fixed port instead of an OS-assigned one. |
 | `binary` | bundled | Path to an `extenddb` binary of this package's release, overriding the bundled one. |
-| `startupTimeoutMs` | `15000` | The time budget of `start()`, shared by the binary's version check and the wait for the server to become healthy. A health probe in flight at the deadline can add up to 1 s. |
+| `startupTimeoutMs` | `15000` | The time budget of `start()`, shared by the binary's version check and the wait for the server to become healthy, counted from launch, or from the last catalog migration line the server prints if that is later. The server prints one every 5 s while it migrates, so a value under 5000 can give up during a migration. A health probe in flight at the deadline can add up to 1 s. |
+| `onProgress` | none | A function called with each catalog migration line the server prints on stderr while it starts. `extenddb start` writes these lines to its stderr. |
 
 The returned object carries `endpoint`, `port`, `credentials`, `region`,
 `storage`, and `stop()`, which shuts the server down and resolves when the
 process has exited.
+
+When the server does not become healthy, `start()` stops it and rejects. If
+the server exited first, the error's `exitCode` and `signal` are the server's,
+and `extenddb start` exits with the server's exit code.
+
+In file mode, when an older release created the database, the server migrates
+it before serving it. Before its first change it copies the database to
+`<db>.pre-migration-<from>-to-<to>-<time>` in the same directory, `.extenddb/`
+for the default path. Nothing removes the copy.
 
 `start()` runs only a binary of this package's release. It looks for the
 binary in the `binary` option, then `EXTENDDB_BINARY`, then the platform

@@ -311,7 +311,7 @@ async fn the_stores_under_the_migration_lock_check_its_lease() {
     .await
     .expect("lock");
     let held = held_lock_for_tests(held, target);
-    let stores = MongoCatalogMigrations
+    let stores = MongoCatalogMigrations::new()
         .locked_stores(&held, None)
         .await
         .expect("the stores under the lock");
@@ -348,7 +348,7 @@ async fn the_stores_under_the_migration_lock_check_its_lease() {
         .await
         .unwrap();
 
-    MongoCatalogMigrations.release(held).await;
+    MongoCatalogMigrations::new().release(held).await;
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     assert!(stores.settings().get_setting("catalog_id").await.is_err());
     drop(stores);

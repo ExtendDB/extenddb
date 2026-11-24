@@ -33,6 +33,10 @@ pub struct Advice<'a> {
     /// store wherever it runs and whatever `extenddb.toml` the directory
     /// holds.
     pub assignment: Option<&'a str>,
+    /// The message is a server's refusal: for a catalog behind the binary
+    /// it also names `serve --migrate`, which applies the migrations at
+    /// startup.
+    pub serving: bool,
 }
 
 impl Advice<'_> {
@@ -101,6 +105,7 @@ pub struct AdviceFor {
     backup: String,
     config: Option<String>,
     assignment: Option<String>,
+    serving: bool,
 }
 
 impl AdviceFor {
@@ -133,7 +138,15 @@ impl AdviceFor {
                     })
                 })
                 .and_then(|m| m.location_assignment(target)),
+            serving: false,
         }
+    }
+
+    /// The advice for a server's refusal ([`Advice::serving`]).
+    #[must_use]
+    pub fn for_server(mut self) -> Self {
+        self.serving = true;
+        self
     }
 
     /// The advice, borrowing these values.
@@ -145,6 +158,7 @@ impl AdviceFor {
             backup: &self.backup,
             config: self.config.as_deref(),
             assignment: self.assignment.as_deref(),
+            serving: self.serving,
         }
     }
 }
@@ -174,14 +188,18 @@ pub fn status_message(status: &CatalogStatus, advice: &Advice<'_>) -> String {
                      is not detected while it runs.",
                 ),
             };
-            format!(
+            let mut message = format!(
                 "{at}, and ExtendDB {release} needs migration {latest}.\n{}\n{stop}\n{backup}, \
                  then run:\n{}",
                 pending_line(pending),
                 advice.command("--yes"),
                 release = advice.release,
                 backup = capitalized(advice.backup),
-            )
+            );
+            if advice.serving {
+                message.push_str("\nor start this server with --migrate.");
+            }
+            message
         }
         // `init --config <file>` refuses a config file that exists, and this
         // catalog was found through one, so the command is named alone.
@@ -291,7 +309,7 @@ pub fn stores_label(pending: &Pending, stores: usize) -> String {
 
 /// `Pending (all breaking): 2 name (catalog), ...`, or each kind beside its
 /// migration when the kinds differ.
-fn pending_line(pending: &[Pending]) -> String {
+pub(crate) fn pending_line(pending: &[Pending]) -> String {
     let groups = grouped(pending);
     let same = groups.windows(2).all(|w| w[0].0.kind == w[1].0.kind);
     let items: Vec<String> = groups
@@ -329,6 +347,7 @@ mod tests {
         backup: "back up the SQLite database file /var/lib/extenddb/extenddb.sqlite",
         config: Some("/etc/extenddb/extenddb.toml"),
         assignment: None,
+        serving: false,
     };
 
     fn pending(kind: Kind) -> Vec<Pending> {
@@ -372,6 +391,48 @@ mod tests {
             message.ends_with("  extenddb migrate --config /etc/extenddb/extenddb.toml --yes"),
             "{message}"
         );
+    }
+
+    /// A server's refusal of a catalog behind it ends with the other way to
+    /// apply the migrations, starting the server with `--migrate`. `migrate`
+    /// and `verify` print the same message without that line.
+    #[test]
+    fn a_server_refusing_a_catalog_behind_it_names_migrate() {
+        let status = CatalogStatus::Behind {
+            version: Some(1),
+            pending: pending(Kind::Breaking),
+        };
+        let serving = Advice {
+            serving: true,
+            ..ADVICE
+        };
+        let message = status_message(&status, &serving);
+        assert!(
+            message.ends_with(
+                "\n  extenddb migrate --config /etc/extenddb/extenddb.toml --yes\nor start this \
+                 server with --migrate."
+            ),
+            "{message}"
+        );
+        assert!(!status_message(&status, &ADVICE).contains("--migrate"));
+        // Only a catalog behind the binary can be migrated at startup: every
+        // other refusal is the same for a server.
+        let attention = CatalogStatus::NeedsAttention {
+            items: vec!["migration 2: a collision".to_owned()],
+        };
+        assert_eq!(
+            status_message(&attention, &serving),
+            status_message(&attention, &ADVICE)
+        );
+        let shown = super::AdviceFor::new(
+            "1.0.1",
+            "/srv/x.sqlite".to_owned(),
+            None,
+            &crate::migrations::Target::at("/srv/x.sqlite"),
+            Some("/etc/extenddb/extenddb.toml"),
+        );
+        assert!(!shown.advice().serving);
+        assert!(shown.for_server().advice().serving);
     }
 
     #[test]

@@ -231,6 +231,10 @@ pub(crate) fn generate_config(
     let tls_cert = extenddb_config::expand_tilde("~/.extenddb/tls/cert.pem");
     let tls_key = extenddb_config::expand_tilde("~/.extenddb/tls/key.pem");
     let run_dir = extenddb_config::expand_tilde("~/.extenddb/run");
+    // `refuse`, or `apply` in a dev build.
+    let catalog_upgrade = extenddb_config::ServerConfig::default()
+        .catalog_upgrade
+        .as_str();
 
     // Compute docs_dir line before the template so it lands in the top-level
     // TOML section (before any [section] header).
@@ -270,6 +274,8 @@ bind_addr = "{bind_addr}"
 # run_dir = "{run_dir}"          # Directory for PID file
 # throttling_enabled = false     # Enable provisioned throughput throttling
 # request_timeout_secs = 30      # Close a connection whose headers or body stall this long (1 to 86400)
+# catalog_upgrade = "{catalog_upgrade}"     # "apply" migrates a catalog behind this binary at startup
+# catalog_upgrade_lock_timeout = 60  # Seconds serve waits for the migration lock under "apply"
 
 [server.tls]
 # TLS is mandatory. The server refuses to start with enabled = false.

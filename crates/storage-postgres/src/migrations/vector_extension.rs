@@ -95,8 +95,8 @@ pub async fn try_create_vector_extension(
             failures.push(format!("as the application role: {e}"));
             format!(
                 "NOTICE: could not create the pgvector extension ({}). Vector indexes are \
-                 unavailable until it is installed; pass --pg-user with a role that may create \
-                 it to retry.",
+                 unavailable until it is installed; to retry, run extenddb migrate --yes \
+                 --pg-user <role> with a role that may create it.",
                 failures.join("; ")
             )
         }

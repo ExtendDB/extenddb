@@ -5,10 +5,10 @@
 
 const { execFile, spawn } = require("node:child_process");
 const net = require("node:net");
-const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 const fs = require("node:fs");
+const { waitForStartup } = require("./startup.js");
 
 // The launcher and its platform packages are published together at this
 // version, and the launcher runs only a binary of the same release.
@@ -111,35 +111,6 @@ function freePort() {
       srv.close((err) => (err ? reject(err) : resolve(port)));
     });
     srv.on("error", reject);
-  });
-}
-
-// Probe /health until it answers 200 or the clock passes `deadline` (a
-// Date.now() value). The function compares the deadline with the clock and
-// never gives it to a timer, so a deadline of any size works.
-function waitHealthy(endpoint, deadline, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    const probe = () => {
-      const req = http.get(`${endpoint}/health`, (res) => {
-        res.resume();
-        if (res.statusCode === 200) return resolve();
-        retry();
-      });
-      req.on("error", retry);
-      req.setTimeout(1000, () => {
-        req.destroy();
-        retry();
-      });
-    };
-    const retry = () => {
-      if (Date.now() > deadline) {
-        return reject(
-          new Error(`extenddb did not become healthy within the ${timeoutMs}ms startup timeout`)
-        );
-      }
-      setTimeout(probe, 100);
-    };
-    probe();
   });
 }
 
@@ -265,6 +236,22 @@ function checkBinaryVersion(binary, env, cwd, deadline, timeoutMs) {
 }
 
 /**
+ * Stop `child`: SIGTERM, then SIGKILL after 5 s. Resolves once it has
+ * exited, at once when it never started or has already exited.
+ */
+function stopChild(child) {
+  return new Promise((resolve) => {
+    if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) {
+      resolve();
+      return;
+    }
+    child.once("exit", () => resolve());
+    child.kill("SIGTERM");
+    setTimeout(() => child.kill("SIGKILL"), 5000).unref();
+  });
+}
+
+/**
  * Start an ExtendDB dev server.
  *
  * @param {object} [options]
@@ -277,20 +264,28 @@ function checkBinaryVersion(binary, env, cwd, deadline, timeoutMs) {
  *   launcher's own release.
  * @param {number} [options.startupTimeoutMs]  The time budget of start(),
  *   shared by the binary's version check and the wait for the server to
- *   become healthy (default 15000). A health probe in flight at the deadline
- *   can add up to 1 s.
+ *   become healthy (default 15000), counted from the start or from the last
+ *   catalog migration line the server printed, whichever is later. A health
+ *   probe in flight at the deadline can add up to 1 s.
+ * @param {(line: string) => void} [options.onProgress]  Called with each
+ *   catalog migration line the server prints on stderr while it starts.
  * @returns {Promise<{endpoint: string, port: number, credentials: object,
  *                    region: string, storage: string, stop: () => Promise<void>}>}
+ *   Rejects when the server does not become healthy, after stopping it.
+ *   When the server exited first, the error's `exitCode` and `signal` are
+ *   the server's.
  */
 async function start(options = {}) {
   // One deadline for the whole start. The version check and the health wait
-  // share it, so start() takes about one startupTimeoutMs: a health probe in
-  // flight at the deadline can add up to its 1 s timeout. Number() reads a
+  // share it, so start() takes about one startupTimeoutMs when the server
+  // prints no catalog migration line; each one restarts the wait. A health
+  // probe in flight at the deadline can add up to its 1 s timeout. Number() reads a
   // numeric string such as "20000" as that many ms. A fraction, Infinity or a value
   // above 2^31-1 works because start() compares the deadline with the clock
   // and gives a timer only a clamped delay.
   const timeoutMs = Number(options.startupTimeoutMs ?? 15000);
-  const deadline = Date.now() + timeoutMs;
+  const startedAt = Date.now();
+  const deadline = startedAt + timeoutMs;
   const binary = resolveBinary(options.binary);
   const port = options.port ?? (await freePort());
   const { sqlitePath, description } = resolveStorage(options);
@@ -309,10 +304,6 @@ async function start(options = {}) {
     cwd,
     stdio: ["ignore", "ignore", "pipe"],
   });
-  let stderrTail = "";
-  child.stderr.on("data", (d) => {
-    stderrTail = (stderrTail + d.toString()).slice(-4000);
-  });
 
   const endpoint = `http://127.0.0.1:${port}`;
   const spawned = new Promise((_, reject) => {
@@ -323,23 +314,28 @@ async function start(options = {}) {
       }
       reject(err);
     });
-    child.on("exit", (code) =>
-      reject(new Error(`extenddb exited during startup (code ${code}): ${stderrTail}`))
-    );
   });
-  // The health wait gets the time the version check left.
-  await Promise.race([waitHealthy(endpoint, deadline, timeoutMs), spawned]);
-  child.removeAllListeners("exit");
+  // A dev server migrates an existing database before it serves; the
+  // timeout restarts at each progress line. The first wait gets the time
+  // the version check left.
+  try {
+    await Promise.race([
+      waitForStartup(child, endpoint, timeoutMs, options.onProgress, startedAt),
+      spawned,
+    ]);
+  } catch (err) {
+    // The caller gets no handle to a server that failed to start, and one
+    // left running would go on migrating and then serve on its port.
+    await stopChild(child);
+    throw err;
+  }
 
   let stopped = false;
-  const stop = () =>
-    new Promise((resolve) => {
-      if (stopped || child.exitCode !== null) return resolve();
-      stopped = true;
-      child.once("exit", () => resolve());
-      child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 5000).unref();
-    });
+  const stop = () => {
+    if (stopped) return Promise.resolve();
+    stopped = true;
+    return stopChild(child);
+  };
   // Best effort: do not outlive the caller.
   process.once("exit", () => child.kill("SIGKILL"));
 

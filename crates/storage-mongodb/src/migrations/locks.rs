@@ -31,6 +31,7 @@
 //! own first and then looks for the other, so two that start together
 //! cannot both miss each other.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -250,7 +251,8 @@ pub struct MigrationLock {
     token: String,
     lease: Arc<Lease>,
     renewal: JoinHandle<()>,
-    released: bool,
+    /// Set by the first release, so a later one and `Drop` do nothing.
+    released: AtomicBool,
 }
 
 impl MigrationLock {
@@ -285,7 +287,7 @@ impl MigrationLock {
                     token,
                     lease,
                     renewal,
-                    released: false,
+                    released: AtomicBool::new(false),
                 });
             }
             if started.elapsed() >= timeout {
@@ -344,9 +346,19 @@ impl MigrationLock {
     }
 
     /// Delete the lock document if this process still owns it.
-    pub async fn release(mut self) {
+    pub async fn release(self) {
+        self.release_held().await;
+    }
+
+    /// [`MigrationLock::release`] for a caller that holds the lock behind a
+    /// shared reference, as the commands' `HeldLock` does: the delete goes
+    /// through this lock's own client, on the caller's runtime. Only the
+    /// first call deletes, and `Drop` then does nothing.
+    pub(crate) async fn release_held(&self) {
         self.renewal.abort();
-        self.released = true;
+        if self.released.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let _ = tokio::time::timeout(
             REQUEST_TIMEOUT,
             self.settings
@@ -358,9 +370,9 @@ impl MigrationLock {
     /// Stop renewing and keep the document, as a process that was killed
     /// does: the lock then ends when its lease does.
     #[cfg(feature = "test-util")]
-    pub fn abandon(mut self) {
+    pub fn abandon(self) {
         self.renewal.abort();
-        self.released = true;
+        self.released.store(true, Ordering::SeqCst);
     }
 }
 
@@ -371,7 +383,7 @@ impl Drop for MigrationLock {
     /// on a thread of its own with a client of its own.
     fn drop(&mut self) {
         self.renewal.abort();
-        if self.released {
+        if *self.released.get_mut() {
             return;
         }
         let target = self.target.clone();

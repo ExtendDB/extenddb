@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """What the catalog check scripts share: running a command with a time limit,
 checking its exit code, reporting each check, and starting and stopping a
-server.
+server, in the foreground or in daemon mode.
 
 devtools/check-sqlite-catalog-lock, check-sqlite-older-binary,
 check-postgres-catalog-lock, check-postgres-older-binary,
@@ -17,6 +17,7 @@ import os
 import signal
 import subprocess
 import time
+import tomllib
 
 failures = 0
 
@@ -53,6 +54,17 @@ def run(cmd: list[str], env: dict | None = None, timeout: float = 90, cwd: str |
     return done.returncode, done.stdout + done.stderr
 
 
+def run_split(cmd: list[str], env: dict | None, timeout: float = 120) -> tuple[int, str, str]:
+    """Run `cmd` and return its exit code, stdout and stderr apart. A
+    command still running after `timeout` seconds is killed, and its code
+    is -1."""
+    try:
+        done = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as e:
+        return -1, _text(e.stdout), f"still running after {timeout:g} s\n{_text(e.stderr)}"
+    return done.returncode, done.stdout, done.stderr
+
+
 def expect_exit(
     want: int,
     what: str,
@@ -80,7 +92,11 @@ def healthy(url: str, proc: subprocess.Popen | None = None, seconds: float = 60)
     while time.monotonic() < deadline:
         if proc is not None and proc.poll() is not None:
             return False
-        probe = subprocess.run(["curl", "-sk", url], capture_output=True, text=True, check=False)
+        # A port that is bound but not accepting holds curl for its 300 s
+        # connect timeout, so each probe has its own limit.
+        probe = subprocess.run(
+            ["curl", "-sk", "--max-time", "2", url], capture_output=True, text=True, check=False
+        )
         if "healthy" in probe.stdout:
             return True
         time.sleep(0.5)
@@ -124,6 +140,57 @@ def stop(proc: subprocess.Popen) -> None:
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
+
+
+def pid_file(config: str, env: dict, port: int) -> str:
+    """The PID file of a daemon started with `config`, `env` and
+    `--port port`: <run_dir>/extenddb-<port>.pid, where run_dir is
+    EXTENDDB__SERVER__RUN_DIR, else `[server] run_dir` in `config`, else
+    ~/.extenddb/run, and ~ is env's HOME."""
+    run_dir = env.get("EXTENDDB__SERVER__RUN_DIR")
+    if not run_dir:
+        try:
+            with open(config, "rb") as f:
+                run_dir = tomllib.load(f).get("server", {}).get("run_dir")
+        except (OSError, tomllib.TOMLDecodeError):
+            run_dir = None
+    run_dir = run_dir or "~/.extenddb/run"
+    if run_dir == "~" or run_dir.startswith("~/"):
+        run_dir = env.get("HOME", os.path.expanduser("~")) + run_dir[1:]
+    return os.path.join(run_dir, f"extenddb-{port}.pid")
+
+
+def _command_line(pid: int) -> str:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read().replace(b"\0", b" ").decode("utf-8", "replace")
+    except OSError:
+        done = subprocess.run(["ps", "-p", str(pid), "-o", "args="], capture_output=True, text=True, check=False)
+        return done.stdout
+
+
+def kill_daemon(path: str, binary: str) -> None:
+    """Stop the daemon whose PID file is `path`, when one is running
+    `binary`: SIGTERM, then SIGKILL after 30 s. A daemon is not one of the
+    processes `start` started, and one left running would hold its port,
+    and on SQLite the database's lock, after the script ends."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            pid = int(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return
+    # A PID file left behind can name a process that reused the PID.
+    command = _command_line(pid)
+    if binary not in command or " serve" not in command:
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(60):
+            time.sleep(0.5)
+            os.kill(pid, 0)
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 def with_filesystem_store(config: str, work: str) -> tuple[str, str]:

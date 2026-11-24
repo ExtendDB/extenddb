@@ -186,7 +186,7 @@ async fn check_migrations(
 
     println!("--- Checking catalog migrations...");
     let location = app_config.storage.connection_config();
-    let key_source = match crate::util::status_key_source(app_config) {
+    let key_source = match crate::util::status_key_source(app_config, true) {
         Ok(key_source) => key_source,
         Err(e) => {
             println!("  FAIL: {e:#}");

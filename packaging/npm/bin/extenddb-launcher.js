@@ -54,6 +54,9 @@ async function main() {
     }
   }
 
+  // A server that migrates its database before it serves says so on
+  // stderr; show those lines while the start waits.
+  opts.onProgress = (line) => process.stderr.write(`${line}\n`);
   const eb = await start(opts);
   console.log(`ExtendDB dev server ready`);
   console.log(`  endpoint:   ${eb.endpoint}`);
@@ -71,5 +74,7 @@ async function main() {
 
 main().catch((err) => {
   console.error(err.message);
-  process.exit(1);
+  // The server's own code tells a caller what to do: 5 needs a person, 6
+  // means try again.
+  process.exit(Number.isInteger(err.exitCode) && err.exitCode !== 0 ? err.exitCode : 1);
 });
