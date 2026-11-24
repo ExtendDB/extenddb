@@ -335,17 +335,6 @@ pub(crate) fn validate_put_delete_return_values(
     Ok(())
 }
 
-/// The service's refusal of a request that fails the constraints `clauses`
-/// state, one clause for each constraint.
-fn validation_failure(clauses: &[String]) -> DynamoDbError {
-    let count = clauses.len();
-    DynamoDbError::ValidationException(format!(
-        "{count} validation error{} detected: {}",
-        if count == 1 { "" } else { "s" },
-        clauses.join("; ")
-    ))
-}
-
 /// The clause for a member at `path` that the request does not carry.
 pub(crate) fn null_clause(path: &str) -> String {
     format!("Value null at '{path}' failed to satisfy constraint: Member must not be null")
@@ -370,7 +359,9 @@ pub(crate) fn require_members(
     if clauses.is_empty() {
         Ok(())
     } else {
-        Err(validation_failure(&clauses))
+        Err(DynamoDbError::ValidationException(
+            extenddb_core::error::validation_errors_detected(&clauses),
+        ))
     }
 }
 
