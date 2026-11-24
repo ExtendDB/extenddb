@@ -456,10 +456,10 @@ fn a_number_is_listed_as_the_decimal_it_reads_as() {
 #[test]
 fn the_set_tokens_list_the_assignments_and_the_calls() {
     let tokens = SetTokens::read(
-        "UPDATE \"t\" SET a = upper(m), ss = set_add(ss, <<'b'>>) REMOVE r SET b = \
-         coalesce(m, 1) WHERE pk = size(x)",
+        "UPDATE \"t\" SET a = \"upper\"(m), ss = set_add(ss, <<'b'>>) REMOVE r SET b = \
+         coalesce(m, 1), c = \"COUNT\"(m) WHERE pk = size(x)",
     );
-    assert_eq!(tokens.members, vec![false, true, false]);
+    assert_eq!(tokens.members, vec![false, true, false, false]);
     let calls: Vec<(&str, &str, &str)> = tokens
         .calls
         .iter()
@@ -468,8 +468,9 @@ fn the_set_tokens_list_the_assignments_and_the_calls() {
     assert_eq!(
         calls,
         vec![
-            ("upper", "1:20:5", "1:25:1"),
-            ("coalesce", "1:73:8", "1:81:1")
+            ("upper", "1:20:7", "1:27:1"),
+            ("coalesce", "1:75:8", "1:83:1"),
+            ("\"COUNT\"", "1:95:7", "1:102:1")
         ]
     );
 }

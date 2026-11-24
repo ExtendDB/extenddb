@@ -86,6 +86,22 @@ impl Parser {
         let fallback = self.term_error();
         let next = self.nth_kind(1).cloned();
         match word.as_str() {
+            // `NOT` in a SET value is read with its operand and refused once
+            // the statement parses, ahead of what the operand holds and of the
+            // calls in the SET values (measured 2026-11-23: `SET x = NOT a`,
+            // `NOT NOT a`, `NOT true`, `1 + NOT a`, `NOT -0.0` and `NOT {'k':
+            // 1, 'k': 2}`; `SET x = NOT a, a = size(m)` names the NOT and `SET
+            // x = NOT a, y = WHERE ...` its syntax error). In an INSERT value
+            // it is in the arguments of a call, which the INSERT refuses
+            // (measured 2026-11-23: `{'a': upper(NOT b)}` names `upper`). The
+            // operand stands in for the form and never runs.
+            "not" if self.in_values && !self.in_where => {
+                self.bump();
+                if !self.in_insert {
+                    self.defer("Unsupported operator in Update Expression. Operator: not");
+                }
+                self.operand()
+            }
             // A prefix and two forms that take an expression first.
             "not" | "case" | "pivot" => {
                 self.bump();
@@ -324,6 +340,10 @@ impl Parser {
     }
 
     fn bare_term(&mut self) -> PResult<BareForm> {
+        let signed = self.tokens[self.pos..]
+            .iter()
+            .find(|t| !matches!(t.kind, TokenKind::LParen))
+            .is_some_and(|t| matches!(t.kind, TokenKind::Plus | TokenKind::Minus));
         let mut operand = self.operand()?;
         // A call with path steps after it is a path (measured 2026-11-13:
         // `foo(1).a` is "Unsupported operation: Path").
@@ -382,12 +402,21 @@ impl Parser {
             Operand::Literal(_) => BareForm::Unsupported("Lit"),
             Operand::Parameter(_) => BareForm::Unsupported("Parameter"),
             // An aggregate call is named as such (measured 2026-11-13 with
-            // `count(1)`); any other call is taken for a condition check like
-            // an operator expression (measured 2026-11-02 with `size(x)`).
-            Operand::Function(name, _) if AGGREGATES.contains(&name.as_str()) => {
-                BareForm::Unsupported("CallAgg")
-            }
-            Operand::Function(..) => BareForm::Call,
+            // `count(1)`), and so are `nullif`, `coalesce` and `cast`
+            // (measured 2026-11-23 with `nullif(1, 2)`, `coalesce(1)` and
+            // `cast(1 AS INT)`), also in parentheses (`(nullif(1, 2))`; for a
+            // quoted name see `call_name`). Any other call, and one of these
+            // with a sign before it, also in parentheses (`-nullif(1, 2)`,
+            // `(-count(1))`), is taken for a condition check like an operator
+            // expression (measured 2026-11-02 with `size(x)`).
+            Operand::Function(name, _) => match name.as_str() {
+                _ if signed => BareForm::Call,
+                n if AGGREGATES.contains(&n) => BareForm::Unsupported("CallAgg"),
+                "nullif" => BareForm::Unsupported("NullIf"),
+                "coalesce" => BareForm::Unsupported("Coalesce"),
+                "cast" => BareForm::Unsupported("Cast"),
+                _ => BareForm::Call,
+            },
             Operand::Arith(..) => BareForm::Operator,
         })
     }

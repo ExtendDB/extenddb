@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The checks of a statement's literal values and of the calls in its SET
-//! values, made once the statement parses.
+//! values, made once the statement parses, the name a call is compared by
+//! ([`call_name`]) and the refusal of a call by its name ([`Call::refusal`]),
+//! which the parser also gives the calls of a WHERE condition.
 //!
 //! [`check_condition_values`] reads the literals of the WHERE condition and
 //! [`check_written_values`] the values an INSERT or an UPDATE writes. Each
@@ -53,8 +55,9 @@ use crate::validation::number::validate_and_normalize_number;
 /// inside a map, a list and a call).
 pub const EMPTY_BAG: &str = "Empty bags are not supported";
 
-/// The condition functions. A SET value that calls one is refused naming it
-/// (measured 2026-11-06 for each, with any number of arguments).
+/// The condition functions, the only calls a WHERE condition recognizes. A
+/// SET value that calls one is refused naming it (measured 2026-11-06 for
+/// each, with any number of arguments; see [`Call::refusal`]).
 const CONDITION_FUNCTIONS: [&str; 6] = [
     "attribute_exists",
     "attribute_not_exists",
@@ -64,10 +67,16 @@ const CONDITION_FUNCTIONS: [&str; 6] = [
     "size",
 ];
 
-/// The aggregate calls, refused in a SET value as a token the expression
-/// does not take, naming the call (measured 2026-11-06 for each), and as a
-/// statement by the kind of call they are (see `parser::terms`).
+/// The aggregate calls, refused in a SET value and in a condition as a token
+/// the expression does not take, naming the call (measured 2026-11-06 and
+/// 2026-11-23 for each; see [`Call::refusal`]), and as a statement by the
+/// kind of call they are (see `parser::terms`).
 pub(crate) const AGGREGATES: [&str; 5] = ["avg", "count", "max", "min", "sum"];
+
+/// The calls that are forms of their own when the name is not quoted, each
+/// with its own argument rules (see `Parser::form_arguments`), refusal (see
+/// [`Call::refusal`]) and statement name (see `parser::terms`).
+pub(crate) const FORMS: [&str; 3] = ["nullif", "coalesce", "cast"];
 
 /// The path a value's own refusals name for the value itself.
 const ROOT: &str = "root";
@@ -328,15 +337,78 @@ struct SetTokens {
     calls: Vec<Call>,
 }
 
-/// A call in a SET value.
+/// A call by the tokens of its name: in a SET value, read from the statement
+/// once it parses (see [`SetTokens`]); in a WHERE condition, by the parser
+/// as it reads the call.
 #[derive(Debug, PartialEq)]
-struct Call {
-    /// The name, in lower case.
-    name: String,
-    /// The `line:column:length` of the name.
-    at: String,
+pub(crate) struct Call {
+    /// The name the code compares the call by (see [`call_name`]).
+    pub(crate) name: String,
+    /// The `line:column:length` of the name, its quotes counted.
+    pub(crate) at: String,
     /// The `line:column:length` of the `(` after the name.
-    paren_at: String,
+    pub(crate) paren_at: String,
+}
+
+/// The name the code compares a call by, from its name as `written` and
+/// whether it is `quoted`: the name in lower case, so a function is found
+/// quoted or not and in any case, but a quoted name that is an aggregate in
+/// another case than lower, or `nullif`, `coalesce` or `cast` in any case,
+/// keeps its quotes, so no form claims it and it is a call like any other.
+///
+/// Measured 2026-11-23 in a SET value, in a condition and as a statement:
+/// `"count"` and `"sum"` are the aggregates, and `"COUNT"`, `"Count"` and
+/// `"Sum"` are unrecognized functions, named in lower case; `"SIZE"`,
+/// `"Attribute_Exists"`, `"Contains"`, `"If_Not_Exists"`, `"LIST_APPEND"`,
+/// `"SET_ADD"` and `"Set_Delete"` get the answers of `size`,
+/// `attribute_exists`, `contains`, `if_not_exists`, `list_append`, `set_add`
+/// and `set_delete`; `"nullif"`, `"NULLIF"`, `"coalesce"` and `"cast"` are
+/// unrecognized functions where `nullif`, `coalesce` and `cast` are forms of
+/// their own.
+pub(crate) fn call_name(written: &str, quoted: bool) -> String {
+    let name = written.to_ascii_lowercase();
+    let form = AGGREGATES.contains(&name.as_str()) || FORMS.contains(&name.as_str());
+    if quoted && form && !AGGREGATES.contains(&written) {
+        format!("\"{written}\"")
+    } else {
+        name
+    }
+}
+
+impl Call {
+    /// The refusal of the call by its name (see [`call_name`]), in a WHERE
+    /// condition when `condition` and in a SET value otherwise, or `None`
+    /// when the call runs: a condition function in a condition, and
+    /// `if_not_exists` and `list_append` in a SET value, whose operands are
+    /// checked apart (measured 2026-11-06 and 2026-11-23 in a SET value and
+    /// in a condition).
+    pub(crate) fn refusal(&self, condition: bool) -> Option<String> {
+        let (name, at) = (&self.name, &self.at);
+        let unsupported =
+            |token: &str, at: &str| format!("Unsupported token in expression: {token} at {at}");
+        Some(match name.as_str() {
+            n if CONDITION_FUNCTIONS.contains(&n) => {
+                if condition {
+                    return None;
+                }
+                format!("The function is not allowed in an update expression; function: {name}")
+            }
+            "if_not_exists" | "list_append" => {
+                if !condition {
+                    return None;
+                }
+                format!("The function is not allowed in a condition expression; function: {name}")
+            }
+            n if AGGREGATES.contains(&n) => unsupported(name, at),
+            "nullif" => unsupported("UNKNOWN", at),
+            "coalesce" => unsupported("UNKNOWN", &self.paren_at),
+            "cast" => unsupported(name, at),
+            _ => format!(
+                "Unrecognized function: {} at {at}",
+                name.trim_matches('"').to_ascii_lowercase()
+            ),
+        })
+    }
 }
 
 impl SetTokens {
@@ -371,13 +443,13 @@ impl SetTokens {
                     read.members.push(members);
                     whole_value_call = members.then_some(i + 1);
                 }
-                TokenKind::Ident(word)
+                TokenKind::Ident(word) | TokenKind::QuotedIdent(word)
                     if in_set
                         && next == Some(&TokenKind::LParen)
                         && whole_value_call != Some(i) =>
                 {
                     read.calls.push(Call {
-                        name: word.to_ascii_lowercase(),
+                        name: call_name(word, matches!(token.kind, TokenKind::QuotedIdent(_))),
                         at: span(token),
                         paren_at: tokens.get(i + 1).map(span).unwrap_or_default(),
                     });
@@ -397,18 +469,25 @@ impl SetTokens {
     }
 }
 
-/// The `set_add(` or `set_delete(` call, in any case, at token `i` of
-/// `tokens` that is a SET value on its own, or `None`. A call with an
-/// arithmetic operator after its closing parenthesis is a call like any other
-/// in the value, which the value's walk refuses (measured 2026-11-13:
-/// `set_add(a) + 1`, `set_add(a, <<'b'>>) + 1` and
-/// `set_delete(a, <<'b'>>) - 1` are "Unrecognized function" at the name, and
-/// `set_add(<<>>) + 1` is refused for the empty bag). A call left open is on
-/// its own.
+/// The `set_add(` or `set_delete(` call, in any case, quoted or not (see
+/// [`call_name`]; measured 2026-11-23: `"set_add"(ss, <<'b'>>)`,
+/// `"SET_ADD"(ss, <<'b'>>)`, `"set_delete"(ss, <<'b'>>)` and
+/// `"Set_Delete"(ss, <<'b'>>)` run), at token `i` of `tokens` that is a SET
+/// value on its own, or `None`. A call with an arithmetic operator after its
+/// closing parenthesis is a call like any other in the value, which the
+/// value's walk refuses (measured 2026-11-13: `set_add(a) + 1`, `set_add(a,
+/// <<'b'>>) + 1` and `set_delete(a, <<'b'>>) - 1` are "Unrecognized
+/// function" at the name, and `set_add(<<>>) + 1` is refused for the empty
+/// bag). A call left open is on its own.
 pub(crate) fn whole_value_set_call(tokens: &[Token], i: usize) -> Option<SetMembersOp> {
-    let op = match tokens.get(i).map(|t| &t.kind) {
-        Some(TokenKind::Ident(w)) if w.eq_ignore_ascii_case("set_add") => SetMembersOp::Add,
-        Some(TokenKind::Ident(w)) if w.eq_ignore_ascii_case("set_delete") => SetMembersOp::Delete,
+    let (word, quoted) = match tokens.get(i).map(|t| &t.kind) {
+        Some(TokenKind::Ident(w)) => (w, false),
+        Some(TokenKind::QuotedIdent(w)) => (w, true),
+        _ => return None,
+    };
+    let op = match call_name(word, quoted).as_str() {
+        "set_add" => SetMembersOp::Add,
+        "set_delete" => SetMembersOp::Delete,
         _ => return None,
     };
     if tokens.get(i + 1).map(|t| &t.kind) != Some(&TokenKind::LParen) {
@@ -466,56 +545,31 @@ impl SetWalk<'_> {
     }
 
     /// The refusal of the `occurrence`-th call named `name` in the SET
-    /// values, once its arguments pass (measured 2026-11-06 for each name
-    /// here and for `exists`, `upper`, `lower`, `char_length`, `substring`,
-    /// `trim` and two names that are no function, in ExecuteStatement,
-    /// BatchExecuteStatement and ExecuteTransaction). `if_not_exists` and
-    /// `list_append` take two operands, and the first operand of
-    /// `if_not_exists` is a path; `set_add` and `set_delete` are the whole
-    /// value or not a function.
+    /// values, once its arguments pass (measured 2026-11-06 in
+    /// ExecuteStatement, BatchExecuteStatement and ExecuteTransaction; see
+    /// [`Call::refusal`]). `if_not_exists` and `list_append` take two
+    /// operands, and the first operand of `if_not_exists` is a path;
+    /// `set_add` and `set_delete` are the whole value or not a function.
     fn call(&self, name: &str, args: &[Operand], occurrence: usize) -> Result<(), String> {
-        let at = |paren: bool| {
-            self.tokens
-                .call(name, occurrence)
-                .map(|call| format!(" at {}", if paren { &call.paren_at } else { &call.at }))
-                .unwrap_or_default()
-        };
-        match name {
-            "if_not_exists" | "list_append" => {
-                if args.len() != 2 {
-                    return Err(format!(
-                        "Incorrect number of operands for operator or function; operator or \
-                         function: {name}, number of operands: {}",
-                        args.len()
-                    ));
-                }
-                if name == "if_not_exists" && !matches!(args[0], Operand::Path(_)) {
-                    return Err(format!(
-                        "Operator or function requires a document path; operator or function: \
-                         {name}"
-                    ));
-                }
-                Ok(())
+        if matches!(name, "if_not_exists" | "list_append") {
+            if args.len() != 2 {
+                return Err(format!(
+                    "Incorrect number of operands for operator or function; operator or \
+                     function: {name}, number of operands: {}",
+                    args.len()
+                ));
             }
-            _ if CONDITION_FUNCTIONS.contains(&name) => Err(format!(
-                "The function is not allowed in an update expression; function: {name}"
-            )),
-            _ if AGGREGATES.contains(&name) => Err(format!(
-                "Unsupported token in expression: {name}{}",
-                at(false)
-            )),
-            // (measured 2026-11-06: `nullif(1, m)` names the call,
-            // `coalesce(m, 1)` the parenthesis after it)
-            "nullif" => Err(format!(
-                "Unsupported token in expression: UNKNOWN{}",
-                at(false)
-            )),
-            "coalesce" => Err(format!(
-                "Unsupported token in expression: UNKNOWN{}",
-                at(true)
-            )),
-            _ => Err(format!("Unrecognized function: {name}{}", at(false))),
+            if name == "if_not_exists" && !matches!(args[0], Operand::Path(_)) {
+                return Err(format!(
+                    "Operator or function requires a document path; operator or function: \
+                     {name}"
+                ));
+            }
         }
+        self.tokens
+            .call(name, occurrence)
+            .and_then(|call| call.refusal(false))
+            .map_or(Ok(()), Err)
     }
 }
 

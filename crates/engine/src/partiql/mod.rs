@@ -433,7 +433,8 @@ pub(crate) fn bind_parameter(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use extenddb_core::partiql::parse;
+    use extenddb_core::partiql::parser::{parse_for_request, parse_for_transaction};
+    use extenddb_core::partiql::{ParseError, parse};
 
     fn message(err: DynamoDbError) -> String {
         match err {
@@ -672,5 +673,229 @@ mod tests {
                 "{sql}"
             );
         }
+    }
+
+    /// The parser of one operation's statements.
+    type Parse = fn(&str, usize) -> Result<Statement, ParseError>;
+
+    /// What the operation that parses with `parse` answers `sql` ahead of
+    /// its table lookup: the parser's refusal or the statement checks', or
+    /// an empty string when the statement reaches the table.
+    fn answer(parse: Parse, sql: &str) -> String {
+        parse(sql, 0)
+            .map_err(|e| e.message)
+            .and_then(|statement| check_statement(&statement, &[], sql))
+            .err()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn calls_and_not_in_set_values_and_conditions_get_the_services_refusals() {
+        // Measured 2026-11-23 in us-east-1 on this table, which does not
+        // exist, each statement twice: with ExecuteStatement (`es`), and the
+        // statements of their own also with BatchExecuteStatement (`batch`,
+        // the Error of the response) and ExecuteTransaction (`tx`, after the
+        // prefix "Validation failed in TransactStatements[0]: ", which the
+        // transaction adds). A SET value starts at column 39, a condition
+        // after the key at column 57 and an INSERT value after the key at
+        // column 59. The service refuses a call or a NOT once the statement
+        // parses, the first in written order. A quoted name is an aggregate
+        // only when written in lower case, is never `nullif`, `coalesce` or
+        // `cast`, and is any other function in any case. `SET a = size(m), x
+        // = NOT a`, which the service refuses for `size`, is left out: the
+        // parser's refusal of the NOT comes ahead of the checks made after
+        // the parse (#886).
+        let es: Parse = parse_for_execute_statement;
+        let batch: Parse = parse_for_request;
+        let tx: Parse = parse_for_transaction;
+        const TABLE: &str = "\"ets-parityat-missing\"";
+        let update = |value: &str| format!("UPDATE {TABLE} SET {value} WHERE pk = 'q'");
+        let select =
+            |condition: &str| format!("SELECT * FROM {TABLE} WHERE pk = 'q' AND {condition}");
+        let insert = |value: &str| format!("INSERT INTO {TABLE} VALUE {{'pk': 'q', 'a': {value}}}");
+        let wf =
+            |reason: &str| format!("Statement wasn't well formed, can't be processed: {reason}");
+        let unary = || wf("Aggregate functions are always unary");
+        let no_right_side = || wf("Missing right-hand side expression of infix operator");
+        let token =
+            |token: &str, at: &str| format!("Unsupported token in expression: {token} at {at}");
+        let unrecognized = |name: &str, at: &str| format!("Unrecognized function: {name} at {at}");
+        let not_in_update = |name: &str| {
+            format!("The function is not allowed in an update expression; function: {name}")
+        };
+        let not_in_condition = |name: &str| {
+            format!("The function is not allowed in a condition expression; function: {name}")
+        };
+        let update_not = || "Unsupported operator in Update Expression. Operator: not".to_owned();
+        let data_type =
+            |name: &str, at: &str| format!("Unsupported data type: {name} under key root at {at}");
+        let operation = |name: &str| format!("Unsupported operation: {name}");
+        let exists_only =
+            || "EXISTS can only be used in ExecuteTransaction write requests.".to_owned();
+        let in_transaction = || "Unsupported operation in transaction.".to_owned();
+        let table_lookup = String::new;
+        #[rustfmt::skip]
+        let rows = [
+            // Calls in a SET value.
+            ("F1", es, update("a = count()"), unary()),
+            ("A1", es, update("a = COUNT()"), unary()),
+            ("A2", es, update("a = avg()"), unary()),
+            ("F5", es, update("a = count(m)"), token("count", "1:39:5")),
+            ("F11", es, update("a = count(*)"), token("count", "1:39:5")),
+            ("F12", es, update("a = count(m, 1)"), token("count", "1:39:5")),
+            ("A3", es, update("a = count(DISTINCT m)"), token("count", "1:39:5")),
+            ("F10", es, update("a = sum(m)"), token("sum", "1:39:3")),
+            ("F16", es, update("a = \"count\"(m)"), token("count", "1:39:7")),
+            ("F2", es, update("a = nullif(m)"), wf("Expected COMMA")),
+            ("F15", es, update("a = nullif()"), wf("Unexpected term")),
+            ("F7", es, update("a = nullif(m, 1)"), token("UNKNOWN", "1:39:6")),
+            ("F14", es, update("a = coalesce()"), wf("Unexpected term")),
+            ("F6", es, update("a = coalesce(m, 1)"), token("UNKNOWN", "1:47:1")),
+            ("Q1", es, update("a = \"nullif\"(m, 1)"), unrecognized("nullif", "1:39:8")),
+            ("Q2", es, update("a = \"coalesce\"(m, 1)"), unrecognized("coalesce", "1:39:10")),
+            ("F3", es, update("a = cast(m AS INT)"), token("cast", "1:39:4")),
+            ("C6", es, update("a = CAST(m AS VARCHAR(5))"), token("cast", "1:39:4")),
+            ("F13", es, update("a = cast(m)"), wf("Expected AS")),
+            ("C4", es, update("a = cast(m INT)"), wf("Expected AS")),
+            ("C1", es, update("a = cast(m AS)"), wf("Expected type name")),
+            ("C2", es, update("a = cast(m AS foo)"), wf("Expected type name")),
+            ("C3", es, format!("UPDATE {TABLE} SET a = cast(m AS INT WHERE pk = 'q'"), wf("Expected RIGHT_PAREN")),
+            ("C7", es, update("a = cast()"), wf("Unexpected term")),
+            ("Q7", es, update("a = \"cast\"(m AS INT)"), wf("Expected RIGHT_PAREN")),
+            ("F4", es, update("a = \"upper\"(m)"), unrecognized("upper", "1:39:7")),
+            ("F8", es, update("a = upper(m)"), unrecognized("upper", "1:39:5")),
+            ("F9", es, update("a = size(m)"), not_in_update("size")),
+            ("F17", es, update("a = \"size\"(m)"), not_in_update("size")),
+            ("F18", es, update("a = attribute_exists(m)"), not_in_update("attribute_exists")),
+            ("F19", es, update("a = begins_with(m, 'x')"), not_in_update("begins_with")),
+            ("Q5", es, update("a = \"if_not_exists\"(m, 1)"), table_lookup()),
+            ("Q6", es, update("a = \"list_append\"(l, l)"), table_lookup()),
+            ("S1", es, update("a = \"count\"()"), unary()),
+            ("S13", es, update("a = \"avg\"()"), unary()),
+            ("S6", es, update("a = \"COUNT\"(m)"), unrecognized("count", "1:39:7")),
+            ("S2", es, update("a = count(*, 1)"), wf("Expected RIGHT_PAREN")),
+            ("S3", es, update("a = count(ALL m)"), token("count", "1:39:5")),
+            ("S4", es, update("a = count(DISTINCT)"), wf("Unexpected term")),
+            ("V6", es, update("ss = \"set_add\"(ss, <<'b'>>)"), table_lookup()),
+            ("V7", es, update("ss = \"set_delete\"(ss, <<'b'>>)"), table_lookup()),
+            ("X1", es, update("a = sum(*)"), wf("sum(*) is not allowed")),
+            ("X17", es, update("a = max(*)"), wf("max(*) is not allowed")),
+            ("X10", es, update("a = count(DISTINCT m, 1)"), token("count", "1:39:5")),
+            ("X28", es, update("a = \"sum\"(m)"), token("sum", "1:39:5")),
+            ("X27", es, update("a = \"Sum\"(m)"), unrecognized("sum", "1:39:5")),
+            ("X14", es, update("a = \"Count\"(m), b = count(m)"), unrecognized("count", "1:39:7")),
+            ("X25", es, update("a = \"UPPER\"(m)"), unrecognized("upper", "1:39:7")),
+            ("X37", es, update("a = \"NULLIF\"(m, 1)"), unrecognized("nullif", "1:39:8")),
+            ("X38", es, update("a = \"nullif\"(m)"), unrecognized("nullif", "1:39:8")),
+            ("X42", es, update("a = \"coalesce\"(m)"), unrecognized("coalesce", "1:39:10")),
+            ("X21", es, update("a = \"SIZE\"(m)"), not_in_update("size")),
+            ("X3", es, update("a = \"If_Not_Exists\"(m, 1)"), table_lookup()),
+            ("X24", es, update("l = \"LIST_APPEND\"(l, [1])"), table_lookup()),
+            ("X8", es, update("ss = \"SET_ADD\"(ss, <<'b'>>)"), table_lookup()),
+            ("X40", es, update("ss = \"Set_Delete\"(ss, <<'b'>>)"), table_lookup()),
+            // Calls in a WHERE condition.
+            ("G6", es, select("count() = 1"), unary()),
+            ("A4", es, select("max() = 1"), unary()),
+            ("G1", es, select("count(m) = 1"), token("count", "1:57:5")),
+            ("G11", es, select("count(*) = 1"), token("count", "1:57:5")),
+            ("G10", es, select("sum(m) = 1"), token("sum", "1:57:3")),
+            ("Q3", es, select("\"count\"(m) = 1"), token("count", "1:57:7")),
+            ("G12", es, select("nullif(m) = 1"), wf("Expected COMMA")),
+            ("G3", es, select("nullif(m, 1) = 1"), token("UNKNOWN", "1:57:6")),
+            ("G2", es, select("coalesce(m, 1) = 1"), token("UNKNOWN", "1:65:1")),
+            ("G13", es, select("coalesce(m) = 1"), token("UNKNOWN", "1:65:1")),
+            ("G7", es, select("cast(m AS INT) = 1"), token("cast", "1:57:4")),
+            ("C5", es, select("cast(m AS) = 1"), wf("Expected type name")),
+            ("G4", es, select("if_not_exists(m, 1) = 1"), not_in_condition("if_not_exists")),
+            ("Q4", es, select("\"if_not_exists\"(m, 1) = 1"), not_in_condition("if_not_exists")),
+            ("G5", es, select("list_append(l, l) = 1"), not_in_condition("list_append")),
+            ("G8", es, select("\"upper\"(m) = 1"), unrecognized("upper", "1:57:7")),
+            ("G9", es, select("upper(m) = 1"), unrecognized("upper", "1:57:5")),
+            ("G14", es, select("set_add(m, <<1>>) = 1"), unrecognized("set_add", "1:57:7")),
+            ("G15", es, select("\"size\"(m) = 1"), table_lookup()),
+            ("W1", es, select("\"count\"() = 1"), unary()),
+            ("W5", es, select("\"COUNT\"(m) = 1"), unrecognized("count", "1:57:7")),
+            ("W2", es, select("count(*, 1) = 1"), wf("Expected RIGHT_PAREN")),
+            ("W3", es, select("count(ALL m) = 1"), token("count", "1:57:5")),
+            ("X18", es, select("count(ALL) = 1"), wf("Unexpected term")),
+            ("X22", es, select("\"If_Not_Exists\"(m, 1) = 1"), not_in_condition("if_not_exists")),
+            ("X2", es, select("\"SIZE\"(m) = 1"), table_lookup()),
+            ("X23", es, select("\"Attribute_Exists\"(m)"), table_lookup()),
+            ("X39", es, select("\"Contains\"(m, 'a')"), table_lookup()),
+            // NOT in a SET value, refused ahead of what its operand holds.
+            ("N1", es, update("x = NOT a"), update_not()),
+            ("N2", es, update("x = NOT NOT a"), update_not()),
+            ("N3", es, update("x = NOT true"), update_not()),
+            ("N4", es, update("x = 1 + NOT a"), update_not()),
+            ("N36", es, update("x = NOT -0.0"), update_not()),
+            ("N37", es, update("x = NOT {'k': 1, 'k': 2}"), update_not()),
+            ("X6", es, update("x = NOT +b"), update_not()),
+            ("X12", es, update("x = NOT <<1, 'a'>>"), update_not()),
+            ("X20", es, update("a = size(NOT m), b = upper(m)"), update_not()),
+            // A call as the statement: an aggregate, `nullif`, `coalesce`
+            // and `cast` are named, also in parentheses. A quoted name that
+            // is no form, and any of these with a sign before it, are calls
+            // like any other: the EXISTS text outside a transaction, and in
+            // one an operation a transaction does not run.
+            ("B11", es, "\"count\"()".to_owned(), unary()),
+            ("B16", es, "avg(*)".to_owned(), wf("avg(*) is not allowed")),
+            ("B6", es, "nullif(1, 2)".to_owned(), operation("NullIf")),
+            ("B6", batch, "nullif(1, 2)".to_owned(), operation("NullIf")),
+            ("B6", tx, "nullif(1, 2)".to_owned(), operation("NullIf")),
+            ("B8", es, "coalesce(1)".to_owned(), operation("Coalesce")),
+            ("B8", batch, "coalesce(1)".to_owned(), operation("Coalesce")),
+            ("B8", tx, "coalesce(1)".to_owned(), operation("Coalesce")),
+            ("B10", es, "cast(1 AS INT)".to_owned(), operation("Cast")),
+            ("B10", batch, "cast(1 AS INT)".to_owned(), operation("Cast")),
+            ("B10", tx, "cast(1 AS INT)".to_owned(), operation("Cast")),
+            ("X29", es, "(nullif(1, 2))".to_owned(), operation("NullIf")),
+            ("X29", batch, "(nullif(1, 2))".to_owned(), operation("NullIf")),
+            ("X29", tx, "(nullif(1, 2))".to_owned(), operation("NullIf")),
+            ("X34", es, "(coalesce(1))".to_owned(), operation("Coalesce")),
+            ("X4", es, "\"COUNT\"(1)".to_owned(), exists_only()),
+            ("X4", batch, "\"COUNT\"(1)".to_owned(), exists_only()),
+            ("X4", tx, "\"COUNT\"(1)".to_owned(), in_transaction()),
+            ("X47", es, "(\"COUNT\"(1))".to_owned(), exists_only()),
+            ("X13", es, "(\"nullif\"(1, 2))".to_owned(), exists_only()),
+            ("X13", batch, "(\"nullif\"(1, 2))".to_owned(), exists_only()),
+            ("X13", tx, "(\"nullif\"(1, 2))".to_owned(), in_transaction()),
+            ("X33", es, "(\"coalesce\"(1))".to_owned(), exists_only()),
+            ("X35", es, "(\"cast\"(1))".to_owned(), exists_only()),
+            ("X32", es, "-\"nullif\"(1, 2)".to_owned(), exists_only()),
+            ("X46", es, "-nullif(1, 2)".to_owned(), exists_only()),
+            ("Y1", es, "-count(1)".to_owned(), exists_only()),
+            ("Y1", batch, "-count(1)".to_owned(), exists_only()),
+            ("Y2", es, "(-count(1))".to_owned(), exists_only()),
+            ("Y3", es, "-\"count\"(1)".to_owned(), exists_only()),
+            ("Y3", batch, "-\"count\"(1)".to_owned(), exists_only()),
+            ("Y4", es, "+count(1)".to_owned(), exists_only()),
+            // A call as an INSERT value, read as in a SET value and refused
+            // by its name.
+            ("C6", es, insert("count()"), unary()),
+            ("C7", es, insert("cast(m AS INT)"), data_type("cast", "1:59:4")),
+            ("C9", es, insert("upper(NOT b)"), data_type("upper", "1:59:5")),
+            ("X5", es, insert("nullif(m)"), wf("Expected COMMA")),
+            ("X9", es, insert("count(*)"), data_type("count", "1:59:5")),
+            // A syntax error anywhere comes first, then the first refusal in
+            // written order.
+            ("O1", es, format!("UPDATE {TABLE} SET x = NOT a, y = WHERE pk = 'q'"), wf("Unexpected keyword")),
+            ("O4", es, format!("UPDATE {TABLE} SET a = upper(m), b = WHERE pk = 'q'"), wf("Unexpected keyword")),
+            ("O5", es, select("count(m) = 1 AND"), no_right_side()),
+            ("O6", es, select("if_not_exists(m, 1) = 1 AND"), no_right_side()),
+            ("O11", es, select("cast(m AS INT) = 1 AND"), no_right_side()),
+            ("O7", es, select("upper(m) = 1 AND count(m) = 1"), unrecognized("upper", "1:57:5")),
+            ("O8", es, select("count(m) = 1 AND upper(m) = 1"), token("count", "1:57:5")),
+            ("O9", es, update("a = count(m), b = upper(m)"), token("count", "1:39:5")),
+            ("O10", es, update("a = upper(m), b = count(m)"), unrecognized("upper", "1:39:5")),
+            ("O3", es, update("x = NOT a, a = size(m)"), update_not()),
+        ];
+        let differing: Vec<String> = rows
+            .iter()
+            .filter_map(|(row, parse, sql, want)| {
+                let got = answer(*parse, sql);
+                (got != *want).then(|| format!("{row} {sql}\n  want {want:?}\n  got  {got:?}"))
+            })
+            .collect();
+        assert!(differing.is_empty(), "{}", differing.join("\n"));
     }
 }

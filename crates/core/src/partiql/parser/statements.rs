@@ -366,8 +366,10 @@ impl Parser {
             )));
         }
         self.in_values = true;
+        self.in_insert = true;
         let value = self.item_map()?;
         self.in_values = false;
+        self.in_insert = false;
         Ok(InsertStatement { table, value })
     }
 
