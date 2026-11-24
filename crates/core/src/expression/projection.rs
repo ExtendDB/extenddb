@@ -64,7 +64,7 @@ pub struct Projection {
 impl Projection {
     /// Compile parsed paths into a trie, resolving `#name` references once.
     /// With `reject_overlap`, rejects paths where one is a prefix of another
-    /// (DynamoDB's rule); pass `false` for desugared `AttributesToGet`. With
+    /// (`DynamoDB`'s rule); pass `false` for desugared `AttributesToGet`. With
     /// `reject_reserved`, rejects a reserved word written bare.
     ///
     /// Each path is checked in written order. A path reports its first faulty
@@ -135,6 +135,8 @@ pub(crate) enum ResolvedElement {
 }
 
 /// Resolve `#name` references in parsed paths, rejecting index-start paths.
+/// With `reject_reserved`, it refuses a reserved word written bare, at its
+/// element.
 ///
 /// The service checks the paths one after another in text order. It checks a
 /// path's names, then its length. When `overlap` names the expression kind,
