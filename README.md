@@ -438,24 +438,24 @@ that names the build:
   compiled for wasm32." The engine's backup subsystem does not build for
   `wasm32`, so the engine refuses these four there, after the body parse, as
   it refuses any other known operation whose handler is compiled only off
-  `wasm32`. A body that is not JSON gets `SerializationException`, as on a
-  server; a JSON body gets the refusal, even one the handler would refuse,
-  such as a `DescribeBackup` with no `BackupArn` (natively and on a server,
-  "1 validation error detected: Value null at 'backupArn' …"). Built
+  `wasm32`. A body that does not parse gets `SerializationException`, as on
+  a server; a body that parses gets the refusal, even one the handler would
+  refuse, such as a `DescribeBackup` with no `BackupArn` (natively and on a
+  server, "1 validation error detected: Value null at 'backupArn' …"). Built
   natively, the adapter runs the engine's backup handlers instead, and with no
   backup store `CreateBackup` backs a table up in the catalog, as a server
   without one does.
 - The PartiQL operations — `ExecuteStatement`, `BatchExecuteStatement`,
   `ExecuteTransaction` — "… the PartiQL surface is not part of the browser build."
   This build refuses them by name, before it parses the body, so every body
-  gets the refusal: a body that is not JSON, which a server answers with
+  gets the refusal: a body that does not parse, which a server answers with
   `SerializationException` "Start of structure or map found where not
-  expected: …", and a JSON body the handler would refuse, such as an
-  `ExecuteStatement` with no `Statement` (on a server, "1 validation error
-  detected: Value null at 'statement' failed to satisfy constraint: Member
-  must not be null").
+  expected: …", and a body that parses and that the handler would refuse,
+  such as an `ExecuteStatement` with no `Statement` (on a server, "1 validation
+  error detected: Value null at 'statement' failed to satisfy constraint:
+  Member must not be null").
 - `DescribeEndpoints` — "… it is called in-process and has no network endpoint
-  to report." It is refused by name too, so a body that is not JSON gets the
+  to report." It is refused by name too, so a body that does not parse gets the
   refusal, where a server answers `SerializationException`.
 - An `UpdateTable` that creates a vector index — "… it cannot build a vector
   index; create the table with its vector indexes instead." The SQLite backend
@@ -471,29 +471,30 @@ that carry an `onWasm` expectation for this build. Eight do. Two are for the
 vector-index refusal: "UpdateTable creating a vector index on VecT adds the
 index to the table" expects the refusal here, and "DescribeTable VecT after the
 vector-index create" expects the table to keep only the index it was created
-with. The other six are the backup cases with a JSON body (one
+with. The other six are the backup cases whose body parses (one
 `CreateBackup`, three `DescribeBackup`, one `DeleteBackup` and one
 `RestoreTableFromBackup`), which expect the backup refusal here and the backup
 handlers' answers natively.
 
 `ListBackups`, `DescribeContinuousBackups`, `UpdateContinuousBackups`,
 `ImportTable` and `ExportTableToPointInTime` run the engine's own handlers, as
-on a server, so both builds give a malformed request the same answer:
-`SerializationException` for a body that is not JSON, and otherwise the
-handler's error, except for the point-in-time refusals at the end of this
-paragraph. This build creates no backup (see above) and has no import or
+a server does. On this build a request to one of them whose body does not
+parse gets `SerializationException`, and one whose body parses gets the
+handler's answer, except that an `UpdateContinuousBackups` that enables
+point-in-time recovery gets the refusal at the end of this paragraph, before
+the handler. This build creates no backup (see above) and has no import or
 export paths, so `ListBackups` lists no backups, `DescribeContinuousBackups`
-reports point-in-time recovery `DISABLED` for a table that exists and
-`TableNotFoundException` for one that does not, and `ImportTable` /
+reports point-in-time recovery `DISABLED` for the name of a table that exists
+and `TableNotFoundException` for any other valid name and for every name that
+starts with `arn:`, and `ImportTable` /
 `ExportTableToPointInTime` return the "disabled" `ValidationException` that a
 server with no import or export paths gives a request it does not refuse
 before dispatch (the requests it does refuse are under "Checks the server
 makes that this build does not"). As the server does, the build refuses,
-before any table is read, every `RestoreTableToPointInTime` whose body is
-JSON (`PointInTimeRecoveryUnavailableException`) and an
-`UpdateContinuousBackups` that enables point-in-time recovery
-(`ContinuousBackupsUnavailableException`), so a request naming a missing
-table gets the refusal too.
+before any table is read, every `RestoreTableToPointInTime` whose body parses
+(`PointInTimeRecoveryUnavailableException`) and an `UpdateContinuousBackups`
+that enables point-in-time recovery (`ContinuousBackupsUnavailableException`),
+so a request naming a missing table gets the refusal too.
 
 The wasm workflow's clippy step refuses calls known to trap or hang on
 `wasm32` in the workspace crates this build compiles;
@@ -538,11 +539,12 @@ this build the server's refusal of every request while a Cassandra, MongoDB or
 PostgreSQL backend registers again with its catalog, or the
 `AccessDeniedException` "User: is not authorized to perform this operation" it
 gives a request that passes its signature check and `admit` when its state has
-no catalog store, which `extenddb serve` never builds. The server's name checks of a `RestoreTableToPointInTime` never
-run: `admit` refuses that operation first, on both builds. Nor do its
-**table names**, **table ARNs** and **accounts** checks, or the IAM decision
-of **signature**, run on an `UpdateContinuousBackups` that enables
-point-in-time recovery: `admit` refuses it first, with
+no catalog store, which `extenddb serve` never builds. The server's name checks
+of a `RestoreTableToPointInTime` never run: on both builds `parse_request`
+refuses one whose body does not parse, and `admit` refuses every other one,
+first. Nor do its **table names**, **table ARNs** and **accounts** checks, or
+the IAM decision of **signature**, run on an `UpdateContinuousBackups` that
+enables point-in-time recovery: `admit` refuses it first, with
 `ContinuousBackupsUnavailableException`, on both builds, whatever its
 `TableName`.
 

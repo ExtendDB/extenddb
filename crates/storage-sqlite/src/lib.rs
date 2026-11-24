@@ -162,8 +162,7 @@ mod admin_store;
 mod authorization_store;
 mod backup;
 mod backup_catalog;
-// Creates and removes the database file for `init` and `destroy`; it takes
-// the serve lock, compiled off wasm32.
+// `Bootstrapper`; its `destroy` takes the serve lock, compiled off wasm32.
 #[cfg(not(target_arch = "wasm32"))]
 mod bootstrapper;
 mod catalog_store;
@@ -172,14 +171,14 @@ mod create_table;
 mod credential_store;
 mod data;
 mod delete_table;
-// Starts the server's background workers, which wasm32 does not run.
+// `ServerRuntimeHooks`: the server's background workers, not run on wasm32.
 #[cfg(not(target_arch = "wasm32"))]
 mod hooks;
 mod management_store;
 mod metadata;
 pub mod migrations;
 mod number_key;
-// The lifecycle commands' helpers, which only `server_backend` installs.
+// `OperationsEngine`, which only `server_backend` installs.
 #[cfg(not(target_arch = "wasm32"))]
 mod operations;
 mod password_hash_store;

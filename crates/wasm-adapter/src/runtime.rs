@@ -22,8 +22,8 @@
 //! 1. It refuses the operations [`unsupported_reason`] names, with a
 //!    `ValidationException` that names the build, each for the reason its
 //!    documentation gives. The refusal goes by the operation name alone,
-//!    before the body is parsed, so a body that is not JSON gets it too, where
-//!    the server answers `SerializationException`.
+//!    before the body is parsed, so a body that does not parse gets it too,
+//!    where the server answers `SerializationException`.
 //! 2. It runs `extenddb_engine::parse_request` and `ParsedRequest::admit`, the
 //!    pre-dispatch checks the server applies too (the server also
 //!    authenticates between them; this build authenticates no request).

@@ -46,7 +46,7 @@ pub struct ParsedRequest<'a> {
 /// # Errors
 ///
 /// `UnknownOperationException` for an operation the engine does not
-/// dispatch; `SerializationException` for a body that is not valid JSON.
+/// dispatch; `SerializationException` for a body that does not parse as JSON.
 // Public for its two callers, the HTTP server's `handle_request` and the
 // WebAssembly adapter's `Engine::dispatch`, not for other users of the crate.
 #[doc(hidden)]
