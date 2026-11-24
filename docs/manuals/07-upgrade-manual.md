@@ -390,12 +390,24 @@ deployment, even when no catalog migration is required.
 
 ### v1.1.0: on MongoDB, a stored IAM document that cannot be read fails the request
 
-**What changed.** On MongoDB, the authorization store left out a stored IAM document that it could not read, and the request was evaluated without it. A Deny, a permissions boundary or a session policy in that document did not apply. Now each request that needs the document gets HTTP 500 (`InternalServerError`, "Internal error during authorization"), and the server logs `a stored IAM document cannot be read` with the collection and the document's `_id` (#920). These documents are:
+**What changed.** On MongoDB, the authorization store left out a stored IAM document that it could not read, and the server evaluated the request without it. A Deny, a permissions boundary or a session policy in that document did not apply. Now each request whose authorization reads the document gets HTTP 500 (`InternalServerError`, "Internal error during authorization"). The server logs `a stored IAM document cannot be read` with the collection, the document's `_id` and the fields that name its owner (#920). These documents are:
 
 - a policy or a permissions boundary with no `policy_document`, or with a value that has no JSON form (a Decimal128, or binary data of the generic subtype)
 - a group membership or a group policy whose group name is not a string
 - a session policy or session tags with no JSON form
 - a user, role or resource tag whose key or value is not a string
+
+**Which requests fail.** The authorization of each request reads all of the caller's policies, permissions boundaries and tags, and the tags of the table that the request names. It reads the tags also when no policy uses them. So one such document fails these requests:
+
+- a user's policy, permissions boundary, tag or group membership: every request of that user
+- a group's policy: every request of each member of the group
+- a role's policy, permissions boundary or tag: every request of each session of the role
+- a session's policy or tags: every request of that session
+- a table's tag: every request on the table and on its indexes, from every principal. No principal can use the table until the tag is repaired. A request whose resource is one of the table's streams or backups does not read its tags.
+
+`DescribeEndpoints`, and a request that the server refuses before its IAM decision, read none of these documents.
+
+A server that cached the document before the damage keeps using the cached copy until the entry is `ttl_seconds` old (60 seconds by default). In that time it logs the document at each background refresh, which a request starts once the entry is `soft_ttl_seconds` old (30 seconds by default). After that, the error is not cached: the next request reads the catalog again, and each read logs the document.
 
 **Who is affected.** A MongoDB deployment whose catalog holds such a document. ExtendDB writes none of them, so the case needs a change made outside ExtendDB, or damage. SQLite, PostgreSQL and Cassandra are not affected. No catalog migration is required.
 
@@ -411,7 +423,15 @@ db.iam_role_tags.find({ $expr: { $or: [{ $ne: [{ $type: "$tag_key" }, "string"] 
 db.tags.find({ $expr: { $or: [{ $ne: [{ $type: "$tag_key" }, "string"] }, { $ne: [{ $type: "$tag_value" }, "string"] }] } })
 ```
 
-They do not find a Decimal128 or binary value nested inside one of those documents. The server log names each such document when a request needs it. Repair a document from its source, for example by writing the policy again with `extenddb manage put-user-policy`, or delete it.
+They do not find a Decimal128 or binary value nested inside one of those documents. The server log names each such document when the authorization of a request reads it. The log line gives the collection, the `_id`, and each owner field that the document holds, with its stored value: `account_id`, `principal_type`, `principal_name`, `user_name`, `group_name`, `role_name`, `session_name`, `policy_name`, `resource_arn` and `tag_key`. Repair a document from its source with the command that wrote it. For a user policy, take the names from the log line, and run this command with the admin password in `EXTENDDB_PASSWORD`:
+
+```bash
+extenddb manage --config /path/to/extenddb.toml --user ADMIN_NAME put-user-policy \
+    --account-id <account_id> --user-name <principal_name> \
+    --policy-name <policy_name> --policy-document '<the policy>'
+```
+
+That command replaces the stored document in place. If the server still logs the same `_id` after the command, delete the document in `mongosh` with `db.<collection>.deleteOne({ _id: <_id> })`, with the `_id` as the log line gives it, for example `ObjectId("6b0603127c34ca3ce12a6bdf")`. Then run the command again. For a table tag, the command that wrote it fails too, because the authorization of `TagResource` and `UntagResource` on a table reads the table's tags. Delete the damaged tag in `mongosh` first, then tag the table again.
 
 ### v1.0.0: Cassandra reads and writes at `LOCAL_QUORUM`
 
