@@ -43,8 +43,8 @@ impl ExtendDb {
     /// exit, but the promise still never settles, so a top-level `await` of it
     /// in an ES module still ends the process, with exit status 13. One such
     /// panic comes from a host with no Web Crypto (`globalThis.crypto`, which
-    /// Node 18 does not define in a script): the `uuid` crate panics when it
-    /// cannot draw random bytes.
+    /// Node 18 does not define in a file it runs, ES module or not): the
+    /// `uuid` crate panics when it cannot draw random bytes.
     ///
     /// # Errors
     ///

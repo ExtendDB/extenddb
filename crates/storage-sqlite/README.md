@@ -6,7 +6,7 @@ in-tree workspace crate selected by Cargo feature.
 ## Design
 
 Single-file (or in-memory) storage using SQLite via `sqlx`. On `wasm32`, which
-`sqlx` does not build for, the crate opens only an in-memory database and
+`sqlx`'s SQLite driver does not build for, the crate opens only an in-memory database and
 reaches it through `src/wasm_sqlx.rs`, a module that implements the part of the
 `sqlx` API the crate uses over the SQLite that `sqlite-wasm-rs` bundles; its
 module documentation lists the differences from `sqlx`. Targets:
@@ -98,7 +98,10 @@ SigV4 is verified — a request signed with a different secret is rejected with
 ## Conformance
 
 Per [RFC-0002](https://github.com/ExtendDB/extenddb/blob/main/docs/rfcs), this
-backend implements the full storage trait surface.
+backend implements the full storage trait surface. The `wasm32` build does
+not compile its `Bootstrapper` (`SqliteBootstrapper`), and its
+`SnapshotEngine` answers every table snapshot with an `Unsupported` error,
+since it has no file to copy.
 
 Mandatory traits (required for acceptance):
 
