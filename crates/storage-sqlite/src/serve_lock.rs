@@ -251,10 +251,16 @@ fn open_options_0600() -> std::fs::OpenOptions {
     std::fs::OpenOptions::new()
 }
 
+/// Set `file` to mode 0600 through its descriptor.
 #[cfg(unix)]
-fn restrict_to_owner(file: &File, path: &Path) -> Result<(), String> {
+pub(crate) fn set_owner_only(file: &File) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(unix)]
+fn restrict_to_owner(file: &File, path: &Path) -> Result<(), String> {
+    set_owner_only(file)
         .map_err(|e| format!("cannot set the mode of lock file {}: {e}", path.display()))
 }
 

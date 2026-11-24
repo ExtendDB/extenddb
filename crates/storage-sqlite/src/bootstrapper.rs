@@ -158,15 +158,9 @@ impl Bootstrapper for SqliteBootstrapper {
                 ))
             })?;
         }
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        match options.open(path) {
-            Ok(_) => Ok(()),
+        let created = crate::file_mode::create_owner_only(path).map_err(OpError::Internal)?;
+        match created {
+            Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(exists()),
             Err(e) => Err(OpError::Internal(format!(
                 "create SQLite database '{}': {e}",

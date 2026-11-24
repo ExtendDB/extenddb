@@ -13,15 +13,16 @@
 //! narrows an existing one, and any sidecar left beside it, to 0600) before
 //! the connection can create a sidecar from it. The bootstrapper and catalog
 //! pools on a file database are opened through [`connect`], which calls
-//! `prepare` before the pool's first connection.
-//! The engine pool (`store.rs`) connects with its own connection options and
-//! calls `prepare` before that connect; its connect creates a missing file
-//! only when `prepare` creates it. The migration runner opens its own
-//! connection, which creates a missing database whatever the location asks.
-//! When it opens the database for writing, it first creates the file with
-//! mode 0600, through a dangling symlink too, and calls `prepare`, so that
-//! connection never creates the database. Its read-only connection for the
-//! catalog status changes no mode.
+//! `prepare` before the pool's first connection. The engine pool (`store.rs`)
+//! connects with its own connection options and calls `prepare` before that
+//! connect; its connect creates a missing file only when `prepare` creates
+//! it. The migration runner opens its own connection, which creates a missing
+//! database whatever the location asks. When it opens the database for
+//! writing, it first creates the file with [`create_owner_only`], through a
+//! dangling symlink too, and calls `prepare`, so that connection never
+//! creates the database. Its read-only connection for the catalog status
+//! changes no mode. `init` creates the database file with `create_owner_only`
+//! as well.
 //!
 //! Only a regular file with a permission bit outside 0600 is changed, and it is
 //! set to 0600. Anything else at one of those names is left alone: a symlink
@@ -30,13 +31,14 @@
 //! file that cannot be narrowed is an error. The directory's mode is left
 //! alone. On platforms other than Unix `prepare` does nothing.
 
+use std::path::Path;
 #[cfg(unix)]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 #[cfg(unix)]
 use std::str::FromStr;
 
 #[cfg(unix)]
-use crate::serve_lock::{database_file, resolve_dangling_symlinks};
+use crate::serve_lock::{database_file, resolve_dangling_symlinks, set_owner_only};
 use crate::sqlite_util::sqlite_url;
 
 /// Open a pool on `location` (a path, `:memory:` or a `sqlite:` URL) with
@@ -61,7 +63,8 @@ pub(crate) async fn connect(
 /// to read a file's mode before it changes, or to make the change fail.
 #[cfg(unix)]
 struct ModeCalls<'a> {
-    /// Sets a file `prepare` has just created to 0600, through its descriptor.
+    /// Sets a file [`create_owner_only`] has just created to 0600, through its
+    /// descriptor.
     created: &'a dyn Fn(&std::fs::File) -> std::io::Result<()>,
     /// Sets an existing regular file to 0600, given the path to change (on
     /// Linux, the file's handle under `/proc/self/fd`).
@@ -70,7 +73,7 @@ struct ModeCalls<'a> {
 
 #[cfg(unix)]
 const SYSTEM: ModeCalls<'static> = ModeCalls {
-    created: &set_created_owner_only,
+    created: &set_owner_only,
     existing: &set_existing_owner_only,
 };
 
@@ -97,7 +100,9 @@ fn prepare_with(location: &str, calls: &ModeCalls<'_>) -> Result<(), String> {
         return Ok(());
     };
     if opened.created {
-        create_owner_only(&resolve_dangling_symlinks(&opened.path), calls)?;
+        // A file that cannot be created here, or an entry already at the name,
+        // is left to SQLite's own open, which reports it in its usual terms.
+        let _ = create_owner_only_with(&resolve_dangling_symlinks(&opened.path), calls)?;
     }
     restrict_files(&opened.path, calls)
 }
@@ -160,37 +165,57 @@ fn opened_file(location: &str) -> Option<OpenedFile> {
     Some(OpenedFile { path, created })
 }
 
-/// Create `path` with mode 0600 if nothing is there yet. `create_new` refuses
-/// any existing entry, a symlink included, so nothing is followed or replaced.
+/// Create the database file `path` with mode 0600 if nothing is there yet.
+/// `prepare`, the migration runner and `init` create a missing database here.
+/// `create_new` refuses any existing entry, a symlink included, so nothing is
+/// followed or replaced. The umask applies to the mode the file is created
+/// with and can remove owner bits as well, so the new file is then set to
+/// 0600 through its descriptor. Closing the descriptor afterwards releases no
+/// lock: the file is new, so no SQLite connection of this process has it open.
+///
+/// # Errors
+///
+/// The outer error is a new file whose mode cannot be set. The inner result
+/// is the create's, which each caller judges: `AlreadyExists` when an entry is
+/// at `path`.
 #[cfg(unix)]
-fn create_owner_only(path: &Path, calls: &ModeCalls<'_>) -> Result<(), String> {
+pub(crate) fn create_owner_only(path: &Path) -> Result<std::io::Result<()>, String> {
+    create_owner_only_with(path, &SYSTEM)
+}
+
+#[cfg(unix)]
+fn create_owner_only_with(
+    path: &Path,
+    calls: &ModeCalls<'_>,
+) -> Result<std::io::Result<()>, String> {
     use std::os::unix::fs::OpenOptionsExt;
-    match std::fs::OpenOptions::new()
+    let file = match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(path)
     {
-        // The umask applies to `mode` and can remove owner bits as well.
-        Ok(file) => (calls.created)(&file).map_err(|e| {
-            format!(
-                "cannot set the mode of SQLite database {}: {e}",
-                path.display()
-            )
-        }),
-        // The file exists, or cannot be created here. SQLite's own open
-        // decides what that means and reports it in its usual terms.
-        Err(_) => Ok(()),
-    }
+        Ok(file) => file,
+        Err(e) => return Ok(Err(e)),
+    };
+    (calls.created)(&file).map_err(|e| {
+        format!(
+            "cannot set the mode of SQLite database {}: {e}",
+            path.display()
+        )
+    })?;
+    Ok(Ok(()))
 }
 
-/// Set a file this module has just created to 0600. Closing its descriptor
-/// afterwards releases no lock: the file is new, so no SQLite connection of
-/// this process has it open.
-#[cfg(unix)]
-fn set_created_owner_only(file: &std::fs::File) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+/// As the Unix version, on a platform without Unix modes: the file is
+/// created with the platform's default permissions.
+#[cfg(not(unix))]
+pub(crate) fn create_owner_only(path: &Path) -> Result<std::io::Result<()>, String> {
+    Ok(std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map(drop))
 }
 
 /// Narrow the database file and each sidecar of it to mode 0600 where needed.

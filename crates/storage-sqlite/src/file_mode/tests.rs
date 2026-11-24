@@ -249,7 +249,7 @@ async fn prepare_creates_the_target_of_a_dangling_symlink() {
 /// test's directory is touched, whoever runs the test.
 fn read_only_calls<'a>(existing: &'a dyn Fn(&Path) -> std::io::Result<()>) -> super::ModeCalls<'a> {
     super::ModeCalls {
-        created: &super::set_created_owner_only,
+        created: &crate::serve_lock::set_owner_only,
         existing,
     }
 }
@@ -457,7 +457,7 @@ fn prepare_creates_the_database_file_with_mode_0600() {
     let record = |file: &std::fs::File| {
         let created = file.metadata()?.permissions().mode() & 0o7777;
         *created_with.lock().expect("lock") = Some(created);
-        super::set_created_owner_only(file)
+        crate::serve_lock::set_owner_only(file)
     };
     let calls = super::ModeCalls {
         created: &record,

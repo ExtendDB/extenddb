@@ -1,10 +1,9 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Opening the database file for the runner: the file's mode when the runner
-//! creates it, and the error for a database that cannot be opened.
-
-use std::path::Path;
+//! Opening the database file for the runner: the error for a database that
+//! cannot be opened. The runner creates a missing database file with
+//! `file_mode::create_owner_only`.
 
 use extenddb_storage::migrations::MigrationError;
 
@@ -26,25 +25,4 @@ pub(super) fn open_error(location: &str, e: &sqlx::Error) -> MigrationError {
         ));
     }
     MigrationError::store(format!("open SQLite database {location}"), e)
-}
-
-/// Create the database file with mode 0600 when it does not exist, before
-/// SQLite opens it: the database holds the encryption key once `init` writes
-/// it, and SQLite gives its `-wal` and `-shm` files the database file's mode.
-pub(super) fn create_private(path: &Path) -> Result<(), MigrationError> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    match options.open(path) {
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(MigrationError::store(
-            format!("create the database file {}", path.display()),
-            e,
-        )),
-    }
 }
