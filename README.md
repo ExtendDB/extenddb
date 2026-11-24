@@ -490,11 +490,12 @@ starts with `arn:`, and `ImportTable` /
 `ExportTableToPointInTime` return the "disabled" `ValidationException` that a
 server with no import or export paths gives a request it does not refuse
 before dispatch (the requests it does refuse are under "Checks the server
-makes that this build does not"). As the server does, the build refuses,
-before any table is read, every `RestoreTableToPointInTime` whose body parses
+makes that this build does not"). The build refuses, before any table is
+read, every `RestoreTableToPointInTime` whose body parses
 (`PointInTimeRecoveryUnavailableException`) and an `UpdateContinuousBackups`
 that enables point-in-time recovery (`ContinuousBackupsUnavailableException`),
-so a request naming a missing table gets the refusal too.
+as the server does with each such request it authenticates, so a request
+naming a missing table gets the refusal too.
 
 The wasm workflow's clippy step refuses calls known to trap or hang on
 `wasm32` in the workspace crates this build compiles;
@@ -540,12 +541,14 @@ PostgreSQL backend registers again with its catalog, or the
 `AccessDeniedException` "User: is not authorized to perform this operation" it
 gives a request that passes its signature check and `admit` when its state has
 no catalog store, which `extenddb serve` never builds. The server's name checks
-of a `RestoreTableToPointInTime` never run: on both builds `parse_request`
-refuses one whose body does not parse, and `admit` refuses every other one,
-first. Nor do its **table names**, **table ARNs** and **accounts** checks, or
-the IAM decision of **signature**, run on an `UpdateContinuousBackups` that
-enables point-in-time recovery: `admit` refuses it first, with
-`ContinuousBackupsUnavailableException`, on both builds, whatever its
+of a `RestoreTableToPointInTime` never run: `parse_request` refuses one whose
+body does not parse, the server's authentication one it does not accept, and
+`admit` every other one, first (this build authenticates nothing, so here
+`admit` refuses every one whose body parses). Nor do its **table names**,
+**table ARNs** and **accounts** checks, or the IAM decision of **signature**,
+run on an `UpdateContinuousBackups` that enables point-in-time recovery:
+`admit` refuses every one the server authenticates, and on this build every
+one, first, with `ContinuousBackupsUnavailableException`, whatever its
 `TableName`.
 
 The checks of a request's names and ARNs (**table names**, **index names**,
