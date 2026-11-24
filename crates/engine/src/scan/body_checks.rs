@@ -70,12 +70,21 @@ pub(crate) fn checked_body(mut body: Value, raw_body: &[u8]) -> Result<CheckedBo
         .projection_expression
         .as_ref()
         .is_some_and(|s| !s.is_empty());
+    // The service's values message depends on the path. On the newer path
+    // (order R) it has no suffix (#765). On the older path (order U: a float
+    // or out of range Limit, Segment or TotalSegments, or a value it cannot
+    // read as one type) it names FilterExpression as null (measured
+    // 2026-11-24 beside `Limit: 1.5`).
+    let value_expr_params: &[ExpressionKind] = match order {
+        CheckOrder::Unreadable => &[ExpressionKind::Filter],
+        CheckOrder::Readable => &[],
+    };
     extenddb_core::expression::validate_expression_param_usage(
         input.expression_attribute_names.as_ref(),
         has_proj_expr || has_filter_expr,
         input.expression_attribute_values.as_ref(),
         has_filter_expr,
-        &[ExpressionKind::Filter],
+        value_expr_params,
     )?;
 
     // Order U: a faulty ScanFilter list value, after the no-expression checks
