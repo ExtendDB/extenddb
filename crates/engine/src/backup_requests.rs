@@ -137,7 +137,7 @@ pub(crate) fn validate_name_member(
 
 /// The length bounds for a `TableName` member: the deployment's, which
 /// default to the model's 3 to 255.
-pub(crate) fn table_name_bounds(limits: &LimitsConfig) -> (usize, usize) {
+fn table_name_bounds(limits: &LimitsConfig) -> (usize, usize) {
     (limits.min_table_name_length, limits.max_table_name_length)
 }
 
