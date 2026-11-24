@@ -1622,7 +1622,7 @@
       "error": "SerializationException",
       "checks": [
         {
-          "path": "/message",
+          "path": "/Message",
           "equals": "Start of structure or map found where not expected: missing field `IndexName`"
         }
       ]
@@ -2280,7 +2280,7 @@
       "error": "SerializationException",
       "checks": [
         {
-          "path": "/message",
+          "path": "/Message",
           "contains": "Start of structure or map found where not expected"
         }
       ]
@@ -2292,7 +2292,7 @@
       "error": "SerializationException",
       "checks": [
         {
-          "path": "/message",
+          "path": "/Message",
           "contains": "Start of structure or map found where not expected"
         }
       ]
@@ -2304,7 +2304,7 @@
       "error": "SerializationException",
       "checks": [
         {
-          "path": "/message",
+          "path": "/Message",
           "contains": "Start of structure or map found where not expected"
         }
       ]
@@ -2316,7 +2316,7 @@
       "error": "SerializationException",
       "checks": [
         {
-          "path": "/message",
+          "path": "/Message",
           "contains": "Start of structure or map found where not expected"
         }
       ]
@@ -2328,7 +2328,7 @@
       "error": "SerializationException",
       "checks": [
         {
-          "path": "/message",
+          "path": "/Message",
           "contains": "Start of structure or map found where not expected"
         }
       ]
@@ -2340,7 +2340,7 @@
       "error": "SerializationException",
       "checks": [
         {
-          "path": "/message",
+          "path": "/Message",
           "contains": "Start of structure or map found where not expected"
         }
       ]
@@ -2352,7 +2352,7 @@
       "error": "SerializationException",
       "checks": [
         {
-          "path": "/message",
+          "path": "/Message",
           "contains": "Start of structure or map found where not expected"
         }
       ]
@@ -2554,7 +2554,7 @@
       "error": "SerializationException",
       "checks": [
         {
-          "path": "/message",
+          "path": "/Message",
           "equals": "Start of structure or map found where not expected: key must be a string at line 1 column 3"
         }
       ]
@@ -4898,7 +4898,7 @@
       "error": "SerializationException",
       "checks": [
         {
-          "path": "/message",
+          "path": "/Message",
           "equals": "missing field `ShardIterator`"
         }
       ]
@@ -4912,7 +4912,7 @@
       "error": "SerializationException",
       "checks": [
         {
-          "path": "/message",
+          "path": "/Message",
           "equals": "invalid type: integer `5`, expected a string"
         }
       ]
@@ -4926,7 +4926,7 @@
       "error": "SerializationException",
       "checks": [
         {
-          "path": "/message",
+          "path": "/Message",
           "equals": "invalid type: null, expected a string"
         }
       ]
@@ -4938,7 +4938,7 @@
       "error": "SerializationException",
       "checks": [
         {
-          "path": "/message",
+          "path": "/Message",
           "equals": "invalid length 0, expected struct GetRecordsInput with 2 elements"
         }
       ]
@@ -4953,7 +4953,7 @@
       "error": "SerializationException",
       "checks": [
         {
-          "path": "/message",
+          "path": "/Message",
           "equals": "invalid type: string \"5\", expected i64"
         }
       ]
@@ -4995,7 +4995,7 @@
       "error": "SerializationException",
       "checks": [
         {
-          "path": "/message",
+          "path": "/Message",
           "equals": "Start of structure or map found where not expected: missing field `Key`"
         }
       ]
