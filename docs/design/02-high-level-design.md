@@ -153,6 +153,7 @@ graph TD
 
     ENGINE --> CORE
     ENGINE --> STORAGE
+    ENGINE --> AUTH
 
     AUTH --> CORE
 
@@ -160,9 +161,10 @@ graph TD
     STORAGE_PG --> CORE
 
     STORAGE --> CORE
+    STORAGE --> AUTH
 ```
 
-**Key principle:** `core` depends on nothing in the workspace and has no async runtime — it is sync Rust (types, expressions, validation, capacity, errors). `storage` depends only on `core`. `engine` depends on `core` + `storage` and contains the async operation handlers. Backend crates depend on `storage` + `core`. `auth` depends on `core`. `server` depends on `core` + `storage` + `auth` + `engine`. `bin` wires everything together.
+**Key principle:** `core` depends on nothing in the workspace and has no async runtime — it is sync Rust (types, expressions, validation, capacity, errors, and the crypto primitives that `auth` and `storage` share). `auth` depends on `core` and `cache`. `storage` depends on `core` and `auth`. `engine` depends on `core`, `auth` and `storage` (and on `backup-store`, except on wasm32) and contains the async operation handlers. Backend crates depend on `storage`, `auth` and `core`. `server` depends on `core`, `storage`, `auth` and `engine`, and on `cache`, `config` and `backup-store`. `bin` wires everything together. The graph above shows the main edges only.
 
 ## 3. Request Lifecycle
 
@@ -443,8 +445,8 @@ There is no in-memory locking (no `Mutex`, `RwLock`, or similar) on the data pat
 | TLS | rustls | No OpenSSL dependency; cryptography from AWS-LC through aws-lc-rs |
 | PostgreSQL driver | sqlx | Async, compile-time query checking, migrations |
 | Serialization | serde + serde_json | Standard, zero-copy where possible |
-| Crypto (SigV4) | aws-lc-rs | HMAC-SHA256, SHA-256 and the constant-time signature compare from AWS-LC, the library rustls already uses ([ADR-0026](../adr/0026-credential-crypto-on-aws-lc.md)) |
-| Crypto (encryption) | aws-lc-rs | AES-256-GCM for credential encryption, in one module (`extenddb_storage::secret_cipher`) |
+| Crypto (SigV4) | aws-lc-rs; on wasm32, `sha2`, `hmac` and `subtle` | HMAC-SHA256, SHA-256 and the constant-time signature compare from AWS-LC, the library rustls already uses ([ADR-0026](../adr/0026-credential-crypto-on-aws-lc.md)); AWS-LC does not build for wasm32. Both backends sit in one module, `extenddb_core::crypto` (`crates/core/src/crypto.rs`) |
+| Crypto (encryption) | aws-lc-rs; on wasm32, `aes-gcm` and `getrandom` | AES-256-GCM for credential encryption, from the same `extenddb_core::crypto` module; `extenddb_storage::secret_cipher` calls it |
 | Compression | flate2 | gzip support |
 | CRC32 | crc32fast | SIMD-accelerated |
 | CLI | clap | Standard Rust CLI framework |
