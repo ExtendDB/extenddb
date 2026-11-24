@@ -733,6 +733,39 @@ mod tests {
         let exists_only =
             || "EXISTS can only be used in ExecuteTransaction write requests.".to_owned();
         let in_transaction = || "Unsupported operation in transaction.".to_owned();
+        let count = |name: &str, n: usize| {
+            format!(
+                "Incorrect number of operands for operator or function; operator or function: \
+                 {name}, number of operands: {n}"
+            )
+        };
+        let overflow = || {
+            "Number overflow. Attempting to store a number with magnitude larger than supported \
+             range under root"
+                .to_owned()
+        };
+        let operator =
+            |op: &str| format!("Unsupported operator in Condition Expression. Operator: {op}");
+        let path = |name: &str| {
+            format!("Operator or function requires a document path; operator or function: {name}")
+        };
+        let in_limit = || {
+            "The IN operator is provided with too many operands; number of operands: 101".to_owned()
+        };
+        let operator_limit =
+            || "The expression contains too many operators; operator count: 301".to_owned();
+        let is_left_side = || {
+            "The left hand side argument to IS must be a Variable Reference, Literal, or Path"
+                .to_owned()
+        };
+        let in101 = format!(
+            "a IN [{}]",
+            (1..=101)
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let ops150 = ["a = 1"; 150].join(" AND ");
         let table_lookup = String::new;
         #[rustfmt::skip]
         let rows = [
@@ -822,6 +855,125 @@ mod tests {
             ("X2", es, select("\"SIZE\"(m) = 1"), table_lookup()),
             ("X23", es, select("\"Attribute_Exists\"(m)"), table_lookup()),
             ("X39", es, select("\"Contains\"(m, 'a')"), table_lookup()),
+            // A condition function with the wrong number of operands, quoted
+            // or not and in any case, wherever the call stands (at the start
+            // of a predicate, after NOT, in parentheses, on either side of a
+            // comparison, as a BETWEEN bound, as an IN member), after a
+            // syntax error and after what the walk of the condition meets
+            // (measured 2026-11-23 and 2026-11-24).
+            ("Y6", es, select("contains(m)"), count("contains", 1)),
+            ("Y5", es, select("\"Contains\"(m)"), count("contains", 1)),
+            ("Y8", es, select("size(m, 1) = 1"), count("size", 2)),
+            ("Y7", es, select("\"Size\"(m, 1) = 1"), count("size", 2)),
+            ("H9b", es, select("begins_with(m)"), count("begins_with", 1)),
+            ("H9a", es, select("\"Begins_With\"(m)"), count("begins_with", 1)),
+            ("H11b", es, select("attribute_exists(m, 1)"), count("attribute_exists", 2)),
+            ("H11a", es, select("\"Attribute_Exists\"(m, 1)"), count("attribute_exists", 2)),
+            ("K1", es, select("attribute_exists()"), count("attribute_exists", 0)),
+            ("K2", es, select("attribute_not_exists(m, 1)"), count("attribute_not_exists", 2)),
+            ("K3", es, select("\"Attribute_Not_Exists\"(m, 1)"), count("attribute_not_exists", 2)),
+            ("K4", es, select("attribute_type(m)"), count("attribute_type", 1)),
+            ("K5", es, select("attribute_type(m, 'S', 1)"), count("attribute_type", 3)),
+            ("K6", es, select("\"Attribute_Type\"(m)"), count("attribute_type", 1)),
+            ("K7", es, select("begins_with(m, 'a', 'b')"), count("begins_with", 3)),
+            ("K8", es, select("contains(m, 'a', 'b')"), count("contains", 3)),
+            ("K9", es, select("\"CONTAINS\"(m, 'a', 'b')"), count("contains", 3)),
+            ("K10", es, select("size() = 1"), count("size", 0)),
+            ("K11", es, select("\"size\"() = 1"), count("size", 0)),
+            ("K12", es, select("contains()"), count("contains", 0)),
+            ("K13", es, select("contains(m) AND b = 1e126"), overflow()),
+            ("K14", es, select("contains(m) AND"), no_right_side()),
+            ("K15", es, format!("SELECT * FROM {TABLE} WHERE contains(m) AND pk = 'q'"), count("contains", 1)),
+            ("K16", es, format!("SELECT * FROM {TABLE} WHERE pk = 'q' OR contains(m)"), count("contains", 1)),
+            ("P1", es, select("a = size(m, 1)"), count("size", 2)),
+            ("P2", es, select("a < size()"), count("size", 0)),
+            ("P4", es, select("NOT contains(m)"), count("contains", 1)),
+            ("P5", es, select("(contains(m))"), count("contains", 1)),
+            ("P6", es, select("a BETWEEN size(m, 1) AND 2"), count("size", 2)),
+            ("P7", es, select("a IN [size(m, 1)]"), count("size", 2)),
+            ("G1", es, select("a = contains(m)"), count("contains", 1)),
+            ("G3", es, select("a = attribute_exists(m, 1)"), count("attribute_exists", 2)),
+            ("D11", es, format!("UPDATE {TABLE} SET a = size(m) WHERE pk = 'q' AND contains(m)"), count("contains", 1)),
+            // A literal in `attribute_exists` or `attribute_not_exists` gets
+            // the path check wherever the call stands in the condition,
+            // quoted or not (measured 2026-11-24).
+            ("P1", es, select("a = attribute_exists(1)"), path("attribute_exists")),
+            ("P2", es, select("a = attribute_not_exists(1)"), path("attribute_not_exists")),
+            ("P3", es, select("a IN [attribute_exists(1)]"), path("attribute_exists")),
+            ("P4", es, select("size(attribute_exists(1)) = 1"), path("attribute_exists")),
+            ("P5", es, select("a BETWEEN attribute_exists(1) AND 2"), path("attribute_exists")),
+            ("P6", es, select("contains(m, attribute_exists(1))"), path("attribute_exists")),
+            ("P7", es, select("a = \"Attribute_Not_Exists\"(1)"), path("attribute_not_exists")),
+            ("X8", es, select("a = \"Attribute_Exists\"(1)"), path("attribute_exists")),
+            // The operand count and the path check of a condition function
+            // or of IS MISSING, the IN list limit and the operator count come
+            // in written order, each check of a call or of IS MISSING ahead
+            // of its own count as an operator, after a number, an operator,
+            // an AND or OR argument that is not a condition, an IN with no
+            // list and an IS after the call (measured 2026-11-24).
+            // `attribute_exists(1) AND a = <<1, 1>>`, which the service
+            // refuses for the set, is left out: the parser gives that set
+            // another text (#886).
+            ("C1", es, select("attribute_exists(m, 1) AND attribute_exists(1)"), count("attribute_exists", 2)),
+            ("O1", es, select("attribute_exists(1) AND attribute_exists(m, 1)"), path("attribute_exists")),
+            ("O2", es, select("contains(m) AND attribute_exists(1)"), count("contains", 1)),
+            ("O3", es, select("attribute_exists(1) AND contains(m)"), path("attribute_exists")),
+            ("O16", es, select("attribute_not_exists(1) AND contains(m)"), path("attribute_not_exists")),
+            ("C4", es, select(&format!("attribute_exists(m, 1) AND {in101}")), count("attribute_exists", 2)),
+            ("C5", es, select(&format!("{in101} AND attribute_exists(m, 1)")), in_limit()),
+            ("O5", es, select(&format!("attribute_exists(1) AND {in101}")), path("attribute_exists")),
+            ("O6", es, select(&format!("{in101} AND attribute_exists(1)")), in_limit()),
+            ("O10", es, select(&format!("{in101} AND contains(m)")), in_limit()),
+            ("O11", es, select(&format!("contains(m) AND {in101}")), count("contains", 1)),
+            ("C6", es, select(&format!("attribute_exists(m, 1) AND {ops150}")), count("attribute_exists", 2)),
+            ("O4", es, select(&format!("{ops150} AND attribute_exists(m, 1)")), operator_limit()),
+            ("O7", es, select(&format!("attribute_exists(1) AND {ops150}")), path("attribute_exists")),
+            ("O12", es, select(&format!("{ops150} AND contains(m)")), operator_limit()),
+            ("C18", es, select("attribute_exists(1) AND b = 1e126"), overflow()),
+            ("O14", es, select("attribute_exists(1) AND a + 1 = 2"), operator("+")),
+            ("C8", es, select("attribute_exists(m, 1) AND a + 1 = 2"), operator("+")),
+            ("C10", es, select("attribute_exists(m, 1) AND a"), "The arguments to AND/OR must be Expressions".to_owned()),
+            ("C3", es, select("attribute_exists(m, 1) AND a IN 1"), "IN operator must have a left hand argument of type Variable Reference and right hand argument of type Seq with at least one member".to_owned()),
+            ("R1", es, select("attribute_exists(1) AND 1 IS MISSING"), path("attribute_exists")),
+            ("R2", es, select("attribute_exists(m, 1) AND 1 IS MISSING"), count("attribute_exists", 2)),
+            ("R3", es, select("\"Attribute_Exists\"(1) AND 1 IS MISSING"), path("attribute_exists")),
+            ("R4", es, select("attribute_exists(1) AND true IS MISSING"), path("attribute_exists")),
+            ("R8", es, format!("DELETE FROM {TABLE} WHERE pk = 'q' AND attribute_exists(1) AND 1 IS MISSING"), path("attribute_exists")),
+            ("R10", es, select(&format!("{}attribute_exists(1)", "a = 1 AND ".repeat(149))), path("attribute_exists")),
+            ("R13", es, select(&format!("{}contains(m)", "a = 1 AND ".repeat(149))), count("contains", 1)),
+            ("Z21", es, select(&format!("{}1 IS MISSING", "a = 1 AND ".repeat(149))), path("attribute_not_exists")),
+            ("B2", es, select(&format!("{}NOT attribute_exists(1)", "a = 1 AND ".repeat(149))), path("attribute_exists")),
+            ("C5", es, select(&format!("{}a = 1 AND NOT attribute_exists(1)", "a = 1 AND ".repeat(148))), path("attribute_exists")),
+            ("N1", es, select(&format!("{}NOT 1 IS MISSING", "a = 1 AND ".repeat(149))), path("attribute_not_exists")),
+            ("N2", es, select(&format!("{}NOT attribute_exists(m, 1)", "a = 1 AND ".repeat(149))), count("attribute_exists", 2)),
+            ("N3", es, select(&format!("{}NOT contains(m)", "a = 1 AND ".repeat(149))), count("contains", 1)),
+            ("R28", es, select(&format!("{ops150} AND attribute_exists(1)")), operator_limit()),
+            ("R16", es, select("attribute_exists(1) IS NULL"), is_left_side()),
+            // A quoted condition function reads as any other call, with what
+            // may follow an operand, and a quoted presence function as a
+            // predicate gets the path check. In the brackets of an ORDER BY
+            // term or a SET target a condition function gets the brackets'
+            // answer (measured 2026-11-24).
+            ("A1", es, select("\"Size\"(m) BETWEEN 1 AND 2"), table_lookup()),
+            ("A3", es, select("\"Size\"(m) IN [1, 2]"), table_lookup()),
+            ("A8", es, select("(\"Size\"(m)) = 1"), table_lookup()),
+            ("A6", es, select("\"Size\"(m) + 1 = 2"), operator("+")),
+            ("A16", es, select("\"Contains\"(m, 'a') + 1 = 2"), operator("+")),
+            ("A13", es, select("\"Size\"(m LIKE 'x') = 1"), operator("like")),
+            ("A14", es, select("\"Contains\"(m LIKE 'x', 'a')"), operator("like")),
+            ("A10", es, select("\"Size\"(m) IS NULL"), is_left_side()),
+            ("A22", es, select("\"Size\"(m, 1)"), count("size", 2)),
+            ("A19", es, select("\"Attribute_Exists\"(1)"), path("attribute_exists")),
+            ("O15", es, select("\"Attribute_Not_Exists\"(1)"), path("attribute_not_exists")),
+            ("O8", es, select("\"Attribute_Exists\"(1) AND contains(m)"), path("attribute_exists")),
+            ("O9", es, select("contains(m) AND \"Attribute_Exists\"(1)"), count("contains", 1)),
+            ("O13", es, select("\"Attribute_Exists\"(1) AND b = 1e126"), overflow()),
+            ("B7", es, format!("SELECT * FROM {TABLE} WHERE pk = 'q' ORDER BY m[\"Attribute_Exists\"(1)]"), table_lookup()),
+            ("B7u", es, format!("SELECT * FROM {TABLE} WHERE pk = 'q' ORDER BY m[attribute_exists(1)]"), table_lookup()),
+            ("B7c", es, format!("SELECT * FROM {TABLE} WHERE pk = 'q' ORDER BY m[attribute_exists(m, 1)]"), table_lookup()),
+            ("B9", es, update("m[\"Attribute_Exists\"(1)] = 1"), wf("Invalid path component for simple path")),
+            ("B9u", es, update("m[attribute_exists(1)] = 1"), wf("Invalid path component for simple path")),
+            ("B11", es, update("m[attribute_exists(x, 1)] = 1"), wf("Invalid path component for simple path")),
             // NOT in a SET value, refused ahead of what its operand holds.
             ("N1", es, update("x = NOT a"), update_not()),
             ("N2", es, update("x = NOT NOT a"), update_not()),

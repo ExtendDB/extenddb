@@ -6,10 +6,11 @@
 use super::limits::{MAX_OPERATORS, Nest};
 use super::{
     AND_OR_ARGUMENTS, BARE_OPERAND, Brackets, GROUPED_OPERAND, NO_COMPARISON, NOT_A_CONDITION,
-    NOT_ARGUMENT, PResult, ParseError, Parser, forms,
+    NOT_ARGUMENT, PResult, ParseError, Parser,
 };
 use crate::partiql::ast::{CompareOp, Operand, Path, TypeName, WhereExpr};
 use crate::partiql::lexer::{Token, TokenKind};
+use crate::partiql::values::{self, CONDITION_FUNCTIONS};
 
 impl Parser {
     // --- where expression ---
@@ -99,17 +100,23 @@ impl Parser {
 
     /// `NOT`, any number of times, before a predicate. The run is read in a
     /// loop, so its length costs no stack. The predicate is one part of the
-    /// walk of the condition (see [`walk`]).
+    /// walk of the condition (see [`walk`]). The NOTs count as operators once
+    /// the predicate is read, so a check of a call or of IS MISSING in it
+    /// comes ahead of their count (measured 2026-11-24, each twice: after 300
+    /// operators, `NOT attribute_exists(1)` and `NOT 1 IS MISSING` get the
+    /// path refusal and `NOT contains(m)` the operand count).
     fn not_expr(&mut self) -> PResult<WhereExpr> {
         let mut nots = 0;
         while self.eat_keyword("NOT") {
-            self.count_operator();
             nots += 1;
         }
         self.after_not = nots > 0;
         let before = self.walk_part();
         let predicate = self.predicate();
         self.end_walk_part(before);
+        for _ in 0..nots {
+            self.count_operator();
+        }
         let mut expr = predicate?;
         for _ in 0..nots.min(MAX_OPERATORS + 1) {
             expr = WhereExpr::Not(Box::new(expr));
@@ -153,59 +160,34 @@ impl Parser {
 
     /// A predicate that is not in parentheses: a condition function, or an
     /// operand and what follows it.
+    ///
+    /// A condition function is an unquoted name in any case. With another
+    /// number of operands than it takes (see [`Parser::check_operand_count`])
+    /// the predicate stands for the call and never runs.
     #[inline(never)]
     fn term_predicate(&mut self) -> PResult<WhereExpr> {
-        // Function-style predicates: begins_with / contains / attribute_type.
-        if let TokenKind::Ident(name) = &self.peek().kind {
-            let lname = name.to_ascii_lowercase();
-            if matches!(
-                lname.as_str(),
-                "begins_with" | "contains" | "attribute_type"
-            ) && matches!(
-                self.tokens.get(self.pos + 1).map(|t| &t.kind),
-                Some(TokenKind::LParen)
-            ) {
-                self.count_operator();
-                self.bump();
-                let args = self.call_args()?;
-                if args.len() != 2 {
-                    return Err(ParseError::new(format!("{lname} requires two arguments")));
-                }
+        if let Some(name) = self.condition_function_ahead() {
+            let within = self.within_operator_limit();
+            self.count_operator();
+            self.bump();
+            let args = self.call_args()?;
+            let counted = self.check_operand_count(&name, &args, within);
+            let predicate = if name == "size" {
+                // A size call is the left side of a comparison.
+                self.finish_comparison(Operand::Function(name, args))?
+            } else if !counted || args.len() == 1 {
+                WhereExpr::Function(name, args)
+            } else {
                 let mut it = args.into_iter();
                 let a = it.next().unwrap();
                 let b = it.next().unwrap();
-                return self.after_predicate(match lname.as_str() {
+                match name.as_str() {
                     "begins_with" => WhereExpr::BeginsWith(a, b),
                     "contains" => WhereExpr::Contains(a, b),
                     _ => WhereExpr::AttributeType(a, b),
-                });
-            }
-            // In brackets a size call may stand alone as a value, so it is
-            // read as an operand (measured 2026-11-06: `m[k[size(x)]]` is
-            // refused at the `k`).
-            let value_call = lname == "size" && self.brackets == Brackets::Inner;
-            if matches!(
-                lname.as_str(),
-                "attribute_exists" | "attribute_not_exists" | "size"
-            ) && !value_call
-                && matches!(
-                    self.tokens.get(self.pos + 1).map(|t| &t.kind),
-                    Some(TokenKind::LParen)
-                )
-            {
-                self.count_operator();
-                self.bump();
-                let args = self.call_args()?;
-                // size(...) can appear as the left of a comparison; handle that below
-                // by treating the function as an operand. Here with no comparison it is
-                // a bare boolean function (attribute_exists / attribute_not_exists).
-                if lname == "size" {
-                    let comparison = self.finish_comparison(Operand::Function(lname, args))?;
-                    return self.after_predicate(comparison);
                 }
-                forms::check_presence_operands(&lname, &args)?;
-                return self.after_predicate(WhereExpr::Function(lname, args));
-            }
+            };
+            return self.after_predicate(predicate);
         }
         let left_start = self.pos;
         let exec = self.is_keyword("EXEC");
@@ -350,6 +332,77 @@ impl Parser {
                 | TokenKind::Gt
                 | TokenKind::Ge
         )
+    }
+
+    /// The condition function at the current token with `(` after it, by the
+    /// name the code compares it by (see [`values::call_ahead`]), or `None`.
+    /// A quoted name is read as any other call is (see [`Parser::call`]),
+    /// with what may follow an operand (measured 2026-11-24: `"Size"(m)
+    /// BETWEEN 1 AND 2` runs, and `"Size"(m) + 1 = 2` and `"Contains"(m LIKE
+    /// 'x', 'a')` are refused for the operator). In brackets a size call may
+    /// stand alone as a value, so it is read as an operand (measured
+    /// 2026-11-06: `m[k[size(x)]]` is refused at the `k`).
+    fn condition_function_ahead(&self) -> Option<String> {
+        if !matches!(self.peek().kind, TokenKind::Ident(_)) {
+            return None;
+        }
+        values::call_ahead(&self.tokens, self.pos).filter(|name| {
+            CONDITION_FUNCTIONS.contains(&name.as_str())
+                && !(name == "size" && self.brackets == Brackets::Inner)
+        })
+    }
+
+    /// The operand count check on a call in a condition, `name` as the code
+    /// compares it (see [`values::call_name`]) and `args` its arguments:
+    /// `attribute_exists`, `attribute_not_exists` and `size` take one
+    /// operand, `attribute_type`, `begins_with` and `contains` two, and a
+    /// condition function with another number is refused in its place among
+    /// the operand refusals (see [`Parser::refuse_before_count`]). Measured
+    /// 2026-11-23 and 2026-11-24 for each function, quoted or not, where a
+    /// predicate starts; for `contains` after NOT and in parentheses; for
+    /// `size`, `contains` and `attribute_exists` on the right of a
+    /// comparison; and for `size` as a BETWEEN bound and as an IN member.
+    /// Any other call takes any arguments. A call with the operands it takes
+    /// gets the path check (see [`Parser::check_presence_operand`]). Both
+    /// checks take `within`, whether the condition was within its operator
+    /// limit before the call was counted. Returns whether the call has the
+    /// operands it takes.
+    pub(super) fn check_operand_count(
+        &mut self,
+        name: &str,
+        args: &[Operand],
+        within: bool,
+    ) -> bool {
+        if !CONDITION_FUNCTIONS.contains(&name) {
+            return true;
+        }
+        let operands = match name {
+            "attribute_exists" | "attribute_not_exists" | "size" => 1,
+            _ => 2,
+        };
+        if args.len() != operands {
+            self.refuse_before_count(&values::operand_count_refusal(name, args.len()), within);
+            return false;
+        }
+        self.check_presence_operand(name, args, within);
+        true
+    }
+
+    /// The operand check on `attribute_exists` and `attribute_not_exists`
+    /// with one operand, `name` as the code compares it: the operand is a
+    /// document path rather than a literal or a parameter, or the call is
+    /// refused among the operand refusals, wherever it stands in the
+    /// condition (measured 2026-11-02 where a predicate starts, and
+    /// 2026-11-24 quoted or not there, on the right of a comparison, as an
+    /// IN member, as a BETWEEN bound and as an operand of `size` and
+    /// `contains`). The check comes ahead of the call's count as an operator
+    /// (see [`Parser::refuse_before_count`]).
+    fn check_presence_operand(&mut self, name: &str, args: &[Operand], within: bool) {
+        if matches!(name, "attribute_exists" | "attribute_not_exists")
+            && !matches!(args[0], Operand::Path(_))
+        {
+            self.refuse_before_count(&values::path_operand_refusal(name), within);
+        }
     }
 
     fn finish_comparison(&mut self, left: Operand) -> PResult<WhereExpr> {

@@ -203,18 +203,6 @@ fn attribute_exists_needs_a_document_path() {
 }
 
 #[test]
-fn attribute_exists_needs_exactly_one_operand() {
-    assert_eq!(
-        err("SELECT * FROM \"t\" WHERE pk = 'p' AND attribute_exists()"),
-        "Incorrect number of operands for operator or function; operator or function: attribute_exists, number of operands: 0"
-    );
-    assert_eq!(
-        err("SELECT * FROM \"t\" WHERE pk = 'p' AND attribute_exists(ss, ns)"),
-        "Incorrect number of operands for operator or function; operator or function: attribute_exists, number of operands: 2"
-    );
-}
-
-#[test]
 fn a_condition_function_compared_with_a_boolean() {
     let condition = |sql: &str| match parse(sql).unwrap() {
         Statement::Select(s) => match s.where_clause.unwrap() {

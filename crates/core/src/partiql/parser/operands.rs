@@ -7,7 +7,7 @@ use super::limits::Nest;
 use super::{LITERAL_ROOT, PResult, ParseError, Parser, terms};
 use crate::partiql::ast::{ArithOp, Operand};
 use crate::partiql::lexer::{TokenKind, WordClass, is_function_keyword, word_class};
-use crate::partiql::values::{AGGREGATES, Call, FORMS, call_name};
+use crate::partiql::values::{AGGREGATES, Call, FORMS, call_name, operand_count_refusal};
 use crate::types::AttributeValue;
 
 /// A number literal with the signs written before it folded in (see
@@ -170,9 +170,7 @@ impl Parser {
             if self.in_where {
                 self.refuse_condition_operator(op);
             } else {
-                self.defer_sign(&format!(
-                    "Incorrect number of operands for operator or function; operator or function: {op}, number of operands: 1"
-                ));
+                self.defer_sign(&operand_count_refusal(op, 1));
             }
         }
         self.end_walk_part(before);
@@ -312,9 +310,11 @@ impl Parser {
     /// compares it (see [`call_name`]). Its arguments are read by the rules
     /// of its form (see [`Parser::form_arguments`]). In a condition the call
     /// is refused by its name once the statement parses (see
-    /// [`Call::refusal`]); in a SET value the checks made then refuse it (see
-    /// `values`).
+    /// [`Call::refusal`]), and a condition function by its operands (see
+    /// [`Parser::check_operand_count`]); in a SET value the checks made then
+    /// refuse it (see `values`).
     fn call(&mut self, name: String) -> PResult<Operand> {
+        let within = self.within_operator_limit();
         self.count_operator();
         let at = self.span();
         self.bump();
@@ -337,6 +337,9 @@ impl Parser {
         // for the `+`).
         if let Some(refusal) = refusal {
             self.defer(&refusal);
+        }
+        if self.in_where {
+            self.check_operand_count(&call.name, &args, within);
         }
         Ok(Operand::Function(call.name, args))
     }
