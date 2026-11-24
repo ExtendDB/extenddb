@@ -10,51 +10,24 @@
 
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{ExpressionMaps, Projection};
-use extenddb_core::types::{
-    AttributeValue, DescribeTableInput, Item, ReturnConsumedCapacity, item_size_bytes,
-};
+use extenddb_core::types::{DescribeTableInput, Item, ReturnConsumedCapacity, item_size_bytes};
 
 #[path = "search_vectors_condition.rs"]
 mod condition;
+
+#[path = "search_vectors_request.rs"]
+mod request;
 
 use crate::OperationContext;
 use crate::create_table::storage_err_to_dynamo;
 use crate::serialize_output;
 use crate::{DispatchMetrics, DispatchResult};
-
-/// Minimum length of a vector index name.
-const MIN_INDEX_NAME_LENGTH: usize = 3;
-/// Maximum number of nearest neighbors a single search may request.
-const MAX_TOP_K: i64 = 100;
-/// Maximum number of elements in a search vector.
-const MAX_SEARCH_VECTOR_LENGTH: usize = 4096;
-/// `SearchVectors` request body.
-#[derive(Debug, Clone, Deserialize)]
-struct SearchVectorsInput {
-    #[serde(rename = "TableName")]
-    table_name: String,
-    #[serde(rename = "IndexName")]
-    index_name: String,
-    #[serde(rename = "SearchVector")]
-    search_vector: Vec<AttributeValue>,
-    #[serde(rename = "TopK")]
-    top_k: i64,
-    #[serde(rename = "SearchConditionExpression")]
-    search_condition_expression: Option<String>,
-    #[serde(rename = "ProjectionExpression")]
-    projection_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames")]
-    expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(rename = "ExpressionAttributeValues")]
-    expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-    #[serde(rename = "ReturnConsumedCapacity", default)]
-    return_consumed_capacity: ReturnConsumedCapacity,
-}
+use request::{MAX_TOP_K, MIN_INDEX_NAME_LENGTH, SearchVectorsInput, parse_search_vector};
 
 /// A single search result: the item plus its similarity score.
 #[derive(Debug, Serialize)]
@@ -332,50 +305,6 @@ pub async fn handle_search_vectors(
     })
 }
 
-/// Validate a `SearchVector` and convert it into `f32`.
-///
-/// Checks the length bounds (1..=`MAX_SEARCH_VECTOR_LENGTH`) and that every
-/// element is a finite number before converting.
-fn parse_search_vector(values: &[AttributeValue]) -> Result<Vec<f32>, DynamoDbError> {
-    if values.is_empty() {
-        return Err(DynamoDbError::ValidationException(
-            "1 validation error detected: Value at 'SearchVector' failed to satisfy constraint: \
-             Member must have length greater than or equal to 1"
-                .to_owned(),
-        ));
-    }
-    if values.len() > MAX_SEARCH_VECTOR_LENGTH {
-        return Err(DynamoDbError::ValidationException(format!(
-            "1 validation error detected: Value at 'SearchVector' failed to satisfy constraint: \
-             Member must have length less than or equal to {MAX_SEARCH_VECTOR_LENGTH}"
-        )));
-    }
-    let mut out = Vec::with_capacity(values.len());
-    for v in values {
-        match v {
-            AttributeValue::N(n) => {
-                let f = n.parse::<f32>().map_err(|_| {
-                    DynamoDbError::ValidationException(
-                        "Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute".to_owned(),
-                    )
-                })?;
-                if !f.is_finite() {
-                    return Err(DynamoDbError::ValidationException(
-                        "Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute".to_owned(),
-                    ));
-                }
-                out.push(f);
-            }
-            _ => {
-                return Err(DynamoDbError::ValidationException(
-                    "Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute".to_owned(),
-                ));
-            }
-        }
-    }
-    Ok(out)
-}
-
 /// Bytes reported as `ConsumedCapacity.VectorSearchRequestBytes` for one search.
 ///
 /// `returned_non_vector_bytes` is the summed stored size of the items actually
@@ -454,8 +383,10 @@ mod order_tests;
 #[cfg(test)]
 mod tests {
     use super::condition::resolve_search_scope;
+    use super::request::MAX_SEARCH_VECTOR_LENGTH;
     use super::*;
     use extenddb_core::expression::SearchCondition;
+    use extenddb_core::types::AttributeValue;
     use extenddb_core::types::{
         AttributeDefinition, ScalarAttributeType, SearchSchemaElement, SearchSchemaElementType,
     };
