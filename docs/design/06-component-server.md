@@ -362,9 +362,11 @@ ExtendDB's own `AccountId` dimension.
   one-second and 1,441 one-minute buckets, 111,488 bytes. So the breakdown
   holds at most `accounts x operations x 111,488` bytes of buckets, plus the
   keys and map entries. A pair with one request a day holds two buckets. With
-  its keys and map entries it takes about 340 bytes when its account sends many
-  operations, and about 810 bytes when its account sends only that operation
-  (release build, counting allocator, 23 November 2026). A ring's allocation
+  its keys and map entries it takes 286 to 429 bytes when its account sends 3
+  to 40 operations. The cost steps up each time the account's map of
+  operations grows. It is 475 bytes with 2 operations. It is 810 bytes when its
+  account sends only that operation (release build, counting allocator, 1,000
+  accounts, 24 November 2026). A ring's allocation
   does not shrink: a pair keeps the largest allocation it reached until a day
   passes with no request for it. With the 40 operations the server dispatches,
   an account that sends every operation every second holds about 4.46 MB

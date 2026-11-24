@@ -394,9 +394,11 @@ or one minute of the last day. A bucket exists only for a second or minute in
 which the account sent that operation. An operation the account sends every
 second holds the most buckets, 1,742, which is 111,488 bytes (109 KiB). An
 operation the account sends once a day holds two buckets. With its keys and
-map entries that is about 340 bytes when the account sends many operations,
-and about 810 bytes when the account sends only that operation (measured on a
-release build with a counting allocator, 23 November 2026). With the 40
+map entries that is 286 to 429 bytes when the account sends 3 to 40
+operations. The cost steps up each time the account's map of operations grows.
+It is 475 bytes with 2 operations, and 810 bytes when the account sends only
+that operation. These figures come from a release build with a counting
+allocator and 1,000 accounts, on 24 November 2026. With the 40
 operations the server dispatches, an account that sends every operation every
 second holds about 4.46 MB (4.25 MiB) of buckets. An account that sends each
 operation once a day holds about 14 KB. The memory of an operation's buckets
@@ -412,9 +414,11 @@ the seconds and minutes in which each of those accounts was active. Below one
 request a second per operation, they grow with the request rate. Above it, and
 with the table count or uptime, they do not grow. With
 `throttling_enabled = true` the throttle manager keeps a read and a write token
-bucket for each partition key that a GetItem, PutItem, UpdateItem or DeleteItem
-names. It never drops one. Resident memory then grows with the number of
-distinct partition keys those requests name.
+bucket for each distinct value of the first attribute in the `Key` or `Item`
+of a GetItem, PutItem, UpdateItem or DeleteItem. That attribute comes first in
+name order, or in the request's order on a build with the MongoDB backend. So
+it can be the sort key. It never drops a bucket. Resident memory then grows
+with the number of distinct values those requests carry.
 
 Every release through 1.0.0 kept one latency segment record per request that
 reaches dispatch in memory for 24 hours. So does any later release before the
