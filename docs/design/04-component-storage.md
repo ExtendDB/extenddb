@@ -412,8 +412,8 @@ The PostgreSQL backend uses two categories of tables:
     indexes cannot serve the predicates (see technical debt C-11). On index
     tables created with the collated key columns, the text key columns (`pk`,
     `sk_s`, `base_pk`, `base_sk_s` and their numbered variants) carry the
-    collation. A GSI Query cursor there is served in one seek, by the ordering
-    index, or by the primary key on a hash-only GSI (section 7 has the LSI and
+    collation. A GSI or LSI Query cursor there is served in one seek, by the
+    ordering index, or by the primary key on a hash-only GSI (section 7 has the
     Scan cases).
 
 - **Item storage**: `item_data` JSONB contains the complete item including key
@@ -739,11 +739,11 @@ The PostgreSQL and SQLite backends translate this to a SQL `WHERE` clause. The
 cursor compares the same columns the statement's `ORDER BY` sorts on, in the
 same order and in the same direction. So the predicate is one row comparison,
 `>` for a forward page and `<` for a reverse one. It is a plain comparison when
-the cursor has one column. In the Scan, base table Query, GSI and hash-only
-index shapes below, a key index whose columns follow the cursor's serves the
-page. The page comes out in order with no sort step, except the Scan on an
-index with more than one RANGE attribute (see Index Scan). For the base table
-Scan and Query that index is the primary key. For a GSI it is the
+the cursor has one column. In every shape below, a key index whose columns
+follow the cursor's serves the page. The page comes out in order with no sort
+step, except the Scan on an index with more than one RANGE attribute (see
+Index Scan). For the base table Scan and Query that index is the primary key.
+For a GSI or LSI it is the
 ordering index `(pk, sk_*, base_pk, base_sk_*)`. A hash-only index has no
 ordering index, because `create_index_data_table` creates one only when the
 index declares a sort key. Its page comes from the primary key
@@ -762,9 +762,11 @@ show PostgreSQL. SQLite emits the same shape with `?` placeholders and without
 
 The plans here are for the statements shown, which carry no sort key
 condition. With an equality on the index sort key, PostgreSQL planned a Sort
-on every page (over a Bitmap Index Scan on a GSI, over the Index Scan on an
-LSI) while a `BETWEEN` kept the Index Scan, and SQLite seeks on the
-condition's terms and applies the cursor as a filter.
+over a Bitmap Index Scan on every GSI page. A `BETWEEN` kept the Index Scan.
+On an LSI with 50 items per sort key value, both plans of each page with an
+equality were an Index Scan at Limit 10. At Limit 101, the custom plan of the
+first page was a Sort over a Bitmap Heap Scan. SQLite seeks on the condition's
+terms and applies the cursor as a filter.
 
 **Base table Scan:**
 ```sql
