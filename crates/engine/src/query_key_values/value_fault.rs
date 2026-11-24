@@ -17,12 +17,14 @@ use serde_json::{Map, Value};
 /// out.
 const NULL_VALUE: &str = "The supplied Item contains a null AttributeValue";
 
-/// The type descriptors of an AttributeValue, in the order the service reads
+/// The type descriptors of an AttributeValue, in the order the service checks
 /// the payloads of a value with several type descriptors (see
-/// [`first_fault`]). Core's list is a private constant of its `partiql`
-/// module, as for [`NULL_VALUE`].
+/// [`first_fault`]): a duplicate `SS` member ahead of the numbers (measured
+/// 2026-11-24), `N` ahead of `NS`, `NS` ahead of `BS`, and `NS` and `M` ahead
+/// of `L`. Core's list is a private constant of its `partiql` module, as for
+/// [`NULL_VALUE`].
 pub(super) const TYPE_DESCRIPTORS: [&str; 10] =
-    ["S", "N", "B", "SS", "NS", "BS", "M", "L", "NULL", "BOOL"];
+    ["SS", "S", "N", "B", "NS", "BS", "M", "L", "NULL", "BOOL"];
 
 /// The first fault inside one value, in document order for `L` items and in
 /// the map's iteration order for `M` members (see [`first_fault`]).
@@ -74,12 +76,15 @@ impl Fault<'_> {
 }
 
 /// The first fault in `value` (`member` is its name when it is the value of an
-/// `M` member): a null or no type descriptor, then the numbers in `N`, `NS`
-/// and every value an `L` or `M` holds, then more than one type descriptor.
-/// With `sets`, an empty set or a set with a duplicate member is a fault too,
-/// after the numbers of an `NS` (see [`set_fault`]); both paths check the
-/// numbers of every value ahead of the sets, the newer one with the
-/// deserializer's texts (see `validate_sets` in `scan_request`).
+/// `M` member): a null or no type descriptor, then the payloads in the order
+/// of [`TYPE_DESCRIPTORS`] (the numbers in `N` and `NS`, and every value an
+/// `L` or `M` holds), then more than one type descriptor. With `sets`, an
+/// empty set or a set with a duplicate member is a fault too, `SS` ahead of
+/// the numbers and `NS` after its own numbers (see [`set_fault`]); without
+/// it, the deserializer reports them after the request-time checks. Both
+/// paths check the numbers of a value the service reads as one type ahead of
+/// its sets, the newer one with the deserializer's texts (see `validate_sets`
+/// in `scan_request`).
 /// `L` items are visited in document order and `M` members in the map's
 /// iteration order: sorted by key without the `preserve_order` feature of
 /// `serde_json`, in document order with it, as in the MongoDB build (bson
@@ -96,7 +101,10 @@ impl Fault<'_> {
 /// (measured 2026-11-19: `{"N": "bob", "S": "x"}` and `{"S": "x", "N": "bob"}`
 /// answer the numeric text for `bob`, `{"N": "1", "S": "x"}` the more than one
 /// datatypes text, `{"S": "x", "L": [null]}` the null text, and `N` is read
-/// ahead of `NS`, `NS` and `M` ahead of `L`).
+/// ahead of `NS`, `NS` and `M` ahead of `L`; measured 2026-11-24: `{"SS":
+/// ["a", "a"], "N": "bob"}` answers the duplicate text, `{"NS": ["1", "1"],
+/// "N": "bob"}` the numeric text, and `{"NS": ["1", "1"], "L": [{"N":
+/// "bob"}]}` the duplicate text).
 pub(super) fn first_fault<'a>(
     value: &'a Value,
     member: Option<&'a str>,
@@ -147,8 +155,16 @@ pub(super) fn first_fault<'a>(
 /// number set  may not be empty for key :a`, and `{"SS": ["x", "x"]}`
 /// answers `... One or more parameter values were invalid: Input collection
 /// [x, x] contains duplicates. for key :a`; on `Query` the duplicate `NS`
-/// answers the same as on `Scan`. A member of another JSON type is left to
-/// the shape fault check.
+/// answers the same as on `Scan`. Beside a second type descriptor the texts
+/// are the same (measured 2026-11-24 on `Query`, each body twice, as `...
+/// for key :z`): `{"SS": ["a", "a"], "N": "1"}` answers `One or more
+/// parameter values were invalid: Input collection [a, a] contains
+/// duplicates.`, `{"NS": ["1", "1"], "S": "x"}` `Input collection contains
+/// duplicates`, `{"BS": ["YQ==", "YQ=="], "N": "1"}` `One or more parameter
+/// values were invalid: Input collection [YQ==, YQ==]of type BS contains
+/// duplicates.`, and an empty `SS`, `NS` or `BS` beside a second descriptor
+/// the deserializer's empty set text. A member of another JSON type is left
+/// to the shape fault check.
 fn set_fault<'a>(descriptor: &str, members: &[Value]) -> Option<Fault<'a>> {
     if !members.iter().all(Value::is_string) {
         return None;

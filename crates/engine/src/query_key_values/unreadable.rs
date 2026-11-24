@@ -236,28 +236,35 @@ fn null_value() -> Value {
 ///    members (see [`first_fault`]), as `ExpressionAttributeValues contains
 ///    invalid value: <reason> for key <placeholder>`: a null (`The supplied
 ///    Item contains a null AttributeValue`, with `: <member> is null` when it
-///    is the value of an `M` member), no type descriptor, more than one, or
-///    an `N` that is not a number. Such an `N` is echoed as written, and an
-///    empty one has no colon after the message. No `M` with more than one
-///    member was measured. A float `Limit` that satisfies its constraint
-///    beside `{"N": "bob"}` answers this wrapped text too, on `Scan` and
-///    `Query` (measured 2026-11-23 18:45 UTC). An empty set and a set with a
-///    duplicate member are faults of the value too, with this path's texts
-///    (measured 2026-11-24 05:41 UTC beside `Limit: 1.5`; see `set_fault`):
-///    `{"NS": ["1", "1"]}` as an entry or inside an `L` answers `Input
-///    collection contains duplicates`, wrapped, on `Scan` and `Query`, and an
-///    invalid names key is reported ahead of it, an empty name after it. When
-///    no member of `value_expressions` is present, the service answers the
+///    is the value of an `M` member), no type descriptor, more than one, an
+///    `N` that is not a number, or an empty set or a set with a duplicate
+///    member beside a second type descriptor (measured 2026-11-24; see
+///    `set_fault`). Such an `N` is echoed as written, and an empty one has no
+///    colon after the message. No `M` with more than one member was measured.
+///    A float `Limit` that satisfies its constraint beside `{"N": "bob"}`
+///    answers this wrapped text too, on `Scan` and `Query` (measured
+///    2026-11-23 18:45 UTC). An empty set and a set with a duplicate member
+///    are faults of the value too, with this path's texts (measured
+///    2026-11-24 05:41 UTC beside `Limit: 1.5`; see `set_fault`): `{"NS":
+///    ["1", "1"]}` as an entry or inside an `L` answers `Input collection
+///    contains duplicates`, wrapped, on `Scan` and `Query`, and an invalid
+///    names key is reported ahead of it, an empty name after it. When no
+///    member of `value_expressions` is present, the service answers the
 ///    expressions-only text ahead of these faults (`ExpressionAttributeValues
 ///    can only be specified when using expressions: FilterExpression is
 ///    null`, for a duplicate `NS` with no expression or with a
 ///    `ProjectionExpression` alone, and for `{"N": "bob"}`), which the
-///    handler gives after these checks; so the sets are checked only when one
-///    is present, and a number is checked as before. The numbers of every
-///    value come ahead of the sets, as on the newer path: beside a set fault
-///    in one value and a number fault in another, the service named `:n`
-///    whether it held the set or the number (`:a` held the other), where this
-///    order names the number (#1013);
+///    handler gives after these checks; so the sets of a value the service
+///    reads as one type are checked only when one is present, and a number is
+///    checked as before. The numbers of every such value come ahead of its
+///    sets, as on the newer path: beside a set fault in one value and a
+///    number fault in another, the service named `:n` whether it held the set
+///    or the number (`:a` held the other), where this order names the number
+///    (#1013). A value the service cannot read as one type has its sets
+///    checked with its numbers, in the order of `TYPE_DESCRIPTORS`: `{"SS":
+///    ["a", "a"], "N": "1"}` and `{"SS": ["a", "a"], "N": "bob"}` answer the
+///    duplicate text, and `{"NS": ["1", "1"], "N": "bob"}` the numeric text
+///    (measured 2026-11-24);
 /// 5. an empty name in `ExpressionAttributeNames` (measured 2026-11-19 in
 ///    either member order). `{"#a": ""}` beside `{"X": "1"}`, `{}`, `{"N":
 ///    "1", "S": "x"}`, a null or `{"S": null}` answers that value's text.
@@ -339,16 +346,17 @@ pub(crate) fn older_form_checks(
     if let Some(values) = values {
         // The values the service cannot read first; the sort is stable, so
         // each group keeps the placeholder order. The numbers of every value
-        // come ahead of the sets, as on the newer path, and the sets are
-        // checked only when an expression that can read a value is present
-        // (item 4).
+        // come ahead of the sets, as on the newer path, and the sets of a
+        // value the service reads as one type are checked only when an
+        // expression that can read a value is present (item 4). A value it
+        // cannot read as one type has its sets checked with its numbers.
         let mut entries = sorted_entries(values);
         entries.sort_by_key(|(_, value)| !unreadable(value));
         let sets = value_expressions.iter().any(|field| present(body, field));
         let passes: &[bool] = if sets { &[false, true] } else { &[false] };
         for &with_sets in passes {
             for (key, value) in &entries {
-                if let Some(fault) = first_fault(value, None, with_sets) {
+                if let Some(fault) = first_fault(value, None, with_sets || unreadable(value)) {
                     return Err(DynamoDbError::ValidationException(format!(
                         "ExpressionAttributeValues contains invalid value: {} for key {key}",
                         fault.reason()

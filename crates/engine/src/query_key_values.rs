@@ -157,7 +157,18 @@ pub fn validate_query_request_body(body: &Value) -> Result<(), DynamoDbError> {
 ///   `SerializationException: Unexpected token received from parser`, and
 ///   `ConsistentRead: 1` `SerializationException: NUMBER_VALUE cannot be
 ///   converted to Boolean`. The handler's own deserialization still refuses
-///   every string in `ConsistentRead` and `ScanIndexForward`.
+///   every string in `ConsistentRead` and `ScanIndexForward`;
+/// - a null member, which the service reads as an absent one (see
+///   [`present`]), and a null name in `ExpressionAttributeNames`, which it
+///   reads as an empty name and reports after these checks. Measured
+///   2026-11-24, each body twice: `ScanIndexForward: null` beside `Select:
+///   "NOPE"` answers the `Select` text, and alone, with a table that does not
+///   exist, `ResourceNotFoundException`; `ExpressionAttributeNames: {"#a":
+///   null}` beside `Select: "NOPE"` or `ReturnConsumedCapacity: "NOPE"`
+///   answers that enum's text, beside `{"N": "bob"}` the numeric text in the
+///   `ExpressionAttributeValues contains invalid value` form, and alone
+///   `ExpressionAttributeNames contains invalid value: Empty attribute name
+///   for key #a`. The handler's own deserialization still refuses both.
 ///
 /// `Limit`, `Segment` and `TotalSegments` of another JSON type are shape
 /// faults with the texts of `int32_member::read` (`STRING_VALUE cannot be
@@ -179,6 +190,7 @@ pub(crate) fn shape_fault_first<T: DeserializeOwned>(
     body.as_object()
         .into_iter()
         .flatten()
+        .filter(|(name, _)| present(body, name))
         .find_map(|(name, value)| match (name.as_str(), value) {
             ("ConsistentRead" | "ScanIndexForward", Value::String(text))
                 if BOOLEAN_TEXTS
@@ -190,6 +202,16 @@ pub(crate) fn shape_fault_first<T: DeserializeOwned>(
             ("Limit" | "Segment" | "TotalSegments", member) => {
                 crate::int32_member::read(Some(member)).err()
             }
+            ("ExpressionAttributeNames", Value::Object(names)) => read(
+                name,
+                Value::Object(
+                    names
+                        .iter()
+                        .filter(|(_, alias)| !alias.is_null())
+                        .map(|(key, alias)| (key.clone(), alias.clone()))
+                        .collect(),
+                ),
+            ),
             ("ExpressionAttributeValues", Value::Object(entries)) => {
                 entries.iter().find_map(|(key, entry)| {
                     read(
@@ -308,7 +330,9 @@ fn validate_no_parameter_mix(body: &Value) -> Result<(), DynamoDbError> {
 /// The checks the `ExpressionAttributeNames` deserializer makes, on the raw
 /// body: an empty map, a key that is not `#` and a name, a key over 255 bytes,
 /// and an empty name, with the deserializer's text. A map or name of another
-/// JSON type is a shape fault, which this leaves to the shape fault check.
+/// JSON type is a shape fault, which this leaves to the shape fault check, and
+/// a null name is left to the handler's deserializer (see
+/// [`shape_fault_first`]).
 ///
 /// # Errors
 ///
