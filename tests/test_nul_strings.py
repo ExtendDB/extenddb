@@ -25,6 +25,7 @@ next code point alone as well.
 from __future__ import annotations
 
 import random
+import string
 import time
 
 import pytest
@@ -373,13 +374,16 @@ class TestNulInStrings:
 
 
 def _long_key() -> str:
-    """2046 bytes: 1364 random letters with U+0001 after every second one, 682
-    in all. The service allows a partition key value of 2048 bytes. Random
-    letters keep PostgreSQL from compressing the key below its btree entry
-    limit of 2704 bytes; a repeated pattern would compress."""
+    """2046 bytes: 1364 random letters and digits with U+0001 after every
+    second one, 682 in all. The service allows a partition key value of 2048
+    bytes. PostgreSQL compresses a btree entry over about 2 KB when it can,
+    and a key of letters alone compresses enough to fit the 2704-byte entry
+    limit even with each U+0001 stored as two bytes; letters and digits do
+    not."""
     rng = random.Random(368)
     key = "".join(
-        rng.choice("abcdefghijklmnopqrstuvwxyz") + ("" if i % 2 == 0 else SOH) for i in range(1364)
+        rng.choice(string.ascii_letters + string.digits) + ("" if i % 2 == 0 else SOH)
+        for i in range(1364)
     )
     assert (len(key.encode()), key.count(SOH)) == (2046, 682)
     return key

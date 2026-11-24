@@ -539,23 +539,26 @@ async fn ledger_rows_of_13(pool: &PgPool) -> i64 {
 }
 
 /// A partition key of 2046 bytes, within the service's 2048, made of letters
-/// from a fixed pseudo-random sequence with U+0001 after every second one
-/// (682 of them), which an earlier release stores in `pk` as it is. Migration
-/// 13 applies in both stores and leaves the key's 2046 bytes as they were;
-/// escaping the key column would make it 2728 bytes, over PostgreSQL's btree
-/// entry limit of 2704.
+/// and digits from a fixed pseudo-random sequence with U+0001 after every
+/// second one (682 of them), which an earlier release stores in `pk` as it is.
+/// Migration 13 applies in both stores and leaves the key's 2046 bytes as they
+/// were; escaping the key column would make it 2728 bytes, over PostgreSQL's
+/// btree entry limit of 2704. PostgreSQL compresses an entry over about 2 KB
+/// when it can, and a key of letters alone compresses enough to fit the limit
+/// with each U+0001 stored as two bytes; letters and digits do not.
 #[tokio::test]
 async fn migration_13_applies_over_a_long_key_holding_u0001() {
     let Some(base) = base_conn() else {
         return skip("migration 13 long key");
     };
+    const ALNUM: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut state: u32 = 0x2545_f491;
     let mut key = String::new();
     for i in 0..1364 {
         state ^= state << 13;
         state ^= state >> 17;
         state ^= state << 5;
-        key.push(char::from(b'a' + (state % 26) as u8));
+        key.push(char::from(ALNUM[(state % 62) as usize]));
         if i % 2 == 1 {
             key.push('\u{1}');
         }
