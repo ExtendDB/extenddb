@@ -368,6 +368,13 @@ fn key_conditions_refuse_non_indexable_operators_on_any_key_at_request_time() {
         "{err:?}"
     );
     assert!(validate_key_conditions(&kc(vec![("pk", cond("EQ", vec![s("p")]))])).is_ok());
+    // The range key desugaring gives the same refusal for such an operator.
+    let err =
+        desugar_sk_condition(&cond("NE", vec![s("a")]), "sk", &mut HashMap::new()).unwrap_err();
+    assert!(
+        matches!(&err, DynamoDbError::ValidationException(m) if Some(m.clone()) == refusal(NOT_INDEXABLE)),
+        "{err:?}"
+    );
 }
 
 #[test]

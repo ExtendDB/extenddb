@@ -172,6 +172,13 @@ fn check_key_schema_type(
 /// CONTAINS`).
 const NON_INDEXABLE: [&str; 6] = ["NE", "NULL", "NOT_NULL", "CONTAINS", "NOT_CONTAINS", "IN"];
 
+/// The refusal of a key condition entry with an operator in [`NON_INDEXABLE`].
+fn not_indexable() -> DynamoDbError {
+    DynamoDbError::ValidationException(format!(
+        "{INVALID_PARAMS}Attempted conditional constraint is not an indexable operation"
+    ))
+}
+
 /// Request-time checks for legacy `KeyConditions`: [`validate_legacy_conditions`]
 /// on every entry, then the non-indexable operator refusal on every entry.
 /// Both ran before the table lookup on the service: a non-indexable operator
@@ -191,9 +198,7 @@ pub fn validate_key_conditions(
         .values()
         .any(|cond| NON_INDEXABLE.contains(&cond.comparison_operator.as_str()))
     {
-        return Err(DynamoDbError::ValidationException(format!(
-            "{INVALID_PARAMS}Attempted conditional constraint is not an indexable operation"
-        )));
+        return Err(not_indexable());
     }
     Ok(())
 }
@@ -303,9 +308,7 @@ fn desugar_sk_condition(
             })
         }
         // validate_key_conditions refused every other operator at request time.
-        _ => Err(DynamoDbError::ValidationException(format!(
-            "{INVALID_PARAMS}Attempted conditional constraint is not an indexable operation"
-        ))),
+        _ => Err(not_indexable()),
     }
 }
 
