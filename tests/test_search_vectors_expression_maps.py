@@ -7,10 +7,9 @@ The service checks the two maps before it reads either expression, so these
 answers do not depend on the grammar the account has. Every request here uses
 conditions both grammars accept, and the module runs under either one.
 
-Measured against the live service in eu-north-1, on an account with the
-extended grammar, each request twice with the same answer: on 2026-11-21, and
-the 254, 255 and 256 byte keys and the empty maps against a missing table on
-2026-11-23.
+Measured against the live service in eu-north-1, each request twice with
+the same answer: on 2026-11-21, and the 254, 255 and 256 byte keys and the
+empty maps against a missing table on 2026-11-23.
 
 The module skips when the target backend does not support vector indexes,
 unless ``EXTENDDB_EXPECT_VECTORS=1``, which makes that a failure.

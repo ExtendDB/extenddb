@@ -3,14 +3,16 @@
 
 """SearchVectors with the extended SearchConditionExpression grammar.
 
-For an account the grammar is enabled for, a search condition takes ``<>``,
-``<``, ``<=``, ``>``, ``>=``, BETWEEN, IN, OR, NOT, parentheses,
-``attribute_exists`` and ``attribute_not_exists``, and more than one
-condition on an attribute, up to 50 conditions.
+Under the extended grammar, a search condition takes ``<>``, ``<``, ``<=``,
+``>``, ``>=``, BETWEEN, IN, OR, NOT, parentheses, ``attribute_exists`` and
+``attribute_not_exists``, and more than one condition on an attribute, up to
+50 conditions. The service serves it to every account; ExtendDB serves it to
+the accounts the ``search_inequality_filters`` setting names, every account
+when the setting is absent.
 
 Every expected response was measured against the live service in
-eu-north-1, on an account with the extended grammar, each request twice with
-the same answer, on 2026-11-19 and 2026-11-21.
+eu-north-1, each request twice with the same answer, on 2026-11-19 and
+2026-11-21.
 
 The module probes one inequality search to learn the grammar the target
 serves. Against ExtendDB it also reads the ``search_inequality_filters``

@@ -4,12 +4,11 @@
 //! The search condition against the index search schema.
 //!
 //! Every expected answer was measured against the live service in
-//! eu-north-1, on an account with the extended grammar, on 2026-11-23, each
-//! request twice with the same answer, against a vector table with the
-//! search schema of the case; `Ok` stands for a search the service answered
-//! with 200, the accepted shapes of the two partition tests included. The
-//! partition a condition selects is internal; the wire tests pin that the
-//! HASH value scopes the search.
+//! eu-north-1 on 2026-11-23, each request twice with the same answer,
+//! against a vector table with the search schema of the case; `Ok` stands
+//! for a search the service answered with 200, the accepted shapes of the
+//! two partition tests included. The partition a condition selects is
+//! internal; the wire tests pin that the HASH value scopes the search.
 
 use std::collections::HashMap;
 

@@ -4,11 +4,11 @@
 //! The conditions a search condition records, and the condition limit.
 //!
 //! The recorded conditions are internal and have no answer of their own on
-//! the wire. Every answer under the limit of 50 was measured against the live
-//! service in eu-north-1, on an account with the extended grammar, on
-//! 2026-11-23, each request twice with the same answer, against a missing
-//! table; `Ok` stands for a request the service passed to the table lookup.
-//! A limit of 1 or 3 exists only in these tests.
+//! the wire. Every answer under the limit of 50 was measured against the
+//! live service in eu-north-1 on 2026-11-23, each request twice with the
+//! same answer, against a missing table; `Ok` stands for a request the
+//! service passed to the table lookup. A limit of 1 or 3 exists only in
+//! these tests.
 
 use super::rules::{Condition, Operator};
 use super::tests_support::{

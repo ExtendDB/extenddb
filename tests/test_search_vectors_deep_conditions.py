@@ -9,11 +9,11 @@ the same syntax error as a run of one. The server must go on answering: after
 each request the test sends a valid search, and against ExtendDB it also
 reads ``/health``.
 
-Measured against the live service in eu-north-1, on an account with the
-extended grammar, each request twice with the same answer, on 2026-11-23 on
-this table and on a missing table; the 1500 and 4080 open parentheses also on
-2026-11-22. Under the equality-only grammar the test asserts only that each
-condition is refused and that the server keeps answering.
+Measured against the live service in eu-north-1, each request twice with the
+same answer, on 2026-11-23 on this table and on a missing table; the 1500 and
+4080 open parentheses also on 2026-11-22. Under the equality-only grammar the
+test asserts only that each condition is refused and that the server keeps
+answering.
 
 The module skips when the target backend does not support vector indexes,
 unless ``EXTENDDB_EXPECT_VECTORS=1``, which makes that a failure.
