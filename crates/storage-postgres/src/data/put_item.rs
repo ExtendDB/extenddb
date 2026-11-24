@@ -92,18 +92,19 @@ impl PostgresEngine {
         // return, an index or a stream to maintain, or is already slow: a repair
         // for a GSI created meanwhile then commits with the write
         // (`gsi_build::fix_up_stale_write`) instead of after it. A create-only
-        // put with nothing else to do is the exception: the key alone decides its
-        // condition (`requires_absent_item`), so one autocommit insert does
-        // (`insert_absent`).
-        let no_tx_work = !return_old
-            && indexes.is_empty()
+        // put with no index or stream to maintain is the exception: the key
+        // alone decides its condition (`requires_absent_item`), so one
+        // autocommit insert does (`insert_absent`). `return_old` does not keep
+        // it in a transaction, because a create-only put that succeeds found no
+        // old item.
+        let nothing_to_maintain = indexes.is_empty()
             && vector_metas.is_empty()
             && stream.is_none()
             && stamp.elapsed() <= super::gsi_build::GRACE_WRITE;
         let create_only = self.create_only_puts
-            && no_tx_work
+            && nothing_to_maintain
             && condition.is_some_and(|c| requires_absent_item(c, &key_info.key_schema, maps));
-        let needs_tx = !no_tx_work || (condition.is_some() && !create_only);
+        let needs_tx = !create_only && (condition.is_some() || return_old || !nothing_to_maintain);
 
         if let Some((sk_name, sk_type)) =
             sk_info(&key_info.key_schema, &key_info.attribute_definitions)
@@ -155,10 +156,7 @@ impl PostgresEngine {
                         }
                         Err(e) => return Err(e),
                     }
-                    let insert_sql = format!(
-                        "INSERT INTO {ddb_table} (pk, {sk_col}, item_data) VALUES ($1, $2, $3) \
-                         ON CONFLICT (pk, {sk_col}) DO NOTHING"
-                    );
+                    let insert_sql = insert_if_absent_sql(&ddb_table, Some(sk_col));
                     let result =
                         bind_sk_execute!(&insert_sql, pk_text.as_str(), &sk, &item_json, &mut *tx)?;
                     if result.rows_affected() == 1 {
@@ -338,10 +336,7 @@ impl PostgresEngine {
                         }
                         Err(e) => return Err(e),
                     }
-                    let insert_sql = format!(
-                        "INSERT INTO {ddb_table} (pk, item_data) VALUES ($1, $2) \
-                         ON CONFLICT (pk) DO NOTHING"
-                    );
+                    let insert_sql = insert_if_absent_sql(&ddb_table, None);
                     let result = sqlx::query(&insert_sql)
                         .bind(pk_text.as_str())
                         .bind(&item_json)
@@ -533,21 +528,12 @@ impl PostgresEngine {
         sk: Option<(&str, &SortKeyValue)>,
         item_json: &serde_json::Value,
     ) -> Result<(), StorageError> {
-        let (insert_sql, select_sql) = match sk {
-            Some((sk_col, _)) => (
-                format!(
-                    "INSERT INTO {ddb_table} (pk, {sk_col}, item_data) VALUES ($1, $2, $3) \
-                     ON CONFLICT (pk, {sk_col}) DO NOTHING"
-                ),
-                format!("SELECT item_data FROM {ddb_table} WHERE pk = $1 AND {sk_col} = $2"),
-            ),
-            None => (
-                format!(
-                    "INSERT INTO {ddb_table} (pk, item_data) VALUES ($1, $2) \
-                     ON CONFLICT (pk) DO NOTHING"
-                ),
-                format!("SELECT item_data FROM {ddb_table} WHERE pk = $1"),
-            ),
+        let insert_sql = insert_if_absent_sql(ddb_table, sk.map(|(sk_col, _)| sk_col));
+        let select_sql = match sk {
+            Some((sk_col, _)) => {
+                format!("SELECT item_data FROM {ddb_table} WHERE pk = $1 AND {sk_col} = $2")
+            }
+            None => format!("SELECT item_data FROM {ddb_table} WHERE pk = $1"),
         };
         let mut attempt: u32 = 0;
         loop {
@@ -580,6 +566,22 @@ impl PostgresEngine {
                 return Err(create_race_exhausted(attempt));
             }
         }
+    }
+}
+
+/// The statement that inserts an item only if its key is not in the table: on
+/// `pk` and, with `sk_col`, on the sort key column too. It inserts no row when
+/// the key exists. The transaction path and `insert_absent` both use it.
+fn insert_if_absent_sql(ddb_table: &str, sk_col: Option<&str>) -> String {
+    match sk_col {
+        Some(sk_col) => format!(
+            "INSERT INTO {ddb_table} (pk, {sk_col}, item_data) VALUES ($1, $2, $3) \
+             ON CONFLICT (pk, {sk_col}) DO NOTHING"
+        ),
+        None => format!(
+            "INSERT INTO {ddb_table} (pk, item_data) VALUES ($1, $2) \
+             ON CONFLICT (pk) DO NOTHING"
+        ),
     }
 }
 

@@ -27,9 +27,10 @@ pub struct PostgresStorageConfig {
     pub catalog_pool_size: Option<u32>,
     /// Write a `PutItem` whose condition only says that the item must not
     /// exist (`attribute_not_exists` on a key attribute) as one autocommit
-    /// `INSERT ... ON CONFLICT DO NOTHING`, when it has nothing else to do in
-    /// a transaction. `false` keeps such puts on the transaction path. The
-    /// answers are the same either way.
+    /// `INSERT ... ON CONFLICT DO NOTHING`, when the table has no index and no
+    /// stream to maintain and the write is not already slow. `false` keeps
+    /// such puts on the transaction path. The answers are the same either
+    /// way.
     #[serde(
         default = "default_create_only_puts",
         deserialize_with = "extenddb_storage::config::string_coerce::bool"

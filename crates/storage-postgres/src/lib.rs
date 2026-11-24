@@ -288,8 +288,8 @@ pub struct PostgresEngine {
     /// the search path exists, so this backend still refuses vector operations
     /// over the wire; the flag is what that decision will read.
     pub(crate) vector_capable: bool,
-    /// Whether a create-only put with nothing else to do in a transaction is
-    /// one autocommit `INSERT ... ON CONFLICT DO NOTHING`
+    /// Whether a create-only put on a table with no index and no stream to
+    /// maintain is one autocommit `INSERT ... ON CONFLICT DO NOTHING`
     /// (`storage.postgres.create_only_puts`, on by default). Off, such a put
     /// takes the transaction path, as every conditional put did before.
     pub(crate) create_only_puts: bool,

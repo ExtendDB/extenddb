@@ -1,14 +1,26 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 //! Create-only puts: a `PutItem` whose condition is `attribute_not_exists` on a
-//! key attribute. With nothing else to do in a transaction, the write is one
-//! autocommit `INSERT ... ON CONFLICT DO NOTHING`; these tests hold it to the
-//! answers of the transaction path.
+//! key attribute. On a table with no index and no stream to maintain, the write
+//! is one autocommit `INSERT ... ON CONFLICT DO NOTHING`; these tests hold it to
+//! the answers of the transaction path.
+//!
+//! The scratch database is the one of `common/stream_disable_fixture.rs`, and
+//! the insert gate is the one of `common/insert_gate.rs`, which
+//! `put_create_race.rs` uses too.
 //!
 //! Requires `EXTENDDB_TEST_PG_CONNECTION_STRING`, a base URL with no database
 //! component (for example `postgresql://postgres@127.0.0.1:5432`), pointing at a
 //! server whose role may create and drop databases. Without it every test here
 //! reports a skip and passes, the same convention the wire suites use.
+
+// The scratch database of the stream disable tests. The fixture also exports
+// the stream types for those tests, and this file uses none of them.
+#[allow(unused_imports)]
+#[path = "common/stream_disable_fixture.rs"]
+mod fixture;
+#[path = "common/insert_gate.rs"]
+mod insert_gate;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -19,77 +31,16 @@ use extenddb_core::types::{
     KeyType, ScalarAttributeType, TableKeyInfo, UpdateTableInput,
 };
 use extenddb_storage::{DataEngine, TableEngine};
-use extenddb_storage_postgres::{PostgresConfig, PostgresEngine};
-use sqlx::postgres::PgPoolOptions;
-use sqlx::{Connection, PgConnection, PgPool};
+use fixture::{ACCOUNT, Scratch, base_conn};
+use insert_gate::{
+    BYPASS_GATE, close_gate, connect, install_gate, open_gate, open_gate_fully,
+    wait_until_blocked_by, wait_until_waiting,
+};
+use sqlx::{PgConnection, PgPool};
 
-const ACCOUNT: &str = "123456789012";
-const REGION: &str = "us-east-1";
 const TABLE: &str = "t_create_only";
 /// A table keyed on `pk` alone; the put has a separate statement for it.
 const HASH_TABLE: &str = "t_create_only_hash";
-
-struct Scratch {
-    engine: PostgresEngine,
-    db: PgPool,
-    admin: PgPool,
-    db_name: String,
-}
-
-impl Scratch {
-    async fn cleanup(self) {
-        let Scratch {
-            engine,
-            db,
-            admin,
-            db_name,
-        } = self;
-        drop(engine);
-        db.close().await;
-        sqlx::query(&format!(
-            "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
-        ))
-        .execute(&admin)
-        .await
-        .expect("drop the scratch database");
-        admin.close().await;
-    }
-}
-
-/// The server's base URL, or `None` to skip. With `EXTENDDB_TEST_PG_REQUIRED`
-/// set to any value but `0`, a job that must reach a server fails here
-/// instead.
-fn base_conn() -> Option<String> {
-    let conn = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING").unwrap_or_default();
-    if conn.trim().is_empty() {
-        let required =
-            std::env::var("EXTENDDB_TEST_PG_REQUIRED").is_ok_and(|v| !v.is_empty() && v != "0");
-        assert!(
-            !required,
-            "EXTENDDB_TEST_PG_CONNECTION_STRING is not set, and EXTENDDB_TEST_PG_REQUIRED says \
-             this job must reach a PostgreSQL server"
-        );
-        return None;
-    }
-    Some(conn.trim_end_matches('/').to_owned())
-}
-
-fn shipped_migrations() -> Vec<String> {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut out = Vec::new();
-    for dir in ["migrations", "data_migrations"] {
-        let mut files: Vec<_> = std::fs::read_dir(root.join(dir))
-            .expect("read the migrations directory")
-            .map(|e| e.expect("directory entry").path())
-            .filter(|p| p.extension().is_some_and(|e| e == "sql"))
-            .collect();
-        files.sort();
-        for f in files {
-            out.push(std::fs::read_to_string(&f).expect("read a migration file"));
-        }
-    }
-    out
-}
 
 fn skip(test: &str) {
     eprintln!(
@@ -98,60 +49,12 @@ fn skip(test: &str) {
     );
 }
 
+/// The scratch database of the shared fixture, with the GSI workers running.
 async fn scratch() -> Scratch {
-    let base = base_conn().expect("caller checks base_conn() first");
-    let db_name = format!("eddb_cput_{}", uuid::Uuid::new_v4().simple())[..24].to_owned();
-    let admin = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&format!("{base}/postgres"))
-        .await
-        .expect("connect to the postgres maintenance database");
-    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
-        .execute(&admin)
-        .await
-        .expect("create the scratch database");
-    let url = format!("{base}/{db_name}");
-    let db = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&url)
-        .await
-        .expect("connect to the scratch database");
-    // One scratch database stands in for both the catalog and the data database.
-    for sql in shipped_migrations() {
-        sqlx::raw_sql(&sql)
-            .execute(&db)
-            .await
-            .expect("apply a shipped migration");
-    }
-    sqlx::query(
-        "INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0') \
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-    )
-    .execute(&db)
-    .await
-    .expect("pin the control-plane delay to zero");
-    sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES ($1, $2)")
-        .bind(ACCOUNT)
-        .bind(format!("acct-{db_name}"))
-        .execute(&db)
-        .await
-        .expect("seed the account row");
-    let engine = PostgresEngine::new(
-        &PostgresConfig {
-            connection_string: url,
-            pool_size: 10,
-            max_item_size_bytes: 400_000,
-        },
-        REGION,
-    )
-    .await
-    .expect("open a PostgresEngine on the scratch database")
-    .start_gsi_workers();
+    let s = fixture::scratch().await;
     Scratch {
-        engine,
-        db,
-        admin,
-        db_name,
+        engine: s.engine.start_gsi_workers(),
+        ..s
     }
 }
 
@@ -363,9 +266,22 @@ async fn put_if(
     expr: &str,
     maps: &ExpressionMaps,
 ) -> Result<Option<Item>, extenddb_storage::error::StorageError> {
+    put_if_old(s, key_info, it, expr, maps, false).await
+}
+
+/// `put_if` that also asks for the old item when `return_old` is set, as a
+/// request with `ReturnValues = ALL_OLD` or `ReturnConsumedCapacity` does.
+async fn put_if_old(
+    s: &Scratch,
+    key_info: &TableKeyInfo,
+    it: Item,
+    expr: &str,
+    maps: &ExpressionMaps,
+    return_old: bool,
+) -> Result<Option<Item>, extenddb_storage::error::StorageError> {
     let c = cond(expr);
     s.engine
-        .put_item(key_info, it, false, Some(&c), maps, None)
+        .put_item(key_info, it, return_old, Some(&c), maps, None)
         .await
 }
 
@@ -377,7 +293,9 @@ async fn stored(s: &Scratch, key_info: &TableKeyInfo, n: u32) -> Option<Item> {
 }
 
 /// On a table keyed on `pk` and `sk` and on one keyed on `pk` alone, which have
-/// their own statements, for each form of the condition.
+/// their own statements, for each form of the condition, without and with a
+/// request for the old item. A put that creates the item has no old item to
+/// return.
 #[tokio::test]
 async fn create_only_put_inserts_when_absent_and_reports_the_item_when_present() {
     let test = "create_only_put_inserts_when_absent_and_reports_the_item_when_present";
@@ -411,25 +329,30 @@ async fn create_only_put_inserts_when_absent_and_reports_the_item_when_present()
             if !range && expr.contains("sk") {
                 continue;
             }
-            let pk = format!("k{n}");
-            let first = keyed(*range, &pk, "first");
-            put_if(&s, key_info, first.clone(), expr, maps)
-                .await
-                .unwrap_or_else(|e| panic!("{expr}: first put: {e:?}"));
-            match put_if(&s, key_info, keyed(*range, &pk, "second"), expr, maps).await {
-                Err(extenddb_storage::error::StorageError::ConditionFailed(Some(old))) => {
-                    assert_eq!(old, first, "{expr}: the failure names the stored item");
+            for return_old in [false, true] {
+                let what = format!("{expr} (range: {range}, return_old: {return_old})");
+                let pk = format!("k{n}-{return_old}");
+                let first = keyed(*range, &pk, "first");
+                let created = put_if_old(&s, key_info, first.clone(), expr, maps, return_old)
+                    .await
+                    .unwrap_or_else(|e| panic!("{what}: first put: {e:?}"));
+                assert_eq!(created, None, "{what}: a created item has no old item");
+                let second = keyed(*range, &pk, "second");
+                match put_if_old(&s, key_info, second, expr, maps, return_old).await {
+                    Err(extenddb_storage::error::StorageError::ConditionFailed(Some(old))) => {
+                        assert_eq!(old, first, "{what}: the failure names the stored item");
+                    }
+                    other => {
+                        panic!("{what}: second put: expected ConditionFailed(Some), got {other:?}")
+                    }
                 }
-                other => {
-                    panic!("{expr}: second put: expected ConditionFailed(Some), got {other:?}")
-                }
+                let stored = s
+                    .engine
+                    .get_item(key_info, &key(*range, &pk))
+                    .await
+                    .expect("get");
+                assert_eq!(stored, Some(first), "{what}: unchanged");
             }
-            let stored = s
-                .engine
-                .get_item(key_info, &key(*range, &pk))
-                .await
-                .expect("get");
-            assert_eq!(stored, Some(first), "{expr} (range: {range}): unchanged");
         }
     }
     s.cleanup().await;
@@ -537,58 +460,8 @@ async fn create_only_put_on_an_indexed_table_maintains_the_index() {
 // put's read, a plain SELECT that no row lock would delay, queues behind it. The
 // locker deletes the winner and commits, so the read finds no item.
 
-/// The advisory lock key of the gate.
-const GATE: i64 = 0x4372_4f6e;
-
 /// The key of the item the gate tests race on.
 const RACE_PK: &str = "race";
-
-/// Open a connection to the scratch database outside its pools. Returns it and
-/// its backend pid.
-async fn connect(s: &Scratch) -> (PgConnection, i32) {
-    let base = base_conn().expect("caller checks base_conn() first");
-    let mut conn = PgConnection::connect(&format!("{base}/{}", s.db_name))
-        .await
-        .expect("connect to the scratch database");
-    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut conn)
-        .await
-        .expect("read the backend pid");
-    (conn, pid)
-}
-
-/// Wait until `pid` waits for a lock of kind `event`. With `blocker`, wait
-/// instead until any backend waits for such a lock that `blocker` holds. Fails
-/// after 5 s, so the caller can report what the put did instead.
-async fn wait_for_lock_wait(
-    db: &PgPool,
-    pid: Option<i32>,
-    blocker: Option<i32>,
-    event: &str,
-) -> Result<(), String> {
-    for _ in 0..500 {
-        let waiting: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_stat_activity \
-             WHERE datname = current_database() AND wait_event_type = 'Lock' \
-             AND wait_event = $3 \
-             AND ($1::int IS NULL OR pid = $1) \
-             AND ($2::int IS NULL OR $2 = ANY(pg_blocking_pids(pid)))",
-        )
-        .bind(pid)
-        .bind(blocker)
-        .bind(event)
-        .fetch_one(db)
-        .await
-        .expect("read pg_stat_activity");
-        if waiting > 0 {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    Err(format!(
-        "no wait on a {event} lock (pid {pid:?}, blocker {blocker:?})"
-    ))
-}
 
 /// The data table of `table`, quoted.
 async fn data_table(db: &PgPool, table: &str) -> String {
@@ -612,25 +485,8 @@ async fn gated_table(s: &Scratch, range: bool) -> (TableKeyInfo, String, PgConne
         (create_hash_table(s).await, HASH_TABLE)
     };
     let data = data_table(&s.db, name).await;
-    sqlx::raw_sql(&format!(
-        "CREATE FUNCTION pass_gate() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
-           IF current_setting('test.bypass_gate', true) = 'on' THEN RETURN NEW; END IF; \
-           PERFORM pg_advisory_lock_shared({GATE}); \
-           PERFORM pg_advisory_unlock_shared({GATE}); \
-           RETURN NEW; \
-         END $$; \
-         CREATE TRIGGER pass_gate BEFORE INSERT ON {data} \
-           FOR EACH ROW EXECUTE FUNCTION pass_gate();"
-    ))
-    .execute(&s.db)
-    .await
-    .expect("install the gate trigger");
-    let (mut gate, gate_pid) = connect(s).await;
-    sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(GATE)
-        .execute(&mut gate)
-        .await
-        .expect("close the gate");
+    install_gate(&s.db, &data).await;
+    let (gate, gate_pid) = close_gate(&s.db).await;
     (key_info, data, gate, gate_pid)
 }
 
@@ -646,7 +502,7 @@ async fn lose_to_a_deleted_winner(
     rearm: bool,
 ) -> Result<(), String> {
     let mut tx = s.db.begin().await.expect("begin the winner");
-    sqlx::query("SET LOCAL test.bypass_gate = 'on'")
+    sqlx::query(BYPASS_GATE)
         .execute(&mut *tx)
         .await
         .expect("bypass the gate");
@@ -663,7 +519,7 @@ async fn lose_to_a_deleted_winner(
         .expect("insert the winner");
     tx.commit().await.expect("commit the winner");
 
-    let (mut locker, locker_pid) = connect(s).await;
+    let (mut locker, locker_pid) = connect(&s.db).await;
     sqlx::query("BEGIN")
         .execute(&mut locker)
         .await
@@ -672,27 +528,15 @@ async fn lose_to_a_deleted_winner(
     let lock = sqlx::query(&lock_sql).execute(&mut locker);
     let open = async {
         // The locker queues behind the parked insert; then the gate opens.
-        wait_for_lock_wait(&s.db, Some(locker_pid), None, "relation").await?;
-        sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(GATE)
-            .execute(&mut *gate)
-            .await
-            .expect("open the gate");
-        if rearm {
-            // Granted only after the parked insert has passed the gate.
-            sqlx::query("SELECT pg_advisory_lock($1)")
-                .bind(GATE)
-                .execute(&mut *gate)
-                .await
-                .expect("close the gate again");
-        }
+        wait_until_waiting(&s.db, locker_pid, "relation").await?;
+        open_gate(gate, rearm).await;
         Ok::<(), String>(())
     };
     let (lock_result, gate) = tokio::join!(lock, open);
     gate?;
     lock_result.expect("lock the table");
     // The put's read waits for the locker.
-    wait_for_lock_wait(&s.db, None, Some(locker_pid), "relation").await?;
+    wait_until_blocked_by(&s.db, locker_pid, "relation").await?;
     let sql = if range {
         format!("DELETE FROM {data} WHERE pk = $1 AND sk_n = 1")
     } else {
@@ -708,15 +552,6 @@ async fn lose_to_a_deleted_winner(
         .await
         .expect("commit the delete");
     Ok(())
-}
-
-/// Release every advisory lock `gate` holds. A driver that stops early calls
-/// this, so that a parked insert goes on and the put can report its result.
-async fn open_gate_fully(gate: &mut PgConnection) {
-    sqlx::query("SELECT pg_advisory_unlock_all()")
-        .execute(gate)
-        .await
-        .expect("open the gate");
 }
 
 async fn deleted_winner_is_retried(test: &str, range: bool) {
@@ -737,7 +572,7 @@ async fn deleted_winner_is_retried(test: &str, range: bool) {
     );
     let driver = async {
         let steps = async {
-            wait_for_lock_wait(&s.db, None, Some(gate_pid), "advisory").await?;
+            wait_until_blocked_by(&s.db, gate_pid, "advisory").await?;
             lose_to_a_deleted_winner(&s, &data, range, &mut gate, "winner", false).await
         }
         .await;
@@ -802,7 +637,7 @@ async fn a_create_only_put_that_keeps_losing_gives_up_after_five_inserts() {
     let driver = async {
         let steps = async {
             for k in 1..=5 {
-                wait_for_lock_wait(&s.db, None, Some(gate_pid), "advisory").await?;
+                wait_until_blocked_by(&s.db, gate_pid, "advisory").await?;
                 lose_to_a_deleted_winner(&s, &data, true, &mut gate, &format!("w{k}"), k < 5)
                     .await?;
             }
@@ -851,7 +686,7 @@ async fn the_switch_sends_a_create_only_put_back_to_the_transaction_path() {
     let data = data_table(&s.db, TABLE).await;
 
     // An outside transaction holds the item's row lock.
-    let (mut locker, locker_pid) = connect(&s).await;
+    let (mut locker, locker_pid) = connect(&s.db).await;
     sqlx::query("BEGIN")
         .execute(&mut locker)
         .await
@@ -871,20 +706,25 @@ async fn the_switch_sends_a_create_only_put_back_to_the_transaction_path() {
         other => panic!("expected ConditionFailed(Some), got {other:?}"),
     };
 
-    // On (the default): answered while the lock is still held.
-    let on = s.engine.put_item(
-        &key_info,
-        item(1, Some("second"), None),
-        false,
-        Some(&condition),
-        &maps,
-        None,
-    );
-    expect_failure(
-        tokio::time::timeout(Duration::from_secs(5), on)
-            .await
-            .expect("the create-only put does not wait for the row lock"),
-    );
+    // On (the default): answered while the lock is still held, also when the
+    // request asks for the old item.
+    for return_old in [false, true] {
+        let on = s.engine.put_item(
+            &key_info,
+            item(1, Some("second"), None),
+            return_old,
+            Some(&condition),
+            &maps,
+            None,
+        );
+        expect_failure(
+            tokio::time::timeout(Duration::from_secs(5), on)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("the create-only put (return_old: {return_old}) waited for the row lock")
+                }),
+        );
+    }
 
     // Off: the locking read waits for the outside transaction.
     let off_engine = s.engine.clone().with_create_only_puts(false);
@@ -897,7 +737,7 @@ async fn the_switch_sends_a_create_only_put_back_to_the_transaction_path() {
         None,
     );
     let release = async {
-        let waited = wait_for_lock_wait(&s.db, None, Some(locker_pid), "transactionid").await;
+        let waited = wait_until_blocked_by(&s.db, locker_pid, "transactionid").await;
         sqlx::query("COMMIT")
             .execute(&mut locker)
             .await
