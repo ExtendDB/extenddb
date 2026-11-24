@@ -1059,7 +1059,8 @@ The backend implements every trait in `extenddb-storage`:
   subset.
 - `StreamEngine` — session-scoped per-shard sequence numbers, four
   shards per stream, CRC32 pk routing, TRIM_HORIZON / LATEST /
-  AT_SEQUENCE_NUMBER / AFTER_SEQUENCE_NUMBER iterators, 24h retention.
+  AT_SEQUENCE_NUMBER / AFTER_SEQUENCE_NUMBER / AT_TIMESTAMP iterators,
+  24h retention.
 - `MetadataEngine` — TTL lifecycle, tags, table-size tracking.
 - `BackupEngine` — CreateBackup, RestoreTableFromBackup, DeleteBackup
   via server-side `$out` aggregation.
