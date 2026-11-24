@@ -316,15 +316,11 @@ fn like_inside_the_argument_of_a_call_is_refused_as_like() {
         "Number overflow. Attempting to store a number with magnitude larger than \
          supported range under root"
     );
-    // NOT LIKE there, a condition function that starts a predicate and
-    // LIKE in a SET value are not measured.
-    for condition in ["foo(a NOT LIKE 'x')", "size(a LIKE 'x') = 1"] {
-        assert_eq!(
-            err(&format!("SELECT * FROM \"t\" WHERE {condition}")),
-            wf("Expected RIGHT_PAREN"),
-            "{condition}"
-        );
-    }
+    // NOT LIKE there and LIKE in a SET value are not measured.
+    assert_eq!(
+        err("SELECT * FROM \"t\" WHERE foo(a NOT LIKE 'x')"),
+        wf("Expected RIGHT_PAREN")
+    );
     assert_eq!(
         err("UPDATE \"t\" SET q = foo(a LIKE 'x') WHERE pk = 'a'"),
         wf("Expected RIGHT_PAREN")

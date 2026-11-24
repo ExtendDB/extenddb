@@ -104,8 +104,9 @@ pub(crate) fn unsupported_operation(what: &str) -> String {
 
 /// The refusal of an operand that is the whole WHERE condition (measured
 /// 2026-11-02 with a name, a path, a number, a string, a list, `true` and a
-/// parameter).
-const NOT_A_CONDITION: &str = "WHERE clause must contain an expression that resolves to a boolean";
+/// parameter, and 2026-11-24 with `size(m)`, which `operand_types` refuses).
+pub(crate) const NOT_A_CONDITION: &str =
+    "WHERE clause must contain an expression that resolves to a boolean";
 
 /// The refusal of an operand that is an argument of AND or OR (measured
 /// 2026-11-02: `a AND pk = 'a'`).
@@ -124,10 +125,6 @@ const BARE_OPERAND: &str = "<operand>";
 /// holds, until the group is read as that operand (see `Parser::predicate`).
 /// It never leaves the parser. No call can have this name.
 const GROUPED_OPERAND: &str = "<grouped operand>";
-
-/// The syntax error of a `size` call with no comparison after it, where the
-/// service's answer is not measured.
-const NO_COMPARISON: &str = "Expected a comparison operator";
 
 /// Parse a single PartiQL statement.
 ///
