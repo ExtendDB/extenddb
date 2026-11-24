@@ -15,6 +15,16 @@ use serde_json::Value;
 
 use crate::types::AttributeValue;
 
+/// The refusal of an attribute value that is JSON null, the same for an
+/// item attribute as for a member of a PartiQL parameter.
+pub const NULL_MEMBER: &str = "The supplied Item contains a null AttributeValue";
+
+/// The refusal of a JSON null at the attribute or map member `name`.
+#[must_use]
+pub fn null_member(name: &str) -> String {
+    format!("{NULL_MEMBER}: {name} is null")
+}
+
 /// Maximum placeholder key length in bytes, including the `#` / `:` prefix.
 const MAX_PLACEHOLDER_KEY_BYTES: usize = 255;
 
@@ -119,28 +129,29 @@ where
 }
 
 /// Whether `refusal`, a text of [`crate::types::from_nested`], is one the
-/// engine's `deserialize_error` answers with a `SerializationException`.
+/// engine's `deserialize_error` answers with a `SerializationException`: a
+/// payload or a set member of the wrong JSON type, a value that is not an
+/// object, or a `B` that is not base64.
 fn is_serialization_text(refusal: &str) -> bool {
-    refusal
-        .split_once(" value must be ")
-        .is_some_and(|(tag, _)| crate::types::TYPE_DESCRIPTORS.contains(&tag))
-        || refusal.starts_with("invalid type: ")
+    refusal.split_once(' ').is_some_and(|(tag, rest)| {
+        crate::types::TYPE_DESCRIPTORS.contains(&tag)
+            && (rest.starts_with("value must be ") || rest.starts_with("member must be "))
+    }) || refusal.starts_with("invalid type: ")
         || refusal.starts_with("invalid base64: ")
 }
 
 /// Whether the value `members` describe has no single type descriptor, or
-/// holds one that has none in an `L` or an `M` at any depth.
+/// holds in an `L` or an `M` at any depth one that has none, or a JSON null.
 fn has_no_single_descriptor(members: &serde_json::Map<String, Value>) -> bool {
+    let holds_one = |value: &Value| {
+        value
+            .as_object()
+            .map_or(value.is_null(), has_no_single_descriptor)
+    };
     match crate::types::type_descriptor(members) {
         Ok((tag, payload)) => match (tag.as_str(), payload) {
-            ("L", Value::Array(items)) => items
-                .iter()
-                .filter_map(Value::as_object)
-                .any(has_no_single_descriptor),
-            ("M", Value::Object(entries)) => entries
-                .values()
-                .filter_map(Value::as_object)
-                .any(has_no_single_descriptor),
+            ("L", Value::Array(items)) => items.iter().any(holds_one),
+            ("M", Value::Object(entries)) => entries.values().any(holds_one),
             _ => false,
         },
         Err(_) => true,
@@ -213,10 +224,11 @@ where
         false,
         |key, value| {
             // A value that has, or holds in an `L` or an `M`, a value with no
-            // single type descriptor is refused with the deserializer's text
-            // named after its key, read at depth 0: such a value may hold one
-            // map or list more than an item attribute (measured 2026-11-23
-            // and 2026-11-24 on UpdateItem and Query, each shape twice).
+            // single type descriptor or a JSON null is refused with the
+            // deserializer's text named after its key, read at depth 0: such
+            // a value may hold one map or list more than an item attribute
+            // (measured 2026-11-23 and 2026-11-24 on UpdateItem and Query,
+            // each shape twice; the null rows on UpdateItem, #1432).
             // Caught here because a serde error does not carry the key. A
             // refusal the engine answers with a `SerializationException` (a
             // payload of the wrong JSON type, a value that is not an object,
@@ -225,7 +237,9 @@ where
             // or an `M` either (measured 2026-11-24 with
             // `{"L": [{"S": 1}, {"S": "x", "N": "1"}]}` as `:v`, twice).
             // Where ExtendDB answers a wrong JSON type with a text of its
-            // own, as for a number in a set, the text stays wrapped (#1012).
+            // own, as for a number in a set, the text stays wrapped (#1012),
+            // unless the value stands after a null element or member, which
+            // the parameter type check reads (`crate::types::from_nested`).
             // Any other value is read by `convert`, whose refusals are bare.
             if let Some(members) = value.as_object()
                 && has_no_single_descriptor(members)
@@ -383,9 +397,12 @@ mod tests {
     /// an `M`, is refused with the deserializer's text named after its key:
     /// the count's text, or that of a payload checked ahead of the count,
     /// with one map or list more allowed than in an item attribute (measured
-    /// 2026-11-23 and 2026-11-24 on Query and UpdateItem, each twice). Any
-    /// other value, and a payload that is not base64 or is of the wrong JSON
-    /// type, keep the deserializer's bare text.
+    /// 2026-11-23 and 2026-11-24 on Query and UpdateItem, each twice). So is
+    /// a null element of an `L` or a null member of an `M`, and the content
+    /// refusal of an element written before the null (measured 2026-11-24 on
+    /// UpdateItem, each twice, #1432). Any other value, and a payload that is
+    /// not base64 or is of the wrong JSON type, wherever it stands, keep the
+    /// deserializer's bare text.
     #[test]
     fn values_with_no_single_descriptor_are_refused_by_key() {
         let wrapped = |text: &str| {
@@ -429,9 +446,30 @@ mod tests {
                      must have the value of true",
                 ),
             ),
+            (r#"{"S":"x","L":[null]}"#, wrapped(NULL_MEMBER)),
+            // A null element of an `L` or a null member of an `M`, with one
+            // descriptor at every level (#1432).
+            (r#"{"L":[null]}"#, wrapped(NULL_MEMBER)),
+            (r#"{"L":[{"S":"x"},null]}"#, wrapped(NULL_MEMBER)),
+            (r#"{"L":[null,{"S":"x","N":"1"}]}"#, wrapped(NULL_MEMBER)),
+            (r#"{"M":{"a":null}}"#, wrapped(&null_member("a"))),
             (
-                r#"{"S":"x","L":[null]}"#,
-                wrapped("The supplied Item contains a null AttributeValue"),
+                r#"{"M":{"a":{"S":"x"},"b":null}}"#,
+                wrapped(&null_member("b")),
+            ),
+            // The content refusal of an element before the null.
+            (
+                r#"{"L":[{"SS":[]},null]}"#,
+                wrapped(
+                    "One or more parameter values were invalid: An string set  may not be empty",
+                ),
+            ),
+            (
+                r#"{"L":[{"NULL":false},null]}"#,
+                wrapped(
+                    "One or more parameter values were invalid: Null attribute value types \
+                     must have the value of true",
+                ),
             ),
             // A value with two descriptors in an `L` or an `M`.
             (
@@ -463,7 +501,7 @@ mod tests {
             // wrapper, with a text of its own, #1189).
             (r#"{"S":"x","B":"!!!"}"#, base64.clone()),
             (r#"{"S":"x","BS":["!!!"]}"#, base64.clone()),
-            (r#"{"N":"bob","B":"!!!"}"#, base64),
+            (r#"{"N":"bob","B":"!!!"}"#, base64.clone()),
             // A payload of the wrong JSON type, or a value that is not an
             // object, keeps ExtendDB's bare text, alone or in an `L` or an
             // `M` (DynamoDB: a `SerializationException` with no wrapper and a
@@ -484,6 +522,39 @@ mod tests {
                  exactly one type descriptor"
                     .to_owned(),
             ),
+            // A value of the wrong JSON type written after a null element or
+            // member comes ahead of the null (measured 2026-11-24 on
+            // UpdateItem, each twice, #1432), with the parameter type
+            // check's text for a set member.
+            (
+                r#"{"L":[null,{"S":1}]}"#,
+                "S value must be a string".to_owned(),
+            ),
+            (
+                r#"{"M":{"a":null,"b":"x"}}"#,
+                "invalid type: string \"x\", expected a DynamoDB AttributeValue map with \
+                 exactly one type descriptor"
+                    .to_owned(),
+            ),
+            (
+                r#"{"L":[null,{"SS":[1]}]}"#,
+                "SS member must be a string".to_owned(),
+            ),
+            (r#"{"L":[null,{"B":"!!!"}]}"#, base64),
+            (
+                r#"{"L":[{"L":[null]},{"S":1}]}"#,
+                "S value must be a string".to_owned(),
+            ),
+            (
+                r#"{"L":[null,"x"]}"#,
+                "invalid type: string \"x\", expected a DynamoDB AttributeValue map with \
+                 exactly one type descriptor"
+                    .to_owned(),
+            ),
+            // A value with no descriptor and a set with a null member are not
+            // of the wrong JSON type, so the null keeps its text.
+            (r#"{"L":[null,{}]}"#, wrapped(NULL_MEMBER)),
+            (r#"{"L":[null,{"SS":["a",null]}]}"#, wrapped(NULL_MEMBER)),
         ];
         for (value, want) in cases {
             let msg = values_err(&format!(r#"{{"values":{{":v":{value}}}}}"#));
