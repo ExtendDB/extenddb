@@ -19,12 +19,14 @@ use serde_json::{Map, Value};
 /// out.
 const NULL_VALUE: &str = "The supplied Item contains a null AttributeValue";
 
-/// The type descriptors of an AttributeValue, in the order the service reads
+/// The type descriptors of an AttributeValue, in the order the service checks
 /// the payloads of a value with several type descriptors (see
-/// [`first_fault`]). Core's list is a private constant of its `partiql`
-/// module, as for [`NULL_VALUE`].
+/// [`first_fault`]): a duplicate `SS` member ahead of the numbers (measured
+/// 2026-11-24), `N` ahead of `NS`, `NS` ahead of `BS`, and `NS` and `M` ahead
+/// of `L`. Core's list is a private constant of its `partiql` module, as for
+/// [`NULL_VALUE`].
 pub(super) const TYPE_DESCRIPTORS: [&str; 10] =
-    ["S", "N", "B", "SS", "NS", "BS", "M", "L", "NULL", "BOOL"];
+    ["SS", "S", "N", "B", "NS", "BS", "M", "L", "NULL", "BOOL"];
 
 /// The first fault inside one value, in document order for `L` items and in
 /// the map's iteration order for `M` members (see [`first_fault`]).
@@ -191,16 +193,17 @@ pub(crate) fn first_fault<'a>(
 }
 
 /// The first fault in `value` (`member` is its name when it is the value of an
-/// `M` member): a null or no type descriptor, then the numbers in `N`, `NS`
-/// and every value an `L` or `M` holds, and with `sets` the set faults in the
-/// same walk (an `NS` after its numbers; see [`set_fault`]), then more than
-/// one type descriptor. `L` items are visited in document order and `M`
-/// members in the order `members_in_order` gives. A value of another JSON
-/// type, and an `N` or `NS` payload of the wrong JSON type, are shape faults
-/// the deserializer reports. A type descriptor with a null payload counts as
-/// absent, as the service reads it (measured 2026-11-19: `{"S": null}`
-/// answers the empty value text, and `{"S": null, "N": "1"}` in a
-/// `FilterExpression` is accepted).
+/// `M` member): a null or no type descriptor, then the payloads in the order
+/// of [`TYPE_DESCRIPTORS`] (the numbers in `N` and `NS`, and every value an
+/// `L` or `M` holds), and with `sets` the set faults in the same walk (`SS`
+/// ahead of the numbers, an `NS` after its own numbers; see [`set_fault`]),
+/// then more than one type descriptor. `L` items are visited in document
+/// order and `M` members in the order `members_in_order` gives. A value of
+/// another JSON type, and an `N` or `NS` payload of the wrong JSON type, are
+/// shape faults the deserializer reports. A type descriptor with a null
+/// payload counts as absent, as the service reads it (measured 2026-11-19:
+/// `{"S": null}` answers the empty value text, and `{"S": null, "N": "1"}` in
+/// a `FilterExpression` is accepted).
 ///
 /// With several type descriptors, the service reads each payload in the order
 /// of [`TYPE_DESCRIPTORS`], whatever order the request wrote them in, and
@@ -208,7 +211,10 @@ pub(crate) fn first_fault<'a>(
 /// (measured 2026-11-19: `{"N": "bob", "S": "x"}` and `{"S": "x", "N": "bob"}`
 /// answer the numeric text for `bob`, `{"N": "1", "S": "x"}` the more than one
 /// datatypes text, `{"S": "x", "L": [null]}` the null text, and `N` is read
-/// ahead of `NS`, `NS` and `M` ahead of `L`).
+/// ahead of `NS`, `NS` and `M` ahead of `L`; measured 2026-11-24: `{"SS":
+/// ["a", "a"], "N": "bob"}` answers the duplicate text, `{"NS": ["1", "1"],
+/// "N": "bob"}` the numeric text, and `{"NS": ["1", "1"], "L": [{"N":
+/// "bob"}]}` the duplicate text).
 pub(crate) fn first_fault_in<'a>(
     value: &'a Value,
     member: Option<&'a str>,
@@ -253,7 +259,11 @@ pub(crate) fn first_fault_in<'a>(
 
 /// An empty set, or two members of one value (an `NS`'s by numeric value, see
 /// `has_equal_numbers`), in the payload of the set type `descriptor`. A member
-/// that is not a string is a shape fault the deserializer reports.
+/// that is not a string is a shape fault the deserializer reports. Beside a
+/// second type descriptor the service answers the older path's texts, wrapped
+/// (measured 2026-11-24 on `Query`, each body twice: `{"SS": ["a", "a"], "N":
+/// "1"}`, `{"NS": ["1", "1"], "S": "x"}`, `{"BS": ["YQ==", "YQ=="], "N":
+/// "1"}`, and an empty `SS`, `NS` or `BS` beside a second descriptor).
 fn set_fault<'a>(descriptor: &'static str, members: &'a [Value]) -> Option<Fault<'a>> {
     if members.is_empty() {
         return Some(Fault::Set(SetFault::Empty(descriptor)));

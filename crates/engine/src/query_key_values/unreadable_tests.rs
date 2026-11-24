@@ -64,9 +64,14 @@ fn a_number_fault_in_a_value_with_several_types_is_named_ahead_of_the_several_ty
     // Measured 2026-11-19, each value beside `:p = {"S": "x"}`: the service
     // reads every payload, N ahead of NS, NS and M ahead of L, whatever order
     // the request wrote them in, and answers the more than one datatypes text
-    // only when no payload has a fault.
+    // only when no payload has a fault. Measured 2026-11-24 the same way: an
+    // empty set and a set with a duplicate member are faults too, SS ahead
+    // of the numbers, NS after its own numbers and ahead of BS and L.
     let numeric =
         |text: &str| format!("The parameter cannot be converted to a numeric value: {text}");
+    let invalid = |text: &str| format!("One or more parameter values were invalid: {text}");
+    let ss_dup = invalid("Input collection [a, a] contains duplicates.");
+    let ns_dup = "Input collection contains duplicates".to_owned();
     for (value, reason) in [
         (json!({"N": "bob", "S": "x"}), numeric("bob")),
         (json!({"N": "1", "S": "x"}), SEVERAL.to_owned()),
@@ -94,6 +99,36 @@ fn a_number_fault_in_a_value_with_several_types_is_named_ahead_of_the_several_ty
         (
             json!({"M": {"k": {"N": "aaa"}}, "L": [{"N": "bbb"}]}),
             numeric("aaa"),
+        ),
+        (json!({"SS": ["a", "a"], "N": "1"}), ss_dup.clone()),
+        (json!({"SS": ["a", "a"], "N": "bob"}), ss_dup.clone()),
+        (json!({"SS": ["a", "a"], "X": "1"}), ss_dup.clone()),
+        (json!({"SS": ["a", "a"], "L": [null]}), ss_dup.clone()),
+        (json!({"S": "x", "L": [{"SS": ["a", "a"]}]}), ss_dup),
+        (json!({"NS": ["1", "1"], "S": "x"}), ns_dup.clone()),
+        (json!({"NS": ["1", "1"], "N": "bob"}), numeric("bob")),
+        (
+            json!({"NS": ["1", "1"], "L": [{"N": "bob"}]}),
+            ns_dup.clone(),
+        ),
+        (json!({"NS": ["bob", "bob"], "S": "x"}), numeric("bob")),
+        (json!({"NS": ["1", "1"], "BS": ["YQ==", "YQ=="]}), ns_dup),
+        (
+            json!({"BS": ["YQ==", "YQ=="], "N": "1"}),
+            invalid("Input collection [YQ==, YQ==]of type BS contains duplicates."),
+        ),
+        (json!({"BS": ["YQ==", "YQ=="], "N": "bob"}), numeric("bob")),
+        (
+            json!({"SS": [], "N": "1"}),
+            invalid("An string set  may not be empty"),
+        ),
+        (
+            json!({"NS": [], "S": "x"}),
+            invalid("An number set  may not be empty"),
+        ),
+        (
+            json!({"BS": [], "N": "1"}),
+            invalid("Binary sets should not be empty"),
         ),
     ] {
         let body = body_with(json!({":p": {"S": "x"}, ":z": value}), json!({}));

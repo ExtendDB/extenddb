@@ -176,8 +176,9 @@ fn each_member_and_value_is_read_on_its_own_for_a_shape_fault() {
     // A shape fault is reported past an unknown descriptor or an empty set in
     // another member or value, a number or an `"on"` in `ConsistentRead` is a
     // shape fault, and a member the service reads from a JSON type the typed
-    // input refuses leaves the check's answer. Each row holds the values, the
-    // other members and the answer.
+    // input refuses leaves the check's answer. Measured 2026-11-24 the same
+    // way: a null member and a null name leave the check's answer too. Each
+    // row holds the values, the other members and the answer.
     let shape = |text: &str| {
         (
             "SerializationException",
@@ -241,7 +242,29 @@ fn each_member_and_value_is_read_on_its_own_for_a_shape_fault() {
             json!({"ScanIndexForward": "0", "Select": "NOPE"}),
             select_nope.clone(),
         ),
-        (sx, json!({"Limit": 1.5, "Select": "NOPE"}), select_nope),
+        (
+            sx.clone(),
+            json!({"Limit": 1.5, "Select": "NOPE"}),
+            select_nope.clone(),
+        ),
+        (
+            sx.clone(),
+            json!({"ScanIndexForward": null, "Select": "NOPE"}),
+            select_nope.clone(),
+        ),
+        (
+            sx.clone(),
+            json!({"ExpressionAttributeNames": {"#a": null}, "Select": "NOPE"}),
+            select_nope,
+        ),
+        (
+            sx,
+            json!({"ExpressionAttributeNames": {"#a": null}, "ReturnConsumedCapacity": "NOPE"}),
+            (
+                "ValidationException",
+                one_error(&RCC_BAD.replace("'bad'", "'NOPE'")),
+            ),
+        ),
     ];
     let mismatches: Vec<String> = rows
         .into_iter()
