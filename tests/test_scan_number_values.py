@@ -80,6 +80,7 @@ MIX = (
 )
 EAN_KEY = 'ExpressionAttributeNames contains invalid key: Syntax error; key: "a"'
 INVALID_VALUE = "ExpressionAttributeValues contains invalid value: "
+EMPTY_AV = "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes"
 
 
 def _newer(field: str, bound: str) -> str:
