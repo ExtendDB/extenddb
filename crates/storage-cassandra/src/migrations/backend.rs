@@ -20,10 +20,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use cdrs_tokio::consistency::Consistency;
-use extenddb_storage::management_store::ManagementStore;
+use extenddb_storage::management_store::{ManagementStore, SettingsStore};
 use extenddb_storage::migrations::{
-    CatalogTraces, Done, HasManagementStore, LedgerColumns, LedgerRow, Migration, MigrationBackend,
-    MigrationError, MigrationId, Released, Step, StoreKind, StoreRef, record_rows,
+    CatalogTraces, Done, HasManagementStore, LedgerColumns, LedgerRow, LockedStores, Migration,
+    MigrationBackend, MigrationError, MigrationId, Released, Step, StoreKind, StoreRef,
+    record_rows,
 };
 
 use super::agreement::{AGREEMENT_TIMEOUT, wait_for_agreement_with};
@@ -62,14 +63,15 @@ fn stopped_by_hook() -> MigrationError {
 }
 
 impl CassandraStores {
-    fn new(
+    pub(super) fn new(
         session: Arc<CassandraSession>,
         keyspace_prefix: &str,
         lease: Option<LeaseHandle>,
     ) -> Self {
         Self {
             management: LeasedManagementStore::new(
-                CassandraCatalogStore::catalog_only(session.clone(), keyspace_prefix.to_owned()),
+                CassandraCatalogStore::catalog_only(session.clone(), keyspace_prefix.to_owned())
+                    .reading_key_rows_at_all(),
                 lease.clone(),
             ),
             session,
@@ -156,6 +158,19 @@ impl CassandraStores {
 
 impl HasManagementStore for CassandraStores {
     fn management_store(&self) -> &dyn ManagementStore {
+        &self.management
+    }
+}
+
+/// The catalog's stores for the encryption-key commands, which open them
+/// under the lock they hold as a migration does: every call checks the
+/// lease first and is bounded by the request timeout.
+impl LockedStores for CassandraStores {
+    fn management(&self) -> &dyn ManagementStore {
+        &self.management
+    }
+
+    fn settings(&self) -> &dyn SettingsStore {
         &self.management
     }
 }
@@ -341,8 +356,9 @@ struct KeyspaceLedger<'a> {
     keyspace: &'a str,
     /// The `catalog_version` to write with this keyspace's row. Migration
     /// 1's row and the version go in one logged batch: a stop between two
-    /// writes would leave that row beside a 0.1.x version row, which the
-    /// next run reads as a catalog an older release wrote to. A later row
+    /// writes would leave that row beside the dotted version row of 0.1.14
+    /// or earlier, which the next run reads as a catalog an older release
+    /// wrote to. A later row
     /// goes on its own, after the version, since its notes can be long and a
     /// logged batch is refused past the node's `batch_size_fail_threshold`
     /// (50 KB by default). A stop between them leaves the version ahead of
@@ -530,7 +546,7 @@ impl MigrationBackend for CassandraMigrations<'_> {
             Step::Record => Done::default(),
         };
         // The first time migration 1 is applied to a store, the store must
-        // match the v1.0 schema; a later --reconverge leaves its row as it
+        // match migration 1's schema; a later --reconverge leaves its row as it
         // is and is not checked, since later migrations change the schema.
         if id == MigrationId::Baseline && row.is_some() {
             self.agree().await?;
