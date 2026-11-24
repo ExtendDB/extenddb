@@ -685,10 +685,12 @@ pub(crate) async fn poll_gsi_backfill_recovery(
 }
 
 /// One scan of the recovery worker, limited to the `CREATING` indexes of one
-/// table. Hidden because no deployment path calls it: a direct test drives the
-/// worker's claim with it, and the table filter keeps the scan off the indexes
-/// the tests running beside it stage. The backfills it starts keep running
-/// after it returns, as they do in the worker between two scans.
+/// table; for tests. A direct test drives the worker's claim with it, and the
+/// table filter keeps the scan off the indexes the tests running beside it
+/// stage. The backfills it starts keep running after it returns, as they do in
+/// the worker between two scans, where
+/// [`recover_stale_gsi_backfills_for_tests`] waits for them.
+#[cfg(any(test, feature = "test-util"))]
 #[doc(hidden)]
 pub async fn recover_stale_gsi_backfills_of_table(
     engine: &Arc<CassandraEngine>,
