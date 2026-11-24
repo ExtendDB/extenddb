@@ -6,14 +6,15 @@
 //! and writes nothing when it refuses; a dev build migrates `Uninitialized`
 //! and `Behind` first, and refuses the rest; an in-memory database is
 //! created by the runner every time. The lock that keeps a migrator, a
-//! second migrator and a server apart is tested here too.
+//! second migrator and a server apart is tested here too, and so is the
+//! refusal of an encryption key that the secret cipher refuses.
 
 use std::path::Path;
 use std::time::Duration;
 
 use extenddb_storage::migrations::{CatalogStatus, MigrationError, MigrationId, exit};
 use extenddb_storage::server_components::{
-    BackendError, ServerComponents, ServerComponentsOptions,
+    BackendError, KeySource, ServerComponents, ServerComponentsOptions,
 };
 
 use super::migrate;
@@ -35,7 +36,8 @@ async fn start(path: &str, dev: bool) -> Result<ServerComponents, BackendError> 
         path: path.to_owned(),
         pool_size: 2,
     };
-    crate::sqlite_server_components_factory(&config, "us-east-1", options(dev)).await
+    crate::server_backend::sqlite_server_components_factory(&config, "us-east-1", options(dev))
+        .await
 }
 
 /// The refusal a factory returned, with its exit code.
@@ -164,6 +166,31 @@ async fn a_dev_server_creates_a_missing_catalog_and_its_rows() {
     assert!(copies(&db).is_empty(), "a new database has nothing to copy");
 }
 
+/// A dev server writes no catalog key into a catalog that has a key ring,
+/// whether or not it then starts.
+#[tokio::test]
+async fn a_dev_server_writes_no_catalog_key_beside_a_key_ring() {
+    let db = temp_db("serve-dev-ring");
+    let location = db.to_string_lossy().into_owned();
+    super::migrate(&location, "1.0.0-test", Duration::from_secs(5))
+        .await
+        .expect("a current catalog");
+    exec(
+        &db,
+        "INSERT INTO settings (key, value) VALUES ('encryption_key_ring', '{}')",
+    )
+    .await;
+    let _ = start(&location, true).await;
+    let pool = plain_pool(&db).await;
+    let key: Option<String> =
+        sqlx::query_scalar("SELECT value FROM settings WHERE key = 'encryption_key'")
+            .fetch_optional(&pool)
+            .await
+            .expect("read");
+    pool.close().await;
+    assert!(key.is_none(), "the dev bootstrap wrote a catalog key");
+}
+
 #[tokio::test]
 async fn a_dev_server_refuses_a_catalog_that_needs_attention() {
     let db = temp_db("serve-dev-attention");
@@ -217,6 +244,40 @@ async fn a_server_refuses_while_a_migration_holds_the_database() {
     );
 }
 
+/// A server refuses a catalog whose encryption key the secret cipher refuses,
+/// and names the reason. Without the check it started, and every signed
+/// request failed with a 500.
+#[tokio::test]
+async fn a_server_refuses_an_encryption_key_the_cipher_refuses() {
+    let db = temp_db("serve-bad-key");
+    let location = current_catalog(&db).await;
+    let set_key =
+        |key: &str| format!("UPDATE settings SET value = '{key}' WHERE key = 'encryption_key'");
+    // 32 bytes and a trailing newline.
+    exec(
+        &db,
+        &set_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"),
+    )
+    .await;
+    match start(&location, false).await {
+        Err(BackendError::InvalidEncryptionKey(r)) => {
+            assert!(r.starts_with("decode encryption key: "), "{r}");
+        }
+        Err(other) => panic!("refused for another reason: {other}"),
+        Ok(_) => panic!("the server started"),
+    }
+    exec(
+        &db,
+        &set_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+    )
+    .await;
+    drop(
+        start(&location, false)
+            .await
+            .expect("starts with a 32-byte key"),
+    );
+}
+
 #[tokio::test]
 async fn a_server_serves_a_catalog_ahead_by_additive_migrations_only() {
     let db = temp_db("serve-ahead");
@@ -258,6 +319,88 @@ async fn an_in_memory_server_creates_its_catalog_through_the_runner() {
         .await
         .expect("read");
     assert_eq!(version, Some(LATEST.to_string()));
+}
+
+/// An in-memory catalog is new at each start, so it refuses key_file.
+#[tokio::test]
+async fn an_in_memory_server_refuses_a_key_file() {
+    let config = crate::config::SqliteConfig {
+        path: ":memory:".to_owned(),
+        pool_size: 2,
+    };
+    let mut options = options(false);
+    options.key_source = KeySource::Kek(zeroize::Zeroizing::new([3; 32]).into());
+    match crate::server_backend::sqlite_server_components_factory(&config, "us-east-1", options)
+        .await
+    {
+        Err(BackendError::InitializationFailed(message)) => {
+            assert!(message.contains("in-memory"), "{message}");
+        }
+        Err(other) => panic!("refused for another reason: {other}"),
+        Ok(_) => panic!("an in-memory server started with key_file"),
+    }
+}
+
+/// A switched catalog (a key ring, no catalog key) starts with the KEK of
+/// its ring, and both stores then hold the ring's DEK; without key_file, or
+/// with another KEK, the server refuses.
+#[tokio::test]
+async fn a_server_loads_the_dek_of_a_switched_catalog_with_its_kek() {
+    use extenddb_storage::key_ring::KeyRing;
+    use extenddb_storage::secret_keys::SecretKeys;
+
+    const KEK: [u8; 32] = [3; 32];
+    let db = temp_db("serve-ring");
+    let location = current_catalog(&db).await;
+    let pool = plain_pool(&db).await;
+    let catalog_id: String =
+        sqlx::query_scalar("SELECT value FROM settings WHERE key = 'catalog_id'")
+            .fetch_one(&pool)
+            .await
+            .expect("the catalog id");
+    let dek = SecretKeys::dek_for_tests([5; 32], 1, &catalog_id);
+    let ring = KeyRing::seal(&KEK, &catalog_id, &[&dek], false, None).expect("a ring");
+    sqlx::query("DELETE FROM settings WHERE key = 'encryption_key'")
+        .execute(&pool)
+        .await
+        .expect("delete the catalog key");
+    sqlx::query("INSERT INTO settings (key, value) VALUES ('encryption_key_ring', ?)")
+        .bind(ring.to_json())
+        .execute(&pool)
+        .await
+        .expect("write the ring");
+    pool.close().await;
+
+    let start_with = |key_source: KeySource| {
+        let location = location.clone();
+        async move {
+            let config = crate::config::SqliteConfig {
+                path: location,
+                pool_size: 2,
+            };
+            let mut options = options(false);
+            options.key_source = key_source;
+            crate::server_backend::sqlite_server_components_factory(&config, "us-east-1", options)
+                .await
+        }
+    };
+    let kek = |bytes: [u8; 32]| KeySource::Kek(zeroize::Zeroizing::new(bytes).into());
+    let started = start_with(kek(KEK)).await.expect("starts with the KEK");
+    let keys = started.catalog_store.secret_keys().expect("a key holder");
+    assert_eq!(keys.dek_id(), Some(1));
+    drop(started);
+    for (source, expected) in [
+        (KeySource::CatalogKey, "Set [auth.encryption] key_file"),
+        (kek([4; 32]), "and the key file holds the KEK with id"),
+    ] {
+        match start_with(source).await {
+            Err(BackendError::InitializationFailed(message)) => {
+                assert!(message.contains(expected), "{message}");
+            }
+            Err(other) => panic!("refused for another reason: {other}"),
+            Ok(_) => panic!("the server started"),
+        }
+    }
 }
 
 #[tokio::test]
@@ -319,7 +462,7 @@ async fn a_caller_holding_the_serve_lock_migrates_through_migrate_holding() {
         .await
         .expect_err("the lock is this process's own");
     assert_eq!(err.exit_code(), exit::LOCKED);
-    let report = super::migrate_holding(&location, RELEASE, &held)
+    let report = super::file_database::migrate_holding(&location, RELEASE, &held)
         .await
         .expect("migrate holding the lock");
     assert_eq!(report.to, Some(LATEST));
@@ -331,10 +474,53 @@ async fn a_caller_holding_the_serve_lock_migrates_through_migrate_holding() {
     // Another database's lock is not this one's.
     let other = temp_db("holding-other");
     let other_lock = crate::serve_lock::ServeLock::acquire(&other).expect("other lock");
-    let refused = super::migrate_holding(&location, RELEASE, &other_lock).await;
+    let refused = super::file_database::migrate_holding(&location, RELEASE, &other_lock).await;
     assert!(
         matches!(refused, Err(MigrationError::Refused(_))),
         "{refused:?}"
     );
     drop(held);
+}
+
+/// The stores of a held migration lock read and write the catalog, and a
+/// server refuses to start while the lock is held.
+#[tokio::test]
+async fn the_stores_of_a_held_lock_write_the_catalog() {
+    use extenddb_storage::migrations::{CatalogMigrations, Target};
+    use extenddb_storage::secret_keys::SecretTable;
+
+    let db = temp_db("locked-stores");
+    let location = current_catalog(&db).await;
+    let migrations = super::SqliteCatalogMigrations;
+    let lock = migrations
+        .lock(&Target::at(&location), Duration::from_secs(5))
+        .await
+        .expect("the migration lock");
+    let stores = migrations
+        .locked_stores(&lock, None)
+        .await
+        .expect("the stores of the lock");
+    stores
+        .settings()
+        .set_setting("locked_stores_test", "written")
+        .await
+        .expect("write a setting");
+    let page = stores
+        .management()
+        .read_secret_page(SecretTable::AccessKeys, None, 10)
+        .await
+        .expect("read the access keys");
+    assert!(page.rows.is_empty());
+    let err = refusal(start(&location, false).await);
+    assert!(matches!(err, MigrationError::Locked(_)), "{err:?}");
+    drop(stores);
+    migrations.release(lock).await;
+    let pool = plain_pool(&db).await;
+    let value: Option<String> =
+        sqlx::query_scalar("SELECT value FROM settings WHERE key = 'locked_stores_test'")
+            .fetch_optional(&pool)
+            .await
+            .expect("read");
+    pool.close().await;
+    assert_eq!(value.as_deref(), Some("written"));
 }

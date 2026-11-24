@@ -891,12 +891,27 @@ pub fn check_private_directory(dir: &Path, what: &str) -> Result<(), StoreError>
 }
 
 fn check_private_tree(root: &Path, meta: &std::fs::Metadata, what: &str) -> Result<(), StoreError> {
+    check_owner_only(root, meta)?;
+    check_private_ancestors(root, what)
+}
+
+/// The ancestor half of the owner-only rule, for the canonical path `path`:
+/// every ancestor is a directory, not a symlink, owned by the effective user
+/// or by root, and not writable by group or others unless its sticky bit is
+/// set. `what` names `path` in the messages. The backup root, the restore
+/// spool and the KEK file (RFC-0000 section 2, check 2) use it. No check is
+/// made on other platforms.
+///
+/// # Errors
+///
+/// `PermissionDenied` naming the ancestor and what it needs; `Io` when an
+/// ancestor cannot be read.
+pub fn check_private_ancestors(path: &Path, what: &str) -> Result<(), StoreError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        check_owner_only(root, meta)?;
         let euid = effective_uid();
-        let mut ancestor = root.parent();
+        let mut ancestor = path.parent();
         while let Some(dir) = ancestor {
             let m = std::fs::symlink_metadata(dir)
                 .map_err(|e| StoreError::io(format!("stat {}", dir.display()), e))?;
@@ -914,7 +929,8 @@ fn check_private_tree(root: &Path, meta: &std::fs::Metadata, what: &str) -> Resu
             if m.uid() != euid && m.uid() != 0 {
                 return Err(StoreError::PermissionDenied(format!(
                     "{} (an ancestor of the {what}) is owned by uid {}; the {what} must sit \
-                     under directories owned by root or by the extenddb user",
+                     under directories owned by root or by the user extenddb runs as (uid \
+                     {euid})",
                     dir.display(),
                     m.uid()
                 )));
@@ -932,7 +948,7 @@ fn check_private_tree(root: &Path, meta: &std::fs::Metadata, what: &str) -> Resu
     }
     #[cfg(not(unix))]
     {
-        let _ = (root, meta, what);
+        let _ = (path, what);
     }
     Ok(())
 }
@@ -992,8 +1008,9 @@ fn check_root_is_directory(root: &Path, meta: &std::fs::Metadata) -> Result<(), 
     Ok(())
 }
 
+/// The effective user ID of this process.
 #[cfg(unix)]
-fn effective_uid() -> u32 {
+pub fn effective_uid() -> u32 {
     // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { libc::geteuid() }
 }

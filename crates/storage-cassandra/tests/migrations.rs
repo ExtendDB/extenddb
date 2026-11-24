@@ -512,12 +512,13 @@ async fn the_check_before_the_lock_reads_no_policy() {
     deployment(&session, &prefix).await;
     let migrations = CassandraCatalogMigrations;
     let target = target_of(&prefix);
-    let lock = migrations.lock(&target, TIMEOUT).await.expect("lock");
-    migrations
-        .forget(&lock, 2)
-        .await
-        .expect("forget migration 2");
-    migrations.release(lock).await;
+    // Migration 2 pending: its ledger row deleted (the version row is left
+    // as it was; the next run rewrites it).
+    cql(
+        &session,
+        &format!("DELETE FROM {prefix}_catalog.extenddb_migrations WHERE id = 2"),
+    )
+    .await;
     // A user, whose policies migration 2's read looks up.
     cql(
         &session,
@@ -639,7 +640,7 @@ async fn migration_1_converges_a_legacy_catalog_and_stops_on_a_table_of_another_
     let catalog = format!("{prefix}_catalog");
     keyspace(&session, &catalog).await;
     // A catalog with the legacy files' tables and no ledger, as a release
-    // before 1.0 left it, with the traces in its settings: the version row,
+    // before 0.1.15 left it, with the traces in its settings: the version row,
     // the marker, and a setting an operator changed.
     run_baseline_unrecorded(&session, &catalog, StoreKind::Catalog)
         .await
@@ -1659,4 +1660,66 @@ async fn init_finishes_a_catalog_stopped_before_its_admin_user() {
     );
     drop(drops);
     helpers::flush_pending_drops(&session).await;
+}
+
+/// The stores that `CatalogMigrations::locked_stores` opens for the
+/// encryption-key commands work while the lock is held, and refuse once it
+/// is released.
+#[tokio::test]
+async fn the_stores_under_the_migration_lock_check_its_lease() {
+    use extenddb_storage::secret_keys::SecretTable;
+
+    if helpers::skip_without_cassandra() {
+        return;
+    }
+    let session = session().await;
+    let (prefix, _drops) = new_prefix("locked");
+    keyspace(&session, &format!("{prefix}_catalog")).await;
+    migrate_catalog_keyspace(session.clone(), &prefix, "test", TIMEOUT)
+        .await
+        .expect("migrate the catalog");
+    let migrations = CassandraCatalogMigrations;
+    let lock = migrations
+        .lock(&target_of(&prefix), TIMEOUT)
+        .await
+        .expect("lock");
+    let stores = migrations
+        .locked_stores(&lock, None)
+        .await
+        .expect("the stores under the lock");
+    stores
+        .settings()
+        .set_setting("row_under_lock", "value")
+        .await
+        .expect("write");
+    assert_eq!(
+        stores
+            .settings()
+            .get_setting("row_under_lock")
+            .await
+            .expect("read")
+            .as_deref(),
+        Some("value")
+    );
+    assert!(
+        stores
+            .settings()
+            .replace_setting("row_under_lock", "value", "replaced")
+            .await
+            .expect("replace")
+    );
+    let page = stores
+        .management()
+        .read_secret_page(SecretTable::AccessKeys, None, 1000)
+        .await
+        .expect("page");
+    assert!(page.rows.is_empty() && page.next.is_none());
+    stores
+        .management()
+        .delete_setting("row_under_lock")
+        .await
+        .expect("delete");
+
+    migrations.release(lock).await;
+    assert!(stores.settings().get_setting("catalog_id").await.is_err());
 }

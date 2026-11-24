@@ -12,7 +12,7 @@ use std::time::Duration;
 use bson::{Document, doc};
 use extenddb_storage::migrations::{CatalogStatus, MigrationBackend, MigrationId, Runner};
 use extenddb_storage_mongodb::migrations::{
-    Definitions, MigrationLock, MongoMigrations, Timing, describe_store, lock,
+    Definitions, LOCK_ID, MigrationLock, MongoMigrations, Timing, describe_store, lock,
 };
 use migrations_support::{Deployment, fixture, server};
 
@@ -277,28 +277,43 @@ async fn an_upgrade_stopped_at_any_request_finishes_on_the_next_run() {
     assert!(stop_at_every_request(&uri, Some("0.1.12")).await > 10);
 }
 
+/// A holder that was killed leaves its lock document behind with a live
+/// lease. A claim is refused while the lease runs and takes the lock on its
+/// first attempt once the lease has ended. The lease ends here by moving
+/// `expires_at` to a second before the server's clock, so the test does not
+/// wait for a lease or race its claims against one: `acquire` checks its
+/// timeout only after a claim returns, so a claim that is slow to answer
+/// could land after a short lease ended. This test does not check that the
+/// abandoned holder stops renewing: under `Timing::PRODUCTION` its first
+/// renewal comes after 15 s.
+/// `the_holder_keeps_the_lock_for_three_leases_and_a_killed_one_is_replaced_within_a_lease`
+/// in `migrations_locks.rs` checks it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lock_left_by_a_killed_holder_is_taken_once_it_expires() {
     let Some(uri) = server() else { return };
     let d = Deployment::new(&uri, "expired").await;
-    let timing = Timing {
-        lease: Duration::from_secs(2),
-        renew_every: Duration::from_millis(500),
-        margin: Duration::from_millis(800),
-        idle_limit: Duration::from_secs(30),
-        retry_every: Duration::from_millis(100),
-        ..Timing::PRODUCTION
-    };
-    MigrationLock::acquire(&d.target, Duration::from_secs(5), timing)
+    MigrationLock::acquire(&d.target, Duration::from_secs(5), Timing::PRODUCTION)
         .await
         .expect("lock")
         .abandon();
-    let refused = MigrationLock::acquire(&d.target, Duration::from_millis(500), timing)
+    // The 60 s lease is live, and a zero timeout makes this one attempt.
+    let refused = MigrationLock::acquire(&d.target, Duration::ZERO, Timing::PRODUCTION)
         .await
         .err()
         .expect("held");
     assert_eq!(refused.exit_code(), 6);
-    let again = MigrationLock::acquire(&d.target, Duration::from_secs(5), timing)
+    let expired = d
+        .catalog()
+        .collection::<Document>("settings")
+        .update_one(
+            doc! { "_id": LOCK_ID },
+            vec![doc! { "$set": { "expires_at": { "$subtract": ["$$NOW", 1000] } } }],
+        )
+        .await
+        .expect("end the lease");
+    assert_eq!(expired.matched_count, 1);
+    // A zero timeout makes one attempt, so the lock must be free on it.
+    let again = MigrationLock::acquire(&d.target, Duration::ZERO, Timing::PRODUCTION)
         .await
         .expect("taken after the lease");
     again.release().await;

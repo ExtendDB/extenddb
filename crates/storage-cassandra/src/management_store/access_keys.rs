@@ -3,11 +3,14 @@
 
 //! Access key, session, and caller-tag operations for `CassandraCatalogStore`.
 
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use crate::catalog_store::CassandraCatalogStore;
 use cdrs_tokio::types::IntoRustByName;
 use cdrs_tokio::types::blob::Blob;
+use extenddb_storage::CatalogStore;
 use extenddb_storage::management_store::{AccessKeyCreated, OpError, OpResult};
-use extenddb_storage::secret_cipher::encrypt_secret;
+use extenddb_storage::secret_keys::{SecretRow, require_keys};
 
 impl CassandraCatalogStore {
     // ── Access keys ────────────────────────────────────────────────
@@ -22,33 +25,18 @@ impl CassandraCatalogStore {
             return Err(OpError::NotFound("User not found".to_owned()));
         }
 
-        // P119: Use cached encryption key if available, fall back to DB query.
-        let enc_key: String = if let Some(cached) = self.encryption_key() {
-            cached.to_string()
-        } else {
-            let catalog_keyspace = self.catalog_keyspace();
-            let query = format!(
-                "SELECT value FROM {catalog_keyspace}.settings WHERE key = 'encryption_key'"
-            );
-
-            let row = crate::cassandra_util::query_optional(
-                self.session(),
-                &query,
-                cdrs_tokio::query_values!(),
-                "create_access_key",
-            )
-            .await?
-            .ok_or_else(|| OpError::Internal("Encryption key not configured".to_owned()))?;
-
-            crate::cassandra_util::get_column(&row, "value", "create_access_key")?
-        };
-
+        let keys = require_keys(self.secret_keys())?;
         let access_key_id = generate_access_key_id();
         let secret_key = generate_secret_key();
-        let encrypted = encrypt_secret(&secret_key, &enc_key, &access_key_id).map_err(|e| {
-            tracing::error!("create_access_key encryption: {e}");
-            OpError::Internal("Database error".to_owned())
-        })?;
+        let encrypted = keys
+            .encrypt(
+                &SecretRow::access_key(&access_key_id, account_id, user_name),
+                &secret_key,
+            )
+            .map_err(|e| {
+                tracing::error!("create_access_key encryption: {e}");
+                OpError::Internal("Database error".to_owned())
+            })?;
 
         let catalog_keyspace = self.catalog_keyspace();
         let insert_query = format!(
@@ -98,7 +86,8 @@ impl CassandraCatalogStore {
 
         let result = self
             .session()
-            .query_with_values(
+            .run(
+                Stmt::Lwt,
                 &delete_query,
                 cdrs_tokio::query_values!(key_id, account_id, user_name),
             )
@@ -170,29 +159,13 @@ impl CassandraCatalogStore {
             return Err(OpError::NotFound("IAM user not found".to_owned()));
         }
 
-        // P119: Use cached encryption key if available, fall back to DB query.
-        let enc_key: String = if let Some(cached) = self.encryption_key() {
-            cached.to_string()
-        } else {
-            let catalog_keyspace = self.catalog_keyspace();
-            let query = format!(
-                "SELECT value FROM {catalog_keyspace}.settings WHERE key = 'encryption_key'"
-            );
-
-            let row = crate::cassandra_util::query_optional(
-                self.session(),
-                &query,
-                cdrs_tokio::query_values!(),
-                "import_access_key",
+        let keys = require_keys(self.secret_keys())?;
+        let encrypted = keys
+            .encrypt(
+                &SecretRow::access_key(access_key_id, account_id, user_name),
+                secret_access_key,
             )
-            .await?
-            .ok_or_else(|| OpError::Internal("Encryption key not configured".to_owned()))?;
-
-            crate::cassandra_util::get_column(&row, "value", "import_access_key")?
-        };
-
-        let encrypted =
-            encrypt_secret(secret_access_key, &enc_key, access_key_id).map_err(|e| {
+            .map_err(|e| {
                 tracing::error!("import_access_key encryption: {e}");
                 OpError::Internal("Database error".to_owned())
             })?;
@@ -249,7 +222,10 @@ impl CassandraCatalogStore {
         let session_policy_json = session_policy
             .as_ref()
             .map(std::string::ToString::to_string);
-        let expires_ms = expires_at.unix_timestamp() * 1000 + i64::from(expires_at.millisecond());
+        // Whole seconds: the AAD of the session secret carries `expires_at`
+        // in whole Unix seconds, and the stored value must read back as the
+        // value that was encrypted.
+        let expires_ms = expires_at.unix_timestamp() * 1000;
 
         crate::cassandra_util::execute(
             self.session(),

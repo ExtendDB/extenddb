@@ -16,25 +16,32 @@
 //! status the server started with; otherwise a migration ran in between,
 //! and the server stops.
 
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use extenddb_storage::hooks::{Reregistration, ServingRegistrar};
 use extenddb_storage::migrations::{CatalogStatus, MigrationError, Target};
+use extenddb_storage::secret_keys::SecretKeys;
+use extenddb_storage::server_components::{BackendError, KeySource, load_secret_keys};
+use zeroize::Zeroizing;
 
 use super::locks::{KEEPALIVE_INTERVAL, SERVE_APPLICATION, ServingRegistration};
+use super::sessions::{close_status, status_session};
 use super::{PostgresTarget, catalog_status, require_data_connection_row, resolve};
+use crate::catalog_store::PostgresCatalogStore;
 
 /// The serving registration of a running server, with what it needs to
 /// take it again: the catalog's databases, the status the server started
-/// with, and the name its session carries.
+/// with, and the name its session carries; and the key holder loaded under
+/// it, which the server's stores share.
 pub struct ServerRegistration {
     target: PostgresTarget,
     started: CatalogStatus,
     keepalive: Duration,
     application: &'static str,
     current: Mutex<ServingRegistration>,
+    keys: Option<Arc<SecretKeys>>,
 }
 
 impl ServerRegistration {
@@ -103,24 +110,80 @@ impl ServerRegistration {
         keepalive: Duration,
         application: &'static str,
     ) -> Result<Self, MigrationError> {
-        let Some(target) = resolve(&Target::at(connection_string)).await? else {
-            return Err(MigrationError::Status(CatalogStatus::Uninitialized));
+        Self::register_loading(connection_string, keepalive, application, KeySource::None)
+            .await
+            .map_err(|e| match e {
+                BackendError::Catalog(e) => e,
+                other => MigrationError::Refused(other.to_string()),
+            })
+    }
+
+    /// [`ServerRegistration::register_as`] for the server factory, which
+    /// also loads the key (RFC-0000 sections 7 and 12): after the serving
+    /// key is taken and before the status is read, the key rows are read
+    /// and `key_source` loads the one key holder that serves the status
+    /// read, the data database's connection string and the stores. A KEK
+    /// in `key_source` is wiped when the load returns.
+    ///
+    /// # Errors
+    ///
+    /// The refusals of [`load_secret_keys`], and those of
+    /// [`ServerRegistration::register`] as [`BackendError::Catalog`].
+    pub async fn register_keyed(
+        connection_string: &str,
+        application: &'static str,
+        key_source: KeySource,
+    ) -> Result<Self, BackendError> {
+        Self::register_loading(
+            connection_string,
+            KEEPALIVE_INTERVAL,
+            application,
+            key_source,
+        )
+        .await
+    }
+
+    async fn register_loading(
+        connection_string: &str,
+        keepalive: Duration,
+        application: &'static str,
+        key_source: KeySource,
+    ) -> Result<Self, BackendError> {
+        let Some(target) = resolve(&Target::at(connection_string))
+            .await
+            .map_err(BackendError::Catalog)?
+        else {
+            return Err(BackendError::Catalog(MigrationError::Status(
+                CatalogStatus::Uninitialized,
+            )));
         };
         let registration =
             ServingRegistration::register_keepalive(&target.catalog, keepalive, application)
-                .await?;
+                .await
+                .map_err(BackendError::Catalog)?;
+        let keys = match load_keys(&target, key_source).await {
+            Ok(keys) => keys,
+            Err(e) => {
+                registration.release().await;
+                return Err(e);
+            }
+        };
+        let target = match &keys {
+            Some(keys) => target.with_secret_keys(Arc::clone(keys)),
+            None => target,
+        };
         let status = match catalog_status(&target).await {
             Ok(status) => status,
             Err(e) => {
                 registration.release().await;
-                return Err(e);
+                return Err(BackendError::Catalog(e));
             }
         };
         match status {
             CatalogStatus::Current { .. } | CatalogStatus::AheadCompatible { .. } => {
                 if let Err(e) = require_data_connection_row(&target).await {
                     registration.release().await;
-                    return Err(e);
+                    return Err(BackendError::Catalog(e));
                 }
                 if matches!(status, CatalogStatus::AheadCompatible { .. }) {
                     tracing::warn!(
@@ -134,14 +197,52 @@ impl ServerRegistration {
                     keepalive,
                     application,
                     current: Mutex::new(registration),
+                    keys,
                 })
             }
             status => {
                 registration.release().await;
-                Err(MigrationError::Status(status))
+                Err(BackendError::Catalog(MigrationError::Status(status)))
             }
         }
     }
+
+    /// The key holder loaded under this registration, or `None` when it
+    /// was taken with `KeySource::None`.
+    #[must_use]
+    pub fn secret_keys(&self) -> Option<Arc<SecretKeys>> {
+        self.keys.clone()
+    }
+
+    /// The catalog's data database connection string, opened with the key
+    /// holder of this registration in a catalog with a key ring; `None`
+    /// when the catalog has no such row.
+    ///
+    /// # Errors
+    ///
+    /// The catalog cannot be read, or the key holder does not open the row.
+    pub async fn data_connection_string(
+        &self,
+    ) -> Result<Option<Zeroizing<String>>, MigrationError> {
+        super::data_connection_string(&self.target).await
+    }
+}
+
+/// Load the key holder of `key_source` from the catalog's key rows, on a
+/// read-only session of its own. `KeySource::None` opens no session.
+async fn load_keys(
+    target: &PostgresTarget,
+    key_source: KeySource,
+) -> Result<Option<Arc<SecretKeys>>, BackendError> {
+    if matches!(key_source, KeySource::None) {
+        return Ok(None);
+    }
+    let pool = status_session(&target.catalog, target.connect_timeout)
+        .await
+        .map_err(BackendError::Catalog)?;
+    let keys = load_secret_keys(&PostgresCatalogStore::new(pool.clone()), key_source).await;
+    close_status(pool).await;
+    keys
 }
 
 #[async_trait]
