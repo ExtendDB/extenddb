@@ -19,8 +19,14 @@ pub(crate) struct FileUri {
     /// The path, decoded.
     path: Vec<u8>,
     /// The query options in order, decoded. Read only by `creates_file`,
-    /// which the Unix file mode code uses.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    /// which the Unix file mode code uses, and by the tests.
+    #[cfg_attr(
+        all(not(unix), not(test)),
+        expect(
+            dead_code,
+            reason = "read only by `creates_file`, which only Unix compiles"
+        )
+    )]
     options: Vec<(Vec<u8>, Vec<u8>)>,
 }
 

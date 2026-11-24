@@ -33,15 +33,13 @@
 //! directory's mode is left alone. On platforms other than Unix `prepare` does
 //! nothing.
 
-use std::path::Path;
 #[cfg(unix)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::str::FromStr;
 
 #[cfg(unix)]
 use crate::serve_lock::{database_file, resolve_dangling_symlinks, set_owner_only};
-use crate::sqlite_util::sqlite_url;
 
 /// Open a pool on `location` (a path, `:memory:` or a `sqlite:` URL) with
 /// `options`, keeping the database file and its sidecars owner read/write
@@ -50,13 +48,15 @@ use crate::sqlite_util::sqlite_url;
 /// # Errors
 ///
 /// A file's mode cannot be set, or the pool cannot connect.
+// Off wasm32 with its callers, the bootstrapper and the catalog pool.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn connect(
     location: &str,
     options: sqlx::sqlite::SqlitePoolOptions,
 ) -> Result<sqlx::SqlitePool, String> {
     prepare(location)?;
     options
-        .connect(&sqlite_url(location))
+        .connect(&crate::sqlite_util::sqlite_url(location))
         .await
         .map_err(|e| e.to_string())
 }
@@ -138,7 +138,7 @@ struct OpenedFile {
 #[cfg(unix)]
 fn opened_file(location: &str) -> Option<OpenedFile> {
     let path = database_file(location).ok()??;
-    let url = sqlite_url(location);
+    let url = crate::sqlite_util::sqlite_url(location);
     let (mut rwc, mut ro, mut vfs, mut immutable) = (false, false, None, false);
     if let Some((_, query)) = url.split_once('?') {
         for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
@@ -212,8 +212,10 @@ fn create_owner_only_with(
 
 /// As the Unix version, on a platform without Unix modes: the file is
 /// created with the platform's default permissions.
-#[cfg(not(unix))]
-pub(crate) fn create_owner_only(path: &Path) -> Result<std::io::Result<()>, String> {
+// Off wasm32 with its callers, `create_catalog_db` and the migration runner's
+// write open.
+#[cfg(not(any(unix, target_arch = "wasm32")))]
+pub(crate) fn create_owner_only(path: &std::path::Path) -> Result<std::io::Result<()>, String> {
     Ok(std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
