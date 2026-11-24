@@ -165,6 +165,7 @@ pub(crate) async fn handle_request(
             &state,
             &identity,
             &input,
+            &body,
             &operation,
             &account_id,
             Some(source_ip.as_str()),

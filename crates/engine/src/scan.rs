@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::expression::{ExpressionKind, ExpressionMaps, Projection};
+use extenddb_core::expression::{Expr, ExpressionKind, ExpressionMaps, Projection};
 use extenddb_core::types::{
     IndexType, ProjectionType, ScanInput, ScanOutput, Select, TableKeyInfo,
     VECTOR_INDEX_BACKFILLING_SCAN_PREFIX, VECTOR_INDEX_SCAN_NOT_SUPPORTED,
@@ -72,7 +72,7 @@ pub(crate) async fn handle_partiql_scan(
 /// `ExpressionAttributeValues` entries checked as `depth` says.
 #[allow(clippy::cast_possible_wrap)] // item counts won't exceed i64::MAX
 async fn run_scan(
-    mut body: Value,
+    body: Value,
     raw_body: &[u8],
     depth: ValuesDepth,
     ctx: &OperationContext,
@@ -111,91 +111,28 @@ async fn run_scan(
     // ExclusiveStartKey's faults, then the faulty ExpressionAttributeValues
     // entries in the same member order (each in the invalid-value form) and an
     // empty name, then the nesting depth, then the expression and request
-    // checks and the table.
-    let order = crate::scan_request::request_checks(&body, depth)?;
-    // Limit, Segment and TotalSegments are read as the service reads them,
-    // from any JSON number the body parser reads; see `int32_member`.
-    crate::int32_member::saturate(&mut body, &crate::int32_member::SCAN_RANGES)?;
-    // A key, an ExpressionAttributeValues entry or empty name and a ScanFilter
-    // list value (order U), or a Select value (order R), that the service
-    // reports later is held back here, so that the typed deserialization does
-    // not report it ahead of the checks the service makes first.
-    let orders = member_orders(raw_body);
-    let start_key = StartKeyBody::take(&mut body, orders.key.as_deref());
-    let expression_values = ExpressionValuesBody::take(&mut body, order, orders.values.as_deref());
-    let scan_filter_values = ScanFilterBody::take(&mut body, order, orders.filter.as_deref());
-    let select = SelectBody::take(&mut body, order);
-    let input: ScanInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
-
-    let has_cond_op = input.conditional_operator.is_some();
+    // checks and the table. The server runs the checks up to the Select enum
+    // in order R, and up to the faulty entries and the empty name in order
+    // U, ahead of the IAM decision (see `checked_body`).
+    let CheckedBody {
+        order,
+        input,
+        has_proj_expr,
+        legacy_filter,
+        start_key,
+    } = checked_body(body, raw_body, depth)?;
+    // Order U: the nesting depth, after the faulty entries and an empty name.
+    if order == CheckOrder::Unreadable
+        && depth == ValuesDepth::Checked
+        && let Some(ref values) = input.expression_attribute_values
+    {
+        extenddb_core::validation::validate_attribute_values_nesting_depth(values.values())?;
+    }
 
     let maps = build_expression_maps(
         input.expression_attribute_names.as_ref(),
         input.expression_attribute_values.as_ref(),
     );
-
-    let has_filter_expr = input
-        .filter_expression
-        .as_ref()
-        .is_some_and(|s| !s.is_empty());
-    let has_proj_expr = input
-        .projection_expression
-        .as_ref()
-        .is_some_and(|s| !s.is_empty());
-    extenddb_core::expression::validate_expression_param_usage(
-        input.expression_attribute_names.as_ref(),
-        has_proj_expr || has_filter_expr,
-        input.expression_attribute_values.as_ref(),
-        has_filter_expr,
-        &[ExpressionKind::Filter],
-    )?;
-
-    // Order U: a faulty ScanFilter list value, after the no-expression checks
-    // and ahead of ConditionalOperator, the value count and the key's faults
-    // (measured 2026-11-05; see `scan_request::ScanFilterBody`).
-    scan_filter_values.validate()?;
-
-    // ConditionalOperator requires a ScanFilter with two or more conditions.
-    extenddb_core::validation::validate_conditional_operator_usage(
-        has_cond_op,
-        input.scan_filter.as_ref().map_or(0, HashMap::len),
-    )?;
-
-    // Desugar a legacy ScanFilter: its value count is a request parameter
-    // check, ahead of every fault in the key (measured 2026-11-05). The mix
-    // check refuses a ScanFilter beside a FilterExpression, so the two
-    // branches below never both apply.
-    let legacy_filter = match input.scan_filter {
-        Some(ref sf) if !sf.is_empty() => {
-            let cond_op = input.conditional_operator.unwrap_or_default();
-            Some(desugar_filter(sf, cond_op)?)
-        }
-        _ => None,
-    };
-
-    match order {
-        CheckOrder::Unreadable => {
-            // The key's faults, then the faulty ExpressionAttributeValues
-            // entries in the fitted order (each in the invalid-value form) and
-            // an empty name, then the nesting depth (measured 2026-10-31,
-            // 2026-11-05 and 2026-11-19; see `scan_request::StartKeyBody` and
-            // `ExpressionValuesBody`).
-            start_key.validate(order)?;
-            expression_values.validate()?;
-            if depth == ValuesDepth::Checked
-                && let Some(ref values) = input.expression_attribute_values
-            {
-                extenddb_core::validation::validate_attribute_values_nesting_depth(
-                    values.values(),
-                )?;
-            }
-        }
-        CheckOrder::Readable => {
-            // The Select enum, after the no-expression check and the nesting
-            // check and ahead of the filter syntax (measured 2026-11-05).
-            select.validate()?;
-        }
-    }
 
     // Parse FilterExpression, or take the desugared ScanFilter.
     let (filter, filter_maps) = match legacy_filter {
@@ -587,5 +524,118 @@ async fn run_scan(
             index_name: input.index_name,
             ..Default::default()
         },
+    })
+}
+
+/// The parts of a `Scan` body that [`checked_body`] hands to the checks and
+/// the read after it.
+pub(crate) struct CheckedBody {
+    order: CheckOrder,
+    input: ScanInput,
+    has_proj_expr: bool,
+    legacy_filter: Option<(Expr, ExpressionMaps)>,
+    start_key: StartKeyBody,
+}
+
+/// The checks of a `Scan` body in the order of [`run_scan`], up to the
+/// `Select` enum in order R and up to the faulty `ExpressionAttributeValues`
+/// entries and an empty name in order U, with the nesting depth of order R
+/// checked as `depth` says. `raw_body` is the request text `body` was parsed
+/// from (see `scan_request::member_orders`).
+///
+/// The service answers an invalid `Select` (order R) and an entry with an
+/// unknown type descriptor (order U) with its `ValidationException` to a
+/// principal that may not Scan the table (measured 2026-11-19 with a role
+/// allowed only `DescribeTable`). It makes every other check here first, so
+/// the server runs them all ahead of the IAM decision; see
+/// `scan_request::validate_before_authorization`.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` with the service's text, or
+/// `DynamoDbError::SerializationException` for a body of the wrong shape.
+pub(crate) fn checked_body(
+    mut body: Value,
+    raw_body: &[u8],
+    depth: ValuesDepth,
+) -> Result<CheckedBody, DynamoDbError> {
+    let order = crate::scan_request::request_checks(&body, depth)?;
+    // Limit, Segment and TotalSegments are read as the service reads them,
+    // from any JSON number the body parser reads; see `int32_member`.
+    crate::int32_member::saturate(&mut body, &crate::int32_member::SCAN_RANGES)?;
+    // A key, an ExpressionAttributeValues entry or empty name and a ScanFilter
+    // list value (order U), or a Select value (order R), that the service
+    // reports later is held back here, so that the typed deserialization does
+    // not report it ahead of the checks the service makes first.
+    let orders = member_orders(raw_body);
+    let start_key = StartKeyBody::take(&mut body, orders.key.as_deref());
+    let expression_values = ExpressionValuesBody::take(&mut body, order, orders.values.as_deref());
+    let scan_filter_values = ScanFilterBody::take(&mut body, order, orders.filter.as_deref());
+    let select = SelectBody::take(&mut body, order);
+    let input: ScanInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
+
+    let has_cond_op = input.conditional_operator.is_some();
+
+    let has_filter_expr = input
+        .filter_expression
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    let has_proj_expr = input
+        .projection_expression
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    extenddb_core::expression::validate_expression_param_usage(
+        input.expression_attribute_names.as_ref(),
+        has_proj_expr || has_filter_expr,
+        input.expression_attribute_values.as_ref(),
+        has_filter_expr,
+        &[ExpressionKind::Filter],
+    )?;
+
+    // Order U: a faulty ScanFilter list value, after the no-expression checks
+    // and ahead of ConditionalOperator, the value count and the key's faults
+    // (measured 2026-11-05; see `scan_request::ScanFilterBody`).
+    scan_filter_values.validate()?;
+
+    // ConditionalOperator requires a ScanFilter with two or more conditions.
+    extenddb_core::validation::validate_conditional_operator_usage(
+        has_cond_op,
+        input.scan_filter.as_ref().map_or(0, HashMap::len),
+    )?;
+
+    // Desugar a legacy ScanFilter: its value count is a request parameter
+    // check, ahead of every fault in the key (measured 2026-11-05). The mix
+    // check refuses a ScanFilter beside a FilterExpression, so the two
+    // branches below never both apply.
+    let legacy_filter = match input.scan_filter {
+        Some(ref sf) if !sf.is_empty() => {
+            let cond_op = input.conditional_operator.unwrap_or_default();
+            Some(desugar_filter(sf, cond_op)?)
+        }
+        _ => None,
+    };
+
+    match order {
+        CheckOrder::Unreadable => {
+            // The key's faults, then the faulty ExpressionAttributeValues
+            // entries in the fitted order (each in the invalid-value form) and
+            // an empty name; `run_scan` checks the nesting depth next
+            // (measured 2026-10-31, 2026-11-05 and 2026-11-19; see
+            // `scan_request::StartKeyBody` and `ExpressionValuesBody`).
+            start_key.validate(order)?;
+            expression_values.validate()?;
+        }
+        CheckOrder::Readable => {
+            // The Select enum, after the no-expression check and the nesting
+            // check and ahead of the filter syntax (measured 2026-11-05).
+            select.validate()?;
+        }
+    }
+    Ok(CheckedBody {
+        order,
+        input,
+        has_proj_expr,
+        legacy_filter,
+        start_key,
     })
 }

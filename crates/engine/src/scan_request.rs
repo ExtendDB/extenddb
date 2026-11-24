@@ -215,7 +215,8 @@ pub(crate) enum ValuesDepth {
 /// `Limit`, `Segment` and `TotalSegments` with `int32_member::saturate`
 /// before it deserializes.
 ///
-/// The server runs the same function ahead of the IAM decision.
+/// [`validate_before_authorization`] runs these checks first, ahead of the
+/// IAM decision.
 ///
 /// # Errors
 ///
@@ -223,6 +224,21 @@ pub(crate) enum ValuesDepth {
 /// `DynamoDbError::SerializationException` for a body of the wrong shape.
 pub fn validate_scan_request_body(body: &Value) -> Result<(), DynamoDbError> {
     request_checks(body, ValuesDepth::Checked).map(drop)
+}
+
+/// The checks of a `Scan` body that the server runs ahead of the IAM
+/// decision: [`validate_scan_request_body`], then the handler's checks up to
+/// the `Select` enum in order R and up to the faulty
+/// `ExpressionAttributeValues` entries and an empty name in order U, in the
+/// service's order (see `scan::checked_body`). `raw_body` is the request
+/// text `body` was parsed from. The handler reads the member order of three
+/// maps from it (see [`member_orders`]).
+///
+/// # Errors
+///
+/// As [`validate_scan_request_body`].
+pub fn validate_before_authorization(body: &Value, raw_body: &[u8]) -> Result<(), DynamoDbError> {
+    crate::scan::checked_body(body.clone(), raw_body, ValuesDepth::Checked).map(drop)
 }
 
 /// [`validate_scan_request_body`] with the nesting depth checked as `depth`
