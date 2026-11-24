@@ -5,7 +5,10 @@
 //! take one. Query and Scan send the enum clause alone, ahead of the operand
 //! count of a legacy filter condition. PutItem, UpdateItem and DeleteItem
 //! send it inside the "1 validation error detected" envelope. Measured
-//! 2026-11-13 and 2026-11-14 (us-east-1).
+//! 2026-11-13, 2026-11-14 and 2026-11-24 (us-east-1). Beside some other
+//! faults, such as an empty AttributeValue or a null `ComparisonOperator` in
+//! the filter, Query and Scan send the clause inside a counted envelope with
+//! the set as `[OR, AND]`, which ExtendDB does not (#978).
 
 use extenddb_core::error::DynamoDbError;
 use serde_json::{Value, json};
@@ -92,16 +95,38 @@ async fn refused_conditional_operator_text() {
     }
 }
 
+/// The Query and Scan mapping keeps the envelope of a refusal whose echoed
+/// value names `conditionalOperator`. `refused_conditional_operator_text`
+/// checks the clause that loses it.
+#[test]
+fn query_scan_mapping_keeps_an_echo_of_conditional_operator() {
+    let select = "1 validation error detected: Value 'x at 'conditionalOperator'' at 'select' \
+                  failed to satisfy constraint: Member must satisfy enum value set: \
+                  [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]";
+    let error = <serde_json::Error as serde::de::Error>::custom(select);
+    match crate::query_scan_deserialize_error(error) {
+        DynamoDbError::ValidationException(msg) => assert_eq!(msg, select),
+        other => panic!("{select} gave {other:?}"),
+    }
+}
+
 /// A string where the `AttributesToGet` list goes, written ahead of an
 /// invalid `ConditionalOperator`, answers `SerializationException`, the
-/// exception DynamoDB sends (measured 2026-11-17, us-east-1).
+/// exception DynamoDB sends (measured 2026-11-17 and 2026-11-24, us-east-1).
+/// The test checks that the Query and Scan mapping keeps the exception a
+/// `SerializationException`. `refused_conditional_operator_text` checks the
+/// text of the refusal.
 #[tokio::test]
 async fn unreadable_attributes_to_get_answers_before_conditional_operator() {
     let ctx = context(None).await;
     for operation in ["Query", "Scan"] {
         let mut body = request(operation, "XOR", condition("EQ", &["x"]));
-        // The workspace build turns on serde_json's preserve_order, which
-        // reads members in the order written, so ConditionalOperator goes last.
+        // A build with serde_json's preserve_order reads members in the order
+        // written; bson turns it on, so the MongoDB build and a `--workspace`
+        // build have it, and the SQLite build does not. ConditionalOperator
+        // goes last, so both builds read AttributesToGet first. Written first,
+        // the preserve_order build answers the ConditionalOperator refusal
+        // where DynamoDB answers SerializationException (#723).
         body.as_object_mut().unwrap().remove("ConditionalOperator");
         body["AttributesToGet"] = json!("x");
         body["ConditionalOperator"] = json!("XOR");

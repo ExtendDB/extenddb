@@ -8,7 +8,10 @@ ValidationException on the five operations that take one. Query and Scan
 send the enum clause alone. PutItem, UpdateItem and DeleteItem send it
 inside the "1 validation error detected: " envelope. On Query and Scan the
 clause comes ahead of the operand count of a BETWEEN in the legacy filter.
-Measured 2026-11-13 and 2026-11-14 (us-east-1).
+Measured 2026-11-13, 2026-11-14 and 2026-11-24 (us-east-1). Beside some
+other faults, such as an empty AttributeValue or a null ComparisonOperator
+in the legacy filter, DynamoDB sends the clause inside a counted envelope
+with the set as [OR, AND] (#978). No request here gets that form.
 
 Dual-target against Amazon DynamoDB and extenddb.
 """
