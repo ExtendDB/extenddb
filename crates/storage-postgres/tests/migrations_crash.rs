@@ -349,7 +349,7 @@ async fn a_server_refuses_while_a_migrator_holds_only_the_migration_key() {
         return skip("legacy migrator");
     };
     let s = Scratch::new(&base, "pgm_legacy").await;
-    // A migrator of a release before 1.0, or one between taking its own key
+    // A migrator of a release before 0.1.15, or one between taking its own key
     // and the servers' key, holds the migration key alone.
     let catalog = s.catalog().await;
     let mut legacy = catalog.begin().await.unwrap();

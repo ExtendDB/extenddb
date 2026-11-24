@@ -445,9 +445,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-async"
-version = "1.2.11"
+version = "1.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52eec3db979d18cb807fc1070961cc51d87d069abe9ab57917769687368a8c6c"
+checksum = "2ffcaf626bdda484571968400c326a244598634dc75fd451325a54ad1a59acfc"
 dependencies = [
  "futures-util",
  "pin-project-lite",
@@ -534,10 +534,12 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-json"
-version = "0.62.3"
+version = "0.62.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3cb96aa208d62ee94104645f7b2ecaf77bf27edf161590b6224bfbac2832f979"
+checksum = "701a947f4797e52a911e114a898667c746c39feea467bbd1abd7b3721f702ffa"
 dependencies = [
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
  "aws-smithy-types",
 ]
 
@@ -587,11 +589,12 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-runtime-api"
-version = "1.11.3"
+version = "1.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "49952c52f7eebb72ce2a754d3866cc0f87b97d2a46146b79f80f3a93fb2b3716"
+checksum = "9db177daa6ba8afb9ee1aefcf548c907abcf52065e394ee11a92780057fe0e8c"
 dependencies = [
  "aws-smithy-async",
+ "aws-smithy-runtime-api-macros",
  "aws-smithy-types",
  "bytes",
  "http 0.2.12",
@@ -603,10 +606,32 @@ dependencies = [
 ]
 
 [[package]]
-name = "aws-smithy-types"
-version = "1.4.3"
+name = "aws-smithy-runtime-api-macros"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b3a26048eeab0ddeba4b4f9d51654c79af8c3b32357dc5f336cee85ab331c33"
+checksum = "8d7396fd9500589e62e460e987ecb671bad374934e55ec3b5f498cc7a8a8a7b7"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "aws-smithy-schema"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7442cb268338f0eb8278140a107c046756aa01093d8ef5e99628d34ae09c94f5"
+dependencies = [
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "http 1.4.0",
+]
+
+[[package]]
+name = "aws-smithy-types"
+version = "1.4.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53f93074121a1be41317b9aa607143ae17900631f7f59a99f2b905d519d6783b"
 dependencies = [
  "base64-simd",
  "bytes",
@@ -1351,9 +1376,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "12218662ccac37d9714f2191252553d67585b97df8c839cbe49e0bde278dc865"
 dependencies = [
  "cmov",
 ]
@@ -1599,7 +1624,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1635,7 +1660,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb"
-version = "0.1.14"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "extenddb-app",
@@ -1653,7 +1678,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-app"
-version = "0.1.14"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1667,6 +1692,7 @@ dependencies = [
  "extenddb-engine",
  "extenddb-server",
  "extenddb-storage",
+ "extenddb-storage-sqlite",
  "futures",
  "libc",
  "rcgen",
@@ -1674,16 +1700,18 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "tempfile",
  "time",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
 name = "extenddb-auth"
-version = "0.1.14"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "aws-credential-types",
@@ -1694,6 +1722,7 @@ dependencies = [
  "extenddb-core",
  "futures",
  "hex",
+ "libc",
  "proptest",
  "serde_json",
  "sha2 0.10.9",
@@ -1706,7 +1735,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-backup-store"
-version = "0.1.14"
+version = "1.0.0"
 dependencies = [
  "aws-config",
  "aws-runtime",
@@ -1731,7 +1760,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-cache"
-version = "0.1.14"
+version = "1.0.0"
 dependencies = [
  "futures",
  "moka",
@@ -1742,7 +1771,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-config"
-version = "0.1.14"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "config",
@@ -1757,7 +1786,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-core"
-version = "0.1.14"
+version = "1.0.0"
 dependencies = [
  "base64 0.22.1",
  "bigdecimal",
@@ -1773,7 +1802,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-engine"
-version = "0.1.14"
+version = "1.0.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1799,7 +1828,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-server"
-version = "0.1.14"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1838,11 +1867,12 @@ dependencies = [
  "tracing-subscriber",
  "unicode-properties",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
 name = "extenddb-storage"
-version = "0.1.14"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -1868,7 +1898,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-storage-cassandra"
-version = "0.1.14"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1899,7 +1929,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-storage-mongodb"
-version = "0.1.14"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1929,7 +1959,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-storage-postgres"
-version = "0.1.14"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1961,7 +1991,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-storage-sqlite"
-version = "0.1.14"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3194,7 +3224,7 @@ dependencies = [
  "tokio-util",
  "typed-builder",
  "uuid",
- "webpki-roots 1.0.7",
+ "webpki-roots 1.0.10",
 ]
 
 [[package]]
@@ -3870,7 +3900,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4605,7 +4635,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4704,9 +4734,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.52.3"
+version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
  "bytes",
  "libc",
@@ -5239,14 +5269,14 @@ version = "0.26.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
 dependencies = [
- "webpki-roots 1.0.7",
+ "webpki-roots 1.0.10",
 ]
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.7"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52f5ee44c96cf55f1b349600768e3ece3a8f26010c05265ab73f945bb1a2eb9d"
+checksum = "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -5273,7 +5303,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
