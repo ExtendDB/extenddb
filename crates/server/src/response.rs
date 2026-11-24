@@ -34,8 +34,8 @@ pub(crate) fn success_response(body: &Value, request_id: &str) -> Response {
 }
 
 /// REQ-ERR-001: `__type` with prefix. REQ-ERR-002: message field, under the
-/// key `extenddb_core::error::message_key` picks. REQ-ERR-003: Omit the message
-/// field when empty (real `DynamoDB` behavior, verified 2026-05-04).
+/// key `error_document` picks. REQ-ERR-003: Omit the message field when empty
+/// (real `DynamoDB` behavior, verified 2026-05-04).
 pub(crate) fn error_response(error: &DynamoDbError, request_id: &str) -> Response {
     // The body shape (`__type`, optional message, `CancellationReasons`, `Item`)
     // is built by the shared `error_document` helper so the wire body and the
