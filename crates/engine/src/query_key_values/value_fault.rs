@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::types::{EMPTY_ATTRIBUTE_VALUE, MULTI_ATTRIBUTE_VALUE};
 use extenddb_core::validation::number::{NOT_A_NUMBER, NUMBER_SET_DUPLICATES, has_equal_numbers};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// The service's text for a null value. Core's copy is a private constant of
 /// its `partiql` module, which a build without the `partiql` feature leaves
@@ -166,24 +166,41 @@ impl SetFault<'_> {
     }
 }
 
+/// The order in which a walk visits the members of an `M`.
+pub(crate) type MemberOrder = for<'m> fn(&'m Map<String, Value>) -> Vec<(&'m String, &'m Value)>;
+
+/// The members of an `M` in the map's iteration order: sorted by key without
+/// the `preserve_order` feature of `serde_json`, in document order with it, as
+/// in the MongoDB build (bson turns the feature on).
+fn map_order(members: &Map<String, Value>) -> Vec<(&String, &Value)> {
+    members.iter().collect()
+}
+
+/// [`first_fault_in`] with the members of each `M` in the map's iteration
+/// order. The service visits the members of an `M` in an
+/// `ExpressionAttributeValues` entry in an order of its own (#1013): measured
+/// 2026-11-23, `{"M": {"z": {"N": "bob"}, "b": {"N": "fred"}}}` answers
+/// `bob`, as document order does. For the members of an `M` in an
+/// `ExclusiveStartKey` value see `scan_request::StartKeyBody`.
+pub(crate) fn first_fault<'a>(
+    value: &'a Value,
+    member: Option<&'a str>,
+    sets: bool,
+) -> Option<Fault<'a>> {
+    first_fault_in(value, member, sets, map_order)
+}
+
 /// The first fault in `value` (`member` is its name when it is the value of an
 /// `M` member): a null or no type descriptor, then the numbers in `N`, `NS`
 /// and every value an `L` or `M` holds, and with `sets` the set faults in the
 /// same walk (an `NS` after its numbers; see [`set_fault`]), then more than
 /// one type descriptor. `L` items are visited in document order and `M`
-/// members in the map's iteration order: sorted by key without the
-/// `preserve_order` feature of `serde_json`, in document order with it, as in
-/// the MongoDB build (bson turns the feature on). The service visits the
-/// members of an `M` in an order of its own (#1013). Measured 2026-11-05 and
-/// 2026-11-23: `{"M": {"k": {"N": "bob"}, "j": {}}}` in an
-/// `ExclusiveStartKey` member answers the empty value, as sorted order does,
-/// and `{"M": {"z": {"N": "bob"}, "b": {"N": "fred"}}}` answers `bob`, as
-/// document order does. A value of another JSON type, and an `N` or
-/// `NS` payload of the wrong JSON type, are shape faults the deserializer
-/// reports. A type descriptor with a null payload counts as absent, as the
-/// service reads it (measured 2026-11-19: `{"S": null}` answers the empty
-/// value text, and `{"S": null, "N": "1"}` in a `FilterExpression` is
-/// accepted).
+/// members in the order `members_in_order` gives. A value of another JSON
+/// type, and an `N` or `NS` payload of the wrong JSON type, are shape faults
+/// the deserializer reports. A type descriptor with a null payload counts as
+/// absent, as the service reads it (measured 2026-11-19: `{"S": null}`
+/// answers the empty value text, and `{"S": null, "N": "1"}` in a
+/// `FilterExpression` is accepted).
 ///
 /// With several type descriptors, the service reads each payload in the order
 /// of [`TYPE_DESCRIPTORS`], whatever order the request wrote them in, and
@@ -192,10 +209,11 @@ impl SetFault<'_> {
 /// answer the numeric text for `bob`, `{"N": "1", "S": "x"}` the more than one
 /// datatypes text, `{"S": "x", "L": [null]}` the null text, and `N` is read
 /// ahead of `NS`, `NS` and `M` ahead of `L`).
-pub(crate) fn first_fault<'a>(
+pub(crate) fn first_fault_in<'a>(
     value: &'a Value,
     member: Option<&'a str>,
     sets: bool,
+    members_in_order: MemberOrder,
 ) -> Option<Fault<'a>> {
     let Value::Object(map) = value else {
         return value.is_null().then_some(Fault::Null(member));
@@ -214,12 +232,16 @@ pub(crate) fn first_fault<'a>(
                 .find_map(number_fault)
                 .or_else(|| sets.then(|| set_fault(descriptor, members)).flatten()),
             ("SS" | "BS", Value::Array(members)) if sets => set_fault(descriptor, members),
-            ("L", Value::Array(items)) => {
-                items.iter().find_map(|item| first_fault(item, None, sets))
-            }
-            ("M", Value::Object(members)) => members
+            ("L", Value::Array(items)) => items
                 .iter()
-                .find_map(|(name, inner)| first_fault(inner, Some(name), sets)),
+                .find_map(|item| first_fault_in(item, None, sets, members_in_order)),
+            ("M", Value::Object(members)) => {
+                members_in_order(members)
+                    .into_iter()
+                    .find_map(|(name, inner)| {
+                        first_fault_in(inner, Some(name), sets, members_in_order)
+                    })
+            }
             _ => None,
         });
     match payloads.len() {

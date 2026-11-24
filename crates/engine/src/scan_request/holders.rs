@@ -8,12 +8,12 @@
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::types::{EMPTY_ATTRIBUTE_VALUE, Item, MULTI_ATTRIBUTE_VALUE};
 use extenddb_core::validation::NESTING_MESSAGE;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
-use super::member_order::fitted_order_of;
+use super::member_order::{fitted_member_order, fitted_order_of};
 use super::{CheckOrder, nested_too_deep};
 use crate::query_key_values::{
-    Fault, SELECT, SetFault, first_fault, is_shape_fault, validate_names,
+    Fault, SELECT, SetFault, first_fault, first_fault_in, is_shape_fault, validate_names,
 };
 
 /// The service's prefix on a fault in an `ExclusiveStartKey` value it cannot
@@ -38,7 +38,8 @@ fn stand_in() -> Value {
 /// checks the service makes on the key (measured 2026-10-31 to 2026-11-05,
 /// us-east-1; see the module doc), the first faulty member in the fitted
 /// member order ([`super::member_order::fitted_member_order`]) and, inside one member, the first
-/// fault in the value's element order (see `first_fault`):
+/// fault in the value's element order, the members of an `M` in the same
+/// fitted order (see [`hashed_members`]):
 ///
 /// - in order U, after the request parameter checks and ahead of the
 ///   expression values and checks: a value the service cannot read as one
@@ -120,13 +121,31 @@ impl StartKeyBody {
             .members
             .iter()
             .filter_map(|name| key?.get(name))
-            .find_map(|value| first_fault(value, None, true));
+            .find_map(|value| first_fault_in(value, None, true, hashed_members));
         match (fault, &self.deferred) {
             (Some(fault), _) => Err(key_fault_text(fault, order)),
             (None, Some(deferred)) => Err(deferred.clone()),
             (None, None) => Ok(()),
         }
     }
+}
+
+/// The members of an `M` in an `ExclusiveStartKey` value in the fitted order
+/// of the key's own members ([`fitted_member_order`]), with the parsed map's
+/// order in place of the request's inside one bucket. Measured 2026-11-24 at
+/// 08:11 UTC (us-east-1, each request twice, a table that does not exist), on
+/// an `M` at the top of a key member: `{"M": {"q": {"N": "bob"}, "b": {}}}`
+/// answers the number and `{"M": {"b": {"N": "bob"}, "q": {}}}` the prefixed
+/// empty value (`q` is in bucket 1 of four, `b` in bucket 2), and `{"M": {"k":
+/// {"N": "bob"}, "j": {}}}` the prefixed empty value (`j` in bucket 2, `k` in
+/// 3), as on 2026-11-05. Request order would name `bob` for all three and
+/// sorted order would name it for the second. An `M` deeper in the value is
+/// read the same way (not measured).
+fn hashed_members(members: &Map<String, Value>) -> Vec<(&String, &Value)> {
+    fitted_member_order(members.keys().map(String::as_str))
+        .iter()
+        .filter_map(|name| members.get_key_value(name.as_str()))
+        .collect()
 }
 
 /// The service's text for the first fault in a key member in `order`: the

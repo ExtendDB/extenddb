@@ -41,7 +41,7 @@ pub(crate) use unreadable::{
     QUERY_CONDITIONS, QUERY_VALUE_EXPRESSIONS, SCAN_CONDITIONS, has_unreadable, older_form_checks,
     older_form_request_checks, readable_for_shape_check, value_shape_fault,
 };
-pub(crate) use value_fault::{Fault, SetFault, first_fault};
+pub(crate) use value_fault::{Fault, SetFault, first_fault, first_fault_in};
 
 /// The service's text for a key condition value of the wrong type.
 pub const KEY_CONDITION_TYPE_MISMATCH: &str = "One or more parameter values were invalid: Condition parameter type does not match schema type";

@@ -89,22 +89,27 @@ fn a_shape_fault_in_a_key_value_answers_the_prefixed_text() {
         Some(format!("{KEY_PREFIX}{MORE_THAN_ONE}"))
     );
     // Inside one member the first fault in the value's element order: the
-    // members of an `M` in the parsed map's order (the service answers the
-    // empty value for `{"M": {"k": {"N": "bob"}, "j": {}}}` in a non-key
-    // member, 2026-11-05), the members of an `L` in their order (2026-11-23,
-    // `{"L": [{"N": "bob"}, {}]}` answers the number).
-    let inside = with_key(json!({
-        "pk": {"S": "x"}, "sk": {"S": "x"}, "z": {"M": {"k": {"N": "bob"}, "j": {}}},
-    }));
-    // #1013: the MongoDB build (`serde_json/preserve_order`) reads `k` first.
-    let preserve_order = inside["ExclusiveStartKey"]["z"]["M"]
-        .as_object()
-        .and_then(|members| members.keys().next())
-        .is_some_and(|first| first == "k");
-    let in_a_map: &str = if preserve_order { NUMERIC_BOB } else { &empty };
-    assert_eq!(check_key(&inside).as_deref(), Some(in_a_map));
-    let in_a_list = with_key(json!({"pk": {"L": [{"N": "bob"}, {}]}, "sk": {"S": "s"}}));
-    assert_eq!(check_key(&in_a_list).as_deref(), Some(NUMERIC_BOB));
+    // members of an `M` in the hash order on every build (`hashed_members`;
+    // 2026-11-05 in a non-key member and 2026-11-24 in a key member), the
+    // members of an `L` in their order (2026-11-23, `{"L": [{"N": "bob"},
+    // {}]}` answers the number).
+    let empty = empty.as_str();
+    for (member, value, text) in [
+        ("z", json!({"M": {"k": {"N": "bob"}, "j": {}}}), empty),
+        ("pk", json!({"M": {"k": {"N": "bob"}, "j": {}}}), empty),
+        (
+            "pk",
+            json!({"M": {"q": {"N": "bob"}, "b": {}}}),
+            NUMERIC_BOB,
+        ),
+        ("pk", json!({"M": {"b": {"N": "bob"}, "q": {}}}), empty),
+        ("pk", json!({"L": [{"N": "bob"}, {}]}), NUMERIC_BOB),
+    ] {
+        let mut key = json!({"pk": {"S": "x"}, "sk": {"S": "s"}});
+        key[member] = value.clone();
+        let body = with_key(key);
+        assert_eq!(check_key(&body).as_deref(), Some(text), "{member} {value}");
+    }
 }
 
 /// Measured 2026-11-05: in order R the set faults of a key answer the service's

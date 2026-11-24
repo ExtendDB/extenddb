@@ -392,12 +392,14 @@ TWO_ORDERS = [
     # Order U: the key's shape fault ahead of the table's index rules.
     ("key-empty-and-consistent-gsi", '"IndexName": "gsi", "ConsistentRead": true, '
      '"ExclusiveStartKey": {"gpk": {"S": "g"}, "pk": {"S": "p"}, "sk": {}}', EMPTY_KEY_VALUE),
-    # #1013: a build with the MongoDB crate (bson turns on serde_json's
-    # preserve_order) reads the members of an M in the request's order and
-    # names bob; a build without it sorts them and names the empty value.
+    # The members of an M in a key value in the hash order: j ahead of k, q
+    # ahead of b (2026-11-05 and 2026-11-24 08:11 UTC).
     ("key-shape-M-nested-N-bob", '"ExclusiveStartKey": {"pk": {"S": "x"}, "sk": {"S": "x"}, '
-     '"z": {"M": {"k": {"N": "bob"}, "j": {}}}}',
-     ("either", EMPTY_KEY_VALUE, NUMERIC_BOB)),
+     '"z": {"M": {"k": {"N": "bob"}, "j": {}}}}', EMPTY_KEY_VALUE),
+    ("key-M-q-bob-b-empty", '"ExclusiveStartKey": {"pk": {"M": {"q": {"N": "bob"}, "b": {}}}, '
+     '"sk": {"S": "s"}}', NUMERIC_BOB),
+    ("key-M-b-bob-q-empty", '"ExclusiveStartKey": {"pk": {"M": {"b": {"N": "bob"}, "q": {}}}, '
+     '"sk": {"S": "s"}}', EMPTY_KEY_VALUE),
 ]
 
 
@@ -561,9 +563,7 @@ class TestTwoOrders:
                              ids=[r[0] for r in TWO_ORDERS])
     def test_rows(self, dynamodb_client, table, fields, expected):
         message = _validation_message(*_scan(dynamodb_client, table, fields))
-        if isinstance(expected, tuple) and expected[0] == "either":
-            assert message in expected[1:], message
-        elif isinstance(expected, tuple):
+        if isinstance(expected, tuple):
             # The text predates this branch (#722, #838, #839): the check's
             # place is asserted.
             assert message.startswith(expected[1]), message
