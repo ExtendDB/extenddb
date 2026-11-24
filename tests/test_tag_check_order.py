@@ -9,9 +9,12 @@ the tag keys and values, a table ARN's table segment, partition, service and
 region, the table's existence, and last a key that reads ``aws:`` once U+017F
 is read as ``s``. CreateTable checks a member of the wrong JSON type first,
 then a TableName of bad length or outside the pattern, then a missing
-TableName, then the Tags, then the rest of the request. Every expected
-response in this file was measured against DynamoDB in us-east-1 on
-2026-10-24, 2026-11-20 or 2026-11-23.
+TableName, then the Tags, then the rest of the request. A key that reads
+``aws:`` once U+017F is read as ``s`` comes in the middle of the rest: after
+the index names and the throughput checks, before the key schema, attribute
+definition and stream checks. Every expected response in this file was
+measured against DynamoDB in us-east-1 on 2026-10-24, 2026-11-20, 2026-11-23
+or 2026-11-24.
 
 REQ-TEST-001
 """
@@ -30,6 +33,7 @@ from test_tag_validation import (
     assert_create_table_refused,
     assert_error,
     assert_validation,
+    create_table_error,
     key_message,
     prefix_message,
     value_message,
@@ -37,6 +41,7 @@ from test_tag_validation import (
 
 K_BAD = [{"Key": "k!", "Value": "v"}]
 K_OK = [{"Key": "valid-key", "Value": "v"}]
+K_LONG_S = [{"Key": "aw\u017f:foo", "Value": "v"}]
 STREAM = "stream/2026-01-01T00:00:00.000"
 
 
@@ -213,10 +218,36 @@ def test_a_valid_key_still_checks_the_arn(dynamodb_client_no_validation, tag_tab
     assert_error(calls[op], *valid_key_answer(shape, arn))
 
 
-# CreateTable: each definition error with an invalid tag reports the tag, and
-# a long-s key reports itself before the key schema checks and after the enum
-# checks.
+# CreateTable: each definition error with an invalid tag reports the tag. A
+# long-s key reports itself after the enum, index name and throughput checks
+# and before the key schema, attribute definition and stream checks.
 UNDEFINED_KEY = [{"AttributeName": "other", "AttributeType": "S"}]
+TWO_HASH_KEYS = {
+    "AttributeDefinitions": [
+        {"AttributeName": "pk", "AttributeType": "S"},
+        {"AttributeName": "p2", "AttributeType": "S"},
+    ],
+    "KeySchema": [
+        {"AttributeName": "pk", "KeyType": "HASH"},
+        {"AttributeName": "p2", "KeyType": "HASH"},
+    ],
+}
+STREAM_WITHOUT_VIEW_TYPE = {"StreamSpecification": {"StreamEnabled": True}}
+
+
+def attributes(*names: str) -> list[dict]:
+    return [{"AttributeName": n, "AttributeType": "S"} for n in names]
+
+
+def keys(*pairs: tuple[str, str]) -> list[dict]:
+    return [{"AttributeName": n, "KeyType": t} for n, t in pairs]
+
+
+def gsi(name: str, **members) -> dict:
+    projection = {"ProjectionType": "ALL"}
+    return {"IndexName": name, "KeySchema": keys(("gk", "HASH")), "Projection": projection, **members}
+
+
 CREATE_TABLE_ORDER = [
     ("undefined-key-attribute", {"AttributeDefinitions": UNDEFINED_KEY}, K_BAD, key_message("k!")),
     (
@@ -240,35 +271,56 @@ CREATE_TABLE_ORDER = [
         key_message("k!"),
     ),
     ("missing-key-schema", {"KeySchema": None}, K_BAD, key_message("k!")),
-    (
-        "two-hash-keys",
-        {
-            "AttributeDefinitions": [
-                {"AttributeName": "pk", "AttributeType": "S"},
-                {"AttributeName": "p2", "AttributeType": "S"},
-            ],
-            "KeySchema": [
-                {"AttributeName": "pk", "KeyType": "HASH"},
-                {"AttributeName": "p2", "KeyType": "HASH"},
-            ],
-        },
-        K_BAD,
-        key_message("k!"),
-    ),
-    ("stream-without-view-type", {"StreamSpecification": {"StreamEnabled": True}}, K_BAD, key_message("k!")),
+    ("two-hash-keys", TWO_HASH_KEYS, K_BAD, key_message("k!")),
+    ("stream-without-view-type", STREAM_WITHOUT_VIEW_TYPE, K_BAD, key_message("k!")),
     (
         "long-s-before-undefined-key-attribute",
         {"AttributeDefinitions": UNDEFINED_KEY},
-        [{"Key": "aw\u017f:foo", "Value": "v"}],
+        K_LONG_S,
         LONG_S_MESSAGE,
     ),
     (
         "billing-mode-enum-before-long-s",
         {"BillingMode": "FOO"},
-        [{"Key": "aw\u017f:foo", "Value": "v"}],
+        K_LONG_S,
         "1 validation error detected: Value 'FOO' at 'billingMode' failed to satisfy constraint: "
         "Member must satisfy enum value set: [PROVISIONED, PAY_PER_REQUEST]",
     ),
+    (
+        "on-demand-throughput-before-long-s",
+        {"ProvisionedThroughput": {"ReadCapacityUnits": 1, "WriteCapacityUnits": 1}},
+        K_LONG_S,
+        "One or more parameter values were invalid: Neither ReadCapacityUnits nor "
+        "WriteCapacityUnits can be specified when BillingMode is PAY_PER_REQUEST",
+    ),
+    ("long-s-before-two-hash-keys", TWO_HASH_KEYS, K_LONG_S, LONG_S_MESSAGE),
+    (
+        "long-s-before-third-key-schema-element",
+        {
+            "AttributeDefinitions": attributes("pk", "sk", "xk"),
+            "KeySchema": keys(("pk", "HASH"), ("sk", "RANGE"), ("xk", "RANGE")),
+        },
+        K_LONG_S,
+        LONG_S_MESSAGE,
+    ),
+    (
+        "long-s-before-unused-attribute-definition",
+        {"AttributeDefinitions": attributes("pk", "extra")},
+        K_LONG_S,
+        LONG_S_MESSAGE,
+    ),
+    (
+        "long-s-before-on-demand-gsi-throughput",
+        {
+            "AttributeDefinitions": attributes("pk", "gk"),
+            "GlobalSecondaryIndexes": [
+                gsi("gsi1", ProvisionedThroughput={"ReadCapacityUnits": 1, "WriteCapacityUnits": 1})
+            ],
+        },
+        K_LONG_S,
+        LONG_S_MESSAGE,
+    ),
+    ("long-s-before-stream-without-view-type", STREAM_WITHOUT_VIEW_TYPE, K_LONG_S, LONG_S_MESSAGE),
 ]
 
 
@@ -279,6 +331,62 @@ def test_create_table_checks_the_tags_before_the_definition(
     dynamodb_client_no_validation, label, definition, tags, expected
 ):
     assert_create_table_refused(dynamodb_client_no_validation, expected, Tags=tags, **definition)
+
+
+# These faults beside a long-s key are reported before it (measured
+# 2026-11-24). ExtendDB words each of them in its own text, as main does
+# (#1041, #1147, #904), so a row holds the code and that the long-s check did
+# not answer.
+CONSTRAINTS_BEFORE_LONG_S = [
+    ("provisioned-without-throughput", {"BillingMode": "PROVISIONED"}),
+    (
+        "throughput-below-one",
+        {
+            "BillingMode": "PROVISIONED",
+            "ProvisionedThroughput": {"ReadCapacityUnits": 0, "WriteCapacityUnits": 0},
+        },
+    ),
+    (
+        "gsi-name-too-short",
+        {"AttributeDefinitions": attributes("pk", "gk"), "GlobalSecondaryIndexes": [gsi("g")]},
+    ),
+    (
+        "lsi-name-too-short",
+        {
+            "AttributeDefinitions": attributes("pk", "sk", "lk"),
+            "KeySchema": keys(("pk", "HASH"), ("sk", "RANGE")),
+            "LocalSecondaryIndexes": [
+                {
+                    "IndexName": "g",
+                    "KeySchema": keys(("pk", "HASH"), ("lk", "RANGE")),
+                    "Projection": {"ProjectionType": "ALL"},
+                }
+            ],
+        },
+    ),
+    (
+        "gsi-throughput-below-one",
+        {
+            "BillingMode": "PROVISIONED",
+            "ProvisionedThroughput": {"ReadCapacityUnits": 1, "WriteCapacityUnits": 1},
+            "AttributeDefinitions": attributes("pk", "gk"),
+            "GlobalSecondaryIndexes": [
+                gsi("gsi1", ProvisionedThroughput={"ReadCapacityUnits": 0, "WriteCapacityUnits": 0})
+            ],
+        },
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "label,definition", CONSTRAINTS_BEFORE_LONG_S, ids=[r[0] for r in CONSTRAINTS_BEFORE_LONG_S]
+)
+def test_create_table_reports_a_constraint_before_a_long_s_key(
+    dynamodb_client_no_validation, label, definition
+):
+    err = create_table_error(dynamodb_client_no_validation, Tags=K_LONG_S, **definition)
+    assert (err["Status"], err["Code"]) == (400, "ValidationException"), err
+    assert err["Message"] != LONG_S_MESSAGE, err
 
 
 TOO_SHORT = (

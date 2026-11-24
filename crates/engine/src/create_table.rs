@@ -6,7 +6,8 @@ use serde_json::Value;
 use extenddb_core::error::{DynamoDbError, ErrorMessageKey, error_message};
 use extenddb_core::types::{CreateTableInput, CreateTableOutput};
 use extenddb_core::validation::{
-    validate_create_table, validate_folded_tag_prefix, validate_table_name, validate_tags_member,
+    validate_create_table_constraints, validate_create_table_definition,
+    validate_folded_tag_prefix, validate_table_name, validate_tags_member,
 };
 
 use crate::OperationContext;
@@ -85,14 +86,16 @@ pub async fn handle_create_table(
     input.resolve_table_throughput_mode();
 
     // A key that starts with `aws:` once U+017F is read as `s` is refused
-    // here: the service reports the enum and missing-member errors before it,
-    // and the key schema, attribute definition and stream errors after it
-    // (measured 2026-11-20). The service also reports the throughput errors
-    // before it. `validate_create_table` checks those after the key schema, so
-    // a request with both faults gets this error here instead.
+    // between the two groups of `validate_create_table`, which runs here
+    // without its TableName check, made above. The service reports the enum
+    // and missing-member errors, the index names, the table's throughput
+    // against its billing mode and a provisioned GSI's throughput minimum
+    // before it. It reports the key schema, attribute definition and stream
+    // errors and a GSI's throughput on an on-demand table after it (measured
+    // 2026-11-20 and 2026-11-24).
+    validate_create_table_constraints(&input)?;
     validate_folded_tag_prefix(input.tags.as_deref().unwrap_or_default())?;
-
-    validate_create_table(&input, &ctx.limits)?;
+    validate_create_table_definition(&input, &ctx.limits)?;
 
     // An empty SearchSchema means the same as an absent one, so it is collapsed
     // here, once, rather than in each backend. Storing the empty list would make

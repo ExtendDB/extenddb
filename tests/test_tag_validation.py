@@ -146,10 +146,10 @@ def assert_validation(call, expected_message: str) -> None:
     assert_error(call, "ValidationException", expected_message)
 
 
-def assert_create_table_refused(client, expected_message: str, **params) -> None:
-    """CreateTable under a new name fails with that message and leaves no table.
-
-    A server that accepts the request still has its table deleted.
+def create_table_error(client, **params) -> dict:
+    """The error a CreateTable under a new name fails with, with its HTTP
+    status under ``Status``. The test fails if the request is accepted or
+    leaves a table, and a server that accepts it still has its table deleted.
     """
     name = f"extenddb-test-{uuid.uuid4().hex[:12]}"
     definition = {
@@ -160,16 +160,27 @@ def assert_create_table_refused(client, expected_message: str, **params) -> None
     definition.update(params)
     request = {k: v for k, v in definition.items() if v is not None}
     try:
-        assert_validation(lambda: client.create_table(TableName=name, **request), expected_message)
         with pytest.raises(ClientError) as exc:
+            client.create_table(TableName=name, **request)
+        with pytest.raises(ClientError) as absent:
             client.describe_table(TableName=name)
-        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        assert absent.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        status = exc.value.response["ResponseMetadata"]["HTTPStatusCode"]
+        return {**exc.value.response["Error"], "Status": status}
     finally:
         try:
             wait_for_active(client, name)
             client.delete_table(TableName=name)
         except ClientError:
             pass
+
+
+def assert_create_table_refused(client, expected_message: str, **params) -> None:
+    """CreateTable under a new name fails with HTTP 400, ValidationException
+    and that exact message, and leaves no table."""
+    err = create_table_error(client, **params)
+    got = (err["Status"], err["Code"], err["Message"])
+    assert got == (400, "ValidationException", expected_message), err
 
 
 @pytest.fixture(scope="class")
