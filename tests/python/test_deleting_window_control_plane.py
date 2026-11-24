@@ -257,8 +257,7 @@ class TestConcurrentDeleteTable:
     ``ResourceNotFoundException``; that answer is accepted there only. The
     PostgreSQL and SQLite CI legs run ``devtools/run-tests`` without
     ``--backend``, so an empty ``EXTENDDB_TEST_BACKEND`` counts as one of them.
-    Two 200s mean both calls ran the deletion, which is what #553 reports on
-    Cassandra and #550 fixed on SQLite and MongoDB.
+    Two 200s mean both calls ran the deletion.
     """
 
     ROUNDS = 3
@@ -270,10 +269,6 @@ class TestConcurrentDeleteTable:
         from concurrent.futures import ThreadPoolExecutor
 
         from helpers import make_dynamodb_client
-
-        loser_codes = ("ResourceInUseException",)
-        if is_extenddb and BACKEND in self.ROW_REMOVED_IN_REQUEST:
-            loser_codes += ("ResourceNotFoundException",)
 
         for round_index in range(self.ROUNDS):
             name = unique_name("del-pair")
@@ -302,9 +297,14 @@ class TestConcurrentDeleteTable:
                 f"accepted; one call deletes the table and the other is refused"
             )
             assert accepted[0]["TableDescription"]["TableStatus"] == "DELETING"
-            err = refused[0].response["Error"]
-            assert err["Code"] in loser_codes, (round_index, BACKEND, err)
-            if err["Code"] == "ResourceInUseException":
-                assert err["Message"] == _being_deleted(name)
+            expected = {"ResourceInUseException": _being_deleted(name)}
+            if is_extenddb and BACKEND in self.ROW_REMOVED_IN_REQUEST:
+                # ExtendDB's DeleteTable answer for a table it has removed, on
+                # PostgreSQL (a local server, 2026-11-24) and SQLite, which
+                # share the engine's mapping. The service adds the table name.
+                expected["ResourceNotFoundException"] = NOT_FOUND
+            code = refused[0].response["Error"]["Code"]
+            assert code in expected, (round_index, BACKEND, refused[0].response["Error"])
+            assert_validation(refused[0], expected[code], code)
 
             wait_for_deleted(dynamodb_client, name, timeout=120.0)
