@@ -8,6 +8,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use crate::serde_helpers::{NULL_MEMBER, null_member};
+
 /// Virtual `DynamoDB` attribute value — the fundamental data type.
 ///
 /// Each variant maps to a `DynamoDB` type descriptor. Custom Serialize/Deserialize
@@ -253,26 +255,60 @@ fn from_descriptor(
             }
             Ok(AttributeValue::Null)
         }
-        // `L` and `M` consume their payload (see `from_nested`).
+        // `L` and `M` consume their payload (see `from_nested`). A null
+        // element or member is refused as in a parameter, behind a value of
+        // the wrong JSON type written after it (`ahead_of_null`, #1432).
         "L" => match value {
-            Value::Array(arr) => Ok(AttributeValue::L(
-                arr.into_iter()
-                    .map(|v| from_nested(v, depth + 1))
-                    .collect::<Result<_, _>>()?,
-            )),
+            Value::Array(arr) => {
+                let mut items = Vec::with_capacity(arr.len());
+                let mut rest = arr.into_iter();
+                while let Some(v) = rest.next() {
+                    let read = match v {
+                        Value::Null => Err(NULL_MEMBER.to_owned()),
+                        v => from_nested(v, depth + 1),
+                    };
+                    items.push(read.map_err(|refusal| ahead_of_null(refusal, &mut rest))?);
+                }
+                Ok(AttributeValue::L(items))
+            }
             _ => Err("L value must be an array".to_owned()),
         },
         "M" => match value {
-            Value::Object(obj) => Ok(AttributeValue::M(
-                obj.into_iter()
-                    .map(|(k, v)| from_nested(v, depth + 1).map(|av| (k, av)))
-                    .collect::<Result<_, _>>()?,
-            )),
+            Value::Object(obj) => {
+                let mut entries = BTreeMap::new();
+                let mut rest = obj.into_iter();
+                while let Some((k, v)) = rest.next() {
+                    let read = match v {
+                        Value::Null => Err(null_member(&k)),
+                        v => from_nested(v, depth + 1),
+                    };
+                    let later = |refusal| ahead_of_null(refusal, rest.by_ref().map(|(_, v)| v));
+                    entries.insert(k, read.map_err(later)?);
+                }
+                Ok(AttributeValue::M(entries))
+            }
             _ => Err("M value must be an object".to_owned()),
         },
         // Not reached: `from_members` passes a member of `TYPE_DESCRIPTORS`.
         _ => Err(EMPTY_ATTRIBUTE_VALUE.to_owned()),
     }
+}
+
+/// The refusal of an element of an `L` or a member of an `M`, with `rest`
+/// the elements or members written after it. `DynamoDB` refuses a value of
+/// the wrong JSON type while it reads the request, wherever it stands, and a
+/// null element or member in a later pass, so the first type fault in `rest`
+/// comes ahead of the null's text (measured 2026-11-24 with
+/// `{"L": [null, {"S": 1}]}` and `{"M": {"a": null, "b": "x"}}`, #1432). The
+/// parameter type check reads each value of `rest` but a null, as it reads
+/// past a null inside a value. Every other refusal stands.
+fn ahead_of_null(refusal: String, rest: impl Iterator<Item = serde_json::Value>) -> String {
+    if !refusal.starts_with(NULL_MEMBER) {
+        return refusal;
+    }
+    rest.filter(|v| !v.is_null())
+        .find_map(|v| crate::partiql::params::check_parameter_types(&[v]).err())
+        .unwrap_or(refusal)
 }
 
 /// The payload of an `SS`.
@@ -739,7 +775,6 @@ mod tests {
         ];
         // Each fault beside an `S`, and every pair of faults of two
         // descriptors, refused for the descriptor that comes first in `order`.
-        let null_member = "The supplied Item contains a null AttributeValue";
         let faults = [
             (
                 "NULL",
@@ -765,8 +800,8 @@ mod tests {
                 crate::partiql::params::NUMBER_SET_DUPLICATES.to_owned(),
             ),
             ("BS", "[]", invalid("Binary sets should not be empty")),
-            ("L", "[null]", null_member.to_owned()),
-            ("M", r#"{"k":null}"#, format!("{null_member}: k is null")),
+            ("L", "[null]", NULL_MEMBER.to_owned()),
+            ("M", r#"{"k":null}"#, null_member("k")),
             ("N", r#""bob""#, unconvertible("bob")),
         ];
         let order = ["SS", "N", "NS", "BS", "M", "L", "NULL"];
@@ -933,15 +968,19 @@ mod tests {
         );
     }
 
-    /// The text of an error inside an `L` or `M` is what
-    /// `serde_json::from_value` gave when each level re-deserialized a clone
-    /// of its subtree; the levels now consume the value instead, and these
-    /// strings (the API's error text) did not change. Checked from text and
-    /// from a `serde_json::Value`, the engine's path.
+    /// The text of an error inside an `L` or `M` is the refusal of the level
+    /// that holds it, as `serde_json::from_value` gave it when each level
+    /// re-deserialized a clone of its subtree (the levels now consume the
+    /// value instead), except that a null element or member is refused as in
+    /// a parameter, behind a value of the wrong JSON type written after it
+    /// in the same value (#1432; the null rows and the type rows measured
+    /// 2026-11-24 through PutItem, each twice). Checked from text and from a
+    /// `serde_json::Value`, the engine's path.
     #[test]
-    fn nested_error_text_is_unchanged() {
+    fn nested_error_text() {
         const EXPECTING: &str =
             "expected a DynamoDB AttributeValue map with exactly one type descriptor";
+        let base64 = from_descriptor("B", serde_json::json!("!!!"), 0).unwrap_err();
         let cases = [
             (
                 r#"{"L":["x"]}"#,
@@ -970,8 +1009,79 @@ mod tests {
             ),
             (
                 r#"{"M":{"a":{"L":[null]}}}"#,
-                format!("invalid type: null, {EXPECTING}"),
+                NULL_MEMBER.to_owned(),
                 " at line 1 column 24",
+            ),
+            (
+                r#"{"L":[null]}"#,
+                NULL_MEMBER.to_owned(),
+                " at line 1 column 12",
+            ),
+            (
+                r#"{"L":[{"S":"x"},null]}"#,
+                NULL_MEMBER.to_owned(),
+                " at line 1 column 22",
+            ),
+            (
+                r#"{"L":[null,{"S":"x","N":"1"}]}"#,
+                NULL_MEMBER.to_owned(),
+                " at line 1 column 30",
+            ),
+            (
+                r#"{"M":{"a":null}}"#,
+                null_member("a"),
+                " at line 1 column 16",
+            ),
+            (
+                r#"{"M":{"a":{"S":"x"},"b":null}}"#,
+                null_member("b"),
+                " at line 1 column 30",
+            ),
+            // A value of the wrong JSON type after the null, in the same `L`
+            // or `M`, comes first, with the parameter type check's text. The
+            // fifth of these rows applies the rule one level up. A value with
+            // no descriptor and a set with a null member are not of the wrong
+            // JSON type, so the null keeps its text (all measured 2026-11-24,
+            // each twice).
+            (
+                r#"{"L":[null,{"S":1}]}"#,
+                "S value must be a string".to_owned(),
+                " at line 1 column 20",
+            ),
+            (
+                r#"{"M":{"a":null,"b":"x"}}"#,
+                format!("invalid type: string \"x\", {EXPECTING}"),
+                " at line 1 column 24",
+            ),
+            (
+                r#"{"L":[null,{"SS":[1]}]}"#,
+                "SS member must be a string".to_owned(),
+                " at line 1 column 23",
+            ),
+            (
+                r#"{"L":[null,{"B":"!!!"}]}"#,
+                base64,
+                " at line 1 column 24",
+            ),
+            (
+                r#"{"L":[{"L":[null]},{"S":1}]}"#,
+                "S value must be a string".to_owned(),
+                " at line 1 column 28",
+            ),
+            (
+                r#"{"L":[null,"x"]}"#,
+                format!("invalid type: string \"x\", {EXPECTING}"),
+                " at line 1 column 16",
+            ),
+            (
+                r#"{"L":[null,{}]}"#,
+                NULL_MEMBER.to_owned(),
+                " at line 1 column 15",
+            ),
+            (
+                r#"{"L":[null,{"SS":["a",null]}]}"#,
+                NULL_MEMBER.to_owned(),
+                " at line 1 column 30",
             ),
         ];
         for (json, message, position) in cases {

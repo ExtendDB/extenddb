@@ -54,6 +54,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use super::number::{check_number, parameter_message};
+use crate::serde_helpers::{NULL_MEMBER, null_member};
 use crate::types::AttributeValue;
 use crate::validation::MAX_ITEM_NESTING_DEPTH;
 use crate::validation::number::validate_and_normalize_number;
@@ -80,15 +81,15 @@ const EMPTY_ATTRIBUTE_VALUE: &str =
 const MULTI_ATTRIBUTE_VALUE: &str = "Supplied AttributeValue has more than one datatypes \
      set, must contain exactly one of the supported datatypes";
 
-/// The refusals of a null member, for each kind of value that holds one
-/// (measured 2026-11-06). A null member of a map is named after it.
+/// The refusals of a null member of a set (measured 2026-11-06). A null
+/// member of a map or a list is refused with [`NULL_MEMBER`], and one of a
+/// map is named after it.
 const NULL_STRING_SET_MEMBER: &str = "One or more parameter values were invalid: \
      An string set may not have a null string as a member";
 const NULL_NUMBER_SET_MEMBER: &str =
     "One or more parameter values were invalid: Numeric sets may not contain null";
 const NULL_BINARY_SET_MEMBER: &str =
     "One or more parameter values were invalid: Binary sets may not contain null or empty values";
-const NULL_MEMBER: &str = "The supplied Item contains a null AttributeValue";
 
 /// Check the JSON types of a statement's parameters (wire attribute values),
 /// the first of the two passes (see the module documentation). The caller
@@ -237,7 +238,7 @@ fn check_payload(tag: &str, payload: &Value, depth: usize) -> Result<(), String>
             let next = enter(depth)?;
             for (name, member) in entries {
                 if member.is_null() {
-                    return Err(format!("{NULL_MEMBER}: {name} is null"));
+                    return Err(null_member(name));
                 }
                 check_value(member, next)?;
             }

@@ -65,7 +65,10 @@ def _nested_lists(levels: int) -> dict:
 # A value with two type descriptors is refused for a null member or for the
 # nesting of a payload before the count (measured 2026-11-23 and 2026-11-24
 # through PutItem, UpdateItem, GetItem, BatchWriteItem and
-# TransactWriteItems).
+# TransactWriteItems). A null element of an `L` or a null member of an `M`
+# is refused as "The supplied Item contains a null AttributeValue", named
+# after the member of an `M` (measured 2026-11-24 through PutItem and
+# UpdateItem, #1432).
 #
 # These tests assert the error class and HTTP status. The exact SS-null
 # wording is locked in by `TestStringSetWithNullSpecificMessage` below.
@@ -79,6 +82,8 @@ EMPTY_AV_SCENARIOS = [
     pytest.param({"NS": ["1", None]}, id="ns_with_null_element"),
     pytest.param({"BS": ["QQ==", None]}, id="bs_with_null_element"),
     pytest.param({"S": "x", "L": [None]}, id="null_in_list_beside_s"),
+    pytest.param({"L": [None]}, id="null_in_list"),
+    pytest.param({"M": {"k": None}}, id="null_in_map"),
     pytest.param({"S": "x", "L": [_nested_lists(32)]}, id="33_lists_beside_s"),
 ]
 
@@ -132,7 +137,8 @@ def _assert_empty_attribute_value(resp: requests.Response) -> None:
       ``{"SS":[..., null]}`` case.
     - "The supplied Item contains a null AttributeValue" and "Nesting Levels
       have exceeded supported limits: ..." for the values with two type
-      descriptors.
+      descriptors, and the former for a null element of an ``L`` or a null
+      member of an ``M``.
 
     The exact SS-specific wording is locked in by the focused tests in
     ``TestStringSetWithNullSpecificMessage``.
