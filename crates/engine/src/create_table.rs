@@ -222,9 +222,9 @@ pub fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> Dynamo
             // Never InternalServerError.
             DynamoDbError::TransactionConflictException(msg)
         }
-        StorageError::TransactionInProgress => DynamoDbError::TransactionInProgressException(
-            "Transaction from previous request is still in progress".to_owned(),
-        ),
+        e @ StorageError::TransactionInProgress => {
+            DynamoDbError::TransactionInProgressException(e.to_string())
+        }
         StorageError::Internal(msg) => {
             // Log the raw message for debugging but do not expose storage
             // backend details (e.g. PostgreSQL error text) to the client.
@@ -274,6 +274,22 @@ mod storage_error_mapping_tests {
         assert!(
             matches!(err, DynamoDbError::ServiceUnavailable(_)),
             "{err:?}"
+        );
+    }
+
+    /// Another send of the request holds its token: the service's status,
+    /// error type and message (measured 2026-11-19).
+    #[test]
+    fn transaction_in_progress_carries_the_service_message() {
+        let err = storage_err_to_dynamo(StorageError::TransactionInProgress);
+        let message = err.to_string();
+        assert_eq!(
+            (err.status_code(), err.error_type(), message.as_str()),
+            (
+                400,
+                "TransactionInProgressException",
+                "Transaction from previous request is still in progress"
+            )
         );
     }
 }
