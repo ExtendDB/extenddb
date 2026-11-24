@@ -224,7 +224,7 @@ Auth providers implement the `AuthProvider` trait using `#[async_trait]` for obj
 
 ## Security Architecture
 
-### Authentication
+### SigV4 Authentication
 
 SigV4 signature verification follows the AWS specification. Credentials are stored encrypted (AES-256-GCM) in the storage backend. Access key prefixes distinguish long-term (`AKIA`) from temporary (`ASIA`) credentials.
 

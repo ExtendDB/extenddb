@@ -55,7 +55,7 @@ from a request sent to that service or backend.
 
 | Area | DynamoDB | ExtendDB |
 |------|----------|------|
-| Table creation delay | Returns `CREATING` immediately; transitions to `ACTIVE` typically within seconds. Same behavior for on-demand and provisioned | Configurable via `control_plane_delay_seconds` runtime setting (default: 5s) |
+| Table creation delay | Returns `CREATING` immediately; transitions to `ACTIVE` typically within seconds. Same behavior for on-demand and provisioned | Configurable via `control_plane_delay_seconds` runtime setting (default: 0.25s) |
 | DeletionProtectionEnabled | Enforced | Enforced (accepted and stored, DeleteTable rejects when enabled) |
 | U+0000 in a key attribute name, an index key attribute name or a projected attribute name | Accepted; `DescribeTable` returns each name byte for byte (measured 2026-09-18 and 2026-10-24, and again on 2026-11-04) | The same on all four backends. PostgreSQL `jsonb` cannot hold U+0000, so a PostgreSQL deployment stores these names through an escape, U+0000 as U+0001 U+0001 and U+0001 as U+0001 U+0002. Catalog migration 11 applies the escape to the names an earlier release stored (see the [Upgrade Manual](manuals/07-upgrade-manual.md#general-upgrade-procedure)) |
 | Stream disable and enable | `UpdateTable StreamEnabled=false` answers `UPDATING`; the stream reports `DISABLED` a few seconds later with every shard closed, and every write acknowledged before that lands in the closed stream. `StreamEnabled=true` afterwards creates a new stream with a later label; both streams stay listed, and a disabled stream stays describable after its table is deleted | The shards close inside the `UpdateTable` call and the response says `ACTIVE`. A write that reaches storage after the close is acknowledged and recorded in no stream (on MongoDB it is recorded past the shard's `EndingSequenceNumber` instead); the window is one write wide. A disabled stream is removed with its table. A stream created by a release before this one loses its ARN once the table is disabled and re-enabled (its label lived only in the table row) |
@@ -262,7 +262,7 @@ ExtendDB exposes runtime settings that have no DynamoDB equivalent:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `control_plane_delay_seconds` | 5 | Simulated delay for table state transitions (CREATING → ACTIVE, DELETING → removed) |
+| `control_plane_delay_seconds` | 0.25 | Simulated delay for table state transitions (CREATING → ACTIVE, DELETING → removed) |
 | `index_propagation_delay_ms` | 10 | System-wide default propagation delay for asynchronous secondary-index maintenance (milliseconds), covering GSIs and vector indexes alike. Per-GSI overrides stored in catalog; vector indexes have no per-index override. 0 = synchronous. Accepts the pre-rename name `gsi_propagation_delay_ms` as a deprecated alias, and a catalog created before the rename keeps honouring a value stored under it. |
 | `throttling_enabled` | `true` | Enable provisioned capacity throttling (token bucket per table/partition) |
 | `limits.allow_multipart_table_keys` | `false` | Enable multi-part base table key extension |

@@ -108,7 +108,7 @@ aws dynamodb create-table \
     }]'
 ```
 
-Tables transition through `CREATING` → `ACTIVE` status. The transition delay is configurable via the `control_plane_delay_seconds` runtime setting (default: 5 seconds). Poll with DescribeTable until `TableStatus` is `ACTIVE` before performing operations on the table.
+Tables transition through `CREATING` → `ACTIVE` status. The transition delay is configurable via the `control_plane_delay_seconds` runtime setting (default: 0.25 seconds). Poll with DescribeTable until `TableStatus` is `ACTIVE` before performing operations on the table.
 
 ### DeleteTable
 
@@ -388,7 +388,7 @@ aws dynamodbstreams describe-stream \
 aws dynamodbstreams get-shard-iterator \
     --endpoint-url https://127.0.0.1:18443 \
     --stream-arn "<stream-arn>" \
-    --shard-id "shard-0" \
+    --shard-id "<shard-id>" \
     --shard-iterator-type TRIM_HORIZON
 
 # Get a shard iterator positioned at the first record created at or after a
