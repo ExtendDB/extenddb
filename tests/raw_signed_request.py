@@ -6,7 +6,8 @@
 boto3 validates and reshapes the parameters before it signs, so it cannot send
 a tag written as ``["k", "v"]``. ``signed_post`` signs the bytes it is given with
 botocore's signer and posts them unchanged, with the credentials of the caller
-rather than the ones in the environment.
+rather than the ones in the environment. ``answer`` reads the status, the error
+type and the message of the response.
 """
 
 from __future__ import annotations
@@ -45,4 +46,19 @@ def signed_post(
         headers=dict(request.headers),
         verify=not endpoint.startswith("https://"),
         timeout=30,
+    )
+
+
+def answer(resp: requests.Response) -> tuple[int, str, str]:
+    """The HTTP status, the error type after the ``#`` and the message of a
+    JSON answer, or the status, an empty type and the text of an answer that
+    is not JSON."""
+    try:
+        doc = resp.json()
+    except ValueError:
+        return resp.status_code, "", resp.text
+    return (
+        resp.status_code,
+        doc.get("__type", "").rsplit("#", 1)[-1],
+        doc.get("message", doc.get("Message", "")),
     )

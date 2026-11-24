@@ -61,7 +61,9 @@ extenddb-app = { path = "crates/app", version = "=1.0.0" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# 1.0.129 added `Value::sort_all_objects`, which the transaction token hash
+# calls.
+serde_json = "1.0.129"
 toml = "0.8"
 
 # Error handling

@@ -431,3 +431,7 @@ pub(crate) async fn handle_request(
 
     response
 }
+
+#[cfg(test)]
+#[path = "handler_member_order_tests.rs"]
+mod member_order_tests;

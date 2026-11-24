@@ -12,6 +12,7 @@ pub mod backup_format;
 pub mod error;
 pub mod expression;
 pub mod limits;
+pub mod map_order;
 pub mod metrics;
 #[cfg(feature = "partiql")]
 pub mod partiql;

@@ -423,10 +423,10 @@ pub(super) fn condition_key_refusal(
 /// statements share an identity when they address the same item.
 pub(super) fn canonical_identity(table: &str, key: &Map<String, Value>) -> String {
     // A JSON map holds its members in the order the build gives it: the order
-    // they were inserted in when the build includes the MongoDB storage crate
-    // (any build of the whole workspace), name order otherwise. The key is
-    // always built pk before sk, so in either order equal (table, key) pairs
-    // serialise identically.
+    // they were inserted in when the build includes the server, whose crate
+    // turns on serde_json's `preserve_order` feature, name order otherwise.
+    // The key is always built pk before sk, so in either order equal
+    // (table, key) pairs serialise identically.
     serde_json::json!({ "t": table, "k": key }).to_string()
 }
 

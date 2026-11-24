@@ -3,7 +3,7 @@
 
 //! Unit tests for the echo of a statement list.
 
-use serde_json::json;
+use serde_json::{Map, json};
 
 use super::*;
 
@@ -167,64 +167,6 @@ fn an_echo_is_cut_at_a_character_boundary() {
     assert!(echo.full());
     echo.push("c");
     assert_eq!(echo.0.len(), MAX_ECHO_BYTES);
-}
-
-fn printed(map: &Value) -> Vec<&str> {
-    print_order(map.as_object().unwrap())
-        .into_iter()
-        .map(|(name, _)| name.as_str())
-        .collect()
-}
-
-#[test]
-fn map_members_print_in_the_measured_order() {
-    let map = json!({ "c": {"S": "1"}, "a": {"S": "2"}, "p": {"S": "3"} });
-    assert_eq!(printed(&map), ["p", "a", "c"]);
-    let map = json!({ "zeta": {}, "alpha": {}, "mid": {}, "beta": {} });
-    assert_eq!(printed(&map), ["zeta", "mid", "beta", "alpha"]);
-    let members: Map<String, Value> = (0..=12)
-        .rev()
-        .map(|i| (format!("k{i}"), json!({ "N": i.to_string() })))
-        .collect();
-    assert_eq!(
-        printed(&Value::Object(members)),
-        [
-            "k0", "k1", "k2", "k3", "k4", "k11", "k5", "k10", "k6", "k7", "k12", "k8", "k9"
-        ]
-    );
-}
-
-#[test]
-fn the_table_holds_size_over_three_quarters_rounded_up() {
-    // 3 members take 4 buckets and 6 take 8, not 8 and 16.
-    let map = json!({ "m0": {}, "m1": {}, "m2": {} });
-    assert_eq!(printed(&map), ["m1", "m2", "m0"]);
-    let members: Map<String, Value> = (0..6).map(|i| (format!("k{i}"), json!({}))).collect();
-    assert_eq!(
-        printed(&Value::Object(members)),
-        ["k3", "k4", "k5", "k0", "k1", "k2"]
-    );
-}
-
-#[test]
-fn keys_that_share_a_bucket_keep_the_order_the_map_holds_them_in() {
-    // q and a share bucket 1 of 4.
-    assert_eq!(bucket("q", 4), bucket("a", 4));
-    let map = json!({ "q": {"S": "1"}, "a": {"S": "2"} });
-    let held: Vec<&str> = map
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(String::as_str)
-        .collect();
-    assert_eq!(printed(&map), held);
-}
-
-#[test]
-fn a_key_hashes_over_its_utf16_units() {
-    // 0xD83D * 31 + 0xDE00 = 1772899, whose folded low five bits are 24.
-    assert_eq!(bucket("\u{1F600}", 32), 24);
-    assert_eq!(bucket("a", 1), 0);
 }
 
 #[test]

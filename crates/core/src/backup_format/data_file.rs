@@ -795,9 +795,9 @@ where
 /// the item being built, whatever the nesting depth. Peak heap growth while
 /// decoding one line, per line byte (requested bytes counted by a global
 /// allocator, release build, `serde_json` 1.0.150 without `preserve_order`,
-/// which is the default `extenddb` binary and `cargo test -p extenddb-core`;
-/// a build that includes the MongoDB backend enables `preserve_order`
-/// through `bson`, replaces `serde_json`'s `BTreeMap` with `indexmap`, and
+/// which is `cargo test -p extenddb-core`; every build that includes the
+/// server enables `preserve_order` (the server crate turns it on, and so
+/// does `bson`), replaces `serde_json`'s `BTreeMap` with `indexmap`, and
 /// measures about two thirds of each figure, 51 for the flat list, so the
 /// table is the larger of the two; the `VmHWM` growth on Linux x86-64 with
 /// glibc malloc is within 4% of it):
