@@ -337,9 +337,10 @@ impl ScanFilterBody {
 }
 
 /// The `Select` field of a `Scan` body in order R, where the service checks
-/// the enum after the no-expression check and the nesting check and ahead of
-/// the filter syntax (2026-11-05): [`Self::take`] takes an invalid value out of
-/// the body, so that the typed deserialization does not report it first, and
+/// the enum after the no-expression check and the nesting check (2026-11-05)
+/// and makes the filter syntax, an undefined value and the unused values ahead
+/// of it (2026-11-19, #1391): [`Self::take`] takes an invalid value out of the
+/// body, so that the typed deserialization does not report it first, and
 /// keeps the clause; [`Self::validate`] reports it. In order U the enum is a
 /// clause of the request-time aggregate (see `older_form_request_checks`) and
 /// nothing is taken.

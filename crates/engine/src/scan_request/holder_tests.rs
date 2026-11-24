@@ -324,9 +324,10 @@ fn an_order_u_entry_nested_33_levels_is_a_fault_of_the_entry() {
 /// list value back for the step after the no-expression checks: a value that is
 /// not one AttributeValue answers `Supplied AttributeValue is empty, must
 /// contain exactly one of the supported datatypes` with no prefix, for `{}` and
-/// for `{"X": "1"}`. In order R nothing is taken. A malformed number in a list
-/// is #507's check (#564 item 3): the request-time checks pass it and `take`
-/// leaves it in the body in both orders.
+/// for `{"X": "1"}`. In order R nothing is taken: a malformed number in a list
+/// is #507's check (#564 item 3), the request-time checks pass it and `take`
+/// leaves it in the body. In order U `take` takes the number out and names it
+/// as the list's fault (2026-11-23: `[{"N": "bob"}, {}]` answers the number).
 #[test]
 fn a_scan_filter_list_value_is_checked_at_its_step() {
     let list = |values: Value| {
