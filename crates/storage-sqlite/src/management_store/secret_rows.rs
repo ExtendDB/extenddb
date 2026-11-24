@@ -280,14 +280,19 @@ mod tests {
     }
 
     /// The bytes of every file in `dir`: the database, its WAL and its
-    /// shared-memory index.
+    /// shared-memory index. It skips a file that goes between the listing
+    /// and the read: SQLite deletes the WAL and its index when the last
+    /// connection closes.
     fn files(dir: &Path) -> Vec<(String, Vec<u8>)> {
         std::fs::read_dir(dir)
             .expect("list the directory")
-            .map(|entry| {
+            .filter_map(|entry| {
                 let path = entry.expect("an entry").path();
-                let bytes = std::fs::read(&path).expect("read a file");
-                (path.display().to_string(), bytes)
+                match std::fs::read(&path) {
+                    Ok(bytes) => Some((path.display().to_string(), bytes)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => panic!("read {}: {e}", path.display()),
+                }
             })
             .collect()
     }
