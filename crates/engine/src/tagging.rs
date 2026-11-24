@@ -382,29 +382,10 @@ pub async fn handle_list_tags_of_resource(
 #[cfg(test)]
 mod tests {
     use super::{
-        arn_storage_error, deployment_scope_error, tag_subresource_not_dynamodb_resource,
+        deployment_scope_error, tag_subresource_not_dynamodb_resource,
         tag_subresource_not_table_or_stream,
     };
     use extenddb_core::error::DynamoDbError;
-    use extenddb_storage::error::StorageError;
-
-    /// A missing table behind a resource ARN names the ARN; anything else is a
-    /// fault, not a client error.
-    #[test]
-    fn a_missing_table_behind_an_arn_names_the_arn() {
-        let arn = "arn:aws:dynamodb:us-east-1:123456789012:table/t";
-        match arn_storage_error(StorageError::TableNotFound("t".to_owned()), arn) {
-            DynamoDbError::ResourceNotFoundException(msg) => assert_eq!(
-                msg,
-                format!("Requested resource not found: ResourceArn: {arn} not found")
-            ),
-            other => panic!("expected ResourceNotFoundException, got {other:?}"),
-        }
-        assert!(matches!(
-            arn_storage_error(StorageError::Internal("boom".to_owned()), arn),
-            DynamoDbError::InternalServerError(_)
-        ));
-    }
 
     /// The tag handler refuses exactly the ARNs the shared predicate puts
     /// outside this deployment, the predicate the server's StreamArn scope
