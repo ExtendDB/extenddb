@@ -5,10 +5,13 @@
 references, a hash-only table, a GSI and number key values.
 
 Measured on the service in us-east-1 on 2026-10-23, the number rows on
-2026-11-20. The main key size rows are in ``test_query_key_size.py``.
+2026-11-20 and 2026-11-24. The main key size rows are in
+``test_query_key_size.py``.
 """
 
 from __future__ import annotations
+
+import os
 
 import pytest
 
@@ -19,6 +22,7 @@ from query_key_size_support import (  # noqa: F401  (fixtures are used by name)
     base_table,
     hash_only_table,
     index_table,
+    number_table,
     refused,
     refused_ending,
 )
@@ -189,18 +193,59 @@ DIGITS_MESSAGE = "Attempting to store more than 38 significant digits in a Numbe
 OVERFLOW_MESSAGE = (
     "Number overflow. Attempting to store a number with magnitude larger than supported range"
 )
+UNDERFLOW_MESSAGE = (
+    "Number underflow. Attempting to store a number with magnitude smaller than supported range"
+)
+NOT_A_NUMBER = "The parameter cannot be converted to a numeric value: "
+
+# The service reads U+FF11 as the digit 1. ExtendDB's number rules do not
+# (#565), so on ExtendDB these rows are expected to fail. Not strict: a check
+# that reads these digits in one of the forms makes the rows of that form pass.
+FULLWIDTH_DIGITS = pytest.mark.xfail(
+    bool(os.environ.get("DYNAMODB_ENDPOINT", "").strip()),
+    reason="#565: the number rules do not read U+FF11 as a digit",
+    strict=False,
+)
+
+
+def number_query(form: str, index_table: str, number_table: str, number: str) -> dict:
+    """A Query with the N value ``number`` in the key position ``form``.
+
+    ``gsi`` and ``gsi-legacy``: HASH ``n`` of the GSI ``ngsi``, in
+    ``KeyConditionExpression`` and in ``KeyConditions``. ``partition`` and
+    ``sort``: HASH ``pk`` and RANGE ``sk`` of a table with N keys.
+    """
+    value = {"N": number}
+    if form == "gsi-legacy":
+        condition = {"n": {"ComparisonOperator": "EQ", "AttributeValueList": [value]}}
+        return {"TableName": index_table, "IndexName": "ngsi", "KeyConditions": condition}
+    sort_values = {":p": {"N": "1"}, ":v": value}
+    target, expression, values = {
+        "gsi": ({"TableName": index_table, "IndexName": "ngsi"}, "n = :v", {":v": value}),
+        "partition": ({"TableName": number_table}, "pk = :v", {":v": value}),
+        "sort": ({"TableName": number_table}, "pk = :p AND sk = :v", sort_values),
+    }[form]
+    return {**target, "KeyConditionExpression": expression, "ExpressionAttributeValues": values}
 
 
 class TestNumberKeyValues:
-    """GSI ``ngsi`` with HASH ``n`` (N), measured 2026-11-20 in us-east-1.
+    """Number key values on the GSI ``ngsi`` (HASH ``n``, N) and a table with N keys.
 
-    A number with more than 38 significant digits or out of range gets the
-    number's sentence, not the size sentence. A valid number is sized after it
-    is normalized, so 2100 zeros followed by ``1`` is served. A number in other
-    Unicode decimal digits (U+FF11, U+0967 U+0968) is served too.
+    Measured 2026-11-20 on ``ngsi``: a number with more than 38 significant
+    digits or out of range gets the number's sentence, not the size sentence.
+    A valid number is sized after it is normalized, so 2100 zeros followed by
+    ``1`` is served. A number in other Unicode decimal digits (U+FF11, U+0967
+    U+0968) is served too.
+
+    Measured 2026-11-24: an ASCII value that is not a number gets ``The
+    parameter cannot be converted to a numeric value: `` followed by the
+    value, ``1e-131`` gets the underflow sentence, and 39 or 683 U+FF11 get
+    the 38-digit sentence. The service gives these answers before the table
+    lookup, on a table that does not exist too, so the rows run in each key
+    position.
     """
 
-    @pytest.mark.parametrize("syntax", ["expression", "legacy"])
+    @pytest.mark.parametrize("form", ["gsi", "gsi-legacy"])
     @pytest.mark.parametrize(
         ("number", "message"),
         [
@@ -213,21 +258,30 @@ class TestNumberKeyValues:
         ],
     )
     def test_a_number_is_checked_before_it_is_sized(
-        self, dynamodb_client, index_table, number, message, syntax
+        self, dynamodb_client, index_table, number_table, number, message, form
     ):
-        if syntax == "expression":
-            condition = {
-                "KeyConditionExpression": "n = :v",
-                "ExpressionAttributeValues": {":v": {"N": number}},
-            }
-        else:
-            condition = {
-                "KeyConditions": {
-                    "n": {"ComparisonOperator": "EQ", "AttributeValueList": [{"N": number}]}
-                }
-            }
-        query = {"TableName": index_table, "IndexName": "ngsi", **condition}
+        query = number_query(form, index_table, number_table, number)
         if message is None:
             assert dynamodb_client.query(**query)["Count"] == 0
         else:
             refused(dynamodb_client, message, **query)
+
+    @pytest.mark.parametrize("form", ["gsi", "gsi-legacy", "partition", "sort"])
+    @pytest.mark.parametrize(
+        ("number", "message"),
+        [
+            pytest.param("abc", NOT_A_NUMBER + "abc", id="abc"),
+            pytest.param("x" * 2049, NOT_A_NUMBER + "x" * 2049, id="2049-x"),
+            pytest.param(" 1", NOT_A_NUMBER + " 1", id="space-1"),
+            pytest.param("", NOT_A_NUMBER, id="empty"),
+            pytest.param("1e-131", UNDERFLOW_MESSAGE, id="underflow"),
+            pytest.param("\uff11" * 39, DIGITS_MESSAGE, id="39-fullwidth", marks=FULLWIDTH_DIGITS),
+            pytest.param(
+                "\uff11" * 683, DIGITS_MESSAGE, id="683-fullwidth", marks=FULLWIDTH_DIGITS
+            ),
+        ],
+    )
+    def test_each_key_position_gets_the_number_sentence(
+        self, dynamodb_client, index_table, number_table, number, message, form
+    ):
+        refused(dynamodb_client, message, **number_query(form, index_table, number_table, number))

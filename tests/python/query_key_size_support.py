@@ -184,6 +184,18 @@ def hash_only_table(dynamodb_client):
 
 
 @pytest.fixture(scope="module")
+def number_table(dynamodb_client):
+    """HASH ``pk`` and RANGE ``sk``, both N."""
+    with make_table(
+        dynamodb_client,
+        "qks-num",
+        AttributeDefinitions=[attr("pk", "N"), attr("sk", "N")],
+        KeySchema=[key("pk", "HASH"), key("sk", "RANGE")],
+    ) as name:
+        yield name
+
+
+@pytest.fixture(scope="module")
 def binary_table(dynamodb_client):
     """HASH ``pk`` and RANGE ``sk``, both B."""
     with make_table(
