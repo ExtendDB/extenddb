@@ -5,16 +5,18 @@
 
 Amazon DynamoDB rejects a request that provides ExpressionAttributeNames or
 ExpressionAttributeValues when there is no expression parameter that could
-reference them. The names message is always suffix-free. On the read APIs the
-values message names the null value-capable expression parameter(s) for that
-API (Scan: "FilterExpression is null"; Query: none). PutItem, UpdateItem, and
-DeleteItem give both messages suffix-free and wrapped in
-"1 validation error detected: " (measured 2026-10-14).
+reference them. The names message is always suffix-free. On a Query or a Scan
+whose AttributeValues parse, the values message is suffix-free as well: it
+ends after "expressions". PutItem, UpdateItem, and DeleteItem give both
+messages suffix-free and wrapped in "1 validation error detected: "
+(measured 2026-10-14).
 
 Dual-target against Amazon DynamoDB and extenddb.
 """
 
 from __future__ import annotations
+
+import uuid
 
 import pytest
 from botocore.exceptions import ClientError
@@ -80,13 +82,28 @@ class TestExpressionParamsWithoutExpression:
             NAMES_MSG,
         )
 
-    def test_scan_values_no_expression(self, dynamodb_client, hash_table):
+    @pytest.mark.parametrize(
+        "missing, extra",
+        [
+            pytest.param(True, {}, id="missing-table"),
+            pytest.param(False, {}, id="existing-table"),
+            pytest.param(False, {"ProjectionExpression": "a"}, id="projection-expression"),
+            pytest.param(
+                False, {"ScanFilter": {"a": {"ComparisonOperator": "NULL"}}}, id="scan-filter"
+            ),
+        ],
+    )
+    def test_scan_values_no_expression(self, dynamodb_client, hash_table, missing, extra):
+        # A missing table gets this message too, so the check runs before the
+        # table lookup.
+        table = f"extenddb-missing-{uuid.uuid4().hex[:12]}" if missing else hash_table
         _expect_validation(
             lambda: dynamodb_client.scan(
-                TableName=hash_table,
+                TableName=table,
                 ExpressionAttributeValues={":v": {"S": "x"}},
+                **extra,
             ),
-            f"{VALUES_PREFIX}: FilterExpression is null",
+            VALUES_PREFIX,
         )
 
     def test_delete_item_names_no_expression(self, dynamodb_client, hash_table):
@@ -166,7 +183,7 @@ class TestExpressionParamsWithoutExpression:
         )
 
     def test_query_values_no_expression(self, dynamodb_client, hash_table):
-        # Query emits no values suffix, unlike Scan/Delete/Update.
+        # Query emits no values suffix, as Scan does.
         _expect_validation(
             lambda: dynamodb_client.query(
                 TableName=hash_table,
