@@ -116,78 +116,73 @@ fn message(result: Result<(), DynamoDbError>) -> String {
     }
 }
 
-#[test]
-fn hash_value_of_2048_bytes_is_accepted() {
-    let kc = hash_only("pk", "v");
-    assert!(check(&kc, &base_schema(), &maps(&[("v", 2048)])).is_ok());
+/// A key condition of `attribute = :vN` clauses, each `:vN` an S value of the
+/// given length. The first clause is in `pk_path` and the others in
+/// `extra_pk_conditions`: the check assigns a clause by its attribute name,
+/// not by its field.
+fn equalities(clauses: &[(&str, usize)]) -> (KeyCondition, ExpressionMaps) {
+    let names: Vec<String> = (0..clauses.len()).map(|i| format!("v{i}")).collect();
+    let mut kc = hash_only(clauses[0].0, &names[0]);
+    kc.extra_pk_conditions = clauses[1..]
+        .iter()
+        .zip(&names[1..])
+        .map(|((attribute, _), name)| (path(attribute), placeholder(name)))
+        .collect();
+    let values: Vec<(&str, usize)> = names
+        .iter()
+        .zip(clauses)
+        .map(|(name, (_, len))| (name.as_str(), *len))
+        .collect();
+    (kc, maps(&values))
 }
 
 #[test]
-fn hash_value_of_2049_bytes_is_refused_with_the_service_sentence() {
-    let kc = hash_only("pk", "v");
-    let msg = message(check(&kc, &base_schema(), &maps(&[("v", 2049)])));
-    assert_eq!(msg, HASH_MSG_2048);
-}
-
-#[test]
-fn hash_sentence_has_no_space_between_of_and_the_number() {
-    let kc = hash_only("pk", "v");
-    let msg = message(check(&kc, &base_schema(), &maps(&[("v", 2049)])));
-    assert!(msg.ends_with("limit of2048 bytes"), "got: {msg}");
-}
-
-#[test]
-fn range_value_of_1024_bytes_is_accepted() {
-    let mut kc = hash_only("pk", "p");
-    kc.sk_condition = Some(eq("sk", "v"));
-    assert!(check(&kc, &base_schema(), &maps(&[("p", 1), ("v", 1024)])).is_ok());
-}
-
-#[test]
-fn range_value_of_1025_bytes_is_refused_with_the_service_sentence() {
-    let mut kc = hash_only("pk", "p");
-    kc.sk_condition = Some(eq("sk", "v"));
-    let msg = message(check(&kc, &base_schema(), &maps(&[("p", 1), ("v", 1025)])));
-    assert_eq!(msg, RANGE_MSG_1024);
-}
-
-#[test]
-fn two_range_values_are_added_together() {
-    // Measured 2026-10-23 on `idx`: `a` and `c` of 600 bytes with `b` of 1
-    // byte is refused, `a` of 600 bytes alone passes. Each value is under the
-    // limit alone; together they are not.
-    let mut kc = hash_only("h", "h");
-    kc.sk_condition = Some(eq("a", "x"));
-    kc.extra_sk_conditions = vec![(path("b"), placeholder("y")), (path("c"), placeholder("z"))];
-    let m = maps(&[("h", 1), ("x", 600), ("y", 1), ("z", 600)]);
-    assert_eq!(
-        message(check(&kc, &multi_range_schema(), &m)),
-        RANGE_MSG_1024
-    );
-}
-
-#[test]
-fn one_600_byte_range_value_on_a_multi_range_index_is_accepted() {
-    // Measured 2026-10-23 on `idx`.
-    let mut kc = hash_only("h", "h");
-    kc.sk_condition = Some(eq("a", "x"));
-    let m = maps(&[("h", 1), ("x", 600)]);
-    assert!(check(&kc, &multi_range_schema(), &m).is_ok());
-}
-
-#[test]
-fn two_range_values_totalling_exactly_1024_are_accepted_and_1025_refused() {
-    // Measured 2026-10-23 on `idx`: 512 and 512 pass, 512 and 513 are refused.
-    let mut kc = hash_only("h", "h");
-    kc.sk_condition = Some(eq("a", "x"));
-    kc.extra_sk_conditions = vec![(path("b"), placeholder("y"))];
-    let m = maps(&[("h", 1), ("x", 512), ("y", 512)]);
-    assert!(check(&kc, &multi_range_schema(), &m).is_ok());
-    let m = maps(&[("h", 1), ("x", 512), ("y", 513)]);
-    assert_eq!(
-        message(check(&kc, &multi_range_schema(), &m)),
-        RANGE_MSG_1024
-    );
+fn equality_clauses_are_checked_against_the_limits() {
+    let (base, idx, two) = (base_schema(), multi_range_schema(), two_hash_schema());
+    let hash = Some(HASH_MSG_2048);
+    let total = Some(HASH_TOTAL_MSG_2048);
+    let range = Some(RANGE_MSG_1024);
+    // The key schema, the `attribute = :v` clauses with the bytes of each
+    // value, and the expected sentence (`None` for `Ok`).
+    let cases: [(&[KeySchemaElement], &[(&str, usize)], Option<&str>); 16] = [
+        // Measured 2026-10-23 on a base table with HASH `pk` and RANGE `sk`:
+        // the limits, and the hash sentence when both limits are exceeded.
+        (&base, &[("pk", 2048)], None),
+        (&base, &[("pk", 2049)], hash),
+        (&base, &[("pk", 1), ("sk", 1024)], None),
+        (&base, &[("pk", 1), ("sk", 1025)], range),
+        (&base, &[("pk", 2049), ("sk", 1025)], hash),
+        // Measured 2026-10-23 on `idx`: `a` and `c` of 600 bytes with `b` of 1
+        // byte is refused, `a` of 600 bytes alone passes. Each value is under
+        // the limit alone; together they are not. 512 and 512 pass, 512 and
+        // 513 are refused.
+        (&idx, &[("h", 1), ("a", 600), ("b", 1), ("c", 600)], range),
+        (&idx, &[("h", 1), ("a", 600)], None),
+        (&idx, &[("h", 1), ("a", 512), ("b", 512)], None),
+        (&idx, &[("h", 1), ("a", 512), ("b", 513)], range),
+        // Measured 2026-10-23 on `two-hash`: `h1` of 2049 bytes and `h2` of 1
+        // byte get the single sentence. 1025 and 1024 bytes (sum 2049, neither
+        // over) and 2048 and 2048 bytes get the aggregated sentence.
+        (&two, &[("h1", 2049), ("h2", 1)], hash),
+        (&two, &[("h1", 1), ("h2", 2049)], hash),
+        (&two, &[("h1", 1025), ("h2", 1024)], total),
+        (&two, &[("h1", 2048), ("h2", 2048)], total),
+        // Measured 2026-11-20 on `two-hash`: a sum of exactly 2048 bytes
+        // passes, and with the HASH sum and a 1025-byte RANGE value both over,
+        // the aggregated hash sentence comes back.
+        (&two, &[("h1", 1024), ("h2", 1024)], None),
+        (&two, &[("h1", 1025), ("h2", 1024), ("r", 1025)], total),
+        // Not measured: the single hash check runs before the sum.
+        (&two, &[("h1", 2049), ("h2", 2048)], hash),
+    ];
+    for (schema, clauses, expected) in cases {
+        let (kc, m) = equalities(clauses);
+        let result = check(&kc, schema, &m);
+        match expected {
+            Some(sentence) => assert_eq!(message(result), sentence, "{clauses:?}"),
+            None => assert!(result.is_ok(), "{clauses:?}: {result:?}"),
+        }
+    }
 }
 
 #[test]
@@ -311,82 +306,6 @@ fn every_comparison_operator_and_begins_with_are_sized() {
 }
 
 #[test]
-fn the_hash_sentence_wins_when_both_limits_are_exceeded() {
-    let mut kc = hash_only("pk", "p");
-    kc.sk_condition = Some(eq("sk", "v"));
-    let m = maps(&[("p", 2049), ("v", 1025)]);
-    assert_eq!(message(check(&kc, &base_schema(), &m)), HASH_MSG_2048);
-}
-
-fn two_hash_condition() -> KeyCondition {
-    let mut kc = hash_only("h1", "x");
-    kc.extra_pk_conditions = vec![(path("h2"), placeholder("y"))];
-    kc
-}
-
-#[test]
-fn one_hash_value_over_the_limit_gets_the_single_sentence() {
-    // Measured 2026-10-23 on `two-hash`: `h1` of 2049 bytes and `h2` of 1 byte.
-    let kc = two_hash_condition();
-    let m = maps(&[("x", 2049), ("y", 1)]);
-    assert_eq!(message(check(&kc, &two_hash_schema(), &m)), HASH_MSG_2048);
-    let m = maps(&[("x", 1), ("y", 2049)]);
-    assert_eq!(message(check(&kc, &two_hash_schema(), &m)), HASH_MSG_2048);
-}
-
-#[test]
-fn hash_values_that_add_up_over_the_limit_get_the_aggregated_sentence() {
-    // Measured 2026-10-23 on `two-hash`: 1025 and 1024 bytes (sum 2049, neither
-    // over) and 2048 and 2048 bytes are both refused.
-    let kc = two_hash_condition();
-    for (x, y) in [(1025, 1024), (2048, 2048)] {
-        let m = maps(&[("x", x), ("y", y)]);
-        assert_eq!(
-            message(check(&kc, &two_hash_schema(), &m)),
-            HASH_TOTAL_MSG_2048,
-            "{x} + {y}"
-        );
-    }
-}
-
-#[test]
-fn hash_values_that_add_up_to_exactly_the_limit_are_accepted() {
-    // Not measured: a sum of exactly 2048 bytes. Treated as within the limit,
-    // as a single 2048-byte value is (measured).
-    let kc = two_hash_condition();
-    let m = maps(&[("x", 1024), ("y", 1024)]);
-    assert!(check(&kc, &two_hash_schema(), &m).is_ok());
-}
-
-#[test]
-fn the_aggregated_hash_sentence_has_a_space_before_the_number() {
-    let kc = two_hash_condition();
-    let m = maps(&[("x", 1025), ("y", 1024)]);
-    let msg = message(check(&kc, &two_hash_schema(), &m));
-    assert!(msg.ends_with("size limit of 2048 bytes"), "got: {msg}");
-}
-
-#[test]
-fn a_hash_sum_over_the_limit_wins_over_the_range_sum() {
-    // Not measured: both the HASH sum and the RANGE sum over. The hash
-    // sentences come first, as the single hash sentence does (measured).
-    let mut kc = two_hash_condition();
-    kc.sk_condition = Some(eq("r", "z"));
-    let m = maps(&[("x", 1025), ("y", 1024), ("z", 1025)]);
-    assert_eq!(
-        message(check(&kc, &two_hash_schema(), &m)),
-        HASH_TOTAL_MSG_2048
-    );
-}
-
-#[test]
-fn the_single_hash_sentence_wins_over_the_aggregated_one() {
-    let kc = two_hash_condition();
-    let m = maps(&[("x", 2049), ("y", 2048)]);
-    assert_eq!(message(check(&kc, &two_hash_schema(), &m)), HASH_MSG_2048);
-}
-
-#[test]
 fn binary_values_count_their_bytes() {
     let kc = hash_only("pk", "v");
     let values = HashMap::from([("v".to_owned(), AttributeValue::B(vec![0u8; 2049]))]);
@@ -455,48 +374,53 @@ fn a_clause_on_an_attribute_outside_the_key_schema_adds_nothing() {
 }
 
 #[test]
-fn an_undefined_value_placeholder_on_the_clause_itself_returns_ok() {
-    let kc = hash_only("pk", "missing");
-    assert!(check(&kc, &base_schema(), &maps(&[("v", 5000)])).is_ok());
-}
-
-#[test]
-fn an_undefined_name_reference_on_the_clause_itself_returns_ok() {
-    let kc = hash_only("#nope", "v");
-    assert!(check(&kc, &base_schema(), &maps(&[("v", 5000)])).is_ok());
-}
-
-#[test]
-fn an_undefined_value_in_another_clause_wins_over_the_size_of_a_defined_one() {
-    // Measured 2026-10-23: `pk = :v AND sk = :missing` with `:v` of 2049 bytes
-    // is refused as an undefined attribute value, not as a size.
-    let mut kc = hash_only("pk", "v");
-    kc.sk_condition = Some(eq("sk", "missing"));
-    assert!(check(&kc, &base_schema(), &maps(&[("v", 2049)])).is_ok());
-}
-
-#[test]
-fn an_undefined_name_in_another_clause_wins_over_the_size_of_a_defined_one() {
-    // Measured 2026-10-23: `pk = :v AND #n = :w` with `#n` undefined and `:v`
-    // of 2049 bytes is refused as an undefined attribute name, not as a size.
-    let mut kc = hash_only("pk", "v");
-    kc.sk_condition = Some(eq("#n", "w"));
-    assert!(check(&kc, &base_schema(), &maps(&[("v", 2049), ("w", 1)])).is_ok());
-}
-
-#[test]
-fn an_undefined_reference_wins_whatever_its_position() {
-    // The oversized clause may come before or after the undefined one.
-    let mut kc = hash_only("pk", "missing");
-    kc.sk_condition = Some(eq("sk", "v"));
-    assert!(check(&kc, &base_schema(), &maps(&[("v", 5000)])).is_ok());
-}
-
-#[test]
-fn an_undefined_bound_of_a_between_returns_ok() {
-    let mut kc = hash_only("pk", "p");
-    kc.sk_condition = Some(between("sk", "l", "missing"));
-    assert!(check(&kc, &base_schema(), &maps(&[("p", 1), ("l", 5000)])).is_ok());
+fn an_undefined_reference_returns_ok_whatever_the_sizes() {
+    let with_sort = |pk_value: &str, sk: SortKeyCondition| KeyCondition {
+        sk_condition: Some(sk),
+        ..hash_only("pk", pk_value)
+    };
+    let cases: [(&str, KeyCondition, &[(&str, usize)]); 6] = [
+        (
+            "undefined value on the clause",
+            hash_only("pk", "missing"),
+            &[("v", 5000)],
+        ),
+        (
+            "undefined name on the clause",
+            hash_only("#nope", "v"),
+            &[("v", 5000)],
+        ),
+        // Measured 2026-10-23: `pk = :v AND sk = :missing` with `:v` of 2049
+        // bytes is refused as an undefined attribute value, not as a size.
+        (
+            "undefined value in another clause",
+            with_sort("v", eq("sk", "missing")),
+            &[("v", 2049)],
+        ),
+        // Measured 2026-10-23: `pk = :v AND #n = :w` with `#n` undefined and
+        // `:v` of 2049 bytes is refused as an undefined attribute name, not as
+        // a size.
+        (
+            "undefined name in another clause",
+            with_sort("v", eq("#n", "w")),
+            &[("v", 2049), ("w", 1)],
+        ),
+        // The oversized clause may come before or after the undefined one.
+        (
+            "oversized clause after the undefined one",
+            with_sort("missing", eq("sk", "v")),
+            &[("v", 5000)],
+        ),
+        (
+            "undefined bound of a BETWEEN",
+            with_sort("p", between("sk", "l", "missing")),
+            &[("p", 1), ("l", 5000)],
+        ),
+    ];
+    for (label, kc, values) in cases {
+        let result = check(&kc, &base_schema(), &maps(values));
+        assert!(result.is_ok(), "{label}: {result:?}");
+    }
 }
 
 #[test]
