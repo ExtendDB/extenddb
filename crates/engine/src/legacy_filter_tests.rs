@@ -318,6 +318,9 @@ fn numbers_are_checked_before_the_operator_checks() {
     );
     assert_eq!(msg("EQ", &[n("1")]), None);
     assert_eq!(msg("EQ", &[n("-1.5e3")]), None);
+    // A number holding a character outside ASCII is left to the later checks:
+    // the service reads U+FF11 as 1 (measured 2026-11-24).
+    assert_eq!(msg("EQ", &[n("\u{ff11}")]), None);
 }
 
 #[test]

@@ -173,13 +173,27 @@ pub fn expected_values(
 /// `NS`, `L` or `M`. Measured on a top-level value on 2026-10-24, and on
 /// 2026-11-12 inside `NS`, `L`, `M` and an `M` in an `L`, in all three maps.
 ///
+/// A number that holds a character outside ASCII and that these rules cannot
+/// read passes this check. The service reads Unicode decimal digits as
+/// digits and these rules do not (#565): one U+FF11 in any of the three maps
+/// answers `ResourceNotFoundException` on a table that does not exist
+/// (measured 2026-11-24, where `abc` answers the number message).
+///
 /// # Errors
 ///
 /// Returns `DynamoDbError::ValidationException` with the service's text.
 pub fn condition_values(values: &[AttributeValue]) -> Result<(), DynamoDbError> {
-    values
-        .iter()
-        .try_for_each(|value| attribute_numbers(EmptyText::WithColon, value))
+    let mut numbers = Vec::new();
+    for value in values {
+        collect_numbers(value, &mut numbers);
+    }
+    numbers
+        .into_iter()
+        .try_for_each(|n| match normalize_number(n) {
+            Ok(_) => Ok(()),
+            Err(fault) if fault.is_not_a_number() && !n.is_ascii() => Ok(()),
+            Err(_) => number_text(EmptyText::WithColon, n),
+        })
         .map_err(bare)
 }
 

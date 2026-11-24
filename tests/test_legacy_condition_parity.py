@@ -3,8 +3,8 @@
 """Legacy QueryFilter, ScanFilter and KeyConditions: the checks that need the
 key schema, the number check on legacy values, and BatchGetItem capacity for
 absent keys. Every expected response was measured against Amazon DynamoDB in
-us-east-1 on 2026-10-24 (issue #477), and the cases marked 2026-10-31 and
-2026-11-12 on those dates.
+us-east-1 on 2026-10-24 (issue #477), and the cases marked 2026-10-31,
+2026-11-12 and 2026-11-24 on those dates.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ NOT_SUPPORTED = "Query key condition not supported"
 EMPTY_KEY = "One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty string value. Key: {}"
 FILTER_ON_KEY = "QueryFilter can only contain non-primary key attributes: Primary key attribute: {}"
 NOT_A_NUMBER = "The parameter cannot be converted to a numeric value: {}"
+TABLE_NOT_FOUND = ("ResourceNotFoundException", "Requested resource not found")
 
 
 def _cond(operator, values=None):
@@ -200,11 +201,23 @@ class TestLegacyNumberValues:
         # A QueryFilter error is reported before a KeyConditions number.
         assert _validation_error(lambda: client.query(TableName=ss_table, KeyConditions={"pk": _cond("EQ", [_n("abc")])}, QueryFilter={"a": _cond("BEGINS_WITH", [_n("1")])})) == LEGACY_TYPE.format("BEGINS_WITH", "N")
 
-    def test_number_check_on_a_table_that_does_not_exist(self, dynamodb_client_no_validation):
-        client = dynamodb_client_no_validation
-        absent = f"absent_{uuid.uuid4().hex[:8]}"
-        assert _validation_error(lambda: client.scan(TableName=absent, ScanFilter={"a": _cond("EQ", [_n("abc")])})) == NOT_A_NUMBER.format("abc")
-        assert _validation_error(lambda: client.scan(TableName=absent, ScanFilter={"a": _cond("EQ", [_n("abc")])}, IndexName="nope")) == NOT_A_NUMBER.format("abc")
+    @pytest.mark.parametrize(
+        ("operation", "args", "error"),
+        [
+            pytest.param("scan", {"ScanFilter": {"a": _cond("EQ", [_n("abc")])}}, ("ValidationException", NOT_A_NUMBER.format("abc")), id="scan_filter_abc"),
+            pytest.param("scan", {"ScanFilter": {"a": _cond("EQ", [_n("abc")])}, "IndexName": "nope"}, ("ValidationException", NOT_A_NUMBER.format("abc")), id="scan_filter_abc_on_an_index"),
+            # Measured 2026-11-24: the service reads U+FF11 as the digit one
+            # (#565), so the request reaches the table lookup.
+            pytest.param("query", {"KeyConditions": {"n": _cond("EQ", [_n("\uff11")])}}, TABLE_NOT_FOUND, id="key_conditions_ff11"),
+            pytest.param("query", {"KeyConditions": {"pk": _cond("EQ", [_s("a")])}, "QueryFilter": {"x": _cond("EQ", [_n("\uff11")])}}, TABLE_NOT_FOUND, id="query_filter_ff11"),
+            pytest.param("scan", {"ScanFilter": {"x": _cond("EQ", [_n("\uff11")])}}, TABLE_NOT_FOUND, id="scan_filter_ff11"),
+        ],
+    )
+    def test_number_check_on_a_table_that_does_not_exist(self, dynamodb_client_no_validation, missing_table, operation, args, error):
+        with pytest.raises(ClientError) as ei:
+            getattr(dynamodb_client_no_validation, operation)(TableName=missing_table, **args)
+        response = ei.value.response
+        assert (response["ResponseMetadata"]["HTTPStatusCode"], response["Error"]["Code"], response["Error"]["Message"]) == (400, *error)
 
     @pytest.mark.parametrize(("segments", "absent_table"), [({"Segment": 0}, False), ({"Segment": 2, "TotalSegments": 2}, False), ({"Segment": 0}, True)])
     def test_number_is_checked_before_the_segment_checks(self, dynamodb_client_no_validation, ss_table, segments, absent_table):

@@ -521,7 +521,8 @@ const INVALID_PARAMS: &str = "One or more parameter values were invalid: ";
 ///
 /// 1. every `N` in the value list, including inside `NS`, `L` and `M`, is a
 ///    valid number (`The parameter cannot be converted to a numeric value:
-///    <raw>`, or the overflow, underflow and 38-digit messages; no prefix);
+///    <raw>`, or the overflow, underflow and 38-digit messages; no prefix),
+///    or holds a character outside ASCII (see `condition_values`);
 /// 2. the operator is one of the thirteen (`Invalid comparison operator`);
 /// 3. the value count fits the operator: none for `NULL` and `NOT_NULL`, two
 ///    for `BETWEEN`, one or more for `IN`, one otherwise (`Invalid number of
