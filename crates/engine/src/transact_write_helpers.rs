@@ -404,7 +404,7 @@ mod tests {
             ),
         ] {
             let body: Value = serde_json::from_str(body).unwrap();
-            assert_eq!(compute_fingerprint(&body, "tok-1"), stored, "{body}");
+            assert_eq!(fp(&body, "tok-1"), stored, "{body}");
         }
     }
 
