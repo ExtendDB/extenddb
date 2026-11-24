@@ -18,7 +18,7 @@ use crate::expression::{
 };
 use crate::limits::LimitsConfig;
 use crate::types::{AttributeValue, KeySchemaElement, KeyType};
-use crate::validation::number::normalize_number;
+use crate::validation::number::{NumberFault, normalize_number};
 
 /// Byte size of a key attribute value.
 ///
@@ -117,20 +117,28 @@ enum ClauseSize {
 /// HASH `n` (N). In `KeyConditionExpression` and in `KeyConditions`, 2049 or
 /// 39 digits answer `Attempting to store more than 38 significant digits in a
 /// Number`. `1` followed by 2100 zeros answers `Number overflow. ...`, and the
-/// service serves 2100 zeros followed by `1`.
+/// service serves 2100 zeros followed by `1`. `1e-131` answers `Number
+/// underflow. ...` as a partition and as a sort key value (measured
+/// 2026-11-24).
 ///
-/// A value that `normalize_number` does not read as a number adds nothing to
-/// the size. The service refuses such a value with a number sentence, not a
-/// size sentence (measured 2026-11-24 in us-east-1). `abc` and 2049 `x`
-/// answer `The parameter cannot be converted to a numeric value: ` followed
-/// by the value, in `KeyConditionExpression` and in `KeyConditions`. The
-/// service reads U+FF11 as a digit, and 39 of them answer the 38-digit
-/// sentence.
+/// An ASCII value that `normalize_number` does not read as a number is refused
+/// with `The parameter cannot be converted to a numeric value: ` followed by
+/// the value as sent. Measured 2026-11-24 in us-east-1, in
+/// `KeyConditionExpression` and in `KeyConditions`: `abc`, 2049 `x`, ` 1`
+/// and the empty value. An empty value keeps the colon, which the text of
+/// `NumberFault::Empty` does not have.
+///
+/// A value that is not a number to these rules and holds a character outside
+/// ASCII adds nothing to the size. The service reads Unicode decimal digits as
+/// digits and these rules do not (#565). It serves a Query with one U+FF11,
+/// read as the number 1, and answers the 38-digit sentence for 39, 683 or
+/// 2049 of them. Refusing such a value here would refuse the one U+FF11.
 ///
 /// # Errors
 ///
-/// Returns the number's `ValidationException` for an `N` value with more
-/// than 38 significant digits or a magnitude out of range.
+/// Returns the number's `ValidationException` for an `N` value that is not a
+/// number and holds ASCII characters only, has more than 38 significant
+/// digits or has a magnitude out of range.
 fn sized_clause(
     clause: &Clause<'_>,
     key_schema: &[KeySchemaElement],
@@ -156,7 +164,10 @@ fn sized_clause(
         let bytes = match value {
             AttributeValue::N(n) => match normalize_number(n) {
                 Ok(digits) => digits.len(),
-                Err(fault) if fault.is_not_a_number() => 0,
+                Err(fault) if fault.is_not_a_number() && !n.is_ascii() => 0,
+                Err(fault) if fault.is_not_a_number() => {
+                    return Err(NumberFault::Malformed.error(n));
+                }
                 Err(fault) => return Err(fault.error(n)),
             },
             other => key_value_byte_size(other),
@@ -192,10 +203,10 @@ fn sized_clause(
 ///   value). This check does not make that refusal.
 /// - The HASH checks run before the RANGE check, so the hash sentence wins when
 ///   both limits are exceeded.
-/// - An `N` value with more than 38 significant digits or a magnitude out of
-///   range is refused with the number's sentence and is not sized. A value
-///   the number validator does not read as a number adds nothing (see
-///   `sized_clause`).
+/// - An `N` value that is not a number, has more than 38 significant digits or
+///   has a magnitude out of range is refused with the number's sentence and is
+///   not sized. A value that is not a number and holds a character outside
+///   ASCII adds nothing (see `sized_clause`).
 /// - If a `#name` or `:value` of any key clause is not defined, the check
 ///   returns `Ok`, because the service reports the undefined reference ahead
 ///   of the size. `ExtendDB` refuses most such requests later on. On a key

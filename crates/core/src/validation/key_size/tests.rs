@@ -454,17 +454,27 @@ fn number_values_get_the_number_rules_before_any_size() {
     // with more than 38 significant digits or out of range gets the number's
     // sentence, never the size sentence. A valid one is sized by its
     // normalized digits. A number in other Unicode decimal digits is served.
-    // The RANGE rows apply the same rule to a sort key value. The 2049 `x`
-    // and 2049 U+FF11 rows are values the validator does not read as a
-    // number: they add nothing, so the size check passes them. The service
-    // refuses them with a number sentence (measured 2026-11-24: `The parameter
-    // cannot be converted to a numeric value: xxx...` for 2049 `x`, and the
-    // digit sentence for 39 U+FF11).
+    // The RANGE rows apply the same rule to a sort key value. Measured
+    // 2026-11-24: an ASCII value that is not a number gets the not-a-number
+    // sentence with the value after the colon, the empty value too, and
+    // `1e-131` gets the underflow sentence. 2049 U+FF11 is not a number to
+    // these rules and adds nothing, so the size check passes it. The service
+    // answers the 38-digit sentence for it (#565).
     const DIGITS: &str = "Attempting to store more than 38 significant digits in a Number";
     const OVERFLOW: &str =
         "Number overflow. Attempting to store a number with magnitude larger than supported range";
+    const UNDERFLOW: &str = "Number underflow. Attempting to store a number with magnitude smaller than supported range";
+    let not_a_number =
+        |n: &str| format!("The parameter cannot be converted to a numeric value: {n}");
     let zeros = "0".repeat(2100);
-    let cases: [(&str, &str, String, Option<&str>); 10] = [
+    let x2049 = "x".repeat(2049);
+    let (x, abc, space, empty) = (
+        not_a_number(&x2049),
+        not_a_number("abc"),
+        not_a_number(" 1"),
+        not_a_number(""),
+    );
+    let cases: [(&str, &str, String, Option<&str>); 15] = [
         ("hash, 2049 digits", "pk", "1".repeat(2049), Some(DIGITS)),
         ("hash, 39 digits", "pk", "1".repeat(39), Some(DIGITS)),
         (
@@ -483,7 +493,17 @@ fn number_values_get_the_number_rules_before_any_size() {
         ),
         ("range, 1025 digits", "sk", "1".repeat(1025), Some(DIGITS)),
         ("range, 2100 zeros and 1", "sk", format!("{zeros}1"), None),
-        ("hash, 2049 x", "pk", "x".repeat(2049), None),
+        ("hash, 2049 x", "pk", x2049, Some(x.as_str())),
+        ("hash, abc", "pk", "abc".to_owned(), Some(abc.as_str())),
+        (
+            "hash, space and 1",
+            "pk",
+            " 1".to_owned(),
+            Some(space.as_str()),
+        ),
+        ("hash, empty", "pk", String::new(), Some(empty.as_str())),
+        ("hash, 1e-131", "pk", "1e-131".to_owned(), Some(UNDERFLOW)),
+        ("range, 1e-131", "sk", "1e-131".to_owned(), Some(UNDERFLOW)),
         ("hash, 2049 U+FF11", "pk", "\u{ff11}".repeat(2049), None),
     ];
     for (label, attribute, n, expected) in cases {
