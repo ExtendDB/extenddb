@@ -19,7 +19,8 @@
 #   pedantic  pedantic clippy of the adapter's own code, all its targets
 #   core      extenddb-core's wasm32 tests, under Node
 #   shim      the SQLite shim's wasm32 tests, under Node
-#   corpus    the browser module and the parity corpus, under Node
+#   corpus    the parity corpus on wasm32, and the browser module's checks of
+#             submit's JavaScript boundary, under Node
 #   wasm-bindgen-version
 #             print the version of the wasm-bindgen crate in Cargo.lock
 #
@@ -275,10 +276,10 @@ case "$step" in
         # The adapter's own code (--no-deps), with the pedantic group the
         # clippy step does not enable. --all-targets also checks the adapter's
         # test targets for wasm32, with the dev-dependencies that target
-        # selects. Their tests are native only (tests/parity.rs and the
-        # library's test module are cfg-gated off wasm32), so on wasm32 the
-        # step lints the library in its test configuration as well and fails
-        # when a test target or a dev-dependency stops building there.
+        # selects: tests/parity.rs, which runs there too, and the library in
+        # its test configuration (its test module is cfg-gated off wasm32), so
+        # the step fails when a test target or a dev-dependency stops building
+        # there.
         run cargo clippy --locked --no-deps -p "$ADAPTER" --all-targets --target "$TARGET" \
             -- -D warnings -W clippy::pedantic
         ;;
@@ -329,27 +330,31 @@ case "$step" in
         ;;
 
     corpus)
-        # Builds the browser module with wasm-pack, which runs wasm-bindgen,
-        # and runs the shared parity corpus through it under Node: the same
-        # cases as the native test (crates/wasm-adapter/tests/parity.rs, against
-        # sqlx and the C SQLite), with its assertions except where a case
-        # carries an `onWasm` expectation.
+        # First the parity corpus on wasm32: crates/wasm-adapter/tests/parity.rs,
+        # the test that also runs it natively (against sqlx and the C SQLite),
+        # here through the adapter's browser surface over the SQLite shim,
+        # under Node, in the release profile the module ships in. TESTS names
+        # its one test, as the core and shim steps name theirs.
+        ARGS=(--release -p "$ADAPTER" --test parity)
+        TESTS=(every_case_gives_its_expected_answer)
+        run_suite corpus
+
+        # Then the browser module, built with wasm-pack, which runs
+        # wasm-bindgen, and crates/wasm-adapter/parity/run.mjs, which checks
+        # through it what only a JavaScript caller can do with `submit`.
         #
         # --mode no-install makes wasm-pack stop, rather than download or build
         # a wasm-bindgen, when it finds none of the version in Cargo.lock (the
         # workflow's tool cache or install step puts one in ~/.cargo/bin).
         # --no-opt skips wasm-opt, which the workflow does not install: without
         # it, wasm-pack would run a wasm-opt it finds on PATH or in its cache,
-        # so the module the corpus runs would depend on the machine. wasm-opt
-        # is an optimizer (here it makes the module about a quarter smaller)
-        # and is not meant to change the answers the corpus checks; no step
-        # runs the corpus over its output, the module the first build command
-        # of the README produces. The README's "Building it" says how wasm-pack
-        # finds or downloads its tools, and what else it does, including the
-        # `cargo metadata` that updates an out-of-date Cargo.lock before the
-        # build. Running that command first with --locked makes the step stop
-        # on such a lock, as the build step's `cargo build --locked` does, and
-        # leaves the lock as it was.
+        # so the module the checks run would depend on the machine. The
+        # README's "Building it" says how wasm-pack finds or downloads its
+        # tools, and what else it does, including the `cargo metadata` that
+        # updates an out-of-date Cargo.lock before the build. Running that
+        # command first with --locked makes the step stop on such a lock, as
+        # the build step's `cargo build --locked` does, and leaves the lock as
+        # it was.
         if ! command -v wasm-pack >/dev/null 2>&1; then
             die "wasm-pack is not on PATH; install the version .github/workflows/wasm.yml installs (cargo install --locked --version <that version> wasm-pack)"
         fi
@@ -360,7 +365,8 @@ case "$step" in
             lock="$(lock_wasm_bindgen_version)"
             die "wasm-pack build failed. If it stopped with \"Not able to find or install a local wasm-bindgen.\", it found no wasm-bindgen of the version of the wasm-bindgen crate in Cargo.lock, ${lock}, on PATH or in its cache, and --mode no-install lets it neither download nor build one; $(wasm_bindgen_cli_advice "$lock")"
         fi
-        run node crates/wasm-adapter/parity/run.mjs
+        show node crates/wasm-adapter/parity/run.mjs
+        node crates/wasm-adapter/parity/run.mjs
         ;;
 
     wasm-bindgen-version)

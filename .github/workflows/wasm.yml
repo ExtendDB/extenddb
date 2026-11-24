@@ -83,14 +83,15 @@ jobs:
       # job's WASM_PACK_VERSION, so that a new wasm-pack release does not
       # change how the corpus step builds the module. The CLI must be of the
       # crate's version: its wasm-bindgen, which writes the JS glue, and its
-      # wasm-bindgen-test-runner, which runs the two test steps below, read
-      # the description the crate's macros put into the module, and both stop
-      # with a "different bindgen format" error when that description's
-      # schema version is not their own; the corpus step's wasm-pack needs a
-      # wasm-bindgen of that version too (README.md's "Building it" says where
-      # it looks for one). The cache key holds both versions, so a cache hit
-      # restores tools of those versions and a miss installs them; both land
-      # in ~/.cargo/bin, and a hit skips their multi-minute compile.
+      # wasm-bindgen-test-runner, which runs the tests of the last three steps
+      # below, read the description the crate's macros put into the module,
+      # and both stop with a "different bindgen format" error when that
+      # description's schema version is not their own; the corpus step's
+      # wasm-pack needs a wasm-bindgen of that version too (README.md's
+      # "Building it" says where it looks for one). The cache key holds both
+      # versions, so a cache hit restores tools of those versions and a miss
+      # installs them; both land in ~/.cargo/bin, and a hit skips their
+      # multi-minute compile.
       - name: Read the wasm-bindgen version from Cargo.lock
         id: wasm-bindgen
         run: |
@@ -129,5 +130,5 @@ jobs:
         run: devtools/run-wasm-step core
       - name: SQLite shim wasm tests under Node
         run: devtools/run-wasm-step shim
-      - name: Headless parity corpus under Node
+      - name: Parity corpus and submit's JavaScript boundary under Node
         run: devtools/run-wasm-step corpus

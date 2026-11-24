@@ -50,9 +50,9 @@ serde_json = { workspace = true }
 # `console.error` before the trap that follows the panic.
 #
 # The first three floors are the releases that wasm-bindgen-test 0.3.80,
-# the floor extenddb-core and extenddb-storage-sqlite give the harness of
-# their wasm tests, requires exactly, so no lower release of them resolves
-# in this workspace.
+# the floor extenddb-core, extenddb-storage-sqlite and this crate give the
+# harness of their wasm tests, requires exactly, so no lower release of them
+# resolves in this workspace.
 # console_error_panic_hook 0.1.6 is the first release whose hook adds the
 # JavaScript stack to the message; 0.1.0 to 0.1.4 need a nightly compiler
 # (they use `#![feature]`).
@@ -63,9 +63,14 @@ js-sys = "0.3.107"
 console_error_panic_hook = "0.1.6"
 
 # A current-thread runtime drives the adapter's async `submit` in the native
-# unit tests (the browser build uses `wasm-bindgen-futures` instead). Scoped to
+# tests (the browser build uses `wasm-bindgen-futures` instead). Scoped to
 # non-wasm so `cargo clippy -p extenddb-wasm-adapter --target
 # wasm32-unknown-unknown --all-targets` does not pull tokio's net stack, which
 # has no wasm32 target.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
+
+# The harness that runs tests/parity.rs on wasm32 under Node; the same floor
+# as extenddb-core's wasm-bindgen-test, for the reason its manifest gives.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3.80"

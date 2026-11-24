@@ -1,13 +1,14 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Native side of the shared parity harness.
+//! The parity corpus (`../parity/corpus.json`), run on both targets.
 //!
-//! Runs the shared case corpus (`../parity/corpus.json`) through
-//! [`extenddb_wasm_adapter::Engine`] built natively — the `ExtendDB` engine over
-//! `sqlx` and the C `SQLite` library. The wasm side (`../parity/run.mjs`) runs
-//! the same corpus through the wasm module under Node. Both runners implement
-//! the same three rules:
+//! Natively the test runs the cases through [`extenddb_wasm_adapter::Engine`]:
+//! the `ExtendDB` engine over `sqlx` and the C `SQLite` library, on a tokio
+//! runtime. On `wasm32` it runs them through `ExtendDb`, the surface the
+//! browser module exports (the engine over the crate's synchronous `SQLite`
+//! shim and the bundled `SQLite`), under Node with `wasm-bindgen-test`. One set
+//! of rules serves both runs:
 //!
 //! - the case schema ([`read_case`]): the members a case may have, the type of
 //!   each, and that every case checks something;
@@ -17,33 +18,26 @@
 //! - the judging of a response against the case's error name and checks
 //!   ([`judge`]).
 //!
-//! Each runner judges every row of `../parity/runner-selftest.json` first, and
-//! fails if a row's outcome differs from the one the row records; the rows hold
-//! the two implementations of each rule to the same outcomes. Neither runner
-//! compares the full responses of the two builds with each other; a member a
-//! case does not check can differ between them without either run failing.
+//! A case may carry an `onWasm` expectation, which the `wasm32` run uses in
+//! place of the case's `error` and `checks`; the native run checks its shape
+//! and uses the case's own. Neither run compares the full responses of the two
+//! builds with each other; a member a case does not check can differ between
+//! them without either run failing.
 //!
-//! A case may carry an `onWasm` expectation, which the wasm runner uses in
-//! place of the case's `error` and `checks`; this runner checks its shape and
-//! uses the case's own.
-//!
-//! Native only: it drives the engine on a tokio runtime, a native-only
-//! dev-dependency, so the file compiles to nothing on `wasm32` and
-//! `cargo clippy -p extenddb-wasm-adapter --target wasm32-unknown-unknown
-//! --all-targets` can build.
-#![cfg(not(target_arch = "wasm32"))]
+//! `parity/run.mjs` checks what only a JavaScript caller can do: `submit` with
+//! arguments that are not strings, through the module `wasm-pack` emits.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 use serde_json::{Map, Value};
 
-/// The shared corpus, embedded so the test is hermetic.
+/// The corpus, embedded so the test is hermetic.
 const CORPUS: &str = include_str!("../parity/corpus.json");
 
-/// The runners' shared self-test rows, each with the outcome (`pass`, `fail`
-/// or `reject`) both runners must give it.
-const SELFTEST: &str = include_str!("../parity/runner-selftest.json");
+/// Whether this run judges a case against its `onWasm` expectation, when it
+/// has one.
+const ON_WASM: bool = cfg!(target_arch = "wasm32");
 
 /// The members a case may have.
 const CASE_MEMBERS: [&str; 8] = [
@@ -52,16 +46,6 @@ const CASE_MEMBERS: [&str; 8] = [
 
 /// The members of a case's `onWasm` expectation, all required.
 const ON_WASM_MEMBERS: [&str; 3] = ["error", "checks", "reason"];
-
-/// The members a self-test row may have.
-const ROW_MEMBERS: [&str; 7] = [
-    "name", "case", "caseText", "saved", "response", "bytes", "expect",
-];
-
-/// The largest magnitude of a number a case may carry, 2^53 - 1. Every
-/// integer up to it is exact in an IEEE-754 double, the type the Node runner
-/// reads a number into, so both runners read and send the same value.
-const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 
 /// What a case expects of a response: the error it names, or `None` for
 /// success, and the checks on its members.
@@ -102,6 +86,8 @@ struct Case<'a> {
     op: &'a str,
     request: Request<'a>,
     expect: Expectation<'a>,
+    /// The case's `onWasm` expectation, if it has one.
+    on_wasm: Option<Expectation<'a>>,
     /// The values the case saves for later cases: a name and the JSON Pointer
     /// of the string in the response that it saves.
     save: Vec<(&'a str, &'a str)>,
@@ -167,38 +153,6 @@ fn pieces(s: &str) -> Result<Vec<Piece<'_>>, String> {
         pieces.push(Piece::Text(rest));
     }
     Ok(pieces)
-}
-
-/// Refuse every number in `value` that is not an integer written in decimal
-/// with no fraction or exponent, is not `-0`, and whose magnitude is at most
-/// 2^53 - 1.
-///
-/// The number's text is read back through `Number::to_string`, which gives
-/// the integer's digits for an integer and a fraction or exponent for a float
-/// (and the text as written when `serde_json`'s `arbitrary_precision` feature
-/// is on), so the rule reads the number as written either way.
-fn check_numbers(value: &Value) -> Result<(), String> {
-    match value {
-        Value::Number(n) => {
-            let text = n.to_string();
-            let digits = text.strip_prefix('-').unwrap_or(&text);
-            let integer = !digits.is_empty()
-                && digits.bytes().all(|b| b.is_ascii_digit())
-                && (digits == "0" || !digits.starts_with('0'))
-                && text != "-0";
-            if integer && digits.parse::<u64>().is_ok_and(|m| m <= MAX_SAFE_INTEGER) {
-                Ok(())
-            } else {
-                Err(format!(
-                    "the number {text} is not an integer between -(2^53 - 1) and 2^53 - 1 \
-                     written without a fraction or exponent"
-                ))
-            }
-        }
-        Value::Array(items) => items.iter().try_for_each(check_numbers),
-        Value::Object(members) => members.values().try_for_each(check_numbers),
-        _ => Ok(()),
-    }
 }
 
 /// Refuse a body string whose `${` does not begin a reference, or whose
@@ -282,12 +236,10 @@ fn read_expectation<'a>(
     };
     let checks_something = match error {
         None => checks.iter().any(|check| check.path != "/__type"),
-        Some(_) => checks
-            .iter()
-            .any(|check| {
-                matches!(check.path, "/message" | "/Message")
-                    && !matches!(check.kind, CheckKind::Present)
-            }),
+        Some(_) => checks.iter().any(|check| {
+            matches!(check.path, "/message" | "/Message")
+                && !matches!(check.kind, CheckKind::Present)
+        }),
     };
     if !checks_something {
         return Err(match error {
@@ -302,8 +254,8 @@ fn read_expectation<'a>(
 }
 
 /// Read a case's `onWasm` expectation: an object with `error`, `checks` and a
-/// non-empty `reason`, and no other member. Only the wasm runner uses it.
-fn read_on_wasm(value: &Value) -> Result<(), String> {
+/// non-empty `reason`, and no other member.
+fn read_on_wasm(value: &Value) -> Result<Expectation<'_>, String> {
     let members = value
         .as_object()
         .ok_or("onWasm must be an object with error, checks and reason")?;
@@ -317,7 +269,6 @@ fn read_on_wasm(value: &Value) -> Result<(), String> {
         return Err("onWasm needs a reason, a non-empty string".to_owned());
     }
     read_expectation(members.get("error"), members.get("checks"))
-        .map(drop)
         .map_err(|e| format!("onWasm: {e}"))
 }
 
@@ -328,8 +279,7 @@ fn read_on_wasm(value: &Value) -> Result<(), String> {
 /// ([`read_expectation`]); optionally `save`, an object whose keys are names
 /// ([`is_save_name`]) and whose values are JSON Pointers; optionally `onWasm`
 /// ([`read_on_wasm`]), but not together with `save`; and no other member.
-/// Every number in it is an integer of at most 2^53 - 1 in magnitude
-/// ([`check_numbers`]). In its body strings every `${` begins a reference
+/// In its body strings every `${` begins a reference
 /// `${name}` ([`pieces`]) to a value in `saved`, the names earlier cases save.
 fn read_case<'a>(value: &'a Value, saved: &HashSet<String>) -> Result<Case<'a>, String> {
     let members = value.as_object().ok_or("a case must be an object")?;
@@ -341,7 +291,6 @@ fn read_case<'a>(value: &'a Value, saved: &HashSet<String>) -> Result<Case<'a>, 
     {
         return Err(within(format!("unknown member {key:?}")));
     }
-    check_numbers(value).map_err(within)?;
     let op = non_empty_str(members.get("op"))
         .ok_or_else(|| within("op must be a non-empty string".to_owned()))?;
     let request = match (members.get("body"), members.get("rawBody")) {
@@ -375,20 +324,25 @@ fn read_case<'a>(value: &'a Value, saved: &HashSet<String>) -> Result<Case<'a>, 
             .collect::<Result<Vec<_>, _>>()?,
         Some(other) => return Err(within(format!("save {other} is not an object"))),
     };
-    if let Some(on_wasm) = members.get("onWasm") {
-        read_on_wasm(on_wasm).map_err(within)?;
-        if members.contains_key("save") {
-            return Err(within(
-                "a case with onWasm cannot save values, as its response differs by build"
-                    .to_owned(),
-            ));
+    let on_wasm = match members.get("onWasm") {
+        None => None,
+        Some(on_wasm) => {
+            let on_wasm = read_on_wasm(on_wasm).map_err(within)?;
+            if members.contains_key("save") {
+                return Err(within(
+                    "a case with onWasm cannot save values, as its response differs by build"
+                        .to_owned(),
+                ));
+            }
+            Some(on_wasm)
         }
-    }
+    };
     Ok(Case {
         name,
         op,
         request,
         expect,
+        on_wasm,
         save,
     })
 }
@@ -448,8 +402,10 @@ fn write_json_string(s: &str, out: &mut String) {
 }
 
 /// Write `value` as canonical JSON: no whitespace, object members sorted by
-/// the code points of their names, numbers as their decimal digits (the
-/// schema admits only integers), strings as [`write_json_string`] writes them.
+/// the code points of their names, numbers as `serde_json` writes them,
+/// strings as [`write_json_string`] writes them. The request text so does not
+/// depend on the order in which `serde_json` keeps an object's members, which
+/// its `preserve_order` feature changes.
 fn canonical_json(value: &Value, out: &mut String) {
     match value {
         Value::Null => out.push_str("null"),
@@ -544,7 +500,7 @@ fn error_short_name(resp: &Value) -> Option<String> {
 
 /// JSON equality as the corpus defines it: object members compare regardless
 /// of their order, array elements in order, and numbers by their value as an
-/// `f64` (so `1` equals `1.0`, as it does once JavaScript has parsed both).
+/// `f64` (so `1` equals `1.0`).
 fn json_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => x.as_f64() == y.as_f64(),
@@ -610,134 +566,73 @@ fn save(case: &Case<'_>, resp: &Value, saved: &mut HashMap<String, String>) -> R
     Ok(())
 }
 
-/// A row's outcome: `pass`, `fail` or `reject`, with what failed or why the
-/// case was rejected. `Err` when the row itself does not follow the row
-/// schema (see `runner-selftest.json`).
-fn row_outcome(row: &Value) -> Result<(&'static str, String), String> {
-    let members = row.as_object().ok_or("a row must be an object")?;
-    if let Some(key) = members
-        .keys()
-        .find(|key| !ROW_MEMBERS.contains(&key.as_str()))
-    {
-        return Err(format!("unknown row member {key:?}"));
-    }
-    let parsed: Value;
-    let case = match (members.get("case"), members.get("caseText")) {
-        (Some(case), None) => case,
-        (None, Some(Value::String(text))) => match serde_json::from_str(text) {
-            Ok(value) => {
-                parsed = value;
-                &parsed
-            }
-            Err(e) => return Ok(("reject", format!("caseText does not parse: {e}"))),
-        },
-        _ => return Err("a row needs exactly one of case and caseText (a string)".to_owned()),
-    };
-    let saved: HashMap<String, String> = match members.get("saved") {
-        None => HashMap::new(),
-        Some(Value::Object(saved)) => saved
-            .iter()
-            .map(|(key, value)| match value {
-                Value::String(value) => Ok((key.clone(), value.clone())),
-                _ => Err(format!("saved value {key:?} is not a string")),
-            })
-            .collect::<Result<_, _>>()?,
-        Some(_) => return Err("saved must be an object".to_owned()),
-    };
-    let names: HashSet<String> = saved.keys().cloned().collect();
-    let case = match read_case(case, &names) {
-        Ok(case) => case,
-        Err(e) => return Ok(("reject", e)),
-    };
-    if let Some(bytes) = members.get("bytes") {
-        let bytes = bytes.as_str().ok_or("bytes must be a string")?;
-        let got = request_text(&case, &saved);
-        if got != bytes {
-            return Ok(("fail", format!("the request is {got}")));
-        }
-    }
-    if let Some(response) = members.get("response") {
-        if let Err(why) = judge(&case.expect, response) {
-            return Ok(("fail", why));
-        }
-        if let Err(why) = save(&case, response, &mut saved.clone()) {
-            return Ok(("fail", why));
-        }
-    }
-    Ok(("pass", String::new()))
+/// An instance of the build under test, over a fresh in-memory database.
+#[cfg(not(target_arch = "wasm32"))]
+async fn create() -> extenddb_wasm_adapter::Engine {
+    extenddb_wasm_adapter::Engine::new()
+        .await
+        .expect("in-memory engine initializes")
 }
 
-/// Judge every row of the shared runner self-test and compare each outcome
-/// with the row's `expect`, panicking on any difference. Returns the number of
-/// rows.
-fn judge_self_test_rows() -> usize {
-    let fixture: Value = serde_json::from_str(SELFTEST).expect("runner-selftest.json parses");
-    let members = fixture
-        .as_object()
-        .expect("runner-selftest.json is an object");
-    assert!(
-        members
-            .keys()
-            .all(|key| ["_comment", "rows"].contains(&key.as_str())),
-        "runner-selftest.json has only _comment and rows"
-    );
-    let rows = members["rows"].as_array().expect("rows is an array");
-    assert!(!rows.is_empty(), "runner-selftest.json must have rows");
-    let disagreements: Vec<String> = rows
-        .iter()
-        .enumerate()
-        .filter_map(|(index, row)| {
-            let label = row["name"].as_str().unwrap_or("<unnamed>");
-            let expect = row["expect"].as_str();
-            match row_outcome(row) {
-                Err(e) => Some(format!("row {index} '{label}' is malformed: {e}")),
-                Ok((got, why)) if Some(got) != expect => Some(format!(
-                    "row {index} '{label}': expected {expect:?}, got {got} ({why})"
-                )),
-                Ok(_) => None,
-            }
-        })
-        .collect();
-    assert!(
-        disagreements.is_empty(),
-        "self-test rows judged differently than expected:\n{}",
-        disagreements.join("\n")
-    );
-    rows.len()
+/// An instance of the build under test, over a fresh in-memory database.
+#[cfg(target_arch = "wasm32")]
+async fn create() -> extenddb_wasm_adapter::ExtendDb {
+    extenddb_wasm_adapter::ExtendDb::create()
+        .await
+        .unwrap_or_else(|e| panic!("in-memory engine initializes: {e:?}"))
 }
 
-/// Judge every self-test row, then run the whole corpus through the native
-/// engine in order, against one fresh in-memory database (state carries
-/// between cases, as the wasm runner drives it).
-#[tokio::test]
-async fn the_self_test_rows_then_the_corpus_pass_on_the_native_build() {
-    let rows = judge_self_test_rows();
+/// The answer of `instance` to one request.
+#[cfg(not(target_arch = "wasm32"))]
+async fn submit(instance: &extenddb_wasm_adapter::Engine, op: &str, request: &str) -> String {
+    instance.submit(op, request).await
+}
 
+/// The answer of `instance` to one request, the string its promise resolves
+/// with.
+#[cfg(target_arch = "wasm32")]
+async fn submit(instance: &extenddb_wasm_adapter::ExtendDb, op: &str, request: &str) -> String {
+    use wasm_bindgen::JsValue;
+    let promise = instance.submit(&JsValue::from_str(op), &JsValue::from_str(request));
+    wasm_bindgen_futures::JsFuture::from(promise)
+        .await
+        .unwrap_or_else(|e| panic!("submit rejected: {e:?}"))
+        .as_string()
+        .expect("submit resolves with a string")
+}
+
+/// Run the whole corpus in order against one fresh in-memory database (state
+/// carries between cases), judging each case against its `onWasm`
+/// expectation on `wasm32` when it has one, else against its own.
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+async fn every_case_gives_its_expected_answer() {
     let corpus: Value = serde_json::from_str(CORPUS).expect("corpus.json parses");
     let cases = read_corpus(&corpus).unwrap_or_else(|e| panic!("corpus.json is malformed: {e}"));
 
-    let engine = extenddb_wasm_adapter::Engine::new()
-        .await
-        .expect("in-memory engine initializes");
+    let instance = create().await;
 
     let mut saved = HashMap::new();
     let mut checks = 0;
     for case in &cases {
+        let expect = match &case.on_wasm {
+            Some(on_wasm) if ON_WASM => on_wasm,
+            _ => &case.expect,
+        };
         let request = request_text(case, &saved);
-        let out = engine.submit(case.op, &request).await;
+        let out = submit(&instance, case.op, &request).await;
         let resp: Value = serde_json::from_str(&out)
             .unwrap_or_else(|e| panic!("case '{}': response is not JSON ({e}): {out}", case.name));
-        if let Err(why) = judge(&case.expect, &resp) {
+        if let Err(why) = judge(expect, &resp) {
             panic!("case '{}': {why}", case.name);
         }
-        checks += case.expect.checks.len();
+        checks += expect.checks.len();
         if let Err(why) = save(case, &resp, &mut saved) {
             panic!("case '{}': {why}", case.name);
         }
     }
     println!(
-        "native parity runner: {rows} self-test rows judged as expected; {} cases and {checks} \
-         checks passed",
+        "parity corpus: {} cases and {checks} checks passed",
         cases.len()
     );
 }
