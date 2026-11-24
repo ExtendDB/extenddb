@@ -34,8 +34,8 @@ pub struct SqliteCatalogStore {
     /// same file as the engine pool, so an uncoordinated catalog write can
     /// hold the SQLite file write lock past a locked writer's `busy_timeout`
     /// (and vice versa), failing an unrelated request with `database is
-    /// locked`. The server wiring in `lib.rs` shares the engine's lock here so
-    /// both sets of writers queue on one lock.
+    /// locked`. The server wiring in `server_backend.rs` shares the engine's
+    /// lock here so both sets of writers queue on one lock.
     write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -151,7 +151,7 @@ impl SettingsStore for SqliteCatalogStore {
 
 // ── MetricsStore ───────────────────────────────────────────────────────
 
-#[derive(sqlx::FromRow)]
+sqlite_row_struct! {
 struct DbMetricsRow {
     bucket: String,
     account_id: String,
@@ -163,6 +163,7 @@ struct DbMetricsRow {
     count: i64,
     min: f64,
     max: f64,
+}
 }
 
 /// `account_metrics`: migration 10 replaced `metrics` with it.

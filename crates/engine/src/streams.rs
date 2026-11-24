@@ -167,8 +167,8 @@ pub async fn handle_get_shard_iterator(
     // Encode creation timestamp (seconds since epoch) for 15-minute expiration.
     // unwrap_or_default: returns epoch 0 if the system clock is before 1970,
     // which only makes the iterator expire on the next GetRecords.
-    let created_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let created_at = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
 
@@ -429,8 +429,8 @@ pub async fn handle_get_records(
 
     // Check iterator expiration (15 minutes).
     if let Some(created_at) = it.created_at {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let now = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         if now.saturating_sub(created_at) > SHARD_ITERATOR_EXPIRY_SECS {
@@ -480,8 +480,8 @@ pub async fn handle_get_records(
     // so the 15-minute window resets.
     let next_iterator = {
         let next_seq = last_seq.unwrap_or_else(|| it.sequence.clone());
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let now = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         Some(encode_shard_iterator(
