@@ -7,7 +7,7 @@
 
 ## 1. Purpose
 
-The `core` crate contains all DynamoDB-specific business logic that is independent of the storage backend, HTTP server, and async runtime. It is pure synchronous Rust — types, expression parsing/evaluation, validation, capacity calculation, and error types.
+The `core` crate contains all DynamoDB-specific business logic that is independent of the storage backend, HTTP server, and async runtime. It is synchronous Rust — types, expression parsing/evaluation, validation, capacity calculation, and error types.
 
 **Dependencies:** serde, serde_json, thiserror, time, uuid, base64, bigdecimal (no tokio, no sqlx, no axum, no async runtime)
 

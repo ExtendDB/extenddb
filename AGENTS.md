@@ -33,7 +33,7 @@ extenddb/
 │   ├── bin/              # CLI, config, daemon lifecycle (extenddb binary)
 │   ├── cache/            # Auth and authz caches
 │   ├── config/           # Config parsing shared by the CLI and the server
-│   ├── core/             # Pure sync types, validation, expression parsing (no async)
+│   ├── core/             # Sync types, validation, expression parsing (no async)
 │   ├── engine/           # DynamoDB operation handlers (PutItem, Query, etc.)
 │   ├── server/           # HTTP server, management API, web console
 │   ├── storage/          # Storage trait definitions (TableEngine trait)
@@ -86,7 +86,8 @@ extenddb-wasm-adapter (experimental WebAssembly build; publish = false)
 ```
 
 - **extenddb-core:** Synchronous Rust. No async runtime. Types, validation, expression parsing, and the crypto
-  module (AWS-LC through `aws-lc-rs` natively, RustCrypto crates on `wasm32`).
+  module (AWS-LC through `aws-lc-rs` natively; on `wasm32`, the RustCrypto `sha2`, `hmac` and `aes-gcm` crates,
+  `subtle` and `getrandom`).
 - **extenddb-storage:** Trait definitions only. No implementation.
 - **extenddb-storage-postgres:** Concrete PostgreSQL implementation.
 - **extenddb-storage-sqlite:** Concrete SQLite implementation, the dev and CI backend.

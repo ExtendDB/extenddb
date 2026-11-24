@@ -57,7 +57,8 @@ Exactly one `storage-*` backend is linked per binary, selected by mutually exclu
 
 Key principle: `core` depends on nothing in the workspace and has no async runtime. It contains sync Rust: types,
 expression parsing and evaluation, input validation, capacity calculation, error types, and the crypto module, which
-links AWS-LC through `aws-lc-rs` natively. Every other crate depends on `core`.
+links AWS-LC through `aws-lc-rs` natively. Every crate but `cache` and `backup-store` depends on `core`, directly or
+through another crate.
 
 ## Crate Roles
 
@@ -72,7 +73,8 @@ Sync Rust library. No async runtime, no database drivers, no HTTP framework.
 - **limits**: Configurable limits matching real DynamoDB defaults (item size, batch sizes, expression depth/tokens)
 - **capacity**: RCU/WCU calculation logic
 - **crypto**: SHA-256, HMAC-SHA256, constant-time comparison, AES-256-GCM `seal`/`open` and a random fill; AWS-LC
-  through `aws-lc-rs` natively, RustCrypto crates and the browser's Web Crypto (for randomness) on `wasm32`
+  through `aws-lc-rs` natively; on `wasm32`, the RustCrypto `sha2`, `hmac` and `aes-gcm` crates, `subtle` for the
+  comparison and `getrandom` over the browser's Web Crypto for randomness
 
 ### engine
 

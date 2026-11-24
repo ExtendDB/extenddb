@@ -29,7 +29,7 @@ extenddb (ExtendDB) is a standalone async Rust application structured as a Cargo
 │                     Engine (async operation handlers)               │
 │  Operation dispatch · response formatting · stream record assembly  │
 ├─────────────────────────────────────────────────────────────────────┤
-│                     Core (pure sync — no async runtime)             │
+│                       Core (sync — no async runtime)                │
 │  Types · expression parsing/evaluation · validation · capacity      │
 │  error types · configurable limits                                  │
 └──────────────┬───────────────────────────────────┬──────────────────┘
@@ -53,7 +53,7 @@ extenddb/
 ├── docs/                         # Design documentation (this folder)
 │
 ├── crates/
-│   ├── core/                     # DynamoDB types, expressions, validation (pure sync, no async runtime)
+│   ├── core/                     # DynamoDB types, expressions, validation (sync, no async runtime)
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs
@@ -162,7 +162,7 @@ graph TD
     STORAGE --> CORE
 ```
 
-**Key principle:** `core` depends on nothing in the workspace and has no async runtime — it is pure sync Rust (types, expressions, validation, capacity, errors). `storage` depends only on `core`. `engine` depends on `core` + `storage` and contains the async operation handlers. Backend crates depend on `storage` + `core`. `auth` depends on `core`. `server` depends on `core` + `storage` + `auth` + `engine`. `bin` wires everything together.
+**Key principle:** `core` depends on nothing in the workspace and has no async runtime — it is sync Rust (types, expressions, validation, capacity, errors). `storage` depends only on `core`. `engine` depends on `core` + `storage` and contains the async operation handlers. Backend crates depend on `storage` + `core`. `auth` depends on `core`. `server` depends on `core` + `storage` + `auth` + `engine`. `bin` wires everything together.
 
 ## 3. Request Lifecycle
 
@@ -204,7 +204,7 @@ sequenceDiagram
 
 **Rationale:**
 - Compile-time enforcement of dependency boundaries — the storage trait crate physically cannot depend on PostgreSQL
-- `core` is pure sync Rust with no async runtime — types, expressions, validation, capacity, errors
+- `core` is sync Rust with no async runtime — types, expressions, validation, capacity, errors
 - `engine` contains async operation handlers that depend on `core` + `storage`, keeping the async boundary explicit
 - Independent testing — `cargo test -p dynamodb-core` needs no database and no async runtime
 - Faster incremental builds — changing the Postgres backend doesn't recompile the expression parser

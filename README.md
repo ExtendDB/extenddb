@@ -699,7 +699,7 @@ that target and in this workspace only `extenddb-core` selects one.
 crates/
   auth/               — SigV4 verification, IAM policy engine
   bin/                — CLI, config, daemon lifecycle
-  core/               — types, validation, expressions (pure sync Rust, no async)
+  core/               — types, validation, expressions (sync Rust, no async)
   engine/             — operation handlers
   server/             — HTTP server, management API, web console
   storage/            — storage trait definitions
