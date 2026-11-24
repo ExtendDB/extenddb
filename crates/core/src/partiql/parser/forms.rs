@@ -3,9 +3,8 @@
 
 //! Statement forms and functions beyond the base productions in the parent
 //! module: the FROM-first UPDATE, SET and REMOVE clauses in any number and
-//! order, `set_add` and `set_delete` in a SET, `EXISTS(SELECT ...)`, the
-//! operand checks on the presence functions, and a condition function
-//! compared with a boolean.
+//! order, `set_add` and `set_delete` in a SET, `EXISTS(SELECT ...)`, and a
+//! condition function compared with a boolean.
 //!
 //! Every message is the service's (measured 2026-11-02).
 
@@ -293,24 +292,6 @@ impl Parser {
             "Unsupported data type: {name} under key root at {at}"
         )))
     }
-}
-
-/// The operand checks on `attribute_exists` and `attribute_not_exists`: exactly
-/// one operand, and that operand a document path rather than a literal or a
-/// parameter (measured 2026-11-02).
-pub(super) fn check_presence_operands(name: &str, args: &[Operand]) -> PResult<()> {
-    if args.len() != 1 {
-        return Err(ParseError::new(format!(
-            "Incorrect number of operands for operator or function; operator or function: {name}, number of operands: {}",
-            args.len()
-        )));
-    }
-    if !matches!(args[0], Operand::Path(_)) {
-        return Err(ParseError::new(format!(
-            "Operator or function requires a document path; operator or function: {name}"
-        )));
-    }
-    Ok(())
 }
 
 #[cfg(test)]

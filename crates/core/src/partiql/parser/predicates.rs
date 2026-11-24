@@ -7,6 +7,7 @@
 use super::{IN_OPERANDS, IS_LEFT_SIDE, LITERAL_ROOT, Nest, PResult, ParseError, Parser};
 use crate::partiql::ast::{CompareOp, Operand, TypeName, WhereExpr};
 use crate::partiql::lexer::{TokenKind, WordClass, is_function_keyword, word_class};
+use crate::partiql::values::path_operand_refusal;
 use crate::types::AttributeValue;
 
 impl Parser {
@@ -128,6 +129,7 @@ impl Parser {
     /// other types with no filter are not measured against their left side,
     /// and keep the place of an operator, before it.
     pub(super) fn is_test(&mut self, left: Operand, left_span: &str) -> PResult<WhereExpr> {
+        let within = self.within_operator_limit();
         self.count_operator();
         let negated = self.eat_keyword("NOT");
         if negated {
@@ -143,18 +145,24 @@ impl Parser {
             return Ok(WhereExpr::Function("is".to_owned(), vec![left]));
         }
         if ty == TypeName::Missing {
-            return match left {
-                Operand::Path(path) => Ok(WhereExpr::IsMissing(path, !negated)),
-                // (measured 2026-11-02: `1 IS MISSING` and `'x' IS NOT
-                // MISSING`). Other literals are not measured.
+            if let Operand::Path(path) = left {
+                return Ok(WhereExpr::IsMissing(path, !negated));
+            }
+            // A number or a string gets the path refusal of
+            // `attribute_not_exists` (measured 2026-11-02: `1 IS MISSING` and
+            // `'x' IS NOT MISSING`); the text for other literals is not
+            // measured. Either refusal takes its place among the operand
+            // refusals (measured 2026-11-24: after `attribute_exists(1)`, `1
+            // IS MISSING` and `true IS MISSING` are refused for the call).
+            let refusal = match left {
                 Operand::Literal(AttributeValue::N(_) | AttributeValue::S(_)) => {
-                    Err(ParseError::new(
-                        "Operator or function requires a document path; operator or function: \
-                         attribute_not_exists",
-                    ))
+                    path_operand_refusal("attribute_not_exists")
                 }
-                _ => Err(ParseError::new("IS MISSING requires an attribute path")),
+                _ => "IS MISSING requires an attribute path".to_owned(),
             };
+            self.refuse_before_count(&refusal, within);
+            // It stands for the test and never runs.
+            return Ok(WhereExpr::Function("is".to_owned(), vec![left]));
         }
         if ty != TypeName::Null && ty.attribute_type().is_none() {
             let refusal = format!("{} at {left_span}", ty.unsupported_filter_message());

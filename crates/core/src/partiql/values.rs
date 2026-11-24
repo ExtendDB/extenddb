@@ -3,8 +3,9 @@
 
 //! The checks of a statement's literal values and of the calls in its SET
 //! values, made once the statement parses, the name a call is compared by
-//! ([`call_name`]) and the refusal of a call by its name ([`Call::refusal`]),
-//! which the parser also gives the calls of a WHERE condition.
+//! ([`call_name`]), the refusal of a call by its name ([`Call::refusal`]) and
+//! by its operand count ([`operand_count_refusal`]), which the parser also
+//! gives the calls of a WHERE condition.
 //!
 //! [`check_condition_values`] reads the literals of the WHERE condition and
 //! [`check_written_values`] the values an INSERT or an UPDATE writes. Each
@@ -58,7 +59,7 @@ pub const EMPTY_BAG: &str = "Empty bags are not supported";
 /// The condition functions, the only calls a WHERE condition recognizes. A
 /// SET value that calls one is refused naming it (measured 2026-11-06 for
 /// each, with any number of arguments; see [`Call::refusal`]).
-const CONDITION_FUNCTIONS: [&str; 6] = [
+pub(crate) const CONDITION_FUNCTIONS: [&str; 6] = [
     "attribute_exists",
     "attribute_not_exists",
     "attribute_type",
@@ -375,6 +376,37 @@ pub(crate) fn call_name(written: &str, quoted: bool) -> String {
     }
 }
 
+/// The name the code compares a call by (see [`call_name`]) when token `i`
+/// of `tokens` is a name, quoted or not, with `(` after it, or `None`.
+pub(crate) fn call_ahead(tokens: &[Token], i: usize) -> Option<String> {
+    let name = match tokens.get(i).map(|t| &t.kind) {
+        Some(TokenKind::Ident(word)) => call_name(word, false),
+        Some(TokenKind::QuotedIdent(word)) => call_name(word, true),
+        _ => return None,
+    };
+    (tokens.get(i + 1).map(|t| &t.kind) == Some(&TokenKind::LParen)).then_some(name)
+}
+
+/// The refusal of the operator or function `name` called with `count`
+/// operands, where it takes another number (measured 2026-11-02 for
+/// `attribute_exists`, a sign and the SET functions, and 2026-11-23 and
+/// 2026-11-24 for every condition function, quoted or not).
+pub(crate) fn operand_count_refusal(name: &str, count: usize) -> String {
+    format!(
+        "Incorrect number of operands for operator or function; operator or function: {name}, \
+         number of operands: {count}"
+    )
+}
+
+/// The refusal of the operator or function `name` whose operand is not a
+/// document path (measured 2026-11-02 for `attribute_exists`,
+/// `attribute_not_exists` and IS MISSING, 2026-11-23 for the first operand of
+/// `"If_Not_Exists"` in a SET value, and 2026-11-24 for the quoted presence
+/// functions).
+pub(crate) fn path_operand_refusal(name: &str) -> String {
+    format!("Operator or function requires a document path; operator or function: {name}")
+}
+
 impl Call {
     /// The refusal of the call by its name (see [`call_name`]), in a WHERE
     /// condition when `condition` and in a SET value otherwise, or `None`
@@ -480,19 +512,11 @@ impl SetTokens {
 /// function" at the name, and `set_add(<<>>) + 1` is refused for the empty
 /// bag). A call left open is on its own.
 pub(crate) fn whole_value_set_call(tokens: &[Token], i: usize) -> Option<SetMembersOp> {
-    let (word, quoted) = match tokens.get(i).map(|t| &t.kind) {
-        Some(TokenKind::Ident(w)) => (w, false),
-        Some(TokenKind::QuotedIdent(w)) => (w, true),
-        _ => return None,
-    };
-    let op = match call_name(word, quoted).as_str() {
+    let op = match call_ahead(tokens, i)?.as_str() {
         "set_add" => SetMembersOp::Add,
         "set_delete" => SetMembersOp::Delete,
         _ => return None,
     };
-    if tokens.get(i + 1).map(|t| &t.kind) != Some(&TokenKind::LParen) {
-        return None;
-    }
     let mut depth = 0usize;
     let close = tokens[i + 1..].iter().position(|t| {
         match t.kind {
@@ -553,17 +577,10 @@ impl SetWalk<'_> {
     fn call(&self, name: &str, args: &[Operand], occurrence: usize) -> Result<(), String> {
         if matches!(name, "if_not_exists" | "list_append") {
             if args.len() != 2 {
-                return Err(format!(
-                    "Incorrect number of operands for operator or function; operator or \
-                     function: {name}, number of operands: {}",
-                    args.len()
-                ));
+                return Err(operand_count_refusal(name, args.len()));
             }
             if name == "if_not_exists" && !matches!(args[0], Operand::Path(_)) {
-                return Err(format!(
-                    "Operator or function requires a document path; operator or function: \
-                     {name}"
-                ));
+                return Err(path_operand_refusal(name));
             }
         }
         self.tokens

@@ -16,8 +16,11 @@
 //! 5. an alias in the select list, and an UPDATE whose target is an index;
 //! 6. a LIMIT clause;
 //! 7. the first problem the walk of the WHERE condition meets (below);
-//! 8. the IN list limit and the operator count of the condition, whichever
-//!    the condition meets first;
+//! 8. the IN list limit, the operator count of the condition, the operand
+//!    count of a condition function and the path operand check of a
+//!    presence function or an IS MISSING test, whichever the condition meets
+//!    first (measured 2026-11-24 for the operand checks; see
+//!    [`Parser::refuse_before_count`]);
 //! 9. the refusals in an UPDATE's SET and REMOVE clauses and in an INSERT's
 //!    value, wherever they are written, then those after the condition.
 //!
@@ -99,9 +102,10 @@ pub(super) struct Findings {
     /// The first problem the walk of the WHERE condition has met in the part
     /// of the condition being read (see [`Parser::walk_part`]).
     walk: Option<String>,
-    /// The refusal of the first IN list with too many members, when the
-    /// condition meets it before its 301st operator.
-    in_operands: Option<String>,
+    /// The first refusal of the operands of an IN list, a condition function
+    /// or an IS MISSING test that the condition meets within its operator
+    /// limit (see [`Parser::refuse_before_count`]).
+    operands: Option<String>,
     /// The first refusal in an UPDATE's SET and REMOVE clauses or an INSERT's
     /// value.
     values: Option<String>,
@@ -284,11 +288,42 @@ impl Parser {
     }
 
     /// Note an IN list of `members` members, read with the operators counted
-    /// so far.
+    /// so far, the IN among them.
     pub(super) fn count_in_operands(&mut self, members: usize) {
-        if members > MAX_IN_OPERANDS && self.within_operator_limit() {
-            let refusal = too_many_in_operands(members);
-            keep_first(&mut self.found.in_operands, &refusal);
+        if members > MAX_IN_OPERANDS {
+            self.refuse_before_count(&too_many_in_operands(members), self.within_operator_limit());
+        }
+    }
+
+    /// Keep the refusal of the operands of an IN list (see
+    /// [`Parser::count_in_operands`]), of a condition function (see
+    /// [`Parser::check_operand_count`]) or of the operand of IS MISSING (see
+    /// [`Parser::is_test`]) among the operand refusals, `within` being
+    /// whether the condition was within its operator limit before the call
+    /// or the test was counted, or once the IN was counted. The first one
+    /// kept, or else the operator count, is reported once the condition has
+    /// been read, after what the walk meets (measured 2026-11-24: an operand
+    /// count, a literal where a path is taken, in a presence function or
+    /// before IS MISSING, an IN list of 101 members and 301 operators are
+    /// refused for the one written first; a number that breaks an item
+    /// number rule, a set with two equal members, a `+`, an AND argument
+    /// that is not a condition and an IS after a call come ahead of an
+    /// operand count or a path refusal written before them).
+    ///
+    /// The check of a call or of IS MISSING comes ahead of its own count as
+    /// an operator (measured 2026-11-24, each twice: as the 301st operator,
+    /// `attribute_exists(1)` and `1 IS MISSING` get the path refusal and
+    /// `contains(m)` the operand count, and after the 301st operator
+    /// `attribute_exists(1)` gets the operator count). The service counts
+    /// every operator once its operands are read, the IN and the operator
+    /// around a call too. This parser counts a comparison, BETWEEN, IN, AND
+    /// and OR when it reads them, so a check inside one of them at the 301st
+    /// operator gets the operator count here (measured 2026-11-24: after 300
+    /// operators, the service gives `a = attribute_exists(1)` the path
+    /// refusal and `a IN [1, ..., 101]` the IN list refusal).
+    pub(super) fn refuse_before_count(&mut self, refusal: &str, within: bool) {
+        if within {
+            keep_first(&mut self.found.operands, refusal);
         }
     }
 
@@ -359,7 +394,7 @@ impl Parser {
         }
         if reached > Part::Where && condition {
             refusal = refusal
-                .or(found.in_operands)
+                .or(found.operands)
                 .or_else(|| (!self.within_operator_limit()).then(too_many_operators));
         }
         if reached >= Part::Values {
