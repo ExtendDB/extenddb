@@ -9,10 +9,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use extenddb_storage::migrations::{
     CatalogMigrations, CatalogStatus, HasManagementStore, HeldLock, LedgerRow, Listed,
-    MigrationBackend, MigrationError, MigrationId, RunKind, RunReport, Runner, Target,
-    policy_rewrite_lines, policy_rewrite_pending,
+    LockedStores, MigrationBackend, MigrationError, MigrationId, RunKind, RunReport, Runner,
+    Target, policy_rewrite_lines, policy_rewrite_pending,
 };
 
+use super::backend::LockedCatalog;
 use super::{
     MigrationLock, SqliteMigrations, catalog_status, in_memory_refusal, lock_for_migration,
 };
@@ -130,6 +131,20 @@ impl CatalogMigrations for SqliteCatalogMigrations {
         let result = migrations.forget(id).await;
         migrations.close().await;
         result
+    }
+
+    /// The management store over the runner's one connection to the file,
+    /// opened as `migrate --yes` opens it, under the file's lock. SQLite has
+    /// no data connection string, so `data_connection` is not read.
+    async fn locked_stores(
+        &self,
+        lock: &HeldLock,
+        data_connection: Option<&str>,
+    ) -> Result<Box<dyn LockedStores>, MigrationError> {
+        let _ = data_connection;
+        let location = locked_location(lock)?;
+        let migrations = SqliteMigrations::open(location).await?;
+        Ok(Box::new(LockedCatalog::new(migrations)))
     }
 }
 

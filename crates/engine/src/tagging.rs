@@ -122,12 +122,7 @@ async fn refuse_while_deleting(
         return Ok(false);
     }
     if while_deleting == WhileDeleting::Refuse && !tag_subresource_is_stream(resource) {
-        return Err(DynamoDbError::ResourceInUseException(
-            extenddb_core::error::error_message(
-                extenddb_core::error::ErrorMessageKey::TableBeingDeleted,
-                &[table_name],
-            ),
-        ));
+        return Err(crate::create_table::table_being_deleted(table_name));
     }
     Ok(true)
 }

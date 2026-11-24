@@ -28,6 +28,10 @@ mod backup_engine;
 mod cassandra_engine;
 #[path = "direct/concurrent_account_creation.rs"]
 mod concurrent_account_creation;
+#[path = "direct/consistency_levels.rs"]
+mod consistency_levels;
+#[path = "direct/consistency_shape.rs"]
+mod consistency_shape;
 #[path = "direct/delete_item.rs"]
 mod delete_item;
 #[path = "direct/deleting_window.rs"]
@@ -62,10 +66,14 @@ mod query;
 mod roles;
 #[path = "direct/scan.rs"]
 mod scan;
+#[path = "direct/secret_rows.rs"]
+mod secret_rows;
 #[path = "direct/settings_store.rs"]
 mod settings_store;
 #[path = "direct/snapshot_engine.rs"]
 mod snapshot_engine;
+#[path = "direct/stream_at_timestamp.rs"]
+mod stream_at_timestamp;
 #[path = "direct/stream_disable.rs"]
 mod stream_disable;
 #[path = "direct/stream_endings.rs"]
