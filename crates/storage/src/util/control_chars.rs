@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Order-preserving escape for the two characters a storage engine may not be
-//! able to hold verbatim.
+//! Escape for the two characters a storage engine may not be able to hold
+//! verbatim in a document.
 //!
 //! DynamoDB accepts the character U+0000 anywhere a string appears: partition
 //! and sort keys, index keys, attribute values, map keys, attribute names. Two
-//! of the storage engines cannot store it as is. PostgreSQL `TEXT` rejects the
-//! byte (`invalid byte sequence for encoding "UTF8": 0x00`) and `jsonb` rejects
-//! the `\u0000` escape. BSON field names are C strings and end at the first NUL.
+//! of the storage engines cannot store it as is in a document. PostgreSQL
+//! `jsonb` rejects the `\u0000` escape, and BSON field names are C strings and
+//! end at the first NUL. PostgreSQL `TEXT` rejects the byte too (`invalid byte
+//! sequence for encoding "UTF8": 0x00`); the PostgreSQL key columns are not
+//! escaped, and that backend refuses a key value that holds U+0000.
 //!
 //! The escape maps each affected character to a two-character sequence that
 //! contains no NUL:
@@ -19,25 +21,16 @@
 //!
 //! Every other character passes through unchanged, so a string without either
 //! character encodes to itself and the stored form of ordinary data does not
-//! change. The mapping is applied per character and the two output sequences
-//! share the prefix U+0001, so three properties hold, each pinned by a test
-//! below:
-//!
-//! - **Round trip.** `unescape(escape(s)) == s` for every `s`.
-//! - **Byte order.** `escape(a) < escape(b)` exactly when `a < b` under UTF-8
-//!   byte comparison. PostgreSQL compares key columns under `COLLATE "C"`, so
-//!   Query ordering, `BETWEEN`, and cursor comparisons on escaped keys give the
-//!   same answers as on the originals.
-//! - **Prefix.** `escape(p)` is a prefix of `escape(s)` exactly when `p` is a
-//!   prefix of `s`, so `begins_with` on escaped values is exact.
+//! change. The mapping is applied per character, so `unescape(escape(s)) == s`
+//! for every `s` and two different strings never escape to the same text; the
+//! tests below pin both.
 //!
 //! Decoding is lenient about a U+0001 that is not followed by U+0001 or U+0002:
-//! it is returned as a literal U+0001. Rows written before this escape existed
-//! can hold such a character, and a lenient decoder reads them unchanged. A
-//! legacy string that contained U+0001 immediately followed by U+0001 or U+0002
-//! would decode differently; on PostgreSQL, catalog migration 13,
-//! `escape_control_chars`, re-encodes such rows so that case cannot arise after
-//! it has run.
+//! it is returned as a literal U+0001. A string written before this escape
+//! existed that contained U+0001 immediately followed by U+0001 or U+0002
+//! would decode differently. On PostgreSQL, catalog migration 13,
+//! `escape_control_chars`, re-encodes such documents so that case cannot arise
+//! after it has run; on MongoDB only a document marked as escaped is decoded.
 
 use std::borrow::Cow;
 
@@ -154,11 +147,7 @@ fn map_json(
         Value::Object(map) => {
             let mut out = serde_json::Map::with_capacity(map.len());
             for (k, val) in map {
-                let key = if k.bytes().any(|b| b == 0 || b == 1) {
-                    f(&k)
-                } else {
-                    k
-                };
+                let key = if needs_escape(&k) { f(&k) } else { k };
                 out.insert(key, map_json(val, values_too, f));
             }
             Value::Object(out)
@@ -233,38 +222,6 @@ mod tests {
             "x\u{1}\u{0}\u{2}y",
         ] {
             assert_eq!(unescape_control(&escape_control(s)), s, "{s:?}");
-        }
-    }
-
-    #[test]
-    fn escape_preserves_utf8_byte_order() {
-        // The whole point: PostgreSQL compares the escaped column under
-        // COLLATE "C", and every ordering answer must equal the answer on
-        // the originals.
-        let corpus = corpus(4);
-        for a in &corpus {
-            for b in &corpus {
-                let want = a.as_bytes().cmp(b.as_bytes());
-                let got = escape_control(a)
-                    .as_bytes()
-                    .cmp(escape_control(b).as_bytes());
-                assert_eq!(want, got, "a={a:?} b={b:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn escape_preserves_prefixes() {
-        // begins_with on escaped values must be exact in both directions.
-        let corpus = corpus(4);
-        for p in &corpus {
-            for s in &corpus {
-                let want = s.as_bytes().starts_with(p.as_bytes());
-                let got = escape_control(s)
-                    .as_bytes()
-                    .starts_with(escape_control(p).as_bytes());
-                assert_eq!(want, got, "p={p:?} s={s:?}");
-            }
         }
     }
 
