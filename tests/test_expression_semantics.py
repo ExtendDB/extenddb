@@ -619,7 +619,7 @@ class TestReadExpressionReferences:
         _expect(lambda: dynamodb_client.scan(TableName=empty, FilterExpression="x = :q", Segment=0),
                 F + UNDEF_VALUE.format(":q"))
         _expect(lambda: dynamodb_client.scan(TableName=empty, ProjectionExpression="#p", ExpressionAttributeValues={":u": N}),
-                "ExpressionAttributeValues can only be specified when using expressions: FilterExpression is null")
+                "ExpressionAttributeValues can only be specified when using expressions")
 
 
 class TestKeyShapeMessages:

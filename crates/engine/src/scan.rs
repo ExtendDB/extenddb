@@ -146,12 +146,13 @@ pub async fn handle_scan(
         .projection_expression
         .as_ref()
         .is_some_and(|s| !s.is_empty());
+    // No values suffix when the request's AttributeValues parse.
     extenddb_core::expression::validate_expression_param_usage(
         input.expression_attribute_names.as_ref(),
         has_proj_expr || has_filter_expr,
         input.expression_attribute_values.as_ref(),
         has_filter_expr,
-        &[ExpressionKind::Filter],
+        &[],
     )?;
 
     // ConditionalOperator requires a ScanFilter with two or more conditions.
