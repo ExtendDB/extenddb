@@ -8,8 +8,9 @@ answers do not depend on the grammar the account has. Every request here uses
 conditions both grammars accept, and the module runs under either one.
 
 Measured against the live service in eu-north-1, each request twice with
-the same answer: on 2026-11-21, and the 254, 255 and 256 byte keys and the
-empty maps against a missing table on 2026-11-23.
+the same answer: on 2026-11-21, the 254, 255 and 256 byte keys and the
+empty maps against a missing table on 2026-11-23, and a bad name ahead of a
+bad key, also in us-east-1, on 2026-11-24.
 
 The module skips when the target backend does not support vector indexes,
 unless ``EXTENDDB_EXPECT_VECTORS=1``, which makes that a failure.
@@ -154,6 +155,26 @@ class TestKeysAndNames:
             if names is not None:
                 fields["ExpressionAttributeNames"] = names
             refused(_raw(table, **fields), expected)
+
+    def test_a_bad_name_answers_ahead_of_a_bad_key(self, table):
+        """The service checks every name before any key. Measured in
+        eu-north-1 and us-east-1 on 2026-11-24."""
+        cases = [
+            ({"n": ""},
+             "ExpressionAttributeNames contains invalid value: Empty attribute name for key n"),
+            ({"n": "C" * 65536},
+             "Attribute name is too large, must be less than 65536 bytes for key n"),
+        ]
+        for names, expected in cases:
+            refused(
+                _raw(
+                    table,
+                    SearchConditionExpression="Country = :us",
+                    ExpressionAttributeNames=names,
+                    ExpressionAttributeValues=US,
+                ),
+                expected,
+            )
 
     @pytest.mark.parametrize("size", [254, 255, 256])
     def test_a_key_is_at_most_255_bytes(self, table, size):
