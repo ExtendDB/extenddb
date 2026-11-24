@@ -201,10 +201,8 @@ impl DataEngine for PostgresEngine {
         // ((hashtext(pk)::bigint & 2147483647) % total = seg), evaluated for
         // the candidate key. `key_info` is scan-shaped, so `key_schema[0]` is
         // the pk of whichever table (data or index) the scan targets, matching
-        // the `pk` column the predicate hashes, so the key text is the stored
-        // (escaped) form, as `pk_to_text` from `key_text` gives it. Bigint
-        // bitmask instead of abs() per CB-20 / SP-SCN-002 (hashtext() ==
-        // i32::MIN).
+        // the `pk` column the predicate hashes. Bigint bitmask instead of
+        // abs() per CB-20 / SP-SCN-002 (hashtext() == i32::MIN).
         let pk_name = key_info.key_schema[0].attribute_name.clone();
         let key = key.clone();
         Box::pin(async move {

@@ -5,243 +5,190 @@
 //! The shared helpers in `extenddb_storage::util` turn key attribute values into
 //! the text the SQL backends bind against `pk`, `sk_s`, `base_pk`, and the other
 //! string key columns. `PostgreSQL` `TEXT` cannot hold the byte 0x00, which
-//! DynamoDB allows anywhere in a string key, so this module wraps those helpers
-//! and passes every string component through the order-preserving escape from
-//! `extenddb_storage::util::escape_control`. Numbers and base64 binaries contain
-//! neither U+0000 nor U+0001 and are unchanged. The escape preserves byte order
-//! and prefixes, so the `COLLATE "C"` comparisons, `BETWEEN`, `begins_with`,
-//! and row-comparison cursors that run on these columns return the same rows
-//! they would on the raw text.
+//! DynamoDB allows anywhere in a string key. The key columns hold the text the
+//! shared helpers give, as every earlier release stored it, and these wrappers
+//! refuse a string key value that holds U+0000 with a `ValidationException`
+//! ([`NUL_IN_KEY`]) instead of a statement that fails. Numbers and base64
+//! binaries never hold U+0000. The item documents in `item_data` hold U+0000
+//! through the escape of `data::item_to_json`; the key columns are not escaped,
+//! so a key keeps the bytes and the length an earlier release stored for it.
 //!
 //! Every site in this crate that produces key column text imports these three
-//! functions instead of the shared ones, so the write path, the read path, index
-//! rows, cursors, and the propagation queue all agree on the stored form.
+//! functions instead of the shared ones, so a write, a read, an index row and a
+//! cursor refuse the same keys. A write also refuses an item whose key for one
+//! of the table's indexes holds U+0000 ([`refuse_nul_index_keys`]), before its
+//! first statement, because the queue writes an asynchronous index's rows after
+//! the write commits.
 
 use std::borrow::Cow;
 
-use extenddb_core::types::{AttributeValue, Item, KeySchemaElement, KeyType, ScalarAttributeType};
+use extenddb_core::types::{AttributeValue, Item, KeySchemaElement, ScalarAttributeType};
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{self, SortKeyValue, encode_netstring_composite, escape_control};
+use extenddb_storage::util::{self, SortKeyValue};
 
-/// Partition key attribute value as escaped column text.
-pub(crate) fn pk_to_text(value: &AttributeValue) -> Result<Cow<'_, str>, StorageError> {
-    Ok(match util::pk_to_text(value)? {
-        Cow::Borrowed(s) => escape_control(s),
-        Cow::Owned(s) => Cow::Owned(escape_control(&s).into_owned()),
-    })
+use super::index::{IndexMeta, item_has_index_keys};
+
+/// The answer to a key value that holds U+0000.
+pub(crate) const NUL_IN_KEY: &str = "Key attribute values cannot contain the character \
+     U+0000 on the PostgreSQL storage backend, whose text columns cannot hold the byte 0x00. \
+     Remove the character from the key value, or use another storage backend.";
+
+/// Refuse key text that holds U+0000 ([`NUL_IN_KEY`]).
+fn refuse_nul(text: &str) -> Result<(), StorageError> {
+    if text.as_bytes().contains(&0) {
+        return Err(StorageError::Validation(NUL_IN_KEY.to_owned()));
+    }
+    Ok(())
 }
 
-/// Composite partition key as escaped column text.
-///
-/// Mirrors `extenddb_storage::util::composite_pk_to_text`: a single HASH
-/// attribute is its own text, several are netstring-joined. Each part is
-/// escaped before joining, which is also what `query_scan` does when it builds
-/// the same text from a key condition, so the two agree byte for byte.
+/// Partition key attribute value as column text.
+pub(crate) fn pk_to_text(value: &AttributeValue) -> Result<Cow<'_, str>, StorageError> {
+    let text = util::pk_to_text(value)?;
+    refuse_nul(&text)?;
+    Ok(text)
+}
+
+/// Composite partition key as column text: a single HASH attribute is its own
+/// text, several are netstring-joined (`extenddb_storage::util::composite_pk_to_text`).
+/// The join holds U+0000 exactly when a part does.
 pub(crate) fn composite_pk_to_text(
     item: &Item,
     key_schema: &[KeySchemaElement],
 ) -> Result<String, StorageError> {
-    let hash_elements: Vec<_> = key_schema
-        .iter()
-        .filter(|ks| ks.key_type == KeyType::Hash)
-        .collect();
-    if hash_elements.len() == 1 {
-        let val = item
-            .get(&hash_elements[0].attribute_name)
-            .ok_or_else(|| StorageError::Internal("missing partition key".to_owned()))?;
-        return Ok(pk_to_text(val)?.into_owned());
-    }
-    let mut parts = Vec::with_capacity(hash_elements.len());
-    for ks in &hash_elements {
-        let val = item.get(&ks.attribute_name).ok_or_else(|| {
-            StorageError::Internal(format!(
-                "missing partition key attribute {}",
-                ks.attribute_name
-            ))
-        })?;
-        parts.push(util::pk_to_text(val)?);
-    }
-    Ok(join_escaped_parts(&parts))
+    let text = util::composite_pk_to_text(item, key_schema)?;
+    refuse_nul(&text)?;
+    Ok(text)
 }
 
-/// The stored text of a composite partition key whose parts, as
-/// `extenddb_storage::util::pk_to_text` renders each HASH attribute, are
-/// `raw_parts`: each part escaped, then netstring-joined. The netstring length
-/// is that of the escaped part.
-///
-/// [`composite_pk_to_text`] builds every composite key column through this
-/// function, and catalog migration 13, `escape_control_chars`, rebuilds legacy
-/// composite key columns through it ([`reescape_legacy_composite`]).
-pub(crate) fn join_escaped_parts<S: AsRef<str>>(raw_parts: &[S]) -> String {
-    let parts: Vec<String> = raw_parts
-        .iter()
-        .map(|p| escape_control(p.as_ref()).into_owned())
-        .collect();
-    encode_netstring_composite(&parts)
-}
-
-/// Split a netstring-joined composite key (`<len>:<text>,` per part, `len`
-/// the part's length in bytes) into its parts. `None` when `text` is not a
-/// sequence of well-formed netstrings.
-pub(crate) fn split_netstring_composite(text: &str) -> Option<Vec<&str>> {
-    let mut parts = Vec::new();
-    let mut rest = text;
-    while !rest.is_empty() {
-        let colon = rest.find(':')?;
-        let digits = &rest[..colon];
-        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        let len: usize = digits.parse().ok()?;
-        let start = colon + 1;
-        let end = start.checked_add(len)?;
-        let part = rest.get(start..end)?;
-        if rest.as_bytes().get(end) != Some(&b',') {
-            return None;
-        }
-        parts.push(part);
-        rest = &rest[end + 1..];
-    }
-    (!parts.is_empty()).then_some(parts)
-}
-
-/// The stored form of a composite key column that a build without the escape
-/// wrote: its netstring parts hold raw text, so each is escaped and the parts
-/// are joined again with the new lengths, as [`composite_pk_to_text`] writes the
-/// same key. Escaping the whole text instead would leave every length prefix
-/// counting the raw part. `None` when `legacy` is not a netstring.
-pub(crate) fn reescape_legacy_composite(legacy: &str) -> Option<String> {
-    split_netstring_composite(legacy).map(|parts| join_escaped_parts(&parts))
-}
-
-/// Sort key attribute value as a typed bind value, string keys escaped.
+/// Sort key attribute value as a typed bind value.
 pub(crate) fn parse_sk(
     value: &AttributeValue,
     sk_type: ScalarAttributeType,
 ) -> Result<SortKeyValue, StorageError> {
-    Ok(match util::parse_sk(value, sk_type)? {
-        SortKeyValue::S(s) => SortKeyValue::S(escape_control(&s).into_owned()),
-        other => other,
-    })
+    let sk = util::parse_sk(value, sk_type)?;
+    if let SortKeyValue::S(s) = &sk {
+        refuse_nul(s)?;
+    }
+    Ok(sk)
+}
+
+/// Whether one of the attributes of `key_schema` that `item` holds is a string
+/// with U+0000.
+pub(crate) fn holds_nul_key(item: &Item, key_schema: &[KeySchemaElement]) -> bool {
+    key_schema.iter().any(
+        |ks| matches!(item.get(&ks.attribute_name), Some(AttributeValue::S(s)) if s.contains('\0')),
+    )
+}
+
+/// Refuse `item` when its key under `key_schema` holds U+0000, with the error
+/// the key text functions return.
+pub(crate) fn refuse_nul_key(
+    item: &Item,
+    key_schema: &[KeySchemaElement],
+) -> Result<(), StorageError> {
+    if holds_nul_key(item, key_schema) {
+        return Err(StorageError::Validation(NUL_IN_KEY.to_owned()));
+    }
+    Ok(())
+}
+
+/// Refuse a written item that holds every key attribute of one of `indexes`
+/// and whose key for that index holds U+0000. An index row that the queue or
+/// a backfill writes later leaves such an item out (`gsi_build::indexable`),
+/// as it leaves out an item written before the index existed.
+pub(crate) fn refuse_nul_index_keys(
+    item: &Item,
+    indexes: &[IndexMeta],
+) -> Result<(), StorageError> {
+    for idx in indexes {
+        if item_has_index_keys(item, &idx.key_schema) {
+            refuse_nul_key(item, &idx.key_schema)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use extenddb_core::types::KeyType;
+
     use super::*;
 
-    fn ks(name: &str) -> KeySchemaElement {
+    fn ks(name: &str, key_type: KeyType) -> KeySchemaElement {
         KeySchemaElement {
             attribute_name: name.to_owned(),
-            key_type: KeyType::Hash,
+            key_type,
         }
     }
 
+    fn refused<T>(result: Result<T, StorageError>) -> String {
+        match result {
+            Err(StorageError::Validation(message)) => message,
+            Err(other) => panic!("expected the refusal, got {other:?}"),
+            Ok(_) => panic!("expected the refusal, got a key text"),
+        }
+    }
+
+    const MESSAGE: &str = "Key attribute values cannot contain the character U+0000 on the \
+         PostgreSQL storage backend, whose text columns cannot hold the byte 0x00. Remove the \
+         character from the key value, or use another storage backend.";
+
     #[test]
-    fn string_keys_are_escaped_and_other_types_are_not() {
+    fn a_string_key_with_u0000_is_refused() {
         assert_eq!(
-            pk_to_text(&AttributeValue::S("a\u{0}b".into())).unwrap(),
-            "a\u{1}\u{1}b"
+            refused(pk_to_text(&AttributeValue::S("a\u{0}b".into()))),
+            MESSAGE
         );
         assert_eq!(
-            pk_to_text(&AttributeValue::S("plain".into())).unwrap(),
-            "plain"
+            refused(parse_sk(
+                &AttributeValue::S("\u{0}".into()),
+                ScalarAttributeType::S
+            )),
+            MESSAGE
         );
-        assert_eq!(
-            pk_to_text(&AttributeValue::N("12.5".into())).unwrap(),
-            "12.5"
-        );
-        assert_eq!(
-            pk_to_text(&AttributeValue::B(vec![0, 1, 2])).unwrap(),
-            util::pk_to_text(&AttributeValue::B(vec![0, 1, 2])).unwrap()
-        );
+        let mut item = Item::new();
+        item.insert("h1".to_owned(), AttributeValue::S("a".into()));
+        item.insert("h2".to_owned(), AttributeValue::S("b\u{0}".into()));
+        let schema = [ks("h1", KeyType::Hash), ks("h2", KeyType::Hash)];
+        assert_eq!(refused(composite_pk_to_text(&item, &schema)), MESSAGE);
+        assert_eq!(refused(refuse_nul_key(&item, &schema)), MESSAGE);
+        assert_eq!(refused(composite_pk_to_text(&item, &schema[1..])), MESSAGE);
+    }
+
+    #[test]
+    fn other_keys_keep_the_text_of_the_shared_helpers() {
+        // U+0001 is stored as it is, as every earlier release stored it.
+        for value in [
+            AttributeValue::S("a\u{1}\u{2}b".into()),
+            AttributeValue::S("plain".into()),
+            AttributeValue::N("12.5".into()),
+            AttributeValue::B(vec![0, 1, 2]),
+        ] {
+            assert_eq!(
+                pk_to_text(&value).unwrap(),
+                util::pk_to_text(&value).unwrap(),
+                "{value:?}"
+            );
+        }
         match parse_sk(&AttributeValue::S("\u{1}".into()), ScalarAttributeType::S).unwrap() {
-            SortKeyValue::S(s) => assert_eq!(s, "\u{1}\u{2}"),
+            SortKeyValue::S(s) => assert_eq!(s, "\u{1}"),
             _ => panic!("string sort key"),
         }
         match parse_sk(&AttributeValue::B(vec![0]), ScalarAttributeType::B).unwrap() {
             SortKeyValue::B(b) => assert_eq!(b, vec![0]),
             _ => panic!("binary sort key"),
         }
-    }
-
-    #[test]
-    fn composite_text_escapes_each_part_before_joining() {
-        let mut item = Item::new();
-        item.insert("h1".to_owned(), AttributeValue::S("a\u{0}".into()));
-        item.insert("h2".to_owned(), AttributeValue::S("b".into()));
-        let text = composite_pk_to_text(&item, &[ks("h1"), ks("h2")]).unwrap();
-        // The escaped part is three bytes, and the netstring length says so.
-        assert_eq!(text, "3:a\u{1}\u{1},1:b,");
-        assert!(!text.contains('\u{0}'));
-        // Single hash attribute: the escaped value itself.
-        let text = composite_pk_to_text(&item, &[ks("h1")]).unwrap();
-        assert_eq!(text, "a\u{1}\u{1}");
-    }
-
-    #[test]
-    fn netstring_split_inverts_the_join() {
-        let cases: [&[&str]; 5] = [
-            &["a", "b"],
-            &["", "x"],
-            &["1:a,", ",:", "z"],
-            &["a\u{1}\u{2}", "\u{e9}t\u{e9}", "12"],
-            &["only"],
-        ];
-        for parts in cases {
-            let owned: Vec<String> = parts.iter().map(|p| (*p).to_owned()).collect();
-            let joined = encode_netstring_composite(&owned);
-            assert_eq!(
-                split_netstring_composite(&joined).as_deref(),
-                Some(parts),
-                "{joined:?}"
-            );
-        }
-        for bad in [
-            "",
-            "a",
-            "1:ab,",
-            "2:a,",
-            "x:ab,",
-            "+1:a,",
-            "1:a",
-            "1:a,2",
-            "1:\u{e9},",
-        ] {
-            assert_eq!(split_netstring_composite(bad), None, "{bad:?}");
-        }
-    }
-
-    #[test]
-    fn a_legacy_composite_key_is_rebuilt_as_the_write_path_builds_it() {
-        // The case from the review: a raw U+0001 in the first of two HASH
-        // parts. Escaping the whole text would give 2:a\x01\x02,1:b, with a
-        // length prefix that no longer matches its part.
-        let legacy = "2:a\u{1},1:b,";
-        let rebuilt = reescape_legacy_composite(legacy).expect("a netstring");
-        assert_eq!(rebuilt, "3:a\u{1}\u{2},1:b,");
-
         let mut item = Item::new();
         item.insert("h1".to_owned(), AttributeValue::S("a\u{1}".into()));
         item.insert("h2".to_owned(), AttributeValue::S("b".into()));
+        item.insert("v".to_owned(), AttributeValue::S("\u{0}".into()));
+        let schema = [ks("h1", KeyType::Hash), ks("h2", KeyType::Hash)];
         assert_eq!(
-            composite_pk_to_text(&item, &[ks("h1"), ks("h2")]).unwrap(),
-            rebuilt
+            composite_pk_to_text(&item, &schema).unwrap(),
+            "2:a\u{1},1:b,"
         );
-
-        // Parts without U+0001 keep their text and their lengths.
-        assert_eq!(
-            reescape_legacy_composite("1:x,2:yz,").as_deref(),
-            Some("1:x,2:yz,")
-        );
-        assert_eq!(reescape_legacy_composite("a\u{1}b"), None);
-    }
-
-    #[test]
-    fn stored_text_never_contains_nul() {
-        for raw in ["\u{0}", "a\u{0}b", "\u{0}\u{1}\u{2}", "x\u{1}\u{1}y"] {
-            let av = AttributeValue::S(raw.into());
-            let text = pk_to_text(&av).unwrap();
-            assert!(!text.contains('\u{0}'), "{raw:?} -> {text:?}");
-        }
+        // A U+0000 outside the key does not concern the key.
+        assert!(refuse_nul_key(&item, &schema).is_ok());
+        assert!(refuse_nul_key(&item, &[ks("v", KeyType::Range)]).is_err());
     }
 }

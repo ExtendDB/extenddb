@@ -23,8 +23,8 @@ pub enum SortKeyValue {
 /// For multi-attribute keys, uses netstring encoding: each part is encoded as
 /// `<decimal-length>:<value>,` and concatenated. This is collision-free
 /// regardless of value content. The parts are the raw attribute strings; a
-/// backend whose columns cannot hold every character (PostgreSQL, see
-/// `escape_control`) escapes its key text in its own wrapper.
+/// backend whose columns cannot hold every character (PostgreSQL text cannot
+/// hold U+0000) refuses such a key in its own wrapper.
 pub fn composite_pk_to_text(
     item: &Item,
     key_schema: &[KeySchemaElement],

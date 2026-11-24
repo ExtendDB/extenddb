@@ -135,10 +135,13 @@ pub(crate) async fn run(s: &Scratch) -> Result<Vec<String>, MigrationError> {
     run_pool(&s.db).await
 }
 
-/// Seed a data table, an index table, `gsi_pending`, `stream_records`,
-/// `stream_pending` and `backup_items` with three row kinds: raw U+0001 in
-/// key columns and inside jsonb strings and object keys, the literal
-/// six-character text backslash-u-0001 inside a jsonb string, and plain rows.
+/// Seed a data table, an index table, a vector index table, `gsi_pending`,
+/// `stream_records`, `stream_pending` and `backup_items` with three row
+/// kinds: raw U+0001 in key columns and inside jsonb strings and object keys,
+/// the literal six-character text backslash-u-0001 inside a jsonb string, and
+/// plain rows. The catalog also lists a `DELETING` table `t2`, whose physical
+/// table holds a raw U+0001 row, with an index, and a table `t3` with no
+/// physical table.
 pub(crate) async fn seed(db: &PgPool) {
     let ks = json!([
         {"AttributeName": "pk", "KeyType": "HASH"},
@@ -175,6 +178,42 @@ pub(crate) async fn seed(db: &PgPool) {
     .execute(db)
     .await
     .expect("seed the indexes row");
+    for (table_id, status) in [("t2", "DELETING"), ("t3", "ACTIVE")] {
+        sqlx::query(
+            "INSERT INTO tables (account_id, table_name, key_schema, attribute_definitions, \
+             table_status, table_arn, table_id) VALUES ($1, $2, $3, $4, $5, $6, $2)",
+        )
+        .bind("111122223333")
+        .bind(table_id)
+        .bind(&ks)
+        .bind(&ad)
+        .bind(status)
+        .bind(format!(
+            "arn:aws:dynamodb:us-east-1:111122223333:table/{table_id}"
+        ))
+        .execute(db)
+        .await
+        .expect("seed a tables row");
+    }
+    sqlx::query(
+        "INSERT INTO indexes (table_id, index_id, index_name, index_type, key_schema, \
+         projection) VALUES ('t2', 'i2', 'gsi2', 'GSI', $1, $2)",
+    )
+    .bind(json!([{"AttributeName": "gpk", "KeyType": "HASH"}]))
+    .bind(json!({"ProjectionType": "ALL"}))
+    .execute(db)
+    .await
+    .expect("seed the index row of the deleting table");
+    sqlx::query(
+        "INSERT INTO vector_indexes (table_id, index_id, index_name, dimensions, \
+         distance_function, vector_attribute, projection) \
+         VALUES ('t1', 'v1', 'vec1', 2, 'COSINE', $1, $2)",
+    )
+    .bind(json!({"AttributeName": "emb"}))
+    .bind(json!({"ProjectionType": "ALL"}))
+    .execute(db)
+    .await
+    .expect("seed the vector_indexes row");
 
     sqlx::raw_sql(
         r#"CREATE TABLE "_ddb_t1" (
@@ -196,11 +235,32 @@ pub(crate) async fn seed(db: &PgPool) {
             base_sk_b BYTEA,
             item_data JSONB NOT NULL,
             PRIMARY KEY (pk, base_pk, base_sk_s)
+        );
+        CREATE TABLE "_ddb_t2" (
+            pk TEXT COLLATE "C" NOT NULL PRIMARY KEY,
+            item_data JSONB NOT NULL
+        );
+        CREATE TABLE "_ddb_vec_v1" (
+            base_pk TEXT COLLATE "C" NOT NULL PRIMARY KEY,
+            item_data JSONB NOT NULL
         );"#,
     )
     .execute(db)
     .await
-    .expect("create the physical data and index tables");
+    .expect("create the physical data, index and vector index tables");
+    for (table, key_column, pk) in [
+        ("_ddb_t2", "pk", "d\u{1}"),
+        ("_ddb_vec_v1", "base_pk", "a\u{1}b"),
+    ] {
+        sqlx::query(&format!(
+            "INSERT INTO \"{table}\" ({key_column}, item_data) VALUES ($1, $2)"
+        ))
+        .bind(pk)
+        .bind(json!({"pk": {"S": pk}, "k\u{1}": {"S": "v\u{1}"}}))
+        .execute(db)
+        .await
+        .expect("seed a row of the deleting table or of the vector index table");
+    }
 
     for (pk, sk, item) in [
         (
@@ -335,18 +395,25 @@ async fn reencodes_legacy_rows() {
     assert_eq!(
         notes,
         vec![
-            "backup_items: 3 row update(s)",
-            "_ddb_t1 (table \"t\" of account 111122223333): 3 row update(s)",
-            "_ddb_i1 (index \"gsi1\" of table \"t\" of account 111122223333): 5 row update(s)",
+            "backup_items: 1 row update(s)",
+            "table \"t2\" of account 111122223333: skipped, the table is being deleted",
+            "table \"t3\" of account 111122223333: skipped, its physical table _ddb_t3 does not \
+             exist",
+            "index \"gsi2\" of table \"t2\" of account 111122223333: skipped, the table is being \
+             deleted",
+            "_ddb_t1 (table \"t\" of account 111122223333): 1 row update(s)",
+            "_ddb_i1 (index \"gsi1\" of table \"t\" of account 111122223333): 1 row update(s)",
+            "_ddb_vec_v1 (vector index \"vec1\" of table \"t\" of account 111122223333): 1 row \
+             update(s)",
             "gsi_pending: 1 row update(s)",
             "stream_records: 1 row update(s)",
             "stream_pending: 1 row update(s)",
         ]
     );
 
-    // Data table: raw U+0001 became U+0001 U+0002 in the key columns and
-    // inside every jsonb string and object key; the literal-backslash row
-    // and the plain row are byte-identical.
+    // Data table: raw U+0001 became U+0001 U+0002 inside every jsonb string
+    // and object key, and the key columns keep their text; the
+    // literal-backslash row and the plain row are byte-identical.
     let rows: Vec<(String, String, serde_json::Value)> =
         sqlx::query_as("SELECT pk, sk_s, item_data FROM \"_ddb_t1\" ORDER BY pk")
             .fetch_all(&s.db)
@@ -356,8 +423,8 @@ async fn reencodes_legacy_rows() {
         rows,
         vec![
             (
-                "a\u{1}\u{2}b".to_owned(),
-                "s\u{1}\u{2}".to_owned(),
+                "a\u{1}b".to_owned(),
+                "s\u{1}".to_owned(),
                 json!({"pk": {"S": "a\u{1}\u{2}b"}, "k\u{1}\u{2}": {"S": "v\u{1}\u{2}"}}),
             ),
             (
@@ -373,7 +440,8 @@ async fn reencodes_legacy_rows() {
         ]
     );
 
-    // Index table: pk, sk_s, base_pk, base_sk_s and item_data all re-encoded.
+    // Index table: item_data re-encoded, pk, sk_s, base_pk and base_sk_s as
+    // they were.
     let rows: Vec<(String, String, String, String, serde_json::Value)> = sqlx::query_as(
         "SELECT pk, sk_s, base_pk, base_sk_s, item_data FROM \"_ddb_i1\" ORDER BY pk",
     )
@@ -384,10 +452,10 @@ async fn reencodes_legacy_rows() {
         rows,
         vec![
             (
-                "g\u{1}\u{2}".to_owned(),
-                "gs\u{1}\u{2}".to_owned(),
-                "a\u{1}\u{2}b".to_owned(),
-                "s\u{1}\u{2}".to_owned(),
+                "g\u{1}".to_owned(),
+                "gs\u{1}".to_owned(),
+                "a\u{1}b".to_owned(),
+                "s\u{1}".to_owned(),
                 json!({"gpk": {"S": "g\u{1}\u{2}"}}),
             ),
             (
@@ -399,6 +467,29 @@ async fn reencodes_legacy_rows() {
             ),
         ]
     );
+
+    // The vector index table is re-encoded; the deleting table is not.
+    for (table, key_column, pk, item) in [
+        (
+            "_ddb_vec_v1",
+            "base_pk",
+            "a\u{1}b",
+            json!({"pk": {"S": "a\u{1}\u{2}b"}, "k\u{1}\u{2}": {"S": "v\u{1}\u{2}"}}),
+        ),
+        (
+            "_ddb_t2",
+            "pk",
+            "d\u{1}",
+            json!({"pk": {"S": "d\u{1}"}, "k\u{1}": {"S": "v\u{1}"}}),
+        ),
+    ] {
+        let rows: Vec<(String, serde_json::Value)> =
+            sqlx::query_as(&format!("SELECT {key_column}, item_data FROM \"{table}\""))
+                .fetch_all(&s.db)
+                .await
+                .expect("read a vector index or deleting table");
+        assert_eq!(rows, vec![(pk.to_owned(), item)], "{table}");
+    }
 
     // gsi_pending: NULL old_item stays NULL, the raw row's item image is
     // re-encoded, and its index context is left as it is: migration 11
@@ -452,7 +543,8 @@ async fn reencodes_legacy_rows() {
         ]
     );
 
-    // backup_items, including the NULL sk row.
+    // backup_items, including the NULL sk row: item_data re-encoded, pk and
+    // sk as they were.
     let rows: Vec<(String, Option<String>, serde_json::Value)> =
         sqlx::query_as("SELECT pk, sk, item_data FROM backup_items ORDER BY pk")
             .fetch_all(&s.db)
@@ -462,8 +554,8 @@ async fn reencodes_legacy_rows() {
         rows,
         vec![
             (
-                "p\u{1}\u{2}".to_owned(),
-                Some("s\u{1}\u{2}".to_owned()),
+                "p\u{1}".to_owned(),
+                Some("s\u{1}".to_owned()),
                 json!({"pk": {"S": "p\u{1}\u{2}"}}),
             ),
             ("plain".to_owned(), None, json!({"pk": {"S": "plain"}}),),
@@ -512,8 +604,8 @@ async fn reencodes_jsonb_rows_with_standard_conforming_strings_off() {
             .fetch_one(&s.db)
             .await
             .unwrap();
-    assert_eq!(pk, "a\u{1}\u{2}b");
-    assert_eq!(sk, "s\u{1}\u{2}");
+    assert_eq!(pk, "a\u{1}b");
+    assert_eq!(sk, "s\u{1}");
     assert_eq!(
         item,
         json!({"pk": {"S": "a\u{1}\u{2}b"}, "k\u{1}\u{2}": {"S": "v\u{1}\u{2}"}}),

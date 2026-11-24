@@ -282,12 +282,15 @@ fn params(start: usize, n: usize) -> String {
 }
 
 /// Whether an item belongs in the index: every key attribute present, of the
-/// declared type, and not empty.
+/// declared type, and not empty, and no string key holding U+0000, which the
+/// key columns cannot hold.
 ///
 /// An item that fails is left out of the index rather than failing the build or
 /// stalling a queue partition. It can only be an item written before the index
 /// existed, or by a writer that had not yet seen the index's attribute
-/// definitions; the service skips such items in a backfill too.
+/// definitions; the service skips such items in a backfill too. A write that
+/// sees the index refuses an item whose key for it holds U+0000
+/// (`key_text::refuse_nul_index_keys`).
 pub(crate) fn indexable(
     item: &Item,
     index_ks: &[KeySchemaElement],
@@ -302,7 +305,9 @@ pub(crate) fn indexable(
             .find(|ad| ad.attribute_name == ks.attribute_name)
             .map(|ad| ad.attribute_type);
         match (declared, value) {
-            (Some(ScalarAttributeType::S), AttributeValue::S(s)) => !s.is_empty(),
+            (Some(ScalarAttributeType::S), AttributeValue::S(s)) => {
+                !s.is_empty() && !s.contains('\0')
+            }
             (Some(ScalarAttributeType::N), AttributeValue::N(n)) => {
                 n.parse::<sqlx::types::BigDecimal>().is_ok()
             }
@@ -1430,6 +1435,13 @@ mod tests {
         assert!(indexable(&item, &index_ks, &defs));
         item.insert("g".into(), AttributeValue::S(String::new()));
         assert!(!indexable(&item, &index_ks, &defs), "empty string key");
+        item.insert("g".into(), AttributeValue::S("a\u{0}".into()));
+        assert!(
+            !indexable(&item, &index_ks, &defs),
+            "U+0000 in a string key"
+        );
+        item.insert("g".into(), AttributeValue::S("a\u{1}".into()));
+        assert!(indexable(&item, &index_ks, &defs), "U+0001 in a string key");
     }
 
     #[test]

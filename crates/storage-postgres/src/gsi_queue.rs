@@ -159,31 +159,13 @@ const PG_UNDEFINED_TABLE: &str = "SQLSTATE 42P01";
 /// order. A local
 /// hash (not `std`'s, which is not guaranteed stable across builds) keeps the
 /// mapping fixed for a given key forever.
-pub(crate) fn partition_for(base_pk_text: &str) -> i32 {
+fn partition_for(base_pk_text: &str) -> i32 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
     for byte in base_pk_text.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
     }
     (hash % NUM_WORKERS) as i32
-}
-
-/// The `worker_partition` of a queued row: the partition of its base key,
-/// which `new_item` carries for puts and updates and `old_item` for deletes
-/// (the base key is immutable over an item's lifetime). The key text is the
-/// stored (escaped) form, so a key holding U+0001 hashes differently from the
-/// raw text a build without the escape hashed; catalog migration 13,
-/// `escape_control_chars`, recomputes the column of such rows through this
-/// function.
-pub(crate) fn worker_partition(
-    old_item: Option<&Item>,
-    new_item: Option<&Item>,
-    context: &PendingApplyContext,
-) -> Result<i32, StorageError> {
-    Ok(match new_item.or(old_item) {
-        Some(item) => partition_for(&composite_pk_to_text(item, context.base_key_schema())?),
-        None => 0,
-    })
 }
 
 /// Check if a `StorageError` is caused by an undefined table (SQLSTATE 42P01).
@@ -348,7 +330,14 @@ pub(crate) async fn enqueue_gsi_pending(
     // catalog documents it was read from (`catalog_json`); the item images
     // are stored in the form of `item_data` (`item_to_json`).
     let context_json = to_catalog_json(context)?;
-    let worker_partition = worker_partition(old_item, new_item, context)?;
+
+    // Route all updates for a given base item to one worker.
+    // The base key is immutable over an item's lifetime; `new_item` carries it
+    // for puts/updates, `old_item` for deletes.
+    let worker_partition = match new_item.or(old_item) {
+        Some(item) => partition_for(&composite_pk_to_text(item, context.base_key_schema())?),
+        None => 0,
+    };
 
     let delay_interval = jitter_delay_ms(delay_ms) as f64 / 1000.0;
     sqlx::query(

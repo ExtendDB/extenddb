@@ -10,7 +10,7 @@ use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{sk_column, sk_info};
 
-use super::key_text::{parse_sk, pk_to_text};
+use super::key_text::{parse_sk, pk_to_text, refuse_nul_index_keys};
 
 use super::gsi_build::fix_up_stale_write;
 use super::index::{enqueue_async_indexes, fetch_write_path_indexes, sync_indexes};
@@ -230,6 +230,7 @@ impl PostgresEngine {
                     validation::SecondaryIndexEmptyContext::UpdateExpression,
                 )
                 .map_err(|e| StorageError::Validation(e.to_string()))?;
+                refuse_nul_index_keys(&item, &indexes)?;
             }
 
             // REMOVE and DELETE on a key that holds no row change nothing: the

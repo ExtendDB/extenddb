@@ -704,10 +704,6 @@ pub async fn apply_all_migrations(
 #[cfg(test)]
 mod m0013_guard_tests;
 #[cfg(test)]
-mod m0013_keys_tests;
-#[cfg(test)]
-mod m0013_order_tests;
-#[cfg(test)]
 mod m0013_tests;
 #[cfg(test)]
 mod tests;

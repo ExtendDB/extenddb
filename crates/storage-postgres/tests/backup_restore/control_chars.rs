@@ -18,13 +18,17 @@ async fn stored_rows(s: &Scratch, physical_id: &str) -> Vec<String> {
     .expect("read stored rows")
 }
 
-/// Items holding U+0000 and U+0001 in key values, index key values, nested
-/// values, and attribute names are stored through the control-character
-/// escape. The legacy reader decodes the backup's items, and a restore
+/// Items holding U+0001 in key values and index key values, and U+0000 and
+/// U+0001 in nested values and attribute names: the documents are stored
+/// through the control-character escape, and the key columns hold the key
+/// text as it is. The legacy reader decodes the backup's items, and a restore
 /// copies `backup_items` text into the target as it is and derives the key
 /// columns and index rows from it, so those must come out in the same stored
-/// form as the source's (escaped once, not twice), and the restored items
-/// must read back equal to what was written.
+/// form as the source's (documents escaped once, not twice), and the restored
+/// items must read back equal to what was written. One item, stored as a
+/// write before the GSI existed would store it, holds U+0000 in the GSI's key
+/// `g`, which the key columns cannot hold: the source's index has no row for
+/// it, and the restore leaves it out of the index too.
 #[tokio::test]
 async fn restore_keeps_control_characters_in_keys_indexes_and_items() {
     if base_conn().is_none() {
@@ -53,17 +57,17 @@ async fn restore_keeps_control_characters_in_keys_indexes_and_items() {
         .await
         .expect("describe the source");
     let src_key_info = key_info("nul_src", &src, &src_desc);
-    let items: Vec<Item> = [
+    let mut items: Vec<Item> = [
         serde_json::json!({
-            "pk": {"S": "p\u{0}a"}, "sk": {"N": "1"},
-            "g": {"S": "g\u{0}\u{1}"}, "l": {"S": "l\u{1}\u{1}x"},
+            "pk": {"S": "p\u{1}a"}, "sk": {"N": "1"},
+            "g": {"S": "g\u{1}\u{2}"}, "l": {"S": "l\u{1}\u{1}x"},
             "n\u{0}ame": {"S": "v\u{0}"},
             "m": {"M": {"k\u{1}": {"S": "\u{0}"}, "plain": {"N": "2"}}},
             "list": {"L": [{"S": "\u{1}\u{2}"}, {"SS": ["a\u{0}", "b"]}]}
         }),
         serde_json::json!({
-            "pk": {"S": "p\u{0}a"}, "sk": {"N": "2"},
-            "g": {"S": "g\u{0}\u{1}"}, "l": {"S": "l\u{0}"}
+            "pk": {"S": "p\u{1}a"}, "sk": {"N": "2"},
+            "g": {"S": "g\u{1}\u{2}"}, "l": {"S": "l\u{1}"}, "v": {"S": "\u{0}"}
         }),
         serde_json::json!({"pk": {"S": "\u{1}"}, "sk": {"N": "3"}, "l": {"S": "\u{1}\u{2}"}}),
         serde_json::json!({"pk": {"S": "plain"}, "sk": {"N": "4"}, "g": {"S": "g"}}),
@@ -84,6 +88,21 @@ async fn restore_keeps_control_characters_in_keys_indexes_and_items() {
             .await
             .expect("put");
     }
+
+    let nul_in_gsi_key: Item = serde_json::from_value(serde_json::json!({
+        "pk": {"S": "nul"}, "sk": {"N": "5"}, "g": {"S": "g\u{0}"}
+    }))
+    .expect("item");
+    sqlx::query(&format!(
+        "INSERT INTO \"_ddb_{src}\" (pk, sk_n, item_data) VALUES ('nul', 5, $1)"
+    ))
+    .bind(extenddb_storage::util::escape_json_strings(
+        serde_json::to_value(&nul_in_gsi_key).expect("item json"),
+    ))
+    .execute(&s.db)
+    .await
+    .expect("store the item as a write before the GSI would");
+    items.push(nul_in_gsi_key);
 
     let backup = s
         .engine
@@ -115,7 +134,8 @@ async fn restore_keeps_control_characters_in_keys_indexes_and_items() {
     assert_eq!(table_status(&s, "nul_dst").await.as_deref(), Some("ACTIVE"));
 
     // The base table and each index table hold the same stored rows as the
-    // source's, so every key column and document was escaped exactly once.
+    // source's, so every key column kept its text and every document was
+    // escaped exactly once.
     assert_eq!(
         stored_rows(&s, &desc.table_id).await,
         stored_rows(&s, &src).await

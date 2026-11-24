@@ -106,6 +106,23 @@ impl HasManagementStore for PostgresStores {
     }
 }
 
+#[cfg(test)]
+impl PostgresStores {
+    /// The stores of a run over `catalog` and `data`, which look for other
+    /// sessions, for a test that calls a body's `detect`.
+    pub(crate) fn for_detect(catalog: PgPool, data: PgPool) -> Self {
+        Self {
+            management: PostgresCatalogStore::new(catalog.clone()),
+            catalog,
+            data,
+            data_watch: None,
+            lock: None,
+            application: runner_application(),
+            checks_sessions: true,
+        }
+    }
+}
+
 /// The catalog's stores under a held migration lock, for `encryption-key
 /// switch`, `rotate` and `reset` (RFC-0000 section 8, common rules): the
 /// management store over the runner's catalog connection, holding no key.

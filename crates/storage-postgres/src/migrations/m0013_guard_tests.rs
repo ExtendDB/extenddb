@@ -6,11 +6,13 @@
 //! of `m0013_tests`. That the runner stops on a `detect` item before its first
 //! write is checked over two databases in `tests/migrations_golden.rs`.
 
+use extenddb_storage::migrations::CodeBody;
 use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
+use super::PostgresStores;
 use super::m0013_escape_control_chars::{
-    IGNORE_CONNECTIONS_ENV, catalog_has_rows, data_has_rows, other_sessions,
+    EscapeBackupItems, IGNORE_CONNECTIONS_ENV, catalog_has_rows, data_has_rows, other_sessions,
 };
 use super::m0013_tests::{base_conn, scratch, seed, skip, test_application};
 
@@ -206,5 +208,62 @@ async fn only_a_store_with_rows_is_checked() {
     seed(&s.db).await;
     assert!(catalog_has_rows(&s.db).await.unwrap());
     assert!(data_has_rows(&s.db, &s.db).await.unwrap());
+    s.cleanup().await;
+}
+
+/// The catalog body's `detect` stops a run while another session holds the
+/// catalog database and `backup_items` holds a row, with one item that names
+/// the session; with no backup item, or once the session is gone, it finds
+/// nothing.
+#[tokio::test]
+async fn the_catalog_body_stops_a_run_while_another_session_holds_the_catalog() {
+    if base_conn().is_none() {
+        skip("the_catalog_body_stops_a_run_while_another_session_holds_the_catalog");
+        return;
+    }
+    let s = scratch().await;
+    let base = base_conn().unwrap();
+    let stores = PostgresStores::for_detect(s.db.clone(), s.db.clone());
+    let client = unnamed(&base, &s.db_name).await;
+    let client_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&client)
+        .await
+        .unwrap();
+    assert_eq!(
+        EscapeBackupItems.detect(&stores).await.unwrap(),
+        Vec::<String>::new(),
+        "backup_items is empty"
+    );
+
+    seed(&s.db).await;
+    let (user, addr): (String, Option<String>) = sqlx::query_as(
+        "SELECT usename::text, client_addr::text FROM pg_stat_activity WHERE pid = $1",
+    )
+    .bind(client_pid)
+    .fetch_one(&s.db)
+    .await
+    .unwrap();
+    let want = format!(
+        "1 other session(s) hold the catalog database {}: {user} from {} (no application \
+         name). Migration 13 rewrites stored strings and runs with every ExtendDB server \
+         stopped and every other session on the database closed, because a server still \
+         writing would leave rows in the earlier encoding. Stop them and run `extenddb \
+         migrate --yes` again. If the only other sessions are idle connections a connection \
+         pooler holds, set EXTENDDB_MIGRATE_IGNORE_CONNECTIONS=1 to skip this check",
+        s.db_name,
+        addr.as_deref().unwrap_or("no client address shown"),
+    );
+    assert_eq!(EscapeBackupItems.detect(&stores).await.unwrap(), vec![want]);
+
+    client.close().await;
+    let mut items = EscapeBackupItems.detect(&stores).await.unwrap();
+    for _ in 0..50 {
+        if items.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        items = EscapeBackupItems.detect(&stores).await.unwrap();
+    }
+    assert_eq!(items, Vec::<String>::new(), "the session closed");
     s.cleanup().await;
 }

@@ -449,7 +449,8 @@ async fn rows_of(pool: &PgPool, table: &str, label: &str, key: [&str; 2]) -> Vec
 /// Migration 13 on the 0.1.14 fixture, migrated through 12, whose strings an
 /// earlier release stored with a raw U+0001: in the key columns of
 /// `seed_tbl`'s table, GSI and LSI, in their documents, and in the backup's
-/// `backup_items`.
+/// `backup_items`. The documents are re-encoded, and the key columns keep
+/// their text.
 #[tokio::test]
 async fn migration_13_escapes_the_strings_an_earlier_release_stored() {
     let Some(base) = base_conn() else {
@@ -535,6 +536,69 @@ async fn ledger_rows_of_13(pool: &PgPool) -> i64 {
         .fetch_one(pool)
         .await
         .unwrap()
+}
+
+/// A partition key of 2046 bytes, within the service's 2048, made of letters
+/// from a fixed pseudo-random sequence with U+0001 after every second one
+/// (682 of them), which an earlier release stores in `pk` as it is. Migration
+/// 13 applies in both stores and leaves the key's 2046 bytes as they were;
+/// escaping the key column would make it 2728 bytes, over PostgreSQL's btree
+/// entry limit of 2704.
+#[tokio::test]
+async fn migration_13_applies_over_a_long_key_holding_u0001() {
+    let Some(base) = base_conn() else {
+        return skip("migration 13 long key");
+    };
+    let mut state: u32 = 0x2545_f491;
+    let mut key = String::new();
+    for i in 0..1364 {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        key.push(char::from(b'a' + (state % 26) as u8));
+        if i % 2 == 1 {
+            key.push('\u{1}');
+        }
+    }
+    assert_eq!((key.len(), key.matches('\u{1}').count()), (2046, 682));
+    let s = Scratch::new(&base, "pgm_g13k").await;
+    s.load("0.1.14").await;
+    s.migrate_through(MigrationId::UniqueAccessKeyIds).await;
+    let catalog = s.catalog().await;
+    let data = s.data().await;
+    let (table, _) = seed_tbl_tables(&catalog).await.remove(0);
+    let item = serde_json::json!({"pk": {"S": key}, "sk": {"S": "long"}});
+    sqlx::query(&format!(
+        "INSERT INTO \"{table}\" (pk, sk_s, item_data) VALUES ($1, 'long', $2)"
+    ))
+    .bind(&key)
+    .bind(&item)
+    .execute(&data)
+    .await
+    .expect("main stores the key");
+    catalog.close().await;
+    data.close().await;
+
+    s.migrate_through(MigrationId::EscapeControlChars).await;
+    assert_eq!(s.status().await, CatalogStatus::Current { version: LATEST });
+    let catalog = s.catalog().await;
+    let data = s.data().await;
+    assert_eq!(ledger_rows_of_13(&catalog).await, 1, "catalog ledger");
+    assert_eq!(ledger_rows_of_13(&data).await, 1, "data ledger");
+    let (pk, stored): (String, serde_json::Value) = sqlx::query_as(&format!(
+        "SELECT pk, item_data FROM \"{table}\" WHERE sk_s = 'long'"
+    ))
+    .fetch_one(&data)
+    .await
+    .unwrap();
+    assert_eq!(pk, key);
+    let escaped = key.replace('\u{1}', "\u{1}\u{2}");
+    assert_eq!(
+        stored,
+        serde_json::json!({"pk": {"S": escaped}, "sk": {"S": "long"}})
+    );
+    catalog.close().await;
+    data.close().await;
 }
 
 /// While another session holds the data database of a store with tables,

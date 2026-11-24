@@ -1,25 +1,26 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Migration 13, `escape_control_chars`, PostgreSQL: re-encode the rows an
-//! earlier release wrote, whose strings are stored raw.
+//! Migration 13, `escape_control_chars`, PostgreSQL: re-encode the item
+//! documents an earlier release wrote, whose strings are stored raw.
 //!
-//! This release stores every string through the order-preserving escape in
-//! `extenddb_storage::util::escape_control` (U+0000 as U+0001 U+0001, U+0001
-//! as U+0001 U+0002), so that U+0000, which DynamoDB accepts anywhere a string
-//! appears, can be held in `TEXT` and `jsonb` columns. A row an earlier
-//! release wrote holds its strings raw, and a raw U+0001 followed by U+0001 or
-//! U+0002 reads back differently under the decoder (a lone U+0001 reads back
-//! unchanged). Earlier releases could not store U+0000, so for their rows the
-//! escape of the stored text is the re-encode, and a row without U+0001
-//! encodes to itself and is left alone.
+//! This release stores every string of an item document (names, map keys,
+//! values) through an escape (U+0000 as U+0001 U+0001, U+0001 as U+0001
+//! U+0002), so that U+0000, which DynamoDB accepts anywhere a string appears,
+//! can be held in `jsonb`. A document an earlier release wrote holds its
+//! strings raw, and a raw U+0001 followed by U+0001 or U+0002 reads back
+//! differently under the decoder (a lone U+0001 reads back unchanged).
+//! Earlier releases could not store U+0000, so for their documents the escape
+//! of the stored text is the re-encode, and a document without U+0001 is left
+//! alone. The key columns (`pk`, `sk_s`, `base_pk` and the others) are not
+//! rewritten: this release stores a key as earlier releases stored it, and
+//! refuses a key value that holds U+0000 (`data::key_text`).
 //!
-//! Two bodies, one per database. The catalog body rewrites `backup_items`,
-//! which lives in the catalog database; the data body rewrites every data
-//! table, index table and vector index table (the text key columns and
-//! `item_data`), the item images of `gsi_pending` (`old_item`, `new_item`)
-//! and the stream records of `stream_records` and `stream_pending`, and
-//! recomputes `gsi_pending.worker_partition` for the rows it changes.
+//! Two bodies, one per database. The catalog body rewrites
+//! `backup_items.item_data`, which lives in the catalog database; the data
+//! body rewrites `item_data` of every data table, index table and vector
+//! index table, the item images of `gsi_pending` (`old_item`, `new_item`) and
+//! the stream records of `stream_records` and `stream_pending`.
 //! `gsi_pending.index_context` is not rewritten: catalog migration 11,
 //! `attribute_name_escape`, applies the same escape to it once. Tables are
 //! listed from the catalog rows; a row whose table is `DELETING`, or whose
@@ -37,18 +38,21 @@
 //! status read does not look for sessions, so the preview runs beside a
 //! server as for every other migration.
 //!
-//! The key text and document rewrites call the write path's escape and key
-//! text functions (`escape_control`, `escape_json_strings`,
-//! `key_text::reescape_legacy_composite`, `gsi_queue::worker_partition`), so
-//! a migrated row is the row this release writes for the same item.
+//! No index entry and no constraint covers the strings of a document, so a
+//! rewrite fails only when the database does, for example on a lost
+//! connection or a full disk. The catalog body commits before the data body
+//! runs. A data body that fails leaves the catalog store at migration 13 and
+//! the data store behind it; neither a server of this release nor one of an
+//! earlier release starts against the deployment until `extenddb migrate
+//! --yes` runs the data body again.
 //!
-//! This module's checksum covers `mod.rs`, `keys.rs`, `order.rs` and
+//! The rewrite escapes through this module's own copy of the escape
+//! ([`escape`]). This module's checksum covers `mod.rs`, `escape.rs` and
 //! `guard.rs`, and is pinned once the migration is released. They are
 //! excluded from rustfmt and clippy so neither can require an edit.
 
+mod escape;
 mod guard;
-mod keys;
-mod order;
 
 use async_trait::async_trait;
 use extenddb_storage::migrations::{CodeBody, Done, MigrationError};
@@ -59,19 +63,19 @@ use super::PostgresStores;
 pub(crate) use guard::other_sessions;
 #[cfg(test)]
 pub(crate) use guard::{IGNORE_CONNECTIONS_ENV, catalog_has_rows, data_has_rows};
-pub(crate) use keys::{BACKUP_ITEMS_COMPOSITE_ROWS, has_composite_partition_key};
-pub(crate) use order::{BATCH, rewrite_longest_first, with_detail};
 
 /// The text of every file of this module, whose SHA-256 the checksum test pins.
 pub(crate) const SOURCE: &str = concat!(
     include_str!("mod.rs"),
-    include_str!("keys.rs"),
-    include_str!("order.rs"),
+    include_str!("escape.rs"),
     include_str!("guard.rs"),
 );
 
 /// Recorded as this migration's checksum. Changes only with a new migration.
 const FINGERPRINT: &str = "0013_escape_control_chars/postgres/1";
+
+/// Rows read per round trip.
+const BATCH: usize = 500;
 
 /// The catalog body: `backup_items`.
 pub(crate) struct EscapeBackupItems;
@@ -130,11 +134,11 @@ impl CodeBody<PostgresStores> for EscapeDataRows {
     }
 }
 
-/// A failed statement as a migration error: `what`, the database's message
-/// with its DETAIL ([`with_detail`]), and the SQLSTATE, which the runner reads
-/// to run the body again after a lock timeout.
+/// A failed statement as a migration error: `what`, the database's message,
+/// and the SQLSTATE, which the runner reads to run the body again after a
+/// lock timeout.
 pub(crate) fn db_error(what: &str, e: &sqlx::Error) -> MigrationError {
-    let message = format!("{what}: {}", with_detail(e));
+    let message = format!("{what}: {e}");
     match e.as_database_error().and_then(|d| d.code()) {
         Some(code) => MigrationError::Database {
             message,
@@ -144,31 +148,17 @@ pub(crate) fn db_error(what: &str, e: &sqlx::Error) -> MigrationError {
     }
 }
 
-/// One physical table's rewrite: its text key columns, and the jsonb columns
-/// whose rows are re-encoded one by one.
+/// One physical table's rewrite: the jsonb columns that hold its item
+/// documents.
 struct EscapeWork {
     /// Bare (unquoted) table name, e.g. `_ddb_<id>` or `gsi_pending`.
     table: String,
-    text_columns: Vec<TextKeyColumn>,
-    jsonb_columns: Vec<String>,
-    /// `gsi_pending` only: recompute `worker_partition` after the re-encode
-    /// ([`keys::recompute_worker_partitions`]).
-    recompute_worker_partition: bool,
-    /// The DynamoDB table (and index) the physical table holds, for errors
-    /// and notes.
+    columns: Vec<String>,
+    /// The DynamoDB table (and index) the physical table holds, for notes.
     ddb_name: Option<String>,
 }
 
 impl EscapeWork {
-    /// `<table>.<col>`, with the DynamoDB name when known: how errors name a
-    /// column.
-    fn column(&self, col: &str) -> String {
-        match &self.ddb_name {
-            Some(ddb) => format!("{}.{col} ({ddb})", self.table),
-            None => format!("{}.{col}", self.table),
-        }
-    }
-
     /// `<table>`, with the DynamoDB name when known: how notes name a table.
     fn label(&self) -> String {
         match &self.ddb_name {
@@ -178,120 +168,50 @@ impl EscapeWork {
     }
 }
 
-/// A text key column and the rows of it that hold a composite partition key.
-struct TextKeyColumn {
-    name: String,
-    /// SQL boolean expression over the row, true where the column holds the
-    /// netstring join of several HASH attributes. Those rows are rebuilt one
-    /// by one ([`keys::rebuild_composite_rows`]); the others hold one
-    /// attribute's text and get the single-statement SQL replace.
-    composite_rows: String,
-}
-
-impl TextKeyColumn {
-    fn new(name: String, composite: bool) -> Self {
-        let composite_rows = if composite { "TRUE" } else { "FALSE" }.to_owned();
-        Self {
-            name,
-            composite_rows,
-        }
-    }
-}
-
-/// The columns of `table` in the public schema of type `data_type` among
-/// `names` (or, for `None`, the key columns `pk`, `base_pk`, `sk*_s` and
-/// `base_sk*_s`), in column order.
-async fn columns(
+/// The jsonb columns of `table` in the public schema among `names`, in column
+/// order; none when the table does not exist.
+async fn jsonb_columns(
     conn: &mut PgConnection,
     table: &str,
-    data_type: &str,
-    names: Option<&[&str]>,
+    names: &[&str],
 ) -> Result<Vec<String>, MigrationError> {
-    let names: Option<Vec<String>> = names.map(|n| n.iter().map(|c| (*c).to_owned()).collect());
+    let names: Vec<String> = names.iter().map(|c| (*c).to_owned()).collect();
     sqlx::query_scalar(
         "SELECT column_name::text FROM information_schema.columns \
-         WHERE table_schema = 'public' AND table_name = $1 AND data_type = $2 \
-           AND CASE WHEN $3::text[] IS NULL \
-               THEN column_name IN ('pk', 'base_pk') OR column_name::text ~ '^(base_)?sk[0-9]*_s$' \
-               ELSE column_name::text = ANY($3) END \
+         WHERE table_schema = 'public' AND table_name = $1 AND data_type = 'jsonb' \
+           AND column_name::text = ANY($2) \
          ORDER BY ordinal_position",
     )
     .bind(table)
-    .bind(data_type)
     .bind(names)
     .fetch_all(&mut *conn)
     .await
-    .map_err(|e| db_error(&format!("list the {data_type} columns of {table}"), &e))
+    .map_err(|e| db_error(&format!("list the jsonb columns of {table}"), &e))
 }
 
-/// The rewrite of a `_ddb_*` table, whose columns are read from
-/// `information_schema.columns` so that exactly the sort key columns this
-/// table has (`sk_s`, `sk<N>_s`, `base_sk<N>_s`, ...) are covered. `None`
-/// when the physical table does not exist. `composite` names the columns
-/// whose key schema has more than one HASH attribute, so they hold a
-/// netstring join on every row.
-async fn dynamic_table_work(
-    conn: &mut PgConnection,
-    table: String,
-    composite: &[&str],
-) -> Result<Option<EscapeWork>, MigrationError> {
-    let text_columns = columns(conn, &table, "text", None).await?;
-    let jsonb_columns = columns(conn, &table, "jsonb", Some(&["item_data"])).await?;
-    if text_columns.is_empty() && jsonb_columns.is_empty() {
-        return Ok(None);
-    }
-    let text_columns = text_columns
-        .into_iter()
-        .map(|name| {
-            let composite = composite.contains(&name.as_str());
-            TextKeyColumn::new(name, composite)
-        })
-        .collect();
-    Ok(Some(EscapeWork {
-        table,
-        text_columns,
-        jsonb_columns,
-        recompute_worker_partition: false,
-        ddb_name: None,
-    }))
-}
-
-/// The rewrite of a fixed-name table, with the candidate columns filtered
-/// through `information_schema.columns`. `None` when the table is absent.
-async fn fixed_table_work(
+/// The rewrite of `table`'s columns among `names`, or `None` when the table
+/// has none of them.
+async fn table_work(
     conn: &mut PgConnection,
     table: &str,
-    text: &[&str],
-    jsonb: &[&str],
+    names: &[&str],
+    ddb_name: Option<String>,
 ) -> Result<Option<EscapeWork>, MigrationError> {
-    let text_columns = if text.is_empty() {
-        Vec::new()
-    } else {
-        columns(conn, table, "text", Some(text)).await?
-    };
-    let jsonb_columns = columns(conn, table, "jsonb", Some(jsonb)).await?;
-    if text_columns.is_empty() && jsonb_columns.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(EscapeWork {
+    let columns = jsonb_columns(conn, table, names).await?;
+    Ok((!columns.is_empty()).then(|| EscapeWork {
         table: table.to_owned(),
-        text_columns: text_columns
-            .into_iter()
-            .map(|name| TextKeyColumn::new(name, false))
-            .collect(),
-        jsonb_columns,
-        recompute_worker_partition: false,
-        ddb_name: None,
+        columns,
+        ddb_name,
     }))
 }
 
 /// The re-encoded form of a stored jsonb value, or `None` when re-encoding
-/// does not change it. `escape_json_strings` only changes strings and object
-/// keys containing U+0000 or U+0001, so a plain document and a document whose
+/// does not change it. The escape only changes strings and object keys
+/// containing U+0000 or U+0001, so a plain document and a document whose
 /// strings hold the literal six-character text backslash-u-0001 both come
 /// back equal and are skipped.
 pub(crate) fn reencoded_json(value: &serde_json::Value) -> Option<serde_json::Value> {
-    let escaped = extenddb_storage::util::escape_json_strings(value.clone());
+    let escaped = escape::escape_document(value.clone());
     (escaped != *value).then_some(escaped)
 }
 
@@ -350,74 +270,6 @@ async fn escape_jsonb_rows(
     Ok(changed)
 }
 
-/// Rewrite one table; returns the number of row updates.
-async fn escape_rows_in_table(
-    conn: &mut PgConnection,
-    work: &EscapeWork,
-) -> Result<u64, MigrationError> {
-    let quoted = format!("\"{}\"", work.table);
-    let mut rewritten: u64 = 0;
-
-    // Key text columns holding one attribute's text: TEXT has no escaping
-    // layer, so a single SQL statement per column is exact. NULL columns never
-    // match (position() is NULL). The statement can fail on the primary key
-    // when two legacy keys differ only by a U+0002 after a U+0001, depending
-    // on the order it meets them (`order`); it runs under a savepoint, and on
-    // a unique violation the column is rewritten again row by row, longest
-    // legacy text first. Rows holding a composite key are rebuilt part by
-    // part instead; the other columns of the row keep the replace().
-    for col in &work.text_columns {
-        let TextKeyColumn {
-            name,
-            composite_rows,
-        } = col;
-        let what = work.column(name);
-        let single_rows = format!("NOT ({composite_rows})");
-        let sql = format!(
-            "UPDATE {quoted} SET \"{name}\" = replace(\"{name}\", chr(1), chr(1) || chr(2)) \
-             WHERE position(chr(1) IN \"{name}\") > 0 AND {single_rows}"
-        );
-        sqlx::query("SAVEPOINT escape_column")
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| db_error(&format!("savepoint before {what}"), &e))?;
-        match sqlx::query(&sql).execute(&mut *conn).await {
-            Ok(done) => {
-                sqlx::query("RELEASE SAVEPOINT escape_column")
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(|e| db_error(&format!("release the savepoint of {what}"), &e))?;
-                rewritten += done.rows_affected();
-            }
-            Err(e) if crate::pg_util::is_unique_violation(&e) => {
-                sqlx::query("ROLLBACK TO SAVEPOINT escape_column")
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(|e| db_error(&format!("roll back {what}"), &e))?;
-                // Legacy text holds no U+0000, so the escape is the replace()
-                // above.
-                rewritten += rewrite_longest_first(conn, &quoted, name, &single_rows, &what, |legacy| {
-                    Ok(extenddb_storage::util::escape_control(legacy).into_owned())
-                })
-                .await?;
-            }
-            Err(e) => return Err(db_error(&format!("re-encode {what}"), &e)),
-        }
-        if composite_rows != "FALSE" {
-            rewritten +=
-                keys::rebuild_composite_rows(conn, &quoted, name, composite_rows, &what).await?;
-        }
-    }
-
-    for col in &work.jsonb_columns {
-        rewritten += escape_jsonb_rows(conn, &quoted, col).await?;
-    }
-    if work.recompute_worker_partition {
-        rewritten += keys::recompute_worker_partitions(conn).await?;
-    }
-    Ok(rewritten)
-}
-
 /// Rewrite every table of `work` in order; one note per table with a change.
 async fn escape_all(
     conn: &mut PgConnection,
@@ -425,7 +277,11 @@ async fn escape_all(
     notes: &mut Vec<String>,
 ) -> Result<(), MigrationError> {
     for w in work {
-        let rewritten = escape_rows_in_table(conn, w).await?;
+        let quoted = format!("\"{}\"", w.table);
+        let mut rewritten: u64 = 0;
+        for col in &w.columns {
+            rewritten += escape_jsonb_rows(conn, &quoted, col).await?;
+        }
         if rewritten > 0 {
             notes.push(format!("{}: {rewritten} row update(s)", w.label()));
         }
@@ -434,31 +290,19 @@ async fn escape_all(
 }
 
 /// The catalog body on `conn`, the catalog database in the runner's
-/// transaction. `backup_items.pk` is the data table's `pk` as the backup
-/// copied it, so a backup of a table with several HASH attributes holds a
-/// netstring join there.
+/// transaction.
 pub(crate) async fn escape_catalog(conn: &mut PgConnection) -> Result<Vec<String>, MigrationError> {
     let mut notes = Vec::new();
-    let mut work = Vec::new();
-    if let Some(mut w) = fixed_table_work(conn, "backup_items", &["pk", "sk"], &["item_data"]).await? {
-        for col in &mut w.text_columns {
-            if col.name == "pk" {
-                col.composite_rows = BACKUP_ITEMS_COMPOSITE_ROWS.to_owned();
-            }
-        }
-        work.push(w);
-    }
+    let work: Vec<EscapeWork> = table_work(conn, "backup_items", &["item_data"], None)
+        .await?
+        .into_iter()
+        .collect();
     escape_all(conn, &work, &mut notes).await?;
     Ok(notes)
 }
 
 /// The data body on `conn`, the data database in the runner's transaction,
 /// with the tables listed from `catalog`.
-///
-/// A partition key column whose key schema has more than one HASH attribute
-/// holds a netstring join (`key_text::composite_pk_to_text`): `pk` of a table
-/// or index with such a key schema, and `base_pk` of the index and vector
-/// tables of a table with one.
 pub(crate) async fn escape_data(
     catalog: &PgPool,
     conn: &mut PgConnection,
@@ -466,9 +310,8 @@ pub(crate) async fn escape_data(
     let mut notes = Vec::new();
     let mut work: Vec<EscapeWork> = Vec::new();
 
-    type TableRow = (String, String, String, String, serde_json::Value);
-    let tables: Vec<TableRow> = sqlx::query_as(
-        "SELECT table_id, table_name, account_id, table_status, key_schema FROM tables \
+    let tables: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT table_id, table_name, account_id, table_status FROM tables \
          ORDER BY table_id COLLATE \"C\"",
     )
     .fetch_all(catalog)
@@ -476,18 +319,13 @@ pub(crate) async fn escape_data(
     .map_err(|e| db_error("list tables", &e))?;
     let deleting: std::collections::HashSet<&str> = tables
         .iter()
-        .filter(|(_, _, _, status, _)| status == "DELETING")
-        .map(|(id, _, _, _, _)| id.as_str())
+        .filter(|(_, _, _, status)| status == "DELETING")
+        .map(|(id, _, _, _)| id.as_str())
         .collect();
-    let composite_tables: std::collections::HashSet<&str> = tables
-        .iter()
-        .filter(|(_, _, _, _, ks)| has_composite_partition_key(ks))
-        .map(|(id, _, _, _, _)| id.as_str())
-        .collect();
-    // How errors and notes name the DynamoDB table of a physical table.
+    // How notes name the DynamoDB table of a physical table.
     let ddb_tables: std::collections::HashMap<&str, String> = tables
         .iter()
-        .map(|(id, name, account, _, _)| (id.as_str(), format!("table {name:?} of account {account}")))
+        .map(|(id, name, account, _)| (id.as_str(), format!("table {name:?} of account {account}")))
         .collect();
     let ddb_table = |table_id: &str| {
         ddb_tables
@@ -495,51 +333,26 @@ pub(crate) async fn escape_data(
             .cloned()
             .unwrap_or_else(|| format!("table id {table_id}"))
     };
-    let skip = |label: String, physical: &str, notes: &mut Vec<String>, table_id: &str| {
-        if deleting.contains(table_id) {
-            notes.push(format!("{label}: skipped, the table is being deleted"));
-        } else {
-            notes.push(format!("{label}: skipped, its physical table {physical} does not exist"));
-        }
-    };
 
-    for (id, _, _, _, ks) in &tables {
-        let label = ddb_table(id);
-        let physical = format!("_ddb_{id}");
-        let cols: &[&str] = if has_composite_partition_key(ks) { &["pk"] } else { &[] };
-        match dynamic_table_work(conn, physical.clone(), cols).await? {
-            Some(mut w) if !deleting.contains(id.as_str()) => {
-                w.ddb_name = Some(label);
-                work.push(w);
-            }
-            _ => skip(label, &physical, &mut notes, id),
-        }
-    }
-    let indexes: Vec<(String, String, String, serde_json::Value)> = sqlx::query_as(
-        "SELECT index_id, table_id, index_name, key_schema FROM indexes \
-         ORDER BY index_id COLLATE \"C\"",
+    // Every physical table the catalog lists: (physical name, the id of its
+    // DynamoDB table, how notes name it).
+    let mut physical: Vec<(String, String, String)> = tables
+        .iter()
+        .map(|(id, _, _, _)| (format!("_ddb_{id}"), id.clone(), ddb_table(id)))
+        .collect();
+    let indexes: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT index_id, table_id, index_name FROM indexes ORDER BY index_id COLLATE \"C\"",
     )
     .fetch_all(catalog)
     .await
     .map_err(|e| db_error("list indexes", &e))?;
-    for (id, table_id, name, ks) in &indexes {
-        let label = format!("index {name:?} of {}", ddb_table(table_id));
-        let physical = format!("_ddb_{id}");
-        let mut cols: Vec<&str> = Vec::new();
-        if has_composite_partition_key(ks) {
-            cols.push("pk");
-        }
-        if composite_tables.contains(table_id.as_str()) {
-            cols.push("base_pk");
-        }
-        match dynamic_table_work(conn, physical.clone(), &cols).await? {
-            Some(mut w) if !deleting.contains(table_id.as_str()) => {
-                w.ddb_name = Some(label);
-                work.push(w);
-            }
-            _ => skip(label, &physical, &mut notes, table_id),
-        }
-    }
+    physical.extend(indexes.iter().map(|(id, table_id, name)| {
+        (
+            format!("_ddb_{id}"),
+            table_id.clone(),
+            format!("index {name:?} of {}", ddb_table(table_id)),
+        )
+    }));
     let vectors: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT index_id, table_id, index_name FROM vector_indexes \
          ORDER BY index_id COLLATE \"C\"",
@@ -547,40 +360,38 @@ pub(crate) async fn escape_data(
     .fetch_all(catalog)
     .await
     .map_err(|e| db_error("list vector indexes", &e))?;
-    for (id, table_id, name) in &vectors {
-        let label = format!("vector index {name:?} of {}", ddb_table(table_id));
-        let physical = format!("_ddb_vec_{id}");
-        let cols: &[&str] = if composite_tables.contains(table_id.as_str()) {
-            &["base_pk"]
-        } else {
-            &[]
-        };
-        match dynamic_table_work(conn, physical.clone(), cols).await? {
-            Some(mut w) if !deleting.contains(table_id.as_str()) => {
-                w.ddb_name = Some(label);
-                work.push(w);
-            }
-            _ => skip(label, &physical, &mut notes, table_id),
+    physical.extend(vectors.iter().map(|(id, table_id, name)| {
+        (
+            format!("_ddb_vec_{id}"),
+            table_id.clone(),
+            format!("vector index {name:?} of {}", ddb_table(table_id)),
+        )
+    }));
+
+    for (table, table_id, label) in physical {
+        if deleting.contains(table_id.as_str()) {
+            notes.push(format!("{label}: skipped, the table is being deleted"));
+            continue;
+        }
+        match table_work(conn, &table, &["item_data"], Some(label.clone())).await? {
+            Some(w) => work.push(w),
+            None => notes.push(format!("{label}: skipped, its physical table {table} does not exist")),
         }
     }
 
     // Fixed tables holding item documents. `gsi_pending.index_context` is a
     // catalog document, which migration 11 escaped once with the same
     // mapping; escaping it again would read a U+0001 back as U+0001 U+0002.
-    if let Some(mut w) =
-        fixed_table_work(conn, "gsi_pending", &[], &["old_item", "new_item"]).await?
-    {
-        w.recompute_worker_partition = true;
-        work.push(w);
-    }
     // A stream record waits in `stream_pending` until the numbering moves it
     // to `stream_records` (migration 7), so both hold item documents.
     // `record_bytes`, the numbering's estimate of a batch's size, keeps the
     // length the write sent.
-    for table in ["stream_records", "stream_pending"] {
-        if let Some(w) = fixed_table_work(conn, table, &[], &["record_data"]).await? {
-            work.push(w);
-        }
+    for (table, columns) in [
+        ("gsi_pending", &["old_item", "new_item"][..]),
+        ("stream_records", &["record_data"][..]),
+        ("stream_pending", &["record_data"][..]),
+    ] {
+        work.extend(table_work(conn, table, columns, None).await?);
     }
 
     escape_all(conn, &work, &mut notes).await?;

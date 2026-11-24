@@ -39,7 +39,7 @@ use futures::future::BoxFuture;
 use crate::PostgresEngine;
 use crate::catalog_json::{escape_json, from_catalog_json, to_catalog_json, unescape_json};
 use crate::create_table::{RestoreRegistration, RestoreSource};
-use crate::data::key_text::{composite_pk_to_text, parse_sk};
+use crate::data::key_text::{composite_pk_to_text, holds_nul_key, parse_sk};
 use crate::data::{
     all_sort_key_info, data_table_name, index_table_name, insert_index_rows_multi,
     item_has_index_keys, json_to_item, project_item_for_index, table_storage_relations,
@@ -242,9 +242,13 @@ pub(crate) async fn insert_restore_rows(
 
     for idx in indexes {
         let idx_sks = all_sort_key_info(&idx.key_schema, attribute_definitions);
+        // An item whose key for the index holds U+0000 is left out of it, as
+        // the backfill leaves it out (`gsi_build::indexable`).
         let projected: Vec<(&Item, Item)> = batch
             .iter()
-            .filter(|(item, _)| item_has_index_keys(item, &idx.key_schema))
+            .filter(|(item, _)| {
+                item_has_index_keys(item, &idx.key_schema) && !holds_nul_key(item, &idx.key_schema)
+            })
             .map(|(item, _)| {
                 (
                     item,
