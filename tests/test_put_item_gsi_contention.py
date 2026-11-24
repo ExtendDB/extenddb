@@ -148,9 +148,9 @@ def test_unconditional_puts_on_one_key_of_a_gsi_table_commit_or_are_shed(
     # is under, so the count is reported and bounded: a shed put is the only
     # failure a caller can get, and at least nine in ten of the puts commit.
     # A server that gives up after 50 attempts, the budget the other retry
-    # loops keep, shed about a quarter of the puts of this shape in two runs
-    # at a load average of 14 to 20, and fails the second check; a server
-    # that gives up at the first conflict sheds nearly every put.
+    # loops keep, shed 431 and 444 of the 2,016 puts in two runs at a load
+    # average of 17 to 19, and fails the second check; a server that gives up
+    # at the first conflict sheds nearly every put.
     print(f"{len(failures)} of {total} puts were shed, {committed} committed")
     assert set(failures) <= {SHED}, (
         f"{len(failures)} of {total} puts failed with something other than a shed put: "
