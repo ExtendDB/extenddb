@@ -3575,6 +3575,23 @@
       ]
     },
     {
+      "name": "table names: UpdateContinuousBackups enabling recovery with a TableName outside the pattern answers the refusal",
+      "op": "UpdateContinuousBackups",
+      "body": {
+        "TableName": "bad name!",
+        "PointInTimeRecoverySpecification": {
+          "PointInTimeRecoveryEnabled": true
+        }
+      },
+      "error": "ContinuousBackupsUnavailableException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Point-in-time recovery is not supported by this storage backend"
+        }
+      ]
+    },
+    {
       "name": "table names: DescribeLimits with a TableName outside the pattern answers its limits",
       "op": "DescribeLimits",
       "body": {
@@ -3934,6 +3951,23 @@
         {
           "path": "/message",
           "contains": "Value null at 'pointInTimeRecoverySpecification' failed to satisfy constraint: Member must not be null"
+        }
+      ]
+    },
+    {
+      "name": "table ARNs: UpdateContinuousBackups enabling recovery with a TableName that is not a table ARN answers the refusal",
+      "op": "UpdateContinuousBackups",
+      "body": {
+        "TableName": "arn:bogus",
+        "PointInTimeRecoverySpecification": {
+          "PointInTimeRecoveryEnabled": true
+        }
+      },
+      "error": "ContinuousBackupsUnavailableException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "Point-in-time recovery is not supported by this storage backend"
         }
       ]
     },
