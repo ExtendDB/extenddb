@@ -31,8 +31,8 @@
 //!
 //! The management stores (users, access keys, policies, groups, roles,
 //! accounts, admin, settings, metrics) write through the separate catalog
-//! pool in `lib.rs`, which for a file-backed database opens the same file;
-//! the server wiring shares this same lock instance into
+//! pool in `server_backend.rs`, which for a file-backed database opens the
+//! same file; the server wiring there shares this same lock instance into
 //! `SqliteCatalogStore`, so those writers queue with the engine's. The
 //! credential store only reads. The one deliberate exclusion from the lock,
 //! so the invariant stays auditable, is init-time bootstrap (in this file and
@@ -43,6 +43,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use extenddb_storage::error::StorageError;
+use extenddb_storage::management_store::SettingsStore as _;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tokio::sync::Mutex;
@@ -245,8 +246,24 @@ impl SqliteEngine {
     }
 
     /// Handle to the control-plane notifier, for the background poller.
+    // Read by the control-plane worker, which the browser build does not run.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn control_plane_notify(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.control_plane_notify)
+    }
+
+    /// Insert the account `account_id` under the name `default`, unless it
+    /// exists. The server's bootstrap ([`Self::bootstrap_dev_rows`]) and the
+    /// embedded in-memory engine ([`Self::new_in_memory`]) both register their
+    /// account through this one statement.
+    async fn insert_default_account(&self, account_id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO accounts (account_id, account_name) VALUES (?, 'default')",
+        )
+        .bind(account_id)
+        .execute(&self.pool)
+        .await
+        .map(drop)
     }
 
     /// Write the rows a server needs that `init` writes on a production
@@ -259,6 +276,8 @@ impl SqliteEngine {
     /// Returns `Some(password)` when a new admin user was created with a
     /// generated password (so the caller can surface it once), or `None` when
     /// the admin already existed or the password came from the environment.
+    // Called only by the server's startup (`server_backend.rs`).
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn bootstrap_dev_rows(
         &self,
         admin_user: Option<&str>,
@@ -291,26 +310,21 @@ impl SqliteEngine {
         // Default account + canonical marker. Record the default account id in
         // settings (idempotent, backfill-safe) so callers resolve it explicitly
         // rather than inferring it from account-list ordering.
-        let account_id: String = match sqlx::query_scalar(
-            "SELECT account_id FROM accounts ORDER BY account_id LIMIT 1",
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| internal(format!("check accounts: {e}")))?
-        {
-            Some(id) => id,
-            None => {
-                let id = helpers::generate_account_id();
-                sqlx::query(
-                    "INSERT OR IGNORE INTO accounts (account_id, account_name) VALUES (?, 'default')",
-                )
-                .bind(&id)
-                .execute(&self.pool)
+        let account_id: String =
+            match sqlx::query_scalar("SELECT account_id FROM accounts ORDER BY account_id LIMIT 1")
+                .fetch_optional(&self.pool)
                 .await
-                .map_err(|e| internal(format!("create default account: {e}")))?;
-                id
-            }
-        };
+                .map_err(|e| internal(format!("check accounts: {e}")))?
+            {
+                Some(id) => id,
+                None => {
+                    let id = helpers::generate_account_id();
+                    self.insert_default_account(&id)
+                        .await
+                        .map_err(|e| internal(format!("create default account: {e}")))?;
+                    id
+                }
+            };
         sqlx::query("INSERT OR IGNORE INTO settings (key, value) VALUES ('default_account_id', ?)")
             .bind(&account_id)
             .execute(&self.pool)
@@ -490,6 +504,96 @@ impl SqliteEngine {
         .ok()
         .flatten()
         .map_or_else(|| "(not configured)".to_owned(), |(v,)| v)
+    }
+}
+
+// The real `SnapshotEngine` impl (`snapshot_engine`) uses `sqlx` API the
+// wasm32 shim does not provide, so it is compiled off the browser build. The
+// `StorageEngine` blanket impl still requires the subtrait, so the wasm build
+// answers it with an `Unsupported` error.
+#[cfg(target_arch = "wasm32")]
+impl extenddb_storage::snapshot::SnapshotEngine for SqliteEngine {
+    fn open_table_snapshot(
+        &self,
+        account_id: &str,
+        table_name: &str,
+    ) -> futures::future::BoxFuture<
+        '_,
+        Result<extenddb_storage::snapshot::TableSnapshot, StorageError>,
+    > {
+        let _ = (account_id, table_name);
+        Box::pin(async {
+            Err(StorageError::Unsupported(
+                extenddb_core::error::webassembly_unsupported_message(
+                    "A table snapshot",
+                    "its SQLite driver lacks the API the snapshot reader uses",
+                ),
+            ))
+        })
+    }
+}
+
+impl SqliteEngine {
+    /// Build a ready-to-use in-memory engine for an embedded (browser) caller:
+    /// open a `:memory:` database, run the catalog migrations on its single
+    /// connection, register `account_id`, and switch the control plane to
+    /// synchronous (`control_plane_delay_seconds = 0`,
+    /// `index_propagation_delay_ms = 0`) so a created table is `ACTIVE` at once
+    /// and index maintenance happens on the write path — there are no
+    /// background workers in this configuration to drive an asynchronous one.
+    ///
+    /// The migrations run through the function the server's in-memory startup
+    /// calls, and the account row through the statement its bootstrap uses. No
+    /// encryption key or admin user is written: an embedded build does no
+    /// authentication, and the data-plane operations need only the account row
+    /// to exist.
+    ///
+    /// # Errors
+    ///
+    /// The database cannot be opened, the migrations fail, or a setup statement
+    /// fails.
+    #[doc(hidden)]
+    pub async fn new_in_memory(
+        region: &str,
+        account_id: &str,
+        max_item_size_bytes: usize,
+    ) -> Result<Self, StorageError> {
+        let engine = Self::new(":memory:", 1, region, max_item_size_bytes).await?;
+
+        // An in-memory database lives only on the engine's single connection,
+        // so its catalog is created there, by the call the server's in-memory
+        // startup makes.
+        crate::migrations::migrate_in_memory(&engine.pool, ":memory:", "")
+            .await
+            .map_err(|e| StorageError::Internal(format!("run in-memory migrations: {e}")))?;
+
+        // The account the data-plane operations write under. CreateTable
+        // records the owning account, so the row must exist first. The rest of
+        // `bootstrap_dev_rows` is not run: it generates the account id and an
+        // encryption key and hashes an admin password, none of which an
+        // embedded build without authentication uses.
+        Self::validate_account_id(account_id)?;
+        engine
+            .insert_default_account(account_id)
+            .await
+            .map_err(|e| StorageError::Internal(format!("register account: {e}")))?;
+
+        // No background workers run here, so make the control plane synchronous:
+        // a created table is `ACTIVE` at once and index maintenance happens on
+        // the write path, not via a poller that never runs. Zero means
+        // synchronous for both settings.
+        let settings = crate::SqliteCatalogStore::new(engine.pool.clone());
+        for (key, value) in [
+            ("control_plane_delay_seconds", "0"),
+            ("index_propagation_delay_ms", "0"),
+        ] {
+            settings
+                .set_setting(key, value)
+                .await
+                .map_err(|e| StorageError::Internal(format!("set {key}: {e:?}")))?;
+        }
+
+        Ok(engine)
     }
 }
 
@@ -673,8 +777,8 @@ mod d1_write_lock_tests {
     }
 
     /// Build a catalog store over the engine's pool and, critically, the
-    /// engine's OWN write lock, mirroring the server wiring in `lib.rs`. The
-    /// key holder lets access-key creation encrypt.
+    /// engine's OWN write lock, mirroring the server wiring in
+    /// `server_backend.rs`. The key holder lets access-key creation encrypt.
     fn catalog_store(engine: &SqliteEngine) -> crate::SqliteCatalogStore {
         let keys = extenddb_storage::secret_keys::SecretKeys::dek_for_tests([0; 32], 1, "test");
         crate::SqliteCatalogStore::with_secret_keys(
