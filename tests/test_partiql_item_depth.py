@@ -19,7 +19,8 @@ parameter is refused by the parameter check in every form.
 
 Runs against real DynamoDB (EXTENDDB_TEST_ENDPOINT unset, AWS credentials) and
 against an extenddb server (EXTENDDB_TEST_ENDPOINT set) with identical
-assertions. Every expected value was measured on the service (2026-11-02).
+assertions. Every expected value was measured on the service (2026-11-02; a
+SELECT that reads the whole table on 2026-11-09).
 Tables use the ``extenddb-measure-pqd-`` prefix and are deleted at the end.
 """
 
@@ -281,6 +282,29 @@ class TestPartiqlDeleteAndSelect:
             ConsistentRead=True,
         )["Items"]
         assert items == [{"pk": {"S": stored}, "a": {"N": "1"}}]
+
+    def test_a_select_that_reads_the_whole_table_compares_a_deep_value_like_any_other(
+        self, dynamodb_client, table, stored
+    ):
+        items = dynamodb_client.execute_statement(
+            Statement=f"SELECT * FROM \"{table}\" WHERE a <> ?",
+            Parameters=[deep(32)],
+            ConsistentRead=True,
+        )["Items"]
+        assert {"pk": {"S": stored}, "a": {"N": "1"}} in items
+
+    def test_a_select_that_reads_the_whole_table_meets_the_parameter_check_at_33_levels(
+        self, dynamodb_client, table
+    ):
+        assert (
+            validation_message(
+                lambda: dynamodb_client.execute_statement(
+                    Statement=f"SELECT * FROM \"{table}\" WHERE a <> ?",
+                    Parameters=[deep(33)],
+                )
+            )
+            == NESTED
+        )
 
 
 class TestPartiqlBatch:

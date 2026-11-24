@@ -10,7 +10,7 @@ use serde_json::Value;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{ExpressionKind, ExpressionMaps, Projection};
 use extenddb_core::types::{
-    IndexType, ProjectionType, ScanInput, ScanOutput, Select, TableKeyInfo,
+    IndexType, ProjectionType, ScanOutput, Select, TableKeyInfo,
     VECTOR_INDEX_BACKFILLING_SCAN_PREFIX, VECTOR_INDEX_SCAN_NOT_SUPPORTED,
 };
 use extenddb_storage::error::StorageError;
@@ -22,89 +22,93 @@ use crate::expression_helpers::{build_expression_maps, parse_optional_filter};
 use crate::index_helpers::{
     VectorIndexReadRefusal, classify_unresolved_index_read, combined_lek_key_schema,
 };
-use crate::legacy_filter::desugar_filter;
 use crate::read_helpers::{PostRead, read_page};
+use crate::scan_request::CheckOrder;
 use crate::serialize_output;
 use crate::start_key::validate_scan_exclusive_start_key;
 use crate::{DispatchMetrics, DispatchResult};
+
+mod body_checks;
+
+pub(crate) use body_checks::{CheckedBody, checked_body};
 
 /// Handle a `Scan` request.
 ///
 /// Reads all items from the table (or segment), applies `FilterExpression`
 /// post-read, applies `ProjectionExpression`, and enforces the 1 MB limit.
+/// `raw_body` is the request text `body` was parsed from; the checks read the
+/// request's order of the `ExclusiveStartKey` members, the
+/// `ExpressionAttributeValues` entries and the `ScanFilter` conditions from it
+/// in one pass (see `scan_request::member_orders`). The `Scan` a PartiQL
+/// `SELECT` is translated into has no request text and passes an empty one,
+/// so the parsed body's member order stands in for the request's order.
 ///
 /// # Errors
 ///
 /// Returns `DynamoDbError` for validation failures, missing tables, or storage errors.
 #[allow(clippy::cast_possible_wrap)] // item counts won't exceed i64::MAX
 pub async fn handle_scan(
-    mut body: Value,
+    body: Value,
+    raw_body: &[u8],
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
-    // Request-time checks on the raw body, in the service's order: the Limit,
-    // Segment and TotalSegments ranges, the ReturnConsumedCapacity enum, the
-    // expression and non-expression parameter mix, the
-    // ExpressionAttributeNames checks, every number in
-    // ExpressionAttributeValues, the set faults, the Select enum, or the
-    // older order for a body on the service's older validation path. They run
-    // before typed deserialization so a field that does not deserialize does
-    // not stop the ones before it; a field of the wrong JSON type is reported
-    // ahead of them; see `scan_request`. Limit, Segment and TotalSegments are
-    // then read as the service reads them, from any JSON number the body
-    // parser reads; see `int32_member`.
-    crate::scan_request::validate_scan_request_body(&body)?;
-    crate::int32_member::saturate(&mut body, &crate::int32_member::SCAN_RANGES)?;
-    let input: ScanInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
-
-    // Validate Filter/Projection expressions before the existence
-    // check; index resolution, Segment pairing, Select and key checks stay after.
-    let has_cond_op = input.conditional_operator.is_some();
+    // The checks run in one of the service's two orders, measured 2026-10-25
+    // to 2026-11-23 (see `scan_request`): order U on the service's older
+    // validation path (a value it cannot read as one type, or a Limit,
+    // Segment or TotalSegments that is a float or outside int32), order R
+    // otherwise. Order R:
+    //  - request-time, on the raw body: the AttributesToGet length and the
+    //    Limit, Segment and TotalSegments ranges in one message, the
+    //    ReturnConsumedCapacity enum, the expression and non-expression
+    //    parameter mix, the ExpressionAttributeNames checks, every number in
+    //    ExpressionAttributeValues, the first empty or duplicate set there,
+    //    the nesting depth of the entries (the numbers of the ScanFilter
+    //    lists are #507's check);
+    //  - a member of the wrong JSON type anywhere in the body;
+    //  - the request parameter checks: ExpressionAttributeNames and
+    //    ExpressionAttributeValues with no expression, ConditionalOperator with
+    //    no ScanFilter, a ScanFilter condition's value count;
+    //  - the Select enum;
+    //  - the expression and request checks: the filter syntax, the projection
+    //    syntax, an undefined value, the operand types, the Select rules, the
+    //    unused values, COUNT with AttributesToGet, the Segment pairing;
+    //  - the ExclusiveStartKey's value faults (a number, an empty or duplicate
+    //    set), in the fitted member order;
+    //  - the table lookup, the index resolution and the index rules, the key
+    //    schema.
+    // Order U differs in these places: the constraint clauses take the older
+    // form with the Select and ReturnConsumedCapacity clauses in the same
+    // message; the parameter mix and the ExpressionAttributeNames key checks
+    // follow at request time, and the numbers, sets and nesting depth of
+    // ExpressionAttributeValues leave request time; the ScanFilter list values
+    // are checked after the no-expression checks and ahead of
+    // ConditionalOperator; after the request parameter checks come the
+    // ExclusiveStartKey's faults, then the faulty ExpressionAttributeValues
+    // entries in the same member order (each in the invalid-value form, an
+    // entry nested too deep among them) and an empty name, then the expression
+    // and request checks and the table. The server runs the checks up to the
+    // Select enum in order R, and up to the faulty entries and the empty name
+    // in order U, ahead of the IAM decision (see `checked_body`).
+    let CheckedBody {
+        order,
+        input,
+        has_proj_expr,
+        legacy_filter,
+        start_key,
+    } = checked_body(body, raw_body)?;
 
     let maps = build_expression_maps(
         input.expression_attribute_names.as_ref(),
         input.expression_attribute_values.as_ref(),
     );
 
-    let has_filter_expr = input
-        .filter_expression
-        .as_ref()
-        .is_some_and(|s| !s.is_empty());
-    let has_proj_expr = input
-        .projection_expression
-        .as_ref()
-        .is_some_and(|s| !s.is_empty());
-    // No values suffix when the request's AttributeValues parse.
-    extenddb_core::expression::validate_expression_param_usage(
-        input.expression_attribute_names.as_ref(),
-        has_proj_expr || has_filter_expr,
-        input.expression_attribute_values.as_ref(),
-        has_filter_expr,
-        &[],
-    )?;
-
-    // ConditionalOperator requires a ScanFilter with two or more conditions.
-    extenddb_core::validation::validate_conditional_operator_usage(
-        has_cond_op,
-        input.scan_filter.as_ref().map_or(0, HashMap::len),
-    )?;
-
-    // Parse FilterExpression or desugar legacy ScanFilter
-    let (filter, filter_maps) = if let Some(ref sf) = input.scan_filter {
-        if sf.is_empty() {
-            (
-                parse_optional_filter(input.filter_expression.as_deref(), &ctx.limits)?,
-                None,
-            )
-        } else {
-            let cond_op = input.conditional_operator.unwrap_or_default();
-            let (expr, fmaps) = desugar_filter(sf, cond_op)?;
-            (Some(expr), Some(fmaps))
-        }
-    } else {
-        (
+    // Parse FilterExpression, or take the desugared ScanFilter.
+    let (filter, filter_maps) = match legacy_filter {
+        Some((expr, fmaps)) => (Some(expr), Some(fmaps)),
+        None => (
             parse_optional_filter(input.filter_expression.as_deref(), &ctx.limits)?,
             None,
-        )
+        ),
     };
 
     // Parse ProjectionExpression or desugar legacy AttributesToGet
@@ -154,14 +158,48 @@ pub async fn handle_scan(
         None => None,
     };
 
+    // Build the combined expression maps for the operand checks and the
+    // post-read evaluation.
+    let combined_maps = {
+        let mut names = maps.names.clone();
+        let mut values = maps.values.clone();
+
+        if let Some(ref fm) = filter_maps {
+            values.extend(fm.values.clone());
+        }
+        if !extra_proj_names.is_empty() {
+            for (k, v) in &extra_proj_names {
+                let stripped = k.strip_prefix('#').unwrap_or(k);
+                names.insert(stripped.to_owned(), v.clone());
+            }
+        }
+        ExpressionMaps::new(names, values)
+    };
+
+    // Validate the filter's placeholders and operand types, ahead of the
+    // Select rules, the unused values and the Segment pairing (measured
+    // 2026-11-05).
+    if let Some(ref f) = filter {
+        let mut placeholders = Vec::new();
+        extenddb_core::expression::collect_value_placeholders(f, &mut placeholders);
+        for placeholder in placeholders {
+            combined_maps.resolve_value_for(&placeholder, "FilterExpression")?;
+        }
+        extenddb_core::expression::validate_begins_with_operands(f, &combined_maps).map_err(
+            |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
+        )?;
+        extenddb_core::expression::validate_ordering_operand_types(f, &combined_maps).map_err(
+            |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
+        )?;
+    }
+
     // Validate Select vs ProjectionExpression and index requirements (shared
-    // with Query so both reject the same combinations identically).
+    // with Query so both reject the same combinations identically). COUNT with
+    // a ProjectionExpression is checked below, after the unused values
+    // (measured 2026-11-05).
     extenddb_core::validation::validate_select_projection(
         input.select,
-        input
-            .projection_expression
-            .as_deref()
-            .is_some_and(|s| !s.is_empty()),
+        has_proj_expr && !matches!(input.select, Some(Select::Count)),
         input
             .attributes_to_get
             .as_ref()
@@ -193,6 +231,64 @@ pub async fn handle_scan(
             &extra_names,
             &std::collections::HashSet::new(),
         )?;
+    }
+
+    // Select COUNT with a projection: a ProjectionExpression after the unused
+    // values, AttributesToGet ahead of the Segment pairing, both ahead of the
+    // key's value faults and the table lookup (measured 2026-11-05). The
+    // texts are the service's for Scan; the AttributesToGet one differs from
+    // the service's (#838).
+    if let Some(Select::Count) = input.select {
+        if has_proj_expr {
+            return Err(DynamoDbError::ValidationException(
+                "Cannot specify the ProjectionExpression when choosing to get only the Count"
+                    .to_owned(),
+            ));
+        }
+        if effective_projection_str.is_some() {
+            return Err(DynamoDbError::ValidationException(
+                "Cannot specify the ProjectionExpression when Select is COUNT".to_owned(),
+            ));
+        }
+    }
+
+    // Validate Segment/TotalSegments pairing. The range of each field is
+    // checked at request time in validate_scan_request_body; the service
+    // reports a missing partner with a message per direction, after the unused
+    // values and ahead of the key's value faults and of the table lookup
+    // (measured 2026-11-05).
+    match (input.segment, input.total_segments) {
+        (Some(_), None) => {
+            return Err(DynamoDbError::ValidationException(
+                "The TotalSegments parameter is required but was not present in the request when Segment parameter is present"
+                    .to_owned(),
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(DynamoDbError::ValidationException(
+                "The Segment parameter is required but was not present in the request when parameter TotalSegments is present"
+                    .to_owned(),
+            ));
+        }
+        (Some(seg), Some(total)) => {
+            if seg >= total {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "The Segment parameter is zero-based and must be less than parameter TotalSegments: \
+                     Segment: {seg} is not less than TotalSegments: {total}"
+                )));
+            }
+        }
+        (None, None) => {}
+    }
+
+    // Limit >= 1 is checked at request time in validate_scan_request_body.
+
+    // Order R: the ExclusiveStartKey's value faults, every number in it with
+    // the value check's text and the set faults, in the fitted member order,
+    // ahead of the table lookup (measured 2026-11-05; see
+    // `scan_request::StartKeyBody`).
+    if order == CheckOrder::Readable {
+        start_key.validate(order)?;
     }
 
     // P118: Fetch key_info first so we can use table_id for index lookup.
@@ -267,35 +363,6 @@ pub async fn handle_scan(
         )?;
     }
 
-    // Validate Segment/TotalSegments pairing. The range of each field is
-    // checked at request time in validate_scan_request_body; the service
-    // reports a missing partner with a message per direction.
-    match (input.segment, input.total_segments) {
-        (Some(_), None) => {
-            return Err(DynamoDbError::ValidationException(
-                "The TotalSegments parameter is required but was not present in the request when Segment parameter is present"
-                    .to_owned(),
-            ));
-        }
-        (None, Some(_)) => {
-            return Err(DynamoDbError::ValidationException(
-                "The Segment parameter is required but was not present in the request when parameter TotalSegments is present"
-                    .to_owned(),
-            ));
-        }
-        (Some(seg), Some(total)) => {
-            if seg >= total {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "The Segment parameter is zero-based and must be less than parameter TotalSegments: \
-                     Segment: {seg} is not less than TotalSegments: {total}"
-                )));
-            }
-        }
-        (None, None) => {}
-    }
-
-    // Limit >= 1 is checked at request time in validate_scan_request_body.
-
     // For index scans, build a key_info that reflects the index's key schema.
     let scan_key_info = if let Some(ref idx) = index_info {
         TableKeyInfo {
@@ -324,35 +391,10 @@ pub async fn handle_scan(
                 .to_owned(),
         ));
     }
-    if let Some(Select::Count) = input.select
-        && effective_projection_str.is_some()
-    {
-        return Err(DynamoDbError::ValidationException(
-            "Cannot specify the ProjectionExpression when Select is COUNT".to_owned(),
-        ));
-    }
-
     let index_proj = if matches!(input.select, Some(Select::AllProjectedAttributes)) {
         index_info.as_ref()
     } else {
         None
-    };
-
-    // Build the combined expression maps for post-read evaluation.
-    let combined_maps = {
-        let mut names = maps.names.clone();
-        let mut values = maps.values.clone();
-
-        if let Some(ref fm) = filter_maps {
-            values.extend(fm.values.clone());
-        }
-        if !extra_proj_names.is_empty() {
-            for (k, v) in &extra_proj_names {
-                let stripped = k.strip_prefix('#').unwrap_or(k);
-                names.insert(stripped.to_owned(), v.clone());
-            }
-        }
-        ExpressionMaps::new(names, values)
     };
 
     // Validate ExclusiveStartKey matches the key schema
@@ -386,16 +428,6 @@ pub async fn handle_scan(
                 )));
             }
         }
-    }
-
-    // Validate begins_with operand types upfront (before any rows are scanned).
-    if let Some(ref f) = filter {
-        extenddb_core::expression::validate_begins_with_operands(f, &combined_maps).map_err(
-            |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
-        )?;
-        extenddb_core::expression::validate_ordering_operand_types(f, &combined_maps).map_err(
-            |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
-        )?;
     }
 
     // Determine which key schema to use for LastEvaluatedKey extraction.

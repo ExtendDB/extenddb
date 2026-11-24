@@ -16,13 +16,18 @@
 use std::borrow::Cow;
 
 use extenddb_core::error::{DynamoDbError, validation_errors};
+use extenddb_core::types::AttributeValue;
+use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use super::value_fault::{TYPE_DESCRIPTORS, first_fault};
 use super::{
-    RETURN_CONSUMED_CAPACITY, SELECT, present, sorted_entries, validate_name_keys, validate_names,
+    RETURN_CONSUMED_CAPACITY, SELECT, is_shape_fault, present, sorted_entries, validate_name_keys,
+    validate_names,
 };
-use crate::int32_member::{LIMIT, RangeFault, RangeField, SEGMENT, TOTAL_SEGMENTS};
+use crate::int32_member::{
+    AT_LEAST_ONE_MEMBER, LIMIT, LengthField, RangeFault, RangeField, SEGMENT, TOTAL_SEGMENTS,
+};
 
 /// The condition maps of `Scan` whose `AttributeValueList` entries the
 /// service reads.
@@ -31,10 +36,6 @@ pub(crate) const SCAN_CONDITIONS: &[&str] = &["ScanFilter"];
 /// The condition maps of `Query` whose `AttributeValueList` entries the
 /// service reads.
 pub(crate) const QUERY_CONDITIONS: &[&str] = &["KeyConditions", "QueryFilter"];
-
-/// The expression members of `Scan` that can read an
-/// `ExpressionAttributeValues` entry; see [`older_form_checks`] item 4.
-pub(crate) const SCAN_VALUE_EXPRESSIONS: &[&str] = &["FilterExpression"];
 
 /// The expression members of `Query` that can read an
 /// `ExpressionAttributeValues` entry; see [`older_form_checks`] item 4.
@@ -149,6 +150,26 @@ pub(crate) fn readable_for_shape_check<'a>(body: &'a Value, conditions: &[&str])
     }
 }
 
+/// The first `SerializationException` among the values [`has_unreadable`]
+/// reads (see [`attribute_values`]), each deserialized on its own as an
+/// `AttributeValue` with the parts the service cannot read replaced (see
+/// [`readable_for_shape_check`]): a member of the wrong JSON type anywhere in
+/// an `ExpressionAttributeValues` entry, an `ExclusiveStartKey` value or a
+/// condition list value. Read on its own, such a member is found behind a
+/// value fault that comes first in the same map or list. Measured on `Scan`
+/// 2026-11-23 (us-east-1, each body twice): `{"pk": {"NS": []}, "sk": {"S":
+/// 5}}` as the key and `{"L": [{"S": 5}, {}]}` as an entry answer
+/// `SerializationException: NUMBER_VALUE cannot be converted to String`.
+pub(crate) fn value_shape_fault(body: &Value, conditions: &[&str]) -> Option<DynamoDbError> {
+    let readable = readable_for_shape_check(body, conditions);
+    attribute_values(&readable, conditions).find_map(|value| {
+        AttributeValue::deserialize(value)
+            .map_err(crate::deserialize_error)
+            .err()
+            .filter(is_shape_fault)
+    })
+}
+
 /// Replace each part of `value` the service cannot read as one type, in the
 /// value and in the values an `L` or `M` holds. A null, or an object with no
 /// type descriptor the service knows, becomes `{"NULL": true}`. An unknown
@@ -218,7 +239,10 @@ fn null_value() -> Value {
 ///    answers `select`, `returnConsumedCapacity`, then `limit` with
 ///    `-2147483648`). Two invalid enums beside a float `Limit` that satisfies
 ///    its constraint answer the two enum clauses (measured 2026-11-23 on
-///    `Scan` and `Query`);
+///    `Scan` and `Query`). On `Scan` an empty `AttributesToGet` adds `Value
+///    '[]' at 'attributesToGet' failed to satisfy constraint: Member must have
+///    length greater than or equal to 1` after the `Limit` fault (measured
+///    2026-11-23 21:49 UTC, with the five other faults);
 /// 2. the expression and non-expression parameter mix, which
 ///    `validate_parameter_mix` checks with the operation's members (measured
 ///    2026-11-23 18:45 UTC: on `Scan` a mix beside `Limit: 1.5` and an
@@ -295,7 +319,13 @@ fn null_value() -> Value {
 /// item 4 (measured 2026-11-23 18:52 UTC on `Scan` and `Query`: `{"pk": {}}`
 /// beside `{"N": "bob"}` answers `The provided starting key is invalid:
 /// Supplied AttributeValue is empty, must contain exactly one of the
-/// supported datatypes`).
+/// supported datatypes`). `Scan` makes items 1 to 3 here
+/// ([`older_form_request_checks`]) and items 4 and 5 in its handler, after the
+/// expressions-only check and the key's faults, with the numbers and the sets
+/// of each entry in one walk and the entries in the hash order of
+/// `scan_request::fitted_member_order`, which names `:z`, `:b`, `:b`, `:b`
+/// and `:n` in the rows above, and `:n` beside `:a` in both arrangements of
+/// item 4, as the service does; see `scan_request::ExpressionValuesBody`.
 pub(crate) fn older_form_checks(
     body: &Value,
     values: Option<&Map<String, Value>>,
@@ -303,45 +333,7 @@ pub(crate) fn older_form_checks(
     validate_parameter_mix: fn(&Value) -> Result<(), DynamoDbError>,
     value_expressions: &[&str],
 ) -> Result<(), DynamoDbError> {
-    let range = |field: &RangeField| {
-        ranges
-            .iter()
-            .find(|fault| fault.field.name == field.name)
-            .map(|fault| {
-                (
-                    fault.value.to_string(),
-                    fault.field.older_name,
-                    fault.constraint.clone(),
-                )
-            })
-    };
-    let violations: Vec<(String, &str, String)> = [
-        enum_violation(body, "Select", "select", SELECT),
-        range(&TOTAL_SEGMENTS),
-        enum_violation(
-            body,
-            "ReturnConsumedCapacity",
-            "returnConsumedCapacity",
-            RETURN_CONSUMED_CAPACITY,
-        ),
-        range(&SEGMENT),
-        range(&LIMIT),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    if !violations.is_empty() {
-        let clauses: Vec<(&str, &str, &str)> = violations
-            .iter()
-            .map(|(value, field, constraint)| (value.as_str(), *field, constraint.as_str()))
-            .collect();
-        return Err(DynamoDbError::ValidationException(validation_errors(
-            &clauses,
-        )));
-    }
-
-    validate_parameter_mix(body)?;
-    validate_name_keys(body)?;
+    older_form_request_checks(body, ranges, None, validate_parameter_mix)?;
 
     if let Some(values) = values {
         // The values the service cannot read first; the sort is stable, so
@@ -366,6 +358,63 @@ pub(crate) fn older_form_checks(
         }
     }
     validate_names(body)
+}
+
+/// Items 1 to 3 of [`older_form_checks`]. `empty_list` is a list member whose
+/// length constraint fails (`Scan`'s `AttributesToGet`, see
+/// `int32_member::ATTRIBUTES_TO_GET`); its clause comes last in item 1.
+pub(crate) fn older_form_request_checks(
+    body: &Value,
+    ranges: &[RangeFault],
+    empty_list: Option<&LengthField>,
+    validate_parameter_mix: fn(&Value) -> Result<(), DynamoDbError>,
+) -> Result<(), DynamoDbError> {
+    let range = |field: &RangeField| {
+        ranges
+            .iter()
+            .find(|fault| fault.field.name == field.name)
+            .map(|fault| {
+                (
+                    fault.value.to_string(),
+                    fault.field.older_name,
+                    fault.constraint.clone(),
+                )
+            })
+    };
+    let violations: Vec<(String, &str, String)> = [
+        enum_violation(body, "Select", "select", SELECT),
+        range(&TOTAL_SEGMENTS),
+        enum_violation(
+            body,
+            "ReturnConsumedCapacity",
+            "returnConsumedCapacity",
+            RETURN_CONSUMED_CAPACITY,
+        ),
+        range(&SEGMENT),
+        range(&LIMIT),
+        empty_list.map(|list| {
+            (
+                "[]".to_owned(),
+                list.older_name,
+                AT_LEAST_ONE_MEMBER.to_owned(),
+            )
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !violations.is_empty() {
+        let clauses: Vec<(&str, &str, &str)> = violations
+            .iter()
+            .map(|(value, field, constraint)| (value.as_str(), *field, constraint.as_str()))
+            .collect();
+        return Err(DynamoDbError::ValidationException(validation_errors(
+            &clauses,
+        )));
+    }
+
+    validate_parameter_mix(body)?;
+    validate_name_keys(body)
 }
 
 /// The enum violation for `field` when the body holds a string that is not one

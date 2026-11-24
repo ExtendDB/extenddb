@@ -2517,7 +2517,12 @@ fn validate_attribute_number(value: &AttributeValue) -> Result<(), DynamoDbError
 }
 
 /// Maximum total nesting levels (M/L wrappers plus the leaf) `DynamoDB` allows.
-pub(crate) const MAX_ITEM_NESTING_DEPTH: usize = 32;
+pub const MAX_ITEM_NESTING_DEPTH: usize = 32;
+
+/// The service's refusal of a value nested past its limit, the same for an
+/// item attribute and for a request value.
+pub const NESTING_MESSAGE: &str = "Nesting Levels have exceeded supported limits: \
+     Attributes in the item have nested levels beyond supported limit";
 
 /// Validate that no attribute value in `item` nests beyond `MAX_ITEM_NESTING_DEPTH`.
 pub fn validate_item_nesting_depth(item: &Item) -> Result<(), DynamoDbError> {
@@ -2568,9 +2573,7 @@ fn check_attribute_value_depth(
 }
 
 fn nesting_depth_error() -> DynamoDbError {
-    DynamoDbError::ValidationException(
-        "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit".to_owned(),
-    )
+    DynamoDbError::ValidationException(NESTING_MESSAGE.to_owned())
 }
 
 fn validate_unique_index_names(input: &CreateTableInput) -> Result<(), DynamoDbError> {

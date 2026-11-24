@@ -28,9 +28,8 @@ and the values.
 
 Dual-target: runs against the service and against extenddb. Where extenddb
 gives another text than the service, the row names both, the issue that
-tracks the difference, and asserts the one for the target: the duplicate set
-text (#1360), the value named among several faulty values (#1013), and the
-Segment pairing text.
+tracks the difference, and asserts the one for the target: the value named
+among several faulty values (#1013) and the Segment pairing text.
 
 Run:
   EXTENDDB_TEST_ENDPOINT=https://localhost:18443 \\
@@ -510,11 +509,9 @@ ORDER_ROWS = [
     ("empty name ahead of N bob",
      {"ExpressionAttributeValues": {":n": NB}, "ExpressionAttributeNames": {"#a": ""}},
      "ExpressionAttributeNames contains invalid value: Empty attribute name for key #a", None),
-    # extenddb lists the members in the duplicates text (#1360).
     ("duplicate NS member ahead of Select",
      {"Select": "NOPE", "FilterExpression": "a = :d", "ExpressionAttributeValues": {":d": {"NS": ["1", "1"]}}},
-     "One or more parameter values were invalid: Input collection contains duplicates.",
-     "One or more parameter values were invalid: Input collection [1, 1] contains duplicates."),
+     "One or more parameter values were invalid: Input collection contains duplicates.", None),
     ("empty NS ahead of Select",
      {"Select": "NOPE", "ExpressionAttributeValues": {":d": {"NS": []}}},
      "One or more parameter values were invalid: An number set  may not be empty", None),
@@ -533,11 +530,11 @@ ORDER_ROWS = [
     ("ScanFilter mix beside an unknown type descriptor",
      {"ScanFilter": SCAN_FILTER, "FilterExpression": "a = :x", "ExpressionAttributeValues": {":x": X1}},
      MIX, None),
-    # The service names :n by an order of its own; extenddb names the value it
-    # cannot read first (#1013).
+    # The entries in the fitted hash order of scan_request: :n in bucket 0
+    # ahead of :a in 3.
     ("{} beside N bob",
      {"FilterExpression": "a = :a OR a = :n", "ExpressionAttributeValues": {":a": {}, ":n": NB}},
-     INVALID_VALUE + NUMERIC + "bob for key :n", INVALID_VALUE + EMPTY_AV + " for key :a"),
+     INVALID_VALUE + NUMERIC + "bob for key :n", None),
     ("Segment 1.5 beside Select", {"Segment": 1.5, "TotalSegments": 2, "Select": "NOPE"}, SELECT_ENUM, None),
     ("TotalSegments 2.5 beside Select", {"Segment": 0, "TotalSegments": 2.5, "Select": "NOPE"},
      SELECT_ENUM, None),

@@ -119,8 +119,12 @@ fn a_range_member_of_another_json_type_is_a_shape_fault_with_the_service_text() 
         ),
     ];
     for (body, operation, expected) in rows {
+        // On Scan the Select enum of a body whose values the service can read
+        // is a check of the handler (see `scan_request::SelectBody`), so the
+        // request-time checks pass and the handler's read reports the member.
         let check = if operation == "Scan" {
             validate_scan_request_body(&body)
+                .and_then(|()| saturate(&mut body.clone(), &SCAN_RANGES))
         } else {
             validate_query_request_body(&body)
         };

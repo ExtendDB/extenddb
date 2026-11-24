@@ -295,9 +295,18 @@ fn enum_checks_sit_on_either_side_of_the_numbers() {
         json!("NOPE"),
     );
     assert_eq!(check(&both).as_deref(), Some(RCC_ENUM));
-    // With the numbers valid, an invalid Select is reported.
+    // With every value readable (order R) the Select enum is not a
+    // request-time check: the handler reports it after the no-expression check
+    // and the nesting check (measured 2026-11-05); beside an unreadable value
+    // (order U) it is one.
+    assert_eq!(check(&json!({"TableName": "t", "Select": "NOPE"})), None);
     assert_eq!(
-        check(&json!({"TableName": "t", "Select": "NOPE"})).as_deref(),
+        check(&json!({
+            "TableName": "t",
+            "Select": "NOPE",
+            "ExclusiveStartKey": {"pk": {}, "sk": {"S": "x"}},
+        }))
+        .as_deref(),
         Some(SELECT_ENUM)
     );
     // A valid request passes.
@@ -403,13 +412,11 @@ fn names_sets_and_unreadable_values_are_reported_in_the_measured_order() {
                    "ExpressionAttributeValues": {":d": {"NS": ["1", "1"]}}}),
             "ExpressionAttributeNames contains invalid key: Syntax error; key: \"a\"",
         ),
-        // The service answers `One or more parameter values were invalid:
-        // Input collection contains duplicates.` for an NS (#1360).
         (
             "duplicate NS member ahead of Select",
             json!({"TableName": "t", "Select": "NOPE", "FilterExpression": "a = :d",
                    "ExpressionAttributeValues": {":d": {"NS": ["1", "1"]}}}),
-            "One or more parameter values were invalid: Input collection [1, 1] contains duplicates.",
+            "One or more parameter values were invalid: Input collection contains duplicates.",
         ),
         (
             "empty NS ahead of Select",
@@ -449,22 +456,6 @@ fn names_sets_and_unreadable_values_are_reported_in_the_measured_order() {
                    "ExpressionAttributeValues": {":x": {"X": "1"}}}),
             MIX_SCAN_FILTER,
         ),
-        // The service names `:n` here (`... numeric value: bob for key :n`);
-        // it picks among faulty values by an order of its own (#1013).
-        (
-            "{} beside N bob",
-            json!({"TableName": "t", "FilterExpression": "a = :a OR a = :n",
-                   "ExpressionAttributeValues": {":a": {}, ":n": {"N": "bob"}}}),
-            "ExpressionAttributeValues contains invalid value: Supplied AttributeValue is \
-                 empty, must contain exactly one of the supported datatypes for key :a",
-        ),
-        (
-            "X 1 beside a filter that does not read it",
-            json!({"TableName": "t", "FilterExpression": "attribute_exists(a)",
-                   "ExpressionAttributeValues": {":x": {"X": "1"}}}),
-            "ExpressionAttributeValues contains invalid value: Supplied AttributeValue is \
-                 empty, must contain exactly one of the supported datatypes for key :x",
-        ),
         (
             "Segment 1.5 beside Select",
             json!({"TableName": "t", "Segment": 1.5, "TotalSegments": 2, "Select": "NOPE"}),
@@ -479,6 +470,12 @@ fn names_sets_and_unreadable_values_are_reported_in_the_measured_order() {
     for (row, body, expected) in rows {
         assert_eq!(check(&body).as_deref(), Some(expected), "{row}");
     }
+    // A faulty entry beside a value the service cannot read is not a
+    // request-time check on `Scan`: the handler reports it after the key's
+    // faults (see `request_tests`).
+    let unreadable_entries = json!({"TableName": "t", "FilterExpression": "a = :a OR a = :n",
+                                    "ExpressionAttributeValues": {":a": {}, ":n": {"N": "bob"}}});
+    assert_eq!(check(&unreadable_entries), None);
 }
 
 #[test]

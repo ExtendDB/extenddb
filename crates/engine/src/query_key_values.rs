@@ -38,11 +38,10 @@ mod unreadable;
 mod value_fault;
 
 pub(crate) use unreadable::{
-    QUERY_CONDITIONS, QUERY_VALUE_EXPRESSIONS, SCAN_CONDITIONS, SCAN_VALUE_EXPRESSIONS,
-    has_unreadable, older_form_checks, readable_for_shape_check,
+    QUERY_CONDITIONS, QUERY_VALUE_EXPRESSIONS, SCAN_CONDITIONS, has_unreadable, older_form_checks,
+    older_form_request_checks, readable_for_shape_check, value_shape_fault,
 };
-pub(crate) use value_fault::deserializer_fault;
-use value_fault::first_fault;
+pub(crate) use value_fault::{Fault, SetFault, first_fault, first_fault_in};
 
 /// The service's text for a key condition value of the wrong type.
 pub const KEY_CONDITION_TYPE_MISMATCH: &str = "One or more parameter values were invalid: Condition parameter type does not match schema type";
@@ -237,15 +236,19 @@ const BOOLEAN_TEXTS: [&str; 10] = ["true", "t", "yes", "y", "1", "false", "f", "
 /// The deserializer's `SerializationException` for `body` as a `T`, unless it
 /// is the one for an AttributeValue with an unknown type descriptor.
 fn shape_fault<T: DeserializeOwned>(body: Value) -> Option<DynamoDbError> {
-    match serde_json::from_value::<T>(body).map_err(crate::deserialize_error) {
-        Err(DynamoDbError::SerializationException(msg))
-            if msg.contains(UNKNOWN_TYPE_DESCRIPTOR) =>
-        {
-            None
-        }
-        Err(shape @ DynamoDbError::SerializationException(_)) => Some(shape),
-        _ => None,
-    }
+    serde_json::from_value::<T>(body)
+        .map_err(crate::deserialize_error)
+        .err()
+        .filter(is_shape_fault)
+}
+
+/// Whether `fault`, from [`crate::deserialize_error`], is a fault in the shape
+/// of the body (a member of the wrong JSON type), which the service reports
+/// ahead of every check, rather than an attribute value the deserializer
+/// refuses with a `ValidationException` or an unknown type descriptor; see
+/// [`shape_fault_first`].
+pub(crate) fn is_shape_fault(fault: &DynamoDbError) -> bool {
+    matches!(fault, DynamoDbError::SerializationException(msg) if !msg.contains(UNKNOWN_TYPE_DESCRIPTOR))
 }
 
 /// The deserializer's text for an AttributeValue whose type descriptor is not
@@ -269,7 +272,7 @@ fn query_request_checks(body: &Value) -> Result<(), DynamoDbError> {
         );
     }
     if !ranges.faults.is_empty() {
-        return Err(crate::int32_member::newer_form(&ranges.faults));
+        return Err(crate::int32_member::newer_form(None, &ranges.faults));
     }
 
     // Query stops at the first invalid enum: ReturnConsumedCapacity ahead of

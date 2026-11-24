@@ -261,6 +261,30 @@ pub(crate) fn ranges(body: &Value, fields: &'static [RangeField]) -> Ranges {
     ranges
 }
 
+/// A list member whose length the service checks with the range constraints,
+/// in the same message: its name in the newer and in the older form.
+pub(crate) struct LengthField {
+    pub(crate) name: &'static str,
+    pub(crate) older_name: &'static str,
+}
+
+/// `Scan`'s `AttributesToGet`, which must hold one name or more: an empty
+/// list answers `Value at 'AttributesToGet' failed to satisfy constraint:
+/// Member must have length greater than or equal to 1` ahead of the range
+/// clauses in the newer form (measured 2026-10-30 12:40 UTC: `Limit: 0` with
+/// `AttributesToGet: []` answers the length clause, then the `Limit` clause),
+/// and `Value '[]' at 'attributesToGet' ...` after every other clause in the
+/// older form (measured 2026-11-23 21:49 UTC: beside `Limit: 0.0`, beside
+/// `Select: "BAD"` and an empty value, and with the five other faults; see
+/// `older_form_request_checks`).
+pub(crate) const ATTRIBUTES_TO_GET: LengthField = LengthField {
+    name: "AttributesToGet",
+    older_name: "attributesToGet",
+};
+
+/// The length constraint of a [`LengthField`].
+pub(crate) const AT_LEAST_ONE_MEMBER: &str = "Member must have length greater than or equal to 1";
+
 /// The newer form of the range faults, for a request whose range members are
 /// integers inside int32 and whose values the service can read: every fault
 /// in one message, in the order of the fields, `1 validation error detected:
@@ -268,9 +292,19 @@ pub(crate) fn ranges(body: &Value, fields: &'static [RangeField]) -> Ranges {
 /// greater than or equal to 1`, or `3 validation errors detected: Value at
 /// 'Limit' ...; Value at 'Segment' ...; Value at 'TotalSegments' ...`
 /// (measured on `Scan` 2026-10-25 and 2026-10-31, us-east-1, each request
-/// twice).
-pub(crate) fn newer_form(faults: &[RangeFault]) -> DynamoDbError {
-    let clauses: Vec<String> = faults.iter().map(RangeFault::newer_clause).collect();
+/// twice). The clause of `empty_list`, a list member whose length constraint
+/// fails, comes first (see [`ATTRIBUTES_TO_GET`]).
+pub(crate) fn newer_form(empty_list: Option<&LengthField>, faults: &[RangeFault]) -> DynamoDbError {
+    let clauses: Vec<String> = empty_list
+        .map(|list| {
+            format!(
+                "Value at '{}' failed to satisfy constraint: {AT_LEAST_ONE_MEMBER}",
+                list.name
+            )
+        })
+        .into_iter()
+        .chain(faults.iter().map(RangeFault::newer_clause))
+        .collect();
     DynamoDbError::ValidationException(validation_errors_detected(&clauses))
 }
 

@@ -23,6 +23,7 @@ const TOTAL_LOW: &str = "Value at 'TotalSegments' failed to satisfy constraint: 
 const TOTAL_HIGH: &str = "Value at 'TotalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000";
 const SELECT_BAD: &str = "Value 'BAD' at 'select' failed to satisfy constraint: Member must satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]";
 const RCC_BAD: &str = "Value 'BAD' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]";
+const ATG_EMPTY: &str = "Value '[]' at 'attributesToGet' failed to satisfy constraint: Member must have length greater than or equal to 1";
 
 fn check(body: &Value) -> Option<String> {
     match validate_scan_request_body(body) {
@@ -220,9 +221,10 @@ fn a_float_or_saturated_limit_switches_a_segment_fault_to_the_older_form() {
 /// clauses, in the order select, totalSegments, returnConsumedCapacity,
 /// segment, limit, also when only the enum clauses apply, and ahead of the
 /// parameter mix and the names checks. A float `Limit` that satisfies its
-/// constraint beside `{"N": "bob"}` answers the wrapped numeric text. In the
-/// newer form the enums keep their places: a range fault alone, then
-/// `ReturnConsumedCapacity` alone.
+/// constraint beside `{"N": "bob"}` answers the wrapped numeric text, after
+/// the request-time checks (see `request_tests`). In the newer form the enums
+/// keep their places: a range fault alone, then `ReturnConsumedCapacity`
+/// alone.
 #[test]
 fn the_enum_clauses_sit_inside_the_older_form_message() {
     let limit_0 = older("0", "limit", "greater than or equal to 1");
@@ -255,6 +257,20 @@ fn the_enum_clauses_sit_inside_the_older_form_message() {
             r#""Limit": 1.5, "Select": "BAD", "ReturnConsumedCapacity": "BAD""#.to_owned(),
             format!("2 validation errors detected: {SELECT_BAD}; {RCC_BAD}"),
         ),
+        // Measured 2026-11-23 21:49 UTC: the AttributesToGet length clause
+        // comes last, with six faults and beside an empty value.
+        (
+            r#""AttributesToGet": [], "Limit": 0.0, "Segment": -1, "TotalSegments": 1000001, "Select": "BAD", "ReturnConsumedCapacity": "BAD""#.to_owned(),
+            format!(
+                "6 validation errors detected: {SELECT_BAD}; {}; {RCC_BAD}; {}; {limit_0}; {ATG_EMPTY}",
+                older("1000001", "totalSegments", "less than or equal to 1000000"),
+                older("-1", "segment", "greater than or equal to 0")
+            ),
+        ),
+        (
+            r#""AttributesToGet": [], "Select": "BAD", "FilterExpression": "a = :a", "ExpressionAttributeValues": {":a": {}}"#.to_owned(),
+            format!("2 validation errors detected: {SELECT_BAD}; {ATG_EMPTY}"),
+        ),
         (
             r#""Limit": -2147483649, "ReturnConsumedCapacity": "bad""#.to_owned(),
             format!(
@@ -279,10 +295,6 @@ fn the_enum_clauses_sit_inside_the_older_form_message() {
         (
             r#""Limit": 0.0, "ExpressionAttributeNames": {"a": "b"}"#.to_owned(),
             one(&limit_0),
-        ),
-        (
-            r#""Limit": 1.5, "FilterExpression": "a = :n", "ExpressionAttributeValues": {":n": {"N": "bob"}}"#.to_owned(),
-            "ExpressionAttributeValues contains invalid value: The parameter cannot be converted to a numeric value: bob for key :n".to_owned(),
         ),
         // The newer form: the range fault alone, then ReturnConsumedCapacity alone.
         (

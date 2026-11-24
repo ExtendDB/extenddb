@@ -136,7 +136,7 @@ async fn jobs(s: &Scratch) -> Jobs {
 }
 
 async fn try_call(ctx: &OperationContext, operation: &str, body: Value) -> Result<Value, String> {
-    dispatch(operation, body, ctx, "127.0.0.1:0")
+    dispatch(operation, body, &[], ctx, "127.0.0.1:0")
         .await
         .map(|r| r.body)
         .map_err(|e| format!("{e:?}"))

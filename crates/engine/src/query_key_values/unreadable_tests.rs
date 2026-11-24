@@ -4,7 +4,9 @@
 //! `ExpressionAttributeValues`, `ExclusiveStartKey` or condition lists hold a
 //! value the service cannot read as one type, or whose `Limit` is a float or
 //! an integer outside int32. The set check of that path is tested on `Scan`
-//! and `Query` here, since both take it through `older_form_checks`.
+//! and `Query` here: `Query` makes it in `older_form_checks`, and `Scan` in
+//! the checks the server runs ahead of the IAM decision
+//! (`scan_request::validate_before_authorization`).
 
 use extenddb_core::error::DynamoDbError;
 use serde_json::{Value, json};
@@ -14,7 +16,7 @@ use super::tests::{
     SEVERAL, body_with, message, one_error,
 };
 use super::validate_query_request_body;
-use crate::scan_request::validate_scan_request_body;
+use crate::scan_request::validate_before_authorization;
 
 #[test]
 fn a_value_the_service_cannot_read_as_one_type_is_named_with_its_placeholder() {
@@ -527,12 +529,15 @@ fn a_null_list_entry_and_a_nested_list_member_take_the_older_path() {
 /// a number set, the deserializer's text for an empty number set and a
 /// string set. An invalid names key comes ahead of the set, an empty name
 /// after it. With no expression that can read a value, the service answers
-/// the expressions-only text instead, which the handler gives, so the check
-/// does not run then. Beside a set fault in one value and a number fault in
-/// another, the service named `:n` in both arrangements (#1013); here the
-/// numbers of every value come ahead of the sets, as on the newer path.
+/// the expressions-only text instead, which `Scan` gives ahead of the set.
+/// Beside a set fault in one value and a number fault in another, the service
+/// named `:n` in both arrangements, as `Scan`'s hash order of the entries
+/// does; `Query`'s `older_form_checks` reads the numbers of every value ahead
+/// of the sets (#1013).
 #[test]
 fn an_empty_or_duplicate_set_is_refused_on_the_older_path() {
+    const EXPRESSIONS_ONLY: &str = "ExpressionAttributeValues can only be specified when using \
+                                    expressions: FilterExpression is null";
     let duplicate_ns = json!({"NS": ["1", "1"]});
     let dup = format!("{INVALID_VALUE}Input collection contains duplicates for key :a");
     let scan = |fields: Value| {
@@ -592,26 +597,31 @@ fn an_empty_or_duplicate_set_is_refused_on_the_older_path() {
                         "ExpressionAttributeValues": {":a": duplicate_ns.clone(), ":n": {"N": "bob"}}})),
             Some(format!("{INVALID_VALUE}{NUMERIC_BOB} for key :n")),
         ),
-        // The number in `:a` ahead of the set in `:n` (the service named `:n`, #1013).
+        // The set in `:n` ahead of the number in `:a` (the service named `:n`).
         (
             scan(json!({"FilterExpression": "a = :a AND b = :n",
                         "ExpressionAttributeValues": {":a": {"N": "bob"}, ":n": duplicate_ns.clone()}})),
-            Some(format!("{INVALID_VALUE}{NUMERIC_BOB} for key :a")),
+            Some(format!(
+                "{INVALID_VALUE}Input collection contains duplicates for key :n"
+            )),
         ),
-        // No expression, or a ProjectionExpression alone: not refused here.
+        // No expression, or a ProjectionExpression alone: the expressions-only text.
         (
             scan(json!({"ExpressionAttributeValues": {":a": duplicate_ns.clone()}})),
-            None,
+            Some(EXPRESSIONS_ONLY.to_owned()),
         ),
         (
             scan(json!({"ProjectionExpression": "a",
                         "ExpressionAttributeValues": {":a": duplicate_ns.clone()}})),
-            None,
+            Some(EXPRESSIONS_ONLY.to_owned()),
         ),
     ];
     for (body, expected) in rows {
         assert_eq!(
-            message(validate_scan_request_body(&body)),
+            message(validate_before_authorization(
+                &body,
+                body.to_string().as_bytes()
+            )),
             expected,
             "{body}"
         );

@@ -164,10 +164,15 @@ fn key_info_for_authz(
 /// All authorization data is fetched via `state.authz_cache`, which sits on
 /// top of the underlying `AuthorizationStore` and serves cached, pre-parsed
 /// `PolicyDocument`s.
+///
+/// `raw_body` is the request text `input` was parsed from. The Scan checks
+/// ahead of the IAM decision read the member order of three maps from it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn authorize_request(
     state: &AppState,
     identity: &extenddb_auth::AuthIdentity,
     input: &Value,
+    raw_body: &[u8],
     operation: &str,
     account_id: &str,
     source_ip: Option<&str>,
@@ -245,18 +250,20 @@ pub(crate) async fn authorize_request(
         authz_resource::validate_tag_resource_arn_shape(arn)?;
     }
 
-    // A Query's and a Scan's request-time checks run before the IAM decision,
-    // after the cross-account refusal above; see
+    // A Query's request-time checks, and a Scan's checks up to its `Select`
+    // enum or its faulty `ExpressionAttributeValues` entries, run before the
+    // IAM decision, after the cross-account refusal above; see
     // `extenddb_engine::query_key_values::validate_query_request_body` and
-    // `extenddb_engine::scan_request::validate_scan_request_body`. The service
-    // answers a malformed Scan with its ValidationException for a principal
-    // that may not Scan the table (measured 2026-11-19 with a role allowed
-    // only DescribeTable: an `N` value that is not a number, a `Limit` of 0
-    // and a `Segment` of -1 each answer ValidationException). The checks read
-    // only the request body.
+    // `extenddb_engine::scan_request::validate_before_authorization`. The
+    // service answers a malformed Scan with its ValidationException for a
+    // principal that may not Scan the table (measured 2026-11-19 with a role
+    // allowed only DescribeTable: an `N` value that is not a number, a `Limit`
+    // of 0, a `Segment` of -1, an invalid `Select` and an entry with an
+    // unknown type descriptor each answer ValidationException). The checks
+    // read only the request.
     match operation {
         "Query" => extenddb_engine::query_key_values::validate_query_request_body(input)?,
-        "Scan" => extenddb_engine::scan_request::validate_scan_request_body(input)?,
+        "Scan" => extenddb_engine::scan_request::validate_before_authorization(input, raw_body)?,
         _ => {}
     }
 
