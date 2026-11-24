@@ -1,0 +1,47 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Checks that a PR title is a conventional commit subject
+# (devtools/check-pr-title). Squash is the only merge method and a squash
+# commit takes the PR title as its subject (CONTRIBUTING.md). The release
+# automation tracked in #1395 will build the changelog from those subjects.
+#
+# The title is read from the event payload and reaches the script through
+# the environment, never by interpolation into the script source. The job
+# checks out devtools/ (in cone mode, also the files at the repository
+# root) at the PR's base commit, so a PR that edits the checker is still
+# checked by the version on the base branch. It holds no credential. It
+# runs again when the title is edited. In a merge queue run there is no PR
+# title to check, and the job is skipped, which counts as passing.
+
+name: PR title
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  conventional:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out devtools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          sparse-checkout: devtools
+          persist-credentials: false
+
+      - name: Check the title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: python3 devtools/check-pr-title "$TITLE"

@@ -34,6 +34,12 @@ We suggest following the workflow below for proposing and contributing improveme
 1. Ensure all tests pass and code is properly formatted.
 1. Submit your changes as a pull request, linked to the issue and (if applicable) RFC that your
  work addresses.
+1. Title the pull request as a [conventional commit](https://www.conventionalcommits.org/) subject,
+ `type(scope): summary`, for example `fix(storage-postgres): retry a serialization failure`. Squash
+ is the only merge method, and the repository settings make the PR title the commit subject and the
+ PR description the commit message. The PR title check (`devtools/check-pr-title`) relies on these
+ settings and lists the accepted types. To revert a change, title the PR
+ `revert: <the reverted title>`; GitHub's default `Revert "..."` title fails the check.
 
 ### Build
 
