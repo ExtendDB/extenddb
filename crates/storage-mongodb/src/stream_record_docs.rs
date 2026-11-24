@@ -23,9 +23,10 @@ pub(crate) fn records_from_docs(docs: Vec<Document>) -> Result<Vec<StreamRecord>
             let record_bson = d
                 .remove("record_data")
                 .ok_or_else(|| StorageError::Internal("Missing record_data".to_owned()))?;
-            // Reverses the object-key escape applied when the record was
+            // Reverses the object-key escape of a record marked when it was
             // written; see json_to_item_data.
-            let json_val = crate::data::item_data_to_json(&record_bson)?;
+            let json_val =
+                crate::data::item_data_to_json(&record_bson, crate::data::names_escaped(&d))?;
             serde_json::from_value(json_val).map_err(|e| StorageError::Internal(e.to_string()))
         })
         .collect()

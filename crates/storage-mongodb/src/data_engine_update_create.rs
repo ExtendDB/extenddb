@@ -30,9 +30,9 @@
 //! `item_data: { a: { b: ... } }`, where PutItem stores the field `"a.b"`,
 //! and the same path conflicts with an update of an attribute named `a`.
 //! A key attribute name containing U+0000 or U+0001 has the same problem in
-//! another form: `item_to_document` stores it escaped
-//! (`extenddb_storage::util::control_chars`), and the path would name the
-//! raw text. A table with a key attribute name that
+//! another form: `item_to_document` stores it escaped in a document marked
+//! `names_escaped` (`crate::data::json_to_item_data`), and the path would
+//! name the raw text. A table with a key attribute name that
 //! `key_names_are_plain_paths` rejects therefore does not take the native
 //! upsert; it takes the session path, which writes the document
 //! `item_to_document` builds.
@@ -50,8 +50,9 @@ use crate::data::key_fields::insert_only_key_fields;
 /// Whether `name` is usable as one field name in a MongoDB update path. A dot
 /// would split it into nested fields and a leading `$` would read as an
 /// operator or positional path. A name containing U+0000 or U+0001 is stored
-/// in escaped form, so a path built from the raw name would address a
-/// different field (and BSON refuses U+0000 in a field name).
+/// escaped in a document marked `names_escaped`, so a path built from the raw
+/// name would address a different field there (and BSON refuses U+0000 in a
+/// field name).
 pub(super) fn is_plain_path_name(name: &str) -> bool {
     !name.contains('.') && !name.starts_with('$') && !needs_escape(name)
 }
@@ -183,8 +184,9 @@ mod tests {
 
     #[test]
     fn a_key_name_with_u0000_or_u0001_leaves_the_native_upsert() {
-        // item_to_document stores these names escaped, so the
-        // `item_data.<name>` path of the upsert would name another field.
+        // item_to_document stores these names escaped in a marked
+        // document, so the `item_data.<name>` path of the upsert would name
+        // another field there.
         assert!(key_names_are_plain_paths(&schema(&[(
             "a\u{2}b",
             KeyType::Hash

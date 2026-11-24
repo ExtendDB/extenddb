@@ -78,9 +78,9 @@ pub fn is_pushable(expr: &Expr, maps: &ExpressionMaps) -> Pushable {
 /// cannot safely be emitted as a MongoDB field path. A dot would mean nested
 /// document traversal in MongoDB, while a leading `$` would be interpreted as
 /// an operator or otherwise have special meaning in a MongoDB path. A name
-/// containing U+0000 or U+0001 is stored under its escaped form (see
-/// `extenddb_storage::util::escape_control`), so the raw name would not match
-/// the stored field.
+/// containing U+0000 or U+0001 is stored escaped in a document marked
+/// `names_escaped` (see `crate::data::json_to_item_data`) and as it is in
+/// another, so one field path cannot match both.
 fn unsafe_attribute_reason(expr: &Expr, maps: &ExpressionMaps) -> Option<&'static str> {
     match expr {
         Expr::Path(elements) => elements.iter().find_map(|element| match element {
@@ -402,8 +402,9 @@ mod tests {
 
     #[test]
     fn nul_attribute_name_is_not_pushable() {
-        // The stored field name is the escaped form, so a raw path on a
-        // name containing U+0000 would never match; must fall back.
+        // The stored field name is the escaped form in a marked document,
+        // so a raw path on a name containing U+0000 would not match; must
+        // fall back.
         let expr = Expr::Compare {
             left: Box::new(path("a\u{0}b")),
             op: CompareOp::Eq,

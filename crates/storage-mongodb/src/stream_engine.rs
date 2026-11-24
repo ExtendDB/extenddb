@@ -287,7 +287,7 @@ impl StreamEngine for MongoEngine {
                         { "$match": { "$expr": record_match } },
                         { "$sort": { "sequence_number": 1 } },
                         { "$limit": limit },
-                        { "$project": { "_id": 0, "record_data": 1 } },
+                        { "$project": { "_id": 0, "record_data": 1, "names_escaped": 1 } },
                     ],
                     "as": "records",
                 } },
@@ -297,6 +297,7 @@ impl StreamEngine for MongoEngine {
                     "shard_id": 1,
                     "has_record": { "$ne": [{ "$type": "$records" }, "missing"] },
                     "record_data": "$records.record_data",
+                    "names_escaped": "$records.names_escaped",
                 } },
             ];
             let cursor = self

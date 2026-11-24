@@ -28,8 +28,9 @@ use extenddb_storage::{
 use crate::MongoEngine;
 use crate::condition::condition_to_filter;
 use crate::data::{
-    binary_sk_to_hex, composite_id, data_collection_name, document_to_item, index_document,
-    index_entry_filter, item_to_document, json_to_item_data, pk_filter, sk_field_name, sk_suffix,
+    NAMES_ESCAPED, binary_sk_to_hex, composite_id, data_collection_name, document_to_item,
+    index_document, index_entry_filter, item_to_document, json_to_item_data, names_need_escape,
+    pk_filter, sk_field_name, sk_suffix,
 };
 use crate::pushdown::{Pushable, is_pushable};
 
@@ -37,8 +38,9 @@ use extenddb_core::types::{Projection, ProjectionType};
 
 /// Resolve a single-component update path for the native MongoDB fast path.
 /// Literal attribute names containing dots or beginning with `$` cannot be
-/// represented safely by MongoDB's ordinary update paths, and names
-/// containing U+0000 or U+0001 differ from the stored (escaped) field name,
+/// represented safely by MongoDB's ordinary update paths, and a name
+/// containing U+0000 or U+0001 is stored escaped in a document marked
+/// `names_escaped` and as it is in another, which this path does not read,
 /// so they must use the Rust/session path.
 fn native_attribute_name(path: &[PathElement], maps: &ExpressionMaps) -> Option<String> {
     if path.len() != 1 {
@@ -1831,11 +1833,16 @@ impl MongoEngine {
                         _ => return None, // complex expressions (if_not_exists, list_append, arithmetic)
                     };
                     let field = format!("item_data.{attr_name}");
-                    // The value lands inside item_data, so its nested map
-                    // keys must be in stored (escaped) form, matching what
-                    // item_to_document writes.
+                    // The value lands inside item_data. A nested field name
+                    // holding U+0000 or U+0001 is stored escaped in a marked
+                    // document and as it is in another, and this path does
+                    // not read the document, so such a value takes the slow
+                    // path; any other value is stored the same in both.
                     let val_json = serde_json::to_value(val).ok()?;
-                    let val_bson = json_to_item_data(val_json).ok()?;
+                    if names_need_escape(&val_json) {
+                        return None;
+                    }
+                    let val_bson = bson::to_bson(&val_json).ok()?;
                     set_doc.insert(field, val_bson);
                 }
                 UpdateAction::Remove { path } => {
@@ -2256,8 +2263,8 @@ impl MongoEngine {
             serde_json::to_value(&record).map_err(|e| StorageError::Internal(e.to_string()))?;
         // The record's key and image maps carry attribute names as object
         // keys, which become BSON field names; convert through the same
-        // escaping helper as item_data.
-        let record_bson = json_to_item_data(record_json)?;
+        // helper as item_data, and mark the record when it escaped them.
+        let (record_bson, escaped) = json_to_item_data(record_json)?;
 
         // key_info already carries table_id — no need to re-read the catalog
         // just to resolve it, and re-reading inside the session against the
@@ -2265,16 +2272,20 @@ impl MongoEngine {
         // needlessly.
         let table_id = &key_info.table_id;
 
+        let mut record_doc = doc! {
+            "sequence_number": &record.dynamodb.sequence_number,
+            "shard_id": &shard_id,
+            "table_id": table_id,
+            "event_name": crate::stream_engine::event_name_ddb_str(record.event_name),
+            "record_data": record_bson,
+            "created_at": created_at,
+        };
+        if escaped {
+            record_doc.insert(NAMES_ESCAPED, true);
+        }
         let records_coll = self.data_db.collection::<Document>("stream_records");
         records_coll
-            .insert_one(doc! {
-                "sequence_number": &record.dynamodb.sequence_number,
-                "shard_id": &shard_id,
-                "table_id": table_id,
-                "event_name": crate::stream_engine::event_name_ddb_str(record.event_name),
-                "record_data": record_bson,
-                "created_at": created_at,
-            })
+            .insert_one(record_doc)
             .session(&mut *session)
             .await
             .map_err(crate::write_conflict::transaction_error)?;
@@ -4745,9 +4756,10 @@ transaction_read_concern = "majority""#,
 
     #[test]
     fn native_update_rejects_control_character_literal_attribute_names() {
-        // Stored field names carry the escaped form of U+0000 and U+0001,
-        // so a native update path built from the raw name would target a
-        // different field; these names must use the Rust/session path.
+        // A marked document stores the escaped form of U+0000 and U+0001
+        // in field names, so a native update path built from the raw name
+        // would target a different field there; these names must use the
+        // Rust/session path.
         for name in ["a\u{0}b", "a\u{1}b"] {
             let mut names = std::collections::HashMap::new();
             names.insert("name".to_owned(), name.to_owned());
@@ -4755,6 +4767,27 @@ transaction_read_concern = "majority""#,
             let path = vec![PathElement::Attribute("#name".to_owned())];
 
             assert_eq!(native_attribute_name(&path, &maps), None, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn native_update_leaves_a_value_with_control_character_field_names() {
+        // A marked document stores such a nested name escaped and another
+        // document stores it as it is, and the native path reads neither, so
+        // the update takes the session path. A plain nested name stays native.
+        for (key, native) in [("k\u{0}", false), ("k\u{1}", false), ("k\u{2}", true)] {
+            let inner =
+                std::collections::BTreeMap::from([(key.to_owned(), AttributeValue::S("v".into()))]);
+            let values =
+                std::collections::HashMap::from([("m".to_owned(), AttributeValue::M(inner))]);
+            let maps = ExpressionMaps::new(std::collections::HashMap::new(), values);
+            let tokens = expression::tokenize("SET a = :m").unwrap();
+            let actions = expression::parse_update(&tokens).unwrap();
+            assert_eq!(
+                MongoEngine::try_build_native_update(&actions, &maps).is_some(),
+                native,
+                "{key:?}"
+            );
         }
     }
 
