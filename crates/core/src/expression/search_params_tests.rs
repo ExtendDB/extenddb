@@ -75,6 +75,25 @@ fn an_empty_attribute_name_answers_before_the_keys_and_the_values() {
     );
 }
 
+/// An attribute name of 65536 bytes or more answers ahead of a bad key, as
+/// an empty one does (measured on DynamoDB 2026-11-24, `{"n": <65536 bytes>}`
+/// twice in each of two regions).
+#[test]
+fn a_too_large_attribute_name_answers_before_the_keys() {
+    let large = "C".repeat(65536);
+    assert_eq!(
+        maps(Some(&names(&[("n", large.as_str())])), None),
+        "Attribute name is too large, must be less than 65536 bytes for key n"
+    );
+    assert_eq!(
+        maps(
+            Some(&names(&[("#a-b", large.as_str())])),
+            Some(&values(&[":us"]))
+        ),
+        "Attribute name is too large, must be less than 65536 bytes for key #a-b"
+    );
+}
+
 #[test]
 fn a_bad_name_key_answers_before_a_bad_value_key() {
     assert_eq!(
