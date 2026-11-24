@@ -18,9 +18,9 @@ use std::borrow::Cow;
 use extenddb_core::error::{DynamoDbError, validation_errors};
 use serde_json::{Map, Value};
 
+use super::value_fault::{TYPE_DESCRIPTORS, first_fault};
 use super::{
-    RETURN_CONSUMED_CAPACITY, SELECT, TYPE_DESCRIPTORS, first_fault, present, sorted_entries,
-    validate_name_keys, validate_names,
+    RETURN_CONSUMED_CAPACITY, SELECT, present, sorted_entries, validate_name_keys, validate_names,
 };
 use crate::int32_member::{LIMIT, RangeFault, RangeField, SEGMENT, TOTAL_SEGMENTS};
 
