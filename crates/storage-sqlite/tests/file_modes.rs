@@ -16,7 +16,7 @@
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use extenddb_storage::bootstrapper::{Bootstrapper, write_bootstrap_rows};
@@ -35,17 +35,16 @@ const RELEASE: &str = "1.0.0-test";
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// A fresh directory for one test, with the process umask set to 022.
-fn deployment_dir() -> PathBuf {
+/// A fresh directory for one test, with the process umask set to 022. The
+/// directory is removed when it is dropped, also when the test fails.
+fn deployment_dir() -> tempfile::TempDir {
     // SAFETY: umask reads and replaces the process file-mode mask and has no
     // other effect; every test in this binary sets the same value.
     unsafe { libc::umask(0o022) };
-    let dir = std::env::temp_dir().join(format!(
-        "extenddb-file-modes-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-    std::fs::create_dir_all(&dir).expect("dir");
-    dir
+    tempfile::Builder::new()
+        .prefix("extenddb-file-modes-")
+        .tempdir()
+        .expect("dir")
 }
 
 fn database_path(dir: &Path) -> String {
@@ -201,7 +200,8 @@ async fn first_write(path: &str, components: &ServerComponents) {
 #[tokio::test]
 async fn a_connection_outside_the_openers_leaves_0644_files() {
     use sqlx::Executor;
-    let dir = deployment_dir();
+    let tmp = deployment_dir();
+    let dir = tmp.path();
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
         .after_connect(|conn, _| {
@@ -222,14 +222,14 @@ async fn a_connection_outside_the_openers_leaves_0644_files() {
         assert_eq!(modes.get(name), Some(&0o644), "{name} in {modes:?}");
     }
     pool.close().await;
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `init`, `serve`, a first write, a clean stop and a second `serve` leave
 /// every file owner-only, with the WAL sidecars present while a server is up.
 #[tokio::test]
 async fn init_serve_write_stop_and_restart_leave_every_file_owner_only() {
-    let dir = deployment_dir();
+    let tmp = deployment_dir();
+    let dir = tmp.path();
     let path = database_path(&dir);
     let sidecars = ["x.sqlite-wal", "x.sqlite-shm"];
 
@@ -248,14 +248,14 @@ async fn init_serve_write_stop_and_restart_leave_every_file_owner_only() {
     let again = serve(&path, ServerComponentsOptions::default()).await;
     assert_owner_only(&dir, "a second serve", &sidecars);
     drop(again);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A dev-mode `serve` that bootstraps a database no `init` created makes it
 /// owner-only too.
 #[tokio::test]
 async fn a_bootstrapping_serve_creates_owner_only_files() {
-    let dir = deployment_dir();
+    let tmp = deployment_dir();
+    let dir = tmp.path();
     let path = database_path(&dir);
     let mut options = ServerComponentsOptions::default();
     options.bootstrap_if_uninitialized = true;
@@ -266,14 +266,14 @@ async fn a_bootstrapping_serve_creates_owner_only_files() {
         &["x.sqlite-wal", "x.sqlite-shm"],
     );
     drop(components);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Files left at 0644 by an earlier version are set to 0600 by the next
 /// `serve`, and by the next `migrate --yes`, before anything reads them.
 #[tokio::test]
 async fn serve_and_migrate_restrict_files_left_at_0644() {
-    let dir = deployment_dir();
+    let tmp = deployment_dir();
+    let dir = tmp.path();
     let path = database_path(&dir);
     init(&path).await;
 
@@ -289,7 +289,6 @@ async fn serve_and_migrate_restrict_files_left_at_0644() {
     set_every_mode(&dir, 0o644);
     migrate(&path).await;
     assert_owner_only(&dir, "migrate over 0644 files", &[]);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The migration runner's connection creates a missing database whatever the
@@ -299,7 +298,8 @@ async fn serve_and_migrate_restrict_files_left_at_0644() {
 /// from it. Nothing narrows the files after the connect.
 #[tokio::test]
 async fn the_migration_runner_creates_the_target_of_a_dangling_symlink_owner_only() {
-    let dir = deployment_dir();
+    let tmp = deployment_dir();
+    let dir = tmp.path();
     let link = dir.join("x.sqlite");
     std::os::unix::fs::symlink(dir.join("target.sqlite"), &link).expect("symlink");
     let location = format!("sqlite://{}", link.display());
@@ -310,7 +310,6 @@ async fn the_migration_runner_creates_the_target_of_a_dangling_symlink_owner_onl
         &["target.sqlite", "target.sqlite-wal", "target.sqlite-shm"],
     );
     drop(runner);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Over a database an earlier version left at 0644 with no sidecars, the
@@ -324,7 +323,8 @@ async fn the_migration_runner_creates_its_sidecars_at_0600_over_a_0644_database(
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
-    let dir = deployment_dir();
+    let tmp = deployment_dir();
+    let dir = tmp.path();
     let path = database_path(&dir);
     init(&path).await;
     for name in ["x.sqlite-wal", "x.sqlite-shm"] {
@@ -336,7 +336,7 @@ async fn the_migration_runner_creates_its_sidecars_at_0600_over_a_0644_database(
     let stop = Arc::new(AtomicBool::new(false));
     let seen = Arc::new(Mutex::new(BTreeMap::<String, u32>::new()));
     let watcher = {
-        let (stop, seen, dir) = (Arc::clone(&stop), Arc::clone(&seen), dir.clone());
+        let (stop, seen, dir) = (Arc::clone(&stop), Arc::clone(&seen), dir.to_path_buf());
         std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 for name in ["x.sqlite-wal", "x.sqlite-shm"] {
@@ -371,7 +371,6 @@ async fn the_migration_runner_creates_its_sidecars_at_0600_over_a_0644_database(
         assert_eq!(*mode, 0o600, "{name} was {mode:o} during the open");
     }
     drop(runner);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // Each opener alone, on a database path that does not exist yet, read before
@@ -383,7 +382,8 @@ async fn the_migration_runner_creates_its_sidecars_at_0600_over_a_0644_database(
 /// listing finds no table.
 #[tokio::test]
 async fn the_bootstrapper_pool_alone_creates_owner_only_files() {
-    let dir = deployment_dir();
+    let tmp = deployment_dir();
+    let dir = tmp.path();
     let path = database_path(&dir);
     let tables = SqliteBootstrapper::new(&path)
         .list_table_names()
@@ -391,20 +391,19 @@ async fn the_bootstrapper_pool_alone_creates_owner_only_files() {
         .expect("list_table_names");
     assert!(tables.is_empty(), "{tables:?}");
     assert_owner_only(&dir, "the bootstrapper's pool", &[]);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The engine's pool, which `serve` opens first.
 #[tokio::test]
 async fn the_engine_pool_alone_creates_owner_only_files() {
-    let dir = deployment_dir();
+    let tmp = deployment_dir();
+    let dir = tmp.path();
     let path = database_path(&dir);
     let engine = SqliteEngine::new(&path, 2, "us-east-1", 409_600)
         .await
         .expect("engine");
     assert_owner_only(&dir, "the engine's pool", &["x.sqlite-wal", "x.sqlite-shm"]);
     drop(engine);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The catalog pool, which `settings`, `verify` and the management and
@@ -414,12 +413,12 @@ async fn the_engine_pool_alone_creates_owner_only_files() {
 /// files at the first transaction.
 #[tokio::test]
 async fn the_catalog_pool_alone_creates_owner_only_files() {
-    let dir = deployment_dir();
+    let tmp = deployment_dir();
+    let dir = tmp.path();
     let path = database_path(&dir);
     let store = (extenddb_storage_sqlite::backend().settings_store)(&path)
         .await
         .expect("settings store");
     assert_owner_only(&dir, "the catalog pool", &[]);
     drop(store);
-    let _ = std::fs::remove_dir_all(&dir);
 }

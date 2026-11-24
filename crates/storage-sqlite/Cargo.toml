@@ -55,6 +55,8 @@ extenddb-backup-store = { path = "../backup-store" }
 # every tracing event of a child process.
 log = "0.4"
 tracing-subscriber = { workspace = true }
+# Scratch directories that are removed when a test panics.
+tempfile = "3"
 # The crate's own tests need `test-hooks`; a dev-dependency on itself turns
 # the feature on for test builds only.
 extenddb-storage-sqlite = { path = ".", features = ["test-hooks"] }

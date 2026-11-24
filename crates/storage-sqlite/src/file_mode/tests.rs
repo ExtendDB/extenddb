@@ -9,13 +9,13 @@ use std::sync::{Arc, Mutex};
 
 use super::{connect, prepare, restrict};
 
-fn temp_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "extenddb-file-mode-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-    std::fs::create_dir_all(&dir).expect("dir");
-    dir
+/// A directory for one test, removed when it is dropped, also when the test
+/// fails.
+fn temp_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("extenddb-file-mode-")
+        .tempdir()
+        .expect("dir")
 }
 
 fn mode(path: &Path) -> u32 {
@@ -61,18 +61,19 @@ async fn raw_wal_pool(path: &Path) -> sqlx::SqlitePool {
 
 #[test]
 fn prepare_creates_a_missing_database_with_mode_0600() {
-    let dir = temp_dir();
+    let tmp = temp_dir();
+    let dir = tmp.path();
     let db = dir.join("db.sqlite");
     prepare(&db.to_string_lossy()).expect("prepare");
     assert_eq!(mode(&db), 0o600);
     assert_eq!(std::fs::metadata(&db).expect("metadata").len(), 0);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A configured `sqlite:` URL names the same files as the path in it.
 #[test]
 fn prepare_and_restrict_accept_a_sqlite_url() {
-    let dir = temp_dir();
+    let tmp = temp_dir();
+    let dir = tmp.path();
     let db = dir.join("db.sqlite");
     let location = format!("sqlite://{}?mode=rwc", db.display());
     prepare(&location).expect("prepare");
@@ -84,12 +85,12 @@ fn prepare_and_restrict_accept_a_sqlite_url() {
     restrict(&location).expect("restrict");
     assert_eq!(mode(&db), 0o600);
     assert_eq!(mode(&wal), 0o600);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn prepare_and_restrict_set_an_existing_database_and_its_sidecars_to_0600() {
-    let dir = temp_dir();
+    let tmp = temp_dir();
+    let dir = tmp.path();
     let db = dir.join("db.sqlite");
     let files: Vec<PathBuf> = ["", "-wal", "-shm", "-journal"]
         .iter()
@@ -110,12 +111,12 @@ fn prepare_and_restrict_set_an_existing_database_and_its_sidecars_to_0600() {
     for file in &files {
         assert_eq!(mode(file), 0o600, "{}", file.display());
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn prepare_creates_nothing_when_the_connection_would_not() {
-    let dir = temp_dir();
+    let tmp = temp_dir();
+    let dir = tmp.path();
     let plain = dir.join("plain.sqlite");
     let read_only = dir.join("ro.sqlite");
     // A sqlite: URL is passed to sqlx as given: without mode=rwc sqlx does
@@ -158,7 +159,6 @@ fn prepare_creates_nothing_when_the_connection_would_not() {
     }
     restrict(&plain.to_string_lossy()).expect("restrict");
     assert_eq!(std::fs::read_dir(&dir).expect("read_dir").count(), 0);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Open a pool through `connect` that switches to WAL and writes in its
@@ -212,12 +212,12 @@ async fn connect_and_record_at(
 /// creates, are 0600 from the moment they exist.
 #[tokio::test]
 async fn connect_creates_a_missing_database_and_its_sidecars_at_0600() {
-    let dir = temp_dir();
+    let tmp = temp_dir();
+    let dir = tmp.path();
     let db = dir.join("db.sqlite");
     let (pool, seen) = connect_and_record(&db, None).await;
     assert_eq!(seen, [("", 0o600), ("-wal", 0o600), ("-shm", 0o600)]);
     pool.close().await;
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The rule the fix relies on, whatever the umask: SQLite gives a new
@@ -226,7 +226,8 @@ async fn connect_creates_a_missing_database_and_its_sidecars_at_0600() {
 /// connection opens it, so the sidecars the connection creates are 0600.
 #[tokio::test]
 async fn connect_restricts_an_existing_database_before_sqlite_creates_its_sidecars() {
-    let dir = temp_dir();
+    let tmp = temp_dir();
+    let dir = tmp.path();
     let db = dir.join("db.sqlite");
     raw_wal_pool(&db).await.close().await;
     for suffix in ["-wal", "-shm"] {
@@ -236,7 +237,6 @@ async fn connect_restricts_an_existing_database_before_sqlite_creates_its_sideca
     let (pool, seen) = connect_and_record(&db, None).await;
     assert_eq!(seen, [("", 0o600), ("-wal", 0o600), ("-shm", 0o600)]);
     pool.close().await;
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Whatever the connection leaves behind is set to 0600 once the pool
@@ -244,19 +244,20 @@ async fn connect_restricts_an_existing_database_before_sqlite_creates_its_sideca
 /// and its sidecars to 0644.
 #[tokio::test]
 async fn connect_restricts_the_files_after_the_pool_connects() {
-    let dir = temp_dir();
+    let tmp = temp_dir();
+    let dir = tmp.path();
     let db = dir.join("db.sqlite");
     let (pool, _) = connect_and_record(&db, Some(0o644)).await;
     for suffix in ["", "-wal", "-shm"] {
         assert_eq!(mode(&sidecar(&db, suffix)), 0o600, "{suffix}");
     }
     pool.close().await;
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn prepare_creates_the_target_of_a_dangling_symlink() {
-    let dir = temp_dir();
+    let tmp = temp_dir();
+    let dir = tmp.path();
     let target = dir.join("real.sqlite");
     let link = dir.join("link.sqlite");
     std::os::unix::fs::symlink(&target, &link).expect("symlink");
@@ -275,7 +276,6 @@ async fn prepare_creates_the_target_of_a_dangling_symlink() {
     restrict(&location).expect("restrict");
     assert_eq!(mode(&sidecar(&target, "-wal")), 0o600);
     pool.close().await;
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Mode calls that record each existing file they are asked to change and
@@ -305,7 +305,8 @@ fn within_ten_seconds(
 /// off) is left to SQLite, which refuses it; the directory keeps its mode.
 #[test]
 fn a_directory_at_the_database_name_keeps_its_mode() {
-    let dir = temp_dir();
+    let tmp = temp_dir();
+    let dir = tmp.path();
     let db_dir = dir.join("dbdir");
     std::fs::create_dir(&db_dir).expect("dbdir");
     set_mode(&db_dir, 0o755);
@@ -317,7 +318,6 @@ fn a_directory_at_the_database_name_keeps_its_mode() {
         restrict(&location).expect("restrict");
         assert_eq!(mode(&db_dir), 0o755, "{location}");
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Only a regular file is changed. A symlink at a sidecar name is not
@@ -327,7 +327,8 @@ fn a_directory_at_the_database_name_keeps_its_mode() {
 #[test]
 fn only_regular_files_are_changed_and_nothing_waits() {
     use std::os::unix::ffi::OsStrExt;
-    let dir = temp_dir();
+    let tmp = temp_dir();
+    let dir = tmp.path();
     let db = dir.join("db.sqlite");
     std::fs::write(&db, b"").expect("db");
     set_mode(&db, 0o644);
@@ -367,14 +368,14 @@ fn only_regular_files_are_changed_and_nothing_waits() {
     assert_eq!(mode(&fifo), 0o644, "the FIFO at -wal was changed");
     #[cfg(target_os = "linux")]
     assert_eq!(mode(&socket), 0o644, "the socket at -shm was changed");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A regular file wider than 0600 whose mode cannot be changed (here the
 /// change fails with EROFS) is an error naming the file, and stays as it was.
 #[test]
 fn a_file_that_cannot_be_narrowed_is_an_error() {
-    let dir = temp_dir();
+    let tmp = temp_dir();
+    let dir = tmp.path();
     let db = dir.join("db.sqlite");
     std::fs::write(&db, b"").expect("db");
     set_mode(&db, 0o644);
@@ -394,14 +395,14 @@ fn a_file_that_cannot_be_narrowed_is_an_error() {
         );
     }
     assert_eq!(mode(&db), 0o644);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Files already 0600, or narrower, are not changed at all, so a read-only
 /// mount whose files are already owner-only still opens.
 #[test]
 fn owner_only_files_are_left_alone() {
-    let dir = temp_dir();
+    let tmp = temp_dir();
+    let dir = tmp.path();
     let db = dir.join("db.sqlite");
     for (suffix, file_mode) in [("", 0o600), ("-wal", 0o600), ("-shm", 0o400)] {
         std::fs::write(sidecar(&db, suffix), b"").expect("create");
@@ -419,7 +420,6 @@ fn owner_only_files_are_left_alone() {
     assert_eq!(*asked.lock().expect("lock"), Vec::<PathBuf>::new());
     assert_eq!(mode(&db), 0o600);
     assert_eq!(mode(&sidecar(&db, "-shm")), 0o400);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Whether a write lock on `len` bytes at `start` of `file` would conflict
@@ -457,7 +457,8 @@ fn write_lock_conflicts(file: &Path, start: i64, len: i64) -> bool {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn narrowing_keeps_the_locks_of_an_open_connection() {
-    let dir = temp_dir();
+    let tmp = temp_dir();
+    let dir = tmp.path();
     let db = dir.join("db.sqlite");
     let pool = raw_wal_pool(&db).await;
     for suffix in ["", "-wal", "-shm"] {
@@ -476,7 +477,6 @@ async fn narrowing_keeps_the_locks_of_an_open_connection() {
         "the connection's lock on the -shm file was released"
     );
     pool.close().await;
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `prepare` creates the database file with mode 0600, rather than a wider
@@ -486,7 +486,8 @@ async fn narrowing_keeps_the_locks_of_an_open_connection() {
 #[test]
 fn prepare_creates_the_database_file_with_mode_0600() {
     use std::os::unix::fs::OpenOptionsExt;
-    let dir = temp_dir();
+    let tmp = temp_dir();
+    let dir = tmp.path();
     let reference = dir.join("reference");
     std::fs::OpenOptions::new()
         .write(true)
@@ -508,7 +509,6 @@ fn prepare_creates_the_database_file_with_mode_0600() {
     super::prepare_with(&db.to_string_lossy(), &calls).expect("prepare");
     assert_eq!(*created_with.lock().expect("lock"), Some(mode(&reference)));
     assert_eq!(mode(&db), 0o600);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Location forms on which SQLite creates the database on disk: the last of
@@ -522,7 +522,8 @@ async fn forms_sqlite_creates_on_disk_start_at_0600() {
         "sqlite:file:{db}%3Fcache=shared?mode=rwc",
         "sqlite:file:{db}%3Fmode=rwc?mode=rwc",
     ] {
-        let dir = temp_dir();
+        let tmp = temp_dir();
+        let dir = tmp.path();
         let db = dir.join("db.sqlite");
         let location = form.replace("{db}", &db.to_string_lossy());
         let (pool, seen) = connect_and_record_at(&location, &db, None).await;
@@ -532,7 +533,6 @@ async fn forms_sqlite_creates_on_disk_start_at_0600() {
             "{location}"
         );
         pool.close().await;
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -541,7 +541,8 @@ async fn forms_sqlite_creates_on_disk_start_at_0600() {
 /// `restrict` reaches it and its sidecars, which the setup leaves at 0644.
 #[tokio::test]
 async fn a_decoded_file_uri_path_names_the_file_sqlite_opens() {
-    let dir = temp_dir();
+    let tmp = temp_dir();
+    let dir = tmp.path();
     let db = dir.join("a b.sqlite");
     let location = format!("sqlite:file:{}/a%2520b.sqlite?mode=rwc", dir.display());
     let (pool, seen) = connect_and_record_at(&location, &db, Some(0o644)).await;
@@ -562,7 +563,6 @@ async fn a_decoded_file_uri_path_names_the_file_sqlite_opens() {
     names.sort();
     assert_eq!(names, ["a b.sqlite", "a b.sqlite-shm", "a b.sqlite-wal"]);
     pool.close().await;
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Locations that name a path SQLite does not open: `mod%65=memory`, which
@@ -572,7 +572,8 @@ async fn a_decoded_file_uri_path_names_the_file_sqlite_opens() {
 /// path names, and the in-memory connection leaves nothing there either.
 #[tokio::test]
 async fn locations_sqlite_does_not_open_as_named_are_left_alone() {
-    let dir = temp_dir();
+    let tmp = temp_dir();
+    let dir = tmp.path();
     let db = dir.join("db.sqlite");
     let in_memory = format!("sqlite://{}?mode=rwc&mod%65=memory", db.display());
     for location in [
@@ -592,5 +593,4 @@ async fn locations_sqlite_does_not_open_as_named_are_left_alone() {
         .expect("write");
     pool.close().await;
     assert_eq!(std::fs::read_dir(&dir).expect("read_dir").count(), 0);
-    let _ = std::fs::remove_dir_all(&dir);
 }
