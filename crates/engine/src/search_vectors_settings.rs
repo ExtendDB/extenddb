@@ -12,9 +12,12 @@
 //! A read is kept for [`REFRESH`], so a busy server reads the catalog about
 //! once per interval rather than once per request, and a change made through
 //! the management API applies at once through
-//! [`search_filter_settings_changed`]. A read that fails or outlasts
-//! [`READ_TIMEOUT`] answers `ServiceUnavailableException`, as other transient
-//! storage faults do; it never changes which grammar an account gets.
+//! [`search_filter_settings_changed`]. When a read fails or outlasts
+//! [`READ_TIMEOUT`], the server uses the value of its last read that
+//! answered, a change through the management API notwithstanding. Before any
+//! read has answered, such a read answers `ServiceUnavailableException`, as
+//! other transient storage faults do. A fault never changes which grammar an
+//! account gets.
 //!
 //! A server sends at most one read of the setting at a time. A read that
 //! outlasts [`READ_TIMEOUT`] keeps running in its own task, and the next
@@ -99,7 +102,8 @@ struct Kept {
     read_at: Instant,
     /// The stored value, so a malformed value is logged once per change.
     raw: Option<String>,
-    /// `None` when the read failed.
+    /// The value of the last read that answered, this one or an earlier one.
+    /// `None` when no read has answered yet.
     accounts: Option<EnabledAccounts>,
 }
 
@@ -113,6 +117,10 @@ struct InFlight {
 struct Settings {
     store: Arc<dyn SettingsStore>,
     kept: Mutex<Option<Kept>>,
+    /// The value of the last read that answered, with the value of
+    /// [`Settings::changes`] when it was sent. A change through the management
+    /// API leaves it, so a read that fails after a change uses it.
+    last: Mutex<Option<(u64, EnabledAccounts)>>,
     /// How many times the management API changed the setting, so a read
     /// sent before a change is not used after it.
     changes: Mutex<u64>,
@@ -128,6 +136,7 @@ impl Settings {
         Self {
             store,
             kept: Mutex::new(None),
+            last: Mutex::new(None),
             changes: Mutex::new(0),
             reading: tokio::sync::Mutex::new(None),
         }
@@ -137,6 +146,22 @@ impl Settings {
         let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
         *self.changes.lock().unwrap_or_else(PoisonError::into_inner) += 1;
         *kept = None;
+    }
+
+    /// The value of the last read that answered.
+    fn last(&self) -> Option<EnabledAccounts> {
+        let last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+        last.as_ref().map(|(_, accounts)| accounts.clone())
+    }
+
+    /// The value of the last read that answered, when no change through the
+    /// management API came after it was sent.
+    fn unchanged_last(&self) -> Option<EnabledAccounts> {
+        let last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+        let changes = self.changes();
+        last.as_ref()
+            .filter(|(sent, _)| *sent == changes)
+            .map(|(_, accounts)| accounts.clone())
     }
 
     fn changes(&self) -> u64 {
@@ -164,7 +189,16 @@ impl Settings {
         if let Some(answer) = self.fresh() {
             return answer;
         }
-        let mut reading = self.reading.lock().await;
+        // A request does not wait on a read that another request waits on, or
+        // that outlasted READ_TIMEOUT, when an earlier read answered after the
+        // last change: it uses that read's value.
+        let mut reading = match self.reading.try_lock() {
+            Ok(reading) => reading,
+            Err(_) => match self.unchanged_last() {
+                Some(accounts) => return Ok(accounts),
+                None => self.reading.lock().await,
+            },
+        };
         if let Some(answer) = self.fresh() {
             return answer;
         }
@@ -175,6 +209,11 @@ impl Settings {
             .is_some_and(|r| r.changes != self.changes())
         {
             *reading = None;
+        }
+        if reading.as_ref().is_some_and(|r| !r.task.is_finished())
+            && let Some(accounts) = self.unchanged_last()
+        {
+            return Ok(accounts);
         }
         let in_flight = reading.get_or_insert_with(|| self.send_read());
         let sent = in_flight.changes;
@@ -190,21 +229,23 @@ impl Settings {
                 if let Some(ignored) = ignored {
                     tracing::warn!("{ignored}");
                 }
+                *self.last.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some((sent, accounts.clone()));
                 (raw, Some(accounts))
             }
             Ok(Ok(Err(e))) => {
                 tracing::warn!("{SEARCH_INEQUALITY_FILTERS} could not be read: {e:?}");
-                (previous, None)
+                (previous, self.last())
             }
             Ok(Err(e)) => {
                 tracing::warn!("{SEARCH_INEQUALITY_FILTERS} could not be read: {e}");
-                (previous, None)
+                (previous, self.last())
             }
             Err(_) => {
                 tracing::warn!(
                     "{SEARCH_INEQUALITY_FILTERS} could not be read within {READ_TIMEOUT:?}"
                 );
-                (previous, None)
+                (previous, self.last())
             }
         };
         let answer = accounts.clone().ok_or_else(unavailable);
