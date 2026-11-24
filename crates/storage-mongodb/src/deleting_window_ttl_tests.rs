@@ -44,8 +44,10 @@ impl Fixture {
 }
 
 /// UpdateTimeToLive during the window writes the catalog document, the way the
-/// service runs its ordinary TTL rules there (measured 2026-10-25), and the
-/// other non-ACTIVE statuses keep their refusal.
+/// service runs its ordinary TTL rules there (measured 2026-10-25). A CREATING
+/// table keeps `TableNotActive`, ExtendDB's current answer: the service
+/// answers `ResourceNotFoundException` for a CREATING table (measured
+/// 2026-11-20).
 #[tokio::test]
 async fn update_ttl_during_the_window_is_served() {
     let Some(f) = Fixture::new().await else {

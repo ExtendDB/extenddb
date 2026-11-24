@@ -281,100 +281,114 @@ class TestDeletingWindowDataPlane:
         assert_validation(exc.value, NOT_FOUND, "ResourceNotFoundException")
 
 
-class TestDeletingWindowTimeToLive:
+_DESCRIBE_TTL_REFUSED = (
+    "ValidationException",
+    "Cannot describe time to live while table is in DELETING state: "
+    "Current table state is DELETING",
+)
+_TTL_ON = {"Enabled": True, "AttributeName": "ttl"}
+_STREAM_TAG = [{"Key": "sk", "Value": "sv"}]
+
+# The TTL calls and the stream ARN tag calls in the window, one table per row:
+# on the service a tag write starts a tag update that refuses the next tag
+# write on the resource for a few seconds, so a row that writes a tag before
+# DeleteTable waits that update out. A row is (the table has a stream,
+# steps before DeleteTable, steps after it). A step is (operation, request,
+# answer), where the answer is the response body or an (error code, message)
+# pair. ``{name}`` and ``{stream}`` (the table's LatestStreamArn) are
+# filled in per table. Measured: the TTL rows 2026-10-25 (three tables, every
+# call while DescribeTable read DELETING, the DescribeTimeToLive refusal before
+# and after an UpdateTimeToLive); the stream ARN rows 2026-10-26.
+WINDOW_ROWS = [
+    pytest.param(
+        False,
+        [],
+        [("describe_time_to_live", {"TableName": "{name}"}, _DESCRIBE_TTL_REFUSED)],
+        id="describe-ttl",
+    ),
+    pytest.param(
+        False,
+        [],
+        [
+            (
+                "update_time_to_live",
+                {"TableName": "{name}", "TimeToLiveSpecification": _TTL_ON},
+                {"TimeToLiveSpecification": _TTL_ON},
+            ),
+            ("describe_time_to_live", {"TableName": "{name}"}, _DESCRIBE_TTL_REFUSED),
+        ],
+        id="update-ttl",
+    ),
+    pytest.param(
+        True,
+        [],
+        [("tag_resource", {"ResourceArn": "{stream}", "Tags": _STREAM_TAG}, {})],
+        id="tag-stream",
+    ),
+    pytest.param(
+        True,
+        [("tag_resource", {"ResourceArn": "{stream}", "Tags": _STREAM_TAG}, {})],
+        [
+            ("list_tags_of_resource", {"ResourceArn": "{stream}"}, {"Tags": _STREAM_TAG}),
+            ("untag_resource", {"ResourceArn": "{stream}", "TagKeys": ["sk"]}, {}),
+        ],
+        id="untag-stream",
+    ),
+]
+
+
+def _fill(value, values: dict):
+    """``value`` with each ``{key}`` in its strings replaced from ``values``."""
+    if isinstance(value, str):
+        return value.format(**values)
+    if isinstance(value, dict):
+        return {key: _fill(item, values) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_fill(item, values) for item in value]
+    return value
+
+
+def _run_step(dynamodb_client, step, values: dict) -> None:
+    """Send one request of a row and assert its whole answer."""
+    operation, request, answer = step
+    call = getattr(dynamodb_client, operation)
+    if isinstance(answer, tuple):
+        code, message = answer
+        with pytest.raises(ClientError) as exc:
+            call(**_fill(request, values))
+        assert_validation(exc.value, _fill(message, values), code)
+    else:
+        resp = call(**_fill(request, values))
+        resp.pop("ResponseMetadata", None)
+        assert resp == _fill(answer, values), operation
+
+
+class TestDeletingWindowTimeToLiveAndStreamTags:
     """``DescribeTimeToLive`` is refused during the window and
-    ``UpdateTimeToLive`` runs its ordinary rules (measured 2026-10-25 on three
-    tables, every call issued while ``DescribeTable`` read ``DELETING``).
+    ``UpdateTimeToLive`` runs its ordinary rules. The table's stream ARN is a
+    resource of its own: both tag writes and the read are served on it, where
+    the table ARN refuses the writes (``TestDeletingWindowControlPlane``).
     ``DescribeTimeToLive`` on a ``CREATING`` table is refused with the same
     sentence naming ``CREATING`` (measured 2026-10-26); the fixture cannot hold
     a table ``CREATING``, so that row is pinned in the engine's unit tests."""
 
-    def test_describe_time_to_live_is_refused(self, dynamodb_client, is_extenddb):
+    @pytest.mark.parametrize("stream, before, after", WINDOW_ROWS)
+    def test_answers_in_the_window(self, dynamodb_client, is_extenddb, stream, before, after):
         name = unique_name("del-window")
-        lock = _open_window(dynamodb_client, is_extenddb, name)
+        lock = _open_window(dynamodb_client, is_extenddb, name, stream=stream)
         try:
-            dynamodb_client.delete_table(TableName=name)
-            with pytest.raises(ClientError) as exc:
-                dynamodb_client.describe_time_to_live(TableName=name)
-            err = exc.value.response["Error"]
-            assert err["Code"] == "ValidationException"
-            assert err["Message"] == (
-                "Cannot describe time to live while table is in DELETING state: "
-                "Current table state is DELETING"
-            )
-        finally:
-            if lock is not None:
-                lock.release()
-        wait_for_deleted(dynamodb_client, name, timeout=120.0)
-
-    def test_update_time_to_live_is_served(self, dynamodb_client, is_extenddb):
-        """The enable is accepted and answers with the specification it wrote;
-        DescribeTimeToLive stays refused after it."""
-        name = unique_name("del-window")
-        lock = _open_window(dynamodb_client, is_extenddb, name)
-        try:
-            dynamodb_client.delete_table(TableName=name)
-            resp = dynamodb_client.update_time_to_live(
-                TableName=name,
-                TimeToLiveSpecification={"Enabled": True, "AttributeName": "ttl"},
-            )
-            assert resp["TimeToLiveSpecification"] == {
-                "Enabled": True,
-                "AttributeName": "ttl",
+            table = dynamodb_client.describe_table(TableName=name)["Table"]
+            values = {
+                "name": name,
+                "stream": table.get("LatestStreamArn", ""),
             }
-            with pytest.raises(ClientError) as exc:
-                dynamodb_client.describe_time_to_live(TableName=name)
-            assert exc.value.response["Error"]["Code"] == "ValidationException"
-        finally:
-            if lock is not None:
-                lock.release()
-        wait_for_deleted(dynamodb_client, name, timeout=120.0)
-
-
-class TestDeletingWindowTags:
-    """The table's stream ARN is a resource of its own: both tag writes and the
-    read are served on it during the window (measured 2026-10-26), where the
-    table ARN refuses the writes (``TestDeletingWindowControlPlane``)."""
-
-    def test_stream_arn_tag_resource_is_served(self, dynamodb_client, is_extenddb):
-        """TagResource on the stream ARN, the first tag write after the delete,
-        answers 200 with an empty body."""
-        name = unique_name("del-window")
-        lock = _open_window(dynamodb_client, is_extenddb, name, stream=True)
-        try:
-            stream_arn = dynamodb_client.describe_table(TableName=name)["Table"]["LatestStreamArn"]
+            for step in before:
+                _run_step(dynamodb_client, step, values)
+            if before:
+                _settle_tags(dynamodb_client, is_extenddb, values["stream"])
             dynamodb_client.delete_table(TableName=name)
-
-            resp = dynamodb_client.tag_resource(
-                ResourceArn=stream_arn, Tags=[{"Key": "sk", "Value": "sv"}]
-            )
-            resp.pop("ResponseMetadata", None)
-            assert resp == {}
-        finally:
-            if lock is not None:
-                lock.release()
-        wait_for_deleted(dynamodb_client, name, timeout=120.0)
-
-    def test_stream_arn_untag_resource_is_served(self, dynamodb_client, is_extenddb):
-        """ListTagsOfResource on the stream ARN answers with the tags written
-        before the delete, and UntagResource on it, the first tag write after
-        the delete, answers 200 with an empty body."""
-        name = unique_name("del-window")
-        lock = _open_window(dynamodb_client, is_extenddb, name, stream=True)
-        try:
-            stream_arn = dynamodb_client.describe_table(TableName=name)["Table"]["LatestStreamArn"]
-            dynamodb_client.tag_resource(
-                ResourceArn=stream_arn, Tags=[{"Key": "sk", "Value": "sv"}]
-            )
-            _settle_tags(dynamodb_client, is_extenddb, stream_arn)
-            dynamodb_client.delete_table(TableName=name)
-
-            listed = dynamodb_client.list_tags_of_resource(ResourceArn=stream_arn)
-            assert listed["Tags"] == [{"Key": "sk", "Value": "sv"}]
-
-            resp = dynamodb_client.untag_resource(ResourceArn=stream_arn, TagKeys=["sk"])
-            resp.pop("ResponseMetadata", None)
-            assert resp == {}
+            for step in after:
+                _run_step(dynamodb_client, step, values)
         finally:
             if lock is not None:
                 lock.release()

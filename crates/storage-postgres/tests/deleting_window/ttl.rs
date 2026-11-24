@@ -10,7 +10,6 @@
 use std::sync::Arc;
 
 use extenddb_storage::MetadataEngine;
-use extenddb_storage::error::StorageError;
 use serde_json::json;
 
 use super::{
@@ -18,90 +17,85 @@ use super::{
     start_deleting, status_of,
 };
 
-/// UpdateTimeToLive during the window writes the catalog row, the way the
-/// service runs its ordinary TTL rules there (measured 2026-10-25), and leaves
-/// the status alone. The disable direction is served too.
+/// UpdateTimeToLive by the status of `TABLE`'s catalog row, on one window,
+/// row after row. DELETING is admitted beside ACTIVE in both directions, the
+/// way the service runs its ordinary TTL rules in the window (measured
+/// 2026-10-25): the write lands on the row and leaves the status alone. A
+/// CREATING table keeps `TableNotActive` and a missing one `TableNotFound`,
+/// ExtendDB's current answers: the service answers `ResourceNotFoundException`
+/// for a CREATING table (measured 2026-11-20).
 #[tokio::test]
-async fn update_ttl_during_the_window_is_served() {
+async fn update_ttl_by_table_status() {
+    // (status of `TABLE`, table named, the calls' `enabled` in order, the
+    // stored `ttl_attribute` after them or the last call's error)
+    type Row = (
+        &'static str,
+        &'static str,
+        &'static [bool],
+        Result<Option<&'static str>, String>,
+    );
     if base_conn().is_none() {
-        return skip("update_ttl_during_the_window_is_served");
+        return skip("update_ttl_by_table_status");
     }
     let s = scratch().await;
     open_window(&s).await;
 
-    s.engine
-        .update_ttl(ACCOUNT, TABLE, "ttl", true)
+    let rows: [Row; 4] = [
+        ("DELETING", TABLE, &[true], Ok(Some("ttl"))),
+        ("DELETING", TABLE, &[true, false], Ok(None)),
+        (
+            "CREATING",
+            TABLE,
+            &[true],
+            Err(format!("TableNotActive({TABLE:?})")),
+        ),
+        (
+            "DELETING",
+            "t_absent",
+            &[true],
+            Err("TableNotFound(\"t_absent\")".to_owned()),
+        ),
+    ];
+    for (status, table, calls, expected) in rows {
+        let row = format!("{status} {table} {calls:?}");
+        sqlx::query(
+            "UPDATE tables SET table_status = $1 WHERE account_id = $2 AND table_name = $3",
+        )
+        .bind(status)
+        .bind(ACCOUNT)
+        .bind(TABLE)
+        .execute(&s.catalog)
         .await
-        .expect("UpdateTimeToLive on a DELETING table");
-    let attr: Option<String> = sqlx::query_scalar(
-        "SELECT ttl_attribute FROM tables WHERE account_id = $1 AND table_name = $2",
-    )
-    .bind(ACCOUNT)
-    .bind(TABLE)
-    .fetch_one(&s.catalog)
-    .await
-    .expect("read the TTL attribute");
-    assert_eq!(attr.as_deref(), Some("ttl"));
-    assert_eq!(
-        status_of(&s.catalog, TABLE).await.as_deref(),
-        Some("DELETING"),
-        "the write must not change the status"
-    );
-
-    s.engine
-        .update_ttl(ACCOUNT, TABLE, "ttl", false)
-        .await
-        .expect("the disable direction during the window");
-    let attr: Option<String> = sqlx::query_scalar(
-        "SELECT ttl_attribute FROM tables WHERE account_id = $1 AND table_name = $2",
-    )
-    .bind(ACCOUNT)
-    .bind(TABLE)
-    .fetch_one(&s.catalog)
-    .await
-    .expect("read the TTL attribute");
-    assert_eq!(attr, None);
-
-    s.cleanup().await;
-}
-
-/// A CREATING table keeps the TTL refusal: the window admits DELETING only,
-/// and a table with no row at all is still reported as absent.
-#[tokio::test]
-async fn update_ttl_outside_active_and_deleting_keeps_its_refusal() {
-    if base_conn().is_none() {
-        return skip("update_ttl_outside_active_and_deleting_keeps_its_refusal");
+        .expect("set the status");
+        let (last, earlier) = calls.split_last().expect("one call at least");
+        for &enabled in earlier {
+            s.engine
+                .update_ttl(ACCOUNT, table, "ttl", enabled)
+                .await
+                .unwrap_or_else(|e| panic!("{row}: an earlier call failed: {e:?}"));
+        }
+        let result = s.engine.update_ttl(ACCOUNT, table, "ttl", *last).await;
+        match expected {
+            Ok(attribute) => {
+                result.unwrap_or_else(|e| panic!("{row}: {e:?}"));
+                let stored: Option<String> = sqlx::query_scalar(
+                    "SELECT ttl_attribute FROM tables WHERE account_id = $1 AND table_name = $2",
+                )
+                .bind(ACCOUNT)
+                .bind(table)
+                .fetch_one(&s.catalog)
+                .await
+                .expect("read the TTL attribute");
+                assert_eq!(stored.as_deref(), attribute, "{row}");
+            }
+            Err(error) => assert_eq!(format!("{:?}", result.expect_err(&row)), error, "{row}"),
+        }
+        assert_eq!(
+            status_of(&s.catalog, TABLE).await.as_deref(),
+            Some(status),
+            "{row}: the write must not change the status"
+        );
     }
-    let s = scratch().await;
-    open_window(&s).await;
-    sqlx::query(
-        "UPDATE tables SET table_status = 'CREATING' WHERE account_id = $1 AND table_name = $2",
-    )
-    .bind(ACCOUNT)
-    .bind(TABLE)
-    .execute(&s.catalog)
-    .await
-    .expect("mark CREATING");
-
-    let err = s
-        .engine
-        .update_ttl(ACCOUNT, TABLE, "ttl", true)
-        .await
-        .expect_err("UpdateTimeToLive on a CREATING table");
-    assert!(
-        matches!(&err, StorageError::TableNotActive(name) if name == TABLE),
-        "expected TableNotActive({TABLE:?}), got {err:?}"
-    );
-
-    let err = s
-        .engine
-        .update_ttl(ACCOUNT, "t_absent", "ttl", true)
-        .await
-        .expect_err("UpdateTimeToLive on a missing table");
-    assert!(
-        matches!(&err, StorageError::TableNotFound(name) if name == "t_absent"),
-        "expected TableNotFound(\"t_absent\"), got {err:?}"
-    );
 
     s.cleanup().await;
 }

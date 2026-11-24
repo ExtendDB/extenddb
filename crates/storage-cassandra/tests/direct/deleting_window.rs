@@ -179,9 +179,11 @@ async fn update_table_on_a_creating_table_keeps_table_not_active() {
 
 /// UpdateTimeToLive during the window writes the catalog row, the way the
 /// service runs its ordinary TTL rules there (measured 2026-10-25), and leaves
-/// the status alone; the other non-ACTIVE statuses keep their refusal. The
-/// enable is undone before the row is removed so the account keyspace's TTL
-/// entries do not outlive the test.
+/// the status alone. A CREATING table keeps `TableNotActive`, ExtendDB's
+/// current answer: the service answers `ResourceNotFoundException` for a
+/// CREATING table (measured 2026-11-20). The enable reports ENABLING, as on an
+/// ACTIVE table before its backfill runs. The enable is undone before the row
+/// is removed so the account keyspace's TTL entries do not outlive the test.
 #[tokio::test]
 async fn update_ttl_during_the_window_is_served() {
     use extenddb_core::types::TimeToLiveStatus;
@@ -201,7 +203,7 @@ async fn update_ttl_during_the_window_is_served() {
         .await
         .expect("the TTL description");
     assert_eq!(desc.attribute_name.as_deref(), Some("ttl"));
-    assert_ne!(desc.time_to_live_status, TimeToLiveStatus::Disabled);
+    assert_eq!(desc.time_to_live_status, TimeToLiveStatus::Enabling);
     assert_eq!(
         status_of(&engine, &account.account_id).await.as_deref(),
         Some("DELETING"),
