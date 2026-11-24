@@ -373,6 +373,17 @@ def _wait_active(ddb, name: str, timeout: float = 60.0) -> None:
     raise AssertionError(f"{name} did not become ACTIVE")
 
 
+def _wait_log(server: _Server, needle: str, timeout: float = 60.0) -> str:
+    """The server's log once it holds `needle`, failing after `timeout`
+    seconds. A job can write its line after the state a test waits for: a
+    restore writes its `ACTIVE` line after it flips the target (#1157)."""
+    deadline = time.monotonic() + timeout
+    while needle not in server.log_text():
+        assert time.monotonic() < deadline, server.log_text()[-4000:]
+        time.sleep(0.2)
+    return server.log_text()
+
+
 def _create_composite_table(ddb, name: str, gsi: bool = False) -> None:
     """A key-ordered table: `pk` S hash key, `sk` N range key."""
     attrs = [
@@ -964,7 +975,10 @@ def _wait_table_gone(ddb, name: str, timeout: float = 120.0) -> None:
         except ClientError as e:
             assert e.response["Error"]["Code"] == "ResourceNotFoundException", e.response["Error"]
             return
-        assert status == "CREATING", f"{name} is {status}, it was never writable"
+        # The removal of a failed restore's target can pass through DELETING
+        # (PostgreSQL's abort_restore sets it before the drop), so a poll can
+        # see either status. Neither is writable.
+        assert status in ("CREATING", "DELETING"), f"{name} is {status}, it was never writable"
         time.sleep(0.2)
     raise AssertionError(f"{name} still exists after {timeout} s")
 
@@ -1001,10 +1015,8 @@ def test_a_tampered_data_file_fails_the_restore_before_any_item(deployment, tmp_
     a file is loaded reads "data file <key>: data file sha256 checksum
     mismatch" or, when the flipped byte sits in the gzip trailer so the
     decoder's own CRC fires first, "data file <key>: data file decode error:
-    corrupt gzip stream does not have a matching checksum" instead. A
-    CREATING target answers no read whatever the job did, so the GetItem
-    probe below only confirms the target never became readable. The backup
-    itself stays AVAILABLE."""
+    corrupt gzip stream does not have a matching checksum" instead. The
+    backup itself stays AVAILABLE."""
     d = deployment
     _restore_cell(d)
     _add_backup_settings(d, RESTORE_BACKUP_SETTINGS)
@@ -1017,33 +1029,10 @@ def test_a_tampered_data_file_fails_the_restore_before_any_item(deployment, tmp_
             last = f.read(1)
             f.seek(-1, os.SEEK_END)
             f.write(bytes([last[0] ^ 0xFF]))
-        target = f"{name}-r"
-        resp = ddb.restore_table_from_backup(TargetTableName=target, BackupArn=arn)["TableDescription"]
-        assert resp["TableStatus"] == "CREATING", resp
-        assert resp["RestoreSummary"]["SourceBackupArn"] == arn, resp
-        readable = []
-        deadline = time.monotonic() + 120
-        while time.monotonic() < deadline:
-            try:
-                got = ddb.get_item(TableName=target, Key={"pk": {"S": "p0000"}, "sk": {"N": "0"}}, ConsistentRead=True)
-                if "Item" in got:
-                    readable.append(got["Item"])
-            except ClientError:
-                pass
-            try:
-                ddb.describe_table(TableName=target)
-            except ClientError as e:
-                assert e.response["Error"]["Code"] == "ResourceNotFoundException", e.response["Error"]
-                break
-            time.sleep(0.2)
-        else:
-            raise AssertionError(f"{target} was not removed within 120 s")
-        assert readable == [], f"an item of the failed restore was readable: {readable[:1]}"
-        log = server.log_text()
-        failed = [line for line in log.splitlines() if "FAILED (data file data/000002.json.gz does not match the manifest" in line]
-        assert len(failed) == 1, log[-4000:]
-        assert "the target was removed" in failed[0], failed[0]
-        assert ddb.describe_backup(BackupArn=arn)["BackupDescription"]["BackupDetails"]["BackupStatus"] == "AVAILABLE"
+        _restore_fails(
+            server, ddb, f"{name}-r", arn,
+            "FAILED (data file data/000002.json.gz does not match the manifest",
+        )
     finally:
         server.stop()
 
@@ -1110,9 +1099,8 @@ def test_sigterm_leaves_the_restore_running_and_it_finishes_after_restart(deploy
             Select="COUNT",
         )["Count"]
         assert by_g == RESTORE_ITEMS // 50, by_g
-        log = server.log_text()
+        log = _wait_log(server, ": ACTIVE, ")
         assert "taken over by this instance and resumed" in log, log[-4000:]
-        assert ": ACTIVE, " in log, log[-4000:]
     finally:
         server.stop()
 
@@ -1167,16 +1155,10 @@ def test_a_store_outage_mid_download_leaves_the_restore_running_and_it_completes
     moto_host, moto_port = _moto_or_skip()
     bucket = moto_bucket
     base = os.path.realpath(str(tmp_path))
-    port = _free_port()
-    store = (
-        '[backup.store]\nkind = "s3"\n[backup.store.s3]\n'
-        f'bucket = "{bucket}"\nendpoint = "http://127.0.0.1:{port}"\n'
-        'force_path_style = true\nregion = "us-east-1"\n'
-    )
     if _sqlite_build():
         sd = _SqliteDeployment(str(tmp_path))
         spool = os.path.join(base, "backup-spool")
-        _append(sd.config, "[backup]\nreconcile_interval_secs = 1\nmax_concurrent_jobs = 1\n" + RESTORE_BACKUP_SETTINGS + store)
+        _append(sd.config, "[backup]\nreconcile_interval_secs = 1\nmax_concurrent_jobs = 1\n" + RESTORE_BACKUP_SETTINGS)
         d = _Deployment("sqlite", sd.config, sd.port, "", sd.cert, base)
     elif _pg_build():
         cli_env = request.getfixturevalue("cli_env")
@@ -1191,12 +1173,20 @@ def test_a_store_outage_mid_download_leaves_the_restore_running_and_it_completes
             cli_env["config_path"],
             "[backup]\nreconcile_interval_secs = 1\nmax_concurrent_jobs = 1\n"
             + RESTORE_BACKUP_SETTINGS
-            + f'spool_path = "{spool}"\n'
-            + store,
+            + f'spool_path = "{spool}"\n',
         )
         d = _Deployment("postgres", cli_env["config_path"], cli_env["port"], "", os.path.join(cli_env["tls_dir"], "cert.pem"), base)
     else:
         pytest.skip("EXTENDDB_BINARY is neither a SQLite nor a PostgreSQL build")
+    # Picked after the server's port, and never equal to it: the forwarder
+    # binds this port before the server starts.
+    port = _free_port(d.port)
+    _append(
+        d.config,
+        '[backup.store]\nkind = "s3"\n[backup.store.s3]\n'
+        f'bucket = "{bucket}"\nendpoint = "http://127.0.0.1:{port}"\n'
+        'force_path_style = true\nregion = "us-east-1"\n',
+    )
     forwarder = _Forwarder(port, (moto_host, moto_port))
     server = _Server(d.config, str(tmp_path / "serve.log"), env=_s3_env())
     try:
@@ -1232,8 +1222,8 @@ def test_a_store_outage_mid_download_leaves_the_restore_running_and_it_completes
         assert _count(ddb, target) == RESTORE_ITEMS
         entries = [e for e in os.listdir(spool) if e.startswith("restore-")]
         assert entries == [], f"the spool entry stays: {entries}"
-        log = server.log_text()
-        assert ": ACTIVE, " in log and ": FAILED (" not in log, log[-4000:]
+        log = _wait_log(server, ": ACTIVE, ")
+        assert ": FAILED (" not in log, log[-4000:]
     finally:
         server.stop()
         forwarder.stop()
@@ -1317,11 +1307,7 @@ def test_remove_target_removes_a_target_not_empty_restore(deployment, tmp_path):
 
     server, ddb, creds = _started(d, str(tmp_path / "serve2.log"))
     try:
-        deadline = time.monotonic() + 60
-        while "target_not_empty" not in server.log_text():
-            assert time.monotonic() < deadline, server.log_text()[-4000:]
-            time.sleep(0.2)
-        log = server.log_text()
+        log = _wait_log(server, "target_not_empty")
         failed = [line for line in log.splitlines() if "target_not_empty" in line]
         assert any(target in line for line in failed), failed
         assert ddb.describe_table(TableName=target)["Table"]["TableStatus"] == "CREATING"
@@ -1615,13 +1601,9 @@ def _restore_fails(server: _Server, ddb, target: str, arn: str, *needles: str) -
     assert resp["TableStatus"] == "CREATING", resp
     assert resp["RestoreSummary"]["SourceBackupArn"] == arn, resp
     _wait_table_gone(ddb, target)
-    deadline = time.monotonic() + 15
-    while True:
-        failed = [line for line in server.log_text().splitlines() if ": FAILED (" in line and f" into {target} " in line]
-        if failed or time.monotonic() > deadline:
-            break
-        time.sleep(0.25)
-    assert len(failed) == 1, server.log_text()[-4000:]
+    log = _wait_log(server, f" into {target} (account {ACCOUNT}): FAILED (", timeout=15)
+    failed = [line for line in log.splitlines() if ": FAILED (" in line and f" into {target} " in line]
+    assert len(failed) == 1, log[-4000:]
     for needle in needles:
         assert needle in failed[0], failed[0]
     assert "the target was removed" in failed[0], failed[0]
@@ -1762,8 +1744,8 @@ def test_a_multi_part_key_table_restores_with_the_sources_item_set(deployment, t
         assert "RestoreSummary" not in table, table
         got = sorted(_canonical(i) for i in _scan_items(ddb, target))
         assert got == expected, f"{len(got)} restored items against {len(expected)} in the source"
-        log = server.log_text()
-        assert f" into {target} " in log and ": ACTIVE, " in log and ": FAILED (" not in log, log[-4000:]
+        log = _wait_log(server, ": ACTIVE, ")
+        assert f" into {target} " in log and ": FAILED (" not in log, log[-4000:]
     finally:
         server.stop()
 
@@ -3690,14 +3672,16 @@ def test_a_create_backup_during_the_moves_wait_is_refused(deployment, tmp_path):
 
 def test_a_row_that_lands_during_the_moves_sync_exits_1(deployment, tmp_path):
     """Beside servers (PostgreSQL): server A stays on the old root, server B
-    runs on a new root holding a copy of the old tree and 2,000 junk
-    prefixes (so the move's sync lists for a while). A CreateBackup on A
-    passes its claim reads and is held in its CREATING insert by a trigger;
-    `--move-store <old root>` then moves the old row, and the trigger lets
-    the insert go once the move prints that it syncs the configured store.
-    The job's row lands under the old root during that sync: the closing
-    report names it under "Rows that landed under the old root during the
-    move" and the command exits 1, naming the remedy."""
+    runs on a new root holding a copy of the old tree, which includes one
+    complete backup whose row was dropped, so the move's sync adopts it. A
+    CreateBackup on A passes its claim reads and is held in its CREATING
+    insert by a trigger; `--move-store <old root>` then moves the old row,
+    and the trigger lets the insert go once the move prints that it syncs
+    the configured store. A second trigger holds the sync's adoption insert
+    until the late row has committed, so the late row lands during the sync
+    whatever the runner's speed: the closing report names it under "Rows
+    that landed under the old root during the move" and the command exits
+    1, naming the remedy."""
     d = deployment
     if d.backend == "sqlite":
         pytest.skip("on SQLite the serve lock keeps every server stopped during the move")
@@ -3721,6 +3705,14 @@ def test_a_row_that_lands_during_the_moves_sync_exits_1(deployment, tmp_path):
         creds = _provision(d.port, d.cert, ADMIN_PASSWORD)
         ddb_a = _client(d.port, creds)
         name, moved = _small_backed_up_table(ddb_a, "landed")
+        # A complete backup under the old root with no row: the move leaves
+        # it (it moves rows only), and the move's sync adopts it from the
+        # copy. Its adoption insert is the sync's one `backup_index` write,
+        # and it comes before the closing report's read of the other stores'
+        # rows.
+        adoptee = ddb_a.create_backup(TableName=name, BackupName="adoptee")["BackupDetails"]["BackupArn"]
+        _wait_backup_available(ddb_a, adoptee, timeout=60)
+        _drop_row(d, adoptee)
         new = os.path.join(d.cwd, "backups-new")
         os.mkdir(new, 0o700)
         new = os.path.realpath(new)
@@ -3734,11 +3726,6 @@ def test_a_row_that_lands_during_the_moves_sync_exits_1(deployment, tmp_path):
             server=b,
         )
         _copy_tree_into(old, new)
-        for i in range(2000):
-            _private_file(
-                os.path.join(new, ACCOUNT, "junk", f"0179{i:010d}-0000abcd", "data", "000001.json.gz"),
-                b"x",
-            )
         _catalog(d, "CREATE TABLE landed_release (x int)", ())
         _catalog(
             d,
@@ -3751,6 +3738,25 @@ def test_a_row_that_lands_during_the_moves_sync_exits_1(deployment, tmp_path):
             d,
             "CREATE TRIGGER landed_hold BEFORE INSERT ON backup_index FOR EACH ROW "
             "WHEN (NEW.status = 'CREATING') EXECUTE FUNCTION landed_hold()",
+            (),
+        )
+        # The sync's adoption insert waits for the late row, which orders the
+        # late row's commit before the report's read. After 30 s it fails
+        # the insert instead, so a cell that never released says so.
+        _catalog(
+            d,
+            "CREATE OR REPLACE FUNCTION landed_gate() RETURNS trigger AS $$ BEGIN "
+            "FOR i IN 1..600 LOOP "
+            "IF EXISTS (SELECT 1 FROM backup_index WHERE backup_name = 'late') THEN RETURN NEW; END IF; "
+            "PERFORM pg_sleep(0.05); END LOOP; "
+            "RAISE EXCEPTION 'landed_gate: the late row did not land within 30 s'; "
+            "END $$ LANGUAGE plpgsql",
+            (),
+        )
+        _catalog(
+            d,
+            "CREATE TRIGGER landed_gate BEFORE INSERT ON backup_index FOR EACH ROW "
+            "WHEN (NEW.status = 'AVAILABLE') EXECUTE FUNCTION landed_gate()",
             (),
         )
         held = True
@@ -3803,11 +3809,14 @@ def test_a_row_that_lands_during_the_moves_sync_exits_1(deployment, tmp_path):
         assert late is not None, result
         assert released, "the move's sync line was printed before it ended"
         assert f"Moved (each row now names the configured store):\n  {moved}" in text, text[-4000:]
+        assert _adopted_section(text).splitlines()[1:-1] == [f"  {adoptee}"], text[-4000:]
         assert "--- Rows that landed under the old root during the move:\n  " + late in text, text[-4000:]
         assert rc == 1, text[-4000:]
         assert "a row landed under the old root during the move (1 listed above)" in text, text[-4000:]
     finally:
         if held:
+            _catalog(d, "DROP TRIGGER IF EXISTS landed_gate ON backup_index", ())
+            _catalog(d, "DROP FUNCTION IF EXISTS landed_gate()", ())
             _catalog(d, "DROP TRIGGER IF EXISTS landed_hold ON backup_index", ())
             _catalog(d, "DROP FUNCTION IF EXISTS landed_hold()", ())
             _catalog(d, "DROP TABLE IF EXISTS landed_release", ())
@@ -4605,8 +4614,8 @@ def test_migrate_legacy_refuses_a_13_digit_id_or_an_item_618_let_in_and_keeps_bo
     """Three in-catalog backups: one of a table holding three items with an
     `N` value #618 let in (written into storage, `_seed_stored_items`), one
     of a table that restores, and (SQLite, PostgreSQL) a copy of the
-    second's rows under a 13-digit backup id, the shape every 0.1.x release
-    issued. `migrate-legacy --all`
+    second's rows under a 13-digit backup id, the shape that 0.1.14 and earlier
+    releases issued. `migrate-legacy --all`
     migrates the second and goes on past the other two, each refused with
     its reason and its way out (the item count, the first item and #618;
     the id of the 13-digit shape), and exits 1 naming the two. The refused
@@ -4661,8 +4670,8 @@ def test_migrate_legacy_refuses_a_13_digit_id_or_an_item_618_let_in_and_keeps_bo
         refusals = 2 if old else 1
         if old:
             assert (
-                f"refused {old} (account {ACCOUNT}): its backup id {_backup_id(old)} has the 13-digit shape a "
-                "0.1.x release issued, and a store prefix carries only the 14-digit shape; restore it "
+                f"refused {old} (account {ACCOUNT}): its backup id {_backup_id(old)} has the 13-digit shape that "
+                "0.1.14 and earlier releases issued, and a store prefix carries only the 14-digit shape; restore it "
                 "(RestoreTableFromBackup) and take a new backup of the restored table, which has a new ARN. "
                 "Its in-catalog backup is kept"
             ) in res.stdout, out

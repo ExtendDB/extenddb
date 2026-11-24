@@ -9,6 +9,8 @@
 //! Architecture: `input string → tokenizer → tokens → parser → AST → evaluator → result`
 
 mod ast;
+#[cfg(test)]
+mod depth_tests;
 mod evaluator;
 mod key_condition;
 mod kind;

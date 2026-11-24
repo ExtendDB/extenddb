@@ -426,6 +426,7 @@ impl Bootstrapper for PostgresBootstrapper {
                 password: self.config.admin_password.clone(),
             }),
             data_connection: Some(self.app_connection_url(&self.config.data_db)),
+            ..Target::default()
         }
     }
 

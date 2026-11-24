@@ -534,22 +534,28 @@ async fn a_link_to_the_database_under_a_copys_name_is_not_opened() {
     migrations.close().await;
 }
 
-/// This process's POSIX locks on the file at `path`, from /proc/locks: one
-/// `<type> <start>-<end>` entry each.
+/// This process's POSIX locks on the file at `path`, one `<type> <start>-<end>`
+/// entry per lock. They are the `lock:` lines of /proc/self/fdinfo that name
+/// the file's inode; a duplicated descriptor lists its file's locks again, and
+/// the set keeps one. A read of /proc/locks is not one snapshot: the kernel
+/// returns it a page at a time, so a lock that another test or another process
+/// takes or releases between two pages can hide or repeat an entry.
 #[cfg(target_os = "linux")]
-fn posix_locks(path: &std::path::Path) -> Vec<String> {
+fn posix_locks(path: &std::path::Path) -> std::collections::BTreeSet<String> {
     use std::os::unix::fs::MetadataExt;
     let inode = std::fs::metadata(path).expect("the file").ino().to_string();
-    let pid = std::process::id().to_string();
-    std::fs::read_to_string("/proc/locks")
-        .expect("/proc/locks")
+    let fdinfo: String = std::fs::read_dir("/proc/self/fdinfo")
+        .expect("/proc/self/fdinfo")
+        // A descriptor closed since the listing has no fdinfo.
+        .filter_map(|fd| std::fs::read_to_string(fd.expect("a descriptor").path()).ok())
+        .collect();
+    fdinfo
         .lines()
         .filter_map(|line| {
-            // `1: POSIX  ADVISORY  READ 4242 08:01:131074 1073741826 1073742335`
-            let fields: Vec<&str> = line.split_whitespace().collect();
+            // `lock:\t1: POSIX  ADVISORY  READ 4242 08:01:131074 1073741826 1073742335`
+            let fields: Vec<&str> = line.strip_prefix("lock:")?.split_whitespace().collect();
             let ours = fields.len() >= 8
                 && fields[1] == "POSIX"
-                && fields[4] == pid
                 && fields[5].rsplit(':').next() == Some(inode.as_str());
             ours.then(|| format!("{} {}-{}", fields[3], fields[6], fields[7]))
         })
@@ -985,7 +991,9 @@ async fn a_failed_ledger_insert_leaves_nothing_of_the_body() {
 
 /// `forget` deletes the ledger row and writes the version row in one
 /// transaction: when the version row cannot be written, the ledger row is
-/// still there.
+/// still there. The command's path is followed under the lock, with a
+/// runner given a released bound of 0, so the latest migration is one it may
+/// forget whatever bound this binary carries.
 #[tokio::test]
 async fn a_forget_whose_version_row_fails_keeps_the_ledger_row() {
     use extenddb_storage::migrations::{CatalogMigrations, Target};
@@ -1006,11 +1014,18 @@ async fn a_forget_whose_version_row_fails_keeps_the_ledger_row() {
         .lock(&target, std::time::Duration::ZERO)
         .await
         .expect("lock");
-    let err = SqliteCatalogMigrations
-        .forget(&lock, LATEST)
+    let migrations = SqliteMigrations::open(&db.to_string_lossy())
         .await
-        .expect_err("the version row fails");
+        .expect("open");
+    let result = migrations
+        .forget_with(
+            &Runner::new(&migrations, "").with_released_through(0),
+            LATEST,
+        )
+        .await;
+    migrations.close().await;
     drop(lock);
+    let err = result.expect_err("the version row fails");
     assert!(
         err.to_string()
             .contains("the version row cannot be written"),

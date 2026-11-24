@@ -352,10 +352,10 @@ enum BackupCommand {
     /// Copy in-catalog backups into the configured backup store, each under its own ARN, and
     /// replace each by its catalog row. Takes the maintenance claim first (every backup and
     /// restore job answers LimitExceededException until it ends) and waits for running jobs; on
-    /// SQLite it needs the server stopped. Refuses a backup a 0.1.x release took (its backup id
-    /// has the 13-digit shape a 0.1.x release issued) and one with an item the item check refuses
-    /// or a definition the legacy restore refuses, keeping its in-catalog backup; restore such a
-    /// backup and take a new one.
+    /// SQLite it needs the server stopped. Refuses a backup that 0.1.14 or an earlier release
+    /// took (its backup id has the 13-digit shape those releases issued) and one with an item
+    /// the item check refuses or a definition the legacy restore refuses, keeping its
+    /// in-catalog backup; restore such a backup and take a new one.
     /// With --all it then cleans up after deleted in-catalog backups: what a stopped run left
     /// under each one's prefix is deleted, and its record removed.
     #[command(group(clap::ArgGroup::new("backups").required(true).args(["arn", "all"])))]
@@ -659,6 +659,7 @@ async fn open_catalog(
     options.beside_server = mode == Mode::Read;
     options.startup_recovery = false;
     options.command = Some(command);
+    options.key_source = crate::util::command_key_source(app_config)?;
     let mut storage_config = app_config.storage.clone();
     storage_config.set_instance_id(&format!(
         "{}:backup-command",
