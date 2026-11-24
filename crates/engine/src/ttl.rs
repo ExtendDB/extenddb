@@ -149,14 +149,6 @@ pub async fn handle_update_time_to_live(
         None
     };
 
-    // The status decides whether the index work after the write runs at all.
-    // It is read before the write: a delete that starts between the two meets
-    // that work, as before.
-    let status = crate::table_lifecycle::read_table_description(&input.table_name, ctx)
-        .await
-        .map_err(storage_to_dynamo)?
-        .table_status;
-
     ctx.storage
         .update_ttl(
             &ctx.account_id,
@@ -167,7 +159,26 @@ pub async fn handle_update_time_to_live(
         .await
         .map_err(storage_to_dynamo)?;
 
-    if status == TableStatus::Deleting {
+    // The status decides whether the index work below runs at all. It is read
+    // after the write, so a delete that marked the row at any point before
+    // this read is seen here. A mark that lands after this read and before the
+    // index statements is not: that work then runs on a DELETING table. A
+    // missing row means the delete finished after the write and removed the
+    // row the write landed on, so there is no index left to change. A failed
+    // read skips the index work too, with a warning, as a failed index
+    // statement below does: the write is made, and the TTL worker's
+    // pending-index pass builds an enabled table's index later.
+    let skip_index_ddl =
+        match crate::table_lifecycle::read_table_description(&input.table_name, ctx).await {
+            Ok(desc) => desc.table_status == TableStatus::Deleting,
+            Err(StorageError::TableNotFound(_)) => true,
+            Err(e) => {
+                tracing::warn!("TTL index work skipped for {}: {e}", input.table_name);
+                true
+            }
+        };
+
+    if skip_index_ddl {
         // No index DDL for a table being deleted: the delete removes its data
         // table or collection with the index, so the catalog write above is
         // the whole change. If it ran, a PostgreSQL DROP INDEX would wait, with

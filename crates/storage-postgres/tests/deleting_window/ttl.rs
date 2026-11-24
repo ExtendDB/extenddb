@@ -8,6 +8,7 @@
 //! table with its index, so the engine sends no index DDL for such a table.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use extenddb_storage::MetadataEngine;
 use serde_json::json;
@@ -125,17 +126,10 @@ pub(super) fn engine_context(s: &Scratch) -> extenddb_engine::OperationContext {
     }
 }
 
-/// UpdateTimeToLive disabling TTL during the window, through the engine
-/// handler, sends no DROP INDEX: the index built while the table was ACTIVE is
-/// still there when the call returns, the catalog write landed, and the row is
-/// still DELETING.
-#[tokio::test]
-async fn update_ttl_disable_during_the_window_sends_no_drop_index() {
-    if base_conn().is_none() {
-        return skip("update_ttl_disable_during_the_window_sends_no_drop_index");
-    }
-    let s = scratch().await;
-    create_table_named(&s, TABLE).await;
+/// Create `TABLE`, enable TTL on `ttl` and build its index while the table is
+/// ACTIVE. Returns the index names.
+async fn table_with_a_ttl_index(s: &Scratch) -> Vec<String> {
+    create_table_named(s, TABLE).await;
     s.engine
         .update_ttl(ACCOUNT, TABLE, "ttl", true)
         .await
@@ -144,25 +138,22 @@ async fn update_ttl_disable_during_the_window_sends_no_drop_index() {
         .create_ttl_index(ACCOUNT, TABLE, "ttl")
         .await
         .expect("build the TTL index while ACTIVE");
-    let built = ttl_indexes(&s).await;
+    let built = ttl_indexes(s).await;
     assert_eq!(built.len(), 1, "one TTL index before the delete: {built:?}");
-    start_deleting(&s).await;
+    built
+}
 
-    let ctx = engine_context(&s);
-    let out = extenddb_engine::handle_update_time_to_live(
-        json!({"TableName": TABLE,
-               "TimeToLiveSpecification": {"Enabled": false, "AttributeName": "ttl"}}),
-        &ctx,
-    )
-    .await
-    .expect("UpdateTimeToLive disable during the window");
-    assert_eq!(
-        out["TimeToLiveSpecification"],
-        json!({"Enabled": false, "AttributeName": "ttl"})
-    );
-    drop(ctx);
+/// The disable request the handler tests send.
+fn disable_ttl() -> serde_json::Value {
+    json!({"TableName": TABLE,
+           "TimeToLiveSpecification": {"Enabled": false, "AttributeName": "ttl"}})
+}
 
-    assert_eq!(ttl_indexes(&s).await, built, "no DROP INDEX was sent");
+/// Assert what a disable through the handler left: no DROP INDEX was sent
+/// (the index built while the table was ACTIVE is still there), the catalog
+/// write landed, and the row is DELETING.
+async fn assert_disabled_without_drop_index(s: &Scratch, built: &[String]) {
+    assert_eq!(ttl_indexes(s).await, built, "no DROP INDEX was sent");
     let attr: Option<String> = sqlx::query_scalar(
         "SELECT ttl_attribute FROM tables WHERE account_id = $1 AND table_name = $2",
     )
@@ -176,6 +167,97 @@ async fn update_ttl_disable_during_the_window_sends_no_drop_index() {
         status_of(&s.catalog, TABLE).await.as_deref(),
         Some("DELETING")
     );
+}
+
+/// UpdateTimeToLive disabling TTL during the window, through the engine
+/// handler, sends no DROP INDEX.
+#[tokio::test]
+async fn update_ttl_disable_during_the_window_sends_no_drop_index() {
+    if base_conn().is_none() {
+        return skip("update_ttl_disable_during_the_window_sends_no_drop_index");
+    }
+    let s = scratch().await;
+    let built = table_with_a_ttl_index(&s).await;
+    start_deleting(&s).await;
+
+    let ctx = engine_context(&s);
+    let out = extenddb_engine::handle_update_time_to_live(disable_ttl(), &ctx)
+        .await
+        .expect("UpdateTimeToLive disable during the window");
+    assert_eq!(
+        out["TimeToLiveSpecification"],
+        json!({"Enabled": false, "AttributeName": "ttl"})
+    );
+    drop(ctx);
+    assert_disabled_without_drop_index(&s, &built).await;
+
+    s.cleanup().await;
+}
+
+/// A DELETING mark that commits while the handler's UpdateTimeToLive write
+/// waits for the row lock is seen by the handler's status read, which comes
+/// after the write, so the disable sends no DROP INDEX. The test holds the
+/// row with `SELECT ... FOR UPDATE`, as the control-plane pass holds a due
+/// DELETING row, sends the disable, waits until the handler's UPDATE waits for
+/// that lock, then marks the row DELETING and commits. A status read made
+/// before the write would have read ACTIVE and dropped the index.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mark_committed_during_the_ttl_write_sends_no_drop_index() {
+    if base_conn().is_none() {
+        return skip("a_mark_committed_during_the_ttl_write_sends_no_drop_index");
+    }
+    let s = scratch().await;
+    let built = table_with_a_ttl_index(&s).await;
+
+    let mut holder = s.catalog.begin().await.expect("begin the row lock holder");
+    sqlx::query("SELECT table_id FROM tables WHERE account_id = $1 AND table_name = $2 FOR UPDATE")
+        .bind(ACCOUNT)
+        .bind(TABLE)
+        .fetch_one(&mut *holder)
+        .await
+        .expect("lock the catalog row");
+
+    let ctx = engine_context(&s);
+    let disable = tokio::spawn(async move {
+        extenddb_engine::handle_update_time_to_live(disable_ttl(), &ctx).await
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() \
+             AND wait_event_type = 'Lock' AND query LIKE 'UPDATE tables SET ttl_attribute%'",
+        )
+        .fetch_one(&s.catalog)
+        .await
+        .expect("read pg_stat_activity");
+        if waiting == 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline && !disable.is_finished(),
+            "the handler's TTL write never waited for the row lock"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    sqlx::query(
+        "UPDATE tables SET table_status = 'DELETING' WHERE account_id = $1 AND table_name = $2",
+    )
+    .bind(ACCOUNT)
+    .bind(TABLE)
+    .execute(&mut *holder)
+    .await
+    .expect("mark the row DELETING");
+    holder.commit().await.expect("commit the mark");
+
+    let out = disable
+        .await
+        .expect("the handler task")
+        .expect("UpdateTimeToLive disable");
+    assert_eq!(
+        out["TimeToLiveSpecification"],
+        json!({"Enabled": false, "AttributeName": "ttl"})
+    );
+    assert_disabled_without_drop_index(&s, &built).await;
 
     s.cleanup().await;
 }

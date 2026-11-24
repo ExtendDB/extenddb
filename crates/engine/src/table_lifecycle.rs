@@ -17,8 +17,8 @@
 //! `UpdateTimeToLive`, `TagResource`, `UntagResource` and `ListTagsOfResource`
 //! each make it once per call. `DescribeTimeToLive` on an `ACTIVE` table sends
 //! five and three, where it sent one. `UpdateTimeToLive` sends the four or two
-//! more, and on a `DELETING` table it skips the TTL read after the write and
-//! the index statements.
+//! more, after its write, and on a `DELETING` table it skips the TTL read after
+//! the write and the index statements.
 
 use extenddb_core::types::{DescribeTableInput, TableDescription};
 use extenddb_storage::error::StorageError;
