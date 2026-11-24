@@ -290,6 +290,10 @@ const UNKNOWN_CHARACTER_ROWS: &[(&str, &str, &str)] = &[
     ("#v = é\tabc", "é", "= é\tabc"),
     ("#v = é\n:v", "é", "= é\n:v"),
     ("#v = é\r:v", "é", "= é\r:v"),
+    // No token after the character: the window runs to the end of the
+    // expression, trailing whitespace kept (measured 2026-11-24).
+    ("#v = é   ", "é", "= é   "),
+    ("  é  ", "é", "  é  "),
 ];
 
 #[test]

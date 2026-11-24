@@ -7,16 +7,17 @@ When the character is the first fault in the expression, Amazon DynamoDB
 answers ``Invalid <Kind>: Syntax error; token: "<t>", near: "<window>"``: the
 token is the character as sent, a whole code point, and the window runs from
 the start of the previous token (or of the expression, when no token comes
-before it) to the end of the next one, with each character outside the
-grammar counted as one token. U+0000 is removed from the token and the window.
+before it) to the end of the next one (or of the expression, when no token
+follows it), with each character outside the grammar counted as one token.
+U+0000 is removed from the token and the window.
 On PutItem, UpdateItem and DeleteItem the message starts with the count
 ``1 validation error detected: ``. ExtendDB leaves the count out of this
 error, so on ExtendDB those rows compare the text after the count and then
 end as an expected failure.
 
 Every expected text was measured against Amazon DynamoDB (us-east-1), each
-request twice: the rows of ``OPERATION_ROWS`` on 2026-11-18, the others on
-2026-10-25.
+request twice: the rows of ``OPERATION_ROWS`` on 2026-11-18, the two rows with
+no token after the character on 2026-11-24, the others on 2026-10-25.
 
 Dual-target against Amazon DynamoDB and extenddb.
 """
@@ -120,6 +121,9 @@ def table(dynamodb_client):
         ("#v \u00e9>= :v", "\u00e9", "#v \u00e9>="),
         ("#v = \u00e9 abc", "\u00e9", "= \u00e9 abc"),
         ("#v[\u00e912] = :v", "\u00e9", "[\u00e912"),
+        # No token after the character: the window runs to the end.
+        ("#v = \u00e9   ", "\u00e9", "= \u00e9   "),
+        ("  \u00e9  ", "\u00e9", "  \u00e9  "),
     ],
 )
 def test_scan_filter(dynamodb_client, table, expr, token, near):
