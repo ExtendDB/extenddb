@@ -40,7 +40,9 @@ crc32fast = { workspace = true }
 zeroize = { workspace = true }
 web-time = { workspace = true }
 # `database_file` reads a location's query as sqlx reads it, on both targets.
-url = { workspace = true }
+# The crate `url` re-exports; `url` itself would add its IDNA tables to the
+# wasm32 build.
+form_urlencoded = "1"
 
 # Storage transport, split per target. Native keeps `sqlx` (SQLite feature) and
 # the C `libsqlite3-sys`; native SQLite is the behaviour this backend is

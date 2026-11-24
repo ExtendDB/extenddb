@@ -57,7 +57,7 @@ pub(crate) fn database_file(location: &str) -> Result<Option<PathBuf>, String> {
     // same way sqlx does (form-urlencoded pairs after the first `?`, so an
     // encoded key such as `mod%65` is `mode`).
     let mode_memory = url.split_once('?').is_some_and(|(_, query)| {
-        url::form_urlencoded::parse(query.as_bytes())
+        form_urlencoded::parse(query.as_bytes())
             .any(|(key, value)| key == "mode" && value == "memory")
     });
     let filename = options.get_filename().to_string_lossy().into_owned();

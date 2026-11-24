@@ -141,7 +141,7 @@ fn opened_file(location: &str) -> Option<OpenedFile> {
     let url = crate::sqlite_util::sqlite_url(location);
     let (mut rwc, mut ro, mut vfs, mut immutable) = (false, false, None, false);
     if let Some((_, query)) = url.split_once('?') {
-        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        for (key, value) in form_urlencoded::parse(query.as_bytes()) {
             match &*key {
                 "mode" => {
                     rwc |= value == "rwc";
