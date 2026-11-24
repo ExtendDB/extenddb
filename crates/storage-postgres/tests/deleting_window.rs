@@ -18,7 +18,8 @@
 //! Requires `EXTENDDB_TEST_PG_CONNECTION_STRING`, a base URL with no database
 //! component (for example `postgresql://postgres@127.0.0.1:5432`), pointing at a
 //! server whose role may create and drop databases. Without it every test here
-//! reports a skip and passes, the same convention the wire suites use.
+//! reports a skip and passes, the same convention the wire suites use, unless
+//! `EXTENDDB_TEST_PG_REQUIRED` is set, as in CI, which makes it a failure.
 //!
 //! The data-plane tests below pin the other half of the window: DynamoDB serves
 //! `PutItem`, `GetItem`, `Query` and `Scan` on a `DELETING` table until the
@@ -74,9 +75,20 @@ impl Scratch {
     }
 }
 
+/// The server's base URL from `EXTENDDB_TEST_PG_CONNECTION_STRING`, or
+/// `None` to skip. With `EXTENDDB_TEST_PG_REQUIRED` set (CI sets it beside
+/// the connection string) a missing or empty URL is a failure, so a typo in
+/// the variable's name cannot turn the step green by skipping every test.
 fn base_conn() -> Option<String> {
-    let conn = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING").ok()?;
-    (!conn.trim().is_empty()).then(|| conn.trim_end_matches('/').to_owned())
+    let conn = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING").unwrap_or_default();
+    if conn.trim().is_empty() {
+        assert!(
+            std::env::var_os("EXTENDDB_TEST_PG_REQUIRED").is_none(),
+            "EXTENDDB_TEST_PG_REQUIRED is set but EXTENDDB_TEST_PG_CONNECTION_STRING is not"
+        );
+        return None;
+    }
+    Some(conn.trim_end_matches('/').to_owned())
 }
 
 /// Every `.sql` file under `migrations/` and `data_migrations/`, each
