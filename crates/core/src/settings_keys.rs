@@ -108,6 +108,11 @@ pub const VECTOR_ALLOCATION_PHASE_DELAY_MS: &str = "vector_allocation_phase_dela
 #[cfg(feature = "search-inequality-filters")]
 pub const SEARCH_INEQUALITY_FILTERS: &str = "search_inequality_filters";
 
+/// The value a server uses for [`SEARCH_INEQUALITY_FILTERS`] when the
+/// catalog has no row for it.
+#[cfg(feature = "search-inequality-filters")]
+pub const SEARCH_INEQUALITY_FILTERS_DEFAULT: &str = "all";
+
 /// Resolve a caller-supplied settings key to its canonical name.
 ///
 /// Accepting the old name keeps `extenddb settings set gsi_propagation_delay_ms 0`

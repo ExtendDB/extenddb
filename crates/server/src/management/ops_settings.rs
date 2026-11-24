@@ -58,6 +58,21 @@ fn validate_search_inequality_filters(value: &str) -> Result<(), &'static str> {
     extenddb_core::expression::search_filter::EnabledAccounts::parse(value).map(|_| ())
 }
 
+/// The value the server uses for `key` when the catalog has no row for it,
+/// for a key the server reads and no storage engine does. `None` for any
+/// other key: a storage engine's default comes from
+/// `extenddb_storage::operations::setting_default`.
+#[must_use]
+pub fn server_setting_default(key: &str) -> Option<String> {
+    #[cfg(feature = "search-inequality-filters")]
+    if key == extenddb_core::settings_keys::SEARCH_INEQUALITY_FILTERS {
+        return Some(extenddb_core::settings_keys::SEARCH_INEQUALITY_FILTERS_DEFAULT.to_owned());
+    }
+    #[cfg(not(feature = "search-inequality-filters"))]
+    let _ = key;
+    None
+}
+
 /// Read-only keys that cannot be changed via the settings API.
 pub const READONLY_KEYS: &[&str] = &[
     "catalog_version",
