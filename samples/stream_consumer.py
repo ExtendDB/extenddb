@@ -9,6 +9,10 @@ Creates a table with streams enabled, then runs two threads:
 
 Usage:
     EXTENDDB_TEST_ENDPOINT=http://localhost:18443 python samples/stream_consumer.py
+
+    EXTENDDB_STREAM_SINCE, an epoch time in seconds, is optional. When set,
+    the poller starts each shard at the first record created at or after
+    that time (AT_TIMESTAMP) instead of the oldest one (TRIM_HORIZON).
 """
 
 from __future__ import annotations
