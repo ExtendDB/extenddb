@@ -74,6 +74,7 @@ pub use describe_limits::handle_describe_limits;
 pub use describe_table::handle_describe_table;
 pub use get_item::handle_get_item;
 pub use import_export::{handle_export_table, handle_import_table};
+pub use int32_member::read_floats_as_written;
 pub use item_authorizer::{ItemAccess, ItemAuthorization, ItemAuthorizer};
 pub use list_tables::handle_list_tables;
 pub use put_item::handle_put_item;

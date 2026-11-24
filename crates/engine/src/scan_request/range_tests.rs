@@ -14,7 +14,7 @@ use extenddb_core::types::ScanInput;
 use serde_json::Value;
 
 use super::validate_scan_request_body;
-use crate::int32_member::{SCAN_RANGES, saturate};
+use crate::int32_member::{SCAN_RANGES, read_floats_as_written, saturate};
 
 const LIMIT: &str = "Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1";
 const SEGMENT_LOW: &str = "Value at 'Segment' failed to satisfy constraint: Member must have value greater than or equal to 0";
@@ -33,9 +33,14 @@ fn check(body: &Value) -> Option<String> {
 }
 
 /// A Scan body with `fields` added to the table name, written as JSON text so
-/// a number keeps the form the request wrote (`0.0`, `1e2`).
+/// a number keeps the form the request wrote (`0.0`, `1e2`), read as the
+/// server reads it: parsed, then the float range members read from their
+/// digits (see `int32_member::read_floats_as_written`).
 fn scan(fields: &str) -> Value {
-    serde_json::from_str(&format!(r#"{{"TableName": "t", {fields}}}"#)).expect("JSON")
+    let text = format!(r#"{{"TableName": "t", {fields}}}"#);
+    let mut body: Value = serde_json::from_str(&text).expect("JSON");
+    read_floats_as_written("Scan", &mut body, text.as_bytes());
+    body
 }
 
 fn one(clause: &str) -> String {
@@ -85,6 +90,10 @@ fn integers_inside_int32_answer_the_newer_form_in_the_order_limit_segment_total_
     }
 }
 
+/// Measured 2026-10-25, 2026-10-30 and 2026-11-24 05:41 UTC (the long
+/// fractions, a table that does not exist): a float or a value outside int32
+/// takes the older form, the value echoed as the service reads it, a
+/// fraction truncated toward zero whatever the nearest double is.
 #[test]
 fn a_float_or_a_value_outside_int32_answers_the_older_form_with_limit_last() {
     let at_least_one = "greater than or equal to 1";
@@ -94,6 +103,14 @@ fn a_float_or_a_value_outside_int32_answers_the_older_form_with_limit_last() {
             one(&older("-2147483648", "limit", at_least_one)),
         ),
         (r#""Limit": 0.0"#, one(&older("0", "limit", at_least_one))),
+        (
+            r#""Limit": 0.99999999999999999999"#,
+            one(&older("0", "limit", at_least_one)),
+        ),
+        (
+            r#""TotalSegments": 0.99999999999999999999"#,
+            one(&older("0", "totalSegments", at_least_one)),
+        ),
         (
             r#""Segment": 0, "TotalSegments": 2147483648"#,
             one(&older(
@@ -127,7 +144,10 @@ fn a_float_or_a_value_outside_int32_answers_the_older_form_with_limit_last() {
 /// Measured 2026-10-25: `Limit: 1.5` and `Limit: 1.0` return one item,
 /// `Limit: 1e2`, `Limit: 2147483648` and `Limit: 9223372036854775808` are
 /// accepted, and `Segment: 1.5` of `TotalSegments: 2` returns the items of
-/// segment 1. The handler reads the members as the service does.
+/// segment 1. Measured 2026-11-24 05:41 UTC (a table that does not exist):
+/// `Segment: -0.99999999999999999999` of `TotalSegments: 2` is accepted, and a
+/// `Query` `Limit: 2.99999999999999999999` is, where the nearest double
+/// reads as -1 and 3. The handler reads the members as the service does.
 #[test]
 fn floats_and_out_of_range_integers_that_satisfy_the_constraints_are_accepted() {
     for (fields, limit, segment) in [
@@ -136,7 +156,18 @@ fn floats_and_out_of_range_integers_that_satisfy_the_constraints_are_accepted() 
         (r#""Limit": 1.5"#, Some(1), None),
         (r#""Limit": 1.0"#, Some(1), None),
         (r#""Limit": 1e2"#, Some(100), None),
+        (r#""Limit": 2.99999999999999999999"#, Some(2), None),
         (r#""Segment": 1.5, "TotalSegments": 2"#, None, Some(1)),
+        (
+            r#""Segment": 1.99999999999999999999, "TotalSegments": 2"#,
+            None,
+            Some(1),
+        ),
+        (
+            r#""Segment": -0.99999999999999999999, "TotalSegments": 2"#,
+            None,
+            Some(0),
+        ),
     ] {
         let mut body = scan(fields);
         assert_eq!(check(&body), None, "{fields}");
@@ -349,13 +380,15 @@ fn three_older_form_faults_are_reported_total_segments_segment_limit() {
 }
 
 /// Measured 2026-10-30 12:40 UTC: a negative fraction is truncated toward
-/// zero, and `-0` is read as 0.
+/// zero, and `-0` is read as 0. Measured 2026-11-24 05:41 UTC:
+/// `-0.99999999999999999999` is read as 0 too, where the nearest double is -1.
 #[test]
 fn a_negative_fraction_is_truncated_toward_zero() {
     for (fields, value) in [
         (r#""Limit": -1.5"#, "-1"),
         (r#""Limit": -0.5"#, "0"),
         (r#""Limit": -0"#, "0"),
+        (r#""Limit": -0.99999999999999999999"#, "0"),
     ] {
         assert_eq!(
             check(&scan(fields)),

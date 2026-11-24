@@ -8,8 +8,9 @@ written here (``0.0``, ``1e2``, ``9223372036854775808``). Each request is a
 row of the table measured against DynamoDB (us-east-1) on 2026-10-25 at 09:23,
 09:25, 09:28, 10:38, 10:55 and 12:56 UTC, or of the ones measured on
 2026-10-30 at 12:40 UTC, 2026-10-31 at 12:36 UTC, 2026-10-31 between 23:54
-and 23:56 UTC, 2026-11-12, and 2026-11-23 at 14:51 and 18:45 UTC (a table
-that does not exist) where a row says so, each sent twice, and each expected
+and 23:56 UTC, 2026-11-12, 2026-11-23 at 14:51 and 18:45 UTC, and 2026-11-24
+at 05:41 UTC (a table that does not exist) where a row says so, each sent
+twice, and each expected
 answer is the service's. Where a table records only that the service accepted
 a request, the test asserts what a Scan with that limit returns on this table
 of 12 items. ``Segment: 0, TotalSegments: 1`` with ``ConsistentRead: true``
@@ -30,8 +31,9 @@ path: the ``Select`` and ``ReturnConsumedCapacity`` enum clauses and the range
 clauses, with the value saturated or truncated and echoed, are reported in one
 message in the order select, totalSegments, returnConsumedCapacity, segment,
 limit. A float or an out-of-range integer that satisfies the constraint is
-accepted. A range field of another JSON type is a ``SerializationException``
-with the service's text.
+accepted. A fraction is truncated as written: ``0.99999999999999999999`` reads
+as 0, not as the double nearest it. A range field of another JSON type is a
+``SerializationException`` with the service's text.
 """
 
 from __future__ import annotations
@@ -153,6 +155,12 @@ OLDER_FORM = [
      one(older("2147483647", "segment", "less than or equal to 999999"))),
     ("Limit-int32-max-Segment-minus-1", '"Limit": 2147483647, "Segment": -1, "TotalSegments": 2',
      one(SEGMENT_LOW)),
+    # Measured 2026-11-24 05:41 UTC: a long fraction is truncated as written,
+    # where the double nearest it is 1 or -1.
+    ("Limit-long-fraction", '"Limit": 0.99999999999999999999', one(OLDER_LIMIT_0)),
+    ("Limit-negative-long-fraction", '"Limit": -0.99999999999999999999', one(OLDER_LIMIT_0)),
+    ("TotalSegments-long-fraction", '"TotalSegments": 0.99999999999999999999',
+     one(older("0", "totalSegments", "greater than or equal to 1"))),
 ]
 
 # Measured 2026-11-23 at 14:51 UTC (M01 to M03, M14, M15) and 2026-11-12
@@ -456,26 +464,38 @@ class TestFloatsAndValuesOutsideInt32AreAccepted:
         assert status == 200, payload
         assert (payload["Count"], payload["ScannedCount"]) == (ITEMS, ITEMS)
 
-    @pytest.mark.parametrize("fields", ['"Limit": 1.5', '"Limit": 1.0'],
-                             ids=["Limit-1.5", "Limit-1.0"])
-    def test_a_fractional_limit_is_truncated(self, dynamodb_client, table, fields):
+    @pytest.mark.parametrize("fields, count", [
+        ('"Limit": 1.5', 1), ('"Limit": 1.0', 1),
+        # Measured 2026-11-24 05:41 UTC (a table that does not exist): the
+        # service accepts the fraction, and reads it as written, so the page
+        # holds 2 items, not the 3 of the nearest double.
+        ('"Limit": 2.99999999999999999999', 2),
+    ], ids=["Limit-1.5", "Limit-1.0", "Limit-long-fraction"])
+    def test_a_fractional_limit_is_truncated(self, dynamodb_client, table, fields, count):
         status, payload = _scan(dynamodb_client, table, fields + ', "ConsistentRead": true')
         assert status == 200, payload
-        assert (payload["Count"], payload["ScannedCount"]) == (1, 1)
+        assert (payload["Count"], payload["ScannedCount"]) == (count, count)
 
-    def test_a_fractional_segment_is_truncated(self, dynamodb_client, table):
+    @pytest.mark.parametrize("fraction, segment", [
+        ("1.5", 1),
+        # Measured 2026-11-24 05:41 UTC: Segment -0.99999999999999999999 of 2
+        # is accepted, so it reads as 0; the nearest double, -1, is refused.
+        ("1.99999999999999999999", 1),
+        ("-0.99999999999999999999", 0),
+    ], ids=["Segment-1.5", "Segment-long-fraction", "Segment-negative-long-fraction"])
+    def test_a_fractional_segment_is_truncated(self, dynamodb_client, table, fraction, segment):
         # The TotalSegments of 2 is this test's; the table records only Segment 1.5.
         status, half = _scan(dynamodb_client, table,
-                             '"Segment": 1.5, "TotalSegments": 2, "ConsistentRead": true')
+                             f'"Segment": {fraction}, "TotalSegments": 2, "ConsistentRead": true')
         assert status == 200, half
         status, whole = _scan(dynamodb_client, table,
-                              '"Segment": 1, "TotalSegments": 2, "ConsistentRead": true')
+                              f'"Segment": {segment}, "TotalSegments": 2, "ConsistentRead": true')
         assert status == 200, whole
 
         def keys(page):
             return sorted(item["pk"]["S"] for item in page["Items"])
 
-        assert keys(whole), "segment 1 of 2 holds at least one item"
+        assert keys(whole), f"segment {segment} of 2 holds at least one item"
         assert keys(half) == keys(whole)
 
     def test_segment_0_of_1_returns_every_item(self, dynamodb_client, table):
@@ -525,6 +545,20 @@ class TestBesideAnExpressionAttributeValuesEntry:
     def test_query_limit_float_or_outside_int32(self, dynamodb_client, table, fields, expected):
         body = json.dumps({"TableName": table, **fields})
         assert _validation_message(*_raw(dynamodb_client, "Query", body)) == expected
+
+    def test_query_limit_long_fraction(self, dynamodb_client, table):
+        # Measured 2026-11-24 05:41 UTC (a table that does not exist): the
+        # written decimal is truncated, so 0.99999999999999999999 answers the
+        # limit clause with '0' and 2.99999999999999999999 is accepted.
+        def body(limit: str) -> str:
+            return ('{"TableName": %s, "KeyConditionExpression": "pk = :p", "Limit": %s, '
+                    '"ExpressionAttributeValues": {":p": {"S": "p0"}}}' % (json.dumps(table), limit))
+
+        refused = _raw(dynamodb_client, "Query", body("0.99999999999999999999"))
+        assert _validation_message(*refused) == one(OLDER_LIMIT_0)
+        status, payload = _raw(dynamodb_client, "Query", body("2.99999999999999999999"))
+        assert status == 200, payload
+        assert payload["Count"] == 1
 
     @pytest.mark.parametrize("entry", [e for _, e in UNREADABLE_MEMBERS],
                              ids=[i for i, _ in UNREADABLE_MEMBERS])
