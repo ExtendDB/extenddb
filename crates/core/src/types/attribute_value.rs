@@ -90,7 +90,8 @@ impl<'de> Visitor<'de> for AttributeValueVisitor {
 }
 
 /// The type descriptors `DynamoDB` defines.
-const TYPE_DESCRIPTORS: [&str; 10] = ["S", "N", "B", "SS", "NS", "BS", "BOOL", "NULL", "L", "M"];
+pub(crate) const TYPE_DESCRIPTORS: [&str; 10] =
+    ["S", "N", "B", "SS", "NS", "BS", "BOOL", "NULL", "L", "M"];
 
 /// Whether the member `name: payload` of a value object is a type descriptor
 /// the value is read by: one of [`TYPE_DESCRIPTORS`] whose payload is not

@@ -118,9 +118,15 @@ where
     )
 }
 
-/// The start of the attribute value deserializer's text for a `B` payload or
-/// a `BS` member that is not base64.
-const INVALID_BASE64: &str = "invalid base64: ";
+/// Whether `refusal`, a text of [`crate::types::from_nested`], is one the
+/// engine's `deserialize_error` answers with a `SerializationException`.
+fn is_serialization_text(refusal: &str) -> bool {
+    refusal
+        .split_once(" value must be ")
+        .is_some_and(|(tag, _)| crate::types::TYPE_DESCRIPTORS.contains(&tag))
+        || refusal.starts_with("invalid type: ")
+        || refusal.starts_with("invalid base64: ")
+}
 
 /// Whether the value `members` describe has no single type descriptor, or
 /// holds one that has none in an `L` or an `M` at any depth.
@@ -212,13 +218,19 @@ where
             // map or list more than an item attribute (measured 2026-11-23
             // and 2026-11-24 on UpdateItem and Query, each shape twice).
             // Caught here because a serde error does not carry the key. A
-            // `B` or `BS` payload that is not base64 keeps its bare text, as
-            // a single `B` does. Any other value is read by `convert`, whose
-            // refusals are bare.
+            // refusal the engine answers with a `SerializationException` (a
+            // payload of the wrong JSON type, a value that is not an object,
+            // a `B` or `BS` payload that is not base64) keeps its bare text,
+            // as in a single value: DynamoDB gives these no wrapper in an `L`
+            // or an `M` either (measured 2026-11-24 with
+            // `{"L": [{"S": 1}, {"S": "x", "N": "1"}]}` as `:v`, twice).
+            // Where ExtendDB answers a wrong JSON type with a text of its
+            // own, as for a number in a set, the text stays wrapped (#1012).
+            // Any other value is read by `convert`, whose refusals are bare.
             if let Some(members) = value.as_object()
                 && has_no_single_descriptor(members)
                 && let Err(refusal) = crate::types::from_nested(value.clone(), 0)
-                && !refusal.starts_with(INVALID_BASE64)
+                && !is_serialization_text(&refusal)
             {
                 return Err(format!(
                     "ExpressionAttributeValues contains invalid value: {refusal} for key {key}"
@@ -372,8 +384,8 @@ mod tests {
     /// the count's text, or that of a payload checked ahead of the count,
     /// with one map or list more allowed than in an item attribute (measured
     /// 2026-11-23 and 2026-11-24 on Query and UpdateItem, each twice). Any
-    /// other value, and a payload that is not base64, keep the deserializer's
-    /// bare text.
+    /// other value, and a payload that is not base64 or is of the wrong JSON
+    /// type, keep the deserializer's bare text.
     #[test]
     fn values_with_no_single_descriptor_are_refused_by_key() {
         let wrapped = |text: &str| {
@@ -392,6 +404,11 @@ mod tests {
             (
                 r#"{"S":"x","N":"bob"}"#,
                 wrapped("The parameter cannot be converted to a numeric value: bob"),
+            ),
+            // A request text that reads like a type text is still wrapped.
+            (
+                r#"{"S":"x","N":"a value must be b"}"#,
+                wrapped("The parameter cannot be converted to a numeric value: a value must be b"),
             ),
             (
                 r#"{"SS":["a","a"],"N":"bob"}"#,
@@ -426,6 +443,7 @@ mod tests {
                 wrapped("The parameter cannot be converted to a numeric value: bob"),
             ),
             (r#"{"L":[{"S":"x","N":"1"}]}"#, wrapped(MULTI)),
+            (r#"{"L":[{"S":"x","BOOL":"yes"}]}"#, wrapped(MULTI)),
             (
                 r#"{"M":{"k":{"S":"x","SS":["a","a"]}}}"#,
                 wrapped(
@@ -446,9 +464,26 @@ mod tests {
             (r#"{"S":"x","B":"!!!"}"#, base64.clone()),
             (r#"{"S":"x","BS":["!!!"]}"#, base64.clone()),
             (r#"{"N":"bob","B":"!!!"}"#, base64),
-            // ExtendDB's own text for a payload of the wrong JSON type, left
-            // unwrapped (not measured; #1012 tracks these texts).
+            // A payload of the wrong JSON type, or a value that is not an
+            // object, keeps ExtendDB's bare text, alone or in an `L` or an
+            // `M` (DynamoDB: a `SerializationException` with no wrapper and a
+            // text of its own, #1012; the `L` and `M` rows measured
+            // 2026-11-24, each twice).
             (r#"{"S":1}"#, "S value must be a string".to_owned()),
+            (
+                r#"{"L":[{"S":1},{"S":"x","N":"1"}]}"#,
+                "S value must be a string".to_owned(),
+            ),
+            (
+                r#"{"M":{"a":{"BOOL":"x"},"b":{"S":"x","N":"1"}}}"#,
+                "BOOL value must be a boolean".to_owned(),
+            ),
+            (
+                r#"{"L":[1,{"S":"x","N":"1"}]}"#,
+                "invalid type: integer `1`, expected a DynamoDB AttributeValue map with \
+                 exactly one type descriptor"
+                    .to_owned(),
+            ),
         ];
         for (value, want) in cases {
             let msg = values_err(&format!(r#"{{"values":{{":v":{value}}}}}"#));

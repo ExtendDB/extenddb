@@ -84,6 +84,9 @@ pub use warm_throughput::{
     WarmThroughputDescription, WarmThroughputRecord, WarmThroughputStatus, epoch_seconds_now,
 };
 
+/// The type descriptors, for the wrapper of `ExpressionAttributeValues`
+/// refusals (`crate::serde_helpers`).
+pub(crate) use attribute_value::TYPE_DESCRIPTORS;
 /// The deserializer's reader of a value at a depth, for the condition
 /// operands, which are read at depth 0 (`crate::serde_helpers`).
 pub(crate) use attribute_value::from_nested;
