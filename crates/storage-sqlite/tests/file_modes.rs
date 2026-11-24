@@ -161,8 +161,9 @@ async fn serve(path: &str, options: ServerComponentsOptions) -> ServerComponents
         .expect("server components")
 }
 
-/// A first write: an account through the management store (the `manage`
-/// command's opener), then CreateTable and TagResource through the engine.
+/// A first write: an account through the management store (the opener the
+/// `encryption-key` commands use), then CreateTable and TagResource through
+/// the engine.
 async fn first_write(path: &str, components: &ServerComponents) {
     let management = (extenddb_storage_sqlite::backend().management_store)(path)
         .await

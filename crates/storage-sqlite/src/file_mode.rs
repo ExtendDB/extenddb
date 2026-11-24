@@ -25,11 +25,13 @@
 //! as well.
 //!
 //! Only a regular file with a permission bit outside 0600 is changed, and it is
-//! set to 0600. Anything else at one of those names is left alone: a symlink
-//! (never followed), a directory, a FIFO, a socket, a device, or a regular file
-//! already 0600 or narrower. As with the lock file in `serve_lock`, a regular
-//! file that cannot be narrowed is an error. The directory's mode is left
-//! alone. On platforms other than Unix `prepare` does nothing.
+//! set to 0600. Anything else at one of those names is left alone: a symlink at
+//! a sidecar name (never followed; a symlink at the database name is followed
+//! to the file SQLite opens), a directory, a FIFO, a socket, a device, or a
+//! regular file already 0600 or narrower. As with the lock file in
+//! `serve_lock`, a regular file that cannot be narrowed is an error. The
+//! directory's mode is left alone. On platforms other than Unix `prepare` does
+//! nothing.
 
 use std::path::Path;
 #[cfg(unix)]
