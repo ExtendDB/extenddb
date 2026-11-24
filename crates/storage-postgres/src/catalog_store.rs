@@ -11,10 +11,13 @@
 
 use std::sync::Arc;
 
+use extenddb_storage::diagnostics::{DiagError, DiagResult, OrphanDrop, StorageRelationCheck};
 use extenddb_storage::management_store::{MetricsRow, OpError, OpResult};
 use extenddb_storage::secret_keys::SecretKeys;
 use futures::future::BoxFuture;
 use sqlx::PgPool;
+
+use crate::data::catalog_check::CheckFailure;
 
 /// PostgreSQL-backed catalog store for settings, metrics, and rate limiting.
 ///
@@ -28,6 +31,9 @@ pub struct PostgresCatalogStore {
     /// reads it through `CatalogStore::secret_keys`. `None` for a store
     /// opened without a key, which writes no credential.
     keys: Option<Arc<SecretKeys>>,
+    /// How long `catalog-check` waits for the index changes in flight
+    /// ([`crate::data::catalog_check::INDEX_LOCK_BUDGET`]).
+    index_lock_budget: std::time::Duration,
 }
 
 impl PostgresCatalogStore {
@@ -35,13 +41,30 @@ impl PostgresCatalogStore {
     /// holder.
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
-        Self { pool, keys: None }
+        Self::with_secret_keys(pool, None)
     }
 
     /// Create a new catalog store with the key holder the factory loaded.
     #[must_use]
     pub fn with_secret_keys(pool: PgPool, keys: Option<Arc<SecretKeys>>) -> Self {
-        Self { pool, keys }
+        Self {
+            pool,
+            keys,
+            index_lock_budget: crate::data::catalog_check::INDEX_LOCK_BUDGET,
+        }
+    }
+
+    /// A store whose `catalog-check` waits at most `budget` for the index
+    /// changes in flight, so a test can reach the end of the wait. Compiled
+    /// only with `test-hooks`.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_index_lock_budget(pool: PgPool, budget: std::time::Duration) -> Self {
+        Self {
+            index_lock_budget: budget,
+            ..Self::new(pool)
+        }
     }
 
     /// Borrow the underlying pool (escape hatch for callers not yet migrated).
@@ -191,25 +214,112 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for PostgresCatalogStore {
                     .await
                     .map_err(|e| DiagError::QueryFailed(e.to_string()))?;
             let (name,) = name_row.ok_or_else(not_configured)?;
-
-            // The connection string as the server reads it: in a catalog with
-            // a key ring the row is encrypted, and the KEK of key_file opens
-            // it (RFC-0000 section 12).
-            let target =
-                crate::migrations::PostgresTarget::new((*pool.connect_options()).clone(), &name)
-                    .with_key_source(key, false);
-            let conn = crate::migrations::data_connection_string(&target)
+            let conn = data_connection_row(&pool, key)
                 .await
                 .map_err(|e| DiagError::QueryFailed(e.to_string()))?
                 .ok_or_else(not_configured)?;
-            sqlx::postgres::PgPoolOptions::new()
-                .max_connections(1)
-                .connect(&conn)
-                .await
-                .map_err(|e| DiagError::ConnectionFailed(e.to_string()))?;
+            connect_data(&conn).await?;
             Ok(name)
         })
     }
+
+    fn check_storage_relations(
+        &self,
+        key: &extenddb_storage::server_components::KeySource,
+    ) -> BoxFuture<'_, DiagResult<StorageRelationCheck>> {
+        let key = key.clone();
+        Box::pin(async move {
+            let data = data_pool(&self.pool, key).await?;
+            let budget = self.index_lock_budget;
+            crate::data::catalog_check::check(&self.pool, &data, budget)
+                .await
+                .map_err(|e| catalog_check_error(&e, budget, "the check did not finish"))
+        })
+    }
+
+    fn drop_orphaned_relations(
+        &self,
+        key: &extenddb_storage::server_components::KeySource,
+        orphaned: Vec<String>,
+    ) -> BoxFuture<'_, DiagResult<Vec<(String, OrphanDrop)>>> {
+        let key = key.clone();
+        Box::pin(async move {
+            let data = data_pool(&self.pool, key).await?;
+            let budget = self.index_lock_budget;
+            crate::data::catalog_check::drop_orphaned(&self.pool, &data, orphaned, budget)
+                .await
+                .map_err(|e| catalog_check_error(&e, budget, "nothing was dropped"))
+        })
+    }
+}
+
+/// The error `catalog-check` reports when its catalog work fails. A wait for
+/// the `SHARE` lock on `indexes` that ran out its budget says so, with
+/// `outcome`, the effect on this run.
+fn catalog_check_error(e: &CheckFailure, budget: std::time::Duration, outcome: &str) -> DiagError {
+    match e {
+        CheckFailure::IndexLock(e) => DiagError::QueryFailed(format!(
+            "index changes in progress kept the index catalog locked for more than {} \
+             seconds, so {outcome}; run the command again: {e}",
+            budget.as_secs()
+        )),
+        CheckFailure::Sql(e) => DiagError::QueryFailed(e.to_string()),
+    }
+}
+
+/// The pool that holds the data relations: the data database the catalog
+/// names, as `extenddb init` records it.
+///
+/// A catalog without the setting, or with an empty one, is refused: the data
+/// relations could then only be looked for in the catalog's own database, a
+/// layout `init` does not create, where another deployment's relations can
+/// sit unnamed by this catalog. A row the key does not open is refused in
+/// the same way, so the command prints the refusal on its own.
+async fn data_pool(
+    catalog: &PgPool,
+    key: extenddb_storage::server_components::KeySource,
+) -> DiagResult<PgPool> {
+    let conn = data_connection_row(catalog, key)
+        .await
+        .map_err(|e| match e {
+            extenddb_storage::migrations::MigrationError::Refused(refusal) => {
+                DiagError::NotConfigured(refusal)
+            }
+            e => DiagError::QueryFailed(e.to_string()),
+        })?;
+    let Some(conn) = conn.filter(|conn| !conn.is_empty()) else {
+        return Err(DiagError::NotConfigured(
+            "No data database connection string in settings. Run `extenddb init`.".to_owned(),
+        ));
+    };
+    connect_data(&conn).await
+}
+
+/// The catalog's `data_database_connection_string` row as the server reads
+/// it: in a catalog with a key ring the row is encrypted, and `key` opens it
+/// (RFC-0000 section 12). The read takes only the catalog's rows, so the
+/// target needs no data database name.
+async fn data_connection_row(
+    catalog: &PgPool,
+    key: extenddb_storage::server_components::KeySource,
+) -> Result<Option<zeroize::Zeroizing<String>>, extenddb_storage::migrations::MigrationError> {
+    let target = crate::migrations::PostgresTarget::new((*catalog.connect_options()).clone(), "")
+        .with_key_source(key, false);
+    crate::migrations::data_connection_string(&target).await
+}
+
+/// A pool on the data database at `conn`. Statement logging is off, so a
+/// drop that waits out its lock timeout does not print a slow-statement line
+/// in the middle of the command's report.
+async fn connect_data(conn: &str) -> DiagResult<PgPool> {
+    let options = conn
+        .parse::<sqlx::postgres::PgConnectOptions>()
+        .map_err(|e| DiagError::ConnectionFailed(e.to_string()))?;
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(sqlx::ConnectOptions::disable_statement_logging(options))
+        .await
+        .map_err(|e| DiagError::ConnectionFailed(e.to_string()))
 }
 
 // ── MetricsStore ───────────────────────────────────────────────────────
