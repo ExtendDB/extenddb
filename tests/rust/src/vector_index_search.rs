@@ -557,6 +557,26 @@ async fn the_vector_attribute_is_returned_only_when_named() {
         "the vector must be returned when named in ProjectionExpression: {item}"
     );
 
+    // A reserved word written bare is refused at its element, before the
+    // undefined `#u` after it. DynamoDB's answer on 2026-11-24, measured twice
+    // on a table name that does not exist.
+    let body = format!(
+        r#"{{
+        "TableName": "{name}",
+        "IndexName": "vidx",
+        "SearchVector": [{{"N": "1"}}, {{"N": "0"}}],
+        "TopK": 5,
+        "ProjectionExpression": "name.#u"
+    }}"#
+    );
+    let (status, text) = call("SearchVectors", &body).await;
+    assert_validation_message(
+        status,
+        &text,
+        "Invalid ProjectionExpression: Attribute name is a reserved keyword; \
+         reserved keyword: name",
+    );
+
     let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
 }
 

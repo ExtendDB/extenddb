@@ -9,7 +9,7 @@ duplicate ``a`` and ``a``) with a ValidationException. Sibling paths such as
 ``a.b`` and ``a.c`` are accepted. The rejection happens during request
 validation, so it fires even when the item does not exist, and it applies to
 every read API that takes a ProjectionExpression. All messages here were
-captured directly from Amazon DynamoDB via the AWS CLI.
+captured directly from Amazon DynamoDB.
 """
 
 from __future__ import annotations
@@ -49,24 +49,27 @@ READS = {
     ),
 }
 # The first fault in written order: a reserved word or an undefined #name is a
-# fault of its path, and an overlap is a fault of the later path. Measured on
-# GetItem 2026-11-14, and on the other reads 2026-11-18.
+# fault of its path, and an overlap is a fault of the later path. The first
+# four rows were measured on GetItem 2026-11-14 and on the other reads
+# 2026-11-18. name.#u was measured on GetItem and Query 2026-11-18, and on
+# Scan, BatchGetItem and TransactGetItems 2026-11-24.
 FIRST_FAULT_ALL_READS = [
     ("#u, name", UNDEFINED_U),
     ("a, a.b, name", OVERLAP.format(one="[a]", two="[a, b]")),
     ("a, a.b, #u", OVERLAP.format(one="[a]", two="[a, b]")),
     ("a.b, c.d, c, a", OVERLAP.format(one="[c, d]", two="[c]")),
+    ("name.#u", RESERVED_NAME),
 ]
-# Measured on GetItem, and name.#u on Query too.
+# Measured on GetItem 2026-11-18.
 FIRST_FAULT_GET_ITEM = [
     ("name, #u", RESERVED_NAME),
     ("a, name, a.b", RESERVED_NAME),
     ("#u.name", UNDEFINED_U),
-    ("name.#u", RESERVED_NAME),
 ]
 
 
 def _validation_message(excinfo) -> str:
+    assert excinfo.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
     err = excinfo.value.response["Error"]
     assert err["Code"] == "ValidationException"
     return err["Message"]
@@ -260,8 +263,7 @@ class TestProjectionOverlap:
     @pytest.mark.parametrize(
         ("operation", "expression", "expected"),
         [(op, expr, msg) for op in READS for expr, msg in FIRST_FAULT_ALL_READS]
-        + [("GetItem", expr, msg) for expr, msg in FIRST_FAULT_GET_ITEM]
-        + [("Query", "name.#u", RESERVED_NAME)],
+        + [("GetItem", expr, msg) for expr, msg in FIRST_FAULT_GET_ITEM],
     )
     def test_first_fault_in_written_order(
         self, dynamodb_client, overlap_table, operation, expression, expected
