@@ -264,12 +264,14 @@ class TestOrdinaryWritesOnATransactionCreatedItem:
         )
 
 
-def _race(round_number: int, delete, write) -> None:
+def _race(round_number: int, delete, write, hold_write: bool = True) -> None:
     """Run `delete` and `write` on two threads released together. Odd rounds
     hold the delete back a little and even rounds the write, so both orders
-    of arrival occur over a run."""
+    of arrival occur over a run. With `hold_write` false, even rounds release
+    both at once."""
     barrier = threading.Barrier(WRITERS)
     lead = 0.002 if round_number % 2 else 0.0
+    write_wait = 0.002 - lead if hold_write else 0.0
 
     def run(call, wait):
         barrier.wait()
@@ -278,7 +280,7 @@ def _race(round_number: int, delete, write) -> None:
 
     threads = [
         threading.Thread(target=run, args=(delete, lead)),
-        threading.Thread(target=run, args=(write, 0.002 - lead)),
+        threading.Thread(target=run, args=(write, write_wait)),
     ]
     for t in threads:
         t.start()
@@ -346,10 +348,12 @@ def test_a_delete_racing_a_create_of_the_same_index_row_leaves_the_indexes_agree
     run on a slow runner, so the DeleteItem form resends the same way in the
     rounds where the delete is sent first, and sends the create once in the
     others, so its rounds still include a create refused by the item the
-    delete then removes. A round counts as a create that landed after the
-    delete only when that create was started before the delete answered:
-    once a successful delete has answered, the attempt started after it
-    always succeeds."""
+    delete then removes. On a fast runner a DeleteItem can answer within the
+    2 ms the create is held back, so in its resend rounds the DeleteItem
+    form starts the create together with the delete. A round counts as a
+    create that landed after the delete only when that create was started
+    before the delete answered: once a successful delete has answered, the
+    attempt started after it always succeeds."""
     disagreements = []
     created = refused = 0
     for n in range(RACE_ROUNDS):
@@ -392,7 +396,7 @@ def test_a_delete_racing_a_create_of_the_same_index_row_leaves_the_indexes_agree
             finally:
                 answered.set()
 
-        _race(n, delete, create)
+        _race(n, delete, create, hold_write=delete_with == "TransactWriteItems")
         # A request that meets the other one in flight on the item can be
         # refused with a conflict; the indexes must agree with the base table
         # whatever each request answered.
