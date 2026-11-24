@@ -33,6 +33,7 @@ mod snapshot_engine;
 pub use snapshot_engine::{
     MIN_NEXT_PAGE_ROWS, MIN_PAGE_ROWS, SNAPSHOT_SLOT_BOUND, map_fetch_error, page_sql_for,
 };
+mod stream_at_timestamp;
 mod stream_engine;
 mod stream_lifecycle;
 #[doc(hidden)]

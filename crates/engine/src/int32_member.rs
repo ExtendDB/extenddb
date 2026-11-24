@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::error::validation_error_envelope;
+use extenddb_core::error::validation_errors_detected;
 use extenddb_core::types::saturated_int32;
 use serde_json::Value;
 use serde_json::value::RawValue;
@@ -305,7 +305,7 @@ pub(crate) fn newer_form(empty_list: Option<&LengthField>, faults: &[RangeFault]
         .into_iter()
         .chain(faults.iter().map(RangeFault::newer_clause))
         .collect();
-    DynamoDbError::ValidationException(validation_error_envelope(&clauses))
+    DynamoDbError::ValidationException(validation_errors_detected(&clauses))
 }
 
 #[cfg(test)]
