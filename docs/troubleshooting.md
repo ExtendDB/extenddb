@@ -511,11 +511,14 @@ SELECT l.pid, l.mode, a.query_start, l.relation::regclass AS relation, a.query
                         FROM unnest(ARRAY['_ddb_<table_id>', '_ddb_<index_id>']) AS n);
 ```
 
+A third cause, on Cassandra only, is a `DeleteTable` that stopped after it claimed the table's row. The server process stopped, or a statement after the claim failed. The claim keeps the row `DELETING` until its deadline, 300 s after the claim or after the call's renewal of it. The 60-second sweep removes the table at its first pass after the deadline, so the table disappears within about 6 minutes. Until then a `DeleteTable` of the table is refused with `ResourceInUseException` (`Table is being deleted: <table_name>`).
+
 **Fix:** If a table appears stuck:
 1. Check that extenddb is running (`extenddb status`).
 2. Wait for the configured `control_plane_delay_seconds` (default: 0.25) — the poller is woken immediately when a table enters a transitional state.
 3. On PostgreSQL, look for a session holding a lock on the table (above); the delete finishes within about a second of its end.
 4. If the server was restarted, transitions are recovered automatically at startup.
+5. On Cassandra, wait about 6 minutes for a table that a stopped `DeleteTable` claimed: the sweep removes it after the claim's deadline (above).
 
 ### Data tables without a catalog row (PostgreSQL, separate data database)
 
