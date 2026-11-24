@@ -359,11 +359,11 @@ function readExpectation(error, checks) {
     const list = checks.map(readCheck);
     const checksSomething = error === null
         ? list.some((c) => c.path !== '/__type')
-        : list.some((c) => c.path === '/message' && c.kind !== 'present');
+        : list.some((c) => (c.path === '/message' || c.path === '/Message') && c.kind !== 'present');
     if (!checksSomething) {
         throw new Reject(error === null
             ? 'a success case needs a check on the response body'
-            : 'an error case needs an equals, contains or absent check on /message');
+            : 'an error case needs an equals, contains or absent check on /message or /Message');
     }
     return { error, checks: list };
 }

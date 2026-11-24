@@ -35,7 +35,7 @@
     "          {path, present:true}, or {path, absent:true}, where path is a JSON",
     "          Pointer. A success case needs a check whose path is not /__type,",
     "          and an error case an equals, contains or absent check on",
-    "          /message. N values are strings in the wire shape.",
+    "          /message or /Message. N values are strings in the wire shape.",
     "  save    optional: {name: JSON Pointer}; stores the string at each pointer",
     "          of the response under name (ASCII letters, digits and _, not",
     "          starting with a digit). In a later case's body strings, each",
@@ -1336,7 +1336,7 @@
           "equals": "ConditionalCheckFailed"
         },
         {
-          "path": "/message",
+          "path": "/Message",
           "equals": "Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]"
         }
       ]

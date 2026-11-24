@@ -262,7 +262,8 @@ fn read_check(check: &Value) -> Result<Check<'_>, String> {
 /// `error` is required: `null` for success or the error's short name. `checks`
 /// is required and must check something beyond the outcome: a success case
 /// needs a check whose path is not `/__type`, and an error case needs an
-/// `equals`, `contains` or `absent` check on `/message`.
+/// `equals`, `contains` or `absent` check on the message, `/message` or
+/// `/Message` (the key the error document gives it).
 fn read_expectation<'a>(
     error: Option<&'a Value>,
     checks: Option<&'a Value>,
@@ -283,13 +284,17 @@ fn read_expectation<'a>(
         None => checks.iter().any(|check| check.path != "/__type"),
         Some(_) => checks
             .iter()
-            .any(|check| check.path == "/message" && !matches!(check.kind, CheckKind::Present)),
+            .any(|check| {
+                matches!(check.path, "/message" | "/Message")
+                    && !matches!(check.kind, CheckKind::Present)
+            }),
     };
     if !checks_something {
         return Err(match error {
             None => "a success case needs a check on the response body".to_owned(),
             Some(_) => {
-                "an error case needs an equals, contains or absent check on /message".to_owned()
+                "an error case needs an equals, contains or absent check on /message or /Message"
+                    .to_owned()
             }
         });
     }
