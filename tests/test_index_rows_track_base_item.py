@@ -341,21 +341,30 @@ def test_a_delete_racing_a_create_of_the_same_index_row_leaves_the_indexes_agree
     to it lands while the item still exists. Against a transaction the create
     is resent until it succeeds or the delete has answered, with one last
     attempt after the answer, so the rounds reach the create that commits
-    after the delete."""
+    after the delete. A create sent once next to a DeleteItem can also reach
+    its condition check before the delete's write lands, in every round of a
+    run on a slow runner, so the DeleteItem form resends the same way in the
+    rounds where the delete is sent first, and sends the create once in the
+    others, so its rounds still include a create refused by the item the
+    delete then removes. A round counts as a create that landed after the
+    delete only when that create was started before the delete answered:
+    once a successful delete has answered, the attempt started after it
+    always succeeds."""
     disagreements = []
     created = refused = 0
-    resend = delete_with == "TransactWriteItems"
     for n in range(RACE_ROUNDS):
+        # `_race` holds the delete back in odd rounds and the create in even.
+        resend = delete_with == "TransactWriteItems" or n % 2 == 0
         pk = f"same-row-{delete_with}-{n}"
         gk = f"g-{pk}"
         dynamodb_client.put_item(TableName=indexed_table, Item=_item(pk, "1", "same", gk, "v1"))
-        outcome: dict[str, str] = {}
+        outcome: dict[str, str | bool] = {}
         key = {"pk": {"S": pk}, "sk": {"S": "1"}}
         answered = threading.Event()
 
         def create():
-            last = False
             while True:
+                outcome["before_answer"] = not answered.is_set()
                 try:
                     raw_clients[0].put_item(
                         TableName=indexed_table,
@@ -366,9 +375,8 @@ def test_a_delete_racing_a_create_of_the_same_index_row_leaves_the_indexes_agree
                     return
                 except ClientError as e:
                     outcome["create"] = e.response["Error"]["Code"]
-                if not resend or last:
+                if not resend or not outcome["before_answer"]:
                     return
-                last = answered.is_set()
 
         def delete():
             try:
@@ -394,10 +402,10 @@ def test_a_delete_racing_a_create_of_the_same_index_row_leaves_the_indexes_agree
             "ConditionalCheckFailedException",
             "TransactionConflictException",
         ), outcome
-        if outcome["create"] == "ok":
-            created += 1
-        else:
+        if outcome["create"] != "ok":
             refused += 1
+        elif outcome["before_answer"]:
+            created += 1
 
         base = _base(dynamodb_client, indexed_table, pk, "1")
         want_lsi = [("same", base["data"]["S"])] if base else []
@@ -407,6 +415,8 @@ def test_a_delete_racing_a_create_of_the_same_index_row_leaves_the_indexes_agree
         if (got_lsi, got_gsi) != (want_lsi, want_gsi):
             disagreements.append((pk, outcome, want_lsi, got_lsi, got_gsi))
     assert not disagreements, f"an index disagrees with the base table: {disagreements}"
-    assert created, f"no create landed after the delete in {RACE_ROUNDS} rounds"
-    if not resend:
+    assert created, (
+        f"no create sent before the delete answered landed after it in {RACE_ROUNDS} rounds"
+    )
+    if delete_with == "DeleteItem":
         assert refused, f"no create landed before the delete in {RACE_ROUNDS} rounds"
