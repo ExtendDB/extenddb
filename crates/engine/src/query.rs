@@ -798,3 +798,105 @@ mod empty_key_condition_tests {
         assert!(reject_empty_key_condition_expression(Some("pk = :v")).is_ok());
     }
 }
+
+#[cfg(test)]
+mod exclusive_start_key_tests {
+    use extenddb_core::error::DynamoDbError;
+    use extenddb_core::types::{QueryInput, ScanInput};
+    use serde_json::json;
+
+    const PREFIXED_EMPTY: &str = "The provided starting key is invalid: Supplied AttributeValue is empty, must contain exactly one of the supported datatypes";
+
+    // The production deserialize path (serde_json::from_value + deserialize_error),
+    // exactly as query.rs and scan.rs run it.
+    fn query_err(esk: serde_json::Value) -> DynamoDbError {
+        serde_json::from_value::<QueryInput>(json!({
+            "TableName": "T",
+            "KeyConditionExpression": "pk = :v",
+            "ExpressionAttributeValues": {":v": {"S": "p0"}},
+            "ExclusiveStartKey": esk,
+        }))
+        .map_err(crate::deserialize_error)
+        .unwrap_err()
+    }
+    fn scan_err(esk: serde_json::Value) -> DynamoDbError {
+        serde_json::from_value::<ScanInput>(json!({ "TableName": "T", "ExclusiveStartKey": esk }))
+            .map_err(crate::deserialize_error)
+            .unwrap_err()
+    }
+
+    #[test]
+    fn empty_value_is_prefixed_validation_exception() {
+        for err in [query_err(json!({"pk": {}})), scan_err(json!({"pk": {}}))] {
+            match err {
+                DynamoDbError::ValidationException(m) => assert_eq!(m, PREFIXED_EMPTY),
+                other => panic!("expected ValidationException, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_descriptor_is_prefixed_validation_exception() {
+        let esk = json!({"pk": {"X": "1"}});
+        for err in [query_err(esk.clone()), scan_err(esk)] {
+            match err {
+                DynamoDbError::ValidationException(m) => assert_eq!(m, PREFIXED_EMPTY),
+                other => panic!("expected ValidationException, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn empty_number_set_keeps_its_own_message_unprefixed() {
+        const NS_EMPTY: &str =
+            "One or more parameter values were invalid: An number set  may not be empty";
+        for err in [
+            query_err(json!({"pk": {"NS": []}})),
+            scan_err(json!({"pk": {"NS": []}})),
+        ] {
+            match err {
+                DynamoDbError::ValidationException(m) => assert_eq!(m, NS_EMPTY),
+                other => panic!("expected ValidationException, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn nested_unknown_descriptor_is_not_prefixed() {
+        // Only a top-level unknown descriptor is "empty"; a nested one keeps
+        // the deserializer's own error (a SerializationException), as before.
+        match query_err(json!({"pk": {"L": [{"X": "1"}]}})) {
+            DynamoDbError::SerializationException(m) => {
+                assert!(!m.contains("provided starting key"), "{m}");
+            }
+            other => panic!("expected SerializationException, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn valid_and_absent_start_keys_deserialize() {
+        use extenddb_core::types::AttributeValue;
+        let q: QueryInput = serde_json::from_value(json!({
+            "TableName": "T",
+            "KeyConditionExpression": "pk = :v",
+            "ExpressionAttributeValues": {":v": {"S": "p0"}},
+            "ExclusiveStartKey": {"pk": {"S": "k"}},
+        }))
+        .unwrap();
+        assert_eq!(
+            q.exclusive_start_key.unwrap().get("pk"),
+            Some(&AttributeValue::S("k".to_owned()))
+        );
+        // Absent and explicit null both deserialize to None, for Query and Scan.
+        let q2: QueryInput = serde_json::from_value(json!({
+            "TableName": "T",
+            "KeyConditionExpression": "pk = :v",
+            "ExpressionAttributeValues": {":v": {"S": "p0"}},
+        }))
+        .unwrap();
+        assert!(q2.exclusive_start_key.is_none());
+        let s: ScanInput =
+            serde_json::from_value(json!({ "TableName": "T", "ExclusiveStartKey": null })).unwrap();
+        assert!(s.exclusive_start_key.is_none());
+    }
+}

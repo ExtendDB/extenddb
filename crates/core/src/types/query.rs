@@ -76,7 +76,11 @@ pub struct QueryInput {
     pub scan_index_forward: bool,
     #[serde(rename = "Limit")]
     pub limit: Option<i64>,
-    #[serde(rename = "ExclusiveStartKey")]
+    #[serde(
+        rename = "ExclusiveStartKey",
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_exclusive_start_key"
+    )]
     pub exclusive_start_key: Option<Item>,
     #[serde(rename = "Select")]
     pub select: Option<Select>,
@@ -144,7 +148,11 @@ pub struct ScanInput {
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "Limit")]
     pub limit: Option<i64>,
-    #[serde(rename = "ExclusiveStartKey")]
+    #[serde(
+        rename = "ExclusiveStartKey",
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_exclusive_start_key"
+    )]
     pub exclusive_start_key: Option<Item>,
     #[serde(rename = "Select")]
     pub select: Option<Select>,
