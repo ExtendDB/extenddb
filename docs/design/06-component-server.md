@@ -471,7 +471,7 @@ All management routes use `POST /management/<action>` with JSON request/response
 }
 ```
 
-> **Note:** The `SecretAccessKey` is returned only in this response and is not retrievable afterward. The storage layer stores the raw secret (not a hash) because SigV4 authentication requires the original secret key for HMAC computation. Secrets are encrypted at rest with AES-256-GCM using a per-catalog encryption key generated during `extenddb init`.
+> **Note:** The `SecretAccessKey` is returned only in this response and is not retrievable afterward. The storage layer stores the raw secret (not a hash) because SigV4 authentication requires the original secret key for HMAC computation. Secrets are encrypted at rest with AES-256-GCM. By default the key is a per-catalog encryption key generated during `extenddb init`; with `[auth.encryption] key_file` set, it is a data encryption key that a key-encryption key file wraps (the Security Model's Credential Storage section). The response holds the secret for the life of the request, and afterwards the server's credential cache keeps only the SigV4 signing key derived from it.
 
 **Assume Role:**
 ```json
@@ -634,6 +634,6 @@ The handler calls `core::capacity::calculator` to compute consumed RCU/WCU, then
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

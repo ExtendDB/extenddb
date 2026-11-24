@@ -13,7 +13,8 @@ pub use backup::{
     OTHER_STORE, RESTORE_REGISTRATION_TIMEOUT, S3_CHECK_TIMEOUT, STORE_IDENTITY_KEY, Spool,
     StoreFence, StoreHealth, StoreHealthReport, StoreIdentityFile, StoreProblem, TARGET_NOT_EMPTY,
     check_configured_store, check_configured_store_read_only, maintenance, migrate_legacy,
-    read_identity_bounded, reconciler, store_identity, store_maintenance, sync,
+    read_identity_bounded, reconciler, refuse_point_in_time_recovery, store_identity,
+    store_maintenance, sync,
 };
 mod batch_get_item;
 mod batch_write_item;
@@ -31,11 +32,13 @@ mod gsi_updates;
 mod import_export;
 mod import_export_io;
 mod index_helpers;
+mod int32_member;
 mod item_authorizer;
 mod legacy_filter;
 mod list_tables;
 #[cfg(feature = "partiql")]
 mod partiql;
+pub mod private_fs;
 mod put_item;
 mod query;
 mod read_helpers;
