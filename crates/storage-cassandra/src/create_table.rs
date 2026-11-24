@@ -3,6 +3,8 @@
 
 //! `create_table` implementation for `CassandraEngine`.
 
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use cdrs_tokio::types::value::Value;
 use extenddb_core::types::{
     BillingMode, BillingModeSummary, CreateTableInput, GsiDescription, LsiDescription,
@@ -195,7 +197,8 @@ impl CassandraEngine {
         let delay_query = format!("SELECT value FROM {catalog_keyspace}.settings WHERE key = ?");
         let delay_seconds: f64 = self
             .session
-            .query_with_values(
+            .run(
+                Stmt::Read,
                 &delay_query,
                 cdrs_tokio::query_values!("control_plane_delay_seconds"),
             )
@@ -331,7 +334,8 @@ impl CassandraEngine {
 
         let result = self
             .session
-            .query_with_values(
+            .run(
+                Stmt::Lwt,
                 &insert_table_cql,
                 cdrs_tokio::query::QueryValues::SimpleValues(values),
             )
@@ -444,7 +448,8 @@ impl CassandraEngine {
                 );
 
                 self.session
-                    .query_with_values(
+                    .run(
+                        Stmt::Write,
                         &insert_index_cql,
                         cdrs_tokio::query::QueryValues::SimpleValues(index_values),
                     )
@@ -475,7 +480,8 @@ impl CassandraEngine {
                 );
 
                 self.session
-                    .query_with_values(
+                    .run(
+                        Stmt::Write,
                         &insert_index_cql,
                         cdrs_tokio::query::QueryValues::SimpleValues(vec![
                             Value::from(table_id.as_str()),
@@ -504,7 +510,8 @@ impl CassandraEngine {
                 );
 
                 self.session
-                    .query_with_values(
+                    .run(
+                        Stmt::Write,
                         &insert_tag_cql,
                         cdrs_tokio::query_values!(
                             table_arn.as_str(),

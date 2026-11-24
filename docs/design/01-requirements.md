@@ -219,7 +219,7 @@ These are the core CRUD operations. All must be fully implemented.
 **Key requirements:**
 - REQ-STREAM-001: Support all four stream view types: KEYS_ONLY, NEW_IMAGE, OLD_IMAGE, NEW_AND_OLD_IMAGES
 - REQ-STREAM-002: Stream records must capture changes from PutItem, UpdateItem, DeleteItem, BatchWriteItem, TransactWriteItems
-- REQ-STREAM-003: Support shard iterator types: TRIM_HORIZON, LATEST, AT_SEQUENCE_NUMBER, AFTER_SEQUENCE_NUMBER
+- REQ-STREAM-003: Support shard iterator types: TRIM_HORIZON, LATEST, AT_SEQUENCE_NUMBER, AFTER_SEQUENCE_NUMBER, AT_TIMESTAMP
 - REQ-STREAM-004: Stream records must be ordered by sequence number within a shard
 - REQ-STREAM-005: Detailed shard management and retention design is deferred
 
