@@ -31,9 +31,9 @@ use extenddb_core::expression::{
     Expr, ExpressionMaps, KeyCondition, PathElement, SortKeyCondition,
 };
 use extenddb_core::types::{
-    AttributeDefinition, EMPTY_ATTRIBUTE_VALUE, MULTI_ATTRIBUTE_VALUE, QueryInput,
+    AttributeDefinition, AttributeValue, EMPTY_ATTRIBUTE_VALUE, MULTI_ATTRIBUTE_VALUE, QueryInput,
 };
-use extenddb_core::validation::number::NOT_A_NUMBER;
+use extenddb_core::validation::number::{NOT_A_NUMBER, NUMBER_SET_DUPLICATES, has_equal_numbers};
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
@@ -52,11 +52,13 @@ pub const LIMIT_BELOW_ONE: &str = "1 validation error detected: Value at 'Limit'
 /// out.
 const NULL_VALUE: &str = "The supplied Item contains a null AttributeValue";
 
-/// The type descriptors of an AttributeValue, in the order the service reads
+/// The type descriptors of an AttributeValue, in the order the service checks
 /// the payloads of a value with several type descriptors (see
-/// [`first_fault`]). Core's list is a private constant of its `partiql`
-/// module, as for [`NULL_VALUE`].
-const TYPE_DESCRIPTORS: [&str; 10] = ["S", "N", "B", "SS", "NS", "BS", "M", "L", "NULL", "BOOL"];
+/// [`first_fault`]): a duplicate `SS` member ahead of the numbers (measured
+/// 2026-11-24), `N` ahead of `NS`, `NS` ahead of `BS`, and `NS` and `M` ahead
+/// of `L`. Core's list is a private constant of its `partiql` module, as for
+/// [`NULL_VALUE`].
+const TYPE_DESCRIPTORS: [&str; 10] = ["SS", "S", "N", "B", "NS", "BS", "M", "L", "NULL", "BOOL"];
 
 /// The members of the two enums the request-time checks read.
 const RETURN_CONSUMED_CAPACITY: &[&str] = &["INDEXES", "TOTAL", "NONE"];
@@ -398,6 +400,9 @@ enum Fault<'a> {
     /// A number the number rules refuse for its magnitude or precision, with
     /// their text.
     Refused(String),
+    /// An empty set, or a set two of whose members have one value, beside a
+    /// second type descriptor, with the text of that path (see [`set_fault`]).
+    Set(String),
 }
 
 impl Fault<'_> {
@@ -425,14 +430,19 @@ impl Fault<'_> {
             Fault::SeveralTypes => MULTI_ATTRIBUTE_VALUE.to_owned(),
             Fault::NotANumber("") => NOT_A_NUMBER.to_owned(),
             Fault::NotANumber(text) => format!("{NOT_A_NUMBER}: {text}"),
-            Fault::Refused(msg) => msg,
+            Fault::Refused(msg) | Fault::Set(msg) => msg,
         }
     }
 }
 
 /// The first fault in `value` (`member` is its name when it is the value of an
-/// `M` member): a null or no type descriptor, then the numbers in `N`, `NS`
-/// and every value an `L` or `M` holds, then more than one type descriptor.
+/// `M` member): a null or no type descriptor, then the payloads in the order
+/// of [`TYPE_DESCRIPTORS`] (the numbers in `N` and `NS`, and every value an
+/// `L` or `M` holds), then more than one type descriptor. With `sets`, an
+/// empty set and a set two of whose members have one value are faults too,
+/// `SS` ahead of the numbers and `NS` after its own numbers (see
+/// [`set_fault`]); without it, the deserializer reports them after the
+/// request-time checks.
 /// `L` items are visited in document order and `M` members in the map's
 /// iteration order: sorted by key without the `preserve_order` feature of
 /// `serde_json`, in document order with it, as in the MongoDB build (bson
@@ -449,8 +459,11 @@ impl Fault<'_> {
 /// (measured 2026-11-19: `{"N": "bob", "S": "x"}` and `{"S": "x", "N": "bob"}`
 /// answer the numeric text for `bob`, `{"N": "1", "S": "x"}` the more than one
 /// datatypes text, `{"S": "x", "L": [null]}` the null text, and `N` is read
-/// ahead of `NS`, `NS` and `M` ahead of `L`).
-fn first_fault<'a>(value: &'a Value, member: Option<&'a str>) -> Option<Fault<'a>> {
+/// ahead of `NS`, `NS` and `M` ahead of `L`; measured 2026-11-24: `{"SS":
+/// ["a", "a"], "N": "bob"}` answers the duplicate text, `{"NS": ["1", "1"],
+/// "N": "bob"}` the numeric text, and `{"NS": ["1", "1"], "L": [{"N":
+/// "bob"}]}` the duplicate text).
+fn first_fault<'a>(value: &'a Value, member: Option<&'a str>, sets: bool) -> Option<Fault<'a>> {
     let Value::Object(map) = value else {
         return value.is_null().then_some(Fault::Null(member));
     };
@@ -465,17 +478,51 @@ fn first_fault<'a>(value: &'a Value, member: Option<&'a str>) -> Option<Fault<'a
             ("NS", Value::Array(members)) => members
                 .iter()
                 .filter_map(Value::as_str)
-                .find_map(number_fault),
-            ("L", Value::Array(items)) => items.iter().find_map(|item| first_fault(item, None)),
+                .find_map(number_fault)
+                .or_else(|| sets.then(|| set_fault(descriptor, members)).flatten()),
+            ("SS" | "BS", Value::Array(members)) if sets => set_fault(descriptor, members),
+            ("L", Value::Array(items)) => {
+                items.iter().find_map(|item| first_fault(item, None, sets))
+            }
             ("M", Value::Object(members)) => members
                 .iter()
-                .find_map(|(name, inner)| first_fault(inner, Some(name))),
+                .find_map(|(name, inner)| first_fault(inner, Some(name), sets)),
             _ => None,
         });
     match payloads.len() {
         0 => Some(Fault::Empty),
         1 => fault,
         _ => fault.or(Some(Fault::SeveralTypes)),
+    }
+}
+
+/// The service's refusal of a set of type `descriptor` whose `members` are
+/// strings, beside a second type descriptor: [`NUMBER_SET_DUPLICATES`] for an
+/// `NS` two of whose members have one value, else the deserializer's text for
+/// an empty set or an `SS` or `BS` that holds a member twice. Measured
+/// 2026-11-24, each body twice, as `ExpressionAttributeValues contains invalid
+/// value: ... for key :z`: `{"SS": ["a", "a"], "N": "1"}` answers `One or more
+/// parameter values were invalid: Input collection [a, a] contains
+/// duplicates.`, `{"NS": ["1", "1"], "S": "x"}` `Input collection contains
+/// duplicates`, `{"BS": ["YQ==", "YQ=="], "N": "1"}` `One or more parameter
+/// values were invalid: Input collection [YQ==, YQ==]of type BS contains
+/// duplicates.`, and an empty `SS`, `NS` or `BS` beside a second descriptor
+/// the deserializer's empty set text. A member of another JSON type is left
+/// to the shape fault check.
+fn set_fault<'a>(descriptor: &str, members: &[Value]) -> Option<Fault<'a>> {
+    if !members.iter().all(Value::is_string) {
+        return None;
+    }
+    if descriptor == "NS" && has_equal_numbers(members) {
+        return Some(Fault::Set(NUMBER_SET_DUPLICATES.to_owned()));
+    }
+    let set = Value::Object(Map::from_iter([(
+        descriptor.to_owned(),
+        Value::Array(members.to_vec()),
+    )]));
+    match serde_json::from_value::<AttributeValue>(set).map_err(crate::deserialize_error) {
+        Err(DynamoDbError::ValidationException(msg)) => Some(Fault::Set(msg)),
+        _ => None,
     }
 }
 
@@ -520,7 +567,7 @@ fn validate_expression_attribute_value_numbers(
 ) -> Result<(), DynamoDbError> {
     match sorted_entries(values)
         .into_iter()
-        .find_map(|(_, value)| first_fault(value, None))
+        .find_map(|(_, value)| first_fault(value, None, false))
     {
         Some(fault) => Err(DynamoDbError::ValidationException(
             fault.request_time_text(),
