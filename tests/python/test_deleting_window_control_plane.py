@@ -133,27 +133,24 @@ def _assert_in_use(exc: ClientError, name: str) -> None:
     assert err["Message"] == _being_deleted(name)
 
 
-def _settle_tags(dynamodb_client, is_extenddb: bool, arn: str) -> None:
-    """On the service, wait out the tag update a tag write starts.
+def _delete_table_after_tag_write(dynamodb_client, name: str):
+    """DeleteTable, retried while the service refuses it after a tag write.
 
-    For several seconds after ``TagResource`` or ``UntagResource`` the service
-    answers another tag write on the resource with ``LimitExceededException``
-    and ``DeleteTable`` on the table with ``ResourceInUseException``, both
-    ``Table tags are being updated: <name>`` (measured 2026-10-26). An
-    ``UntagResource`` of a key the resource does not carry is retried until it
-    is answered. ExtendDB has no such state.
+    For a few seconds after ``TagResource`` or ``UntagResource`` the service
+    answers ``DeleteTable`` on the table with ``ResourceInUseException``
+    ``Attempt to change a resource which is still in use: Table tags are being
+    updated: <name>`` (measured 2026-10-26 and 2026-11-20). A retried
+    ``DeleteTable`` starts no new tag update, where another tag write would.
+    ExtendDB has no such state, so its first ``DeleteTable`` is answered.
     """
-    if is_extenddb:
-        return
     for _ in range(30):
         try:
-            dynamodb_client.untag_resource(ResourceArn=arn, TagKeys=["settle-probe"])
-            return
+            return dynamodb_client.delete_table(TableName=name)
         except ClientError as exc:
             if "tags are being updated" not in exc.response["Error"]["Message"]:
                 raise
             time.sleep(1)
-    raise TimeoutError(f"the tags of {arn} were still being updated after 30 attempts")
+    raise TimeoutError(f"DeleteTable of {name} was still refused after 30 attempts")
 
 
 class TestDeletingWindowControlPlane:
@@ -192,11 +189,12 @@ class TestDeletingWindowControlPlane:
         DeleteTable (measured 2026-11-03)."""
         name = unique_name("del-window")
         lock = _open_window(dynamodb_client, is_extenddb, name)
+        deleted = False
         try:
             arn = dynamodb_client.describe_table(TableName=name)["Table"]["TableArn"]
             dynamodb_client.tag_resource(ResourceArn=arn, Tags=[{"Key": "k1", "Value": "v1"}])
-            _settle_tags(dynamodb_client, is_extenddb, arn)
-            dynamodb_client.delete_table(TableName=name)
+            _delete_table_after_tag_write(dynamodb_client, name)
+            deleted = True
             with pytest.raises(ClientError) as exc:
                 dynamodb_client.tag_resource(ResourceArn=arn, Tags=[{"Key": "k2", "Value": "v2"}])
             _assert_in_use(exc.value, name)
@@ -208,6 +206,8 @@ class TestDeletingWindowControlPlane:
         finally:
             if lock is not None:
                 lock.release()
+            if not deleted:
+                _delete_table_after_tag_write(dynamodb_client, name)
         wait_for_deleted(dynamodb_client, name, timeout=120.0)
 
 
@@ -291,8 +291,7 @@ _STREAM_TAG = [{"Key": "sk", "Value": "sv"}]
 
 # The TTL calls and the stream ARN tag calls in the window, one table per row:
 # on the service a tag write starts a tag update that refuses the next tag
-# write on the resource for a few seconds, so a row that writes a tag before
-# DeleteTable waits that update out. A row is (the table has a stream,
+# write on the resource for a few seconds. A row is (the table has a stream,
 # steps before DeleteTable, steps after it). A step is (operation, request,
 # answer), where the answer is the response body or an (error code, message)
 # pair. ``{name}`` and ``{stream}`` (the table's LatestStreamArn) are
@@ -376,6 +375,7 @@ class TestDeletingWindowTimeToLiveAndStreamTags:
     def test_answers_in_the_window(self, dynamodb_client, is_extenddb, stream, before, after):
         name = unique_name("del-window")
         lock = _open_window(dynamodb_client, is_extenddb, name, stream=stream)
+        deleted = False
         try:
             table = dynamodb_client.describe_table(TableName=name)["Table"]
             values = {
@@ -384,12 +384,13 @@ class TestDeletingWindowTimeToLiveAndStreamTags:
             }
             for step in before:
                 _run_step(dynamodb_client, step, values)
-            if before:
-                _settle_tags(dynamodb_client, is_extenddb, values["stream"])
-            dynamodb_client.delete_table(TableName=name)
+            _delete_table_after_tag_write(dynamodb_client, name)
+            deleted = True
             for step in after:
                 _run_step(dynamodb_client, step, values)
         finally:
             if lock is not None:
                 lock.release()
+            if not deleted:
+                _delete_table_after_tag_write(dynamodb_client, name)
         wait_for_deleted(dynamodb_client, name, timeout=120.0)
