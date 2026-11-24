@@ -55,7 +55,11 @@ impl<'de> Deserialize<'de> for ReturnValues {
 pub struct ExpectedAttributeValue {
     /// Legacy shorthand: if `Value` is set (without `ComparisonOperator`),
     /// it means `EQ` comparison.
-    #[serde(rename = "Value")]
+    #[serde(
+        rename = "Value",
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_operands"
+    )]
     pub value: Option<AttributeValue>,
     /// `true` = `attribute_exists`, `false` = `attribute_not_exists`.
     #[serde(rename = "Exists")]
@@ -64,7 +68,11 @@ pub struct ExpectedAttributeValue {
     #[serde(rename = "ComparisonOperator")]
     pub comparison_operator: Option<String>,
     /// Values for the comparison operator.
-    #[serde(rename = "AttributeValueList")]
+    #[serde(
+        rename = "AttributeValueList",
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_operands"
+    )]
     pub attribute_value_list: Option<Vec<AttributeValue>>,
 }
 

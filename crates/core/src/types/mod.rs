@@ -84,10 +84,11 @@ pub use warm_throughput::{
     WarmThroughputDescription, WarmThroughputRecord, WarmThroughputStatus, epoch_seconds_now,
 };
 
+/// The deserializer's reader of a value at a depth, for the condition
+/// operands, which are read at depth 0 (`crate::serde_helpers`).
+pub(crate) use attribute_value::from_nested;
 /// The deserializer's test for a member of a value object, and the member it
 /// reads a value by, for the readers that read a value before it is
 /// deserialized.
 pub(crate) use attribute_value::is_type_descriptor;
-/// The string set duplicate refusal, for the PartiQL payload check.
-pub(crate) use attribute_value::string_set_duplicates;
 pub use attribute_value::type_descriptor;

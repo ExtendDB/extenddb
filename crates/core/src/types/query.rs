@@ -16,7 +16,11 @@ use super::{AttributeValue, Item};
 pub struct Condition {
     #[serde(rename = "ComparisonOperator")]
     pub comparison_operator: String,
-    #[serde(rename = "AttributeValueList", default)]
+    #[serde(
+        rename = "AttributeValueList",
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_operands"
+    )]
     pub attribute_value_list: Vec<AttributeValue>,
 }
 

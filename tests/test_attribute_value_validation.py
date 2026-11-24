@@ -47,6 +47,14 @@ from conftest import scoped_table
 ENDPOINT = os.environ.get("EXTENDDB_TEST_ENDPOINT", "http://localhost:18443").strip()
 
 
+def _nested_lists(levels: int) -> dict:
+    """``{"S": "x"}`` inside ``levels`` lists."""
+    value: dict = {"S": "x"}
+    for _ in range(levels):
+        value = {"L": [value]}
+    return value
+
+
 # Wire-format AttributeValues that DynamoDB rejects with a
 # ValidationException. The bare `{}`, deeply-nested `{}`, and multi-key
 # variants all surface as `EMPTY_ATTRIBUTE_VALUE` ("Supplied AttributeValue
@@ -54,6 +62,10 @@ ENDPOINT = os.environ.get("EXTENDDB_TEST_ENDPOINT", "http://localhost:18443").st
 # *class* but have type-specific message text — for example, real DDB
 # returns `"An string set may not have a null string as a member"` for the
 # `{"SS":[..., null]}` case (yes, "An string set" is verbatim DDB wording).
+# A value with two type descriptors is refused for a null member or for the
+# nesting of a payload before the count (measured 2026-11-23 and 2026-11-24
+# through PutItem, UpdateItem, GetItem, BatchWriteItem and
+# TransactWriteItems).
 #
 # These tests assert the error class and HTTP status. The exact SS-null
 # wording is locked in by `TestStringSetWithNullSpecificMessage` below.
@@ -66,6 +78,8 @@ EMPTY_AV_SCENARIOS = [
     pytest.param({"SS": ["a", None]}, id="ss_with_null_element"),
     pytest.param({"NS": ["1", None]}, id="ns_with_null_element"),
     pytest.param({"BS": ["QQ==", None]}, id="bs_with_null_element"),
+    pytest.param({"S": "x", "L": [None]}, id="null_in_list_beside_s"),
+    pytest.param({"S": "x", "L": [_nested_lists(32)]}, id="33_lists_beside_s"),
 ]
 
 # AttributeValue with more than one type-key. DynamoDB rejects with
@@ -110,12 +124,15 @@ def _signed_post(operation: str, body: dict) -> requests.Response:
 def _assert_empty_attribute_value(resp: requests.Response) -> None:
     """Assert the response is a 400 ValidationException for a malformed AttributeValue.
 
-    Accepts either of two DynamoDB wordings:
+    Accepts any of these DynamoDB wordings:
     - ``EMPTY_ATTRIBUTE_VALUE`` ("Supplied AttributeValue is empty, ...") for
       bare-empty and nested-empty cases.
     - ``INVALID_PARAMETER_VALUE`` with the SS-specific suffix
       ("An string set may not have a null string as a member") for the
       ``{"SS":[..., null]}`` case.
+    - "The supplied Item contains a null AttributeValue" and "Nesting Levels
+      have exceeded supported limits: ..." for the values with two type
+      descriptors.
 
     The exact SS-specific wording is locked in by the focused tests in
     ``TestStringSetWithNullSpecificMessage``.
@@ -140,7 +157,9 @@ def _assert_empty_attribute_value(resp: requests.Response) -> None:
             or "may not contain null" in message
         )
     )
-    assert is_empty_av or is_invalid_param, (
+    is_null_member = "The supplied Item contains a null AttributeValue" in message
+    is_too_deep = "Nesting Levels have exceeded supported limits" in message
+    assert is_empty_av or is_invalid_param or is_null_member or is_too_deep, (
         f"expected EMPTY_ATTRIBUTE_VALUE or INVALID_PARAMETER_VALUE wording, got: {message}"
     )
 
