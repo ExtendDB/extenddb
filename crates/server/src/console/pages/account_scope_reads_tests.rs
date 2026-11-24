@@ -27,8 +27,10 @@ use extenddb_storage::authorization_store::{AuthorizationStore, SessionData as R
 use extenddb_storage::management_store::{
     AccessKeyCreated, AccountDetail, AdminEntry, AdminStore, GroupDetail, GroupListEntry,
     ManagementStore, MetricsFilter, MetricsRow, MetricsStore, OpError, OpResult, PasswordHashStore,
-    RateLimitStore, RoleDetail, RoleListEntry, SettingsStore, UserDetail, UserListEntry,
+    RateLimitStore, RoleDetail, RoleListEntry, SecretPage, SecretWrite, SettingsStore, UserDetail,
+    UserListEntry,
 };
+use extenddb_storage::secret_keys::SecretTable;
 use futures::future::BoxFuture;
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -137,6 +139,10 @@ impl ManagementStore for CountingStore {
             &str, &str, &[u8], &str, &str, &str, &Option<Value>, &Option<Value>, OffsetDateTime
         ) -> ();
         fetch_caller_tags(&str, &str) -> Vec<(String, String)>;
+        read_secret_page(SecretTable, Option<&str>, usize) -> SecretPage;
+        write_secrets(SecretTable, &[SecretWrite]) -> ();
+        delete_secrets(SecretTable, &[String]) -> ();
+        delete_setting(&str) -> ();
     }
 }
 
@@ -209,11 +215,7 @@ impl PasswordHashStore for CountingStore {
     }
 }
 
-impl CatalogStore for CountingStore {
-    fn cached_encryption_key(&self) -> Option<String> {
-        None
-    }
-}
+impl CatalogStore for CountingStore {}
 
 /// The password hash every test session logs in with. It is made at run
 /// time, so that no literal reaches the session stamp.

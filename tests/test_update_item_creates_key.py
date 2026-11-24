@@ -31,7 +31,7 @@ import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-from conftest import scoped_table
+from conftest import call_with_handshake_retry, scoped_table
 
 WRITERS = 8
 KEYS = 30
@@ -362,9 +362,14 @@ def race(request, dynamodb_client, raw_client) -> RaceResult:
             for key in result.keys:
                 try:
                     if op == "put":
-                        raw_client.put_item(TableName=table, Item={**key, "w": {"S": f"put{i}"}})
+                        call_with_handshake_retry(
+                            raw_client.put_item,
+                            TableName=table,
+                            Item={**key, "w": {"S": f"put{i}"}},
+                        )
                     else:
-                        raw_client.update_item(
+                        call_with_handshake_retry(
+                            raw_client.update_item,
                             TableName=table,
                             Key=key,
                             UpdateExpression="SET w = :w",
