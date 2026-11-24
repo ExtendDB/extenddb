@@ -2260,6 +2260,78 @@
       ]
     },
     {
+      "name": "ListBackups with a malformed body is SerializationException on both targets",
+      "op": "ListBackups",
+      "rawBody": "{ not json",
+      "error": "SerializationException",
+      "checks": [
+        {
+          "path": "/message",
+          "contains": "Start of structure or map found where not expected"
+        }
+      ]
+    },
+    {
+      "name": "DescribeContinuousBackups with a malformed body is SerializationException on both targets",
+      "op": "DescribeContinuousBackups",
+      "rawBody": "{ not json",
+      "error": "SerializationException",
+      "checks": [
+        {
+          "path": "/message",
+          "contains": "Start of structure or map found where not expected"
+        }
+      ]
+    },
+    {
+      "name": "UpdateContinuousBackups with a malformed body is SerializationException on both targets",
+      "op": "UpdateContinuousBackups",
+      "rawBody": "{ not json",
+      "error": "SerializationException",
+      "checks": [
+        {
+          "path": "/message",
+          "contains": "Start of structure or map found where not expected"
+        }
+      ]
+    },
+    {
+      "name": "ImportTable with a malformed body is SerializationException on both targets",
+      "op": "ImportTable",
+      "rawBody": "{ not json",
+      "error": "SerializationException",
+      "checks": [
+        {
+          "path": "/message",
+          "contains": "Start of structure or map found where not expected"
+        }
+      ]
+    },
+    {
+      "name": "ExportTableToPointInTime with a malformed body is SerializationException on both targets",
+      "op": "ExportTableToPointInTime",
+      "rawBody": "{ not json",
+      "error": "SerializationException",
+      "checks": [
+        {
+          "path": "/message",
+          "contains": "Start of structure or map found where not expected"
+        }
+      ]
+    },
+    {
+      "name": "RestoreTableToPointInTime with a malformed body is SerializationException on both targets",
+      "op": "RestoreTableToPointInTime",
+      "rawBody": "{ not json",
+      "error": "SerializationException",
+      "checks": [
+        {
+          "path": "/message",
+          "contains": "Start of structure or map found where not expected"
+        }
+      ]
+    },
+    {
       "name": "RestoreTableToPointInTime is refused before the source table is read",
       "op": "RestoreTableToPointInTime",
       "body": {
