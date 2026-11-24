@@ -197,9 +197,17 @@ def flushed(endpoint_url: str, dynamodb_client, dynamodb_client_no_validation):
     try:
         wait_for_active(dynamodb_client, sentinel)
         arn = dynamodb_client.describe_table(TableName=sentinel)["Table"]["TableArn"]
-        backup_arn = dynamodb_client.create_backup(
-            TableName=arn, BackupName=f"metrics-names-{suffix}"
-        )["BackupDetails"]["BackupArn"]
+        create_backup_supported = True
+        try:
+            backup_arn = dynamodb_client.create_backup(
+                TableName=arn, BackupName=f"metrics-names-{suffix}"
+            )["BackupDetails"]["BackupArn"]
+        except dynamodb_client.exceptions.ClientError as exc:
+            err = exc.response["Error"]
+            if err.get("Code") == "ValidationException" and "CreateBackup is not supported" in err.get("Message", ""):
+                create_backup_supported = False
+            else:
+                raise
         resp = _raw_post(
             endpoint_url,
             "BatchWriteItem",
@@ -220,6 +228,8 @@ def flushed(endpoint_url: str, dynamodb_client, dynamodb_client_no_validation):
                 _dimension(m, "TableName") == sentinel
                 for m in _rows(data, "ConsumedWriteCapacityUnits", "PutItem")
             )
+            if not create_backup_supported:
+                return put_item
             # Under the bare name or, if the ARN were not reduced, the ARN, so
             # that a regression fails the ARN test rather than this wait.
             create_backup = any(
@@ -254,6 +264,7 @@ def flushed(endpoint_url: str, dynamodb_client, dynamodb_client_no_validation):
         data = _settled_metrics(
             endpoint_url, data, time.monotonic() + FLUSH_DEADLINE_SECONDS
         )
+        data["_create_backup_supported"] = create_backup_supported
         yield (*INVALID_NAMES, refused_valid, decoy, missing), sentinel, data
     finally:
         try:
@@ -284,9 +295,11 @@ def test_user_errors_carry_no_table_name(flushed) -> None:
 
 def test_a_table_named_by_its_arn_is_reported_under_its_name(flushed) -> None:
     _, sentinel, data = flushed
+    arns = sorted(n for n in _table_names(data) if n.startswith("arn:"))
+    assert not arns, f"metrics recorded table ARNs as table names: {arns}"
+    if not data.get("_create_backup_supported", True):
+        pytest.skip("CreateBackup is not supported by this storage backend")
     backed_up = _rows(data, "SuccessfulRequestLatency", "CreateBackup")
     assert sentinel in {_dimension(m, "TableName") for m in backed_up}, (
         f"no SuccessfulRequestLatency for CreateBackup under {sentinel}: {backed_up}"
     )
-    arns = sorted(n for n in _table_names(data) if n.startswith("arn:"))
-    assert not arns, f"metrics recorded table ARNs as table names: {arns}"

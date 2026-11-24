@@ -78,10 +78,20 @@ pub async fn run_with_metrics(
     tracing::info!("bigtable TTL worker stopped");
 }
 
+/// Run one TTL sweep pass across all 16 shards without metrics collection.
+///
+/// # Errors
+///
+/// Returns an error description if reading system clock fails.
 pub async fn sweep_once(engine: &BigtableEngine) -> Result<(), String> {
     sweep_once_with_metrics(engine, None).await
 }
 
+/// Run one TTL sweep pass across all 16 shards with optional metrics collection.
+///
+/// # Errors
+///
+/// Returns an error description if reading system clock fails.
 pub async fn sweep_once_with_metrics(
     engine: &BigtableEngine,
     metrics: Option<&MetricsCollector>,
@@ -121,6 +131,8 @@ async fn sweep_once_with_token(
     Ok(())
 }
 
+// Justification: per-shard TTL sweep pages chronological index entries, verifies table_id and live item state, emits service stream records, and retires stale entries.
+#[allow(clippy::too_many_lines)]
 async fn sweep_shard(
     engine: &BigtableEngine,
     shard_id: u8,
@@ -183,15 +195,23 @@ async fn sweep_shard(
         if resp.is_empty() {
             break;
         }
+        let batch_len = resp.len();
 
         let mut last_key = None;
 
         for (raw_key, cells) in resp {
+            if shutdown.is_cancelled() {
+                return Ok(());
+            }
             last_key = Some(raw_key.clone());
             let idx_ts_micros = cells.iter().map(|c| c.timestamp_micros).max().unwrap_or(0);
+            let cell_val = cells
+                .iter()
+                .find(|c| c.family_name == "d" && c.qualifier.is_empty())
+                .map_or(&[][..], |c| c.value.as_slice());
 
-            let (_, expiry, account_id, table_name, base_row_key) =
-                match crate::data::encoding::ttl_key::decode_ttl_key(&raw_key) {
+            let (_, expiry, account_id, table_name, entry_table_id, base_row_key) =
+                match crate::data::encoding::ttl_key::decode_ttl_entry(&raw_key, cell_val) {
                     Ok(decoded) => decoded,
                     Err(e) => {
                         tracing::warn!("failed to decode TTL index key: {e}");
@@ -216,6 +236,11 @@ async fn sweep_shard(
                     continue;
                 }
             };
+
+            if entry_table_id.is_some_and(|tid| tid != key_info.table_id) {
+                let _ = delete_ttl_index_entry_up_to(engine, &raw_key, idx_ts_micros).await;
+                continue;
+            }
 
             let ttl_desc = match MetadataEngine::describe_ttl(engine, account_id, table_name).await
             {
@@ -328,6 +353,7 @@ async fn sweep_shard(
                     if let Some(m) = metrics {
                         m.record_ttl_deletion(account_id, table_name);
                         let staleness = now_epoch_s.saturating_sub(live_secs).max(0);
+                        // Justification: TTL staleness in seconds fits comfortably within f64's 53-bit mantissa for metric histograms.
                         #[allow(clippy::cast_precision_loss)]
                         m.record_ttl_staleness(account_id, table_name, staleness as f64);
                     }
@@ -344,6 +370,9 @@ async fn sweep_shard(
             }
         }
 
+        if i64::try_from(batch_len).unwrap_or(i64::MAX) < limit {
+            break;
+        }
         if let Some(key) = last_key {
             start_key = key;
             exclude_start = true;
@@ -392,7 +421,13 @@ pub(crate) async fn delete_ttl_index_entry_up_to(
 
 /// Ensure the `__extenddb_ttl_index__` system table exists on the Bigtable
 /// data instance (called from Migration 1 `M0001DataBaseline`).
-pub async fn ensure_ttl_index_table(client: &BigtableClient) -> Result<(), String> {
+///
+/// # Errors
+///
+/// Returns [`crate::data::admin::AdminError`] if connecting or creating the table fails.
+pub async fn ensure_ttl_index_table(
+    client: &BigtableClient,
+) -> Result<(), crate::data::admin::AdminError> {
     let mut admin = crate::data::admin::AdminClient::connect(client).await?;
     admin
         .create_table(
@@ -400,6 +435,4 @@ pub async fn ensure_ttl_index_table(client: &BigtableClient) -> Result<(), Strin
             &[("d", Some(crate::data::admin::gc_max_versions(1)))],
         )
         .await
-        .map_err(|e| format!("create TTL index table: {e}"))?;
-    Ok(())
 }

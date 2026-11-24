@@ -9,7 +9,7 @@
 //! table-ID limit).
 //!
 //! Shadow Row Key layout (bounded to <= 3,276 bytes for all single-RANGE
-//! DynamoDB key combinations, well within Bigtable's 4,096-byte row-key limit):
+//! `DynamoDB` key combinations, well within Bigtable's 4,096-byte row-key limit):
 //! - Index partition digest header (`37` bytes):
 //!   `[TAG_PK_DIGEST (0x44):1][32u32.to_be_bytes():4][sha256(index_hash_keys):32]`
 //! - Zero or more index sort-key segments (`0..=4` RANGE keys in schema order):
@@ -42,7 +42,7 @@ pub const TAG_PK_DIGEST: u8 = 0x44;
 pub const PK_DIGEST_LEN: usize = 32;
 
 /// Order-preserving escape encoding for non-terminal byte segments
-/// (FoundationDB tuple encoding pattern). Replaces each `0x00` byte with `0x00 0xFF`.
+/// (`FoundationDB` tuple encoding pattern). Replaces each `0x00` byte with `0x00 0xFF`.
 #[must_use]
 pub fn escape_bytes(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len() + 4);
@@ -68,6 +68,11 @@ pub fn escape_bytes_terminated(bytes: &[u8]) -> Vec<u8> {
 
 /// Decode an escape-encoded segment from a byte slice starting at `idx`.
 /// Returns the unescaped bytes and the new index immediately after `0x00 0x00`.
+///
+/// # Errors
+///
+/// Returns [`StorageError::Internal`] if the escaped segment is truncated,
+/// missing its `0x00 0x00` terminator, or contains an invalid escape byte.
 #[cfg(any(test, feature = "test-hooks"))]
 pub fn unescape_bytes_terminated(
     bytes: &[u8],
@@ -137,6 +142,10 @@ fn tag_bytes_for(av: &AttributeValue) -> Result<(u8, Vec<u8>), StorageError> {
 
 /// Compute a canonical, domain-separated 32-byte SHA-256 digest over `1..=4`
 /// partition-key scalar attribute values in key-schema order.
+///
+/// # Errors
+///
+/// Returns [`StorageError::Validation`] if `hash_vals` is empty or contains a non-scalar attribute.
 pub fn hash_partition_values(
     hash_vals: &[&AttributeValue],
 ) -> Result<[u8; PK_DIGEST_LEN], StorageError> {
@@ -162,12 +171,15 @@ pub fn hash_partition_values(
 /// Because bytes `1..5` carry the exact payload length (`32`), `pk_prefix_slice`
 /// and parallel-scan segment hashing treat base-table and shadow-table row keys
 /// uniformly.
+///
+/// # Errors
+///
+/// Returns [`StorageError::Validation`] if `hash_vals` is empty or contains a non-scalar attribute.
 pub fn encode_gsi_pk_prefix(hash_vals: &[&AttributeValue]) -> Result<Vec<u8>, StorageError> {
     let digest = hash_partition_values(hash_vals)?;
     let mut out = Vec::with_capacity(5 + PK_DIGEST_LEN);
     out.push(TAG_PK_DIGEST);
-    #[allow(clippy::cast_possible_truncation)]
-    out.extend_from_slice(&(PK_DIGEST_LEN as u32).to_be_bytes());
+    out.extend_from_slice(&u32::try_from(PK_DIGEST_LEN).unwrap_or(32).to_be_bytes());
     out.extend_from_slice(&digest);
     Ok(out)
 }
@@ -178,11 +190,18 @@ pub fn encode_gsi_pk_prefix(hash_vals: &[&AttributeValue]) -> Result<Vec<u8>, St
 /// (sparse-index semantics). Validates that the encoded shadow row key never
 /// exceeds Bigtable's 4,096-byte row-key limit so callers can validate all
 /// shadow keys before committing the base row.
+///
+/// # Errors
+///
+/// Returns [`StorageError::Validation`] if index or base key schemas are invalid,
+/// key attributes have non-scalar types, or the encoded shadow row key exceeds 4 KiB.
 pub fn shadow_row_key_for_item(
     item: &Item,
     index_key_schema: &[KeySchemaElement],
     base_key_schema: &[KeySchemaElement],
 ) -> Result<Option<Vec<u8>>, StorageError> {
+    const BASE_PK_SORT_PREFIX_CAP: usize = 64;
+
     let mut hash_vals: Vec<&AttributeValue> = Vec::with_capacity(4);
     for ks in index_key_schema
         .iter()
@@ -221,7 +240,6 @@ pub fn shadow_row_key_for_item(
     // Base partition key (HASH) tie-breaker: leading 64 escaped bytes (preserving
     // exact DynamoDB lexicographic base-PK order for keys <= 64 bytes) followed by
     // `[0x00, 0x00|0x01]` and the 32-byte SHA-256 digest (`<= 163` bytes total).
-    const BASE_PK_SORT_PREFIX_CAP: usize = 64;
     let base_pk = base_key_schema
         .iter()
         .find(|k| k.key_type == KeyType::Hash)

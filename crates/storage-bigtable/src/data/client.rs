@@ -6,7 +6,6 @@
 //! helpers, RE2 byte escaping, and gRPC error classification.
 
 use std::error::Error as StdError;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -43,8 +42,6 @@ const BIGTABLE_FEATURES_REVERSE_SCANS: &str = "CAE=";
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RPC_ATTEMPTS: usize = 6;
 
-static LAST_MONOTONIC_MILLIS: AtomicI64 = AtomicI64::new(0);
-
 /// Decoded Bigtable cell returned by [`DataHandle::read_rows`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowCell {
@@ -75,44 +72,32 @@ pub enum BigtableError {
     AuthError(String),
 }
 
-/// Strictly monotonically increasing, millisecond-aligned timestamp in
-/// microseconds guaranteed to be strictly greater than `exclusive_floor_micros`.
+/// Millisecond-aligned wall-clock timestamp in microseconds (`>= 1_000`)
+/// guaranteed to be strictly greater than `exclusive_floor_micros`.
+///
+/// Per-row state transitions pass the cell timestamp observed on that row so
+/// updates strictly advance the row's cell version without a process-wide
+/// counter that could push timestamps ahead of wall-clock time under sustained
+/// multi-row throughput.
 #[must_use]
 pub fn monotonic_timestamp_after_micros(exclusive_floor_micros: i64) -> i64 {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX / MICROS_PER_MILLI))
-        .unwrap_or(1)
+        .map_or(1, |d| {
+            i64::try_from(d.as_millis()).unwrap_or(i64::MAX / MICROS_PER_MILLI)
+        })
         .max(1);
     let min_ms = if exclusive_floor_micros <= 0 {
         1
     } else {
         (exclusive_floor_micros / MICROS_PER_MILLI).saturating_add(1)
     };
-    let floor_ms = now_ms.max(min_ms);
-
-    let mut prev = LAST_MONOTONIC_MILLIS.load(Ordering::Relaxed);
-    loop {
-        let next = if floor_ms > prev {
-            floor_ms
-        } else {
-            prev.saturating_add(1)
-        };
-        match LAST_MONOTONIC_MILLIS.compare_exchange_weak(
-            prev,
-            next,
-            Ordering::SeqCst,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => return next.saturating_mul(MICROS_PER_MILLI),
-            Err(actual) => prev = actual,
-        }
-    }
+    now_ms.max(min_ms).saturating_mul(MICROS_PER_MILLI)
 }
 
-/// Strictly monotonically increasing, millisecond-aligned timestamp in
-/// microseconds for non-OCC rows (`__extenddb_catalog__`, `__extenddb_txn_log__`
-/// coordinator state transitions, and `__extenddb_ttl_index__`).
+/// Millisecond-aligned wall-clock timestamp in microseconds (`>= 1_000`) for
+/// newly inserted cells (`__extenddb_catalog__` `put_if_absent`,
+/// `__extenddb_txn_log__` open, and `__extenddb_ttl_index__`).
 #[must_use]
 pub fn monotonic_timestamp_micros() -> i64 {
     monotonic_timestamp_after_micros(0)
@@ -197,8 +182,9 @@ pub fn map_bigtable_err(context: &str, err: BigtableError) -> StorageError {
             StorageError::Transient(format!("{context}: request timed out after {secs}s"))
         }
         BigtableError::TransportError(e) => StorageError::Connection(format!("{context}: {e}")),
-        BigtableError::ChunkError(e) => StorageError::Internal(format!("{context}: {e}")),
-        BigtableError::AuthError(e) => StorageError::Internal(format!("{context}: {e}")),
+        BigtableError::ChunkError(e) | BigtableError::AuthError(e) => {
+            StorageError::Internal(format!("{context}: {e}"))
+        }
     }
 }
 
@@ -296,6 +282,17 @@ struct ReadRowsAssembler {
 }
 
 impl ReadRowsAssembler {
+    fn reset_current_row(&mut self) {
+        self.cur_row_key = None;
+        self.cur_row_cells.clear();
+        self.cur_family = None;
+        self.cur_qualifier = None;
+        self.cur_timestamp = 0;
+        self.cur_labels.clear();
+        self.cur_value.clear();
+        self.in_split_cell = false;
+    }
+
     fn feed_chunks(&mut self, chunks: Vec<CellChunk>) -> Result<(), BigtableError> {
         for mut chunk in chunks {
             if let Some(RowStatus::ResetRow(_)) = chunk.row_status {
@@ -304,20 +301,13 @@ impl ReadRowsAssembler {
                         "ResetRow chunk carried unexpected cell value bytes".to_owned(),
                     ));
                 }
-                self.cur_row_key = None;
-                self.cur_row_cells.clear();
-                self.cur_family = None;
-                self.cur_qualifier = None;
-                self.cur_timestamp = 0;
-                self.cur_labels.clear();
-                self.cur_value.clear();
-                self.in_split_cell = false;
+                self.reset_current_row();
                 continue;
             }
 
             if !chunk.row_key.is_empty() {
                 match &self.cur_row_key {
-                    None => self.cur_row_key = Some(chunk.row_key),
+                    None => self.cur_row_key = Some(std::mem::take(&mut chunk.row_key)),
                     Some(existing) if existing == &chunk.row_key => {}
                     Some(_) => {
                         return Err(BigtableError::ChunkError(
@@ -331,6 +321,12 @@ impl ReadRowsAssembler {
                 ));
             }
 
+            // Invariant: all Bigtable writes in `extenddb-storage-bigtable` stamp
+            // explicit millisecond-aligned timestamps `>= 1_000` (`MICROS_PER_MILLI`;
+            // server-assigned `-1` and epoch `0` are never written), so a trailing
+            // `CommitRow(true)` frame with `timestamp_micros == 0` and omitted
+            // family/qualifier/labels/value after `>= 1` decoded cell is unambiguously
+            // a standalone commit marker rather than a second empty cell.
             let is_pure_commit_marker = !self.in_split_cell
                 && !self.cur_row_cells.is_empty()
                 && chunk.family_name.is_none()
@@ -342,55 +338,7 @@ impl ReadRowsAssembler {
                 && matches!(chunk.row_status, Some(RowStatus::CommitRow(true)));
 
             if !is_pure_commit_marker {
-                if !self.in_split_cell {
-                    if chunk.family_name.is_some()
-                        && chunk.family_name != self.cur_family
-                        && chunk.qualifier.is_none()
-                    {
-                        return Err(BigtableError::ChunkError(
-                            "new column family missing qualifier".to_owned(),
-                        ));
-                    }
-                    if let Some(fam) = chunk.family_name {
-                        self.cur_family = Some(fam);
-                    }
-                    if let Some(qual) = chunk.qualifier {
-                        self.cur_qualifier = Some(qual);
-                    }
-                    if self.cur_qualifier.is_none() {
-                        return Err(BigtableError::ChunkError(
-                            "cell chunk missing column qualifier".to_owned(),
-                        ));
-                    }
-                    self.cur_timestamp = chunk.timestamp_micros;
-                    self.cur_labels = chunk.labels;
-                    let cap = if chunk.value_size > 0 {
-                        usize::try_from(chunk.value_size)
-                            .unwrap_or(MAX_GRPC_MESSAGE_BYTES)
-                            .min(MAX_GRPC_MESSAGE_BYTES)
-                    } else {
-                        chunk.value.len()
-                    };
-                    self.cur_value = Vec::with_capacity(cap);
-                }
-
-                self.cur_value.append(&mut chunk.value);
-                if chunk.value_size > 0 {
-                    self.in_split_cell = true;
-                } else {
-                    self.in_split_cell = false;
-                    let qual = self.cur_qualifier.clone().ok_or_else(|| {
-                        BigtableError::ChunkError("cell missing qualifier".to_owned())
-                    })?;
-                    let fam = self.cur_family.clone().unwrap_or_default();
-                    self.cur_row_cells.push(RowCell {
-                        family_name: fam,
-                        qualifier: qual,
-                        value: std::mem::take(&mut self.cur_value),
-                        timestamp_micros: self.cur_timestamp,
-                        labels: std::mem::take(&mut self.cur_labels),
-                    });
-                }
+                self.append_cell_chunk(&mut chunk)?;
             }
 
             if let Some(RowStatus::CommitRow(true)) = chunk.row_status {
@@ -411,6 +359,60 @@ impl ReadRowsAssembler {
         Ok(())
     }
 
+    fn append_cell_chunk(&mut self, chunk: &mut CellChunk) -> Result<(), BigtableError> {
+        if !self.in_split_cell {
+            if chunk.family_name.is_some()
+                && chunk.family_name != self.cur_family
+                && chunk.qualifier.is_none()
+            {
+                return Err(BigtableError::ChunkError(
+                    "new column family missing qualifier".to_owned(),
+                ));
+            }
+            if let Some(fam) = chunk.family_name.take() {
+                self.cur_family = Some(fam);
+            }
+            if let Some(qual) = chunk.qualifier.take() {
+                self.cur_qualifier = Some(qual);
+            }
+            if self.cur_qualifier.is_none() {
+                return Err(BigtableError::ChunkError(
+                    "cell chunk missing column qualifier".to_owned(),
+                ));
+            }
+            self.cur_timestamp = chunk.timestamp_micros;
+            self.cur_labels = std::mem::take(&mut chunk.labels);
+            let cap = if chunk.value_size > 0 {
+                usize::try_from(chunk.value_size)
+                    .unwrap_or(MAX_GRPC_MESSAGE_BYTES)
+                    .min(MAX_GRPC_MESSAGE_BYTES)
+            } else {
+                chunk.value.len()
+            };
+            self.cur_value = Vec::with_capacity(cap);
+        }
+
+        self.cur_value.append(&mut chunk.value);
+        if chunk.value_size > 0 {
+            self.in_split_cell = true;
+        } else {
+            self.in_split_cell = false;
+            let qual = self
+                .cur_qualifier
+                .clone()
+                .ok_or_else(|| BigtableError::ChunkError("cell missing qualifier".to_owned()))?;
+            let fam = self.cur_family.clone().unwrap_or_default();
+            self.cur_row_cells.push(RowCell {
+                family_name: fam,
+                qualifier: qual,
+                value: std::mem::take(&mut self.cur_value),
+                timestamp_micros: self.cur_timestamp,
+                labels: std::mem::take(&mut self.cur_labels),
+            });
+        }
+        Ok(())
+    }
+
     fn finish(self) -> Result<Vec<AssembledRow>, BigtableError> {
         if self.cur_row_key.is_some() || self.in_split_cell {
             return Err(BigtableError::ChunkError(
@@ -422,15 +424,22 @@ impl ReadRowsAssembler {
 }
 
 async fn decode_read_rows_stream(
-    timeout: Duration,
+    deadline: Instant,
+    timeout_secs: u64,
     mut stream: Streaming<ReadRowsResponse>,
 ) -> Result<Vec<AssembledRow>, BigtableError> {
-    let started = Instant::now();
     let mut assembler = ReadRowsAssembler::default();
-    while let Some(resp) = stream.message().await? {
-        if started.elapsed() > timeout {
-            return Err(BigtableError::TimeoutError(timeout.as_secs()));
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(BigtableError::TimeoutError(timeout_secs));
         }
+        let next = tokio::time::timeout(remaining, stream.message())
+            .await
+            .map_err(|_| BigtableError::TimeoutError(timeout_secs))?;
+        let Some(resp) = next? else {
+            break;
+        };
         assembler.feed_chunks(resp.chunks)?;
     }
     assembler.finish()
@@ -479,7 +488,7 @@ fn build_pooled_grpc(
             let endpoint = Endpoint::from_static(BIGTABLE_DATA_ENDPOINT)
                 .tls_config(tls.clone())
                 .map_err(|e| format!("configure Bigtable TLS endpoint: {e}"))?
-                .http2_keep_alive_interval(Duration::from_secs(300))
+                .http2_keep_alive_interval(Duration::from_mins(5))
                 .keep_alive_timeout(Duration::from_secs(20))
                 .http2_adaptive_window(true)
                 .timeout(RPC_TIMEOUT)
@@ -502,7 +511,7 @@ fn build_pooled_grpc(
 
 /// Bundles a resilient data-plane connection pool to Cloud Bigtable (or
 /// `cbtemulator`). Automatically replaces broken HTTP/2 channels on `GoAway`
-/// or transport errors and injects fresh OAuth2 bearer tokens plus
+/// or transport errors and injects fresh `OAuth2` bearer tokens plus
 /// `x-goog-request-params` routing headers on GCP requests.
 pub struct BigtableClient {
     config: BigtableStorageConfig,
@@ -522,6 +531,18 @@ impl BigtableClient {
         &self.config
     }
 
+    /// Shared `OAuth2` token provider (absent when connected to `cbtemulator`).
+    #[must_use]
+    pub fn token_provider(&self) -> Option<&Arc<dyn TokenProvider>> {
+        self.token_provider.as_ref()
+    }
+
+    /// Connect a resilient Bigtable data-plane pool using `config`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error description if TLS endpoint setup or GCP credential
+    /// initialization fails.
     pub async fn connect(config: &BigtableStorageConfig) -> Result<Self, String> {
         let channel_size = config.pool_size.max(1) as usize;
         let effective_emulator = config.resolve_emulator_host();
@@ -674,11 +695,17 @@ async fn sleep_retry_backoff(attempt: usize) {
 impl DataHandle<'_> {
     /// Execute `ReadRows`, automatically reconnecting and retrying on `GoAway`,
     /// transport drops, or transient gRPC errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BigtableError`] if all retry attempts fail, stream frames are
+    /// malformed, or reading exceeds `RPC_TIMEOUT`.
     pub async fn read_rows(
         &mut self,
         request: ReadRowsRequest,
     ) -> Result<Vec<(Vec<u8>, Vec<RowCell>)>, BigtableError> {
         for attempt in 0..MAX_RPC_ATTEMPTS {
+            let deadline = Instant::now() + RPC_TIMEOUT;
             let pool = self.parent.current_pool();
             let mut client = pool.client.clone();
             let tonic_req = self
@@ -690,7 +717,10 @@ impl DataHandle<'_> {
                 )
                 .await?;
             let outcome = match client.read_rows(tonic_req).await {
-                Ok(resp) => decode_read_rows_stream(RPC_TIMEOUT, resp.into_inner()).await,
+                Ok(resp) => {
+                    decode_read_rows_stream(deadline, RPC_TIMEOUT.as_secs(), resp.into_inner())
+                        .await
+                }
                 Err(status) => Err(BigtableError::RpcError(status)),
             };
             match outcome {
@@ -712,6 +742,10 @@ impl DataHandle<'_> {
 
     /// Execute `MutateRow` (all callers use explicit timestamps or row deletes,
     /// making retries idempotent across channel reconnects).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BigtableError`] if the RPC fails after bounded retries.
     pub async fn mutate_row(
         &mut self,
         request: MutateRowRequest,
@@ -745,10 +779,16 @@ impl DataHandle<'_> {
         unreachable!("MAX_RPC_ATTEMPTS is non-zero")
     }
 
-    /// Execute `MutateRows`, draining the streaming response and verifying
-    /// every per-entry status code before returning.
+    /// Execute `MutateRows`, draining the streaming response within `RPC_TIMEOUT`
+    /// and verifying every per-entry status code before returning.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BigtableError`] if any batch entry fails, the stream stalls
+    /// past `RPC_TIMEOUT`, or retries are exhausted.
     pub async fn mutate_rows(&mut self, request: MutateRowsRequest) -> Result<(), BigtableError> {
         for attempt in 0..MAX_RPC_ATTEMPTS {
+            let deadline = Instant::now() + RPC_TIMEOUT;
             let pool = self.parent.current_pool();
             let mut client = pool.client.clone();
             let tonic_req = self
@@ -766,7 +806,17 @@ impl DataHandle<'_> {
                     let mut stream = resp.into_inner();
                     let mut entry_err: Option<BigtableError> = None;
                     loop {
-                        match stream.message().await {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            entry_err = Some(BigtableError::TimeoutError(RPC_TIMEOUT.as_secs()));
+                            break;
+                        }
+                        let Ok(next_msg) = tokio::time::timeout(remaining, stream.message()).await
+                        else {
+                            entry_err = Some(BigtableError::TimeoutError(RPC_TIMEOUT.as_secs()));
+                            break;
+                        };
+                        match next_msg {
                             Ok(Some(batch)) => {
                                 for entry in batch.entries {
                                     if let Some(st) = entry.status
@@ -817,20 +867,50 @@ impl DataHandle<'_> {
     /// Execute `CheckAndMutateRow`. Reconnects on `GoAway` / transport drops
     /// and retries pre-execution rejections (`ResourceExhausted`, `Aborted`)
     /// where Bigtable has not applied any mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BigtableError`] if the RPC fails after pre-execution retries.
     pub async fn check_and_mutate_row(
         &mut self,
         request: CheckAndMutateRowRequest,
     ) -> Result<CheckAndMutateRowResponse, BigtableError> {
-        self.check_and_mutate_row_inner(request, false).await
+        self.check_and_mutate_row_inner(request, false)
+            .await
+            .map(|(resp, _)| resp)
     }
 
-    /// Execute an idempotent `CheckAndMutateRow` (such as `m:v == expected_version`
-    /// base/shadow CAS or version-only tombstone reclamation), retrying
-    /// `Unavailable` and `GoAway` transport errors as well.
+    /// Execute a `CheckAndMutateRow` whose caller either uses an idempotent
+    /// mutation (such as lease renewal or version-only tombstone reclamation) or
+    /// explicitly disambiguates an applied first attempt on retry (such as
+    /// coordinator `PENDING -> COMMITTED`/`ABORTED` state transitions and
+    /// `place_intent_once`), retrying `Unavailable` and `GoAway` transport
+    /// errors as well.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BigtableError`] if the RPC fails after bounded retries.
     pub async fn check_and_mutate_row_idempotent(
         &mut self,
         request: CheckAndMutateRowRequest,
     ) -> Result<CheckAndMutateRowResponse, BigtableError> {
+        self.check_and_mutate_row_inner(request, true)
+            .await
+            .map(|(resp, _)| resp)
+    }
+
+    /// Same as [`Self::check_and_mutate_row_idempotent`], also returning the
+    /// 0-based retry `attempt` index that succeeded so callers such as
+    /// `TxnCoordinator::open_with_token` can disambiguate a retried response
+    /// after Attempt 0 already applied on Bigtable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BigtableError`] if the RPC fails after bounded retries.
+    pub async fn check_and_mutate_row_idempotent_with_attempt(
+        &mut self,
+        request: CheckAndMutateRowRequest,
+    ) -> Result<(CheckAndMutateRowResponse, usize), BigtableError> {
         self.check_and_mutate_row_inner(request, true).await
     }
 
@@ -838,7 +918,7 @@ impl DataHandle<'_> {
         &mut self,
         request: CheckAndMutateRowRequest,
         idempotent: bool,
-    ) -> Result<CheckAndMutateRowResponse, BigtableError> {
+    ) -> Result<(CheckAndMutateRowResponse, usize), BigtableError> {
         for attempt in 0..MAX_RPC_ATTEMPTS {
             let pool = self.parent.current_pool();
             let mut client = pool.client.clone();
@@ -851,7 +931,7 @@ impl DataHandle<'_> {
                 )
                 .await?;
             match client.check_and_mutate_row(tonic_req).await {
-                Ok(resp) => return Ok(resp.into_inner()),
+                Ok(resp) => return Ok((resp.into_inner(), attempt)),
                 Err(status) => {
                     let err = BigtableError::RpcError(status);
                     if is_goaway_or_transport_err(&err) {
@@ -879,17 +959,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn monotonic_timestamps_strictly_increase_within_same_millisecond() {
-        let mut prev = monotonic_timestamp_micros();
-        assert_eq!(prev % MICROS_PER_MILLI, 0);
-        for _ in 0..256 {
-            let next = monotonic_timestamp_micros();
-            assert!(next > prev, "expected {next} > {prev}");
-            assert_eq!(next % MICROS_PER_MILLI, 0);
-            prev = next;
+    fn timestamps_stay_on_wall_clock_without_global_drift_and_advance_past_floor() {
+        let before_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| i64::try_from(d.as_millis()).unwrap_or(1))
+            .unwrap_or(1);
+        let mut last = 0i64;
+        for _ in 0..5_000 {
+            let ts = monotonic_timestamp_micros();
+            assert!(ts >= MICROS_PER_MILLI, "expected {ts} >= 1_000");
+            assert_eq!(ts % MICROS_PER_MILLI, 0);
+            assert!(ts >= last, "wall-clock timestamp regressed: {ts} < {last}");
+            last = ts;
         }
+        let after_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| i64::try_from(d.as_millis()).unwrap_or(1))
+            .unwrap_or(1);
+        assert!(
+            last >= before_ms * MICROS_PER_MILLI,
+            "expected {last} >= {}",
+            before_ms * MICROS_PER_MILLI
+        );
+        assert!(
+            last <= (after_ms + 1_000) * MICROS_PER_MILLI,
+            "5,000 calls drifted ahead of wall-clock time: {last} vs {} ms",
+            after_ms
+        );
 
-        let future_floor = prev + 5_000;
+        let same_ms_step = monotonic_timestamp_after_micros(last);
+        assert!(same_ms_step > last, "expected {same_ms_step} > {last}");
+        assert_eq!(same_ms_step % MICROS_PER_MILLI, 0);
+
+        let future_floor = same_ms_step + 5_000;
         let after_floor = monotonic_timestamp_after_micros(future_floor);
         assert!(
             after_floor > future_floor,

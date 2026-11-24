@@ -102,6 +102,8 @@ pub struct TxnTtlMutation {
     pub account_id: String,
     pub table_name: String,
     #[serde(default)]
+    pub table_id: Option<String>,
+    #[serde(default)]
     pub old_expiry: Option<i64>,
     #[serde(default)]
     pub new_expiry: Option<i64>,
@@ -133,12 +135,95 @@ pub struct TxnState {
     pub state: String,
     pub state_ts_micros: i64,
     pub started_at: Option<i64>,
+    pub open_nonce: Option<String>,
     pub participants: Option<Vec<ParticipantRow>>,
     pub mutations: Option<Vec<ParticipantMutation>>,
     pub stream_records: Option<Vec<TxnStreamRecord>>,
     pub ttl_mutations: Option<Vec<TxnTtlMutation>>,
     pub token_meta: Option<TxnTokenMeta>,
     pub base_guard: Option<SideEffectBaseGuard>,
+}
+
+/// Decode a coordinator row's `t:*` cells into [`TxnState`], returning `None`
+/// if `t:state` is absent (for example during concurrent row deletion).
+#[must_use]
+pub(crate) fn decode_txn_state_cells(cells: Vec<crate::data::client::RowCell>) -> Option<TxnState> {
+    let mut state: Option<String> = None;
+    let mut state_ts_micros: i64 = 0;
+    let mut started_at: Option<i64> = None;
+    let mut open_nonce: Option<String> = None;
+    let mut participants: Option<Vec<ParticipantRow>> = None;
+    let mut mutations: Option<Vec<ParticipantMutation>> = None;
+    let mut stream_records: Option<Vec<TxnStreamRecord>> = None;
+    let mut ttl_mutations: Option<Vec<TxnTtlMutation>> = None;
+    let mut token_meta: Option<TxnTokenMeta> = None;
+    let mut base_guard: Option<SideEffectBaseGuard> = None;
+
+    for cell in cells {
+        if cell.family_name == TXN_FAMILY {
+            match cell.qualifier.as_slice() {
+                b"state" if state.is_none() => {
+                    state_ts_micros = cell.timestamp_micros;
+                    state = String::from_utf8(cell.value).ok();
+                }
+                b"started_at" if started_at.is_none() => {
+                    started_at = String::from_utf8(cell.value)
+                        .ok()
+                        .and_then(|s| s.parse::<i64>().ok());
+                }
+                b"open_nonce" if open_nonce.is_none() => {
+                    open_nonce = String::from_utf8(cell.value).ok();
+                }
+                b"participants" if participants.is_none() => {
+                    participants = serde_json::from_slice(&cell.value).ok();
+                }
+                b"mutations" if mutations.is_none() => {
+                    mutations = serde_json::from_slice(&cell.value).ok();
+                }
+                b"stream_records" if stream_records.is_none() => {
+                    stream_records = serde_json::from_slice(&cell.value).ok();
+                }
+                b"ttl_mutations" if ttl_mutations.is_none() => {
+                    ttl_mutations = serde_json::from_slice(&cell.value).ok();
+                }
+                b"token_meta" if token_meta.is_none() => {
+                    token_meta = serde_json::from_slice(&cell.value).ok();
+                }
+                b"base_guard" if base_guard.is_none() => {
+                    base_guard = serde_json::from_slice(&cell.value).ok();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let st = state?;
+    Some(TxnState {
+        state: st,
+        state_ts_micros,
+        started_at,
+        open_nonce,
+        participants,
+        mutations,
+        stream_records,
+        ttl_mutations,
+        token_meta,
+        base_guard,
+    })
+}
+
+/// Returns `true` when a retried `open_with_token` call observes the exact
+/// `PENDING` incarnation written by its own earlier attempt (`started_at` and
+/// per-call `open_nonce` both match).
+#[must_use]
+pub(crate) fn is_own_retried_open(
+    st: &TxnState,
+    expected_started_at: i64,
+    expected_nonce: &str,
+) -> bool {
+    st.state == "PENDING"
+        && st.started_at == Some(expected_started_at)
+        && st.open_nonce.as_deref() == Some(expected_nonce)
 }
 
 #[derive(Clone, Copy)]
@@ -148,6 +233,7 @@ pub struct TxnCoordinator<'a> {
 }
 
 impl<'a> TxnCoordinator<'a> {
+    #[must_use]
     pub fn new(client: &'a BigtableClient, intent_max_age: Duration) -> Self {
         Self {
             client,
@@ -190,6 +276,10 @@ impl<'a> TxnCoordinator<'a> {
 
     /// Write the coordinator row in `PENDING` state if it doesn't exist.
     /// Returns `Ok((created, started_at_micros))`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if serialization or the `CheckAndMutateRow` RPC fails.
     pub async fn open(
         &self,
         txn_id: &str,
@@ -199,6 +289,15 @@ impl<'a> TxnCoordinator<'a> {
     }
 
     /// Atomically open a `PENDING` coordinator row with optional `TxnTokenMeta`.
+    ///
+    /// Stamps a per-call `t:open_nonce` cell alongside `t:started_at` so if a
+    /// transport retry (`attempt > 0`) runs after Bigtable already applied
+    /// Attempt 0's `false_mutations`, the caller recognizes its own `PENDING`
+    /// incarnation instead of colliding with itself for `intent_timeout_secs`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if serialization or the `CheckAndMutateRow` RPC fails.
     pub async fn open_with_token(
         &self,
         txn_id: &str,
@@ -207,6 +306,7 @@ impl<'a> TxnCoordinator<'a> {
     ) -> Result<(bool, i64), StorageError> {
         let mut data = self.client.data();
         let now_micros = monotonic_timestamp_micros();
+        let open_nonce = Uuid::new_v4().simple().to_string();
         let serialized = serde_json::to_vec(participants)
             .map_err(|e| StorageError::Internal(format!("serialize participants: {e}")))?;
 
@@ -229,6 +329,12 @@ impl<'a> TxnCoordinator<'a> {
                 TXN_FAMILY,
                 b"started_at",
                 now_micros.to_string().into_bytes(),
+                now_micros,
+            ),
+            Self::set_cell_at(
+                TXN_FAMILY,
+                b"open_nonce",
+                open_nonce.as_bytes().to_vec(),
                 now_micros,
             ),
             Self::set_cell_at(TXN_FAMILY, b"participants", serialized, now_micros),
@@ -254,12 +360,29 @@ impl<'a> TxnCoordinator<'a> {
             ..CheckAndMutateRowRequest::default()
         };
 
-        let resp = data
-            .check_and_mutate_row_idempotent(req)
-            .await
-            .map_err(|e| map_bigtable_err("txn open", e))?;
-
-        Ok((!resp.predicate_matched, now_micros))
+        match data.check_and_mutate_row_idempotent_with_attempt(req).await {
+            Ok((resp, attempt)) => {
+                if !resp.predicate_matched {
+                    return Ok((true, now_micros));
+                }
+                if attempt > 0
+                    && let Some(st) = self.get_state(txn_id).await?
+                    && is_own_retried_open(&st, now_micros, &open_nonce)
+                {
+                    return Ok((true, now_micros));
+                }
+                Ok((false, now_micros))
+            }
+            Err(e) => {
+                let mapped = map_bigtable_err("txn open", e);
+                if let Ok(Some(st)) = self.get_state(txn_id).await
+                    && is_own_retried_open(&st, now_micros, &open_nonce)
+                {
+                    let _ = self.drop_matching_start(txn_id, now_micros).await;
+                }
+                Err(mapped)
+            }
+        }
     }
 
     /// Read the latest coordinator state from `__extenddb_txn_log__`.
@@ -267,6 +390,10 @@ impl<'a> TxnCoordinator<'a> {
     /// Never emits `DeleteFromColumn` on `t:state` during transitions,
     /// retries transient gRPC glitches, and treats a row lacking `t:state` as
     /// `Ok(None)` so concurrent cleanup never triggers `StorageError::Internal` HTTP 500s.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if reading `__extenddb_txn_log__` fails after retries.
     pub async fn get_state(&self, txn_id: &str) -> Result<Option<TxnState>, StorageError> {
         let mut last_err: Option<StorageError> = None;
         let mut resp_opt = None;
@@ -309,71 +436,15 @@ impl<'a> TxnCoordinator<'a> {
         let Some((_, cells)) = resp.into_iter().next() else {
             return Ok(None);
         };
-
-        let mut state: Option<String> = None;
-        let mut state_ts_micros: i64 = 0;
-        let mut started_at: Option<i64> = None;
-        let mut participants: Option<Vec<ParticipantRow>> = None;
-        let mut mutations: Option<Vec<ParticipantMutation>> = None;
-        let mut stream_records: Option<Vec<TxnStreamRecord>> = None;
-        let mut ttl_mutations: Option<Vec<TxnTtlMutation>> = None;
-        let mut token_meta: Option<TxnTokenMeta> = None;
-        let mut base_guard: Option<SideEffectBaseGuard> = None;
-
-        for cell in cells {
-            if cell.family_name == TXN_FAMILY {
-                match cell.qualifier.as_slice() {
-                    b"state" if state.is_none() => {
-                        state_ts_micros = cell.timestamp_micros;
-                        state = String::from_utf8(cell.value).ok();
-                    }
-                    b"started_at" if started_at.is_none() => {
-                        started_at = String::from_utf8(cell.value)
-                            .ok()
-                            .and_then(|s| s.parse::<i64>().ok());
-                    }
-                    b"participants" if participants.is_none() => {
-                        participants = serde_json::from_slice(&cell.value).ok();
-                    }
-                    b"mutations" if mutations.is_none() => {
-                        mutations = serde_json::from_slice(&cell.value).ok();
-                    }
-                    b"stream_records" if stream_records.is_none() => {
-                        stream_records = serde_json::from_slice(&cell.value).ok();
-                    }
-                    b"ttl_mutations" if ttl_mutations.is_none() => {
-                        ttl_mutations = serde_json::from_slice(&cell.value).ok();
-                    }
-                    b"token_meta" if token_meta.is_none() => {
-                        token_meta = serde_json::from_slice(&cell.value).ok();
-                    }
-                    b"base_guard" if base_guard.is_none() => {
-                        base_guard = serde_json::from_slice(&cell.value).ok();
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        let Some(st) = state else {
-            return Ok(None);
-        };
-
-        Ok(Some(TxnState {
-            state: st,
-            state_ts_micros,
-            started_at,
-            participants,
-            mutations,
-            stream_records,
-            ttl_mutations,
-            token_meta,
-            base_guard,
-        }))
+        Ok(decode_txn_state_cells(cells))
     }
 
     /// Single-RPC attempt to place `m:intent:<txn_id>` if and only if NO
     /// physical `m:intent:*` cell currently exists on `participant`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the `CheckAndMutateRow` or verification RPC fails.
     pub async fn place_intent_once(
         &self,
         txn_id: &str,
@@ -474,7 +545,8 @@ impl<'a> TxnCoordinator<'a> {
             if attempts >= max_attempts {
                 return Ok(false);
             }
-            let jitter = rand::random_range(0..delay.as_millis() as u64);
+            let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+            let jitter = rand::random_range(0..delay_ms);
             tokio::time::sleep(delay + Duration::from_millis(jitter)).await;
             delay *= 2;
         }
@@ -485,6 +557,10 @@ impl<'a> TxnCoordinator<'a> {
     ///
     /// Returns `Ok(Some(commit_ts_micros))` if committed, or `Ok(None)` if the
     /// coordinator incarnation was already aborted or swept.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if serialization or the `CheckAndMutateRow` RPC fails.
     pub async fn try_commit_full(
         &self,
         txn_id: &str,
@@ -558,6 +634,10 @@ impl<'a> TxnCoordinator<'a> {
     /// `delete_cas` shadow-index or TTL side effects that encountered a
     /// transient failure after base commit, so `sweeper` finishes them cleanly
     /// without returning a misleading error on an already-durable write.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if serialization or the `MutateRow` RPC fails.
     pub async fn write_committed_side_effects(
         &self,
         txn_id: &str,
@@ -572,6 +652,10 @@ impl<'a> TxnCoordinator<'a> {
     /// optional base-row `(participant, base_version)` guard so `roll_forward`
     /// skips stale shadow puts and TTL additions if the base row has moved past
     /// `base_version`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if serialization or the `MutateRow` RPC fails.
     pub async fn write_committed_side_effects_guarded(
         &self,
         txn_id: &str,
@@ -656,6 +740,10 @@ impl<'a> TxnCoordinator<'a> {
 
     /// Atomically CAS `(t:state == "PENDING" && t:started_at == started_at_micros)`
     /// to `"ABORTED"` BEFORE clearing any participant intent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the `CheckAndMutateRow` or state-verification RPC fails.
     pub async fn try_abort_pending(
         &self,
         txn_id: &str,
@@ -682,11 +770,24 @@ impl<'a> TxnCoordinator<'a> {
             .check_and_mutate_row_idempotent(req)
             .await
             .map_err(|e| map_bigtable_err("txn try_abort_pending", e))?;
-        Ok(resp.predicate_matched)
+        if resp.predicate_matched {
+            Ok(true)
+        } else if let Some(st) = self.get_state(txn_id).await?
+            && st.state == "ABORTED"
+            && st.started_at == Some(started_at_micros)
+        {
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// Mark a `COMMITTED` coordinator `CLEANED` at `ts > after_ts_micros`
     /// without resurrecting a row that was already dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the `CheckAndMutateRow` RPC fails.
     pub async fn cleaned(&self, txn_id: &str, after_ts_micros: i64) -> Result<(), StorageError> {
         let mut data = self.client.data();
         let ts_micros = monotonic_timestamp_after_micros(after_ts_micros);
@@ -772,6 +873,12 @@ impl<'a> TxnCoordinator<'a> {
     /// advancing `m:v = new_version` only on the final chunk so concurrent
     /// `roll_forward` callers cooperatively complete remaining attributes without
     /// premature intent clearing, torn reads, or post-delete zombie cells.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if cell encoding or any `CheckAndMutateRow` RPC fails.
+    // Justification: fenced Phase 2 apply covers Put, Delete, single-RPC CAS, and progressive multi-chunk attribute-offset CAS in one atomic state machine.
+    #[allow(clippy::too_many_lines)]
     pub async fn apply_fenced_mutation(
         &self,
         txn_id: &str,
@@ -902,7 +1009,8 @@ impl<'a> TxnCoordinator<'a> {
                 let app_profile = self.client.app_profile_id.clone().unwrap_or_default();
 
                 loop {
-                    let (expected_stage, is_cont, body_muts, next_stage, next_state) = match stage {
+                    let (expected_stage, is_cont, body_muts, next_stage, target_stage) = match stage
+                    {
                         ChunkStage::Initial => {
                             let take = (rpc_limit - 3).min(data_muts.len());
                             let mut body = Vec::with_capacity(take + 1);
@@ -995,10 +1103,10 @@ impl<'a> TxnCoordinator<'a> {
                         }
                     };
                     if resp.predicate_matched {
-                        if next_state == ChunkStage::Done {
+                        if target_stage == ChunkStage::Done {
                             return Ok(true);
                         }
-                        stage = next_state;
+                        stage = target_stage;
                     } else {
                         let Some((fresh_stage, fresh_ts)) =
                             self.read_own_intent_stage(txn_id, participant).await?
@@ -1029,6 +1137,10 @@ impl<'a> TxnCoordinator<'a> {
     /// Clear an intent cell unconditionally (used while this incarnation still owns `txn:<id>`).
     /// Treats `NotFound` on a deleted table as completed so surviving participants'
     /// intents are never stranded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if `MutateRow` fails with an error other than `NotFound`.
     pub async fn clear_intent(
         &self,
         txn_id: &str,
@@ -1059,6 +1171,10 @@ impl<'a> TxnCoordinator<'a> {
     /// Clear an orphaned/cleaned intent cell bounded to `[0, next_millis_exclusive(max_ts_micros))`
     /// so delayed cleanup of an earlier deterministic `ClientRequestToken` incarnation
     /// can NEVER delete a newer incarnation's newly placed intent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if `MutateRow` fails with an error other than `NotFound`.
     pub async fn clear_intent_up_to(
         &self,
         txn_id: &str,
@@ -1090,6 +1206,10 @@ impl<'a> TxnCoordinator<'a> {
 
     /// Delete the coordinator row only if `t:started_at` still matches
     /// `started_at_micros`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if `CheckAndMutateRow` fails with an error other than `NotFound`.
     pub async fn drop_matching_start(
         &self,
         txn_id: &str,
@@ -1118,6 +1238,10 @@ impl<'a> TxnCoordinator<'a> {
     }
 
     /// Unconditional coordinator row delete (post-clean GC when `started_at` is unknown).
+    ///
+    /// # Errors
+    ///
+    /// Infallible best-effort cleanup; always returns `Ok(())`.
     pub async fn drop(&self, txn_id: &str) -> Result<(), StorageError> {
         let mut data = self.client.data();
         let req = MutateRowRequest {
@@ -1395,6 +1519,7 @@ fn build_fenced_apply_predicate(
 }
 
 /// Filter reading only the newest cell per qualifier in family `t` of `__extenddb_txn_log__`.
+#[must_use]
 pub fn build_txn_log_latest_filter() -> RowFilter {
     RowFilter {
         filter: Some(Filter::Chain(Chain {
@@ -1407,6 +1532,40 @@ pub fn build_txn_log_latest_filter() -> RowFilter {
                 },
             ],
         })),
+    }
+}
+
+/// Server-side `RowFilter` returning the newest cell per qualifier in family `t`
+/// of `__extenddb_txn_log__` strictly for coordinator rows whose latest `t:state`
+/// equals `exact_state` (e.g. `b"PENDING"` or `b"COMMITTED"`), skipping
+/// non-matching coordinator rows on the server without consuming `rows_limit`.
+#[must_use]
+pub fn build_txn_log_state_filter(exact_state: &[u8]) -> RowFilter {
+    RowFilter {
+        filter: Some(Filter::Condition(Box::new(Condition {
+            predicate_filter: Some(Box::new(RowFilter {
+                filter: Some(Filter::Chain(Chain {
+                    filters: vec![
+                        RowFilter {
+                            filter: Some(Filter::FamilyNameRegexFilter(format!("^{TXN_FAMILY}$"))),
+                        },
+                        RowFilter {
+                            filter: Some(Filter::ColumnQualifierRegexFilter(b"^state$".to_vec())),
+                        },
+                        RowFilter {
+                            filter: Some(Filter::CellsPerColumnLimitFilter(1)),
+                        },
+                        RowFilter {
+                            filter: Some(Filter::ValueRegexFilter(exact_re2_bytes(exact_state))),
+                        },
+                    ],
+                })),
+            })),
+            true_filter: Some(Box::new(build_txn_log_latest_filter())),
+            false_filter: Some(Box::new(RowFilter {
+                filter: Some(Filter::BlockAllFilter(true)),
+            })),
+        }))),
     }
 }
 
@@ -1434,7 +1593,13 @@ fn build_intent_presence_filter() -> RowFilter {
 
 /// Ensure the `__extenddb_txn_log__` system table exists on the Bigtable
 /// data instance (called from Migration 1 `M0001DataBaseline`).
-pub async fn ensure_txn_log_table(client: &BigtableClient) -> Result<(), String> {
+///
+/// # Errors
+///
+/// Returns [`crate::data::admin::AdminError`] if connecting or creating the table fails.
+pub async fn ensure_txn_log_table(
+    client: &BigtableClient,
+) -> Result<(), crate::data::admin::AdminError> {
     let mut admin = crate::data::admin::AdminClient::connect(client).await?;
     admin
         .create_table(
@@ -1458,6 +1623,58 @@ mod tests {
         let sid = TxnCoordinator::new_single_txn_id();
         assert!(sid.starts_with(SINGLE_TXN_PREFIX));
         assert!(TxnCoordinator::is_single_item_txn(&sid));
+    }
+
+    #[test]
+    fn test_open_with_token_retry_nonce_disambiguates_own_pending_incarnation() {
+        use crate::data::client::RowCell;
+
+        let cells = vec![
+            RowCell {
+                family_name: TXN_FAMILY.to_owned(),
+                qualifier: b"state".to_vec(),
+                value: b"PENDING".to_vec(),
+                timestamp_micros: 1_700_000_000_000,
+                labels: vec![],
+            },
+            RowCell {
+                family_name: TXN_FAMILY.to_owned(),
+                qualifier: b"started_at".to_vec(),
+                value: b"1700000000000".to_vec(),
+                timestamp_micros: 1_700_000_000_000,
+                labels: vec![],
+            },
+            RowCell {
+                family_name: TXN_FAMILY.to_owned(),
+                qualifier: b"open_nonce".to_vec(),
+                value: b"nonce-caller-a".to_vec(),
+                timestamp_micros: 1_700_000_000_000,
+                labels: vec![],
+            },
+        ];
+        let decoded = decode_txn_state_cells(cells).expect("decoded TxnState");
+        assert!(is_own_retried_open(
+            &decoded,
+            1_700_000_000_000,
+            "nonce-caller-a"
+        ));
+        assert!(
+            !is_own_retried_open(&decoded, 1_700_000_000_000, "nonce-caller-b"),
+            "concurrent peer with identical millisecond timestamp must NOT claim another caller's row"
+        );
+        assert!(!is_own_retried_open(
+            &decoded,
+            1_700_000_001_000,
+            "nonce-caller-a"
+        ));
+
+        let mut committed = decoded.clone();
+        committed.state = "COMMITTED".to_owned();
+        assert!(!is_own_retried_open(
+            &committed,
+            1_700_000_000_000,
+            "nonce-caller-a"
+        ));
     }
 
     #[test]
@@ -1578,6 +1795,8 @@ mod tests {
             &build_pending_incarnation_predicate(1_700_000_000_000),
             false,
         );
+        assert_no_nested_condition(&build_txn_log_state_filter(b"PENDING"), false);
+        assert_no_nested_condition(&build_txn_log_state_filter(b"COMMITTED"), false);
         for (expected, existed) in [
             (Some(7), true),
             (Some(7), false),

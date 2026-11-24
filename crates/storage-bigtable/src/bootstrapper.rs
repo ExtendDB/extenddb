@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! BigTable implementation of `Bootstrapper`.
+//! Cloud Bigtable implementation of `Bootstrapper`.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -28,7 +28,7 @@ use crate::migrations::{MigrationLease, lease_of};
 
 const DEFAULT_ADMIN_USER: &str = "admin";
 
-/// Strict validator for ExtendDB-managed Bigtable data and secondary-index
+/// Strict validator for `ExtendDB`-managed Bigtable data and secondary-index
 /// shadow table short names: `^t[0-9a-f]{16}(_[gl][0-9a-f]{8})?$`.
 #[must_use]
 pub fn is_extenddb_managed_data_table(name: &str) -> bool {
@@ -72,6 +72,15 @@ impl BigtableBootstrapper {
         }
     }
 
+    /// Build a [`BigtableBootstrapper`] from a TOML config file and environment
+    /// variable overrides.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if `config_path` exists with invalid TOML or if
+    /// `project_id` / `instance_id` are missing.
+    // Justification: matches the async from_config constructor signature shared across backend bootstrappers.
+    #[allow(clippy::unused_async)]
     pub async fn from_config(
         config_path: &str,
         _cli_args: &[String],
@@ -122,7 +131,7 @@ impl BigtableBootstrapper {
         ]) {
             config.project_id = proj;
         } else if config.project_id.is_empty() && config.emulator_host.is_some() {
-            config.project_id = "extenddb-dev".to_owned();
+            "extenddb-dev".clone_into(&mut config.project_id);
         }
         if let Some(inst) = env_non_empty(&[
             "EXTENDDB__STORAGE__BIGTABLE__INSTANCE_ID",
@@ -130,7 +139,7 @@ impl BigtableBootstrapper {
         ]) {
             config.instance_id = inst;
         } else if config.instance_id.is_empty() && config.emulator_host.is_some() {
-            config.instance_id = "extenddb-dev".to_owned();
+            "extenddb-dev".clone_into(&mut config.instance_id);
         }
         if let Some(data_inst) = env_non_empty(&[
             "EXTENDDB__STORAGE__BIGTABLE__DATA_INSTANCE_ID",
@@ -294,7 +303,7 @@ impl BigtableBootstrapper {
             .map_err(|e| OpError::Internal(e.to_string()))?;
         Ok(row.and_then(|v| {
             v.get("catalog_version")
-                .and_then(|s| s.as_str())
+                .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
         }))
     }
@@ -314,14 +323,14 @@ impl Bootstrapper for BigtableBootstrapper {
         let client = self.client().await?;
         AdminClient::validate_app_profile(client)
             .await
-            .map_err(OpError::Internal)?;
+            .map_err(|e| OpError::Internal(e.to_string()))?;
         let mut admin = AdminClient::connect(client)
             .await
-            .map_err(OpError::Internal)?;
+            .map_err(|e| OpError::Internal(e.to_string()))?;
         admin
             .create_table(CATALOG_TABLE, &[(CF, Some(gc_max_versions(1)))])
             .await
-            .map_err(OpError::Internal)?;
+            .map_err(|e| OpError::Internal(e.to_string()))?;
         Ok(())
     }
 
@@ -329,13 +338,13 @@ impl Bootstrapper for BigtableBootstrapper {
         let data_inst = self.config.effective_data_instance_id();
         if data_inst != self.config.instance_id {
             let mut data_cfg = self.config.clone();
-            data_cfg.instance_id = data_inst.to_owned();
+            data_inst.clone_into(&mut data_cfg.instance_id);
             let data_client = BigtableClient::connect(&data_cfg)
                 .await
                 .map_err(OpError::Internal)?;
             AdminClient::validate_app_profile(&data_client)
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(|e| OpError::Internal(e.to_string()))?;
         }
         // Data-instance system tables (`__extenddb_data_ledger__`,
         // `__extenddb_txn_log__`, and `__extenddb_ttl_index__`) are provisioned
@@ -387,7 +396,7 @@ impl Bootstrapper for BigtableBootstrapper {
             .map_err(|e| OpError::Internal(e.to_string()))?;
         let account_id = if let Some((row_key, val)) = existing.first() {
             val.get("account_id")
-                .and_then(|s| s.as_str())
+                .and_then(serde_json::Value::as_str)
                 .or_else(|| row_key.strip_prefix(keys::ACCOUNT_SCAN_PREFIX))
                 .unwrap_or("")
                 .to_owned()
@@ -450,17 +459,16 @@ impl Bootstrapper for BigtableBootstrapper {
                 already_existed: true,
                 from_env: existing
                     .get("from_env")
-                    .and_then(|v| v.as_bool())
+                    .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
             });
         }
 
-        let (password, generated, from_env) = match env_password {
-            Some(p) => (p.to_owned(), None, true),
-            None => {
-                let p = generate_random_password();
-                (p.clone(), Some(p), false)
-            }
+        let (password, generated, from_env) = if let Some(p) = env_password {
+            (p.to_owned(), None, true)
+        } else {
+            let p = generate_random_password();
+            (p.clone(), Some(p), false)
         };
         let hashed = hash_password_async(password).await?;
         let now = time::OffsetDateTime::now_utc()
@@ -530,8 +538,11 @@ impl Bootstrapper for BigtableBootstrapper {
         let client = self.client().await?;
         let mut admin = AdminClient::connect(client)
             .await
-            .map_err(OpError::Internal)?;
-        let tables = admin.list_tables().await.map_err(OpError::Internal)?;
+            .map_err(|e| OpError::Internal(e.to_string()))?;
+        let tables = admin
+            .list_tables()
+            .await
+            .map_err(|e| OpError::Internal(e.to_string()))?;
         let catalog_listed = if tables.iter().any(|t| t == CATALOG_TABLE) {
             self.catalog_named_data_tables(client).await
         } else {
@@ -547,14 +558,17 @@ impl Bootstrapper for BigtableBootstrapper {
 
         if let Some(data_inst) = separate_data_instance {
             let mut data_cfg = self.config.clone();
-            data_cfg.instance_id = data_inst.to_owned();
+            data_inst.clone_into(&mut data_cfg.instance_id);
             let data_client = BigtableClient::connect(&data_cfg)
                 .await
                 .map_err(OpError::Internal)?;
             let mut data_admin = AdminClient::connect(&data_client)
                 .await
-                .map_err(OpError::Internal)?;
-            let data_tables = data_admin.list_tables().await.map_err(OpError::Internal)?;
+                .map_err(|e| OpError::Internal(e.to_string()))?;
+            let data_tables = data_admin
+                .list_tables()
+                .await
+                .map_err(|e| OpError::Internal(e.to_string()))?;
             for t in data_tables {
                 if SYSTEM_TABLES.contains(&t.as_str())
                     || catalog_listed.contains(&t)
@@ -563,7 +577,7 @@ impl Bootstrapper for BigtableBootstrapper {
                     data_admin
                         .delete_table(&t)
                         .await
-                        .map_err(OpError::Internal)?;
+                        .map_err(|e| OpError::Internal(e.to_string()))?;
                 }
             }
         }
@@ -576,14 +590,17 @@ impl Bootstrapper for BigtableBootstrapper {
                     || catalog_listed.contains(t)
                     || is_extenddb_managed_data_table(t))
             {
-                admin.delete_table(t).await.map_err(OpError::Internal)?;
+                admin
+                    .delete_table(t)
+                    .await
+                    .map_err(|e| OpError::Internal(e.to_string()))?;
             }
         }
         if tables.iter().any(|t| t == CATALOG_TABLE) {
             admin
                 .delete_table(CATALOG_TABLE)
                 .await
-                .map_err(OpError::Internal)?;
+                .map_err(|e| OpError::Internal(e.to_string()))?;
         }
         Ok(())
     }

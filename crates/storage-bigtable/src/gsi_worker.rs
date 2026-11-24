@@ -13,19 +13,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use extenddb_core::types::{GsiDescription, IndexInfo, IndexType, Item, TableKeyInfo};
+use extenddb_storage::CancellationToken;
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{CancellationToken, sleep_or_shutdown};
 
 use crate::BigtableEngine;
-use crate::catalog::{Catalog, CatalogJsonAction};
-use crate::data::admin::AdminClient;
+use crate::catalog::CatalogJsonAction;
+use crate::data::admin::{AdminClient, AdminError};
 use crate::data::encoding::row_key;
 use crate::data::item_ops::{ItemOps, next_occ_version};
 use crate::data::query_scan::QueryScan;
-use crate::runtime_hooks::run_leased_worker;
+use crate::runtime_hooks::{run_leased_worker, spawn_catalog_lease_renewal};
 
 const SCAN_BATCH: i64 = 200;
-const GSI_BUILD_LEASE: Duration = Duration::from_secs(60);
+const GSI_BUILD_LEASE: Duration = Duration::from_mins(1);
 
 /// Distributed catalog lock name guarding a single GSI's `CREATING -> ACTIVE`
 /// build across nodes (`lock:gsi_build:<table_id>:<index_name>`).
@@ -60,6 +60,11 @@ pub async fn run(engine: Arc<BigtableEngine>, cadence: Duration, shutdown: Cance
     tracing::info!("bigtable GSI recovery worker stopped");
 }
 
+/// Run one GSI recovery pass across all catalog tables.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] if scanning `__extenddb_catalog__` fails.
 pub async fn sweep_once(engine: &BigtableEngine) -> Result<(), StorageError> {
     let token = CancellationToken::new();
     sweep_once_with_token(engine, &token).await
@@ -88,7 +93,7 @@ async fn sweep_once_with_token(
             tracing::warn!("missing data_table in catalog row {k}");
             continue;
         };
-        let desc = match engine.deserialize_table_description(&val) {
+        let desc = match BigtableEngine::deserialize_table_description(&val) {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!("deserialize TableDescription for {k} failed: {e}");
@@ -132,23 +137,13 @@ async fn sweep_once_with_token(
             }
 
             let renew_token = shutdown.child_token();
-            let renew_tok_bg = renew_token.clone();
-            let renew_client = engine.catalog_client_arc();
-            let renew_lock_name = build_lock.clone();
-            let renew_owner = owner.clone();
-            let renewal = tokio::spawn(async move {
-                let every = GSI_BUILD_LEASE / 3;
-                while sleep_or_shutdown(&renew_tok_bg, every).await {
-                    let c = Catalog::new(&renew_client);
-                    if let Ok(false) = c
-                        .renew_lock(&renew_lock_name, &renew_owner, GSI_BUILD_LEASE)
-                        .await
-                    {
-                        renew_tok_bg.cancel();
-                        return;
-                    }
-                }
-            });
+            let renewal = spawn_catalog_lease_renewal(
+                engine.catalog_client_arc(),
+                build_lock.clone(),
+                owner.clone(),
+                GSI_BUILD_LEASE,
+                renew_token.clone(),
+            );
 
             let outcome = recover_creating_gsi(
                 engine,
@@ -191,7 +186,7 @@ async fn recover_creating_gsi(
     let Some(cur_row) = engine.cat().get(&meta_key).await? else {
         return Ok(());
     };
-    let cur_desc = engine.deserialize_table_description(&cur_row)?;
+    let cur_desc = BigtableEngine::deserialize_table_description(&cur_row)?;
     let still_creating = cur_desc
         .global_secondary_indexes
         .as_ref()
@@ -214,7 +209,7 @@ async fn recover_creating_gsi(
             "GSI build lease cancelled during visibility fence".into(),
         ));
     }
-    reconcile_table_gsi(engine, base_key_info, data_table, gsi).await?;
+    reconcile_table_gsi(engine, base_key_info, data_table, gsi, token).await?;
     if token.is_cancelled() {
         return Err(StorageError::Transient(
             "GSI build lease lost before ACTIVE promotion".into(),
@@ -231,7 +226,7 @@ async fn ensure_gsi_shadow_table(
     let shadow_table = crate::gsi::shadow_table_id(data_table, index_name);
     let mut admin = AdminClient::connect(engine.client_ref())
         .await
-        .map_err(StorageError::Internal)?;
+        .map_err(AdminError::into_storage_error)?;
     let families = vec![
         ("d", Some(crate::data::admin::gc_max_versions(1))),
         ("m", Some(crate::data::admin::gc_max_versions(1))),
@@ -240,7 +235,7 @@ async fn ensure_gsi_shadow_table(
     admin
         .create_table(&shadow_table, &families)
         .await
-        .map_err(StorageError::Internal)
+        .map_err(AdminError::into_storage_error)
 }
 
 pub(crate) fn build_reconciler_base_key_info(
@@ -301,7 +296,7 @@ async fn promote_creating_gsi_to_active(
             let Some(mut row) = cur else {
                 return Ok((CatalogJsonAction::NoOp, false));
             };
-            let mut desc = engine.deserialize_table_description(&row)?;
+            let mut desc = BigtableEngine::deserialize_table_description(&row)?;
             let mut promoted = false;
             if let Some(ref mut gsis) = desc.global_secondary_indexes {
                 for g in gsis.iter_mut() {
@@ -314,7 +309,7 @@ async fn promote_creating_gsi_to_active(
             if !promoted {
                 return Ok((CatalogJsonAction::NoOp, false));
             }
-            engine.write_table_description_into_row(&mut row, &desc)?;
+            BigtableEngine::write_table_description_into_row(&mut row, &desc)?;
             Ok((CatalogJsonAction::Put(row), true))
         })
         .await?;
@@ -325,19 +320,23 @@ async fn promote_creating_gsi_to_active(
 }
 
 /// Reconciles both shadow-to-base and base-to-shadow directions for a single GSI,
-/// propagating errors so `"CREATING"` GSIs are never marked `"ACTIVE"` while
-/// backfill is incomplete.
+/// propagating errors and respecting `token` cancellation so `"CREATING"` GSIs
+/// are never marked `"ACTIVE"` while backfill is incomplete or unfenced.
 pub(crate) async fn reconcile_table_gsi(
     engine: &BigtableEngine,
     base_key_info: &TableKeyInfo,
     data_table: &str,
     gsi: &GsiDescription,
+    token: &CancellationToken,
 ) -> Result<(), StorageError> {
+    if token.is_cancelled() {
+        return Err(StorageError::Transient("GSI build lease cancelled".into()));
+    }
     engine
         .roll_forward_committed_txns_for_table(data_table)
         .await?;
-    reconcile_gsi_shadow_to_base(engine, base_key_info, data_table, gsi).await?;
-    reconcile_gsi_base_to_shadow(engine, base_key_info, data_table, gsi).await?;
+    reconcile_gsi_shadow_to_base(engine, base_key_info, data_table, gsi, token).await?;
+    reconcile_gsi_base_to_shadow(engine, base_key_info, data_table, gsi, token).await?;
     Ok(())
 }
 
@@ -346,9 +345,10 @@ async fn reconcile_gsi_shadow_to_base(
     base_key_info: &TableKeyInfo,
     data_table: &str,
     gsi: &GsiDescription,
+    token: &CancellationToken,
 ) -> Result<(), StorageError> {
     let shadow_table = crate::gsi::shadow_table_id(data_table, &gsi.index_name);
-    let shadow_qs = QueryScan::new(engine.client_ref(), &shadow_table);
+    let shadow_qs = QueryScan::with_engine(engine, &shadow_table);
 
     let gsi_key_info = TableKeyInfo {
         table_name: format!("{}__gsi_{}", base_key_info.table_name, gsi.index_name),
@@ -365,6 +365,9 @@ async fn reconcile_gsi_shadow_to_base(
 
     let mut start_key = None;
     loop {
+        if token.is_cancelled() {
+            return Err(StorageError::Transient("GSI build lease cancelled".into()));
+        }
         let (items, last) = shadow_qs
             .scan(
                 &gsi_key_info,
@@ -390,6 +393,9 @@ async fn reconcile_gsi_shadow_to_base(
         let base_rows = base_ops.batch_get(base_key_info, &base_keys).await?;
 
         for ((shadow_item, base_key), base_row) in items.into_iter().zip(base_keys).zip(base_rows) {
+            if token.is_cancelled() {
+                return Err(StorageError::Transient("GSI build lease cancelled".into()));
+            }
             reconcile_shadow_item_with_base(
                 engine,
                 data_table,
@@ -417,13 +423,17 @@ async fn reconcile_gsi_base_to_shadow(
     base_key_info: &TableKeyInfo,
     data_table: &str,
     gsi: &GsiDescription,
+    token: &CancellationToken,
 ) -> Result<(), StorageError> {
-    let base_qs = QueryScan::new(engine.client_ref(), data_table);
+    let base_qs = QueryScan::with_engine(engine, data_table);
     let shadow_table = crate::gsi::shadow_table_id(data_table, &gsi.index_name);
     let shadow_ops = ItemOps::new(engine.client_ref(), &shadow_table, 0);
 
     let mut start_key = None;
     loop {
+        if token.is_cancelled() {
+            return Err(StorageError::Transient("GSI build lease cancelled".into()));
+        }
         let (items, last) = base_qs
             .scan(
                 base_key_info,
@@ -463,6 +473,9 @@ async fn reconcile_gsi_base_to_shadow(
             for ((base_item, expected_projected, _key), existing_shadow) in
                 targets.into_iter().zip(existing_shadows)
             {
+                if token.is_cancelled() {
+                    return Err(StorageError::Transient("GSI build lease cancelled".into()));
+                }
                 let needs_write = match existing_shadow {
                     None => true,
                     Some(shadow_item) => shadow_item != expected_projected,
@@ -508,6 +521,7 @@ async fn reconcile_gsi_base_to_shadow(
     Ok(())
 }
 
+// Justification: shadow-vs-base item reconciliation needs engine, table/index descriptors, shadow ItemOps, and both decoded key/row views.
 #[allow(clippy::too_many_arguments)]
 async fn reconcile_shadow_item_with_base(
     engine: &BigtableEngine,
@@ -563,9 +577,18 @@ async fn reconcile_shadow_item_with_base(
                 .await;
         }
         (None, None) => {
-            shadow_ops
+            if let Some(tomb_ver) = shadow_ops
                 .delete_shadow_orphan_if_unchanged(&shadow_key_bytes)
-                .await?;
+                .await?
+            {
+                engine
+                    .enqueue_tombstone_gc_best_effort(
+                        &shadow_ops_table_name(data_table, gsi),
+                        &shadow_key_bytes,
+                        tomb_ver,
+                    )
+                    .await;
+            }
         }
         (Some(fresh_base), ver_opt) => {
             let expected_projected = crate::gsi::project_for_shadow(

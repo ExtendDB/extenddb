@@ -377,10 +377,10 @@ impl BackupCatalog for BigtableEngine {
         Box::pin(async { Ok(None) })
     }
 
-    fn list_restore_jobs<'a>(
-        &'a self,
+    fn list_restore_jobs(
+        &self,
         _status: Option<JobStatus>,
-    ) -> BoxFuture<'a, Result<Vec<RestoreJobRow>, StorageError>> {
+    ) -> BoxFuture<'_, Result<Vec<RestoreJobRow>, StorageError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 

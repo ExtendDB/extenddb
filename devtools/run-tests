@@ -607,7 +607,7 @@ if $RUN_PYTEST; then
                 # Keep concurrent xdist workers below MAX_FAILURES_PER_PRINCIPAL (5)
                 # so simultaneous Basic-Auth admin setup calls on high-core hosts do
                 # not trip the 5-in-flight login reservation cap in rate_limit.rs.
-                XDIST_WORKERS=$(python3 -c "import os; print(min(4, max(2, os.cpu_count() // 3)))")
+                XDIST_WORKERS=$(python3 -c "import os; print(min(4, max(2, (os.cpu_count() or 2) // 3)))")
             else
                 XDIST_WORKERS=$(python3 -c "import os; print(max(2, os.cpu_count() // 3))")
             fi
@@ -617,16 +617,11 @@ if $RUN_PYTEST; then
         PYTEST_ARGS+=(-n "$XDIST_WORKERS" --dist loadfile)
     fi
     if [[ "$BACKEND" == "bigtable" ]]; then
-        # Bigtable refuses CreateBackup; skip only tests/fixtures that require
-        # creating an on-demand backup while keeping ListBackups / DescribeBackup /
-        # DeleteBackup / RestoreTableFromBackup validation and missing-backup
-        # tests active (including non-CreateBackup validation tests in
-        # test_backup_restore_fidelity.py).
-        PYTEST_ARGS+=(
-            --ignore=tests/test_authz_cross_account.py
-            --ignore=tests/test_metrics_table_names.py
-        )
-        BIGTABLE_PYTEST_NOT="not TestExplicitDenyOnResourceArn and not TestBackupResourceTags and not TestBackupAuthorization and not (test_backup_restore_fidelity and not test_backup_and_table_names_are_validated and not test_create_backup_of_a_missing_table_is_table_not_found)"
+        # Bigtable refuses CreateBackup; skip only tests/classes whose entire
+        # purpose is creating and exercising on-demand logical backups while
+        # keeping cross-account authz, resource-ARN authz, metrics table-name
+        # hygiene, and missing-backup/validation tests active.
+        BIGTABLE_PYTEST_NOT="not TestBackupResourceTags and not TestBackupAuthorization and not (test_backup_restore_fidelity and not test_backup_and_table_names_are_validated and not test_create_backup_of_a_missing_table_is_table_not_found)"
         if [[ -n "$FILTER" ]]; then
             PYTEST_ARGS+=(-k "($FILTER) and ($BIGTABLE_PYTEST_NOT)")
         else

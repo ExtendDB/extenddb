@@ -12,6 +12,7 @@
 //!    reclaiming pure version-only tombstone rows (`reclaim_version_only_row`)
 //!    once the intent-timeout grace window has elapsed.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,12 +34,58 @@ use crate::data::encoding::ttl_key::{
 use crate::data::item_ops::{ItemOps, next_millis_exclusive, now_millis, now_millis_micros};
 use crate::runtime_hooks::run_leased_worker;
 use crate::transact::{
-    ParticipantMutation, ParticipantRow, SideEffectBaseGuard, TXN_FAMILY, TXN_LOG_TABLE,
-    TxnCoordinator, TxnState, TxnStreamRecord, TxnTokenMeta, TxnTtlMutation,
-    build_txn_log_latest_filter,
+    ParticipantRow, TXN_LOG_TABLE, TxnCoordinator, TxnState, build_txn_log_latest_filter,
+    decode_txn_state_cells,
 };
 
 const TOMBSTONE_SWEEP_BATCH: i64 = 200;
+
+pub(crate) fn base_table_family_key(table_short: &str) -> &str {
+    table_short.split('_').next().unwrap_or(table_short)
+}
+
+fn record_blocked_txn_tables(blocked: &mut HashSet<String>, st: &TxnState) {
+    if let Some(ref parts) = st.participants {
+        for p in parts {
+            blocked.insert(base_table_family_key(&p.data_table).to_owned());
+        }
+    }
+    if let Some(ref muts) = st.mutations {
+        for m in muts {
+            blocked.insert(base_table_family_key(&m.participant.data_table).to_owned());
+        }
+    }
+    if let Some(ref guard) = st.base_guard {
+        blocked.insert(base_table_family_key(&guard.participant.data_table).to_owned());
+    }
+}
+
+fn record_unsettled_committed_rows(unsettled: &mut HashSet<(String, Vec<u8>)>, st: &TxnState) {
+    if let Some(ref parts) = st.participants {
+        for p in parts {
+            unsettled.insert((p.data_table.clone(), p.row_key.clone()));
+        }
+    }
+    if let Some(ref muts) = st.mutations {
+        for m in muts {
+            unsettled.insert((
+                m.participant.data_table.clone(),
+                m.participant.row_key.clone(),
+            ));
+        }
+    }
+    if let Some(ref guard) = st.base_guard {
+        unsettled.insert((
+            guard.participant.data_table.clone(),
+            guard.participant.row_key.clone(),
+        ));
+    }
+}
+
+struct TxnSweepOutcome {
+    blocked_tables: HashSet<String>,
+    unsettled_committed_rows: HashSet<(String, Vec<u8>)>,
+}
 
 pub async fn run(engine: Arc<BigtableEngine>, cadence: Duration, shutdown: CancellationToken) {
     tracing::info!("bigtable 2PC sweeper worker started; cadence={cadence:?}");
@@ -53,10 +100,10 @@ pub async fn run(engine: Arc<BigtableEngine>, cadence: Duration, shutdown: Cance
         cadence,
         lease_duration,
         shutdown,
-        |_pass_token| {
+        |pass_token| {
             let engine = engine.clone();
             async move {
-                if let Err(e) = sweep_once(&engine).await {
+                if let Err(e) = sweep_inner(&engine, None, None, &pass_token).await {
                     tracing::warn!("2PC sweeper sweep error: {e}");
                 }
             }
@@ -67,39 +114,91 @@ pub async fn run(engine: Arc<BigtableEngine>, cadence: Duration, shutdown: Cance
 }
 
 /// Run one sweep pass over `__extenddb_txn_log__` and due row-tombstone GC entries.
+///
+/// # Errors
+///
+/// Returns an error description if reading `__extenddb_txn_log__` or
+/// `__extenddb_ttl_index__` fails.
 pub async fn sweep_once(engine: &BigtableEngine) -> Result<(), String> {
-    sweep_inner(engine, None).await
+    let token = CancellationToken::new();
+    sweep_inner(engine, None, None, &token).await
 }
 
 /// Run one sweep pass with an optional cutoff timestamp override (for testing
 /// immediate recovery and tombstone reclamation without sleeping `intent_timeout_secs`).
+///
+/// # Errors
+///
+/// Returns an error description if reading `__extenddb_txn_log__` or
+/// `__extenddb_ttl_index__` fails.
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub async fn sweep_with_cutoff_override(
     engine: &BigtableEngine,
     cutoff_override_micros: Option<i64>,
 ) -> Result<(), String> {
-    sweep_inner(engine, cutoff_override_micros).await
+    let token = CancellationToken::new();
+    sweep_inner(engine, cutoff_override_micros, None, &token).await
+}
+
+/// Run one sweep pass overriding only the tombstone GC readiness clock while
+/// keeping `__extenddb_txn_log__` `PENDING` timeout evaluation on live wall time.
+///
+/// # Errors
+///
+/// Returns an error description if reading `__extenddb_txn_log__` or
+/// `__extenddb_ttl_index__` fails.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub async fn sweep_once_with_tombstone_cutoff(
+    engine: &BigtableEngine,
+    tomb_now_ms_override: Option<u64>,
+) -> Result<(), String> {
+    let token = CancellationToken::new();
+    sweep_inner(engine, None, tomb_now_ms_override, &token).await
 }
 
 async fn sweep_inner(
     engine: &BigtableEngine,
     cutoff_override_micros: Option<i64>,
+    tomb_now_ms_override: Option<u64>,
+    shutdown: &CancellationToken,
 ) -> Result<(), String> {
-    let all_settled = sweep_txn_log(engine, cutoff_override_micros).await?;
-    if !all_settled {
+    let outcome = sweep_txn_log(engine, cutoff_override_micros, shutdown).await?;
+    if shutdown.is_cancelled() {
         return Ok(());
     }
-    let tomb_now_ms = cutoff_override_micros
-        .map(|us| u64::try_from((us / 1_000).max(0)).unwrap_or(u64::MAX))
-        .unwrap_or_else(now_millis);
-    sweep_due_tombstones(engine, tomb_now_ms, cutoff_override_micros.is_some()).await
+    let tomb_now_ms = tomb_now_ms_override.unwrap_or_else(|| {
+        cutoff_override_micros.map_or_else(now_millis, |us| {
+            u64::try_from((us / 1_000).max(0)).unwrap_or(u64::MAX)
+        })
+    });
+    sweep_due_tombstones(
+        engine,
+        tomb_now_ms,
+        tomb_now_ms_override.is_some() || cutoff_override_micros.is_some(),
+        &outcome,
+        shutdown,
+    )
+    .await
 }
 
+// Justification: coordinator log paging, CLEANED/ABORTED cleanup, timed-out PENDING CAS abort, COMMITTED/post-* roll-forward, and unsettled-row tracking run in one pass.
+#[allow(clippy::too_many_lines)]
 async fn sweep_txn_log(
     engine: &BigtableEngine,
     cutoff_override_micros: Option<i64>,
-) -> Result<bool, String> {
+    shutdown: &CancellationToken,
+) -> Result<TxnSweepOutcome, String> {
+    let mut blocked_tables = engine.flush_pending_side_effect_recoveries().await;
+    let mut unsettled_committed_rows = HashSet::new();
+    if shutdown.is_cancelled() {
+        return Ok(TxnSweepOutcome {
+            blocked_tables,
+            unsettled_committed_rows,
+        });
+    }
+
     let client = engine.client_ref();
     let mut data = client.data();
     let txn_log_table = client.full_table_name(TXN_LOG_TABLE);
@@ -111,11 +210,10 @@ async fn sweep_txn_log(
     let limit = 100;
     let mut start_key = start_prefix;
     let mut exclude_start = false;
-    let mut all_settled = true;
 
     let now_micros = now_millis_micros();
-    #[allow(clippy::cast_possible_wrap)]
-    let intent_timeout_micros = (engine.intent_timeout_secs().saturating_mul(1_000_000)) as i64;
+    let intent_timeout_micros =
+        i64::try_from(engine.intent_timeout_secs().saturating_mul(1_000_000)).unwrap_or(i64::MAX);
     let cutoff = cutoff_override_micros.unwrap_or_else(|| now_micros - intent_timeout_micros);
 
     let coord = TxnCoordinator::new(
@@ -124,6 +222,12 @@ async fn sweep_txn_log(
     );
 
     loop {
+        if shutdown.is_cancelled() {
+            return Ok(TxnSweepOutcome {
+                blocked_tables,
+                unsettled_committed_rows,
+            });
+        }
         let range = RowRange {
             start_key: Some(if exclude_start {
                 StartKey::StartKeyOpen(start_key.clone())
@@ -153,10 +257,16 @@ async fn sweep_txn_log(
         if resp.is_empty() {
             break;
         }
-
+        let batch_len = resp.len();
         let mut last_key = None;
 
         for (raw_key, cells) in resp {
+            if shutdown.is_cancelled() {
+                return Ok(TxnSweepOutcome {
+                    blocked_tables,
+                    unsettled_committed_rows,
+                });
+            }
             last_key = Some(raw_key.clone());
             let Ok(s) = String::from_utf8(raw_key) else {
                 continue;
@@ -165,117 +275,69 @@ async fn sweep_txn_log(
                 continue;
             };
 
-            let mut state: Option<String> = None;
-            let mut state_ts_micros: i64 = 0;
-            let mut started_at: Option<i64> = None;
-            let mut participants: Option<Vec<ParticipantRow>> = None;
-            let mut mutations: Option<Vec<ParticipantMutation>> = None;
-            let mut stream_records: Option<Vec<TxnStreamRecord>> = None;
-            let mut ttl_mutations: Option<Vec<TxnTtlMutation>> = None;
-            let mut token_meta: Option<TxnTokenMeta> = None;
-            let mut base_guard: Option<SideEffectBaseGuard> = None;
-
-            for cell in cells {
-                if cell.family_name == TXN_FAMILY {
-                    match cell.qualifier.as_slice() {
-                        b"state" if state.is_none() => {
-                            state_ts_micros = cell.timestamp_micros;
-                            state = String::from_utf8(cell.value).ok();
-                        }
-                        b"started_at" if started_at.is_none() => {
-                            started_at = String::from_utf8(cell.value)
-                                .ok()
-                                .and_then(|s| s.parse::<i64>().ok());
-                        }
-                        b"participants" if participants.is_none() => {
-                            participants = serde_json::from_slice(&cell.value).ok();
-                        }
-                        b"mutations" if mutations.is_none() => {
-                            mutations = serde_json::from_slice(&cell.value).ok();
-                        }
-                        b"stream_records" if stream_records.is_none() => {
-                            stream_records = serde_json::from_slice(&cell.value).ok();
-                        }
-                        b"ttl_mutations" if ttl_mutations.is_none() => {
-                            ttl_mutations = serde_json::from_slice(&cell.value).ok();
-                        }
-                        b"token_meta" if token_meta.is_none() => {
-                            token_meta = serde_json::from_slice(&cell.value).ok();
-                        }
-                        b"base_guard" if base_guard.is_none() => {
-                            base_guard = serde_json::from_slice(&cell.value).ok();
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            let Some(st) = state else {
+            let Some(txn_state) = decode_txn_state_cells(cells) else {
                 continue;
             };
-            let Some(start) = started_at else {
+            let Some(start) = txn_state.started_at else {
                 continue;
             };
 
-            if st == "CLEANED" {
-                if let Some(ref tm) = token_meta
+            if txn_state.state == "CLEANED" {
+                if let Some(ref tm) = txn_state.token_meta
                     && let Err(e) = engine
                         .persist_idempotency_if_unexpired(
                             &tm.account_id,
                             &tm.token,
                             &tm.fingerprint,
                             &txn_id,
-                            state_ts_micros.max(start),
+                            txn_state.state_ts_micros.max(start),
                         )
                         .await
                 {
                     tracing::warn!(
                         "2PC Sweeper: failed to persist idempotency record for CLEANED txn {txn_id}: {e}"
                     );
-                    all_settled = false;
                     continue;
                 }
                 if let Err(e) = coord.drop_matching_start(&txn_id, start).await {
                     tracing::warn!(
                         "2PC Sweeper: failed to drop CLEANED coordinator row for {txn_id}: {e}"
                     );
-                    all_settled = false;
                 }
                 continue;
             }
 
-            if st == "ABORTED" {
-                if !clear_aborted_intents_and_drop(&coord, &txn_id, start, participants.as_deref())
-                    .await
-                {
-                    all_settled = false;
-                }
+            if txn_state.state == "ABORTED" {
+                let _ = clear_aborted_intents_and_drop(
+                    &coord,
+                    &txn_id,
+                    start,
+                    txn_state.participants.as_deref(),
+                )
+                .await;
                 continue;
             }
 
             // Post-commit side-effect recovery records (`participants == Some([])`)
-            // can roll forward immediately without waiting `intent_timeout_secs`.
-            let is_side_effect_recovery =
-                st == "COMMITTED" && participants.as_ref().is_some_and(Vec::is_empty);
+            // roll forward immediately without waiting `intent_timeout_secs`.
+            let is_side_effect_recovery = txn_state.state == "COMMITTED"
+                && txn_state.participants.as_ref().is_some_and(Vec::is_empty);
 
             if is_side_effect_recovery || start <= cutoff {
-                match st.as_str() {
+                match txn_state.state.as_str() {
                     "PENDING" => {
                         match coord
-                            .try_abort_pending(&txn_id, start, start.max(state_ts_micros))
+                            .try_abort_pending(&txn_id, start, start.max(txn_state.state_ts_micros))
                             .await
                         {
                             Ok(true) => {
-                                if !clear_aborted_intents_and_drop(
+                                let _ = clear_aborted_intents_and_drop(
                                     &coord,
                                     &txn_id,
                                     start,
-                                    participants.as_deref(),
+                                    txn_state.participants.as_deref(),
                                 )
-                                .await
-                                {
-                                    all_settled = false;
-                                }
+                                .await;
                             }
                             Ok(false) => match coord.get_state(&txn_id).await {
                                 Ok(Some(fresh))
@@ -286,72 +348,61 @@ async fn sweep_txn_log(
                                         tracing::error!(
                                             "2PC Sweeper: rollforward after CAS race failed for {txn_id}: {e}"
                                         );
-                                        all_settled = false;
+                                        record_blocked_txn_tables(&mut blocked_tables, &fresh);
                                     }
                                 }
                                 Ok(Some(fresh))
                                     if fresh.state == "ABORTED"
                                         && fresh.started_at == Some(start) =>
                                 {
-                                    if !clear_aborted_intents_and_drop(
+                                    let _ = clear_aborted_intents_and_drop(
                                         &coord,
                                         &txn_id,
                                         start,
                                         fresh.participants.as_deref(),
                                     )
-                                    .await
-                                    {
-                                        all_settled = false;
-                                    }
+                                    .await;
                                 }
                                 Ok(Some(fresh)) if fresh.state == "PENDING" => {
-                                    all_settled = false;
+                                    record_blocked_txn_tables(&mut blocked_tables, &fresh);
                                 }
                                 Ok(_) => {}
                                 Err(e) => {
                                     tracing::warn!(
                                         "2PC Sweeper: get_state after CAS miss failed for {txn_id}: {e}"
                                     );
-                                    all_settled = false;
+                                    record_blocked_txn_tables(&mut blocked_tables, &txn_state);
                                 }
                             },
                             Err(e) => {
                                 tracing::warn!(
                                     "2PC Sweeper: try_abort_pending failed for {txn_id}: {e}"
                                 );
-                                all_settled = false;
+                                record_blocked_txn_tables(&mut blocked_tables, &txn_state);
                             }
                         }
                     }
                     "COMMITTED" => {
-                        let txn_state = TxnState {
-                            state: st,
-                            state_ts_micros,
-                            started_at: Some(start),
-                            participants,
-                            mutations,
-                            stream_records,
-                            ttl_mutations,
-                            token_meta,
-                            base_guard,
-                        };
                         if let Err(e) = engine.roll_forward(&txn_id, &txn_state).await {
                             tracing::error!(
                                 "2PC Sweeper: rollforward failed for txn {txn_id}: {e}"
                             );
-                            all_settled = false;
+                            record_blocked_txn_tables(&mut blocked_tables, &txn_state);
                         }
                     }
-                    _ => {
-                        tracing::warn!("2PC Sweeper: unknown txn state {st}");
-                        all_settled = false;
+                    other => {
+                        tracing::warn!("2PC Sweeper: unknown txn state {other}");
+                        record_blocked_txn_tables(&mut blocked_tables, &txn_state);
                     }
                 }
-            } else if st == "COMMITTED" {
-                all_settled = false;
+            } else if txn_state.state == "COMMITTED" {
+                record_unsettled_committed_rows(&mut unsettled_committed_rows, &txn_state);
             }
         }
 
+        if i64::try_from(batch_len).unwrap_or(i64::MAX) < limit {
+            break;
+        }
         if let Some(key) = last_key {
             start_key = key;
             exclude_start = true;
@@ -360,13 +411,20 @@ async fn sweep_txn_log(
         }
     }
 
-    Ok(all_settled)
+    Ok(TxnSweepOutcome {
+        blocked_tables,
+        unsettled_committed_rows,
+    })
 }
 
+// Justification: shard iteration, tombstone queue ReadRows paging, per-table/per-row gating, and guarded row deletion stay together.
+#[allow(clippy::too_many_lines)]
 async fn sweep_due_tombstones(
     engine: &BigtableEngine,
     now_ms: u64,
     has_cutoff_override: bool,
+    outcome: &TxnSweepOutcome,
+    shutdown: &CancellationToken,
 ) -> Result<(), String> {
     let client = engine.client_ref();
     let mut data = client.data();
@@ -377,6 +435,9 @@ async fn sweep_due_tombstones(
     let mut exclude_start = false;
 
     loop {
+        if shutdown.is_cancelled() {
+            return Ok(());
+        }
         let range = RowRange {
             start_key: Some(if exclude_start {
                 StartKey::StartKeyOpen(start_key.clone())
@@ -409,6 +470,9 @@ async fn sweep_due_tombstones(
         let batch_len = resp.len();
         let mut last_key = None;
         for (queue_key, cells) in resp {
+            if shutdown.is_cancelled() {
+                return Ok(());
+            }
             last_key = Some(queue_key.clone());
             let Some(cell) = cells
                 .into_iter()
@@ -420,6 +484,15 @@ async fn sweep_due_tombstones(
             if let Some((expected_ver, table_short, raw_row_key)) =
                 decode_tombstone_gc_value(&cell.value)
             {
+                if outcome
+                    .blocked_tables
+                    .contains(base_table_family_key(table_short))
+                    || outcome
+                        .unsettled_committed_rows
+                        .contains(&(table_short.to_owned(), raw_row_key.to_vec()))
+                {
+                    continue;
+                }
                 let cur_wall_ms = now_millis();
                 if has_cutoff_override
                     && cur_wall_ms <= expected_ver

@@ -18,8 +18,8 @@
 //! M    0x0A + JSON-serialized BTreeMap<String, AttributeValue>
 //! ```
 //!
-//! Scalars stay hand-rolled (tiny + simple). Sets / L / M use serde_json
-//! under their tag bytes — leverages AttributeValue's existing serde impls
+//! Scalars stay hand-rolled (tiny + simple). Sets / L / M use `serde_json`
+//! under their tag bytes — leverages `AttributeValue`'s existing serde impls
 //! which produce DDB-spec JSON, and decoders are symmetric.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -39,6 +39,11 @@ pub const TAG_BS: u8 = 0x08;
 pub const TAG_L: u8 = 0x09;
 pub const TAG_M: u8 = 0x0A;
 
+/// Encode a single [`AttributeValue`] into its 1-byte type tag + payload bytes.
+///
+/// # Errors
+///
+/// Returns [`StorageError::Internal`] if JSON serialization of a set, list, or map fails.
 pub fn encode(av: &AttributeValue) -> Result<Vec<u8>, StorageError> {
     Ok(match av {
         AttributeValue::S(s) => {
@@ -59,7 +64,7 @@ pub fn encode(av: &AttributeValue) -> Result<Vec<u8>, StorageError> {
             out.extend_from_slice(b);
             out
         }
-        AttributeValue::Bool(b) => vec![TAG_BOOL, if *b { 1 } else { 0 }],
+        AttributeValue::Bool(b) => vec![TAG_BOOL, u8::from(*b)],
         AttributeValue::Null => vec![TAG_NULL],
         AttributeValue::SS(set) => {
             let body = serde_json::to_vec(set)
@@ -113,6 +118,12 @@ pub fn encode(av: &AttributeValue) -> Result<Vec<u8>, StorageError> {
     })
 }
 
+/// Decode a 1-byte type tag + payload byte slice back into an [`AttributeValue`].
+///
+/// # Errors
+///
+/// Returns [`StorageError::Internal`] if `bytes` is empty, carries an unknown tag,
+/// or contains invalid UTF-8 / JSON / base64 payloads.
 pub fn decode(bytes: &[u8]) -> Result<AttributeValue, StorageError> {
     let tag = *bytes
         .first()

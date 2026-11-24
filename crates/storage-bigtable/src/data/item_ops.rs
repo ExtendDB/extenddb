@@ -1,9 +1,10 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! PutItem / GetItem / DeleteItem / UpdateItem against a BigTable data table.
+//! `PutItem` / `GetItem` / `DeleteItem` / `UpdateItem` against a Cloud Bigtable data table.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use bigdecimal::ToPrimitive;
 use extenddb_core::expression::{
@@ -26,7 +27,6 @@ use uuid::Uuid;
 
 use crate::data::client::{
     BigtableClient, exact_re2_bytes, map_bigtable_err, monotonic_timestamp_after_micros,
-    monotonic_timestamp_micros,
 };
 use crate::data::encoding::{cell, row_key};
 
@@ -38,8 +38,6 @@ pub const FAMILY_META: &str = "m";
 pub const QUALIFIER_VERSION: &[u8] = b"v";
 /// Qualifier prefix for 2PC intent cells in family `m`.
 pub const QUALIFIER_INTENT_PREFIX: &[u8] = b"intent:";
-/// Intent ID prefix for direct multi-chunk `ItemOps::put_cas` staging.
-pub const DIRECT_PUT_STAGE_PREFIX: &str = "sgl-put-";
 /// Qualifier for shadow-row in-progress multi-chunk step markers in family `m`.
 pub const QUALIFIER_SHADOW_CHUNK: &[u8] = b"chunk";
 /// Safe per-RPC mutation batch ceiling below Bigtable's 100,000-mutation hard limit.
@@ -55,6 +53,7 @@ tokio::task_local! {
 /// exercise multi-chunk CAS + overflow `MutateRow` execution without hitting
 /// `cbtemulator`'s quadratic in-memory column-slice insertion).
 #[inline]
+#[must_use]
 pub fn max_mutations_per_rpc() -> usize {
     #[cfg(feature = "test-hooks")]
     {
@@ -80,6 +79,7 @@ where
 
 /// Split a mutation vector into `(initial_cas_batch, overflow_chunks)` where
 /// every returned batch has length `<= limit`.
+#[must_use]
 pub fn split_mutation_batches(
     mut mutations: Vec<Mutation>,
     limit: usize,
@@ -95,15 +95,18 @@ pub fn split_mutation_batches(
 
 /// Current wall-clock time in whole milliseconds since Unix epoch (at least 1).
 #[inline]
+#[must_use]
 pub fn now_millis() -> u64 {
-    (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000).max(1) as u64
+    u64::try_from((time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000).max(1))
+        .unwrap_or(u64::MAX)
 }
 
 /// Current wall-clock time in microseconds aligned to Bigtable's millisecond
 /// cell-timestamp granularity (`TimestampGranularity::MILLIS`).
 #[inline]
+#[must_use]
 pub fn now_millis_micros() -> i64 {
-    (now_millis().saturating_mul(1_000)) as i64
+    i64::try_from(now_millis().saturating_mul(1_000)).unwrap_or(i64::MAX)
 }
 
 /// Compute the next monotonically increasing OCC row version.
@@ -118,6 +121,7 @@ pub fn now_millis_micros() -> i64 {
 ///    dominates all older cell versions across every qualifier, preventing
 ///    torn rows.
 #[inline]
+#[must_use]
 pub fn next_occ_version(prev: Option<u64>) -> u64 {
     let now_ms = now_millis();
     match prev {
@@ -129,8 +133,16 @@ pub fn next_occ_version(prev: Option<u64>) -> u64 {
 /// Convert an OCC version into a millisecond-aligned Bigtable cell timestamp
 /// in microseconds (`version * 1_000`).
 #[inline]
+#[must_use]
+// Justification: `micros` is explicitly clamped to `i64::MAX` before casting inside a `const fn`.
+#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 pub const fn version_to_timestamp_micros(version: u64) -> i64 {
-    (version.saturating_mul(1_000)) as i64
+    let micros = version.saturating_mul(1_000);
+    if micros > i64::MAX as u64 {
+        i64::MAX
+    } else {
+        micros as i64
+    }
 }
 
 /// Smallest millisecond-aligned (`% 1_000 == 0`) timestamp in microseconds
@@ -143,6 +155,7 @@ pub const fn version_to_timestamp_micros(version: u64) -> i64 {
 /// includes `v * 1_000` in `[0, next)` while excluding every strictly newer
 /// OCC version `>= v + 1`.
 #[inline]
+#[must_use]
 pub const fn next_millis_exclusive(ts_micros: i64) -> i64 {
     if ts_micros <= 0 {
         1_000
@@ -151,10 +164,10 @@ pub const fn next_millis_exclusive(ts_micros: i64) -> i64 {
     }
 }
 
-/// Parse a DynamoDB `N` string into a positive Unix epoch second (`>= 1`) for
+/// Parse a `DynamoDB` `N` string into a positive Unix epoch second (`>= 1`) for
 /// TTL indexing and expiration checks (supporting integer, fractional, and
 /// scientific-notation decimal strings). Zero and negative values never expire
-/// in DynamoDB (matching `SqliteEngine` / `PostgresEngine` `BETWEEN 1 AND now`).
+/// in `DynamoDB` (matching `SqliteEngine` / `PostgresEngine` `BETWEEN 1 AND now`).
 #[must_use]
 pub fn parse_ttl_epoch_secs(s: &str) -> Option<i64> {
     let trimmed = s.trim();
@@ -204,6 +217,7 @@ pub struct RowSnapshot {
 }
 
 /// Decodes an OCC row version from cell bytes.
+#[must_use]
 pub fn decode_version(bytes: &[u8]) -> Option<u64> {
     if bytes.len() == 8 {
         let arr: [u8; 8] = bytes.try_into().ok()?;
@@ -439,34 +453,6 @@ pub(crate) fn build_meta_qualifier_exact_match_filter(
     }
 }
 
-fn build_put_cas_chunk_predicate(
-    intent_qual: &[u8],
-    expected_stage: &[u8],
-    expected_version: Option<u64>,
-) -> RowFilter {
-    let stage_match = build_meta_qualifier_exact_match_filter(intent_qual, expected_stage);
-    match expected_version {
-        Some(v) => RowFilter {
-            filter: Some(Filter::Condition(Box::new(Condition {
-                predicate_filter: Some(Box::new(stage_match)),
-                true_filter: Some(Box::new(build_version_match_filter(v))),
-                false_filter: Some(Box::new(RowFilter {
-                    filter: Some(Filter::BlockAllFilter(true)),
-                })),
-            }))),
-        },
-        None => RowFilter {
-            filter: Some(Filter::Condition(Box::new(Condition {
-                predicate_filter: Some(Box::new(ItemOps::missing_version_filter())),
-                true_filter: Some(Box::new(RowFilter {
-                    filter: Some(Filter::BlockAllFilter(true)),
-                })),
-                false_filter: Some(Box::new(stage_match)),
-            }))),
-        },
-    }
-}
-
 pub(crate) fn build_shadow_cas_predicate(
     cur_ver: Option<u64>,
     cur_chunk: Option<&[u8]>,
@@ -560,7 +546,7 @@ pub(crate) fn build_tombstone_reclaim_conflict_filter(expected_version: u64) -> 
     }
 }
 
-fn decode_snapshot_cells(
+pub(crate) fn decode_snapshot_cells(
     cells: Vec<crate::data::client::RowCell>,
 ) -> Result<RowSnapshot, StorageError> {
     let mut item: Item = BTreeMap::new();
@@ -619,6 +605,7 @@ pub struct ItemOps<'a> {
 }
 
 impl<'a> ItemOps<'a> {
+    #[must_use]
     pub fn new(
         client: &'a BigtableClient,
         data_table_short: &str,
@@ -631,6 +618,10 @@ impl<'a> ItemOps<'a> {
     }
 
     /// Check whether ANY physical 2PC intent cell currently holds `row_key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the `ReadRows` RPC fails.
     pub async fn has_any_intent(&self, row_key: &[u8]) -> Result<bool, StorageError> {
         let mut data = self.client.data();
         let req = ReadRowsRequest {
@@ -652,6 +643,10 @@ impl<'a> ItemOps<'a> {
     }
 
     /// Read `(item, occ_version, all_intents)` for a single row by raw key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the `ReadRows` RPC or cell decoding fails.
     pub async fn get_row_snapshot_by_raw_key(
         &self,
         row_key: &[u8],
@@ -687,6 +682,10 @@ impl<'a> ItemOps<'a> {
 
     /// Batch-read `(item, occ_version, all_intents)` across pre-encoded raw keys,
     /// returning snapshots in the exact order of `row_keys`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the `ReadRows` RPC or cell decoding fails.
     pub async fn batch_get_row_snapshots_by_raw_keys(
         &self,
         row_keys: &[Vec<u8>],
@@ -698,7 +697,7 @@ impl<'a> ItemOps<'a> {
         let req = ReadRowsRequest {
             table_name: self.full_table_name.clone(),
             app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
-            rows_limit: row_keys.len() as i64,
+            rows_limit: i64::try_from(row_keys.len()).unwrap_or(i64::MAX),
             rows: Some(RowSet {
                 row_keys: row_keys.to_vec(),
                 row_ranges: vec![],
@@ -731,6 +730,10 @@ impl<'a> ItemOps<'a> {
 
     /// Read the entire row by raw encoded key into an `Item` map along with its
     /// captured OCC row version (`m:v`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if reading or decoding the row fails.
     pub async fn get_by_raw_key_with_version(
         &self,
         row_key: &[u8],
@@ -740,6 +743,10 @@ impl<'a> ItemOps<'a> {
     }
 
     /// Read the entire row into an `Item` map along with its captured OCC row version.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if key encoding, reading, or cell decoding fails.
     pub async fn get_with_version(
         &self,
         key_info: &TableKeyInfo,
@@ -750,6 +757,10 @@ impl<'a> ItemOps<'a> {
     }
 
     /// Read the entire row into an `Item` map. Returns `Ok(None)` if absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if key encoding, reading, or cell decoding fails.
     pub async fn get(
         &self,
         key_info: &TableKeyInfo,
@@ -761,6 +772,10 @@ impl<'a> ItemOps<'a> {
 
     /// Read multiple rows into `Item` maps using pre-encoded raw row keys,
     /// returning results in the exact order of `row_keys`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the `ReadRows` RPC or cell decoding fails.
     pub async fn batch_get_by_raw_keys(
         &self,
         row_keys: &[Vec<u8>],
@@ -772,7 +787,7 @@ impl<'a> ItemOps<'a> {
         let req = ReadRowsRequest {
             table_name: self.full_table_name.clone(),
             app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
-            rows_limit: row_keys.len() as i64,
+            rows_limit: i64::try_from(row_keys.len()).unwrap_or(i64::MAX),
             rows: Some(RowSet {
                 row_keys: row_keys.to_vec(),
                 row_ranges: vec![],
@@ -821,6 +836,10 @@ impl<'a> ItemOps<'a> {
     }
 
     /// Read multiple rows into `Item` maps. Returns items in the same order as `keys`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if key encoding, reading, or cell decoding fails.
     pub async fn batch_get(
         &self,
         key_info: &TableKeyInfo,
@@ -840,6 +859,17 @@ impl<'a> ItemOps<'a> {
     /// `m:v == expected_version` (or row absence when `expected_version == None`),
     /// then replaces family `d` and updates `m:v` at
     /// `version_to_timestamp_micros(next_version)`.
+    ///
+    /// Uses [`crate::data::client::DataHandle::check_and_mutate_row`] (retrying
+    /// only pre-execution rejections) so a lost response after Bigtable applied
+    /// Attempt 0 can never flip `predicate_matched` into a false `OccMismatch`.
+    /// Items exceeding `max_mutations_per_rpc()` must use `BigtableEngine`'s
+    /// coordinator-logged `sgl-*` path rather than direct `put_cas`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if encoding fails, `item` exceeds `rpc_limit`,
+    /// or the `CheckAndMutateRow` RPC fails.
     pub async fn put_cas(
         &self,
         key_info: &TableKeyInfo,
@@ -847,119 +877,36 @@ impl<'a> ItemOps<'a> {
         expected_version: Option<u64>,
         row_existed: bool,
     ) -> Result<CasOutcome, StorageError> {
+        let rpc_limit = max_mutations_per_rpc().max(4);
+        if item.len().saturating_add(3) > rpc_limit {
+            return Err(StorageError::Internal(format!(
+                "ItemOps::put_cas requires coordinator-fenced staging when item mutations ({}) exceed per-RPC limit ({rpc_limit})",
+                item.len().saturating_add(3)
+            )));
+        }
+
         let row_key = row_key::encode_key(item, &key_info.key_schema)?;
         let next_version = next_occ_version(expected_version);
         let ts_micros = version_to_timestamp_micros(next_version);
-        let rpc_limit = max_mutations_per_rpc().max(4);
         let predicate = select_occ_predicate(expected_version, row_existed);
-        let mv_mutations = vec![
-            Mutation {
-                mutation: Some(mutation::Mutation::SetCell(SetCell {
-                    family_name: FAMILY_META.to_string(),
-                    column_qualifier: QUALIFIER_VERSION.to_vec(),
-                    timestamp_micros: ts_micros,
-                    value: next_version.to_string().into_bytes(),
-                })),
-            },
-            Mutation {
-                mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
-                    family_name: FAMILY_META.to_string(),
-                    column_qualifier: QUALIFIER_VERSION.to_vec(),
-                    time_range: older_than_ts_range(ts_micros),
-                })),
-            },
-        ];
 
-        if item.len().saturating_add(3) <= rpc_limit {
-            let mut mutations = Vec::with_capacity(item.len() + 3);
-            mutations.extend(mv_mutations);
-            mutations.extend(self.item_to_mutations_at(item, true, ts_micros)?);
-
-            let mut data = self.client.data();
-            let req = CheckAndMutateRowRequest {
-                table_name: self.full_table_name.clone(),
-                app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
-                row_key: row_key.clone(),
-                predicate_filter: Some(predicate),
-                true_mutations: vec![],
-                false_mutations: mutations,
-                ..CheckAndMutateRowRequest::default()
-            };
-
-            let resp = data
-                .check_and_mutate_row_idempotent(req)
-                .await
-                .map_err(|e| map_bigtable_err("CheckAndMutateRow put", e))?;
-
-            if !resp.predicate_matched {
-                return Ok(CasOutcome::Applied(next_version));
-            }
-            if self.has_any_intent(&row_key).await? {
-                return Ok(CasOutcome::IntentPresent);
-            }
-            return Ok(CasOutcome::OccMismatch);
-        }
-
-        // Multi-chunk `put_cas`: place primary-key attributes first so family `d`
-        // is never headless, stage behind `m:intent:sgl-put-* = "attr:<offset>"`
-        // without advancing `m:v`, fence every overflow chunk via a single-Condition
-        // `CheckAndMutateRow` on `(m:intent:sgl-put-*, m:v)`, and advance `m:v` +
-        // clear the staging intent atomically on the final chunk.
-        let mut attr_cells = Vec::with_capacity(item.len());
-        for ks in &key_info.key_schema {
-            if let Some(val) = item.get(&ks.attribute_name) {
-                attr_cells.push(Mutation {
-                    mutation: Some(mutation::Mutation::SetCell(SetCell {
-                        family_name: FAMILY_DATA.to_string(),
-                        column_qualifier: ks.attribute_name.as_bytes().to_vec(),
-                        timestamp_micros: ts_micros,
-                        value: cell::encode(val)?,
-                    })),
-                });
-            }
-        }
-        for (name, val) in item {
-            if key_info
-                .key_schema
-                .iter()
-                .any(|ks| ks.attribute_name == *name)
-            {
-                continue;
-            }
-            attr_cells.push(Mutation {
-                mutation: Some(mutation::Mutation::SetCell(SetCell {
-                    family_name: FAMILY_DATA.to_string(),
-                    column_qualifier: name.as_bytes().to_vec(),
-                    timestamp_micros: ts_micros,
-                    value: cell::encode(val)?,
-                })),
-            });
-        }
-
-        let take_first = (rpc_limit - 2).min(attr_cells.len());
-        let intent_qual = format!(
-            "intent:{DIRECT_PUT_STAGE_PREFIX}{}",
-            Uuid::new_v4().simple()
-        )
-        .into_bytes();
-        let mut stage_ts = monotonic_timestamp_micros().max(ts_micros);
-        let mut expected_stage = format!("attr:{take_first}").into_bytes();
-
-        let mut first_false_mutations = Vec::with_capacity(take_first + 2);
-        first_false_mutations.push(Mutation {
+        let mut mutations = Vec::with_capacity(item.len() + 3);
+        mutations.push(Mutation {
             mutation: Some(mutation::Mutation::SetCell(SetCell {
                 family_name: FAMILY_META.to_string(),
-                column_qualifier: intent_qual.clone(),
-                timestamp_micros: stage_ts,
-                value: expected_stage.clone(),
+                column_qualifier: QUALIFIER_VERSION.to_vec(),
+                timestamp_micros: ts_micros,
+                value: next_version.to_string().into_bytes(),
             })),
         });
-        first_false_mutations.push(Mutation {
-            mutation: Some(mutation::Mutation::DeleteFromFamily(DeleteFromFamily {
-                family_name: FAMILY_DATA.to_string(),
+        mutations.push(Mutation {
+            mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
+                family_name: FAMILY_META.to_string(),
+                column_qualifier: QUALIFIER_VERSION.to_vec(),
+                time_range: older_than_ts_range(ts_micros),
             })),
         });
-        first_false_mutations.extend_from_slice(&attr_cells[..take_first]);
+        mutations.extend(self.item_to_mutations_at(item, true, ts_micros)?);
 
         let mut data = self.client.data();
         let req = CheckAndMutateRowRequest {
@@ -968,93 +915,29 @@ impl<'a> ItemOps<'a> {
             row_key: row_key.clone(),
             predicate_filter: Some(predicate),
             true_mutations: vec![],
-            false_mutations: first_false_mutations,
+            false_mutations: mutations,
             ..CheckAndMutateRowRequest::default()
         };
+
         let resp = data
-            .check_and_mutate_row_idempotent(req)
+            .check_and_mutate_row(req)
             .await
-            .map_err(|e| map_bigtable_err("CheckAndMutateRow put chunk0", e))?;
-        if resp.predicate_matched {
-            if self.has_any_intent(&row_key).await? {
-                return Ok(CasOutcome::IntentPresent);
-            }
-            return Ok(CasOutcome::OccMismatch);
+            .map_err(|e| map_bigtable_err("CheckAndMutateRow put", e))?;
+
+        if !resp.predicate_matched {
+            return Ok(CasOutcome::Applied(next_version));
         }
-
-        let mut offset = take_first;
-        loop {
-            let chunk_pred =
-                build_put_cas_chunk_predicate(&intent_qual, &expected_stage, expected_version);
-            let remaining = attr_cells.len().saturating_sub(offset);
-            let is_final = remaining.saturating_add(3) <= rpc_limit;
-
-            let mut true_mutations = Vec::new();
-            let next_offset;
-            if is_final {
-                true_mutations.push(Mutation {
-                    mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
-                        family_name: FAMILY_META.to_string(),
-                        column_qualifier: intent_qual.clone(),
-                        time_range: None,
-                    })),
-                });
-                true_mutations.extend(mv_mutations.iter().cloned());
-                true_mutations.extend_from_slice(&attr_cells[offset..]);
-                next_offset = attr_cells.len();
-            } else {
-                let step_cap = rpc_limit.saturating_sub(2).max(1);
-                let take = remaining.min(step_cap);
-                next_offset = offset + take;
-                stage_ts = monotonic_timestamp_after_micros(stage_ts);
-                let next_stage = format!("attr:{next_offset}").into_bytes();
-                true_mutations.push(Mutation {
-                    mutation: Some(mutation::Mutation::SetCell(SetCell {
-                        family_name: FAMILY_META.to_string(),
-                        column_qualifier: intent_qual.clone(),
-                        timestamp_micros: stage_ts,
-                        value: next_stage.clone(),
-                    })),
-                });
-                true_mutations.push(Mutation {
-                    mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
-                        family_name: FAMILY_META.to_string(),
-                        column_qualifier: intent_qual.clone(),
-                        time_range: older_than_ts_range(stage_ts),
-                    })),
-                });
-                true_mutations.extend_from_slice(&attr_cells[offset..next_offset]);
-                expected_stage = next_stage;
-            }
-
-            let mut chunk_data = self.client.data();
-            let chunk_req = CheckAndMutateRowRequest {
-                table_name: self.full_table_name.clone(),
-                app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
-                row_key: row_key.clone(),
-                predicate_filter: Some(chunk_pred),
-                true_mutations,
-                false_mutations: vec![],
-                ..CheckAndMutateRowRequest::default()
-            };
-            let chunk_resp = chunk_data
-                .check_and_mutate_row_idempotent(chunk_req)
-                .await
-                .map_err(|e| map_bigtable_err("CheckAndMutateRow put chunk", e))?;
-            if !chunk_resp.predicate_matched {
-                if self.has_any_intent(&row_key).await? {
-                    return Ok(CasOutcome::IntentPresent);
-                }
-                return Ok(CasOutcome::OccMismatch);
-            }
-            if is_final {
-                return Ok(CasOutcome::Applied(next_version));
-            }
-            offset = next_offset;
+        if self.has_any_intent(&row_key).await? {
+            return Ok(CasOutcome::IntentPresent);
         }
+        Ok(CasOutcome::OccMismatch)
     }
 
     /// Guarded `put` wrapper returning `TransactionConflict` on conflict.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] on conflict, encoding failure, or RPC error.
     pub async fn put(
         &self,
         key_info: &TableKeyInfo,
@@ -1079,6 +962,10 @@ impl<'a> ItemOps<'a> {
     /// OCC-guarded Delete: verifies no `m:intent:*` cell AND `m:v == expected_version`.
     /// Clears family `d` while advancing `m:v` to `next_occ_version(expected_version)`
     /// whenever a row or `m:v` existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if key encoding or the `CheckAndMutateRow` RPC fails.
     pub async fn delete_cas(
         &self,
         key_info: &TableKeyInfo,
@@ -1127,7 +1014,7 @@ impl<'a> ItemOps<'a> {
         };
 
         let resp = data
-            .check_and_mutate_row_idempotent(req)
+            .check_and_mutate_row(req)
             .await
             .map_err(|e| map_bigtable_err("CheckAndMutateRow delete", e))?;
 
@@ -1142,6 +1029,10 @@ impl<'a> ItemOps<'a> {
     }
 
     /// Guarded `delete` wrapper returning `TransactionConflict` on conflict.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] on conflict, key encoding failure, or RPC error.
     pub async fn delete(
         &self,
         key_info: &TableKeyInfo,
@@ -1238,6 +1129,8 @@ impl<'a> ItemOps<'a> {
     /// `CheckAndMutateRow` on `(new_version, "{new_version}:{nonce}:{step}")` so
     /// concurrent higher-version writes or deletes preempt immediately and
     /// stale in-flight chunks are rejected atomically.
+    // Justification: shadow version CAS handles both single-RPC atomic writes and multi-chunk fenced progressions in one state machine.
+    #[allow(clippy::too_many_lines)]
     async fn apply_shadow_version_cas(
         &self,
         op_name: &str,
@@ -1281,7 +1174,7 @@ impl<'a> ItemOps<'a> {
             };
             let mut data = self.client.data();
             let resp = data
-                .check_and_mutate_row_idempotent(req)
+                .check_and_mutate_row(req)
                 .await
                 .map_err(|e| map_bigtable_err(op_name, e))?;
             return Ok(if initial_in_false_branch {
@@ -1342,7 +1235,7 @@ impl<'a> ItemOps<'a> {
             ..CheckAndMutateRowRequest::default()
         };
         let resp0 = data
-            .check_and_mutate_row_idempotent(req0)
+            .check_and_mutate_row(req0)
             .await
             .map_err(|e| map_bigtable_err(op_name, e))?;
         let applied0 = if initial_in_false_branch {
@@ -1408,7 +1301,7 @@ impl<'a> ItemOps<'a> {
                 ..CheckAndMutateRowRequest::default()
             };
             let cresp = cdata
-                .check_and_mutate_row_idempotent(creq)
+                .check_and_mutate_row(creq)
                 .await
                 .map_err(|e| map_bigtable_err(op_name, e))?;
             if !cresp.predicate_matched {
@@ -1494,6 +1387,11 @@ impl<'a> ItemOps<'a> {
     /// `SetCell` before bounded `DeleteFromColumn` so concurrent index `Query`/`Scan`
     /// readers never observe a transiently empty shadow row on `cbtemulator`.
     /// Rejects (`Ok(false)`) any delayed write whose `new_version < cur_ver`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if cell encoding fails or CAS contention /
+    /// transient RPC errors exceed bounded retries.
     pub async fn put_shadow_versioned(
         &self,
         shadow_row_key: &[u8],
@@ -1501,6 +1399,7 @@ impl<'a> ItemOps<'a> {
         new_version: u64,
     ) -> Result<bool, StorageError> {
         let base_ts_micros = version_to_timestamp_micros(new_version);
+        let mut transient_retries = 0usize;
         for _ in 0..32 {
             let (existing_quals, max_d_ts, cur_ver, cur_chunk, max_chunk_ts) =
                 self.read_shadow_row_meta(shadow_row_key).await?;
@@ -1525,7 +1424,7 @@ impl<'a> ItemOps<'a> {
                 new_version,
             )?;
 
-            if self
+            match self
                 .apply_shadow_version_cas(
                     "CheckAndMutateRow put_shadow_versioned",
                     shadow_row_key,
@@ -1533,9 +1432,18 @@ impl<'a> ItemOps<'a> {
                     (new_version, ts_micros),
                     mutations,
                 )
-                .await?
+                .await
             {
-                return Ok(true);
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(StorageError::Transient(_) | StorageError::Connection(_))
+                    if transient_retries < 5 =>
+                {
+                    let backoff_ms = 5u64 << transient_retries;
+                    transient_retries += 1;
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                }
+                Err(e) => return Err(e),
             }
         }
         Err(StorageError::Transient(
@@ -1550,12 +1458,18 @@ impl<'a> ItemOps<'a> {
     /// `[0, next_millis_exclusive(...))` under a `CheckAndMutateRow` guard on
     /// `(cur_ver, cur_chunk)`, rejecting (`Ok(false)`) any delayed delete whose
     /// `new_version < cur_ver`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if CAS contention or transient RPC errors
+    /// exceed bounded retries.
     pub async fn delete_shadow_versioned(
         &self,
         shadow_row_key: &[u8],
         new_version: u64,
     ) -> Result<bool, StorageError> {
         let ts_micros = version_to_timestamp_micros(new_version);
+        let mut transient_retries = 0usize;
         for _ in 0..32 {
             let (existing_quals, max_d_ts, cur_ver, cur_chunk, max_chunk_ts) =
                 self.read_shadow_row_meta(shadow_row_key).await?;
@@ -1599,7 +1513,7 @@ impl<'a> ItemOps<'a> {
                 });
             }
 
-            if self
+            match self
                 .apply_shadow_version_cas(
                     "CheckAndMutateRow delete_shadow_versioned",
                     shadow_row_key,
@@ -1607,9 +1521,18 @@ impl<'a> ItemOps<'a> {
                     (new_version, ts_micros),
                     mutations,
                 )
-                .await?
+                .await
             {
-                return Ok(true);
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(StorageError::Transient(_) | StorageError::Connection(_))
+                    if transient_retries < 5 =>
+                {
+                    let backoff_ms = 5u64 << transient_retries;
+                    transient_retries += 1;
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                }
+                Err(e) => return Err(e),
             }
         }
         Err(StorageError::Transient(
@@ -1619,15 +1542,21 @@ impl<'a> ItemOps<'a> {
 
     /// Reconciler-safe cleanup of an orphaned shadow row: clears observed `d:*`
     /// qualifiers via millisecond-aligned bounded `DeleteFromColumn` only if the
-    /// shadow row's `(m:v, m:chunk)` state has not changed since inspection.
+    /// shadow row's `(m:v, m:chunk)` state has not changed since inspection,
+    /// returning `Ok(Some(next_ver))` when applied so the caller can enqueue a
+    /// `b"tomb:"` tombstone GC entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if reading or mutating the shadow row fails.
     pub async fn delete_shadow_orphan_if_unchanged(
         &self,
         shadow_row_key: &[u8],
-    ) -> Result<bool, StorageError> {
+    ) -> Result<Option<u64>, StorageError> {
         let (existing_quals, max_d_ts, cur_ver, cur_chunk, max_chunk_ts) =
             self.read_shadow_row_meta(shadow_row_key).await?;
         if existing_quals.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
         let next_ver = next_occ_version(cur_ver);
         let ts_micros = version_to_timestamp_micros(next_ver);
@@ -1659,14 +1588,16 @@ impl<'a> ItemOps<'a> {
             });
         }
 
-        self.apply_shadow_version_cas(
-            "CheckAndMutateRow delete_shadow_orphan",
-            shadow_row_key,
-            (cur_ver, cur_chunk.as_deref(), max_chunk_ts),
-            (next_ver, ts_micros),
-            mutations,
-        )
-        .await
+        let applied = self
+            .apply_shadow_version_cas(
+                "CheckAndMutateRow delete_shadow_orphan",
+                shadow_row_key,
+                (cur_ver, cur_chunk.as_deref(), max_chunk_ts),
+                (next_ver, ts_micros),
+                mutations,
+            )
+            .await?;
+        Ok(applied.then_some(next_ver))
     }
 
     /// Atomically reclaim a version-only tombstone row (base table or shadow
@@ -1676,6 +1607,10 @@ impl<'a> ItemOps<'a> {
     /// Executes `DeleteFromRow` in `false_mutations` iff `now_millis() > expected_version`
     /// AND the row simultaneously has NO `m:intent:*` cells, NO `m:chunk` cells,
     /// NO `d:*` data cells, AND `m:v == expected_version`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the `CheckAndMutateRow` RPC fails.
     pub async fn reclaim_version_only_row(
         &self,
         row_key_bytes: &[u8],
@@ -1705,6 +1640,10 @@ impl<'a> ItemOps<'a> {
 
     /// Apply a list of mutations to a row by raw encoded key, splitting batches
     /// larger than `MAX_MUTATIONS_PER_RPC` across multiple `MutateRow` calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if any `MutateRow` chunk fails.
     pub async fn mutate_cells(
         &self,
         row_key_bytes: Vec<u8>,
@@ -1730,16 +1669,21 @@ impl<'a> ItemOps<'a> {
         Ok(())
     }
 
-    /// Turn an `Item` map into BigTable `Mutation`s where every `SetCell` uses
+    /// Turn an `Item` map into Bigtable `Mutation`s where every `SetCell` uses
     /// the deterministic `timestamp_micros` derived from the row's OCC version.
     ///
     /// `timestamp_micros` MUST be divisible by `1_000` (`TimestampGranularity::MILLIS`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if encoding any attribute value fails.
     pub fn item_to_mutations_at(
         &self,
         item: &Item,
         delete_row_first: bool,
         timestamp_micros: i64,
     ) -> Result<Vec<Mutation>, StorageError> {
+        let _ = self;
         debug_assert!(
             timestamp_micros > 0 && timestamp_micros % 1_000 == 0,
             "Bigtable cell timestamp must be positive and millisecond-aligned, got {timestamp_micros}"
@@ -1767,6 +1711,11 @@ impl<'a> ItemOps<'a> {
 }
 
 /// Apply `UpdateAction`s with full vector-index and attribute-definition validation.
+///
+/// # Errors
+///
+/// Returns [`StorageError::Validation`] if an update expression violates key or
+/// vector-index constraints.
 pub fn apply_update_actions_validated(
     existing: &Item,
     actions: &[UpdateAction],
@@ -1788,6 +1737,11 @@ pub fn apply_update_actions_validated(
 
 /// Evaluate a `ConditionExpression` against the existing item. Returns `Ok(())`
 /// if the condition holds (or is `None`); `ConditionFailed` if it doesn't.
+///
+/// # Errors
+///
+/// Returns [`StorageError::ConditionFailed`] when `condition` evaluates to
+/// `false`, or [`StorageError::Validation`] on invalid expression operands.
 pub fn check_condition(
     existing: Option<&Item>,
     condition: Option<&Expr>,
@@ -1971,10 +1925,6 @@ mod tests {
             assert_no_nested_condition(&pred, false);
         }
         assert_no_nested_condition(&build_tombstone_reclaim_conflict_filter(99), false);
-        for ev in [Some(10), None] {
-            let cpred = build_put_cas_chunk_predicate(b"intent:sgl-put-1", b"attr:4", ev);
-            assert_no_nested_condition(&cpred, false);
-        }
         for (cv, cc, expected_false_branch) in [
             (None, None, true),
             (Some(7), None, false),

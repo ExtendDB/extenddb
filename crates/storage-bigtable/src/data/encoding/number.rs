@@ -1,29 +1,31 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Lex-preserving encoding for DDB `N` attribute values used as row-key parts.
+//! Lex-preserving encoding for `DynamoDB` `N` attribute values used as row-key parts.
 //!
-//! DDB `N` is an arbitrary-precision decimal (up to 38 significant digits;
+//! `DynamoDB` `N` is an arbitrary-precision decimal (up to 38 significant digits;
 //! magnitude in `[1e-130, 1e+126)` or zero, with either sign). To use it as a
-//! row-key in BigTable's lex-sorted row-key space, the encoded bytes must
+//! row key in Bigtable's lex-sorted row-key space, the encoded bytes must
 //! compare byte-wise the same way the underlying numbers compare arithmetically.
 //!
 //! ## Format
 //!
 //! ```text
 //!   value = 0   → 0x80                          (1 byte)
-//!   value > 0   → 0xFF | exp_biased | digits[38]   (41 bytes)
-//!   value < 0   → 0x00 | ~exp_biased | ~digits[38] (41 bytes)
+//!   value > 0   → 0xFF | exp_biased | digits[38]   (40 bytes)
+//!   value < 0   → 0x00 | ~exp_biased | ~digits[38] (40 bytes)
 //! ```
 //!
 //! - `exp_biased = scientific_exponent + 130` (range `[0, 255]`, fits in 1 byte).
 //! - Mantissa digits stored as one byte per decimal digit, normalized to remove
 //!   leading and trailing zeros so identical values share the same encoding.
 //!   Padded to 38 bytes with `0x00` (positive) so shorter mantissas compare
-//!   less. Negatives invert byte-wise (`9 - digit`) and pad with `0xFF` so
+//!   less. Negatives invert byte-wise (`9 - digit`) and pad with `0x09` so
 //!   shorter negative mantissas compare greater (closer to zero).
 //! - The single-byte `0x80` for zero sits between the negative band (leading
 //!   `0x00`) and the positive band (leading `0xFF`).
+
+use std::fmt::Write as _;
 
 use extenddb_storage::error::StorageError;
 
@@ -34,6 +36,12 @@ const SIGN_NEG: u8 = 0x00;
 const SIGN_ZERO: u8 = 0x80;
 const SIGN_POS: u8 = 0xFF;
 
+/// Encode a `DynamoDB` `N` string into order-preserving bytes (`1` or `40` bytes).
+///
+/// # Errors
+///
+/// Returns [`StorageError::Validation`] if `s` is empty, malformed, exceeds 38
+/// significant digits, or falls outside scientific exponent bounds `[-130, 125]`.
 pub fn encode(s: &str) -> Result<Vec<u8>, StorageError> {
     let s = s.trim();
     if s.is_empty() {
@@ -76,7 +84,11 @@ pub fn encode(s: &str) -> Result<Vec<u8>, StorageError> {
     let mut digits = String::with_capacity(int_part.len() + frac_part.len());
     digits.push_str(int_part);
     digits.push_str(frac_part);
-    let raw_exp = exp_suffix - (frac_part.len() as i32);
+    let frac_len = i32::try_from(frac_part.len())
+        .map_err(|_| StorageError::Validation(format!("N fractional part too long: {s}")))?;
+    let raw_exp = exp_suffix
+        .checked_sub(frac_len)
+        .ok_or_else(|| StorageError::Validation(format!("N exponent overflow: {s}")))?;
 
     let leading_zeros = digits.bytes().take_while(|&b| b == b'0').count();
     let digits = &digits[leading_zeros..];
@@ -84,7 +96,11 @@ pub fn encode(s: &str) -> Result<Vec<u8>, StorageError> {
         return Ok(vec![SIGN_ZERO]);
     }
     let trailing_zeros = digits.bytes().rev().take_while(|&b| b == b'0').count();
-    let raw_exp = raw_exp + (trailing_zeros as i32);
+    let trailing_zeros_i32 = i32::try_from(trailing_zeros)
+        .map_err(|_| StorageError::Validation(format!("N mantissa too long: {s}")))?;
+    let raw_exp = raw_exp
+        .checked_add(trailing_zeros_i32)
+        .ok_or_else(|| StorageError::Validation(format!("N exponent overflow: {s}")))?;
     let digits = &digits[..digits.len() - trailing_zeros];
 
     if digits.len() > MANTISSA_DIGITS {
@@ -93,13 +109,18 @@ pub fn encode(s: &str) -> Result<Vec<u8>, StorageError> {
         )));
     }
 
-    let sci_exp = raw_exp + (digits.len() as i32) - 1;
+    let digits_len_i32 = i32::try_from(digits.len())
+        .map_err(|_| StorageError::Internal("mantissa length fits in i32".into()))?;
+    let sci_exp = raw_exp
+        .checked_add(digits_len_i32 - 1)
+        .ok_or_else(|| StorageError::Validation(format!("N exponent overflow: {s}")))?;
     if !(-EXP_BIAS..=125).contains(&sci_exp) {
         return Err(StorageError::Validation(format!(
             "N scientific exponent out of DDB range [-130, 125]: {s} (sci_exp={sci_exp})"
         )));
     }
-    let biased_exp = (sci_exp + EXP_BIAS) as u8;
+    let biased_exp = u8::try_from(sci_exp + EXP_BIAS)
+        .map_err(|_| StorageError::Internal("biased exponent fits in u8".into()))?;
 
     let mut out = Vec::with_capacity(1 + 1 + MANTISSA_DIGITS);
     if sign > 0 {
@@ -120,6 +141,11 @@ pub fn encode(s: &str) -> Result<Vec<u8>, StorageError> {
     Ok(out)
 }
 
+/// Decode order-preserving `N` bytes back into a canonical decimal string.
+///
+/// # Errors
+///
+/// Returns [`StorageError::Internal`] if `bytes` is empty or malformed.
 pub fn decode(bytes: &[u8]) -> Result<String, StorageError> {
     if bytes.is_empty() {
         return Err(StorageError::Internal("empty number bytes".into()));
@@ -137,14 +163,14 @@ pub fn decode(bytes: &[u8]) -> Result<String, StorageError> {
     let biased_exp = bytes[1];
 
     let (is_pos, exp, raw_digits) = if sign == SIGN_POS {
-        let exp = (biased_exp as i32) - EXP_BIAS;
+        let exp = i32::from(biased_exp) - EXP_BIAS;
         let mut digs = Vec::with_capacity(MANTISSA_DIGITS);
         for &b in &bytes[2..] {
             digs.push(b + b'0');
         }
         (true, exp, digs)
     } else if sign == SIGN_NEG {
-        let exp = ((0xFF - biased_exp) as i32) - EXP_BIAS;
+        let exp = i32::from(0xFF - biased_exp) - EXP_BIAS;
         let mut digs = Vec::with_capacity(MANTISSA_DIGITS);
         for &b in &bytes[2..] {
             let digit = 9_u8.saturating_sub(b);
@@ -170,11 +196,13 @@ pub fn decode(bytes: &[u8]) -> Result<String, StorageError> {
     }
     let sig_digits_str = std::str::from_utf8(sig_digits)
         .map_err(|e| StorageError::Internal(format!("invalid UTF-8 in numeric digits: {e}")))?;
-    let final_exp = exp - (sig_len as i32) + 1;
+    let sig_len_i32 = i32::try_from(sig_len)
+        .map_err(|_| StorageError::Internal("mantissa length fits in i32".into()))?;
+    let final_exp = exp - sig_len_i32 + 1;
     if final_exp == 0 {
         out_str.push_str(sig_digits_str);
     } else {
-        out_str.push_str(&format!("{sig_digits_str}e{final_exp}"));
+        let _ = write!(out_str, "{sig_digits_str}e{final_exp}");
     }
     Ok(out_str)
 }

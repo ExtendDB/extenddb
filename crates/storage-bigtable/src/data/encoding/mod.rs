@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Encoders/decoders mapping DDB attribute values + composite keys to
-//! BigTable bytes.
+//! Bigtable bytes.
 
 pub mod cell;
 pub mod number;

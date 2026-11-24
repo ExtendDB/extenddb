@@ -9,7 +9,7 @@
 //! PK-only:    [pk_tag:1] [pk_len:u32BE] [pk_bytes]
 //! ```
 //! - `pk_tag` / `sk_tag`: `0x53`=S, `0x4E`=N, `0x42`=B
-//! - PK length-prefix groups rows with the same PK contiguously in BigTable's
+//! - PK length-prefix groups rows with the same PK contiguously in Bigtable's
 //!   lex-sorted row-key space; SK bytes preserve DDB's intra-partition sort
 //!   order.
 //! - For S/B the SK bytes are raw. For N the SK bytes are the
@@ -111,10 +111,21 @@ fn encoded_key_bytes(av: &AttributeValue) -> Result<Vec<u8>, StorageError> {
 
 /// `(tag, bytes)` pair for an SK value — used by query/scan to construct range
 /// bounds without re-deriving the encoding rules.
+///
+/// # Errors
+///
+/// Returns [`StorageError::Validation`] if `av` is not a scalar `S`, `N`, or `B` key value.
 pub fn sk_tag_and_bytes(av: &AttributeValue) -> Result<(u8, Vec<u8>), StorageError> {
     Ok((tag_for(av)?, encoded_key_bytes(av)?))
 }
 
+/// Encode a base-table item's primary key (`HASH` + optional `RANGE`) into its
+/// Bigtable row key, enforcing Bigtable's 4,096-byte row-key ceiling.
+///
+/// # Errors
+///
+/// Returns [`StorageError::Validation`] if required key attributes are missing,
+/// have non-scalar types, or exceed `MAX_ROW_KEY_SIZE`.
 pub fn encode_key(
     item: &extenddb_core::types::Item,
     key_schema: &[KeySchemaElement],
@@ -134,10 +145,12 @@ pub fn encode_key(
         .ok_or_else(|| StorageError::Validation(format!("missing key attr {pk_name}")))?;
     let pk_tag = tag_for(pk)?;
     let pk_bytes = encoded_key_bytes(pk)?;
+    let pk_len = u32::try_from(pk_bytes.len())
+        .map_err(|_| StorageError::Validation("partition key exceeds u32 length".into()))?;
 
     let mut out = Vec::with_capacity(1 + 4 + pk_bytes.len() + 1 + 64);
     out.push(pk_tag);
-    out.extend_from_slice(&(pk_bytes.len() as u32).to_be_bytes());
+    out.extend_from_slice(&pk_len.to_be_bytes());
     out.extend_from_slice(&pk_bytes);
 
     if let Some(sk_name) = sk_name {
@@ -159,11 +172,17 @@ pub fn encode_key(
 }
 
 /// Lower bound for a Query against a single partition.
+///
+/// # Errors
+///
+/// Returns [`StorageError::Validation`] if `pk` is not a valid scalar key attribute.
 pub fn pk_range_start(pk: &AttributeValue) -> Result<Vec<u8>, StorageError> {
     let pk_bytes = encoded_key_bytes(pk)?;
+    let pk_len = u32::try_from(pk_bytes.len())
+        .map_err(|_| StorageError::Validation("partition key exceeds u32 length".into()))?;
     let mut out = Vec::with_capacity(1 + 4 + pk_bytes.len());
     out.push(tag_for(pk)?);
-    out.extend_from_slice(&(pk_bytes.len() as u32).to_be_bytes());
+    out.extend_from_slice(&pk_len.to_be_bytes());
     out.extend_from_slice(&pk_bytes);
     Ok(out)
 }
@@ -173,12 +192,21 @@ pub fn pk_range_start(pk: &AttributeValue) -> Result<Vec<u8>, StorageError> {
 /// Because byte `0` of `pk_range_start` is always a type tag (`0x42`/`0x4E`/`0x53`
 /// `< 0xFF`), `binary_prefix_upper_bound` always succeeds and never exceeds
 /// `pk_range_start(pk).len()`.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] if `pk` cannot be encoded as a partition key.
 pub fn pk_range_end_exclusive(pk: &AttributeValue) -> Result<Vec<u8>, StorageError> {
     let start = pk_range_start(pk)?;
     binary_prefix_upper_bound(&start)
         .ok_or_else(|| StorageError::Internal("all-0xFF PK prefix".into()))
 }
 
+/// Decode a base-table Bigtable row key back into its key attributes.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] if `key` is truncated or `key_schema` lacks a `HASH` key.
 pub fn decode_key(
     key: &[u8],
     key_schema: &[KeySchemaElement],

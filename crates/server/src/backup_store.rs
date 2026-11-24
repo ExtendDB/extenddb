@@ -806,6 +806,15 @@ pub fn banner_line_for_backend(
         EffectiveStore::Unconfigured(Unconfigured::Disabled) => {
             "backup store: disabled; CreateBackup writes in-catalog backups".to_owned()
         }
+        EffectiveStore::Configured { config, defaulted } if unsupported => format!(
+            "backup store: {}{}{spool}; CreateBackup is not supported by this storage backend",
+            banner_target(&config),
+            if defaulted {
+                " (the default beside the database file)"
+            } else {
+                ""
+            }
+        ),
         EffectiveStore::Configured { config, defaulted } => format!(
             "backup store: {}{}{spool}",
             banner_target(&config),
@@ -2119,6 +2128,23 @@ mod tests {
         assert_eq!(
             banner_line_for_backend(&disabled, None, "bigtable"),
             "backup store: disabled; CreateBackup is not supported by this storage backend"
+        );
+        let missing = format!("/nonexistent-{}/backups", uuid::Uuid::new_v4().simple());
+        let configured_fs = BackupConfig {
+            store: Some(extenddb_backup_store::BackupStoreConfig {
+                kind: BackupStoreKind::Filesystem,
+                filesystem: Some(extenddb_backup_store::FilesystemStoreConfig {
+                    path: std::path::PathBuf::from(&missing),
+                }),
+                s3: None,
+            }),
+            ..BackupConfig::default()
+        };
+        assert_eq!(
+            banner_line_for_backend(&configured_fs, None, "bigtable"),
+            format!(
+                "backup store: filesystem {missing}; CreateBackup is not supported by this storage backend"
+            )
         );
     }
 }

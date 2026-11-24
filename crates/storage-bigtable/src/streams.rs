@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! DynamoDB Streams support for the Cloud Bigtable backend.
+//! `DynamoDB` Streams support for the Cloud Bigtable backend.
 //!
 //! Stream shard lineage, deduplication markers, and records live in `__extenddb_catalog__`:
 //! - `stream_shard:<shard_id>` — one `ShardMeta` row per labelled stream shard
@@ -104,8 +104,7 @@ pub fn shard_label_millis_and_index(shard_id: &str) -> (u64, u8) {
         let idx = suffix[14..16].parse::<u8>().unwrap_or(0);
         return (label_ms.max(1), idx);
     }
-    #[allow(clippy::cast_possible_truncation)]
-    let fallback_idx = (crc32fast::hash(shard_id.as_bytes()) % 100) as u8;
+    let fallback_idx = u8::try_from(crc32fast::hash(shard_id.as_bytes()) % 100).unwrap_or(0);
     (1_000_000_000_000, fallback_idx)
 }
 
@@ -240,9 +239,10 @@ pub fn build_record(
     };
     let size_bytes = i64::try_from(item_size_bytes(representative)).unwrap_or(i64::MAX);
     let creation_ts = time::OffsetDateTime::now_utc().unix_timestamp();
-    let region = capture
-        .map(|c| c.region.as_ref().to_owned())
-        .unwrap_or_else(|| default_region.to_owned());
+    let region = capture.map_or_else(
+        || default_region.to_owned(),
+        |c| c.region.as_ref().to_owned(),
+    );
     let user_identity = capture.and_then(|c| c.user_identity.clone());
 
     Some(StreamRecord {
@@ -265,6 +265,10 @@ pub fn build_record(
 }
 
 /// Persist a shard metadata row into `__extenddb_catalog__`.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] if JSON serialization or the catalog write fails.
 pub async fn put_shard(cat: &Catalog<'_>, shard: &ShardMeta) -> Result<(), StorageError> {
     let body = serde_json::to_value(shard)
         .map_err(|e| StorageError::Internal(format!("encode shard meta: {e}")))?;
@@ -272,6 +276,10 @@ pub async fn put_shard(cat: &Catalog<'_>, shard: &ShardMeta) -> Result<(), Stora
 }
 
 /// Insert a shard metadata row only if it does not already exist.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] if JSON serialization or the catalog CAS fails.
 pub async fn put_shard_if_absent(
     cat: &Catalog<'_>,
     shard: &ShardMeta,
@@ -283,6 +291,10 @@ pub async fn put_shard_if_absent(
 }
 
 /// Load all shard metadata rows belonging to `table_id`.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] if the catalog prefix scan fails.
 pub async fn load_table_shards(
     cat: &Catalog<'_>,
     table_id: &str,
@@ -390,6 +402,10 @@ async fn advance_shard_cursor_if_open(
 
 /// Ensure `ShardMeta.next_seq_num` is strictly past a `stream_record:<shard_id>:<seq>`
 /// row BEFORE 24-hour retention pruning deletes the record.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] if advancing the shard cursor fails.
 pub async fn ensure_shard_past_record(
     cat: &Catalog<'_>,
     record_row_key: &str,
@@ -409,6 +425,10 @@ pub async fn ensure_shard_past_record(
 /// Close each open shard in `shard_ids` atomically via `Catalog::mutate_json_cas`,
 /// serializing against in-process writers via `shard_local_mutex` and preserving
 /// concurrent `next_seq_num` / `last_sequence_number` advances.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] if reading the shard tail or persisting the closed `ShardMeta` fails.
 pub async fn close_shards_by_id(
     cat: &Catalog<'_>,
     shard_ids: &[String],
@@ -440,8 +460,7 @@ pub async fn close_shards_by_id(
             .into_iter()
             .flatten()
             .max()
-            .map(str::to_owned)
-            .unwrap_or_else(|| meta.starting_sequence_number.clone());
+            .map_or_else(|| meta.starting_sequence_number.clone(), str::to_owned);
             meta.ending_sequence_number = Some(end_seq);
             let encoded = serde_json::to_value(&meta)
                 .map_err(|e| StorageError::Internal(format!("encode shard meta: {e}")))?;
@@ -483,6 +502,12 @@ async fn persist_dedup_marker(cat: &Catalog<'_>, rk: &str, seq: &str, created_at
 /// - Returns `Ok(None)` without writing when `ShardMeta.ending_sequence_number`
 ///   is already set, so a closed shard never receives records past its ending
 ///   sequence number.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] if catalog reads/CAS writes fail or contention exceeds the retry cap.
+// Justification: dedup check, contiguous slot claiming, post-close sealing check, and cursor CAS advance form one atomic append loop.
+#[allow(clippy::too_many_lines)]
 pub async fn write_record_ordered(
     cat: &Catalog<'_>,
     shard_id: &str,
@@ -651,6 +676,10 @@ pub async fn write_record_ordered(
 }
 
 /// Append a stream record idempotently via contiguous shard slot assignment.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] if writing the ordered stream record fails.
 pub async fn write_record(
     cat: &Catalog<'_>,
     shard_id: &str,
@@ -664,6 +693,10 @@ pub async fn write_record(
 /// Return the highest 26-digit sequence number recorded in `shard_id`, or `None`,
 /// using `ShardMeta` plus bounded tail-slot point reads rather than scanning
 /// the shard's 24-hour record history.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] if reading or decoding `ShardMeta` or tail records fails.
 pub async fn latest_sequence_for_shard(
     cat: &Catalog<'_>,
     shard_id: &str,

@@ -153,12 +153,20 @@ def table(env):
     )
     wait_for_active(admin, name)
     desc = admin.describe_table(TableName=name)["Table"]
-    backup_arn = admin.create_backup(TableName=name, BackupName="xbk")["BackupDetails"]["BackupArn"]
+    try:
+        backup_arn = admin.create_backup(TableName=name, BackupName="xbk")["BackupDetails"]["BackupArn"]
+        backup_id = backup_arn.split("/backup/", 1)[1]
+    except ClientError as exc:
+        err = exc.response["Error"]
+        if err.get("Code") == "ValidationException" and "CreateBackup is not supported" in err.get("Message", ""):
+            backup_id = "01700000000000-aaaaaaaa"
+        else:
+            raise
     return {
         "name": name,
         "table_arn": desc["TableArn"],
         "stream_label": desc["LatestStreamArn"].split("/stream/", 1)[1],
-        "backup_id": backup_arn.split("/backup/", 1)[1],
+        "backup_id": backup_id,
     }
 
 

@@ -13,15 +13,17 @@ use extenddb_core::types::{
     AttributeValue, Item, KeySchemaElement, KeyType, ScalarAttributeType, TableKeyInfo,
 };
 use extenddb_storage::error::StorageError;
-use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::row_filter::{Chain, Filter};
+use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::row_filter::{
+    Chain, Filter, Interleave,
+};
 use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::row_range::{EndKey, StartKey};
 use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::{
     ReadRowsRequest, RowFilter, RowRange, RowSet,
 };
 
 use crate::data::client::{BigtableClient, is_reverse_scan_unsupported_err, map_bigtable_err};
-use crate::data::encoding::{cell, row_key};
-use crate::data::item_ops::FAMILY_DATA;
+use crate::data::encoding::row_key;
+use crate::data::item_ops::{FAMILY_DATA, FAMILY_META, ItemOps, decode_snapshot_cells};
 
 /// Extract the `[pk_tag:1][pk_len:4][pk_bytes]` slice from an encoded row key
 /// (base-table `[S/N/B][len][bytes]` or shadow-table `[TAG_PK_DIGEST][32][sha256]`).
@@ -48,6 +50,10 @@ fn pk_prefix_slice(encoded_row_key: &[u8]) -> Result<&[u8], StorageError> {
 /// Compute the parallel-scan segment `[0, total_segments)` for an encoded row key
 /// (base table or GSI/LSI shadow table) by hashing its partition-key prefix
 /// with CRC32.
+///
+/// # Errors
+///
+/// Returns [`StorageError::Internal`] if `encoded_row_key` has a malformed PK header.
 pub fn pk_segment_from_encoded_key(
     encoded_row_key: &[u8],
     total_segments: u64,
@@ -63,6 +69,10 @@ pub fn pk_segment_from_encoded_key(
 /// Compute whether `key` belongs to `segment` of `total_segments` for
 /// `key_schema` on a base table (`is_index == false`) or shadow index table
 /// (`is_index == true`).
+///
+/// # Errors
+///
+/// Returns [`StorageError`] if `key_schema` has no `HASH` key or key encoding fails.
 pub fn key_belongs_to_segment(
     key: &Item,
     key_schema: &[KeySchemaElement],
@@ -93,15 +103,46 @@ pub fn key_belongs_to_segment(
     Ok(pk_segment_from_encoded_key(&pk_prefix, total)? == seg)
 }
 
-fn data_family_latest_filter() -> RowFilter {
+/// Row filter for `Query` and `Scan`: emits the latest cell per attribute in
+/// family `d` PLUS any active `m:intent:*` or `m:chunk` staging marker in
+/// family `m`, while still filtering out pure `m:v`-only tombstones server-side
+/// so deleted rows never consume `rows_limit`.
+fn query_scan_row_filter() -> RowFilter {
     RowFilter {
-        filter: Some(Filter::Chain(Chain {
+        filter: Some(Filter::Interleave(Interleave {
             filters: vec![
                 RowFilter {
-                    filter: Some(Filter::FamilyNameRegexFilter(format!("^{FAMILY_DATA}$"))),
+                    filter: Some(Filter::Chain(Chain {
+                        filters: vec![
+                            RowFilter {
+                                filter: Some(Filter::FamilyNameRegexFilter(format!(
+                                    "^{FAMILY_DATA}$"
+                                ))),
+                            },
+                            RowFilter {
+                                filter: Some(Filter::CellsPerColumnLimitFilter(1)),
+                            },
+                        ],
+                    })),
                 },
                 RowFilter {
-                    filter: Some(Filter::CellsPerColumnLimitFilter(1)),
+                    filter: Some(Filter::Chain(Chain {
+                        filters: vec![
+                            RowFilter {
+                                filter: Some(Filter::FamilyNameRegexFilter(format!(
+                                    "^{FAMILY_META}$"
+                                ))),
+                            },
+                            RowFilter {
+                                filter: Some(Filter::ColumnQualifierRegexFilter(
+                                    b"^(intent:.*|chunk)$".to_vec(),
+                                )),
+                            },
+                            RowFilter {
+                                filter: Some(Filter::CellsPerColumnLimitFilter(1)),
+                            },
+                        ],
+                    })),
                 },
             ],
         })),
@@ -333,18 +374,15 @@ pub(crate) fn build_base_range_for_query(
             let mut bw_start = pk_prefix.clone();
             bw_start.push(tag);
             bw_start.extend_from_slice(bytes);
-            let bw_upper = match row_key::binary_prefix_upper_bound(bytes) {
-                Some(u) => {
-                    let mut end = pk_prefix.clone();
-                    end.push(tag);
-                    end.extend_from_slice(&u);
-                    end
-                }
-                None => {
-                    let mut end = pk_prefix.clone();
-                    end.push(tag + 1);
-                    end
-                }
+            let bw_upper = if let Some(u) = row_key::binary_prefix_upper_bound(bytes) {
+                let mut end = pk_prefix.clone();
+                end.push(tag);
+                end.extend_from_slice(&u);
+                end
+            } else {
+                let mut end = pk_prefix.clone();
+                end.push(tag + 1);
+                end
             };
             (bw_start, bw_upper, true)
         }
@@ -396,11 +434,18 @@ type EncodedHashAttr = (String, (u8, Vec<u8>));
 
 /// Build `(pk_prefix, start, end, end_open)` over an index shadow table (`GSI`
 /// or `LSI`) supporting `1..=4` HASH and `0..=4` RANGE key attributes.
+// Justification: composite HASH/RANGE validation, contiguous prefix slot assembly, and terminal SK operator bounds run in one pass.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn build_gsi_range_for_query(
     index_key_schema: &[KeySchemaElement],
     kc: &KeyCondition,
     maps: &ExpressionMaps,
 ) -> Result<(QueryRangeBounds, Vec<EncodedHashAttr>), StorageError> {
+    enum RangeClause<'b> {
+        Eq(&'b Expr),
+        Cond(&'b SortKeyCondition),
+    }
+
     let hash_attrs: Vec<&str> = index_key_schema
         .iter()
         .filter(|k| k.key_type == KeyType::Hash)
@@ -447,11 +492,6 @@ pub(crate) fn build_gsi_range_for_query(
         return Err(StorageError::Validation(
             "sort key condition provided on HASH-only index".into(),
         ));
-    }
-
-    enum RangeClause<'b> {
-        Eq(&'b Expr),
-        Cond(&'b SortKeyCondition),
     }
 
     let mut slots: Vec<Option<RangeClause<'_>>> = (0..range_attrs.len()).map(|_| None).collect();
@@ -505,7 +545,7 @@ pub(crate) fn build_gsi_range_for_query(
                 value,
                 ..
             }) => value,
-            _ => {
+            RangeClause::Cond(_) => {
                 return Err(StorageError::Validation(
                     "non-terminal index RANGE key condition must be equality".into(),
                 ));
@@ -582,18 +622,15 @@ pub(crate) fn build_gsi_range_for_query(
             let mut bw_start = prefix.clone();
             bw_start.push(tag);
             bw_start.extend_from_slice(&crate::gsi::escape_bytes(bytes));
-            let bw_upper = match row_key::binary_prefix_upper_bound(bytes) {
-                Some(u) => {
-                    let mut end = prefix;
-                    end.push(tag);
-                    end.extend_from_slice(&crate::gsi::escape_bytes(&u));
-                    end
-                }
-                None => {
-                    let mut end = prefix;
-                    end.push(tag + 1);
-                    end
-                }
+            let bw_upper = if let Some(u) = row_key::binary_prefix_upper_bound(bytes) {
+                let mut end = prefix;
+                end.push(tag);
+                end.extend_from_slice(&crate::gsi::escape_bytes(&u));
+                end
+            } else {
+                let mut end = prefix;
+                end.push(tag + 1);
+                end
             };
             (pk_prefix, bw_start, bw_upper, true)
         }
@@ -612,7 +649,9 @@ fn item_matches_expected_hashes(item: &Item, expected_hashes: &[(String, (u8, Ve
 
 pub struct QueryScan<'a> {
     client: &'a BigtableClient,
+    data_table_short: String,
     full_table_name: String,
+    engine: Option<&'a crate::engine::BigtableEngine>,
 }
 
 impl<'a> QueryScan<'a> {
@@ -620,34 +659,117 @@ impl<'a> QueryScan<'a> {
     pub fn new(client: &'a BigtableClient, data_table_short: &str) -> Self {
         Self {
             client,
+            data_table_short: data_table_short.to_owned(),
             full_table_name: client.full_table_name(data_table_short),
+            engine: None,
         }
     }
 
-    fn cells_to_item(
+    #[must_use]
+    pub(crate) fn with_engine(
+        engine: &'a crate::engine::BigtableEngine,
+        data_table_short: &str,
+    ) -> Self {
+        let client = engine.data_client();
+        Self {
+            client,
+            data_table_short: data_table_short.to_owned(),
+            full_table_name: client.full_table_name(data_table_short),
+            engine: Some(engine),
+        }
+    }
+
+    async fn resolve_row_cells(
+        &self,
+        is_index: bool,
+        raw_key: &[u8],
         cells: Vec<crate::data::client::RowCell>,
     ) -> Result<Option<Item>, StorageError> {
-        let mut item: Item = BTreeMap::new();
-        for c in cells {
-            if c.family_name == FAMILY_DATA {
-                let attr = String::from_utf8(c.qualifier)
-                    .map_err(|e| StorageError::Internal(format!("decode qualifier: {e}")))?;
-                if let std::collections::btree_map::Entry::Vacant(e) = item.entry(attr) {
-                    e.insert(cell::decode(&c.value)?);
+        let mut snap = decode_snapshot_cells(cells)?;
+        if !snap.in_progress_chunk && snap.intents.is_empty() {
+            return Ok(snap.item);
+        }
+        if let Some(engine) = self.engine {
+            if is_index {
+                return engine
+                    .resolve_scanned_shadow_row(&self.data_table_short, raw_key, snap)
+                    .await;
+            }
+            return engine
+                .read_row_resolving_committed_intents(&self.data_table_short, raw_key)
+                .await;
+        }
+
+        // `query_scan_row_filter()` intentionally omits `m:v` so pure `m:v`
+        // tombstones are filtered out server-side without consuming `rows_limit`;
+        // reload the full `(d, m)` row snapshot here so `snap.version` reflects
+        // the live `m:v` cell before matching coordinator versions.
+        let ops = ItemOps::new(self.client, &self.data_table_short, 10);
+        snap = ops.get_row_snapshot_by_raw_key(raw_key).await?;
+        if is_index {
+            for attempt in 0..8u64 {
+                if !snap.in_progress_chunk {
+                    return Ok(snap.item);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2 << attempt.min(4))).await;
+                snap = ops.get_row_snapshot_by_raw_key(raw_key).await?;
+            }
+            if snap.in_progress_chunk {
+                return Err(StorageError::Transient(
+                    "concurrent multi-chunk shadow write still in progress".into(),
+                ));
+            }
+            return Ok(snap.item);
+        }
+
+        let coord =
+            crate::transact::TxnCoordinator::new(self.client, std::time::Duration::from_mins(1));
+        for attempt in 0..8u64 {
+            for (tid, _) in &snap.intents {
+                if let Some(st) = coord.get_state(tid).await?
+                    && st.state == "COMMITTED"
+                    && let Some(muts) = st.mutations
+                {
+                    for pm in muts {
+                        if pm.participant.data_table == self.data_table_short
+                            && pm.participant.row_key.as_slice() == raw_key
+                            && ((pm.expected_version == snap.version
+                                && (snap.in_progress_chunk
+                                    || pm.row_existed == snap.item.is_some()))
+                                || (pm.new_version.is_some() && pm.new_version == snap.version))
+                        {
+                            return Ok(match pm.payload {
+                                crate::transact::TxnOpPayload::Put { item } => Some(item),
+                                crate::transact::TxnOpPayload::Delete => None,
+                            });
+                        }
+                    }
                 }
             }
+            if !snap.in_progress_chunk {
+                return Ok(snap.item);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2 << attempt.min(4))).await;
+            snap = ops.get_row_snapshot_by_raw_key(raw_key).await?;
         }
-        if item.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(item))
+        if snap.in_progress_chunk {
+            return Err(StorageError::Transient(
+                "concurrent multi-chunk write still in progress".into(),
+            ));
         }
+        Ok(snap.item)
     }
 
     /// Run a `Query` against the base table (`is_index == false`) or an index
     /// shadow table (`is_index == true`, covering both GSIs and LSIs, even when
     /// an index's key schema matches the base table's key schema).
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] on invalid key conditions, malformed
+    /// `ExclusiveStartKey`, or `ReadRows` / intent-resolution RPC failures.
+    // Justification: Query combines range-bound construction, ExclusiveStartKey validation, reverse-scan fallback, and cooperative intent resolution.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn query(
         &self,
         key_info: &TableKeyInfo,
@@ -684,17 +806,11 @@ impl<'a> QueryScan<'a> {
                     return Ok((Vec::new(), None));
                 };
                 start = s.max(start);
-            } else if !end_open && resume <= end || end_open && resume < end {
+            } else if (!end_open && resume <= end) || (end_open && resume < end) {
                 end = resume;
                 end_open = true;
             }
         }
-
-        let Some((start, end, end_open)) =
-            row_key::clamp_range_to_max_row_key(start, end, end_open)
-        else {
-            return Ok((Vec::new(), None));
-        };
 
         let make_row_set = |s: Vec<u8>, e: Vec<u8>, open: bool| RowSet {
             row_keys: vec![],
@@ -708,73 +824,138 @@ impl<'a> QueryScan<'a> {
             }],
         };
 
-        let fetch_limit = match limit {
-            Some(l) if l > 0 => l.saturating_add(1),
-            _ => 0,
-        };
+        let target_plus_one = limit
+            .filter(|&l| l > 0)
+            .map(|l| usize::try_from(l).unwrap_or(usize::MAX).saturating_add(1));
 
         let mut data = self.client.data();
-        let use_client_reverse_fallback;
-        let resp = if !forward && self.client.emulator_host.is_some() {
-            // `cbtemulator` does not implement `ReadRowsRequest.reversed = true`;
-            // scan the partition forward and reverse in memory.
-            use_client_reverse_fallback = true;
+        let mut items: Vec<Item> = Vec::new();
+        let mut cur_start = start;
+        let mut cur_end = end;
+        let mut cur_end_open = end_open;
+
+        if !forward && self.client.emulator_host.is_some() {
+            let Some((s, e, open)) =
+                row_key::clamp_range_to_max_row_key(cur_start, cur_end, cur_end_open)
+            else {
+                return Ok((Vec::new(), None));
+            };
             let req = ReadRowsRequest {
                 table_name: self.full_table_name.clone(),
                 app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
-                rows: Some(make_row_set(start, end, end_open)),
+                rows: Some(make_row_set(s, e, open)),
                 rows_limit: 0,
-                filter: Some(data_family_latest_filter()),
+                filter: Some(query_scan_row_filter()),
                 reversed: false,
                 ..ReadRowsRequest::default()
             };
-            data.read_rows(req)
+            let resp = data
+                .read_rows(req)
                 .await
-                .map_err(|e| map_bigtable_err("Query ReadRows", e))?
+                .map_err(|e| map_bigtable_err("Query ReadRows", e))?;
+            let mut forward_items = Vec::with_capacity(resp.len());
+            for (raw_key, cells) in resp {
+                if let Some(item) = self.resolve_row_cells(is_index, &raw_key, cells).await?
+                    && (!is_index || item_matches_expected_hashes(&item, &expected_hashes))
+                {
+                    forward_items.push(item);
+                }
+            }
+            forward_items.reverse();
+            items = forward_items;
         } else {
-            let req = ReadRowsRequest {
-                table_name: self.full_table_name.clone(),
-                app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
-                rows: Some(make_row_set(start.clone(), end.clone(), end_open)),
-                rows_limit: fetch_limit,
-                filter: Some(data_family_latest_filter()),
-                reversed: !forward,
-                ..ReadRowsRequest::default()
-            };
-            match data.read_rows(req).await {
-                Ok(r) => {
-                    use_client_reverse_fallback = false;
-                    r
-                }
-                Err(e) if !forward && is_reverse_scan_unsupported_err(&e) => {
-                    use_client_reverse_fallback = true;
-                    let fallback_req = ReadRowsRequest {
-                        table_name: self.full_table_name.clone(),
-                        app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
-                        rows: Some(make_row_set(start, end, end_open)),
-                        rows_limit: 0,
-                        filter: Some(data_family_latest_filter()),
-                        reversed: false,
-                        ..ReadRowsRequest::default()
-                    };
-                    data.read_rows(fallback_req)
-                        .await
-                        .map_err(|e2| map_bigtable_err("Query ReadRows fallback", e2))?
-                }
-                Err(e) => return Err(map_bigtable_err("Query ReadRows", e)),
-            }
-        };
+            while let Some((s, e, open)) = row_key::clamp_range_to_max_row_key(
+                cur_start.clone(),
+                cur_end.clone(),
+                cur_end_open,
+            ) {
+                let page_limit = target_plus_one.map_or(0, |want| {
+                    i64::try_from(want.saturating_sub(items.len()).max(1)).unwrap_or(i64::MAX)
+                });
+                let req = ReadRowsRequest {
+                    table_name: self.full_table_name.clone(),
+                    app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+                    rows: Some(make_row_set(s.clone(), e.clone(), open)),
+                    rows_limit: page_limit,
+                    filter: Some(query_scan_row_filter()),
+                    reversed: !forward,
+                    ..ReadRowsRequest::default()
+                };
+                let resp = match data.read_rows(req).await {
+                    Ok(r) => r,
+                    Err(err) if !forward && is_reverse_scan_unsupported_err(&err) => {
+                        let fallback_req = ReadRowsRequest {
+                            table_name: self.full_table_name.clone(),
+                            app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+                            rows: Some(make_row_set(s, e, open)),
+                            rows_limit: 0,
+                            filter: Some(query_scan_row_filter()),
+                            reversed: false,
+                            ..ReadRowsRequest::default()
+                        };
+                        let fb_resp = data
+                            .read_rows(fallback_req)
+                            .await
+                            .map_err(|e2| map_bigtable_err("Query ReadRows fallback", e2))?;
+                        let mut tail = Vec::with_capacity(fb_resp.len());
+                        for (raw_key, cells) in fb_resp {
+                            if let Some(item) =
+                                self.resolve_row_cells(is_index, &raw_key, cells).await?
+                                && (!is_index
+                                    || item_matches_expected_hashes(&item, &expected_hashes))
+                            {
+                                tail.push(item);
+                            }
+                        }
+                        tail.reverse();
+                        items.extend(tail);
+                        break;
+                    }
+                    Err(err) => return Err(map_bigtable_err("Query ReadRows", err)),
+                };
 
-        let mut items: Vec<Item> = Vec::with_capacity(resp.len());
-        for (_key, cells) in resp {
-            if let Some(item) = Self::cells_to_item(cells)?
-                && (!is_index || item_matches_expected_hashes(&item, &expected_hashes))
-            {
-                items.push(item);
+                let batch_count = resp.len();
+                if batch_count == 0 {
+                    break;
+                }
+                let mut last_raw_key: Option<Vec<u8>> = None;
+                for (raw_key, cells) in resp {
+                    last_raw_key = Some(raw_key.clone());
+                    if let Some(item) = self.resolve_row_cells(is_index, &raw_key, cells).await?
+                        && (!is_index || item_matches_expected_hashes(&item, &expected_hashes))
+                    {
+                        items.push(item);
+                        if let Some(want) = target_plus_one
+                            && items.len() >= want
+                        {
+                            break;
+                        }
+                    }
+                }
+                if page_limit == 0 {
+                    break;
+                }
+                if let Some(want) = target_plus_one
+                    && items.len() >= want
+                {
+                    break;
+                }
+                if i64::try_from(batch_count).unwrap_or(i64::MAX) < page_limit {
+                    break;
+                }
+                let Some(last_k) = last_raw_key else {
+                    break;
+                };
+                if forward {
+                    let Some(next_s) = row_key::next_valid_row_key_after(&last_k) else {
+                        break;
+                    };
+                    cur_start = next_s;
+                } else {
+                    cur_end = last_k;
+                    cur_end_open = true;
+                }
             }
-        }
-        if use_client_reverse_fallback {
-            items.reverse();
         }
 
         let last_evaluated = match limit {
@@ -789,6 +970,11 @@ impl<'a> QueryScan<'a> {
 
     /// Run a `Scan` against the base table (`is_index == false`) or an index
     /// shadow table (`is_index == true`, covering both GSIs and LSIs).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] on malformed `ExclusiveStartKey` or `ReadRows`
+    /// / intent-resolution RPC failures.
     pub async fn scan(
         &self,
         key_info: &TableKeyInfo,
@@ -813,58 +999,13 @@ impl<'a> QueryScan<'a> {
         let seg = u64::try_from(segment.unwrap_or(0).max(0)).unwrap_or(0) % total;
         let mut data = self.client.data();
 
-        if total == 1 {
-            let fetch_limit = match limit {
-                Some(l) if l > 0 => l.saturating_add(1),
-                _ => 0,
-            };
-            let req = ReadRowsRequest {
-                table_name: self.full_table_name.clone(),
-                app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
-                rows: Some(RowSet {
-                    row_keys: vec![],
-                    row_ranges: vec![RowRange {
-                        start_key: Some(StartKey::StartKeyClosed(cursor_start)),
-                        end_key: None,
-                    }],
-                }),
-                rows_limit: fetch_limit,
-                filter: Some(data_family_latest_filter()),
-                ..ReadRowsRequest::default()
-            };
-            let resp = data
-                .read_rows(req)
-                .await
-                .map_err(|e| map_bigtable_err("Scan ReadRows", e))?;
-            let mut items = Vec::with_capacity(resp.len());
-            for (_raw_key, cells) in resp {
-                if let Some(item) = Self::cells_to_item(cells)? {
-                    items.push(item);
-                }
-            }
-            let last_evaluated = match limit {
-                Some(l) if l > 0 && items.len() > usize::try_from(l).unwrap_or(usize::MAX) => {
-                    items.truncate(usize::try_from(l).unwrap_or(usize::MAX));
-                    items.last().map(|it| extract_lek(it, key_info, is_index))
-                }
-                _ => None,
-            };
-            return Ok((items, last_evaluated));
-        }
-
-        // Parallel scan (`total > 1`): page forward until we collect `limit + 1`
-        // items belonging to `seg` or reach the end of the table.
         let target_plus_one = limit
             .filter(|&l| l > 0)
             .map(|l| usize::try_from(l).unwrap_or(usize::MAX).saturating_add(1));
-        let page_batch: i64 = match limit {
-            Some(l) if l > 0 => {
-                (l.saturating_mul(i64::try_from(total).unwrap_or(i64::MAX))).clamp(64, 1024)
-            }
-            _ => 512,
-        };
+
         let mut items: Vec<Item> = Vec::new();
         loop {
+            let req_limit = scan_page_limit(total, limit, target_plus_one, items.len());
             let req = ReadRowsRequest {
                 table_name: self.full_table_name.clone(),
                 app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
@@ -875,14 +1016,14 @@ impl<'a> QueryScan<'a> {
                         end_key: None,
                     }],
                 }),
-                rows_limit: page_batch,
-                filter: Some(data_family_latest_filter()),
+                rows_limit: req_limit,
+                filter: Some(query_scan_row_filter()),
                 ..ReadRowsRequest::default()
             };
             let resp = data
                 .read_rows(req)
                 .await
-                .map_err(|e| map_bigtable_err("Scan ReadRows segment", e))?;
+                .map_err(|e| map_bigtable_err("Scan ReadRows", e))?;
             let batch_count = resp.len();
             if batch_count == 0 {
                 break;
@@ -890,33 +1031,29 @@ impl<'a> QueryScan<'a> {
             let mut last_raw_key: Option<Vec<u8>> = None;
             for (raw_key, cells) in resp {
                 last_raw_key = Some(raw_key.clone());
-                if pk_segment_from_encoded_key(&raw_key, total)? != seg {
+                if total > 1 && pk_segment_from_encoded_key(&raw_key, total)? != seg {
                     continue;
                 }
-                if let Some(item) = Self::cells_to_item(cells)? {
+                if let Some(item) = self.resolve_row_cells(is_index, &raw_key, cells).await? {
                     items.push(item);
-                    if let Some(want) = target_plus_one
-                        && items.len() >= want
-                    {
+                    if target_plus_one.is_some_and(|want| items.len() >= want) {
                         break;
                     }
                 }
             }
-            if let Some(want) = target_plus_one
-                && items.len() >= want
+            if req_limit == 0
+                || target_plus_one.is_some_and(|want| items.len() >= want)
+                || i64::try_from(batch_count).unwrap_or(i64::MAX) < req_limit
             {
                 break;
             }
-            if i64::try_from(batch_count).unwrap_or(i64::MAX) < page_batch {
+            let Some(next_k) = last_raw_key
+                .as_deref()
+                .and_then(row_key::next_valid_row_key_after)
+            else {
                 break;
-            }
-            if let Some(k) = last_raw_key
-                && let Some(next_k) = row_key::next_valid_row_key_after(&k)
-            {
-                cursor_start = next_k;
-            } else {
-                break;
-            }
+            };
+            cursor_start = next_k;
         }
 
         let last_evaluated = match limit {
@@ -927,6 +1064,25 @@ impl<'a> QueryScan<'a> {
             _ => None,
         };
         Ok((items, last_evaluated))
+    }
+}
+
+fn scan_page_limit(
+    total: u64,
+    limit: Option<i64>,
+    target_plus_one: Option<usize>,
+    have: usize,
+) -> i64 {
+    if total == 1 {
+        return target_plus_one.map_or(0, |want| {
+            i64::try_from(want.saturating_sub(have).max(1)).unwrap_or(i64::MAX)
+        });
+    }
+    match limit {
+        Some(l) if l > 0 => {
+            (l.saturating_mul(i64::try_from(total).unwrap_or(i64::MAX))).clamp(64, 1024)
+        }
+        _ => 512,
     }
 }
 

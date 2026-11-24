@@ -1,12 +1,14 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! BigTable admin operations (`CreateTable`, `DeleteTable`, `ListTables`,
+//! Cloud Bigtable admin operations (`CreateTable`, `DeleteTable`, `ListTables`,
 //! `ModifyColumnFamilies`, and startup `GetAppProfile` validation).
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
+use extenddb_storage::error::StorageError;
 use gcp_auth::TokenProvider;
 use googleapis_tonic_google_bigtable_admin_v2::google::bigtable::admin::v2::{
     AppProfile, ColumnFamily, CreateTableRequest, DeleteTableRequest, GcRule, GetAppProfileRequest,
@@ -20,15 +22,52 @@ use googleapis_tonic_google_bigtable_admin_v2::google::bigtable::admin::v2::{
 };
 use tonic::Status;
 use tonic::metadata::MetadataValue;
-use tonic::service::Interceptor;
-use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
-use crate::data::client::{BigtableClient, MAX_GRPC_MESSAGE_BYTES};
+use crate::data::client::{BigtableClient, MAX_GRPC_MESSAGE_BYTES, classify_grpc_status};
 
 const BIGTABLE_ADMIN_ENDPOINT: &str = "https://bigtableadmin.googleapis.com:443";
 const BIGTABLE_ADMIN_HOST: &str = "bigtableadmin.googleapis.com";
 const BIGTABLE_ADMIN_SCOPE: &str = "https://www.googleapis.com/auth/bigtable.admin";
+const ADMIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const ADMIN_RPC_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// Typed Cloud Bigtable Table/Instance Admin error preserving `tonic::Status`
+/// codes so callers classify transient quota, transport, and deadline errors
+/// via [`classify_grpc_status`] rather than display-string matching.
+#[derive(Debug, thiserror::Error)]
+pub enum AdminError {
+    #[error("{context}: {status}")]
+    Rpc {
+        context: String,
+        #[source]
+        status: Status,
+    },
+
+    #[error("{0}")]
+    Transport(String),
+
+    #[error("{0}")]
+    Auth(String),
+
+    #[error("{0}")]
+    InvalidAppProfile(String),
+}
+
+impl AdminError {
+    /// Convert this admin error into [`StorageError`], delegating gRPC status
+    /// codes (`ResourceExhausted`, `Unavailable`, `DeadlineExceeded`,
+    /// `Aborted`, `NotFound`, and HTTP/2 `GoAway`) to [`classify_grpc_status`].
+    #[must_use]
+    pub fn into_storage_error(self) -> StorageError {
+        match self {
+            Self::Rpc { context, status } => classify_grpc_status(&context, &status),
+            Self::Transport(msg) => StorageError::Connection(msg),
+            Self::Auth(msg) => StorageError::Internal(msg),
+            Self::InvalidAppProfile(msg) => StorageError::Validation(msg),
+        }
+    }
+}
 
 /// Convenience helper to build a GC rule that keeps at most `n` cell versions.
 #[must_use]
@@ -41,6 +80,12 @@ pub fn gc_max_versions(n: i32) -> GcRule {
 /// Validate that an [`AppProfile`] uses single-cluster routing with single-row
 /// transactions (`allow_transactional_writes`) enabled, which Cloud Bigtable
 /// requires for `CheckAndMutateRow`.
+///
+/// # Errors
+///
+/// Returns an actionable configuration error message when `profile` uses
+/// multi-cluster routing, lacks a routing policy, or disables
+/// `allow_transactional_writes`.
 pub fn validate_app_profile_proto(
     profile: &AppProfile,
     instance_id: &str,
@@ -70,99 +115,116 @@ pub fn validate_app_profile_proto(
     }
 }
 
-/// Interceptor that adds an `Authorization: Bearer ...` header to every
-/// outgoing request when a token is present.
-#[derive(Clone)]
-pub struct AuthInterceptor {
-    bearer: Option<Arc<String>>,
-}
-
-impl Interceptor for AuthInterceptor {
-    fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
-        if let Some(b) = &self.bearer {
-            let value = MetadataValue::try_from(b.as_str())
-                .map_err(|e| Status::unauthenticated(format!("bad bearer header: {e}")))?;
-            req.metadata_mut().insert("authorization", value);
-        }
-        Ok(req)
+async fn connect_admin_channel(
+    client: &BigtableClient,
+) -> Result<(Channel, Option<Arc<dyn TokenProvider>>), AdminError> {
+    if let Some(host) = &client.emulator_host {
+        let uri = if host.starts_with("http://") || host.starts_with("https://") {
+            host.clone()
+        } else {
+            format!("http://{host}")
+        };
+        let endpoint = Endpoint::from_shared(uri)
+            .map_err(|e| AdminError::Transport(format!("admin endpoint: {e}")))?
+            .connect_timeout(ADMIN_CONNECT_TIMEOUT)
+            .timeout(ADMIN_RPC_TIMEOUT)
+            .tcp_nodelay(true);
+        let channel = endpoint
+            .connect()
+            .await
+            .map_err(|e| AdminError::Transport(format!("admin connect emulator {host}: {e}")))?;
+        Ok((channel, None))
+    } else {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let tls = ClientTlsConfig::new()
+            .with_native_roots()
+            .domain_name(BIGTABLE_ADMIN_HOST);
+        let endpoint = Endpoint::from_static(BIGTABLE_ADMIN_ENDPOINT)
+            .tls_config(tls)
+            .map_err(|e| AdminError::Transport(format!("admin tls: {e}")))?
+            .connect_timeout(ADMIN_CONNECT_TIMEOUT)
+            .timeout(ADMIN_RPC_TIMEOUT)
+            .http2_keep_alive_interval(Duration::from_mins(5))
+            .keep_alive_timeout(Duration::from_secs(20))
+            .tcp_nodelay(true);
+        let channel = endpoint
+            .connect()
+            .await
+            .map_err(|e| AdminError::Transport(format!("admin connect real: {e}")))?;
+        let provider: Arc<dyn TokenProvider> = if let Some(shared) = client.token_provider() {
+            Arc::clone(shared)
+        } else if let Some(cred_path) = &client.credentials_path {
+            let sa = gcp_auth::CustomServiceAccount::from_file(cred_path).map_err(|e| {
+                AdminError::Auth(format!("gcp_auth CustomServiceAccount load: {e}"))
+            })?;
+            Arc::new(sa)
+        } else {
+            gcp_auth::provider()
+                .await
+                .map_err(|e| AdminError::Auth(format!("gcp_auth provider: {e}")))?
+        };
+        Ok((channel, Some(provider)))
     }
 }
 
-async fn connect_admin_channel(
-    client: &BigtableClient,
-) -> Result<(Channel, AuthInterceptor), String> {
-    let (channel, bearer) = match &client.emulator_host {
-        Some(host) => {
-            let uri = if host.starts_with("http://") || host.starts_with("https://") {
-                host.clone()
-            } else {
-                format!("http://{host}")
-            };
-            let endpoint =
-                Endpoint::from_shared(uri).map_err(|e| format!("admin endpoint: {e}"))?;
-            let channel = endpoint
-                .connect()
-                .await
-                .map_err(|e| format!("admin connect emulator {host}: {e}"))?;
-            (channel, None)
-        }
-        None => {
-            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-            let tls = ClientTlsConfig::new()
-                .with_native_roots()
-                .domain_name(BIGTABLE_ADMIN_HOST);
-            let endpoint = Endpoint::from_static(BIGTABLE_ADMIN_ENDPOINT)
-                .tls_config(tls)
-                .map_err(|e| format!("admin tls: {e}"))?;
-            let channel = endpoint
-                .connect()
-                .await
-                .map_err(|e| format!("admin connect real: {e}"))?;
-            let token = if let Some(cred_path) = &client.credentials_path {
-                let provider = gcp_auth::CustomServiceAccount::from_file(cred_path)
-                    .map_err(|e| format!("gcp_auth CustomServiceAccount load: {e}"))?;
-                provider
-                    .token(&[BIGTABLE_ADMIN_SCOPE])
-                    .await
-                    .map_err(|e| format!("gcp_auth token: {e}"))?
-            } else {
-                let provider = gcp_auth::provider()
-                    .await
-                    .map_err(|e| format!("gcp_auth provider: {e}"))?;
-                provider
-                    .token(&[BIGTABLE_ADMIN_SCOPE])
-                    .await
-                    .map_err(|e| format!("gcp_auth token: {e}"))?
-            };
-            let bearer = Arc::new(format!("Bearer {}", token.as_str()));
-            (channel, Some(bearer))
-        }
-    };
-    Ok((channel, AuthInterceptor { bearer }))
-}
-
-fn admin_request<T>(payload: T, param_key: &str, resource_name: &str) -> tonic::Request<T> {
+fn attach_admin_headers<T>(
+    payload: T,
+    param_key: &str,
+    resource_name: &str,
+    bearer_header: Option<&str>,
+) -> Result<tonic::Request<T>, AdminError> {
     let mut req = tonic::Request::new(payload);
+    if let Some(b) = bearer_header {
+        let value = MetadataValue::try_from(b)
+            .map_err(|e| AdminError::Auth(format!("bad bearer header: {e}")))?;
+        req.metadata_mut().insert("authorization", value);
+    }
     let routing = format!("{param_key}={}", urlencoding::encode(resource_name));
     if let Ok(val) = MetadataValue::try_from(routing) {
         req.metadata_mut().insert("x-goog-request-params", val);
     }
-    req
+    Ok(req)
+}
+
+async fn make_admin_request<T>(
+    payload: T,
+    param_key: &str,
+    resource_name: &str,
+    token_provider: Option<&Arc<dyn TokenProvider>>,
+) -> Result<tonic::Request<T>, AdminError> {
+    let bearer = if let Some(provider) = token_provider {
+        let token = provider
+            .token(&[BIGTABLE_ADMIN_SCOPE])
+            .await
+            .map_err(|e| AdminError::Auth(format!("gcp_auth token: {e}")))?;
+        Some(format!("Bearer {}", token.as_str()))
+    } else {
+        None
+    };
+    attach_admin_headers(payload, param_key, resource_name, bearer.as_deref())
 }
 
 pub struct AdminClient {
-    inner: BigtableTableAdminClient<InterceptedService<Channel, AuthInterceptor>>,
+    inner: BigtableTableAdminClient<Channel>,
+    token_provider: Option<Arc<dyn TokenProvider>>,
     instance_name: String,
 }
 
 impl AdminClient {
-    pub async fn connect(client: &BigtableClient) -> Result<Self, String> {
-        let (channel, interceptor) = connect_admin_channel(client).await?;
-        let inner = BigtableTableAdminClient::with_interceptor(channel, interceptor)
+    /// Connect an admin channel reusing `client`'s configured endpoint and
+    /// shared `OAuth2` [`TokenProvider`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdminError`] if transport connection or credential setup fails.
+    pub async fn connect(client: &BigtableClient) -> Result<Self, AdminError> {
+        let (channel, token_provider) = connect_admin_channel(client).await?;
+        let inner = BigtableTableAdminClient::new(channel)
             .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
         Ok(Self {
             inner,
+            token_provider,
             instance_name: client.instance_name(),
         })
     }
@@ -172,7 +234,12 @@ impl AdminClient {
     ///
     /// Skipped on the local emulator (`cbtemulator` does not implement
     /// `BigtableInstanceAdmin`).
-    pub async fn validate_app_profile(client: &BigtableClient) -> Result<(), String> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdminError`] if `GetAppProfile` fails or the profile lacks
+    /// single-cluster transactional routing.
+    pub async fn validate_app_profile(client: &BigtableClient) -> Result<(), AdminError> {
         if client.emulator_host.is_some() {
             return Ok(());
         }
@@ -182,31 +249,44 @@ impl AdminClient {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or("default");
-        let (channel, interceptor) = connect_admin_channel(client).await?;
-        let mut instance_admin =
-            BigtableInstanceAdminClient::with_interceptor(channel, interceptor)
-                .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
-                .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
+        let (channel, token_provider) = connect_admin_channel(client).await?;
+        let mut instance_admin = BigtableInstanceAdminClient::new(channel)
+            .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+            .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
         let name = format!("{}/appProfiles/{profile_id}", client.instance_name());
-        let req = admin_request(GetAppProfileRequest { name: name.clone() }, "name", &name);
+        let req = make_admin_request(
+            GetAppProfileRequest { name: name.clone() },
+            "name",
+            &name,
+            token_provider.as_ref(),
+        )
+        .await?;
         let resp = instance_admin
             .get_app_profile(req)
             .await
-            .map_err(|status| {
-                format!(
-                    "get_app_profile('{profile_id}') on instance '{}': {status}",
+            .map_err(|status| AdminError::Rpc {
+                context: format!(
+                    "get_app_profile('{profile_id}') on instance '{}'",
                     client.instance_id
-                )
+                ),
+                status,
             })?
             .into_inner();
         validate_app_profile_proto(&resp, &client.instance_id, profile_id)
+            .map_err(AdminError::InvalidAppProfile)
     }
 
+    /// Create a Bigtable table with `families` (or ensure missing families exist
+    /// if the table was already created).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdminError`] if `CreateTable` or `ModifyColumnFamilies` fails.
     pub async fn create_table(
         &mut self,
         table_id: &str,
         families: &[(&str, Option<GcRule>)],
-    ) -> Result<(), String> {
+    ) -> Result<(), AdminError> {
         let mut column_families = HashMap::with_capacity(families.len());
         for (name, rule) in families {
             column_families.insert(
@@ -218,7 +298,7 @@ impl AdminClient {
             );
         }
         let parent = self.instance_name.clone();
-        let req = admin_request(
+        let req = make_admin_request(
             CreateTableRequest {
                 parent: parent.clone(),
                 table_id: table_id.to_owned(),
@@ -230,35 +310,50 @@ impl AdminClient {
             },
             "parent",
             &parent,
-        );
+            self.token_provider.as_ref(),
+        )
+        .await?;
         match self.inner.create_table(req).await {
             Ok(_) => Ok(()),
             Err(status) if status.code() == tonic::Code::AlreadyExists => {
                 self.ensure_families(table_id, families).await
             }
-            Err(status) => Err(format!("create_table({table_id}): {status}")),
+            Err(status) => Err(AdminError::Rpc {
+                context: format!("create_table({table_id})"),
+                status,
+            }),
         }
     }
 
+    /// Ensure all `families` exist on `table_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdminError`] if `ModifyColumnFamilies` fails with a non-idempotent error.
+    // Justification: schema inspection, per-family GC-rule comparison, ModifyColumnFamilies retry, and verification run sequentially.
+    #[allow(clippy::too_many_lines)]
     pub async fn ensure_families(
         &mut self,
         table_id: &str,
         families: &[(&str, Option<GcRule>)],
-    ) -> Result<(), String> {
+    ) -> Result<(), AdminError> {
         if families.is_empty() {
             return Ok(());
         }
         let table_name = format!("{}/tables/{table_id}", self.instance_name);
+        let get_req = make_admin_request(
+            GetTableRequest {
+                name: table_name.clone(),
+                view: table::View::SchemaView as i32,
+            },
+            "name",
+            &table_name,
+            self.token_provider.as_ref(),
+        )
+        .await?;
         let existing_families = self
             .inner
-            .get_table(admin_request(
-                GetTableRequest {
-                    name: table_name.clone(),
-                    view: table::View::SchemaView as i32,
-                },
-                "name",
-                &table_name,
-            ))
+            .get_table(get_req)
             .await
             .ok()
             .map(|r| r.into_inner().column_families);
@@ -287,7 +382,7 @@ impl AdminClient {
                 })),
             })
             .collect();
-        let batch_req = admin_request(
+        let batch_req = make_admin_request(
             ModifyColumnFamiliesRequest {
                 name: table_name.clone(),
                 modifications,
@@ -295,7 +390,9 @@ impl AdminClient {
             },
             "name",
             &table_name,
-        );
+            self.token_provider.as_ref(),
+        )
+        .await?;
         match self.inner.modify_column_families(batch_req).await {
             Ok(_) => return Ok(()),
             Err(status)
@@ -312,11 +409,16 @@ impl AdminClient {
                     status.code(),
                     tonic::Code::AlreadyExists | tonic::Code::FailedPrecondition
                 ) => {}
-            Err(status) => return Err(format!("ensure_families({table_id}): {status}")),
+            Err(status) => {
+                return Err(AdminError::Rpc {
+                    context: format!("ensure_families({table_id})"),
+                    status,
+                });
+            }
         }
 
         for (name, rule) in missing {
-            let req = admin_request(
+            let req = make_admin_request(
                 ModifyColumnFamiliesRequest {
                     name: table_name.clone(),
                     modifications: vec![Modification {
@@ -331,7 +433,9 @@ impl AdminClient {
                 },
                 "name",
                 &table_name,
-            );
+                self.token_provider.as_ref(),
+            )
+            .await?;
             match self.inner.modify_column_families(req).await {
                 Ok(_) => {}
                 Err(status)
@@ -340,36 +444,53 @@ impl AdminClient {
                         tonic::Code::AlreadyExists | tonic::Code::FailedPrecondition
                     ) => {}
                 Err(status) => {
-                    return Err(format!("ensure_families({table_id}, {name}): {status}"));
+                    return Err(AdminError::Rpc {
+                        context: format!("ensure_families({table_id}, {name})"),
+                        status,
+                    });
                 }
             }
         }
         Ok(())
     }
 
-    pub async fn delete_table(&mut self, table_id: &str) -> Result<(), String> {
+    /// Delete `table_id` under the configured instance (idempotent if absent).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdminError`] if `DeleteTable` fails with an error other than `NotFound`.
+    pub async fn delete_table(&mut self, table_id: &str) -> Result<(), AdminError> {
         let table_name = format!("{}/tables/{table_id}", self.instance_name);
-        let req = admin_request(
+        let req = make_admin_request(
             DeleteTableRequest {
                 name: table_name.clone(),
             },
             "name",
             &table_name,
-        );
+            self.token_provider.as_ref(),
+        )
+        .await?;
         match self.inner.delete_table(req).await {
             Ok(_) => Ok(()),
             Err(status) if status.code() == tonic::Code::NotFound => Ok(()),
-            Err(status) => Err(format!("delete_table({table_id}): {status}")),
+            Err(status) => Err(AdminError::Rpc {
+                context: format!("delete_table({table_id})"),
+                status,
+            }),
         }
     }
 
     /// List all table short-names under the instance, paging through all pages.
-    pub async fn list_tables(&mut self) -> Result<Vec<String>, String> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdminError`] if any `ListTables` page fails.
+    pub async fn list_tables(&mut self) -> Result<Vec<String>, AdminError> {
         let mut out = Vec::new();
         let mut page_token = String::new();
         let parent = self.instance_name.clone();
         loop {
-            let req = admin_request(
+            let req = make_admin_request(
                 ListTablesRequest {
                     parent: parent.clone(),
                     view: table::View::NameOnly as i32,
@@ -378,18 +499,22 @@ impl AdminClient {
                 },
                 "parent",
                 &parent,
-            );
+                self.token_provider.as_ref(),
+            )
+            .await?;
             let resp = self
                 .inner
                 .list_tables(req)
                 .await
-                .map_err(|status| format!("list_tables: {status}"))?
+                .map_err(|status| AdminError::Rpc {
+                    context: "list_tables".to_owned(),
+                    status,
+                })?
                 .into_inner();
             out.extend(resp.tables.into_iter().map(|t| {
                 t.name
                     .rsplit_once('/')
-                    .map(|(_, last)| last.to_owned())
-                    .unwrap_or(t.name)
+                    .map_or(t.name.clone(), |(_, last)| last.to_owned())
             }));
             if resp.next_page_token.is_empty() {
                 break;
@@ -441,11 +566,8 @@ mod tests {
     #[test]
     fn admin_request_url_encodes_x_goog_request_params_and_preserves_auth() {
         let parent = "projects/example.com:proj-a/instances/inst-b";
-        let req = admin_request((), "parent", parent);
-        let mut interceptor = AuthInterceptor {
-            bearer: Some(Arc::new("Bearer test-token".to_owned())),
-        };
-        let intercepted = interceptor.call(req).expect("interceptor");
+        let intercepted =
+            attach_admin_headers((), "parent", parent, Some("Bearer test-token")).expect("headers");
         assert_eq!(
             intercepted
                 .metadata()
@@ -466,7 +588,7 @@ mod tests {
         );
 
         let table_name = format!("{parent}/tables/__extenddb_catalog__");
-        let treq = admin_request((), "name", &table_name);
+        let treq = attach_admin_headers((), "name", &table_name, None).expect("table headers");
         assert_eq!(
             treq.metadata()
                 .get("x-goog-request-params")
@@ -475,5 +597,43 @@ mod tests {
                 .expect("ascii"),
             "name=projects%2Fexample.com%3Aproj-a%2Finstances%2Finst-b%2Ftables%2F__extenddb_catalog__"
         );
+    }
+
+    #[test]
+    fn admin_error_classifies_grpc_status_codes_via_tonic_code() {
+        for status in [
+            Status::resource_exhausted("Resource has been exhausted (e.g. check quota)."),
+            Status::unavailable("backend restarting"),
+            Status::deadline_exceeded("admin call timed out"),
+            Status::aborted("concurrent schema modification"),
+            Status::internal("h2 protocol error: GoAway(ENHANCE_YOUR_CALM)"),
+        ] {
+            let err = AdminError::Rpc {
+                context: "create_table(t1)".to_owned(),
+                status,
+            }
+            .into_storage_error();
+            assert!(
+                matches!(err, StorageError::Transient(_)),
+                "expected Transient, got {err:?}"
+            );
+        }
+
+        let not_found = AdminError::Rpc {
+            context: "ensure_families(t1)".to_owned(),
+            status: Status::not_found("table missing"),
+        }
+        .into_storage_error();
+        assert!(matches!(not_found, StorageError::TableNotFound(_)));
+
+        let perm = AdminError::Rpc {
+            context: "create_table(t1)".to_owned(),
+            status: Status::permission_denied("missing bigtable.tables.create"),
+        }
+        .into_storage_error();
+        assert!(matches!(perm, StorageError::Internal(_)));
+
+        let transport = AdminError::Transport("dial error".to_owned()).into_storage_error();
+        assert!(matches!(transport, StorageError::Connection(_)));
     }
 }

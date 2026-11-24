@@ -1,14 +1,14 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! BigTable backend configuration.
+//! Cloud Bigtable backend configuration.
 
 use std::sync::OnceLock;
 
 use extenddb_storage::config::{StartupWarning, StorageConfig};
 use serde::Deserialize;
 
-/// Connection settings for a BigTable backend deployment.
+/// Connection settings for a Cloud Bigtable backend deployment.
 ///
 /// Loaded from the `[storage.bigtable]` block in `extenddb.toml`. If
 /// `emulator_host` (or `BIGTABLE_EMULATOR_HOST`) is set, the backend connects
@@ -264,7 +264,12 @@ impl BigtableStorageConfig {
         format!("bigtable://{}/{}{query}", self.project_id, self.instance_id)
     }
 
-    /// Round-trip parse from the string produced by `connection_string`.
+    /// Round-trip parse from the string produced by [`Self::connection_string`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if `s` is not a valid `bigtable://<project>/<instance>` URL
+    /// or contains out-of-range numeric query parameters.
     pub fn from_connection_string(s: &str) -> Result<Self, String> {
         let stripped = s
             .strip_prefix("bigtable://")
@@ -299,8 +304,7 @@ impl BigtableStorageConfig {
                 }
                 if let Some((k, raw_v)) = pair.split_once('=') {
                     let v = urlencoding::decode(raw_v)
-                        .map(|c| c.into_owned())
-                        .unwrap_or_else(|_| raw_v.to_owned());
+                        .map_or_else(|_| raw_v.to_owned(), std::borrow::Cow::into_owned);
                     match k {
                         "emulator" | "emulator_host" => {
                             let trimmed = v.trim();

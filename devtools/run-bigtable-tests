@@ -143,12 +143,31 @@ find_cbtemulator() {
     return 1
 }
 
-wait_tcp() {
-    local host="$1" port="$2" timeout_s="${3:-60}" pid="${4:-}"
-    python3 - "$host" "$port" "$timeout_s" "$pid" <<'PY'
+wait_h2_grpc() {
+    local addr="$1" timeout_s="${2:-60}" pid="${3:-}"
+    python3 - "$addr" "$timeout_s" "$pid" <<'PY'
 import os, socket, sys, time
-host, port, timeout_s, pid_str = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
+
+raw_addr, timeout_s, pid_str = sys.argv[1].strip(), float(sys.argv[2]), sys.argv[3]
 pid = int(pid_str) if pid_str else None
+for prefix in ("http://", "https://"):
+    if raw_addr.startswith(prefix):
+        raw_addr = raw_addr[len(prefix):]
+        break
+raw_addr = raw_addr.split("/", 1)[0]
+if raw_addr.startswith("["):
+    end_bracket = raw_addr.find("]")
+    if end_bracket <= 1 or end_bracket + 2 > len(raw_addr) or raw_addr[end_bracket + 1] != ":":
+        sys.exit(3)
+    host = raw_addr[1:end_bracket]
+    port = int(raw_addr[end_bracket + 2:])
+else:
+    if ":" not in raw_addr:
+        sys.exit(3)
+    host, port_s = raw_addr.rsplit(":", 1)
+    port = int(port_s)
+
+H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00"
 deadline = time.monotonic() + timeout_s
 while time.monotonic() < deadline:
     if pid is not None:
@@ -157,10 +176,21 @@ while time.monotonic() < deadline:
         except OSError:
             sys.exit(2)
     try:
-        with socket.create_connection((host, port), timeout=1.0):
-            sys.exit(0)
+        with socket.create_connection((host, port), timeout=1.0) as sock:
+            sock.settimeout(1.0)
+            sock.sendall(H2_PREFACE)
+            hdr = b""
+            while len(hdr) < 9:
+                chunk = sock.recv(9 - len(hdr))
+                if not chunk:
+                    break
+                hdr += chunk
+            # HTTP/2 SETTINGS frame has type 0x04 and stream identifier 0.
+            if len(hdr) == 9 and hdr[3] == 0x04 and hdr[5:9] == b"\x00\x00\x00\x00":
+                sys.exit(0)
     except OSError:
-        time.sleep(0.2)
+        pass
+    time.sleep(0.2)
 sys.exit(1)
 PY
 }
@@ -227,7 +257,7 @@ if [[ -z "$EMULATOR_HOST" ]]; then
         echo "error: cbtemulator binary not found and docker unavailable (set CBTEMULATOR_BIN or --emulator-host)" >&2
         exit 1
     fi
-    if ! wait_tcp 127.0.0.1 "$EMULATOR_PORT" 60 "$EMULATOR_PID"; then
+    if ! wait_h2_grpc "$EMULATOR_HOST" 60 "$EMULATOR_PID"; then
         echo "error: cbtemulator did not become ready on $EMULATOR_HOST" >&2
         if [[ -n "$EMULATOR_CONTAINER" ]]; then
             docker logs "$EMULATOR_CONTAINER" >&2 || true
@@ -238,10 +268,8 @@ if [[ -z "$EMULATOR_HOST" ]]; then
     fi
     echo "  cbtemulator ready on $EMULATOR_HOST"
 else
-    EMU_H="${EMULATOR_HOST%:*}"
-    EMU_P="${EMULATOR_HOST##*:}"
     echo "=== Verifying external Bigtable emulator at $EMULATOR_HOST ==="
-    if ! wait_tcp "$EMU_H" "$EMU_P" 15 ""; then
+    if ! wait_h2_grpc "$EMULATOR_HOST" 15 ""; then
         echo "error: Bigtable emulator not reachable at $EMULATOR_HOST" >&2
         exit 1
     fi
@@ -256,8 +284,18 @@ fi
 
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy \
     REQUESTS_CA_BUNDLE CURL_CA_BUNDLE SSL_CERT_FILE AWS_CA_BUNDLE || true
-export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost"
-export no_proxy="${no_proxy:+${no_proxy},}127.0.0.1,localhost"
+export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost,::1,[::1]"
+export no_proxy="${no_proxy:+${no_proxy},}127.0.0.1,localhost,::1,[::1]"
+
+ORIG_HOME="${HOME:-}"
+if [[ -n "$ORIG_HOME" ]]; then
+    export CARGO_HOME="${CARGO_HOME:-$ORIG_HOME/.cargo}"
+    export RUSTUP_HOME="${RUSTUP_HOME:-$ORIG_HOME/.rustup}"
+fi
+RUN_HOME="$OUTPUT_DIR/home"
+mkdir -p "$RUN_HOME"
+chmod 0700 "$RUN_HOME"
+export HOME="$RUN_HOME"
 
 # ---------------------------------------------------------------------------
 # Initialize extenddb

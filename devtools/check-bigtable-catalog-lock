@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+"""Serve and migrate on one Bigtable catalog, with a release binary:
+
+    devtools/check-bigtable-catalog-lock <extenddb binary> [emulator port] [api port]
+
+On a local `cbtemulator` process (or `google-cloud-cli:emulators` in Docker,
+published on 127.0.0.1 only):
+
+- before init, migrate --yes and verify exit 1 naming extenddb init;
+- init exits 0, and a second init exits 1 saying the catalog is already
+  initialized;
+- the migrate preview and verify run beside a server and exit 0, and
+  migrate --yes exits 6 naming the server's host and pid;
+- a server stopped with SIGTERM deletes its registration, so migrate --yes
+  then runs at once; `backup list` and `backup purge`'s dry run, with and
+  without a store configured, release the registration they take, so
+  migrate --yes right after them runs at once too;
+- a server killed with SIGKILL keeps migrate --yes waiting until its
+  registration expires, at most 45 s after its last renewal;
+- a server whose Bigtable endpoint stops answering answers 503 within 40 s,
+  before its registration can expire (45 s after its last renewal), then
+  tries to register again for 30 s, exits 1, and removes its PID file.
+
+Everything runs in a new temporary directory, with HOME pointed into it so
+init's TLS certificate is not written to the caller's home. The server
+binds 127.0.0.1 only. The emulator is stopped at the end.
+"""
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+
+from catalog_checks import (
+    docker,
+    expect_exit,
+    finish,
+    healthy,
+    report,
+    start,
+    stop,
+    watch_lost_registration,
+    with_filesystem_store,
+)
+
+H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00"
+
+
+def find_cbtemulator() -> str | None:
+    for env_key in ("CBTEMULATOR_BIN", "CBTEMULATOR"):
+        candidate = os.environ.get(env_key, "").strip()
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    found = shutil.which("cbtemulator")
+    if found:
+        return found
+    for candidate in (
+        "/usr/lib/google-cloud-sdk/platform/bigtable-emulator/cbtemulator",
+        "/usr/local/Caskroom/google-cloud-sdk/latest/google-cloud-sdk/platform/bigtable-emulator/cbtemulator",
+        os.path.expanduser("~/google-cloud-sdk/platform/bigtable-emulator/cbtemulator"),
+    ):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def wait_h2(host: str, port: int, timeout_s: float, proc: subprocess.Popen | None = None) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if proc is not None and proc.poll() is not None:
+            return False
+        try:
+            with socket.create_connection((host, port), timeout=1.0) as sock:
+                sock.settimeout(1.0)
+                sock.sendall(H2_PREFACE)
+                hdr = b""
+                while len(hdr) < 9:
+                    chunk = sock.recv(9 - len(hdr))
+                    if not chunk:
+                        break
+                    hdr += chunk
+                if len(hdr) == 9 and hdr[3] == 0x04 and hdr[5:9] == b"\x00\x00\x00\x00":
+                    return True
+        except OSError:
+            pass
+        time.sleep(0.2)
+    return False
+
+
+def main(binary: str, emulator_port: int, api_port: int) -> int:
+    binary = os.path.realpath(binary)
+    container = f"extenddb-check-bt-lock-{emulator_port}"
+    work = tempfile.mkdtemp()
+    servers: list[subprocess.Popen] = []
+    emu_proc: subprocess.Popen | None = None
+    used_docker = False
+    try:
+        os.chdir(work)
+        cbt_bin = find_cbtemulator()
+        if cbt_bin is not None:
+            emu_proc = start(
+                [cbt_bin, "-host=127.0.0.1", f"-port={emulator_port}"],
+                None,
+                os.path.join(work, "cbtemulator.log"),
+            )
+            if not wait_h2("127.0.0.1", emulator_port, 60, emu_proc):
+                report(False, f"cbtemulator on 127.0.0.1:{emulator_port} did not answer HTTP/2")
+                return finish()
+        else:
+            docker("rm", "-f", container)
+            started_docker = docker(
+                "run",
+                "-d",
+                "--name",
+                container,
+                "-p",
+                f"127.0.0.1:{emulator_port}:{emulator_port}",
+                "gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators",
+                "gcloud",
+                "beta",
+                "emulators",
+                "bigtable",
+                "start",
+                f"--host-port=0.0.0.0:{emulator_port}",
+            )
+            used_docker = True
+            if started_docker.returncode != 0 or not wait_h2("127.0.0.1", emulator_port, 60):
+                report(False, f"start {container}", started_docker.stderr)
+                return finish()
+
+        for proxy_var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+            os.environ.pop(proxy_var, None)
+        os.environ["NO_PROXY"] = "127.0.0.1,localhost"
+        os.environ["no_proxy"] = "127.0.0.1,localhost"
+
+        env = dict(
+            os.environ,
+            HOME=os.path.join(work, "home"),
+            EXTENDDB__SERVER__RUN_DIR=os.path.join(work, "run"),
+            EXTENDDB_ADMIN_PASSWORD="CheckAdminPassw0rd1",
+            BIGTABLE_EMULATOR_HOST=f"127.0.0.1:{emulator_port}",
+        )
+
+        with open("extenddb.toml", "w", encoding="utf-8") as f:
+            f.write(
+                '[storage]\nbackend = "bigtable"\n\n'
+                '[storage.bigtable]\nproject_id = "extenddb-check"\n'
+                f'instance_id = "extenddb-check"\nemulator_host = "127.0.0.1:{emulator_port}"\n'
+            )
+
+        migrate = [binary, "migrate", "--config", "extenddb.toml"]
+        verify = [binary, "verify", "--config", "extenddb.toml"]
+        serve = [binary, "serve", "--config", "extenddb.toml", "--foreground", "--port", str(api_port)]
+        url = f"https://127.0.0.1:{api_port}/health"
+
+        output = expect_exit(1, "migrate --yes before init", migrate + ["--yes", "--lock-timeout", "1"], env)
+        report("extenddb init" in output, "the refusal names extenddb init", output)
+        expect_exit(1, "verify before init", verify, env, contains="extenddb init")
+
+        expect_exit(
+            0,
+            "init",
+            [binary, "init", "--backend", "bigtable", "--config", "extenddb.toml", "--overwrite"],
+            env,
+            timeout=120,
+        )
+        expect_exit(
+            1,
+            "a second init",
+            [binary, "init", "--backend", "bigtable", "--config", "extenddb.toml", "--overwrite"],
+            env,
+            contains="already initialized",
+        )
+
+        expect_exit(0, "verify on the fresh catalog", verify, env, contains="OK: Current")
+        expect_exit(0, "the migrate preview on the fresh catalog", migrate, env, contains="Up to date")
+        expect_exit(0, "migrate --list", migrate + ["--list"], env, contains="not applicable")
+
+        server = start(serve, env, "serve.log")
+        servers.append(server)
+        if not healthy(url, server, 60):
+            stop(server)
+            with open("serve.log", encoding="utf-8") as f:
+                report(False, "the server did not become healthy", f.read())
+            return finish()
+
+        expect_exit(0, "migrate preview beside a server", migrate, env)
+        expect_exit(0, "verify beside a server", verify, env)
+        expect_exit(
+            6,
+            "migrate --yes while a server runs",
+            migrate + ["--yes", "--lock-timeout", "2"],
+            env,
+            contains=f"pid {server.pid} on {socket.gethostname()}",
+        )
+        stop(server)
+        report(server.returncode == 0, f"the server stopped on SIGTERM with exit {server.returncode}")
+        stopped_at = time.monotonic()
+        expect_exit(0, "migrate --yes once the server stopped", migrate + ["--yes", "--lock-timeout", "2"], env)
+        report(time.monotonic() - stopped_at < 20, "the stopped server deleted its registration")
+
+        backup = [binary, "backup", "--config", "extenddb.toml"]
+        expect_exit(0, "backup list with no server running", backup + ["list"], env, contains="none (")
+        expect_exit(
+            0,
+            "backup purge's dry run with no server running",
+            backup + ["purge"],
+            env,
+            contains="Dry run: nothing was deleted",
+        )
+        store_config, root = with_filesystem_store(os.path.join(work, "extenddb.toml"), work)
+        backup = [binary, "backup", "--config", store_config]
+        expect_exit(
+            0,
+            "backup list with a filesystem store configured",
+            backup + ["list"],
+            env,
+            contains=f"=== backups in the filesystem store {root}",
+        )
+        expect_exit(
+            0,
+            "backup purge's dry run with a filesystem store configured",
+            backup + ["purge"],
+            env,
+            contains="Dry run: nothing was deleted. Run again with --confirm",
+        )
+        started = time.monotonic()
+        expect_exit(
+            0,
+            "migrate --yes right after the backup commands",
+            migrate + ["--yes", "--lock-timeout", "2"],
+            env,
+        )
+        report(
+            time.monotonic() - started < 20,
+            "migrate --yes did not wait for a backup command's registration",
+        )
+        expect_exit(
+            0,
+            "migrate --yes --reconverge on a current Bigtable catalog",
+            migrate + ["--yes", "--reconverge"],
+            env,
+            contains="Ran again 1 baseline",
+        )
+        expect_exit(
+            1,
+            "migrate --forget 9999 refuses a nonexistent ledger entry",
+            migrate + ["--forget", "9999"],
+            env,
+            contains="carries no migration 9999",
+        )
+
+        # A server killed without deleting its registration blocks migrate --yes
+        # until the registration expires, at most 45 s after its last renewal.
+        server = start(serve, env, "serve-killed.log")
+        servers.append(server)
+        if healthy(url, server, 60):
+            server.kill()
+            server.wait()
+            killed = time.monotonic()
+            expect_exit(
+                0,
+                "migrate --yes after a killed server's registration expires",
+                migrate + ["--yes", "--lock-timeout", "70"],
+                env,
+                timeout=90,
+            )
+            waited = time.monotonic() - killed
+            report(waited <= 55, f"migrate --yes ran {waited:.0f} s after the server was killed")
+        else:
+            report(False, "the server did not start for the kill check")
+
+        # A server whose Bigtable endpoint stops answering answers 503 within 40 s,
+        # before its registration can expire (45 s after its last renewal), then
+        # tries to register again for 30 s, exits 1, and removes its PID file.
+        server = start(serve + ["--write-pid-file"], env, "serve-paused.log")
+        servers.append(server)
+        pid_file = os.path.join(work, "run", f"extenddb-{api_port}.pid")
+        if healthy(url, server, 60) and report(os.path.exists(pid_file), "the server wrote its PID file"):
+            if emu_proc is not None:
+                os.kill(emu_proc.pid, signal.SIGSTOP)
+            else:
+                docker("pause", container)
+            try:
+                first_503, code, took = watch_lost_registration(server, url, 120)
+            finally:
+                if emu_proc is not None:
+                    os.kill(emu_proc.pid, signal.SIGCONT)
+                else:
+                    docker("unpause", container)
+            with open("serve-paused.log", encoding="utf-8") as f:
+                log = f.read()
+            report(
+                first_503 is not None and first_503 < 40,
+                "the server answered 503 "
+                + (
+                    "never"
+                    if first_503 is None
+                    else f"{first_503:.1f} s after its database stopped answering"
+                )
+                + ", within 40 s, before its registration can expire",
+                log,
+            )
+            report(
+                code == 1 and first_503 is not None and first_503 + 25 <= took <= first_503 + 50,
+                f"the server exited {code} {took:.0f} s after its database stopped answering, "
+                "25 to 50 s after its first 503",
+                log,
+            )
+            last = next((line for line in reversed(log.splitlines()) if line.strip()), "")
+            report(
+                "registration" in last,
+                f"its last line names the lost registration: {last.strip()[-300:]!r}",
+                log,
+            )
+            report(not os.path.exists(pid_file), "the server removed its PID file")
+        else:
+            report(False, "the server did not start for the pause check")
+    finally:
+        for server in servers:
+            if server.poll() is None:
+                server.send_signal(signal.SIGTERM)
+                stop(server)
+        if emu_proc is not None:
+            try:
+                os.kill(emu_proc.pid, signal.SIGCONT)
+            except OSError:
+                pass
+            stop(emu_proc)
+        if used_docker:
+            docker("unpause", container)
+            docker("rm", "-f", "-v", container)
+        os.chdir("/")
+        shutil.rmtree(work, ignore_errors=True)
+    return finish()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) not in (2, 3, 4):
+        sys.exit(__doc__)
+    sys.exit(
+        main(
+            sys.argv[1],
+            int(sys.argv[2]) if len(sys.argv) > 2 else 18086,
+            int(sys.argv[3]) if len(sys.argv) > 3 else 18460,
+        )
+    )

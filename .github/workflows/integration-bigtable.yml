@@ -6,7 +6,7 @@ on:
   pull_request:
   merge_group:
   push:
-    branches: [main, feat/bigtable-backend]
+    branches: [main]
 
 permissions:
   contents: read
@@ -166,6 +166,8 @@ jobs:
         env:
           EXTENDDB_TEST_BACKUP_STORE: none
         run: devtools/run-bigtable-tests -- --rust-integration
+      - name: Check Bigtable catalog lock and serving registration
+        run: python3 devtools/check-bigtable-catalog-lock target/release/extenddb 18086 18460
 
   bigtable-production-build:
     runs-on: extenddb_ubuntu-2404_4-core

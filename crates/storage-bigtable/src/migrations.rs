@@ -22,12 +22,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::hooks::{Reregistration, ServingRegistrar};
-use extenddb_storage::management_store::{ManagementStore, SettingsStore};
+use extenddb_storage::management_store::{
+    AccessKeyCreated, AccountDetail, GroupDetail, GroupListEntry, ManagementStore, OpError,
+    OpResult, RoleDetail, RoleListEntry, SecretPage, SecretWrite, SessionPolicyEntry,
+    SettingsStore, StoredDocument, UserDetail, UserListEntry,
+};
 use extenddb_storage::migrations::{
     CatalogMigrations, CatalogStatus, CatalogTraces, Done, HeldLock, Kind, LedgerRow, Listed,
     LockedStores, Migration, MigrationBackend, MigrationError, MigrationId, Released, RunKind,
     RunReport, Runner, Step, StoreBody, StoreKind, StoreRef, Target,
 };
+use extenddb_storage::secret_keys::SecretTable;
+use futures::future::BoxFuture;
 use serde_json::json;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -94,7 +100,7 @@ impl Timing {
     /// every 15 s with a 25 s safety margin, and 45 s server registrations
     /// renewed every 5 s with a 30 s loss deadline.
     pub const PRODUCTION: Self = Self {
-        lease: Duration::from_secs(60),
+        lease: Duration::from_mins(1),
         renew_every: Duration::from_secs(15),
         margin: Duration::from_secs(25),
         idle_limit: Duration::from_secs(30),
@@ -133,6 +139,11 @@ impl MigrationLease {
 
     /// Verify that the holder still owns a valid, un-expired lease within the
     /// safety margin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MigrationError::Store`] if the lease was lost or its safety
+    /// window has elapsed since the last confirmed renewal.
     pub fn check(&self) -> Result<(), MigrationError> {
         if let Some(reason) = self
             .lost
@@ -193,6 +204,11 @@ pub struct MigrationLock {
 impl MigrationLock {
     /// Acquire `lock:catalog_migrations`, polling until `timeout` elapses, and
     /// start background renewal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MigrationError::Locked`] if another migrator holds the lock
+    /// past `timeout`, or [`MigrationError::Store`] on RPC failure.
     pub async fn acquire(
         catalog_client: Arc<BigtableClient>,
         timeout: Duration,
@@ -259,6 +275,11 @@ impl MigrationLock {
 
     /// Wait up to `timeout` for all live `server_registration:<token>` rows to
     /// disappear or expire.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MigrationError::Locked`] if servers remain registered past
+    /// `timeout`, or [`MigrationError::Store`] on lease loss or RPC failure.
     pub async fn wait_for_servers(&self, timeout: Duration) -> Result<(), MigrationError> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -323,7 +344,22 @@ fn spawn_lock_renewal(
     tokio::spawn(async move {
         let mut wait = timing.renew_every;
         loop {
-            tokio::time::sleep(wait).await;
+            let remaining = {
+                let since = lease
+                    .renewed
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .elapsed();
+                timing.valid_for().saturating_sub(since)
+            };
+            if remaining.is_zero() {
+                let _ = lease.check();
+                return;
+            }
+            tokio::time::sleep(wait.min(remaining)).await;
+            if lease.check().is_err() {
+                return;
+            }
             if lease.idle_for() >= timing.idle_limit {
                 let _ = lease.mark_lost(format!(
                     "migration holder made no progress for {} s; stopping lock renewal",
@@ -331,10 +367,23 @@ fn spawn_lock_renewal(
                 ));
                 return;
             }
+            let remaining = {
+                let since = lease
+                    .renewed
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .elapsed();
+                timing.valid_for().saturating_sub(since)
+            };
+            if remaining.is_zero() {
+                let _ = lease.check();
+                return;
+            }
             let sent = Instant::now();
+            let bound = REQUEST_TIMEOUT.min(timing.renew_every).min(remaining);
             let cat = Catalog::new(&catalog_client);
             match tokio::time::timeout(
-                REQUEST_TIMEOUT.min(timing.renew_every),
+                bound,
                 cat.renew_lock(MIGRATION_LOCK_NAME, &owner, timing.lease),
             )
             .await
@@ -350,10 +399,16 @@ fn spawn_lock_renewal(
                     return;
                 }
                 Ok(Err(e)) => {
+                    if lease.check().is_err() {
+                        return;
+                    }
                     tracing::warn!(error = %e, "migration lock renewal failed; retrying");
                     wait = Duration::from_secs(1).min(timing.renew_every);
                 }
                 Err(_) => {
+                    if lease.check().is_err() {
+                        return;
+                    }
                     tracing::warn!("migration lock renewal timed out; retrying");
                     wait = Duration::from_secs(1).min(timing.renew_every);
                 }
@@ -423,6 +478,12 @@ pub struct ServingRegistration {
 }
 
 impl ServingRegistration {
+    /// Register a serving process with the default [`SERVE_COMMAND`] label.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MigrationError`] if catalog connection fails, the catalog is
+    /// uninitialized, or a migration holds `lock:catalog_migrations`.
     pub async fn register(
         connection_string: &str,
         release: &str,
@@ -431,6 +492,13 @@ impl ServingRegistration {
         Self::register_as(connection_string, release, SERVE_COMMAND, timing).await
     }
 
+    /// Register a serving process under `command` and verify no migration lock
+    /// is currently held.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MigrationError`] if catalog connection fails, the catalog is
+    /// uninitialized, or a migration holds `lock:catalog_migrations`.
     pub async fn register_as(
         connection_string: &str,
         release: &str,
@@ -705,14 +773,23 @@ impl ServingRegistrar for ServerRegistration {
 
 /// Read-only catalog status check across both `StoreKind::Catalog` and
 /// `StoreKind::Data`.
+///
+/// # Errors
+///
+/// Returns [`MigrationError`] if connecting to Bigtable or reading ledgers fails.
 pub async fn catalog_status(connection_string: &str) -> Result<CatalogStatus, MigrationError> {
     let target = Target::at(connection_string);
     let backend = BigtableMigrationRunnerBackend::connect(&target, None).await?;
-    Runner::new(&backend, "").status().await
+    backend.resolve_status("").await
 }
 
 /// Register as a serving process, verify that no migration lock is held, and
 /// verify that `Runner::status` is `Current` or `AheadCompatible`.
+///
+/// # Errors
+///
+/// Returns [`MigrationError`] if the migration lock is held, the catalog status
+/// forbids serving, or a Bigtable request fails.
 pub async fn register_and_check(
     connection_string: &str,
     release: &str,
@@ -722,6 +799,11 @@ pub async fn register_and_check(
 }
 
 /// [`register_and_check`] for the process named by `command`.
+///
+/// # Errors
+///
+/// Returns [`MigrationError`] if the migration lock is held, the catalog status
+/// forbids serving, or a Bigtable request fails.
 pub async fn register_and_check_as(
     connection_string: &str,
     release: &str,
@@ -767,6 +849,11 @@ pub struct BigtableMigrationStores {
 }
 
 impl BigtableMigrationStores {
+    /// Verify the active migration lease is still held within its safety window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MigrationError::Store`] if the held lease was lost or expired.
     pub fn check_lease(&self) -> Result<(), MigrationError> {
         if let Some(ref lease) = self.lease {
             lease.check()?;
@@ -970,7 +1057,9 @@ async fn connect_catalog_and_data(
             .map_err(|e| MigrationError::store("connect to Bigtable catalog instance", e))?,
     );
     let data_instance_id = cfg.effective_data_instance_id().to_owned();
-    let data_client = if data_instance_id != cfg.instance_id {
+    let data_client = if data_instance_id == cfg.instance_id {
+        catalog_client.clone()
+    } else {
         let mut data_cfg = cfg.clone();
         data_cfg.instance_id.clone_from(&data_instance_id);
         Arc::new(
@@ -978,8 +1067,6 @@ async fn connect_catalog_and_data(
                 .await
                 .map_err(|e| MigrationError::store("connect to Bigtable data instance", e))?,
         )
-    } else {
-        catalog_client.clone()
     };
     Ok((catalog_client, data_client, data_instance_id))
 }
@@ -1015,6 +1102,51 @@ impl BigtableMigrationRunnerBackend {
                 Catalog::with_table(&self.stores.data_client, DATA_LEDGER_TABLE)
             }
         }
+    }
+
+    /// Inspect `__extenddb_catalog__` for non-ephemeral rows when neither
+    /// `migration_ledger:catalog:*` nor `version:catalog` / `setting:catalog_version`
+    /// is present, distinguishing an empty catalog from a damaged or foreign
+    /// `__extenddb_catalog__` table across any column family or qualifier.
+    async fn unexpected_uninitialized_catalog_rows(&self) -> Result<Vec<String>, MigrationError> {
+        self.stores.check_lease()?;
+        let cat = Catalog::new(&self.stores.catalog_client);
+        let row_keys = match cat.scan_any_row_keys(16).await {
+            Ok(keys) => keys,
+            Err(StorageError::TableNotFound(_)) => {
+                self.stores.progressed();
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(MigrationError::store("scan __extenddb_catalog__ rows", e)),
+        };
+        self.stores.progressed();
+        let lock_key = format!("lock:{MIGRATION_LOCK_NAME}");
+        let catalog_id_key = keys::setting("catalog_id");
+        let unexpected: Vec<String> = row_keys
+            .into_iter()
+            .filter(|k| {
+                k != &lock_key
+                    && k != &catalog_id_key
+                    && !k.starts_with(keys::SERVER_REGISTRATION_SCAN_PREFIX)
+            })
+            .collect();
+        Ok(unexpected)
+    }
+
+    async fn resolve_status(&self, applied_by: &str) -> Result<CatalogStatus, MigrationError> {
+        let status = Runner::new(self, applied_by).status().await?;
+        if status == CatalogStatus::Uninitialized {
+            let unexpected = self.unexpected_uninitialized_catalog_rows().await?;
+            if !unexpected.is_empty() {
+                return Ok(CatalogStatus::NeedsAttention {
+                    items: vec![format!(
+                        "{CATALOG_TABLE} is not an ExtendDB catalog or is missing its migration ledger/catalog_version records (holds: {})",
+                        unexpected.join(", ")
+                    )],
+                });
+            }
+        }
+        Ok(status)
     }
 }
 
@@ -1108,40 +1240,41 @@ impl MigrationBackend for BigtableMigrationRunnerBackend {
             Err(e) => return Err(MigrationError::store("read catalog version", e)),
         };
         self.stores.progressed();
-        let catalog_version = row.and_then(|v| {
+        let mut catalog_version = row.and_then(|v| {
             v.get("catalog_version")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
         });
+        if catalog_version.is_none() {
+            self.stores.check_lease()?;
+            let setting_row = cat
+                .get(&keys::setting("catalog_version"))
+                .await
+                .map_err(|e| MigrationError::store("read setting:catalog_version", e))?;
+            self.stores.progressed();
+            catalog_version = setting_row.and_then(|v| {
+                v.get("value")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+        }
+        self.stores.check_lease()?;
+        let marker_row = cat
+            .get(&keys::setting("resource_tag_migration"))
+            .await
+            .map_err(|e| MigrationError::store("read setting:resource_tag_migration", e))?;
+        self.stores.progressed();
         Ok(CatalogTraces {
             catalog_version,
-            resource_tag_marker: false,
+            resource_tag_marker: marker_row.is_some(),
         })
     }
 
     async fn catalog_is_empty(&self) -> Result<bool, MigrationError> {
-        self.stores.check_lease()?;
-        let cat = Catalog::new(&self.stores.catalog_client);
-        let ver = match cat.get(keys::VERSION).await {
-            Ok(v) => v,
-            Err(StorageError::TableNotFound(_)) => {
-                self.stores.progressed();
-                return Ok(true);
-            }
-            Err(e) => return Err(MigrationError::store("check catalog version", e)),
-        };
-        if ver.is_some() {
-            self.stores.progressed();
-            return Ok(false);
-        }
-        let ledger = cat
-            .scan_prefix(&keys::migration_ledger_prefix_for_store(
-                StoreKind::Catalog.as_str(),
-            ))
-            .await
-            .map_err(|e| MigrationError::store("check catalog ledger", e))?;
-        self.stores.progressed();
-        Ok(ledger.is_empty())
+        Ok(self
+            .unexpected_uninitialized_catalog_rows()
+            .await?
+            .is_empty())
     }
 
     async fn before_first_write(
@@ -1275,78 +1408,109 @@ struct LeasedBigtableStores {
 }
 
 impl LeasedBigtableStores {
-    fn check(&self) -> extenddb_storage::management_store::OpResult<()> {
+    fn check(&self) -> OpResult<()> {
         self.lease
             .check()
-            .map_err(|e| extenddb_storage::management_store::OpError::Internal(e.to_string()))
+            .map_err(|e| OpError::Internal(e.to_string()))
+    }
+}
+
+fn leased_no_answer(what: &str) -> OpError {
+    OpError::Internal(format!(
+        "{what}: no answer within {} s",
+        REQUEST_TIMEOUT.as_secs()
+    ))
+}
+
+macro_rules! checked_leased_store {
+    ($( fn $name:ident(&self $(, $arg:ident: $ty:ty)* $(,)?) -> $ret:ty; )+) => {
+        $(
+            fn $name(&self $(, $arg: $ty)*) -> $ret {
+                if let Err(e) = self.check() {
+                    return Box::pin(async move { Err(e) });
+                }
+                let call = self.inner.$name($($arg),*);
+                Box::pin(async move {
+                    let answer = tokio::time::timeout(REQUEST_TIMEOUT, call).await;
+                    self.lease.progressed();
+                    answer.unwrap_or_else(|_| Err(leased_no_answer(stringify!($name))))
+                })
+            }
+        )+
+    };
+}
+
+impl ManagementStore for LeasedBigtableStores {
+    checked_leased_store! {
+        fn create_account(&self, account_id: &str, account_name: &str) -> BoxFuture<'_, OpResult<()>>;
+        fn delete_account(&self, account_id: &str) -> BoxFuture<'_, OpResult<()>>;
+        fn default_account_id(&self) -> BoxFuture<'_, OpResult<Option<String>>>;
+        fn list_all_accounts(&self) -> BoxFuture<'_, OpResult<Vec<(String, String)>>>;
+        fn list_all_accounts_full(&self) -> BoxFuture<'_, OpResult<Vec<(String, String, time::OffsetDateTime)>>>;
+        fn list_accounts_for(&self, account_id: &str) -> BoxFuture<'_, OpResult<Vec<(String, String)>>>;
+        fn get_account_detail(&self, account_id: &str) -> BoxFuture<'_, OpResult<Option<AccountDetail>>>;
+        fn dashboard_counts(&self) -> BoxFuture<'_, OpResult<(i64, i64)>>;
+        fn create_user(&self, account_id: &str, user_name: &str, password_hash: Option<&str>) -> BoxFuture<'_, OpResult<()>>;
+        fn delete_user(&self, account_id: &str, user_name: &str) -> BoxFuture<'_, OpResult<()>>;
+        fn list_users(&self, account_id: &str) -> BoxFuture<'_, OpResult<Vec<UserListEntry>>>;
+        fn get_user_detail(&self, account_id: &str, user_name: &str) -> BoxFuture<'_, OpResult<Option<UserDetail>>>;
+        fn verify_iam_user_password(&self, account_id: &str, user_name: &str, password: &str) -> BoxFuture<'_, OpResult<bool>>;
+        fn change_user_password(&self, account_id: &str, user_name: &str, password_hash: &str) -> BoxFuture<'_, OpResult<()>>;
+        fn tag_user(&self, account_id: &str, user_name: &str, tags: &[(String, String)]) -> BoxFuture<'_, OpResult<()>>;
+        fn untag_user(&self, account_id: &str, user_name: &str, tag_keys: &[String]) -> BoxFuture<'_, OpResult<()>>;
+        fn list_user_tags(&self, account_id: &str, user_name: &str) -> BoxFuture<'_, OpResult<Vec<(String, String)>>>;
+        fn create_group(&self, account_id: &str, group_name: &str) -> BoxFuture<'_, OpResult<()>>;
+        fn delete_group(&self, account_id: &str, group_name: &str) -> BoxFuture<'_, OpResult<()>>;
+        fn list_groups(&self, account_id: &str) -> BoxFuture<'_, OpResult<Vec<GroupListEntry>>>;
+        fn get_group_detail(&self, account_id: &str, group_name: &str) -> BoxFuture<'_, OpResult<Option<GroupDetail>>>;
+        fn add_group_member(&self, account_id: &str, group_name: &str, user_name: &str) -> BoxFuture<'_, OpResult<()>>;
+        fn remove_group_member(&self, account_id: &str, group_name: &str, user_name: &str) -> BoxFuture<'_, OpResult<()>>;
+        fn create_role(&self, account_id: &str, role_name: &str, trust_policy: &serde_json::Value) -> BoxFuture<'_, OpResult<()>>;
+        fn delete_role(&self, account_id: &str, role_name: &str) -> BoxFuture<'_, OpResult<()>>;
+        fn list_roles(&self, account_id: &str) -> BoxFuture<'_, OpResult<Vec<RoleListEntry>>>;
+        fn get_role_detail(&self, account_id: &str, role_name: &str) -> BoxFuture<'_, OpResult<Option<RoleDetail>>>;
+        fn get_role_trust_policy(&self, account_id: &str, role_name: &str) -> BoxFuture<'_, OpResult<Option<serde_json::Value>>>;
+        fn tag_role(&self, account_id: &str, role_name: &str, tags: &[(String, String)]) -> BoxFuture<'_, OpResult<()>>;
+        fn untag_role(&self, account_id: &str, role_name: &str, tag_keys: &[String]) -> BoxFuture<'_, OpResult<()>>;
+        fn list_role_tags(&self, account_id: &str, role_name: &str) -> BoxFuture<'_, OpResult<Vec<(String, String)>>>;
+        fn put_policy(&self, account_id: &str, principal_type: &str, principal_name: &str, policy_name: &str, document: &serde_json::Value) -> BoxFuture<'_, OpResult<()>>;
+        fn delete_policy(&self, account_id: &str, principal_type: &str, principal_name: &str, policy_name: &str) -> BoxFuture<'_, OpResult<()>>;
+        fn list_policies(&self, account_id: &str, principal_type: &str, principal_name: &str) -> BoxFuture<'_, OpResult<Vec<(String, serde_json::Value, time::OffsetDateTime)>>>;
+        fn list_policy_documents(&self, account_id: &str, principal_type: &str, principal_name: &str) -> BoxFuture<'_, OpResult<Vec<(String, StoredDocument)>>>;
+        fn set_user_boundary(&self, account_id: &str, user_name: &str, document: &serde_json::Value) -> BoxFuture<'_, OpResult<()>>;
+        fn get_user_boundary(&self, account_id: &str, user_name: &str) -> BoxFuture<'_, OpResult<Option<serde_json::Value>>>;
+        fn delete_user_boundary(&self, account_id: &str, user_name: &str) -> BoxFuture<'_, OpResult<()>>;
+        fn set_role_boundary(&self, account_id: &str, role_name: &str, document: &serde_json::Value) -> BoxFuture<'_, OpResult<()>>;
+        fn get_role_boundary(&self, account_id: &str, role_name: &str) -> BoxFuture<'_, OpResult<Option<serde_json::Value>>>;
+        fn boundary_document(&self, account_id: &str, principal_type: &str, principal_name: &str) -> BoxFuture<'_, OpResult<Option<StoredDocument>>>;
+        fn delete_role_boundary(&self, account_id: &str, role_name: &str) -> BoxFuture<'_, OpResult<()>>;
+        fn create_access_key(&self, account_id: &str, user_name: &str) -> BoxFuture<'_, OpResult<AccessKeyCreated>>;
+        fn delete_access_key(&self, account_id: &str, user_name: &str, key_id: &str) -> BoxFuture<'_, OpResult<()>>;
+        fn list_access_keys(&self, account_id: &str, user_name: &str) -> BoxFuture<'_, OpResult<Vec<(String, bool, time::OffsetDateTime)>>>;
+        fn import_access_key(&self, account_id: &str, user_name: &str, access_key_id: &str, secret_access_key: &str) -> BoxFuture<'_, OpResult<()>>;
+        fn store_session(&self, session_token: &str, access_key_id: &str, secret_key_encrypted: &[u8], account_id: &str, role_name: &str, session_name: &str, session_tags: &Option<serde_json::Value>, session_policy: &Option<serde_json::Value>, expires_at: time::OffsetDateTime) -> BoxFuture<'_, OpResult<()>>;
+        fn list_session_policies(&self) -> BoxFuture<'_, OpResult<Vec<SessionPolicyEntry>>>;
+        fn update_session_policy(&self, session_token: &str, document: &serde_json::Value) -> BoxFuture<'_, OpResult<()>>;
+        fn fetch_caller_tags(&self, account_id: &str, resource: &str) -> BoxFuture<'_, OpResult<Vec<(String, String)>>>;
+        fn read_secret_page(&self, table: SecretTable, page: Option<&str>, page_size: usize) -> BoxFuture<'_, OpResult<SecretPage>>;
+        fn write_secrets(&self, table: SecretTable, rows: &[SecretWrite]) -> BoxFuture<'_, OpResult<()>>;
+        fn delete_secrets(&self, table: SecretTable, keys: &[String]) -> BoxFuture<'_, OpResult<()>>;
+        fn delete_setting(&self, key: &str) -> BoxFuture<'_, OpResult<()>>;
     }
 }
 
 impl SettingsStore for LeasedBigtableStores {
-    fn get_setting(
-        &self,
-        key: &str,
-    ) -> futures::future::BoxFuture<'_, extenddb_storage::management_store::OpResult<Option<String>>>
-    {
-        let key = key.to_owned();
-        Box::pin(async move {
-            self.check()?;
-            let res = SettingsStore::get_setting(&self.inner, &key).await;
-            self.lease.progressed();
-            res
-        })
-    }
-
-    fn set_setting(
-        &self,
-        key: &str,
-        value: &str,
-    ) -> futures::future::BoxFuture<'_, extenddb_storage::management_store::OpResult<()>> {
-        let key = key.to_owned();
-        let value = value.to_owned();
-        Box::pin(async move {
-            self.check()?;
-            let res = SettingsStore::set_setting(&self.inner, &key, &value).await;
-            self.lease.progressed();
-            res
-        })
-    }
-
-    fn replace_setting(
-        &self,
-        key: &str,
-        expected: &str,
-        value: &str,
-    ) -> futures::future::BoxFuture<'_, extenddb_storage::management_store::OpResult<bool>> {
-        let key = key.to_owned();
-        let expected = expected.to_owned();
-        let value = value.to_owned();
-        Box::pin(async move {
-            self.check()?;
-            let res = SettingsStore::replace_setting(&self.inner, &key, &expected, &value).await;
-            self.lease.progressed();
-            res
-        })
-    }
-
-    fn list_settings(
-        &self,
-    ) -> futures::future::BoxFuture<
-        '_,
-        extenddb_storage::management_store::OpResult<Vec<(String, String)>>,
-    > {
-        Box::pin(async move {
-            self.check()?;
-            let res = SettingsStore::list_settings(&self.inner).await;
-            self.lease.progressed();
-            res
-        })
+    checked_leased_store! {
+        fn get_setting(&self, key: &str) -> BoxFuture<'_, OpResult<Option<String>>>;
+        fn set_setting(&self, key: &str, value: &str) -> BoxFuture<'_, OpResult<()>>;
+        fn replace_setting(&self, key: &str, expected: &str, value: &str) -> BoxFuture<'_, OpResult<bool>>;
+        fn list_settings(&self) -> BoxFuture<'_, OpResult<Vec<(String, String)>>>;
     }
 }
 
 impl LockedStores for LeasedBigtableStores {
     fn management(&self) -> &dyn ManagementStore {
-        &self.inner
+        self
     }
 
     fn settings(&self) -> &dyn SettingsStore {
@@ -1387,9 +1551,7 @@ impl CatalogMigrations for BigtableCatalogMigrations {
 
     async fn status(&self, target: &Target) -> Result<CatalogStatus, MigrationError> {
         let backend = BigtableMigrationRunnerBackend::connect(target, None).await?;
-        Runner::new(&backend, env!("CARGO_PKG_VERSION"))
-            .status()
-            .await
+        backend.resolve_status(env!("CARGO_PKG_VERSION")).await
     }
 
     async fn status_under_lock(
@@ -1406,9 +1568,7 @@ impl CatalogMigrations for BigtableCatalogMigrations {
             },
             data_instance_id: h.data_instance_id.clone(),
         };
-        Runner::new(&backend, env!("CARGO_PKG_VERSION"))
-            .status()
-            .await
+        backend.resolve_status(env!("CARGO_PKG_VERSION")).await
     }
 
     async fn catalog_ledger(&self, target: &Target) -> Result<Vec<LedgerRow>, MigrationError> {
@@ -1436,6 +1596,12 @@ impl CatalogMigrations for BigtableCatalogMigrations {
             },
             data_instance_id: h.data_instance_id.clone(),
         };
+        if kind != RunKind::Reconverge
+            && let status @ CatalogStatus::NeedsAttention { .. } =
+                backend.resolve_status(release).await?
+        {
+            return Err(MigrationError::Status(status));
+        }
         let runner = Runner::new(&backend, release);
         match kind {
             RunKind::Create | RunKind::Migrate => runner.migrate().await,
@@ -1480,6 +1646,12 @@ impl CatalogMigrations for BigtableCatalogMigrations {
 impl BigtableCatalogMigrations {
     /// Acquire the catalog migration lock with explicit [`Timing`] (exposed for
     /// fast lease-renewal and server-fence tests).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MigrationError`] if the catalog is uninitialized (when
+    /// `!creating`), holds unexpected foreign/damaged rows without ledger
+    /// records (when `creating`), or lock acquisition / server drain fails.
     pub async fn lock_with_timing(
         &self,
         target: &Target,
@@ -1492,7 +1664,27 @@ impl BigtableCatalogMigrations {
             connect_catalog_and_data(&cfg).await?;
         let creating = target.data_connection.is_some();
 
+        let probe = BigtableMigrationRunnerBackend {
+            stores: BigtableMigrationStores {
+                catalog_client: catalog_client.clone(),
+                data_client: data_client.clone(),
+                lease: None,
+            },
+            data_instance_id: data_instance_id.clone(),
+        };
+
         if creating {
+            if !Runner::new(&probe, "").initialized().await? {
+                let unexpected = probe.unexpected_uninitialized_catalog_rows().await?;
+                if !unexpected.is_empty() {
+                    return Err(MigrationError::Refused(format!(
+                        "the table {CATALOG_TABLE} is not an ExtendDB catalog: it holds {}. \
+                         Nothing was written to it. Run init against a Bigtable instance where \
+                         {CATALOG_TABLE} is empty or absent",
+                        unexpected.join(", ")
+                    )));
+                }
+            }
             // `init`: ensure `__extenddb_catalog__` exists before taking the
             // lock so a fresh catalog always writes and renews
             // `lock:catalog_migrations` prior to running Migration 1.
@@ -1503,18 +1695,17 @@ impl BigtableCatalogMigrations {
                 .create_table(CATALOG_TABLE, &[(CF, Some(gc_max_versions(1)))])
                 .await
                 .map_err(|e| MigrationError::store("ensure __extenddb_catalog__ for lock", e))?;
-        } else {
-            let probe = BigtableMigrationRunnerBackend {
-                stores: BigtableMigrationStores {
-                    catalog_client: catalog_client.clone(),
-                    data_client: data_client.clone(),
-                    lease: None,
-                },
-                data_instance_id: data_instance_id.clone(),
-            };
-            if !Runner::new(&probe, "").initialized().await? {
-                return Err(MigrationError::Status(CatalogStatus::Uninitialized));
+        } else if !Runner::new(&probe, "").initialized().await? {
+            let unexpected = probe.unexpected_uninitialized_catalog_rows().await?;
+            if !unexpected.is_empty() {
+                return Err(MigrationError::Status(CatalogStatus::NeedsAttention {
+                    items: vec![format!(
+                        "{CATALOG_TABLE} is not an ExtendDB catalog or is missing its migration ledger/catalog_version records (holds: {})",
+                        unexpected.join(", ")
+                    )],
+                }));
             }
+            return Err(MigrationError::Status(CatalogStatus::Uninitialized));
         }
 
         let started = Instant::now();

@@ -17,7 +17,6 @@ use extenddb_core::metrics::{MetricsCollector, QuerySource};
 use extenddb_storage::hooks::{
     CancellationToken, ServerRuntimeHooks, ServingRegistrar, WorkerContext, sleep_or_shutdown,
 };
-use extenddb_storage::{DataEngine, StreamEngine};
 
 use crate::BigtableEngine;
 use crate::catalog::Catalog;
@@ -25,14 +24,110 @@ use crate::config::BigtableStorageConfig;
 use crate::data::client::BigtableClient;
 use crate::ttl_worker;
 
-const STREAM_CLEANUP_INTERVAL: Duration = Duration::from_secs(3_600);
+const STREAM_CLEANUP_INTERVAL: Duration = Duration::from_hours(1);
 const STREAM_RETENTION_HOURS: i64 = 24;
-const IDEMPOTENCY_CLEANUP_INTERVAL: Duration = Duration::from_secs(600);
+const IDEMPOTENCY_CLEANUP_INTERVAL: Duration = Duration::from_mins(10);
 const IDEMPOTENCY_MAX_AGE_SECS: i64 = 600;
+const LEASE_RENEW_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Spawn a background renewal task for a held catalog lease `lock:<lock_name>`,
+/// renewing every `lease_duration / 3` and cancelling `cancel_on_loss` if
+/// ownership is lost (`Ok(false)`) OR if transient renewal errors / timeouts
+/// prevent confirmed renewal across `80%` of `lease_duration`.
+pub(crate) fn spawn_catalog_lease_renewal(
+    catalog_client: Arc<BigtableClient>,
+    lock_name: String,
+    owner: String,
+    lease_duration: Duration,
+    cancel_on_loss: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    let renew_interval = (lease_duration / 3).max(Duration::from_secs(1));
+    let safety_ms = u64::try_from(lease_duration.as_millis())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(4)
+        / 5;
+    let safety_window = Duration::from_millis(safety_ms.max(1_000));
+
+    tokio::spawn(async move {
+        let mut last_renewed = Instant::now();
+        let mut wait = renew_interval;
+        loop {
+            let remaining = safety_window.saturating_sub(last_renewed.elapsed());
+            if remaining.is_zero() {
+                tracing::warn!(
+                    lock_name,
+                    "catalog lease safety window elapsed without renewal; cancelling fenced pass"
+                );
+                cancel_on_loss.cancel();
+                return;
+            }
+            if !sleep_or_shutdown(&cancel_on_loss, wait.min(remaining)).await {
+                return;
+            }
+            let remaining = safety_window.saturating_sub(last_renewed.elapsed());
+            if remaining.is_zero() {
+                tracing::warn!(
+                    lock_name,
+                    "catalog lease safety window elapsed without renewal; cancelling fenced pass"
+                );
+                cancel_on_loss.cancel();
+                return;
+            }
+            let sent = Instant::now();
+            let bound = LEASE_RENEW_RPC_TIMEOUT.min(renew_interval).min(remaining);
+            let renew_cat = Catalog::new(&catalog_client);
+            match tokio::time::timeout(
+                bound,
+                renew_cat.renew_lock(&lock_name, &owner, lease_duration),
+            )
+            .await
+            {
+                Ok(Ok(true)) => {
+                    last_renewed = sent;
+                    wait = renew_interval;
+                }
+                Ok(Ok(false)) => {
+                    tracing::warn!(
+                        lock_name,
+                        "catalog lease ownership lost during pass; cancelling fenced pass"
+                    );
+                    cancel_on_loss.cancel();
+                    return;
+                }
+                Ok(Err(e)) => {
+                    if last_renewed.elapsed() >= safety_window {
+                        tracing::warn!(
+                            lock_name,
+                            error = %e,
+                            "catalog lease renewal failed past safety window; cancelling fenced pass"
+                        );
+                        cancel_on_loss.cancel();
+                        return;
+                    }
+                    tracing::warn!(lock_name, error = %e, "catalog lease renewal failed; retrying");
+                    wait = Duration::from_secs(1).min(renew_interval);
+                }
+                Err(_) => {
+                    if last_renewed.elapsed() >= safety_window {
+                        tracing::warn!(
+                            lock_name,
+                            "catalog lease renewal timed out past safety window; cancelling fenced pass"
+                        );
+                        cancel_on_loss.cancel();
+                        return;
+                    }
+                    tracing::warn!(lock_name, "catalog lease renewal timed out; retrying");
+                    wait = Duration::from_secs(1).min(renew_interval);
+                }
+            }
+        }
+    })
+}
 
 /// Run a periodic background worker guarded by a distributed catalog lease
 /// `lock:<lock_name>`, renewing the lease every `lease_duration / 3` while the
-/// pass runs and cancelling `pass_token` immediately if renewal loses the lock.
+/// pass runs and cancelling `pass_token` immediately if renewal loses the lock
+/// or exceeds its safety window.
 pub async fn run_leased_worker<F, Fut>(
     catalog_client: Arc<BigtableClient>,
     lock_name: &'static str,
@@ -45,7 +140,6 @@ pub async fn run_leased_worker<F, Fut>(
     F: FnMut(CancellationToken) -> Fut,
     Fut: Future<Output = ()>,
 {
-    let renew_interval = (lease_duration / 3).max(Duration::from_secs(1));
     while sleep_or_shutdown(&shutdown, cadence).await {
         let cat = Catalog::new(&catalog_client);
         let acquired = match cat.try_lock(lock_name, &owner, lease_duration).await {
@@ -60,31 +154,13 @@ pub async fn run_leased_worker<F, Fut>(
         }
 
         let pass_token = shutdown.child_token();
-        let renew_token = pass_token.clone();
-        let renew_client = catalog_client.clone();
-        let renew_owner = owner.clone();
-        let renewal_task = tokio::spawn(async move {
-            while sleep_or_shutdown(&renew_token, renew_interval).await {
-                let renew_cat = Catalog::new(&renew_client);
-                match renew_cat
-                    .renew_lock(lock_name, &renew_owner, lease_duration)
-                    .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        tracing::warn!(
-                            lock_name,
-                            "worker lease ownership lost during pass; cancelling pass"
-                        );
-                        renew_token.cancel();
-                        return;
-                    }
-                    Err(e) => {
-                        tracing::warn!(lock_name, error = %e, "worker lease renewal failed");
-                    }
-                }
-            }
-        });
+        let renewal_task = spawn_catalog_lease_renewal(
+            catalog_client.clone(),
+            lock_name.to_owned(),
+            owner.clone(),
+            lease_duration,
+            pass_token.clone(),
+        );
 
         work(pass_token.clone()).await;
 
@@ -179,22 +255,22 @@ async fn run_stream_record_cleanup(
         STREAM_CLEANUP_INTERVAL,
         lease,
         shutdown,
-        |_pass_token| {
+        |pass_token| {
             let engine = engine.clone();
             let metrics = metrics.clone();
             async move {
                 let start = Instant::now();
-                match StreamEngine::cleanup_expired_stream_records(&*engine, STREAM_RETENTION_HOURS)
+                match engine
+                    .cleanup_expired_stream_records_cancellable(STREAM_RETENTION_HOURS, &pass_token)
                     .await
                 {
                     Ok(n) => {
                         if n > 0 {
                             tracing::info!("bigtable stream cleanup deleted {n} expired record(s)");
                         }
-                        #[allow(clippy::cast_precision_loss)]
                         metrics.record_worker_success(
                             QuerySource::StreamCleanup,
-                            start.elapsed().as_micros() as f64,
+                            start.elapsed().as_secs_f64() * 1_000_000.0,
                         );
                     }
                     Err(e) => {
@@ -223,16 +299,17 @@ async fn run_idempotency_token_cleanup(
         IDEMPOTENCY_CLEANUP_INTERVAL,
         lease,
         shutdown,
-        |_pass_token| {
+        |pass_token| {
             let engine = engine.clone();
             let metrics = metrics.clone();
             async move {
                 let start = Instant::now();
-                match DataEngine::cleanup_expired_idempotency_tokens(
-                    &*engine,
-                    IDEMPOTENCY_MAX_AGE_SECS,
-                )
-                .await
+                match engine
+                    .cleanup_expired_idempotency_tokens_cancellable(
+                        IDEMPOTENCY_MAX_AGE_SECS,
+                        &pass_token,
+                    )
+                    .await
                 {
                     Ok(n) => {
                         if n > 0 {
@@ -240,10 +317,9 @@ async fn run_idempotency_token_cleanup(
                                 "bigtable idempotency cleanup deleted {n} expired token(s)"
                             );
                         }
-                        #[allow(clippy::cast_precision_loss)]
                         metrics.record_worker_success(
                             QuerySource::IdempotencyCleanup,
-                            start.elapsed().as_micros() as f64,
+                            start.elapsed().as_secs_f64() * 1_000_000.0,
                         );
                     }
                     Err(e) => {

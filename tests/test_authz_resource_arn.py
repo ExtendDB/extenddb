@@ -155,15 +155,26 @@ def table(auth_env, mgmt, account_id, region):
     admin.put_item(TableName=name, Item={"pk": {"S": "p1"}, "g1pk": {"S": "g1"}})
     desc = admin.describe_table(TableName=name)["Table"]
     table_arn = desc["TableArn"]
-    backup_arn = admin.create_backup(TableName=name, BackupName="arnbk")["BackupDetails"]["BackupArn"]
+    has_backup = True
+    try:
+        backup_arn = admin.create_backup(TableName=name, BackupName="arnbk")["BackupDetails"]["BackupArn"]
+    except ClientError as exc:
+        err = exc.response["Error"]
+        if err.get("Code") == "ValidationException" and "CreateBackup is not supported" in err.get("Message", ""):
+            backup_arn = f"{table_arn}/backup/01700000000000-aaaaaaaa"
+            has_backup = False
+        else:
+            raise
     yield {
         "name": name,
         "table_arn": table_arn,
         "index_arn": table_arn + "/index/gsi1",
         "stream_arn": desc.get("LatestStreamArn"),
         "backup_arn": backup_arn,
+        "has_backup": has_backup,
     }
-    _delete_backup_when_available(admin, backup_arn)
+    if has_backup:
+        _delete_backup_when_available(admin, backup_arn)
     try:
         admin.delete_table(TableName=name)
     except ClientError:
@@ -464,6 +475,8 @@ class TestExplicitDenyOnResourceArn:
             admin.untag_resource(ResourceArn=tbl, TagKeys=["ttk"])
 
     def test_backup_operations_see_no_resource_tags(self, table):
+        if not table["has_backup"]:
+            pytest.skip("CreateBackup is not supported by this storage backend")
         # Pins the measured behaviour; the branch before the fix also read no
         # tags here, because nothing can be stored under a backup ARN.
         admin = self._ddb(ALLOW_ALL)

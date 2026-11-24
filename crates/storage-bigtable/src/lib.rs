@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cloud Bigtable storage backend for ExtendDB.
+//! Cloud Bigtable storage backend for `ExtendDB`.
 
 pub mod backup_stubs;
 pub mod bootstrapper;
@@ -12,9 +12,8 @@ pub mod data;
 pub mod engine;
 pub mod gsi;
 pub mod gsi_worker;
-// Frozen once released: neither rustfmt nor a later clippy lint may require
-// an edit that changes its checksum.
 #[rustfmt::skip]
+// Justification: frozen once released so neither rustfmt nor a later clippy lint may require an edit that changes m0001_baseline's pinned checksum.
 #[allow(clippy::all, deprecated)]
 pub mod m0001_baseline;
 pub mod migrations;
@@ -31,7 +30,7 @@ pub use config::BigtableStorageConfig;
 pub use data::client::BigtableClient;
 pub use engine::BigtableEngine;
 
-/// Backend identifier registered with ExtendDB.
+/// Backend identifier registered with `ExtendDB`.
 pub const BACKEND_NAME: &str = "bigtable";
 
 /// Default control-plane transition delay (`control_plane_delay_seconds`) in seconds.
@@ -113,6 +112,8 @@ pub fn backend() -> extenddb_storage::Backend {
     }
 }
 
+// Justification: server_components_factory wires config parsing, app-profile validation, migration gate, secret keys, and component registration in sequence.
+#[allow(clippy::too_many_lines)]
 fn server_components_factory(
     config: &(dyn extenddb_storage::config::StorageConfig + 'static),
     region: &str,
@@ -155,12 +156,12 @@ fn server_components_factory(
         // issues any `CheckAndMutateRow` against `__extenddb_catalog__`.
         crate::data::admin::AdminClient::validate_app_profile(&client)
             .await
-            .map_err(extenddb_storage::BackendError::InitializationFailed)?;
+            .map_err(|e| extenddb_storage::BackendError::InitializationFailed(e.to_string()))?;
 
         let data_client = match cfg.data_instance_id.as_deref() {
             Some(data_inst) if !data_inst.is_empty() && data_inst != cfg.instance_id => {
                 let mut data_cfg = cfg.clone();
-                data_cfg.instance_id = data_inst.to_owned();
+                data_inst.clone_into(&mut data_cfg.instance_id);
                 let dc = std::sync::Arc::new(
                     crate::data::client::BigtableClient::connect(&data_cfg)
                         .await
@@ -174,7 +175,9 @@ fn server_components_factory(
                 }
                 crate::data::admin::AdminClient::validate_app_profile(&dc)
                     .await
-                    .map_err(extenddb_storage::BackendError::InitializationFailed)?;
+                    .map_err(|e| {
+                        extenddb_storage::BackendError::InitializationFailed(e.to_string())
+                    })?;
                 dc
             }
             _ => client.clone(),

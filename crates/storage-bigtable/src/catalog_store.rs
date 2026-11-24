@@ -286,7 +286,7 @@ impl DiagnosticsStore for BigtableCatalogStore {
                 .scan_prefix(keys::TABLE_META_SCAN_PREFIX)
                 .await
                 .map_err(storage_diag_err)?;
-            Ok(tables.len() as i64)
+            Ok(i64::try_from(tables.len()).unwrap_or(i64::MAX))
         })
     }
 
@@ -303,11 +303,11 @@ impl DiagnosticsStore for BigtableCatalogStore {
                 total += desc
                     .get("GlobalSecondaryIndexes")
                     .and_then(serde_json::Value::as_array)
-                    .map_or(0, |a| a.len() as i64);
+                    .map_or(0, |a| i64::try_from(a.len()).unwrap_or(i64::MAX));
                 total += desc
                     .get("LocalSecondaryIndexes")
                     .and_then(serde_json::Value::as_array)
-                    .map_or(0, |a| a.len() as i64);
+                    .map_or(0, |a| i64::try_from(a.len()).unwrap_or(i64::MAX));
             }
             Ok(total)
         })
@@ -319,7 +319,16 @@ impl DiagnosticsStore for BigtableCatalogStore {
     ) -> BoxFuture<'_, DiagResult<String>> {
         Box::pin(async move {
             let data_inst = self.client.config().effective_data_instance_id().to_owned();
-            if data_inst != self.client.instance_id {
+            if data_inst == self.client.instance_id {
+                let mut admin = AdminClient::connect(&self.client)
+                    .await
+                    .map_err(|e| DiagError::ConnectionFailed(e.to_string()))?;
+                admin
+                    .list_tables()
+                    .await
+                    .map_err(|e| DiagError::QueryFailed(e.to_string()))?;
+                Ok(self.client.instance_id.clone())
+            } else {
                 let mut data_cfg = self.client.config().clone();
                 data_cfg.instance_id.clone_from(&data_inst);
                 let data_client = BigtableClient::connect(&data_cfg)
@@ -327,15 +336,12 @@ impl DiagnosticsStore for BigtableCatalogStore {
                     .map_err(DiagError::ConnectionFailed)?;
                 let mut admin = AdminClient::connect(&data_client)
                     .await
-                    .map_err(DiagError::ConnectionFailed)?;
-                admin.list_tables().await.map_err(DiagError::QueryFailed)?;
-                Ok(data_inst)
-            } else {
-                let mut admin = AdminClient::connect(&self.client)
+                    .map_err(|e| DiagError::ConnectionFailed(e.to_string()))?;
+                admin
+                    .list_tables()
                     .await
-                    .map_err(DiagError::ConnectionFailed)?;
-                admin.list_tables().await.map_err(DiagError::QueryFailed)?;
-                Ok(self.client.instance_id.clone())
+                    .map_err(|e| DiagError::QueryFailed(e.to_string()))?;
+                Ok(data_inst)
             }
         })
     }
@@ -687,7 +693,7 @@ impl RateLimitStore for BigtableCatalogStore {
                             .is_some_and(|ts| ts >= cutoff)
                 })
                 .count();
-            Ok(count as i64)
+            Ok(i64::try_from(count).unwrap_or(i64::MAX))
         })
     }
 
@@ -715,7 +721,7 @@ impl RateLimitStore for BigtableCatalogStore {
                             .is_some_and(|ts| ts >= cutoff)
                 })
                 .count();
-            Ok(count as i64)
+            Ok(i64::try_from(count).unwrap_or(i64::MAX))
         })
     }
 
@@ -1135,7 +1141,10 @@ impl ManagementStore for BigtableCatalogStore {
                 .scan_prefix("admin:")
                 .await
                 .map_err(internal_op_err)?;
-            Ok((accts.len() as i64, admins.len() as i64))
+            Ok((
+                i64::try_from(accts.len()).unwrap_or(i64::MAX),
+                i64::try_from(admins.len()).unwrap_or(i64::MAX),
+            ))
         })
     }
 
@@ -2449,6 +2458,8 @@ impl ManagementStore for BigtableCatalogStore {
 
     // ── Encryption-Key Commands ────────────────────────────────────
 
+    // Justification: cursor validation, bounded range paging, and SecretTable-specific row decoding stay in one sequential pass.
+    #[allow(clippy::too_many_lines)]
     fn read_secret_page(
         &self,
         table: SecretTable,
@@ -2458,90 +2469,108 @@ impl ManagementStore for BigtableCatalogStore {
         let page = page.map(str::to_owned);
         Box::pin(async move {
             let page_size = page_size.max(1);
-            let prefix = match table {
-                SecretTable::AccessKeys => keys::ACCESS_KEY_SCAN_PREFIX,
-                SecretTable::IamSessions => keys::IAM_SESSION_SCAN_PREFIX,
+            let (prefix, end_open) = match table {
+                SecretTable::AccessKeys => (keys::ACCESS_KEY_SCAN_PREFIX, "access_key;"),
+                SecretTable::IamSessions => (keys::IAM_SESSION_SCAN_PREFIX, "iam_session;"),
             };
-            let raw = self
-                .cat()
-                .scan_prefix(prefix)
-                .await
-                .map_err(internal_op_err)?;
-            let mut matched: Vec<StoredSecretRow> = Vec::new();
-            for (rk, v) in raw {
-                let Some(pk) = rk.strip_prefix(prefix).map(str::to_owned) else {
-                    continue;
-                };
-                if let Some(after) = page.as_deref()
-                    && pk.as_str() <= after
-                {
-                    continue;
-                }
-                let Some(secret_key_encrypted) = decode_stored_secret(&v) else {
-                    continue;
-                };
-                let access_key_id = v
-                    .get("access_key_id")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or(&pk)
-                    .to_owned();
-                let account_id = v
-                    .get("account_id")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
-                let created_at = v
-                    .get("created_at")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(parse_rfc3339);
+            let fetch_limit_usize = page_size.saturating_add(1);
+            let fetch_limit = i64::try_from(fetch_limit_usize).unwrap_or(i64::MAX);
+            let (mut cur_start, mut cur_inclusive) = match page.as_deref() {
+                Some(after) => (format!("{prefix}{after}"), false),
+                None => (prefix.to_owned(), true),
+            };
+            let cat = self.cat();
+            let mut matched: Vec<StoredSecretRow> = Vec::with_capacity(fetch_limit_usize);
 
-                match table {
-                    SecretTable::AccessKeys => {
-                        let principal_name = v
-                            .get("user_name")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("")
-                            .to_owned();
-                        matched.push(StoredSecretRow {
-                            table,
-                            key: pk,
-                            access_key_id,
-                            account_id,
-                            principal_name,
-                            session_name: None,
-                            expires_at: None,
-                            created_at,
-                            secret_key_encrypted,
-                            write_timestamp: None,
-                        });
+            while matched.len() < fetch_limit_usize {
+                let raw = cat
+                    .scan_str_range(&cur_start, cur_inclusive, end_open, fetch_limit)
+                    .await
+                    .map_err(internal_op_err)?;
+                let batch_len = raw.len();
+                if batch_len == 0 {
+                    break;
+                }
+                let mut last_rk = String::new();
+                for (rk, v) in raw {
+                    last_rk.clone_from(&rk);
+                    let Some(pk) = rk.strip_prefix(prefix).map(str::to_owned) else {
+                        continue;
+                    };
+                    let Some(secret_key_encrypted) = decode_stored_secret(&v) else {
+                        continue;
+                    };
+                    let access_key_id = v
+                        .get("access_key_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(&pk)
+                        .to_owned();
+                    let account_id = v
+                        .get("account_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    let created_at = v
+                        .get("created_at")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(parse_rfc3339);
+
+                    match table {
+                        SecretTable::AccessKeys => {
+                            let principal_name = v
+                                .get("user_name")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("")
+                                .to_owned();
+                            matched.push(StoredSecretRow {
+                                table,
+                                key: pk,
+                                access_key_id,
+                                account_id,
+                                principal_name,
+                                session_name: None,
+                                expires_at: None,
+                                created_at,
+                                secret_key_encrypted,
+                                write_timestamp: None,
+                            });
+                        }
+                        SecretTable::IamSessions => {
+                            let principal_name = v
+                                .get("role_name")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("")
+                                .to_owned();
+                            let session_name = v
+                                .get("session_name")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned);
+                            let expires_at = session_expires_at(&v).map(|(secs, _)| secs);
+                            matched.push(StoredSecretRow {
+                                table,
+                                key: pk,
+                                access_key_id,
+                                account_id,
+                                principal_name,
+                                session_name,
+                                expires_at,
+                                created_at,
+                                secret_key_encrypted,
+                                write_timestamp: None,
+                            });
+                        }
                     }
-                    SecretTable::IamSessions => {
-                        let principal_name = v
-                            .get("role_name")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("")
-                            .to_owned();
-                        let session_name = v
-                            .get("session_name")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_owned);
-                        let expires_at = session_expires_at(&v).map(|(secs, _)| secs);
-                        matched.push(StoredSecretRow {
-                            table,
-                            key: pk,
-                            access_key_id,
-                            account_id,
-                            principal_name,
-                            session_name,
-                            expires_at,
-                            created_at,
-                            secret_key_encrypted,
-                            write_timestamp: None,
-                        });
+                    if matched.len() >= fetch_limit_usize {
+                        break;
                     }
                 }
+                if batch_len < fetch_limit_usize || last_rk.is_empty() {
+                    break;
+                }
+                cur_start = last_rk;
+                cur_inclusive = false;
             }
-            matched.sort_by(|a, b| a.key.cmp(&b.key));
+
             let has_more = matched.len() > page_size;
             matched.truncate(page_size);
             let next = if has_more {
@@ -2928,6 +2957,8 @@ impl BigtableCredentialStore {
     }
 }
 
+// Justification: async_trait expansion of CredentialStore::lookup_credential spans ASIA session + AKIA user/admin decryption and policy assembly.
+#[allow(clippy::too_many_lines)]
 #[async_trait::async_trait]
 impl extenddb_auth::CredentialStore for BigtableCredentialStore {
     async fn lookup_credential(
