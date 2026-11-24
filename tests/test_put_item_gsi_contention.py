@@ -17,7 +17,7 @@ backend to is the contract the retry loop gives: every call answers 200 or 503
 ServiceUnavailable, never 400 TransactionConflictException and never 500; the
 stored item is one writer's item, whole; and the index holds exactly one entry
 for it. These tests fail on a server that reports a lost race to the client as
-a 400 or a 500, or that sheds more than half of the puts.
+a 400 or a 500, or that sheds more than a tenth of the puts.
 """
 
 from __future__ import annotations
@@ -32,13 +32,14 @@ import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-from conftest import configured_backend, scoped_table
+from conftest import call_with_handshake_retry, configured_backend, scoped_table
 
 WRITERS = 32
 PUTS_PER_WRITER = 63
-# The only failure a contended put may answer. The server sheds a put that
-# has been losing to other writers for CONTENTION_DEADLINE (10 s).
-SHED = "503 ServiceUnavailable"
+# The only failure a contended put may answer, as status, code and message.
+# The server sheds a put that has been losing to other writers for
+# CONTENTION_DEADLINE (10 s).
+SHED = "503 ServiceUnavailable Service is temporarily unavailable"
 
 
 @pytest.fixture(scope="module")
@@ -83,7 +84,9 @@ def gsi_table(dynamodb_client):
 def _hammer(clients: list, table: str, pk: str) -> list[str]:
     """WRITERS threads each put PUTS_PER_WRITER items on `pk`, each with its own client.
 
-    Returns the failures.
+    Returns the failures, each as status, code and message. A TLS handshake
+    that fails before a put is sent is retried by `call_with_handshake_retry`,
+    since the clients retry nothing by themselves.
     """
     start = threading.Barrier(WRITERS, timeout=30)
     failures: list[str] = []
@@ -97,9 +100,13 @@ def _hammer(clients: list, table: str, pk: str) -> list[str]:
             for n in range(PUTS_PER_WRITER):
                 item = {"pk": {"S": pk}, "gk": {"S": f"g-{pk}-{i}-{n}"}, "w": {"S": f"w{i}-{n}"}}
                 try:
-                    client.put_item(TableName=table, Item=item)
+                    call_with_handshake_retry(client.put_item, TableName=table, Item=item)
                 except ClientError as e:
-                    code = f"{e.response['ResponseMetadata']['HTTPStatusCode']} {e.response['Error']['Code']}"
+                    r = e.response
+                    code = (
+                        f"{r['ResponseMetadata']['HTTPStatusCode']} "
+                        f"{r['Error']['Code']} {r['Error']['Message']}"
+                    )
                     with lock:
                         failures.append(code)
         except BaseException as e:  # noqa: BLE001 - surfaced below
@@ -138,16 +145,18 @@ def test_unconditional_puts_on_one_key_of_a_gsi_table_commit_or_are_shed(
     total = WRITERS * PUTS_PER_WRITER
     committed = total - len(failures)
     # How many of the contended puts were shed depends on the load the server
-    # is under, so the count is reported and only bounded loosely: a shed put
-    # is the only failure a caller can get, and at least half of the puts
-    # commit. A server that gives up at the first conflict sheds nearly every
-    # put of this shape and fails the second check.
+    # is under, so the count is reported and bounded: a shed put is the only
+    # failure a caller can get, and at least nine in ten of the puts commit.
+    # A server that gives up after 50 attempts, the budget the other retry
+    # loops keep, shed about a quarter of the puts of this shape in two runs
+    # at a load average of 14 to 20, and fails the second check; a server
+    # that gives up at the first conflict sheds nearly every put.
     print(f"{len(failures)} of {total} puts were shed, {committed} committed")
     assert set(failures) <= {SHED}, (
         f"{len(failures)} of {total} puts failed with something other than a shed put: "
         f"{sorted(set(failures))}"
     )
-    assert committed >= total // 2, f"only {committed} of {total} puts committed"
+    assert committed >= total * 9 // 10, f"only {committed} of {total} puts committed"
     final = dynamodb_client.get_item(
         TableName=gsi_table, Key={"pk": {"S": pk}}, ConsistentRead=True
     )["Item"]
