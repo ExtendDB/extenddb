@@ -465,6 +465,14 @@ impl StreamEngine for RecordingStorage {
     ) -> BoxFuture<'_, Result<Option<String>, StorageError>> {
         unimplemented!("not reached by read handlers")
     }
+
+    fn first_sequence_number_at_or_after(
+        &self,
+        _shard_id: &str,
+        _at_ms: i64,
+    ) -> BoxFuture<'_, Result<Option<String>, StorageError>> {
+        unimplemented!("not reached by read handlers")
+    }
 }
 
 impl WorkerStore for RecordingStorage {
