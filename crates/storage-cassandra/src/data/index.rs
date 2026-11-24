@@ -137,8 +137,8 @@ pub async fn fetch_index_by_name(
         .next()
         .ok_or_else(|| StorageError::IndexNotFound(index_name.to_owned()))?;
 
-    let index_status: Option<String> = row.get_by_name("index_status").ok().flatten();
-    if index_status.as_deref() == Some("CREATING") {
+    let index_status: String = get_column(&row, "index_status", "fetch_index_by_name")?;
+    if index_status == "CREATING" {
         let heartbeat: Option<i64> = row.get_by_name("backfill_heartbeat").ok().flatten();
         return Err(extenddb_storage::gsi_backfill::creating_read_refusal(
             index_name,

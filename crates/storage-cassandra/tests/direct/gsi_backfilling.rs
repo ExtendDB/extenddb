@@ -117,6 +117,14 @@ mod tests {
             .index_info_by_table_id(&ki.table_id, "gidx")
             .await
             .expect("an ACTIVE index resolves");
+
+        // A row whose status cannot be read is not served from the index.
+        set_row(&engine, &ki.table_id, "index_status = null").await;
+        let read = engine.index_info_by_table_id(&ki.table_id, "gidx").await;
+        assert!(
+            matches!(read, Err(StorageError::Internal(_))),
+            "a status that cannot be read fails the read: {read:?}"
+        );
     }
 
     /// One `i64` column, by its alias, from the first row of a query.
