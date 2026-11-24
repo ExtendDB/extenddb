@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use serde::de::{self, Deserialize, Deserializer};
 use serde_json::Value;
 
-use crate::types::AttributeValue;
+use crate::types::{AttributeValue, Item};
 
 /// Maximum placeholder key length in bytes, including the `#` / `:` prefix.
 const MAX_PLACEHOLDER_KEY_BYTES: usize = 255;
@@ -152,6 +152,54 @@ where
     )
 }
 
+/// The `AttributeValue` type descriptors ExtendDB recognizes. A value with no
+/// member, or a single member outside this set, is "empty" to the service.
+const KNOWN_DESCRIPTORS: &[&str] = &["S", "N", "B", "SS", "NS", "BS", "M", "L", "BOOL", "NULL"];
+
+/// DynamoDB's message for an `ExclusiveStartKey` value that is empty or
+/// carries only an unknown type descriptor: the service reports both as
+/// "empty", prefixed with the starting-key sentence. A recognized but invalid
+/// value (an empty number set, for one) keeps its own message with no prefix.
+/// Measured on DynamoDB (us-east-1, 2026-11-24).
+const INVALID_START_KEY_EMPTY: &str = "The provided starting key is invalid: Supplied \
+     AttributeValue is empty, must contain exactly one of the supported datatypes";
+
+/// Deserialize `ExclusiveStartKey` (Query and Scan). An empty value or one
+/// with only an unknown type descriptor answers [`INVALID_START_KEY_EMPTY`];
+/// any other malformed value keeps its own `AttributeValue` error, so an empty
+/// number set still answers "An number set may not be empty" with no prefix.
+/// A valid value deserializes as before.
+///
+/// # Errors
+///
+/// Returns the deserializer error type when a key value is malformed.
+pub fn deserialize_exclusive_start_key<'de, D>(deserializer: D) -> Result<Option<Item>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(raw) = Option::<serde_json::Map<String, Value>>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let mut out = Item::new();
+    for (name, value) in raw {
+        // The service reports an empty value, or one whose single member is
+        // not a known type descriptor, as "empty" with the starting-key
+        // prefix. A recognized descriptor with bad content (an empty number
+        // set, for one) keeps its own message. Decide on the value's shape,
+        // not on another layer's error text, so a member whose data merely
+        // contains "descriptor" is not mistaken for an unknown descriptor.
+        if let Some(obj) = value.as_object() {
+            let first_key = obj.keys().next().map_or("", String::as_str);
+            if obj.is_empty() || (obj.len() == 1 && !KNOWN_DESCRIPTORS.contains(&first_key)) {
+                return Err(de::Error::custom(INVALID_START_KEY_EMPTY));
+            }
+        }
+        let av = serde_json::from_value::<AttributeValue>(value).map_err(de::Error::custom)?;
+        out.insert(name, av);
+    }
+    Ok(Some(out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +227,82 @@ mod tests {
         serde_json::from_str::<TestValues>(json)
             .unwrap_err()
             .to_string()
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct TestStartKey {
+        #[serde(default, deserialize_with = "deserialize_exclusive_start_key")]
+        key: Option<Item>,
+    }
+
+    fn start_key_err(json: &str) -> String {
+        // Match the production path (serde_json::from_value), which does not
+        // append a position suffix to a custom error, unlike from_str.
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        serde_json::from_value::<TestStartKey>(value)
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn start_key_empty_value_is_prefixed_empty() {
+        assert_eq!(
+            start_key_err(r#"{"key":{"pk":{},"sk":{"S":"x"}}}"#),
+            INVALID_START_KEY_EMPTY
+        );
+    }
+
+    #[test]
+    fn start_key_unknown_descriptor_is_prefixed_empty() {
+        // The service reports an unknown descriptor as "empty", same as {}.
+        assert_eq!(
+            start_key_err(r#"{"key":{"pk":{"X":"1"},"sk":{"S":"x"}}}"#),
+            INVALID_START_KEY_EMPTY
+        );
+    }
+
+    #[test]
+    fn start_key_empty_number_set_keeps_its_own_message_unprefixed() {
+        assert_eq!(
+            start_key_err(r#"{"key":{"pk":{"NS":[]},"sk":{"S":"x"}}}"#),
+            "One or more parameter values were invalid: An number set  may not be empty"
+        );
+    }
+
+    #[test]
+    fn start_key_set_member_text_is_not_mistaken_for_a_descriptor() {
+        // A recognized descriptor (SS) whose data contains "descriptor" must
+        // keep its own error, not the prefixed empty one.
+        let msg = start_key_err(
+            r#"{"key":{"pk":{"SS":["unknown AttributeValue type descriptor","unknown AttributeValue type descriptor"]}}}"#,
+        );
+        assert!(msg.contains("contains duplicates"), "{msg}");
+        assert!(!msg.contains("provided starting key"), "{msg}");
+    }
+
+    #[test]
+    fn start_key_nested_unknown_descriptor_is_passed_through() {
+        // Only a top-level unknown descriptor is "empty"; a nested one keeps
+        // its own error (the service behavior here was not measured).
+        let msg = start_key_err(r#"{"key":{"pk":{"L":[{"X":"1"}]}}}"#);
+        assert!(
+            msg.contains("unknown AttributeValue type descriptor"),
+            "{msg}"
+        );
+        assert!(!msg.contains("provided starting key"), "{msg}");
+    }
+
+    #[test]
+    fn start_key_valid_value_deserializes() {
+        let parsed: TestStartKey =
+            serde_json::from_str(r#"{"key":{"pk":{"S":"p0"},"sk":{"S":"x"}}}"#).unwrap();
+        assert_eq!(parsed.key.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn start_key_absent_is_none() {
+        let parsed: TestStartKey = serde_json::from_str("{}").unwrap();
+        assert!(parsed.key.is_none());
     }
 
     #[test]
