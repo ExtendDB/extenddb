@@ -11,6 +11,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
+default = ["search-inequality-filters"]
 mongodb-test-hooks = []
 # The backup and restore jobs' kill-point pauses (`EXTENDDB_BACKUP_PAUSE`),
 # for the binary-level crash tests. The engine's points are its own feature;
@@ -24,8 +25,9 @@ backup-test-hooks = ["extenddb-engine/backup-test-hooks", "extenddb-storage/test
 # SearchVectors inequality filters: the extended SearchConditionExpression
 # grammar (comparators, BETWEEN, IN, OR, NOT, attribute_exists and
 # attribute_not_exists) for the accounts the `search_inequality_filters`
-# runtime setting names. Off by default. Removable: with this off, the
-# grammar module is not compiled and SearchVectors behaves as before.
+# runtime setting names, every account when it is absent. On by default.
+# Removable: with this off, the grammar module is not compiled and
+# SearchVectors accepts only an AND of equalities.
 search-inequality-filters = ["extenddb-core/search-inequality-filters", "extenddb-engine/search-inequality-filters"]
 
 [dependencies]

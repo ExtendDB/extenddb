@@ -11,6 +11,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
+default = ["search-inequality-filters"]
 # Compiles the snapshot page-size setter the consistency test uses and the
 # shared conformance check. Production builds do not compile them.
 test-hooks = ["extenddb-storage/test-hooks"]
@@ -19,8 +20,8 @@ test-hooks = ["extenddb-storage/test-hooks"]
 # session's settings, and the post-check's definitions.
 test-util = ["extenddb-storage/test-util"]
 # The SearchVectors inequality filter tests, which evaluate the extended
-# grammar on this backend. Production builds do not need it: the backend
-# applies whatever filter the engine hands it.
+# grammar on this backend. On by default. The backend applies whatever filter
+# the engine hands it, so the feature adds tests only.
 search-inequality-filters = ["extenddb-core/search-inequality-filters"]
 
 [dev-dependencies]

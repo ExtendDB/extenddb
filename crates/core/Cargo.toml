@@ -23,13 +23,14 @@ time = { workspace = true }
 uuid = { workspace = true }
 
 [features]
-default = ["partiql"]
+default = ["partiql", "search-inequality-filters"]
 # PartiQL grammar, AST and query planning. Removable: with this off, the
 # `partiql` module is not compiled and nothing else in core references it.
 partiql = []
 # SearchVectors inequality filters: the extended SearchConditionExpression
 # grammar (comparators, BETWEEN, IN, OR, NOT, attribute_exists and
 # attribute_not_exists) for the accounts the `search_inequality_filters`
-# runtime setting names. Off by default. Removable: with this off, the
-# grammar module is not compiled and SearchVectors behaves as before.
+# runtime setting names, every account when it is absent. On by default.
+# Removable: with this off, the grammar module is not compiled and
+# SearchVectors accepts only an AND of equalities.
 search-inequality-filters = []

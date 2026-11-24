@@ -168,10 +168,10 @@ def _settings_api() -> tuple[str, tuple[str, str]] | None:
 def expected_grammar() -> str | None:
     """``equality`` or ``extended`` from the setting; ``None`` when it cannot be read.
 
-    An absent setting is ``off``, which is also what a build without the
-    feature serves. A list of accounts names the account in
-    ``EXTENDDB_TEST_ACCOUNT_ID``, which ``devtools/provision-test-credentials``
-    exports.
+    An absent or empty setting is every account, so the extended grammar;
+    ``off`` is the equality-only grammar. A list of accounts names the
+    account in ``EXTENDDB_TEST_ACCOUNT_ID``, which
+    ``devtools/provision-test-credentials`` exports.
     """
     api = _settings_api()
     if api is None:
@@ -179,12 +179,12 @@ def expected_grammar() -> str | None:
     url, auth = api
     resp = requests.get(url, auth=auth, timeout=30, verify=False)
     if resp.status_code == 404:
-        return "equality"
+        return "extended"
     assert resp.status_code == 200, f"GET {url}: {resp.status_code} {resp.text}"
     value = resp.json()["value"].strip()
     if value == "off":
         return "equality"
-    if value == "all":
+    if value in ("all", ""):
         return "extended"
     account = os.environ.get("EXTENDDB_TEST_ACCOUNT_ID", "").strip()
     if not account:

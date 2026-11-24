@@ -18,7 +18,7 @@ name = "extenddb"
 path = "src/main.rs"
 
 [features]
-default = ["postgres"]
+default = ["postgres", "search-inequality-filters"]
 postgres = ["extenddb-storage-postgres"]
 cassandra = ["extenddb-storage-cassandra"]
 sqlite = ["extenddb-storage-sqlite"]
@@ -40,7 +40,9 @@ mongodb-test-hooks = [
 dev-mode = ["extenddb-app/dev-mode"]
 # SearchVectors inequality filters: the extended SearchConditionExpression
 # grammar for the accounts the `search_inequality_filters` runtime setting
-# names. Off by default; with it off SearchVectors behaves as before.
+# names, every account when it is absent. On by default, here and in every
+# crate that declares it; with it off in all of them SearchVectors accepts
+# only an AND of equalities.
 search-inequality-filters = ["extenddb-app/search-inequality-filters"]
 
 [dependencies]

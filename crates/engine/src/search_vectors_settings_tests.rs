@@ -104,12 +104,55 @@ fn is_unavailable(answer: &Result<EnabledAccounts, DynamoDbError>) -> bool {
 }
 
 #[tokio::test]
-async fn a_server_without_a_store_enables_no_account() {
+async fn a_server_without_a_store_enables_every_account() {
     let storage = storage().await;
     assert_eq!(
         enabled_accounts(&storage).await.unwrap(),
+        EnabledAccounts::All
+    );
+}
+
+#[tokio::test]
+async fn an_absent_or_empty_value_enables_every_account() {
+    for answer in [Answer::Value(None), Answer::Value(Some(String::new()))] {
+        let settings = Settings::new(Store::new(answer));
+        assert_eq!(
+            settings.enabled_accounts().await.unwrap(),
+            EnabledAccounts::All
+        );
+    }
+}
+
+#[tokio::test]
+async fn off_and_a_list_still_restrict_the_grammar() {
+    let settings = Settings::new(Store::value("off"));
+    assert_eq!(
+        settings.enabled_accounts().await.unwrap(),
         EnabledAccounts::Off
     );
+    let settings = Settings::new(Store::value("111111111111"));
+    let listed = settings.enabled_accounts().await.unwrap();
+    assert!(listed.enabled_for("111111111111", None));
+    assert!(!listed.enabled_for("222222222222", None));
+}
+
+/// A malformed value enables every account and is logged once per change.
+#[test]
+fn a_malformed_value_is_logged_once_and_enables_every_account() {
+    let (accounts, logged) = Settings::parse(Some("on"), None);
+    assert_eq!(accounts, EnabledAccounts::All);
+    assert_eq!(
+        logged.as_deref(),
+        Some(
+            "search_inequality_filters = \"on\" ignored: must be 'off', 'all', or a \
+             comma-separated list of 12-digit account IDs"
+        )
+    );
+    assert_eq!(
+        Settings::parse(Some("on"), Some("on")),
+        (EnabledAccounts::All, None)
+    );
+    assert!(Settings::parse(Some("on"), Some("off")).1.is_some());
 }
 
 #[tokio::test]
@@ -127,7 +170,7 @@ async fn each_server_reads_its_own_store() {
     );
     assert_eq!(
         enabled_accounts(&third).await.unwrap(),
-        EnabledAccounts::Off
+        EnabledAccounts::All
     );
     // installing again replaces the server's store
     install_search_filter_settings(&first, Store::value("off"));
@@ -191,7 +234,7 @@ async fn a_read_is_kept_for_the_refresh_interval() {
     tokio::time::advance(REFRESH).await;
     assert_eq!(
         settings.enabled_accounts().await.unwrap(),
-        EnabledAccounts::Off
+        EnabledAccounts::All
     );
     assert_eq!(store.reads(), 4);
 }
@@ -331,4 +374,68 @@ async fn a_poisoned_lock_leaves_the_setting_readable() {
         EnabledAccounts::Off
     );
     assert_eq!(store.reads(), 2);
+}
+
+/// The warnings this thread's subscriber receives.
+#[derive(Clone, Default)]
+struct Warnings(Arc<Mutex<Vec<String>>>);
+
+struct Message<'a>(&'a mut String);
+
+impl tracing::field::Visit for Message<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            *self.0 = format!("{value:?}");
+        }
+    }
+}
+
+impl tracing::Subscriber for Warnings {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() == tracing::Level::WARN
+    }
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut message = String::new();
+        event.record(&mut Message(&mut message));
+        self.0.lock().unwrap().push(message);
+    }
+    fn enter(&self, _span: &tracing::span::Id) {}
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// A server that reads a malformed value logs it once, and again after the
+/// value changes to another malformed one.
+#[tokio::test(start_paused = true)]
+async fn a_server_logs_a_malformed_value_once_per_change() {
+    let warnings = Warnings::default();
+    let _guard = tracing::subscriber::set_default(warnings.clone());
+    let store = Store::value("on");
+    let settings = Settings::new(store.clone());
+    for _ in 0..3 {
+        assert_eq!(
+            settings.enabled_accounts().await.unwrap(),
+            EnabledAccounts::All
+        );
+        tokio::time::advance(REFRESH).await;
+    }
+    store.set(Answer::Value(Some("true".to_owned())));
+    tokio::time::advance(REFRESH).await;
+    assert_eq!(
+        settings.enabled_accounts().await.unwrap(),
+        EnabledAccounts::All
+    );
+    assert_eq!(store.reads(), 4);
+    let reason = "must be 'off', 'all', or a comma-separated list of 12-digit account IDs";
+    assert_eq!(
+        *warnings.0.lock().unwrap(),
+        [
+            format!("search_inequality_filters = \"on\" ignored: {reason}"),
+            format!("search_inequality_filters = \"true\" ignored: {reason}"),
+        ]
+    );
 }

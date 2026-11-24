@@ -14,18 +14,16 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# The search-inequality-filters Cargo feature is off by default, so no other
-# workflow compiles its code or its tests. These jobs build it, lint it, run
-# its unit tests, and run the SearchVectors wire tests against a server built
-# with it and the search_inequality_filters setting at `all`.
-env:
-  FEATURES: >-
-    extenddb-core/search-inequality-filters,extenddb-engine/search-inequality-filters,extenddb-server/search-inequality-filters,extenddb-storage-sqlite/search-inequality-filters,extenddb-storage-postgres/search-inequality-filters
-
+# The search-inequality-filters Cargo feature is on by default, so the other
+# workflows build, lint and test it, and their wire tests run with the
+# search_inequality_filters setting absent, which gives every account the
+# extended grammar. These jobs cover what they do not: each crate that
+# declares the feature built and tested with it compiled out, and the vector
+# wire tests with the setting written as `off` and as `all`.
 jobs:
-  lint:
+  compiled-out:
     runs-on: extenddb_ubuntu-2404_4-core
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -35,60 +33,21 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo clippy --workspace --all-targets --features "$FEATURES" -- -D warnings
-      # The SQLite-only binary, whose backend selection differs from the
-      # workspace build's PostgreSQL default.
-      - run: cargo clippy -p extenddb --all-targets --no-default-features --features sqlite,search-inequality-filters -- -D warnings
-
-  msrv:
-    runs-on: extenddb_ubuntu-2404_4-core
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: "1.91.1"
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo build --locked --workspace --features "$FEATURES"
-
-  unit:
-    runs-on: extenddb_ubuntu-2404_4-core
-    timeout-minutes: 40
-    services:
-      postgres:
-        image: pgvector/pgvector:pg16
-        env:
-          POSTGRES_PASSWORD: devpass
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 127.0.0.1:5432:5432
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Unit tests of the crates the feature changes
-        run: >-
-          cargo test --locked --no-fail-fast
-          -p extenddb-core -p extenddb-engine -p extenddb-server -p extenddb-storage-sqlite
-          --features "extenddb-core/search-inequality-filters,extenddb-engine/search-inequality-filters,extenddb-server/search-inequality-filters,extenddb-storage-sqlite/search-inequality-filters"
-      # Same environment as the PostgreSQL storage-level job in
-      # integration.yml: the tests create and drop their own databases, and
-      # EXTENDDB_TEST_PG_REQUIRED turns a missing connection into a failure.
-      - name: PostgreSQL storage tests
-        env:
-          EXTENDDB_TEST_PG_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
-          EXTENDDB_TEST_PG_REQUIRED: "1"
-        run: cargo test --locked --no-fail-fast --release -p extenddb-storage-postgres --features search-inequality-filters --tests
+      # One crate per run: a crate built with others would get the feature
+      # back from a dependent that enables its defaults.
+      - name: Lint each crate with the feature off
+        run: |
+          set -e
+          cargo clippy --locked -p extenddb-core --all-targets --no-default-features --features partiql -- -D warnings
+          cargo clippy --locked -p extenddb-engine --all-targets --no-default-features --features partiql -- -D warnings
+          for crate in extenddb-server extenddb-app extenddb-storage-sqlite extenddb-storage-postgres; do
+            cargo clippy --locked -p "$crate" --all-targets --no-default-features -- -D warnings
+          done
+      - name: Unit tests of core and the engine with the feature off
+        run: |
+          set -e
+          cargo test --locked --no-fail-fast -p extenddb-core --no-default-features --features partiql
+          cargo test --locked --no-fail-fast -p extenddb-engine --no-default-features --features partiql
 
   wire:
     runs-on: extenddb_ubuntu-2404_4-core
@@ -97,6 +56,7 @@ jobs:
       fail-fast: false
       matrix:
         backend: [sqlite, postgres]
+        setting: ["off", all]
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -120,7 +80,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build release
-        run: cargo build --locked --release -p extenddb --no-default-features --features ${{ matrix.backend }},search-inequality-filters
+        run: cargo build --locked --release -p extenddb --no-default-features --features ${{ matrix.backend }}
 
       - name: Initialize ExtendDB
         id: init
@@ -161,14 +121,15 @@ jobs:
       # file, except the CLI catalog migration file, which builds catalogs of
       # its own and does not depend on the feature. devtools/run-tests writes
       # the setting before the suite starts; the modules read it and fail when
-      # the server serves the other grammar.
+      # the server serves the other grammar. Under `off` the tests of the
+      # extended grammar skip.
       - name: Run the vector wire tests
         env:
           EXTENDDB_TEST_ENDPOINT: https://127.0.0.1:18443
           EXTENDDB_ADMIN_USER: admin
           EXTENDDB_ADMIN_PASSWORD: ${{ steps.init.outputs.admin_password }}
           EXTENDDB_TEST_BACKUP_STORE: ${{ matrix.backend == 'sqlite' && 'filesystem' || 'none' }}
-          EXTENDDB_TEST_SEARCH_INEQUALITY_FILTERS: all
+          EXTENDDB_TEST_SEARCH_INEQUALITY_FILTERS: ${{ matrix.setting }}
           EXTENDDB_EXPECT_VECTORS: "1"
         run: devtools/run-tests --extenddb --pytest --parallel --filter "vector and not test_cli"
 
@@ -179,13 +140,11 @@ jobs:
   search-inequality-filters:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 5
-    needs: [lint, msrv, unit, wire]
+    needs: [compiled-out, wire]
     if: always()
     steps:
       - run: |
-          if [ "${{ needs.lint.result }}" != "success" ] \
-              || [ "${{ needs.msrv.result }}" != "success" ] \
-              || [ "${{ needs.unit.result }}" != "success" ] \
+          if [ "${{ needs.compiled-out.result }}" != "success" ] \
               || [ "${{ needs.wire.result }}" != "success" ]; then
             exit 1
           fi

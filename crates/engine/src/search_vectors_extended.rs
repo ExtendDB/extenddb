@@ -12,7 +12,7 @@
 //! which accounts get the grammar. It is read through the settings store the
 //! server installs with [`install_search_filter_settings`] (see
 //! `search_vectors_settings.rs`), so a change applies without a restart.
-//! Until a store is installed, no account gets the grammar.
+//! Until a store is installed, every account gets the grammar.
 
 pub(crate) use imp::{Extended, parse_request, resolve_scope};
 

@@ -5,8 +5,9 @@
 //!
 //! The server installs its settings store against its storage engine with
 //! [`install_search_filter_settings`], so two servers in one process read
-//! their own catalogs. A storage engine without an installed store enables no
-//! account.
+//! their own catalogs. An absent or empty value enables every account, as
+//! does a storage engine without an installed store. A malformed value is
+//! logged once per change and enables every account.
 //!
 //! A read is kept for [`REFRESH`], so a busy server reads the catalog about
 //! once per interval rather than once per request, and a change made through
@@ -69,7 +70,7 @@ pub fn search_filter_settings_changed() {
 }
 
 /// The accounts the setting enables on the server that `storage` belongs
-/// to. An absent or malformed value enables none.
+/// to. An absent, empty or malformed value enables every account.
 ///
 /// # Errors
 ///
@@ -85,7 +86,7 @@ pub(crate) async fn enabled_accounts(
         .map(|(_, settings)| Arc::clone(settings));
     match settings {
         Some(settings) => settings.enabled_accounts().await,
-        None => Ok(EnabledAccounts::Off),
+        None => Ok(EnabledAccounts::All),
     }
 }
 
@@ -185,7 +186,10 @@ impl Settings {
         let previous = kept.take().and_then(|k| k.raw);
         let (raw, accounts) = match read {
             Ok(Ok(Ok(raw))) => {
-                let accounts = Self::parse(raw.as_deref(), previous.as_deref());
+                let (accounts, ignored) = Self::parse(raw.as_deref(), previous.as_deref());
+                if let Some(ignored) = ignored {
+                    tracing::warn!("{ignored}");
+                }
                 (raw, Some(accounts))
             }
             Ok(Ok(Err(e))) => {
@@ -214,16 +218,21 @@ impl Settings {
         answer
     }
 
-    fn parse(raw: Option<&str>, previous: Option<&str>) -> EnabledAccounts {
+    /// The accounts a stored value enables, and the line to log when the
+    /// value is malformed and differs from the previous read. An absent
+    /// value, like a malformed one, enables every account.
+    fn parse(raw: Option<&str>, previous: Option<&str>) -> (EnabledAccounts, Option<String>) {
         let Some(value) = raw else {
-            return EnabledAccounts::Off;
+            return (EnabledAccounts::All, None);
         };
-        EnabledAccounts::parse(value).unwrap_or_else(|reason| {
-            if previous != Some(value) {
-                tracing::warn!("{SEARCH_INEQUALITY_FILTERS} = {value:?} ignored: {reason}");
-            }
-            EnabledAccounts::Off
-        })
+        match EnabledAccounts::parse(value) {
+            Ok(accounts) => (accounts, None),
+            Err(reason) => (
+                EnabledAccounts::All,
+                (previous != Some(value))
+                    .then(|| format!("{SEARCH_INEQUALITY_FILTERS} = {value:?} ignored: {reason}")),
+            ),
+        }
     }
 }
 

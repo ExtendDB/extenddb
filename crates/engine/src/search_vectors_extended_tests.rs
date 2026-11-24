@@ -94,14 +94,16 @@ async fn parsed(
 #[tokio::test]
 async fn the_setting_selects_the_accounts() {
     for (value, expected) in [
-        (Ok(None), false),
+        // an absent or empty value is every account
+        (Ok(None), true),
+        (Ok(Some("")), true),
         (Ok(Some("off")), false),
         (Ok(Some("all")), true),
         (Ok(Some("111111111111")), true),
         (Ok(Some("222222222222,111111111111")), true),
         (Ok(Some("222222222222")), false),
-        // a value that does not parse reads as off
-        (Ok(Some("on")), false),
+        // a value that does not parse is logged and reads as every account
+        (Ok(Some("on")), true),
     ] {
         let storage = install(value).await;
         assert_eq!(
@@ -124,13 +126,13 @@ async fn a_store_that_fails_answers_a_retryable_fault() {
 }
 
 #[tokio::test]
-async fn without_an_installed_store_no_account_gets_the_grammar() {
+async fn without_an_installed_store_every_account_gets_the_grammar() {
     let storage: Arc<dyn StorageEngine> = Arc::new(
         SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("an in-memory database opens"),
     );
-    assert!(!parsed(&storage, Some(INEQUALITY)).await.unwrap());
+    assert!(parsed(&storage, Some(INEQUALITY)).await.unwrap());
 }
 
 #[tokio::test]

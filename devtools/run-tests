@@ -52,7 +52,9 @@
 #                               search_inequality_filters runtime setting
 #                               (off, all, or account IDs), written before any
 #                               suite starts; a server that refuses it is an
-#                               error. Unset leaves the setting as it is.
+#                               error. Unset leaves the setting as it is; an
+#                               absent setting gives every account the
+#                               extended grammar.
 #
 # REQ-TEST-001, D-1, D-2, D-3, D-4, D-5
 
@@ -131,7 +133,8 @@ Environment (--extenddb with an integration suite):
                               integration suite's backup tests read it too)
   EXTENDDB_TEST_SEARCH_INEQUALITY_FILTERS
                               value for the search_inequality_filters setting,
-                              written before any suite starts (optional)
+                              written before any suite starts (optional;
+                              absent, the setting is every account)
 Environment (--real-dynamodb): EXTENDDB_TEST_ENDPOINT and EXTENDDB_ADMIN_PASSWORD
   unset; AWS credentials from the SDK's chain or AWS_ACCESS_KEY_ID.
 EOF

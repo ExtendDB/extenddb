@@ -244,7 +244,9 @@ jobs:
           EXTENDDB_TEST_PG_ADMIN_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
           EXTENDDB_TEST_BACKUP_STORE: filesystem
           # pgvector is present, so the SearchVectors suites fail rather than
-          # skip when the backend refuses vector indexes.
+          # skip when the backend refuses vector indexes. The
+          # search_inequality_filters setting is absent, so they run under the
+          # extended grammar.
           EXTENDDB_EXPECT_VECTORS: "1"
         run: devtools/run-tests --extenddb --pytest --comprehensive --terraform --parallel
 
@@ -426,7 +428,9 @@ jobs:
           # defaulted root beside the database file.
           EXTENDDB_TEST_BACKUP_STORE: filesystem
           # SQLite serves vector search, so the SearchVectors suites fail
-          # rather than skip when the backend refuses vector indexes.
+          # rather than skip when the backend refuses vector indexes. The
+          # search_inequality_filters setting is absent, so they run under the
+          # extended grammar.
           EXTENDDB_EXPECT_VECTORS: "1"
         run: devtools/run-tests --extenddb --pytest --comprehensive --terraform --parallel
 

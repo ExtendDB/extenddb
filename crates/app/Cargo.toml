@@ -11,6 +11,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
+default = ["search-inequality-filters"]
 # Developer mode: plain HTTP on loopback, open authorization (SigV4
 # authentication still enforced), seeded dev credential. A build-time profile
 # for local development and CI. The thin bin enforces that it is paired with the
@@ -21,8 +22,9 @@ backup-test-hooks = ["extenddb-server/backup-test-hooks"]
 # SearchVectors inequality filters: the extended SearchConditionExpression
 # grammar (comparators, BETWEEN, IN, OR, NOT, attribute_exists and
 # attribute_not_exists) for the accounts the `search_inequality_filters`
-# runtime setting names. Off by default. Removable: with this off, the
-# grammar module is not compiled and SearchVectors behaves as before.
+# runtime setting names, every account when it is absent. On by default.
+# Removable: with this off, the grammar module is not compiled and
+# SearchVectors accepts only an AND of equalities.
 search-inequality-filters = ["extenddb-server/search-inequality-filters"]
 
 [dependencies]

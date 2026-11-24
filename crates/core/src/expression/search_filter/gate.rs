@@ -3,19 +3,21 @@
 
 //! Which accounts get the extended grammar.
 //!
-//! The service enables the grammar for a request when the caller or the
-//! table owner is enabled. The setting names them: `off`, `all`, or a
-//! comma-separated list of 12-digit account IDs.
+//! The service serves the grammar to every account. The setting names the
+//! accounts ExtendDB serves it to: `all` (the default), `off`, or a
+//! comma-separated list of 12-digit account IDs, in which case a request
+//! gets the grammar when the caller or the table owner is listed.
 
 use std::collections::BTreeSet;
 
 /// The parsed value of the setting.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum EnabledAccounts {
-    /// No account. The default, and the value when the setting is absent.
-    #[default]
+    /// No account.
     Off,
-    /// Every account.
+    /// Every account. The default, and the value when the setting is absent
+    /// or empty.
+    #[default]
     All,
     /// The listed accounts.
     Listed(BTreeSet<String>),
@@ -30,7 +32,7 @@ impl EnabledAccounts {
     pub fn parse(value: &str) -> Result<Self, &'static str> {
         match value.trim() {
             "off" => return Ok(Self::Off),
-            "all" => return Ok(Self::All),
+            "all" | "" => return Ok(Self::All),
             _ => {}
         }
         let mut accounts = BTreeSet::new();
@@ -65,6 +67,18 @@ mod tests {
     use super::EnabledAccounts;
 
     #[test]
+    fn every_account_is_the_default() {
+        assert_eq!(EnabledAccounts::default(), EnabledAccounts::All);
+        for empty in ["", " ", "\t"] {
+            assert_eq!(
+                EnabledAccounts::parse(empty),
+                Ok(EnabledAccounts::All),
+                "{empty:?}"
+            );
+        }
+    }
+
+    #[test]
     fn off_and_all_parse() {
         assert_eq!(EnabledAccounts::parse("off"), Ok(EnabledAccounts::Off));
         assert_eq!(EnabledAccounts::parse("all"), Ok(EnabledAccounts::All));
@@ -84,7 +98,6 @@ mod tests {
     #[test]
     fn a_malformed_value_is_refused() {
         for bad in [
-            "",
             "on",
             "true",
             "12345",

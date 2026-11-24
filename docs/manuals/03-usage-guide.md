@@ -434,7 +434,12 @@ the declared number of dimensions. An item that omits it is stored and simply do
 not appear in that index, the same way a GSI ignores an item missing its key.
 
 `SearchVectors` returns the nearest items with a `Score` per hit, ordered nearest
-first, and takes an optional `TopK` up to 100.
+first, and takes an optional `TopK` up to 100. A `SearchConditionExpression` takes
+one `=` on the index's HASH attribute and up to 50 conditions on its inline filter
+attributes: `=`, `<>`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN`, `AND`, `OR`, `NOT`,
+parentheses, `attribute_exists` and `attribute_not_exists`. The
+`search_inequality_filters` runtime setting can limit the conditions other than
+an AND of equalities to a list of accounts, or turn them off.
 
 Four things are worth knowing before building on it.
 
