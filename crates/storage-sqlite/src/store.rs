@@ -486,11 +486,10 @@ impl SqliteEngine {
     }
 }
 
-// Table snapshots copy the database file on disk; the real `SnapshotEngine`
-// impl (`snapshot_engine`) is compiled off the browser build. The
+// The real `SnapshotEngine` impl (`snapshot_engine`) uses `sqlx` API the
+// wasm32 shim does not provide, so it is compiled off the browser build. The
 // `StorageEngine` blanket impl still requires the subtrait, so the wasm build
-// answers it with an `Unsupported` error: a browser gives the module no
-// filesystem to copy the database file on.
+// answers it with an `Unsupported` error.
 #[cfg(target_arch = "wasm32")]
 impl extenddb_storage::snapshot::SnapshotEngine for SqliteEngine {
     fn open_table_snapshot(
@@ -506,7 +505,7 @@ impl extenddb_storage::snapshot::SnapshotEngine for SqliteEngine {
             Err(StorageError::Unsupported(
                 extenddb_core::error::webassembly_unsupported_message(
                     "A table snapshot",
-                    "it has no filesystem",
+                    "its SQLite driver lacks the API the snapshot reader uses",
                 ),
             ))
         })
