@@ -3702,7 +3702,7 @@
       ]
     },
     {
-      "name": "table names: GetItem with an empty TableName answers ResourceNotFoundException, as the server does",
+      "name": "table names: GetItem with an empty TableName answers ResourceNotFoundException",
       "op": "GetItem",
       "body": {
         "TableName": "",
@@ -3721,7 +3721,7 @@
       ]
     },
     {
-      "name": "table names: BatchGetItem with an empty RequestItems key answers ResourceNotFoundException, as the server does",
+      "name": "table names: BatchGetItem with an empty RequestItems key answers ResourceNotFoundException",
       "op": "BatchGetItem",
       "body": {
         "RequestItems": {
@@ -3745,7 +3745,7 @@
       ]
     },
     {
-      "name": "table names: TransactWriteItems with an empty member TableName answers ResourceNotFoundException, as the server does",
+      "name": "table names: TransactWriteItems with an empty member TableName answers ResourceNotFoundException",
       "op": "TransactWriteItems",
       "body": {
         "TransactItems": [
@@ -3770,7 +3770,7 @@
       ]
     },
     {
-      "name": "table names: ListTables with an empty ExclusiveStartTableName lists from the first table, as the server does",
+      "name": "table names: ListTables with an empty ExclusiveStartTableName lists from the first table",
       "op": "ListTables",
       "body": {
         "ExclusiveStartTableName": "",
@@ -3790,7 +3790,7 @@
       ]
     },
     {
-      "name": "table names: ImportTable with an empty table name answers that import is disabled, as the server does",
+      "name": "table names: ImportTable with an empty table name answers that import is disabled",
       "op": "ImportTable",
       "body": {
         "TableCreationParameters": {
@@ -3822,7 +3822,7 @@
       ]
     },
     {
-      "name": "table names: ListStreams with an empty TableName lists no streams, as the server does",
+      "name": "table names: ListStreams with an empty TableName lists no streams",
       "op": "ListStreams",
       "body": {
         "TableName": ""
