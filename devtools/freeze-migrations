@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+"""Freeze the catalog migrations that a release ships.
+
+    devtools/freeze-migrations [--release-version X.Y.Z] [--root DIR]
+
+This is step 7 of "Adding a catalog migration" in CONTRIBUTING.md as a
+script. It raises `RELEASED_THROUGH` in
+crates/storage/src/migrations/registry.rs to the last migration id and
+inserts, into each backend's `RELEASED` table, the lines that the backend's
+`the_released_bodies_match_their_checksums` test prints for the migrations
+it freezes. It then formats the four crates and runs the four tests again,
+which must pass. When `RELEASED_THROUGH` already equals the last id, it
+changes nothing.
+
+With `--release-version`, it refuses to freeze a breaking migration in a
+patch release from 1.0 on (X.Y.Z with X at least 1 and Z above 0), which
+docs/versioning.md forbids. The fix is to release X.Y+1.0 instead, with a
+`Release-As: X.Y+1.0` footer at the end of the description of a PR merged
+to main. A 0.x release can carry a breaking migration whatever part of its
+number changes. The version is checked before anything else.
+
+The tests are unit tests and need no database. The script runs them with
+the bound unchanged first. Every check that can refuse the freeze runs
+before the first write, so such a refusal leaves the tree as it was. If
+`cargo fmt` or the tests fail after the freeze, the files stay written for
+inspection; `git checkout -- crates/` undoes them.
+
+Exit 0 when the freeze is done or there is nothing to freeze, 1 otherwise.
+"""
+
+import argparse
+import pathlib
+import re
+import subprocess
+import sys
+
+BACKENDS = ("sqlite", "postgres", "mongodb", "cassandra")
+REGISTRY = "crates/storage/src/migrations/registry.rs"
+BOUND_RE = re.compile(r"pub const RELEASED_THROUGH: u32 = (\d+);")
+# Entries of `migration_ids!`: `Variant = <n>, "<name>",`
+ID_RE = re.compile(r"^\s*([A-Z][A-Za-z0-9]*) = (\d+), \"", re.MULTILINE)
+# One line as `released_line` in crates/storage/src/migrations/checksum.rs
+# prints it.
+LINE_RE = re.compile(
+    r"^    Released \{ id: MigrationId::([A-Za-z0-9]+), store: StoreKind::[A-Za-z]+, "
+    r"checksum: \"[0-9a-f]{64}\", fingerprint: (?:None|Some\(\"[^\"]+\"\)), "
+    r"kind: Kind::(Breaking|Additive), convergent: (?:true|false), rebless: None \},$"
+)
+VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+TABLE_START = "pub(crate) const RELEASED: &[Released] = &["
+# The RELEASED table as rustfmt writes it with at least one entry: the
+# opening line, indented or empty lines, and a `];` line with nothing after
+# it. An empty table (`= &[];`) does not match.
+TABLE_RE = re.compile(
+    "^" + re.escape(TABLE_START) + r"\n(?P<body>(?:    .*\n|\n)*)\];\n", re.MULTILINE
+)
+
+
+class FreezeError(Exception):
+    pass
+
+
+def crate(backend):
+    return f"extenddb-storage-{backend}"
+
+
+def table_file(root, backend):
+    return root / f"crates/storage-{backend}/src/migrations/mod.rs"
+
+
+def run_checksum_test(root, backend):
+    """Run one backend's checksum test and return (passed, output)."""
+    result = subprocess.run(
+        [
+            "cargo", "test", "--locked", "-p", crate(backend), "--lib",
+            "the_released_bodies_match_their_checksums", "--", "--nocapture",
+        ],
+        cwd=root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    return result.returncode == 0, result.stdout
+
+
+def run_fmt(root, backend):
+    subprocess.run(["cargo", "fmt", "-p", crate(backend)], cwd=root, check=True)
+
+
+def read_registry(root):
+    text = (root / REGISTRY).read_text(encoding="utf-8")
+    bound = BOUND_RE.search(text)
+    if bound is None:
+        raise FreezeError(f"no `pub const RELEASED_THROUGH: u32 = <n>;` in {REGISTRY}")
+    ids = {name: int(n) for name, n in ID_RE.findall(text)}
+    if not ids:
+        raise FreezeError(f"no migration ids found in {REGISTRY}")
+    return text, int(bound.group(1)), ids
+
+
+def parse_lines(output):
+    """The `Released` lines in a test's output, as (variant, kind, line)."""
+    found = []
+    for raw in output.splitlines():
+        match = LINE_RE.match(raw)
+        if match:
+            found.append((match.group(1), match.group(2), raw))
+    return found
+
+
+def insert_lines(text, lines, backend):
+    """Insert lines before the `];` that closes the RELEASED table."""
+    found = list(TABLE_RE.finditer(text))
+    if len(found) != 1:
+        raise FreezeError(
+            f"{backend}: expected exactly one multi-line `{TABLE_START}` table closed by `];`"
+        )
+    end = found[0].end("body")
+    return text[:end] + "".join(line + "\n" for line in lines) + text[end:]
+
+
+def patch_release(version):
+    """Whether version is a patch release that docs/versioning.md's rules cover.
+
+    The rules apply from 1.0, so a 0.x version is never one.
+    """
+    match = VERSION_RE.match(version)
+    if match is None:
+        raise FreezeError(f"--release-version {version!r} is not MAJOR.MINOR.PATCH")
+    return int(match.group(1)) >= 1 and int(match.group(3)) != 0
+
+
+def freeze(root, release_version=None, run_test=run_checksum_test, fmt=run_fmt, log=print):
+    patch = release_version is not None and patch_release(release_version)
+    registry_text, bound, ids = read_registry(root)
+    last = max(ids.values())
+    if bound > last:
+        raise FreezeError(f"RELEASED_THROUGH is {bound}, above the last migration, {last}")
+    if bound == last:
+        log(f"RELEASED_THROUGH is {bound}, the last migration; nothing to freeze")
+        return False
+    frozen = {name for name, number in ids.items() if bound < number <= last}
+
+    # Collect every backend's lines before writing anything.
+    additions = {}
+    breaking = set()
+    for backend in BACKENDS:
+        passed, output = run_test(root, backend)
+        if not passed:
+            raise FreezeError(
+                f"{backend}: the checksum test fails before the freeze; fix that first\n{output}"
+            )
+        lines = [(name, kind, line) for name, kind, line in parse_lines(output) if name in frozen]
+        missing = frozen - {name for name, _, _ in lines}
+        if missing:
+            raise FreezeError(
+                f"{backend}: the checksum test printed no line for {', '.join(sorted(missing))}"
+            )
+        lines.sort(key=lambda entry: ids[entry[0]])
+        additions[backend] = [line for _, _, line in lines]
+        breaking.update(f"{name} ({ids[name]})" for name, kind, _ in lines if kind == "Breaking")
+
+    if patch and breaking:
+        major, minor, _ = VERSION_RE.match(release_version).groups()
+        raise FreezeError(
+            f"{release_version} is a patch release and would freeze the breaking migration "
+            f"{', '.join(sorted(breaking))}; docs/versioning.md allows one only in a minor or "
+            f"major release. Release {major}.{int(minor) + 1}.0 instead, with the footer "
+            f"`Release-As: {major}.{int(minor) + 1}.0` at the end of the description of a PR "
+            "merged to main."
+        )
+
+    # Every check passed: write the bound and the four tables together.
+    raised = BOUND_RE.sub(f"pub const RELEASED_THROUGH: u32 = {last};", registry_text, count=1)
+    writes = {root / REGISTRY: raised}
+    for backend, lines in additions.items():
+        path = table_file(root, backend)
+        writes[path] = insert_lines(path.read_text(encoding="utf-8"), lines, backend)
+    for path, text in writes.items():
+        path.write_text(text, encoding="utf-8")
+    for backend in BACKENDS:
+        fmt(root, backend)
+
+    for backend in BACKENDS:
+        passed, output = run_test(root, backend)
+        if not passed:
+            raise FreezeError(
+                f"{backend}: the checksum test fails after the freeze; the files stay written, "
+                f"and `git checkout -- crates/` undoes them\n{output}"
+            )
+    log(
+        f"froze migrations {bound + 1} to {last}: RELEASED_THROUGH is {last}, "
+        f"and {sum(len(v) for v in additions.values())} lines were added to the four RELEASED tables"
+    )
+    return True
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--release-version", help="the version being released, X.Y.Z")
+    parser.add_argument(
+        "--root",
+        type=pathlib.Path,
+        default=pathlib.Path(__file__).resolve().parent.parent,
+        help="the repository root (default: the checkout this script is in)",
+    )
+    args = parser.parse_args(argv)
+    try:
+        freeze(args.root, args.release_version)
+    except (FreezeError, subprocess.CalledProcessError, OSError) as error:
+        print(f"FAIL: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
