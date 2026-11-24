@@ -21,14 +21,13 @@ pub fn validation_errors(errors: &[(&str, &str, &str)]) -> String {
             format!("Value '{value}' at '{field}' failed to satisfy constraint: {constraint}")
         })
         .collect();
-    validation_error_envelope(&details)
+    validation_errors_detected(&details)
 }
 
-/// Wrap already rendered constraint clauses in `DynamoDB`'s envelope:
-/// `1 validation error detected: <clause>`, or `N validation errors detected:
-/// <clause>; <clause>` for several.
+/// The service's envelope for one or more constraint clauses: `N validation
+/// error(s) detected: ` and the clauses joined by `; `.
 #[must_use]
-pub fn validation_error_envelope(clauses: &[String]) -> String {
+pub fn validation_errors_detected(clauses: &[String]) -> String {
     let count = clauses.len();
     format!(
         "{count} validation error{} detected: {}",
@@ -36,6 +35,13 @@ pub fn validation_error_envelope(clauses: &[String]) -> String {
         clauses.join("; ")
     )
 }
+
+/// The service's answer to a `StreamArn` that is not a stream ARN of the
+/// right shape (`DescribeStream` and `GetShardIterator`, measured 2026-10-23,
+/// us-east-1), and to a `GetShardIterator` whose `StreamArn` is absent, null
+/// or empty (measured 2026-11-23). The server checks the shape before
+/// authorization; the `GetShardIterator` handler checks the presence.
+pub const INVALID_STREAM_ARN: &str = "Invalid StreamArn";
 
 /// Keys for error message templates. Compile-time checked — no stringly-typed lookups.
 #[derive(Debug, Clone, Copy)]

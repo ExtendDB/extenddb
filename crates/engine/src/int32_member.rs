@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::error::validation_error_envelope;
+use extenddb_core::error::validation_errors_detected;
 use extenddb_core::types::saturated_int32;
 use serde_json::Value;
 use serde_json::value::RawValue;
@@ -271,7 +271,7 @@ pub(crate) fn ranges(body: &Value, fields: &'static [RangeField]) -> Ranges {
 /// twice).
 pub(crate) fn newer_form(faults: &[RangeFault]) -> DynamoDbError {
     let clauses: Vec<String> = faults.iter().map(RangeFault::newer_clause).collect();
-    DynamoDbError::ValidationException(validation_error_envelope(&clauses))
+    DynamoDbError::ValidationException(validation_errors_detected(&clauses))
 }
 
 #[cfg(test)]
