@@ -7,9 +7,10 @@ use std::collections::HashMap;
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
-    Expr, ExpressionKind, ExpressionMaps, KeyCondition, PathElement, Token, UpdateAction,
-    parse_condition_with_depth_limit, parse_key_condition, parse_projection, parse_update_from,
-    tokenize_for, tokenize_with_limit, validate_no_reserved_words, validate_ordering_operand_types,
+    ConditionFault, Expr, ExpressionKind, ExpressionMaps, KeyCondition, PathElement, Token,
+    UpdateAction, parse_condition_classified, parse_condition_from, parse_key_condition_from,
+    parse_projection_from, parse_update_from, tokenize_for, tokenize_with_limit,
+    validate_no_reserved_words, validate_operator_count, validate_placeholders_and_operands,
 };
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{AttributeValue, ConditionalOperator, ExpectedAttributeValue};
@@ -89,8 +90,32 @@ pub fn check_expression_size(
 pub fn parse_condition_expr(expr: &str, limits: &LimitsConfig) -> Result<Expr, DynamoDbError> {
     check_expression_size(expr, ExpressionKind::Condition, limits)?;
     tokenize_expression(expr, limits)
-        .and_then(|tokens| parse_condition_with_depth_limit(&tokens, limits.max_expression_depth))
+        .and_then(|tokens| parse_condition_from(&tokens, expr, limits.max_expression_depth))
         .map_err(|e| prefix_expression_error(e, ExpressionKind::Condition))
+}
+
+/// Check a parsed condition or filter in the service's order, after the parse
+/// and before the unused placeholder check and the table lookup:
+/// [`validate_placeholders_and_operands`], then [`validate_operator_count`]
+/// against `limits.max_expression_operators`.
+///
+/// `TransactWriteItems` counts the same way on the service, but it does not
+/// call this check (measured 2026-11-19: a Put of 151, 200 or 300 `#v = :v`
+/// terms joined by OR answers 301, 399 or 599, a ConditionCheck of 151 terms
+/// answers 301, and a Put of 150 terms is evaluated).
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` with the `Invalid <kind>:`
+/// prefix for the first fault.
+pub fn check_parsed_condition(
+    expr: &Expr,
+    maps: &ExpressionMaps,
+    kind: ExpressionKind,
+    limits: &LimitsConfig,
+) -> Result<(), DynamoDbError> {
+    validate_placeholders_and_operands(expr, maps).map_err(|e| prefix_expression_error(e, kind))?;
+    validate_operator_count(expr, kind, limits.max_expression_operators)
 }
 
 /// Tokenize, reserved-word check, and parse an `UpdateExpression`.
@@ -203,8 +228,8 @@ pub fn resolve_condition(
     let maps = build_expression_maps(names, values);
     let condition = parse_optional_condition(condition_expression, limits)?;
     if let Some(ref expr) = condition {
-        validate_ordering_operand_types(expr, &maps)
-            .map_err(|e| prefix_expression_error(e, ExpressionKind::Condition))?;
+        // Before the unused placeholder check and the table lookup.
+        check_parsed_condition(expr, &maps, ExpressionKind::Condition, limits)?;
     }
     Ok((condition, maps))
 }
@@ -230,7 +255,7 @@ pub fn parse_projection_expr(
         if limits.enforce_reserved_keywords {
             validate_no_reserved_words(&tokens)?;
         }
-        parse_projection(&tokens)
+        parse_projection_from(&tokens, proj_str)
     });
     result.map_err(|e| prefix_expression_error(e, ExpressionKind::Projection))
 }
@@ -242,9 +267,11 @@ pub fn parse_projection_expr(
 /// # Errors
 ///
 /// Returns `DynamoDbError::ValidationException` for over-size, syntax, or
-/// reserved-word errors.
+/// reserved-word errors, and for an undefined placeholder or an operand type
+/// fault in a key condition over the operator cap.
 pub fn parse_key_condition_expr(
     expr: &str,
+    maps: &ExpressionMaps,
     limits: &LimitsConfig,
 ) -> Result<KeyCondition, DynamoDbError> {
     check_expression_size(expr, ExpressionKind::KeyCondition, limits)?;
@@ -257,7 +284,34 @@ pub fn parse_key_condition_expr(
         if limits.enforce_reserved_keywords {
             validate_no_reserved_words(&tokens)?;
         }
-        parse_key_condition(&tokens)
+        // The service reads a key condition with the condition grammar first.
+        // A syntax error in that grammar comes before the operator count and
+        // the key condition rules (measured 2026-11-19: `pk = :p OR` answers
+        // token "<EOF>", near "OR"; `pk = :p =` token "=", near ":p ="; `pk =
+        // :p sk = :s` token "sk", near ":p sk ="). The count comes next: `pk =
+        // :v OR` + 150 terms answers the count, not the operator refusal, and
+        // 151 AND-joined equalities answer the count ahead of the
+        // one-condition-per-key check (measured 2026-10-25). A key condition
+        // over the cap that also holds an undefined placeholder or an operand
+        // of the wrong type answers that fault instead (measured 2026-11-20:
+        // `#x = :p AND` 150 terms answers the undefined `#x`). When the
+        // condition grammar refuses the text in another way, the key
+        // condition parser reports the error in its own words.
+        match parse_condition_classified(&tokens, expr, limits.max_expression_depth) {
+            Ok(condition) => {
+                if let Err(count) = validate_operator_count(
+                    &condition,
+                    ExpressionKind::KeyCondition,
+                    limits.max_expression_operators,
+                ) {
+                    validate_placeholders_and_operands(&condition, maps)?;
+                    return Err(count);
+                }
+            }
+            Err(ConditionFault::Syntax(err)) => return Err(err),
+            Err(ConditionFault::Other(_)) => {}
+        }
+        parse_key_condition_from(&tokens, expr)
     })
     .map_err(|e| prefix_expression_error(e, ExpressionKind::KeyCondition))
 }
@@ -508,3 +562,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "expression_helpers_order_tests.rs"]
+mod order_tests;

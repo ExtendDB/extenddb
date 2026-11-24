@@ -183,11 +183,11 @@ class TestExpressionAttributeValuesEntries:
             )
         err = exc_info.value.response["Error"]
         assert err["Code"] == "ValidationException"
-        # Quirk: unlike ExpressionAttributeNames, the values variant omits the
-        # "; size of key: N" suffix.
+        # Measured 2026-10-25 (us-east-1) on Scan, Query and PutItem: the values
+        # variant carries the "; size of key: N" suffix like the names one.
         assert err["Message"] == (
             "ExpressionAttributeValues contains invalid key: The expression "
-            "attribute map contains a key that is too long;"
+            "attribute map contains a key that is too long; size of key: 256"
         )
 
     def test_value_empty_attribute_value(self, dynamodb_client_no_validation, hash_table):

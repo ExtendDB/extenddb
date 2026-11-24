@@ -310,6 +310,7 @@ key_path = "{tls_key}"
 # max_attribute_name_bytes = 65535
 # max_expression_tokens = 4096
 # max_expression_depth = 150
+# max_expression_operators = 300
 # per_table_max_rcu = 40000
 # per_table_max_wcu = 40000
 # per_account_max_rcu = 80000

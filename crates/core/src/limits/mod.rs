@@ -58,6 +58,11 @@ pub struct LimitsConfig {
     /// calls in an update.
     #[serde(default = "default_max_expression_depth")]
     pub max_expression_depth: usize,
+    /// Maximum operators in a condition, filter or key condition expression
+    /// (DynamoDB: 300). Each comparison, `AND`, `OR`, `NOT`, `BETWEEN`, `IN`
+    /// and function call counts one.
+    #[serde(default = "default_max_expression_operators")]
+    pub max_expression_operators: usize,
     /// Maximum policy document size in bytes (before JSON parsing).
     #[serde(default = "default_max_policy_document_bytes")]
     pub max_policy_document_bytes: usize,
@@ -96,6 +101,7 @@ impl Default for LimitsConfig {
             max_expression_tokens: default_max_expression_tokens(),
             max_expression_length_bytes: default_max_expression_length_bytes(),
             max_expression_depth: default_max_expression_depth(),
+            max_expression_operators: default_max_expression_operators(),
             max_policy_document_bytes: default_max_policy_document_bytes(),
             max_import_file_bytes: default_max_import_file_bytes(),
             max_import_item_count: default_max_import_item_count(),
@@ -155,6 +161,9 @@ fn default_max_expression_length_bytes() -> usize {
 }
 fn default_max_expression_depth() -> usize {
     150
+}
+fn default_max_expression_operators() -> usize {
+    crate::expression::MAX_EXPRESSION_OPERATORS
 }
 fn default_max_policy_document_bytes() -> usize {
     // AWS IAM limit: 6,144 bytes for inline policies.

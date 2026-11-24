@@ -13,13 +13,17 @@ mod ast;
 mod depth_tests;
 mod evaluator;
 mod key_condition;
+mod key_condition_resolve;
 mod kind;
+mod operand_check;
+mod operator_count;
 mod parser;
 mod parser_common;
 mod projection;
 mod reserved_words;
 mod resolver;
 mod search_condition;
+mod syntax_error;
 #[cfg(test)]
 mod test_timeout;
 mod tokenizer;
@@ -30,11 +34,16 @@ pub use ast::{ArithOp, CompareOp, Expr, PathElement, UpdateAction, removes_only}
 pub use evaluator::evaluate_condition;
 pub use key_condition::{
     KeyClauseOperand, KeyCondition, SortKeyCondition, key_condition_clause_operands,
-    parse_key_condition,
+    parse_key_condition, parse_key_condition_from,
 };
 pub use kind::ExpressionKind;
-pub use parser::{parse_condition, parse_condition_with_depth_limit};
-pub use projection::{Projection, parse_projection};
+pub use operand_check::validate_placeholders_and_operands;
+pub use operator_count::{MAX_EXPRESSION_OPERATORS, validate_operator_count};
+pub use parser::{
+    ConditionFault, parse_condition, parse_condition_classified, parse_condition_from,
+    parse_condition_with_depth_limit,
+};
+pub use projection::{Projection, parse_projection, parse_projection_from};
 pub use reserved_words::validate_no_reserved_words;
 pub use resolver::{
     ExpressionMaps, collect_key_condition_refs, collect_value_placeholders, resolve_element_name,
