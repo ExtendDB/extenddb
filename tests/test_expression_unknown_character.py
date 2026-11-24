@@ -10,8 +10,9 @@ the start of the previous token (or of the expression, when no token comes
 before it) to the end of the next one, with each character outside the
 grammar counted as one token. U+0000 is removed from the token and the window.
 On PutItem, UpdateItem and DeleteItem the message starts with the count
-``1 validation error detected: ``. ExtendDB leaves the count out, so those
-rows are an expected failure on ExtendDB.
+``1 validation error detected: ``. ExtendDB leaves the count out of this
+error, so on ExtendDB those rows compare the text after the count and then
+end as an expected failure.
 
 Every expected text was measured against Amazon DynamoDB (us-east-1), each
 request twice: the rows of ``OPERATION_ROWS`` on 2026-11-18, the others on
@@ -22,12 +23,10 @@ Dual-target against Amazon DynamoDB and extenddb.
 
 from __future__ import annotations
 
-import os
-
 import pytest
 from botocore.exceptions import ClientError
 
-from conftest import scoped_table
+from conftest import _is_real_dynamodb, scoped_table
 
 PREFIX = "1 validation error detected: "
 NAMES = {"#v": "v"}
@@ -35,15 +34,16 @@ VALUES = {":v": {"S": "x"}}
 ABSENT = {"pk": {"S": "absent"}, "sk": {"S": "absent"}}
 INDEX = "gsi"
 
-# ExtendDB sends the message of a PutItem, UpdateItem or DeleteItem
-# validation error without the count before it. Not strict, so a server that
-# sends the count passes these rows.
-MISSING_COUNT = pytest.mark.xfail(
-    bool(os.environ.get("EXTENDDB_TEST_ENDPOINT", "").strip()),
-    reason="ExtendDB leaves out the count '1 validation error detected: '",
-    raises=AssertionError,
-    strict=False,
-)
+def _assert_message(msg: str, expected: str) -> None:
+    """Assert that ``msg`` is the service's text ``expected``.
+
+    On ExtendDB a message that is ``expected`` without the count ends the
+    test as an expected failure. Any other message must equal ``expected``,
+    so the token and the window are compared on every target.
+    """
+    if not _is_real_dynamodb() and PREFIX + msg == expected:
+        pytest.xfail("ExtendDB leaves out the count '1 validation error detected: '")
+    assert msg == expected
 
 
 def _message(func) -> str:
@@ -135,7 +135,6 @@ def test_scan_filter(dynamodb_client, table, expr, token, near):
     assert msg == syntax("FilterExpression", token, near)
 
 
-@MISSING_COUNT
 @pytest.mark.parametrize(
     "condition, token, near",
     [
@@ -153,10 +152,9 @@ def test_put_item_condition(dynamodb_client, table, condition, token, near):
             ExpressionAttributeValues=VALUES,
         )
     )
-    assert msg == PREFIX + syntax("ConditionExpression", token, near)
+    _assert_message(msg, PREFIX + syntax("ConditionExpression", token, near))
 
 
-@MISSING_COUNT
 def test_update_item_condition(dynamodb_client, table):
     msg = _message(
         lambda: dynamodb_client.update_item(
@@ -168,7 +166,7 @@ def test_update_item_condition(dynamodb_client, table):
             ExpressionAttributeValues=VALUES,
         )
     )
-    assert msg == PREFIX + syntax("ConditionExpression", "\u00e9", "= \u00e9\u00e9")
+    _assert_message(msg, PREFIX + syntax("ConditionExpression", "\u00e9", "= \u00e9\u00e9"))
 
 
 def test_query_filter(dynamodb_client, table):
@@ -206,7 +204,6 @@ def test_query_key_condition(dynamodb_client, table, kce, token, near):
     assert msg == syntax("KeyConditionExpression", token, near)
 
 
-@MISSING_COUNT
 @pytest.mark.parametrize(
     "update, token, near, values",
     [
@@ -229,7 +226,7 @@ def test_update_expression(dynamodb_client, table, update, token, near, values):
             **extra,
         )
     )
-    assert msg == PREFIX + syntax("UpdateExpression", token, near)
+    _assert_message(msg, PREFIX + syntax("UpdateExpression", token, near))
 
 
 @pytest.mark.parametrize(
@@ -270,7 +267,6 @@ OPERATION_ROWS = [
     pytest.param(
         lambda client, table: client.delete_item(TableName=table, Key=ABSENT, **CONDITION),
         PREFIX + IN_CONDITION,
-        marks=MISSING_COUNT,
         id="DeleteItem-condition",
     ),
     pytest.param(
@@ -346,4 +342,4 @@ OPERATION_ROWS = [
 
 @pytest.mark.parametrize("send, expected", OPERATION_ROWS)
 def test_operation(dynamodb_client, table, send, expected):
-    assert _message(lambda: send(dynamodb_client, table)) == expected
+    _assert_message(_message(lambda: send(dynamodb_client, table)), expected)
