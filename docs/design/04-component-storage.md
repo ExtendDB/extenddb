@@ -410,10 +410,11 @@ The PostgreSQL backend uses two categories of tables:
     `ORDER BY` with `COLLATE "C"`, so results are byte-ordered on tables
     created before the columns carried the collation; on those tables the
     indexes cannot serve the predicates (see technical debt C-11). On index
-    tables created with the collated key columns, the same columns (`pk`,
-    `sk_s`, `base_pk`, `base_sk_s`) carry the collation. A GSI cursor there is
-    a row comparison the ordering index serves in one seek (the LSI case is in
-    section 7).
+    tables created with the collated key columns, the text key columns (`pk`,
+    `sk_s`, `base_pk`, `base_sk_s` and their numbered variants) carry the
+    collation. A GSI Query cursor there is served in one seek, by the ordering
+    index, or by the primary key on a hash-only GSI (section 7 has the LSI and
+    Scan cases).
 
 - **Item storage**: `item_data` JSONB contains the complete item including key
   attributes, matching the DynamoDB model where key attributes are part of the
@@ -741,8 +742,8 @@ same order and in the same direction. So the predicate is one row comparison,
 the cursor has one column. In the Scan, base table Query, GSI and hash-only
 index shapes below, a key index whose columns follow the cursor's serves the
 page. The page comes out in order with no sort step, except the Scan on an
-index with more than one RANGE attribute (see Index Scan). For the Scan and
-the base table Query that index is the primary key. For a GSI it is the
+index with more than one RANGE attribute (see Index Scan). For the base table
+Scan and Query that index is the primary key. For a GSI it is the
 ordering index `(pk, sk_*, base_pk, base_sk_*)`. A hash-only index has no
 ordering index, because `create_index_data_table` creates one only when the
 index declares a sort key. Its page comes from the primary key
@@ -754,9 +755,16 @@ collation, so the indexes do not serve a `COLLATE "C"` predicate or
 sort key column. Where the first cursor column other than `pk` is one of
 these, PostgreSQL reads the rows through the `pk` prefix of the key index. It
 then filters the cursor and sorts the rest, on every page (technical debt
-C-11). The statements below show PostgreSQL. SQLite emits the same shape with
-`?` placeholders and without `COLLATE`, because its text columns already
-compare by byte value.
+C-11). Where a later cursor column is one of these, PostgreSQL seeks on the
+leading columns and sorts the rest (Incremental Sort). The statements below
+show PostgreSQL. SQLite emits the same shape with `?` placeholders and without
+`COLLATE`, because its text columns already compare by byte value.
+
+The plans here are for the statements shown, which carry no sort key
+condition. With an equality on the index sort key, PostgreSQL planned a Sort
+on every page (over a Bitmap Index Scan on a GSI, over the Index Scan on an
+LSI) while a `BETWEEN` kept the Index Scan, and SQLite seeks on the
+condition's terms and applies the cursor as a filter.
 
 **Base table Scan:**
 ```sql
@@ -790,9 +798,8 @@ comparison and the page sequence is the exact mirror of the forward one. The
 service has the same mirror property: a reverse Query returns the forward
 order reversed, among items that share an index sort key and among the items
 of a hash-only index partition (measured 2026-09-17). An ascending tiebreaker
-under a descending sort key is not a mirror, and on a hash-only index, where
-the tiebreaker is the whole order, an ascending cursor under a descending
-`ORDER BY` repeated the first page's items and skipped the rest.
+under a descending sort key is not a mirror, so the reverse cursor compares
+every column, the tiebreaker included, with `<`.
 ```sql
 WHERE pk = $gsi_pk
   AND (sk_s COLLATE "C", base_pk COLLATE "C", base_sk_n) < ($gsi_sk, $base_pk, $base_sk)
