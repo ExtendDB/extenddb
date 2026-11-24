@@ -111,7 +111,7 @@ fn table_name_of(resource: &str) -> &str {
 /// stream ARN with another partition, service or region is refused in the
 /// first half, before the tags (measured 2026-11-20).
 async fn validate_resource_arn(arn: &str, ctx: &OperationContext) -> Result<(), DynamoDbError> {
-    let fields = validate_arn_shape_and_account(arn, ctx)?;
+    let fields = validate_arn_shape_and_account(arn, &ctx.account_id, &ctx.region)?;
     validate_arn_region_and_table(fields, arn, ctx).await
 }
 
@@ -121,7 +121,8 @@ async fn validate_resource_arn(arn: &str, ctx: &OperationContext) -> Result<(), 
 /// for the second half.
 fn validate_arn_shape_and_account<'a>(
     arn: &'a str,
-    ctx: &OperationContext,
+    account_id: &str,
+    region: &str,
 ) -> Result<extenddb_core::arn::ArnFields<'a>, DynamoDbError> {
     if !arn.starts_with("arn:") {
         return Err(DynamoDbError::ValidationException(format!(
@@ -170,14 +171,14 @@ fn validate_arn_shape_and_account<'a>(
         )));
     }
 
-    if fields.account != ctx.account_id.as_ref() {
+    if fields.account != account_id {
         return Err(DynamoDbError::AccessDeniedException(
             "Access is denied".to_owned(),
         ));
     }
 
     if tag_subresource_is_stream(resource)
-        && let Some(err) = deployment_scope_error(&fields, arn, &ctx.region)
+        && let Some(err) = deployment_scope_error(&fields, arn, region)
     {
         return Err(err);
     }
@@ -232,7 +233,7 @@ pub async fn handle_tag_resource(
         ));
     }
 
-    let fields = validate_arn_shape_and_account(&input.resource_arn, ctx)?;
+    let fields = validate_arn_shape_and_account(&input.resource_arn, &ctx.account_id, &ctx.region)?;
     validate_tags(&input.tags)?;
     validate_arn_region_and_table(fields, &input.resource_arn, ctx).await?;
     validate_folded_tag_prefix(&input.tags)?;
@@ -273,7 +274,7 @@ pub async fn handle_untag_resource(
         ));
     }
 
-    let fields = validate_arn_shape_and_account(&input.resource_arn, ctx)?;
+    let fields = validate_arn_shape_and_account(&input.resource_arn, &ctx.account_id, &ctx.region)?;
     validate_tag_keys(&input.tag_keys)?;
     validate_arn_region_and_table(fields, &input.resource_arn, ctx).await?;
 
@@ -329,7 +330,7 @@ pub async fn handle_list_tags_of_resource(
 mod tests {
     use super::{
         deployment_scope_error, table_name_of, tag_subresource_not_dynamodb_resource,
-        tag_subresource_not_table_or_stream,
+        tag_subresource_not_table_or_stream, validate_arn_shape_and_account,
     };
     use extenddb_core::error::DynamoDbError;
 
@@ -337,6 +338,33 @@ mod tests {
     fn table_name_of_strips_the_sub_resource() {
         assert_eq!(table_name_of("table/t"), "t");
         assert_eq!(table_name_of("table/t/stream/2026-10-20T16:17:40.188"), "t");
+    }
+
+    /// The first half refuses an index ARN and an export ARN with the
+    /// service's texts. The server's gate answers both before the engine
+    /// runs, so no wire test reaches these two checks.
+    #[test]
+    fn the_first_half_refuses_an_index_and_an_export_arn() {
+        let table = "arn:aws:dynamodb:us-east-1:444455556666:table/T";
+        for (arn, reason) in [
+            (
+                format!("{table}/index/g"),
+                "Invalid resource arn provided, only table or stream is accepted. \
+                 Provided resource arn",
+            ),
+            (
+                format!("{table}/export/01700000000000-abcdef12"),
+                "Provided Arn is not a DynamoDB resource arn",
+            ),
+        ] {
+            match validate_arn_shape_and_account(&arn, "444455556666", "us-east-1") {
+                Err(DynamoDbError::ValidationException(m)) => assert_eq!(
+                    m,
+                    format!("One or more parameter values were invalid: {reason}: {arn}")
+                ),
+                other => panic!("{arn}: {other:?}"),
+            }
+        }
     }
 
     /// The tag handler refuses exactly the ARNs the shared predicate puts
