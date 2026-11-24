@@ -79,7 +79,7 @@ use futures::StreamExt;
 /// The number of rows `cases()` returns, written here by hand rather than
 /// counted from `cases()`, so that a row deleted from or filtered out of
 /// `cases()` fails the test. Adding or removing a row changes this number.
-const ROWS: usize = 96;
+const ROWS: usize = 102;
 
 /// The number of rows named `difference: ...`.
 const DIFFERENCE_ROWS: usize = 6;
@@ -618,6 +618,79 @@ fn cases() -> Vec<Case> {
                     .fetch_one(&pool)
                     .await
             )
+        ),
+        row!(
+            "raw_sql binds nothing: :name, @name, $name and $0 are NULL",
+            "Ok(1)",
+            |pool| {
+                sqlx::raw_sql("CREATE TABLE t (a, b, c, d); INSERT INTO t VALUES (:a, @b, $c, $0)")
+                    .execute(&pool)
+                    .await?;
+                render(
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT count(*) FROM t WHERE a IS NULL AND b IS NULL AND c IS NULL \
+                         AND d IS NULL",
+                    )
+                    .fetch_one(&pool)
+                    .await,
+                )
+            }
+        ),
+        row!(
+            "Executor::execute on a &str binds nothing: :name, @name, $name and $0 are NULL",
+            "Ok(1)",
+            |pool| {
+                use sqlx::Executor as _;
+                (&pool).execute("CREATE TABLE t (a, b, c, d)").await?;
+                (&pool)
+                    .execute("INSERT INTO t VALUES (:a, @b, $c, $0)")
+                    .await?;
+                render(
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT count(*) FROM t WHERE a IS NULL AND b IS NULL AND c IS NULL \
+                         AND d IS NULL",
+                    )
+                    .fetch_one(&pool)
+                    .await,
+                )
+            }
+        ),
+        row!(
+            "query with no arguments refuses a :name placeholder",
+            "Err[Protocol] encountered unexpected or invalid data: unsupported SQL parameter \
+             format: :x (sqlx_sqlite::arguments:99)",
+            |pool| render(
+                sqlx::query("SELECT :x")
+                    .execute(&pool)
+                    .await
+                    .map(|r| r.rows_affected())
+            )
+        ),
+        row!(
+            "query_as with no arguments refuses an @name placeholder",
+            "Err[Protocol] encountered unexpected or invalid data: unsupported SQL parameter \
+             format: @x (sqlx_sqlite::arguments:99)",
+            |pool| render(
+                sqlx::query_as::<_, (i64,)>("SELECT @x")
+                    .fetch_all(&pool)
+                    .await
+            )
+        ),
+        row!(
+            "query_scalar with no arguments refuses a $name placeholder",
+            "Err[Protocol] encountered unexpected or invalid data: parameters with non-integer \
+             names are not currently supported: abc (sqlx_sqlite::arguments:93)",
+            |pool| render(
+                sqlx::query_scalar::<_, i64>("SELECT $abc")
+                    .fetch_optional(&pool)
+                    .await
+            )
+        ),
+        row!(
+            "fetch with no arguments refuses a :name placeholder",
+            "[Err[Protocol] encountered unexpected or invalid data: unsupported SQL parameter \
+             format: :x (sqlx_sqlite::arguments:99)]",
+            |pool| stream(&pool, "SELECT :x").await
         ),
         difference!(
             "difference: fetch_one with a $0 placeholder",

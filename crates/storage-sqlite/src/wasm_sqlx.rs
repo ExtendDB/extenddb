@@ -51,7 +51,11 @@
 //!   statements of the same SQL used; `:name`, `@name` and a non-numeric
 //!   `$name` are [`Error::Protocol`]. Binding stops at the first placeholder
 //!   with no argument, so it and the ones after it are NULL; arguments with no
-//!   placeholder are not bound.
+//!   placeholder are not bound. A call that carries no arguments, `raw_sql`
+//!   and `Executor::execute` on a `&str`, binds nothing, so every placeholder
+//!   in its SQL, `:name`, `@name`, `$name` and `$0` included, is NULL; a
+//!   query built with `query`, `query_as` or `query_scalar` carries arguments
+//!   even when none is bound, and binds as above.
 //! * **Running SQL.** The SQL is trimmed and every statement in it runs in
 //!   turn. `rows_affected` adds up `sqlite3_changes` after each statement (so a
 //!   `SELECT` counts the changes of the last write before it, as SQLite reports
@@ -111,7 +115,8 @@
 //!   [`Error::BeginFailed`], so its next `begin_with` on that connection fails
 //!   with `InvalidSavePointStatement`; here the connection is left as it was
 //!   and the next `begin_with` runs.
-//! * **`$0`.** A `$0` placeholder is [`Error::Protocol`] from every terminal.
+//! * **`$0`.** A `$0` placeholder in a query built with `query`, `query_as`
+//!   or `query_scalar` is [`Error::Protocol`] from every terminal.
 //!   Under `sqlx` the argument lookup for it (`arguments.rs:116`, the index
 //!   `n - 1` with `n = 0`) panics the connection's worker thread while it
 //!   binds, before the statement runs, and the call returns as if the
@@ -1397,7 +1402,14 @@ impl Run {
 /// [`bind_all`]), `sqlite3_changes` is added up after each statement, and the
 /// first error stops the run. SQL with no statement runs nothing and reports
 /// zero.
-fn run_query(handle: &Handle, sql: &str, params: &[Param], keep: Rows) -> Run {
+///
+/// `params` is `None` for a call that carries no arguments, `raw_sql` and
+/// `Executor::execute` on a `&str`; `sqlx-sqlite` binds nothing for such a
+/// call (`bind` in its `connection/execute.rs` runs `SqliteArguments::bind`
+/// only when there are arguments), so every placeholder in its SQL is NULL.
+/// The query builders always carry arguments, an empty list when nothing was
+/// bound, as `sqlx::query` does.
+fn run_query(handle: &Handle, sql: &str, params: Option<&[Param]>, keep: Rows) -> Run {
     let mut run = Run {
         rows: Vec::new(),
         result: QueryResult::default(),
@@ -1412,7 +1424,7 @@ fn run_query(handle: &Handle, sql: &str, params: &[Param], keep: Rows) -> Run {
 fn run_statements(
     handle: &Handle,
     sql: &str,
-    params: &[Param],
+    params: Option<&[Param]>,
     keep: Rows,
     run: &mut Run,
 ) -> Result<(), Error> {
@@ -1444,7 +1456,9 @@ fn run_statements(
             // Only whitespace, a comment or an empty statement was consumed.
             continue;
         }
-        args_used += bind_all(db, stmt, params, args_used)?;
+        if let Some(params) = params {
+            args_used += bind_all(db, stmt, params, args_used)?;
+        }
 
         let mut names: Option<Arc<Vec<String>>> = None;
         loop {
@@ -1475,9 +1489,10 @@ fn run_statements(
     Ok(())
 }
 
-/// A statement with no parameters (pragmas and transaction control).
+/// A statement with no arguments (pragmas and transaction control), run as
+/// `Executor::execute` on a `&str` runs it.
 fn run_exec(handle: &Handle, sql: &str) -> Result<QueryResult, Error> {
-    run_query(handle, sql, &[], Rows::Discard)
+    run_query(handle, sql, None, Rows::Discard)
         .into_result()
         .map(|(_, result)| result)
 }
@@ -1485,19 +1500,19 @@ fn run_exec(handle: &Handle, sql: &str) -> Result<QueryResult, Error> {
 /// Run a query for its first row, if any.
 fn first_row<E: Executor>(ex: &E, sql: &str, params: &[Param]) -> Result<Option<Row>, Error> {
     ex.ensure_available()?;
-    let (rows, _) = run_query(&ex.handle(), sql, params, Rows::First).into_result()?;
+    let (rows, _) = run_query(&ex.handle(), sql, Some(params), Rows::First).into_result()?;
     Ok(rows.into_iter().next())
 }
 
 /// Run a query for all its rows.
 fn all_rows<E: Executor>(ex: &E, sql: &str, params: &[Param]) -> Result<Vec<Row>, Error> {
     ex.ensure_available()?;
-    let (rows, _) = run_query(&ex.handle(), sql, params, Rows::All).into_result()?;
+    let (rows, _) = run_query(&ex.handle(), sql, Some(params), Rows::All).into_result()?;
     Ok(rows)
 }
 
-/// Run a query for its side effect.
-fn execute<E: Executor>(ex: &E, sql: &str, params: &[Param]) -> Result<QueryResult, Error> {
+/// Run a query for its side effect; `params` as [`run_query`] takes it.
+fn execute<E: Executor>(ex: &E, sql: &str, params: Option<&[Param]>) -> Result<QueryResult, Error> {
     ex.ensure_available()?;
     let (_, result) = run_query(&ex.handle(), sql, params, Rows::Discard).into_result()?;
     Ok(result)
@@ -1530,7 +1545,7 @@ impl<DB> Query<DB> {
 
     /// Execute for side effect.
     pub async fn execute<E: Executor<Database = DB>>(self, ex: E) -> Result<QueryResult, Error> {
-        execute(&ex, &self.sql, &self.params)
+        execute(&ex, &self.sql, Some(&self.params))
     }
 }
 
@@ -1601,7 +1616,7 @@ impl<O: FromRow, DB> QueryAs<O, DB> {
         let items: Vec<Result<O, Error>> = match ex.ensure_available() {
             Err(e) => vec![Err(e)],
             Ok(()) => {
-                let run = run_query(&ex.handle(), &self.sql, &self.params, Rows::All);
+                let run = run_query(&ex.handle(), &self.sql, Some(&self.params), Rows::All);
                 run.rows
                     .iter()
                     .map(O::from_row)
@@ -1680,7 +1695,7 @@ pub fn raw_sql(sql: &str) -> RawSql {
 impl RawSql {
     /// Execute the whole script, running every statement in the string.
     pub async fn execute<E: Executor>(self, ex: E) -> Result<QueryResult, Error> {
-        execute(&ex, &self.sql, &[])
+        execute(&ex, &self.sql, None)
     }
 }
 
