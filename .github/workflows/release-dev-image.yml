@@ -9,7 +9,9 @@
 # promote-registry composite action — signature verified at each destination
 # before any tag is placed, forward-only latest per destination. The attest
 # job runs beside propagate and attests the build provenance and the SBOMs
-# (see release-image.yml for the design).
+# (see release-image.yml for the design). With the `dry_run` input the run
+# ends after the build jobs and publishes nothing, in a concurrency group of
+# its own (release-image.yml).
 #
 # Re-entrant on registry state: if the version tag already exists on Docker
 # Hub WITH a verifying signature, the publish job treats the published,
@@ -59,12 +61,16 @@ on:
       tag:
         description: 'Existing version tag to release, e.g. v0.1.6'
         required: true
+      dry_run:
+        description: 'Rehearse only: run the gates and both builds with their smoke tests, scans and SBOMs; publish, sign, mirror and attest nothing'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-image-extenddb-dev
+  group: release-image-extenddb-dev${{ inputs.dry_run && '-dry' || '' }}
   cancel-in-progress: false
 
 env:
@@ -155,7 +161,9 @@ jobs:
   build:
     needs: gate
     strategy:
-      fail-fast: true
+      # A release stops at the first failing architecture; a rehearsal lets
+      # both report.
+      fail-fast: ${{ !inputs.dry_run }}
       matrix:
         include:
           - arch: amd64
@@ -268,25 +276,11 @@ jobs:
             "$TRIVY_IMAGE" image --input /image.tar.gz \
             --format cyclonedx --no-progress --skip-version-check \
             > "sbom/sbom-${ARCH}.cdx.json"
-          REQUIRE_CRATES=0
-          grep -q 'cargo auditable build' Dockerfile.dev && REQUIRE_CRATES=1
-          python3 - "sbom/sbom-${ARCH}.cdx.json" "$REQUIRE_CRATES" <<'PY'
-          import json, re, sys
-          bom = json.load(open(sys.argv[1]))
-          crates = [c for c in bom.get("components", []) if c.get("purl", "").startswith("pkg:cargo/")]
-          ids = [p.get("value", "") for p in bom.get("metadata", {}).get("component", {}).get("properties", [])
-                 if p.get("name") == "aquasecurity:trivy:ImageID"]
-          if (bom.get("bomFormat") != "CycloneDX" or not bom.get("components") or len(ids) != 1
-                  or not re.fullmatch(r"sha256:[0-9a-f]{64}", ids[0])):
-              print(f"::error::{sys.argv[1]} is not a CycloneDX SBOM of one image")
-              sys.exit(1)
-          if not crates:
-              if sys.argv[2] == "1":
-                  print(f"::error::{sys.argv[1]} lists no crates, but Dockerfile.dev builds with cargo-auditable")
-                  sys.exit(1)
-              print(f"::warning::{sys.argv[1]} lists no crates: this tag's Dockerfile.dev predates cargo-auditable")
-          print(f"{len(bom['components'])} components, {len(crates)} of them crates; image {ids[0]}")
-          PY
+          # The check is devtools/check-image-sbom at the tagged commit, shared
+          # with devtools/release-dry-run; a tag from before it has none.
+          [[ -x devtools/check-image-sbom ]] \
+            || { echo "::error::tagged commit has no devtools/check-image-sbom; use a tag created after it was merged"; exit 1; }
+          devtools/check-image-sbom "sbom/sbom-${ARCH}.cdx.json" Dockerfile.dev
 
       - name: Upload the SBOM artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
@@ -303,8 +297,32 @@ jobs:
           retention-days: 1
           compression-level: 0
 
+  # A rehearsal's end: the gates and the builds ran as the release runs them,
+  # and nothing was published. The publish-side jobs are skipped by their
+  # `if`, so their environments ask no approval.
+  dry-run-summary:
+    needs: [gate, build]
+    if: ${{ inputs.dry_run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Summarise the rehearsal
+        run: |
+          {
+            echo "### Dry run: gates and builds passed, nothing published"
+            echo ""
+            echo "Both architectures of \`${{ env.IMAGE_REPO }}\` built, passed the smoke test and the vulnerability scan, and produced SBOMs. Dispatch again without the dry run to publish."
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| tag | \`v${{ needs.gate.outputs.version }}\` |"
+            echo "| commit | \`${{ needs.gate.outputs.sha }}\` |"
+            echo "| version (from tag) | \`${{ needs.gate.outputs.version }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   publish:
     needs: [gate, build]
+    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: dockerhub       # approval 1: publish + sign (Docker Hub credential lives here)

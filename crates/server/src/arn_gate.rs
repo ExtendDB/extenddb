@@ -202,6 +202,7 @@ pub(crate) fn check_transact_member_arn(arn: &str, location: &str) -> Result<(),
 
 /// `SourceTableArn` of `RestoreTableToPointInTime` and `TableArn` of
 /// `ExportTableToPointInTime` with a table segment that fails the pattern.
+/// The server refuses every `RestoreTableToPointInTime` before this code runs.
 pub(crate) fn check_table_arn_field(operation: &str, arn: &str) -> Result<(), DynamoDbError> {
     let bad = matches!(parse(arn), Some(res) if res.sub.is_none() && !in_pattern(&res.table));
     if !bad {

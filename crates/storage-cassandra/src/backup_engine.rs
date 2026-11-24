@@ -83,13 +83,13 @@
 //! that read the in-catalog row before the conversion does not claim the
 //! index row after it.
 
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use cdrs_tokio::consistency::Consistency;
-use cdrs_tokio::query::BatchQueryBuilder;
 use cdrs_tokio::types::map::Map;
 use cdrs_tokio::types::{AsRust, IntoRustByName, rows::Row};
 use extenddb_core::types::{
@@ -512,7 +512,7 @@ impl CassandraEngine {
             "SELECT * FROM {}.backups_by_arn WHERE account_id = ? AND backup_arn = ?",
             self.catalog_keyspace()
         );
-        let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+        let rows = crate::cassandra_util::query_rows::<StorageError>(
             &self.session,
             &query,
             cdrs_tokio::query_values!(account_id, backup_arn),
@@ -595,7 +595,7 @@ impl CassandraEngine {
             #[allow(clippy::cast_possible_truncation)]
             let bucket_i32 = bucket as i32;
             if bucket >= known {
-                let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+                let rows = crate::cassandra_util::query_rows::<StorageError>(
                     &self.session,
                     &probe,
                     cdrs_tokio::query_values!(backup_arn, bucket_i32),
@@ -607,7 +607,11 @@ impl CassandraEngine {
                 }
             }
             self.session
-                .query_with_values(&delete, cdrs_tokio::query_values!(backup_arn, bucket_i32))
+                .run(
+                    Stmt::Write,
+                    &delete,
+                    cdrs_tokio::query_values!(backup_arn, bucket_i32),
+                )
                 .await
                 .map_err(|e| StorageError::Internal(format!("Delete backup payload: {e}")))?;
             bucket += 1;
@@ -644,7 +648,8 @@ impl CassandraEngine {
             "DELETE FROM {catalog}.backups_by_account WHERE account_id = ? AND created_at = ? AND backup_arn = ?"
         );
         self.session
-            .query_with_values(
+            .run(
+                Stmt::Write,
                 &by_account,
                 cdrs_tokio::query_values!(
                     backup.account_id.as_str(),
@@ -659,7 +664,8 @@ impl CassandraEngine {
             "DELETE FROM {catalog}.backups_by_table WHERE account_id = ? AND table_name = ? AND created_at = ? AND backup_arn = ?"
         );
         self.session
-            .query_with_values(
+            .run(
+                Stmt::Write,
                 &by_table,
                 cdrs_tokio::query_values!(
                     backup.account_id.as_str(),
@@ -869,7 +875,7 @@ impl CassandraEngine {
              WHERE account_id = ? AND table_name = ?",
             self.catalog_keyspace()
         );
-        let row = crate::cassandra_util::query_rows_quorum::<StorageError>(
+        let row = crate::cassandra_util::query_rows::<StorageError>(
             &self.session,
             &query,
             cdrs_tokio::query_values!(account_id, target_name),
@@ -902,7 +908,7 @@ impl CassandraEngine {
              WHERE account_id = ? AND table_name = ?",
             self.catalog_keyspace()
         );
-        let row = crate::cassandra_util::query_rows_quorum::<StorageError>(
+        let row = crate::cassandra_util::query_rows::<StorageError>(
             &self.session,
             &query,
             cdrs_tokio::query_values!(account_id, table_name),
@@ -942,7 +948,7 @@ impl CassandraEngine {
              ALLOW FILTERING",
             self.catalog_keyspace()
         );
-        let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+        let rows = crate::cassandra_util::query_rows::<StorageError>(
             &self.session,
             &query,
             cdrs_tokio::query_values!(account_id, backup_arn),
@@ -1251,7 +1257,8 @@ impl CassandraEngine {
             let bucket_i32 = bucket as i32;
             let rows = self
                 .session
-                .query_with_values(
+                .run(
+                    Stmt::Read,
                     &query,
                     cdrs_tokio::query_values!(job.backup_arn.as_str(), bucket_i32),
                 )
@@ -1793,17 +1800,17 @@ impl CassandraEngine {
         let mut keys = Vec::new();
         let mut paging_state = None;
         loop {
-            let mut params = cdrs_tokio::statement::StatementParamsBuilder::new()
-                .with_consistency(Consistency::LocalQuorum)
-                .with_page_size(page_size);
-            if let Some(state) = paging_state.take() {
-                params = params.with_paging_state(state);
-            }
             let failed =
                 |e: cdrs_tokio::error::Error| StorageError::Internal(format!("{WHAT}: {e}"));
             let body = self
                 .session
-                .query_with_params(&scan, params.build())
+                .run_paged(
+                    Stmt::Read,
+                    &scan,
+                    cdrs_tokio::query_values!(),
+                    page_size,
+                    paging_state.take(),
+                )
                 .await
                 .map_err(failed)?
                 .response_body()
@@ -1998,7 +2005,8 @@ impl LegacyBackupReader for CassandraEngine {
                         #[allow(clippy::cast_possible_truncation)]
                         let bucket_i32 = bucket as i32;
                         self.session
-                            .query_with_values(
+                            .run(
+                                Stmt::Write,
                                 &insert_item,
                                 cdrs_tokio::query_values!(
                                     backup_arn.as_str(),
@@ -2070,8 +2078,7 @@ impl LegacyBackupReader for CassandraEngine {
             // once its heartbeat is stale, rather than an AVAILABLE backup no
             // listing ever shows.
             let list_rows: Result<(), StorageError> = async {
-                let batch = BatchQueryBuilder::new()
-                    .with_consistency(Consistency::LocalQuorum)
+                let batch = crate::cassandra_util::batch()
                     .add_query(
                         insert_by_account,
                         cdrs_tokio::query_values!(
@@ -2099,7 +2106,7 @@ impl LegacyBackupReader for CassandraEngine {
                         ),
                     );
                 self.session
-                    .batch(
+                    .run_batch(
                         batch
                             .build()
                             .map_err(|e| StorageError::Internal(e.to_string()))?,
@@ -2205,7 +2212,8 @@ impl LegacyBackupReader for CassandraEngine {
                     "SELECT backup_arn FROM {catalog}.backups_by_table WHERE account_id = ? AND table_name = ?"
                 );
                 self.session
-                    .query_with_values(
+                    .run(
+                        Stmt::Read,
                         &query,
                         cdrs_tokio::query_values!(account_id.as_str(), table_name),
                     )
@@ -2215,7 +2223,11 @@ impl LegacyBackupReader for CassandraEngine {
                     "SELECT backup_arn FROM {catalog}.backups_by_account WHERE account_id = ?"
                 );
                 self.session
-                    .query_with_values(&query, cdrs_tokio::query_values!(account_id.as_str()))
+                    .run(
+                        Stmt::Read,
+                        &query,
+                        cdrs_tokio::query_values!(account_id.as_str()),
+                    )
                     .await
             };
             let rows = result
@@ -2421,7 +2433,7 @@ impl LegacyBackupReader for CassandraEngine {
                      heartbeat_at FROM {catalog}.backups_by_arn \
                      WHERE backup_status = ? ALLOW FILTERING"
                 );
-                let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+                let rows = crate::cassandra_util::query_rows::<StorageError>(
                     &self.session,
                     &query,
                     cdrs_tokio::query_values!(status),
@@ -2605,19 +2617,18 @@ const LEGACY_KEYS_PAGE: i32 = 1000;
 /// Rows of one item bucket `items` reads per query.
 const LEGACY_ITEMS_PAGE: i32 = 8;
 
-/// The parameters of one page of `items`: the values at consistency `ALL`.
-/// The in-catalog create wrote each bucket row at `ONE`, so a read of fewer
-/// than every replica can miss a row one replica alone holds and end short;
-/// at `ALL` every live replica's rows are merged, and a replica that does
-/// not answer fails the read rather than shortening it
+/// One page of `items`, read at `ALL`. The in-catalog create of an older
+/// version wrote each bucket row at `ONE`, so a read of fewer than every
+/// replica can miss a row that one replica alone holds, and end short. At
+/// `ALL`, every live replica's rows are merged, and a replica that does not
+/// answer fails the read instead of shortening it
 /// ([`legacy_items_read_error`]).
-fn legacy_items_page_params(
+async fn read_items_page<S: crate::cassandra_util::PolicySession>(
+    session: &S,
+    query: &str,
     values: cdrs_tokio::query::QueryValues,
-) -> cdrs_tokio::statement::StatementParams {
-    cdrs_tokio::statement::StatementParamsBuilder::new()
-        .with_consistency(Consistency::All)
-        .with_values(values)
-        .build()
+) -> Result<cdrs_tokio::frame::Envelope, cdrs_tokio::error::Error> {
+    session.run(Stmt::ReadAll, query, values).await
 }
 
 /// A failed page read of `items`: a replica that did not answer the read
@@ -2678,24 +2689,22 @@ impl LegacyItemsCursor {
     async fn read_page(&mut self) -> Result<(), StorageError> {
         #[allow(clippy::cast_possible_truncation)]
         let bucket = self.bucket as i32;
-        let rows = self
-            .engine
-            .session
-            .query_with_params(
-                &self.query,
-                legacy_items_page_params(cdrs_tokio::query_values!(
-                    self.backup_arn.as_str(),
-                    bucket,
-                    self.after,
-                    LEGACY_ITEMS_PAGE
-                )),
-            )
-            .await
-            .map_err(|e| legacy_items_read_error(&e))?
-            .response_body()
-            .map_err(|e| StorageError::Internal(format!("Parse backup payload: {e}")))?
-            .into_rows()
-            .unwrap_or_default();
+        let rows = read_items_page(
+            &*self.engine.session,
+            &self.query,
+            cdrs_tokio::query_values!(
+                self.backup_arn.as_str(),
+                bucket,
+                self.after,
+                LEGACY_ITEMS_PAGE
+            ),
+        )
+        .await
+        .map_err(|e| legacy_items_read_error(&e))?
+        .response_body()
+        .map_err(|e| StorageError::Internal(format!("Parse backup payload: {e}")))?
+        .into_rows()
+        .unwrap_or_default();
         let full = rows.len() >= usize::try_from(LEGACY_ITEMS_PAGE).unwrap_or(usize::MAX);
         for row in rows {
             let item_index: i64 = row
@@ -2760,14 +2769,74 @@ fn restore_source_of(backup: &StoredBackup) -> Result<BackupRestoreSource, Stora
 mod tests {
     use super::*;
 
-    /// `items` reads every page at `ALL`, the one level at which a row
-    /// written at `ONE` to one replica cannot be missed by a live read.
-    #[test]
-    fn the_legacy_item_pages_are_read_at_all() {
-        let params =
-            legacy_items_page_params(cdrs_tokio::query_values!("arn", 0_i32, -1_i64, 8_i32));
-        assert_eq!(params.query_params.consistency, Consistency::All);
-        assert!(params.query_params.values.is_some());
+    /// A session that records the kind of each statement and sends nothing.
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<Stmt>>);
+
+    impl Recorder {
+        fn record(
+            &self,
+            kind: Stmt,
+        ) -> std::future::Ready<Result<cdrs_tokio::frame::Envelope, cdrs_tokio::error::Error>>
+        {
+            self.0.lock().expect("the record").push(kind);
+            std::future::ready(Err(cdrs_tokio::error::Error::General(
+                "recorded, not sent".to_owned(),
+            )))
+        }
+    }
+
+    impl crate::cassandra_util::PolicySession for Recorder {
+        fn run<Q: AsRef<str>>(
+            &self,
+            kind: Stmt,
+            _query: Q,
+            _values: cdrs_tokio::query::QueryValues,
+        ) -> impl std::future::Future<
+            Output = Result<cdrs_tokio::frame::Envelope, cdrs_tokio::error::Error>,
+        > + Send {
+            self.record(kind)
+        }
+
+        fn run_paged<Q: AsRef<str>>(
+            &self,
+            kind: Stmt,
+            _query: Q,
+            _values: cdrs_tokio::query::QueryValues,
+            _page_size: i32,
+            _paging_state: Option<cdrs_tokio::types::CBytes>,
+        ) -> impl std::future::Future<
+            Output = Result<cdrs_tokio::frame::Envelope, cdrs_tokio::error::Error>,
+        > + Send {
+            self.record(kind)
+        }
+
+        fn run_batch(
+            &self,
+            _batch: cdrs_tokio::query::QueryBatch,
+        ) -> impl std::future::Future<
+            Output = Result<cdrs_tokio::frame::Envelope, cdrs_tokio::error::Error>,
+        > + Send {
+            std::future::ready(Err(cdrs_tokio::error::Error::General(
+                "recorded, not sent".to_owned(),
+            )))
+        }
+    }
+
+    /// `items` reads every page as `Stmt::ReadAll`, which runs at `ALL`: the
+    /// one level at which a row written at `ONE` to one replica cannot be
+    /// missed by a live read. One node cannot show the level, so this test
+    /// checks the kind that the page read sends.
+    #[tokio::test]
+    async fn the_legacy_item_pages_are_read_at_all() {
+        let session = Recorder::default();
+        let _ = read_items_page(
+            &session,
+            "SELECT item_index, item_data FROM ks.backup_items",
+            cdrs_tokio::query_values!(),
+        )
+        .await;
+        assert_eq!(*session.0.lock().expect("the record"), [Stmt::ReadAll]);
     }
 
     /// A replica that does not answer the read at `ALL` is named, the

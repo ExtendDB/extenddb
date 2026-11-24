@@ -32,13 +32,16 @@ snapshot tooling.
 What a table backup is not:
 
 - It does not hold the catalog: accounts, IAM users, groups, roles, policies, access keys, runtime settings
-  and the encryption key live in the catalog database, which no table backup contains. Back the catalog up
+  and the encryption key rows live in the catalog database, which no table backup contains. Back the catalog up
   with the database's own tools (the admin guide's [Data Recovery](05-admin-guide.md#data-recovery) entry
   names the databases and gives the PostgreSQL commands), and keep that copy off the host as well. On
   PostgreSQL the catalog and data databases are one copy: dump both with the server stopped, or take a base
-  backup of the PostgreSQL server that holds both. A catalog backup holds the encryption key that decrypts the
-  access key secrets, and on PostgreSQL the application role's password: protect it as a secret, and create
-  the dump files with `umask 077`.
+  backup of the PostgreSQL server that holds both. Without `[auth.encryption] key_file`, a catalog backup
+  holds the encryption key that decrypts the access key secrets, and on PostgreSQL the application role's
+  password: protect it as a secret, and create the dump files with `umask 077`. With a KEK file, the backup
+  holds the data encryption key wrapped under the KEK and opens only with that KEK; [Recovering from catalog
+  loss](#recovering-from-catalog-loss) says which key a restore needs. Create the dump files with `umask 077`
+  in either case.
 - It is not scheduled. ExtendDB has no backup scheduler: run `CreateBackup` from cron or your scheduler. As a
   crontab line, where every `%` must be escaped because cron turns an unescaped `%` into a newline:
 
@@ -493,13 +496,27 @@ sync`.
 
 ### The catalog is restored from a database backup
 
+A catalog copy needs the key it was taken with. A copy taken while the deployment used the catalog key holds
+that key in its `encryption_key` row and needs a configuration without `[auth.encryption] key_file`. A copy
+taken after `extenddb encryption-key switch` holds the data encryption key (DEK) wrapped under a
+key-encryption key (KEK), in its `encryption_key_ring` row, and needs the KEK whose id that ring names, on
+the restoring host, with the same `[auth.encryption]` section; the server refuses a ring that names another
+KEK and prints both ids. `rewrap` and `rotate` change no older copy, so keep each KEK for as long as a copy
+wrapped under it is kept (the admin guide's [Encryption Key](05-admin-guide.md#encryption-key) section). A
+physical copy of a PostgreSQL, MongoDB or Cassandra catalog taken after the switch (a write-ahead log
+archive, an SSTable before compaction, an oplog entry) can still hold the deleted `encryption_key` row and
+with it each secret that existed before the switch; re-create those access keys to end that exposure. If the
+KEK of a copy is lost, see [The KEK of a catalog copy is lost](#the-kek-of-a-catalog-copy-is-lost).
+
 Restore the catalog from its database backup (the admin guide's [Data
 Recovery](05-admin-guide.md#data-recovery) entry). On PostgreSQL the catalog and data databases are one copy:
 restore both, either from dumps taken together with the server stopped, into new, empty databases owned by the
 application role as the entry gives it (restoring over the existing databases restores nothing), or from one
 base backup of the PostgreSQL server that held both, with PostgreSQL's own procedure. On a new PostgreSQL
 server create the application role before the dumps' restore and, when the server's address changed, set the
-data database's address in the restored catalog, as the entry's last paragraph says. On SQLite the database
+data database's address in the restored catalog, as the entry's last paragraph says: with a `psql UPDATE` of
+the `data_database_connection_string` row for a catalog without a key ring, and with `extenddb encryption-key
+set-data-connection` for a catalog with one, whose row is encrypted. On SQLite the database
 file holds the catalog and the tables; restore it as the entry's SQLite row says. Either way every table returns to the copy's moment, and a table created after it is gone. The restored catalog has the same catalog id, so it still
 owns the store root, and its accounts and IAM are back. Then run, with the servers stopped on SQLite and
 beside them on the other backends:
@@ -546,6 +563,53 @@ table while its old items stay in a table of the data database that nothing refe
 the copy is listed and answers `ResourceNotFoundException` until it is deleted again. Restore the pair
 instead.
 
+### The KEK of a catalog copy is lost
+
+A catalog copy taken after the switch to a KEK file opens only with the KEK that its `encryption_key_ring`
+row names. When that KEK is gone, the stored secrets of the copy are gone with it: every access key secret
+and every session secret. Everything else in the catalog is readable, and `extenddb encryption-key reset`
+makes the copy serve again without them. With every server stopped:
+
+1. Restore the copy as the section above says, and check it with `extenddb encryption-key status`, with
+   `key_file` unset for that run: with `key_file` naming the lost file, `status` stops at the file rule and
+   prints nothing about the ring. Without it, `status` prints the ring with its KEK id and marks it as not
+   authenticated, since no KEK of yours opens it. The server itself refuses to start on it and prints the
+   ring's KEK id beside the id of the configured KEK.
+2. Create a new KEK file and keep a copy away from the host, then run the preview and read what it lists:
+
+   ```bash
+   extenddb encryption-key reset --config extenddb.toml --key-file /etc/extenddb/kek-2 --discard-secrets
+   ```
+
+   On PostgreSQL the command reads the data database connection string on standard input, in the preview
+   too, because no key of the run opens the stored row: write the string to a file under `umask 077` and
+   run the command with `< conn.txt`, as the admin guide's [`set-data-connection`](05-admin-guide.md#set-data-connection)
+   paragraph shows.
+3. Run it again with `--yes`. It deletes every `access_keys` and `iam_sessions` row and the `encryption_key`
+   row if one exists, writes the connection string row under a new DEK on PostgreSQL, writes a new ring with
+   that DEK under the new KEK, and prints the deleted access key IDs. Every user, role, policy, group, account
+   and table stays. A run that stops before the ring write leaves the old ring, and the same command with the
+   same standard input runs again from the start.
+4. Set `key_file` to the new file and start the server.
+5. Give the users their credentials back: create new access keys, or import the pairs the clients hold under
+   their old IDs with `import-access-key`, as step 2 of [The catalog is lost and
+   re-created](#the-catalog-is-lost-and-re-created) does, turning `allow_credential_import` on for the
+   imports and off again after them. Clients that use AssumeRole call it again.
+
+`reset` is for a lost KEK only. It refuses a ring whose KEK id equals the given KEK's id while a DEK fails to
+unwrap: that ring has damage or a changed field, and its KEK is not lost. It also refuses a catalog key row
+without a ring. A catalog with neither row lost its DEK with the ring, and `reset` treats it as a lost KEK.
+
+### Restore a damaged or missing key ring
+
+For a damaged ring, and for a catalog key row without a ring, restore a catalog copy taken before the change
+and check it with `status`. A ring that says a switch or a DEK replacement did not finish, when no run of yours
+stopped, is a ring row that a writer to the catalog database put back from an older copy: do not resume it,
+because the resumed run would re-encrypt the rows that writer chose. Restore a catalog copy taken after your
+last `encryption-key` run finished, and check it with `status`. When a run of yours did stop, resume it with
+the same command; for a switch, unset `key_file` for the run. A ring under an older KEK, or whose DEK id is
+lower than the one the last command printed, can be such a write-back as well; `status` prints both ids.
+
 ### The catalog is lost and re-created
 
 When no catalog backup exists, `extenddb init` creates a new catalog with a new catalog id. `init` refuses a
@@ -558,7 +622,10 @@ values, so a `port`, `bind_addr`, TLS path, cache `ttl_seconds` or limit you set
 server listens on 18443; and `[backup]`,
 `[backup.store]`, `[import]`, `[export]` and every other section you added are dropped. Copy the file aside
 before running `init`, and before the new server starts put the copy back whole, taking only the regenerated
-storage settings from the new file. Without `[backup.store]` a PostgreSQL, MongoDB or Cassandra server has
+storage settings from the new file. A re-created catalog holds a new catalog key and no key ring, so leave
+`[auth.encryption]` out of the copy you put back until `extenddb encryption-key switch --yes` has run on the
+new catalog (the admin guide's [Encryption Key](05-admin-guide.md#encryption-key) section); with `key_file`
+set, the server refuses a catalog that has the catalog key and no ring. Without `[backup.store]` a PostgreSQL, MongoDB or Cassandra server has
 no store (`/health` shows no `backup_store` component, `CreateBackup` writes in-catalog backups, and `backup
 sync --adopt-store` exits 1, "no backup store is configured"), and a SQLite server uses the default root beside
 the database; when the store was configured elsewhere, that root is a new, empty directory, and `--adopt-store`
@@ -884,7 +951,7 @@ The command prints one line per backup and a summary:
 
 ```
 migrated arn:aws:dynamodb:us-east-1:123456789012:table/orders/backup/01793991641206-db64fc83 (account 123456789012): 303 items, 3158 bytes
-refused arn:aws:dynamodb:us-east-1:123456789012:table/orders/backup/1793254932797-4116998c (account 123456789012): its backup id 1793254932797-4116998c has the 13-digit shape a 0.1.x release issued, and a store prefix carries only the 14-digit shape; restore it (RestoreTableFromBackup) and take a new backup of the restored table, which has a new ARN. Its in-catalog backup is kept
+refused arn:aws:dynamodb:us-east-1:123456789012:table/orders/backup/1793254932797-4116998c (account 123456789012): its backup id 1793254932797-4116998c has the 13-digit shape that 0.1.14 and earlier releases issued, and a store prefix carries only the 14-digit shape; restore it (RestoreTableFromBackup) and take a new backup of the restored table, which has a new ARN. Its in-catalog backup is kept
 
 === extenddb backup migrate-legacy complete: 1 migrated, 0 finished, 0 already in the store, 0 deleted, 1 refused, 0 skipped, 0 failed ===
 ```
@@ -929,7 +996,7 @@ than `stale_job_after_secs`.
 What it refuses, keeping the legacy backup as it is. A refusal before the copy writes nothing, and one after
 it deletes the copy, except where the list says the prefix is left:
 
-- **Every backup a 0.1.x release took.** Their backup ids have the 13-digit shape a 0.1.x release issued
+- **Every backup that 0.1.14 or an earlier release took.** Their backup ids have the 13-digit shape those releases issued
   (13 digits with a hex suffix, or 13 bare digits), and a store prefix carries only the 14-digit shape. Only legacy backups taken by this release
   line migrate: those of a server without a store, with `kind = "disabled"`, and on Cassandra.
 - A backup holding an item the item check refuses: a value the wire stores without validating it (#618,
@@ -1138,11 +1205,13 @@ neither path is refused, "Either FilePath or S3Prefix must be provided"). It rea
 DynamoDB export directly, with `ImportTable` or a restore, is planned (#748) and not in this release; `backup
 sync` adopts only prefixes with an ExtendDB manifest.
 
+---
+
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.
