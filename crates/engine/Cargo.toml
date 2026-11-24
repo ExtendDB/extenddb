@@ -27,7 +27,9 @@ extenddb-core = { workspace = true }
 extenddb-storage = { workspace = true }
 extenddb-backup-store = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# `raw_value`: the digits of a `Limit`, `Segment` or `TotalSegments` as the
+# request wrote them; see `int32_member::read_floats_as_written`.
+serde_json = { workspace = true, features = ["raw_value"] }
 tracing = { workspace = true }
 base64 = { workspace = true }
 uuid = { workspace = true }

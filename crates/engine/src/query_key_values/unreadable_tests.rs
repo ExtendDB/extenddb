@@ -3,7 +3,10 @@
 //! Tests for a `Query` on the service's older validation path: one whose
 //! `ExpressionAttributeValues`, `ExclusiveStartKey` or condition lists hold a
 //! value the service cannot read as one type, or whose `Limit` is a float or
-//! an integer outside int32.
+//! an integer outside int32. The set check of that path is tested on `Scan`
+//! and `Query` here: `Query` makes it in `older_form_checks`, and `Scan` in
+//! the checks the server runs ahead of the IAM decision
+//! (`scan_request::validate_before_authorization`).
 
 use extenddb_core::error::DynamoDbError;
 use serde_json::{Value, json};
@@ -13,6 +16,7 @@ use super::tests::{
     SEVERAL, body_with, message, one_error,
 };
 use super::validate_query_request_body;
+use crate::scan_request::validate_before_authorization;
 
 #[test]
 fn a_value_the_service_cannot_read_as_one_type_is_named_with_its_placeholder() {
@@ -459,7 +463,7 @@ fn a_limit_that_is_a_float_or_outside_int32_takes_the_older_path() {
     }
 }
 
-/// Measured 2026-11-12 (demohan, each row twice): a null `AttributeValueList`
+/// Measured 2026-11-12 (each row twice): a null `AttributeValueList`
 /// entry of `KeyConditions` and an `L` nested in an `L` are values the service
 /// cannot read, so a `Limit` of 0 beside them takes the older form on `Query`.
 #[test]
@@ -481,4 +485,115 @@ fn a_null_list_entry_and_a_nested_list_member_take_the_older_path() {
             "{body}"
         );
     }
+}
+
+/// Measured 2026-11-24 05:41 UTC (us-east-1, each request twice, a table that
+/// does not exist), each beside `Limit: 1.5`, which puts the request on the
+/// older path: an empty set and a set with a duplicate member are refused
+/// with this path's wrapped text, `Input collection contains duplicates` for
+/// a number set, the deserializer's text for an empty number set and a
+/// string set. An invalid names key comes ahead of the set, an empty name
+/// after it. With no expression that can read a value, the service answers
+/// the expressions-only text instead, which `Scan` gives ahead of the set.
+/// Beside a set fault in one value and a number fault in another, the service
+/// named `:n` in both arrangements, as `Scan`'s hash order of the entries
+/// does; `Query`'s `older_form_checks` reads the numbers of every value ahead
+/// of the sets (#1013).
+#[test]
+fn an_empty_or_duplicate_set_is_refused_on_the_older_path() {
+    const EXPRESSIONS_ONLY: &str = "ExpressionAttributeValues can only be specified when using \
+                                    expressions: FilterExpression is null";
+    let duplicate_ns = json!({"NS": ["1", "1"]});
+    let dup = format!("{INVALID_VALUE}Input collection contains duplicates for key :a");
+    let scan = |fields: Value| {
+        let mut body = json!({"TableName": "t", "Limit": 1.5});
+        if let (Value::Object(body), Value::Object(fields)) = (&mut body, fields) {
+            body.extend(fields);
+        }
+        body
+    };
+    let reads_a = |value: Value| {
+        scan(json!({"FilterExpression": "a = :a", "ExpressionAttributeValues": {":a": value}}))
+    };
+    let rows = [
+        (reads_a(duplicate_ns.clone()), Some(dup.clone())),
+        (
+            reads_a(json!({"NS": []})),
+            Some(format!(
+                "{INVALID_VALUE}One or more parameter values were invalid: An number set  may \
+                 not be empty for key :a"
+            )),
+        ),
+        (
+            reads_a(json!({"SS": ["x", "x"]})),
+            Some(format!(
+                "{INVALID_VALUE}One or more parameter values were invalid: Input collection \
+                 [x, x] contains duplicates. for key :a"
+            )),
+        ),
+        (
+            reads_a(json!({"L": [duplicate_ns.clone()]})),
+            Some(dup.clone()),
+        ),
+        // The names key check comes first, the empty name check after.
+        (
+            scan(
+                json!({"FilterExpression": "a = :a", "ExpressionAttributeNames": {"a": "b"},
+                        "ExpressionAttributeValues": {":a": duplicate_ns.clone()}}),
+            ),
+            Some(INVALID_KEY.to_owned()),
+        ),
+        (
+            scan(
+                json!({"FilterExpression": "#a = :a", "ExpressionAttributeNames": {"#a": ""},
+                        "ExpressionAttributeValues": {":a": duplicate_ns.clone()}}),
+            ),
+            Some(dup.clone()),
+        ),
+        // A value the service cannot read is named ahead of the set.
+        (
+            scan(json!({"FilterExpression": "a = :a AND b = :z",
+                        "ExpressionAttributeValues": {":a": duplicate_ns.clone(), ":z": {"X": "1"}}})),
+            Some(format!("{INVALID_VALUE}{EMPTY} for key :z")),
+        ),
+        // The number in `:n` ahead of the set in `:a` (the service named `:n`).
+        (
+            scan(json!({"FilterExpression": "a = :a AND b = :n",
+                        "ExpressionAttributeValues": {":a": duplicate_ns.clone(), ":n": {"N": "bob"}}})),
+            Some(format!("{INVALID_VALUE}{NUMERIC_BOB} for key :n")),
+        ),
+        // The set in `:n` ahead of the number in `:a` (the service named `:n`).
+        (
+            scan(json!({"FilterExpression": "a = :a AND b = :n",
+                        "ExpressionAttributeValues": {":a": {"N": "bob"}, ":n": duplicate_ns.clone()}})),
+            Some(format!(
+                "{INVALID_VALUE}Input collection contains duplicates for key :n"
+            )),
+        ),
+        // No expression, or a ProjectionExpression alone: the expressions-only text.
+        (
+            scan(json!({"ExpressionAttributeValues": {":a": duplicate_ns.clone()}})),
+            Some(EXPRESSIONS_ONLY.to_owned()),
+        ),
+        (
+            scan(json!({"ProjectionExpression": "a",
+                        "ExpressionAttributeValues": {":a": duplicate_ns.clone()}})),
+            Some(EXPRESSIONS_ONLY.to_owned()),
+        ),
+    ];
+    for (body, expected) in rows {
+        assert_eq!(
+            message(validate_before_authorization(
+                &body,
+                body.to_string().as_bytes()
+            )),
+            expected,
+            "{body}"
+        );
+    }
+    let query = body_with(
+        json!({":p": {"S": "p0"}, ":a": duplicate_ns}),
+        json!({"Limit": 1.5, "FilterExpression": "a = :a"}),
+    );
+    assert_eq!(message(validate_query_request_body(&query)), Some(dup));
 }

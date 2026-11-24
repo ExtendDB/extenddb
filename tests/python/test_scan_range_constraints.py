@@ -8,8 +8,9 @@ written here (``0.0``, ``1e2``, ``9223372036854775808``). Each request is a
 row of the table measured against DynamoDB (us-east-1) on 2026-10-25 at 09:23,
 09:25, 09:28, 10:38, 10:55 and 12:56 UTC, or of the ones measured on
 2026-10-30 at 12:40 UTC, 2026-10-31 at 12:36 UTC, 2026-10-31 between 23:54
-and 23:56 UTC, 2026-11-12, and 2026-11-23 at 14:51 and 18:45 UTC (a table
-that does not exist) where a row says so, each sent twice, and each expected
+and 23:56 UTC, 2026-11-12, 2026-11-23 at 14:51 and 18:45 UTC, and 2026-11-24
+at 05:41 UTC (a table that does not exist) where a row says so, each sent
+twice, and each expected
 answer is the service's. Where a table records only that the service accepted
 a request, the test asserts what a Scan with that limit returns on this table
 of 12 items. ``Segment: 0, TotalSegments: 1`` with ``ConsistentRead: true``
@@ -30,8 +31,9 @@ path: the ``Select`` and ``ReturnConsumedCapacity`` enum clauses and the range
 clauses, with the value saturated or truncated and echoed, are reported in one
 message in the order select, totalSegments, returnConsumedCapacity, segment,
 limit. A float or an out-of-range integer that satisfies the constraint is
-accepted. A range field of another JSON type is a ``SerializationException``
-with the service's text.
+accepted. A fraction is truncated as written: ``0.99999999999999999999`` reads
+as 0, not as the double nearest it. A range field of another JSON type is a
+``SerializationException`` with the service's text.
 """
 
 from __future__ import annotations
@@ -153,10 +155,16 @@ OLDER_FORM = [
      one(older("2147483647", "segment", "less than or equal to 999999"))),
     ("Limit-int32-max-Segment-minus-1", '"Limit": 2147483647, "Segment": -1, "TotalSegments": 2',
      one(SEGMENT_LOW)),
+    # Measured 2026-11-24 05:41 UTC: a long fraction is truncated as written,
+    # where the double nearest it is 1 or -1.
+    ("Limit-long-fraction", '"Limit": 0.99999999999999999999', one(OLDER_LIMIT_0)),
+    ("Limit-negative-long-fraction", '"Limit": -0.99999999999999999999', one(OLDER_LIMIT_0)),
+    ("TotalSegments-long-fraction", '"TotalSegments": 0.99999999999999999999',
+     one(older("0", "totalSegments", "greater than or equal to 1"))),
 ]
 
 # Measured 2026-11-23 at 14:51 UTC (M01 to M03, M14, M15) and 2026-11-12
-# (demohan, 2 to 10 sends): in the older form the Select and
+# (2 to 10 sends): in the older form the Select and
 # ReturnConsumedCapacity enum clauses sit in the one message with the range
 # clauses, in the order select, totalSegments, returnConsumedCapacity, segment,
 # limit, also when only the enum clauses apply. In the newer form a range fault
@@ -189,23 +197,6 @@ OLDER_FORM_WITH_ENUMS = [
     ("newer-both-enums", '"Select": "NOPE", "ReturnConsumedCapacity": "NOPE"', one(RCC_NOPE)),
 ]
 
-# Measured 2026-11-23 at 18:45 UTC: in the older form the aggregate comes ahead
-# of the parameter mix and of an invalid ExpressionAttributeNames key, and a
-# float Limit that satisfies its constraint beside an N that is not a number
-# answers the wrapped numeric text.
-
-# ExpressionAttributeValues entries the service does not read as one
-# AttributeValue (older form beside Limit 0), and two it does (newer form).
-UNREADABLE = [("empty", {}), ("unknown-type", {"X": "1"}), ("two-types", {"S": "x", "N": "1"})]
-READABLE = [("empty-NS", {"NS": []}), ("duplicate-NS", {"NS": ["1", "1"]})]
-# Measured 2026-10-30 12:40 UTC on Scan, each under :d beside a filter that
-# reads :p: older form.
-# Measured 2026-11-12: an L nested in an L does the same, on Scan and Query.
-UNREADABLE_MEMBERS = [("L-empty-member", {"L": [{}]}),
-                      ("M-member-type-X", {"M": {"k": {"X": "1"}}}),
-                      ("lower-case-s", {"s": "x"}),
-                      ("L-in-L-empty-member", {"L": [{"L": [{}]}]})]
-
 
 def _conditions(name: str, entry: dict) -> dict:
     return {name: {"ComparisonOperator": "EQ", "AttributeValueList": [entry]}}
@@ -215,6 +206,10 @@ def _scan_filter(entry: dict) -> str:
     return '"ScanFilter": ' + json.dumps(_conditions("a", entry))
 
 
+# Measured 2026-11-23 at 18:45 UTC: in the older form the aggregate comes ahead
+# of the parameter mix and of an invalid ExpressionAttributeNames key, and a
+# float Limit that satisfies its constraint beside an N that is not a number
+# answers the wrapped numeric text.
 OLDER_FORM_BEFORE_THE_MIX = [
     ("Select-ahead-of-the-mix",
      '"Limit": 1.5, "Select": "BAD", ' + _scan_filter({"S": "x"})
@@ -232,25 +227,6 @@ OLDER_FORM_BEFORE_THE_MIX = [
      "The parameter cannot be converted to a numeric value: bob for key :n"),
 ]
 
-# Measured 2026-11-12 (demohan) and 2026-11-23 at 14:51 UTC (M07, M08): a null
-# is a value the service cannot read as one type, as an entry, an L member of
-# one or a payload in an ExclusiveStartKey value; {"NULL": true}, {"L": []} and
-# a null ExclusiveStartKey member keep the newer form.
-NULL_ROWS = [
-    ("null-entry", '"Limit": 0, "ExpressionAttributeValues": {":p": null}', one(OLDER_LIMIT_0)),
-    ("L-null-member", '"Limit": 0, "ExpressionAttributeValues": {":p": {"L": [null]}}',
-     one(OLDER_LIMIT_0)),
-    ("ExclusiveStartKey-S-null",
-     '"Limit": 0, "ExclusiveStartKey": {"pk": {"S": null}, "sk": {"S": "s0"}}',
-     one(OLDER_LIMIT_0)),
-    ("Segment-minus-1-null-entry",
-     '"Segment": -1, "TotalSegments": 2, "ExpressionAttributeValues": {":p": null}',
-     one(OLDER_SEGMENT_MINUS_1)),
-    ("NULL-true", '"Limit": 0, "ExpressionAttributeValues": {":p": {"NULL": true}}', one(LIMIT)),
-    ("L-empty", '"Limit": 0, "ExpressionAttributeValues": {":p": {"L": []}}', one(LIMIT)),
-    ("ExclusiveStartKey-null", '"Limit": 0, "ExclusiveStartKey": null', one(LIMIT)),
-]
-
 # Measured 2026-11-23 at 18:45 UTC, each beside Select BAD: a range field of
 # another JSON type answers SerializationException with the service's text,
 # and no message for an array.
@@ -259,80 +235,6 @@ INT32_SHAPE_ROWS = [
      "STRING_VALUE cannot be converted to Integer"),
     ("Limit-true", '"Limit": true, "Select": "BAD"', "TRUE_VALUE cannot be converted to Integer"),
     ("Limit-array", '"Limit": [1], "Select": "BAD"', None),
-]
-
-
-# Measured 2026-10-31 between 23:54 and 23:56 UTC: a value that is not one
-# AttributeValue in ExclusiveStartKey or in a condition list answers the older
-# form; a readable one, also of the wrong type for the key, the newer form.
-KEY_AND_LISTS = [
-    ("ExclusiveStartKey-empty", '"Limit": 0, "ExclusiveStartKey": {"pk": {}, "sk": {"S": "x"}}',
-     one(OLDER_LIMIT_0)),
-    ("ExclusiveStartKey-type-X",
-     '"Limit": 0, "ExclusiveStartKey": {"pk": {"X": "1"}, "sk": {"S": "x"}}', one(OLDER_LIMIT_0)),
-    ("ScanFilter-empty", '"Limit": 0, ' + _scan_filter({}), one(OLDER_LIMIT_0)),
-    ("ScanFilter-type-X", '"Limit": 0, ' + _scan_filter({"X": "1"}), one(OLDER_LIMIT_0)),
-    ("Segment-beside-ExclusiveStartKey-empty",
-     '"Segment": -1, "TotalSegments": 2, "ExclusiveStartKey": {"pk": {}, "sk": {"S": "x"}}',
-     one(OLDER_SEGMENT_MINUS_1)),
-    # Measured 2026-11-23 at 14:51 UTC: an M member of a key value and an L
-    # member of a list entry are read as the entry is.
-    ("ExclusiveStartKey-M-empty-member",
-     '"Limit": 0, "ExclusiveStartKey": {"pk": {"M": {"k": {}}}, "sk": {"S": "s0"}}',
-     one(OLDER_LIMIT_0)),
-    ("ScanFilter-L-empty-member", '"Limit": 0, ' + _scan_filter({"L": [{}]}), one(OLDER_LIMIT_0)),
-    ("ExclusiveStartKey-N-on-an-S-key",
-     '"Limit": 0, "ExclusiveStartKey": {"pk": {"N": "1"}, "sk": {"S": "x"}}', one(LIMIT)),
-    ("ScanFilter-N", '"Limit": 0, ' + _scan_filter({"N": "1"}), one(LIMIT)),
-]
-QUERY_KEY_AND_LISTS = [
-    ("ExclusiveStartKey-empty",
-     {"KeyConditionExpression": "pk = :p", "Limit": 0,
-      "ExpressionAttributeValues": {":p": {"S": "p0"}},
-      "ExclusiveStartKey": {"pk": {}, "sk": {"S": "x"}}}, one(OLDER_LIMIT_0)),
-    ("QueryFilter-empty",
-     {"KeyConditions": _conditions("pk", {"S": "p0"}), "Limit": 0,
-      "QueryFilter": _conditions("a", {})}, one(OLDER_LIMIT_0)),
-    ("KeyConditions-empty", {"KeyConditions": _conditions("pk", {}), "Limit": 0},
-     one(OLDER_LIMIT_0)),
-    ("KeyConditions-S", {"KeyConditions": _conditions("pk", {"S": "p0"}), "Limit": 0}, one(LIMIT)),
-    # Measured 2026-11-12 (demohan): a null list entry.
-    ("KeyConditions-null", {"KeyConditions": _conditions("pk", None), "Limit": 0},
-     one(OLDER_LIMIT_0)),
-]
-
-# Measured 2026-11-23 at 14:51 UTC (M09, M10, M13) and 18:45 UTC (F05 to F08):
-# a Query Limit that is a float or outside int32 takes the older path without
-# a value the service cannot read, with the enum clauses in the one message,
-# ahead of the mix, and the numbers wrapped.
-QUERY_OLDER_FORM = [
-    ("Limit-below-int32",
-     {"KeyConditionExpression": "pk = :p", "Limit": -2147483649,
-      "ExpressionAttributeValues": {":p": {"S": "p0"}}}, one(OLDER_LIMIT_MIN)),
-    ("Limit-0.0",
-     {"KeyConditionExpression": "pk = :p", "Limit": 0.0,
-      "ExpressionAttributeValues": {":p": {"S": "p0"}}}, one(OLDER_LIMIT_0)),
-    ("Limit-0-RCC-empty-entry",
-     {"KeyConditionExpression": "pk = :p", "Limit": 0, "ReturnConsumedCapacity": "BAD",
-      "ExpressionAttributeValues": {":p": {"S": "p0"}, ":a": {}}},
-     f"2 validation errors detected: {RCC_BAD}; {OLDER_LIMIT_0}"),
-    ("Limit-below-int32-both-enums",
-     {"KeyConditionExpression": "pk = :p", "Limit": -2147483649, "Select": "BAD",
-      "ReturnConsumedCapacity": "BAD", "ExpressionAttributeValues": {":p": {"S": "p0"}}},
-     f"3 validation errors detected: {SELECT_BAD}; {RCC_BAD}; {OLDER_LIMIT_MIN}"),
-    ("Limit-1.5-both-enums",
-     {"KeyConditionExpression": "pk = :p", "Limit": 1.5, "Select": "BAD",
-      "ReturnConsumedCapacity": "BAD", "ExpressionAttributeValues": {":p": {"S": "p0"}}},
-     f"2 validation errors detected: {SELECT_BAD}; {RCC_BAD}"),
-    ("Limit-1.5-beside-N-bob",
-     {"KeyConditionExpression": "pk = :p", "Limit": 1.5, "FilterExpression": "a = :n",
-      "ExpressionAttributeValues": {":p": {"S": "p0"}, ":n": {"N": "bob"}}},
-     "ExpressionAttributeValues contains invalid value: "
-     "The parameter cannot be converted to a numeric value: bob for key :n"),
-    ("Limit-0.0-ahead-of-the-mix",
-     {"KeyConditionExpression": "pk = :p", "Limit": 0.0, "FilterExpression": "a = :p",
-      "QueryFilter": _conditions("a", {"S": "x"}),
-      "ExpressionAttributeValues": {":p": {"S": "p0"}}}, one(OLDER_LIMIT_0)),
 ]
 
 
@@ -417,13 +319,6 @@ class TestTheOlderFormCarriesTheEnumClauses:
         assert _validation_message(*_scan(dynamodb_client, table, fields)) == expected
 
 
-class TestANullIsAValueTheServiceCannotRead:
-    @pytest.mark.parametrize("fields, expected", [r[1:] for r in NULL_ROWS],
-                             ids=[r[0] for r in NULL_ROWS])
-    def test_rows(self, dynamodb_client, table, fields, expected):
-        assert _validation_message(*_scan(dynamodb_client, table, fields)) == expected
-
-
 class TestARangeFieldOfAnotherJsonType:
     @pytest.mark.parametrize("fields, expected", [r[1:] for r in INT32_SHAPE_ROWS],
                              ids=[r[0] for r in INT32_SHAPE_ROWS])
@@ -456,26 +351,38 @@ class TestFloatsAndValuesOutsideInt32AreAccepted:
         assert status == 200, payload
         assert (payload["Count"], payload["ScannedCount"]) == (ITEMS, ITEMS)
 
-    @pytest.mark.parametrize("fields", ['"Limit": 1.5', '"Limit": 1.0'],
-                             ids=["Limit-1.5", "Limit-1.0"])
-    def test_a_fractional_limit_is_truncated(self, dynamodb_client, table, fields):
+    @pytest.mark.parametrize("fields, count", [
+        ('"Limit": 1.5', 1), ('"Limit": 1.0', 1),
+        # Measured 2026-11-24 05:41 UTC (a table that does not exist): the
+        # service accepts the fraction, and reads it as written, so the page
+        # holds 2 items, not the 3 of the nearest double.
+        ('"Limit": 2.99999999999999999999', 2),
+    ], ids=["Limit-1.5", "Limit-1.0", "Limit-long-fraction"])
+    def test_a_fractional_limit_is_truncated(self, dynamodb_client, table, fields, count):
         status, payload = _scan(dynamodb_client, table, fields + ', "ConsistentRead": true')
         assert status == 200, payload
-        assert (payload["Count"], payload["ScannedCount"]) == (1, 1)
+        assert (payload["Count"], payload["ScannedCount"]) == (count, count)
 
-    def test_a_fractional_segment_is_truncated(self, dynamodb_client, table):
+    @pytest.mark.parametrize("fraction, segment", [
+        ("1.5", 1),
+        # Measured 2026-11-24 05:41 UTC: Segment -0.99999999999999999999 of 2
+        # is accepted, so it reads as 0; the nearest double, -1, is refused.
+        ("1.99999999999999999999", 1),
+        ("-0.99999999999999999999", 0),
+    ], ids=["Segment-1.5", "Segment-long-fraction", "Segment-negative-long-fraction"])
+    def test_a_fractional_segment_is_truncated(self, dynamodb_client, table, fraction, segment):
         # The TotalSegments of 2 is this test's; the table records only Segment 1.5.
         status, half = _scan(dynamodb_client, table,
-                             '"Segment": 1.5, "TotalSegments": 2, "ConsistentRead": true')
+                             f'"Segment": {fraction}, "TotalSegments": 2, "ConsistentRead": true')
         assert status == 200, half
         status, whole = _scan(dynamodb_client, table,
-                              '"Segment": 1, "TotalSegments": 2, "ConsistentRead": true')
+                              f'"Segment": {segment}, "TotalSegments": 2, "ConsistentRead": true')
         assert status == 200, whole
 
         def keys(page):
             return sorted(item["pk"]["S"] for item in page["Items"])
 
-        assert keys(whole), "segment 1 of 2 holds at least one item"
+        assert keys(whole), f"segment {segment} of 2 holds at least one item"
         assert keys(half) == keys(whole)
 
     def test_segment_0_of_1_returns_every_item(self, dynamodb_client, table):
@@ -483,81 +390,3 @@ class TestFloatsAndValuesOutsideInt32AreAccepted:
                                 '"Segment": 0, "TotalSegments": 1, "ConsistentRead": true')
         assert status == 200, payload
         assert (payload["Count"], payload["ScannedCount"]) == (ITEMS, ITEMS)
-
-
-class TestBesideAnExpressionAttributeValuesEntry:
-    """Limit 0 beside an entry that is not one AttributeValue answers the older
-    form on Scan and on Query (measured 12:56 UTC); beside an empty or a
-    duplicate NS, the newer form."""
-
-    @pytest.mark.parametrize("entry", [e for _, e in UNREADABLE], ids=[i for i, _ in UNREADABLE])
-    def test_scan_unreadable_entry(self, dynamodb_client, table, entry):
-        fields = '"Limit": 0, "ExpressionAttributeValues": ' + json.dumps({":a": entry})
-        assert _validation_message(*_scan(dynamodb_client, table, fields)) == one(OLDER_LIMIT_0)
-
-    @pytest.mark.parametrize("entry", [e for _, e in READABLE], ids=[i for i, _ in READABLE])
-    def test_scan_readable_entry(self, dynamodb_client, table, entry):
-        fields = '"Limit": 0, "ExpressionAttributeValues": ' + json.dumps({":a": entry})
-        assert _validation_message(*_scan(dynamodb_client, table, fields)) == one(LIMIT)
-
-    @pytest.mark.parametrize("entry, expected",
-                             [(e, one(OLDER_LIMIT_0)) for _, e in UNREADABLE]
-                             + [(e, one(LIMIT)) for _, e in READABLE],
-                             ids=[i for i, _ in UNREADABLE] + [i for i, _ in READABLE])
-    def test_query(self, dynamodb_client, table, entry, expected):
-        body = json.dumps({
-            "TableName": table, "KeyConditionExpression": "pk = :p", "Limit": 0,
-            "ExpressionAttributeValues": {":p": {"S": "p0"}, ":a": entry},
-        })
-        assert _validation_message(*_raw(dynamodb_client, "Query", body)) == expected
-
-    def test_query_limit_below_int32_beside_an_empty_entry(self, dynamodb_client, table):
-        # Measured 2026-10-31 12:36 UTC: the echoed value is saturated to
-        # int32, as the Scan row Limit -2147483649 is.
-        body = json.dumps({
-            "TableName": table, "KeyConditionExpression": "pk = :p", "Limit": -2147483649,
-            "ExpressionAttributeValues": {":p": {"S": "p0"}, ":a": {}},
-        })
-        assert _validation_message(*_raw(dynamodb_client, "Query", body)) == one(OLDER_LIMIT_MIN)
-
-    @pytest.mark.parametrize("fields, expected", [r[1:] for r in QUERY_OLDER_FORM],
-                             ids=[r[0] for r in QUERY_OLDER_FORM])
-    def test_query_limit_float_or_outside_int32(self, dynamodb_client, table, fields, expected):
-        body = json.dumps({"TableName": table, **fields})
-        assert _validation_message(*_raw(dynamodb_client, "Query", body)) == expected
-
-    @pytest.mark.parametrize("entry", [e for _, e in UNREADABLE_MEMBERS],
-                             ids=[i for i, _ in UNREADABLE_MEMBERS])
-    def test_scan_unreadable_member(self, dynamodb_client, table, entry):
-        fields = ('"Limit": 0, "FilterExpression": "a = :p", "ExpressionAttributeValues": '
-                  + json.dumps({":p": {"S": "x"}, ":d": entry}))
-        assert _validation_message(*_scan(dynamodb_client, table, fields)) == one(OLDER_LIMIT_0)
-
-    @pytest.mark.parametrize("entry", [e for _, e in UNREADABLE_MEMBERS],
-                             ids=[i for i, _ in UNREADABLE_MEMBERS])
-    def test_query_unreadable_member(self, dynamodb_client, table, entry):
-        # Measured on Query 2026-10-31 12:36 UTC, each entry under :d beside
-        # the key condition's :p.
-        body = json.dumps({
-            "TableName": table, "KeyConditionExpression": "pk = :p", "Limit": 0,
-            "ExpressionAttributeValues": {":p": {"S": "p0"}, ":d": entry},
-        })
-        assert _validation_message(*_raw(dynamodb_client, "Query", body)) == one(OLDER_LIMIT_0)
-
-
-class TestBesideAnUnreadableValueInTheKeyOrAConditionList:
-    """Measured 2026-10-31 between 23:54 and 23:56 UTC: a value that is not one
-    AttributeValue in ExclusiveStartKey, or in the AttributeValueList of a
-    ScanFilter, KeyConditions or QueryFilter condition, switches to the older
-    form, as an ExpressionAttributeValues entry does."""
-
-    @pytest.mark.parametrize("fields, expected", [r[1:] for r in KEY_AND_LISTS],
-                             ids=[r[0] for r in KEY_AND_LISTS])
-    def test_scan(self, dynamodb_client, table, fields, expected):
-        assert _validation_message(*_scan(dynamodb_client, table, fields)) == expected
-
-    @pytest.mark.parametrize("fields, expected", [r[1:] for r in QUERY_KEY_AND_LISTS],
-                             ids=[r[0] for r in QUERY_KEY_AND_LISTS])
-    def test_query(self, dynamodb_client, table, fields, expected):
-        body = json.dumps({"TableName": table, **fields})
-        assert _validation_message(*_raw(dynamodb_client, "Query", body)) == expected

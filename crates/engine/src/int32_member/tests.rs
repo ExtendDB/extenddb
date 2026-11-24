@@ -8,14 +8,29 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::types::{QueryInput, ScanInput};
 use serde_json::{Value, json};
 
-use super::{QUERY_RANGES, SCAN_RANGES, saturate};
+use super::{
+    QUERY_RANGES, RangeField, SCAN_RANGES, int32_from_decimal_text, read_floats_as_written,
+    saturate,
+};
 use crate::query_key_values::validate_query_request_body;
 use crate::scan_request::validate_scan_request_body;
 
+/// The `Limit`, `Segment` and `TotalSegments` a handler reads.
+type Members = (Option<i64>, Option<i64>, Option<i64>);
+
 /// A Scan body with `fields` added to the table name, written as JSON text so
-/// a number keeps the form the request wrote (`1.5`, `1e2`).
+/// a number keeps the form the request wrote (`1.5`, `1e2`), read as the
+/// server reads it: parsed, then the float members read from their digits.
 fn scan(fields: &str) -> Value {
-    serde_json::from_str(&format!(r#"{{"TableName": "t", {fields}}}"#)).expect("JSON")
+    as_written("Scan", &format!(r#"{{"TableName": "t", {fields}}}"#))
+}
+
+/// `text` parsed, then the float range members of `operation` read from the
+/// digits as written, as the server does before any check.
+fn as_written(operation: &str, text: &str) -> Value {
+    let mut body: Value = serde_json::from_str(text).expect("JSON");
+    read_floats_as_written(operation, &mut body, text.as_bytes());
+    body
 }
 
 /// The message of a `SerializationException`, or `None` for `Ok`.
@@ -133,4 +148,145 @@ fn a_range_member_of_another_json_type_is_a_shape_fault_with_the_service_text() 
         shape_fault(saturate(&mut body, &SCAN_RANGES)).as_deref(),
         Some("FALSE_VALUE cannot be converted to Integer")
     );
+}
+
+/// The reader of a number's written digits: the decimal truncated toward
+/// zero, then saturated to int32, whatever the nearest double is.
+#[test]
+fn a_decimal_text_is_truncated_toward_zero_and_saturated() {
+    for (text, expected) in [
+        ("0.99999999999999999999", Some(0)),
+        ("-0.99999999999999999999", Some(0)),
+        ("0.9999999999999999", Some(0)),
+        ("2.99999999999999999999", Some(2)),
+        ("1.99999999999999999999", Some(1)),
+        ("-1.99999999999999999999", Some(-1)),
+        ("1000000.99999999999999999999", Some(1_000_000)),
+        ("1.5", Some(1)),
+        ("-1.5", Some(-1)),
+        ("-0.5", Some(0)),
+        ("0.0", Some(0)),
+        ("-0.0", Some(0)),
+        ("1e2", Some(100)),
+        ("1E+2", Some(100)),
+        ("1.5e1", Some(15)),
+        ("123e-1", Some(12)),
+        ("5e-1", Some(0)),
+        ("0.5e-3", Some(0)),
+        ("2147483647.9", Some(i32::MAX)),
+        ("2147483648.5", Some(i32::MAX)),
+        ("-2147483649.5", Some(i32::MIN)),
+        ("1e300", Some(i32::MAX)),
+        ("-1e300", Some(i32::MIN)),
+        ("0e300", Some(0)),
+        ("1e99999999999999999999", None),
+        ("x", None),
+    ] {
+        assert_eq!(int32_from_decimal_text(text), expected, "{text}");
+    }
+}
+
+/// Measured 2026-11-24 05:41 UTC (us-east-1, each request twice, a table that
+/// does not exist): `Limit: 0.99999999999999999999` on `Scan` and `Query` and
+/// `Limit: -0.99999999999999999999` on `Scan` answer `Value '0' at 'limit'`,
+/// `TotalSegments: 0.99999999999999999999` answers `Value '0' at
+/// 'totalSegments'`, and `Segment: -0.99999999999999999999` of
+/// `TotalSegments: 2` and a `Query` `Limit: 2.99999999999999999999` are
+/// accepted: the service truncates the written decimal, where the body parser
+/// reads the nearest double. The server reads such a member from its digits
+/// before any check, so the checks and the handler get the service's value,
+/// and the member stays a float. An integer member is not touched.
+#[test]
+fn a_float_member_is_read_from_the_digits_the_request_wrote() {
+    let limit_0 = "1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1";
+    let total_0 = limit_0.replace("'limit'", "'totalSegments'");
+    let query = |fields: &str| {
+        as_written(
+            "Query",
+            &format!(
+                r#"{{"TableName": "t", "KeyConditionExpression": "pk = :p", {fields}, "ExpressionAttributeValues": {{":p": {{"S": "p0"}}}}}}"#
+            ),
+        )
+    };
+    // (operation, the fields after TableName, the refusal, the members read)
+    let rows: [(&str, &str, Option<&str>, Members); 7] = [
+        (
+            "Scan",
+            r#""Limit": 0.99999999999999999999"#,
+            Some(limit_0),
+            (Some(0), None, None),
+        ),
+        (
+            "Scan",
+            r#""TotalSegments": 0.99999999999999999999"#,
+            Some(total_0.as_str()),
+            (None, None, Some(0)),
+        ),
+        (
+            "Scan",
+            r#""Limit": -0.99999999999999999999"#,
+            Some(limit_0),
+            (Some(0), None, None),
+        ),
+        (
+            "Scan",
+            r#""Limit": 2.99999999999999999999, "Segment": 1.99999999999999999999, "TotalSegments": 2"#,
+            None,
+            (Some(2), Some(1), Some(2)),
+        ),
+        (
+            "Scan",
+            r#""Segment": -0.99999999999999999999, "TotalSegments": 2"#,
+            None,
+            (None, Some(0), Some(2)),
+        ),
+        (
+            "Query",
+            r#""Limit": 0.99999999999999999999"#,
+            Some(limit_0),
+            (Some(0), None, None),
+        ),
+        (
+            "Query",
+            r#""Limit": 2.99999999999999999999"#,
+            None,
+            (Some(2), None, None),
+        ),
+    ];
+    for (operation, fields, refusal, expected) in rows {
+        let (mut body, ranges): (Value, &[RangeField]) = if operation == "Scan" {
+            (scan(fields), &SCAN_RANGES)
+        } else {
+            (query(fields), &QUERY_RANGES)
+        };
+        let check = if operation == "Scan" {
+            validate_scan_request_body(&body)
+        } else {
+            validate_query_request_body(&body)
+        };
+        let got = match check {
+            Ok(()) => None,
+            Err(DynamoDbError::ValidationException(msg)) => Some(msg),
+            Err(other) => panic!("unexpected error {other:?}"),
+        };
+        assert_eq!(got.as_deref(), refusal, "{body}");
+        saturate(&mut body, ranges).expect("JSON numbers");
+        let read = (
+            body.get("Limit").and_then(Value::as_i64),
+            body.get("Segment").and_then(Value::as_i64),
+            body.get("TotalSegments").and_then(Value::as_i64),
+        );
+        assert_eq!(read, expected, "{body}");
+    }
+    // A member written with a fraction stays a float, which keeps the request
+    // on the older path (the refusals above are in the older form); an
+    // integer member is left as the parser read it; and the raw body of
+    // another operation is not read.
+    let body = scan(r#""Limit": 2.99999999999999999999, "Segment": 1.5, "TotalSegments": 2"#);
+    assert_eq!(body["Limit"].as_f64(), Some(2.0));
+    assert_eq!(body["Segment"].as_f64(), Some(1.0));
+    assert!(body["TotalSegments"].is_i64());
+    let text = r#"{"TableName": "t", "Limit": 2.99999999999999999999}"#;
+    let body = as_written("GetItem", text);
+    assert_eq!(body["Limit"].as_f64(), Some(3.0));
 }
