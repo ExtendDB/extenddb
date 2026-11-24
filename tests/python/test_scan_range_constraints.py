@@ -164,7 +164,7 @@ OLDER_FORM = [
 ]
 
 # Measured 2026-11-23 at 14:51 UTC (M01 to M03, M14, M15) and 2026-11-12
-# (demohan, 2 to 10 sends): in the older form the Select and
+# (2 to 10 sends): in the older form the Select and
 # ReturnConsumedCapacity enum clauses sit in the one message with the range
 # clauses, in the order select, totalSegments, returnConsumedCapacity, segment,
 # limit, also when only the enum clauses apply. In the newer form a range fault
@@ -197,11 +197,6 @@ OLDER_FORM_WITH_ENUMS = [
     ("newer-both-enums", '"Select": "NOPE", "ReturnConsumedCapacity": "NOPE"', one(RCC_NOPE)),
 ]
 
-# Measured 2026-11-23 at 18:45 UTC: in the older form the aggregate comes ahead
-# of the parameter mix and of an invalid ExpressionAttributeNames key, and a
-# float Limit that satisfies its constraint beside an N that is not a number
-# answers the wrapped numeric text.
-
 # ExpressionAttributeValues entries the service does not read as one
 # AttributeValue (older form beside Limit 0), and two it does (newer form).
 UNREADABLE = [("empty", {}), ("unknown-type", {"X": "1"}), ("two-types", {"S": "x", "N": "1"})]
@@ -223,6 +218,10 @@ def _scan_filter(entry: dict) -> str:
     return '"ScanFilter": ' + json.dumps(_conditions("a", entry))
 
 
+# Measured 2026-11-23 at 18:45 UTC: in the older form the aggregate comes ahead
+# of the parameter mix and of an invalid ExpressionAttributeNames key, and a
+# float Limit that satisfies its constraint beside an N that is not a number
+# answers the wrapped numeric text.
 OLDER_FORM_BEFORE_THE_MIX = [
     ("Select-ahead-of-the-mix",
      '"Limit": 1.5, "Select": "BAD", ' + _scan_filter({"S": "x"})
@@ -257,7 +256,7 @@ OLDER_FORM_SETS = [
     ("duplicate-NS-in-L", '{"L": [{"NS": ["1", "1"]}]}', DUPLICATE_NS),
 ]
 
-# Measured 2026-11-12 (demohan) and 2026-11-23 at 14:51 UTC (M07, M08): a null
+# Measured 2026-11-12 and 2026-11-23 at 14:51 UTC (M07, M08): a null
 # is a value the service cannot read as one type, as an entry, an L member of
 # one or a payload in an ExclusiveStartKey value; {"NULL": true}, {"L": []} and
 # a null ExclusiveStartKey member keep the newer form.
@@ -321,7 +320,7 @@ QUERY_KEY_AND_LISTS = [
     ("KeyConditions-empty", {"KeyConditions": _conditions("pk", {}), "Limit": 0},
      one(OLDER_LIMIT_0)),
     ("KeyConditions-S", {"KeyConditions": _conditions("pk", {"S": "p0"}), "Limit": 0}, one(LIMIT)),
-    # Measured 2026-11-12 (demohan): a null list entry.
+    # Measured 2026-11-12: a null list entry.
     ("KeyConditions-null", {"KeyConditions": _conditions("pk", None), "Limit": 0},
      one(OLDER_LIMIT_0)),
 ]

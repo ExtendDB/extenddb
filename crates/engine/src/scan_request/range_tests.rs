@@ -177,7 +177,7 @@ fn floats_and_out_of_range_integers_that_satisfy_the_constraints_are_accepted() 
     }
 }
 
-/// Measured 2026-11-12 (demohan, each row twice) and 2026-11-23 14:51 UTC: a
+/// Measured 2026-11-12 (each row twice) and 2026-11-23 14:51 UTC: a
 /// `Limit` that is a float or outside int32 puts a `Segment` fault in the
 /// older form, also when the `Limit` satisfies its constraint; a `Segment`
 /// outside int32 is echoed saturated; and with every member inside int32 the
@@ -303,7 +303,7 @@ fn the_enum_clauses_sit_inside_the_older_form_message() {
     }
 }
 
-/// Measured 2026-11-12 (demohan, each row twice) and 2026-11-23 14:51 UTC: a
+/// Measured 2026-11-12 (each row twice) and 2026-11-23 14:51 UTC: a
 /// null is a value the service cannot read as one type, as an
 /// `ExpressionAttributeValues` entry, an `L` member of one or a payload in an
 /// `ExclusiveStartKey` value, so a range fault beside it takes the older form.

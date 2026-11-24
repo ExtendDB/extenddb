@@ -461,7 +461,7 @@ fn a_limit_that_is_a_float_or_outside_int32_takes_the_older_path() {
     }
 }
 
-/// Measured 2026-11-12 (demohan, each row twice): a null `AttributeValueList`
+/// Measured 2026-11-12 (each row twice): a null `AttributeValueList`
 /// entry of `KeyConditions` and an `L` nested in an `L` are values the service
 /// cannot read, so a `Limit` of 0 beside them takes the older form on `Query`.
 #[test]
