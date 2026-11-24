@@ -36,10 +36,13 @@ impl ExtendDb {
     /// Async because opening the database and running the catalog migrations is
     /// async. In JavaScript: `const db = await ExtendDb.create();`. The promise
     /// resolves with the ready engine, or rejects as described under Errors. A
-    /// panic during creation traps instead, and the promise then stays pending.
-    /// One such panic comes from a host with no Web Crypto
-    /// (`globalThis.crypto`, which Node 18 does not define in an ES module):
-    /// the `uuid` crate panics when it cannot draw random bytes.
+    /// panic during creation traps instead: the trap throws out of the task
+    /// that was creating the engine, so the promise stays pending. Under Node,
+    /// that uncaught `RuntimeError` ends the process with exit status 1 unless
+    /// the program handles `uncaughtException`. One such panic comes from a
+    /// host with no Web Crypto (`globalThis.crypto`, which Node 18 does not
+    /// define in an ES module): the `uuid` crate panics when it cannot draw
+    /// random bytes.
     ///
     /// # Errors
     ///
@@ -80,7 +83,9 @@ impl ExtendDb {
     /// undefined state: whatever the panicking request held when it stopped is
     /// never released, so a later call may answer, fail or hang. Reload the
     /// page to get a fresh instance. The panic hook writes the panic and its
-    /// stack to `console.error` first.
+    /// stack to `console.error` first. Under Node, as for [`ExtendDb::create`],
+    /// the uncaught `RuntimeError` ends the process unless the program handles
+    /// `uncaughtException`.
     pub fn submit(&self, operation: &JsValue, body: &JsValue) -> js_sys::Promise {
         // `as_string` is `Some` only for a JavaScript string. It copies the
         // value into linear memory, so nothing below borrows a JS value.
