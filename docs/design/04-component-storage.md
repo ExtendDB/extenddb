@@ -489,10 +489,11 @@ DynamoDB supports two read consistency modes: strongly consistent and eventually
 PostgreSQL backend in this repository serves every item read and write from `data_pool`; the `read_pool` and
 `read_replica_url` in the sketch above are a proposal for a read replica mode, not code that exists.
 
-**Single-node mode (what the backend does today):** All reads are strongly consistent regardless of the `consistent_read`
-flag. This is strictly stronger than the DynamoDB spec and compatible with all applications. The `consistent_read`
-parameter is accepted and correctly reflected in capacity calculations (eventually consistent reads consume 0.5 RCU vs
-1.0 RCU for strongly consistent).
+**Single-node mode (what the backend does today):** Base table and local secondary index reads are strongly consistent
+regardless of the `consistent_read` flag. This is strictly stronger than the DynamoDB spec and compatible with all
+applications. Global secondary index rows go through the propagation queue (section 6), so a read on a GSI can lag the
+base table, as on the service. The `consistent_read` parameter is accepted and correctly reflected in capacity
+calculations (eventually consistent reads consume 0.5 RCU vs 1.0 RCU for strongly consistent).
 
 **Read replica mode (proposed, `read_replica_url` configured):** Eventually consistent reads (`consistent_read=false`)
 would be routed to a PostgreSQL streaming replica that is a few milliseconds behind the primary. Strongly consistent
