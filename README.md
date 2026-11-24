@@ -478,19 +478,22 @@ handlers' answers natively.
 
 `ListBackups`, `DescribeContinuousBackups`, `UpdateContinuousBackups`,
 `ImportTable` and `ExportTableToPointInTime` run the engine's own handlers, as
-on a server, so a malformed request gets the handler's validation error on both
-builds. This build creates no backup (see above) and has no import or export
-paths, so `ListBackups` lists no backups, `DescribeContinuousBackups` reports
-point-in-time recovery `DISABLED` for a table that exists and
+on a server, so both builds give a malformed request the same answer:
+`SerializationException` for a body that is not JSON, and otherwise the
+handler's error, except for the point-in-time refusals at the end of this
+paragraph. This build creates no backup (see above) and has no import or
+export paths, so `ListBackups` lists no backups, `DescribeContinuousBackups`
+reports point-in-time recovery `DISABLED` for a table that exists and
 `TableNotFoundException` for one that does not, and `ImportTable` /
 `ExportTableToPointInTime` return the "disabled" `ValidationException` that a
 server with no import or export paths gives a request it does not refuse
 before dispatch (the requests it does refuse are under "Checks the server
-makes that this build does not"). As the server does, the build refuses
-every `RestoreTableToPointInTime` (`PointInTimeRecoveryUnavailableException`)
-and an `UpdateContinuousBackups` that enables point-in-time recovery
-(`ContinuousBackupsUnavailableException`) before any table is read, so a
-request naming a missing table gets the refusal too.
+makes that this build does not"). As the server does, the build refuses,
+before any table is read, every `RestoreTableToPointInTime` whose body is
+JSON (`PointInTimeRecoveryUnavailableException`) and an
+`UpdateContinuousBackups` that enables point-in-time recovery
+(`ContinuousBackupsUnavailableException`), so a request naming a missing
+table gets the refusal too.
 
 The wasm workflow's clippy step refuses calls known to trap or hang on
 `wasm32` in the workspace crates this build compiles;
