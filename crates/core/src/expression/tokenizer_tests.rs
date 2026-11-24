@@ -294,6 +294,9 @@ const UNKNOWN_CHARACTER_ROWS: &[(&str, &str, &str)] = &[
     // expression, trailing whitespace kept (measured 2026-11-24).
     ("#v = é   ", "é", "= é   "),
     ("  é  ", "é", "  é  "),
+    // A leading byte-order mark is a character outside the grammar too
+    // (measured 2026-11-24).
+    ("\u{feff}#v = :v", "\u{feff}", "\u{feff}#v"),
 ];
 
 #[test]

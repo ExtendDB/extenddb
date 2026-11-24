@@ -17,7 +17,8 @@ end as an expected failure.
 
 Every expected text was measured against Amazon DynamoDB (us-east-1), each
 request twice: the rows of ``OPERATION_ROWS`` on 2026-11-18, the two rows with
-no token after the character on 2026-11-24, the others on 2026-10-25.
+no token after the character and the byte-order mark row on 2026-11-24, the
+others on 2026-10-25.
 
 Dual-target against Amazon DynamoDB and extenddb.
 """
@@ -124,6 +125,8 @@ def table(dynamodb_client):
         # No token after the character: the window runs to the end.
         ("#v = \u00e9   ", "\u00e9", "= \u00e9   "),
         ("  \u00e9  ", "\u00e9", "  \u00e9  "),
+        # A leading byte-order mark is a character outside the grammar too.
+        ("\ufeff#v = :v", "\ufeff", "\ufeff#v"),
     ],
 )
 def test_scan_filter(dynamodb_client, table, expr, token, near):
