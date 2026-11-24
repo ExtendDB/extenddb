@@ -3,14 +3,23 @@
 
 //! `AuthorizationStore` trait implementation for `MongoDB`.
 //!
-//! A stored policy, permissions boundary, session policy, session tags value,
-//! group membership or tag that these loaders cannot read (a field missing or
-//! of another type) fails the load with `OpError::Internal`, as a failed query
-//! does: a document left out can hold the Deny that matches the request. Two
-//! reads stay lenient, as on the other backends. A session tag entry whose key
-//! or value is not a string is left out, because `AssumeRole` stores the
-//! session tags as the caller sent them. A `created_at` that cannot be read
-//! gives `None`, because sessions written before 0.1.14 have none.
+//! These stored documents fail the load with `OpError::Internal`, as a failed
+//! query does, because a document left out can hold the Deny that matches the
+//! request:
+//!
+//! - a policy or permissions boundary with no `policy_document`, or one whose
+//!   `policy_document` has no JSON form
+//! - a session policy or session tags value with no JSON form
+//! - a group membership or group policy whose group name is not a string
+//! - a tag whose key or value is not a string
+//!
+//! Some reads stay lenient, as on the other backends. A session without a
+//! session policy or session tags has none. A session tags value that is
+//! neither an array nor an object gives no tags. The store leaves out a
+//! session tag entry whose key or value is not a string. `AssumeRole` stores
+//! the session tags as the caller sent them, so it can store both. A
+//! `created_at` that cannot be read gives `None`, because sessions written
+//! before 0.1.14 have none.
 
 use futures::TryStreamExt;
 use futures::future::BoxFuture;
@@ -376,12 +385,39 @@ impl AuthorizationStore for MongoCatalogStore {
     }
 }
 
+/// The fields that name the owner of a stored IAM document: its account,
+/// principal, group, session, policy, resource or tag key. None of them holds
+/// a policy, a tag value or a credential.
+const OWNER_FIELDS: [&str; 10] = [
+    "account_id",
+    "principal_type",
+    "principal_name",
+    "user_name",
+    "group_name",
+    "role_name",
+    "session_name",
+    "policy_name",
+    "resource_arn",
+    "tag_key",
+];
+
+/// The owner fields that `d` holds, as `field=value` pairs with each value as
+/// BSON displays it, for the log line of a document that cannot be read.
+fn owner(d: &Document) -> String {
+    OWNER_FIELDS
+        .iter()
+        .filter_map(|field| d.get(field).map(|value| format!("{field}={value}")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Log a stored document of `collection` that cannot be read, and give the
 /// error of the load that needs it.
 fn unreadable(collection: &str, d: &Document, fault: &str) -> OpError {
     tracing::error!(
         collection,
         id = %d.get("_id").map_or_else(String::new, ToString::to_string),
+        owner = %owner(d),
         "a stored IAM document cannot be read ({fault}); an authorization load \
          that needs it fails until the document is repaired or deleted"
     );
@@ -432,4 +468,57 @@ fn bson_datetime_to_rfc3339(dt: &mongodb::bson::DateTime) -> Option<String> {
             odt.format(&time::format_description::well_known::Rfc3339)
                 .ok()
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use mongodb::bson::{Binary, doc, spec::BinarySubtype};
+
+    use super::owner;
+
+    /// The owner part of the log line gives each owner field of an unreadable
+    /// document as stored. It leaves out the document's content and a
+    /// session's credentials.
+    #[test]
+    fn the_log_line_names_the_owner_of_an_unreadable_document() {
+        let rows = [
+            (
+                doc! {
+                    "_id": 1,
+                    "account_id": "444455556666",
+                    "principal_type": "user",
+                    "principal_name": "alice",
+                    "policy_name": "p",
+                    "policy_document": Binary { subtype: BinarySubtype::Generic, bytes: vec![1] },
+                },
+                r#"account_id="444455556666" principal_type="user" principal_name="alice" policy_name="p""#,
+            ),
+            (
+                doc! { "account_id": "444455556666", "group_name": 7, "user_name": "bob" },
+                r#"account_id="444455556666" user_name="bob" group_name=7"#,
+            ),
+            (
+                doc! {
+                    "session_token": "token",
+                    "access_key_id": "ASIAEXAMPLE",
+                    "account_id": "444455556666",
+                    "role_name": "r",
+                    "session_name": "s",
+                    "session_tags": [{ "Key": "team", "Value": "a" }],
+                },
+                r#"account_id="444455556666" role_name="r" session_name="s""#,
+            ),
+            (
+                doc! {
+                    "resource_arn": "arn:aws:dynamodb:us-east-1:444455556666:table/t",
+                    "tag_key": "team",
+                    "tag_value": "a",
+                },
+                r#"resource_arn="arn:aws:dynamodb:us-east-1:444455556666:table/t" tag_key="team""#,
+            ),
+        ];
+        for (d, want) in rows {
+            assert_eq!(owner(&d), want, "{d}");
+        }
+    }
 }
