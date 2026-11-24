@@ -27,7 +27,6 @@
 //! default depth on an unauthenticated connection.
 
 use serde::Deserialize;
-use serde::de::IgnoredAny;
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
@@ -143,23 +142,187 @@ pub(crate) fn parse_request_value(body: &[u8], depth: usize) -> Result<Value, Dy
 /// Check the JSON syntax of a request body whose [`nesting_depth`] is `depth`
 /// without building it, so the handler can refuse a malformed body nested past
 /// [`UNAUTHENTICATED_PARSE_DEPTH`] before authentication, as the service does.
-/// `serde_json` skips an ignored value in one loop that keeps the kinds of the
-/// open containers on a heap stack, so the check does not recurse at any
-/// depth.
+/// [`skip_value`] reads the body's first value in one loop that keeps the
+/// closers of the open containers on a heap stack, so the check does not
+/// recurse at any depth.
 ///
-/// The check reads one JSON value, as the service's check before
-/// authentication does: bytes after a complete body, an invalid UTF-8 byte in
-/// a string and a lone surrogate escape all pass it (measured 2026-11-19,
-/// us-east-1: unsigned, each is a `MissingAuthenticationTokenException`). A
-/// body that fails it gets a `SerializationException`, with no message past
-/// the ceiling, as from [`parse_request_value`], and with the server's usual
-/// wording within it.
+/// The check reads one JSON value with the grammar [`skip_value`] describes.
+/// Bytes after a complete body, an invalid UTF-8 byte in a string and a lone
+/// surrogate escape pass it (measured 2026-11-19, us-east-1: unsigned, each is
+/// a `MissingAuthenticationTokenException`). So do the numbers `01`, `1.`,
+/// `1e` and `-`, the escape `\u12G4`, and NUL, VT and FF between tokens
+/// (measured 2026-11-24, us-east-1, at 63 and 20000 wrappers: unsigned, each
+/// is a `MissingAuthenticationTokenException`, and badly signed an
+/// `InvalidSignatureException`). A body that fails it gets a
+/// `SerializationException`, with no message past the ceiling, as from
+/// [`parse_request_value`], and with the server's usual wording within it.
 pub(crate) fn check_request_syntax(body: &[u8], depth: usize) -> Result<(), DynamoDbError> {
-    let mut de = serde_json::Deserializer::from_slice(body);
-    match IgnoredAny::deserialize(&mut de) {
-        Ok(IgnoredAny) => Ok(()),
-        Err(_) if depth > MAX_REQUEST_JSON_DEPTH => Err(over_ceiling_refusal()),
-        Err(e) => Err(serialization_error(&e.to_string())),
+    skip_value(body).map_err(|fault| {
+        if depth > MAX_REQUEST_JSON_DEPTH {
+            over_ceiling_refusal()
+        } else {
+            serialization_error(fault)
+        }
+    })
+}
+
+/// Whether `b` can be part of a number as the service reads one. The service
+/// takes a run of these bytes that starts with a digit or `-` as one number.
+fn number_byte(b: u8) -> bool {
+    matches!(b, b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
+}
+
+/// A cursor over a request body, for [`skip_value`].
+struct Scan<'a> {
+    body: &'a [u8],
+    at: usize,
+}
+
+impl Scan<'_> {
+    /// The byte at the cursor after any whitespace, or `None` at the end of
+    /// the body. Besides JSON's space, TAB, LF and CR, the service skips NUL,
+    /// VT and FF between tokens and refuses SOH there (measured 2026-11-24,
+    /// us-east-1: unsigned, a 200 wrapper `PutItem` with one of the three
+    /// before a value is a `MissingAuthenticationTokenException`, and with
+    /// SOH there a `SerializationException`).
+    fn token(&mut self) -> Option<u8> {
+        while let Some(&b) = self.body.get(self.at) {
+            if !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x00 | 0x0b | 0x0c) {
+                return Some(b);
+            }
+            self.at += 1;
+        }
+        None
+    }
+
+    /// The byte at the cursor, which moves past it.
+    fn next(&mut self) -> Option<u8> {
+        let b = *self.body.get(self.at)?;
+        self.at += 1;
+        Some(b)
+    }
+
+    /// Skip a string literal from after its opening quote to after its
+    /// closing quote. As in JSON, a raw control byte, or an escape letter
+    /// other than `"`, `\`, `/`, `b`, `f`, `n`, `r`, `t` and `u`, is a fault.
+    /// The four bytes after `\u` are not read as hex digits: the service
+    /// takes any byte from `0` to `g` (0x30 to 0x67) there and refuses the
+    /// others (measured 2026-11-24, us-east-1, unsigned, 200 wrappers:
+    /// `\u12G4`, `\u::::`, `\u@@@@`, `\u` and four backslashes, `\u` and four
+    /// backticks, `\uffff` and `\ugggg` are a
+    /// `MissingAuthenticationTokenException`; `\u/123`, `\u12.4`, `\u12"x`,
+    /// `\uhhhh`, `\uzzzz`, `\u~~~~`, `\u` and four SOH bytes, and `\u` and four
+    /// bytes above 0x7F are a `SerializationException`).
+    fn skip_string(&mut self) -> Result<(), &'static str> {
+        loop {
+            match self.next().ok_or("unterminated string")? {
+                b'"' => return Ok(()),
+                b'\\' => match self.next().ok_or("unterminated string")? {
+                    b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {}
+                    b'u' => {
+                        for _ in 0..4 {
+                            if !matches!(self.next(), Some(b'0'..=b'g')) {
+                                return Err("invalid unicode escape");
+                            }
+                        }
+                    }
+                    _ => return Err("invalid escape"),
+                },
+                0x00..=0x1f => return Err("control character in string"),
+                _ => {}
+            }
+        }
+    }
+
+    /// Skip an object key and the colon after it.
+    fn skip_key(&mut self) -> Result<(), &'static str> {
+        if self.token() != Some(b'"') {
+            return Err("key must be a string");
+        }
+        self.at += 1;
+        self.skip_string()?;
+        if self.token() != Some(b':') {
+            return Err("expected `:`");
+        }
+        self.at += 1;
+        Ok(())
+    }
+
+    /// Skip `word`, which must start at the cursor.
+    fn skip_literal(&mut self, word: &[u8]) -> Result<(), &'static str> {
+        if !self.body[self.at..].starts_with(word) {
+            return Err("invalid literal");
+        }
+        self.at += word.len();
+        Ok(())
+    }
+}
+
+/// Read past the first JSON value of `body` without building it. The grammar
+/// is JSON's, as `serde_json` applies it, except in the three lexemes where
+/// the service's check before authentication is looser: whitespace also takes
+/// NUL, VT and FF ([`Scan::token`]); a number is `-` or a digit and then any
+/// run of [`number_byte`]s, so `01`, `1.`, `1e` and `-` pass (measured
+/// 2026-11-24, us-east-1, at 63 and 20000 wrappers: unsigned, each is a
+/// `MissingAuthenticationTokenException`); and the four bytes after `\u` may
+/// be any byte from `0` to `g` ([`Scan::skip_string`]). Bytes after the value
+/// are not read. The closers of the open containers sit on a heap stack, one
+/// byte per level, so the loop never recurses.
+fn skip_value(body: &[u8]) -> Result<(), &'static str> {
+    let mut scan = Scan { body, at: 0 };
+    let mut open: Vec<u8> = Vec::new();
+    'value: loop {
+        match scan.token().ok_or("expected value")? {
+            opener @ (b'{' | b'[') => {
+                scan.at += 1;
+                let closer = if opener == b'{' { b'}' } else { b']' };
+                if scan.token() == Some(closer) {
+                    scan.at += 1;
+                } else {
+                    open.push(closer);
+                    if opener == b'{' {
+                        scan.skip_key()?;
+                    }
+                    continue 'value;
+                }
+            }
+            b'"' => {
+                scan.at += 1;
+                scan.skip_string()?;
+            }
+            b'-' | b'0'..=b'9' => {
+                scan.at += 1;
+                while scan.body.get(scan.at).is_some_and(|&b| number_byte(b)) {
+                    scan.at += 1;
+                }
+            }
+            b't' => scan.skip_literal(b"true")?,
+            b'f' => scan.skip_literal(b"false")?,
+            b'n' => scan.skip_literal(b"null")?,
+            _ => return Err("expected value"),
+        }
+        // The value is complete: close containers until a comma starts the
+        // next member, or the outermost container closes.
+        loop {
+            let Some(&closer) = open.last() else {
+                return Ok(());
+            };
+            match scan.token() {
+                Some(b',') => {
+                    scan.at += 1;
+                    if closer == b'}' {
+                        scan.skip_key()?;
+                    }
+                    continue 'value;
+                }
+                Some(b) if b == closer => {
+                    scan.at += 1;
+                    open.pop();
+                }
+                Some(_) => return Err("expected `,` or the end of the container"),
+                None => return Err("unterminated container"),
+            }
+        }
     }
 }
 
@@ -188,17 +351,39 @@ mod tests {
     /// maps around a string leaf: `{"M":{"n": ... {"S":"leaf"} ... }}`. Its
     /// structural depth is `3 + 2 * wrappers`.
     fn deep_body(wrappers: usize) -> Vec<u8> {
-        let mut s = String::from(r#"{"TableName":"t","Item":{"data":"#);
-        for _ in 0..wrappers {
-            s.push_str(r#"{"M":{"n":"#);
-        }
-        s.push_str(r#"{"S":"leaf"}"#);
-        for _ in 0..wrappers {
-            s.push_str("}}");
-        }
-        s.push_str("}}");
-        s.into_bytes()
+        deep_body_with_leaf(wrappers, br#"{"S":"leaf"}"#)
     }
+
+    /// [`deep_body`] with `leaf` in place of `{"S":"leaf"}`.
+    fn deep_body_with_leaf(wrappers: usize, leaf: &[u8]) -> Vec<u8> {
+        let mut body = br#"{"TableName":"t","Item":{"data":"#.to_vec();
+        for _ in 0..wrappers {
+            body.extend_from_slice(br#"{"M":{"n":"#);
+        }
+        body.extend_from_slice(leaf);
+        for _ in 0..wrappers {
+            body.extend_from_slice(b"}}");
+        }
+        body.extend_from_slice(b"}}");
+        body
+    }
+
+    /// The leaves the service's check before authentication passes where
+    /// `serde_json`'s grammar refuses them (measured 2026-11-24, us-east-1, at
+    /// 63 and 20000 wrappers: unsigned, each is a
+    /// `MissingAuthenticationTokenException`, and badly signed an
+    /// `InvalidSignatureException`): the numbers `01`, `1.`, `1e` and `-`, the
+    /// escape `\u12G4`, and FF, NUL and VT before a value.
+    const LOOSE_LEAVES: [&[u8]; 8] = [
+        br#"{"S":01}"#,
+        br#"{"S":1.}"#,
+        br#"{"S":1e}"#,
+        br#"{"S":-}"#,
+        br#"{"S":"le\u12G4af"}"#,
+        b"{\"S\":\x0c\"leaf\"}",
+        b"{\"S\":\x00\"leaf\"}",
+        b"{\"S\":\x0b\"leaf\"}",
+    ];
 
     fn parse(body: &[u8]) -> Result<Value, DynamoDbError> {
         parse_request_value(body, nesting_depth(body))
@@ -377,14 +562,18 @@ mod tests {
     }
 
     #[test]
-    fn the_syntax_check_refuses_a_malformed_deep_body_as_the_parse_does() {
+    fn the_syntax_check_refuses_a_malformed_deep_body() {
         // Rows: a body nested past the pre-auth depth with a syntax fault. The
         // service refuses each before authentication with a
-        // SerializationException (measured 2026-11-19, us-east-1, unsigned
-        // and badly signed). For the structural faults in these rows the check
-        // gives the message the parse after authentication gives. For a raw
-        // control character in a string, the skip reports one column earlier.
-        // The parse recurses, so the rows run on a worker-sized stack.
+        // SerializationException and no message (measured in us-east-1:
+        // the structural faults on 2026-11-19, unsigned and badly signed; the
+        // control byte and the unknown escape in a string on 2026-11-20,
+        // unsigned, badly signed and signed; the `\u` before the closing
+        // quote, SOH before a value, `tru`, the missing colon and the missing
+        // comma on 2026-11-24, unsigned and badly signed). Within the ceiling
+        // the check's refusal carries the server's wording, and past it no
+        // message. The check does not recurse, so the rows run on the default
+        // test-thread stack.
         let rows = [
             [&b"x"[..], &b"[".repeat(6000)].concat(),
             [&b"x"[..], &b"[".repeat(200)].concat(),
@@ -393,45 +582,50 @@ mod tests {
             truncated_body(2000),
             truncated_body(20000),
             [&truncated_body(200)[..], b"]"].concat(),
+            deep_body_with_leaf(200, br#"{"S":"le\u"}"#),
+            deep_body_with_leaf(200, b"{\"S\":\x01\"leaf\"}"),
+            deep_body_with_leaf(200, br#"{"S":tru}"#),
+            deep_body_with_leaf(200, br#"{"S" "leaf"}"#),
+            deep_body_with_leaf(200, br#"{"S":"leaf" "T":"x"}"#),
+            deep_body_with_leaf(200, b"{\"S\":\"le\x01af\"}"),
+            deep_body_with_leaf(200, br#"{"S":"le\qaf"}"#),
         ];
-        std::thread::Builder::new()
-            .stack_size(REQUEST_WORKER_STACK_SIZE)
-            .spawn(move || {
-                for body in &rows {
-                    let depth = nesting_depth(body);
-                    assert!(depth > UNAUTHENTICATED_PARSE_DEPTH, "{} bytes", body.len());
-                    let checked = check_request_syntax(body, depth).unwrap_err();
-                    let parsed = parse_request_value(body, depth).unwrap_err();
-                    assert!(matches!(checked, DynamoDbError::SerializationException(_)));
-                    assert_eq!(checked.message(), parsed.message(), "{} bytes", body.len());
-                }
-            })
-            .unwrap()
-            .join()
-            .unwrap();
+        for body in &rows {
+            let depth = nesting_depth(body);
+            assert!(depth > UNAUTHENTICATED_PARSE_DEPTH, "{} bytes", body.len());
+            let err = check_request_syntax(body, depth).unwrap_err();
+            assert!(matches!(err, DynamoDbError::SerializationException(_)));
+            assert_eq!(
+                err.message().is_empty(),
+                depth > MAX_REQUEST_JSON_DEPTH,
+                "{} bytes: {:?}",
+                body.len(),
+                err.message()
+            );
+        }
     }
 
     #[test]
     fn the_syntax_check_passes_what_the_service_authenticates_first() {
-        // Rows: bodies the service's check before authentication passes
+        // Rows: bodies the service's check before authentication passes.
+        // Complete bodies far past the ceiling, bytes after a complete body,
+        // an invalid UTF-8 byte in a string and a lone surrogate escape
         // (measured 2026-11-19, us-east-1: unsigned, each is a
-        // MissingAuthenticationTokenException). Complete bodies far past the
-        // ceiling, bytes after a complete body, an invalid UTF-8 byte in a
-        // string and a lone surrogate escape. This runs on the default
-        // test-thread stack, where a parse that recursed a million levels
-        // would overflow, so it also shows that the check does not recurse.
-        let leaf = |with: &[u8]| {
-            let body = deep_body(200);
-            let at = body.windows(6).position(|w| w == b"\"leaf\"").unwrap();
-            [&body[..at], with, &body[at + 6..]].concat()
-        };
-        let rows = [
+        // MissingAuthenticationTokenException), and each leaf of
+        // `LOOSE_LEAVES` at 63 and at 20000 wrappers (measured 2026-11-24).
+        // This runs on the default test-thread stack, where a parse that
+        // recursed a million levels would overflow, so it also shows that the
+        // check does not recurse.
+        let mut rows = vec![
             [b"[".repeat(1_000_000), b"]".repeat(1_000_000)].concat(),
             deep_body(20000),
             [deep_body(2000), b"x".to_vec()].concat(),
-            leaf(b"\"le\xffaf\""),
-            leaf(br#""le\ud800af""#),
+            deep_body_with_leaf(200, b"{\"S\":\"le\xffaf\"}"),
+            deep_body_with_leaf(200, br#"{"S":"le\ud800af"}"#),
         ];
+        for wrappers in [63, 20000] {
+            rows.extend(LOOSE_LEAVES.map(|leaf| deep_body_with_leaf(wrappers, leaf)));
+        }
         for body in &rows {
             let depth = nesting_depth(body);
             assert!(depth > UNAUTHENTICATED_PARSE_DEPTH, "{} bytes", body.len());
