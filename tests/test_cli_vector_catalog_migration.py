@@ -130,6 +130,25 @@ def _data_db(cli_env):
     return cli_env["db_name"][: -len("_catalog")]
 
 
+def _wait_until_alone(databases, timeout=30.0):
+    """Wait until no client session is connected to `databases`. PostgreSQL
+    removes a closed session from pg_stat_activity a moment after the close
+    returns, and a stopped server's sessions end after its process does, so a
+    run that counts other sessions waits for them here instead of sleeping."""
+    deadline = time.monotonic() + timeout
+    while True:
+        others = _query(
+            "postgres",
+            "SELECT count(*) FROM pg_stat_activity WHERE datname = ANY(%s) "
+            "AND backend_type = 'client backend'",
+            (list(databases),),
+        )
+        if others == 0:
+            return
+        assert time.monotonic() < deadline, f"{others} session(s) still hold {databases}"
+        time.sleep(0.1)
+
+
 def _query(database, sql, params=()):
     conn = _conn(database)
     try:
@@ -451,9 +470,9 @@ class TestVectorCatalogMigration:
             _seed_table_and_backup(cli_env)
         finally:
             _run_extenddb("stop", config=cli_env["config_path"], check=False)
-            time.sleep(1)
-        _forget_migration_13(cli_env)
         catalog, data = cli_env["db_name"], _data_db(cli_env)
+        _wait_until_alone((catalog, data))
+        _forget_migration_13(cli_env)
 
         pending = _run_extenddb(
             "migrate", *_pg_args(), config=cli_env["config_path"], check=False
@@ -482,6 +501,7 @@ class TestVectorCatalogMigration:
         ), refused_output
         assert 13 not in _ledger_ids(catalog)
         assert 13 not in _ledger_ids(data)
+        _wait_until_alone((catalog, data))
 
         applied = _run_extenddb(
             "migrate", "--yes", *_pg_args(),
