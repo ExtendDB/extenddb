@@ -850,10 +850,12 @@ does not serve it without a sort step: PostgreSQL adds an Incremental Sort,
 SQLite a temporary B-tree.
 
 On a base table without a sort key, the Scan cursor is `pk > $last_pk` with
-`ORDER BY pk`. A Query with an `ExclusiveStartKey` on such a table returns no
-items and runs no statement, because the key condition fixes the only key
-column. The `base_sk_*` column drops out of every index cursor, Query and Scan
-alike. A GSI Query cursor is then `(sk_s COLLATE "C", base_pk COLLATE "C")`, a
+`ORDER BY pk`. A Query with an `ExclusiveStartKey` on such a table is refused
+with `ValidationException` (`The provided exclusive start key is invalid`)
+before it reaches storage (`crates/engine/src/start_key.rs`), because the key
+condition fixes the only key column. The `base_sk_*` column drops out of every
+index cursor, Query and Scan alike. A GSI Query cursor is then
+`(sk_s COLLATE "C", base_pk COLLATE "C")`, a
 hash-only index Query cursor is `base_pk COLLATE "C"` alone, and an LSI cannot
 exist.
 
