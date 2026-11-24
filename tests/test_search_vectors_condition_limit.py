@@ -3,13 +3,12 @@
 
 """SearchVectors condition count limit and the order of the expression checks.
 
-Under the equality-only grammar, measured against Amazon DynamoDB on
-2026-10-29 and 2026-10-30 in us-east-1, before the service served the
-extended grammar to every account, on a table whose vector index declares a
-HASH ``h`` and 18 inline filters ``f1`` to ``f18``. Each request shape was
-sent twice with the same response both times. ExtendDB serves this grammar
-when the ``search_inequality_filters`` setting is ``off`` or does not name
-the account.
+Under the equality-only grammar, which ExtendDB serves when the
+``search_inequality_filters`` setting is ``off`` or does not name the
+account. The answers were measured against Amazon DynamoDB on 2026-10-29 and
+2026-10-30 in us-east-1, on a table whose vector index declares a HASH ``h``
+and 18 inline filters ``f1`` to ``f18``. Each request shape was sent twice
+with the same response both times.
 
 The limit is 19 comparisons. The 20th gets ``Invalid SearchConditionExpression:
 SearchConditionExpression cannot have more than 1 partition key and more than
@@ -31,9 +30,9 @@ For syntax errors, undefined aliases, nested paths and logical operators,
 ExtendDB's wording differs from the service's. Those tests assert that the
 check, not the count, answers.
 
-The service now serves the extended grammar instead (comparators other than
-``=``, OR, NOT, IN, BETWEEN, up to 50 conditions), and so does ExtendDB when
-the setting is absent. The ``grammar`` fixture asks the target which grammar
+The service serves the extended grammar (comparators other than ``=``, OR,
+NOT, IN, BETWEEN, up to 50 conditions), and so does ExtendDB when the setting
+is absent. The ``grammar`` fixture asks the target which grammar
 it serves, by sending ``h = :v0 AND f1 <> :v1``: the equality-only grammar
 refuses it with the comparator message and the extended grammar answers 200.
 Against ExtendDB the fixture also reads the ``search_inequality_filters``
