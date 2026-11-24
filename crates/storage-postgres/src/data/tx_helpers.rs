@@ -484,9 +484,13 @@ pub(super) async fn write_stream_record_to_shard_in_tx(
 /// from before that commit: no row, or the `cancelled:` row that the commit
 /// replaced ([`stale_read`]). The statement then runs once more. It does not
 /// wait, because this transaction holds the lock, and at READ COMMITTED it
-/// takes a new snapshot, which holds the locked row. The level comes from the
-/// role or the database and may not be READ COMMITTED, so a second stale
-/// result answers `Err(TransactionInProgress)` and the request does not run.
+/// takes a new snapshot, which holds the locked row. At REPEATABLE READ or
+/// SERIALIZABLE, which a role, the database or the connection string can set
+/// (#570), the first statement fails with SQLSTATE 40001 instead, because the
+/// committed row is not in the transaction's snapshot, and the request is
+/// cancelled with `TransactionConflict` on every member. A second stale
+/// result is not expected at any level. If one comes, it answers
+/// `Err(TransactionInProgress)`, so that the request does not run twice.
 pub(super) async fn check_idempotency_token_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: &str,
