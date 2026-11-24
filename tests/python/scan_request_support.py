@@ -98,6 +98,7 @@ EAV_EMPTY_E = (EAV_VALUE + "Supplied AttributeValue is empty, must contain exact
 EAV_EMPTY_A = EAV_EMPTY_E.replace(":e", ":a")
 EAV_TWO_A = (EAV_VALUE + "Supplied AttributeValue has more than one datatypes set, must contain "
              "exactly one of the supported datatypes for key :a")
+EAV_NESTING_D = EAV_VALUE + NESTING + " for key :d"
 EAN_NO_EXPRESSION = "ExpressionAttributeNames can only be specified when using expressions"
 CONDOP = "ConditionalOperator can only be used when Filter or Expected has two or more elements"
 UNDEFINED_ZZ = ("Invalid FilterExpression: An expression attribute value used in expression "
@@ -108,8 +109,8 @@ SEGMENT_ALONE = ("The TotalSegments parameter is required but was not present in
                  "when Segment parameter is present")
 EMPTY_KEY = '"ExclusiveStartKey": {"pk": {}, "sk": {"S": "x"}}'
 FILTER_P = '"FilterExpression": "a = :p"'
-NEST32_S = json.dumps(nest({"S": "x"}, 32))
-NEST32_N = json.dumps(nest({"N": "1"}, 32))
+NEST33_S = json.dumps(nest({"S": "x"}, 33))
+NEST33_N = json.dumps(nest({"N": "1"}, 33))
 
 EMPTY_VALUE_BARE = ("Supplied AttributeValue is empty, must contain exactly one of the "
                     "supported datatypes")

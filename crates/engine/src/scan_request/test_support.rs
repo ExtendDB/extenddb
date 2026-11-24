@@ -10,8 +10,8 @@
 //! Every row is a request sent to the service (us-east-1, each request twice,
 //! a Scan of a table the probe created) with the answer it gave: on 2026-10-25
 //! at 10:38 and 10:55 UTC, on 2026-10-30 at 12:40 UTC, on 2026-10-31 between
-//! 23:54 and 23:56 UTC and on 2026-11-05 where a test says so. The test of the
-//! PartiQL Scan's checks names its own measurement. The tests of
+//! 23:54 and 23:56 UTC and on 2026-11-05 where a test says so. The tests of
+//! the nesting depth name their own measurements. The tests of
 //! `StartKeyBody::take` and `SelectBody::take` check which values they hold
 //! back, with no service answer; the tests of `ExpressionValuesBody::take` and
 //! `ScanFilterBody::take` also check the measured texts they keep; the tests of
@@ -21,7 +21,7 @@
 use extenddb_core::error::DynamoDbError;
 use serde_json::{Value, json};
 
-use super::{CheckOrder, SelectBody, StartKeyBody, ValuesDepth, request_checks};
+use super::{CheckOrder, SelectBody, StartKeyBody, request_checks};
 
 pub(super) const MIX: &str = "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {ScanFilter} Expression parameters: {FilterExpression}";
 
@@ -54,13 +54,7 @@ pub(super) fn validation_message(result: Result<(), DynamoDbError>) -> Option<St
 /// The request-time checks of a `Scan` request on `body`, in the order of the
 /// body's class.
 pub(super) fn check(body: &Value) -> Option<String> {
-    check_with(body, ValuesDepth::Checked)
-}
-
-/// The request-time checks on `body` with the nesting depth checked as
-/// `depth` says, in the order of the body's class.
-pub(super) fn check_with(body: &Value, depth: ValuesDepth) -> Option<String> {
-    validation_message(request_checks(body, depth).map(drop))
+    validation_message(request_checks(body).map(drop))
 }
 
 /// A Scan body with the fields of `extra` added to the table name.

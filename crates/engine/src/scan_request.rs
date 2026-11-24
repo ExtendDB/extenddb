@@ -15,9 +15,9 @@
 //! see `has_unreadable`), or whose `Limit`, `Segment` or `TotalSegments` is a
 //! float or an integer outside int32. Every other request follows order R. No
 //! single order fits the measured rows: `{"pk": {}, "sk": {"S": "x"}}` with
-//! `Select: "BAD"` answers the `Select` clause, a value nested 32 levels with
+//! `Select: "BAD"` answers the `Select` clause, a value nested 33 levels with
 //! `Select: "BAD"` answers the nesting text, and the same nested value beside
-//! that key answers the key's text.
+//! that key answers the key's text (2026-11-24 08:46 UTC).
 //!
 //! Order R:
 //!
@@ -40,21 +40,23 @@
 //!    varies for a number beside another entry's fault: `{":n": {"N":
 //!    "fred"}, ":a": {"N": "bob"}}` answered `fred` in 4 of 6 sends and `bob`
 //!    in 2 on 2026-11-23 (7 of 14 each in the review of 2026-11-12), and
-//!    `{"NS": ["bob", "1", "1"]}` beside a value nested 32 levels answered
-//!    `bob` in 4 of 4 sends on 2026-11-23 and the nesting text in 3 of 6 on
-//!    2026-11-12. The numbers of the `ScanFilter` lists are #507's check (#564
+//!    `{"NS": ["bob", "1", "1"]}` beside a value nested 33 levels answered
+//!    `bob` in one of two sends and the nesting text in the other on
+//!    2026-11-24 (beside 32 levels, `bob` in 4 of 4 sends on 2026-11-23 and
+//!    the nesting text in 3 of 6 on 2026-11-12). The numbers of the
+//!    `ScanFilter` lists are #507's check (#564
 //!    item 3, measured 2026-11-05: the number text ahead of a number in the
 //!    key);
 //! 6. an empty set and a set with a duplicate member in
 //!    `ExpressionAttributeValues`, the entries in placeholder order (see
 //!    [`validate_sets`]);
-//! 7. the nesting depth of `ExpressionAttributeValues`: a value nested 32
+//! 7. the nesting depth of `ExpressionAttributeValues`: a value nested 33
 //!    levels deep answers `Nesting Levels have exceeded supported limits:
-//!    Attributes in the item have nested levels beyond supported limit`, 31
-//!    levels pass, read or unused, with or without an expression (2026-10-30
-//!    and 2026-10-31: ahead of the no-expression check, B4-5a; 2026-11-05:
-//!    ahead of the filter syntax, the `Select` enum and the key's number);
-//!    see [`ValuesDepth`];
+//!    Attributes in the item have nested levels beyond supported limit`, 32
+//!    levels pass, read or unused, with or without an expression (see
+//!    [`nested_too_deep`]; 2026-11-24 08:46 UTC: 33 levels ahead of the
+//!    no-expression check, the filter syntax, the `Select` enum and the key's
+//!    number, and after an empty `NS` in another entry);
 //! 8. the request parameter checks: `ExpressionAttributeNames` with no
 //!    expression, then `ExpressionAttributeValues` with no expression, then
 //!    `ConditionalOperator` with no `ScanFilter`, then a `ScanFilter`
@@ -95,12 +97,12 @@
 //!    with the prefix `The provided starting key is invalid: `, a number with
 //!    the number check's text, a set fault with the texts of the older path;
 //! 5. the `ExpressionAttributeValues` entries, in the same member order
-//!    ([`member_order::fitted_member_order`]), the first faulty one named, every fault in
-//!    the form `ExpressionAttributeValues contains invalid value: <text> for
-//!    key :e`, then an empty name in `ExpressionAttributeNames` (see
+//!    ([`member_order::fitted_member_order`]), the first faulty one named, an
+//!    entry nested 33 levels or more among them, every fault in the form
+//!    `ExpressionAttributeValues contains invalid value: <text> for key :e`,
+//!    then an empty name in `ExpressionAttributeNames` (see
 //!    [`ExpressionValuesBody`]);
-//! 6. the nesting depth, then the expression and request checks of order R
-//!    step 10, then the table.
+//! 6. the expression and request checks of order R step 10, then the table.
 //!
 //! Pairs never sent together keep the code's order: in order R the nesting
 //! check against `ExpressionAttributeNames` with no expression,
@@ -131,15 +133,16 @@
 //!
 //! The JSON parser accepts 128 levels of nesting, which is 62 `L` levels; a
 //! body nested deeper is a `SerializationException` from the parser, ahead of
-//! every check here. The service answers the nesting text from 32 to 62 levels
-//! and, from 63 to 100 levels, `ExpressionAttributeValues contains invalid
-//! value: Nesting Levels have exceeded supported limits: Attributes in the
-//! item have nested levels beyond supported limit for key :d` (measured
-//! 2026-10-30), which this module does not reach.
+//! every check here. The service answers the nesting text from 33 to 62 levels
+//! and, from 63 levels, `ExpressionAttributeValues contains invalid value:
+//! Nesting Levels have exceeded supported limits: Attributes in the item have
+//! nested levels beyond supported limit for key :d` (measured 2026-10-30 at
+//! 63 to 100 levels, and 2026-11-24 08:11 UTC at 33, 34, 62, 63 and 64 levels
+//! of an `L` and an `M` chain), which this module does not reach.
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::types::{AttributeValue, ScanInput};
-use serde::Deserialize;
+use extenddb_core::types::ScanInput;
+use extenddb_core::validation::{MAX_ITEM_NESTING_DEPTH, NESTING_MESSAGE};
 use serde_json::{Map, Value};
 
 use crate::int32_member::{ATTRIBUTES_TO_GET, SCAN_RANGES, newer_form, ranges};
@@ -183,25 +186,40 @@ impl CheckOrder {
     }
 }
 
-/// Whether the `Scan` checks include the nesting depth of the
-/// `ExpressionAttributeValues` entries, in either order. A `Scan` request's
-/// checks do: the service refuses an entry nested 32 levels deep. The checks
-/// of the Scan a PartiQL `SELECT` is translated into do not: the service
-/// accepts a parameter nested 32 levels deep in the `SELECT`'s `WHERE` clause
-/// and refuses one nested 33 levels (measured 2026-11-09). The PartiQL
-/// parameter check refuses 33 levels before the statement is read (see
-/// `extenddb_core::partiql::params`), and the parser refuses a literal inside
-/// 32 maps or lists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ValuesDepth {
-    /// Refuse an entry nested 32 levels deep or more.
-    Checked,
-    /// Leave the depth of the entries unchecked.
-    Unchecked,
+/// Whether the service refuses `value`, an `ExpressionAttributeValues` entry
+/// as the request wrote it, for its nesting depth: it holds more than
+/// `MAX_ITEM_NESTING_DEPTH` (32) `L` or `M` levels, an empty one counted, in
+/// the payload of either type descriptor. The service accepts a value inside
+/// 32 levels and refuses 33, one level more than an item attribute may hold
+/// (measured 2026-11-24 08:11 UTC, us-east-1, each request twice: an `L` chain
+/// and an `M` chain around `{"N": "1"}` at 30, 31 and 32 levels answer
+/// `ResourceNotFoundException`, at 33, 34 and 62 levels the nesting text). A
+/// PartiQL parameter has the same limit (see `extenddb_core::partiql::params`).
+/// The entry is read as JSON, as a value of order U may not deserialize: the
+/// service reports the depth of `{}` inside 33 levels ahead of the empty leaf
+/// (measured 2026-11-24 08:46 UTC).
+pub(crate) fn nested_too_deep(value: &Value) -> bool {
+    fn deeper_than(value: &Value, levels: usize) -> bool {
+        let Value::Object(map) = value else {
+            return false;
+        };
+        let lists = map.get("L").and_then(Value::as_array);
+        let maps = map.get("M").and_then(Value::as_object);
+        if lists.is_none() && maps.is_none() {
+            return false;
+        }
+        levels == 0
+            || lists
+                .into_iter()
+                .flatten()
+                .chain(maps.into_iter().flat_map(Map::values))
+                .any(|inner| deeper_than(inner, levels - 1))
+    }
+    deeper_than(value, MAX_ITEM_NESTING_DEPTH)
 }
 
 /// The `Scan` checks that run on the raw request body, in the order the
-/// module documentation gives, with the nesting depth checked.
+/// module documentation gives.
 ///
 /// The checks read the raw body, so a field that does not deserialize (an
 /// invalid `Select`, for one) does not stop the ones before it. When a check
@@ -225,7 +243,7 @@ pub(crate) enum ValuesDepth {
 /// Returns `DynamoDbError::ValidationException` with the service's text, or
 /// `DynamoDbError::SerializationException` for a body of the wrong shape.
 pub fn validate_scan_request_body(body: &Value) -> Result<(), DynamoDbError> {
-    request_checks(body, ValuesDepth::Checked).map(drop)
+    request_checks(body).map(drop)
 }
 
 /// The checks of a `Scan` body that the server runs ahead of the IAM
@@ -240,11 +258,11 @@ pub fn validate_scan_request_body(body: &Value) -> Result<(), DynamoDbError> {
 ///
 /// As [`validate_scan_request_body`].
 pub fn validate_before_authorization(body: &Value, raw_body: &[u8]) -> Result<(), DynamoDbError> {
-    crate::scan::checked_body(body.clone(), raw_body, ValuesDepth::Checked).map(drop)
+    crate::scan::checked_body(body.clone(), raw_body).map(drop)
 }
 
-/// [`validate_scan_request_body`] with the nesting depth checked as `depth`
-/// says, and the order the request follows when every check passes.
+/// [`validate_scan_request_body`], and the order the request follows when
+/// every check passes.
 ///
 /// A member of the wrong JSON type inside an `ExpressionAttributeValues`
 /// entry, an `ExclusiveStartKey` value or a `ScanFilter` list value is found
@@ -255,21 +273,18 @@ pub fn validate_before_authorization(body: &Value, raw_body: &[u8]) -> Result<()
 /// # Errors
 ///
 /// As [`validate_scan_request_body`].
-pub(crate) fn request_checks(
-    body: &Value,
-    depth: ValuesDepth,
-) -> Result<CheckOrder, DynamoDbError> {
+pub(crate) fn request_checks(body: &Value) -> Result<CheckOrder, DynamoDbError> {
     if let Some(shape) = value_shape_fault(body, SCAN_CONDITIONS) {
         return Err(shape);
     }
-    scan_request_checks(body, depth).map_err(|check| {
+    scan_request_checks(body).map_err(|check| {
         shape_fault_first::<ScanInput>(&readable_for_shape_check(body, SCAN_CONDITIONS), check)
     })
 }
 
 /// The `Scan` checks in the service's order; see
 /// [`validate_scan_request_body`].
-fn scan_request_checks(body: &Value, depth: ValuesDepth) -> Result<CheckOrder, DynamoDbError> {
+fn scan_request_checks(body: &Value) -> Result<CheckOrder, DynamoDbError> {
     let order = CheckOrder::of(body);
     let ranges = ranges(body, &SCAN_RANGES);
     let empty_list = body
@@ -303,15 +318,10 @@ fn scan_request_checks(body: &Value, depth: ValuesDepth) -> Result<CheckOrder, D
     {
         validate_expression_attribute_value_numbers(values)?;
         validate_sets(values)?;
-        if depth == ValuesDepth::Checked {
-            // Every entry deserializes once the numbers and the sets pass,
-            // but one of the wrong JSON type, which the shape fault check
-            // reports.
-            let values: Vec<AttributeValue> = values
-                .values()
-                .filter_map(|value| AttributeValue::deserialize(value).ok())
-                .collect();
-            extenddb_core::validation::validate_attribute_values_nesting_depth(&values)?;
+        if values.values().any(nested_too_deep) {
+            return Err(DynamoDbError::ValidationException(
+                NESTING_MESSAGE.to_owned(),
+            ));
         }
     }
     Ok(order)
@@ -348,11 +358,12 @@ fn validate_parameter_mix(body: &Value) -> Result<(), DynamoDbError> {
 /// nesting depth and the `Select` enum (measured 2026-11-19 and 2026-11-23: a
 /// duplicate or an empty `NS`, a duplicate `SS` or `BS`, and a duplicate `NS`
 /// in an `L` beside `Select: "NOPE"` answer the set text). Beside a value
-/// nested 32 levels in another entry the answer varies: `{":e": {"NS": []}}`
-/// answered the empty-set text in both sends on 2026-11-05 and in 4 of 4 on
-/// 2026-11-23, and the nesting text in 12 of 14 sends on 2026-11-12, and
-/// `{":s": {"SS": ["a", "a"]}}` the duplicates text in one of two sends
-/// (2026-11-05). Beside a number fault in another value, the service named
+/// nested 33 levels in another entry, `{":e": {"NS": []}}` answered the
+/// empty-set text in 2 of 2 sends and `{":s": {"SS": ["a", "a"]}}` the
+/// duplicates text in one of two and the nesting text in the other
+/// (2026-11-24 08:46 UTC); beside 32 levels the empty `NS` answered the
+/// nesting text in 12 of 14 sends on 2026-11-12. Beside a number fault in
+/// another value, the service named
 /// either value between two identical requests (measured 2026-11-05 and
 /// 2026-11-19), and this check comes after the numbers. With two set faults,
 /// `{":n": {"NS": []}, ":a": {"SS": []}}`, the service answered the `SS` text

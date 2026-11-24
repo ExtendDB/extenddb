@@ -7,10 +7,11 @@
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::types::{EMPTY_ATTRIBUTE_VALUE, Item, MULTI_ATTRIBUTE_VALUE};
+use extenddb_core::validation::NESTING_MESSAGE;
 use serde_json::Value;
 
-use super::CheckOrder;
 use super::member_order::fitted_order_of;
+use super::{CheckOrder, nested_too_deep};
 use crate::query_key_values::{
     Fault, SELECT, SetFault, first_fault, is_shape_fault, validate_names,
 };
@@ -153,10 +154,15 @@ fn key_fault_text(fault: Fault<'_>, order: CheckOrder) -> DynamoDbError {
 }
 
 /// The `ExpressionAttributeValues` of a `Scan` body in order U, whose faults
-/// the service reports at the map's own step: after the key's faults and ahead
-/// of the nesting check, read by an expression or not (2026-10-31 B4-7 and
-/// 2026-11-05), every fault in the form `ExpressionAttributeValues contains
-/// invalid value: <text> for key :e`. The first fault inside one entry is the
+/// the service reports at the map's own step: after the key's faults, read by
+/// an expression or not (2026-10-31 B4-7 and 2026-11-05), every fault in the
+/// form `ExpressionAttributeValues contains invalid value: <text> for key :e`.
+/// An entry nested 33 levels or more is a fault of the entry, found ahead of
+/// the faults inside it (see `nested_too_deep`; measured 2026-11-24 08:46 and
+/// 08:47 UTC: beside `Limit: 1.5` a 33-level `:p` answers the nesting text
+/// for key `:p`, `{}` inside 33 levels answers it for its entry, a 33-level
+/// `:d` ahead of `{}` in `:e` is named, and `{}` in `:b` ahead of it is).
+/// Otherwise the first fault inside one entry is the
 /// one `first_fault` finds in the value's element order: a value the service
 /// cannot read as one type (`Supplied AttributeValue is empty, must contain
 /// exactly one of the supported datatypes` for `{}` and for `{"X": "1"}`, the
@@ -208,7 +214,12 @@ impl ExpressionValuesBody {
                 let Some(value) = entries.get_mut(&name) else {
                     continue;
                 };
-                if let Some(text) = first_fault(value, None, true).map(Fault::reason) {
+                let text = if nested_too_deep(value) {
+                    Some(NESTING_MESSAGE.to_owned())
+                } else {
+                    first_fault(value, None, true).map(Fault::reason)
+                };
+                if let Some(text) = text {
                     fault.get_or_insert_with(|| {
                         DynamoDbError::ValidationException(format!(
                             "ExpressionAttributeValues contains invalid value: {text} for key {name}"

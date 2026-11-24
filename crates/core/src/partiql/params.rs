@@ -53,12 +53,9 @@ use serde_json::{Map, Value};
 use super::number::{check_number, parameter_message};
 use crate::types::AttributeValue;
 use crate::validation::MAX_ITEM_NESTING_DEPTH;
+pub use crate::validation::NESTING_MESSAGE;
 pub use crate::validation::number::NUMBER_SET_DUPLICATES;
 use crate::validation::number::has_equal_numbers;
-
-/// The service's nesting-depth message, the same for parameters as for items.
-pub const NESTING_MESSAGE: &str = "Nesting Levels have exceeded supported limits: \
-     Attributes in the item have nested levels beyond supported limit";
 
 /// The refusal of an attribute value with no type: `{}`, a value whose only
 /// members the model does not name, or whose members are all null.

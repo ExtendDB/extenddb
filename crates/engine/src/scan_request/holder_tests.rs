@@ -8,8 +8,8 @@
 use serde_json::{Value, json};
 
 use super::test_support::{
-    EMPTY_VALUE, INVALID, MORE_THAN_ONE, NUMERIC_BOB, SELECT_BAD, check, scan, validation_message,
-    with,
+    EMPTY_VALUE, INVALID, MORE_THAN_ONE, NESTING, NUMERIC_BOB, SELECT_BAD, check, nested, scan,
+    validation_message, with,
 };
 use super::{CheckOrder, ExpressionValuesBody, ScanFilterBody, SelectBody};
 
@@ -264,6 +264,59 @@ fn an_order_u_set_fault_in_an_expression_value_takes_the_invalid_value_form() {
             Some(wrapper(text, ":l")),
             "{value}"
         );
+    }
+}
+
+/// Measured 2026-11-24 at 08:46 and 08:47 UTC (us-east-1, each body twice, a
+/// table that does not exist): in order U an entry nested 33 levels is a fault
+/// of the entry, in the invalid-value form, named in the hash order and found
+/// ahead of the faults inside it. Beside `Limit: 1.5` a 33-level `:p` answers
+/// it for `:p`, `{}` inside 33 levels answers it for its entry, `:d` nested 33
+/// levels is named ahead of `{}` in `:e`, and `{}` in `:b` ahead of `:d`.
+/// Inside 32 levels the empty leaf is named (measured 2026-11-05 at 06:20 UTC).
+#[test]
+fn an_order_u_entry_nested_33_levels_is_a_fault_of_the_entry() {
+    let wrapper = |text: &str, name: &str| {
+        format!("ExpressionAttributeValues contains invalid value: {text} for key {name}")
+    };
+    let x = json!({"S": "x"});
+    let one = json!({"N": "1"});
+    for (values, limit, text) in [
+        (
+            json!({":p": nested(&x, 33)}),
+            Some(1.5),
+            wrapper(NESTING, ":p"),
+        ),
+        (
+            json!({":p": x, ":d": nested(&json!({}), 33)}),
+            None,
+            wrapper(NESTING, ":d"),
+        ),
+        (
+            json!({":p": x, ":d": nested(&one, 33), ":e": {}}),
+            None,
+            wrapper(NESTING, ":d"),
+        ),
+        (
+            json!({":p": x, ":b": {}, ":d": nested(&one, 33)}),
+            None,
+            wrapper(EMPTY_VALUE, ":b"),
+        ),
+        (
+            json!({":p": x, ":d": nested(&json!({}), 32)}),
+            None,
+            wrapper(EMPTY_VALUE, ":d"),
+        ),
+    ] {
+        let mut body =
+            scan(json!({"FilterExpression": "a = :p", "ExpressionAttributeValues": values}));
+        if let Some(limit) = limit {
+            body["Limit"] = json!(limit);
+        }
+        assert_eq!(CheckOrder::of(&body), CheckOrder::Unreadable, "{body}");
+        assert_eq!(check(&body), None, "{body}");
+        let values = ExpressionValuesBody::take(&mut body, CheckOrder::Unreadable, None);
+        assert_eq!(validation_message(values.validate()), Some(text), "{body}");
     }
 }
 

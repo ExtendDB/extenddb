@@ -15,7 +15,8 @@ from helpers import unique_name
 from scan_request_support import (
     MIX, NUMERIC_BOB, RCC_ENUM, NESTING, LIMIT, SELECT_ENUM, KEY_PREFIX, EMPTY_KEY_VALUE, INVALID,
     NS_EMPTY, SS_EMPTY, BS_EMPTY, NUMERIC_FRED, EAV_NO_EXPRESSION, BOB_KEY, EAV_VALUE, EAV_EMPTY_E,
-    EAN_NO_EXPRESSION, CONDOP, EMPTY_KEY, FILTER_P, NEST32_N, EMPTY_VALUE_BARE, MORE_THAN_ONE_BARE,
+    EAV_NESTING_D, EAN_NO_EXPRESSION, CONDOP, EMPTY_KEY, FILTER_P, NEST33_N, EMPTY_VALUE_BARE,
+    MORE_THAN_ONE_BARE,
     EAV_EMPTY_B, EAV_EMPTY_P, EAV_NUMBER_A, EAV_NUMBER_N, SF_EMPTY, SF_BOB, NONASCII_KEY_A_BOB,
     NONASCII_KEY_E_EMPTY, nest, _scan, _validation_message, table, t4_table, u_table, v_table,
 )
@@ -91,15 +92,17 @@ ROWS_2026_11_05 = [
      '"ExpressionAttributeValues": {":e": {"NS": []}}', RCC_ENUM),
     ("eavR-NSe-and-select-bad", "table", FILTER_P + ', "ExpressionAttributeValues": '
      '{":p": {"S": "x"}, ":e": {"NS": []}}, "Select": "BAD"', NS_EMPTY),
-    # Re-measured 2026-11-05 at 06:20 UTC with the nested value written out
-    # (32 L levels): in order R an empty set beside a nested value answered
-    # the set text in both sends that day and in 4 of 4 on 2026-11-23, and
-    # the nesting text in 12 of 14 sends in the review of 2026-11-12. In order
-    # U the empty leaf of a nested entry is named.
+    # In order R an empty set beside a value nested 33 levels answered the set
+    # text in 2 of 2 sends on 2026-11-24 (beside 32 levels, the nesting text in
+    # 12 of 14 sends in the review of 2026-11-12). In order U the empty leaf
+    # inside 32 levels is named (2026-11-05 at 06:20 UTC), and inside 33 levels
+    # the entry's nesting (2026-11-24 at 08:46 UTC).
     ("eavR-NSe-and-nest", "table", FILTER_P + ', "ExpressionAttributeValues": '
-     '{":p": {"S": "x"}, ":d": ' + NEST32_N + ', ":e": {"NS": []}}', ("either", NS_EMPTY, NESTING)),
+     '{":p": {"S": "x"}, ":d": ' + NEST33_N + ', ":e": {"NS": []}}', ("either", NS_EMPTY, NESTING)),
     ("eavU-nest32-empty-leaf", "table", FILTER_P + ', "ExpressionAttributeValues": '
      '{":p": {"S": "x"}, ":d": ' + json.dumps(nest({}, 32)) + '}', EAV_EMPTY_E.replace(":e", ":d")),
+    ("eavU-nest33-empty-leaf", "table", FILTER_P + ', "ExpressionAttributeValues": '
+     '{":p": {"S": "x"}, ":d": ' + json.dumps(nest({}, 33)) + '}', EAV_NESTING_D),
     ("eavU-empty-and-filter-syntax", "table", '"FilterExpression": "a = = :p", '
      '"ExpressionAttributeValues": {":p": {}}', EAV_EMPTY_P),
     ("eavU-empty-and-undefined", "table", '"FilterExpression": "a = :zz", '
@@ -157,20 +160,20 @@ ROWS_2026_11_05 = [
      '{":n": {"N": "fred"}, ":a": {"N": "bob"}}', ("either", NUMERIC_FRED, NUMERIC_BOB)),
     ("eavR-two-set-faults", "table", '"ExpressionAttributeValues": {":n": {"NS": []}, ":a": {"SS": []}}',
      ("either", SS_EMPTY, NS_EMPTY)),
-    # Order R: a malformed number inside an entry with a set fault, beside the
-    # nesting fault of another entry, answered the number in 4 of 4 sends on
-    # 2026-11-23 and the nesting text in 3 of 6 on 2026-11-12; with the number
-    # ahead of the set fault in one L the service's two sends disagreed. The SS
-    # duplicates beside a nested value answered the duplicates text and the
-    # nesting text.
+    # Order R, beside an entry nested 33 levels (2026-11-24 at 08:46 and 08:59
+    # UTC): a malformed number inside an entry with a set fault answered the
+    # number in one send and the nesting text in the other, as did a number
+    # ahead of a set fault in one L, and the SS duplicates answered the
+    # duplicates text and the nesting text (beside 32 levels, the nesting text
+    # in 3 of 6 sends on 2026-11-12).
     ("eavR-NSbobdup-and-nest", "table", FILTER_P + ', "ExpressionAttributeValues": '
-     '{":p": {"S": "x"}, ":d": ' + NEST32_N + ', ":a": {"NS": ["bob", "1", "1"]}}',
+     '{":p": {"S": "x"}, ":d": ' + NEST33_N + ', ":a": {"NS": ["bob", "1", "1"]}}',
      ("either", NUMERIC_BOB, NESTING)),
     ("eavR-L-bob-then-NSe-and-nest", "table", FILTER_P + ', "ExpressionAttributeValues": '
-     '{":p": {"S": "x"}, ":d": ' + NEST32_N + ', ":l": {"L": [{"N": "bob"}, {"NS": []}]}}',
+     '{":p": {"S": "x"}, ":d": ' + NEST33_N + ', ":l": {"L": [{"N": "bob"}, {"NS": []}]}}',
      ("either", NUMERIC_BOB, NESTING)),
     ("eavR-SSdup-and-nest", "table", FILTER_P + ', "ExpressionAttributeValues": '
-     '{":p": {"S": "x"}, ":d": ' + NEST32_N + ', ":s": {"SS": ["a", "a"]}}',
+     '{":p": {"S": "x"}, ":d": ' + NEST33_N + ', ":s": {"SS": ["a", "a"]}}',
      ("either", INVALID + 'Input collection ["a", "a"] contains duplicates.', NESTING)),
     ("eavR-NSe-and-mix", "table", FILTER_P + ', "ScanFilter": {"a": {"ComparisonOperator": "EQ", '
      '"AttributeValueList": [{"N": "1"}]}}, "ExpressionAttributeValues": {":p": {"S": "x"}, '

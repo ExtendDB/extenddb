@@ -11,10 +11,10 @@ use extenddb_core::error::DynamoDbError;
 use serde_json::{Value, json};
 
 use super::test_support::{
-    INVALID, LENGTH, MIX, NESTING, NUMERIC_BOB, SELECT_BAD, check, check_select, check_with,
-    filter, nested, scan, with, with_key, with_unused_value,
+    INVALID, LENGTH, MIX, NESTING, NUMERIC_BOB, SELECT_BAD, check, check_select, filter, nested,
+    scan, with, with_key, with_unused_value,
 };
-use super::{CheckOrder, ExpressionValuesBody, ValuesDepth, request_checks};
+use super::{CheckOrder, ExpressionValuesBody, request_checks};
 
 #[test]
 fn an_empty_scan_filter_counts_as_present_for_the_parameter_mix() {
@@ -122,7 +122,7 @@ fn every_request_time_check_comes_ahead_of_the_number_in_the_exclusive_start_key
         (
             json!({
                 "FilterExpression": "a = :p",
-                "ExpressionAttributeValues": {":p": {"S": "x"}, ":d": nested(&json!({"N": "1"}), 32)},
+                "ExpressionAttributeValues": {":p": {"S": "x"}, ":d": nested(&json!({"N": "1"}), 33)},
             }),
             NESTING,
         ),
@@ -197,8 +197,8 @@ fn two_malformed_numbers_in_order_r_answer_one_of_the_two() {
 /// empty `NS` text in the other (2026-11-05); the placeholder order names
 /// `:a`. A malformed number inside an entry with a set fault is one of the
 /// numbers, which come first: `{"NS": ["bob", "1", "1"]}` beside a value nested
-/// 32 levels in another entry answered `bob` in 4 of 4 sends on 2026-11-23 at
-/// 14:12 UTC (the nesting text in 3 of 6 sends in the review of 2026-11-12).
+/// 33 levels in another entry answered `bob` in one of two sends and the
+/// nesting text in the other on 2026-11-24 at 08:46 UTC.
 #[test]
 fn the_order_r_set_pass_visits_the_entries_in_sorted_name_order() {
     let body = scan(json!({"ExpressionAttributeValues": {":n": {"NS": []}, ":a": {"SS": []}}}));
@@ -215,7 +215,7 @@ fn the_order_r_set_pass_visits_the_entries_in_sorted_name_order() {
     let one = json!({"N": "1"});
     let mut body = scan(json!({
         "FilterExpression": "a = :p",
-        "ExpressionAttributeValues": {":p": {"S": "x"}, ":d": nested(&one, 32), ":a": {"NS": ["bob", "1", "1"]}},
+        "ExpressionAttributeValues": {":p": {"S": "x"}, ":d": nested(&one, 33), ":a": {"NS": ["bob", "1", "1"]}},
     }));
     assert_eq!(check(&body).as_deref(), Some(NUMERIC_BOB));
     // In order R `ExpressionValuesBody` takes nothing: every fault of the map
@@ -253,7 +253,7 @@ fn a_value_of_the_wrong_json_type_is_found_behind_a_value_fault() {
     ] {
         assert!(
             matches!(
-                request_checks(&body, ValuesDepth::Checked),
+                request_checks(&body),
                 Err(DynamoDbError::SerializationException(_))
             ),
             "{body}"
@@ -263,7 +263,7 @@ fn a_value_of_the_wrong_json_type_is_found_behind_a_value_fault() {
         json!({"AttributesToGet": [], "ExclusiveStartKey": {"pk": {"NS": []}},
                             "Limit": "5"}),
     );
-    match request_checks(&limit, ValuesDepth::Checked) {
+    match request_checks(&limit) {
         Err(DynamoDbError::SerializationException(msg)) => {
             assert_eq!(msg, "STRING_VALUE cannot be converted to Integer");
         }
@@ -271,34 +271,47 @@ fn a_value_of_the_wrong_json_type_is_found_behind_a_value_fault() {
     }
 }
 
+/// Measured 2026-11-24 at 08:11 UTC (us-east-1, each request twice, a table
+/// that does not exist): an `L` chain and an `M` chain around `{"N": "1"}` in
+/// a `FilterExpression` value pass at 30, 31 and 32 levels and answer the
+/// nesting text at 33, 34 and 62 levels. At 08:46 UTC, 33 levels answered the
+/// nesting text ahead of the `Select` enum, the filter syntax, the
+/// no-expression check and the key's number, and after an empty `NS` in
+/// another entry; beside `{"SS": ["a", "a"]}` the duplicates text in one of
+/// two sends and the nesting text in the other.
 #[test]
-fn a_value_nested_32_levels_deep_is_refused_and_31_levels_pass() {
+fn a_value_nested_33_levels_deep_is_refused_and_32_levels_pass() {
     let one = json!({"N": "1"});
-    for levels in [32, 33, 40, 60] {
+    let map = |levels: usize| (0..levels).fold(one.clone(), |inner, _| json!({"M": {"m": inner}}));
+    for levels in [33, 34, 40, 62] {
         let body = with_unused_value(nested(&one, levels));
         assert_eq!(check(&body).as_deref(), Some(NESTING), "{levels} levels");
+        let body = with_unused_value(map(levels));
+        assert_eq!(
+            check(&body).as_deref(),
+            Some(NESTING),
+            "{levels} map levels"
+        );
     }
-    // 31 levels reach the checks the handler makes after deserializing.
-    assert_eq!(check(&with_unused_value(nested(&one, 31))), None);
-    // Measured 2026-10-30 12:40 UTC: ahead of the Select enum.
+    // 32 levels reach the checks the handler makes after deserializing.
+    assert_eq!(check(&with_unused_value(nested(&one, 32))), None);
+    assert_eq!(check(&with_unused_value(map(32))), None);
+    // Ahead of the Select enum.
     let select = with(
-        with_unused_value(nested(&one, 32)),
+        with_unused_value(nested(&one, 33)),
         json!({"Select": "BAD"}),
     );
     assert_eq!(check(&select).as_deref(), Some(NESTING));
-    // Measured 2026-10-31 (B4-5a): with no expression at all, the nesting text
-    // ahead of the no-expression check.
-    let no_expression = scan(json!({"ExpressionAttributeValues": {":d": nested(&one, 32)}}));
+    // With no expression at all, the nesting text ahead of the no-expression
+    // check (B4-5a).
+    let no_expression = scan(json!({"ExpressionAttributeValues": {":d": nested(&one, 33)}}));
     assert_eq!(check(&no_expression).as_deref(), Some(NESTING));
     // The set pass comes ahead of the nesting check: an empty set in another
     // entry answers the set text, with the text of order R, and a duplicate
-    // set too. The service's answer varies there (eavR-NSe-and-nest: the set
-    // text in both sends on 2026-11-05 and 4 of 4 on 2026-11-23, the nesting
-    // text in 12 of 14 on 2026-11-12). A number in a third entry comes ahead
-    // of both.
+    // set too. A number in a third entry comes ahead of both.
     let beside_empty_set = scan(
         json!({"FilterExpression": "a = :p", "ExpressionAttributeValues":
-        {":p": {"S": "x"}, ":d": nested(&one, 32), ":e": {"NS": []}}}),
+        {":p": {"S": "x"}, ":d": nested(&one, 33), ":e": {"NS": []}}}),
     );
     assert_eq!(CheckOrder::of(&beside_empty_set), CheckOrder::Readable);
     assert_eq!(
@@ -307,7 +320,7 @@ fn a_value_nested_32_levels_deep_is_refused_and_31_levels_pass() {
     );
     let beside_duplicates = scan(
         json!({"FilterExpression": "a = :p", "ExpressionAttributeValues":
-        {":p": {"S": "x"}, ":d": nested(&one, 32), ":a": {"SS": ["a", "a"]}}}),
+        {":p": {"S": "x"}, ":d": nested(&one, 33), ":a": {"SS": ["a", "a"]}}}),
     );
     assert_eq!(
         check(&beside_duplicates).as_deref(),
@@ -317,34 +330,32 @@ fn a_value_nested_32_levels_deep_is_refused_and_31_levels_pass() {
     );
     let number_first = scan(
         json!({"FilterExpression": "a = :p", "ExpressionAttributeValues":
-        {":p": {"S": "x"}, ":d": nested(&one, 32), ":e": {"NS": []}, ":n": {"N": "bob"}}}),
+        {":p": {"S": "x"}, ":d": nested(&one, 33), ":e": {"NS": []}, ":n": {"N": "bob"}}}),
     );
     assert_eq!(check(&number_first).as_deref(), Some(NUMERIC_BOB));
     // In order U the nesting check leaves request time: beside an unused
-    // empty value (B4-7) or a key shape fault (2026-11-05) the request-time
-    // checks pass and the handler reports those first.
+    // empty value (B4-7) or a key shape fault the request-time checks pass,
+    // and the handler reports the key's fault and then the faulty entries in
+    // the hash order, the nested one among them.
     let beside_empty = scan(json!({
         "FilterExpression": "a = :p",
-        "ExpressionAttributeValues": {":p": {"S": "x"}, ":d": nested(&one, 32), ":e": {}},
+        "ExpressionAttributeValues": {":p": {"S": "x"}, ":d": nested(&one, 33), ":e": {}},
     }));
     assert_eq!(check(&beside_empty), None);
     let beside_key = with(
-        with_unused_value(nested(&one, 32)),
+        with_unused_value(nested(&one, 33)),
         json!({"ExclusiveStartKey": {"pk": {}, "sk": {"S": "x"}}}),
     );
     assert_eq!(check(&beside_key), None);
 }
 
-/// Measured 2026-11-09 at 11:44 UTC (us-east-1, each request once):
-/// `SELECT * FROM "t" WHERE a <> ?` with a parameter of 32 maps around a
-/// string returns two items, and with 33 maps answers the nesting text; a
-/// `Scan` with the `FilterExpression` `a <> :v` answers the nesting text for
-/// the 32-map `:v` and returns the two items for 31 maps. The body here is the
-/// one the `SELECT` is translated into. Beside the deep value the PartiQL
-/// Scan's number check still runs (no service answer: the PartiQL parameter
-/// check refuses such a number first).
+/// The body a PartiQL `SELECT` is translated into has the limit of a `Scan`
+/// request: `SELECT * FROM "t" WHERE a <> ?` with a parameter of 32 maps
+/// around a string returns the items, and with 33 maps answers the nesting
+/// text (measured 2026-11-09 at 11:44 UTC, each request once), which the
+/// PartiQL parameter check gives before the statement is read.
 #[test]
-fn a_value_nested_32_levels_deep_passes_the_checks_of_a_partiql_scan() {
+fn the_body_of_a_partiql_select_passes_32_levels() {
     let deep = |levels: usize| {
         (0..levels).fold(json!({"S": "leaf"}), |inner, _| json!({"M": {"n": inner}}))
     };
@@ -357,16 +368,8 @@ fn a_value_nested_32_levels_deep_passes_the_checks_of_a_partiql_scan() {
     };
     let body = select(deep(32));
     assert_eq!(CheckOrder::of(&body), CheckOrder::Readable);
-    assert_eq!(check(&body).as_deref(), Some(NESTING));
-    assert_eq!(check_with(&body, ValuesDepth::Unchecked), None);
-    assert_eq!(check(&select(deep(31))), None);
-    assert_eq!(check_with(&select(deep(31)), ValuesDepth::Unchecked), None);
-    let mut with_number = body;
-    with_number["ExpressionAttributeValues"][":v1"] = json!({"N": "bob"});
-    assert_eq!(
-        check_with(&with_number, ValuesDepth::Unchecked).as_deref(),
-        Some(NUMERIC_BOB)
-    );
+    assert_eq!(check(&body), None);
+    assert_eq!(check(&select(deep(33))).as_deref(), Some(NESTING));
 }
 
 #[test]
@@ -380,8 +383,8 @@ fn the_number_check_runs_before_the_nesting_check() {
             "{levels} levels"
         );
     }
-    // An M at the top, 31 lists below it.
-    let body = with_unused_value(json!({"M": {"k": nested(&bob, 31)}}));
+    // An M at the top, 32 lists below it.
+    let body = with_unused_value(json!({"M": {"k": nested(&bob, 32)}}));
     assert_eq!(check(&body).as_deref(), Some(NUMERIC_BOB));
 }
 
@@ -428,11 +431,6 @@ fn combinations_measured_on_2026_10_31_follow_the_order_of_the_checks() {
         json!({"ExclusiveStartKey": {"pk": {"N": "fred"}}}),
     );
     assert_eq!(check(&both).as_deref(), Some(NUMERIC_BOB));
-    // A map nests as a list does.
-    let map =
-        |levels: usize| (0..levels).fold(json!({"N": "1"}), |inner, _| json!({"M": {"k": inner}}));
-    assert_eq!(check(&with_unused_value(map(32))).as_deref(), Some(NESTING));
-    assert_eq!(check(&with_unused_value(map(31))), None);
     // The ReturnConsumedCapacity enum comes ahead of the parameter mix
     // (2026-11-05).
     let rcc_mix = with(

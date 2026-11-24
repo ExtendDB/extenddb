@@ -12,9 +12,10 @@ at 12:40 UTC and on 2026-10-31 between 23:54 and 23:56 UTC where a row says
 so, each sent twice, and each expected answer is the service's. The table here
 holds 12 items, so the count the accepted request returns is 12.
 
-Depth is the number of ``L`` wrappers around the leaf: 32 or more answers the
-nesting text, 31 reaches the unused-value check. A malformed number at the
-bottom is reported first, at the depths 31 to 60 that were measured.
+Depth is the number of ``L`` wrappers around the leaf: 33 or more answers the
+nesting text, 32 reaches the unused-value check (measured 2026-11-24 at 08:11
+UTC). A malformed number at the bottom is reported first, at the depths 31 to
+60 that were measured.
 
 The service follows one of two check orders (measured 2026-10-31 to
 2026-11-23, each request twice). A request on the service's older validation
@@ -27,8 +28,9 @@ the ``Select`` and ``ReturnConsumedCapacity`` clauses among them, the parameter
 mix, the request parameter checks with the ``ScanFilter`` list values, the
 key's faults (the first faulty member in the fitted member order, a value the
 service cannot read with the prefix ``The provided starting key is invalid:
-``), the faulty ``ExpressionAttributeValues`` entries and then an empty name,
-the nesting depth, the expression checks, the table. Every other request
+``), the faulty ``ExpressionAttributeValues`` entries (an entry nested 33 levels
+among them) and then an empty name, the expression checks, the table. Every
+other request
 follows order R: the constraint clauses in the newer form, the
 ``ReturnConsumedCapacity`` enum, the parameter mix, the
 ``ExpressionAttributeNames`` checks, the numbers and then the set faults of
@@ -62,8 +64,9 @@ from scan_request_support import (
     ITEMS, MIX, LENGTH, LENGTH_AND_LIMIT, NUMERIC_BOB, RCC_ENUM, NESTING, UNUSED, LIMIT, SEGMENT,
     SELECT_ENUM, SELECT_SPECIFIC, UNUSED_U, KEY_PREFIX, EMPTY_KEY_VALUE, TWO_DESCRIPTORS, INVALID,
     NS_EMPTY, SS_EMPTY, BS_EMPTY, NS_DUP, SS_DUP, NUMERIC_FRED, EAV_NO_EXPRESSION, VALID_FILTER,
-    BOB_FILTER, ONE, BOB, BOB_KEY, EAV_EMPTY_E, EAV_EMPTY_A, EAV_TWO_A, EAN_NO_EXPRESSION, CONDOP,
-    UNDEFINED_ZZ, BEGINS_N, EMPTY_KEY, FILTER_P, NEST32_S, NEST32_N, nest, unused_value, _scan,
+    BOB_FILTER, ONE, BOB, BOB_KEY, EAV_EMPTY_E, EAV_EMPTY_A, EAV_TWO_A, EAV_NESTING_D,
+    EAN_NO_EXPRESSION, CONDOP,
+    UNDEFINED_ZZ, BEGINS_N, EMPTY_KEY, FILTER_P, NEST33_S, NEST33_N, nest, unused_value, _scan,
     _validation_message, table, n_table, ab_table, pa_table, it_table,
 )
 
@@ -239,9 +242,10 @@ N_KEY_FAULTS = [
 TWO_ORDERS = [
     # Order U: an unreadable ExpressionAttributeValues entry, read or unused,
     # after the Select enum, the request parameter checks and the key's faults,
-    # ahead of the nesting check, the unused values and the table.
+    # ahead of the unused values and the table. An entry nested 33 levels is a
+    # fault of its own, named in the hash order: :d ahead of :e (2026-11-24).
     ("B4-7", FILTER_P + ', "ExpressionAttributeValues": {":p": {"S": "x"}, ":d": '
-     + NEST32_N + ', ":e": {}}', EAV_EMPTY_E),
+     + NEST33_N + ', ":e": {}}', EAV_NESTING_D),
     ("B4-7-flat", FILTER_P + ', "ExpressionAttributeValues": {":p": {"S": "x"}, ":e": {}}',
      EAV_EMPTY_E),
     ("B4-7-X", FILTER_P + ', "ExpressionAttributeValues": {":p": {"S": "x"}, ":e": {"X": "1"}}',
@@ -265,22 +269,23 @@ TWO_ORDERS = [
      ("startswith", EAV_NO_EXPRESSION)),
     ("B4-7-noexpr-two", '"ExpressionAttributeValues": {":e": {"S": "x", "N": "1"}}',
      ("startswith", EAV_NO_EXPRESSION)),
-    # Order U: the nesting check after the key's faults (the three b.*.nesting
-    # rows of 2026-11-05 and the nest-*-key-empty rows).
+    # Order U: the nested entry after the key's faults (the three b.*.nesting
+    # rows of 2026-11-05 and the nest-*-key-empty rows, sent with 33 levels on
+    # 2026-11-24).
     ("nesting-beside-empty-key", FILTER_P + ', "ExpressionAttributeValues": {":p": '
-     + NEST32_S + '}, ' + EMPTY_KEY, EMPTY_KEY_VALUE),
+     + NEST33_S + '}, ' + EMPTY_KEY, EMPTY_KEY_VALUE),
     ("nesting-beside-type-X-key", FILTER_P + ', "ExpressionAttributeValues": {":p": '
-     + NEST32_S + '}, "ExclusiveStartKey": {"pk": {"X": "1"}, "sk": {"S": "x"}}',
+     + NEST33_S + '}, "ExclusiveStartKey": {"pk": {"X": "1"}, "sk": {"S": "x"}}',
      EMPTY_KEY_VALUE),
     ("nesting-beside-two-descriptors-key", FILTER_P + ', "ExpressionAttributeValues": {":p": '
-     + NEST32_S + '}, "ExclusiveStartKey": {"pk": {"S": "x", "N": "1"}, "sk": {"S": "x"}}',
+     + NEST33_S + '}, "ExclusiveStartKey": {"pk": {"S": "x", "N": "1"}, "sk": {"S": "x"}}',
      TWO_DESCRIPTORS),
     ("nest-read-N-key-empty", FILTER_P + ', "ExpressionAttributeValues": {":p": '
-     + NEST32_N + '}, ' + EMPTY_KEY, EMPTY_KEY_VALUE),
+     + NEST33_N + '}, ' + EMPTY_KEY, EMPTY_KEY_VALUE),
     ("nest-unused-S-key-empty", FILTER_P + ', "ExpressionAttributeValues": {":p": {"S": "x"}, '
-     '":d": ' + NEST32_S + '}, ' + EMPTY_KEY, EMPTY_KEY_VALUE),
+     '":d": ' + NEST33_S + '}, ' + EMPTY_KEY, EMPTY_KEY_VALUE),
     ("nest-unused-N-key-empty", FILTER_P + ', "ExpressionAttributeValues": {":p": {"S": "x"}, '
-     '":d": ' + NEST32_N + '}, ' + EMPTY_KEY, EMPTY_KEY_VALUE),
+     '":d": ' + NEST33_N + '}, ' + EMPTY_KEY, EMPTY_KEY_VALUE),
     # Order U: the parameter mix and the other request parameter checks ahead of
     # the key's shape fault (arity-key-empty-and-eav-noexpr).
     ("mix-beside-empty-key", '"ScanFilter": {"a": {"ComparisonOperator": "EQ", '
@@ -290,16 +295,16 @@ TWO_ORDERS = [
      '"AttributeValueList": []}}, "ExpressionAttributeNames": {"#a": "a"}, ' + EMPTY_KEY,
      EAN_NO_EXPRESSION),
     # Order R: the nesting check ahead of the Select enum, the filter syntax,
-    # the no-expression check and the key's number.
+    # the no-expression check and the key's number (33 levels, 2026-11-24).
     ("nest-unused-S-select-bad", FILTER_P + ', "ExpressionAttributeValues": {":p": {"S": "x"}, '
-     '":d": ' + NEST32_S + '}, "Select": "BAD"', NESTING),
+     '":d": ' + NEST33_S + '}, "Select": "BAD"', NESTING),
     ("nest-read-S-filter-syntax", '"FilterExpression": "a = = :p", "ExpressionAttributeValues": '
-     '{":p": ' + NEST32_S + '}', NESTING),
+     '{":p": ' + NEST33_S + '}', NESTING),
     ("nest-read-S-eav-noexpr-sibling", '"ProjectionExpression": "a", '
-     '"ExpressionAttributeValues": {":p": ' + NEST32_S + '}', NESTING),
-    ("nest-read-S-key-bob", FILTER_P + ', "ExpressionAttributeValues": {":p": ' + NEST32_S
+     '"ExpressionAttributeValues": {":p": ' + NEST33_S + '}', NESTING),
+    ("nest-read-S-key-bob", FILTER_P + ', "ExpressionAttributeValues": {":p": ' + NEST33_S
      + '}, ' + BOB_KEY, NESTING),
-    ("B4-5a", '"ExpressionAttributeValues": {":d": ' + NEST32_N + '}', NESTING),
+    ("B4-5a", '"ExpressionAttributeValues": {":d": ' + NEST33_N + '}', NESTING),
     # Order R: a set fault in ExpressionAttributeValues ahead of the
     # no-expression check; the set texts with the members JSON-quoted.
     ("B4-7-noexpr-NSe", '"ExpressionAttributeValues": {":e": {"NS": []}}', NS_EMPTY),
@@ -419,8 +424,8 @@ class TestExclusiveStartKey:
     def test_the_other_checks_come_first(self, dynamodb_client, table, fields, expected):
         assert _validation_message(*_scan(dynamodb_client, table, fields)) == expected
 
-    def test_32_levels_are_refused_ahead_of_the_key(self, dynamodb_client, table):
-        fields = BOB_KEY + ", " + unused_value(nest(ONE, 32))
+    def test_33_levels_are_refused_ahead_of_the_key(self, dynamodb_client, table):
+        fields = BOB_KEY + ", " + unused_value(nest(ONE, 33))
         assert _validation_message(*_scan(dynamodb_client, table, fields)) == NESTING
 
     def test_the_select_rule_is_checked_ahead_of_the_key(self, dynamodb_client, table):
@@ -580,19 +585,19 @@ class TestTwoOrders:
 class TestNestingDepth:
     """``ExpressionAttributeValues`` nested in lists."""
 
-    @pytest.mark.parametrize("levels", [32, 33, 40, 60])
-    def test_a_valid_number_at_the_bottom_is_refused_from_32_levels(
+    @pytest.mark.parametrize("levels", [33, 34, 40, 60])
+    def test_a_valid_number_at_the_bottom_is_refused_from_33_levels(
             self, dynamodb_client, table, levels):
         fields = unused_value(nest(ONE, levels))
         assert _validation_message(*_scan(dynamodb_client, table, fields)) == NESTING
 
-    def test_31_levels_reach_the_unused_value_check(self, dynamodb_client, table):
-        fields = unused_value(nest(ONE, 31))
+    def test_32_levels_reach_the_unused_value_check(self, dynamodb_client, table):
+        fields = unused_value(nest(ONE, 32))
         assert _validation_message(*_scan(dynamodb_client, table, fields)) == UNUSED
 
-    def test_32_levels_are_refused_ahead_of_the_select_enum(self, dynamodb_client, table):
-        # Measured 2026-10-30 12:40 UTC.
-        fields = unused_value(nest(ONE, 32)) + ', "Select": "BAD"'
+    def test_33_levels_are_refused_ahead_of_the_select_enum(self, dynamodb_client, table):
+        # Measured 2026-11-24 08:46 UTC.
+        fields = unused_value(nest(ONE, 33)) + ', "Select": "BAD"'
         assert _validation_message(*_scan(dynamodb_client, table, fields)) == NESTING
 
     @pytest.mark.parametrize("levels", [31, 32, 33, 40, 60])
@@ -601,7 +606,7 @@ class TestNestingDepth:
         fields = unused_value(nest(BOB, levels))
         assert _validation_message(*_scan(dynamodb_client, table, fields)) == NUMERIC_BOB
 
-    def test_a_map_at_32_levels_with_a_malformed_number_is_reported_first(
+    def test_a_map_at_33_levels_with_a_malformed_number_is_reported_first(
             self, dynamodb_client, table):
-        fields = unused_value({"M": {"k": nest(BOB, 31)}})
+        fields = unused_value({"M": {"k": nest(BOB, 32)}})
         assert _validation_message(*_scan(dynamodb_client, table, fields)) == NUMERIC_BOB

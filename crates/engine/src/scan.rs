@@ -25,8 +25,7 @@ use crate::index_helpers::{
 use crate::legacy_filter::desugar_filter;
 use crate::read_helpers::{PostRead, read_page};
 use crate::scan_request::{
-    CheckOrder, ExpressionValuesBody, ScanFilterBody, SelectBody, StartKeyBody, ValuesDepth,
-    member_orders,
+    CheckOrder, ExpressionValuesBody, ScanFilterBody, SelectBody, StartKeyBody, member_orders,
 };
 use crate::serialize_output;
 use crate::start_key::validate_scan_exclusive_start_key;
@@ -39,42 +38,17 @@ use crate::{DispatchMetrics, DispatchResult};
 /// `raw_body` is the request text `body` was parsed from; the checks read the
 /// request's order of the `ExclusiveStartKey` members, the
 /// `ExpressionAttributeValues` entries and the `ScanFilter` conditions from it
-/// in one pass (see `scan_request::member_orders`).
+/// in one pass (see `scan_request::member_orders`). The `Scan` a PartiQL
+/// `SELECT` is translated into has no request text and passes an empty one,
+/// so the parsed body's member order stands in for the request's order.
 ///
 /// # Errors
 ///
 /// Returns `DynamoDbError` for validation failures, missing tables, or storage errors.
+#[allow(clippy::cast_possible_wrap)] // item counts won't exceed i64::MAX
 pub async fn handle_scan(
     body: Value,
     raw_body: &[u8],
-    ctx: &OperationContext,
-) -> Result<DispatchResult, DynamoDbError> {
-    run_scan(body, raw_body, ValuesDepth::Checked, ctx).await
-}
-
-/// Handle the `Scan` a PartiQL `SELECT` is translated into: the checks and the
-/// read of [`handle_scan`], except the nesting depth of the
-/// `ExpressionAttributeValues` entries, which is not checked in either order
-/// (see [`ValuesDepth`]). The body has no request text, so the parsed body's
-/// member order stands in for the request's order.
-///
-/// # Errors
-///
-/// Returns `DynamoDbError` for validation failures, missing tables, or storage errors.
-pub(crate) async fn handle_partiql_scan(
-    body: Value,
-    ctx: &OperationContext,
-) -> Result<DispatchResult, DynamoDbError> {
-    run_scan(body, &[], ValuesDepth::Unchecked, ctx).await
-}
-
-/// The checks and the read of a `Scan` body, with the nesting depth of the
-/// `ExpressionAttributeValues` entries checked as `depth` says.
-#[allow(clippy::cast_possible_wrap)] // item counts won't exceed i64::MAX
-async fn run_scan(
-    body: Value,
-    raw_body: &[u8],
-    depth: ValuesDepth,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
     // The checks run in one of the service's two orders, measured 2026-10-25
@@ -109,25 +83,18 @@ async fn run_scan(
     // are checked after the no-expression checks and ahead of
     // ConditionalOperator; after the request parameter checks come the
     // ExclusiveStartKey's faults, then the faulty ExpressionAttributeValues
-    // entries in the same member order (each in the invalid-value form) and an
-    // empty name, then the nesting depth, then the expression and request
-    // checks and the table. The server runs the checks up to the Select enum
-    // in order R, and up to the faulty entries and the empty name in order
-    // U, ahead of the IAM decision (see `checked_body`).
+    // entries in the same member order (each in the invalid-value form, an
+    // entry nested too deep among them) and an empty name, then the expression
+    // and request checks and the table. The server runs the checks up to the
+    // Select enum in order R, and up to the faulty entries and the empty name
+    // in order U, ahead of the IAM decision (see `checked_body`).
     let CheckedBody {
         order,
         input,
         has_proj_expr,
         legacy_filter,
         start_key,
-    } = checked_body(body, raw_body, depth)?;
-    // Order U: the nesting depth, after the faulty entries and an empty name.
-    if order == CheckOrder::Unreadable
-        && depth == ValuesDepth::Checked
-        && let Some(ref values) = input.expression_attribute_values
-    {
-        extenddb_core::validation::validate_attribute_values_nesting_depth(values.values())?;
-    }
+    } = checked_body(body, raw_body)?;
 
     let maps = build_expression_maps(
         input.expression_attribute_names.as_ref(),
@@ -537,11 +504,10 @@ pub(crate) struct CheckedBody {
     start_key: StartKeyBody,
 }
 
-/// The checks of a `Scan` body in the order of [`run_scan`], up to the
+/// The checks of a `Scan` body in the order of [`handle_scan`], up to the
 /// `Select` enum in order R and up to the faulty `ExpressionAttributeValues`
-/// entries and an empty name in order U, with the nesting depth of order R
-/// checked as `depth` says. `raw_body` is the request text `body` was parsed
-/// from (see `scan_request::member_orders`).
+/// entries and an empty name in order U. `raw_body` is the request text
+/// `body` was parsed from (see `scan_request::member_orders`).
 ///
 /// The service answers an invalid `Select` (order R) and an entry with an
 /// unknown type descriptor (order U) with its `ValidationException` to a
@@ -554,12 +520,8 @@ pub(crate) struct CheckedBody {
 ///
 /// Returns `DynamoDbError::ValidationException` with the service's text, or
 /// `DynamoDbError::SerializationException` for a body of the wrong shape.
-pub(crate) fn checked_body(
-    mut body: Value,
-    raw_body: &[u8],
-    depth: ValuesDepth,
-) -> Result<CheckedBody, DynamoDbError> {
-    let order = crate::scan_request::request_checks(&body, depth)?;
+pub(crate) fn checked_body(mut body: Value, raw_body: &[u8]) -> Result<CheckedBody, DynamoDbError> {
+    let order = crate::scan_request::request_checks(&body)?;
     // Limit, Segment and TotalSegments are read as the service reads them,
     // from any JSON number the body parser reads; see `int32_member`.
     crate::int32_member::saturate(&mut body, &crate::int32_member::SCAN_RANGES)?;
@@ -618,9 +580,9 @@ pub(crate) fn checked_body(
     match order {
         CheckOrder::Unreadable => {
             // The key's faults, then the faulty ExpressionAttributeValues
-            // entries in the fitted order (each in the invalid-value form) and
-            // an empty name; `run_scan` checks the nesting depth next
-            // (measured 2026-10-31, 2026-11-05 and 2026-11-19; see
+            // entries in the fitted order (each in the invalid-value form, an
+            // entry nested too deep among them) and an empty name (measured
+            // 2026-10-31, 2026-11-05, 2026-11-19 and 2026-11-24; see
             // `scan_request::StartKeyBody` and `ExpressionValuesBody`).
             start_key.validate(order)?;
             expression_values.validate()?;
