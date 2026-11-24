@@ -32,7 +32,7 @@ import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-from conftest import scoped_table
+from conftest import call_with_handshake_retry, scoped_table
 
 WORKERS = 4
 TXNS_PER_WORKER = 25
@@ -103,7 +103,9 @@ def _run(client, builders) -> tuple[int, int, list[dict]]:
             with lock:
                 attempts += 1
             try:
-                client.transact_write_items(TransactItems=builders[which]())
+                call_with_handshake_retry(
+                    client.transact_write_items, TransactItems=builders[which]()
+                )
                 with lock:
                     committed += 1
             except ClientError as e:

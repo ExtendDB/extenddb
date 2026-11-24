@@ -219,7 +219,7 @@ These are the core CRUD operations. All must be fully implemented.
 **Key requirements:**
 - REQ-STREAM-001: Support all four stream view types: KEYS_ONLY, NEW_IMAGE, OLD_IMAGE, NEW_AND_OLD_IMAGES
 - REQ-STREAM-002: Stream records must capture changes from PutItem, UpdateItem, DeleteItem, BatchWriteItem, TransactWriteItems
-- REQ-STREAM-003: Support shard iterator types: TRIM_HORIZON, LATEST, AT_SEQUENCE_NUMBER, AFTER_SEQUENCE_NUMBER
+- REQ-STREAM-003: Support shard iterator types: TRIM_HORIZON, LATEST, AT_SEQUENCE_NUMBER, AFTER_SEQUENCE_NUMBER, AT_TIMESTAMP
 - REQ-STREAM-004: Stream records must be ordered by sequence number within a shard
 - REQ-STREAM-005: Detailed shard management and retention design is deferred
 
@@ -668,6 +668,6 @@ DynamoDB SDKs support optional endpoint discovery via the `DescribeEndpoints` op
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

@@ -30,9 +30,11 @@ use std::time::{Duration, Instant};
 use extenddb_storage::migrations::{MigrationError, MigrationId, StatusNote, StoreKind, StoreRef};
 use sqlx::PgPool;
 use sqlx::postgres::PgConnectOptions;
+use zeroize::Zeroizing;
 
 use super::PostgresTarget;
-use super::connect::{RUNNER_APPLICATION_PREFIX, one_connection, relation_exists, sql_error};
+use super::connect::{RUNNER_APPLICATION_PREFIX, one_connection, sql_error};
+use super::connection_row::connection_row;
 
 /// How often the wait for an earlier runner looks again.
 const POLL: Duration = Duration::from_millis(200);
@@ -131,18 +133,6 @@ pub(crate) async fn wait_for_earlier_runners(
     }
 }
 
-/// The catalog's `data_database_connection_string` row; `None` when the
-/// catalog has no settings table or no such row.
-async fn connection_row(catalog: &PgPool) -> Result<Option<String>, MigrationError> {
-    if !relation_exists(catalog, "settings").await? {
-        return Ok(None);
-    }
-    sqlx::query_scalar("SELECT value FROM settings WHERE key = 'data_database_connection_string'")
-        .fetch_optional(catalog)
-        .await
-        .map_err(|e| sql_error("read data_database_connection_string", &e))
-}
-
 /// A status session (read-only, named `extenddb status`) on `options`.
 pub(crate) async fn status_session(
     options: &PgConnectOptions,
@@ -168,9 +158,11 @@ pub(crate) async fn close_status(pool: PgPool) {
 }
 
 /// [`connection_row`] on a status session of its own.
-async fn read_connection_row(target: &PostgresTarget) -> Result<Option<String>, MigrationError> {
+async fn read_connection_row(
+    target: &PostgresTarget,
+) -> Result<Option<Zeroizing<String>>, MigrationError> {
     let pool = status_session(&target.catalog, target.connect_timeout).await?;
-    let row = connection_row(&pool).await;
+    let row = connection_row(target, &pool).await;
     close_status(pool).await;
     row
 }
@@ -180,23 +172,25 @@ async fn read_connection_row(target: &PostgresTarget) -> Result<Option<String>, 
 /// when the catalog has the row; otherwise the catalog's server and
 /// credentials with the target's data database. A target whose data
 /// database was given on the command line keeps that name on the row's
-/// server.
+/// server. In a catalog with a key ring the row is opened first
+/// ([`connection_row`]).
 ///
 /// # Errors
 ///
 /// The row is not a PostgreSQL URL, or it names another data database than
-/// the target's, which was not given on the command line.
+/// the target's, which was not given on the command line, or the catalog
+/// has a key ring and the target's key does not open the row.
 pub(crate) async fn served_data(
     target: &PostgresTarget,
     catalog: &PgPool,
 ) -> Result<PgConnectOptions, MigrationError> {
-    served_from(target, connection_row(catalog).await?)
+    served_from(target, connection_row(target, catalog).await?.as_deref())
 }
 
 /// [`served_data`] from the row's value.
 fn served_from(
     target: &PostgresTarget,
-    row: Option<String>,
+    row: Option<&String>,
 ) -> Result<PgConnectOptions, MigrationError> {
     let Some(row) = row.filter(|r| !r.is_empty()) else {
         return Ok(target.data());
@@ -233,7 +227,20 @@ fn served_from(
 pub async fn served_data_options(
     target: &PostgresTarget,
 ) -> Result<PgConnectOptions, MigrationError> {
-    served_from(target, read_connection_row(target).await?)
+    served_from(target, read_connection_row(target).await?.as_deref())
+}
+
+/// The catalog's data database connection string as the server connects
+/// with it, opened with the target's key in a catalog with a key ring
+/// ([`connection_row`]); `None` when the catalog has no such row.
+///
+/// # Errors
+///
+/// As [`connection_row`], or the catalog cannot be reached.
+pub async fn data_connection_string(
+    target: &PostgresTarget,
+) -> Result<Option<Zeroizing<String>>, MigrationError> {
+    read_connection_row(target).await
 }
 
 /// For the server: refuse a catalog with no `data_database_connection_string`
@@ -242,9 +249,10 @@ pub async fn served_data_options(
 ///
 /// # Errors
 ///
-/// The row is missing or empty, or the catalog cannot be read.
+/// The row is missing or empty, the catalog cannot be read, or the catalog
+/// has a key ring and the target's key does not open the row.
 pub async fn require_data_connection_row(target: &PostgresTarget) -> Result<(), MigrationError> {
-    match read_connection_row(target).await? {
+    match read_connection_row(target).await?.as_deref() {
         Some(value) if !value.is_empty() => Ok(()),
         _ => Err(MigrationError::Refused(format!(
             "the catalog database {} has no data_database_connection_string row, which \

@@ -23,7 +23,7 @@ On PostgreSQL, the data database connection string is stored in the catalog's `s
 | `tables` | DynamoDB table metadata. Composite PK: `(account_id, table_name)`. Stores key schema, attribute definitions, billing mode, stream spec, status, ARN, and TTL config. |
 | `indexes` | GSI/LSI metadata. FK on `table_id` (UUID) with CASCADE delete. |
 | `tags` | Resource tags. PK: `(resource_arn, tag_key)`. |
-| `settings` | Key-value store for catalog version, data DB URL, the AES-256-GCM key that encrypts access key secrets (`encryption_key`), and runtime settings. |
+| `settings` | Key-value store for catalog version, data DB URL, the AES-256-GCM key that encrypts access key secrets (`encryption_key`, or with `[auth.encryption] key_file` the `encryption_key_ring` row holding that key wrapped under a key-encryption key kept in a file), and runtime settings. |
 | `schema_history` | Migration tracking. Records which SQL files have been applied. |
 | `admin_users` | Admin credentials (bcrypt-hashed passwords). |
 | `iam_users` | IAM users scoped to accounts. Optional console password. |
@@ -106,9 +106,9 @@ extenddb uses SigV4 signature verification with a local IAM credential store. Th
 Full SigV4 signature verification:
 
 1. Extract `Authorization` header components (credential, signed headers, signature)
-2. Look up access key in the credential store (cached in memory, database on a miss; encryption key cached at startup)
+2. Look up access key in the credential store (the signing key cached in locked memory, database on a miss; the key that decrypts secrets is loaded at startup)
 3. Reconstruct the canonical request and string-to-sign
-4. Derive the signing key: `HMAC-SHA256(HMAC-SHA256(HMAC-SHA256(HMAC-SHA256("AWS4" + secret, date), region), service), "aws4_request")`
+4. Derive the signing key on a cache miss: `HMAC-SHA256(HMAC-SHA256(HMAC-SHA256(HMAC-SHA256("AWS4" + secret, date), region), service), "aws4_request")`, then wipe the secret and keep the signing key in the locked key store for that scope date; a cache hit reuses it
 5. Compare computed signature with the provided signature (constant-time comparison)
 6. Return `AuthIdentity::User` or `AuthIdentity::RoleSession` with account context
 
@@ -126,9 +126,9 @@ Policy conditions support all IAM condition operators: `StringEquals`, `StringNo
 
 ### Credential Storage
 
-Access key secrets are encrypted at rest using AES-256-GCM. The encryption key is generated during `extenddb init` and stored in the `settings` table under the key `encryption_key`. Each access key record stores the encrypted secret and a unique nonce.
+Access key secrets are encrypted at rest using AES-256-GCM. By default the encryption key is generated during `extenddb init` and stored in the `settings` table under the key `encryption_key`, with the access key ID as the additional authenticated data (AAD). With `[auth.encryption] key_file` set, a key-encryption key (KEK) in that file wraps a data encryption key (DEK), the `settings` row `encryption_key_ring` holds the wrapped DEK, and each secret's AAD binds it to its row (catalog id, table, access key ID, account, principal, session name and expiry). Each access key record stores the encrypted secret and a unique nonce. The Security Model's Credential Storage section has both modes.
 
-Credential lookups (access key ID → decrypted secret) go through each server's in-memory credential cache; a miss reads the database. See Credential and Policy Caching in the Security Model. The server reads the encryption key that decrypts secrets once, at startup. extenddb never changes the key. A change made by hand in the `settings` table takes effect at the next restart. See Credential Storage in the Security Model, and Caching Design below.
+Credential lookups (access key ID → SigV4 signing key) go through each server's in-memory credential cache; a miss reads the database, decrypts the secret, derives the signing key and wipes the secret. See Credential and Policy Caching in the Security Model. The server reads the key that decrypts secrets once, at startup, into the locked key store. `extenddb encryption-key` switches a deployment to a KEK file, changes the KEK and replaces the DEK (the admin guide's Encryption Key section); a change takes effect at the next restart. See Credential Storage in the Security Model, and Caching Design below.
 
 ## DynamoDB Streams Internals
 
@@ -150,6 +150,7 @@ Each stream has a fixed set of shards (currently 4 shards per stream). On Postgr
 - `LATEST`: Start from the most recent record
 - `AT_SEQUENCE_NUMBER`: Start at a specific sequence number
 - `AFTER_SEQUENCE_NUMBER`: Start after a specific sequence number
+- `AT_TIMESTAMP`: Start at the first record created at or after the `Timestamp` (epoch seconds, rounded to the millisecond)
 
 Iterators expire after 15 minutes of inactivity.
 
@@ -190,7 +191,7 @@ extenddb caches a small set of operational settings in memory to avoid per-reque
 | Setting | Mechanism | Refresh | Justification |
 |---------|-----------|---------|---------------|
 | `index_propagation_delay_ms` | `AtomicU64` | Background poller every 30s | Write-path hot path; briefly-stale value only affects GSI propagation timing |
-| `encryption_key` | `Arc<str>` loaded at startup | Never: read at startup, so a change made by hand takes a restart | Decryption key for access key secrets. extenddb generates it once and never changes it |
+| `encryption_key` / `encryption_key_ring` | One slot of the locked key store, loaded at startup | Never: read at startup, so a change takes a restart | Key that decrypts access key secrets. `extenddb init` generates it; `extenddb encryption-key` replaces it, with every server stopped when stored secrets are rewritten |
 | `log_level` / `log_destination` | Tracing filter reload | Background poller every 30s | Observability tuning; stale value only delays log level changes |
 | `throttling_enabled` | `AtomicBool` | Background poller every 30s | Capacity management toggle; briefly-stale is safe |
 
@@ -233,6 +234,6 @@ Caching of operational settings is currently unconditional. If issues arise (e.g
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

@@ -26,7 +26,9 @@ signed, so no client library recurses to produce them.
 Before authentication the service checks only a body's syntax, at every depth:
 a deep body with a syntax fault is a SerializationException unsigned or badly
 signed, and a complete deep body gets the authentication error (us-east-1,
-2026-11-19).
+2026-11-19). That check is looser than JSON's grammar in three lexemes: a
+number such as `01`, `1.`, `1e` or `-`, the escape `\\u12G4`, and NUL, VT or FF
+between tokens all reach authentication (us-east-1, 2026-11-24).
 """
 
 from __future__ import annotations
@@ -49,6 +51,23 @@ NEST_FULL = (
     "Attributes in the item have nested levels beyond supported limit"
 )
 SERIALIZATION_TYPE = "com.amazon.coral.service#SerializationException"
+LEAF = '{"S":"leaf"}'
+
+# Leaves the service's check before authentication passes where JSON's grammar
+# refuses them: the numbers `01`, `1.`, `1e` and `-`, the escape `\u12G4`, and
+# form feed, NUL and vertical tab before a value (us-east-1, 2026-11-24, at 63
+# and 20000 wrappers, 2 of 2 sends each: unsigned
+# MissingAuthenticationTokenException, badly signed InvalidSignatureException).
+LOOSE_LEAVES = {
+    "number-01": '{"S":01}',
+    "number-1.": '{"S":1.}',
+    "number-1e": '{"S":1e}',
+    "number-minus": '{"S":-}',
+    "escape-u12G4": '{"S":"le\\u12G4af"}',
+    "form-feed-before-value": '{"S":\x0c"leaf"}',
+    "nul-before-value": '{"S":\x00"leaf"}',
+    "vertical-tab-before-value": '{"S":\x0b"leaf"}',
+}
 
 
 @pytest.fixture(scope="module")
@@ -82,10 +101,11 @@ def _put_error(client, table_name: str, data: dict) -> dict:
     return exc_info.value.response["Error"]
 
 
-def _raw_put_body(table_name: str, pk: str, wrappers: int) -> bytes:
+def _raw_put_body(table_name: str, pk: str, wrappers: int, leaf: str = LEAF) -> bytes:
     """A PutItem body whose `data` attribute is `wrappers` single-key maps around
-    a string leaf, assembled as raw JSON so nothing recurses to build it."""
-    data = '{"M":{"n":' * wrappers + '{"S":"leaf"}' + "}}" * wrappers
+    `leaf`, a string leaf unless a row puts a fault there, assembled as raw JSON
+    so nothing recurses to build it."""
+    data = '{"M":{"n":' * wrappers + leaf + "}}" * wrappers
     return (
         '{"TableName":'
         + json.dumps(table_name)
@@ -250,22 +270,38 @@ def _unauthenticated_post(
 
 @pytest.mark.parametrize("signing", ["unsigned", "bad-signature"])
 @pytest.mark.parametrize(
-    "wrappers",
-    [None, 63, 200, 2000, 20000],
-    ids=lambda w: "x-then-6000-openers" if w is None else f"truncated-{w}",
+    "wrappers, leaf",
+    [
+        pytest.param(None, None, id="x-then-6000-openers"),
+        pytest.param(63, None, id="truncated-63"),
+        pytest.param(200, None, id="truncated-200"),
+        pytest.param(2000, None, id="truncated-2000"),
+        pytest.param(20000, None, id="truncated-20000"),
+        pytest.param(200, '{"S":"le\\u"}', id="u-before-closing-quote"),
+        pytest.param(200, '{"S":\x01"leaf"}', id="soh-before-value"),
+        pytest.param(200, '{"S":tru}', id="tru"),
+        pytest.param(200, '{"S" "leaf"}', id="missing-colon"),
+        pytest.param(200, '{"S":"leaf" "T":"x"}', id="missing-comma"),
+        pytest.param(200, '{"S":"le\x01af"}', id="control-byte-in-string"),
+        pytest.param(200, '{"S":"le\\qaf"}', id="unknown-escape"),
+    ],
 )
 def test_a_malformed_deep_body_is_refused_before_authentication(
-    dynamodb_client, endpoint_url, table, wrappers, signing
+    dynamodb_client, endpoint_url, table, wrappers, leaf, signing
 ):
     # Each body nests past the 127 levels ExtendDB parses before
-    # authentication and has a syntax fault. The service answers each with a
-    # 400 SerializationException and no message field, unsigned and badly
-    # signed (2 of 2 sends per body and signing, us-east-1, 2026-11-19).
-    body = (
-        b"x" + b"[" * 6000
-        if wrappers is None
-        else _raw_put_body(table, "malformed", wrappers)[:-1]
-    )
+    # authentication and has a syntax fault: `x` before the openers, the body
+    # without its last byte, or the fault in the leaf. The service answers
+    # each with a 400 SerializationException and no message field, unsigned
+    # and badly signed (2 of 2 sends per body and signing, us-east-1: the
+    # first five rows 2026-11-19, the control byte and the unknown escape
+    # 2026-11-20, the other five 2026-11-24).
+    if wrappers is None:
+        body = b"x" + b"[" * 6000
+    elif leaf is None:
+        body = _raw_put_body(table, "malformed", wrappers)[:-1]
+    else:
+        body = _raw_put_body(table, "malformed", wrappers, leaf)
     resp = _unauthenticated_post(dynamodb_client, endpoint_url, body, signing)
     assert resp.status_code == 400, resp.text
     assert _is_messageless_serialization_error(resp.json()), resp.text
@@ -273,19 +309,30 @@ def test_a_malformed_deep_body_is_refused_before_authentication(
 
 @pytest.mark.parametrize("signing", ["unsigned", "bad-signature"])
 @pytest.mark.parametrize(
-    "wrappers, tail",
-    [(63, b""), (2000, b""), (20000, b""), (2000, b"x")],
-    ids=["complete-63", "complete-2000", "complete-20000", "complete-2000-then-x"],
+    "wrappers, leaf, tail",
+    [
+        pytest.param(63, LEAF, b"", id="complete-63"),
+        pytest.param(2000, LEAF, b"", id="complete-2000"),
+        pytest.param(20000, LEAF, b"", id="complete-20000"),
+        pytest.param(2000, LEAF, b"x", id="complete-2000-then-x"),
+    ]
+    + [
+        pytest.param(wrappers, leaf, b"", id=f"{name}-{wrappers}")
+        for wrappers in (63, 20000)
+        for name, leaf in LOOSE_LEAVES.items()
+    ],
 )
 def test_a_complete_deep_body_reaches_authentication(
-    dynamodb_client, endpoint_url, table, wrappers, tail, signing
+    dynamodb_client, endpoint_url, table, wrappers, leaf, tail, signing
 ):
     # The check before authentication reads one complete JSON value at any
-    # depth and ignores bytes after it, as the service's does: unsigned, each
-    # body is MissingAuthenticationTokenException, and badly signed
-    # InvalidSignatureException (2 of 2 sends each, us-east-1, 2026-11-19).
-    # ExtendDB's type for the first is MissingAuthenticationToken (#1075).
-    body = _raw_put_body(table, "unauthenticated", wrappers) + tail
+    # depth and ignores bytes after it, as the service's does, and passes each
+    # leaf of LOOSE_LEAVES: unsigned, each body is
+    # MissingAuthenticationTokenException, and badly signed
+    # InvalidSignatureException (2 of 2 sends each, us-east-1, 2026-11-19 for
+    # the first four rows and 2026-11-24 for the rest). ExtendDB's type for the
+    # first is MissingAuthenticationToken (#1075).
+    body = _raw_put_body(table, "unauthenticated", wrappers, leaf) + tail
     resp = _unauthenticated_post(dynamodb_client, endpoint_url, body, signing)
     assert resp.status_code == 400, resp.text
     expected = (

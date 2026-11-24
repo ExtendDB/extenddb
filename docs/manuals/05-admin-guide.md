@@ -220,7 +220,7 @@ Took the maintenance claim as "extenddb backup sync on <host> (pid <pid>)".
 The configured store's check passes (store id <store id>); each server finds it so at its next reconciler cycle.
 ```
 
-`extenddb backup migrate-legacy <arn>` or `--all` (exactly one) copies in-catalog backups into the configured store under their own ARNs, names, backup ids and creation times, and replaces each by its catalog row, AVAILABLE and unowned as a row `backup sync` inserts (the backup manual's [Legacy backups](14-backup-and-restore.md#legacy-backups) section gives what it refuses and the way out for each). `<arn>` is checked as a backup ARN before anything is opened (exit 2) and matched as written and rebuilt in this server's region; `--all` takes every in-catalog backup of every account that is not deleted, oldest first, and then the deleted ones. It needs the configured store healthy, opens the catalog as `serve` does (on SQLite under the serve lock: stop the server first; beside it the command exits 6), takes the maintenance claim on every backend for its whole run and waits as `purge` does, so CreateBackup and RestoreTableFromBackup answer `LimitExceededException` on every instance until it ends. Per backup it refuses a backup id of the 13-digit shape a 0.1.x release issued (every backup a 0.1.x release took) before it reads anything; streams the items through the backup job's writer, each checked with the item validator under this instance's `[limits]`, into data files under the backup's prefix, then the DynamoDB manifests and `extenddb-manifest.json` (`snapshot.kind` `legacy_in_catalog`, no marker, `item_order` `unordered`, `source_backend` and `source_extenddb_version` this binary's), each object written only if its key holds nothing (an object there stops the run, left as it is; on Cassandra the items are read at consistency `ALL`); runs the deletion fence before its first put, before the manifest's write, before the replacement and before each deletion of a copy (a root whose `extenddb-store.json` names another catalog stops the run with the copy and the in-catalog backup kept); reads the prefix back as sync does and checks the item count against the in-catalog backup's twice; and only then replaces the in-catalog backup with its row in one step. Objects under a backup's prefix with no catalog row of its backup id (under any ARN) are an earlier run's when the manifest there, if any, names the backup, and are deleted through the fence before the copy is written again (a walk of the prefix that starts no removal more than two heartbeat periods after the claim's last confirmed beat; a copy the run itself deletes is deleted object by object, only what it wrote); a row of the id under another ARN, or a manifest naming another backup, refuses the backup with nothing under the prefix deleted. Under the prefix of a deleted in-catalog backup they are deleted, and once the store lists nothing there the deleted backup's in-catalog record is removed and the backup reported `deleted`; while the record is there `backup sync` does not adopt the prefix. Before the manifest's write, each deletion under a prefix, the replacement and a record's removal the command waits for one heartbeat of its claim. Each line is `migrated`, `finished` (an earlier run had written its row; what was left of the in-catalog backup is removed), already in the store, `deleted` (the backup was deleted: nothing to migrate; a note says when a stopped run's copy was deleted or the record removed), `refused` (with its reason and way out), `skipped` (CREATING, DELETING, or deleted meanwhile, during the copy included; on SQLite the command first removes a CREATING in-catalog backup, whose create is dead under the serve lock, as `purge` does, and logs that removal under `extenddb::audit`) or `failed` (a later run tries again), with its notes indented under it; a `refused` or `failed` line says "Its in-catalog backup is kept" only where one is (not for a deleted backup, nor after a replacement call whose answer did not come, nor once the claim is lost). Each backup the command deleted or replaced anything for is logged under `extenddb::audit` with the account and the ARN, whatever its line says (a `refused`, `skipped` or `failed` backup whose earlier copy it deleted, and on Cassandra every finish, included), a line that changed nothing is not, and the command's log lines go to standard output with its own. `--all` goes on past a backup it does not migrate and exits 1 at the end with the counts; a lost claim (no heartbeat confirmed within two periods counts as lost; on SQLite a beat parked on the command's own write lock still confirms), a store the writer finds unhealthy, a failed listing or catalog call and a signal (acted on before the next backup and, inside a copy, at the writer's next step, the objects recorded for the copy in progress deleted and named in a note; a replacement under way finishes first) stop it, exit 1, the claim released (the stop says the claim is released only when its release succeeded, otherwise it waits out `stale_job_after_secs` on PostgreSQL, MongoDB and Cassandra; after a lost claim it says the run no longer holds the claim, which another command may hold). A second signal exits at once with status 130 and leaves what a kill leaves: the copy in progress, which the next run deletes, and on PostgreSQL, MongoDB and Cassandra the claim held until its heartbeat is older than `stale_job_after_secs`. A store call under way when the process is stopped (SIGSTOP, a paused VM) completes on resume; the backup manual's legacy section says what it can still do. It exits 0 when every backup it reached is in the store or deleted. While an in-catalog backup holds an ARN, in any status, `backup sync` skips a prefix whose manifest names that ARN, naming the command (a prefix with no manifest yet, which a run stopped before its manifest leaves, is reported "not a complete backup: no manifest"). Its peak memory does not grow with the backup on PostgreSQL, MongoDB and Cassandra (48 to 75 MiB measured on PostgreSQL debug builds for 1,000 and for 100,000 items, 75 once beside a running server, 56 and 55 MiB on MongoDB and Cassandra measured on an earlier revision of the command, on the 16-core host above); on SQLite it measured 55 to 149 MiB for 1,000 to 250,000 items, the page cache of its connections, at most about 32 MB times `pool_size`:
+`extenddb backup migrate-legacy <arn>` or `--all` (exactly one) copies in-catalog backups into the configured store under their own ARNs, names, backup ids and creation times, and replaces each by its catalog row, AVAILABLE and unowned as a row `backup sync` inserts (the backup manual's [Legacy backups](14-backup-and-restore.md#legacy-backups) section gives what it refuses and the way out for each). `<arn>` is checked as a backup ARN before anything is opened (exit 2) and matched as written and rebuilt in this server's region; `--all` takes every in-catalog backup of every account that is not deleted, oldest first, and then the deleted ones. It needs the configured store healthy, opens the catalog as `serve` does (on SQLite under the serve lock: stop the server first; beside it the command exits 6), takes the maintenance claim on every backend for its whole run and waits as `purge` does, so CreateBackup and RestoreTableFromBackup answer `LimitExceededException` on every instance until it ends. Per backup it refuses a backup id of the 13-digit shape that 0.1.14 and earlier releases issued (every backup those releases took) before it reads anything; streams the items through the backup job's writer, each checked with the item validator under this instance's `[limits]`, into data files under the backup's prefix, then the DynamoDB manifests and `extenddb-manifest.json` (`snapshot.kind` `legacy_in_catalog`, no marker, `item_order` `unordered`, `source_backend` and `source_extenddb_version` this binary's), each object written only if its key holds nothing (an object there stops the run, left as it is; on Cassandra the items are read at consistency `ALL`); runs the deletion fence before its first put, before the manifest's write, before the replacement and before each deletion of a copy (a root whose `extenddb-store.json` names another catalog stops the run with the copy and the in-catalog backup kept); reads the prefix back as sync does and checks the item count against the in-catalog backup's twice; and only then replaces the in-catalog backup with its row in one step. Objects under a backup's prefix with no catalog row of its backup id (under any ARN) are an earlier run's when the manifest there, if any, names the backup, and are deleted through the fence before the copy is written again (a walk of the prefix that starts no removal more than two heartbeat periods after the claim's last confirmed beat; a copy the run itself deletes is deleted object by object, only what it wrote); a row of the id under another ARN, or a manifest naming another backup, refuses the backup with nothing under the prefix deleted. Under the prefix of a deleted in-catalog backup they are deleted, and once the store lists nothing there the deleted backup's in-catalog record is removed and the backup reported `deleted`; while the record is there `backup sync` does not adopt the prefix. Before the manifest's write, each deletion under a prefix, the replacement and a record's removal the command waits for one heartbeat of its claim. Each line is `migrated`, `finished` (an earlier run had written its row; what was left of the in-catalog backup is removed), already in the store, `deleted` (the backup was deleted: nothing to migrate; a note says when a stopped run's copy was deleted or the record removed), `refused` (with its reason and way out), `skipped` (CREATING, DELETING, or deleted meanwhile, during the copy included; on SQLite the command first removes a CREATING in-catalog backup, whose create is dead under the serve lock, as `purge` does, and logs that removal under `extenddb::audit`) or `failed` (a later run tries again), with its notes indented under it; a `refused` or `failed` line says "Its in-catalog backup is kept" only where one is (not for a deleted backup, nor after a replacement call whose answer did not come, nor once the claim is lost). Each backup the command deleted or replaced anything for is logged under `extenddb::audit` with the account and the ARN, whatever its line says (a `refused`, `skipped` or `failed` backup whose earlier copy it deleted, and on Cassandra every finish, included), a line that changed nothing is not, and the command's log lines go to standard output with its own. `--all` goes on past a backup it does not migrate and exits 1 at the end with the counts; a lost claim (no heartbeat confirmed within two periods counts as lost; on SQLite a beat parked on the command's own write lock still confirms), a store the writer finds unhealthy, a failed listing or catalog call and a signal (acted on before the next backup and, inside a copy, at the writer's next step, the objects recorded for the copy in progress deleted and named in a note; a replacement under way finishes first) stop it, exit 1, the claim released (the stop says the claim is released only when its release succeeded, otherwise it waits out `stale_job_after_secs` on PostgreSQL, MongoDB and Cassandra; after a lost claim it says the run no longer holds the claim, which another command may hold). A second signal exits at once with status 130 and leaves what a kill leaves: the copy in progress, which the next run deletes, and on PostgreSQL, MongoDB and Cassandra the claim held until its heartbeat is older than `stale_job_after_secs`. A store call under way when the process is stopped (SIGSTOP, a paused VM) completes on resume; the backup manual's legacy section says what it can still do. It exits 0 when every backup it reached is in the store or deleted. While an in-catalog backup holds an ARN, in any status, `backup sync` skips a prefix whose manifest names that ARN, naming the command (a prefix with no manifest yet, which a run stopped before its manifest leaves, is reported "not a complete backup: no manifest"). Its peak memory does not grow with the backup on PostgreSQL, MongoDB and Cassandra (48 to 75 MiB measured on PostgreSQL debug builds for 1,000 and for 100,000 items, 75 once beside a running server, 56 and 55 MiB on MongoDB and Cassandra measured on an earlier revision of the command, on the 16-core host above); on SQLite it measured 55 to 149 MiB for 1,000 to 250,000 items, the page cache of its connections, at most about 32 MB times `pool_size`:
 
 ```
 <INFO log line of the store check>
@@ -254,6 +254,13 @@ The third line's tail names the record's state: `was FAILED (<reason>)` or `was 
 | Key | Default | Description |
 |-----|---------|-------------|
 | `provider` | `builtin` | Auth provider: `builtin` (SigV4 + IAM). The server refuses to start with `"none"`. |
+
+#### [auth.encryption]
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `key_file` | unset | Path of the key-encryption key (KEK) file. Unset, the server encrypts stored secrets with the catalog key in the `encryption_key` row, as `extenddb init` created it. Set, it unwraps the data encryption key (DEK) from the `encryption_key_ring` row with the KEK in this file. Set it only after `extenddb encryption-key switch --yes` has run; the [Encryption Key](#encryption-key) section gives the procedure, the file format and the ownership and mode the file must have. A leading `~` expands as in the TLS key path, and the path must then be absolute: `serve` changes its working directory to `/` when it detaches, so the configuration refuses a relative path. An in-memory SQLite catalog refuses it. |
+| `require_locked_memory` | `true` | With `key_file` set, the server refuses to start when it cannot lock the memory that holds the DEK and the cached signing keys, and names the memlock limit it needs. `false` turns that refusal into a warning. Without `key_file` the server warns and starts in either case. |
 
 #### [auth.cache]
 
@@ -333,7 +340,7 @@ Managed via `extenddb settings set`. Changes take effect within 30 seconds witho
 ./target/release/extenddb settings --config extenddb.toml set log_level debug
 ```
 
-`list` and `get` mask secret values (`encryption_key`, and any key whose name
+`list` and `get` mask secret values (`encryption_key`, `encryption_key_ring`, and any key whose name
 contains `connection_string`, `password`, `secret` or `token`) as `••••••••`,
 the same mask the management API and the console print. To print the stored
 value of a secret setting, pass `--show-secret` to `get`:
@@ -343,7 +350,9 @@ value of a secret setting, pass `--show-secret` to `get`:
 ```
 
 The value is written to standard output in full, so keep it out of shell
-history, CI logs and pasted transcripts.
+history, CI logs and pasted transcripts. `set` refuses `encryption_key` and
+`encryption_key_ring`; the [Encryption Key](#encryption-key) commands are the
+one way to change them.
 
 ## IAM Management
 
@@ -707,16 +716,17 @@ DynamoDB. The `Resource` element of a policy is matched field by field, and a
 |-----------|-------------------------|
 | Item and table operations (GetItem, PutItem, Query and Scan on the base table, CreateTable, UpdateTable, DescribeTable, and so on) | `table/<name>` |
 | Query and Scan with an `IndexName` | `table/<name>/index/<index>` |
+| SearchVectors | `table/<name>/index/<index>` (the vector index searched) |
 | TagResource, UntagResource, ListTagsOfResource | the `ResourceArn` (a table or stream ARN) |
 | DescribeStream, GetShardIterator | the `StreamArn` |
 | GetRecords | the stream the shard iterator reads |
 | ListStreams | `table/<name>/stream/*` when a table is named, else `table/*/stream/*` |
 | DescribeBackup, DeleteBackup | the `BackupArn` |
-| CreateBackup, DescribeContinuousBackups, UpdateContinuousBackups | `table/<name>` |
+| CreateBackup, DescribeContinuousBackups, UpdateContinuousBackups | `table/<name>` (an `UpdateContinuousBackups` that enables point-in-time recovery is refused before authorization) |
 | ExportTableToPointInTime | the source `table/<name>` |
 | ImportTable | the new `table/<name>` |
 | RestoreTableFromBackup | the backup ARN, plus Scan, Query, GetItem, PutItem, UpdateItem, DeleteItem and BatchWriteItem on the target `table/<name>` |
-| RestoreTableToPointInTime | the same item actions on the target `table/<name>`, then the source `table/<name>` |
+| RestoreTableToPointInTime | refused before authorization (point-in-time recovery is not supported) |
 | ListTables | `table/*` |
 | DescribeLimits | `*` |
 | DescribeEndpoints | not authorized (signed request, no IAM permission) |
@@ -732,20 +742,25 @@ Earlier builds authorized several of these operations against
 `table/*` instead of the specific resource. Review existing policies before
 upgrading:
 
-- **Index reads.** Query and Scan with an `IndexName` are authorized against
-  `table/<name>/index/<index>`. A policy that granted a principal only
-  `table/<name>` no longer allows reads of that table's indexes. Grant
-  `table/<name>/index/<index>` or `table/<name>/index/*` as needed. This
-  matches DynamoDB.
-- **Fencing a whole table with a Deny.** Index reads, `ListStreams` with a
-  TableName, and `ListBackups` with a TableName are authorized against a
-  sub-resource ARN (`table/<name>/index/*`, `table/<name>/stream/*`,
-  `table/<name>/backup/*`), not the bare `table/<name>`. A `Deny` written only
-  on `table/<name>` therefore does not cover them. An operator who means to
-  fence a whole table adds `table/<name>/*` to the `Deny` alongside
+- **Index reads.** Query and Scan with an `IndexName`, and SearchVectors, are
+  authorized against `table/<name>/index/<index>`. A policy that granted a
+  principal only `table/<name>` no longer allows reads or searches of that
+  table's indexes. Grant `table/<name>/index/<index>` or
+  `table/<name>/index/*` as needed. This matches DynamoDB for Query and Scan.
+  For SearchVectors it follows the DynamoDB developer guide, which gives
+  `table/<name>/index/<index>` as the resource; it has not been measured
+  against the service.
+- **Fencing a whole table with a Deny.** Index reads, `SearchVectors`,
+  `ListStreams` with a TableName, and `ListBackups` with a TableName are
+  authorized against a sub-resource ARN (`table/<name>/index/*`,
+  `table/<name>/stream/*`, `table/<name>/backup/*`), not the bare
+  `table/<name>`. A `Deny` written only on `table/<name>` therefore does not
+  cover them, and `SearchVectors` needs the index ARN
+  (`table/<name>/index/<index>`) in the `Allow` as well. An operator who means
+  to fence a whole table adds `table/<name>/*` to the `Deny` alongside
   `table/<name>`.
-- **Index reads and resource tags.** An index Query or Scan evaluates the base
-  table's resource tags (`aws:ResourceTag/*`; `dynamodb:ResourceTag/*` is
+- **Index reads and resource tags.** An index Query or Scan, and SearchVectors,
+  evaluate the base table's resource tags (`aws:ResourceTag/*`; `dynamodb:ResourceTag/*` is
   absent for every resource),
   because a secondary index inherits the tags of its table. An ABAC `Deny` or
   `Allow` conditioned on the table's tags applies to its indexes.
@@ -780,13 +795,12 @@ upgrading:
   DynamoDB returns for an iterator it did not issue. Shard iterators expire after
   15 minutes.
 - **Restores.** A restore writes items into its target table, so
-  RestoreTableFromBackup and RestoreTableToPointInTime require the item write
-  and read actions on the target table in addition to the restore action. A
+  RestoreTableFromBackup requires the item write and read actions on the
+  target table in addition to the restore action. A
   principal that could previously restore with only the restore permission now
-  also needs those actions on the target table name. RestoreTableToPointInTime
-  checks the item actions on the target before the restore action, as DynamoDB
-  does, so a principal with no policy is denied naming `dynamodb:Scan` on the
-  target table.
+  also needs those actions on the target table name. From v0.1.15,
+  RestoreTableToPointInTime is refused before authorization, for every
+  principal, because point-in-time recovery is not supported.
 - **Denial messages.** An AccessDeniedException now ends with the clause the
   service uses: "with an explicit deny in an identity-based policy" when an
   explicit Deny matched the request, or "because no identity-based policy allows
@@ -933,6 +947,166 @@ deny `dynamodb:PutItem` on it instead.
 ./target/release/extenddb manage --user admin --password <pw> \
     untag-user --account-id 123456789012 --user-name alice --tag-keys Department
 ```
+
+## Encryption Key
+
+extenddb encrypts only stored secrets: the secret of each access key and the secret of each AssumeRole session, and on PostgreSQL the `data_database_connection_string` row once a key ring exists. Table data is not encrypted. By default one AES-256-GCM key, the catalog key, encrypts them, and the catalog `settings` table holds that key in plaintext in the `encryption_key` row, so a copy of the catalog opens every stored secret. With `[auth.encryption] key_file` set, a key-encryption key (KEK) in a file on the server host wraps the data encryption key (DEK) that encrypts the stored secrets, and the catalog holds only the wrapped DEK, in the `encryption_key_ring` row. The [Security Model](10-security-model.md#attackers-and-what-each-gets) gives what each attacker gets in each mode.
+
+The `extenddb encryption-key` commands switch a deployment to a KEK file and manage its keys. Each takes `--config extenddb.toml`, previews by default and writes only with `--yes`.
+
+| Command | What it does | Servers | Rewrites stored secrets |
+|---|---|---|---|
+| `extenddb encryption-key status` | Prints the key source, the KEK id, the DEK ids and the count of stored secrets per key, and the access key ID, owner and creation time of each stored secret under a key other than the current one. It prints no secret | may run | no; it reads each secret and wipes the plaintext at once |
+| `extenddb encryption-key switch --key-file <path>` | Switches from the catalog key to a KEK file | stopped | yes |
+| `extenddb encryption-key rewrap --key-file <new path>` | Wraps the same DEK under a new KEK, and rewrites the ring row only | may run | no |
+| `extenddb encryption-key rotate` | Replaces the DEK | stopped | yes |
+| `extenddb encryption-key reset --key-file <path> --discard-secrets` | Recovers a restored catalog whose KEK is lost | stopped | deletes every stored secret |
+| `extenddb encryption-key set-data-connection` | PostgreSQL only. Reads a connection string from standard input and writes the `data_database_connection_string` row encrypted under the DEK | may run | no |
+
+### The KEK file
+
+The file holds exactly 32 random bytes in standard base64 with padding, which is 44 characters, and at most one trailing newline. Nothing else is accepted: no comment, no blank line, no leading or trailing space. Create it under `umask 077`, and copy it to a place away from the host before any command writes the ring, because from that write on the ring opens only with it:
+
+```bash
+umask 077
+head -c 32 /dev/urandom | base64 > /etc/extenddb/kek
+```
+
+The KEK must be new random bytes. A catalog copy taken before the switch holds the catalog key, and a KEK equal to it would open the ring of every later copy; `switch` refuses a KEK that equals the catalog key or a DEK of the ring.
+
+The file rule is the set of checks that the server and every command apply before they read the key. They refuse the file when one fails:
+
+1. The path is resolved to its canonical form, so a Kubernetes secret volume's symlink is checked at its target.
+2. Every parent directory of the canonical path is owned by root or by the server's user, and none is writable by group or others unless its sticky bit is set.
+3. The file is opened with `O_NOFOLLOW` and checked through the open descriptor, so no one can swap it between the check and the read. It is a regular file that root or the server's user owns, and others have no permission bits.
+4. On Linux the file's POSIX access control list (ACL) is read before the group bits are judged. With an ACL mask entry, the group bits of the mode are the mask, and the owning group's permission is in its own ACL entry. Each named user entry must name the server's user, each named group entry its effective group, and the entry for others must grant nothing. Group access, through the mode's group bits without an ACL, the owning group's ACL entry, or a named group entry, is accepted only on a file that root owns, and only for the server's effective group. On macOS the rule checks owner and mode only, and the startup log says so.
+
+The two delivery routes that give the file a root owner pass: the systemd tmpfs case (root owner, an ACL entry for the service user, mode shown as 0440) and the Kubernetes `fsGroup` case (root owner, group 10001, mode 0440, for a server whose effective group is 10001). A file that the server's user owns needs no group access, and the rule refuses one that has it. The rule cannot see who belongs to a group, so the server's effective group must have no other members: every member can read a file that the rule accepts through that group. The rule refuses a file that any other user can read, where the TLS key check narrows the mode and warns: a user who could read the file may already hold the KEK.
+
+The server reads the file once at startup into memory it wipes afterwards, unwraps the DEK into the locked key store and drops the KEK. The file is unchanged. `rewrap` reads the file again when it runs. On SQLite the server warns at startup when the KEK file and the database file are on the same file system, because one snapshot then holds both.
+
+### Delivering the KEK file
+
+Any tool that gives a service a file at start can deliver the KEK, with no extenddb code. The server runs as the user `extenddb` in the [systemd unit](11-deployment-guide.md#systemd-service) and as uid 10001 in the container image, so each route gives that user the file with an owner and a mode that the file rule accepts.
+
+systemd is the recommended route for the systemd deployment of the deployment guide, on a host with systemd 250 or later and a TPM 2.0 chip. Write the KEK to a file, keep a copy away from the host, and seal the file to the TPM. `LoadCredentialEncrypted=` decrypts it at each start of the unit into `/run/credentials/<unit>/`, which systemd unmounts when the unit stops, so a copy of the host disk holds no KEK that opens without that TPM. Root on the running host can still decrypt it.
+
+```bash
+systemd-creds encrypt --with-key=tpm2 --name=extenddb-kek /etc/extenddb/kek /etc/credstore.encrypted/extenddb-kek
+```
+
+```ini
+[Service]
+LoadCredentialEncrypted=extenddb-kek:/etc/credstore.encrypted/extenddb-kek
+Environment=EXTENDDB__AUTH__ENCRYPTION__KEY_FILE=%d/extenddb-kek
+LimitMEMLOCK=16M
+```
+
+On a ramfs systemd gives the file to the unit's user at mode 0400. systemd 254 or later on Linux 6.4 or later uses a tmpfs, where root owns the file and a POSIX ACL entry lets the user read it, so the mode reads as 0440; the file rule accepts both. `LimitMEMLOCK=` is for the locked key store ([Memory locking](#memory-locking)).
+
+On Kubernetes, use a Secret volume with `defaultMode: 0400`, and `securityContext: {runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001}` on the pod. kubelet then gives the file to root with group 10001 at mode 0440; without `fsGroup` the file belongs to group root and uid 10001 cannot open it. The file rule accepts the group bits only on a file that root owns and whose group is the server's effective group, so the server must run with group 10001: the image's `USER 10001:10001` gives it, and `runAsGroup: 10001` keeps it whatever the container runtime does. A process whose effective group is 0 and holds 10001 only as a supplementary group is refused. Every container in the pod gets the `fsGroup` as a supplementary group, so mount the Secret volume into the extenddb container alone. Secrets are unencrypted in etcd unless the cluster enables encryption at rest. Set the memlock limit through the container runtime. Point `EXTENDDB__AUTH__ENCRYPTION__KEY_FILE` at the mounted file.
+
+On Docker swarm, create the service with `--secret source=extenddb-kek,target=kek,uid=10001,gid=10001,mode=0400`. The default, root with mode 0444, fails the file rule. Swarm keeps every secret in the Raft log of its managers, and each manager keeps the key of that log unencrypted on its disk, so a copy of a manager's disk gives the KEK. If that copy must not give the KEK, enable `--autolock`; each manager restart then waits for an operator to type the unlock key, and after a manager's Docker restarts no service starts or restarts until an operator unlocks it. extenddb restarts do not wait while the managers are up. Compose file secrets are bind mounts that ignore `uid`, `gid` and `mode`, so uid 10001 must own the host file at mode 0400.
+
+On Podman, use `--secret extenddb-kek,type=mount,uid=10001,gid=10001,mode=0400`. The default, root with mode 0444, fails the file rule.
+
+With sops and age, sops keeps the encrypted KEK in configuration management, and `sops decrypt` in an `ExecStartPre=` writes the file under `umask 077`. Use this route only with an age identity on a hardware token, such as a YubiKey or a TPM through an age plugin: an age identity file on the same disk as the KEK protects no more than a plain KEK file. A PIN or touch policy on the token stops unattended restarts.
+
+The offline commands need the KEK too. They run only while every server is stopped, started by an operator, as the server's user, with the same delivery route as the server. On systemd that is a transient service with the same `LoadCredentialEncrypted=` line, started with `systemd-run --wait --pipe`; its credentials directory is `/run/credentials/<unit name>.service/`. This example previews a switch, with every server stopped, as the `--yes` run after it:
+
+```bash
+sudo systemd-run --wait --pipe --unit=extenddb-keys --uid=extenddb --gid=extenddb \
+  -p LoadCredentialEncrypted=extenddb-kek:/etc/credstore.encrypted/extenddb-kek \
+  /usr/local/bin/extenddb encryption-key switch --config /etc/extenddb/extenddb.toml \
+  --key-file /run/credentials/extenddb-keys.service/extenddb-kek
+```
+
+`rotate`, `rewrap`, `set-data-connection` and `status` open the ring with the KEK that `key_file` names in the configuration. The transient unit does not inherit the `Environment=` line of the server's unit, so pass the path with `--setenv`:
+
+```bash
+sudo systemd-run --wait --pipe --unit=extenddb-keys --uid=extenddb --gid=extenddb \
+  -p LoadCredentialEncrypted=extenddb-kek:/etc/credstore.encrypted/extenddb-kek \
+  --setenv=EXTENDDB__AUTH__ENCRYPTION__KEY_FILE=/run/credentials/extenddb-keys.service/extenddb-kek \
+  /usr/local/bin/extenddb encryption-key rotate --config /etc/extenddb/extenddb.toml
+```
+
+`rewrap` needs the new KEK as well: a second `-p LoadCredentialEncrypted=extenddb-kek-2:/etc/credstore.encrypted/extenddb-kek-2` line delivers it, and `--key-file /run/credentials/extenddb-keys.service/extenddb-kek-2` names it.
+
+On Kubernetes it is a Job that mounts the same Secret while the Deployment has 0 replicas. On swarm it is a one-off service with the same secret, and on Podman a `podman run` with the same secret. `rewrap` and `set-data-connection` may run beside the running server, with the same route.
+
+None of these copies is a backup of the KEK. A TPM-sealed file opens only with that TPM, so it is lost with the host. Keep a copy of each KEK away from the host, made before the KEK is sealed or stored as a secret, for as long as a catalog copy wrapped under it is kept. Every route gives root on the running host the DEK, because the server holds it in memory.
+
+### Rules common to the commands
+
+- Each command reads the KEK file through the file rule, as the server's user, with the server's delivery route.
+- Every command except `status` and `reset` checks the ring before it writes anything. A ring under another KEK is refused with both KEK ids printed. A ring in which any DEK fails to unwrap is refused; the message names `encryption-key status` and the [restore steps](14-backup-and-restore.md#restore-a-damaged-or-missing-key-ring) of the Backup and Restore manual. `status` reports such a ring: it prints its fields, marked as not authenticated, and which DEK ids fail to unwrap.
+- Before its first write, `switch --yes` and `rotate --yes` open every `access_keys` and `iam_sessions` secret with the keys the run holds. If a secret opens under none of them, the run stops and writes nothing, and prints how many such secrets exist and their access key IDs. `--keep-unopenable` lets the run go on and leave those secrets as they are; they fail on every request today and fail the same way afterwards. On PostgreSQL the connection string row gets the same check, and `--keep-unopenable` does not apply to it.
+- Without `--yes`, a command previews: it prints what `--yes` would do and writes nothing. The previews and `status` decrypt each stored secret only to find its key, wipe each plaintext at once, and print counts; for each secret under a key other than the target they print the access key ID, owner and creation time. They print no secret.
+- The offline commands (`switch`, `rotate`, `reset`) open the catalog as `migrate --yes` does and take the migration lock, which waits for registered servers to stop. Their previews take the lock too, so stop every server before the preview. They take the `--lock-timeout` option of `migrate --yes`, wait up to that limit, and then exit 6. On Cassandra and MongoDB the lock is a lease that the command's stores check before each request. Behind PgBouncer, or for up to 30 s after a failover of the catalog's PostgreSQL server, a server can serve beside the holder of the lock, so stop every server first.
+- No command takes a copy of the database, unlike `migrate --yes` on SQLite: a copy beside the database would hold the catalog key next to every secret. A run that stops at any step runs again with the same arguments, and the pass resumes.
+- A command with nothing to do exits 0 and prints that the ring is already in the target state, with its KEK id and DEK id. A second `switch` with the current KEK file reports success, and so does a `rewrap` to the file the ring already names.
+- Every command that writes prints a summary at the end: the KEK id, the DEK id, the counts per table, on PostgreSQL whether the `data_database_connection_string` row was rewritten, the access key IDs of the stored secrets that no key opens, and the `key_file` line for the configuration. No command prints a secret, the connection string or its password. The summary of `switch`, `rewrap` and `rotate` ends with this notice: "This does not revoke any credential. Each access key keeps its secret. A secret that leaked before this run works until its access key is re-created." The summary of `reset` ends with a line that says every access key and every session was deleted, and names the Backup and Restore manual's [lost KEK](14-backup-and-restore.md#the-kek-of-a-catalog-copy-is-lost) section.
+
+### `switch --key-file <path>`
+
+`switch` is the one-time change from the catalog key to a KEK file. The deployment runs with the catalog key before it and with `key_file` after it.
+
+1. Stop every server. The preview takes the migration lock, as the `--yes` run does, and waits for a running server until `--lock-timeout` passes.
+2. Preview: `extenddb encryption-key switch --config extenddb.toml --key-file /etc/extenddb/kek`.
+3. Run it with `--yes`, as the server's user. A run that has a switch to do refuses a configuration that sets `key_file`, so set `key_file` after the switch; a ring that is already finished under the given KEK is reported as nothing to do, and the run exits 0. It refuses a KEK equal to the catalog key or to a DEK of the ring, migrations that are not current, and a catalog without a `catalog_id` row. It checks every stored secret with the catalog key, writes the ring with a new DEK and the switch marked unfinished, rewrites every stored secret under the DEK (on PostgreSQL the connection string row too), deletes the `encryption_key` row, marks the switch finished and prints the summary.
+4. Set `key_file` in `[auth.encryption]`, or `EXTENDDB__AUTH__ENCRYPTION__KEY_FILE`, and start the server.
+5. Re-create the access keys that existed before the switch, to end the exposure of older catalog copies, which hold the catalog key. Sessions expire within 12 hours.
+
+A run that stopped resumes with the same arguments: the ring records the switch as unfinished and the id of the catalog key it started from, and the resumed run accepts only that catalog key. Until it finishes, the server refuses to start ([Troubleshooting](../troubleshooting.md#encryption-key-errors)). A new deployment that wants a KEK file runs `init`, then `switch --key-file <path> --yes`, then `serve`; `init` creates no access key, so that deployment never has a stored secret under the catalog key.
+
+### `rewrap --key-file <new path>`
+
+`rewrap` is the routine KEK change. It needs no outage and touches no stored secret: it opens the ring with the configured KEK, reads the new KEK from `--key-file`, writes the ring with the same DEK wrapped under the new KEK, and prints the summary with the `key_file` line for the new file. It refuses a ring whose switch is unfinished, a catalog that has a catalog key row, a ring with two DEKs (finish the switch or the rotation first), a new KEK that equals the DEK of the ring, and a ring that changed while it ran. It writes the ring only while the row still holds the ring that `rewrap` read: when a `rotate` wrote the ring in between, `rewrap` writes nothing and refuses with "the key ring changed while `extenddb encryption-key rewrap` ran, so nothing was written" ([Troubleshooting](../troubleshooting.md#the-key-ring-changed-while-rewrap-or-rotate-ran)).
+
+Running servers keep their DEK and read the ring only at startup. Until `key_file` names the new file, a restart refuses and prints both KEK ids, so change `key_file` right after the command. Whoever holds an old KEK and a catalog copy from before its rewrap still holds the DEK; only `rotate` ends that for a reader of catalog copies.
+
+### `rotate`
+
+`rotate` replaces the DEK. It rewrites every stored secret, so every server is stopped while it runs: stop every server, preview with `extenddb encryption-key rotate --config extenddb.toml`, run it with `--yes`, then start the server. The preview takes the migration lock as the `--yes` run does. It opens the ring with the configured KEK, refuses a ring whose switch is unfinished (finish the switch first) and a catalog key row (below), checks every stored secret with each DEK of the ring, adds a DEK with the next id, rewrites each stored secret under it, writes the ring with the new DEK alone, and prints the summary. It adds the DEK only while the row still holds the ring that `rotate` read: `rewrap` runs beside a server and outside the migration lock, and when a `rewrap` wrote the ring in between, `rotate` writes nothing and refuses with "the key ring changed while `extenddb encryption-key rotate` ran, so nothing was written". A run that stopped left two DEKs in the ring; the same command resumes it with the higher id as the target. A DEK replacement does not protect a secret whose ciphertext and key leaked together: re-create that access key.
+
+### A catalog key that appears after the switch
+
+After a finished switch the catalog has no `encryption_key` row. One can appear again from an older release run against the catalog, from an older SQLite dev image, which writes a new catalog key into a switched catalog at startup, or from a writer to the catalog database. The server refuses to start, says so and names `encryption-key status`, which lists each stored secret under that key with its access key ID, owner and creation time. `switch` and `rotate` refuse such a key unless the operator passes `--accept-catalog-key` after reading that list. With it, the run treats the catalog key as an old key, re-encrypts the listed secrets under the ring's DEK and deletes the row; `switch` then writes no new DEK. The older dev image is the documented reason to pass the option, and it runs with a configuration that does not set `key_file`. The option accepts the listed rows as written and checks nothing about them: a writer who inserted the key chose every field of those rows.
+
+### `reset --key-file <path> --discard-secrets`
+
+`reset` recovers a restored catalog whose KEK is lost. Stop every server, preview, run it with `--yes`, then start the server; the preview takes the migration lock as the `--yes` run does. Every user, role, policy, group, account and table stays; every access key and every session goes. Without `--discard-secrets` the command refuses, so the preview and the flag both say what is lost. On PostgreSQL it reads the data database connection string on standard input, as `set-data-connection` does, because no key of the run opens the stored row. It deletes every `access_keys` and `iam_sessions` row and the `encryption_key` row if one exists, trying no key on them, writes the connection string row under a new DEK on PostgreSQL, writes a new ring with that DEK under the given KEK, and prints the summary with the deleted access key IDs. The old ring stays until that last write, so a run that stops earlier runs again with the same arguments and the same standard input.
+
+`reset` refuses a catalog with a catalog key row and no ring (without `key_file` that catalog uses the catalog key, and the message names `switch`), and a ring whose KEK id equals the given KEK's id while a DEK fails to unwrap: that ring has damage and its KEK is not lost, so restore a catalog copy instead. When every DEK unwraps under the given KEK, the KEK is not lost; `reset` writes nothing and exits 0. The Backup and Restore manual's [lost KEK](14-backup-and-restore.md#the-kek-of-a-catalog-copy-is-lost) section gives the steps around it.
+
+### `set-data-connection`
+
+`set-data-connection` runs on PostgreSQL only. The command takes a connection string on standard input, encrypts it under the DEK and writes the `data_database_connection_string` row. For a catalog with a ring it replaces the `psql UPDATE` of [Data Recovery](#data-recovery) after a restore to a server with another connection string; a catalog without a ring keeps its plaintext row and that `psql UPDATE`. It refuses a catalog without a ring, a ring whose switch is unfinished, a ring with two DEKs, and a string that does not parse as a PostgreSQL connection string. It may run beside a running server, which keeps its data pool until it restarts, so a wrong string shows at the next start; `extenddb verify` tests the stored string. The settings API keeps the row read-only.
+
+For standard input, here and for `reset`, the command reads it to the end, strips one trailing newline, refuses empty input and refuses a terminal, so it never waits with no prompt. A preview of `set-data-connection` reads no standard input; `reset` reads it in its preview too. To keep the password out of the shell history, write the string to a file under `umask 077`, run the command with the file as standard input, and delete the file after the run:
+
+```bash
+umask 077
+printf '%s\n' 'postgresql://extenddb:<password>@<new host>:<new port>/extenddb' > conn.txt
+extenddb encryption-key set-data-connection --config extenddb.toml --yes < conn.txt
+rm conn.txt
+```
+
+### What changes for an operator
+
+- Give the KEK file to `serve`, and on PostgreSQL to `migrate`, `catalog-check`, `verify` and the `backup` commands, which read the encrypted connection string row and need the KEK after the switch.
+- Keep each old KEK while a catalog copy wrapped under it is kept. `rewrap` and `rotate` change no older copy, and a restore needs the KEK that the copy's ring names (the [Backup and Restore manual](14-backup-and-restore.md#recovering-from-catalog-loss)).
+- After `init --overwrite`, put `[auth.encryption]` back; that command keeps only the storage settings. Delete `[auth.encryption]` and any `EXTENDDB__AUTH__ENCRYPTION__KEY_FILE` override before a rollback to a release without this setting (the [Upgrade Manual](07-upgrade-manual.md#the-switch-to-a-kek-file-rollback)).
+- Keep catalog dumps under `umask 077`. A dump taken before the switch holds the catalog key.
+- A switch or rotation that did not finish stops the server at its next start, with a message that names the command that resumes it. [Troubleshooting](../troubleshooting.md#encryption-key-errors) lists each message. The change adds no metric.
+
+### Memory locking
+
+The server keeps the key that opens stored secrets and the cached SigV4 signing keys in the locked key store: memory that stays out of swap and out of core dumps. On Linux it uses `memfd_secret` where the kernel offers it (enabled by default since Linux 6.5), and otherwise an anonymous mapping locked with `mlock` and marked `MADV_DONTDUMP` and `MADV_WIPEONFORK`. The startup log line names the protection in force: `memfd_secret`, locked pages, or none. The store's size follows `[auth.cache] max_entries`: two 32-byte slots per entry, so the default 10,000 entries need 640,000 bytes, plus one 32-byte buffer per runtime worker thread.
+
+The kernel's default memlock limit is 8 MiB on kernel 5.16 and later, and 64 KiB before. Hosts on an older kernel, for example RHEL 9 and Amazon Linux 2, need `LimitMEMLOCK=16M` in the unit, `--ulimit memlock=` in Docker, or a smaller `max_entries`. When locking fails under a configuration that sets `key_file`, startup refuses, names the limit it needs and both fixes; `[auth.encryption] require_locked_memory = false` turns the refusal into a warning. Without `key_file` the server warns and starts.
+
+Core dumps stay on: `MADV_DONTDUMP` keeps the core and excludes the key pages, so a crash can still be diagnosed. An operator who wants no core at all sets `LimitCORE=0` in the unit. On macOS the store uses `mlock` with no per-range core exclusion, and on Windows `VirtualLock`.
 
 ## Web Console
 
@@ -1110,7 +1284,7 @@ Table backups (`CreateBackup`) hold one table's items and definition; they do no
 | MongoDB | `extenddb_catalog` and `extenddb_data`, fixed names |
 | Cassandra | The catalog keyspace `<keyspace_prefix>_catalog` and one keyspace per account, `<keyspace_prefix>_account_<account id>` (`keyspace_prefix` defaults to `extenddb`) |
 
-On PostgreSQL the catalog and data databases are one copy: dump both with every server of the catalog stopped, or, to back up without stopping the server, take a base backup (`pg_basebackup`) of the PostgreSQL server that holds both. Each `pg_dump` takes its own snapshot of one database, so two dumps taken while a server runs disagree when a table is created or deleted between them. The catalog dump holds the encryption key and the application role's password (in the `data_database_connection_string` setting), so create both files readable by their owner alone, with `umask 077`. With the default names:
+On PostgreSQL the catalog and data databases are one copy: dump both with every server of the catalog stopped, or, to back up without stopping the server, take a base backup (`pg_basebackup`) of the PostgreSQL server that holds both. Each `pg_dump` takes its own snapshot of one database, so two dumps taken while a server runs disagree when a table is created or deleted between them. Without `[auth.encryption] key_file`, the catalog dump holds the encryption key and the application role's password (in the `data_database_connection_string` setting); with a KEK file, it holds the wrapped data encryption key and that row encrypted, which open only with the KEK (the [Encryption Key](#encryption-key) section). In either case create both files readable by their owner alone, with `umask 077`. With the default names:
 
 ```bash
 # Backup, with the server stopped, with the pg_dump of the server's major version
@@ -1135,7 +1309,7 @@ psql -v ON_ERROR_STOP=1 -f data_backup.sql extenddb
 psql -c 'DROP DATABASE extenddb_catalog_before_restore' -c 'DROP DATABASE extenddb_before_restore' postgres
 ```
 
-On a new PostgreSQL server (the old one lost with its databases) create the application role first: a dump holds no roles, and without it `createdb -O extenddb` fails, `role "extenddb" does not exist`. Give it the password that the catalog dump's `data_database_connection_string` row carries (`postgresql://extenddb:<password>@<host>:<port>/extenddb`), the one the config file's `[storage.postgres] connection_string` names as well: `psql -c "CREATE USER extenddb WITH PASSWORD '<password>'" postgres`. That row also records the data database's host and port, and the server connects to the data database there. On a server at another address, point the config file's `connection_string` at it and, after the restore and before the server starts, set the row: `psql -c "UPDATE settings SET value = 'postgresql://extenddb:<password>@<new host>:<new port>/extenddb' WHERE key = 'data_database_connection_string'" extenddb_catalog`. Without that the server connects to the old address: it fails to start once nothing answers there, and while the old server still answers, the tables created then keep their items in the old server's data database while the new catalog lists them.
+On a new PostgreSQL server (the old one lost with its databases) create the application role first: a dump holds no roles, and without it `createdb -O extenddb` fails, `role "extenddb" does not exist`. Give it the password that the catalog dump's `data_database_connection_string` row carries (`postgresql://extenddb:<password>@<host>:<port>/extenddb`), the one the config file's `[storage.postgres] connection_string` names as well: `psql -c "CREATE USER extenddb WITH PASSWORD '<password>'" postgres`. In a catalog with a key ring that row is encrypted and the dump no longer gives the password; take it from the config file's `connection_string`, which names the same role. That row also records the data database's host and port, and the server connects to the data database there. On a server at another address, point the config file's `connection_string` at it and, after the restore and before the server starts, set the row. For a catalog without a key ring (no `[auth.encryption] key_file`): `psql -c "UPDATE settings SET value = 'postgresql://extenddb:<password>@<new host>:<new port>/extenddb' WHERE key = 'data_database_connection_string'" extenddb_catalog`. For a catalog with a key ring, the row is encrypted under the data encryption key, so write it with `extenddb encryption-key set-data-connection`, which reads the new string on standard input and needs the KEK file on the new host (the [Encryption Key](#encryption-key) section). Without that the server connects to the old address: it fails to start once nothing answers there, and while the old server still answers, the tables created then keep their items in the old server's data database while the new catalog lists them.
 
 ---
 
@@ -1144,6 +1318,6 @@ On a new PostgreSQL server (the old one lost with its databases) create the appl
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

@@ -221,11 +221,11 @@ jobs:
           devtools/check-postgres-catalog-lock ./target/release/extenddb
           postgresql://postgres:devpass@127.0.0.1:5432 18452
 
-      # The last 0.1.x image's verify, migrate --yes and serve against
+      # The 0.1.14 image's verify, migrate --yes and serve against
       # catalogs this binary created and migrated: what each writes, and that
       # this binary then reports WrittenByOlderRelease and --reconverge
       # restores Current.
-      - name: Check the last 0.1.x release against migrated catalogs
+      - name: Check the 0.1.14 release against migrated catalogs
         run: |
           docker pull extenddb/extenddb-postgres:0.1.14
           devtools/check-postgres-older-binary ./target/release/extenddb \
@@ -322,10 +322,10 @@ jobs:
       - name: Check serve and migrate on one catalog
         run: devtools/check-sqlite-catalog-lock ./target/release/extenddb 18450
 
-      # The last 0.1.x dev image's serve and migrate --yes against catalogs
+      # The 0.1.14 dev image's serve and migrate --yes against catalogs
       # this binary migrated: what each writes, and that this binary then
       # reports WrittenByOlderRelease and --reconverge restores Current.
-      - name: Check the last 0.1.x release against migrated catalogs
+      - name: Check the 0.1.14 release against migrated catalogs
         run: |
           docker pull extenddb/extenddb-dev:0.1.14
           devtools/check-sqlite-older-binary ./target/release/extenddb \
@@ -766,8 +766,10 @@ jobs:
       # holds a row lock open while a write waits on it, and the backup restore
       # cases need catalog rows the current binary would not write; all need
       # direct access. The online GSI build tests reorder queue rows by hand and
-      # pause writers with a test hook. They build their own throwaway databases;
-      # the connection string is the server, not a database. `--tests` runs
+      # pause writers with a test hook. The LSI query plan test reads the
+      # statement the engine sent from pg_stat_activity and explains it, which
+      # the wire cannot show. They build their own throwaway databases; the
+      # connection string is the server, not a database. `--tests` runs
       # every target of the crate, so a new test file needs no edit here, and
       # EXTENDDB_TEST_PG_REQUIRED turns a test's skip for a missing connection
       # string into a failure.
