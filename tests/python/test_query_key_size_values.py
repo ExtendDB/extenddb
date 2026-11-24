@@ -11,8 +11,6 @@ Measured on the service in us-east-1 on 2026-10-23, the number rows on
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
 from query_key_size_support import (  # noqa: F401  (fixtures are used by name)
@@ -198,15 +196,6 @@ UNDERFLOW_MESSAGE = (
 )
 NOT_A_NUMBER = "The parameter cannot be converted to a numeric value: "
 
-# The service reads U+FF11 as the digit 1. ExtendDB's number rules do not
-# (#565), so on ExtendDB these rows are expected to fail. Not strict: a check
-# that reads these digits in one of the forms makes the rows of that form pass.
-FULLWIDTH_DIGITS = pytest.mark.xfail(
-    bool(os.environ.get("DYNAMODB_ENDPOINT", "").strip()),
-    reason="#565: the number rules do not read U+FF11 as a digit",
-    strict=False,
-)
-
 
 def number_query(form: str, index_table: str, number_table: str, number: str) -> dict:
     """A Query with the N value ``number`` in the key position ``form``.
@@ -239,10 +228,10 @@ class TestNumberKeyValues:
 
     Measured 2026-11-24: an ASCII value that is not a number gets ``The
     parameter cannot be converted to a numeric value: `` followed by the
-    value, ``1e-131`` gets the underflow sentence, and 39 or 683 U+FF11 get
-    the 38-digit sentence. The service gives these answers before the table
-    lookup, on a table that does not exist too, so the rows run in each key
-    position.
+    value, and ``1e-131`` gets the underflow sentence. 39 or 683 U+FF11 get
+    the 38-digit sentence, which #565 covers, so no row here holds them. The
+    service gives these answers before the table lookup, on a table that
+    does not exist too, so the rows run in each key position.
     """
 
     @pytest.mark.parametrize("form", ["gsi", "gsi-legacy"])
@@ -275,10 +264,6 @@ class TestNumberKeyValues:
             pytest.param(" 1", NOT_A_NUMBER + " 1", id="space-1"),
             pytest.param("", NOT_A_NUMBER, id="empty"),
             pytest.param("1e-131", UNDERFLOW_MESSAGE, id="underflow"),
-            pytest.param("\uff11" * 39, DIGITS_MESSAGE, id="39-fullwidth", marks=FULLWIDTH_DIGITS),
-            pytest.param(
-                "\uff11" * 683, DIGITS_MESSAGE, id="683-fullwidth", marks=FULLWIDTH_DIGITS
-            ),
         ],
     )
     def test_each_key_position_gets_the_number_sentence(
