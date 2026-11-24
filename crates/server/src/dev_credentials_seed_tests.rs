@@ -55,9 +55,12 @@ async fn start(path: &Path) -> Start {
 
     // Any fixed 32-byte key: the two stores only have to agree on it.
     let key = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
-    let catalog = SqliteCatalogStore::with_encryption_key(
+    let keys = Some(Arc::new(
+        extenddb_storage::secret_keys::SecretKeys::catalog_key(&key).expect("a catalog key"),
+    ));
+    let catalog = SqliteCatalogStore::with_secret_keys(
         pool.clone(),
-        key.clone(),
+        keys.clone(),
         Arc::new(tokio::sync::Mutex::new(())),
     );
     match catalog.create_account(ACCOUNT, "dev").await {
@@ -70,7 +73,7 @@ async fn start(path: &Path) -> Start {
         .expect("record the default account");
     Start {
         catalog,
-        credentials: SqliteCredentialStore::new(pool, key),
+        credentials: SqliteCredentialStore::new(pool, keys),
     }
 }
 
