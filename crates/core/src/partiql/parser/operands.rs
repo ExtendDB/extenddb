@@ -434,6 +434,7 @@ impl Parser {
                 ArithOp::Sub
             };
             self.refuse_condition_operator(if op == ArithOp::Add { "+" } else { "-" });
+            self.count_value_operator();
             self.bump();
             self.require_rhs()?;
             let right = self.operand_atom()?;
@@ -561,7 +562,9 @@ impl Parser {
     /// takes the steps after them (measured 2026-11-05: `(m).k = 1` and
     /// `(m)['k'] = 1` read `m.k`), and a literal followed by steps is
     /// refused at the literal. A comma of their own makes a list (measured
-    /// 2026-11-05: `SET x = ('a', 'b')` stores a list).
+    /// 2026-11-05: `SET x = ('a', 'b')` stores a list). The parentheses nest
+    /// as a group and not as an operand: the service reads 1001 levels of
+    /// them round a name, a string and a SET value (measured 2026-11-24).
     fn operand_in_parentheses(&mut self) -> PResult<Operand> {
         if self.list_in_parentheses_ahead() {
             let list = self.list_in_parentheses(LITERAL_ROOT)?;
@@ -569,7 +572,14 @@ impl Parser {
         }
         let open = self.pos;
         self.bump();
-        let inner = self.nested(Nest::Group, Self::operand)?;
+        let inner = self.nested(Nest::Group, |p| {
+            // One part of the walk of a condition, as an operand is (see
+            // [`Parser::operand`]).
+            let before = p.walk_part();
+            let inner = p.operand_unnested();
+            p.end_walk_part(before);
+            inner
+        })?;
         // (measured 2026-11-05: `a = (1` and `pk = ('a'`)
         if !self.eat(&TokenKind::RParen) {
             return Err(ParseError::well_formed("Expected RIGHT_PAREN"));

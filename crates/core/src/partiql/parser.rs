@@ -185,6 +185,7 @@ fn parse_attempt(
         bare_left: false,
         nesting: Nesting::new(inline),
         operators: 0,
+        value_operators: 0,
         operator_refusals: 0,
         brackets: Brackets::Refused,
         bracket_groups: None,
@@ -248,6 +249,9 @@ struct Parser {
     nesting: Nesting,
     /// The operators of the WHERE condition read so far.
     operators: usize,
+    /// The operators of the SET values read so far (see
+    /// [`Parser::count_value_operator`]).
+    value_operators: usize,
     /// The operators of the WHERE condition refused so far (see
     /// [`Parser::refuse_condition_operator`]).
     operator_refusals: usize,

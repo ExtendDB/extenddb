@@ -82,9 +82,20 @@ impl Parser {
         let fallback = self.term_error();
         let next = self.nth_kind(1).cloned();
         match word.as_str() {
-            // A prefix and two forms that take an expression first.
+            // A prefix and two forms that take an expression first. A run of
+            // them is read in a loop, so its length costs no depth (the
+            // service reads 2031 `NOT`s before a SET value, and answers 1626
+            // `CASE` words as it answers 100, measured 2026-11-24); the
+            // answer is the last word's.
             "not" | "case" | "pivot" => {
+                let mut fallback = fallback;
                 self.bump();
+                while let TokenKind::Ident(w) = &self.peek().kind
+                    && matches!(w.to_ascii_lowercase().as_str(), "not" | "case" | "pivot")
+                {
+                    fallback = self.term_error();
+                    self.bump();
+                }
                 self.operand()?;
                 Err(fallback)
             }
