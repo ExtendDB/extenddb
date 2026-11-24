@@ -29,6 +29,7 @@ mod repeated_headers;
 mod request_attributes;
 mod request_helpers;
 mod request_parse;
+mod request_syntax;
 mod request_tags;
 mod response;
 mod serve;
