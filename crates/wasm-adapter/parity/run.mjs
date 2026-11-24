@@ -41,7 +41,7 @@
 // (built by the test harness before this runner is invoked).
 //
 // Node-hosting note: a browser always defines `globalThis.crypto`, and Node 22
-// does; Node 18 does not define it in an ES module, so the runner installs
+// does; Node 18 does not define it in a script, so the runner installs
 // Node's Web Crypto when it is missing, before the module loads. The runner
 // adds nothing else to the environment; it loads the same module files a
 // browser would.
