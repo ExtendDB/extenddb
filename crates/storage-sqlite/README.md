@@ -5,7 +5,11 @@ in-tree workspace crate selected by Cargo feature.
 
 ## Design
 
-Single-file (or in-memory) storage using SQLite via `sqlx`. Targets:
+Single-file (or in-memory) storage using SQLite via `sqlx`. On `wasm32`, which
+`sqlx` does not build for, the crate opens only an in-memory database and
+reaches it through `src/wasm_sqlx.rs`, a module that implements the part of the
+`sqlx` API the crate uses over the SQLite that `sqlite-wasm-rs` bundles; its
+module documentation lists the differences from `sqlx`. Targets:
 
 - Local development without PostgreSQL
 - CI / integration tests (especially the ephemeral in-memory mode)
