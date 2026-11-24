@@ -357,7 +357,8 @@ pub const SERIALIZATION_FAILURE_BODY: &[u8] =
 /// Build the DynamoDB-shaped error document for `error`.
 ///
 /// Returns the JSON body a client receives for a failed request: `__type` with
-/// its namespace prefix (REQ-ERR-001), an optional `message` omitted when empty
+/// its namespace prefix (REQ-ERR-001), an optional message under the key
+/// `message_key` picks (REQ-ERR-002), omitted when empty
 /// (REQ-ERR-003 — real DynamoDB omits it for `UnknownOperationException` and
 /// other messageless errors), and the `CancellationReasons` /`Item` members
 /// that `TransactionCanceledException` and `ConditionalCheckFailedException`
@@ -370,7 +371,7 @@ pub fn error_document(error: &DynamoDbError) -> serde_json::Value {
     let mut body = serde_json::json!({ "__type": error.full_error_type() });
     let message = error.message();
     if !message.is_empty() {
-        body["message"] = serde_json::Value::String(message.to_owned());
+        body[message_key(error)] = serde_json::Value::String(message.to_owned());
     }
     if let Some(reasons) = error.cancellation_reasons() {
         body["CancellationReasons"] = serde_json::to_value(reasons).unwrap_or_default();
@@ -379,6 +380,22 @@ pub fn error_document(error: &DynamoDbError) -> serde_json::Value {
         body["Item"] = serde_json::to_value(item).unwrap_or_default();
     }
     body
+}
+
+/// The key that carries the error message. `DynamoDB` sends `Message` on
+/// `TransactionCanceledException` and `IdempotentParameterMismatchException`
+/// (us-east-1, raw bodies, 2026-10-29, 2026-11-03 and 2026-11-19). It also
+/// sends `Message` on `TransactionInProgressException`, which ExtendDB does
+/// not raise, and on `AccessDeniedException` and `SerializationException`
+/// (2026-11-12 and 2026-11-19), which keep `message` here. The other errors
+/// measured carry `message`. REQ-ERR-002 in `docs/design/01-requirements.md`
+/// lists them.
+fn message_key(error: &DynamoDbError) -> &'static str {
+    match error {
+        DynamoDbError::TransactionCanceledException { .. }
+        | DynamoDbError::IdempotentParameterMismatchException(_) => "Message",
+        _ => "message",
+    }
 }
 
 /// The `SerializationException` a malformed request body produces.
@@ -534,7 +551,7 @@ mod tests {
                 item: None,
             }],
         });
-        assert_eq!(doc["message"], serde_json::json!("Transaction cancelled"));
+        assert_eq!(doc["Message"], serde_json::json!("Transaction cancelled"));
         let reasons = doc["CancellationReasons"]
             .as_array()
             .expect("CancellationReasons is an array");
