@@ -1783,8 +1783,16 @@ class TestPostgres:
         finally:
             conn.close()
 
-        res = command("migrate", "--forget", "6", *lh._pg_args())
-        assert res.returncode == 0, res.stdout + res.stderr
+        # A catalog behind the binary: migration 6's ledger row deleted (the
+        # version row is left as it was; the next run rewrites it).
+        conn = psycopg2.connect(lh.PG_ADMIN_CONN + "/" + pg_env["db_name"])
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM extenddb_migrations WHERE id = 6")
+                assert cur.rowcount == 1
+        finally:
+            conn.close()
         for args in (
             ("backup", "list"),
             ("backup", "purge", "--confirm"),

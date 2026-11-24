@@ -105,6 +105,35 @@ fn an_index_query_names_the_index_arn() {
     }
 }
 
+/// SearchVectors in another account names the vector index ARN, as Query does,
+/// and a request with no index names the table.
+#[test]
+fn a_cross_account_search_vectors_names_the_index_arn() {
+    let input = json!({ "TableName": FOREIGN, "IndexName": "vidx" });
+    assert_eq!(
+        find("SearchVectors", &input, A),
+        other("SearchVectors", &format!("{FOREIGN}/index/vidx"))
+    );
+    for input in [
+        json!({ "TableName": FOREIGN }),
+        json!({ "TableName": FOREIGN, "IndexName": "" }),
+    ] {
+        assert_eq!(
+            find("SearchVectors", &input, A),
+            other("SearchVectors", FOREIGN)
+        );
+    }
+    // The denial for a known account names that resource.
+    let p = "arn:aws:iam::444455556666:user/u";
+    let index = format!("{FOREIGN}/index/vidx");
+    let DynamoDbError::AccessDeniedException(m) =
+        refusal("SearchVectors", "SearchVectors", &index, true, p)
+    else {
+        panic!("expected AccessDeniedException");
+    };
+    assert!(m.contains(&format!("on resource: {index} ")), "{m}");
+}
+
 /// The caller's own resources, bare names, ARNs that are not a table resource
 /// and fields the service reads as a name are left to authorization.
 #[test]

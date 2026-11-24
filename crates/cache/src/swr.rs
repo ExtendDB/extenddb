@@ -37,7 +37,7 @@ pub struct SwrCacheConfig {
 impl Default for SwrCacheConfig {
     fn default() -> Self {
         Self {
-            ttl: Duration::from_secs(60),
+            ttl: Duration::from_mins(1),
             soft_ttl: Duration::from_secs(30),
             negative_ttl: Duration::from_secs(5),
             max_entries: 10_000,
