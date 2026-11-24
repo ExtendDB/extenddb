@@ -102,9 +102,11 @@ backend implements the full storage trait surface. The `wasm32` build does
 not compile five of those implementations: `Bootstrapper`
 (`SqliteBootstrapper`) and `ServerRuntimeHooks`, which set up a file-backed
 server and start its background workers; `OperationsEngine`, which gives the
-`extenddb` lifecycle commands their backend helpers; and `CatalogMigrations`
-and `LockedStores`, which the `init`, `migrate` and `encryption-key` commands
-use. Two methods answer `StorageError::Unsupported` there:
+`extenddb` lifecycle commands their backend helpers; `CatalogMigrations`,
+which `init`, `migrate`, `verify` and `encryption-key` call, and which `serve`
+and the `backup` commands call to word their refusal of a catalog error; and
+`LockedStores`, which the `encryption-key` commands use. Two methods answer
+`StorageError::Unsupported` there:
 `SnapshotEngine::open_table_snapshot`, for every table, since its native
 implementation uses `sqlx` API that the `wasm32` build does not provide, and
 `TableEngine::update_table`, for a request that creates a vector index, since
