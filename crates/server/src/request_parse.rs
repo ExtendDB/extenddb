@@ -572,8 +572,9 @@ mod tests {
         // quote, SOH before a value, `tru`, the missing colon and the missing
         // comma on 2026-11-24, unsigned and badly signed). Within the ceiling
         // the check's refusal carries the server's wording, and past it no
-        // message. The check does not recurse, so the rows run on the default
-        // test-thread stack.
+        // message. The unclosed rows of exactly 5200 and 5201 openers pin
+        // that boundary. The check does not recurse, so the rows run on the
+        // default test-thread stack.
         let rows = [
             [&b"x"[..], &b"[".repeat(6000)].concat(),
             [&b"x"[..], &b"[".repeat(200)].concat(),
@@ -582,6 +583,8 @@ mod tests {
             truncated_body(2000),
             truncated_body(20000),
             [&truncated_body(200)[..], b"]"].concat(),
+            b"[".repeat(5200),
+            b"[".repeat(5201),
             deep_body_with_leaf(200, br#"{"S":"le\u"}"#),
             deep_body_with_leaf(200, b"{\"S\":\x01\"leaf\"}"),
             deep_body_with_leaf(200, br#"{"S":tru}"#),
