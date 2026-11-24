@@ -11,10 +11,9 @@
 //! each sidecar with the mode of the database file. [`prepare`] creates the
 //! database file with mode 0600 when the connection would create it (or
 //! narrows an existing one, and any sidecar left beside it, to 0600) before
-//! the connection can create a sidecar from it; [`restrict`] narrows the file
-//! and every sidecar present to 0600 whoever created them. The bootstrapper
-//! and catalog pools on a file database are opened through [`connect`], which
-//! calls `prepare` before the pool's first connection and `restrict` after it.
+//! the connection can create a sidecar from it. The bootstrapper and catalog
+//! pools on a file database are opened through [`connect`], which calls
+//! `prepare` before the pool's first connection.
 //! The engine pool (`store.rs`) connects with its own connection options and
 //! calls `prepare` before that connect; its connect creates a missing file
 //! only when `prepare` creates it. The migration runner opens its own
@@ -29,7 +28,7 @@
 //! (never followed), a directory, a FIFO, a socket, a device, or a regular file
 //! already 0600 or narrower. As with the lock file in `serve_lock`, a regular
 //! file that cannot be narrowed is an error. The directory's mode is left
-//! alone. On platforms other than Unix `prepare` and `restrict` do nothing.
+//! alone. On platforms other than Unix `prepare` does nothing.
 
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
@@ -42,22 +41,20 @@ use crate::sqlite_util::sqlite_url;
 
 /// Open a pool on `location` (a path, `:memory:` or a `sqlite:` URL) with
 /// `options`, keeping the database file and its sidecars owner read/write
-/// only.
+/// only: [`prepare`] runs before the pool's first connection.
 ///
 /// # Errors
 ///
-/// The pool cannot connect, or a file's mode cannot be set.
+/// A file's mode cannot be set, or the pool cannot connect.
 pub(crate) async fn connect(
     location: &str,
     options: sqlx::sqlite::SqlitePoolOptions,
 ) -> Result<sqlx::SqlitePool, String> {
     prepare(location)?;
-    let pool = options
+    options
         .connect(&sqlite_url(location))
         .await
-        .map_err(|e| e.to_string())?;
-    restrict(location)?;
-    Ok(pool)
+        .map_err(|e| e.to_string())
 }
 
 /// The calls that change a mode. [`SYSTEM`] makes them; tests substitute them
@@ -107,30 +104,6 @@ fn prepare_with(location: &str, calls: &ModeCalls<'_>) -> Result<(), String> {
 
 #[cfg(not(unix))]
 pub(crate) fn prepare(_location: &str) -> Result<(), String> {
-    Ok(())
-}
-
-/// After the pool connects to `location`: narrow the database file and every
-/// `-wal`, `-shm` and `-journal` file present to mode 0600.
-///
-/// # Errors
-///
-/// A file's mode cannot be set.
-#[cfg(unix)]
-fn restrict(location: &str) -> Result<(), String> {
-    restrict_with(location, &SYSTEM)
-}
-
-#[cfg(unix)]
-fn restrict_with(location: &str, calls: &ModeCalls<'_>) -> Result<(), String> {
-    match opened_file(location) {
-        Some(opened) => restrict_files(&opened.path, calls),
-        None => Ok(()),
-    }
-}
-
-#[cfg(not(unix))]
-fn restrict(_location: &str) -> Result<(), String> {
     Ok(())
 }
 

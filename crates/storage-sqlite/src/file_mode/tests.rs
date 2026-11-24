@@ -7,7 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use super::{connect, prepare, restrict};
+use super::{connect, prepare};
 
 /// A directory for one test, removed when it is dropped, also when the test
 /// fails.
@@ -37,8 +37,7 @@ fn sidecar(db: &Path, suffix: &str) -> PathBuf {
 }
 
 /// A pool opened the way the crate's openers open theirs (WAL journal),
-/// without `prepare` or `restrict`, holding its connection so the
-/// sidecars stay on disk.
+/// without `prepare`, holding its connection so the sidecars stay on disk.
 async fn raw_wal_pool(path: &Path) -> sqlx::SqlitePool {
     use sqlx::Executor;
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -71,7 +70,7 @@ fn prepare_creates_a_missing_database_with_mode_0600() {
 
 /// A configured `sqlite:` URL names the same files as the path in it.
 #[test]
-fn prepare_and_restrict_accept_a_sqlite_url() {
+fn prepare_accepts_a_sqlite_url() {
     let tmp = temp_dir();
     let dir = tmp.path();
     let db = dir.join("db.sqlite");
@@ -82,13 +81,13 @@ fn prepare_and_restrict_accept_a_sqlite_url() {
     std::fs::write(&wal, b"").expect("create");
     set_mode(&db, 0o644);
     set_mode(&wal, 0o644);
-    restrict(&location).expect("restrict");
+    prepare(&location).expect("prepare over 0644 files");
     assert_eq!(mode(&db), 0o600);
     assert_eq!(mode(&wal), 0o600);
 }
 
 #[test]
-fn prepare_and_restrict_set_an_existing_database_and_its_sidecars_to_0600() {
+fn prepare_sets_an_existing_database_and_its_sidecars_to_0600() {
     let tmp = temp_dir();
     let dir = tmp.path();
     let db = dir.join("db.sqlite");
@@ -101,13 +100,6 @@ fn prepare_and_restrict_set_an_existing_database_and_its_sidecars_to_0600() {
         set_mode(file, 0o644);
     }
     prepare(&db.to_string_lossy()).expect("prepare");
-    for file in &files {
-        assert_eq!(mode(file), 0o600, "{}", file.display());
-    }
-    for file in &files {
-        set_mode(file, 0o644);
-    }
-    restrict(&db.to_string_lossy()).expect("restrict");
     for file in &files {
         assert_eq!(mode(file), 0o600, "{}", file.display());
     }
@@ -157,27 +149,21 @@ fn prepare_creates_nothing_when_the_connection_would_not() {
         );
         prepare(&uri).expect("prepare");
     }
-    restrict(&plain.to_string_lossy()).expect("restrict");
     assert_eq!(std::fs::read_dir(&dir).expect("read_dir").count(), 0);
 }
 
 /// Open a pool through `connect` that switches to WAL and writes in its
 /// connection setup, and return it with the modes of the database file
-/// and its `-wal` and `-shm` files as that setup saw them, which is before
-/// `connect` calls `restrict`. With `set_in_setup`, the setup then sets
-/// those files to that mode.
-async fn connect_and_record(
-    db: &Path,
-    set_in_setup: Option<u32>,
-) -> (sqlx::SqlitePool, Vec<(&'static str, u32)>) {
-    connect_and_record_at(&db.to_string_lossy(), db, set_in_setup).await
+/// and its `-wal` and `-shm` files as that setup saw them, once SQLite has
+/// created the sidecars.
+async fn connect_and_record(db: &Path) -> (sqlx::SqlitePool, Vec<(&'static str, u32)>) {
+    connect_and_record_at(&db.to_string_lossy(), db).await
 }
 
 /// As `connect_and_record`, connecting to `location`, which opens `db`.
 async fn connect_and_record_at(
     location: &str,
     db: &Path,
-    set_in_setup: Option<u32>,
 ) -> (sqlx::SqlitePool, Vec<(&'static str, u32)>) {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let options = {
@@ -191,14 +177,9 @@ async fn connect_and_record_at(
                     conn.execute("PRAGMA journal_mode = WAL").await?;
                     conn.execute("CREATE TABLE IF NOT EXISTS t (k INTEGER PRIMARY KEY)")
                         .await?;
-                    let files = ["", "-wal", "-shm"].map(|suffix| (suffix, sidecar(&db, suffix)));
-                    let modes = files.clone().map(|(suffix, file)| (suffix, mode(&file)));
+                    let modes =
+                        ["", "-wal", "-shm"].map(|suffix| (suffix, mode(&sidecar(&db, suffix))));
                     seen.lock().expect("lock").extend(modes);
-                    if let Some(setup_mode) = set_in_setup {
-                        for (_, file) in &files {
-                            set_mode(file, setup_mode);
-                        }
-                    }
                     Ok(())
                 })
             })
@@ -215,7 +196,7 @@ async fn connect_creates_a_missing_database_and_its_sidecars_at_0600() {
     let tmp = temp_dir();
     let dir = tmp.path();
     let db = dir.join("db.sqlite");
-    let (pool, seen) = connect_and_record(&db, None).await;
+    let (pool, seen) = connect_and_record(&db).await;
     assert_eq!(seen, [("", 0o600), ("-wal", 0o600), ("-shm", 0o600)]);
     pool.close().await;
 }
@@ -234,23 +215,8 @@ async fn connect_restricts_an_existing_database_before_sqlite_creates_its_sideca
         let _ = std::fs::remove_file(sidecar(&db, suffix));
     }
     set_mode(&db, 0o644);
-    let (pool, seen) = connect_and_record(&db, None).await;
+    let (pool, seen) = connect_and_record(&db).await;
     assert_eq!(seen, [("", 0o600), ("-wal", 0o600), ("-shm", 0o600)]);
-    pool.close().await;
-}
-
-/// Whatever the connection leaves behind is set to 0600 once the pool
-/// has connected. Here the connection setup itself sets the database file
-/// and its sidecars to 0644.
-#[tokio::test]
-async fn connect_restricts_the_files_after_the_pool_connects() {
-    let tmp = temp_dir();
-    let dir = tmp.path();
-    let db = dir.join("db.sqlite");
-    let (pool, _) = connect_and_record(&db, Some(0o644)).await;
-    for suffix in ["", "-wal", "-shm"] {
-        assert_eq!(mode(&sidecar(&db, suffix)), 0o600, "{suffix}");
-    }
     pool.close().await;
 }
 
@@ -273,7 +239,7 @@ async fn prepare_creates_the_target_of_a_dangling_symlink() {
         assert_eq!(mode(&file), 0o600, "{}", file.display());
     }
     set_mode(&sidecar(&target, "-wal"), 0o644);
-    restrict(&location).expect("restrict");
+    prepare(&location).expect("prepare over a 0644 sidecar");
     assert_eq!(mode(&sidecar(&target, "-wal")), 0o600);
     pool.close().await;
 }
@@ -315,7 +281,6 @@ fn a_directory_at_the_database_name_keeps_its_mode() {
         format!("{}/", db_dir.display()),
     ] {
         prepare(&location).expect("prepare");
-        restrict(&location).expect("restrict");
         assert_eq!(mode(&db_dir), 0o755, "{location}");
     }
 }
@@ -343,7 +308,7 @@ fn only_regular_files_are_changed_and_nothing_waits() {
     // the duration of the call.
     assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o644) }, 0, "mkfifo");
     set_mode(&fifo, 0o644);
-    // A socket node, made with mknod because the test directory's path is
+    // A socket node, made with mknod because the test directory's path can be
     // longer than a socket address allows; Linux lets any user make one.
     let socket = sidecar(&db, "-shm");
     #[cfg(target_os = "linux")]
@@ -357,9 +322,7 @@ fn only_regular_files_are_changed_and_nothing_waits() {
     }
 
     let location = db.to_string_lossy().into_owned();
-    let (for_prepare, for_restrict) = (location.clone(), location);
-    within_ten_seconds(move || prepare(&for_prepare)).expect("prepare");
-    within_ten_seconds(move || restrict(&for_restrict)).expect("restrict");
+    within_ten_seconds(move || prepare(&location)).expect("prepare");
 
     assert_eq!(mode(&db), 0o600);
     assert_eq!(mode(&decoy), 0o644, "the symlink at -journal was followed");
@@ -382,18 +345,14 @@ fn a_file_that_cannot_be_narrowed_is_an_error() {
     let fail = |_: &Path| Err(std::io::Error::from_raw_os_error(libc::EROFS));
     let calls = read_only_calls(&fail);
     let location = db.to_string_lossy().into_owned();
-    for result in [
-        super::prepare_with(&location, &calls),
-        super::restrict_with(&location, &calls),
-    ] {
-        let err = result.expect_err("a mode that cannot be set is accepted");
-        assert!(
-            err.starts_with("cannot set the mode of SQLite file ")
-                && err.contains(&*db.to_string_lossy())
-                && err.contains("Read-only file system"),
-            "{err}"
-        );
-    }
+    let err =
+        super::prepare_with(&location, &calls).expect_err("a mode that cannot be set is accepted");
+    assert!(
+        err.starts_with("cannot set the mode of SQLite file ")
+            && err.contains(&*db.to_string_lossy())
+            && err.contains("Read-only file system"),
+        "{err}"
+    );
     assert_eq!(mode(&db), 0o644);
 }
 
@@ -416,7 +375,6 @@ fn owner_only_files_are_left_alone() {
     let calls = read_only_calls(&fail);
     let location = db.to_string_lossy().into_owned();
     super::prepare_with(&location, &calls).expect("prepare");
-    super::restrict_with(&location, &calls).expect("restrict");
     assert_eq!(*asked.lock().expect("lock"), Vec::<PathBuf>::new());
     assert_eq!(mode(&db), 0o600);
     assert_eq!(mode(&sidecar(&db, "-shm")), 0o400);
@@ -464,7 +422,7 @@ async fn narrowing_keeps_the_locks_of_an_open_connection() {
     for suffix in ["", "-wal", "-shm"] {
         set_mode(&sidecar(&db, suffix), 0o644);
     }
-    restrict(&db.to_string_lossy()).expect("restrict");
+    prepare(&db.to_string_lossy()).expect("prepare");
     for suffix in ["", "-wal", "-shm"] {
         assert_eq!(mode(&sidecar(&db, suffix)), 0o600, "{suffix}");
     }
@@ -526,7 +484,7 @@ async fn forms_sqlite_creates_on_disk_start_at_0600() {
         let dir = tmp.path();
         let db = dir.join("db.sqlite");
         let location = form.replace("{db}", &db.to_string_lossy());
-        let (pool, seen) = connect_and_record_at(&location, &db, None).await;
+        let (pool, seen) = connect_and_record_at(&location, &db).await;
         assert_eq!(
             seen,
             [("", 0o600), ("-wal", 0o600), ("-shm", 0o600)],
@@ -538,15 +496,19 @@ async fn forms_sqlite_creates_on_disk_start_at_0600() {
 
 /// A `file:` URI whose path SQLite decodes (`%2520` reaches SQLite as `%20`,
 /// a space): `prepare` creates the file SQLite opens and no other, and
-/// `restrict` reaches it and its sidecars, which the setup leaves at 0644.
+/// narrows it and its sidecars when they are wider.
 #[tokio::test]
 async fn a_decoded_file_uri_path_names_the_file_sqlite_opens() {
     let tmp = temp_dir();
     let dir = tmp.path();
     let db = dir.join("a b.sqlite");
     let location = format!("sqlite:file:{}/a%2520b.sqlite?mode=rwc", dir.display());
-    let (pool, seen) = connect_and_record_at(&location, &db, Some(0o644)).await;
+    let (pool, seen) = connect_and_record_at(&location, &db).await;
     assert_eq!(seen, [("", 0o600), ("-wal", 0o600), ("-shm", 0o600)]);
+    for suffix in ["", "-wal", "-shm"] {
+        set_mode(&sidecar(&db, suffix), 0o644);
+    }
+    prepare(&location).expect("prepare over 0644 files");
     for suffix in ["", "-wal", "-shm"] {
         assert_eq!(mode(&sidecar(&db, suffix)), 0o600, "{suffix}");
     }
@@ -568,8 +530,8 @@ async fn a_decoded_file_uri_path_names_the_file_sqlite_opens() {
 /// Locations that name a path SQLite does not open: `mod%65=memory`, which
 /// sqlx reads as `mode=memory`, and a `file:` URI with `vfs` or `immutable`
 /// in the query, which sqlx wraps so that SQLite opens a relative path spelled
-/// `file:...`. `prepare` and `restrict` create nothing in the directory the
-/// path names, and the in-memory connection leaves nothing there either.
+/// `file:...`. `prepare` creates nothing in the directory the path names, and
+/// the in-memory connection leaves nothing there either.
 #[tokio::test]
 async fn locations_sqlite_does_not_open_as_named_are_left_alone() {
     let tmp = temp_dir();
@@ -582,7 +544,6 @@ async fn locations_sqlite_does_not_open_as_named_are_left_alone() {
         format!("sqlite:file:{}?mode=rwc&immutable=1", db.display()),
     ] {
         prepare(&location).expect("prepare");
-        restrict(&location).expect("restrict");
     }
     let pool = connect(&in_memory, sqlx::sqlite::SqlitePoolOptions::new())
         .await
