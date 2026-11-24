@@ -440,13 +440,13 @@ mod tests {
             ))
             .is_ok()
         );
-        assert!(
-            v(&input(
+        assert_eq!(
+            message(v(&input(
                 ShardIteratorType::AtTimestamp,
                 None,
                 Some(now + 2.0)
-            ))
-            .is_err()
+            ))),
+            format!("One or more parameter values were invalid: {FUTURE}")
         );
     }
 

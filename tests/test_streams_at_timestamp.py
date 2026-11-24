@@ -193,21 +193,20 @@ class TestPositioning:
         # The group's own second, as an integer, includes the group.
         assert _values(_at(streams_client, arn, shard, ts(int(g2[0])))) == all_vals[3:]
         assert _values(_at(streams_client, arn, shard, ts(int(g3[0])))) == all_vals[6:]
-        # Fractional seconds inside the group's second skip it: the writes
-        # landed at +0.050 to about +0.100, so .5 and .999 start at group 3.
-        # Guard on the measured span so a slow write on a loaded host skips
-        # the probe instead of failing it.
-        if g2[1] < int(g2[0]) + 0.5:
-            assert _values(_at(streams_client, arn, shard, ts(int(g2[0]) + 0.5))) == all_vals[6:]
-            assert _values(_at(streams_client, arn, shard, ts(int(g2[0]) + 0.999))) == all_vals[6:]
-        else:
-            pytest.skip(f"group 2 spanned past +0.5 s ({g2[1] - int(g2[0]):.3f}); boundary probe not meaningful")
         # One second after the last record: nothing.
         assert _at(streams_client, arn, shard, ts(int(g3[1]) + 1)) == []
         # ApproximateCreationDateTime is whole seconds.
         recs = _at(streams_client, arn, shard, ts(g1[0] - 10))
         for r in recs:
             assert r["dynamodb"]["ApproximateCreationDateTime"].microsecond == 0
+        # Fractional seconds inside the group's second skip it: the writes
+        # landed at +0.050 to about +0.100, so .5 and .999 start at group 3.
+        # Last, and guarded on the measured span, so a slow write on a loaded
+        # host skips this probe alone instead of failing it.
+        if g2[1] >= int(g2[0]) + 0.5:
+            pytest.skip(f"group 2 spanned past +0.5 s ({g2[1] - int(g2[0]):.3f}); boundary probe not meaningful")
+        assert _values(_at(streams_client, arn, shard, ts(int(g2[0]) + 0.5))) == all_vals[6:]
+        assert _values(_at(streams_client, arn, shard, ts(int(g2[0]) + 0.999))) == all_vals[6:]
 
     def test_boundary_is_at_or_after_the_record_millisecond(self, dynamodb_client, streams_client, raw_streams_client, stream_table):
         """T equal to a record's own creation millisecond returns that record
@@ -464,12 +463,12 @@ class TestValidationMatrix:
             ShardIteratorType="AT_TIMESTAMP", Timestamp=int(time.time()) + 3600,
         )
         assert (code, msg) == ("ValidationException", PREFIX + "Timestamp parameter cannot be greater than the current timestamp")
-        code, _ = _error(
+        code, msg = _error(
             raw_streams_client.get_shard_iterator,
             StreamArn=arn, ShardId="shardId-00000000000000000000-00000000",
             ShardIteratorType="AT_TIMESTAMP", Timestamp=int(time.time()) - 60,
         )
-        assert code == "ResourceNotFoundException"
+        assert (code, msg) == ("ResourceNotFoundException", "Requested resource not found: Shard does not exist")
         assert shard  # the real shard still exists
 
     def test_near_future_is_accepted(self, dynamodb_client, streams_client, stream_table):
@@ -481,9 +480,9 @@ class TestValidationMatrix:
             Timestamp=datetime.fromtimestamp(time.time() + 0.5, tz=timezone.utc),
         )
         assert "ShardIterator" in resp
-        code, _ = _error(
+        code, msg = _error(
             streams_client.get_shard_iterator,
             StreamArn=arn, ShardId=shard, ShardIteratorType="AT_TIMESTAMP",
             Timestamp=datetime.fromtimestamp(time.time() + 5, tz=timezone.utc),
         )
-        assert code == "ValidationException"
+        assert (code, msg) == ("ValidationException", PREFIX + "Timestamp parameter cannot be greater than the current timestamp")
