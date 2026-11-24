@@ -4078,6 +4078,7 @@ async fn test_2pc_cas_sweeper_race_and_expired_committed_intent() {
                     stream_records: None,
                     ttl_mutations: None,
                     token_meta: None,
+                    base_guard: None,
                 };
                 eng_w.roll_forward(&tid_w, &state).await.unwrap();
                 true
@@ -4613,6 +4614,7 @@ async fn test_streams_contiguous_slots_concurrent_dedup_phantom_and_contention()
         }]),
         ttl_mutations: None,
         token_meta: None,
+        base_guard: None,
     };
     ctx.engine
         .roll_forward("txn-superseded-phantom", &superseded_state)
@@ -8426,5 +8428,1377 @@ async fn test_lsi_ordered_shadow_table_lifecycle_and_queries() {
     assert!(
         !admin.list_tables().await.unwrap().contains(&lsi_shadow),
         "DeleteTable must drop physical LSI shadow table {lsi_shadow}"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Fault-Injecting HTTP/2 Proxy Helper & Concurrency / Recovery Regression Suite
+// -----------------------------------------------------------------------------
+
+struct FaultInjectionProxy {
+    listen_addr: String,
+    shadow_delay_ms: Arc<std::sync::atomic::AtomicUsize>,
+    shadow_drop_budget: Arc<std::sync::atomic::AtomicUsize>,
+    shadow_pass_before_drop: Arc<std::sync::atomic::AtomicUsize>,
+    updated_val_delay_ms: Arc<std::sync::atomic::AtomicUsize>,
+    intent_delay_ms: Arc<std::sync::atomic::AtomicUsize>,
+    stream_record_delay_ms: Arc<std::sync::atomic::AtomicUsize>,
+    ending_seq_delay_ms: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FaultInjectionProxy {
+    async fn start(upstream_addr: String) -> Self {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fault injection proxy");
+        let listen_addr = listener.local_addr().expect("local_addr").to_string();
+        let shadow_delay_ms = Arc::new(AtomicUsize::new(0));
+        let shadow_drop_budget = Arc::new(AtomicUsize::new(0));
+        let shadow_pass_before_drop = Arc::new(AtomicUsize::new(0));
+        let updated_val_delay_ms = Arc::new(AtomicUsize::new(0));
+        let intent_delay_ms = Arc::new(AtomicUsize::new(0));
+        let stream_record_delay_ms = Arc::new(AtomicUsize::new(0));
+        let ending_seq_delay_ms = Arc::new(AtomicUsize::new(0));
+
+        let sd = shadow_delay_ms.clone();
+        let sdrop = shadow_drop_budget.clone();
+        let spass = shadow_pass_before_drop.clone();
+        let uvd = updated_val_delay_ms.clone();
+        let idel = intent_delay_ms.clone();
+        let srdel = stream_record_delay_ms.clone();
+        let esdel = ending_seq_delay_ms.clone();
+
+        tokio::spawn(async move {
+            while let Ok((client_sock, _)) = listener.accept().await {
+                let upstream = upstream_addr.clone();
+                let sd = sd.clone();
+                let sdrop = sdrop.clone();
+                let spass = spass.clone();
+                let uvd = uvd.clone();
+                let idel = idel.clone();
+                let srdel = srdel.clone();
+                let esdel = esdel.clone();
+
+                tokio::spawn(async move {
+                    let Ok(server_sock) = TcpStream::connect(&upstream).await else {
+                        return;
+                    };
+                    let _ = client_sock.set_nodelay(true);
+                    let _ = server_sock.set_nodelay(true);
+                    let (mut cr, mut cw) = client_sock.into_split();
+                    let (mut sr, mut sw) = server_sock.into_split();
+
+                    let c2s = tokio::spawn(async move {
+                        let mut buf = vec![0u8; 65_536];
+                        while let Ok(n) = cr.read(&mut buf).await {
+                            if n == 0 {
+                                break;
+                            }
+                            let chunk = &buf[..n];
+                            let contains = |pat: &[u8]| chunk.windows(pat.len()).any(|w| w == pat);
+
+                            let hits_shadow = contains(b"_g") && !contains(b"__extenddb_");
+                            if contains(b"updated") && !hits_shadow {
+                                let d = uvd.swap(0, Ordering::SeqCst);
+                                if d > 0 {
+                                    tokio::time::sleep(Duration::from_millis(d as u64)).await;
+                                }
+                            }
+                            if contains(b"intent:sgl-") {
+                                let d = idel.swap(0, Ordering::SeqCst);
+                                if d > 0 {
+                                    tokio::time::sleep(Duration::from_millis(d as u64)).await;
+                                }
+                            }
+                            if contains(b"stream_record:") && contains(b"NEW_AND_OLD_IMAGES") {
+                                let d = srdel.swap(0, Ordering::SeqCst);
+                                if d > 0 {
+                                    tokio::time::sleep(Duration::from_millis(d as u64)).await;
+                                }
+                            }
+                            if contains(b"\"ending_sequence_number\":\"1") {
+                                let d = esdel.swap(0, Ordering::SeqCst);
+                                if d > 0 {
+                                    tokio::time::sleep(Duration::from_millis(d as u64)).await;
+                                }
+                            }
+                            if hits_shadow {
+                                let d = sd.swap(0, Ordering::SeqCst);
+                                if d > 0 {
+                                    tokio::time::sleep(Duration::from_millis(d as u64)).await;
+                                }
+                                let pass_left = spass.load(Ordering::SeqCst);
+                                if pass_left > 0 {
+                                    spass.fetch_sub(1, Ordering::SeqCst);
+                                } else {
+                                    let drop_left = sdrop.load(Ordering::SeqCst);
+                                    if drop_left > 0 {
+                                        sdrop.fetch_sub(1, Ordering::SeqCst);
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if sw.write_all(chunk).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+
+                    let s2c = tokio::spawn(async move {
+                        let mut buf = vec![0u8; 65_536];
+                        while let Ok(n) = sr.read(&mut buf).await {
+                            if n == 0 {
+                                break;
+                            }
+                            if cw.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+
+                    tokio::select! {
+                        _ = c2s => {},
+                        _ = s2c => {},
+                    }
+                });
+            }
+        });
+
+        Self {
+            listen_addr,
+            shadow_delay_ms,
+            shadow_drop_budget,
+            shadow_pass_before_drop,
+            updated_val_delay_ms,
+            intent_delay_ms,
+            stream_record_delay_ms,
+            ending_seq_delay_ms,
+        }
+    }
+}
+
+async fn setup_fault_proxy_context(
+    intent_timeout_secs: u64,
+) -> Option<(
+    Arc<BigtableClient>,
+    Arc<BigtableEngine>,
+    Arc<BigtableEngine>,
+    FaultInjectionProxy,
+    String,
+)> {
+    let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
+    let project_id = format!("flt-proj-{suffix}");
+    let instance_id = format!("flt-inst-{suffix}");
+
+    let probe_cfg = BigtableStorageConfig {
+        project_id: project_id.clone(),
+        instance_id: instance_id.clone(),
+        pool_size: 1,
+        intent_timeout_secs,
+        ..BigtableStorageConfig::default()
+    };
+    let (emulator_host, clean_client) = resolve_reachable_emulator_host(&probe_cfg).await?;
+
+    let mut clean_cfg = probe_cfg;
+    clean_cfg.emulator_host = Some(emulator_host.clone());
+
+    let bootstrapper = BigtableBootstrapper::new(clean_cfg);
+    bootstrapper.create_catalog_db().await.unwrap();
+    bootstrapper.create_data_db().await.unwrap();
+    let target = bootstrapper.init_target();
+    let lock = BigtableCatalogMigrations
+        .lock(&target, Duration::from_secs(10))
+        .await
+        .unwrap();
+    BigtableCatalogMigrations
+        .run(&lock, env!("CARGO_PKG_VERSION"), RunKind::Create)
+        .await
+        .unwrap();
+    BigtableCatalogMigrations.release(lock).await;
+
+    let engine_clean = Arc::new(BigtableEngine::new(
+        clean_client.clone(),
+        clean_client.clone(),
+        intent_timeout_secs,
+    ));
+
+    let proxy = FaultInjectionProxy::start(emulator_host).await;
+    let proxy_cfg = BigtableStorageConfig {
+        project_id,
+        instance_id,
+        emulator_host: Some(proxy.listen_addr.clone()),
+        pool_size: 1,
+        intent_timeout_secs,
+        ..BigtableStorageConfig::default()
+    };
+    let proxy_client = Arc::new(BigtableClient::connect(&proxy_cfg).await.unwrap());
+    let engine_proxy = Arc::new(BigtableEngine::new(
+        proxy_client.clone(),
+        proxy_client,
+        intent_timeout_secs,
+    ));
+
+    Some((
+        clean_client,
+        engine_clean,
+        engine_proxy,
+        proxy,
+        "123456789012".to_string(),
+    ))
+}
+
+fn single_hash_table_with_all_gsi(name: &str) -> CreateTableInput {
+    CreateTableInput {
+        table_name: name.to_string(),
+        key_schema: vec![KeySchemaElement {
+            attribute_name: "pk".into(),
+            key_type: KeyType::Hash,
+        }],
+        attribute_definitions: vec![
+            AttributeDefinition {
+                attribute_name: "pk".into(),
+                attribute_type: ScalarAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "gsi_pk".into(),
+                attribute_type: ScalarAttributeType::S,
+            },
+        ],
+        billing_mode: Some(BillingMode::PayPerRequest),
+        deletion_protection_enabled: Some(false),
+        global_secondary_indexes: Some(vec![GsiInput {
+            index_name: "gsi_idx".into(),
+            key_schema: vec![KeySchemaElement {
+                attribute_name: "gsi_pk".into(),
+                key_type: KeyType::Hash,
+            }],
+            projection: Projection {
+                projection_type: ProjectionType::All,
+                non_key_attributes: None,
+            },
+            provisioned_throughput: None,
+            warm_throughput: None,
+        }]),
+        ..CreateTableInput::default()
+    }
+}
+
+#[tokio::test]
+async fn test_admin_create_table_idempotency_and_missing_family_reconciliation() {
+    use extenddb_storage_bigtable::data::admin::gc_max_versions;
+
+    let Some(ctx) = setup_emulator_context().await else {
+        eprintln!("Skipping Bigtable test: emulator unavailable");
+        return;
+    };
+    let mut admin = AdminClient::connect(&ctx.client).await.unwrap();
+    let table_id = unique_name("t_admin_reconcile");
+
+    admin
+        .create_table(&table_id, &[("d", None), ("m", Some(gc_max_versions(1)))])
+        .await
+        .expect("fresh create_table succeeds");
+
+    // Re-running create_table when all families already exist must succeed without error.
+    admin
+        .create_table(&table_id, &[("d", None), ("m", Some(gc_max_versions(1)))])
+        .await
+        .expect("idempotent create_table on existing table succeeds");
+
+    // Re-running create_table with additional families on an existing table reconciles only missing families.
+    admin
+        .create_table(
+            &table_id,
+            &[
+                ("d", None),
+                ("m", Some(gc_max_versions(1))),
+                ("t", Some(gc_max_versions(1))),
+                ("x", Some(gc_max_versions(1))),
+            ],
+        )
+        .await
+        .expect("create_table reconciles missing column families on existing table");
+
+    ctx.client
+        .data()
+        .mutate_row(MutateRowRequest {
+            table_name: ctx.client.full_table_name(&table_id),
+            row_key: b"probe".to_vec(),
+            mutations: vec![Mutation {
+                mutation: Some(mutation::Mutation::SetCell(mutation::SetCell {
+                    family_name: "x".into(),
+                    column_qualifier: b"q".to_vec(),
+                    timestamp_micros: extenddb_storage_bigtable::data::item_ops::now_millis_micros(
+                    ),
+                    value: b"ok".to_vec(),
+                })),
+            }],
+            ..MutateRowRequest::default()
+        })
+        .await
+        .expect("write to newly reconciled column family succeeds");
+
+    admin.delete_table(&table_id).await.unwrap();
+}
+
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn test_chunked_mutation_fencing_prevents_torn_reads_and_delete_zombies() {
+    use extenddb_storage_bigtable::data::encoding::{cell, row_key};
+    use extenddb_storage_bigtable::data::item_ops::{
+        CasOutcome, ItemOps, now_millis_micros, with_max_mutations_per_rpc,
+    };
+    use extenddb_storage_bigtable::sweeper;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let Some((clean_client, engine1, engine_proxy, proxy, acct)) =
+        setup_fault_proxy_context(2).await
+    else {
+        eprintln!("Skipping Bigtable test: emulator unavailable");
+        return;
+    };
+    let engine2 = Arc::new(BigtableEngine::new(
+        clean_client.clone(),
+        clean_client.clone(),
+        2,
+    ));
+    let tbl = unique_name("tbl_chunked_fencing");
+    let desc = engine1
+        .create_table(&acct, single_hash_table_with_all_gsi(&tbl))
+        .await
+        .unwrap();
+    let ki = engine1.table_key_info(&acct, &tbl).await.unwrap();
+    let dt = format!("t{}", &desc.table_id.replace('-', "")[..16]);
+    let shadow_tbl = extenddb_storage_bigtable::gsi::shadow_table_id(&dt, "gsi_idx");
+    let maps = ExpressionMaps::default();
+
+    let mk_wide = |pk: &str, gsi: &str, tag: &str| -> Item {
+        let mut it = BTreeMap::new();
+        it.insert("pk".to_owned(), AttributeValue::S(pk.to_owned()));
+        it.insert("gsi_pk".to_owned(), AttributeValue::S(gsi.to_owned()));
+        for idx in 0..36 {
+            it.insert(
+                format!("z_attr_{idx:02}"),
+                AttributeValue::S(format!("{tag}_{idx:02}")),
+            );
+        }
+        it
+    };
+
+    let verify_generation_coherence = |it: &Item| -> Result<(), String> {
+        if it.len() != 38 {
+            return Err(format!("expected 38 attributes, got {}", it.len()));
+        }
+        let Some(AttributeValue::S(first_val)) = it.get("z_attr_00") else {
+            return Err("missing z_attr_00".to_string());
+        };
+        let Some((prefix, _)) = first_val.rsplit_once('_') else {
+            return Err(format!("unexpected z_attr_00 value {first_val}"));
+        };
+        for idx in 1..36 {
+            let attr = format!("z_attr_{idx:02}");
+            let expected = format!("{prefix}_{idx:02}");
+            match it.get(&attr) {
+                Some(AttributeValue::S(actual)) if actual == &expected => {}
+                other => {
+                    return Err(format!(
+                        "inconsistent generation across chunks at {attr}: expected {expected}, got {other:?}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    };
+
+    // Part 0a: Fresh absent-row `(None, false)` multi-chunk `TransactWriteItems` + `ALL`-GSI shadow (`limit = 4`).
+    let fresh_txn_item = mk_wide("k_absent_txn", "g_absent_txn", "init0");
+    with_max_mutations_per_rpc(4, async {
+        engine1
+            .transact_write_items(
+                &[TransactWriteOp::Put {
+                    key_info: &ki,
+                    item: &fresh_txn_item,
+                    condition: None,
+                    maps: &maps,
+                    return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+                    stream: None,
+                }],
+                None,
+            )
+            .await
+    })
+    .await
+    .expect("absent-row multi-chunk TransactWriteItems must succeed");
+    let got_fresh_txn = engine1
+        .get_item(&ki, &s_item(&[("pk", "k_absent_txn")]))
+        .await
+        .unwrap()
+        .expect("k_absent_txn must exist");
+    verify_generation_coherence(&got_fresh_txn).unwrap();
+
+    // Part 0b: Unversioned existing row `(None, true)` (raw `d:` cells without `m:v`) multi-chunk `TransactWriteItems`.
+    let unversioned_rk =
+        row_key::encode_key(&s_item(&[("pk", "k_unversioned")]), &ki.key_schema).unwrap();
+    clean_client
+        .data()
+        .mutate_row(MutateRowRequest {
+            table_name: clean_client.full_table_name(&dt),
+            row_key: unversioned_rk,
+            mutations: vec![Mutation {
+                mutation: Some(mutation::Mutation::SetCell(mutation::SetCell {
+                    family_name: "d".into(),
+                    column_qualifier: b"pk".to_vec(),
+                    timestamp_micros: now_millis_micros(),
+                    value: cell::encode(&AttributeValue::S("k_unversioned".into())).unwrap(),
+                })),
+            }],
+            ..MutateRowRequest::default()
+        })
+        .await
+        .unwrap();
+    let unversioned_next = mk_wide("k_unversioned", "g_unversioned", "unv1");
+    with_max_mutations_per_rpc(4, async {
+        engine1
+            .transact_write_items(
+                &[TransactWriteOp::Put {
+                    key_info: &ki,
+                    item: &unversioned_next,
+                    condition: None,
+                    maps: &maps,
+                    return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+                    stream: None,
+                }],
+                None,
+            )
+            .await
+    })
+    .await
+    .expect("unversioned-row multi-chunk TransactWriteItems must succeed");
+    let got_unversioned = engine1
+        .get_item(&ki, &s_item(&[("pk", "k_unversioned")]))
+        .await
+        .unwrap()
+        .expect("k_unversioned must exist");
+    verify_generation_coherence(&got_unversioned).unwrap();
+
+    // Part 0c: Multi-chunk `UpdateItem` growing a small row above `max_mutations_per_rpc`.
+    engine1
+        .put_item(
+            &ki,
+            s_item(&[("pk", "k_upd_grow"), ("gsi_pk", "g_upd_grow")]),
+            false,
+            None,
+            &maps,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut set_clauses = Vec::new();
+    let mut upd_maps = ExpressionMaps::default();
+    for idx in 0..36 {
+        set_clauses.push(format!("z_attr_{idx:02} = :v{idx:02}"));
+        upd_maps.values.insert(
+            format!("v{idx:02}"),
+            AttributeValue::S(format!("updg_{idx:02}")),
+        );
+    }
+    let upd_actions = parse_upd(&format!("SET {}", set_clauses.join(", ")));
+    let (_, upd_new) = with_max_mutations_per_rpc(
+        4,
+        engine1.update_item(
+            &ki,
+            &s_item(&[("pk", "k_upd_grow")]),
+            &upd_actions,
+            false,
+            true,
+            None,
+            &upd_maps,
+            None,
+        ),
+    )
+    .await
+    .expect("multi-chunk UpdateItem must succeed");
+    verify_generation_coherence(&upd_new.unwrap()).unwrap();
+
+    // Part 0d: Stalled mid-chunk shadow write (`limit = 4`) immediately superseded by `delete_item` without lockout.
+    let _ = engine_proxy
+        .get_item(&ki, &s_item(&[("pk", "k_mid_shd")]))
+        .await
+        .unwrap();
+    proxy.shadow_pass_before_drop.store(2, Ordering::SeqCst);
+    proxy.shadow_drop_budget.store(8, Ordering::SeqCst);
+    with_max_mutations_per_rpc(
+        4,
+        engine_proxy.put_item(
+            &ki,
+            mk_wide("k_mid_shd", "g_mid_shd", "stall0"),
+            false,
+            None,
+            &maps,
+            None,
+        ),
+    )
+    .await
+    .expect("put_item with mid-chunk shadow fault delegates to sweeper without error");
+    proxy.shadow_drop_budget.store(0, Ordering::SeqCst);
+
+    engine1
+        .delete_item(
+            &ki,
+            &s_item(&[("pk", "k_mid_shd")]),
+            false,
+            None,
+            &maps,
+            None,
+        )
+        .await
+        .expect("delete_item must immediately supersede stalled multi-chunk shadow row");
+    sweeper::sweep_once(&engine1).await.unwrap();
+    let kc = parse_kc("gsi_pk = :v");
+    let mut qm_mid = ExpressionMaps::default();
+    qm_mid
+        .values
+        .insert("v".into(), AttributeValue::S("g_mid_shd".into()));
+    let (mid_rows, _) = engine1
+        .query(&ki, &kc, &qm_mid, true, None, None, Some("gsi_idx"))
+        .await
+        .unwrap();
+    assert!(
+        mid_rows.is_empty(),
+        "superseded mid-chunk shadow row must be cleanly retired: {mid_rows:?}"
+    );
+
+    // Part 1: Multi-chunk `PutItem` (`limit = 4`) vs concurrent `GetItem` and `TransactGetItems`.
+    engine1
+        .put_item(&ki, mk_wide("k1", "g0", "gen0"), false, None, &maps, None)
+        .await
+        .unwrap();
+
+    let done = Arc::new(AtomicBool::new(false));
+    let done_w = done.clone();
+    let eng_w = engine1.clone();
+    let ki_w = ki.clone();
+    let writer = tokio::spawn(async move {
+        let m = ExpressionMaps::default();
+        for g in 1..=60 {
+            let it = mk_wide("k1", "g0", &format!("gen{g}"));
+            with_max_mutations_per_rpc(4, eng_w.put_item(&ki_w, it, false, None, &m, None))
+                .await
+                .unwrap();
+            if done_w.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+    });
+
+    let key_k1 = s_item(&[("pk", "k1")]);
+    let mut torn_get: Option<String> = None;
+    let mut torn_tget: Option<String> = None;
+    for _ in 0..350 {
+        if torn_get.is_none()
+            && let Some(it) = engine2.get_item(&ki, &key_k1).await.unwrap()
+            && let Err(reason) = verify_generation_coherence(&it)
+        {
+            torn_get = Some(reason);
+        }
+        if torn_tget.is_none() {
+            let tget = engine2
+                .transact_get_items(&[TransactGetOp {
+                    key_info: &ki,
+                    key: &key_k1,
+                }])
+                .await
+                .unwrap();
+            if let Some(Some(it)) = tget.into_iter().next()
+                && let Err(reason) = verify_generation_coherence(&it)
+            {
+                torn_tget = Some(reason);
+            }
+        }
+        if torn_get.is_some() || torn_tget.is_some() {
+            break;
+        }
+    }
+    done.store(true, Ordering::Relaxed);
+    writer.await.unwrap();
+
+    assert!(
+        torn_get.is_none(),
+        "GetItem observed torn multi-chunk write: {torn_get:?}"
+    );
+    assert!(
+        torn_tget.is_none(),
+        "TransactGetItems observed torn multi-chunk write: {torn_tget:?}"
+    );
+
+    // Part 2: Concurrent multi-chunk `PutItem` (`limit = 6`) vs `DeleteItem` + base/GSI consistency.
+    let mut zombie_base: Option<(u64, usize, bool)> = None;
+    let mut gsi_mismatch: Option<(u64, bool, usize)> = None;
+    for round in 0..50u64 {
+        let pk = format!("k_del_{round}");
+        let gsi_val = format!("g_del_{round}");
+        let it = mk_wide(&pk, &gsi_val, "v1");
+        let eng_put = engine1.clone();
+        let ki_put = ki.clone();
+        let put_task = tokio::spawn(async move {
+            let m = ExpressionMaps::default();
+            with_max_mutations_per_rpc(6, eng_put.put_item(&ki_put, it, false, None, &m, None))
+                .await
+        });
+        tokio::time::sleep(Duration::from_micros(80 + (round % 15) * 60)).await;
+        let del_key = s_item(&[("pk", &pk)]);
+        let del_res = engine2
+            .delete_item(&ki, &del_key, true, None, &maps, None)
+            .await;
+        let put_res = put_task.await.unwrap();
+        let del_old = del_res.expect("concurrent DeleteItem must not fail");
+        put_res.expect("concurrent multi-chunk PutItem must not fail");
+        if let Some(old_item) = &del_old {
+            assert_eq!(old_item.len(), 38);
+            assert!(old_item.contains_key("pk"));
+        }
+        let final_base = engine1.get_item(&ki, &del_key).await.unwrap();
+        if let Some(final_item) = &final_base
+            && (final_item.len() != 38 || !final_item.contains_key("pk") || del_old.is_some())
+        {
+            zombie_base = Some((round, final_item.len(), final_item.contains_key("pk")));
+            break;
+        }
+        let mut qmaps = ExpressionMaps::default();
+        qmaps.values.insert("v".into(), AttributeValue::S(gsi_val));
+        let (gsi_rows, _) = engine1
+            .query(&ki, &kc, &qmaps, true, None, None, Some("gsi_idx"))
+            .await
+            .unwrap();
+        let expected_gsi_len = usize::from(final_base.is_some());
+        if gsi_rows.len() != expected_gsi_len || gsi_rows.first().is_some_and(|r| r.len() != 38) {
+            gsi_mismatch = Some((round, final_base.is_some(), gsi_rows.len()));
+            break;
+        }
+    }
+
+    assert!(
+        zombie_base.is_none(),
+        "Concurrent multi-chunk PutItem and DeleteItem produced zombie/partial row: {zombie_base:?}"
+    );
+    assert!(
+        gsi_mismatch.is_none(),
+        "Concurrent multi-chunk PutItem and DeleteItem left GSI out of sync with base: {gsi_mismatch:?}"
+    );
+
+    // Part 3: Direct `ItemOps::put_cas` and `ItemOps::put_shadow_versioned` multi-chunk checks.
+    let ops = ItemOps::new(&clean_client, &dt, 2);
+    let direct_item = mk_wide("k_direct", "g_direct", "direct1");
+    let direct_res =
+        with_max_mutations_per_rpc(5, ops.put_cas(&ki, &direct_item, None, false)).await;
+    assert!(matches!(direct_res, Ok(CasOutcome::Applied(_))));
+    let got_direct = engine1
+        .get_item(&ki, &s_item(&[("pk", "k_direct")]))
+        .await
+        .unwrap()
+        .unwrap();
+    verify_generation_coherence(&got_direct).unwrap();
+
+    let shadow_ops = ItemOps::new(&clean_client, &shadow_tbl, 2);
+    let shadow_rk = row_key::encode_key(&s_item(&[("pk", "shd_probe")]), &ki.key_schema).unwrap();
+    assert!(
+        with_max_mutations_per_rpc(
+            5,
+            shadow_ops.put_shadow_versioned(&shadow_rk, &direct_item, 100),
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        shadow_ops
+            .delete_shadow_versioned(&shadow_rk, 200)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !with_max_mutations_per_rpc(
+            5,
+            shadow_ops.put_shadow_versioned(&shadow_rk, &direct_item, 150),
+        )
+        .await
+        .unwrap(),
+        "stale multi-chunk shadow put must be rejected when m:v is already higher"
+    );
+    assert!(
+        with_max_mutations_per_rpc(
+            5,
+            shadow_ops.put_shadow_versioned(&shadow_rk, &direct_item, 250),
+        )
+        .await
+        .unwrap(),
+        "newer multi-chunk shadow put after delete must succeed cleanly"
+    );
+}
+
+#[tokio::test]
+async fn test_delayed_inline_shadow_write_does_not_resurrect_deleted_gsi_entry() {
+    use extenddb_storage_bigtable::{gsi_worker, sweeper};
+    use std::sync::atomic::Ordering;
+
+    let Some((_client, engine_clean, engine_proxy, proxy, acct)) =
+        setup_fault_proxy_context(2).await
+    else {
+        eprintln!("Skipping Bigtable test: emulator unavailable");
+        return;
+    };
+    let tbl = unique_name("tbl_delayed_shadow");
+    engine_clean
+        .create_table(&acct, single_hash_table_with_all_gsi(&tbl))
+        .await
+        .unwrap();
+    let ki = engine_clean.table_key_info(&acct, &tbl).await.unwrap();
+    let maps = ExpressionMaps::default();
+
+    let _ = engine_proxy
+        .get_item(&ki, &s_item(&[("pk", "u1")]))
+        .await
+        .unwrap();
+    proxy.shadow_delay_ms.store(2400, Ordering::SeqCst);
+
+    let ep = engine_proxy.clone();
+    let ki_w1 = ki.clone();
+    let w1 = tokio::spawn(async move {
+        ep.put_item(
+            &ki_w1,
+            s_item(&[("pk", "u1"), ("gsi_pk", "stale_val")]),
+            false,
+            None,
+            &ExpressionMaps::default(),
+            None,
+        )
+        .await
+        .unwrap()
+    });
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    engine_clean
+        .delete_item(&ki, &s_item(&[("pk", "u1")]), false, None, &maps, None)
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    sweeper::sweep_once(&engine_clean).await.unwrap();
+    w1.await.unwrap();
+    sweeper::sweep_once(&engine_clean).await.unwrap();
+    gsi_worker::sweep_once(&engine_clean).await.unwrap();
+
+    let base_after = engine_clean
+        .get_item(&ki, &s_item(&[("pk", "u1")]))
+        .await
+        .unwrap();
+    let kc = parse_kc("gsi_pk = :v");
+    let mut qmaps = ExpressionMaps::default();
+    qmaps
+        .values
+        .insert("v".into(), AttributeValue::S("stale_val".into()));
+    let (gsi_rows, _) = engine_clean
+        .query(&ki, &kc, &qmaps, true, None, None, Some("gsi_idx"))
+        .await
+        .unwrap();
+
+    assert!(base_after.is_none());
+    assert!(
+        gsi_rows.is_empty(),
+        "Delayed inline GSI write must not resurrect deleted item in GSI: {gsi_rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_sweeper_deferred_side_effect_recovery_skips_deleted_base_and_cleans_multihop_gsi() {
+    use extenddb_storage_bigtable::{gsi_worker, sweeper};
+    use std::sync::atomic::Ordering;
+
+    let Some((_client, engine_clean, engine_proxy, proxy, acct)) =
+        setup_fault_proxy_context(2).await
+    else {
+        eprintln!("Skipping Bigtable test: emulator unavailable");
+        return;
+    };
+    let tbl = unique_name("tbl_deferred_recovery");
+    engine_clean
+        .create_table(&acct, single_hash_table_with_all_gsi(&tbl))
+        .await
+        .unwrap();
+    let ki = engine_clean.table_key_info(&acct, &tbl).await.unwrap();
+    let maps = ExpressionMaps::default();
+    let kc = parse_kc("gsi_pk = :v");
+
+    // 1. Seed `initial_val`, update to `deleted_val` with dropped shadow RPCs, then delete `u1`.
+    //    Even when sweeper initially hits transient shadow failures past the tombstone grace window,
+    //    neither `initial_val` nor `deleted_val` may survive once recovery settles.
+    engine_clean
+        .put_item(
+            &ki,
+            s_item(&[("pk", "u1"), ("gsi_pk", "initial_val")]),
+            false,
+            None,
+            &maps,
+            None,
+        )
+        .await
+        .unwrap();
+
+    proxy.shadow_drop_budget.store(12, Ordering::SeqCst);
+    engine_proxy
+        .put_item(
+            &ki,
+            s_item(&[("pk", "u1"), ("gsi_pk", "deleted_val")]),
+            false,
+            None,
+            &maps,
+            None,
+        )
+        .await
+        .unwrap();
+    proxy.shadow_drop_budget.store(0, Ordering::SeqCst);
+
+    engine_clean
+        .delete_item(&ki, &s_item(&[("pk", "u1")]), false, None, &maps, None)
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    proxy.shadow_drop_budget.store(12, Ordering::SeqCst);
+    sweeper::sweep_once(&engine_proxy).await.unwrap();
+    proxy.shadow_drop_budget.store(0, Ordering::SeqCst);
+
+    sweeper::sweep_once(&engine_clean).await.unwrap();
+    gsi_worker::sweep_once(&engine_clean).await.unwrap();
+
+    let base_after = engine_clean
+        .get_item(&ki, &s_item(&[("pk", "u1")]))
+        .await
+        .unwrap();
+    assert!(base_after.is_none());
+
+    for check_val in ["initial_val", "deleted_val"] {
+        let mut qmaps = ExpressionMaps::default();
+        qmaps
+            .values
+            .insert("v".into(), AttributeValue::S(check_val.into()));
+        let (gsi_rows, _) = engine_clean
+            .query(&ki, &kc, &qmaps, true, None, None, Some("gsi_idx"))
+            .await
+            .unwrap();
+        assert!(
+            gsi_rows.is_empty(),
+            "Deferred post-commit recovery must not leave '{check_val}' in GSI: {gsi_rows:?}"
+        );
+    }
+
+    // 2. Multi-hop GSI update (`hop_a -> hop_b [deferred] -> hop_c`) must still delete `hop_a`
+    //    while skipping superseded `Put("hop_b")`.
+    engine_clean
+        .put_item(
+            &ki,
+            s_item(&[("pk", "u_hop"), ("gsi_pk", "hop_a")]),
+            false,
+            None,
+            &maps,
+            None,
+        )
+        .await
+        .unwrap();
+
+    proxy.shadow_drop_budget.store(12, Ordering::SeqCst);
+    engine_proxy
+        .put_item(
+            &ki,
+            s_item(&[("pk", "u_hop"), ("gsi_pk", "hop_b")]),
+            false,
+            None,
+            &maps,
+            None,
+        )
+        .await
+        .unwrap();
+    proxy.shadow_drop_budget.store(0, Ordering::SeqCst);
+
+    engine_clean
+        .put_item(
+            &ki,
+            s_item(&[("pk", "u_hop"), ("gsi_pk", "hop_c")]),
+            false,
+            None,
+            &maps,
+            None,
+        )
+        .await
+        .unwrap();
+
+    sweeper::sweep_once(&engine_clean).await.unwrap();
+    gsi_worker::sweep_once(&engine_clean).await.unwrap();
+
+    for (val, expected_count) in [("hop_a", 0usize), ("hop_b", 0usize), ("hop_c", 1usize)] {
+        let mut hm = ExpressionMaps::default();
+        hm.values
+            .insert("v".into(), AttributeValue::S(val.to_string()));
+        let (rows, _) = engine_clean
+            .query(&ki, &kc, &hm, true, None, None, Some("gsi_idx"))
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            expected_count,
+            "unexpected GSI row count for {val}: {rows:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_ahead_of_clock_tombstone_reclamation_preserves_subsequent_gsi_inserts() {
+    use extenddb_storage_bigtable::data::encoding::row_key;
+    use extenddb_storage_bigtable::data::item_ops::{ItemOps, now_millis};
+    use extenddb_storage_bigtable::transact::{
+        ParticipantMutation, ParticipantRow, TxnCoordinator, TxnOpPayload,
+    };
+    use extenddb_storage_bigtable::{gsi_worker, sweeper};
+    use std::sync::atomic::Ordering;
+
+    let Some((client, engine_clean, engine_proxy, proxy, acct)) =
+        setup_fault_proxy_context(2).await
+    else {
+        eprintln!("Skipping Bigtable test: emulator unavailable");
+        return;
+    };
+    let tbl = unique_name("tbl_ahead_tombstone");
+    let desc = engine_clean
+        .create_table(&acct, single_hash_table_with_all_gsi(&tbl))
+        .await
+        .unwrap();
+    let ki = engine_clean.table_key_info(&acct, &tbl).await.unwrap();
+    let dt = format!("t{}", &desc.table_id.replace('-', "")[..16]);
+    let maps = ExpressionMaps::default();
+
+    let item_va = s_item(&[("pk", "k_hot"), ("gsi_pk", "vA")]);
+    let rk = row_key::encode_key(&item_va, &ki.key_schema).unwrap();
+
+    // Seed row at an OCC version ahead of wall clock (e.g., sub-ms hot-key burst or peer clock skew).
+    let v_ahead = now_millis() + 6_000;
+    let coord = TxnCoordinator::new(&client, Duration::from_secs(2));
+    let part = ParticipantRow {
+        data_table: dt.clone(),
+        row_key: rk.clone(),
+    };
+    let (_, started_at) = coord
+        .open_with_token("txn-ahead-seed", std::slice::from_ref(&part), None)
+        .await
+        .unwrap();
+    assert!(
+        coord
+            .place_intent_once("txn-ahead-seed", &part)
+            .await
+            .unwrap()
+    );
+    coord
+        .try_commit_full(
+            "txn-ahead-seed",
+            started_at,
+            &[ParticipantMutation {
+                participant: part,
+                payload: TxnOpPayload::Put {
+                    item: item_va.clone(),
+                },
+                expected_version: None,
+                row_existed: false,
+                new_version: Some(v_ahead),
+            }],
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    let key_hot = s_item(&[("pk", "k_hot")]);
+    let _ = engine_clean.get_item(&ki, &key_hot).await.unwrap();
+    engine_clean
+        .put_item(&ki, item_va.clone(), false, None, &maps, None)
+        .await
+        .unwrap();
+
+    proxy.shadow_drop_budget.store(6, Ordering::SeqCst);
+    engine_proxy
+        .delete_item(&ki, &key_hot, false, None, &maps, None)
+        .await
+        .unwrap();
+    proxy.shadow_drop_budget.store(0, Ordering::SeqCst);
+
+    // Direct reclamation attempt while wall clock has not caught up to the tombstone version must refuse.
+    let ops = ItemOps::new(&client, &dt, 2);
+    assert!(
+        !ops.reclaim_version_only_row(&rk, v_ahead + 2)
+            .await
+            .unwrap(),
+        "reclaim_version_only_row must refuse while wall clock <= expected_version"
+    );
+
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
+    sweeper::sweep_once(&engine_clean).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    sweeper::sweep_once(&engine_clean).await.unwrap();
+
+    engine_clean
+        .put_item(&ki, item_va, false, None, &maps, None)
+        .await
+        .unwrap();
+
+    sweeper::sweep_once(&engine_clean).await.unwrap();
+    gsi_worker::sweep_once(&engine_clean).await.unwrap();
+
+    let base_after = engine_clean.get_item(&ki, &key_hot).await.unwrap();
+    let kc = parse_kc("gsi_pk = :v");
+    let mut qmaps = ExpressionMaps::default();
+    qmaps
+        .values
+        .insert("v".into(), AttributeValue::S("vA".into()));
+    let (gsi_after, _) = engine_clean
+        .query(&ki, &kc, &qmaps, true, None, None, Some("gsi_idx"))
+        .await
+        .unwrap();
+
+    assert!(base_after.is_some());
+    assert_eq!(
+        gsi_after.len(),
+        1,
+        "Re-inserted item after ahead-of-clock delete must retain its live GSI entry: {gsi_after:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_concurrent_put_item_during_stream_disable_never_exceeds_ending_sequence_number() {
+    use extenddb_core::types::UpdateTableInput;
+    use std::sync::atomic::Ordering;
+
+    let Some((clean_client, engine_clean, engine_writer, proxy_writer, acct)) =
+        setup_fault_proxy_context(10).await
+    else {
+        eprintln!("Skipping Bigtable test: emulator unavailable");
+        return;
+    };
+
+    let emulator_host = clean_client.emulator_host.clone().unwrap();
+    let proxy_closer = FaultInjectionProxy::start(emulator_host).await;
+    let closer_cfg = BigtableStorageConfig {
+        project_id: clean_client.project_id.clone(),
+        instance_id: clean_client.instance_id.clone(),
+        emulator_host: Some(proxy_closer.listen_addr.clone()),
+        pool_size: 1,
+        intent_timeout_secs: 10,
+        ..BigtableStorageConfig::default()
+    };
+    let closer_client = Arc::new(BigtableClient::connect(&closer_cfg).await.unwrap());
+    let engine_closer = Arc::new(BigtableEngine::new(
+        closer_client.clone(),
+        closer_client,
+        10,
+    ));
+
+    let tbl = unique_name("tbl_stream_seal");
+    let desc = engine_clean
+        .create_table(
+            &acct,
+            CreateTableInput {
+                table_name: tbl.clone(),
+                key_schema: vec![KeySchemaElement {
+                    attribute_name: "pk".into(),
+                    key_type: KeyType::Hash,
+                }],
+                attribute_definitions: vec![AttributeDefinition {
+                    attribute_name: "pk".into(),
+                    attribute_type: ScalarAttributeType::S,
+                }],
+                billing_mode: Some(BillingMode::PayPerRequest),
+                deletion_protection_enabled: Some(false),
+                stream_specification: Some(StreamSpecification {
+                    stream_enabled: true,
+                    stream_view_type: Some(StreamViewType::NewAndOldImages),
+                }),
+                ..CreateTableInput::default()
+            },
+        )
+        .await
+        .unwrap();
+    let stream_arn = desc.latest_stream_arn.clone().unwrap();
+    let ki = engine_clean.table_key_info(&acct, &tbl).await.unwrap();
+    let maps = ExpressionMaps::default();
+    let capture = StreamCapture {
+        view_type: StreamViewType::NewAndOldImages,
+        user_identity: None,
+        region: Arc::from("us-east-1"),
+    };
+
+    let target_shard = engine_clean
+        .assign_shard(&acct, &tbl, "k_race")
+        .await
+        .unwrap();
+
+    engine_clean
+        .put_item(
+            &ki,
+            s_item(&[("pk", "k_race"), ("v", "seed")]),
+            false,
+            None,
+            &maps,
+            Some(&capture),
+        )
+        .await
+        .unwrap();
+
+    let _ = engine_writer
+        .get_item(&ki, &s_item(&[("pk", "k_race")]))
+        .await
+        .unwrap();
+
+    proxy_writer.intent_delay_ms.store(120, Ordering::SeqCst);
+    proxy_writer
+        .stream_record_delay_ms
+        .store(320, Ordering::SeqCst);
+    proxy_closer
+        .ending_seq_delay_ms
+        .store(180, Ordering::SeqCst);
+
+    let ew = engine_writer.clone();
+    let ki_w = ki.clone();
+    let cap_w = StreamCapture {
+        view_type: StreamViewType::NewAndOldImages,
+        user_identity: None,
+        region: Arc::from("us-east-1"),
+    };
+    let w_task = tokio::spawn(async move {
+        ew.put_item(
+            &ki_w,
+            s_item(&[("pk", "k_race"), ("v", "after_seal")]),
+            false,
+            None,
+            &ExpressionMaps::default(),
+            Some(&cap_w),
+        )
+        .await
+        .unwrap()
+    });
+
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let disable_in: UpdateTableInput = serde_json::from_value(serde_json::json!({
+        "TableName": tbl,
+        "StreamSpecification": {
+            "StreamEnabled": false
+        }
+    }))
+    .unwrap();
+    engine_closer
+        .update_table(&acct, disable_in)
+        .await
+        .expect("update_table Disable streams");
+
+    w_task.await.unwrap();
+
+    let sdesc = engine_clean
+        .describe_stream(
+            &acct,
+            &DescribeStreamInput {
+                stream_arn: stream_arn.clone(),
+                limit: None,
+                exclusive_start_shard_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    let shard_desc = sdesc
+        .shards
+        .iter()
+        .find(|s| s.shard_id == target_shard)
+        .unwrap();
+    let ending_seq = shard_desc
+        .sequence_number_range
+        .ending_sequence_number
+        .clone()
+        .expect("shard is closed with EndingSequenceNumber");
+
+    let (recs, _) = engine_clean
+        .get_stream_records(&acct, &stream_arn, &target_shard, None, 100)
+        .await
+        .unwrap();
+    assert!(!recs.is_empty());
+    let last_seq = recs.last().unwrap().dynamodb.sequence_number.clone();
+    assert!(
+        last_seq <= ending_seq,
+        "Stream records must never exceed closed shard EndingSequenceNumber ({last_seq} > {ending_seq})"
+    );
+
+    // Defense-in-depth check: even if an unexposed record slot exists past `ending_seq`,
+    // `get_stream_records` clamps at `ending_seq`.
+    let post_seal_seq = extenddb_storage_bigtable::streams::slot_sequence_number(&target_shard, 99);
+    assert!(post_seal_seq > ending_seq);
+    let mut synthetic = recs.last().unwrap().clone();
+    synthetic.dynamodb.sequence_number = post_seal_seq.clone();
+    let cat = extenddb_storage_bigtable::catalog::Catalog::new(&clean_client);
+    cat.put(
+        &extenddb_storage_bigtable::catalog::keys::stream_record(&target_shard, &post_seal_seq),
+        &serde_json::to_value(&synthetic).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let (clamped_recs, _) = engine_clean
+        .get_stream_records(&acct, &stream_arn, &target_shard, None, 100)
+        .await
+        .unwrap();
+    assert!(
+        clamped_recs
+            .iter()
+            .all(|r| r.dynamodb.sequence_number <= ending_seq),
+        "get_stream_records must clamp at EndingSequenceNumber"
+    );
+    let (after_end_recs, next_after) = engine_clean
+        .get_stream_records(&acct, &stream_arn, &target_shard, Some(&ending_seq), 100)
+        .await
+        .unwrap();
+    assert!(after_end_recs.is_empty());
+    assert!(next_after.is_none());
+}
+
+#[tokio::test]
+async fn test_slow_write_during_online_gsi_creation_preserves_and_updates_active_gsi_entry() {
+    use extenddb_core::types::UpdateTableInput;
+    use extenddb_storage_bigtable::{gsi_worker, sweeper};
+    use std::sync::atomic::Ordering;
+
+    let Some((_client, engine_clean, engine_proxy, proxy, acct)) =
+        setup_fault_proxy_context(2).await
+    else {
+        eprintln!("Skipping Bigtable test: emulator unavailable");
+        return;
+    };
+    let tbl = unique_name("tbl_online_gsi_drift");
+    engine_clean
+        .create_table(
+            &acct,
+            CreateTableInput {
+                table_name: tbl.clone(),
+                key_schema: vec![KeySchemaElement {
+                    attribute_name: "pk".into(),
+                    key_type: KeyType::Hash,
+                }],
+                attribute_definitions: vec![AttributeDefinition {
+                    attribute_name: "pk".into(),
+                    attribute_type: ScalarAttributeType::S,
+                }],
+                billing_mode: Some(BillingMode::PayPerRequest),
+                deletion_protection_enabled: Some(false),
+                ..CreateTableInput::default()
+            },
+        )
+        .await
+        .unwrap();
+    let ki = engine_clean.table_key_info(&acct, &tbl).await.unwrap();
+    let maps = ExpressionMaps::default();
+
+    engine_clean
+        .put_item(
+            &ki,
+            s_item(&[("pk", "k1"), ("gsi_pk", "v1"), ("payload", "initial")]),
+            false,
+            None,
+            &maps,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let _ = engine_proxy
+        .get_item(&ki, &s_item(&[("pk", "k1")]))
+        .await
+        .unwrap();
+
+    proxy.updated_val_delay_ms.store(1500, Ordering::SeqCst);
+    proxy.shadow_pass_before_drop.store(2, Ordering::SeqCst);
+    proxy.shadow_drop_budget.store(6, Ordering::SeqCst);
+
+    let ep = engine_proxy.clone();
+    let ki_slow = ki.clone();
+    let slow_writer = tokio::spawn(async move {
+        ep.put_item(
+            &ki_slow,
+            s_item(&[("pk", "k1"), ("gsi_pk", "v1"), ("payload", "updated")]),
+            false,
+            None,
+            &ExpressionMaps::default(),
+            None,
+        )
+        .await
+        .unwrap()
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let add_gsi: UpdateTableInput = serde_json::from_value(serde_json::json!({
+        "TableName": tbl,
+        "AttributeDefinitions": [
+            { "AttributeName": "pk", "AttributeType": "S" },
+            { "AttributeName": "gsi_pk", "AttributeType": "S" }
+        ],
+        "GlobalSecondaryIndexUpdates": [
+            {
+                "Create": {
+                    "IndexName": "G1",
+                    "KeySchema": [{ "AttributeName": "gsi_pk", "KeyType": "HASH" }],
+                    "Projection": { "ProjectionType": "ALL" }
+                }
+            }
+        ]
+    }))
+    .unwrap();
+    let updated_desc = engine_clean.update_table(&acct, add_gsi).await.unwrap();
+    assert_eq!(
+        updated_desc.global_secondary_indexes.as_ref().unwrap()[0].index_status,
+        "ACTIVE"
+    );
+
+    slow_writer.await.unwrap();
+    proxy.shadow_drop_budget.store(0, Ordering::SeqCst);
+
+    sweeper::sweep_once(&engine_clean).await.unwrap();
+    gsi_worker::sweep_once(&engine_clean).await.unwrap();
+
+    let live_base = engine_clean
+        .get_item(&ki, &s_item(&[("pk", "k1")]))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        live_base.get("payload"),
+        Some(&AttributeValue::S("updated".to_string()))
+    );
+
+    let kc = parse_kc("gsi_pk = :v");
+    let mut qmaps = ExpressionMaps::default();
+    qmaps
+        .values
+        .insert("v".into(), AttributeValue::S("v1".into()));
+    let fresh_ki = engine_clean.table_key_info(&acct, &tbl).await.unwrap();
+    let (gsi_rows, _) = engine_clean
+        .query(&fresh_ki, &kc, &qmaps, true, None, None, Some("G1"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        gsi_rows.len(),
+        1,
+        "Online GSI entry must remain present and updated after slow-write drift repair: {gsi_rows:?}"
+    );
+    assert_eq!(
+        gsi_rows[0].get("payload"),
+        Some(&AttributeValue::S("updated".to_string()))
     );
 }

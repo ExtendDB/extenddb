@@ -51,9 +51,9 @@ use crate::data::encoding::ttl_key::{
     encode_tombstone_gc_value, encode_ttl_key,
 };
 use crate::data::item_ops::{
-    CasOutcome, ItemOps, RowSnapshot, apply_update_actions_validated, check_condition,
-    next_occ_version, now_millis, now_millis_micros, older_than_ts_range, parse_ttl_epoch_secs,
-    version_to_timestamp_micros,
+    CasOutcome, DIRECT_PUT_STAGE_PREFIX, ItemOps, RowSnapshot, apply_update_actions_validated,
+    check_condition, max_mutations_per_rpc, next_occ_version, now_millis, now_millis_micros,
+    older_than_ts_range, parse_ttl_epoch_secs, version_to_timestamp_micros,
 };
 use crate::data::query_scan::{QueryScan, key_belongs_to_segment};
 use crate::gsi_worker::gsi_build_lock_name;
@@ -919,9 +919,18 @@ impl BigtableEngine {
         .await
     }
 
+    /// Time budget for inline post-commit side effects (`< intent_timeout_secs`
+    /// grace window so a stalled inline shadow/TTL write persists a `post-*`
+    /// recovery record in `__extenddb_txn_log__` before tombstone GC can run).
+    #[inline]
+    fn inline_side_effect_budget(&self) -> Duration {
+        let grace_ms = self.intent_timeout_secs.max(2).saturating_mul(1_000);
+        Duration::from_millis((grace_ms.saturating_mul(2) / 5).clamp(500, 10_000))
+    }
+
     /// Enqueue a best-effort delayed reclamation entry (`b"tomb:"`) in
     /// `__extenddb_ttl_index__` so `sweeper` deletes pure version-only tombstone
-    /// rows once `intent_timeout_secs` has elapsed.
+    /// rows once `intent_timeout_secs` has elapsed past `max(expected_version + 1, now_millis())`.
     pub(crate) async fn enqueue_tombstone_gc_best_effort(
         &self,
         table_short: &str,
@@ -929,7 +938,10 @@ impl BigtableEngine {
         expected_version: u64,
     ) {
         let grace_ms = self.intent_timeout_secs.max(2).saturating_mul(1_000);
-        let ready_ms = now_millis().saturating_add(grace_ms);
+        let ready_ms = expected_version
+            .saturating_add(1)
+            .max(now_millis())
+            .saturating_add(grace_ms);
         let queue_key = encode_tombstone_gc_key(ready_ms, table_short, raw_row_key);
         let queue_val = encode_tombstone_gc_value(expected_version, table_short, raw_row_key);
         let ts_micros = version_to_timestamp_micros(expected_version.max(1));
@@ -1155,7 +1167,14 @@ impl BigtableEngine {
                                 || m.participant.data_table.starts_with(&shadow_prefix)
                         })
                     });
-                    if touches_part || touches_mut {
+                    let touches_guard = st
+                        .base_guard
+                        .as_ref()
+                        .is_some_and(|g| g.participant.data_table == data_table);
+                    let touches_ttl = st.ttl_mutations.as_ref().is_some_and(|ts| {
+                        ts.iter().any(|t| t.participant.data_table == data_table)
+                    });
+                    if touches_part || touches_mut || touches_guard || touches_ttl {
                         self.roll_forward(tid, &st).await?;
                     }
                 }
@@ -1203,7 +1222,11 @@ impl BigtableEngine {
             }
             match coord.get_state(&tid).await? {
                 None => {
-                    let _ = coord.clear_intent_up_to(&tid, &this_part, intent_ts).await;
+                    if tid.starts_with(DIRECT_PUT_STAGE_PREFIX) && intent_ts >= cutoff {
+                        saw_single = true;
+                    } else {
+                        let _ = coord.clear_intent_up_to(&tid, &this_part, intent_ts).await;
+                    }
                 }
                 Some(ts) => match ts.state.as_str() {
                     "COMMITTED" => {
@@ -1517,9 +1540,21 @@ impl BigtableEngine {
             &self.client,
             Duration::from_secs(self.intent_timeout_secs.max(1)),
         );
+        let base_guard = crate::transact::SideEffectBaseGuard {
+            participant: crate::transact::ParticipantRow {
+                data_table: data_table.to_owned(),
+                row_key: base_row_key.to_vec(),
+            },
+            base_version: new_version,
+        };
         let recovery_id = format!("post-{}", Uuid::new_v4().simple());
         if let Err(e) = coord
-            .write_committed_side_effects(&recovery_id, &side_muts, &side_ttls)
+            .write_committed_side_effects_guarded(
+                &recovery_id,
+                Some(&base_guard),
+                &side_muts,
+                &side_ttls,
+            )
             .await
         {
             tracing::error!(
@@ -1533,6 +1568,7 @@ impl BigtableEngine {
     /// Post-commit slow-write check: when a write took `>= FAST_WRITE_BUDGET`
     /// since reading `table_meta`, refresh uncached `table_meta` and repair any
     /// GSI (`CREATING`/`ACTIVE`) or TTL (`ENABLING`/`ENABLED`) added concurrently.
+    #[allow(clippy::too_many_arguments)]
     async fn repair_slow_write_schema_drift(
         &self,
         key_info: &TableKeyInfo,
@@ -1541,6 +1577,8 @@ impl BigtableEngine {
         initial_desc: &TableDescription,
         initial_ttl_attr: Option<&str>,
         old_item: Option<&Item>,
+        committed_item: Option<&Item>,
+        committed_version: u64,
     ) {
         let account_id = key_info.account_id.as_str();
         let table_name = key_info.table_name.as_str();
@@ -1583,50 +1621,229 @@ impl BigtableEngine {
             return;
         }
 
-        let Ok((live_item, live_ver)) = self
-            .read_base_row_for_worker(data_table, base_row_key)
-            .await
-        else {
-            return;
-        };
-        let ver = live_ver.unwrap_or_else(|| next_occ_version(None));
-
-        for g in added_gsis {
-            let shadow = crate::gsi::shadow_table_id(data_table, &g.index_name);
-            let ops = ItemOps::new(&self.client, &shadow, self.intent_timeout_secs);
-            if let Some(old) = old_item
-                && let Ok(Some(old_rk)) =
-                    crate::gsi::shadow_row_key_for_item(old, &g.key_schema, &fresh_desc.key_schema)
-            {
-                let _ = ops.delete_shadow_versioned(&old_rk, ver).await;
+        let budget = self.inline_side_effect_budget();
+        let (live_item_owned, target_ver, mut had_repair_err) = match tokio::time::timeout(
+            budget,
+            self.read_base_row_for_worker(data_table, base_row_key),
+        )
+        .await
+        {
+            Ok(Ok((None, None))) => {
+                if old_item.is_none() {
+                    return;
+                }
+                (None, committed_version, false)
             }
-            if let Some(ref item) = live_item
-                && let Ok(Some(new_rk)) =
-                    crate::gsi::shadow_row_key_for_item(item, &g.key_schema, &fresh_desc.key_schema)
-            {
-                let projected = crate::gsi::project_for_shadow(
-                    item,
-                    &g.projection,
-                    &fresh_desc.key_schema,
-                    &g.key_schema,
+            Ok(Ok((live_item, live_ver))) => {
+                if live_ver.is_some_and(|lv| lv < committed_version) {
+                    (committed_item.cloned(), committed_version, false)
+                } else {
+                    (live_item, live_ver.unwrap_or(committed_version), false)
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    table = %table_name,
+                    error = %e,
+                    "slow-write schema-drift base read failed; scheduling recovery"
                 );
-                let _ = ops.put_shadow_versioned(&new_rk, &projected, ver).await;
+                (committed_item.cloned(), committed_version, true)
+            }
+            Err(_) => {
+                tracing::warn!(
+                    table = %table_name,
+                    "slow-write schema-drift base read timed out; scheduling recovery"
+                );
+                (committed_item.cloned(), committed_version, true)
+            }
+        };
+        let target_item = live_item_owned.as_ref();
+
+        let mut repair_plans = Vec::with_capacity(added_gsis.len());
+        let mut repair_gsi_schemas = Vec::with_capacity(added_gsis.len());
+        for g in added_gsis {
+            let shadow_table = crate::gsi::shadow_table_id(data_table, &g.index_name);
+            let old_key = old_item.and_then(|o| {
+                crate::gsi::shadow_row_key_for_item(o, &g.key_schema, &fresh_desc.key_schema)
+                    .ok()
+                    .flatten()
+            });
+            let new_entry = target_item.and_then(|item| {
+                crate::gsi::shadow_row_key_for_item(item, &g.key_schema, &fresh_desc.key_schema)
+                    .ok()
+                    .flatten()
+                    .map(|rk| {
+                        let projected = crate::gsi::project_for_shadow(
+                            item,
+                            &g.projection,
+                            &fresh_desc.key_schema,
+                            &g.key_schema,
+                        );
+                        (rk, projected)
+                    })
+            });
+            if old_key.is_some() || new_entry.is_some() {
+                repair_plans.push(ShadowTargetPlan {
+                    shadow_table: shadow_table.clone(),
+                    old_key,
+                    new_entry,
+                });
+                repair_gsi_schemas.push((shadow_table, g.key_schema.clone()));
             }
         }
 
-        if ttl_changed
-            && let (Some(attr), Some(item)) = (fresh_ttl_attr.as_deref(), live_item.as_ref())
-            && let Some(exp) = get_ttl_expiry(item, attr)
-        {
-            let _ = insert_ttl_index_entry_at(
-                &self.client,
-                account_id,
-                table_name,
+        let repair_ttl_attr = ttl_changed.then_some(fresh_ttl_attr.as_deref()).flatten();
+        if repair_plans.is_empty() && repair_ttl_attr.is_none() {
+            return;
+        }
+
+        if !had_repair_err {
+            if !repair_plans.is_empty() {
+                match tokio::time::timeout(
+                    budget,
+                    self.apply_shadow_plans(&repair_plans, target_ver),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            table = %table_name,
+                            error = %e,
+                            "slow-write schema-drift shadow repair failed; scheduling recovery"
+                        );
+                        had_repair_err = true;
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            table = %table_name,
+                            "slow-write schema-drift shadow repair timed out; scheduling recovery"
+                        );
+                        had_repair_err = true;
+                    }
+                }
+            }
+            if repair_ttl_attr.is_some() {
+                match tokio::time::timeout(
+                    budget,
+                    self.maintain_ttl_index(
+                        key_info,
+                        repair_ttl_attr,
+                        old_item,
+                        target_item,
+                        target_ver,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            table = %table_name,
+                            error = %e,
+                            "slow-write schema-drift TTL repair failed; scheduling recovery"
+                        );
+                        had_repair_err = true;
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            table = %table_name,
+                            "slow-write schema-drift TTL repair timed out; scheduling recovery"
+                        );
+                        had_repair_err = true;
+                    }
+                }
+            }
+        }
+
+        if had_repair_err {
+            self.persist_side_effect_recovery_on_failure(
+                key_info,
+                data_table,
                 base_row_key,
-                exp,
-                version_to_timestamp_micros(ver),
+                &repair_plans,
+                repair_ttl_attr,
+                old_item,
+                target_item,
+                target_ver,
             )
             .await;
+            return;
+        }
+
+        // Re-verify the base row if we inserted any GSI entry: if a pre-fence fast
+        // writer deleted or mutated the row before `SCHEMA_VISIBILITY_FENCE` without
+        // writing a GSI tombstone, retire the stale entry immediately.
+        if repair_plans.iter().any(|p| p.new_entry.is_some()) {
+            match tokio::time::timeout(
+                budget,
+                self.read_base_row_for_worker(data_table, base_row_key),
+            )
+            .await
+            {
+                Ok(Ok((post_item, post_ver)))
+                    if post_ver != Some(target_ver) || post_item != live_item_owned =>
+                {
+                    let retire_ver = post_ver
+                        .unwrap_or_else(|| target_ver.saturating_add(1))
+                        .max(target_ver.saturating_add(1));
+                    let mut retire_plans = Vec::new();
+                    for (plan, (_, gsi_schema)) in repair_plans.iter().zip(&repair_gsi_schemas) {
+                        if let Some((put_rk, _)) = &plan.new_entry {
+                            let cur_rk = post_item.as_ref().and_then(|it| {
+                                crate::gsi::shadow_row_key_for_item(
+                                    it,
+                                    gsi_schema,
+                                    &fresh_desc.key_schema,
+                                )
+                                .ok()
+                                .flatten()
+                            });
+                            if cur_rk.as_ref() != Some(put_rk) {
+                                retire_plans.push(ShadowTargetPlan {
+                                    shadow_table: plan.shadow_table.clone(),
+                                    old_key: Some(put_rk.clone()),
+                                    new_entry: None,
+                                });
+                            }
+                        }
+                    }
+                    if !retire_plans.is_empty() {
+                        let retire_res = tokio::time::timeout(
+                            budget,
+                            self.apply_shadow_plans(&retire_plans, retire_ver),
+                        )
+                        .await;
+                        if !matches!(retire_res, Ok(Ok(()))) {
+                            self.persist_side_effect_recovery_on_failure(
+                                key_info,
+                                data_table,
+                                base_row_key,
+                                &retire_plans,
+                                None,
+                                target_item,
+                                post_item.as_ref(),
+                                retire_ver,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => {
+                    self.persist_side_effect_recovery_on_failure(
+                        key_info,
+                        data_table,
+                        base_row_key,
+                        &repair_plans,
+                        repair_ttl_attr,
+                        old_item,
+                        target_item,
+                        target_ver,
+                    )
+                    .await;
+                }
+            }
         }
     }
 
@@ -2030,6 +2247,7 @@ impl BigtableEngine {
                 stream_records: Some(log_records),
                 ttl_mutations: Some(ttl_mutations),
                 token_meta: None,
+                base_guard: None,
             };
 
             return Ok((existing, post_stage, txn_id, Some(committed_state)));
@@ -2040,9 +2258,62 @@ impl BigtableEngine {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_fenced_single_item_write(
+        &self,
+        key_info: &TableKeyInfo,
+        data_table: &str,
+        row_key: &[u8],
+        desc: &TableDescription,
+        ttl_attr: Option<&str>,
+        meta_read_at: Instant,
+        op: SingleWriteOp<'_>,
+        condition: Option<&Expr>,
+        maps: &ExpressionMaps,
+        stream: Option<&StreamCapture>,
+    ) -> Result<(Option<Item>, Option<Item>), StorageError> {
+        let (existing, new_item, txn_id, committed_state) = self
+            .commit_fenced_single_item_write(
+                key_info, data_table, desc, ttl_attr, op, condition, maps, stream,
+            )
+            .await?;
+        let committed_ver = committed_state
+            .as_ref()
+            .and_then(|st| st.mutations.as_ref())
+            .and_then(|ms| ms.first())
+            .and_then(|m| m.new_version);
+        if let Some(state) = committed_state
+            && let Err(e) = self.roll_forward(&txn_id, &state).await
+        {
+            tracing::warn!(
+                txn_id = %txn_id,
+                table = %key_info.table_name,
+                error = %e,
+                "post-commit roll_forward deferred to sweeper"
+            );
+        }
+        if meta_read_at.elapsed() >= FAST_WRITE_BUDGET
+            && let Some(ver) = committed_ver
+        {
+            self.repair_slow_write_schema_drift(
+                key_info,
+                data_table,
+                row_key,
+                desc,
+                ttl_attr,
+                existing.as_ref(),
+                new_item.as_ref(),
+                ver,
+            )
+            .await;
+        }
+        Ok((existing, new_item))
+    }
+
     /// Unified single-item write path (`PutItem`, `DeleteItem`, `UpdateItem`):
     /// - Validates index keys & shadow keys BEFORE committing.
-    /// - Uses coordinator-fenced write when stream capture is active, or direct
+    /// - Uses coordinator-fenced write when stream capture is active OR when a
+    ///   single-item write exceeds `max_mutations_per_rpc()`, and direct
     ///   single-row OCC (`put_cas`/`delete_cas`) otherwise.
     /// - Never surfaces post-commit side-effect errors to the client (`#9`),
     ///   delegating any unrecovered post-`put_cas` shadow/TTL retry to
@@ -2070,48 +2341,31 @@ impl BigtableEngine {
 
         let row_key =
             crate::data::encoding::row_key::encode_key(op.lookup_key(), &key_info.key_schema)?;
+        let rpc_limit = max_mutations_per_rpc().max(4);
+        let exceeds_rpc_limit =
+            matches!(&op, SingleWriteOp::Put { item } if item.len().saturating_add(3) > rpc_limit);
         let should_capture_stream =
             Self::active_stream_target_for_capture(&desc, stream, op.lookup_key())?.is_some();
 
-        if should_capture_stream {
-            let (existing, new_item, txn_id, committed_state) = self
-                .commit_fenced_single_item_write(
-                    key_info,
-                    &data_table,
-                    &desc,
-                    ttl_attr.as_deref(),
-                    op,
-                    condition,
-                    maps,
-                    stream,
-                )
-                .await?;
-            if let Some(state) = committed_state
-                && let Err(e) = self.roll_forward(&txn_id, &state).await
-            {
-                tracing::warn!(
-                    txn_id = %txn_id,
-                    table = %key_info.table_name,
-                    error = %e,
-                    "post-commit roll_forward deferred to sweeper"
-                );
-            }
-            if meta_read_at.elapsed() >= FAST_WRITE_BUDGET {
-                self.repair_slow_write_schema_drift(
+        if should_capture_stream || exceeds_rpc_limit {
+            return self
+                .finish_fenced_single_item_write(
                     key_info,
                     &data_table,
                     &row_key,
                     &desc,
                     ttl_attr.as_deref(),
-                    existing.as_ref(),
+                    meta_read_at,
+                    op,
+                    condition,
+                    maps,
+                    stream,
                 )
                 .await;
-            }
-            return Ok((existing, new_item));
         }
 
         let op_label = op.op_label();
-        let _row_guard = self.acquire_single_write_lock(&data_table, &row_key).await;
+        let row_guard = self.acquire_single_write_lock(&data_table, &row_key).await;
         let ops = ItemOps::new(&self.client, &data_table, self.intent_timeout_secs);
         let single_deadline =
             Instant::now() + Duration::from_secs(self.intent_timeout_secs.max(2) + 2);
@@ -2142,6 +2396,27 @@ impl BigtableEngine {
                 }
             };
 
+            if post_stage
+                .as_ref()
+                .is_some_and(|new_item| new_item.len().saturating_add(3) > rpc_limit)
+            {
+                drop(row_guard);
+                return self
+                    .finish_fenced_single_item_write(
+                        key_info,
+                        &data_table,
+                        &row_key,
+                        &desc,
+                        ttl_attr.as_deref(),
+                        meta_read_at,
+                        op,
+                        condition,
+                        maps,
+                        stream,
+                    )
+                    .await;
+            }
+
             // Pre-compute and validate all GSI + LSI shadow keys BEFORE `put_cas` / `delete_cas`.
             let shadow_plans = Self::prepare_shadow_plan(
                 &key_info.key_schema,
@@ -2164,32 +2439,50 @@ impl BigtableEngine {
 
             match cas_res {
                 CasOutcome::Applied(new_version) => {
-                    // Commit point has passed: never return `Err` to the client (`#9`).
-                    let shadow_res = self.apply_shadow_plans(&shadow_plans, new_version).await;
-                    let ttl_res = self
-                        .maintain_ttl_index(
-                            key_info,
-                            ttl_attr.as_deref(),
-                            existing.as_ref(),
-                            post_stage.as_ref(),
-                            new_version,
-                        )
-                        .await;
-                    if let Err(ref e) = shadow_res {
-                        tracing::warn!(
-                            table = %key_info.table_name,
-                            error = %e,
-                            "post-commit shadow update failed; scheduling sweeper recovery"
-                        );
-                    }
-                    if let Err(ref e) = ttl_res {
-                        tracing::warn!(
-                            table = %key_info.table_name,
-                            error = %e,
-                            "post-commit TTL index update failed; scheduling sweeper recovery"
-                        );
-                    }
-                    if shadow_res.is_err() || ttl_res.is_err() {
+                    // Commit point has passed: bound inline side-effect latency strictly
+                    // below the tombstone grace horizon and never return `Err` to the client (`#9`).
+                    let inline_budget = self.inline_side_effect_budget();
+                    let side_outcome = tokio::time::timeout(inline_budget, async {
+                        let shadow_res = self.apply_shadow_plans(&shadow_plans, new_version).await;
+                        let ttl_res = self
+                            .maintain_ttl_index(
+                                key_info,
+                                ttl_attr.as_deref(),
+                                existing.as_ref(),
+                                post_stage.as_ref(),
+                                new_version,
+                            )
+                            .await;
+                        (shadow_res, ttl_res)
+                    })
+                    .await;
+                    let needs_recovery = match side_outcome {
+                        Ok((shadow_res, ttl_res)) => {
+                            if let Err(ref e) = shadow_res {
+                                tracing::warn!(
+                                    table = %key_info.table_name,
+                                    error = %e,
+                                    "post-commit shadow update failed; scheduling sweeper recovery"
+                                );
+                            }
+                            if let Err(ref e) = ttl_res {
+                                tracing::warn!(
+                                    table = %key_info.table_name,
+                                    error = %e,
+                                    "post-commit TTL index update failed; scheduling sweeper recovery"
+                                );
+                            }
+                            shadow_res.is_err() || ttl_res.is_err()
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                table = %key_info.table_name,
+                                "post-commit side-effect budget exceeded; scheduling sweeper recovery"
+                            );
+                            true
+                        }
+                    };
+                    if needs_recovery {
                         self.persist_side_effect_recovery_on_failure(
                             key_info,
                             &data_table,
@@ -2214,6 +2507,8 @@ impl BigtableEngine {
                             &desc,
                             ttl_attr.as_deref(),
                             existing.as_ref(),
+                            post_stage.as_ref(),
+                            new_version,
                         )
                         .await;
                     }
@@ -2312,6 +2607,28 @@ impl BigtableEngine {
         );
 
         let is_side_effect_only = state.participants.as_ref().is_some_and(Vec::is_empty);
+        let post_base_still_current =
+            if is_side_effect_only && let Some(ref guard) = state.base_guard {
+                let base_ops = ItemOps::new(
+                    client,
+                    &guard.participant.data_table,
+                    self.intent_timeout_secs,
+                );
+                match base_ops
+                    .get_row_snapshot_by_raw_key(&guard.participant.row_key)
+                    .await
+                {
+                    Ok(snap) => {
+                        snap.item.is_some()
+                            && snap.version == Some(guard.base_version)
+                            && !snap.in_progress_chunk
+                    }
+                    Err(StorageError::TableNotFound(_)) => false,
+                    Err(e) => return Err(e),
+                }
+            } else {
+                true
+            };
         let mut materialized_participants: HashSet<crate::transact::ParticipantRow> =
             HashSet::new();
 
@@ -2354,16 +2671,19 @@ impl BigtableEngine {
                             self.intent_timeout_secs,
                         );
                         match ops
-                            .get_by_raw_key_with_version(&m.participant.row_key)
+                            .get_row_snapshot_by_raw_key(&m.participant.row_key)
                             .await
                         {
-                            Ok((cur_item, cur_ver)) => {
-                                let matches_our_write = cur_ver == Some(new_version)
+                            Ok(snap) => {
+                                let matches_our_write = !snap.in_progress_chunk
+                                    && snap.version == Some(new_version)
                                     && match &m.payload {
                                         crate::transact::TxnOpPayload::Put { item } => {
-                                            cur_item.as_ref() == Some(item)
+                                            snap.item.as_ref() == Some(item)
                                         }
-                                        crate::transact::TxnOpPayload::Delete => cur_item.is_none(),
+                                        crate::transact::TxnOpPayload::Delete => {
+                                            snap.item.is_none()
+                                        }
                                     };
                                 last_base_still_current = matches_our_write;
                                 if matches_our_write {
@@ -2380,6 +2700,12 @@ impl BigtableEngine {
                     }
                 } else {
                     if !is_side_effect_only && !last_base_still_current {
+                        continue;
+                    }
+                    if is_side_effect_only
+                        && !post_base_still_current
+                        && matches!(m.payload, crate::transact::TxnOpPayload::Put { .. })
+                    {
                         continue;
                     }
                     let ops =
@@ -2422,16 +2748,23 @@ impl BigtableEngine {
                     || state.mutations.is_none()
                     || materialized_participants.contains(&tm.participant)
                 {
-                    apply_ttl_mutation_versioned(
-                        client,
-                        &tm.account_id,
-                        &tm.table_name,
-                        &tm.participant.row_key,
-                        tm.old_expiry,
-                        tm.new_expiry,
-                        tm.new_version,
-                    )
-                    .await?;
+                    let effective_new_exp = if is_side_effect_only && !post_base_still_current {
+                        None
+                    } else {
+                        tm.new_expiry
+                    };
+                    if tm.old_expiry.is_some() || effective_new_exp.is_some() {
+                        apply_ttl_mutation_versioned(
+                            client,
+                            &tm.account_id,
+                            &tm.table_name,
+                            &tm.participant.row_key,
+                            tm.old_expiry,
+                            effective_new_exp,
+                            tm.new_version,
+                        )
+                        .await?;
+                    }
                 }
             }
         }
@@ -2536,23 +2869,63 @@ impl BigtableEngine {
         data_table: &str,
         row_key: &[u8],
     ) -> Result<(bool, Option<Item>, Option<u64>), StorageError> {
-        let snap = ops.get_row_snapshot_by_raw_key(row_key).await?;
-        if snap.intents.is_empty() {
-            return Ok((false, snap.item, snap.version));
+        let deadline = Instant::now() + Duration::from_secs(self.intent_timeout_secs.max(5) + 5);
+        let coord = crate::transact::TxnCoordinator::new(
+            &self.client,
+            Duration::from_secs(self.intent_timeout_secs.max(1)),
+        );
+        let mut sleep_step = 0u64;
+        let mut snap = ops.get_row_snapshot_by_raw_key(row_key).await?;
+        while Instant::now() < deadline {
+            if snap.intents.is_empty() && !snap.in_progress_chunk {
+                return Ok((false, snap.item, snap.version));
+            }
+            if !snap.intents.is_empty() {
+                if self
+                    .resolve_blocking_intents(data_table, row_key, None)
+                    .await?
+                    == IntentBlockState::Cleared
+                {
+                    snap = ops.get_row_snapshot_by_raw_key(row_key).await?;
+                    continue;
+                }
+                if !snap.in_progress_chunk {
+                    return Ok((true, snap.item, snap.version));
+                }
+                // Serve the authoritative post-image from `__extenddb_txn_log__`
+                // while a `COMMITTED` coordinator's chunks are still settling.
+                for (tid, _) in &snap.intents {
+                    if !tid.starts_with(DIRECT_PUT_STAGE_PREFIX)
+                        && let Some(st) = coord.get_state(tid).await?
+                        && st.state == "COMMITTED"
+                        && let Some(muts) = &st.mutations
+                    {
+                        for m in muts {
+                            if m.participant.data_table == data_table
+                                && m.participant.row_key == row_key
+                            {
+                                let committed_item = match &m.payload {
+                                    crate::transact::TxnOpPayload::Put { item } => {
+                                        Some(item.clone())
+                                    }
+                                    crate::transact::TxnOpPayload::Delete => None,
+                                };
+                                return Ok((true, committed_item, m.new_version.or(snap.version)));
+                            }
+                        }
+                    }
+                }
+            }
+            sleep_step = sleep_step.saturating_add(1);
+            tokio::time::sleep(Duration::from_millis(1 + sleep_step.min(8))).await;
+            snap = ops.get_row_snapshot_by_raw_key(row_key).await?;
         }
-        if self
-            .resolve_blocking_intents(data_table, row_key, None)
-            .await?
-            == IntentBlockState::Cleared
-        {
-            let refreshed = ops.get_row_snapshot_by_raw_key(row_key).await?;
-            return Ok((
-                !refreshed.intents.is_empty(),
-                refreshed.item,
-                refreshed.version,
+        if snap.in_progress_chunk {
+            return Err(StorageError::Transient(
+                "concurrent multi-chunk write still in progress".to_string(),
             ));
         }
-        Ok((true, snap.item, snap.version))
+        Ok((!snap.intents.is_empty(), snap.item, snap.version))
     }
 
     async fn wait_or_fail_occ_intent(
@@ -4659,7 +5032,10 @@ impl DataEngine for BigtableEngine {
                     }
                 }
 
-                if unique_key_count == 1 && all_tids.is_empty() {
+                if unique_key_count == 1
+                    && all_tids.is_empty()
+                    && map_1.values().all(|s| !s.in_progress_chunk)
+                {
                     let mut out = Vec::with_capacity(total_ops);
                     for (_, dt, rk) in &resolved_ops {
                         let item = map_1
@@ -4673,8 +5049,35 @@ impl DataEngine for BigtableEngine {
                 let mut txns_1: HashMap<String, Option<crate::transact::TxnState>> =
                     HashMap::with_capacity(all_tids.len());
                 for tid in all_tids.keys() {
-                    let st = coord.get_state(tid).await?;
-                    txns_1.insert(tid.clone(), st);
+                    if tid.starts_with(DIRECT_PUT_STAGE_PREFIX) {
+                        txns_1.insert(tid.clone(), None);
+                    } else {
+                        let st = coord.get_state(tid).await?;
+                        txns_1.insert(tid.clone(), st);
+                    }
+                }
+
+                let mut torn_unlogged_chunk = false;
+                for ((dt, rk), snap) in &map_1 {
+                    if snap.in_progress_chunk {
+                        let has_committed_post_image = snap.intents.iter().any(|(tid, _)| {
+                            txns_1
+                                .get(tid)
+                                .and_then(Option::as_ref)
+                                .is_some_and(|st| st.state == "COMMITTED" && st.mutations.is_some())
+                        });
+                        if !has_committed_post_image {
+                            let _ = self.resolve_blocking_intents(dt, rk, None).await;
+                            torn_unlogged_chunk = true;
+                        }
+                    }
+                }
+                if torn_unlogged_chunk {
+                    let jitter_ms = 1
+                        + rand::random_range(0..4u64)
+                        + u64::try_from(attempt.min(8)).unwrap_or(0);
+                    tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
+                    continue;
                 }
 
                 let mut cross_skew = false;
@@ -4747,7 +5150,11 @@ impl DataEngine for BigtableEngine {
 
                 let mut txns_match = true;
                 for tid in all_tids.keys() {
-                    let st_2 = coord.get_state(tid).await?;
+                    let st_2 = if tid.starts_with(DIRECT_PUT_STAGE_PREFIX) {
+                        None
+                    } else {
+                        coord.get_state(tid).await?
+                    };
                     let sig_1 = txns_1
                         .get(tid)
                         .and_then(Option::as_ref)
@@ -4767,6 +5174,7 @@ impl DataEngine for BigtableEngine {
                 }
 
                 let mut out: Vec<Option<Item>> = vec![None; total_ops];
+                let mut saw_unresolved_chunk = false;
                 for (idx, data_table, enc_key) in &resolved_ops {
                     let Some(row_snap) = map_1.get(&(data_table.clone(), enc_key.clone())) else {
                         continue;
@@ -4800,7 +5208,20 @@ impl DataEngine for BigtableEngine {
                         }
                     }
 
+                    if resolved_item.is_none() && row_snap.in_progress_chunk {
+                        saw_unresolved_chunk = true;
+                        break;
+                    }
+
                     out[*idx] = resolved_item.unwrap_or_else(|| row_snap.item.clone());
+                }
+
+                if saw_unresolved_chunk {
+                    let jitter_ms = 1
+                        + rand::random_range(0..4u64)
+                        + u64::try_from(attempt.min(8)).unwrap_or(0);
+                    tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
+                    continue;
                 }
 
                 return Ok(out);
@@ -5308,6 +5729,7 @@ impl DataEngine for BigtableEngine {
             let mut log_records: Vec<crate::transact::TxnStreamRecord> = Vec::new();
             let mut ttl_mutations: Vec<crate::transact::TxnTtlMutation> = Vec::new();
             let mut txn_mutations = Vec::with_capacity(resolved.len());
+            let mut committed_versions: Vec<Option<u64>> = vec![None; resolved.len()];
 
             for (idx, (op, data_table, desc, ttl_attr, participant)) in resolved.iter().enumerate()
             {
@@ -5338,6 +5760,7 @@ impl DataEngine for BigtableEngine {
                 };
 
                 let next_version = next_occ_version(read_versions[idx]);
+                committed_versions[idx] = Some(next_version);
                 let payload = match &new_item {
                     Some(item) => crate::transact::TxnOpPayload::Put { item: item.clone() },
                     None => crate::transact::TxnOpPayload::Delete,
@@ -5461,6 +5884,7 @@ impl DataEngine for BigtableEngine {
                 stream_records: Some(log_records),
                 ttl_mutations: Some(ttl_mutations),
                 token_meta,
+                base_guard: None,
             };
 
             // Commit point has passed: log any post-commit roll_forward failure
@@ -5477,7 +5901,9 @@ impl DataEngine for BigtableEngine {
                 for (idx, (op, data_table, desc, ttl_attr, participant)) in
                     resolved.iter().enumerate()
                 {
-                    if staged_items[idx].is_some() {
+                    if let (Some(staged_item), Some(cver)) =
+                        (staged_items[idx].as_ref(), committed_versions[idx])
+                    {
                         self.repair_slow_write_schema_drift(
                             &op.key_info,
                             data_table,
@@ -5485,6 +5911,8 @@ impl DataEngine for BigtableEngine {
                             desc,
                             ttl_attr.as_deref(),
                             items_read[idx].as_ref(),
+                            staged_item.as_ref(),
+                            cver,
                         )
                         .await;
                     }
@@ -5956,9 +6384,20 @@ impl StreamEngine for BigtableEngine {
                 return Err(extenddb_storage::util::stream_does_not_exist());
             }
 
-            // Bounded server-side range read starting strictly after `after_sequence` (`#23`).
+            // Bounded server-side range read starting strictly after `after_sequence` (`#23`),
+            // clamped at `shard_meta.ending_sequence_number` when the shard is closed.
+            if let (Some(after_seq), Some(end_seq)) = (
+                after.as_deref(),
+                shard_meta.ending_sequence_number.as_deref(),
+            ) && after_seq >= end_seq
+            {
+                return Ok((Vec::new(), None));
+            }
             let prefix = keys::stream_record_shard_prefix(&shard_id);
-            let end_open = format!("stream_record:{shard_id};");
+            let end_open = match shard_meta.ending_sequence_number.as_deref() {
+                Some(end_seq) => format!("{prefix}{end_seq}\x00"),
+                None => format!("stream_record:{shard_id};"),
+            };
             let (start_key, start_inclusive) = match &after {
                 Some(seq) => (format!("{prefix}{seq}"), false),
                 None => (prefix, true),
@@ -5972,6 +6411,13 @@ impl StreamEngine for BigtableEngine {
             let mut records: Vec<StreamRecord> = Vec::with_capacity(rows.len());
             for (_key, value) in rows {
                 if let Ok(record) = serde_json::from_value::<StreamRecord>(value) {
+                    if shard_meta
+                        .ending_sequence_number
+                        .as_deref()
+                        .is_some_and(|end_seq| record.dynamodb.sequence_number.as_str() > end_seq)
+                    {
+                        continue;
+                    }
                     records.push(record);
                 }
             }

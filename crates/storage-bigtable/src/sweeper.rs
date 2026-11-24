@@ -33,8 +33,9 @@ use crate::data::encoding::ttl_key::{
 use crate::data::item_ops::{ItemOps, next_millis_exclusive, now_millis, now_millis_micros};
 use crate::runtime_hooks::run_leased_worker;
 use crate::transact::{
-    ParticipantMutation, ParticipantRow, TXN_FAMILY, TXN_LOG_TABLE, TxnCoordinator, TxnState,
-    TxnStreamRecord, TxnTokenMeta, TxnTtlMutation, build_txn_log_latest_filter,
+    ParticipantMutation, ParticipantRow, SideEffectBaseGuard, TXN_FAMILY, TXN_LOG_TABLE,
+    TxnCoordinator, TxnState, TxnStreamRecord, TxnTokenMeta, TxnTtlMutation,
+    build_txn_log_latest_filter,
 };
 
 const TOMBSTONE_SWEEP_BATCH: i64 = 200;
@@ -85,17 +86,20 @@ async fn sweep_inner(
     engine: &BigtableEngine,
     cutoff_override_micros: Option<i64>,
 ) -> Result<(), String> {
-    sweep_txn_log(engine, cutoff_override_micros).await?;
+    let all_settled = sweep_txn_log(engine, cutoff_override_micros).await?;
+    if !all_settled {
+        return Ok(());
+    }
     let tomb_now_ms = cutoff_override_micros
         .map(|us| u64::try_from((us / 1_000).max(0)).unwrap_or(u64::MAX))
         .unwrap_or_else(now_millis);
-    sweep_due_tombstones(engine, tomb_now_ms).await
+    sweep_due_tombstones(engine, tomb_now_ms, cutoff_override_micros.is_some()).await
 }
 
 async fn sweep_txn_log(
     engine: &BigtableEngine,
     cutoff_override_micros: Option<i64>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let client = engine.client_ref();
     let mut data = client.data();
     let txn_log_table = client.full_table_name(TXN_LOG_TABLE);
@@ -107,6 +111,7 @@ async fn sweep_txn_log(
     let limit = 100;
     let mut start_key = start_prefix;
     let mut exclude_start = false;
+    let mut all_settled = true;
 
     let now_micros = now_millis_micros();
     #[allow(clippy::cast_possible_wrap)]
@@ -168,6 +173,7 @@ async fn sweep_txn_log(
             let mut stream_records: Option<Vec<TxnStreamRecord>> = None;
             let mut ttl_mutations: Option<Vec<TxnTtlMutation>> = None;
             let mut token_meta: Option<TxnTokenMeta> = None;
+            let mut base_guard: Option<SideEffectBaseGuard> = None;
 
             for cell in cells {
                 if cell.family_name == TXN_FAMILY {
@@ -196,6 +202,9 @@ async fn sweep_txn_log(
                         b"token_meta" if token_meta.is_none() => {
                             token_meta = serde_json::from_slice(&cell.value).ok();
                         }
+                        b"base_guard" if base_guard.is_none() => {
+                            base_guard = serde_json::from_slice(&cell.value).ok();
+                        }
                         _ => {}
                     }
                 }
@@ -223,15 +232,24 @@ async fn sweep_txn_log(
                     tracing::warn!(
                         "2PC Sweeper: failed to persist idempotency record for CLEANED txn {txn_id}: {e}"
                     );
+                    all_settled = false;
                     continue;
                 }
-                let _ = coord.drop_matching_start(&txn_id, start).await;
+                if let Err(e) = coord.drop_matching_start(&txn_id, start).await {
+                    tracing::warn!(
+                        "2PC Sweeper: failed to drop CLEANED coordinator row for {txn_id}: {e}"
+                    );
+                    all_settled = false;
+                }
                 continue;
             }
 
             if st == "ABORTED" {
-                clear_aborted_intents_and_drop(&coord, &txn_id, start, participants.as_deref())
-                    .await;
+                if !clear_aborted_intents_and_drop(&coord, &txn_id, start, participants.as_deref())
+                    .await
+                {
+                    all_settled = false;
+                }
                 continue;
             }
 
@@ -248,13 +266,16 @@ async fn sweep_txn_log(
                             .await
                         {
                             Ok(true) => {
-                                clear_aborted_intents_and_drop(
+                                if !clear_aborted_intents_and_drop(
                                     &coord,
                                     &txn_id,
                                     start,
                                     participants.as_deref(),
                                 )
-                                .await;
+                                .await
+                                {
+                                    all_settled = false;
+                                }
                             }
                             Ok(false) => match coord.get_state(&txn_id).await {
                                 Ok(Some(fresh))
@@ -265,31 +286,40 @@ async fn sweep_txn_log(
                                         tracing::error!(
                                             "2PC Sweeper: rollforward after CAS race failed for {txn_id}: {e}"
                                         );
+                                        all_settled = false;
                                     }
                                 }
                                 Ok(Some(fresh))
                                     if fresh.state == "ABORTED"
                                         && fresh.started_at == Some(start) =>
                                 {
-                                    clear_aborted_intents_and_drop(
+                                    if !clear_aborted_intents_and_drop(
                                         &coord,
                                         &txn_id,
                                         start,
                                         fresh.participants.as_deref(),
                                     )
-                                    .await;
+                                    .await
+                                    {
+                                        all_settled = false;
+                                    }
+                                }
+                                Ok(Some(fresh)) if fresh.state == "PENDING" => {
+                                    all_settled = false;
                                 }
                                 Ok(_) => {}
                                 Err(e) => {
                                     tracing::warn!(
                                         "2PC Sweeper: get_state after CAS miss failed for {txn_id}: {e}"
                                     );
+                                    all_settled = false;
                                 }
                             },
                             Err(e) => {
                                 tracing::warn!(
                                     "2PC Sweeper: try_abort_pending failed for {txn_id}: {e}"
                                 );
+                                all_settled = false;
                             }
                         }
                     }
@@ -303,17 +333,22 @@ async fn sweep_txn_log(
                             stream_records,
                             ttl_mutations,
                             token_meta,
+                            base_guard,
                         };
                         if let Err(e) = engine.roll_forward(&txn_id, &txn_state).await {
                             tracing::error!(
                                 "2PC Sweeper: rollforward failed for txn {txn_id}: {e}"
                             );
+                            all_settled = false;
                         }
                     }
                     _ => {
                         tracing::warn!("2PC Sweeper: unknown txn state {st}");
+                        all_settled = false;
                     }
                 }
+            } else if st == "COMMITTED" {
+                all_settled = false;
             }
         }
 
@@ -325,10 +360,14 @@ async fn sweep_txn_log(
         }
     }
 
-    Ok(())
+    Ok(all_settled)
 }
 
-async fn sweep_due_tombstones(engine: &BigtableEngine, now_ms: u64) -> Result<(), String> {
+async fn sweep_due_tombstones(
+    engine: &BigtableEngine,
+    now_ms: u64,
+    has_cutoff_override: bool,
+) -> Result<(), String> {
     let client = engine.client_ref();
     let mut data = client.data();
     let full_index_table = client.full_table_name(TTL_INDEX_TABLE);
@@ -381,12 +420,37 @@ async fn sweep_due_tombstones(engine: &BigtableEngine, now_ms: u64) -> Result<()
             if let Some((expected_ver, table_short, raw_row_key)) =
                 decode_tombstone_gc_value(&cell.value)
             {
+                let cur_wall_ms = now_millis();
+                if has_cutoff_override
+                    && cur_wall_ms <= expected_ver
+                    && expected_ver.saturating_sub(cur_wall_ms) <= 50
+                {
+                    tokio::time::sleep(Duration::from_millis(
+                        expected_ver.saturating_sub(cur_wall_ms).saturating_add(1),
+                    ))
+                    .await;
+                }
+                if now_millis() <= expected_ver {
+                    continue;
+                }
                 let ops = ItemOps::new(client, table_short, 0);
                 match ops
                     .reclaim_version_only_row(raw_row_key, expected_ver)
                     .await
                 {
-                    Ok(_) | Err(StorageError::TableNotFound(_)) => {}
+                    Ok(true) | Err(StorageError::TableNotFound(_)) => {}
+                    Ok(false) => match ops.get_row_snapshot_by_raw_key(raw_row_key).await {
+                        Ok(snap)
+                            if snap.version == Some(expected_ver)
+                                && (snap.item.is_none()
+                                    || !snap.intents.is_empty()
+                                    || snap.in_progress_chunk) =>
+                        {
+                            continue;
+                        }
+                        Ok(_) | Err(StorageError::TableNotFound(_)) => {}
+                        Err(_) => continue,
+                    },
                     Err(e) => {
                         tracing::debug!(
                             table = %table_short,
@@ -436,7 +500,7 @@ async fn clear_aborted_intents_and_drop(
     txn_id: &str,
     started_at_micros: i64,
     participants: Option<&[ParticipantRow]>,
-) {
+) -> bool {
     let mut success = true;
     if let Some(parts) = participants {
         for p in parts {
@@ -452,8 +516,10 @@ async fn clear_aborted_intents_and_drop(
     if success {
         if let Err(e) = coord.drop_matching_start(txn_id, started_at_micros).await {
             tracing::warn!("2PC Sweeper: failed to drop coordinator row for txn {txn_id}: {e}");
+            success = false;
         } else {
             tracing::info!("2PC Sweeper: rolled back stale txn {txn_id}");
         }
     }
+    success
 }

@@ -338,6 +338,56 @@ async fn advance_shard_cursor_at_least(
     .await
 }
 
+/// Atomically verify `ShardMeta` has not been sealed strictly below `committed_seq`
+/// and advance `next_seq_num` / `last_sequence_number` via CAS.
+///
+/// Returns `Ok(false)` when `ending_sequence_number` is set strictly below
+/// `committed_seq` (or the shard metadata row was removed), allowing
+/// `write_record_ordered` to delete any unexposed post-close slot record and
+/// return `Ok(None)`.
+async fn advance_shard_cursor_if_open(
+    cat: &Catalog<'_>,
+    shard_id: &str,
+    min_next_slot: u64,
+    committed_seq: &str,
+) -> Result<bool, StorageError> {
+    let rk = keys::stream_shard(shard_id);
+    cat.mutate_json_cas(&rk, std::convert::identity, |existing| {
+        let Some(val) = existing else {
+            return Ok((CatalogJsonAction::NoOp, false));
+        };
+        let mut meta: ShardMeta = serde_json::from_value(val)
+            .map_err(|e| StorageError::Internal(format!("decode shard meta {shard_id}: {e}")))?;
+        if meta
+            .ending_sequence_number
+            .as_deref()
+            .is_some_and(|end_seq| committed_seq > end_seq)
+        {
+            return Ok((CatalogJsonAction::NoOp, false));
+        }
+        let mut changed = false;
+        if meta.next_seq_num < min_next_slot {
+            meta.next_seq_num = min_next_slot;
+            changed = true;
+        }
+        if meta
+            .last_sequence_number
+            .as_deref()
+            .is_none_or(|prev| committed_seq > prev)
+        {
+            meta.last_sequence_number = Some(committed_seq.to_owned());
+            changed = true;
+        }
+        if !changed {
+            return Ok((CatalogJsonAction::NoOp, true));
+        }
+        let encoded = serde_json::to_value(&meta)
+            .map_err(|e| StorageError::Internal(format!("encode shard meta: {e}")))?;
+        Ok((CatalogJsonAction::Put(encoded), true))
+    })
+    .await
+}
+
 /// Ensure `ShardMeta.next_seq_num` is strictly past a `stream_record:<shard_id>:<seq>`
 /// row BEFORE 24-hour retention pruning deletes the record.
 pub async fn ensure_shard_past_record(
@@ -357,12 +407,15 @@ pub async fn ensure_shard_past_record(
 }
 
 /// Close each open shard in `shard_ids` atomically via `Catalog::mutate_json_cas`,
-/// preserving concurrent `next_seq_num` / `last_sequence_number` advances.
+/// serializing against in-process writers via `shard_local_mutex` and preserving
+/// concurrent `next_seq_num` / `last_sequence_number` advances.
 pub async fn close_shards_by_id(
     cat: &Catalog<'_>,
     shard_ids: &[String],
 ) -> Result<(), StorageError> {
     for sid in shard_ids {
+        let local_lock = shard_local_mutex(sid);
+        let _guard = local_lock.lock().await;
         let fallback_latest = latest_sequence_for_shard(cat, sid).await?;
         let rk = keys::stream_shard(sid);
         cat.mutate_json_cas(&rk, std::convert::identity, |existing| {
@@ -462,14 +515,25 @@ pub async fn write_record_ordered(
             .flatten()
         {
             if let Some(existing_seq) = read_dedup_seq(cat, drk).await? {
-                if let Some(slot) = parse_slot_from_sequence(&existing_seq) {
-                    let _ = advance_shard_cursor_at_least(
+                if let Some(slot) = parse_slot_from_sequence(&existing_seq)
+                    && !advance_shard_cursor_if_open(
                         cat,
                         shard_id,
                         slot.saturating_add(1),
                         &existing_seq,
                     )
-                    .await;
+                    .await?
+                {
+                    let _ = cat
+                        .delete(&keys::stream_record(shard_id, &existing_seq))
+                        .await;
+                    for clean_drk in [event_dedup_rk.as_deref(), extra_dedup_rk.as_deref()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        let _ = cat.delete(clean_drk).await;
+                    }
+                    return Ok(None);
                 }
                 return Ok(Some(existing_seq));
             }
@@ -489,6 +553,9 @@ pub async fn write_record_ordered(
             .map_err(|e| StorageError::Internal(format!("encode stream record: {e}")))?;
 
         if cat.put_if_absent(&rec_rk, &body).await? {
+            // Persist dedup markers BEFORE advancing `ShardMeta.next_seq_num` so a
+            // crash mid-append never loses deduplication on recovery, then atomically
+            // verify via CAS on `ShardMeta` that the shard was not sealed below `cand_seq`.
             for drk in [event_dedup_rk.as_deref(), extra_dedup_rk.as_deref()]
                 .into_iter()
                 .flatten()
@@ -501,22 +568,30 @@ pub async fn write_record_ordered(
                 )
                 .await;
             }
-            let _ = advance_shard_cursor_at_least(
-                cat,
-                shard_id,
-                cand_slot.saturating_add(1),
-                &cand_seq,
-            )
-            .await;
+            if !advance_shard_cursor_if_open(cat, shard_id, cand_slot.saturating_add(1), &cand_seq)
+                .await?
+            {
+                let _ = cat.delete(&rec_rk).await;
+                for drk in [event_dedup_rk.as_deref(), extra_dedup_rk.as_deref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    let _ = cat.delete(drk).await;
+                }
+                return Ok(None);
+            }
             return Ok(Some(cand_seq));
         }
 
-        // Another writer claimed `cand_slot`. Help persist that winner's `event_id`
-        // dedup marker BEFORE advancing `ShardMeta.next_seq_num` to `cand_slot + 1`.
-        if let Some(winner_val) = cat.get(&rec_rk).await?
-            && let Ok(winner_rec) = serde_json::from_value::<StreamRecord>(winner_val)
-            && !winner_rec.event_id.is_empty()
-        {
+        // Another writer claimed `cand_slot` (or an idempotent `put_if_absent` retry
+        // observed our own slot). Persist that winner's dedup marker BEFORE advancing
+        // `ShardMeta.next_seq_num`, then verify via CAS that the shard remains open.
+        let winner_opt = cat
+            .get(&rec_rk)
+            .await?
+            .and_then(|v| serde_json::from_value::<StreamRecord>(v).ok())
+            .filter(|w| !w.event_id.is_empty());
+        if let Some(ref winner_rec) = winner_opt {
             let winner_drk = keys::stream_dedup(shard_id, &winner_rec.event_id);
             persist_dedup_marker(
                 cat,
@@ -525,30 +600,44 @@ pub async fn write_record_ordered(
                 winner_rec.dynamodb.approximate_creation_date_time,
             )
             .await;
-            if winner_rec.event_id == record.event_id {
-                if let Some(ref extra_drk) = extra_dedup_rk {
-                    persist_dedup_marker(
-                        cat,
-                        extra_drk,
-                        &cand_seq,
-                        winner_rec.dynamodb.approximate_creation_date_time,
-                    )
-                    .await;
-                }
-                let _ = advance_shard_cursor_at_least(
+            if winner_rec.event_id == record.event_id
+                && let Some(ref extra_drk) = extra_dedup_rk
+            {
+                persist_dedup_marker(
                     cat,
-                    shard_id,
-                    cand_slot.saturating_add(1),
+                    extra_drk,
                     &cand_seq,
+                    winner_rec.dynamodb.approximate_creation_date_time,
                 )
                 .await;
-                return Ok(Some(cand_seq));
             }
         }
 
-        let _ =
-            advance_shard_cursor_at_least(cat, shard_id, cand_slot.saturating_add(1), &cand_seq)
-                .await;
+        if !advance_shard_cursor_if_open(cat, shard_id, cand_slot.saturating_add(1), &cand_seq)
+            .await?
+        {
+            let _ = cat.delete(&rec_rk).await;
+            if let Some(ref winner_rec) = winner_opt {
+                let _ = cat
+                    .delete(&keys::stream_dedup(shard_id, &winner_rec.event_id))
+                    .await;
+                if winner_rec.event_id == record.event_id {
+                    for drk in [event_dedup_rk.as_deref(), extra_dedup_rk.as_deref()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        let _ = cat.delete(drk).await;
+                    }
+                }
+            }
+            return Ok(None);
+        }
+
+        if let Some(winner_rec) = winner_opt
+            && winner_rec.event_id == record.event_id
+        {
+            return Ok(Some(cand_seq));
+        }
 
         if attempt > 8 {
             let jitter_ms = rand::random_range(1..=4u64);

@@ -37,6 +37,9 @@ pub const MAX_GRPC_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const BIGTABLE_DATA_ENDPOINT: &str = "https://bigtable.googleapis.com:443";
 const BIGTABLE_DATA_HOST: &str = "bigtable.googleapis.com";
 const BIGTABLE_DATA_SCOPE: &str = "https://www.googleapis.com/auth/bigtable.data";
+/// URL-safe base64 encoding of `google.bigtable.v2.FeatureFlags { reverse_scans: true }`
+/// (`[0x08, 0x01]`), required by Cloud Bigtable when `ReadRowsRequest.reversed == true`.
+const BIGTABLE_FEATURES_REVERSE_SCANS: &str = "CAE=";
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RPC_ATTEMPTS: usize = 6;
 
@@ -622,6 +625,10 @@ impl BigtableClient {
             req.metadata_mut()
                 .insert("x-goog-request-params", routing_val);
         }
+        req.metadata_mut().insert(
+            "bigtable-features",
+            MetadataValue::from_static(BIGTABLE_FEATURES_REVERSE_SCANS),
+        );
         Ok(req)
     }
 
@@ -1069,9 +1076,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn make_request_attaches_x_goog_request_params_header() {
+    async fn make_request_attaches_routing_and_reverse_scan_feature_headers() {
+        use base64::Engine as _;
+        use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::FeatureFlags;
+        use prost::Message as _;
+
+        let flags_proto = FeatureFlags {
+            reverse_scans: true,
+            ..FeatureFlags::default()
+        }
+        .encode_to_vec();
+        assert_eq!(flags_proto, vec![0x08, 0x01]);
+        assert_eq!(
+            base64::engine::general_purpose::URL_SAFE.encode(&flags_proto),
+            BIGTABLE_FEATURES_REVERSE_SCANS
+        );
+
         let cfg = BigtableStorageConfig {
-            project_id: "proj-a".to_owned(),
+            project_id: "example.com:proj-a".to_owned(),
             instance_id: "inst-b".to_owned(),
             app_profile_id: Some("single-tx".to_owned()),
             emulator_host: Some("127.0.0.1:8086".to_owned()),
@@ -1091,7 +1113,14 @@ mod tests {
             .expect("ascii header");
         assert_eq!(
             hdr,
-            "table_name=projects%2Fproj-a%2Finstances%2Finst-b%2Ftables%2Ft0123456789abcdef&app_profile_id=single-tx"
+            "table_name=projects%2Fexample.com%3Aproj-a%2Finstances%2Finst-b%2Ftables%2Ft0123456789abcdef&app_profile_id=single-tx"
         );
+        let feat_hdr = req
+            .metadata()
+            .get("bigtable-features")
+            .expect("bigtable-features header present")
+            .to_str()
+            .expect("ascii header");
+        assert_eq!(feat_hdr, BIGTABLE_FEATURES_REVERSE_SCANS);
     }
 }

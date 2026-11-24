@@ -101,7 +101,7 @@ When connecting to Google Cloud Bigtable (no emulator active), `extenddb serve` 
 ExtendDB authenticates using `credentials_path` (a service-account JSON key file) when set, or Application Default Credentials (ADC) otherwise. Grant the service account permissions on the target instance(s) covering:
 
 - **Data plane**: `bigtable.tables.readRows`, `bigtable.tables.mutateRows`, `bigtable.tables.checkAndMutateRow`
-- **Table lifecycle (`init`, `migrate`, `CreateTable`, `UpdateTable`, `DeleteTable`, `destroy`)**: `bigtable.tables.create`, `bigtable.tables.delete`, `bigtable.tables.get`, `bigtable.tables.list`
+- **Table lifecycle (`init`, `migrate`, `CreateTable`, `UpdateTable`, `DeleteTable`, `destroy`)**: `bigtable.tables.create`, `bigtable.tables.update`, `bigtable.tables.delete`, `bigtable.tables.get`, `bigtable.tables.list`
 - **Startup app-profile validation**: `bigtable.appProfiles.get`
 
 Predefined role `roles/bigtable.admin` (scoped to the Bigtable instance) includes all of the above.

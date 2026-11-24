@@ -22,7 +22,12 @@ use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::{
     TimestampRange, mutation,
 };
 
-use crate::data::client::{BigtableClient, map_bigtable_err};
+use uuid::Uuid;
+
+use crate::data::client::{
+    BigtableClient, exact_re2_bytes, map_bigtable_err, monotonic_timestamp_after_micros,
+    monotonic_timestamp_micros,
+};
 use crate::data::encoding::{cell, row_key};
 
 /// Family for DDB attribute cells.
@@ -33,6 +38,10 @@ pub const FAMILY_META: &str = "m";
 pub const QUALIFIER_VERSION: &[u8] = b"v";
 /// Qualifier prefix for 2PC intent cells in family `m`.
 pub const QUALIFIER_INTENT_PREFIX: &[u8] = b"intent:";
+/// Intent ID prefix for direct multi-chunk `ItemOps::put_cas` staging.
+pub const DIRECT_PUT_STAGE_PREFIX: &str = "sgl-put-";
+/// Qualifier for shadow-row in-progress multi-chunk step markers in family `m`.
+pub const QUALIFIER_SHADOW_CHUNK: &[u8] = b"chunk";
 /// Safe per-RPC mutation batch ceiling below Bigtable's 100,000-mutation hard limit.
 pub const MAX_MUTATIONS_PER_RPC: usize = 90_000;
 
@@ -183,13 +192,15 @@ pub enum CasOutcome {
     OccMismatch,
 }
 
-/// Atomic single-row read snapshot capturing `d:*`, `m:v`, and all physical
-/// `(txn_id, intent_cell_ts_micros)` entries regardless of wall-clock age.
+/// Atomic single-row read snapshot capturing `d:*`, `m:v`, all physical
+/// `(txn_id, intent_cell_ts_micros)` entries regardless of wall-clock age, and
+/// whether an in-progress multi-chunk write is currently staging `d:*`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RowSnapshot {
     pub item: Option<Item>,
     pub version: Option<u64>,
     pub intents: Vec<(String, i64)>,
+    pub in_progress_chunk: bool,
 }
 
 /// Decodes an OCC row version from cell bytes.
@@ -378,15 +389,157 @@ fn select_occ_predicate(expected_version: Option<u64>, row_existed: bool) -> Row
     }
 }
 
+/// Filter matching any latest cell at `m:<qualifier>`.
+pub(crate) fn build_meta_qualifier_present_filter(qualifier: &[u8]) -> RowFilter {
+    RowFilter {
+        filter: Some(Filter::Chain(Chain {
+            filters: vec![
+                RowFilter {
+                    filter: Some(Filter::FamilyNameRegexFilter(format!("^{FAMILY_META}$"))),
+                },
+                RowFilter {
+                    filter: Some(Filter::ColumnQualifierRegexFilter(exact_re2_bytes(
+                        qualifier,
+                    ))),
+                },
+                RowFilter {
+                    filter: Some(Filter::CellsPerColumnLimitFilter(1)),
+                },
+            ],
+        })),
+    }
+}
+
+/// Filter matching `latest(m:<qualifier>) == expected_val` (`CellsPerColumnLimitFilter(1)`
+/// applied before `ValueRegexFilter` so lazy `MaxNumVersions(1)` compaction can
+/// never match an older cell).
+pub(crate) fn build_meta_qualifier_exact_match_filter(
+    qualifier: &[u8],
+    expected_val: &[u8],
+) -> RowFilter {
+    RowFilter {
+        filter: Some(Filter::Chain(Chain {
+            filters: vec![
+                RowFilter {
+                    filter: Some(Filter::FamilyNameRegexFilter(format!("^{FAMILY_META}$"))),
+                },
+                RowFilter {
+                    filter: Some(Filter::ColumnQualifierRegexFilter(exact_re2_bytes(
+                        qualifier,
+                    ))),
+                },
+                RowFilter {
+                    filter: Some(Filter::CellsPerColumnLimitFilter(1)),
+                },
+                RowFilter {
+                    filter: Some(Filter::ValueRegexFilter(exact_re2_bytes(expected_val))),
+                },
+            ],
+        })),
+    }
+}
+
+fn build_put_cas_chunk_predicate(
+    intent_qual: &[u8],
+    expected_stage: &[u8],
+    expected_version: Option<u64>,
+) -> RowFilter {
+    let stage_match = build_meta_qualifier_exact_match_filter(intent_qual, expected_stage);
+    match expected_version {
+        Some(v) => RowFilter {
+            filter: Some(Filter::Condition(Box::new(Condition {
+                predicate_filter: Some(Box::new(stage_match)),
+                true_filter: Some(Box::new(build_version_match_filter(v))),
+                false_filter: Some(Box::new(RowFilter {
+                    filter: Some(Filter::BlockAllFilter(true)),
+                })),
+            }))),
+        },
+        None => RowFilter {
+            filter: Some(Filter::Condition(Box::new(Condition {
+                predicate_filter: Some(Box::new(ItemOps::missing_version_filter())),
+                true_filter: Some(Box::new(RowFilter {
+                    filter: Some(Filter::BlockAllFilter(true)),
+                })),
+                false_filter: Some(Box::new(stage_match)),
+            }))),
+        },
+    }
+}
+
+pub(crate) fn build_shadow_cas_predicate(
+    cur_ver: Option<u64>,
+    cur_chunk: Option<&[u8]>,
+) -> (RowFilter, bool) {
+    match (cur_ver, cur_chunk) {
+        (None, None) => (
+            RowFilter {
+                filter: Some(Filter::Interleave(Interleave {
+                    filters: vec![
+                        ItemOps::missing_version_filter(),
+                        build_meta_qualifier_present_filter(QUALIFIER_SHADOW_CHUNK),
+                    ],
+                })),
+            },
+            true,
+        ),
+        (Some(cv), None) => (
+            RowFilter {
+                filter: Some(Filter::Condition(Box::new(Condition {
+                    predicate_filter: Some(Box::new(build_meta_qualifier_present_filter(
+                        QUALIFIER_SHADOW_CHUNK,
+                    ))),
+                    true_filter: Some(Box::new(RowFilter {
+                        filter: Some(Filter::BlockAllFilter(true)),
+                    })),
+                    false_filter: Some(Box::new(build_version_match_filter(cv))),
+                }))),
+            },
+            false,
+        ),
+        (None, Some(raw)) => (
+            RowFilter {
+                filter: Some(Filter::Condition(Box::new(Condition {
+                    predicate_filter: Some(Box::new(ItemOps::missing_version_filter())),
+                    true_filter: Some(Box::new(RowFilter {
+                        filter: Some(Filter::BlockAllFilter(true)),
+                    })),
+                    false_filter: Some(Box::new(build_meta_qualifier_exact_match_filter(
+                        QUALIFIER_SHADOW_CHUNK,
+                        raw,
+                    ))),
+                }))),
+            },
+            false,
+        ),
+        (Some(cv), Some(raw)) => (
+            RowFilter {
+                filter: Some(Filter::Condition(Box::new(Condition {
+                    predicate_filter: Some(Box::new(build_meta_qualifier_exact_match_filter(
+                        QUALIFIER_SHADOW_CHUNK,
+                        raw,
+                    ))),
+                    true_filter: Some(Box::new(build_version_match_filter(cv))),
+                    false_filter: Some(Box::new(RowFilter {
+                        filter: Some(Filter::BlockAllFilter(true)),
+                    })),
+                }))),
+            },
+            false,
+        ),
+    }
+}
+
 /// De Morgan conflict filter for reclaiming a version-only tombstone row at
 /// `expected_version`: matches (preventing `DeleteFromRow` in `false_mutations`)
-/// whenever ANY `m:intent:*` cell exists, OR `m:v != expected_version`, OR ANY
-/// `d:*` data cell exists.
+/// whenever ANY `m:intent:*` cell exists, OR `m:chunk` exists, OR
+/// `m:v != expected_version`, OR ANY `d:*` data cell exists.
 pub(crate) fn build_tombstone_reclaim_conflict_filter(expected_version: u64) -> RowFilter {
     RowFilter {
         filter: Some(Filter::Interleave(Interleave {
             filters: vec![
                 build_active_intent_filter(),
+                build_meta_qualifier_present_filter(QUALIFIER_SHADOW_CHUNK),
                 build_version_mismatch_filter(expected_version),
                 RowFilter {
                     filter: Some(Filter::Chain(Chain {
@@ -413,6 +566,8 @@ fn decode_snapshot_cells(
     let mut item: Item = BTreeMap::new();
     let mut version: Option<u64> = None;
     let mut intents: BTreeMap<String, i64> = BTreeMap::new();
+    let mut intent_latest_val: BTreeMap<String, (i64, Vec<u8>)> = BTreeMap::new();
+    let mut has_shadow_chunk = false;
     for c in cells {
         if c.family_name == FAMILY_DATA {
             let attr_name = String::from_utf8(c.qualifier)
@@ -424,6 +579,8 @@ fn decode_snapshot_cells(
         } else if c.family_name == FAMILY_META {
             if c.qualifier.as_slice() == QUALIFIER_VERSION && version.is_none() {
                 version = decode_version(&c.value);
+            } else if c.qualifier.as_slice() == QUALIFIER_SHADOW_CHUNK {
+                has_shadow_chunk = true;
             } else if c.qualifier.starts_with(QUALIFIER_INTENT_PREFIX)
                 && let Ok(qual_str) = std::str::from_utf8(&c.qualifier)
                 && let Some(tid) = qual_str.strip_prefix("intent:")
@@ -432,13 +589,26 @@ fn decode_snapshot_cells(
                     .entry(tid.to_string())
                     .and_modify(|ts| *ts = (*ts).max(c.timestamp_micros))
                     .or_insert(c.timestamp_micros);
+                intent_latest_val
+                    .entry(tid.to_string())
+                    .and_modify(|cur| {
+                        if c.timestamp_micros > cur.0 {
+                            *cur = (c.timestamp_micros, c.value.clone());
+                        }
+                    })
+                    .or_insert_with(|| (c.timestamp_micros, c.value));
             }
         }
     }
+    let in_progress_chunk = has_shadow_chunk
+        || intent_latest_val
+            .values()
+            .any(|(_, val)| val.starts_with(b"attr:"));
     Ok(RowSnapshot {
         item: (!item.is_empty()).then_some(item),
         version,
         intents: intents.into_iter().collect(),
+        in_progress_chunk,
     })
 }
 
@@ -509,6 +679,7 @@ impl<'a> ItemOps<'a> {
                 item: None,
                 version: None,
                 intents: Vec::new(),
+                in_progress_chunk: false,
             });
         };
         decode_snapshot_cells(cells)
@@ -552,6 +723,7 @@ impl<'a> ItemOps<'a> {
                     item: None,
                     version: None,
                     intents: Vec::new(),
+                    in_progress_chunk: false,
                 })
             })
             .collect())
@@ -678,32 +850,116 @@ impl<'a> ItemOps<'a> {
         let row_key = row_key::encode_key(item, &key_info.key_schema)?;
         let next_version = next_occ_version(expected_version);
         let ts_micros = version_to_timestamp_micros(next_version);
+        let rpc_limit = max_mutations_per_rpc().max(4);
+        let predicate = select_occ_predicate(expected_version, row_existed);
+        let mv_mutations = vec![
+            Mutation {
+                mutation: Some(mutation::Mutation::SetCell(SetCell {
+                    family_name: FAMILY_META.to_string(),
+                    column_qualifier: QUALIFIER_VERSION.to_vec(),
+                    timestamp_micros: ts_micros,
+                    value: next_version.to_string().into_bytes(),
+                })),
+            },
+            Mutation {
+                mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
+                    family_name: FAMILY_META.to_string(),
+                    column_qualifier: QUALIFIER_VERSION.to_vec(),
+                    time_range: older_than_ts_range(ts_micros),
+                })),
+            },
+        ];
 
-        let mut mutations = Vec::with_capacity(item.len() + 3);
-        // Place `m:v` and `DeleteFromFamily("d")` at the front so the first
-        // `MAX_MUTATIONS_PER_RPC` chunk atomically advances the OCC fence even
-        // when an item carries > 90,000 small attributes.
-        mutations.push(Mutation {
+        if item.len().saturating_add(3) <= rpc_limit {
+            let mut mutations = Vec::with_capacity(item.len() + 3);
+            mutations.extend(mv_mutations);
+            mutations.extend(self.item_to_mutations_at(item, true, ts_micros)?);
+
+            let mut data = self.client.data();
+            let req = CheckAndMutateRowRequest {
+                table_name: self.full_table_name.clone(),
+                app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+                row_key: row_key.clone(),
+                predicate_filter: Some(predicate),
+                true_mutations: vec![],
+                false_mutations: mutations,
+                ..CheckAndMutateRowRequest::default()
+            };
+
+            let resp = data
+                .check_and_mutate_row_idempotent(req)
+                .await
+                .map_err(|e| map_bigtable_err("CheckAndMutateRow put", e))?;
+
+            if !resp.predicate_matched {
+                return Ok(CasOutcome::Applied(next_version));
+            }
+            if self.has_any_intent(&row_key).await? {
+                return Ok(CasOutcome::IntentPresent);
+            }
+            return Ok(CasOutcome::OccMismatch);
+        }
+
+        // Multi-chunk `put_cas`: place primary-key attributes first so family `d`
+        // is never headless, stage behind `m:intent:sgl-put-* = "attr:<offset>"`
+        // without advancing `m:v`, fence every overflow chunk via a single-Condition
+        // `CheckAndMutateRow` on `(m:intent:sgl-put-*, m:v)`, and advance `m:v` +
+        // clear the staging intent atomically on the final chunk.
+        let mut attr_cells = Vec::with_capacity(item.len());
+        for ks in &key_info.key_schema {
+            if let Some(val) = item.get(&ks.attribute_name) {
+                attr_cells.push(Mutation {
+                    mutation: Some(mutation::Mutation::SetCell(SetCell {
+                        family_name: FAMILY_DATA.to_string(),
+                        column_qualifier: ks.attribute_name.as_bytes().to_vec(),
+                        timestamp_micros: ts_micros,
+                        value: cell::encode(val)?,
+                    })),
+                });
+            }
+        }
+        for (name, val) in item {
+            if key_info
+                .key_schema
+                .iter()
+                .any(|ks| ks.attribute_name == *name)
+            {
+                continue;
+            }
+            attr_cells.push(Mutation {
+                mutation: Some(mutation::Mutation::SetCell(SetCell {
+                    family_name: FAMILY_DATA.to_string(),
+                    column_qualifier: name.as_bytes().to_vec(),
+                    timestamp_micros: ts_micros,
+                    value: cell::encode(val)?,
+                })),
+            });
+        }
+
+        let take_first = (rpc_limit - 2).min(attr_cells.len());
+        let intent_qual = format!(
+            "intent:{DIRECT_PUT_STAGE_PREFIX}{}",
+            Uuid::new_v4().simple()
+        )
+        .into_bytes();
+        let mut stage_ts = monotonic_timestamp_micros().max(ts_micros);
+        let mut expected_stage = format!("attr:{take_first}").into_bytes();
+
+        let mut first_false_mutations = Vec::with_capacity(take_first + 2);
+        first_false_mutations.push(Mutation {
             mutation: Some(mutation::Mutation::SetCell(SetCell {
                 family_name: FAMILY_META.to_string(),
-                column_qualifier: QUALIFIER_VERSION.to_vec(),
-                timestamp_micros: ts_micros,
-                value: next_version.to_string().into_bytes(),
+                column_qualifier: intent_qual.clone(),
+                timestamp_micros: stage_ts,
+                value: expected_stage.clone(),
             })),
         });
-        mutations.push(Mutation {
-            mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
-                family_name: FAMILY_META.to_string(),
-                column_qualifier: QUALIFIER_VERSION.to_vec(),
-                time_range: older_than_ts_range(ts_micros),
+        first_false_mutations.push(Mutation {
+            mutation: Some(mutation::Mutation::DeleteFromFamily(DeleteFromFamily {
+                family_name: FAMILY_DATA.to_string(),
             })),
         });
-        mutations.extend(self.item_to_mutations_at(item, true, ts_micros)?);
-
-        let rpc_limit = max_mutations_per_rpc();
-        let (mutations, overflow_chunks) = split_mutation_batches(mutations, rpc_limit);
-
-        let predicate = select_occ_predicate(expected_version, row_existed);
+        first_false_mutations.extend_from_slice(&attr_cells[..take_first]);
 
         let mut data = self.client.data();
         let req = CheckAndMutateRowRequest {
@@ -712,26 +968,90 @@ impl<'a> ItemOps<'a> {
             row_key: row_key.clone(),
             predicate_filter: Some(predicate),
             true_mutations: vec![],
-            false_mutations: mutations,
+            false_mutations: first_false_mutations,
             ..CheckAndMutateRowRequest::default()
         };
-
         let resp = data
             .check_and_mutate_row_idempotent(req)
             .await
-            .map_err(|e| map_bigtable_err("CheckAndMutateRow put", e))?;
-
-        if !resp.predicate_matched {
-            for chunk in overflow_chunks {
-                self.mutate_cells(row_key.clone(), chunk).await?;
+            .map_err(|e| map_bigtable_err("CheckAndMutateRow put chunk0", e))?;
+        if resp.predicate_matched {
+            if self.has_any_intent(&row_key).await? {
+                return Ok(CasOutcome::IntentPresent);
             }
-            return Ok(CasOutcome::Applied(next_version));
+            return Ok(CasOutcome::OccMismatch);
         }
 
-        if self.has_any_intent(&row_key).await? {
-            return Ok(CasOutcome::IntentPresent);
+        let mut offset = take_first;
+        loop {
+            let chunk_pred =
+                build_put_cas_chunk_predicate(&intent_qual, &expected_stage, expected_version);
+            let remaining = attr_cells.len().saturating_sub(offset);
+            let is_final = remaining.saturating_add(3) <= rpc_limit;
+
+            let mut true_mutations = Vec::new();
+            let next_offset;
+            if is_final {
+                true_mutations.push(Mutation {
+                    mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
+                        family_name: FAMILY_META.to_string(),
+                        column_qualifier: intent_qual.clone(),
+                        time_range: None,
+                    })),
+                });
+                true_mutations.extend(mv_mutations.iter().cloned());
+                true_mutations.extend_from_slice(&attr_cells[offset..]);
+                next_offset = attr_cells.len();
+            } else {
+                let step_cap = rpc_limit.saturating_sub(2).max(1);
+                let take = remaining.min(step_cap);
+                next_offset = offset + take;
+                stage_ts = monotonic_timestamp_after_micros(stage_ts);
+                let next_stage = format!("attr:{next_offset}").into_bytes();
+                true_mutations.push(Mutation {
+                    mutation: Some(mutation::Mutation::SetCell(SetCell {
+                        family_name: FAMILY_META.to_string(),
+                        column_qualifier: intent_qual.clone(),
+                        timestamp_micros: stage_ts,
+                        value: next_stage.clone(),
+                    })),
+                });
+                true_mutations.push(Mutation {
+                    mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
+                        family_name: FAMILY_META.to_string(),
+                        column_qualifier: intent_qual.clone(),
+                        time_range: older_than_ts_range(stage_ts),
+                    })),
+                });
+                true_mutations.extend_from_slice(&attr_cells[offset..next_offset]);
+                expected_stage = next_stage;
+            }
+
+            let mut chunk_data = self.client.data();
+            let chunk_req = CheckAndMutateRowRequest {
+                table_name: self.full_table_name.clone(),
+                app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+                row_key: row_key.clone(),
+                predicate_filter: Some(chunk_pred),
+                true_mutations,
+                false_mutations: vec![],
+                ..CheckAndMutateRowRequest::default()
+            };
+            let chunk_resp = chunk_data
+                .check_and_mutate_row_idempotent(chunk_req)
+                .await
+                .map_err(|e| map_bigtable_err("CheckAndMutateRow put chunk", e))?;
+            if !chunk_resp.predicate_matched {
+                if self.has_any_intent(&row_key).await? {
+                    return Ok(CasOutcome::IntentPresent);
+                }
+                return Ok(CasOutcome::OccMismatch);
+            }
+            if is_final {
+                return Ok(CasOutcome::Applied(next_version));
+            }
+            offset = next_offset;
         }
-        Ok(CasOutcome::OccMismatch)
     }
 
     /// Guarded `put` wrapper returning `TransactionConflict` on conflict.
@@ -843,12 +1163,12 @@ impl<'a> ItemOps<'a> {
         }
     }
 
-    /// Read `(existing_d_qualifiers, max_d_timestamp_micros, current_shadow_version)`
-    /// for a GSI shadow row.
+    /// Read `(existing_d_qualifiers, max_d_timestamp_micros, current_shadow_version, current_shadow_chunk, max_chunk_ts_micros)`
+    /// for a GSI/LSI shadow row.
     async fn read_shadow_row_meta(
         &self,
         shadow_row_key: &[u8],
-    ) -> Result<(Vec<Vec<u8>>, i64, Option<u64>), StorageError> {
+    ) -> Result<(Vec<Vec<u8>>, i64, Option<u64>, Option<Vec<u8>>, i64), StorageError> {
         let mut data = self.client.data();
         let req = ReadRowsRequest {
             table_name: self.full_table_name.clone(),
@@ -870,6 +1190,8 @@ impl<'a> ItemOps<'a> {
         let mut quals: Vec<Vec<u8>> = Vec::new();
         let mut max_d_ts: i64 = 0;
         let mut ver: Option<u64> = None;
+        let mut chunk_marker: Option<Vec<u8>> = None;
+        let mut max_chunk_ts: i64 = 0;
         if let Some((_, cells)) = resp.into_iter().next() {
             for c in cells {
                 if c.family_name == FAMILY_DATA {
@@ -877,18 +1199,22 @@ impl<'a> ItemOps<'a> {
                     if !quals.iter().any(|q| q.as_slice() == c.qualifier.as_slice()) {
                         quals.push(c.qualifier);
                     }
-                } else if c.family_name == FAMILY_META
-                    && c.qualifier.as_slice() == QUALIFIER_VERSION
-                    && ver.is_none()
-                {
-                    ver = decode_version(&c.value);
+                } else if c.family_name == FAMILY_META {
+                    if c.qualifier.as_slice() == QUALIFIER_VERSION && ver.is_none() {
+                        ver = decode_version(&c.value);
+                    } else if c.qualifier.as_slice() == QUALIFIER_SHADOW_CHUNK {
+                        max_chunk_ts = max_chunk_ts.max(c.timestamp_micros);
+                        if chunk_marker.is_none() {
+                            chunk_marker = Some(c.value);
+                        }
+                    }
                 }
             }
         }
-        Ok((quals, max_d_ts, ver))
+        Ok((quals, max_d_ts, ver, chunk_marker, max_chunk_ts))
     }
 
-    fn missing_version_filter() -> RowFilter {
+    pub(crate) fn missing_version_filter() -> RowFilter {
         RowFilter {
             filter: Some(Filter::Chain(Chain {
                 filters: vec![
@@ -906,57 +1232,193 @@ impl<'a> ItemOps<'a> {
         }
     }
 
-    /// Execute a version-guarded `CheckAndMutateRow` against a shadow index row
-    /// (`cur_ver == Some(cv)` or `cur_ver == None`), transparently flushing any
-    /// overflow mutations (`> MAX_MUTATIONS_PER_RPC`) once the atomic version
-    /// fence succeeds.
+    /// Execute a version-and-chunk-guarded `CheckAndMutateRow` against a shadow
+    /// index row (`(cur_ver, cur_chunk)`), fencing every overflow chunk
+    /// (`> MAX_MUTATIONS_PER_RPC`) via a flat (zero-nested-Condition)
+    /// `CheckAndMutateRow` on `(new_version, "{new_version}:{nonce}:{step}")` so
+    /// concurrent higher-version writes or deletes preempt immediately and
+    /// stale in-flight chunks are rejected atomically.
     async fn apply_shadow_version_cas(
         &self,
         op_name: &str,
         shadow_row_key: &[u8],
-        cur_ver: Option<u64>,
-        mutations: Vec<Mutation>,
+        (cur_ver, cur_chunk, max_chunk_ts): (Option<u64>, Option<&[u8]>, i64),
+        (new_version, ts_micros): (u64, i64),
+        mut mutations: Vec<Mutation>,
     ) -> Result<bool, StorageError> {
-        let rpc_limit = max_mutations_per_rpc();
-        let (mutations, overflow_chunks) = split_mutation_batches(mutations, rpc_limit);
+        let rpc_limit = max_mutations_per_rpc().max(4);
+        let (initial_predicate, initial_in_false_branch) =
+            build_shadow_cas_predicate(cur_ver, cur_chunk);
 
-        let req = match cur_ver {
-            Some(cv) => CheckAndMutateRowRequest {
+        let needs_chunk_clear = cur_chunk.is_some();
+        let single_len = mutations
+            .len()
+            .saturating_add(usize::from(needs_chunk_clear));
+
+        if single_len <= rpc_limit {
+            if needs_chunk_clear {
+                mutations.push(Mutation {
+                    mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
+                        family_name: FAMILY_META.to_string(),
+                        column_qualifier: QUALIFIER_SHADOW_CHUNK.to_vec(),
+                        time_range: None,
+                    })),
+                });
+            }
+            let (true_mutations, false_mutations) = if initial_in_false_branch {
+                (vec![], mutations)
+            } else {
+                (mutations, vec![])
+            };
+            let req = CheckAndMutateRowRequest {
                 table_name: self.full_table_name.clone(),
                 app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
                 row_key: shadow_row_key.to_vec(),
-                predicate_filter: Some(build_version_match_filter(cv)),
-                true_mutations: mutations,
-                false_mutations: vec![],
+                predicate_filter: Some(initial_predicate),
+                true_mutations,
+                false_mutations,
                 ..CheckAndMutateRowRequest::default()
-            },
-            None => CheckAndMutateRowRequest {
-                table_name: self.full_table_name.clone(),
-                app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
-                row_key: shadow_row_key.to_vec(),
-                predicate_filter: Some(Self::missing_version_filter()),
-                true_mutations: vec![],
-                false_mutations: mutations,
-                ..CheckAndMutateRowRequest::default()
-            },
+            };
+            let mut data = self.client.data();
+            let resp = data
+                .check_and_mutate_row_idempotent(req)
+                .await
+                .map_err(|e| map_bigtable_err(op_name, e))?;
+            return Ok(if initial_in_false_branch {
+                !resp.predicate_matched
+            } else {
+                resp.predicate_matched
+            });
+        }
+
+        // Multi-chunk shadow write (`mutations[0..2]` hold `m:v` SetCell + DeleteFromColumn,
+        // `mutations[2..]` hold `d:*` cells/deletes):
+        let d_mutations = if mutations.len() >= 2 {
+            mutations.split_off(2)
+        } else {
+            Vec::new()
         };
+        let nonce_full = Uuid::new_v4().simple().to_string();
+        let nonce = &nonce_full[..8];
+        let mut chunk_ts = monotonic_timestamp_after_micros(max_chunk_ts).max(ts_micros);
+        let mut step_token = format!("{new_version}:{nonce}:0").into_bytes();
 
+        let mut chunk0 = mutations;
+        chunk0.push(Mutation {
+            mutation: Some(mutation::Mutation::SetCell(SetCell {
+                family_name: FAMILY_META.to_string(),
+                column_qualifier: QUALIFIER_SHADOW_CHUNK.to_vec(),
+                timestamp_micros: chunk_ts,
+                value: step_token.clone(),
+            })),
+        });
+        if needs_chunk_clear {
+            chunk0.push(Mutation {
+                mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
+                    family_name: FAMILY_META.to_string(),
+                    column_qualifier: QUALIFIER_SHADOW_CHUNK.to_vec(),
+                    time_range: older_than_ts_range(chunk_ts),
+                })),
+            });
+        }
+        let first_d_cap = rpc_limit.saturating_sub(chunk0.len());
+        let split_at = d_mutations.len().min(first_d_cap);
+        let (first_d, rest_d) = d_mutations.split_at(split_at);
+        chunk0.extend_from_slice(first_d);
+
+        let (true_mutations0, false_mutations0) = if initial_in_false_branch {
+            (vec![], chunk0)
+        } else {
+            (chunk0, vec![])
+        };
         let mut data = self.client.data();
-        let resp = data
-            .check_and_mutate_row_idempotent(req)
+        let req0 = CheckAndMutateRowRequest {
+            table_name: self.full_table_name.clone(),
+            app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+            row_key: shadow_row_key.to_vec(),
+            predicate_filter: Some(initial_predicate),
+            true_mutations: true_mutations0,
+            false_mutations: false_mutations0,
+            ..CheckAndMutateRowRequest::default()
+        };
+        let resp0 = data
+            .check_and_mutate_row_idempotent(req0)
             .await
             .map_err(|e| map_bigtable_err(op_name, e))?;
-        let applied = if cur_ver.is_some() {
-            resp.predicate_matched
+        let applied0 = if initial_in_false_branch {
+            !resp0.predicate_matched
         } else {
-            !resp.predicate_matched
+            resp0.predicate_matched
         };
-        if applied {
-            for chunk in overflow_chunks {
-                self.mutate_cells(shadow_row_key.to_vec(), chunk).await?;
-            }
+        if !applied0 {
+            return Ok(false);
         }
-        Ok(applied)
+
+        let mut rem_offset = 0usize;
+        let mut step_idx = 0usize;
+        loop {
+            let rem = rest_d.len().saturating_sub(rem_offset);
+            let (pred, _) = build_shadow_cas_predicate(Some(new_version), Some(&step_token));
+            let (batch, is_final, next_rem_offset) = if rem.saturating_add(1) <= rpc_limit {
+                let mut fin = Vec::with_capacity(rem + 1);
+                fin.push(Mutation {
+                    mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
+                        family_name: FAMILY_META.to_string(),
+                        column_qualifier: QUALIFIER_SHADOW_CHUNK.to_vec(),
+                        time_range: None,
+                    })),
+                });
+                fin.extend_from_slice(&rest_d[rem_offset..]);
+                (fin, true, rest_d.len())
+            } else {
+                chunk_ts = monotonic_timestamp_after_micros(chunk_ts);
+                step_idx += 1;
+                let next_token = format!("{new_version}:{nonce}:{step_idx}").into_bytes();
+                let take = (rpc_limit - 2).min(rem);
+                let next_off = rem_offset + take;
+                let mut mid = Vec::with_capacity(take + 2);
+                mid.push(Mutation {
+                    mutation: Some(mutation::Mutation::SetCell(SetCell {
+                        family_name: FAMILY_META.to_string(),
+                        column_qualifier: QUALIFIER_SHADOW_CHUNK.to_vec(),
+                        timestamp_micros: chunk_ts,
+                        value: next_token.clone(),
+                    })),
+                });
+                mid.push(Mutation {
+                    mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
+                        family_name: FAMILY_META.to_string(),
+                        column_qualifier: QUALIFIER_SHADOW_CHUNK.to_vec(),
+                        time_range: older_than_ts_range(chunk_ts),
+                    })),
+                });
+                mid.extend_from_slice(&rest_d[rem_offset..next_off]);
+                step_token = next_token;
+                (mid, false, next_off)
+            };
+
+            let mut cdata = self.client.data();
+            let creq = CheckAndMutateRowRequest {
+                table_name: self.full_table_name.clone(),
+                app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+                row_key: shadow_row_key.to_vec(),
+                predicate_filter: Some(pred),
+                true_mutations: batch,
+                false_mutations: vec![],
+                ..CheckAndMutateRowRequest::default()
+            };
+            let cresp = cdata
+                .check_and_mutate_row_idempotent(creq)
+                .await
+                .map_err(|e| map_bigtable_err(op_name, e))?;
+            if !cresp.predicate_matched {
+                return Ok(false);
+            }
+            if is_final {
+                return Ok(true);
+            }
+            rem_offset = next_rem_offset;
+        }
     }
 
     pub(crate) fn build_shadow_put_mutations(
@@ -1038,14 +1500,22 @@ impl<'a> ItemOps<'a> {
         projected_item: &Item,
         new_version: u64,
     ) -> Result<bool, StorageError> {
+        let base_ts_micros = version_to_timestamp_micros(new_version);
         for _ in 0..32 {
-            let (existing_quals, max_d_ts, cur_ver) =
+            let (existing_quals, max_d_ts, cur_ver, cur_chunk, max_chunk_ts) =
                 self.read_shadow_row_meta(shadow_row_key).await?;
             if let Some(cv) = cur_ver
                 && cv > new_version
             {
                 return Ok(false);
             }
+
+            let ts_micros =
+                if (cur_ver.is_none() && max_d_ts >= base_ts_micros) || max_d_ts > base_ts_micros {
+                    next_millis_exclusive(max_d_ts)
+                } else {
+                    base_ts_micros
+                };
 
             let mutations = Self::build_shadow_put_mutations(
                 projected_item,
@@ -1059,7 +1529,8 @@ impl<'a> ItemOps<'a> {
                 .apply_shadow_version_cas(
                     "CheckAndMutateRow put_shadow_versioned",
                     shadow_row_key,
-                    cur_ver,
+                    (cur_ver, cur_chunk.as_deref(), max_chunk_ts),
+                    (new_version, ts_micros),
                     mutations,
                 )
                 .await?
@@ -1076,8 +1547,9 @@ impl<'a> ItemOps<'a> {
     ///
     /// Never uses unbounded `DeleteFromFamily("d")` or `DeleteFromRow`. Advances
     /// shadow `m:v` to `new_version` while clearing `d:*` cells bounded by
-    /// `[0, next_millis_exclusive(...))` under a `CheckAndMutateRow` guard on `cur_ver`,
-    /// rejecting (`Ok(false)`) any delayed delete whose `new_version < cur_ver`.
+    /// `[0, next_millis_exclusive(...))` under a `CheckAndMutateRow` guard on
+    /// `(cur_ver, cur_chunk)`, rejecting (`Ok(false)`) any delayed delete whose
+    /// `new_version < cur_ver`.
     pub async fn delete_shadow_versioned(
         &self,
         shadow_row_key: &[u8],
@@ -1085,14 +1557,14 @@ impl<'a> ItemOps<'a> {
     ) -> Result<bool, StorageError> {
         let ts_micros = version_to_timestamp_micros(new_version);
         for _ in 0..32 {
-            let (existing_quals, max_d_ts, cur_ver) =
+            let (existing_quals, max_d_ts, cur_ver, cur_chunk, max_chunk_ts) =
                 self.read_shadow_row_meta(shadow_row_key).await?;
             if let Some(cv) = cur_ver
                 && cv > new_version
             {
                 return Ok(false);
             }
-            if existing_quals.is_empty() && cur_ver == Some(new_version) {
+            if existing_quals.is_empty() && cur_ver == Some(new_version) && cur_chunk.is_none() {
                 return Ok(true);
             }
 
@@ -1131,7 +1603,8 @@ impl<'a> ItemOps<'a> {
                 .apply_shadow_version_cas(
                     "CheckAndMutateRow delete_shadow_versioned",
                     shadow_row_key,
-                    cur_ver,
+                    (cur_ver, cur_chunk.as_deref(), max_chunk_ts),
+                    (new_version, ts_micros),
                     mutations,
                 )
                 .await?
@@ -1146,12 +1619,13 @@ impl<'a> ItemOps<'a> {
 
     /// Reconciler-safe cleanup of an orphaned shadow row: clears observed `d:*`
     /// qualifiers via millisecond-aligned bounded `DeleteFromColumn` only if the
-    /// shadow row's `m:v` state has not changed since inspection.
+    /// shadow row's `(m:v, m:chunk)` state has not changed since inspection.
     pub async fn delete_shadow_orphan_if_unchanged(
         &self,
         shadow_row_key: &[u8],
     ) -> Result<bool, StorageError> {
-        let (existing_quals, max_d_ts, cur_ver) = self.read_shadow_row_meta(shadow_row_key).await?;
+        let (existing_quals, max_d_ts, cur_ver, cur_chunk, max_chunk_ts) =
+            self.read_shadow_row_meta(shadow_row_key).await?;
         if existing_quals.is_empty() {
             return Ok(false);
         }
@@ -1188,24 +1662,28 @@ impl<'a> ItemOps<'a> {
         self.apply_shadow_version_cas(
             "CheckAndMutateRow delete_shadow_orphan",
             shadow_row_key,
-            cur_ver,
+            (cur_ver, cur_chunk.as_deref(), max_chunk_ts),
+            (next_ver, ts_micros),
             mutations,
         )
         .await
     }
 
     /// Atomically reclaim a version-only tombstone row (base table or shadow
-    /// index table) once the intent-timeout grace window has elapsed.
+    /// index table) once the intent-timeout grace window has elapsed and wall
+    /// clock has strictly passed `expected_version`.
     ///
-    /// Executes `DeleteFromRow` in `false_mutations` iff the row simultaneously
-    /// has NO `m:intent:*` cells, NO `d:*` data cells, AND `m:v == expected_version`.
-    /// If any live cell, active intent, or newer OCC version arrived in the
-    /// meantime, `predicate_matched` is `true` and the row is left untouched.
+    /// Executes `DeleteFromRow` in `false_mutations` iff `now_millis() > expected_version`
+    /// AND the row simultaneously has NO `m:intent:*` cells, NO `m:chunk` cells,
+    /// NO `d:*` data cells, AND `m:v == expected_version`.
     pub async fn reclaim_version_only_row(
         &self,
         row_key_bytes: &[u8],
         expected_version: u64,
     ) -> Result<bool, StorageError> {
+        if now_millis() <= expected_version {
+            return Ok(false);
+        }
         let req = CheckAndMutateRowRequest {
             table_name: self.full_table_name.clone(),
             app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
@@ -1448,5 +1926,64 @@ mod tests {
         assert_eq!(cas_batch.len(), MAX_MUTATIONS_PER_RPC);
         assert_eq!(overflow_chunks.len(), 1);
         assert_eq!(overflow_chunks[0].len(), 75_002);
+    }
+
+    fn assert_no_nested_condition(filter: &RowFilter, inside_condition: bool) {
+        match &filter.filter {
+            Some(Filter::Condition(cond)) => {
+                assert!(
+                    !inside_condition,
+                    "Cloud Bigtable forbids nested Filter::Condition inside another Condition"
+                );
+                if let Some(p) = &cond.predicate_filter {
+                    assert_no_nested_condition(p, true);
+                }
+                if let Some(t) = &cond.true_filter {
+                    assert_no_nested_condition(t, true);
+                }
+                if let Some(f) = &cond.false_filter {
+                    assert_no_nested_condition(f, true);
+                }
+            }
+            Some(Filter::Chain(chain)) => {
+                for sub in &chain.filters {
+                    assert_no_nested_condition(sub, inside_condition);
+                }
+            }
+            Some(Filter::Interleave(interleave)) => {
+                for sub in &interleave.filters {
+                    assert_no_nested_condition(sub, inside_condition);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn all_item_ops_row_filters_contain_zero_nested_conditions() {
+        for (ev, existed) in [
+            (Some(10), true),
+            (Some(10), false),
+            (None, true),
+            (None, false),
+        ] {
+            let pred = select_occ_predicate(ev, existed);
+            assert_no_nested_condition(&pred, false);
+        }
+        assert_no_nested_condition(&build_tombstone_reclaim_conflict_filter(99), false);
+        for ev in [Some(10), None] {
+            let cpred = build_put_cas_chunk_predicate(b"intent:sgl-put-1", b"attr:4", ev);
+            assert_no_nested_condition(&cpred, false);
+        }
+        for (cv, cc, expected_false_branch) in [
+            (None, None, true),
+            (Some(7), None, false),
+            (None, Some(b"7:abcd:0".as_slice()), false),
+            (Some(7), Some(b"7:abcd:0".as_slice()), false),
+        ] {
+            let (spred, in_false) = build_shadow_cas_predicate(cv, cc);
+            assert_eq!(in_false, expected_false_branch);
+            assert_no_nested_condition(&spred, false);
+        }
     }
 }

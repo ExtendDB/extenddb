@@ -32,8 +32,7 @@ use crate::data::client::{
 };
 use crate::data::item_ops::{
     FAMILY_DATA, QUALIFIER_VERSION, build_version_match_filter, max_mutations_per_rpc,
-    next_millis_exclusive, older_than_ts_range, split_mutation_batches,
-    version_to_timestamp_micros,
+    next_millis_exclusive, older_than_ts_range, version_to_timestamp_micros,
 };
 
 pub const TXN_LOG_TABLE: &str = "__extenddb_txn_log__";
@@ -119,6 +118,16 @@ pub struct TxnTokenMeta {
     pub fingerprint: String,
 }
 
+/// Base-row version fence recorded on `post-<uuid>` side-effect recovery
+/// entries (`t:base_guard`) so `roll_forward` skips stale shadow `Put` and TTL
+/// additions when the base row has already moved past `base_version` (while
+/// still executing `Delete` cleanups for multi-hop index updates).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SideEffectBaseGuard {
+    pub participant: ParticipantRow,
+    pub base_version: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct TxnState {
     pub state: String,
@@ -129,6 +138,7 @@ pub struct TxnState {
     pub stream_records: Option<Vec<TxnStreamRecord>>,
     pub ttl_mutations: Option<Vec<TxnTtlMutation>>,
     pub token_meta: Option<TxnTokenMeta>,
+    pub base_guard: Option<SideEffectBaseGuard>,
 }
 
 #[derive(Clone, Copy)]
@@ -308,6 +318,7 @@ impl<'a> TxnCoordinator<'a> {
         let mut stream_records: Option<Vec<TxnStreamRecord>> = None;
         let mut ttl_mutations: Option<Vec<TxnTtlMutation>> = None;
         let mut token_meta: Option<TxnTokenMeta> = None;
+        let mut base_guard: Option<SideEffectBaseGuard> = None;
 
         for cell in cells {
             if cell.family_name == TXN_FAMILY {
@@ -336,6 +347,9 @@ impl<'a> TxnCoordinator<'a> {
                     b"token_meta" if token_meta.is_none() => {
                         token_meta = serde_json::from_slice(&cell.value).ok();
                     }
+                    b"base_guard" if base_guard.is_none() => {
+                        base_guard = serde_json::from_slice(&cell.value).ok();
+                    }
                     _ => {}
                 }
             }
@@ -354,6 +368,7 @@ impl<'a> TxnCoordinator<'a> {
             stream_records,
             ttl_mutations,
             token_meta,
+            base_guard,
         }))
     }
 
@@ -549,6 +564,21 @@ impl<'a> TxnCoordinator<'a> {
         mutations: &[ParticipantMutation],
         ttl_mutations: &[TxnTtlMutation],
     ) -> Result<(), StorageError> {
+        self.write_committed_side_effects_guarded(txn_id, None, mutations, ttl_mutations)
+            .await
+    }
+
+    /// Persist a `COMMITTED` post-commit side-effect recovery record carrying an
+    /// optional base-row `(participant, base_version)` guard so `roll_forward`
+    /// skips stale shadow puts and TTL additions if the base row has moved past
+    /// `base_version`.
+    pub async fn write_committed_side_effects_guarded(
+        &self,
+        txn_id: &str,
+        base_guard: Option<&SideEffectBaseGuard>,
+        mutations: &[ParticipantMutation],
+        ttl_mutations: &[TxnTtlMutation],
+    ) -> Result<(), StorageError> {
         if mutations.is_empty() && ttl_mutations.is_empty() {
             return Ok(());
         }
@@ -569,6 +599,16 @@ impl<'a> TxnCoordinator<'a> {
             Self::set_cell_at(TXN_FAMILY, b"participants", empty_parts, ts_micros),
             Self::set_cell_at(TXN_FAMILY, b"mutations", serialized_muts, ts_micros),
         ];
+        if let Some(guard) = base_guard {
+            let serialized_guard = serde_json::to_vec(guard)
+                .map_err(|e| StorageError::Internal(format!("serialize base_guard: {e}")))?;
+            muts.push(Self::set_cell_at(
+                TXN_FAMILY,
+                b"base_guard",
+                serialized_guard,
+                ts_micros,
+            ));
+        }
         if !ttl_mutations.is_empty() {
             let serialized_ttls = serde_json::to_vec(ttl_mutations)
                 .map_err(|e| StorageError::Internal(format!("serialize side-effect ttls: {e}")))?;
@@ -670,9 +710,68 @@ impl<'a> TxnCoordinator<'a> {
         Ok(())
     }
 
+    async fn read_own_intent_stage(
+        &self,
+        txn_id: &str,
+        participant: &ParticipantRow,
+    ) -> Result<Option<(Vec<u8>, i64)>, StorageError> {
+        let qualifier = Self::intent_qualifier(txn_id);
+        let mut data = self.client.data();
+        let req = ReadRowsRequest {
+            table_name: self.client.full_table_name(&participant.data_table),
+            app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+            rows_limit: 1,
+            rows: Some(RowSet {
+                row_keys: vec![participant.row_key.clone()],
+                row_ranges: vec![],
+            }),
+            filter: Some(RowFilter {
+                filter: Some(Filter::Chain(Chain {
+                    filters: vec![
+                        RowFilter {
+                            filter: Some(Filter::FamilyNameRegexFilter(format!(
+                                "^{INTENT_FAMILY}$"
+                            ))),
+                        },
+                        RowFilter {
+                            filter: Some(Filter::ColumnQualifierRegexFilter(exact_re2_bytes(
+                                &qualifier,
+                            ))),
+                        },
+                        RowFilter {
+                            filter: Some(Filter::CellsPerColumnLimitFilter(1)),
+                        },
+                    ],
+                })),
+            }),
+            ..ReadRowsRequest::default()
+        };
+        match data.read_rows(req).await {
+            Ok(resp) => {
+                for (_, cells) in resp {
+                    for cell in cells {
+                        if cell.family_name == INTENT_FAMILY && cell.qualifier == qualifier {
+                            return Ok(Some((cell.value, cell.timestamp_micros)));
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            Err(e) if is_table_not_found_err(&e) => Ok(None),
+            Err(e) => Err(map_bigtable_err("ReadRows read_own_intent_stage", e)),
+        }
+    }
+
     /// Apply participant mutation in Phase 2 fenced with predicate asserting BOTH:
-    /// 1. Coordinator's own intent `m:intent:<txn_id>` is still present, AND
+    /// 1. Coordinator's own intent `m:intent:<txn_id>` matches the expected stage, AND
     /// 2. Row's OCC state still matches `(expected_version, row_existed)`.
+    ///
+    /// When a `Put` exceeds `max_mutations_per_rpc()`, executes progressive
+    /// `CheckAndMutateRow` chunks fenced on `rpc_limit`-independent attribute-offset
+    /// markers (`txn_id -> attr:<offset> -> ... -> chunk:done`) and `m:v`,
+    /// advancing `m:v = new_version` only on the final chunk so concurrent
+    /// `roll_forward` callers cooperatively complete remaining attributes without
+    /// premature intent clearing, torn reads, or post-delete zombie cells.
     pub async fn apply_fenced_mutation(
         &self,
         txn_id: &str,
@@ -682,35 +781,59 @@ impl<'a> TxnCoordinator<'a> {
         row_existed: bool,
         new_version: u64,
     ) -> Result<bool, StorageError> {
-        let mut data = self.client.data();
         let ts_micros = version_to_timestamp_micros(new_version);
-        let predicate = build_fenced_apply_predicate(txn_id, expected_version, row_existed);
+        let rpc_limit = max_mutations_per_rpc().max(4);
+        let mv_mutations = vec![
+            Mutation {
+                mutation: Some(mutation::Mutation::SetCell(SetCell {
+                    family_name: INTENT_FAMILY.to_string(),
+                    column_qualifier: QUALIFIER_VERSION.to_vec(),
+                    timestamp_micros: ts_micros,
+                    value: new_version.to_string().into_bytes(),
+                })),
+            },
+            Mutation {
+                mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
+                    family_name: INTENT_FAMILY.to_string(),
+                    column_qualifier: QUALIFIER_VERSION.to_vec(),
+                    time_range: older_than_ts_range(ts_micros),
+                })),
+            },
+        ];
 
-        let mut true_mutations = Vec::new();
         match payload {
-            TxnOpPayload::Put { item } => {
-                true_mutations.push(Mutation {
-                    mutation: Some(mutation::Mutation::SetCell(SetCell {
-                        family_name: INTENT_FAMILY.to_string(),
-                        column_qualifier: QUALIFIER_VERSION.to_vec(),
-                        timestamp_micros: ts_micros,
-                        value: new_version.to_string().into_bytes(),
-                    })),
-                });
-                true_mutations.push(Mutation {
-                    mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
-                        family_name: INTENT_FAMILY.to_string(),
-                        column_qualifier: QUALIFIER_VERSION.to_vec(),
-                        time_range: older_than_ts_range(ts_micros),
-                    })),
-                });
+            TxnOpPayload::Delete => {
+                let mut true_mutations = Vec::with_capacity(3);
                 true_mutations.push(Mutation {
                     mutation: Some(mutation::Mutation::DeleteFromFamily(DeleteFromFamily {
                         family_name: FAMILY_DATA.to_string(),
                     })),
                 });
+                true_mutations.extend(mv_mutations);
+                let mut data = self.client.data();
+                let req = CheckAndMutateRowRequest {
+                    table_name: self.client.full_table_name(&participant.data_table),
+                    app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+                    row_key: participant.row_key.clone(),
+                    predicate_filter: Some(build_fenced_apply_predicate(
+                        txn_id,
+                        expected_version,
+                        row_existed,
+                    )),
+                    true_mutations,
+                    false_mutations: vec![],
+                    ..CheckAndMutateRowRequest::default()
+                };
+                match data.check_and_mutate_row_idempotent(req).await {
+                    Ok(r) => Ok(r.predicate_matched),
+                    Err(e) if is_table_not_found_err(&e) => Ok(false),
+                    Err(e) => Err(map_bigtable_err("apply_fenced_mutation", e)),
+                }
+            }
+            TxnOpPayload::Put { item } => {
+                let mut data_muts = Vec::with_capacity(item.len());
                 for (name, value) in item {
-                    true_mutations.push(Mutation {
+                    data_muts.push(Mutation {
                         mutation: Some(mutation::Mutation::SetCell(SetCell {
                             family_name: FAMILY_DATA.to_string(),
                             column_qualifier: name.as_bytes().to_vec(),
@@ -719,69 +842,188 @@ impl<'a> TxnCoordinator<'a> {
                         })),
                     });
                 }
-            }
-            TxnOpPayload::Delete => {
-                true_mutations.push(Mutation {
-                    mutation: Some(mutation::Mutation::DeleteFromFamily(DeleteFromFamily {
-                        family_name: FAMILY_DATA.to_string(),
-                    })),
-                });
-                true_mutations.push(Mutation {
-                    mutation: Some(mutation::Mutation::SetCell(SetCell {
-                        family_name: INTENT_FAMILY.to_string(),
-                        column_qualifier: QUALIFIER_VERSION.to_vec(),
-                        timestamp_micros: ts_micros,
-                        value: new_version.to_string().into_bytes(),
-                    })),
-                });
-                true_mutations.push(Mutation {
-                    mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
-                        family_name: INTENT_FAMILY.to_string(),
-                        column_qualifier: QUALIFIER_VERSION.to_vec(),
-                        time_range: older_than_ts_range(ts_micros),
-                    })),
-                });
-            }
-        }
 
-        let rpc_limit = max_mutations_per_rpc();
-        let (true_mutations, overflow_chunks) = split_mutation_batches(true_mutations, rpc_limit);
+                if data_muts.len().saturating_add(3) <= rpc_limit {
+                    let mut true_mutations = Vec::with_capacity(data_muts.len() + 3);
+                    true_mutations.extend(mv_mutations.iter().cloned());
+                    true_mutations.push(Mutation {
+                        mutation: Some(mutation::Mutation::DeleteFromFamily(DeleteFromFamily {
+                            family_name: FAMILY_DATA.to_string(),
+                        })),
+                    });
+                    true_mutations.extend(data_muts.iter().cloned());
+                    let mut data = self.client.data();
+                    let req = CheckAndMutateRowRequest {
+                        table_name: self.client.full_table_name(&participant.data_table),
+                        app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
+                        row_key: participant.row_key.clone(),
+                        predicate_filter: Some(build_fenced_stage_predicate(
+                            txn_id,
+                            txn_id.as_bytes(),
+                            expected_version,
+                            row_existed,
+                            false,
+                        )),
+                        true_mutations,
+                        false_mutations: vec![],
+                        ..CheckAndMutateRowRequest::default()
+                    };
+                    match data.check_and_mutate_row_idempotent(req).await {
+                        Ok(r) if r.predicate_matched => return Ok(true),
+                        Ok(_) => {
+                            // Fall through to inspect `read_own_intent_stage` in case a peer
+                            // with a smaller per-RPC mutation limit already advanced `m:intent`
+                            // to an in-progress `attr:<offset>` or `chunk:done` stage.
+                        }
+                        Err(e) if is_table_not_found_err(&e) => return Ok(false),
+                        Err(e) => return Err(map_bigtable_err("apply_fenced_mutation", e)),
+                    }
+                }
 
-        let req = CheckAndMutateRowRequest {
-            table_name: self.client.full_table_name(&participant.data_table),
-            app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
-            row_key: participant.row_key.clone(),
-            predicate_filter: Some(predicate),
-            true_mutations,
-            false_mutations: vec![],
-            ..CheckAndMutateRowRequest::default()
-        };
-
-        let resp = match data.check_and_mutate_row_idempotent(req).await {
-            Ok(r) => r,
-            Err(e) if is_table_not_found_err(&e) => return Ok(false),
-            Err(e) => return Err(map_bigtable_err("apply_fenced_mutation", e)),
-        };
-
-        if resp.predicate_matched {
-            for chunk in overflow_chunks {
-                let mut chunk_data = self.client.data();
-                let mreq = MutateRowRequest {
-                    table_name: self.client.full_table_name(&participant.data_table),
-                    app_profile_id: self.client.app_profile_id.clone().unwrap_or_default(),
-                    row_key: participant.row_key.clone(),
-                    mutations: chunk,
-                    ..MutateRowRequest::default()
+                let Some((cur_stage, cur_intent_ts)) =
+                    self.read_own_intent_stage(txn_id, participant).await?
+                else {
+                    return Ok(false);
                 };
-                match chunk_data.mutate_row(mreq).await {
-                    Ok(_) => {}
-                    Err(e) if is_table_not_found_err(&e) => return Ok(false),
-                    Err(e) => return Err(map_bigtable_err("apply_fenced_mutation overflow", e)),
+                let mut floor_ts = cur_intent_ts;
+                let mut stage = match parse_chunk_stage(txn_id, &cur_stage) {
+                    Some(ChunkStage::Initial) if data_muts.len().saturating_add(3) > rpc_limit => {
+                        ChunkStage::Initial
+                    }
+                    Some(ChunkStage::AttrOffset(off)) if off <= data_muts.len() => {
+                        ChunkStage::AttrOffset(off)
+                    }
+                    Some(ChunkStage::Done) => return Ok(true),
+                    _ => return Ok(false),
+                };
+
+                let qualifier = Self::intent_qualifier(txn_id);
+                let full_table = self.client.full_table_name(&participant.data_table);
+                let app_profile = self.client.app_profile_id.clone().unwrap_or_default();
+
+                loop {
+                    let (expected_stage, is_cont, body_muts, next_stage, next_state) = match stage {
+                        ChunkStage::Initial => {
+                            let take = (rpc_limit - 3).min(data_muts.len());
+                            let mut body = Vec::with_capacity(take + 1);
+                            body.push(Mutation {
+                                mutation: Some(mutation::Mutation::DeleteFromFamily(
+                                    DeleteFromFamily {
+                                        family_name: FAMILY_DATA.to_string(),
+                                    },
+                                )),
+                            });
+                            body.extend_from_slice(&data_muts[..take]);
+                            (
+                                txn_id.as_bytes().to_vec(),
+                                false,
+                                body,
+                                format!("attr:{take}").into_bytes(),
+                                ChunkStage::AttrOffset(take),
+                            )
+                        }
+                        ChunkStage::AttrOffset(offset) => {
+                            let rem = data_muts.len().saturating_sub(offset);
+                            if rem.saturating_add(4) <= rpc_limit {
+                                let mut body = Vec::with_capacity(rem + 2);
+                                body.extend_from_slice(&data_muts[offset..]);
+                                body.extend(mv_mutations.iter().cloned());
+                                (
+                                    format!("attr:{offset}").into_bytes(),
+                                    true,
+                                    body,
+                                    b"chunk:done".to_vec(),
+                                    ChunkStage::Done,
+                                )
+                            } else {
+                                let take = (rpc_limit - 2).min(rem);
+                                let next_off = offset + take;
+                                let body = data_muts[offset..next_off].to_vec();
+                                (
+                                    format!("attr:{offset}").into_bytes(),
+                                    true,
+                                    body,
+                                    format!("attr:{next_off}").into_bytes(),
+                                    ChunkStage::AttrOffset(next_off),
+                                )
+                            }
+                        }
+                        ChunkStage::Done => return Ok(true),
+                    };
+
+                    let predicate = build_fenced_stage_predicate(
+                        txn_id,
+                        &expected_stage,
+                        expected_version,
+                        row_existed,
+                        is_cont,
+                    );
+                    let stage_ts = monotonic_timestamp_after_micros(floor_ts);
+                    floor_ts = stage_ts;
+
+                    let mut true_mutations = Vec::with_capacity(body_muts.len() + 2);
+                    true_mutations.push(Self::set_cell_at(
+                        INTENT_FAMILY,
+                        &qualifier,
+                        next_stage,
+                        stage_ts,
+                    ));
+                    true_mutations.push(Mutation {
+                        mutation: Some(mutation::Mutation::DeleteFromColumn(DeleteFromColumn {
+                            family_name: INTENT_FAMILY.to_string(),
+                            column_qualifier: qualifier.clone(),
+                            time_range: older_than_ts_range(stage_ts),
+                        })),
+                    });
+                    true_mutations.extend(body_muts);
+
+                    let mut data = self.client.data();
+                    let req = CheckAndMutateRowRequest {
+                        table_name: full_table.clone(),
+                        app_profile_id: app_profile.clone(),
+                        row_key: participant.row_key.clone(),
+                        predicate_filter: Some(predicate),
+                        true_mutations,
+                        false_mutations: vec![],
+                        ..CheckAndMutateRowRequest::default()
+                    };
+                    let resp = match data.check_and_mutate_row_idempotent(req).await {
+                        Ok(r) => r,
+                        Err(e) if is_table_not_found_err(&e) => return Ok(false),
+                        Err(e) => {
+                            return Err(map_bigtable_err("apply_fenced_mutation chunk", e));
+                        }
+                    };
+                    if resp.predicate_matched {
+                        if next_state == ChunkStage::Done {
+                            return Ok(true);
+                        }
+                        stage = next_state;
+                    } else {
+                        let Some((fresh_stage, fresh_ts)) =
+                            self.read_own_intent_stage(txn_id, participant).await?
+                        else {
+                            return Ok(false);
+                        };
+                        floor_ts = floor_ts.max(fresh_ts);
+                        match (stage, parse_chunk_stage(txn_id, &fresh_stage)) {
+                            (_, Some(ChunkStage::Done)) => return Ok(true),
+                            (ChunkStage::Initial, Some(ChunkStage::AttrOffset(off)))
+                                if off <= data_muts.len() =>
+                            {
+                                stage = ChunkStage::AttrOffset(off);
+                            }
+                            (ChunkStage::AttrOffset(cur), Some(ChunkStage::AttrOffset(off)))
+                                if off > cur && off <= data_muts.len() =>
+                            {
+                                stage = ChunkStage::AttrOffset(off);
+                            }
+                            _ => return Ok(false),
+                        }
+                    }
                 }
             }
         }
-
-        Ok(resp.predicate_matched)
     }
 
     /// Clear an intent cell unconditionally (used while this incarnation still owns `txn:<id>`).
@@ -868,8 +1110,11 @@ impl<'a> TxnCoordinator<'a> {
             false_mutations: vec![],
             ..CheckAndMutateRowRequest::default()
         };
-        let _ = data.check_and_mutate_row_idempotent(req).await;
-        Ok(())
+        match data.check_and_mutate_row_idempotent(req).await {
+            Ok(_) => Ok(()),
+            Err(e) if is_table_not_found_err(&e) => Ok(()),
+            Err(e) => Err(map_bigtable_err("txn drop_matching_start", e)),
+        }
     }
 
     /// Unconditional coordinator row delete (post-clean GC when `started_at` is unknown).
@@ -952,32 +1197,27 @@ fn build_pending_incarnation_predicate(started_at_micros: i64) -> RowFilter {
     }
 }
 
-/// Predicate matching iff `m:intent:<txn_id>` is present AND the row's OCC
-/// state matches `(expected_version, row_existed)`.
-fn build_fenced_apply_predicate(
-    txn_id: &str,
-    expected_version: Option<u64>,
-    row_existed: bool,
-) -> RowFilter {
-    let qualifier = TxnCoordinator::intent_qualifier(txn_id);
-    let qualifier_regex = exact_re2_bytes(&qualifier);
-    let intent_present = RowFilter {
-        filter: Some(Filter::Chain(Chain {
-            filters: vec![
-                RowFilter {
-                    filter: Some(Filter::FamilyNameRegexFilter(format!("^{INTENT_FAMILY}$"))),
-                },
-                RowFilter {
-                    filter: Some(Filter::ColumnQualifierRegexFilter(qualifier_regex)),
-                },
-                RowFilter {
-                    filter: Some(Filter::CellsPerColumnLimitFilter(1)),
-                },
-            ],
-        })),
-    };
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChunkStage {
+    Initial,
+    AttrOffset(usize),
+    Done,
+}
 
-    let has_v = RowFilter {
+fn parse_chunk_stage(txn_id: &str, raw: &[u8]) -> Option<ChunkStage> {
+    if raw == txn_id.as_bytes() {
+        return Some(ChunkStage::Initial);
+    }
+    if raw == b"chunk:done" {
+        return Some(ChunkStage::Done);
+    }
+    let rest = raw.strip_prefix(b"attr:")?;
+    let offset = std::str::from_utf8(rest).ok()?.parse::<usize>().ok()?;
+    Some(ChunkStage::AttrOffset(offset))
+}
+
+fn build_has_version_filter() -> RowFilter {
+    RowFilter {
         filter: Some(Filter::Chain(Chain {
             filters: vec![
                 RowFilter {
@@ -991,27 +1231,54 @@ fn build_fenced_apply_predicate(
                 },
             ],
         })),
-    };
+    }
+}
 
-    let has_d = RowFilter {
+fn build_has_data_limit1_filter() -> RowFilter {
+    RowFilter {
         filter: Some(Filter::Chain(Chain {
             filters: vec![
                 RowFilter {
                     filter: Some(Filter::FamilyNameRegexFilter(format!("^{FAMILY_DATA}$"))),
                 },
                 RowFilter {
-                    filter: Some(Filter::CellsPerColumnLimitFilter(1)),
+                    filter: Some(Filter::CellsPerRowLimitFilter(1)),
                 },
             ],
         })),
-    };
+    }
+}
 
-    let state_guard = match (expected_version, row_existed) {
-        (Some(v), _) => build_version_match_filter(v),
-        (None, false) => {
+fn combine_intent_and_occ_flat(
+    intent_limit1: RowFilter,
+    expected_version: Option<u64>,
+    row_existed: bool,
+    is_continuation_chunk: bool,
+) -> RowFilter {
+    let has_v = build_has_version_filter();
+    match (expected_version, is_continuation_chunk, row_existed) {
+        (Some(v), _, _) => RowFilter {
+            filter: Some(Filter::Condition(Box::new(Condition {
+                predicate_filter: Some(Box::new(intent_limit1)),
+                true_filter: Some(Box::new(build_version_match_filter(v))),
+                false_filter: Some(Box::new(RowFilter {
+                    filter: Some(Filter::BlockAllFilter(true)),
+                })),
+            }))),
+        },
+        (None, true, _) => RowFilter {
+            filter: Some(Filter::Condition(Box::new(Condition {
+                predicate_filter: Some(Box::new(has_v)),
+                true_filter: Some(Box::new(RowFilter {
+                    filter: Some(Filter::BlockAllFilter(true)),
+                })),
+                false_filter: Some(Box::new(intent_limit1)),
+            }))),
+        },
+        (None, false, false) => {
             let has_v_or_d = RowFilter {
                 filter: Some(Filter::Interleave(Interleave {
-                    filters: vec![has_v, has_d],
+                    filters: vec![has_v, build_has_data_limit1_filter()],
                 })),
             };
             RowFilter {
@@ -1020,42 +1287,111 @@ fn build_fenced_apply_predicate(
                     true_filter: Some(Box::new(RowFilter {
                         filter: Some(Filter::BlockAllFilter(true)),
                     })),
-                    false_filter: Some(Box::new(RowFilter {
-                        filter: Some(Filter::PassAllFilter(true)),
-                    })),
+                    false_filter: Some(Box::new(intent_limit1)),
                 }))),
             }
         }
-        (None, true) => RowFilter {
-            filter: Some(Filter::Condition(Box::new(Condition {
-                predicate_filter: Some(Box::new(has_d)),
-                true_filter: Some(Box::new(RowFilter {
-                    filter: Some(Filter::Condition(Box::new(Condition {
-                        predicate_filter: Some(Box::new(has_v)),
-                        true_filter: Some(Box::new(RowFilter {
-                            filter: Some(Filter::BlockAllFilter(true)),
-                        })),
-                        false_filter: Some(Box::new(RowFilter {
-                            filter: Some(Filter::PassAllFilter(true)),
-                        })),
-                    }))),
+        (None, false, true) => {
+            // Exact logical AND of two 1-cell-bounded presence filters without a
+            // nested Condition: `Interleave([intent_limit1, has_d_limit1])` emits
+            // 2 cells iff both hold, so `CellsPerRowOffsetFilter(1)` emits 1 cell
+            // iff both hold and 0 cells otherwise.
+            let both_present = RowFilter {
+                filter: Some(Filter::Chain(Chain {
+                    filters: vec![
+                        RowFilter {
+                            filter: Some(Filter::Interleave(Interleave {
+                                filters: vec![intent_limit1, build_has_data_limit1_filter()],
+                            })),
+                        },
+                        RowFilter {
+                            filter: Some(Filter::CellsPerRowOffsetFilter(1)),
+                        },
+                    ],
                 })),
-                false_filter: Some(Box::new(RowFilter {
-                    filter: Some(Filter::BlockAllFilter(true)),
-                })),
-            }))),
-        },
-    };
-
-    RowFilter {
-        filter: Some(Filter::Condition(Box::new(Condition {
-            predicate_filter: Some(Box::new(intent_present)),
-            true_filter: Some(Box::new(state_guard)),
-            false_filter: Some(Box::new(RowFilter {
-                filter: Some(Filter::BlockAllFilter(true)),
-            })),
-        }))),
+            };
+            RowFilter {
+                filter: Some(Filter::Condition(Box::new(Condition {
+                    predicate_filter: Some(Box::new(has_v)),
+                    true_filter: Some(Box::new(RowFilter {
+                        filter: Some(Filter::BlockAllFilter(true)),
+                    })),
+                    false_filter: Some(Box::new(both_present)),
+                }))),
+            }
+        }
     }
+}
+
+fn build_fenced_stage_predicate(
+    txn_id: &str,
+    expected_stage: &[u8],
+    expected_version: Option<u64>,
+    row_existed: bool,
+    is_continuation_chunk: bool,
+) -> RowFilter {
+    let qualifier = TxnCoordinator::intent_qualifier(txn_id);
+    let stage_limit1 = RowFilter {
+        filter: Some(Filter::Chain(Chain {
+            filters: vec![
+                RowFilter {
+                    filter: Some(Filter::FamilyNameRegexFilter(format!("^{INTENT_FAMILY}$"))),
+                },
+                RowFilter {
+                    filter: Some(Filter::ColumnQualifierRegexFilter(exact_re2_bytes(
+                        &qualifier,
+                    ))),
+                },
+                RowFilter {
+                    filter: Some(Filter::CellsPerColumnLimitFilter(1)),
+                },
+                RowFilter {
+                    filter: Some(Filter::ValueRegexFilter(exact_re2_bytes(expected_stage))),
+                },
+                RowFilter {
+                    filter: Some(Filter::CellsPerRowLimitFilter(1)),
+                },
+            ],
+        })),
+    };
+    combine_intent_and_occ_flat(
+        stage_limit1,
+        expected_version,
+        row_existed,
+        is_continuation_chunk,
+    )
+}
+
+/// Predicate matching iff `m:intent:<txn_id>` is present AND the row's OCC
+/// state matches `(expected_version, row_existed)`, using a single flat outer
+/// `Filter::Condition` (zero nested `Condition`s).
+fn build_fenced_apply_predicate(
+    txn_id: &str,
+    expected_version: Option<u64>,
+    row_existed: bool,
+) -> RowFilter {
+    let qualifier = TxnCoordinator::intent_qualifier(txn_id);
+    let intent_limit1 = RowFilter {
+        filter: Some(Filter::Chain(Chain {
+            filters: vec![
+                RowFilter {
+                    filter: Some(Filter::FamilyNameRegexFilter(format!("^{INTENT_FAMILY}$"))),
+                },
+                RowFilter {
+                    filter: Some(Filter::ColumnQualifierRegexFilter(exact_re2_bytes(
+                        &qualifier,
+                    ))),
+                },
+                RowFilter {
+                    filter: Some(Filter::CellsPerColumnLimitFilter(1)),
+                },
+                RowFilter {
+                    filter: Some(Filter::CellsPerRowLimitFilter(1)),
+                },
+            ],
+        })),
+    };
+    combine_intent_and_occ_flat(intent_limit1, expected_version, row_existed, false)
 }
 
 /// Filter reading only the newest cell per qualifier in family `t` of `__extenddb_txn_log__`.
@@ -1205,20 +1541,81 @@ mod tests {
         }
     }
 
+    fn assert_no_nested_condition(filter: &RowFilter, inside_condition: bool) {
+        match &filter.filter {
+            Some(Filter::Condition(cond)) => {
+                assert!(
+                    !inside_condition,
+                    "Cloud Bigtable forbids nested Filter::Condition inside another Condition"
+                );
+                if let Some(p) = &cond.predicate_filter {
+                    assert_no_nested_condition(p, true);
+                }
+                if let Some(t) = &cond.true_filter {
+                    assert_no_nested_condition(t, true);
+                }
+                if let Some(f) = &cond.false_filter {
+                    assert_no_nested_condition(f, true);
+                }
+            }
+            Some(Filter::Chain(chain)) => {
+                for sub in &chain.filters {
+                    assert_no_nested_condition(sub, inside_condition);
+                }
+            }
+            Some(Filter::Interleave(interleave)) => {
+                for sub in &interleave.filters {
+                    assert_no_nested_condition(sub, inside_condition);
+                }
+            }
+            _ => {}
+        }
+    }
+
     #[test]
-    fn test_build_fenced_apply_predicate_uses_outer_condition() {
-        for (expected, existed) in [(Some(7), true), (None, false), (None, true)] {
+    fn test_build_fenced_apply_and_stage_predicates_use_single_flat_outer_condition() {
+        assert_no_nested_condition(
+            &build_pending_incarnation_predicate(1_700_000_000_000),
+            false,
+        );
+        for (expected, existed) in [
+            (Some(7), true),
+            (Some(7), false),
+            (None, false),
+            (None, true),
+        ] {
             let pred = build_fenced_apply_predicate("txn-abc.123", expected, existed);
+            assert_no_nested_condition(&pred, false);
             if let Some(Filter::Condition(cond)) = pred.filter {
                 assert!(cond.predicate_filter.is_some());
                 assert!(cond.true_filter.is_some());
-                assert!(matches!(
-                    cond.false_filter.as_ref().and_then(|f| f.filter.as_ref()),
-                    Some(Filter::BlockAllFilter(true))
-                ));
+                assert!(cond.false_filter.is_some());
             } else {
-                panic!("expected outer Filter::Condition so true_filter inspects full row");
+                panic!("expected outer Filter::Condition");
+            }
+            for is_cont in [false, true] {
+                let spred = build_fenced_stage_predicate(
+                    "txn-abc.123",
+                    b"attr:4",
+                    expected,
+                    existed,
+                    is_cont,
+                );
+                assert_no_nested_condition(&spred, false);
             }
         }
+        assert_eq!(
+            parse_chunk_stage("txn-1", b"txn-1"),
+            Some(ChunkStage::Initial)
+        );
+        assert_eq!(
+            parse_chunk_stage("txn-1", b"attr:42"),
+            Some(ChunkStage::AttrOffset(42))
+        );
+        assert_eq!(
+            parse_chunk_stage("txn-1", b"chunk:done"),
+            Some(ChunkStage::Done)
+        );
+        assert_eq!(parse_chunk_stage("txn-1", b"other"), None);
     }
 }
