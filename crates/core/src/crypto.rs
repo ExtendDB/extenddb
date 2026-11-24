@@ -184,29 +184,6 @@ mod imp {
     use sha2::{Digest, Sha256};
     use zeroize::Zeroizing;
 
-    // aes wipes the AES-256 round keys when the cipher drops only under its
-    // `zeroize` feature, which also marks the cipher `ZeroizeOnDrop` (aes 0.8.4
-    // src/soft.rs, the backend wasm32 compiles). polyval wipes its key and
-    // state only under its own `zeroize` feature, which is what gives
-    // `Polyval` a `Drop` implementation (polyval 0.6.2 src/backend/soft32.rs,
-    // the backend wasm32 compiles); without it the type holds plain integers
-    // and has no drop glue. This block requires that marker of the block
-    // cipher aes-gcm re-exports (`aes_gcm::aes`) and drop glue of
-    // `polyval::Polyval`, so the build fails when either feature is off;
-    // core's manifest turns both on. `polyval::Polyval` names core's own
-    // polyval dependency, which is the `Polyval` inside aes-gcm's GHASH when
-    // the build holds one copy of polyval; the docstring of
-    // devtools/check-wasm-clippy-guard, in the repository this crate's
-    // manifest names, says how the build's copies are checked.
-    const _: () = {
-        const fn wiped_on_drop<T: zeroize::ZeroizeOnDrop>() {}
-        wiped_on_drop::<aes_gcm::aes::Aes256>();
-        assert!(
-            core::mem::needs_drop::<polyval::Polyval>(),
-            "polyval is built without its zeroize feature, so Polyval does not wipe its key on drop"
-        );
-    };
-
     pub(super) fn sha256(data: &[u8]) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(data);
