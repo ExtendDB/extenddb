@@ -11,8 +11,9 @@
 //! this backend is defined against.
 //!
 //! Each row runs its request on a fresh in-memory pool with one connection,
-//! the pool the backend opens for an in-memory database (one row opens its own
-//! pool with `max_connections(2)` beside it), and renders the
+//! the pool the backend opens for an in-memory database (three rows open their
+//! own pool beside it: one with `max_connections(2)`, two with a short acquire
+//! timeout), and renders the
 //! outcome as `Ok(<value>)` or `Err[<variant>] <message>`. On native targets
 //! the row runs against `sqlx-sqlite` (the version `Cargo.lock` pins) over the
 //! C SQLite; on wasm32 it runs against the shim. A row has one expected
@@ -43,9 +44,16 @@
 //! or a skipped row counted in `compare_rows`). Such changes are for review.
 //! The test does not read the shim's documentation.
 //!
-//! Natively the pool's acquire timeout is cut from `sqlx`'s 30 s default to
-//! 50 ms, so the rows that find the connection checked out return
-//! `PoolTimedOut` without the wait; the shim does not wait at all.
+//! Natively each row's pool keeps `sqlx`'s acquire timeout of 30 s, so a row
+//! does not fail on a loaded host because its pool was slow to open a
+//! connection. The two rows that expect `PoolTimedOut` because the connection
+//! is checked out open their own pool with a 50 ms acquire timeout
+//! ([`timing_out_pool`]), so `sqlx` returns it without the 30 s wait; the shim
+//! does not wait at all. In those two rows the steps that must get the
+//! connection (opening the pool, and the statement after the connection is
+//! handed back) run through [`retry_timed_out`], which natively runs a step
+//! again while it times out, for up to 30 s, so a slow host does not fail them
+//! either.
 //!
 //! The table is an integration test rather than an inline test module so the
 //! wasm test binary compiles against only the crate, its dependencies and
@@ -71,6 +79,8 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Duration;
 
 #[cfg(target_arch = "wasm32")]
 use extenddb_storage_sqlite::wasm_sqlx_for_tests as sqlx;
@@ -164,21 +174,71 @@ async fn pool() -> Result<sqlx::SqlitePool, sqlx::Error> {
         .await
 }
 
+/// [`pool`] with a 50 ms acquire timeout natively, for the rows that expect
+/// `PoolTimedOut` while the connection is checked out (see the module
+/// documentation).
+async fn timing_out_pool() -> Result<sqlx::SqlitePool, sqlx::Error> {
+    let location = in_memory()?;
+    retry_timed_out(|| {
+        timing_out(pool_options())
+            .max_connections(1)
+            .connect_with(location.clone())
+    })
+    .await
+}
+
+/// Run `step` and, natively, run it again while it fails with
+/// `PoolTimedOut`, until 30 s (`sqlx`'s default acquire timeout) have passed:
+/// for a step of a [`timing_out_pool`] row that must get the connection.
+#[cfg(not(target_arch = "wasm32"))]
+async fn retry_timed_out<T, F: Future<Output = Result<T, sqlx::Error>>>(
+    mut step: impl FnMut() -> F,
+) -> Result<T, sqlx::Error> {
+    let start = std::time::Instant::now();
+    loop {
+        match step().await {
+            Err(sqlx::Error::PoolTimedOut) if start.elapsed() < Duration::from_secs(30) => {}
+            outcome => return outcome,
+        }
+    }
+}
+
+/// Run `step` once: the shim does not wait for the connection, so a time-out
+/// there does not depend on the host.
+#[cfg(target_arch = "wasm32")]
+async fn retry_timed_out<T, F: Future<Output = Result<T, sqlx::Error>>>(
+    mut step: impl FnMut() -> F,
+) -> Result<T, sqlx::Error> {
+    step().await
+}
+
 /// The connect options of the location `sqlite::memory:`.
 fn in_memory() -> Result<sqlx::sqlite::SqliteConnectOptions, sqlx::Error> {
     sqlx::sqlite::SqliteConnectOptions::from_str("sqlite::memory:")
 }
 
-/// Pool options with a 50 ms acquire timeout (see the module documentation).
+/// Pool options with `sqlx`'s defaults.
 #[cfg(not(target_arch = "wasm32"))]
 fn pool_options() -> sqlx::sqlite::SqlitePoolOptions {
-    sqlx::sqlite::SqlitePoolOptions::new().acquire_timeout(std::time::Duration::from_millis(50))
+    sqlx::sqlite::SqlitePoolOptions::new()
 }
 
 /// Pool options; the shim has no acquire timeout to set.
 #[cfg(target_arch = "wasm32")]
 fn pool_options() -> sqlx::sqlite::SqlitePoolOptions {
     sqlx::pool_options()
+}
+
+/// `options` with a 50 ms acquire timeout.
+#[cfg(not(target_arch = "wasm32"))]
+fn timing_out(options: sqlx::sqlite::SqlitePoolOptions) -> sqlx::sqlite::SqlitePoolOptions {
+    options.acquire_timeout(Duration::from_millis(50))
+}
+
+/// `options` as they are: the shim has no acquire timeout to set.
+#[cfg(target_arch = "wasm32")]
+fn timing_out(options: sqlx::sqlite::SqlitePoolOptions) -> sqlx::sqlite::SqlitePoolOptions {
+    options
 }
 
 /// The variant name of an error: its `Debug` text up to the first character
@@ -863,7 +923,8 @@ fn cases() -> Vec<Case> {
         row!(
             "pool statement, acquire, begin, begin_with during a transaction",
             format!("{TIMED_OUT} | {TIMED_OUT} | {TIMED_OUT} | {TIMED_OUT} | Ok(1)"),
-            |pool| {
+            |_pool| {
+                let pool = timing_out_pool().await?;
                 let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
                 let statement = render(sqlx::query("SELECT 1").execute(&pool).await.map(drop));
                 let acquire = render(pool.acquire().await.map(drop));
@@ -880,7 +941,8 @@ fn cases() -> Vec<Case> {
         row!(
             "a pool statement while a connection is acquired",
             format!("{TIMED_OUT} | Ok(1) | Ok(1)"),
-            |pool| {
+            |_pool| {
+                let pool = timing_out_pool().await?;
                 let mut conn = pool.acquire().await?;
                 let statement = render(sqlx::query("SELECT 1").execute(&pool).await.map(drop));
                 let on_conn = render(
@@ -890,8 +952,7 @@ fn cases() -> Vec<Case> {
                 );
                 drop(conn);
                 let after = render(
-                    sqlx::query_scalar::<_, i64>("SELECT 1")
-                        .fetch_one(&pool)
+                    retry_timed_out(|| sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(&pool))
                         .await,
                 );
                 format!("{statement} | {on_conn} | {after}")

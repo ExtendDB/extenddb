@@ -101,9 +101,9 @@
 //!   by default) for the connection before it returns
 //!   [`Error::PoolTimedOut`]; this module returns it at once. The transport is
 //!   synchronous on a single thread, so nothing could hand the connection back
-//!   during a wait. The table's native pools set a 50 ms acquire timeout, so
-//!   its rows that find the connection checked out expect `PoolTimedOut` from
-//!   both sides.
+//!   during a wait. The two rows of the table that find the connection
+//!   checked out give their native pools a 50 ms acquire timeout, so they
+//!   expect `PoolTimedOut` from both sides.
 //! * **One connection.** `max_connections`, `min_connections`, `idle_timeout`
 //!   and `max_lifetime` are accepted and not used: the pool never opens a
 //!   second connection and never recycles the one it has. Under `sqlx` an
