@@ -33,11 +33,14 @@ import os
 import pytest
 from botocore.exceptions import ClientError
 
-from helpers import unique_name, wait_for_active, wait_for_deleted
+from helpers import assert_validation, unique_name, wait_for_active, wait_for_deleted
 
 PG_ADMIN = os.environ.get("EXTENDDB_TEST_PG_ADMIN_CONNECTION_STRING", "").rstrip("/")
 CATALOG_DB = os.environ.get("EXTENDDB_TEST_PG_CATALOG_DB", "extenddb_catalog")
 BACKEND = os.environ.get("EXTENDDB_TEST_BACKEND", "").strip()
+# What GetItem, and Query and Scan on an index, answer once the table is gone
+# (measured 2026-11-24, names that do not exist).
+NOT_FOUND = "Requested resource not found"
 
 
 def _being_deleted(name: str) -> str:
@@ -148,7 +151,6 @@ class TestDeletingWindowControlPlane:
                 lock.release()
         wait_for_deleted(dynamodb_client, name, timeout=120.0)
 
-
     def test_tag_changes_are_being_deleted_and_tags_are_listed(self, dynamodb_client, is_extenddb):
         """TagResource and UntagResource while the table is DELETING are ResourceInUseException
         with the DELETING sentence, and ListTagsOfResource lists the tag the table had before
@@ -210,7 +212,7 @@ class TestDeletingWindowDataPlane:
 
         with pytest.raises(ClientError) as exc:
             dynamodb_client.get_item(TableName=name, Key={"pk": {"S": "w1"}}, ConsistentRead=True)
-        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        assert_validation(exc.value, NOT_FOUND, "ResourceNotFoundException")
 
     def test_index_reads_after_the_table_is_gone_are_not_found(self, dynamodb_client, is_extenddb):
         """Query and Scan on an index of a table that is gone are ResourceNotFoundException,
@@ -237,7 +239,7 @@ class TestDeletingWindowDataPlane:
                 KeyConditionExpression="gk = :gk",
                 ExpressionAttributeValues={":gk": {"S": "x"}},
             )
-        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        assert_validation(exc.value, NOT_FOUND, "ResourceNotFoundException")
         with pytest.raises(ClientError) as exc:
             dynamodb_client.scan(TableName=name, IndexName="gsi1")
-        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        assert_validation(exc.value, NOT_FOUND, "ResourceNotFoundException")
