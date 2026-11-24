@@ -7,7 +7,7 @@
 //! [`install_search_filter_settings`], so two servers in one process read
 //! their own catalogs. An absent or empty value enables every account, as
 //! does a storage engine without an installed store. A malformed value is
-//! logged once per change and enables every account.
+//! logged once per change and enables no account.
 //!
 //! A read is kept for [`REFRESH`], so a busy server reads the catalog about
 //! once per interval rather than once per request, and a change made through
@@ -73,7 +73,7 @@ pub fn search_filter_settings_changed() {
 }
 
 /// The accounts the setting enables on the server that `storage` belongs
-/// to. An absent, empty or malformed value enables every account.
+/// to. An absent or empty value enables every account, a malformed one none.
 ///
 /// # Errors
 ///
@@ -261,7 +261,7 @@ impl Settings {
 
     /// The accounts a stored value enables, and the line to log when the
     /// value is malformed and differs from the previous read. An absent
-    /// value, like a malformed one, enables every account.
+    /// value enables every account, a malformed one none.
     fn parse(raw: Option<&str>, previous: Option<&str>) -> (EnabledAccounts, Option<String>) {
         let Some(value) = raw else {
             return (EnabledAccounts::All, None);
@@ -269,9 +269,10 @@ impl Settings {
         match EnabledAccounts::parse(value) {
             Ok(accounts) => (accounts, None),
             Err(reason) => (
-                EnabledAccounts::All,
-                (previous != Some(value))
-                    .then(|| format!("{SEARCH_INEQUALITY_FILTERS} = {value:?} ignored: {reason}")),
+                EnabledAccounts::Off,
+                (previous != Some(value)).then(|| {
+                    format!("{SEARCH_INEQUALITY_FILTERS} = {value:?} enables no account: {reason}")
+                }),
             ),
         }
     }

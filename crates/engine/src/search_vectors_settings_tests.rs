@@ -136,21 +136,21 @@ async fn off_and_a_list_still_restrict_the_grammar() {
     assert!(!listed.enabled_for("222222222222", None));
 }
 
-/// A malformed value enables every account and is logged once per change.
+/// A malformed value enables no account and is logged once per change.
 #[test]
-fn a_malformed_value_is_logged_once_and_enables_every_account() {
+fn a_malformed_value_is_logged_once_and_enables_no_account() {
     let (accounts, logged) = Settings::parse(Some("on"), None);
-    assert_eq!(accounts, EnabledAccounts::All);
+    assert_eq!(accounts, EnabledAccounts::Off);
     assert_eq!(
         logged.as_deref(),
         Some(
-            "search_inequality_filters = \"on\" ignored: must be 'off', 'all', or a \
-             comma-separated list of 12-digit account IDs"
+            "search_inequality_filters = \"on\" enables no account: must be empty, 'off', \
+             'all', or a comma-separated list of 12-digit account IDs"
         )
     );
     assert_eq!(
         Settings::parse(Some("on"), Some("on")),
-        (EnabledAccounts::All, None)
+        (EnabledAccounts::Off, None)
     );
     assert!(Settings::parse(Some("on"), Some("off")).1.is_some());
 }
@@ -516,7 +516,7 @@ async fn a_server_logs_a_malformed_value_once_per_change() {
     for _ in 0..3 {
         assert_eq!(
             settings.enabled_accounts().await.unwrap(),
-            EnabledAccounts::All
+            EnabledAccounts::Off
         );
         tokio::time::advance(REFRESH).await;
     }
@@ -524,15 +524,15 @@ async fn a_server_logs_a_malformed_value_once_per_change() {
     tokio::time::advance(REFRESH).await;
     assert_eq!(
         settings.enabled_accounts().await.unwrap(),
-        EnabledAccounts::All
+        EnabledAccounts::Off
     );
     assert_eq!(store.reads(), 4);
-    let reason = "must be 'off', 'all', or a comma-separated list of 12-digit account IDs";
+    let reason = "must be empty, 'off', 'all', or a comma-separated list of 12-digit account IDs";
     assert_eq!(
         *warnings.0.lock().unwrap(),
         [
-            format!("search_inequality_filters = \"on\" ignored: {reason}"),
-            format!("search_inequality_filters = \"true\" ignored: {reason}"),
+            format!("search_inequality_filters = \"on\" enables no account: {reason}"),
+            format!("search_inequality_filters = \"true\" enables no account: {reason}"),
         ]
     );
 }

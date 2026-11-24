@@ -39,9 +39,8 @@ impl EnabledAccounts {
         for entry in value.split(',') {
             let account = entry.trim();
             if account.len() != 12 || !account.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(
-                    "must be 'off', 'all', or a comma-separated list of 12-digit account IDs",
-                );
+                return Err("must be empty, 'off', 'all', or a comma-separated list of \
+                            12-digit account IDs");
             }
             accounts.insert(account.to_owned());
         }
