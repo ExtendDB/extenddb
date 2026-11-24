@@ -11,7 +11,10 @@
 //! `postgres://user:pass@127.0.0.1:5432`); skips otherwise. The test builds
 //! its own scratch database and drops it afterwards.
 
+// The fixture re-exports the types the stream disable tests need; this test
+// uses its scratch database and shard helpers only.
 #[path = "common/stream_disable_fixture.rs"]
+#[allow(unused_imports)]
 mod fixture;
 
 use fixture::*;
