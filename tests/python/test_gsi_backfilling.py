@@ -14,6 +14,12 @@ two runs) with whole strings, both refusals ValidationException:
 
 The CREATING description carries exactly the members in ``CREATING_MEMBERS``.
 
+ExecuteStatement naming the index is sent in each phase as well. Its answers
+are ExtendDB's, derived from the same index lookup as Query and Scan: in the
+first phase the PartiQL text for an index the table does not have, which
+carries no index name, in the second the backfilling sentence. The service's
+answer to a PartiQL read of a CREATING index is not measured.
+
 On the service the first phase lasted about 30 s and the second about 480 s.
 ExtendDB builds a three-item index in milliseconds, so the test sets the
 ``gsi_creating_phase_delay_ms:<table>`` hold, which lengthens both phases, and
@@ -35,6 +41,7 @@ from helpers import make_dynamodb_client
 
 GSI = "gsi_slow"
 NOT_FOUND = f"The table does not have the specified index: {GSI}"
+NOT_FOUND_STATEMENT = "The table does not have the specified index"
 BACKFILLING = f"Cannot read from backfilling global secondary index: {GSI}"
 CREATING_MEMBERS = {
     "Backfilling",
@@ -75,7 +82,8 @@ def _set_hold(endpoint: str, table: str, ms: int) -> None:
 def _outcome(call, **kwargs):
     """``("OK", count)`` for a served read, ``(code, message)`` for a refusal."""
     try:
-        return ("OK", call(**kwargs)["Count"])
+        response = call(**kwargs)
+        return ("OK", response["Count"] if "Count" in response else len(response["Items"]))
     except botocore.exceptions.ClientError as e:
         return (e.response["Error"]["Code"], e.response["Error"]["Message"])
 
@@ -135,6 +143,10 @@ def test_added_gsi_reports_backfilling_and_refuses_reads_by_phase(
                 ExpressionAttributeValues={":v": {"S": "v"}},
             )
             scan = _outcome(dynamodb_client.scan, TableName=table, IndexName=GSI)
+            statement = _outcome(
+                dynamodb_client.execute_statement,
+                Statement=f"SELECT * FROM \"{table}\".\"{GSI}\" WHERE g = 'v'",
+            )
             after = _gsi(dynamodb_client, table)
             if before is None or before != after:
                 time.sleep(0.05)
@@ -144,15 +156,18 @@ def test_added_gsi_reports_backfilling_and_refuses_reads_by_phase(
                 assert set(before) == CREATING_MEMBERS, sorted(before)
                 assert query == ("ValidationException", NOT_FOUND), query
                 assert scan == ("ValidationException", NOT_FOUND), scan
+                assert statement == ("ValidationException", NOT_FOUND_STATEMENT), statement
                 phase = 1
             elif state == ("CREATING", True):
                 assert set(before) == CREATING_MEMBERS, sorted(before)
                 assert query == ("ValidationException", BACKFILLING), query
                 assert scan == ("ValidationException", BACKFILLING), scan
+                assert statement == ("ValidationException", BACKFILLING), statement
                 phase = 2
             elif state == ("ACTIVE", ABSENT):
                 assert query == ("OK", 3), query
                 assert scan == ("OK", 3), scan
+                assert statement == ("OK", 3), statement
                 phase = 3
             else:
                 pytest.fail(f"a state the service does not report: {state}")
