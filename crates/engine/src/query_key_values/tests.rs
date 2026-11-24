@@ -69,6 +69,9 @@ pub(super) fn message(result: Result<(), DynamoDbError>) -> Option<String> {
 }
 
 /// The service's texts that the request-time check tests expect.
+pub(super) const LIMIT_BELOW_ONE: &str = "1 validation error detected: Value at 'Limit' failed to \
+                                          satisfy constraint: Member must have value greater than \
+                                          or equal to 1";
 pub(super) const INVALID_VALUE: &str = "ExpressionAttributeValues contains invalid value: ";
 pub(super) const EMPTY: &str =
     "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes";
@@ -496,4 +499,43 @@ fn a_value_that_does_not_deserialize_does_not_stop_the_number_check_of_another()
         validate_query_request_body(&body),
         Err(DynamoDbError::SerializationException(_))
     ));
+}
+
+/// Measured 2026-10-31 between 23:54 and 23:56 UTC: an empty value in
+/// `ExclusiveStartKey`, or as an `AttributeValueList` entry of `KeyConditions`
+/// or `QueryFilter`, answers a `Limit` of 0 in the older form, as an entry of
+/// `ExpressionAttributeValues` does; a readable `KeyConditions` entry keeps the
+/// newer form.
+#[test]
+fn an_unreadable_value_in_the_start_key_or_a_condition_list_switches_to_the_older_form() {
+    let older_limit = "1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1";
+    let key_conditions = |entry: serde_json::Value| serde_json::json!({"pk": {"ComparisonOperator": "EQ", "AttributeValueList": [entry]}});
+    let start_key = serde_json::json!({
+        "TableName": "t", "KeyConditionExpression": "pk = :p", "Limit": 0,
+        "ExpressionAttributeValues": {":p": {"S": "p0"}},
+        "ExclusiveStartKey": {"pk": {}, "sk": {"S": "x"}},
+    });
+    let query_filter = serde_json::json!({
+        "TableName": "t", "KeyConditions": key_conditions(serde_json::json!({"S": "p0"})),
+        "Limit": 0,
+        "QueryFilter": {"a": {"ComparisonOperator": "EQ", "AttributeValueList": [{}]}},
+    });
+    let key_condition = serde_json::json!({
+        "TableName": "t", "KeyConditions": key_conditions(serde_json::json!({})), "Limit": 0,
+    });
+    for body in [start_key, query_filter, key_condition] {
+        assert_eq!(
+            message(validate_query_request_body(&body)).as_deref(),
+            Some(older_limit),
+            "{body}"
+        );
+    }
+    let readable = serde_json::json!({
+        "TableName": "t", "KeyConditions": key_conditions(serde_json::json!({"S": "p0"})),
+        "Limit": 0,
+    });
+    assert_eq!(
+        message(validate_query_request_body(&readable)).as_deref(),
+        Some(LIMIT_BELOW_ONE)
+    );
 }

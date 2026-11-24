@@ -96,7 +96,7 @@ pub(crate) async fn handle_request(
     // --- Pre-auth body validation ---
     // Real DynamoDB validates request format (empty body, invalid JSON) before
     // authentication. Malformed requests get 400 regardless of auth state.
-    let input: Value = match serde_json::from_slice(&body) {
+    let mut input: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
             return error_response(
@@ -107,6 +107,11 @@ pub(crate) async fn handle_request(
             );
         }
     };
+    // A Scan's or Query's Limit, Segment or TotalSegments written with a
+    // fraction or an exponent is read from the digits as written, so the
+    // request-time checks and the handler see the value the service reads;
+    // see `extenddb_engine::read_floats_as_written`.
+    extenddb_engine::read_floats_as_written(&operation, &mut input, &body);
 
     // --- Auth segment ---
     let auth_start = std::time::Instant::now();

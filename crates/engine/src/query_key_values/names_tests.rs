@@ -6,10 +6,10 @@
 use serde_json::json;
 
 use super::tests::{
-    EMPTY, INVALID_KEY, INVALID_VALUE, LIMIT_ZERO, MIX, NULL, NUMERIC_BOB, RCC_BAD, SELECT_BAD,
-    SEVERAL, body_with, message, one_error,
+    EMPTY, INVALID_KEY, INVALID_VALUE, LIMIT_BELOW_ONE, LIMIT_ZERO, MIX, NULL, NUMERIC_BOB,
+    RCC_BAD, SELECT_BAD, SEVERAL, body_with, message, one_error,
 };
-use super::{LIMIT_BELOW_ONE, validate_query_request_body};
+use super::validate_query_request_body;
 
 #[test]
 fn the_names_checks_take_the_service_order() {

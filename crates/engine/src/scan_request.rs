@@ -4,18 +4,19 @@
 //! The `Scan` checks that run on the request body alone, before the body is
 //! deserialized and before the table is looked up.
 //!
-//! Measured 2026-10-25, 2026-11-19 and 2026-11-23 (us-east-1, each request
-//! twice), for a body whose `ExpressionAttributeValues` the service can read,
+//! Measured 2026-10-25, 2026-10-31, 2026-11-19 and 2026-11-23 (us-east-1,
+//! each request twice), for a body whose values the service can read and
+//! whose `Limit`, `Segment` and `TotalSegments` are integers inside int32,
 //! the service answers in this order:
 //!
 //! 1. the range constraints on `Limit` (at least 1), `Segment` (0 to 999999)
 //!    and `TotalSegments` (1 to 1000000), each checked when present, whether or
-//!    not the other segment field is. This module reports the first fault in
-//!    the order `Limit`, `Segment`, `TotalSegments`, with the `Limit` text
-//!    `Query` uses and the `Segment` and `TotalSegments` texts of the previous
-//!    release. The service reports every range fault in one message, and its
-//!    texts differ from these for `Segment` and `TotalSegments`, and for a
-//!    `Limit` outside the int32 range;
+//!    not the other segment field is, every fault in one message, the field
+//!    capitalised and no value echoed: `1 validation error detected: Value at
+//!    'Limit' failed to satisfy constraint: Member must have value greater
+//!    than or equal to 1`, or `3 validation errors detected: Value at 'Limit'
+//!    ...; Value at 'Segment' ...; Value at 'TotalSegments' ...` in that
+//!    order; see `int32_member::ranges`;
 //! 2. the `ReturnConsumedCapacity` enum;
 //! 3. the expression and non-expression parameter mix;
 //! 4. the `ExpressionAttributeNames` checks (see `validate_names`);
@@ -27,12 +28,18 @@
 //! 7. the `Select` enum. Both enums invalid answers the
 //!    `ReturnConsumedCapacity` error alone.
 //!
-//! A body whose `ExpressionAttributeValues` holds a value the service cannot
-//! read as one type (a null, no type descriptor, an unknown one, more than
-//! one, a null payload) takes another order on the service. An invalid
-//! `Select` and `ReturnConsumedCapacity` are reported together, with the
-//! range faults in an older form, then the mix, the names and the values.
-//! Here the range checks above come first, then `unreadable_value_checks`.
+//! A body on the service's older validation path takes another order: one
+//! whose `ExpressionAttributeValues`, `ExclusiveStartKey` or `ScanFilter`
+//! `AttributeValueList` holds a value the service cannot read as one type (a
+//! null, no type descriptor, an unknown one, more than one, a null payload),
+//! or whose `Limit`, `Segment` or `TotalSegments` is a float or an integer
+//! outside int32. An invalid `Select`, the `TotalSegments` fault, an invalid
+//! `ReturnConsumedCapacity`, the `Segment` fault and the `Limit` fault are
+//! reported together in one message, in that order, each value echoed as the
+//! service reads it (a fraction truncated toward zero, a value outside int32
+//! saturated: `Value '-2147483648' at 'limit' ...`), then the mix, the names
+//! and the values, an empty or duplicate set among them; see
+//! `older_form_checks`.
 //!
 //! On the service the undefined placeholder, unused value and filter syntax
 //! checks also come ahead of the `Select` enum and the table lookup (measured
@@ -46,14 +53,14 @@
 //! `SerializationException`; see `shape_fault_first`.
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::types::{AttributeValue, ScanInput};
-use serde::Deserialize;
+use extenddb_core::types::ScanInput;
 use serde_json::{Map, Value};
 
+use crate::int32_member::{SCAN_RANGES, newer_form, ranges};
 use crate::query_key_values::{
-    LIMIT_BELOW_ONE, RETURN_CONSUMED_CAPACITY, SELECT, non_empty, present,
-    readable_for_shape_check, shape_fault_first, sorted_entries, unreadable,
-    unreadable_value_checks, validate_expression_attribute_value_numbers, validate_names,
+    RETURN_CONSUMED_CAPACITY, SCAN_CONDITIONS, SCAN_VALUE_EXPRESSIONS, SELECT, deserializer_fault,
+    has_unreadable, non_empty, older_form_checks, present, readable_for_shape_check,
+    shape_fault_first, sorted_entries, validate_expression_attribute_value_numbers, validate_names,
 };
 
 /// The `Scan` checks that run on the raw request body, in the order the
@@ -64,10 +71,11 @@ use crate::query_key_values::{
 /// fails, each member of the body is deserialized on its own as part of a
 /// [`ScanInput`], and a `SerializationException` from that is the answer
 /// instead, as the service reports a shape fault ahead of every validation;
-/// see `shape_fault_first`. For that read the parts of an
-/// `ExpressionAttributeValues` value that the service cannot read are
-/// replaced (see `readable_for_shape_check`), so a null value is not a shape
-/// fault. A body that passes every check is not deserialized here.
+/// see `shape_fault_first`. For that read the parts of a value that the
+/// service cannot read are replaced (see `readable_for_shape_check`), so a
+/// null value is not a shape fault. A body that passes every check is not
+/// deserialized here; the handler reads `Limit`, `Segment` and
+/// `TotalSegments` with `int32_member::saturate` before it deserializes.
 ///
 /// The server runs the same function ahead of the IAM decision.
 ///
@@ -76,22 +84,29 @@ use crate::query_key_values::{
 /// Returns `DynamoDbError::ValidationException` with the service's text, or
 /// `DynamoDbError::SerializationException` for a body of the wrong shape.
 pub fn validate_scan_request_body(body: &Value) -> Result<(), DynamoDbError> {
-    scan_request_checks(body)
-        .map_err(|check| shape_fault_first::<ScanInput>(&readable_for_shape_check(body), check))
+    scan_request_checks(body).map_err(|check| {
+        shape_fault_first::<ScanInput>(&readable_for_shape_check(body, SCAN_CONDITIONS), check)
+    })
 }
 
 /// The `Scan` checks in the service's order; see
 /// [`validate_scan_request_body`].
 fn scan_request_checks(body: &Value) -> Result<(), DynamoDbError> {
-    validate_ranges(body)?;
-
+    let ranges = ranges(body, &SCAN_RANGES);
     let values = body
         .get("ExpressionAttributeValues")
         .and_then(Value::as_object);
-    if let Some(values) = values
-        && values.values().any(unreadable)
-    {
-        return unreadable_value_checks(body, values, validate_parameter_mix);
+    if ranges.older_form || has_unreadable(body, SCAN_CONDITIONS) {
+        return older_form_checks(
+            body,
+            values,
+            &ranges.faults,
+            validate_parameter_mix,
+            SCAN_VALUE_EXPRESSIONS,
+        );
+    }
+    if !ranges.faults.is_empty() {
+        return Err(newer_form(&ranges.faults));
     }
 
     crate::validate_enum_fields(
@@ -141,65 +156,28 @@ fn validate_parameter_mix(body: &Value) -> Result<(), DynamoDbError> {
 
 /// The faults the `AttributeValue` deserializer reports as a
 /// `ValidationException`, such as an empty set and a set with a duplicate
-/// member, with the deserializer's text. The values are visited in
-/// placeholder order. The service reports these after the
-/// `ExpressionAttributeNames` checks and ahead of the `Select` enum (measured
-/// 2026-11-19 and 2026-11-23: a duplicate or an empty `NS`, a duplicate `SS`
-/// or `BS`, and a duplicate `NS` in an `L` beside `Select: "NOPE"` answer the
-/// set text). Beside a number fault in another value, the service named
-/// either value between two identical requests (measured 2026-11-19), and
-/// this check comes after the numbers. A value of the wrong JSON type is left
-/// to the shape fault check.
+/// member, with the deserializer's text (see `deserializer_fault`). The
+/// values are visited in placeholder order. The service reports these after
+/// the `ExpressionAttributeNames` checks and ahead of the `Select` enum
+/// (measured 2026-11-19 and 2026-11-23: a duplicate or an empty `NS`, a
+/// duplicate `SS` or `BS`, and a duplicate `NS` in an `L` beside `Select:
+/// "NOPE"` answer the set text). Beside a number fault in another value, the
+/// service named either value between two identical requests (measured
+/// 2026-11-19), and this check comes after the numbers. A value of the wrong
+/// JSON type is left to the shape fault check. On the older validation path
+/// the sets are checked with the values, with that path's texts (see
+/// `older_form_checks`).
 fn validate_sets(values: &Map<String, Value>) -> Result<(), DynamoDbError> {
-    match sorted_entries(values).into_iter().find_map(|(_, value)| {
-        match AttributeValue::deserialize(value).map_err(crate::deserialize_error) {
-            Err(fault @ DynamoDbError::ValidationException(_)) => Some(fault),
-            _ => None,
-        }
-    }) {
+    match sorted_entries(values)
+        .into_iter()
+        .find_map(|(_, value)| deserializer_fault(value))
+    {
         Some(fault) => Err(fault),
         None => Ok(()),
     }
 }
 
-/// The range constraints on `Limit`, `Segment` and `TotalSegments`, the first
-/// fault in that order. `Limit` answers [`LIMIT_BELOW_ONE`], the text `Query`
-/// uses. `Segment` and `TotalSegments` keep the texts of the previous release.
-fn validate_ranges(body: &Value) -> Result<(), DynamoDbError> {
-    let get = |field: &str| body.get(field).and_then(Value::as_i64);
-    if let Some(limit) = get("Limit")
-        && limit < 1
-    {
-        return Err(DynamoDbError::ValidationException(
-            LIMIT_BELOW_ONE.to_owned(),
-        ));
-    }
-    if let Some(segment) = get("Segment") {
-        if segment < 0 {
-            return Err(DynamoDbError::ValidationException(format!(
-                "1 validation error detected: Value '{segment}' at 'segment' failed to satisfy constraint: Member must have value greater than or equal to 0"
-            )));
-        }
-        if segment > 999_999 {
-            return Err(DynamoDbError::ValidationException(format!(
-                "1 validation error detected: Value '{segment}' at 'segment' failed to satisfy constraint: Member must have value less than or equal to 999999"
-            )));
-        }
-    }
-    if let Some(total) = get("TotalSegments") {
-        if total < 1 {
-            return Err(DynamoDbError::ValidationException(
-                "The parameter TotalSegments should be greater than or equal to 1".to_owned(),
-            ));
-        }
-        if total > 1_000_000 {
-            return Err(DynamoDbError::ValidationException(format!(
-                "1 validation error detected: Value '{total}' at 'totalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000"
-            )));
-        }
-    }
-    Ok(())
-}
-
+#[cfg(test)]
+mod range_tests;
 #[cfg(test)]
 mod tests;

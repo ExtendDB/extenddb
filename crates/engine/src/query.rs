@@ -44,12 +44,15 @@ use crate::{DispatchMetrics, DispatchResult};
 /// Returns `DynamoDbError` for validation failures, missing tables, or storage errors.
 #[allow(clippy::cast_possible_wrap)] // item counts won't exceed i64::MAX
 pub async fn handle_query(
-    body: Value,
+    mut body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
     // The request-time checks on the raw body, before typed deserialization;
-    // see `query_key_values::validate_query_request_body`.
+    // see `query_key_values::validate_query_request_body`. Limit is then read
+    // as the service reads it, from any JSON number the body parser reads; see
+    // `int32_member`.
     crate::query_key_values::validate_query_request_body(&body)?;
+    crate::int32_member::saturate(&mut body, &crate::int32_member::QUERY_RANGES)?;
     let input: QueryInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
     // P118: Fetch key_info first so we can use table_id for index lookup.

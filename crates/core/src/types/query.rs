@@ -207,3 +207,36 @@ pub struct ScanOutput {
     #[serde(rename = "ConsumedCapacity", skip_serializing_if = "Option::is_none")]
     pub consumed_capacity: Option<ConsumedCapacity>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::saturated_int32;
+
+    fn number(text: &str) -> serde_json::Number {
+        serde_json::from_str(text).expect("a JSON number")
+    }
+
+    #[test]
+    fn a_json_number_is_truncated_toward_zero_and_saturated_to_int32() {
+        for (text, expected) in [
+            ("1", 1),
+            ("-2147483648", i32::MIN),
+            ("2147483647", i32::MAX),
+            ("-2147483649", i32::MIN),
+            ("2147483648", i32::MAX),
+            ("9223372036854775808", i32::MAX),
+            ("-9223372036854775809", i32::MIN),
+            ("1.5", 1),
+            ("1.0", 1),
+            ("0.0", 0),
+            ("-1.5", -1),
+            ("-0.5", 0),
+            ("-0", 0),
+            ("1e2", 100),
+            ("1e40", i32::MAX),
+            ("-1e40", i32::MIN),
+        ] {
+            assert_eq!(saturated_int32(&number(text)), expected, "{text}");
+        }
+    }
+}

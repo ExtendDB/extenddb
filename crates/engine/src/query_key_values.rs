@@ -30,35 +30,22 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
     Expr, ExpressionMaps, KeyCondition, PathElement, SortKeyCondition,
 };
-use extenddb_core::types::{
-    AttributeDefinition, AttributeValue, EMPTY_ATTRIBUTE_VALUE, MULTI_ATTRIBUTE_VALUE, QueryInput,
-};
-use extenddb_core::validation::number::{NOT_A_NUMBER, NUMBER_SET_DUPLICATES, has_equal_numbers};
+use extenddb_core::types::{AttributeDefinition, QueryInput};
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
 mod unreadable;
+mod value_fault;
 
-pub(crate) use unreadable::{readable_for_shape_check, unreadable, unreadable_value_checks};
+pub(crate) use unreadable::{
+    QUERY_CONDITIONS, QUERY_VALUE_EXPRESSIONS, SCAN_CONDITIONS, SCAN_VALUE_EXPRESSIONS,
+    has_unreadable, older_form_checks, readable_for_shape_check,
+};
+pub(crate) use value_fault::deserializer_fault;
+use value_fault::first_fault;
 
 /// The service's text for a key condition value of the wrong type.
 pub const KEY_CONDITION_TYPE_MISMATCH: &str = "One or more parameter values were invalid: Condition parameter type does not match schema type";
-
-/// The service's text for a `Limit` below 1 on `Query`.
-pub const LIMIT_BELOW_ONE: &str = "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1";
-
-/// The service's text for a null value. Core's copy is a private constant of
-/// its `partiql` module, which a build without the `partiql` feature leaves
-/// out.
-const NULL_VALUE: &str = "The supplied Item contains a null AttributeValue";
-
-/// The type descriptors of an AttributeValue, in the order the service checks
-/// the payloads of a value with several type descriptors (see
-/// [`first_fault`]): a duplicate `SS` member ahead of the numbers (measured
-/// 2026-11-24), `N` ahead of `NS`, `NS` ahead of `BS`, and `NS` and `M` ahead
-/// of `L`. Core's list is a private constant of its `partiql` module, as for
-/// [`NULL_VALUE`].
-const TYPE_DESCRIPTORS: [&str; 10] = ["SS", "S", "N", "B", "NS", "BS", "M", "L", "NULL", "BOOL"];
 
 /// The members of the two enums the request-time checks read.
 pub(crate) const RETURN_CONSUMED_CAPACITY: &[&str] = &["INDEXES", "TOTAL", "NONE"];
@@ -71,12 +58,14 @@ pub(crate) const SELECT: &[&str] = &[
 
 /// The `Query` checks that run on the request body alone, before the body is
 /// deserialized and before the table is looked up, in the service's order:
-/// `Limit`, the `ReturnConsumedCapacity` enum, the expression and
-/// non-expression parameter mix, the `ExpressionAttributeNames` map (see
-/// `validate_names`), every number in `ExpressionAttributeValues`, then the
-/// `Select` enum (measured 2026-10-24 and 2026-11-11: a `Limit` of 0 is
-/// reported ahead of an invalid enum value of either field and of a parameter
-/// mix, an invalid `ReturnConsumedCapacity` ahead of a mix with
+/// the `Limit` range (at least 1, the newer form `1 validation error
+/// detected: Value at 'Limit' failed to satisfy constraint: Member must have
+/// value greater than or equal to 1`), the `ReturnConsumedCapacity` enum, the
+/// expression and non-expression parameter mix, the `ExpressionAttributeNames`
+/// map (see `validate_names`), every number in `ExpressionAttributeValues`,
+/// then the `Select` enum (measured 2026-10-24 and 2026-11-11: a `Limit` of 0
+/// is reported ahead of an invalid enum value of either field and of a
+/// parameter mix, an invalid `ReturnConsumedCapacity` ahead of a mix with
 /// `AttributesToGet`, `QueryFilter`, `ConditionalOperator` or `KeyConditions`
 /// and ahead of an `N` value that is not a number, a mix ahead of that value,
 /// and that value ahead of an invalid `Select`. Measured 2026-11-19 in either
@@ -84,9 +73,15 @@ pub(crate) const SELECT: &[&str] = &[
 /// invalid `ReturnConsumedCapacity` and a mix, and ahead of an `N` value that
 /// is not a number, a set with a duplicate member and an invalid `Select`).
 ///
-/// A request whose `ExpressionAttributeValues` holds a value the service
-/// cannot read as one type takes another order; see
-/// `unreadable_value_checks`.
+/// A request that holds a value the service cannot read as one type (in
+/// `ExpressionAttributeValues`, `ExclusiveStartKey` or a `KeyConditions` or
+/// `QueryFilter` list; see `has_unreadable`), or whose `Limit` is a float or
+/// an integer outside int32, takes the service's older validation path, with
+/// the `Limit` fault in its older form, `Value '-2147483648' at 'limit' ...`,
+/// the value echoed as the service reads it (see `int32_member::ranges`); see
+/// `older_form_checks`. Measured 2026-11-23 (us-east-1, each request twice):
+/// `Limit: -2147483649` beside a readable value answers `Value '-2147483648'
+/// at 'limit'`, and `Limit: 0.0` answers `Value '0' at 'limit'`.
 ///
 /// The checks read the raw body, so a field that does not deserialize (an
 /// invalid `Select`, for one) does not stop the ones before it. When a check
@@ -121,8 +116,9 @@ pub(crate) const SELECT: &[&str] = &[
 /// Returns `DynamoDbError::ValidationException` with the service's text, or
 /// `DynamoDbError::SerializationException` for a body of the wrong shape.
 pub fn validate_query_request_body(body: &Value) -> Result<(), DynamoDbError> {
-    query_request_checks(body)
-        .map_err(|check| shape_fault_first::<QueryInput>(&readable_for_shape_check(body), check))
+    query_request_checks(body).map_err(|check| {
+        shape_fault_first::<QueryInput>(&readable_for_shape_check(body, QUERY_CONDITIONS), check)
+    })
 }
 
 /// When a request-time check has failed with `check`, the deserializer's
@@ -161,7 +157,7 @@ pub fn validate_query_request_body(body: &Value) -> Result<(), DynamoDbError> {
 ///   `SerializationException: Unexpected token received from parser`, and
 ///   `ConsistentRead: 1` `SerializationException: NUMBER_VALUE cannot be
 ///   converted to Boolean`. The handler's own deserialization still refuses
-///   every string in these members;
+///   every string in `ConsistentRead` and `ScanIndexForward`;
 /// - a null member, which the service reads as an absent one (see
 ///   [`present`]), and a null name in `ExpressionAttributeNames`, which it
 ///   reads as an empty name and reports after these checks. Measured
@@ -173,6 +169,11 @@ pub fn validate_query_request_body(body: &Value) -> Result<(), DynamoDbError> {
 ///   `ExpressionAttributeValues contains invalid value` form, and alone
 ///   `ExpressionAttributeNames contains invalid value: Empty attribute name
 ///   for key #a`. The handler's own deserialization still refuses both.
+///
+/// `Limit`, `Segment` and `TotalSegments` of another JSON type are shape
+/// faults with the texts of `int32_member::read` (`STRING_VALUE cannot be
+/// converted to Integer`, measured 2026-11-23 on `Query` and `Scan`), which
+/// the handlers read them with.
 pub(crate) fn shape_fault_first<T: DeserializeOwned>(
     body: &Value,
     check: DynamoDbError,
@@ -198,7 +199,9 @@ pub(crate) fn shape_fault_first<T: DeserializeOwned>(
             {
                 None
             }
-            ("Limit" | "Segment" | "TotalSegments", Value::Number(_)) => None,
+            ("Limit" | "Segment" | "TotalSegments", member) => {
+                crate::int32_member::read(Some(member)).err()
+            }
             ("ExpressionAttributeNames", Value::Object(names)) => read(
                 name,
                 Value::Object(
@@ -252,21 +255,21 @@ const UNKNOWN_TYPE_DESCRIPTOR: &str = "unknown AttributeValue type descriptor";
 /// The `Query` checks in the service's order; see
 /// [`validate_query_request_body`].
 fn query_request_checks(body: &Value) -> Result<(), DynamoDbError> {
+    let ranges = crate::int32_member::ranges(body, &crate::int32_member::QUERY_RANGES);
     let values = body
         .get("ExpressionAttributeValues")
         .and_then(Value::as_object);
-    if let Some(values) = values
-        && values.values().any(unreadable)
-    {
-        return unreadable_value_checks(body, values, validate_no_parameter_mix);
+    if ranges.older_form || has_unreadable(body, QUERY_CONDITIONS) {
+        return older_form_checks(
+            body,
+            values,
+            &ranges.faults,
+            validate_no_parameter_mix,
+            QUERY_VALUE_EXPRESSIONS,
+        );
     }
-
-    if let Some(limit) = body.get("Limit").and_then(Value::as_i64)
-        && limit < 1
-    {
-        return Err(DynamoDbError::ValidationException(
-            LIMIT_BELOW_ONE.to_owned(),
-        ));
+    if !ranges.faults.is_empty() {
+        return Err(crate::int32_member::newer_form(&ranges.faults));
     }
 
     // Query stops at the first invalid enum: ReturnConsumedCapacity ahead of
@@ -351,7 +354,7 @@ pub(crate) fn validate_names(body: &Value) -> Result<(), DynamoDbError> {
 /// name that is not empty, so an empty name passes here. Beside a value the
 /// service cannot read as one type, the service makes the key checks ahead of
 /// the values and reports an empty name after them; see
-/// `unreadable_value_checks`.
+/// `older_form_checks`.
 fn validate_name_keys(body: &Value) -> Result<(), DynamoDbError> {
     match body.get("ExpressionAttributeNames") {
         Some(Value::Object(names)) => {
@@ -386,160 +389,6 @@ pub(crate) fn sorted_entries(values: &Map<String, Value>) -> Vec<(&String, &Valu
     let mut entries: Vec<(&String, &Value)> = values.iter().collect();
     entries.sort_by_key(|(key, _)| *key);
     entries
-}
-
-/// The first fault inside one value, in document order for `L` items and in
-/// the map's iteration order for `M` members (see [`first_fault`]).
-enum Fault<'a> {
-    /// A null, with the member name when it is the value of an `M` member.
-    Null(Option<&'a str>),
-    /// No type descriptor the service knows.
-    Empty,
-    /// More than one type descriptor, with no fault in their payloads.
-    SeveralTypes,
-    /// An `N` text or `NS` member that is not a number, as the request wrote it.
-    NotANumber(&'a str),
-    /// A number the number rules refuse for its magnitude or precision, with
-    /// their text.
-    Refused(String),
-    /// An empty set, or a set two of whose members have one value, beside a
-    /// second type descriptor, with the text of that path (see [`set_fault`]).
-    Set(String),
-}
-
-impl Fault<'_> {
-    /// The request-time number check's text: the value echoed with each
-    /// decimal digit folded to ASCII (measured 2026-11-11: `{"N": "\u{ff11}bob"}`
-    /// answers `The parameter cannot be converted to a numeric value: 1bob`,
-    /// `\u{661}\u{662}x` answers `12x`), and the colon kept after an empty one.
-    fn request_time_text(self) -> String {
-        match self {
-            Fault::NotANumber(text) => format!(
-                "{NOT_A_NUMBER}: {}",
-                crate::decimal_digits::fold_decimal_digits(text)
-            ),
-            other => other.reason(),
-        }
-    }
-
-    /// The text [`unreadable_value_checks`] wraps: a number echoed as written
-    /// and no colon after an empty one (measured 2026-11-11).
-    fn reason(self) -> String {
-        match self {
-            Fault::Null(None) => NULL_VALUE.to_owned(),
-            Fault::Null(Some(member)) => format!("{NULL_VALUE}: {member} is null"),
-            Fault::Empty => EMPTY_ATTRIBUTE_VALUE.to_owned(),
-            Fault::SeveralTypes => MULTI_ATTRIBUTE_VALUE.to_owned(),
-            Fault::NotANumber("") => NOT_A_NUMBER.to_owned(),
-            Fault::NotANumber(text) => format!("{NOT_A_NUMBER}: {text}"),
-            Fault::Refused(msg) | Fault::Set(msg) => msg,
-        }
-    }
-}
-
-/// The first fault in `value` (`member` is its name when it is the value of an
-/// `M` member): a null or no type descriptor, then the payloads in the order
-/// of [`TYPE_DESCRIPTORS`] (the numbers in `N` and `NS`, and every value an
-/// `L` or `M` holds), then more than one type descriptor. With `sets`, an
-/// empty set and a set two of whose members have one value are faults too,
-/// `SS` ahead of the numbers and `NS` after its own numbers (see
-/// [`set_fault`]); without it, the deserializer reports them after the
-/// request-time checks.
-/// `L` items are visited in document order and `M` members in the map's
-/// iteration order: sorted by key without the `preserve_order` feature of
-/// `serde_json`, in document order with it, as in the MongoDB build (bson
-/// turns the feature on). A value of another JSON type, and an `N` or `NS`
-/// payload of the wrong JSON type, are shape faults the deserializer
-/// reports. A type descriptor with a null payload counts as absent, as the
-/// service reads it (measured 2026-11-19: `{"S": null}` answers the empty
-/// value text, and `{"S": null, "N": "1"}` in a `FilterExpression` is
-/// accepted).
-///
-/// With several type descriptors, the service reads each payload in the order
-/// of [`TYPE_DESCRIPTORS`], whatever order the request wrote them in, and
-/// answers the more than one datatypes text only when no payload has a fault
-/// (measured 2026-11-19: `{"N": "bob", "S": "x"}` and `{"S": "x", "N": "bob"}`
-/// answer the numeric text for `bob`, `{"N": "1", "S": "x"}` the more than one
-/// datatypes text, `{"S": "x", "L": [null]}` the null text, and `N` is read
-/// ahead of `NS`, `NS` and `M` ahead of `L`; measured 2026-11-24: `{"SS":
-/// ["a", "a"], "N": "bob"}` answers the duplicate text, `{"NS": ["1", "1"],
-/// "N": "bob"}` the numeric text, and `{"NS": ["1", "1"], "L": [{"N":
-/// "bob"}]}` the duplicate text).
-fn first_fault<'a>(value: &'a Value, member: Option<&'a str>, sets: bool) -> Option<Fault<'a>> {
-    let Value::Object(map) = value else {
-        return value.is_null().then_some(Fault::Null(member));
-    };
-    let payloads: Vec<(&str, &Value)> = TYPE_DESCRIPTORS
-        .iter()
-        .filter_map(|&descriptor| Some((descriptor, map.get(descriptor).filter(|p| !p.is_null())?)))
-        .collect();
-    let fault = payloads
-        .iter()
-        .find_map(|&(descriptor, payload)| match (descriptor, payload) {
-            ("N", Value::String(text)) => number_fault(text),
-            ("NS", Value::Array(members)) => members
-                .iter()
-                .filter_map(Value::as_str)
-                .find_map(number_fault)
-                .or_else(|| sets.then(|| set_fault(descriptor, members)).flatten()),
-            ("SS" | "BS", Value::Array(members)) if sets => set_fault(descriptor, members),
-            ("L", Value::Array(items)) => {
-                items.iter().find_map(|item| first_fault(item, None, sets))
-            }
-            ("M", Value::Object(members)) => members
-                .iter()
-                .find_map(|(name, inner)| first_fault(inner, Some(name), sets)),
-            _ => None,
-        });
-    match payloads.len() {
-        0 => Some(Fault::Empty),
-        1 => fault,
-        _ => fault.or(Some(Fault::SeveralTypes)),
-    }
-}
-
-/// The service's refusal of a set of type `descriptor` whose `members` are
-/// strings, beside a second type descriptor: [`NUMBER_SET_DUPLICATES`] for an
-/// `NS` two of whose members have one value, else the deserializer's text for
-/// an empty set or an `SS` or `BS` that holds a member twice. Measured
-/// 2026-11-24, each body twice, as `ExpressionAttributeValues contains invalid
-/// value: ... for key :z`: `{"SS": ["a", "a"], "N": "1"}` answers `One or more
-/// parameter values were invalid: Input collection [a, a] contains
-/// duplicates.`, `{"NS": ["1", "1"], "S": "x"}` `Input collection contains
-/// duplicates`, `{"BS": ["YQ==", "YQ=="], "N": "1"}` `One or more parameter
-/// values were invalid: Input collection [YQ==, YQ==]of type BS contains
-/// duplicates.`, and an empty `SS`, `NS` or `BS` beside a second descriptor
-/// the deserializer's empty set text. A member of another JSON type is left
-/// to the shape fault check.
-fn set_fault<'a>(descriptor: &str, members: &[Value]) -> Option<Fault<'a>> {
-    if !members.iter().all(Value::is_string) {
-        return None;
-    }
-    if descriptor == "NS" && has_equal_numbers(members) {
-        return Some(Fault::Set(NUMBER_SET_DUPLICATES.to_owned()));
-    }
-    let set = Value::Object(Map::from_iter([(
-        descriptor.to_owned(),
-        Value::Array(members.to_vec()),
-    )]));
-    match serde_json::from_value::<AttributeValue>(set).map_err(crate::deserialize_error) {
-        Err(DynamoDbError::ValidationException(msg)) => Some(Fault::Set(msg)),
-        _ => None,
-    }
-}
-
-/// `text` against the number rules, with Unicode decimal digits folded for the
-/// check; see [`crate::decimal_digits`].
-fn number_fault(text: &str) -> Option<Fault<'_>> {
-    let folded = crate::decimal_digits::fold_decimal_digits(text);
-    match extenddb_core::validation::number::validate_and_normalize_number(&folded) {
-        Ok(_) => None,
-        Err(DynamoDbError::ValidationException(msg)) if msg.starts_with(NOT_A_NUMBER) => {
-            Some(Fault::NotANumber(text))
-        }
-        Err(DynamoDbError::ValidationException(msg)) => Some(Fault::Refused(msg)),
-        Err(other) => Some(Fault::Refused(other.to_string())),
-    }
 }
 
 /// Refuse the first `N` value in `ExpressionAttributeValues` (including `NS`
