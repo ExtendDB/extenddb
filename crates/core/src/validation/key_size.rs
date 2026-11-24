@@ -101,8 +101,9 @@ enum ClauseSize {
     /// The clause names an attribute outside the key schema, or is not a
     /// placeholder, and adds nothing.
     Skipped,
-    /// The key type of the clause's attribute and the bytes it contributes.
-    Bytes(KeyType, usize),
+    /// The position of the clause's attribute in the key schema and the bytes
+    /// the clause contributes.
+    Bytes(usize, usize),
 }
 
 /// Size one clause. A clause with two values (`BETWEEN`) contributes the
@@ -162,27 +163,33 @@ fn sized_clause(
         };
         size = size.max(bytes);
     }
-    let Some(key) = key_schema.iter().find(|ks| ks.attribute_name == name) else {
+    let Some(key) = key_schema.iter().position(|ks| ks.attribute_name == name) else {
         return Ok(ClauseSize::Skipped);
     };
     if !placeholders {
         return Ok(ClauseSize::Skipped);
     }
-    Ok(ClauseSize::Bytes(key.key_type, size))
+    Ok(ClauseSize::Bytes(key, size))
 }
 
 /// Refuse a `Query` whose key condition carries a key value over the key size
 /// limits.
 ///
 /// - If any single HASH value is over `max_partition_key_size_bytes` (2048),
-///   the single hash sentence. Otherwise, if the HASH values add up to more
-///   than that, the aggregated hash sentence (only an index with several HASH
-///   attributes can reach it).
-/// - Every RANGE clause contributes the size of its value, whatever its
-///   operator (`=`, `<`, `<=`, `>`, `>=`, `begins_with`); a `BETWEEN`
-///   contributes the larger of its two bounds. The contributions are added
-///   up, and a total over `max_sort_key_size_bytes` (1024) is refused with
-///   the range sentence.
+///   the single hash sentence. Otherwise, if the values of the HASH
+///   attributes add up to more than that, the aggregated hash sentence (only
+///   an index with several HASH attributes can reach it).
+/// - Every RANGE attribute contributes the size of its clause's value,
+///   whatever the operator (`=`, `<`, `<=`, `>`, `>=`, `begins_with`); a
+///   `BETWEEN` contributes the larger of its two bounds. The contributions are
+///   added up, and a total over `max_sort_key_size_bytes` (1024) is refused
+///   with the range sentence.
+/// - A key attribute with more than one clause contributes its largest value
+///   once, so a second clause on `pk` does not reach the aggregated hash
+///   sentence. The service refuses that key condition with `Invalid
+///   KeyConditionExpression: KeyConditionExpressions must only contain one
+///   condition per key` (measured 2026-11-24 with 1025 bytes in each `pk`
+///   value). This check does not make that refusal.
 /// - The HASH checks run before the RANGE check, so the hash sentence wins when
 ///   both limits are exceeded.
 /// - An `N` value with more than 38 significant digits or a magnitude out of
@@ -225,20 +232,24 @@ pub fn validate_query_key_sizes(
     maps: &ExpressionMaps,
     limits: &LimitsConfig,
 ) -> Result<(), DynamoDbError> {
-    let mut hash_over = false;
-    let mut hash_total: usize = 0;
-    let mut range_total: usize = 0;
+    let mut sizes = vec![0; key_schema.len()];
     for clause in clauses(key_condition) {
         match sized_clause(&clause, key_schema, maps)? {
             ClauseSize::Unresolved => return Ok(()),
             ClauseSize::Skipped => {}
-            ClauseSize::Bytes(KeyType::Hash, size) => {
+            ClauseSize::Bytes(key, size) => sizes[key] = sizes[key].max(size),
+        }
+    }
+    let mut hash_over = false;
+    let mut hash_total: usize = 0;
+    let mut range_total: usize = 0;
+    for (key, size) in key_schema.iter().zip(sizes) {
+        match key.key_type {
+            KeyType::Hash => {
                 hash_over |= size > limits.max_partition_key_size_bytes;
                 hash_total = hash_total.saturating_add(size);
             }
-            ClauseSize::Bytes(KeyType::Range, size) => {
-                range_total = range_total.saturating_add(size);
-            }
+            KeyType::Range => range_total = range_total.saturating_add(size),
         }
     }
     if hash_over {

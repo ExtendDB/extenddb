@@ -144,7 +144,7 @@ fn equality_clauses_are_checked_against_the_limits() {
     let range = Some(RANGE_MSG_1024);
     // The key schema, the `attribute = :v` clauses with the bytes of each
     // value, and the expected sentence (`None` for `Ok`).
-    let cases: [(&[KeySchemaElement], &[(&str, usize)], Option<&str>); 16] = [
+    let cases: [(&[KeySchemaElement], &[(&str, usize)], Option<&str>); 18] = [
         // Measured 2026-10-23 on a base table with HASH `pk` and RANGE `sk`:
         // the limits, and the hash sentence when both limits are exceeded.
         (&base, &[("pk", 2048)], None),
@@ -174,6 +174,13 @@ fn equality_clauses_are_checked_against_the_limits() {
         (&two, &[("h1", 1025), ("h2", 1024), ("r", 1025)], total),
         // Not measured: the single hash check runs before the sum.
         (&two, &[("h1", 2049), ("h2", 2048)], hash),
+        // Two clauses on one attribute: the attribute counts its larger value
+        // once. The service refuses both with `Invalid KeyConditionExpression:
+        // KeyConditionExpressions must only contain one condition per key`
+        // (measured 2026-11-24 with 1025 bytes in each `pk` value; #489
+        // records the `sk` shape), a refusal this check does not make.
+        (&base, &[("pk", 1025), ("pk", 1025)], None),
+        (&base, &[("pk", 1), ("sk", 600), ("sk", 600)], None),
     ];
     for (schema, clauses, expected) in cases {
         let (kc, m) = equalities(clauses);
