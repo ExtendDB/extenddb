@@ -56,16 +56,13 @@ impl CassandraEngine {
              ALLOW FILTERING"
         );
 
-        let result =
-            self.session.query(&query).await.map_err(|e| {
-                StorageError::Internal(format!("Failed to query CREATING tables: {e}"))
-            })?;
-
-        let body = result.response_body().map_err(|e| {
-            StorageError::Internal(format!("Failed to parse CREATING tables response: {e}"))
-        })?;
-
-        let rows = body.into_rows().unwrap_or_default();
+        let rows: Vec<cdrs_tokio::types::rows::Row> = crate::cassandra_util::query_rows(
+            &self.session,
+            &query,
+            cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
+            "Failed to query CREATING tables",
+        )
+        .await?;
 
         for row in rows {
             let account_id: String = row
@@ -104,16 +101,13 @@ impl CassandraEngine {
              ALLOW FILTERING"
         );
 
-        let result =
-            self.session.query(&query).await.map_err(|e| {
-                StorageError::Internal(format!("Failed to query DELETING tables: {e}"))
-            })?;
-
-        let body = result.response_body().map_err(|e| {
-            StorageError::Internal(format!("Failed to parse DELETING tables response: {e}"))
-        })?;
-
-        let rows = body.into_rows().unwrap_or_default();
+        let rows: Vec<cdrs_tokio::types::rows::Row> = crate::cassandra_util::query_rows(
+            &self.session,
+            &query,
+            cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
+            "Failed to query DELETING tables",
+        )
+        .await?;
 
         for row in rows {
             let account_id: String = row

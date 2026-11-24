@@ -24,7 +24,8 @@
 //! `DeleteTable`, `DeleteItem` and `DeleteBackup` were not sent to the
 //! service; they take the answers of `UpdateTable`, `UpdateItem` and
 //! `DescribeBackup`. `SearchVectors` has no service counterpart and takes the
-//! answers of `DescribeTable`.
+//! answers of `DescribeTable`, naming the vector index ARN as `Query` and
+//! `Scan` name theirs.
 //!
 //! On the service a `StreamArn` that is not a stream ARN (a table, index or
 //! backup ARN included), or has an empty partition, service or account field,
@@ -127,8 +128,9 @@ pub(crate) fn find(operation: &str, input: &Value, account_id: &str) -> Option<O
         "ListStreams" | "ImportTable" | "ListTables" | "DescribeLimits" | "DescribeEndpoints"
         | "GetRecords" => None,
         // An index query names the index ARN, built from the table ARN as
-        // written (measured: `.../table/<T>/index/<I>`).
-        "Query" | "Scan" => {
+        // written (measured: `.../table/<T>/index/<I>`). SearchVectors names
+        // its index the same way, as `authz_targets` does.
+        "Query" | "Scan" | "SearchVectors" => {
             let table = field("TableName")?;
             let resource = match field("IndexName") {
                 Some(index)

@@ -26,13 +26,11 @@ pub(crate) enum PaginationBinds {
     None,
     /// Index query where base table has no SK — only `base_pk` as tie-breaker.
     BasePkOnly { pk_text: String },
-    /// LSI query. `base_sk` alone is a complete tie-breaker, because every
-    /// row shares the queried partition key.
-    BaseSkOnly { sk: SortKeyValue },
-    /// Full base primary key as tie-breaker. Required by a GSI query when the
-    /// base table has a SK: rows sharing an index SK can come from different
-    /// base partitions and can also share a base SK, so `base_sk` alone does
-    /// not identify a row. Also used by a hash-only index on such a table.
+    /// Full base primary key of the start key as tie-breaker. On a GSI, rows
+    /// sharing an index SK can come from different base partitions and can
+    /// also share a base SK, so `base_sk` alone does not identify a row. On an
+    /// LSI the start key's partition key is the queried one, every row's
+    /// `base_pk`. Also used by a hash-only index on a table with a SK.
     BasePkAndSk { pk_text: String, sk: SortKeyValue },
 }
 
@@ -199,9 +197,6 @@ pub(crate) async fn execute_query_sql(
         PaginationBinds::None => {}
         PaginationBinds::BasePkOnly { pk_text } => {
             query = query.bind(pk_text.clone());
-        }
-        PaginationBinds::BaseSkOnly { sk } => {
-            query = bind_sk_value(query, sk);
         }
         PaginationBinds::BasePkAndSk { pk_text, sk } => {
             query = query.bind(pk_text.clone());

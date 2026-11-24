@@ -284,7 +284,7 @@ jobs:
         run: devtools/check-mongodb-auth ./target/release/extenddb 27081 18490
       - name: Check the released catalogs against a fresh install
         run: devtools/check-mongodb-released ./target/release/extenddb 27061 18480
-      - name: Check the last 0.1.x release against migrated catalogs
+      - name: Check the 0.1.14 release against migrated catalogs
         run: |
           docker pull extenddb/extenddb-mongodb:0.1.14
           devtools/check-mongodb-older-binary ./target/release/extenddb \
