@@ -79,16 +79,16 @@ pub(crate) fn error_response(error: &DynamoDbError, request_id: &str) -> Respons
 
 /// The key that carries the error message. `DynamoDB` sends `Message` on
 /// `TransactionCanceledException` and `IdempotentParameterMismatchException`
-/// (us-east-1, raw bodies, 2026-10-29, 2026-11-03 and 2026-11-19). It also
-/// sends `Message` on `TransactionInProgressException`, which ExtendDB does
-/// not raise, and on `AccessDeniedException` and `SerializationException`
-/// (2026-11-12 and 2026-11-19), which keep `message` here. The other errors
-/// measured carry `message`. REQ-ERR-002 in `docs/design/01-requirements.md`
-/// lists them.
+/// (us-east-1, raw bodies, 2026-10-29, 2026-11-03 and 2026-11-19), and on
+/// `TransactionInProgressException` (2026-11-19). It also sends `Message` on
+/// `AccessDeniedException` and `SerializationException` (2026-11-12 and
+/// 2026-11-19), which keep `message` here. The other errors measured carry
+/// `message`. REQ-ERR-002 in `docs/design/01-requirements.md` lists them.
 fn message_key(error: &DynamoDbError) -> &'static str {
     match error {
         DynamoDbError::TransactionCanceledException { .. }
-        | DynamoDbError::IdempotentParameterMismatchException(_) => "Message",
+        | DynamoDbError::IdempotentParameterMismatchException(_)
+        | DynamoDbError::TransactionInProgressException(_) => "Message",
         _ => "message",
     }
 }
