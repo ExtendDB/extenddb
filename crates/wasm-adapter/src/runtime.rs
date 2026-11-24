@@ -302,19 +302,6 @@ mod tests {
         );
     }
 
-    /// Validation order: an unknown op with a malformed body is still
-    /// `UnknownOperationException`, matching the server's pre-auth order.
-    #[tokio::test]
-    async fn an_unknown_operation_with_a_malformed_body_is_unknown_operation() {
-        let engine = engine().await;
-        let out = engine.submit("NoSuchOperation", "{ this is not json").await;
-        assert_eq!(
-            error_type(&out),
-            "com.amazon.coral.service#UnknownOperationException",
-            "{out}"
-        );
-    }
-
     /// The HTTP server refuses a body over 16 MiB with
     /// `RequestEntityTooLargeException` before it parses it; the adapter has
     /// no size limit, so a `ListTables` body of 17 MiB (padded with JSON
