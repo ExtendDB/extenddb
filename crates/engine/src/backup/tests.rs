@@ -4849,9 +4849,16 @@ fn throughput_override_under_pay_per_request_is_refused() {
 
 #[test]
 fn invalid_provisioned_throughput_override_matches_create_table() {
-    let expected = "One or more parameter values were invalid: ReadCapacityUnits and \
-                    WriteCapacityUnits must both be greater than or equal to 1 for table";
     for (read, write) in [(0, 5), (5, 0), (-1, 5), (5, -1)] {
+        let (value, unit) = if write < 1 {
+            (write, "writeCapacityUnits")
+        } else {
+            (read, "readCapacityUnits")
+        };
+        let expected = format!(
+            "1 validation error detected: Value '{value}' at 'provisionedThroughput.{unit}' \
+             failed to satisfy constraint: Member must have value greater than or equal to 1"
+        );
         let overrides = parse_restore_table_overrides(&json!({
             "BillingModeOverride": "PROVISIONED",
             "ProvisionedThroughputOverride": { "ReadCapacityUnits": read, "WriteCapacityUnits": write },
@@ -5451,7 +5458,7 @@ async fn index_overrides_the_service_refuses_are_refused() {
         (
             "{0, 0}",
             json!({ "GlobalSecondaryIndexOverride": [gsi_entry(Some((0, 0)))] }),
-            "ReadCapacityUnits and WriteCapacityUnits must both be greater than or equal to 1",
+            "2 validation errors detected: Value '0' at 'globalSecondaryIndexes.1.member.provisionedThroughput.writeCapacityUnits' failed to satisfy constraint: Member must have value greater than or equal to 1; Value '0' at 'globalSecondaryIndexes.1.member.provisionedThroughput.readCapacityUnits' failed to satisfy constraint: Member must have value greater than or equal to 1",
         ),
         (
             "an index on-demand throughput on a PROVISIONED restore",

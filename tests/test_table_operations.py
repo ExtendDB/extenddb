@@ -464,6 +464,14 @@ class TestUpdateTable:
                 ProvisionedThroughput={"ReadCapacityUnits": 0, "WriteCapacityUnits": 5},
             )
         assert exc_info.value.response["Error"]["Code"] == "ValidationException"
+        # The message names the member, path and value, as DynamoDB does. The
+        # text is backend-independent (it comes from extenddb-core), so this
+        # end-to-end assertion covers every backend the suite runs against.
+        assert exc_info.value.response["Error"]["Message"] == (
+            "1 validation error detected: Value '0' at "
+            "'provisionedThroughput.readCapacityUnits' failed to satisfy constraint: "
+            "Member must have value greater than or equal to 1"
+        )
 
     def test_update_table_remove_nonexistent_gsi(
         self, create_and_cleanup_table, dynamodb_client, unique_table_name
