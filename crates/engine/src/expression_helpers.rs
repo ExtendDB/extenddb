@@ -136,6 +136,7 @@ const SINGLE_ITEM_WRITE_WRAPPED: [&str; 5] = [
 /// other message as it is. A PartiQL statement runs through the single-item
 /// write handlers and reports these messages without the wrapper (see
 /// `partiql::bare_expression_error`).
+#[cfg_attr(not(feature = "partiql"), allow(dead_code))]
 pub fn strip_single_item_write_prefix(err: DynamoDbError) -> DynamoDbError {
     match err {
         DynamoDbError::ValidationException(msg) => {
@@ -187,6 +188,7 @@ pub fn parse_condition_expr_with(
 /// # Errors
 ///
 /// Returns `DynamoDbError::ValidationException` for syntax or reserved-word errors.
+#[cfg_attr(not(feature = "partiql"), allow(dead_code))]
 pub fn parse_update_expr(
     update_expr: &str,
     limits: &LimitsConfig,
