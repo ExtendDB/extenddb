@@ -11,8 +11,7 @@
 //! that the export scan asks for a consistent read.
 //!
 //! The storage double in [`recording`] records every read call with the
-//! options it received and answers with no items; the handlers run end to end
-//! above it.
+//! options it received; the handlers run end to end above it.
 
 mod fixtures;
 mod recording;
@@ -28,14 +27,14 @@ use extenddb_core::limits::LimitsConfig;
 
 use crate::{BackupRuntime, OperationContext};
 use fixtures::{ACCOUNT, EVENTS, GSI, LSI, ORDERS, USERS};
-use recording::{ReadCall, RecordingStorage};
+use recording::{Fake, ReadCall};
 
-fn context(storage: &Arc<RecordingStorage>) -> OperationContext {
+fn context(storage: &Arc<Fake>) -> OperationContext {
     context_with_export_paths(storage, Vec::new())
 }
 
 fn context_with_export_paths(
-    storage: &Arc<RecordingStorage>,
+    storage: &Arc<Fake>,
     export_paths: Vec<Arc<PathBuf>>,
 ) -> OperationContext {
     let empty: Vec<Arc<PathBuf>> = Vec::new();
@@ -112,7 +111,7 @@ const SENT_AND_EXPECTED: [(Option<bool>, bool); 3] =
 /// Runs one handler over a fresh recording storage and returns the single
 /// read it made.
 async fn single_read(op: &str, body: Value) -> ReadCall {
-    let storage = RecordingStorage::new();
+    let storage = recording::storage();
     let ctx = context(&storage);
     let result = match op {
         "GetItem" => crate::get_item::handle_get_item(body, &ctx).await,
@@ -179,7 +178,7 @@ async fn batch_get_item_carries_consistent_read_per_table() {
     // leaves the member absent in the other. Both Users shapes must reach
     // storage as `false`, so a handler that treats "present" as "true" fails.
     for users_sent in [Some(false), None] {
-        let storage = RecordingStorage::new();
+        let storage = recording::storage();
         let ctx = context(&storage);
         let body = json!({
             "RequestItems": {
@@ -233,7 +232,7 @@ async fn gsi_query_reaches_storage_eventually_consistent() {
 
 #[tokio::test]
 async fn gsi_query_with_consistent_read_is_refused_before_storage() {
-    let storage = RecordingStorage::new();
+    let storage = recording::storage();
     let ctx = context(&storage);
     let result =
         crate::query::handle_query(with_consistent_read(gsi_query_body(), Some(true)), &ctx).await;
@@ -269,7 +268,7 @@ async fn gsi_scan_reaches_storage_eventually_consistent() {
 
 #[tokio::test]
 async fn gsi_scan_with_consistent_read_is_refused_before_storage() {
-    let storage = RecordingStorage::new();
+    let storage = recording::storage();
     let ctx = context(&storage);
     let result =
         crate::scan::handle_scan(with_consistent_read(gsi_scan_body(), Some(true)), &ctx).await;
@@ -340,7 +339,7 @@ impl Drop for ExportRoot {
 #[tokio::test]
 async fn export_scan_asks_for_a_consistent_read() {
     let root = ExportRoot::new();
-    let storage = RecordingStorage::new();
+    let storage = recording::storage();
     let ctx = context_with_export_paths(&storage, vec![Arc::new(root.0.clone())]);
     let file_path = root.0.join(ACCOUNT).join("orders.json");
     let body = json!({
