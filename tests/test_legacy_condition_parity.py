@@ -200,7 +200,7 @@ class TestLegacyNumberValues:
         # A QueryFilter error is reported before a KeyConditions number.
         assert _validation_error(lambda: client.query(TableName=ss_table, KeyConditions={"pk": _cond("EQ", [_n("abc")])}, QueryFilter={"a": _cond("BEGINS_WITH", [_n("1")])})) == LEGACY_TYPE.format("BEGINS_WITH", "N")
 
-    def test_number_is_checked_before_the_table_lookup_and_select(self, dynamodb_client_no_validation):
+    def test_number_check_on_a_table_that_does_not_exist(self, dynamodb_client_no_validation):
         client = dynamodb_client_no_validation
         absent = f"absent_{uuid.uuid4().hex[:8]}"
         assert _validation_error(lambda: client.scan(TableName=absent, ScanFilter={"a": _cond("EQ", [_n("abc")])})) == NOT_A_NUMBER.format("abc")
