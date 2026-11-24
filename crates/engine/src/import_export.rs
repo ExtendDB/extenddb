@@ -60,12 +60,11 @@ pub async fn handle_import_table(
     // orphaned destination table behind.
     let source_path = validate_path(&input.file_source.path, &ctx.import_paths, &ctx.account_id)?;
 
-    tracing::info!(
-        account_id = %ctx.account_id,
-        operation = "ImportTable",
-        table_name = %tcp.table_name,
-        resolved_path = %source_path.display(),
-        "import/export file access"
+    log_file_access(
+        &ctx.account_id,
+        "ImportTable",
+        &tcp.table_name,
+        &source_path,
     );
 
     // Check file size against limit.
@@ -335,12 +334,11 @@ pub async fn handle_export_table(
         })?;
     }
 
-    tracing::info!(
-        account_id = %ctx.account_id,
-        operation = "ExportTableToPointInTime",
-        table_name = %table_name,
-        resolved_path = %output_path.display(),
-        "import/export file access"
+    log_file_access(
+        &ctx.account_id,
+        "ExportTableToPointInTime",
+        &table_name,
+        &output_path,
     );
 
     let mut file = create_export_file(&output_path).await?;
@@ -524,6 +522,82 @@ fn epoch_seconds() -> f64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+/// Log the file an import reads or an export writes. The table name and the
+/// path are Debug fields, which escape control characters, so a value that
+/// holds a line break or a terminal escape sequence stays inside this one log
+/// line. Both come from the request: ImportTable logs the table name it is
+/// about to create before any check of that name.
+fn log_file_access(account_id: &str, operation: &str, table_name: &str, path: &std::path::Path) {
+    tracing::info!(
+        account_id = %account_id,
+        operation,
+        table_name = ?table_name,
+        resolved_path = ?path,
+        "import/export file access"
+    );
+}
+
+#[cfg(test)]
+mod file_access_log_tests {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("capture lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A line feed, a forged log line, a carriage return and escape sequences.
+    const FORGED: &str = "x\n2026-10-31T23:59:59.000000Z  INFO forged line\r\n\x1b[31mred\x1b[0m";
+
+    /// The access record for `table_name` and `path`, as the text format
+    /// `serve` uses writes it, without colours.
+    fn access_record(table_name: &str, path: &str) -> String {
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            super::log_file_access("1", "ImportTable", table_name, std::path::Path::new(path));
+        });
+        String::from_utf8(capture.0.lock().expect("capture lock").clone()).expect("utf-8 log")
+    }
+
+    fn assert_one_line_without_controls(out: &str) {
+        assert_eq!(out.matches('\n').count(), 1, "one line: {out:?}");
+        assert!(!out.contains('\r') && !out.contains('\x1b'), "{out:?}");
+    }
+
+    #[test]
+    fn a_path_with_control_characters_stays_on_one_log_line() {
+        let out = access_record("orders", &format!("/exports/1/{FORGED}.json"));
+        assert_one_line_without_controls(&out);
+        assert!(
+            out.contains(r#"resolved_path="/exports/1/x\n2026-10-31"#),
+            "{out:?}"
+        );
+    }
+
+    /// ImportTable logs the table name it is about to create before any check
+    /// of that name.
+    #[test]
+    fn a_table_name_with_control_characters_stays_on_one_log_line() {
+        let out = access_record(FORGED, "/imports/1/items.json");
+        assert_one_line_without_controls(&out);
+        assert!(out.contains(r#"table_name="x\n2026-10-31"#), "{out:?}");
+    }
 }
 
 #[cfg(test)]
