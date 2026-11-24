@@ -186,12 +186,38 @@ async fn validate_resource_arn(arn: &str, ctx: &OperationContext) -> Result<(), 
     Ok(())
 }
 
+/// Reject a tag key that contains U+0000, with the service's message
+/// (measured 2026-11-24 on DynamoDB; the raw character is echoed). PostgreSQL
+/// cannot bind U+0000 in a TEXT parameter, so without this check TagResource
+/// and UntagResource answer 500 there; SQLite accepted it. The service answers
+/// ValidationException on both. Precedence against the resource-existence
+/// check and the order across several bad tags were not measured.
+fn reject_nul_tag_key(key: &str) -> Result<(), DynamoDbError> {
+    if key.contains('\0') {
+        return Err(DynamoDbError::ValidationException(format!(
+            "The Tag Key provided is invalid, Key: {key}"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject a tag value that contains U+0000. See [`reject_nul_tag_key`].
+fn reject_nul_tag_value(value: &str) -> Result<(), DynamoDbError> {
+    if value.contains('\0') {
+        return Err(DynamoDbError::ValidationException(format!(
+            "The Tag Value provided is invalid, Value: {value}"
+        )));
+    }
+    Ok(())
+}
+
 /// Handle `TagResource` — add or overwrite tags on a resource.
 ///
 /// # Errors
 ///
 /// Returns `ResourceNotFoundException` if the resource does not exist.
-/// Returns `ValidationException` if the resource ARN is empty.
+/// Returns `ValidationException` if the resource ARN is empty, or a tag key or
+/// value contains U+0000.
 /// Returns `InternalServerError` on storage failures.
 pub async fn handle_tag_resource(
     body: Value,
@@ -206,6 +232,11 @@ pub async fn handle_tag_resource(
     }
 
     validate_resource_arn(&input.resource_arn, ctx).await?;
+
+    for tag in &input.tags {
+        reject_nul_tag_key(&tag.key)?;
+        reject_nul_tag_value(&tag.value)?;
+    }
 
     ctx.storage
         .tag_resource(&input.resource_arn, &input.tags)
@@ -243,6 +274,10 @@ pub async fn handle_untag_resource(
     }
 
     validate_resource_arn(&input.resource_arn, ctx).await?;
+
+    for key in &input.tag_keys {
+        reject_nul_tag_key(key)?;
+    }
 
     ctx.storage
         .untag_resource(&input.resource_arn, &input.tag_keys)
@@ -295,10 +330,36 @@ pub async fn handle_list_tags_of_resource(
 #[cfg(test)]
 mod tests {
     use super::{
-        deployment_scope_error, tag_subresource_not_dynamodb_resource,
-        tag_subresource_not_table_or_stream,
+        deployment_scope_error, reject_nul_tag_key, reject_nul_tag_value,
+        tag_subresource_not_dynamodb_resource, tag_subresource_not_table_or_stream,
     };
     use extenddb_core::error::DynamoDbError;
+
+    #[test]
+    fn nul_tag_key_is_rejected_with_the_service_message() {
+        match reject_nul_tag_key("k\u{0}") {
+            Err(DynamoDbError::ValidationException(m)) => {
+                assert_eq!(m, "The Tag Key provided is invalid, Key: k\u{0}");
+            }
+            other => panic!("expected ValidationException, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nul_tag_value_is_rejected_with_the_service_message() {
+        match reject_nul_tag_value("v\u{0}") {
+            Err(DynamoDbError::ValidationException(m)) => {
+                assert_eq!(m, "The Tag Value provided is invalid, Value: v\u{0}");
+            }
+            other => panic!("expected ValidationException, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tag_key_and_value_without_nul_are_accepted() {
+        assert!(reject_nul_tag_key("Environment").is_ok());
+        assert!(reject_nul_tag_value("production").is_ok());
+    }
 
     /// The tag handler refuses exactly the ARNs the shared predicate puts
     /// outside this deployment, the predicate the server's StreamArn scope
