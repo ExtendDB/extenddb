@@ -93,17 +93,25 @@ enum WhileDeleting {
     Refuse,
 }
 
-/// Refuse a tag change on a table that is being deleted. The service answers
-/// `TagResource` and `UntagResource` on a `DELETING` table with
+/// Answer a tag operation on a table that is being deleted. The service
+/// answers `TagResource` and `UntagResource` on a `DELETING` table's ARN with
 /// `ResourceInUseException` and the sentence `DeleteTable` and `UpdateTable`
 /// give in that window, and serves `ListTagsOfResource` (measured
-/// 2026-11-03). On the table's stream ARN both writes are served in the same
+/// 2026-11-03). These are its answers for the first 0.6 to 2.3 s after
+/// `DeleteTable` returns. After that it answers all three with
+/// `ResourceNotFoundException` while `DescribeTable` still reads `DELETING`
+/// (measured 2026-11-20, five runs). ExtendDB keeps the first answers for the
+/// whole window. On the table's stream ARN both writes are served in the same
 /// window (measured 2026-10-26), so `resource` decides: a stream's tags belong
-/// to the stream, which stays describable after its table is deleted. The key
-/// info carries no status, and the data plane reads a `DELETING` table as
-/// found on PostgreSQL and SQLite, so the status is read from the catalog
-/// (`table_lifecycle::read_table_status`). Any other answer from it is left to
-/// the existence check that follows.
+/// to the stream, which stays describable after its table is deleted. That
+/// holds for the table's latest stream only. Any other label is
+/// `ResourceNotFoundException`, the service's answer for a label that names no
+/// stream (measured 2026-11-20 on a `DELETING` table). The key info carries no
+/// status, and the data plane reads a `DELETING` table as found on PostgreSQL
+/// and SQLite, so the status is read from the catalog
+/// (`table_lifecycle::read_table_description`). A failed read answers as the
+/// key-info read below would: a missing table names the ARN, and any other
+/// error is a fault.
 ///
 /// Returns whether the table is `DELETING` and the request is served: the
 /// key-info read reports a `DELETING` row as not found on MongoDB and
@@ -111,17 +119,25 @@ enum WhileDeleting {
 /// the same way.
 async fn refuse_while_deleting(
     table_name: &str,
+    arn: &str,
     resource: &str,
     ctx: &OperationContext,
     while_deleting: WhileDeleting,
 ) -> Result<bool, DynamoDbError> {
-    let Ok(status) = crate::table_lifecycle::read_table_status(table_name, ctx).await else {
-        return Ok(false);
-    };
-    if status != TableStatus::Deleting {
+    let desc = crate::table_lifecycle::read_table_description(table_name, ctx)
+        .await
+        .map_err(|e| arn_storage_error(e, arn))?;
+    if desc.table_status != TableStatus::Deleting {
         return Ok(false);
     }
-    if while_deleting == WhileDeleting::Refuse && !tag_subresource_is_stream(resource) {
+    if tag_subresource_is_stream(resource) {
+        if desc.latest_stream_arn.as_deref() != Some(arn) {
+            return Err(arn_storage_error(
+                extenddb_storage::error::StorageError::TableNotFound(table_name.to_owned()),
+                arn,
+            ));
+        }
+    } else if while_deleting == WhileDeleting::Refuse {
         return Err(crate::create_table::table_being_deleted(table_name));
     }
     Ok(true)
@@ -144,7 +160,8 @@ async fn refuse_while_deleting(
 /// | Stream ARN with a different partition, service, or region | `ValidationException` (`Invalid StreamArn`) |
 /// | Table does not exist | `ResourceNotFoundException` |
 /// | Table is `DELETING`, for `TagResource` and `UntagResource` on the table ARN (`while_deleting` is `Refuse`) | `ResourceInUseException` (`Table is being deleted`) |
-/// | Table is `DELETING`, for `ListTagsOfResource` and for the stream ARN | served |
+/// | Table is `DELETING`, for `ListTagsOfResource` and for the table's latest stream ARN | served |
+/// | Table is `DELETING`, for a stream ARN whose label is not the table's latest stream | `ResourceNotFoundException` |
 ///
 /// Account is checked before the partition, service, and region, matching the
 /// service: a cross-account ARN is denied without revealing whether its other
@@ -222,7 +239,7 @@ async fn validate_resource_arn(
 
     // A served request on a DELETING table skips the key-info read, which
     // reports such a row as not found on MongoDB and Cassandra.
-    if refuse_while_deleting(table_name, resource, ctx, while_deleting).await? {
+    if refuse_while_deleting(table_name, arn, resource, ctx, while_deleting).await? {
         return Ok(());
     }
     // Verify the table exists via table_key_info (lightweight check).
@@ -344,7 +361,9 @@ pub async fn handle_list_tags_of_resource(
     }
 
     // Served while the table is DELETING, with the tags, as the service serves
-    // it (measured 2026-10-25): the read is not a change to the resource.
+    // it in the first seconds of the window (measured 2026-10-25; the later
+    // answers are in `refuse_while_deleting`): the read is not a change to the
+    // resource.
     validate_resource_arn(&input.resource_arn, ctx, WhileDeleting::Serve).await?;
 
     let tags = ctx

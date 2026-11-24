@@ -108,6 +108,23 @@ async fn ttl_indexes(s: &Scratch) -> Vec<String> {
         .expect("list the TTL indexes")
 }
 
+/// The engine's request context over the scratch engine.
+pub(super) fn engine_context(s: &Scratch) -> extenddb_engine::OperationContext {
+    extenddb_engine::OperationContext {
+        storage: Arc::new(s.engine.clone()),
+        backup: Arc::new(extenddb_engine::BackupRuntime::new(1)),
+        limits: Arc::new(extenddb_core::limits::LimitsConfig::default()),
+        region: Arc::from("us-east-1"),
+        account_id: Arc::from(ACCOUNT),
+        import_paths: Arc::from(Vec::new()),
+        export_paths: Arc::from(Vec::new()),
+        authorized_key_info: extenddb_engine::AuthorizedKeyInfo::default(),
+        auth_cache: extenddb_auth::AuthCacheRegistry::empty(),
+        table_key_info_lookup: None,
+        item_authorizer: None,
+    }
+}
+
 /// UpdateTimeToLive disabling TTL during the window, through the engine
 /// handler, sends no DROP INDEX: the index built while the table was ACTIVE is
 /// still there when the call returns, the catalog write landed, and the row is
@@ -131,19 +148,7 @@ async fn update_ttl_disable_during_the_window_sends_no_drop_index() {
     assert_eq!(built.len(), 1, "one TTL index before the delete: {built:?}");
     start_deleting(&s).await;
 
-    let ctx = extenddb_engine::OperationContext {
-        storage: Arc::new(s.engine.clone()),
-        backup: Arc::new(extenddb_engine::BackupRuntime::new(1)),
-        limits: Arc::new(extenddb_core::limits::LimitsConfig::default()),
-        region: Arc::from("us-east-1"),
-        account_id: Arc::from(ACCOUNT),
-        import_paths: Arc::from(Vec::new()),
-        export_paths: Arc::from(Vec::new()),
-        authorized_key_info: extenddb_engine::AuthorizedKeyInfo::default(),
-        auth_cache: extenddb_auth::AuthCacheRegistry::empty(),
-        table_key_info_lookup: None,
-        item_authorizer: None,
-    };
+    let ctx = engine_context(&s);
     let out = extenddb_engine::handle_update_time_to_live(
         json!({"TableName": TABLE,
                "TimeToLiveSpecification": {"Enabled": false, "AttributeName": "ttl"}}),

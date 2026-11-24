@@ -12,6 +12,26 @@ use serde_json::json;
 use super::*;
 
 impl Fixture {
+    /// Create `TABLE` with a stream and set its document to `DELETING`.
+    /// Returns the stream's ARN.
+    async fn open_window_with_stream(&self) -> String {
+        let input: CreateTableInput = serde_json::from_value(json!({
+            "TableName": TABLE,
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "KEYS_ONLY"},
+            "BillingMode": "PAY_PER_REQUEST"
+        }))
+        .expect("create input");
+        let desc = self
+            .engine
+            .create_table(ACCOUNT, input)
+            .await
+            .expect("create the table");
+        self.set_status("DELETING").await;
+        desc.latest_stream_arn.expect("the table's stream ARN")
+    }
+
     /// Drop `TABLE`'s data collection, as a delete call does after it marks
     /// the document `DELETING` and before it removes the document, and return
     /// the collection's name.
@@ -132,17 +152,19 @@ async fn a_ttl_index_build_during_the_window_creates_no_collection() {
 /// The engine's tag and TTL handlers against a `DELETING` document, through a
 /// `MongoEngine`. The key-info read reports such a document as not found on
 /// this backend, so the answers below depend on the handlers reading the
-/// status first. The tag rows match the service (measured 2026-10-25 for the
-/// table ARN, 2026-10-26 for the stream ARN), as do the `DescribeTimeToLive`
-/// rows for `DELETING` and `CREATING`. The enable runs after the data
-/// collection is dropped, as the delete call drops it before it removes the
-/// document, and leaves no collection behind.
+/// status first. The tag rows match the service: for the table ARN its first
+/// answers after `DeleteTable` returns (measured 2026-10-25), for the stream
+/// ARN its answers in the window (measured 2026-10-26), and for a stream label
+/// that names no stream its `ResourceNotFoundException` (measured 2026-11-20).
+/// The `DescribeTimeToLive` rows for `DELETING` and `CREATING` match it too.
+/// The enable runs after the data collection is dropped, as the delete call
+/// drops it before it removes the document, and leaves no collection behind.
 #[tokio::test]
 async fn engine_tag_and_ttl_handlers_during_the_window() {
     let Some(f) = Fixture::new().await else {
         return;
     };
-    f.open_window().await;
+    let stream_arn = f.open_window_with_stream().await;
     let ctx = extenddb_engine::OperationContext {
         storage: Arc::new(f.engine.clone()),
         backup: Arc::new(extenddb_engine::BackupRuntime::new(1)),
@@ -157,12 +179,12 @@ async fn engine_tag_and_ttl_handlers_during_the_window() {
         item_authorizer: None,
     };
     let arn = format!("arn:aws:dynamodb:us-east-1:{ACCOUNT}:table/{TABLE}");
-    // The tag path does not look the stream up, so any label of the
-    // service's shape names the table's stream.
-    let stream_arn = format!("{arn}/stream/2026-10-26T00:13:40.188");
+    // A label of the service's shape that names no stream of the table.
+    let made_up = format!("{arn}/stream/2000-01-01T00:00:00.000");
     let in_use = format!(
         "Attempt to change a resource which is still in use: Table is being deleted: {TABLE}"
     );
+    let not_found = format!("Requested resource not found: ResourceArn: {made_up} not found");
     // A tag written before the delete.
     f.engine
         .tag_resource(
@@ -215,6 +237,30 @@ async fn engine_tag_and_ttl_handlers_during_the_window() {
     )
     .await
     .expect("UntagResource on the stream ARN is served");
+
+    let tag = extenddb_engine::handle_tag_resource(
+        json!({"ResourceArn": made_up, "Tags": [{"Key": "fk", "Value": "fv"}]}),
+        &ctx,
+    )
+    .await;
+    assert!(
+        matches!(&tag, Err(DynamoDbError::ResourceNotFoundException(m)) if *m == not_found),
+        "TagResource on a made-up stream label: {tag:?}"
+    );
+    let listed =
+        extenddb_engine::handle_list_tags_of_resource(json!({"ResourceArn": made_up}), &ctx).await;
+    assert!(
+        matches!(&listed, Err(DynamoDbError::ResourceNotFoundException(m)) if *m == not_found),
+        "ListTagsOfResource on a made-up stream label: {listed:?}"
+    );
+    assert_eq!(
+        f.engine
+            .list_tags(&made_up)
+            .await
+            .expect("read the made-up label's tag rows"),
+        Vec::<Tag>::new(),
+        "no tag row is stored for a made-up stream label"
+    );
 
     let described =
         extenddb_engine::handle_describe_time_to_live(json!({"TableName": TABLE}), &ctx).await;

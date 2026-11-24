@@ -43,6 +43,8 @@ use extenddb_storage_postgres::{PostgresConfig, PostgresEngine};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 
+#[path = "deleting_window/tags.rs"]
+mod tags;
 #[path = "deleting_window/ttl.rs"]
 mod ttl;
 

@@ -57,9 +57,10 @@ pub async fn handle_describe_time_to_live(
     // The TTL columns live on the catalog row, which outlives the status
     // change, so the read below answers for a DELETING table too: the status
     // is what decides, and the key-info read cannot supply it.
-    let status = crate::table_lifecycle::read_table_status(&input.table_name, ctx)
+    let status = crate::table_lifecycle::read_table_description(&input.table_name, ctx)
         .await
-        .map_err(storage_to_dynamo)?;
+        .map_err(storage_to_dynamo)?
+        .table_status;
     check_describe_status(status)?;
 
     let desc = ctx
@@ -151,9 +152,10 @@ pub async fn handle_update_time_to_live(
     // The status decides whether the index work after the write runs at all.
     // It is read before the write: a delete that starts between the two meets
     // that work, as before.
-    let status = crate::table_lifecycle::read_table_status(&input.table_name, ctx)
+    let status = crate::table_lifecycle::read_table_description(&input.table_name, ctx)
         .await
-        .map_err(storage_to_dynamo)?;
+        .map_err(storage_to_dynamo)?
+        .table_status;
 
     ctx.storage
         .update_ttl(

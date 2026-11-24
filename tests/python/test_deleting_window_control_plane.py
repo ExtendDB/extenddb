@@ -286,6 +286,10 @@ _DESCRIBE_TTL_REFUSED = (
     "Cannot describe time to live while table is in DELETING state: "
     "Current table state is DELETING",
 )
+_MADE_UP_NOT_FOUND = (
+    "ResourceNotFoundException",
+    "Requested resource not found: ResourceArn: {made_up} not found",
+)
 _TTL_ON = {"Enabled": True, "AttributeName": "ttl"}
 _STREAM_TAG = [{"Key": "sk", "Value": "sv"}]
 
@@ -294,10 +298,13 @@ _STREAM_TAG = [{"Key": "sk", "Value": "sv"}]
 # write on the resource for a few seconds. A row is (the table has a stream,
 # steps before DeleteTable, steps after it). A step is (operation, request,
 # answer), where the answer is the response body or an (error code, message)
-# pair. ``{name}`` and ``{stream}`` (the table's LatestStreamArn) are
+# pair. ``{name}``, ``{stream}`` (the table's LatestStreamArn) and
+# ``{made_up}`` (a stream ARN of the table whose label names no stream) are
 # filled in per table. Measured: the TTL rows 2026-10-25 (three tables, every
 # call while DescribeTable read DELETING, the DescribeTimeToLive refusal before
-# and after an UpdateTimeToLive); the stream ARN rows 2026-10-26.
+# and after an UpdateTimeToLive); the stream ARN rows 2026-10-26; the made-up
+# label 2026-11-20 on a DELETING table and 2026-11-24 on a table that does not
+# exist.
 WINDOW_ROWS = [
     pytest.param(
         False,
@@ -333,6 +340,19 @@ WINDOW_ROWS = [
         ],
         id="untag-stream",
     ),
+    pytest.param(
+        True,
+        [],
+        [
+            (
+                "tag_resource",
+                {"ResourceArn": "{made_up}", "Tags": [{"Key": "fk", "Value": "fv"}]},
+                _MADE_UP_NOT_FOUND,
+            ),
+            ("list_tags_of_resource", {"ResourceArn": "{made_up}"}, _MADE_UP_NOT_FOUND),
+        ],
+        id="made-up-stream-label",
+    ),
 ]
 
 
@@ -366,7 +386,8 @@ class TestDeletingWindowTimeToLiveAndStreamTags:
     """``DescribeTimeToLive`` is refused during the window and
     ``UpdateTimeToLive`` runs its ordinary rules. The table's stream ARN is a
     resource of its own: both tag writes and the read are served on it, where
-    the table ARN refuses the writes (``TestDeletingWindowControlPlane``).
+    the table ARN refuses the writes (``TestDeletingWindowControlPlane``). A
+    stream ARN whose label names no stream is ``ResourceNotFoundException``.
     ``DescribeTimeToLive`` on a ``CREATING`` table is refused with the same
     sentence naming ``CREATING`` (measured 2026-10-26); the fixture cannot hold
     a table ``CREATING``, so that row is pinned in the engine's unit tests."""
@@ -381,6 +402,7 @@ class TestDeletingWindowTimeToLiveAndStreamTags:
             values = {
                 "name": name,
                 "stream": table.get("LatestStreamArn", ""),
+                "made_up": f"{table['TableArn']}/stream/2000-01-01T00:00:00.000",
             }
             for step in before:
                 _run_step(dynamodb_client, step, values)
