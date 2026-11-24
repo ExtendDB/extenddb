@@ -131,7 +131,8 @@ struct OpenedFile {
 /// and the last `vfs` and the last `immutable` win. A plain path always gets
 /// `mode=rwc` from `sqlite_url`. A `file:` URI's own query is then read as
 /// SQLite reads it (`sqlite_uri`), and the file is created only if SQLite
-/// would create it on disk, with a VFS in the unix family.
+/// would create it on disk, with a unix VFS the linked SQLite has
+/// (`sqlite_uri::is_unix_vfs`).
 #[cfg(unix)]
 fn opened_file(location: &str) -> Option<OpenedFile> {
     let path = database_file(location).ok()??;
@@ -158,7 +159,7 @@ fn opened_file(location: &str) -> Option<OpenedFile> {
     }
     let created = rwc
         && !ro
-        && vfs.is_none_or(|vfs| vfs.starts_with("unix"))
+        && vfs.is_none_or(|vfs| crate::sqlite_uri::is_unix_vfs(vfs.as_bytes()))
         && uri.is_none_or(|rest| {
             crate::sqlite_uri::FileUri::parse(rest).is_ok_and(|uri| uri.creates_file())
         });

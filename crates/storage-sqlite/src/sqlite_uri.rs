@@ -134,7 +134,8 @@ impl FileUri {
     /// the read-write-create access sqlx passes for `mode=rwc`, after these
     /// options. Every `cache` and `mode` value must be one SQLite knows; a
     /// `mode` may not ask for more access than the flags before it allow; the
-    /// last `mode` decides; and the last `vfs` must be in the unix family.
+    /// last `mode` decides; and the last `vfs` must be a unix VFS SQLite has
+    /// ([`is_unix_vfs`]).
     #[cfg(unix)]
     pub(crate) fn creates_file(&self) -> bool {
         let mut flags = READWRITE | CREATE;
@@ -159,8 +160,24 @@ impl FileUri {
                 _ => {}
             }
         }
-        flags & CREATE != 0 && flags & MEMORY == 0 && vfs.is_none_or(|vfs| vfs.starts_with(b"unix"))
+        flags & CREATE != 0 && flags & MEMORY == 0 && vfs.is_none_or(is_unix_vfs)
     }
+}
+
+/// Whether `name` names a VFS of SQLite's unix family that the linked SQLite
+/// has. Those VFSes open the database as a file on disk. SQLite reads the
+/// name up to its first NUL, and it refuses an open with a name it does not
+/// have (`no such vfs`), so it creates no file for one.
+#[cfg(unix)]
+pub(crate) fn is_unix_vfs(name: &[u8]) -> bool {
+    let name = name.split(|&b| b == 0).next().unwrap_or_default();
+    name.starts_with(b"unix")
+        && std::ffi::CString::new(name).is_ok_and(|name| {
+            // SAFETY: `sqlite3_vfs_find` reads the NUL-terminated name, which
+            // `name` owns for the duration of the call. The pointer it
+            // returns is only compared with null.
+            !unsafe { libsqlite3_sys::sqlite3_vfs_find(name.as_ptr()) }.is_null()
+        })
 }
 
 fn hex(c: u8) -> u8 {
@@ -249,6 +266,9 @@ mod tests {
             ("/d?cache=none", false),
             ("/d?vfs=memdb", false),
             ("/d?vfs=memdb&vfs=unix-excl", true),
+            ("/d?vfs=unix-none", true),
+            // A name SQLite does not have: the open fails with no such vfs.
+            ("/d?vfs=unixfoo", false),
         ] {
             assert_eq!(parse(rest).creates_file(), creates, "{rest}");
         }

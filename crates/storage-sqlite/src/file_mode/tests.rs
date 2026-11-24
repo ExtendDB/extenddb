@@ -121,26 +121,31 @@ fn prepare_creates_nothing_when_the_connection_would_not() {
     ))
     .expect("prepare");
     // A `file:` URI with its own query (here `?mode=ro`, percent-encoded
-    // for sqlx), and a VFS outside the unix family, are left to SQLite.
+    // for sqlx), a VFS outside the unix family, and a VFS name SQLite does
+    // not have, are left to SQLite.
     prepare(&format!(
         "sqlite:file:{}%3Fmode=ro?mode=rwc",
         dir.join("uri.sqlite").display()
     ))
     .expect("prepare");
-    prepare(&format!(
-        "sqlite://{}?mode=rwc&vfs=memdb",
-        dir.join("vfs.sqlite").display()
-    ))
-    .expect("prepare");
+    for (name, vfs) in [("vfs.sqlite", "memdb"), ("unixfoo.sqlite", "unixfoo")] {
+        prepare(&format!(
+            "sqlite://{}?mode=rwc&vfs={vfs}",
+            dir.join(name).display()
+        ))
+        .expect("prepare");
+    }
     prepare(":memory:").expect("prepare");
     prepare("sqlite::memory:").expect("prepare");
     // A `file:` URI whose own query SQLite reads as no creation: `mode=rw`,
-    // `mode=memory`, a VFS outside the unix family, and `mode=ro` followed by
-    // `mode=rwc`, which asks for more access than `ro` allows and fails.
+    // `mode=memory`, a VFS outside the unix family, a VFS name SQLite does
+    // not have, and `mode=ro` followed by `mode=rwc`, which asks for more
+    // access than `ro` allows and fails.
     for (name, query) in [
         ("rw.sqlite", "mode=rw"),
         ("memory.sqlite", "mode=memory"),
         ("memdb.sqlite", "vfs=memdb"),
+        ("unixfoo-uri.sqlite", "vfs=unixfoo"),
         ("escalate.sqlite", "mode=ro%26mode=rwc"),
     ] {
         let uri = format!(
@@ -491,13 +496,15 @@ fn prepare_creates_the_database_file_with_mode_0600() {
 }
 
 /// Location forms on which SQLite creates the database on disk: the last of
-/// several `vfs` values is `unix`, and a `file:` URI's own query does not
-/// narrow the open. The database and its sidecars are 0600 from the moment
-/// they exist, as the connection setup sees them.
+/// several `vfs` values is `unix`, a `vfs` value that SQLite reads up to the
+/// NUL in it as `unix`, and a `file:` URI's own query does not narrow the
+/// open. The database and its sidecars are 0600 from the moment they exist,
+/// as the connection setup sees them.
 #[tokio::test]
 async fn forms_sqlite_creates_on_disk_start_at_0600() {
     for form in [
         "sqlite://{db}?mode=rwc&vfs=memdb&vfs=unix",
+        "sqlite://{db}?mode=rwc&vfs=unix%00x",
         "sqlite:file:{db}%3Fcache=shared?mode=rwc",
         "sqlite:file:{db}%3Fmode=rwc?mode=rwc",
     ] {
