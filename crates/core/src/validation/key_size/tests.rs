@@ -516,12 +516,17 @@ fn number_values_get_the_number_rules_before_any_size() {
     // with more than 38 significant digits or out of range gets the number's
     // sentence, never the size sentence. A valid one is sized by its
     // normalized digits. A number in other Unicode decimal digits is served.
-    // The RANGE rows apply the same rule to a sort key value.
+    // The RANGE rows apply the same rule to a sort key value. The 2049 `x`
+    // and 2049 U+FF11 rows are values the validator does not read as a
+    // number: they add nothing, so the size check passes them. The service
+    // refuses them with a number sentence (measured 2026-11-24: `The parameter
+    // cannot be converted to a numeric value: xxx...` for 2049 `x`, and the
+    // digit sentence for 39 U+FF11).
     const DIGITS: &str = "Attempting to store more than 38 significant digits in a Number";
     const OVERFLOW: &str =
         "Number overflow. Attempting to store a number with magnitude larger than supported range";
     let zeros = "0".repeat(2100);
-    let cases: [(&str, &str, String, Option<&str>); 8] = [
+    let cases: [(&str, &str, String, Option<&str>); 10] = [
         ("hash, 2049 digits", "pk", "1".repeat(2049), Some(DIGITS)),
         ("hash, 39 digits", "pk", "1".repeat(39), Some(DIGITS)),
         (
@@ -540,6 +545,8 @@ fn number_values_get_the_number_rules_before_any_size() {
         ),
         ("range, 1025 digits", "sk", "1".repeat(1025), Some(DIGITS)),
         ("range, 2100 zeros and 1", "sk", format!("{zeros}1"), None),
+        ("hash, 2049 x", "pk", "x".repeat(2049), None),
+        ("hash, 2049 U+FF11", "pk", "\u{ff11}".repeat(2049), None),
     ];
     for (label, attribute, n, expected) in cases {
         let (kc, values) = if attribute == "sk" {

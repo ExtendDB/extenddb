@@ -24,8 +24,8 @@ use crate::validation::number::normalize_number;
 ///
 /// `S` is sized by its UTF-8 bytes, `B` by its decoded bytes and `N` by its
 /// digit string. A number that passes the number rules is normalized when the
-/// request is read; on the Query path a number that breaks them is refused
-/// before it is sized (see `sized_clause`).
+/// request is read. The Query path sizes an `N` value in `sized_clause` and
+/// does not call this function for it.
 pub(super) fn key_value_byte_size(value: &AttributeValue) -> usize {
     match value {
         AttributeValue::S(s) => s.len(),
@@ -109,13 +109,22 @@ enum ClauseSize {
 /// larger of the two. Measured 2026-10-23: bounds of 600 and 600 bytes pass (a
 /// sum would be 1200), bounds of 1 and 1025 bytes are refused.
 ///
-/// An `N` value is checked against the number rules first, and one that breaks
-/// them is refused with the number's own sentence, never sized; one that
-/// passes is sized by its normalized digit string. Measured 2026-11-20 in
-/// us-east-1 on a GSI with HASH `n` (N). In `KeyConditionExpression` and in
-/// `KeyConditions`, 2049 or 39 digits answer `Attempting to store more than 38
-/// significant digits in a Number`. `1` followed by 2100 zeros answers `Number
-/// overflow. ...`, and the service serves 2100 zeros followed by `1`.
+/// An `N` value is checked against the number rules first. One with more than
+/// 38 significant digits or a magnitude out of range is refused with the
+/// number's own sentence and is not sized. One that passes is sized by its
+/// normalized digit string. Measured 2026-11-20 in us-east-1 on a GSI with
+/// HASH `n` (N). In `KeyConditionExpression` and in `KeyConditions`, 2049 or
+/// 39 digits answer `Attempting to store more than 38 significant digits in a
+/// Number`. `1` followed by 2100 zeros answers `Number overflow. ...`, and the
+/// service serves 2100 zeros followed by `1`.
+///
+/// A value that `normalize_number` does not read as a number adds nothing to
+/// the size. The service refuses such a value with a number sentence, not a
+/// size sentence (measured 2026-11-24 in us-east-1). `abc` and 2049 `x`
+/// answer `The parameter cannot be converted to a numeric value: ` followed
+/// by the value, in `KeyConditionExpression` and in `KeyConditions`. The
+/// service reads U+FF11 as a digit, and 39 of them answer the 38-digit
+/// sentence.
 ///
 /// # Errors
 ///
@@ -144,12 +153,9 @@ fn sized_clause(
             return Ok(ClauseSize::Unresolved);
         };
         let bytes = match value {
-            // The service reads Unicode decimal digits such as U+FF11 as
-            // digits, and `normalize_number` refuses them, so a value it does
-            // not read as a number is sized by its text (measured 2026-11-20).
             AttributeValue::N(n) => match normalize_number(n) {
                 Ok(digits) => digits.len(),
-                Err(fault) if fault.is_not_a_number() => n.len(),
+                Err(fault) if fault.is_not_a_number() => 0,
                 Err(fault) => return Err(fault.error(n)),
             },
             other => key_value_byte_size(other),
@@ -181,8 +187,8 @@ fn sized_clause(
 ///   both limits are exceeded.
 /// - An `N` value with more than 38 significant digits or a magnitude out of
 ///   range is refused with the number's sentence and is not sized. A value
-///   the number validator does not read as a number is sized by its text
-///   (see `sized_clause`).
+///   the number validator does not read as a number adds nothing (see
+///   `sized_clause`).
 /// - If a `#name` or `:value` of any key clause is not defined, the check
 ///   returns `Ok`, because the service reports the undefined reference ahead
 ///   of the size. ExtendDB refuses most such requests later on. On a key
