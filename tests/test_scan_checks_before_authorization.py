@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """A malformed Scan from a principal that may not Scan the table answers the
-request's ValidationException, not AccessDeniedException. The principal is a
-user created through the extenddb management API, so this file is skipped
-against the service.
+request's error, not AccessDeniedException. The principal is a user created
+through the extenddb management API, so this file is skipped against the
+service.
 
 Run:
   EXTENDDB_TEST_ENDPOINT=https://localhost:18443 \\
@@ -36,21 +36,31 @@ from test_scan_number_values import (
     _raw_scan,
 )
 
-# Measured 2026-11-19 16:34 UTC with a role allowed only dynamodb:DescribeTable
-# on the table, each body twice: the service answers each with the text below,
-# and the valid body with AccessDeniedException.
+VALIDATION = "ValidationException"
+SERIALIZATION = "SerializationException"
+
+# (row, body, error code, message). Measured with a role allowed only
+# dynamodb:DescribeTable, each body twice: the first nine rows on 2026-11-19 at
+# 16:34 UTC on a table of the role's account, the rows from "Limit of the wrong
+# JSON type" on 2026-11-24 at 08:28, 08:33 and 09:59 UTC on a table that does
+# not exist. The service answers each with the code and text below, except
+# where a row's comment gives the service's text, and the valid body with
+# AccessDeniedException.
 ROWS = [
-    ("N bob", NB_FILTER, NUMERIC + "bob"),
-    ("Limit 0", {"Limit": 0}, ONE_ERROR + LIMIT_RANGE),
-    ("ReturnConsumedCapacity", {"ReturnConsumedCapacity": "NOPE"}, RCC_ENUM),
-    ("mix", {"ScanFilter": SCAN_FILTER, "FilterExpression": "attribute_exists(a)"}, MIX),
-    ("Select", {"Select": "NOPE"}, SELECT_ENUM),
-    ("names", {"ExpressionAttributeNames": {"a": "b"}, "FilterExpression": "attribute_exists(a)"}, EAN_KEY),
+    ("N bob", NB_FILTER, VALIDATION, NUMERIC + "bob"),
+    ("Limit 0", {"Limit": 0}, VALIDATION, ONE_ERROR + LIMIT_RANGE),
+    ("ReturnConsumedCapacity", {"ReturnConsumedCapacity": "NOPE"}, VALIDATION, RCC_ENUM),
+    ("mix", {"ScanFilter": SCAN_FILTER, "FilterExpression": "attribute_exists(a)"}, VALIDATION, MIX),
+    ("Select", {"Select": "NOPE"}, VALIDATION, SELECT_ENUM),
+    ("names", {"ExpressionAttributeNames": {"a": "b"}, "FilterExpression": "attribute_exists(a)"},
+     VALIDATION, EAN_KEY),
     ("unknown type descriptor", {"FilterExpression": "a = :x", "ExpressionAttributeValues": {":x": X1}},
-     INVALID_VALUE + EMPTY_AV + " for key :x"),
-    ("null beside Select", {**NULL_BESIDE_SELECT, "ExpressionAttributeValues": {":v": None}}, SELECT_BAD),
+     VALIDATION, INVALID_VALUE + EMPTY_AV + " for key :x"),
+    ("null beside Select", {**NULL_BESIDE_SELECT, "ExpressionAttributeValues": {":v": None}},
+     VALIDATION, SELECT_BAD),
     ("exponent above int32",
-     {"FilterExpression": "a = :n", "ExpressionAttributeValues": {":n": {"N": "1e9999999999"}}}, OVERFLOW),
+     {"FilterExpression": "a = :n", "ExpressionAttributeValues": {":n": {"N": "1e9999999999"}}},
+     VALIDATION, OVERFLOW),
     # A float Limit puts the request on the service's older validation path,
     # where an empty or duplicate set is refused with that path's wrapped
     # text. Measured 2026-11-24 from a principal allowed only DescribeTable
@@ -58,10 +68,34 @@ ROWS = [
     # that does not exist (both texts).
     ("duplicate NS on the older path",
      {"Limit": 1.5, "FilterExpression": "a = :a", "ExpressionAttributeValues": {":a": {"NS": ["1", "1"]}}},
-     INVALID_VALUE + "Input collection contains duplicates for key :a"),
+     VALIDATION, INVALID_VALUE + "Input collection contains duplicates for key :a"),
     ("empty NS on the older path",
      {"Limit": 1.5, "FilterExpression": "a = :a", "ExpressionAttributeValues": {":a": {"NS": []}}},
+     VALIDATION,
      INVALID_VALUE + "One or more parameter values were invalid: An number set  may not be empty for key :a"),
+    ("Limit of the wrong JSON type", {"Limit": "5"}, SERIALIZATION, "STRING_VALUE cannot be converted to Integer"),
+    # The service answers "NUMBER_VALUE cannot be converted to String"; the
+    # text here is #1012's.
+    ("Select of the wrong JSON type", {"Select": 5}, SERIALIZATION,
+     "Start of structure or map found where not expected: invalid type: integer `5`, expected a string"),
+    ("names with no expression", {"ExpressionAttributeNames": {"#a": "a"}},
+     VALIDATION, "ExpressionAttributeNames can only be specified when using expressions"),
+    # On the newer path the service's text has no suffix (#722), so the row
+    # takes the older path, where extenddb and the service agree.
+    ("values with no expression on the older path",
+     {"Limit": 1.5, "ExpressionAttributeValues": {":a": {"S": "x"}}}, VALIDATION,
+     "ExpressionAttributeValues can only be specified when using expressions: FilterExpression is null"),
+    ("ConditionalOperator without a ScanFilter", {"ConditionalOperator": "AND"},
+     VALIDATION, "ConditionalOperator cannot be used without Filter or Expected"),
+    # The service answers "One or more parameter values were invalid: Invalid
+    # number of argument(s) for the EQ ComparisonOperator"; the text here is
+    # #838's.
+    ("ScanFilter value count", {"ScanFilter": {"a": {"ComparisonOperator": "EQ", "AttributeValueList": []}}},
+     VALIDATION, "Invalid number of attribute values for comparison"),
+    ("empty ScanFilter list value on the older path",
+     {"ScanFilter": {"a": {"ComparisonOperator": "EQ", "AttributeValueList": [{}]}}}, VALIDATION, EMPTY_AV),
+    ("empty key value on the older path", {"ExclusiveStartKey": {"pk": {}, "sk": {"S": "x"}}},
+     VALIDATION, "The provided starting key is invalid: " + EMPTY_AV),
 ]
 
 
@@ -81,11 +115,11 @@ class TestChecksBeforeAuthorization(ManagementPrincipals):
                 "Statement": [{"Effect": "Allow", "Action": "dynamodb:DescribeTable", "Resource": arn}],
             })
             failures = []
-            for row, body, message in ROWS:
+            for row, body, code, message in ROWS:
                 status, payload = _raw_scan(describe_only, {"TableName": name, **body})
                 got = (status, payload.get("__type", "").rsplit("#", 1)[-1],
                        payload.get("message", payload.get("Message")))
-                if got != (400, "ValidationException", message):
+                if got != (400, code, message):
                     failures.append(f"{row}: {got}")
             status, payload = _raw_scan(describe_only, {"TableName": name, **OK_FILTER})
             if (status, payload.get("__type", "").rsplit("#", 1)[-1]) != (400, "AccessDeniedException"):
